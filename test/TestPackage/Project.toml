@@ -1,0 +1,7 @@
+name = "TestPackage"
+uuid = "3de84ad7-74ec-4978-af9b-7fbc7fd80352"
+authors = ["Nitro.jl Contributors"]
+version = "0.1.0"
+
+[deps]
+Nitro = "e5efdb2c-68ee-4494-894d-55bb80f0a340"

@@ -1,0 +1,820 @@
+﻿module Core
+
+using Base: @kwdef
+using HTTP
+using HTTP: Router
+using Sockets
+using JSON
+using Base
+using Dates
+using Reexport
+using DataStructures: CircularDeque
+import Base.Threads: lock, nthreads
+import ..WAS_LOADED_AFTER_REVISE
+
+include("errors.jl");       @reexport using .Errors
+include("util.jl");         @reexport using .Util
+include("types.jl");        @reexport using .Types 
+include("crypto.jl");       @reexport using .Crypto
+include("cookies.jl");      @reexport using .Cookies
+include("constants.jl");    @reexport using .Constants
+include("context.jl");      @reexport using .AppContext
+include("handlers.jl");     @reexport using .Handlers
+include("middleware.jl");   @reexport using .Middleware
+include("routerhof.jl");    @reexport using .RouterHOF
+include("reflection.jl");   @reexport using .Reflection
+include("extractors.jl");   @reexport using .Extractors
+include("response.jl");     @reexport using .Res
+include("routing.jl");      @reexport using .Routing
+
+export start, serve, serveparallel, terminate,
+    internalrequest, staticfiles, dynamicfiles, spafiles
+
+"""
+    Base.getproperty(req::HTTP.Request, sym::Symbol)
+
+Extend HTTP.Request to provide DX-friendly shorthand access to common properties:
+- `req.params`: Returns path parameters
+- `req.query`: Returns query parameters 
+- `req.session`: Returns the session dictionary from context (if present)
+- `req.ip`: Returns the caller's IP address from context
+"""
+function Base.getproperty(req::HTTP.Request, sym::Symbol)
+    if sym === :params
+        return HTTP.getparams(req)
+    elseif sym === :query
+        return Types.queryvars(req)
+    elseif sym === :session
+        return Base.get(req.context, :session, nothing)
+    elseif sym === :ip
+        return Base.get(req.context, :ip, nothing)
+    else
+        return getfield(req, sym)
+    end
+end
+
+nitro_title = raw"""
+   ____                            
+  / __ \_  ____  ______ ____  ____ 
+ / / / / |/_/ / / / __ `/ _ \/ __ \
+/ /_/ />  </ /_/ / /_/ /  __/ / / /
+\____/_/|_|\__, /\__, /\___/_/ /_/ 
+          /____//____/   
+
+"""
+
+function serverwelcome(external_url::String, prefix::Nullable{String}, parallel::Bool)
+    printstyled(nitro_title, color=:blue, bold=true)
+    server_url = join_url_path(external_url, prefix)
+    @info "📦 Version 1.10.0 (2026-01-01)"
+    if !isnothing(prefix)
+        @info "🏷️  Global path prefix: $prefix"
+    end
+    @info "✅ Started server: $server_url"
+    if parallel
+        @info "🚀 Running in parallel mode with $(Threads.nthreads()) threads"
+        # Add a warning if the interactive threadpool is empty when running in parallel mode
+        if nthreads(:interactive) == 0
+            @warn """
+            🚨 Interactive threadpool is empty. This can hurt performance when running in parallel mode.
+            Try launching julia like \"julia --threads 3,1\" to add 1 thread to the interactive threadpool.
+            """
+        end  
+    end
+end
+
+
+function ReviseHandler()
+    return function (handle)
+        return function (req::HTTP.Request)
+            Revise = Main.Revise
+            if !isempty(Revise.revision_queue)
+                @info "🔴 Starting pre-request revision"
+                Revise.revise()
+                @info "🟢 Pre-request revision finished"
+            end
+            invokelatest(handle, req)
+        end
+    end
+end
+
+"""
+    serve(; middleware::Vector=[], handler=stream_handler, host="127.0.0.1", port=8080, async=false, parallel=false, serialize=true, catch_errors=true, docs=true, metrics=true, show_errors=true, show_banner=true, docs_path="/docs", schema_path="/schema", external_url=nothing, revise, kwargs...)
+
+Start the webserver with your own custom request handler
+"""
+function serve(ctx::ServerContext;
+    middleware  = [],
+    handler     = stream_handler,
+    host        = "127.0.0.1",
+    port        = 8080,
+    async       = false,
+    parallel    = true,
+    serialize   = true,
+    catch_errors= true,
+    show_errors = true,
+    show_banner = true,
+    external_url = nothing,
+    prefix      = nothing,
+    context     = missing,
+    revise      = :none, # :none, :lazy, :eager
+    secret_key  = nothing,
+    httponly    = nothing,
+    secure      = nothing,
+    samesite    = nothing,
+    kwargs...) :: Server
+
+    if !ismissing(context)
+        ctx.app_context[] = Context(context)
+    end
+
+    # initialize cookie configuration
+    # we only overwrite the fields that are explicitly passed to serve()
+    current = ctx.service.cookies[]
+    ctx.service.cookies[] = CookieConfig(
+        secret_key = isnothing(secret_key) ? current.secret_key : secret_key,
+        httponly = isnothing(httponly) ? current.httponly : httponly,
+        secure   = isnothing(secure)   ? current.secure   : secure,
+        samesite = isnothing(samesite) ? current.samesite : samesite,
+        path     = current.path,
+        domain   = current.domain,
+        maxage   = current.maxage,
+        expires  = current.expires,
+        max_cookie_size = current.max_cookie_size
+    )
+
+    # set the external url if it's passed
+    ctx.service.external_url[] = external_url isa String ? external_url : "http://$host:$port"
+
+    # Set the global path prefix (defaults to nothing)
+    ctx.service.prefix[] = prefix isa String ? prefix : nothing
+    
+    # intitialize app_context
+
+
+    # setup revise if requested
+    if revise == :lazy || revise == :eager
+        if parallel
+            @warn "You are attempting to use Revise with multiple threads. Please note that Revise 3.5.18 and earlier are not threadsafe."
+        end
+        if !WAS_LOADED_AFTER_REVISE[]
+            error("You must load Revise.jl before Nitro.jl to use the `revise` option")
+        end
+        if ctx.mod === nothing
+            @warn "You are trying to use the `revise` option without @oxidize. Code in the `Main` module, which likely includes your routes, will not be tracked and revised."
+        end
+        middleware = convert(Vector{Any}, middleware)
+        insert!(middleware, 1, ReviseHandler())
+    end
+
+    # compose our middleware ahead of time (so it only has to be built up once)
+    configured_middelware = setupmiddleware(ctx; middleware, serialize, catch_errors, show_errors)
+
+    # setup the primary stream handler function (can be customized by the caller)
+    handle_stream = handler(configured_middelware)
+
+    if parallel
+
+        if Threads.nthreads() <= 1
+            @warn "serveparallel() only has 1 thread available to use, try launching julia like this: \"julia -t auto\" to leverage multiple threads"
+        end
+
+        if haskey(kwargs, :queuesize)
+            @warn "Deprecated: The `queuesize` parameter is no longer used / supported in serveparallel()"
+        end
+
+        # wrap top level handler with parallel handler
+        handle_stream = parallel_stream_handler(handle_stream)
+    end
+
+    if revise == :eager
+        ctx.service.eager_revise[] = start_revise_service()
+    end
+
+    # The cleanup of resources are put at the topmost level in `methods.jl`
+    try
+        return startserver(ctx; host, port, show_banner, parallel, async, kwargs, start=(kwargs) ->
+            HTTP.serve!(handle_stream, host, port; kwargs...))
+    finally
+        if ctx.service.eager_revise[] !== nothing && async == false
+            close(ctx.service.eager_revise[])
+        end
+    end
+end
+
+function start_revise_service()
+    revise_task_done = Ref(false)
+    revise_task = @async begin
+        Revise = Main.Revise
+        while true
+            if revise_task_done[]
+                break
+            end
+            wait(Revise.revision_event)
+            if revise_task_done[]
+                break
+            end
+            @info "🗘  Starting eager revision"
+            Revise.revise()
+            @info "👍 Eager revision finished"
+        end
+    end
+    EagerReviseService(revise_task, revise_task_done)
+end
+
+
+"""
+    terminate(ctx)
+
+Gracefully shuts down the webserver
+"""
+function terminate(context::ServerContext)
+    if isopen(context.service)
+        # cleanup lifecycle middleware
+        shutdown.(context.service.lifecycle_middleware)
+        empty!(context.service.lifecycle_middleware)
+
+        # clear any cached middleware strategies so new servers pick up updated middleware
+        empty!(context.service.middleware_cache)
+
+        # Set the external url to nothing when the server is terminated
+        context.service.external_url[] = nothing
+
+        # stop the server
+        close(context.service)
+    end
+end
+
+
+
+"""
+    decorate_request(ip::IPAddr)
+
+This function can be used to add additional usefull metadata to the incoming 
+request context dictionary. At the moment, it just inserts the caller's ip address
+"""
+function decorate_request(ip::IPAddr, stream::HTTP.Stream)
+    return function (handle)
+        return function (req::HTTP.Request)
+            req.context[:ip] = ip
+            req.context[:stream] = stream
+            handle(req)
+        end
+    end
+end
+
+"""
+This is our root stream handler used in both serve() and serveparallel().
+This function determines how we handle all incoming requests
+"""
+
+function stream_handler(middleware::Function)
+    return function (stream::HTTP.Stream)
+        # extract the caller's ip address
+        ip, _ = Sockets.getpeername(stream)
+        # build up a streamhandler to handle our incoming requests
+        handle_stream = HTTP.streamhandler(middleware |> decorate_request(ip, stream))
+        # handle the incoming request
+        return handle_stream(stream)
+    end
+end
+
+
+"""
+    parallel_stream_handler(handle_stream::Function)
+
+This function uses `Threads.@spawn` to schedule a new task on any available thread. 
+Inside this task, `@async` is used for cooperative multitasking, allowing the task to yield during I/O operations. 
+"""
+function parallel_stream_handler(handle_stream::Function)
+    function (stream::HTTP.Stream)
+        task = Threads.@spawn begin
+            handle = @async handle_stream(stream)
+            wait(handle)
+        end
+        wait(task)
+    end
+end
+
+"""
+Compose the user & internally defined middleware functions together. Practically, this allows
+users to 'chain' middleware functions like `serve(handler1, handler2, handler3)` when starting their 
+application and have them execute in the order they were passed (left to right) for each incoming request
+"""
+function setupmiddleware(ctx::ServerContext; middleware::Vector=[], serialize::Bool=true, catch_errors::Bool=true, show_errors=true)::Function
+
+    # determine if we have any special router or route-specific middleware
+    raw_middleware = reverse(middleware)
+    
+    processed_middleware = process_middleware(ctx, raw_middleware)
+
+    custom_middleware = if !isempty(ctx.service.custommiddleware)
+        [compose(ctx.service.router, ctx.service.middleware_cache_lock, processed_middleware, ctx.service.custommiddleware, ctx.service.middleware_cache)]
+    else
+        processed_middleware
+    end
+
+    # If a global prefix is passed, then we inject middleware to remove the prefix at runtime before routing
+    global_prefix_middleware = !isnothing(ctx.service.prefix[]) ? [PrefixStripMiddleware(ctx.service.prefix[])] : []
+
+    # check if we should use our default serialization middleware function
+    serializer = serialize ? [DefaultSerializer(catch_errors; show_errors)] : []
+
+    # combine all our middleware functions
+    # Middleware execution is linear:
+    # 1. Global Prefix (Outer-most)
+    # 2. Custom User Middleware
+    # 3. Serializer
+    # 4. Router (Inner-most)
+    return reduce(|>, [
+        ctx.service.router,
+        serializer...,
+        custom_middleware...,
+        global_prefix_middleware...
+    ])
+end
+
+
+"""
+Internal helper function to launch the server in a consistent way
+"""
+function startserver(ctx::ServerContext; host, port, show_banner=false, parallel=false, async=false, kwargs, start)::Server
+
+    show_banner && serverwelcome(ctx.service.external_url[], ctx.service.prefix[], parallel)
+
+    # start the HTTP server
+    ctx.service.server[] = start(preprocesskwargs(kwargs))
+
+    # Signal start of server to LifecycleMiddleware functions
+    startup.(ctx.service.lifecycle_middleware)
+
+    if !async
+        try
+            wait(ctx.service)
+        catch error
+            !isa(error, InterruptException) && @error "ERROR: " exception = (error, catch_backtrace())
+        finally
+            println() # this pushes the "[ Info: Server on 127.0.0.1:8080 closing" to the next line
+        end
+    end
+
+    return ctx.service.server[]
+end
+
+
+"""
+Used to overwrite defaults to any incoming keyword arguments
+"""
+function preprocesskwargs(kwargs)
+    kwargs_dict = Dict{Symbol,Any}(kwargs)
+
+    # always set to streaming mode (regardless of what was passed)
+    kwargs_dict[:stream] = true
+
+    # user passed no loggin preferences - use defualt logging format 
+    if isempty(kwargs_dict) || !haskey(kwargs_dict, :access_log)
+        kwargs_dict[:access_log] = logfmt"$time_iso8601 - $remote_addr:$remote_port - \"$request\" $status"
+    end
+
+    return kwargs_dict
+end
+
+
+"""
+    internalrequest(req::HTTP.Request; middleware::Vector=[], serialize::Bool=true, catch_errors::Bool=true)
+
+Directly call one of our other endpoints registered with the router, using your own middleware
+and bypassing any globally defined middleware
+"""
+function internalrequest(ctx::ServerContext, req::HTTP.Request; middleware::Vector=[], serialize::Bool=true, catch_errors=true, context=missing)::HTTP.Response
+    req.context[:ip] = IPv4("127.0.0.1") # label internal requests
+
+    # Temporarily set the context if provided
+    old_ctx = ctx.app_context[]
+    if !ismissing(context)
+        ctx.app_context[] = Context(context)
+    end
+
+    try
+        return req |> setupmiddleware(ctx; middleware, serialize, catch_errors)
+    finally
+        # restore the old context
+        if !ismissing(context)
+            ctx.app_context[] = old_ctx
+        end
+    end
+end
+
+"""
+If a global prefix is passed through the serve() function then we want to inject a 
+middleware function to intercept requests and strip off the prefix so it's compatible 
+with the actual registered routes - which doesn't include the prefix.
+"""
+function PrefixStripMiddleware(prefix::String)
+    plen = length(prefix)
+    NOT_FOUND = HTTP.Response(404, "Not Found")
+    return function (handler)
+        return function (req::HTTP.Request)
+            if startswith(req.target, prefix)
+                newtarget = req.target[plen+1:end]
+                req.target = isempty(newtarget) ? "/" : newtarget
+                return handler(req)
+            else
+                return NOT_FOUND
+            end
+        end
+    end
+end
+
+
+
+"""
+Create a default serializer function that handles HTTP requests and formats the responses.
+"""
+function DefaultSerializer(catch_errors::Bool; show_errors::Bool)
+    return function (handle)
+        return function (req::HTTP.Request)
+            return handlerequest(catch_errors; show_errors) do
+                response = handle(req)
+                format_response!(req, response)
+                return req.response
+            end
+        end
+    end
+end
+
+
+
+# Case 1: If we are given a string - just return it
+function parse_route(::String, route::String) :: String
+    return route 
+end
+
+# Case 2: Call OuterRouter with default args to get InnerRouter, then call with http_method
+function parse_route(http_method::String, router::OuterRouter) :: String
+    inner_router::InnerRouter = router()
+    return inner_router(http_method)
+end
+
+# Case 3: Call InnerRouter with http_method to get the final path
+function parse_route(http_method::String, router::InnerRouter) :: String
+    return router(http_method)
+end
+
+
+function parse_func_params(route::String, func::Function)
+
+    """
+    Parsing Rules:
+        1. path parameters are detected by their presence in the route string
+        2. query parameters are not in the route string and can have default values
+        3. path extractors can be used instead of traditional path parameters
+        4. extractors can be used alongside traditional path & query params
+    """
+
+    info = splitdef(func, start=2) # skip the identifying first arg 
+
+    # collect path param definitions from the route string
+    hasBraces = r"({)|(})"
+    route_params = Vector{Symbol}()
+    for value in HTTP.URIs.splitpath(route)
+        if contains(value, hasBraces)
+            variable = replace(value, hasBraces => "") |> strip
+            push!(route_params, Symbol(variable))
+        end
+    end
+
+    # Identify all path & query params (can be declared as regular variables or extractors)
+    pathnames = Vector{Symbol}()
+    querynames = Vector{Symbol}()
+    headernames = Vector{Symbol}()
+    cookienames = Vector{Symbol}()
+    bodynames = Vector{Symbol}()
+
+    path_params = []
+    query_params = []
+    header_params = []
+    cookie_params = []
+    body_params = []
+
+    for param in info.args
+
+        # case 1: it's an Context type it will be injected by the framework (so we skip it)
+        if param.type <: Context
+            continue
+
+        # case 2: it's an extractor type
+        elseif param.type <: Extractor
+
+            innner_type = param.type |> extracttype
+            # push the variables from the struct into the params array
+            if param.type <: Path
+                append!(pathnames, fieldnames(innner_type))
+                push!(path_params, param)
+            elseif param.type <: Query
+                append!(querynames, fieldnames(innner_type))
+                push!(query_params, param)
+            elseif param.type <: Header
+                append!(headernames, fieldnames(innner_type))
+                push!(header_params, param)
+            elseif param.type <: Session
+                push!(cookienames, param.name)
+                push!(cookie_params, param)
+            elseif param.type <: Cookie
+                push!(cookienames, param.name)
+                push!(cookie_params, param)
+            else
+                append!(bodynames, fieldnames(innner_type))
+                push!(body_params, param)
+            end
+
+        # case 3: It's a path parameter
+        elseif param.name in route_params
+            push!(pathnames, param.name)
+            push!(path_params, param)
+
+        # Case 4: It's a query parameter
+        else
+            push!(querynames, param.name)
+            push!(query_params, param)
+        end
+    end
+
+    # make sure all the path params are present in the route
+    if !isempty(route_params)
+        missing_params = [
+            route_param
+            for route_param in route_params
+            if !any(path_param -> path_param == route_param, pathnames)
+        ]
+        if !isempty(missing_params)
+            throw(ArgumentError("Your request handler is missing path parameters: {$(join(missing_params, ", "))} defined in this route: $route"))
+        end
+    end
+
+    return (
+        info=info, pathparams=path_params,
+        pathnames=pathnames, queryparams=query_params,
+        querynames=querynames, headers=header_params,
+        headernames=headernames, cookies=cookie_params,
+        cookienames=cookienames, bodyargs=body_params,
+        bodynames=bodynames
+    )
+end
+
+
+"""
+    register(ctx::ServerContext, httpmethod::String, route::String, func::Function)
+
+Register a request handler function with a path to the ROUTER
+"""
+function register(ctx::ServerContext, httpmethod::String, route::Union{String,HOFRouter}, func::Function)
+    # Parse & validate path parameters
+    route = parse_route(httpmethod, route)
+    func_details = parse_func_params(route, func)
+
+
+
+    # Register the route with the router
+    registerhandler(ctx, ctx.service.router, httpmethod, route, func, func_details)
+end
+
+
+"""
+This registers a route wihout generating any documentation for it. Used primarily for internal routes like 
+docs and metrics
+"""
+function register_internal(ctx::ServerContext, router::Router, httpmethod::String, route::Union{String,HOFRouter}, func::Function)
+    # Parse & validate path parameters
+    route = parse_route(httpmethod, route)
+    func_details = parse_func_params(route, func)
+
+    # Register the route with the router
+    registerhandler(ctx, router, httpmethod, route, func, func_details)
+end
+
+
+"""
+Generate the parser strategy to apply to incoming requests. It will return a function 
+which accepts a HTTP.Request and returns a Vector of the parsed parameters
+"""
+function create_param_parser(ctx::ServerContext, func_details)
+    info = func_details.info
+    pathparams = func_details.pathnames
+    queryparams = func_details.querynames
+
+    strategies = Vector{Function}()
+
+    """
+    Listed below are the different parsing strategies that can 
+    be used on incoming HTTP Requests
+    """
+
+    function context_strategy(_::LazyRequest)
+        return ctx.app_context[]
+    end
+
+    function extractor_strategy(lr::LazyRequest, param::Param{T}) where T
+        return extract(param, lr)
+    end
+
+    function cookie_strategy(lr::LazyRequest, param::Param{T}) where T
+        return extract(param, lr, ctx.service.cookies[].secret_key)
+    end
+
+    function session_strategy(lr::LazyRequest, param::Param{T}) where T
+        return extract(param, lr, ctx.service.cookies[].secret_key, ctx.app_context[])
+    end
+
+    function pathparam_strategy(lr::LazyRequest, param::Param{T}, name::String) where T
+        raw_pathparams = Types.pathparams(lr)
+        return parseparam(param.type, raw_pathparams[name])
+    end
+
+    function queryparam_strategy(lr::LazyRequest, param::Param{T}, name::String) where T
+        raw_queryparams = Types.queryvars(lr)
+        if !haskey(raw_queryparams, name) && param.hasdefault
+            return param.default
+        else
+            return parseparam(param.type, raw_queryparams[name])
+        end
+    end
+
+    function queryparam_strategy_no_default(lr::LazyRequest, param::Param{T}, name::String) where T
+        raw_queryparams = Types.queryvars(lr)
+        return parseparam(param.type, raw_queryparams[name])
+    end
+
+    """
+    Figure out which strategy to use for each parameter, 
+    based on the parameter's type, name, and position
+    """
+    for param in info.sig
+        name = param.name
+        str_name = String(name)
+        if param.type <: Context
+            push!(strategies, context_strategy)
+        elseif param.type <: Session
+            push!(strategies, lr -> session_strategy(lr, param))
+        elseif param.type <: Cookie
+            push!(strategies, lr -> cookie_strategy(lr, param))
+        elseif param.type <: Extractor
+            push!(strategies, lr -> extractor_strategy(lr, param))
+        elseif name in pathparams
+            push!(strategies, lr -> pathparam_strategy(lr, param, str_name))
+        elseif name in queryparams
+            query_parsing_strat = param.hasdefault ? queryparam_strategy : queryparam_strategy_no_default
+            push!(strategies, lr -> query_parsing_strat(lr, param, str_name))
+        end
+    end
+
+    strat_length = length(strategies)
+
+    # The final function is used to apply the strategies and extract the parameters
+    return function(req::HTTP.Request)
+        lr = LazyRequest(request=req)
+        results = Vector{Any}(undef, strat_length)
+        @inbounds for i in 1:strat_length
+            results[i] = strategies[i](lr)
+        end
+        return results
+    end
+end
+
+
+function registerhandler(ctx::ServerContext, router::Router, httpmethod::String, route::String, func::Function, func_details::NamedTuple)
+
+    # Get information about the function's arguments
+    method = first(methods(func))
+    no_args = method.nargs == 1
+
+    # check if handler has a :request kwarg
+    info = func_details.info
+    has_req_kwarg = :request in Base.kwarg_decl(method)
+    has_ctx_kwarg = :context in Base.kwarg_decl(method)
+
+    has_path_params = !isempty(info.args)
+
+    # Generate the function handler based on the input types
+    arg_type = first_arg_type(method, httpmethod)
+    func_handle = select_handler(arg_type, has_ctx_kwarg, has_req_kwarg, has_path_params, ctx; no_args=no_args)
+
+    # Generate the parameter parsing strategy for each endpoint
+    parse_params = create_param_parser(ctx, func_details)
+
+    # Generate the parameter parsing strategy for each endpoint
+    parse_params = create_param_parser(ctx, func_details)
+
+    # Figure out if we need to include parameter parsing logic for this route
+    if isempty(info.sig)
+        handle = function (req::HTTP.Request)
+            func_handle(req, func)
+        end
+    else
+        handle = function (req::HTTP.Request)
+            params = parse_params(req)
+            func_handle(req, func; parameters=params)
+        end
+    end
+
+    # Use method aliases for special methods
+    resolved_httpmethod = get(METHOD_ALIASES, httpmethod, httpmethod)
+
+    HTTP.register!(router, resolved_httpmethod, route, handle)
+end
+
+
+
+
+
+
+
+"""
+    staticfiles(folder::String, mountdir::String; headers::Vector{Pair{String,String}}=[], loadfile::Union{Function,Nothing}=nothing)
+
+Mount all files inside the /static folder (or user defined mount point). 
+The `headers` array will get applied to all mounted files
+"""
+function staticfiles(
+    ctx::ServerContext,
+    router::HTTP.Router,
+    folder::String,
+    mountdir::String="static";
+    headers::Vector=[],
+    loadfile::Nullable{Function}=nothing
+)
+    # remove the leading slash 
+    if first(mountdir) == '/'
+        mountdir = mountdir[2:end]
+    end
+    function addroute(currentroute, filepath)
+        resp = file(filepath; loadfile=loadfile, headers=headers)
+        register_internal(ctx, router, GET, currentroute, () -> resp)
+    end
+    mountfolder(folder, mountdir, addroute)
+end
+
+"""
+    spafiles(folder::String, mountdir::String="static"; headers::Vector{Pair{String,String}}=[], loadfile::Union{Function,Nothing}=nothing)
+
+Mount all files inside the /static folder (or user defined mount point) for a Single Page Application (SPA).
+In addition to registering all files, it also registers a catch-all route `/*` that serves `index.html` 
+for any unmatched requests, enabling SPA History Mode routing (e.g., Vue Router, React Router).
+"""
+function spafiles(
+    ctx::ServerContext,
+    router::HTTP.Router,
+    folder::String,
+    mountdir::String="static";
+    headers::Vector=[],
+    loadfile::Nullable{Function}=nothing
+)
+    # remove the leading slash 
+    if first(mountdir) == '/'
+        mountdir = mountdir[2:end]
+    end
+
+    # First, mount all the actual files
+    function addroute(currentroute, filepath)
+        resp = file(filepath; loadfile=loadfile, headers=headers)
+        register_internal(ctx, router, GET, currentroute, () -> resp)
+    end
+    mountfolder(folder, mountdir, addroute)
+
+    # Then, register the catch-all SPA fallback route to serve index.html
+    index_path = joinpath(folder, "index.html")
+    if isfile(index_path)
+        # The catch-all route in HTTP.Router uses `/**` for regex multi-level matching
+        fallback_route = mountdir == "" ? "/**" : "/$mountdir/**"
+        register_internal(ctx, router, GET, fallback_route, (req::HTTP.Request) -> file(index_path; loadfile=loadfile, headers=headers))
+    else
+        @warn "spafiles: No 'index.html' found in $folder. History mode fallback will not work."
+    end
+end
+
+
+"""
+    dynamicfiles(folder::String, mountdir::String; headers::Vector{Pair{String,String}}=[], loadfile::Union{Function,Nothing}=nothing)
+
+Mount all files inside the /static folder (or user defined mount point), 
+but files are re-read on each request. The `headers` array will get applied to all mounted files
+"""
+function dynamicfiles(
+    ctx::ServerContext,
+    router::Router,
+    folder::String,
+    mountdir::String="static";
+    headers::Vector=[],
+    loadfile::Nullable{Function}=nothing
+)
+    # remove the leading slash 
+    if first(mountdir) == '/'
+        mountdir = mountdir[2:end]
+    end
+    function addroute(currentroute, filepath)
+        register_internal(ctx, router, GET, currentroute, () -> file(filepath; loadfile=loadfile, headers=headers))
+    end
+    mountfolder(folder, mountdir, addroute)
+end
+
+end
