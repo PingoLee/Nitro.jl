@@ -47,7 +47,7 @@ end
 # Set up router with AuthMiddleware
 auth = router("/auth", middleware=[BearerAuth(validate_token)])
 
-route(["GET"], auth("/protected") function(req)
+route(["GET"], auth("/protected"), function(req)
     # Return user info from context
     user = req.context[:user]
     return HTTP.Response(200, "Hello, $(user[:name])!")

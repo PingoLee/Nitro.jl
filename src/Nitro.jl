@@ -36,8 +36,8 @@ end
 
 export  @oxidize, @oxidise,
         # Server lifecycle
-        serve, terminate, internalrequest,
-        resetstate, instance, router, route,
+    serve, terminate, internalrequest,
+    resetstate, instance, router,
         # File serving
         staticfiles, dynamicfiles, spafiles,
         # Util

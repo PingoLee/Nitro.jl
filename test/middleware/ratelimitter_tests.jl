@@ -9,11 +9,11 @@ using ..Constants
 
 limit = router("/limited", middleware=[RateLimiter(rate_limit=50, window_period=Second(3))])
 
-route(["GET"], limit("/goodbye", middleware=[RateLimiter(rate_limit=25, window=Second(3))]) function()
+route(["GET"], limit("/goodbye", middleware=[RateLimiter(rate_limit=25, window=Second(3))]), function()
     return "goodbye"
 end)
 
-route(["GET"], limit("/greet") function()
+route(["GET"], limit("/greet"), function()
     return "hello"
 end)
 

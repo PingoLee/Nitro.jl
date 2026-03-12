@@ -54,7 +54,10 @@ function SessionMiddleware(;
     secret_key::Nullable{String} = nothing,
     max_age::Int = 86400,
     store::MemoryStore{String, Dict{String,Any}} = DEFAULT_STORE,
-    prune_probability::Float64 = 0.01)
+    prune_probability::Float64 = 0.01,
+    secure::Bool = true,
+    httponly::Bool = true,
+    samesite::String = "Lax")
 
     return function(handle::Function)
         return function(req::HTTP.Request)
@@ -92,9 +95,9 @@ function SessionMiddleware(;
                 cookie_str = format_cookie(
                     cookie_name, cookie_value;
                     path="/",
-                    httponly=true,
-                    secure=true,
-                    samesite="Lax",
+                    httponly=httponly,
+                    secure=secure,
+                    samesite=samesite,
                     maxage=max_age
                 )
                 push!(response.headers, "Set-Cookie" => cookie_str)

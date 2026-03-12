@@ -29,6 +29,7 @@ urlpatterns(CONTEXT[], "/api/v1",
 """
 
 using HTTP
+using UUIDs: UUID
 
 using ..AppContext: ServerContext
 using ..Types: Nullable, RouteDefinition
@@ -44,6 +45,7 @@ const CONVERTERS = Dict{String, Type}(
     "str"   => String,
     "float" => Float64,
     "bool"  => Bool,
+    "uuid"  => UUID,
 )
 
 # ─── Path Converter Parser ───────────────────────────────────────────
@@ -85,7 +87,7 @@ end
 
 Define a single route using Django-style path syntax.
 
-Path converters: `<int:name>`, `<str:name>`, `<float:name>`, `<bool:name>`.
+Path converters: `<int:name>`, `<str:name>`, `<float:name>`, `<bool:name>`, `<uuid:name>`.
 """
 function path(pattern::String, handler::Function; 
     method::String = "GET",

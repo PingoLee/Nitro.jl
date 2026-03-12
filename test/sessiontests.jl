@@ -9,6 +9,7 @@
 
 using Nitro
 using Nitro.Types
+import Nitro: route
 using Test
 using HTTP
 
@@ -149,6 +150,32 @@ end
         end
         
         @test all(results .== ["user-$i" for i in 1:n])
+    end
+
+    @testset "SessionMiddleware cookie configuration" begin
+        store = MemoryStore{String, Dict{String,Any}}()
+        middleware = SessionMiddleware(
+            cookie_name="local_session",
+            max_age=120,
+            store=store,
+            prune_probability=0.0,
+            secure=false,
+            httponly=false,
+            samesite="Strict"
+        )
+
+        handler = function(req::HTTP.Request)
+            req.session["user_id"] = 77
+            return HTTP.Response(200, "configured")
+        end
+
+        response = middleware(handler)(HTTP.Request("GET", "/login"))
+        cookie_header = HTTP.header(response, "Set-Cookie")
+
+        @test occursin("local_session=", cookie_header)
+        @test !occursin("Secure", cookie_header)
+        @test !occursin("HttpOnly", cookie_header)
+        @test occursin("SameSite=Strict", cookie_header)
     end
 
 end

@@ -27,7 +27,7 @@ end
 
 index = router(middleware=[CorsHandler])
 
-route(["GET"], index("/") function(req)
+route(["GET"], index("/"), function(req)
     return "Hello World"
 end)
 

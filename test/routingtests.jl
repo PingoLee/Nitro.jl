@@ -3,6 +3,7 @@
 using Test
 using HTTP
 using Nitro
+using UUIDs
 using Nitro: path, urlpatterns, include_routes, convert_django_path, RouteDefinition, GET, POST, PUT, DELETE
 
 # ─── Test: convert_django_path ────────────────────────────────────────
@@ -28,6 +29,11 @@ using Nitro: path, urlpatterns, include_routes, convert_django_path, RouteDefini
     nitro_path, hints = convert_django_path("/toggle/<bool:enabled>")
     @test nitro_path == "/toggle/{enabled}"
     @test hints[:enabled] == Bool
+
+    # UUID converter
+    nitro_path, hints = convert_django_path("/keys/<uuid:key>")
+    @test nitro_path == "/keys/{key}"
+    @test hints[:key] == UUID
 
     # No converters (plain path)
     nitro_path, hints = convert_django_path("/static/page")
@@ -64,6 +70,10 @@ end
     rd = path("/users/<int:id>", handler)
     @test rd.pattern == "/users/{id}"
     @test rd.type_hints[:id] == Int
+
+    rd = path("/keys/<uuid:key>", handler)
+    @test rd.pattern == "/keys/{key}"
+    @test rd.type_hints[:key] == UUID
 
     # With name
     rd = path("/users/<int:id>", handler, name="user-detail")

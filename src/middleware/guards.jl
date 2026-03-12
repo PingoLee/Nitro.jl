@@ -19,10 +19,10 @@ pre-handler functions that run before the route handler.
 ## Built-in Guard Factories
 
 ### `login_required(; redirect_url="/login")`
-Checks for `req.context[:session]["user_id"]`. Redirects if not found.
+Checks for `req.session["user_id"]`. Redirects if not found.
 
 ### `role_required(role::String)`
-Checks for `req.context[:session]["role"]`. Returns 403 if mismatch.
+Checks for `req.session["role"]`. Returns 403 if mismatch.
 
 ## Example
 ```julia
@@ -80,7 +80,7 @@ path("/dashboard", handler, middleware=[GuardMiddleware(login_required())])
 """
 function login_required(; redirect_url::String="/login", session_key::String="user_id")
     return function(req::HTTP.Request)
-        session = get(req.context, :session, Dict{String,Any}())
+        session = isnothing(req.session) ? Dict{String,Any}() : req.session
         if !haskey(session, session_key)
             return HTTP.Response(302, ["Location" => redirect_url])
         end
@@ -104,7 +104,7 @@ path("/admin", handler, middleware=[GuardMiddleware(
 """
 function role_required(role::String; session_key::String="role")
     return function(req::HTTP.Request)
-        session = get(req.context, :session, Dict{String,Any}())
+        session = isnothing(req.session) ? Dict{String,Any}() : req.session
         user_role = get(session, session_key, nothing)
         if isnothing(user_role) || user_role != role
             return HTTP.Response(403, ["Content-Type" => "application/json"], 

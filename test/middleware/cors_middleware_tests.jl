@@ -9,20 +9,20 @@ module RouterLevelTests
 
     # Set up router with CORS middleware (default config)
     cors_router = router("/cors", middleware=[Cors()])
-    route(["GET", "OPTIONS"] cors_router("/hello") function()
+    route(["GET", "OPTIONS"], cors_router("/hello"), function()
         return "ok"
     end)
 
     # Custom config: allow_credentials and max_age
     custom_router = router("/customcors", middleware=[Cors(allowed_origins=["https://example.com"], allow_credentials=true, max_age=600)])
-    route(["GET", "OPTIONS"] custom_router("/test") function() 
+    route(["GET", "OPTIONS"], custom_router("/test"), function() 
         return "custom" 
     end)
 
     # Start server for tests
 
     custom_header_router = router("/extracors", middleware=[Cors(extra_headers=["Access-Control-Expose-Headers" => "X-My-Header", "X-Test-Header" => "TestValue"])])
-    route(["GET", "OPTIONS"] custom_header_router("/custom") function()
+    route(["GET", "OPTIONS"], custom_header_router("/custom"), function()
         return "custom headers"
     end)
 

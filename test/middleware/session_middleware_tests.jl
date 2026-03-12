@@ -44,6 +44,41 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
         set_cookie_headers = filter(h -> lowercase(h.first) == "set-cookie", response.headers)
         @test length(set_cookie_headers) >= 1
         @test occursin("test_session=", set_cookie_headers[1].second)
+        @test occursin("HttpOnly", set_cookie_headers[1].second)
+        @test occursin("Secure", set_cookie_headers[1].second)
+        @test occursin("SameSite=Lax", set_cookie_headers[1].second)
+    end
+
+    @testset "session cookie attributes are configurable" begin
+        store = MemoryStore{String, Dict{String,Any}}()
+
+        mw = SessionMiddleware(
+            cookie_name="dev_session",
+            max_age=3600,
+            store=store,
+            prune_probability=0.0,
+            secure=false,
+            httponly=false,
+            samesite="Strict"
+        )
+
+        handler = function(req::HTTP.Request)
+            req.context[:session]["mode"] = "dev"
+            return HTTP.Response(200, "OK")
+        end
+
+        response = mw(handler)(HTTP.Request("GET", "/test"))
+
+        @test response.status == 200
+
+        set_cookie_headers = filter(h -> lowercase(h.first) == "set-cookie", response.headers)
+        @test length(set_cookie_headers) == 1
+
+        cookie_header = set_cookie_headers[1].second
+        @test occursin("dev_session=", cookie_header)
+        @test !occursin("HttpOnly", cookie_header)
+        @test !occursin("Secure", cookie_header)
+        @test occursin("SameSite=Strict", cookie_header)
     end
 
     @testset "session data modification" begin

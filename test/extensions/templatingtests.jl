@@ -5,6 +5,10 @@ using HTTP
 using Mustache
 using OteraEngine
 using Nitro
+import Nitro: route
+
+const TEST_CONTENT_DIR = normpath(joinpath(@__DIR__, "..", "content"))
+content_path(parts...) = joinpath(TEST_CONTENT_DIR, parts...)
 
 function clean_output(result::String)
     # Replace carriage returns followed by line feeds (\r\n) with a single newline (\n)
@@ -78,25 +82,25 @@ Well, 6000.0 dollars, after taxes.
 
 
     @testset "mustache() from file no content type" begin 
-        render = mustache("./content/mustache_template.txt", from_file=true)
+        render = mustache(content_path("mustache_template.txt"), from_file=true)
         response = render(data)
         @test response.body |> String |> clean_output == expected_output
     end
 
     @testset "mustache() from file w/ content type" begin 
-        render = mustache("./content/mustache_template.txt", mime_type="text/plain", from_file=true)
+        render = mustache(content_path("mustache_template.txt"), mime_type="text/plain", from_file=true)
         response = render(data)
         @test response.body |> String |> clean_output == expected_output
     end
 
     @testset "mustache() from file with no content type" begin 
-        render = open(mustache, "./content/mustache_template.txt")
+        render = open(mustache, content_path("mustache_template.txt"))
         response = render(data)
         @test response.body |> String |> clean_output == expected_output
     end
 
     @testset "mustache() from file with content type" begin 
-        render = open(io -> mustache(io; mime_type="text/plain"), "./content/mustache_template.txt")
+        render = open(io -> mustache(io; mime_type="text/plain"), content_path("mustache_template.txt"))
         response = render(data)
         @test response.body |> String |> clean_output == expected_output
     end
@@ -120,7 +124,7 @@ Well, 6000.0 dollars, after taxes.
 
         mus_str = mustache(mustache_template_str)
         mus_tpl = mustache(mustache_template)
-        mus_file = mustache("./content/mustache_template.txt", from_file=true)
+        mus_file = mustache(content_path("mustache_template.txt"), from_file=true)
         
         route(["GET"], "/mustache/string", function()
             return mus_str(data)
@@ -227,13 +231,13 @@ Well, 6000.0 dollars, after taxes.
 
         data = Dict(:name => "watasu", :age => 15)
 
-        render = otera("./content/otera_template.html", from_file=true)
+        render = otera(content_path("otera_template.html"), from_file=true)
         result = render(data)
         x =  result.body |> String |> clean_output
         @test result.body |> String |> clean_output == expected_output
 
         # with explicit content type
-        render = open(io -> otera(io; mime_type="text/html"), "./content/otera_template.html")
+        render = open(io -> otera(io; mime_type="text/html"), content_path("otera_template.html"))
         result = render(data)
         @test result.body |> String |> clean_output == expected_output
     end
@@ -261,11 +265,11 @@ Well, 6000.0 dollars, after taxes.
         </html>
         """ |> remove_trailing_newline
 
-        render = otera("./content/otera_template_no_vars.html", from_file=true)
+        render = otera(content_path("otera_template_no_vars.html"), from_file=true)
         result = render()
         @test result.body |> String |> clean_output == expected_output
 
-        render = otera("./content/otera_template_no_vars.html", mime_type="text/html", from_file=true)
+        render = otera(content_path("otera_template_no_vars.html"), mime_type="text/html", from_file=true)
         result = render()
         @test result.body |> String |> clean_output == expected_output
     end
@@ -282,7 +286,7 @@ Well, 6000.0 dollars, after taxes.
         </html>
         """ |> remove_trailing_newline
 
-        render = otera("./content/otera_template_jl.html", from_file=true)
+        render = otera(content_path("otera_template_jl.html"), from_file=true)
         result = render(Dict(:name => "World"))
         @test result.body |> String |> clean_output == expected_output
     end

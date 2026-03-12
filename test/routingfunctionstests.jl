@@ -6,6 +6,7 @@ using Sockets
 using Dates 
 
 using Nitro
+import Nitro: route
 
 ##### Setup Routes #####
 
