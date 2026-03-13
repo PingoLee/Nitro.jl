@@ -1,4 +1,4 @@
-﻿module SessionMiddlewareTests
+module SessionMiddlewareTests
 
 using Test
 using HTTP
@@ -24,7 +24,7 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
 
         # Simulate a handler that reads the session
         handler = function(req::HTTP.Request)
-            session = get(req.context, :session, nothing)
+            session = getsession(req)
             @test !isnothing(session)       # session should be injected
             @test session isa Dict{String,Any}
             @test isempty(session)           # new session should be empty
@@ -63,7 +63,7 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
         )
 
         handler = function(req::HTTP.Request)
-            req.context[:session]["mode"] = "dev"
+            getsession(req)["mode"] = "dev"
             return HTTP.Response(200, "OK")
         end
 
@@ -93,8 +93,8 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
 
         # Handler that sets session data
         set_handler = function(req::HTTP.Request)
-            req.context[:session]["user_id"] = 42
-            req.context[:session]["username"] = "testuser"
+            getsession(req)["user_id"] = 42
+            getsession(req)["username"] = "testuser"
             return HTTP.Response(200, "set")
         end
 
@@ -135,7 +135,7 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
 
         # Handler that reads the session
         read_handler = function(req::HTTP.Request)
-            session = req.context[:session]
+            session = getsession(req)
             @test session["user_id"] == 99
             @test session["role"] == "admin"
             return HTTP.Response(200, "read")
@@ -170,7 +170,7 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
 
         # Handler checks session is fresh (empty)
         handler = function(req::HTTP.Request)
-            session = req.context[:session]
+            session = getsession(req)
             @test isempty(session)  # expired session should yield a new empty session
             return HTTP.Response(200, "fresh")
         end
@@ -203,7 +203,7 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
 
         # Handler that doesn't modify the session
         handler = function(req::HTTP.Request)
-            _ = req.context[:session]  # read but don't modify
+            _ = getsession(req)  # read but don't modify
             return HTTP.Response(200, "no-change")
         end
 
@@ -216,6 +216,54 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
         # Should NOT have a Set-Cookie header (session not modified, not new)
         set_cookie_headers = filter(h -> lowercase(h.first) == "set-cookie", response.headers)
         @test length(set_cookie_headers) == 0
+    end
+
+    @testset "custom session store backend" begin
+        # 1. Define a custom store
+        struct MockStore{K,V} <: Nitro.Core.Types.AbstractSessionStore{K,V}
+            data::Dict{K, SessionPayload{V}}
+            MockStore{K,V}() where {K,V} = new{K,V}(Dict{K, SessionPayload{V}}())
+        end
+
+        # 2. Implement the interface
+        function Base.get(store::MockStore, key, default)
+            return Base.get(store.data, key, default)
+        end
+        function Nitro.Core.Cookies.storesession!(store::MockStore{K,V}, key::K, val::V; ttl::Int=3600) where {K,V}
+            store.data[key] = SessionPayload(val, Dates.now(Dates.UTC) + Dates.Second(ttl))
+        end
+        function Nitro.Core.Cookies.prunesessions!(store::MockStore)
+            current_time = Dates.now(Dates.UTC)
+            for (k,v) in store.data
+                if v.expires <= current_time
+                    delete!(store.data, k)
+                end
+            end
+        end
+
+        store = MockStore{String, Dict{String,Any}}()
+
+        mw = SessionMiddleware(
+            cookie_name="custom_session",
+            store=store,
+            prune_probability=0.0
+        )
+
+        handler = function(req::HTTP.Request)
+            getsession(req)["custom_backend"] = true
+            return HTTP.Response(200, "custom")
+        end
+
+        wrapped = mw(handler)
+        req = HTTP.Request("GET", "/custom")
+        response = wrapped(req)
+
+        @test response.status == 200
+        
+        # Verify it went into our custom store
+        @test length(store.data) == 1
+        payload = first(values(store.data))
+        @test payload.data["custom_backend"] == true
     end
 
 end

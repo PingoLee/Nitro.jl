@@ -8,24 +8,18 @@ using ..Constants
 # Setup the first app
 app1 = instance()
 
-app1.get("/") do 
-    "welcome to server #1"
-end
-
-app1.get("/subtract/{a}/{b}") do req, a::Int, b::Int
-    Dict("answer" => a - b) |> json
-end
+app1.urlpatterns("",
+    app1.path("/", () -> "welcome to server #1"),
+    app1.path("/subtract/<int:a>/<int:b>", (req, a::Int, b::Int) -> Dict("answer" => a - b) |> json)
+)
 
 # Setup the second app
 app2 = instance()
 
-app2.get("/") do 
-    "welcome to server #2"
-end
-
-app2.get("/add/{a}/{b}") do req, a::Int, b::Int
-    Dict("answer" => a + b) |> json
-end
+app2.urlpatterns("",
+    app2.path("/", () -> "welcome to server #2"),
+    app2.path("/add/<int:a>/<int:b>", (req, a::Int, b::Int) -> Dict("answer" => a + b) |> json)
+)
 
 # start both servers together
 app1.serve(port=PORT, async=true, show_errors=false, show_banner=false)

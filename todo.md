@@ -1,4 +1,4 @@
-﻿# Nitro.jl Refactor TODO
+# Nitro.jl Refactor TODO
 
 This file tracks what Nitro itself should do, and what should live in reusable apps/packages.
 
@@ -30,7 +30,7 @@ This file tracks what Nitro itself should do, and what should live in reusable a
 - [x] Verify nested route modules work cleanly for multi-file app structures.
 
 ### Request/Response Ergonomics
-- [ ] Standardize on `req.params`, `req.query`, `req.session`, and `req.ip` for handler ergonomics.
+- [x] Standardize on `req.params`, `req.query`, `req.session`, and `req.ip` for handler ergonomics.
 - [x] Keep `Res.json()`, `Res.status()`, and `Res.send()` as the default response style in examples and docs.
 - [ ] Decide whether Nitro should provide a small request helper for merged JSON/query/form access, or leave that to app-level helpers.
 - [ ] Improve docs for request parsing so Genie users have a clear migration path.
@@ -44,7 +44,7 @@ This file tracks what Nitro itself should do, and what should live in reusable a
 
 ### Sessions
 - [ ] Keep session support in core, but make the storage contract reusable.
-- [ ] Define and document a store interface for memory, Redis, database, or custom backends.
+- [x] Define and document a store interface for memory, Redis, database, or custom backends.
 - [ ] Ensure session middleware can use external stores without depending on PormG directly.
 - [ ] Add tests for persistent session stores via adapters, not core-specific database code.
 

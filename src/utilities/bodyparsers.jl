@@ -14,7 +14,7 @@ Read the body of a HTTP.Request as a String
 """
 function text(req::HTTP.Request) :: String
     body = IOBuffer(HTTP.payload(req))
-    return eof(body) ? nothing : read(seekstart(body), String)
+    return eof(body) ? "" : read(seekstart(body), String)
 end
 
 
@@ -35,7 +35,7 @@ Read the body of a HTTP.Request as a Vector{UInt8}
 """
 function binary(req::HTTP.Request) :: Vector{UInt8}
     body = IOBuffer(HTTP.payload(req))
-    return eof(body) ? nothing : readavailable(body)
+    return eof(body) ? UInt8[] : readavailable(body)
 end
 
 

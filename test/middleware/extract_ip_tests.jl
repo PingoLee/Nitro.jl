@@ -3,6 +3,7 @@
 using Test
 using HTTP
 using Sockets
+using Nitro: setip!
 using Nitro.Middleware: extract_ip
 
 @testset "extract_ip function tests" begin
@@ -10,7 +11,7 @@ using Nitro.Middleware: extract_ip
     # Helper function to create a request with specific headers and context IP
     function create_request(headers, context_ip::IPAddr = IPv4("127.0.0.1"))
         req = HTTP.Request("GET", "/", headers, "")
-        req.context[:ip] = context_ip
+        setip!(req, context_ip)
         return req
     end
 
@@ -70,12 +71,12 @@ using Nitro.Middleware: extract_ip
         @test extract_ip(req) == IPv4("203.0.113.1")
     end
 
-    @testset "Fallback to req.context[:ip] when no headers" begin
+    @testset "Fallback to getip(req) when no headers" begin
         req = create_request([], IPv4("127.0.0.1"))
         @test extract_ip(req) == IPv4("127.0.0.1")
     end
 
-    @testset "Fallback to req.context[:ip] when headers are empty" begin
+    @testset "Fallback to getip(req) when headers are empty" begin
         req = create_request(["X-Forwarded-For" => ""], IPv4("127.0.0.1"))
         @test extract_ip(req) == IPv4("127.0.0.1")
     end

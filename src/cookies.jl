@@ -1,4 +1,4 @@
-﻿module Cookies
+module Cookies
 
 using HTTP
 using Dates
@@ -625,12 +625,26 @@ function load_cookie_settings!(defaults::Nullable{Dict} = nothing)
 end
 
 """
+Add a session to a store with a time-to-live (TTL). Must be implemented by custom stores.
+"""
+function storesession!(store::AbstractSessionStore, key, value; ttl::Int = 3600)
+    throw(MethodError(storesession!, (store, key, value)))
+end
+
+"""
 Add a session to a MemoryStore with a time-to-live (TTL).
 """
 function storesession!(store::MemoryStore{K, V}, key::K, value::V; ttl::Int = 3600) where {K, V}
     lock(store.lock) do
         store.data[key] = SessionPayload(value, Dates.now(Dates.UTC) + Dates.Second(ttl))
     end
+end
+
+"""
+Remove expired sessions from a store. Defaults to doing nothing for custom stores if not implemented.
+"""
+function prunesessions!(store::AbstractSessionStore)
+    return nothing
 end
 
 """

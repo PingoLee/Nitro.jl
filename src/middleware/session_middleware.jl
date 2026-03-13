@@ -3,7 +3,8 @@ module SessionMiddleware_
 using HTTP
 using Dates
 using JSON
-using ...Types: MemoryStore, SessionPayload, Nullable, LifecycleMiddleware
+using ...Core: getsession, setsession!
+using ...Types: MemoryStore, AbstractSessionStore, SessionPayload, Nullable, LifecycleMiddleware
 using ...Cookies: storesession!, prunesessions!, format_cookie, get_cookie
 
 export SessionMiddleware
@@ -18,7 +19,7 @@ Creates a middleware that manages server-side sessions with cookie-based session
 
 ## How it works
 1. **On request**: Reads the session cookie, loads session data from the store, 
-   and injects it into `req.context[:session]` as a `Dict{String,Any}`.
+   and injects it into `getsession(req)` as a `Dict{String,Any}`.
 2. **On response**: If session data was modified, saves it back to the store 
    and sets the session cookie on the response.
 
@@ -26,7 +27,7 @@ Creates a middleware that manages server-side sessions with cookie-based session
 - `cookie_name::String`: Name of the session cookie (default: `"nitro_session"`).
 - `secret_key::Union{String,Nothing}`: Secret key for cookie signing (default: `nothing`).
 - `max_age::Int`: Session TTL in seconds (default: `86400` = 24 hours).
-- `store::MemoryStore`: The session store backend (default: shared in-memory store).
+- `store::AbstractSessionStore`: The session store backend (default: shared in-memory store).
 - `prune_probability::Float64`: Probability of pruning expired sessions per request (default: `0.01`).
 
 ## Example
@@ -39,12 +40,12 @@ serve(middleware=[
 ])
 
 @get "/login" function(req)
-    req.context[:session]["user_id"] = 42
+    getsession(req)["user_id"] = 42
     return Dict("status" => "logged in")
 end
 
 @get "/dashboard" function(req)
-    user_id = get(req.context[:session], "user_id", nothing)
+    user_id = get(getsession(req), "user_id", nothing)
     return Dict("user_id" => user_id)
 end
 ```
@@ -53,7 +54,7 @@ function SessionMiddleware(;
     cookie_name::String = "nitro_session",
     secret_key::Nullable{String} = nothing,
     max_age::Int = 86400,
-    store::MemoryStore{String, Dict{String,Any}} = DEFAULT_STORE,
+    store::AbstractSessionStore{String, Dict{String,Any}} = DEFAULT_STORE,
     prune_probability::Float64 = 0.01,
     secure::Bool = true,
     httponly::Bool = true,
@@ -76,7 +77,7 @@ function SessionMiddleware(;
             end
 
             # 2. Inject session into request context
-            req.context[:session] = session_data
+            setsession!(req, session_data)
             req.context[:session_id] = session_id
 
             # Take a snapshot to detect modifications
@@ -86,7 +87,7 @@ function SessionMiddleware(;
             response = handle(req)
 
             # 4. Check if session was modified and save if needed
-            current_session = req.context[:session]
+            current_session = getsession(req)
             if current_session != snapshot || is_new
                 storesession!(store, session_id, current_session; ttl=max_age)
 
@@ -121,7 +122,7 @@ end
 """
 Load session data from the store. Returns (data, is_new).
 """
-function _load_session(store::MemoryStore{String, Dict{String,Any}}, session_id::Nullable{String})
+function _load_session(store::AbstractSessionStore{String, Dict{String,Any}}, session_id::Nullable{String})
     if isnothing(session_id)
         return (Dict{String,Any}(), true)
     end

@@ -1,4 +1,4 @@
-﻿module Core
+module Core
 
 using Base: @kwdef
 using HTTP
@@ -19,6 +19,14 @@ include("crypto.jl");       @reexport using .Crypto
 include("cookies.jl");      @reexport using .Cookies
 include("constants.jl");    @reexport using .Constants
 include("context.jl");      @reexport using .AppContext
+
+function getparams end
+function getquery end
+function getsession end
+function setsession! end
+function getip end
+function setip! end
+
 include("handlers.jl");     @reexport using .Handlers
 include("middleware.jl");   @reexport using .Middleware
 include("routerhof.jl");    @reexport using .RouterHOF
@@ -28,30 +36,122 @@ include("response.jl");     @reexport using .Res
 include("routing.jl");      @reexport using .Routing
 
 export start, serve, serveparallel, terminate,
-    internalrequest, staticfiles, dynamicfiles, spafiles
+    internalrequest, staticfiles, dynamicfiles, spafiles,
+    getparams, getquery, getsession, setsession!, getip, setip!, payload
 
 """
-    Base.getproperty(req::HTTP.Request, sym::Symbol)
+    getparams(req::HTTP.Request) -> Dict{String, String}
 
-Extend HTTP.Request to provide DX-friendly shorthand access to common properties:
-- `req.params`: Returns path parameters
-- `req.query`: Returns query parameters 
-- `req.session`: Returns the session dictionary from context (if present)
-- `req.ip`: Returns the caller's IP address from context
+Returns the path parameters for the request.
 """
-function Base.getproperty(req::HTTP.Request, sym::Symbol)
-    if sym === :params
-        return HTTP.getparams(req)
-    elseif sym === :query
-        return Types.queryvars(req)
-    elseif sym === :session
-        return Base.get(req.context, :session, nothing)
-    elseif sym === :ip
-        return Base.get(req.context, :ip, nothing)
-    else
-        return getfield(req, sym)
+getparams(req::HTTP.Request) = HTTP.getparams(req)
+
+"""
+    getquery(req::HTTP.Request) -> Dict{String, String}
+
+Returns the query parameters for the request.
+"""
+getquery(req::HTTP.Request) = HTTP.queryparams(req)
+
+"""
+    getsession(req::HTTP.Request) -> Union{Dict{String,Any}, Nothing}
+
+Returns the session dictionary from the request context, if present.
+"""
+getsession(req::HTTP.Request) = Base.get(req.context, :session, nothing)
+
+"""
+    setsession!(req::HTTP.Request, val::Dict{String,Any})
+
+Assigns the session dictionary to the request context.
+"""
+setsession!(req::HTTP.Request, val) = (req.context[:session] = val)
+
+"""
+    getip(req::HTTP.Request) -> Union{Sockets.IPAddr, Nothing}
+
+Returns the caller's IP address from the request context, if present.
+"""
+getip(req::HTTP.Request) = Base.get(req.context, :ip, nothing)
+
+"""
+    setip!(req::HTTP.Request, val::Sockets.IPAddr)
+
+Assigns the caller's IP address to the request context.
+"""
+setip!(req::HTTP.Request, val) = (req.context[:ip] = val)
+
+"""
+    payload(req::HTTP.Request) -> Dict{String, Any}
+
+Returns a merged dictionary containing the JSON body, form data, and query parameters 
+from the incoming request. Keys from the JSON body take precedence over form data, 
+which take precedence over query parameters.
+"""
+function payload(req::HTTP.Request)::Dict{String, Any}
+    merged = Dict{String, Any}()
+    
+    # 1. Query Params (lowest precedence)
+    query_dict = getquery(req)
+    if !isnothing(query_dict)
+        for (k, v) in query_dict
+            merged[string(k)] = v
+        end
     end
+
+    # 2. Body Data (Form or JSON)
+    ct = HTTP.header(req, "Content-Type", "")
+    
+    if occursin("application/json", ct)
+        json_dict = try
+            res = json(req)
+            !isnothing(res) ? res : Dict{String, Any}()
+        catch
+            Dict{String, Any}()
+        end
+        for (k, v) in json_dict
+            merged[string(k)] = v
+        end
+    elseif occursin("application/x-www-form-urlencoded", ct) || occursin("multipart/form-data", ct)
+        form_dict = formdata(req)
+        if !isnothing(form_dict)
+            for (k, v) in form_dict
+                merged[string(k)] = v
+            end
+        end
+    else
+        # Fallback: try JSON first, then Form if JSON fails, if no Content-Type or unknown
+        # This keeps it ergonomic for simple curl/testing calls without headers.
+        json_dict = try
+            res = json(req)
+            !isnothing(res) ? res : nothing
+        catch
+            nothing
+        end
+        
+        if !isnothing(json_dict)
+            for (k, v) in json_dict
+                merged[string(k)] = v
+            end
+        else
+            form_dict = formdata(req)
+            if !isnothing(form_dict) && !isempty(form_dict)
+                # If it's just a single key with empty value and looks like JSON, ignore it
+                if length(form_dict) == 1 && isempty(first(values(form_dict))) && startswith(first(keys(form_dict)), "{")
+                    # skip
+                else
+                    for (k, v) in form_dict
+                        merged[string(k)] = v
+                    end
+                end
+            end
+        end
+    end
+    
+    return merged
 end
+
+
 
 nitro_title = raw"""
    ____                            
@@ -256,7 +356,7 @@ request context dictionary. At the moment, it just inserts the caller's ip addre
 function decorate_request(ip::IPAddr, stream::HTTP.Stream)
     return function (handle)
         return function (req::HTTP.Request)
-            req.context[:ip] = ip
+            setip!(req, ip)
             req.context[:stream] = stream
             handle(req)
         end
@@ -288,6 +388,10 @@ Inside this task, `@async` is used for cooperative multitasking, allowing the ta
 """
 function parallel_stream_handler(handle_stream::Function)
     function (stream::HTTP.Stream)
+        if nthreads() <= 1
+            return handle_stream(stream)
+        end
+
         task = Threads.@spawn begin
             handle = @async handle_stream(stream)
             wait(handle)
@@ -387,7 +491,7 @@ Directly call one of our other endpoints registered with the router, using your 
 and bypassing any globally defined middleware
 """
 function internalrequest(ctx::ServerContext, req::HTTP.Request; middleware::Vector=[], serialize::Bool=true, catch_errors=true, context=missing)::HTTP.Response
-    req.context[:ip] = IPv4("127.0.0.1") # label internal requests
+    setip!(req, IPv4("127.0.0.1")) # label internal requests
 
     # Temporarily set the context if provided
     old_ctx = ctx.app_context[]
@@ -715,6 +819,13 @@ function registerhandler(ctx::ServerContext, router::Router, httpmethod::String,
             params = parse_params(req)
             func_handle(req, func; parameters=params)
         end
+    end
+
+    if httpmethod == STREAM
+        for resolved_httpmethod in HTTP_METHODS
+            HTTP.register!(router, resolved_httpmethod, route, handle)
+        end
+        return
     end
 
     # Use method aliases for special methods

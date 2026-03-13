@@ -3,6 +3,7 @@ using HTTP
 using Dates
 using Sockets
 using LRUCache
+using ...Core: getip
 
 # Import top level types module
 using ...Types 
@@ -52,7 +53,7 @@ Creates a middleware function that enforces rate limiting based on IP address, w
 - `exempt_paths::Vector{String}`: Request path prefixes to skip rate limiting. Default is empty.
 
 # Customization
-To customize IP extraction, set `auto_extract_ip=false` and insert your own middleware before the rate limiter to assign the desired IP address to `req.context[:ip]`. This is useful for advanced scenarios such as extracting IPs from custom headers, authentication tokens, or supporting non-standard proxy setups.
+To customize IP extraction, set `auto_extract_ip=false` and insert your own middleware before the rate limiter to assign the desired IP address to `getip(req)`. This is useful for advanced scenarios such as extracting IPs from custom headers, authentication tokens, or supporting non-standard proxy setups.
 
 # Note
 This implementation uses UTC time to avoid timezone and DST issues. Significant system clock adjustments (NTP sync, manual changes) may temporarily affect rate limiting accuracy.
@@ -130,7 +131,7 @@ function FixedRateLimiter(;
 
                 lock(store_lock) do
                     current_time = now(UTC)
-                    ip = req.context[:ip]
+                    ip = getip(req)
 
                     if haskey(rate_limit_store, ip)
                         count, last_reset = rate_limit_store[ip]
@@ -271,7 +272,7 @@ function SlidingRateLimiter(;
                 lock(store_lock) do
                                     
                     current_time = now(UTC)
-                    ip = req.context[:ip]
+                    ip = getip(req)
                     
                     # Get existing timestamps or create empty vector
                     timestamps = get!(rate_limit_store, ip, DateTime[])

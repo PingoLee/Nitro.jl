@@ -165,7 +165,7 @@ end
         )
 
         handler = function(req::HTTP.Request)
-            req.session["user_id"] = 77
+            getsession(req)["user_id"] = 77
             return HTTP.Response(200, "configured")
         end
 

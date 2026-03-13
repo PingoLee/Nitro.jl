@@ -1,4 +1,4 @@
-﻿module AuthMiddlewareTests
+module AuthMiddlewareTests
 
 using Test
 using HTTP
@@ -76,10 +76,36 @@ serve(port=PORT, host=HOST, async=true, show_errors=false, show_banner=false, ac
     # Invalid token
     @test_throws HTTP.Exceptions.StatusError HTTP.get("$localhost/auth/protected"; headers=Dict("Authorization" => "Bearer badtoken"))
 
-    # Valid token
     r = HTTP.get("$localhost/auth/protected"; headers=Dict("Authorization" => "Bearer $good_token"))
     @test r.status == 200
     @test text(r) == "Hello, TestUser!"
+end
+
+@testset "CookieAuthMiddleware unit tests" begin
+    # Build middleware
+    mw = CookieAuthMiddleware(validate_token, cookie_name="my_auth_cookie")
+    handler = mw(req->HTTP.Response(200, "ok"))
+
+    # Case A: Missing cookie
+    reqA = HTTP.Request("GET", "/")
+    resA = handler(reqA)
+    @test resA.status == 401
+    @test contains(text(resA), "Missing or invalid authentication cookie")
+
+    # Case B: Invalid token (validator returns nothing)
+    reqB = HTTP.Request("GET", "/")
+    HTTP.setheader(reqB, "Cookie" => "my_auth_cookie=badtoken")
+    resB = handler(reqB)
+    @test resB.status == 401
+    @test contains(text(resB), "Invalid or expired token")
+
+    # Case C: Valid token
+    reqC = HTTP.Request("GET", "/")
+    HTTP.setheader(reqC, "Cookie" => "my_auth_cookie=$good_token")
+    resC = handler(reqC)
+    @test resC.status == 200
+    @test text(resC) == "ok"
+    @test reqC.context[:user][:name] == "TestUser"
 end
 
 terminate()

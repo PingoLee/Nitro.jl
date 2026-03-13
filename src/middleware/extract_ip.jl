@@ -2,27 +2,28 @@
 module ExtractIPMiddleware
 using HTTP
 using Sockets
+using ...Core: getip, setip!
 
 export ExtractIP, extract_ip
 
 """
     ExtractIP()
 
-Middleware that extracts the client IP address from HTTP request headers and assigns it to `req.context[:ip]`.
+Middleware that extracts the client IP address from HTTP request headers and assigns it to `getip(req)`.
 
 This middleware checks common proxy headers in priority order:
 1. `CF-Connecting-IP` (Cloudflare)
 2. `True-Client-IP` (Akamai/Enterprise proxies)
 3. `X-Forwarded-For` (standard, may be a comma-separated list; uses the first entry)
 4. `X-Real-IP` (Nginx/other proxies)
-5. Falls back to the pre-existing `req.context[:ip]` if no headers are present.
+5. Falls back to the pre-existing `getip(req)` if no headers are present.
 
 Intended for use before middleware that relies on accurate client IP detection, such as rate limiting or logging.
 """
 function ExtractIP()
     function(handle::Function)
         function(req::HTTP.Request)
-            req.context[:ip] = extract_ip(req)
+            setip!(req, extract_ip(req))
             return handle(req)
         end
     end
@@ -38,7 +39,7 @@ Extracts the client IP address from an HTTP request, checking headers in priorit
 2. `True-Client-IP` (Akamai/Enterprise proxies)
 3. `X-Forwarded-For` (standard, may be a comma-separated list; uses the first entry)
 4. `X-Real-IP` (Nginx/other proxies)
-5. Falls back to `req.context[:ip]` if no headers are present.
+5. Falls back to `getip(req)` if no headers are present.
 
 Returns the parsed `IPAddr` for use in rate limiting.
 """
@@ -78,7 +79,7 @@ function extract_ip(req::HTTP.Request) :: IPAddr
     end
 
     # fallback to the pre-existing ip object
-    return req.context[:ip]
+    return getip(req)
 end
 
 

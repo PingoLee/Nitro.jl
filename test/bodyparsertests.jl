@@ -1,4 +1,4 @@
-﻿
+
 module BodyParserTests 
 using Test
 
@@ -233,6 +233,46 @@ end
     end
 
 
+    @testset "payload merges JSON, Form, and Query params" begin
+        # Test Query only
+        req = Request("GET", "/?a=1&b=2")
+        data = payload(req)
+        @test data["a"] == "1"
+        @test data["b"] == "2"
+
+        # Test Form only
+        req = Request("POST", "/", [], "a=1&b=2")
+        data = payload(req)
+        @test data["a"] == "1"
+        @test data["b"] == "2"
+
+        # Test JSON only
+        req = Request("POST", "/", [], """{"a": 1, "b": 2}""")
+        data = payload(req)
+        @test data["a"] == 1
+        @test data["b"] == 2
+
+        # Test Precedence (JSON > Form > Query)
+        # Using HTTP Request directly to combine query and body
+        req = Request("POST", "/?a=query_a&b=query_b&c=query_c", ["Content-Type" => "application/json"], """{"a": "json_a"}""")
+        # We need to force `formdata` to parse something for the test by simulating a multipart or x-www-form-urlencoded,
+        # but JSON parser won't parse it if Content-Type isn't json. 
+        # So we'll test Query + JSON first.
+        data = payload(req)
+        @test data["a"] == "json_a" # JSON wins
+        @test data["b"] == "query_b" # Fallback to Query
+        @test data["c"] == "query_c"
+
+        # Test Query + Form Data
+        req_form = Request("POST", "/?a=query_a&b=query_b", ["Content-Type" => "application/x-www-form-urlencoded"], "a=form_a&c=form_c")
+        data_form = payload(req_form)
+        @test data_form["a"] == "form_a" # Form wins over Query
+        @test data_form["b"] == "query_b" # Fallback to Query
+        @test data_form["c"] == "form_c" # Only in Form
     end
+
+    end
+
+end
 
 end

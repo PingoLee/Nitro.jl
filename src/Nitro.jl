@@ -1,4 +1,4 @@
-﻿module Nitro
+module Nitro
 
 const WAS_LOADED_AFTER_REVISE :: Ref{Bool} = Ref(false)
 
@@ -41,6 +41,7 @@ export  @oxidize, @oxidise,
         # File serving
         staticfiles, dynamicfiles, spafiles,
         # Util
+        getparams, getquery, getsession, setsession!, getip, setip!, payload,
         redirect, formdata, format_sse_message,
         html, text, json, file, xml, js, css, binary,
         # Extractors

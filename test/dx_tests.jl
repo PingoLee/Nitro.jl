@@ -41,18 +41,18 @@ using HTTP
         @test req.target == "/test"
 
         # Test session access
-        req.context[:session] = Dict("user_id" => 123)
-        @test req.session["user_id"] == 123
+        setsession!(req, Dict("user_id" => 123))
+        @test getsession(req)["user_id"] == 123
 
         # Test IP access
         import Sockets: IPv4
-        req.context[:ip] = IPv4("127.0.0.1")
-        @test req.ip == IPv4("127.0.0.1")
+        setip!(req, IPv4("127.0.0.1"))
+        @test getip(req) == IPv4("127.0.0.1")
         
         # Test empty context
         req_empty = HTTP.Request("GET", "/empty")
-        @test isnothing(req_empty.session)
-        @test isnothing(req_empty.ip)
+        @test isnothing(getsession(req_empty))
+        @test isnothing(getip(req_empty))
     end
 
 end

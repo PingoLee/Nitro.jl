@@ -13,9 +13,8 @@ using ..Util
 
 export Server, Nullable, Context,
     LifecycleMiddleware, startup, shutdown,
-    LifecycleMiddleware, startup, shutdown,
     Param, isrequired, LazyRequest, headers, pathparams, queryvars, jsonbody, formbody, textbody,
-    CookieConfig, Cookie, Session, SessionPayload, MemoryStore, Extractor,
+    CookieConfig, Cookie, Session, SessionPayload, AbstractSessionStore, MemoryStore, Extractor,
     RouteDefinition
 
 const Nullable{T} = Union{T, Nothing}
@@ -76,8 +75,11 @@ struct SessionPayload{T}
     expires::DateTime
 end
 
+# Abstract interface for session stores
+abstract type AbstractSessionStore{K, V} end
+
 # A thread-safe in-memory store for sessions
-struct MemoryStore{K, V}
+struct MemoryStore{K, V} <: AbstractSessionStore{K, V}
     data::Dict{K, SessionPayload{V}}
     lock::Base.ReentrantLock
     MemoryStore{K, V}() where {K, V} = new{K, V}(Dict{K, SessionPayload{V}}(), Base.ReentrantLock())
