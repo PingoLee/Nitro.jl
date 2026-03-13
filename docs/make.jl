@@ -15,6 +15,7 @@ makedocs(
             "tutorial/path_parameters.md",
             "tutorial/query_parameters.md",
             "tutorial/request_body.md",
+            "tutorial/sessions_and_auth.md",
             "Cookies and Sessions" => [
                 "tutorial/cookies/basics.md",
                 "tutorial/cookies/configuration.md",

@@ -4,6 +4,8 @@ using Test
 using Nitro
 using HTTP
 
+const TEST_FILE_PATH = joinpath(@__DIR__, "content", "test.txt")
+
 @testset "Developer Experience (DX) Improvements" begin
 
     @testset "Default Multi-threading" begin
@@ -30,6 +32,27 @@ using HTTP
         @test res_send.status == 200
         @test any(h -> h[1] == "Content-Type" && occursin("text/plain", h[2]), res_send.headers)
         @test String(res_send.body) == "Raw text"
+
+        # Test Res.file()
+        res_file = Res.file(TEST_FILE_PATH)
+        @test res_file.status == 200
+        @test any(h -> h[1] == "Content-Type" && occursin("text/plain", h[2]), res_file.headers)
+        @test any(h -> h[1] == "Content-Disposition" && occursin("attachment", h[2]), res_file.headers)
+        @test String(res_file.body) == read(TEST_FILE_PATH, String)
+
+        # Test Res.file() custom filename and headers
+        named_file = Res.file(TEST_FILE_PATH, filename="download.txt", headers=["X-Test" => "1"])
+        @test any(h -> h[1] == "Content-Disposition" && occursin("download.txt", h[2]), named_file.headers)
+        @test any(h -> h[1] == "X-Test" && h[2] == "1", named_file.headers)
+
+        # Test Res.redirect()
+        res_redirect = Res.redirect("/login")
+        @test res_redirect.status == 302
+        @test any(h -> h[1] == "Location" && h[2] == "/login", res_redirect.headers)
+
+        custom_redirect = Res.redirect("/dashboard", status=303, headers=["Cache-Control" => "no-store"])
+        @test custom_redirect.status == 303
+        @test any(h -> h[1] == "Cache-Control" && h[2] == "no-store", custom_redirect.headers)
     end
 
     @testset "HTTP.Request Convenience Properties" begin

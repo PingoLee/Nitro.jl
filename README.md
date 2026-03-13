@@ -90,7 +90,11 @@ Nitro adds shorthand accessors to `HTTP.Request`:
 
 - `req.params` for path parameters
 - `req.query` for query parameters
+- `req.json` for JSON request bodies (`nothing` on empty or malformed JSON)
+- `req.form` for form-encoded request bodies (`Dict()` on empty or non-form bodies)
+- `req.input` for a merged `Dict{String,Any}` view of params, form, JSON, and query data
 - `req.session` for session state injected by middleware
+- `req.user` for the authenticated principal injected by session or bearer auth middleware
 - `req.ip` for the caller IP
 
 ```julia
@@ -102,6 +106,8 @@ function show_request(req::HTTP.Request, id::Int)
         "id" => id,
         "params" => req.params,
         "query" => req.query,
+        "json" => req.json,
+        "input" => req.input,
         "session" => req.session,
         "ip" => string(req.ip),
     ))
@@ -113,6 +119,20 @@ urlpatterns("",
 
 serve()
 ```
+
+For direct handler access, prefer `req.json`, `req.form`, and `req.input`. `LazyRequest` still exists for extractors and app-level wrappers, but handler code no longer needs to wrap `HTTP.Request` just to parse a body.
+
+### Genie Migration
+
+If you are migrating simple Genie handlers, the rough mapping is:
+
+- `params(:id)` or route params -> `req.params["id"]`
+- query string lookups -> `req.query["key"]`
+- parsed JSON body -> `req.json`
+- parsed form body -> `req.form`
+- a single merged view for simple CRUD handlers -> `req.input`
+
+For complex validation or typed conversion, prefer Nitro extractors over manually pulling values out of `req.input`.
 
 ## App Context
 
@@ -164,7 +184,7 @@ end
 
 function profile(req::HTTP.Request)
     user_id = isnothing(req.session) ? nothing : get(req.session, "user_id", nothing)
-    return isnothing(user_id) ? Res.status(401, "Unauthorized") : Res.json(Dict("user_id" => user_id))
+    return isnothing(user_id) ? Res.send("Unauthorized", status=401) : Res.json(Dict("user_id" => user_id))
 end
 
 urlpatterns("",
@@ -185,6 +205,31 @@ serve(middleware=[
 
 Use `secure=false` for local HTTP development only. Keep `secure=true` in production.
 
+`SessionMiddleware` now accepts any `AbstractSessionStore`, not just the built-in in-memory store. Both `SessionMiddleware` and `BearerAuth` converge on `req.user`, so guards can stay agnostic to whether auth came from a server-side session or a JWT.
+
+## Auth Helpers
+
+`Nitro.Auth` contains higher-level security primitives without coupling Nitro core to a database layer.
+
+```julia
+using HTTP
+using Nitro
+using Nitro.Auth
+
+token = encode_jwt(Dict("sub" => "42", "role" => "admin", "exp" => trunc(Int, time()) + 3600), "secret")
+validator = jwt_validator("secret")
+
+function profile(req::HTTP.Request)
+    return Res.json(Dict("user" => req.user))
+end
+
+urlpatterns("",
+    path("/profile", profile, method="GET", middleware=[BearerAuth(validator)]),
+)
+```
+
+The module also exposes `set_auth_cookie!`, `clear_auth_cookie!`, `make_password`, `check_password`, and `validate_claims`.
+
 ## Middleware Order
 
 Nitro applies middleware in this order:
@@ -203,6 +248,8 @@ Nitro exposes `Res` helpers for explicit response construction:
 - `Res.json`
 - `Res.send`
 - `Res.status`
+- `Res.file`
+- `Res.redirect`
 
 These are the preferred examples for new applications.
 

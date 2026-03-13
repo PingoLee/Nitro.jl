@@ -14,12 +14,31 @@ using ..Util
 export Server, Nullable, Context,
     LifecycleMiddleware, startup, shutdown,
     Param, isrequired, LazyRequest, headers, pathparams, queryvars, jsonbody, formbody, textbody,
-    CookieConfig, Cookie, Session, SessionPayload, AbstractSessionStore, MemoryStore, Extractor,
+    CookieConfig, Cookie, Session, SessionPayload,
+    AbstractSessionStore, get_session, set_session!, delete_session!, cleanup_expired_sessions!,
+    MemoryStore, Extractor,
     RouteDefinition
 
 const Nullable{T} = Union{T, Nothing}
 
 abstract type Extractor{T} end
+abstract type AbstractSessionStore end
+
+function get_session(store::AbstractSessionStore, session_id)
+    throw(MethodError(get_session, (store, session_id)))
+end
+
+function set_session!(store::AbstractSessionStore, session_id, data; ttl::Int = 3600)
+    throw(MethodError(set_session!, (store, session_id, data)))
+end
+
+function delete_session!(store::AbstractSessionStore, session_id)
+    throw(MethodError(delete_session!, (store, session_id)))
+end
+
+function cleanup_expired_sessions!(store::AbstractSessionStore)
+    throw(MethodError(cleanup_expired_sessions!, (store,)))
+end
 
 # Generic cookie configuration
 @kwdef struct CookieConfig
@@ -75,11 +94,8 @@ struct SessionPayload{T}
     expires::DateTime
 end
 
-# Abstract interface for session stores
-abstract type AbstractSessionStore{K, V} end
-
 # A thread-safe in-memory store for sessions
-struct MemoryStore{K, V} <: AbstractSessionStore{K, V}
+struct MemoryStore{K, V} <: AbstractSessionStore
     data::Dict{K, SessionPayload{V}}
     lock::Base.ReentrantLock
     MemoryStore{K, V}() where {K, V} = new{K, V}(Dict{K, SessionPayload{V}}(), Base.ReentrantLock())
@@ -89,6 +105,55 @@ function Base.get(store::MemoryStore, key, default)
     lock(store.lock) do
         return Base.get(store.data, key, default)
     end
+end
+
+function _copy_session_value(value)
+    if value isa AbstractDict || value isa AbstractArray
+        return copy(value)
+    end
+    return value
+end
+
+function get_session(store::MemoryStore{K, V}, key::K) where {K, V}
+    lock(store.lock) do
+        payload = Base.get(store.data, key, nothing)
+        if isnothing(payload)
+            return nothing
+        end
+
+        if payload.expires <= Dates.now(Dates.UTC)
+            delete!(store.data, key)
+            return nothing
+        end
+
+        return _copy_session_value(payload.data)
+    end
+end
+
+function set_session!(store::MemoryStore{K, V}, key::K, value::V; ttl::Int = 3600) where {K, V}
+    lock(store.lock) do
+        store.data[key] = SessionPayload(value, Dates.now(Dates.UTC) + Dates.Second(ttl))
+    end
+    return value
+end
+
+function delete_session!(store::MemoryStore{K, V}, key) where {K, V}
+    lock(store.lock) do
+        delete!(store.data, key)
+    end
+    return nothing
+end
+
+function cleanup_expired_sessions!(store::MemoryStore)
+    current_time = Dates.now(Dates.UTC)
+    lock(store.lock) do
+        for (key, payload) in store.data
+            if payload.expires <= current_time
+                delete!(store.data, key)
+            end
+        end
+    end
+    return nothing
 end
 
 # Represents the application context 
@@ -126,86 +191,29 @@ function shutdown(lf::LifecycleMiddleware)
     end
 end
 
-const Server = HTTP.Server
 
-@kwdef struct Param{T}
-    name::Symbol
-    type::Type{T}
-    default::Union{T, Missing} = missing
-    hasdefault::Bool = false
+# ─── Lazy Request Accessors ───────────────────────────────────────────
+
+struct LazyRequest
+    req::HTTP.Request
 end
 
-function isrequired(p::Param{T}) where T
-    return !p.hasdefault || (ismissing(p.default) && !(T <: Missing))
-end
+pathparams(req::HTTP.Request) = HTTP.getparams(req)
+queryvars(req::HTTP.Request)  = HTTP.queryparams(req)
+headers(req::HTTP.Request)   = HTTP.headers(req)
 
-# Lazily init frequently used components of a request to be used between parameters when parsing
-@kwdef struct LazyRequest
-    request     :: HTTP.Request
-    headers     = Ref{Nullable{Dict{String,String}}}(nothing)
-    pathparams  = Ref{Nullable{Dict{String,String}}}(nothing)
-    queryparams = Ref{Nullable{Dict{String,String}}}(nothing)
-    formbody    = Ref{Nullable{Dict{String,String}}}(nothing)
-    jsonbody    = Ref{Nullable{JSON.Object}}(nothing)
-    textbody    = Ref{Nullable{String}}(nothing)
-end
+jsonbody(req::HTTP.Request; kwargs...) = json(req; kwargs...)
+formbody(req::HTTP.Request)           = formdata(req)
+textbody(req::HTTP.Request)           = text(req)
 
-function headers(req::LazyRequest) :: Nullable{Dict{String,String}}
-    if isnothing(req.headers[])
-        req.headers[] = Dict(String(k) => String(v) for (k,v) in HTTP.headers(req.request))
-    end
-    return req.headers[] 
-end
+# ─── Routing ──────────────────────────────────────────────────────────
 
-function pathparams(req::LazyRequest) :: Nullable{Dict{String,String}}
-    if isnothing(req.pathparams[])
-        req.pathparams[] = HTTP.getparams(req.request)
-    end
-    return req.pathparams[] 
-end
-
-function queryvars(req::LazyRequest) :: Nullable{Dict{String,String}}
-    if isnothing(req.queryparams[])
-        req.queryparams[] = HTTP.queryparams(req.request)
-    end
-    return req.queryparams[]
-end
-
-function jsonbody(req::LazyRequest) :: Nullable{JSON.Object}
-    if isnothing(req.jsonbody[])
-        req.jsonbody[] = json(req.request)
-    end
-    return req.jsonbody[] 
-end
-
-function formbody(req::LazyRequest) :: Nullable{Dict{String,String}}
-    if isnothing(req.formbody[])
-        req.formbody[] = formdata(req.request)
-    end
-    return req.formbody[] 
-end
-
-function textbody(req::LazyRequest) :: Nullable{String}
-    if isnothing(req.textbody[])
-        req.textbody[] = text(req.request)
-    end
-    return req.textbody[] 
-end
-
-
-"""
-    RouteDefinition
-
-Represents a single route in the Django-style URL dispatch system.
-Created by `path()` and collected by `urlpatterns()`.
-"""
-struct RouteDefinition
-    pattern::String                     # e.g. "/users/<int:id>"
+@kwdef struct RouteDefinition
+    path::String
+    method::String
     handler::Function
-    methods::Vector{String}             # e.g. ["GET"]
-    name::Nullable{String}              # optional route name
-    middleware::Nullable{Vector}         # optional middleware
-    type_hints::Dict{Symbol,Type}       # from path converters, e.g. :id => Int
+    middleware::Vector{Function} = Function[]
+    name::Nullable{String} = nothing
 end
 
-end
+end # module Types

@@ -6,8 +6,9 @@ The public API documented here is:
 
 - `serve()` for starting the server
 - `path()`, `urlpatterns()`, and `include_routes()` for route registration
-- `req.params`, `req.query`, `req.session`, and `req.ip` for request ergonomics
+- `req.params`, `req.query`, `req.json`, `req.form`, `req.input`, `req.session`, `req.user`, and `req.ip` for request ergonomics
 - `serve(context=...)` for typed application configuration
+- `Nitro.Auth` for JWT, auth cookies, password hashing, and auth validator helpers
 
 ## Minimal Example
 
@@ -95,7 +96,10 @@ function inspect_request(req::HTTP.Request, id::Int)
         "id" => id,
         "params" => req.params,
         "query" => req.query,
+        "json" => req.json,
+        "input" => req.input,
         "session" => req.session,
+        "user" => req.user,
         "ip" => string(req.ip),
     ))
 end
@@ -106,6 +110,18 @@ urlpatterns("",
 
 serve()
 ```
+
+For direct handler access, use `req.json`, `req.form`, and `req.input`. `LazyRequest` remains useful for extractors, but ordinary handlers should usually stay on plain `HTTP.Request`.
+
+### Genie Migration Notes
+
+- route params -> `req.params`
+- query string -> `req.query`
+- parsed JSON body -> `req.json`
+- parsed form body -> `req.form`
+- merged request data for simple handlers -> `req.input`
+
+Use extractors when you need typed validation instead of a merged dictionary.
 
 ## App Context Pipeline
 
@@ -156,7 +172,7 @@ end
 function profile(req::HTTP.Request)
     session = req.session
     if isnothing(session) || !haskey(session, "user_id")
-        return Res.status(401, "Unauthorized")
+        return Res.send("Unauthorized", status=401)
     end
     return Res.json(Dict("user_id" => session["user_id"]))
 end
@@ -188,4 +204,4 @@ Middleware runs in this order:
 3. Default serializer/error middleware
 4. Router dispatch
 
-Place IP extraction before rate limiting and session/auth middleware before guards that rely on `req.session`.
+Place IP extraction before rate limiting and session/auth middleware before guards that rely on `req.user`.

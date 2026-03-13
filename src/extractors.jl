@@ -251,6 +251,16 @@ function extract(param::Param{Session{T}}, request::LazyRequest, secret_key::Nul
 
     # app_context is expected to be a Context object
     store = app_context.payload
+
+    if store isa AbstractSessionStore
+        instance = get_session(store, val)
+        if isnothing(instance)
+            return Session(session_cookie_name, T)
+        end
+
+        valid_instance = try_validate(param, instance)
+        return Session(session_cookie_name, valid_instance)
+    end
     
     # We assume the store is a Dict-like object or support get()
     instance = try

@@ -1,9 +1,20 @@
+module BodyParsers
 
 using HTTP 
 using JSON
 using ..Util
 
 export text, binary, json, formdata
+
+const EMPTY_FORM_DATA = Dict{String,String}()
+
+function _request_payload(req::HTTP.Request)
+    payload = HTTP.payload(req)
+    if isnothing(payload) || isempty(payload)
+        return nothing
+    end
+    return payload
+end
 
 ### Helper functions used to parse the body of a HTTP.Request object
 
@@ -23,8 +34,16 @@ end
 
 Read the html form data from the body of a HTTP.Request
 """
-function formdata(req::HTTP.Request) :: Dict
-    return HTTP.queryparams(text(req))
+function formdata(req::HTTP.Request) :: Dict{String,String}
+    body = text(req)
+    if isnothing(body) || !occursin('=', body)
+        return copy(EMPTY_FORM_DATA)
+    end
+    try
+        return HTTP.queryparams(body)
+    catch
+        return copy(EMPTY_FORM_DATA)
+    end
 end
 
 
@@ -45,60 +64,32 @@ end
 Read the body of a HTTP.Request as JSON with additional arguments for the read/serializer.
 """
 function json(req::HTTP.Request; kwargs...)
-    body = IOBuffer(HTTP.payload(req))
-    return eof(body) ? nothing : JSON.parse(body; kwargs...)    
+    payload = _request_payload(req)
+    if isnothing(payload)
+        return nothing
+    end
+    try
+        return JSON.parse(IOBuffer(payload); kwargs...)
+    catch
+        return nothing
+    end
 end
 
 """
-    json(request::HTTP.Request, class_type; keyword_arguments...)
+    json(request::HTTP.Request, class_type::Type{T}; keyword_arguments...)
 
 Read the body of a HTTP.Request as JSON with additional arguments for the read/serializer into a custom struct.
 """
-function json(req::HTTP.Request, class_type::Type{T}; kwargs...) :: T where {T}
-    body = IOBuffer(HTTP.payload(req))
-    return eof(body) ? nothing : JSON.parse(body, class_type; kwargs...)    
+function json(req::HTTP.Request, class_type::Type{T}; kwargs...) where {T}
+    payload = _request_payload(req)
+    if isnothing(payload)
+        return nothing
+    end
+    try
+        return JSON.parse(IOBuffer(payload), class_type; kwargs...)
+    catch
+        return nothing
+    end
 end
 
-
-### Helper functions used to parse the body of an HTTP.Response object
-
-
-"""
-    text(response::HTTP.Response)
-
-Read the body of a HTTP.Response as a String
-"""
-function text(response::HTTP.Response) :: String
-    return String(response.body)
-end
-
-"""
-    formdata(request::HTTP.Response)
-
-Read the html form data from the body of a HTTP.Response
-"""
-function formdata(response::HTTP.Response) :: Dict
-    return HTTP.queryparams(text(response))
-end
-
-
-"""
-    json(response::HTTP.Response; keyword_arguments)
-
-Read the body of a HTTP.Response as JSON with additional keyword arguments
-"""
-function json(response::HTTP.Response; kwargs...) :: JSON.Object
-    return JSON.parse(response.body; kwargs...)
-end
-
-
-"""
-    json(response::HTTP.Response, class_type; keyword_arguments)
-
-Read the body of a HTTP.Response as JSON with additional keyword arguments and serialize it into a custom struct
-"""
-function json(response::HTTP.Response, class_type::Type{T}; kwargs...) :: T where {T}
-    return JSON.parse(response.body, class_type; kwargs...)
-end
-
-
+end # module BodyParsers

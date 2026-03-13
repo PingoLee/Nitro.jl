@@ -3,7 +3,7 @@
 using Test
 using HTTP
 using Nitro
-using Nitro: GuardMiddleware, login_required, role_required, GET
+using Nitro: GuardMiddleware, login_required, role_required, permission_required, GET
 
 @testset "GuardMiddleware" begin
 
@@ -68,7 +68,7 @@ using Nitro: GuardMiddleware, login_required, role_required, GET
     @testset "login_required guard" begin
         guard = login_required(redirect_url="/login")
 
-        # No session context → should redirect
+        # No user context → should redirect
         req_no_session = HTTP.Request("GET", "/test")
         result = guard(req_no_session)
         @test result isa HTTP.Response
@@ -76,9 +76,9 @@ using Nitro: GuardMiddleware, login_required, role_required, GET
         location = HTTP.header(result, "Location", "")
         @test location == "/login"
 
-        # With session context → should pass
+        # With user context → should pass
         req_with_session = HTTP.Request("GET", "/test")
-        req_with_session.context[:session] = Dict{String,Any}("user_id" => 42)
+        req_with_session.context[:user] = Dict{String,Any}("user_id" => 42)
         result2 = guard(req_with_session)
         @test isnothing(result2)
     end
@@ -86,7 +86,7 @@ using Nitro: GuardMiddleware, login_required, role_required, GET
     @testset "role_required guard" begin
         guard = role_required("admin")
 
-        # No session → blocked
+        # No user → blocked
         req_no_session = HTTP.Request("GET", "/test")
         result = guard(req_no_session)
         @test result isa HTTP.Response
@@ -94,16 +94,30 @@ using Nitro: GuardMiddleware, login_required, role_required, GET
 
         # Wrong role → blocked
         req_wrong_role = HTTP.Request("GET", "/test")
-        req_wrong_role.context[:session] = Dict{String,Any}("role" => "user")
+        req_wrong_role.context[:user] = Dict{String,Any}("role" => "user")
         result2 = guard(req_wrong_role)
         @test result2 isa HTTP.Response
         @test result2.status == 403
 
         # Correct role → passes
         req_admin = HTTP.Request("GET", "/test")
-        req_admin.context[:session] = Dict{String,Any}("role" => "admin")
+        req_admin.context[:user] = Dict{String,Any}("role" => "admin")
         result3 = guard(req_admin)
         @test isnothing(result3)
+    end
+
+    @testset "permission_required guard" begin
+        guard = permission_required("reports:read")
+
+        req_missing = HTTP.Request("GET", "/test")
+        req_missing.context[:user] = Dict{String,Any}("permissions" => ["reports:write"])
+        result = guard(req_missing)
+        @test result isa HTTP.Response
+        @test result.status == 403
+
+        req_allowed = HTTP.Request("GET", "/test")
+        req_allowed.context[:user] = Dict{String,Any}("permissions" => ["reports:read", "reports:write"])
+        @test isnothing(guard(req_allowed))
     end
 
 end

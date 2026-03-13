@@ -3,7 +3,12 @@ module AuthMiddlewareTests
 using Test
 using HTTP
 using Nitro; @oxidize
-using ..Constants
+
+if !isdefined(@__MODULE__, :Constants)
+    include(joinpath(@__DIR__, "..", "constants.jl"))
+end
+
+using .Constants: HOST, PORT, localhost
 
 good_token = "goodtoken"
 validate_token(token) = token == good_token ? Dict(:id => 1, :name => "TestUser") : nothing
@@ -49,7 +54,7 @@ auth = router("/auth", middleware=[BearerAuth(validate_token)])
 
 route(["GET"], auth("/protected"), function(req)
     # Return user info from context
-    user = req.context[:user]
+    user = req.user
     return HTTP.Response(200, "Hello, $(user[:name])!")
 end)
 

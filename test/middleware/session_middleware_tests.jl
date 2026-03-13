@@ -138,6 +138,7 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
             session = getsession(req)
             @test session["user_id"] == 99
             @test session["role"] == "admin"
+            @test req.user["user_id"] == 99
             return HTTP.Response(200, "read")
         end
 

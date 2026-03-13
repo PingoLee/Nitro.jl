@@ -21,6 +21,8 @@ router
 
 ## Context And Requests
 
+Direct handler request ergonomics use `req.params`, `req.query`, `req.json`, `req.form`, `req.input`, `req.session`, and `req.ip`. `LazyRequest` remains the extractor-facing wrapper.
+
 ```@docs
 Context
 context
@@ -29,6 +31,8 @@ formdata
 ```
 
 ## Responses
+
+The `Res` module is the preferred response surface for handlers and includes `Res.json`, `Res.send`, `Res.status`, `Res.file`, and `Res.redirect`.
 
 ```@docs
 html

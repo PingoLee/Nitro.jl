@@ -635,9 +635,7 @@ end
 Add a session to a MemoryStore with a time-to-live (TTL).
 """
 function storesession!(store::MemoryStore{K, V}, key::K, value::V; ttl::Int = 3600) where {K, V}
-    lock(store.lock) do
-        store.data[key] = SessionPayload(value, Dates.now(Dates.UTC) + Dates.Second(ttl))
-    end
+    return set_session!(store, key, value; ttl)
 end
 
 """
@@ -651,16 +649,7 @@ end
 Remove expired sessions from a MemoryStore.
 """
 function prunesessions!(store::MemoryStore)
-    current_time = Dates.now(Dates.UTC)
-    # For now, we must lock the store while iterating and deleting from the internal Dict.
-    # For very large session sets, a sampling-based approach (like Redis) could be implemented if you accept this PR
-    lock(store.lock) do
-        for (k, v) in store.data
-            if v.expires <= current_time
-                delete!(store.data, k)
-            end
-        end
-    end
+    return cleanup_expired_sessions!(store)
 end
 
 end

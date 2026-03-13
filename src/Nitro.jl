@@ -9,6 +9,7 @@ function __init__()
 end
 
 include("core.jl"); using .Core
+include("Auth.jl"); using .Auth
 include("instances.jl"); using .Instances
 
 import HTTP: Request, Response, Stream, WebSocket, queryparams
@@ -50,7 +51,9 @@ export  @oxidize, @oxidise,
         configcookies, get_cookie, set_cookie!, Cookies, Errors,
         # Middleware
         BearerAuth, Cors, RateLimiter, ExtractIP,
-        SessionMiddleware, GuardMiddleware, login_required, role_required,
+        SessionMiddleware, GuardMiddleware, login_required, role_required, permission_required, CSRFMiddleware,
+        # Auth module
+        Auth,
         # Common HTTP Types
         Request, Response, Stream, WebSocket, queryparams,
         # Context Types and methods
