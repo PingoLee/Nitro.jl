@@ -6,6 +6,7 @@ using HTTP: Server, Router
 using ..Types
 
 export ServerContext, EagerReviseService, Service, wait, close, isopen
+export set_extension!, get_extension, delete_extension!, has_extension
 
 
 
@@ -29,6 +30,8 @@ end
     middleware_cache_lock :: ReentrantLock          = ReentrantLock()
     lifecycle_middleware  :: Set{LifecycleMiddleware} = Set{LifecycleMiddleware}()
     cookies               :: Ref{CookieConfig}      = Ref{CookieConfig}(CookieConfig())
+    extensions            :: Dict{Symbol, Any}      = Dict{Symbol, Any}()
+    extensions_lock       :: ReentrantLock          = ReentrantLock()
 end
 
 @kwdef struct ServerContext
@@ -42,6 +45,34 @@ Base.wait(service::Service)     = !isnothing(service.server[]) && wait(service.s
 function Base.close(service::Service)
     !isnothing(service.server[]) && close(service.server[])
     !isnothing(service.eager_revise[]) && close(service.eager_revise[])
+end
+
+function set_extension!(ctx::ServerContext, key::Symbol, value)
+    lock(ctx.service.extensions_lock) do
+        ctx.service.extensions[key] = value
+    end
+    return value
+end
+
+function get_extension(ctx::ServerContext, key::Symbol, default=nothing)
+    lock(ctx.service.extensions_lock) do
+        return Base.get(ctx.service.extensions, key, default)
+    end
+end
+
+function delete_extension!(ctx::ServerContext, key::Symbol)
+    lock(ctx.service.extensions_lock) do
+        if haskey(ctx.service.extensions, key)
+            delete!(ctx.service.extensions, key)
+        end
+    end
+    return nothing
+end
+
+function has_extension(ctx::ServerContext, key::Symbol)
+    lock(ctx.service.extensions_lock) do
+        return haskey(ctx.service.extensions, key)
+    end
 end
 
 

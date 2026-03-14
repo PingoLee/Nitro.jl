@@ -20,12 +20,37 @@ export Server, Nullable, Context,
     RouteDefinition
 
 const Nullable{T} = Union{T, Nothing}
+const Server = HTTP.Server
 
 abstract type Extractor{T} end
-abstract type AbstractSessionStore end
+abstract type AbstractSessionStore{K, V} end
 
-function get_session(store::AbstractSessionStore, session_id)
-    throw(MethodError(get_session, (store, session_id)))
+@kwdef struct Param{T}
+    name::Symbol
+    type::Type{T} = T
+    default::Nullable{T} = nothing
+    hasdefault::Bool = false
+end
+
+Param(name::Symbol, type::Type{T}, default, hasdefault::Bool) where {T} =
+    Param{T}(name, type, default === missing ? nothing : default, hasdefault)
+
+isrequired(param::Param) = !param.hasdefault
+
+function get_session(store::AbstractSessionStore{K, V}, session_id::K) where {K, V}
+    payload = Base.get(store, session_id, nothing)
+    if isnothing(payload)
+        return nothing
+    end
+
+    if payload isa SessionPayload{V}
+        if payload.expires <= Dates.now(Dates.UTC)
+            return nothing
+        end
+        return _copy_session_value(payload.data)
+    end
+
+    return payload
 end
 
 function set_session!(store::AbstractSessionStore, session_id, data; ttl::Int = 3600)
@@ -95,7 +120,7 @@ struct SessionPayload{T}
 end
 
 # A thread-safe in-memory store for sessions
-struct MemoryStore{K, V} <: AbstractSessionStore
+struct MemoryStore{K, V} <: AbstractSessionStore{K, V}
     data::Dict{K, SessionPayload{V}}
     lock::Base.ReentrantLock
     MemoryStore{K, V}() where {K, V} = new{K, V}(Dict{K, SessionPayload{V}}(), Base.ReentrantLock())
@@ -122,7 +147,6 @@ function get_session(store::MemoryStore{K, V}, key::K) where {K, V}
         end
 
         if payload.expires <= Dates.now(Dates.UTC)
-            delete!(store.data, key)
             return nothing
         end
 
@@ -198,22 +222,46 @@ struct LazyRequest
     req::HTTP.Request
 end
 
+LazyRequest(; request::HTTP.Request) = LazyRequest(request)
+
+function Base.getproperty(request::LazyRequest, sym::Symbol)
+    if sym === :request
+        return getfield(request, :req)
+    end
+    return getfield(request, sym)
+end
+
 pathparams(req::HTTP.Request) = HTTP.getparams(req)
 queryvars(req::HTTP.Request)  = HTTP.queryparams(req)
-headers(req::HTTP.Request)   = HTTP.headers(req)
+headers(req::HTTP.Request)   = Dict(String(k) => String(v) for (k, v) in HTTP.headers(req))
 
 jsonbody(req::HTTP.Request; kwargs...) = json(req; kwargs...)
 formbody(req::HTTP.Request)           = formdata(req)
 textbody(req::HTTP.Request)           = text(req)
 
+pathparams(request::LazyRequest) = pathparams(request.req)
+queryvars(request::LazyRequest) = queryvars(request.req)
+headers(request::LazyRequest) = headers(request.req)
+
+jsonbody(request::LazyRequest; kwargs...) = jsonbody(request.req; kwargs...)
+formbody(request::LazyRequest) = formbody(request.req)
+textbody(request::LazyRequest) = textbody(request.req)
+
 # ─── Routing ──────────────────────────────────────────────────────────
 
 @kwdef struct RouteDefinition
-    path::String
-    method::String
+    pattern::String
     handler::Function
-    middleware::Vector{Function} = Function[]
+    methods::Vector{String} = String[]
     name::Nullable{String} = nothing
+    middleware::Nullable{Vector} = nothing
+    type_hints::Dict{Symbol, Type} = Dict{Symbol, Type}()
 end
+
+RouteDefinition(pattern::String, handler::Function, methods::Vector{String}, name, middleware, type_hints) =
+    RouteDefinition(; pattern, handler, methods, name, middleware, type_hints)
+
+RouteDefinition(path::String, method::String, handler::Function, middleware::Vector{Function}, name::Nullable{String}) =
+    RouteDefinition(; pattern=path, handler, methods=[method], name, middleware, type_hints=Dict{Symbol, Type}())
 
 end # module Types

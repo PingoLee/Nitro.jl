@@ -7,7 +7,7 @@ using ..Errors: ValidationError
 export recursive_merge, parseparam, 
     redirect, handlerequest,
     format_response!, set_content_size!, format_sse_message,
-    join_url_path
+    join_url_path, is_test
 
 ### Request helper functions ###
 
@@ -303,6 +303,10 @@ end
 
 join_url_path(::Nothing, route::String) :: String = route
 join_url_path(prefix::String, ::Nothing) :: String = prefix
+
+function is_test()
+    return haskey(ENV, "JULIA_TESTING") || haskey(ENV, "PK_TESTING")
+end
 
 # """
 #     generate_parser(func::Function, pathparams::Vector{Tuple{String,Type}})

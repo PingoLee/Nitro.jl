@@ -308,6 +308,20 @@ function format_cookie(
     return join(parts, "; ")
 end
 
+function format_cookie(name::String, value::String, config::CookieConfig)
+    return format_cookie(
+        name,
+        value;
+        path=config.path,
+        domain=config.domain,
+        expires=config.expires,
+        maxage=config.maxage,
+        httponly=config.httponly,
+        secure=config.secure,
+        samesite=config.samesite,
+    )
+end
+
 # ============================================================================
 # SECTION 3: Public API (Get/Set)
 # ============================================================================

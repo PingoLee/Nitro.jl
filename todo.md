@@ -32,6 +32,7 @@ This file tracks what Nitro itself should do, and what should live in reusable a
 
 ### Request/Response Ergonomics
 - [x] Standardize on `req.params`, `req.query`, `req.session`, and `req.ip` for handler ergonomics.
+- [x] Standardize on `req.user` for authenticated handler ergonomics.
 - [x] Keep `Res.json()`, `Res.status()`, and `Res.send()` as the default response style in examples and docs.
 - [x] Provide lazy request accessors via `LazyRequest` (JSON, form, text, headers).
 - [x] Implement `req.input` (or `req.data`) as a unified accessor that merges path parameters, query string, and body (JSON or Form).
@@ -39,6 +40,7 @@ This file tracks what Nitro itself should do, and what should live in reusable a
 - [x] Improve docs for request parsing so Genie users have a clear migration path.
 - [x] Add `req.form` and `req.json` shorthands to `HTTP.Request` extension in `src/core.jl`.
 - [x] Ensure `Res` module includes common helper for file downloads and custom redirects.
+- [x] Re-verify ergonomics/body parser behavior after rebase via focused tests and full `Pkg.test()`.
 
 ### Security Foundation
 - [x] Keep Nitro security primitives generic: cookie helpers, session middleware, bearer middleware, guards, CORS, IP extraction, and rate limiting.
@@ -91,3 +93,75 @@ This file tracks what Nitro itself should do, and what should live in reusable a
 > process-local database connections, and `Channel`-backed queues. A separate worker process
 > means another Julia cold start, re-established DB connections, and IPC overhead — not worth
 > it for a single-machine server. Keep everything in-process with `Threads.@spawn`.
+
+Folder layout inside the app:
+```
+src/Workers/
+  registry.jl    ← TASK_REGISTRY, TASK_LOCK, TaskInfo, TaskStatus enum
+  queue.jl       ← SequentialQueue, queue processor (Threads.@spawn only — no @async)
+  execution.jl   ← _execute_queued_task, retry logic, timeout_call
+  api.jl         ← submit_task, submit_sequential_task, get_task_status,
+                    cancel_task, get_all_tasks, get_queue_status
+```
+
+- [x] Ported orignal `bi_server` background task logic to Nitro.jl infrastructure.
+- [x] Refactor Workers into the folder layout above, replacing the flat single-file module.
+- [x] **Fix threading bug**: replace `@async` in `_execute_task_async` with `Threads.@spawn`; `@async` runs on thread 1 alongside HTTP coordination and can stall the web server under load.
+- [x] Keep sequential queue processor strictly on `Threads.@spawn` (already correct).
+- [x] Make cancellation semantics explicit: document that `schedule(task, InterruptException())` is best-effort and not guaranteed to interrupt blocking I/O.
+- [x] Add structured logging and error formatting for long-running jobs. (Added `TaskStatus` and detailed `TaskInfo` tracking)
+- [x] Add tests for queue order, retry behavior, cancellation, timeout, and duplicate submission. (Verified in [test/workerstests.jl](test/workerstests.jl))
+- [ ] Extract to `NitroWorkers.jl` when: (a) a second Nitro project needs the same machinery, or (b) workers need to scale independently of the web server.
+
+## PormG Integration
+
+> PormG is not published to the Julia general registry. **Do not use path dependencies
+> for anything beyond local solo development** — path deps break silently on any machine
+> where the relative directory layout differs.
+
+**Recommended dependency strategy by stage:**
+
+| Stage | How to add PormG |
+|---|---|
+| Local dev now | `{url = "https://github.com/PingoLee/PormG.jl", rev = "main"}` in `[sources]` |
+| Production deploy | Same git URL, pin `rev` to a specific commit hash for reproducibility |
+| When PormG stabilizes | Publish to a private registry via `LocalRegistry.jl`; then `add PormG` works normally |
+
+- [ ] Replace `path = "../PormG.jl"` in bi_server `Project.toml` with a git URL source.
+- [ ] Pin `rev` to a specific commit hash before any production deployment.
+- [ ] Keep PormG outside Nitro core; never import it from `src/`.
+- [ ] If any Nitro package extension for PormG is needed, keep it under `ext/` only as a weak dependency.
+- [ ] When PormG's API stabilizes, set up a private registry with `LocalRegistry.jl`.
+
+## BI Server Migration Plan
+
+- [ ] Audit every route in the Genie server and classify it as auth, BI API, BPA API, worker control, or infrastructure.
+- [x] Create a typed `AppConfig` in the BI server app with sections for server, auth, workers, and PormG/database settings. (Documented example in [docs/src/tutorial/bi_app_config.md](/home/pingo03/app/Nitro.jl/docs/src/tutorial/bi_app_config.md))
+- [x] Create a migration instruction file for the new workspace. (Created [.github/instructions/nitro-migration.instructions.md](.github/instructions/nitro-migration.instructions.md))
+- [ ] Load BI server config in the app layer from env-specific files plus environment variables, then inject it into Nitro via app context.
+- [ ] Move auth behavior into the reusable auth app instead of rebuilding it per project.
+- [ ] Move task queue behavior into the reusable worker app instead of putting it in Nitro core.
+- [ ] Port Genie routes to Nitro route modules using `path()` and `urlpatterns()`.
+- [ ] Replace Genie payload helpers with Nitro request accessors and extractor-based parsing.
+- [ ] Replace Genie cookie helpers with Nitro cookie/session helpers or the reusable auth app.
+- [ ] Keep BPA query/dataframe logic in the BI app, not in Nitro core.
+- [ ] Keep sync endpoints as web triggers that enqueue worker jobs, rather than doing job orchestration in the HTTP framework.
+- [ ] Replace checked-in sensitive config values with environment variables or non-committed local config.
+- [ ] Add migration examples from Genie handlers to Nitro handlers for login, protected JSON, BPA read endpoints, and worker status endpoints.
+
+## Tests And Docs
+- [x] Add tests that reflect the new direction: routing, security primitives, session configuration, CORS, and extension points.
+- [x] Add tests for local-development cookie behavior and production-secure cookie behavior.
+- [x] Run full `Pkg.test()` successfully after the request/response and auth refactors were rebased.
+- [ ] Write one full example app using Nitro + reusable auth app.
+- [ ] Write one full example app using Nitro + reusable worker app.
+- [ ] Write one full example app using Nitro + external PormG app.
+- [x] Update README and docs so Genie users understand what belongs in Nitro core vs app packages.
+- [ ] Keep test style consistent and easy to extend for app packages.
+
+## Success Criteria
+- [ ] Nitro core stays small, reusable, and framework-focused.
+- [x] JWT/auth can be reused across multiple Nitro projects without copying code.
+- [ ] Worker queues can be reused across multiple Nitro projects without re-embedding background logic in the server.
+- [ ] PormG remains optional and external.
+- [ ] A BI server can be rebuilt on Nitro by composing Nitro + auth app + worker app + PormG app.

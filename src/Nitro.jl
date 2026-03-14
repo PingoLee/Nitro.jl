@@ -11,9 +11,10 @@ end
 include("core.jl"); using .Core
 include("Auth.jl"); using .Auth
 include("instances.jl"); using .Instances
+include("Workers.jl"); using .Workers
 
 import HTTP: Request, Response, Stream, WebSocket, queryparams
-using .Core: ServerContext, Server, Nullable, HOFRouter
+using .Core: ServerContext, Nullable, HOFRouter
 using .Core: GET, POST, PUT, DELETE, PATCH
 
 const CONTEXT :: Ref{ServerContext} = Ref(ServerContext())
@@ -50,8 +51,10 @@ export  @oxidize, @oxidise,
         # Cookies & Security
         configcookies, get_cookie, set_cookie!, Cookies, Errors,
         # Middleware
-        BearerAuth, Cors, RateLimiter, ExtractIP,
+        BearerAuth, CookieAuthMiddleware, Cors, RateLimiter, ExtractIP,
         SessionMiddleware, GuardMiddleware, login_required, role_required, permission_required, CSRFMiddleware,
+        # Optional app extensions
+        Workers,
         # Auth module
         Auth,
         # Common HTTP Types

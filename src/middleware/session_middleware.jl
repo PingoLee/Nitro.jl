@@ -3,10 +3,10 @@ module SessionMiddleware_
 using HTTP
 using Dates
 using JSON
+using UUIDs
 using ...Types: AbstractSessionStore, MemoryStore, SessionPayload, Nullable
-using ...Types: get_session, set_session!, delete_session!, cleanup_expired_sessions!
 using ...Types: CookieConfig
-using ...Cookies: format_cookie, get_cookie
+using ...Cookies: format_cookie, get_cookie, storesession!, prunesessions!
 
 export SessionMiddleware
 
@@ -22,7 +22,7 @@ function SessionMiddleware(;
     cookie_name::String = "nitro_session",
     secret_key::Nullable{String} = nothing,
     max_age::Int = 86400,
-    store::AbstractSessionStore = DEFAULT_STORE,
+    store::AbstractSessionStore{String, Dict{String,Any}} = DEFAULT_STORE,
     prune_probability::Float64 = 0.01,
     secure::Bool = true,
     httponly::Bool = true,
@@ -44,12 +44,13 @@ function SessionMiddleware(;
         return function(req::HTTP.Request)
             # Probabilistic pruning of expired sessions
             if rand() < prune_probability
-                cleanup_expired_sessions!(store)
+                prunesessions!(store)
             end
 
             # 1. Load or create session
             session_id = _get_session_id(req, cookie_name)
             session_data, is_new = _load_session(store, session_id)
+            original_session = deepcopy(session_data)
 
             # Generate a new session ID if there's no existing valid one
             if is_new
@@ -59,15 +60,18 @@ function SessionMiddleware(;
             # 2. Inject session into request
             req.context[:session] = session_data
             req.context[:session_id] = session_id
+            req.context[:user] = session_data
 
             # 3. Call next handler
             response = handle(req)
 
             # 4. Save session and set cookie
-            _save_session(store, session_id, req.context[:session], max_age)
-            
-            # Add Set-Cookie header to response
-            HTTP.setheader(response, "Set-Cookie" => format_cookie(cookie_name, session_id, config))
+            current_session = req.context[:session]
+            session_changed = is_new || current_session != original_session
+            if session_changed
+                _save_session(store, session_id, current_session, max_age)
+                HTTP.setheader(response, "Set-Cookie" => format_cookie(cookie_name, session_id, config))
+            end
 
             return response
         end
@@ -79,24 +83,32 @@ function _get_session_id(req::HTTP.Request, cookie_name::String)
 end
 
 function _generate_session_id()
-    return Base.UUIDs.uuid4() |> string
+    return string(UUIDs.uuid4())
 end
 
-function _load_session(store::AbstractSessionStore, session_id::Nullable{String})
+function _load_session(store::AbstractSessionStore{String, Dict{String,Any}}, session_id::Nullable{String})
     if isnothing(session_id)
         return Dict{String,Any}(), true
     end
 
-    data = get_session(store, session_id)
-    if isnothing(data)
+    payload = Base.get(store, session_id, nothing)
+    if isnothing(payload)
         return Dict{String,Any}(), true
     end
 
+    if payload isa SessionPayload
+        if payload.expires <= Dates.now(Dates.UTC)
+            return Dict{String,Any}(), true
+        end
+        return copy(payload.data), false
+    end
+
+    data = payload isa AbstractDict ? copy(payload) : payload
     return data, false
 end
 
-function _save_session(store::AbstractSessionStore, session_id::String, data::Dict{String,Any}, max_age::Int)
-    set_session!(store, session_id, data; ttl=max_age)
+function _save_session(store::AbstractSessionStore{String, Dict{String,Any}}, session_id::String, data::Dict{String,Any}, max_age::Int)
+    storesession!(store, session_id, data; ttl=max_age)
 end
 
 end # module SessionMiddleware_

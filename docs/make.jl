@@ -11,6 +11,7 @@ makedocs(
         "api.md",
         "Manual" => [
             "tutorial/first_steps.md",
+            "tutorial/bi_app_config.md",
             "tutorial/request_types.md",
             "tutorial/path_parameters.md",
             "tutorial/query_parameters.md",
