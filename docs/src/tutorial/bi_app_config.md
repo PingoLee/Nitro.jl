@@ -138,7 +138,25 @@ serve(host=config.server_host, port=config.server_port, context=config)
 3. Build `AppConfig`.
 4. Initialize external packages such as `PormG` from the app layer.
 5. Build routes, middleware, and worker hooks.
-6. Start Nitro with `serve(context=config)`.
+6. If you use `Nitro.Workers`, attach `worker_startup(...)` in the `serve(middleware=[...])` list.
+7. Start Nitro with `serve(context=config)`.
+
+For example:
+
+```julia
+serve(
+    host=config.server_host,
+    port=config.server_port,
+    context=config,
+    middleware=[
+        worker_startup(
+            queues=["agendamento"],
+            cleanup_interval_hours=24,
+            cleanup_retain_days=7,
+        ),
+    ],
+)
+```
 
 For the BI server migration, this config object is the bridge between the old Genie layout
 and the new Nitro app bootstrap.

@@ -140,4 +140,39 @@ end
     end
 end
 
+@testset "Public worker startup API bootstraps lifecycle" begin
+    ctx = Nitro.Core.ServerContext()
+
+    lifecycle = startup(
+        ctx;
+        queues=["reports"],
+        cleanup_enabled=true,
+        cleanup_interval_hours=0.00005,
+        cleanup_retain_days=7,
+    )
+
+    processed = Nitro.Core.process_middleware(ctx, [lifecycle])
+    @test length(processed) == 1
+    @test isnothing(worker_store(ctx))
+
+    lifecycle.on_startup()
+
+    store = worker_store(ctx)
+    @test store isa InMemoryWorkerStore
+    @test get_queue_status(ctx, "reports")[:running] == true
+    @test store.cleanup_scheduler[] isa CleanupScheduler
+
+    lock(store.task_lock) do
+        expired = TaskInfo("lifecycle-expired")
+        expired.status = COMPLETED
+        expired.completed_at = Dates.now(Dates.UTC) - Dates.Day(10)
+        store.task_registry[expired.id] = expired
+    end
+
+    @test wait_for(() -> get_task_status(ctx, "lifecycle-expired")[:status] == "NOT_FOUND") == :ok
+
+    lifecycle.on_shutdown()
+    @test isnothing(worker_store(ctx))
+end
+
 end

@@ -44,6 +44,15 @@ function serveparallel(; kwargs...)
 end
 
 
+"""
+    worker_startup(; kwargs...)
+
+Create a lifecycle middleware that starts `Nitro.Workers` when `serve()` starts and
+shuts the worker runtime down when the server terminates.
+"""
+worker_startup(; kwargs...) = Nitro.Workers.startup(CONTEXT[]; kwargs...)
+
+
 ### Core Routing Functions (Internal plumbing for path() and urlpatterns()) ###
 
 function route(methods::Vector{String}, path::Union{String,HOFRouter}, func::Function)

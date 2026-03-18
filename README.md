@@ -167,7 +167,96 @@ Recommended bootstrap flow:
 1. Load config in your app.
 2. Run app initializers.
 3. Build route modules with `path()` and `urlpatterns()`.
-4. Start Nitro with `serve(context=app_config)`.
+4. Attach worker lifecycle middleware if your app uses `Nitro.Workers`.
+5. Start Nitro with `serve(context=app_config)`.
+
+## Development Hot Reload
+
+Nitro supports optional hot reload through `Revise.jl`.
+
+The important rule is simple:
+
+- development: load `Revise` before `Nitro`
+- production: do not load `Revise`
+
+Example for a simple app:
+
+```julia
+using Revise
+using Nitro
+
+urlpatterns("",
+    path("/health", req -> Res.json(Dict("ok" => true)), method="GET"),
+)
+
+serve(revise=:lazy)
+```
+
+Valid `revise` values are:
+
+- `:none` disables hot reload
+- `:lazy` checks for revisions before each request
+- `:eager` waits for file change notifications and revises in the background
+
+For production, start Nitro normally:
+
+```julia
+using Nitro
+
+serve()
+```
+
+If you use a package wrapper around Nitro, such as an application module with a `start_server()` function,
+that wrapper should expose a `revise` keyword and forward it to `serve(...)`.
+
+For example:
+
+```julia
+function start_server(; revise=:none, async=false)
+    serve(; revise=revise, async=async)
+end
+```
+
+Then an end user can run the app in development like this:
+
+```julia
+using Revise
+using MyApp
+
+MyApp.start_server(revise=:lazy)
+```
+
+This is the recommended setup for package-based Nitro applications.
+
+## Worker Startup
+
+`Nitro.Workers` already provides task submission APIs. For app bootstrapping, use the public
+startup helpers instead of reaching into the worker internals.
+
+```julia
+using HTTP
+using Nitro
+
+queues = ["reports", "agendamento"]
+
+urlpatterns("",
+    path("/health", req -> Res.json(Dict("ok" => true)), method="GET"),
+)
+
+serve(
+    context=my_config,
+    middleware=[
+        worker_startup(
+            queues=queues,
+            cleanup_interval_hours=24,
+            cleanup_retain_days=7,
+        ),
+    ],
+)
+```
+
+If you need to prepare workers outside server startup, use `Nitro.Workers.start!(ctx; ...)`
+with a `ServerContext` directly.
 
 ## Session Middleware
 

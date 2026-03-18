@@ -1,6 +1,7 @@
 ﻿module UtilTests
 using Test
 using Nitro.Core.Util
+using Nitro.Core: serverwelcome
 
 @testset "join_url_path" begin
     # prefix == nothing returns route verbatim (current implementation)
@@ -83,6 +84,35 @@ end
     longp = "/" * repeat("a", 1000)
     longr = "/" * repeat("b", 1000)
     @test join_url_path(longp, longr) == "/" * repeat("a", 1000) * "/" * repeat("b", 1000)
+end
+
+@testset "serverwelcome banner includes environment when available" begin
+    output = mktemp() do path, io
+        redirect_stdout(io) do
+            withenv("NITRO_ENV" => "dev") do
+                serverwelcome("http://127.0.0.1:8080", nothing, false)
+            end
+        end
+        flush(io)
+        read(path, String)
+    end
+
+    @test occursin("Environment: dev", output)
+    @test occursin("Starting server at http://127.0.0.1:8080", output)
+
+    output_without_env = mktemp() do path, io
+        redirect_stdout(io) do
+            withenv("NITRO_ENV" => nothing) do
+                serverwelcome("http://127.0.0.1:8080", "/api", true)
+            end
+        end
+        flush(io)
+        read(path, String)
+    end
+
+    @test !occursin("Environment:", output_without_env)
+    @test occursin("Global prefix: /api", output_without_env)
+    @test occursin("parallel mode:", output_without_env)
 end
 
 end

@@ -12,6 +12,8 @@ makedocs(
         "Manual" => [
             "tutorial/first_steps.md",
             "tutorial/bi_app_config.md",
+            "tutorial/hot_reload.md",
+            "tutorial/workers.md",
             "tutorial/request_types.md",
             "tutorial/path_parameters.md",
             "tutorial/query_parameters.md",

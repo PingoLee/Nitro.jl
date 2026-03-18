@@ -10,7 +10,7 @@ using Dates
 using Reexport
 using DataStructures: CircularDeque
 import Base.Threads: lock, nthreads
-import ..WAS_LOADED_AFTER_REVISE
+import ..has_revise_hooks, ..revise_hooks
 
 include("errors.jl");       @reexport using .Errors
 include("util.jl");         @reexport using .Util
@@ -162,42 +162,36 @@ function payload(req::HTTP.Request)::Dict{String, Any}
     return req.input
 end
 
-nitro_title = raw"""
-   ____                            
-  / __ \_  ____  ______ ____  ____ 
- / / / / |/_/ / / / __ `/ _ \/ __ \
-/ /_/ />  </ /_/ / /_/ /  __/ / / /
-\____/_/|_|\__, /\__, /\___/_/ /_/ 
-          /____//____/   
-
-"""
-
 function serverwelcome(external_url::String, prefix::Nullable{String}, parallel::Bool)
-    printstyled(nitro_title, color=:blue, bold=true)
-    server_url = join_url_path(external_url, prefix)
-    @info "📦 Version 1.10.0 (2026-01-01)"
-    if !isnothing(prefix)
-        @info "🏷️  Global path prefix: $prefix"
-    end
-    @info "✅ Started server: $server_url"
+    server_url = Util.join_url_path(external_url, prefix)
+    curr_time = Dates.format(now(), "yyyy-mm-dd HH:MM:SS")
+    current_env = get(ENV, "NITRO_ENV", nothing)
+    
+    printstyled(" Nitro 1.10.0 ", color=:cyan, reverse=true, bold=true)
     if parallel
-        @info "🚀 Running in parallel mode with $(Threads.nthreads()) threads"
-        if nthreads(:interactive) == 0
-            @warn """
-            🚨 Interactive threadpool is empty. This can hurt performance when running in parallel mode.
-            Try launching julia like \"julia --threads 3,1\" to add 1 thread to the interactive threadpool.
-            """
-        end
+        printstyled(" (parallel mode: $(Threads.nthreads()) threads)", color=:light_black)
     end
+    println("\n$curr_time")
+    if !isnothing(current_env)
+        println("Environment: $current_env")
+    end
+    
+    if !isnothing(prefix)
+        println("Global prefix: $prefix")
+    end
+    
+    print("Starting server at ")
+    printstyled("$server_url\n", color=:cyan, bold=true)
+    println("Quit the server with CONTROL-C.")
 end
 
 function ReviseHandler()
     return function(handle)
         return function(req::HTTP.Request)
-            Revise = Main.Revise
-            if !isempty(Revise.revision_queue)
+            hooks = revise_hooks()
+            if hooks !== nothing && Base.invokelatest(hooks.has_pending_revisions)
                 @info "🔴 Starting pre-request revision"
-                Revise.revise()
+                Base.invokelatest(hooks.revise)
                 @info "🟢 Pre-request revision finished"
             end
             invokelatest(handle, req)
@@ -250,8 +244,8 @@ function serve(ctx::ServerContext;
         if parallel
             @warn "You are attempting to use Revise with multiple threads. Please note that Revise 3.5.18 and earlier are not threadsafe."
         end
-        if !WAS_LOADED_AFTER_REVISE[]
-            error("You must load Revise.jl before Nitro.jl to use the `revise` option")
+        if !has_revise_hooks()
+            error("Revise support is unavailable. Load Revise.jl in your development session before using the `revise` option")
         end
         if ctx.mod === nothing
             @warn "You are trying to use the `revise` option without @oxidize. Code in the `Main` module, which likely includes your routes, will not be tracked and revised."
@@ -292,17 +286,20 @@ end
 function start_revise_service()
     revise_task_done = Ref(false)
     revise_task = @async begin
-        Revise = Main.Revise
+        hooks = revise_hooks()
+        if hooks === nothing
+            return nothing
+        end
         while true
             if revise_task_done[]
                 break
             end
-            wait(Revise.revision_event)
+            Base.invokelatest(hooks.wait_for_revision_event)
             if revise_task_done[]
                 break
             end
             @info "🗘  Starting eager revision"
-            Revise.revise()
+            Base.invokelatest(hooks.revise)
             @info "👍 Eager revision finished"
         end
     end

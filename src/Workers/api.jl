@@ -7,6 +7,76 @@ function _resolve_store(ctx::ServerContext; key::Symbol=DEFAULT_EXTENSION_KEY, s
     return isnothing(ctx_store) ? default_store() : ctx_store
 end
 
+function _install_or_resolve_store!(ctx::ServerContext; key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
+    if isnothing(store)
+        existing_store = worker_store(ctx; key)
+        return isnothing(existing_store) ? install!(ctx; key) : existing_store
+    end
+
+    install!(ctx; key, store)
+    return store
+end
+
+function start!(ctx::ServerContext;
+    queues::AbstractVector{<:AbstractString}=String[],
+    cleanup_enabled::Bool=true,
+    cleanup_interval_hours::Real=24,
+    cleanup_retain_days::Int=7,
+    key::Symbol=DEFAULT_EXTENSION_KEY,
+    store::Union{Nothing, AbstractWorkerStore}=nothing,
+)
+    resolved_store = _install_or_resolve_store!(ctx; key, store)
+    resolved_store isa InMemoryWorkerStore || throw(MethodError(start!, (ctx, resolved_store)))
+
+    for queue_name in queues
+        _start_queue_processor(resolved_store, String(queue_name))
+    end
+
+    if cleanup_enabled
+        start_cleanup_scheduler(; interval_hours=cleanup_interval_hours, retain_days=cleanup_retain_days, store=resolved_store)
+    else
+        stop_cleanup_scheduler!(resolved_store)
+    end
+
+    return resolved_store
+end
+
+function startup(ctx::ServerContext;
+    queues::AbstractVector{<:AbstractString}=String[],
+    cleanup_enabled::Bool=true,
+    cleanup_interval_hours::Real=24,
+    cleanup_retain_days::Int=7,
+    key::Symbol=DEFAULT_EXTENSION_KEY,
+    store::Union{Nothing, AbstractWorkerStore}=nothing,
+)
+    queue_names = String.(collect(queues))
+
+    passthrough = function(handle::Function)
+        return function(req)
+            return handle(req)
+        end
+    end
+
+    on_startup = () -> begin
+        start!(ctx;
+            queues=queue_names,
+            cleanup_enabled=cleanup_enabled,
+            cleanup_interval_hours=cleanup_interval_hours,
+            cleanup_retain_days=cleanup_retain_days,
+            key=key,
+            store=store,
+        )
+        return nothing
+    end
+
+    on_shutdown = () -> begin
+        uninstall!(ctx; key)
+        return nothing
+    end
+
+    return LifecycleMiddleware(; middleware=passthrough, on_startup, on_shutdown)
+end
+
 function _register_or_watch!(store::InMemoryWorkerStore, task_key::String, user_id::String; queue_name::Union{Nothing, String}=nothing)
     should_start = false
 

@@ -26,12 +26,14 @@ UUIDs = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
 Mustache = "ffc61752-8dc7-55ee-8c37-f3e9cdd09e70"
 OteraEngine = "b2d7f28f-acd6-4007-8b26-bc27716e5513"
 ProtoBuf = "3349acd9-ac6a-5e09-bcdb-63829b23a429"
+Revise = "295af30f-e4ad-537b-8983-00126c2a3abe"
 TimeZones = "f269a46b-ccf7-5d73-abea-4c690281aa53"
 
 [extensions]
 MustacheExt = "Mustache"
 OteraEngineExt = "OteraEngine"
 ProtoBufExt = "ProtoBuf"
+NitroReviseExt = "Revise"
 TimeZonesExt = "TimeZones"
 
 [compat]
@@ -50,6 +52,7 @@ Printf = "^1"
 ProtoBuf = "^1"
 Random = "^1"
 Reexport = "^1"
+Revise = "^3"
 SHA = "^0.7"
 Sockets = "^1"
 StructTypes = "^1"
@@ -59,8 +62,9 @@ julia = "^1.10"
 
 [extras]
 Pkg = "44cfe95a-1eb2-52ea-b672-e2afdf69b78f"
+Revise = "295af30f-e4ad-537b-8983-00126c2a3abe"
 Suppressor = "fd094767-a336-5f1f-9728-57cf17d0bbfb"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["Mustache", "OteraEngine", "ProtoBuf", "Pkg", "Suppressor", "Test", "TimeZones"]
+test = ["Mustache", "OteraEngine", "ProtoBuf", "Pkg", "Revise", "Suppressor", "Test", "TimeZones"]

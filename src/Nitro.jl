@@ -1,12 +1,25 @@
 module Nitro
 
-const WAS_LOADED_AFTER_REVISE :: Ref{Bool} = Ref(false)
-
-function __init__()
-    if isdefined(Main, :Revise)
-        WAS_LOADED_AFTER_REVISE[] = true
-    end
+Base.@kwdef struct ReviseHooks
+    revise::Function
+    has_pending_revisions::Function
+    wait_for_revision_event::Function
 end
+
+const REVISE_HOOKS :: Ref{Union{Nothing, ReviseHooks}} = Ref{Union{Nothing, ReviseHooks}}(nothing)
+
+function register_revise_hooks!(; revise::Function, has_pending_revisions::Function, wait_for_revision_event::Function)
+    REVISE_HOOKS[] = ReviseHooks(; revise, has_pending_revisions, wait_for_revision_event)
+    return REVISE_HOOKS[]
+end
+
+function clear_revise_hooks!()
+    REVISE_HOOKS[] = nothing
+    return nothing
+end
+
+revise_hooks() = REVISE_HOOKS[]
+has_revise_hooks() = !isnothing(REVISE_HOOKS[])
 
 include("core.jl"); using .Core
 include("Auth.jl"); using .Auth
@@ -39,7 +52,9 @@ end
 export  @oxidize, @oxidise,
         # Server lifecycle
     serve, terminate, internalrequest,
+    worker_startup,
     resetstate, instance, router,
+        register_revise_hooks!, clear_revise_hooks!,
         # File serving
         staticfiles, dynamicfiles, spafiles,
         # Util
