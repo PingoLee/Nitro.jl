@@ -34,7 +34,6 @@ const CONTEXT :: Ref{ServerContext} = Ref(ServerContext())
 
 include("exts.jl")
 include("methods.jl")
-include("deprecated.jl")
 
 macro oxidize()
     quote
@@ -49,7 +48,7 @@ macro oxidize()
     end |> esc
 end
 
-export  @oxidize, @oxidise,
+export  @oxidize,
         # Server lifecycle
     serve, terminate, internalrequest,
     worker_startup,

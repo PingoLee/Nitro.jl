@@ -2,19 +2,15 @@ module Constants
 using HTTP
 
 
-export PACKAGE_DIR, DATA_PATH,
+export PACKAGE_DIR,
     GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS, CONNECT, TRACE, 
     HTTP_METHODS,
     WEBSOCKET, STREAM,
-    SPECIAL_METHODS, METHOD_ALIASES, TYPE_ALIASES,
-    SWAGGER_VERSION, REDOC_VERSION
+    SPECIAL_METHODS, METHOD_ALIASES, TYPE_ALIASES
 
 # Generate a reliable path to our package directory
 const PACKAGE_DIR = @__DIR__
 
-# Generate a reliable path to our internal data folder that works when the 
-# package is used with PackageCompiler.jl
-const DATA_PATH = joinpath(@__DIR__, "..", "data")
 
 # HTTP Methods
 const GET       :: String   = "GET"
@@ -45,8 +41,5 @@ const TYPE_ALIASES :: Dict{String, Type} = Dict(
     WEBSOCKET   => HTTP.WebSockets.WebSocket,
     STREAM      => HTTP.Streams.Stream
 )
-
-const SWAGGER_VERSION   :: String = "swagger@5.7.2"
-const REDOC_VERSION     :: String = "redoc@2.1.2"
 
 end
