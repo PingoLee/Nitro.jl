@@ -7,7 +7,7 @@ using Suppressor
 using ProtoBuf
 using ..Constants
 using Nitro; @oxidize
-using Nitro: extract, Param, LazyRequest, Extractor, ProtoBuffer, isbodyparam
+using Nitro: extract, Param, LazyRequest, Extractor, ProtoBuffer, isbodyparam, FormFile, Files
 
 # extend the built-in validate function
 import Nitro: validate
@@ -320,5 +320,70 @@ end
 
 end
 
+# ─── Helper to build raw multipart/form-data bytes for testing ────────
+
+function _build_multipart(; boundary::String="----TestBoundary7MA4YWxkTrZu0gW", parts::Vector)
+    io = IOBuffer()
+    for part in parts
+        write(io, "--$boundary\r\n")
+        if haskey(part, :filename)
+            write(io, "Content-Disposition: form-data; name=\"$(part[:name])\"; filename=\"$(part[:filename])\"\r\n")
+            ct = get(part, :content_type, "application/octet-stream")
+            write(io, "Content-Type: $ct\r\n")
+        else
+            write(io, "Content-Disposition: form-data; name=\"$(part[:name])\"\r\n")
+        end
+        write(io, "\r\n")
+        write(io, part[:data])
+        write(io, "\r\n")
+    end
+    write(io, "--$boundary--\r\n")
+    body = take!(io)
+    content_type = "multipart/form-data; boundary=$boundary"
+    return body, content_type
+end
+
+@testset "Files extractor - single file by name" begin
+    body, ct = _build_multipart(parts=[
+        Dict(:name => "document", :filename => "report.xlsx", :data => "fake xlsx content")
+    ])
+    req = HTTP.Request("POST", "/", ["Content-Type" => ct], body)
+    param = Param(:document, Files{FormFile}, missing, false)
+    result = extract(param, LazyRequest(request=req))
+    @test result isa Files{FormFile}
+    @test result.payload.filename == "report.xlsx"
+    @test String(result.payload.data) == "fake xlsx content"
+end
+
+@testset "Files extractor - all files" begin
+    body, ct = _build_multipart(parts=[
+        Dict(:name => "file1", :filename => "data.dbf", :data => "dbf bytes"),
+        Dict(:name => "file2", :filename => "sheet.xlsx", :data => "xlsx bytes")
+    ])
+    req = HTTP.Request("POST", "/", ["Content-Type" => ct], body)
+    param = Param(:files, Files{Vector{FormFile}}, missing, false)
+    result = extract(param, LazyRequest(request=req))
+    @test result isa Files{Vector{FormFile}}
+    @test length(result.payload) == 2
+    @test result.payload[1].filename == "data.dbf"
+    @test result.payload[2].filename == "sheet.xlsx"
+end
+
+@testset "Files extractor - missing field throws ValidationError" begin
+    body, ct = _build_multipart(parts=[
+        Dict(:name => "other", :filename => "file.txt", :data => "content")
+    ])
+    req = HTTP.Request("POST", "/", ["Content-Type" => ct], body)
+    param = Param(:document, Files{FormFile}, missing, false)
+    @test_throws Nitro.Core.Errors.ValidationError extract(param, LazyRequest(request=req))
+end
+
+@testset "Files extractor - empty multipart returns empty vector" begin
+    req = HTTP.Request("POST", "/", ["Content-Type" => "application/json"], """{}""")
+    param = Param(:files, Files{Vector{FormFile}}, missing, false)
+    result = extract(param, LazyRequest(request=req))
+    @test result isa Files{Vector{FormFile}}
+    @test isempty(result.payload)
+end
 
 end

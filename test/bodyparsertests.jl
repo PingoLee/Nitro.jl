@@ -273,4 +273,105 @@ end
 
 end
 
+# ─── Helper to build raw multipart/form-data bytes for testing ────────
+
+"""Build a raw multipart/form-data body and Content-Type header for testing."""
+function build_multipart(; boundary::String="----TestBoundary7MA4YWxkTrZu0gW", parts::Vector)
+    io = IOBuffer()
+    for part in parts
+        write(io, "--$boundary\r\n")
+        if haskey(part, :filename)
+            write(io, "Content-Disposition: form-data; name=\"$(part[:name])\"; filename=\"$(part[:filename])\"\r\n")
+            ct = get(part, :content_type, "application/octet-stream")
+            write(io, "Content-Type: $ct\r\n")
+        else
+            write(io, "Content-Disposition: form-data; name=\"$(part[:name])\"\r\n")
+        end
+        write(io, "\r\n")
+        write(io, part[:data])
+        write(io, "\r\n")
+    end
+    write(io, "--$boundary--\r\n")
+    body = take!(io)
+    content_type = "multipart/form-data; boundary=$boundary"
+    return body, content_type
+end
+
+@testset "multipart() - single file upload" begin
+    body, ct = build_multipart(parts=[
+        Dict(:name => "document", :filename => "report.xlsx", :content_type => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", :data => "fake xlsx content")
+    ])
+    req = Request("POST", "/upload", ["Content-Type" => ct], body)
+    result = multipart(req)
+
+    @test haskey(result, "document")
+    f = result["document"]
+    @test f isa FormFile
+    @test f.name == "document"
+    @test f.filename == "report.xlsx"
+    @test f.content_type == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    @test String(f.data) == "fake xlsx content"
+end
+
+@testset "multipart() - multiple files under different field names" begin
+    body, ct = build_multipart(parts=[
+        Dict(:name => "file1", :filename => "data.dbf", :content_type => "application/octet-stream", :data => "dbf bytes"),
+        Dict(:name => "file2", :filename => "sheet.xlsx", :content_type => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", :data => "xlsx bytes")
+    ])
+    req = Request("POST", "/upload", ["Content-Type" => ct], body)
+    result = multipart(req)
+
+    @test length(result) == 2
+    @test result["file1"] isa FormFile
+    @test result["file2"] isa FormFile
+    @test result["file1"].filename == "data.dbf"
+    @test result["file2"].filename == "sheet.xlsx"
+    @test String(result["file1"].data) == "dbf bytes"
+    @test String(result["file2"].data) == "xlsx bytes"
+end
+
+@testset "multipart() - multiple files under same field name" begin
+    body, ct = build_multipart(parts=[
+        Dict(:name => "attachments", :filename => "file1.dbf", :data => "content1"),
+        Dict(:name => "attachments", :filename => "file2.dbf", :data => "content2"),
+        Dict(:name => "attachments", :filename => "file3.xlsx", :data => "content3")
+    ])
+    req = Request("POST", "/upload", ["Content-Type" => ct], body)
+    result = multipart(req)
+
+    @test haskey(result, "attachments")
+    files = result["attachments"]
+    @test files isa Vector
+    @test length(files) == 3
+    @test files[1].filename == "file1.dbf"
+    @test files[2].filename == "file2.dbf"
+    @test files[3].filename == "file3.xlsx"
+end
+
+@testset "multipart() - mixed files and text fields" begin
+    body, ct = build_multipart(parts=[
+        Dict(:name => "description", :data => "My upload"),
+        Dict(:name => "file", :filename => "data.csv", :content_type => "text/csv", :data => "a,b,c\n1,2,3")
+    ])
+    req = Request("POST", "/upload", ["Content-Type" => ct], body)
+    result = multipart(req)
+
+    @test result["description"] isa String
+    @test result["description"] == "My upload"
+    @test result["file"] isa FormFile
+    @test result["file"].filename == "data.csv"
+end
+
+@testset "multipart() - non-multipart request returns empty dict" begin
+    req = Request("POST", "/upload", ["Content-Type" => "application/json"], """{"key": "value"}""")
+    result = multipart(req)
+    @test isempty(result)
+end
+
+@testset "multipart() - empty body returns empty dict" begin
+    req = Request("POST", "/upload", ["Content-Type" => "multipart/form-data; boundary=xyz"], UInt8[])
+    result = multipart(req)
+    @test isempty(result)
+end
+
 end

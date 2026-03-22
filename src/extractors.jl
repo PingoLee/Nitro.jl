@@ -5,14 +5,14 @@ using Base: @kwdef
 using HTTP
 using Dates
 
-using ..Util: text, json, formdata, parseparam
+using ..Util: text, json, formdata, multipart, parseparam, FormFile
 using ..Reflection: struct_builder, extract_struct_info
 using ..Errors: ValidationError
 using ..Types
 using ..Cookies
 
 export extract, validate, extracttype, isextractor, isreqparam, isbodyparam,
-    Path, Query, Header, Json, JsonFragment, Form, Body, Cookie, Session
+    Path, Query, Header, Json, JsonFragment, Form, Body, Cookie, Session, Files
 
 """
 Given a classname, build a new Extractor class
@@ -55,6 +55,7 @@ end
 @extractor JsonFragment
 @extractor Form
 @extractor Body
+@extractor Files
 
 function extracttype(::Type{U}) where {T, U <: Extractor{T}}
     return T
@@ -69,7 +70,7 @@ function isreqparam(::Param{U}) where {T, U <: Extractor{T}}
 end
 
 function isbodyparam(::Param{U}) where {T, U <: Extractor{T}}
-    return U <: Union{Json{T}, JsonFragment{T}, Form{T}, Body{T}}
+    return U <: Union{Json{T}, JsonFragment{T}, Form{T}, Body{T}, Files{T}}
 end
 
 # Generic validation function - if no validate function is defined for a type, return true
@@ -289,6 +290,60 @@ function extract(param::Param{Session{T}}, request::LazyRequest, secret_key::Nul
     
     valid_instance = try_validate(param, instance)
     return Session(session_cookie_name, valid_instance)
+end
+
+"""
+    extract(param::Param{Files{Vector{FormFile}}}, request::LazyRequest) :: Files{Vector{FormFile}}
+
+Extracts **all** uploaded files from a `multipart/form-data` request body.
+
+Returns a `Files` wrapper whose `.payload` is a `Vector{FormFile}`.
+If the request is not multipart or contains no files, the vector is empty.
+"""
+function extract(param::Param{Files{Vector{FormFile}}}, request::LazyRequest) :: Files{Vector{FormFile}}
+    instance = safe_extract(param) do
+        parsed = multipartbody(request)
+        files = FormFile[]
+        for (_, value) in parsed
+            if value isa FormFile
+                push!(files, value)
+            elseif value isa Vector{FormFile}
+                append!(files, value)
+            end
+        end
+        files
+    end
+    valid_instance = try_validate(param, instance)
+    return Files(valid_instance)
+end
+
+"""
+    extract(param::Param{Files{FormFile}}, request::LazyRequest) :: Files{FormFile}
+
+Extracts a **single** uploaded file from a `multipart/form-data` request body.
+The file is matched by the parameter name (e.g., a handler parameter named `document`
+will look for a multipart field called `"document"`).
+
+Throws a `ValidationError` if no file is found with that field name.
+"""
+function extract(param::Param{Files{FormFile}}, request::LazyRequest) :: Files{FormFile}
+    instance = safe_extract(param) do
+        parsed = multipartbody(request)
+        name = string(param.name)
+        value = get(parsed, name, nothing)
+        if isnothing(value)
+            throw(ValidationError("No file found for field '$(name)' in multipart form data"))
+        end
+        if value isa FormFile
+            value
+        elseif value isa Vector{FormFile}
+            first(value)
+        else
+            throw(ValidationError("Field '$(name)' is not a file upload"))
+        end
+    end
+    valid_instance = try_validate(param, instance)
+    return Files(valid_instance)
 end
 
 end

@@ -13,7 +13,7 @@ using ..Util
 
 export Server, Nullable, Context,
     LifecycleMiddleware, startup, shutdown,
-    Param, isrequired, LazyRequest, headers, pathparams, queryvars, jsonbody, formbody, textbody,
+    Param, isrequired, LazyRequest, headers, pathparams, queryvars, jsonbody, formbody, textbody, multipartbody,
     CookieConfig, Cookie, Session, SessionPayload,
     AbstractSessionStore, get_session, set_session!, delete_session!, cleanup_expired_sessions!,
     MemoryStore, Extractor,
@@ -238,6 +238,7 @@ headers(req::HTTP.Request)   = Dict(String(k) => String(v) for (k, v) in HTTP.he
 jsonbody(req::HTTP.Request; kwargs...) = json(req; kwargs...)
 formbody(req::HTTP.Request)           = formdata(req)
 textbody(req::HTTP.Request)           = text(req)
+multipartbody(req::HTTP.Request)      = multipart(req)
 
 pathparams(request::LazyRequest) = pathparams(request.req)
 queryvars(request::LazyRequest) = queryvars(request.req)
@@ -246,6 +247,7 @@ headers(request::LazyRequest) = headers(request.req)
 jsonbody(request::LazyRequest; kwargs...) = jsonbody(request.req; kwargs...)
 formbody(request::LazyRequest) = formbody(request.req)
 textbody(request::LazyRequest) = textbody(request.req)
+multipartbody(request::LazyRequest) = multipartbody(request.req)
 
 # ─── Routing ──────────────────────────────────────────────────────────
 

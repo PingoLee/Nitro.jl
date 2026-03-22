@@ -77,6 +77,14 @@ dynamicfiles
 spafiles
 ```
 
+## File Uploads
+
+```@docs
+FormFile
+multipart
+Files
+```
+
 ## Utilities
 
 ```@docs
