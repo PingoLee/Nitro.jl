@@ -1,60 +1,98 @@
-﻿# Request Types 
+﻿# Request Types
 
-When designing an API you need to first think about what `type` of requests
-and what `routes` or `paths` your api would need to function. 
+Every HTTP request has a **method** that communicates the *intent* of the operation.
+When designing an API, choosing the right method makes your endpoints
+predictable and consistent with production standards.
 
-For example, if we were to design a weather app we'd probably want a way to lookup weather alerts for a particular state
+## HTTP Methods in Practice
+
+For Nitro.jl-style applications, two methods cover virtually all real-world needs:
+
+| Method | Purpose | When to use |
+|--------|---------|-------------|
+| `GET`  | Fetch / query data | Reading records, dashboards, status checks |
+| `POST` | Submit data / trigger an action | Creating records, imports, syncs, complex lookups |
+
+> `PUT`, `PATCH`, and `DELETE` are supported, but action-oriented backends (like BI data pipelines)
+> naturally favor `POST` for any operation that involves a payload or a side-effect.
+
+## Anatomy of a URL
 
 ```
-http://localhost:8080/weather/alerts/{state}
+http://localhost:8080/api/worker/status/abc-123?verbose=true
+│        │      │    │                  │        │
+scheme  host  port  path           path param  query param
 ```
 
-This url can be broken down into several parts 
-- `host` → `http://localhost`
-- `port` → `8080`
-- `route` or `path` → `/weather/alerts/{state}`
-- `path parameter` → `{state}`
+## GET — Reading Data
 
-Before we start writing code for we need to answer some questions: 
-1. What kind of data manipulation is this route going to perform?
-    - Are we adding/removing/updating data? (This determines our http method)
-2. Will this endpoint need any inputs?
-    - If so, will we need to pass them through the path or inside the body of the http request?
-
-This is when knowing the different type of http methods comes in handy.
-
-Common HTTP methods:
-
-- POST → when you want to **create** some data
-- GET → when you want to **get** data
-- PUT → **update** some data if it already exists or **create** it
-- PATCH → when you want to **update** some data
-- DELETE → when you want to **delete** some data
-
-(there are more methods that aren't in this list)
-
-In the HTTP protocol, you can communicate to each path using one (or more) of these "methods".
-
-In reality you can use any of these http methods to do any of those operations. But it's heavily recommended to use the appropriate http method so that people & machines can easily understand your web api. 
-
-Now back to our web example. Lets answer those questions:
-
-1. This endpoint will return alerts from the US National Weather service api
-2. The only input we will need is the state abbreviation
-
-Since we will only be fetching data and not creating/updating/deleting anything, that means we will want to setup a `GET` route for our api to handle this type of action.
+Use `GET` when the handler only reads and returns data. Parameters come from the
+path or query string — never from the body.
 
 ```julia
-using Nitro
-using HTTP
+# src/Handlers/ProductHandlers.jl
+module ProductHandlers
 
-@get "/weather/alerts/{state}" function(req::HTTP.Request, state::String)
-    return HTTP.get("https://api.weather.gov/alerts/active?area=$state")
+using HTTP
+using Nitro
+using PormG
+import ..appM  # your app's model module
+
+export list_by_category
+
+function list_by_category(req::HTTP.Request, category::String)
+    # PormG pipe idiom — Model.objects returns a chainable query builder
+    query = appM.Product.objects.filter("category" => category)
+    return Res.json(list(query))
 end
 
-serve() 
+end # module
 ```
 
-With our code in place, we can run this code and visit the endpoint in our browser to view the alerts. Try it out yourself by clicking on the link below. 
+```julia
+# src/Routes.jl
+path("/api/products/<str:category>", ProductHandlers.list_by_category, method="GET", middleware=auth_guard),
+```
 
-http://127.0.0.1:8080/weather/alerts/NY
+## POST — Submitting Data or Complex Lookups
+
+Use `POST` when the handler receives a body payload or performs a write/side-effect. It is ALSO
+preferred for lookups when the input is too large for a URL (e.g. a batch of IDs).
+
+```julia
+# src/Handlers/ProductHandlers.jl
+function find_by_skus(req::HTTP.Request)
+    payload = req.json
+    skus = get(payload, "skus", String[])
+
+    # PormG's __@in operator for batch lookup
+    query = appM.Product.objects.filter("sku__@in" => skus)
+
+    return Res.json(list(query))
+end
+```
+
+```julia
+# src/Routes.jl
+path("/api/products/batch", ProductHandlers.find_by_skus, method="POST", middleware=auth_guard),
+```
+
+## Deciding Which Method to Use
+
+Ask yourself two questions:
+
+1. **Does the handler change state or trigger a side-effect?** → `POST`
+2. **Does the client need to send a body with structured data?** → `POST`
+
+Everything else is `GET`.
+
+```
+GET  /api/products/<str:category>  → filter by category
+GET  /api/worker/status/:id        → read task status
+POST /api/products/batch           → batch lookup by SKU list
+POST /api/import/data              → upload files, queue a job
+POST /api/sync/units               → trigger a sync with a payload
+```
+
+> The batch lookup pattern (`POST` for reads) is common when the input list is too
+> large or sensitive to place in a URL.

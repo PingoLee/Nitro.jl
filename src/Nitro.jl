@@ -50,18 +50,18 @@ end
 
 export  @oxidize,
         # Server lifecycle
-    serve, terminate, internalrequest,
-    worker_startup,
-    resetstate, instance, router,
+        serve, terminate, internalrequest,
+        worker_startup,
+        resetstate, instance, router,
         register_revise_hooks!, clear_revise_hooks!,
         # File serving
         staticfiles, dynamicfiles, spafiles,
         # Util
         getparams, getquery, getsession, setsession!, getip, setip!, payload,
-        redirect, formdata, format_sse_message,
+        redirect, formdata, multipart, format_sse_message,
         html, text, json, file, xml, js, css, binary,
         # Extractors
-        Path, Query, Header, Json, JsonFragment, Form, Body, Cookie, Session, extract, validate,
+        Path, Query, Header, Json, JsonFragment, Form, Body, Cookie, Session, Files, FormFile, extract, validate,
         # Cookies & Security
         configcookies, get_cookie, set_cookie!, Cookies, Errors,
         # Middleware

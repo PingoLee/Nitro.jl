@@ -1,93 +1,134 @@
-﻿# Request Body 
+﻿# Request Body
 
-Whenever you need to send data from a client to your API,  you send it as a request body.
+A request body is data sent by the client to your API — usually JSON or a form.
+Used when inputs are too complex or large for a URL.
 
-A request body is data sent by the client to your API (usually JSON). A response body is the data your API sends to the client.
+Nitro.jl offers two layers of body access:
+1. **Low-level** — `req.json` / `req.form` on `HTTP.Request` (simple, flexible)
+2. **Extractors** — `Json{T}`, `Form{T}`, `JsonFragment{T}` (typed, validated, recommended)
 
-Request bodies are useful when you need to send more complicated information
-to an API. Imagine we wanted to request an uber/lyft to come pick us up. The app (a client) will have to send a lot of information to make this happen. It'd need to send information about the user (like location data, membership info) and data about the destination. The api in turn will have to figure out pricing, available drivers and potential routes to take. 
+---
 
-The inputs of this api are pretty complicated which means it's a perfect case where we'd want to use the request body to send this information. You could send this kind of information through the URL, but I'd highly recommend you don't. Request bodies can store data in pretty much any format which is a lot more flexible than what a URL can support.
+## Low-level: `req.json` and `req.form`
 
-
-## Handler-first parsing
-
-For normal handlers, Nitro extends `HTTP.Request` with body accessors:
-
-- `req.json` for parsed JSON bodies
-- `req.form` for parsed form bodies
-- `req.input` for a merged view of path params, form data, JSON, and query parameters
-
-`req.json` returns `nothing` on empty or malformed JSON. `req.form` returns an empty `Dict{String,String}` when the request does not contain form data.
+Nitro extends `HTTP.Request` with body accessors. This is the simplest approach
+when you need to inspect the raw payload before deciding what to do.
 
 ```julia
+# src/Handlers/ProductHandlers.jl
+module ProductHandlers
+
 using HTTP
 using Nitro
+using PormG
+import ..appM  # your app's model module
 
-struct Person
-    name::String
-    age::Int
-end
+export get_product
 
-function create_person(req::HTTP.Request)
-    data = req.json
-    if isnothing(data)
-        return Res.send("Expected a JSON body", status=400)
+function get_product(req::HTTP.Request)
+    payload = req.json  # Dict{String, Any} or nothing
+    if !(payload isa AbstractDict)
+        return Res.json(Dict("error" => "Invalid JSON payload"), status=400)
     end
 
-    return Res.json(Dict(
-        "name" => data["name"],
-        "age" => data["age"],
-    ))
+    sku = get(payload, "sku", nothing)
+    isnothing(sku) && return Res.json(Dict("error" => "sku is required"), status=400)
+
+    # PormG lookup using the pipe idiom
+    product = appM.Product.objects.filter("sku" => sku)
+
+    return Res.json(first(list(product)))
 end
 
-function create_person_form(req::HTTP.Request)
-    form = req.form
-    return Res.json(Dict(
-        "name" => get(form, "name", "anonymous"),
-        "age" => get(form, "age", "unknown"),
-    ))
-end
-
-urlpatterns("",
-    path("/create/json", create_person, method="POST"),
-    path("/create/form", create_person_form, method="POST"),
-)
-
-serve()
+end # module
 ```
 
-## Typed extraction
+---
 
-If you want typed conversion and validation, use Nitro extractors. `LazyRequest` is still the internal/request-wrapper mechanism behind extractors, but handler code should generally prefer direct `HTTP.Request` accessors.
+## Recommended: The `Json{T}` Extractor
+
+For typed handlers, declare a `@kwdef` struct and use `Json{T}`. Nitro automatically
+constructs the struct with the JSON payload. This is ideal when combined with `PormG` filters.
 
 ```julia
-using HTTP
 using Nitro
+using PormG
 
-struct Person
-    name::String
-    age::Int
+@kwdef struct ProductSearch
+    name     :: String           = ""
+    category :: String           = ""
+    limit    :: Int              = 20
 end
 
-function create_typed(req::HTTP.Request, payload::Json{Person})
-    person = payload.payload
-    return Res.json(Dict("name" => person.name, "age" => person.age))
+function search_products(req, payload::Json{ProductSearch})
+    q = payload.payload
+
+    # PormG: build a query with the pipe idiom, chain filters dynamically
+    query = appM.Product.objects
+
+    !isempty(q.name)     && query.filter("name__@icontains" => q.name)
+    !isempty(q.category) && query.filter("category" => q.category)
+
+    return Res.json(list(query.page(1, q.limit)))
 end
-
-urlpatterns("",
-    path("/create/typed", create_typed, method="POST"),
-)
-
-serve()
 ```
 
-## Genie migration
+### Inline Validation
 
-If you are coming from Genie-style handlers, the easiest migration path is:
+Attach a validator that returns a `Bool`. A `false` result automatically produces a `400 Bad Request`.
 
-- replace body parsing helpers with `req.json` or `req.form`
-- use `req.input` when you want one merged dictionary for simple CRUD handlers
-- move to extractors when you need typed conversion or validation
+```julia
+# At least one search field must be provided
+function search_products(req, payload = Json(ProductSearch, q -> !isempty(q.name) || !isempty(q.category)))
+    # ... handler logic
+end
+```
 
-If you still need manual parsing utilities outside a handler, the lower-level `json(req, T)` and `formdata(req)` helpers remain available.
+---
+
+## The `Form{T}` Extractor
+
+For `application/x-www-form-urlencoded` bodies, use `Form{T}` the same way:
+
+```julia
+@kwdef struct LoginForm
+    username :: String
+    password :: String
+end
+
+function login(req, form::Form{LoginForm})
+    f = form.payload
+    return authenticate(f.username, f.password)
+end
+```
+
+---
+
+## The `JsonFragment{T}` Extractor
+
+When your JSON body contains multiple top-level keys and you want to split them into
+separate typed structs, use `JsonFragment{T}`.
+
+```julia
+# POST body: {"origin": {"lat": -1.0, "lon": -2.0}, "destination": {"lat": 3.0, "lon": 4.0}}
+
+@kwdef struct Coords
+    lat :: Float64
+    lon :: Float64
+end
+
+function route_trip(req, origin::JsonFragment{Coords}, destination::JsonFragment{Coords})
+    o, d = origin.payload, destination.payload
+    return Res.json(Dict("from" => (o.lat, o.lon), "to" => (d.lat, d.lon)))
+end
+```
+
+---
+
+## API Reference
+
+```@docs
+Json
+Form
+JsonFragment
+```

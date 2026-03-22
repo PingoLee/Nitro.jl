@@ -4,7 +4,25 @@ using HTTP
 using JSON
 using ..Util
 
-export text, binary, json, formdata
+export text, binary, json, formdata, multipart, FormFile
+
+"""
+    FormFile
+
+Represents a single uploaded file from a `multipart/form-data` request.
+
+# Fields
+- `name::String` — the form field name
+- `filename::String` — the original filename provided by the client
+- `content_type::String` — the MIME type of the file (e.g. `"application/octet-stream"`)
+- `data::Vector{UInt8}` — the raw file bytes
+"""
+struct FormFile
+    name::String
+    filename::String
+    content_type::String
+    data::Vector{UInt8}
+end
 
 const EMPTY_FORM_DATA = Dict{String,String}()
 
@@ -141,6 +159,78 @@ function json(res::HTTP.Response, class_type::Type{T}; kwargs...) where {T}
         return nothing
     end
     return JSON.parse(IOBuffer(payload), class_type; kwargs...)
+end
+
+
+"""
+    multipart(request::HTTP.Request) :: Dict{String, Union{FormFile, Vector{FormFile}, String, Vector{String}}}
+
+Parse a `multipart/form-data` request body and return a `Dict` mapping field names
+to their values.
+
+- **File fields** (those with a `filename`) become [`FormFile`](@ref) objects.
+- **Text fields** (no `filename`) become `String` values.
+- When the same field name appears more than once, the values are collected into a `Vector`.
+
+Returns an empty `Dict` if the request is not `multipart/form-data` or has no body.
+
+# Examples
+
+```julia
+# Inside a handler
+function upload_handler(req)
+    files = multipart(req.request)
+    # Single file field
+    file = files["document"]  # => FormFile
+    file.filename             # => "report.xlsx"
+    file.data                 # => Vector{UInt8}
+
+    # Multiple files under the same field name
+    attachments = files["attachments"]  # => Vector{FormFile}
+    for f in attachments
+        println(f.filename, " => ", length(f.data), " bytes")
+    end
+end
+```
+"""
+function multipart(req::HTTP.Request) :: Dict{String, Union{FormFile, Vector{FormFile}, String, Vector{String}}}
+    result = Dict{String, Union{FormFile, Vector{FormFile}, String, Vector{String}}}()
+    
+    parts = try
+        HTTP.parse_multipart_form(req)
+    catch
+        return result
+    end
+
+    if isnothing(parts)
+        return result
+    end
+
+    for part in parts
+        name = part.name
+        if !isnothing(part.filename) && !isempty(part.filename)
+            file = FormFile(name, part.filename, part.contenttype, read(part.data))
+            _multipart_append!(result, name, file)
+        else
+            value = String(read(part.data))
+            _multipart_append!(result, name, value)
+        end
+    end
+
+    return result
+end
+
+function _multipart_append!(dict, key::String, value)
+    if haskey(dict, key)
+        existing = dict[key]
+        if existing isa Vector
+            push!(existing, value)
+        else
+            dict[key] = [existing, value]
+        end
+    else
+        dict[key] = value
+    end
 end
 
 end # module BodyParsers
