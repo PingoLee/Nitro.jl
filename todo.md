@@ -45,6 +45,7 @@ This file tracks what Nitro itself should do, and what should live in reusable a
 ### Security Foundation
 - [x] Keep Nitro security primitives generic: cookie helpers, session middleware, bearer middleware, guards, CORS, IP extraction, and rate limiting.
 - [x] Create a unified `Nitro.Auth` module for authentication (JWT, Cookies, Passwords, CSRF).
+- [x] Refactor `CSRFMiddleware` to return errors using `Res.json()` instead of raw `HTTP.Response` objects.
 - [x] Implement a cookie-auth middleware hook so reusable auth apps can authenticate from signed/encrypted cookies without duplicating middleware wiring.
 - [x] Fix `SessionMiddleware` cookie configuration so `secure` is configurable and works in local development over plain HTTP.
 - [x] Review default cookie settings for `HttpOnly`, `Secure`, `SameSite`, and expiration behavior.
@@ -52,6 +53,7 @@ This file tracks what Nitro itself should do, and what should live in reusable a
 
 ### Sessions
 - [x] Keep session support in core, but make the storage contract reusable via `AbstractSessionStore`.
+- [x] Remove `req.context[:user] = session_data` from `SessionMiddleware` to prevent overwriting auth context.
 - [x] Define and document a store interface for memory, Redis, database, or custom backends.
 - [x] Implement `MemoryStore` as a default provider.
 - [x] Ensure session middleware can use external stores without depending on PormG directly.

@@ -32,25 +32,41 @@ Nitro core stays database-agnostic. If your application needs a user lookup, do 
 
 ## Unified Auth Context
 
-Both session and bearer auth middleware populate `req.user`.
+To leverage Nitro's Guards and Auth module, populate `req.context[:user]` with the authenticated entity. `BearerAuth` does this automatically for JWTs.
+
+> **Note:** `SessionMiddleware` manages state (`req.session`) but no longer automatically populates `req.user`. When building a stateful, cookie-backed application, you should write a custom middleware that reads the session and loads your authenticated entity into `req.user`.
 
 ```julia
 using HTTP
 using Nitro
 
+# Example: Custom middleware to map session data to the User context
+function SessionAuthMiddleware(handle)
+    return function(req::HTTP.Request)
+        # Assuming `SessionMiddleware` has already run and populated `req.session`
+        session = req.session
+        if session !== nothing && haskey(session, "user_id")
+            # In a real app, you would load the user from the database here
+            req.context[:user] = Dict("id" => session["user_id"], "role" => session["role"])
+        end
+        return handle(req)
+    end
+end
+
 function dashboard(req::HTTP.Request)
     return Res.json(Dict(
         "session" => req.session,
-        "user" => req.user,
+        "user" => req.user, # Populated by SessionAuthMiddleware
     ))
 end
 
 urlpatterns("",
-    path("/dashboard", dashboard, method="GET", middleware=[GuardMiddleware(login_required())]),
+    path("/dashboard", dashboard, method="GET", middleware=[
+        SessionAuthMiddleware,
+        GuardMiddleware(login_required())
+    ]),
 )
 ```
-
-If a session contains a `user` entry, Nitro uses it directly. If it only contains `user_id`, `role`, or similar fields, Nitro exposes the full session dictionary as `req.user` so guards can still make authorization decisions.
 
 ## JWT Helpers
 

@@ -60,7 +60,6 @@ function SessionMiddleware(;
             # 2. Inject session into request
             req.context[:session] = session_data
             req.context[:session_id] = session_id
-            req.context[:user] = session_data
 
             # 3. Call next handler
             response = handle(req)

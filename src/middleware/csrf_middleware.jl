@@ -7,6 +7,7 @@ using Base64
 
 using ...Types: CookieConfig, Nullable
 using ...Cookies: get_cookie, set_cookie!
+using ...Res: json
 
 export CSRFMiddleware, issue_csrf_token!, validate_csrf_token
 
@@ -98,7 +99,7 @@ function CSRFMiddleware(secret::String; cookie_name::String="csrf_token", header
             existing_cookie = get_cookie(req, cookie_name, nothing; encrypted=false)
 
             if !(method in SAFE_METHODS)
-                validate_csrf_token(req, secret; cookie_name, header_name, form_field) || return HTTP.Response(403, ["Content-Type" => "application/json"], codeunits("{\"error\":\"Invalid CSRF token\"}"))
+                validate_csrf_token(req, secret; cookie_name, header_name, form_field) || return json(Dict("error" => "Invalid CSRF token"); status=403)
             else
                 raw_token, _ = existing_cookie === nothing ? (nothing, nothing) : _parse_signed_token(existing_cookie)
                 req.context[:csrf_token] = raw_token
