@@ -1,4 +1,4 @@
-﻿using Documenter
+using Documenter
 using Nitro
 
 makedocs(
@@ -19,6 +19,7 @@ makedocs(
             "tutorial/query_parameters.md",
             "tutorial/request_body.md",
             "tutorial/file_uploads.md",
+            "tutorial/secrets.md",
             "tutorial/sessions_and_auth.md",
             "Cookies and Sessions" => [
                 "tutorial/cookies/basics.md",

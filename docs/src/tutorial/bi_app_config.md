@@ -88,6 +88,8 @@ end
 end
 ```
 
+> **Tip on Dummy Fallback Values**: Notice that all secrets and configs use `get(ENV, "KEY", "fallback")`. This pattern is highly recommended. It ensures that your application won't crash when Documenter.jl (`docs/make.jl`) evaluates these blocks or when your CI suite runs basic tests without a `.env` file present.
+
 ## Why This Lives In The App
 
 - Nitro stays framework-focused and does not accumulate app-specific config types.
