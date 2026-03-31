@@ -28,11 +28,11 @@ function getip end
 function setip! end
 
 include("handlers.jl");     @reexport using .Handlers
-include("middleware.jl");   @reexport using .Middleware
 include("routerhof.jl");    @reexport using .RouterHOF
 include("reflection.jl");   @reexport using .Reflection
 include("extractors.jl");   @reexport using .Extractors
 include("response.jl");     @reexport using .Res
+include("middleware.jl");   @reexport using .Middleware
 include("routing.jl");      @reexport using .Routing
 
 export start, serve, serveparallel, terminate,

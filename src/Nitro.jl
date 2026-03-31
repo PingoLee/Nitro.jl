@@ -62,6 +62,8 @@ export  @oxidize,
         html, text, json, file, xml, js, css, binary,
         # Extractors
         Path, Query, Header, Json, JsonFragment, Form, Body, Cookie, Session, Files, FormFile, extract, validate,
+        # Extractor extension surface (for app-layer custom extractors)
+        Param, LazyRequest, ValidationError,
         # Cookies & Security
         configcookies, get_cookie, set_cookie!, Cookies, Errors,
         # Middleware
@@ -79,4 +81,6 @@ export  @oxidize,
         path, urlpatterns, include_routes, RouteDefinition,
         # Response Abstractions
         Res
+
+include("precompile.jl")
 end
