@@ -14,10 +14,12 @@ using ..Core.Types: AbstractSessionStore, get_session
 export AuthError,
     set_auth_cookie!, clear_auth_cookie!, extract_auth_token,
     encode_jwt, decode_jwt, validate_iat, validate_claims,
-    make_password, check_password, validate_password, password_needs_upgrade,
+    make_password, check_password, validate_password, password_needs_upgrade, is_password_usable,
+    set_default_algorithm!, SUPPORTED_ALGORITHMS, DEFAULT_ALGORITHM,
     ValidationResult, PasswordValidator,
     PasswordEncoder, PBKDF2PasswordEncoder, BCryptPasswordEncoder, SpringSecurityPBKDF2PasswordEncoder,
-    DelegatingPasswordEncoder, encode, matches, upgrade_encoding,
+    DelegatingPasswordEncoder, Argon2PasswordEncoder, parse_argon2_phc,
+    encode, matches, upgrade_encoding,
     jwt_validator, session_user_validator, no_auth_validator,
     GuardMiddleware, login_required, role_required, permission_required
 

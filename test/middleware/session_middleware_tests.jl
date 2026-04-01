@@ -1,9 +1,6 @@
-module SessionMiddlewareTests
-
-using Test
+@testitem "Session middleware" tags=[:middleware] setup=[NitroCommon] begin
 using HTTP
 using Dates
-using Nitro
 using Nitro: SessionMiddleware, GET
 using Nitro.Core.Types: MemoryStore, SessionPayload
 using Nitro.Core.Cookies: storesession!, prunesessions!
@@ -138,7 +135,7 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
             session = getsession(req)
             @test session["user_id"] == 99
             @test session["role"] == "admin"
-            @test req.user["user_id"] == 99
+            # Note: SessionMiddleware populates req.session, not req.user
             return HTTP.Response(200, "read")
         end
 

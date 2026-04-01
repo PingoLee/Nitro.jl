@@ -1,13 +1,11 @@
-﻿module PathPrefixUrlTests
-
+﻿@testitem "Path prefix" tags=[:core, :network] setup=[NitroCommon] begin
 using Test
 using HTTP
-using ..Constants
-using Nitro; @oxidise
+using Nitro
 
-route(["GET"], "/test", function()
-    return "Hello World"
-end)
+urlpatterns("",
+    path("/test", function() return "Hello World" end, method="GET"),
+)
 
 serve(prefix="/custom-api", port=PORT, host=HOST, async=true,  show_errors=false, show_banner=false)
 

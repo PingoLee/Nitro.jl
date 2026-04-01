@@ -1,4 +1,4 @@
-module SessionStoreTests
+@testitem "Session stores" tags=[:core] setup=[NitroCommon] begin
 
 using Test
 using HTTP

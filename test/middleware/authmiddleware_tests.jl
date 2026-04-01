@@ -1,14 +1,6 @@
-module AuthMiddlewareTests
-
-using Test
+@testitem "Auth middleware" tags=[:middleware, :auth, :network] setup=[NitroCommon] begin
 using HTTP
-using Nitro; @oxidize
-
-if !isdefined(@__MODULE__, :Constants)
-    include(joinpath(@__DIR__, "..", "constants.jl"))
-end
-
-using .Constants: HOST, PORT, localhost
+using Nitro
 
 good_token = "goodtoken"
 validate_token(token) = token == good_token ? Dict(:id => 1, :name => "TestUser") : nothing
@@ -49,14 +41,14 @@ validate_token(token) = token == good_token ? Dict(:id => 1, :name => "TestUser"
 end
 
 
-# Set up router with AuthMiddleware
-auth = router("/auth", middleware=[BearerAuth(validate_token)])
-
-route(["GET"], auth("/protected"), function(req)
-    # Return user info from context
-    user = req.user
-    return HTTP.Response(200, "Hello, $(user[:name])!")
-end)
+# Set up route with AuthMiddleware
+urlpatterns("/auth",
+    path("/protected", function(req)
+        # Return user info from context
+        user = req.user
+        return HTTP.Response(200, "Hello, $(user[:name])!")
+    end, method="GET", middleware=[BearerAuth(validate_token)]),
+)
 
 # Start server for tests
 serve(port=PORT, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)

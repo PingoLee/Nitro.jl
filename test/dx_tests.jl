@@ -1,4 +1,4 @@
-﻿module DXTests
+﻿@testitem "Developer Experience" tags=[:core] setup=[NitroCommon] begin
 
 using Test
 using Nitro

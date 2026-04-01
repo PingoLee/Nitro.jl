@@ -3,9 +3,13 @@ using Printf
 
 const DEFAULT_PBKDF2_ITERATIONS = 720000
 const DEFAULT_PBKDF2_KEY_LENGTH = 32
-const DEFAULT_PASSWORD_ALGORITHM = "pbkdf2_sha256"
 const DEFAULT_BCRYPT_COST = 12
 const DEFAULT_SPRING_ITERATIONS = 310000
+
+const SUPPORTED_ALGORITHMS = ["pbkdf2_sha256", "bcrypt", "spring_sha256"]
+# Future: push!(SUPPORTED_ALGORITHMS, "argon2") when backend is ready
+
+const _DEFAULT_ALGORITHM = Ref{String}("pbkdf2_sha256")
 
 _isalnum(char::Char) = isletter(char) || isdigit(char)
 
@@ -15,7 +19,14 @@ function encode end
 function matches end
 function upgrade_encoding end
 
-DEFAULT_ALGORITHM() = DEFAULT_PASSWORD_ALGORITHM
+DEFAULT_ALGORITHM() = _DEFAULT_ALGORITHM[]
+
+function set_default_algorithm!(algorithm::String)
+    alg = lowercase(algorithm)
+    alg in SUPPORTED_ALGORITHMS || throw(ArgumentError("Unsupported algorithm: $algorithm. Supported: $(join(SUPPORTED_ALGORITHMS, ", "))"))
+    _DEFAULT_ALGORITHM[] = alg
+    return alg
+end
 
 struct ValidationResult
     valid::Bool
@@ -116,6 +127,63 @@ struct DelegatingPasswordEncoder <: PasswordEncoder
         new(default_encoder, encoders)
     end
 end
+
+# ── Argon2 scaffolding (feature-gated, backend not yet available) ────────────
+# These types and stubs define the public contract so extensions can reference
+# them today. The real implementation lands when an Argon2 backend is ready.
+
+struct Argon2PasswordEncoder <: PasswordEncoder
+    memory_cost::Int      # KiB
+    time_cost::Int        # iterations
+    parallelism::Int
+    hash_length::Int
+    salt_length::Int
+
+    function Argon2PasswordEncoder(; memory_cost::Int=65536, time_cost::Int=3, parallelism::Int=4, hash_length::Int=32, salt_length::Int=16)
+        memory_cost < 8 && throw(ArgumentError("Argon2 memory_cost must be at least 8 KiB"))
+        time_cost < 1 && throw(ArgumentError("Argon2 time_cost must be at least 1"))
+        parallelism < 1 && throw(ArgumentError("Argon2 parallelism must be at least 1"))
+        hash_length < 4 && throw(ArgumentError("Argon2 hash_length must be at least 4"))
+        salt_length < 8 && throw(ArgumentError("Argon2 salt_length must be at least 8"))
+        new(memory_cost, time_cost, parallelism, hash_length, salt_length)
+    end
+end
+
+function encode(::Argon2PasswordEncoder, ::AbstractString)
+    throw(ErrorException("Argon2 backend is not yet available. Install and load an Argon2 package to enable this encoder."))
+end
+
+function matches(::Argon2PasswordEncoder, ::AbstractString, ::AbstractString)
+    throw(ErrorException("Argon2 backend is not yet available. Install and load an Argon2 package to enable this encoder."))
+end
+
+function upgrade_encoding(::Argon2PasswordEncoder, ::AbstractString)
+    throw(ErrorException("Argon2 backend is not yet available. Install and load an Argon2 package to enable this encoder."))
+end
+
+"""
+    parse_argon2_phc(encoded::AbstractString) -> NamedTuple or nothing
+
+Parse an Argon2 PHC-format string into its components.
+Returns `nothing` if the string is not valid Argon2 PHC format.
+
+Expected format: `\$argon2id\$v=19\$m=<memory>,t=<time>,p=<parallelism>\$<salt_b64>\$<hash_b64>`
+"""
+function parse_argon2_phc(encoded::AbstractString)
+    m = match(r"^\$argon2(id|i|d)\$v=(\d+)\$m=(\d+),t=(\d+),p=(\d+)\$([A-Za-z0-9+/=]+)\$([A-Za-z0-9+/=]+)$", encoded)
+    m === nothing && return nothing
+    return (
+        variant = m.captures[1],
+        version = parse(Int, m.captures[2]),
+        memory_cost = parse(Int, m.captures[3]),
+        time_cost = parse(Int, m.captures[4]),
+        parallelism = parse(Int, m.captures[5]),
+        salt_b64 = m.captures[6],
+        hash_b64 = m.captures[7],
+    )
+end
+
+# ── End Argon2 scaffolding ───────────────────────────────────────────────────
 
 const DEFAULT_COMMON_PASSWORDS = Set([
     "password", "password1", "password123", "123456", "123456789", "12345678",
@@ -355,7 +423,19 @@ function upgrade_encoding(encoder::DelegatingPasswordEncoder, encoded_hash::Abst
     return true
 end
 
-function make_password(password::AbstractString; algorithm::String=DEFAULT_PASSWORD_ALGORITHM, iterations::Int=DEFAULT_PBKDF2_ITERATIONS, bcrypt_cost::Int=DEFAULT_BCRYPT_COST)
+function is_password_usable(encoded::AbstractString)
+    encoded = strip(encoded)
+    isempty(encoded) && return false
+    startswith(encoded, "pbkdf2_sha256\$") && return true
+    startswith(encoded, "sha256:") && return true
+    startswith(encoded, "\$2a\$") && return true
+    startswith(encoded, "\$2b\$") && return true
+    startswith(encoded, "\$2y\$") && return true
+    startswith(encoded, "\$argon2") && return true
+    return false
+end
+
+function make_password(password::AbstractString; algorithm::String=DEFAULT_ALGORITHM(), iterations::Int=DEFAULT_PBKDF2_ITERATIONS, bcrypt_cost::Int=DEFAULT_BCRYPT_COST)
     isempty(password) && throw(ArgumentError("Password cannot be empty"))
     algorithm = lowercase(algorithm)
 
@@ -364,7 +444,8 @@ function make_password(password::AbstractString; algorithm::String=DEFAULT_PASSW
     elseif algorithm == "bcrypt"
         return encode(BCryptPasswordEncoder(cost=bcrypt_cost), password)
     elseif algorithm == "spring_sha256"
-        return encode(SpringSecurityPBKDF2PasswordEncoder(iterations=iterations), password)
+        spring_iters = iterations == DEFAULT_PBKDF2_ITERATIONS ? DEFAULT_SPRING_ITERATIONS : iterations
+        return encode(SpringSecurityPBKDF2PasswordEncoder(iterations=spring_iters), password)
     end
 
     throw(ArgumentError("Unsupported password algorithm: $algorithm"))

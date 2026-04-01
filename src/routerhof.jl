@@ -65,6 +65,7 @@ If router or route specific middleware is defined, then it's used instead of the
 middleware. 
 """
 function compose(router::HTTP.Router, cache_lock::ReentrantLock, globalmiddleware::Vector, custommiddleware::Dict, middleware_cache::Dict)
+    use_cache = isempty(globalmiddleware)
     return function (handler)
         return function (req::HTTP.Request)
 
@@ -73,18 +74,22 @@ function compose(router::HTTP.Router, cache_lock::ReentrantLock, globalmiddlewar
             # Check if the current request matches one of our predefined routes 
             if innerhandler !== nothing
 
-                # Check if we already have a cached middleware function for this specific route
+                # Check if we already have a cached middleware function for this specific route.
+                # Skip cache when per-call global middleware is present: caching would bake in
+                # caller-specific settings (e.g. catch_errors=false) and corrupt future requests.
                 key = genkey(req.method, path)
-                func = get(middleware_cache, key, nothing)
-                if !isnothing(func)
-                    return func(req)
+                if use_cache
+                    func = get(middleware_cache, key, nothing)
+                    if !isnothing(func)
+                        return func(req)
+                    end
                 end
 
                 # Combine all the middleware functions together 
                 strategy = buildmiddleware(key, handler, globalmiddleware, custommiddleware)
                 
-                ## Below Double-checked locking is used to reduce the overhead of acquiring a lock
-                if !haskey(middleware_cache, key)
+                ## Cache only when no per-call middleware is involved (double-checked locking)
+                if use_cache && !haskey(middleware_cache, key)
                     lock(cache_lock) do 
                         if !haskey(middleware_cache, key)
                             middleware_cache[key] = strategy

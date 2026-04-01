@@ -21,6 +21,7 @@ makedocs(
             "tutorial/file_uploads.md",
             "tutorial/secrets.md",
             "tutorial/sessions_and_auth.md",
+            "tutorial/passwords.md",
             "Cookies and Sessions" => [
                 "tutorial/cookies/basics.md",
                 "tutorial/cookies/configuration.md",

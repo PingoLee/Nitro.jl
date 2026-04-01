@@ -58,6 +58,7 @@ This file tracks what Nitro itself should do, and what should live in reusable a
 - [x] Implement `MemoryStore` as a default provider.
 - [x] Ensure session middleware can use external stores without depending on PormG directly.
 - [x] Add tests for persistent session stores via adapters, not core-specific database code.
+- [ ] Decide the `SessionMiddleware` auth contract: either remove the unused `validator` keyword or wire it explicitly without repopulating `req.user` from raw session state.
 
 ### Extension Points
 - [ ] Document how external apps/packages plug into Nitro via middleware, route modules, and package extensions.
@@ -67,11 +68,12 @@ This file tracks what Nitro itself should do, and what should live in reusable a
 
 ## Auth Module (Nitro.Auth)
 
-> **Status**: Core implementation finished and integrated into Nitro.jl.
+> **Status**: Core implementation is integrated into Nitro.jl, but contract cleanup and token-scope follow-up still remain.
 
 - [x] Implement JWT encode/decode with support for multiple keys and `kid` rotation.
 - [x] Validate `iat`, `exp`, `nbf`, issuer, and audience claims where configured.
-- [x] Add support for access-token and refresh-token flows.
+- [x] Add support for access-token flows.
+- [ ] Add refresh-token helpers and lifecycle support, or narrow the documented auth scope to access tokens only.
 - [x] Support both bearer-token auth and cookie-based auth in a unified `req.user` context.
 - [x] Provide login/logout helpers (`set_auth_cookie!`, `clear_auth_cookie!`) that handle cookies safely.
 - [x] Expose reusable guards like `login_required`, `role_required`, and claim-based/permission-based guards.
@@ -85,6 +87,7 @@ This file tracks what Nitro itself should do, and what should live in reusable a
     - [x] `PasswordValidator` with i18n support (`Printf`-based).
 - [x] Keep the module storage-agnostic via `AbstractSessionStore`.
 - [x] Add comprehensive tests for invalid signature, expired tokens, i18n passwords, and cross-encoder matching.
+  - [ ] Finish auth-context unification so guards rely on `req.user` consistently instead of falling back to the raw session dictionary.
 
 ## Workers App
 
@@ -114,6 +117,13 @@ src/Workers/
 - [x] Add structured logging and error formatting for long-running jobs. (Added `TaskStatus` and detailed `TaskInfo` tracking)
 - [x] Add tests for queue order, retry behavior, cancellation, timeout, and duplicate submission. (Verified in [test/workerstests.jl](test/workerstests.jl))
 - [ ] Extract to `NitroWorkers.jl` when: (a) a second Nitro project needs the same machinery, or (b) workers need to scale independently of the web server.
+
+### Future Work
+- [ ] Extract store logic to `AbstractWorkerStore` for pluggable backends.
+- [ ] Create `NitroWorkersRedisExt` for Redis-backed task registry.
+- [ ] Add structured logging and metrics for queue depth and execution times.
+- [ ] Support task progress updates during long-running callbacks.
+- [ ] Add WebSocket support for real-time task status updates.
 
 ## PormG Integration
 
@@ -155,6 +165,7 @@ src/Workers/
 - [x] Add tests that reflect the new direction: routing, security primitives, session configuration, CORS, and extension points.
 - [x] Add tests for local-development cookie behavior and production-secure cookie behavior.
 - [x] Run full `Pkg.test()` successfully after the request/response and auth refactors were rebased.
+- [ ] Add focused tests for the finalized `SessionMiddleware` validator behavior and the `req.user` guard contract.
 - [ ] Write one full example app using Nitro + reusable auth app.
 - [ ] Write one full example app using Nitro + reusable worker app.
 - [ ] Write one full example app using Nitro + external PormG app.

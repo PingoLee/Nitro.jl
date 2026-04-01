@@ -1,4 +1,4 @@
-module ErgonomicsTests
+@testitem "Request ergonomics" tags=[:core] setup=[NitroCommon] begin
 
 using Test
 using HTTP

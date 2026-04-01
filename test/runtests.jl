@@ -1,64 +1,77 @@
-module RunTests 
+using ReTestItems
+using Nitro # Ensure the package itself is loaded
 
-include("constants.jl"); using .Constants
-include("test_utils.jl"); using .TestUtils
+# Ordered list of test files — preserves the current execution order.
+# ReTestItems runs them sequentially by default; parallel execution
+# is NOT enabled until every file is verified parallel-safe.
+const TEST_FILES = [
+    # ── Shared setup ──
+    "setup_tests.jl",
 
-# #### Security & Robustness ####
+    # ── Security & Robustness ──
+    "security_tests.jl",
 
-include("securitytests.jl")
+    # ── Extension Tests ──
+    "extensions/timezone_tests.jl",
+    "extensions/templating_tests.jl",
+    "extensions/protobuf/protobuf_tests.jl",
+    "extensions/crypto_tests.jl",
 
-# #### Extension Tests ####
+    # ── Special Handler Tests ──
+    "sse_tests.jl",
+    "websocket_tests.jl",
+    "streaming_tests.jl",
+    "handler_tests.jl",
 
-include("extensions/timezonetests.jl")
-include("extensions/templatingtests.jl")
-include("extensions/protobuf/protobuftests.jl")
-include("extensions/cryptotests.jl")
+    # ── Core Tests ──
+    "util_tests.jl",
+    "cookies_tests.jl",
+    "session_tests.jl",
+    "sessionstores_tests.jl",
+    "workers_tests.jl",
+    "reexports_tests.jl",
+    "precompilation_test.jl",
+    "extractor_tests.jl",
+    "render_tests.jl",
+    "bodyparser_tests.jl",
+    "ergonomics_tests.jl",
+    "instance_tests.jl",
+    "parallel_tests.jl",
+    "middleware_tests.jl",
+    "appcontext_tests.jl",
+    "path_prefix_tests.jl",
+    "routing_tests.jl",
+    "original_tests.jl",
+    "spa_tests.jl",
+    "dx_tests.jl",
+    "auth_module_tests.jl",
+    "auth_tests.jl",
+    "revise_test.jl",
 
+    # ── Scenario Tests ──
+    "scenarios/thunderingherd_test.jl",
 
-#### Sepcial Handler Tests ####
+    # ── Prebuilt Middleware Tests ──
+    "middleware/extract_ip_tests.jl",
+    "middleware/ratelimitter_tests.jl",
+    "middleware/ratelimitter_lru_tests.jl",
+    "middleware/authmiddleware_tests.jl",
+    "middleware/cors_middleware_tests.jl",
+    "middleware/lifecycle_middleware_tests.jl",
+    "middleware/session_middleware_tests.jl",
+    "middleware/guards_tests.jl",
 
-include("ssetests.jl")
-include("websockettests.jl")
-include("streamingtests.jl")
-include("handlertests.jl")
+    # ── Quality Gate ──
+    "aqua_tests.jl",
+]
 
-#### Core Tests ####
-include("utiltests.jl")
-include("cookiestests.jl")
-include("sessiontests.jl")
-include("sessionstores_tests.jl")
-include("workerstests.jl")
-include("test_reexports.jl")
-include("precompilationtest.jl")
-include("extractortests.jl")
-include("rendertests.jl")
-include("bodyparsertests.jl")
-include("ergonomics_tests.jl")
-include("oxidise.jl")
-include("instancetests.jl")
-include("paralleltests.jl")
-include("middlewaretests.jl")
-include("appcontexttests.jl")
-include("path_prefix_tests.jl")
-include("routingtests.jl")
-include("originaltests.jl")
-include("spatests.jl")
-include("dx_tests.jl")
-include("auth_module_tests.jl")
-include("auth_tests.jl")
-include("revise.jl")
+function run_all_tests(; kwargs...)
+    paths = [joinpath(@__DIR__, f) for f in TEST_FILES]
+    runtests(paths...; testitem_timeout=600, kwargs...)
+end
 
-#### Scenario Tests ####
-include("./scenarios/thunderingherd.jl")
+if get(ENV, "NITRO_TEST_SKIP_AUTO", "0") != "1"
+    run_all_tests()
+end
 
-#### Prebuilt Middleware Tests ####
-include("middleware/extract_ip_tests.jl")
-include("middleware/ratelimitter_tests.jl")
-include("middleware/ratelimitter_lru_tests.jl")
-include("middleware/authmiddleware_tests.jl")
-include("middleware/cors_middleware_tests.jl")
-include("middleware/lifecycle_middleware_tests.jl")
-include("middleware/session_middleware_tests.jl")
-include("middleware/guards_tests.jl")
-
-end 
+# julia --project -e 'using Pkg; Pkg.test()'

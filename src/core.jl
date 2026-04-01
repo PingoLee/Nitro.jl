@@ -35,7 +35,7 @@ include("response.jl");     @reexport using .Res
 include("middleware.jl");   @reexport using .Middleware
 include("routing.jl");      @reexport using .Routing
 
-export start, serve, serveparallel, terminate,
+export serve, terminate,
     internalrequest, staticfiles, dynamicfiles, spafiles,
     getparams, getquery, getsession, setsession!, getip, setip!, payload
 
@@ -248,7 +248,7 @@ function serve(ctx::ServerContext;
             error("Revise support is unavailable. Load Revise.jl in your development session before using the `revise` option")
         end
         if ctx.mod === nothing
-            @warn "You are trying to use the `revise` option without @oxidize. Code in the `Main` module, which likely includes your routes, will not be tracked and revised."
+            @warn "You are trying to use the `revise` option, but no module was provided to track. Code in the `Main` module may not be tracked and revised."
         end
         middleware = convert(Vector{Any}, middleware)
         insert!(middleware, 1, ReviseHandler())

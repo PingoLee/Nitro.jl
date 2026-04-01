@@ -1,6 +1,4 @@
-﻿module ExtractIPTests
-
-using Test
+﻿@testitem "Extract IP" tags=[:middleware] setup=[NitroCommon] begin
 using HTTP
 using Sockets
 using Nitro: setip!

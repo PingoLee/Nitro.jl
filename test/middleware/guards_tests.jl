@@ -1,8 +1,5 @@
-﻿module GuardsTests
-
-using Test
+﻿@testitem "Guards" tags=[:middleware, :auth] setup=[NitroCommon] begin
 using HTTP
-using Nitro
 using Nitro: GuardMiddleware, login_required, role_required, permission_required, GET
 
 @testset "GuardMiddleware" begin

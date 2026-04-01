@@ -1,9 +1,7 @@
-﻿module LifecycleMiddlewareTests
-
-using Test
+﻿@testitem "Lifecycle middleware" tags=[:middleware] setup=[NitroCommon] begin
 using Suppressor
 using Nitro.Core
-using Nitro; @oxidize
+using Nitro
 
 @testset "LifecycleMiddleware - startup/shutdown hooks" begin
     sflag = Ref(false)
@@ -61,4 +59,4 @@ end
     end
 end
 
-end # module
+end # @testitem

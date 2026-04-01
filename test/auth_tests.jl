@@ -1,4 +1,4 @@
-module AuthTests
+@testitem "Auth integration" tags=[:auth, :core] setup=[NitroCommon] begin
 
 using Test
 using HTTP

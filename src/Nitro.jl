@@ -35,21 +35,7 @@ const CONTEXT :: Ref{ServerContext} = Ref(ServerContext())
 include("exts.jl")
 include("methods.jl")
 
-macro oxidize()
-    quote
-        import Nitro
-        import Nitro: PACKAGE_DIR, ServerContext, Nullable, HOFRouter
-        import Nitro: GET, POST, PUT, DELETE, PATCH, STREAM, WEBSOCKET
-
-        const CONTEXT :: Ref{ServerContext}  = Ref(ServerContext(; mod=$(__module__)))
-        include(joinpath(PACKAGE_DIR, "methods.jl"))
-        
-        nothing; # to hide last definition
-    end |> esc
-end
-
-export  @oxidize,
-        # Server lifecycle
+export  # Server lifecycle
         serve, terminate, internalrequest,
         worker_startup,
         resetstate, instance, router,
@@ -57,13 +43,13 @@ export  @oxidize,
         # File serving
         staticfiles, dynamicfiles, spafiles,
         # Util
-        getparams, getquery, getsession, setsession!, getip, setip!, payload,
+        getparams, getquery, getsession, setsession!, getip, setip!, payload, getexternalurl,
         redirect, formdata, multipart, format_sse_message,
         html, text, json, file, xml, js, css, binary,
         # Extractors
         Path, Query, Header, Json, JsonFragment, Form, Body, Cookie, Session, Files, FormFile, extract, validate,
         # Extractor extension surface (for app-layer custom extractors)
-        Param, LazyRequest, ValidationError,
+        Param, LazyRequest, ValidationError, Nullable,
         # Cookies & Security
         configcookies, get_cookie, set_cookie!, Cookies, Errors,
         # Middleware
