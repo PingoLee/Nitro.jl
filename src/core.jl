@@ -220,6 +220,10 @@ function serve(ctx::ServerContext;
     samesite=nothing,
     kwargs...)::Server
 
+    if revise ∉ (:none, :lazy, :eager)
+        throw(ArgumentError("Invalid `revise` value $(repr(revise)). Expected one of :none, :lazy, or :eager."))
+    end
+
     if !ismissing(context)
         ctx.app_context[] = Context(context)
     end
@@ -241,7 +245,7 @@ function serve(ctx::ServerContext;
     ctx.service.prefix[] = prefix isa String ? prefix : nothing
 
     if revise == :lazy || revise == :eager
-        if parallel
+        if parallel && Threads.nthreads() > 1
             @warn "You are attempting to use Revise with multiple threads. Please note that Revise 3.5.18 and earlier are not threadsafe."
         end
         if !has_revise_hooks()

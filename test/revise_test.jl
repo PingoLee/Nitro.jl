@@ -33,6 +33,8 @@ original_revise_hooks = Nitro.revise_hooks()
 Nitro.clear_revise_hooks!()
 
 try
+    @test_throws "Invalid `revise` value" serve(port=PORT, host=HOST, show_errors=false, show_banner=false, access_log=nothing, revise=:all)
+
     # Production path should not require Revise when hot reload is disabled.
     serve(port=PORT, host=HOST, show_errors=false, show_banner=false, access_log=nothing, async=true)
     @test String(HTTP.get("$localhost/").body) == "Ok"

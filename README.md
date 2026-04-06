@@ -198,6 +198,8 @@ Valid `revise` values are:
 - `:lazy` checks for revisions before each request
 - `:eager` waits for file change notifications and revises in the background
 
+Passing any other value raises an `ArgumentError`.
+
 For production, start Nitro normally:
 
 ```julia
