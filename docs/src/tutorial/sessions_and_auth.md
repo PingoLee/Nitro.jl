@@ -1,69 +1,261 @@
 # Sessions and Auth
 
-Nitro now treats session storage and authenticated user resolution as separate concerns.
+Nitro treats session storage and authenticated user resolution as separate concerns.
 
-- `SessionMiddleware` is responsible for loading and persisting server-side session state.
-- `BearerAuth` is responsible for extracting credentials and attaching the authenticated principal.
+- `SessionMiddleware` manages server-side session state via `req.session`.
+- `BearerAuth` extracts credentials and attaches the authenticated principal.
 - Guards read `req.user`, so they work the same way for session-backed and JWT-backed routes.
 
-## Session Stores
-
-The built-in `MemoryStore` now implements `AbstractSessionStore`.
+## Quick Start
 
 ```julia
 using Nitro
+using PormG
 
+# 1. Configure PormG
+PormG.Configuration.load("db")
+PormG.@import_models "db/models.jl" models
+import .models as M
+
+# 2. One-call database session setup (creates table if needed)
+store = pormg_nitro_session(db_key="db")
+
+# 3. Define handlers
+function login_handler(req::HTTP.Request)
+    payload = req.json
+    username = get(payload, "username", "")
+    password = get(payload, "password", "")
+
+    user = M.User.objects.filter("username" => username).first()
+    if isnothing(user) || !check_password(password, user[:password])
+        return Res.status(401, Res.json(Dict("error" => "Invalid credentials")))
+    end
+
+    # Store data in the session — like Django's request.session
+    req.session["user_id"]  = user[:id]
+    req.session["username"] = user[:username]
+    req.session["role"]     = user[:is_staff] ? "staff" : "user"
+
+    return Res.json(Dict("message" => "Welcome $(user[:username])!"))
+end
+
+function me_handler(req::HTTP.Request)
+    user_id = get(req.session, "user_id", nothing)
+    if isnothing(user_id)
+        return Res.status(401, Res.json(Dict("error" => "Not authenticated")))
+    end
+    return Res.json(Dict(
+        "user_id"  => user_id,
+        "username" => req.session["username"],
+        "role"     => req.session["role"],
+    ))
+end
+
+function logout_handler(req::HTTP.Request)
+    # Clear all session data — equivalent to Django's request.session.flush()
+    empty!(req.session)
+    return Res.json(Dict("message" => "Logged out"))
+end
+
+# 4. Routes
+urlpatterns("/api",
+    path("/login",  login_handler,  method="POST"),
+    path("/me",     me_handler,     method="GET"),
+    path("/logout", logout_handler, method="POST"),
+)
+
+# 5. Serve
+serve(middleware=[
+    SessionMiddleware(store=store, cookie_name="nitro_sess", secure=false, samesite="Lax"),
+], port=8080, revise=:lazy)
+```
+
+## Session Stores
+
+### In-Memory (development)
+
+The built-in `MemoryStore` keeps sessions in a process-local dictionary.
+Sessions are lost on restart.
+
+```julia
 store = MemoryStore{String, Dict{String,Any}}()
-set_session!(store, "session-1", Dict("user_id" => 42, "role" => "admin"); ttl=3600)
 
 serve(middleware=[
     SessionMiddleware(store=store, secure=false),
 ])
 ```
 
-To implement a custom store, define methods for:
+### PormG-Backed (production)
 
-- `get_session(store, session_id)`
-- `set_session!(store, session_id, data; ttl=...)`
-- `delete_session!(store, session_id)`
-- `cleanup_expired_sessions!(store)`
+`pormg_nitro_session()` creates the `nitro_session` table with `IF NOT EXISTS`,
+sets up the expiry index, and returns a ready-to-use store.
 
-Nitro core stays database-agnostic. If your application needs a user lookup, do that in a validator function instead of inside the framework.
+```julia
+using Nitro, PormG
+
+PormG.Configuration.load("db")
+
+store = pormg_nitro_session(db_key="db")
+
+serve(middleware=[
+    SessionMiddleware(store=store, max_age=3600, secure=true),
+])
+```
+
+Sessions are stored as JSON in the database with a fixed-point expiry timestamp
+(no sliding expiry). Works with any PormG-supported backend (SQLite, PostgreSQL).
+
+### Custom Stores
+
+Implement these four methods for your store type `S <: AbstractSessionStore{String, Dict{String,Any}}`:
+
+```julia
+Base.get(store::S, session_id::String, default)       # → SessionPayload or default
+set_session!(store::S, session_id::String, data; ttl)  # → persist data with TTL
+delete_session!(store::S, session_id::String)           # → remove a session
+cleanup_expired_sessions!(store::S)                     # → prune expired entries
+```
+
+## Using `req.session` — Django-style
+
+`req.session` is a `Dict{String, Any}` injected by `SessionMiddleware`.
+It works exactly like Django's `request.session`:
+
+| Django (Python) | Nitro (Julia) |
+|---|---|
+| `request.session["user_id"] = 42` | `req.session["user_id"] = 42` |
+| `request.session.get("role", "guest")` | `get(req.session, "role", "guest")` |
+| `del request.session["cart"]` | `delete!(req.session, "cart")` |
+| `request.session.flush()` | `empty!(req.session)` |
+| `"user_id" in request.session` | `haskey(req.session, "user_id")` |
+
+Changes are automatically detected and persisted at the end of the request.
+You do not need to call a save method.
+
+### Store data
+
+```julia
+function login_handler(req::HTTP.Request)
+    # ... validate credentials ...
+    req.session["user_id"]   = user[:id]
+    req.session["username"]  = user[:username]
+    req.session["logged_in"] = string(Dates.now())
+    return Res.json(Dict("status" => "ok"))
+end
+```
+
+### Read data
+
+```julia
+function dashboard_handler(req::HTTP.Request)
+    user_id = get(req.session, "user_id", nothing)
+    if isnothing(user_id)
+        return Res.status(401, Res.json(Dict("error" => "Login required")))
+    end
+    return Res.json(Dict("user_id" => user_id))
+end
+```
+
+### Update / append data
+
+Because `req.session` is a plain `Dict{String, Any}`, you update or append with
+the same Julia idioms you would use on any dictionary.
+
+**Overwrite a key:**
+
+```julia
+function update_role_handler(req::HTTP.Request)
+    req.session["role"] = "admin"       # replaces previous value
+    return Res.json(Dict("status" => "role updated"))
+end
+```
+
+**Append to a list stored in the session:**
+
+```julia
+function add_to_cart_handler(req::HTTP.Request, product_id::Int)
+    cart = get(req.session, "cart", Int[])   # default to empty list
+    push!(cart, product_id)
+    req.session["cart"] = cart               # write back
+    return Res.json(Dict("cart" => cart))
+end
+```
+
+**Merge a sub-dict (bulk update):**
+
+```julia
+function update_prefs_handler(req::HTTP.Request)
+    patch = req.json                         # e.g. Dict("theme" => "dark")
+    prefs = get(req.session, "prefs", Dict{String,Any}())
+    merge!(prefs, patch)
+    req.session["prefs"] = prefs
+    return Res.json(Dict("prefs" => prefs))
+end
+```
+
+All changes are automatically persisted at the end of the request by `SessionMiddleware`.
+
+### Delete keys
+
+```julia
+function remove_cart_handler(req::HTTP.Request)
+    delete!(req.session, "cart")
+    return Res.json(Dict("status" => "cart cleared"))
+end
+```
+
+### Flush / logout
+
+```julia
+function logout_handler(req::HTTP.Request)
+    empty!(req.session)
+    return Res.json(Dict("message" => "Logged out"))
+end
+```
+
+## Session Regeneration
+
+After login, regenerate the session ID to prevent session-fixation attacks:
+
+```julia
+function login_handler(req::HTTP.Request)
+    # ... validate credentials ...
+    req.session["user_id"] = user[:id]
+
+    # Cycle the session ID — works with any store backend
+    regenerate_session!(req, store; ttl=3600)
+
+    return Res.json(Dict("status" => "ok"))
+end
+```
+
+`regenerate_session!` copies the current session data to a new ID, deletes the old
+session, and updates the request context so `SessionMiddleware` writes the new
+cookie automatically.
 
 ## Unified Auth Context
 
-To leverage Nitro's Guards and Auth module, populate `req.context[:user]` with the authenticated entity. `BearerAuth` does this automatically for JWTs.
-
-> **Note:** `SessionMiddleware` manages state (`req.session`) but no longer automatically populates `req.user`. When building a stateful, cookie-backed application, you should write a custom middleware that reads the session and loads your authenticated entity into `req.user`.
+`SessionMiddleware` manages state (`req.session`) but does not automatically
+populate `req.user`. Write a small middleware to bridge them:
 
 ```julia
-using HTTP
-using Nitro
-
-# Example: Custom middleware to map session data to the User context
 function SessionAuthMiddleware(handle)
     return function(req::HTTP.Request)
-        # Assuming `SessionMiddleware` has already run and populated `req.session`
         session = req.session
-        if session !== nothing && haskey(session, "user_id")
-            # In a real app, you would load the user from the database here
-            req.context[:user] = Dict("id" => session["user_id"], "role" => session["role"])
+        if !isnothing(session) && haskey(session, "user_id")
+            req.context[:user] = Dict(
+                "id"   => session["user_id"],
+                "role" => get(session, "role", "user"),
+            )
         end
         return handle(req)
     end
 end
 
-function dashboard(req::HTTP.Request)
-    return Res.json(Dict(
-        "session" => req.session,
-        "user" => req.user, # Populated by SessionAuthMiddleware
-    ))
-end
-
 urlpatterns("",
     path("/dashboard", dashboard, method="GET", middleware=[
         SessionAuthMiddleware,
-        GuardMiddleware(login_required())
+        GuardMiddleware(login_required()),
     ]),
 )
 ```
@@ -73,7 +265,6 @@ urlpatterns("",
 `Nitro.Auth` provides stateless JWT helpers with HS256 signing and claim validation.
 
 ```julia
-using HTTP
 using Nitro
 using Nitro.Auth
 
@@ -103,7 +294,6 @@ claims = decode_jwt(token, keys)
 Use the higher-level cookie helpers for auth tokens:
 
 ```julia
-using HTTP
 using Nitro.Auth
 
 res = HTTP.Response(200)
@@ -118,4 +308,5 @@ serve(middleware=[
 ])
 ```
 
-The middleware uses a signed double-submit cookie. Safe requests receive a CSRF cookie automatically; unsafe requests must echo either the raw token or the signed cookie value in the `X-CSRF-Token` header.
+The middleware uses a signed double-submit cookie. Safe requests receive a CSRF cookie
+automatically; unsafe requests must echo the token in the `X-CSRF-Token` header.

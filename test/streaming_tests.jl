@@ -3,6 +3,9 @@ using Test
 using HTTP
 using Nitro
 
+port = get_free_port()
+localhost = "http://$HOST:$port"
+
 function explicit_stream(stream::HTTP.Stream)
     # Set headers
     HTTP.setheader(stream, "Content-Type" => "text/plain")
@@ -31,7 +34,7 @@ urlpatterns("",
     path("/api/error", implicit_stream, method="GET"),
 )
 
-serve(port=PORT, host=HOST, async=true,  show_errors=false, show_banner=false, access_log=nothing)
+serve(port=port, host=HOST, async=true,  show_errors=false, show_banner=false, access_log=nothing)
 
 @testset "StreamingChunksDemo Tests" begin
 

@@ -5,6 +5,9 @@ using HTTP
 using Suppressor
 using Nitro
 
+port = get_free_port()
+localhost = "http://$HOST:$port"
+
 @testset "parallel tests" begin
 
     invocation = []
@@ -43,7 +46,7 @@ using Nitro
 
     if Threads.nthreads() <= 1
         # the service should work even when we only have a single thread available (not ideal)
-        @async serve(port=PORT, show_errors=false, show_banner=false, queuesize=100)
+        @async serve(port=port, show_errors=false, show_banner=false, queuesize=100)
         sleep(1)  # give the server time to start before making requests
         r = HTTP.get("$localhost/get")
         @test r.status == 200
@@ -55,7 +58,7 @@ using Nitro
     # only run these tests if we have more than one thread to work with
     if Threads.nthreads() > 1
 
-        serve(host=HOST, port=PORT, show_errors=true, async=true, show_banner=true)
+        serve(host=HOST, port=port, show_errors=true, async=true, show_banner=true)
         sleep(3)
 
         r = HTTP.get("$localhost/get")
@@ -72,7 +75,7 @@ using Nitro
         
         terminate()
 
-        serve(host=HOST, port=PORT, middleware=[handler1, handler2, handler3], show_errors=true, async=true, show_banner=false)
+        serve(host=HOST, port=port, middleware=[handler1, handler2, handler3], show_errors=true, async=true, show_banner=false)
         sleep(1)
 
         r = HTTP.get("$localhost/get")

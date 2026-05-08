@@ -66,10 +66,11 @@ function SessionMiddleware(;
 
             # 4. Save session and set cookie
             current_session = req.context[:session]
-            session_changed = is_new || current_session != original_session
+            final_session_id = get(req.context, :session_id, session_id)
+            session_changed = is_new || final_session_id != session_id || current_session != original_session
             if session_changed
-                _save_session(store, session_id, current_session, max_age)
-                HTTP.setheader(response, "Set-Cookie" => format_cookie(cookie_name, session_id, config))
+                _save_session(store, final_session_id, current_session, max_age)
+                HTTP.setheader(response, "Set-Cookie" => format_cookie(cookie_name, final_session_id, config))
             end
 
             return response

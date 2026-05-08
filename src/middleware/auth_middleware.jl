@@ -3,6 +3,7 @@ module AuthMiddleware
 using HTTP
 using ...Types
 using ...Cookies: get_cookie
+using ...Errors: CookieError
 
 export BearerAuth, CookieAuthMiddleware
 
@@ -24,7 +25,14 @@ function CookieAuthMiddleware(validate_token::Function; cookie_name::String = "a
     return function (handle::Function)
         return function(req::HTTP.Request)
             # Try to extract the authentication cookie
-            token = get_cookie(req, cookie_name, secret_key)
+            token = try
+                get_cookie(req, cookie_name, nothing; encrypted=secret_key !== nothing, secret_key=secret_key)
+            catch e
+                if e isa CookieError
+                    return MISSING_COOKIE
+                end
+                rethrow(e)
+            end
             if isnothing(token) || isempty(token)
                 return MISSING_COOKIE
             end

@@ -3,6 +3,9 @@ using Test
 using HTTP
 using Nitro
 
+port = get_free_port()
+localhost = "http://$HOST:$port"
+
 urlpatterns("",
     path("/noarg", function(;request)
         @test isa(request, HTTP.Request)
@@ -19,7 +22,7 @@ urlpatterns("",
     end, method="GET"),
 )
 
-serve(port=PORT, host=HOST, async=true,  show_errors=false, show_banner=false, access_log=nothing)
+serve(port=port, host=HOST, async=true,  show_errors=false, show_banner=false, access_log=nothing)
 
 @testset "Handler request Injection Tests" begin
 

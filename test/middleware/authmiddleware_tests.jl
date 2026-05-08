@@ -2,6 +2,9 @@
 using HTTP
 using Nitro
 
+port = get_free_port()
+localhost = "http://$HOST:$port"
+
 good_token = "goodtoken"
 validate_token(token) = token == good_token ? Dict(:id => 1, :name => "TestUser") : nothing
 
@@ -51,7 +54,7 @@ urlpatterns("/auth",
 )
 
 # Start server for tests
-serve(port=PORT, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
+serve(port=port, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
 
 @testset "BearerAuth Middleware Tests" begin
 
@@ -82,6 +85,9 @@ end
     # Build middleware
     mw = CookieAuthMiddleware(validate_token, cookie_name="my_auth_cookie")
     handler = mw(req->HTTP.Response(200, "ok"))
+    secret = "auth-secret"
+    encrypted_mw = CookieAuthMiddleware(validate_token, cookie_name="my_auth_cookie", secret_key=secret)
+    encrypted_handler = encrypted_mw(req->HTTP.Response(200, "ok"))
 
     # Case A: Missing cookie
     reqA = HTTP.Request("GET", "/")
@@ -103,6 +109,25 @@ end
     @test resC.status == 200
     @test text(resC) == "ok"
     @test reqC.context[:user][:name] == "TestUser"
+
+    # Case D: Valid encrypted cookie
+    login_res = HTTP.Response(200)
+    set_cookie!(login_res, "my_auth_cookie", good_token, encrypted=true, secret_key=secret)
+    reqD = HTTP.Request("GET", "/")
+    HTTP.setheader(reqD, "Cookie" => HTTP.header(login_res, "Set-Cookie"))
+    resD = encrypted_handler(reqD)
+    @test resD.status == 200
+    @test text(resD) == "ok"
+    @test reqD.context[:user][:name] == "TestUser"
+
+    # Case E: Invalid encrypted cookie should be rejected as unauthorized, not raise
+    wrong_res = HTTP.Response(200)
+    set_cookie!(wrong_res, "my_auth_cookie", good_token, encrypted=true, secret_key="wrong-secret")
+    reqE = HTTP.Request("GET", "/")
+    HTTP.setheader(reqE, "Cookie" => HTTP.header(wrong_res, "Set-Cookie"))
+    resE = encrypted_handler(reqE)
+    @test resE.status == 401
+    @test contains(text(resE), "Missing or invalid authentication cookie")
 end
 
 terminate()

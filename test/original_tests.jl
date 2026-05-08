@@ -1,5 +1,8 @@
 ﻿@testitem "Original integration" tags=[:core, :network] setup=[NitroCommon] begin
 
+# Workers run from a different cwd; anchor everything to the test directory.
+cd(@__DIR__)
+
 using Test
 using HTTP
 using JSON
@@ -7,6 +10,9 @@ using Sockets
 using Dates 
 using Suppressor
 using Nitro
+
+port = get_free_port()
+localhost = "http://$HOST:$port"
 
 struct Person
     name::String
@@ -20,11 +26,9 @@ end
 
 
 # mount all files inside the content folder under /static
-#@staticfiles "content"
 staticfiles("content")
 
 # mount files under /dynamic
-#@dynamicfiles "content" "/dynamic"
 dynamicfiles("content", "/dynamic")
 
 # test that trailing system file path separators are allowed
@@ -157,7 +161,7 @@ catch e
     @test true
 end
 
-serve(async=true, port=PORT, show_errors=false, show_banner=true)
+serve(async=true, port=port, show_errors=false, show_banner=true)
 
 r = internalrequest(HTTP.Request("GET", "/anonymous"))
 @test r.status == 200
@@ -494,11 +498,11 @@ catch e
     @test true
 end
 
-@async serve(middleware=[middleware1, middleware2, middleware3], port=PORT, show_errors=false, show_banner=false)
+@async serve(middleware=[middleware1, middleware2, middleware3], port=port, show_errors=false, show_banner=false)
 sleep(1)
 
 # This should be a non-empty string now that the service is running
-@test getexternalurl() == "http://127.0.0.1:6060"
+@test getexternalurl() == "http://$HOST:$port"
 
 r = internalrequest(HTTP.Request("GET", "/get"))
 @test r.status == 200

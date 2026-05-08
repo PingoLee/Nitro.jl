@@ -2,13 +2,14 @@ module Cookies
 
 using HTTP
 using Dates
+using UUIDs
 using ..Types
 using ..Errors
 
 using ..Crypto: encrypt_payload, decrypt_payload
 
 export parse_cookies, format_cookie, get_cookie, set_cookie!, load_cookie_settings!,
-    storesession!, prunesessions!
+    storesession!, prunesessions!, regenerate_session!
 
 # ============================================================================
 # SECTION 1: Internal Normalization & Validation
@@ -112,6 +113,67 @@ function _normalize_bool(val::Any, name::String) :: Bool
         return val != 0
     end
     throw(ArgumentError("$name: cannot parse '$val' as Bool"))
+end
+
+function _has_ctl_chars(val::AbstractString) :: Bool
+    return any(ch -> ch <= '\x1f' || ch == '\x7f', val)
+end
+
+function _validate_cookie_name(name::String) :: String
+    isempty(name) && throw(ArgumentError("cookie name cannot be empty"))
+    _has_ctl_chars(name) && throw(ArgumentError("cookie name contains control characters"))
+
+    for ch in name
+        if isletter(ch) || isdigit(ch) || ch in ('!', '#', '\$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~')
+            continue
+        end
+        throw(ArgumentError("cookie name contains invalid character: '$ch'"))
+    end
+
+    return name
+end
+
+function _validate_cookie_value(value::String) :: String
+    _has_ctl_chars(value) && throw(ArgumentError("cookie value contains control characters"))
+
+    for ch in value
+        if ch == '!' || ('#' <= ch <= '+') || ('-' <= ch <= ':') || ('<' <= ch <= '[') || (']' <= ch <= '~')
+            continue
+        end
+        throw(ArgumentError("cookie value contains invalid character: '$ch'"))
+    end
+
+    return value
+end
+
+function _normalize_path(val::Any) :: String
+    if !isa(val, AbstractString)
+        throw(ArgumentError("path: expected String, got $(typeof(val))"))
+    end
+
+    path = String(val)
+    isempty(path) && throw(ArgumentError("path: cannot be empty"))
+    startswith(path, "/") || throw(ArgumentError("path: must start with '/': $path"))
+    _has_ctl_chars(path) && throw(ArgumentError("path: contains control characters"))
+    occursin(';', path) && throw(ArgumentError("path: contains invalid character: ';'"))
+
+    return path
+end
+
+function _normalize_runtime_path(val::Any) :: String
+    if !isa(val, AbstractString)
+        throw(ArgumentError("path: expected String, got $(typeof(val))"))
+    end
+
+    path = String(val)
+    _has_ctl_chars(path) && throw(ArgumentError("path: contains control characters"))
+    occursin(';', path) && throw(ArgumentError("path: contains invalid character: ';'"))
+
+    if isempty(path) || !startswith(path, "/")
+        return "/"
+    end
+
+    return path
 end
 
 function _normalize_maxage(val::Any) :: Tuple{Union{Int, Nothing}, Bool, Union{Dates.DateTime, Nothing}}
@@ -261,6 +323,10 @@ function format_cookie(
     secure::Bool = true, 
     samesite::String = "Lax"
 )
+    _validate_cookie_name(name)
+    _validate_cookie_value(value)
+    path = _normalize_path(path)
+
     parts = ["$name=$value", "Path=$path"]
     
     if !isnothing(domain)
@@ -397,6 +463,7 @@ function get_cookie(
     name::Union{String, Symbol},
     default::Any = nothing; 
     encrypted::Bool = false, 
+    config::CookieConfig = CookieConfig(),
     secret_key::Union{String, Nothing} = nothing,
     max_cookie_size::Union{Int, Nothing} = nothing,
     kwargs...
@@ -423,13 +490,23 @@ function get_cookie(
     
     raw_value = String(found_value)
 
+    final_secret = isnothing(secret_key) ? config.secret_key : secret_key
+    final_max_cookie_size = isnothing(max_cookie_size) ? config.max_cookie_size : max_cookie_size
+
     # Check size limit
-    if !isnothing(max_cookie_size) && length(raw_value) > max_cookie_size
+    if !isnothing(final_max_cookie_size) && length(raw_value) > final_max_cookie_size
         return final_default
     end
     
     # Decrypt if requested
-    final_value = (encrypted && !isnothing(secret_key) && secret_key != "") ? decrypt_payload(secret_key, raw_value) : raw_value
+    final_value = if encrypted
+        if isnothing(final_secret) || final_secret == ""
+            throw(CookieError("Encrypted cookie access requires a non-empty secret_key"))
+        end
+        decrypt_payload(final_secret, raw_value)
+    else
+        raw_value
+    end
     
     if isnothing(final_default) || final_default isa String
         return final_value
@@ -502,10 +579,7 @@ function set_cookie!(
     set_if_not_nothing(:samesite, samesite)
 
     # 2. Normalize and apply defaults from config
-    final_path = Base.get(merged_attrs, :path, isnothing(config.path) ? "/" : config.path)
-    if !startswith(final_path, "/")
-        final_path = "/"
-    end
+    final_path = _normalize_runtime_path(Base.get(merged_attrs, :path, isnothing(config.path) ? "/" : config.path))
 
     final_domain = nothing
     if haskey(merged_attrs, :domain)
@@ -548,8 +622,14 @@ function set_cookie!(
     is_encrypted = isnothing(encrypted) ? !isnothing(final_secret) : encrypted
     str_value = string(value)
     
-    # If encryption is requested but key is empty, we skip encryption (empty key is falsy for security)
-    final_value = (is_encrypted && !isnothing(final_secret) && final_secret != "") ? encrypt_payload(final_secret, str_value) : str_value
+    final_value = if is_encrypted
+        if isnothing(final_secret) || final_secret == ""
+            throw(CookieError("Encrypted cookie writes require a non-empty secret_key"))
+        end
+        encrypt_payload(final_secret, str_value)
+    else
+        str_value
+    end
     
     cookie_str = format_cookie(
         string(name), 
@@ -608,13 +688,7 @@ function load_cookie_settings!(defaults::Nullable{Dict} = nothing)
                     optimized_defaults[attr_key] = v
                 end
             elseif attr_key == :path
-                if !isa(v, String)
-                    push!(errors, "path: expected String, got $(typeof(v))")
-                elseif !startswith(v, "/")
-                    push!(errors, "path: must start with '/': $v")
-                else
-                    optimized_defaults[attr_key] = v
-                end
+                optimized_defaults[attr_key] = _normalize_path(v)
             elseif attr_key == :domain
                 optimized_defaults[attr_key] = _normalize_domain(v)
             elseif attr_key == :expires
@@ -664,6 +738,37 @@ Remove expired sessions from a MemoryStore.
 """
 function prunesessions!(store::MemoryStore)
     return cleanup_expired_sessions!(store)
+end
+
+"""
+    regenerate_session!(req::HTTP.Request, store::AbstractSessionStore{String, Dict{String,Any}}; ttl::Int=3600) -> String
+
+Regenerate the session ID to prevent session-fixation attacks.
+
+Copies the current session data to a new session ID, deletes the old session,
+and updates `req.context[:session_id]` so that `SessionMiddleware` writes the
+new cookie on the response. Works with any `AbstractSessionStore` backend.
+
+Returns the new session ID.
+"""
+function regenerate_session!(req::HTTP.Request, store::AbstractSessionStore{String, Dict{String,Any}}; ttl::Int=3600)
+    old_id = get(req.context, :session_id, nothing)
+    session_data = get(req.context, :session, Dict{String,Any}())
+
+    new_id = string(UUIDs.uuid4())
+
+    # Write current data under new ID
+    set_session!(store, new_id, session_data; ttl=ttl)
+
+    # Remove old session
+    if !isnothing(old_id)
+        delete_session!(store, old_id)
+    end
+
+    # Update the request context so middleware writes the new cookie
+    req.context[:session_id] = new_id
+
+    return new_id
 end
 
 end

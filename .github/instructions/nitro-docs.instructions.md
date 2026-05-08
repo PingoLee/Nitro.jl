@@ -74,29 +74,30 @@ const appM = automatic_models   # handlers import this alias
 
 ## 5. PormG Query Idiom
 
-When showing ORM queries with PormG, use the **pipe + chained filter** idiom.
-Never use `.objects.` (it does not exist) or the one-liner `(Model |> object).filter(...)`.
+When showing ORM queries with PormG, use the **dot-chained** idiom via `.objects.`:
 
 ```julia
-# ✅ correct — two-line idiom
-query = appM.Product |> object
-query.filter("category" => category)
+# ✅ correct — Django-style dot chaining
+M.Product.objects.filter("category" => category).list()
 
-# ✅ also correct — conditional chaining
-query = appM.Product |> object
+# ✅ correct — conditional chaining
+query = M.Product.objects.filter("is_active" => true)
 !isempty(f.name) && query.filter("name__@icontains" => f.name)
 !isnothing(f.category) && query.filter("category" => f.category)
+results = query.list()
 
-# ❌ wrong — .objects. doesn't exist
-appM.Product.objects.filter("category" => category)
+# ✅ correct — single record lookup (null-safe, adds LIMIT 1)
+user = M.User.objects.filter("username" => username).first()
 
-# ❌ wrong — one-liner makes chaining unreadable
-(appM.Product |> object).filter("category" => category)
+# ✅ also correct — pipe idiom
+query = M.Product |> object
+query.filter("category" => category)
 ```
 
-Common PormG operators to demonstrate: `__@icontains`, `__@in`, `.page(n, limit)`, `list(query)`.
+Terminal methods: `.list()`, `.first()`, `.count()`, `.exists()`, `.delete()`.
+Common filter operators: `__@icontains`, `__@in`, `.page(n, limit)`, `.order_by("-created")`.
 
-## 5. Response Construction
+## 6. Response Construction
 
 Always use `Res` module functions. Never return raw dicts or strings from handlers.
 

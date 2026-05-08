@@ -21,8 +21,10 @@ app2.urlpatterns("",
 )
 
 # start both servers together
-app1.serve(port=PORT, async=true, show_errors=false, show_banner=false)
-app2.serve(port=PORT + 1, async=true, show_errors=false, show_banner=false)
+port1 = get_free_port()
+port2 = get_free_port()
+app1.serve(port=port1, async=true, show_errors=false, show_banner=false)
+app2.serve(port=port2, async=true, show_errors=false, show_banner=false)
 
 @testset "testing unqiue instances" begin
 

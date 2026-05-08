@@ -5,6 +5,9 @@ using Pkg: TOML
 using Nitro
 using HTTP
 
+port = get_free_port()
+localhost = "http://$HOST:$port"
+
 urlpatterns("",
     path("/", function() return text("Ok") end, method="GET"),
 )
@@ -33,17 +36,17 @@ original_revise_hooks = Nitro.revise_hooks()
 Nitro.clear_revise_hooks!()
 
 try
-    @test_throws "Invalid `revise` value" serve(port=PORT, host=HOST, show_errors=false, show_banner=false, access_log=nothing, revise=:all)
+    @test_throws "Invalid `revise` value" serve(port=port, host=HOST, show_errors=false, show_banner=false, access_log=nothing, revise=:all)
 
     # Production path should not require Revise when hot reload is disabled.
-    serve(port=PORT, host=HOST, show_errors=false, show_banner=false, access_log=nothing, async=true)
+    serve(port=port, host=HOST, show_errors=false, show_banner=false, access_log=nothing, async=true)
     @test String(HTTP.get("$localhost/").body) == "Ok"
     terminate()
 
     # Test error message when Revise support is unavailable.
     error_task = @async begin
         for revise in (:lazy, :eager)
-            @test_throws "Revise support is unavailable" serve(port=PORT, host=HOST, show_errors=false, show_banner=false, access_log=nothing, revise=revise)
+            @test_throws "Revise support is unavailable" serve(port=port, host=HOST, show_errors=false, show_banner=false, access_log=nothing, revise=revise)
         end
     end
 
@@ -78,7 +81,7 @@ try
         end
 
         try
-            serve(port=PORT, host=HOST, show_errors=false, show_banner=false, access_log=nothing, revise=revise_mode, middleware=[handler1], async=true)
+            serve(port=port, host=HOST, show_errors=false, show_banner=false, access_log=nothing, revise=revise_mode, middleware=[handler1], async=true)
 
             if revise_mode == :eager
                 @test timedwait(() -> revise_called_count[] == 1, 10) == :ok

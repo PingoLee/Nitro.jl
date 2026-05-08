@@ -4,6 +4,8 @@ using HTTP
 using HTTP.WebSockets
 using Nitro
 
+port = get_free_port()
+
 urlpatterns("",
     path("/ws", function(ws::HTTP.WebSocket)
         try
@@ -52,12 +54,12 @@ urlpatterns("",
     end, method="GET"),
 )
 
-serve(port=PORT, host=HOST, async=true,  show_errors=false, show_banner=false, access_log=nothing)
+serve(port=port, host=HOST, async=true,  show_errors=false, show_banner=false, access_log=nothing)
 
 @testset "Websocket Tests" begin
 
     @testset "/ws route" begin
-        WebSockets.open("ws://$HOST:$PORT/ws") do ws
+        WebSockets.open("ws://$HOST:$port/ws") do ws
             send(ws, "Test message")
             response = receive(ws)
             @test response == "Received message: Test message"
@@ -65,7 +67,7 @@ serve(port=PORT, host=HOST, async=true,  show_errors=false, show_banner=false, a
     end
 
     @testset "/router/ws route" begin
-        WebSockets.open("ws://$HOST:$PORT/router/ws") do ws
+        WebSockets.open("ws://$HOST:$port/router/ws") do ws
             send(ws, "Test message")
             response = receive(ws)
             @test response == "Received message: Test message"
@@ -73,7 +75,7 @@ serve(port=PORT, host=HOST, async=true,  show_errors=false, show_banner=false, a
     end
 
     @testset "/ws with arg route" begin
-        WebSockets.open("ws://$HOST:$PORT/ws/9") do ws
+        WebSockets.open("ws://$HOST:$port/ws/9") do ws
             send(ws, "Test message")
             response = receive(ws)
             @test response == "Received message from 9: Test message"
@@ -81,7 +83,7 @@ serve(port=PORT, host=HOST, async=true,  show_errors=false, show_banner=false, a
     end
 
     @testset "/ws with route(GET)" begin
-        WebSockets.open("ws://$HOST:$PORT/ws/get") do ws
+        WebSockets.open("ws://$HOST:$port/ws/get") do ws
             send(ws, "Test message")
             response = receive(ws)
             @test response == "Received message: Test message"

@@ -6,6 +6,8 @@ using Nitro
 using UUIDs
 using Nitro: path, urlpatterns, include_routes, convert_django_path, RouteDefinition, GET, POST, PUT, DELETE
 
+port = get_free_port()
+
 # ─── Test: convert_django_path ────────────────────────────────────────
 
 @testset "convert_django_path" begin
@@ -126,7 +128,7 @@ end
     )
 
     # Test via internalrequest
-    serve(port=6060, async=true, show_banner=false)
+    serve(port=port, async=true, show_banner=false)
     sleep(1)
 
     try
@@ -166,7 +168,7 @@ end
         include_routes("/user", user_routes)...,
     )
 
-    serve(port=6060, async=true, show_banner=false)
+    serve(port=port, async=true, show_banner=false)
     sleep(1)
 
     try

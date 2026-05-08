@@ -5,6 +5,8 @@ using HTTP
 using Nitro
 using Nitro: spafiles, GET
 
+port = get_free_port()
+
 @testset "SPA History Mode Tests" begin
     # Create a temporary directory structure to simulate an SPA build
     test_dir = mktempdir()
@@ -29,7 +31,7 @@ using Nitro: spafiles, GET
         # Mount the SPA folder
         spafiles(test_dir, "app")
         
-        serve(port=6065, async=true, show_banner=false)
+        serve(port=port, async=true, show_banner=false)
         sleep(1)
 
         try
@@ -74,7 +76,7 @@ using Nitro: spafiles, GET
         # This should log a warning about missing index.html, but still serve script.js
         spafiles(empty_dir, "empty")
         
-        serve(port=6065, async=true, show_banner=false)
+        serve(port=port, async=true, show_banner=false)
         sleep(1)
 
         try

@@ -1127,19 +1127,25 @@ const Cookies = Nitro.Cookies
         resetstate()
     end
 
-    @testset "ROBUSTNESS: Empty string secret key validation" begin
-        # Empty secret key should not be allowed for encryption
+    @testset "ROBUSTNESS: Secret key validation and config fallback" begin
+        # Invalid or missing secret keys should fail closed for encrypted reads and writes.
         res = HTTP.Response(200)
         
-        # 1. Test set_cookie! with empty secret_key
-        # It should NOT encrypt if key is empty
-        res2 = set_cookie!(res, "test_empty_key", "value", secret_key="", encrypted=true)
-        header = HTTP.header(res2, "Set-Cookie")
-        @test occursin("test_empty_key=value", header)
+        # 1. Empty explicit key during write must fail closed.
+        @test_throws Nitro.Core.Errors.CookieError set_cookie!(res, "test_empty_key", "value", secret_key="", encrypted=true)
         
-        # 2. Test get_cookie with empty secret_key
+        # 2. Empty explicit key during read must fail closed.
         req = HTTP.Request("GET", "/", ["Cookie" => "test_empty_key=value"])
-        @test Cookies.get_cookie(req, "test_empty_key", secret_key="", encrypted=true) == "value"
+        @test_throws Nitro.Core.Errors.CookieError Cookies.get_cookie(req, "test_empty_key", secret_key="", encrypted=true)
+
+        # 3. Missing key during encrypted read must also fail closed.
+        @test_throws Nitro.Core.Errors.CookieError Cookies.get_cookie(req, "test_empty_key", encrypted=true)
+
+        # 4. Core API should accept an explicit config as the key source.
+        conf = CookieConfig(secret_key=secret)
+        encrypted_value = Cookies.encrypt_payload(secret, "config-backed")
+        req_with_config = HTTP.Request("GET", "/", ["Cookie" => "test_config_key=$encrypted_value"])
+        @test Cookies.get_cookie(req_with_config, "test_config_key", encrypted=true, config=conf) == "config-backed"
     end
 
     @testset "SECURITY: AES-GCM Integrity (Tampering)" begin

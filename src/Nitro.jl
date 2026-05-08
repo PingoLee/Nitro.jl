@@ -52,6 +52,7 @@ export  # Server lifecycle
         Param, LazyRequest, ValidationError, Nullable,
         # Cookies & Security
         configcookies, get_cookie, set_cookie!, Cookies, Errors,
+        regenerate_session!,
         # Middleware
         BearerAuth, CookieAuthMiddleware, Cors, RateLimiter, ExtractIP,
         SessionMiddleware, GuardMiddleware, login_required, role_required, permission_required, CSRFMiddleware,

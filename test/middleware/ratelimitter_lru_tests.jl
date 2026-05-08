@@ -4,7 +4,13 @@ using Dates
 using Nitro
 
 function warm_up_and_reset(url; pause_seconds)
-    HTTP.request("GET", url, status_exception=false)
+    # Use HTTP.get (the same call site as the test loops) so that JIT compilation
+    # happens here rather than inside the timing-sensitive rate-limit window.
+    r = HTTP.get(url; status_exception=false)
+    _ = text(r)
+    _ = HTTP.header(r, "X-RateLimit-Limit")
+    _ = HTTP.header(r, "X-RateLimit-Remaining")
+    _ = HTTP.header(r, "X-RateLimit-Reset")
     sleep(pause_seconds)
 end
 
@@ -18,8 +24,12 @@ urlpatterns("",
     path("/ok", function() return "ok" end, method="GET"),
 )
 
+# Use a dynamic port to avoid conflicts when running tests in parallel.
+port = get_free_port()
+host = HOST
+localhost = "http://$host:$port"
 # Warm the route once so JIT latency does not consume the sliding window budget.
-serve(middleware=[RateLimiter(strategy=:sliding_window, rate_limit=10, window=Second(3))], port=PORT, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
+serve(middleware=[RateLimiter(strategy=:sliding_window, rate_limit=10, window=Second(3))], port=port, host=host, async=true, show_errors=false, show_banner=false, access_log=nothing)
 warm_up_and_reset("$localhost/ok"; pause_seconds=3.1)
 
 @testset "Rate Limiter Tests" begin
@@ -64,7 +74,7 @@ terminate()
 
 
 # Create a server without global middleware but with route-level middleware on /limited/*
-serve(port=PORT, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
+serve(port=port, host=host, async=true, show_errors=false, show_banner=false, access_log=nothing)
 
 HTTP.request("GET", "$localhost/limited/greet", status_exception=false)
 HTTP.request("GET", "$localhost/limited/goodbye", status_exception=false)
@@ -145,7 +155,7 @@ urlpatterns("",
     path("/exempt",  function() return "exempt" end,  method="GET"),
 )
 
-serve(middleware=[RateLimiter(strategy=:sliding_window, rate_limit=10, window=Second(1), exempt_paths=["/exempt"])], port=PORT, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
+serve(middleware=[RateLimiter(strategy=:sliding_window, rate_limit=10, window=Second(1), exempt_paths=["/exempt"])], port=port, host=host, async=true, show_errors=false, show_banner=false, access_log=nothing)
 warm_up_and_reset("$localhost/limited"; pause_seconds=1.1)
 
 @testset "Exempt Paths Test" begin
@@ -195,7 +205,7 @@ urlpatterns("",
     path("/notexempt", function() return "notexempt" end, method="GET"),
 )
 
-serve(middleware=[RateLimiter(strategy=:sliding_window, rate_limit=5, window=Second(1), exempt_paths=["/exempt1", "/exempt2"])], port=PORT, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
+serve(middleware=[RateLimiter(strategy=:sliding_window, rate_limit=5, window=Second(1), exempt_paths=["/exempt1", "/exempt2"])], port=port, host=host, async=true, show_errors=false, show_banner=false, access_log=nothing)
 warm_up_and_reset("$localhost/limited"; pause_seconds=1.1)
 
 @testset "Multiple Exempt Paths Test" begin

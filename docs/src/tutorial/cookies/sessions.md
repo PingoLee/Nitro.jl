@@ -37,9 +37,18 @@ NewSessionStore() = SessionStore(Dict{String, Dict{String, Any}}())
 ### Note on Persistence
 > **⚠️ Production Advice:** The in-memory example above loses data when the server restarts. 
 > 
-> **You can implement persistence today:** Simply replace the `Dict` in the `SessionStore` with a database connection (like Redis, PostgreSQL, or SQLite). Since you control the logic in the route handlers, you can swap `store.data[id]` with a database query (e.g., `DBInterface.execute(...)`).
+> **Recommended: Use `pormg_nitro_session()`** — Nitro provides a built-in PormG-backed session
+> store that persists sessions in your database automatically. See the
+> [Sessions and Auth](@ref) guide for setup instructions.
 >
-> *Official plugins for automatic database persistence are planned for future releases.*
+> ```julia
+> using Nitro, PormG
+> store = pormg_nitro_session()
+> serve(middleware=[SessionMiddleware(store=store, max_age=3600)])
+> ```
+>
+> If you prefer a different backend, you can implement your own store using the
+> `AbstractSessionStore` interface.
 
 ## 2. Configuring Security
 

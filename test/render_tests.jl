@@ -1,4 +1,5 @@
 ﻿@testitem "Render" tags=[:core] setup=[NitroCommon] begin
+cd(@__DIR__)
 using Test
 using HTTP
 

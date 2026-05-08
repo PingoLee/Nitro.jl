@@ -3,6 +3,9 @@ using Test
 using HTTP
 using Nitro
 
+port = get_free_port()
+localhost = "http://$HOST:$port"
+
 struct Person
     name::String
     age::Int
@@ -16,7 +19,7 @@ urlpatterns("",
     path("/method-only", function() return json(context()) end, method="GET"),
 )
 
-serve(port=PORT, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
+serve(port=port, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
 
 @testset "null context tests" begin 
     try
@@ -47,7 +50,7 @@ terminate()
 
 person = Person("John", 25)
 
-serve(port=PORT, host=HOST, async=true, show_errors=true, show_banner=false, access_log=nothing, context=person)
+serve(port=port, host=HOST, async=true, show_errors=true, show_banner=false, access_log=nothing, context=person)
 
 @testset "context() tests" begin
     @test context() isa Person

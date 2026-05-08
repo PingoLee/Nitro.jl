@@ -44,7 +44,9 @@ urlpatterns("",
     end, method="POST"),
 )
 
-serve(host=HOST, port=PORT, async=true, show_banner=false, access_log=nothing)
+port = get_free_port()
+localhost = "http://$HOST:$port"
+serve(host=HOST, port=port, async=true, show_banner=false, access_log=nothing)
 
 @testset "Test ZonedDateTime as a Path Param" begin 
     r = HTTP.get("$localhost/time/2025-02-02T22:25:31.035+07:00")

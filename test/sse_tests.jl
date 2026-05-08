@@ -4,6 +4,9 @@ using Dates
 using HTTP
 using Nitro
 
+port = get_free_port()
+localhost = "http://$HOST:$port"
+
 urlpatterns("",
     path("/health", function() return text("I'm alive") end, method="GET"),
     path("/events/{name}", function(stream::HTTP.Stream, name::String)
@@ -23,7 +26,7 @@ urlpatterns("",
 )
 
 
-serve(port=PORT, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
+serve(port=port, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
 
 
 @testset "Stream Function tests" begin 
