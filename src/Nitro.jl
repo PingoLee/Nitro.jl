@@ -65,7 +65,7 @@ export  # Server lifecycle
         # Context Types and methods
         Context, context,
         # Django-style Routing (THE routing API)
-        path, urlpatterns, include_routes, RouteDefinition,
+        path, urlpatterns, include_routes, RouteDefinition, url,
         # Response Abstractions
         Res
 

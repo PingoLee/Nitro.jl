@@ -158,12 +158,15 @@ password_needs_upgrade(old_hash; min_iterations=720_000)  # true
 A typical pattern in a login handler:
 
 ```julia
+jwt_secret = get(ENV, "JWT_SECRET", nothing)
+isnothing(jwt_secret) && error("JWT_SECRET must be set")
+
 function login(req::HTTP.Request)
     body = json(req)
     stored_hash = lookup_user_hash(body["username"])  # your DB lookup
 
     if !check_password(body["password"], stored_hash)
-        return Res.status(401, "invalid credentials")
+        return Res.json(Dict("error" => "invalid credentials"); status=401)
     end
 
     if password_needs_upgrade(stored_hash)
@@ -171,7 +174,7 @@ function login(req::HTTP.Request)
         update_user_hash(body["username"], new_hash)  # your DB update
     end
 
-    token = encode_jwt(Dict("sub" => body["username"], "exp" => trunc(Int, time()) + 3600), "secret")
+    token = encode_jwt(Dict("sub" => body["username"], "exp" => trunc(Int, time()) + 3600), jwt_secret)
     return Res.json(Dict("token" => token))
 end
 

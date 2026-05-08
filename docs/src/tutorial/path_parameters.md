@@ -6,22 +6,33 @@ The values extracted from the URL are passed directly to your request handler as
 
 ## Django-style paths (Recommended)
 
-The recommended way to define paths is using the Django-style syntax `<converter:name>`. This automatically validates the type and injects the value into your handler.
+The recommended way to define paths is using the Django-style syntax `<converter:name>`. Nitro converts the incoming value using the converter type before calling your handler, even when the handler parameter itself is untyped. If you also annotate the handler parameter, Nitro checks that the route converter and handler type are compatible during registration.
 
 ```julia
-# src/Routes.jl
-function urlpatterns(config)
-    return [
-        path("/multiply/<float:a>/<float:b>", MathHandlers.multiply, method="POST"),
-        path("/user/<int:id>", UserHandlers.get_user)
-    ]
+using HTTP
+using Nitro
+
+function multiply(req::HTTP.Request, a::Float64, b::Float64)
+    return Res.json(Dict("result" => a * b))
 end
 
-# src/Handlers/MathHandlers.jl
-function multiply(req, a::Float64, b::Float64)
-    return a * b
+function get_user(req::HTTP.Request, id)
+    return Res.json(Dict(
+        "id" => id,
+        "type" => string(typeof(id)),
+    ))
+end
+
+# src/Routes.jl
+function urlpatterns()
+    return [
+        path("/multiply/<float:a>/<float:b>", multiply, method="POST"),
+        path("/user/<int:id>", get_user, method="GET"),
+    ]
 end
 ```
+
+That means `/user/42` reaches `get_user` with `id == 42` and `typeof(id) == Int`. A mismatched definition such as `function get_user(req::HTTP.Request, id::String)` with `path("/user/<int:id>", get_user)` now fails during route registration instead of drifting into runtime parsing errors.
 
 The available converters are:
 - `<int:name>` (e.g., `123`)
@@ -30,14 +41,39 @@ The available converters are:
 - `<bool:name>` (e.g., `true`)
 - `<uuid:name>` (e.g., `550e8400-e29b-41d4-a716-446655440000`)
 
+## Named Routes And Reverse URLs
+
+Use the `name=` keyword when you want to refer to a route later without hard-coding the path string again.
+
+```julia
+using HTTP
+using Nitro
+using UUIDs
+
+function get_user(req::HTTP.Request, id::Int)
+    return Res.json(Dict("id" => id))
+end
+
+function urlpatterns()
+    return [
+        path("/users/<int:id>", get_user, method="GET", name="user-detail"),
+    ]
+end
+
+user_path = url("user-detail"; id=42)
+# "/users/42"
+```
+
+Nitro substitutes the `{param}` placeholders from the registered route pattern. It raises an `ArgumentError` if the route name does not exist, if a required parameter is missing, or if extra keyword arguments are provided.
+
 ## Using brackets `{name}`
 
-You can also use the older bracket syntax. If you don't provide a type annotation in the handler, Nitro assumes it's a `String`.
+You can also use the older bracket syntax. Without a converter, Nitro uses the handler annotation to decide how to parse the value. If you leave the handler parameter untyped, Nitro treats the value as a `String`.
 
 ```julia
 # Route: /greet/{name}
-function greet(req, name::String)
-    return "Hello $name"
+function greet(req::HTTP.Request, name::String)
+    return Res.send("Hello $name")
 end
 ```
 

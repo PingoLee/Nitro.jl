@@ -38,6 +38,8 @@ using ..RouterHOF: genkey, process_middleware
 
 export path, urlpatterns, include_routes, convert_django_path
 
+const ROUTE_PARAM_REGEX = r"{(\w+)}"
+
 # ─── Path Converter Registry ─────────────────────────────────────────
 
 const CONVERTERS = Dict{String, Type}(
@@ -142,6 +144,68 @@ function include_routes(prefix::String, routes::RouteDefinition...)
 end
 
 
+function register_named_route!(ctx::ServerContext, name::String, full_path::String)
+    return Base.lock(ctx.service.named_routes_lock) do
+        existing_path = get(ctx.service.named_routes, name, nothing)
+        if isnothing(existing_path)
+            ctx.service.named_routes[name] = full_path
+        elseif existing_path != full_path
+            throw(ArgumentError(
+                "Duplicate route name: '$name' is already registered for '$existing_path'"
+            ))
+        end
+
+        return full_path
+    end
+end
+
+function build_named_route(pattern::String, kwargs)
+    provided = Dict{String, String}(
+        string(key) => HTTP.escapeuri(string(value))
+        for (key, value) in kwargs
+    )
+    consumed = Set{String}()
+
+    route = replace(pattern, ROUTE_PARAM_REGEX => function(match)
+        captures = Base.match(ROUTE_PARAM_REGEX, match).captures
+        param_name = captures[1]
+        if !haskey(provided, param_name)
+            throw(ArgumentError("Missing route parameter '$param_name' for route '$pattern'"))
+        end
+
+        push!(consumed, param_name)
+        return provided[param_name]
+    end)
+
+    extra_params = sort!(collect(setdiff(Set(keys(provided)), consumed)))
+    if !isempty(extra_params)
+        throw(ArgumentError(
+            "Unknown route parameters for route '$pattern': $(join(extra_params, ", "))"
+        ))
+    end
+
+    return route
+end
+
+"""
+    url(ctx, name; kwargs...)
+
+Build a URL path for a named route by substituting `{param}` placeholders from
+the registered route pattern.
+"""
+function url(ctx::ServerContext, name::String; kwargs...)
+    pattern = Base.lock(ctx.service.named_routes_lock) do
+        get(ctx.service.named_routes, name, nothing)
+    end
+
+    if isnothing(pattern)
+        throw(ArgumentError("Unknown route name: '$name'"))
+    end
+
+    return build_named_route(pattern, kwargs)
+end
+
+
 # ─── Internal: Register a single RouteDefinition ─────────────────────
 
 """
@@ -151,6 +215,10 @@ circular dependency issues at include-time.
 """
 function register_route(ctx::ServerContext, prefix::String, route_def::RouteDefinition)
     full_path = join_url_path(prefix, route_def.pattern)
+
+    if !isnothing(route_def.name)
+        register_named_route!(ctx, route_def.name, full_path)
+    end
     
     # Set up per-route middleware if defined
     if !isnothing(route_def.middleware)
@@ -164,7 +232,7 @@ function register_route(ctx::ServerContext, prefix::String, route_def::RouteDefi
     # Call Core.register via the parent module
     core = parentmodule(Routing)
     for method in route_def.methods
-        core.register(ctx, method, full_path, route_def.handler)
+        core.register(ctx, method, full_path, route_def.handler; type_hints=route_def.type_hints)
     end
 end
 

@@ -60,9 +60,12 @@ function load_config(env::String="dev")
         get(ENV, "DB_PASS", "")
     )
 
+    api_secret = get(ENV, "API_SECRET_KEY", nothing)
+    isnothing(api_secret) && error("API_SECRET_KEY must be set")
+
     auth = AuthConfig(
-        get(ENV, "API_SECRET_KEY", "changeme"),
-        Dict("default" => get(ENV, "API_SECRET_KEY", "changeme")),
+        api_secret,
+        Dict("default" => api_secret),
         ["default"],
         env == "prod",
         3600

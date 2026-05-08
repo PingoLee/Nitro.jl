@@ -58,3 +58,30 @@ set_cookie!(res, "auth_token", token,
 # For an API serving a separate Frontend domain:
 set_cookie!(res, "session", id, samesite="None", secure=true)
 ```
+
+## Transport Security and HSTS
+
+`secure=true` protects the cookie transport once the browser is already speaking HTTPS,
+but it does not tell the browser to avoid plaintext HTTP on the first visit. For public
+HTTPS deployments, also set `Strict-Transport-Security` at your reverse proxy or in an
+application middleware.
+
+```julia
+using HTTP
+
+function HSTSMiddleware(handle)
+    return function(req::HTTP.Request)
+        response = handle(req)
+        HTTP.setheader(response, "Strict-Transport-Security" => "max-age=31536000; includeSubDomains")
+        return response
+    end
+end
+
+serve(urlpatterns, middleware=[
+    HSTSMiddleware,
+    SessionMiddleware(secure=true),
+])
+```
+
+If TLS terminates at a load balancer or reverse proxy, prefer setting HSTS there so every
+response is covered consistently.

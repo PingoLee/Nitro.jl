@@ -28,7 +28,7 @@ function login_handler(req::HTTP.Request)
 
     user = M.User.objects.filter("username" => username).first()
     if isnothing(user) || !check_password(password, user[:password])
-        return Res.status(401, Res.json(Dict("error" => "Invalid credentials")))
+        return Res.json(Dict("error" => "Invalid credentials"); status=401)
     end
 
     # Store data in the session — like Django's request.session
@@ -36,13 +36,16 @@ function login_handler(req::HTTP.Request)
     req.session["username"] = user[:username]
     req.session["role"]     = user[:is_staff] ? "staff" : "user"
 
+    # Rotate the session ID after authentication to prevent fixation.
+    regenerate_session!(req, store; ttl=3600)
+
     return Res.json(Dict("message" => "Welcome $(user[:username])!"))
 end
 
 function me_handler(req::HTTP.Request)
     user_id = get(req.session, "user_id", nothing)
     if isnothing(user_id)
-        return Res.status(401, Res.json(Dict("error" => "Not authenticated")))
+        return Res.json(Dict("error" => "Not authenticated"); status=401)
     end
     return Res.json(Dict(
         "user_id"  => user_id,
@@ -52,8 +55,8 @@ function me_handler(req::HTTP.Request)
 end
 
 function logout_handler(req::HTTP.Request)
-    # Clear all session data — equivalent to Django's request.session.flush()
     empty!(req.session)
+    regenerate_session!(req, store; ttl=3600)
     return Res.json(Dict("message" => "Logged out"))
 end
 
@@ -65,10 +68,18 @@ urlpatterns("/api",
 )
 
 # 5. Serve
-serve(middleware=[
+serve(urlpatterns, middleware=[
     SessionMiddleware(store=store, cookie_name="nitro_sess", secure=false, samesite="Lax"),
-], port=8080, revise=:lazy)
+])
 ```
+
+The `secure=false` example is for local HTTP development only. Keep `secure=true` in production.
+
+With the default `rotate_on_auth=true` and `auth_key="user_id"`, `SessionMiddleware`
+also rotates an existing session automatically when `req.session["user_id"]` is added,
+removed, or changed. Keep `regenerate_session!` in login/logout flows when you want the
+rotation to happen immediately inside the handler or when your authenticated principal
+uses a different session key.
 
 ## Session Stores
 
@@ -126,11 +137,16 @@ It works exactly like Django's `request.session`:
 | `request.session["user_id"] = 42` | `req.session["user_id"] = 42` |
 | `request.session.get("role", "guest")` | `get(req.session, "role", "guest")` |
 | `del request.session["cart"]` | `delete!(req.session, "cart")` |
-| `request.session.flush()` | `empty!(req.session)` |
+| `request.session.flush()` | `empty!(req.session); regenerate_session!(req, store; ttl=3600)` |
 | `"user_id" in request.session` | `haskey(req.session, "user_id")` |
 
 Changes are automatically detected and persisted at the end of the request.
 You do not need to call a save method.
+
+`empty!(req.session)` only clears the current payload. For the default `user_id`-based flow,
+`SessionMiddleware` now rotates an existing session automatically when auth state changes.
+Call `regenerate_session!` explicitly if you want that rotation to happen immediately in the
+current handler or if your authenticated principal uses a different session key.
 
 ### Store data
 
@@ -150,7 +166,7 @@ end
 function dashboard_handler(req::HTTP.Request)
     user_id = get(req.session, "user_id", nothing)
     if isnothing(user_id)
-        return Res.status(401, Res.json(Dict("error" => "Login required")))
+        return Res.json(Dict("error" => "Login required"); status=401)
     end
     return Res.json(Dict("user_id" => user_id))
 end
@@ -209,20 +225,23 @@ end
 ```julia
 function logout_handler(req::HTTP.Request)
     empty!(req.session)
+    regenerate_session!(req, store; ttl=3600)
     return Res.json(Dict("message" => "Logged out"))
 end
 ```
 
+This invalidates the previous authenticated session on the server side and writes a fresh anonymous session cookie on the response.
+
 ## Session Regeneration
 
-After login, regenerate the session ID to prevent session-fixation attacks:
+After login or any privilege change, regenerate the session ID to prevent session-fixation attacks:
 
 ```julia
 function login_handler(req::HTTP.Request)
     # ... validate credentials ...
     req.session["user_id"] = user[:id]
 
-    # Cycle the session ID — works with any store backend
+    # Cycle the session ID — works with any store backend.
     regenerate_session!(req, store; ttl=3600)
 
     return Res.json(Dict("status" => "ok"))
@@ -231,7 +250,12 @@ end
 
 `regenerate_session!` copies the current session data to a new ID, deletes the old
 session, and updates the request context so `SessionMiddleware` writes the new
-cookie automatically.
+cookie automatically. In practice, use the same `ttl` you want for the rotated session.
+
+If you keep the default `auth_key="user_id"`, `SessionMiddleware` also performs this
+rotation automatically for existing sessions whose auth state changes during the request.
+Use explicit `regenerate_session!` calls for custom auth keys or for flows where you want
+the rotation to happen before the handler finishes.
 
 ## Unified Auth Context
 
@@ -268,7 +292,10 @@ urlpatterns("",
 using Nitro
 using Nitro.Auth
 
-validator = jwt_validator("super-secret")
+jwt_secret = get(ENV, "JWT_SECRET", nothing)
+isnothing(jwt_secret) && error("JWT_SECRET must be set")
+
+validator = jwt_validator(jwt_secret)
 
 function profile(req::HTTP.Request)
     return Res.json(Dict("sub" => req.user["sub"]))
@@ -282,7 +309,12 @@ urlpatterns("",
 You can also pass a keyset with `kid` values for rotation:
 
 ```julia
-keys = Dict("default" => "secret-a", "rotated" => "secret-b")
+required_env(name::String) = get(ENV, name, nothing) === nothing ? error("$name must be set") : ENV[name]
+
+keys = Dict(
+    "default" => required_env("JWT_SECRET_PRIMARY"),
+    "rotated" => required_env("JWT_SECRET_ROTATED"),
+)
 token = encode_jwt(Dict("sub" => "42", "exp" => trunc(Int, time()) + 300), keys; kid="rotated")
 claims = decode_jwt(token, keys)
 ```
@@ -300,11 +332,14 @@ res = HTTP.Response(200)
 set_auth_cookie!(res, "jwt-token"; secure=false)
 ```
 
-For cookie-authenticated browsers, add `CSRFMiddleware` to unsafe routes:
+For cookie-authenticated browsers, load the CSRF secret from the environment and add `CSRFMiddleware` to unsafe routes:
 
 ```julia
-serve(middleware=[
-    CSRFMiddleware("csrf-secret"; config=CookieConfig(httponly=false, secure=false)),
+csrf_secret = get(ENV, "CSRF_SECRET", nothing)
+isnothing(csrf_secret) && error("CSRF_SECRET must be set")
+
+serve(urlpatterns, middleware=[
+    CSRFMiddleware(csrf_secret; config=CookieConfig(httponly=false, secure=true, samesite="Lax")),
 ])
 ```
 

@@ -13,11 +13,8 @@ urlpatterns("",
     path("/ok", function() return "ok" end, method="GET"),
 )
 
-# Use a dynamic port to avoid conflicts when running tests in parallel.
-port = get_free_port()
-host = HOST
-localhost = "http://$host:$port"
-serve(middleware=[RateLimiter(rate_limit=100, window=Second(3))], port=port, host=host, async=true, show_errors=false, show_banner=false, access_log=nothing)
+# Create a rate limiter with realistic limits for testing (100 requests per second)
+serve(middleware=[RateLimiter(rate_limit=100, window=Second(3))], port=PORT, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
 
 @testset "Rate Limiter Tests" begin
 
@@ -61,7 +58,7 @@ terminate()
 
 
 # Create a server without global middleware but with route-level middleware on /limited/*
-serve(port=port, host=host, async=true, show_errors=false, show_banner=false, access_log=nothing)
+serve(port=PORT, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
 
 
 sleep(5) # Ensure rate limiter window is completely reset and any background cleanup is done
@@ -138,7 +135,7 @@ terminate()
 rl = RateLimiter(rate_limit=1, window=Hour(1), cleanup_period=Second(1), cleanup_threshold=Second(1))
 
 # Start server for background cleanup test
-serve(middleware=[rl], port=port, host=host, async=true, show_errors=false, show_banner=false, access_log=nothing)
+serve(middleware=[rl], port=PORT, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
 
 @testset "Background Cleanup Test" begin
 
@@ -185,7 +182,7 @@ urlpatterns("",
     path("/exempt",  function() return "exempt" end,  method="GET"),
 )
 
-serve(middleware=[RateLimiter(rate_limit=10, window=Second(1), exempt_paths=["/exempt"])], port=port, host=host, async=true, show_errors=false, show_banner=false, access_log=nothing)
+serve(middleware=[RateLimiter(rate_limit=10, window=Second(1), exempt_paths=["/exempt"])], port=PORT, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
 
 @testset "Exempt Paths Test" begin
     # First request to /limited should succeed with headers

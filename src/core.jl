@@ -456,7 +456,74 @@ function parse_route(http_method::String, router::InnerRouter)::String
     return router(http_method)
 end
 
-function parse_func_params(route::String, func::Function)
+function pathparam_type(route::String, param::Param, type_hints::Dict{Symbol, Type})::Type
+    hinted_type = get(type_hints, param.name, nothing)
+
+    if isnothing(hinted_type)
+        return param.type
+    elseif param.type == Any
+        return hinted_type
+    elseif param.type <: hinted_type || hinted_type <: param.type
+        return Reflection.select_type(param.type, hinted_type)
+    elseif hinted_type == Int && param.type <: Integer
+        return param.type
+    elseif hinted_type == Float64 && param.type <: AbstractFloat
+        return param.type
+    elseif hinted_type == String && param.type <: AbstractString
+        return param.type
+    else
+        throw(ArgumentError(
+            "Path parameter $(param.name) uses route converter type $(hinted_type), " *
+            "but the handler declares $(param.type) for route: $route"
+        ))
+    end
+end
+
+function merge_pathparam_type_hints(route::String, info::NamedTuple, route_params::Vector{Symbol}, type_hints::Dict{Symbol, Type})
+    if isempty(route_params) || isempty(type_hints)
+        return info
+    end
+
+    route_param_names = Set(route_params)
+
+    function resolve_param(param::Param)
+        if !(param.name in route_param_names)
+            return param
+        end
+
+        resolved_type = pathparam_type(route, param, type_hints)
+        if resolved_type == param.type
+            return param
+        end
+
+        default_value = if !isnothing(param.default) && !(param.default isa resolved_type)
+            convert(resolved_type, param.default)
+        else
+            param.default
+        end
+
+        return Param(
+            name=param.name,
+            type=resolved_type,
+            default=default_value,
+            hasdefault=param.hasdefault,
+        )
+    end
+
+    args = [resolve_param(param) for param in info.args]
+    sig = [resolve_param(param) for param in info.sig]
+    sig_map = Dict{Symbol, Param}(param.name => param for param in sig)
+
+    return (
+        name=info.name,
+        args=args,
+        kwargs=info.kwargs,
+        sig=sig,
+        sig_map=sig_map,
+    )
+end
+
+function parse_func_params(route::String, func::Function; type_hints::Dict{Symbol, Type}=Dict{Symbol, Type}())
     info = splitdef(func, start=2)
 
     hasBraces = r"({)|(})"
@@ -467,6 +534,8 @@ function parse_func_params(route::String, func::Function)
             push!(route_params, Symbol(variable))
         end
     end
+
+    info = merge_pathparam_type_hints(route, info, route_params, type_hints)
 
     pathnames = Vector{Symbol}()
     querynames = Vector{Symbol}()
@@ -534,15 +603,15 @@ function parse_func_params(route::String, func::Function)
     )
 end
 
-function register(ctx::ServerContext, httpmethod::String, route::Union{String,HOFRouter}, func::Function)
+function register(ctx::ServerContext, httpmethod::String, route::Union{String,HOFRouter}, func::Function; type_hints::Dict{Symbol, Type}=Dict{Symbol, Type}())
     route = parse_route(httpmethod, route)
-    func_details = parse_func_params(route, func)
+    func_details = parse_func_params(route, func; type_hints)
     registerhandler(ctx, ctx.service.router, httpmethod, route, func, func_details)
 end
 
-function register_internal(ctx::ServerContext, router::Router, httpmethod::String, route::Union{String,HOFRouter}, func::Function)
+function register_internal(ctx::ServerContext, router::Router, httpmethod::String, route::Union{String,HOFRouter}, func::Function; type_hints::Dict{Symbol, Type}=Dict{Symbol, Type}())
     route = parse_route(httpmethod, route)
-    func_details = parse_func_params(route, func)
+    func_details = parse_func_params(route, func; type_hints)
     registerhandler(ctx, router, httpmethod, route, func, func_details)
 end
 

@@ -176,6 +176,33 @@ end
     @test String(response2.body) == "99"
 end
 
+@testset "SessionMiddleware auto-rotates when auth key changes" begin
+    store = MemoryStore{String, Dict{String,Any}}()
+    original_id = "anon-session"
+    set_session!(store, original_id, Dict{String,Any}("cart" => [7]); ttl=3600)
+
+    middleware = SessionMiddleware(
+        cookie_name="sid",
+        max_age=3600,
+        store=store,
+        prune_probability=0.0,
+        secure=false,
+    )
+
+    login_handler = function(req::HTTP.Request)
+        getsession(req)["user_id"] = 77
+        return HTTP.Response(200, "logged in")
+    end
+
+    response = middleware(login_handler)(HTTP.Request("GET", "/login", ["Cookie" => "sid=$original_id"]))
+    cookie_header = HTTP.header(response, "Set-Cookie")
+    rotated_id = String(match(r"sid=([^;]+)", cookie_header).captures[1])
+
+    @test rotated_id != original_id
+    @test get_session(store, original_id) === nothing
+    @test get_session(store, rotated_id) == Dict{String,Any}("cart" => [7], "user_id" => 77)
+end
+
 @testset "SessionMiddleware fails closed on store write errors" begin
     middleware = SessionMiddleware(
         cookie_name="sid",

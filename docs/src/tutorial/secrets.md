@@ -13,20 +13,30 @@ using HTTP
 using Nitro
 using DotEnv
 
+required_env(name::String) = get(ENV, name, nothing) === nothing ? error("$name must be set") : ENV[name]
+
 # 1. Load your `.env` file (optional, depends on your deployment)
 DotEnv.config()
 
-# 2. Get the secret from the environment, with a safe development fallback
-SECRET_KEY = get(ENV, "API_SECRET_KEY", "fallback-secret-for-dev")
+# 2. Require the secret from the environment
+SECRET_KEY = required_env("API_SECRET_KEY")
+
+function health(req::HTTP.Request)
+    return Res.send("ok")
+end
+
+urlpatterns("",
+    path("/", health, method="GET"),
+)
 
 # 3. Pass the secret to the components that need it
-serve(
-    middleware=[
-        SessionMiddleware(), # See notes below on Sessions
-        CSRFMiddleware(SECRET_KEY)
-    ]
-)
+serve(urlpatterns, middleware=[
+    SessionMiddleware(),
+    CSRFMiddleware(SECRET_KEY),
+])
 ```
+
+For local development, put a non-checked-in secret in `.env`. Avoid committed fallbacks such as `dev-secret` or `changeme` in application code.
 
 ## Passing Secrets to your Application Routes
 
@@ -37,7 +47,9 @@ struct AppConfig
     secret_key::String
 end
 
-config = AppConfig(get(ENV, "SECRET_KEY", "dev-secret"))
+required_env(name::String) = get(ENV, name, nothing) === nothing ? error("$name must be set") : ENV[name]
+
+config = AppConfig(required_env("SECRET_KEY"))
 
 function sign_payload(req::HTTP.Request, ctx::Context{AppConfig})
     secret = ctx.payload.secret_key
@@ -68,6 +80,11 @@ Instead of encrypting the UUID, you secure the session by configuring the cookie
 - `HttpOnly=true` (Prevents JavaScript XSS from stealing the UUID)
 - `Secure=true` (Ensures the UUID is only sent over HTTPS so it cannot be intercepted on public Wi-Fi)
 - `SameSite="Lax"` or `"Strict"` (Prevents CSRF attacks)
+
+Those are already the defaults in `SessionMiddleware`. Only override them when you intentionally need a different policy, such as local HTTP development.
+
+For HTTPS deployments, pair `Secure=true` cookies with `Strict-Transport-Security` so the
+browser keeps using HTTPS after the first secure response.
 
 ```julia
 # Secure session configuration for production

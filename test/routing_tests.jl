@@ -4,7 +4,7 @@ using Test
 using HTTP
 using Nitro
 using UUIDs
-using Nitro: path, urlpatterns, include_routes, convert_django_path, RouteDefinition, GET, POST, PUT, DELETE
+using Nitro: path, urlpatterns, include_routes, convert_django_path, RouteDefinition, GET, POST, PUT, DELETE, url
 
 port = get_free_port()
 
@@ -119,11 +119,24 @@ end
     # Register handlers using urlpatterns
     list_handler = (req) -> "list"
     detail_handler = (req, id) -> "detail: $id"
+    inferred_handler = function(req::HTTP.Request, id)
+        return Res.send(string(typeof(id)))
+    end
+    bool_handler = function(req::HTTP.Request, enabled)
+        return Res.send("$(typeof(enabled)):$(enabled)")
+    end
+    uuid_handler = function(req::HTTP.Request, key)
+        return Res.send("$(typeof(key)):$(key)")
+    end
     create_handler = (req) -> "created"
+    key_id = UUID("550e8400-e29b-41d4-a716-446655440000")
     
     urlpatterns("/api",
         path("/items", list_handler, method="GET"),
         path("/items/<int:id>", detail_handler, method="GET"),
+        path("/typed/<int:id>", inferred_handler, method="GET"),
+        path("/toggle/<bool:enabled>", bool_handler, method="GET"),
+        path("/keys/<uuid:key>", uuid_handler, method="GET"),
         path("/items", create_handler, method="POST"),
     )
 
@@ -142,6 +155,33 @@ end
         r = internalrequest(HTTP.Request("GET", "/api/items/42"))
         @test r.status == 200
 
+        # GET /api/typed/42
+        r = internalrequest(HTTP.Request("GET", "/api/typed/42"))
+        @test r.status == 200
+        @test Nitro.text(r) == string(Int)
+
+        # GET /api/typed/not-an-int
+        r = internalrequest(HTTP.Request("GET", "/api/typed/not-an-int"))
+        @test r.status == 500
+
+        # GET /api/toggle/true
+        r = internalrequest(HTTP.Request("GET", "/api/toggle/true"))
+        @test r.status == 200
+        @test Nitro.text(r) == "Bool:true"
+
+        # GET /api/toggle/not-a-bool
+        r = internalrequest(HTTP.Request("GET", "/api/toggle/not-a-bool"))
+        @test r.status == 500
+
+        # GET /api/keys/<uuid>
+        r = internalrequest(HTTP.Request("GET", "/api/keys/$key_id"))
+        @test r.status == 200
+        @test Nitro.text(r) == "Base.UUID:$key_id"
+
+        # GET /api/keys/not-a-uuid
+        r = internalrequest(HTTP.Request("GET", "/api/keys/not-a-uuid"))
+        @test r.status == 500
+
         # POST /api/items
         r = internalrequest(HTTP.Request("POST", "/api/items"))
         @test r.status == 200
@@ -149,6 +189,65 @@ end
         @test body == "created" || body == "\"created\""
     finally
         terminate()
+        resetstate()
+    end
+end
+
+@testset "named routes" begin
+    user_handler = function(req::HTTP.Request, id::Int)
+        return Res.send("ok")
+    end
+    flag_handler = function(req::HTTP.Request, enabled::Bool)
+        return Res.send("ok")
+    end
+    key_handler = function(req::HTTP.Request, key::UUID)
+        return Res.send("ok")
+    end
+    key_id = UUID("550e8400-e29b-41d4-a716-446655440000")
+
+    try
+        urlpatterns("/api",
+            path("/users/<int:id>", user_handler, method="GET", name="user-detail"),
+            path("/flags/<bool:enabled>", flag_handler, method="GET", name="flag-detail"),
+            path("/keys/<uuid:key>", key_handler, method="GET", name="key-detail"),
+        )
+
+        @test url("user-detail"; id=42) == "/api/users/42"
+        @test url("flag-detail"; enabled=true) == "/api/flags/true"
+        @test url("key-detail"; key=key_id) == "/api/keys/$key_id"
+        @test_throws ArgumentError url("user-detail")
+        @test_throws ArgumentError url("user-detail"; id=42, extra=1)
+        @test_throws ArgumentError url("missing-route"; id=42)
+    finally
+        resetstate()
+    end
+end
+
+@testset "duplicate route names" begin
+    handler = function(req::HTTP.Request)
+        return Res.send("ok")
+    end
+
+    try
+        @test_throws ArgumentError urlpatterns("",
+            path("/users", handler, method="GET", name="dup-route"),
+            path("/admins", handler, method="GET", name="dup-route"),
+        )
+    finally
+        resetstate()
+    end
+end
+
+@testset "converter type conflicts" begin
+    bad_handler = function(req::HTTP.Request, id::String)
+        return Res.send(id)
+    end
+
+    try
+        @test_throws ArgumentError urlpatterns("",
+            path("/conflict/<int:id>", bad_handler, method="GET"),
+        )
+    finally
         resetstate()
     end
 end

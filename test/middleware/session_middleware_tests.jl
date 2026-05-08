@@ -1,7 +1,7 @@
 @testitem "Session middleware" tags=[:middleware] setup=[NitroCommon] begin
 using HTTP
 using Dates
-using Nitro: SessionMiddleware, GET
+using Nitro: SessionMiddleware, GET, set_cookie!
 using Nitro.Core.Types: MemoryStore, SessionPayload
 using Nitro.Core.Cookies: storesession!, prunesessions!
 
@@ -106,13 +106,70 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
         @test length(set_cookie_headers) >= 1
         
         cookie_str = set_cookie_headers[1].second
-        session_id = match(r"mod_session=([^;]+)", cookie_str).captures[1]
+        session_id = String(match(r"mod_session=([^;]+)", cookie_str).captures[1])
 
         # Verify the data was stored in the MemoryStore
         payload = Base.get(store, session_id, nothing)
         @test !isnothing(payload)
         @test payload.data["user_id"] == 42
         @test payload.data["username"] == "testuser"
+    end
+
+    @testset "session middleware preserves existing Set-Cookie headers" begin
+        store = MemoryStore{String, Dict{String,Any}}()
+
+        mw = SessionMiddleware(
+            cookie_name="stacked_session",
+            max_age=3600,
+            store=store,
+            prune_probability=0.0,
+            secure=false,
+        )
+
+        handler = function(req::HTTP.Request)
+            response = HTTP.Response(200, "OK")
+            set_cookie!(response, "flash", "saved"; encrypted=false, secure=false)
+            getsession(req)["user_id"] = 42
+            return response
+        end
+
+        response = mw(handler)(HTTP.Request("GET", "/stacked"))
+        set_cookie_headers = [header.second for header in response.headers if lowercase(header.first) == "set-cookie"]
+
+        @test length(set_cookie_headers) == 2
+        @test any(occursin("flash=saved", header) for header in set_cookie_headers)
+        @test any(occursin("stacked_session=", header) for header in set_cookie_headers)
+    end
+
+    @testset "existing authenticated session rotates session id" begin
+        store = MemoryStore{String, Dict{String,Any}}()
+        original_session_id = "anon-session-id"
+        storesession!(store, original_session_id, Dict{String,Any}("cart" => [1, 2]); ttl=3600)
+
+        mw = SessionMiddleware(
+            cookie_name="auth_session",
+            max_age=3600,
+            store=store,
+            prune_probability=0.0,
+            secure=false,
+        )
+
+        handler = function(req::HTTP.Request)
+            getsession(req)["user_id"] = 99
+            return HTTP.Response(200, "OK")
+        end
+
+        response = mw(handler)(HTTP.Request("GET", "/login", ["Cookie" => "auth_session=$original_session_id"]))
+        cookie_header = HTTP.header(response, "Set-Cookie")
+        rotated_session_id = String(match(r"auth_session=([^;]+)", cookie_header).captures[1])
+
+        @test rotated_session_id != original_session_id
+        @test Base.get(store, original_session_id, nothing) === nothing
+
+        payload = Base.get(store, rotated_session_id, nothing)
+        @test !isnothing(payload)
+        @test payload.data["user_id"] == 99
+        @test payload.data["cart"] == [1, 2]
     end
 
     @testset "session retrieval on subsequent request" begin

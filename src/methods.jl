@@ -109,6 +109,16 @@ function getexternalurl() :: String
 end
 
 """
+    url(name; kwargs...)
+
+Build a URL path for a named route registered through `path(..., name="...")`.
+Keyword arguments fill the route parameters.
+"""
+function url(name::String; kwargs...)
+    return Nitro.Core.Routing.url(CONTEXT[], name; kwargs...)
+end
+
+"""
     internalrequest(req::Nitro.Request; middleware::Vector=[], serialize::Bool=true, catch_errors=true, context=missing)
 
 Sends an internal request to the server, allowing for communication between different parts of the application.
