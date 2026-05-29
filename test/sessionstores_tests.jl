@@ -11,14 +11,20 @@ struct FailingSessionStore <: AbstractSessionStore{String, Dict{String,Any}} end
 
 struct DeleteFailingSessionStore <: AbstractSessionStore{String, Dict{String,Any}} end
 
+mutable struct DelegatingSessionStore <: AbstractSessionStore{String, Dict{String,Any}}
+    data::Dict{String, SessionPayload{Dict{String,Any}}}
+    prune_calls::Int
+end
+
+DelegatingSessionStore() = DelegatingSessionStore(Dict{String, SessionPayload{Dict{String,Any}}}(), 0)
+
 Base.get(::FailingSessionStore, ::String, default) = default
 Base.get(::DeleteFailingSessionStore, ::String, default) = default
+Base.get(store::DelegatingSessionStore, key::String, default) = get(store.data, key, default)
 
 function Nitro.Types.set_session!(::FailingSessionStore, ::String, ::Dict{String,Any}; ttl::Int=3600)
     throw(ErrorException("session write failed"))
 end
-
-Nitro.Core.Cookies.storesession!(::FailingSessionStore, ::String, ::Dict{String,Any}; ttl::Int=3600) = throw(ErrorException("session write failed"))
 
 function Nitro.Types.delete_session!(::FailingSessionStore, ::String)
     throw(ErrorException("session delete failed"))
@@ -36,6 +42,21 @@ end
 
 Nitro.Types.cleanup_expired_sessions!(::DeleteFailingSessionStore) = nothing
 
+function Nitro.Types.set_session!(store::DelegatingSessionStore, session_id::String, value::Dict{String,Any}; ttl::Int=3600)
+    store.data[session_id] = SessionPayload(copy(value), Dates.now(Dates.UTC) + Dates.Second(ttl))
+    return value
+end
+
+function Nitro.Types.delete_session!(store::DelegatingSessionStore, session_id::String)
+    delete!(store.data, session_id)
+    return nothing
+end
+
+function Nitro.Types.cleanup_expired_sessions!(store::DelegatingSessionStore)
+    store.prune_calls += 1
+    return nothing
+end
+
 @testset "Session store interface" begin
     store = MemoryStore{String, Dict{String,Any}}()
 
@@ -52,6 +73,16 @@ Nitro.Types.cleanup_expired_sessions!(::DeleteFailingSessionStore) = nothing
     end
     cleanup_expired_sessions!(store)
     @test !haskey(store.data, "expired")
+end
+
+@testset "Cookie session helpers delegate to store interface" begin
+    store = DelegatingSessionStore()
+
+    Nitro.Core.Cookies.storesession!(store, "delegated", Dict{String,Any}("user_id" => 7); ttl=60)
+    @test get_session(store, "delegated") == Dict{String,Any}("user_id" => 7)
+
+    Nitro.Core.Cookies.prunesessions!(store)
+    @test store.prune_calls == 1
 end
 
 @testset "MemoryStore fixed-TTL expiry" begin

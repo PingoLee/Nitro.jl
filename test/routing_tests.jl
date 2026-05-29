@@ -242,10 +242,16 @@ end
     bad_handler = function(req::HTTP.Request, id::String)
         return Res.send(id)
     end
+    bad_bool_handler = function(req::HTTP.Request, id::Bool)
+        return Res.send(string(id))
+    end
 
     try
         @test_throws ArgumentError urlpatterns("",
             path("/conflict/<int:id>", bad_handler, method="GET"),
+        )
+        @test_throws ArgumentError urlpatterns("",
+            path("/bool-conflict/<int:id>", bad_bool_handler, method="GET"),
         )
     finally
         resetstate()

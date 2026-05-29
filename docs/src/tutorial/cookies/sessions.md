@@ -150,6 +150,10 @@ delete_session!(store::S, session_id::String)
 cleanup_expired_sessions!(store::S)
 ```
 
+`SessionMiddleware` uses Nitro's `storesession!` and `prunesessions!` helpers, and those
+delegate to `set_session!` and `cleanup_expired_sessions!` by default. Implementing the
+four methods above is enough for custom backends.
+
 ## Logout Semantics
 
 With `SessionMiddleware`, `empty!(req.session)` only clears the current payload. To retire the old authenticated session ID, pair it with `regenerate_session!`.

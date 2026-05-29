@@ -713,10 +713,12 @@ function load_cookie_settings!(defaults::Nullable{Dict} = nothing)
 end
 
 """
-Add a session to a store with a time-to-live (TTL). Must be implemented by custom stores.
+Add a session to a store with a time-to-live (TTL).
+
+Custom stores can satisfy this by implementing `set_session!`.
 """
 function storesession!(store::AbstractSessionStore, key, value; ttl::Int = 3600)
-    throw(MethodError(storesession!, (store, key, value)))
+    return set_session!(store, key, value; ttl)
 end
 
 """
@@ -727,10 +729,20 @@ function storesession!(store::MemoryStore{K, V}, key::K, value::V; ttl::Int = 36
 end
 
 """
-Remove expired sessions from a store. Defaults to doing nothing for custom stores if not implemented.
+Remove expired sessions from a store.
+
+If the store implements `cleanup_expired_sessions!`, delegate to it. Otherwise,
+leave pruning as a no-op for stores that do not support background cleanup.
 """
 function prunesessions!(store::AbstractSessionStore)
-    return nothing
+    try
+        return cleanup_expired_sessions!(store)
+    catch e
+        if e isa MethodError && e.f === cleanup_expired_sessions!
+            return nothing
+        end
+        rethrow()
+    end
 end
 
 """

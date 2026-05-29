@@ -465,7 +465,7 @@ function pathparam_type(route::String, param::Param, type_hints::Dict{Symbol, Ty
         return hinted_type
     elseif param.type <: hinted_type || hinted_type <: param.type
         return Reflection.select_type(param.type, hinted_type)
-    elseif hinted_type == Int && param.type <: Integer
+    elseif hinted_type == Int && param.type <: Integer && param.type != Bool
         return param.type
     elseif hinted_type == Float64 && param.type <: AbstractFloat
         return param.type
