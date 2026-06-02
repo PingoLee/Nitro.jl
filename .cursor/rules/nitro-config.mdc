@@ -1,0 +1,42 @@
+---
+description: Nitro.jl app configuration — no framework singleton, typed app config, bootstrap order, secrets
+globs: "**/*.jl"
+alwaysApply: false
+---
+
+# Nitro.jl Configuration & Bootstrap
+
+When designing configuration, bootstrapping applications, or proposing developer ergonomics for **Nitro.jl**, follow these rules:
+
+## 1. Config ownership
+- **Nitro provides the pipeline, not the schema**: Hooks and conventions for loading app config are fine; the config object lives in the application layer.
+- **No global `Nitro.config` singleton**: Do not add a Genie-style mutable framework-wide config object.
+- **Typed app config**: Applications define their own structs (`AppConfig`, `ServerConfig`, `AuthConfig`, `WorkerConfig`, `DatabaseConfig`, etc.).
+
+## 2. Bootstrap flow
+- **Explicit startup only**: load config → resolve secrets/env → run initializers → build routes/middleware → `serve(context=...)`.
+- **Use app context for shared config**: Inject through Nitro app context, not hidden globals.
+- **No implicit auto-loading** that obscures startup order.
+
+## 3. Separation of concerns
+- **Framework config stays small**: host/port, cookies, middleware composition, request handling.
+- **App config stays in the app**: auth, workers, PormG, feature flags, business rules.
+- **Do not move app-specific config into Nitro `src/`**.
+
+## 4. Environment strategy
+- Environment-specific files (`config/env/dev.jl`, etc.) are an **app** convention, not core Nitro.
+- **Secrets must not be committed**; use env vars or non-committed local config.
+- Allow env vars to override file-based app config for deployment.
+
+## 5. PormG and external integrations
+- PormG connection settings and model loading are **app-owned** or live in `ext/NitroPormGExt.jl`.
+- Keep Nitro core database-agnostic; integration hooks stay generic.
+
+## 6. Developer experience
+- Document one recommended app bootstrap pattern in docs when touching tutorials.
+- Config must be swappable in tests without mutating framework-global state.
+- Support multiple Nitro apps in one Julia process or test suite.
+
+## 7. Migration from Genie-style apps
+- App-layer folders like `config/env/` and `config/initializers/` are fine.
+- **Do not copy Genie's global mutable config singleton**; use explicit bootstrap code instead.

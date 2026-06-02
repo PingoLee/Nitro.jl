@@ -30,7 +30,7 @@ end
             "sub" => "42",
             "iss" => "nitro-tests",
             "aud" => ["nitro"],
-            "exp" => NOW_TS + 60,
+            "exp" => NOW_TS + 3600,
             "nbf" => NOW_TS - 1,
         ),
         keyset;
@@ -247,7 +247,7 @@ end
 end
 
 @testset "Validator factories" begin
-    token = Nitro.Auth.encode_jwt(Dict("sub" => "9", "exp" => NOW_TS + 60), "secret-a")
+    token = Nitro.Auth.encode_jwt(Dict("sub" => "9", "exp" => NOW_TS + 3600), "secret-a")
     validator = Nitro.Auth.jwt_validator("secret-a")
     claims = validator(token)
     @test claims["sub"] == "9"

@@ -46,6 +46,7 @@ const TEST_FILES = [
     "extensions/protobuf/protobuf_tests.jl",
     "extensions/crypto_tests.jl",
     "extensions/pormg_session_tests.jl",
+    "extensions/pormg_worker_tests.jl",
 
     # ── Special Handler Tests ─────────────────────────────────────────────────
     "sse_tests.jl",
@@ -100,7 +101,7 @@ const TEST_FILES = [
 #   julia --project=. test/runtests.jl test/sessionstores_tests.jl
 #   julia --project=. test/runtests.jl --tags core --name "Session stores"
 #   julia -t auto --project=. test/runtests.jl --workers 2
-#   julia --project=. test/runtests.jl test/sessionstores_tests.jl --workers 2
+#   julia --project=. test/runtests.jl test\middleware\ratelimitter_lru_tests.jl --workers 2
 let args = copy(ARGS)
     paths     = String[]
     tags      = Symbol[]

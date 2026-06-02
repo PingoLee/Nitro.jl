@@ -1,7 +1,7 @@
 module Errors
 ## In this module, we export commonly used exceptions across the package 
 
-export ValidationError, CookieError
+export ValidationError, CookieError, AuthorizationError
 
 # This is used by the Extractors.jl module to signal that a validation error has occurred
 struct ValidationError <: Exception
@@ -25,6 +25,14 @@ end
 
 function Base.showerror(io::IO, e::CookieError)
     print(io, "Cookie Error: $(e.msg)")
+end
+
+struct AuthorizationError <: Exception
+    msg::String
+end
+
+function Base.showerror(io::IO, e::AuthorizationError)
+    print(io, "Authorization Error: $(e.msg)")
 end
 
 end

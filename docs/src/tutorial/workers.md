@@ -84,7 +84,7 @@ Different queues can still run independently.
 
 ## Start Workers With The Server
 
-The recommended app-level entrypoint is `worker_startup(...)`.
+The recommended app-level entrypoint is the exported `worker_startup(...)` middleware.
 
 Add it to the `serve(middleware=[...])` list so Nitro starts the worker runtime on server startup and shuts it down when the server stops.
 
@@ -105,7 +105,8 @@ end
 
 function report_status(req::HTTP.Request)
     task_id = string(req.params["task_id"])
-    return Res.json(get_task_status(task_id))
+    # Pass user_id to securely query task status
+    return Res.json(get_task_status(task_id, "user-1"))
 end
 
 urlpatterns("",
@@ -119,6 +120,7 @@ serve(
             queues=["reports"],
             cleanup_interval_hours=24,
             cleanup_retain_days=7,
+            recover_zombies=true, # Automatically fails tasks stuck in RUNNING on process crashes
         ),
     ],
 )
@@ -244,25 +246,125 @@ Use stable keys when duplicate work should collapse into one job:
 
 Use unique keys when every request must create a distinct job.
 
+## Database Persistence
+
+By default, Nitro.jl uses an `InMemoryWorkerStore` to hold worker tasks in memory. If your server restarts, volatile tasks are lost.
+
+To make your queues **durable and survive server restarts**, you can configure the database-backed `PormGWorkerStore` using the `NitroPormGExt` extension.
+
+### 1. Configure the PormG connection
+Configure PormG with the connection key you want workers to use:
+
+```julia
+using Nitro
+using PormG
+
+PormG.Configuration.load("workers")
+```
+
+The default key is `"db"`. Use a different `db_key` when your worker database uses another PormG connection.
+
+### 2. Bootstrap the worker store
+Create the task table and indexes, then keep the returned store for worker calls or startup middleware:
+
+```julia
+using Nitro
+using Nitro.Workers
+
+worker_store = pormg_nitro_worker(db_key="workers")
+```
+
+Task metadata will now be persisted to that database, while live running threads are managed safely in memory to prevent serialization issues.
+
+### 3. Start workers with the persistent store
+Pass the store into the worker startup middleware:
+
+```julia
+serve(
+    middleware=[
+        worker_startup(
+            queues=["reports"],
+            store=worker_store,
+            recover_zombies=true,
+        ),
+    ],
+)
+```
+
+For direct calls, pass the same store explicitly:
+
+```julia
+task_id = submit_task("report-42", run_report, "user-1"; store=worker_store)
+status = get_task_status(task_id, "user-1"; store=worker_store)
+```
+
+## User Access Control & Queue Authorization
+
+To support multitenant backends, Nitro.jl workers include built-in authorization mechanisms.
+
+### 1. Task Ownership & Watchers
+Task submission functions require a `user_id`, and that user is registered as the task's first **watcher**.
+- Status, cancellation, and listing functions accept a `user_id` parameter to enforce watcher-based access.
+- Only the system, task owners, or designated watchers can query or cancel a task. If an unauthorized user tries to access it, an `AuthorizationError` is thrown.
+
+```julia
+using Nitro.Errors: AuthorizationError
+
+try
+    # Submit task with ownership
+    task_id = submit_task("my-task", heavy_job, "user-123")
+
+    # Authorized checks succeed
+    status = get_task_status(task_id, "user-123")
+
+    # Unauthorized checks throw an error
+    unauthorized = get_task_status(task_id, "intruder-99")
+catch err
+    if err isa AuthorizationError
+        println("Access denied!")
+    end
+end
+```
+
+### 2. Queue Authorization
+You can restrict access to specific sequential queues globally using queue authorizers:
+
+```julia
+function my_queue_authorizer(queue_name::String, user_id::String)::Bool
+    # Only admins can push tasks to the maintenance queue
+    if queue_name == "maintenance"
+        return user_id == "admin-user"
+    end
+    return true
+end
+
+set_queue_authorizer!(worker_store, my_queue_authorizer)
+```
+
+## Startup Zombie Task Recovery (Option B)
+
+To protect databases from stuck `RUNNING` tasks when a server or worker process crashes unexpectedly, Nitro.jl implements **automatic startup recovery**.
+* When the server starts up (via the `worker_startup(...)` middleware), it sweeps the database store for all tasks marked as `RUNNING`.
+* For each task, it checks if there is a live, in-memory execution thread running in the current process.
+* If there is no live execution (meaning the task is a "zombie" orphaned by a previous crash), it marks the task status as `FAILED` with the error: `"Worker process terminated unexpectedly mid-execution."`
+* By default, automatic recovery is enabled (`recover_zombies=true`).
+
 ## When Not To Use Workers
 
-Do not use `Nitro.Workers` as a substitute for a separate worker service when you need:
+Do not use `InMemoryWorkerStore` for jobs that must survive server restarts. For durable in-process queues, always configure the `PormGWorkerStore` extension.
 
-- jobs that must survive server restarts
-- cross-process or cross-machine execution
-- durable queues backed by Redis, Postgres, or another external broker
-- long-running scheduled infrastructure outside the web server lifecycle
-
-For those cases, keep Nitro as the API layer and move heavy or durable job execution into a separate worker process.
+Even with database persistence, keep in mind that `Nitro.Workers` is an in-process runner. Move to a dedicated external queue cluster (like Celery or Sidekiq) if you need:
+- cross-machine execution or horizontal scaling across separate nodes
+- extremely heavy CPU-bound job queues that should not compete with your web server thread pool
 
 ## Summary
 
-Use `Nitro.Workers` when you need lightweight in-process background execution for Nitro requests.
+Use `Nitro.Workers` when you need lightweight or persistent background execution for Nitro requests.
 
 - use `worker_startup(...)` to bootstrap workers with the server
+- use `PormGWorkerStore` to persist task state to your database
+- use the `user_id` parameter to enforce strict access control and queue authorization
 - use `submit_task(...)` for parallel jobs
 - use `submit_sequential_task(...)` for ordered queue processing
 - use `get_task_status(...)` and `get_queue_status(...)` to monitor work
 - use `TaskOptions(...)` for retries and timeouts
-
-For most apps, that gives you a simple async job model without introducing a second service.

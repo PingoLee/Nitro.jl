@@ -1,6 +1,7 @@
 ---
-applyTo: "**/*.md"
-description: "Nitro.jl documentation conventions — tutorial style, routing examples, generic models, PormG idioms"
+description: Nitro.jl documentation conventions — tutorial style, routing examples, generic models, PormG idioms
+globs: "docs/**/*.md"
+alwaysApply: false
 ---
 
 # Nitro.jl Documentation Conventions
@@ -42,23 +43,19 @@ src/
 ## 3. Generic Examples — No Domain-Specific Models
 
 Tutorial examples must use **generic, universally understandable** models and fields.
-Do not reference domain-specific databases, identifiers, or terminology
-(e.g. CPF/CNS numbers, BPA records, IBGE codes, patient records, or any model tied to a
-specific production project).
+Do not reference domain-specific databases, identifiers, or terminology tied to a specific production project.
 
 | Use this | Not this |
 |---|---|
-| `appM.Product` | `biM.Bas_populacao` |
-| `ProductHandlers` | `PatientHandlers` |
-| `ProductFilters` | `PatientFilters` |
-| `name`, `category`, `store_id`, `sku` | `no_paciente`, `nu_cpf`, `ibge_id` |
-| `/api/products/...` | `/api/bpa/...`, `/api/city/.../patients` |
+| `appM.Product` | production-specific model names |
+| `ProductHandlers` | domain-specific handler module names |
+| `name`, `category`, `store_id`, `sku` | project-specific field names |
 
 Good generic domains: Products, Orders, Users, Drivers, Stores, Items.
 
 ## 4. PormG Model Setup
 
-When showing how to wire PormG into an app, use the `@import_models` + alias pattern from `BI.jl`:
+When showing how to wire PormG into an app, use the `@import_models` + alias pattern:
 
 ```julia
 # src/App.jl
@@ -70,68 +67,27 @@ const appM = automatic_models   # handlers import this alias
 - The `db/` directory lives **outside** `src/` alongside the project root.
 - `@import_models` creates a plain Julia module; the `const appM = ...` alias is what handlers use.
 - Handlers include `import ..appM` and query with `appM.Product |> object`.
-- Never import `PormG` in `src/` of the Nitro core itself — only in application code and `ext/NitroPormGExt/`.
+- Never import `PormG` in `src/` of the Nitro **core** itself — only in application code and `ext/NitroPormGExt/`.
 
 ## 5. PormG Query Idiom
 
 When showing ORM queries with PormG, use the **dot-chained** idiom via `.objects.`:
 
 ```julia
-# ✅ correct — Django-style dot chaining
 M.Product.objects.filter("category" => category).list()
-
-# ✅ correct — conditional chaining
-query = M.Product.objects.filter("is_active" => true)
-!isempty(f.name) && query.filter("name__@icontains" => f.name)
-!isnothing(f.category) && query.filter("category" => f.category)
-results = query.list()
-
-# ✅ correct — single record lookup (null-safe, adds LIMIT 1)
-user = M.User.objects.filter("username" => username).first()
-
-# ✅ also correct — pipe idiom
-query = M.Product |> object
-query.filter("category" => category)
 ```
 
 Terminal methods: `.list()`, `.first()`, `.count()`, `.exists()`, `.delete()`.
-Common filter operators: `__@icontains`, `__@in`, `.page(n, limit)`, `.order_by("-created")`.
 
 ## 6. Response Construction
 
 Always use `Res` module functions. Never return raw dicts or strings from handlers.
 
-```julia
-# ✅ correct
-return Res.json(list(query))
-return Res.status(201, product)
-return Res.status(400, "invalid payload")
-
-# ❌ wrong
-return Dict("data" => rows)
-return "ok"
-```
-
-## 6. Handler Signatures
+## 7. Handler Signatures
 
 Always type the `req` parameter as `HTTP.Request` and path parameters with their concrete type.
 
-```julia
-# ✅ correct
-function get_product(req::HTTP.Request, id::Int)
-
-# ❌ avoid — untyped parameters hurt readability and type stability
-function get_product(req, id)
-```
-
-## 7. `serve()` and Entry-Point
+## 8. `serve()` and Entry-Point
 
 - Use `serve(urlpatterns)` — no positional port argument unless specifically demonstrating port configuration.
 - Never use `serveparallel()` — it is deleted.
-
-```julia
-# src/main.jl
-include("Handlers/ProductHandlers.jl")
-include("Routes.jl")
-serve(urlpatterns)
-```

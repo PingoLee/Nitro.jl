@@ -5,7 +5,7 @@ This module holds all the partial function & struct definitions for all package 
 export ProtoBuffer, protobuf
 export mustache, otera
 export png, svg, pdf
-export pormg_nitro_session
+export pormg_nitro_session, pormg_nitro_worker
 
 # Serialization extension definitions
 function protobuf end
@@ -40,3 +40,13 @@ serve(middleware=[SessionMiddleware(store=store)])
 ```
 """
 function pormg_nitro_session end
+
+"""
+    pormg_nitro_worker(; db_key="db") -> PormGWorkerStore
+
+Create a database-backed worker task store using PormG.
+Automatically ensures the `nitro_task` table and index exist (IF NOT EXISTS).
+
+Requires `using PormG` and a configured PormG connection.
+"""
+function pormg_nitro_worker end

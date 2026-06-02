@@ -1,0 +1,68 @@
+---
+description: Workers module migration — persistent stores, user_id/watchers, queue authorizers, zombie recovery
+globs: "{src/Workers/**/*.jl,ext/NitroPormGExt.jl,test/**/*worker*.jl,test/extensions/**/*.jl}"
+alwaysApply: false
+---
+
+# Nitro.jl Workers Module Migration Guide
+
+This rule applies when changing the Workers queue, `NitroPormGExt` worker storage, or worker tests.
+
+## 1. Context & Architectural Changes
+
+The worker system supports both volatile in-memory queues and persistent database stores with access control.
+
+### Legacy pitfalls
+1. **No Persistence**: In-memory-only tasks are lost on restart.
+2. **No Multi-tenancy / Security**: Unscoped task APIs allow cross-user access.
+3. **No Storage Abstraction**: Tight coupling between queue processor and one store implementation.
+
+### Current architecture
+- **`AbstractWorkerStore`**: Interface for storage backends.
+- **`InMemoryWorkerStore`**: Volatile, thread-safe store in `src/Workers/`.
+- **`PormGWorkerStore`**: Persistent store in `ext/NitroPormGExt.jl`.
+- **Volatile execution handles**: Running `Task` objects stay in `active_tasks::Dict{UUID, Task}`; metadata lives in the store.
+- **Queue authorization hooks**: Optional `queue_authorizer(queue_name, user_id)::Bool`.
+- **Watchers**: Tasks have `user_id` and `watchers`; APIs validate access when `user_id` is supplied.
+
+## 2. API Migration
+
+Task submission requires `user_id`. Read/manage APIs accept `user_id` and enforce watcher-based access (`AuthorizationError` when denied).
+
+```julia
+task_id = submit_task("default_queue", () -> work(), "user_123")
+task = get_task_status(task_id, "user_123")
+cancel_task(task_id, "user_123")
+user_tasks = get_all_tasks(nothing, "user_123")
+```
+
+## 3. Database Persistence
+
+Configure PormG, then bootstrap the store:
+
+```julia
+persistent_store = pormg_nitro_worker(db_key="workers")
+serve(middleware=[startup(queues=["reports"], store=persistent_store, recover_zombies=true)])
+```
+
+## 4. Queue Authorization
+
+```julia
+function my_queue_authorizer(queue_name::String, user_id::String)::Bool
+    queue_name == "maintenance" && return user_id == "admin-user"
+    return true
+end
+set_queue_authorizer!(persistent_store, my_queue_authorizer)
+```
+
+## 5. Zombie Task Recovery
+
+On startup, `RUNNING` tasks without a live in-memory `Task` are marked `FAILED` when `recover_zombies=true`.
+
+## 6. Developer Rules
+
+> **Strict core isolation**: Never import `PormG` or run DB queries in `src/Workers`. Database logic belongs in `ext/NitroPormGExt.jl`.
+
+- Add abstract stubs in `src/Workers/registry.jl`.
+- Implement in `InMemoryWorkerStore` and `PormGWorkerStore`.
+- **Never serialize running `Task` objects** to the database.

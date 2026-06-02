@@ -4,6 +4,7 @@ using Test
 using Dates
 using Nitro
 using Nitro.Workers
+using Nitro.Errors: AuthorizationError
 
 function wait_for(predicate::Function; timeout::Real=5.0)
     return timedwait(predicate, timeout)
@@ -173,6 +174,206 @@ end
 
     lifecycle.on_shutdown()
     @test isnothing(worker_store(ctx))
+end
+
+@testset "User access control and queue authorization" begin
+    store = InMemoryWorkerStore()
+    
+    # Configure a mock queue authorizer
+    set_queue_authorizer!(store, (queue_name, user_id) -> begin
+        if queue_name == "admin-queue"
+            return user_id == "admin-user"
+        end
+        return true
+    end)
+
+    try
+        # 1. Queue Authorization test
+        # Authorized user succeeds
+        task1 = submit_sequential_task("admin-queue", "task-auth-ok", () -> "ok", "admin-user"; store=store)
+        @test task1 == "task-auth-ok"
+
+        # Unauthorized user throws AuthorizationError
+        @test_throws AuthorizationError submit_sequential_task("admin-queue", "task-auth-fail", () -> "fail", "other-user"; store=store)
+
+        # 2. Task querying and watchers access control
+        # submit a task by user-a (so user-a is the first watcher)
+        task_id = submit_task("task-access", () -> "data", "user-a"; store=store)
+        @test task_id == "task-access"
+
+        # user-a can check status
+        status_a = get_task_status("task-access", "user-a"; store=store)
+        @test status_a[:id] == "task-access"
+
+        # user-b cannot check status (throws AuthorizationError)
+        @test_throws AuthorizationError get_task_status("task-access", "user-b"; store=store)
+
+        # check without user_id works (system bypass)
+        @test get_task_status("task-access"; store=store)[:id] == "task-access"
+
+        # 3. Listing tasks (get_all_tasks)
+        # add another task by user-b
+        submit_task("task-user-b", () -> "data", "user-b"; store=store)
+
+        # get_all_tasks for user-a only returns task-access
+        tasks_a = get_all_tasks(nothing, "user-a"; store=store)
+        @test length(tasks_a) == 1
+        @test tasks_a[1][:id] == "task-access"
+
+        # get_all_tasks for user-b only returns task-user-b
+        tasks_b = get_all_tasks(nothing, "user-b"; store=store)
+        @test length(tasks_b) == 1
+        @test tasks_b[1][:id] == "task-user-b"
+
+        # get_all_tasks without user returns both
+        all_tasks = get_all_tasks(nothing; store=store)
+        @test length(all_tasks) == 3 # task-auth-ok + task-access + task-user-b
+
+        # 4. Cancellation access control
+        # user-b cannot cancel user-a's task
+        @test_throws AuthorizationError cancel_task("task-access", "user-b"; store=store)
+
+        # user-a can cancel their own task
+        cancel_res = cancel_task("task-access", "user-a"; store=store)
+        @test cancel_res[:status] == "Task cancelled"
+    finally
+        reset_store!(store)
+    end
+end
+
+@testset "Zombie task recovery on startup" begin
+    store = InMemoryWorkerStore()
+
+    try
+        # Setup a running task that has NO live execution handle
+        lock(store.task_lock) do
+            t1 = TaskInfo("zombie-running")
+            t1.status = RUNNING
+            t1.created_at = Dates.now(Dates.UTC)
+            store.task_registry[t1.id] = t1
+
+            # And a running task that DOES have a live execution handle (should NOT be recovered)
+            t2 = TaskInfo("active-running")
+            t2.status = RUNNING
+            t2.created_at = Dates.now(Dates.UTC)
+            store.task_registry[t2.id] = t2
+
+            # Register in-memory active task
+            store.active_tasks[t2.id] = @async sleep(0.05)
+        end
+
+        # Run recovery
+        recovered_count = recover_zombie_tasks!(; store=store)
+        @test recovered_count == 1
+
+        # Test zombie is marked FAILED
+        zombie_status = get_task_status("zombie-running"; store=store)
+        @test zombie_status[:status] == "FAILED"
+        @test zombie_status[:error] == "Worker process terminated unexpectedly mid-execution."
+        @test zombie_status[:completed_at] isa DateTime
+
+        # Test active running task is untouched
+        active_status = get_task_status("active-running"; store=store)
+        @test active_status[:status] == "RUNNING"
+
+        # Cleanup active task
+        wait(store.active_tasks["active-running"])
+    finally
+        reset_store!(store)
+    end
+end
+
+@testset "cancel_task is atomic: completed task result is never overwritten" begin
+    store = InMemoryWorkerStore()
+    try
+        # Regression: cancel_task used to read status outside the task lock,
+        # so a concurrent _complete_task! could overwrite COMPLETED→CANCELLED.
+        task_id = submit_task("race-task", () -> "safe-result", "user"; store=store)
+        @test wait_for(() -> get_task_status(task_id; store=store)[:status] == "COMPLETED") == :ok
+
+        # Cancelling an already-completed task must return an error, not overwrite the result.
+        result = cancel_task(task_id; store=store)
+        @test haskey(result, :error)
+
+        final = get_task_status(task_id; store=store)
+        @test final[:status] == "COMPLETED"
+        @test final[:result] == "safe-result"
+    finally
+        reset_store!(store)
+    end
+end
+
+@testset "terminal state fields are consistent: error and completed_at visible with status" begin
+    store = InMemoryWorkerStore()
+    try
+        # Regression: _fail_task! and _cancel_task! used to write status before error/completed_at,
+        # so concurrent readers could observe status=FAILED with error=nothing.
+        task_id = submit_task("fail-task", () -> error("boom"), "user"; store=store)
+        @test wait_for(() -> get_task_status(task_id; store=store)[:status] == "FAILED"; timeout=10.0) == :ok
+
+        status = get_task_status(task_id; store=store)
+        @test status[:error] !== nothing
+        @test occursin("boom", status[:error])
+        @test status[:completed_at] !== nothing
+    finally
+        reset_store!(store)
+    end
+
+    store2 = InMemoryWorkerStore()
+    started = Base.Event()
+    try
+        task_id2 = submit_task("cancel-fields-task", task_info -> begin
+            notify(started)
+            while true; sleep(0.01); end
+        end, "user"; store=store2)
+
+        wait(started)
+        cancel_task(task_id2; store=store2)
+        @test wait_for(() -> get_task_status(task_id2; store=store2)[:status] == "CANCELLED") == :ok
+
+        status2 = get_task_status(task_id2; store=store2)
+        @test status2[:error] !== nothing
+        @test status2[:completed_at] !== nothing
+    finally
+        reset_store!(store2)
+    end
+end
+
+@testset "concurrent cancel and task completion: always reaches a consistent terminal state" begin
+    # Stress test for the TOCTOU race between cancel_task and _complete_task!.
+    # Without the lock_tasks fix both could write to the same task, leaving it
+    # CANCELLED with result=nothing even though the callback completed.
+    store = InMemoryWorkerStore()
+    try
+        for trial in 1:30
+            reset_store!(store)
+            gate = Base.Event()
+
+            task_id = "race-$(trial)"
+            submit_task(task_id, () -> begin
+                notify(gate)
+                sleep(0.001)
+                return "result-$(trial)"
+            end, "user"; store=store)
+
+            wait(gate)
+            cancel_task(task_id; store=store)
+
+            # Let either path finish.
+            wait_for(() -> get_task_status(task_id; store=store)[:status] in ("COMPLETED", "CANCELLED"))
+
+            final = get_task_status(task_id; store=store)
+            @test final[:status] in ("COMPLETED", "CANCELLED")
+            if final[:status] == "COMPLETED"
+                @test final[:result] == "result-$(trial)"
+            else
+                @test final[:error] !== nothing
+                @test final[:completed_at] !== nothing
+            end
+        end
+    finally
+        reset_store!(store)
+    end
 end
 
 end

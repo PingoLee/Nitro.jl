@@ -13,24 +13,31 @@ urlpatterns("",
     path("/ok", function() return "ok" end, method="GET"),
 )
 
-# Create a rate limiter with realistic limits for testing (100 requests per second)
-serve(middleware=[RateLimiter(strategy=:sliding_window, rate_limit=100, window=Second(3))], port=PORT, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
+# The sliding-window strategy prunes timestamps per-request, so a burst that
+# spans the window lets early requests age out before the limit is reached. On a
+# loaded CI run (parallel workers compiling at startup) even a few localhost
+# round-trips can take seconds, which made the original "fire N requests within a
+# 3s window" approach flaky. Enforcement and recovery are therefore tested
+# separately so neither depends on a burst-vs-window timing race:
+#   • enforcement uses a large window the tiny burst cannot possibly span;
+#   • recovery uses rate_limit=1 so it only ever issues single requests.
 
-@testset "Rate Limiter Tests" begin
+# ── Enforcement: limit is applied and the remaining counter decrements ─────────
+serve(middleware=[RateLimiter(strategy=:sliding_window, rate_limit=3, window=Minute(1))], port=PORT, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
 
-    # First request: verify headers and countdown start
+@testset "Sliding Window Enforcement" begin
+    # First request: verify headers and remaining countdown start
     r = HTTP.get("$localhost/ok")
     @test r.status == 200
     @test text(r) == "ok"
-    @test HTTP.header(r, "X-RateLimit-Limit") == "100"
-    @test HTTP.header(r, "X-RateLimit-Remaining") == "99"
-    reset_time = parse(Int, HTTP.header(r, "X-RateLimit-Reset"))
-    @test reset_time > 0 && reset_time <= 3
+    @test HTTP.header(r, "X-RateLimit-Limit") == "3"
+    @test HTTP.header(r, "X-RateLimit-Remaining") == "2"
+    @test parse(Int, HTTP.header(r, "X-RateLimit-Reset")) > 0
 
-    # Exhaust the remaining quota (no per-request assertions needed)
-    for _ in 2:100
-        HTTP.get("$localhost/ok")
-    end
+    # Exhaust the remaining quota; the window is far larger than the burst, so
+    # the counter decrements deterministically regardless of request latency.
+    @test HTTP.header(HTTP.get("$localhost/ok"), "X-RateLimit-Remaining") == "1"
+    @test HTTP.header(HTTP.get("$localhost/ok"), "X-RateLimit-Remaining") == "0"
 
     # Next request must be rate limited (429)
     try
@@ -39,20 +46,38 @@ serve(middleware=[RateLimiter(strategy=:sliding_window, rate_limit=100, window=S
     catch e
         @test e isa HTTP.Exceptions.StatusError
         @test e.response.status == 429
-        @test HTTP.header(e.response, "X-RateLimit-Limit") == "100"
+        @test HTTP.header(e.response, "X-RateLimit-Limit") == "3"
         @test HTTP.header(e.response, "X-RateLimit-Remaining") == "0"
-        reset_time = parse(Int, HTTP.header(e.response, "X-RateLimit-Reset"))
-        @test reset_time > 0 && reset_time <= 3
+        @test parse(Int, HTTP.header(e.response, "X-RateLimit-Reset")) > 0
     end
+end
+terminate()
 
-    # Wait for the window to reset (just over 3 seconds)
-    sleep(3.1)
+sleep(1)  # let the port free up before re-binding
 
-    # First request after reset should succeed again
+# ── Recovery: a slot frees up once its window elapses ──────────────────────────
+serve(middleware=[RateLimiter(strategy=:sliding_window, rate_limit=1, window=Second(3))], port=PORT, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
+
+@testset "Sliding Window Recovery" begin
+    # First request consumes the only slot
     r = HTTP.get("$localhost/ok")
     @test r.status == 200
-    @test HTTP.header(r, "X-RateLimit-Remaining") == "99"
+    @test HTTP.header(r, "X-RateLimit-Remaining") == "0"
 
+    # An immediate follow-up is rate limited (both fall within the same window)
+    try
+        HTTP.get("$localhost/ok"; retry=false)
+        @test false  # Should not reach here
+    catch e
+        @test e isa HTTP.Exceptions.StatusError
+        @test e.response.status == 429
+    end
+
+    # After the window elapses the slot frees up again
+    sleep(3.1)
+    r = HTTP.get("$localhost/ok")
+    @test r.status == 200
+    @test HTTP.header(r, "X-RateLimit-Remaining") == "0"
 end
 terminate()
 

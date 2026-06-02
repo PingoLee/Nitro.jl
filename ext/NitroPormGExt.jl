@@ -11,6 +11,16 @@ import Nitro.Core.Types: AbstractSessionStore, SessionPayload, get_session, set_
 import Nitro.Core.Cookies: storesession!, prunesessions!
 import Nitro: pormg_nitro_session
 
+import Nitro.Workers: AbstractWorkerStore, TaskInfo, TaskStatus, TaskOptions, SequentialQueue, CleanupScheduler,
+    PENDING, RUNNING, COMPLETED, FAILED, CANCELLED,
+    get_task_info, set_task!, delete_task!, cleanup_tasks!, get_all_tasks,
+    get_active_task, register_active_task!, deregister_active_task!,
+    get_queue_authorizer, set_queue_authorizer!,
+    get_sequential_queues, get_queue_lock, get_cleanup_scheduler, lock_tasks
+import Nitro: pormg_nitro_worker
+
+export PormGWorkerStore, pormg_nitro_worker
+
 # ============================================================================
 # SECTION 1: Password Field Hooks (existing)
 # ============================================================================
@@ -294,7 +304,368 @@ function pormg_nitro_session(; db_key::String="db")
 end
 
 # ============================================================================
-# SECTION 5: Initialization
+# SECTION 6: Task Model
+# ============================================================================
+
+"""
+PormG model for the `nitro_task` table.
+
+Columns:
+- `id`           — VARCHAR(100), primary key
+- `status`       — VARCHAR(20)
+- `progress`     — FLOAT
+- `result`       — TEXT (JSON-serialized task results)
+- `error`        — TEXT
+- `created_at`   — TIMESTAMPTZ
+- `started_at`   — TIMESTAMPTZ, indexed for efficient querying/pruning
+- `completed_at` — TIMESTAMPTZ, indexed for efficient querying/pruning
+- `watchers`     — TEXT (JSON-serialized list of watchers)
+- `queue_name`   — VARCHAR(100)
+"""
+function _define_task_model()
+    if isdefined(PormG, :Models)
+        return PormG.Models.Model("nitro_task",
+            id           = PormG.Models.CharField(max_length=100, primary_key=true),
+            status       = PormG.Models.CharField(max_length=20),
+            progress     = PormG.Models.FloatField(default=0.0),
+            result       = PormG.Models.TextField(default=""),
+            error        = PormG.Models.TextField(default=""),
+            created_at   = PormG.Models.DateTimeField(),
+            started_at   = PormG.Models.DateTimeField(null=true, blank=true, db_index=true),
+            completed_at = PormG.Models.DateTimeField(null=true, blank=true, db_index=true),
+            watchers     = PormG.Models.TextField(default="[]"),
+            queue_name   = PormG.Models.CharField(max_length=100),
+        )
+    end
+    return nothing
+end
+
+# Lazily initialised after __init__
+const _TASK_MODEL = Ref{Any}(nothing)
+
+function task_model()
+    if isnothing(_TASK_MODEL[])
+        _TASK_MODEL[] = _define_task_model()
+    end
+    return _TASK_MODEL[]
+end
+
+# ============================================================================
+# SECTION 7: PormGWorkerStore
+# ============================================================================
+
+"""
+    PormGWorkerStore(; model=nothing)
+
+A PormG-backed worker store that implements Nitro's `AbstractWorkerStore`.
+"""
+struct PormGWorkerStore <: AbstractWorkerStore
+    model::Any
+    active_tasks::Dict{String, Task}
+    active_lock::ReentrantLock
+    task_lock::ReentrantLock
+    sequential_queues::Dict{String, SequentialQueue}
+    queue_lock::ReentrantLock
+    cleanup_scheduler::Ref{Union{Nothing, CleanupScheduler}}
+    queue_authorizer::Ref{Any}
+end
+
+function PormGWorkerStore(; model=nothing)
+    m = isnothing(model) ? task_model() : model
+    if isnothing(m)
+        error("PormGWorkerStore requires PormG.Models to be available. Ensure PormG is properly loaded.")
+    end
+    return PormGWorkerStore(
+        m,
+        Dict{String, Task}(),
+        ReentrantLock(),
+        ReentrantLock(),
+        Dict{String, SequentialQueue}(),
+        ReentrantLock(),
+        Ref{Union{Nothing, CleanupScheduler}}(nothing),
+        Ref{Any}(nothing),
+    )
+end
+
+# -- Serialization Helpers --
+
+function _to_db_record(task::TaskInfo)
+    result_str = isnothing(task.result) ? "" : JSON.json(task.result)
+    watchers_str = JSON.json(task.watchers)
+    return Dict{String, Any}(
+        "id" => task.id,
+        "status" => string(task.status),
+        "progress" => task.progress,
+        "result" => result_str,
+        "error" => isnothing(task.error) ? "" : task.error,
+        "created_at" => task.created_at,
+        "started_at" => task.started_at,
+        "completed_at" => task.completed_at,
+        "watchers" => watchers_str,
+        "queue_name" => isnothing(task.queue_name) ? "" : task.queue_name,
+    )
+end
+
+function _parse_optional_db_datetime(val)
+    if val === nothing || val === missing
+        return nothing
+    end
+    if val isa AbstractString && isempty(strip(val))
+        return nothing
+    end
+    return _parse_db_datetime(val)
+end
+
+function _from_db_record(row)::TaskInfo
+    # Support both symbol lookup (PormG DB rows) and string dict (for mocks)
+    get_val = (key_sym, key_str) -> haskey(row, key_sym) ? row[key_sym] : row[key_str]
+
+    id = string(get_val(:id, "id"))
+    task = TaskInfo(id)
+
+    status_str = string(get_val(:status, "status"))
+    if status_str == "PENDING"
+        task.status = PENDING
+    elseif status_str == "RUNNING"
+        task.status = RUNNING
+    elseif status_str == "COMPLETED"
+        task.status = COMPLETED
+    elseif status_str == "FAILED"
+        task.status = FAILED
+    elseif status_str == "CANCELLED"
+        task.status = CANCELLED
+    else
+        error("PormGWorkerStore: unknown task status '$(status_str)' for task '$(id)'")
+    end
+
+    task.progress = Float64(get_val(:progress, "progress"))
+
+    result_str = string(get_val(:result, "result"))
+    task.result = isempty(result_str) ? nothing : JSON.parse(result_str)
+
+    err_str = string(get_val(:error, "error"))
+    task.error = isempty(err_str) ? nothing : err_str
+
+    task.created_at = _parse_db_datetime(get_val(:created_at, "created_at"))
+
+    task.started_at = _parse_optional_db_datetime(get_val(:started_at, "started_at"))
+
+    task.completed_at = _parse_optional_db_datetime(get_val(:completed_at, "completed_at"))
+
+    watchers_str = string(get_val(:watchers, "watchers"))
+    task.watchers = isempty(watchers_str) ? String[] : convert(Vector{String}, JSON.parse(watchers_str))
+
+    qn_str = string(get_val(:queue_name, "queue_name"))
+    task.queue_name = isempty(qn_str) ? nothing : qn_str
+
+    return task
+end
+
+# -- AbstractWorkerStore Interface Methods --
+
+function get_task_info(store::PormGWorkerStore, task_id::String)
+    m = store.model
+    try
+        result = m.objects.filter("id" => task_id).first()
+        if isnothing(result)
+            return nothing
+        end
+        task_info = _from_db_record(result)
+        task_info.sys_task = get_active_task(store, task_id)
+        return task_info
+    catch e
+        @warn "PormGWorkerStore: failed to read task" exception=(e, catch_backtrace())
+        return nothing
+    end
+end
+
+function set_task!(store::PormGWorkerStore, task_id::String, task_info::TaskInfo)
+    m = store.model
+    record = _to_db_record(task_info)
+    try
+        existing = m.objects.filter("id" => task_id).first()
+        if isnothing(existing)
+            m.objects.create(
+                "id" => record["id"],
+                "status" => record["status"],
+                "progress" => record["progress"],
+                "result" => record["result"],
+                "error" => record["error"],
+                "created_at" => record["created_at"],
+                "started_at" => record["started_at"],
+                "completed_at" => record["completed_at"],
+                "watchers" => record["watchers"],
+                "queue_name" => record["queue_name"],
+            )
+        else
+            m.objects.filter("id" => task_id).update(
+                "status" => record["status"],
+                "progress" => record["progress"],
+                "result" => record["result"],
+                "error" => record["error"],
+                "created_at" => record["created_at"],
+                "started_at" => record["started_at"],
+                "completed_at" => record["completed_at"],
+                "watchers" => record["watchers"],
+                "queue_name" => record["queue_name"],
+            )
+        end
+    catch e
+        @warn "PormGWorkerStore: failed to write task" exception=(e, catch_backtrace())
+        rethrow()
+    end
+    return task_info
+end
+
+function delete_task!(store::PormGWorkerStore, task_id::String)
+    m = store.model
+    try
+        m.objects.filter("id" => task_id).delete()
+    catch e
+        @warn "PormGWorkerStore: failed to delete task" exception=(e, catch_backtrace())
+        rethrow()
+    end
+    return nothing
+end
+
+function cleanup_tasks!(store::PormGWorkerStore, retain_days::Int)
+    m = store.model
+    cutoff = Dates.now(Dates.UTC) - Dates.Day(retain_days)
+    try
+        total_deleted, _ = m.objects.filter(
+            "completed_at__@lte" => cutoff,
+            "completed_at__@isnull" => false,
+            "status__@in" => string.((COMPLETED, FAILED, CANCELLED)),
+        ).delete()
+        return total_deleted
+    catch e
+        @warn "PormGWorkerStore: failed to cleanup old tasks" exception=(e, catch_backtrace())
+        return 0
+    end
+end
+
+function get_all_tasks(store::PormGWorkerStore, status::Union{Nothing, TaskStatus}=nothing, user_id::Union{Nothing, String}=nothing, queue_name::Union{Nothing, String}=nothing)
+    m = store.model
+    try
+        qs = m.objects
+        if status !== nothing
+            qs = qs.filter("status" => string(status))
+        end
+        if queue_name !== nothing
+            qs = qs.filter("queue_name" => queue_name)
+        end
+
+        tasks = TaskInfo[]
+        for row in qs
+            task_info = _from_db_record(row)
+            if user_id !== nothing && !isempty(user_id) && !(user_id in task_info.watchers)
+                continue
+            end
+            push!(tasks, task_info)
+        end
+        return tasks
+    catch e
+        @warn "PormGWorkerStore: failed to list tasks" exception=(e, catch_backtrace())
+        return TaskInfo[]
+    end
+end
+
+function get_active_task(store::PormGWorkerStore, task_id::String)
+    lock(store.active_lock) do
+        return get(store.active_tasks, task_id, nothing)
+    end
+end
+
+function register_active_task!(store::PormGWorkerStore, task_id::String, task::Task)
+    lock(store.active_lock) do
+        store.active_tasks[task_id] = task
+    end
+    return task
+end
+
+function deregister_active_task!(store::PormGWorkerStore, task_id::String)
+    lock(store.active_lock) do
+        delete!(store.active_tasks, task_id)
+    end
+    return nothing
+end
+
+function get_queue_authorizer(store::PormGWorkerStore)
+    return store.queue_authorizer[]
+end
+
+function set_queue_authorizer!(store::PormGWorkerStore, authorizer)
+    store.queue_authorizer[] = authorizer
+    return authorizer
+end
+
+function get_sequential_queues(store::PormGWorkerStore)
+    return store.sequential_queues
+end
+
+function get_queue_lock(store::PormGWorkerStore)
+    return store.queue_lock
+end
+
+function get_cleanup_scheduler(store::PormGWorkerStore)
+    return store.cleanup_scheduler
+end
+
+function lock_tasks(callback::Function, store::PormGWorkerStore)
+    return lock(store.task_lock) do
+        callback()
+    end
+end
+
+# ============================================================================
+# SECTION 8: Table Bootstrap & Convenience Constructor
+# ============================================================================
+
+"""
+    _ensure_task_table!(conn, model)
+
+Execute `CREATE TABLE IF NOT EXISTS` and index creations for the `nitro_task` table.
+"""
+function _ensure_task_table!(conn, model)
+    create_table_sql = PormG.Dialect.create_table(conn, model)
+    PormG.ConnectionPool.fetch(conn, create_table_sql)
+
+    create_index_sql1 = PormG.Dialect.create_index(
+        conn,
+        "\"nitro_task_started_at_idx\"",
+        "\"nitro_task\"",
+        ["\"started_at\""],
+    )
+    PormG.ConnectionPool.fetch(conn, create_index_sql1)
+
+    create_index_sql2 = PormG.Dialect.create_index(
+        conn,
+        "\"nitro_task_completed_at_idx\"",
+        "\"nitro_task\"",
+        ["\"completed_at\""],
+    )
+    PormG.ConnectionPool.fetch(conn, create_index_sql2)
+    return nothing
+end
+
+"""
+    pormg_nitro_worker(; db_key="db") -> PormGWorkerStore
+
+One-call setup for PormG-backed workers. Creates the `nitro_task` table (if it doesn't exist),
+creates indexes, and returns a ready-to-use `PormGWorkerStore`.
+"""
+function pormg_nitro_worker(; db_key::String="db")
+    model = task_model()
+    if isnothing(model)
+        error("pormg_nitro_worker: PormG.Models is not available. Ensure PormG is properly loaded.")
+    end
+    conn = PormG.connection(key=db_key)
+    _ensure_task_table!(conn, model)
+    return PormGWorkerStore(model=model)
+end
+
+# ============================================================================
+# SECTION 9: Initialization
 # ============================================================================
 
 function __init__()
@@ -305,8 +676,9 @@ function __init__()
         PormG.register_field_hook(:PasswordField, :auto_hash, hash_password_field)
     end
 
-    # Pre-initialize the session model so it's ready when needed
+    # Pre-initialize the models so they're ready when needed
     _SESSION_MODEL[] = _define_session_model()
+    _TASK_MODEL[] = _define_task_model()
 end
 
 end # module NitroPormGExt
