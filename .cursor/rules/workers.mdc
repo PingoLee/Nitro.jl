@@ -1,23 +1,18 @@
 ---
-description: Workers module migration — persistent stores, user_id/watchers, queue authorizers, zombie recovery
+description: Workers module — persistent stores, user_id/watchers, queue authorizers, zombie recovery
 globs: "{src/Workers/**/*.jl,ext/NitroPormGExt.jl,test/**/*worker*.jl,test/extensions/**/*.jl}"
 alwaysApply: false
 ---
 
-# Nitro.jl Workers Module Migration Guide
+# Nitro.jl Workers Module
 
 This rule applies when changing the Workers queue, `NitroPormGExt` worker storage, or worker tests.
 
-## 1. Context & Architectural Changes
+## 1. Context & Architecture
 
 The worker system supports both volatile in-memory queues and persistent database stores with access control.
 
-### Legacy pitfalls
-1. **No Persistence**: In-memory-only tasks are lost on restart.
-2. **No Multi-tenancy / Security**: Unscoped task APIs allow cross-user access.
-3. **No Storage Abstraction**: Tight coupling between queue processor and one store implementation.
-
-### Current architecture
+### Storage backends
 - **`AbstractWorkerStore`**: Interface for storage backends.
 - **`InMemoryWorkerStore`**: Volatile, thread-safe store in `src/Workers/`.
 - **`PormGWorkerStore`**: Persistent store in `ext/NitroPormGExt.jl`.
@@ -25,7 +20,7 @@ The worker system supports both volatile in-memory queues and persistent databas
 - **Queue authorization hooks**: Optional `queue_authorizer(queue_name, user_id)::Bool`.
 - **Watchers**: Tasks have `user_id` and `watchers`; APIs validate access when `user_id` is supplied.
 
-## 2. API Migration
+## 2. Task API
 
 Task submission requires `user_id`. Read/manage APIs accept `user_id` and enforce watcher-based access (`AuthorizationError` when denied).
 

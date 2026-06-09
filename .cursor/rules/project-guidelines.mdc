@@ -9,12 +9,12 @@ Read this file at the start of a **changed-code review** or large refactor so he
 
 ## Rule index
 
-| Area | Cursor rule | When it applies |
-|------|-------------|-----------------|
+| Area | Rule file | When it applies |
+|------|-----------|-----------------|
 | Core framework (`src/`, handlers, routing, middleware) | `nitro-core.mdc` | All `*.jl` under the package |
 | App config & bootstrap (no `Nitro.config` singleton) | `nitro-config.mdc` | Application design and `serve` setup |
 | Documentation (`docs/`) | `nitro-docs.mdc` | Tutorial and API docs |
-| Workers + PormG worker ext | `workers-migration.mdc` | `src/Workers/`, `ext/NitroPormGExt.jl`, worker tests |
+| Workers + PormG worker ext | `workers.mdc` | `src/Workers/`, `ext/NitroPormGExt.jl`, worker tests |
 
 ## Package layout (review slices)
 

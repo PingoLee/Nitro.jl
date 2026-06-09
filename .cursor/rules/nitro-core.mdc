@@ -46,6 +46,3 @@ Whenever you write code, write tests, or propose architecture for this repositor
 - **Testing**: Any new feature or bug fix must have a corresponding test in `test/`. Use `Pkg.test()` for verification.
 - **Type Stability**: Crucial for high-throughput HTTP handling. Avoid `Any` types in internal request pipelines. Use `Nullable{T}` over `Union{T, Missing}` for internal types.
 
-## 8. No Backward Compatibility with Legacy Nitro APIs
-- Nitro.jl is a **new framework**. There is zero obligation to maintain backward compatibility with deleted Nitro APIs.
-- Old patterns (macro routing, `serveparallel()`, `@staticfiles`, `@dynamicfiles`) are permanently deleted, not deprecated.

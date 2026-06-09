@@ -18,7 +18,7 @@ Implementation workflow (not a review). Follow `nitro-core.mdc` and `nitro-docs.
 | **Nitro.jl package** | `src/` or existing handler modules; often inline in `test/` for behavior tests | `urlpatterns` in the relevant test file or example |
 | **Application using Nitro** | `src/Handlers/<Domain>Handlers.jl` | `src/Routes.jl` (or `src/Routes/*.jl`) via `path()` / `include_routes()` |
 
-Do not use `@get`, `@post`, `serveparallel()`, or function-style route registrars.
+Follow routing and response rules from `nitro-core.mdc`.
 
 ## Steps
 

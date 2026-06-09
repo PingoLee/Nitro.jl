@@ -17,11 +17,7 @@ follow these rules so every example is consistent and immediately usable.
 - **Always** use Django path converters (`<int:id>`, `<str:slug>`, `<float:n>`, `<uuid:key>`).
 
 ```julia
-# ✅ correct
 path("/api/products/<int:id>", ProductHandlers.get_product, method="GET")
-
-# ❌ wrong — deleted API
-@get "/api/products/{id}" function(req, id::Int) ... end
 ```
 
 ## 2. Project Structure: Handlers / Routes Separation
@@ -90,4 +86,3 @@ Always type the `req` parameter as `HTTP.Request` and path parameters with their
 ## 8. `serve()` and Entry-Point
 
 - Use `serve(urlpatterns)` — no positional port argument unless specifically demonstrating port configuration.
-- Never use `serveparallel()` — it is deleted.

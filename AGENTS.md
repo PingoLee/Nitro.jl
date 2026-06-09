@@ -8,33 +8,11 @@ Single source of truth for all AI agents (Claude Code, Cursor, Codex, Gemini CLI
 
 Hard stops. Getting any of these wrong produces broken or architecturally invalid code.
 
-### Routing — Django-style only
-- Use `path()`, `urlpatterns()`, `include_routes()` exclusively.
-- `@get`, `@post`, `@put`, `@patch`, `@delete`, `get()`, `post()`, `serveparallel()` are **permanently deleted**. Never suggest or recreate them.
-- Path parameters use converters: `<int:id>`, `<str:slug>`, `<uuid:key>`.
-
-```julia
-# correct
-path("/api/products/<int:id>", ProductHandlers.get_product, method="GET")
-
-# wrong — deleted API
-@get "/api/products/{id}" function(req, id::Int) ... end
-```
-
-### PormG isolation
-- `PormG` may only be imported inside `ext/NitroPormGExt.jl`.
-- Never import `PormG` in `src/`. The core must stay database-agnostic.
-
-### Responses
-- Always use `Res.json()`, `Res.status()`, `Res.send()` — never return raw `Dict` or `String` from handlers.
-
-### Config — no framework singleton
-- No `Nitro.config` global. Applications define their own typed config structs (`AppConfig`, etc.).
-- Bootstrap order: load config → resolve secrets → run initializers → `serve(context=...)`.
-
-### Workers — access control required
-- All task APIs require `user_id`. New storage backends implement `AbstractWorkerStore`.
-- Worker DB logic lives exclusively in `ext/NitroPormGExt.jl`, not in `src/Workers/`.
+- **Routing**: use `path()`, `urlpatterns()`, `include_routes()` exclusively. Path parameters use converters: `<int:id>`, `<str:slug>`, `<uuid:key>`.
+- **PormG isolation**: `PormG` may only be imported inside `ext/NitroPormGExt.jl` — never in `src/`.
+- **Responses**: always use `Res.json()`, `Res.status()`, `Res.send()` — never return raw `Dict` or `String` from handlers.
+- **Config**: no `Nitro.config` global. Applications define typed config structs. Bootstrap order: load config → resolve secrets → run initializers → `serve(context=...)`.
+- **Workers**: all task APIs require `user_id`. New storage backends implement `AbstractWorkerStore`. DB logic lives exclusively in `ext/NitroPormGExt.jl`.
 
 ---
 
@@ -47,14 +25,14 @@ Detailed constraints, idioms, and examples. Read the relevant file before writin
 | Core framework, routing, security | [`.cursor/rules/nitro-core.mdc`](.cursor/rules/nitro-core.mdc) | Any `src/*.jl` change |
 | Config & bootstrap | [`.cursor/rules/nitro-config.mdc`](.cursor/rules/nitro-config.mdc) | App config or `serve()` design |
 | Documentation | [`.cursor/rules/nitro-docs.mdc`](.cursor/rules/nitro-docs.mdc) | `docs/**/*.md` edits |
-| Workers + PormG ext | [`.cursor/rules/workers-migration.mdc`](.cursor/rules/workers-migration.mdc) | `src/Workers/`, `ext/`, worker tests |
+| Workers + PormG ext | [`.cursor/rules/workers.mdc`](.cursor/rules/workers.mdc) | `src/Workers/`, `ext/`, worker tests |
 | Review index & diff order | [`.cursor/rules/project-guidelines.mdc`](.cursor/rules/project-guidelines.mdc) | Pre-PR code review |
 
 ---
 
 ## Skills (`.cursor/skills/`)
 
-Each skill is a `SKILL.md` file describing a workflow. In Cursor, invoke with `@skill-name`. In other agents, read the `SKILL.md` and follow it manually.
+Each skill is a `SKILL.md` file describing a workflow. Read the relevant file and follow the steps.
 
 | Skill | File | Purpose |
 |-------|------|---------|

@@ -37,6 +37,3 @@ When designing configuration, bootstrapping applications, or proposing developer
 - Config must be swappable in tests without mutating framework-global state.
 - Support multiple Nitro apps in one Julia process or test suite.
 
-## 7. Migration from Genie-style apps
-- App-layer folders like `config/env/` and `config/initializers/` are fine.
-- **Do not copy Genie's global mutable config singleton**; use explicit bootstrap code instead.

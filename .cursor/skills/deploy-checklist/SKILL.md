@@ -35,7 +35,7 @@ Report missing env vars by name; do not invent secret values.
 - [ ] `serve(urlpatterns; middleware=[...])` order: global middleware → defaults → router (`nitro-core.mdc`).
 - [ ] `SessionMiddleware` / `CSRFMiddleware` present for stateful cookie apps.
 - [ ] `spafiles` or static config matches how the frontend is served in production.
-- [ ] Worker `startup(..., store=..., recover_zombies=...)` configured if background queues are used (`workers-migration.mdc`).
+- [ ] Worker `startup(..., store=..., recover_zombies=...)` configured if background queues are used (`workers.mdc`).
 
 ## 4. Reverse proxy (when requested)
 
