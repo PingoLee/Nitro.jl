@@ -11,6 +11,9 @@ function get_all_tasks end
 function get_active_task end
 function register_active_task! end
 function deregister_active_task! end
+function get_active_task_info end
+function register_active_task_info! end
+function deregister_active_task_info! end
 
 # -- Queue permission checks interface functions --
 function get_queue_authorizer end
@@ -118,6 +121,10 @@ function get_active_task(store::InMemoryWorkerStore, task_id::String)
     end
 end
 
+function get_active_task_info(store::InMemoryWorkerStore, task_id::String)
+    return get_task_info(store, task_id)
+end
+
 function register_active_task!(store::InMemoryWorkerStore, task_id::String, task::Task)
     lock(store.active_lock) do
         store.active_tasks[task_id] = task
@@ -131,6 +138,10 @@ function register_active_task!(store::InMemoryWorkerStore, task_id::String, task
     return task
 end
 
+function register_active_task_info!(store::InMemoryWorkerStore, task_id::String, task_info::TaskInfo)
+    return set_task!(store, task_id, task_info)
+end
+
 function deregister_active_task!(store::InMemoryWorkerStore, task_id::String)
     lock(store.active_lock) do
         delete!(store.active_tasks, task_id)
@@ -141,6 +152,10 @@ function deregister_active_task!(store::InMemoryWorkerStore, task_id::String)
             task_info.sys_task = nothing
         end
     end
+    return nothing
+end
+
+function deregister_active_task_info!(store::InMemoryWorkerStore, task_id::String)
     return nothing
 end
 

@@ -32,7 +32,7 @@ Revise = "295af30f-e4ad-537b-8983-00126c2a3abe"
 TimeZones = "f269a46b-ccf7-5d73-abea-4c690281aa53"
 
 [sources]
-PormG = {path = "../PormG"}
+PormG = {path = "../PormG.jl"}
 
 [extensions]
 MustacheExt = "Mustache"

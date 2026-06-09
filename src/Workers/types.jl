@@ -5,7 +5,7 @@ current_time_utc() = Dates.now(Dates.UTC)
 mutable struct TaskInfo
     id::String
     status::TaskStatus
-    progress::Float64
+    @atomic progress::Float64
     result::Any
     error::Union{Nothing, String}
     created_at::DateTime
@@ -31,6 +31,21 @@ mutable struct TaskInfo
             queue_name,
         )
     end
+end
+
+"""
+    update_progress!(task_info::TaskInfo, value::Real)
+
+Atomically set a task's progress (0–100 scale) and return the task.
+
+Call this from task callbacks instead of assigning `task_info.progress`
+directly. The field is atomic, so a plain assignment raises
+`ConcurrencyViolationError`; routing writes through this function keeps progress
+updates race-free with the status readers that poll a running task.
+"""
+function update_progress!(task_info::TaskInfo, value::Real)
+    @atomic task_info.progress = Float64(value)
+    return task_info
 end
 
 @kwdef struct TaskOptions

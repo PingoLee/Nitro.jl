@@ -15,6 +15,7 @@ import Nitro.Workers: AbstractWorkerStore, TaskInfo, TaskStatus, TaskOptions, Se
     PENDING, RUNNING, COMPLETED, FAILED, CANCELLED,
     get_task_info, set_task!, delete_task!, cleanup_tasks!, get_all_tasks,
     get_active_task, register_active_task!, deregister_active_task!,
+    get_active_task_info, register_active_task_info!, deregister_active_task_info!,
     get_queue_authorizer, set_queue_authorizer!,
     get_sequential_queues, get_queue_lock, get_cleanup_scheduler, lock_tasks
 import Nitro: pormg_nitro_worker
@@ -361,7 +362,9 @@ A PormG-backed worker store that implements Nitro's `AbstractWorkerStore`.
 """
 struct PormGWorkerStore <: AbstractWorkerStore
     model::Any
+    db_key::String
     active_tasks::Dict{String, Task}
+    active_task_infos::Dict{String, TaskInfo}
     active_lock::ReentrantLock
     task_lock::ReentrantLock
     sequential_queues::Dict{String, SequentialQueue}
@@ -370,14 +373,16 @@ struct PormGWorkerStore <: AbstractWorkerStore
     queue_authorizer::Ref{Any}
 end
 
-function PormGWorkerStore(; model=nothing)
+function PormGWorkerStore(; model=nothing, db_key::String="db")
     m = isnothing(model) ? task_model() : model
     if isnothing(m)
         error("PormGWorkerStore requires PormG.Models to be available. Ensure PormG is properly loaded.")
     end
     return PormGWorkerStore(
         m,
+        db_key,
         Dict{String, Task}(),
+        Dict{String, TaskInfo}(),
         ReentrantLock(),
         ReentrantLock(),
         Dict{String, SequentialQueue}(),
@@ -386,6 +391,12 @@ function PormGWorkerStore(; model=nothing)
         Ref{Any}(nothing),
     )
 end
+
+# Route every task query to the store's configured connection. PormG's query
+# manager always supports `.db(key)`, so we call it directly rather than
+# silently falling back to the model's default connection (which would write
+# tasks to the wrong database).
+_task_objects(store::PormGWorkerStore) = store.model.objects.db(store.db_key)
 
 # -- Serialization Helpers --
 
@@ -438,7 +449,7 @@ function _from_db_record(row)::TaskInfo
         error("PormGWorkerStore: unknown task status '$(status_str)' for task '$(id)'")
     end
 
-    task.progress = Float64(get_val(:progress, "progress"))
+    @atomic task.progress = Float64(get_val(:progress, "progress"))
 
     result_str = string(get_val(:result, "result"))
     task.result = isempty(result_str) ? nothing : JSON.parse(result_str)
@@ -464,15 +475,22 @@ end
 # -- AbstractWorkerStore Interface Methods --
 
 function get_task_info(store::PormGWorkerStore, task_id::String)
-    m = store.model
+    # Return the live in-memory info for an active task so callers see fresh
+    # progress (the field is atomic, so concurrent reads are race-free). We do
+    # NOT write `sys_task` back onto this shared object: nothing reads that field
+    # (cancellation resolves the running task via `get_active_task`), and writing
+    # it from a reader thread would mutate the worker's own task object.
+    active_info = get_active_task_info(store, task_id)
+    if active_info !== nothing
+        return active_info
+    end
+
     try
-        result = m.objects.filter("id" => task_id).first()
+        result = _task_objects(store).filter("id" => task_id).first()
         if isnothing(result)
             return nothing
         end
-        task_info = _from_db_record(result)
-        task_info.sys_task = get_active_task(store, task_id)
-        return task_info
+        return _from_db_record(result)
     catch e
         @warn "PormGWorkerStore: failed to read task" exception=(e, catch_backtrace())
         return nothing
@@ -480,12 +498,11 @@ function get_task_info(store::PormGWorkerStore, task_id::String)
 end
 
 function set_task!(store::PormGWorkerStore, task_id::String, task_info::TaskInfo)
-    m = store.model
     record = _to_db_record(task_info)
     try
-        existing = m.objects.filter("id" => task_id).first()
+        existing = _task_objects(store).filter("id" => task_id).first()
         if isnothing(existing)
-            m.objects.create(
+            _task_objects(store).create(
                 "id" => record["id"],
                 "status" => record["status"],
                 "progress" => record["progress"],
@@ -498,7 +515,7 @@ function set_task!(store::PormGWorkerStore, task_id::String, task_info::TaskInfo
                 "queue_name" => record["queue_name"],
             )
         else
-            m.objects.filter("id" => task_id).update(
+            _task_objects(store).filter("id" => task_id).update(
                 "status" => record["status"],
                 "progress" => record["progress"],
                 "result" => record["result"],
@@ -518,9 +535,8 @@ function set_task!(store::PormGWorkerStore, task_id::String, task_info::TaskInfo
 end
 
 function delete_task!(store::PormGWorkerStore, task_id::String)
-    m = store.model
     try
-        m.objects.filter("id" => task_id).delete()
+        _task_objects(store).filter("id" => task_id).delete()
     catch e
         @warn "PormGWorkerStore: failed to delete task" exception=(e, catch_backtrace())
         rethrow()
@@ -529,10 +545,9 @@ function delete_task!(store::PormGWorkerStore, task_id::String)
 end
 
 function cleanup_tasks!(store::PormGWorkerStore, retain_days::Int)
-    m = store.model
     cutoff = Dates.now(Dates.UTC) - Dates.Day(retain_days)
     try
-        total_deleted, _ = m.objects.filter(
+        total_deleted, _ = _task_objects(store).filter(
             "completed_at__@lte" => cutoff,
             "completed_at__@isnull" => false,
             "status__@in" => string.((COMPLETED, FAILED, CANCELLED)),
@@ -545,9 +560,8 @@ function cleanup_tasks!(store::PormGWorkerStore, retain_days::Int)
 end
 
 function get_all_tasks(store::PormGWorkerStore, status::Union{Nothing, TaskStatus}=nothing, user_id::Union{Nothing, String}=nothing, queue_name::Union{Nothing, String}=nothing)
-    m = store.model
     try
-        qs = m.objects
+        qs = _task_objects(store)
         if status !== nothing
             qs = qs.filter("status" => string(status))
         end
@@ -555,9 +569,27 @@ function get_all_tasks(store::PormGWorkerStore, status::Union{Nothing, TaskStatu
             qs = qs.filter("queue_name" => queue_name)
         end
 
+        # Snapshot the live in-memory infos so running tasks report fresh
+        # progress/status instead of the last value flushed to the database
+        # (the worker only writes to the DB at RUNNING-start and on completion).
+        active = lock(store.active_lock) do
+            copy(store.active_task_infos)
+        end
+
         tasks = TaskInfo[]
-        for row in qs
+        for row in qs.list()
             task_info = _from_db_record(row)
+            live = get(active, task_info.id, nothing)
+            if live !== nothing
+                # Overlay volatile fields only; keep the DB-derived object so
+                # we never leak the running `sys_task` into serialized output.
+                task_info.status = live.status
+                @atomic task_info.progress = live.progress
+                task_info.result = live.result
+                task_info.error = live.error
+                task_info.started_at = live.started_at
+                task_info.completed_at = live.completed_at
+            end
             if user_id !== nothing && !isempty(user_id) && !(user_id in task_info.watchers)
                 continue
             end
@@ -583,9 +615,29 @@ function register_active_task!(store::PormGWorkerStore, task_id::String, task::T
     return task
 end
 
+function get_active_task_info(store::PormGWorkerStore, task_id::String)
+    lock(store.active_lock) do
+        return get(store.active_task_infos, task_id, nothing)
+    end
+end
+
+function register_active_task_info!(store::PormGWorkerStore, task_id::String, task_info::TaskInfo)
+    lock(store.active_lock) do
+        store.active_task_infos[task_id] = task_info
+    end
+    return task_info
+end
+
 function deregister_active_task!(store::PormGWorkerStore, task_id::String)
     lock(store.active_lock) do
         delete!(store.active_tasks, task_id)
+    end
+    return nothing
+end
+
+function deregister_active_task_info!(store::PormGWorkerStore, task_id::String)
+    lock(store.active_lock) do
+        delete!(store.active_task_infos, task_id)
     end
     return nothing
 end
@@ -661,7 +713,7 @@ function pormg_nitro_worker(; db_key::String="db")
     end
     conn = PormG.connection(key=db_key)
     _ensure_task_table!(conn, model)
-    return PormGWorkerStore(model=model)
+    return PormGWorkerStore(model=model, db_key=db_key)
 end
 
 # ============================================================================

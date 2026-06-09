@@ -55,6 +55,14 @@ function Base.getproperty(qs::MockTaskQuerySet, name::Symbol)
             end
             return MockTaskQuerySet(getfield(qs, :table), new_filters)
         end
+    elseif name === :db
+        return function(_db_key::String)
+            return qs
+        end
+    elseif name === :list
+        return function()
+            return _filtered_rows(qs)
+        end
     elseif name === :first
         return function()
             rows = _filtered_rows(qs)
@@ -129,6 +137,7 @@ else
         store = RealPormGWorkerStore(model=MockTaskModel())
 
         @test store isa AbstractWorkerStore
+        @test store.db_key == "db"
 
         @testset "create and read task" begin
             info = TaskInfo("task-1"; queue_name="reports")
@@ -151,7 +160,7 @@ else
         @testset "update task progress" begin
             retrieved = get_task_info(store, "task-1")
             retrieved.status = RUNNING
-            retrieved.progress = 50.0
+            update_progress!(retrieved, 50.0)
             retrieved.started_at = Dates.now(Dates.UTC)
             set_task!(store, "task-1", retrieved)
 
@@ -246,6 +255,30 @@ else
             @test all(t.queue_name == "invoices" for t in invoices)
 
             @test length(get_all_tasks(store4, PENDING)) == 5
+        end
+
+        @testset "get_all_tasks overlays live progress for active tasks" begin
+            # A RUNNING task only flushes to the DB at start and on completion, so its
+            # stored progress is stale. get_all_tasks must overlay the in-memory info
+            # so the list endpoint reports the same live progress as get_task_status.
+            store5 = RealPormGWorkerStore(model=MockTaskModel())
+
+            info = TaskInfo("task-live"; queue_name="reports")
+            info.status = RUNNING
+            update_progress!(info, 0.0)
+            set_task!(store5, info.id, info)  # DB row stuck at 0.0
+
+            live = TaskInfo("task-live"; queue_name="reports")
+            live.status = RUNNING
+            update_progress!(live, 73.0)
+            register_active_task_info!(store5, live.id, live)
+
+            listed = only(get_all_tasks(store5, RUNNING))
+            @test listed.progress == 73.0
+
+            # After the task terminates the cache entry is gone and the DB value wins.
+            deregister_active_task_info!(store5, live.id)
+            @test only(get_all_tasks(store5, RUNNING)).progress == 0.0
         end
 
         @testset "_from_db_record raises on unknown status string" begin

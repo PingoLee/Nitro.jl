@@ -143,6 +143,7 @@ function _execute_task_async(store::AbstractWorkerStore, task_key::String, callb
         task_info.started_at = current_time_utc()
         task_info.sys_task = current_task()
         register_active_task!(store, task_key, current_task())
+        register_active_task_info!(store, task_key, task_info)
         set_task!(store, task_key, task_info)
 
         max_attempts = options.retry_on_failure ? options.max_retries : 0
@@ -276,6 +277,7 @@ function cancel_task(task_id::AbstractString, user_id::Union{Nothing, AbstractSt
         task_info.status = CANCELLED
         set_task!(store, task_info.id, task_info)
         deregister_active_task!(store, task_info.id)
+        deregister_active_task_info!(store, task_info.id)
 
         return Dict{Symbol, Any}(:status => "Task cancelled")
     end

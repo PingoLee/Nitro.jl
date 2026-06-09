@@ -167,7 +167,7 @@ Returns a dictionary with fields such as:
 - `:queue_name`
 
 ```julia
-status = get_task_status("report-42")
+status = get_task_status("report-42", "user-1")
 ```
 
 ### `get_all_tasks`
@@ -175,8 +175,8 @@ status = get_task_status("report-42")
 Returns all tasks, optionally filtered by worker status.
 
 ```julia
-all_tasks = get_all_tasks()
-running_tasks = get_all_tasks(RUNNING)
+all_tasks = get_all_tasks(nothing, "user-1")
+running_tasks = get_all_tasks(RUNNING, "user-1")
 ```
 
 ### `get_queue_status`
@@ -199,7 +199,7 @@ It reports information like:
 Tasks can be cancelled by id:
 
 ```julia
-cancel_task("report-42")
+cancel_task("report-42", "user-1")
 ```
 
 Tasks can also retry on failure by passing `TaskOptions`.
@@ -262,7 +262,7 @@ using PormG
 PormG.Configuration.load("workers")
 ```
 
-The default key is `"db"`. Use a different `db_key` when your worker database uses another PormG connection.
+The default key is `"db"`. Use a different `db_key` when your worker database uses another PormG connection, for example `db_key="db_bs"`.
 
 ### 2. Bootstrap the worker store
 Create the task table and indexes, then keep the returned store for worker calls or startup middleware:
@@ -304,8 +304,9 @@ To support multitenant backends, Nitro.jl workers include built-in authorization
 
 ### 1. Task Ownership & Watchers
 Task submission functions require a `user_id`, and that user is registered as the task's first **watcher**.
-- Status, cancellation, and listing functions accept a `user_id` parameter to enforce watcher-based access.
-- Only the system, task owners, or designated watchers can query or cancel a task. If an unauthorized user tries to access it, an `AuthorizationError` is thrown.
+- Status, cancellation, and listing functions accept an optional `user_id` parameter.
+- Passing a non-empty `user_id` enforces watcher-based access. Only task owners or designated watchers can query or cancel a task; unauthorized users get an `AuthorizationError`.
+- Omitting `user_id` bypasses watcher checks and should be reserved for explicit system/admin paths or app-level public worker endpoints.
 
 ```julia
 using Nitro.Errors: AuthorizationError
@@ -363,7 +364,7 @@ Use `Nitro.Workers` when you need lightweight or persistent background execution
 
 - use `worker_startup(...)` to bootstrap workers with the server
 - use `PormGWorkerStore` to persist task state to your database
-- use the `user_id` parameter to enforce strict access control and queue authorization
+- use `user_id` on submission, and pass it to read/manage APIs when routes are user-scoped
 - use `submit_task(...)` for parallel jobs
 - use `submit_sequential_task(...)` for ordered queue processing
 - use `get_task_status(...)` and `get_queue_status(...)` to monitor work

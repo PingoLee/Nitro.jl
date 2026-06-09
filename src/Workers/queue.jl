@@ -18,14 +18,16 @@ function _complete_task!(store::AbstractWorkerStore, task_info::TaskInfo, result
         current = get_task_info(store, task_info.id)
         if current !== nothing && current.status == CANCELLED
             deregister_active_task!(store, task_info.id)
+            deregister_active_task_info!(store, task_info.id)
             return current
         end
         task_info.result = result
         task_info.completed_at = current_time_utc()
-        task_info.progress = 100.0
+        @atomic task_info.progress = 100.0
         task_info.sys_task = nothing
         task_info.status = COMPLETED
         deregister_active_task!(store, task_info.id)
+        deregister_active_task_info!(store, task_info.id)
         set_task!(store, task_info.id, task_info)
         return task_info
     end
@@ -38,6 +40,7 @@ function _fail_task!(store::AbstractWorkerStore, task_info::TaskInfo, message::S
         task_info.sys_task = nothing
         task_info.status = FAILED
         deregister_active_task!(store, task_info.id)
+        deregister_active_task_info!(store, task_info.id)
         set_task!(store, task_info.id, task_info)
         return task_info
     end
@@ -50,6 +53,7 @@ function _cancel_task!(store::AbstractWorkerStore, task_info::TaskInfo; message:
         task_info.sys_task = nothing
         task_info.status = CANCELLED
         deregister_active_task!(store, task_info.id)
+        deregister_active_task_info!(store, task_info.id)
         set_task!(store, task_info.id, task_info)
         return task_info
     end
@@ -70,6 +74,7 @@ function _execute_queued_task(store::AbstractWorkerStore, item::QueueItem)
     task_info.started_at = current_time_utc()
     task_info.sys_task = current_task()
     register_active_task!(store, task_info.id, current_task())
+    register_active_task_info!(store, task_info.id, task_info)
     set_task!(store, task_info.id, task_info)
 
     max_attempts = item.options.retry_on_failure ? item.options.max_retries : 0

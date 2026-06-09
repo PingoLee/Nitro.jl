@@ -18,17 +18,21 @@ The worker system supports both volatile in-memory queues and persistent databas
 - **`PormGWorkerStore`**: Persistent store in `ext/NitroPormGExt.jl`.
 - **Volatile execution handles**: Running `Task` objects stay in `active_tasks::Dict{UUID, Task}`; metadata lives in the store.
 - **Queue authorization hooks**: Optional `queue_authorizer(queue_name, user_id)::Bool`.
-- **Watchers**: Tasks have `user_id` and `watchers`; APIs validate access when `user_id` is supplied.
+- **Watchers**: Task submissions register the submitting `user_id` as a watcher. Read/manage APIs validate watcher access when `user_id` is supplied.
 
 ## 2. Task API
 
-Task submission requires `user_id`. Read/manage APIs accept `user_id` and enforce watcher-based access (`AuthorizationError` when denied).
+Task submission requires `user_id`. Read/manage APIs accept optional `user_id`.
+Passing a non-empty `user_id` enforces watcher-based access (`AuthorizationError` when denied). Omitting `user_id` is a deliberate system/public-endpoint bypass for routes that intentionally expose shared task visibility, not the default for user-scoped APIs.
 
 ```julia
 task_id = submit_task("default_queue", () -> work(), "user_123")
 task = get_task_status(task_id, "user_123")
 cancel_task(task_id, "user_123")
 user_tasks = get_all_tasks(nothing, "user_123")
+
+# System/public endpoint bypass, only when the app intentionally allows it:
+public_status = get_task_status(task_id)
 ```
 
 ## 3. Database Persistence
