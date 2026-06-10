@@ -11,6 +11,10 @@ using ..ExtractIPMiddleware: ExtractIP
 
 export RateLimiter
 
+# Response returned when the limiter fails closed (its default). Built fresh per
+# call so callers can't mutate a shared response object's headers.
+SERVICE_UNAVAILABLE() = HTTP.Response(503, "Service Unavailable")
+
 function RateLimiter(;strategy::Symbol = :fixed_window, kwargs...)
     kwargs_dict = Dict(kwargs)
 
@@ -62,11 +66,14 @@ This implementation uses UTC time to avoid timezone and DST issues. Significant 
 An `LifecycleMiddleware` struct containing the middleware function and a cleanup function to stop the background task on server shutdown.
 """
 function FixedRateLimiter(;
-    rate_limit          :: Int = 100, 
-    window              :: Period = Minute(1), 
-    cleanup_period      :: Period = Minute(10), 
+    rate_limit          :: Int = 100,
+    window              :: Period = Minute(1),
+    cleanup_period      :: Period = Minute(10),
     cleanup_threshold   :: Period = Minute(10),
     auto_extract_ip     :: Bool = true,
+    trust_forwarded     :: Bool = false,
+    trusted_proxies     :: Union{Nothing, Vector{<:IPAddr}} = nothing,
+    fail_open           :: Bool = false,
     exempt_paths        :: Vector{String} = String[])
 
     # Validate parameters
@@ -182,15 +189,18 @@ function FixedRateLimiter(;
 
             catch error
                 @error "Fixed Rate limiter error" exception=(error, catch_backtrace())
-                # Always process the incoming request even if our rate limiting fails
-                return handle(req)
+                # Fail closed by default: a bug or attacker-triggered error in the
+                # limiter must not become a way to bypass the limit. Operators can
+                # opt into fail-open (prioritising availability) via `fail_open=true`.
+                fail_open && return handle(req)
+                return SERVICE_UNAVAILABLE()
             end
         end
     end
 
     # If auto_extract_ip is true, then we'll use this composed version of the middleware
     function extract_ip_and_rate_limit(handle::Function) :: Function
-        reduce(|>, [handle, rate_limit_only, ExtractIP()])
+        reduce(|>, [handle, rate_limit_only, ExtractIP(; trust_forwarded, trusted_proxies)])
     end
 
     return LifecycleMiddleware(;
@@ -235,7 +245,10 @@ function SlidingRateLimiter(;
     window          :: Period = Minute(1),
     max_clients     :: Int = 10000,
     exempt_paths    :: Vector{String} = String[],
-    auto_extract_ip :: Bool = true)
+    auto_extract_ip :: Bool = true,
+    trust_forwarded :: Bool = false,
+    trusted_proxies :: Union{Nothing, Vector{<:IPAddr}} = nothing,
+    fail_open       :: Bool = false)
 
     # Validate parameters
     rate_limit > 0 || throw(ArgumentError("rate_limit must be positive, got $rate_limit"))
@@ -302,15 +315,17 @@ function SlidingRateLimiter(;
                 
             catch error
                 @error "Sliding Window Rate limiter error" exception=(error, catch_backtrace())
-                # Always proceed on middleware errors to maintain service availability
-                return handle(req)
+                # Fail closed by default so a limiter error can't be used to bypass
+                # the limit; set `fail_open=true` to prioritise availability instead.
+                fail_open && return handle(req)
+                return SERVICE_UNAVAILABLE()
             end
         end
     end
 
     # Compose with IP extraction if auto_extract_ip is enabled
     function extract_ip_and_rate_limit(handle::Function)
-        return reduce(|>, [handle, rate_limit_only, ExtractIP()])
+        return reduce(|>, [handle, rate_limit_only, ExtractIP(; trust_forwarded, trusted_proxies)])
     end
 
     return auto_extract_ip ? extract_ip_and_rate_limit : rate_limit_only

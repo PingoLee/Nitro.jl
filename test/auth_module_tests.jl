@@ -3,6 +3,8 @@
 using Test
 using HTTP
 using Nitro
+using Base64
+using JSON
 import Nitro.Auth: PasswordValidator, validate
 import Nitro.Auth: encode, matches, upgrade_encoding, PBKDF2PasswordEncoder, BCryptPasswordEncoder,
     DelegatingPasswordEncoder, SpringSecurityPBKDF2PasswordEncoder
@@ -43,6 +45,34 @@ end
 
     expired = Nitro.Auth.encode_jwt(Dict("sub" => "42", "exp" => NOW_TS - 120), "secret-a")
     @test_throws Nitro.Auth.AuthError Nitro.Auth.decode_jwt(expired, "secret-a")
+
+    # A token without an exp claim is accepted by default only as a short-lived
+    # access token bounded by iat + 15 minutes.
+    no_exp = Nitro.Auth.encode_jwt(Dict("sub" => "42"), "secret-a")
+    @test Nitro.Auth.decode_jwt(no_exp, "secret-a")["sub"] == "42"
+
+    old_no_exp = Nitro.Auth.encode_jwt(Dict("sub" => "42", "iat" => NOW_TS - 901), "secret-a")
+    @test_throws Nitro.Auth.AuthError Nitro.Auth.decode_jwt(old_no_exp, "secret-a"; iat_skew=0)
+
+    # Apps can require an explicit exp claim, or choose a longer fallback max age.
+    @test_throws Nitro.Auth.AuthError Nitro.Auth.decode_jwt(no_exp, "secret-a"; require_exp=true)
+    @test Nitro.Auth.decode_jwt(no_exp, "secret-a"; exp_timeout=3600)["sub"] == "42"
+
+    # Explicit exp remains authoritative and is not capped by the default iat fallback.
+    explicit_exp = Nitro.Auth.encode_jwt(Dict("sub" => "42", "iat" => NOW_TS - 1200, "exp" => NOW_TS + 3600), "secret-a")
+    @test Nitro.Auth.decode_jwt(explicit_exp, "secret-a"; iat_skew=0)["sub"] == "42"
+
+    # A token with neither exp nor iat has no secure lifetime anchor.
+    b64json(data) = replace(replace(replace(Base64.base64encode(Vector{UInt8}(codeunits(JSON.json(data)))), '+' => '-'), '/' => '_'), '=' => "")
+    missing_iat = string(b64json(Dict("alg" => "HS256", "typ" => "JWT")), ".", b64json(Dict("sub" => "42")), ".")
+    @test_throws Nitro.Auth.AuthError Nitro.Auth.decode_jwt(missing_iat, "secret-a"; verify=false)
+
+    # encode_jwt(expires_in=...) stamps an exp so the token is time-bounded.
+    ttl_token = Nitro.Auth.encode_jwt(Dict("sub" => "42"), "secret-a"; expires_in=3600)
+    @test Nitro.Auth.decode_jwt(ttl_token, "secret-a")["sub"] == "42"
+
+    short_lived = Nitro.Auth.encode_jwt(Dict("sub" => "42"), "secret-a"; expires_in=-120)
+    @test_throws Nitro.Auth.AuthError Nitro.Auth.decode_jwt(short_lived, "secret-a")
 end
 
 @testset "Password helpers" begin
@@ -222,8 +252,11 @@ end
 
     @test upgrade_encoding(delegating, pbkdf2_hash) == false
 
+    # An unrecognized hash format must never authenticate via a plaintext
+    # comparison: it warns and returns false (no plaintext fallback).
     plain_text = "password123"
-    @test_logs (:warn, r"Unknown hash format") matches(delegating, plain_text, plain_text)
+    @test_logs (:warn, r"Unknown or unsupported password hash format") matches(delegating, plain_text, plain_text)
+    @test matches(delegating, plain_text, plain_text) == false
 end
 
 @testset "Cross-Encoder Compatibility" begin

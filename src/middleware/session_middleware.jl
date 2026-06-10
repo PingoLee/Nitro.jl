@@ -7,6 +7,7 @@ using UUIDs
 using ...Types: AbstractSessionStore, MemoryStore, SessionPayload, Nullable
 using ...Types: CookieConfig
 using ...Cookies: get_cookie, set_cookie!, storesession!, prunesessions!, regenerate_session!
+using ...Crypto: secure_uuid4
 
 export SessionMiddleware
 
@@ -98,7 +99,7 @@ function _get_session_id(req::HTTP.Request, cookie_name::String)
 end
 
 function _generate_session_id()
-    return string(UUIDs.uuid4())
+    return string(secure_uuid4())
 end
 
 function _load_session(store::AbstractSessionStore{String, Dict{String,Any}}, session_id::Nullable{String})

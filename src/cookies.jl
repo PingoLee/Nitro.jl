@@ -6,7 +6,7 @@ using UUIDs
 using ..Types
 using ..Errors
 
-using ..Crypto: encrypt_payload, decrypt_payload
+using ..Crypto: encrypt_payload, decrypt_payload, secure_uuid4
 
 export parse_cookies, format_cookie, get_cookie, set_cookie!, load_cookie_settings!,
     storesession!, prunesessions!, regenerate_session!
@@ -767,7 +767,7 @@ function regenerate_session!(req::HTTP.Request, store::AbstractSessionStore{Stri
     old_id = get(req.context, :session_id, nothing)
     session_data = get(req.context, :session, Dict{String,Any}())
 
-    new_id = string(UUIDs.uuid4())
+    new_id = string(secure_uuid4())
 
     # Write current data under new ID
     set_session!(store, new_id, session_data; ttl=ttl)

@@ -357,7 +357,8 @@ end
     @test upgrade_encoding(delegating, pbkdf2_hash) == false
 
     plain_text = "password123"
-    @test_logs (:warn, r"Unknown hash format") matches(delegating, plain_text, plain_text)
+    @test_logs (:warn, r"Unknown or unsupported password hash format") matches(delegating, plain_text, plain_text)
+    @test matches(delegating, plain_text, plain_text) == false
   end
 
   @testset "Cross-Encoder Compatibility" begin

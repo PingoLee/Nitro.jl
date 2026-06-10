@@ -22,6 +22,8 @@ end
 
 _current_timestamp() = trunc(Int, Dates.datetime2unix(Dates.now(Dates.UTC)))
 
+const DEFAULT_JWT_MAX_AGE_SECONDS = 15 * 60
+
 function validate_iat(claims::AbstractDict; timeout::Int=300, skew::Int=30, now_ts::Int=_current_timestamp())
     iat = _claim_value(claims, "iat", nothing)
     iat === nothing && throw(AuthError("Missing iat claim"))
@@ -47,9 +49,17 @@ function _normalize_audience(value)
     return [string(value)]
 end
 
-function validate_claims(claims::AbstractDict; exp_timeout::Union{Int, Nothing}=nothing, iat_skew::Int=30, issuer=nothing, audience=nothing, now_ts::Int=_current_timestamp())
+function validate_claims(claims::AbstractDict; exp_timeout::Union{Int, Nothing}=DEFAULT_JWT_MAX_AGE_SECONDS, iat_skew::Int=30, issuer=nothing, audience=nothing, require_exp::Bool=false, now_ts::Int=_current_timestamp())
     exp = _claim_value(claims, "exp", nothing)
-    if exp !== nothing && now_ts > _claim_int(exp, "exp") + iat_skew
+    if exp === nothing
+        if require_exp
+            throw(AuthError("JWT missing required exp claim"))
+        end
+        exp_timeout === nothing && throw(AuthError("JWT missing exp claim and no fallback max age was configured"))
+        # A token without `exp` is still accepted, but only as a short-lived
+        # access token bounded by iat + exp_timeout.
+        validate_iat(claims; timeout=exp_timeout, skew=iat_skew, now_ts=now_ts)
+    elseif now_ts > _claim_int(exp, "exp") + iat_skew
         throw(AuthError("JWT expired"))
     end
 
@@ -63,9 +73,6 @@ function validate_claims(claims::AbstractDict; exp_timeout::Union{Int, Nothing}=
         issued_at = _claim_int(iat, "iat")
         if now_ts + iat_skew < issued_at
             throw(AuthError("JWT issued in the future"))
-        end
-        if exp_timeout !== nothing
-            validate_iat(claims; timeout=exp_timeout, skew=iat_skew, now_ts=now_ts)
         end
     end
 

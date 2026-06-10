@@ -1,6 +1,7 @@
 ﻿@testitem "Rate limiter" tags=[:middleware, :network, :slow] setup=[NitroCommon] begin
 using HTTP
 using Dates
+using Sockets
 using Nitro
 
 urlpatterns("/limited",
@@ -219,6 +220,68 @@ serve(middleware=[RateLimiter(rate_limit=10, window=Second(1), exempt_paths=["/e
     @test !HTTP.hasheader(r, "X-RateLimit-Limit")
     @test !HTTP.hasheader(r, "X-RateLimit-Remaining")
     @test !HTTP.hasheader(r, "X-RateLimit-Reset")
+end
+
+terminate()
+
+# ── Proxied-setup behavior ────────────────────────────────────────────────────
+# The limiter keys on the resolved client IP. These tests pin the two behaviors
+# of the secure-by-default IP extraction: forwarding headers are ignored unless
+# the operator trusts the proxy. The live server's socket peer is the loopback
+# address (HOST = "127.0.0.1"), which stands in for the reverse proxy.
+
+sleep(3.1) # ensure any prior window/cleanup state is gone
+
+# Default: no trust configured → X-Forwarded-For is IGNORED. Distinct forwarded
+# client IPs all collapse onto the proxy's socket IP and share a single bucket.
+serve(middleware=[RateLimiter(rate_limit=3, window=Second(5))], port=PORT, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
+
+@testset "Proxied: forwarding headers ignored by default (shared bucket)" begin
+    # Three requests, each claiming a different client IP, consume the SAME quota
+    # because the spoofable header is not trusted.
+    for i in 1:3
+        r = HTTP.get("$localhost/ok", ["X-Forwarded-For" => "203.0.113.$i"]; retry=false)
+        @test r.status == 200
+    end
+
+    # A fourth distinct "client" is still throttled — proof the bucket is shared
+    # across everyone behind the proxy.
+    try
+        HTTP.get("$localhost/ok", ["X-Forwarded-For" => "203.0.113.4"]; retry=false)
+        @test false
+    catch e
+        @test e isa HTTP.Exceptions.StatusError
+        @test e.response.status == 429
+    end
+end
+
+terminate()
+
+sleep(3.1)
+
+# Trusted proxy: when the socket peer is a configured trusted proxy, the limiter
+# honors X-Forwarded-For and buckets each forwarded client independently.
+serve(middleware=[RateLimiter(rate_limit=2, window=Second(5),
+        trusted_proxies=[ip"127.0.0.1", ip"::1"])],
+    port=PORT, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
+
+@testset "Proxied: trusted_proxies honors per-client X-Forwarded-For" begin
+    # Each distinct forwarded client gets its own bucket of `rate_limit` requests.
+    for client in ("203.0.113.10", "203.0.113.11", "203.0.113.12")
+        r1 = HTTP.get("$localhost/ok", ["X-Forwarded-For" => client]; retry=false)
+        @test r1.status == 200
+        r2 = HTTP.get("$localhost/ok", ["X-Forwarded-For" => client]; retry=false)
+        @test r2.status == 200
+
+        # The 3rd request for the SAME client exceeds its own limit of 2.
+        try
+            HTTP.get("$localhost/ok", ["X-Forwarded-For" => client]; retry=false)
+            @test false
+        catch e
+            @test e isa HTTP.Exceptions.StatusError
+            @test e.response.status == 429
+        end
+    end
 end
 
 terminate()

@@ -194,7 +194,7 @@ const DEFAULT_COMMON_PASSWORDS = Set([
 const GLOBAL_PASSWORD_ENCODER = Ref{DelegatingPasswordEncoder}(DelegatingPasswordEncoder())
 
 function _generate_salt(length::Int=22)
-    raw = rand(UInt8, length)
+    raw = secure_random_bytes(length)
     encoded = Base64.base64encode(raw)
     safe = replace(replace(encoded, '+' => '.'), '/' => '_')
     return safe[1:min(length, lastindex(safe))]
@@ -358,7 +358,7 @@ end
 
 function encode(encoder::SpringSecurityPBKDF2PasswordEncoder, password::AbstractString)
     isempty(password) && throw(ArgumentError("Password cannot be empty"))
-    salt_bytes = rand(UInt8, encoder.salt_length)
+    salt_bytes = secure_random_bytes(encoder.salt_length)
     salt_b64 = Base64.base64encode(salt_bytes)
     derived = _pbkdf2_sha256(password, String(salt_b64), encoder.iterations; key_length=encoder.key_length)
     hash_b64 = Base64.base64encode(derived)
@@ -407,8 +407,11 @@ function matches(encoder::DelegatingPasswordEncoder, password::AbstractString, e
     elseif startswith(encoded, "\$2a\$") || startswith(encoded, "\$2b\$") || startswith(encoded, "\$2y\$")
         return matches(get(encoder.encoders, "bcrypt", BCryptPasswordEncoder()), password, encoded)
     end
-    @warn "Unknown hash format. Password may be stored in plain text." maxlog=1
-    return _constant_time_equals(password, encoded)
+    # Security: never fall back to comparing the supplied password against the
+    # stored value as plaintext. An unknown/corrupted hash format must fail to
+    # match rather than risk authenticating a plaintext-stored credential.
+    @warn "Unknown or unsupported password hash format; refusing to match. Re-hash with a supported encoder." maxlog=1
+    return false
 end
 
 function upgrade_encoding(encoder::DelegatingPasswordEncoder, encoded_hash::AbstractString)

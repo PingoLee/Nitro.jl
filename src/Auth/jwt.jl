@@ -12,7 +12,10 @@ end
 
 function _json_dict(data)
     if data isa AbstractDict
-        return Dict(string(key) => value for (key, value) in pairs(data))
+        # Widen to `Any` values so we can always stamp integer `iat`/`exp`
+        # claims, even when the caller passed a string-only payload (which would
+        # otherwise infer a narrow `Dict{String,String}`).
+        return Dict{String, Any}(string(key) => value for (key, value) in pairs(data))
     end
     throw(ArgumentError("JWT payload must be a dictionary"))
 end
@@ -64,11 +67,16 @@ function _constant_time_equals(left::Vector{UInt8}, right::Vector{UInt8})
     return diff == 0
 end
 
-function encode_jwt(payload::AbstractDict, secret_or_keyset; kid=nothing)
+function encode_jwt(payload::AbstractDict, secret_or_keyset; kid=nothing, expires_in::Union{Int, Nothing}=nothing)
     header = Dict("alg" => "HS256", "typ" => "JWT")
     claims = _json_dict(payload)
     if !haskey(claims, "iat")
         claims["iat"] = _current_timestamp()
+    end
+    # Stamp an expiration when a TTL is requested and the caller didn't set one
+    # explicitly, so issued tokens are time-bounded by default.
+    if expires_in !== nothing && !haskey(claims, "exp")
+        claims["exp"] = _claim_int(claims["iat"], "iat") + expires_in
     end
 
     secret, resolved_kid = _resolve_secret(secret_or_keyset, kid)
@@ -84,7 +92,7 @@ function encode_jwt(payload::AbstractDict, secret_or_keyset; kid=nothing)
     return string(signing_input, ".", signature)
 end
 
-function decode_jwt(token::AbstractString, secret_or_keyset; issuer=nothing, audience=nothing, exp_timeout::Union{Int, Nothing}=nothing, iat_skew::Int=30, verify::Bool=true, with_kid::Bool=false)
+function decode_jwt(token::AbstractString, secret_or_keyset; issuer=nothing, audience=nothing, exp_timeout::Union{Int, Nothing}=DEFAULT_JWT_MAX_AGE_SECONDS, iat_skew::Int=30, verify::Bool=true, with_kid::Bool=false, require_exp::Bool=false)
     segments = split(String(token), '.')
     length(segments) == 3 || throw(AuthError("Invalid JWT format"))
 
@@ -100,6 +108,6 @@ function decode_jwt(token::AbstractString, secret_or_keyset; issuer=nothing, aud
         kid = resolved_kid
     end
 
-    validate_claims(claims; exp_timeout=exp_timeout, iat_skew=iat_skew, issuer=issuer, audience=audience)
+    validate_claims(claims; exp_timeout=exp_timeout, iat_skew=iat_skew, issuer=issuer, audience=audience, require_exp=require_exp)
     return with_kid ? (claims, kid) : claims
 end

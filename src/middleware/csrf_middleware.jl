@@ -2,11 +2,11 @@ module CSRFMiddleware_
 
 using HTTP
 using SHA
-using Random
 using Base64
 
 using ...Types: CookieConfig, Nullable
 using ...Cookies: get_cookie, set_cookie!
+using ...Crypto: secure_random_bytes
 using ...Res: json
 
 export CSRFMiddleware, issue_csrf_token!, validate_csrf_token
@@ -24,8 +24,22 @@ function _csrf_signature(secret::String, token::AbstractString)
     return _base64url_encode(signature)
 end
 
+# Compare two strings without an early-exit, so attackers can't recover the
+# expected signature/token byte-by-byte from response timing. The length check
+# itself is not secret (token lengths are fixed and public).
+function _constant_time_equals(left::AbstractString, right::AbstractString)
+    left_bytes = codeunits(left)
+    right_bytes = codeunits(right)
+    length(left_bytes) == length(right_bytes) || return false
+    diff = UInt8(0)
+    @inbounds for index in eachindex(left_bytes)
+        diff |= xor(left_bytes[index], right_bytes[index])
+    end
+    return diff == 0
+end
+
 function _generate_raw_token()
-    return _base64url_encode(rand(UInt8, 32))
+    return _base64url_encode(secure_random_bytes(32))
 end
 
 function _signed_token(secret::String, raw_token::String)
@@ -85,11 +99,11 @@ function validate_csrf_token(req::HTTP.Request, secret::String; cookie_name::Str
 
     raw_token, signature = _parse_signed_token(cookie_value)
     raw_token === nothing && return false
-    signature == _csrf_signature(secret, raw_token) || return false
+    _constant_time_equals(signature, _csrf_signature(secret, raw_token)) || return false
 
     presented = _presented_token(req, header_name, form_field)
     presented === nothing && return false
-    return presented == raw_token || presented == cookie_value
+    return _constant_time_equals(presented, raw_token) || _constant_time_equals(presented, cookie_value)
 end
 
 function CSRFMiddleware(secret::String; cookie_name::String="csrf_token", header_name::String="X-CSRF-Token", form_field::String="_csrf", ttl::Int=3600, config::CookieConfig=CookieConfig(httponly=false, secure=true, samesite="Lax", path="/", maxage=ttl))

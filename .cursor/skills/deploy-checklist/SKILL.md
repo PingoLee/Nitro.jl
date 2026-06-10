@@ -44,6 +44,16 @@ If the user uses nginx (or similar) in front of Nitro:
 - [ ] `proxy_pass` to the Nitro listen address (e.g. `http://127.0.0.1:8080`).
 - [ ] SPA history fallback: `try_files $uri $uri/ /index.html;` for the frontend root.
 - [ ] WebSocket upgrade headers if the app uses Nitro websockets.
+- [ ] **Client IP / rate limiting behind a proxy.** `ExtractIP` and `RateLimiter`
+      ignore forwarding headers (`X-Forwarded-For`, `X-Real-IP`, `CF-Connecting-IP`,
+      `True-Client-IP`) by **default** — they cannot be trusted from arbitrary
+      clients. Behind a reverse proxy this means every client collapses onto the
+      proxy's socket IP and shares one rate-limit bucket. Configure the trusted
+      proxy so per-client limits work again:
+      `RateLimiter(...; trusted_proxies=[ip"127.0.0.1"])` (honor headers only when
+      the peer is a listed proxy — preferred), or `trust_forwarded=true` (trust any
+      peer; only when clients cannot reach Nitro directly). Make the proxy set
+      `X-Forwarded-For`/`X-Real-IP`.
 
 Provide a minimal config snippet only when asked; do not overwrite existing infra files without confirmation.
 

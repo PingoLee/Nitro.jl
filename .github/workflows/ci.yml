@@ -31,6 +31,13 @@ jobs:
         threads: [1, 2]
     steps:
       - uses: actions/checkout@v4
+      # PormG is a path dependency (`[sources] PormG = {path = "../PormG.jl"}`)
+      # and a hard test dependency, so it must exist alongside this checkout for
+      # `Pkg.test()` to resolve. checkout@v4 won't write outside the workspace,
+      # so clone it as a sibling directly.
+      - name: Check out PormG.jl (sibling path dependency)
+        shell: bash
+        run: git clone --depth 1 https://github.com/PingoLee/PormG.jl.git ../PormG.jl
       - uses: julia-actions/setup-julia@v2
         with:
           version: ${{ matrix.version }}

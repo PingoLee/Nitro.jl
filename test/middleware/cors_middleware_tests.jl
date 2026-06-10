@@ -27,12 +27,6 @@ urlpatterns("/multicors",
         middleware=[Cors(allowed_origins=["https://app.example.com", "https://admin.example.com"], allow_credentials=true)]),
 )
 
-# Wildcard + credentials — must echo request origin, not "*"
-urlpatterns("/wildcred",
-    path("/open", function() return "wildcred" end, methods=["GET", "OPTIONS"],
-        middleware=[Cors(allowed_origins=["*"], allow_credentials=true)]),
-)
-
 serve(port=port, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
 
 @testset "CORS Middleware Tests" begin
@@ -94,17 +88,17 @@ end
     @test HTTP.header(r, "Vary") == "Origin"
 end
 
-@testset "Wildcard + Credentials CORS" begin
-    # Must echo the request origin, not "*"
-    r = HTTP.request("OPTIONS", "$localhost/wildcred/open",
-        ["Origin" => "https://any-site.example.com"])
-    @test HTTP.header(r, "Access-Control-Allow-Origin") == "https://any-site.example.com"
-    @test HTTP.header(r, "Access-Control-Allow-Credentials") == "true"
-    @test HTTP.header(r, "Vary") == "Origin"
+@testset "Wildcard + Credentials is rejected at construction" begin
+    # Reflecting an arbitrary Origin alongside credentials would let any site
+    # make credentialed cross-origin requests, so this combination must throw
+    # rather than silently echo the request Origin.
+    @test_throws ArgumentError Cors(allowed_origins=["*"], allow_credentials=true)
 
-    # Without Origin header, falls back to "*"
-    r = HTTP.request("OPTIONS", "$localhost/wildcred/open")
-    @test HTTP.header(r, "Access-Control-Allow-Origin") == "*"
+    # Wildcard without credentials is still fine.
+    @test Cors(allowed_origins=["*"], allow_credentials=false) isa Function
+
+    # Credentials with explicit origins is fine.
+    @test Cors(allowed_origins=["https://example.com"], allow_credentials=true) isa Function
 end
 
 terminate()

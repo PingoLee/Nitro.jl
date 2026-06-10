@@ -94,8 +94,16 @@ function parseparam(::Type{Char}, str::String; escape=true)
     return first(value)
 end
 
+# Upper bound on the length of a URL-supplied pattern compiled into a `Regex`
+# path parameter. Compiling (and later matching) an attacker-controlled regex is
+# a ReDoS vector; legitimate route patterns are short, so cap the input.
+const MAX_REGEX_PARAM_LENGTH = 256
+
 function parseparam(::Type{Regex}, str::String; escape=true)
     value = escape ? HTTP.unescapeuri(str) : str
+    if ncodeunits(value) > MAX_REGEX_PARAM_LENGTH
+        throw(ValidationError("Regex path parameter exceeds maximum length of $MAX_REGEX_PARAM_LENGTH bytes"))
+    end
     return Regex(value)
 end
 
@@ -150,9 +158,13 @@ function format_response!(req::HTTP.Request, resp::HTTP.Response)
 end
 
 function format_response!(req::HTTP.Request, content::AbstractString)
-    # Dynamically determine the content type when given a string
+    # Security: serve raw string returns as text/plain. We must NOT content-sniff
+    # here — `HTTP.sniff` would classify an attacker-influenced string that looks
+    # like markup as text/html, turning a reflected value into stored/reflected
+    # XSS. Handlers that intentionally return HTML/JS/etc. must opt in explicitly
+    # via the `Res.html`, `Res.js`, ... helpers, which set the type themselves.
     body = string(content)
-    HTTP.setheader(req.response, "Content-Type" => HTTP.sniff(body))
+    HTTP.setheader(req.response, "Content-Type" => "text/plain; charset=utf-8")
     HTTP.setheader(req.response, "Content-Length" => string(sizeof(body)))
 
     req.response.status = 200

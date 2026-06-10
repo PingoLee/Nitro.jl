@@ -17,8 +17,11 @@ When multiple origins are configured, this middleware checks the incoming
 Origin` header is added so that caches do not serve a response keyed to one
 origin for a different one.
 
-When `allow_credentials=true`, the wildcard `*` is not permitted by browsers,
-so the middleware always falls back to per-request origin matching in that case.
+When `allow_credentials=true`, a wildcard origin (`*`) is rejected at
+construction time with an `ArgumentError`: browsers forbid credentialed
+requests against `Access-Control-Allow-Origin: *`, and reflecting an arbitrary
+Origin alongside credentials would expose responses to any website. Specify the
+explicit origins you trust in `allowed_origins` instead.
 
 # Keyword Arguments
 
@@ -50,9 +53,20 @@ function Cors(;
     needs_dynamic  = !is_wildcard && !is_single
     origin_set     = Set(allowed_origins)
 
-    # When credentials are enabled the browser rejects "*", so we must
-    # always resolve against the request even for a single-origin list.
-    force_dynamic  = allow_credentials && is_wildcard
+    # Security: a wildcard origin combined with credentials is forbidden. The
+    # only way to satisfy it is to reflect the request's Origin back together
+    # with `Access-Control-Allow-Credentials: true`, which lets ANY site make
+    # credentialed cross-origin requests and read the responses. Reject it at
+    # construction time so the misconfiguration can't ship.
+    if allow_credentials && is_wildcard
+        throw(ArgumentError(
+            "CORS misconfiguration: allow_credentials=true cannot be combined with a " *
+            "wildcard origin (\"*\"). Browsers forbid credentialed requests against " *
+            "`Access-Control-Allow-Origin: *`, and reflecting an arbitrary Origin with " *
+            "credentials exposes responses to any website. List the explicit origins you " *
+            "trust in `allowed_origins` instead."
+        ))
+    end
 
     # Pre-build the headers that are the same for every response.
     static_headers :: Vector{Pair{String, String}} = [
@@ -72,7 +86,7 @@ function Cors(;
 
     # Fast path: single allowed origin OR wildcard without credentials.
     # The origin header value never changes, so we can freeze it once.
-    if !needs_dynamic && !force_dynamic
+    if !needs_dynamic
         origin_value = is_wildcard ? "*" : allowed_origins[1]
         frozen_headers = vcat(["Access-Control-Allow-Origin" => origin_value], static_headers)
 
@@ -93,25 +107,16 @@ function Cors(;
         end
     end
 
-    # Dynamic path: multiple origins, or wildcard + credentials.
-    # Resolve the correct origin on every request.
+    # Dynamic path: multiple explicit origins. Echo the request's Origin back
+    # only when it is in the allow-list; otherwise omit Allow-Origin so the
+    # browser blocks the response cleanly.
     return function(handle::Function)
         return function(req::HTTP.Request)
             request_origin = HTTP.header(req, "Origin", "")
             headers = copy(static_headers)
 
-            if force_dynamic
-                # Credentials + wildcard: echo any origin back.
-                if !isempty(request_origin)
-                    push!(headers, "Access-Control-Allow-Origin" => request_origin)
-                else
-                    push!(headers, "Access-Control-Allow-Origin" => "*")
-                end
-            elseif request_origin in origin_set
+            if request_origin in origin_set
                 push!(headers, "Access-Control-Allow-Origin" => request_origin)
-            else
-                # Origin not in allowed list — still attach headers without
-                # Allow-Origin so the browser blocks the response cleanly.
             end
 
             push!(headers, "Vary" => "Origin")
