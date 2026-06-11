@@ -4,7 +4,6 @@ description: >-
   Pre-production checklist for Nitro.jl apps: env/secrets, Project.toml deps,
   extensions, nginx SPA proxy, tests, and optional formatting. Use before deploy
   or when the user asks to prepare for production.
-disable-model-invocation: true
 ---
 
 # Production Deploy Checklist
@@ -13,14 +12,14 @@ Run this as a **read-only audit** first; implement fixes only when the user asks
 
 Applies to **applications built on Nitro.jl**. For changes to the Nitro package itself, focus on steps 2, 4, and 6 (deps, CI, tests).
 
-Read `nitro-config.mdc` for config ownership rules before recommending structure changes.
+Read `nitro-config.instructions.md` for config ownership rules before recommending structure changes.
 
 ## 1. Environment and secrets
 
 - [ ] Production config does not rely on committed secrets.
 - [ ] Session/crypto secrets (`SECRET_KEY`, cookie keys, JWT secrets) come from environment or a non-committed local file.
 - [ ] Debug/dev-only flags are off in production (no verbose error leakage to clients).
-- [ ] Worker and DB connection strings use the correct env for the target (`nitro-config.mdc`).
+- [ ] Worker and DB connection strings use the correct env for the target (`nitro-config.instructions.md`).
 
 Report missing env vars by name; do not invent secret values.
 
@@ -32,10 +31,10 @@ Report missing env vars by name; do not invent secret values.
 
 ## 3. Nitro runtime pipeline
 
-- [ ] `serve(urlpatterns; middleware=[...])` order: global middleware → defaults → router (`nitro-core.mdc`).
+- [ ] `serve(urlpatterns; middleware=[...])` order: global middleware → defaults → router (`nitro-core.instructions.md`).
 - [ ] `SessionMiddleware` / `CSRFMiddleware` present for stateful cookie apps.
 - [ ] `spafiles` or static config matches how the frontend is served in production.
-- [ ] Worker `startup(..., store=..., recover_zombies=...)` configured if background queues are used (`workers.mdc`).
+- [ ] Worker `startup(..., store=..., recover_zombies=...)` configured if background queues are used (`workers.instructions.md`).
 
 ## 4. Reverse proxy (when requested)
 

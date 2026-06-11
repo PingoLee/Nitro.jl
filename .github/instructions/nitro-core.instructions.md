@@ -1,7 +1,6 @@
 ---
 description: Nitro.jl core architecture — philosophy, concurrency, routing, security, PormG isolation, quality standards
-globs: "**/*.jl"
-alwaysApply: false
+applyTo: "**/*.jl"
 ---
 
 # Nitro.jl Core Architecture & Implementation Rules
@@ -45,4 +44,3 @@ Whenever you write code, write tests, or propose architecture for this repositor
 ## 7. Quality Standards
 - **Testing**: Any new feature or bug fix must have a corresponding test in `test/`. Use `Pkg.test()` for verification.
 - **Type Stability**: Crucial for high-throughput HTTP handling. Avoid `Any` types in internal request pipelines. Use `Nullable{T}` over `Union{T, Missing}` for internal types.
-

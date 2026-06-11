@@ -1,6 +1,9 @@
 ---
-description: Nitro.jl review checkpoints — active subsystems, rule index, and diff-review surface areas
-alwaysApply: false
+name: project-guidelines
+description: >-
+  Nitro.jl review checkpoints, rule index, and diff-review surface areas.
+  Use at the start of a changed-code review or large refactor so heuristics
+  match the current codebase layout.
 ---
 
 # Nitro.jl Project Guidelines (Review Index)
@@ -11,10 +14,10 @@ Read this file at the start of a **changed-code review** or large refactor so he
 
 | Area | Rule file | When it applies |
 |------|-----------|-----------------|
-| Core framework (`src/`, handlers, routing, middleware) | `nitro-core.mdc` | All `*.jl` under the package |
-| App config & bootstrap (no `Nitro.config` singleton) | `nitro-config.mdc` | Application design and `serve` setup |
-| Documentation (`docs/`) | `nitro-docs.mdc` | Tutorial and API docs |
-| Workers + PormG worker ext | `workers.mdc` | `src/Workers/`, `ext/NitroPormGExt.jl`, worker tests |
+| Core framework (`src/`, handlers, routing, middleware) | `nitro-core.instructions.md` | All `*.jl` under the package |
+| App config & bootstrap (no `Nitro.config` singleton) | `nitro-config.instructions.md` | Application design and `serve` setup |
+| Documentation (`docs/`) | `nitro-docs.instructions.md` | Tutorial and API docs |
+| Workers + PormG worker ext | `workers.instructions.md` | `src/Workers/`, `ext/NitroPormGExt.jl`, worker tests |
 
 ## Package layout (review slices)
 
@@ -35,7 +38,7 @@ Review diffs in this order when using the `changed-code-review` skill:
 - **DB isolation**: no `PormG` import in `src/`; worker persistence only via `ext/NitroPormGExt.jl`.
 - **Workers**: `user_id` / watchers on task APIs; `AbstractWorkerStore` for new storage features.
 - **Tests**: run `Pkg.test()`; new behavior needs coverage under `test/`.
-- **Docs**: examples must match current routing and generic model names (`nitro-docs.mdc`).
+- **Docs**: examples must match current routing and generic model names (`nitro-docs.instructions.md`).
 
 ## Skills (explicit invocation)
 

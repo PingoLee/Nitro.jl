@@ -4,7 +4,6 @@ description: >-
   Review changed code before push or PR by reading git diff in ordered slices
   for src/Workers, core src/, ext/, test/, and remaining paths, then report
   bugs, security issues, regressions, and missing coverage in Nitro.jl.
-disable-model-invocation: true
 ---
 
 # Changed Code Review
@@ -126,7 +125,7 @@ In the final pass, review `docs/`, `.github/workflows/`, `Project.toml`, and roo
 
 ## Review Method
 
-1. Read `.cursor/rules/project-guidelines.mdc` for the rule index and active checkpoints.
+1. Read the `project-guidelines` skill (`.github/skills/project-guidelines/SKILL.md`) for the rule index and active checkpoints.
 2. Identify the changed file set with `git diff --name-only` (or `git diff HEAD --name-only` for all local).
 3. Read the `src/Workers` slice first when present.
 4. Read the core `src/` slice (excluding Workers) for routing, middleware, and extractors.
@@ -137,7 +136,7 @@ In the final pass, review `docs/`, `.github/workflows/`, `Project.toml`, and roo
 
 ## Project-Specific Heuristics
 
-Always re-read `.cursor/rules/project-guidelines.mdc` (step 1) so newly active rules are included. Permanent baselines:
+Always re-read the `project-guidelines` skill (step 1) so newly active rules are included. Permanent baselines:
 
 - Flag any `import PormG` or DB access in `src/` (belongs in `ext/NitroPormGExt.jl` only)
 - Flag macro routing (`@get`, `@post`, etc.) or `serveparallel()` in code or docs
@@ -147,7 +146,7 @@ Always re-read `.cursor/rules/project-guidelines.mdc` (step 1) so newly active r
 - Flag serializing or persisting live `Task` objects
 - Flag new public exports in `src/Nitro.jl` without doc/test consideration
 - Flag `SessionMiddleware`/`CSRFMiddleware` changes that break SPA cookie/CSRF assumptions documented in `docs/`
-- Flag docs using domain-specific production models instead of generic examples (`nitro-docs.mdc`)
+- Flag docs using domain-specific production models instead of generic examples (`nitro-docs.instructions.md`)
 - Flag missing tests for authorization, validation, or store edge cases
 
 ## After Reporting Findings

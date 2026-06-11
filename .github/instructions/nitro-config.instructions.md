@@ -1,7 +1,6 @@
 ---
 description: Nitro.jl app configuration — no framework singleton, typed app config, bootstrap order, secrets
-globs: "**/*.jl"
-alwaysApply: false
+applyTo: "**/*.jl"
 ---
 
 # Nitro.jl Configuration & Bootstrap
@@ -36,4 +35,3 @@ When designing configuration, bootstrapping applications, or proposing developer
 - Document one recommended app bootstrap pattern in docs when touching tutorials.
 - Config must be swappable in tests without mutating framework-global state.
 - Support multiple Nitro apps in one Julia process or test suite.
-

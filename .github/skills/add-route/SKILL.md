@@ -4,12 +4,11 @@ description: >-
   Add a Nitro.jl API route end-to-end: handler, path() registration, guards,
   tests, and Pkg.test(). Use when the user asks for a new endpoint, route, or
   handler in Nitro.jl or a Nitro-based app.
-disable-model-invocation: true
 ---
 
 # Add Route Workflow
 
-Implementation workflow (not a review). Follow `nitro-core.mdc` and `nitro-docs.mdc` throughout.
+Implementation workflow (not a review). Follow `nitro-core.instructions.md` and `nitro-docs.instructions.md` throughout.
 
 ## Scope
 
@@ -18,7 +17,7 @@ Implementation workflow (not a review). Follow `nitro-core.mdc` and `nitro-docs.
 | **Nitro.jl package** | `src/` or existing handler modules; often inline in `test/` for behavior tests | `urlpatterns` in the relevant test file or example |
 | **Application using Nitro** | `src/Handlers/<Domain>Handlers.jl` | `src/Routes.jl` (or `src/Routes/*.jl`) via `path()` / `include_routes()` |
 
-Follow routing and response rules from `nitro-core.mdc`.
+Follow routing and response rules from `nitro-core.instructions.md`.
 
 ## Steps
 
@@ -40,18 +39,18 @@ path("/api/items/<int:id>", ItemHandlers.get_item, method="GET")
 ### 3. Guards and middleware
 
 - Auth required? Add `guards=[login_required()]` (and `role_required` / `permission_required` if needed).
-- Mutations with cookies/session? Ensure `SessionMiddleware` and `CSRFMiddleware` are in the app pipeline (`nitro-core.mdc`).
+- Mutations with cookies/session? Ensure `SessionMiddleware` and `CSRFMiddleware` are in the app pipeline (`nitro-core.instructions.md`).
 - Do not put route-specific auth in global middleware when a guard is enough.
 
 ### 4. Tests
 
-- Add tests under `test/` (or the app’s test suite).
+- Add tests under `test/` (or the app's test suite).
 - Cover success (expected status and body shape) and failure (401/403/422 when guards or validation apply).
 - For framework changes, extend an existing test file when the domain matches.
 
 ### 5. Documentation (if user-facing)
 
-- Update `docs/` when the change is a public API or tutorial-worthy behavior (`nitro-docs.mdc`).
+- Update `docs/` when the change is a public API or tutorial-worthy behavior (`nitro-docs.instructions.md`).
 - Use generic examples (Products, Users) — no production-domain models.
 
 ### 6. Verify

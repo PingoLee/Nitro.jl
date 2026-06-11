@@ -1,6 +1,6 @@
 # Nitro.jl — Agent Context
 
-Single source of truth for all AI agents (Claude Code, Cursor, Codex, Gemini CLI, etc.).
+Single source of truth for all AI agents (Claude Code, GitHub Copilot, Codex, Gemini CLI, etc.).
 
 ---
 
@@ -22,24 +22,24 @@ Detailed constraints, idioms, and examples. Read the relevant file before writin
 
 | Area | Rule file | When to read |
 |------|-----------|--------------|
-| Core framework, routing, security | [`.cursor/rules/nitro-core.mdc`](.cursor/rules/nitro-core.mdc) | Any `src/*.jl` change |
-| Config & bootstrap | [`.cursor/rules/nitro-config.mdc`](.cursor/rules/nitro-config.mdc) | App config or `serve()` design |
-| Documentation | [`.cursor/rules/nitro-docs.mdc`](.cursor/rules/nitro-docs.mdc) | `docs/**/*.md` edits |
-| Workers + PormG ext | [`.cursor/rules/workers.mdc`](.cursor/rules/workers.mdc) | `src/Workers/`, `ext/`, worker tests |
-| Review index & diff order | [`.cursor/rules/project-guidelines.mdc`](.cursor/rules/project-guidelines.mdc) | Pre-PR code review |
+| Core framework, routing, security | [`.github/instructions/nitro-core.instructions.md`](.github/instructions/nitro-core.instructions.md) | Any `src/*.jl` change |
+| Config & bootstrap | [`.github/instructions/nitro-config.instructions.md`](.github/instructions/nitro-config.instructions.md) | App config or `serve()` design |
+| Documentation | [`.github/instructions/nitro-docs.instructions.md`](.github/instructions/nitro-docs.instructions.md) | `docs/**/*.md` edits |
+| Workers + PormG ext | [`.github/instructions/workers.instructions.md`](.github/instructions/workers.instructions.md) | `src/Workers/`, `ext/`, worker tests |
 
 ---
 
-## Skills (`.cursor/skills/`)
+## Skills (`.github/skills/`)
 
-Each skill is a `SKILL.md` file describing a workflow. Read the relevant file and follow the steps.
+Each skill is a `SKILL.md` file describing a workflow (the [Agent Skills](https://docs.github.com/en/copilot/concepts/agents/about-agent-skills) open format, also used by Claude Code). Read the relevant file and follow the steps.
 
 | Skill | File | Purpose |
 |-------|------|---------|
-| `changed-code-review` | [`.cursor/skills/changed-code-review/SKILL.md`](.cursor/skills/changed-code-review/SKILL.md) | Pre-push / pre-PR git diff review in ordered slices |
-| `add-route` | [`.cursor/skills/add-route/SKILL.md`](.cursor/skills/add-route/SKILL.md) | New endpoint: handler, `path()`, guards, tests |
-| `deploy-checklist` | [`.cursor/skills/deploy-checklist/SKILL.md`](.cursor/skills/deploy-checklist/SKILL.md) | Pre-production env, deps, proxy, and test audit |
-| `nitro-typed-multipart-proposal` | [`.cursor/skills/nitro-typed-multipart-proposal/SKILL.md`](.cursor/skills/nitro-typed-multipart-proposal/SKILL.md) | Typed mixed multipart (`MultipartForm{T}`) design |
+| `changed-code-review` | [`.github/skills/changed-code-review/SKILL.md`](.github/skills/changed-code-review/SKILL.md) | Pre-push / pre-PR git diff review in ordered slices |
+| `add-route` | [`.github/skills/add-route/SKILL.md`](.github/skills/add-route/SKILL.md) | New endpoint: handler, `path()`, guards, tests |
+| `deploy-checklist` | [`.github/skills/deploy-checklist/SKILL.md`](.github/skills/deploy-checklist/SKILL.md) | Pre-production env, deps, proxy, and test audit |
+| `nitro-typed-multipart-proposal` | [`.github/skills/nitro-typed-multipart-proposal/SKILL.md`](.github/skills/nitro-typed-multipart-proposal/SKILL.md) | Typed mixed multipart (`MultipartForm{T}`) design |
+| `project-guidelines` | [`.github/skills/project-guidelines/SKILL.md`](.github/skills/project-guidelines/SKILL.md) | Review index & diff order — pre-PR code review |
 
 ---
 

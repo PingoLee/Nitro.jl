@@ -5,7 +5,6 @@ description: >-
   Nitro.jl — text fields plus files in one extractor, validation, and tutorial
   updates. Use when working on multipart uploads, FormFile extractors, or the
   BI-style import handler pattern.
-disable-model-invocation: true
 ---
 
 # Nitro Proposal: Typed Mixed Multipart Extraction
@@ -93,7 +92,7 @@ Integrate `ValidationError` for missing fields, parse failures, and missing file
 
 ## Nitro.jl Constraints
 
-When implementing, follow `nitro-core.mdc`:
+When implementing, follow `nitro-core.instructions.md`:
 
 - Core extractor logic stays in `src/` without `PormG`
 - Handlers in app code use `Res.json` / `Res.status`

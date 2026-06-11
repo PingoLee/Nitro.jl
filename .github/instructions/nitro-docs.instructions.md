@@ -1,7 +1,6 @@
 ---
 description: Nitro.jl documentation conventions — tutorial style, routing examples, generic models, PormG idioms
-globs: "docs/**/*.md"
-alwaysApply: false
+applyTo: "docs/**/*.md"
 ---
 
 # Nitro.jl Documentation Conventions

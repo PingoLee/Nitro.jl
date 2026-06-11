@@ -10,7 +10,7 @@ Use this when we want a pre-push or pre-PR review of local changes.
 
 ### Prompt commands for AI agents
 
-Copy one of these into Codex / Cursor / Claude Code:
+Copy one of these into Codex / GitHub Copilot / Claude Code:
 
 ```text
 Use the changed-code-review skill and review my unstaged changes in this repo.
@@ -33,7 +33,7 @@ Use the changed-code-review skill and review what was just pushed to origin/main
 The review should:
 
 1. Read `AGENTS.md`
-2. Read `.cursor/rules/project-guidelines.mdc`
+2. Use the `project-guidelines` skill (`.github/skills/project-guidelines/SKILL.md`)
 3. Review diffs in this order:
    - `src/Workers`
    - `src` excluding `src/Workers`
