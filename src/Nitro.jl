@@ -26,7 +26,12 @@ include("Auth.jl"); using .Auth
 include("instances.jl"); using .Instances
 include("Workers.jl"); using .Workers
 
-import HTTP: Request, Response, Stream, WebSocket, queryparams
+import HTTP: Request, Response, Stream, queryparams
+# HTTP.jl v2 no longer exports the stream write primitives (`startwrite`/`closewrite`) at
+# the top level the way v1 did; re-export them (with the read side) so Nitro STREAM/SSE
+# handlers can call them unqualified, as before.
+import HTTP: startread, startwrite, closeread, closewrite
+import HTTP.WebSockets: WebSocket
 using .Core: ServerContext, Nullable, HOFRouter
 using .Core: GET, POST, PUT, DELETE, PATCH
 
@@ -62,6 +67,8 @@ export  # Server lifecycle
         Auth,
         # Common HTTP Types
         Request, Response, Stream, WebSocket, queryparams,
+        # Streaming primitives (re-exported from HTTP for STREAM/SSE handlers)
+        startread, startwrite, closeread, closewrite,
         # Context Types and methods
         Context, context,
         # Django-style Routing (THE routing API)

@@ -10,6 +10,8 @@ using SHA
 
 # Access Cookies module from Nitro to avoid ambiguity
 const Cookies = Nitro.Cookies
+# HTTP.jl v2 also exports `Cookie`; import Nitro's extractor explicitly to disambiguate.
+using Nitro: Cookie
 
 @testset "Cookies with Encrypted Values" begin
 

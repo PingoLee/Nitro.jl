@@ -1,7 +1,9 @@
 module Core
 
 using Base: @kwdef
-using HTTP
+# HTTP.jl v2 newly exports top-level names (`Cookie`, `Form`, `Middleware`, ...) that
+# collide with Nitro's. Import qualified-only and pull in just the bare names we rely on.
+import HTTP
 using HTTP: Router
 using Sockets
 using JSON
@@ -84,29 +86,51 @@ Extend HTTP.Request to provide DX-friendly shorthand access to common properties
 - `req.form`: Returns parsed form data (cached per request)
 - `req.input`: Returns merged request input (params > form > json > query)
 """
-function Base.getproperty(req::HTTP.Request, sym::Symbol)
-    if sym === :params
-        return HTTP.getparams(req)
-    elseif sym === :query
-        return Types.queryvars(req)
-    elseif sym === :json
-        return request_cache!(req, REQUEST_JSON_CACHE_KEY) do
-            Types.jsonbody(req)
+# HTTP.jl v2 defines its own `Base.getproperty(::Request, ::Symbol)` (special-casing
+# `:context` and `:version`). Nitro extends this with DX shorthands, but a same-signature
+# definition would *overwrite* HTTP's method — which Julia forbids during precompilation.
+# We therefore install Nitro's version (a strict superset that still honors HTTP's
+# `:context`/`:version` semantics) at load time from `__init__`.
+function _install_request_getproperty!()
+    @eval Core function Base.getproperty(req::HTTP.Request, sym::Symbol)
+        if sym === :params
+            return HTTP.getparams(req)
+        elseif sym === :query
+            return Types.queryvars(req)
+        elseif sym === :json
+            return request_cache!(req, REQUEST_JSON_CACHE_KEY) do
+                Types.jsonbody(req)
+            end
+        elseif sym === :form
+            return request_cache!(req, REQUEST_FORM_CACHE_KEY) do
+                Types.formbody(req)
+            end
+        elseif sym === :input || sym === :data
+            return request_input(req)
+        elseif sym === :session
+            return Base.get(req.context, :session, nothing)
+        elseif sym === :user
+            return Base.get(req.context, :user, nothing)
+        elseif sym === :ip
+            return Base.get(req.context, :ip, nothing)
+        elseif sym === :context
+            # Preserve HTTP.jl v2 semantics: `.context` returns the metadata view.
+            return HTTP._request_context_metadata!(getfield(req, :context))
+        elseif sym === :version
+            return VersionNumber(Int(getfield(req, :proto_major)), Int(getfield(req, :proto_minor)))
+        else
+            return getfield(req, sym)
         end
-    elseif sym === :form
-        return request_cache!(req, REQUEST_FORM_CACHE_KEY) do
-            Types.formbody(req)
-        end
-    elseif sym === :input || sym === :data
-        return request_input(req)
-    elseif sym === :session
-        return Base.get(req.context, :session, nothing)
-    elseif sym === :user
-        return Base.get(req.context, :user, nothing)
-    elseif sym === :ip
-        return Base.get(req.context, :ip, nothing)
-    else
-        return getfield(req, sym)
+    end
+end
+
+function __init__()
+    # Only install at real load time. During precompilation (of Nitro itself or any
+    # dependent package/extension), `jl_generating_output` is 1 — mutating the already
+    # serialized `Core` module via `@eval` then would break incremental compilation.
+    # The method is (re)installed every time Nitro is loaded into a live session.
+    if ccall(:jl_generating_output, Cint, ()) == 0
+        _install_request_getproperty!()
     end
 end
 
@@ -122,7 +146,17 @@ getparams(req::HTTP.Request) = HTTP.getparams(req)
 
 Returns the query parameters for the request.
 """
-getquery(req::HTTP.Request) = HTTP.queryparams(req)
+getquery(req::HTTP.Request) = Types.queryvars(req)
+
+# HTTP.jl v1 shipped `queryparams(::Request)` / `queryparams(::Response)`; v2 only provides
+# the URIs `queryparams(::AbstractString)` / `(::URI)`. Re-add the message overloads (which
+# Nitro re-exports) so existing call sites keep working. A `Response` resolves its query
+# from the linked request, returning `nothing` when there is none.
+HTTP.queryparams(req::HTTP.Request) = Types.queryvars(req)
+function HTTP.queryparams(res::HTTP.Response)
+    linked = res.request
+    return linked === nothing ? nothing : Types.queryvars(linked)
+end
 
 """
     getsession(req::HTTP.Request) -> Union{Dict{String,Any}, Nothing}
@@ -210,6 +244,7 @@ function serve(ctx::ServerContext;
     catch_errors=true,
     show_errors=true,
     show_banner=true,
+    access_log=true,
     external_url=nothing,
     prefix=nothing,
     context=missing,
@@ -258,7 +293,7 @@ function serve(ctx::ServerContext;
         insert!(middleware, 1, ReviseHandler())
     end
 
-    configured_middelware = setupmiddleware(ctx; middleware, serialize, catch_errors, show_errors)
+    configured_middelware = setupmiddleware(ctx; middleware, serialize, catch_errors, show_errors, access_log)
     handle_stream = handler(configured_middelware)
 
     if parallel
@@ -279,7 +314,7 @@ function serve(ctx::ServerContext;
 
     try
         return startserver(ctx; host, port, show_banner, parallel, async, kwargs, start=(kwargs) ->
-            HTTP.serve!(handle_stream, host, port; kwargs...))
+            HTTP.listen!(handle_stream, host, port; kwargs...))
     finally
         if ctx.service.eager_revise[] !== nothing && async == false
             close(ctx.service.eager_revise[])
@@ -320,21 +355,74 @@ function terminate(context::ServerContext)
     end
 end
 
-function decorate_request(ip::IPAddr, stream::HTTP.Stream)
-    return function(handle)
-        return function(req::HTTP.Request)
-            req.context[:ip] = ip
-            req.context[:stream] = stream
-            handle(req)
+# True once a handler has begun writing the response on the raw stream (e.g. a STREAM
+# route that called `startwrite`, or a WebSocket upgrade). Used to decide whether the
+# framework still needs to emit a serialized `Response`.
+_response_started(stream::HTTP.Stream)::Bool = (@atomic :acquire stream.response_started)
+
+# HTTP.jl v1's `Sockets.getpeername(::HTTP.Stream)` no longer works in v2 — server streams
+# are not raw sockets. The peer address is reachable through the server connection that v2
+# tracks on the stream (`stream.tracked.conn`, a Reseau `TCP.Conn`/`TLS.Conn`, whose `fd`
+# carries `raddr`). Navigate that path defensively and fall back to loopback when the
+# address is unavailable (e.g. a future internal layout change) so a request is never
+# failed merely because the client IP couldn't be determined.
+function _peer_ip(stream::HTTP.Stream)::IPAddr
+    try
+        conn = getfield(getfield(stream, :tracked), :conn)
+        raddr = getfield(getfield(conn, :fd), :raddr)
+        raddr === nothing && return Sockets.localhost
+        ip = getfield(raddr, :ip)
+        if length(ip) == 4
+            return IPv4(ip[1], ip[2], ip[3], ip[4])
+        else
+            acc = UInt128(0)
+            for b in ip
+                acc = (acc << 8) | UInt128(b)
+            end
+            return IPv6(acc)
         end
+    catch
+        return Sockets.localhost
     end
+end
+
+# Custom stream adapter (replaces `HTTP.streamhandler`, which unconditionally writes the
+# handler's returned `Response`). Nitro's STREAM/WebSocket handlers take over the raw
+# stream and write the response themselves, so we only emit the serialized `Response` when
+# the handler hasn't already started one. The HTTP.jl v2 server loop closes the read/write
+# sides and turns any thrown exception into a 500 after this returns.
+# Write a response body to the stream WITHOUT consuming it. HTTP.jl v2's
+# `_write_response_body_to_stream!` advances the `BytesBody` read cursor, which corrupts
+# any Response object that is reused across requests — a common pattern in handler code
+# (e.g. module-level `const` error responses). Reading `BytesBody.data` directly is
+# cursor-independent, so a shared response can be written any number of times.
+_write_response_body!(stream::HTTP.Stream, ::HTTP.EmptyBody) = nothing
+_write_response_body!(stream::HTTP.Stream, ::Nothing) = nothing
+function _write_response_body!(stream::HTTP.Stream, body::HTTP.BytesBody)
+    isempty(body.data) || write(stream, body.data)
+    return nothing
+end
+function _write_response_body!(stream::HTTP.Stream, body::Union{AbstractVector{UInt8}, AbstractString})
+    isempty(body) || write(stream, body)
+    return nothing
 end
 
 function stream_handler(middleware::Function)
     return function(stream::HTTP.Stream)
-        ip, _ = Sockets.getpeername(stream)
-        handle_stream = HTTP.streamhandler(middleware |> decorate_request(ip, stream))
-        return handle_stream(stream)
+        ip = _peer_ip(stream)
+        req = HTTP._buffered_stream_request(stream)
+        req.context[:ip] = ip
+        req.context[:stream] = stream
+
+        result = middleware(req)
+
+        if !_response_started(stream)
+            resp = result isa HTTP.Response ? result : HTTP.Response(200)
+            resp.request = req
+            stream.response = resp
+            _write_response_body!(stream, resp.body)
+        end
+        return nothing
     end
 end
 
@@ -348,7 +436,7 @@ function parallel_stream_handler(handle_stream::Function)
     end
 end
 
-function setupmiddleware(ctx::ServerContext; middleware::Vector=[], serialize::Bool=true, catch_errors::Bool=true, show_errors=true)::Function
+function setupmiddleware(ctx::ServerContext; middleware::Vector=[], serialize::Bool=true, catch_errors::Bool=true, show_errors=true, access_log=false)::Function
     raw_middleware = reverse(middleware)
     processed_middleware = process_middleware(ctx, raw_middleware)
 
@@ -360,12 +448,15 @@ function setupmiddleware(ctx::ServerContext; middleware::Vector=[], serialize::B
 
     global_prefix_middleware = !isnothing(ctx.service.prefix[]) ? [PrefixStripMiddleware(ctx.service.prefix[])] : []
     serializer = serialize ? [DefaultSerializer(catch_errors; show_errors)] : []
+    # Accept `true` to enable; `nothing`/`false` (or the old logfmt value) disable it.
+    access_log_middleware = access_log === true ? [AccessLogMiddleware()] : []
 
     return reduce(|>, [
         ctx.service.router,
         serializer...,
         custom_middleware...,
         global_prefix_middleware...,
+        access_log_middleware...,
     ])
 end
 
@@ -388,13 +479,13 @@ function startserver(ctx::ServerContext; host, port, show_banner=false, parallel
 end
 
 function preprocesskwargs(kwargs)
+    # HTTP.jl v2's `listen!` is already Stream-based, so the v1 `stream=true` flag is
+    # gone. Access logging (the old `logfmt`/`access_log` default) is now handled by
+    # `AccessLogMiddleware` in the middleware chain instead.
     kwargs_dict = Dict{Symbol,Any}(kwargs)
-    kwargs_dict[:stream] = true
-
-    if isempty(kwargs_dict) || !haskey(kwargs_dict, :access_log)
-        kwargs_dict[:access_log] = logfmt"$time_iso8601 - $remote_addr:$remote_port - \"$request\" $status"
-    end
-
+    # `listen!` rejects unknown keyword arguments. Drop v1-only server kwargs that Nitro
+    # still tolerates for back-compat (a deprecation warning is emitted in `serve`).
+    delete!(kwargs_dict, :queuesize)
     return kwargs_dict
 end
 
@@ -411,6 +502,25 @@ function internalrequest(ctx::ServerContext, req::HTTP.Request; middleware::Vect
     finally
         if !ismissing(context)
             ctx.app_context[] = old_ctx
+        end
+    end
+end
+
+"""
+    AccessLogMiddleware()
+
+Logs one line per request once the response status is known, mirroring the old
+HTTP.jl v1 `access_log` default (`\$time_iso8601 - \$remote_addr:\$remote_port - "\$request" \$status`).
+HTTP.jl v2 removed the `logfmt`/`access_log` server kwargs, so request logging now
+lives in the middleware chain.
+"""
+function AccessLogMiddleware()
+    return function(handle)
+        return function(req::HTTP.Request)
+            response = handle(req)
+            ip = Base.get(req.context, :ip, nothing)
+            @info "$(Dates.format(now(), "yyyy-mm-ddTHH:MM:SS")) - $ip - \"$(req.method) $(req.target)\" $(response.status)"
+            return response
         end
     end
 end
@@ -435,9 +545,7 @@ function DefaultSerializer(catch_errors::Bool; show_errors::Bool)
     return function(handle)
         return function(req::HTTP.Request)
             return handlerequest(catch_errors; show_errors) do
-                response = handle(req)
-                format_response!(req, response)
-                return req.response
+                format_response(handle(req))
             end
         end
     end

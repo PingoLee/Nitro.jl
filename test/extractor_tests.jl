@@ -7,6 +7,9 @@ using Suppressor
 using ProtoBuf
 using Nitro
 using Nitro: extract, Param, LazyRequest, Extractor, ProtoBuffer, isbodyparam, FormFile, Files
+# HTTP.jl v2 exports `Form`/`Cookie` at the top level, which collide with Nitro's
+# extractors under `using HTTP`. Import the Nitro ones explicitly to disambiguate.
+using Nitro: Form, Cookie
 
 # extend the built-in validate function
 import Nitro: validate

@@ -2,7 +2,7 @@
 module ExtractIPMiddleware
 using HTTP
 using Sockets
-using ...Core: getip, setip!
+using ...Core: getip, setip!, header_name_isequal
 
 export ExtractIP, extract_ip
 
@@ -91,13 +91,13 @@ function _extract_forwarded_ip(req::HTTP.Request, peer)::IPAddr
     xri  :: Union{String,Nothing} = nothing
 
     for (k, v) in req.headers
-        if isnothing(cfip) && HTTP.Messages.field_name_isequal(k, "CF-Connecting-IP")
+        if isnothing(cfip) && header_name_isequal(k, "CF-Connecting-IP")
             cfip = v
-        elseif isnothing(tci) && HTTP.Messages.field_name_isequal(k, "True-Client-IP")
+        elseif isnothing(tci) && header_name_isequal(k, "True-Client-IP")
             tci = v
-        elseif isnothing(xff) && HTTP.Messages.field_name_isequal(k, "X-Forwarded-For")
+        elseif isnothing(xff) && header_name_isequal(k, "X-Forwarded-For")
             xff = v
-        elseif isnothing(xri) && HTTP.Messages.field_name_isequal(k, "X-Real-IP")
+        elseif isnothing(xri) && header_name_isequal(k, "X-Real-IP")
             xri = v
         end
     end

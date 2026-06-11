@@ -10,6 +10,10 @@ using ..Reflection: struct_builder, extract_struct_info
 using ..Errors: ValidationError
 using ..Types
 using ..Cookies
+# HTTP.jl v2 newly exports `Cookie` at the top level, which collides with Nitro's
+# `Cookie` extractor (defined in `Types`). Import it explicitly so the unqualified
+# `Cookie` references below resolve unambiguously to ours, not `HTTP.Cookie`.
+using ..Types: Cookie
 
 export extract, validate, extracttype, isextractor, isreqparam, isbodyparam,
     Path, Query, Header, Json, JsonFragment, Form, Body, Cookie, Session, Files
