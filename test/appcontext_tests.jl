@@ -14,6 +14,8 @@ end
 urlpatterns("",
     path("/test", function(req) return "Hello World" end, method="GET"),
     path("/injected", function(req, ctx::Context{Person}) return json(ctx.payload) end, method="GET"),
+    path("/getcontext", function(req) return json(getcontext(req)) end, method="GET"),
+    path("/getcontext-typed", function(req) return json(getcontext(req, Person)) end, method="GET"),
     path("/kwarg-only", function(req; context) return json(context) end, method="GET"),
     path("/both-kwargs", function(; request::Request, context::Person) return json(context) end, method="GET"),
     path("/method-only", function() return json(context()) end, method="GET"),
@@ -46,6 +48,22 @@ serve(port=port, host=HOST, async=true, show_errors=false, show_banner=false, ac
     @test context() isa Missing
 end
 
+@testset "getcontext null context" begin
+    # No context configured: getcontext(req) is nothing ...
+    response = HTTP.get("$localhost/getcontext")
+    @test response.status == 200
+    @test text(response) == "null"
+
+    # ... and the typed accessor raises (→ 500)
+    try
+        HTTP.get("$localhost/getcontext-typed")
+        @test false
+    catch e
+        @test e isa HTTP.Exception
+        @test e.status == 500
+    end
+end
+
 terminate()
 
 person = Person("John", 25)
@@ -63,8 +81,18 @@ end
     @test text(response) == "Hello World"
 end
 
-@testset "accessing injected context from a function handler" begin 
+@testset "accessing injected context from a function handler" begin
     response = HTTP.get("$localhost/injected")
+    @test response.status == 200
+    @test json(response, Person) == person
+end
+
+@testset "getcontext(req) reaches the typed config without a Context param" begin
+    response = HTTP.get("$localhost/getcontext")
+    @test response.status == 200
+    @test json(response, Person) == person
+
+    response = HTTP.get("$localhost/getcontext-typed")
     @test response.status == 200
     @test json(response, Person) == person
 end
@@ -81,10 +109,32 @@ end
     @test json(response, Person) == person
 end
 
-@testset "context() method only" begin 
+@testset "context() method only" begin
     response = HTTP.get("$localhost/method-only")
     @test response.status == 200
     @test json(response, Person) == person
+end
+
+terminate()
+
+# The app context is seeded before the middleware pipeline, so getcontext(req)
+# is available inside global/custom middleware — not only at handler dispatch.
+function _ctx_probe(handler)
+    return function(req::HTTP.Request)
+        resp = handler(req)
+        cfg = getcontext(req)
+        HTTP.setheader(resp, "X-Ctx-Name" => cfg === nothing ? "none" : cfg.name)
+        return resp
+    end
+end
+
+serve(port=port, host=HOST, async=true, show_errors=false, show_banner=false,
+      access_log=nothing, context=person, middleware=[_ctx_probe])
+
+@testset "getcontext available inside middleware" begin
+    response = HTTP.get("$localhost/test")
+    @test response.status == 200
+    @test HTTP.header(response, "X-Ctx-Name") == "John"
 end
 
 terminate()

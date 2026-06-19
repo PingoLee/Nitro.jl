@@ -26,6 +26,7 @@ function getsession end
 function setsession! end
 function getip end
 function setip! end
+function getcontext end
 
 include("handlers.jl");     @reexport using .Handlers
 include("routerhof.jl");    @reexport using .RouterHOF
@@ -37,11 +38,14 @@ include("routing.jl");      @reexport using .Routing
 
 export serve, terminate,
     internalrequest, staticfiles, dynamicfiles, spafiles,
-    getparams, getquery, getsession, setsession!, getip, setip!, payload
+    getparams, getquery, getsession, setsession!, getip, setip!, getcontext, payload
 
 const REQUEST_JSON_CACHE_KEY = :__nitro_request_json
 const REQUEST_FORM_CACHE_KEY = :__nitro_request_form
 const REQUEST_INPUT_CACHE_KEY = :__nitro_request_input
+const REQUEST_FILES_CACHE_KEY = :__nitro_request_files
+const REQUEST_POST_CACHE_KEY = :__nitro_request_post
+const REQUEST_CONTEXT_KEY = :__nitro_app_context
 
 function request_cache!(builder::Function, req::HTTP.Request, key::Symbol)
     if haskey(req.context, key)
@@ -62,12 +66,25 @@ function merge_request_input!(merged::Dict{String,Any}, source)
     return merged
 end
 
+const REQUEST_MULTIPART_CACHE_KEY = :__nitro_request_multipart
+
+"""
+Parse the `multipart/form-data` body once per request and cache the raw result, so that
+`req.files` and `req.post` can both read it without re-parsing (and re-reading) the body.
+"""
+function request_multipart(req::HTTP.Request)
+    return request_cache!(req, REQUEST_MULTIPART_CACHE_KEY) do
+        Types.multipartbody(req)
+    end
+end
+
 function request_input(req::HTTP.Request) :: Dict{String,Any}
     return request_cache!(req, REQUEST_INPUT_CACHE_KEY) do
         merged = Dict{String,Any}()
         merge_request_input!(merged, req.query)
         merge_request_input!(merged, req.json)
         merge_request_input!(merged, req.form)
+        merge_request_input!(merged, req.post)
         merge_request_input!(merged, req.params)
         merged
     end
@@ -82,7 +99,9 @@ Extend HTTP.Request to provide DX-friendly shorthand access to common properties
 - `req.ip`: Returns the caller's IP address from context
 - `req.json`: Returns the parsed JSON body (cached per request)
 - `req.form`: Returns parsed form data (cached per request)
-- `req.input`: Returns merged request input (params > form > json > query)
+- `req.files`: Returns the file parts of a multipart body, `Dict{String, Union{FormFile, Vector{FormFile}}}` (cached per request) — Django `request.FILES`
+- `req.post`: Returns the text fields of a multipart body, `Dict{String, Union{String, Vector{String}}}` (cached per request) — Django `request.POST`
+- `req.input`: Returns merged request input (params > post > form > json > query, where `post` is the multipart text fields)
 """
 function Base.getproperty(req::HTTP.Request, sym::Symbol)
     if sym === :params
@@ -99,6 +118,24 @@ function Base.getproperty(req::HTTP.Request, sym::Symbol)
         end
     elseif sym === :input || sym === :data
         return request_input(req)
+    elseif sym === :files
+        # Django request.FILES — only the file parts of a multipart body, cached.
+        return request_cache!(req, REQUEST_FILES_CACHE_KEY) do
+            parsed = request_multipart(req)
+            Dict{String, Union{FormFile, Vector{FormFile}}}(
+                k => v for (k, v) in parsed
+                if v isa FormFile || v isa Vector{FormFile}
+            )
+        end
+    elseif sym === :post
+        # Django request.POST for multipart — the text fields of a multipart body, cached.
+        return request_cache!(req, REQUEST_POST_CACHE_KEY) do
+            parsed = request_multipart(req)
+            Dict{String, Union{String, Vector{String}}}(
+                k => v for (k, v) in parsed
+                if v isa String || v isa Vector{String}
+            )
+        end
     elseif sym === :session
         return Base.get(req.context, :session, nothing)
     elseif sym === :user
@@ -153,10 +190,50 @@ Assigns the caller's IP address to the request context.
 setip!(req::HTTP.Request, val) = (req.context[:ip] = val)
 
 """
+    getcontext(req::HTTP.Request) -> Union{Any, Nothing}
+
+Returns the application context payload for the request — the object passed to
+`serve(context = ...)` — or `nothing` when no context was configured.
+
+This is the request-side counterpart to declaring a `Context{T}` handler parameter:
+it lets handlers and the business logic they call reach the typed application config
+from `req` alone, without threading a `Context` argument through every signature.
+
+```julia
+serve(context = AppConfig(...))
+
+function handler(req)
+    cfg = getcontext(req)        # ::AppConfig (untyped at the call site)
+    cfg.host
+end
+```
+
+Use [`getcontext(req, T)`](@ref) when you want the value statically typed as `T`.
+"""
+function getcontext(req::HTTP.Request)
+    ctx = Base.get(req.context, REQUEST_CONTEXT_KEY, missing)
+    return ctx isa Context ? ctx.payload : nothing
+end
+
+"""
+    getcontext(req::HTTP.Request, ::Type{T}) -> T
+
+Returns the application context payload typed as `T`, so field access is statically
+typed (`getcontext(req, AppConfig).host`). Throws an `ArgumentError` when no context
+was configured, and a `TypeError` when the payload is not a `T`.
+"""
+function getcontext(req::HTTP.Request, ::Type{T}) where {T}
+    ctx = Base.get(req.context, REQUEST_CONTEXT_KEY, missing)
+    ctx isa Context || throw(ArgumentError(
+        "No application context on request; pass `context = ...` to `serve()`."))
+    return ctx.payload::T
+end
+
+"""
     payload(req::HTTP.Request) -> Dict{String, Any}
 
-Returns a merged dictionary containing the JSON body, form data, and query parameters 
-from the incoming request.
+Returns a merged dictionary containing the JSON body, form data, multipart text
+fields, and query parameters from the incoming request.
 """
 function payload(req::HTTP.Request)::Dict{String, Any}
     return req.input
@@ -348,6 +425,20 @@ function parallel_stream_handler(handle_stream::Function)
     end
 end
 
+# Outermost wrapper that seeds the per-request context with the application
+# context (`serve(context = ...)`), so `getcontext(req)` works everywhere in the
+# pipeline — global/custom middleware, per-route middleware, and handlers alike.
+# Runs before any other middleware, so the app context is visible from the very
+# first hook a request passes through.
+function _app_context_seed(ctx::ServerContext)
+    return function(handler::Function)
+        return function(req::HTTP.Request)
+            req.context[REQUEST_CONTEXT_KEY] = ctx.app_context[]
+            return handler(req)
+        end
+    end
+end
+
 function setupmiddleware(ctx::ServerContext; middleware::Vector=[], serialize::Bool=true, catch_errors::Bool=true, show_errors=true)::Function
     raw_middleware = reverse(middleware)
     processed_middleware = process_middleware(ctx, raw_middleware)
@@ -366,6 +457,7 @@ function setupmiddleware(ctx::ServerContext; middleware::Vector=[], serialize::B
         serializer...,
         custom_middleware...,
         global_prefix_middleware...,
+        _app_context_seed(ctx),
     ])
 end
 

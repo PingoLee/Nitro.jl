@@ -6,7 +6,7 @@ Base.@kwdef struct ReviseHooks
     wait_for_revision_event::Function
 end
 
-const REVISE_HOOKS :: Ref{Union{Nothing, ReviseHooks}} = Ref{Union{Nothing, ReviseHooks}}(nothing)
+const REVISE_HOOKS::Ref{Union{Nothing,ReviseHooks}} = Ref{Union{Nothing,ReviseHooks}}(nothing)
 
 function register_revise_hooks!(; revise::Function, has_pending_revisions::Function, wait_for_revision_event::Function)
     REVISE_HOOKS[] = ReviseHooks(; revise, has_pending_revisions, wait_for_revision_event)
@@ -21,53 +21,57 @@ end
 revise_hooks() = REVISE_HOOKS[]
 has_revise_hooks() = !isnothing(REVISE_HOOKS[])
 
-include("core.jl"); using .Core
-include("Auth.jl"); using .Auth
-include("instances.jl"); using .Instances
-include("Workers.jl"); using .Workers
+include("core.jl")
+using .Core
+include("Auth.jl")
+using .Auth
+include("instances.jl")
+using .Instances
+include("Workers.jl")
+using .Workers
 
 import HTTP: Request, Response, Stream, WebSocket, queryparams
 using .Core: ServerContext, Nullable, HOFRouter
 using .Core: GET, POST, PUT, DELETE, PATCH
 
-const CONTEXT :: Ref{ServerContext} = Ref(ServerContext())
+const CONTEXT::Ref{ServerContext} = Ref(ServerContext())
 
 include("exts.jl")
 include("methods.jl")
 
 export  # Server lifecycle
-        serve, terminate, internalrequest,
-        worker_startup,
-        resetstate, instance, router,
-        register_revise_hooks!, clear_revise_hooks!,
-        # File serving
-        staticfiles, dynamicfiles, spafiles,
-        # Util
-        getparams, getquery, getsession, setsession!, getip, setip!, payload, getexternalurl,
-        redirect, formdata, multipart, format_sse_message,
-        html, text, json, file, xml, js, css, binary,
-        # Extractors
-        Path, Query, Header, Json, JsonFragment, Form, Body, Cookie, Session, Files, FormFile, extract, validate,
-        # Extractor extension surface (for app-layer custom extractors)
-        Param, LazyRequest, ValidationError, Nullable,
-        # Cookies & Security
-        configcookies, get_cookie, set_cookie!, Cookies, Errors,
-        regenerate_session!,
-        # Middleware
-        BearerAuth, CookieAuthMiddleware, Cors, RateLimiter, ExtractIP,
-        SessionMiddleware, GuardMiddleware, login_required, role_required, permission_required, CSRFMiddleware,
-        # Optional app extensions
-        Workers,
-        # Auth module
-        Auth,
-        # Common HTTP Types
-        Request, Response, Stream, WebSocket, queryparams,
-        # Context Types and methods
-        Context, context,
-        # Django-style Routing (THE routing API)
-        path, urlpatterns, include_routes, RouteDefinition, url,
-        # Response Abstractions
-        Res
+    serve, terminate, internalrequest,
+    worker_startup,
+    resetstate, instance, router,
+    register_revise_hooks!, clear_revise_hooks!,
+    # File serving
+    staticfiles, dynamicfiles, spafiles,
+    # Util
+    getparams, getquery, getsession, setsession!, getip, setip!, getcontext, payload, getexternalurl,
+    redirect, formdata, multipart, format_sse_message,
+    html, text, json, file, xml, js, css, binary,
+    # Extractors
+    Path, Query, Header, Json, JsonFragment, Form, Body, Cookie, Session, Files, MultipartForm, FormFile, extract, validate,
+    # Extractor extension surface (for app-layer custom extractors)
+    Param, LazyRequest, ValidationError, Nullable,
+    # Cookies & Security
+    configcookies, get_cookie, set_cookie!, Cookies, Errors,
+    regenerate_session!,
+    # Middleware
+    BearerAuth, CookieAuthMiddleware, Cors, RateLimiter, ExtractIP,
+    SessionMiddleware, GuardMiddleware, login_required, role_required, permission_required, CSRFMiddleware,
+    # Optional app extensions
+    Workers,
+    # Auth module
+    Auth,
+    # Common HTTP Types
+    Request, Response, Stream, WebSocket, queryparams,
+    # Context Types and methods
+    Context, context,
+    # Django-style Routing (THE routing API)
+    path, urlpatterns, include_routes, RouteDefinition, url,
+    # Response Abstractions
+    Res
 
 include("precompile.jl")
 end

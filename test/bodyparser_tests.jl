@@ -358,6 +358,21 @@ end
     @test result["file"].filename == "data.csv"
 end
 
+@testset "multipart() - same field name as both file and text does not crash" begin
+    # Pathological input: one field name carries both a file part and a text
+    # part. This must not throw (it used to raise a MethodError building a
+    # Vector{Any}). The file wins the slot; the conflicting text is dropped.
+    body, ct = build_multipart(parts=[
+        Dict(:name => "field", :filename => "f.txt", :data => "file bytes"),
+        Dict(:name => "field", :data => "text value"),
+    ])
+    req = Request("POST", "/upload", ["Content-Type" => ct], body)
+    result = multipart(req)
+    @test result["field"] isa FormFile
+    @test result["field"].filename == "f.txt"
+    @test String(result["field"].data) == "file bytes"
+end
+
 @testset "multipart() - non-multipart request returns empty dict" begin
     req = Request("POST", "/upload", ["Content-Type" => "application/json"], """{"key": "value"}""")
     result = multipart(req)

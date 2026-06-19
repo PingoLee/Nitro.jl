@@ -238,7 +238,7 @@ function cleanup_expired_sessions!(store::PormGSessionStore)
     m = store.model
     now_utc = Dates.now(Dates.UTC)
     try
-        m.objects.filter("expires_at__lte" => now_utc).delete()
+        m.objects.filter("expires_at__@lte" => now_utc).delete()
     catch e
         @warn "PormGSessionStore: failed to cleanup expired sessions" exception=(e, catch_backtrace())
     end

@@ -124,4 +124,52 @@ end
 
 terminate()
 
+# ── Path-scoped global CORS ──
+
+urlpatterns("",
+    path("/open/data", function() return "open" end, method="GET"),
+    path("/closed/data", function() return "closed" end, method="GET"),
+    path("/api/v1/users", function() return "users" end, method="GET"),
+)
+
+# Exact-match allow-list + a prefix predicate, installed as a *global* middleware.
+serve(middleware=[Cors(paths=["/open/data"])], port=port, host=HOST, async=true,
+      show_errors=false, show_banner=false, access_log=nothing)
+
+@testset "Path-scoped CORS (exact allow-list)" begin
+    # In-scope path gets CORS headers...
+    r = HTTP.get("$localhost/open/data")
+    @test HTTP.header(r, "Access-Control-Allow-Origin") == "*"
+
+    r = HTTP.request("OPTIONS", "$localhost/open/data")
+    @test r.status == 200
+    @test HTTP.header(r, "Access-Control-Allow-Origin") == "*"
+
+    # ...out-of-scope path passes through with NO CORS headers
+    r = HTTP.get("$localhost/closed/data")
+    @test r.status == 200
+    @test HTTP.header(r, "Access-Control-Allow-Origin") == ""
+
+    # Query string is stripped before matching
+    r = HTTP.get("$localhost/open/data?foo=bar")
+    @test HTTP.header(r, "Access-Control-Allow-Origin") == "*"
+end
+
+terminate()
+
+serve(middleware=[Cors(paths = p -> startswith(p, "/api/"))], port=port, host=HOST,
+      async=true, show_errors=false, show_banner=false, access_log=nothing)
+
+@testset "Path-scoped CORS (predicate)" begin
+    # Matches the /api/ prefix
+    r = HTTP.get("$localhost/api/v1/users")
+    @test HTTP.header(r, "Access-Control-Allow-Origin") == "*"
+
+    # Does not match
+    r = HTTP.get("$localhost/open/data")
+    @test HTTP.header(r, "Access-Control-Allow-Origin") == ""
+end
+
+terminate()
+
 end

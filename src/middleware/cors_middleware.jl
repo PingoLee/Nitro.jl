@@ -5,8 +5,27 @@ using ...Types
 
 export Cors
 
+# Returns the request path with any query string stripped, e.g.
+# "/api/import?x=1" -> "/api/import".
+function _request_path(req::HTTP.Request)
+    target = req.target
+    q = findfirst('?', target)
+    return isnothing(q) ? target : target[1:prevind(target, q)]
+end
+
+# Builds the predicate that decides whether CORS applies to a given request path.
+#   nothing          -> every path (default, backwards compatible)
+#   Vector{String}   -> exact-match allow-list
+#   Function         -> custom predicate (path::AbstractString) -> Bool
+_cors_path_predicate(::Nothing) = Returns(true)
+_cors_path_predicate(pred::Function) = pred
+function _cors_path_predicate(allowed::Vector{String})
+    allowset = Set(allowed)
+    return path -> path in allowset
+end
+
 """
-    Cors(; allowed_origins=["*"], allowed_headers=["*"], allowed_methods=["GET","POST","OPTIONS"], allow_credentials=false, max_age=nothing, extra_headers=Pair[])
+    Cors(; allowed_origins=["*"], allowed_headers=["*"], allowed_methods=["GET","POST","OPTIONS"], allow_credentials=false, max_age=nothing, extra_headers=Pair[], paths=nothing)
 
 Creates a middleware function that adds CORS headers to responses and handles preflight OPTIONS requests.
 
@@ -31,9 +50,37 @@ explicit origins you trust in `allowed_origins` instead.
     - `allow_credentials`: If true, adds `Access-Control-Allow-Credentials: true`.
     - `max_age`: If set, adds `Access-Control-Max-Age` header.
     - `extra_headers`: Vector of additional key-value pairs.
+    - `paths`: Restrict CORS to a subset of request paths. Defaults to `nothing`
+      (apply to every request). Pass a `Vector{String}` for an exact-match
+      allow-list, or a predicate `(path::AbstractString) -> Bool` for custom
+      matching (e.g. prefix matching). Requests whose path is not in scope pass
+      straight through with no CORS headers and no preflight short-circuit. This
+      is useful when `Cors` is installed as a global server middleware but only
+      a handful of endpoints are meant to be cross-origin.
+
+      Paths are matched against the **route path** — the same string you pass to
+      `path()` — *after* any global `prefix` (from `serve(prefix=...)`) has been
+      stripped. So when serving under `prefix="/v1"`, a client request to
+      `/v1/api/import` is matched here as `/api/import`. List your route paths,
+      not the full client URL.
 
 # Returns
 A middleware closure compatible with the Nitro middleware pipeline.
+
+# Examples
+
+```julia
+# Only these two endpoints get CORS, even when installed globally
+Cors(allowed_origins=["https://app.example.com"], allow_credentials=true,
+     paths=["/api/import/data", "/api/apsaude/fix"])
+
+# Prefix matching via a predicate
+Cors(paths = path -> startswith(path, "/api/"))
+
+# Under a global prefix, list the ROUTE path (the prefix is already stripped):
+#   serve(prefix="/v1", middleware=[Cors(paths=["/api/import"])])
+# matches client requests to /v1/api/import
+```
 """
 function Cors(;
     allowed_origins     :: Vector{String} = ["*"],
@@ -41,7 +88,10 @@ function Cors(;
     allowed_methods     :: Vector{String} = ["GET","POST","OPTIONS"],
     allow_credentials   :: Bool = false,
     max_age             :: Union{Int,Nothing} = nothing,
-    extra_headers       :: Vector{Pair{String, String}} = Pair{String,String}[])
+    extra_headers       :: Vector{Pair{String, String}} = Pair{String,String}[],
+    paths               :: Union{Nothing, Vector{String}, Function} = nothing)
+
+    applies = _cors_path_predicate(paths)
 
     format_header(xs::Vector{String}) = ("*" in xs) ? "*" : join(xs, ", ")
 
@@ -97,6 +147,7 @@ function Cors(;
 
         return function(handle::Function)
             return function(req::HTTP.Request)
+                applies(_request_path(req)) || return handle(req)
                 if HTTP.method(req) == "OPTIONS"
                     return HTTP.Response(200, frozen_headers)
                 end
@@ -112,6 +163,7 @@ function Cors(;
     # browser blocks the response cleanly.
     return function(handle::Function)
         return function(req::HTTP.Request)
+            applies(_request_path(req)) || return handle(req)
             request_origin = HTTP.header(req, "Origin", "")
             headers = copy(static_headers)
 

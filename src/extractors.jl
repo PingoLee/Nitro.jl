@@ -12,7 +12,7 @@ using ..Types
 using ..Cookies
 
 export extract, validate, extracttype, isextractor, isreqparam, isbodyparam,
-    Path, Query, Header, Json, JsonFragment, Form, Body, Cookie, Session, Files
+    Path, Query, Header, Json, JsonFragment, Form, Body, Cookie, Session, Files, MultipartForm
 
 """
 Given a classname, build a new Extractor class
@@ -56,6 +56,7 @@ end
 @extractor Form
 @extractor Body
 @extractor Files
+@extractor MultipartForm
 
 function extracttype(::Type{U}) where {T, U <: Extractor{T}}
     return T
@@ -70,14 +71,24 @@ function isreqparam(::Param{U}) where {T, U <: Extractor{T}}
 end
 
 function isbodyparam(::Param{U}) where {T, U <: Extractor{T}}
-    return U <: Union{Json{T}, JsonFragment{T}, Form{T}, Body{T}, Files{T}}
+    return U <: Union{Json{T}, JsonFragment{T}, Form{T}, Body{T}, Files{T}, MultipartForm{T}}
 end
 
 # Generic validation function - if no validate function is defined for a type, return true
 validate(type::T) where {T} = true
 
+# Render a bounded, byte-safe preview of a failed instance for error messages.
+# Validators can run on payloads holding raw file bytes (e.g. uploads via
+# `MultipartForm`/`Files`), so never interpolate the whole instance: `:limit`
+# elides long (incl. nested) arrays, and the char cap guards an unbounded field
+# such as a very long `String`. Keeps the message useful without dumping bytes.
+function _instance_preview(instance; limit::Int = 300)
+    s = sprint(show, instance; context = :limit => true)
+    return length(s) <= limit ? s : string(first(s, limit), " …")
+end
+
 """
-This function will try to validate an instance of a type using both global and local validators. 
+This function will try to validate an instance of a type using both global and local validators.
 If both validators pass, the instance is returned. If either fails, an ArgumentError is thrown.
 """
 function try_validate(param::Param{U}, instance::T) :: T where {T, U <: Extractor{T}}
@@ -85,17 +96,17 @@ function try_validate(param::Param{U}, instance::T) :: T where {T, U <: Extracto
     # Case 1: Use global validate function - returns true if one isn't defined for this type
     if !validate(instance)
         impl = Base.which(validate, (T,))
-        throw(ValidationError("Validation failed for $(param.name): $T \n|> $instance \n|> $impl"))   
+        throw(ValidationError("Validation failed for $(param.name): $T \n|> $(_instance_preview(instance)) \n|> $impl"))
     end
 
     # Case 2: Use custom validate function from an Extractor (if defined)
     if param.hasdefault && param.default isa U && !isnothing(param.default.validate)
         if !param.default.validate(instance)
             impl = Base.which(param.default.validate, (T,))
-            throw(ValidationError("Validation failed for $(param.name): $T \n|> $instance \n|> $impl"))
+            throw(ValidationError("Validation failed for $(param.name): $T \n|> $(_instance_preview(instance)) \n|> $impl"))
         end
     end
-    
+
     return instance
 end
 
@@ -344,6 +355,191 @@ function extract(param::Param{Files{FormFile}}, request::LazyRequest) :: Files{F
     end
     valid_instance = try_validate(param, instance)
     return Files(valid_instance)
+end
+
+# ─── MultipartForm{T} — typed mixed multipart (text fields + files) ──────────
+
+"""
+    extract(param::Param{MultipartForm{T}}, request::LazyRequest) :: MultipartForm{T}
+
+Extracts a `multipart/form-data` request body and binds **both** its text fields and
+its file parts into a single typed struct `T`.
+
+`T` must be constructible from its fields in declaration order (a plain `struct` or a
+`@kwdef struct`). Each field of `T` is bound by its type:
+
+| Field type                  | Source                                            |
+|-----------------------------|---------------------------------------------------|
+| `String`                    | single text field (by field name)                 |
+| `T <: Number`, `Bool`       | single text field, parsed                         |
+| `Vector{String}`            | all text fields under that name                   |
+| `FormFile`                  | single uploaded file (by field name)              |
+| `Vector{FormFile}`          | all uploaded files under that name                |
+| `Union{X, Nothing}`         | optional — `nothing` when the field is absent     |
+
+For a `@kwdef struct`, a field absent from the body falls back to its declared default;
+an absent `Union{X, Nothing}` field always binds to `nothing` (taking precedence over a
+default). A required field (no default, no `Nothing` in its type) that is absent is an error.
+
+Throws a `ValidationError` (→ 400) when the body is not multipart, a required field is
+missing, a value cannot be parsed, or `validate(::T)` / an extractor-local validator fails.
+
+```julia
+struct ImportUpload
+    user_id  :: String
+    ibge_id  :: Int
+    files    :: Vector{FormFile}
+end
+
+function submit_import(req, payload::MultipartForm{ImportUpload})
+    data = payload.payload
+    data.files     # ::Vector{FormFile}
+    data.ibge_id   # ::Int
+end
+```
+"""
+function extract(param::Param{MultipartForm{T}}, request::LazyRequest) :: MultipartForm{T} where {T}
+    # Reject a genuinely non-multipart request up front. Detect this from the
+    # Content-Type rather than from an empty parse result, so that a well-formed
+    # (but empty or incomplete) multipart body falls through to the field binder
+    # and gets a specific "Missing field 'X'" error instead of a misleading
+    # "Content-Type must be multipart/form-data".
+    content_type = HTTP.header(request.request, "Content-Type", "")
+    if !occursin("multipart/form-data", content_type)
+        throw(ValidationError("Content-Type must be multipart/form-data for parameter: $(param.name)"))
+    end
+
+    parsed = multipartbody(request)
+    instance = safe_extract(param) do
+        multipart_struct_builder(T, parsed)
+    end
+    valid_instance = try_validate(param, instance)
+    return MultipartForm(valid_instance)
+end
+
+"""
+Builds an instance of `T` by binding each of its fields from a parsed multipart body.
+
+A plain `struct` is constructed positionally in declaration order. A `@kwdef struct`
+is constructed by keyword so that **field defaults are honored**: a field absent from
+the body falls back to its declared default. An absent `Union{Nothing, _}` field always
+binds to `nothing` (the documented optional rule, which takes precedence over a default),
+and an absent field with neither a default nor `Nothing` in its type raises a
+`ValidationError`.
+"""
+function multipart_struct_builder(::Type{T}, parsed::AbstractDict) :: T where {T}
+    # A `@kwdef` struct exposes a keyword constructor accepting all its fields;
+    # a plain struct does not. Building the former by keyword lets us omit absent
+    # fields so their declared defaults apply.
+    if hasmethod(T, Tuple{}, fieldnames(T))
+        return multipart_kw_build(T, parsed)
+    end
+    args = Any[multipart_bind(String(name), fieldtype(T, name), parsed) for name in fieldnames(T)]
+    return T(args...)
+end
+
+function multipart_kw_build(::Type{T}, parsed::AbstractDict) :: T where {T}
+    kwargs = Pair{Symbol, Any}[]
+    for name in fieldnames(T)
+        field = String(name)
+        ftype = fieldtype(T, name)
+        if haskey(parsed, field)
+            push!(kwargs, name => multipart_bind(field, ftype, parsed))
+        elseif ftype isa Union && Nothing in Base.uniontypes(ftype)
+            push!(kwargs, name => nothing)   # documented optional → nothing
+        end
+        # else: absent and non-optional — omit so the struct's own default applies.
+    end
+    try
+        return T(; kwargs...)
+    catch e
+        e isa UndefKeywordError &&
+            throw(ValidationError("Missing required field '$(e.var)'"))
+        rethrow()
+    end
+end
+
+multipart_bind(field::String, ::Type{String}, parsed::AbstractDict) =
+    multipart_text_value(field, parsed)
+
+function multipart_bind(field::String, ::Type{N}, parsed::AbstractDict) where {N <: Number}
+    raw = strip(multipart_text_value(field, parsed))
+    result = tryparse(N, raw)
+    isnothing(result) && throw(ValidationError("Field '$field' could not be parsed as $N"))
+    return result
+end
+
+function multipart_bind(field::String, ::Type{Bool}, parsed::AbstractDict)
+    raw = strip(multipart_text_value(field, parsed))
+    raw in ("true", "1", "yes") && return true
+    raw in ("false", "0", "no") && return false
+    throw(ValidationError("Field '$field' is not a valid Bool value"))
+end
+
+multipart_bind(field::String, ::Type{Vector{String}}, parsed::AbstractDict) =
+    multipart_text_values(field, parsed)
+
+function multipart_bind(field::String, ::Type{FormFile}, parsed::AbstractDict)
+    value = get(parsed, field, nothing)
+    isnothing(value) && throw(ValidationError("Missing file field '$field'"))
+    value isa FormFile && return value
+    if value isa Vector{FormFile}
+        length(value) == 1 && return first(value)
+        throw(ValidationError("Field '$field' expected one file but received $(length(value))"))
+    end
+    throw(ValidationError("Field '$field' is not a file upload"))
+end
+
+function multipart_bind(field::String, ::Type{Vector{FormFile}}, parsed::AbstractDict)
+    value = get(parsed, field, nothing)
+    isnothing(value) && throw(ValidationError("Missing file field '$field'"))
+    value isa FormFile && return FormFile[value]
+    value isa Vector{FormFile} && return value
+    throw(ValidationError("Field '$field' is not a file upload"))
+end
+
+function multipart_bind(field::String, union_type::Union, parsed::AbstractDict)
+    member_types = Base.uniontypes(union_type)
+    optional = Nothing in member_types
+    optional && !haskey(parsed, field) && return nothing
+
+    last_error = nothing
+    for current_type in member_types
+        current_type === Nothing && continue
+        try
+            return multipart_bind(field, current_type, parsed)
+        catch e
+            last_error = e
+        end
+    end
+    last_error isa ValidationError && throw(last_error)
+    throw(ValidationError("Could not bind multipart field '$field' to $union_type"))
+end
+
+multipart_bind(field::String, ::Type{T}, parsed::AbstractDict) where {T} =
+    throw(ValidationError("Unsupported multipart field type $T for field '$field'"))
+
+function multipart_text_value(field::String, parsed::AbstractDict) :: String
+    value = get(parsed, field, nothing)
+    isnothing(value) && throw(ValidationError("Missing text field '$field'"))
+    value isa AbstractString && return String(value)
+    if value isa Vector && eltype(value) <: AbstractString
+        length(value) == 1 && return String(first(value))
+        throw(ValidationError("Field '$field' expected one value but received $(length(value))"))
+    end
+    (value isa FormFile || value isa Vector{FormFile}) &&
+        throw(ValidationError("Field '$field' is a file upload, expected text"))
+    throw(ValidationError("Field '$field' has unsupported multipart value type $(typeof(value))"))
+end
+
+function multipart_text_values(field::String, parsed::AbstractDict) :: Vector{String}
+    value = get(parsed, field, nothing)
+    isnothing(value) && throw(ValidationError("Missing text field '$field'"))
+    value isa AbstractString && return String[String(value)]
+    value isa Vector && eltype(value) <: AbstractString && return String[String(v) for v in value]
+    (value isa FormFile || value isa Vector{FormFile}) &&
+        throw(ValidationError("Field '$field' is a file upload, expected text"))
+    throw(ValidationError("Field '$field' has unsupported multipart value type $(typeof(value))"))
 end
 
 end

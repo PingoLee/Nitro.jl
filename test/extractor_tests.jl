@@ -333,6 +333,28 @@ function _build_multipart(; boundary::String="----TestBoundary7MA4YWxkTrZu0gW", 
     return body, content_type
 end
 
+# Payload types for the MultipartForm{T} extractor tests
+struct ImportUpload
+    user_id     :: String
+    ibge_id     :: Int
+    dry_run     :: Union{Nothing, Bool}
+    files       :: Vector{FormFile}
+end
+
+@kwdef struct SingleFileUpload
+    category :: String
+    file     :: FormFile
+end
+
+@kwdef struct DefaultsUpload
+    user_id :: String
+    label   :: String = "unlabeled"   # non-nothing default, honored when absent
+    retries :: Int    = 3             # non-nothing default, honored when absent
+    file    :: FormFile
+end
+
+validate(u::ImportUpload) = u.ibge_id > 0 && !isempty(u.user_id)
+
 @testset "Files extractor - single file by name" begin
     body, ct = _build_multipart(parts=[
         Dict(:name => "document", :filename => "report.xlsx", :data => "fake xlsx content")
@@ -375,5 +397,248 @@ end
     @test result isa Files{Vector{FormFile}}
     @test isempty(result.payload)
 end
+
+@testset "MultipartForm - mixed text fields and files" begin
+    body, ct = _build_multipart(parts=[
+        Dict(:name => "user_id", :data => "alice"),
+        Dict(:name => "ibge_id", :data => "355030"),
+        Dict(:name => "dry_run", :data => "true"),
+        Dict(:name => "files", :filename => "a.csv", :data => "row1"),
+        Dict(:name => "files", :filename => "b.csv", :data => "row2"),
+    ])
+    req = HTTP.Request("POST", "/", ["Content-Type" => ct], body)
+    param = Param(:payload, MultipartForm{ImportUpload}, missing, false)
+    result = extract(param, LazyRequest(request=req))
+
+    @test result isa MultipartForm{ImportUpload}
+    data = result.payload
+    @test data.user_id == "alice"
+    @test data.ibge_id == 355030          # parsed Int
+    @test data.dry_run === true           # parsed Bool
+    @test length(data.files) == 2         # Vector{FormFile}
+    @test data.files[1].filename == "a.csv"
+    @test data.files[2].filename == "b.csv"
+end
+
+@testset "MultipartForm - optional field absent binds to nothing" begin
+    body, ct = _build_multipart(parts=[
+        Dict(:name => "user_id", :data => "bob"),
+        Dict(:name => "ibge_id", :data => "1"),
+        Dict(:name => "files", :filename => "x.csv", :data => "data"),
+    ])
+    req = HTTP.Request("POST", "/", ["Content-Type" => ct], body)
+    param = Param(:payload, MultipartForm{ImportUpload}, missing, false)
+    result = extract(param, LazyRequest(request=req))
+    @test result.payload.dry_run === nothing
+end
+
+@testset "MultipartForm - single FormFile field" begin
+    body, ct = _build_multipart(parts=[
+        Dict(:name => "category", :data => "reports"),
+        Dict(:name => "file", :filename => "doc.pdf", :data => "pdf bytes"),
+    ])
+    req = HTTP.Request("POST", "/", ["Content-Type" => ct], body)
+    param = Param(:payload, MultipartForm{SingleFileUpload}, missing, false)
+    result = extract(param, LazyRequest(request=req))
+    @test result.payload.category == "reports"
+    @test result.payload.file isa FormFile
+    @test result.payload.file.filename == "doc.pdf"
+end
+
+@testset "MultipartForm - @kwdef defaults honored when fields absent" begin
+    # Only user_id + file sent; label/retries absent → declared defaults apply.
+    body, ct = _build_multipart(parts=[
+        Dict(:name => "user_id", :data => "erin"),
+        Dict(:name => "file", :filename => "x.csv", :data => "data"),
+    ])
+    req = HTTP.Request("POST", "/", ["Content-Type" => ct], body)
+    param = Param(:payload, MultipartForm{DefaultsUpload}, missing, false)
+    result = extract(param, LazyRequest(request=req)).payload
+    @test result.user_id == "erin"
+    @test result.label == "unlabeled"   # default, not an error
+    @test result.retries == 3           # default, not an error
+
+    # When present, the body value overrides the default.
+    body, ct = _build_multipart(parts=[
+        Dict(:name => "user_id", :data => "erin"),
+        Dict(:name => "label", :data => "q3"),
+        Dict(:name => "retries", :data => "7"),
+        Dict(:name => "file", :filename => "x.csv", :data => "data"),
+    ])
+    req = HTTP.Request("POST", "/", ["Content-Type" => ct], body)
+    result = extract(param, LazyRequest(request=req)).payload
+    @test result.label == "q3"
+    @test result.retries == 7
+end
+
+@testset "MultipartForm - @kwdef missing required (no default) throws" begin
+    # user_id has no default and is absent → ValidationError, not UndefKeywordError.
+    body, ct = _build_multipart(parts=[
+        Dict(:name => "file", :filename => "x.csv", :data => "data"),
+    ])
+    req = HTTP.Request("POST", "/", ["Content-Type" => ct], body)
+    param = Param(:payload, MultipartForm{DefaultsUpload}, missing, false)
+    @test_throws Nitro.Core.Errors.ValidationError extract(param, LazyRequest(request=req))
+end
+
+@testset "MultipartForm - missing required text field throws" begin
+    body, ct = _build_multipart(parts=[
+        Dict(:name => "ibge_id", :data => "1"),
+        Dict(:name => "files", :filename => "x.csv", :data => "data"),
+    ])
+    req = HTTP.Request("POST", "/", ["Content-Type" => ct], body)
+    param = Param(:payload, MultipartForm{ImportUpload}, missing, false)
+    @test_throws Nitro.Core.Errors.ValidationError extract(param, LazyRequest(request=req))
+end
+
+@testset "MultipartForm - unparseable number throws" begin
+    body, ct = _build_multipart(parts=[
+        Dict(:name => "user_id", :data => "x"),
+        Dict(:name => "ibge_id", :data => "not-a-number"),
+        Dict(:name => "files", :filename => "x.csv", :data => "data"),
+    ])
+    req = HTTP.Request("POST", "/", ["Content-Type" => ct], body)
+    param = Param(:payload, MultipartForm{ImportUpload}, missing, false)
+    @test_throws Nitro.Core.Errors.ValidationError extract(param, LazyRequest(request=req))
+end
+
+@testset "MultipartForm - validate(::T) failure throws" begin
+    body, ct = _build_multipart(parts=[
+        Dict(:name => "user_id", :data => "carol"),
+        Dict(:name => "ibge_id", :data => "0"),   # fails validate: ibge_id > 0
+        Dict(:name => "files", :filename => "x.csv", :data => "data"),
+    ])
+    req = HTTP.Request("POST", "/", ["Content-Type" => ct], body)
+    param = Param(:payload, MultipartForm{ImportUpload}, missing, false)
+    @test_throws Nitro.Core.Errors.ValidationError extract(param, LazyRequest(request=req))
+end
+
+@testset "MultipartForm - validation error message stays bounded (no file-byte dump)" begin
+    # A large uploaded file that fails validation must NOT dump its bytes into
+    # the error message (which would otherwise bloat logs by ~the file size).
+    big = repeat("A", 200_000)
+    body, ct = _build_multipart(parts=[
+        Dict(:name => "user_id", :data => "carol"),
+        Dict(:name => "ibge_id", :data => "0"),          # fails validate: ibge_id > 0
+        Dict(:name => "files", :filename => "big.csv", :data => big),
+    ])
+    req = HTTP.Request("POST", "/", ["Content-Type" => ct], body)
+    param = Param(:payload, MultipartForm{ImportUpload}, missing, false)
+    err = try
+        extract(param, LazyRequest(request=req)); nothing
+    catch e
+        e
+    end
+    @test err isa Nitro.Core.Errors.ValidationError
+    @test length(err.msg) < 2_000          # bounded, not ~200 KB
+    @test !occursin(big, err.msg)          # the file bytes are not embedded
+    @test occursin("ImportUpload", err.msg)  # still names the failing type
+end
+
+@testset "MultipartForm - non-multipart body throws" begin
+    req = HTTP.Request("POST", "/", ["Content-Type" => "application/json"], """{}""")
+    param = Param(:payload, MultipartForm{ImportUpload}, missing, false)
+    @test_throws Nitro.Core.Errors.ValidationError extract(param, LazyRequest(request=req))
+end
+
+@testset "MultipartForm - empty multipart body reports the missing field, not Content-Type" begin
+    # A well-formed multipart/form-data body with no parts must NOT be reported
+    # as a Content-Type error — the message should name the missing field.
+    boundary = "----TestBoundaryEmpty"
+    req = HTTP.Request("POST", "/",
+        ["Content-Type" => "multipart/form-data; boundary=$boundary"],
+        "--$boundary--\r\n")
+    param = Param(:payload, MultipartForm{ImportUpload}, missing, false)
+    err = try
+        extract(param, LazyRequest(request=req))
+        nothing
+    catch e
+        e
+    end
+    @test err isa Nitro.Core.Errors.ValidationError
+    @test occursin("user_id", err.msg)
+    @test !occursin("Content-Type", err.msg)
+end
+
+@testset "MultipartForm - file given where text expected throws" begin
+    body, ct = _build_multipart(parts=[
+        Dict(:name => "user_id", :filename => "oops.txt", :data => "uploaded"),  # file, but user_id is text
+        Dict(:name => "ibge_id", :data => "1"),
+        Dict(:name => "files", :filename => "x.csv", :data => "data"),
+    ])
+    req = HTTP.Request("POST", "/", ["Content-Type" => ct], body)
+    param = Param(:payload, MultipartForm{ImportUpload}, missing, false)
+    @test_throws Nitro.Core.Errors.ValidationError extract(param, LazyRequest(request=req))
+end
+
+end
+
+@testitem "MultipartForm end-to-end dispatch" tags=[:core] setup=[NitroCommon] begin
+
+using Test
+using HTTP
+using Nitro
+using Nitro: path, FormFile, MultipartForm
+
+# Uses a *local* ServerContext + internalrequest, so this item mutates no global
+# router/server state and is safe to run in parallel with other test items.
+
+struct E2EUpload
+    user_id :: String
+    count   :: Int
+    files   :: Vector{FormFile}
+end
+
+function upload_handler(req, payload::MultipartForm{E2EUpload})
+    data = payload.payload
+    return Res.json(Dict(
+        "user_id"   => data.user_id,
+        "count"     => data.count,
+        "num_files" => length(data.files),
+        "first"     => isempty(data.files) ? "" : data.files[1].filename,
+    ))
+end
+
+function _multipart_request(target)
+    boundary = "----E2EBoundary"
+    io = IOBuffer()
+    for part in [
+        (name="user_id", data="dave"),
+        (name="count", data="3"),
+        (name="files", filename="a.csv", data="r1"),
+        (name="files", filename="b.csv", data="r2"),
+    ]
+        write(io, "--$boundary\r\n")
+        if haskey(part, :filename)
+            write(io, "Content-Disposition: form-data; name=\"$(part.name)\"; filename=\"$(part.filename)\"\r\n")
+            write(io, "Content-Type: application/octet-stream\r\n")
+        else
+            write(io, "Content-Disposition: form-data; name=\"$(part.name)\"\r\n")
+        end
+        write(io, "\r\n$(part.data)\r\n")
+    end
+    write(io, "--$boundary--\r\n")
+    return HTTP.Request("POST", target, ["Content-Type" => "multipart/form-data; boundary=$boundary"], take!(io))
+end
+
+ctx = Nitro.Core.ServerContext()
+Nitro.Core.Routing.urlpatterns(ctx, "/api", Nitro.RouteDefinition[
+    path("/upload", upload_handler, method="POST"),
+])
+
+r = Nitro.Core.internalrequest(ctx, _multipart_request("/api/upload"))
+@test r.status == 200
+body = Nitro.json(r)
+@test body["user_id"] == "dave"
+@test body["count"] == 3
+@test body["num_files"] == 2
+@test body["first"] == "a.csv"
+
+# Bad payload (count not a number) → 400 ValidationError
+bad = HTTP.Request("POST", "/api/upload",
+    ["Content-Type" => "multipart/form-data; boundary=b"],
+    "--b\r\nContent-Disposition: form-data; name=\"user_id\"\r\n\r\nx\r\n--b\r\nContent-Disposition: form-data; name=\"count\"\r\n\r\nNaN\r\n--b--\r\n")
+r = Nitro.Core.internalrequest(ctx, bad)
+@test r.status == 400
 
 end

@@ -17,6 +17,25 @@ Every uploaded file is represented as a [`FormFile`](@ref) with four fields:
 | `content_type` | `String`         | MIME type (e.g. `"application/octet-stream"`)    |
 | `data`         | `Vector{UInt8}`  | Raw file bytes                                   |
 
+!!! warning "Never trust `filename` — sanitize before writing to disk"
+    `FormFile.filename` is attacker-controlled. Writing it directly —
+    `write(joinpath("uploads", f.filename), f.data)` — is a **path-traversal**
+    vulnerability: a client can send `../../etc/cron.d/evil` or an absolute path
+    and escape your upload directory. Always reduce the filename to a bare,
+    validated basename first. The examples below use this helper:
+
+    ```julia
+    # Strip any directory components and reject empty / dot names.
+    function safe_filename(name::AbstractString)
+        base = basename(name)                       # drops ".." / "/" path parts
+        (isempty(base) || base in (".", "..")) && return string("upload_", rand(UInt32))
+        return base
+    end
+    ```
+
+    For stronger guarantees, generate your own name (e.g. a UUID) and keep the
+    original only as metadata, as the worker example near the end does.
+
 ## Project structure
 
 For a module that handles file uploads the recommended layout is:
@@ -60,7 +79,7 @@ function upload_mixed(req)
     attachments = attachments isa FormFile ? [attachments] : attachments
 
     for f in attachments
-        write(joinpath("uploads", f.filename), f.data)
+        write(joinpath("uploads", safe_filename(f.filename)), f.data)
     end
 
     return Res.json(Dict(
@@ -91,7 +110,7 @@ export upload_single, upload_all
 function upload_single(req, document::Files{FormFile})
     file = document.payload
 
-    write(joinpath("uploads", file.filename), file.data)
+    write(joinpath("uploads", safe_filename(file.filename)), file.data)
 
     return Res.json(Dict(
         "saved"        => file.filename,
@@ -104,7 +123,7 @@ function upload_all(req, files::Files{Vector{FormFile}})
     all_files = files.payload
 
     for f in all_files
-        write(joinpath("uploads", f.filename), f.data)
+        write(joinpath("uploads", safe_filename(f.filename)), f.data)
     end
 
     return Res.json(Dict(
@@ -115,6 +134,59 @@ end
 
 end # module UploadHandlers
 ```
+
+### Using the `MultipartForm` extractor (text fields **and** files)
+
+`Files{T}` only extracts files. When a request mixes **typed text fields and files** in the
+same `multipart/form-data` body — the common "metadata + upload" case — declare a
+`MultipartForm{T}` parameter. Nitro parses the body once and binds every field of `T` by
+its type, with validation and automatic `400` responses on bad input.
+
+```julia
+struct ImportUpload
+    user_id  :: String
+    ibge_id  :: Int                       # text field, parsed to Int
+    dry_run  :: Union{Nothing, Bool}      # optional — `nothing` when absent
+    tags     :: Vector{String}            # repeated text fields
+    files    :: Vector{FormFile}          # all files under the "files" field
+end
+
+# Optional: a validator runs automatically; returning `false` → 400
+Nitro.validate(u::ImportUpload) = u.ibge_id > 0 && !isempty(u.user_id)
+
+function upload_mixed(req, upload::MultipartForm{ImportUpload})
+    data = upload.payload                 # fully typed ImportUpload
+
+    for f in data.files
+        write(joinpath("uploads", safe_filename(f.filename)), f.data)
+    end
+
+    return Res.json(Dict(
+        "user_id" => data.user_id,
+        "ibge_id" => data.ibge_id,
+        "dry_run" => data.dry_run,
+        "files"   => [f.filename for f in data.files],
+    ))
+end
+```
+
+Field binding rules:
+
+| Field type in `T`           | Bound from                                        |
+|-----------------------------|---------------------------------------------------|
+| `String`                    | single text field (matched by field name)         |
+| `Int`, `Float64`, `Bool`, … | single text field, parsed                          |
+| `Vector{String}`            | all text fields sent under that name              |
+| `FormFile`                  | single uploaded file                              |
+| `Vector{FormFile}`          | all uploaded files under that name                |
+| `Union{X, Nothing}`         | optional — binds to `nothing` when the field is absent |
+
+`T` only needs to be constructible from its fields in declaration order, so a plain `struct`
+or a `@kwdef struct` both work. With a `@kwdef struct`, a field's default is used when that
+field is absent from the body (a `Union{…, Nothing}` field still binds to `nothing` when
+absent, which takes precedence over a default). A missing required field, an unparseable
+value, or a failing `validate(::T)` all raise a `ValidationError`, which Nitro turns into a
+`400` response.
 
 ## Routes (the "urls")
 
@@ -167,9 +239,10 @@ const STAGING_DIR = "data/tmp"
 function submit_import(req, upload::Files{FormFile})
     file = upload.payload
 
-    # 1. Stage to disk
+    # 1. Stage to disk — the UUID task_key is the real identity; the original
+    #    filename is sanitized to a bare basename so it can't traverse paths.
     task_key   = "import_$(uuid4())"
-    staged_path = joinpath(STAGING_DIR, "$(task_key)_$(file.filename)")
+    staged_path = joinpath(STAGING_DIR, "$(task_key)_$(safe_filename(file.filename))")
     mkpath(dirname(staged_path))
     write(staged_path, file.data)
 

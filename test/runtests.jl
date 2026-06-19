@@ -1,3 +1,21 @@
+# ── Bootstrap test-only dependencies ──────────────────────────────────────────
+# Test-only deps (Suppressor, ProtoBuf, …) live in `[extras]` / `[targets].test`,
+# so they are only on the load path under `Pkg.test()`. When this file is run
+# directly — `julia --project=. test/runtests.jl <args>` — those packages are
+# missing and every test item errors with "Package X not found in current path".
+# Detect that case and re-dispatch through `Pkg.test` once, forwarding the CLI
+# args, so all the documented commands below work without extra ceremony.
+if Base.identify_package("Suppressor") === nothing && get(ENV, "NITRO_TEST_REDISPATCH", "0") == "0"
+    import Pkg
+    withenv("NITRO_TEST_REDISPATCH" => "1") do
+        # Forward this launcher's thread count to the test subprocess, so
+        # `julia -t auto … runtests.jl` still runs test items multithreaded
+        # after the re-dispatch (relevant for in-process runs, i.e. no --workers).
+        Pkg.test(; test_args = ARGS, julia_args = `-t $(Threads.nthreads())`)
+    end
+    exit(0)
+end
+
 using ReTestItems
 using Nitro
 
@@ -97,11 +115,22 @@ const TEST_FILES = [
 ]
 
 # ── CLI argument parsing ───────────────────────────────────────────────────────
-# Supports:
+# Supports (test deps are auto-provisioned via the bootstrap block above):
 #   julia --project=. test/runtests.jl test/sessionstores_tests.jl
 #   julia --project=. test/runtests.jl --tags core --name "Session stores"
-#   julia -t auto --project=. test/runtests.jl --workers 2
-#   julia --project=. test/runtests.jl test\middleware\ratelimitter_lru_tests.jl --workers 2
+#   julia -t auto --project=. test/runtests.jl                 # in-process, multithreaded
+#   julia --project=. test/runtests.jl --workers 3             # parallel worker processes
+#   julia --project=. test/runtests.jl test\middleware\ratelimitter_lru_tests.jl
+#
+#   Flags: --tags <tag>   filter by @testitem tag
+#          --name <name>  filter by test item name (substring)
+#          --workers <n>  number of ReTestItems worker processes
+#   Bare paths select files/dirs; Windows (\) and POSIX (/) separators both work.
+#
+#   Threads vs workers: `-t auto` gives the in-process run multiple threads (used
+#   when --workers is omitted). With --workers <n>, items run in worker processes
+#   whose thread count is ReTestItems' nworker_threads (1 by default), so `-t` on
+#   the launcher does not affect them.
 let args = copy(ARGS)
     paths     = String[]
     tags      = Symbol[]
@@ -117,6 +146,7 @@ let args = copy(ARGS)
         elseif a == "--workers" && !isempty(args)
             nworkers = parse(Int, popfirst!(args))
         elseif !startswith(a, "--")
+            a = replace(a, '\\' => '/')   # accept Windows-style separators on any OS
             push!(paths, isabspath(a) ? a : joinpath(@__DIR__, "..", a))
         end
     end

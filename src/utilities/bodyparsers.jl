@@ -66,6 +66,11 @@ end
 Read the html form data from the body of a HTTP.Request
 """
 function formdata(req::HTTP.Request) :: Dict{String,String}
+    # multipart/form-data is not urlencoded — parsing it here yields a garbage
+    # key. Use `multipart(req)` (`req.files` / `req.post`) for multipart bodies.
+    if occursin("multipart/form-data", HTTP.header(req, "Content-Type", ""))
+        return copy(EMPTY_FORM_DATA)
+    end
     body = text(req)
     if isnothing(body) || !occursin('=', body)
         return copy(EMPTY_FORM_DATA)
@@ -195,7 +200,7 @@ end
 """
 function multipart(req::HTTP.Request) :: Dict{String, Union{FormFile, Vector{FormFile}, String, Vector{String}}}
     result = Dict{String, Union{FormFile, Vector{FormFile}, String, Vector{String}}}()
-    
+
     parts = try
         HTTP.parse_multipart_form(req)
     catch
@@ -206,31 +211,35 @@ function multipart(req::HTTP.Request) :: Dict{String, Union{FormFile, Vector{For
         return result
     end
 
+    # Collect files and text into separate, homogeneously-typed buckets. This
+    # keeps the per-field vectors correctly typed (`Vector{FormFile}` /
+    # `Vector{String}`) and, crucially, prevents a field name that anomalously
+    # carries both a file part and a text part from collapsing into a
+    # `Vector{Any}` — which the typed result Dict cannot hold and which used to
+    # throw a `MethodError` (a client-triggerable 500 via `req.files`/`req.post`).
+    files = Dict{String, Vector{FormFile}}()
+    texts = Dict{String, Vector{String}}()
     for part in parts
         name = part.name
         if !isnothing(part.filename) && !isempty(part.filename)
-            file = FormFile(name, part.filename, part.contenttype, read(part.data))
-            _multipart_append!(result, name, file)
+            push!(get!(() -> FormFile[], files, name),
+                  FormFile(name, part.filename, part.contenttype, read(part.data)))
         else
-            value = String(read(part.data))
-            _multipart_append!(result, name, value)
+            push!(get!(() -> String[], texts, name), String(read(part.data)))
         end
+    end
+
+    # A file field wins its name (a filename is an explicit upload); a text part
+    # sent under a name already used by a file is dropped rather than crashing.
+    for (name, fs) in files
+        result[name] = length(fs) == 1 ? fs[1] : fs
+    end
+    for (name, ts) in texts
+        haskey(result, name) && continue
+        result[name] = length(ts) == 1 ? ts[1] : ts
     end
 
     return result
-end
-
-function _multipart_append!(dict, key::String, value)
-    if haskey(dict, key)
-        existing = dict[key]
-        if existing isa Vector
-            push!(existing, value)
-        else
-            dict[key] = [existing, value]
-        end
-    else
-        dict[key] = value
-    end
 end
 
 end # module BodyParsers
