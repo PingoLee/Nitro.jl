@@ -18,7 +18,13 @@ Read `nitro-config.instructions.md` for config ownership rules before recommendi
 
 - [ ] Production config does not rely on committed secrets.
 - [ ] Session/crypto secrets (`SECRET_KEY`, cookie keys, JWT secrets) come from environment or a non-committed local file.
-- [ ] Debug/dev-only flags are off in production (no verbose error leakage to clients).
+- [ ] Error handling is production-safe. Nitro **never** sends stack traces to clients:
+      a handler that throws returns a generic `{"message": "500: Internal Server Error"}`
+      (via `catch_errors=true`, the default). The `serve(...; show_errors=true)` kwarg
+      (default `true`) gates only **server-side** error logging, *not* the client response.
+      Keep it `true` in production so failures are recorded in your logs — setting
+      `show_errors=false` does not harden the response (it is already generic); it only
+      silences your own error logs.
 - [ ] Worker and DB connection strings use the correct env for the target (`nitro-config.instructions.md`).
 
 Report missing env vars by name; do not invent secret values.
@@ -34,6 +40,11 @@ Report missing env vars by name; do not invent secret values.
 - [ ] `serve(urlpatterns; middleware=[...])` order: global middleware → defaults → router (`nitro-core.instructions.md`).
 - [ ] `SessionMiddleware` / `CSRFMiddleware` present for stateful cookie apps.
 - [ ] `spafiles` or static config matches how the frontend is served in production.
+- [ ] Access logging is privacy-safe. `serve(...; access_log=true)` (default on) logs the
+      request **path only** — query strings are redacted so reset tokens, API keys, and
+      OAuth `code`/`state` carried in URLs never reach the logs. Enable
+      `serve(...; access_log_query=true)` only when you are certain no secrets travel in
+      query strings.
 - [ ] Worker `startup(..., store=..., recover_zombies=...)` configured if background queues are used (`workers.instructions.md`).
 
 ## 4. Reverse proxy (when requested)
@@ -52,7 +63,10 @@ If the user uses nginx (or similar) in front of Nitro:
       `RateLimiter(...; trusted_proxies=[ip"127.0.0.1"])` (honor headers only when
       the peer is a listed proxy — preferred), or `trust_forwarded=true` (trust any
       peer; only when clients cannot reach Nitro directly). Make the proxy set
-      `X-Forwarded-For`/`X-Real-IP`.
+      `X-Forwarded-For`/`X-Real-IP`. The socket peer IP is resolved for **both** plain
+      HTTP and direct-TLS listeners; if a Nitro/HTTP upgrade ever breaks that resolution
+      it now logs a loud, rate-limited error (and the request falls back to loopback)
+      rather than silently degrading IP-based limits and audit logs — watch for it.
 
 Provide a minimal config snippet only when asked; do not overwrite existing infra files without confirmation.
 

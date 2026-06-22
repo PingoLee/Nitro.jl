@@ -49,6 +49,21 @@ const REQUEST_FILES_CACHE_KEY = :__nitro_request_files
 const REQUEST_POST_CACHE_KEY = :__nitro_request_post
 const REQUEST_CONTEXT_KEY = :__nitro_app_context
 
+# ── HTTP.jl v2 compatibility shim ───────────────────────────────────────────────
+# The HTTP private/undocumented *functions* Nitro's request layer reaches into are
+# wrapped here, so an HTTP upgrade that renames one is a single-line fix instead of
+# a grep hunt. Guarded by the "HTTP internals contract" canary in
+# test/http_internals_contract_tests.jl.
+#
+# Deliberately NOT centralized here: the `HTTP.EmptyBody`/`HTTP.BytesBody` body
+# *types* (dispatched on inline in bodyparsers.jl / core.jl) and the `_peer_ip`
+# stream-layout reach (below) — both carry their own canary coverage. Each wrapper
+# uses `getfield` (not property access) so it never re-enters the overridden
+# `getproperty` defined in `_install_request_getproperty!`.
+_http_metadata(req::HTTP.Request)          = HTTP._request_context_metadata!(getfield(req, :context))
+_http_version(req::HTTP.Request)           = VersionNumber(Int(getfield(req, :proto_major)), Int(getfield(req, :proto_minor)))
+_http_stream_request(stream::HTTP.Stream)  = HTTP._buffered_stream_request(stream)
+
 function request_cache!(builder::Function, req::HTTP.Request, key::Symbol)
     if haskey(req.context, key)
         return req.context[key]
@@ -152,9 +167,9 @@ function _install_request_getproperty!()
             return Base.get(req.context, :ip, nothing)
         elseif sym === :context
             # Preserve HTTP.jl v2 semantics: `.context` returns the metadata view.
-            return HTTP._request_context_metadata!(getfield(req, :context))
+            return _http_metadata(req)
         elseif sym === :version
-            return VersionNumber(Int(getfield(req, :proto_major)), Int(getfield(req, :proto_minor)))
+            return _http_version(req)
         else
             return getfield(req, sym)
         end
@@ -310,6 +325,40 @@ function ReviseHandler()
     end
 end
 
+"""
+    serve(; middleware=[], host="127.0.0.1", port=8080, kwargs...) -> Server
+
+Start the Nitro HTTP server with the registered routes. Runs until `terminate()`
+(or `Ctrl-C`); pass `async=true` to return immediately and serve in the background.
+
+# Keyword arguments
+- `middleware=[]`: global middleware applied to every request, outermost first.
+- `host="127.0.0.1"`, `port=8080`: listen address. Keep `host` on loopback when a
+  reverse proxy terminates TLS in front of Nitro.
+- `async=false`: when `true`, return the running `Server` instead of blocking.
+- `parallel=true`: handle requests on the thread pool via `Threads.@spawn`.
+- `serialize=true`: auto-format handler return values into responses (see `Res`).
+- `catch_errors=true`: convert a thrown handler error into a generic
+  `500 Internal Server Error`. **Stack traces are never sent to the client** —
+  the body is always `{"message": "500: Internal Server Error"}`.
+- `show_errors=true`: gate **server-side** error logging only (not the client
+  response). Leave it `true` in production so failures are recorded in your logs;
+  `false` merely silences those logs and does *not* harden the already-generic response.
+- `access_log=true`: emit one log line per request. By default only the request
+  **path** is logged — query strings are redacted so tokens, API keys, and OAuth
+  `code`/`state` carried in URLs never reach the logs.
+- `access_log_query=false`: set `true` to log the full target including the query
+  string. Only enable when you are certain no secrets travel in query strings.
+- `prefix=nothing`: strip a global URL prefix (e.g. `"/api"`) before routing.
+- `revise=:none`: `:lazy`/`:eager` enable Revise-based hot reload (dev only).
+- `secret_key`, `httponly`, `secure`, `samesite`: override cookie defaults for this run.
+
+IP-based controls (rate limiting, audit logging) key on the socket peer address,
+resolved for both plain-HTTP and direct-TLS listeners. Behind a reverse proxy,
+configure `ExtractIP`/`RateLimiter` with `trusted_proxies` so per-client limits work.
+
+See also `terminate`, `RateLimiter`, and `ExtractIP`.
+"""
 function serve(ctx::ServerContext;
     middleware=[],
     handler=stream_handler,
@@ -322,6 +371,7 @@ function serve(ctx::ServerContext;
     show_errors=true,
     show_banner=true,
     access_log=true,
+    access_log_query=false,
     external_url=nothing,
     prefix=nothing,
     context=missing,
@@ -370,7 +420,7 @@ function serve(ctx::ServerContext;
         insert!(middleware, 1, ReviseHandler())
     end
 
-    configured_middelware = setupmiddleware(ctx; middleware, serialize, catch_errors, show_errors, access_log)
+    configured_middelware = setupmiddleware(ctx; middleware, serialize, catch_errors, show_errors, access_log, access_log_query)
     handle_stream = handler(configured_middelware)
 
     if parallel
@@ -437,17 +487,45 @@ end
 # framework still needs to emit a serialized `Response`.
 _response_started(stream::HTTP.Stream)::Bool = (@atomic :acquire stream.response_started)
 
+# Resolve the underlying Reseau `TCP.FD` (which carries `raddr`) from the server connection.
+# The connection is transport-dependent: a plaintext `Reseau.TCP.Conn` exposes `:fd`
+# directly, while a `Reseau.TLS.Conn` wraps the TCP connection under `:tcp` and has no `:fd`
+# of its own. The earlier `conn.fd` shortcut therefore worked for HTTP but threw for *every*
+# HTTPS connection, silently sending every TLS client's IP to loopback. We branch on field
+# presence rather than importing Reseau (a transitive dep that must not leak into `src/`); an
+# unrecognized layout raises, which `_peer_ip` turns into the structural-break alarm below.
+function _conn_fd(conn)
+    if hasfield(typeof(conn), :fd)        # Reseau.TCP.Conn
+        return getfield(conn, :fd)
+    elseif hasfield(typeof(conn), :tcp)   # Reseau.TLS.Conn wraps a TCP.Conn under :tcp
+        return getfield(getfield(conn, :tcp), :fd)
+    end
+    error("Nitro: unrecognized Reseau connection type $(typeof(conn)) — no `:fd` or `:tcp` field")
+end
+
 # HTTP.jl v1's `Sockets.getpeername(::HTTP.Stream)` no longer works in v2 — server streams
 # are not raw sockets. The peer address is reachable through the server connection that v2
-# tracks on the stream (`stream.tracked.conn`, a Reseau `TCP.Conn`/`TLS.Conn`, whose `fd`
-# carries `raddr`). Navigate that path defensively and fall back to loopback when the
-# address is unavailable (e.g. a future internal layout change) so a request is never
-# failed merely because the client IP couldn't be determined.
+# tracks on the stream (`stream.tracked.conn`, a Reseau `TCP.Conn`/`TLS.Conn`, whose backing
+# `TCP.FD` carries `raddr`; see `_conn_fd`). Navigate that path defensively and fall back to
+# loopback when the address is unavailable so a request is never failed merely because the
+# client IP couldn't be determined — but make that fallback *loud*. Silently treating every
+# client as loopback degrades IP-based controls (rate limiting keys collapse to one bucket,
+# audit logs lose the source IP) and, combined with `ExtractIP(trusted_proxies=[loopback])`,
+# would cause `X-Forwarded-For` to be trusted from every client. We distinguish two cases:
+#   * `raddr === nothing` — a legitimate runtime condition for some connection types; warn.
+#   * a thrown `getfield` — the HTTP/Reseau internal layout this reaches into has likely
+#     changed; this is a structural break, so log it as an error with the exception.
+# Both use `maxlog=1` so a persistent failure can't flood the log one line per request.
 function _peer_ip(stream::HTTP.Stream)::IPAddr
     try
         conn = getfield(getfield(stream, :tracked), :conn)
-        raddr = getfield(getfield(conn, :fd), :raddr)
-        raddr === nothing && return Sockets.localhost
+        raddr = getfield(_conn_fd(conn), :raddr)
+        if raddr === nothing
+            @warn "Nitro: peer address unavailable on this connection; falling back to " *
+                  "loopback. IP-based rate limiting, audit logging and trusted-proxy " *
+                  "checks are degraded for affected requests." maxlog=1
+            return Sockets.localhost
+        end
         ip = getfield(raddr, :ip)
         if length(ip) == 4
             return IPv4(ip[1], ip[2], ip[3], ip[4])
@@ -458,7 +536,13 @@ function _peer_ip(stream::HTTP.Stream)::IPAddr
             end
             return IPv6(acc)
         end
-    catch
+    catch err
+        @error "Nitro: could not read the peer IP from HTTP stream internals — the " *
+               "HTTP.jl/Reseau stream layout `_peer_ip` reaches into may have changed. " *
+               "Falling back to loopback, which SILENTLY DEGRADES IP-based rate limiting " *
+               "and audit logging, and (with `trusted_proxies` set) can cause " *
+               "X-Forwarded-For to be trusted from every client. Pin HTTP.jl/Reseau and " *
+               "verify `_peer_ip`." exception=(err, catch_backtrace()) maxlog=1
         return Sockets.localhost
     end
 end
@@ -487,7 +571,7 @@ end
 function stream_handler(middleware::Function)
     return function(stream::HTTP.Stream)
         ip = _peer_ip(stream)
-        req = HTTP._buffered_stream_request(stream)
+        req = _http_stream_request(stream)
         req.context[:ip] = ip
         req.context[:stream] = stream
 
@@ -527,7 +611,7 @@ function _app_context_seed(ctx::ServerContext)
     end
 end
 
-function setupmiddleware(ctx::ServerContext; middleware::Vector=[], serialize::Bool=true, catch_errors::Bool=true, show_errors=true, access_log=false)::Function
+function setupmiddleware(ctx::ServerContext; middleware::Vector=[], serialize::Bool=true, catch_errors::Bool=true, show_errors=true, access_log=false, access_log_query::Bool=false)::Function
     raw_middleware = reverse(middleware)
     processed_middleware = process_middleware(ctx, raw_middleware)
 
@@ -540,7 +624,7 @@ function setupmiddleware(ctx::ServerContext; middleware::Vector=[], serialize::B
     global_prefix_middleware = !isnothing(ctx.service.prefix[]) ? [PrefixStripMiddleware(ctx.service.prefix[])] : []
     serializer = serialize ? [DefaultSerializer(catch_errors; show_errors)] : []
     # Accept `true` to enable; `nothing`/`false` (or the old logfmt value) disable it.
-    access_log_middleware = access_log === true ? [AccessLogMiddleware()] : []
+    access_log_middleware = access_log === true ? [AccessLogMiddleware(; log_query=access_log_query)] : []
 
     return reduce(|>, [
         ctx.service.router,
@@ -599,19 +683,26 @@ function internalrequest(ctx::ServerContext, req::HTTP.Request; middleware::Vect
 end
 
 """
-    AccessLogMiddleware()
+    AccessLogMiddleware(; log_query::Bool=false)
 
 Logs one line per request once the response status is known, mirroring the old
 HTTP.jl v1 `access_log` default (`\$time_iso8601 - \$remote_addr:\$remote_port - "\$request" \$status`).
 HTTP.jl v2 removed the `logfmt`/`access_log` server kwargs, so request logging now
 lives in the middleware chain.
+
+Security: by default only the request **path** is logged, not the query string.
+Query strings routinely carry secrets (password-reset tokens, API keys, OAuth
+`code`/`state`, signed-URL signatures), and access logs are frequently shipped to
+third-party aggregators. Pass `log_query=true` to log the full target including the
+query when you are sure no sensitive data travels in URLs.
 """
-function AccessLogMiddleware()
+function AccessLogMiddleware(; log_query::Bool=false)
     return function(handle)
         return function(req::HTTP.Request)
             response = handle(req)
             ip = Base.get(req.context, :ip, nothing)
-            @info "$(Dates.format(now(), "yyyy-mm-ddTHH:MM:SS")) - $ip - \"$(req.method) $(req.target)\" $(response.status)"
+            target = log_query ? req.target : HTTP.URI(req.target).path
+            @info "$(Dates.format(now(), "yyyy-mm-ddTHH:MM:SS")) - $ip - \"$(req.method) $target\" $(response.status)"
             return response
         end
     end

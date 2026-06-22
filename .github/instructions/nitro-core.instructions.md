@@ -27,7 +27,7 @@ Whenever you write code, write tests, or propose architecture for this repositor
 
 ## 4. Request and Response Ergonomics
 - **Request Properties**: Use the strict shorthand property accessors (`req.params`, `req.query`, `req.session`, `req.ip`) instead of `req.context` lookup.
-- **Response Builders**: Always return responses using the global `Res` module functions (`Res.json()`, `Res.status()`, `Res.send()`). Avoid returning raw dictionaries or raw strings directly from handlers.
+- **Response Builders**: Always return responses using the global `Res` module functions (`Res.json()`, `Res.status()`, `Res.send()`). Raw returns *are* auto-formatted as a convenience — a `Dict`/struct becomes a JSON body, a `String`/primitive becomes `text/plain`. This is **not** an XSS hole: raw strings are deliberately served as `text/plain` *without* content-sniffing, so an attacker-influenced value can never be reclassified as `text/html`/JS. The reason to prefer `Res.*` is **intent, not safety** — it makes the status code and content type explicit instead of inferred from the return type. Reach for `Res.html`/`Res.js` (which opt into those content types) only when you actually want markup.
 
 ## 5. Security & Middleware
 - **Linear Execution**: Middleware executes strictly Top-Down: Global Prefix Middleware -> Custom Middleware -> Defaults -> Router.

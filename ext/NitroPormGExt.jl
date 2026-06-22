@@ -728,6 +728,14 @@ function __init__()
         PormG.register_field_hook(:PasswordField, :auto_hash, hash_password_field)
     end
 
+    # Tell PormG to skip Nitro's own infrastructure tables (`nitro_session`, `nitro_task`)
+    # during schema introspection / makemigrations, so a consumer's `import_models` never
+    # reverse-engineers them into user models. The knowledge lives here — next to the model
+    # definitions above — rather than being hardcoded into PormG itself.
+    if isdefined(PormG, :register_ignore_tables!)
+        PormG.register_ignore_tables!(["nitro_session", "nitro_task"])
+    end
+
     # Pre-initialize the models so they're ready when needed
     _SESSION_MODEL[] = _define_session_model()
     _TASK_MODEL[] = _define_task_model()
