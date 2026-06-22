@@ -3,7 +3,7 @@ using HTTP
 using Dates
 using Sockets
 using LRUCache
-using ...Core: getip
+using ...Core: getip, header_name_isequal
 
 # Import top level types module
 using ...Types 
@@ -382,13 +382,13 @@ function set_rate_headers!(resp::HTTP.Response, rate_limit::Int, remaining_reque
         # End if all headers are found
         if has_retry && has_limit && has_remaining && has_reset
             break
-        elseif !has_retry && HTTP.Messages.field_name_isequal(k, "Retry-After")
+        elseif !has_retry && header_name_isequal(k, "Retry-After")
             has_retry = true
-        elseif !has_limit && HTTP.Messages.field_name_isequal(k, "X-RateLimit-Limit")
+        elseif !has_limit && header_name_isequal(k, "X-RateLimit-Limit")
             has_limit = true
-        elseif !has_remaining && HTTP.Messages.field_name_isequal(k, "X-RateLimit-Remaining" )
+        elseif !has_remaining && header_name_isequal(k, "X-RateLimit-Remaining" )
             has_remaining = true
-        elseif !has_reset && HTTP.Messages.field_name_isequal(k, "X-RateLimit-Reset")
+        elseif !has_reset && header_name_isequal(k, "X-RateLimit-Reset")
             has_reset = true
         end
     end

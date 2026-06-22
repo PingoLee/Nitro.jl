@@ -8,6 +8,13 @@ import ProtoBuf: encode, decode, ProtoDecoder, ProtoEncoder
 
 export protobuf, extract
 
+# HTTP.jl v2 stores request bodies as `AbstractBody` and may keep response bodies as a
+# raw byte vector or string. Normalize any of these to bytes for protobuf decoding.
+_pb_body_bytes(body::AbstractVector{UInt8}) = body
+_pb_body_bytes(body::AbstractString) = codeunits(String(body))
+_pb_body_bytes(::HTTP.EmptyBody) = UInt8[]
+_pb_body_bytes(body::HTTP.BytesBody) = body.data
+
 """
     protobuf(request::HTTP.Request, type::Type{T}) :: T where {T}
 
@@ -21,12 +28,12 @@ Decode a protobuf message from the body of an HTTP request.
 - The decoded protobuf message of the specified type.
 """
 function protobuf(request::HTTP.Request, type::Type{T}) :: T where {T}
-    io = IOBuffer(request.body)
+    io = IOBuffer(_pb_body_bytes(request.body))
     return decode(ProtoDecoder(io), type)
 end
 
 function protobuf(response::HTTP.Response, type::Type{T}) :: T where {T}
-    io = IOBuffer(response.body)
+    io = IOBuffer(_pb_body_bytes(response.body))
     return decode(ProtoDecoder(io), type)
 end
 

@@ -148,7 +148,7 @@ function Cors(;
         return function(handle::Function)
             return function(req::HTTP.Request)
                 applies(_request_path(req)) || return handle(req)
-                if HTTP.method(req) == "OPTIONS"
+                if req.method == "OPTIONS"
                     return HTTP.Response(200, frozen_headers)
                 end
                 response = handle(req)
@@ -173,7 +173,7 @@ function Cors(;
 
             push!(headers, "Vary" => "Origin")
 
-            if HTTP.method(req) == "OPTIONS"
+            if req.method == "OPTIONS"
                 return HTTP.Response(200, headers)
             end
             response = handle(req)

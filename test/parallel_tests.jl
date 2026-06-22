@@ -70,7 +70,7 @@ localhost = "http://$HOST:$port"
         try
             @suppress_err r = HTTP.get("$localhost/customerror", connect_timeout=3)
         catch e 
-            @test e isa MethodError || e isa HTTP.ExceptionRequest.StatusError
+            @test e isa MethodError || e isa HTTP.StatusError
         end
         
         terminate()

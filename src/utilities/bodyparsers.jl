@@ -26,20 +26,25 @@ end
 
 const EMPTY_FORM_DATA = Dict{String,String}()
 
+# HTTP.jl v2 replaced the raw `Vector{UInt8}` request body (and `HTTP.payload`) with the
+# `AbstractBody` hierarchy. Extract the bytes without consuming the body cursor so the
+# same request body can be read more than once (e.g. `.json` and `.form`). Responses may
+# additionally retain their body as a raw `Vector{UInt8}` or `String` (v2 keeps byte/string
+# bodies as-is so fixtures can inspect `response.body` directly), so handle those too.
+_body_bytes(::HTTP.EmptyBody) = UInt8[]
+_body_bytes(body::HTTP.BytesBody) = Vector{UInt8}(body.data)
+_body_bytes(::Nothing) = UInt8[]
+_body_bytes(body::AbstractVector{UInt8}) = Vector{UInt8}(body)
+_body_bytes(body::AbstractString) = Vector{UInt8}(codeunits(String(body)))
+
 function _request_payload(req::HTTP.Request)
-    payload = HTTP.payload(req)
-    if isnothing(payload) || isempty(payload)
-        return nothing
-    end
-    return payload
+    payload = _body_bytes(req.body)
+    return isempty(payload) ? nothing : payload
 end
 
 function _request_payload(res::HTTP.Response)
-    payload = res.body
-    if isnothing(payload) || isempty(payload)
-        return nothing
-    end
-    return payload
+    payload = _body_bytes(res.body)
+    return isempty(payload) ? nothing : payload
 end
 
 ### Helper functions used to parse the body of a HTTP.Request object
@@ -50,7 +55,7 @@ end
 Read the body of a HTTP.Request as a String
 """
 function text(req::HTTP.Request) :: String
-    body = IOBuffer(HTTP.payload(req))
+    body = IOBuffer(_body_bytes(req.body))
     return eof(body) ? "" : read(seekstart(body), String)
 end
 
@@ -101,7 +106,7 @@ end
 Read the body of a HTTP.Request as a Vector{UInt8}
 """
 function binary(req::HTTP.Request) :: Vector{UInt8}
-    body = IOBuffer(HTTP.payload(req))
+    body = IOBuffer(_body_bytes(req.body))
     return eof(body) ? UInt8[] : readavailable(body)
 end
 

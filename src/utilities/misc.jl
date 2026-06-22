@@ -4,9 +4,9 @@ using Dates
 
 using ..Errors: ValidationError
 
-export recursive_merge, parseparam, 
+export recursive_merge, parseparam,
     redirect, handlerequest,
-    format_response!, set_content_size!, format_sse_message,
+    format_response, header_name_isequal, set_content_size!, format_sse_message,
     join_url_path, is_test
 
 ### Request helper functions ###
@@ -152,44 +152,51 @@ end
     Response Formatter functions
 """
 
-function format_response!(req::HTTP.Request, resp::HTTP.Response)
-    # Return Response's as is without any modifications
-    req.response = resp
-end
+# HTTP.jl v2's `Request` has no mutable `response` scratch field, and `Response{B}` is
+# parametric on its body type (so the body cannot be reassigned in-place after
+# construction). `format_response` therefore builds and returns a fresh `HTTP.Response`
+# from whatever a handler returned.
 
-function format_response!(req::HTTP.Request, content::AbstractString)
+format_response(resp::HTTP.Response) = resp
+
+function format_response(content::AbstractString)
     # Security: serve raw string returns as text/plain. We must NOT content-sniff
     # here — `HTTP.sniff` would classify an attacker-influenced string that looks
     # like markup as text/html, turning a reflected value into stored/reflected
     # XSS. Handlers that intentionally return HTML/JS/etc. must opt in explicitly
     # via the `Res.html`, `Res.js`, ... helpers, which set the type themselves.
     body = string(content)
-    HTTP.setheader(req.response, "Content-Type" => "text/plain; charset=utf-8")
-    HTTP.setheader(req.response, "Content-Length" => string(sizeof(body)))
-
-    req.response.status = 200
-    req.response.body = content
+    return HTTP.Response(200, [
+        "Content-Type" => "text/plain; charset=utf-8",
+        "Content-Length" => string(sizeof(body)),
+    ], body)
 end
 
-function format_response!(req::HTTP.Request, content::Union{Number, Bool, Char, Symbol})
+function format_response(content::Union{Number, Bool, Char, Symbol})
     # Convert all primitvies to a string and set the content type to text/plain
     body = string(content)
-    HTTP.setheader(req.response, "Content-Type" => "text/plain; charset=utf-8")
-    HTTP.setheader(req.response, "Content-Length" => string(sizeof(body)))
-
-    req.response.status = 200
-    req.response.body = body
+    return HTTP.Response(200, [
+        "Content-Type" => "text/plain; charset=utf-8",
+        "Content-Length" => string(sizeof(body)),
+    ], body)
 end
 
-function format_response!(req::HTTP.Request, content::Any)
+function format_response(content::Any)
     # Convert anthything else to a JSON string
     body = JSON.json(content)
-    HTTP.setheader(req.response, "Content-Type" => "application/json; charset=utf-8")
-    HTTP.setheader(req.response, "Content-Length" => string(sizeof(body)))
-
-    req.response.status = 200
-    req.response.body = body    
+    return HTTP.Response(200, [
+        "Content-Type" => "application/json; charset=utf-8",
+        "Content-Length" => string(sizeof(body)),
+    ], body)
 end
+
+"""
+    header_name_isequal(a, b) -> Bool
+
+Case-insensitive comparison of two HTTP header field names. Replaces
+`HTTP.Messages.field_name_isequal`, which was removed in HTTP.jl v2.
+"""
+header_name_isequal(a::AbstractString, b::AbstractString) = lowercase(a) == lowercase(b)
 
 
 

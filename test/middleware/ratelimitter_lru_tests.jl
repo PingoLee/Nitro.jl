@@ -44,7 +44,7 @@ serve(middleware=[RateLimiter(strategy=:sliding_window, rate_limit=3, window=Min
         HTTP.get("$localhost/ok"; retry=false)
         @test false  # Should not reach here
     catch e
-        @test e isa HTTP.Exceptions.StatusError
+        @test e isa HTTP.StatusError
         @test e.response.status == 429
         @test HTTP.header(e.response, "X-RateLimit-Limit") == "3"
         @test HTTP.header(e.response, "X-RateLimit-Remaining") == "0"
@@ -69,7 +69,7 @@ serve(middleware=[RateLimiter(strategy=:sliding_window, rate_limit=1, window=Sec
         HTTP.get("$localhost/ok"; retry=false)
         @test false  # Should not reach here
     catch e
-        @test e isa HTTP.Exceptions.StatusError
+        @test e isa HTTP.StatusError
         @test e.response.status == 429
     end
 
@@ -85,6 +85,11 @@ terminate()
 # Create a server without global middleware but with route-level middleware on /limited/*
 serve(port=PORT, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
 
+# Warm up the route + middleware code paths before the timed bursts below, so first-request
+# JIT compilation isn't spent inside the 3s rate-limit window. These warmup hits age out of
+# the window during the sleeps below, so they don't affect the bucket assertions.
+HTTP.get("$localhost/limited/greet")
+HTTP.get("$localhost/limited/goodbye")
 
 sleep(5) # Ensure rate limiter window is completely reset and any background cleanup is done
 
@@ -108,7 +113,7 @@ sleep(5) # Ensure rate limiter window is completely reset and any background cle
         HTTP.get("$localhost/limited/greet"; retry=false)
         @test false
     catch e
-        @test e isa HTTP.Exceptions.StatusError
+        @test e isa HTTP.StatusError
         @test e.response.status == 429
         @test HTTP.header(e.response, "X-RateLimit-Limit") == "50"
         @test HTTP.header(e.response, "X-RateLimit-Remaining") == "0"
@@ -126,8 +131,10 @@ end
 sleep(3.1) # Ensure rate limiter window is reset before starting next testset
 
 @testset "Limited Other Endpoint Rate Limiter" begin
-    # First request: verify route-level rate limiting headers
-    r = HTTP.request("GET", "$localhost/limited/goodbye", status_exception=false)
+    # First request: verify route-level rate limiting headers. Use `HTTP.get` (pooled
+    # keep-alive) rather than bare `HTTP.request`, so the 25-request burst stays well
+    # inside the 3s window — see the "Limited Greet Endpoint" testset above.
+    r = HTTP.get("$localhost/limited/goodbye")
     @test r.status == 200
     @test text(r) == "goodbye"
     @test HTTP.header(r, "X-RateLimit-Limit") == "25"
@@ -137,20 +144,25 @@ sleep(3.1) # Ensure rate limiter window is reset before starting next testset
 
     # Exhaust remaining quota
     for _ in 2:25
-        HTTP.request("GET", "$localhost/limited/goodbye", status_exception=false)
+        HTTP.get("$localhost/limited/goodbye")
     end
 
     # 26th request should be rate limited (429)
-    r = HTTP.request("GET", "$localhost/limited/goodbye", status_exception=false)
-    @test r.status == 429
-    @test HTTP.header(r, "X-RateLimit-Limit") == "25"
-    @test HTTP.header(r, "X-RateLimit-Remaining") == "0"
-    reset_time = parse(Int, HTTP.header(r, "X-RateLimit-Reset"))
-    @test reset_time > 0 && reset_time <= 3
+    try
+        HTTP.get("$localhost/limited/goodbye"; retry=false)
+        @test false
+    catch e
+        @test e isa HTTP.StatusError
+        @test e.response.status == 429
+        @test HTTP.header(e.response, "X-RateLimit-Limit") == "25"
+        @test HTTP.header(e.response, "X-RateLimit-Remaining") == "0"
+        reset_time = parse(Int, HTTP.header(e.response, "X-RateLimit-Reset"))
+        @test reset_time > 0 && reset_time <= 3
+    end
 
     # Wait for reset and verify recovery
     sleep(3.1)
-    r = HTTP.request("GET", "$localhost/limited/goodbye", status_exception=false)
+    r = HTTP.get("$localhost/limited/goodbye")
     @test r.status == 200
     @test HTTP.header(r, "X-RateLimit-Remaining") == "24"
 end
@@ -185,7 +197,7 @@ serve(middleware=[RateLimiter(strategy=:sliding_window, rate_limit=10, window=Se
         HTTP.get("$localhost/limited"; retry=false)
         @test false
     catch e
-        @test e isa HTTP.Exceptions.StatusError
+        @test e isa HTTP.StatusError
         @test e.response.status == 429
         @test HTTP.header(e.response, "X-RateLimit-Limit") == "10"
         @test HTTP.header(e.response, "X-RateLimit-Remaining") == "0"

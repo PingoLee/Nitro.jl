@@ -232,8 +232,12 @@ function Base.getproperty(request::LazyRequest, sym::Symbol)
 end
 
 pathparams(req::HTTP.Request) = HTTP.getparams(req)
-queryvars(req::HTTP.Request)  = HTTP.queryparams(req)
-headers(req::HTTP.Request)   = Dict(String(k) => String(v) for (k, v) in HTTP.headers(req))
+queryvars(req::HTTP.Request)  = HTTP.queryparams(HTTP.URI(req.target).query)
+# HTTP.jl v2 canonicalizes header field names to Title-Case (e.g. "Content-Type").
+# Header names are case-insensitive per RFC 9110, and downstream consumers (the
+# `Header` extractor's `struct_builder`, cookie lookups) match against lowercase
+# keys, so normalize to lowercase here for stable, case-insensitive access.
+headers(req::HTTP.Request)   = Dict(lowercase(String(k)) => String(v) for (k, v) in req.headers)
 
 jsonbody(req::HTTP.Request; kwargs...) = json(req; kwargs...)
 formbody(req::HTTP.Request)           = formdata(req)

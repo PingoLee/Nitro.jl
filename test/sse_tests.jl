@@ -31,7 +31,7 @@ serve(port=port, host=HOST, async=true, show_errors=false, show_banner=false, ac
 
 @testset "Stream Function tests" begin 
 
-    HTTP.open("GET", "$localhost/events/john", headers=Dict("Connection" => "close")) do io
+    HTTP.open("GET", "$localhost/events/john", ["Connection" => "close"]) do io
         while !eof(io)
             message = String(readavailable(io))
             if !isempty(message) && message != "null"
@@ -40,7 +40,7 @@ serve(port=port, host=HOST, async=true, show_errors=false, show_banner=false, ac
         end
     end
 
-    HTTP.open("GET", "$localhost/events/matt", headers=Dict("Connection" => "close")) do io
+    HTTP.open("GET", "$localhost/events/matt", ["Connection" => "close"]) do io
         while !eof(io)
             message = String(readavailable(io))
             if !isempty(message) && message != "null"

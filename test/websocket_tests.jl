@@ -2,12 +2,13 @@
 using Test
 using HTTP
 using HTTP.WebSockets
+using HTTP.WebSockets: send, receive
 using Nitro
 
 port = get_free_port()
 
 urlpatterns("",
-    path("/ws", function(ws::HTTP.WebSocket)
+    path("/ws", function(ws::HTTP.WebSockets.WebSocket)
         try
             for msg in ws
                 send(ws, "Received message: $msg")
@@ -18,7 +19,7 @@ urlpatterns("",
             end
         end
     end, method="WEBSOCKET"),
-    path("/router/ws", function(ws::HTTP.WebSocket)
+    path("/router/ws", function(ws::HTTP.WebSockets.WebSocket)
         try
             for msg in ws
                 send(ws, "Received message: $msg")
@@ -41,7 +42,7 @@ urlpatterns("",
         end
     end, method="WEBSOCKET"),
     # WebSocket handler registered via GET method (detected by first arg type)
-    path("/ws/get", function(ws::HTTP.WebSocket)
+    path("/ws/get", function(ws::HTTP.WebSockets.WebSocket)
         try
             for msg in ws
                 send(ws, "Received message: $msg")

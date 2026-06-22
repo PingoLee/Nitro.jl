@@ -39,7 +39,7 @@ const METHOD_ALIASES :: Dict{String,String} = Dict(
 
 const TYPE_ALIASES :: Dict{String, Type} = Dict(
     WEBSOCKET   => HTTP.WebSockets.WebSocket,
-    STREAM      => HTTP.Streams.Stream
+    STREAM      => HTTP.Stream
 )
 
 end

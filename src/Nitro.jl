@@ -30,7 +30,12 @@ using .Instances
 include("Workers.jl")
 using .Workers
 
-import HTTP: Request, Response, Stream, WebSocket, queryparams
+import HTTP: Request, Response, Stream, queryparams
+# HTTP.jl v2 no longer exports the stream write primitives (`startwrite`/`closewrite`) at
+# the top level the way v1 did; re-export them (with the read side) so Nitro STREAM/SSE
+# handlers can call them unqualified, as before.
+import HTTP: startread, startwrite, closeread, closewrite
+import HTTP.WebSockets: WebSocket
 using .Core: ServerContext, Nullable, HOFRouter
 using .Core: GET, POST, PUT, DELETE, PATCH
 
@@ -40,38 +45,40 @@ include("exts.jl")
 include("methods.jl")
 
 export  # Server lifecycle
-    serve, terminate, internalrequest,
-    worker_startup,
-    resetstate, instance, router,
-    register_revise_hooks!, clear_revise_hooks!,
-    # File serving
-    staticfiles, dynamicfiles, spafiles,
-    # Util
-    getparams, getquery, getsession, setsession!, getip, setip!, getcontext, payload, getexternalurl,
-    redirect, formdata, multipart, format_sse_message,
-    html, text, json, file, xml, js, css, binary,
-    # Extractors
-    Path, Query, Header, Json, JsonFragment, Form, Body, Cookie, Session, Files, MultipartForm, FormFile, extract, validate,
-    # Extractor extension surface (for app-layer custom extractors)
-    Param, LazyRequest, ValidationError, Nullable,
-    # Cookies & Security
-    configcookies, get_cookie, set_cookie!, Cookies, Errors,
-    regenerate_session!,
-    # Middleware
-    BearerAuth, CookieAuthMiddleware, Cors, RateLimiter, ExtractIP,
-    SessionMiddleware, GuardMiddleware, login_required, role_required, permission_required, CSRFMiddleware,
-    # Optional app extensions
-    Workers,
-    # Auth module
-    Auth,
-    # Common HTTP Types
-    Request, Response, Stream, WebSocket, queryparams,
-    # Context Types and methods
-    Context, context,
-    # Django-style Routing (THE routing API)
-    path, urlpatterns, include_routes, RouteDefinition, url,
-    # Response Abstractions
-    Res
+        serve, terminate, internalrequest,
+        worker_startup,
+        resetstate, instance, router,
+        register_revise_hooks!, clear_revise_hooks!,
+        # File serving
+        staticfiles, dynamicfiles, spafiles,
+        # Util
+        getparams, getquery, getsession, setsession!, getip, setip!, getcontext, payload, getexternalurl,
+        redirect, formdata, multipart, format_sse_message,
+        html, text, json, file, xml, js, css, binary,
+        # Extractors
+        Path, Query, Header, Json, JsonFragment, Form, Body, Cookie, Session, Files, MultipartForm, FormFile, extract, validate,
+        # Extractor extension surface (for app-layer custom extractors)
+        Param, LazyRequest, ValidationError, Nullable,
+        # Cookies & Security
+        configcookies, get_cookie, set_cookie!, Cookies, Errors,
+        regenerate_session!,
+        # Middleware
+        BearerAuth, CookieAuthMiddleware, Cors, RateLimiter, ExtractIP,
+        SessionMiddleware, GuardMiddleware, login_required, role_required, permission_required, CSRFMiddleware,
+        # Optional app extensions
+        Workers,
+        # Auth module
+        Auth,
+        # Common HTTP Types
+        Request, Response, Stream, WebSocket, queryparams,
+        # Streaming primitives (re-exported from HTTP for STREAM/SSE handlers)
+        startread, startwrite, closeread, closewrite,
+        # Context Types and methods
+        Context, context,
+        # Django-style Routing (THE routing API)
+        path, urlpatterns, include_routes, RouteDefinition, url,
+        # Response Abstractions
+        Res
 
 include("precompile.jl")
 end

@@ -24,4 +24,13 @@ using PrecompileTools
         Request("POST", "/precompile/items", ["Content-Type" => "application/json"], "{\"name\":\"test\"}");
         catch_errors=false,
     )
+
+    # NOTE: a live-server round-trip (serve! + loopback HTTP.get) is intentionally NOT added
+    # here. As of HTTP 2.3.0 / Reseau 1.3.1 it no longer hangs precompilation (the earlier
+    # precompile-context Reseau loopback deadlock is fixed), but it gives no benefit: the
+    # live request path is specialized on the user's *specific* handler/middleware closure
+    # types, which only exist at runtime, so the first real network request recompiles them
+    # regardless. A sample precompile route can't stand in for arbitrary user routes — first
+    # request stayed ~3.9s with the live workload vs ~3.3s without it. Not worth the added
+    # precompile cost.
 end
