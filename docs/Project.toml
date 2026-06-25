@@ -4,4 +4,4 @@ Nitro = "e5efdb2c-68ee-4494-894d-55bb80f0a340"
 
 [compat]
 Documenter = "^1.16.0"
-Nitro = "^0.1"
+Nitro = "0.1, 0.2"
