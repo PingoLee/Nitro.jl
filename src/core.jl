@@ -557,6 +557,14 @@ end
 # any Response object that is reused across requests — a common pattern in handler code
 # (e.g. module-level `const` error responses). Reading `BytesBody.data` directly is
 # cursor-independent, so a shared response can be written any number of times.
+#
+# The consume-and-close-on-write of a String→`BytesBody` body is *intentional* upstream
+# behavior (HTTP.jl #1272), not a bug to wait on; `Vector{UInt8}` bodies are written
+# non-destructively by HTTP itself (HTTP.jl #1254). Nitro depends on neither — it writes
+# the bytes here. The `BytesBody.data` field this reaches into is an HTTP internal,
+# canaried in test/http_internals_contract_tests.jl; the reuse-safety it buys is covered
+# behaviorally in test/middleware/authmiddleware_tests.jl. Do not route response bodies
+# back through HTTP's consuming writer.
 _write_response_body!(stream::HTTP.Stream, ::HTTP.EmptyBody) = nothing
 _write_response_body!(stream::HTTP.Stream, ::Nothing) = nothing
 function _write_response_body!(stream::HTTP.Stream, body::HTTP.BytesBody)

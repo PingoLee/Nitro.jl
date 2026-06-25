@@ -3,7 +3,7 @@ using HTTP
 using Dates
 using Sockets
 using LRUCache
-using ...Core: getip, header_name_isequal
+using ...Core: getip, header_name_isequal, own_response_headers
 
 # Import top level types module
 using ...Types 
@@ -180,8 +180,9 @@ function FixedRateLimiter(;
                     set_rate_headers!(response, rate_limit, 0, reset_time)
                     return response
                 else
-                    # Get the response from a properly handled request
-                    response = handle(req)
+                    # Get the response, then own its headers before adding ours — the
+                    # handler's response may be a shared/`const` object.
+                    response = own_response_headers(handle(req))
                     # Add rate limit headers to successful responses
                     set_rate_headers!(response, rate_limit, remaining_requests, reset_time)
                     return response
@@ -304,7 +305,8 @@ function SlidingRateLimiter(;
                     else
                         # This request is within the limit
                         push!(timestamps, current_time)
-                        response = handle(req)
+                        # Own the handler's (possibly shared/`const`) response before adding headers.
+                        response = own_response_headers(handle(req))
                         remaining_requests = rate_limit - length(timestamps)
                         # Time until oldest request expires (when 1 slot becomes available)
                         reset_time = compute_reset_time_safe(current_time, timestamps)

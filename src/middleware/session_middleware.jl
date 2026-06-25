@@ -8,6 +8,7 @@ using ...Types: AbstractSessionStore, MemoryStore, SessionPayload, Nullable
 using ...Types: CookieConfig
 using ...Cookies: get_cookie, set_cookie!, storesession!, prunesessions!, regenerate_session!
 using ...Crypto: secure_uuid4
+using ...Core: own_response_headers
 
 export SessionMiddleware
 
@@ -85,6 +86,11 @@ function SessionMiddleware(;
             if session_changed
                 _save_session(store, final_session_id, current_session, max_age)
 
+                # Own the headers before adding Set-Cookie: `response` may be a shared/`const`
+                # object (e.g. an auth-rejection response). Mutating it in place would attach
+                # this visitor's session cookie to every later request that returns the same
+                # object — a cross-request session leak — and races other threads.
+                response = own_response_headers(response)
                 # Append the session cookie without clobbering any sibling Set-Cookie headers.
                 set_cookie!(response, cookie_name, final_session_id; config=config, encrypted=false, maxage=max_age)
             end

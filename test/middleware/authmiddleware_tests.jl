@@ -81,6 +81,27 @@ serve(port=port, host=HOST, async=true, show_errors=false, show_banner=false, ac
     @test text(r) == "Hello, TestUser!"
 end
 
+@testset "Reused const error Response survives repeated requests (HTTP.jl footgun guard)" begin
+    # `BearerAuth` returns the module-level `const EXPIRED_TOKEN` / `INVALID_HEADER`
+    # `Response` objects (String bodies) on every rejection. HTTP.jl's own write path would
+    # consume the String body's single-use `BytesBody` cursor on first send and serve an
+    # empty/truncated body on every reuse afterwards; Nitro's `_write_response_body!`
+    # (src/core.jl) writes `BytesBody.data` directly, non-destructively. Hit each shared
+    # const several times on a kept-alive connection and assert the body is intact every
+    # time — a regression to HTTP's consuming writer would empty or truncate these here.
+    for _ in 1:4
+        r = HTTP.get("$localhost/auth/protected";
+                     headers=Dict("Authorization" => "Bearer badtoken"), status_exception=false)
+        @test r.status == 401
+        @test text(r) == "Unauthorized: Invalid or expired token"     # const EXPIRED_TOKEN
+    end
+    for _ in 1:4
+        r = HTTP.get("$localhost/auth/protected"; status_exception=false)
+        @test r.status == 401
+        @test text(r) == "Unauthorized: Missing or invalid Authorization header"  # const INVALID_HEADER
+    end
+end
+
 @testset "CookieAuthMiddleware unit tests" begin
     # Build middleware
     mw = CookieAuthMiddleware(validate_token, cookie_name="my_auth_cookie")
