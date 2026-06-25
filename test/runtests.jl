@@ -109,6 +109,7 @@ const TEST_FILES = [
     "middleware/cors_middleware_tests.jl",
     "middleware/lifecycle_middleware_tests.jl",
     "middleware/session_middleware_tests.jl",
+    "middleware/shared_response_mutation_tests.jl",
     "middleware/guards_tests.jl",
 
     # ── Quality Gate ──────────────────────────────────────────────────────────

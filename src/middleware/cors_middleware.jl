@@ -2,6 +2,7 @@ module CORSMiddleware
 
 using HTTP
 using ...Types
+using ...Core: add_response_headers
 
 export Cors
 
@@ -151,9 +152,9 @@ function Cors(;
                 if req.method == "OPTIONS"
                     return HTTP.Response(200, frozen_headers)
                 end
-                response = handle(req)
-                append!(response.headers, frozen_headers)
-                return response
+                # Return a fresh response with the CORS headers added — never mutate the
+                # handler's response in place, which may be a shared/`const` object.
+                return add_response_headers(handle(req), frozen_headers)
             end
         end
     end
@@ -176,9 +177,9 @@ function Cors(;
             if req.method == "OPTIONS"
                 return HTTP.Response(200, headers)
             end
-            response = handle(req)
-            append!(response.headers, headers)
-            return response
+            # Fresh response with CORS headers added; `headers` carries this request's
+            # echoed Origin, so mutating a shared response in place would leak it to others.
+            return add_response_headers(handle(req), headers)
         end
     end
 end

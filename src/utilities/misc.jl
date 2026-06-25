@@ -7,7 +7,8 @@ using ..Errors: ValidationError
 export recursive_merge, parseparam,
     redirect, handlerequest,
     format_response, header_name_isequal, set_content_size!, format_sse_message,
-    join_url_path, is_test
+    join_url_path, is_test,
+    own_response_headers, add_response_headers
 
 ### Request helper functions ###
 
@@ -197,6 +198,59 @@ Case-insensitive comparison of two HTTP header field names. Replaces
 `HTTP.Messages.field_name_isequal`, which was removed in HTTP.jl v2.
 """
 header_name_isequal(a::AbstractString, b::AbstractString) = lowercase(a) == lowercase(b)
+
+"""
+    own_response_headers(resp::HTTP.Response) -> HTTP.Response
+
+Return a copy of `resp` that owns its `headers` vector, so a caller can add response
+headers without mutating `resp` in place.
+
+Response objects are routinely shared across requests and threads — module-level `const`
+error responses, cached responses — and Nitro's server is multithreaded
+(`Threads.@spawn` per request). Appending to a *returned* response's `headers` therefore
+mutates the shared object: it leaks/accumulates headers across requests (e.g. a session
+`Set-Cookie` minted for one request served to the next) and is an unsynchronized data
+race on the headers vector.
+
+`status` and `body` are shared by reference. Sharing the body is safe because Nitro
+writes bodies non-destructively (`Core._write_response_body!`); see
+`docs/design/response-body-lifecycle.md`. Every other `HTTP.Response` field
+(`reason`, `trailers`, HTTP version, `close`, and the client-side redirect fields) is
+preserved — a handler returning `HTTP.Response(...; close=true)` keeps `close=true`
+through the middleware chain. Used by header-adding middleware (CORS, session, CSRF,
+rate limiter).
+"""
+own_response_headers(resp::HTTP.Response) = _rebuild_with_headers(resp, copy(resp.headers))
+
+"""
+    add_response_headers(resp::HTTP.Response, extra) -> HTTP.Response
+
+Return a new response carrying `resp`'s status and body plus the `extra` header pairs,
+without mutating `resp`. See [`own_response_headers`](@ref) for why in-place header
+mutation of a returned response is unsafe, and for the full set of fields preserved.
+"""
+add_response_headers(resp::HTTP.Response, extra) = _rebuild_with_headers(resp, vcat(resp.headers, extra))
+
+# Rebuild `resp` with a fresh `headers` vector while preserving every other field.
+# The two-argument `HTTP.Response(status, headers, body)` constructor resets `reason`,
+# `trailers`, HTTP version, `close`, and the client-side redirect fields to their
+# defaults; the server reads `close`/version to decide connection teardown, so they
+# must survive header-adding middleware. `body` (an `AbstractBody`) is shared by
+# reference. See `own_response_headers`.
+_rebuild_with_headers(resp::HTTP.Response, headers) = HTTP.Response(
+    resp.status, resp.body;
+    reason          = resp.reason,
+    headers         = headers,
+    trailers        = resp.trailers,
+    content_length  = resp.content_length,
+    proto_major     = resp.proto_major,
+    proto_minor     = resp.proto_minor,
+    close           = resp.close,
+    request         = resp.request,
+    request_url     = resp.request_url,
+    previous        = resp.previous,
+    redirect_count  = resp.redirect_count,
+)
 
 
 

@@ -8,6 +8,7 @@ using ...Types: CookieConfig, Nullable
 using ...Cookies: get_cookie, set_cookie!
 using ...Crypto: secure_random_bytes
 using ...Res: json
+using ...Core: own_response_headers
 
 export CSRFMiddleware, issue_csrf_token!, validate_csrf_token
 
@@ -121,6 +122,9 @@ function CSRFMiddleware(secret::String; cookie_name::String="csrf_token", header
 
             response = handle(req)
             if method in SAFE_METHODS && existing_cookie === nothing
+                # Own the headers before issuing the cookie: `response` may be a shared/`const`
+                # object, and `issue_csrf_token!` mutates the headers in place.
+                response = own_response_headers(response)
                 raw_token = issue_csrf_token!(response, secret; cookie_name, ttl, config)
                 req.context[:csrf_token] = raw_token
             end
