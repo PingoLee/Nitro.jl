@@ -82,6 +82,7 @@ const TEST_FILES = [
     "http_internals_contract_tests.jl",
     "precompilation_test.jl",
     "extractor_tests.jl",
+    "reflection_tests.jl",
     "render_tests.jl",
     "bodyparser_tests.jl",
     "ergonomics_tests.jl",
