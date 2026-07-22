@@ -36,7 +36,12 @@ function login_required(; redirect_url::String="/login", session_key::String="us
 		if !(user isa AbstractDict)
 			return HTTP.Response(302, ["Location" => redirect_url])
 		end
-		if haskey(user, session_key) || haskey(user, Symbol(session_key)) || !isempty(user)
+		# Require a positive authentication marker: the configured session_key must be
+		# present. Do NOT admit on `!isempty(user)` — `_request_user` falls back to the
+		# raw `req.session` dict when `req.context[:user]` is unset, so treating any
+		# non-empty dict as authenticated lets an anonymous visitor who merely has
+		# session data (e.g. an anonymous cart) pass the guard.
+		if haskey(user, session_key) || haskey(user, Symbol(session_key))
 			return nothing
 		end
 		return HTTP.Response(302, ["Location" => redirect_url])
