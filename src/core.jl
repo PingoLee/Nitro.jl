@@ -325,11 +325,39 @@ function ReviseHandler()
     end
 end
 
+# Nominal wrapper for the composed stream handler. Its only job is to give the handler
+# stored in `HTTP.Server.handler` a *Nitro-owned* type, so we can attach a secret-safe
+# `show` (below) without pirating `show` for every `HTTP.Server` in the session.
+struct NitroStreamHandler{F} <: Function
+    f::F
+end
+(h::NitroStreamHandler)(stream) = h.f(stream)
+
+# SECURITY: `HTTP.Server` has no custom `show`, so Julia's default walks its fields —
+# including `handler`, whose closures capture the cookie/JWT `secret_key`, DB creds, and
+# API keys. Displaying a server (REPL auto-display, `@show`, a pasted session) would
+# print all of them. Constrained to `NitroStreamHandler`, this override is *not* type
+# piracy and never touches a non-Nitro `HTTP.Server`; it prints only the address.
+# (`dump` bypasses `show` entirely and still walks raw fields — explicit introspection
+# can't be, and isn't, prevented here.)
+Base.show(io::IO, s::Server{<:NitroStreamHandler}) =
+    print(io, "HTTP.Server(", something(s.bound_address, s.address), ")")
+Base.show(io::IO, ::MIME"text/plain", s::Server{<:NitroStreamHandler}) = show(io, s)
+
 """
-    serve(; middleware=[], host="127.0.0.1", port=8080, kwargs...) -> Server
+    serve(; middleware=[], host="127.0.0.1", port=8080, kwargs...) -> Union{Server, Nothing}
 
 Start the Nitro HTTP server with the registered routes. Runs until `terminate()`
 (or `Ctrl-C`); pass `async=true` to return immediately and serve in the background.
+
+Returns the running `Server` in `async=true` mode; in blocking mode it returns
+`nothing`, since the server has already shut down by the time control returns and a
+shut-down handle is not useful. The returned handle is safe to display: Nitro gives
+its servers a custom `show` that prints only the address (see `NitroStreamHandler`),
+so secrets captured in the handler closures — cookie/JWT `secret_key`, API keys, DB
+credentials — are never printed by an accidental REPL auto-display, `@show`, string
+interpolation, or logging. (`dump` bypasses `show` and still walks raw fields; that
+is explicit introspection, not accidental disclosure.)
 
 # Keyword arguments
 - `middleware=[]`: global middleware applied to every request, outermost first.
@@ -380,7 +408,7 @@ function serve(ctx::ServerContext;
     httponly=nothing,
     secure=nothing,
     samesite=nothing,
-    kwargs...)::Server
+    kwargs...)::Union{Server, Nothing}
 
     if revise ∉ (:none, :lazy, :eager)
         throw(ArgumentError("Invalid `revise` value $(repr(revise)). Expected one of :none, :lazy, or :eager."))
@@ -434,6 +462,9 @@ function serve(ctx::ServerContext;
 
         handle_stream = parallel_stream_handler(handle_stream)
     end
+
+    # Wrap last, so the handler HTTP stores gets our secret-safe `show` (see NitroStreamHandler).
+    handle_stream = NitroStreamHandler(handle_stream)
 
     if revise == :eager
         ctx.service.eager_revise[] = start_revise_service()
@@ -644,7 +675,7 @@ function setupmiddleware(ctx::ServerContext; middleware::Vector=[], serialize::B
     ])
 end
 
-function startserver(ctx::ServerContext; host, port, show_banner=false, parallel=false, async=false, kwargs, start)::Server
+function startserver(ctx::ServerContext; host, port, show_banner=false, parallel=false, async=false, kwargs, start)::Union{Server, Nothing}
     show_banner && serverwelcome(ctx.service.external_url[], ctx.service.prefix[], parallel)
     ctx.service.server[] = start(preprocesskwargs(kwargs))
     startup.(ctx.service.lifecycle_middleware)
@@ -657,6 +688,12 @@ function startserver(ctx::ServerContext; host, port, show_banner=false, parallel
         finally
             println()
         end
+        # The blocking path only returns after shutdown (Ctrl-C), so a server handle here
+        # would be useless. Return `nothing` to keep the REPL clean. (Secret disclosure via
+        # the handle is handled separately by the `NitroStreamHandler` `show` override — that
+        # covers the `async=true` handle too; this early return is just tidiness.)
+        # The server stays reachable via `ctx.service.server[]` for `terminate`.
+        return nothing
     end
 
     return ctx.service.server[]

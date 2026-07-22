@@ -88,6 +88,13 @@ multipart
 Files
 ```
 
+## Secrets
+
+```@docs
+SecretString
+reveal
+```
+
 ## Utilities
 
 ```@docs

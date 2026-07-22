@@ -21,7 +21,10 @@ end
 function serve(; kwargs...) 
     async = Base.get(kwargs, :async, false)
     try
-        # return the resulting HTTP.Server object
+        # Returns the running `HTTP.Server` when async; `nothing` in blocking mode (the
+        # server is already down by then, so the handle would be useless). Either way the
+        # handle is safe to display — `Nitro.Core.NitroStreamHandler` gives it a `show`
+        # that prints only the address, never the secrets captured in handler closures.
         return Nitro.Core.serve(CONTEXT[]; kwargs...)
     finally
         # close server on exit if we aren't running asynchronously
