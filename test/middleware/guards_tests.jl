@@ -79,35 +79,49 @@ using Nitro: GuardMiddleware, login_required, role_required, permission_required
         result2 = guard(req_with_session)
         @test isnothing(result2)
 
-        # Regression (auth bypass): an authenticated-user dict that lacks the session_key
-        # must NOT pass just because it is non-empty.
-        req_userdict_no_key = HTTP.Request("GET", "/test")
-        req_userdict_no_key.context[:user] = Dict{String,Any}("cart" => [1, 2, 3])
-        result3 = guard(req_userdict_no_key)
-        @test result3 isa HTTP.Response
-        @test result3.status == 302
+        # An explicitly-set identity WITHOUT the session_key (e.g. JWT claims keyed by
+        # `sub`, not `user_id`) is still authenticated — a middleware vouched for it.
+        # Requiring the marker here would lock out legitimate token-authenticated users.
+        req_claims = HTTP.Request("GET", "/test")
+        req_claims.context[:user] = Dict{String,Any}("sub" => "user-123", "exp" => 9999999999)
+        @test isnothing(guard(req_claims))
 
-        # Regression (auth bypass): an ANONYMOUS visitor with session data but no
-        # user_id — under the documented SessionMiddleware + SessionAuthMiddleware
-        # pattern context[:user] is unset, so _request_user falls back to the raw
-        # session dict — must be redirected, not admitted.
+        # A non-Dict identity object set by middleware (e.g. a user struct / NamedTuple)
+        # is authenticated too.
+        req_struct = HTTP.Request("GET", "/test")
+        req_struct.context[:user] = (id = 7, name = "alice")
+        @test isnothing(guard(req_struct))
+
+        # Defensive: an EMPTY context[:user] Dict carries no identity → redirect.
+        req_empty_user = HTTP.Request("GET", "/test")
+        req_empty_user.context[:user] = Dict{String,Any}()
+        result_empty = guard(req_empty_user)
+        @test result_empty isa HTTP.Response
+        @test result_empty.status == 302
+
+        # Auth bypass (regression): an ANONYMOUS visitor with session data but no
+        # context[:user] must be redirected — the raw session is NOT an authenticated
+        # identity, so it counts only when it carries the login marker.
         req_anon_session = HTTP.Request("GET", "/test")
         req_anon_session.context[:session] = Dict{String,Any}("cart" => [1, 2, 3], "prefs" => "dark")
-        result4 = guard(req_anon_session)
-        @test result4 isa HTTP.Response
-        @test result4.status == 302
+        result_anon = guard(req_anon_session)
+        @test result_anon isa HTTP.Response
+        @test result_anon.status == 302
 
-        # Session-based auth still works via the fallback: a session carrying the
-        # session_key (and no context[:user]) is a logged-in user → pass.
+        # Session-based auth via the fallback: a session carrying the session_key (and
+        # no context[:user]) is a logged-in user → pass.
         req_session_auth = HTTP.Request("GET", "/test")
         req_session_auth.context[:session] = Dict{String,Any}("user_id" => 7, "cart" => [1])
         @test isnothing(guard(req_session_auth))
 
-        # Custom session_key is honored.
+        # Custom session_key is honored on the fallback path.
         guard_custom = login_required(redirect_url="/login", session_key="uid")
-        req_custom = HTTP.Request("GET", "/test")
-        req_custom.context[:user] = Dict{String,Any}("uid" => 99)
-        @test isnothing(guard_custom(req_custom))
+        req_custom_ok = HTTP.Request("GET", "/test")
+        req_custom_ok.context[:session] = Dict{String,Any}("uid" => 99)
+        @test isnothing(guard_custom(req_custom_ok))
+        req_custom_no = HTTP.Request("GET", "/test")
+        req_custom_no.context[:session] = Dict{String,Any}("user_id" => 99)  # wrong key for this guard
+        @test guard_custom(req_custom_no).status == 302
     end
 
     @testset "role_required guard" begin

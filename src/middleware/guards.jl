@@ -32,16 +32,33 @@ end
 
 function login_required(; redirect_url::String="/login", session_key::String="user_id")
 	return function(req::HTTP.Request)
-		user = _request_user(req)
-		if !(user isa AbstractDict)
-			return HTTP.Response(302, ["Location" => redirect_url])
+		# Two distinct sources of "user", which must be trusted differently:
+		#
+		#   1. `req.context[:user]` set by an auth middleware (BearerAuth /
+		#      CookieAuthMiddleware / a SessionAuthMiddleware) — the request has
+		#      ALREADY been authenticated, so trust the identity as-is. It need not
+		#      contain `session_key` (a JWT-claims identity is keyed by `sub`, not
+		#      `user_id`), and it may be a struct rather than a Dict.
+		#
+		#   2. The raw `req.session` dict, used only as a fallback when no middleware
+		#      set `:user`. This is NOT an authenticated identity — an anonymous
+		#      visitor accumulates session data (e.g. a cart) — so it counts as
+		#      logged in only when it carries the login marker (`session_key`).
+		#
+		# Conflating the two (admitting any non-empty dict) is the auth bypass fixed
+		# here; requiring `session_key` on source 1 would instead lock out legitimate
+		# token-authenticated users.
+		ctx_user = Base.get(req.context, :user, nothing)
+		if ctx_user !== nothing
+			# An empty Dict carries no identity; stay defensive and treat it as unauthenticated.
+			if ctx_user isa AbstractDict && isempty(ctx_user)
+				return HTTP.Response(302, ["Location" => redirect_url])
+			end
+			return nothing
 		end
-		# Require a positive authentication marker: the configured session_key must be
-		# present. Do NOT admit on `!isempty(user)` — `_request_user` falls back to the
-		# raw `req.session` dict when `req.context[:user]` is unset, so treating any
-		# non-empty dict as authenticated lets an anonymous visitor who merely has
-		# session data (e.g. an anonymous cart) pass the guard.
-		if haskey(user, session_key) || haskey(user, Symbol(session_key))
+
+		session = getsession(req)
+		if session isa AbstractDict && (haskey(session, session_key) || haskey(session, Symbol(session_key)))
 			return nothing
 		end
 		return HTTP.Response(302, ["Location" => redirect_url])
