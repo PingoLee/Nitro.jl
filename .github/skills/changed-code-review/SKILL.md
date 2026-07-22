@@ -79,7 +79,6 @@ Prioritize:
 
 - Incorrect control flow, missing edge-case handling, or wrong conditional logic
 - **Routing API drift**: reintroduced `@get`/`@post`, `serveparallel()`, or function-style `get()`/`post()` registrars
-- **Response contract drift**: handler returns raw `Dict`/`String` instead of `Res.json` / `Res.status`
 - **Middleware order**: session/CSRF/guards applied after routing or in wrong pipeline position
 - **Extractor/handler mismatch**: path converters, typed extractors, or `validate` behavior inconsistent with route signature
 - **Workers API drift**: `submit_task` / `get_task_status` / `cancel_task` called without `user_id` where authorization is required
@@ -157,7 +156,7 @@ Always re-read the `project-guidelines` skill (step 1) so newly active rules are
 
 - Flag any `import PormG` or DB access in `src/` (belongs in `ext/NitroPormGExt.jl` only)
 - Flag macro routing (`@get`, `@post`, etc.) or `serveparallel()` in code or docs
-- Flag handlers returning raw dicts/strings instead of `Res` helpers
+- Note (advisory only) handlers returning raw dicts/strings — prefer `Res` helpers for explicit status/content type; raw returns are safe and auto-formatted (nitro-core §4), not a defect
 - Flag worker task submit/list/cancel without `user_id` where the new API requires it
 - Flag `AbstractWorkerStore` changes missing parallel updates in `InMemoryWorkerStore` and `PormGWorkerStore`
 - Flag serializing or persisting live `Task` objects

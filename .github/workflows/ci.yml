@@ -76,4 +76,15 @@ jobs:
             using Nitro
             doctest(Nitro)'
       - run: julia --project=docs docs/make.jl
+  docs-lint:
+    name: Docs reference lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1.12'
+      # No package build needed — the script uses only stdlib and reads files.
+      - name: Lint agent-context docs for path/link/symbol drift
+        run: julia .github/scripts/docs_lint.jl
 

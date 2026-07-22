@@ -62,7 +62,7 @@ const appM = automatic_models   # handlers import this alias
 - The `db/` directory lives **outside** `src/` alongside the project root.
 - `@import_models` creates a plain Julia module; the `const appM = ...` alias is what handlers use.
 - Handlers include `import ..appM` and query with `appM.Product |> object`.
-- Never import `PormG` in `src/` of the Nitro **core** itself — only in application code and `ext/NitroPormGExt/`.
+- Never import `PormG` in `src/` of the Nitro **core** itself — only in application code and `ext/NitroPormGExt.jl`.
 
 ## 5. PormG Query Idiom
 
@@ -76,7 +76,7 @@ Terminal methods: `.list()`, `.first()`, `.count()`, `.exists()`, `.delete()`.
 
 ## 6. Response Construction
 
-Always use `Res` module functions. Never return raw dicts or strings from handlers.
+Always use `Res` module functions in examples, so status and content type are explicit and readers learn the intended form. (Raw dict/string returns are safe and auto-formatted per nitro-core §4 — this is a teaching convention, not a safety rule.)
 
 ## 7. Handler Signatures
 

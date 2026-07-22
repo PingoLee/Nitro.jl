@@ -40,7 +40,7 @@ Configure PormG, then bootstrap the store:
 
 ```julia
 persistent_store = pormg_nitro_worker(db_key="workers")
-serve(middleware=[startup(queues=["reports"], store=persistent_store, recover_zombies=true)])
+serve(middleware=[worker_startup(queues=["reports"], store=persistent_store, recover_zombies=true)])
 ```
 
 ## 4. Queue Authorization

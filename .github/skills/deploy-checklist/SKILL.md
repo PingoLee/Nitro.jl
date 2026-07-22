@@ -45,7 +45,7 @@ Report missing env vars by name; do not invent secret values.
       OAuth `code`/`state` carried in URLs never reach the logs. Enable
       `serve(...; access_log_query=true)` only when you are certain no secrets travel in
       query strings.
-- [ ] Worker `startup(..., store=..., recover_zombies=...)` configured if background queues are used (`workers.instructions.md`).
+- [ ] Worker `worker_startup(..., store=..., recover_zombies=...)` configured if background queues are used (`workers.instructions.md`).
 
 ## 4. Reverse proxy (when requested)
 

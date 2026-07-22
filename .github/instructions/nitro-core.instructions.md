@@ -41,7 +41,7 @@ Whenever you write code, write tests, or propose architecture for this repositor
 - **Session Management**: Ensure `SessionMiddleware` is configured properly in the global pipeline for stateful apps. Access session data directly via `req.session`.
 
 ## 6. Persistence: PormG.jl Extension (Weak Dependency)
-- **Extension Isolation**: Any code importing or directly depending on `PormG` MUST live inside `ext/NitroPormGExt/`.
+- **Extension Isolation**: Any code importing or directly depending on `PormG` MUST live inside `ext/NitroPormGExt.jl`.
 - **Core Purity**: Never import `PormG` in `src/`. The core web server must remain database-agnostic.
 - **Connection Management**: Do not manage raw database connections in route handlers. Use the middleware/context provided by the `NitroPormGExt` extension.
 
