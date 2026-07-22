@@ -65,6 +65,7 @@ export  # Server lifecycle
         # Middleware
         BearerAuth, CookieAuthMiddleware, Cors, RateLimiter, ExtractIP,
         SessionMiddleware, GuardMiddleware, login_required, role_required, permission_required, CSRFMiddleware,
+        AccessLog, AccessRecord,
         # Optional app extensions
         Workers,
         # Auth module
