@@ -68,6 +68,8 @@ ExtractIP
 GuardMiddleware
 login_required
 role_required
+AccessLog
+AccessRecord
 ```
 
 ## Files
@@ -84,6 +86,13 @@ spafiles
 FormFile
 multipart
 Files
+```
+
+## Secrets
+
+```@docs
+SecretString
+reveal
 ```
 
 ## Utilities

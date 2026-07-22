@@ -91,17 +91,34 @@ Prioritize:
 
 ### Security issues
 
-Check aggressively for:
+Check aggressively for the following. For any finding, trace a concrete attacker-controlled input to the sink before reporting — flag it as **confirmed** (a reachable path from untrusted input) or **theoretical** (pattern present, reachability unproven). Do not report pattern matches you could not connect to reachable input.
+
+**Injection & untrusted sinks**
 
 - Raw SQL string interpolation instead of parameterized queries or ORM APIs in `ext/`
-- Logging or printing session data, CSRF tokens, JWTs, or credentials
-- New routes missing `login_required`, `role_required`, or `CSRFMiddleware` where mutations occur
-- Worker task APIs that skip watcher/`user_id` checks on read, cancel, or list
-- `Res.json` or error paths that leak stack traces or internal DB errors to clients
 - Dynamic `eval`/`include`/`run` built from request input
+- **XSS via the deliberate escape hatches**: user-influenced data flowing into `Res.html` or `Res.js` without escaping. (Raw `String` returns and `Res.send` are `text/plain` and safe by design — see `nitro-core.instructions.md` §4 — so `Res.html`/`Res.js` are the *only* HTML/JS sinks worth reviewing.)
+- **Open redirect / header (CRLF) injection**: user input reaching a `Location` redirect target, `Set-Cookie`, or other response header without validation
+- **SSRF**: outbound HTTP/DB/file requests whose URL, host, or path derives from request input
 - File upload/path handling without sanitization (path traversal via `FormFile.filename` or staged paths)
-- CORS or cookie settings that weaken `SameSite`/secure defaults without explicit justification
+
+**AuthN / AuthZ**
+
+- New routes missing `login_required`, `role_required`, or `CSRFMiddleware` where mutations occur
+- **IDOR / broken object-level authZ**: a route that authenticates the caller but never checks they *own* the resource — any handler that loads a record by a client-supplied id must verify ownership, not just `login_required`. The worker `user_id` check is one instance of this general rule.
+- Worker task APIs that skip watcher/`user_id` checks on read, cancel, or list
+- **Mass assignment / over-posting**: typed extractors binding a request body to a struct where a client can set privileged fields (`is_admin`, `role`, `user_id`, ownership keys) that should be server-assigned
+- **Auth correctness, not just presence**: token verification that skips signature/expiry checks, JWT `alg:none` or algorithm-confusion acceptance, or non-constant-time comparison of tokens/CSRF secrets/passwords. For anything auth/crypto-shaped, hand off to `/security-review` for depth.
+
+**Disclosure, transport & availability**
+
+- Logging or printing session data, CSRF tokens, JWTs, or credentials
+- `Res.json` or error paths that leak stack traces or internal DB errors to clients
+- CORS or cookie settings that weaken `SameSite`, `Secure`, or `HttpOnly` defaults (session cookies must stay `HttpOnly`) without explicit justification
+- **DoS / resource exhaustion**: missing request-body or multipart-upload size caps, and catastrophic-backtracking (ReDoS) risk in path converters or `validate` patterns fed by request input
 - Secrets committed in docs, tests, or CI config
+
+This checklist is a fast pre-push pass, not a full audit; for auth, crypto, or availability changes, recommend the dedicated `/security-review` command.
 
 ### Tests
 

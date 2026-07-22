@@ -8,5 +8,6 @@ include("middleware/cors_middleware.jl"); @reexport using .CORSMiddleware
 include("middleware/csrf_middleware.jl"); @reexport using .CSRFMiddleware_
 include("middleware/session_middleware.jl"); @reexport using .SessionMiddleware_
 include("middleware/guards.jl"); @reexport using .GuardsMiddleware
+include("middleware/access_log.jl"); @reexport using .StructuredAccessLogMiddleware
 
 end

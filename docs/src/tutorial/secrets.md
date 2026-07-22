@@ -44,15 +44,15 @@ If your custom routes or middleware need access to a secret (for example, to sig
 
 ```julia
 struct AppConfig
-    secret_key::String
+    secret_key::SecretString
 end
 
 required_env(name::String) = get(ENV, name, nothing) === nothing ? error("$name must be set") : ENV[name]
 
-config = AppConfig(required_env("SECRET_KEY"))
+config = AppConfig(SecretString(required_env("SECRET_KEY")))
 
 function sign_payload(req::HTTP.Request, ctx::Context{AppConfig})
-    secret = ctx.payload.secret_key
+    secret = reveal(ctx.payload.secret_key)
     # Sign something with secret...
 end
 
@@ -61,6 +61,42 @@ serve(context=config)
 ```
 
 For a comprehensive guide on building `AppConfig`, refer to the [BI App Config Example](bi_app_config.md).
+
+## Keeping Secrets Out of Logs and REPL Output
+
+Secrets stored as plain `String` fields are one accident away from disclosure: an
+`@show config` while debugging, an `@info` log that includes the config struct, an
+error message interpolating it, or a REPL auto-display of any value that (directly or
+through nested fields) contains it — Julia's default `show` recursively prints every
+field, secret included.
+
+Wrap secrets in `SecretString` and all of those paths print a mask instead:
+
+```julia
+config = AppConfig(SecretString(required_env("SECRET_KEY")))
+
+@show config
+# config = AppConfig(SecretString("****"))
+
+@info "startup" config          # logs the mask, never the key
+"debug: $config"                # interpolates the mask, never the key
+```
+
+Read the value only where it is actually used, via `reveal`:
+
+```julia
+token = encode_jwt(payload, reveal(config.secret_key))
+```
+
+Because `reveal` is the single unwrap point, `grep -rn "reveal("` audits every place
+the raw secret is touched. Comparing a `SecretString` with `==` (against another
+`SecretString` or a plain string) is constant-time, so checks like
+`config.api_key == client_token` are safe from timing attacks.
+
+!!! warning
+    `SecretString` guards against *accidental* disclosure only. Deliberate
+    introspection (`dump`, `getfield`) still reaches the raw value — nothing in a
+    running Julia process is hidden from reflection.
 
 ## Do Sessions Need Encryption?
 

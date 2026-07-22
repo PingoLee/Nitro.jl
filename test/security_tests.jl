@@ -68,3 +68,60 @@ end
     @test occursin("token=SECRET-XYZ", logs[1].message)
 end
 end
+
+@testitem "Security: SecretString redaction" tags=[:security, :core] setup=[NitroCommon] begin
+using Nitro
+using Test
+
+const RAW = "NITRO-RAW-SECRET-77aa1e"
+
+# App-config shape from docs/src/tutorial/secrets.md: the secret sits in a struct
+# whose default recursive `show` must hit the SecretString mask at the leaf.
+struct SecretTestConfig
+    name::String
+    api_key::SecretString
+end
+
+@testset "every display path masks the value" begin
+    s = SecretString(RAW)
+    for rendered in (sprint(show, s),
+                     sprint((io, x) -> show(io, MIME("text/plain"), x), s),
+                     repr(s),
+                     string(s),
+                     "interpolated: $s")
+        @test !occursin(RAW, rendered)
+        @test occursin("****", rendered)
+    end
+end
+
+@testset "containing structs mask through default recursive show" begin
+    cfg = SecretTestConfig("app", SecretString(RAW))
+    shown = sprint(show, cfg)
+    @test !occursin(RAW, shown)
+    @test occursin("****", shown)
+    @test occursin("app", shown)            # non-secret fields still display normally
+end
+
+@testset "reveal is the explicit unwrap" begin
+    @test reveal(SecretString(RAW)) == RAW
+    @test reveal(SecretString(SubString("abc-def", 1, 3))) == "abc"   # AbstractString ctor
+    s = SecretString(RAW)
+    @test SecretString(s) === s             # idempotent — no double wrapping
+end
+
+@testset "constant-time equality semantics" begin
+    @test SecretString("k1") == SecretString("k1")
+    @test SecretString("k1") != SecretString("k2")
+    @test SecretString("k1") == "k1"        # auth shape: stored secret vs client token
+    @test "k1" == SecretString("k1")
+    @test SecretString("k1") != "k1-longer" # length mismatch
+    @test SecretString("") == SecretString("")
+end
+
+@testset "hash honors the == contract" begin
+    @test hash(SecretString("k1")) == hash(SecretString("k1"))
+    @test hash(SecretString("k1")) == hash("k1")    # consistent with mixed ==
+    d = Dict(SecretString("k1") => 1)
+    @test d[SecretString("k1")] == 1
+end
+end

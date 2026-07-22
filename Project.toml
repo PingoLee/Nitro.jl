@@ -1,6 +1,6 @@
 name = "Nitro"
 uuid = "e5efdb2c-68ee-4494-894d-55bb80f0a340"
-version = "0.2.0"
+version = "0.3.0"
 authors = ["Nitro.jl Contributors"]
 repo = "https://github.com/NitroFramework/Nitro.jl.git"
 

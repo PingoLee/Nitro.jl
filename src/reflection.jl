@@ -58,7 +58,37 @@ function walkargs(predicate::Function, expr)
         end
     end
     return false
-end 
+end
+
+# The name a lowered-code node refers to, WITHOUT module qualification. Used by the
+# self-reference check below; returning "" means "not a named reference".
+_node_name(x::GlobalRef)     = String(x.name)
+_node_name(x::Symbol)        = String(x)
+_node_name(x::QuoteNode)     = x.value isa Symbol ? String(x.value) : ""
+_node_name(x::Function)      = String(nameof(x))
+_node_name(@nospecialize(_)) = ""
+
+"""
+    _is_self_reference(name, func_name) -> Bool
+
+Whether `name` refers to the function currently being reconstructed. Lowered
+self-references are the exact name (`myhandler`, `#36`) or a generated derivative —
+the base name extended through a `#` in a gensym pattern (`#36#37`, `#myhandler#12`,
+`##36#40`, `myhandler##kw`).
+
+Matching must be on these exact token shapes, never a substring test over the
+stringified node: stringification includes module qualification, so an unrelated
+module or closure whose printed name merely *contains* the function's name — e.g.
+module `##Extractors#360` against anonymous handler `#36` — would be mistaken for a
+self-reference, silently discarding a parameter's default value and misclassifying
+the parameter (a `Header(...)` extractor default degrades to a required query param).
+"""
+function _is_self_reference(name::AbstractString, func_name::AbstractString)::Bool
+    isempty(name) && return false
+    return name == func_name ||
+           startswith(name, func_name * "#") ||
+           startswith(name, "#" * func_name * "#")
+end
 
 function reconstruct(info::Core.CodeInfo, func_name::Symbol)
     
@@ -101,10 +131,10 @@ function reconstruct(info::Core.CodeInfo, func_name::Symbol)
 
         if expr isa Expr
             if expr.head == :(=)
-                (lhs, rhs) = expr.args  
+                (lhs, rhs) = expr.args
                 try
                     assignments[lhs] = eval(rebuild!(rhs))
-                catch 
+                catch
                 end
                 
             # identify the function signature
@@ -125,13 +155,14 @@ function reconstruct(info::Core.CodeInfo, func_name::Symbol)
 
     for arg in evaled_sig.args
 
-        contains_func_name = walkargs(arg) do x
-            # Super generic check to see if the function name is in the expression
-            return contains("$x", "$func_name")
-        end
+        # Skip self-references (the function's own name or its generated derivatives)
+        # by comparing unqualified node names on exact token shapes — see
+        # `_is_self_reference` for why a stringified substring test is wrong here.
+        fname = String(func_name)
+        contains_func_name = walkargs(x -> _is_self_reference(_node_name(x), fname), arg)
 
-        if contains_func_name || arg == NO_VALUES  || arg isa GlobalRef && contains("$(arg.name)", "$func_name")
-            continue            
+        if contains_func_name || arg == NO_VALUES || arg isa GlobalRef && _is_self_reference(String(arg.name), fname)
+            continue
         end
 
         if arg isa Expr

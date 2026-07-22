@@ -6,7 +6,8 @@ using Base64
 using UUIDs
 using ..Errors
 
-export encrypt_payload, decrypt_payload, secure_random_bytes, secure_uuid4
+export encrypt_payload, decrypt_payload, secure_random_bytes, secure_uuid4,
+       SecretString, reveal
 
 """
     secure_random_bytes(n::Int) -> Vector{UInt8}
@@ -141,5 +142,70 @@ function decrypt_payload(secret::String, payload::String)
         throw(CookieError("Decryption failed"))
     end
 end
+
+# ── Secret handling ─────────────────────────────────────────────────────────────
+
+# Constant-time byte comparison. The early length check leaks only the *length*
+# mismatch (standard and accepted — cf. Python's hmac.compare_digest); when lengths
+# match, every byte is visited regardless of where the first difference occurs, so
+# timing reveals nothing about the content.
+function ct_compare(a::AbstractVector{UInt8}, b::AbstractVector{UInt8})::Bool
+    length(a) == length(b) || return false
+    diff = UInt8(0)
+    for i in eachindex(a, b)
+        @inbounds diff |= a[i] ⊻ b[i]
+    end
+    return diff == 0x00
+end
+ct_compare(a::AbstractString, b::AbstractString)::Bool =
+    ct_compare(codeunits(String(a)), codeunits(String(b)))
+
+"""
+    SecretString(value::AbstractString)
+
+Wrapper for secrets (API keys, signing keys, tokens) that redacts itself under
+display: `show`, `repr`, string interpolation, logging, and the default recursive
+`show` of any *containing* struct all print `SecretString("****")` instead of the
+value. Use it for secret fields in app config structs passed via `serve(context=…)`
+so an accidental `@show config` or REPL display never prints the secret.
+
+Access the underlying value only via [`reveal`](@ref) — the explicit unwrap keeps
+every use of the raw secret greppable. `SecretString` is deliberately **not** an
+`AbstractString`: it cannot flow into string operations or output unnoticed.
+
+Comparing with `==` (against another `SecretString` or an `AbstractString`) is
+constant-time in the content, making it safe for auth-style checks such as
+`config.api_key == request_token`.
+
+!!! warning
+    Redaction covers display, not reflection: `dump` and `getfield` still reach
+    the raw value. This guards against *accidental* disclosure only.
+"""
+struct SecretString
+    value::String
+end
+SecretString(s::AbstractString) = SecretString(String(s))
+SecretString(s::SecretString) = s               # idempotent
+
+"""
+    reveal(s::SecretString) -> String
+
+Return the wrapped secret value. This is the only sanctioned way to read a
+[`SecretString`](@ref); keeping the unwrap explicit makes every use of the raw
+secret auditable with a single grep.
+"""
+reveal(s::SecretString)::String = s.value
+
+Base.show(io::IO, ::SecretString) = print(io, "SecretString(\"****\")")
+Base.show(io::IO, ::MIME"text/plain", s::SecretString) = show(io, s)
+
+# Constant-time equality (see ct_compare); mixed comparisons cover the common
+# auth shape `stored_secret == client_supplied_token`.
+Base.:(==)(a::SecretString, b::SecretString) = ct_compare(a.value, b.value)
+Base.:(==)(a::SecretString, b::AbstractString) = ct_compare(a.value, String(b))
+Base.:(==)(a::AbstractString, b::SecretString) = b == a
+# Hash by value so `==`-equal secrets (and equal plain strings) hash equally,
+# keeping the Dict/Set contract intact.
+Base.hash(s::SecretString, h::UInt) = hash(s.value, h)
 
 end
