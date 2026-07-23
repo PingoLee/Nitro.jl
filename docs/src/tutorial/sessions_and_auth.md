@@ -306,6 +306,12 @@ urlpatterns("",
 )
 ```
 
+`jwt_validator` returns a normalized [`Principal`](authentication.md): the
+verified claims stay readable dict-style (`req.user["sub"]`, as above), and the resolved
+identity is available as a typed field — `req.user.id` is the `sub` claim by default
+(configurable via `identity_claim`, or derive it from the verified key id with
+`identity_from=:kid`). See [Authentication](authentication.md) for the full contract.
+
 You can also pass a keyset with `kid` values for rotation:
 
 ```julia
@@ -349,12 +355,11 @@ claims as `req.user`. Because the claims *are* the identity here, `req.user` has
   The `user_id` marker is required only on the raw-`req.session` fallback, never on a
   principal that `BearerAuth` already authenticated.
 
-To authorize the specific action, check the `action` claim. `role_required` is
-key-parameterizable, so point it at `action` instead of the default `role`:
+To authorize the specific action, declare it with `claim_required`:
 
 ```julia
 # 403 unless req.user["action"] == "reports:generate"
-authorize_generate = role_required("reports:generate"; role_key="action")
+authorize_generate = claim_required("action", "reports:generate")
 
 function generate_report(req::HTTP.Request)
     return Res.json(Dict("status" => "queued", "requested_by" => req.user["app"]))
@@ -368,13 +373,16 @@ urlpatterns("",
 )
 ```
 
-If you authorize by action in many places, name the intent with a thin alias:
+For list-shaped claims (permissions, scopes), use `kind=:contains`:
 
 ```julia
-action_required(action::String) = role_required(action; role_key="action")
-
-# middleware=[BearerAuth(jwt_validator(jwt_secret)), GuardMiddleware(action_required("reports:generate"))]
+# 403 unless "reports:read" in req.user["scopes"]
+GuardMiddleware(claim_required("scopes", "reports:read"; kind=:contains))
 ```
+
+`role_required` and `permission_required` are thin aliases over `claim_required`, so the
+older key-parameterized form (`role_required("reports:generate"; role_key="action")`)
+still works and behaves identically.
 
 ### Tokens with `iat` but no `exp`
 
@@ -397,6 +405,21 @@ reads the header's `kid` to select the matching key:
 keys = Dict("primary" => primary_secret, "rotated" => rotated_secret)
 validator = jwt_validator(keys)
 ```
+
+With a keyset, the *verified* key id is exposed as `req.user.kid`, which unlocks two more
+patterns (both covered in depth in [Authentication](authentication.md)):
+
+```julia
+# Authorize by signer: only tokens signed by these keys may reach this route.
+GuardMiddleware(kid_required(["service-a", "service-b"]))
+
+# One key per caller? Make the signer the principal: req.user.id == verified kid.
+validator = jwt_validator(keys; identity_from=:kid)
+```
+
+Note the trust boundary: a `kid` is only *verified* when resolved against a keyset. With a
+single string secret the header `kid` is an unchecked label, so `kid_required` denies and
+`identity_from=:kid` is a construction-time error.
 
 ## Auth Cookies and CSRF
 

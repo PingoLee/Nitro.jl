@@ -21,7 +21,8 @@ export AuthError,
     DelegatingPasswordEncoder, Argon2PasswordEncoder, parse_argon2_phc,
     encode, matches, upgrade_encoding,
     jwt_validator, session_user_validator, no_auth_validator,
-    GuardMiddleware, login_required, role_required, permission_required
+    GuardMiddleware, login_required, role_required, permission_required,
+    claim_required, kid_required, Principal
 
 struct AuthError <: Exception
     msg::String

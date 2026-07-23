@@ -92,7 +92,7 @@ function encode_jwt(payload::AbstractDict, secret_or_keyset; kid=nothing, expire
     return string(signing_input, ".", signature)
 end
 
-function decode_jwt(token::AbstractString, secret_or_keyset; issuer=nothing, audience=nothing, exp_timeout::Union{Int, Nothing}=DEFAULT_JWT_MAX_AGE_SECONDS, iat_skew::Int=30, verify::Bool=true, with_kid::Bool=false, require_exp::Bool=false)
+function decode_jwt(token::AbstractString, secret_or_keyset; issuer=nothing, audience=nothing, exp_timeout::Union{Int, Nothing}=DEFAULT_JWT_MAX_AGE_SECONDS, iat_skew::Int=30, verify::Bool=true, with_kid::Bool=false, require_exp::Bool=false, required_claims::Union{AbstractVector{<:AbstractString}, Nothing}=nothing)
     segments = split(String(token), '.')
     length(segments) == 3 || throw(AuthError("Invalid JWT format"))
 
@@ -108,6 +108,6 @@ function decode_jwt(token::AbstractString, secret_or_keyset; issuer=nothing, aud
         kid = resolved_kid
     end
 
-    validate_claims(claims; exp_timeout=exp_timeout, iat_skew=iat_skew, issuer=issuer, audience=audience, require_exp=require_exp)
+    validate_claims(claims; exp_timeout=exp_timeout, iat_skew=iat_skew, issuer=issuer, audience=audience, require_exp=require_exp, required_claims=required_claims)
     return with_kid ? (claims, kid) : claims
 end

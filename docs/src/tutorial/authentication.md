@@ -1,75 +1,230 @@
 # Authentication
 
-!!! warning "Outline / work in progress"
-    This page is a **skeleton**, not finished documentation. It fixes the *structure*
-    of Nitro's authentication story so sections can be filled consistently, and it is a
-    coverage checklist: each `🔍`/`📝`/`🟡` marker is a gap to resolve (or an issue to
-    file) before that section is written. It is intentionally **not** in the site nav
-    (`docs/make.jl`) until it is filled in against a settled `req.user` contract (#4).
+Nitro's auth layer is a set of **primitives plus a small declarative surface**, not a
+framework: you own the user model and login flow; Nitro owns token verification, the
+principal contract, and route guards. The design follows established precedents — the
+principal mirrors ASP.NET's `ClaimsPrincipal` / Spring's `Authentication` (identity claim
+defaults to `sub`), `claim_required` mirrors ASP.NET's `RequireClaim`, and the 401/403
+split follows RFC 6750.
 
-Status legend: ✅ written elsewhere · 🟡 blocked on an open contract change · 🔍 needs a
-code check before documenting (candidate review task) · 📝 gap, nothing to point at yet.
+## 1. Pick your model
 
-## 1. Overview — pick your model
+| Model | Credential | Typical client | Identity | Start here |
+|---|---|---|---|---|
+| **Session auth** | Session cookie | Browsers (stateful) | `user_id` in `req.session` | [Sessions & Auth](sessions_and_auth.md) |
+| **Bearer / JWT** | `Authorization: Bearer <jwt>` | SPAs, mobile, APIs | `sub` claim | §4 below |
+| **Service / capability token** | Bearer JWT, no `sub` | Machine-to-machine | the `action`/scope claim | §5 below |
+| **Key-scoped (signer) auth** | Bearer JWT signed by a per-caller key | Multi-tenant services | the verified `kid` | §5 below |
 
-- What Nitro provides vs. what the app owns (`Nitro.Auth` is primitives, not a framework). ✅ (intro of `sessions_and_auth.md`)
-- Decision guide: **session auth** (browser, stateful) vs **bearer/JWT** (API, stateless) vs **service/capability tokens** (machine-to-machine). 📝 (no side-by-side "which do I use" exists)
-- The `req.user` contract — what an "authenticated principal" is. 🟡 (#4; also #24 — Dict vs struct)
+The models compose: one app can serve browser sessions on HTML routes and bearer tokens on
+API routes. Whatever the model, the result of authentication is the same artifact — the
+**principal** attached to the request.
 
-## 2. Principals & the request context
+## 2. The principal
 
-- `req.user`, `req.context[:user]`, `req.context[:auth_claims]` — who sets each, expected shape. 🟡 (#4)
-- How guards resolve the principal (`_request_user`), incl. the raw-session fallback. 🔍 (fallback is a bypass surface — login_required just changed; `role_required`/`permission_required` still fall back — is that intended?)
+Auth middleware (`BearerAuth`, `CookieAuthMiddleware`) attaches the authenticated identity
+at `req.context[:user]`, readable as `req.user`. With `jwt_validator` the attached value
+is a `Principal` — an immutable, dict-like wrapper over the **verified** claims:
 
-## 3. Bearer / JWT auth
+```julia
+function whoami(req::HTTP.Request)
+    user = req.user
+    user["sub"]      # claims read through dict-style
+    user.id          # normalized identity (the configured identity claim, default "sub")
+    user.kid         # keyset-verified key id, or nothing
+    user.source      # where `id` came from: :claim or :kid
+    return Res.json(user)   # serializes as the claims object — no metadata leaks
+end
+```
 
-- `BearerAuth(validator)` — header + optional cookie extraction, `(user, claims)` tuple form. ✅ partial (`sessions_and_auth.md` "JWT Helpers")
-- `CookieAuthMiddleware(validator)`. 🔍 (does not catch validator exceptions → 500 instead of 401 — #11)
-- Error/status taxonomy across the auth layer (401 consts vs 302 vs 403 vs 500). 🔍 (no single documented contract; ties to #11)
+The contract:
 
-## 4. JWT internals
+- **`id === nothing` still means authenticated.** A service token without a `sub` claim
+  authenticates; it simply has no subject identity. Guards that need an identity claim can
+  demand one (`required_claims=["sub"]`).
+- **A `Principal` is read-only.** It is a verified security artifact; enrich it by
+  building your own user object in a `user_validator`, or copy it with `Dict(principal)`.
+- **Two context slots.** Without a `user_validator`, the `Principal` *is* `req.user`. With
+  one, your returned user object lands in `req.context[:user]` and the `Principal` rides
+  along at `req.context[:auth_claims]` — so guards like `kid_required` still see the
+  verified metadata.
+- **Custom validators** can opt into the same contract by returning a `Principal` (or a
+  `(user, principal)` tuple).
+- **Guards resolve the principal** from `req.context[:user]` first. Only when no auth
+  middleware attached one do `login_required`/`claim_required` fall back to the raw
+  `req.session` dict — that fallback serves session-based apps, and `login_required`
+  accepts it only when it carries the login marker (`session_key`, default `"user_id"`).
 
-- `encode_jwt` / `decode_jwt` — HS256, `verify`, `require_exp`, `exp_timeout`, `iat_skew`. ✅ partial
-- Claim validation: `exp`/`iat`/`nbf`/`iss`/`aud`. ✅ (one line today; expand)
-- Key rotation: keyset + `kid`, `_resolve_secret`, `with_kid`. ✅ partial
-- **JWT security checklist**: is `alg=none` rejected? algorithm pinned to HS256 on decode? `aud` as array supported? behavior when `kid` present but not in keyset? 🔍 (candidate issue — verify against `src/Auth/jwt.jl`, none of this is documented or clearly tested)
+## 3. The error contract
+
+One rule, everywhere:
+
+| Status | Meaning | Returned by |
+|---|---|---|
+| **401** | *Not authenticated* — credential missing, malformed, expired, or failed verification | `BearerAuth`, `CookieAuthMiddleware` |
+| **403** | *Authenticated but not authorized* — the principal lacks the required claim/kid | `claim_required`, `role_required`, `permission_required`, `kid_required` |
+| **302** | Browser redirect to login (session-flavored apps) | `login_required` (`redirect_url`, default `/login`) |
+
+A **throwing validator is a 401, never a 500**: both auth middlewares catch validator
+exceptions (e.g. `jwt_validator` throwing `AuthError` on an expired token) and return the
+same 401 as any other invalid credential. This matches RFC 6750: `invalid_token` → 401,
+`insufficient_scope` → 403.
+
+## 4. JWT validation
+
+### Quick start — safe by default
+
+```julia
+using Nitro
+using Nitro.Auth
+
+jwt_secret = get(ENV, "JWT_SECRET", nothing)
+isnothing(jwt_secret) && error("JWT_SECRET must be set")
+
+validator = jwt_validator(jwt_secret)
+
+urlpatterns("",
+    path("/profile", profile, method="GET", middleware=[BearerAuth(validator)]),
+)
+```
+
+Every token is **always** signature-verified (HMAC-SHA256 — the header `alg` is never
+trusted) and **always** time-bounded: an `exp` claim is honored, and a token without one
+is accepted only as a short-lived access token bounded by `iat + exp_timeout` (15 minutes
+by default). There is no permissive mode; hardening below is opt-in *on top of* these
+defaults.
+
+### Configuring identity
+
+```julia
+jwt_validator(secret)                            # id = "sub" claim (default)
+jwt_validator(secret; identity_claim="action")   # id = a custom claim
+jwt_validator(keyset; identity_from=:kid)        # id = the verified key id (signer == principal)
+```
+
+`identity_from=:kid` says "the key-holder *is* the principal" — the right model when each
+caller signs with its own key. It requires a keyset (see the trust model below) and makes
+the coupling between identity and key rotation explicit. If per-subject identity might
+ever be needed, put a stable `sub` in the token now — even if it currently equals the
+`kid` — so identity never has to be retrofitted onto a rotation field.
+
+### Production profile
+
+```julia
+validator = jwt_validator(jwt_secret;
+    profile = :strict,
+    issuer = "https://auth.example.com",
+    audience = "product-api",
+    required_claims = ["sub"],
+)
+```
+
+`profile=:strict` refuses to construct without `issuer` and `audience`, and forces
+`require_exp=true`. `required_claims` (usable in either profile) rejects tokens missing
+any named claim. All configuration errors surface at construction — app startup — not at
+request time.
+
+### Key rotation and the `kid` trust model
+
+```julia
+keyset = Dict(
+    "primary" => get(ENV, "JWT_SECRET_PRIMARY", ""),
+    "rotated" => get(ENV, "JWT_SECRET_ROTATED", ""),
+)
+validator = jwt_validator(keyset)
+```
+
+`decode_jwt` selects the key by the token's `kid` header, and the *verified* key id is
+exposed as `req.user.kid`. The trust boundary matters: **a `kid` is only trusted when it
+was resolved against a keyset** — with a single string secret the header `kid` is an
+attacker-writable label, so it is never exposed on the `Principal`, `kid_required` denies,
+and `identity_from=:kid` is a construction-time `ArgumentError`.
+
+Lower-level pieces (`encode_jwt`, `decode_jwt`, claim validation for
+`exp`/`iat`/`nbf`/`iss`/`aud`) are covered in [Sessions & Auth](sessions_and_auth.md).
 
 ## 5. Service & capability tokens
 
-- Tokens keyed by `action`/scope, no `sub`/`user_id`. ✅ (just added to `sessions_and_auth.md`)
-- Authorize by claim with `role_required(...; role_key="action")`; `action_required` alias. ✅
-- `iat`-only tokens + `exp_timeout` replay bound. ✅
-- **Depends on the login_required follow-up being merged** before this reads true on `main`. 🟡
+Tokens that authorize an *action* rather than identify a *user* carry an `action` (or
+scope) claim and often no `sub`. Authentication works unchanged; authorization is a claim
+guard:
+
+```julia
+urlpatterns("",
+    path("/reports/generate", generate_report, method="POST", middleware=[
+        BearerAuth(jwt_validator(jwt_secret)),
+        GuardMiddleware(claim_required("action", "reports:generate")),
+    ]),
+)
+```
+
+When callers sign with per-caller keys, authorize by **signer** instead — possession of an
+allowed key, for that route, *is* the authorization (the same per-route pattern as Envoy's
+`jwt_authn` requirements):
+
+```julia
+validator = jwt_validator(keyset; identity_from=:kid)
+
+urlpatterns("",
+    # only tokens verified against these key ids may reach this route
+    path("/sync", sync_handler, method="POST", middleware=[
+        BearerAuth(validator),
+        GuardMiddleware(kid_required(["service-a", "service-b"])),
+    ]),
+)
+```
+
+A router-wide default allowlist is just the same guard at the router level, with tighter
+per-route subsets where needed. See the service-token section of
+[Sessions & Auth](sessions_and_auth.md) for `iat`-only tokens and `exp_timeout`.
 
 ## 6. Guards & authorization
 
-- `login_required`, `role_required`, `permission_required` — signatures, what each checks. ✅ partial (scattered)
-- A single guards matrix (input shape, pass/deny condition, status code). 📝
-- Non-Dict principals (structs) are rejected by guards. 🔍 (#24)
-- Composing guards with `GuardMiddleware`; order vs middleware. ✅ (nitro-core §5)
+Guards are per-route checks composed with `GuardMiddleware(guards...)`; each either
+returns `nothing` (pass) or a response (deny). They run after auth middleware, in order.
+
+| Guard | Passes when | Denies with |
+|---|---|---|
+| `login_required(; redirect_url, session_key)` | An auth middleware attached a non-empty principal, **or** the session carries `session_key` | 302 → `redirect_url` |
+| `claim_required(claim, value; kind=:equals)` | `principal[claim] == value` | 403 |
+| `claim_required(claim, value; kind=:contains)` | `value in principal[claim]` (a list) | 403 |
+| `role_required(role; role_key="role")` | alias: `claim_required(role_key, role)` | 403 |
+| `permission_required(perm; permissions_key="permissions")` | alias: `claim_required(permissions_key, perm; kind=:contains)` | 403 |
+| `kid_required(allowed)` | The principal's **verified** `kid` is in `allowed` | 403 |
+
+Notes:
+
+- The claim guards read any dict-like principal — a `Principal`, a plain claims dict from
+  a custom validator, or (fallback) the raw session dict of a session-authenticated app.
+- `kid_required` has **no** session fallback and never trusts a claim named `"kid"` —
+  only the keyset-verified key id carried by a `Principal`. No trusted kid ⇒ 403.
+- Guards deny with a shared constant `403 Forbidden` response; bodies are stable and safe
+  to assert on in tests.
 
 ## 7. Session-based auth
 
-- `SessionMiddleware` + a `SessionAuthMiddleware` bridge to `req.user`. ✅ ("Unified Auth Context")
-- The unused `validator` kwarg on `SessionMiddleware`. 🟡 (#4 / audit)
-- Session regeneration on login (fixation). ✅ ("Session Regeneration")
+`SessionMiddleware`, the `req.session` API, session regeneration, and bridging sessions
+into `req.user` are covered in [Sessions & Auth](sessions_and_auth.md).
 
 ## 8. Auth cookies & CSRF
 
-- `set_auth_cookie!` / `clear_auth_cookie!` / `extract_auth_token`. ✅ partial
-- `CSRFMiddleware` for cookie auth. ✅ partial (🔍 token not session-bound + thin tests — #10)
+`set_auth_cookie!` / `clear_auth_cookie!` and `CSRFMiddleware` for cookie-authenticated
+browsers: see [Sessions & Auth](sessions_and_auth.md) and [Cookies](cookies.md).
 
 ## 9. Passwords
 
-- Encoders (PBKDF2 / BCrypt / delegating / legacy) + `PasswordValidator`. ✅ (`passwords.md` — link, don't duplicate)
+Password hashing (PBKDF2, BCrypt, Spring/Django-compatible encoders, validation and
+upgrade flows): see [Passwords](passwords.md).
 
 ## 10. OAuth2
 
-- Authorization-code flow. ✅ (`oauth2.md` — link)
+The authorization-code flow walkthrough: see [OAuth2](oauth2.md).
 
-## 11. Hardening / deployment
+## 11. Hardening checklist
 
-- Refresh-token lifecycle (or documented "access tokens only"). 🟡 (#7)
-- Baseline security-response headers. 🔍 (no middleware ships — #13)
-- Secrets from env, not committed; rotate. ✅ (`secrets.md`)
-- Reverse proxy, `trusted_proxies`, client-IP trust for auth rate-limiting. 🔍 (spoofable in trusted mode — #16)
+- Secrets from the environment, never committed; rotate via keysets — [Secrets](secrets.md).
+- `profile=:strict` (+ `required_claims`) on production validators (§4).
+- Access tokens only, short-lived (`expires_in`/`exp`); refresh-token lifecycles are an
+  application concern today.
+- Behind a reverse proxy, configure trusted proxies before trusting client IPs for
+  auth-adjacent rate limiting.

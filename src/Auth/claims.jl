@@ -49,7 +49,7 @@ function _normalize_audience(value)
     return [string(value)]
 end
 
-function validate_claims(claims::AbstractDict; exp_timeout::Union{Int, Nothing}=DEFAULT_JWT_MAX_AGE_SECONDS, iat_skew::Int=30, issuer=nothing, audience=nothing, require_exp::Bool=false, now_ts::Int=_current_timestamp())
+function validate_claims(claims::AbstractDict; exp_timeout::Union{Int, Nothing}=DEFAULT_JWT_MAX_AGE_SECONDS, iat_skew::Int=30, issuer=nothing, audience=nothing, require_exp::Bool=false, required_claims::Union{AbstractVector{<:AbstractString}, Nothing}=nothing, now_ts::Int=_current_timestamp())
     exp = _claim_value(claims, "exp", nothing)
     if exp === nothing
         if require_exp
@@ -85,6 +85,14 @@ function validate_claims(claims::AbstractDict; exp_timeout::Union{Int, Nothing}=
         expected = _normalize_audience(audience)
         actual = _normalize_audience(_claim_value(claims, "aud", nothing))
         any(item in actual for item in expected) || throw(AuthError("Invalid JWT audience"))
+    end
+
+    if required_claims !== nothing
+        for name in required_claims
+            if _claim_value(claims, name, nothing) === nothing
+                throw(AuthError("JWT missing required claim: $name"))
+            end
+        end
     end
 
     return claims
