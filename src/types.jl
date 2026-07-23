@@ -17,13 +17,67 @@ export Server, Nullable, Context,
     CookieConfig, Cookie, Session, SessionPayload,
     AbstractSessionStore, get_session, set_session!, delete_session!, cleanup_expired_sessions!,
     MemoryStore, Extractor,
-    RouteDefinition
+    RouteDefinition, Principal
 
 const Nullable{T} = Union{T, Nothing}
 const Server = HTTP.Server
 
 abstract type Extractor{T} end
 abstract type AbstractSessionStore{K, V} end
+
+"""
+    Principal(claims; id=nothing, kid=nothing, source=:claim)
+
+The normalized authenticated principal that Nitro auth middleware attaches at
+`req.context[:user]` (readable as `req.user`).
+
+Behaves as a **read-only** claims dictionary — `principal["sub"]`, `get`, `haskey`,
+iteration, and JSON serialization all read through to the verified claims — with
+normalized identity available as typed fields:
+
+- `id::Nullable{String}` — the resolved identity: the configured identity claim
+  (default `"sub"`), or the verified key id when identity derives from `kid`.
+  `nothing` when the token carries no identity claim (e.g. service/capability
+  tokens) — the request is still authenticated.
+- `claims::Dict{String,Any}` — the verified token claims.
+- `kid::Nullable{String}` — the **keyset-verified** key id, or `nothing`. Only ever
+  populated when the token was verified against a keyset; a `kid` header on a
+  single-secret token is an unverified label and is never exposed here.
+- `source::Symbol` — where `id` came from: `:claim` or `:kid`.
+
+A `Principal` is immutable: it is a verified security artifact. Use `Dict(principal)`
+for a mutable copy, or a `user_validator` to build an enriched application user.
+"""
+struct Principal <: AbstractDict{String, Any}
+    id::Nullable{String}
+    claims::Dict{String, Any}
+    kid::Nullable{String}
+    source::Symbol
+end
+
+function Principal(claims::AbstractDict; id=nothing, kid=nothing, source::Symbol=:claim)
+    normalized = claims isa Dict{String, Any} ? claims :
+        Dict{String, Any}(string(key) => value for (key, value) in pairs(claims))
+    return Principal(
+        id === nothing ? nothing : string(id),
+        normalized,
+        kid === nothing ? nothing : String(kid),
+        source,
+    )
+end
+
+# Read-only dict interface, delegating to the verified claims. `get`/`haskey` have no
+# generic AbstractDict fallback, so these delegations are load-bearing for the guards'
+# `get(user, key, nothing)` calls. Deliberately no `setindex!`/`delete!`/`pop!`.
+Base.iterate(principal::Principal) = iterate(getfield(principal, :claims))
+Base.iterate(principal::Principal, state) = iterate(getfield(principal, :claims), state)
+Base.length(principal::Principal) = length(getfield(principal, :claims))
+Base.get(principal::Principal, key, default) = get(getfield(principal, :claims), key, default)
+Base.get(f::Base.Callable, principal::Principal, key) = get(f, getfield(principal, :claims), key)
+Base.getindex(principal::Principal, key) = getindex(getfield(principal, :claims), key)
+Base.haskey(principal::Principal, key) = haskey(getfield(principal, :claims), key)
+Base.keys(principal::Principal) = keys(getfield(principal, :claims))
+Base.values(principal::Principal) = values(getfield(principal, :claims))
 
 @kwdef struct Param{T}
     name::Symbol

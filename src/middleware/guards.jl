@@ -2,9 +2,16 @@ module GuardsMiddleware
 
 using HTTP
 using ...Core: getsession
-using ...Types: Nullable
+using ...Types: Nullable, Principal
 
-export GuardMiddleware, login_required, role_required, permission_required
+export GuardMiddleware, login_required, role_required, permission_required,
+	claim_required, kid_required
+
+# Shared denial response for authorization guards. Module-level `const` Responses are
+# reuse-safe in Nitro (non-consuming write path, see nitro-core §4), so denials are
+# allocation-free. Contract: 401 = unauthenticated (auth middleware), 403 = authenticated
+# but not authorized (guards), 302 = browser redirect (`login_required`).
+const FORBIDDEN = HTTP.Response(403, "Forbidden")
 
 function GuardMiddleware(guards::Function...)
 	return function(handle::Function)
@@ -65,22 +72,82 @@ function login_required(; redirect_url::String="/login", session_key::String="us
 	end
 end
 
-function role_required(role::String; role_key::String="role")
-	return function(req::HTTP.Request)
-		user = _request_user(req)
-		if !(user isa AbstractDict) || get(user, role_key, nothing) != role
-			return HTTP.Response(403, "Forbidden")
+"""
+    claim_required(claim, value; kind=:equals)
+
+Declarative authorization guard on a claim of the request principal: 403 unless the
+principal's `claim` matches `value`.
+
+- `kind = :equals` — the claim's value must `==` `value` (e.g. a role or action claim).
+- `kind = :contains` — the claim must be a list containing `value` (e.g. permissions/scopes).
+
+The principal is resolved like the other guards (`req.context[:user]` set by auth
+middleware, with the raw-session fallback for session-based apps). `role_required` and
+`permission_required` are thin aliases over this guard.
+"""
+function claim_required(claim::String, value; kind::Symbol=:equals)
+	if kind === :equals
+		return function(req::HTTP.Request)
+			user = _request_user(req)
+			if !(user isa AbstractDict) || get(user, claim, nothing) != value
+				return FORBIDDEN
+			end
+			return nothing
 		end
-		return nothing
+	elseif kind === :contains
+		return function(req::HTTP.Request)
+			user = _request_user(req)
+			container = user isa AbstractDict ? get(user, claim, nothing) : nothing
+			if !(container isa AbstractVector) || !(value in container)
+				return FORBIDDEN
+			end
+			return nothing
+		end
 	end
+	throw(ArgumentError("claim_required kind must be :equals or :contains, got $(repr(kind))"))
 end
 
-function permission_required(permission::String; permissions_key::String="permissions")
+role_required(role::String; role_key::String="role") =
+	claim_required(role_key, role; kind=:equals)
+
+permission_required(permission::String; permissions_key::String="permissions") =
+	claim_required(permissions_key, permission; kind=:contains)
+
+# The verified key id of the request principal. Only a `Principal` carries a trusted kid
+# (populated exclusively from keyset-verified decodes); there is deliberately no session
+# fallback — a kid is meaningless in a session, so absence denies.
+function _request_kid(req::HTTP.Request)
+	user = Base.get(req.context, :user, nothing)
+	if user isa Principal && user.kid !== nothing
+		return user.kid
+	end
+	claims = Base.get(req.context, :auth_claims, nothing)
+	if claims isa Principal && claims.kid !== nothing
+		return claims.kid
+	end
+	return nothing
+end
+
+"""
+    kid_required(allowed)
+
+Authorization guard on the *verified* JWT key id: 403 unless the token that authenticated
+this request was verified against a keyset and its resolved `kid` is in `allowed` (a
+string or collection of strings).
+
+Use with a keyset-backed `jwt_validator` — the resulting `Principal` carries the verified
+`kid` (as does the `(user, principal)` tuple flow via `req.context[:auth_claims]`).
+Custom validators opt in by returning a `Principal`. Requests authenticated with a single
+string secret never carry a trusted kid and are denied.
+"""
+function kid_required(allowed)
+	allowed_set = allowed isa AbstractString ? Set{String}((String(allowed),)) :
+		Set{String}(String(kid) for kid in allowed)
+	isempty(allowed_set) && throw(ArgumentError("kid_required requires at least one allowed key id"))
 	return function(req::HTTP.Request)
-		user = _request_user(req)
-		permissions = user isa AbstractDict ? get(user, permissions_key, nothing) : nothing
-		if !(permissions isa AbstractVector) || !(permission in permissions)
-			return HTTP.Response(403, "Forbidden")
+		kid = _request_kid(req)
+		if kid === nothing || !(kid in allowed_set)
+			return FORBIDDEN
 		end
 		return nothing
 	end

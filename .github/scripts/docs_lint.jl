@@ -55,7 +55,7 @@ const REQUIRED_SYMBOLS = String[
     "submit_task", "get_task_status", "cancel_task", "get_all_tasks",
     "set_queue_authorizer!", "pormg_nitro_worker",
     "add_response_headers", "own_response_headers",
-    "login_required", "role_required",
+    "login_required", "role_required", "claim_required", "kid_required", "Principal",
 ]
 
 # ---- helpers ---------------------------------------------------------------

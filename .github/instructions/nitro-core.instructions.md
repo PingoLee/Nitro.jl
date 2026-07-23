@@ -36,7 +36,8 @@ Whenever you write code, write tests, or propose architecture for this repositor
 ## 5. Security & Middleware
 - **Linear Execution**: Middleware executes strictly Top-Down: Global Prefix Middleware -> Custom Middleware -> Defaults -> Router.
 - **Guards vs Middleware**:
-  - Use **Guards** (e.g., `login_required`, `role_required`) for route-specific authentication or authorization. Guards are functions that run before the handler and can abort the request early.
+  - Use **Guards** (e.g., `login_required`, `role_required`, `claim_required`, `kid_required`) for route-specific authentication or authorization. Guards are functions that run before the handler and can abort the request early.
+  - **Auth error contract**: `401` = unauthenticated (auth middleware; a throwing validator maps to 401, never 500), `403` = authenticated but not authorized (guards), `302` = `login_required` browser redirect. The authenticated principal is the `Principal` type (`src/types.jl`) — an immutable dict-like wrapper over verified claims with typed `id`/`kid` fields.
   - Use **Middleware** (e.g., `SessionMiddleware`, `RateLimiter`) for global, application-wide, or router-wide checks and mutations.
 - **Session Management**: Ensure `SessionMiddleware` is configured properly in the global pipeline for stateful apps. Access session data directly via `req.session`.
 

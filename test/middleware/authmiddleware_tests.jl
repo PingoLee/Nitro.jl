@@ -149,6 +149,36 @@ end
     resE = encrypted_handler(reqE)
     @test resE.status == 401
     @test contains(text(resE), "Missing or invalid authentication cookie")
+
+    # Case F (error contract regression): a THROWING validator (e.g. jwt_validator on an
+    # expired/malformed token) must be a clean 401, never an unhandled exception → 500.
+    throwing_mw = CookieAuthMiddleware(_ -> error("boom"), cookie_name="my_auth_cookie")
+    throwing_handler = throwing_mw(req->HTTP.Response(200, "ok"))
+    reqF = HTTP.Request("GET", "/")
+    HTTP.setheader(reqF, "Cookie" => "my_auth_cookie=whatever")
+    resF = throwing_handler(reqF)
+    @test resF.status == 401
+    @test contains(text(resF), "Invalid or expired token")
+
+    # Case G: a (user, claims) tuple return populates both context slots (same contract
+    # as BearerAuth).
+    tuple_mw = CookieAuthMiddleware(token -> (Dict("uid" => 1), Dict("sub" => "1")), cookie_name="my_auth_cookie")
+    tuple_handler = tuple_mw(req->HTTP.Response(200, "ok"))
+    reqG = HTTP.Request("GET", "/")
+    HTTP.setheader(reqG, "Cookie" => "my_auth_cookie=$good_token")
+    @test tuple_handler(reqG).status == 200
+    @test reqG.context[:user] == Dict("uid" => 1)
+    @test reqG.context[:auth_claims] == Dict("sub" => "1")
+
+    # Case H: a two-argument validator receives the request (arity dispatch, like
+    # BearerAuth).
+    seen_req = Ref{Any}(nothing)
+    twoarg_mw = CookieAuthMiddleware((token, req) -> (seen_req[] = req; Dict("uid" => 2)), cookie_name="my_auth_cookie")
+    twoarg_handler = twoarg_mw(req->HTTP.Response(200, "ok"))
+    reqH = HTTP.Request("GET", "/")
+    HTTP.setheader(reqH, "Cookie" => "my_auth_cookie=$good_token")
+    @test twoarg_handler(reqH).status == 200
+    @test seen_req[] === reqH
 end
 
 terminate()
