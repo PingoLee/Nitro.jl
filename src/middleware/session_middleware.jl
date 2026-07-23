@@ -15,11 +15,41 @@ export SessionMiddleware
 const DEFAULT_STORE = MemoryStore{String, Dict{String,Any}}()
 
 """
-    SessionMiddleware(; cookie_name, secret_key, max_age, store, prune_interval)
+    SessionMiddleware(; cookie_name, secret_key, max_age, store, prune_probability,
+                        rotate_on_auth, auth_key, validator, ...)
 
-Creates a middleware that manages server-side sessions with cookie-based session IDs.
-When `rotate_on_auth=true`, an existing session is automatically assigned a new
-session ID if the configured `auth_key` changes during the request.
+Creates a middleware that manages server-side sessions with cookie-based session IDs. The
+mutable session dictionary is exposed as `req.session` (`req.context[:session]`).
+
+# Session fixation defense (`rotate_on_auth`, `auth_key`, `validator`)
+
+When `rotate_on_auth=true` (the default), an existing session is assigned a **new** session
+ID whenever its authenticated identity changes during a request — i.e. on login, logout, or
+a user switch — so a pre-login session ID can never be replayed against the post-login
+session. The identity is captured before the handler runs and compared after.
+
+How that identity is resolved, in order:
+
+- `auth_key::String = "user_id"` — the session key whose value *is* the identity. This is
+  the common case: your login handler sets `req.session["user_id"] = …` and logout clears
+  it; the change triggers regeneration.
+- `validator::Union{Function, Nothing} = nothing` — an optional **fallback identity
+  resolver**, consulted *only* when `auth_key` is absent from the session (and a session ID
+  exists). It is arity-dispatched — called as `validator(session_id, session_data)` if that
+  method exists, else `validator(session_id)` — and its return value is the identity marker
+  used for change detection.
+
+The `validator` participates in fixation detection **only**; it never populates
+`req.user`. Authenticating a request (attaching a principal) is the job of `BearerAuth` /
+`CookieAuthMiddleware`, and guards read `req.user` / the raw session there. This separation
+is deliberate: `SessionMiddleware` owns session *state and rotation*, not the auth identity
+contract.
+
+# Other keyword arguments
+
+- `cookie_name::String = "nitro_session"`, `store`, `max_age::Int`, `prune_probability::Float64`.
+- Cookie attributes (`secure`, `httponly`, `samesite`, `path`, `domain`, `secret_key`) or a
+  fully-formed `config::CookieConfig`.
 """
 function SessionMiddleware(;
     cookie_name::String = "nitro_session",

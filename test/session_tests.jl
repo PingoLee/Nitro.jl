@@ -178,5 +178,76 @@ end
         @test occursin("SameSite=Strict", cookie_header)
     end
 
+    @testset "SessionMiddleware validator contract (#4)" begin
+        # The `validator` kwarg is a FALLBACK identity resolver for session-fixation
+        # detection: consulted only when `auth_key` is absent, used purely to decide
+        # whether the session ID must be regenerated. It never populates req.user.
+
+        cookie_of(resp) = match(r"app_session=([^;]+)", HTTP.header(resp, "Set-Cookie", "")).captures[1]
+
+        # Helper: seed a store with an existing session under a known id, then drive one
+        # request whose handler mutates the session, and report whether the id rotated.
+        function run_with_existing(; validator, auth_key="user_id", seed::Dict{String,Any}, mutate!)
+            store = MemoryStore{String, Dict{String,Any}}()
+            set_session!(store, "existing-id", seed; ttl=120)
+            mw = SessionMiddleware(cookie_name="app_session", store=store, prune_probability=0.0,
+                                   secure=false, auth_key=auth_key, validator=validator)
+            handler = function(req::HTTP.Request)
+                mutate!(getsession(req))
+                return HTTP.Response(200, "ok")
+            end
+            req = HTTP.Request("GET", "/", ["Cookie" => "app_session=existing-id"])
+            return req, mw(handler)(req)
+        end
+
+        # An app that keys identity by a claim `sub` (no flat "user_id") supplies a
+        # validator to derive the marker. Logging IN (marker nothing -> "u1") must rotate
+        # the session id — fixation defense.
+        identity_validator = (session_id, data) -> get(data, "sub", nothing)
+        _, resp_login = run_with_existing(
+            validator=identity_validator,
+            seed=Dict{String,Any}("cart" => [1]),                 # anonymous, no identity yet
+            mutate! = s -> (s["sub"] = "u1"),                     # ...becomes authenticated
+        )
+        @test cookie_of(resp_login) != "existing-id"             # regenerated
+
+        # No auth-boundary crossing (identity stable) → id is preserved.
+        _, resp_stable = run_with_existing(
+            validator=identity_validator,
+            seed=Dict{String,Any}("sub" => "u1"),
+            mutate! = s -> (s["cart"] = [1, 2]),                 # non-auth mutation
+        )
+        @test cookie_of(resp_stable) == "existing-id"            # not rotated
+
+        # Logging OUT (identity "u1" -> nothing) also crosses the boundary → rotate.
+        _, resp_logout = run_with_existing(
+            validator=identity_validator,
+            seed=Dict{String,Any}("sub" => "u1"),
+            mutate! = s -> delete!(s, "sub"),
+        )
+        @test cookie_of(resp_logout) != "existing-id"
+
+        # `auth_key` takes precedence: when the flat key is present, the validator is not
+        # consulted. A validator that would (wrongly) report a stable identity must not
+        # suppress rotation driven by the real auth_key change.
+        never = (_...) -> "constant"
+        _, resp_authkey = run_with_existing(
+            validator=never, auth_key="user_id",
+            seed=Dict{String,Any}("user_id" => 1),
+            mutate! = s -> (s["user_id"] = 2),                   # user switch via auth_key
+        )
+        @test cookie_of(resp_authkey) != "existing-id"
+
+        # Single-arity validators are supported via arity dispatch, and the validator
+        # never writes req.user (it is not an auth-context populator).
+        req_probe, resp_probe = run_with_existing(
+            validator = session_id -> session_id,               # 1-arg form
+            seed=Dict{String,Any}("cart" => [1]),
+            mutate! = s -> (s["cart"] = [1, 2]),
+        )
+        @test resp_probe.status == 200
+        @test !haskey(req_probe.context, :user)                 # never populates req.user
+    end
+
 end
 end
