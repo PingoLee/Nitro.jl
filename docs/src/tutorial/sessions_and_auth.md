@@ -306,6 +306,12 @@ urlpatterns("",
 )
 ```
 
+`jwt_validator` returns a normalized [`Principal`](authentication.md): the
+verified claims stay readable dict-style (`req.user["sub"]`, as above), and the resolved
+identity is available as a typed field — `req.user.id` is the `sub` claim by default
+(configurable via `identity_claim`, or derive it from the verified key id with
+`identity_from=:kid`). See [Authentication](authentication.md) for the full contract.
+
 You can also pass a keyset with `kid` values for rotation:
 
 ```julia
@@ -320,6 +326,100 @@ claims = decode_jwt(token, keys)
 ```
 
 `validate_claims` checks `exp`, `iat`, `nbf`, `iss`, and `aud` when present.
+
+## Service and Capability Tokens
+
+Not every token identifies a *user*. A **service token** authorizes a *capability*: it
+carries an `action` (or scope) claim instead of a `sub`/`user_id`. This is the common
+shape for service-to-service calls — one backend calling your API on behalf of no
+particular person.
+
+```julia
+using Nitro.Auth
+
+# A caller mints a short-lived token that authorizes one action.
+token = encode_jwt(Dict(
+    "app"    => "analytics-service",
+    "action" => "reports:generate",
+    "iat"    => trunc(Int, time()),
+    "exp"    => trunc(Int, time()) + 300,
+), jwt_secret)
+```
+
+`BearerAuth(jwt_validator(jwt_secret))` verifies the signature and attaches the decoded
+claims as `req.user`. Because the claims *are* the identity here, `req.user` has no
+`sub`/`user_id` — and that is fine:
+
+- **`login_required` only checks that a validly-signed token is present.** It trusts any
+  principal an auth middleware attached, so an `action`-keyed token (no `user_id`) passes.
+  The `user_id` marker is required only on the raw-`req.session` fallback, never on a
+  principal that `BearerAuth` already authenticated.
+
+To authorize the specific action, declare it with `claim_required`:
+
+```julia
+# 403 unless req.user["action"] == "reports:generate"
+authorize_generate = claim_required("action", "reports:generate")
+
+function generate_report(req::HTTP.Request)
+    return Res.json(Dict("status" => "queued", "requested_by" => req.user["app"]))
+end
+
+urlpatterns("",
+    path("/reports/generate", generate_report, method="POST", middleware=[
+        BearerAuth(jwt_validator(jwt_secret)),
+        GuardMiddleware(authorize_generate),
+    ]),
+)
+```
+
+For list-shaped claims (permissions, scopes), use `kind=:contains`:
+
+```julia
+# 403 unless "reports:read" in req.user["scopes"]
+GuardMiddleware(claim_required("scopes", "reports:read"; kind=:contains))
+```
+
+`role_required` and `permission_required` are thin aliases over `claim_required`, so the
+older key-parameterized form (`role_required("reports:generate"; role_key="action")`)
+still works and behaves identically.
+
+### Tokens with `iat` but no `exp`
+
+Short-lived service tokens sometimes carry only `iat`. Nitro accepts them (`decode_jwt`
+does not require `exp` by default) but still bounds replay by enforcing a **maximum age
+from `iat`** (about 15 minutes by default). Set `exp_timeout` to at least the token's real
+lifetime so legitimate tokens are not rejected:
+
+```julia
+# accept iat-only tokens up to 5 minutes old
+validator = jwt_validator(jwt_secret; exp_timeout=300)
+```
+
+### Key rotation with `kid`
+
+When the signer sets a `kid` header, pass a keyset instead of a single secret; `decode_jwt`
+reads the header's `kid` to select the matching key:
+
+```julia
+keys = Dict("primary" => primary_secret, "rotated" => rotated_secret)
+validator = jwt_validator(keys)
+```
+
+With a keyset, the *verified* key id is exposed as `req.user.kid`, which unlocks two more
+patterns (both covered in depth in [Authentication](authentication.md)):
+
+```julia
+# Authorize by signer: only tokens signed by these keys may reach this route.
+GuardMiddleware(kid_required(["service-a", "service-b"]))
+
+# One key per caller? Make the signer the principal: req.user.id == verified kid.
+validator = jwt_validator(keys; identity_from=:kid)
+```
+
+Note the trust boundary: a `kid` is only *verified* when resolved against a keyset. With a
+single string secret the header `kid` is an unchecked label, so `kid_required` denies and
+`identity_from=:kid` is a construction-time error.
 
 ## Auth Cookies and CSRF
 

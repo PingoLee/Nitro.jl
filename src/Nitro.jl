@@ -64,7 +64,8 @@ export  # Server lifecycle
         regenerate_session!, SecretString, reveal,
         # Middleware
         BearerAuth, CookieAuthMiddleware, Cors, RateLimiter, ExtractIP,
-        SessionMiddleware, GuardMiddleware, login_required, role_required, permission_required, CSRFMiddleware,
+        SessionMiddleware, GuardMiddleware, login_required, role_required, permission_required,
+        claim_required, kid_required, Principal, CSRFMiddleware,
         AccessLog, AccessRecord,
         # Optional app extensions
         Workers,

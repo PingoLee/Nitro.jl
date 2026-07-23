@@ -1,3 +1,64 @@
+@testitem "Principal" tags=[:auth, :core] setup=[NitroCommon] begin
+
+using Test
+using JSON
+using Nitro: Principal
+
+@testset "read-only dict interface over claims" begin
+    claims = Dict{String,Any}("sub" => "42", "role" => "admin", "scopes" => ["read"])
+    principal = Principal(claims; id="42")
+
+    # Typed fields
+    @test principal.id == "42"
+    @test principal.kid === nothing
+    @test principal.source === :claim
+
+    # Dict reads pass through to the verified claims
+    @test principal["role"] == "admin"
+    @test get(principal, "role", nothing) == "admin"
+    @test get(principal, "nope", :default) === :default
+    @test get(() -> :computed, principal, "nope") === :computed
+    @test haskey(principal, "sub")
+    @test !haskey(principal, "nope")
+    @test Set(keys(principal)) == Set(["sub", "role", "scopes"])
+    @test "admin" in collect(values(principal))
+    @test length(principal) == 3
+    @test !isempty(principal)
+    @test Dict(pairs(principal)) == claims
+
+    # AbstractDict generic fallbacks
+    @test principal == claims
+    @test principal isa AbstractDict
+    @test Dict(principal) == claims && Dict(principal) isa Dict
+    @test occursin("sub", sprint(show, MIME"text/plain"(), principal))
+
+    # Immutable: a verified security artifact cannot be mutated
+    @test_throws MethodError principal["extra"] = 1
+    @test_throws MethodError delete!(principal, "sub")
+
+    # Empty principal
+    @test isempty(Principal(Dict{String,Any}()))
+end
+
+@testset "constructor coercions" begin
+    # Non-string id is stringified; Symbol-keyed claims are normalized
+    principal = Principal(Dict(:sub => 42); id=42, kid="service-a", source=:kid)
+    @test principal.id == "42"
+    @test principal.kid == "service-a"
+    @test principal.source === :kid
+    @test principal["sub"] == 42
+end
+
+@testset "JSON wire shape equals the claims object" begin
+    claims = Dict{String,Any}("sub" => "42", "iat" => 1234, "role" => "admin")
+    principal = Principal(claims; id="42", kid="k1")
+    # id/kid/source metadata must never leak into serialized output (key order is
+    # not significant in JSON, so compare parsed objects)
+    @test JSON.parse(JSON.json(principal)) == JSON.parse(JSON.json(claims))
+end
+
+end
+
 @testitem "Auth module" tags=[:auth, :core] setup=[NitroCommon] begin
 
 using Test
@@ -73,6 +134,14 @@ end
 
     short_lived = Nitro.Auth.encode_jwt(Dict("sub" => "42"), "secret-a"; expires_in=-120)
     @test_throws Nitro.Auth.AuthError Nitro.Auth.decode_jwt(short_lived, "secret-a")
+
+    # required_claims: named claims must be present (any value), else AuthError.
+    @test Nitro.Auth.decode_jwt(ttl_token, "secret-a"; required_claims=["sub", "exp"])["sub"] == "42"
+    @test_throws Nitro.Auth.AuthError Nitro.Auth.decode_jwt(ttl_token, "secret-a"; required_claims=["aud"])
+    @test Nitro.Auth.validate_claims(Dict("sub" => "1", "exp" => NOW_TS + 60); required_claims=["sub"]) isa AbstractDict
+    @test_throws Nitro.Auth.AuthError Nitro.Auth.validate_claims(Dict("exp" => NOW_TS + 60); required_claims=["sub"])
+    # Symbol-keyed claims are honored, matching the rest of claim validation.
+    @test Nitro.Auth.validate_claims(Dict(:sub => "1", :exp => NOW_TS + 60); required_claims=["sub"]) isa AbstractDict
 end
 
 @testset "Password helpers" begin
@@ -289,6 +358,102 @@ end
     Nitro.Types.set_session!(store, "sess-1", Dict{String,Any}("user" => Dict("id" => 5)); ttl=60)
     session_validator = Nitro.Auth.session_user_validator(store)
     @test session_validator("sess-1")["id"] == 5
+    # The optional second argument is the middleware arity-dispatch slot; an HTTP.Request
+    # there must not be mistaken for session data.
+    @test session_validator("sess-1", HTTP.Request("GET", "/"))["id"] == 5
+end
+
+@testset "jwt_validator identity and profiles" begin
+    keyset = Dict("service-a" => "secret-a", "service-b" => "secret-b")
+
+    @testset "returns a normalized Principal" begin
+        validator = Nitro.Auth.jwt_validator("secret-a")
+        principal = validator(Nitro.Auth.encode_jwt(Dict("sub" => 9, "role" => "admin"), "secret-a"; expires_in=3600))
+        @test principal isa Nitro.Principal
+        @test principal.id == "9"            # default identity claim "sub", stringified
+        @test principal.source === :claim
+        @test principal["role"] == "admin"   # claims read through
+
+        # A token without the identity claim still authenticates (service tokens)
+        subless = validator(Nitro.Auth.encode_jwt(Dict("action" => "sync"), "secret-a"; expires_in=3600))
+        @test subless isa Nitro.Principal
+        @test subless.id === nothing
+        @test subless["action"] == "sync"
+
+        # Custom identity claim
+        action_validator = Nitro.Auth.jwt_validator("secret-a"; identity_claim="action")
+        @test action_validator(Nitro.Auth.encode_jwt(Dict("action" => "sync"), "secret-a"; expires_in=3600)).id == "sync"
+    end
+
+    @testset "kid trust model" begin
+        # Keyset-verified kid is exposed on the principal
+        keyset_validator = Nitro.Auth.jwt_validator(keyset)
+        principal = keyset_validator(Nitro.Auth.encode_jwt(Dict("sub" => "9"), keyset; kid="service-b", expires_in=3600))
+        @test principal.kid == "service-b"
+        @test principal.id == "9"
+
+        # identity_from=:kid — the verified signer is the principal
+        kid_validator = Nitro.Auth.jwt_validator(keyset; identity_from=:kid)
+        signer = kid_validator(Nitro.Auth.encode_jwt(Dict("action" => "sync"), keyset; kid="service-a", expires_in=3600))
+        @test signer.id == "service-a"
+        @test signer.kid == "service-a"
+        @test signer.source === :kid
+
+        # A kid header on a SINGLE-SECRET token is an unverified label → never exposed
+        single_validator = Nitro.Auth.jwt_validator("secret-a")
+        spoofable = single_validator(Nitro.Auth.encode_jwt(Dict("sub" => "9"), "secret-a"; expires_in=3600))
+        @test spoofable.kid === nothing
+    end
+
+    @testset "user_validator receives the Principal, tuple carries it" begin
+        seen = Ref{Any}(nothing)
+        validator = Nitro.Auth.jwt_validator(keyset;
+            user_validator = principal -> (seen[] = principal; Dict("uid" => principal.id)))
+        result = validator(Nitro.Auth.encode_jwt(Dict("sub" => "7"), keyset; kid="service-a", expires_in=3600))
+        @test seen[] isa Nitro.Principal
+        @test seen[]["sub"] == "7"           # dict-compatible with old claims-style validators
+        @test result isa Tuple && length(result) == 2
+        @test result[1] == Dict("uid" => "7")
+        @test result[2] isa Nitro.Principal  # normalized artifact rides in the tuple
+        @test result[2].kid == "service-a"
+
+        # A rejecting user_validator still yields nothing
+        rejecting = Nitro.Auth.jwt_validator(keyset; user_validator = _ -> nothing)
+        @test rejecting(Nitro.Auth.encode_jwt(Dict("sub" => "7"), keyset; expires_in=3600)) === nothing
+    end
+
+    @testset "construction-time validation" begin
+        @test_throws ArgumentError Nitro.Auth.jwt_validator("secret-a"; identity_from=:header)
+        @test_throws ArgumentError Nitro.Auth.jwt_validator("secret-a"; profile=:lenient)
+        @test_throws ArgumentError Nitro.Auth.jwt_validator("secret-a"; with_kid=true)
+        # Signature verification can never be disabled through the validator — otherwise a
+        # forged token (with an attacker-chosen kid) would authenticate and pass kid_required.
+        @test_throws ArgumentError Nitro.Auth.jwt_validator("secret-a"; verify=false)
+        @test_throws ArgumentError Nitro.Auth.jwt_validator(keyset; verify=false)
+        @test_throws ArgumentError Nitro.Auth.jwt_validator("secret-a"; profile=:strict, issuer="iss", audience="aud", verify=false)
+        # :kid identity requires a keyset — a header kid is unverified against one secret
+        @test_throws ArgumentError Nitro.Auth.jwt_validator("secret-a"; identity_from=:kid)
+        # :strict demands issuer + audience and forbids weakening require_exp
+        @test_throws ArgumentError Nitro.Auth.jwt_validator("secret-a"; profile=:strict)
+        @test_throws ArgumentError Nitro.Auth.jwt_validator("secret-a"; profile=:strict, issuer="iss")
+        @test_throws ArgumentError Nitro.Auth.jwt_validator("secret-a"; profile=:strict, issuer="iss", audience="aud", require_exp=false)
+    end
+
+    @testset "strict profile" begin
+        strict = Nitro.Auth.jwt_validator("secret-a"; profile=:strict, issuer="iss", audience="aud", required_claims=["sub"])
+        good = Nitro.Auth.encode_jwt(Dict("sub" => "1", "iss" => "iss", "aud" => "aud"), "secret-a"; expires_in=3600)
+        @test strict(good).id == "1"
+
+        # Missing exp is rejected (require_exp forced)
+        no_exp = Nitro.Auth.encode_jwt(Dict("sub" => "1", "iss" => "iss", "aud" => "aud"), "secret-a")
+        @test_throws Nitro.Auth.AuthError strict(no_exp)
+        # Wrong issuer/audience rejected
+        wrong_iss = Nitro.Auth.encode_jwt(Dict("sub" => "1", "iss" => "other", "aud" => "aud"), "secret-a"; expires_in=3600)
+        @test_throws Nitro.Auth.AuthError strict(wrong_iss)
+        # required_claims enforced
+        no_sub = Nitro.Auth.encode_jwt(Dict("iss" => "iss", "aud" => "aud"), "secret-a"; expires_in=3600)
+        @test_throws Nitro.Auth.AuthError strict(no_sub)
+    end
 end
 
 @testset "SUPPORTED_ALGORITHMS constant" begin
