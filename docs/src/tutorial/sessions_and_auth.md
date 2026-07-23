@@ -321,6 +321,83 @@ claims = decode_jwt(token, keys)
 
 `validate_claims` checks `exp`, `iat`, `nbf`, `iss`, and `aud` when present.
 
+## Service and Capability Tokens
+
+Not every token identifies a *user*. A **service token** authorizes a *capability*: it
+carries an `action` (or scope) claim instead of a `sub`/`user_id`. This is the common
+shape for service-to-service calls — one backend calling your API on behalf of no
+particular person.
+
+```julia
+using Nitro.Auth
+
+# A caller mints a short-lived token that authorizes one action.
+token = encode_jwt(Dict(
+    "app"    => "analytics-service",
+    "action" => "reports:generate",
+    "iat"    => trunc(Int, time()),
+    "exp"    => trunc(Int, time()) + 300,
+), jwt_secret)
+```
+
+`BearerAuth(jwt_validator(jwt_secret))` verifies the signature and attaches the decoded
+claims as `req.user`. Because the claims *are* the identity here, `req.user` has no
+`sub`/`user_id` — and that is fine:
+
+- **`login_required` only checks that a validly-signed token is present.** It trusts any
+  principal an auth middleware attached, so an `action`-keyed token (no `user_id`) passes.
+  The `user_id` marker is required only on the raw-`req.session` fallback, never on a
+  principal that `BearerAuth` already authenticated.
+
+To authorize the specific action, check the `action` claim. `role_required` is
+key-parameterizable, so point it at `action` instead of the default `role`:
+
+```julia
+# 403 unless req.user["action"] == "reports:generate"
+authorize_generate = role_required("reports:generate"; role_key="action")
+
+function generate_report(req::HTTP.Request)
+    return Res.json(Dict("status" => "queued", "requested_by" => req.user["app"]))
+end
+
+urlpatterns("",
+    path("/reports/generate", generate_report, method="POST", middleware=[
+        BearerAuth(jwt_validator(jwt_secret)),
+        GuardMiddleware(authorize_generate),
+    ]),
+)
+```
+
+If you authorize by action in many places, name the intent with a thin alias:
+
+```julia
+action_required(action::String) = role_required(action; role_key="action")
+
+# middleware=[BearerAuth(jwt_validator(jwt_secret)), GuardMiddleware(action_required("reports:generate"))]
+```
+
+### Tokens with `iat` but no `exp`
+
+Short-lived service tokens sometimes carry only `iat`. Nitro accepts them (`decode_jwt`
+does not require `exp` by default) but still bounds replay by enforcing a **maximum age
+from `iat`** (about 15 minutes by default). Set `exp_timeout` to at least the token's real
+lifetime so legitimate tokens are not rejected:
+
+```julia
+# accept iat-only tokens up to 5 minutes old
+validator = jwt_validator(jwt_secret; exp_timeout=300)
+```
+
+### Key rotation with `kid`
+
+When the signer sets a `kid` header, pass a keyset instead of a single secret; `decode_jwt`
+reads the header's `kid` to select the matching key:
+
+```julia
+keys = Dict("primary" => primary_secret, "rotated" => rotated_secret)
+validator = jwt_validator(keys)
+```
+
 ## Auth Cookies and CSRF
 
 Use the higher-level cookie helpers for auth tokens:
