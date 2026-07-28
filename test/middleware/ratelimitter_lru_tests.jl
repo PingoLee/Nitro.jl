@@ -281,9 +281,10 @@ using Nitro: setip!
 # through that limiter behind whichever handler happened to be slowest.
 #
 # The bug has no functional signature — status, body and headers are identical either
-# way — so wall-clock overlap is the only observable. This is the repo's only
-# `@elapsed` assertion; the margin is deliberately 4x, and testsets 2 and 3 add
-# deterministic (non-timing) assertions so the item still has teeth on a slow machine.
+# way — so wall-clock overlap is the only observable. These are the repo's only
+# `@elapsed` assertions; the margins are deliberately generous (4x in testset 1, 2x in
+# testset 4), and testsets 2 and 3 add deterministic (non-timing) assertions so the item
+# still has teeth on a slow machine.
 #
 # Driven in-process (cf. test/middleware/shared_response_mutation_tests.jl) rather than
 # through a live server, so the measurement isn't polluted by HTTP.jl's connection pool
@@ -333,7 +334,8 @@ end
 
 # ── 2. The lock still does its job: no lost updates on the shared bucket ───────
 @testset "Counter is still serialized under concurrency" begin
-    wrapped = RateLimiter(strategy=:sliding_window, rate_limit=100,
+    limit = 100
+    wrapped = RateLimiter(strategy=:sliding_window, rate_limit=limit,
                           window=Minute(1), auto_extract_ip=false)(
         req -> (yield(); HTTP.Response(200, "ok")))
     ip = IPv4("10.0.0.2")
@@ -349,7 +351,7 @@ end
     # Each admitted request must consume exactly one distinct slot. Order-independent,
     # so it holds under `-t auto` too. A read-modify-write moved out of store_lock
     # would show up here as duplicated values.
-    @test sort(remaining) == collect((100 - N):99)
+    @test sort(remaining) == collect((limit - N):(limit - 1))
 end
 
 # ── 3. The limit itself still holds under concurrent load ─────────────────────
@@ -367,5 +369,41 @@ end
 
     @test count(==(200), statuses) == limit
     @test count(==(429), statuses) == limit
+end
+
+# ── 4. A rejection is not stuck behind an in-flight slow handler ──────────────
+@testset "429 is served while slow handlers are in flight" begin
+    limit = 2
+    wrapped = RateLimiter(strategy=:sliding_window, rate_limit=limit,
+                          window=Minute(1), auto_extract_ip=false)(
+        req -> (sleep(DELAY); HTTP.Response(200, "ok")))
+
+    # Warm both the admit and reject paths on a throwaway limiter with a fast handler.
+    # Closure specializations are shared across instances, so this JITs everything the
+    # timed section below needs without spending the real limiter's quota — and keeps
+    # this testset independent of whether testset 3 ran first.
+    warmup = RateLimiter(strategy=:sliding_window, rate_limit=1, window=Minute(1),
+                         auto_extract_ip=false)(req -> HTTP.Response(200, "ok"))
+    @test warmup(make_request(IPv4("10.0.0.4"))).status == 200
+    @test warmup(make_request(IPv4("10.0.0.4"))).status == 429
+
+    # Saturate the quota; both handlers are now parked in `sleep(DELAY)`.
+    ip = IPv4("10.0.0.5")
+    inflight = [@async wrapped(make_request(ip)) for _ in 1:limit]
+    sleep(DELAY / 4)   # let both tasks reach the sleep
+
+    # This request is rejected without consulting the handler at all, so it must not
+    # wait on the in-flight ones. Pre-fix it blocks on store_lock until at least the
+    # first slow handler returns (>= 0.75 * DELAY remaining here); post-fix the lock is
+    # free and the 429 is built in microseconds.
+    rejected = nothing
+    elapsed = @elapsed (rejected = wrapped(make_request(ip)))
+
+    @test rejected.status == 429
+    @test HTTP.header(rejected, "X-RateLimit-Remaining") == "0"
+    @test elapsed < DELAY / 2
+
+    # Drain the in-flight requests so the testset doesn't leak running tasks.
+    @test all(r -> r.status == 200, fetch.(inflight))
 end
 end

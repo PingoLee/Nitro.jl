@@ -284,13 +284,6 @@ function SlidingRateLimiter(;
                     end
                 end
 
-                # Limit decision + header values, computed under `store_lock` and
-                # consumed after it is released. Mirrors FixedRateLimiter so both
-                # strategies read the same way.
-                reset_time = 0
-                should_limit = false
-                remaining_requests = rate_limit
-
                 # CONCURRENCY (nitro-core §2) — DO NOT call `handle(req)` in here.
                 # Nitro serves every request via `Threads.@spawn`; this lock is shared
                 # by every client of this limiter instance, so anything held under it
@@ -301,7 +294,12 @@ function SlidingRateLimiter(;
                 # `Vector{DateTime}`, and LRUCache's internal SpinLock protects only
                 # the container, not that vector. Every read/write of `timestamps`
                 # must therefore stay inside this block.
-                lock(store_lock) do
+                #
+                # The decision is returned as a concrete `Tuple{Bool,Int,Int}` rather
+                # than assigned to hoisted locals: assigning an enclosing-scope local
+                # from inside a closure boxes it, which would hand `set_rate_headers!`
+                # three `Any`s on the request hot path (nitro-core §7).
+                should_limit, remaining_requests, reset_time = lock(store_lock) do
                     current_time = now(UTC)
                     ip = getip(req)
 
@@ -315,20 +313,19 @@ function SlidingRateLimiter(;
 
                     # Check if adding this request would exceed the limit
                     if length(timestamps) >= rate_limit
-                        should_limit = true
-                        remaining_requests = 0
-                        reset_time = compute_reset_time_safe(current_time, timestamps)
-                    else
-                        # Within the limit: consume the slot and snapshot the header
-                        # values now, while the vector is still guarded. These are the
-                        # same values the old code produced — it computed them after
-                        # `handle(req)`, but the vector could not change meanwhile
-                        # because the lock was (wrongly) held across the handler.
-                        push!(timestamps, current_time)
-                        remaining_requests = rate_limit - length(timestamps)
-                        # Time until oldest request expires (when 1 slot becomes available)
-                        reset_time = compute_reset_time_safe(current_time, timestamps)
+                        return (true, 0, compute_reset_time_safe(current_time, timestamps))
                     end
+
+                    # Within the limit: consume the slot and snapshot the header values
+                    # now, while the vector is still guarded. These are the same values
+                    # the old code produced — it computed them after `handle(req)`, but
+                    # the vector could not change meanwhile because the lock was
+                    # (wrongly) held across the handler.
+                    push!(timestamps, current_time)
+                    # Remaining quota, and time until the oldest request expires (when
+                    # 1 slot becomes available).
+                    return (false, rate_limit - length(timestamps),
+                            compute_reset_time_safe(current_time, timestamps))
                 end
 
                 # Prepare the response — outside the lock, so a slow handler delays
