@@ -42,6 +42,13 @@ shims; each break below includes its migration.
   validator form and the `(user, claims)` tuple contract, aligning both auth middlewares.
 - `session_user_validator` no longer mistakes the request object passed by middleware
   arity-dispatch for session data.
+- `RateLimiter(strategy=:sliding_window)` no longer holds its internal lock while the
+  downstream handler runs (#15). One slow request used to serialize every other request
+  through the same limiter, defeating Nitro's per-request `Threads.@spawn` concurrency;
+  rate-limit rejections also had to queue behind it. The limit decision and the
+  `X-RateLimit-*` values are now computed under the lock and the handler is called after
+  it is released — emitted header values are unchanged. `strategy=:fixed_window` was
+  already correct.
 
 ### Breaking (pre-release; architecture over compat)
 
