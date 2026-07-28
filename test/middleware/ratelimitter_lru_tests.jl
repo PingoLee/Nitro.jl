@@ -266,3 +266,106 @@ end
 terminate()
 
 end
+
+@testitem "Sliding rate limiter does not hold its lock across the handler" tags=[:middleware] setup=[NitroCommon] begin
+using HTTP
+using Dates
+using Sockets
+using Nitro
+using Nitro: setip!
+
+# Regression test for #15. `SlidingRateLimiter` used to call the downstream handler
+# from inside `lock(store_lock) do … end`, so the whole inner middleware chain and
+# route handler ran while a limiter-wide lock was held. Under Nitro's
+# `Threads.@spawn`-per-request model (nitro-core §2) that serialised every request
+# through that limiter behind whichever handler happened to be slowest.
+#
+# The bug has no functional signature — status, body and headers are identical either
+# way — so wall-clock overlap is the only observable. This is the repo's only
+# `@elapsed` assertion; the margin is deliberately 4x, and testsets 2 and 3 add
+# deterministic (non-timing) assertions so the item still has teeth on a slow machine.
+#
+# Driven in-process (cf. test/middleware/shared_response_mutation_tests.jl) rather than
+# through a live server, so the measurement isn't polluted by HTTP.jl's connection pool
+# and accept loop. `auto_extract_ip=false` makes RateLimiter return the bare
+# `handle -> req -> resp` closure; with no ExtractIP in front, each synthetic request
+# must carry its own IP via `setip!` (an `LRU{IPAddr,…}` key of `nothing` throws and
+# the limiter fail-closes to 503).
+
+const DELAY = 0.2          # per-request handler latency
+const N     = 8            # concurrent requests (must be < rate_limit, or the surplus
+                           # is rejected with 429 and never reaches the sleep)
+
+make_request(ip) = begin
+    r = HTTP.Request("GET", "/")
+    setip!(r, ip)
+    return r
+end
+
+# ── 1. Concurrency: N slow requests must overlap, not serialize ────────────────
+@testset "Handler runs outside store_lock" begin
+    slow = req -> (sleep(DELAY); HTTP.Response(200, "ok"))
+    wrapped = RateLimiter(strategy=:sliding_window, rate_limit=100,
+                          window=Minute(1), auto_extract_ip=false)(slow)
+    ip = IPv4("10.0.0.1")
+
+    # Warm up: JIT the limiter closure, own_response_headers and set_rate_headers!
+    # before anything is timed. On a cold ReTestItems worker, compilation alone can
+    # otherwise exceed the budget below.
+    @test wrapped(make_request(ip)).status == 200
+
+    responses = Vector{HTTP.Response}(undef, N)
+    elapsed = @elapsed begin
+        # `@async`, not `Threads.@spawn`: ReTestItems workers default to
+        # nworker_threads = 1, and `sleep` yields, so this exercises the lock
+        # contention identically at 1 thread and at N threads.
+        @sync for i in 1:N
+            @async responses[i] = wrapped(make_request(ip))
+        end
+    end
+
+    @test all(r -> r.status == 200, responses)
+
+    # Fixed:  ~DELAY       (all N sleeps overlap)      -> ~0.2s
+    # Buggy:  ~N * DELAY   (each waits for store_lock) -> ~1.6s
+    @test elapsed < 4 * DELAY
+end
+
+# ── 2. The lock still does its job: no lost updates on the shared bucket ───────
+@testset "Counter is still serialized under concurrency" begin
+    wrapped = RateLimiter(strategy=:sliding_window, rate_limit=100,
+                          window=Minute(1), auto_extract_ip=false)(
+        req -> (yield(); HTTP.Response(200, "ok")))
+    ip = IPv4("10.0.0.2")
+
+    remaining = Vector{Int}(undef, N)
+    @sync for i in 1:N
+        @async begin
+            r = wrapped(make_request(ip))
+            remaining[i] = parse(Int, HTTP.header(r, "X-RateLimit-Remaining"))
+        end
+    end
+
+    # Each admitted request must consume exactly one distinct slot. Order-independent,
+    # so it holds under `-t auto` too. A read-modify-write moved out of store_lock
+    # would show up here as duplicated values.
+    @test sort(remaining) == collect((100 - N):99)
+end
+
+# ── 3. The limit itself still holds under concurrent load ─────────────────────
+@testset "Exactly rate_limit requests are admitted" begin
+    limit = 50
+    wrapped = RateLimiter(strategy=:sliding_window, rate_limit=limit,
+                          window=Minute(1), auto_extract_ip=false)(
+        req -> (yield(); HTTP.Response(200, "ok")))
+    ip = IPv4("10.0.0.3")
+
+    statuses = Vector{Int}(undef, 2 * limit)
+    @sync for i in 1:(2 * limit)
+        Threads.@spawn statuses[i] = wrapped(make_request(ip)).status
+    end
+
+    @test count(==(200), statuses) == limit
+    @test count(==(429), statuses) == limit
+end
+end
