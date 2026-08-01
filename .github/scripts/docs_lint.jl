@@ -100,6 +100,8 @@ const REQUIRED_SYMBOLS = String[
     "SessionMiddleware", "CSRFMiddleware", "Cors", "RateLimiter", "ExtractIP",
     "BearerAuth", "CookieAuthMiddleware", "GuardMiddleware", "AccessLog",
     "SecretString", "reveal",
+    # Release-train tooling — the versioning rule and cut-release skill name these.
+    "upgrade_guide", "_parse_upgrading",
 ]
 
 # ---- helpers ---------------------------------------------------------------

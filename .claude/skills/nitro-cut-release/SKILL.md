@@ -1,6 +1,6 @@
 ---
 name: nitro-cut-release
-description: Cut a Nitro.jl release — verify the pre-publish gate, confirm the Project.toml version matches the open CHANGELOG cycle, stamp the "Unreleased" heading with a date, tag it, and open the next cycle. Maintainer-invoked; never run as a side effect of finishing a feature.
+description: Cut a Nitro.jl release train — verify the pre-publish gate, bump Project.toml once, stamp the UPGRADING.md "Unreleased" entries with the new version, date and tag it, and open a fresh Unreleased. Maintainer-invoked; never run as a side effect of finishing a feature.
 ---
 
 # nitro-cut-release

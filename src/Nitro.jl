@@ -43,6 +43,7 @@ const CONTEXT::Ref{ServerContext} = Ref(ServerContext())
 
 include("exts.jl")
 include("methods.jl")
+include("upgrading.jl")
 
 export  # Server lifecycle
         serve, terminate, internalrequest,
@@ -80,7 +81,9 @@ export  # Server lifecycle
         # Django-style Routing (THE routing API)
         path, urlpatterns, include_routes, RouteDefinition, url,
         # Response Abstractions
-        Res
+        Res,
+        # Version-scoped UPGRADING.md emitter (release-train rollout)
+        upgrade_guide
 
 include("precompile.jl")
 end
