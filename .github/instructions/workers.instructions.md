@@ -34,11 +34,48 @@ user_tasks = get_all_tasks(nothing, "user_123")
 public_status = get_task_status(task_id)
 ```
 
+### Reporting progress — never assign the field
+
+`TaskInfo.progress` is declared `@atomic`. Plain assignment from a callback throws
+`ConcurrencyViolationError`:
+
+```julia
+# ✗ throws — violates the @atomic field
+task_info.progress = 50
+
+# ✓ the only supported write
+update_progress!(task_info, 50)     # 0–100 scale, returns the task
+```
+
+This is a live documentation bug in the workers tutorial
+([#54](https://github.com/PingoLee/Nitro.jl/issues/54)) — do not copy the assignment form from
+existing docs, and fix it where you find it.
+
+### The rest of the exported surface
+
+`Workers` exports considerably more than the four functions above. The ones worth knowing before
+you add anything:
+
+| API | Purpose |
+|-----|---------|
+| `submit_sequential_task`, `SequentialQueue` | Ordered, one-at-a-time execution within a queue |
+| `is_task_running`, `get_queue_status` | Introspection without mutating |
+| `update_progress!` | The only safe write to `TaskInfo.progress` |
+| `cleanup_old_tasks`, `start_cleanup_scheduler`, `stop_cleanup_scheduler!` | Retention |
+| `shutdown!` | Graceful teardown — stop the cleanup scheduler and queue processors |
+| `reset_store!`, `install!`, `uninstall!`, `worker_store`, `default_store` | Store lifecycle |
+
+**`shutdown!` is part of the store contract, not an optional extra.** A store that does not
+implement it leaks its cleanup scheduler and queue processors on shutdown — which is exactly what
+`PormGWorkerStore` does today ([#29](https://github.com/PingoLee/Nitro.jl/issues/29)). Any new
+backend must implement it.
+
 ## 3. Database Persistence
 
 Configure PormG, then bootstrap the store:
 
 ```julia
+# db_key defaults to "db"; "workers" below is an explicit override, not the default.
 persistent_store = pormg_nitro_worker(db_key="workers")
 serve(middleware=[worker_startup(queues=["reports"], store=persistent_store, recover_zombies=true)])
 ```

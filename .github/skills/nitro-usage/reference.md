@@ -283,7 +283,8 @@ get_all_tasks(filter_status = nothing, user_id = nothing; store = default_store(
 
 worker_startup(; queues, store, recover_zombies)              # a middleware
 set_queue_authorizer!(store, authorizer)                      # (queue, user_id) -> Bool
-pormg_nitro_worker(; db_key = "workers")                      # needs `using PormG`
+pormg_nitro_worker(; db_key = "db")                           # needs `using PormG`
+update_progress!(task_info, value)                            # NEVER assign .progress directly
 ```
 
 Every one of these also has a `(ctx::ServerContext, …)` method — use it to avoid the global

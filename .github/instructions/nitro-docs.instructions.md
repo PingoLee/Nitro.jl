@@ -13,7 +13,7 @@ follow these rules so every example is consistent and immediately usable.
 - **Never** use `@get`, `@post`, `router()`, or any other macro/HOF routing API in examples.
   Those APIs are deleted. Using them in docs will mislead readers.
 - **Always** use `path()` + `urlpatterns` for route declarations.
-- **Always** use Django path converters (`<int:id>`, `<str:slug>`, `<float:n>`, `<uuid:key>`).
+- **Always** use Django path converters. The registry defines exactly five — `<int:id>`, `<str:slug>`, `<float:n>`, `<bool:flag>`, `<uuid:key>`. Do not invent others in examples; an unknown converter throws at `path()` time.
 
 ```julia
 path("/api/products/<int:id>", ProductHandlers.get_product, method="GET")

@@ -20,7 +20,7 @@ This is a process skill, not a code skill — it does not touch `src/`.
 
 ## Use This Skill For
 
-- Creating one or many GitHub issues (including the one-time bulk migration from `todo.md`)
+- Creating one or many GitHub issues
 - Editing, closing, commenting on, or relabeling existing issues
 - Adding or adjusting labels
 
@@ -33,10 +33,10 @@ This is a process skill, not a code skill — it does not touch `src/`.
 - **Release gating is the `pre-publish` label, nothing more.** "What must be settled before
   Nitro's first General-registry publish?" is answered live by
   `gh issue list --label pre-publish`.
-- **Transitional note.** `todo.md` was the pre-migration backlog. It is deleted in the same
-  reviewed pass that files the migrated issues (see the bulk workflow below). Until that pass
-  lands, treat any unchecked `todo.md` item as unmigrated backlog — but do not partially rewrite
-  the file; the conversion happens in one pass.
+- **The migration is done.** `todo.md` was the pre-migration backlog; it has been converted to
+  issues and deleted, and no file in the repo mirrors the tracker any more. If you find a
+  checklist file that looks like a backlog, it is stale — surface it for deletion rather than
+  working from it.
 
 ## Tooling
 
@@ -72,7 +72,7 @@ Creating issues publishes content on a public repo and notifies watchers — it 
   ("the reference Genie app") or drop it. Secrets, connection strings, and hostnames never
   appear in issues.
 
-## Bulk migration / creation workflow
+## Bulk creation workflow
 
 1. **Draft, then confirm.** Write every proposed issue (title, labels, full body) to a review file
    and show the user the plan (a title/label table is enough). Create nothing public until they
@@ -96,9 +96,9 @@ Creating issues publishes content on a public repo and notifies watchers — it 
    issue or PR.
 7. **Verify after.** Check the open count, label assignment, and spot-check that a rich body (task
    lists, blockquotes, code fences) rendered: `gh issue view <n> --json body -q '.body'`.
-8. **Delete the migrated source file in the same reviewed pass.** Once the issues exist and are
-   verified, `todo.md` is removed — leaving a stale copy would recreate the two-homes problem
-   this model exists to end.
+8. **If the issues came from a file, delete it in the same reviewed pass.** Once the issues exist
+   and are verified, the source checklist is removed — leaving a stale copy would recreate the
+   two-homes problem this model exists to end.
 
 ## Closing a resolved issue
 
