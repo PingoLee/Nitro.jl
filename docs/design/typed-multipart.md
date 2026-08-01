@@ -1,13 +1,9 @@
----
-name: nitro-typed-multipart-proposal
-description: >-
-  Design and implement typed mixed multipart extraction (MultipartForm{T}) in
-  Nitro.jl — text fields plus files in one extractor, validation, and tutorial
-  updates. Use when working on multipart uploads, FormFile extractors, or the
-  BI-style import handler pattern.
----
+# Design: Typed Mixed Multipart Extraction (`MultipartForm{T}`)
 
-# Nitro Proposal: Typed Mixed Multipart Extraction
+> **Status:** design record. Moved here from `.github/skills/` — it is a proposal, not a repeatable
+> workflow, so it belongs with the other design records rather than in the skill registry. `Files{…}`
+> and `MultipartForm{T}` both exist in `src/extractors.jl` today; this document is the rationale for
+> the shape they took and the open questions that remain.
 
 ## Context
 

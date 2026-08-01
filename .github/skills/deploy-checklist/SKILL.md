@@ -37,7 +37,8 @@ Report missing env vars by name; do not invent secret values.
 
 ## 3. Nitro runtime pipeline
 
-- [ ] `serve(urlpatterns; middleware=[...])` order: global middleware → defaults → router (`nitro-core.instructions.md`).
+- [ ] Routes registered with `urlpatterns(prefix, routes)` **before** `serve()`; `serve(middleware=[...])`
+      is keyword-only. Pipeline order: global middleware → defaults → router (`nitro-core.instructions.md`).
 - [ ] `SessionMiddleware` / `CSRFMiddleware` present for stateful cookie apps.
 - [ ] `spafiles` or static config matches how the frontend is served in production.
 - [ ] Access logging is privacy-safe. `serve(...; access_log=true)` (default on) logs the

@@ -96,7 +96,7 @@ Check aggressively for the following. For any finding, trace a concrete attacker
 
 - Raw SQL string interpolation instead of parameterized queries or ORM APIs in `ext/`
 - Dynamic `eval`/`include`/`run` built from request input
-- **XSS via the deliberate escape hatches**: user-influenced data flowing into `Res.html` or `Res.js` without escaping. (Raw `String` returns and `Res.send` are `text/plain` and safe by design — see `nitro-core.instructions.md` §4 — so `Res.html`/`Res.js` are the *only* HTML/JS sinks worth reviewing.)
+- **XSS via the deliberate escape hatches**: user-influenced data flowing into the top-level `html()`, `js()`, `xml()`, or `css()` constructors (`src/utilities/render.jl`) without escaping. Those four are the *only* markup/script sinks — raw `String` returns and `Res.send` are `text/plain` and safe by design (see `nitro-core.instructions.md` §4). Note `Res.html`/`Res.js` **do not exist**; a diff that calls them is a bug, not a sink.
 - **Open redirect / header (CRLF) injection**: user input reaching a `Location` redirect target, `Set-Cookie`, or other response header without validation
 - **SSRF**: outbound HTTP/DB/file requests whose URL, host, or path derives from request input
 - File upload/path handling without sanitization (path traversal via `FormFile.filename` or staged paths)
@@ -141,7 +141,7 @@ In the final pass, review `docs/`, `.github/workflows/`, `Project.toml`, and roo
 
 ## Review Method
 
-1. Read the `project-guidelines` skill (`.github/skills/project-guidelines/SKILL.md`) for the rule index and active checkpoints.
+1. Read [`nitro-general.instructions.md`](../../instructions/nitro-general.instructions.md) for the non-negotiables, the hard-stop index, and the **architecture map** — the map doubles as a review checkpoint: a new `src/` file that no row covers is itself a finding.
 2. Identify the changed file set with `git diff --name-only` (or `git diff HEAD --name-only` for all local).
 3. Read the `src/Workers` slice first when present.
 4. Read the core `src/` slice (excluding Workers) for routing, middleware, and extractors.
@@ -152,7 +152,7 @@ In the final pass, review `docs/`, `.github/workflows/`, `Project.toml`, and roo
 
 ## Project-Specific Heuristics
 
-Always re-read the `project-guidelines` skill (step 1) so newly active rules are included. Permanent baselines:
+Always re-read the general instructions (step 1) so newly active rules are included. Permanent baselines:
 
 - Flag any `import PormG` or DB access in `src/` (belongs in `ext/NitroPormGExt.jl` only)
 - Flag macro routing (`@get`, `@post`, etc.) or `serveparallel()` in code or docs

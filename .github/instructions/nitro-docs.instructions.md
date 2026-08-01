@@ -84,4 +84,13 @@ Always type the `req` parameter as `HTTP.Request` and path parameters with their
 
 ## 8. `serve()` and Entry-Point
 
-- Use `serve(urlpatterns)` — no positional port argument unless specifically demonstrating port configuration.
+- **`serve()` is keyword-only.** It takes no positional argument — not a port, and *not* the routes.
+  Route registration is a separate, earlier step:
+
+```julia
+urlpatterns("", routes)   # register (prefix first; "" is root)
+serve()                   # then start — add host=/port=/middleware=/context= as needed
+```
+
+- Never write `serve(urlpatterns)` or `serve(routes)`; there is no such method and the example will
+  not run.
