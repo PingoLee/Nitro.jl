@@ -39,7 +39,8 @@ Whenever you write code, write tests, or propose architecture for this repositor
 ## 5. Security & Middleware
 - **Linear Execution**: Middleware executes strictly Top-Down: Global Prefix Middleware -> Custom Middleware -> Defaults -> Router.
 - **Guards vs Middleware**:
-  - Use **Guards** (e.g., `login_required`, `role_required`, `claim_required`, `kid_required`) for route-specific authentication or authorization. Guards are functions that run before the handler and can abort the request early.
+  - Use **Guards** (`login_required`, `role_required`, `permission_required`, `claim_required`, `kid_required`) for route-specific authentication or authorization. Guards are functions that run before the handler and can abort the request early. `role_required` and `permission_required` are thin aliases over `claim_required`.
+  - **Guards attach through `GuardMiddleware`, not a `guards=` keyword.** `path()` takes `method`, `methods`, `name`, and `middleware` only — a guard reaches a route as `middleware=[GuardMiddleware(login_required(), …)]`, or app-wide in the `serve(middleware=…)` pipeline.
   - **Auth error contract**: `401` = unauthenticated (auth middleware; a throwing validator maps to 401, never 500), `403` = authenticated but not authorized (guards), `302` = `login_required` browser redirect. The authenticated principal is the `Principal` type (`src/types.jl`) — an immutable dict-like wrapper over verified claims with typed `id`/`kid` fields.
   - Use **Middleware** (e.g., `SessionMiddleware`, `RateLimiter`) for global, application-wide, or router-wide checks and mutations.
 - **Session Management**: Ensure `SessionMiddleware` is configured properly in the global pipeline for stateful apps. Access session data directly via `req.session`.
@@ -51,4 +52,4 @@ Whenever you write code, write tests, or propose architecture for this repositor
 
 ## 7. Quality Standards
 - **Testing**: Any new feature or bug fix must have a corresponding test in `test/`. Use `Pkg.test()` for verification.
-- **Type Stability**: Crucial for high-throughput HTTP handling. Avoid `Any` types in internal request pipelines. Use `Nullable{T}` over `Union{T, Missing}` for internal types.
+- **Type Stability**: Crucial for high-throughput HTTP handling. Avoid `Any` types in internal request pipelines. Nitro's optional-value alias is `Nullable{T} = Union{T, Nothing}` (`src/types.jl`) — write `Nullable{T}` rather than spelling out `Union{T, Nothing}`, and do not reach for `Missing`, which Nitro does not use for absence.

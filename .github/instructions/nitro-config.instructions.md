@@ -34,4 +34,10 @@ When designing configuration, bootstrapping applications, or proposing developer
 ## 6. Developer experience
 - Document one recommended app bootstrap pattern in docs when touching tutorials.
 - Config must be swappable in tests without mutating framework-global state.
-- Support multiple Nitro apps in one Julia process or test suite.
+- **Multiple Nitro apps in one process is the design target, not the current state.** The
+  process-wide `CONTEXT[]` singleton (`src/Nitro.jl`, `src/methods.jl`) still backs the top-level
+  API, so two apps in one process share a router and an app context, and
+  `internalrequest(context=…)` races a live server — tracked in
+  [#31](https://github.com/PingoLee/Nitro.jl/issues/31). Do not write docs or tests that assume it
+  already works. **Do** write new code against the explicit `(ctx::ServerContext, …)` methods (or
+  `instance(...)`), which is the path to closing that gap.
