@@ -32,6 +32,10 @@
 #      "`nitro-core.instructions.md` §4" must resolve to a real `## 4.` heading in
 #      that file. The hub's hard-stop index is built entirely out of these, so an
 #      unchecked § pointer is exactly how the index rots.
+#   I. Subagent envelopes — a quarantined agent (one whose purpose is that it
+#      CANNOT act) must declare an explicit tools list containing no acting tool.
+#      A quarantine that silently gains Bash is worse than none, because every
+#      doc still claims it holds. See docs/design/agent-security.md.
 #   H. `applyTo` coverage — every glob in an instruction file's front-matter
 #      matches at least one tracked file. Catches a rule scoped to a directory
 #      that has since been renamed.
@@ -55,6 +59,7 @@ const DOC_GLOBS = String[
     "CLAUDE.md",
 ]
 const DOC_DIRS = String[
+    joinpath(".claude", "agents"),
     joinpath(".github", "instructions"),
     joinpath(".github", "skills"),
     joinpath(".claude", "skills"),
@@ -65,7 +70,16 @@ const HUB = joinpath(".github", "instructions", "nitro-general.instructions.md")
 
 const SKILLS_DIR       = joinpath(ROOT, ".github", "skills")
 const CLAUDE_SKILLS_DIR = joinpath(ROOT, ".claude", "skills")
+const CLAUDE_AGENTS_DIR = joinpath(ROOT, ".claude", "agents")
 const INSTRUCTIONS_DIR = joinpath(ROOT, ".github", "instructions")
+
+# Subagents whose whole purpose is a reduced capability envelope. If one of these
+# ever gains a tool that can act (Bash, Write, Edit, WebFetch), the quarantine it
+# implements is silently gone while every doc still claims it holds — so the
+# allowed toolset is pinned here and checked. See docs/design/agent-security.md.
+const QUARANTINED_AGENTS = Dict{String,Set{String}}(
+    "issue-reader" => Set(["Read", "Grep", "Glob"]),
+)
 
 # Some docs illustrate a *downstream app's* file layout (not this repo's). Those
 # example paths are intentionally absent here — allowlist them so the path check
@@ -317,6 +331,46 @@ function lint_registry(errors)
     end
 end
 
+function lint_agents(errors)
+    isdir(CLAUDE_AGENTS_DIR) || return
+    hub = joinpath(ROOT, HUB)
+    hubtext = isfile(hub) ? read(hub, String) : ""
+
+    for f in sort(readdir(CLAUDE_AGENTS_DIR))
+        endswith(f, ".md") || continue
+        name = f[1:end-3]
+        fm = front_matter(read(joinpath(CLAUDE_AGENTS_DIR, f), String))
+
+        get(fm, "name", "") == name ||
+            push!(errors, ".claude/agents/$(f): front-matter name `$(get(fm, "name", ""))` != filename `$(name)`")
+        isempty(get(fm, "description", "")) &&
+            push!(errors, ".claude/agents/$(f): empty or missing `description`")
+
+        occursin(".claude/agents/$(f)", hubtext) ||
+            push!(errors, "$(HUB): subagent `$(name)` exists but is not listed in the Subagents table")
+
+        # Capability-envelope pin: a quarantined agent must never gain an acting tool.
+        if haskey(QUARANTINED_AGENTS, name)
+            declared = get(fm, "tools", "")
+            if isempty(declared)
+                push!(errors, ".claude/agents/$(f): quarantined agent must declare an explicit `tools:` list")
+            else
+                got = Set(strip(t) for t in split(declared, ',') if !isempty(strip(t)))
+                allowed = QUARANTINED_AGENTS[name]
+                extra = setdiff(got, allowed)
+                isempty(extra) ||
+                    push!(errors, ".claude/agents/$(f): quarantined agent grants disallowed tool(s) " *
+                                  "$(join(sort(collect(extra)), ", ")) — the quarantine only holds while it cannot act")
+            end
+        end
+    end
+
+    for name in sort(collect(keys(QUARANTINED_AGENTS)))
+        isfile(joinpath(CLAUDE_AGENTS_DIR, name * ".md")) ||
+            push!(errors, ".claude/agents/$(name).md: pinned quarantined agent is missing")
+    end
+end
+
 function lint_claude_mirror(errors)
     isdir(SKILLS_DIR) || return
     source = Dict{String,String}()
@@ -377,6 +431,7 @@ function main()
     lint_instruction_frontmatter(errors, all_files)
     lint_registry(errors)
     lint_claude_mirror(errors)
+    lint_agents(errors)
 
     if isempty(errors)
         println("docs_lint: OK — $(length(docs)) docs, $(length(REQUIRED_SYMBOLS)) symbols, " *
