@@ -76,15 +76,34 @@ These are canonical here — no other file owns them.
   wait for an explicit go-ahead. Pushing and opening PRs are a *separate* confirmation again.
   Outward-facing backlog operations (issue create/edit/close) follow the same rule.
 
-- **Changelog contract.** A behavior or API change is **done** when it ships code + tests + docs
-  **and** its entry lands in the current `## [0.y.0] — Unreleased` section of
-  [`CHANGELOG.md`](../../CHANGELOG.md) under `Added` / `Changed` / `Fixed` / `Removed`. Breaking
-  entries carry a concrete `before → after` migration inline — Nitro is pre-registry, so the
-  migration note *is* the compatibility story. **Versioning is per cycle, not per PR**:
-  `Project.toml` already carries the version named in the open `Unreleased` heading, so a normal PR
-  leaves it alone. One exception — the first *breaking* change to land in a cycle that opened as a
-  `z` release raises both `Project.toml` and the heading to the next `y`. Dates and tags are stamped
-  at cut time by [`nitro-cut-release`](../skills/nitro-cut-release/SKILL.md).
+- **Upgrade-log contract — release trains, not per-PR bumps.** A **breaking or behavior** change is
+  **done** when it ships code + tests + docs **and** prepends its entry to the **`## Unreleased`**
+  section of [`UPGRADING.md`](../../UPGRADING.md) with `- **Version**: Unreleased` — and **it does
+  not bump `Project.toml`.** Each entry carries a *"How to find the calls to migrate"* grep and a
+  concrete `before → after`; Nitro is pre-registry, so that migration note *is* the compatibility
+  story. No per-app rollout tables — a consuming app's dependency pin **is** its rollout state.
+  The maintainer cuts a train via [`nitro-cut-release`](../skills/nitro-cut-release/SKILL.md): bump
+  the `y` slot **once**, stamp every `Unreleased` entry, date + `git tag` it, open a fresh
+  `## Unreleased`. `z` is a purely-additive train or a hotfix to a tagged one.
+
+  **`UPGRADING.md` is not a changelog.** It carries only what *forces* an app edit — a new opt-in
+  capability needs no entry, because nothing breaks without it; document those in `docs/`. There is
+  deliberately **no `CHANGELOG.md`**; do not reintroduce one, and do not mirror the log into a second
+  file. The read side is `upgrade_guide(from = v"<pin>")` ([`src/upgrading.jl`](../../src/upgrading.jl)),
+  which renders only the slice newer than a given pin; the *user-facing* explanation of the model
+  lives in [`docs/src/upgrading.md`](../../docs/src/upgrading.md) — extend that page rather than
+  restating it here.
+
+- **Bumping the PormG pin — run its upgrade guide first.** Nitro path-depends on PormG (`[sources]`)
+  and pins it in `[compat]`. PormG uses the same release-train model, so **before** raising that pin
+  run `PormG.upgrade_guide(from = v"<current pin>")` and apply every entry it lists — bumping the pin
+  without applying them is the exact failure the model exists to prevent. PormG is a weakdep, so run
+  it from PormG's own env (`julia --project=../PormG.jl`), not Nitro's. Nitro's PormG surface is
+  confined to `ext/NitroPormGExt.jl`, which keeps most entries inapplicable — but confirm that per
+  entry with its grep rather than assuming, and re-run the `test/extensions/pormg_*` tests. Entries
+  can be **data** migrations rather than code ones: PormG's UTC canonicalization of `DateTimeField`
+  requires a one-time re-normalization of existing **SQLite** rows, which reaches the `expires_at` and
+  timestamp columns Nitro's session and worker stores write.
 
 - **No runtime side effects in module bodies.** Cached precompilation runs a module body **only in
   the precompile worker** — loading from cache does not re-run it. Top-level `atexit`, `ENV`
@@ -163,7 +182,7 @@ and follow its steps.
 | `nitro-test-troubleshooting` | [`.github/skills/nitro-test-troubleshooting/SKILL.md`](../skills/nitro-test-troubleshooting/SKILL.md) | A test is red, flaky, or order-dependent and it isn't an obvious regression |
 | `deploy-checklist` | [`.github/skills/deploy-checklist/SKILL.md`](../skills/deploy-checklist/SKILL.md) | Pre-production env, deps, proxy, and test audit |
 | `nitro-issue-management` | [`.github/skills/nitro-issue-management/SKILL.md`](../skills/nitro-issue-management/SKILL.md) | GitHub backlog: file/label/close issues (`pre-publish` gating label) |
-| `nitro-cut-release` | [`.github/skills/nitro-cut-release/SKILL.md`](../skills/nitro-cut-release/SKILL.md) | Stamp `## Unreleased`, bump `Project.toml` once, tag (maintainer-invoked) |
+| `nitro-cut-release` | [`.github/skills/nitro-cut-release/SKILL.md`](../skills/nitro-cut-release/SKILL.md) | Cut a release train: bump `Project.toml` once, stamp the `UPGRADING.md` entries, tag (maintainer-invoked) |
 
 Editing Nitro itself → the area's deep-dive rule file, plus `add-route` for new endpoints. Writing
 application code that *consumes* Nitro → `nitro-usage`. Reviews → `changed-code-review`.

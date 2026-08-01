@@ -9,6 +9,7 @@ makedocs(
     pages = [
         "Overview" => "index.md",
         "api.md",
+        "upgrading.md",
         "Manual" => [
             "tutorial/first_steps.md",
             "tutorial/bi_app_config.md",
