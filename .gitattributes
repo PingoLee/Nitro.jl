@@ -1,0 +1,10 @@
+# Shell scripts must keep LF endings. This repo is developed on Windows, where `core.autocrlf`
+# hands out CRLF working copies; bash then chokes on the carriage returns with errors like
+# `$'\r': command not found` — so `scripts/worktree_setup.sh` would break for anyone on Linux/macOS
+# or in CI, while still appearing to work locally. Pin the ending rather than relying on config.
+#
+# Deliberately narrow: *.jl and *.md are NOT pinned. Julia does not care about line endings, and
+# normalizing them would rewrite every file in the repo on its next touch for no benefit. Markdown
+# that is *parsed* (UPGRADING.md, read by `_parse_upgrading` in src/upgrading.jl) handles CRLF in
+# the parser instead, which also covers files that never went through git.
+*.sh text eol=lf
