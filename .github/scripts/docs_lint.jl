@@ -2,10 +2,13 @@
 #
 # docs_lint.jl — guard the agent-context docs against drift.
 #
-# Instruction/skill docs (AGENTS.md, .github/instructions/*, .github/skills/**)
-# restate rules and reference concrete files and API symbols. When code moves or
-# a symbol is renamed, those references silently rot. This lint fails CI on the
-# mechanically-checkable classes of that drift.
+# The agent-doc system is built on one rule: *one fact, one home*. AGENTS.md is a
+# thin pointer, `.github/instructions/nitro-general.instructions.md` is the
+# canonical hub, area files own their area, and `.github/skills/` holds
+# workflows. That only stays true if every *cross-reference* between them is
+# checked — otherwise the hub silently rots into a second, wrong copy.
+#
+# This lint fails CI on the mechanically-checkable classes of that drift.
 #
 # What it checks:
 #   A. Path references — every repo-relative path mentioned in backticks
@@ -14,10 +17,31 @@
 #      real file (fragment/anchor and external URLs are ignored).
 #   C. Public-symbol existence — a curated set of API names the docs commit to
 #      must still be defined somewhere in `src/` or `ext/`.
+#   D. Front-matter — every skill declares `name` (matching its directory) and a
+#      non-empty `description`; every instruction file declares `applyTo` and
+#      `description`.
+#   E. Registry parity — every directory under `.github/skills/` is listed in the
+#      hub's skill table, and every instruction file is listed in its rule table.
+#      A skill nobody links to is invisible; a table row for a deleted skill is a
+#      lie.
+#   F. `.claude/skills/` mirror — Claude Code reads `.claude/skills/`, Copilot
+#      reads `.github/skills/`. The former are thin stubs pointing at the latter;
+#      this check keeps the two name/description sets identical so the slash
+#      command and the agent skill can never describe different things.
+#   G. Section-anchor references — a pointer like `[nitro-core §4](…)` or
+#      "`nitro-core.instructions.md` §4" must resolve to a real `## 4.` heading in
+#      that file. The hub's hard-stop index is built entirely out of these, so an
+#      unchecked § pointer is exactly how the index rots.
+#   H. `applyTo` coverage — every glob in an instruction file's front-matter
+#      matches at least one tracked file. Catches a rule scoped to a directory
+#      that has since been renamed.
 #
 # What it does NOT catch (documented so nobody trusts it too far):
-#   - Wrong overload / signature drift (e.g. `startup(...)` vs `worker_startup(...)`
-#     when both names exist). Symbol-*existence* only; no Julia parsing.
+#   - Wrong overload / signature drift (e.g. `Res.status(code, msg)` when only
+#     `Res.status(code)` exists). Symbol-*existence* only; no Julia parsing.
+#   - A symbol that exists in the wrong namespace (`Res.html` vs `html`) — check C
+#     is namespace-blind. Add such pairs to REQUIRED_SYMBOLS only by their
+#     defining name.
 #   - Prose that is merely stale but references nothing concrete.
 #
 # Run locally:  julia .github/scripts/docs_lint.jl
@@ -33,14 +57,24 @@ const DOC_GLOBS = String[
 const DOC_DIRS = String[
     joinpath(".github", "instructions"),
     joinpath(".github", "skills"),
+    joinpath(".claude", "skills"),
 ]
+
+# The canonical hub: the file that must list every skill and every rule file.
+const HUB = joinpath(".github", "instructions", "nitro-general.instructions.md")
+
+const SKILLS_DIR       = joinpath(ROOT, ".github", "skills")
+const CLAUDE_SKILLS_DIR = joinpath(ROOT, ".claude", "skills")
+const INSTRUCTIONS_DIR = joinpath(ROOT, ".github", "instructions")
 
 # Some docs illustrate a *downstream app's* file layout (not this repo's). Those
 # example paths are intentionally absent here — allowlist them so the path check
 # doesn't flag them. Fail-closed: a NEW example path fails until it is listed,
 # which keeps real drift (a moved core file) from hiding behind "it's an example".
 const IGNORE_PATHS = Set{String}([
-    "src/Routes.jl",   # nitro-docs / add-route: app route-declaration file
+    "src/Routes.jl",   # nitro-docs / add-route / nitro-usage: app route file
+    "src/App.jl",      # nitro-usage: app entry point
+    "src/main.jl",     # nitro-docs: app entry point
 ])
 const IGNORE_PREFIXES = String[
     "src/Routes/",     # app sub-router files
@@ -50,12 +84,22 @@ const IGNORE_PREFIXES = String[
 # Check C: API names the docs rely on. If any is renamed/removed, the docs that
 # name it are wrong — fail until either the code or the docs are updated.
 const REQUIRED_SYMBOLS = String[
-    "worker_startup", "serve",
-    "path", "urlpatterns", "include_routes",
+    "worker_startup", "serve", "terminate", "resetstate", "internalrequest", "instance",
+    "path", "urlpatterns", "include_routes", "url",
     "submit_task", "get_task_status", "cancel_task", "get_all_tasks",
     "set_queue_authorizer!", "pormg_nitro_worker",
     "add_response_headers", "own_response_headers",
-    "login_required", "role_required", "claim_required", "kid_required", "Principal",
+    "login_required", "role_required", "permission_required", "claim_required",
+    "kid_required", "Principal",
+    # Response constructors — the markup sinks the security rules name.
+    "html", "js", "css", "xml", "text", "binary",
+    # Request/body plumbing the usage skill teaches.
+    "formdata", "multipart", "payload", "getcontext", "regenerate_session!",
+    "staticfiles", "spafiles", "dynamicfiles",
+    # Middleware constructors.
+    "SessionMiddleware", "CSRFMiddleware", "Cors", "RateLimiter", "ExtractIP",
+    "BearerAuth", "CookieAuthMiddleware", "GuardMiddleware", "AccessLog",
+    "SecretString", "reveal",
 ]
 
 # ---- helpers ---------------------------------------------------------------
@@ -76,19 +120,49 @@ function collect_docs()
     return docs
 end
 
-# Strip inline/fenced code so link-like text inside code samples isn't linted as
-# a real path, and vice-versa: we lint backtick paths (A) and md links (B)
-# directly off the raw text, so we keep the raw content and match precisely.
+"""
+Parse the leading `---` front-matter block into a Dict{String,String}.
+Handles plain `key: value` and folded `key: >-` blocks (subsequent indented
+lines are joined with spaces). Returns an empty Dict when there is no block.
+"""
+function front_matter(text)
+    lines = split(text, '\n')
+    (isempty(lines) || strip(lines[1]) != "---") && return Dict{String,String}()
+    close_idx = findnext(l -> strip(l) == "---", lines, 2)
+    close_idx === nothing && return Dict{String,String}()
+
+    fm = Dict{String,String}()
+    key = ""
+    for i in 2:(close_idx - 1)
+        line = lines[i]
+        m = match(r"^([A-Za-z_][A-Za-z0-9_]*):[ \t]*(.*)$", line)
+        if m !== nothing && !startswith(line, " ") && !startswith(line, "\t")
+            key = m.captures[1]
+            val = strip(m.captures[2])
+            fm[key] = (val == ">-" || val == ">" || val == "|") ? "" : val
+        elseif !isempty(key)
+            fm[key] = strip(fm[key] * " " * strip(line))
+        end
+    end
+    return fm
+end
+
+normalize_ws(s) = replace(strip(s), r"\s+" => " ")
 
 # A: repo-relative paths inside backticks.
 #   PATH_RE — file-ish, ends in an extension, e.g. `src/utilities/misc.jl`
 #   DIR_RE  — directory-ish, trailing slash, e.g. `ext/NitroPormGExt/`
-#             (bug #1's shape: a dir written where a `.jl` file was meant).
 const PATH_RE = r"`((?:src|ext|test|docs|\.github)/[A-Za-z0-9_./\-]+\.[A-Za-z0-9]+)`"
 const DIR_RE  = r"`((?:src|ext|test|docs|\.github)/[A-Za-z0-9_./\-]+/)`"
 
 # B: markdown links `](target)` — capture the target.
 const LINK_RE = r"\]\(([^)]+)\)"
+
+# G: section pointers, both spellings.
+#   linked:   [nitro-core §4](nitro-core.instructions.md)
+#   backtick: `nitro-core.instructions.md` §4
+const SECTION_LINK_RE = r"\[[^\]]*?§(\d+)\]\(([^)#]+)(?:#[^)]*)?\)"
+const SECTION_TICK_RE = r"`([A-Za-z0-9_\-]+\.instructions\.md)`[^\n]{0,12}?§(\d+)"
 
 function lint_paths(file, text, errors)
     for re in (PATH_RE, DIR_RE), m in eachmatch(re, text)
@@ -102,9 +176,7 @@ end
 function lint_links(file, text, errors)
     for m in eachmatch(LINK_RE, text)
         target = strip(m.captures[1])
-        # Skip external URLs and same-page anchors.
         (occursin("://", target) || startswith(target, "#") || startswith(target, "mailto:")) && continue
-        # Drop any #fragment (line anchors like #L42).
         path = first(split(target, '#'))
         isempty(path) && continue
         resolved = normpath(joinpath(dirname(file), path))
@@ -115,9 +187,8 @@ end
 
 # C: is `sym` defined anywhere under src/ or ext/?
 function symbol_defined(sym)
-    # Escape regex metachars in the symbol (e.g. trailing `!`).
     esc = replace(sym, r"([!])" => s"\\\1")
-    pat = Regex("(?:^|[^A-Za-z0-9_!])" * esc * "\\s*(?:\\(|=)")
+    pat = Regex("(?:^|[^A-Za-z0-9_!])" * esc * "\\s*(?:\\(|=|\\{)")
     for sub in ("src", "ext")
         base = joinpath(ROOT, sub)
         isdir(base) || continue
@@ -127,6 +198,159 @@ function symbol_defined(sym)
         end
     end
     return false
+end
+
+# G: does `file` contain a `## <n>.` heading?
+function has_section(path, n)
+    isfile(path) || return false
+    return occursin(Regex("(?m)^#{2,3}\\s+" * string(n) * "\\."), read(path, String))
+end
+
+function lint_sections(file, text, errors)
+    for m in eachmatch(SECTION_LINK_RE, text)
+        n, target = m.captures[1], strip(m.captures[2])
+        occursin("://", target) && continue
+        resolved = normpath(joinpath(dirname(file), target))
+        endswith(resolved, ".md") || continue
+        has_section(resolved, n) ||
+            push!(errors, "$(relpath(file, ROOT)): §$(n) pointer into `$(target)` has no matching `## $(n).` heading")
+    end
+    for m in eachmatch(SECTION_TICK_RE, text)
+        target, n = m.captures[1], m.captures[2]
+        resolved = joinpath(INSTRUCTIONS_DIR, target)
+        has_section(resolved, n) ||
+            push!(errors, "$(relpath(file, ROOT)): §$(n) pointer into `$(target)` has no matching `## $(n).` heading")
+    end
+end
+
+# H: convert a front-matter glob to a regex and test it against tracked files.
+function glob_matches_any(glob, all_files)
+    pat = replace(glob, r"[.()\[\]+^$]" => s -> "\\" * s)
+    pat = replace(pat, "**/" => "\x00")     # `**/` may match zero segments
+    pat = replace(pat, "**" => "\x01")
+    pat = replace(pat, "*" => "[^/]*")
+    pat = replace(pat, "\x00" => "(?:.*/)?")
+    pat = replace(pat, "\x01" => ".*")
+    re = Regex("^" * pat * "\$")
+    return any(f -> occursin(re, f), all_files)
+end
+
+function tracked_files()
+    files = String[]
+    for (dir, _, fs) in walkdir(ROOT)
+        occursin(joinpath(ROOT, ".git"), dir) && continue
+        for f in fs
+            push!(files, replace(relpath(joinpath(dir, f), ROOT), '\\' => '/'))
+        end
+    end
+    return files
+end
+
+# ---- structural checks -----------------------------------------------------
+
+function lint_skill_frontmatter(errors)
+    isdir(SKILLS_DIR) || return
+    for name in sort(readdir(SKILLS_DIR))
+        skill = joinpath(SKILLS_DIR, name, "SKILL.md")
+        if !isfile(skill)
+            push!(errors, ".github/skills/$(name)/: no SKILL.md")
+            continue
+        end
+        fm = front_matter(read(skill, String))
+        got = get(fm, "name", "")
+        got == name ||
+            push!(errors, ".github/skills/$(name)/SKILL.md: front-matter name `$(got)` != directory `$(name)`")
+        isempty(get(fm, "description", "")) &&
+            push!(errors, ".github/skills/$(name)/SKILL.md: empty or missing `description`")
+    end
+end
+
+function lint_instruction_frontmatter(errors, all_files)
+    isdir(INSTRUCTIONS_DIR) || return
+    for f in sort(readdir(INSTRUCTIONS_DIR))
+        endswith(f, ".md") || continue
+        fm = front_matter(read(joinpath(INSTRUCTIONS_DIR, f), String))
+        isempty(get(fm, "description", "")) &&
+            push!(errors, ".github/instructions/$(f): empty or missing `description`")
+        applyto = get(fm, "applyTo", "")
+        if isempty(applyto)
+            push!(errors, ".github/instructions/$(f): missing `applyTo` glob")
+            continue
+        end
+        for glob in split(strip(applyto, ['\'', '"']), ',')
+            g = strip(glob)
+            (isempty(g) || g == "**") && continue
+            glob_matches_any(g, all_files) ||
+                push!(errors, ".github/instructions/$(f): applyTo glob `$(g)` matches no file")
+        end
+    end
+end
+
+function lint_registry(errors)
+    hub = joinpath(ROOT, HUB)
+    if !isfile(hub)
+        push!(errors, "$(HUB): canonical hub is missing")
+        return
+    end
+    text = read(hub, String)
+
+    listed_skills = Set{String}(m.captures[1] for m in
+        eachmatch(r"\.github/skills/([A-Za-z0-9_\-]+)/SKILL\.md", text))
+    actual_skills = isdir(SKILLS_DIR) ?
+        Set{String}(d for d in readdir(SKILLS_DIR) if isdir(joinpath(SKILLS_DIR, d))) : Set{String}()
+
+    for s in sort(collect(setdiff(actual_skills, listed_skills)))
+        push!(errors, "$(HUB): skill `$(s)` exists but is not listed in the skill registry table")
+    end
+    for s in sort(collect(setdiff(listed_skills, actual_skills)))
+        push!(errors, "$(HUB): skill registry lists `$(s)` but `.github/skills/$(s)/` does not exist")
+    end
+
+    listed_rules = Set{String}(m.captures[1] for m in
+        eachmatch(r"([A-Za-z0-9_\-]+\.instructions\.md)", text))
+    actual_rules = isdir(INSTRUCTIONS_DIR) ?
+        Set{String}(f for f in readdir(INSTRUCTIONS_DIR) if endswith(f, ".instructions.md")) : Set{String}()
+    hub_basename = basename(HUB)
+
+    for r in sort(collect(setdiff(actual_rules, union(listed_rules, Set([hub_basename])))))
+        push!(errors, "$(HUB): rule file `$(r)` exists but is not listed in the deep-dive table")
+    end
+end
+
+function lint_claude_mirror(errors)
+    isdir(SKILLS_DIR) || return
+    source = Dict{String,String}()
+    for name in readdir(SKILLS_DIR)
+        skill = joinpath(SKILLS_DIR, name, "SKILL.md")
+        isfile(skill) || continue
+        source[name] = normalize_ws(get(front_matter(read(skill, String)), "description", ""))
+    end
+
+    if !isdir(CLAUDE_SKILLS_DIR)
+        push!(errors, ".claude/skills/: missing — Claude Code cannot invoke any skill as /<name>")
+        return
+    end
+    mirrored = Set{String}(d for d in readdir(CLAUDE_SKILLS_DIR) if isdir(joinpath(CLAUDE_SKILLS_DIR, d)))
+
+    for name in sort(collect(setdiff(keys(source), mirrored)))
+        push!(errors, ".claude/skills/: no stub for `$(name)` — add one pointing at .github/skills/$(name)/SKILL.md")
+    end
+    for name in sort(collect(setdiff(mirrored, keys(source))))
+        push!(errors, ".claude/skills/$(name)/: stub has no source at .github/skills/$(name)/")
+    end
+
+    for name in sort(collect(intersect(keys(source), mirrored)))
+        stub = joinpath(CLAUDE_SKILLS_DIR, name, "SKILL.md")
+        if !isfile(stub)
+            push!(errors, ".claude/skills/$(name)/: no SKILL.md")
+            continue
+        end
+        fm = front_matter(read(stub, String))
+        get(fm, "name", "") == name ||
+            push!(errors, ".claude/skills/$(name)/SKILL.md: front-matter name does not match directory")
+        normalize_ws(get(fm, "description", "")) == source[name] ||
+            push!(errors, ".claude/skills/$(name)/SKILL.md: description out of sync with .github/skills/$(name)/SKILL.md")
+    end
 end
 
 # ---- run -------------------------------------------------------------------
@@ -140,6 +364,7 @@ function main()
         text = read(file, String)
         lint_paths(file, text, errors)
         lint_links(file, text, errors)
+        lint_sections(file, text, errors)
     end
 
     for sym in REQUIRED_SYMBOLS
@@ -147,8 +372,15 @@ function main()
             push!(errors, "REQUIRED_SYMBOLS: `$(sym)` referenced by docs is not defined in src/ or ext/")
     end
 
+    all_files = tracked_files()
+    lint_skill_frontmatter(errors)
+    lint_instruction_frontmatter(errors, all_files)
+    lint_registry(errors)
+    lint_claude_mirror(errors)
+
     if isempty(errors)
-        println("docs_lint: OK — $(length(docs)) docs, $(length(REQUIRED_SYMBOLS)) symbols checked")
+        println("docs_lint: OK — $(length(docs)) docs, $(length(REQUIRED_SYMBOLS)) symbols, " *
+                "registry + .claude mirror + § anchors + applyTo globs checked")
         exit(0)
     else
         println(stderr, "docs_lint: $(length(errors)) finding(s):")

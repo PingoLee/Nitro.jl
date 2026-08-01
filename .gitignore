@@ -4,3 +4,7 @@
 test/Manifest.toml
 demo/Manifest.toml
 test_*.txt
+
+# Agent worktrees live under .claude/ but are never part of the tree.
+# (.claude/skills/ IS tracked — it is the Claude Code skill bridge.)
+.claude/worktrees/
