@@ -24,10 +24,11 @@
 #      hub's skill table, and every instruction file is listed in its rule table.
 #      A skill nobody links to is invisible; a table row for a deleted skill is a
 #      lie.
-#   F. `.claude/skills/` mirror — Claude Code reads `.claude/skills/`, Copilot
-#      reads `.github/skills/`. The former are thin stubs pointing at the latter;
-#      this check keeps the two name/description sets identical so the slash
-#      command and the agent skill can never describe different things.
+#   F. Plugin manifest — `.github/skills/` is the ONLY home for skill content.
+#      Copilot and Codex read it directly; Claude Code reaches it through the
+#      repo-local plugin in `.claude-plugin/`, whose `skills` path points there.
+#      This check pins that pointer, verifies the marketplace lists the plugin,
+#      and fails if a second `.claude/skills/` tree ever reappears.
 #   G. Section-anchor references — a pointer like `[nitro-core §4](…)` or
 #      "`nitro-core.instructions.md` §4" must resolve to a real `## 4.` heading in
 #      that file. The hub's hard-stop index is built entirely out of these, so an
@@ -62,7 +63,6 @@ const DOC_DIRS = String[
     joinpath(".claude", "agents"),
     joinpath(".github", "instructions"),
     joinpath(".github", "skills"),
-    joinpath(".claude", "skills"),
 ]
 
 # The canonical hub: the file that must list every skill and every rule file.
@@ -70,6 +70,8 @@ const HUB = joinpath(".github", "instructions", "nitro-general.instructions.md")
 
 const SKILLS_DIR       = joinpath(ROOT, ".github", "skills")
 const CLAUDE_SKILLS_DIR = joinpath(ROOT, ".claude", "skills")
+const PLUGIN_MANIFEST  = joinpath(ROOT, ".claude-plugin", "plugin.json")
+const PLUGIN_MARKET    = joinpath(ROOT, ".claude-plugin", "marketplace.json")
 const CLAUDE_AGENTS_DIR = joinpath(ROOT, ".claude", "agents")
 const INSTRUCTIONS_DIR = joinpath(ROOT, ".github", "instructions")
 
@@ -373,39 +375,53 @@ function lint_agents(errors)
     end
 end
 
-function lint_claude_mirror(errors)
-    isdir(SKILLS_DIR) || return
-    source = Dict{String,String}()
-    for name in readdir(SKILLS_DIR)
-        skill = joinpath(SKILLS_DIR, name, "SKILL.md")
-        isfile(skill) || continue
-        source[name] = normalize_ws(get(front_matter(read(skill, String)), "description", ""))
+function lint_plugin_manifest(errors)
+    # `.github/skills/` is the single home for skill content. Copilot and Codex read it
+    # directly; Claude Code reaches it through the repo-local plugin declared in
+    # `.claude-plugin/`, whose manifest carries a custom `skills` path. If that path drifts
+    # from `.github/skills/`, every `/<name>` invocation silently stops resolving while the
+    # files still look fine — so the pointer is checked here rather than trusted.
+    #
+    # Deliberately regex, not a JSON parse: this script runs on stdlib only (see ci.yml).
+
+    if isdir(CLAUDE_SKILLS_DIR)
+        push!(errors, ".claude/skills/: exists again — skills live only in .github/skills/, " *
+                      "reached via .claude-plugin/plugin.json. Delete it.")
     end
 
-    if !isdir(CLAUDE_SKILLS_DIR)
-        push!(errors, ".claude/skills/: missing — Claude Code cannot invoke any skill as /<name>")
+    if !isfile(PLUGIN_MANIFEST)
+        push!(errors, ".claude-plugin/plugin.json: missing — Claude Code cannot invoke any skill as /<name>")
         return
     end
-    mirrored = Set{String}(d for d in readdir(CLAUDE_SKILLS_DIR) if isdir(joinpath(CLAUDE_SKILLS_DIR, d)))
+    manifest = read(PLUGIN_MANIFEST, String)
 
-    for name in sort(collect(setdiff(keys(source), mirrored)))
-        push!(errors, ".claude/skills/: no stub for `$(name)` — add one pointing at .github/skills/$(name)/SKILL.md")
-    end
-    for name in sort(collect(setdiff(mirrored, keys(source))))
-        push!(errors, ".claude/skills/$(name)/: stub has no source at .github/skills/$(name)/")
+    skills_m = match(r"\"skills\"\s*:\s*\"([^\"]*)\"", manifest)
+    if skills_m === nothing
+        push!(errors, ".claude-plugin/plugin.json: no `skills` field — it is what points Claude Code at .github/skills/")
+    elseif !occursin(r"\.github/skills/?$", skills_m[1])
+        push!(errors, ".claude-plugin/plugin.json: `skills` is \"$(skills_m[1])\", expected \"./.github/skills/\"")
     end
 
-    for name in sort(collect(intersect(keys(source), mirrored)))
-        stub = joinpath(CLAUDE_SKILLS_DIR, name, "SKILL.md")
-        if !isfile(stub)
-            push!(errors, ".claude/skills/$(name)/: no SKILL.md")
-            continue
-        end
-        fm = front_matter(read(stub, String))
-        get(fm, "name", "") == name ||
-            push!(errors, ".claude/skills/$(name)/SKILL.md: front-matter name does not match directory")
-        normalize_ws(get(fm, "description", "")) == source[name] ||
-            push!(errors, ".claude/skills/$(name)/SKILL.md: description out of sync with .github/skills/$(name)/SKILL.md")
+    plugin_name_m = match(r"\"name\"\s*:\s*\"([^\"]*)\"", manifest)
+    plugin_name = plugin_name_m === nothing ? "" : plugin_name_m[1]
+    isempty(plugin_name) && push!(errors, ".claude-plugin/plugin.json: no `name` field")
+
+    if !isfile(PLUGIN_MARKET)
+        push!(errors, ".claude-plugin/marketplace.json: missing — the plugin has nothing to install it from")
+        return
+    end
+    market = read(PLUGIN_MARKET, String)
+    if !isempty(plugin_name) && !occursin("\"$(plugin_name)\"", market)
+        push!(errors, ".claude-plugin/marketplace.json: does not list plugin `$(plugin_name)`")
+    end
+
+    # Every skill directory must still carry a SKILL.md, or the plugin loads a partial set.
+    isdir(SKILLS_DIR) || return
+    for name in sort(readdir(SKILLS_DIR))
+        dir = joinpath(SKILLS_DIR, name)
+        isdir(dir) || continue
+        isfile(joinpath(dir, "SKILL.md")) ||
+            push!(errors, ".github/skills/$(name)/: no SKILL.md — the plugin will skip it")
     end
 end
 
@@ -432,12 +448,12 @@ function main()
     lint_skill_frontmatter(errors)
     lint_instruction_frontmatter(errors, all_files)
     lint_registry(errors)
-    lint_claude_mirror(errors)
+    lint_plugin_manifest(errors)
     lint_agents(errors)
 
     if isempty(errors)
         println("docs_lint: OK — $(length(docs)) docs, $(length(REQUIRED_SYMBOLS)) symbols, " *
-                "registry + .claude mirror + § anchors + applyTo globs checked")
+                "registry + plugin manifest + § anchors + applyTo globs checked")
         exit(0)
     else
         println(stderr, "docs_lint: $(length(errors)) finding(s):")

@@ -1,0 +1,11 @@
+{
+  "name": "nitro-skills",
+  "description": "Nitro.jl agent skills, loaded straight from .github/skills so every agent reads one copy",
+  "author": {
+    "name": "PingoLee"
+  },
+  "homepage": "https://github.com/PingoLee/Nitro.jl",
+  "repository": "https://github.com/PingoLee/Nitro.jl",
+  "license": "MIT",
+  "skills": "./.github/skills/"
+}
