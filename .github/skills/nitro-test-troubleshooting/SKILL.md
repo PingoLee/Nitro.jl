@@ -125,8 +125,11 @@ before building.
 
 Symptoms: `Pkg` resolver errors naming PormG, or every `:pormg` / `:extension` item erroring at load.
 Fix: clone or symlink PormG next to the Nitro checkout. Note this also means **a worktree under
-`.claude/worktrees/` does not have PormG as a sibling** — run the suite from the main checkout, or
-point the source at an absolute path locally (never commit that change).
+`.claude/worktrees/` does not have PormG as a sibling** — the relative path resolves to
+`.claude/worktrees/PormG.jl`, which does not exist, so *every* Pkg operation fails before any test
+runs. Fix it with `bash scripts/worktree_setup.sh`, which links the real clone into place (a
+directory junction on Windows) and instantiates. Never point `[sources]` at an absolute path — that
+change is committable and would break every other checkout.
 
 ### 5. Network and port-binding tests
 

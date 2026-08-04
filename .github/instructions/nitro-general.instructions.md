@@ -196,10 +196,23 @@ Each skill is a `SKILL.md` describing a workflow ([Agent Skills](https://docs.gi
 open format, also used by Claude Code). This table is the **single registry** — do not maintain a
 second copy.
 
-**Invocation, per agent.** Copilot surfaces `.github/skills/` as agent skills. Claude Code reads
-`.claude/skills/`, so each skill has a thin stub there that points at the real file — meaning
-`/<name>` works as a slash command and lands on the same content. Codex/Gemini: open the `SKILL.md`
-and follow its steps.
+**Invocation, per agent.** `.github/skills/` is the **only** home for skill content — there is no
+mirror, no stub, no second copy. Copilot surfaces it as agent skills directly. Claude Code discovers
+skills only under `.claude/skills/`, which this repo does not have; it reaches `.github/skills/`
+through the repo-local plugin declared in [`.claude-plugin/`](../../.claude-plugin/plugin.json),
+whose manifest carries a custom `skills` path — so `/<name>` still works as a slash command and lands
+on the same file everyone else reads. Codex/Gemini: open the `SKILL.md` and follow its steps.
+
+One-time local setup for Claude Code (the marketplace is per user, in
+`~/.claude/plugins/known_marketplaces.json`, not per project):
+
+```
+/plugin marketplace add .
+```
+
+`enabledPlugins` in `.claude/settings.json` is committed, so the plugin activates once the
+marketplace is known. Point it at the **main checkout** — a local `directory` source resolves against
+it, so every worktree shares one marketplace entry.
 
 | Skill | File | Purpose |
 |-------|------|---------|
@@ -209,10 +222,13 @@ and follow its steps.
 | `nitro-test-troubleshooting` | [`.github/skills/nitro-test-troubleshooting/SKILL.md`](../skills/nitro-test-troubleshooting/SKILL.md) | A test is red, flaky, or order-dependent and it isn't an obvious regression |
 | `deploy-checklist` | [`.github/skills/deploy-checklist/SKILL.md`](../skills/deploy-checklist/SKILL.md) | Pre-production env, deps, proxy, and test audit |
 | `nitro-issue-management` | [`.github/skills/nitro-issue-management/SKILL.md`](../skills/nitro-issue-management/SKILL.md) | GitHub backlog: file/label/close issues (`pre-publish` gating label) |
+| `nitro-issue-workflow` | [`.github/skills/nitro-issue-workflow/SKILL.md`](../skills/nitro-issue-workflow/SKILL.md) | Work issue #N end-to-end: provenance, scope, worktree, verify rungs, independent review, land, close out |
 | `nitro-cut-release` | [`.github/skills/nitro-cut-release/SKILL.md`](../skills/nitro-cut-release/SKILL.md) | Cut a release train: bump `Project.toml` once, stamp the `UPGRADING.md` entries, tag (maintainer-invoked) |
 
 Editing Nitro itself → the area's deep-dive rule file, plus `add-route` for new endpoints. Writing
-application code that *consumes* Nitro → `nitro-usage`. Reviews → `changed-code-review`.
+application code that *consumes* Nitro → `nitro-usage`. Reviews → `changed-code-review`. **"Fix issue
+#N", or any change that earns its own branch and PR → `nitro-issue-workflow`, which sequences the
+rest.**
 
 ## Subagents
 
@@ -312,12 +328,13 @@ julia --project=docs docs/make.jl
 - **GitHub Copilot:** auto-attaches this file via `applyTo: '**'`, plus any area file whose glob
   matches the path being edited.
 - **Claude Code:** `CLAUDE.md` → `AGENTS.md` → this file. Skills are reachable as `/<name>` through
-  the stubs in `.claude/skills/`.
+  the repo-local plugin in `.claude-plugin/`, which points at `.github/skills/`.
 - **Codex / Gemini CLI / others:** `AGENTS.md` → this file; open area files and skills manually per
   the tables above.
 - **Drift is machine-checked.** `.github/scripts/docs_lint.jl` runs in CI and fails on a dead path,
   a broken markdown link, a documented API symbol that no longer exists, a `§` pointer with no
-  matching heading, a skill missing from the registry table, or a `.claude/skills/` stub out of sync
-  with its source. Prose is not checked — keep it honest by hand.
+  matching heading, a skill missing from the registry table, a `.claude-plugin/` manifest whose
+  `skills` path no longer points at `.github/skills/`, or a `.claude/skills/` tree reappearing.
+  Prose is not checked — keep it honest by hand.
 - **Exclude from indexing:** the Documenter build output under `docs/`, `.git/`, and the static
   fixture tree `test/content/`.

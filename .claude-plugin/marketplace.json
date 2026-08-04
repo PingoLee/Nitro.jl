@@ -1,0 +1,14 @@
+{
+  "name": "nitro",
+  "owner": {
+    "name": "PingoLee",
+    "url": "https://github.com/PingoLee"
+  },
+  "plugins": [
+    {
+      "name": "nitro-skills",
+      "source": "./",
+      "description": "Nitro.jl agent skills, loaded straight from .github/skills so every agent reads one copy"
+    }
+  ]
+}
