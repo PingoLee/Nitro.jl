@@ -121,7 +121,7 @@ The request exposes Django-style shorthands — prefer these over digging into `
 | `req.input` / `req.data` | Merged input — `params > post > form > json > query` |
 | `req.session` | Session dict, when `SessionMiddleware` is in the pipeline |
 | `req.user` | The authenticated `Principal`, when an auth middleware ran |
-| `req.ip` | Client IP, when `ExtractIP` is in the pipeline |
+| `req.ip` | Client IP, when `ExtractIP` is in the pipeline (`getpeerip(req)` for the socket peer) |
 
 `req.json`, `req.form`, `req.post`, and `req.files` are **cached per request** — reading them twice
 is free, so don't hand-roll your own caching.
@@ -211,7 +211,7 @@ own response unless you need a custom body.
 
 ```julia
 serve(middleware=[
-    ExtractIP(trusted_proxies=[ip"127.0.0.1"]),
+    ExtractIP(forwarded_header=:x_forwarded_for, trusted_proxies=[ip"127.0.0.1"]),
     SessionMiddleware(secret_key=ENV["SECRET_KEY"]),
     BearerAuth(jwt_validator(secret; issuer="myapp", audience="api", profile=:strict)),
     CSRFMiddleware(ENV["CSRF_SECRET"]),

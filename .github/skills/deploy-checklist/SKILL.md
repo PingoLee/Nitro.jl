@@ -56,18 +56,31 @@ If the user uses nginx (or similar) in front of Nitro:
 - [ ] SPA history fallback: `try_files $uri $uri/ /index.html;` for the frontend root.
 - [ ] WebSocket upgrade headers if the app uses Nitro websockets.
 - [ ] **Client IP / rate limiting behind a proxy.** `ExtractIP` and `RateLimiter`
-      ignore forwarding headers (`X-Forwarded-For`, `X-Real-IP`, `CF-Connecting-IP`,
-      `True-Client-IP`) by **default** — they cannot be trusted from arbitrary
-      clients. Behind a reverse proxy this means every client collapses onto the
-      proxy's socket IP and shares one rate-limit bucket. Configure the trusted
-      proxy so per-client limits work again:
-      `RateLimiter(...; trusted_proxies=[ip"127.0.0.1"])` (honor headers only when
-      the peer is a listed proxy — preferred), or `trust_forwarded=true` (trust any
-      peer; only when clients cannot reach Nitro directly). Make the proxy set
-      `X-Forwarded-For`/`X-Real-IP`. The socket peer IP is resolved for **both** plain
-      HTTP and direct-TLS listeners; if a Nitro/HTTP upgrade ever breaks that resolution
-      it now logs a loud, rate-limited error (and the request falls back to loopback)
-      rather than silently degrading IP-based limits and audit logs — watch for it.
+      ignore every forwarding header by **default** — they cannot be trusted from
+      arbitrary clients. Behind a reverse proxy this means every client collapses onto
+      the proxy's socket IP and shares one rate-limit bucket. Restore per-client limits
+      by declaring **both** the trust boundary and the one header your proxy writes:
+      `RateLimiter(...; forwarded_header=:x_forwarded_for, trusted_proxies=[ip"127.0.0.1"])`.
+      Setting either alone is an `ArgumentError` at startup, by design. Only the header
+      you name is read, so a proxy that forgets to strip `CF-Connecting-IP` cannot be
+      used to bypass an `X-Forwarded-For` setup.
+- [ ] **The proxy must _set_ that header, not pass it through.** `X-Real-IP`,
+      `CF-Connecting-IP` and `True-Client-IP` are single-valued and believed as written
+      (nginx: `proxy_set_header X-Real-IP $remote_addr`). `X-Forwarded-For` is a chain
+      and is walked right-to-left with trusted hops peeled, so client-prepended entries
+      are never reached. Strip the headers you don't use anyway — Nitro no longer needs
+      it, but log tooling generally does.
+- [ ] **Dynamic proxy addresses → CIDR.** `trusted_proxies` accepts ranges
+      (`"10.244.0.0/16"`, `"2400:cb00::/32"`) mixed freely with `IPAddr` values, for k8s
+      ingress pods or published CDN prefixes. A catch-all (`"0.0.0.0/0"`) is rejected.
+- [ ] **Audit both addresses.** `getip(req)` is the resolved client; `getpeerip(req)` is
+      the socket peer, which no header can forge. Log both to tell a proxied request
+      from a direct one after an incident.
+- [ ] The socket peer IP is resolved for **both** plain HTTP and direct-TLS listeners;
+      if a Nitro/HTTP upgrade ever breaks that resolution it logs a loud, rate-limited
+      error (and the request falls back to loopback) rather than silently degrading
+      IP-based limits and audit logs — watch for it, because a loopback fallback
+      combined with `trusted_proxies=[ip"127.0.0.1"]` would trust every client.
 
 Provide a minimal config snippet only when asked; do not overwrite existing infra files without confirmation.
 

@@ -290,8 +290,9 @@ using Nitro: setip!
 # through a live server, so the measurement isn't polluted by HTTP.jl's connection pool
 # and accept loop. `auto_extract_ip=false` makes RateLimiter return the bare
 # `handle -> req -> resp` closure; with no ExtractIP in front, each synthetic request
-# must carry its own IP via `setip!` (an `LRU{IPAddr,…}` key of `nothing` throws and
-# the limiter fail-closes to 503).
+# must carry its own IP via `setip!` — a request with no IP is caught by the limiter's
+# explicit guard, which fail-closes to 503 (or passes through under `fail_open=true`).
+# See the "no client IP" testset in test/middleware/ratelimitter_tests.jl.
 
 const DELAY = 0.2          # per-request handler latency
 const N     = 8            # concurrent requests (must be < rate_limit, or the surplus

@@ -274,6 +274,7 @@ sleep(3.1)
 # Trusted proxy: when the socket peer is a configured trusted proxy, the limiter
 # honors X-Forwarded-For and buckets each forwarded client independently.
 serve(middleware=[RateLimiter(rate_limit=2, window=Second(5),
+        forwarded_header=:x_forwarded_for,
         trusted_proxies=[ip"127.0.0.1", ip"::1"])],
     port=PORT, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
 
@@ -297,5 +298,143 @@ serve(middleware=[RateLimiter(rate_limit=2, window=Second(5),
 end
 
 terminate()
+
+sleep(3.1)
+
+# Regression #16, end to end. The client prepends its own X-Forwarded-For entry; the loopback
+# "proxy" appends the address it actually saw, exactly as nginx's proxy_add_x_forwarded_for
+# does. Under the old leftmost-wins rule the prepended value became the bucket key, so rotating
+# it minted a fresh quota on every request — unlimited requests from one client.
+serve(middleware=[RateLimiter(rate_limit=2, window=Second(5),
+        forwarded_header=:x_forwarded_for,
+        trusted_proxies=[ip"127.0.0.1", ip"::1"])],
+    port=PORT, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
+
+@testset "Proxied: rotating a spoofed X-Forwarded-For prefix cannot buy quota" begin
+    real_client = "203.0.113.20"
+
+    # Two requests, each with a DIFFERENT spoofed prefix, must land in the same bucket —
+    # the one keyed on the rightmost non-proxy entry, which is the real client.
+    r1 = HTTP.get("$localhost/ok", ["X-Forwarded-For" => "9.9.9.9, $real_client"]; retry=false)
+    @test r1.status == 200
+    r2 = HTTP.get("$localhost/ok", ["X-Forwarded-For" => "8.8.8.8, $real_client"]; retry=false)
+    @test r2.status == 200
+
+    # A third rotation is throttled: the quota belongs to the client, not to the header.
+    try
+        HTTP.get("$localhost/ok", ["X-Forwarded-For" => "1.2.3.4, $real_client"]; retry=false)
+        @test false
+    catch e
+        @test e isa HTTP.StatusError
+        @test e.response.status == 429
+    end
+
+    # A vendor header cannot be used to sidestep the declared one either.
+    try
+        HTTP.get("$localhost/ok", ["CF-Connecting-IP" => "7.7.7.7",
+                                   "X-Forwarded-For"  => "5.5.5.5, $real_client"]; retry=false)
+        @test false
+    catch e
+        @test e isa HTTP.StatusError
+        @test e.response.status == 429
+    end
+end
+
+terminate()
+
+# ── No client IP on the request ───────────────────────────────────────────────
+# Driven in-process: `auto_extract_ip=false` returns the bare `handle -> req -> resp`
+# closure, so a synthetic request with no `:ip` reaches the limiter unresolved. There is
+# no bucket to key on, so the limiter must decide explicitly rather than letting the
+# `nothing` reach the store and surface as a caught exception per request.
+
+@testset "Rate limiter: a request with no client IP" begin
+    bare() = HTTP.Request("GET", "/ok")
+    ok_handler = _ -> HTTP.Response(200, "ok")
+
+    for strategy in (:fixed_window, :sliding_window)
+        # Fails closed by default — a request that cannot be limited is not admitted.
+        closed = RateLimiter(; strategy, rate_limit=5, window=Second(5), auto_extract_ip=false)
+        mw = closed isa Nitro.LifecycleMiddleware ? closed.middleware : closed
+        @test mw(ok_handler)(bare()).status == 503
+
+        # ...and passes through when the operator opted into availability instead.
+        open_ = RateLimiter(; strategy, rate_limit=5, window=Second(5),
+                            auto_extract_ip=false, fail_open=true)
+        mwo = open_ isa Nitro.LifecycleMiddleware ? open_.middleware : open_
+        @test mwo(ok_handler)(bare()).status == 200
+
+        # A request that DOES carry an IP is unaffected by the guard.
+        withip = HTTP.Request("GET", "/ok"); setip!(withip, ip"203.0.113.50")
+        @test mw(ok_handler)(withip).status == 200
+    end
+end
+
+# ── Construction-time validation ──────────────────────────────────────────────
+# Pure constructor tests: nothing here starts a server, which is the point — a bad trust
+# configuration must be rejected by `RateLimiter(...)` itself, not deferred to `serve()`.
+
+@testset "Rate limiter: keyword dispatch survives a single-typed kwargs dict" begin
+    # `Dict(kwargs)` narrowed to whatever value type it happened to see, so these missed the
+    # `Dict{Symbol, Any}` helper signatures with a MethodError. Only calls mixing two unrelated
+    # value types widened to `Any` — which is exactly what every other test in this file does,
+    # and why the plainest documented call was broken without anything noticing.
+    @test RateLimiter() !== nothing                                       # empty kwargs
+    @test RateLimiter(rate_limit=100) !== nothing                         # Dict{Symbol, Int64}
+    @test RateLimiter(auto_extract_ip=false, fail_open=true) !== nothing  # Dict{Symbol, Bool}
+    @test RateLimiter(exempt_paths=["/health"]) !== nothing               # Dict{Symbol, Vector{String}}
+    @test RateLimiter(strategy=:sliding_window, rate_limit=100) !== nothing
+    # The rename alias still works through the widened dict.
+    @test RateLimiter(window_period=Second(3)) !== nothing
+end
+
+@testset "Rate limiter: removed and inert trust keywords are rejected" begin
+    # `trust_forwarded` is gone from both constructors. Deleting it outright would leave only
+    # Julia's bare "unsupported keyword argument", which names no replacement.
+    err = try RateLimiter(trust_forwarded=true); nothing catch e; e end
+    @test err isa ArgumentError
+    @test occursin("forwarded_header", err.msg)
+    @test occursin("trusted_proxies", err.msg)
+    @test occursin("trust_forwarded", err.msg)
+    @test (try RateLimiter(strategy=:sliding_window, trust_forwarded=false); nothing
+           catch e; e end) isa ArgumentError
+
+    for strategy in (:fixed_window, :sliding_window)
+        # `auto_extract_ip=false` means no `ExtractIP` is built, so these two would be
+        # accepted, never validated, and silently do nothing — every client in one bucket
+        # while the setting reads as active.
+        @test_throws ArgumentError RateLimiter(; strategy, auto_extract_ip=false,
+            forwarded_header=:x_forwarded_for, trusted_proxies=[ip"127.0.0.1"])
+        @test_throws ArgumentError RateLimiter(; strategy, auto_extract_ip=false,
+            trusted_proxies=[ip"127.0.0.1"])
+        @test_throws ArgumentError RateLimiter(; strategy, auto_extract_ip=false,
+            forwarded_header=:x_forwarded_for)
+        # Unparseable entries used to construct cleanly on this path for the same reason.
+        @test_throws ArgumentError RateLimiter(; strategy, auto_extract_ip=false,
+            forwarded_header=:x_forwarded_for, trusted_proxies=["not-an-ip"])
+        # `auto_extract_ip=false` on its own stays valid — that is the documented escape hatch.
+        @test RateLimiter(; strategy, auto_extract_ip=false) !== nothing
+    end
+end
+
+@testset "Rate limiter: trust configuration is validated at construction, not at serve" begin
+    for strategy in (:fixed_window, :sliding_window)
+        # Each of these previously constructed a limiter and only threw later, when `serve`
+        # composed the middleware chain and reached `ExtractIP`.
+        @test_throws ArgumentError RateLimiter(; strategy, trusted_proxies=[ip"127.0.0.1"])
+        @test_throws ArgumentError RateLimiter(; strategy, forwarded_header=:x_forwarded_for)
+        @test_throws ArgumentError RateLimiter(; strategy,
+            forwarded_header=:x_forwarded_for, trusted_proxies=String[])
+        @test_throws ArgumentError RateLimiter(; strategy,
+            forwarded_header=:x_forwarded_for, trusted_proxies=["0.0.0.0/0"])
+        @test_throws ArgumentError RateLimiter(; strategy,
+            forwarded_header=:typo, trusted_proxies=[ip"127.0.0.1"])
+
+        # The correctly-declared pair builds, with CIDR and literals mixed.
+        @test RateLimiter(; strategy, rate_limit=10,
+            forwarded_header=:x_forwarded_for,
+            trusted_proxies=["10.244.0.0/16", ip"127.0.0.1"]) !== nothing
+    end
+end
 
 end

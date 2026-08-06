@@ -16,10 +16,25 @@ export RateLimiter
 SERVICE_UNAVAILABLE() = HTTP.Response(503, "Service Unavailable")
 
 function RateLimiter(;strategy::Symbol = :fixed_window, kwargs...)
-    kwargs_dict = Dict(kwargs)
+    # The element type is load-bearing: `Dict(kwargs)` narrows to the value type it happens to
+    # see, so `RateLimiter(rate_limit=100)` built a `Dict{Symbol, Int64}` and missed the
+    # `Dict{Symbol, Any}` signatures below with a `MethodError`. Only calls mixing two unrelated
+    # value types widened to `Any` and worked, which is why the tests never caught it.
+    kwargs_dict = Dict{Symbol, Any}(kwargs)
 
     # setup alias for :window_period => :window (for backwards compatibility for v1.9.0)
     rename_key!(kwargs_dict, :window_period, :window; message = "The :window_period keyword argument was renamed to :window")
+
+    # `trust_forwarded` was removed here as well as on `ExtractIP` (#16). Deleting a keyword
+    # outright leaves only Julia's bare "unsupported keyword argument", which names no
+    # replacement, so reject it explicitly — this is a migration error, not a compatibility shim.
+    reject_key!(kwargs_dict, :trust_forwarded,
+        "RateLimiter: `trust_forwarded` was removed. It honored forwarding headers from every " *
+        "peer and guessed which header to read, so a client connecting directly could choose " *
+        "the IP its rate-limit bucket keyed on. Name the proxies you trust and the one header " *
+        "they write instead, e.g. `RateLimiter(rate_limit=100, " *
+        "forwarded_header=:x_forwarded_for, trusted_proxies=[ip\"127.0.0.1\"])`; " *
+        "`trusted_proxies` accepts CIDR strings when your proxy addresses are dynamic.")
 
     # Return the rate limiter middleware
     dispatch_rate_limiter(Val(strategy); kwargs_dict...)
@@ -44,7 +59,43 @@ function rename_key!(kwargs_dict::Dict{Symbol, Any}, old_key::Symbol, new_key::S
 end
 
 """
-    FixedRateLimiter(; rate_limit::Int = 100, window::Period = Minute(1), cleanup_period::Period = Minute(10), cleanup_threshold::Period = Minute(10),  auto_extract_ip::Bool = true, exempt_paths::Vector{String} = String[])
+Rejects a keyword that was removed outright, with a message naming what replaced it.
+
+`rename_key!`'s sibling for the case where there is no new key to forward the value to.
+"""
+function reject_key!(kwargs_dict::Dict{Symbol, Any}, key::Symbol, message::String)
+    haskey(kwargs_dict, key) && throw(ArgumentError(message))
+end
+
+"""
+Builds the `ExtractIP` middleware the limiter composes in front of itself, or `nothing` when
+`auto_extract_ip=false`.
+
+`ExtractIP` is the only thing that acts on `forwarded_header`/`trusted_proxies`. Building it here
+rather than inside the composed middleware moves its `ArgumentError` from `serve()` to
+`RateLimiter(...)`, where the offending call actually is. With `auto_extract_ip=false` there is
+nothing to build, so both keywords would be accepted, never validated, and silently have no
+effect — the same "looks configured, isn't" failure `ExtractIP` throws to prevent, so reject the
+combination rather than degrade into one bucket for every client.
+"""
+function build_ip_extractor(auto_extract_ip::Bool, forwarded_header::Symbol, trusted_proxies)
+    if !auto_extract_ip
+        if forwarded_header !== :none || trusted_proxies !== nothing
+            throw(ArgumentError(
+                "RateLimiter misconfiguration: `forwarded_header`/`trusted_proxies` have no " *
+                "effect when `auto_extract_ip=false`, because the limiter then keys on whatever " *
+                "`getip(req)` your own middleware assigned. Every client behind the proxy would " *
+                "share one bucket while the setting looks active. Drop the two keywords and set " *
+                "the IP yourself, or drop `auto_extract_ip=false` and let the limiter run " *
+                "`ExtractIP` with them."))
+        end
+        return nothing
+    end
+    return ExtractIP(; forwarded_header, trusted_proxies)
+end
+
+"""
+    FixedRateLimiter(; rate_limit::Int = 100, window::Period = Minute(1), cleanup_period::Period = Minute(10), cleanup_threshold::Period = Minute(10), auto_extract_ip::Bool = true, forwarded_header::Symbol = :none, trusted_proxies = nothing, fail_open::Bool = false, exempt_paths::Vector{String} = String[])
 
 Creates a middleware function that enforces rate limiting based on IP address, with automatic background cleanup to prevent memory leaks.
 
@@ -53,8 +104,22 @@ Creates a middleware function that enforces rate limiting based on IP address, w
 - `window::Period`: Time window for rate limiting. Default is 1 minute. Must be positive.
 - `cleanup_period::Period`: Interval for running the background cleanup task. Default is 10 minutes. Must be positive.
 - `cleanup_threshold::Period`: Minimum age of inactive IP entries before deletion during cleanup. Default is 10 minutes. Must be positive.
-- `auto_extract_ip::Bool`: If `true` (default), the middleware will automatically extract the client IP address from the request using the built-in extractor.
+- `auto_extract_ip::Bool`: If `true` (default), the middleware will automatically extract the client IP address from the request using the built-in extractor. Setting `false` is incompatible with `forwarded_header`/`trusted_proxies`, since nothing would then apply them.
+- `forwarded_header::Symbol`: Forwarded to [`ExtractIP`](@ref) — the single header your reverse proxy writes. One of `:none` (default), `:x_forwarded_for`, `:x_real_ip`, `:cf_connecting_ip`, `:true_client_ip`. Must be set together with `trusted_proxies`.
+- `trusted_proxies`: Forwarded to [`ExtractIP`](@ref) — the proxies whose forwarding header may be believed, as `IPAddr` values or CIDR strings (`"10.244.0.0/16"`). The header is read only when the socket peer matches one of them.
+- `fail_open::Bool`: If `true`, an internal error in the limiter lets the request through instead of returning 503. Default `false` (fail closed).
 - `exempt_paths::Vector{String}`: Request path prefixes to skip rate limiting. Default is empty.
+
+# Behind a reverse proxy
+Without `trusted_proxies`, every client shares the proxy's socket address and therefore one rate-limit bucket. Declaring the proxy and the header it writes restores per-client limits:
+
+```julia
+RateLimiter(rate_limit = 100,
+            forwarded_header = :x_forwarded_for,
+            trusted_proxies  = [ip"127.0.0.1"])
+```
+
+Forwarding headers are **never** honored from a peer that is not a listed proxy, so a client cannot pick its own bucket. See [`ExtractIP`](@ref) for the full trust model.
 
 # Customization
 To customize IP extraction, set `auto_extract_ip=false` and insert your own middleware before the rate limiter to assign the desired IP address to `getip(req)`. This is useful for advanced scenarios such as extracting IPs from custom headers, authentication tokens, or supporting non-standard proxy setups.
@@ -71,8 +136,8 @@ function FixedRateLimiter(;
     cleanup_period      :: Period = Minute(10),
     cleanup_threshold   :: Period = Minute(10),
     auto_extract_ip     :: Bool = true,
-    trust_forwarded     :: Bool = false,
-    trusted_proxies     :: Union{Nothing, Vector{<:IPAddr}} = nothing,
+    forwarded_header    :: Symbol = :none,
+    trusted_proxies     :: Union{Nothing, AbstractVector} = nothing,
     fail_open           :: Bool = false,
     exempt_paths        :: Vector{String} = String[])
 
@@ -81,6 +146,9 @@ function FixedRateLimiter(;
     Dates.value(window) > 0 || throw(ArgumentError("window must be a positive duration"))
     Dates.value(cleanup_period) > 0 || throw(ArgumentError("cleanup_period must be a positive duration"))
     Dates.value(cleanup_threshold) > 0 || throw(ArgumentError("cleanup_threshold must be a positive duration"))
+
+    # Validates the trust configuration here, not at `serve()` — see `build_ip_extractor`.
+    extract_client_ip = build_ip_extractor(auto_extract_ip, forwarded_header, trusted_proxies)
 
     rate_limit_store = Dict{IPAddr, Tuple{Int, DateTime}}()
     store_lock = ReentrantLock()
@@ -132,6 +200,17 @@ function FixedRateLimiter(;
                     end
                 end
                         
+                # No client address means there is no bucket to key on. Without this guard the
+                # `nothing` reaches the `Dict{IPAddr,…}` store and fails closed via the catch
+                # below, logging a backtrace per request. Honour `fail_open` the same way.
+                if getip(req) === nothing
+                    @warn "Rate limiter: no client IP on this request; cannot apply a per-IP " *
+                          "limit. Put `ExtractIP` before the limiter, or leave " *
+                          "`auto_extract_ip=true`." maxlog=1
+                    fail_open && return handle(req)
+                    return SERVICE_UNAVAILABLE()
+                end
+
                 reset_time = 0
                 should_limit = false
                 remaining_requests = rate_limit
@@ -201,7 +280,7 @@ function FixedRateLimiter(;
 
     # If auto_extract_ip is true, then we'll use this composed version of the middleware
     function extract_ip_and_rate_limit(handle::Function) :: Function
-        reduce(|>, [handle, rate_limit_only, ExtractIP(; trust_forwarded, trusted_proxies)])
+        reduce(|>, [handle, rate_limit_only, extract_client_ip])
     end
 
     return LifecycleMiddleware(;
@@ -214,7 +293,7 @@ end
 
 
 """
-    SlidingRateLimiter(; rate_limit::Int=100, window::Period=Minute(1), max_clients::Int=10000, exempt_paths::Vector{String}=String[], auto_extract_ip::Bool=true)
+    SlidingRateLimiter(; rate_limit::Int=100, window::Period=Minute(1), max_clients::Int=10000, exempt_paths::Vector{String}=String[], auto_extract_ip::Bool=true, forwarded_header::Symbol=:none, trusted_proxies=nothing, fail_open::Bool=false)
 
 Creates a middleware function that enforces rate limiting using an LRU cache for sliding window tracking.
 This implementation provides true sliding window behavior where each request creates its own expiration time,
@@ -225,7 +304,21 @@ offering more precise rate limiting than fixed windows but with higher memory us
 - `window::Period`: Sliding time window duration. Default 1 minute. Must be positive.
 - `max_clients::Int`: Maximum distinct client buckets in LRU cache. Default 10000. Must be positive.
 - `exempt_paths::Vector{String}`: Request path prefixes to skip rate limiting. Default empty.
-- `auto_extract_ip::Bool`: If true, automatically extract IP address from request. Default true.
+- `auto_extract_ip::Bool`: If true, automatically extract IP address from request. Default true. Setting `false` is incompatible with `forwarded_header`/`trusted_proxies`, since nothing would then apply them.
+- `forwarded_header::Symbol`: Forwarded to [`ExtractIP`](@ref) — the single header your reverse proxy writes. One of `:none` (default), `:x_forwarded_for`, `:x_real_ip`, `:cf_connecting_ip`, `:true_client_ip`. Must be set together with `trusted_proxies`.
+- `trusted_proxies`: Forwarded to [`ExtractIP`](@ref) — the proxies whose forwarding header may be believed, as `IPAddr` values or CIDR strings (`"10.244.0.0/16"`). The header is read only when the socket peer matches one of them.
+- `fail_open::Bool`: If `true`, an internal error in the limiter lets the request through instead of returning 503. Default `false` (fail closed).
+
+# Behind a reverse proxy
+Without `trusted_proxies`, every client shares the proxy's socket address and therefore one rate-limit bucket. Declaring the proxy and the header it writes restores per-client limits:
+
+```julia
+RateLimiter(strategy = :sliding_window, rate_limit = 100,
+            forwarded_header = :x_forwarded_for,
+            trusted_proxies  = [ip"127.0.0.1"])
+```
+
+Forwarding headers are **never** honored from a peer that is not a listed proxy, so a client cannot pick its own bucket. See [`ExtractIP`](@ref) for the full trust model.
 
 # Algorithm
 Uses a sliding window approach where:
@@ -248,14 +341,17 @@ function SlidingRateLimiter(;
     max_clients     :: Int = 10000,
     exempt_paths    :: Vector{String} = String[],
     auto_extract_ip :: Bool = true,
-    trust_forwarded :: Bool = false,
-    trusted_proxies :: Union{Nothing, Vector{<:IPAddr}} = nothing,
+    forwarded_header:: Symbol = :none,
+    trusted_proxies :: Union{Nothing, AbstractVector} = nothing,
     fail_open       :: Bool = false)
 
     # Validate parameters
     rate_limit > 0 || throw(ArgumentError("rate_limit must be positive, got $rate_limit"))
     Dates.value(window) > 0 || throw(ArgumentError("window must be a positive duration"))
     max_clients > 0 || throw(ArgumentError("max_clients must be positive, got $max_clients"))
+
+    # Validates the trust configuration here, not at `serve()` — see `build_ip_extractor`.
+    extract_client_ip = build_ip_extractor(auto_extract_ip, forwarded_header, trusted_proxies)
 
     # LRU cache: IPAddr -> Vector of request timestamps
     rate_limit_store = LRU{IPAddr, Vector{DateTime}}(maxsize = max_clients)
@@ -282,6 +378,17 @@ function SlidingRateLimiter(;
                     if startswith(req.target, exempt_path)
                         return handle(req)
                     end
+                end
+
+                # No client address means there is no bucket to key on. Without this guard the
+                # `nothing` reaches the `LRU{IPAddr,…}` store and fails closed via the catch
+                # below, logging a backtrace per request. Honour `fail_open` the same way.
+                if getip(req) === nothing
+                    @warn "Rate limiter: no client IP on this request; cannot apply a per-IP " *
+                          "limit. Put `ExtractIP` before the limiter, or leave " *
+                          "`auto_extract_ip=true`." maxlog=1
+                    fail_open && return handle(req)
+                    return SERVICE_UNAVAILABLE()
                 end
 
                 # CONCURRENCY (nitro-core §2) — DO NOT call `handle(req)` in here.
@@ -353,7 +460,7 @@ function SlidingRateLimiter(;
 
     # Compose with IP extraction if auto_extract_ip is enabled
     function extract_ip_and_rate_limit(handle::Function)
-        return reduce(|>, [handle, rate_limit_only, ExtractIP(; trust_forwarded, trusted_proxies)])
+        return reduce(|>, [handle, rate_limit_only, extract_client_ip])
     end
 
     return auto_extract_ip ? extract_ip_and_rate_limit : rate_limit_only

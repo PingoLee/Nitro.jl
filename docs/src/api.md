@@ -65,6 +65,8 @@ BearerAuth
 Cors
 RateLimiter
 ExtractIP
+extract_ip
+getpeerip
 GuardMiddleware
 login_required
 role_required
