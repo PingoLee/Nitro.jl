@@ -28,6 +28,7 @@ function getsession end
 function setsession! end
 function getip end
 function setip! end
+function getpeerip end
 function getcontext end
 
 include("handlers.jl");     @reexport using .Handlers
@@ -40,7 +41,7 @@ include("routing.jl");      @reexport using .Routing
 
 export serve, terminate,
     internalrequest, staticfiles, dynamicfiles, spafiles,
-    getparams, getquery, getsession, setsession!, getip, setip!, getcontext, payload
+    getparams, getquery, getsession, setsession!, getip, setip!, getpeerip, getcontext, payload
 
 const REQUEST_JSON_CACHE_KEY = :__nitro_request_json
 const REQUEST_FORM_CACHE_KEY = :__nitro_request_form
@@ -239,6 +240,23 @@ Assigns the caller's IP address to the request context.
 setip!(req::HTTP.Request, val) = (req.context[:ip] = val)
 
 """
+    getpeerip(req::HTTP.Request) -> Union{Sockets.IPAddr, Nothing}
+
+Returns the address of the socket that actually connected, as opposed to the client address
+`getip` reports.
+
+The two differ only when `ExtractIP` resolved the client from a forwarding header: it records the
+socket peer here before overwriting `getip(req)`. Without `ExtractIP` in the pipeline the two are
+the same value, because `serve` seeds the request context from the real TCP connection.
+
+Use it to tell a proxied request from a direct one when auditing — that distinction is what makes
+an access log usable after an incident, since a forged forwarding header changes `getip` but can
+never change the socket peer. Note that a custom middleware calling `setip!` directly, rather
+than through `ExtractIP`, overwrites `getip` without recording a peer here.
+"""
+getpeerip(req::HTTP.Request) = Base.get(req.context, :peer_ip, getip(req))
+
+"""
     getcontext(req::HTTP.Request) -> Union{Any, Nothing}
 
 Returns the application context payload for the request — the object passed to
@@ -383,7 +401,8 @@ is explicit introspection, not accidental disclosure.)
 
 IP-based controls (rate limiting, audit logging) key on the socket peer address,
 resolved for both plain-HTTP and direct-TLS listeners. Behind a reverse proxy,
-configure `ExtractIP`/`RateLimiter` with `trusted_proxies` so per-client limits work.
+configure `ExtractIP`/`RateLimiter` with both `trusted_proxies` and the
+`forwarded_header` your proxy writes so per-client limits work.
 
 See also `terminate`, `RateLimiter`, and `ExtractIP`.
 """

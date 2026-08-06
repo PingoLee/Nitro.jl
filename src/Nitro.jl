@@ -53,7 +53,7 @@ export  # Server lifecycle
         # File serving
         staticfiles, dynamicfiles, spafiles,
         # Util
-        getparams, getquery, getsession, setsession!, getip, setip!, getcontext, payload, getexternalurl,
+        getparams, getquery, getsession, setsession!, getip, setip!, getpeerip, getcontext, payload, getexternalurl,
         redirect, formdata, multipart, format_sse_message,
         html, text, json, file, xml, js, css, binary,
         # Extractors
@@ -64,7 +64,7 @@ export  # Server lifecycle
         configcookies, get_cookie, set_cookie!, Cookies, Errors,
         regenerate_session!, SecretString, reveal,
         # Middleware
-        BearerAuth, CookieAuthMiddleware, Cors, RateLimiter, ExtractIP,
+        BearerAuth, CookieAuthMiddleware, Cors, RateLimiter, ExtractIP, extract_ip,
         SessionMiddleware, GuardMiddleware, login_required, role_required, permission_required,
         claim_required, kid_required, Principal, CSRFMiddleware,
         AccessLog, AccessRecord,

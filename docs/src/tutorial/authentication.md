@@ -226,5 +226,6 @@ The authorization-code flow walkthrough: see [OAuth2](oauth2.md).
 - `profile=:strict` (+ `required_claims`) on production validators (§4).
 - Access tokens only, short-lived (`expires_in`/`exp`); refresh-token lifecycles are an
   application concern today.
-- Behind a reverse proxy, configure trusted proxies before trusting client IPs for
-  auth-adjacent rate limiting.
+- Behind a reverse proxy, declare `trusted_proxies` **and** the `forwarded_header` your proxy
+  writes before trusting client IPs for auth-adjacent rate limiting —
+  [Behind a Reverse Proxy](reverse_proxy.md).

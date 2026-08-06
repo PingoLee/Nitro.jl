@@ -21,6 +21,7 @@ makedocs(
             "tutorial/request_body.md",
             "tutorial/file_uploads.md",
             "tutorial/secrets.md",
+            "tutorial/reverse_proxy.md",
             "tutorial/authentication.md",
             "tutorial/sessions_and_auth.md",
             "tutorial/passwords.md",

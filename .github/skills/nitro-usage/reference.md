@@ -146,8 +146,10 @@ end, method="POST")
 Order in the pipeline is top-down: global middleware → framework defaults → router.
 
 ```julia
-ExtractIP(; trust_forwarded::Bool = false,
-            trusted_proxies = nothing)          # Vector{<:IPAddr}
+ExtractIP(; forwarded_header::Symbol = :none,   # :x_forwarded_for | :x_real_ip |
+            trusted_proxies = nothing)          #   :cf_connecting_ip | :true_client_ip
+                                                # trusted_proxies: IPAddr and/or CIDR strings.
+                                                # Both required together, or neither.
 
 RateLimiter(; strategy::Symbol = :fixed_window, # or :sliding_window
               kwargs...)                        # forwarded to the strategy
@@ -195,10 +197,12 @@ GuardMiddleware(guards::Function...)
 AccessLog(sink::Function; capacity::Integer=10_000, batch::Integer=500, …)
 ```
 
-**Behind a reverse proxy**, `ExtractIP` and `RateLimiter` ignore `X-Forwarded-For`, `X-Real-IP`,
-`CF-Connecting-IP`, and `True-Client-IP` by default — every client otherwise collapses onto the
-proxy's IP and shares one bucket. Set `trusted_proxies=[…]` (preferred) or `trust_forwarded=true`
-(only when clients cannot reach Nitro directly).
+**Behind a reverse proxy**, `ExtractIP` and `RateLimiter` ignore every forwarding header by
+default — every client otherwise collapses onto the proxy's IP and shares one bucket. Declare
+**both** `trusted_proxies=[…]` (IPAddr and/or CIDR strings) and the single `forwarded_header` your
+proxy writes; setting either alone is an `ArgumentError` at construction. Only the named header is
+read, `X-Forwarded-For` is walked right-to-left with trusted hops peeled, and the socket peer stays
+available via `getpeerip(req)`.
 
 ---
 

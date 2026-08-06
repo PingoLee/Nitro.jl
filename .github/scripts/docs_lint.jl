@@ -114,6 +114,7 @@ const REQUIRED_SYMBOLS = String[
     "staticfiles", "spafiles", "dynamicfiles",
     # Middleware constructors.
     "SessionMiddleware", "CSRFMiddleware", "Cors", "RateLimiter", "ExtractIP",
+    "extract_ip", "getpeerip",
     "BearerAuth", "CookieAuthMiddleware", "GuardMiddleware", "AccessLog",
     "SecretString", "reveal",
     # Release-train tooling — the versioning rule and cut-release skill name these.
