@@ -4,7 +4,7 @@ using HTTP
 
 using ..Util: join_url_path
 using ..AppContext: ServerContext
-using ..Types: Nullable, LifecycleMiddleware
+using ..Types: Nullable, LifecycleMiddleware, MiddlewareCache, snapshot, cache!
 
 export router, compose, genkey, process_middleware, HOFRouter, OuterRouter, InnerRouter
 
@@ -64,9 +64,12 @@ This function dynamically determines which middleware functions to apply to a re
 If router or route specific middleware is defined, then it's used instead of the globally defined
 middleware. 
 """
-function compose(router::HTTP.Router, cache_lock::ReentrantLock, globalmiddleware::Vector, custommiddleware::Dict, middleware_cache::Dict)
+function compose(router::HTTP.Router, globalmiddleware::Vector, custommiddleware::Dict, middleware_cache::MiddlewareCache)
     use_cache = isempty(globalmiddleware)
     return function (handler)
+        # NOTE: `middleware_cache` is captured as an *object*; `snapshot` is called per
+        # request below. Hoisting the `snapshot` call out to here would freeze the table at
+        # compose time and silently disable caching — every request would rebuild its chain.
         return function (req::HTTP.Request)
 
             innerhandler, path, _ = HTTP.Handlers.gethandler(router, req)
@@ -79,24 +82,26 @@ function compose(router::HTTP.Router, cache_lock::ReentrantLock, globalmiddlewar
                 # caller-specific settings (e.g. catch_errors=false) and corrupt future requests.
                 key = genkey(req.method, path)
                 if use_cache
-                    func = get(middleware_cache, key, nothing)
+                    # One acquire-load, then a lookup on a table no writer will ever mutate.
+                    # See `MiddlewareCache` (src/types.jl) for why this read needs no lock.
+                    func = get(snapshot(middleware_cache), key, nothing)
                     if !isnothing(func)
                         return func(req)
                     end
                 end
 
-                # Combine all the middleware functions together 
+                # Combine all the middleware functions together
                 strategy = buildmiddleware(key, handler, globalmiddleware, custommiddleware)
-                
-                ## Cache only when no per-call middleware is involved (double-checked locking)
-                if use_cache && !haskey(middleware_cache, key)
-                    lock(cache_lock) do 
-                        if !haskey(middleware_cache, key)
-                            middleware_cache[key] = strategy
-                        end
-                    end
-                end
-                
+
+                # Warmup only. Reaching here with `use_cache` means the key was absent from
+                # this request's snapshot, so `cache!` (first-writer-wins, under the lock) *is*
+                # the second half of the double check. The old unlocked `haskey` pre-check was
+                # a deliberate lock-avoidance optimization — it skipped the lock when another
+                # thread published between the read and here — traded away on purpose: it was
+                # a racy read, and the lock it avoided is warmup-bounded with a short critical
+                # section.
+                use_cache && cache!(middleware_cache, key, strategy)
+
                 return strategy(req)
             end
     

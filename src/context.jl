@@ -4,6 +4,9 @@ import Base.Threads: ReentrantLock
 using HTTP
 using HTTP: Server, Router
 using ..Types
+# Unexported from `Types` on purpose: `MiddlewareCache` is internal plumbing for `compose`,
+# so it is named explicitly here rather than widened onto `Core`'s reexport surface.
+using ..Types: MiddlewareCache
 
 export ServerContext, EagerReviseService, Service, wait, close, isopen
 export set_extension!, get_extension, delete_extension!, has_extension
@@ -24,12 +27,11 @@ end
     router              :: Router                   = Router()
     custommiddleware    :: Dict{String, Tuple}      = Dict{String, Tuple}()
     named_routes        :: Dict{String, String}     = Dict{String, String}()
-    middleware_cache    :: Dict{String, Function}   = Dict{String, Function}()
+    middleware_cache    :: MiddlewareCache          = MiddlewareCache()
     external_url        :: Ref{Nullable{String}}    = Ref{Nullable{String}}(nothing)
     prefix              :: Ref{Nullable{String}}    = Ref{Nullable{String}}(nothing)
     eager_revise        :: Ref{Nullable{EagerReviseService}} = Ref{Nullable{EagerReviseService}}(nothing)
     named_routes_lock     :: ReentrantLock          = ReentrantLock()
-    middleware_cache_lock :: ReentrantLock          = ReentrantLock()
     lifecycle_middleware  :: Set{LifecycleMiddleware} = Set{LifecycleMiddleware}()
     cookies               :: Ref{CookieConfig}      = Ref{CookieConfig}(CookieConfig())
     extensions            :: Dict{Symbol, Any}      = Dict{Symbol, Any}()

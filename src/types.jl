@@ -234,7 +234,110 @@ function cleanup_expired_sessions!(store::MemoryStore)
     return nothing
 end
 
-# Represents the application context 
+# ── Middleware-chain cache (copy-on-write) ──────────────────────────────────────
+# Maps a route key ("METHOD|path", see `genkey`) to that route's fully-composed middleware
+# chain. Read on the request hot path (`compose`, src/routerhof.jl); written only during
+# cache warmup — once per route, then never again.
+#
+# Shape: copy-on-write behind an atomic reference, NOT a lock around the read. A reader
+# takes one acquire-load of `entries` and works on that snapshot; a writer copies the
+# current table under `lock`, inserts, and release-stores the copy. No `Dict` reachable by
+# a reader is ever mutated by *this module* — that is the entire safety argument. Julia's
+# `Dict` tolerates concurrent *readers*, but never a reader concurrent with `setindex!`: a
+# `rehash!` swaps the backing `slots`/`keys`/`vals` arrays underneath the reader, yielding
+# a wrong lookup (one route's chain served for another), a `BoundsError`, or a segfault.
+#
+# Scope of the guarantee, stated honestly: `@atomic` makes the *publish* unwritable, but
+# nothing makes a returned *snapshot* unwritable. `ServerContext` is public, so app code
+# can reach `ctx.service.middleware_cache` and `setindex!` a snapshot, reintroducing this
+# bug with no error. `snapshot`'s "immutable by convention" is a convention, enforced by
+# review rather than by the type.
+#
+# Why not simply lock the read: every request on an already-cached route would then
+# serialize through one `ReentrantLock`. Every request runs on `Threads.@spawn`, so that is
+# a permanent hot-path cost paid to close a window that only exists during warmup. The
+# steady state here is pure lock-free reads instead.
+#
+# Cost of the trade: each write copies the whole table, so warming R routes is O(R^2)
+# insertions in aggregate and discards R intermediate tables. One-time and off the
+# steady-state path, but it does mean a burst of garbage proportional to the route table.
+# The O(R^2) shape is the durable fact; a wall-clock number here would only rot. If a route
+# table ever gets big enough for this to matter, the answer is to build the table once at
+# route-registration time, not to abandon copy-on-write.
+#
+# `entries` is `@atomic`, so a plain `cache.entries = ...` raises ConcurrencyViolationError:
+# the type makes the unsynchronized publish that caused this bug unwritable. Bare *reads*
+# are still legal (and only `:monotonic`) — always go through `snapshot`.
+#
+# Relation to `_Writer`/`_Run` in src/middleware/access_log.jl: same generation-swap idea,
+# specialized rather than departed from. `access_log` publishes a plain `run` field via the
+# separate `active` atomic the reader must load anyway, so its publish rides free. Here
+# there is one reference and no gate, so atomicizing that reference directly is the whole
+# mechanism.
+#
+# The value type is abstract on purpose: each route's chain is a distinct closure type
+# produced by `reduce(|>, layers)` in `buildmiddleware`, so no concrete type spans the
+# table. Narrowing it would need FunctionWrappers, which pins the return type and breaks
+# `serialize=false` (where a handler's raw return value flows out through `compose`).
+mutable struct MiddlewareCache
+    @atomic entries :: Dict{String, Function}
+    const lock      :: Base.ReentrantLock
+end
+
+MiddlewareCache() = MiddlewareCache(Dict{String, Function}(), Base.ReentrantLock())
+
+"""
+    snapshot(cache::MiddlewareCache) -> Dict{String, Function}
+
+Reader fast path: one acquire-load, allocation-free. The returned `Dict` is immutable by
+convention — never `setindex!`/`delete!` it. The `:acquire` pairs with the `:release` in
+[`cache!`](@ref) / `empty!`, so a chain is fully constructed by the time a reader can
+observe it.
+"""
+@inline snapshot(cache::MiddlewareCache) = @atomic :acquire cache.entries
+
+"""
+    cache!(cache::MiddlewareCache, key::String, chain::Function) -> Function
+
+Publish `key => chain` unless `key` is already cached; return the chain now in force.
+First writer wins, so a route's cached chain never changes identity underneath a reader.
+Warmup path only — takes the lock and copies the whole table.
+"""
+function cache!(cache::MiddlewareCache, key::String, chain::Function)
+    return lock(cache.lock) do
+        # `:monotonic` suffices: the lock's own acquire/release edges already order this
+        # read against every other writer's publish and that publish's `Dict` contents.
+        current  = @atomic :monotonic cache.entries
+        existing = get(current, key, nothing)
+        isnothing(existing) || return existing
+        updated = copy(current)
+        # Not a rehash-avoidance trick — the rehash happens either way. This forces a
+        # tighter growth curve (16→32→64→…) than `setindex!`'s own policy (16→64→256…),
+        # so each generation's backing array stays right-sized: cheaper copies and
+        # measurably less garbage across a warmup. It also right-sizes the odd generation
+        # where `copy` preserved an over-large capacity.
+        sizehint!(updated, length(current) + 1)
+        updated[key] = chain
+        @atomic :release cache.entries = updated
+        return chain
+    end
+end
+
+"""
+    empty!(cache::MiddlewareCache) -> MiddlewareCache
+
+Drop every cached chain by publishing a fresh table. Deliberately NOT an in-place
+`empty!` of the live `Dict`: `terminate` (src/core.jl) calls this with requests still in
+`compose`, and an in-flight reader must be able to finish against a table nobody mutates.
+"""
+function Base.empty!(cache::MiddlewareCache)
+    lock(cache.lock) do
+        @atomic :release cache.entries = Dict{String, Function}()
+    end
+    return cache
+end
+
+# Represents the application context
 struct Context{T}
     payload::T
 end

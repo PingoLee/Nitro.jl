@@ -526,6 +526,10 @@ function terminate(context::ServerContext)
     if isopen(context.service)
         shutdown.(context.service.lifecycle_middleware)
         empty!(context.service.lifecycle_middleware)
+        # `empty!(::MiddlewareCache)`, not `empty!(::Dict)`: publishes a fresh table under
+        # the cache's lock. Requests are still in `compose` here — the server is not closed
+        # until the `close` a couple of lines below — so an in-flight reader must be able to
+        # finish against a table nobody mutates.
         empty!(context.service.middleware_cache)
         context.service.external_url[] = nothing
         close(context.service)
@@ -674,7 +678,7 @@ function setupmiddleware(ctx::ServerContext; middleware::Vector=[], serialize::B
     processed_middleware = process_middleware(ctx, raw_middleware)
 
     custom_middleware = if !isempty(ctx.service.custommiddleware)
-        [compose(ctx.service.router, ctx.service.middleware_cache_lock, processed_middleware, ctx.service.custommiddleware, ctx.service.middleware_cache)]
+        [compose(ctx.service.router, processed_middleware, ctx.service.custommiddleware, ctx.service.middleware_cache)]
     else
         processed_middleware
     end
