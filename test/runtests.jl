@@ -91,6 +91,7 @@ const TEST_FILES = [
     "server_show_tests.jl",
     "parallel_tests.jl",
     "middleware_tests.jl",
+    "middleware_cache_tests.jl",
     "appcontext_tests.jl",
     "path_prefix_tests.jl",
     "routing_tests.jl",
