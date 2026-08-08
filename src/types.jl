@@ -367,15 +367,12 @@ Use where re-registration must take effect — `custommiddleware`, where re-runn
 `urlpatterns` for a path installs the new per-route middleware. Where an entry must be
 stable once observed, use [`cache!`](@ref).
 
-Scope of "takes effect", precisely: last-writer-wins is a property of *this table*, not
-end-to-end of the request. Once `compose` has cached a route's composed chain in
-`middleware_cache` — which happens on that route's first request when `use_cache` is true,
-and is first-writer-wins — a re-published entry here does not change what that route serves.
-(Before that first request, or after a `terminate`, the cache is cold and the re-publish
-does take effect.) It always takes effect end-to-end when `use_cache` is false, which is the
-case that matters: that is exactly the Revise configuration where re-registration happens
-against a live server. Pre-existing behavior,
-not something this table introduces.
+When `use_cache` is true, publishing to `custommiddleware` alone is not enough to change what a
+route *serves*: a chain already cached in `middleware_cache` is first-writer-wins and would keep
+winning. (With any global or per-call middleware nothing is cached, and `publish!` alone is
+sufficient.) That is why route middleware goes through `publish_route_middleware!`
+(src/routerhof.jl), which pairs this call with a [`delete!`](@ref) of the same key from the
+cache. Reach for that helper rather than calling `publish!` on `custommiddleware` directly (#71).
 
 A reader holding an earlier snapshot keeps seeing the earlier value until it takes a new
 one; that is the copy-on-write contract, not a bug. A request already mid-chain finishes
@@ -402,6 +399,33 @@ function _grown_copy(current::Dict{String, V}) where {V}
     updated = copy(current)
     sizehint!(updated, length(current) + 1)
     return updated
+end
+
+"""
+    delete!(d::CopyOnWriteDict{V}, key::String) -> CopyOnWriteDict{V}
+
+Drop `key` by publishing a copy without it; a no-op if the key is absent. Readers holding an
+earlier snapshot keep seeing the entry until they take a new one — the copy-on-write contract.
+
+Exists so `middleware_cache` can be *invalidated* rather than only appended to: `cache!` is
+first-writer-wins, so without this a route's composed chain would be permanent and middleware
+registered for that route afterwards could never take effect (#71). See
+`publish_route_middleware!` (src/routerhof.jl) for the pairing and for why the order matters.
+
+Takes the lock; copies the whole table only when the key is actually present. Uses a plain
+`copy`, not `_grown_copy` — that one sizehints for an *added* entry, the wrong direction here.
+"""
+function Base.delete!(d::CopyOnWriteDict{V}, key::String) where {V}
+    lock(d.lock) do
+        current = @atomic :monotonic d.entries
+        # Skip the copy entirely when there is nothing to drop. Registration re-publishes far
+        # more often than it invalidates a warmed key, so this is the common case.
+        haskey(current, key) || return d
+        updated = copy(current)
+        delete!(updated, key)
+        @atomic :release d.entries = updated
+    end
+    return d
 end
 
 """

@@ -222,24 +222,35 @@ const urlpatterns = [
     # public — no extra middleware
     path("/api/products", ProductHandlers.list_products, method="GET"),
 
-    # protected — requires authentication
+    # protected — requires authentication. Guards reach a route through `GuardMiddleware`;
+    # they are not middleware themselves.
     path("/api/products", ProductHandlers.create_product,
-         method="POST", middleware=[login_required]),
+         method="POST", middleware=[GuardMiddleware(login_required())]),
 
     path("/api/products/<int:id>", ProductHandlers.delete_product,
-         method="DELETE", middleware=[login_required, role_required("admin")]),
+         method="DELETE",
+         middleware=[GuardMiddleware(login_required(), role_required("admin"))]),
 ]
 ```
 
-### Bypassing global middleware on a route
+### Per-route middleware and global middleware
 
-Pass `middleware=[]` on a `path()` call to opt that route out of **all** middleware
-(including the global ones).  Useful for health-check endpoints that must always
-respond, even when the session store is unavailable.
+Global middleware — the `middleware=[...]` you pass to [`serve`](@ref) — runs on **every**
+request, including requests that match no route (404) and requests whose path matches but
+whose method does not (405).  A route cannot opt out of it.
+
+Passing `middleware=[]` on a `path()` call means "this route adds no middleware of its own".
+It does **not** bypass the global chain:
 
 ```julia
-path("/health", HealthHandlers.ping, method="GET", middleware=[])
+# Global middleware still runs here — `middleware=[]` only means "no *extra* middleware",
+# which is the same as omitting the kwarg. Prefer omitting it.
+path("/health", HealthHandlers.ping, method="GET")
 ```
+
+If a health-check endpoint must respond even when a dependency the global middleware needs is
+unavailable, make that middleware tolerate the failure — for example by skipping its work for
+specific paths — rather than expecting the route to escape it.
 
 ---
 

@@ -32,9 +32,9 @@ using HTTP
 using UUIDs: UUID
 
 using ..AppContext: ServerContext
-using ..Types: Nullable, RouteDefinition, publish!
+using ..Types: Nullable, RouteDefinition
 using ..Util: join_url_path
-using ..RouterHOF: genkey, process_middleware
+using ..RouterHOF: genkey, process_middleware, publish_route_middleware!, _has_layers
 
 export path, urlpatterns, include_routes, convert_django_path
 
@@ -220,12 +220,18 @@ function register_route(ctx::ServerContext, prefix::String, route_def::RouteDefi
         register_named_route!(ctx, route_def.name, full_path)
     end
     
-    # Set up per-route middleware if defined
-    if !isnothing(route_def.middleware)
+    # Set up per-route middleware if defined.
+    #
+    # `!isempty` matters as much as `!isnothing`: publishing a `(nothing, Function[])` entry for
+    # `middleware=[]` contributes zero layers but makes `custommiddleware` permanently non-empty,
+    # which disables `compose`'s per-request emptiness fast path for the WHOLE application —
+    # every request would then pay a second `gethandler` for nothing. `middleware=[]` means "this
+    # route adds none of its own", which is indistinguishable from omitting the kwarg.
+    if _has_layers(route_def.middleware)
         processed_mw = process_middleware(ctx, route_def.middleware)
         for method in route_def.methods
             key = genkey(method, full_path)
-            publish!(ctx.service.custommiddleware, key, (nothing, processed_mw))
+            publish_route_middleware!(ctx, key, (nothing, processed_mw))
         end
     end
     

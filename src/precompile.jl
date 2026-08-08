@@ -26,12 +26,13 @@ using PrecompileTools
     )
 
     # ── Route with per-route middleware → the compose / middleware-cache path ───
-    # `custommiddleware` being non-empty is what installs `compose` at all (see
-    # `setupmiddleware` in src/core.jl), so this is the only block that reaches `genkey`,
-    # `buildmiddleware`, `cache!` and `snapshot`. Two requests: the first takes the cache
-    # miss + publish path, the second the cache-hit read path. Honest scope: only this
-    # generic plumbing carries over — the composed chain itself specializes on the app's
-    # own handler/middleware closure types, per the NOTE below.
+    # `compose` is installed unconditionally (#71), so the blocks above already exercise its
+    # empty-table fast path (`snapshot` + `isempty` + the prebuilt chain). THIS block is the
+    # only one that gets past that check and reaches `gethandler`, `genkey`, `buildmiddleware`,
+    # `cache!` and the cache-hit read. Two requests: the first takes the cache miss + publish
+    # path, the second the cache-hit read path. Honest scope: only this generic plumbing
+    # carries over — the composed chain itself specializes on the app's own handler/middleware
+    # closure types, per the NOTE below.
     precompile_mw = handle -> (req::Request -> handle(req))
     Core.Routing.urlpatterns(ctx, "", RouteDefinition[
         path("/precompile/cached", (req::Request) -> Res.json(Dict("cached" => true)),
@@ -49,6 +50,11 @@ using PrecompileTools
     # `normalize_middleware` over a non-empty vector.
     Core.internalrequest(ctx, Request("GET", "/precompile/cached");
                          middleware=[precompile_mw], catch_errors=false)
+
+    # An unmatched request, with the table non-empty so it gets past the fast path: the only
+    # branch #71 added that nothing above reaches. Returns a plain 404 `Response`; with
+    # `catch_errors=false` nothing is thrown.
+    Core.internalrequest(ctx, Request("GET", "/precompile/missing"); catch_errors=false)
 
     # NOTE: a live-server round-trip (serve! + loopback HTTP.get) is intentionally NOT added
     # here. As of HTTP 2.3.0 / Reseau 1.3.1 it no longer hangs precompilation (the earlier
