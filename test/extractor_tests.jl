@@ -75,12 +75,21 @@ end
     @test isbodyparam(param) == true
 end
 
-@testset "Partial JSON extract" begin 
+@testset "Partial JSON extract" begin
     req = HTTP.Request("GET", "/", [], """{ "person": {"name": "joe", "age": 25} }""")
     param = Param(:person, JsonFragment{Person}, missing, false)
     p = extract(param, LazyRequest(request=req)).payload
     @test p.name == "joe"
     @test p.age == 25
+
+    # The fragment lookup itself is client input: a body missing the key, and a body that
+    # is not a JSON object at all, must be ValidationErrors (400) like every sibling
+    # extractor -- they used to escape as a KeyError / MethodError and surface as 500s.
+    missing_key = HTTP.Request("GET", "/", [], """{ "other": {"name": "joe", "age": 25} }""")
+    @test_throws Nitro.Core.Errors.ValidationError extract(param, LazyRequest(request=missing_key))
+
+    not_an_object = HTTP.Request("GET", "/", [], "not json at all")
+    @test_throws Nitro.Core.Errors.ValidationError extract(param, LazyRequest(request=not_an_object))
 end
 
 

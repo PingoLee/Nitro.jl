@@ -1,7 +1,9 @@
 ﻿@testitem "Util" tags=[:core] setup=[NitroCommon] begin
 using Test
+using UUIDs
 using Nitro.Core.Util
 using Nitro.Core: serverwelcome
+using Nitro: ValidationError
 
 @testset "join_url_path" begin
     # prefix == nothing returns route verbatim (current implementation)
@@ -84,6 +86,75 @@ end
     longp = "/" * repeat("a", 1000)
     longr = "/" * repeat("b", 1000)
     @test join_url_path(longp, longr) == "/" * repeat("a", 1000) * "/" * repeat("b", 1000)
+end
+
+@testset "parseparam unions" begin
+    # A union member that legitimately accepts anything still wins — the raw string is a
+    # parsed `String`, not the old unparsed fallback.
+    @test parseparam(Union{Bool, String}, "asdfasd") == "asdfasd"
+    @test parseparam(Union{Bool, String}, "true") === true
+
+    # No member parses -> a ValidationError (400), not the raw String spliced into a
+    # handler that declared a different type.
+    @test_throws ValidationError parseparam(Union{Int, UUID}, "notanumber")
+
+    # `Nothing` is never a parse target: `JSON.parse(str, Nothing)` succeeds for any valid
+    # JSON document and `Base.uniontypes` puts `Nothing` first, so trying it silently
+    # discarded the client's value.
+    @test Base.uniontypes(Union{Nothing, Int})[1] === Nothing   # guards the premise
+    @test parseparam(Union{Nothing, Int}, "5") === 5
+    @test parseparam(Union{Nothing, String}, "5") == "5"
+    @test_throws ValidationError parseparam(Union{Nothing, Int}, "abc")
+
+    # `Missing` has exactly the same shape -- JSON.parse(str, Missing) also succeeds for
+    # any valid JSON document -- so it is skipped too.
+    @test Base.uniontypes(Union{Missing, Int})[1] === Missing   # guards the premise
+    @test parseparam(Union{Missing, Int}, "5") === 5
+    @test_throws ValidationError parseparam(Union{Missing, Int}, "abc")
+
+    # A literal "null" is no longer absorbed by the skipped `Nothing` member: it is a value
+    # the declared type cannot represent, so it is rejected rather than silently bound.
+    @test_throws ValidationError parseparam(Union{Nothing, Int}, "null")
+
+    # The member method must not unescape a second time.
+    @test parseparam(Union{Int, String}, "a%2520b") == "a%20b"
+    @test parseparam(Union{Int, String}, "a%20b"; escape=false) == "a%20b"
+end
+
+@testset "parseparam_checked" begin
+    @test parseparam_checked(Int, "42", "id", :path) === 42
+    @test parseparam_checked(Float64, "3.5", "ratio", :query) === 3.5
+
+    # Every parse failure becomes a ValidationError (400), including the ones that are not
+    # `ArgumentError`: `first("")` is a BoundsError, an out-of-range Enum is an ArgumentError.
+    @test_throws ValidationError parseparam_checked(Int, "abc", "id", :path)
+    @test_throws ValidationError parseparam_checked(Char, "", "c", :query)
+    @test_throws ValidationError parseparam_checked(Int, "99999999999999999999", "id", :path)
+
+    # The message names the parameter but never echoes the submitted value: `.msg` is
+    # app-reachable (showerror, an app-level `catch ValidationError`), and a parameter
+    # value can be a token.
+    err = try
+        parseparam_checked(Int, "s3cr3t", "limit", :query)
+        nothing
+    catch e
+        e
+    end
+    @test err isa ValidationError
+    @test occursin("limit", err.msg)
+    @test occursin("query", err.msg)
+    @test !occursin("s3cr3t", err.msg)
+
+    # A ValidationError raised inside parseparam passes through unwrapped.
+    capped = try
+        parseparam_checked(Regex, repeat("x", 300), "pat", :path)
+        nothing
+    catch e
+        e
+    end
+    @test capped isa ValidationError
+    @test isnothing(capped.cause)
+    @test occursin("maximum length", capped.msg)
 end
 
 @testset "serverwelcome banner includes environment when available" begin

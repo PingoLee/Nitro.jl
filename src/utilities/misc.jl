@@ -4,7 +4,7 @@ using Dates
 
 using ..Errors: ValidationError
 
-export recursive_merge, parseparam,
+export recursive_merge, parseparam, parseparam_checked,
     redirect, handlerequest,
     format_response, header_name_isequal, set_content_size!, format_sse_message,
     join_url_path, is_test,
@@ -32,15 +32,29 @@ end
 function handlerequest(getresponse::Function, catch_errors::Bool; show_errors::Bool = true)
     if !catch_errors
         return getresponse()
-    else 
-        try 
-            return getresponse()       
+    else
+        try
+            return getresponse()
         catch error
-            if show_errors && !isa(error, InterruptException)
+            if error isa ValidationError
+                # A rejected request is client input, not a server fault: never emit a
+                # backtrace. The old `@error` wrote one stack trace per malformed request,
+                # so a spray of bad URLs was a log-flood / disk-fill vector. `@debug` is
+                # compiled out at the default log level, so this costs nothing in
+                # production.
+                #
+                # `.msg` is deliberately NOT logged. Scalar parameter rejections carry only
+                # a name and a type, but `Extractors.try_validate` interpolates
+                # `_instance_preview(instance)` — up to 300 characters of the deserialized
+                # payload — so a `Json{Login}` validator failure would put the submitted
+                # password in the log. Scrubbing that message is tracked separately; until
+                # then this line reports only that a request was rejected.
+                show_errors && @debug "Request rejected (400 Bad Request)"
+            elseif show_errors && !isa(error, InterruptException)
                 @error "ERROR: " exception=(error, catch_backtrace())
             end
             return handle_error(error)
-        end  
+        end
     end
 end
 
@@ -120,32 +134,83 @@ function parseparam(::Type{T}, str::String; escape=true) where {T <: Enum}
 end
 
 """
-Iterate over the union type and parse the value with the first type that 
-doesn't throw an erorr
+Parse `str` as the first member type of `type` that accepts it.
+
+`Nothing` and `Missing` are never parse targets. `JSON.parse(str, Nothing)` succeeds for *any*
+valid JSON document (likewise `Missing`), and `Base.uniontypes` places them first, so trying them
+made every `Nullable{T}` parameter bind to `nothing` and silently discard the client's value —
+`parseparam(Union{Nothing,Int}, "5")` returned `nothing`. An *absent* optional parameter is
+handled one layer up by the parameter's declared default, not here.
+
+Throws a `ValidationError` when no member type parses. The previous behavior returned the raw
+unparsed `String`, producing a value outside the declared union type.
 """
 function parseparam(type::Union, str::String; escape=true)
     value::String = escape ? HTTP.unescapeuri(str) : str
-    result = value 
     for current_type in Base.uniontypes(type)
-        try 
-            result = parseparam(current_type, value)
-            break 
-        catch 
+        (current_type === Nothing || current_type === Missing) && continue
+        try
+            # `value` is already unescaped — `escape=false` stops the member method from
+            # unescaping a second time (`"a%2520b"` must stay `"a%20b"`, not become `"a b"`).
+            return parseparam(current_type, value; escape=false)
+        catch e
+            # A member type failing is the normal case — but do not let the blanket catch
+            # swallow an interrupt, which would defeat the guard in `parseparam_checked`.
+            e isa InterruptException && rethrow()
             continue
         end
     end
-    return result
+    # The submitted value is deliberately not interpolated. `.msg` is app-reachable — via
+    # `showerror`, via an app-level `catch ValidationError`, and via anything that chooses to
+    # log it — so it must stay value-free regardless of what Nitro itself logs today.
+    throw(ValidationError("Could not parse value as $type"))
 end
 
 """
-The fallback case for parsing parameters. 
+The fallback case for parsing parameters.
 Tries to parse the type as is, if this fails then we assume it's a json string
 """
 function parseparam(::Type{T}, str::String; escape=true) where {T}
+    value = escape ? HTTP.unescapeuri(str) : str
     try
-        return parse(T, escape ? HTTP.unescapeuri(str) : str)
-    catch
-        return JSON.parse(escape ? HTTP.unescapeuri(str) : str, T)
+        return parse(T, value)
+    catch e
+        # This is the method every scalar type below the specialized ones lands in, so it is
+        # where an interrupt would actually be swallowed — falling through to `JSON.parse`
+        # and, one layer up, being reported as a client error. The matching guard in
+        # `parseparam_checked` never sees it without this rethrow.
+        e isa InterruptException && rethrow()
+        return JSON.parse(value, T)
+    end
+end
+
+"""
+    parseparam_checked(::Type{T}, str, name, source)
+
+Parse a scalar path or query parameter, converting **any** parse failure into a
+`ValidationError` so a client input error becomes `400 Bad Request` rather than a
+`500 Internal Server Error` with a logged backtrace.
+
+This is the scalar counterpart of `Extractors.safe_extract`, which cannot be reused here: it is
+typed `Param{U} where U <: Extractor{T}` and so cannot serve a bare `Param{Int}`. Without this
+guard, `parseparam`'s bare `ArgumentError`/JSON errors — plus the `BoundsError` from
+`parseparam(Char, "")` and the `ArgumentError` from an out-of-range `Enum` — reach
+`handle_error(::Any)` and are reported as server faults.
+
+`source` is `:path` or `:query`. It reaches neither the response body — which stays the generic
+`400: Bad Request` — nor Nitro's own log, which reports only that a request was rejected; it is
+there for an application that catches `ValidationError` and wants to say which parameter failed.
+The submitted **value is deliberately never interpolated** into the message: `.msg` is
+app-reachable and must stay value-free, because a parameter value can be a token or other secret.
+"""
+function parseparam_checked(::Type{T}, str::String, name::String, source::Symbol) where {T}
+    try
+        return parseparam(T, str)
+    catch e
+        e isa InterruptException && rethrow()
+        # Already well-formed (e.g. the `Regex` length cap above) — do not double-wrap.
+        e isa ValidationError && rethrow()
+        throw(ValidationError("Invalid $source parameter '$name': expected $T", e))
     end
 end
 

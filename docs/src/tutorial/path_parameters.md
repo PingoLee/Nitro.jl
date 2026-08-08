@@ -41,6 +41,25 @@ The available converters are:
 - `<bool:name>` (e.g., `true`)
 - `<uuid:name>` (e.g., `550e8400-e29b-41d4-a716-446655440000`)
 
+### Invalid Values
+
+A value the converter cannot parse returns **`400 Bad Request`**, not a 404:
+
+```
+GET /user/abc      ->  400 {"message": "400: Bad Request"}
+```
+
+This is a deliberate divergence from Django. In Nitro a converter is a **binding declaration, not a
+routing filter** — `/user/abc` still matches `path("/user/<int:id>", get_user)`, and the request is
+rejected when the value fails to bind to `Int`. That keeps the converter and the handler's own type
+annotation as one rule with one failure mode, and it catches values a route-level pattern could not
+(`/user/99999999999999999999` matches "digits" but overflows `Int`).
+
+The same applies to every scalar parameter, converter or not: an unparseable value is a `400`,
+whether it came from `<int:id>`, from a bare `{id}` whose handler declares `id::Int`, or from a query
+string. Rejections are logged at `@debug` level with no stack trace, because they are client input
+rather than server faults — only a genuine handler error produces a `500` and a backtrace.
+
 ## Named Routes And Reverse URLs
 
 Use the `name=` keyword when you want to refer to a route later without hard-coding the path string again.
@@ -125,6 +144,32 @@ function get_list(req, list::Vector{Int})
     return length(list)
 end
 ```
+
+A `Union{...}` annotation binds to the **first member type that parses**; if no member accepts the
+value, the request is a `400`.
+
+```julia
+# /thing/42   -> id === 42        (Int)
+# /thing/<a valid uuid>           (UUID)
+# /thing/abc  -> 400 Bad Request
+function get_thing(req, id::Union{Int, UUID})
+    return string(typeof(id))
+end
+```
+
+`Nothing` is never a parse target, so `Nullable{T}` (that is, `Union{T, Nothing}`) does **not** mean
+"parse this loosely" — it means the parameter may be *absent*. Give it a default to say what absence
+should produce:
+
+```julia
+# ?cursor=5 -> cursor === 5 ;  no ?cursor -> cursor === nothing ;  ?cursor=abc -> 400
+function list_items(req, cursor::Nullable{Int} = nothing)
+    return isnothing(cursor) ? "first page" : "after $cursor"
+end
+```
+
+Note that a literal `?cursor=null` is a `400`, not `nothing` — `null` is not an `Int`, and `Nothing`
+is not a parse target. To say "absent", omit the parameter rather than sending the string `null`.
 
 ## Per-Route Middleware (Guards)
 

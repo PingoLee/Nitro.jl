@@ -145,9 +145,12 @@ end
 Extracts a part of a json object from the body of a request and converts it into a custom struct
 """
 function extract(param::Param{JsonFragment{T}}, request::LazyRequest) :: JsonFragment{T} where {T}
-    body = Types.jsonbody(request)[string(param.name)]
-    instance = safe_extract(param) do 
-        struct_builder(T, body) 
+    instance = safe_extract(param) do
+        # The fragment lookup belongs INSIDE the guard: a body that is not a JSON object
+        # (`MethodError` on `getindex(::Nothing, ::String)`) or one missing this fragment's
+        # key (`KeyError`) is client input, and used to escape as a 500 with a backtrace
+        # while every sibling extractor returned a 400.
+        struct_builder(T, Types.jsonbody(request)[string(param.name)])
     end
     valid_instance = try_validate(param, instance)
     return JsonFragment(valid_instance)
