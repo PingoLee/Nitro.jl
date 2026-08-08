@@ -1,8 +1,90 @@
+@testitem "Copy-on-write dict — parametric container at both instantiations" tags=[:core, :middleware] setup=[NitroCommon] begin
+using Test
+using Nitro.Core.Types: CopyOnWriteDict, snapshot, cache!, publish!
+
+# #68 generalized `MiddlewareCache` into `CopyOnWriteDict{V}`, serving two `Service` fields
+# with deliberately different write semantics:
+#   `middleware_cache :: CopyOnWriteDict{Function}` — `cache!`, FIRST-writer-wins
+#   `custommiddleware :: CopyOnWriteDict{Tuple}`    — `publish!`, LAST-writer-wins
+# These assertions pin the container itself. The per-field behavior lives in the item below
+# and in test/custommiddleware_tests.jl.
+
+probe(d) = snapshot(d)                     # a call boundary, so @inferred/@allocated mean something
+mkf(tag) = (req -> tag)
+
+@testset "snapshot is type-stable and allocation-free at both V" begin
+    cf = CopyOnWriteDict{Function}(); cache!(cf, "k", mkf("f"))
+    ct = CopyOnWriteDict{Tuple}();    publish!(ct, "k", (nothing, Function[]))
+    @test @inferred(probe(cf)) isa Dict{String, Function}
+    @test @inferred(probe(ct)) isa Dict{String, Tuple}
+    probe(cf); probe(ct)                   # warm up before measuring
+    # The reader fast path is on every request; if this ever regresses we want to hear it.
+    @test (@allocated probe(cf)) == 0
+    @test (@allocated probe(ct)) == 0
+end
+
+@testset "empty! republishes at the right value type" begin
+    # Documents the field type after a clear; it does NOT guard a port hazard, and an
+    # earlier draft of this comment wrongly claimed it did. Because `entries` is declared
+    # `@atomic entries :: Dict{String, V}`, `setfield!` *converts* — so even a `Base.empty!`
+    # body that hard-coded `Dict{String,Function}()` would still yield a `Dict{String,Tuple}`
+    # on a `CopyOnWriteDict{Tuple}`. Verified by mutation: that revert leaves this green.
+    @test typeof(snapshot(empty!(CopyOnWriteDict{Tuple}())))    === Dict{String, Tuple}
+    @test typeof(snapshot(empty!(CopyOnWriteDict{Function}()))) === Dict{String, Function}
+end
+
+@testset "publish! is last-writer-wins; cache! is first-writer-wins" begin
+    # Asserted at BOTH V, so the verb pair is proven generic rather than accidentally
+    # correct only for `Function`.
+    for (V, v1, v2) in ((Function, mkf("a"), mkf("b")),
+                        (Tuple, (nothing, Function[]), (Function[], nothing)))
+        p = CopyOnWriteDict{V}()
+        publish!(p, "k", v1); publish!(p, "k", v2)
+        @test snapshot(p)["k"] === v2                  # LWW: overwritten
+
+        c = CopyOnWriteDict{V}()
+        cache!(c, "k", v1)
+        @test cache!(c, "k", v2) === v1                # FWW: loser handed the winner
+        @test snapshot(c)["k"] === v1
+    end
+end
+
+@testset "publish! never mutates a held snapshot" begin
+    # The LWW analogue of the cache's invariant, and the property that makes the race
+    # impossible for `custommiddleware`.
+    d = CopyOnWriteDict{Tuple}()
+    v1, v2 = (nothing, Function[]), (Function[], nothing)
+    publish!(d, "k", v1)
+    reader = snapshot(d)
+    publish!(d, "k", v2)
+    @test reader["k"] === v1
+    @test reader !== snapshot(d)
+    @test snapshot(d)["k"] === v2
+end
+
+@testset "an unsynchronized publish is unwritable at V = Tuple" begin
+    d = CopyOnWriteDict{Tuple}()
+    @test_throws ConcurrencyViolationError d.entries = Dict{String, Tuple}()
+end
+
+@testset "cache! tolerates a nothing value" begin
+    # Guards the `haskey` presence check. The pre-#68 `get(current, key, nothing)` sentinel
+    # is unsound once V is a parameter: at V === Any, `nothing` is a legal stored value, so
+    # the sentinel form treats a present key as absent and republishes — breaking
+    # first-writer-wins. With `haskey` this returns `nothing`; with the sentinel it returns 1.
+    d = CopyOnWriteDict{Any}()
+    cache!(d, "k", nothing)
+    @test cache!(d, "k", 1) === nothing
+    @test snapshot(d)["k"] === nothing
+end
+end
+
+
 @testitem "Middleware cache — copy-on-write publish" tags=[:core, :middleware] setup=[NitroCommon] begin
 using Test
-using Nitro.Core.Types: MiddlewareCache, snapshot, cache!
+using Nitro.Core.Types: CopyOnWriteDict, snapshot, cache!
 
-# Regression test for #35. `MiddlewareCache` backs `compose`'s per-route chain lookup
+# Regression test for #35. `CopyOnWriteDict{Function}` backs `compose`'s per-route chain lookup
 # (src/routerhof.jl), which is read lock-free on every request while warmup writes are
 # still landing. It used to be a plain `Dict` read outside the lock that guarded its
 # writes — a `rehash!` under a concurrent reader yields a wrong lookup (one route's chain
@@ -17,7 +99,7 @@ using Nitro.Core.Types: MiddlewareCache, snapshot, cache!
 mk(tag) = (req -> tag)          # stand-in composed chain; only identity is ever checked
 
 @testset "publish is visible and returns the winner" begin
-    c = MiddlewareCache()
+    c = CopyOnWriteDict{Function}()
     @test isempty(snapshot(c))
     f = mk("a")
     @test cache!(c, "GET|/a", f) === f
@@ -25,7 +107,7 @@ mk(tag) = (req -> tag)          # stand-in composed chain; only identity is ever
 end
 
 @testset "a published snapshot is never mutated" begin
-    c = MiddlewareCache()
+    c = CopyOnWriteDict{Function}()
     f, g = mk("a"), mk("b")
     cache!(c, "GET|/a", f)
     reader = snapshot(c)          # what an in-flight request is holding
@@ -41,7 +123,7 @@ end
 end
 
 @testset "first writer wins; an already-cached key publishes nothing" begin
-    c = MiddlewareCache()
+    c = CopyOnWriteDict{Function}()
     f, g = mk("first"), mk("second")
     cache!(c, "GET|/a", f)
     published = snapshot(c)
@@ -51,7 +133,7 @@ end
 end
 
 @testset "empty! swaps a fresh table in — it does not clear the reader's" begin
-    c = MiddlewareCache()
+    c = CopyOnWriteDict{Function}()
     cache!(c, "GET|/a", mk("a")); cache!(c, "GET|/b", mk("b"))
     reader = snapshot(c)                     # an in-flight request during shutdown
     @test empty!(c) === c
@@ -63,7 +145,7 @@ end
 end
 
 @testset "an unsynchronized publish is unwritable" begin
-    c = MiddlewareCache()
+    c = CopyOnWriteDict{Function}()
     # `entries` is declared `@atomic`, so the plain field write that caused #35 is a
     # runtime error rather than a silent data race. This is the property that keeps the
     # bug from being reintroduced by someone reaching past `cache!`.
@@ -71,7 +153,7 @@ end
 end
 
 @testset "concurrent writers lose nothing" begin
-    c = MiddlewareCache()
+    c = CopyOnWriteDict{Function}()
     fs = Dict("GET|/r$i" => mk("r$i") for i in 1:64)
     # Scope note, honestly: this passes identically against the pre-fix shape, because the
     # pre-fix WRITE path was already correctly locked — #35 was a read bug. Keep it as a
@@ -92,7 +174,7 @@ end
     # cooperative scheduling has no yield point inside a `Dict` lookup. Hence
     # `Threads.@spawn`, gated on thread count so the spin loop cannot starve the writer at
     # `-t 1`. CI runs 1 and 2, so the gated branch does execute in CI.
-    c = MiddlewareCache()
+    c = CopyOnWriteDict{Function}()
     for i in 1:8
         cache!(c, "GET|/seed$i", mk("seed$i"))
     end
@@ -103,7 +185,7 @@ end
         # time at `-t 2` (measured, 200 trials). A round costs ~0.5 ms, so 25 of them buy
         # ~97% detection for ~12 ms. Measured false-positive rate on correct code: 0/600.
         for _ in 1:25
-            c = MiddlewareCache()
+            c = CopyOnWriteDict{Function}()
             for i in 1:8
                 cache!(c, "GET|/seed$i", mk("seed$i"))
             end

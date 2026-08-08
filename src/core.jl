@@ -16,7 +16,8 @@ import ..has_revise_hooks, ..revise_hooks
 
 include("errors.jl");       @reexport using .Errors
 include("util.jl");         @reexport using .Util
-include("types.jl");        @reexport using .Types 
+include("types.jl");        @reexport using .Types
+using .Types: snapshot
 include("crypto.jl");       @reexport using .Crypto
 include("cookies.jl");      @reexport using .Cookies
 include("constants.jl");    @reexport using .Constants
@@ -33,6 +34,7 @@ function getcontext end
 
 include("handlers.jl");     @reexport using .Handlers
 include("routerhof.jl");    @reexport using .RouterHOF
+using .RouterHOF: normalize_middleware, register_lifecycle!
 include("reflection.jl");   @reexport using .Reflection
 include("extractors.jl");   @reexport using .Extractors
 include("response.jl");     @reexport using .Res
@@ -467,6 +469,18 @@ function serve(ctx::ServerContext;
         insert!(middleware, 1, ReviseHandler())
     end
 
+    # Lifecycle registration lives HERE — once per server — not in `setupmiddleware`, which
+    # `internalrequest` also calls, per request (#68). `startup.` runs only in `startserver`,
+    # so a middleware registered from the request path got an `on_shutdown` at `terminate`
+    # with no paired `on_startup` — deterministic, needing no race at all — and additionally
+    # wrote to an unsynchronized `Set` that `startup.`/`shutdown.` broadcast over, which a
+    # concurrent `internalrequest` could overlap.
+    #
+    # Placed after the `revise` block above so it operates on the final `middleware` vector.
+    # (Inert today — `ReviseHandler()` is a plain closure, not a `LifecycleMiddleware`, so
+    # the resulting `Set` is the same either way — but the ordering is the correct default.)
+    register_lifecycle!(ctx, middleware)
+
     configured_middelware = setupmiddleware(ctx; middleware, serialize, catch_errors, show_errors, access_log, access_log_query)
     handle_stream = handler(configured_middelware)
 
@@ -526,7 +540,10 @@ function terminate(context::ServerContext)
     if isopen(context.service)
         shutdown.(context.service.lifecycle_middleware)
         empty!(context.service.lifecycle_middleware)
-        # `empty!(::MiddlewareCache)`, not `empty!(::Dict)`: publishes a fresh table under
+        # Do NOT "symmetrize" this by also emptying `custommiddleware`: that table is route
+        # *registration* state, not cache state. test/original_tests.jl re-serves after a
+        # `terminate()` and expects the registered routes and their middleware to survive.
+        # `empty!(::CopyOnWriteDict)`, not `empty!(::Dict)`: publishes a fresh table under
         # the cache's lock. Requests are still in `compose` here — the server is not closed
         # until the `close` a couple of lines below — so an in-flight reader must be able to
         # finish against a table nobody mutates.
@@ -675,9 +692,18 @@ end
 
 function setupmiddleware(ctx::ServerContext; middleware::Vector=[], serialize::Bool=true, catch_errors::Bool=true, show_errors=true, access_log=false, access_log_query::Bool=false)::Function
     raw_middleware = reverse(middleware)
-    processed_middleware = process_middleware(ctx, raw_middleware)
+    # `normalize_middleware`, NOT `process_middleware`: this runs once per `serve` but ONCE
+    # PER CALL from `internalrequest`, so it must have no registration side effect. `serve`
+    # registers explicitly, just before it calls this. (#68)
+    processed_middleware = normalize_middleware(raw_middleware)
 
-    custom_middleware = if !isempty(ctx.service.custommiddleware)
+    # NOTE — point-in-time read, and that is a known limitation, not a fix. `snapshot` makes
+    # this read *safe* (see `CopyOnWriteDict`, src/types.jl); it does not make it *fresh*.
+    # `serve` evaluates this exactly once, so an app whose first per-route middleware is
+    # registered AFTER the server starts (Revise re-running `urlpatterns`, a runtime
+    # `include_routes`) never gets `compose` installed at all, and that middleware silently
+    # never runs. Pre-existing and orthogonal to #68; tracked as its own issue.
+    custom_middleware = if !isempty(snapshot(ctx.service.custommiddleware))
         [compose(ctx.service.router, processed_middleware, ctx.service.custommiddleware, ctx.service.middleware_cache)]
     else
         processed_middleware

@@ -40,6 +40,16 @@ using PrecompileTools
     Core.internalrequest(ctx, Request("GET", "/precompile/cached"); catch_errors=false)
     Core.internalrequest(ctx, Request("GET", "/precompile/cached"); catch_errors=false)
 
+    # A third request WITH per-call global middleware: `use_cache` is false, so this is the
+    # `compose` branch that skips the cache entirely and rebuilds through `buildmiddleware`
+    # on every request. That is the production shape — `serve(middleware=[...])`, and every
+    # `revise=:lazy|:eager` session via `ReviseHandler` — and nothing above compiles it.
+    # Honest scope: `buildmiddleware` and `snapshot` are already reached by the first
+    # request's cache miss; what is new here is `compose`'s `use_cache == false` branch and
+    # `normalize_middleware` over a non-empty vector.
+    Core.internalrequest(ctx, Request("GET", "/precompile/cached");
+                         middleware=[precompile_mw], catch_errors=false)
+
     # NOTE: a live-server round-trip (serve! + loopback HTTP.get) is intentionally NOT added
     # here. As of HTTP 2.3.0 / Reseau 1.3.1 it no longer hangs precompilation (the earlier
     # precompile-context Reseau loopback deadlock is fixed), but it gives no benefit: the
