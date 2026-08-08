@@ -200,8 +200,9 @@ r = internalrequest(HTTP.Request("GET", "/boolean/true"))
 r = internalrequest(HTTP.Request("GET", "/boolean/false"))
 @test r.status == 200
 
+# An unparseable scalar path param is client input: 400, not 500.
 @suppress global r = internalrequest(HTTP.Request("GET", "/boolean/asdf"))
-@test r.status == 500
+@test r.status == 400
 
 # Test parsing of Any type inside a request handler
 r = internalrequest(HTTP.Request("GET", "/anyparams/hello"))
@@ -213,11 +214,12 @@ r = internalrequest(HTTP.Request("GET", "/anyparams/hello"))
 r = internalrequest(HTTP.Request("GET", "/fruit/1"))
 @test r.status == 200
 
+# An out-of-range enum throws an ArgumentError out of parseparam -> 400, not 500.
 @suppress global r = internalrequest(HTTP.Request("GET", "/fruit/4"))
-@test r.status == 500
+@test r.status == 400
 
 @suppress global r = internalrequest(HTTP.Request("GET", "/fruit/-3"))
-@test r.status == 500
+@test r.status == 400
 
 # date
 r = internalrequest(HTTP.Request("GET", "/date/2022"))
@@ -278,11 +280,12 @@ r = internalrequest(HTTP.Request("GET", """/struct/{"name": "jim", "age": 20}"""
 @test r.status == 200
 @test json(r, Student) == Student("jim", 20)
 
+# Malformed JSON body in a path param -> 400, not 500.
 @suppress global r = internalrequest(HTTP.Request("GET", """/struct/{"aged": 20}"""))
-@test r.status == 500
+@test r.status == 400
 
 @suppress global r = internalrequest(HTTP.Request("GET", """/struct/{"aged": 20}"""))
-@test r.status == 500
+@test r.status == 400
 
 # float 
 r = internalrequest(HTTP.Request("GET", "/float/3.5"))
@@ -405,12 +408,13 @@ r = internalrequest(HTTP.Request("GET", "/static/sample.html"))
 @test r.status == 200
 @test text(r) == file("content/sample.html") |> text
 
+# "a" is not a Float64 -> 400, not 500.
 @suppress global r = internalrequest(HTTP.Request("GET", "/multiply/a/8"))
-@test r.status == 500
+@test r.status == 400
 
 # don't suppress error reporting for this test
 @suppress global r = internalrequest(HTTP.Request("GET", "/multiply/a/8"))
-@test r.status == 500
+@test r.status == 400
 
 # hit endpoint that doesn't exist
 @suppress global r = internalrequest(HTTP.Request("GET", "asdfasdf"))

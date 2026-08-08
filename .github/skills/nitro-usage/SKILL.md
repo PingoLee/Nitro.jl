@@ -319,6 +319,12 @@ Errors never leak: a throwing handler returns a generic `{"message": "500: Inter
 `serve(...; show_errors=true)` (the default) controls **server-side logging only** — turning it off
 does not harden the response, it just blinds your logs. Keep it on.
 
+Client input errors are **400**, not 500: a malformed or missing scalar path/query parameter, and any
+extractor or `validate` failure, return `{"message": "400: Bad Request"}` and are logged at `@debug`
+with no stack trace. Only a genuine handler fault is a 500. So a path converter is a *binding*
+declaration, not a routing filter — `/user/abc` against `<int:id>` is a 400, not a 404 — and a scalar
+query parameter with no default is **required**: omitting it is a 400, not `nothing`.
+
 ---
 
 ## Anti-patterns

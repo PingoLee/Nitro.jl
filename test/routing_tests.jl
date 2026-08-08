@@ -160,9 +160,11 @@ end
         @test r.status == 200
         @test Nitro.text(r) == string(Int)
 
-        # GET /api/typed/not-an-int
+        # GET /api/typed/not-an-int -- a converter mismatch is client input, so 400.
+        # The converter is a *binding* declaration, not a routing filter: the route still
+        # matches (HTTP.jl treats {id} as a bare wildcard) and then fails to bind.
         r = internalrequest(HTTP.Request("GET", "/api/typed/not-an-int"))
-        @test r.status == 500
+        @test r.status == 400
 
         # GET /api/toggle/true
         r = internalrequest(HTTP.Request("GET", "/api/toggle/true"))
@@ -171,7 +173,7 @@ end
 
         # GET /api/toggle/not-a-bool
         r = internalrequest(HTTP.Request("GET", "/api/toggle/not-a-bool"))
-        @test r.status == 500
+        @test r.status == 400
 
         # GET /api/keys/<uuid>
         r = internalrequest(HTTP.Request("GET", "/api/keys/$key_id"))
@@ -180,7 +182,7 @@ end
 
         # GET /api/keys/not-a-uuid
         r = internalrequest(HTTP.Request("GET", "/api/keys/not-a-uuid"))
-        @test r.status == 500
+        @test r.status == 400
 
         # POST /api/items
         r = internalrequest(HTTP.Request("POST", "/api/items"))
@@ -289,6 +291,117 @@ end
     finally
         terminate()
         resetstate()
+    end
+end
+
+end
+
+@testitem "Scalar path & query params reject bad input with 400" tags=[:core] setup=[NitroCommon] begin
+
+using Test
+using HTTP
+using Nitro
+using UUIDs
+using Nitro: path
+
+# Uses a *local* ServerContext + internalrequest, so this item mutates no global
+# router/server state and is safe to run in parallel with other test items.
+
+ctx = Nitro.Core.ServerContext()
+Nitro.Core.Routing.urlpatterns(ctx, "/api", Nitro.RouteDefinition[
+    path("/items/<int:id>",   (req, id::Int)   -> Res.send(string(id)),   method="GET"),
+    path("/toggle/<bool:on>", (req, on::Bool)  -> Res.send(string(on)),   method="GET"),
+    path("/keys/<uuid:key>",  (req, key::UUID) -> Res.send(string(key)),  method="GET"),
+    path("/mixed/{v}",        (req, v::Union{Int, UUID}) -> Res.send(string(typeof(v))), method="GET"),
+    path("/search",           (req, q::String, limit::Int) -> Res.send("$q:$limit"),     method="GET"),
+    path("/page",             (req, page::Int = 1) -> Res.send(string(page)),            method="GET"),
+    path("/cursor",           (req, cursor::Nullable{Int} = nothing) ->
+                                  Res.send(isnothing(cursor) ? "none" : "got:$cursor"),  method="GET"),
+    path("/boom",             (req) -> error("boom"),                                    method="GET"),
+])
+
+get_(target) = Nitro.Core.internalrequest(ctx, HTTP.Request("GET", target))
+
+@testset "happy paths are unchanged" begin
+    @test get_("/api/items/42").status == 200
+    @test Nitro.text(get_("/api/items/42")) == "42"
+    @test get_("/api/toggle/true").status == 200
+    @test get_("/api/search?q=x&limit=3").status == 200
+    @test Nitro.text(get_("/api/search?q=x&limit=3")) == "x:3"
+
+    # A query param with a declared default still falls back when absent.
+    r = get_("/api/page")
+    @test r.status == 200
+    @test Nitro.text(r) == "1"
+end
+
+@testset "malformed path params are 400, not 500" begin
+    for target in ("/api/items/abc", "/api/toggle/nope", "/api/keys/not-a-uuid")
+        r = get_(target)
+        @test r.status == 400
+        @test Nitro.json(r)["message"] == "400: Bad Request"
+    end
+
+    # OverflowError: a value a route-level regex could never reject, which is why the
+    # converter stays a binding declaration rather than becoming a routing filter.
+    @test get_("/api/items/99999999999999999999").status == 400
+
+    # No union member parses -> 400, instead of the raw String reaching the handler.
+    # Assert the bound TYPE, not just the status: a regression to the wrong union member
+    # would still be a 200.
+    r = get_("/api/mixed/42")
+    @test r.status == 200
+    @test Nitro.text(r) == string(Int)
+
+    key = "550e8400-e29b-41d4-a716-446655440000"
+    r = get_("/api/mixed/$key")
+    @test r.status == 200
+    @test Nitro.text(r) == string(UUID)
+
+    @test get_("/api/mixed/notanumber").status == 400
+end
+
+@testset "Nullable scalar params bind the value the client sent" begin
+    # `Base.uniontypes` puts Nothing first and JSON.parse(str, Nothing) succeeds for any
+    # valid JSON, so this used to bind `nothing` and discard the 5 outright.
+    r = get_("/api/cursor?cursor=5")
+    @test r.status == 200
+    @test Nitro.text(r) == "got:5"
+
+    # Absence is still absence -- that is what the declared default is for.
+    r = get_("/api/cursor")
+    @test r.status == 200
+    @test Nitro.text(r) == "none"
+
+    # Present but unparseable is a client error, not a silent `nothing`.
+    @test get_("/api/cursor?cursor=abc").status == 400
+end
+
+@testset "missing and malformed query params are 400, not 500" begin
+    # Required query param absent: this used to be a KeyError -> 500.
+    @test get_("/api/search?q=x").status == 400
+    @test get_("/api/search").status == 400
+
+    # Present but unparseable, with and without a declared default.
+    @test get_("/api/search?q=x&limit=abc").status == 400
+    @test get_("/api/page?page=abc").status == 400
+end
+
+@testset "client input is not logged as a server error" begin
+    # A rejected request must not emit an @error/backtrace: under a spray of malformed
+    # URLs the old behavior wrote one stack trace per request.
+    # `Base.CoreLogging.Error` rather than `Logging.Error`: Logging is not a test dep.
+    # Do NOT add `match_mode=:any` here: with zero patterns it reduces to `all(())`, which
+    # is vacuously true and would pass even with an @error inside. The default `:all` mode
+    # requires `length(logs) == length(patterns) == 0`, which is the actual assertion.
+    @test_logs min_level=Base.CoreLogging.Error begin
+        @test get_("/api/items/abc").status == 400
+        @test get_("/api/search?q=x").status == 400
+    end
+
+    # Negative control: a genuine handler fault is still a 500 and still logs at :error.
+    @test_logs (:error,) match_mode=:any begin
+        @test get_("/api/boom").status == 500
     end
 end
 

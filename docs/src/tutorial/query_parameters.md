@@ -28,6 +28,40 @@ end
 
 ---
 
+## Typed Scalar Parameters
+
+Any handler argument that is neither a path parameter nor an extractor is bound from the query
+string, converted to its declared type:
+
+```julia
+# GET /products?q=chair&limit=50
+function search_products(req, q::String, limit::Int)
+    return Res.json(Dict("q" => q, "limit" => limit))
+end
+```
+
+### Missing And Invalid Values
+
+- **With a default** — an absent parameter falls back to the default. `limit::Int = 20` binds `20`
+  for `GET /products`.
+- **Without a default** — an absent parameter is a **`400 Bad Request`**. `GET /products?q=chair`
+  against the handler above is rejected, because `limit` was declared required.
+- **Present but unparseable** — always a **`400`**, default or not. `?limit=abc` cannot become an
+  `Int`.
+
+```
+GET /products?q=chair&limit=50   ->  200
+GET /products?q=chair            ->  400   (limit is required)
+GET /products?q=chair&limit=abc  ->  400   (limit is not an Int)
+```
+
+Rejections are logged at `@debug` level with no stack trace — they are client input, not server
+faults. If you want the parameter to be genuinely optional, give it a default; declaring it
+`Nullable{Int}` alone does not make an unparseable value acceptable (see
+[Path Parameters](path_parameters.md)).
+
+---
+
 ## Recommended: The `Query{T}` Extractor
 
 For structured handlers, declare a `@kwdef` struct and use `Query{T}`. Nitro automatically

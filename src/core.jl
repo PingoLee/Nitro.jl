@@ -999,21 +999,28 @@ function create_param_parser(ctx::ServerContext, func_details)
 
     function pathparam_strategy(lr::LazyRequest, param::Param{T}, name::String) where T
         raw_pathparams = Types.pathparams(lr)
-        return parseparam(param.type, raw_pathparams[name])
+        # The lookup is deliberately OUTSIDE the guard. A route brace always has a matching
+        # handler parameter (enforced at registration, see `parse_func_params` above) and the
+        # router always populates it, so a miss here is a framework bug rather than client
+        # input — it must stay a 500 with a real stack trace, not be laundered into a 400.
+        return parseparam_checked(param.type, raw_pathparams[name], name, :path)
     end
 
     function queryparam_strategy(lr::LazyRequest, param::Param{T}, name::String) where T
         raw_queryparams = Types.queryvars(lr)
-        if !haskey(raw_queryparams, name) && param.hasdefault
-            return param.default
-        else
-            return parseparam(param.type, raw_queryparams[name])
-        end
+        # Only selected when `param.hasdefault` (see the dispatch loop below), so an absent
+        # key means "use the declared default".
+        haskey(raw_queryparams, name) || return param.default
+        return parseparam_checked(param.type, raw_queryparams[name], name, :query)
     end
 
     function queryparam_strategy_no_default(lr::LazyRequest, param::Param{T}, name::String) where T
         raw_queryparams = Types.queryvars(lr)
-        return parseparam(param.type, raw_queryparams[name])
+        # A required query parameter that was not sent is a client error. This used to be a
+        # bare `raw_queryparams[name]`, whose `KeyError` surfaced as a 500.
+        haskey(raw_queryparams, name) ||
+            throw(ValidationError("Missing required query parameter '$name'"))
+        return parseparam_checked(param.type, raw_queryparams[name], name, :query)
     end
 
     for param in info.sig
