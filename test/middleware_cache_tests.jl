@@ -253,12 +253,14 @@ import Nitro: ServerContext
 # on a LOCAL ServerContext, so this item touches no global CONTEXT[] router state and is
 # order-independent within runtests.jl.
 #
-# Two preconditions must BOTH hold to reach the cache at all:
-#   * `compose` is only installed when `custommiddleware` is non-empty (`setupmiddleware`,
-#     src/core.jl) → every route below is registered with `middleware=`;
-#   * caching is only on when there is no per-call global middleware
-#     (`use_cache = isempty(globalmiddleware)`, src/routerhof.jl)
-#     → `internalrequest` is called with NO `middleware=` kwarg.
+# One precondition to reach the cache: caching is on only when there is no per-call global
+# middleware (`use_cache = isempty(globalmiddleware)`, src/routerhof.jl) → `internalrequest` is
+# called with NO `middleware=` kwarg.
+#
+# Registering every route with `middleware=` is still what makes each key's chain distinct and
+# the route middleware observable — but since #71 it is no longer what installs `compose`,
+# which is now unconditional. It does still get these requests past the per-request emptiness
+# fast path.
 #
 # `terminate()` is deliberately not exercised end-to-end: it requires `isopen(service)`,
 # i.e. a live `serve(async=true)`, which buys a `:network` flake risk for no signal over
