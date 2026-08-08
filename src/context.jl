@@ -4,9 +4,9 @@ import Base.Threads: ReentrantLock
 using HTTP
 using HTTP: Server, Router
 using ..Types
-# Unexported from `Types` on purpose: `MiddlewareCache` is internal plumbing for `compose`,
+# Unexported from `Types` on purpose: `CopyOnWriteDict` is internal plumbing for `compose`,
 # so it is named explicitly here rather than widened onto `Core`'s reexport surface.
-using ..Types: MiddlewareCache
+using ..Types: CopyOnWriteDict
 
 export ServerContext, EagerReviseService, Service, wait, close, isopen
 export set_extension!, get_extension, delete_extension!, has_extension
@@ -25,9 +25,9 @@ end
 @kwdef struct Service
     server              :: Ref{Nullable{Server}}    = Ref{Nullable{Server}}(nothing)
     router              :: Router                   = Router()
-    custommiddleware    :: Dict{String, Tuple}      = Dict{String, Tuple}()
+    custommiddleware    :: CopyOnWriteDict{Tuple}   = CopyOnWriteDict{Tuple}()
     named_routes        :: Dict{String, String}     = Dict{String, String}()
-    middleware_cache    :: MiddlewareCache          = MiddlewareCache()
+    middleware_cache    :: CopyOnWriteDict{Function} = CopyOnWriteDict{Function}()
     external_url        :: Ref{Nullable{String}}    = Ref{Nullable{String}}(nothing)
     prefix              :: Ref{Nullable{String}}    = Ref{Nullable{String}}(nothing)
     eager_revise        :: Ref{Nullable{EagerReviseService}} = Ref{Nullable{EagerReviseService}}(nothing)

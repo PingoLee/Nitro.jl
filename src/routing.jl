@@ -32,7 +32,7 @@ using HTTP
 using UUIDs: UUID
 
 using ..AppContext: ServerContext
-using ..Types: Nullable, RouteDefinition
+using ..Types: Nullable, RouteDefinition, publish!
 using ..Util: join_url_path
 using ..RouterHOF: genkey, process_middleware
 
@@ -225,7 +225,7 @@ function register_route(ctx::ServerContext, prefix::String, route_def::RouteDefi
         processed_mw = process_middleware(ctx, route_def.middleware)
         for method in route_def.methods
             key = genkey(method, full_path)
-            ctx.service.custommiddleware[key] = (nothing, processed_mw)
+            publish!(ctx.service.custommiddleware, key, (nothing, processed_mw))
         end
     end
     
