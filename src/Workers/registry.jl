@@ -19,6 +19,48 @@ function deregister_active_task_info! end
 function get_queue_authorizer end
 function set_queue_authorizer! end
 
+# -- Cross-user task-key permission checks interface functions --
+function get_watch_authorizer end
+
+"""
+    set_watch_authorizer!(store, authorizer)
+
+Install the hook that decides whether a user may join or reuse a task key someone
+else already owns, and return it.
+
+    authorizer(task_key::String, watchers::Vector{String}, user_id::String)::Bool
+
+Watcher membership is the only thing gating `get_task_status` and `cancel_task`, so
+adding a watcher hands out the owner's read and cancel rights. Submitting a key that
+already exists and that the caller does not already watch is therefore refused with
+`AuthorizationError` unless this hook returns `true`. That covers both the live task
+(joining it) and the finished one (replacing it, which discards the owner's result).
+
+`watchers` is a copy, so mutating it has no effect.
+
+**The hook runs while the store's task lock is held.** That lock also serializes
+`set_task!`, `cancel_task`, and zombie recovery, so blocking in the hook stalls the whole
+worker subsystem — make it a pure in-memory predicate over data the app already has.
+Do not query a database from it, and never `fetch` a spawned task that touches the same
+store: the child cannot take a `ReentrantLock` its parent holds, so that deadlocks.
+
+**Re-running a finished key resets its watcher list to the submitter.** An authorized
+reuse therefore drops the previous watchers, who must be re-authorized to rejoin. Hand out
+long-lived ids for a shared task only if the app is prepared for that.
+
+With `:user`-scoped keys (the default) this cannot trigger between two ordinary
+callers, because their ids never collide. Set it when an app deliberately uses
+`scope=:global` to share one expensive task across users.
+
+```julia
+# Resolve the sharing rule from data already in memory, not from a query.
+set_watch_authorizer!(store, function(task_key, watchers, user_id)
+    return ORG_OF[first(watchers)] == ORG_OF[user_id]
+end)
+```
+"""
+function set_watch_authorizer! end
+
 # -- Queue management helper functions --
 function get_sequential_queues end
 function get_queue_lock end
@@ -40,6 +82,7 @@ mutable struct InMemoryWorkerStore <: AbstractWorkerStore
     active_tasks::Dict{String, Task}
     active_lock::ReentrantLock
     queue_authorizer::Ref{Any}
+    watch_authorizer::Ref{Any}
 
     function InMemoryWorkerStore()
         return new(
@@ -50,6 +93,7 @@ mutable struct InMemoryWorkerStore <: AbstractWorkerStore
             Ref{Union{Nothing, CleanupScheduler}}(nothing),
             Dict{String, Task}(),
             ReentrantLock(),
+            Ref{Any}(nothing),
             Ref{Any}(nothing),
         )
     end
@@ -165,6 +209,15 @@ end
 
 function set_queue_authorizer!(store::InMemoryWorkerStore, authorizer)
     store.queue_authorizer[] = authorizer
+    return authorizer
+end
+
+function get_watch_authorizer(store::InMemoryWorkerStore)
+    return store.watch_authorizer[]
+end
+
+function set_watch_authorizer!(store::InMemoryWorkerStore, authorizer)
+    store.watch_authorizer[] = authorizer
     return authorizer
 end
 

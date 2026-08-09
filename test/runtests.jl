@@ -99,6 +99,7 @@ const TEST_FILES = [
     "routing_tests.jl",
     "original_tests.jl",
     "spa_tests.jl",
+    "staticfiles_security_tests.jl",
     "dx_tests.jl",
     "auth_module_tests.jl",
     "auth_tests.jl",

@@ -5,6 +5,7 @@ using Dates
 using JSON
 using Nitro
 using Nitro.Workers
+using Nitro.Errors: AuthorizationError
 
 # These tests exercise the real NitroPormGExt.PormGWorkerStore when PormG is
 # available in the active test environment. The mock model below replaces only
@@ -113,6 +114,82 @@ MockTaskModel() = MockTaskModel(Dict{String, Dict{String, Any}}())
 function Base.getproperty(m::MockTaskModel, name::Symbol)
     if name === :objects
         return MockTaskQuerySet(getfield(m, :_table), Dict{String,Any}())
+    end
+    return getfield(m, name)
+end
+
+# A model that fails the next `fail_next[]` reads and then behaves normally.
+#
+# The failure has to be *transient* to be a meaningful test: `_register_or_watch!`
+# reads the row, and then `set_task!` reads it again before writing. A mock that
+# failed every read would make the write throw too, so the submit would abort for
+# the wrong reason and the test would pass against the unpatched code. Failing
+# exactly one read reproduces the real hazard — a connection blip that makes
+# `get_task_info` report an existing row as absent, skipping the cross-user gate.
+struct FlakyReadQuerySet
+    inner::MockTaskQuerySet
+    fail_next::Ref{Int}
+    fail_ids::Set{String}
+end
+
+function _flaky_guard(qs::FlakyReadQuerySet)
+    inner = getfield(qs, :inner)
+    fail_next = getfield(qs, :fail_next)
+    fail_ids = getfield(qs, :fail_ids)
+
+    # Targeted: fail only reads filtered to a specific task id, so a test can
+    # break one row's read without disturbing the writes around it.
+    id = Base.get(getfield(inner, :filters), "id", nothing)
+    if id !== nothing && id in fail_ids
+        error("simulated database read failure for '$id'")
+    end
+
+    # Counted: fail the next N reads whatever they touch.
+    if fail_next[] > 0
+        fail_next[] -= 1
+        error("simulated transient database read failure")
+    end
+    return nothing
+end
+
+function Base.getproperty(qs::FlakyReadQuerySet, name::Symbol)
+    inner = getfield(qs, :inner)
+    fail_next = getfield(qs, :fail_next)
+    fail_ids = getfield(qs, :fail_ids)
+
+    if name === :db
+        return (key::String) -> FlakyReadQuerySet(inner.db(key), fail_next, fail_ids)
+    elseif name === :filter
+        return (pairs::Pair{String,<:Any}...) -> FlakyReadQuerySet(inner.filter(pairs...), fail_next, fail_ids)
+    elseif name === :first
+        return function()
+            _flaky_guard(qs)
+            return inner.first()
+        end
+    elseif name === :list
+        return function()
+            _flaky_guard(qs)
+            return inner.list()
+        end
+    end
+    return getproperty(inner, name)
+end
+
+struct FlakyReadModel
+    _table::Dict{String, Dict{String, Any}}
+    fail_next::Ref{Int}
+    fail_ids::Set{String}
+end
+
+FlakyReadModel() = FlakyReadModel(Dict{String, Dict{String, Any}}(), Ref(0), Set{String}())
+
+function Base.getproperty(m::FlakyReadModel, name::Symbol)
+    if name === :objects
+        return FlakyReadQuerySet(
+            MockTaskQuerySet(getfield(m, :_table), Dict{String,Any}()),
+            getfield(m, :fail_next),
+            getfield(m, :fail_ids),
+        )
     end
     return getfield(m, name)
 end
@@ -297,6 +374,179 @@ else
 
             bad_row = merge(good_row, Dict{String,Any}("id" => "t2", "status" => "RETRYING"))
             @test_throws ErrorException from_db(bad_row)
+        end
+
+        @testset "watch authorizer round-trips through the store (#19)" begin
+            store6 = RealPormGWorkerStore(model=MockTaskModel())
+
+            # Absent by default; the denial that follows from that is exercised
+            # end-to-end in the testset below, not here.
+            @test get_watch_authorizer(store6) === nothing
+
+            hook = (task_key, watchers, user_id) -> user_id in watchers
+            @test set_watch_authorizer!(store6, hook) === hook
+            @test get_watch_authorizer(store6) === hook
+
+            # Independent of the queue authorizer slot.
+            queue_hook = (queue_name, user_id) -> true
+            set_queue_authorizer!(store6, queue_hook)
+            @test get_watch_authorizer(store6) === hook
+            @test get_queue_authorizer(store6) === queue_hook
+
+            @test set_watch_authorizer!(store6, nothing) === nothing
+            @test get_watch_authorizer(store6) === nothing
+        end
+
+        @testset "the cross-user gate holds end-to-end on PormGWorkerStore (#19)" begin
+            # The accessor test above only proves the hook slot round-trips. This runs
+            # the real submit path against the persistent store, which is where the
+            # gate actually has to hold.
+            store_e2e = RealPormGWorkerStore(model=MockTaskModel())
+            release = Base.Event()
+            attacker_calls = Ref(0)
+
+            try
+                owner_id = submit_task("shared-export", () -> begin
+                    wait(release)
+                    return "victim-secret"
+                end, "victim"; scope=:global, store=store_e2e)
+                @test owner_id == "shared-export"
+
+                @test_throws AuthorizationError submit_task("shared-export", () -> begin
+                    attacker_calls[] += 1
+                    return "attacker-data"
+                end, "attacker"; scope=:global, store=store_e2e)
+
+                notify(release)
+                @test timedwait(() -> get_task_status(owner_id; store=store_e2e)[:status] == "COMPLETED", 5.0) == :ok
+
+                # Terminal state: replacing the row would destroy the owner's result.
+                @test_throws AuthorizationError submit_task("shared-export", () -> begin
+                    attacker_calls[] += 1
+                    return "attacker-data"
+                end, "attacker"; scope=:global, store=store_e2e)
+
+                persisted = get_task_status(owner_id, "victim"; store=store_e2e)
+                @test persisted[:result] == "victim-secret"
+                @test persisted[:watcher_count] == 1
+                @test attacker_calls[] == 0
+
+                # user scope keeps the two users on separate rows entirely
+                a = submit_task("report", () -> "a", "user-a"; store=store_e2e)
+                b = submit_task("report", () -> "b", "user-b"; store=store_e2e)
+                @test a == "user-a::report"
+                @test b == "user-b::report"
+                @test_throws AuthorizationError get_task_status(a, "user-b"; store=store_e2e)
+            finally
+                notify(release)
+                reset_store!(store_e2e)
+            end
+        end
+
+        @testset "one transient read failure denies the key instead of granting it (#19)" begin
+            # Regression: get_task_info used to log a failed read and return `nothing`,
+            # which _register_or_watch! reads as "no such task" — so a single connection
+            # blip skipped the cross-user gate and let the caller take over the row.
+            flaky = FlakyReadModel()
+            store_fail = RealPormGWorkerStore(model=flaky)
+
+            victim = TaskInfo("shared-export")
+            victim.status = COMPLETED
+            victim.result = "victim-secret"
+            victim.completed_at = Dates.now(Dates.UTC)
+            push!(victim.watchers, "victim")
+            set_task!(store_fail, "shared-export", victim)
+
+            # A failed read must surface, not masquerade as an absent row.
+            flaky.fail_next[] = 1
+            @test_throws ErrorException get_task_info(store_fail, "shared-export")
+
+            # Exactly one read fails: the one _register_or_watch! makes. set_task!'s
+            # own probe then succeeds, which is what made this reachable.
+            flaky.fail_next[] = 1
+            @test_throws ErrorException submit_task(
+                "shared-export", () -> "attacker-data", "attacker"; scope=:global, store=store_fail)
+
+            # The victim's row survived intact and is still theirs.
+            flaky.fail_next[] = 0
+            persisted = get_task_status("shared-export", "victim"; store=store_fail)
+            @test persisted[:result] == "victim-secret"
+            @test persisted[:watcher_count] == 1
+            @test_throws AuthorizationError get_task_status("shared-export", "attacker"; store=store_fail)
+        end
+
+        @testset "a failed read of one queued item does not kill the processor (#19)" begin
+            # Regression on the rethrow above: _execute_queued_task reads task
+            # metadata BEFORE registering the active-info cache entry, so that read
+            # hits the DB. An escaping exception unwound the processor's `while true`
+            # loop, leaving the queue undrained and every item behind it stranded.
+            flaky = FlakyReadModel()
+            store_q = RealPormGWorkerStore(model=flaky)
+            gate = Base.Event()
+
+            # One callback shared by all three submits, defined before the processor
+            # is spawned. `_invoke_task_callback` gates on `applicable`, which is
+            # world-age sensitive, so a closure first defined after the processor
+            # task started is invisible to it — unrelated to what this test asserts.
+            run_step = task_info -> begin
+                endswith(task_info.id, "k1") && wait(gate)
+                return "ran-" * task_info.id
+            end
+
+            try
+                first_id = submit_sequential_task("qfail", "k1", run_step, "u"; store=store_q)
+                second_id = submit_sequential_task("qfail", "k2", run_step, "u"; store=store_q)
+                @test first_id == "u::k1"
+                @test second_id == "u::k2"
+
+                # Break only k2's read, then let k1 finish so the processor picks k2 up.
+                push!(flaky.fail_ids, second_id)
+                notify(gate)
+
+                @test timedwait(() -> get_task_status(first_id; store=store_q)[:status] == "COMPLETED", 5.0) == :ok
+
+                # k2 is dropped, but the processor must still be alive and draining.
+                queue = get_sequential_queues(store_q)["qfail"]
+                @test queue.processor_task !== nothing
+                @test !istaskdone(queue.processor_task)
+
+                delete!(flaky.fail_ids, second_id)
+                third_id = submit_sequential_task("qfail", "k3", run_step, "u"; store=store_q)
+                @test timedwait(() -> get_task_status(third_id; store=store_q)[:status] == "COMPLETED", 5.0) == :ok
+                @test get_task_status(third_id; store=store_q)[:result] == "ran-u::k3"
+            finally
+                notify(gate)
+                reset_store!(store_q)
+            end
+        end
+
+        @testset "user-scoped ids round-trip through the DB record (#19)" begin
+            # Scoped ids embed the owner and contain the delimiter; both halves must
+            # survive serialization unchanged. (The VARCHAR(100)->(255) widening is not
+            # covered here: MockTaskModel is a bare Dict and enforces no column length.)
+            store7 = RealPormGWorkerStore(model=MockTaskModel())
+
+            scoped = scoped_task_key("export_report_42", "user-a")
+            @test scoped == "user-a::export_report_42"
+
+            info = TaskInfo(scoped; queue_name="reports")
+            push!(info.watchers, "user-a")
+            set_task!(store7, scoped, info)
+
+            retrieved = get_task_info(store7, scoped)
+            @test retrieved !== nothing
+            @test retrieved.id == scoped
+            @test retrieved.watchers == ["user-a"]
+
+            # The other user's same-key task is a distinct row.
+            other = scoped_task_key("export_report_42", "user-b")
+            other_info = TaskInfo(other; queue_name="reports")
+            push!(other_info.watchers, "user-b")
+            set_task!(store7, other, other_info)
+
+            @test length(get_all_tasks(store7)) == 2
+            @test only(get_all_tasks(store7, nothing, "user-a")).id == scoped
+            @test only(get_all_tasks(store7, nothing, "user-b")).id == other
         end
 
         @testset "lock_tasks provides mutual exclusion for PormGWorkerStore" begin

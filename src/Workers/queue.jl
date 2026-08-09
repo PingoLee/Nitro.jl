@@ -125,6 +125,16 @@ function _start_queue_processor(store::AbstractWorkerStore, queue_name::String)
                         _mark_queue_current_task!(store, queue, item.task_key)
                         try
                             _execute_queued_task(store, item)
+                        catch error
+                            # One bad item must never take the processor down. This
+                            # loop is the only thing draining the queue and nothing
+                            # restarts it until the next submission, so an escaping
+                            # exception strands every item behind it. Callback
+                            # failures are already converted to FAILED inside
+                            # _execute_queued_task; reaching here means the *store*
+                            # threw — a failed metadata read, say. Log it, drop the
+                            # item, keep draining.
+                            @error "Worker queue item aborted outside task execution" exception=(error, catch_backtrace()) queue_name=queue_name task_key=item.task_key
                         finally
                             _mark_queue_current_task!(store, queue, nothing)
                         end

@@ -268,11 +268,24 @@ the `X-CSRF-Token` header.
 ```julia
 staticfiles("public", "static")   # serve ./public at /static
 spafiles("dist", "/")             # SPA history-mode fallback to index.html
-dynamicfiles("uploads", "media")  # re-read from disk per request
+dynamicfiles("build", "media")    # re-read from disk per request
 ```
 
 `staticfiles` snapshots file contents at startup; `dynamicfiles` reads per request. Use `spafiles`
 for a Vue/React/Quasar build so client-side routes fall back to `index.html`.
+
+**Mounts do not serve everything in the folder.** Hidden entries (any path component starting with
+`.`, relative to the folder — so `.env` and all of `.git/`), symlinks resolving outside the folder,
+filenames the router reads as patterns (`*`/`**` shadow sibling URLs; a `{`/`}` name is parsed as a
+path parameter and used to throw at registration, taking `serve()` down with it), and non-regular
+files are refused; the mount logs what it skipped at startup. All of this is evaluated **once, at
+mount time** — `dynamicfiles` re-reads file *contents* per request, not the rules. **Do not mount a
+directory untrusted users can write to** (an uploads folder): put it behind a reverse proxy, or serve
+it from a handler that authorizes each request. See `docs/design/static-serving-boundary.md`. `include_hidden=true` and
+`allow_symlink_escape=true` opt out per mount and widen what is publicly reachable. To serve a
+dotted directory, mount it as its own root — `staticfiles("public/.well-known", ".well-known")` —
+since the rule tests components *below* the folder, never the folder's own name. Only files present
+at startup get a route, so a directory that gains files at runtime needs a handler, not a mount.
 
 ---
 
@@ -286,14 +299,18 @@ serve(middleware=[
     worker_startup(queues=["reports"], store=persistent_store, recover_zombies=true),
 ])
 
-task_id = submit_task("reports", () -> build_report(id), user_id)
+# Returns the STORED id ("<user_id>::report-42"), not the key you passed.
+task_id = submit_task("report-42", () -> build_report(id), user_id)
 status  = get_task_status(task_id, user_id)
 cancel_task(task_id, user_id)
 ```
 
 Omitting `user_id` on a read is a deliberate system/public-endpoint bypass — never the default for a
-user-scoped route. For persistence, `pormg_nitro_worker(db_key="workers")` needs `using PormG` in the
-**application** so the extension loads.
+user-scoped route. Keep the returned id (or rebuild it with `scoped_task_key`) — under the default
+`:user` scope it is namespaced by owner, which is what stops one user reading or cancelling
+another's task by guessing a resource-derived key. For persistence,
+`pormg_nitro_worker(db_key="workers")` needs `using PormG` in the **application** so the extension
+loads.
 
 ---
 
@@ -341,6 +358,7 @@ query parameter with no default is **required**: omitting it is a 400, not `noth
 | `if user.role == "admin"` inside a handler | `role_required("admin")` guard on the route |
 | `login_required()` on a route that loads a record by client id | Also verify ownership — otherwise IDOR |
 | `submit_task(key, cb)` without `user_id` | `submit_task(key, cb, user_id)` |
+| Polling `get_task_status(key, …)` with the key you submitted | Poll with the id `submit_task` returned, or `scoped_task_key(key, user_id)` |
 | Mutating a `Response` returned by inner middleware | `add_response_headers(resp, extra)` |
 | A global mutable config object | A typed struct passed via `serve(context=…)` |
 | `show_errors=false` "for security" | Leave it on — the client response is already generic |

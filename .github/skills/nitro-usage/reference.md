@@ -275,27 +275,49 @@ that is already serving throws; `terminate()` first, or use `instance()` for a s
 ## Static and SPA serving
 
 ```julia
-staticfiles(folder::String, mountdir::String="static"; headers=[], loadfile=nothing)
-spafiles(folder::String,    mountdir::String="static"; headers=[], loadfile=nothing)
-dynamicfiles(folder::String, mountdir::String="static"; headers=[], loadfile=nothing)
+staticfiles(folder::String,  mountdir::String="static"; headers=[], loadfile=nothing,
+            include_hidden::Bool=false, allow_symlink_escape::Bool=false)
+spafiles(folder::String,     mountdir::String="static"; headers=[], loadfile=nothing,
+         include_hidden::Bool=false, allow_symlink_escape::Bool=false)
+dynamicfiles(folder::String, mountdir::String="static"; headers=[], loadfile=nothing,
+             include_hidden::Bool=false, allow_symlink_escape::Bool=false)
 ```
 
 `staticfiles` snapshots contents at startup (fast, needs a restart to pick up changes).
 `dynamicfiles` re-reads per request. `spafiles` adds the history-mode fallback to `index.html`.
+
+**What a mount refuses.** Evaluated **once, at mount time**, for all three — `dynamicfiles` re-reads
+file *contents* per request, not the rules. A directory untrusted users can write to belongs behind a
+proxy, not behind these checks (`docs/design/static-serving-boundary.md`):
+
+| Refused | Opt-out |
+|---|---|
+| Hidden entries: any path component starting with `.`, **relative to the mounted folder** (`.env`, all of `.git/`). Interior dots (`file.min.js`) are unaffected | `include_hidden=true` |
+| Symlinks resolving outside the folder (Windows directory junctions included) | `allow_symlink_escape=true` |
+| Filenames the router reads as patterns: `*`/`**` (HTTP.jl wildcards — they shadow sibling URLs) and any name containing `{` or `}` (parsed as a path parameter, which threw at registration and stopped `serve()` booting) | none |
+| Anything that is not a regular file — symlinked directories, FIFOs, devices | none |
+
+The folder's own name is never tested, so `staticfiles("public/.well-known", ".well-known")` works.
+Enumeration is `Nitro.Core.Util.mountable_files(root; include_hidden, allow_symlink_escape)`;
+`mountfolder` returns the routes it registered. `spafiles` registers its history-mode fallback only
+if `index.html` is itself servable. Only files present at startup get a route.
 
 ---
 
 ## Workers
 
 ```julia
-submit_task(task_key, callback::Function, user_id;            # user_id REQUIRED
+submit_task(task_key, callback::Function, user_id;            # user_id REQUIRED; RETURNS the stored id
+            scope::Symbol = :user,                            # :user namespaces the key by owner
             options::TaskOptions = TaskOptions(), store = default_store())
 get_task_status(task_id, user_id = nothing; store = default_store())
 cancel_task(task_id,     user_id = nothing; store = default_store())
 get_all_tasks(filter_status = nothing, user_id = nothing; store = default_store())
 
+scoped_task_key(task_key, user_id; scope = :user)             # "user-a::report_42"
 worker_startup(; queues, store, recover_zombies)              # a middleware
 set_queue_authorizer!(store, authorizer)                      # (queue, user_id) -> Bool
+set_watch_authorizer!(store, authorizer)                      # (task_key, watchers, user_id) -> Bool
 pormg_nitro_worker(; db_key = "db")                           # needs `using PormG`
 update_progress!(task_info, value)                            # NEVER assign .progress directly
 ```
@@ -304,6 +326,12 @@ Every one of these also has a `(ctx::ServerContext, …)` method — use it to a
 singleton in tests. Submission registers the submitting `user_id` as a watcher; passing a non-empty
 `user_id` to a read/manage call enforces watcher access and raises `AuthorizationError` when denied.
 Omitting it is a deliberate system/public-endpoint bypass.
+
+**`submit_task` returns the stored id, which under the default `:user` scope is
+`"<user_id>::<task_key>"` — not the key you passed.** Read and cancel with the returned value.
+`scope=:global` stores the key verbatim for cross-user deduplication; a caller who is not already a
+watcher is then refused unless `set_watch_authorizer!` allows it. The queue authorizer runs on
+`submit_task` too, under `DEFAULT_QUEUE_NAME` (`"default"`).
 
 ---
 
