@@ -400,6 +400,16 @@ is explicit introspection, not accidental disclosure.)
 - `prefix=nothing`: strip a global URL prefix (e.g. `"/api"`) before routing.
 - `revise=:none`: `:lazy`/`:eager` enable Revise-based hot reload (dev only).
 - `secret_key`, `httponly`, `secure`, `samesite`: override cookie defaults for this run.
+- `shutdown_timeout=10.0`: seconds `terminate` waits for in-flight requests to drain
+  before force-closing what remains. `0` skips the graceful phase entirely.
+- `reuseaddr`: forwarded to `HTTP.listen!`. Defaults to `true` on Linux/macOS, where it
+  allows rebinding a port still in `TIME_WAIT`, and to **`false` on Windows**, where
+  `SO_REUSEADDR` instead lets a second process bind a port another is actively listening
+  on — turning a port conflict into two servers silently splitting the traffic.
+
+Calling `serve` on a context that is **already serving** throws an `ArgumentError`: the
+second call would overwrite the running server's handle and strand its port. Call
+`terminate` first, or give the second listener its own context via `instance`.
 
 IP-based controls (rate limiting, audit logging) key on the socket peer address,
 resolved for both plain-HTTP and direct-TLS listeners. Behind a reverse proxy,
@@ -429,11 +439,36 @@ function serve(ctx::ServerContext;
     httponly=nothing,
     secure=nothing,
     samesite=nothing,
+    shutdown_timeout=SHUTDOWN_TIMEOUT_SECONDS,
     kwargs...)::Union{Server, Nothing}
+
+    # FIRST, before any validation or context mutation, so a rejected call leaves the context
+    # byte-for-byte untouched. `startserver` assigns `ctx.service.server[]` unconditionally, so
+    # without this guard a second `serve()` would overwrite the handle of a *live* server —
+    # leaving it unreachable and its port bound for the life of the process, with nothing left
+    # to close it. That is a programming error, not something to paper over by silently killing
+    # the first server's in-flight requests.
+    if isopen(ctx.service)
+        throw(ArgumentError(
+            "This ServerContext is already serving on " *
+            "$(something(ctx.service.external_url[], "an open listener")). A second `serve()` " *
+            "would overwrite the running server's handle, leaving it unreachable and its port " *
+            "bound until the process exits. Call `terminate()` first, or give the second " *
+            "listener its own context (`instance()`, or `Nitro.Core.serve(ServerContext(); …)`)."))
+    end
 
     if revise ∉ (:none, :lazy, :eager)
         throw(ArgumentError("Invalid `revise` value $(repr(revise)). Expected one of :none, :lazy, or :eager."))
     end
+
+    # Validate HERE rather than only at shutdown. `_shutdown_server` also rejects a bad value,
+    # but by then it is far too late: the stored timeout is read on every `terminate()`, so a
+    # typo'd `shutdown_timeout` would make `terminate()` throw *before* it clears the handle —
+    # leaving a running server that can never be stopped through the normal API. Rejecting the
+    # value at the call site that contains the typo keeps the failure recoverable.
+    # (`NaN >= 0` is false, so NaN is rejected here too.)
+    shutdown_timeout >= 0 ||
+        throw(ArgumentError("`shutdown_timeout` must be >= 0 seconds, got $shutdown_timeout"))
 
     if !ismissing(context)
         ctx.app_context[] = Context(context)
@@ -454,6 +489,9 @@ function serve(ctx::ServerContext;
 
     ctx.service.external_url[] = external_url isa String ? external_url : "http://$host:$port"
     ctx.service.prefix[] = prefix isa String ? prefix : nothing
+    # Stored rather than passed through, because the *blocking* `serve()` calls `terminate()`
+    # from its own `finally` (the Ctrl-C path) with no way to hand it a keyword.
+    ctx.service.shutdown_timeout[] = Float64(shutdown_timeout)
 
     if revise == :lazy || revise == :eager
         if parallel && Threads.nthreads() > 1
@@ -536,9 +574,39 @@ function start_revise_service()
     EagerReviseService(revise_task, revise_task_done)
 end
 
-function terminate(context::ServerContext)
+"""
+    terminate(context::ServerContext; timeout = nothing)
+    terminate(; timeout = nothing)
+
+Stop the running server: run every `LifecycleMiddleware` shutdown hook, drop the composed
+middleware cache, and close the listener. A no-op when nothing is serving.
+
+Shutdown is a **bounded graceful drain**, modeled on Go's `http.Server.Shutdown(ctx)`. The
+listening socket is released immediately — the port is free as soon as `terminate` is entered
+— then Nitro waits up to `timeout` seconds for in-flight requests to finish and force-closes
+whatever remains.
+
+`timeout` defaults to the server's own `serve(shutdown_timeout = …)`, itself defaulting to
+`Nitro.Core.SHUTDOWN_TIMEOUT_SECONDS` (10 seconds). `timeout = 0` skips the graceful phase.
+
+**Long-lived connections are always cut at the timeout.** A WebSocket, SSE, or STREAM handler
+holds its connection for its whole lifetime, so the drain can never wait it out. If such a
+handler has to finish cleanly, give it a shutdown signal of its own — an `Event` or `Channel`
+notified from a `LifecycleMiddleware`'s `on_shutdown`, which runs *before* the drain begins.
+
+!!! warning
+    Do not call `terminate()` from inside a request handler. The handler's own connection is
+    what the drain is waiting on, so the graceful phase is guaranteed to reach its timeout.
+
+See also `serve`.
+"""
+function terminate(context::ServerContext; timeout::Nullable{Real} = nothing)
     if isopen(context.service)
         shutdown.(context.service.lifecycle_middleware)
+        # NOTE(#82): this also drops *route-level* lifecycle middleware, which is registered at
+        # `urlpatterns()` time rather than at `serve()` time — so `serve(); terminate(); serve()`
+        # never re-runs those startup hooks. Fixing it properly means splitting the set into
+        # route-owned and serve-owned halves; tracked separately.
         empty!(context.service.lifecycle_middleware)
         # Do NOT "symmetrize" this by also emptying `custommiddleware`: that table is route
         # *registration* state, not cache state. test/original_tests.jl re-serves after a
@@ -549,8 +617,9 @@ function terminate(context::ServerContext)
         # finish against a table nobody mutates.
         empty!(context.service.middleware_cache)
         context.service.external_url[] = nothing
-        close(context.service)
+        close(context.service; timeout = something(timeout, context.service.shutdown_timeout[]))
     end
+    return nothing
 end
 
 # True once a handler has begun writing the response on the raw stream (e.g. a STREAM
@@ -756,6 +825,15 @@ function preprocesskwargs(kwargs)
     # `listen!` rejects unknown keyword arguments. Drop v1-only server kwargs that Nitro
     # still tolerates for back-compat (a deprecation warning is emitted in `serve`).
     delete!(kwargs_dict, :queuesize)
+    # `SO_REUSEADDR` means something fundamentally different on Windows. On POSIX it only lets
+    # you bind over sockets in TIME_WAIT, which is load-bearing for restarting onto a port you
+    # just shut down. On Windows it lets a second process bind a port another process is
+    # *actively listening on*, with indeterminate delivery between the two — which is why
+    # Microsoft had to add SO_EXCLUSIVEADDRUSE. HTTP.jl defaults it to `true` everywhere, so on
+    # Windows an orphaned Nitro process turns "port already taken" from a loud bind failure into
+    # a silent split-brain where some requests are answered by the corpse, out of *its* router.
+    # `get!` writes only when the key is absent, so an explicit `serve(reuseaddr = …)` wins.
+    Base.get!(kwargs_dict, :reuseaddr, !Sys.iswindows())
     return kwargs_dict
 end
 

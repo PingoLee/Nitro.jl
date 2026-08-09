@@ -13,15 +13,19 @@ using Suppressor
 import Nitro: PACKAGE_DIR, ServerContext, Nullable, HOFRouter
 import Nitro: GET, POST, PUT, DELETE, PATCH, STREAM, WEBSOCKET
 
-export HOST, PORT, localhost
+export HOST
 export values_present, value_absent, value_count, has_property
 export get_free_port
 
 # ── Constants ────────────────────────────────────────────────────────
 
 const HOST = "127.0.0.1"
-const PORT = 6060
-const localhost = "http://$HOST:$PORT"
+
+# There is deliberately NO shared `PORT`/`localhost` here. A fixed port shared by every
+# `:network` item is what made an orphaned server from a *previous* run answer the next
+# run's requests out of its own stale router — a failure that presents as an unrelated
+# assertion error in whichever item happened to run at the time. Every item that binds a
+# socket calls `get_free_port()` and builds its own `localhost` from it.
 
 # ── Test helpers (from test_utils.jl) ────────────────────────────────
 
@@ -70,17 +74,34 @@ function has_property(object::Dict, propertyName::String)
     return haskey(object, "properties") && haskey(object["properties"], propertyName)
 end
 
+const _CLAIMED_PORTS = Set{Int}()
+const _CLAIMED_PORTS_LOCK = ReentrantLock()
+
 """
     get_free_port() -> Int
 
-Find an available TCP port by briefly binding to port 0 and reading
-the OS-assigned port number.
+Ask the OS for an unused TCP port by briefly binding to port 0, reading the assignment,
+and releasing it.
+
+The bind-0/close/rebind window is a TOCTOU race that cannot be closed from here — the
+caller re-binds later, and anything may take the port in between. What *can* be closed is
+the self-collision: two probes issued before either has been bound can be handed the same
+port (`instance_tests.jl` asks for two in a row). So every port handed out is remembered
+and never handed out twice within this process.
 """
 function get_free_port()
-    server = Sockets.listen(Sockets.localhost, 0)
-    port = Int(getsockname(server)[2])
-    close(server)
-    return port
+    lock(_CLAIMED_PORTS_LOCK) do
+        for _ in 1:50
+            server = Sockets.listen(Sockets.localhost, 0)
+            port = Int(getsockname(server)[2])
+            close(server)
+            if port ∉ _CLAIMED_PORTS
+                push!(_CLAIMED_PORTS, port)
+                return port
+            end
+        end
+        error("get_free_port: no unclaimed ephemeral port after 50 attempts")
+    end
 end
 
 end # module NitroCommon

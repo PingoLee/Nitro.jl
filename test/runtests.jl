@@ -89,6 +89,7 @@ const TEST_FILES = [
     "ergonomics_tests.jl",
     "instance_tests.jl",
     "server_show_tests.jl",
+    "server_lifecycle_tests.jl",
     "parallel_tests.jl",
     "middleware_tests.jl",
     "middleware_cache_tests.jl",
@@ -121,6 +122,32 @@ const TEST_FILES = [
     # ── Quality Gate ──────────────────────────────────────────────────────────
     "aqua_tests.jl",
 ]
+
+# ── Per-item cleanup net ───────────────────────────────────────────────────────
+# ReTestItems evaluates this in a `finally` after EVERY test item, whether it passed,
+# failed, or errored — including in-process runs. That makes it strictly better than
+# per-item `try`/`finally`: it also covers items that never call `terminate()` at all,
+# and it still runs when an exception escapes an item's own cleanup.
+#
+# Why it matters: an item that throws between `serve()` and its trailing `terminate()`
+# used to leave the listener bound for the life of the process, so the *next* item — or
+# the next `Pkg.test()` run — got answers from a server it never started.
+#
+# `terminate()` is a cheap no-op when nothing is serving. Items that use their own
+# `ServerContext`/`instance()` are NOT covered by this (it only reaches the global
+# `CONTEXT[]`) and must still clean up after themselves.
+const TEST_END = quote
+    using Nitro
+    # Swallow-and-report, never rethrow. ReTestItems evaluates this as
+    # `try <item> finally <test_end_expr> end`, so an exception raised here REPLACES the
+    # item's own failure — you would be told the cleanup broke and never learn which
+    # assertion did. Cleanup is best-effort by definition; the item's result is the signal.
+    try
+        Nitro.terminate()
+    catch err
+        @error "test_end_expr: terminate() failed; a later :network item may hit a bound port" exception=err
+    end
+end
 
 # ── CLI argument parsing ───────────────────────────────────────────────────────
 # Supports (test deps are auto-provisioned via the bootstrap block above):
@@ -172,6 +199,7 @@ let args = copy(ARGS)
     runtests(
         paths...;
         testitem_timeout = 600,
+        test_end_expr = TEST_END,
         nworkers = nworkers,
         tags     = isempty(tags) ? nothing : tags,
         name     = isnothing(name_filt) ? nothing : name_filt,

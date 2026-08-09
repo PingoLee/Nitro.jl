@@ -11,6 +11,9 @@ import Nitro
 #       `:context` (`_request_context_metadata!`) and `:version`
 #       (`proto_major`/`proto_minor`) handling; and `_buffered_stream_request`.
 #   • src/utilities/bodyparsers.jl — the `EmptyBody` / `BytesBody` body hierarchy.
+#   • src/context.jl — `_shutdown_server`'s bounded drain: it depends on `close(::Server)`
+#       releasing the listener BEFORE its unbounded quiesce loop, and escalates to
+#       `HTTP.forceclose`.
 #
 # None of these are part of HTTP's public, SemVer-guaranteed API, so a 2.x bump
 # can rename or remove them WITHOUT a breaking-version signal. The compat pin
@@ -40,6 +43,32 @@ end
     @test isdefined(HTTP, :EmptyBody)
     @test isdefined(HTTP, :BytesBody)
     @test :data in fieldnames(HTTP.BytesBody)
+end
+
+@testset "bounded-shutdown surface (src/context.jl `_shutdown_server`)" begin
+    # `terminate(timeout=…)` runs `close(server)` on its own task and escalates to
+    # `HTTP.forceclose`. `forceclose` is HTTP *public* API declared via `public`, not
+    # `export` — so `test/reexports_tests.jl` would not notice its removal, and a rename
+    # here would not fail loudly: it would silently reinstate the unbounded hang this
+    # canary exists to prevent.
+    @test isdefined(HTTP, :forceclose)
+    @test hasmethod(HTTP.forceclose, Tuple{HTTP.Server})
+    @test hasmethod(close,  Tuple{HTTP.Server})
+    @test hasmethod(isopen, Tuple{HTTP.Server})
+
+    # The whole design rests on `close` releasing the LISTENER before the (unbounded)
+    # connection drain, so the timeout only ever escalates connection teardown and never
+    # delays freeing the port. These two are the halves of that contract.
+    @test isdefined(HTTP, :_close_listener!)
+    @test isdefined(HTTP, :_close_idle_conns!)
+end
+
+@testset "`reuseaddr` is a Server knob (src/core.jl `preprocesskwargs`)" begin
+    # Nitro injects `reuseaddr=false` on Windows, where SO_REUSEADDR lets a second process
+    # bind a port another is actively listening on. It travels as a `listen!` kwarg and has
+    # to land on this field, which `test/server_lifecycle_tests.jl` asserts against.
+    @test :reuseaddr in fieldnames(HTTP.Server)
+    @test fieldtype(HTTP.Server, :reuseaddr) === Bool
 end
 
 @testset "peer-IP field chain still present (src/core.jl `_peer_ip`/`_conn_fd`)" begin
