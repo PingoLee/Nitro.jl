@@ -160,6 +160,9 @@ Operational notes:
 ## Global middleware now runs on unmatched (404) and method-mismatched (405) requests (#71)
 
 - **Version**: Unreleased
+- **Nitro ref**: #71; `src/routerhof.jl`, `src/core.jl`
+- **Recorded**: 2026-08-08
+- **Severity**: **behavior (middleware now runs on 404/405)** — bug fix.
 
 Global middleware — the `middleware=[...]` vector passed to `serve` — now runs on **every**
 request, including ones that match no route (404) and ones whose path matches but whose method
@@ -211,6 +214,8 @@ end
 Alternatively, move it off the global list and attach it per route with
 `path(...; middleware = [GuardMiddleware(login_required())])`, which never sees unmatched
 requests at all.
+
+---
 
 ## Scalar path & query params reject bad input with 400; `Nullable{T}` params bind their value (#18)
 
@@ -295,6 +300,8 @@ function search(req, q::String, limit::Int = 20) ... end
 
 If an app depends on the old status codes — an integration test asserting `500`, or an HTTP client
 whose retry policy fires on 5xx and not 4xx — update it. Bad input now reports as bad input.
+
+---
 
 ## `ExtractIP` trust model rebuilt; `trust_forwarded` removed (#16)
 
