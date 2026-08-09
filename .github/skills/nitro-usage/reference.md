@@ -266,13 +266,32 @@ Lifecycle: `terminate()`, `resetstate()`, `internalrequest(req; …)` (in-proces
 ## Static and SPA serving
 
 ```julia
-staticfiles(folder::String, mountdir::String="static"; headers=[], loadfile=nothing)
-spafiles(folder::String,    mountdir::String="static"; headers=[], loadfile=nothing)
-dynamicfiles(folder::String, mountdir::String="static"; headers=[], loadfile=nothing)
+staticfiles(folder::String,  mountdir::String="static"; headers=[], loadfile=nothing,
+            include_hidden::Bool=false, allow_symlink_escape::Bool=false)
+spafiles(folder::String,     mountdir::String="static"; headers=[], loadfile=nothing,
+         include_hidden::Bool=false, allow_symlink_escape::Bool=false)
+dynamicfiles(folder::String, mountdir::String="static"; headers=[], loadfile=nothing,
+             include_hidden::Bool=false, allow_symlink_escape::Bool=false)
 ```
 
 `staticfiles` snapshots contents at startup (fast, needs a restart to pick up changes).
 `dynamicfiles` re-reads per request. `spafiles` adds the history-mode fallback to `index.html`.
+
+**What a mount refuses.** Evaluated **once, at mount time**, for all three — `dynamicfiles` re-reads
+file *contents* per request, not the rules. A directory untrusted users can write to belongs behind a
+proxy, not behind these checks (`docs/design/static-serving-boundary.md`):
+
+| Refused | Opt-out |
+|---|---|
+| Hidden entries: any path component starting with `.`, **relative to the mounted folder** (`.env`, all of `.git/`). Interior dots (`file.min.js`) are unaffected | `include_hidden=true` |
+| Symlinks resolving outside the folder (Windows directory junctions included) | `allow_symlink_escape=true` |
+| Filenames the router reads as patterns: `*`/`**` (HTTP.jl wildcards — they shadow sibling URLs) and any name containing `{` or `}` (parsed as a path parameter, which threw at registration and stopped `serve()` booting) | none |
+| Anything that is not a regular file — symlinked directories, FIFOs, devices | none |
+
+The folder's own name is never tested, so `staticfiles("public/.well-known", ".well-known")` works.
+Enumeration is `Nitro.Core.Util.mountable_files(root; include_hidden, allow_symlink_escape)`;
+`mountfolder` returns the routes it registered. `spafiles` registers its history-mode fallback only
+if `index.html` is itself servable. Only files present at startup get a route.
 
 ---
 

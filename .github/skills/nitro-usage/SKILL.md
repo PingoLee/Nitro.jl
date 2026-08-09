@@ -268,11 +268,24 @@ the `X-CSRF-Token` header.
 ```julia
 staticfiles("public", "static")   # serve ./public at /static
 spafiles("dist", "/")             # SPA history-mode fallback to index.html
-dynamicfiles("uploads", "media")  # re-read from disk per request
+dynamicfiles("build", "media")    # re-read from disk per request
 ```
 
 `staticfiles` snapshots file contents at startup; `dynamicfiles` reads per request. Use `spafiles`
 for a Vue/React/Quasar build so client-side routes fall back to `index.html`.
+
+**Mounts do not serve everything in the folder.** Hidden entries (any path component starting with
+`.`, relative to the folder — so `.env` and all of `.git/`), symlinks resolving outside the folder,
+filenames the router reads as patterns (`*`/`**` shadow sibling URLs; a `{`/`}` name is parsed as a
+path parameter and used to throw at registration, taking `serve()` down with it), and non-regular
+files are refused; the mount logs what it skipped at startup. All of this is evaluated **once, at
+mount time** — `dynamicfiles` re-reads file *contents* per request, not the rules. **Do not mount a
+directory untrusted users can write to** (an uploads folder): put it behind a reverse proxy, or serve
+it from a handler that authorizes each request. See `docs/design/static-serving-boundary.md`. `include_hidden=true` and
+`allow_symlink_escape=true` opt out per mount and widen what is publicly reachable. To serve a
+dotted directory, mount it as its own root — `staticfiles("public/.well-known", ".well-known")` —
+since the rule tests components *below* the folder, never the folder's own name. Only files present
+at startup get a route, so a directory that gains files at runtime needs a handler, not a mount.
 
 ---
 
