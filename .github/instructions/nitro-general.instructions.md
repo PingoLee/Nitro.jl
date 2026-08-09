@@ -272,7 +272,7 @@ any code that must not touch the global.
 | `src/utilities/render.jl` | Response constructors: `html`, `text`, `json`, `xml`, `js`, `css`, `binary`, `file` |
 | `src/utilities/bodyparsers.jl` | Request body parsing: `text`, `json`, `binary`, `formdata`, `multipart`, `FormFile` |
 | `src/utilities/misc.jl` | `redirect`, `parseparam`, `add_response_headers`, `own_response_headers`, request plumbing |
-| `src/utilities/fileutil.jl` | `readfile`, `mountfolder` — static-mount helpers |
+| `src/utilities/fileutil.jl` | `readfile`, `mountable_files`, `mountfolder` — static-mount helpers; `mountable_files` owns which files a mount will expose (dotfiles, symlink confinement, route-pattern names) |
 | `src/extractors.jl` | Typed extractors: `Path`, `Query`, `Header`, `Json`, `JsonFragment`, `Form`, `Body`, `Cookie`, `Session`, `Files`, `MultipartForm` |
 | `src/reflection.jl` | `struct_builder`, `splitdef`, `extract_struct_info` — the machinery extractors bind through |
 | `src/handlers.jl` | Handler dispatch — `select_handler`, first-argument typing |

@@ -68,35 +68,104 @@ end
 route(func::Function, methods::Vector{String}, path::Union{String,HOFRouter}) = route(methods, path, func)
 
 
+"""
+    staticfiles(folder::String, mountdir::String="static"; headers::Vector=[], loadfile::Nullable{Function}=nothing,
+                include_hidden::Bool=false, allow_symlink_escape::Bool=false)
+
+Mount the servable files inside `folder` under `mountdir`, reading each one **once at startup** —
+fast to serve, but a change on disk needs a restart. Use [`dynamicfiles`](@ref) to re-read per
+request, or [`spafiles`](@ref) for a single-page app.
+
+Not every file in `folder` is served. These are refused:
+
+- **Hidden entries** — any path component starting with `.` *relative to `folder`*, so `.env` and
+  everything under `.git/`. A symlink is judged by what it resolves to as well as by its own name.
+- **Symlinks resolving outside `folder`**, so `data.csv -> /etc/passwd` is not served.
+- **Filenames the router reads as patterns** — `*` and `**` are wildcards that would shadow sibling
+  URLs, and a name containing `{` or `}` is parsed as a path parameter and throws at registration,
+  which would stop the server booting.
+- **Anything that is not a regular file** — symlinked directories, FIFOs, devices.
+
+`include_hidden=true` serves dotfiles and `allow_symlink_escape=true` serves escaping symlinks; both
+widen what is publicly reachable, so set them deliberately. Note they interact: with
+`allow_symlink_escape=true`, a link pointing at a dotfile *outside* the folder is served regardless
+of `include_hidden`, because the hidden rule is only meaningful relative to the mount.
+
+These rules are evaluated once, at mount time. A directory whose contents untrusted users can change
+belongs behind a reverse proxy — see `docs/design/static-serving-boundary.md`.
+
+To serve a directory that is itself dotted, mount it as its own root — the rule tests components
+*below* `folder`, never `folder`'s own name:
+
+```julia
+staticfiles("public/.well-known", ".well-known")
+```
+
+Note this registers only the files present at startup; anything written later (an ACME
+`acme-challenge` token, say) needs its own route.
+"""
 staticfiles(
-    folder::String, 
-    mountdir::String="static"; 
-    headers::Vector=[], 
-    loadfile::Nullable{Function}=nothing
-) = Nitro.Core.staticfiles(CONTEXT[], CONTEXT[].service.router, folder, mountdir; headers, loadfile)
+    folder::String,
+    mountdir::String="static";
+    headers::Vector=[],
+    loadfile::Nullable{Function}=nothing,
+    include_hidden::Bool=false,
+    allow_symlink_escape::Bool=false
+) = Nitro.Core.staticfiles(CONTEXT[], CONTEXT[].service.router, folder, mountdir; headers, loadfile, include_hidden, allow_symlink_escape)
 
 
 """
-    spafiles(folder::String, mountdir::String="static"; headers::Vector=[], loadfile::Nullable{Function}=nothing)
+    spafiles(folder::String, mountdir::String="static"; headers::Vector=[], loadfile::Nullable{Function}=nothing,
+             include_hidden::Bool=false, allow_symlink_escape::Bool=false)
 
-Mount all files inside the /static folder (or user defined mount point) for a Single Page Application (SPA).
-In addition to registering all files, it also registers a catch-all route `/*` that serves `index.html` 
-for any unmatched requests, enabling SPA History Mode routing.
+Mount `folder` for a Single Page Application. In addition to registering its servable files, this
+registers a catch-all route under `mountdir` that serves `index.html` for any unmatched request,
+enabling SPA History Mode routing.
+
+Which files are servable — and the `include_hidden` / `allow_symlink_escape` opt-outs — is described
+in [`staticfiles`](@ref); the same rules apply here. Two SPA-specific consequences:
+
+- The history-mode fallback is registered **only if `index.html` itself is servable.** If it is
+  refused (an escaping symlink, say), the fallback is skipped and a warning is logged, rather than
+  serving through the mount rules on every unmatched path.
+- Because the fallback answers any unmatched path under the mount, a file that *was* refused reads
+  as `index.html` with a 200 rather than a 404. That is not a leak, but it can be confusing in logs.
 """
 spafiles(
-    folder::String, 
-    mountdir::String="static"; 
-    headers::Vector=[], 
-    loadfile::Nullable{Function}=nothing
-) = Nitro.Core.spafiles(CONTEXT[], CONTEXT[].service.router, folder, mountdir; headers, loadfile)
+    folder::String,
+    mountdir::String="static";
+    headers::Vector=[],
+    loadfile::Nullable{Function}=nothing,
+    include_hidden::Bool=false,
+    allow_symlink_escape::Bool=false
+) = Nitro.Core.spafiles(CONTEXT[], CONTEXT[].service.router, folder, mountdir; headers, loadfile, include_hidden, allow_symlink_escape)
 
 
+"""
+    dynamicfiles(folder::String, mountdir::String="static"; headers::Vector=[], loadfile::Nullable{Function}=nothing,
+                 include_hidden::Bool=false, allow_symlink_escape::Bool=false)
+
+Mount the servable files inside `folder` under `mountdir`, re-reading each one **on every request**
+so changes on disk are picked up without a restart. Use [`staticfiles`](@ref) to snapshot at startup
+instead.
+
+Which files are servable — and the `include_hidden` / `allow_symlink_escape` opt-outs — is described
+in [`staticfiles`](@ref); the same rules apply here. They are evaluated **once, at mount time**: this
+re-reads file *contents* per request, not the directory listing or the rules. Only files present at
+startup get a route, so a directory that gains files at runtime needs a handler, not a mount.
+
+That makes this the wrong tool for a directory untrusted users can write to — a file swapped for a
+symlink after startup is not re-checked. Put a reverse proxy in front of such a directory; see
+`docs/design/static-serving-boundary.md`.
+"""
 dynamicfiles(
-    folder::String, 
-    mountdir::String="static"; 
-    headers::Vector=[], 
-    loadfile::Nullable{Function}=nothing
-) = Nitro.Core.dynamicfiles(CONTEXT[], CONTEXT[].service.router, folder, mountdir; headers, loadfile)
+    folder::String,
+    mountdir::String="static";
+    headers::Vector=[],
+    loadfile::Nullable{Function}=nothing,
+    include_hidden::Bool=false,
+    allow_symlink_escape::Bool=false
+) = Nitro.Core.dynamicfiles(CONTEXT[], CONTEXT[].service.router, folder, mountdir; headers, loadfile, include_hidden, allow_symlink_escape)
 
 """
     getexternalurl()
@@ -220,7 +289,9 @@ terminate() = terminate(CONTEXT[])
 ### Setup Docs Strings ###
 
 
-for method in [:serve, :terminate, :staticfiles, :dynamicfiles,  :internalrequest]
+# `staticfiles`/`dynamicfiles`/`spafiles` are deliberately absent: they carry their own docstrings
+# above, and `Nitro.Core` has none for them, so propagating would replace real docs with a stub.
+for method in [:serve, :terminate, :internalrequest]
     eval(quote
         @doc (@doc(Nitro.Core.$method)) $method
     end)

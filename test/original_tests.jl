@@ -377,7 +377,10 @@ person = json(r, Person)
 @test person.age == 25
 
 function testfolder(prefix::String, folder::String)
-    filepaths = Nitro.Core.Util.getfiles(folder)
+    # Deliberately the same enumerator the mount uses, so the oracle and the production path cannot
+    # disagree about which files exist. What it does NOT prove is that anything is *excluded* —
+    # see the negative assertions below, and test/staticfiles_security_tests.jl.
+    filepaths = Nitro.Core.Util.mountable_files(folder)
     for path in filepaths
         link =  "/$prefix/$(relpath(path, folder))"
         r = internalrequest(HTTP.Request("GET", link))
@@ -390,6 +393,16 @@ end
     testfolder("static", "./content")
     testfolder("dynamic", "./content")
     testfolder("dynamic2", "./content")
+end
+
+@testset "Hidden files under a mount are not served" begin
+    # content/.env is a committed fixture; it must never get a route on any of the three mounts.
+    @test isfile("./content/.env")
+    for prefix in ("static", "dynamic", "dynamic2")
+        r = internalrequest(HTTP.Request("GET", "/$prefix/.env"))
+        @test r.status == 404
+        @test !occursin("FIXTURE_SECRET", text(r))
+    end
 end
 
 r = internalrequest(HTTP.Request("GET", "/file"))
