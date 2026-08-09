@@ -239,6 +239,11 @@ const STAGING_DIR = "data/tmp"
 function submit_import(req, upload::Files{FormFile})
     file = upload.payload
 
+    # Scope the task to its owner. `req.user` is `nothing` unless auth middleware
+    # ran, so check before reaching into it — the route below carries
+    # `login_required()`, which is what makes the Principal branch the real one.
+    user_id = req.user === nothing ? "anonymous" : something(req.user.id, "anonymous")
+
     # 1. Stage to disk — the UUID task_key is the real identity; the original
     #    filename is sanitized to a bare basename so it can't traverse paths.
     task_key   = "import_$(uuid4())"
@@ -248,11 +253,14 @@ function submit_import(req, upload::Files{FormFile})
 
     # 2. Offload to a background worker
     # The worker reads from disk so the request memory is freed immediately.
-    task_id = Nitro.Workers.submit_task(
+    # Returns the STORED id ("<user_id>::import_<uuid>"), not task_key — stage the
+    # file under task_key, but hand the client back what the submit returned.
+    task_id = Nitro.Workers.submit_sequential_task(
         Nitro.CONTEXT[],
         "import_queue",
         task_key,
         (task) -> MyImportModule.process(staged_path),
+        user_id,
     )
 
     # 3. Return immediately
@@ -269,7 +277,8 @@ end # module ImportHandlers
 **Routes** (`src/Routes.jl`):
 
 ```julia
-path("/api/import", ImportHandlers.submit_import, method="POST"),
+path("/api/import", ImportHandlers.submit_import, method="POST",
+     middleware=[GuardMiddleware(login_required())]),
 ```
 
 ## Sending multipart requests (client side)
