@@ -17,6 +17,7 @@ import Nitro.Workers: AbstractWorkerStore, TaskInfo, TaskStatus, TaskOptions, Se
     get_active_task, register_active_task!, deregister_active_task!,
     get_active_task_info, register_active_task_info!, deregister_active_task_info!,
     get_queue_authorizer, set_queue_authorizer!,
+    get_watch_authorizer, set_watch_authorizer!,
     get_sequential_queues, get_queue_lock, get_cleanup_scheduler, lock_tasks
 import Nitro: pormg_nitro_worker
 
@@ -312,7 +313,12 @@ end
 PormG model for the `nitro_task` table.
 
 Columns:
-- `id`           — VARCHAR(100), primary key
+- `id`           — VARCHAR(255), primary key. Holds the *scoped* task id, which under
+                   the default `:user` scope is `"<user_id>::<task_key>"`, so it needs
+                   room for both halves. `_ensure_task_table!` only issues
+                   `CREATE TABLE IF NOT EXISTS`: a database created before this column
+                   was widened keeps its old width and needs a manual `ALTER TABLE`
+                   (SQLite ignores `VARCHAR` lengths, so only Postgres/MySQL care).
 - `status`       — VARCHAR(20)
 - `progress`     — FLOAT
 - `result`       — TEXT (JSON-serialized task results)
@@ -326,7 +332,7 @@ Columns:
 function _define_task_model()
     if isdefined(PormG, :Models)
         return PormG.Models.Model("nitro_task",
-            id           = PormG.Models.CharField(max_length=100, primary_key=true),
+            id           = PormG.Models.CharField(max_length=255, primary_key=true),
             status       = PormG.Models.CharField(max_length=20),
             progress     = PormG.Models.FloatField(default=0.0),
             result       = PormG.Models.TextField(default=""),
@@ -371,6 +377,7 @@ struct PormGWorkerStore <: AbstractWorkerStore
     queue_lock::ReentrantLock
     cleanup_scheduler::Ref{Union{Nothing, CleanupScheduler}}
     queue_authorizer::Ref{Any}
+    watch_authorizer::Ref{Any}
 end
 
 function PormGWorkerStore(; model=nothing, db_key::String="db")
@@ -388,6 +395,7 @@ function PormGWorkerStore(; model=nothing, db_key::String="db")
         Dict{String, SequentialQueue}(),
         ReentrantLock(),
         Ref{Union{Nothing, CleanupScheduler}}(nothing),
+        Ref{Any}(nothing),
         Ref{Any}(nothing),
     )
 end
@@ -485,6 +493,12 @@ function get_task_info(store::PormGWorkerStore, task_id::String)
         return active_info
     end
 
+    # Log and rethrow, matching `set_task!`. Returning `nothing` here would make a
+    # failed read indistinguishable from an absent row, and `_register_or_watch!`
+    # reads absence as "this key is free" — so one swallowed connection blip would
+    # skip the cross-user authorization gate and let a caller take over someone
+    # else's task. It also swallowed `_from_db_record`'s deliberate schema-drift
+    # error, defeating the check that raises it.
     try
         result = _task_objects(store).filter("id" => task_id).first()
         if isnothing(result)
@@ -493,7 +507,7 @@ function get_task_info(store::PormGWorkerStore, task_id::String)
         return _from_db_record(result)
     catch e
         @warn "PormGWorkerStore: failed to read task" exception=(e, catch_backtrace())
-        return nothing
+        rethrow()
     end
 end
 
@@ -648,6 +662,15 @@ end
 
 function set_queue_authorizer!(store::PormGWorkerStore, authorizer)
     store.queue_authorizer[] = authorizer
+    return authorizer
+end
+
+function get_watch_authorizer(store::PormGWorkerStore)
+    return store.watch_authorizer[]
+end
+
+function set_watch_authorizer!(store::PormGWorkerStore, authorizer)
+    store.watch_authorizer[] = authorizer
     return authorizer
 end
 

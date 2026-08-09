@@ -47,6 +47,11 @@ end
 
 The client gets a task id right away and can poll for status later.
 
+!!! warning "The returned id is not the key you passed in"
+    `submit_task` and `submit_sequential_task` namespace the key by its owner, so the
+    id above is `"user-1::report-42"`, not `"report-42"`. Always poll and cancel with the
+    **returned** value. See [Task Keys And Deduplication Scope](@ref).
+
 ## Immediate vs Sequential Tasks
 
 Nitro supports two worker patterns.
@@ -56,7 +61,8 @@ Nitro supports two worker patterns.
 Use `submit_task(...)` when jobs can run independently.
 
 - suitable for parallel work
-- deduplicates by `task_key`
+- deduplicates by `task_key`, within one user by default
+- subject to the queue authorizer under the name `DEFAULT_QUEUE_NAME` (`"default"`)
 - useful for imports, exports, notifications, and one-off background processing
 
 ```julia
@@ -150,7 +156,9 @@ That is useful in custom bootstraps, test setup, or app wrappers that manage the
 
 ## Polling Task Status
 
-Worker jobs are identified by task id. You can inspect them through the worker API.
+Worker jobs are identified by the task id **returned by the submit call** — not by the
+`task_key` you passed in. Hold onto that value (or rebuild it with `scoped_task_key`) and
+use it for every read and cancel.
 
 ### `get_task_status`
 
@@ -167,7 +175,11 @@ Returns a dictionary with fields such as:
 - `:queue_name`
 
 ```julia
-status = get_task_status("report-42", "user-1")
+task_id = submit_task("report-42", () -> build_report(), "user-1")
+status = get_task_status(task_id, "user-1")
+
+# Equivalent, when the returned id was not kept:
+status = get_task_status(scoped_task_key("report-42", "user-1"), "user-1")
 ```
 
 ### `get_all_tasks`
@@ -196,10 +208,10 @@ It reports information like:
 
 ## Cancellation And Retries
 
-Tasks can be cancelled by id:
+Tasks can be cancelled by id — again, the id the submit call returned:
 
 ```julia
-cancel_task("report-42", "user-1")
+cancel_task(task_id, "user-1")
 ```
 
 Tasks can also retry on failure by passing `TaskOptions`.
@@ -219,24 +231,72 @@ submit_task(
 
 If your callback accepts `task_info`, you can update progress while the job runs.
 
+`TaskInfo.progress` is an atomic field, so assigning it raises `ConcurrencyViolationError`.
+Write it through `update_progress!`, which is the only supported path:
+
 ```julia
 task_id = submit_task("report-99", task_info -> begin
-    task_info.progress = 10.0
+    update_progress!(task_info, 10)
     sleep(1)
-    task_info.progress = 60.0
+    update_progress!(task_info, 60)
     sleep(1)
-    task_info.progress = 100.0
+    update_progress!(task_info, 100)
     return "done"
 end, "user-1")
 ```
 
 Clients can then poll `get_task_status(task_id)` and read `:progress`.
 
-## Choosing Good Task Keys
+## Task Keys And Deduplication Scope
 
-Task ids are also deduplication keys.
+Task ids are also deduplication keys, so their scope decides who can collide with whom.
+Watcher membership is what grants the right to read a task's `:result` and to cancel it —
+which means a key that two users can both produce is a key that leaks between them.
 
-If you submit the same `task_key` while the task is already `PENDING` or `RUNNING`, Nitro attaches the caller as another watcher instead of starting duplicate work.
+### `:user` scope (the default)
+
+The key is namespaced by its owner, so `submit_task` returns `"<user_id>::<task_key>"`:
+
+```julia
+a = submit_task("export_report_42", cb, "user-a")   # "user-a::export_report_42"
+b = submit_task("export_report_42", cb, "user-b")   # "user-b::export_report_42"
+```
+
+Two independent tasks. Deduplication still collapses one user's repeat submissions onto
+their own running job, but nothing crosses the user boundary. This is what you want for
+keys derived from resource ids, which are rarely secret.
+
+Rebuild the id with `scoped_task_key` if you did not keep the return value:
+
+```julia
+scoped_task_key("export_report_42", "user-a")   # "user-a::export_report_42"
+```
+
+A `user_id` may not contain `::`, and may not end in `:`. Both rules exist so that two
+different `(user, key)` pairs can never resolve to the same id — without the second,
+`(":report", "alice")` and `("report", "alice:")` would collide on `"alice:::report"`. A
+colon anywhere else in the owner (`"google:12345"`) is fine.
+
+### `:global` scope
+
+Opt in when one expensive job really should be shared across users — a cache warm, a
+nightly rollup, a tenant-wide index rebuild:
+
+```julia
+task_id = submit_task("warm-price-cache", cb, user_id; scope=:global)
+```
+
+The key is stored verbatim, so any user can name it. A caller who is **not already a
+watcher** is refused with `AuthorizationError`, whether the task is still running (joining
+it would hand over read and cancel rights) or already finished (re-running it would discard
+the owner's stored result). To allow sharing, install a watch authorizer — see
+[Queue And Watch Authorization](@ref).
+
+A `:global` key may not contain `::`. That keeps the two namespaces disjoint: without the
+restriction, submitting `"victim::export_42"` globally would produce exactly the id
+`victim`'s own `:user`-scoped `"export_42"` resolves to, and squat it.
+
+### Picking keys
 
 Use stable keys when duplicate work should collapse into one job:
 
@@ -298,11 +358,11 @@ task_id = submit_task("report-42", run_report, "user-1"; store=worker_store)
 status = get_task_status(task_id, "user-1"; store=worker_store)
 ```
 
-## User Access Control & Queue Authorization
+## User Access Control
 
 To support multitenant backends, Nitro.jl workers include built-in authorization mechanisms.
 
-### 1. Task Ownership & Watchers
+### Task Ownership & Watchers
 Task submission functions require a `user_id`, and that user is registered as the task's first **watcher**.
 - Status, cancellation, and listing functions accept an optional `user_id` parameter.
 - Passing a non-empty `user_id` enforces watcher-based access. Only task owners or designated watchers can query or cancel a task; unauthorized users get an `AuthorizationError`.
@@ -327,8 +387,17 @@ catch err
 end
 ```
 
-### 2. Queue Authorization
-You can restrict access to specific sequential queues globally using queue authorizers:
+Because watcher membership is the whole gate, a user does not become a watcher of a task
+they did not create just by naming its key. Under the default `:user` scope they cannot
+name it at all; under `:global` scope they are refused unless a watch authorizer says
+otherwise.
+
+## Queue And Watch Authorization
+
+Two independent hooks, installed on the store.
+
+### Queue authorization
+Restrict who may submit to a queue:
 
 ```julia
 function my_queue_authorizer(queue_name::String, user_id::String)::Bool
@@ -341,6 +410,42 @@ end
 
 set_queue_authorizer!(worker_store, my_queue_authorizer)
 ```
+
+This runs on **both** submit paths. `submit_sequential_task` passes the queue it was given;
+`submit_task` has no sequential queue, so it passes `DEFAULT_QUEUE_NAME` (`"default"`),
+following the convention every comparable queue uses. An authorizer written as an allowlist
+must therefore permit `"default"`, or `submit_task` is closed to everyone:
+
+```julia
+set_queue_authorizer!(worker_store, (queue_name, user_id) ->
+    queue_name == DEFAULT_QUEUE_NAME || queue_name in queues_for(user_id))
+```
+
+### Watch authorization
+Decide who may join or reuse a `:global` task key someone else already owns:
+
+```julia
+# Decide from data already in memory — see the warning below.
+set_watch_authorizer!(worker_store, function(task_key, watchers, user_id)
+    return ORG_OF[first(watchers)] == ORG_OF[user_id]
+end)
+```
+
+Without this hook, cross-user submission of an existing `:global` key is refused. `watchers`
+is a copy, so mutating it has no effect.
+
+!!! warning "The hook runs under the store's task lock"
+    That lock also serializes `set_task!`, `cancel_task`, and zombie recovery, so blocking
+    inside the hook stalls the whole worker subsystem. Make it a pure in-memory predicate:
+    no database queries, and never `fetch` a spawned task that touches the same store — the
+    child cannot take a `ReentrantLock` its parent holds, so that deadlocks. Resolve
+    org/tenant membership into memory before installing the hook.
+
+!!! note "Re-running a finished shared key resets its watchers"
+    A terminal task is replaced, not resumed, so the new submitter becomes the only watcher.
+    Everyone else holding that id starts getting `AuthorizationError` until the hook
+    re-approves them — and a pure status-polling route never re-submits, so it cannot
+    re-approve itself. Give shared ids a short life, or re-submit rather than only poll.
 
 ## Startup Zombie Task Recovery (Option B)
 
@@ -367,5 +472,7 @@ Use `Nitro.Workers` when you need lightweight or persistent background execution
 - use `user_id` on submission, and pass it to read/manage APIs when routes are user-scoped
 - use `submit_task(...)` for parallel jobs
 - use `submit_sequential_task(...)` for ordered queue processing
+- read and cancel with the id the submit call **returned**, not the `task_key` you passed
+- use `scope=:global` only when a job is genuinely shared, and pair it with `set_watch_authorizer!`
 - use `get_task_status(...)` and `get_queue_status(...)` to monitor work
 - use `TaskOptions(...)` for retries and timeouts

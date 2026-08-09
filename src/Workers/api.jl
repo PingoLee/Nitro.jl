@@ -110,18 +110,99 @@ function startup(ctx::ServerContext;
     return LifecycleMiddleware(; middleware=passthrough, on_startup, on_shutdown)
 end
 
+"""
+    scoped_task_key(task_key, user_id; scope=:user) -> String
+
+Resolve the caller-supplied `task_key` to the id a task is actually stored under.
+
+Task ids double as deduplication keys, so their scope decides who can collide with
+whom:
+
+- `:user` (the default) prefixes the key with its owner, so two users submitting
+  `"export_42"` get two independent tasks and neither can reach the other's.
+- `:global` stores the key verbatim, giving system-wide deduplication. A caller who
+  is not already a watcher of an existing global key is refused unless the store's
+  watch authorizer allows it — see [`set_watch_authorizer!`](@ref).
+
+`submit_task` and `submit_sequential_task` return the resolved id; pass *that* to
+`get_task_status` and `cancel_task`, which enforce watcher access when given a
+`user_id`. (`is_task_running` also takes a resolved id, but performs no authorization
+at all — it is an existence probe, not a user-scoped read.) Use this function when the
+return value was not kept.
+
+Throws `ArgumentError` for an unknown `scope`, or when `$(TASK_KEY_DELIMITER)` appears
+where it would break the invariant that **a `:user` id and a `:global` id can never be
+the same string**. Both halves of that are load-bearing:
+
+- a `:user`-scoped `user_id` may neither contain `$(TASK_KEY_DELIMITER)` nor end in `:`;
+- a `:global` `task_key` may not contain `$(TASK_KEY_DELIMITER)` at all, or a caller could
+  submit `"victim$(TASK_KEY_DELIMITER)report"` globally and squat the id `victim`'s own
+  `:user`-scoped `"report"` resolves to.
+
+A `:user`-scoped `task_key` *may* contain the delimiter — the two rules above are exactly
+what make the split unambiguous anyway. Barring `$(TASK_KEY_DELIMITER)` alone is not
+enough: `(":report", "alice")` and `("report", "alice:")` would both resolve to
+`"alice:::report"`. That is the *only* such collision — matching
+`u₁ ‖ :: ‖ k₁ == u₂ ‖ :: ‖ k₂` with neither owner containing `::` forces `u₂ == u₁ * ":"`
+— so rejecting a trailing `:` closes it completely, and a colon anywhere else in an owner
+(`"google:12345"`) stays legal.
+"""
+function scoped_task_key(task_key::AbstractString, user_id::AbstractString; scope::Symbol=:user)
+    if scope === :global
+        if occursin(TASK_KEY_DELIMITER, task_key)
+            throw(ArgumentError(
+                "a :global task_key must not contain '$TASK_KEY_DELIMITER': it would collide with the :user-scoped id namespace"))
+        end
+        return String(task_key)
+    elseif scope !== :user
+        throw(ArgumentError("scope must be :user or :global, got :$scope"))
+    end
+
+    if occursin(TASK_KEY_DELIMITER, user_id) || endswith(user_id, ":")
+        throw(ArgumentError(
+            "user_id '$user_id' must not contain '$TASK_KEY_DELIMITER' or end in ':': that would make the owner half of a :user-scoped task id ambiguous"))
+    end
+
+    return string(user_id, TASK_KEY_DELIMITER, task_key)
+end
+
+function _authorize_queue!(store::AbstractWorkerStore, queue_name::String, user_id::String)
+    authorizer = get_queue_authorizer(store)
+    if authorizer !== nothing && !(Base.invokelatest(authorizer, queue_name, user_id)::Bool)
+        throw(AuthorizationError("User '$user_id' is not authorized to submit tasks to queue '$queue_name'"))
+    end
+    return nothing
+end
+
+# Watcher membership is what grants read and cancel rights, so joining an existing
+# task the caller does not already watch is an authorization decision, not a
+# bookkeeping one. Denied unless the store opts in.
+function _watch_allowed(store::AbstractWorkerStore, task_key::String, watchers::Vector{String}, user_id::String)
+    authorizer = get_watch_authorizer(store)
+    authorizer === nothing && return false
+    return Base.invokelatest(authorizer, task_key, watchers, user_id)::Bool
+end
+
 function _register_or_watch!(store::AbstractWorkerStore, task_key::String, user_id::String; queue_name::Union{Nothing, String}=nothing)
     return lock_tasks(store) do
-        should_start = false
         task_info = get_task_info(store, task_key)
-        if task_info !== nothing
-            if task_info.status in (RUNNING, PENDING)
-                if !(user_id in task_info.watchers)
-                    push!(task_info.watchers, user_id)
-                    set_task!(store, task_key, task_info)
-                end
-                return false
+
+        # Gates both branches below: joining a live task grants the caller the
+        # owner's read/cancel rights, and replacing a finished one destroys the
+        # owner's stored result. `copy` keeps an app callback off the live list.
+        if task_info !== nothing && !(user_id in task_info.watchers)
+            if !_watch_allowed(store, task_key, copy(task_info.watchers), user_id)
+                throw(AuthorizationError(
+                    "User '$user_id' is not authorized to join or reuse task '$task_key'"))
             end
+        end
+
+        if task_info !== nothing && task_info.status in (RUNNING, PENDING)
+            if !(user_id in task_info.watchers)
+                push!(task_info.watchers, user_id)
+                set_task!(store, task_key, task_info)
+            end
+            return false
         end
 
         task_info = TaskInfo(task_key; queue_name)
@@ -173,9 +254,23 @@ function _execute_task_async(store::AbstractWorkerStore, task_key::String, callb
     return task
 end
 
-function submit_task(task_key::AbstractString, callback::Function, user_id::AbstractString; options::TaskOptions=TaskOptions(), store::AbstractWorkerStore=default_store())
-    key = String(task_key)
+"""
+    submit_task(task_key, callback, user_id; scope=:user, options=TaskOptions(), store=default_store())
+
+Run `callback` on its own task and return the id it was stored under.
+
+`scope` decides how `task_key` is namespaced — see [`scoped_task_key`](@ref). The
+returned id is what `get_task_status` and `cancel_task` expect; under the default
+`:user` scope it is *not* the `task_key` that was passed in.
+
+Unqueued tasks are still submissions, so the store's queue authorizer applies under
+the name `$(DEFAULT_QUEUE_NAME)`.
+"""
+function submit_task(task_key::AbstractString, callback::Function, user_id::AbstractString; scope::Symbol=:user, options::TaskOptions=TaskOptions(), store::AbstractWorkerStore=default_store())
     uid = String(user_id)
+    _authorize_queue!(store, DEFAULT_QUEUE_NAME, uid)
+
+    key = scoped_task_key(task_key, uid; scope)
     should_start = _register_or_watch!(store, key, uid)
     if should_start
         _execute_task_async(store, key, callback, options)
@@ -183,24 +278,28 @@ function submit_task(task_key::AbstractString, callback::Function, user_id::Abst
     return key
 end
 
-function submit_task(ctx::ServerContext, task_key::AbstractString, callback::Function, user_id::AbstractString; options::TaskOptions=TaskOptions(), key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
+function submit_task(ctx::ServerContext, task_key::AbstractString, callback::Function, user_id::AbstractString; scope::Symbol=:user, options::TaskOptions=TaskOptions(), key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
     resolved_store = _resolve_store(ctx; key, store)
-    return submit_task(task_key, callback, user_id; options, store=resolved_store)
+    return submit_task(task_key, callback, user_id; scope, options, store=resolved_store)
 end
 
-function submit_sequential_task(queue_name::AbstractString, task_key::AbstractString, callback::Function, user_id::AbstractString; options::TaskOptions=TaskOptions(), store::AbstractWorkerStore=default_store())
+"""
+    submit_sequential_task(queue_name, task_key, callback, user_id; scope=:user, options=TaskOptions(), store=default_store())
+
+Queue `callback` for one-at-a-time execution on `queue_name` and return the id it was
+stored under.
+
+Identical to [`submit_task`](@ref) in how `scope` namespaces `task_key` and in what the
+return value is for; the difference is ordered execution and that the queue authorizer
+sees the real `queue_name`.
+"""
+function submit_sequential_task(queue_name::AbstractString, task_key::AbstractString, callback::Function, user_id::AbstractString; scope::Symbol=:user, options::TaskOptions=TaskOptions(), store::AbstractWorkerStore=default_store())
     queue_id = String(queue_name)
     uid = String(user_id)
 
-    # Queue Authorization
-    authorizer = get_queue_authorizer(store)
-    if authorizer !== nothing
-        if !Base.invokelatest(authorizer, queue_id, uid)
-            throw(AuthorizationError("User '$uid' is not authorized to submit tasks to queue '$queue_id'"))
-        end
-    end
+    _authorize_queue!(store, queue_id, uid)
 
-    key = String(task_key)
+    key = scoped_task_key(task_key, uid; scope)
     should_start = _register_or_watch!(store, key, uid; queue_name=queue_id)
     if should_start
         _start_queue_processor(store, queue_id)
@@ -210,9 +309,9 @@ function submit_sequential_task(queue_name::AbstractString, task_key::AbstractSt
     return key
 end
 
-function submit_sequential_task(ctx::ServerContext, queue_name::AbstractString, task_key::AbstractString, callback::Function, user_id::AbstractString; options::TaskOptions=TaskOptions(), key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
+function submit_sequential_task(ctx::ServerContext, queue_name::AbstractString, task_key::AbstractString, callback::Function, user_id::AbstractString; scope::Symbol=:user, options::TaskOptions=TaskOptions(), key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
     resolved_store = _resolve_store(ctx; key, store)
-    return submit_sequential_task(queue_name, task_key, callback, user_id; options, store=resolved_store)
+    return submit_sequential_task(queue_name, task_key, callback, user_id; scope, options, store=resolved_store)
 end
 
 function get_task_status(task_id::AbstractString, user_id::Union{Nothing, AbstractString}=nothing; store::AbstractWorkerStore=default_store())

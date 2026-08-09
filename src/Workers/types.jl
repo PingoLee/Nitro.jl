@@ -2,6 +2,28 @@
 
 current_time_utc() = Dates.now(Dates.UTC)
 
+"""
+    DEFAULT_QUEUE_NAME
+
+Queue name that [`submit_task`](@ref) authorizes against. Unqueued tasks do not
+run through a `SequentialQueue`, but they are still submissions, so they are
+still subject to the store's queue authorizer — under this name, following the
+default-queue convention every comparable queue uses (Sidekiq `default`, River
+`QueueDefault`).
+
+A `TaskInfo.queue_name` stays `nothing` for these tasks: that field records the
+*sequential* queue a task belongs to, and an unqueued task belongs to none.
+"""
+const DEFAULT_QUEUE_NAME = "default"
+
+"""
+    TASK_KEY_DELIMITER
+
+Separator between the owner and the caller-supplied key in a `:user`-scoped task
+id. `user_id` may not contain it; see [`scoped_task_key`](@ref).
+"""
+const TASK_KEY_DELIMITER = "::"
+
 mutable struct TaskInfo
     id::String
     status::TaskStatus
