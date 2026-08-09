@@ -4,6 +4,9 @@ using Dates
 using Sockets
 using Nitro
 
+port = get_free_port()
+localhost = "http://$HOST:$port"
+
 urlpatterns("/limited",
     path("/goodbye", function() return "goodbye" end, method="GET",
         middleware=[RateLimiter(rate_limit=25, window=Second(3))]),
@@ -15,7 +18,7 @@ urlpatterns("",
 )
 
 # Create a rate limiter with realistic limits for testing (100 requests per second)
-serve(middleware=[RateLimiter(rate_limit=100, window=Second(3))], port=PORT, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
+serve(middleware=[RateLimiter(rate_limit=100, window=Second(3))], port=port, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
 
 @testset "Rate Limiter Tests" begin
 
@@ -59,7 +62,7 @@ terminate()
 
 
 # Create a server without global middleware but with route-level middleware on /limited/*
-serve(port=PORT, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
+serve(port=port, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
 
 # Warm up the route + middleware code paths before the timed bursts below, so first-request
 # JIT compilation isn't spent inside the 3s rate-limit window. These warmup hits age out of
@@ -148,7 +151,7 @@ terminate()
 rl = RateLimiter(rate_limit=1, window=Hour(1), cleanup_period=Second(1), cleanup_threshold=Second(1))
 
 # Start server for background cleanup test
-serve(middleware=[rl], port=PORT, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
+serve(middleware=[rl], port=port, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
 
 @testset "Background Cleanup Test" begin
 
@@ -195,7 +198,7 @@ urlpatterns("",
     path("/exempt",  function() return "exempt" end,  method="GET"),
 )
 
-serve(middleware=[RateLimiter(rate_limit=10, window=Second(1), exempt_paths=["/exempt"])], port=PORT, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
+serve(middleware=[RateLimiter(rate_limit=10, window=Second(1), exempt_paths=["/exempt"])], port=port, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
 
 @testset "Exempt Paths Test" begin
     # First request to /limited should succeed with headers
@@ -246,7 +249,7 @@ sleep(3.1) # ensure any prior window/cleanup state is gone
 
 # Default: no trust configured → X-Forwarded-For is IGNORED. Distinct forwarded
 # client IPs all collapse onto the proxy's socket IP and share a single bucket.
-serve(middleware=[RateLimiter(rate_limit=3, window=Second(5))], port=PORT, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
+serve(middleware=[RateLimiter(rate_limit=3, window=Second(5))], port=port, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
 
 @testset "Proxied: forwarding headers ignored by default (shared bucket)" begin
     # Three requests, each claiming a different client IP, consume the SAME quota
@@ -276,7 +279,7 @@ sleep(3.1)
 serve(middleware=[RateLimiter(rate_limit=2, window=Second(5),
         forwarded_header=:x_forwarded_for,
         trusted_proxies=[ip"127.0.0.1", ip"::1"])],
-    port=PORT, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
+    port=port, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
 
 @testset "Proxied: trusted_proxies honors per-client X-Forwarded-For" begin
     # Each distinct forwarded client gets its own bucket of `rate_limit` requests.
@@ -308,7 +311,7 @@ sleep(3.1)
 serve(middleware=[RateLimiter(rate_limit=2, window=Second(5),
         forwarded_header=:x_forwarded_for,
         trusted_proxies=[ip"127.0.0.1", ip"::1"])],
-    port=PORT, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
+    port=port, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
 
 @testset "Proxied: rotating a spoofed X-Forwarded-For prefix cannot buy quota" begin
     real_client = "203.0.113.20"

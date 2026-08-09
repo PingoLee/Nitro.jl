@@ -3,10 +3,11 @@ using HTTP
 
 
 export PACKAGE_DIR,
-    GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS, CONNECT, TRACE, 
+    GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS, CONNECT, TRACE,
     HTTP_METHODS,
     WEBSOCKET, STREAM,
-    SPECIAL_METHODS, METHOD_ALIASES, TYPE_ALIASES
+    SPECIAL_METHODS, METHOD_ALIASES, TYPE_ALIASES,
+    SHUTDOWN_TIMEOUT_SECONDS
 
 # Generate a reliable path to our package directory
 const PACKAGE_DIR = @__DIR__
@@ -41,5 +42,16 @@ const TYPE_ALIASES :: Dict{String, Type} = Dict(
     WEBSOCKET   => HTTP.WebSockets.WebSocket,
     STREAM      => HTTP.Stream
 )
+
+"""
+Default ceiling, in seconds, on `terminate()`'s graceful drain before Nitro force-closes
+whatever connections are left.
+
+Ten seconds is far more than a healthy shutdown needs — the drain is normally milliseconds,
+since it only has to reap idle keep-alive connections — while still bounding a pathological
+shutdown to something a CI job survives. Override per server with `serve(shutdown_timeout = …)`
+or per call with `terminate(timeout = …)`.
+"""
+const SHUTDOWN_TIMEOUT_SECONDS :: Float64 = 10.0
 
 end

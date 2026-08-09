@@ -135,10 +135,28 @@ change is committable and would break every other checkout.
 
 Items tagged `:network` bind real sockets. Failure shapes:
 
-- **Address already in use** — a previous run's server did not shut down. Look for an orphaned Julia
-  process; `terminate()` is what tests should call in cleanup.
-- **Two suites at once** — a second `Pkg.test()` in another terminal or worktree competing for the
-  same fixed port. Run one at a time.
+- **A test answering from routes it never registered** — e.g. `precompilation_test.jl` receiving
+  `"home"`, which `extractor_tests.jl` registers on the global router. This and *address already in
+  use* are the same failure, and the mechanism ([#73](https://github.com/PingoLee/Nitro.jl/issues/73))
+  is worth knowing because it presents as an unrelated assertion error in whichever item happened to
+  be running. Before the fix, `terminate()` could hang forever: `HTTP.close(::Server)` releases the
+  listener and then loops until every tracked connection is gone, force-closing only *idle* ones —
+  and HTTP 2.4 never marks a connection `HIJACKED`, so a WebSocket/SSE/STREAM handler (or a
+  `terminate()` called from *inside* a handler) pinned its connection `ACTIVE` and that loop never
+  ended. With `nworkers = 0` — the default, and what CI runs — ReTestItems applies **no** per-item
+  timeout, so the run wedged, someone killed it, and the orphaned child kept the port. On Windows
+  `SO_REUSEADDR` then let the next run bind the *same* port alongside the corpse, splitting traffic
+  between two routers instead of failing.
+  Now: `terminate()` is a bounded drain then a force-close (`serve(shutdown_timeout=…)` /
+  `terminate(timeout=…)`, default 10s), Nitro passes `reuseaddr=false` on Windows so a real conflict
+  fails loudly, and `test/runtests.jl` runs `terminate()` in ReTestItems' `test_end_expr` after every
+  item. If it recurs, check for an orphan from an older build (`netstat -ano | grep :<port>`), and
+  whether something passed an explicit `reuseaddr=true`.
+- **No test may use a fixed port.** `PORT`/`localhost` were deliberately removed from `NitroCommon` —
+  a shared constant is what let one run's leftovers answer the next run. Call `get_free_port()` and
+  build your own `localhost = "http://$HOST:$port"`.
+- **Two suites at once** — a second `Pkg.test()` in another terminal or worktree. Still run one at a
+  time: free ports remove the *fixed*-port collision, not contention for machine resources.
 - **Connection refused right after `serve(async=true)`** — the server had not finished binding.
   Tests should wait on readiness rather than sleeping a fixed interval.
 - Windows and macOS runners are slower to bind than Linux; a timeout tuned on Linux may be too tight.

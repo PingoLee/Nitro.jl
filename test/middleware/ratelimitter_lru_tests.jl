@@ -3,6 +3,9 @@ using HTTP
 using Dates
 using Nitro
 
+port = get_free_port()
+localhost = "http://$HOST:$port"
+
 urlpatterns("/limited",
     path("/goodbye", function() return "goodbye" end, method="GET",
         middleware=[RateLimiter(strategy=:sliding_window, rate_limit=25, window=Second(3))]),
@@ -23,7 +26,7 @@ urlpatterns("",
 #   • recovery uses rate_limit=1 so it only ever issues single requests.
 
 # ── Enforcement: limit is applied and the remaining counter decrements ─────────
-serve(middleware=[RateLimiter(strategy=:sliding_window, rate_limit=3, window=Minute(1))], port=PORT, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
+serve(middleware=[RateLimiter(strategy=:sliding_window, rate_limit=3, window=Minute(1))], port=port, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
 
 @testset "Sliding Window Enforcement" begin
     # First request: verify headers and remaining countdown start
@@ -56,7 +59,7 @@ terminate()
 sleep(1)  # let the port free up before re-binding
 
 # ── Recovery: a slot frees up once its window elapses ──────────────────────────
-serve(middleware=[RateLimiter(strategy=:sliding_window, rate_limit=1, window=Second(3))], port=PORT, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
+serve(middleware=[RateLimiter(strategy=:sliding_window, rate_limit=1, window=Second(3))], port=port, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
 
 @testset "Sliding Window Recovery" begin
     # First request consumes the only slot
@@ -83,7 +86,7 @@ terminate()
 
 
 # Create a server without global middleware but with route-level middleware on /limited/*
-serve(port=PORT, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
+serve(port=port, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
 
 # Warm up the route + middleware code paths before the timed bursts below, so first-request
 # JIT compilation isn't spent inside the 3s rate-limit window. These warmup hits age out of
@@ -175,7 +178,7 @@ urlpatterns("",
     path("/exempt",  function() return "exempt" end,  method="GET"),
 )
 
-serve(middleware=[RateLimiter(strategy=:sliding_window, rate_limit=10, window=Second(1), exempt_paths=["/exempt"])], port=PORT, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
+serve(middleware=[RateLimiter(strategy=:sliding_window, rate_limit=10, window=Second(1), exempt_paths=["/exempt"])], port=port, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
 
 @testset "Exempt Paths Test" begin
     # First request to /limited should succeed with headers
@@ -224,7 +227,7 @@ urlpatterns("",
     path("/notexempt", function() return "notexempt" end, method="GET"),
 )
 
-serve(middleware=[RateLimiter(strategy=:sliding_window, rate_limit=5, window=Second(1), exempt_paths=["/exempt1", "/exempt2"])], port=PORT, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
+serve(middleware=[RateLimiter(strategy=:sliding_window, rate_limit=5, window=Second(1), exempt_paths=["/exempt1", "/exempt2"])], port=port, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
 
 @testset "Multiple Exempt Paths Test" begin
     # First 5 requests to /limited should succeed

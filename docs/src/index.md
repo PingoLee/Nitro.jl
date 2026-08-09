@@ -5,6 +5,8 @@ Nitro is a Julia web framework built on HTTP.jl.
 The public API documented here is:
 
 - `serve()` for starting the server
+- `terminate()` for graceful shutdown — a bounded drain of in-flight requests, tuned with
+  `serve(shutdown_timeout=…)` or `terminate(timeout=…)`
 - `serve(revise=:lazy)` and `serve(revise=:eager)` for optional development hot reload with `Revise.jl`
 - `path()`, `urlpatterns()`, and `include_routes()` for route registration
 - `req.params`, `req.query`, `req.json`, `req.form`, `req.input`, `req.session`, `req.user`, and `req.ip` for request ergonomics

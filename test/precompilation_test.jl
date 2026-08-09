@@ -7,8 +7,11 @@ using Nitro: text
 push!(LOAD_PATH, joinpath(@__DIR__, ".TestPackage"))
 using TestPackage
 
+port = get_free_port()
+localhost = "http://$HOST:$port"
+
 # call the start function from the TestPackage
-start(;async=true, host=HOST, port=PORT, show_banner=false, access_log=nothing)
+start(;async=true, host=HOST, port=port, show_banner=false, access_log=nothing)
 
 @testset "TestPackage" begin
 

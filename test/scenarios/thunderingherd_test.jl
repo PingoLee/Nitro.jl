@@ -2,6 +2,9 @@
 using HTTP
 using Nitro
 
+port = get_free_port()
+localhost = "http://$HOST:$port"
+
 allowed_origins = [ "Access-Control-Allow-Origin" => "*" ]
 
 cors_headers = [
@@ -29,7 +32,7 @@ urlpatterns("",
 )
 
 serve(
-    port = PORT, 
+    port = port,
     host = HOST, 
     async = true, 
     show_errors = false, 

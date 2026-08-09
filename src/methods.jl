@@ -18,8 +18,16 @@ function context()
     return ismissing(app_ctx) ? missing : app_ctx.payload
 end
 
-function serve(; kwargs...) 
+function serve(; kwargs...)
     async = Base.get(kwargs, :async, false)
+    # Whether the server this `finally` would tear down is OURS to tear down. Decided from
+    # the context *before* the call, not from a flag set after it: if something is already
+    # serving, `Core.serve` rejects this call and that server belongs to somebody else —
+    # terminating it here would do the very thing the rejection message asks the caller to do
+    # deliberately, making a refused `serve()` lethal to a healthy one. Reading the context up
+    # front also still cleans up when a throw lands *after* the handle was installed, which a
+    # post-hoc `started = true` would miss.
+    ours = !isopen(CONTEXT[].service)
     try
         # Returns the running `HTTP.Server` when async; `nothing` in blocking mode (the
         # server is already down by then, so the handle would be useless). Either way the
@@ -28,9 +36,9 @@ function serve(; kwargs...)
         return Nitro.Core.serve(CONTEXT[]; kwargs...)
     finally
         # close server on exit if we aren't running asynchronously
-        if !async 
+        if !async && ours
             terminate()
-            # only reset state on exit if we aren't running asynchronously & are running it interactively 
+            # only reset state on exit if we aren't running asynchronously & are running it interactively
             isinteractive() && resetstate()
         end
     end
@@ -276,14 +284,12 @@ end
 
 ### Terminate Function ###
 
-"""
-    terminate(context::ServerContext)
-    terminate()
-
-Terminate the server and stop all running tasks.
-"""
-terminate(context::ServerContext) = Nitro.Core.terminate(context)
-terminate() = terminate(CONTEXT[])
+# No docstring here on purpose: the loop below reassigns `@doc(Nitro.Core.terminate)` onto this
+# binding, so anything written here is silently discarded (it is why `terminate` rendered with an
+# empty body in `docs/src/api.md`). The canonical docstring lives on `Nitro.Core.terminate`.
+terminate(context::ServerContext; timeout::Nullable{Real} = nothing) =
+    Nitro.Core.terminate(context; timeout)
+terminate(; timeout::Nullable{Real} = nothing) = terminate(CONTEXT[]; timeout)
 
 
 ### Setup Docs Strings ###
