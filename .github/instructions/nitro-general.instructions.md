@@ -222,7 +222,7 @@ it, so every worktree shares one marketplace entry.
 | `nitro-test-troubleshooting` | [`.github/skills/nitro-test-troubleshooting/SKILL.md`](../skills/nitro-test-troubleshooting/SKILL.md) | A test is red, flaky, or order-dependent and it isn't an obvious regression |
 | `deploy-checklist` | [`.github/skills/deploy-checklist/SKILL.md`](../skills/deploy-checklist/SKILL.md) | Pre-production env, deps, proxy, and test audit |
 | `nitro-issue-management` | [`.github/skills/nitro-issue-management/SKILL.md`](../skills/nitro-issue-management/SKILL.md) | GitHub backlog: file/label/close issues (`pre-publish` gating label) |
-| `nitro-issue-workflow` | [`.github/skills/nitro-issue-workflow/SKILL.md`](../skills/nitro-issue-workflow/SKILL.md) | Work issue #N end-to-end: provenance, scope, worktree, verify rungs, independent review, land, close out |
+| `nitro-issue-workflow` | [`.github/skills/nitro-issue-workflow/SKILL.md`](../skills/nitro-issue-workflow/SKILL.md) | Work issue #N end-to-end at a `quick`/`standard`/`high` tier: provenance, scope, isolation, verify rungs, review, land, close out |
 | `nitro-cut-release` | [`.github/skills/nitro-cut-release/SKILL.md`](../skills/nitro-cut-release/SKILL.md) | Cut a release train: bump `Project.toml` once, stamp the `UPGRADING.md` entries, tag (maintainer-invoked) |
 
 Editing Nitro itself → the area's deep-dive rule file, plus `add-route` for new endpoints. Writing

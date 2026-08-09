@@ -8,6 +8,21 @@ using ..Types: Nullable, LifecycleMiddleware, CopyOnWriteDict, snapshot, cache!,
 
 export router, compose, genkey, process_middleware, HOFRouter, OuterRouter, InnerRouter
 
+# Shared read-only stand-in for "this route has no middleware of that kind". `foldlayers` only
+# ever appends *from* it, never to it, so one instance is safe to share.
+#
+# The win is allocation, not inference: a fresh `[]` per sanitized slot cost a `Vector{Any}` on
+# every `buildmiddleware` call. (It does NOT make the destructure type-stable — the values come
+# out of a `Dict{String,Tuple}` whose `Tuple` is abstract, so both slots infer as `Any` either
+# way. That is #76's territory.) Measured: 224 -> 192 bytes with route middleware present,
+# 192 -> 128 without.
+const EMPTY_LAYERS = Function[]
+
+# "This slot carries at least one middleware." Both registrars gate on this rather than on
+# `!isnothing`, so that an explicit `middleware=[]` — which normalizes to `Function[]`, not
+# `nothing` — does not publish a zero-layer entry and disable the fast path app-wide.
+_has_layers(mw) = !isnothing(mw) && !isempty(mw)
+
 """
     normalize_middleware(middleware::Vector) -> Vector{Function}
 
@@ -70,12 +85,14 @@ end
 
 # Do nothing if we have no middleware to append.
 #
-# Returns `nothing`, NOT `Function[]`, and that is load-bearing twice over: callers store the
-# result into the `Nullable{Vector}` fields of `OuterRouter`/`InnerRouter`, and the guard in
-# `(inner::InnerRouter)(http_method)` below reads those fields via `isnothing`. Return `[]`
-# here and that guard becomes always-true, so every HOF route publishes a
-# `(Function[], Function[])` entry into `custommiddleware` — which makes the table non-empty
-# and installs `compose` for apps that have no per-route middleware at all.
+# Returns `nothing`, NOT `Function[]`, and that is load-bearing twice over. Primarily: callers
+# store the result into the `Nullable{Vector}` fields of `OuterRouter`/`InnerRouter`, and the
+# guard in `(inner::InnerRouter)(http_method)` below reads those fields via `isnothing`. Return
+# `[]` here and that guard becomes always-true, so every HOF route publishes a
+# `(Function[], Function[])` entry into `custommiddleware`. Secondarily, and sharper since #71:
+# those entries contribute zero layers but make the table permanently non-empty, which defeats
+# `compose`'s per-request fast path for the whole app — every request would then pay a second
+# `gethandler` for nothing.
 function process_middleware(::ServerContext, ::Nothing) end
 
 
@@ -84,6 +101,72 @@ This function is used to generate dictionary keys which lookup middleware for ro
 """
 function genkey(http_method::String, path::String)::String
     return "$http_method|$path"
+end
+
+"""
+    publish_route_middleware!(ctx::ServerContext, key::String, value::Tuple) -> Tuple
+
+Register `value` — a `(router middleware, route middleware)` pair — as the middleware for route
+`key`, and invalidate any chain already cached for it.
+
+**Use this instead of writing `ctx.service.custommiddleware` directly.** Publishing alone is not
+enough: `middleware_cache` is first-writer-wins, so a chain composed before the registration
+would keep winning and the new middleware would never run — the same symptom as #71, reached
+through the cache instead of the install gate. Pairing the two here means a future write site
+cannot do one without the other.
+
+Scope: this covers *adding* or *changing* a route's middleware. It does not cover **removal** —
+re-running `urlpatterns` with no `middleware=` kwarg skips the registration branch entirely, so
+a previously-published entry and its cached chain both survive. Pre-existing, and unchanged by
+#71.
+
+**The order is load-bearing.** Publish first, invalidate second. Inverted, a concurrent request
+could miss the freshly-emptied cache, rebuild from the *old* table, and `cache!` that stale
+chain — which first-writer-wins would then make permanent, on every interleaving where the
+request's cache read lands between the two calls.
+
+This order *narrows* that window; it does not close it. A request whose `buildmiddleware`
+snapshot straddles the whole publish-and-invalidate can still cache a stale chain:
+
+    req: cache read                        -> miss
+    req: snapshot(custommiddleware)        -> OLD table
+    reg: publish!(custommiddleware, ...)
+    reg: delete!(middleware_cache, key)    -> key absent, no-op
+    req: cache!(middleware_cache, key, ..) -> stale chain, first-writer-wins, permanent
+
+Reachable only when `use_cache` is true (no global middleware at all) *and* registration races
+a live request — under `revise=:lazy|:eager` `serve` injects `ReviseHandler`, so `use_cache` is
+false and it cannot happen there. Closing it properly needs a generation counter, or publishing
+while holding the cache lock; tracked separately.
+"""
+function publish_route_middleware!(ctx::ServerContext, key::String, value::Tuple)
+    publish!(ctx.service.custommiddleware, key, value)
+    delete!(ctx.service.middleware_cache, key)
+    return value
+end
+
+"""
+    foldlayers(handler::Function, layers::Vector...) -> Function
+
+Fold `handler` and zero or more middleware vectors into a single request function.
+
+Handler first, each vector appended in argument order, then one `reduce(|>, …)` — so the LAST
+element appended ends up OUTERMOST (`reduce(|>, Function[h, a, b])` is `b(a(h))`), and a call
+with no layers returns `handler` itself, because `reduce` over a one-element collection never
+applies the operator.
+
+Both fold sites go through here on purpose. [`buildmiddleware`](@ref) folds
+`route, router, global`; `compose`'s empty-table fast path folds `global` alone. Whenever no
+per-route middleware applies, those two must produce the same chain — appending an empty
+vector contributes nothing — and sharing the fold makes that a fact about the code rather than
+a coincidence between two copies of it that can drift.
+"""
+function foldlayers(handler::Function, layers::Vector...) :: Function
+    chain::Vector{Function} = [handler]
+    for layer in layers
+        append!(chain, layer)
+    end
+    return reduce(|>, chain)
 end
 
 """
@@ -107,19 +190,13 @@ function buildmiddleware(key::String, handler::Function, globalmiddleware::Vecto
     routermiddleware, routemiddleware = get(snapshot(custommiddleware), key, (nothing, nothing))
 
     # sanitize outputs (either value can be nothing)
-    routermiddleware = isnothing(routermiddleware) ? [] : routermiddleware
-    routemiddleware = isnothing(routemiddleware) ? [] : routemiddleware
+    routermiddleware = isnothing(routermiddleware) ? EMPTY_LAYERS : routermiddleware
+    routemiddleware = isnothing(routemiddleware) ? EMPTY_LAYERS : routemiddleware
 
-    # initialize our middleware layers
-    layers::Vector{Function} = [handler]
-
-    # append the middleware in reverse order (so when we reduce over it, it's in the correct order)
-    append!(layers, routemiddleware)
-    append!(layers, routermiddleware)
-    append!(layers, globalmiddleware)
-
-    # combine all the middleware functions together
-    return reduce(|>, layers)
+    # Route middleware innermost, then router middleware, then global — the last appended is
+    # the outermost after the fold. See `foldlayers`, which `compose`'s empty-table fast path
+    # also uses, so the two agree by construction.
+    return foldlayers(handler, routemiddleware, routermiddleware, globalmiddleware)
 end
 
 """
@@ -132,17 +209,50 @@ function compose(router::HTTP.Router, globalmiddleware::Vector,
                  middleware_cache::CopyOnWriteDict{Function})
     use_cache = isempty(globalmiddleware)
     return function (handler)
+        # The chain for "no per-route middleware applies": global middleware only. Built once
+        # here because it never varies. `handler` alone would be WRONG — it is the fold
+        # accumulator (the serializer wrapping the router), and global middleware arrives
+        # sideways as `globalmiddleware`, applied only inside `buildmiddleware`. Returning
+        # `handler` directly is exactly how the unmatched path used to skip every global
+        # middleware in the app. With no global middleware `foldlayers` returns `handler`
+        # itself, so this costs nothing in that case.
+        nocustom = foldlayers(handler, globalmiddleware)
+
         # NOTE: `middleware_cache` is captured as an *object*; `snapshot` is called per
         # request below. Hoisting the `snapshot` call out to here would freeze the table at
         # compose time and silently disable caching — every request would rebuild its chain.
         # `custommiddleware` is captured the same way and for the same reason; it is
-        # snapshotted per call inside `buildmiddleware` — see its own NOTE.
+        # snapshotted per call below and again inside `buildmiddleware` — see its own NOTE.
         return function (req::HTTP.Request)
+
+            # #71: `compose` is now installed unconditionally, and THIS is the emptiness test
+            # that used to live in `setupmiddleware` — evaluated once there, per request here.
+            # It must stay inside this closure: hoisted out, the verdict freezes at compose
+            # time and an app whose first per-route middleware is registered later never sees
+            # it, which is #71 verbatim. The "composed against an EMPTY table" testitem in
+            # test/custommiddleware_tests.jl is what catches that — verified by mutation: the
+            # non-empty-table guard in the same file stays green under the hoist.
+            #
+            # It is also load-bearing for correctness, not just cost: without it, requests
+            # arriving while the table is empty would build a bare chain and `cache!` it, and
+            # `cache!` is first-writer-wins — so middleware registered afterwards would lose
+            # to that cached bare chain and #71 would reappear one level down.
+            #
+            # On the non-empty path this snapshot is one extra 0-allocation acquire-load: two
+            # per request when `use_cache` is false, three on a `use_cache == true` cache miss
+            # (here, the cache read, then `buildmiddleware`). They can disagree only in the
+            # harmless direction — nothing in `src/` ever removes a key from `custommiddleware`,
+            # so a later read can never see an emptier table than this one did.
+            isempty(snapshot(custommiddleware)) && return nocustom(req)
 
             innerhandler, path, _ = HTTP.Handlers.gethandler(router, req)
 
-            # Check if the current request matches one of our predefined routes 
-            if innerhandler !== nothing
+            # `missing` is HTTP.jl's method-mismatch sentinel — a path that matched but not for
+            # this method (405). It is NOT a match: it carries an empty `path`, so treating it
+            # as one keyed the cache on `"METHOD|"` and could pick up the middleware of a route
+            # registered at the empty path. `nothing` is a true miss (404). Both take the
+            # unmatched path below.
+            if !isnothing(innerhandler) && !ismissing(innerhandler)
 
                 # Check if we already have a cached middleware function for this specific route.
                 # Skip cache when per-call global middleware is present: caching would bake in
@@ -171,8 +281,15 @@ function compose(router::HTTP.Router, globalmiddleware::Vector,
 
                 return strategy(req)
             end
-    
-            return handler(req)
+
+            # Unmatched (404) or method-mismatched (405). `nocustom`, NOT `handler`: the router
+            # still produces the 404/405 status downstream, but global middleware must run — a
+            # global `Cors()` has to emit its headers and a global `RateLimiter()` has to count
+            # the request, or unmatched paths become a rate-limit bypass. Returning `handler`
+            # here is what used to exempt them, and only for apps that had per-route middleware
+            # somewhere — an app without it ran global middleware on 404s all along. This
+            # restores parity between the two.
+            return nocustom(req)
         end
     end
 end
@@ -264,10 +381,15 @@ function (inner::InnerRouter)(http_method::String)
 
     final_path = !isnothing(inner.path) ? join_url_path(outer.prefix, inner.path) : join_url_path(outer.prefix, "")
 
-    if !(isnothing(outer.middleware) && isnothing(inner.middleware))
-        publish!(inner.ctx.service.custommiddleware,
-                 genkey(http_method, final_path),
-                 (outer.middleware, inner.middleware))
+    # Non-EMPTY, not merely non-`nothing` — the same guard `register_route` (src/routing.jl)
+    # applies. An explicit `middleware=[]` reaches `process_middleware`'s `::Vector` method and
+    # comes back `Function[]`, which is not `nothing`; publishing that contributes zero layers
+    # but makes `custommiddleware` permanently non-empty, killing `compose`'s per-request
+    # emptiness fast path for the whole application.
+    if _has_layers(outer.middleware) || _has_layers(inner.middleware)
+        publish_route_middleware!(inner.ctx,
+                                  genkey(http_method, final_path),
+                                  (outer.middleware, inner.middleware))
     end
 
 
