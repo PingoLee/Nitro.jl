@@ -14,6 +14,11 @@ Use this skill when the user wants a review of local changes before pushing, ope
 
 This is a review workflow, not an implementation workflow. The default job is to inspect the diff efficiently and report concrete risks.
 
+**If you were handed a tier** by [`nitro-issue-workflow`](../nitro-issue-workflow/SKILL.md) §0, honor
+it: at `standard` this is a single pass, so read only the slices the diff actually touches and do not
+re-derive decisions the brief says the user already approved. At `high`, work the full *Review
+Priorities* checklist and expect to be resumed for a delta re-review. No tier named means `standard`.
+
 ## Use This Skill For
 
 - Reviewing uncommitted or staged local changes before push
@@ -158,7 +163,7 @@ In the final pass, review `docs/`, `.github/workflows/`, `Project.toml`, and roo
 
 ## Review Method
 
-1. Read [`nitro-general.instructions.md`](../../instructions/nitro-general.instructions.md) for the non-negotiables, the hard-stop index, and the **architecture map** — the map doubles as a review checkpoint: a new `src/` file that no row covers is itself a finding.
+1. Read **three sections** of [`nitro-general.instructions.md`](../../instructions/nitro-general.instructions.md) — *Non-negotiables*, *Hard stops — index only*, and *Architecture*. Those carry everything a review needs; the rest of the hub is authoring guidance and design lineage, and reading it whole is the single largest avoidable cost of a review pass. The architecture map doubles as a review checkpoint: a new `src/` file that no row covers is itself a finding. Open an area rule file only when a diff slice lands in its area.
 2. Identify the changed file set with `git diff --name-only` (or `git diff HEAD --name-only` for all local).
 3. Read the `src/Workers` slice first when present.
 4. Read the core `src/` slice (excluding Workers) for routing, middleware, and extractors.
@@ -169,7 +174,7 @@ In the final pass, review `docs/`, `.github/workflows/`, `Project.toml`, and roo
 
 ## Project-Specific Heuristics
 
-Always re-read the general instructions (step 1) so newly active rules are included. Permanent baselines:
+Always re-read the three hub sections named in step 1 so newly active rules are included. Permanent baselines:
 
 - Flag any `import PormG` or DB access in `src/` (belongs in `ext/NitroPormGExt.jl` only)
 - Flag macro routing (`@get`, `@post`, etc.) or `serveparallel()` in code or docs
