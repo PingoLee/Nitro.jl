@@ -102,8 +102,9 @@ const IGNORE_PREFIXES = String[
 const REQUIRED_SYMBOLS = String[
     "worker_startup", "serve", "terminate", "resetstate", "internalrequest", "instance",
     "path", "urlpatterns", "include_routes", "url",
-    "submit_task", "get_task_status", "cancel_task", "get_all_tasks",
-    "set_queue_authorizer!", "pormg_nitro_worker",
+    "submit_task", "submit_sequential_task", "get_task_status", "cancel_task", "get_all_tasks",
+    "set_queue_authorizer!", "set_watch_authorizer!", "scoped_task_key", "DEFAULT_QUEUE_NAME",
+    "pormg_nitro_worker",
     "add_response_headers", "own_response_headers",
     "login_required", "role_required", "permission_required", "claim_required",
     "kid_required", "Principal",

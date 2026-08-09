@@ -299,14 +299,18 @@ serve(middleware=[
     worker_startup(queues=["reports"], store=persistent_store, recover_zombies=true),
 ])
 
-task_id = submit_task("reports", () -> build_report(id), user_id)
+# Returns the STORED id ("<user_id>::report-42"), not the key you passed.
+task_id = submit_task("report-42", () -> build_report(id), user_id)
 status  = get_task_status(task_id, user_id)
 cancel_task(task_id, user_id)
 ```
 
 Omitting `user_id` on a read is a deliberate system/public-endpoint bypass — never the default for a
-user-scoped route. For persistence, `pormg_nitro_worker(db_key="workers")` needs `using PormG` in the
-**application** so the extension loads.
+user-scoped route. Keep the returned id (or rebuild it with `scoped_task_key`) — under the default
+`:user` scope it is namespaced by owner, which is what stops one user reading or cancelling
+another's task by guessing a resource-derived key. For persistence,
+`pormg_nitro_worker(db_key="workers")` needs `using PormG` in the **application** so the extension
+loads.
 
 ---
 
@@ -354,6 +358,7 @@ query parameter with no default is **required**: omitting it is a 400, not `noth
 | `if user.role == "admin"` inside a handler | `role_required("admin")` guard on the route |
 | `login_required()` on a route that loads a record by client id | Also verify ownership — otherwise IDOR |
 | `submit_task(key, cb)` without `user_id` | `submit_task(key, cb, user_id)` |
+| Polling `get_task_status(key, …)` with the key you submitted | Poll with the id `submit_task` returned, or `scoped_task_key(key, user_id)` |
 | Mutating a `Response` returned by inner middleware | `add_response_headers(resp, extra)` |
 | A global mutable config object | A typed struct passed via `serve(context=…)` |
 | `show_errors=false` "for security" | Leave it on — the client response is already generic |

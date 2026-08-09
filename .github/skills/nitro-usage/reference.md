@@ -298,14 +298,17 @@ if `index.html` is itself servable. Only files present at startup get a route.
 ## Workers
 
 ```julia
-submit_task(task_key, callback::Function, user_id;            # user_id REQUIRED
+submit_task(task_key, callback::Function, user_id;            # user_id REQUIRED; RETURNS the stored id
+            scope::Symbol = :user,                            # :user namespaces the key by owner
             options::TaskOptions = TaskOptions(), store = default_store())
 get_task_status(task_id, user_id = nothing; store = default_store())
 cancel_task(task_id,     user_id = nothing; store = default_store())
 get_all_tasks(filter_status = nothing, user_id = nothing; store = default_store())
 
+scoped_task_key(task_key, user_id; scope = :user)             # "user-a::report_42"
 worker_startup(; queues, store, recover_zombies)              # a middleware
 set_queue_authorizer!(store, authorizer)                      # (queue, user_id) -> Bool
+set_watch_authorizer!(store, authorizer)                      # (task_key, watchers, user_id) -> Bool
 pormg_nitro_worker(; db_key = "db")                           # needs `using PormG`
 update_progress!(task_info, value)                            # NEVER assign .progress directly
 ```
@@ -314,6 +317,12 @@ Every one of these also has a `(ctx::ServerContext, …)` method — use it to a
 singleton in tests. Submission registers the submitting `user_id` as a watcher; passing a non-empty
 `user_id` to a read/manage call enforces watcher access and raises `AuthorizationError` when denied.
 Omitting it is a deliberate system/public-endpoint bypass.
+
+**`submit_task` returns the stored id, which under the default `:user` scope is
+`"<user_id>::<task_key>"` — not the key you passed.** Read and cancel with the returned value.
+`scope=:global` stores the key verbatim for cross-user deduplication; a caller who is not already a
+watcher is then refused unless `set_watch_authorizer!` allows it. The queue authorizer runs on
+`submit_task` too, under `DEFAULT_QUEUE_NAME` (`"default"`).
 
 ---
 

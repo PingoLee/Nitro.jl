@@ -25,11 +25,13 @@ export TaskStatus, PENDING, RUNNING, COMPLETED, FAILED, CANCELLED,
     update_progress!, is_task_running, get_all_tasks, cleanup_old_tasks,
     start_cleanup_scheduler, stop_cleanup_scheduler!, get_queue_status,
     format_error, reset_store!, shutdown!,
+    scoped_task_key, DEFAULT_QUEUE_NAME,
     # Abstract store interface
     get_task_info, set_task!, delete_task!, cleanup_tasks!,
     get_active_task, register_active_task!, deregister_active_task!,
     get_active_task_info, register_active_task_info!, deregister_active_task_info!,
     get_queue_authorizer, set_queue_authorizer!,
+    get_watch_authorizer, set_watch_authorizer!,
     get_sequential_queues, get_queue_lock, get_cleanup_scheduler, lock_tasks
 
 end
