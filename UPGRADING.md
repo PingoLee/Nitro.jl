@@ -34,15 +34,70 @@ every consuming app. This file is that rollout checklist.
 
 ---
 
-## Unreleased — next `0.2.0`
+## Unreleased — next `0.3.0`
 
 _Changes merged but not yet cut into a release. A consumer dev'ing Nitro at HEAD is running these,
 and `Nitro.upgrade_guide` surfaces them by default. When the maintainer next rolls changes into a
-consuming app, `nitro-cut-release` stamps every entry below with `0.2.0`, dates them, and tags it._
+consuming app, `nitro-cut-release` stamps every entry below with `0.3.0`, dates them, and tags it._
+
+---
+
+## 0.2.0 — 2026-08-10
+
+## PormG compat moves to `^0.4` — apps on the PormG extension must upgrade PormG too
+
+- **Version**: 0.2.0
+- **Nitro ref**: `Project.toml` `[compat]`; `ext/NitroPormGExt.jl`
+- **Recorded**: 2026-08-10
+- **Severity**: **breaking (dependency resolution)** — an app still bounded to PormG `0.3` does not
+  resolve against this release.
+
+### What changed
+
+Nitro's bound moved from `PormG = "^0.3"` to `PormG = "^0.4"`. PormG 0.4.0 is a breaking release
+train of its own, carrying 17 entries.
+
+**Nitro itself needed no source change.** Every one of those 17 entries was checked against
+`ext/NitroPormGExt.jl` with its own *"How to find the calls to migrate"* grep, and all came back
+empty — Nitro's PormG surface is two models with no foreign keys, no `ManyToManyField`, no bulk
+writes, no introspection, and no `catch` that reads a PormG error type.
+
+**Your app's surface is not that narrow.** Its own models, queries, and migrations are exactly what
+PormG 0.4.0 changes, so the work is in PormG's guide, not this one. The runtime change most likely
+to reach an app silently is **SQLite now enforcing foreign keys** (PormG #276): writes that
+succeeded on SQLite and only failed in PostgreSQL now raise `IntegrityError` on both. Nitro's own
+`nitro_session` and `nitro_task` tables declare no foreign keys, so that enforcement does not touch
+them.
+
+### How to find the calls to migrate
+
+```bash
+# Does this app use the PormG extension at all? If not, only the dependency bound matters.
+rg -n 'pormg_nitro_session|pormg_nitro_worker|PormGSessionStore|PormGWorkerStore' <app>/src
+
+# The app's own PormG bound — this is what must move.
+rg -n 'PormG' <app>/Project.toml
+```
+
+### Migrate your app
+
+```julia
+# 1. Raise the app's own bound in Project.toml [compat]:
+#      PormG = "^0.4"
+#
+# 2. Run PormG's guide from PormG's OWN environment — it is a weak dependency here, so it does not
+#    load from the app's env — and apply every entry it lists before bumping the bound:
+#      julia --project=/path/to/PormG.jl -e 'using PormG; PormG.upgrade_guide(from = v"0.3.0")'
+#
+# 3. Re-run the app's suite against SQLite specifically. Foreign-key enforcement is the change that
+#    passes a code review and fails at runtime.
+```
+
+---
 
 ## `terminate()` force-closes after a bounded drain; `serve()` refuses to start over a live server (#73)
 
-- **Version**: Unreleased
+- **Version**: 0.2.0
 - **Nitro ref**: #73; `src/core.jl`, `src/context.jl`, `src/methods.jl`, `src/constants.jl`
 - **Recorded**: 2026-08-08
 - **Severity**: **behavior (shutdown semantics, a new error on a previously-silent call, and a
@@ -137,7 +192,7 @@ serve(middleware = [Nitro.LifecycleMiddleware(middleware = identity,
 
 ## Static mounts no longer serve dotfiles, escaping symlinks, or route-pattern filenames (#20)
 
-- **Version**: Unreleased
+- **Version**: 0.2.0
 - **Nitro ref**: #20; `src/utilities/fileutil.jl`, `src/core.jl`, `src/methods.jl`
 - **Recorded**: 2026-08-09
 - **Severity**: **behavior (files that were served now 404)** — security fix.
@@ -241,7 +296,7 @@ it is confusing in logs — check the startup message for what was skipped rathe
 
 ## Worker task ids are namespaced by owner, and `submit_task` is authorized (#19)
 
-- **Version**: Unreleased
+- **Version**: 0.2.0
 - **Nitro ref**: #19; `src/Workers/`, `ext/NitroPormGExt.jl`
 - **Recorded**: 2026-08-09
 - **Severity**: **breaking (return value + submit authorization)** — security fix.
@@ -358,7 +413,7 @@ Operational notes:
 
 ## Global middleware now runs on unmatched (404) and method-mismatched (405) requests (#71)
 
-- **Version**: Unreleased
+- **Version**: 0.2.0
 - **Nitro ref**: #71; `src/routerhof.jl`, `src/core.jl`
 - **Recorded**: 2026-08-08
 - **Severity**: **behavior (middleware now runs on 404/405)** — bug fix.
@@ -418,7 +473,7 @@ requests at all.
 
 ## Scalar path & query params reject bad input with 400; `Nullable{T}` params bind their value (#18)
 
-- **Version**: Unreleased
+- **Version**: 0.2.0
 - **Nitro ref**: #18; `src/utilities/misc.jl`, `src/core.jl`, `src/extractors.jl`
 - **Recorded**: 2026-08-08
 - **Severity**: **behavior (status codes + optional-param binding)** — bug fix.
@@ -504,7 +559,7 @@ whose retry policy fires on 5xx and not 4xx — update it. Bad input now reports
 
 ## `ExtractIP` trust model rebuilt; `trust_forwarded` removed (#16)
 
-- **Version**: Unreleased
+- **Version**: 0.2.0
 - **Nitro ref**: #16; `src/middleware/extract_ip.jl`, `src/middleware/rate_limiter.jl`, `src/core.jl`
 - **Recorded**: 2026-08-03
 - **Severity**: **breaking (removed kwarg + changed resolution)** — security fix.
