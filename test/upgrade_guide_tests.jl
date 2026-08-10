@@ -2,7 +2,7 @@
 using Test
 using Nitro
 using Nitro: _parse_upgrading, _read_upgrading_entries, _version_label,
-             _UNRELEASED_VERSION, _UNSTAMPED_VERSION
+             _UNRELEASED_VERSION, _UNSTAMPED_VERSION, _RELEASE_MARKER
 
 # A miniature UPGRADING.md exercising the shapes the real file (and a cut) produce:
 # a header block with no `- **Recorded**:`, a release marker glued to its first entry,
@@ -152,10 +152,18 @@ end
 end
 
 @testset "scoping against the real UPGRADING.md" begin
-    # `from` at the baseline: nothing released since, and nothing uncut yet.
+    # A consumer already pinned to the current release has nothing to do. Both bounds are derived
+    # from `pkgversion` on purpose: a literal `from` couples this test to the release state and
+    # starts failing the moment a train is cut and its entries are stamped with the new version.
     io = IOBuffer()
-    upgrade_guide(io; from = v"0.1.0", to = pkgversion(Nitro))
-    @test occursin("nothing to port between 0.1.0 and", String(take!(io)))
+    current = pkgversion(Nitro)
+    upgrade_guide(io; from = current, to = current)
+    @test occursin("nothing to port between $(current) and", String(take!(io)))
+
+    # The `to` upper bound excludes everything above it — no entry predates the 0.1.0 baseline.
+    io = IOBuffer()
+    upgrade_guide(io; from = v"0.0.1", to = v"0.0.2")
+    @test occursin("nothing to port between 0.0.1 and", String(take!(io)))
 
     # `from` below the baseline surfaces the 0.1.0 wave.
     io = IOBuffer()
@@ -187,6 +195,19 @@ end
     @test all(e -> e.version >= v"0.1.0", entries)
     # The template block must never parse as an entry.
     @test !any(e -> occursin("<api>", e.title), entries)
+end
+
+@testset "no shipped entry swallows the next one" begin
+    # `_parse_upgrading` splits on `---` and takes ONE entry per block, so an entry prepended
+    # without its trailing separator is silently absorbed into the previous entry's body: its
+    # prose still renders, but under the wrong title, and `structured = true` loses it entirely.
+    # That is invisible to a "does it parse" check — it shipped once (#20 under #73), so assert
+    # the shape directly. A body may only carry its own heading.
+    for e in _read_upgrading_entries()
+        swallowed = [strip(m[1]) for m in eachmatch(r"(?m)^##[ \t]+(.+)$", e.body)
+                     if strip(m[1]) != e.title && !occursin(_RELEASE_MARKER, strip(m[1]))]
+        @test isempty(swallowed)
+    end
 end
 
 end

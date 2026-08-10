@@ -133,6 +133,8 @@ serve(middleware = [Nitro.LifecycleMiddleware(middleware = identity,
       shutdown_timeout = 15)
 ```
 
+---
+
 ## Static mounts no longer serve dotfiles, escaping symlinks, or route-pattern filenames (#20)
 
 - **Version**: Unreleased
