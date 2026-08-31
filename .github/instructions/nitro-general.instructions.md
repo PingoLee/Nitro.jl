@@ -223,12 +223,13 @@ it, so every worktree shares one marketplace entry.
 | `deploy-checklist` | [`.github/skills/deploy-checklist/SKILL.md`](../skills/deploy-checklist/SKILL.md) | Pre-production env, deps, proxy, and test audit |
 | `nitro-issue-management` | [`.github/skills/nitro-issue-management/SKILL.md`](../skills/nitro-issue-management/SKILL.md) | GitHub backlog: file/label/close issues (`pre-publish` gating label) |
 | `nitro-issue-workflow` | [`.github/skills/nitro-issue-workflow/SKILL.md`](../skills/nitro-issue-workflow/SKILL.md) | Work issue #N end-to-end at a `quick`/`standard`/`high` tier: provenance, scope, isolation, verify rungs, review, land, close out |
+| `nitro-issue-cluster` | [`.github/skills/nitro-issue-cluster/SKILL.md`](../skills/nitro-issue-cluster/SKILL.md) | Work several issues that share an edit surface in one session: build the cluster, tier it by its worst member, order it, land one commit per issue |
 | `nitro-cut-release` | [`.github/skills/nitro-cut-release/SKILL.md`](../skills/nitro-cut-release/SKILL.md) | Cut a release train: bump `Project.toml` once, stamp the `UPGRADING.md` entries, tag (maintainer-invoked) |
 
 Editing Nitro itself → the area's deep-dive rule file, plus `add-route` for new endpoints. Writing
 application code that *consumes* Nitro → `nitro-usage`. Reviews → `changed-code-review`. **"Fix issue
 #N", or any change that earns its own branch and PR → `nitro-issue-workflow`, which sequences the
-rest.**
+rest; several issues contending for the same file → `nitro-issue-cluster` above it.**
 
 ## Subagents
 
