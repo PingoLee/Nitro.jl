@@ -377,6 +377,117 @@ end
     @test get_("/api/cursor?cursor=abc").status == 400
 end
 
+struct MalformedBox; v::String; end
+
+@testset "percent-encoded values are decoded exactly once (#70)" begin
+    # `HTTP.queryparams` already decodes, and `parseparam` used to decode AGAIN, so any query
+    # value carrying a `%` was silently mangled. Each case below asserts the handler receives
+    # exactly what the client encoded -- one decode, no more.
+
+    # The issue's own reproducer: "100% off".
+    @test Nitro.text(get_("/api/search?q=100%25%20off&limit=1")) == "100% off:1"
+
+    # An encoded plus must survive as an encoded plus. Under the double decode `%252B`
+    # collapsed to a literal `+`, so this is the regression that names the bug.
+    @test Nitro.text(get_("/api/search?q=a%252Bb&limit=1")) == "a%2Bb:1"
+
+    # Double-encoded traversal: ONE decode yields `%2e%2e%2f`. A second would reconstitute
+    # `../` -- the OWASP double-encoding class this invariant exists to foreclose.
+    @test Nitro.text(get_("/api/search?q=%252e%252e%252f&limit=1")) == "%2e%2e%2f:1"
+
+    # A bare `%` that is not a valid escape sequence must not be eaten.
+    @test Nitro.text(get_("/api/search?q=50%25&limit=1")) == "50%:1"
+
+    # Path params come in still-encoded from HTTP.jl's router, so they get their single
+    # decode at the accessor. Same one-decode rule, opposite starting state.
+    ctx2 = Nitro.Core.ServerContext()
+    Nitro.Core.Routing.urlpatterns(ctx2, "", Nitro.RouteDefinition[
+        path("/p/{v}", (req, v::String) -> Res.send(v), method="GET"),
+        # Reads the scalar binding and the `req.params` shorthand in one handler: both must
+        # agree, since they are now the same decoded value.
+        path("/agree/{v}", (req, v::String) -> Res.send("$v|$(req.params["v"])"), method="GET"),
+    ])
+    g2(t) = Nitro.Core.internalrequest(ctx2, HTTP.Request("GET", t))
+
+    @test Nitro.text(g2("/p/a%20b"))     == "a b"
+    @test Nitro.text(g2("/p/a%2Fb"))     == "a/b"
+    @test Nitro.text(g2("/p/a%252Bb"))   == "a%2Bb"     # one decode, not two
+    @test Nitro.text(g2("/agree/a%20b")) == "a b|a b"
+end
+
+@testset "malformed percent-encoding is 400, not 500 (#18 guarantee at the new decode site)" begin
+    # `HTTP.unescapeuri` throws on a bad escape (EOFError for a trailing "%", ArgumentError
+    # for "%ZZ"), and `HTTP.queryparams` decodes internally and throws the same way. Both
+    # decodes now happen in the `Types.*` accessors -- OUTSIDE `parseparam_checked`, which is
+    # what used to convert those into a 400. Without the guard in the accessors this is a 500
+    # with a logged backtrace, which is exactly what #18 removed.
+    ctx3 = Nitro.Core.ServerContext()
+    Nitro.Core.Routing.urlpatterns(ctx3, "", Nitro.RouteDefinition[
+        path("/m/{v}", (req, v::String) -> Res.send(v), method="GET"),
+        path("/mq",    (req, v::String) -> Res.send(v), method="GET"),
+        # `Path{T}` is a genuinely separate binding path, and one that returned 200 with the
+        # raw value before this change -- pin it, or a refactor moving the decode back inside
+        # `parseparam_checked` leaves this testset green while re-breaking the extractor.
+        path("/ex/{v}", (req, p::Nitro.Path{MalformedBox}) -> Res.send(p.payload.v), method="GET"),
+    ])
+    g3(t) = Nitro.Core.internalrequest(ctx3, HTTP.Request("GET", t))
+
+    for target in ("/m/%ZZ", "/m/%", "/m/%2", "/mq?v=%ZZ", "/mq?v=%", "/ex/%ZZ", "/ex/%80")
+        r = g3(target)
+        @test r.status == 400
+        @test Nitro.json(r)["message"] == "400: Bad Request"
+    end
+
+    @test Nitro.text(g3("/ex/a%20b")) == "a b"
+
+    # `req.params` and `req.input` cannot be pinned through a route -- registration requires a
+    # declared handler parameter for every brace, and that parameter's own decode throws first.
+    # Assert at the accessor instead, with the router's slot populated by hand.
+    bad = HTTP.Request("GET", "/raw/%ZZ")
+    bad.context[:params] = Dict("v" => "%ZZ")
+    @test_throws Nitro.ValidationError Nitro.Types.pathparams(bad)
+
+    # Matched on MESSAGE, not type. `req.params` goes through the process-wide
+    # `Base.getproperty(::HTTP.Request, ::Symbol)` override, and `test/instance_tests.jl` installs
+    # its own via `instance()` -- so under the full suite the thrown value is that instance's
+    # `ValidationError`, a distinct type from this module's. That is #32's getproperty piracy,
+    # not a fault here; a type-identity assertion would be order-dependent (green alone, red in
+    # the suite). The direct `Types.pathparams` call above still pins the exact type.
+    @test_throws "Malformed percent-encoding in path parameter 'v'" bad.params
+    @test_throws "Malformed percent-encoding in path parameter 'v'" bad.input
+
+    bad8 = HTTP.Request("GET", "/raw/%80")
+    bad8.context[:params] = Dict("v" => "%80")
+    @test_throws Nitro.ValidationError Nitro.Types.pathparams(bad8)
+    @test_throws "Invalid UTF-8 in path parameter 'v'" bad8.params
+
+    ok = HTTP.Request("GET", "/raw/a%20b")
+    ok.context[:params] = Dict("v" => "a%20b")
+    @test ok.params["v"] == "a b"
+
+    # `unescapeuri` does NOT throw on "%80" -- it returns an invalid-UTF-8 String, which would
+    # surface as a 500 the moment anything serialized it. The boundary rejects it instead.
+    @test g3("/m/%80").status == 400
+    @test !isvalid(HTTP.unescapeuri("%80"))    # guards the premise
+
+    # The query accessor must apply the SAME rule. It did not at first: `?v=%80` returned 200
+    # and `Res.json` emitted an invalid-UTF-8 body. Two accessors disagreeing about what counts
+    # as well-formed is the exact divergence #70 exists to remove.
+    @test g3("/mq?v=%80").status == 400
+    @test g3("/mq?v=caf%E9").status == 400
+
+    # Well-formed escapes are unaffected by the guard.
+    @test Nitro.text(g3("/m/a%20b"))  == "a b"
+    @test Nitro.text(g3("/mq?v=a%20b")) == "a b"
+
+    # And -- the actual point of #18 -- a rejected request must not be logged as a server
+    # error. A spray of malformed URLs used to write one stack trace per request.
+    @test_logs min_level=Base.CoreLogging.Error begin
+        @test g3("/m/%ZZ").status == 400
+        @test g3("/mq?v=%").status == 400
+    end
+end
+
 @testset "missing and malformed query params are 400, not 500" begin
     # Required query param absent: this used to be a KeyError -> 500.
     @test get_("/api/search?q=x").status == 400

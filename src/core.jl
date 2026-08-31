@@ -112,7 +112,7 @@ end
 
 """
 Extend HTTP.Request to provide DX-friendly shorthand access to common properties:
-- `req.params`: Returns path parameters
+- `req.params`: Returns path parameters, percent-decoded (exactly once)
 - `req.query`: Returns query parameters 
 - `req.session`: Returns the session dictionary from context (if present)
 - `req.user`: Returns the authenticated user from context (if present)
@@ -131,7 +131,9 @@ Extend HTTP.Request to provide DX-friendly shorthand access to common properties
 function _install_request_getproperty!()
     @eval Core function Base.getproperty(req::HTTP.Request, sym::Symbol)
         if sym === :params
-            return HTTP.getparams(req)
+            # Via `Types.pathparams`, not `HTTP.getparams`, so path params are percent-decoded
+            # exactly once — the same value the scalar and `Path{T}` binding paths see (#70).
+            return Types.pathparams(req)
         elseif sym === :query
             return Types.queryvars(req)
         elseif sym === :json
@@ -192,9 +194,22 @@ end
 """
     getparams(req::HTTP.Request) -> Dict{String, String}
 
-Returns the path parameters for the request.
+Returns the path parameters for the request, **percent-decoded exactly once**.
+
+HTTP.jl's router hands over raw, still-encoded segments; the single decode happens in
+`Types.pathparams`, which every path-parameter consumer goes through — this accessor, the
+`req.params` shorthand, scalar handler parameters, and the `Path{T}` extractor. They therefore
+all observe the same value. Query parameters (`getquery`) are decoded once by `HTTP.queryparams`
+for the same reason. See #70.
+
+Returns a **fresh `Dict` on each call** — decoding cannot be done in place — so the result is a
+snapshot rather than a handle into the request. Mutating it does not change what a later call
+returns; pass values down a request through `req.context` instead.
+
+A malformed escape (`/x/%ZZ`, a trailing `%`) or a sequence decoding to invalid UTF-8 raises
+`ValidationError`, which the error handler reports as `400 Bad Request` — not a `500`.
 """
-getparams(req::HTTP.Request) = HTTP.getparams(req)
+getparams(req::HTTP.Request) = Types.pathparams(req)
 
 """
     getquery(req::HTTP.Request) -> Dict{String, String}

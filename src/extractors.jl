@@ -161,7 +161,7 @@ Extracts the body from a request and convert it into a custom type
 """
 function extract(param::Param{Body{T}}, request::LazyRequest) :: Body{T} where {T}
     instance = safe_extract(param) do 
-        parseparam(T, textbody(request); escape=false) 
+        parseparam(T, textbody(request))
     end
     valid_instance = try_validate(param, instance)
     return Body(valid_instance)
@@ -230,7 +230,11 @@ function extract(param::Param{Cookie{T}}, request::LazyRequest, secret_key::Null
     # Use get_cookie to handle parsing, decryption and type conversion
     # We pass T() or a representative value of type T as default to trigger type parsing if needed,
     # but here safe_extract handles parseparam(T, ...) so we just get the raw/decrypted string.
-    
+    #
+    # That string is NOT percent-decoded, and must not be: `set_cookie!` does not percent-encode
+    # on write — `_validate_cookie_value` rejects out-of-range octets instead, and `%` is a legal
+    # cookie octet. Decoding here (which `parseparam` used to do by default) therefore mangled any
+    # cookie carrying a literal `%` on the way back in — a write/read asymmetry removed with #70.
     val = Cookies.get_cookie(headers(request), cookie_name; encrypted=!isnothing(secret_key), secret_key=secret_key)
     
     if isnothing(val)

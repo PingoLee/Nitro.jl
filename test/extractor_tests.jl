@@ -654,3 +654,51 @@ r = Nitro.Core.internalrequest(ctx, bad)
 @test r.status == 400
 
 end
+
+@testitem "Extractors decode percent-encoding exactly once (#70)" tags=[:core] setup=[NitroCommon] begin
+
+using Test
+using HTTP
+using Nitro
+using Nitro: path
+
+# The scalar binding path (`parseparam`) and the extractor binding path
+# (`struct_builder`/`parsetype`) used to disagree, each correct for one source and wrong for
+# the other: scalars decoded query values twice, while `Path{T}` never decoded at all -- a
+# `/files/a%2Fb` request reached the struct field as the literal "a%2Fb". Both now read the
+# single decode performed by the `Types.*` accessor, so the two must agree on every URL.
+
+struct PathBox;  v::String; end
+struct QueryBox; q::String; end
+
+ctx = Nitro.Core.ServerContext()
+Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+    path("/ext/{v}", (req, p::Nitro.Path{PathBox}, q::Nitro.Query{QueryBox}) ->
+             Res.send("$(p.payload.v)|$(q.payload.q)"), method="GET"),
+    path("/scalar/{v}", (req, v::String, q::String) -> Res.send("$v|$q"), method="GET"),
+])
+get_(t) = Nitro.Core.internalrequest(ctx, HTTP.Request("GET", t))
+
+@testset "Path{T} decodes -- the half that never did" begin
+    @test Nitro.text(get_("/ext/a%2Fb?q=x"))   == "a/b|x"
+    @test Nitro.text(get_("/ext/a%20b?q=x"))   == "a b|x"
+    # One decode only: `%252B` must land as `%2B`, not as `+`.
+    @test Nitro.text(get_("/ext/a%252Bb?q=x")) == "a%2Bb|x"
+end
+
+@testset "Query{T} is unchanged -- it was already correct" begin
+    @test Nitro.text(get_("/ext/v?q=100%25%20off")) == "v|100% off"
+    @test Nitro.text(get_("/ext/v?q=a%252Bb"))      == "v|a%2Bb"
+end
+
+@testset "the two binding paths agree" begin
+    # This agreement is the point of the change: same URL, same values, whichever way the
+    # handler declares its parameters.
+    for target in ("/%s/a%%2Fb?q=100%%25%%20off", "/%s/a%%20b?q=a%%252Bb", "/%s/plain?q=50%%25")
+        ext    = Nitro.text(get_(Base.replace(target, "%s" => "ext")))
+        scalar = Nitro.text(get_(Base.replace(target, "%s" => "scalar")))
+        @test ext == scalar
+    end
+end
+
+end
