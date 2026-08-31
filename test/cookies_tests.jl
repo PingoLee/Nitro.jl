@@ -954,6 +954,28 @@ using Nitro: Cookie
         @test cookie_obj.name == "user_id"
     end
 
+    @testset "EXTRACTOR: Cookie values are NOT percent-decoded (#70)" begin
+        # `set_cookie!` does not percent-encode on write -- `_validate_cookie_value` rejects
+        # out-of-range octets instead, and `%` (0x25) is a legal cookie octet. The extractor
+        # used to percent-DECODE on read (`parseparam`'s old `escape=true` default), so a
+        # value written verbatim came back mangled. Read now matches write.
+        for raw in ("a%2Bb", "100%25", "a%20b", "50%")
+            # Write side: accepted verbatim, stored verbatim -- no encoding step.
+            res = HTTP.Response(200)
+            Cookies.set_cookie!(res, "pref", raw)
+            @test Cookies.get_cookie(res, "pref") == raw
+
+            # Read side, through the extractor.
+            req = HTTP.Request("GET", "/", ["Cookie" => "pref=$raw"])
+            lazy_req = Nitro.Types.LazyRequest(request=req)
+            param = Nitro.Types.Param(name=:pref, type=Cookie{String})
+            cookie_obj = Nitro.Extractors.extract(param, lazy_req, nothing)
+
+            # Byte-identical round trip: "a%2Bb" must NOT come back as "a+b".
+            @test cookie_obj.value == raw
+        end
+    end
+
     @testset "EXTRACTOR: Encrypted Cookie Extraction" begin
         data = "secure-user-456"
         enc = Cookies.encrypt_payload(secret, data)

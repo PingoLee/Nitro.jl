@@ -10,6 +10,7 @@ using Dates
 using Base: @kwdef
 using DataStructures: CircularDeque
 using ..Util
+using ..Errors: ValidationError
 
 export Server, Nullable, Context,
     LifecycleMiddleware, startup, shutdown,
@@ -497,8 +498,77 @@ function Base.getproperty(request::LazyRequest, sym::Symbol)
     return getfield(request, sym)
 end
 
-pathparams(req::HTTP.Request) = HTTP.getparams(req)
-queryvars(req::HTTP.Request)  = HTTP.queryparams(HTTP.URI(req.target).query)
+# Percent-decoding happens exactly ONCE, here at the boundary where the raw request becomes a
+# map. Everything downstream — `parseparam`, `parsetype`, `struct_builder` — is pure type
+# conversion and must never unescape again.
+#
+# The two sources arrive in *different* states, which is why only one of them decodes:
+#   - HTTP.jl's router splits `req.target` without unescaping, so path segments are still
+#     encoded and this accessor owes them the single decode. Pinned by
+#     `test/http_internals_contract_tests.jl`.
+#   - `HTTP.queryparams` already decodes, so `queryvars` must NOT decode again (#70).
+#
+# `HTTP.getparams` returns `nothing` for a request that never went through the router, and
+# callers (`Core.merge_request_input!`, `req.input`) rely on that passthrough — so the `nothing`
+# is preserved rather than normalized to an empty Dict.
+#
+# Inference NARROWS here: `HTTP.getparams` reads a `Dict{Symbol,Any}` metadata table and infers
+# `Any`, while this returns `Union{Nothing,Dict{String,String}}`. `raw_pathparams[name]` in
+# `create_param_parser` therefore infers `String` instead of `Any` — one dynamic dispatch fewer
+# on the request path, not a new instability. Do not "restore" the old shape.
+#
+# Each call returns a FRESH Dict (the decode cannot be done in place), so `req.params` is a
+# snapshot, not a handle: mutating it does not change what the next read returns. Use
+# `req.context` to pass values down a request. Caching it per request is #38's scope.
+#
+# `HTTP.unescapeuri` THROWS on a malformed escape (`EOFError` for a trailing "%", `ArgumentError`
+# for "%ZZ"). That is client input, so it must be a 400 -- and the decode now runs here, outside
+# `parseparam_checked`, which is what used to convert it. Wrapping it keeps #18's guarantee that
+# a malformed scalar param is a client error rather than a 500 with a logged backtrace.
+# The offending value is deliberately not interpolated: `.msg` is app-reachable and a path
+# segment can carry a token.
+function pathparams(req::HTTP.Request)
+    raw = HTTP.getparams(req)
+    raw === nothing && return nothing
+    decoded = Dict{String,String}()
+    for (k, v) in raw
+        value = try
+            HTTP.unescapeuri(v)
+        catch e
+            e isa InterruptException && rethrow()
+            throw(ValidationError("Malformed percent-encoding in path parameter '$k'", e))
+        end
+        # `unescapeuri` does not validate what the bytes decode TO: "%80" yields an invalid
+        # UTF-8 `String` with no error. Nothing downstream throws on it — it propagates all the
+        # way into the response, and `Res.json` will happily emit a body containing that raw byte -- an invalid
+        # UTF-8 body. Refusing it here is the boundary declining to admit a value the framework
+        # would go on to serialize incorrectly. `queryvars` applies the identical rule.
+        isvalid(value) || throw(ValidationError("Invalid UTF-8 in path parameter '$k'"))
+        decoded[k] = value
+    end
+    return decoded
+end
+# Same guard, same reason: `HTTP.queryparams` decodes internally and throws on a malformed
+# escape, so `?q=%ZZ` was a 500 here too (pre-existing -- this accessor's decode was never
+# inside `parseparam_checked` either). Both accessors now owe their caller a well-formed map
+# or a `ValidationError`; neither leaks a raw decode failure into the server-error path.
+function queryvars(req::HTTP.Request)
+    # Deliberately OUTSIDE the guard: a `req.target` this malformed is a framework/router
+    # problem, not client input, and must stay a logged 500 rather than be laundered into a 400.
+    query = HTTP.URI(req.target).query
+    vars = try
+        HTTP.queryparams(query)
+    catch e
+        e isa InterruptException && rethrow()
+        throw(ValidationError("Malformed percent-encoding in query string", e))
+    end
+    # Same UTF-8 rule as `pathparams` — the two accessors must not disagree about what counts
+    # as a well-formed value, which is the whole point of #70.
+    for (k, v) in vars
+        isvalid(v) || throw(ValidationError("Invalid UTF-8 in query parameter '$k'"))
+    end
+    return vars
+end
 # HTTP.jl v2 canonicalizes header field names to Title-Case (e.g. "Content-Type").
 # Header names are case-insensitive per RFC 9110, and downstream consumers (the
 # `Header` extractor's `struct_builder`, cookie lookups) match against lowercase

@@ -39,6 +39,30 @@ end
     @test :context     in flds
 end
 
+@testset "router hands over STILL-ENCODED path segments" begin
+    # Load-bearing for `Types.pathparams`, which owes path params their single percent-decode
+    # precisely because HTTP.jl's router does not perform one (it splits `req.target` without
+    # unescaping). If an HTTP.jl bump starts decoding here, `Types.pathparams` would decode a
+    # second time and silently reintroduce exactly the double-decode #70 removed -- so this
+    # fails loudly instead.
+    r = HTTP.Router()
+    seen = Ref{Any}(nothing)
+    HTTP.register!(r, "GET", "/f/{name}", req -> (seen[] = HTTP.getparams(req); HTTP.Response(200)))
+    r(HTTP.Request("GET", "/f/a%2Fb%20c"))
+    @test seen[]["name"] == "a%2Fb%20c"
+
+    # The mirror half of the invariant: `HTTP.queryparams` DOES decode, which is why
+    # `Types.queryvars` must not.
+    @test HTTP.queryparams(HTTP.URI("/s?q=100%25%20off").query)["q"] == "100% off"
+
+    # `getparams` yields `nothing` -- not an empty Dict -- for a request that never went
+    # through the router. `Types.pathparams` must pass that through untouched: `req.input`
+    # and `merge_request_input!` branch on it, and decoding blindly over it throws.
+    @test HTTP.getparams(HTTP.Request("GET", "/x")) === nothing
+    @test Nitro.Types.pathparams(HTTP.Request("GET", "/x")) === nothing
+    @test HTTP.Request("GET", "/x").params === nothing
+end
+
 @testset "body type hierarchy still present" begin
     @test isdefined(HTTP, :EmptyBody)
     @test isdefined(HTTP, :BytesBody)

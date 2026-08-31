@@ -93,20 +93,30 @@ function recursive_merge(x::AbstractVector...)
 end 
 
 """
-    Path Parameter Parsing functions
+    Scalar Parameter Parsing functions
+
+**These convert; they never percent-decode.** Decoding happens exactly once, upstream, in the
+`Types.*` accessor that turns the raw request into a map (`Types.pathparams` unescapes, because
+HTTP.jl hands over raw segments; `Types.queryvars` does not, because `HTTP.queryparams` already
+did). Every value reaching `parseparam` is therefore already decoded.
+
+This used to carry an `escape=true` keyword, which made the *converter* decide. That default was
+correct for path params and wrong for query params — the same decode ran twice and any query
+value containing `%` was silently mangled (#70). The knob is gone rather than re-defaulted: a
+converter is the wrong place to know how its input was transported, which is why Django's path
+converters, Spring's `ConversionService`, and axum's `serde` layer are all decode-free too.
 """
 
-function parseparam(::Type{Any}, str::String; escape=true)
-    return escape ? HTTP.unescapeuri(str) : str
+function parseparam(::Type{Any}, str::String)
+    return str
 end
 
-function parseparam(::Type{String}, str::String; escape=true)
-    return escape ? HTTP.unescapeuri(str) : str
+function parseparam(::Type{String}, str::String)
+    return str
 end
 
-function parseparam(::Type{Char}, str::String; escape=true)
-    value = escape ? HTTP.unescapeuri(str) : str
-    return first(value)
+function parseparam(::Type{Char}, str::String)
+    return first(str)
 end
 
 # Upper bound on the length of a URL-supplied pattern compiled into a `Regex`
@@ -114,23 +124,21 @@ end
 # a ReDoS vector; legitimate route patterns are short, so cap the input.
 const MAX_REGEX_PARAM_LENGTH = 256
 
-function parseparam(::Type{Regex}, str::String; escape=true)
-    value = escape ? HTTP.unescapeuri(str) : str
-    if ncodeunits(value) > MAX_REGEX_PARAM_LENGTH
+function parseparam(::Type{Regex}, str::String)
+    if ncodeunits(str) > MAX_REGEX_PARAM_LENGTH
         throw(ValidationError("Regex path parameter exceeds maximum length of $MAX_REGEX_PARAM_LENGTH bytes"))
     end
-    return Regex(value)
+    return Regex(str)
 end
 
 
-function parseparam(::Type{Symbol}, str::String; escape=true)
-    value = escape ? HTTP.unescapeuri(str) : str
-    return Symbol(value)
+function parseparam(::Type{Symbol}, str::String)
+    return Symbol(str)
 end
 
 
-function parseparam(::Type{T}, str::String; escape=true) where {T <: Enum}
-    return T(parse(Int, escape ? HTTP.unescapeuri(str) : str))
+function parseparam(::Type{T}, str::String) where {T <: Enum}
+    return T(parse(Int, str))
 end
 
 """
@@ -145,14 +153,11 @@ handled one layer up by the parameter's declared default, not here.
 Throws a `ValidationError` when no member type parses. The previous behavior returned the raw
 unparsed `String`, producing a value outside the declared union type.
 """
-function parseparam(type::Union, str::String; escape=true)
-    value::String = escape ? HTTP.unescapeuri(str) : str
+function parseparam(type::Union, str::String)
     for current_type in Base.uniontypes(type)
         (current_type === Nothing || current_type === Missing) && continue
         try
-            # `value` is already unescaped — `escape=false` stops the member method from
-            # unescaping a second time (`"a%2520b"` must stay `"a%20b"`, not become `"a b"`).
-            return parseparam(current_type, value; escape=false)
+            return parseparam(current_type, str)
         catch e
             # A member type failing is the normal case — but do not let the blanket catch
             # swallow an interrupt, which would defeat the guard in `parseparam_checked`.
@@ -170,17 +175,16 @@ end
 The fallback case for parsing parameters.
 Tries to parse the type as is, if this fails then we assume it's a json string
 """
-function parseparam(::Type{T}, str::String; escape=true) where {T}
-    value = escape ? HTTP.unescapeuri(str) : str
+function parseparam(::Type{T}, str::String) where {T}
     try
-        return parse(T, value)
+        return parse(T, str)
     catch e
         # This is the method every scalar type below the specialized ones lands in, so it is
         # where an interrupt would actually be swallowed — falling through to `JSON.parse`
         # and, one layer up, being reported as a client error. The matching guard in
         # `parseparam_checked` never sees it without this rethrow.
         e isa InterruptException && rethrow()
-        return JSON.parse(value, T)
+        return JSON.parse(str, T)
     end
 end
 

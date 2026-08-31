@@ -1,6 +1,5 @@
 ﻿module TimeZonesExt
 
-import HTTP
 import TimeZones: ZonedDateTime, ISOZonedDateTimeFormat
 import Nitro.Core.Types: Nullable
 import Nitro.Core.Util: parseparam
@@ -11,8 +10,10 @@ export parseparam
 # Util parsing overloads           #
 ####################################
 
-function parseparam(::Type{T}, str::String; escape=true) where {T <: ZonedDateTime}
-    return parse(T, escape ? HTTP.unescapeuri(str) : str)
+# No percent-decoding here: the `Types.*` accessors decode exactly once at the boundary, so
+# `parseparam` is pure type conversion across the whole family, extensions included (#70).
+function parseparam(::Type{T}, str::String) where {T <: ZonedDateTime}
+    return parse(T, str)
 end
 
 end

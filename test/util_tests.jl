@@ -116,9 +116,26 @@ end
     # the declared type cannot represent, so it is rejected rather than silently bound.
     @test_throws ValidationError parseparam(Union{Nothing, Int}, "null")
 
-    # The member method must not unescape a second time.
-    @test parseparam(Union{Int, String}, "a%2520b") == "a%20b"
-    @test parseparam(Union{Int, String}, "a%20b"; escape=false) == "a%20b"
+    # `parseparam` NEVER percent-decodes -- not in the union method, not in the member it
+    # delegates to. Decoding happens once upstream in the `Types.*` accessor (#70), so a value
+    # arriving here is already decoded and must pass through byte-identical.
+    @test parseparam(Union{Int, String}, "a%20b") == "a%20b"
+    @test parseparam(Union{Int, String}, "a%2520b") == "a%2520b"
+end
+
+@testset "parseparam does not percent-decode (#70)" begin
+    # The `escape` keyword is gone: a converter is the wrong place to decide how its input was
+    # transported. These pin the whole family, so reintroducing a decode in any single method
+    # fails here rather than silently mangling one parameter source.
+    @test parseparam(String, "a%2Bb")   == "a%2Bb"
+    @test parseparam(Any,    "100%25")  == "100%25"
+    @test parseparam(Symbol, "a%20b")   === Symbol("a%20b")
+    @test parseparam(Char,   "%41")     === '%'          # NOT 'A'
+    @test parseparam(Regex,  "a%2Bb")   == r"a%2Bb"
+
+    # The keyword itself must be gone, not merely defaulted to false -- otherwise a call site
+    # could opt back into the double decode.
+    @test_throws MethodError parseparam(String, "a%20b"; escape=true)
 end
 
 @testset "parseparam_checked" begin
