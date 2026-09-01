@@ -491,7 +491,10 @@ using Test
 using HTTP
 using Nitro
 using Nitro.Core.Types: CopyOnWriteDict, snapshot, cache!, publish!
+using Nitro.Core.RouterHOF: cachetag
 import Nitro: ServerContext, path, text
+
+const TAG = cachetag(false, true, true)   # catch_errors=false, show_errors/serialize default
 
 # The sibling of #71, one level down. `middleware_cache` is first-writer-wins, so once a
 # route's composed chain is cached, registering middleware for that route afterwards could
@@ -513,14 +516,16 @@ mktag(tag) = handler -> (req::HTTP.Request -> text(tag * "|" * text(handler(req)
     pipeline = Nitro.Core.setupmiddleware(ctx; catch_errors = false)
 
     @test text(pipeline(HTTP.Request("GET", "/warm"))) == "h"
-    @test haskey(snapshot(ctx.service.middleware_cache), "GET|/warm")   # warmed
+    # Cache keys carry the pipeline's serializer settings since #79; this pipeline is
+    # `catch_errors=false` with the other two defaulted, i.e. "|cES".
+    @test haskey(snapshot(ctx.service.middleware_cache), "GET|/warm" * TAG)   # warmed
 
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/warm", (req::HTTP.Request) -> text("h"), middleware = [mktag("late")])
     ])
 
     # Without the invalidation the cached bare chain wins and this is "h".
-    @test !haskey(snapshot(ctx.service.middleware_cache), "GET|/warm")  # invalidated
+    @test !haskey(snapshot(ctx.service.middleware_cache), "GET|/warm" * TAG)  # invalidated
     @test text(pipeline(HTTP.Request("GET", "/warm"))) == "late|h"
 end
 
@@ -533,14 +538,14 @@ end
     pipeline = Nitro.Core.setupmiddleware(ctx; catch_errors = false)
     pipeline(HTTP.Request("GET", "/keep"))
     pipeline(HTTP.Request("GET", "/drop"))
-    @test haskey(snapshot(ctx.service.middleware_cache), "GET|/keep")
+    @test haskey(snapshot(ctx.service.middleware_cache), "GET|/keep" * TAG)
 
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/drop", (req::HTTP.Request) -> text("d"), middleware = [mktag("new")])
     ])
     entries = snapshot(ctx.service.middleware_cache)
-    @test haskey(entries, "GET|/keep")        # untouched
-    @test !haskey(entries, "GET|/drop")       # invalidated
+    @test haskey(entries, "GET|/keep" * TAG)        # untouched
+    @test !haskey(entries, "GET|/drop" * TAG)       # invalidated
 end
 
 @testset "delete! is copy-on-write" begin

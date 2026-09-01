@@ -7,7 +7,7 @@ using ..AppContext: ServerContext
 using ..Types: Nullable, LifecycleMiddleware, CopyOnWriteDict, snapshot, cache!,
                 cache_if_current!, publish!
 
-export router, compose, genkey, process_middleware, HOFRouter, OuterRouter, InnerRouter
+export router, compose, genkey, cachetag, process_middleware, HOFRouter, OuterRouter, InnerRouter
 
 # Shared read-only stand-in for "this route has no middleware of that kind". `foldlayers` only
 # ever appends *from* it, never to it, so one instance is safe to share.
@@ -131,6 +131,39 @@ function genkey(http_method::String, path::String)::String
 end
 
 """
+    cachetag(catch_errors::Bool, show_errors::Bool, serialize::Bool) -> String
+
+The `middleware_cache` key suffix for one pipeline's serializer settings (#79).
+
+`middleware_cache` lives on `ctx.service` and outlives any single pipeline, but the chain it
+stores closes over `handler` — the fold accumulator, which `setupmiddleware` builds as
+`serialize ? DefaultSerializer(catch_errors; show_errors) : identity` around the router. Those
+three booleans are therefore *baked into the cached value*, while the key named only the route.
+`serve` builds one pipeline for the server's lifetime so the baked settings are always the right
+ones there; `internalrequest` rebuilds per call, so the first call to warm a route won
+permanently and every later call's kwargs were silently ignored.
+
+Fixed by putting every input in the key. The completeness argument is short and worth keeping:
+`compose` receives `handler` already folded, and the only free variables in its construction are
+these three — `router_entry` is fixed per context, and the access-log and prefix middleware wrap
+*outside* `compose`, so they are not captured. Nothing else can vary.
+
+Deliberately NOT collapsed: with `serialize = false` there is no serializer at all, so the other
+two booleans are unobservable and four tags describe one pipeline. Canonicalizing them would
+save at most three unused cache slots and costs a subtle invariant to maintain.
+
+The key space is these 8 tags times the routes actually warmed. `custommiddleware` keeps the
+plain [`genkey`](@ref) — the two tables no longer share a key space.
+"""
+cachetag(catch_errors::Bool, show_errors::Bool, serialize::Bool)::String =
+    string('|', catch_errors ? 'C' : 'c', show_errors ? 'E' : 'e', serialize ? 'S' : 's')
+
+# Every tag `cachetag` can produce. Invalidation must drop a route's chain under ALL of them,
+# and it does so by exact key rather than by prefix matching: a route path may itself contain
+# `|`, so a `"GET|/a|"` prefix would also match the cache key of a route registered at `/a|b`.
+const CACHE_TAGS = ntuple(i -> cachetag(isodd((i - 1) >> 2), isodd((i - 1) >> 1), isodd(i - 1)), 8)
+
+"""
     publish_route_middleware!(ctx::ServerContext, key::String, value::Tuple) -> Tuple
 
 Register `value` — a `(router middleware, route middleware)` pair — as the middleware for route
@@ -175,7 +208,11 @@ identity check handles the chain built before but published after it.
 """
 function publish_route_middleware!(ctx::ServerContext, key::String, value::Tuple)
     publish!(ctx.service.custommiddleware, key, value)
-    delete!(ctx.service.middleware_cache, key)
+    # Every settings variant, not just one (#79): the cache is keyed on route + pipeline
+    # settings, so a route can hold up to `length(CACHE_TAGS)` chains and invalidation has to
+    # drop all of them. One lock acquisition, at most one copy — and it takes that lock
+    # unconditionally, which #81's proof depends on.
+    delete!(ctx.service.middleware_cache, (key * tag for tag in CACHE_TAGS))
     return value
 end
 
@@ -240,8 +277,11 @@ middleware.
 """
 function compose(router::HTTP.Router, globalmiddleware::Vector,
                  custommiddleware::CopyOnWriteDict{Tuple},
-                 middleware_cache::CopyOnWriteDict{Function})
+                 middleware_cache::CopyOnWriteDict{Function};
+                 catch_errors::Bool = true, show_errors::Bool = true, serialize::Bool = true)
     use_cache = isempty(globalmiddleware)
+    # Fixed for this pipeline's lifetime, so build it once here rather than per request (#79).
+    cache_suffix = cachetag(catch_errors, show_errors, serialize)
     return function (handler)
         # The chain for "no per-route middleware applies": global middleware only. Built once
         # here because it never varies. `handler` alone would be WRONG — it is the fold
@@ -292,18 +332,31 @@ function compose(router::HTTP.Router, globalmiddleware::Vector,
             # unmatched path below.
             if !isnothing(innerhandler) && !ismissing(innerhandler)
 
-                # Check if we already have a cached middleware function for this specific route.
-                # Skip cache when per-call global middleware is present: caching would bake in
-                # caller-specific settings (e.g. catch_errors=false) and corrupt future requests.
-                key = genkey(req.method, path)
+                # Check if we already have a cached middleware function for this specific
+                # route AND this pipeline's serializer settings. Skipped entirely when per-call
+                # global middleware is present, since then nothing is cached at all.
+                #
+                # The cache key carries `cache_suffix` and the `custommiddleware` key does not
+                # (#79). The chain closes over `handler`, which bakes in this pipeline's
+                # `catch_errors`/`show_errors`/`serialize`; keying on the route alone let the
+                # first pipeline to warm a route serve its settings to every later one, so a
+                # second `internalrequest` with different kwargs was silently ignored. See
+                # `cachetag` for why those three booleans are the complete set of inputs.
+                #
+                # Built BEFORE the plain `genkey` so a cache hit still allocates exactly one
+                # string, as it did before this change. `genkey` is only needed on the miss
+                # path, where `buildmiddleware` looks up `custommiddleware`.
                 if use_cache
+                    cachekey = string(req.method, '|', path, cache_suffix)
                     # One acquire-load, then a lookup on a table no writer will ever mutate.
                     # See `CopyOnWriteDict` (src/types.jl) for why this read needs no lock.
-                    func = get(snapshot(middleware_cache), key, nothing)
+                    func = get(snapshot(middleware_cache), cachekey, nothing)
                     if !isnothing(func)
                         return func(req)
                     end
                 end
+
+                key = genkey(req.method, path)
 
                 # Combine all the middleware functions together
                 strategy = buildmiddleware(key, handler, globalmiddleware, custommiddleware)
@@ -327,7 +380,8 @@ function compose(router::HTTP.Router, globalmiddleware::Vector,
                 # *earlier* than the one `buildmiddleware` took for itself. That is deliberate
                 # and safe: if a write landed between the two, the identity check fails and we
                 # decline to cache. Conservative in the safe direction — never the other way.
-                use_cache && cache_if_current!(middleware_cache, key, strategy,
+                use_cache && cache_if_current!(middleware_cache,
+                                               string(key, cache_suffix), strategy,
                                                custommiddleware, custom_snap)
 
                 return strategy(req)

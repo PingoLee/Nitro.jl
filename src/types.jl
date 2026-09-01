@@ -236,8 +236,11 @@ function cleanup_expired_sessions!(store::MemoryStore)
 end
 
 # ── Copy-on-write table (atomic publish, lock-free reads) ───────────────────────
-# A `String`-keyed table read on the request hot path and written rarely, off it. Keys are
-# route keys ("METHOD|path", see `genkey`) at both instantiations.
+# A `String`-keyed table read on the request hot path and written rarely, off it. The two
+# instantiations no longer share a key space: `custommiddleware` keys on the route alone
+# ("METHOD|path", see `genkey`), while `middleware_cache` appends the pipeline's serializer
+# settings ("METHOD|path|CES", see `cachetag`) — because the chain it stores closes over those
+# settings, so the route alone is not a complete key for it (#79).
 #
 # Two instantiations, with deliberately different write semantics:
 #
@@ -490,6 +493,41 @@ function Base.delete!(d::CopyOnWriteDict{V}, key::String) where {V}
         haskey(current, key) || return d
         updated = copy(current)
         delete!(updated, key)
+        @atomic :release d.entries = updated
+    end
+    return d
+end
+
+"""
+    delete!(d::CopyOnWriteDict{V}, keys) -> CopyOnWriteDict{V}
+
+Drop several keys in **one** publish. Equivalent to calling the single-key method for each, but
+takes the lock once and copies the table at most once — absent keys cost nothing beyond a
+lookup, and if none are present nothing is published at all.
+
+Exists for `publish_route_middleware!` (src/routerhof.jl), which since #79 must invalidate a
+route's chain under every pipeline-settings tag rather than under one key. Doing that as N
+separate `delete!` calls would take the cache lock N times and publish up to N intermediate
+tables for one logical invalidation.
+
+`keys` is any iterable of `String` — a generator is the expected shape, so nothing is
+materialized.
+
+!!! warning "The lock is taken unconditionally, and that is load-bearing"
+    Same invariant as the single-key method: the all-absent fast path skips the *publish*, never
+    the *lock*. [`cache_if_current!`](@ref)'s proof (#81) requires this call and that publish to
+    be totally ordered on `d.lock`.
+"""
+function Base.delete!(d::CopyOnWriteDict{V}, keys) where {V}
+    lock(d.lock) do
+        current = @atomic :monotonic d.entries
+        # Probe first so the common case — invalidating a route nobody has warmed yet — does no
+        # copying. The lock is already held either way; see the warning above.
+        any(k -> haskey(current, k), keys) || return d
+        updated = copy(current)
+        for k in keys
+            delete!(updated, k)
+        end
         @atomic :release d.entries = updated
     end
     return d

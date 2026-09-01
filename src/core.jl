@@ -838,8 +838,12 @@ function setupmiddleware(ctx::ServerContext; middleware::Vector=[], serialize::B
     return reduce(|>, [
         router_entry,
         serializer...,
+        # `catch_errors`/`show_errors`/`serialize` travel into `compose` because the chain it
+        # caches closes over them, via `serializer` above — so they belong in the cache key
+        # (#79). They are not otherwise used there.
         compose(ctx.service.router, processed_middleware,
-                ctx.service.custommiddleware, ctx.service.middleware_cache),
+                ctx.service.custommiddleware, ctx.service.middleware_cache;
+                catch_errors, show_errors = show_errors === true, serialize),
         global_prefix_middleware...,
         access_log_middleware...,
         _app_context_seed(ctx),

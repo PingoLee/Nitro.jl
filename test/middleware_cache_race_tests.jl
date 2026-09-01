@@ -88,8 +88,10 @@ using Test
 using HTTP
 using Nitro
 using Nitro.Core.Types: snapshot, publish!
-using Nitro.Core.RouterHOF: genkey
+using Nitro.Core.RouterHOF: genkey, cachetag
 import Nitro: ServerContext, path, text
+
+const TAG = cachetag(false, true, true)   # catch_errors=false, show_errors/serialize default
 
 # Integration half of #81, driven through the real `compose` on a LOCAL ServerContext so the
 # item is order-independent. Reproducing the interleaving with real threads would be a flake
@@ -150,7 +152,8 @@ r1 = text(pipeline(HTTP.Request("GET", "/warm")))
     for _ in 1:3
         @test text(pipeline(HTTP.Request("GET", "/warm"))) == "v2|handler"
     end
-    @test snapshot(ctx.service.middleware_cache)[key] isa Function   # and it did converge
+    # Cache keys carry the pipeline's serializer settings since #79 ("|cES" here).
+    @test snapshot(ctx.service.middleware_cache)[key * TAG] isa Function   # it did converge
 end
 
 @testset "warmup still caches on the quiet path" begin
@@ -163,6 +166,6 @@ end
     ])
     quiet = Nitro.Core.setupmiddleware(ctx2; catch_errors = false)
     quiet(HTTP.Request("GET", "/quiet"))
-    @test haskey(snapshot(ctx2.service.middleware_cache), genkey("GET", "/quiet"))
+    @test haskey(snapshot(ctx2.service.middleware_cache), genkey("GET", "/quiet") * TAG)
 end
 end # @testitem
