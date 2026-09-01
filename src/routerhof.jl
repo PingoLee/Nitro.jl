@@ -62,13 +62,22 @@ to is not *proven* free of concurrent writers. Closing that, along with the `Set
 unspecified iteration order, is tracked separately (#74); what #68 removed was the per-request
 writer.
 
-Dedup is load-bearing and comes from `Set`: one shared `RateLimiter()` passed to N routes is
-one registration, so its cleanup task starts once, not N times. `LifecycleMiddleware` is an
-immutable struct, so `Set` dedups it structurally.
+Registration order is preserved and `terminate` unwinds it LIFO (#74), so this appends under
+`lifecycle_lock` rather than pushing into an unsynchronized `Set`. The lock is not ceremony:
+under `revise=:lazy`, `Revise.revise()` runs on a request-handling task and re-running user
+top-level code re-enters `urlpatterns` → `register_route` → here, so two revisions — or one
+revision concurrent with `startup.`/`shutdown.` iterating — race this container.
+
+Dedup is load-bearing, and moving off `Set` is what makes it explicit rather than structural:
+one shared `RateLimiter()` passed to N routes is one registration, so its cleanup task starts
+once, not N times. `∉` on a single-digit vector costs nothing.
 """
 function register_route_lifecycle!(ctx::ServerContext, middleware::Vector)
-    for mw in middleware
-        mw isa LifecycleMiddleware && push!(ctx.service.route_lifecycle, mw)
+    lock(ctx.service.lifecycle_lock) do
+        for mw in middleware
+            mw isa LifecycleMiddleware || continue
+            mw ∉ ctx.service.route_lifecycle && push!(ctx.service.route_lifecycle, mw)
+        end
     end
     return ctx
 end
@@ -89,12 +98,31 @@ exists to restore. The asymmetry is deliberate — a shared object passed both t
 `serve(middleware = ...)` is still, in the app's own terms, that route's middleware.
 """
 function register_serve_lifecycle!(ctx::ServerContext, middleware::Vector)
-    for mw in middleware
-        mw isa LifecycleMiddleware || continue
-        mw in ctx.service.route_lifecycle && continue
-        push!(ctx.service.serve_lifecycle, mw)
+    lock(ctx.service.lifecycle_lock) do
+        for mw in middleware
+            mw isa LifecycleMiddleware || continue
+            mw ∈ ctx.service.route_lifecycle && continue      # route ownership wins
+            mw ∉ ctx.service.serve_lifecycle && push!(ctx.service.serve_lifecycle, mw)
+        end
     end
     return ctx
+end
+
+"""
+    lifecycle_snapshot(ctx::ServerContext) -> (route, serve)
+
+Copies of both lifecycle vectors, taken together under `lifecycle_lock` (#74).
+
+`startup.`/`shutdown.` (src/core.jl) broadcast over the result rather than over the live
+vectors, so an iteration can never overlap a `push!` from a concurrent registration — the
+`revise=:lazy` path that re-enters `urlpatterns` on a request-handling task. Copying rather than
+holding the lock across the hooks is deliberate: a user `on_startup` can block for as long as it
+likes, and it must not be able to deadlock route registration by doing so.
+"""
+function lifecycle_snapshot(ctx::ServerContext)
+    return lock(ctx.service.lifecycle_lock) do
+        (copy(ctx.service.route_lifecycle), copy(ctx.service.serve_lifecycle))
+    end
 end
 
 """

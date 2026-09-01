@@ -348,3 +348,124 @@ lf.on_shutdown()
 @test timedwait(() -> istaskdone(t2), 10.0) === :ok
 @test lf.on_shutdown() === nothing            # idempotent: nothing left to stop
 end # @testitem
+
+
+@testitem "Lifecycle middleware — order is registration order, teardown is LIFO" tags=[:middleware] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+using Nitro.Core: LifecycleMiddleware, startup, shutdown
+using Nitro.Core.RouterHOF: register_route_lifecycle!, register_serve_lifecycle!,
+                            lifecycle_snapshot
+import Nitro: ServerContext, path, text
+
+# Regression test for #74 item 1. `startup.`/`shutdown.` broadcast over a `Set`, which collects
+# in HASH order — and `LifecycleMiddleware` is an immutable struct whose fields are closures,
+# i.e. heap objects, so the order varied run to run. Nothing depended on it yet, which is
+# exactly why it had to be pinned before something did: the first shared resource between two
+# lifecycle middlewares (an `AccessLog` sink flushing into something another lifecycle owns)
+# makes teardown order decide whether the flush succeeds.
+#
+# The contract is now LIFO — startup in registration order, shutdown in its exact reverse —
+# matching Spring's `SmartLifecycle`, ASP.NET Core's `IHostedService`, OTP supervisors, ASGI
+# lifespan, and `defer`/`atexit`.
+
+function recorder()
+    order = String[]
+    mk(name) = LifecycleMiddleware(
+        middleware  = handler -> (req::HTTP.Request -> handler(req)),
+        on_startup  = () -> push!(order, "up:$name"),
+        on_shutdown = () -> push!(order, "down:$name"))
+    return order, mk
+end
+
+@testset "registration order in, exact reverse out" begin
+    order, mk = recorder()
+    a, b, c = mk("a"), mk("b"), mk("c")
+    ctx = ServerContext()
+    register_route_lifecycle!(ctx, Any[a, b, c])
+
+    route_lf, _ = lifecycle_snapshot(ctx)
+    @test route_lf == [a, b, c]                  # a Vector now, and in the order given
+
+    startup.(route_lf)
+    shutdown.(Iterators.reverse(route_lf))
+    @test order == ["up:a", "up:b", "up:c", "down:c", "down:b", "down:a"]
+end
+
+@testset "the order is reproducible across contexts" begin
+    # The property a `Set` could not give: hash order depends on object identity, so two
+    # structurally-identical runs disagreed. Build the same registration twice and compare.
+    runs = map(1:2) do _
+        order, mk = recorder()
+        ctx = ServerContext()
+        register_route_lifecycle!(ctx, Any[mk("a"), mk("b"), mk("c")])
+        route_lf, _ = lifecycle_snapshot(ctx)
+        startup.(route_lf)
+        shutdown.(Iterators.reverse(route_lf))
+        order
+    end
+    @test runs[1] == runs[2]
+end
+
+@testset "dedup survives the container change" begin
+    # Load-bearing, and the thing a naive Set -> Vector swap regresses silently: one shared
+    # `RateLimiter()` on N routes must start its cleanup task once, not N times.
+    _, mk = recorder()
+    lf = mk("shared")
+    ctx = ServerContext()
+    Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+        path("/p", (req::HTTP.Request) -> text("ok"), middleware = [lf]),
+        path("/q", (req::HTTP.Request) -> text("ok"), middleware = [lf]),
+        path("/r", (req::HTTP.Request) -> text("ok"), middleware = [lf]),
+    ])
+    route_lf, _ = lifecycle_snapshot(ctx)
+    @test length(route_lf) == 1
+
+    # ...and on the serve-owned side too, including across repeated registration.
+    ctx2 = ServerContext()
+    register_serve_lifecycle!(ctx2, Any[lf])
+    register_serve_lifecycle!(ctx2, Any[lf])
+    _, serve_lf = lifecycle_snapshot(ctx2)
+    @test length(serve_lf) == 1
+end
+
+@testset "concurrent registration neither loses nor duplicates" begin
+    # #74 item 2. `register_lifecycle!` did a bare `push!` into a `Set` with no lock on either
+    # side, while `startup.`/`shutdown.` broadcast over it. "Registration time" is not a synonym
+    # for "single-threaded startup": under `revise=:lazy`, `Revise.revise()` runs on a
+    # request-handling task and re-running user top-level code re-enters `urlpatterns` ->
+    # `register_route` -> here. Same defect class as #68 item 1.
+    _, mk = recorder()
+    entries = [mk("m$i") for i in 1:64]
+    ctx = ServerContext()
+
+    @sync for e in entries
+        Threads.@spawn register_route_lifecycle!(ctx, Any[e])
+    end
+
+    route_lf, _ = lifecycle_snapshot(ctx)
+    @test length(route_lf) == 64                 # no lost update
+    @test Set(route_lf) == Set(entries)
+    @test allunique(route_lf)                    # ...and no duplicate
+
+    # Registering the same objects again, concurrently, must still be a no-op.
+    @sync for e in entries
+        Threads.@spawn register_route_lifecycle!(ctx, Any[e])
+    end
+    route_lf2, _ = lifecycle_snapshot(ctx)
+    @test length(route_lf2) == 64
+end
+
+@testset "iteration is taken over a snapshot, not the live vector" begin
+    # Guards the other half of the fix: broadcasting over `ctx.service.route_lifecycle`
+    # directly would let a concurrent `push!` mutate the array mid-iteration.
+    _, mk = recorder()
+    ctx = ServerContext()
+    register_route_lifecycle!(ctx, Any[mk("a")])
+    snap, _ = lifecycle_snapshot(ctx)
+    register_route_lifecycle!(ctx, Any[mk("b")])
+    @test length(snap) == 1                      # the copy did not grow underneath us
+    @test length(lifecycle_snapshot(ctx)[1]) == 2
+end
+end # @testitem

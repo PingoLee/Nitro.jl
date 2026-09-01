@@ -34,7 +34,7 @@ function getcontext end
 
 include("handlers.jl");     @reexport using .Handlers
 include("routerhof.jl");    @reexport using .RouterHOF
-using .RouterHOF: normalize_middleware, register_serve_lifecycle!
+using .RouterHOF: normalize_middleware, register_serve_lifecycle!, lifecycle_snapshot
 include("reflection.jl");   @reexport using .Reflection
 include("extractors.jl");   @reexport using .Extractors
 include("response.jl");     @reexport using .Res
@@ -620,9 +620,13 @@ See also `serve`.
 """
 function terminate(context::ServerContext; timeout::Nullable{Real} = nothing)
     if isopen(context.service)
-        # Unwind the reverse of `startserver`'s startup sequence: serve-owned, then route-owned.
-        shutdown.(context.service.serve_lifecycle)
-        shutdown.(context.service.route_lifecycle)
+        # LIFO (#74): the exact reverse of `startserver`'s startup sequence, which ran
+        # route-owned then serve-owned, each in registration order. So: serve-owned reversed,
+        # then route-owned reversed. Teardown order is a specified contract now, not hash
+        # order — see `Service` (src/context.jl) for why LIFO and not something else.
+        route_lf, serve_lf = lifecycle_snapshot(context)
+        shutdown.(Iterators.reverse(serve_lf))
+        shutdown.(Iterators.reverse(route_lf))
         # Only the SERVE-owned half is cleared (#82). These came from this run's
         # `serve(middleware = ...)` list and `serve` re-registers them on the next call, so
         # keeping them would start a previous run's middleware alongside the new one.
@@ -633,7 +637,7 @@ function terminate(context::ServerContext; timeout::Nullable{Real} = nothing)
         # skipped for the rest of the process's life, which for a route-level `RateLimiter`
         # meant its bucket-pruning task never restarted while the store kept growing. They are
         # cleared only by replacing the context (`resetstate()`, src/methods.jl).
-        empty!(context.service.serve_lifecycle)
+        lock(() -> empty!(context.service.serve_lifecycle), context.service.lifecycle_lock)
         # Do NOT "symmetrize" this by also emptying `custommiddleware`: that table is route
         # *registration* state, not cache state. test/original_tests.jl re-serves after a
         # `terminate()` and expects the registered routes and their middleware to survive.
@@ -855,9 +859,13 @@ function startserver(ctx::ServerContext; host, port, show_banner=false, parallel
     ctx.service.server[] = start(preprocesskwargs(kwargs))
     # Route-owned first, then serve-owned: that is declaration order — routes are registered at
     # `urlpatterns()` time, the `serve(middleware = ...)` list only at `serve()` time (#82).
-    # `terminate` unwinds in the exact reverse.
-    startup.(ctx.service.route_lifecycle)
-    startup.(ctx.service.serve_lifecycle)
+    # Within each half, registration order. `terminate` unwinds the exact reverse (#74).
+    #
+    # Over a snapshot, not the live vectors: a `revise=:lazy` re-registration runs on a
+    # request-handling task and could otherwise `push!` while this broadcast iterates.
+    route_lf, serve_lf = lifecycle_snapshot(ctx)
+    startup.(route_lf)
+    startup.(serve_lf)
 
     if !async
         try
