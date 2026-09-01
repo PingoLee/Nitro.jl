@@ -4,7 +4,8 @@ using HTTP
 
 using ..Util: join_url_path
 using ..AppContext: ServerContext
-using ..Types: Nullable, LifecycleMiddleware, CopyOnWriteDict, snapshot, cache!, publish!
+using ..Types: Nullable, LifecycleMiddleware, CopyOnWriteDict, snapshot, cache!,
+                cache_if_current!, publish!
 
 export router, compose, genkey, process_middleware, HOFRouter, OuterRouter, InnerRouter
 
@@ -147,12 +148,13 @@ a previously-published entry and its cached chain both survive. Pre-existing, an
 #71.
 
 **The order is load-bearing.** Publish first, invalidate second. Inverted, a concurrent request
-could miss the freshly-emptied cache, rebuild from the *old* table, and `cache!` that stale
+could miss the freshly-emptied cache, rebuild from the *old* table, and publish that stale
 chain — which first-writer-wins would then make permanent, on every interleaving where the
 request's cache read lands between the two calls.
 
-This order *narrows* that window; it does not close it. A request whose `buildmiddleware`
-snapshot straddles the whole publish-and-invalidate can still cache a stale chain:
+**The order alone was never sufficient**, and #81 was the residual window: a request whose chain
+construction straddled the whole publish-and-invalidate still cached a stale chain, because the
+`delete!` no-oped on a key the request had not written yet.
 
     req: cache read                        -> miss
     req: snapshot(custommiddleware)        -> OLD table
@@ -160,10 +162,16 @@ snapshot straddles the whole publish-and-invalidate can still cache a stale chai
     reg: delete!(middleware_cache, key)    -> key absent, no-op
     req: cache!(middleware_cache, key, ..) -> stale chain, first-writer-wins, permanent
 
-Reachable only when `use_cache` is true (no global middleware at all) *and* registration races
-a live request — under `revise=:lazy|:eager` `serve` injects `ReviseHandler`, so `use_cache` is
-false and it cannot happen there. Closing it properly needs a generation counter, or publishing
-while holding the cache lock; tracked separately.
+That is closed now, on the *other* side: `compose` publishes through
+[`cache_if_current!`](@ref) (src/types.jl) rather than `cache!`, which re-checks
+`custommiddleware`'s table identity while holding the cache's lock. The `delete!` below and that
+re-check are therefore totally ordered on one lock, so a stale chain is either refused outright
+or removed by this `delete!` immediately afterwards. The full argument, and the one invariant it
+rests on — `delete!` must keep taking the lock even when the key is absent — is in
+`cache_if_current!`'s docstring.
+
+Both halves are still needed. `delete!` handles the chain cached *before* registration; the
+identity check handles the chain built before but published after it.
 """
 function publish_route_middleware!(ctx::ServerContext, key::String, value::Tuple)
     publish!(ctx.service.custommiddleware, key, value)
@@ -269,7 +277,11 @@ function compose(router::HTTP.Router, globalmiddleware::Vector,
             # (here, the cache read, then `buildmiddleware`). They can disagree only in the
             # harmless direction — nothing in `src/` ever removes a key from `custommiddleware`,
             # so a later read can never see an emptier table than this one did.
-            isempty(snapshot(custommiddleware)) && return nocustom(req)
+            # Bound, not discarded: this snapshot doubles as the generation stamp handed to
+            # `cache_if_current!` below, which is what closes #81's stale-chain window. See
+            # the publish site for why reusing *this* (earlier) snapshot is sound.
+            custom_snap = snapshot(custommiddleware)
+            isempty(custom_snap) && return nocustom(req)
 
             innerhandler, path, _ = HTTP.Handlers.gethandler(router, req)
 
@@ -297,13 +309,26 @@ function compose(router::HTTP.Router, globalmiddleware::Vector,
                 strategy = buildmiddleware(key, handler, globalmiddleware, custommiddleware)
 
                 # Warmup only. Reaching here with `use_cache` means the key was absent from
-                # this request's snapshot, so `cache!` (first-writer-wins, under the lock) *is*
-                # the second half of the double check. The old unlocked `haskey` pre-check was
-                # a deliberate lock-avoidance optimization — it skipped the lock when another
-                # thread published between the read and here — traded away on purpose: it was
-                # a racy read, and the lock it avoided is warmup-bounded with a short critical
-                # section.
-                use_cache && cache!(middleware_cache, key, strategy)
+                # this request's snapshot, so the publish (first-writer-wins, under the lock)
+                # *is* the second half of the double check. The old unlocked `haskey` pre-check
+                # was a deliberate lock-avoidance optimization — it skipped the lock when
+                # another thread published between the read and here — traded away on purpose:
+                # it was a racy read, and the lock it avoided is warmup-bounded with a short
+                # critical section.
+                #
+                # `cache_if_current!`, NOT `cache!` (#81). Publishing unconditionally could
+                # strand a chain built from a `custommiddleware` table that route registration
+                # has since replaced, and first-writer-wins would then make it permanent —
+                # registered middleware that silently never runs. The extra argument is the
+                # generation stamp: publish only if `custommiddleware` still holds the very
+                # table this chain was derived from.
+                #
+                # `custom_snap` is the snapshot taken above for the emptiness test, which is
+                # *earlier* than the one `buildmiddleware` took for itself. That is deliberate
+                # and safe: if a write landed between the two, the identity check fails and we
+                # decline to cache. Conservative in the safe direction — never the other way.
+                use_cache && cache_if_current!(middleware_cache, key, strategy,
+                                               custommiddleware, custom_snap)
 
                 return strategy(req)
             end
