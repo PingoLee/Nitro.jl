@@ -33,7 +33,24 @@ end
     prefix              :: Ref{Nullable{String}}    = Ref{Nullable{String}}(nothing)
     eager_revise        :: Ref{Nullable{EagerReviseService}} = Ref{Nullable{EagerReviseService}}(nothing)
     named_routes_lock     :: ReentrantLock          = ReentrantLock()
-    lifecycle_middleware  :: Set{LifecycleMiddleware} = Set{LifecycleMiddleware}()
+    # Lifecycle middleware, split by the SCOPE that declared it (#82). The two halves have
+    # genuinely different lifetimes, and collapsing them into one collection is what made
+    # `serve(); terminate(); serve()` silently drop every route-level startup hook:
+    #
+    #   `route_lifecycle` — declared by the CONTEXT, at `urlpatterns()`/`router()` time, once.
+    #       Nothing re-adds these on a second `serve()`, because routes are not re-registered.
+    #       Survives `terminate()`; cleared only by replacing the context (`resetstate()`).
+    #
+    #   `serve_lifecycle` — declared by THIS SERVER RUN, from the `serve(middleware = ...)`
+    #       list, on every `serve()`. Cleared by `terminate()`, or `serve(middleware=[A]);
+    #       terminate(); serve(middleware=[B])` would start `A`'s lifecycle again as well.
+    #
+    # This is the Spring application-context distinction: the registry is a *declaration*, not
+    # a consumable, and a declaration belongs to whatever owns it. No framework clears its
+    # lifecycle registry wholesale on stop — Spring closes the context and you build a new one,
+    # ASP.NET disposes the `IHost`, an OTP child spec outlives its supervisor terminating.
+    route_lifecycle       :: Set{LifecycleMiddleware} = Set{LifecycleMiddleware}()
+    serve_lifecycle       :: Set{LifecycleMiddleware} = Set{LifecycleMiddleware}()
     cookies               :: Ref{CookieConfig}      = Ref{CookieConfig}(CookieConfig())
     extensions            :: Dict{Symbol, Any}      = Dict{Symbol, Any}()
     extensions_lock       :: ReentrantLock          = ReentrantLock()

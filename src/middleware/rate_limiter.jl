@@ -153,40 +153,71 @@ function FixedRateLimiter(;
     rate_limit_store = Dict{IPAddr, Tuple{Int, DateTime}}()
     store_lock = ReentrantLock()
     
-    running = Ref{Bool}(false)
+    # PER-ACTIVATION stop token, not a single shared `running` flag. `on_shutdown` cannot wait
+    # for the cleanup task — it is parked in `sleep(cleanup_period)`, up to `cleanup_period`
+    # away from its next flag check — so a `serve(); terminate(); serve()` cycle overlaps the
+    # old task with the new activation. With one shared flag the sequence was:
+    #
+    #   on_shutdown : running[] = false ; cleanup_task[] = nothing   (old task still sleeping)
+    #   on_startup  : running[] = true  ; isnothing(cleanup_task[]) -> spawns a SECOND task
+    #   old task    : wakes, reads running[] == true, keeps looping
+    #
+    # i.e. one extra cleanup task leaked per restart, unbounded, in the component whose entire
+    # job is to bound resource use. Giving each activation its own `Ref` means a stale task can
+    # only ever observe *its own* token, which `on_shutdown` already set to `false`, so it exits
+    # on its next wake no matter what the current activation is doing. Same shape as
+    # `AccessLog`'s per-activation `_Run` (src/middleware/access_log.jl).
+    #
+    # Hooks stay idempotent across cycles, which is what `startserver`/`terminate` rely on now
+    # that route-owned lifecycle middleware survives a restart (#82).
+    active = Ref{Union{Ref{Bool},Nothing}}(nothing)
     cleanup_task = Ref{Union{Task,Nothing}}(nothing)
 
+    # Returns the cleanup `Task` it spawned, or `nothing` if one was already running.
+    # `startup(::LifecycleMiddleware)` discards the value; tests call `lf.on_startup()`
+    # directly to get a handle on the task, which is the only way to observe that a stale
+    # activation's task actually exits. Keep this return value.
     function on_startup()
-        # enable the flag
-        running[] = true
+        # Already running: `startup` is idempotent, so do not spawn a second task.
+        isnothing(active[]) || return nothing
 
-        # prevent multiple cleanup tasks from being started
-        if isnothing(cleanup_task[])
-            # Start Background cleanup task
-            cleanup_task[] = @async while running[]
-                sleep(cleanup_period)
-                lock(store_lock) do
-                    current_time = now(UTC)
-                    to_delete = []
-                    # Find old entries
-                    for (ip, (_, last_reset)) in rate_limit_store
-                        if current_time - last_reset > cleanup_threshold
-                            push!(to_delete, ip)
-                        end
+        token = Ref(true)
+        active[] = token
+
+        # Start Background cleanup task
+        cleanup_task[] = @async while token[]
+            sleep(cleanup_period)
+            # Re-check AFTER the sleep: `on_shutdown` may have fired while we were parked, and
+            # this is the point a stale task from a previous activation leaves for good.
+            token[] || break
+            lock(store_lock) do
+                current_time = now(UTC)
+                to_delete = []
+                # Find old entries
+                for (ip, (_, last_reset)) in rate_limit_store
+                    if current_time - last_reset > cleanup_threshold
+                        push!(to_delete, ip)
                     end
-                    # Cleanup old entries
-                    for ip in to_delete
-                        delete!(rate_limit_store, ip)
-                    end
+                end
+                # Cleanup old entries
+                for ip in to_delete
+                    delete!(rate_limit_store, ip)
                 end
             end
         end
+        return cleanup_task[]
     end
 
-    # Stop function to halt the task
+    # Stop function to halt the task. Returns the `Task` it signalled, or `nothing` if none
+    # was running. Signalling is all it can do — the task may be mid-`sleep`, and blocking
+    # `terminate` for up to a whole `cleanup_period` would be worse than letting it drain.
     function on_shutdown()
-        running[] = false
+        token = active[]
+        isnothing(token) || (token[] = false)
+        stopped = cleanup_task[]
+        active[] = nothing
         cleanup_task[] = nothing
+        return stopped
     end
 
     function rate_limit_only(handle::Function)

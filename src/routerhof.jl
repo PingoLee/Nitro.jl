@@ -39,14 +39,15 @@ function normalize_middleware(middleware::Vector) :: Vector{Function}
 end
 
 """
-    register_lifecycle!(ctx::ServerContext, middleware::Vector) -> ServerContext
+    register_route_lifecycle!(ctx::ServerContext, middleware::Vector) -> ServerContext
 
-Register every `LifecycleMiddleware` in `middleware` for the server lifecycle, so
-`startserver` runs its `on_startup` and `terminate` its `on_shutdown` (src/core.jl).
+Register every `LifecycleMiddleware` in `middleware` as **route-owned** — declared by the
+context at `urlpatterns()`/`router()` time. These survive `terminate()` and are started again
+by every subsequent `serve()`, because nothing re-registers routes on a restart (#82).
 
-Call this ONLY from paths that run once per server or once per route registration: `serve`,
-`router()`, `OuterRouter`, and `register_route`. **`internalrequest` deliberately does
-not** (#68).
+Call this ONLY from route-registration paths: `router()`, `OuterRouter`, and `register_route`
+(via [`process_middleware`](@ref)). For the `serve(middleware = ...)` list use
+[`register_serve_lifecycle!`](@ref); **`internalrequest` deliberately registers neither** (#68).
 
 `internalrequest` never reaches `startup.` — that lives in `startserver` — so a lifecycle
 middleware registered from there got an `on_shutdown` at the next `terminate` whose paired
@@ -57,16 +58,40 @@ Not fixing that with a lock is the point: the writer had no business existing.
 Note also that "route registration" is not a synonym for "single-threaded startup": under
 `revise=:lazy` a re-registration can run on a request-handling task, so the `Set` this writes
 to is not *proven* free of concurrent writers. Closing that, along with the `Set`'s
-unspecified iteration order, is tracked separately; what #68 removed was the per-request
+unspecified iteration order, is tracked separately (#74); what #68 removed was the per-request
 writer.
 
 Dedup is load-bearing and comes from `Set`: one shared `RateLimiter()` passed to N routes is
 one registration, so its cleanup task starts once, not N times. `LifecycleMiddleware` is an
 immutable struct, so `Set` dedups it structurally.
 """
-function register_lifecycle!(ctx::ServerContext, middleware::Vector)
+function register_route_lifecycle!(ctx::ServerContext, middleware::Vector)
     for mw in middleware
-        mw isa LifecycleMiddleware && push!(ctx.service.lifecycle_middleware, mw)
+        mw isa LifecycleMiddleware && push!(ctx.service.route_lifecycle, mw)
+    end
+    return ctx
+end
+
+"""
+    register_serve_lifecycle!(ctx::ServerContext, middleware::Vector) -> ServerContext
+
+Register every `LifecycleMiddleware` in `middleware` as **serve-owned** — declared by this
+server run, from the `serve(middleware = ...)` list. `terminate()` clears these, so
+`serve(middleware=[A]); terminate(); serve(middleware=[B])` does not also start `A` (#82).
+
+Call this ONLY from `serve` (src/core.jl), once per server.
+
+**Route ownership wins.** A middleware object that is already route-owned is skipped here
+rather than recorded twice, so it starts once per cycle instead of twice. That is also the
+conservative direction: the entry then survives `terminate()`, which is the property #82
+exists to restore. The asymmetry is deliberate — a shared object passed both to a route and to
+`serve(middleware = ...)` is still, in the app's own terms, that route's middleware.
+"""
+function register_serve_lifecycle!(ctx::ServerContext, middleware::Vector)
+    for mw in middleware
+        mw isa LifecycleMiddleware || continue
+        mw in ctx.service.route_lifecycle && continue
+        push!(ctx.service.serve_lifecycle, mw)
     end
     return ctx
 end
@@ -74,12 +99,13 @@ end
 """
     process_middleware(ctx::ServerContext, middleware) -> Vector{Function}
 
-Registration-path helper: [`register_lifecycle!`](@ref) then [`normalize_middleware`](@ref).
-Semantics unchanged by #68 — the per-request path stopped calling *this*; it did not change
-what this does.
+Registration-path helper: [`register_route_lifecycle!`](@ref) then
+[`normalize_middleware`](@ref). Semantics unchanged by #68 — the per-request path stopped
+calling *this*; it did not change what this does. Route-owned is the right half for every
+caller of this function: all of them are route-registration paths (#82).
 """
 function process_middleware(ctx::ServerContext, middleware::Vector) :: Vector{Function}
-    register_lifecycle!(ctx, middleware)
+    register_route_lifecycle!(ctx, middleware)
     return normalize_middleware(middleware)
 end
 

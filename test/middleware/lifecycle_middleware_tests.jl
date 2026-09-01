@@ -70,7 +70,7 @@ using Nitro.Core: LifecycleMiddleware, process_middleware
 import Nitro: ServerContext, path, text
 
 # Regression test for #68 item 2. `process_middleware` used to `push!` into the shared
-# `ctx.service.lifecycle_middleware` Set, and `setupmiddleware` called it — from `serve`
+# lifecycle Set, and `setupmiddleware` called it — from `serve`
 # once, but from `internalrequest` ON EVERY CALL. That made a per-request path a concurrent
 # writer to a Set that `startup.`/`shutdown.` broadcast over (src/core.jl).
 #
@@ -99,7 +99,8 @@ end
         Nitro.Core.internalrequest(ctx, HTTP.Request("GET", "/x");
                                    middleware = [lf], catch_errors = false)
     end
-    @test isempty(ctx.service.lifecycle_middleware)
+    @test isempty(ctx.service.route_lifecycle)
+    @test isempty(ctx.service.serve_lifecycle)
     # The assertion that stops this fix being "just delete the push": the middleware itself
     # must still run on every request, exactly as before.
     @test ran[] == 3
@@ -113,7 +114,9 @@ end
     processed = process_middleware(ctx, [lf])
     @test length(processed) == 1
     @test processed[1] === lf.middleware
-    @test lf in ctx.service.lifecycle_middleware
+    # Route-owned: every caller of `process_middleware` is a route-registration path (#82).
+    @test lf in ctx.service.route_lifecycle
+    @test isempty(ctx.service.serve_lifecycle)
 end
 
 @testset "route and HOF registration paths register" begin
@@ -122,12 +125,12 @@ end
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/y", (req::HTTP.Request) -> text("ok"), middleware = [lf])
     ])
-    @test lf in ctx.service.lifecycle_middleware
+    @test lf in ctx.service.route_lifecycle
 
     lf2, _, _, _ = counting_lifecycle()
     ctx2 = ServerContext()
     Nitro.Core.router(ctx2, "/hof"; middleware = [lf2])
-    @test lf2 in ctx2.service.lifecycle_middleware
+    @test lf2 in ctx2.service.route_lifecycle
 end
 
 @testset "dedup holds — one shared instance across N routes registers once" begin
@@ -139,7 +142,20 @@ end
         path("/p", (req::HTTP.Request) -> text("ok"), middleware = [lf]),
         path("/q", (req::HTTP.Request) -> text("ok"), middleware = [lf]),
     ])
-    @test length(ctx.service.lifecycle_middleware) == 1
+    @test length(ctx.service.route_lifecycle) == 1
+end
+
+@testset "route ownership wins over serve ownership (#82)" begin
+    # A single object handed both to a route and to `serve(middleware = ...)` must start
+    # ONCE per cycle, not twice — and it must land on the half that survives `terminate`.
+    lf, _, _, _ = counting_lifecycle()
+    ctx = ServerContext()
+    Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+        path("/shared", (req::HTTP.Request) -> text("ok"), middleware = [lf]),
+    ])
+    Nitro.Core.RouterHOF.register_serve_lifecycle!(ctx, Any[lf])
+    @test lf in ctx.service.route_lifecycle
+    @test isempty(ctx.service.serve_lifecycle)
 end
 end
 
@@ -171,11 +187,164 @@ Nitro.Core.serve(ctx; middleware = [lf], host = HOST, port = port, async = true,
                  show_banner = false, show_errors = false, access_log = nothing)
 @test timedwait(() -> Base.isopen(ctx.service), 10.0) === :ok
 
-@test lf in ctx.service.lifecycle_middleware
+@test lf in ctx.service.serve_lifecycle
 @test started[] == 1
 @test stopped[] == 0
 
 Nitro.Core.terminate(ctx)
 @test stopped[] == 1
-@test isempty(ctx.service.lifecycle_middleware)
+@test isempty(ctx.service.serve_lifecycle)
 end
+
+
+@testitem "Lifecycle middleware — route-owned hooks survive a serve/terminate cycle" tags=[:middleware, :network] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+using Nitro.Core: LifecycleMiddleware
+import Nitro: ServerContext, path, text
+
+# Regression test for #82. `terminate()` used to `empty!` a single `lifecycle_middleware` Set
+# that held two kinds of member with different lifetimes. Emptying is right for the
+# serve-owned half (from `serve(middleware = ...)`, re-added on every `serve`) and wrong for
+# the route-owned half (from `urlpatterns()`, added once and never re-added) — so after
+# `serve(); terminate(); serve()` every route-level `on_startup` was silently skipped for the
+# rest of the process's life. For a route-level `RateLimiter` that meant its bucket-pruning
+# task never restarted while the limiter kept recording every request: an unbounded leak in
+# the component whose entire job is to bound resource use.
+#
+# Against the unpatched code `started[] == 1` here, not 2.
+
+function counting_lifecycle()
+    started, stopped = Ref(0), Ref(0)
+    lf = LifecycleMiddleware(
+        middleware  = handler -> (req::HTTP.Request -> handler(req)),
+        on_startup  = () -> (started[] += 1),
+        on_shutdown = () -> (stopped[] += 1))
+    return lf, started, stopped
+end
+
+_serve(ctx, port) = Nitro.Core.serve(ctx; host = HOST, port = port, async = true,
+                                     show_banner = false, show_errors = false,
+                                     access_log = nothing)
+
+@testset "route-level on_startup re-fires on the second serve()" begin
+    lf, started, stopped = counting_lifecycle()
+    ctx = ServerContext()
+    Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+        path("/limited", (req::HTTP.Request) -> text("ok"), middleware = [lf])
+    ])
+    @test lf in ctx.service.route_lifecycle
+
+    _serve(ctx, get_free_port())
+    @test timedwait(() -> Base.isopen(ctx.service), 10.0) === :ok
+    @test started[] == 1
+    Nitro.Core.terminate(ctx)
+    @test stopped[] == 1
+
+    # The whole point: route registration is NOT repeated, so the entry has to have survived.
+    @test lf in ctx.service.route_lifecycle
+
+    _serve(ctx, get_free_port())
+    @test timedwait(() -> Base.isopen(ctx.service), 10.0) === :ok
+    @test started[] == 2
+    Nitro.Core.terminate(ctx)
+    @test stopped[] == 2
+end
+
+@testset "serve-owned hooks do NOT accumulate across cycles" begin
+    # The other half, and why "just delete the empty!" is the wrong fix: a serve-owned entry
+    # belongs to its own `serve()` call, so a later `serve(middleware=[B])` must not also
+    # start `A`.
+    lfa, started_a, _ = counting_lifecycle()
+    lfb, started_b, _ = counting_lifecycle()
+    ctx = ServerContext()
+    Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+        path("/health", (req::HTTP.Request) -> text("ok"))
+    ])
+
+    Nitro.Core.serve(ctx; middleware = [lfa], host = HOST, port = get_free_port(),
+                     async = true, show_banner = false, show_errors = false,
+                     access_log = nothing)
+    @test timedwait(() -> Base.isopen(ctx.service), 10.0) === :ok
+    @test started_a[] == 1
+    Nitro.Core.terminate(ctx)
+    @test isempty(ctx.service.serve_lifecycle)
+
+    Nitro.Core.serve(ctx; middleware = [lfb], host = HOST, port = get_free_port(),
+                     async = true, show_banner = false, show_errors = false,
+                     access_log = nothing)
+    @test timedwait(() -> Base.isopen(ctx.service), 10.0) === :ok
+    @test started_b[] == 1
+    @test started_a[] == 1          # NOT 2 — A belonged to the previous run
+    Nitro.Core.terminate(ctx)
+end
+
+@testset "shutdown unwinds the reverse of startup" begin
+    # startserver runs route-owned then serve-owned; terminate must unwind serve-owned first.
+    order = String[]
+    mk(name) = LifecycleMiddleware(
+        middleware  = handler -> (req::HTTP.Request -> handler(req)),
+        on_startup  = () -> push!(order, "up:$name"),
+        on_shutdown = () -> push!(order, "down:$name"))
+
+    route_lf, serve_lf = mk("route"), mk("serve")
+    ctx = ServerContext()
+    Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+        path("/o", (req::HTTP.Request) -> text("ok"), middleware = [route_lf])
+    ])
+    Nitro.Core.serve(ctx; middleware = [serve_lf], host = HOST, port = get_free_port(),
+                     async = true, show_banner = false, show_errors = false,
+                     access_log = nothing)
+    @test timedwait(() -> Base.isopen(ctx.service), 10.0) === :ok
+    Nitro.Core.terminate(ctx)
+
+    @test order == ["up:route", "up:serve", "down:serve", "down:route"]
+end
+end # @testitem
+
+
+@testitem "RateLimiter — a restart does not leak the previous cleanup task" tags=[:middleware, :slow] setup=[NitroCommon] begin
+using Test
+using Dates
+using Nitro
+import Nitro: RateLimiter
+
+# Companion to #82, and a defect the issue body explicitly (and wrongly) ruled out: it claims
+# `RateLimiter`'s hooks "are idempotent across cycles". They were not.
+#
+# `on_shutdown` cannot wait for the cleanup task — it is parked in `sleep(cleanup_period)`,
+# up to 10 minutes from its next flag check by default. With a single shared `running` flag:
+#
+#   on_shutdown : running[] = false ; cleanup_task[] = nothing   (old task still sleeping)
+#   on_startup  : running[] = true  ; isnothing(cleanup_task[]) -> spawns a SECOND task
+#   old task    : wakes, reads running[] == true, keeps looping
+#
+# One extra task leaked per restart, unbounded. Before #82 this only bit serve-owned
+# limiters; fixing #82 made route-owned ones restart too, which widened it.
+#
+# The fix is a per-activation token, so a stale task can only ever observe its OWN flag.
+# `on_startup`/`on_shutdown` return the `Task` so this is observable at all — against the
+# unpatched code `t1` never finishes and the first `timedwait` below times out.
+
+lf = RateLimiter(rate_limit = 5, window = Second(1),
+                 cleanup_period = Millisecond(50), cleanup_threshold = Millisecond(50))
+
+t1 = lf.on_startup()
+@test t1 isa Task
+@test lf.on_startup() === nothing            # idempotent: no second task while one is live
+
+lf.on_shutdown()
+t2 = lf.on_startup()
+@test t2 isa Task
+@test t2 !== t1
+
+# The assertion that fails on the unpatched code: the previous activation's task must exit on
+# its next wake, regardless of the new activation having set the flag back to true.
+@test timedwait(() -> istaskdone(t1), 10.0) === :ok
+@test !istaskdone(t2)                        # ...and the current one is still doing its job
+
+lf.on_shutdown()
+@test timedwait(() -> istaskdone(t2), 10.0) === :ok
+@test lf.on_shutdown() === nothing            # idempotent: nothing left to stop
+end # @testitem
