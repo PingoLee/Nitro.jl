@@ -471,6 +471,34 @@ end
                                           catch_errors = false)) == "late|h"
 end
 
+@testset "keys cannot collide across routes — the tag is fixed width" begin
+    # Security-relevant invariant, and the reason invalidation uses exact keys rather than a
+    # `"GET|/a|"` prefix. A route path may itself contain `|`, so if tags varied in width,
+    # route `/a` under one tag could produce the same key as route `/a|X` under another — and a
+    # cache collision means one route's composed chain is served for a DIFFERENT route, i.e.
+    # the wrong middleware runs. If that middleware is a `GuardMiddleware`, the route it was
+    # registered on is served without it.
+    #
+    # Every tag is exactly 4 characters, so `key1 * tag1 == key2 * tag2` forces `key1 == key2`.
+    # This pins that: a future "shorten the common tag" optimization breaks it silently.
+    @test all(length(t) == 4 for t in CACHE_TAGS)
+
+    ctx = ServerContext()
+    Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+        path("/a", (req::HTTP.Request) -> text("plain"),
+             middleware = [handler -> (req::HTTP.Request -> handler(req))]),
+        path("/a" * cachetag(true, true, true), (req::HTTP.Request) -> text("pipe"),
+             middleware = [handler -> (req::HTTP.Request -> handler(req))]),
+    ])
+    for (target, want) in (("/a", "plain"), ("/a" * cachetag(true, true, true), "pipe")),
+        ce in (true, false)
+        r = Nitro.Core.internalrequest(ctx, HTTP.Request("GET", target); catch_errors = ce)
+        @test text(r) == want          # never the other route's chain
+    end
+    # Two routes times two settings variants, all distinct.
+    @test length(snapshot(ctx.service.middleware_cache)) == 4
+end
+
 @testset "the tag tuple covers every tag cachetag can produce" begin
     # `CACHE_TAGS` drives invalidation, so a tag `cachetag` can emit that is missing from it is
     # a stranded cache entry with no symptom until someone hits that exact pipeline.
