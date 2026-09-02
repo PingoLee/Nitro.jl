@@ -73,6 +73,9 @@ end
     lock(cache.lock)                                  # hold it from this task
     try
         t = Threads.@spawn delete!($cache, "GET|/never-present")
+        # Started, so "not done" below means BLOCKED, not "never scheduled" — otherwise this
+        # negative-within-a-timeout could pass for the wrong reason.
+        @test timedwait(() -> istaskstarted(t), 5.0) === :ok
         # Blocked on the lock we hold: if `delete!` short-circuited before locking it would
         # already be done.
         @test timedwait(() -> istaskdone(t), 0.5) === :timed_out
@@ -153,7 +156,9 @@ r1 = text(pipeline(HTTP.Request("GET", "/warm")))
         @test text(pipeline(HTTP.Request("GET", "/warm"))) == "v2|handler"
     end
     # Cache keys carry the pipeline's serializer settings since #79 ("|cES" here).
-    @test snapshot(ctx.service.middleware_cache)[key * TAG] isa Function   # it did converge
+    # `haskey`, not `isa Function`: the table is a `CopyOnWriteDict{Function}`, so an `isa`
+    # check on the value is true of anything it could possibly hold.
+    @test haskey(snapshot(ctx.service.middleware_cache), key * TAG)   # it did converge
 end
 
 @testset "warmup still caches on the quiet path" begin

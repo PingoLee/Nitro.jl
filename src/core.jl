@@ -789,7 +789,7 @@ function _app_context_seed(ctx::ServerContext)
     end
 end
 
-function setupmiddleware(ctx::ServerContext; middleware::Vector=[], serialize::Bool=true, catch_errors::Bool=true, show_errors=true, access_log=false, access_log_query::Bool=false)::Function
+function setupmiddleware(ctx::ServerContext; middleware::Vector=[], serialize::Bool=true, catch_errors::Bool=true, show_errors::Bool=true, access_log=false, access_log_query::Bool=false)::Function
     raw_middleware = reverse(middleware)
     # `normalize_middleware`, NOT `process_middleware`: this runs once per `serve` but ONCE
     # PER CALL from `internalrequest`, so it must have no registration side effect. `serve`
@@ -845,9 +845,15 @@ function setupmiddleware(ctx::ServerContext; middleware::Vector=[], serialize::B
         # `catch_errors`/`show_errors`/`serialize` travel into `compose` because the chain it
         # caches closes over them, via `serializer` above — so they belong in the cache key
         # (#79). They are not otherwise used there.
+        #
+        # `show_errors` is declared `::Bool` above for this reason: `DefaultSerializer` converts
+        # whatever it gets, so an untyped truthy value (`1`) would bake `true` into the chain
+        # while `cachetag` recorded `e` — two pipelines with different behaviour sharing one
+        # cache key, which is the exact failure #79 removed. Typing it makes the projection
+        # lossless by construction rather than by luck.
         compose(ctx.service.router, processed_middleware,
                 ctx.service.custommiddleware, ctx.service.middleware_cache;
-                catch_errors, show_errors = show_errors === true, serialize),
+                catch_errors, show_errors, serialize),
         global_prefix_middleware...,
         access_log_middleware...,
         _app_context_seed(ctx),

@@ -157,6 +157,27 @@ end
     @test lf in ctx.service.route_lifecycle
     @test isempty(ctx.service.serve_lifecycle)
 end
+
+@testset "...and in the other direction too — serve first, then route" begin
+    # The direction the guard above cannot see. `serve` runs first, then a runtime
+    # `include_routes`/Revise re-registration claims the same object for a route. Without a
+    # promoting guard on the route side it lands in BOTH halves, and `terminate` calls its
+    # `on_shutdown` twice in a single cycle — once per half.
+    lf, _, _, _ = counting_lifecycle()
+    ctx = ServerContext()
+    Nitro.Core.RouterHOF.register_serve_lifecycle!(ctx, Any[lf])
+    @test lf in ctx.service.serve_lifecycle
+
+    Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+        path("/late", (req::HTTP.Request) -> text("ok"), middleware = [lf]),
+    ])
+
+    @test lf in ctx.service.route_lifecycle
+    @test lf ∉ ctx.service.serve_lifecycle          # promoted out, not duplicated
+    # The assertion that matters: exactly one registration across both halves, so exactly one
+    # on_startup and one on_shutdown per cycle.
+    @test count(==(lf), [ctx.service.route_lifecycle; ctx.service.serve_lifecycle]) == 1
+end
 end
 
 
@@ -379,7 +400,15 @@ function recorder()
     return order, mk
 end
 
-@testset "registration order in, exact reverse out" begin
+# NOTE on scope. The two testsets below pin the CONTAINER — that it is ordered, and that the
+# order is reproducible — which is #74 item 1's root cause. They do NOT pin `terminate`'s
+# reversal, because they supply the `Iterators.reverse` themselves; swapping `src/core.jl` to
+# FIFO leaves them green. The assertion that actually pins the teardown contract is
+# `order == ["up:route", "up:serve", "down:serve", "down:route"]` in the
+# "route-owned hooks survive a serve/terminate cycle" item above, which drives the real
+# `serve`/`terminate` — and it is tagged `:network`, so a run filtered away from `:network`
+# does not check the teardown order at all.
+@testset "the container preserves registration order" begin
     order, mk = recorder()
     a, b, c = mk("a"), mk("b"), mk("c")
     ctx = ServerContext()

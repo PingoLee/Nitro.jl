@@ -4,7 +4,7 @@ using HTTP
 
 using ..Util: join_url_path
 using ..AppContext: ServerContext
-using ..Types: Nullable, LifecycleMiddleware, CopyOnWriteDict, snapshot, cache!,
+using ..Types: Nullable, LifecycleMiddleware, CopyOnWriteDict, snapshot,
                 cache_if_current!, publish!
 
 export router, compose, genkey, cachetag, process_middleware, HOFRouter, OuterRouter, InnerRouter
@@ -76,7 +76,22 @@ function register_route_lifecycle!(ctx::ServerContext, middleware::Vector)
     lock(ctx.service.lifecycle_lock) do
         for mw in middleware
             mw isa LifecycleMiddleware || continue
-            mw ∉ ctx.service.route_lifecycle && push!(ctx.service.route_lifecycle, mw)
+            mw ∈ ctx.service.route_lifecycle && continue
+            # PROMOTE, don't just append. "Route ownership wins" has to hold in both
+            # directions or the object ends up in both halves and `terminate` calls its
+            # `on_shutdown` TWICE in one cycle — once per half. Reachable whenever route
+            # registration follows `serve`, which is the runtime-`include_routes` /
+            # `revise=:lazy` case this whole cluster exists for:
+            #
+            #   serve(ctx; middleware = [rl])                       -> serve-owned
+            #   urlpatterns(ctx, "", [path("/x", h, middleware=[rl])])  -> also route-owned
+            #   terminate(ctx)                                      -> shutdown twice
+            #
+            # `RateLimiter`'s hooks happen to tolerate it, but `LifecycleMiddleware` is public
+            # and an app hook that closes a connection or decrements a refcount does not.
+            i = findfirst(==(mw), ctx.service.serve_lifecycle)
+            isnothing(i) || deleteat!(ctx.service.serve_lifecycle, i)
+            push!(ctx.service.route_lifecycle, mw)
         end
     end
     return ctx
@@ -91,11 +106,16 @@ server run, from the `serve(middleware = ...)` list. `terminate()` clears these,
 
 Call this ONLY from `serve` (src/core.jl), once per server.
 
-**Route ownership wins.** A middleware object that is already route-owned is skipped here
-rather than recorded twice, so it starts once per cycle instead of twice. That is also the
-conservative direction: the entry then survives `terminate()`, which is the property #82
-exists to restore. The asymmetry is deliberate — a shared object passed both to a route and to
-`serve(middleware = ...)` is still, in the app's own terms, that route's middleware.
+**Route ownership wins, in both directions.** A middleware object already route-owned is
+skipped here; and [`register_route_lifecycle!`](@ref) *promotes* — it removes the object from
+this half when claiming it. Either way it appears in exactly one half, so it starts and stops
+once per cycle. Enforcing only the direction this function can see would leave an object
+registered serve-first-then-route in both halves, and `terminate` would call its `on_shutdown`
+twice in one cycle.
+
+Route is the winning side because the entry then survives `terminate()`, which is the property
+#82 exists to restore — a shared object passed both to a route and to `serve(middleware = ...)`
+is still, in the app's own terms, that route's middleware.
 """
 function register_serve_lifecycle!(ctx::ServerContext, middleware::Vector)
     lock(ctx.service.lifecycle_lock) do
@@ -176,6 +196,14 @@ Fixed by putting every input in the key. The completeness argument is short and 
 these three — `router_entry` is fixed per context, and the access-log and prefix middleware wrap
 *outside* `compose`, so they are not captured. Nothing else can vary.
 
+!!! warning "One input is excluded by a *different* invariant, not by this key"
+    The cached value is `buildmiddleware(...)`, which also closes over `globalmiddleware`. That
+    is absent from the key and safe **only** because `use_cache = isempty(globalmiddleware)` —
+    nothing is cached at all when there is any. So the obvious future optimization, "why not
+    cache when global middleware is present too?", silently makes this key incomplete again and
+    reintroduces exactly the bug #79 fixed. Caching with non-empty `globalmiddleware` requires
+    putting it in the key first, and it has no stable identity to key on.
+
 Deliberately NOT collapsed: with `serialize = false` there is no serializer at all, so the other
 two booleans are unobservable and four tags describe one pipeline. Canonicalizing them would
 save at most three unused cache slots and costs a subtle invariant to maintain.
@@ -187,8 +215,12 @@ cachetag(catch_errors::Bool, show_errors::Bool, serialize::Bool)::String =
     string('|', catch_errors ? 'C' : 'c', show_errors ? 'E' : 'e', serialize ? 'S' : 's')
 
 # Every tag `cachetag` can produce. Invalidation must drop a route's chain under ALL of them,
-# and it does so by exact key rather than by prefix matching: a route path may itself contain
-# `|`, so a `"GET|/a|"` prefix would also match the cache key of a route registered at `/a|b`.
+# and it does so by exact key rather than by prefix matching. Prefix matching would be *correct*
+# — a route path may contain `|`, so a `"GET|/a|"` prefix would also sweep the cache key of a
+# route registered at `/a|b`, but over-invalidation only costs a rebuild. The reasons are cost
+# and simplicity: a prefix scan is O(#keys) with a `startswith` per key, under the lock, versus
+# eight exact lookups. (What fixed-width tags DO buy is the no-collision property — see the
+# `cachetag` docstring.)
 const CACHE_TAGS = ntuple(i -> cachetag(isodd((i - 1) >> 2), isodd((i - 1) >> 1), isodd(i - 1)), 8)
 
 """
@@ -408,8 +440,9 @@ function compose(router::HTTP.Router, globalmiddleware::Vector,
                 # *earlier* than the one `buildmiddleware` took for itself. That is deliberate
                 # and safe: if a write landed between the two, the identity check fails and we
                 # decline to cache. Conservative in the safe direction — never the other way.
-                use_cache && cache_if_current!(middleware_cache,
-                                               string(key, cache_suffix), strategy,
+                # `cachekey` from the lookup above is still in scope — `if` opens no new scope
+                # in Julia — so reuse it rather than rebuilding the identical string.
+                use_cache && cache_if_current!(middleware_cache, cachekey, strategy,
                                                custommiddleware, custom_snap)
 
                 return strategy(req)

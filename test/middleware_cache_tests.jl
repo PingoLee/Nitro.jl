@@ -472,15 +472,17 @@ end
 end
 
 @testset "keys cannot collide across routes — the tag is fixed width" begin
-    # Security-relevant invariant, and the reason invalidation uses exact keys rather than a
-    # `"GET|/a|"` prefix. A route path may itself contain `|`, so if tags varied in width,
-    # route `/a` under one tag could produce the same key as route `/a|X` under another — and a
-    # cache collision means one route's composed chain is served for a DIFFERENT route, i.e.
-    # the wrong middleware runs. If that middleware is a `GuardMiddleware`, the route it was
-    # registered on is served without it.
+    # Security-relevant invariant. A route path may itself contain `|`, so route `/a` under one
+    # tag and route `/a|X` under another are competing for the same key space. A cache collision
+    # there means one route's composed chain is served for a DIFFERENT route: the wrong
+    # middleware runs, and if the middleware that goes missing is a `GuardMiddleware`, the route
+    # it was registered on is served without it.
     #
-    # Every tag is exactly 4 characters, so `key1 * tag1 == key2 * tag2` forces `key1 == key2`.
-    # This pins that: a future "shorten the common tag" optimization breaks it silently.
+    # Fixed-width tags make the proof trivial — every tag is exactly 4 characters, so
+    # `key1 * tag1 == key2 * tag2` forces `|key1| == |key2|` hence `key1 == key2`. Variable
+    # widths would not automatically collide, but they would replace that one-line argument with
+    # a case analysis over the whole tag set, re-done on every change to it. This pins the cheap
+    # invariant instead: a future "shorten the common tag" optimization trips here.
     @test all(length(t) == 4 for t in CACHE_TAGS)
 
     ctx = ServerContext()

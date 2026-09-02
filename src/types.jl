@@ -511,7 +511,10 @@ separate `delete!` calls would take the cache lock N times and publish up to N i
 tables for one logical invalidation.
 
 `keys` is any iterable of `String` — a generator is the expected shape, so nothing is
-materialized.
+materialized. It is consumed exactly **once**: an earlier draft probed with `any(...)` and then
+iterated again to delete, which silently skipped the matching key when handed a single-pass
+iterator (`Iterators.Stateful`) — an invalidation that deletes nothing and returns normally,
+i.e. #71's symptom with no error.
 
 !!! warning "The lock is taken unconditionally, and that is load-bearing"
     Same invariant as the single-key method: the all-absent fast path skips the *publish*, never
@@ -521,13 +524,19 @@ materialized.
 function Base.delete!(d::CopyOnWriteDict{V}, keys) where {V}
     lock(d.lock) do
         current = @atomic :monotonic d.entries
-        # Probe first so the common case — invalidating a route nobody has warmed yet — does no
-        # copying. The lock is already held either way; see the warning above.
-        any(k -> haskey(current, k), keys) || return d
-        updated = copy(current)
+        # ONE pass. The copy is made lazily, on the first key that is actually present, so the
+        # common case — invalidating a route nobody has warmed yet — still does no copying. Keys
+        # seen before that point were by definition absent, so skipping them loses nothing.
+        # The lock is already held either way; see the warning above.
+        updated = nothing
         for k in keys
+            if isnothing(updated)
+                haskey(current, k) || continue
+                updated = copy(current)
+            end
             delete!(updated, k)
         end
+        isnothing(updated) && return d
         @atomic :release d.entries = updated
     end
     return d
