@@ -34,7 +34,7 @@ function getcontext end
 
 include("handlers.jl");     @reexport using .Handlers
 include("routerhof.jl");    @reexport using .RouterHOF
-using .RouterHOF: normalize_middleware, register_lifecycle!
+using .RouterHOF: normalize_middleware, register_serve_lifecycle!, lifecycle_snapshot
 include("reflection.jl");   @reexport using .Reflection
 include("extractors.jl");   @reexport using .Extractors
 include("response.jl");     @reexport using .Res
@@ -442,7 +442,7 @@ function serve(ctx::ServerContext;
     parallel=true,
     serialize=true,
     catch_errors=true,
-    show_errors=true,
+    show_errors::Bool=true,
     show_banner=true,
     access_log=true,
     access_log_query=false,
@@ -529,10 +529,13 @@ function serve(ctx::ServerContext;
     # wrote to an unsynchronized `Set` that `startup.`/`shutdown.` broadcast over, which a
     # concurrent `internalrequest` could overlap.
     #
+    # SERVE-owned (#82): this list belongs to this server run, so `terminate` clears it. Route
+    # middleware registers itself as route-owned at `urlpatterns()` time instead, and survives.
+    #
     # Placed after the `revise` block above so it operates on the final `middleware` vector.
     # (Inert today — `ReviseHandler()` is a plain closure, not a `LifecycleMiddleware`, so
     # the resulting `Set` is the same either way — but the ordering is the correct default.)
-    register_lifecycle!(ctx, middleware)
+    register_serve_lifecycle!(ctx, middleware)
 
     configured_middelware = setupmiddleware(ctx; middleware, serialize, catch_errors, show_errors, access_log, access_log_query)
     handle_stream = handler(configured_middelware)
@@ -617,12 +620,24 @@ See also `serve`.
 """
 function terminate(context::ServerContext; timeout::Nullable{Real} = nothing)
     if isopen(context.service)
-        shutdown.(context.service.lifecycle_middleware)
-        # NOTE(#82): this also drops *route-level* lifecycle middleware, which is registered at
-        # `urlpatterns()` time rather than at `serve()` time — so `serve(); terminate(); serve()`
-        # never re-runs those startup hooks. Fixing it properly means splitting the set into
-        # route-owned and serve-owned halves; tracked separately.
-        empty!(context.service.lifecycle_middleware)
+        # LIFO (#74): the exact reverse of `startserver`'s startup sequence, which ran
+        # route-owned then serve-owned, each in registration order. So: serve-owned reversed,
+        # then route-owned reversed. Teardown order is a specified contract now, not hash
+        # order — see `Service` (src/context.jl) for why LIFO and not something else.
+        route_lf, serve_lf = lifecycle_snapshot(context)
+        shutdown.(Iterators.reverse(serve_lf))
+        shutdown.(Iterators.reverse(route_lf))
+        # Only the SERVE-owned half is cleared (#82). These came from this run's
+        # `serve(middleware = ...)` list and `serve` re-registers them on the next call, so
+        # keeping them would start a previous run's middleware alongside the new one.
+        #
+        # `route_lifecycle` is deliberately NOT emptied. Those entries were declared once, at
+        # `urlpatterns()` time, and nothing re-adds them — routes are not re-registered on a
+        # second `serve()`. Emptying them is what made every route-level `on_startup` silently
+        # skipped for the rest of the process's life, which for a route-level `RateLimiter`
+        # meant its bucket-pruning task never restarted while the store kept growing. They are
+        # cleared only by replacing the context (`resetstate()`, src/methods.jl).
+        lock(() -> empty!(context.service.serve_lifecycle), context.service.lifecycle_lock)
         # Do NOT "symmetrize" this by also emptying `custommiddleware`: that table is route
         # *registration* state, not cache state. test/original_tests.jl re-serves after a
         # `terminate()` and expects the registered routes and their middleware to survive.
@@ -774,7 +789,7 @@ function _app_context_seed(ctx::ServerContext)
     end
 end
 
-function setupmiddleware(ctx::ServerContext; middleware::Vector=[], serialize::Bool=true, catch_errors::Bool=true, show_errors=true, access_log=false, access_log_query::Bool=false)::Function
+function setupmiddleware(ctx::ServerContext; middleware::Vector=[], serialize::Bool=true, catch_errors::Bool=true, show_errors::Bool=true, access_log=false, access_log_query::Bool=false)::Function
     raw_middleware = reverse(middleware)
     # `normalize_middleware`, NOT `process_middleware`: this runs once per `serve` but ONCE
     # PER CALL from `internalrequest`, so it must have no registration side effect. `serve`
@@ -827,8 +842,18 @@ function setupmiddleware(ctx::ServerContext; middleware::Vector=[], serialize::B
     return reduce(|>, [
         router_entry,
         serializer...,
+        # `catch_errors`/`show_errors`/`serialize` travel into `compose` because the chain it
+        # caches closes over them, via `serializer` above — so they belong in the cache key
+        # (#79). They are not otherwise used there.
+        #
+        # `show_errors` is declared `::Bool` above for this reason: `DefaultSerializer` converts
+        # whatever it gets, so an untyped truthy value (`1`) would bake `true` into the chain
+        # while `cachetag` recorded `e` — two pipelines with different behaviour sharing one
+        # cache key, which is the exact failure #79 removed. Typing it makes the projection
+        # lossless by construction rather than by luck.
         compose(ctx.service.router, processed_middleware,
-                ctx.service.custommiddleware, ctx.service.middleware_cache),
+                ctx.service.custommiddleware, ctx.service.middleware_cache;
+                catch_errors, show_errors, serialize),
         global_prefix_middleware...,
         access_log_middleware...,
         _app_context_seed(ctx),
@@ -838,7 +863,15 @@ end
 function startserver(ctx::ServerContext; host, port, show_banner=false, parallel=false, async=false, kwargs, start)::Union{Server, Nothing}
     show_banner && serverwelcome(ctx.service.external_url[], ctx.service.prefix[], parallel)
     ctx.service.server[] = start(preprocesskwargs(kwargs))
-    startup.(ctx.service.lifecycle_middleware)
+    # Route-owned first, then serve-owned: that is declaration order — routes are registered at
+    # `urlpatterns()` time, the `serve(middleware = ...)` list only at `serve()` time (#82).
+    # Within each half, registration order. `terminate` unwinds the exact reverse (#74).
+    #
+    # Over a snapshot, not the live vectors: a `revise=:lazy` re-registration runs on a
+    # request-handling task and could otherwise `push!` while this broadcast iterates.
+    route_lf, serve_lf = lifecycle_snapshot(ctx)
+    startup.(route_lf)
+    startup.(serve_lf)
 
     if !async
         try

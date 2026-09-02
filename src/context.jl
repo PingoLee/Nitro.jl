@@ -33,7 +33,41 @@ end
     prefix              :: Ref{Nullable{String}}    = Ref{Nullable{String}}(nothing)
     eager_revise        :: Ref{Nullable{EagerReviseService}} = Ref{Nullable{EagerReviseService}}(nothing)
     named_routes_lock     :: ReentrantLock          = ReentrantLock()
-    lifecycle_middleware  :: Set{LifecycleMiddleware} = Set{LifecycleMiddleware}()
+    # Lifecycle middleware, split by the SCOPE that declared it (#82). The two halves have
+    # genuinely different lifetimes, and collapsing them into one collection is what made
+    # `serve(); terminate(); serve()` silently drop every route-level startup hook:
+    #
+    #   `route_lifecycle` — declared by the CONTEXT, at `urlpatterns()`/`router()` time, once.
+    #       Nothing re-adds these on a second `serve()`, because routes are not re-registered.
+    #       Survives `terminate()`; cleared only by replacing the context (`resetstate()`).
+    #
+    #   `serve_lifecycle` — declared by THIS SERVER RUN, from the `serve(middleware = ...)`
+    #       list, on every `serve()`. Cleared by `terminate()`, or `serve(middleware=[A]);
+    #       terminate(); serve(middleware=[B])` would start `A`'s lifecycle again as well.
+    #
+    # This is the Spring application-context distinction: the registry is a *declaration*, not
+    # a consumable, and a declaration belongs to whatever owns it. No framework clears its
+    # lifecycle registry wholesale on stop — Spring closes the context and you build a new one,
+    # ASP.NET disposes the `IHost`, an OTP child spec outlives its supervisor terminating.
+    #
+    # `Vector`, not `Set`, and guarded by `lifecycle_lock` (#74). Broadcasting `startup.`/
+    # `shutdown.` over a `Set` collected it in hash order, and `LifecycleMiddleware` is an
+    # immutable struct whose fields are closures — heap objects — so the order varied run to
+    # run. Teardown is now LIFO: startup in registration order, shutdown in its exact reverse,
+    # matching Spring's `SmartLifecycle` phases, ASP.NET Core's `IHostedService`, OTP
+    # supervisors, ASGI lifespan, and `defer`/`atexit`. Nobody ships FIFO teardown, and nobody
+    # should ship an unspecified one.
+    #
+    # Dedup moves from `Set` to an `∉` guard in `register_*_lifecycle!` and stays load-bearing:
+    # one shared `RateLimiter()` passed to N routes must start its cleanup task once, not N
+    # times. Swapping the container without that guard would regress it silently.
+    #
+    # One lock for both halves — they are always read together, and the asymmetry #74 points at
+    # (`named_routes` has `named_routes_lock`, `extensions` has `extensions_lock`) is the
+    # convention here.
+    route_lifecycle       :: Vector{LifecycleMiddleware} = LifecycleMiddleware[]
+    serve_lifecycle       :: Vector{LifecycleMiddleware} = LifecycleMiddleware[]
+    lifecycle_lock        :: ReentrantLock          = ReentrantLock()
     cookies               :: Ref{CookieConfig}      = Ref{CookieConfig}(CookieConfig())
     extensions            :: Dict{Symbol, Any}      = Dict{Symbol, Any}()
     extensions_lock       :: ReentrantLock          = ReentrantLock()

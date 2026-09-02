@@ -236,8 +236,11 @@ function cleanup_expired_sessions!(store::MemoryStore)
 end
 
 # ── Copy-on-write table (atomic publish, lock-free reads) ───────────────────────
-# A `String`-keyed table read on the request hot path and written rarely, off it. Keys are
-# route keys ("METHOD|path", see `genkey`) at both instantiations.
+# A `String`-keyed table read on the request hot path and written rarely, off it. The two
+# instantiations no longer share a key space: `custommiddleware` keys on the route alone
+# ("METHOD|path", see `genkey`), while `middleware_cache` appends the pipeline's serializer
+# settings ("METHOD|path|CES", see `cachetag`) — because the chain it stores closes over those
+# settings, so the route alone is not a complete key for it (#79).
 #
 # Two instantiations, with deliberately different write semantics:
 #
@@ -361,6 +364,64 @@ function cache!(d::CopyOnWriteDict{V}, key::String, value::V) where {V}
 end
 
 """
+    cache_if_current!(d::CopyOnWriteDict{V}, key::String, value::V,
+                      source::CopyOnWriteDict, expected::Dict) -> Bool
+
+**First writer wins, and only while `source` has not moved.** Publish `key => value` into `d`
+unless `key` is already present *or* `source`'s table is no longer the one `value` was derived
+from. Returns whether it published.
+
+This is [`cache!`](@ref) plus a generation check, and it exists to close the stale-chain race
+that publish-then-invalidate only narrowed (#81). Registration does
+`publish!(custommiddleware, …)` then `delete!(middleware_cache, …)`; a request whose chain
+construction straddled that whole pair used to `cache!` a chain built from the *old* table, and
+first-writer-wins then made it permanent. Symptom: route middleware registered at runtime that
+silently never runs.
+
+**The generation stamp is the table's own identity — there is no counter.** Every write to a
+`CopyOnWriteDict` release-stores a *freshly allocated* `Dict`, and the caller still holds a
+reference to the one it read, so that object cannot be collected and its address cannot be
+reused while the comparison is live. `===` on the snapshot is therefore a sound generation
+check that costs one acquire-load on the miss path and nothing at all on the hit path.
+
+**Why the window is actually closed, not merely narrower.** The check runs *inside* `d`'s lock,
+and [`delete!`](@ref) acquires that same lock **unconditionally** — it locks first and only then
+early-returns on an absent key. So the racing registration and this publish are totally ordered
+on one lock, leaving exactly two cases:
+
+1. This critical section precedes the registration's `delete!`. The `delete!` therefore runs
+   *after* the insert, sees it (unlock→lock happens-before), and removes it.
+2. The registration's `delete!` precedes this critical section. Then `publish!(source, …)`
+   happened-before that `delete!` (program order), which happened-before this section (lock
+   edge) — so this `snapshot(source)` **must** observe the new table, `!==` fires, and nothing
+   is published.
+
+There is no third case, so no interleaving can strand a stale entry.
+
+!!! warning
+    `delete!` must keep taking the lock even when the key is absent. A lock-free `haskey`
+    pre-check added there as an "optimization" would silently reopen case 2.
+
+`expected` is the snapshot the value was derived from. Passing an *earlier* snapshot than the
+one actually used is safe and is what `compose` does — it reuses the snapshot it already took
+for the emptiness test, and `buildmiddleware` takes its own, later one. If the two disagree,
+this refuses to publish: conservative in the safe direction, never the other way.
+"""
+function cache_if_current!(d::CopyOnWriteDict{V}, key::String, value::V,
+                           source::CopyOnWriteDict, expected::Dict)::Bool where {V}
+    return lock(d.lock) do
+        # Inside the lock, and that placement is the whole proof — see the docstring.
+        snapshot(source) === expected || return false
+        current = @atomic :monotonic d.entries
+        haskey(current, key) && return false
+        updated = _grown_copy(current)
+        updated[key] = value
+        @atomic :release d.entries = updated
+        return true
+    end
+end
+
+"""
     publish!(d::CopyOnWriteDict{V}, key::String, value::V) -> V
 
 **Last writer wins.** Publish `key => value`, replacing any existing entry; return `value`.
@@ -415,15 +476,67 @@ registered for that route afterwards could never take effect (#71). See
 
 Takes the lock; copies the whole table only when the key is actually present. Uses a plain
 `copy`, not `_grown_copy` — that one sizehints for an *added* entry, the wrong direction here.
+
+!!! warning "The lock is taken unconditionally, and that is load-bearing"
+    The absent-key fast path skips the *copy*, never the *lock*. [`cache_if_current!`](@ref)'s
+    proof that no interleaving can strand a stale chain (#81) rests on this call and that
+    publish being totally ordered on `d.lock` — a lock-free `haskey` pre-check added here as an
+    optimization would silently reopen the race, with no test failure and no symptom until a
+    registration happens to race a live request.
 """
 function Base.delete!(d::CopyOnWriteDict{V}, key::String) where {V}
     lock(d.lock) do
         current = @atomic :monotonic d.entries
         # Skip the copy entirely when there is nothing to drop. Registration re-publishes far
-        # more often than it invalidates a warmed key, so this is the common case.
+        # more often than it invalidates a warmed key, so this is the common case. NOTE: this
+        # skips the copy, NOT the lock — see the warning above (#81).
         haskey(current, key) || return d
         updated = copy(current)
         delete!(updated, key)
+        @atomic :release d.entries = updated
+    end
+    return d
+end
+
+"""
+    delete!(d::CopyOnWriteDict{V}, keys) -> CopyOnWriteDict{V}
+
+Drop several keys in **one** publish. Equivalent to calling the single-key method for each, but
+takes the lock once and copies the table at most once — absent keys cost nothing beyond a
+lookup, and if none are present nothing is published at all.
+
+Exists for `publish_route_middleware!` (src/routerhof.jl), which since #79 must invalidate a
+route's chain under every pipeline-settings tag rather than under one key. Doing that as N
+separate `delete!` calls would take the cache lock N times and publish up to N intermediate
+tables for one logical invalidation.
+
+`keys` is any iterable of `String` — a generator is the expected shape, so nothing is
+materialized. It is consumed exactly **once**: an earlier draft probed with `any(...)` and then
+iterated again to delete, which silently skipped the matching key when handed a single-pass
+iterator (`Iterators.Stateful`) — an invalidation that deletes nothing and returns normally,
+i.e. #71's symptom with no error.
+
+!!! warning "The lock is taken unconditionally, and that is load-bearing"
+    Same invariant as the single-key method: the all-absent fast path skips the *publish*, never
+    the *lock*. [`cache_if_current!`](@ref)'s proof (#81) requires this call and that publish to
+    be totally ordered on `d.lock`.
+"""
+function Base.delete!(d::CopyOnWriteDict{V}, keys) where {V}
+    lock(d.lock) do
+        current = @atomic :monotonic d.entries
+        # ONE pass. The copy is made lazily, on the first key that is actually present, so the
+        # common case — invalidating a route nobody has warmed yet — still does no copying. Keys
+        # seen before that point were by definition absent, so skipping them loses nothing.
+        # The lock is already held either way; see the warning above.
+        updated = nothing
+        for k in keys
+            if isnothing(updated)
+                haskey(current, k) || continue
+                updated = copy(current)
+            end
+            delete!(updated, k)
+        end
+        isnothing(updated) && return d
         @atomic :release d.entries = updated
     end
     return d

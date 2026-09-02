@@ -4,9 +4,10 @@ using HTTP
 
 using ..Util: join_url_path
 using ..AppContext: ServerContext
-using ..Types: Nullable, LifecycleMiddleware, CopyOnWriteDict, snapshot, cache!, publish!
+using ..Types: Nullable, LifecycleMiddleware, CopyOnWriteDict, snapshot,
+                cache_if_current!, publish!
 
-export router, compose, genkey, process_middleware, HOFRouter, OuterRouter, InnerRouter
+export router, compose, genkey, cachetag, process_middleware, HOFRouter, OuterRouter, InnerRouter
 
 # Shared read-only stand-in for "this route has no middleware of that kind". `foldlayers` only
 # ever appends *from* it, never to it, so one instance is safe to share.
@@ -39,14 +40,15 @@ function normalize_middleware(middleware::Vector) :: Vector{Function}
 end
 
 """
-    register_lifecycle!(ctx::ServerContext, middleware::Vector) -> ServerContext
+    register_route_lifecycle!(ctx::ServerContext, middleware::Vector) -> ServerContext
 
-Register every `LifecycleMiddleware` in `middleware` for the server lifecycle, so
-`startserver` runs its `on_startup` and `terminate` its `on_shutdown` (src/core.jl).
+Register every `LifecycleMiddleware` in `middleware` as **route-owned** — declared by the
+context at `urlpatterns()`/`router()` time. These survive `terminate()` and are started again
+by every subsequent `serve()`, because nothing re-registers routes on a restart (#82).
 
-Call this ONLY from paths that run once per server or once per route registration: `serve`,
-`router()`, `OuterRouter`, and `register_route`. **`internalrequest` deliberately does
-not** (#68).
+Call this ONLY from route-registration paths: `router()`, `OuterRouter`, and `register_route`
+(via [`process_middleware`](@ref)). For the `serve(middleware = ...)` list use
+[`register_serve_lifecycle!`](@ref); **`internalrequest` deliberately registers neither** (#68).
 
 `internalrequest` never reaches `startup.` — that lives in `startserver` — so a lifecycle
 middleware registered from there got an `on_shutdown` at the next `terminate` whose paired
@@ -54,32 +56,115 @@ middleware registered from there got an `on_shutdown` at the next `terminate` wh
 that `push!` landed on an unsynchronized `Set` that `startup.`/`shutdown.` broadcast over.
 Not fixing that with a lock is the point: the writer had no business existing.
 
-Note also that "route registration" is not a synonym for "single-threaded startup": under
-`revise=:lazy` a re-registration can run on a request-handling task, so the `Set` this writes
-to is not *proven* free of concurrent writers. Closing that, along with the `Set`'s
-unspecified iteration order, is tracked separately; what #68 removed was the per-request
-writer.
+Registration order is preserved and `terminate` unwinds it LIFO (#74), so this appends under
+`lifecycle_lock` rather than pushing into an unsynchronized `Set`. The lock is not ceremony:
+"route registration" was never a synonym for "single-threaded startup" — under `revise=:lazy`,
+`Revise.revise()` runs on a request-handling task and re-running user top-level code re-enters
+`urlpatterns` → `register_route` → here, so two revisions, or one revision concurrent with a
+`startup.`/`shutdown.` broadcast, race this container. Those broadcasts read a
+[`lifecycle_snapshot`](@ref) rather than the live vector for the same reason.
 
-Dedup is load-bearing and comes from `Set`: one shared `RateLimiter()` passed to N routes is
-one registration, so its cleanup task starts once, not N times. `LifecycleMiddleware` is an
-immutable struct, so `Set` dedups it structurally.
+**This function also PROMOTES.** Claiming an object that is currently serve-owned removes it
+from `serve_lifecycle` in the same critical section, so it is never in both halves — see
+[`register_serve_lifecycle!`](@ref) for which side wins and why.
+
+!!! note "Promotion is not order-preserving"
+    A promoted object is appended to the end of `route_lifecycle`, so in the cycle where the
+    promotion happens it was started in the *serve* phase but is torn down in the *route*
+    phase — ahead of any serve-owned entries that followed it at startup. Teardown is the exact
+    reverse of startup **in any cycle where no promotion occurred**, which is every cycle after
+    the first: `terminate` empties `serve_lifecycle`, so the next `serve()` starts from a
+    settled split. This is inherent to route ownership winning — an object cannot both move to
+    the route phase and keep its old serve-phase position — and it is why the ordering contract
+    is stated per cycle.
+
+Dedup is load-bearing, and moving off `Set` is what makes it explicit rather than structural:
+one shared `RateLimiter()` passed to N routes is one registration, so its cleanup task starts
+once, not N times. `∉` on a single-digit vector costs nothing.
 """
-function register_lifecycle!(ctx::ServerContext, middleware::Vector)
-    for mw in middleware
-        mw isa LifecycleMiddleware && push!(ctx.service.lifecycle_middleware, mw)
+function register_route_lifecycle!(ctx::ServerContext, middleware::Vector)
+    lock(ctx.service.lifecycle_lock) do
+        for mw in middleware
+            mw isa LifecycleMiddleware || continue
+            mw ∈ ctx.service.route_lifecycle && continue
+            # PROMOTE, don't just append. "Route ownership wins" has to hold in both
+            # directions or the object ends up in both halves and `terminate` calls its
+            # `on_shutdown` TWICE in one cycle — once per half. Reachable whenever route
+            # registration follows `serve`, which is the runtime-`include_routes` /
+            # `revise=:lazy` case this whole cluster exists for:
+            #
+            #   serve(ctx; middleware = [rl])                       -> serve-owned
+            #   urlpatterns(ctx, "", [path("/x", h, middleware=[rl])])  -> also route-owned
+            #   terminate(ctx)                                      -> shutdown twice
+            #
+            # `RateLimiter`'s hooks happen to tolerate it, but `LifecycleMiddleware` is public
+            # and an app hook that closes a connection or decrements a refcount does not.
+            i = findfirst(==(mw), ctx.service.serve_lifecycle)
+            isnothing(i) || deleteat!(ctx.service.serve_lifecycle, i)
+            push!(ctx.service.route_lifecycle, mw)
+        end
     end
     return ctx
 end
 
 """
+    register_serve_lifecycle!(ctx::ServerContext, middleware::Vector) -> ServerContext
+
+Register every `LifecycleMiddleware` in `middleware` as **serve-owned** — declared by this
+server run, from the `serve(middleware = ...)` list. `terminate()` clears these, so
+`serve(middleware=[A]); terminate(); serve(middleware=[B])` does not also start `A` (#82).
+
+Call this ONLY from `serve` (src/core.jl), once per server.
+
+**Route ownership wins, in both directions.** A middleware object already route-owned is
+skipped here; and [`register_route_lifecycle!`](@ref) *promotes* — it removes the object from
+this half when claiming it. Either way it appears in exactly one half, so it starts and stops
+once per cycle. Enforcing only the direction this function can see would leave an object
+registered serve-first-then-route in both halves, and `terminate` would call its `on_shutdown`
+twice in one cycle.
+
+Route is the winning side because the entry then survives `terminate()`, which is the property
+#82 exists to restore — a shared object passed both to a route and to `serve(middleware = ...)`
+is still, in the app's own terms, that route's middleware.
+"""
+function register_serve_lifecycle!(ctx::ServerContext, middleware::Vector)
+    lock(ctx.service.lifecycle_lock) do
+        for mw in middleware
+            mw isa LifecycleMiddleware || continue
+            mw ∈ ctx.service.route_lifecycle && continue      # route ownership wins
+            mw ∉ ctx.service.serve_lifecycle && push!(ctx.service.serve_lifecycle, mw)
+        end
+    end
+    return ctx
+end
+
+"""
+    lifecycle_snapshot(ctx::ServerContext) -> (route, serve)
+
+Copies of both lifecycle vectors, taken together under `lifecycle_lock` (#74).
+
+`startup.`/`shutdown.` (src/core.jl) broadcast over the result rather than over the live
+vectors, so an iteration can never overlap a `push!` from a concurrent registration — the
+`revise=:lazy` path that re-enters `urlpatterns` on a request-handling task. Copying rather than
+holding the lock across the hooks is deliberate: a user `on_startup` can block for as long as it
+likes, and it must not be able to deadlock route registration by doing so.
+"""
+function lifecycle_snapshot(ctx::ServerContext)
+    return lock(ctx.service.lifecycle_lock) do
+        (copy(ctx.service.route_lifecycle), copy(ctx.service.serve_lifecycle))
+    end
+end
+
+"""
     process_middleware(ctx::ServerContext, middleware) -> Vector{Function}
 
-Registration-path helper: [`register_lifecycle!`](@ref) then [`normalize_middleware`](@ref).
-Semantics unchanged by #68 — the per-request path stopped calling *this*; it did not change
-what this does.
+Registration-path helper: [`register_route_lifecycle!`](@ref) then
+[`normalize_middleware`](@ref). Semantics unchanged by #68 — the per-request path stopped
+calling *this*; it did not change what this does. Route-owned is the right half for every
+caller of this function: all of them are route-registration paths (#82).
 """
 function process_middleware(ctx::ServerContext, middleware::Vector) :: Vector{Function}
-    register_lifecycle!(ctx, middleware)
+    register_route_lifecycle!(ctx, middleware)
     return normalize_middleware(middleware)
 end
 
@@ -104,6 +189,51 @@ function genkey(http_method::String, path::String)::String
 end
 
 """
+    cachetag(catch_errors::Bool, show_errors::Bool, serialize::Bool) -> String
+
+The `middleware_cache` key suffix for one pipeline's serializer settings (#79).
+
+`middleware_cache` lives on `ctx.service` and outlives any single pipeline, but the chain it
+stores closes over `handler` — the fold accumulator, which `setupmiddleware` builds as
+`serialize ? DefaultSerializer(catch_errors; show_errors) : identity` around the router. Those
+three booleans are therefore *baked into the cached value*, while the key named only the route.
+`serve` builds one pipeline for the server's lifetime so the baked settings are always the right
+ones there; `internalrequest` rebuilds per call, so the first call to warm a route won
+permanently and every later call's kwargs were silently ignored.
+
+Fixed by putting every input in the key. The completeness argument is short and worth keeping:
+`compose` receives `handler` already folded, and the only free variables in its construction are
+these three — `router_entry` is fixed per context, and the access-log and prefix middleware wrap
+*outside* `compose`, so they are not captured. Nothing else can vary.
+
+!!! warning "One input is excluded by a *different* invariant, not by this key"
+    The cached value is `buildmiddleware(...)`, which also closes over `globalmiddleware`. That
+    is absent from the key and safe **only** because `use_cache = isempty(globalmiddleware)` —
+    nothing is cached at all when there is any. So the obvious future optimization, "why not
+    cache when global middleware is present too?", silently makes this key incomplete again and
+    reintroduces exactly the bug #79 fixed. Caching with non-empty `globalmiddleware` requires
+    putting it in the key first, and it has no stable identity to key on.
+
+Deliberately NOT collapsed: with `serialize = false` there is no serializer at all, so the other
+two booleans are unobservable and four tags describe one pipeline. Canonicalizing them would
+save at most three unused cache slots and costs a subtle invariant to maintain.
+
+The key space is these 8 tags times the routes actually warmed. `custommiddleware` keeps the
+plain [`genkey`](@ref) — the two tables no longer share a key space.
+"""
+cachetag(catch_errors::Bool, show_errors::Bool, serialize::Bool)::String =
+    string('|', catch_errors ? 'C' : 'c', show_errors ? 'E' : 'e', serialize ? 'S' : 's')
+
+# Every tag `cachetag` can produce. Invalidation must drop a route's chain under ALL of them,
+# and it does so by exact key rather than by prefix matching. Prefix matching would be *correct*
+# — a route path may contain `|`, so a `"GET|/a|"` prefix would also sweep the cache key of a
+# route registered at `/a|b`, but over-invalidation only costs a rebuild. The reasons are cost
+# and simplicity: a prefix scan is O(#keys) with a `startswith` per key, under the lock, versus
+# eight exact lookups. (What fixed-width tags DO buy is the no-collision property — see the
+# `cachetag` docstring.)
+const CACHE_TAGS = ntuple(i -> cachetag(isodd((i - 1) >> 2), isodd((i - 1) >> 1), isodd(i - 1)), 8)
+
+"""
     publish_route_middleware!(ctx::ServerContext, key::String, value::Tuple) -> Tuple
 
 Register `value` — a `(router middleware, route middleware)` pair — as the middleware for route
@@ -121,12 +251,13 @@ a previously-published entry and its cached chain both survive. Pre-existing, an
 #71.
 
 **The order is load-bearing.** Publish first, invalidate second. Inverted, a concurrent request
-could miss the freshly-emptied cache, rebuild from the *old* table, and `cache!` that stale
+could miss the freshly-emptied cache, rebuild from the *old* table, and publish that stale
 chain — which first-writer-wins would then make permanent, on every interleaving where the
 request's cache read lands between the two calls.
 
-This order *narrows* that window; it does not close it. A request whose `buildmiddleware`
-snapshot straddles the whole publish-and-invalidate can still cache a stale chain:
+**The order alone was never sufficient**, and #81 was the residual window: a request whose chain
+construction straddled the whole publish-and-invalidate still cached a stale chain, because the
+`delete!` no-oped on a key the request had not written yet.
 
     req: cache read                        -> miss
     req: snapshot(custommiddleware)        -> OLD table
@@ -134,14 +265,24 @@ snapshot straddles the whole publish-and-invalidate can still cache a stale chai
     reg: delete!(middleware_cache, key)    -> key absent, no-op
     req: cache!(middleware_cache, key, ..) -> stale chain, first-writer-wins, permanent
 
-Reachable only when `use_cache` is true (no global middleware at all) *and* registration races
-a live request — under `revise=:lazy|:eager` `serve` injects `ReviseHandler`, so `use_cache` is
-false and it cannot happen there. Closing it properly needs a generation counter, or publishing
-while holding the cache lock; tracked separately.
+That is closed now, on the *other* side: `compose` publishes through
+[`cache_if_current!`](@ref) (src/types.jl) rather than `cache!`, which re-checks
+`custommiddleware`'s table identity while holding the cache's lock. The `delete!` below and that
+re-check are therefore totally ordered on one lock, so a stale chain is either refused outright
+or removed by this `delete!` immediately afterwards. The full argument, and the one invariant it
+rests on — `delete!` must keep taking the lock even when the key is absent — is in
+`cache_if_current!`'s docstring.
+
+Both halves are still needed. `delete!` handles the chain cached *before* registration; the
+identity check handles the chain built before but published after it.
 """
 function publish_route_middleware!(ctx::ServerContext, key::String, value::Tuple)
     publish!(ctx.service.custommiddleware, key, value)
-    delete!(ctx.service.middleware_cache, key)
+    # Every settings variant, not just one (#79): the cache is keyed on route + pipeline
+    # settings, so a route can hold up to `length(CACHE_TAGS)` chains and invalidation has to
+    # drop all of them. One lock acquisition, at most one copy — and it takes that lock
+    # unconditionally, which #81's proof depends on.
+    delete!(ctx.service.middleware_cache, (key * tag for tag in CACHE_TAGS))
     return value
 end
 
@@ -206,8 +347,11 @@ middleware.
 """
 function compose(router::HTTP.Router, globalmiddleware::Vector,
                  custommiddleware::CopyOnWriteDict{Tuple},
-                 middleware_cache::CopyOnWriteDict{Function})
+                 middleware_cache::CopyOnWriteDict{Function};
+                 catch_errors::Bool = true, show_errors::Bool = true, serialize::Bool = true)
     use_cache = isempty(globalmiddleware)
+    # Fixed for this pipeline's lifetime, so build it once here rather than per request (#79).
+    cache_suffix = cachetag(catch_errors, show_errors, serialize)
     return function (handler)
         # The chain for "no per-route middleware applies": global middleware only. Built once
         # here because it never varies. `handler` alone would be WRONG — it is the fold
@@ -243,7 +387,11 @@ function compose(router::HTTP.Router, globalmiddleware::Vector,
             # (here, the cache read, then `buildmiddleware`). They can disagree only in the
             # harmless direction — nothing in `src/` ever removes a key from `custommiddleware`,
             # so a later read can never see an emptier table than this one did.
-            isempty(snapshot(custommiddleware)) && return nocustom(req)
+            # Bound, not discarded: this snapshot doubles as the generation stamp handed to
+            # `cache_if_current!` below, which is what closes #81's stale-chain window. See
+            # the publish site for why reusing *this* (earlier) snapshot is sound.
+            custom_snap = snapshot(custommiddleware)
+            isempty(custom_snap) && return nocustom(req)
 
             innerhandler, path, _ = HTTP.Handlers.gethandler(router, req)
 
@@ -254,30 +402,58 @@ function compose(router::HTTP.Router, globalmiddleware::Vector,
             # unmatched path below.
             if !isnothing(innerhandler) && !ismissing(innerhandler)
 
-                # Check if we already have a cached middleware function for this specific route.
-                # Skip cache when per-call global middleware is present: caching would bake in
-                # caller-specific settings (e.g. catch_errors=false) and corrupt future requests.
-                key = genkey(req.method, path)
+                # Check if we already have a cached middleware function for this specific
+                # route AND this pipeline's serializer settings. Skipped entirely when per-call
+                # global middleware is present, since then nothing is cached at all.
+                #
+                # The cache key carries `cache_suffix` and the `custommiddleware` key does not
+                # (#79). The chain closes over `handler`, which bakes in this pipeline's
+                # `catch_errors`/`show_errors`/`serialize`; keying on the route alone let the
+                # first pipeline to warm a route serve its settings to every later one, so a
+                # second `internalrequest` with different kwargs was silently ignored. See
+                # `cachetag` for why those three booleans are the complete set of inputs.
+                #
+                # Built BEFORE the plain `genkey` so a cache hit still allocates exactly one
+                # string, as it did before this change. `genkey` is only needed on the miss
+                # path, where `buildmiddleware` looks up `custommiddleware`.
                 if use_cache
+                    cachekey = string(req.method, '|', path, cache_suffix)
                     # One acquire-load, then a lookup on a table no writer will ever mutate.
                     # See `CopyOnWriteDict` (src/types.jl) for why this read needs no lock.
-                    func = get(snapshot(middleware_cache), key, nothing)
+                    func = get(snapshot(middleware_cache), cachekey, nothing)
                     if !isnothing(func)
                         return func(req)
                     end
                 end
 
+                key = genkey(req.method, path)
+
                 # Combine all the middleware functions together
                 strategy = buildmiddleware(key, handler, globalmiddleware, custommiddleware)
 
                 # Warmup only. Reaching here with `use_cache` means the key was absent from
-                # this request's snapshot, so `cache!` (first-writer-wins, under the lock) *is*
-                # the second half of the double check. The old unlocked `haskey` pre-check was
-                # a deliberate lock-avoidance optimization — it skipped the lock when another
-                # thread published between the read and here — traded away on purpose: it was
-                # a racy read, and the lock it avoided is warmup-bounded with a short critical
-                # section.
-                use_cache && cache!(middleware_cache, key, strategy)
+                # this request's snapshot, so the publish (first-writer-wins, under the lock)
+                # *is* the second half of the double check. The old unlocked `haskey` pre-check
+                # was a deliberate lock-avoidance optimization — it skipped the lock when
+                # another thread published between the read and here — traded away on purpose:
+                # it was a racy read, and the lock it avoided is warmup-bounded with a short
+                # critical section.
+                #
+                # `cache_if_current!`, NOT `cache!` (#81). Publishing unconditionally could
+                # strand a chain built from a `custommiddleware` table that route registration
+                # has since replaced, and first-writer-wins would then make it permanent —
+                # registered middleware that silently never runs. The extra argument is the
+                # generation stamp: publish only if `custommiddleware` still holds the very
+                # table this chain was derived from.
+                #
+                # `custom_snap` is the snapshot taken above for the emptiness test, which is
+                # *earlier* than the one `buildmiddleware` took for itself. That is deliberate
+                # and safe: if a write landed between the two, the identity check fails and we
+                # decline to cache. Conservative in the safe direction — never the other way.
+                # `cachekey` from the lookup above is still in scope — `if` opens no new scope
+                # in Julia — so reuse it rather than rebuilding the identical string.
+                use_cache && cache_if_current!(middleware_cache, cachekey, strategy,
+                                               custommiddleware, custom_snap)
 
                 return strategy(req)
             end

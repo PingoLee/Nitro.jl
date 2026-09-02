@@ -247,6 +247,7 @@ using HTTP
 using Random: randperm
 using Nitro
 using Nitro.Core.Types: snapshot
+using Nitro.Core.RouterHOF: cachetag
 import Nitro: ServerContext
 
 # Companion to the unit item above: drives the real `compose` fast path (src/routerhof.jl)
@@ -268,6 +269,7 @@ import Nitro: ServerContext
 
 const K = 24        # distinct routes — enough to exercise many keys, not a race parameter
 const M = 4         # requests per route
+const TAG = cachetag(false, true, true)   # catch_errors=false, show_errors/serialize default
 
 # Scope, stated accurately: this item is a FUNCTIONAL regression test for the key→chain
 # mapping and for the cache actually being reached — it is NOT a race test. `@async` tasks
@@ -315,9 +317,12 @@ end
 end
 
 @testset "warmup converged to exactly one entry per route" begin
+    # Cache keys carry this pipeline's serializer settings since #79 — `catch_errors=false`
+    # with default `show_errors`/`serialize` is "|cES". `custommiddleware` keeps the plain
+    # route key; only this table is suffixed.
     entries = snapshot(ctx.service.middleware_cache)
     @test length(entries) == K
-    @test all(haskey(entries, "GET|/warm/$i") for i in 1:K)
+    @test all(haskey(entries, "GET|/warm/$i" * TAG) for i in 1:K)
 end
 
 @testset "cache-hit path returns the right chain" begin
@@ -333,7 +338,7 @@ end
     @test isempty(snapshot(ctx.service.middleware_cache))
     r = Nitro.Core.internalrequest(ctx, HTTP.Request("GET", "/warm/1"); catch_errors=false)
     @test text(r) == "route-1|handler-1"
-    @test haskey(snapshot(ctx.service.middleware_cache), "GET|/warm/1")
+    @test haskey(snapshot(ctx.service.middleware_cache), "GET|/warm/1" * TAG)
 end
 
 @testset "one composed pipeline re-reads the cache on every request" begin
@@ -364,3 +369,144 @@ end
     @test factory_calls[] == 1
 end
 end
+
+
+@testitem "Middleware cache — pipeline settings are part of the key" tags=[:core, :middleware] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+using Nitro.Core.Types: snapshot
+using Nitro.Core.RouterHOF: cachetag, CACHE_TAGS, genkey
+import Nitro: ServerContext, path, text
+
+# Regression test for #79. `middleware_cache` lives on `ctx.service` and outlives any single
+# pipeline, but the chain it stores closes over `handler` — the fold accumulator, which is
+# `DefaultSerializer(catch_errors; show_errors)` wrapping the router. Those settings were baked
+# into the cached value while the key named only the route, so the FIRST pipeline to warm a
+# route won permanently and every later pipeline's kwargs were silently ignored.
+#
+# `compose`'s existing guard did not cover it: it keys on `globalmiddleware` being non-empty,
+# but the settings live in `handler`, which is captured regardless. Pass no per-call middleware
+# and the guard never fires.
+#
+# Not a `serve` bug — one pipeline lives for the server's lifetime there, so its baked settings
+# are the right ones. It bites tests and anything driving `internalrequest` with varying kwargs
+# against a shared context.
+
+@testset "a later internalrequest's catch_errors is honoured" begin
+    ctx = ServerContext()
+    Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+        path("/boom", (req::HTTP.Request) -> error("kaboom"),
+             middleware = [handler -> (req::HTTP.Request -> handler(req))]),
+    ])
+
+    # Warm the route with catch_errors = true: the thrown error is laundered into a 500.
+    r = Nitro.Core.internalrequest(ctx, HTTP.Request("GET", "/boom");
+                                   catch_errors = true)
+    @test r.status == 500
+
+    # THE assertion. Against the unpatched code this returns a 500 too, because the cached
+    # chain carries the first call's catch_errors = true.
+    @test_throws Exception Nitro.Core.internalrequest(ctx, HTTP.Request("GET", "/boom");
+                                                      catch_errors = false)
+end
+
+@testset "the two settings variants coexist as distinct entries" begin
+    ctx = ServerContext()
+    Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+        path("/ok", (req::HTTP.Request) -> text("h"),
+             middleware = [handler -> (req::HTTP.Request -> handler(req))]),
+    ])
+    Nitro.Core.internalrequest(ctx, HTTP.Request("GET", "/ok"); catch_errors = true)
+    Nitro.Core.internalrequest(ctx, HTTP.Request("GET", "/ok"); catch_errors = false)
+
+    entries = snapshot(ctx.service.middleware_cache)
+    @test haskey(entries, "GET|/ok" * cachetag(true, true, true))
+    @test haskey(entries, "GET|/ok" * cachetag(false, true, true))
+    @test length(entries) == 2
+    # ...and `custommiddleware` is NOT suffixed — the two tables have separate key spaces now.
+    @test haskey(snapshot(ctx.service.custommiddleware), genkey("GET", "/ok"))
+end
+
+@testset "serialize=false is its own variant" begin
+    ctx = ServerContext()
+    Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+        path("/s", (req::HTTP.Request) -> text("h"),
+             middleware = [handler -> (req::HTTP.Request -> handler(req))]),
+    ])
+    Nitro.Core.internalrequest(ctx, HTTP.Request("GET", "/s"); serialize = true)
+    Nitro.Core.internalrequest(ctx, HTTP.Request("GET", "/s"); serialize = false)
+    entries = snapshot(ctx.service.middleware_cache)
+    @test haskey(entries, "GET|/s" * cachetag(true, true, true))
+    @test haskey(entries, "GET|/s" * cachetag(true, true, false))
+end
+
+@testset "registration invalidates every settings variant" begin
+    # The batch `delete!`. Invalidating only the variant that happens to match the registering
+    # caller's settings would leave the others stranded — #71's symptom for every OTHER
+    # pipeline, which is exactly the failure a per-key invalidation would reintroduce.
+    ctx = ServerContext()
+    Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+        path("/other", (req::HTTP.Request) -> text("o"),
+             middleware = [handler -> (req::HTTP.Request -> handler(req))]),
+        path("/v", (req::HTTP.Request) -> text("h")),
+    ])
+    Nitro.Core.internalrequest(ctx, HTTP.Request("GET", "/other"); catch_errors = true)
+    Nitro.Core.internalrequest(ctx, HTTP.Request("GET", "/v"); catch_errors = true)
+    Nitro.Core.internalrequest(ctx, HTTP.Request("GET", "/v"); catch_errors = false)
+    @test count(k -> startswith(k, "GET|/v|"), keys(snapshot(ctx.service.middleware_cache))) == 2
+
+    Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+        path("/v", (req::HTTP.Request) -> text("h"),
+             middleware = [handler -> (req::HTTP.Request -> text("late|" * text(handler(req))))]),
+    ])
+    entries = snapshot(ctx.service.middleware_cache)
+    @test !any(startswith(k, "GET|/v|") for k in keys(entries))     # all variants dropped
+    @test haskey(entries, "GET|/other" * cachetag(true, true, true)) # untouched
+
+    # Both variants now see the newly registered middleware.
+    @test text(Nitro.Core.internalrequest(ctx, HTTP.Request("GET", "/v");
+                                          catch_errors = true)) == "late|h"
+    @test text(Nitro.Core.internalrequest(ctx, HTTP.Request("GET", "/v");
+                                          catch_errors = false)) == "late|h"
+end
+
+@testset "keys cannot collide across routes — the tag is fixed width" begin
+    # Security-relevant invariant. A route path may itself contain `|`, so route `/a` under one
+    # tag and route `/a|X` under another are competing for the same key space. A cache collision
+    # there means one route's composed chain is served for a DIFFERENT route: the wrong
+    # middleware runs, and if the middleware that goes missing is a `GuardMiddleware`, the route
+    # it was registered on is served without it.
+    #
+    # Fixed-width tags make the proof trivial — every tag is exactly 4 characters, so
+    # `key1 * tag1 == key2 * tag2` forces `|key1| == |key2|` hence `key1 == key2`. Variable
+    # widths would not automatically collide, but they would replace that one-line argument with
+    # a case analysis over the whole tag set, re-done on every change to it. This pins the cheap
+    # invariant instead: a future "shorten the common tag" optimization trips here.
+    @test all(length(t) == 4 for t in CACHE_TAGS)
+
+    ctx = ServerContext()
+    Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+        path("/a", (req::HTTP.Request) -> text("plain"),
+             middleware = [handler -> (req::HTTP.Request -> handler(req))]),
+        path("/a" * cachetag(true, true, true), (req::HTTP.Request) -> text("pipe"),
+             middleware = [handler -> (req::HTTP.Request -> handler(req))]),
+    ])
+    for (target, want) in (("/a", "plain"), ("/a" * cachetag(true, true, true), "pipe")),
+        ce in (true, false)
+        r = Nitro.Core.internalrequest(ctx, HTTP.Request("GET", target); catch_errors = ce)
+        @test text(r) == want          # never the other route's chain
+    end
+    # Two routes times two settings variants, all distinct.
+    @test length(snapshot(ctx.service.middleware_cache)) == 4
+end
+
+@testset "the tag tuple covers every tag cachetag can produce" begin
+    # `CACHE_TAGS` drives invalidation, so a tag `cachetag` can emit that is missing from it is
+    # a stranded cache entry with no symptom until someone hits that exact pipeline.
+    produced = Set(cachetag(c, e, s) for c in (true, false), e in (true, false), s in (true, false))
+    @test Set(CACHE_TAGS) == produced
+    @test length(CACHE_TAGS) == 8
+    @test allunique(CACHE_TAGS)
+end
+end # @testitem

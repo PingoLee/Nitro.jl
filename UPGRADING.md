@@ -42,6 +42,271 @@ consuming app, `nitro-cut-release` stamps every entry below with `0.3.0`, dates 
 
 ---
 
+## `internalrequest`'s `catch_errors`/`serialize` are no longer ignored on a warm route (#79)
+
+- **Version**: Unreleased
+- **Nitro ref**: #79; `src/routerhof.jl`, `src/core.jl`, `src/types.jl`
+- **Recorded**: 2026-09-01
+- **Severity**: **behavior (a call that returned a `500` now throws)** — bug fix.
+
+### What changed
+
+`middleware_cache` lives on `ctx.service` and outlives any one pipeline, but the chain it stores
+closes over the serializer — `DefaultSerializer(catch_errors; show_errors)`, present only when
+`serialize` is true. Those three settings were baked into the cached value while the key named only
+the route, so the **first** pipeline to warm a route won permanently and every later pipeline's
+kwargs were silently ignored:
+
+```julia
+ctx = ServerContext()
+urlpatterns(ctx, "", [path("/boom", req -> error("kaboom"), middleware = [mw])])
+
+internalrequest(ctx, HTTP.Request("GET", "/boom"); catch_errors = true)   # 500, warms the cache
+internalrequest(ctx, HTTP.Request("GET", "/boom"); catch_errors = false)  # ALSO 500 — ignored
+```
+
+The cache key now carries those settings (`"GET|/boom|cES"`), so each pipeline gets its own chain.
+The second call above **throws**, as it always should have.
+
+**This is not a `serve` change.** One pipeline lives for the server's lifetime there, so its baked
+settings were always the correct ones. It reaches code that drives `internalrequest` with varying
+kwargs against a shared context — in practice, test suites.
+
+`serve`'s and `setupmiddleware`'s `show_errors` kwargs are now declared `::Bool` (they were
+untyped), so that a truthy non-`Bool` cannot bake one behaviour into the chain while the key records
+another. One previously-working combination now throws: `serve(…; serialize = false,
+show_errors = <non-Bool>)` used to slip through — with `serialize = false` no serializer was built,
+so the value was never converted — and is now a `MethodError` at the `serve` boundary.
+
+### How to find the calls to migrate
+
+```bash
+# Two or more internalrequest calls against ONE context with differing kwargs — the shape whose
+# outcome changes. Worth reading each hit rather than trusting the count.
+rg -n -U 'internalrequest[\s\S]{0,200}?(catch_errors|serialize)' <app>/src <app>/test
+
+# Assertions on cache key spelling, which gained a 4-character settings suffix.
+rg -n 'middleware_cache' <app>/src <app>/test
+
+# Non-Bool show_errors, which is now a MethodError rather than a silent conversion.
+rg -n 'show_errors\s*=' <app>/src <app>/test
+```
+
+### Migrate your app
+
+Only tests that leaned on the bug need an edit, and the edit is to assert the correct thing:
+
+```julia
+# ✗ before — the second call silently reused the first call's catch_errors = true
+internalrequest(ctx, HTTP.Request("GET", "/boom"); catch_errors = true)
+@test internalrequest(ctx, HTTP.Request("GET", "/boom"); catch_errors = false).status == 500
+
+# ✓ after — catch_errors = false means the handler's error propagates
+internalrequest(ctx, HTTP.Request("GET", "/boom"); catch_errors = true)
+@test_throws Exception internalrequest(ctx, HTTP.Request("GET", "/boom"); catch_errors = false)
+```
+
+If a test asserted on cache keys directly, add the settings tag. Build it with `cachetag` rather
+than hard-coding the four characters:
+
+```julia
+# ✗ before
+@test haskey(snapshot(ctx.service.middleware_cache), "GET|/warm")
+
+# ✓ after — catch_errors = false, show_errors and serialize defaulted
+using Nitro.Core.RouterHOF: cachetag
+@test haskey(snapshot(ctx.service.middleware_cache), "GET|/warm" * cachetag(false, true, true))
+```
+
+`custommiddleware` is **unchanged** — it still keys on the bare route. The two tables no longer
+share a key space.
+
+---
+
+## Lifecycle hook order is now specified: registration order in, LIFO out (#74)
+
+- **Version**: Unreleased
+- **Nitro ref**: #74; `src/context.jl`, `src/core.jl`, `src/routerhof.jl`
+- **Recorded**: 2026-09-01
+- **Severity**: **breaking (two `Service` fields change container type) plus behavior (a
+  previously-unspecified execution order becomes a contract)** — bug fix.
+
+### What changed
+
+`startserver` ran `startup.(…)` and `terminate` ran `shutdown.(…)` over a `Set`. Broadcasting over
+a `Set` collects it in **hash order**, and `LifecycleMiddleware` is an immutable struct whose fields
+are closures — heap objects — so the order varied run to run and was not reproducible even for an
+identical program.
+
+Nothing depended on it yet, which is precisely why it had to be pinned before something did: the
+first time two lifecycle middlewares share a resource — an `AccessLog` sink flushing into something
+another lifecycle owns — teardown order decides whether the flush succeeds.
+
+`route_lifecycle` and `serve_lifecycle` are now `Vector{LifecycleMiddleware}`, guarded by a new
+`lifecycle_lock`, and the contract is:
+
+- **Startup** — route-owned then serve-owned, each in **registration order**.
+- **Shutdown** — the **exact reverse**: serve-owned reversed, then route-owned reversed.
+
+LIFO teardown is what Spring's `SmartLifecycle` phases, ASP.NET Core's `IHostedService`, OTP
+supervisors, ASGI lifespan, and `defer`/`atexit` all do. Nitro now matches them.
+
+Two further changes fall out of the container swap:
+
+- **Dedup moved from the `Set` to an explicit `∉` guard** and is unchanged in effect: one shared
+  `RateLimiter()` passed to N routes is still one registration, so its cleanup task starts once.
+- **Registration takes `lifecycle_lock`**, and `startup.`/`shutdown.` broadcast over a *copy* taken
+  under it. "Registration time" was never a synonym for "single-threaded startup": under
+  `revise=:lazy`, `Revise.revise()` runs on a request-handling task, and re-running user top-level
+  code re-enters `urlpatterns` → `register_route` → the registration path. Two revisions, or one
+  revision concurrent with a `startup.` broadcast, raced a bare collection. Same defect class as
+  #68 item 1, and the same asymmetry gave it away: `named_routes` and `extensions` on this struct
+  already carry locks.
+
+`ctx.service.router` (the `HTTP.Router`) has the same unsynchronized exposure via `HTTP.register!`
+and is **not** covered here — different container, different owner. Tracked separately.
+
+### How to find the calls to migrate
+
+```bash
+# Reads of the lifecycle vectors. `in` still works; `length`/indexing/iteration now see order.
+rg -n 'route_lifecycle|serve_lifecycle' <app>/src <app>/test
+
+# Anything that assumed hooks were unordered, or ordered some other way.
+rg -n 'on_startup|on_shutdown|LifecycleMiddleware' <app>/src
+```
+
+### Migrate your app
+
+Reading the fields still works — `in`, `length` and `isempty` behave the same — so most apps need
+no edit. Two cases do:
+
+```julia
+# ✗ before — Set semantics; push! deduped for you, and order was meaningless
+push!(ctx.service.route_lifecycle, mw)
+
+# ✓ after — a Vector: register through the API, which dedups and takes the lock
+Nitro.Core.RouterHOF.register_route_lifecycle!(ctx, [mw])
+```
+
+```julia
+# ✗ before — comparing against a Set, order-insensitively
+@test ctx.service.serve_lifecycle == Set([a, b])
+
+# ✓ after — a Vector in registration order
+@test ctx.service.serve_lifecycle == [a, b]
+```
+
+If two of your lifecycle middlewares share a resource, register the **owner first**: it will then
+be torn down last, after its dependents. That is the same rule as `defer`, and the reason the
+order is LIFO rather than FIFO.
+
+!!! note "The contract is per cycle"
+    Teardown is the exact reverse of startup in any cycle where no *ownership promotion* happened.
+    Handing one object to both a route and `serve(middleware = …)` makes it route-owned (#82), and
+    if the route registration lands mid-cycle — a runtime `include_routes`, or Revise re-running
+    `urlpatterns` — that object moves from the serve phase to the route phase for the remainder of
+    that cycle, so it is torn down ahead of serve-owned entries it previously followed. It settles
+    after one `terminate()`, because that clears `serve_lifecycle` and the next `serve()` starts
+    from a stable split. If you depend on teardown order between two middlewares, keep them in the
+    same half.
+
+---
+
+## `Service.lifecycle_middleware` splits by owner; route-level startup hooks survive a restart (#82)
+
+- **Version**: Unreleased
+- **Nitro ref**: #82; `src/context.jl`, `src/core.jl`, `src/routerhof.jl`,
+  `src/middleware/rate_limiter.jl`
+- **Recorded**: 2026-08-31
+- **Severity**: **breaking (a `Service` field is replaced by two) plus behavior (route-level
+  lifecycle hooks now re-run across a `serve()` restart)** — bug fix.
+
+### What changed
+
+`terminate()` ran `empty!(context.service.lifecycle_middleware)`, but that one `Set` held two kinds
+of member with different lifetimes:
+
+- **serve-owned** — added from the `serve(middleware = …)` list on every `serve()`. Clearing these is
+  correct; otherwise `serve(middleware=[A]); terminate(); serve(middleware=[B])` would start `A`'s
+  lifecycle as well.
+- **route-owned** — added at `urlpatterns()` time, once. Clearing these is wrong: nothing ever
+  re-adds them, because routes are not re-registered on a second `serve()`.
+
+So after `serve(); terminate(); serve()`, **every route-level `LifecycleMiddleware`'s `on_startup`
+was silently skipped for the rest of the process's life.** For a route-level `RateLimiter` that meant
+its bucket-pruning task never restarted while the limiter kept recording every request — an unbounded
+leak in the component whose entire job is to bound resource use.
+
+The single field is replaced by two, each cleared by whoever owns it:
+
+| Field | Written by | Cleared by |
+|---|---|---|
+| `route_lifecycle` | `urlpatterns()` / `router()` / `register_route` | `resetstate()` only |
+| `serve_lifecycle` | `serve(middleware = …)` | `terminate()` |
+
+Startup runs route-owned then serve-owned; `terminate` unwinds the exact reverse. An object handed
+to *both* a route and `serve(middleware = …)` is recorded once, as route-owned.
+
+`RateLimiter`'s hooks were fixed in the same change. `on_shutdown` cleared a single shared `running`
+flag without waiting for the cleanup task — parked in `sleep(cleanup_period)`, up to 10 minutes from
+its next check — so the next `on_startup` set the flag back to `true` and the stale task kept looping
+alongside the new one: **one leaked task per restart**. Each activation now owns its own stop token.
+`on_startup` and `on_shutdown` additionally return the cleanup `Task` (or `nothing`), which
+`startup`/`shutdown` discard.
+
+### How to find the calls to migrate
+
+```bash
+# The removed field. Anything reading it must pick a half — or read both.
+rg -n 'lifecycle_middleware' <app>/src <app>/test
+
+# Route-level lifecycle middleware whose on_startup now fires again after a restart.
+rg -n 'RateLimiter|AccessLog|LifecycleMiddleware' <app>/src
+
+# Restart sequences, where the behaviour change is observable.
+rg -n -A5 'terminate\(' <app>/src <app>/test | rg -n 'serve\('
+```
+
+### Migrate your app
+
+```julia
+# ✗ before — one Set, both scopes
+@test lf in ctx.service.lifecycle_middleware
+@test isempty(ctx.service.lifecycle_middleware)
+
+# ✓ after — name the scope you mean
+@test lf in ctx.service.route_lifecycle          # declared by urlpatterns()/router()
+@test lf in ctx.service.serve_lifecycle          # declared by serve(middleware = ...)
+@test isempty(ctx.service.serve_lifecycle)       # what terminate() clears
+```
+
+A `LifecycleMiddleware` attached to a route now has its `on_startup` called on **every** `serve()`,
+not only the first. Hooks must therefore be idempotent across cycles — spawning a task, opening a
+file, or connecting a client in `on_startup` needs a matching teardown in `on_shutdown` that the next
+`on_startup` cannot be confused by. Bind the resource to a per-activation token rather than to a flag
+shared across activations:
+
+```julia
+# ✗ before — one shared flag; a stale task observes the NEW activation's value and keeps running
+running = Ref(false)
+on_startup  = () -> (running[] = true;  isnothing(task[]) && (task[] = @async while running[] … end))
+on_shutdown = () -> (running[] = false; task[] = nothing)
+
+# ✓ after — per activation; a stale task can only ever see its own token
+on_startup = function ()
+    isnothing(active[]) || return nothing         # idempotent
+    token = Ref(true); active[] = token
+    task[] = @async while token[] … end
+end
+on_shutdown = function ()
+    t = active[]; isnothing(t) || (t[] = false)
+    active[] = nothing; task[] = nothing
+end
+```
+
+---
+
 ## Percent-decoding now happens once, at the boundary — query, `Path{T}`, and cookie values change (#70)
 
 - **Version**: Unreleased

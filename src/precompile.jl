@@ -28,9 +28,9 @@ using PrecompileTools
     # ── Route with per-route middleware → the compose / middleware-cache path ───
     # `compose` is installed unconditionally (#71), so the blocks above already exercise its
     # empty-table fast path (`snapshot` + `isempty` + the prebuilt chain). THIS block is the
-    # only one that gets past that check and reaches `gethandler`, `genkey`, `buildmiddleware`,
-    # `cache!` and the cache-hit read. Two requests: the first takes the cache miss + publish
-    # path, the second the cache-hit read path. Honest scope: only this generic plumbing
+    # only one that gets past that check and reaches `gethandler`, `cachetag`, `genkey`,
+    # `buildmiddleware`, `cache_if_current!` and the cache-hit read. Two requests: the first
+    # takes the cache miss + publish path, the second the cache-hit read path. Honest scope: only this generic plumbing
     # carries over — the composed chain itself specializes on the app's own handler/middleware
     # closure types, per the NOTE below.
     precompile_mw = handle -> (req::Request -> handle(req))
