@@ -56,17 +56,27 @@ middleware registered from there got an `on_shutdown` at the next `terminate` wh
 that `push!` landed on an unsynchronized `Set` that `startup.`/`shutdown.` broadcast over.
 Not fixing that with a lock is the point: the writer had no business existing.
 
-Note also that "route registration" is not a synonym for "single-threaded startup": under
-`revise=:lazy` a re-registration can run on a request-handling task, so the `Set` this writes
-to is not *proven* free of concurrent writers. Closing that, along with the `Set`'s
-unspecified iteration order, is tracked separately (#74); what #68 removed was the per-request
-writer.
-
 Registration order is preserved and `terminate` unwinds it LIFO (#74), so this appends under
 `lifecycle_lock` rather than pushing into an unsynchronized `Set`. The lock is not ceremony:
-under `revise=:lazy`, `Revise.revise()` runs on a request-handling task and re-running user
-top-level code re-enters `urlpatterns` → `register_route` → here, so two revisions — or one
-revision concurrent with `startup.`/`shutdown.` iterating — race this container.
+"route registration" was never a synonym for "single-threaded startup" — under `revise=:lazy`,
+`Revise.revise()` runs on a request-handling task and re-running user top-level code re-enters
+`urlpatterns` → `register_route` → here, so two revisions, or one revision concurrent with a
+`startup.`/`shutdown.` broadcast, race this container. Those broadcasts read a
+[`lifecycle_snapshot`](@ref) rather than the live vector for the same reason.
+
+**This function also PROMOTES.** Claiming an object that is currently serve-owned removes it
+from `serve_lifecycle` in the same critical section, so it is never in both halves — see
+[`register_serve_lifecycle!`](@ref) for which side wins and why.
+
+!!! note "Promotion is not order-preserving"
+    A promoted object is appended to the end of `route_lifecycle`, so in the cycle where the
+    promotion happens it was started in the *serve* phase but is torn down in the *route*
+    phase — ahead of any serve-owned entries that followed it at startup. Teardown is the exact
+    reverse of startup **in any cycle where no promotion occurred**, which is every cycle after
+    the first: `terminate` empties `serve_lifecycle`, so the next `serve()` starts from a
+    settled split. This is inherent to route ownership winning — an object cannot both move to
+    the route phase and keep its old serve-phase position — and it is why the ordering contract
+    is stated per cycle.
 
 Dedup is load-bearing, and moving off `Set` is what makes it explicit rather than structural:
 one shared `RateLimiter()` passed to N routes is one registration, so its cleanup task starts

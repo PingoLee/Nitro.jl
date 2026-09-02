@@ -442,7 +442,7 @@ function serve(ctx::ServerContext;
     parallel=true,
     serialize=true,
     catch_errors=true,
-    show_errors=true,
+    show_errors::Bool=true,
     show_banner=true,
     access_log=true,
     access_log_query=false,

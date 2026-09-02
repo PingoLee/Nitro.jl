@@ -72,15 +72,18 @@ The second call above **throws**, as it always should have.
 settings were always the correct ones. It reaches code that drives `internalrequest` with varying
 kwargs against a shared context — in practice, test suites.
 
-`setupmiddleware`'s `show_errors` kwarg is now declared `::Bool` (it was untyped), so that a truthy
-non-`Bool` cannot bake one behaviour into the chain while the key records another.
+`serve`'s and `setupmiddleware`'s `show_errors` kwargs are now declared `::Bool` (they were
+untyped), so that a truthy non-`Bool` cannot bake one behaviour into the chain while the key records
+another. One previously-working combination now throws: `serve(…; serialize = false,
+show_errors = <non-Bool>)` used to slip through — with `serialize = false` no serializer was built,
+so the value was never converted — and is now a `MethodError` at the `serve` boundary.
 
 ### How to find the calls to migrate
 
 ```bash
 # Two or more internalrequest calls against ONE context with differing kwargs — the shape whose
 # outcome changes. Worth reading each hit rather than trusting the count.
-rg -n -B2 -A2 'internalrequest' <app>/test | rg -n 'catch_errors|serialize'
+rg -n -U 'internalrequest[\s\S]{0,200}?(catch_errors|serialize)' <app>/src <app>/test
 
 # Assertions on cache key spelling, which gained a 4-character settings suffix.
 rg -n 'middleware_cache' <app>/src <app>/test
@@ -197,6 +200,16 @@ Nitro.Core.RouterHOF.register_route_lifecycle!(ctx, [mw])
 If two of your lifecycle middlewares share a resource, register the **owner first**: it will then
 be torn down last, after its dependents. That is the same rule as `defer`, and the reason the
 order is LIFO rather than FIFO.
+
+!!! note "The contract is per cycle"
+    Teardown is the exact reverse of startup in any cycle where no *ownership promotion* happened.
+    Handing one object to both a route and `serve(middleware = …)` makes it route-owned (#82), and
+    if the route registration lands mid-cycle — a runtime `include_routes`, or Revise re-running
+    `urlpatterns` — that object moves from the serve phase to the route phase for the remainder of
+    that cycle, so it is torn down ahead of serve-owned entries it previously followed. It settles
+    after one `terminate()`, because that clears `serve_lifecycle` and the next `serve()` starts
+    from a stable split. If you depend on teardown order between two middlewares, keep them in the
+    same half.
 
 ---
 
