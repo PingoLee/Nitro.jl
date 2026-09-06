@@ -136,6 +136,30 @@ config = load_config(get(ENV, "APP_ENV", "dev"))
 serve(host=config.server_host, port=config.server_port, context=config)
 ```
 
+### Reaching The Config From `req` Alone
+
+Declaring a `ctx::Context{AppConfig}` parameter, as above, is the preferred shape: the
+type is written down, so the handler body infers concretely. When you only have the
+request — inside middleware, or in a helper called from several handlers — use the
+**typed** accessor:
+
+```julia
+cfg = getcontext(req, AppConfig)   # ::AppConfig — do this on the request path
+cfg.server_host
+```
+
+not the untyped one:
+
+```julia
+cfg = getcontext(req)              # ::Any — every field access dispatches dynamically
+```
+
+Nitro stores the context payload in a `Ref{Any}` because `serve(context = ...)` can
+reassign it after routes are registered, so its type is not known when a route is
+built. The `::T` in `getcontext(req, T)` is a function barrier that recovers the type
+for everything downstream of it. On a hot path that difference is one dynamic
+`getfield` per access, per request.
+
 ## Recommended Bootstrap Order
 
 1. Load YAML or TOML files in the app layer.

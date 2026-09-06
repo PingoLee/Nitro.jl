@@ -517,3 +517,70 @@ end
 end
 
 end
+
+@testitem "Middleware may read path params before the router runs (#38)" tags=[:core] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+using Nitro.Core: ServerContext, internalrequest
+using Nitro.Core.Routing: urlpatterns
+
+# Regression for the per-request caches. `HTTP.getparams` reads a context slot the ROUTER
+# fills, but middleware -- global, per-route and guards alike -- runs before the router. Two
+# distinct caches had to be taught that:
+#
+#   * `pathparams` must not memoize the pre-router `nothing`, or the path binder indexes into
+#     it and every parameterized route 500s.
+#   * `request_input` must not memoize a merge performed before the params existed, or every
+#     later reader gets an input map with the path params silently missing.
+#
+# The route echoes BOTH maps, so the assertions observe what the handler actually sees rather
+# than only that the request survived: a handler binding `id::Int` goes through the path
+# binder, never through `req.input`, so asserting on the bound value alone would pass even
+# with `req.input` poisoned.
+ctx = ServerContext()
+urlpatterns(ctx, "", Nitro.RouteDefinition[
+    Nitro.path("/items/<int:id>", function (req, id::Int)
+        Res.json(Dict("id" => id, "params" => req.params, "input" => req.input))
+    end, method="GET"),
+])
+
+expected = Dict("id" => 42,
+                "params" => Dict("id" => "42"),
+                "input" => Dict("id" => "42"))
+
+reads_params(handler) = function (req::HTTP.Request)
+    @test req.params === nothing        # pre-router: genuinely not populated yet
+    handler(req)
+end
+
+reads_input(handler) = function (req::HTTP.Request)
+    _ = req.input                       # merges path params -- so it touches them too
+    handler(req)
+end
+
+reads_payload(handler) = function (req::HTTP.Request)
+    _ = Nitro.payload(req)              # the public spelling of the same read
+    handler(req)
+end
+
+roundtrip(mw) = Nitro.json(internalrequest(ctx, HTTP.Request("GET", "/items/42"); middleware=mw))
+
+@testset "no middleware" begin
+    @test roundtrip(Function[]) == expected
+end
+
+@testset "middleware reading req.params does not brick the route" begin
+    # Pre-fix: `pathparams` cached the `nothing`, the binder did `nothing["id"]`, 500.
+    @test roundtrip([reads_params]) == expected
+end
+
+@testset "middleware reading req.input keeps path params in the handler's input" begin
+    # Pre-fix: 200, but `input` came back `{}` -- silently wrong rather than loud.
+    @test roundtrip([reads_input]) == expected
+end
+
+@testset "the same holds through the public payload(req)" begin
+    @test roundtrip([reads_payload]) == expected
+end
+end
