@@ -56,6 +56,15 @@ shared = submit_task("warm-cache", () -> work(), Owner("user_123"); scope=:globa
 public_status = get_task_status(task_id, System())
 ```
 
+**Grant a second identity at submit time, never after.** `submit_task(...; watchers=[Owner("svc")])`
+is the supported way to let a different identity poll or cancel a task
+([#96](https://github.com/PingoLee/Nitro.jl/issues/96)) — the owner is already resolved and
+authorized there, so no second authorization question arises. Do not add a public post-hoc
+`add_watcher!(task_id, ...)`: that would be a second route into the watcher list, which is the
+surface [#19](https://github.com/PingoLee/Nitro.jl/issues/19) closed. The store-level
+`add_watcher!` performs no authorization and is not that API. A grantee gets read, list **and**
+cancel, because `cancel_task` gates on the same list.
+
 **Authority comes from the id; `watchers` only adds to it.** `owner_of(id)` reads the owner half
 back out of a `:user` id, so ownership is derived and unclobberable — a lost watcher append or a
 full-row write from another process cannot evict an owner from their own task. A `:global` id has

@@ -177,7 +177,9 @@ function _watch_allowed(store::AbstractWorkerStore, task_key::String, watchers::
     return Base.invokelatest(authorizer, task_key, watchers, user_id)::Bool
 end
 
-function _register_or_watch!(store::AbstractWorkerStore, task_key::String, owner::Owner; queue_name::Union{Nothing, String}=nothing)
+function _register_or_watch!(store::AbstractWorkerStore, task_key::String, owner::Owner;
+                             queue_name::Union{Nothing, String}=nothing,
+                             grants::AbstractVector{Owner}=Owner[])
     uid = owner.user_id
     return lock_tasks(store) do
         task_info = get_task_info(store, task_key)
@@ -198,6 +200,9 @@ function _register_or_watch!(store::AbstractWorkerStore, task_key::String, owner
             # process-local for a database-backed store, so the read-modify-write was
             # last-write-wins across processes.
             add_watcher!(store, task_key, uid)
+            for grant in grants
+                add_watcher!(store, task_key, grant.user_id)
+            end
             return false
         end
 
@@ -205,6 +210,9 @@ function _register_or_watch!(store::AbstractWorkerStore, task_key::String, owner
         # resubmitter — the one place a whole record, watchers included, is written.
         task_info = TaskInfo(task_key; queue_name)
         push!(task_info.watchers, uid)
+        for grant in grants
+            grant.user_id in task_info.watchers || push!(task_info.watchers, grant.user_id)
+        end
         replace_task!(store, task_key, task_info)
         return true
     end
@@ -253,7 +261,8 @@ function _execute_task_async(store::AbstractWorkerStore, task_key::String, callb
 end
 
 """
-    submit_task(task_key, callback, user_id; scope=:user, options=TaskOptions(), store=default_store())
+    submit_task(task_key, callback, owner::Owner; scope=:user, watchers=Owner[],
+                options=TaskOptions(), store=default_store())
 
 Run `callback` on its own task and return the id it was stored under.
 
@@ -263,21 +272,48 @@ returned id is what `get_task_status` and `cancel_task` expect; under the defaul
 
 Unqueued tasks are still submissions, so the store's queue authorizer applies under
 the name `$(DEFAULT_QUEUE_NAME)`.
+
+# Granting a second identity access
+
+`watchers` grants additional identities read, list and cancel access to the task, because
+the identity that *submits* a task is not always the identity that *polls* it: a browser
+may upload under a deliberately short-lived credential while the application's own backend,
+holding a different long-lived one, drives the progress bar
+([#96](https://github.com/PingoLee/Nitro.jl/issues/96)).
+
+```julia
+task_id = submit_task("import-42", cb, Owner("browser-client");
+                      watchers = [Owner("backend-service")])
+```
+
+The grant is deliberately made **at submit time, by the owner**, rather than by a later
+`add_watcher!(task_id, …)` call. Submitting is the moment the owner is already resolved and
+authorized, so there is no separate authorization question to answer — and a post-hoc
+public grant would be a second way to reach the watcher list, which is exactly the surface
+[#19](https://github.com/PingoLee/Nitro.jl/issues/19) closed.
+
+A granted identity gets the **same rights as the owner minus ownership**: read, list, and
+**cancel**, since `cancel_task` gates on the same list. If that is more authority than you
+want to hand out, do not grant it — there is no read-only grant today.
+
+Re-running a *finished* key replaces the record and resets its watchers, so grants must be
+passed again on each such resubmission. Granting an identity that is already a watcher —
+including the owner — is a no-op.
 """
-function submit_task(task_key::AbstractString, callback::Function, owner::Owner; scope::Symbol=:user, options::TaskOptions=TaskOptions(), store::AbstractWorkerStore=default_store())
+function submit_task(task_key::AbstractString, callback::Function, owner::Owner; scope::Symbol=:user, watchers::AbstractVector{Owner}=Owner[], options::TaskOptions=TaskOptions(), store::AbstractWorkerStore=default_store())
     _authorize_queue!(store, DEFAULT_QUEUE_NAME, owner)
 
     key = scoped_task_key(task_key, owner; scope)
-    should_start = _register_or_watch!(store, key, owner)
+    should_start = _register_or_watch!(store, key, owner; grants=watchers)
     if should_start
         _execute_task_async(store, key, callback, options)
     end
     return key
 end
 
-function submit_task(ctx::ServerContext, task_key::AbstractString, callback::Function, owner::Owner; scope::Symbol=:user, options::TaskOptions=TaskOptions(), key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
+function submit_task(ctx::ServerContext, task_key::AbstractString, callback::Function, owner::Owner; scope::Symbol=:user, watchers::AbstractVector{Owner}=Owner[], options::TaskOptions=TaskOptions(), key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
     resolved_store = _resolve_store(ctx; key, store)
-    return submit_task(task_key, callback, owner; scope, options, store=resolved_store)
+    return submit_task(task_key, callback, owner; scope, watchers, options, store=resolved_store)
 end
 
 """
@@ -290,13 +326,13 @@ Identical to [`submit_task`](@ref) in how `scope` namespaces `task_key` and in w
 return value is for; the difference is ordered execution and that the queue authorizer
 sees the real `queue_name`.
 """
-function submit_sequential_task(queue_name::AbstractString, task_key::AbstractString, callback::Function, owner::Owner; scope::Symbol=:user, options::TaskOptions=TaskOptions(), store::AbstractWorkerStore=default_store())
+function submit_sequential_task(queue_name::AbstractString, task_key::AbstractString, callback::Function, owner::Owner; scope::Symbol=:user, watchers::AbstractVector{Owner}=Owner[], options::TaskOptions=TaskOptions(), store::AbstractWorkerStore=default_store())
     queue_id = String(queue_name)
 
     _authorize_queue!(store, queue_id, owner)
 
     key = scoped_task_key(task_key, owner; scope)
-    should_start = _register_or_watch!(store, key, owner; queue_name=queue_id)
+    should_start = _register_or_watch!(store, key, owner; queue_name=queue_id, grants=watchers)
     if should_start
         _start_queue_processor(store, queue_id)
         queue = _get_or_create_queue(store, queue_id)
@@ -305,9 +341,9 @@ function submit_sequential_task(queue_name::AbstractString, task_key::AbstractSt
     return key
 end
 
-function submit_sequential_task(ctx::ServerContext, queue_name::AbstractString, task_key::AbstractString, callback::Function, owner::Owner; scope::Symbol=:user, options::TaskOptions=TaskOptions(), key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
+function submit_sequential_task(ctx::ServerContext, queue_name::AbstractString, task_key::AbstractString, callback::Function, owner::Owner; scope::Symbol=:user, watchers::AbstractVector{Owner}=Owner[], options::TaskOptions=TaskOptions(), key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
     resolved_store = _resolve_store(ctx; key, store)
-    return submit_sequential_task(queue_name, task_key, callback, owner; scope, options, store=resolved_store)
+    return submit_sequential_task(queue_name, task_key, callback, owner; scope, watchers, options, store=resolved_store)
 end
 
 function get_task_status(task_id::AbstractString, authority::TaskAuthority; store::AbstractWorkerStore=default_store())

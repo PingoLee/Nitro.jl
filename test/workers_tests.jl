@@ -261,6 +261,64 @@ end
     end
 end
 
+@testset "watchers= grants a second identity access at submit time (#96)" begin
+    store = InMemoryWorkerStore()
+    try
+        # The motivating case: the identity that submits is not the one that polls.
+        # A browser uploads under a short-lived credential; the backend, holding a
+        # different long-lived one, drives the progress bar.
+        task_id = submit_task("import-42", () -> "imported", Owner("browser-client");
+                              watchers=[Owner("backend-service")], store=store)
+
+        @test wait_for(() -> get_task_status(task_id, Owner("browser-client"); store=store)[:status] == "COMPLETED") == :ok
+
+        # The grantee can read and list...
+        @test get_task_status(task_id, Owner("backend-service"); store=store)[:result] == "imported"
+        @test only(get_all_tasks(Owner("backend-service"); store=store))[:id] == task_id
+        # ...but ownership stays with the submitter: it is derived from the id.
+        @test get_task_status(task_id, Owner("backend-service"); store=store)[:owner] == "browser-client"
+
+        # Nobody else is admitted by the grant.
+        @test_throws AuthorizationError get_task_status(task_id, Owner("stranger"); store=store)
+
+        # Granting an identity that is already a watcher is a no-op, owner included.
+        again = submit_task("solo", () -> "x", Owner("alice");
+                            watchers=[Owner("alice")], store=store)
+        @test get_task_status(again, Owner("alice"); store=store)[:watcher_count] == 1
+    finally
+        reset_store!(store)
+    end
+end
+
+@testset "watchers= grants cancel too, and does not survive a record reset (#96)" begin
+    store = InMemoryWorkerStore()
+    started = Base.Event()
+    try
+        task_id = submit_task("long-job", task_info -> begin
+            notify(started)
+            while true
+                sleep(0.01)
+            end
+        end, Owner("owner-a"); watchers=[Owner("helper")], store=store)
+        wait(started)
+
+        # A grantee gets the owner's rights minus ownership, and `cancel_task` gates on
+        # the same list -- so the grant carries cancel. Documented, not incidental.
+        @test cancel_task(task_id, Owner("helper"); store=store)[:status] == "Task cancelled"
+        @test wait_for(() -> get_task_status(task_id, Owner("owner-a"); store=store)[:status] == "CANCELLED") == :ok
+
+        # Re-running a finished key replaces the record, so its watcher list resets to
+        # the resubmitter and grants must be passed again.
+        again = submit_task("long-job", () -> "second", Owner("owner-a"); store=store)
+        @test again == task_id
+        @test wait_for(() -> get_task_status(task_id, Owner("owner-a"); store=store)[:result] == "second") == :ok
+        @test_throws AuthorizationError get_task_status(task_id, Owner("helper"); store=store)
+    finally
+        notify(started)
+        reset_store!(store)
+    end
+end
+
 @testset "store write primitives are atomic and intent-scoped (#88)" begin
     store = InMemoryWorkerStore()
     try

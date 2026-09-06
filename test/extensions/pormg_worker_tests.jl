@@ -460,6 +460,21 @@ else
             end
         end
 
+        @testset "watchers= grants persist through the store (#96)" begin
+            store_grant = RealPormGWorkerStore(model=MockTaskModel())
+
+            task_id = submit_task("import-42", () -> "imported", Owner("browser-client");
+                                  watchers=[Owner("backend-service")], store=store_grant)
+            @test timedwait(() -> get_task_status(task_id, Owner("browser-client"); store=store_grant)[:status] == "COMPLETED", 5.0) == :ok
+
+            # The grant has to survive serialization and the state transitions the task
+            # went through on its way to COMPLETED -- which is exactly what #88's
+            # set_task!/replace_task! split protects.
+            @test get_task_status(task_id, Owner("backend-service"); store=store_grant)[:result] == "imported"
+            @test only(get_all_tasks(store_grant, Owner("backend-service"))).id == task_id
+            @test_throws AuthorizationError get_task_status(task_id, Owner("stranger"); store=store_grant)
+        end
+
         @testset "add_watcher! reaches a running task's live info" begin
             store_live = RealPormGWorkerStore(model=MockTaskModel())
 

@@ -450,6 +450,35 @@ watcher of a task they did not create just by naming its key. Under `:user` scop
 cannot name it at all; under `:global` scope they are refused unless a watch authorizer
 says otherwise.
 
+### Granting access to a second identity
+
+The identity that *submits* a task is not always the identity that *polls* it. A browser
+may upload under a deliberately short-lived credential while your own backend, holding a
+different long-lived one, drives the progress bar — and extending the browser's credential
+to cover the whole job is the thing that split exists to prevent.
+
+Pass `watchers` at submit time:
+
+```julia
+task_id = submit_task("import-42", run_import, Owner("browser-client");
+                      watchers = [Owner("backend-service")])
+
+# The backend can now poll and cancel, under its own identity:
+get_task_status(task_id, Owner("backend-service"))
+```
+
+The grant is made **at submit time, by the owner**. That is the moment the owner is already
+resolved and authorized, so there is no second authorization question to answer — and no
+post-hoc public grant call that would become another route into the watcher list.
+
+Two things to know before you use it:
+
+- **A grantee can cancel, not just read.** `cancel_task` gates on the same list, so a grant
+  hands over the owner's rights minus ownership. There is no read-only grant.
+- **Grants do not survive a record reset.** Re-running a *finished* key replaces the record
+  and resets its watchers to the resubmitter, so pass `watchers` again on each such
+  resubmission. Granting an identity that is already a watcher is a no-op.
+
 ## Queue And Watch Authorization
 
 Two independent hooks, installed on the store.
