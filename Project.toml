@@ -2,7 +2,7 @@ name = "Nitro"
 uuid = "e5efdb2c-68ee-4494-894d-55bb80f0a340"
 version = "0.2.0"
 authors = ["Nitro.jl Contributors"]
-repo = "https://github.com/NitroFramework/Nitro.jl.git"
+repo = "https://github.com/PingoLee/Nitro.jl.git"
 
 [deps]
 Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"

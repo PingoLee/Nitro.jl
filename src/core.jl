@@ -67,15 +67,11 @@ _http_metadata(req::HTTP.Request)          = HTTP._request_context_metadata!(get
 _http_version(req::HTTP.Request)           = VersionNumber(Int(getfield(req, :proto_major)), Int(getfield(req, :proto_minor)))
 _http_stream_request(stream::HTTP.Stream)  = HTTP._buffered_stream_request(stream)
 
-function request_cache!(builder::Function, req::HTTP.Request, key::Symbol)
-    if haskey(req.context, key)
-        return req.context[key]
-    end
-
-    value = builder()
-    req.context[key] = value
-    return value
-end
+# One implementation, in `Types` (#38): it probes the raw `HTTP.RequestContext` instead
+# of `req.context`, so a cache miss no longer allocates the metadata `Dict` just to look
+# for a key that is not there. The body-parser caches below (`req.json`, `req.form`, …)
+# get that saving for free by sharing it.
+using .Types: request_cache!
 
 function merge_request_input!(merged::Dict{String,Any}, source)
     if source isa AbstractDict
@@ -98,16 +94,36 @@ function request_multipart(req::HTTP.Request)
     end
 end
 
+# `req.params` is `nothing` until the router populates it, and `merge_request_input!` above
+# silently skips a non-`AbstractDict` source — so a merge performed before the router ran
+# produces an input map with the path params missing, and caching that unconditionally hands
+# every later reader the truncated version. A middleware calling the public `payload(req)`, or
+# a guard reading `req.input["tenant"]`, was enough to do it.
+#
+# That fails *silently* with wrong data rather than loudly, which is the worse shape, so the
+# cached merge is invalidated exactly once: if the value was built while path params were
+# absent and they have since appeared, it is rebuilt and then pinned. `pathparams` solves the
+# same transient-state problem by refusing to cache the `nothing` (see `src/types.jl`); this
+# one cannot, because a route with *no* path parameters leaves `req.params === nothing`
+# permanently, and gating on that would disable this cache for every such route.
+const REQUEST_INPUT_ROUTED_KEY = :__nitro_request_input_routed
+
 function request_input(req::HTTP.Request) :: Dict{String,Any}
-    return request_cache!(req, REQUEST_INPUT_CACHE_KEY) do
-        merged = Dict{String,Any}()
-        merge_request_input!(merged, req.query)
-        merge_request_input!(merged, req.json)
-        merge_request_input!(merged, req.form)
-        merge_request_input!(merged, req.post)
-        merge_request_input!(merged, req.params)
-        merged
+    ctx = getfield(req, :context)
+    params = req.params
+    if haskey(ctx, REQUEST_INPUT_CACHE_KEY) &&
+       (params === nothing || haskey(ctx, REQUEST_INPUT_ROUTED_KEY))
+        return ctx[REQUEST_INPUT_CACHE_KEY] :: Dict{String,Any}
     end
+    merged = Dict{String,Any}()
+    merge_request_input!(merged, req.query)
+    merge_request_input!(merged, req.json)
+    merge_request_input!(merged, req.form)
+    merge_request_input!(merged, req.post)
+    merge_request_input!(merged, params)
+    ctx[REQUEST_INPUT_CACHE_KEY] = merged
+    params === nothing || (ctx[REQUEST_INPUT_ROUTED_KEY] = true)
+    return merged
 end
 
 """
@@ -202,9 +218,14 @@ HTTP.jl's router hands over raw, still-encoded segments; the single decode happe
 all observe the same value. Query parameters (`getquery`) are decoded once by `HTTP.queryparams`
 for the same reason. See #70.
 
-Returns a **fresh `Dict` on each call** — decoding cannot be done in place — so the result is a
-snapshot rather than a handle into the request. Mutating it does not change what a later call
-returns; pass values down a request through `req.context` instead.
+Returns the **same `Dict` for the lifetime of the request** — it is decoded once and cached
+(#38), so the result is a live handle, not a snapshot. Mutating it *does* change what a later
+call returns, and is visible to `req.input` and to every parameter binding that has not run
+yet. Treat it as read-only; pass values down a request through `req.context` instead.
+
+This matches `req.json` and `req.form`, which have always been memoized this way. It used to
+return a fresh `Dict` per call, which meant a handler with N path parameters re-decoded the
+whole table N times.
 
 A malformed escape (`/x/%ZZ`, a trailing `%`) or a sequence decoding to invalid UTF-8 raises
 `ValidationError`, which the error handler reports as `400 Bad Request` — not a `500`.
@@ -215,6 +236,10 @@ getparams(req::HTTP.Request) = Types.pathparams(req)
     getquery(req::HTTP.Request) -> Dict{String, String}
 
 Returns the query parameters for the request.
+
+Parsed once per request and cached (#38), so this returns the **same `Dict`** on every call —
+a live handle, not a snapshot. Treat it as read-only: a mutation is visible to `req.input` and
+to any query-parameter binding that has not run yet.
 """
 getquery(req::HTTP.Request) = Types.queryvars(req)
 
@@ -293,6 +318,21 @@ end
 ```
 
 Use [`getcontext(req, T)`](@ref) when you want the value statically typed as `T`.
+
+!!! warning "Prefer the typed form on the request path"
+    The app context is stored as `Ref{Any}` and can be reassigned after route
+    registration (`serve(context = ...)`, `internalrequest(context = ...)`), so its
+    payload type is genuinely unknown when a route is registered and this accessor
+    can only return `Any`. Every field access on the result is therefore a dynamic
+    `getfield`, once per request — the one remaining `Any` on the parameter-binding
+    path after #37.
+
+    In a handler or middleware that runs per request, reach for
+    `getcontext(req, AppConfig)` instead: the `::T` assertion is a function barrier,
+    so everything downstream of it infers concretely (nitro-core §7). Keep this
+    untyped form for scripts, tests, and one-off inspection. Making the type static
+    rather than asserted means parameterizing the context carrier itself, which is
+    [#31](https://github.com/PingoLee/Nitro.jl/issues/31).
 """
 function getcontext(req::HTTP.Request)
     ctx = Base.get(req.context, REQUEST_CONTEXT_KEY, missing)
@@ -305,6 +345,18 @@ end
 Returns the application context payload typed as `T`, so field access is statically
 typed (`getcontext(req, AppConfig).host`). Throws an `ArgumentError` when no context
 was configured, and a `TypeError` when the payload is not a `T`.
+
+**This is the form to use on the request path.** The `::T` assertion is a function
+barrier: it converts the single `Any` the context carrier forces (see
+[`getcontext(req)`](@ref)) into a concrete type, so the handler body and everything it
+calls infer normally instead of dispatching dynamically on every field access.
+
+```julia
+function handler(req)
+    cfg = getcontext(req, AppConfig)   # ::AppConfig, statically
+    cfg.host                           # concrete getfield, not a dynamic lookup
+end
+```
 """
 function getcontext(req::HTTP.Request, ::Type{T}) where {T}
     ctx = Base.get(req.context, REQUEST_CONTEXT_KEY, missing)
@@ -765,12 +817,27 @@ function stream_handler(middleware::Function)
     end
 end
 
+# One `Threads.@spawn` per request, and nothing else (#39). This used to spawn the
+# task and then, inside it, `@async handle_stream(stream)` followed by `wait(handle)`
+# — a second Task allocation, a scheduler enqueue/dequeue, and a second condition
+# variable, all so the parent could block doing nothing until the child finished.
+# The inner task never ran concurrently with its parent, so it bought no
+# concurrency; exception propagation is identical either way because both `wait`s
+# rethrow. HTTP.jl already spawns per *connection*; this spawn is what moves each
+# *request* off that connection task, which is the Go-style model Nitro wants
+# (nitro-core §2). Do not reintroduce the inner `@async`.
+#
+# One genuine semantic difference, since "pure overhead" undersells it: `@async`
+# creates a **sticky** task, pinned to the thread that created it, while
+# `Threads.@spawn` creates a migratable one. A handler may therefore now move
+# between threads at a yield point mid-request. Nothing in Nitro depends on
+# thread affinity — `src/` calls `Threads.threadid()` nowhere and uses no
+# task-local storage — and migratable is the correct model here. But an *app*
+# using the `threadid()`-as-index pattern (`buffers[Threads.threadid()]`) was
+# already unsound under `@async` and is now visibly so.
 function parallel_stream_handler(handle_stream::Function)
     function(stream::HTTP.Stream)
-        task = Threads.@spawn begin
-            handle = @async handle_stream(stream)
-            wait(handle)
-        end
+        task = Threads.@spawn handle_stream(stream)
         wait(task)
     end
 end
@@ -929,6 +996,50 @@ function internalrequest(ctx::ServerContext, req::HTTP.Request; middleware::Vect
     end
 end
 
+# Strip everything after the path from a request-target, for the access log (#39).
+#
+# The hot path is a slice, not a full `HTTP.URI` parse: parsing per request purely to discard
+# the query is waste, and for the origin-form target that ~every request carries
+# (`/v1/x?k=1`) the prefix before the first '?' *is* the path.
+#
+# Two cases stop that from being the whole story, and both are security-relevant, because
+# this feeds a log that is routinely shipped to third-party aggregators:
+#
+#   * **Absolute-form** (RFC 9112 §3.2.2) -- a server MUST accept `GET http://h/x?k=1`, and
+#     HTTP.jl passes the target through verbatim. A prefix slice keeps
+#     `scheme://userinfo@host`, so `http://user:pa55w0rd@h/x` would put credentials straight
+#     into the log.
+#   * **A leading `//` is an authority, not a path.** `//user:pa55w0rd@evil.example/x` *does*
+#     start with '/', so a naive "starts with '/' means origin-form" test sends it down the
+#     slice branch and logs the credentials anyway. This is the case that makes the guard
+#     `startswith(target, '/') && !startswith(target, "//")` rather than the obvious one.
+#   * **Fragments** are not legal in a request-target and browsers never send one, but a
+#     hand-rolled client can, and '#' binds tighter than '?'. Cutting at whichever comes
+#     first keeps this agreeing with `HTTP.URI(...).path`, which drops the fragment.
+#
+# Everything that is not origin-form is parsed, and the parse result is logged only if it is
+# a real absolute path. That last test is what makes the fallback safe by construction rather
+# than by enumerating forms: authority-form (`CONNECT h.example:443`) parses to the nonsense
+# path "443", and any future shape that resolves to something authority-like fails it too, so
+# the log gets "-" instead of attacker-influenced text. Asterisk-form is a fixed literal with
+# no user content, so it is passed through as itself.
+function _log_target_path(target::AbstractString)
+    target == "*" && return SubString("*")
+    if startswith(target, '/') && !startswith(target, "//")
+        q = findfirst('?', target)
+        h = findfirst('#', target)
+        cut = q === nothing ? h : (h === nothing ? q : min(q, h))
+        return cut === nothing ? SubString(target) : SubString(target, 1, prevind(target, cut))
+    end
+    parsed = try
+        String(HTTP.URI(target).path)
+    catch e
+        e isa InterruptException && rethrow()
+        ""
+    end
+    return SubString(startswith(parsed, '/') ? parsed : "-")
+end
+
 """
     AccessLogMiddleware(; log_query::Bool=false)
 
@@ -942,13 +1053,18 @@ Query strings routinely carry secrets (password-reset tokens, API keys, OAuth
 `code`/`state`, signed-URL signatures), and access logs are frequently shipped to
 third-party aggregators. Pass `log_query=true` to log the full target including the
 query when you are sure no sensitive data travels in URLs.
+
+`log_query=true` logs the request-target **verbatim**, which is not only the query: a
+client may send absolute-form (`GET http://user:pa55w0rd@host/x`), so credentials in the
+authority are logged too. The default path is reduced by `_log_target_path`, which strips
+both. Only opt in for a service whose clients you control.
 """
 function AccessLogMiddleware(; log_query::Bool=false)
     return function(handle)
         return function(req::HTTP.Request)
             response = handle(req)
             ip = Base.get(req.context, :ip, nothing)
-            target = log_query ? req.target : HTTP.URI(req.target).path
+            target = log_query ? req.target : _log_target_path(req.target)
             @info "$(Dates.format(now(), "yyyy-mm-ddTHH:MM:SS")) - $ip - \"$(req.method) $target\" $(response.status)"
             return response
         end
@@ -1153,83 +1269,132 @@ function register_internal(ctx::ServerContext, router::Router, httpmethod::Strin
     registerhandler(ctx, router, httpmethod, route, func, func_details)
 end
 
+# ── Per-parameter binding strategies (#37) ────────────────────────────────────
+#
+# One concrete callable struct per parameter kind, built once at registration.
+# These were closures over `param`, a loop variable drawn from `info.sig::Vector{Param}`.
+# `Param` is a `UnionAll`, so that element type is abstract, so each closure's captured
+# field was abstract too — calling one cost a dynamic dispatch, and entering its
+# `where T` body cost a second. Carrying the parameter's type as the *struct's* type
+# parameter makes `param`, `param.type` and `param.default` concrete fields, so both
+# dispatches resolve statically and the whole strategy list can live in a concrete
+# `Tuple` (see `create_param_parser`). This is the shape `axum` reaches with
+# `FromRequestParts` + per-arity tuple impls; the abstract-vector-of-resolvers it
+# replaces is Spring's `HandlerMethodArgumentResolver`, which only survives on JIT
+# devirtualization the Julia runtime does not do. nitro-core §7.
+#
+# `ServerContext` is a concrete struct, so carrying it by value costs no indirection.
+
+struct ContextStrategy
+    ctx::ServerContext
+end
+(s::ContextStrategy)(::LazyRequest) = s.ctx.app_context[]
+
+struct ExtractorStrategy{T}
+    param::Param{T}
+end
+(s::ExtractorStrategy)(lr::LazyRequest) = extract(s.param, lr)
+
+struct CookieStrategy{T}
+    param::Param{T}
+    ctx::ServerContext
+end
+(s::CookieStrategy)(lr::LazyRequest) =
+    extract(s.param, lr, s.ctx.service.cookies[].secret_key)
+
+struct SessionStrategy{T}
+    param::Param{T}
+    ctx::ServerContext
+end
+(s::SessionStrategy)(lr::LazyRequest) =
+    extract(s.param, lr, s.ctx.service.cookies[].secret_key, s.ctx.app_context[])
+
+struct PathParamStrategy{T}
+    param::Param{T}
+    name::String
+end
+function (s::PathParamStrategy)(lr::LazyRequest)
+    raw_pathparams = Types.pathparams(lr)
+    # The lookup is deliberately OUTSIDE any guard. A route brace always has a matching
+    # handler parameter (enforced at registration, see `parse_func_params` above) and the
+    # router always populates it, so a miss here is a framework bug rather than client
+    # input — it must stay a 500 with a real stack trace, not be laundered into a 400.
+    return parseparam_checked(s.param.type, raw_pathparams[s.name], s.name, :path)
+end
+
+# Selected only when `param.hasdefault`, so an absent key means "use the declared
+# default". Returns `Union{T,Nothing}` by construction — that union is the declared
+# optionality of the parameter, not an inference failure.
+struct QueryParamStrategy{T}
+    param::Param{T}
+    name::String
+end
+function (s::QueryParamStrategy)(lr::LazyRequest)
+    raw_queryparams = Types.queryvars(lr)
+    haskey(raw_queryparams, s.name) || return s.param.default
+    return parseparam_checked(s.param.type, raw_queryparams[s.name], s.name, :query)
+end
+
+struct RequiredQueryParamStrategy{T}
+    param::Param{T}
+    name::String
+end
+function (s::RequiredQueryParamStrategy)(lr::LazyRequest)
+    raw_queryparams = Types.queryvars(lr)
+    # A required query parameter that was not sent is a client error. This used to be a
+    # bare `raw_queryparams[name]`, whose `KeyError` surfaced as a 500.
+    haskey(raw_queryparams, s.name) ||
+        throw(ValidationError("Missing required query parameter '$(s.name)'"))
+    return parseparam_checked(s.param.type, raw_queryparams[s.name], s.name, :query)
+end
+
+# The function barrier that makes the whole thing pay off. `strats` is assembled
+# dynamically above, so at the assembly site its static type is only `Tuple`. Taking it
+# as an explicit type parameter forces a specialization per concrete tuple type, so the
+# returned closure captures it *concretely* — and `map` over a concrete tuple is
+# unrolled, statically dispatched, and returns a concrete `Tuple` with no heap vector
+# and no boxing. Building the closure inline at the call site would leave the field
+# abstract and undo every gain above; keep this barrier.
+#
+# Arity degrades gracefully rather than cliff-edging: past roughly 32 elements Julia
+# stops unrolling `map` and falls back to a generic (still correct) path, so a
+# pathological handler loses the optimization instead of blowing up compile time.
+function _make_param_parser(strats::S) where {S<:Tuple}
+    return function(req::HTTP.Request)
+        lr = LazyRequest(request=req)
+        return map(s -> s(lr), strats)
+    end
+end
+
 function create_param_parser(ctx::ServerContext, func_details)
     info = func_details.info
     pathparams = func_details.pathnames
     queryparams = func_details.querynames
 
-    strategies = Vector{Function}()
-
-    function context_strategy(_::LazyRequest)
-        return ctx.app_context[]
-    end
-
-    function extractor_strategy(lr::LazyRequest, param::Param{T}) where T
-        return extract(param, lr)
-    end
-
-    function cookie_strategy(lr::LazyRequest, param::Param{T}) where T
-        return extract(param, lr, ctx.service.cookies[].secret_key)
-    end
-
-    function session_strategy(lr::LazyRequest, param::Param{T}) where T
-        return extract(param, lr, ctx.service.cookies[].secret_key, ctx.app_context[])
-    end
-
-    function pathparam_strategy(lr::LazyRequest, param::Param{T}, name::String) where T
-        raw_pathparams = Types.pathparams(lr)
-        # The lookup is deliberately OUTSIDE the guard. A route brace always has a matching
-        # handler parameter (enforced at registration, see `parse_func_params` above) and the
-        # router always populates it, so a miss here is a framework bug rather than client
-        # input — it must stay a 500 with a real stack trace, not be laundered into a 400.
-        return parseparam_checked(param.type, raw_pathparams[name], name, :path)
-    end
-
-    function queryparam_strategy(lr::LazyRequest, param::Param{T}, name::String) where T
-        raw_queryparams = Types.queryvars(lr)
-        # Only selected when `param.hasdefault` (see the dispatch loop below), so an absent
-        # key means "use the declared default".
-        haskey(raw_queryparams, name) || return param.default
-        return parseparam_checked(param.type, raw_queryparams[name], name, :query)
-    end
-
-    function queryparam_strategy_no_default(lr::LazyRequest, param::Param{T}, name::String) where T
-        raw_queryparams = Types.queryvars(lr)
-        # A required query parameter that was not sent is a client error. This used to be a
-        # bare `raw_queryparams[name]`, whose `KeyError` surfaced as a 500.
-        haskey(raw_queryparams, name) ||
-            throw(ValidationError("Missing required query parameter '$name'"))
-        return parseparam_checked(param.type, raw_queryparams[name], name, :query)
-    end
+    strategies = Any[]
 
     for param in info.sig
         name = param.name
         str_name = String(name)
+        # Order matters: `Session` and `Cookie` are both `<: Extractor`, so they must be
+        # tested before the generic extractor branch.
         if param.type <: Context
-            push!(strategies, context_strategy)
+            push!(strategies, ContextStrategy(ctx))
         elseif param.type <: Session
-            push!(strategies, lr -> session_strategy(lr, param))
+            push!(strategies, SessionStrategy(param, ctx))
         elseif param.type <: Cookie
-            push!(strategies, lr -> cookie_strategy(lr, param))
+            push!(strategies, CookieStrategy(param, ctx))
         elseif param.type <: Extractor
-            push!(strategies, lr -> extractor_strategy(lr, param))
+            push!(strategies, ExtractorStrategy(param))
         elseif name in pathparams
-            push!(strategies, lr -> pathparam_strategy(lr, param, str_name))
+            push!(strategies, PathParamStrategy(param, str_name))
         elseif name in queryparams
-            query_parsing_strat = param.hasdefault ? queryparam_strategy : queryparam_strategy_no_default
-            push!(strategies, lr -> query_parsing_strat(lr, param, str_name))
+            push!(strategies, param.hasdefault ? QueryParamStrategy(param, str_name) :
+                                                 RequiredQueryParamStrategy(param, str_name))
         end
     end
 
-    strat_length = length(strategies)
-    return function(req::HTTP.Request)
-        lr = LazyRequest(request=req)
-        results = Vector{Any}(undef, strat_length)
-        @inbounds for i in 1:strat_length
-            results[i] = strategies[i](lr)
-        end
-        return results
-    end
+    return _make_param_parser(Tuple(strategies))
 end
 
 function registerhandler(ctx::ServerContext, router::Router, httpmethod::String, route::String, func::Function, func_details::NamedTuple)

@@ -15,13 +15,20 @@ env:
   DOCUMENTER_KEY: ${{ secrets.DOCUMENTER_KEY }}
 jobs:
   test:
-    name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ github.event_name }}
+    name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.threads }} thread(s)
     runs-on: ${{ matrix.os }}
     env:
       JULIA_NUM_THREADS: ${{ matrix.threads }}
+    # Nightly is informational: it breaks for reasons that are not ours, and a permanently
+    # red required check trains you to stop reading CI. Keep it out of the required set.
+    continue-on-error: ${{ matrix.version == 'nightly' }}
     strategy:
       fail-fast: false
       matrix:
+        # `1.12` is the floor `[compat]` declares (`julia = "^1.12"`), so it gets the full
+        # OS x thread-count grid. The two `include`s below cover the rest of that bound and
+        # the future, one job each -- version-specific breakage is not OS-specific, so there
+        # is nothing to learn from running them three times.
         version:
           - '1.12'
         os:
@@ -29,6 +36,22 @@ jobs:
           - macos-latest
           - windows-latest
         threads: [1, 2]
+        include:
+          # Latest stable. Identical to 1.12 today, which is the point: `^1.12` claims 1.13+
+          # is supported and nothing tests it, so this starts covering the claim by itself
+          # the day 1.13 ships rather than waiting for someone to notice.
+          - version: '1'
+            os: ubuntu-latest
+            threads: 2
+          # Nitro is unusually exposed to compiler and Base churn: it redefines
+          # `Base.getproperty(::HTTP.Request, ::Symbol)` at runtime, pirates
+          # `HTTP.queryparams`, reads the `HTTP.BytesBody.data` internal, and treats type
+          # inference as an API property -- `test/handler_tests.jl` asserts an exact
+          # `Base.infer_return_type`. Nightly is how that surfaces before a stable release,
+          # not after.
+          - version: 'nightly'
+            os: ubuntu-latest
+            threads: 2
     steps:
       - uses: actions/checkout@v4
       # PormG is a path dependency (`[sources] PormG = {path = "../PormG.jl"}`)
@@ -48,9 +71,9 @@ jobs:
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
       - uses: julia-actions/julia-processcoverage@v1
-        if: matrix.os == 'ubuntu-latest' && matrix.threads == '1'
+        if: matrix.os == 'ubuntu-latest' && matrix.threads == '1' && matrix.version == '1.12'
       - uses: coverallsapp/github-action@v2
-        if: matrix.os == 'ubuntu-latest' && matrix.threads == '1'
+        if: matrix.os == 'ubuntu-latest' && matrix.threads == '1' && matrix.version == '1.12'
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           file: lcov.info

@@ -20,6 +20,54 @@ using Base.Threads
         @test haskey(req.context, Nitro.Core.REQUEST_INPUT_CACHE_KEY)
     end
 
+    @testset "query, params and headers are cached per request (#38)" begin
+        req = HTTP.Request("GET", "/items/7?a=1&b=2", ["X-Trace" => "abc"])
+        req.context[:params] = Dict("id" => "7")
+
+        # Identity, not equality: these three used to rebuild their Dict on every call,
+        # so the param binder re-decoded the same unchanged target once per bound
+        # parameter. `req.json`/`req.form` were already memoized; this closed the gap.
+        @test req.query === req.query
+        @test req.params === req.params
+        @test Nitro.Core.Types.headers(req) === Nitro.Core.Types.headers(req)
+
+        @test haskey(req.context, Nitro.Core.Types.REQUEST_QUERY_CACHE_KEY)
+        @test haskey(req.context, Nitro.Core.Types.REQUEST_PATHPARAMS_CACHE_KEY)
+        @test haskey(req.context, Nitro.Core.Types.REQUEST_HEADERS_CACHE_KEY)
+
+        # Values still correct after caching.
+        @test req.query == Dict("a" => "1", "b" => "2")
+        @test req.params == Dict("id" => "7")
+        @test Nitro.Core.Types.headers(req)["x-trace"] == "abc"
+    end
+
+    @testset "a pre-router read of path params is never cached (#38)" begin
+        # `HTTP.getparams` reads `req.context[:params]`, which the ROUTER fills — and
+        # middleware runs before the router. Caching the `nothing` a pre-router read sees
+        # would poison the request: the path binder would later index into `nothing` and
+        # 500 every parameterized route. So `nothing` is returned uncached, and the value
+        # starts being cached only once the router has actually populated the slot.
+        req = HTTP.Request("GET", "/never-routed")
+        @test req.params === nothing
+        @test !haskey(req.context, Nitro.Core.Types.REQUEST_PATHPARAMS_CACHE_KEY)
+
+        # Now the router runs. The next read must see the real params, not a cached miss.
+        req.context[:params] = Dict("id" => "7")
+        @test req.params == Dict("id" => "7")
+        @test haskey(req.context, Nitro.Core.Types.REQUEST_PATHPARAMS_CACHE_KEY)
+        @test req.params === req.params
+    end
+
+    @testset "a malformed query is not memoized as a value (#38)" begin
+        # `queryvars` raises `ValidationError` so the error handler can turn it into a 400.
+        # A cache that stored the *failure* would be the wrong shape for that, so a throwing
+        # builder must cache nothing and rethrow on the next touch.
+        req = HTTP.Request("GET", "/x?v=%ZZ")
+        @test_throws Nitro.ValidationError req.query
+        @test !haskey(req.context, Nitro.Core.Types.REQUEST_QUERY_CACHE_KEY)
+        @test_throws Nitro.ValidationError req.query
+    end
+
     @testset "query and merged input" begin
         req = HTTP.Request("POST", "/users/42?shared=query&only_query=1", [], "{\"shared\":\"json\",\"only_json\":2}")
         req.context[:params] = Dict("shared" => "path", "id" => "42")
