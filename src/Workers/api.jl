@@ -177,6 +177,49 @@ function _watch_allowed(store::AbstractWorkerStore, task_key::String, watchers::
     return Base.invokelatest(authorizer, task_key, watchers, user_id)::Bool
 end
 
+# Authorize against the cached record, and only if that denies, re-check the durable one.
+#
+# `get_task_info` may serve a live in-memory object for a running task so pollers see fresh
+# progress without a round-trip. That cache is per process, so a grant issued *elsewhere*
+# is not in it — and #96's whole motivating case is a task submitted on one node and polled
+# from another. Denying on the cache alone would refuse a user who is authorized in the
+# durable record, making the grant work or not depending on which node answered.
+#
+# Ordering matters for cost: the cached check succeeds for the owner and for any watcher
+# this process already knows, so the extra read is paid only on the path that was about to
+# raise anyway. It can only ever turn a denial into an approval, never the reverse.
+function _authorize_or_reload!(store::AbstractWorkerStore, authority::TaskAuthority,
+                               task_info::TaskInfo, action::AbstractString)
+    _is_authorized(authority, task_info) && return task_info
+
+    durable = reload_task(store, task_info.id)
+    if durable !== nothing && _is_authorized(authority, durable)
+        return durable
+    end
+
+    _authorize_task!(authority, task_info, action)   # raises
+    return task_info
+end
+
+# A `watchers=` grant is authorized by the *owner* — but a `:global` task has no owner
+# half in its id, and there the store's watch authorizer IS the whole access policy. Left
+# ungated, any admitted watcher could hand access to an identity the authorizer explicitly
+# refuses, which is transitive expansion the app never approved. So `:global` grants go
+# through the same gate a direct join would.
+#
+# `:user`-scoped grants need no such check: the id names its owner, and an owner sharing
+# their own task is exactly what the feature is for.
+function _authorize_grant!(store::AbstractWorkerStore, task_key::String,
+                           watchers::Vector{String}, grant::Owner)
+    owner_of(task_key) === nothing || return nothing        # :user scope — owner's call
+    grant.user_id in watchers && return nothing             # already admitted
+    if !_watch_allowed(store, task_key, copy(watchers), grant.user_id)
+        throw(AuthorizationError(
+            "User '$(grant.user_id)' is not authorized to watch task '$task_key'"))
+    end
+    return nothing
+end
+
 function _register_or_watch!(store::AbstractWorkerStore, task_key::String, owner::Owner;
                              queue_name::Union{Nothing, String}=nothing,
                              grants::AbstractVector{Owner}=Owner[])
@@ -187,6 +230,14 @@ function _register_or_watch!(store::AbstractWorkerStore, task_key::String, owner
         # Gates both branches below: joining a live task grants the caller the
         # owner's read/cancel rights, and replacing a finished one destroys the
         # owner's stored result. `copy` keeps an app callback off the live list.
+        if task_info !== nothing && !_is_authorized(owner, task_info)
+            # Same staleness trap as the read paths: a cached record can lack a grant
+            # another process issued, which would send an already-authorized watcher to
+            # the authorizer and have it refused.
+            durable = reload_task(store, task_key)
+            durable !== nothing && (task_info = durable)
+        end
+
         if task_info !== nothing && !_is_authorized(owner, task_info)
             if !_watch_allowed(store, task_key, copy(task_info.watchers), uid)
                 throw(AuthorizationError(
@@ -201,6 +252,7 @@ function _register_or_watch!(store::AbstractWorkerStore, task_key::String, owner
             # last-write-wins across processes.
             add_watcher!(store, task_key, uid)
             for grant in grants
+                _authorize_grant!(store, task_key, task_info.watchers, grant)
                 add_watcher!(store, task_key, grant.user_id)
             end
             return false
@@ -211,6 +263,7 @@ function _register_or_watch!(store::AbstractWorkerStore, task_key::String, owner
         task_info = TaskInfo(task_key; queue_name)
         push!(task_info.watchers, uid)
         for grant in grants
+            _authorize_grant!(store, task_key, task_info.watchers, grant)
             grant.user_id in task_info.watchers || push!(task_info.watchers, grant.user_id)
         end
         replace_task!(store, task_key, task_info)
@@ -317,7 +370,8 @@ function submit_task(ctx::ServerContext, task_key::AbstractString, callback::Fun
 end
 
 """
-    submit_sequential_task(queue_name, task_key, callback, user_id; scope=:user, options=TaskOptions(), store=default_store())
+    submit_sequential_task(queue_name, task_key, callback, owner::Owner; scope=:user,
+                           watchers=Owner[], options=TaskOptions(), store=default_store())
 
 Queue `callback` for one-at-a-time execution on `queue_name` and return the id it was
 stored under.
@@ -352,7 +406,7 @@ function get_task_status(task_id::AbstractString, authority::TaskAuthority; stor
         return Dict{Symbol, Any}(:error => "Task not found", :status => "NOT_FOUND")
     end
 
-    _authorize_task!(authority, task_info, "view")
+    task_info = _authorize_or_reload!(store, authority, task_info, "view")
 
     return Dict{Symbol, Any}(
         :id => task_info.id,
@@ -380,7 +434,7 @@ function cancel_task(task_id::AbstractString, authority::TaskAuthority; store::A
             return Dict{Symbol, Any}(:error => "Task not found")
         end
 
-        _authorize_task!(authority, task_info, "cancel")
+        task_info = _authorize_or_reload!(store, authority, task_info, "cancel")
 
         if task_info.status in (COMPLETED, FAILED, CANCELLED)
             return Dict{Symbol, Any}(:error => "Task already finished with status $(task_info.status)")

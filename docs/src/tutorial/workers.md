@@ -239,6 +239,29 @@ Tasks can be cancelled by id — again, the id the submit call returned:
 cancel_task(task_id, Owner("user-1"))
 ```
 
+!!! warning "Cancellation is cooperative"
+    `cancel_task` records the terminal state atomically and sends an `InterruptException`
+    to the worker task, but it **cannot force a running callback to stop**. A callback in a
+    tight loop that never yields, or one blocked in a `ccall` or an external process, keeps
+    running after `cancel_task` has returned `"Task cancelled"` and the status reads
+    `CANCELLED`.
+
+    Write cancellable work so it can notice: yield regularly, and check the status if the
+    job is long-running.
+
+    ```julia
+    submit_task("import", task_info -> begin
+        for chunk in chunks
+            task_info.status == CANCELLED && return "cancelled"
+            process(chunk)
+            update_progress!(task_info, 100 * done / total)
+        end
+    end, Owner("user-1"))
+    ```
+
+    A callback that spawns an external process must kill it itself — see
+    [#49](https://github.com/PingoLee/Nitro.jl/issues/49).
+
 Tasks can also retry on failure by passing `TaskOptions`.
 
 ```julia
@@ -375,6 +398,17 @@ Task metadata will now be persisted to that database, while live running threads
     it orders writes within one process and gives you nothing across processes. Do not
     build a read-modify-write on top of it and assume it is safe; use the atomic store
     operations, or add one.
+
+!!! warning "Nitro owns the format of the `watchers` column"
+    `nitro_task.watchers` holds a JSON array written by `JSON.json`, and its exact byte
+    form is load-bearing in two places: the watcher compare-and-set matches the stored
+    document, and user-scoped listing matches the JSON-quoted user id as a substring.
+
+    Do not rewrite that column by hand, from a migration, or from another language. A row
+    reformatted with different spacing or escaping — `["alice", "bob"]` rather than
+    `["alice","bob"]` — makes the compare-and-set exhaust its retries and raise on the next
+    grant, and can make a row silently drop out of a user's task list. Change watchers only
+    through the worker API.
 
 ### 3. Start workers with the persistent store
 Pass the store into the worker startup middleware:

@@ -318,6 +318,7 @@ owner_of(task_id)                                             # "user-a" | nothi
 
 submit_task(task_key, callback::Function, owner::Owner;       # RETURNS the stored id
             scope::Symbol = :user,                            # :user namespaces the key by owner
+            watchers::Vector{Owner} = Owner[],                # grant a 2nd identity read/list/cancel
             options::TaskOptions = TaskOptions(), store = default_store())
 get_task_status(task_id, authority::TaskAuthority; store = default_store())
 cancel_task(task_id,     authority::TaskAuthority; store = default_store())

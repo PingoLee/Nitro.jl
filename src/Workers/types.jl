@@ -24,6 +24,12 @@ id. `user_id` may not contain it; see [`scoped_task_key`](@ref).
 """
 const TASK_KEY_DELIMITER = "::"
 
+# Sentinel for "this field was not supplied", where `nothing` is itself a legal value.
+# `try_transition!` needs it for `result`: a task that completes with `nothing` is not the
+# same as one whose transition should leave the stored result alone.
+struct _Unsupplied end
+const UNSUPPLIED = _Unsupplied()
+
 """
     TaskAuthority
 

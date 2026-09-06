@@ -179,18 +179,29 @@ end
 function set_task!(store::InMemoryWorkerStore, task_id::String, task_info::TaskInfo)
     lock(store.task_lock) do
         existing = Base.get(store.task_registry, task_id, nothing)
-        if existing !== nothing && existing !== task_info
-            # Callers almost always save the very object they read, in which case there
-            # is nothing to reconcile. When they do not, honour the same contract the
-            # serializing stores now do: a state save carries state, never grants. Both
-            # backends must agree here — a rule enforced by only one of them is a store
-            # that silently behaves differently.
-            empty!(task_info.watchers)
-            append!(task_info.watchers, existing.watchers)
+        # Callers almost always save the very object they read, so there is nothing to
+        # reconcile and the record simply stands.
+        if existing === nothing || existing === task_info
+            store.task_registry[task_id] = task_info
+            return task_info
         end
-        store.task_registry[task_id] = task_info
+
+        # A different object: copy the volatile state across and keep the *stored*
+        # record's watchers — precisely what the serializing store achieves by omitting
+        # the column. The caller's object is left untouched, so both backends agree on
+        # that too; a rule honoured by only one of them is a store that silently behaves
+        # differently, which for this pair means a different security posture.
+        existing.status = task_info.status
+        @atomic existing.progress = task_info.progress
+        existing.result = task_info.result
+        existing.error = task_info.error
+        existing.created_at = task_info.created_at
+        existing.started_at = task_info.started_at
+        existing.completed_at = task_info.completed_at
+        existing.sys_task = task_info.sys_task
+        existing.queue_name = task_info.queue_name
+        return existing
     end
-    return task_info
 end
 
 function replace_task!(store::InMemoryWorkerStore, task_id::String, task_info::TaskInfo)
@@ -213,7 +224,9 @@ end
 
 function try_transition!(store::InMemoryWorkerStore, task_id::String, from, to::TaskStatus;
                          error::Union{Nothing, String}=nothing,
-                         completed_at::Union{Nothing, DateTime}=nothing)
+                         completed_at::Union{Nothing, DateTime}=nothing,
+                         result=UNSUPPLIED,
+                         progress::Union{Nothing, Real}=nothing)
     lock(store.task_lock) do
         task_info = Base.get(store.task_registry, task_id, nothing)
         task_info === nothing && return false
@@ -221,10 +234,30 @@ function try_transition!(store::InMemoryWorkerStore, task_id::String, from, to::
 
         error === nothing || (task_info.error = error)
         completed_at === nothing || (task_info.completed_at = completed_at)
+        result === UNSUPPLIED || (task_info.result = result)
+        progress === nothing || (@atomic task_info.progress = Float64(progress))
         task_info.status = to        # last, so no reader sees the new status early
         return true
     end
 end
+
+"""
+    reload_task(store, task_id::String) -> Union{Nothing, TaskInfo}
+
+Read the **durable** record, bypassing any in-process cache.
+
+Distinct from [`get_task_info`](@ref), which is free to serve a live in-memory object for a
+running task so callers see fresh progress without a round-trip. That cache is per process,
+so its `watchers` can be stale the moment another process issues a grant — and an
+authorization check that consults only the cache refuses a user who *is* authorized in the
+durable record. Read paths therefore fall back to this before denying.
+
+Used only on the denial path, so the common case still costs nothing.
+"""
+function reload_task end
+
+# Nothing is cached: the registry *is* the durable record.
+reload_task(store::InMemoryWorkerStore, task_id::String) = get_task_info(store, task_id)
 
 function delete_task!(store::InMemoryWorkerStore, task_id::String)
     lock(store.task_lock) do

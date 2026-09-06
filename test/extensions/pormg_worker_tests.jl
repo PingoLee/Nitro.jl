@@ -460,6 +460,73 @@ else
             end
         end
 
+        @testset "a completing task cannot overwrite a cancellation from elsewhere (#88)" begin
+            store_x = RealPormGWorkerStore(model=MockTaskModel())
+
+            live = TaskInfo("alice::job")
+            push!(live.watchers, "alice")
+            live.status = RUNNING
+            replace_task!(store_x, live.id, live)
+            # This process is running the task, so `get_task_info` serves THIS object.
+            register_active_task_info!(store_x, live.id, live)
+
+            # Another process cancels: it writes the row and never touches our live object.
+            @test try_transition!(store_x, "alice::job", (PENDING, RUNNING), CANCELLED;
+                                  error="Cancelled") == true
+
+            # Our callback now returns normally. The old guard read `get_task_info`, which
+            # handed back our own live object still saying RUNNING, so the cancellation was
+            # invisible and the completion overwrote it: the canceller was told "cancelled"
+            # while the row said COMPLETED and served the result.
+            Nitro.Workers._complete_task!(store_x, live, "the-result")
+
+            persisted = reload_task(store_x, "alice::job")
+            @test persisted.status == CANCELLED
+            @test persisted.result != "the-result"
+        end
+
+        @testset "a failing task cannot overwrite a cancellation from elsewhere (#88)" begin
+            store_f = RealPormGWorkerStore(model=MockTaskModel())
+
+            live = TaskInfo("alice::flaky")
+            push!(live.watchers, "alice")
+            live.status = RUNNING
+            replace_task!(store_f, live.id, live)
+            register_active_task_info!(store_f, live.id, live)
+
+            try_transition!(store_f, "alice::flaky", (PENDING, RUNNING), CANCELLED; error="Cancelled")
+            # `_fail_task!` had no cancellation guard at all, not even the ineffective one.
+            Nitro.Workers._fail_task!(store_f, live, "boom")
+
+            persisted = reload_task(store_f, "alice::flaky")
+            @test persisted.status == CANCELLED
+            @test persisted.error == "Cancelled"
+        end
+
+        @testset "a grant made elsewhere is honoured despite a stale live record (#96)" begin
+            store_s = RealPormGWorkerStore(model=MockTaskModel())
+
+            live = TaskInfo("alice::upload")
+            push!(live.watchers, "alice")
+            live.status = RUNNING
+            replace_task!(store_s, live.id, live)
+            register_active_task_info!(store_s, live.id, live)
+
+            # Another process grants access. It writes the row; our live object, which
+            # `get_task_info` serves, knows nothing about it. This is #96's own motivating
+            # deployment: submitted on one node, polled from another.
+            @test add_watcher!(store_s, "alice::upload", "backend-service") == true
+            empty!(live.watchers)
+            push!(live.watchers, "alice")          # force the live copy stale
+
+            # Listing reads the row and admits the grantee...
+            @test only(get_all_tasks(store_s, Owner("backend-service"))).id == "alice::upload"
+            # ...and so must the point reads, or the grant works or not by which node answered.
+            @test get_task_status("alice::upload", Owner("backend-service"); store=store_s)[:id] == "alice::upload"
+            # A genuine stranger is still refused after the durable re-check.
+            @test_throws AuthorizationError get_task_status("alice::upload", Owner("stranger"); store=store_s)
+        end
+
         @testset "watchers= grants persist through the store (#96)" begin
             store_grant = RealPormGWorkerStore(model=MockTaskModel())
 
@@ -467,9 +534,10 @@ else
                                   watchers=[Owner("backend-service")], store=store_grant)
             @test timedwait(() -> get_task_status(task_id, Owner("browser-client"); store=store_grant)[:status] == "COMPLETED", 5.0) == :ok
 
-            # The grant has to survive serialization and the state transitions the task
-            # went through on its way to COMPLETED -- which is exactly what #88's
-            # set_task!/replace_task! split protects.
+            # The grant has to survive serialization and round-trip back out of the store.
+            # (This is a #96 test, not a #88 regression test: within one process the saved
+            # object already carries both watchers, so it would pass against the unpatched
+            # `set_task!` too. The non-vacuous #88 cases are above and in workers_tests.jl.)
             @test get_task_status(task_id, Owner("backend-service"); store=store_grant)[:result] == "imported"
             @test only(get_all_tasks(store_grant, Owner("backend-service"))).id == task_id
             @test_throws AuthorizationError get_task_status(task_id, Owner("stranger"); store=store_grant)

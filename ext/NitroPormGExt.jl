@@ -14,7 +14,7 @@ import Nitro: pormg_nitro_session
 import Nitro.Workers: AbstractWorkerStore, TaskInfo, TaskStatus, TaskOptions, SequentialQueue, CleanupScheduler,
     PENDING, RUNNING, COMPLETED, FAILED, CANCELLED,
     TaskAuthority, Owner, System, owner_of, _is_authorized, TASK_KEY_DELIMITER,
-    get_task_info, set_task!, replace_task!, add_watcher!, try_transition!,
+    get_task_info, reload_task, set_task!, replace_task!, add_watcher!, try_transition!,
     delete_task!, cleanup_tasks!, get_all_tasks,
     get_active_task, register_active_task!, deregister_active_task!,
     get_active_task_info, register_active_task_info!, deregister_active_task_info!,
@@ -633,12 +633,19 @@ function add_watcher!(store::PormGWorkerStore, task_id::String, user_id::String)
           "`watchers` column is not in the canonical JSON form this store writes")
 end
 
+reload_task(store::PormGWorkerStore, task_id::String) = _read_db_task(store, task_id)
+
 function try_transition!(store::PormGWorkerStore, task_id::String, from, to::TaskStatus;
                          error::Union{Nothing, String}=nothing,
-                         completed_at::Union{Nothing, DateTime}=nothing)
+                         completed_at::Union{Nothing, DateTime}=nothing,
+                         result=Nitro.Workers.UNSUPPLIED,
+                         progress::Union{Nothing, Real}=nothing)
     columns = Pair{String, Any}["status" => string(to)]
     error === nothing || push!(columns, "error" => error)
     completed_at === nothing || push!(columns, "completed_at" => completed_at)
+    result === Nitro.Workers.UNSUPPLIED ||
+        push!(columns, "result" => isnothing(result) ? "" : JSON.json(result))
+    progress === nothing || push!(columns, "progress" => Float64(progress))
 
     # The status precondition lives in the WHERE clause, so the compare and the write are
     # one statement. Zero rows affected means the task was absent or had already left

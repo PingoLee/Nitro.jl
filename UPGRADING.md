@@ -66,10 +66,15 @@ operations, which every backend can honour with its own storage:
   implements it as a bounded-retry compare-and-set: the expected `watchers` document is part
   of the `WHERE` clause, so a racing append matches zero rows and the retry re-reads what the
   other writer left instead of overwriting it.
-- **`try_transition!(store, task_id, from, to; error, completed_at) -> Bool`** — moves a task
-  between statuses only if it is still in `from`, with the precondition and the write in one
-  statement. `cancel_task` now claims the transition this way, so a task completing
-  concurrently cannot clobber a cancellation.
+- **`try_transition!(store, task_id, from, to; error, completed_at, result, progress) -> Bool`**
+  — moves a task between statuses only if it is still in `from`, with the precondition and
+  the write in one statement. **Every** terminal transition now goes through it: `cancel_task`,
+  and completion, failure and cancellation inside the worker. Whichever writer arrives first
+  wins and the losers write nothing, so a task finishing concurrently — in this process or
+  another one sharing the database — cannot overwrite a cancellation.
+- **`reload_task(store, task_id)`** — reads the durable record, bypassing any in-process
+  cache. Read paths consult it before *denying*, so a grant issued by another process is not
+  refused merely because this process's cached record predates it.
 - **`replace_task!(store, task_id, task_info)`** — writes a whole record, watchers included.
 
 And the change that actually closes the issue: **`set_task!` no longer writes `watchers` at
@@ -124,9 +129,16 @@ Operational notes:
 - PormG's `with_advisory_lock` was also rejected: it is Postgres-only and degrades to a
   no-op with a warning on SQLite, which would give a silently different consistency
   posture per backend.
-- The compare-and-set assumes `watchers` is in the canonical JSON form this store writes.
-  A row written by hand with different spacing will exhaust the retries and raise an error
-  naming the task, rather than silently losing the append.
+- **Nitro now owns the byte format of the `watchers` column.** It is a JSON array written by
+  `JSON.json`, and its exact form is load-bearing twice: the compare-and-set matches the
+  stored document, and user-scoped listing matches the JSON-quoted user id as a substring. A
+  row reformatted by hand, by a migration, or by another language — `["alice", "bob"]` rather
+  than `["alice","bob"]` — makes the next grant exhaust its retries and raise, and can make
+  the row silently drop out of that user's task list. Change watchers only through the worker
+  API.
+- A custom store that also runs its own terminal transitions must route them through
+  `try_transition!` rather than reading the status and then saving, or it reintroduces the
+  race for its own backend.
 
 ---
 

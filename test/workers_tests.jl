@@ -290,6 +290,53 @@ end
     end
 end
 
+@testset "a :global grant is still subject to the watch authorizer (#96)" begin
+    store = InMemoryWorkerStore()
+    org = Dict("victim" => "A", "bob" => "A", "mallory" => "B")
+    set_watch_authorizer!(store, (task_key, watchers, user_id) ->
+        get(org, first(watchers), nothing) == get(org, user_id, nothing))
+
+    try
+        gid = submit_task("shared-index", () -> "secret", Owner("victim");
+                          scope=:global, store=store)
+
+        # A direct join by an out-of-org user is refused — that is #19's gate.
+        @test_throws AuthorizationError submit_task("shared-index", () -> "x", Owner("mallory");
+                                                   scope=:global, store=store)
+
+        # ...so a grant must not be a way around it. For a :global task there is no owner
+        # in the id, which makes the watch authorizer the entire access policy; letting an
+        # admitted watcher hand access onward would be transitive expansion the app never
+        # approved — and it would carry cancel rights too.
+        @test_throws AuthorizationError submit_task("shared-index", () -> "x", Owner("bob");
+                                                   scope=:global, watchers=[Owner("mallory")],
+                                                   store=store)
+        @test_throws AuthorizationError get_task_status(gid, Owner("mallory"); store=store)
+
+        # An in-org grantee the authorizer accepts still goes through.
+        @test submit_task("shared-index", () -> "x", Owner("victim");
+                          scope=:global, watchers=[Owner("bob")], store=store) == gid
+        @test get_task_status(gid, Owner("bob"); store=store)[:id] == gid
+    finally
+        reset_store!(store)
+    end
+end
+
+@testset "a :user grant needs no authorizer — the owner owns the task (#96)" begin
+    store = InMemoryWorkerStore()
+    # An authorizer that refuses everyone. It governs :global key reuse only, so it must
+    # not reach a :user-scoped owner sharing their own task.
+    set_watch_authorizer!(store, (task_key, watchers, user_id) -> false)
+
+    try
+        task_id = submit_task("report", () -> "mine", Owner("alice");
+                              watchers=[Owner("helper")], store=store)
+        @test get_task_status(task_id, Owner("helper"); store=store)[:id] == task_id
+    finally
+        reset_store!(store)
+    end
+end
+
 @testset "watchers= grants cancel too, and does not survive a record reset (#96)" begin
     store = InMemoryWorkerStore()
     started = Base.Event()
