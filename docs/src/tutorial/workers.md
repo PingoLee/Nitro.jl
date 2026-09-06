@@ -200,18 +200,36 @@ every_task = get_all_tasks(System())
 
 ### `get_queue_status`
 
-Useful for sequential queues.
-
-```julia
-queue = get_queue_status("reports")
-```
-
-It reports information like:
+Queue-wide introspection for sequential queues, reporting:
 
 - current task
-- pending count
+- pending count and the ids of everything pending
 - queue state
 - total load
+
+**It is an admin surface and takes `System()` only** — an `Owner` is a `MethodError`:
+
+```julia
+queue = get_queue_status("reports", System())
+```
+
+Queue depth and the current task are facts about a *queue*, not about any one user, and
+the pending-id list carries owners in the `"<owner>::<key>"` prefix. Accepting an `Owner`
+and filtering that list would produce something that looks user-scoped while still
+reporting another tenant's queue depth. Put it behind the same authorization you would put
+in front of Sidekiq Web or a Hangfire dashboard, and keep it off user-facing routes.
+
+To show a user their own pending work, build it from a scoped read instead:
+
+```julia
+mine_pending = get_all_tasks(Owner("user-1"), PENDING)
+```
+
+!!! note "`is_task_running` was removed"
+    It took no user id at all, so any caller who could name an id learned whether it was
+    live. Use `get_task_status(task_id, Owner(user_id))[:status] in ("PENDING", "RUNNING")`,
+    which answers the same question with authorization applied. Note `:status` is a
+    `String`, not the `TaskStatus` enum.
 
 ## Cancellation And Retries
 

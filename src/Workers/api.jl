@@ -126,9 +126,7 @@ whom:
 
 `submit_task` and `submit_sequential_task` return the resolved id; pass *that* to
 `get_task_status` and `cancel_task` along with the [`TaskAuthority`](@ref) the call acts
-under. (`is_task_running` also takes a resolved id, but performs no authorization at all
-— it is an existence probe, not a user-scoped read.) Use this function when the return
-value was not kept.
+under. Use this function when the return value was not kept.
 
 Throws `ArgumentError` for an unknown `scope`, or when a `:global` `task_key` contains
 `$(TASK_KEY_DELIMITER)` — that would let a caller submit `"victim$(TASK_KEY_DELIMITER)report"`
@@ -372,15 +370,6 @@ function cancel_task(ctx::ServerContext, task_id::AbstractString, authority::Tas
     return cancel_task(task_id, authority; store=_resolve_store(ctx; key, store))
 end
 
-function is_task_running(task_key::AbstractString; store::AbstractWorkerStore=default_store())
-    task_info = get_task_info(store, String(task_key))
-    return task_info !== nothing && task_info.status in (PENDING, RUNNING)
-end
-
-function is_task_running(ctx::ServerContext, task_key::AbstractString; key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
-    return is_task_running(task_key; store=_resolve_store(ctx; key, store))
-end
-
 function get_all_tasks(authority::TaskAuthority, filter_status::Union{Nothing, TaskStatus}=nothing; store::AbstractWorkerStore=default_store())
     task_infos = get_all_tasks(store, authority; status=filter_status)
     tasks = Vector{Dict{Symbol, Any}}()
@@ -412,7 +401,26 @@ function cleanup_old_tasks(ctx::ServerContext, days::Int=7; key::Symbol=DEFAULT_
     return cleanup_old_tasks(days; store=_resolve_store(ctx; key, store))
 end
 
-function get_queue_status(queue_name::AbstractString; store::AbstractWorkerStore=default_store())
+"""
+    get_queue_status(queue_name, ::System; store=default_store()) -> Dict{Symbol, Any}
+
+Queue-wide introspection: depth, whether the processor is running, the current task, and
+the ids of everything pending on `queue_name`.
+
+**This is an admin surface, and it takes `System()` only.** Queue depth and `:current_task`
+are global facts about a queue, not facts about any one user, and `:pending_tasks`
+enumerates ids that — since [#19](https://github.com/PingoLee/Nitro.jl/issues/19) — carry
+their owner in the `"<owner>::<key>"` prefix. Handing it an `Owner` and filtering the id
+list would produce something that *looks* user-scoped while still reporting another
+tenant's queue depth, which is the shape [#87](https://github.com/PingoLee/Nitro.jl/issues/87)
+exists to stop. An `Owner` is a `MethodError` here on purpose.
+
+Mount it behind the same authorization you would put in front of Sidekiq Web, Oban Web or
+a Hangfire dashboard — all-or-nothing, and not on a user-facing route. If you want to show
+a user *their* place in a queue, build that from `get_all_tasks(Owner(uid), PENDING)`,
+which reports only what they may see.
+"""
+function get_queue_status(queue_name::AbstractString, ::System; store::AbstractWorkerStore=default_store())
     qlock = get_queue_lock(store)
     queues = get_sequential_queues(store)
 
@@ -436,8 +444,8 @@ function get_queue_status(queue_name::AbstractString; store::AbstractWorkerStore
     end
 end
 
-function get_queue_status(ctx::ServerContext, queue_name::AbstractString; key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
-    return get_queue_status(queue_name; store=_resolve_store(ctx; key, store))
+function get_queue_status(ctx::ServerContext, queue_name::AbstractString, authority::System; key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
+    return get_queue_status(queue_name, authority; store=_resolve_store(ctx; key, store))
 end
 
 function start_cleanup_scheduler(; interval_hours::Real=24, retain_days::Int=7, store::AbstractWorkerStore=default_store())

@@ -94,7 +94,7 @@ you add anything:
 |-----|---------|
 | `submit_sequential_task`, `SequentialQueue` | Ordered, one-at-a-time execution within a queue |
 | `scoped_task_key`, `DEFAULT_QUEUE_NAME` | Resolve a `(task_key, user_id, scope)` to its stored id; the queue name `submit_task` authorizes against |
-| `is_task_running`, `get_queue_status` | Introspection without mutating |
+| `get_queue_status` | Queue-wide introspection — **admin only**, takes `System()`; an `Owner` is a `MethodError` |
 | `update_progress!` | The only safe write to `TaskInfo.progress` |
 | `cleanup_old_tasks`, `start_cleanup_scheduler`, `stop_cleanup_scheduler!` | Retention |
 | `shutdown!` | Graceful teardown — stop the cleanup scheduler and queue processors |

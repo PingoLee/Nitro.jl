@@ -62,7 +62,7 @@ end
         @test wait_for(() -> all(get_task_status(id, Owner("user"); store=store)[:status] == "COMPLETED" for id in ids)) == :ok
         @test observed == ids
 
-        queue_status = get_queue_status("reports"; store=store)
+        queue_status = get_queue_status("reports", System(); store=store)
         @test queue_status[:running] == true
         @test queue_status[:current_task] === nothing
         @test queue_status[:total_load] == 0
@@ -169,7 +169,7 @@ end
 
     store = worker_store(ctx)
     @test store isa InMemoryWorkerStore
-    @test get_queue_status(ctx, "reports")[:running] == true
+    @test get_queue_status(ctx, "reports", System())[:running] == true
     @test store.cleanup_scheduler[] isa CleanupScheduler
 
     lock(store.task_lock) do
@@ -256,6 +256,28 @@ end
         # user-a can cancel their own task
         cancel_res = cancel_task(task_id, Owner("user-a"); store=store)
         @test cancel_res[:status] == "Task cancelled"
+    finally
+        reset_store!(store)
+    end
+end
+
+@testset "queue introspection is an admin surface (#87)" begin
+    store = InMemoryWorkerStore()
+    try
+        submit_sequential_task("reports", "job", () -> "ok", Owner("user-a"); store=store)
+
+        # `:pending_tasks` and `:current_task` enumerate ids that carry their owner in
+        # the "<owner>::<key>" prefix, and queue depth is a fact about the queue rather
+        # than about any one user. So there is no scoped form: an Owner does not compile.
+        @test get_queue_status("reports", System(); store=store)[:running] == true
+        @test_throws MethodError get_queue_status("reports", Owner("user-a"); store=store)
+        # ...and, as everywhere else, omitting the authority is not a way in either.
+        @test_throws MethodError get_queue_status("reports"; store=store)
+
+        # `is_task_running` took no user id at all — any caller who could name an id
+        # learned whether it was live. Retired rather than hardened; it had no tests and
+        # no docs, and `get_task_status` answers the same question with authorization.
+        @test !isdefined(Nitro.Workers, :is_task_running)
     finally
         reset_store!(store)
     end
