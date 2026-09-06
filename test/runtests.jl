@@ -1,4 +1,4 @@
-# ── Bootstrap test-only dependencies ──────────────────────────────────────────
+﻿# ── Bootstrap test-only dependencies ──────────────────────────────────────────
 # Test-only deps (Suppressor, ProtoBuf, …) live in `[extras]` / `[targets].test`,
 # so they are only on the load path under `Pkg.test()`. When this file is run
 # directly — `julia --project=. test/runtests.jl <args>` — those packages are
@@ -164,15 +164,17 @@ end
 #          --workers <n>  number of ReTestItems worker processes
 #   Bare paths select files/dirs; Windows (\) and POSIX (/) separators both work.
 #
-#   Threads vs workers: `-t auto` gives the in-process run multiple threads (used
-#   when --workers is omitted). With --workers <n>, items run in worker processes
-#   whose thread count is ReTestItems' nworker_threads (1 by default), so `-t` on
-#   the launcher does not affect them.
+#   Threads vs workers: test items always run in a worker process now (one by default),
+#   because ReTestItems applies `testitem_timeout` only when `nworkers > 0` -- see the
+#   `runtests` call below. The launcher's `-t` is forwarded to the worker through
+#   `nworker_threads`, so `julia -t auto ... runtests.jl` still runs items multithreaded
+#   and CI's `JULIA_NUM_THREADS: 1` leg still runs them on one thread. `--workers 0` opts
+#   back in to the old in-process mode for debugging, at the cost of per-item timeouts.
 let args = copy(ARGS)
     paths     = String[]
     tags      = Symbol[]
     name_filt = nothing
-    nworkers  = 0
+    nworkers  = -1   # sentinel: `--workers` not given (see the `runtests` call below)
 
     while !isempty(args)
         a = popfirst!(args)
@@ -198,11 +200,31 @@ let args = copy(ARGS)
         end
     end
 
+    # `testitem_timeout` is applied ONLY on the worker path -- ReTestItems documents this
+    # itself ("Note timeouts are currently only applied when `nworkers > 0`"), and the
+    # `Timer` that enforces it lives inside `manage_worker`. The in-process path runs items
+    # in a plain loop with no timer at all. So under the old `nworkers = 0` default -- which
+    # is how both `Pkg.test()` and CI invoke this file -- the `testitem_timeout` below was
+    # dead configuration, and a hung item hung the entire run with no ceiling (#84).
+    #
+    # That is worse than merely unbounded. The observed failure was a wedged run that had to
+    # be killed, whose orphaned child kept a port bound, which then broke the NEXT run's
+    # `:network` items as an unrelated-looking assertion failure.
+    #
+    # One worker, not more: items stay sequential in a single process, which is what the
+    # hand-ordered `TEST_FILES` list above depends on -- several items mutate the global
+    # router via `urlpatterns`.
+    #
+    # `nworker_threads` must be passed explicitly. ReTestItems defaults it to "2", so
+    # omitting it would silently run every item on two threads and quietly delete CI's
+    # `JULIA_NUM_THREADS: 1` leg -- the one that exists to catch thread-count-dependent
+    # races. Forwarding the launcher's own thread count keeps `-t` meaningful.
     runtests(
         paths...;
         testitem_timeout = 600,
         test_end_expr = TEST_END,
-        nworkers = nworkers,
+        nworkers = nworkers < 0 ? 1 : nworkers,
+        nworker_threads = string(Threads.nthreads()),
         tags     = isempty(tags) ? nothing : tags,
         name     = isnothing(name_filt) ? nothing : name_filt,
     )
