@@ -12,7 +12,6 @@ permissions:
   contents: write
 env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-  DOCUMENTER_KEY: ${{ secrets.DOCUMENTER_KEY }}
 jobs:
   test:
     name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.threads }} thread(s)
@@ -80,6 +79,14 @@ jobs:
   docs:
     name: Documentation
     runs-on: ubuntu-latest
+    # Scoped to this job rather than the workflow. `deploydocs` is the only consumer,
+    # and every `test` job clones an unpinned sibling checkout and executes it under
+    # `permissions: contents: write` — so a workflow-level deploy key sits in the
+    # environment of code this repo does not control, on 8 jobs including nightly.
+    # Partial mitigation for #21; `GITHUB_TOKEN` stays at workflow level because
+    # julia-actions/cache needs it to evict caches (hence `permissions: actions: write`).
+    env:
+      DOCUMENTER_KEY: ${{ secrets.DOCUMENTER_KEY }}
     steps:
       - uses: actions/checkout@v4
       - uses: julia-actions/setup-julia@v2
