@@ -988,13 +988,24 @@ end
 #   * **Absolute-form** (RFC 9112 §3.2.2) -- a server MUST accept `GET http://h/x?k=1`, and
 #     HTTP.jl passes the target through verbatim. A prefix slice keeps
 #     `scheme://userinfo@host`, so `http://user:pa55w0rd@h/x` would put credentials straight
-#     into the log. Anything not starting with '/' is therefore parsed properly, and an
-#     unparseable one logs `"-"` rather than risk emitting the raw target.
+#     into the log.
+#   * **A leading `//` is an authority, not a path.** `//user:pa55w0rd@evil.example/x` *does*
+#     start with '/', so a naive "starts with '/' means origin-form" test sends it down the
+#     slice branch and logs the credentials anyway. This is the case that makes the guard
+#     `startswith(target, '/') && !startswith(target, "//")` rather than the obvious one.
 #   * **Fragments** are not legal in a request-target and browsers never send one, but a
 #     hand-rolled client can, and '#' binds tighter than '?'. Cutting at whichever comes
 #     first keeps this agreeing with `HTTP.URI(...).path`, which drops the fragment.
+#
+# Everything that is not origin-form is parsed, and the parse result is logged only if it is
+# a real absolute path. That last test is what makes the fallback safe by construction rather
+# than by enumerating forms: authority-form (`CONNECT h.example:443`) parses to the nonsense
+# path "443", and any future shape that resolves to something authority-like fails it too, so
+# the log gets "-" instead of attacker-influenced text. Asterisk-form is a fixed literal with
+# no user content, so it is passed through as itself.
 function _log_target_path(target::AbstractString)
-    if startswith(target, '/')
+    target == "*" && return SubString("*")
+    if startswith(target, '/') && !startswith(target, "//")
         q = findfirst('?', target)
         h = findfirst('#', target)
         cut = q === nothing ? h : (h === nothing ? q : min(q, h))
@@ -1004,9 +1015,9 @@ function _log_target_path(target::AbstractString)
         String(HTTP.URI(target).path)
     catch e
         e isa InterruptException && rethrow()
-        "-"
+        ""
     end
-    return SubString(isempty(parsed) ? "-" : parsed)
+    return SubString(startswith(parsed, '/') ? parsed : "-")
 end
 
 """

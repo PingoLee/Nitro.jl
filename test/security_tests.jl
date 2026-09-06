@@ -84,6 +84,25 @@ end
         @test tp("/foo?k=a#frag") == "/foo"
     end
 
+    @testset "a leading // is an authority, not a path" begin
+        # The trap: this DOES start with '/', so a naive origin-form test slices it and logs
+        # `//user:pa55w0rd@evil.example/x` verbatim. It must be parsed like absolute-form.
+        @test tp("//user:pa55w0rd@evil.example/x?k=SECRET") == "/x"
+        @test !occursin("pa55w0rd", tp("//user:pa55w0rd@evil.example/x?k=SECRET"))
+        @test !occursin("evil.example", tp("//user:pa55w0rd@evil.example/x?k=SECRET"))
+        @test tp("//evil.example/x") == "/x"
+    end
+
+    @testset "authority-form and asterisk-form" begin
+        # `CONNECT h.example:443` has no path at all; `HTTP.URI` reads it as scheme+path and
+        # yields "443", so the result is rejected for not being an absolute path.
+        @test tp("h.example:443") == "-"
+        @test tp("user:pa55w0rd@h.example:443") == "-"
+        @test !occursin("pa55w0rd", tp("user:pa55w0rd@h.example:443"))
+        # `OPTIONS *` is a fixed literal carrying no user content.
+        @test tp("*") == "*"
+    end
+
     @testset "absolute-form never leaks userinfo into the log" begin
         # RFC 9112 §3.2.2 — a server MUST accept this form, and HTTP.jl passes the target
         # through verbatim. A prefix slice would keep `scheme://user:pass@host`, putting
@@ -105,9 +124,11 @@ end
     # End-to-end through the middleware: every one of these must produce exactly one log
     # line, carrying no query, no fragment and no credentials.
     @testset "end-to-end redaction across target forms" begin
-        for bad in ("/a b?token=SECRET", "/%ZZ?token=SECRET", "//høst?token=SECRET",
+        for bad in ("/a b?token=SECRET", "/%ZZ?token=SECRET",
                     "http://user:pa55w0rd@h.example/v1/x?token=SECRET",
-                    "?token=SECRET", "/foo#frag?token=SECRET")
+                    "//user:pa55w0rd@evil.example/v1/x?token=SECRET",
+                    "user:pa55w0rd@h.example:443",
+                    "?token=SECRET", "/foo#frag?token=SECRET", "*")
             logs = run_once(Nitro.Core.AccessLogMiddleware(), HTTP.Request("GET", bad))
             @test length(logs) == 1
             msg = logs[1].message
