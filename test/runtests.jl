@@ -75,6 +75,7 @@ const TEST_FILES = [
     # ── Core Tests ────────────────────────────────────────────────────────────
     "util_tests.jl",
     "upgrade_guide_tests.jl",
+    "docs_deploy_tests.jl",
     "cookies_tests.jl",
     "session_tests.jl",
     "sessionstores_tests.jl",
