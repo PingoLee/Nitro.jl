@@ -36,10 +36,23 @@ jobs:
           - windows-latest
         threads: [1, 2]
         include:
-          # Latest stable. Identical to 1.12 today, which is the point: `^1.12` claims 1.13+
-          # is supported and nothing tests it, so this starts covering the claim by itself
-          # the day 1.13 ships rather than waiting for someone to notice.
-          - version: '1'
+          # The next release. `[compat]` promises `julia = "^1.12"`, i.e. 1.13+ as well, and
+          # this is the entry that actually tests that claim.
+          #
+          # It replaces a `version: '1'` (latest stable) entry, which sounded like it covered
+          # this but did not: `'1'` resolves to whatever is *released*, and that is still
+          # 1.12.7 — so it ran an exact duplicate of the floor jobs above while 1.13, already
+          # at rc4, went untested. Latest-stable is only useful here once it stops being the
+          # floor, and by then this entry already covers it.
+          #
+          # `~1.13.0-0` rather than `'1.13'` because plain semver ranges exclude
+          # pre-releases; the `-0` lower bound opts them in. It resolves to >=1.13.0-0 and
+          # <1.14.0, so it picks up the newest 1.13 pre-release now and keeps covering 1.13.x
+          # after release — no bump needed when 1.13.0 ships.
+          #
+          # MAINTENANCE: when 1.14 enters pre-release, bump this to `~1.14.0-0`. There is no
+          # self-maintaining "next release" spec (julia-actions/setup-julia#84 proposes one).
+          - version: '~1.13.0-0'
             os: ubuntu-latest
             threads: 2
           # Nitro is unusually exposed to compiler and Base churn: it redefines
