@@ -25,7 +25,7 @@ not have an active local thread executing them into a `FAILED` state.
 """
 function recover_zombie_tasks!(; store::AbstractWorkerStore=default_store())
     return lock_tasks(store) do
-        running_tasks = get_all_tasks(store, RUNNING)
+        running_tasks = get_all_tasks(store, System(); status=RUNNING)
         count = 0
         for task in running_tasks
             if isnothing(get_active_task(store, task.id))
@@ -111,7 +111,7 @@ function startup(ctx::ServerContext;
 end
 
 """
-    scoped_task_key(task_key, user_id; scope=:user) -> String
+    scoped_task_key(task_key, owner::Owner; scope=:user) -> String
 
 Resolve the caller-supplied `task_key` to the id a task is actually stored under.
 
@@ -125,29 +125,26 @@ whom:
   watch authorizer allows it — see [`set_watch_authorizer!`](@ref).
 
 `submit_task` and `submit_sequential_task` return the resolved id; pass *that* to
-`get_task_status` and `cancel_task`, which enforce watcher access when given a
-`user_id`. (`is_task_running` also takes a resolved id, but performs no authorization
-at all — it is an existence probe, not a user-scoped read.) Use this function when the
-return value was not kept.
+`get_task_status` and `cancel_task` along with the [`TaskAuthority`](@ref) the call acts
+under. (`is_task_running` also takes a resolved id, but performs no authorization at all
+— it is an existence probe, not a user-scoped read.) Use this function when the return
+value was not kept.
 
-Throws `ArgumentError` for an unknown `scope`, or when `$(TASK_KEY_DELIMITER)` appears
-where it would break the invariant that **a `:user` id and a `:global` id can never be
-the same string**. Both halves of that are load-bearing:
+Throws `ArgumentError` for an unknown `scope`, or when a `:global` `task_key` contains
+`$(TASK_KEY_DELIMITER)` — that would let a caller submit `"victim$(TASK_KEY_DELIMITER)report"`
+globally and squat the id `victim`'s own `:user`-scoped `"report"` resolves to. Together
+with the two rules [`Owner`](@ref) enforces on construction, that keeps the invariant that
+**a `:user` id and a `:global` id can never be the same string**.
 
-- a `:user`-scoped `user_id` may neither contain `$(TASK_KEY_DELIMITER)` nor end in `:`;
-- a `:global` `task_key` may not contain `$(TASK_KEY_DELIMITER)` at all, or a caller could
-  submit `"victim$(TASK_KEY_DELIMITER)report"` globally and squat the id `victim`'s own
-  `:user`-scoped `"report"` resolves to.
-
-A `:user`-scoped `task_key` *may* contain the delimiter — the two rules above are exactly
-what make the split unambiguous anyway. Barring `$(TASK_KEY_DELIMITER)` alone is not
-enough: `(":report", "alice")` and `("report", "alice:")` would both resolve to
+Why `Owner` bars both `$(TASK_KEY_DELIMITER)` *and* a trailing `:`: a `:user`-scoped
+`task_key` *may* contain the delimiter, and barring it in the owner alone is not enough,
+since `(":report", "alice")` and `("report", "alice:")` would both resolve to
 `"alice:::report"`. That is the *only* such collision — matching
 `u₁ ‖ :: ‖ k₁ == u₂ ‖ :: ‖ k₂` with neither owner containing `::` forces `u₂ == u₁ * ":"`
 — so rejecting a trailing `:` closes it completely, and a colon anywhere else in an owner
-(`"google:12345"`) stays legal.
+(`"google:12345"`) stays legal. [`owner_of`](@ref) is the inverse those rules make total.
 """
-function scoped_task_key(task_key::AbstractString, user_id::AbstractString; scope::Symbol=:user)
+function scoped_task_key(task_key::AbstractString, owner::Owner; scope::Symbol=:user)
     if scope === :global
         if occursin(TASK_KEY_DELIMITER, task_key)
             throw(ArgumentError(
@@ -158,18 +155,17 @@ function scoped_task_key(task_key::AbstractString, user_id::AbstractString; scop
         throw(ArgumentError("scope must be :user or :global, got :$scope"))
     end
 
-    if occursin(TASK_KEY_DELIMITER, user_id) || endswith(user_id, ":")
-        throw(ArgumentError(
-            "user_id '$user_id' must not contain '$TASK_KEY_DELIMITER' or end in ':': that would make the owner half of a :user-scoped task id ambiguous"))
-    end
-
-    return string(user_id, TASK_KEY_DELIMITER, task_key)
+    # The owner half needs no check here: `Owner` validated it on construction, which is
+    # also what closed the hole where the `:global` branch above returned before the
+    # owner was ever validated, admitting an id no `Owner` could later be built from.
+    return string(owner.user_id, TASK_KEY_DELIMITER, task_key)
 end
 
-function _authorize_queue!(store::AbstractWorkerStore, queue_name::String, user_id::String)
+function _authorize_queue!(store::AbstractWorkerStore, queue_name::String, owner::Owner)
     authorizer = get_queue_authorizer(store)
-    if authorizer !== nothing && !(Base.invokelatest(authorizer, queue_name, user_id)::Bool)
-        throw(AuthorizationError("User '$user_id' is not authorized to submit tasks to queue '$queue_name'"))
+    # The hook's `(queue_name, user_id)::Bool` contract is app-facing and unchanged.
+    if authorizer !== nothing && !(Base.invokelatest(authorizer, queue_name, owner.user_id)::Bool)
+        throw(AuthorizationError("User '$(owner.user_id)' is not authorized to submit tasks to queue '$queue_name'"))
     end
     return nothing
 end
@@ -183,30 +179,31 @@ function _watch_allowed(store::AbstractWorkerStore, task_key::String, watchers::
     return Base.invokelatest(authorizer, task_key, watchers, user_id)::Bool
 end
 
-function _register_or_watch!(store::AbstractWorkerStore, task_key::String, user_id::String; queue_name::Union{Nothing, String}=nothing)
+function _register_or_watch!(store::AbstractWorkerStore, task_key::String, owner::Owner; queue_name::Union{Nothing, String}=nothing)
+    uid = owner.user_id
     return lock_tasks(store) do
         task_info = get_task_info(store, task_key)
 
         # Gates both branches below: joining a live task grants the caller the
         # owner's read/cancel rights, and replacing a finished one destroys the
         # owner's stored result. `copy` keeps an app callback off the live list.
-        if task_info !== nothing && !(user_id in task_info.watchers)
-            if !_watch_allowed(store, task_key, copy(task_info.watchers), user_id)
+        if task_info !== nothing && !_is_authorized(owner, task_info)
+            if !_watch_allowed(store, task_key, copy(task_info.watchers), uid)
                 throw(AuthorizationError(
-                    "User '$user_id' is not authorized to join or reuse task '$task_key'"))
+                    "User '$uid' is not authorized to join or reuse task '$task_key'"))
             end
         end
 
         if task_info !== nothing && task_info.status in (RUNNING, PENDING)
-            if !(user_id in task_info.watchers)
-                push!(task_info.watchers, user_id)
+            if !(uid in task_info.watchers)
+                push!(task_info.watchers, uid)
                 set_task!(store, task_key, task_info)
             end
             return false
         end
 
         task_info = TaskInfo(task_key; queue_name)
-        push!(task_info.watchers, user_id)
+        push!(task_info.watchers, uid)
         set_task!(store, task_key, task_info)
         return true
     end
@@ -266,21 +263,20 @@ returned id is what `get_task_status` and `cancel_task` expect; under the defaul
 Unqueued tasks are still submissions, so the store's queue authorizer applies under
 the name `$(DEFAULT_QUEUE_NAME)`.
 """
-function submit_task(task_key::AbstractString, callback::Function, user_id::AbstractString; scope::Symbol=:user, options::TaskOptions=TaskOptions(), store::AbstractWorkerStore=default_store())
-    uid = String(user_id)
-    _authorize_queue!(store, DEFAULT_QUEUE_NAME, uid)
+function submit_task(task_key::AbstractString, callback::Function, owner::Owner; scope::Symbol=:user, options::TaskOptions=TaskOptions(), store::AbstractWorkerStore=default_store())
+    _authorize_queue!(store, DEFAULT_QUEUE_NAME, owner)
 
-    key = scoped_task_key(task_key, uid; scope)
-    should_start = _register_or_watch!(store, key, uid)
+    key = scoped_task_key(task_key, owner; scope)
+    should_start = _register_or_watch!(store, key, owner)
     if should_start
         _execute_task_async(store, key, callback, options)
     end
     return key
 end
 
-function submit_task(ctx::ServerContext, task_key::AbstractString, callback::Function, user_id::AbstractString; scope::Symbol=:user, options::TaskOptions=TaskOptions(), key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
+function submit_task(ctx::ServerContext, task_key::AbstractString, callback::Function, owner::Owner; scope::Symbol=:user, options::TaskOptions=TaskOptions(), key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
     resolved_store = _resolve_store(ctx; key, store)
-    return submit_task(task_key, callback, user_id; scope, options, store=resolved_store)
+    return submit_task(task_key, callback, owner; scope, options, store=resolved_store)
 end
 
 """
@@ -293,14 +289,13 @@ Identical to [`submit_task`](@ref) in how `scope` namespaces `task_key` and in w
 return value is for; the difference is ordered execution and that the queue authorizer
 sees the real `queue_name`.
 """
-function submit_sequential_task(queue_name::AbstractString, task_key::AbstractString, callback::Function, user_id::AbstractString; scope::Symbol=:user, options::TaskOptions=TaskOptions(), store::AbstractWorkerStore=default_store())
+function submit_sequential_task(queue_name::AbstractString, task_key::AbstractString, callback::Function, owner::Owner; scope::Symbol=:user, options::TaskOptions=TaskOptions(), store::AbstractWorkerStore=default_store())
     queue_id = String(queue_name)
-    uid = String(user_id)
 
-    _authorize_queue!(store, queue_id, uid)
+    _authorize_queue!(store, queue_id, owner)
 
-    key = scoped_task_key(task_key, uid; scope)
-    should_start = _register_or_watch!(store, key, uid; queue_name=queue_id)
+    key = scoped_task_key(task_key, owner; scope)
+    should_start = _register_or_watch!(store, key, owner; queue_name=queue_id)
     if should_start
         _start_queue_processor(store, queue_id)
         queue = _get_or_create_queue(store, queue_id)
@@ -309,26 +304,22 @@ function submit_sequential_task(queue_name::AbstractString, task_key::AbstractSt
     return key
 end
 
-function submit_sequential_task(ctx::ServerContext, queue_name::AbstractString, task_key::AbstractString, callback::Function, user_id::AbstractString; scope::Symbol=:user, options::TaskOptions=TaskOptions(), key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
+function submit_sequential_task(ctx::ServerContext, queue_name::AbstractString, task_key::AbstractString, callback::Function, owner::Owner; scope::Symbol=:user, options::TaskOptions=TaskOptions(), key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
     resolved_store = _resolve_store(ctx; key, store)
-    return submit_sequential_task(queue_name, task_key, callback, user_id; scope, options, store=resolved_store)
+    return submit_sequential_task(queue_name, task_key, callback, owner; scope, options, store=resolved_store)
 end
 
-function get_task_status(task_id::AbstractString, user_id::Union{Nothing, AbstractString}=nothing; store::AbstractWorkerStore=default_store())
+function get_task_status(task_id::AbstractString, authority::TaskAuthority; store::AbstractWorkerStore=default_store())
     task_info = get_task_info(store, String(task_id))
     if task_info === nothing
         return Dict{Symbol, Any}(:error => "Task not found", :status => "NOT_FOUND")
     end
 
-    if user_id !== nothing && !isempty(user_id)
-        uid = String(user_id)
-        if !(uid in task_info.watchers)
-            throw(AuthorizationError("User '$uid' is not authorized to view task '$(task_info.id)'"))
-        end
-    end
+    _authorize_task!(authority, task_info, "view")
 
     return Dict{Symbol, Any}(
         :id => task_info.id,
+        :owner => owner_of(task_info.id),
         :status => string(task_info.status),
         :progress => task_info.progress,
         :result => task_info.result,
@@ -341,23 +332,18 @@ function get_task_status(task_id::AbstractString, user_id::Union{Nothing, Abstra
     )
 end
 
-function get_task_status(ctx::ServerContext, task_id::AbstractString, user_id::Union{Nothing, AbstractString}=nothing; key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
-    return get_task_status(task_id, user_id; store=_resolve_store(ctx; key, store))
+function get_task_status(ctx::ServerContext, task_id::AbstractString, authority::TaskAuthority; key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
+    return get_task_status(task_id, authority; store=_resolve_store(ctx; key, store))
 end
 
-function cancel_task(task_id::AbstractString, user_id::Union{Nothing, AbstractString}=nothing; store::AbstractWorkerStore=default_store())
+function cancel_task(task_id::AbstractString, authority::TaskAuthority; store::AbstractWorkerStore=default_store())
     return lock_tasks(store) do
         task_info = get_task_info(store, String(task_id))
         if task_info === nothing
             return Dict{Symbol, Any}(:error => "Task not found")
         end
 
-        if user_id !== nothing && !isempty(user_id)
-            uid = String(user_id)
-            if !(uid in task_info.watchers)
-                throw(AuthorizationError("User '$uid' is not authorized to cancel task '$(task_info.id)'"))
-            end
-        end
+        _authorize_task!(authority, task_info, "cancel")
 
         if task_info.status in (COMPLETED, FAILED, CANCELLED)
             return Dict{Symbol, Any}(:error => "Task already finished with status $(task_info.status)")
@@ -382,8 +368,8 @@ function cancel_task(task_id::AbstractString, user_id::Union{Nothing, AbstractSt
     end
 end
 
-function cancel_task(ctx::ServerContext, task_id::AbstractString, user_id::Union{Nothing, AbstractString}=nothing; key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
-    return cancel_task(task_id, user_id; store=_resolve_store(ctx; key, store))
+function cancel_task(ctx::ServerContext, task_id::AbstractString, authority::TaskAuthority; key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
+    return cancel_task(task_id, authority; store=_resolve_store(ctx; key, store))
 end
 
 function is_task_running(task_key::AbstractString; store::AbstractWorkerStore=default_store())
@@ -395,12 +381,13 @@ function is_task_running(ctx::ServerContext, task_key::AbstractString; key::Symb
     return is_task_running(task_key; store=_resolve_store(ctx; key, store))
 end
 
-function get_all_tasks(filter_status::Union{Nothing, TaskStatus}=nothing, user_id::Union{Nothing, String}=nothing; store::AbstractWorkerStore=default_store())
-    task_infos = get_all_tasks(store, filter_status, user_id)
+function get_all_tasks(authority::TaskAuthority, filter_status::Union{Nothing, TaskStatus}=nothing; store::AbstractWorkerStore=default_store())
+    task_infos = get_all_tasks(store, authority; status=filter_status)
     tasks = Vector{Dict{Symbol, Any}}()
     for task_info in task_infos
         push!(tasks, Dict{Symbol, Any}(
             :id => task_info.id,
+            :owner => owner_of(task_info.id),
             :status => string(task_info.status),
             :progress => task_info.progress,
             :watcher_count => length(task_info.watchers),
@@ -413,8 +400,8 @@ function get_all_tasks(filter_status::Union{Nothing, TaskStatus}=nothing, user_i
     return tasks
 end
 
-function get_all_tasks(ctx::ServerContext, filter_status::Union{Nothing, TaskStatus}=nothing, user_id::Union{Nothing, String}=nothing; key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
-    return get_all_tasks(filter_status, user_id; store=_resolve_store(ctx; key, store))
+function get_all_tasks(ctx::ServerContext, authority::TaskAuthority, filter_status::Union{Nothing, TaskStatus}=nothing; key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
+    return get_all_tasks(authority, filter_status; store=_resolve_store(ctx; key, store))
 end
 
 function cleanup_old_tasks(days::Int=7; store::AbstractWorkerStore=default_store())
@@ -435,7 +422,7 @@ function get_queue_status(queue_name::AbstractString; store::AbstractWorkerStore
             return Dict{Symbol, Any}(:error => "Queue not found")
         end
 
-        pending_tasks = [task.id for task in get_all_tasks(store, PENDING, nothing, String(queue_name))]
+        pending_tasks = [task.id for task in get_all_tasks(store, System(); status=PENDING, queue_name=String(queue_name))]
         processing = queue.current_task !== nothing
         return Dict{Symbol, Any}(
             :queue_name => String(queue_name),

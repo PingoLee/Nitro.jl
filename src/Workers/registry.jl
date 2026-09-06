@@ -140,16 +140,17 @@ function cleanup_tasks!(store::InMemoryWorkerStore, retain_days::Int)
     return length(removed)
 end
 
-function get_all_tasks(store::InMemoryWorkerStore, status::Union{Nothing, TaskStatus}=nothing, user_id::Union{Nothing, String}=nothing, queue_name::Union{Nothing, String}=nothing)
+function get_all_tasks(store::InMemoryWorkerStore, authority::TaskAuthority; status::Union{Nothing, TaskStatus}=nothing, queue_name::Union{Nothing, String}=nothing)
     lock(store.task_lock) do
         tasks = TaskInfo[]
         for task_info in values(store.task_registry)
             if status !== nothing && task_info.status != status
                 continue
             end
-            if user_id !== nothing && !isempty(user_id) && !(user_id in task_info.watchers)
-                continue
-            end
+            # Deliberately no owner -> ids index: the registry is already in RAM, so this
+            # is a Dict scan either way, and an index would be new mutable state to keep
+            # consistent across set_task!, delete_task!, cleanup_tasks! and reset_store!.
+            _is_authorized(authority, task_info) || continue
             if queue_name !== nothing && task_info.queue_name != queue_name
                 continue
             end

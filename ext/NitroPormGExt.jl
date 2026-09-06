@@ -13,6 +13,7 @@ import Nitro: pormg_nitro_session
 
 import Nitro.Workers: AbstractWorkerStore, TaskInfo, TaskStatus, TaskOptions, SequentialQueue, CleanupScheduler,
     PENDING, RUNNING, COMPLETED, FAILED, CANCELLED,
+    TaskAuthority, Owner, System, owner_of, _is_authorized, TASK_KEY_DELIMITER,
     get_task_info, set_task!, delete_task!, cleanup_tasks!, get_all_tasks,
     get_active_task, register_active_task!, deregister_active_task!,
     get_active_task_info, register_active_task_info!, deregister_active_task_info!,
@@ -435,6 +436,19 @@ function _parse_optional_db_datetime(val)
     return _parse_db_datetime(val)
 end
 
+"""
+The `id` of a raw row, without parsing the rest of it.
+
+Same symbol-or-string key handling as `_from_db_record`, so it works against both PormG
+rows and the test mocks — but it exists to let `_authority_rows` dedupe *before* paying
+for a full `_from_db_record`, which JSON-parses the `watchers` blob.
+"""
+function _row_task_id(row)
+    haskey(row, :id) && return string(row[:id])
+    haskey(row, "id") && return string(row["id"])
+    return nothing
+end
+
 function _from_db_record(row)::TaskInfo
     # Support both symbol lookup (PormG DB rows) and string dict (for mocks)
     get_val = (key_sym, key_str) -> haskey(row, key_sym) ? row[key_sym] : row[key_str]
@@ -573,7 +587,52 @@ function cleanup_tasks!(store::PormGWorkerStore, retain_days::Int)
     end
 end
 
-function get_all_tasks(store::PormGWorkerStore, status::Union{Nothing, TaskStatus}=nothing, user_id::Union{Nothing, String}=nothing, queue_name::Union{Nothing, String}=nothing)
+"""
+Rows an authority could possibly be entitled to, as a **superset**.
+
+This narrows the query; it is not the gate. The exact predicate still runs in Julia
+below, so both filters here must be supersets — the post-filter cannot recover a row
+SQL dropped, but it can discard an extra one.
+
+`System` fetches everything. An `Owner` fetches two sets, unioned:
+
+- `id__startswith "<owner>::"` — the owned tasks. `owner_of(id) == u` is equivalent to
+  `startswith(id, u * "::")` for any constructible `Owner`, because `u` contains no
+  `"::"` and `Owner("")` cannot exist.
+- `watchers__contains` the **JSON-quoted** id — the granted ones, which have no id
+  prefix, and every `:global` task, which is watcher-only. Quoting matters: searching
+  for `"bob"` with its quotes cannot match `["bobby"]`.
+
+Two Pair-only queries rather than one `Qor`, so the shape stays inside what a
+`Pair`-typed query mock can express.
+
+The win is rows fetched and `watchers` blobs JSON-parsed, not index usage: on
+PostgreSQL a `LIKE 'x%'` uses the primary-key index only under a C collation or a
+`text_pattern_ops` opclass, which `PormG.Dialect.create_index` cannot express. Do not
+add an index for this.
+"""
+_authority_rows(base, ::System) = base.list()
+
+function _authority_rows(base, authority::Owner)
+    owned = base.filter("id__@startswith" => authority.user_id * TASK_KEY_DELIMITER).list()
+    watched = base.filter("watchers__@contains" => JSON.json(authority.user_id)).list()
+
+    rows = Any[]
+    seen = Set{String}()
+    for row in Iterators.flatten((owned, watched))
+        # Dedupe on the raw row, before `_from_db_record`: under `:user` scope the owner
+        # is also a watcher, so most rows appear in both sets and parsing twice would
+        # spend exactly the JSON work this narrowing exists to avoid.
+        id = _row_task_id(row)
+        id === nothing && continue
+        id in seen && continue
+        push!(seen, id)
+        push!(rows, row)
+    end
+    return rows
+end
+
+function get_all_tasks(store::PormGWorkerStore, authority::TaskAuthority; status::Union{Nothing, TaskStatus}=nothing, queue_name::Union{Nothing, String}=nothing)
     try
         qs = _task_objects(store)
         if status !== nothing
@@ -591,7 +650,7 @@ function get_all_tasks(store::PormGWorkerStore, status::Union{Nothing, TaskStatu
         end
 
         tasks = TaskInfo[]
-        for row in qs.list()
+        for row in _authority_rows(qs, authority)
             task_info = _from_db_record(row)
             live = get(active, task_info.id, nothing)
             if live !== nothing
@@ -604,9 +663,9 @@ function get_all_tasks(store::PormGWorkerStore, status::Union{Nothing, TaskStatu
                 task_info.started_at = live.started_at
                 task_info.completed_at = live.completed_at
             end
-            if user_id !== nothing && !isempty(user_id) && !(user_id in task_info.watchers)
-                continue
-            end
+            # The gate. `_authority_rows` above only narrowed what was fetched; note the
+            # overlay has already run, so a live task cannot slip past this.
+            _is_authorized(authority, task_info) || continue
             push!(tasks, task_info)
         end
         return tasks

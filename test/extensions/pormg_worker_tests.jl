@@ -38,6 +38,18 @@ function _filtered_rows(qs::MockTaskQuerySet)
                 matches = row["completed_at"] !== nothing && row["completed_at"] > v
             elseif k == "completed_at__@isnull"
                 matches = (row["completed_at"] === nothing) == v
+            elseif k == "id__startswith" || k == "id__@startswith"
+                matches = startswith(row["id"], v)
+            elseif k == "watchers__contains" || k == "watchers__@contains"
+                # Substring match on the serialized JSON, like the real backend.
+                matches = occursin(v, row["watchers"])
+            else
+                # Previously an unrecognised key fell through and left `matches` at
+                # whatever the last branch set, so a filter the mock did not model
+                # silently did not constrain — and any test relying on it passed
+                # vacuously. Fail loudly instead.
+                error("MockTaskQuerySet: unmodelled filter key '$k' — teach the mock " *
+                      "about it, or the query under test is not actually being exercised")
             end
             matches || break
         end
@@ -295,15 +307,56 @@ else
             push!(info_b.watchers, "user-b")
             set_task!(store3, "task-b", info_b)
 
-            tasks_a = get_all_tasks(store3, nothing, "user-a")
+            tasks_a = get_all_tasks(store3, Owner("user-a"))
             @test length(tasks_a) == 1
             @test tasks_a[1].id == "task-a"
 
-            tasks_b = get_all_tasks(store3, nothing, "user-b")
+            tasks_b = get_all_tasks(store3, Owner("user-b"))
             @test length(tasks_b) == 1
             @test tasks_b[1].id == "task-b"
 
-            @test length(get_all_tasks(store3)) == 2
+            @test length(get_all_tasks(store3, System())) == 2
+        end
+
+        @testset "the narrowed query still returns owned AND granted tasks" begin
+            # `_authority_rows` narrows with two SQL filters — an id prefix for owned
+            # tasks and a watchers substring for granted ones. Both are supersets on
+            # purpose: the Julia predicate afterwards can discard an extra row, but it
+            # cannot recover one the query dropped. So the risk being covered here is
+            # a row going MISSING, not an extra one slipping through.
+            store_narrow = RealPormGWorkerStore(model=MockTaskModel())
+
+            # Owned: reachable only by the id prefix (its watcher entry is wiped).
+            owned = TaskInfo("alice::mine")
+            set_task!(store_narrow, owned.id, owned)
+
+            # Granted: a :global id, so there is no prefix to match — reachable only
+            # through the watchers filter.
+            granted = TaskInfo("shared-global")
+            push!(granted.watchers, "alice")
+            set_task!(store_narrow, granted.id, granted)
+
+            # Someone else's, matching neither filter.
+            other = TaskInfo("bob::theirs")
+            push!(other.watchers, "bob")
+            set_task!(store_narrow, other.id, other)
+
+            ids = Set(t.id for t in get_all_tasks(store_narrow, Owner("alice")))
+            @test ids == Set(["alice::mine", "shared-global"])
+
+            # A prefix that is not delimiter-terminated must not match: "ali" is not
+            # an owner of "alice::mine", and `owner_of` would never say it was.
+            @test isempty(get_all_tasks(store_narrow, Owner("ali")))
+
+            # The watchers filter matches the JSON-quoted id, so a longer name that
+            # merely starts with the same characters cannot collide.
+            bobby = TaskInfo("global-bobby")
+            push!(bobby.watchers, "bobby")
+            set_task!(store_narrow, bobby.id, bobby)
+            @test isempty(get_all_tasks(store_narrow, Owner("bob")) |>
+                          ts -> filter(t -> t.id == "global-bobby", ts))
+
+            @test length(get_all_tasks(store_narrow, System())) == 4
         end
 
         @testset "get_all_tasks filters by queue_name in the DB query" begin
@@ -323,15 +376,15 @@ else
                 set_task!(store4, t.id, t)
             end
 
-            reports = get_all_tasks(store4, PENDING, nothing, "reports")
+            reports = get_all_tasks(store4, System(); status=PENDING, queue_name="reports")
             @test length(reports) == 3
             @test all(t.queue_name == "reports" for t in reports)
 
-            invoices = get_all_tasks(store4, PENDING, nothing, "invoices")
+            invoices = get_all_tasks(store4, System(); status=PENDING, queue_name="invoices")
             @test length(invoices) == 2
             @test all(t.queue_name == "invoices" for t in invoices)
 
-            @test length(get_all_tasks(store4, PENDING)) == 5
+            @test length(get_all_tasks(store4, System(); status=PENDING)) == 5
         end
 
         @testset "get_all_tasks overlays live progress for active tasks" begin
@@ -350,12 +403,12 @@ else
             update_progress!(live, 73.0)
             register_active_task_info!(store5, live.id, live)
 
-            listed = only(get_all_tasks(store5, RUNNING))
+            listed = only(get_all_tasks(store5, System(); status=RUNNING))
             @test listed.progress == 73.0
 
             # After the task terminates the cache entry is gone and the DB value wins.
             deregister_active_task_info!(store5, live.id)
-            @test only(get_all_tasks(store5, RUNNING)).progress == 0.0
+            @test only(get_all_tasks(store5, System(); status=RUNNING)).progress == 0.0
         end
 
         @testset "_from_db_record raises on unknown status string" begin
@@ -409,34 +462,34 @@ else
                 owner_id = submit_task("shared-export", () -> begin
                     wait(release)
                     return "victim-secret"
-                end, "victim"; scope=:global, store=store_e2e)
+                end, Owner("victim"); scope=:global, store=store_e2e)
                 @test owner_id == "shared-export"
 
                 @test_throws AuthorizationError submit_task("shared-export", () -> begin
                     attacker_calls[] += 1
                     return "attacker-data"
-                end, "attacker"; scope=:global, store=store_e2e)
+                end, Owner("attacker"); scope=:global, store=store_e2e)
 
                 notify(release)
-                @test timedwait(() -> get_task_status(owner_id; store=store_e2e)[:status] == "COMPLETED", 5.0) == :ok
+                @test timedwait(() -> get_task_status(owner_id, Owner("victim"); store=store_e2e)[:status] == "COMPLETED", 5.0) == :ok
 
                 # Terminal state: replacing the row would destroy the owner's result.
                 @test_throws AuthorizationError submit_task("shared-export", () -> begin
                     attacker_calls[] += 1
                     return "attacker-data"
-                end, "attacker"; scope=:global, store=store_e2e)
+                end, Owner("attacker"); scope=:global, store=store_e2e)
 
-                persisted = get_task_status(owner_id, "victim"; store=store_e2e)
+                persisted = get_task_status(owner_id, Owner("victim"); store=store_e2e)
                 @test persisted[:result] == "victim-secret"
                 @test persisted[:watcher_count] == 1
                 @test attacker_calls[] == 0
 
                 # user scope keeps the two users on separate rows entirely
-                a = submit_task("report", () -> "a", "user-a"; store=store_e2e)
-                b = submit_task("report", () -> "b", "user-b"; store=store_e2e)
+                a = submit_task("report", () -> "a", Owner("user-a"); store=store_e2e)
+                b = submit_task("report", () -> "b", Owner("user-b"); store=store_e2e)
                 @test a == "user-a::report"
                 @test b == "user-b::report"
-                @test_throws AuthorizationError get_task_status(a, "user-b"; store=store_e2e)
+                @test_throws AuthorizationError get_task_status(a, Owner("user-b"); store=store_e2e)
             finally
                 notify(release)
                 reset_store!(store_e2e)
@@ -465,14 +518,14 @@ else
             # own probe then succeeds, which is what made this reachable.
             flaky.fail_next[] = 1
             @test_throws ErrorException submit_task(
-                "shared-export", () -> "attacker-data", "attacker"; scope=:global, store=store_fail)
+                "shared-export", () -> "attacker-data", Owner("attacker"); scope=:global, store=store_fail)
 
             # The victim's row survived intact and is still theirs.
             flaky.fail_next[] = 0
-            persisted = get_task_status("shared-export", "victim"; store=store_fail)
+            persisted = get_task_status("shared-export", Owner("victim"); store=store_fail)
             @test persisted[:result] == "victim-secret"
             @test persisted[:watcher_count] == 1
-            @test_throws AuthorizationError get_task_status("shared-export", "attacker"; store=store_fail)
+            @test_throws AuthorizationError get_task_status("shared-export", Owner("attacker"); store=store_fail)
         end
 
         @testset "a failed read of one queued item does not kill the processor (#19)" begin
@@ -494,8 +547,8 @@ else
             end
 
             try
-                first_id = submit_sequential_task("qfail", "k1", run_step, "u"; store=store_q)
-                second_id = submit_sequential_task("qfail", "k2", run_step, "u"; store=store_q)
+                first_id = submit_sequential_task("qfail", "k1", run_step, Owner("u"); store=store_q)
+                second_id = submit_sequential_task("qfail", "k2", run_step, Owner("u"); store=store_q)
                 @test first_id == "u::k1"
                 @test second_id == "u::k2"
 
@@ -503,7 +556,7 @@ else
                 push!(flaky.fail_ids, second_id)
                 notify(gate)
 
-                @test timedwait(() -> get_task_status(first_id; store=store_q)[:status] == "COMPLETED", 5.0) == :ok
+                @test timedwait(() -> get_task_status(first_id, Owner("u"); store=store_q)[:status] == "COMPLETED", 5.0) == :ok
 
                 # k2 is dropped, but the processor must still be alive and draining.
                 queue = get_sequential_queues(store_q)["qfail"]
@@ -511,9 +564,9 @@ else
                 @test !istaskdone(queue.processor_task)
 
                 delete!(flaky.fail_ids, second_id)
-                third_id = submit_sequential_task("qfail", "k3", run_step, "u"; store=store_q)
-                @test timedwait(() -> get_task_status(third_id; store=store_q)[:status] == "COMPLETED", 5.0) == :ok
-                @test get_task_status(third_id; store=store_q)[:result] == "ran-u::k3"
+                third_id = submit_sequential_task("qfail", "k3", run_step, Owner("u"); store=store_q)
+                @test timedwait(() -> get_task_status(third_id, Owner("u"); store=store_q)[:status] == "COMPLETED", 5.0) == :ok
+                @test get_task_status(third_id, Owner("u"); store=store_q)[:result] == "ran-u::k3"
             finally
                 notify(gate)
                 reset_store!(store_q)
@@ -526,7 +579,7 @@ else
             # covered here: MockTaskModel is a bare Dict and enforces no column length.)
             store7 = RealPormGWorkerStore(model=MockTaskModel())
 
-            scoped = scoped_task_key("export_report_42", "user-a")
+            scoped = scoped_task_key("export_report_42", Owner("user-a"))
             @test scoped == "user-a::export_report_42"
 
             info = TaskInfo(scoped; queue_name="reports")
@@ -539,14 +592,14 @@ else
             @test retrieved.watchers == ["user-a"]
 
             # The other user's same-key task is a distinct row.
-            other = scoped_task_key("export_report_42", "user-b")
+            other = scoped_task_key("export_report_42", Owner("user-b"))
             other_info = TaskInfo(other; queue_name="reports")
             push!(other_info.watchers, "user-b")
             set_task!(store7, other, other_info)
 
-            @test length(get_all_tasks(store7)) == 2
-            @test only(get_all_tasks(store7, nothing, "user-a")).id == scoped
-            @test only(get_all_tasks(store7, nothing, "user-b")).id == other
+            @test length(get_all_tasks(store7, System())) == 2
+            @test only(get_all_tasks(store7, Owner("user-a"))).id == scoped
+            @test only(get_all_tasks(store7, Owner("user-b"))).id == other
         end
 
         @testset "lock_tasks provides mutual exclusion for PormGWorkerStore" begin

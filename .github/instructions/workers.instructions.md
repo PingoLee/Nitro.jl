@@ -25,37 +25,48 @@ The worker system supports both volatile in-memory queues and persistent databas
 
 ## 2. Task API
 
-Task submission requires `user_id`. Read/manage APIs accept optional `user_id`.
-Passing a non-empty `user_id` enforces watcher-based access (`AuthorizationError` when denied). Omitting `user_id` is a deliberate system/public-endpoint bypass for routes that intentionally expose shared task visibility, not the default for user-scoped APIs.
+**Every task API takes a required `TaskAuthority`.** `Owner("user_123")` is a validated identity;
+`System()` is the explicit, unscoped bypass. There is no arity that omits it — a call that forgets
+to scope is a `MethodError`, not a silent bypass
+([#48](https://github.com/PingoLee/Nitro.jl/issues/48)). Never re-introduce an optional or
+defaulted authority argument, and never let a `String` stand in for one: `user_id=nothing` **and**
+`user_id=""` were both full bypasses, and the empty-string case was reachable by reading a missing
+claim into an empty string.
 
 **The submit call returns the id, and it is not the `task_key` you passed.** Task ids double as
-deduplication keys, so `scope` decides who can collide with whom — and since watcher membership is
-the sole gate on reading a `:result` and cancelling, a key two users can both produce is a key that
-leaks between them ([#19](https://github.com/PingoLee/Nitro.jl/issues/19)).
+deduplication keys, so `scope` decides who can collide with whom
+([#19](https://github.com/PingoLee/Nitro.jl/issues/19)).
 
 ```julia
 # scope=:user (the default) — id is "user_123::report_42"; no cross-user collision is possible
-task_id = submit_task("report_42", () -> work(), "user_123")
-task = get_task_status(task_id, "user_123")
-cancel_task(task_id, "user_123")
-user_tasks = get_all_tasks(nothing, "user_123")
+task_id = submit_task("report_42", () -> work(), Owner("user_123"))
+task = get_task_status(task_id, Owner("user_123"))
+cancel_task(task_id, Owner("user_123"))
+user_tasks = get_all_tasks(Owner("user_123"))
 
 # Rebuild the id when the return value was not kept
-task_id == scoped_task_key("report_42", "user_123")
+task_id == scoped_task_key("report_42", Owner("user_123"))
 
 # scope=:global — verbatim key, system-wide dedup. A caller who is not already a watcher is
 # refused (AuthorizationError) whether the task is live or finished, unless a watch authorizer
 # allows it. Finished counts: replacing the record would discard the owner's result.
-shared = submit_task("warm-cache", () -> work(), "user_123"; scope=:global)
+shared = submit_task("warm-cache", () -> work(), Owner("user_123"); scope=:global)
 
-# System/public endpoint bypass, only when the app intentionally allows it:
-public_status = get_task_status(task_id)
+# The bypass, only when the app intentionally allows it — and greppable because it is named:
+public_status = get_task_status(task_id, System())
 ```
 
-Never hand-build a scoped id by string concatenation. `scoped_task_key` rejects a `user_id` that
-contains `::` **or ends in `:`**, and a `:global` `task_key` that contains `::`. Those three rules
-together are what make `(user, key) → id` injective and keep the two scopes' id spaces disjoint;
-drop any one and two distinct pairs collide.
+**Authority comes from the id; `watchers` only adds to it.** `owner_of(id)` reads the owner half
+back out of a `:user` id, so ownership is derived and unclobberable — a lost watcher append or a
+full-row write from another process cannot evict an owner from their own task. A `:global` id has
+no owner half, so for those `watchers` remains the entire gate, including for the creator. Keep
+that asymmetry: it is what makes deriving ownership purely additive.
+
+Never hand-build a scoped id by string concatenation. `Owner` rejects a `user_id` that is empty,
+contains `::`, **or ends in `:`**, and `scoped_task_key` rejects a `:global` `task_key` that
+contains `::`. Those rules together are what make `(user, key) → id` injective, keep the two
+scopes' id spaces disjoint, and make `owner_of` a total inverse; drop any one and two distinct
+pairs collide.
 
 ### Reporting progress — never assign the field
 

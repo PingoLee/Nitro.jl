@@ -104,6 +104,7 @@ const REQUIRED_SYMBOLS = String[
     "path", "urlpatterns", "include_routes", "url",
     "submit_task", "submit_sequential_task", "get_task_status", "cancel_task", "get_all_tasks",
     "set_queue_authorizer!", "set_watch_authorizer!", "scoped_task_key", "DEFAULT_QUEUE_NAME",
+    "TaskAuthority", "Owner", "System", "owner_of",
     "pormg_nitro_worker",
     "add_response_headers", "own_response_headers",
     "login_required", "role_required", "permission_required", "claim_required",
@@ -208,7 +209,12 @@ end
 # C: is `sym` defined anywhere under src/ or ext/?
 function symbol_defined(sym)
     esc = replace(sym, r"([!])" => s"\\\1")
-    pat = Regex("(?:^|[^A-Za-z0-9_!])" * esc * "\\s*(?:\\(|=|\\{)")
+    # A call, an assignment, or a parametric use covers functions, constants and any
+    # type with a constructor. A bare type declaration matches none of those --
+    # `abstract type TaskAuthority end` has no `(`, `=` or `{` -- so match those too,
+    # or the lint silently cannot verify an abstract type or a field-less struct.
+    pat = Regex("(?:^|[^A-Za-z0-9_!])" * esc * "\\s*(?:\\(|=|\\{)" *
+                "|(?:abstract\\s+type|primitive\\s+type|mutable\\s+struct|struct)\\s+" * esc * "\\b")
     for sub in ("src", "ext")
         base = joinpath(ROOT, sub)
         isdir(base) || continue

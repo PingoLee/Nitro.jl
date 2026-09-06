@@ -20,21 +20,21 @@ end
             calls[] += 1
             wait(gate)
             return "done"
-        end, "user-a"; store=store)
+        end, Owner("user-a"); store=store)
 
         # Same user, same key, still running: deduplicates onto the live task.
         duplicate_id = submit_task("immediate-task", () -> begin
             calls[] += 100
             return "duplicate"
-        end, "user-a"; store=store)
+        end, Owner("user-a"); store=store)
 
         @test task_id == "user-a::immediate-task"
         @test duplicate_id == task_id
 
         notify(gate)
-        @test wait_for(() -> get_task_status(task_id; store=store)[:status] == "COMPLETED") == :ok
+        @test wait_for(() -> get_task_status(task_id, Owner("user-a"); store=store)[:status] == "COMPLETED") == :ok
 
-        status = get_task_status(task_id; store=store)
+        status = get_task_status(task_id, Owner("user-a"); store=store)
         @test status[:result] == "done"
         @test status[:watcher_count] == 1
         @test calls[] == 1
@@ -55,11 +55,11 @@ end
                 push!(observed, task_info.id)
                 sleep(0.05)
                 return task_info.id
-            end, "user"; store=store))
+            end, Owner("user"); store=store))
         end
 
         @test ids == ["user::queued-1", "user::queued-2", "user::queued-3"]
-        @test wait_for(() -> all(get_task_status(id; store=store)[:status] == "COMPLETED" for id in ids)) == :ok
+        @test wait_for(() -> all(get_task_status(id, Owner("user"); store=store)[:status] == "COMPLETED" for id in ids)) == :ok
         @test observed == ids
 
         queue_status = get_queue_status("reports"; store=store)
@@ -83,9 +83,9 @@ end
                 error("retry me")
             end
             return "ok"
-        end, "user"; options=TaskOptions(retry_on_failure=true, max_retries=2), store=store)
+        end, Owner("user"); options=TaskOptions(retry_on_failure=true, max_retries=2), store=store)
 
-        @test wait_for(() -> get_task_status(retry_id; store=store)[:status] == "COMPLETED"; timeout=10.0) == :ok
+        @test wait_for(() -> get_task_status(retry_id, Owner("user"); store=store)[:status] == "COMPLETED"; timeout=10.0) == :ok
         @test attempts[] == 3
 
         cancel_id = submit_task("cancel-task", task_info -> begin
@@ -94,12 +94,12 @@ end
                 sleep(0.01)
             end
             return task_info.id
-        end, "user"; store=store)
+        end, Owner("user"); store=store)
 
         wait(started)
-        cancel_result = cancel_task(cancel_id; store=store)
+        cancel_result = cancel_task(cancel_id, Owner("user"); store=store)
         @test cancel_result[:status] == "Task cancelled"
-        @test wait_for(() -> get_task_status(cancel_id; store=store)[:status] == "CANCELLED") == :ok
+        @test wait_for(() -> get_task_status(cancel_id, Owner("user"); store=store)[:status] == "CANCELLED") == :ok
 
         lock(store.task_lock) do
             expired = TaskInfo("expired-task")
@@ -109,7 +109,7 @@ end
         end
 
         @test cleanup_old_tasks(7; store=store) == 1
-        @test get_task_status("expired-task"; store=store)[:status] == "NOT_FOUND"
+        @test get_task_status("expired-task", System(); store=store)[:status] == "NOT_FOUND"
     finally
         reset_store!(store)
     end
@@ -135,14 +135,14 @@ end
         end
 
         scheduler = start_cleanup_scheduler(; interval_hours=0.00005, retain_days=7, store=store)
-        @test wait_for(() -> get_task_status("scheduled-expired"; store=store)[:status] == "NOT_FOUND") == :ok
+        @test wait_for(() -> get_task_status("scheduled-expired", System(); store=store)[:status] == "NOT_FOUND") == :ok
         stop_cleanup_scheduler!(scheduler)
 
-        ctx_task_id = submit_task(ctx_one, "ctx-task", () -> "ctx-one", "user")
+        ctx_task_id = submit_task(ctx_one, "ctx-task", () -> "ctx-one", Owner("user"))
         @test ctx_task_id == "user::ctx-task"
-        @test wait_for(() -> get_task_status(ctx_one, ctx_task_id)[:status] == "COMPLETED") == :ok
-        @test get_task_status(ctx_one, ctx_task_id)[:result] == "ctx-one"
-        @test get_task_status(ctx_two, ctx_task_id)[:status] == "NOT_FOUND"
+        @test wait_for(() -> get_task_status(ctx_one, ctx_task_id, Owner("user"))[:status] == "COMPLETED") == :ok
+        @test get_task_status(ctx_one, ctx_task_id, Owner("user"))[:result] == "ctx-one"
+        @test get_task_status(ctx_two, ctx_task_id, Owner("user"))[:status] == "NOT_FOUND"
     finally
         uninstall!(ctx_one)
         uninstall!(ctx_two)
@@ -179,7 +179,7 @@ end
         store.task_registry[expired.id] = expired
     end
 
-    @test wait_for(() -> get_task_status(ctx, "lifecycle-expired")[:status] == "NOT_FOUND") == :ok
+    @test wait_for(() -> get_task_status(ctx, "lifecycle-expired", System())[:status] == "NOT_FOUND") == :ok
 
     lifecycle.on_shutdown()
     @test isnothing(worker_store(ctx))
@@ -199,93 +199,194 @@ end
     try
         # 1. Queue Authorization test
         # Authorized user succeeds
-        task1 = submit_sequential_task("admin-queue", "task-auth-ok", () -> "ok", "admin-user"; store=store)
+        task1 = submit_sequential_task("admin-queue", "task-auth-ok", () -> "ok", Owner("admin-user"); store=store)
         @test task1 == "admin-user::task-auth-ok"
 
         # Unauthorized user throws AuthorizationError
-        @test_throws AuthorizationError submit_sequential_task("admin-queue", "task-auth-fail", () -> "fail", "other-user"; store=store)
+        @test_throws AuthorizationError submit_sequential_task("admin-queue", "task-auth-fail", () -> "fail", Owner("other-user"); store=store)
 
         # 2. Task querying and watchers access control
         # submit a task by user-a (so user-a is the first watcher)
-        task_id = submit_task("task-access", () -> "data", "user-a"; store=store)
+        task_id = submit_task("task-access", () -> "data", Owner("user-a"); store=store)
         @test task_id == "user-a::task-access"
 
         # user-a can check status
-        status_a = get_task_status(task_id, "user-a"; store=store)
+        status_a = get_task_status(task_id, Owner("user-a"); store=store)
         @test status_a[:id] == task_id
 
         # user-b cannot check status (throws AuthorizationError)
-        @test_throws AuthorizationError get_task_status(task_id, "user-b"; store=store)
+        @test_throws AuthorizationError get_task_status(task_id, Owner("user-b"); store=store)
 
-        # check without user_id works (system bypass)
-        @test get_task_status(task_id; store=store)[:id] == task_id
+        # The bypass still exists, but it is now a value you have to name.
+        @test get_task_status(task_id, System(); store=store)[:id] == task_id
+
+        # ...and there is no arity that reaches it by omission. This is #48: the
+        # unsafe call used to be the SHORTER one, so a call site that had merely
+        # forgotten to scope was indistinguishable from one that meant not to.
+        @test_throws MethodError get_task_status(task_id; store=store)
+        @test_throws MethodError cancel_task(task_id; store=store)
+        @test_throws MethodError get_all_tasks(; store=store)
+        @test_throws MethodError get_all_tasks(RUNNING; store=store)
+        # A bare user id is not an authority either — `""` used to be a second,
+        # quieter bypass, reachable by reading a missing claim into an empty string.
+        @test_throws MethodError get_task_status(task_id, "user-a"; store=store)
 
         # 3. Listing tasks (get_all_tasks)
         # add another task by user-b
-        task_b_id = submit_task("task-user-b", () -> "data", "user-b"; store=store)
+        task_b_id = submit_task("task-user-b", () -> "data", Owner("user-b"); store=store)
 
         # get_all_tasks for user-a only returns task-access
-        tasks_a = get_all_tasks(nothing, "user-a"; store=store)
+        tasks_a = get_all_tasks(Owner("user-a"); store=store)
         @test length(tasks_a) == 1
         @test tasks_a[1][:id] == task_id
 
         # get_all_tasks for user-b only returns task-user-b
-        tasks_b = get_all_tasks(nothing, "user-b"; store=store)
+        tasks_b = get_all_tasks(Owner("user-b"); store=store)
         @test length(tasks_b) == 1
         @test tasks_b[1][:id] == task_b_id
 
         # get_all_tasks without user returns both
-        all_tasks = get_all_tasks(nothing; store=store)
+        all_tasks = get_all_tasks(System(); store=store)
         @test length(all_tasks) == 3 # task-auth-ok + task-access + task-user-b
 
         # 4. Cancellation access control
         # user-b cannot cancel user-a's task
-        @test_throws AuthorizationError cancel_task(task_id, "user-b"; store=store)
+        @test_throws AuthorizationError cancel_task(task_id, Owner("user-b"); store=store)
 
         # user-a can cancel their own task
-        cancel_res = cancel_task(task_id, "user-a"; store=store)
+        cancel_res = cancel_task(task_id, Owner("user-a"); store=store)
         @test cancel_res[:status] == "Task cancelled"
     finally
         reset_store!(store)
     end
 end
 
+@testset "Owner validates its identity; System is the named bypass" begin
+    # Every shape that would make the owner half of a `:user` id ambiguous, plus the
+    # empty id, which used to mean "skip the ownership check".
+    @test_throws ArgumentError Owner("")
+    @test_throws ArgumentError Owner("::")
+    @test_throws ArgumentError Owner("bad::uid")
+    @test_throws ArgumentError Owner("alice:")
+
+    # A colon anywhere else in an owner stays legal — "google:12345" is a real shape.
+    @test Owner("google:12345").user_id == "google:12345"
+    @test Owner("user-a") isa TaskAuthority
+    @test System() isa TaskAuthority
+end
+
+@testset "owner_of derives ownership from the id" begin
+    @test owner_of("user-a::export_42") == "user-a"
+    # A :user *key* may contain the delimiter; the first occurrence is the split.
+    @test owner_of("user-a::a::b") == "user-a"
+    # The rival parse here is owner "alice:", which `Owner` cannot construct.
+    @test owner_of("alice:::report") == "alice"
+    # :global ids are stored verbatim and have no owner half.
+    @test owner_of("export_42") === nothing
+    # Not producible by the API, but must fail closed rather than yield "".
+    @test owner_of("::x") === nothing
+    @test owner_of("") === nothing
+
+    # The round trip, and the equivalence the SQL pre-filter in the PormG store
+    # depends on: `owner_of(id) == u` iff `startswith(id, u * "::")`.
+    for (key, uid) in [("export_42", "user-a"), ("a::b", "user-a"), (":report", "alice"),
+                       ("report", "google:12345")]
+        id = scoped_task_key(key, Owner(uid))
+        @test owner_of(id) == uid
+        @test startswith(id, uid * "::")
+    end
+end
+
+@testset "ownership comes from the id, watchers only add to it" begin
+    store = InMemoryWorkerStore()
+    try
+        # A :user task: the owner is derivable from the id, so emptying `watchers`
+        # cannot revoke it. That is the authorization half of #88 — a lost append,
+        # or a full-row write from another process, can no longer evict an owner
+        # from their own task.
+        uid = submit_task("report", () -> "secret", Owner("alice"); store=store)
+        info = get_task_info(store, uid)
+        empty!(info.watchers)
+        set_task!(store, uid, info)
+
+        @test isempty(get_task_info(store, uid).watchers)
+        @test get_task_status(uid, Owner("alice"); store=store)[:id] == uid
+        @test get_task_status(uid, Owner("alice"); store=store)[:owner] == "alice"
+        @test_throws AuthorizationError get_task_status(uid, Owner("mallory"); store=store)
+        # It still lists for its owner, with no watcher entry backing that up.
+        @test length(get_all_tasks(Owner("alice"); store=store)) == 1
+
+        # A :global task has no owner half, so `watchers` remains the whole gate and
+        # emptying it authorizes nobody — including the submitter. The asymmetry is
+        # deliberate: B adds an authority source for :user ids, it removes none.
+        gid = submit_task("shared", () -> "x", Owner("gus"); scope=:global, store=store)
+        @test owner_of(gid) === nothing
+        ginfo = get_task_info(store, gid)
+        empty!(ginfo.watchers)
+        set_task!(store, gid, ginfo)
+
+        @test_throws AuthorizationError get_task_status(gid, Owner("gus"); store=store)
+        @test get_task_status(gid, System(); store=store)[:id] == gid
+        @test isempty(get_all_tasks(Owner("gus"); store=store))
+    finally
+        reset_store!(store)
+    end
+end
+
+@testset "get_all_tasks returns owned and granted tasks, and nothing else" begin
+    store = InMemoryWorkerStore()
+    try
+        mine = submit_task("mine", () -> "a", Owner("alice"); store=store)
+        theirs = submit_task("theirs", () -> "b", Owner("bob"); store=store)
+        # A :global task alice is a watcher of but does not own.
+        shared = submit_task("shared", () -> "c", Owner("carol"); scope=:global, store=store)
+        info = get_task_info(store, shared)
+        push!(info.watchers, "alice")
+        set_task!(store, shared, info)
+
+        ids = Set(t[:id] for t in get_all_tasks(Owner("alice"); store=store))
+        @test ids == Set([mine, shared])       # owned by prefix, granted by watchers
+        @test !(theirs in ids)
+        @test Set(t[:id] for t in get_all_tasks(Owner("bob"); store=store)) == Set([theirs])
+        @test length(get_all_tasks(System(); store=store)) == 3
+    finally
+        reset_store!(store)
+    end
+end
+
 @testset "scoped_task_key resolves and validates the stored id" begin
-    @test scoped_task_key("export_42", "user-a") == "user-a::export_42"
-    @test scoped_task_key("export_42", "user-a"; scope=:user) == "user-a::export_42"
-    @test scoped_task_key("export_42", "user-a"; scope=:global) == "export_42"
+    @test scoped_task_key("export_42", Owner("user-a")) == "user-a::export_42"
+    @test scoped_task_key("export_42", Owner("user-a"); scope=:user) == "user-a::export_42"
+    @test scoped_task_key("export_42", Owner("user-a"); scope=:global) == "export_42"
 
     # A :user task key may contain the delimiter; the owner may not, or
-    # ("a", "::b") and ("a::", "b") would resolve to the same id.
-    @test scoped_task_key("a::b", "user-a") == "user-a::a::b"
-    @test_throws ArgumentError scoped_task_key("b", "user-a::")
-    @test_throws ArgumentError scoped_task_key("b", "::")
+    # ("a", "::b") and ("a::", "b") would resolve to the same id. The owner half is
+    # now rejected by `Owner` on construction, so it can never reach this function.
+    @test scoped_task_key("a::b", Owner("user-a")) == "user-a::a::b"
 
     # An owner ending in ':' is the one remaining collision: without this rule
     # (":report", "alice") and ("report", "alice:") both give "alice:::report".
-    @test_throws ArgumentError scoped_task_key("report", "alice:")
-    @test scoped_task_key(":report", "alice") == "alice:::report"
+    @test scoped_task_key(":report", Owner("alice")) == "alice:::report"
     # A colon elsewhere in the owner is still legal and stays unambiguous.
-    @test scoped_task_key("report", "google:12345") == "google:12345::report"
+    @test scoped_task_key("report", Owner("google:12345")) == "google:12345::report"
 
     # A :global key may not contain it at all, or it could forge a :user id:
     # global "victim::export_42" is exactly what victim's own "export_42" resolves to.
-    @test_throws ArgumentError scoped_task_key("victim::export_42", "attacker"; scope=:global)
-    @test scoped_task_key("victim::export_42", "attacker") == "attacker::victim::export_42"
+    @test_throws ArgumentError scoped_task_key("victim::export_42", Owner("attacker"); scope=:global)
+    @test scoped_task_key("victim::export_42", Owner("attacker")) == "attacker::victim::export_42"
 
-    @test_throws ArgumentError scoped_task_key("export_42", "user-a"; scope=:tenant)
+    @test_throws ArgumentError scoped_task_key("export_42", Owner("user-a"); scope=:tenant)
 
     # The submit paths route through it, including the validation.
     store = InMemoryWorkerStore()
     try
-        @test submit_task("k", () -> 1, "u"; scope=:global, store=store) == "k"
-        @test_throws ArgumentError submit_task("k2", () -> 1, "bad::uid"; store=store)
-        @test_throws ArgumentError submit_task("k3", () -> 1, "u"; scope=:tenant, store=store)
-        @test_throws ArgumentError submit_sequential_task("q", "k4", () -> 1, "u"; scope=:tenant, store=store)
+        @test submit_task("k", () -> 1, Owner("u"); scope=:global, store=store) == "k"
+        @test_throws ArgumentError submit_task("k3", () -> 1, Owner("u"); scope=:tenant, store=store)
+        @test_throws ArgumentError submit_sequential_task("q", "k4", () -> 1, Owner("u"); scope=:tenant, store=store)
 
         # A global submit cannot squat a user-scoped id.
-        @test_throws ArgumentError submit_task("victim::k5", () -> 1, "attacker"; scope=:global, store=store)
-        @test_throws ArgumentError submit_sequential_task("q", "victim::k6", () -> 1, "attacker"; scope=:global, store=store)
+        @test_throws ArgumentError submit_task("victim::k5", () -> 1, Owner("attacker"); scope=:global, store=store)
+        @test_throws ArgumentError submit_sequential_task("q", "victim::k6", () -> 1, Owner("attacker"); scope=:global, store=store)
     finally
         reset_store!(store)
     end
@@ -299,20 +400,20 @@ end
         owner_id = submit_sequential_task("reports", "nightly-rollup", task_info -> begin
             wait(release)
             return "owner-result"
-        end, "owner"; scope=:global, store=store)
+        end, Owner("owner"); scope=:global, store=store)
         @test owner_id == "nightly-rollup"
 
         @test_throws AuthorizationError submit_sequential_task(
-            "reports", "nightly-rollup", () -> "noop", "attacker"; scope=:global, store=store)
+            "reports", "nightly-rollup", () -> "noop", Owner("attacker"); scope=:global, store=store)
 
         notify(release)
-        @test wait_for(() -> get_task_status(owner_id; store=store)[:status] == "COMPLETED") == :ok
-        @test get_task_status(owner_id, "owner"; store=store)[:result] == "owner-result"
-        @test_throws AuthorizationError get_task_status(owner_id, "attacker"; store=store)
+        @test wait_for(() -> get_task_status(owner_id, Owner("owner"); store=store)[:status] == "COMPLETED") == :ok
+        @test get_task_status(owner_id, Owner("owner"); store=store)[:result] == "owner-result"
+        @test_throws AuthorizationError get_task_status(owner_id, Owner("attacker"); store=store)
 
         # Terminal state is gated on the sequential path too.
         @test_throws AuthorizationError submit_sequential_task(
-            "reports", "nightly-rollup", () -> "noop", "attacker"; scope=:global, store=store)
+            "reports", "nightly-rollup", () -> "noop", Owner("attacker"); scope=:global, store=store)
     finally
         notify(release)
         reset_store!(store)
@@ -331,13 +432,13 @@ end
             a_calls[] += 1
             wait(release)
             return "victim-secret"
-        end, "user-a"; store=store)
+        end, Owner("user-a"); store=store)
 
         b_id = submit_task("export_report_42", () -> begin
             b_calls[] += 1
             wait(release)
             return "attacker-data"
-        end, "user-b"; store=store)
+        end, Owner("user-b"); store=store)
 
         @test a_id == "user-a::export_report_42"
         @test b_id == "user-b::export_report_42"
@@ -345,19 +446,19 @@ end
 
         # Two independent tasks: no deduplication across users, so both run.
         notify(release)
-        @test wait_for(() -> get_task_status(a_id; store=store)[:status] == "COMPLETED") == :ok
-        @test wait_for(() -> get_task_status(b_id; store=store)[:status] == "COMPLETED") == :ok
+        @test wait_for(() -> get_task_status(a_id, Owner("user-a"); store=store)[:status] == "COMPLETED") == :ok
+        @test wait_for(() -> get_task_status(b_id, Owner("user-b"); store=store)[:status] == "COMPLETED") == :ok
         @test a_calls[] == 1
         @test b_calls[] == 1
 
         # Neither user became a watcher of the other's task.
-        @test get_task_status(a_id; store=store)[:watcher_count] == 1
-        @test get_task_status(b_id; store=store)[:watcher_count] == 1
+        @test get_task_status(a_id, Owner("user-a"); store=store)[:watcher_count] == 1
+        @test get_task_status(b_id, Owner("user-b"); store=store)[:watcher_count] == 1
 
         # The escalation the issue reports: reading and cancelling across users.
-        @test get_task_status(a_id, "user-a"; store=store)[:result] == "victim-secret"
-        @test_throws AuthorizationError get_task_status(a_id, "user-b"; store=store)
-        @test_throws AuthorizationError cancel_task(a_id, "user-b"; store=store)
+        @test get_task_status(a_id, Owner("user-a"); store=store)[:result] == "victim-secret"
+        @test_throws AuthorizationError get_task_status(a_id, Owner("user-b"); store=store)
+        @test_throws AuthorizationError cancel_task(a_id, Owner("user-b"); store=store)
     finally
         notify(release)
         reset_store!(store)
@@ -373,40 +474,40 @@ end
         owner_id = submit_task("shared-export", () -> begin
             wait(release)
             return "victim-secret"
-        end, "victim"; scope=:global, store=store)
+        end, Owner("victim"); scope=:global, store=store)
         @test owner_id == "shared-export"
 
         # Case 1 — the task is live. Joining it would hand over read/cancel rights.
         @test_throws AuthorizationError submit_task("shared-export", () -> begin
             attacker_calls[] += 1
             return "noop"
-        end, "attacker"; scope=:global, store=store)
+        end, Owner("attacker"); scope=:global, store=store)
 
         # The refused submit left no trace on the victim's task.
-        @test get_task_status(owner_id; store=store)[:watcher_count] == 1
-        @test_throws AuthorizationError get_task_status(owner_id, "attacker"; store=store)
-        @test_throws AuthorizationError cancel_task(owner_id, "attacker"; store=store)
+        @test get_task_status(owner_id, Owner("victim"); store=store)[:watcher_count] == 1
+        @test_throws AuthorizationError get_task_status(owner_id, Owner("attacker"); store=store)
+        @test_throws AuthorizationError cancel_task(owner_id, Owner("attacker"); store=store)
 
         notify(release)
-        @test wait_for(() -> get_task_status(owner_id; store=store)[:status] == "COMPLETED") == :ok
+        @test wait_for(() -> get_task_status(owner_id, Owner("victim"); store=store)[:status] == "COMPLETED") == :ok
 
         # Case 2 — the task is finished. Re-running the key would overwrite the
         # owner's stored result and drop them from the watcher list.
         @test_throws AuthorizationError submit_task("shared-export", () -> begin
             attacker_calls[] += 1
             return "noop"
-        end, "attacker"; scope=:global, store=store)
+        end, Owner("attacker"); scope=:global, store=store)
 
-        after = get_task_status(owner_id, "victim"; store=store)
+        after = get_task_status(owner_id, Owner("victim"); store=store)
         @test after[:status] == "COMPLETED"
         @test after[:result] == "victim-secret"
         @test after[:watcher_count] == 1
         @test attacker_calls[] == 0
 
         # The owner may still re-run their own finished key.
-        again = submit_task("shared-export", () -> "second-run", "victim"; scope=:global, store=store)
+        again = submit_task("shared-export", () -> "second-run", Owner("victim"); scope=:global, store=store)
         @test again == owner_id
-        @test wait_for(() -> get_task_status(owner_id; store=store)[:result] == "second-run") == :ok
+        @test wait_for(() -> get_task_status(owner_id, Owner("victim"); store=store)[:result] == "second-run") == :ok
     finally
         notify(release)
         reset_store!(store)
@@ -427,36 +528,36 @@ end
         owner_id = submit_task("team-export", () -> begin
             wait(release)
             return "shared-result"
-        end, "owner"; scope=:global, store=store)
+        end, Owner("owner"); scope=:global, store=store)
 
         # Denied: the hook says no.
-        @test_throws AuthorizationError submit_task("team-export", () -> "noop", "stranger"; scope=:global, store=store)
+        @test_throws AuthorizationError submit_task("team-export", () -> "noop", Owner("stranger"); scope=:global, store=store)
         @test seen[] == ("team-export", ["owner"], "stranger")
 
         # Allowed: the hook says yes, so the teammate joins as a watcher and
         # deduplicates onto the running task rather than starting a second one.
-        joined = submit_task("team-export", () -> error("must not run"), "teammate"; scope=:global, store=store)
+        joined = submit_task("team-export", () -> error("must not run"), Owner("teammate"); scope=:global, store=store)
         @test joined == owner_id
 
         notify(release)
-        @test wait_for(() -> get_task_status(owner_id; store=store)[:status] == "COMPLETED") == :ok
+        @test wait_for(() -> get_task_status(owner_id, Owner("owner"); store=store)[:status] == "COMPLETED") == :ok
 
-        status = get_task_status(owner_id, "teammate"; store=store)
+        status = get_task_status(owner_id, Owner("teammate"); store=store)
         @test status[:result] == "shared-result"
         @test status[:watcher_count] == 2
-        @test_throws AuthorizationError get_task_status(owner_id, "stranger"; store=store)
+        @test_throws AuthorizationError get_task_status(owner_id, Owner("stranger"); store=store)
 
         # The hook is not consulted for a user who already watches the task.
         seen[] = nothing
-        @test submit_task("team-export", () -> "re-run", "owner"; scope=:global, store=store) == owner_id
+        @test submit_task("team-export", () -> "re-run", Owner("owner"); scope=:global, store=store) == owner_id
         @test seen[] === nothing
 
         # Re-running a finished key REPLACES the record, so the watcher list resets to
         # the submitter and previously-authorized sharers are evicted. Documented on
         # set_watch_authorizer! — asserted here so the behavior cannot drift silently.
-        @test wait_for(() -> get_task_status(owner_id; store=store)[:result] == "re-run") == :ok
-        @test get_task_status(owner_id; store=store)[:watcher_count] == 1
-        @test_throws AuthorizationError get_task_status(owner_id, "teammate"; store=store)
+        @test wait_for(() -> get_task_status(owner_id, Owner("owner"); store=store)[:result] == "re-run") == :ok
+        @test get_task_status(owner_id, Owner("owner"); store=store)[:watcher_count] == 1
+        @test_throws AuthorizationError get_task_status(owner_id, Owner("teammate"); store=store)
     finally
         notify(release)
         reset_store!(store)
@@ -475,14 +576,14 @@ end
     try
         @test DEFAULT_QUEUE_NAME == "default"
 
-        ok_id = submit_task("job", () -> "ran", "allowed"; store=store)
+        ok_id = submit_task("job", () -> "ran", Owner("allowed"); store=store)
         @test ok_id == "allowed::job"
-        @test wait_for(() -> get_task_status(ok_id; store=store)[:status] == "COMPLETED") == :ok
+        @test wait_for(() -> get_task_status(ok_id, Owner("allowed"); store=store)[:status] == "COMPLETED") == :ok
 
-        @test_throws AuthorizationError submit_task("job", () -> "ran", "denied"; store=store)
+        @test_throws AuthorizationError submit_task("job", () -> "ran", Owner("denied"); store=store)
 
         # The denied submission never reached the store.
-        @test get_task_status("denied::job"; store=store)[:status] == "NOT_FOUND"
+        @test get_task_status("denied::job", System(); store=store)[:status] == "NOT_FOUND"
 
         @test calls[] == [(DEFAULT_QUEUE_NAME, "allowed"), (DEFAULT_QUEUE_NAME, "denied")]
     finally
@@ -516,13 +617,13 @@ end
         @test recovered_count == 1
 
         # Test zombie is marked FAILED
-        zombie_status = get_task_status("zombie-running"; store=store)
+        zombie_status = get_task_status("zombie-running", System(); store=store)
         @test zombie_status[:status] == "FAILED"
         @test zombie_status[:error] == "Worker process terminated unexpectedly mid-execution."
         @test zombie_status[:completed_at] isa DateTime
 
         # Test active running task is untouched
-        active_status = get_task_status("active-running"; store=store)
+        active_status = get_task_status("active-running", System(); store=store)
         @test active_status[:status] == "RUNNING"
 
         # Cleanup active task
@@ -537,14 +638,14 @@ end
     try
         # Regression: cancel_task used to read status outside the task lock,
         # so a concurrent _complete_task! could overwrite COMPLETED→CANCELLED.
-        task_id = submit_task("race-task", () -> "safe-result", "user"; store=store)
-        @test wait_for(() -> get_task_status(task_id; store=store)[:status] == "COMPLETED") == :ok
+        task_id = submit_task("race-task", () -> "safe-result", Owner("user"); store=store)
+        @test wait_for(() -> get_task_status(task_id, Owner("user"); store=store)[:status] == "COMPLETED") == :ok
 
         # Cancelling an already-completed task must return an error, not overwrite the result.
-        result = cancel_task(task_id; store=store)
+        result = cancel_task(task_id, Owner("user"); store=store)
         @test haskey(result, :error)
 
-        final = get_task_status(task_id; store=store)
+        final = get_task_status(task_id, Owner("user"); store=store)
         @test final[:status] == "COMPLETED"
         @test final[:result] == "safe-result"
     finally
@@ -557,10 +658,10 @@ end
     try
         # Regression: _fail_task! and _cancel_task! used to write status before error/completed_at,
         # so concurrent readers could observe status=FAILED with error=nothing.
-        task_id = submit_task("fail-task", () -> error("boom"), "user"; store=store)
-        @test wait_for(() -> get_task_status(task_id; store=store)[:status] == "FAILED"; timeout=10.0) == :ok
+        task_id = submit_task("fail-task", () -> error("boom"), Owner("user"); store=store)
+        @test wait_for(() -> get_task_status(task_id, Owner("user"); store=store)[:status] == "FAILED"; timeout=10.0) == :ok
 
-        status = get_task_status(task_id; store=store)
+        status = get_task_status(task_id, Owner("user"); store=store)
         @test status[:error] !== nothing
         @test occursin("boom", status[:error])
         @test status[:completed_at] !== nothing
@@ -574,13 +675,13 @@ end
         task_id2 = submit_task("cancel-fields-task", task_info -> begin
             notify(started)
             while true; sleep(0.01); end
-        end, "user"; store=store2)
+        end, Owner("user"); store=store2)
 
         wait(started)
-        cancel_task(task_id2; store=store2)
-        @test wait_for(() -> get_task_status(task_id2; store=store2)[:status] == "CANCELLED") == :ok
+        cancel_task(task_id2, Owner("user"); store=store2)
+        @test wait_for(() -> get_task_status(task_id2, Owner("user"); store=store2)[:status] == "CANCELLED") == :ok
 
-        status2 = get_task_status(task_id2; store=store2)
+        status2 = get_task_status(task_id2, Owner("user"); store=store2)
         @test status2[:error] !== nothing
         @test status2[:completed_at] !== nothing
     finally
@@ -602,15 +703,15 @@ end
                 notify(gate)
                 sleep(0.001)
                 return "result-$(trial)"
-            end, "user"; store=store)
+            end, Owner("user"); store=store)
 
             wait(gate)
-            cancel_task(task_id; store=store)
+            cancel_task(task_id, Owner("user"); store=store)
 
             # Let either path finish.
-            wait_for(() -> get_task_status(task_id; store=store)[:status] in ("COMPLETED", "CANCELLED"))
+            wait_for(() -> get_task_status(task_id, Owner("user"); store=store)[:status] in ("COMPLETED", "CANCELLED"))
 
-            final = get_task_status(task_id; store=store)
+            final = get_task_status(task_id, Owner("user"); store=store)
             @test final[:status] in ("COMPLETED", "CANCELLED")
             if final[:status] == "COMPLETED"
                 @test final[:result] == "result-$(trial)"
