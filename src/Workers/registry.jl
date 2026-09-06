@@ -17,6 +17,9 @@ frequent than watcher appends, so this was the dominant way a grant went missing
 
 Use [`add_watcher!`](@ref) to add a grant and [`replace_task!`](@ref) to write a whole
 record, watchers included.
+
+The return value is **unspecified** — a store may return the caller's object or the record
+it holds. Do not rely on it, and do not rely on it being the same across backends.
 """
 function set_task! end
 

@@ -13,7 +13,7 @@ import Nitro: pormg_nitro_session
 
 import Nitro.Workers: AbstractWorkerStore, TaskInfo, TaskStatus, TaskOptions, SequentialQueue, CleanupScheduler,
     PENDING, RUNNING, COMPLETED, FAILED, CANCELLED,
-    TaskAuthority, Owner, System, owner_of, _is_authorized, TASK_KEY_DELIMITER,
+    TaskAuthority, Owner, System, UNSUPPLIED, owner_of, _is_authorized, TASK_KEY_DELIMITER,
     get_task_info, reload_task, set_task!, replace_task!, add_watcher!, try_transition!,
     delete_task!, cleanup_tasks!, get_all_tasks,
     get_active_task, register_active_task!, deregister_active_task!,
@@ -638,12 +638,12 @@ reload_task(store::PormGWorkerStore, task_id::String) = _read_db_task(store, tas
 function try_transition!(store::PormGWorkerStore, task_id::String, from, to::TaskStatus;
                          error::Union{Nothing, String}=nothing,
                          completed_at::Union{Nothing, DateTime}=nothing,
-                         result=Nitro.Workers.UNSUPPLIED,
+                         result=UNSUPPLIED,
                          progress::Union{Nothing, Real}=nothing)
     columns = Pair{String, Any}["status" => string(to)]
     error === nothing || push!(columns, "error" => error)
     completed_at === nothing || push!(columns, "completed_at" => completed_at)
-    result === Nitro.Workers.UNSUPPLIED ||
+    result === UNSUPPLIED ||
         push!(columns, "result" => isnothing(result) ? "" : JSON.json(result))
     progress === nothing || push!(columns, "progress" => Float64(progress))
 
@@ -705,11 +705,16 @@ PostgreSQL a `LIKE 'x%'` uses the primary-key index only under a C collation or 
 `text_pattern_ops` opclass, which `PormG.Dialect.create_index` cannot express. Do not
 add an index for this.
 """
-_authority_rows(base, ::System) = base.list()
+_authority_rows(make_base::Function, ::System) = make_base().list()
 
-function _authority_rows(base, authority::Owner)
-    owned = base.filter("id__@startswith" => authority.user_id * TASK_KEY_DELIMITER).list()
-    watched = base.filter("watchers__@contains" => JSON.json(authority.user_id)).list()
+function _authority_rows(make_base::Function, authority::Owner)
+    # `make_base()` must mint a FRESH queryset per leg. PormG's `filter` accumulates onto
+    # the object and returns it (`push!(q.filter, …)`), so filtering one shared base twice
+    # ANDs the two legs together — `watched` would become `owned ∩ watched`, and every
+    # watcher-only task (all `:global` ones, and every `watchers=` grant) would silently
+    # vanish from the listing. That is an intersection where a union is required.
+    owned = make_base().filter("id__@startswith" => authority.user_id * TASK_KEY_DELIMITER).list()
+    watched = make_base().filter("watchers__@contains" => JSON.json(authority.user_id)).list()
 
     rows = Any[]
     seen = Set{String}()
@@ -728,12 +733,16 @@ end
 
 function get_all_tasks(store::PormGWorkerStore, authority::TaskAuthority; status::Union{Nothing, TaskStatus}=nothing, queue_name::Union{Nothing, String}=nothing)
     try
-        qs = _task_objects(store)
-        if status !== nothing
-            qs = qs.filter("status" => string(status))
-        end
-        if queue_name !== nothing
-            qs = qs.filter("queue_name" => queue_name)
+        # A factory, not a queryset: see `_authority_rows` on why each leg needs its own.
+        make_base = function()
+            qs = _task_objects(store)
+            if status !== nothing
+                qs = qs.filter("status" => string(status))
+            end
+            if queue_name !== nothing
+                qs = qs.filter("queue_name" => queue_name)
+            end
+            return qs
         end
 
         # Snapshot the live in-memory infos so running tasks report fresh
@@ -744,7 +753,7 @@ function get_all_tasks(store::PormGWorkerStore, authority::TaskAuthority; status
         end
 
         tasks = TaskInfo[]
-        for row in _authority_rows(qs, authority)
+        for row in _authority_rows(make_base, authority)
             task_info = _from_db_record(row)
             live = get(active, task_info.id, nothing)
             if live !== nothing

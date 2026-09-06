@@ -28,11 +28,16 @@ function recover_zombie_tasks!(; store::AbstractWorkerStore=default_store())
         running_tasks = get_all_tasks(store, System(); status=RUNNING)
         count = 0
         for task in running_tasks
-            if isnothing(get_active_task(store, task.id))
-                task.status = FAILED
-                task.completed_at = Dates.now(Dates.UTC)
-                task.error = "Worker process terminated unexpectedly mid-execution."
-                set_task!(store, task.id, task)
+            isnothing(get_active_task(store, task.id)) || continue
+            # `get_active_task` is process-local, so in a multi-process deployment this
+            # sweep sees another node's genuinely-running task as a zombie. Claiming the
+            # transition rather than saving a decision means that if the task finishes
+            # (or is cancelled) between the read and the write, the real outcome stands
+            # and this sweep writes nothing — the same rule every other terminal write
+            # now follows (#88).
+            if try_transition!(store, task.id, (RUNNING,), FAILED;
+                               error="Worker process terminated unexpectedly mid-execution.",
+                               completed_at=current_time_utc())
                 count += 1
             end
         end
@@ -190,15 +195,18 @@ end
 # raise anyway. It can only ever turn a denial into an approval, never the reverse.
 function _authorize_or_reload!(store::AbstractWorkerStore, authority::TaskAuthority,
                                task_info::TaskInfo, action::AbstractString)
-    _is_authorized(authority, task_info) && return task_info
+    _is_authorized(authority, task_info) && return nothing
 
+    # Authorize against the durable record, but keep serving the cached one: the durable
+    # row for a *running* task holds only what was flushed at RUNNING-start, so returning
+    # it would admit the cross-process grantee and then hand them a frozen progress bar —
+    # the exact field #96 exists to expose. The decision needs the durable record; the
+    # payload does not.
     durable = reload_task(store, task_info.id)
-    if durable !== nothing && _is_authorized(authority, durable)
-        return durable
-    end
+    durable !== nothing && _is_authorized(authority, durable) && return nothing
 
     _authorize_task!(authority, task_info, action)   # raises
-    return task_info
+    return nothing
 end
 
 # A `watchers=` grant is authorized by the *owner* — but a `:global` task has no owner
@@ -245,6 +253,22 @@ function _register_or_watch!(store::AbstractWorkerStore, task_key::String, owner
             end
         end
 
+        # Snapshot the watcher list ONCE, before anything is written, and show every
+        # grant the same value. Reading it live instead made the app's authorizer hook
+        # see a different `watchers` argument per backend and per timing: the in-memory
+        # store's `add_watcher!` mutates the very object we hold, while the database
+        # store's only patches a live copy when the task is already registered as active.
+        # A hook written as `all(w -> same_org(w, uid), watchers)` would then reach
+        # different verdicts on different nodes — parity that a security hook must have.
+        seen = task_info === nothing ? String[] : copy(task_info.watchers)
+
+        # Authorize every grant before applying any. Otherwise a refusal partway through
+        # throws with the earlier grants already durably written — and a submit that
+        # raised would still have handed out access.
+        for grant in grants
+            _authorize_grant!(store, task_key, seen, grant)
+        end
+
         if task_info !== nothing && task_info.status in (RUNNING, PENDING)
             # Atomic and idempotent in the store. Composing this out of
             # get + push! + set_task! under `lock_tasks` is what #88 was: that lock is
@@ -252,7 +276,6 @@ function _register_or_watch!(store::AbstractWorkerStore, task_key::String, owner
             # last-write-wins across processes.
             add_watcher!(store, task_key, uid)
             for grant in grants
-                _authorize_grant!(store, task_key, task_info.watchers, grant)
                 add_watcher!(store, task_key, grant.user_id)
             end
             return false
@@ -263,7 +286,6 @@ function _register_or_watch!(store::AbstractWorkerStore, task_key::String, owner
         task_info = TaskInfo(task_key; queue_name)
         push!(task_info.watchers, uid)
         for grant in grants
-            _authorize_grant!(store, task_key, task_info.watchers, grant)
             grant.user_id in task_info.watchers || push!(task_info.watchers, grant.user_id)
         end
         replace_task!(store, task_key, task_info)
@@ -406,7 +428,7 @@ function get_task_status(task_id::AbstractString, authority::TaskAuthority; stor
         return Dict{Symbol, Any}(:error => "Task not found", :status => "NOT_FOUND")
     end
 
-    task_info = _authorize_or_reload!(store, authority, task_info, "view")
+    _authorize_or_reload!(store, authority, task_info, "view")
 
     return Dict{Symbol, Any}(
         :id => task_info.id,
@@ -434,7 +456,7 @@ function cancel_task(task_id::AbstractString, authority::TaskAuthority; store::A
             return Dict{Symbol, Any}(:error => "Task not found")
         end
 
-        task_info = _authorize_or_reload!(store, authority, task_info, "cancel")
+        _authorize_or_reload!(store, authority, task_info, "cancel")
 
         if task_info.status in (COMPLETED, FAILED, CANCELLED)
             return Dict{Symbol, Any}(:error => "Task already finished with status $(task_info.status)")

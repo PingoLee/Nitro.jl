@@ -259,6 +259,15 @@ cancel_task(task_id, Owner("user-1"))
     end, Owner("user-1"))
     ```
 
+    **`task_info.status` is process-local.** With `PormGWorkerStore` and more than one
+    process, a cancel issued on another node writes the database row and never touches
+    this node's in-memory `TaskInfo`, so the check above will not fire. Poll the durable
+    record instead, sparingly — it is a database round-trip:
+
+    ```julia
+    get_task_status(task_info.id, System())[:status] == "CANCELLED" && return "cancelled"
+    ```
+
     A callback that spawns an external process must kill it itself — see
     [#49](https://github.com/PingoLee/Nitro.jl/issues/49).
 

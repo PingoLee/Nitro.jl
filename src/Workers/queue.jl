@@ -25,9 +25,10 @@ function _finish_task!(store::AbstractWorkerStore, task_info::TaskInfo, to::Task
                        error::Union{Nothing, String}=nothing,
                        result=UNSUPPLIED,
                        progress::Union{Nothing, Real}=nothing)
+    finished_at = current_time_utc()
     return lock_tasks(store) do
         claimed = try_transition!(store, task_info.id, (PENDING, RUNNING), to;
-                                  error, completed_at=current_time_utc(), result, progress)
+                                  error, completed_at=finished_at, result, progress)
 
         # Whether or not we won, this process is done running it.
         deregister_active_task!(store, task_info.id)
@@ -46,7 +47,7 @@ function _finish_task!(store::AbstractWorkerStore, task_info::TaskInfo, to::Task
         error === nothing || (task_info.error = error)
         result === UNSUPPLIED || (task_info.result = result)
         progress === nothing || (@atomic task_info.progress = Float64(progress))
-        task_info.completed_at = current_time_utc()
+        task_info.completed_at = finished_at
         task_info.status = to
         return task_info
     end
@@ -55,11 +56,14 @@ end
 _complete_task!(store::AbstractWorkerStore, task_info::TaskInfo, result) =
     _finish_task!(store, task_info, COMPLETED; result, progress=100.0)
 
+# Carry the progress the task had reached. A serializing store writes only the columns it
+# is given, so omitting it would reset a failed job's "got to 47% and died" to zero there
+# while the in-memory store kept it — a store-parity gap and a diagnostic loss.
 _fail_task!(store::AbstractWorkerStore, task_info::TaskInfo, message::String) =
-    _finish_task!(store, task_info, FAILED; error=message)
+    _finish_task!(store, task_info, FAILED; error=message, progress=task_info.progress)
 
 _cancel_task!(store::AbstractWorkerStore, task_info::TaskInfo; message::String="Cancelled") =
-    _finish_task!(store, task_info, CANCELLED; error=message)
+    _finish_task!(store, task_info, CANCELLED; error=message, progress=task_info.progress)
 
 function _execute_queued_task(store::AbstractWorkerStore, item::QueueItem)
     task_info = get_task_info(store, item.task_key)

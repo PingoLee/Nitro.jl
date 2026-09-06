@@ -139,6 +139,13 @@ Operational notes:
 - A custom store that also runs its own terminal transitions must route them through
   `try_transition!` rather than reading the status and then saving, or it reintroduces the
   race for its own backend.
+- `try_transition!`'s `result` keyword defaults to the exported sentinel `UNSUPPLIED`,
+  which is how a store tells "leave the stored result alone" apart from "the task completed
+  with `nothing`". Compare with `===`, not `isnothing`.
+- If your store's `filter`-style query builder **accumulates** predicates onto one object
+  rather than returning a fresh one, a `get_all_tasks` implementation must build each leg
+  of the owned/granted union from its own query. Sharing one base ANDs the legs together
+  and silently drops every task the user only watches.
 
 ---
 

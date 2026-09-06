@@ -67,11 +67,18 @@ end
 function Base.getproperty(qs::MockTaskQuerySet, name::Symbol)
     if name === :filter
         return function(pairs::Pair{String,<:Any}...)
-            new_filters = copy(getfield(qs, :filters))
+            # ACCUMULATE onto this object and return it, exactly as PormG's `_filter!`
+            # does (`push!(q.filter, …)`; see its "Calls ACCUMULATE (ANDed)" note).
+            #
+            # This used to return a fresh queryset with a copied filter dict, which made
+            # `base.filter(A)` and `base.filter(B)` independent. Against real PormG they
+            # are not: the second call ANDs onto the first. A mock that branches where the
+            # real thing accumulates turns an intersection bug into a passing test.
+            filters = getfield(qs, :filters)
             for (k, v) in pairs
-                new_filters[k] = v
+                filters[k] = v
             end
-            return MockTaskQuerySet(getfield(qs, :table), new_filters)
+            return qs
         end
     elseif name === :db
         return function(_db_key::String)
@@ -501,6 +508,67 @@ else
             persisted = reload_task(store_f, "alice::flaky")
             @test persisted.status == CANCELLED
             @test persisted.error == "Cancelled"
+        end
+
+        @testset "zombie recovery cannot clobber a result claimed elsewhere (#88)" begin
+            store_z = RealPormGWorkerStore(model=MockTaskModel())
+
+            t = TaskInfo("alice::job")
+            push!(t.watchers, "alice")
+            t.status = RUNNING
+            replace_task!(store_z, t.id, t)
+
+            # `get_active_task` is process-local, so this node sees another node's
+            # genuinely-running task as a zombie. Meanwhile that node finishes it.
+            @test try_transition!(store_z, "alice::job", (PENDING, RUNNING), COMPLETED;
+                                  result="real-result", progress=100.0) == true
+
+            # The sweep now claims rather than saves a stale decision, so it writes
+            # nothing: it used to overwrite both the status AND the result column.
+            @test recover_zombie_tasks!(; store=store_z) == 0
+            persisted = reload_task(store_z, "alice::job")
+            @test persisted.status == COMPLETED
+            @test persisted.result == "real-result"
+        end
+
+        @testset "a cross-process grantee still sees live progress (#96)" begin
+            store_p = RealPormGWorkerStore(model=MockTaskModel())
+
+            live = TaskInfo("alice::upload")
+            push!(live.watchers, "alice")
+            live.status = RUNNING
+            replace_task!(store_p, live.id, live)
+            register_active_task_info!(store_p, live.id, live)
+
+            add_watcher!(store_p, "alice::upload", "backend-service")
+            empty!(live.watchers)
+            push!(live.watchers, "alice")        # force the live copy stale again
+            update_progress!(live, 73)           # ...and let it run on
+
+            # The grantee is authorized by the durable row, but must be *served* the live
+            # record — otherwise the backend driving the progress bar, which is the whole
+            # motivating case, reads a bar frozen at whatever was last flushed.
+            granted = get_task_status("alice::upload", Owner("backend-service"); store=store_p)
+            @test granted[:progress] == 73.0
+            @test granted[:progress] == get_task_status("alice::upload", Owner("alice"); store=store_p)[:progress]
+        end
+
+        @testset "a failed task keeps the progress it reached (#88)" begin
+            store_pr = RealPormGWorkerStore(model=MockTaskModel())
+
+            t = TaskInfo("alice::flaky")
+            push!(t.watchers, "alice")
+            t.status = RUNNING
+            replace_task!(store_pr, t.id, t)
+            register_active_task_info!(store_pr, t.id, t)
+            update_progress!(t, 47)
+
+            Nitro.Workers._fail_task!(store_pr, t, "boom")
+
+            # A serializing store writes only the columns it is given, so omitting
+            # progress would reset "got to 47% then died" to zero here while the
+            # in-memory store kept it.
+            @test reload_task(store_pr, "alice::flaky").progress == 47.0
         end
 
         @testset "a grant made elsewhere is honoured despite a stale live record (#96)" begin

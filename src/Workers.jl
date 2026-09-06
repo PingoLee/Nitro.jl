@@ -26,7 +26,7 @@ export TaskStatus, PENDING, RUNNING, COMPLETED, FAILED, CANCELLED,
     start_cleanup_scheduler, stop_cleanup_scheduler!, get_queue_status,
     format_error, reset_store!, shutdown!,
     scoped_task_key, owner_of, DEFAULT_QUEUE_NAME,
-    TaskAuthority, Owner, System,
+    TaskAuthority, Owner, System, UNSUPPLIED,
     # Abstract store interface
     get_task_info, reload_task, set_task!, replace_task!, add_watcher!, try_transition!,
     delete_task!, cleanup_tasks!,

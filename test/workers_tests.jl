@@ -313,6 +313,14 @@ end
                                                    store=store)
         @test_throws AuthorizationError get_task_status(gid, Owner("mallory"); store=store)
 
+        # The refused submit must not have persisted the grants that preceded the
+        # refusal: a submit that raised should not have handed out any access.
+        @test_throws AuthorizationError submit_task("shared-index", () -> "x", Owner("victim");
+                                                   scope=:global,
+                                                   watchers=[Owner("bob"), Owner("mallory")],
+                                                   store=store)
+        @test_throws AuthorizationError get_task_status(gid, Owner("bob"); store=store)
+
         # An in-org grantee the authorizer accepts still goes through.
         @test submit_task("shared-index", () -> "x", Owner("victim");
                           scope=:global, watchers=[Owner("bob")], store=store) == gid
