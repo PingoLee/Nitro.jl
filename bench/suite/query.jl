@@ -6,13 +6,22 @@ SUITE["query"] = BenchmarkGroup()
 
 const QUERY_TARGET = "/bench/q?a=1&b=2&c=3&d=4&e=5"
 
-# NOTE: `queryvars_5keys` is a cache's WORST case and is expected to have regressed slightly
-# against pre-#38 numbers — it builds a bare `HTTP.Request` with no metadata Dict, calls the
-# accessor exactly once, and throws the request away, so it pays for the cache write and never
-# reads it back. It is kept as the honest floor. A real request always has metadata already
-# (`stream_handler` seeds `:ip`/`:stream`, `_app_context_seed` seeds the app context), and is
-# read more than once — which is what `queryvars_5keys_repeated` and the two full-pipeline
-# benchmarks measure.
+# These two measure different halves of the cache, and the difference is the `evals` setting.
+#
+# `queryvars_5keys` takes the tuned default, so `tune!` gives it many evals per `setup` and the
+# request is reused across them: the first eval builds and caches, the rest read it back. It
+# therefore reports the WARM read — 22 allocs before #38, 0 after, since a cache hit allocates
+# nothing at all.
+#
+# `queryvars_5keys_repeated` pins `evals=1`, so `setup` runs for every sample and each
+# measurement is one cold build plus two warm reads on a freshly-built request. That is the
+# shape of a handler with three bound query parameters, and it is the number to quote for the
+# fix: 66 allocs before, 27 after.
+#
+# Neither is the true worst case, which is a single cold read on a request that is then thrown
+# away — there the cache write is pure cost. That does not occur on a served request: by the
+# time a handler runs, `stream_handler` has seeded `:ip`/`:stream` and `_app_context_seed` the
+# app context, so the metadata Dict the write needs already exists.
 SUITE["query"]["queryvars_5keys"] = @benchmarkable Nitro.Core.Types.queryvars(req) setup=(
     req = bench_request("GET", QUERY_TARGET))
 
