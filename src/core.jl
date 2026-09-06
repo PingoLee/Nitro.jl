@@ -293,6 +293,21 @@ end
 ```
 
 Use [`getcontext(req, T)`](@ref) when you want the value statically typed as `T`.
+
+!!! warning "Prefer the typed form on the request path"
+    The app context is stored as `Ref{Any}` and can be reassigned after route
+    registration (`serve(context = ...)`, `internalrequest(context = ...)`), so its
+    payload type is genuinely unknown when a route is registered and this accessor
+    can only return `Any`. Every field access on the result is therefore a dynamic
+    `getfield`, once per request — the one remaining `Any` on the parameter-binding
+    path after #37.
+
+    In a handler or middleware that runs per request, reach for
+    `getcontext(req, AppConfig)` instead: the `::T` assertion is a function barrier,
+    so everything downstream of it infers concretely (nitro-core §7). Keep this
+    untyped form for scripts, tests, and one-off inspection. Making the type static
+    rather than asserted means parameterizing the context carrier itself, which is
+    [#31](https://github.com/PingoLee/Nitro.jl/issues/31).
 """
 function getcontext(req::HTTP.Request)
     ctx = Base.get(req.context, REQUEST_CONTEXT_KEY, missing)
@@ -305,6 +320,18 @@ end
 Returns the application context payload typed as `T`, so field access is statically
 typed (`getcontext(req, AppConfig).host`). Throws an `ArgumentError` when no context
 was configured, and a `TypeError` when the payload is not a `T`.
+
+**This is the form to use on the request path.** The `::T` assertion is a function
+barrier: it converts the single `Any` the context carrier forces (see
+[`getcontext(req)`](@ref)) into a concrete type, so the handler body and everything it
+calls infer normally instead of dispatching dynamically on every field access.
+
+```julia
+function handler(req)
+    cfg = getcontext(req, AppConfig)   # ::AppConfig, statically
+    cfg.host                           # concrete getfield, not a dynamic lookup
+end
+```
 """
 function getcontext(req::HTTP.Request, ::Type{T}) where {T}
     ctx = Base.get(req.context, REQUEST_CONTEXT_KEY, missing)
@@ -1201,83 +1228,132 @@ function register_internal(ctx::ServerContext, router::Router, httpmethod::Strin
     registerhandler(ctx, router, httpmethod, route, func, func_details)
 end
 
+# ── Per-parameter binding strategies (#37) ────────────────────────────────────
+#
+# One concrete callable struct per parameter kind, built once at registration.
+# These were closures over `param`, a loop variable drawn from `info.sig::Vector{Param}`.
+# `Param` is a `UnionAll`, so that element type is abstract, so each closure's captured
+# field was abstract too — calling one cost a dynamic dispatch, and entering its
+# `where T` body cost a second. Carrying the parameter's type as the *struct's* type
+# parameter makes `param`, `param.type` and `param.default` concrete fields, so both
+# dispatches resolve statically and the whole strategy list can live in a concrete
+# `Tuple` (see `create_param_parser`). This is the shape `axum` reaches with
+# `FromRequestParts` + per-arity tuple impls; the abstract-vector-of-resolvers it
+# replaces is Spring's `HandlerMethodArgumentResolver`, which only survives on JIT
+# devirtualization the Julia runtime does not do. nitro-core §7.
+#
+# `ServerContext` is a concrete struct, so carrying it by value costs no indirection.
+
+struct ContextStrategy
+    ctx::ServerContext
+end
+(s::ContextStrategy)(::LazyRequest) = s.ctx.app_context[]
+
+struct ExtractorStrategy{T}
+    param::Param{T}
+end
+(s::ExtractorStrategy)(lr::LazyRequest) = extract(s.param, lr)
+
+struct CookieStrategy{T}
+    param::Param{T}
+    ctx::ServerContext
+end
+(s::CookieStrategy)(lr::LazyRequest) =
+    extract(s.param, lr, s.ctx.service.cookies[].secret_key)
+
+struct SessionStrategy{T}
+    param::Param{T}
+    ctx::ServerContext
+end
+(s::SessionStrategy)(lr::LazyRequest) =
+    extract(s.param, lr, s.ctx.service.cookies[].secret_key, s.ctx.app_context[])
+
+struct PathParamStrategy{T}
+    param::Param{T}
+    name::String
+end
+function (s::PathParamStrategy)(lr::LazyRequest)
+    raw_pathparams = Types.pathparams(lr)
+    # The lookup is deliberately OUTSIDE any guard. A route brace always has a matching
+    # handler parameter (enforced at registration, see `parse_func_params` above) and the
+    # router always populates it, so a miss here is a framework bug rather than client
+    # input — it must stay a 500 with a real stack trace, not be laundered into a 400.
+    return parseparam_checked(s.param.type, raw_pathparams[s.name], s.name, :path)
+end
+
+# Selected only when `param.hasdefault`, so an absent key means "use the declared
+# default". Returns `Union{T,Nothing}` by construction — that union is the declared
+# optionality of the parameter, not an inference failure.
+struct QueryParamStrategy{T}
+    param::Param{T}
+    name::String
+end
+function (s::QueryParamStrategy)(lr::LazyRequest)
+    raw_queryparams = Types.queryvars(lr)
+    haskey(raw_queryparams, s.name) || return s.param.default
+    return parseparam_checked(s.param.type, raw_queryparams[s.name], s.name, :query)
+end
+
+struct RequiredQueryParamStrategy{T}
+    param::Param{T}
+    name::String
+end
+function (s::RequiredQueryParamStrategy)(lr::LazyRequest)
+    raw_queryparams = Types.queryvars(lr)
+    # A required query parameter that was not sent is a client error. This used to be a
+    # bare `raw_queryparams[name]`, whose `KeyError` surfaced as a 500.
+    haskey(raw_queryparams, s.name) ||
+        throw(ValidationError("Missing required query parameter '$(s.name)'"))
+    return parseparam_checked(s.param.type, raw_queryparams[s.name], s.name, :query)
+end
+
+# The function barrier that makes the whole thing pay off. `strats` is assembled
+# dynamically above, so at the assembly site its static type is only `Tuple`. Taking it
+# as an explicit type parameter forces a specialization per concrete tuple type, so the
+# returned closure captures it *concretely* — and `map` over a concrete tuple is
+# unrolled, statically dispatched, and returns a concrete `Tuple` with no heap vector
+# and no boxing. Building the closure inline at the call site would leave the field
+# abstract and undo every gain above; keep this barrier.
+#
+# Arity degrades gracefully rather than cliff-edging: past roughly 32 elements Julia
+# stops unrolling `map` and falls back to a generic (still correct) path, so a
+# pathological handler loses the optimization instead of blowing up compile time.
+function _make_param_parser(strats::S) where {S<:Tuple}
+    return function(req::HTTP.Request)
+        lr = LazyRequest(request=req)
+        return map(s -> s(lr), strats)
+    end
+end
+
 function create_param_parser(ctx::ServerContext, func_details)
     info = func_details.info
     pathparams = func_details.pathnames
     queryparams = func_details.querynames
 
-    strategies = Vector{Function}()
-
-    function context_strategy(_::LazyRequest)
-        return ctx.app_context[]
-    end
-
-    function extractor_strategy(lr::LazyRequest, param::Param{T}) where T
-        return extract(param, lr)
-    end
-
-    function cookie_strategy(lr::LazyRequest, param::Param{T}) where T
-        return extract(param, lr, ctx.service.cookies[].secret_key)
-    end
-
-    function session_strategy(lr::LazyRequest, param::Param{T}) where T
-        return extract(param, lr, ctx.service.cookies[].secret_key, ctx.app_context[])
-    end
-
-    function pathparam_strategy(lr::LazyRequest, param::Param{T}, name::String) where T
-        raw_pathparams = Types.pathparams(lr)
-        # The lookup is deliberately OUTSIDE the guard. A route brace always has a matching
-        # handler parameter (enforced at registration, see `parse_func_params` above) and the
-        # router always populates it, so a miss here is a framework bug rather than client
-        # input — it must stay a 500 with a real stack trace, not be laundered into a 400.
-        return parseparam_checked(param.type, raw_pathparams[name], name, :path)
-    end
-
-    function queryparam_strategy(lr::LazyRequest, param::Param{T}, name::String) where T
-        raw_queryparams = Types.queryvars(lr)
-        # Only selected when `param.hasdefault` (see the dispatch loop below), so an absent
-        # key means "use the declared default".
-        haskey(raw_queryparams, name) || return param.default
-        return parseparam_checked(param.type, raw_queryparams[name], name, :query)
-    end
-
-    function queryparam_strategy_no_default(lr::LazyRequest, param::Param{T}, name::String) where T
-        raw_queryparams = Types.queryvars(lr)
-        # A required query parameter that was not sent is a client error. This used to be a
-        # bare `raw_queryparams[name]`, whose `KeyError` surfaced as a 500.
-        haskey(raw_queryparams, name) ||
-            throw(ValidationError("Missing required query parameter '$name'"))
-        return parseparam_checked(param.type, raw_queryparams[name], name, :query)
-    end
+    strategies = Any[]
 
     for param in info.sig
         name = param.name
         str_name = String(name)
+        # Order matters: `Session` and `Cookie` are both `<: Extractor`, so they must be
+        # tested before the generic extractor branch.
         if param.type <: Context
-            push!(strategies, context_strategy)
+            push!(strategies, ContextStrategy(ctx))
         elseif param.type <: Session
-            push!(strategies, lr -> session_strategy(lr, param))
+            push!(strategies, SessionStrategy(param, ctx))
         elseif param.type <: Cookie
-            push!(strategies, lr -> cookie_strategy(lr, param))
+            push!(strategies, CookieStrategy(param, ctx))
         elseif param.type <: Extractor
-            push!(strategies, lr -> extractor_strategy(lr, param))
+            push!(strategies, ExtractorStrategy(param))
         elseif name in pathparams
-            push!(strategies, lr -> pathparam_strategy(lr, param, str_name))
+            push!(strategies, PathParamStrategy(param, str_name))
         elseif name in queryparams
-            query_parsing_strat = param.hasdefault ? queryparam_strategy : queryparam_strategy_no_default
-            push!(strategies, lr -> query_parsing_strat(lr, param, str_name))
+            push!(strategies, param.hasdefault ? QueryParamStrategy(param, str_name) :
+                                                 RequiredQueryParamStrategy(param, str_name))
         end
     end
 
-    strat_length = length(strategies)
-    return function(req::HTTP.Request)
-        lr = LazyRequest(request=req)
-        results = Vector{Any}(undef, strat_length)
-        @inbounds for i in 1:strat_length
-            results[i] = strategies[i](lr)
-        end
-        return results
-    end
+    return _make_param_parser(Tuple(strategies))
 end
 
 function registerhandler(ctx::ServerContext, router::Router, httpmethod::String, route::String, func::Function, func_details::NamedTuple)

@@ -17,6 +17,13 @@ Nitro.Core.Routing.urlpatterns(BENCH_CTX, "", Nitro.RouteDefinition[
         return Res.json(Dict("n" => length(q2), "a" => get(q1, "a", "")))
     end, method="GET"),
     Nitro.path("/bench/json", (req) -> Res.json(req.json), method="POST"),
+    # Four bound params in one signature. The single-param route above barely moves
+    # when the parser changes shape; the cost of the old `Vector{Any}` + per-param
+    # dynamic dispatch scales with arity, so this is where #37 is visible.
+    Nitro.path("/bench/multi/<int:id>/<str:slug>", function (req, id::Int, slug::String,
+                                                             page::Int = 1, q::String = "")
+        return Res.json(Dict("id" => id, "slug" => slug, "page" => page, "q" => q))
+    end, method="GET"),
 ])
 
 bench_request(method::String, target::String; body::String="") =
