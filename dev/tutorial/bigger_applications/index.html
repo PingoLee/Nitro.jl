@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/><title>- · Nitro.jl</title><meta name="title" content="- · Nitro.jl"/><meta property="og:title" content="- · Nitro.jl"/><meta property="twitter:title" content="- · Nitro.jl"/><meta name="description" content="Documentation for Nitro.jl."/><meta property="og:description" content="Documentation for Nitro.jl."/><meta property="twitter:description" content="Documentation for Nitro.jl."/><script data-outdated-warner src="../../assets/warner.js"></script><link href="https://cdnjs.cloudflare.com/ajax/libs/lato-font/3.0.0/css/lato-font.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/juliamono/0.63.2/juliamono.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/fontawesome.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/solid.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/brands.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.8/katex.min.css" rel="stylesheet" type="text/css"/><script>documenterBaseURL="../.."</script><script src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.6/require.min.js" data-main="../../assets/documenter.js"></script><script src="../../search_index.js"></script><script src="../../siteinfo.js"></script><script src="../../../versions.js"></script><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/catppuccin-mocha.css" data-theme-name="catppuccin-mocha"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/catppuccin-macchiato.css" data-theme-name="catppuccin-macchiato"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/catppuccin-frappe.css" data-theme-name="catppuccin-frappe"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/catppuccin-latte.css" data-theme-name="catppuccin-latte"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/documenter-dark.css" data-theme-name="documenter-dark" data-theme-primary-dark/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/documenter-light.css" data-theme-name="documenter-light" data-theme-primary/><script src="../../assets/themeswap.js"></script></head><body><div id="documenter"><nav class="docs-sidebar"><div class="docs-package-name"><span class="docs-autofit"><a href="../../">Nitro.jl</a></span></div><button class="docs-search-query input is-rounded is-small is-clickable my-2 mx-auto py-1 px-2" id="documenter-search-query">Search docs (Ctrl + /)</button><ul class="docs-menu"><li><a class="tocitem" href="../../">Overview</a></li><li><a class="tocitem" href="../../api/">API</a></li><li><a class="tocitem" href="../../upgrading/">Upgrading Nitro</a></li><li><span class="tocitem">Manual</span><ul><li><a class="tocitem" href="../first_steps/">-</a></li><li><a class="tocitem" href="../bi_app_config/">BI App Config Example</a></li><li><a class="tocitem" href="../hot_reload/">Development Hot Reload</a></li><li><a class="tocitem" href="../workers/">Workers</a></li><li><a class="tocitem" href="../request_types/">-</a></li><li><a class="tocitem" href="../path_parameters/">-</a></li><li><a class="tocitem" href="../query_parameters/">Query Parameters</a></li><li><a class="tocitem" href="../request_body/">-</a></li><li><a class="tocitem" href="../file_uploads/">File Uploads</a></li><li><a class="tocitem" href="../secrets/">Managing Secrets</a></li><li><a class="tocitem" href="../reverse_proxy/">Behind a Reverse Proxy</a></li><li><a class="tocitem" href="../authentication/">Authentication</a></li><li><a class="tocitem" href="../sessions_and_auth/">Sessions and Auth</a></li><li><a class="tocitem" href="../passwords/">Password Hashing</a></li><li><input class="collapse-toggle" id="menuitem-4-15" type="checkbox"/><label class="tocitem" for="menuitem-4-15"><span class="docs-label">Cookies and Sessions</span><i class="docs-chevron"></i></label><ul class="collapsed"><li><a class="tocitem" href="../cookies/basics/">-</a></li><li><a class="tocitem" href="../cookies/configuration/">-</a></li><li><a class="tocitem" href="../cookies/security/">-</a></li><li><a class="tocitem" href="../cookies/sessions/">-</a></li></ul></li><li><a class="tocitem" href="../cron_scheduling/">-</a></li><li class="is-active"><a class="tocitem" href>-</a><ul class="internal"><li><a class="tocitem" href="#Recommended-project-layout"><span>Recommended project layout</span></a></li><li><a class="tocitem" href="#Setting-up-PormG-models"><span>Setting up PormG models</span></a></li><li><a class="tocitem" href="#Defining-handlers"><span>Defining handlers</span></a></li><li><a class="tocitem" href="#Declaring-routes"><span>Declaring routes</span></a></li><li><a class="tocitem" href="#Splitting-routes-across-files-with-include_routes"><span>Splitting routes across files with <code>include_routes</code></span></a></li><li><a class="tocitem" href="#Wiring-everything-in-main.jl"><span>Wiring everything in <code>main.jl</code></span></a></li><li><a class="tocitem" href="#Middleware-layers"><span>Middleware layers</span></a></li><li><a class="tocitem" href="#Internal-requests"><span>Internal requests</span></a></li></ul></li><li><a class="tocitem" href="../oauth2/">OAuth2 with Umbrella.jl</a></li></ul></li></ul><div class="docs-version-selector field has-addons"><div class="control"><span class="docs-label button is-static is-size-7">Version</span></div><div class="docs-selector control is-expanded"><div class="select is-fullwidth is-size-7"><select id="documenter-version-selector"></select></div></div></div></nav><div class="docs-main"><header class="docs-navbar"><a class="docs-sidebar-button docs-navbar-link fa-solid fa-bars is-hidden-desktop" id="documenter-sidebar-button" href="#"></a><nav class="breadcrumb"><ul class="is-hidden-mobile"><li><a class="is-disabled">Manual</a></li><li class="is-active"><a href>-</a></li></ul><ul class="is-hidden-tablet"><li class="is-active"><a href>-</a></li></ul></nav><div class="docs-right"><a class="docs-navbar-link" href="https://github.com/PingoLee/Nitro.jl" title="View the repository on GitHub"><span class="docs-icon fa-brands"></span><span class="docs-label is-hidden-touch">GitHub</span></a><a class="docs-navbar-link" href="https://github.com/PingoLee/Nitro.jl/blob/main/docs/src/tutorial/bigger_applications.md" title="Edit source on GitHub"><span class="docs-icon fa-solid"></span></a><a class="docs-settings-button docs-navbar-link fa-solid fa-gear" id="documenter-settings-button" href="#" title="Settings"></a><a class="docs-article-toggle-button fa-solid fa-chevron-up" id="documenter-article-toggle-button" href="javascript:;" title="Collapse all docstrings"></a></div></header><article class="content" id="documenter-page"><p>﻿# Bigger Applications — Multiple Files</p><p>As your application grows you will spread logic across many files. Nitro uses the same <strong>Handlers / Routes</strong> separation that Django popularised: view-logic lives in handler modules, URL declarations live in a single routes file.</p><h2 id="Recommended-project-layout"><a class="docs-heading-anchor" href="#Recommended-project-layout">Recommended project layout</a><a id="Recommended-project-layout-1"></a><a class="docs-heading-anchor-permalink" href="#Recommended-project-layout" title="Permalink"></a></h2><pre><code class="nohighlight hljs">app/
+├── Project.toml
+├── Manifest.toml
+├── db/
+│   └── automatic_models.jl   # generated by PormG
+└── src/
+    ├── App.jl           # top-level module: loads PormG, includes everything
+    ├── Routes.jl        # all path() declarations
+    └── Handlers/
+        ├── ProductHandlers.jl
+        └── OrderHandlers.jl</code></pre><p>The <code>src/</code> tree is a Julia module. <code>App.jl</code> is the entry-point: it loads PormG, imports the generated model module, includes all handlers and routes, then calls <code>serve()</code>.</p><hr/><h2 id="Setting-up-PormG-models"><a class="docs-heading-anchor" href="#Setting-up-PormG-models">Setting up PormG models</a><a id="Setting-up-PormG-models-1"></a><a class="docs-heading-anchor-permalink" href="#Setting-up-PormG-models" title="Permalink"></a></h2><p>PormG models are generated from your database schema and stored outside <code>src/</code> (e.g. <code>db/</code>). Load them in the top-level module with <code>@import_models</code>, which creates a plain Julia module you can alias and pass down to handlers via <code>import</code>.</p><pre><code class="language-julia hljs"># src/App.jl
+module App
+
+using Nitro
+using HTTP
+using PormG
+
+# Point PormG at your database config directory
+PormG.Configuration.load_many([&quot;db&quot;])
+
+# Import the generated model file — creates a module named `automatic_models`
+PormG.@import_models &quot;../db/automatic_models.jl&quot; automatic_models
+
+# Alias for convenience: handlers do `import ..appM`
+const appM = automatic_models
+
+include(&quot;Handlers/ProductHandlers.jl&quot;)
+include(&quot;Handlers/OrderHandlers.jl&quot;)
+include(&quot;Routes.jl&quot;)
+
+using .Routes
+
+end # module</code></pre><p>Handlers import the alias and use <code>appM.Product.objects</code> for queries:</p><pre><code class="language-julia hljs"># src/Handlers/ProductHandlers.jl
+module ProductHandlers
+
+using HTTP
+using Nitro
+using PormG
+import ..appM   # the alias defined in App.jl
+
+export list_products, get_product
+
+function list_products(req::HTTP.Request)
+    query = appM.Product.objects
+    return Res.json(list(query))
+end
+
+function get_product(req::HTTP.Request, id::Int)
+    query = appM.Product.objects
+    query.filter(&quot;id&quot; =&gt; id)
+    result = list(query)
+    isempty(result) &amp;&amp; return Res.status(404, &quot;not found&quot;)
+    return Res.json(first(result))
+end
+
+end # module</code></pre><hr/><h2 id="Defining-handlers"><a class="docs-heading-anchor" href="#Defining-handlers">Defining handlers</a><a id="Defining-handlers-1"></a><a class="docs-heading-anchor-permalink" href="#Defining-handlers" title="Permalink"></a></h2><p>Handler functions live in plain Julia modules — one file per domain area.</p><pre><code class="language-julia hljs"># src/Handlers/MathHandlers.jl
+module MathHandlers
+
+using HTTP
+using Nitro
+
+export multiply, divide
+
+function multiply(req::HTTP.Request, a::Float64, b::Float64)
+    return Res.json(a * b)
+end
+
+function divide(req::HTTP.Request, a::Float64, b::Float64)
+    a == 0 &amp;&amp; return Res.status(400, &quot;divisor cannot be zero&quot;)
+    return Res.json(a / b)
+end
+
+end # module</code></pre><hr/><h2 id="Declaring-routes"><a class="docs-heading-anchor" href="#Declaring-routes">Declaring routes</a><a id="Declaring-routes-1"></a><a class="docs-heading-anchor-permalink" href="#Declaring-routes" title="Permalink"></a></h2><p>All <code>path()</code> calls are collected in <code>Routes.jl</code>.  This is the only place that wires handler functions to URL patterns.</p><pre><code class="language-julia hljs"># src/Routes.jl
+using Nitro
+import .MathHandlers
+import .ProductHandlers
+
+const urlpatterns = [
+    path(&quot;/api/math/multiply/&lt;float:a&gt;/&lt;float:b&gt;&quot;, MathHandlers.multiply, method=&quot;GET&quot;),
+    path(&quot;/api/math/divide/&lt;float:a&gt;/&lt;float:b&gt;&quot;,   MathHandlers.divide,   method=&quot;GET&quot;),
+
+    path(&quot;/api/products&quot;,               ProductHandlers.list_products,  method=&quot;GET&quot;),
+    path(&quot;/api/products/&lt;int:id&gt;&quot;,      ProductHandlers.get_product,    method=&quot;GET&quot;),
+    path(&quot;/api/products&quot;,               ProductHandlers.create_product, method=&quot;POST&quot;),
+]</code></pre><hr/><h2 id="Splitting-routes-across-files-with-include_routes"><a class="docs-heading-anchor" href="#Splitting-routes-across-files-with-include_routes">Splitting routes across files with <code>include_routes</code></a><a id="Splitting-routes-across-files-with-include_routes-1"></a><a class="docs-heading-anchor-permalink" href="#Splitting-routes-across-files-with-include_routes" title="Permalink"></a></h2><p>For larger apps, split <code>urlpatterns</code> into per-domain files and compose them with <code>include_routes</code>.</p><pre><code class="nohighlight hljs">src/
+└── Routes/
+    ├── math_routes.jl
+    └── product_routes.jl</code></pre><pre><code class="language-julia hljs"># src/Routes/math_routes.jl
+using Nitro
+import ..MathHandlers
+
+const math_routes = [
+    path(&quot;/multiply/&lt;float:a&gt;/&lt;float:b&gt;&quot;, MathHandlers.multiply, method=&quot;GET&quot;),
+    path(&quot;/divide/&lt;float:a&gt;/&lt;float:b&gt;&quot;,   MathHandlers.divide,   method=&quot;GET&quot;),
+]</code></pre><pre><code class="language-julia hljs"># src/Routes.jl
+using Nitro
+include(&quot;Routes/math_routes.jl&quot;)
+include(&quot;Routes/product_routes.jl&quot;)
+
+const urlpatterns = [
+    include_routes(&quot;/api/math&quot;,    math_routes),
+    include_routes(&quot;/api/products&quot;, product_routes),
+]</code></pre><p>The prefix passed to <code>include_routes</code> is prepended to every path in the included list, so <code>/multiply/&lt;float:a&gt;/&lt;float:b&gt;</code> becomes <code>/api/math/multiply/&lt;float:a&gt;/&lt;float:b&gt;</code>.</p><hr/><h2 id="Wiring-everything-in-main.jl"><a class="docs-heading-anchor" href="#Wiring-everything-in-main.jl">Wiring everything in <code>main.jl</code></a><a id="Wiring-everything-in-main.jl-1"></a><a class="docs-heading-anchor-permalink" href="#Wiring-everything-in-main.jl" title="Permalink"></a></h2><pre><code class="language-julia hljs"># src/App.jl  (or main.jl for simpler projects)
+using Nitro
+
+include(&quot;Handlers/ProductHandlers.jl&quot;)
+include(&quot;Handlers/OrderHandlers.jl&quot;)
+include(&quot;Routes.jl&quot;)
+
+serve(urlpatterns, middleware=[SessionMiddleware, RateLimiter])</code></pre><p><code>serve()</code> accepts the <code>urlpatterns</code> vector and any global middleware. Global middleware runs before every route, regardless of which handler it targets.</p><hr/><h2 id="Middleware-layers"><a class="docs-heading-anchor" href="#Middleware-layers">Middleware layers</a><a id="Middleware-layers-1"></a><a class="docs-heading-anchor-permalink" href="#Middleware-layers" title="Permalink"></a></h2><p>Nitro supports middleware at two levels: <strong>global</strong> (via <code>serve()</code>) and <strong>route-level</strong> (via the <code>middleware=</code> keyword on <code>path()</code>).</p><p>Execution order is always:</p><pre><code class="nohighlight hljs">global middleware → route middleware → handler</code></pre><h3 id="Global-middleware"><a class="docs-heading-anchor" href="#Global-middleware">Global middleware</a><a id="Global-middleware-1"></a><a class="docs-heading-anchor-permalink" href="#Global-middleware" title="Permalink"></a></h3><pre><code class="language-julia hljs">serve(urlpatterns, middleware=[SessionMiddleware, RateLimiter])</code></pre><h3 id="Route-level-middleware"><a class="docs-heading-anchor" href="#Route-level-middleware">Route-level middleware</a><a id="Route-level-middleware-1"></a><a class="docs-heading-anchor-permalink" href="#Route-level-middleware" title="Permalink"></a></h3><p>Apply middleware to individual routes by passing a <code>middleware=</code> vector to <code>path()</code>.</p><pre><code class="language-julia hljs">const urlpatterns = [
+    # public — no extra middleware
+    path(&quot;/api/products&quot;, ProductHandlers.list_products, method=&quot;GET&quot;),
+
+    # protected — requires authentication. Guards reach a route through `GuardMiddleware`;
+    # they are not middleware themselves.
+    path(&quot;/api/products&quot;, ProductHandlers.create_product,
+         method=&quot;POST&quot;, middleware=[GuardMiddleware(login_required())]),
+
+    path(&quot;/api/products/&lt;int:id&gt;&quot;, ProductHandlers.delete_product,
+         method=&quot;DELETE&quot;,
+         middleware=[GuardMiddleware(login_required(), role_required(&quot;admin&quot;))]),
+]</code></pre><h3 id="Per-route-middleware-and-global-middleware"><a class="docs-heading-anchor" href="#Per-route-middleware-and-global-middleware">Per-route middleware and global middleware</a><a id="Per-route-middleware-and-global-middleware-1"></a><a class="docs-heading-anchor-permalink" href="#Per-route-middleware-and-global-middleware" title="Permalink"></a></h3><p>Global middleware — the <code>middleware=[...]</code> you pass to <a href="../../api/#Nitro.serve"><code>serve</code></a> — runs on <strong>every</strong> request, including requests that match no route (404) and requests whose path matches but whose method does not (405).  A route cannot opt out of it.</p><p>Passing <code>middleware=[]</code> on a <code>path()</code> call means &quot;this route adds no middleware of its own&quot;. It does <strong>not</strong> bypass the global chain:</p><pre><code class="language-julia hljs"># Global middleware still runs here — `middleware=[]` only means &quot;no *extra* middleware&quot;,
+# which is the same as omitting the kwarg. Prefer omitting it.
+path(&quot;/health&quot;, HealthHandlers.ping, method=&quot;GET&quot;)</code></pre><p>If a health-check endpoint must respond even when a dependency the global middleware needs is unavailable, make that middleware tolerate the failure — for example by skipping its work for specific paths — rather than expecting the route to escape it.</p><hr/><h2 id="Internal-requests"><a class="docs-heading-anchor" href="#Internal-requests">Internal requests</a><a id="Internal-requests-1"></a><a class="docs-heading-anchor-permalink" href="#Internal-requests" title="Permalink"></a></h2><p>Use <code>internalrequest</code> to call one of your own endpoints from within another handler — for example, to reuse validation logic or chain computations:</p><pre><code class="language-julia hljs">using HTTP
+
+function process_and_fetch(req::HTTP.Request, id::Int)
+    # call another endpoint inside the same server
+    inner = internalrequest(HTTP.Request(&quot;GET&quot;, &quot;/api/products/$id&quot;))
+    data  = JSON3.read(inner.body)
+    # ... further processing
+    return Res.json(data)
+end</code></pre></article><nav class="docs-footer"><a class="docs-footer-prevpage" href="../cron_scheduling/">« -</a><a class="docs-footer-nextpage" href="../oauth2/">OAuth2 with Umbrella.jl »</a><div class="flexbox-break"></div><p class="footer-message">Powered by <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> and the <a href="https://julialang.org/">Julia Programming Language</a>.</p></nav></div><div class="modal" id="documenter-settings"><div class="modal-background"></div><div class="modal-card"><header class="modal-card-head"><p class="modal-card-title">Settings</p><button class="delete"></button></header><section class="modal-card-body"><p><label class="label">Theme</label><div class="select"><select id="documenter-themepicker"><option value="auto">Automatic (OS)</option><option value="documenter-light">documenter-light</option><option value="documenter-dark">documenter-dark</option><option value="catppuccin-latte">catppuccin-latte</option><option value="catppuccin-frappe">catppuccin-frappe</option><option value="catppuccin-macchiato">catppuccin-macchiato</option><option value="catppuccin-mocha">catppuccin-mocha</option></select></div></p><hr/><p>This document was generated with <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> version 1.19.0 on <span class="colophon-date" title="Sunday 6 September 2026 17:18">Sunday 6 September 2026</span>. Using Julia version 1.12.7.</p></section><footer class="modal-card-foot"></footer></div></div></div></body></html>

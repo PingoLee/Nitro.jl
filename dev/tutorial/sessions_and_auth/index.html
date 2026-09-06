@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/><title>Sessions and Auth · Nitro.jl</title><meta name="title" content="Sessions and Auth · Nitro.jl"/><meta property="og:title" content="Sessions and Auth · Nitro.jl"/><meta property="twitter:title" content="Sessions and Auth · Nitro.jl"/><meta name="description" content="Documentation for Nitro.jl."/><meta property="og:description" content="Documentation for Nitro.jl."/><meta property="twitter:description" content="Documentation for Nitro.jl."/><script data-outdated-warner src="../../assets/warner.js"></script><link href="https://cdnjs.cloudflare.com/ajax/libs/lato-font/3.0.0/css/lato-font.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/juliamono/0.63.2/juliamono.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/fontawesome.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/solid.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/brands.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.8/katex.min.css" rel="stylesheet" type="text/css"/><script>documenterBaseURL="../.."</script><script src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.6/require.min.js" data-main="../../assets/documenter.js"></script><script src="../../search_index.js"></script><script src="../../siteinfo.js"></script><script src="../../../versions.js"></script><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/catppuccin-mocha.css" data-theme-name="catppuccin-mocha"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/catppuccin-macchiato.css" data-theme-name="catppuccin-macchiato"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/catppuccin-frappe.css" data-theme-name="catppuccin-frappe"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/catppuccin-latte.css" data-theme-name="catppuccin-latte"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/documenter-dark.css" data-theme-name="documenter-dark" data-theme-primary-dark/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/documenter-light.css" data-theme-name="documenter-light" data-theme-primary/><script src="../../assets/themeswap.js"></script></head><body><div id="documenter"><nav class="docs-sidebar"><div class="docs-package-name"><span class="docs-autofit"><a href="../../">Nitro.jl</a></span></div><button class="docs-search-query input is-rounded is-small is-clickable my-2 mx-auto py-1 px-2" id="documenter-search-query">Search docs (Ctrl + /)</button><ul class="docs-menu"><li><a class="tocitem" href="../../">Overview</a></li><li><a class="tocitem" href="../../api/">API</a></li><li><a class="tocitem" href="../../upgrading/">Upgrading Nitro</a></li><li><span class="tocitem">Manual</span><ul><li><a class="tocitem" href="../first_steps/">-</a></li><li><a class="tocitem" href="../bi_app_config/">BI App Config Example</a></li><li><a class="tocitem" href="../hot_reload/">Development Hot Reload</a></li><li><a class="tocitem" href="../workers/">Workers</a></li><li><a class="tocitem" href="../request_types/">-</a></li><li><a class="tocitem" href="../path_parameters/">-</a></li><li><a class="tocitem" href="../query_parameters/">Query Parameters</a></li><li><a class="tocitem" href="../request_body/">-</a></li><li><a class="tocitem" href="../file_uploads/">File Uploads</a></li><li><a class="tocitem" href="../secrets/">Managing Secrets</a></li><li><a class="tocitem" href="../reverse_proxy/">Behind a Reverse Proxy</a></li><li><a class="tocitem" href="../authentication/">Authentication</a></li><li class="is-active"><a class="tocitem" href>Sessions and Auth</a><ul class="internal"><li><a class="tocitem" href="#Quick-Start"><span>Quick Start</span></a></li><li><a class="tocitem" href="#Session-Stores"><span>Session Stores</span></a></li><li><a class="tocitem" href="#Using-req.session-—-Django-style"><span>Using <code>req.session</code> — Django-style</span></a></li><li><a class="tocitem" href="#Session-Regeneration"><span>Session Regeneration</span></a></li><li><a class="tocitem" href="#Unified-Auth-Context"><span>Unified Auth Context</span></a></li><li><a class="tocitem" href="#JWT-Helpers"><span>JWT Helpers</span></a></li><li><a class="tocitem" href="#Service-and-Capability-Tokens"><span>Service and Capability Tokens</span></a></li><li><a class="tocitem" href="#Auth-Cookies-and-CSRF"><span>Auth Cookies and CSRF</span></a></li></ul></li><li><a class="tocitem" href="../passwords/">Password Hashing</a></li><li><input class="collapse-toggle" id="menuitem-4-15" type="checkbox"/><label class="tocitem" for="menuitem-4-15"><span class="docs-label">Cookies and Sessions</span><i class="docs-chevron"></i></label><ul class="collapsed"><li><a class="tocitem" href="../cookies/basics/">-</a></li><li><a class="tocitem" href="../cookies/configuration/">-</a></li><li><a class="tocitem" href="../cookies/security/">-</a></li><li><a class="tocitem" href="../cookies/sessions/">-</a></li></ul></li><li><a class="tocitem" href="../cron_scheduling/">-</a></li><li><a class="tocitem" href="../bigger_applications/">-</a></li><li><a class="tocitem" href="../oauth2/">OAuth2 with Umbrella.jl</a></li></ul></li></ul><div class="docs-version-selector field has-addons"><div class="control"><span class="docs-label button is-static is-size-7">Version</span></div><div class="docs-selector control is-expanded"><div class="select is-fullwidth is-size-7"><select id="documenter-version-selector"></select></div></div></div></nav><div class="docs-main"><header class="docs-navbar"><a class="docs-sidebar-button docs-navbar-link fa-solid fa-bars is-hidden-desktop" id="documenter-sidebar-button" href="#"></a><nav class="breadcrumb"><ul class="is-hidden-mobile"><li><a class="is-disabled">Manual</a></li><li class="is-active"><a href>Sessions and Auth</a></li></ul><ul class="is-hidden-tablet"><li class="is-active"><a href>Sessions and Auth</a></li></ul></nav><div class="docs-right"><a class="docs-navbar-link" href="https://github.com/PingoLee/Nitro.jl" title="View the repository on GitHub"><span class="docs-icon fa-brands"></span><span class="docs-label is-hidden-touch">GitHub</span></a><a class="docs-navbar-link" href="https://github.com/PingoLee/Nitro.jl/blob/main/docs/src/tutorial/sessions_and_auth.md" title="Edit source on GitHub"><span class="docs-icon fa-solid"></span></a><a class="docs-settings-button docs-navbar-link fa-solid fa-gear" id="documenter-settings-button" href="#" title="Settings"></a><a class="docs-article-toggle-button fa-solid fa-chevron-up" id="documenter-article-toggle-button" href="javascript:;" title="Collapse all docstrings"></a></div></header><article class="content" id="documenter-page"><h1 id="Sessions-and-Auth"><a class="docs-heading-anchor" href="#Sessions-and-Auth">Sessions and Auth</a><a id="Sessions-and-Auth-1"></a><a class="docs-heading-anchor-permalink" href="#Sessions-and-Auth" title="Permalink"></a></h1><p>Nitro treats session storage and authenticated user resolution as separate concerns.</p><ul><li><code>SessionMiddleware</code> manages server-side session state via <code>req.session</code>.</li><li><code>BearerAuth</code> extracts credentials and attaches the authenticated principal.</li><li>Guards read <code>req.user</code>, so they work the same way for session-backed and JWT-backed routes.</li></ul><h2 id="Quick-Start"><a class="docs-heading-anchor" href="#Quick-Start">Quick Start</a><a id="Quick-Start-1"></a><a class="docs-heading-anchor-permalink" href="#Quick-Start" title="Permalink"></a></h2><pre><code class="language-julia hljs">using Nitro
+using PormG
+
+# 1. Configure PormG
+PormG.Configuration.load(&quot;db&quot;)
+PormG.@import_models &quot;db/models.jl&quot; models
+import .models as M
+
+# 2. One-call database session setup (creates table if needed)
+store = pormg_nitro_session(db_key=&quot;db&quot;)
+
+# 3. Define handlers
+function login_handler(req::HTTP.Request)
+    payload = req.json
+    username = get(payload, &quot;username&quot;, &quot;&quot;)
+    password = get(payload, &quot;password&quot;, &quot;&quot;)
+
+    user = M.User.objects.filter(&quot;username&quot; =&gt; username).first()
+    if isnothing(user) || !check_password(password, user[:password])
+        return Res.json(Dict(&quot;error&quot; =&gt; &quot;Invalid credentials&quot;); status=401)
+    end
+
+    # Store data in the session — like Django&#39;s request.session
+    req.session[&quot;user_id&quot;]  = user[:id]
+    req.session[&quot;username&quot;] = user[:username]
+    req.session[&quot;role&quot;]     = user[:is_staff] ? &quot;staff&quot; : &quot;user&quot;
+
+    # Rotate the session ID after authentication to prevent fixation.
+    regenerate_session!(req, store; ttl=3600)
+
+    return Res.json(Dict(&quot;message&quot; =&gt; &quot;Welcome $(user[:username])!&quot;))
+end
+
+function me_handler(req::HTTP.Request)
+    user_id = get(req.session, &quot;user_id&quot;, nothing)
+    if isnothing(user_id)
+        return Res.json(Dict(&quot;error&quot; =&gt; &quot;Not authenticated&quot;); status=401)
+    end
+    return Res.json(Dict(
+        &quot;user_id&quot;  =&gt; user_id,
+        &quot;username&quot; =&gt; req.session[&quot;username&quot;],
+        &quot;role&quot;     =&gt; req.session[&quot;role&quot;],
+    ))
+end
+
+function logout_handler(req::HTTP.Request)
+    empty!(req.session)
+    regenerate_session!(req, store; ttl=3600)
+    return Res.json(Dict(&quot;message&quot; =&gt; &quot;Logged out&quot;))
+end
+
+# 4. Routes
+urlpatterns(&quot;/api&quot;,
+    path(&quot;/login&quot;,  login_handler,  method=&quot;POST&quot;),
+    path(&quot;/me&quot;,     me_handler,     method=&quot;GET&quot;),
+    path(&quot;/logout&quot;, logout_handler, method=&quot;POST&quot;),
+)
+
+# 5. Serve
+serve(urlpatterns, middleware=[
+    SessionMiddleware(store=store, cookie_name=&quot;nitro_sess&quot;, secure=false, samesite=&quot;Lax&quot;),
+])</code></pre><p>The <code>secure=false</code> example is for local HTTP development only. Keep <code>secure=true</code> in production.</p><p>With the default <code>rotate_on_auth=true</code> and <code>auth_key=&quot;user_id&quot;</code>, <code>SessionMiddleware</code> also rotates an existing session automatically when <code>req.session[&quot;user_id&quot;]</code> is added, removed, or changed. Keep <code>regenerate_session!</code> in login/logout flows when you want the rotation to happen immediately inside the handler or when your authenticated principal uses a different session key.</p><h2 id="Session-Stores"><a class="docs-heading-anchor" href="#Session-Stores">Session Stores</a><a id="Session-Stores-1"></a><a class="docs-heading-anchor-permalink" href="#Session-Stores" title="Permalink"></a></h2><h3 id="In-Memory-(development)"><a class="docs-heading-anchor" href="#In-Memory-(development)">In-Memory (development)</a><a id="In-Memory-(development)-1"></a><a class="docs-heading-anchor-permalink" href="#In-Memory-(development)" title="Permalink"></a></h3><p>The built-in <code>MemoryStore</code> keeps sessions in a process-local dictionary. Sessions are lost on restart.</p><pre><code class="language-julia hljs">store = MemoryStore{String, Dict{String,Any}}()
+
+serve(middleware=[
+    SessionMiddleware(store=store, secure=false),
+])</code></pre><h3 id="PormG-Backed-(production)"><a class="docs-heading-anchor" href="#PormG-Backed-(production)">PormG-Backed (production)</a><a id="PormG-Backed-(production)-1"></a><a class="docs-heading-anchor-permalink" href="#PormG-Backed-(production)" title="Permalink"></a></h3><p><code>pormg_nitro_session()</code> creates the <code>nitro_session</code> table with <code>IF NOT EXISTS</code>, sets up the expiry index, and returns a ready-to-use store.</p><pre><code class="language-julia hljs">using Nitro, PormG
+
+PormG.Configuration.load(&quot;db&quot;)
+
+store = pormg_nitro_session(db_key=&quot;db&quot;)
+
+serve(middleware=[
+    SessionMiddleware(store=store, max_age=3600, secure=true),
+])</code></pre><p>Sessions are stored as JSON in the database with a fixed-point expiry timestamp (no sliding expiry). Works with any PormG-supported backend (SQLite, PostgreSQL).</p><h3 id="Custom-Stores"><a class="docs-heading-anchor" href="#Custom-Stores">Custom Stores</a><a id="Custom-Stores-1"></a><a class="docs-heading-anchor-permalink" href="#Custom-Stores" title="Permalink"></a></h3><p>Implement these four methods for your store type <code>S &lt;: AbstractSessionStore{String, Dict{String,Any}}</code>:</p><pre><code class="language-julia hljs">Base.get(store::S, session_id::String, default)       # → SessionPayload or default
+set_session!(store::S, session_id::String, data; ttl)  # → persist data with TTL
+delete_session!(store::S, session_id::String)           # → remove a session
+cleanup_expired_sessions!(store::S)                     # → prune expired entries</code></pre><h2 id="Using-req.session-—-Django-style"><a class="docs-heading-anchor" href="#Using-req.session-—-Django-style">Using <code>req.session</code> — Django-style</a><a id="Using-req.session-—-Django-style-1"></a><a class="docs-heading-anchor-permalink" href="#Using-req.session-—-Django-style" title="Permalink"></a></h2><p><code>req.session</code> is a <code>Dict{String, Any}</code> injected by <code>SessionMiddleware</code>. It works exactly like Django&#39;s <code>request.session</code>:</p><table><tr><th style="text-align: right">Django (Python)</th><th style="text-align: right">Nitro (Julia)</th></tr><tr><td style="text-align: right"><code>request.session[&quot;user_id&quot;] = 42</code></td><td style="text-align: right"><code>req.session[&quot;user_id&quot;] = 42</code></td></tr><tr><td style="text-align: right"><code>request.session.get(&quot;role&quot;, &quot;guest&quot;)</code></td><td style="text-align: right"><code>get(req.session, &quot;role&quot;, &quot;guest&quot;)</code></td></tr><tr><td style="text-align: right"><code>del request.session[&quot;cart&quot;]</code></td><td style="text-align: right"><code>delete!(req.session, &quot;cart&quot;)</code></td></tr><tr><td style="text-align: right"><code>request.session.flush()</code></td><td style="text-align: right"><code>empty!(req.session); regenerate_session!(req, store; ttl=3600)</code></td></tr><tr><td style="text-align: right"><code>&quot;user_id&quot; in request.session</code></td><td style="text-align: right"><code>haskey(req.session, &quot;user_id&quot;)</code></td></tr></table><p>Changes are automatically detected and persisted at the end of the request. You do not need to call a save method.</p><p><code>empty!(req.session)</code> only clears the current payload. For the default <code>user_id</code>-based flow, <code>SessionMiddleware</code> now rotates an existing session automatically when auth state changes. Call <code>regenerate_session!</code> explicitly if you want that rotation to happen immediately in the current handler or if your authenticated principal uses a different session key.</p><h3 id="Store-data"><a class="docs-heading-anchor" href="#Store-data">Store data</a><a id="Store-data-1"></a><a class="docs-heading-anchor-permalink" href="#Store-data" title="Permalink"></a></h3><pre><code class="language-julia hljs">function login_handler(req::HTTP.Request)
+    # ... validate credentials ...
+    req.session[&quot;user_id&quot;]   = user[:id]
+    req.session[&quot;username&quot;]  = user[:username]
+    req.session[&quot;logged_in&quot;] = string(Dates.now())
+    return Res.json(Dict(&quot;status&quot; =&gt; &quot;ok&quot;))
+end</code></pre><h3 id="Read-data"><a class="docs-heading-anchor" href="#Read-data">Read data</a><a id="Read-data-1"></a><a class="docs-heading-anchor-permalink" href="#Read-data" title="Permalink"></a></h3><pre><code class="language-julia hljs">function dashboard_handler(req::HTTP.Request)
+    user_id = get(req.session, &quot;user_id&quot;, nothing)
+    if isnothing(user_id)
+        return Res.json(Dict(&quot;error&quot; =&gt; &quot;Login required&quot;); status=401)
+    end
+    return Res.json(Dict(&quot;user_id&quot; =&gt; user_id))
+end</code></pre><h3 id="Update-/-append-data"><a class="docs-heading-anchor" href="#Update-/-append-data">Update / append data</a><a id="Update-/-append-data-1"></a><a class="docs-heading-anchor-permalink" href="#Update-/-append-data" title="Permalink"></a></h3><p>Because <code>req.session</code> is a plain <code>Dict{String, Any}</code>, you update or append with the same Julia idioms you would use on any dictionary.</p><p><strong>Overwrite a key:</strong></p><pre><code class="language-julia hljs">function update_role_handler(req::HTTP.Request)
+    req.session[&quot;role&quot;] = &quot;admin&quot;       # replaces previous value
+    return Res.json(Dict(&quot;status&quot; =&gt; &quot;role updated&quot;))
+end</code></pre><p><strong>Append to a list stored in the session:</strong></p><pre><code class="language-julia hljs">function add_to_cart_handler(req::HTTP.Request, product_id::Int)
+    cart = get(req.session, &quot;cart&quot;, Int[])   # default to empty list
+    push!(cart, product_id)
+    req.session[&quot;cart&quot;] = cart               # write back
+    return Res.json(Dict(&quot;cart&quot; =&gt; cart))
+end</code></pre><p><strong>Merge a sub-dict (bulk update):</strong></p><pre><code class="language-julia hljs">function update_prefs_handler(req::HTTP.Request)
+    patch = req.json                         # e.g. Dict(&quot;theme&quot; =&gt; &quot;dark&quot;)
+    prefs = get(req.session, &quot;prefs&quot;, Dict{String,Any}())
+    merge!(prefs, patch)
+    req.session[&quot;prefs&quot;] = prefs
+    return Res.json(Dict(&quot;prefs&quot; =&gt; prefs))
+end</code></pre><p>All changes are automatically persisted at the end of the request by <code>SessionMiddleware</code>.</p><h3 id="Delete-keys"><a class="docs-heading-anchor" href="#Delete-keys">Delete keys</a><a id="Delete-keys-1"></a><a class="docs-heading-anchor-permalink" href="#Delete-keys" title="Permalink"></a></h3><pre><code class="language-julia hljs">function remove_cart_handler(req::HTTP.Request)
+    delete!(req.session, &quot;cart&quot;)
+    return Res.json(Dict(&quot;status&quot; =&gt; &quot;cart cleared&quot;))
+end</code></pre><h3 id="Flush-/-logout"><a class="docs-heading-anchor" href="#Flush-/-logout">Flush / logout</a><a id="Flush-/-logout-1"></a><a class="docs-heading-anchor-permalink" href="#Flush-/-logout" title="Permalink"></a></h3><pre><code class="language-julia hljs">function logout_handler(req::HTTP.Request)
+    empty!(req.session)
+    regenerate_session!(req, store; ttl=3600)
+    return Res.json(Dict(&quot;message&quot; =&gt; &quot;Logged out&quot;))
+end</code></pre><p>This invalidates the previous authenticated session on the server side and writes a fresh anonymous session cookie on the response.</p><h2 id="Session-Regeneration"><a class="docs-heading-anchor" href="#Session-Regeneration">Session Regeneration</a><a id="Session-Regeneration-1"></a><a class="docs-heading-anchor-permalink" href="#Session-Regeneration" title="Permalink"></a></h2><p>After login or any privilege change, regenerate the session ID to prevent session-fixation attacks:</p><pre><code class="language-julia hljs">function login_handler(req::HTTP.Request)
+    # ... validate credentials ...
+    req.session[&quot;user_id&quot;] = user[:id]
+
+    # Cycle the session ID — works with any store backend.
+    regenerate_session!(req, store; ttl=3600)
+
+    return Res.json(Dict(&quot;status&quot; =&gt; &quot;ok&quot;))
+end</code></pre><p><code>regenerate_session!</code> copies the current session data to a new ID, deletes the old session, and updates the request context so <code>SessionMiddleware</code> writes the new cookie automatically. In practice, use the same <code>ttl</code> you want for the rotated session.</p><p>If you keep the default <code>auth_key=&quot;user_id&quot;</code>, <code>SessionMiddleware</code> also performs this rotation automatically for existing sessions whose auth state changes during the request. Use explicit <code>regenerate_session!</code> calls for custom auth keys or for flows where you want the rotation to happen before the handler finishes.</p><h2 id="Unified-Auth-Context"><a class="docs-heading-anchor" href="#Unified-Auth-Context">Unified Auth Context</a><a id="Unified-Auth-Context-1"></a><a class="docs-heading-anchor-permalink" href="#Unified-Auth-Context" title="Permalink"></a></h2><p><code>SessionMiddleware</code> manages state (<code>req.session</code>) but does not automatically populate <code>req.user</code>. Write a small middleware to bridge them:</p><pre><code class="language-julia hljs">function SessionAuthMiddleware(handle)
+    return function(req::HTTP.Request)
+        session = req.session
+        if !isnothing(session) &amp;&amp; haskey(session, &quot;user_id&quot;)
+            req.context[:user] = Dict(
+                &quot;id&quot;   =&gt; session[&quot;user_id&quot;],
+                &quot;role&quot; =&gt; get(session, &quot;role&quot;, &quot;user&quot;),
+            )
+        end
+        return handle(req)
+    end
+end
+
+urlpatterns(&quot;&quot;,
+    path(&quot;/dashboard&quot;, dashboard, method=&quot;GET&quot;, middleware=[
+        SessionAuthMiddleware,
+        GuardMiddleware(login_required()),
+    ]),
+)</code></pre><h2 id="JWT-Helpers"><a class="docs-heading-anchor" href="#JWT-Helpers">JWT Helpers</a><a id="JWT-Helpers-1"></a><a class="docs-heading-anchor-permalink" href="#JWT-Helpers" title="Permalink"></a></h2><p><code>Nitro.Auth</code> provides stateless JWT helpers with HS256 signing and claim validation.</p><pre><code class="language-julia hljs">using Nitro
+using Nitro.Auth
+
+jwt_secret = get(ENV, &quot;JWT_SECRET&quot;, nothing)
+isnothing(jwt_secret) &amp;&amp; error(&quot;JWT_SECRET must be set&quot;)
+
+validator = jwt_validator(jwt_secret)
+
+function profile(req::HTTP.Request)
+    return Res.json(Dict(&quot;sub&quot; =&gt; req.user[&quot;sub&quot;]))
+end
+
+urlpatterns(&quot;&quot;,
+    path(&quot;/profile&quot;, profile, method=&quot;GET&quot;, middleware=[BearerAuth(validator)]),
+)</code></pre><p><code>jwt_validator</code> returns a normalized <a href="../authentication/"><code>Principal</code></a>: the verified claims stay readable dict-style (<code>req.user[&quot;sub&quot;]</code>, as above), and the resolved identity is available as a typed field — <code>req.user.id</code> is the <code>sub</code> claim by default (configurable via <code>identity_claim</code>, or derive it from the verified key id with <code>identity_from=:kid</code>). See <a href="../authentication/">Authentication</a> for the full contract.</p><p>You can also pass a keyset with <code>kid</code> values for rotation:</p><pre><code class="language-julia hljs">required_env(name::String) = get(ENV, name, nothing) === nothing ? error(&quot;$name must be set&quot;) : ENV[name]
+
+keys = Dict(
+    &quot;default&quot; =&gt; required_env(&quot;JWT_SECRET_PRIMARY&quot;),
+    &quot;rotated&quot; =&gt; required_env(&quot;JWT_SECRET_ROTATED&quot;),
+)
+token = encode_jwt(Dict(&quot;sub&quot; =&gt; &quot;42&quot;, &quot;exp&quot; =&gt; trunc(Int, time()) + 300), keys; kid=&quot;rotated&quot;)
+claims = decode_jwt(token, keys)</code></pre><p><code>validate_claims</code> checks <code>exp</code>, <code>iat</code>, <code>nbf</code>, <code>iss</code>, and <code>aud</code> when present.</p><h2 id="Service-and-Capability-Tokens"><a class="docs-heading-anchor" href="#Service-and-Capability-Tokens">Service and Capability Tokens</a><a id="Service-and-Capability-Tokens-1"></a><a class="docs-heading-anchor-permalink" href="#Service-and-Capability-Tokens" title="Permalink"></a></h2><p>Not every token identifies a <em>user</em>. A <strong>service token</strong> authorizes a <em>capability</em>: it carries an <code>action</code> (or scope) claim instead of a <code>sub</code>/<code>user_id</code>. This is the common shape for service-to-service calls — one backend calling your API on behalf of no particular person.</p><pre><code class="language-julia hljs">using Nitro.Auth
+
+# A caller mints a short-lived token that authorizes one action.
+token = encode_jwt(Dict(
+    &quot;app&quot;    =&gt; &quot;analytics-service&quot;,
+    &quot;action&quot; =&gt; &quot;reports:generate&quot;,
+    &quot;iat&quot;    =&gt; trunc(Int, time()),
+    &quot;exp&quot;    =&gt; trunc(Int, time()) + 300,
+), jwt_secret)</code></pre><p><code>BearerAuth(jwt_validator(jwt_secret))</code> verifies the signature and attaches the decoded claims as <code>req.user</code>. Because the claims <em>are</em> the identity here, <code>req.user</code> has no <code>sub</code>/<code>user_id</code> — and that is fine:</p><ul><li><strong><code>login_required</code> only checks that a validly-signed token is present.</strong> It trusts any principal an auth middleware attached, so an <code>action</code>-keyed token (no <code>user_id</code>) passes. The <code>user_id</code> marker is required only on the raw-<code>req.session</code> fallback, never on a principal that <code>BearerAuth</code> already authenticated.</li></ul><p>To authorize the specific action, declare it with <code>claim_required</code>:</p><pre><code class="language-julia hljs"># 403 unless req.user[&quot;action&quot;] == &quot;reports:generate&quot;
+authorize_generate = claim_required(&quot;action&quot;, &quot;reports:generate&quot;)
+
+function generate_report(req::HTTP.Request)
+    return Res.json(Dict(&quot;status&quot; =&gt; &quot;queued&quot;, &quot;requested_by&quot; =&gt; req.user[&quot;app&quot;]))
+end
+
+urlpatterns(&quot;&quot;,
+    path(&quot;/reports/generate&quot;, generate_report, method=&quot;POST&quot;, middleware=[
+        BearerAuth(jwt_validator(jwt_secret)),
+        GuardMiddleware(authorize_generate),
+    ]),
+)</code></pre><p>For list-shaped claims (permissions, scopes), use <code>kind=:contains</code>:</p><pre><code class="language-julia hljs"># 403 unless &quot;reports:read&quot; in req.user[&quot;scopes&quot;]
+GuardMiddleware(claim_required(&quot;scopes&quot;, &quot;reports:read&quot;; kind=:contains))</code></pre><p><code>role_required</code> and <code>permission_required</code> are thin aliases over <code>claim_required</code>, so the older key-parameterized form (<code>role_required(&quot;reports:generate&quot;; role_key=&quot;action&quot;)</code>) still works and behaves identically.</p><h3 id="Tokens-with-iat-but-no-exp"><a class="docs-heading-anchor" href="#Tokens-with-iat-but-no-exp">Tokens with <code>iat</code> but no <code>exp</code></a><a id="Tokens-with-iat-but-no-exp-1"></a><a class="docs-heading-anchor-permalink" href="#Tokens-with-iat-but-no-exp" title="Permalink"></a></h3><p>Short-lived service tokens sometimes carry only <code>iat</code>. Nitro accepts them (<code>decode_jwt</code> does not require <code>exp</code> by default) but still bounds replay by enforcing a <strong>maximum age from <code>iat</code></strong> (about 15 minutes by default). Set <code>exp_timeout</code> to at least the token&#39;s real lifetime so legitimate tokens are not rejected:</p><pre><code class="language-julia hljs"># accept iat-only tokens up to 5 minutes old
+validator = jwt_validator(jwt_secret; exp_timeout=300)</code></pre><h3 id="Key-rotation-with-kid"><a class="docs-heading-anchor" href="#Key-rotation-with-kid">Key rotation with <code>kid</code></a><a id="Key-rotation-with-kid-1"></a><a class="docs-heading-anchor-permalink" href="#Key-rotation-with-kid" title="Permalink"></a></h3><p>When the signer sets a <code>kid</code> header, pass a keyset instead of a single secret; <code>decode_jwt</code> reads the header&#39;s <code>kid</code> to select the matching key:</p><pre><code class="language-julia hljs">keys = Dict(&quot;primary&quot; =&gt; primary_secret, &quot;rotated&quot; =&gt; rotated_secret)
+validator = jwt_validator(keys)</code></pre><p>With a keyset, the <em>verified</em> key id is exposed as <code>req.user.kid</code>, which unlocks two more patterns (both covered in depth in <a href="../authentication/">Authentication</a>):</p><pre><code class="language-julia hljs"># Authorize by signer: only tokens signed by these keys may reach this route.
+GuardMiddleware(kid_required([&quot;service-a&quot;, &quot;service-b&quot;]))
+
+# One key per caller? Make the signer the principal: req.user.id == verified kid.
+validator = jwt_validator(keys; identity_from=:kid)</code></pre><p>Note the trust boundary: a <code>kid</code> is only <em>verified</em> when resolved against a keyset. With a single string secret the header <code>kid</code> is an unchecked label, so <code>kid_required</code> denies and <code>identity_from=:kid</code> is a construction-time error.</p><h2 id="Auth-Cookies-and-CSRF"><a class="docs-heading-anchor" href="#Auth-Cookies-and-CSRF">Auth Cookies and CSRF</a><a id="Auth-Cookies-and-CSRF-1"></a><a class="docs-heading-anchor-permalink" href="#Auth-Cookies-and-CSRF" title="Permalink"></a></h2><p>Use the higher-level cookie helpers for auth tokens:</p><pre><code class="language-julia hljs">using Nitro.Auth
+
+res = HTTP.Response(200)
+set_auth_cookie!(res, &quot;jwt-token&quot;; secure=false)</code></pre><p>For cookie-authenticated browsers, load the CSRF secret from the environment and add <code>CSRFMiddleware</code> to unsafe routes:</p><pre><code class="language-julia hljs">csrf_secret = get(ENV, &quot;CSRF_SECRET&quot;, nothing)
+isnothing(csrf_secret) &amp;&amp; error(&quot;CSRF_SECRET must be set&quot;)
+
+serve(urlpatterns, middleware=[
+    CSRFMiddleware(csrf_secret; config=CookieConfig(httponly=false, secure=true, samesite=&quot;Lax&quot;)),
+])</code></pre><p>The middleware uses a signed double-submit cookie. Safe requests receive a CSRF cookie automatically; unsafe requests must echo the token in the <code>X-CSRF-Token</code> header.</p></article><nav class="docs-footer"><a class="docs-footer-prevpage" href="../authentication/">« Authentication</a><a class="docs-footer-nextpage" href="../passwords/">Password Hashing »</a><div class="flexbox-break"></div><p class="footer-message">Powered by <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> and the <a href="https://julialang.org/">Julia Programming Language</a>.</p></nav></div><div class="modal" id="documenter-settings"><div class="modal-background"></div><div class="modal-card"><header class="modal-card-head"><p class="modal-card-title">Settings</p><button class="delete"></button></header><section class="modal-card-body"><p><label class="label">Theme</label><div class="select"><select id="documenter-themepicker"><option value="auto">Automatic (OS)</option><option value="documenter-light">documenter-light</option><option value="documenter-dark">documenter-dark</option><option value="catppuccin-latte">catppuccin-latte</option><option value="catppuccin-frappe">catppuccin-frappe</option><option value="catppuccin-macchiato">catppuccin-macchiato</option><option value="catppuccin-mocha">catppuccin-mocha</option></select></div></p><hr/><p>This document was generated with <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> version 1.19.0 on <span class="colophon-date" title="Sunday 6 September 2026 17:18">Sunday 6 September 2026</span>. Using Julia version 1.12.7.</p></section><footer class="modal-card-foot"></footer></div></div></div></body></html>

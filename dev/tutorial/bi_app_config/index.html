@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/><title>BI App Config Example · Nitro.jl</title><meta name="title" content="BI App Config Example · Nitro.jl"/><meta property="og:title" content="BI App Config Example · Nitro.jl"/><meta property="twitter:title" content="BI App Config Example · Nitro.jl"/><meta name="description" content="Documentation for Nitro.jl."/><meta property="og:description" content="Documentation for Nitro.jl."/><meta property="twitter:description" content="Documentation for Nitro.jl."/><script data-outdated-warner src="../../assets/warner.js"></script><link href="https://cdnjs.cloudflare.com/ajax/libs/lato-font/3.0.0/css/lato-font.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/juliamono/0.63.2/juliamono.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/fontawesome.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/solid.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/brands.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.8/katex.min.css" rel="stylesheet" type="text/css"/><script>documenterBaseURL="../.."</script><script src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.6/require.min.js" data-main="../../assets/documenter.js"></script><script src="../../search_index.js"></script><script src="../../siteinfo.js"></script><script src="../../../versions.js"></script><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/catppuccin-mocha.css" data-theme-name="catppuccin-mocha"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/catppuccin-macchiato.css" data-theme-name="catppuccin-macchiato"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/catppuccin-frappe.css" data-theme-name="catppuccin-frappe"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/catppuccin-latte.css" data-theme-name="catppuccin-latte"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/documenter-dark.css" data-theme-name="documenter-dark" data-theme-primary-dark/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/documenter-light.css" data-theme-name="documenter-light" data-theme-primary/><script src="../../assets/themeswap.js"></script></head><body><div id="documenter"><nav class="docs-sidebar"><div class="docs-package-name"><span class="docs-autofit"><a href="../../">Nitro.jl</a></span></div><button class="docs-search-query input is-rounded is-small is-clickable my-2 mx-auto py-1 px-2" id="documenter-search-query">Search docs (Ctrl + /)</button><ul class="docs-menu"><li><a class="tocitem" href="../../">Overview</a></li><li><a class="tocitem" href="../../api/">API</a></li><li><a class="tocitem" href="../../upgrading/">Upgrading Nitro</a></li><li><span class="tocitem">Manual</span><ul><li><a class="tocitem" href="../first_steps/">-</a></li><li class="is-active"><a class="tocitem" href>BI App Config Example</a><ul class="internal"><li><a class="tocitem" href="#Recommended-Shape"><span>Recommended Shape</span></a></li><li><a class="tocitem" href="#Why-This-Lives-In-The-App"><span>Why This Lives In The App</span></a></li><li><a class="tocitem" href="#Mapping-From-A-Genie-BI-App"><span>Mapping From A Genie BI App</span></a></li><li><a class="tocitem" href="#Using-The-Config-With-Nitro"><span>Using The Config With Nitro</span></a></li><li><a class="tocitem" href="#Recommended-Bootstrap-Order"><span>Recommended Bootstrap Order</span></a></li></ul></li><li><a class="tocitem" href="../hot_reload/">Development Hot Reload</a></li><li><a class="tocitem" href="../workers/">Workers</a></li><li><a class="tocitem" href="../request_types/">-</a></li><li><a class="tocitem" href="../path_parameters/">-</a></li><li><a class="tocitem" href="../query_parameters/">Query Parameters</a></li><li><a class="tocitem" href="../request_body/">-</a></li><li><a class="tocitem" href="../file_uploads/">File Uploads</a></li><li><a class="tocitem" href="../secrets/">Managing Secrets</a></li><li><a class="tocitem" href="../reverse_proxy/">Behind a Reverse Proxy</a></li><li><a class="tocitem" href="../authentication/">Authentication</a></li><li><a class="tocitem" href="../sessions_and_auth/">Sessions and Auth</a></li><li><a class="tocitem" href="../passwords/">Password Hashing</a></li><li><input class="collapse-toggle" id="menuitem-4-15" type="checkbox"/><label class="tocitem" for="menuitem-4-15"><span class="docs-label">Cookies and Sessions</span><i class="docs-chevron"></i></label><ul class="collapsed"><li><a class="tocitem" href="../cookies/basics/">-</a></li><li><a class="tocitem" href="../cookies/configuration/">-</a></li><li><a class="tocitem" href="../cookies/security/">-</a></li><li><a class="tocitem" href="../cookies/sessions/">-</a></li></ul></li><li><a class="tocitem" href="../cron_scheduling/">-</a></li><li><a class="tocitem" href="../bigger_applications/">-</a></li><li><a class="tocitem" href="../oauth2/">OAuth2 with Umbrella.jl</a></li></ul></li></ul><div class="docs-version-selector field has-addons"><div class="control"><span class="docs-label button is-static is-size-7">Version</span></div><div class="docs-selector control is-expanded"><div class="select is-fullwidth is-size-7"><select id="documenter-version-selector"></select></div></div></div></nav><div class="docs-main"><header class="docs-navbar"><a class="docs-sidebar-button docs-navbar-link fa-solid fa-bars is-hidden-desktop" id="documenter-sidebar-button" href="#"></a><nav class="breadcrumb"><ul class="is-hidden-mobile"><li><a class="is-disabled">Manual</a></li><li class="is-active"><a href>BI App Config Example</a></li></ul><ul class="is-hidden-tablet"><li class="is-active"><a href>BI App Config Example</a></li></ul></nav><div class="docs-right"><a class="docs-navbar-link" href="https://github.com/PingoLee/Nitro.jl" title="View the repository on GitHub"><span class="docs-icon fa-brands"></span><span class="docs-label is-hidden-touch">GitHub</span></a><a class="docs-navbar-link" href="https://github.com/PingoLee/Nitro.jl/blob/main/docs/src/tutorial/bi_app_config.md" title="Edit source on GitHub"><span class="docs-icon fa-solid"></span></a><a class="docs-settings-button docs-navbar-link fa-solid fa-gear" id="documenter-settings-button" href="#" title="Settings"></a><a class="docs-article-toggle-button fa-solid fa-chevron-up" id="documenter-article-toggle-button" href="javascript:;" title="Collapse all docstrings"></a></div></header><article class="content" id="documenter-page"><h1 id="BI-App-Config-Example"><a class="docs-heading-anchor" href="#BI-App-Config-Example">BI App Config Example</a><a id="BI-App-Config-Example-1"></a><a class="docs-heading-anchor-permalink" href="#BI-App-Config-Example" title="Permalink"></a></h1><p>Nitro should not own your application configuration. Keep the config struct, file loading, and environment-variable resolution in the app layer, then pass the resulting object into Nitro with <code>serve(context=...)</code>.</p><p>This is the right pattern for a BI-style app that uses Nitro for HTTP, <code>Nitro.Auth</code> for authentication helpers, <code>Nitro.Workers</code> for in-process jobs, and <code>PormG</code> as an external package dependency.</p><h2 id="Recommended-Shape"><a class="docs-heading-anchor" href="#Recommended-Shape">Recommended Shape</a><a id="Recommended-Shape-1"></a><a class="docs-heading-anchor-permalink" href="#Recommended-Shape" title="Permalink"></a></h2><p>Split the config by responsibility instead of using one large untyped dictionary.</p><pre><code class="language-julia hljs">module BIAppConfig
+
+export AppConfig, DatabaseConfig, AuthConfig, WorkerConfig, load_config
+
+struct DatabaseConfig
+    adapter::String
+    host::String
+    port::Int
+    database::String
+    username::String
+    password::String
+end
+
+struct AuthConfig
+    secret_key::String
+    api_keys::Dict{String, String}
+    allowed_kids::Vector{String}
+    session_secure::Bool
+    session_timeout::Int
+end
+
+struct WorkerConfig
+    max_concurrent_tasks::Int
+    default_timeout::Int
+    retry_limit::Int
+end
+
+struct AppConfig
+    server_host::String
+    server_port::Int
+    db::DatabaseConfig
+    db_sch::DatabaseConfig
+    auth::AuthConfig
+    workers::WorkerConfig
+    env::String
+end
+
+function load_config(env::String=&quot;dev&quot;)
+    db_default = DatabaseConfig(
+        get(ENV, &quot;DB_ADAPTER&quot;, &quot;postgres&quot;),
+        get(ENV, &quot;DB_HOST&quot;, &quot;localhost&quot;),
+        parse(Int, get(ENV, &quot;DB_PORT&quot;, &quot;5432&quot;)),
+        get(ENV, &quot;DB_NAME&quot;, &quot;bi_db&quot;),
+        get(ENV, &quot;DB_USER&quot;, &quot;postgres&quot;),
+        get(ENV, &quot;DB_PASS&quot;, &quot;&quot;)
+    )
+
+    api_secret = get(ENV, &quot;API_SECRET_KEY&quot;, nothing)
+    isnothing(api_secret) &amp;&amp; error(&quot;API_SECRET_KEY must be set&quot;)
+
+    auth = AuthConfig(
+        api_secret,
+        Dict(&quot;default&quot; =&gt; api_secret),
+        [&quot;default&quot;],
+        env == &quot;prod&quot;,
+        3600
+    )
+
+    workers = WorkerConfig(
+        parse(Int, get(ENV, &quot;WORKER_CONCURRENCY&quot;, &quot;4&quot;)),
+        300,
+        3
+    )
+
+    return AppConfig(
+        get(ENV, &quot;HOST&quot;, &quot;127.0.0.1&quot;),
+        parse(Int, get(ENV, &quot;PORT&quot;, &quot;8000&quot;)),
+        db_default,
+        db_default,
+        auth,
+        workers,
+        env
+    )
+end
+
+end</code></pre><blockquote><p><strong>Tip on Dummy Fallback Values</strong>: Notice that all secrets and configs use <code>get(ENV, &quot;KEY&quot;, &quot;fallback&quot;)</code>. This pattern is highly recommended. It ensures that your application won&#39;t crash when Documenter.jl (<code>docs/make.jl</code>) evaluates these blocks or when your CI suite runs basic tests without a <code>.env</code> file present.</p></blockquote><h2 id="Why-This-Lives-In-The-App"><a class="docs-heading-anchor" href="#Why-This-Lives-In-The-App">Why This Lives In The App</a><a id="Why-This-Lives-In-The-App-1"></a><a class="docs-heading-anchor-permalink" href="#Why-This-Lives-In-The-App" title="Permalink"></a></h2><ul><li>Nitro stays framework-focused and does not accumulate app-specific config types.</li><li><code>PormG</code> remains external; Nitro does not need to know how your BI app names or groups databases.</li><li>Each app can evolve its own config without forcing new public API into Nitro core.</li></ul><h2 id="Mapping-From-A-Genie-BI-App"><a class="docs-heading-anchor" href="#Mapping-From-A-Genie-BI-App">Mapping From A Genie BI App</a><a id="Mapping-From-A-Genie-BI-App-1"></a><a class="docs-heading-anchor-permalink" href="#Mapping-From-A-Genie-BI-App" title="Permalink"></a></h2><p>Typical migration mapping:</p><ul><li><code>db/connection.yml</code> -&gt; <code>DatabaseConfig</code></li><li><code>config/all_sort.yml</code> JWT keys -&gt; <code>AuthConfig</code></li><li>worker tuning and retry limits -&gt; <code>WorkerConfig</code></li><li>host, port, and environment -&gt; top-level <code>AppConfig</code></li></ul><p>If your app has multiple databases such as <code>db</code>, <code>db_sch</code>, or <code>db_esus</code>, keep those as separate typed fields or store them in a typed dictionary owned by the app.</p><h2 id="Using-The-Config-With-Nitro"><a class="docs-heading-anchor" href="#Using-The-Config-With-Nitro">Using The Config With Nitro</a><a id="Using-The-Config-With-Nitro-1"></a><a class="docs-heading-anchor-permalink" href="#Using-The-Config-With-Nitro" title="Permalink"></a></h2><p>Pass the config into Nitro as the typed context payload.</p><pre><code class="language-julia hljs">using HTTP
+using Nitro
+using .BIAppConfig
+
+function health(req::HTTP.Request, ctx::Context{AppConfig})
+    return Res.json(Dict(
+        &quot;env&quot; =&gt; ctx.payload.env,
+        &quot;host&quot; =&gt; ctx.payload.server_host,
+        &quot;port&quot; =&gt; ctx.payload.server_port,
+    ))
+end
+
+urlpatterns(&quot;&quot;,
+    path(&quot;/health&quot;, health, method=&quot;GET&quot;),
+)
+
+config = load_config(get(ENV, &quot;APP_ENV&quot;, &quot;dev&quot;))
+serve(host=config.server_host, port=config.server_port, context=config)</code></pre><h3 id="Reaching-The-Config-From-req-Alone"><a class="docs-heading-anchor" href="#Reaching-The-Config-From-req-Alone">Reaching The Config From <code>req</code> Alone</a><a id="Reaching-The-Config-From-req-Alone-1"></a><a class="docs-heading-anchor-permalink" href="#Reaching-The-Config-From-req-Alone" title="Permalink"></a></h3><p>Declaring a <code>ctx::Context{AppConfig}</code> parameter, as above, is the preferred shape: the type is written down, so the handler body infers concretely. When you only have the request — inside middleware, or in a helper called from several handlers — use the <strong>typed</strong> accessor:</p><pre><code class="language-julia hljs">cfg = getcontext(req, AppConfig)   # ::AppConfig — do this on the request path
+cfg.server_host</code></pre><p>not the untyped one:</p><pre><code class="language-julia hljs">cfg = getcontext(req)              # ::Any — every field access dispatches dynamically</code></pre><p>Nitro stores the context payload in a <code>Ref{Any}</code> because <code>serve(context = ...)</code> can reassign it after routes are registered, so its type is not known when a route is built. The <code>::T</code> in <code>getcontext(req, T)</code> is a function barrier that recovers the type for everything downstream of it. On a hot path that difference is one dynamic <code>getfield</code> per access, per request.</p><h2 id="Recommended-Bootstrap-Order"><a class="docs-heading-anchor" href="#Recommended-Bootstrap-Order">Recommended Bootstrap Order</a><a id="Recommended-Bootstrap-Order-1"></a><a class="docs-heading-anchor-permalink" href="#Recommended-Bootstrap-Order" title="Permalink"></a></h2><ol><li>Load YAML or TOML files in the app layer.</li><li>Apply environment variable overrides.</li><li>Build <code>AppConfig</code>.</li><li>Initialize external packages such as <code>PormG</code> from the app layer.</li><li>Build routes, middleware, and worker hooks.</li><li>If you use <code>Nitro.Workers</code>, attach <code>worker_startup(...)</code> in the <code>serve(middleware=[...])</code> list.</li><li>Start Nitro with <code>serve(context=config)</code>.</li></ol><p>For example:</p><pre><code class="language-julia hljs">serve(
+    host=config.server_host,
+    port=config.server_port,
+    context=config,
+    middleware=[
+        worker_startup(
+            queues=[&quot;agendamento&quot;],
+            cleanup_interval_hours=24,
+            cleanup_retain_days=7,
+        ),
+    ],
+)</code></pre><p>For the BI server migration, this config object is the bridge between the old Genie layout and the new Nitro app bootstrap.</p></article><nav class="docs-footer"><a class="docs-footer-prevpage" href="../first_steps/">« -</a><a class="docs-footer-nextpage" href="../hot_reload/">Development Hot Reload »</a><div class="flexbox-break"></div><p class="footer-message">Powered by <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> and the <a href="https://julialang.org/">Julia Programming Language</a>.</p></nav></div><div class="modal" id="documenter-settings"><div class="modal-background"></div><div class="modal-card"><header class="modal-card-head"><p class="modal-card-title">Settings</p><button class="delete"></button></header><section class="modal-card-body"><p><label class="label">Theme</label><div class="select"><select id="documenter-themepicker"><option value="auto">Automatic (OS)</option><option value="documenter-light">documenter-light</option><option value="documenter-dark">documenter-dark</option><option value="catppuccin-latte">catppuccin-latte</option><option value="catppuccin-frappe">catppuccin-frappe</option><option value="catppuccin-macchiato">catppuccin-macchiato</option><option value="catppuccin-mocha">catppuccin-mocha</option></select></div></p><hr/><p>This document was generated with <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> version 1.19.0 on <span class="colophon-date" title="Sunday 6 September 2026 17:18">Sunday 6 September 2026</span>. Using Julia version 1.12.7.</p></section><footer class="modal-card-foot"></footer></div></div></div></body></html>
