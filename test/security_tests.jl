@@ -67,6 +67,56 @@ end
                     HTTP.Request("GET", "/reset?token=SECRET-XYZ"))
     @test occursin("token=SECRET-XYZ", logs[1].message)
 end
+
+# The redaction above is enforced by `_log_target_path` (#39), which slices an origin-form
+# target instead of parsing a full `HTTP.URI`. These pin the two ways that slice could leak
+# more than the path: an absolute-form target, whose authority may carry credentials, and a
+# fragment, which binds tighter than the query delimiter.
+@testset "target reduction redacts on every request-target form" begin
+    tp = Nitro.Core._log_target_path
+
+    @testset "origin-form (the common case) is a pure slice" begin
+        @test tp("/plain") == "/plain"                    # no query at all
+        @test tp("/p?") == "/p"                           # empty query
+        @test tp("/a?b?c=SECRET") == "/a"                 # first '?' wins
+        @test tp("/café/ü?k=SECRET") == "/café/ü"   # multibyte path before '?'
+        @test tp("/foo#frag?k=SECRET") == "/foo"          # '#' binds tighter than '?'
+        @test tp("/foo?k=a#frag") == "/foo"
+    end
+
+    @testset "absolute-form never leaks userinfo into the log" begin
+        # RFC 9112 §3.2.2 — a server MUST accept this form, and HTTP.jl passes the target
+        # through verbatim. A prefix slice would keep `scheme://user:pass@host`, putting
+        # credentials in a log that is routinely shipped off-box.
+        @test tp("http://h.example/v1/x?k=SECRET") == "/v1/x"
+        @test tp("http://user:pa55w0rd@h.example/v1/x?k=SECRET") == "/v1/x"
+        @test !occursin("pa55w0rd", tp("http://user:pa55w0rd@h.example/v1/x"))
+        @test !occursin("h.example", tp("http://user:pa55w0rd@h.example/v1/x"))
+    end
+
+    @testset "a target with no usable path logs a placeholder, never the raw target" begin
+        # Returning the target unchanged here is what would leak; "-" is the standard
+        # access-log stand-in for a value that is not available.
+        @test tp("?token=SECRET") == "-"
+        @test tp("") == "-"
+        @test !occursin("SECRET", tp("?token=SECRET"))
+    end
+
+    # End-to-end through the middleware: every one of these must produce exactly one log
+    # line, carrying no query, no fragment and no credentials.
+    @testset "end-to-end redaction across target forms" begin
+        for bad in ("/a b?token=SECRET", "/%ZZ?token=SECRET", "//høst?token=SECRET",
+                    "http://user:pa55w0rd@h.example/v1/x?token=SECRET",
+                    "?token=SECRET", "/foo#frag?token=SECRET")
+            logs = run_once(Nitro.Core.AccessLogMiddleware(), HTTP.Request("GET", bad))
+            @test length(logs) == 1
+            msg = logs[1].message
+            @test !occursin("SECRET", msg)
+            @test !occursin("pa55w0rd", msg)
+            @test !occursin('?', msg)
+        end
+    end
+end
 end
 
 @testitem "Security: SecretString redaction" tags=[:security, :core] setup=[NitroCommon] begin

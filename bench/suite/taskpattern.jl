@@ -1,5 +1,8 @@
 # SYNTHETIC: replica of parallel_stream_handler's per-request task pattern
-# (src/core.jl:629-637 — Threads.@spawn wrapping an inner @async, two waits).
+# (Threads.@spawn wrapping an inner @async, two waits). That nesting was removed in
+# #39 — `parallel_stream_handler` is now a single spawn — so `spawn_async_pair` is
+# retained purely as the historical comparison against `spawn_single`, which is what
+# the request path actually does today.
 # internalrequest bypasses this layer, so it is measured standalone against a
 # single-task spawn and a direct call.
 SUITE["taskpattern"] = BenchmarkGroup()

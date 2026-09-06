@@ -67,10 +67,18 @@ localhost = "http://$HOST:$port"
         r = HTTP.post("$localhost/post", body="some demo content")
         @test text(r) == "some demo content"
 
-        try
-            @suppress_err r = HTTP.get("$localhost/customerror", connect_timeout=3)
-        catch e 
-            @test e isa MethodError || e isa HTTP.StatusError
+        # Error-path guard for the parallel handler (#39). To be clear about what this
+        # does and does not prove: it does NOT discriminate the #39 change — the nested
+        # `@async` + second `wait` that was removed rethrew just as the single `wait`
+        # does, so this passes on both shapes. It is here because #39 rewrote the only
+        # path a live request takes, and "a throwing handler still becomes a 500 rather
+        # than hanging or dropping the connection" is the invariant that rewrite could
+        # plausibly have broken. `status_exception=false` makes it an assertion about
+        # the response rather than about which exception the client chose to raise.
+        @suppress_err begin
+            r = HTTP.get("$localhost/customerror", connect_timeout=3, retry=false,
+                         status_exception=false)
+            @test r.status == 500
         end
         
         terminate()

@@ -765,12 +765,27 @@ function stream_handler(middleware::Function)
     end
 end
 
+# One `Threads.@spawn` per request, and nothing else (#39). This used to spawn the
+# task and then, inside it, `@async handle_stream(stream)` followed by `wait(handle)`
+# — a second Task allocation, a scheduler enqueue/dequeue, and a second condition
+# variable, all so the parent could block doing nothing until the child finished.
+# The inner task never ran concurrently with its parent, so it bought no
+# concurrency; exception propagation is identical either way because both `wait`s
+# rethrow. HTTP.jl already spawns per *connection*; this spawn is what moves each
+# *request* off that connection task, which is the Go-style model Nitro wants
+# (nitro-core §2). Do not reintroduce the inner `@async`.
+#
+# One genuine semantic difference, since "pure overhead" undersells it: `@async`
+# creates a **sticky** task, pinned to the thread that created it, while
+# `Threads.@spawn` creates a migratable one. A handler may therefore now move
+# between threads at a yield point mid-request. Nothing in Nitro depends on
+# thread affinity — `src/` calls `Threads.threadid()` nowhere and uses no
+# task-local storage — and migratable is the correct model here. But an *app*
+# using the `threadid()`-as-index pattern (`buffers[Threads.threadid()]`) was
+# already unsound under `@async` and is now visibly so.
 function parallel_stream_handler(handle_stream::Function)
     function(stream::HTTP.Stream)
-        task = Threads.@spawn begin
-            handle = @async handle_stream(stream)
-            wait(handle)
-        end
+        task = Threads.@spawn handle_stream(stream)
         wait(task)
     end
 end
@@ -929,6 +944,39 @@ function internalrequest(ctx::ServerContext, req::HTTP.Request; middleware::Vect
     end
 end
 
+# Strip everything after the path from a request-target, for the access log (#39).
+#
+# The hot path is a slice, not a full `HTTP.URI` parse: parsing per request purely to discard
+# the query is waste, and for the origin-form target that ~every request carries
+# (`/v1/x?k=1`) the prefix before the first '?' *is* the path.
+#
+# Two cases stop that from being the whole story, and both are security-relevant, because
+# this feeds a log that is routinely shipped to third-party aggregators:
+#
+#   * **Absolute-form** (RFC 9112 §3.2.2) -- a server MUST accept `GET http://h/x?k=1`, and
+#     HTTP.jl passes the target through verbatim. A prefix slice keeps
+#     `scheme://userinfo@host`, so `http://user:pa55w0rd@h/x` would put credentials straight
+#     into the log. Anything not starting with '/' is therefore parsed properly, and an
+#     unparseable one logs `"-"` rather than risk emitting the raw target.
+#   * **Fragments** are not legal in a request-target and browsers never send one, but a
+#     hand-rolled client can, and '#' binds tighter than '?'. Cutting at whichever comes
+#     first keeps this agreeing with `HTTP.URI(...).path`, which drops the fragment.
+function _log_target_path(target::AbstractString)
+    if startswith(target, '/')
+        q = findfirst('?', target)
+        h = findfirst('#', target)
+        cut = q === nothing ? h : (h === nothing ? q : min(q, h))
+        return cut === nothing ? SubString(target) : SubString(target, 1, prevind(target, cut))
+    end
+    parsed = try
+        String(HTTP.URI(target).path)
+    catch e
+        e isa InterruptException && rethrow()
+        "-"
+    end
+    return SubString(isempty(parsed) ? "-" : parsed)
+end
+
 """
     AccessLogMiddleware(; log_query::Bool=false)
 
@@ -948,7 +996,7 @@ function AccessLogMiddleware(; log_query::Bool=false)
         return function(req::HTTP.Request)
             response = handle(req)
             ip = Base.get(req.context, :ip, nothing)
-            target = log_query ? req.target : HTTP.URI(req.target).path
+            target = log_query ? req.target : _log_target_path(req.target)
             @info "$(Dates.format(now(), "yyyy-mm-ddTHH:MM:SS")) - $ip - \"$(req.method) $target\" $(response.status)"
             return response
         end
