@@ -631,11 +631,20 @@ end
 #
 # `pathparams` is the one accessor that must NOT cache a `nothing`. `HTTP.getparams` reads
 # `req.context[:params]`, a slot the ROUTER fills -- and middleware runs *before* the router.
-# A pre-router read (a guard doing `req.params["user_id"]`, or anything touching `req.input`,
-# which merges path params in) would otherwise memoize `nothing` for the rest of the request,
+# A pre-router read -- a guard doing `req.params["user_id"]`, or anything touching `req.input`,
+# which merges path params in -- would otherwise memoize `nothing` for the rest of the request,
 # and the path binder would then index into `nothing` and turn every parameterized route into
 # a 500. "Unrouted" is a transient state of the request, not a property of it, so it is
-# returned uncached and recomputed until the router has actually run.
+# returned uncached until the router has actually run.
+#
+# `req.input` needs its own handling on top of this and does not get it for free here: it
+# merges a *copy* of the params, so refusing to cache the `nothing` is not enough to keep its
+# merged map correct. `Core.request_input` carries that rule.
+#
+# Note also that the FIRST non-`nothing` value wins for the rest of the request. Nothing
+# rewrites `req.context[:params]` after the router has set it -- there is one `HTTP.Router`
+# per `ServerContext` and routers do not nest -- but a future layer that did would not be
+# picked up here.
 #
 # A throwing builder caches nothing and rethrows on the next touch. That is correct and
 # load-bearing: `queryvars` raises `ValidationError` on malformed percent-encoding, and

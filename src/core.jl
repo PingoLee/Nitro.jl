@@ -94,16 +94,36 @@ function request_multipart(req::HTTP.Request)
     end
 end
 
+# `req.params` is `nothing` until the router populates it, and `merge_request_input!` above
+# silently skips a non-`AbstractDict` source — so a merge performed before the router ran
+# produces an input map with the path params missing, and caching that unconditionally hands
+# every later reader the truncated version. A middleware calling the public `payload(req)`, or
+# a guard reading `req.input["tenant"]`, was enough to do it.
+#
+# That fails *silently* with wrong data rather than loudly, which is the worse shape, so the
+# cached merge is invalidated exactly once: if the value was built while path params were
+# absent and they have since appeared, it is rebuilt and then pinned. `pathparams` solves the
+# same transient-state problem by refusing to cache the `nothing` (see `src/types.jl`); this
+# one cannot, because a route with *no* path parameters leaves `req.params === nothing`
+# permanently, and gating on that would disable this cache for every such route.
+const REQUEST_INPUT_ROUTED_KEY = :__nitro_request_input_routed
+
 function request_input(req::HTTP.Request) :: Dict{String,Any}
-    return request_cache!(req, REQUEST_INPUT_CACHE_KEY) do
-        merged = Dict{String,Any}()
-        merge_request_input!(merged, req.query)
-        merge_request_input!(merged, req.json)
-        merge_request_input!(merged, req.form)
-        merge_request_input!(merged, req.post)
-        merge_request_input!(merged, req.params)
-        merged
+    ctx = getfield(req, :context)
+    params = req.params
+    if haskey(ctx, REQUEST_INPUT_CACHE_KEY) &&
+       (params === nothing || haskey(ctx, REQUEST_INPUT_ROUTED_KEY))
+        return ctx[REQUEST_INPUT_CACHE_KEY] :: Dict{String,Any}
     end
+    merged = Dict{String,Any}()
+    merge_request_input!(merged, req.query)
+    merge_request_input!(merged, req.json)
+    merge_request_input!(merged, req.form)
+    merge_request_input!(merged, req.post)
+    merge_request_input!(merged, params)
+    ctx[REQUEST_INPUT_CACHE_KEY] = merged
+    params === nothing || (ctx[REQUEST_INPUT_ROUTED_KEY] = true)
+    return merged
 end
 
 """
@@ -1033,6 +1053,11 @@ Query strings routinely carry secrets (password-reset tokens, API keys, OAuth
 `code`/`state`, signed-URL signatures), and access logs are frequently shipped to
 third-party aggregators. Pass `log_query=true` to log the full target including the
 query when you are sure no sensitive data travels in URLs.
+
+`log_query=true` logs the request-target **verbatim**, which is not only the query: a
+client may send absolute-form (`GET http://user:pa55w0rd@host/x`), so credentials in the
+authority are logged too. The default path is reduced by `_log_target_path`, which strips
+both. Only opt in for a service whose clients you control.
 """
 function AccessLogMiddleware(; log_query::Bool=false)
     return function(handle)

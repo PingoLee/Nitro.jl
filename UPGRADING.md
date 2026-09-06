@@ -148,6 +148,14 @@ slot the router fills, and middleware runs before the router, so a pre-router re
 binder index into `nothing` and 500 every parameterized route. Such a read still sees `nothing`, and
 caching begins once the router has populated the slot.
 
+`req.input` needed a second, separate rule, because it merges a *copy* of the path params rather
+than reading them through: a merge performed before the router ran produced an input map with the
+path params missing, and caching that handed every later reader the truncated version — a 200 with
+silently wrong data. That merge is now rebuilt once if it was cached before the params appeared.
+This also fixes a pre-existing bug: middleware calling `payload(req)` or reading
+`req.input["tenant"]` already poisoned `req.input` for the whole request before these caches
+existed.
+
 ---
 
 ## The `PormG` pin moves to `^0.5`, which is a breaking PormG release (#PormG 0.5.0)
