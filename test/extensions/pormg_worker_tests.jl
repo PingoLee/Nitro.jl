@@ -38,6 +38,11 @@ function _filtered_rows(qs::MockTaskQuerySet)
                 matches = row["completed_at"] !== nothing && row["completed_at"] > v
             elseif k == "completed_at__@isnull"
                 matches = (row["completed_at"] === nothing) == v
+            elseif k == "watchers"
+                # Exact match on the serialized document — the compare half of
+                # add_watcher!'s CAS. Without this branch the filter fell through and
+                # matched on `id` alone, so the CAS always appeared to win.
+                matches = row["watchers"] == v
             elseif k == "id__startswith" || k == "id__@startswith"
                 matches = startswith(row["id"], v)
             elseif k == "watchers__contains" || k == "watchers__@contains"
@@ -92,12 +97,17 @@ function Base.getproperty(qs::MockTaskQuerySet, name::Symbol)
         end
     elseif name === :update
         return function(pairs::Pair{String,<:Any}...)
+            # Return the affected-row count, matching PormG's Django-style `update`.
+            # It used to return `nothing`, which would make every compare-and-set in
+            # the store read as a failure — or, worse, as an untested success.
+            touched = 0
             for row in _filtered_rows(qs)
                 for (k, v) in pairs
                     row[k] = v
                 end
+                touched += 1
             end
-            return nothing
+            return touched
         end
     elseif name === :delete
         return function()
@@ -201,6 +211,67 @@ function Base.getproperty(m::FlakyReadModel, name::Symbol)
             MockTaskQuerySet(getfield(m, :_table), Dict{String,Any}()),
             getfield(m, :fail_next),
             getfield(m, :fail_ids),
+        )
+    end
+    return getfield(m, name)
+end
+
+# A model that simulates another process appending a watcher in the window between our
+# read and our UPDATE.
+#
+# Deterministic on purpose. A thread-based race would be the obvious way to test this and
+# the wrong one: it passes or fails on scheduler luck, behaves differently at
+# `nthreads` 1 and 2 (CI runs both), and cannot prove the retry path ran at all. Injecting
+# the competing write exactly once, at exactly the vulnerable moment, forces the CAS to
+# match zero rows and take its retry — the whole point of #88's fix.
+struct RacingWatcherQuerySet
+    inner::MockTaskQuerySet
+    inject_next::Ref{Int}
+    intruder::String
+end
+
+function Base.getproperty(qs::RacingWatcherQuerySet, name::Symbol)
+    inner = getfield(qs, :inner)
+    inject_next = getfield(qs, :inject_next)
+    intruder = getfield(qs, :intruder)
+
+    if name === :db
+        return (key::String) -> RacingWatcherQuerySet(inner.db(key), inject_next, intruder)
+    elseif name === :filter
+        return (pairs::Pair{String,<:Any}...) ->
+            RacingWatcherQuerySet(inner.filter(pairs...), inject_next, intruder)
+    elseif name === :update
+        return function(pairs::Pair{String,<:Any}...)
+            # Only a watchers CAS is worth racing, and only once.
+            is_watcher_cas = any(p -> first(p) == "watchers", pairs) &&
+                             haskey(getfield(inner, :filters), "watchers")
+            if is_watcher_cas && inject_next[] > 0
+                inject_next[] -= 1
+                # The competing write lands first, so our compare value is now stale.
+                for row in values(getfield(inner, :table))
+                    current = JSON.parse(row["watchers"])
+                    intruder in current && continue
+                    row["watchers"] = JSON.json(vcat(current, intruder))
+                end
+            end
+            return inner.update(pairs...)
+        end
+    end
+    return getproperty(inner, name)
+end
+
+struct RacingWatcherModel
+    _table::Dict{String, Dict{String, Any}}
+    inject_next::Ref{Int}
+    intruder::String
+end
+
+function Base.getproperty(m::RacingWatcherModel, name::Symbol)
+    if name === :objects
+        return RacingWatcherQuerySet(
+            MockTaskQuerySet(getfield(m, :_table), Dict{String,Any}()),
+            getfield(m, :inject_next),
+            getfield(m, :intruder),
         )
     end
     return getfield(m, name)
@@ -316,6 +387,93 @@ else
             @test tasks_b[1].id == "task-b"
 
             @test length(get_all_tasks(store3, System())) == 2
+        end
+
+        @testset "watcher and status writes survive a concurrent writer (#88)" begin
+            store_cas = RealPormGWorkerStore(model=MockTaskModel())
+
+            base = TaskInfo("alice::job")
+            push!(base.watchers, "alice")
+            replace_task!(store_cas, base.id, base)
+
+            @testset "set_task! does not carry a stale watcher list" begin
+                add_watcher!(store_cas, "alice::job", "bob")
+
+                # The #88 mechanism, exactly: another process appended "bob" since this
+                # one last read the row, and now this one saves a state transition. It
+                # used to rewrite every column, dropping "bob". A transition happens on
+                # every start/progress/finish, so this was the dominant loss path —
+                # far more frequent than two appends racing each other.
+                stale = TaskInfo("alice::job")
+                push!(stale.watchers, "alice")
+                stale.status = COMPLETED
+                set_task!(store_cas, "alice::job", stale)
+
+                persisted = get_task_info(store_cas, "alice::job")
+                @test persisted.status == COMPLETED       # the state DID land
+                @test "bob" in persisted.watchers         # ...and the grant survived it
+            end
+
+            @testset "replace_task! is the one call that may reset watchers" begin
+                fresh = TaskInfo("alice::job")
+                push!(fresh.watchers, "carol")
+                replace_task!(store_cas, "alice::job", fresh)
+                @test get_task_info(store_cas, "alice::job").watchers == ["carol"]
+            end
+
+            @testset "add_watcher! retries rather than clobbering a racing append" begin
+                # Deterministic rather than threaded: a racing mock injects a competing
+                # watcher between our read and our UPDATE, so the CAS predicate matches
+                # zero rows and the retry loop is forced. This behaves identically at
+                # nthreads 1 and 2, unlike a spawn-based race.
+                table = Dict{String, Dict{String, Any}}()
+                racer = RacingWatcherModel(table, Ref(1), "intruder")
+                store_race = RealPormGWorkerStore(model=racer)
+
+                t = TaskInfo("alice::raced")
+                push!(t.watchers, "alice")
+                replace_task!(store_race, t.id, t)
+
+                @test add_watcher!(store_race, "alice::raced", "bob") == true
+
+                got = get_task_info(store_race, "alice::raced").watchers
+                # Both survive: the retry re-read the value the racer left behind and
+                # appended to *that*, instead of overwriting an append it never saw.
+                @test "intruder" in got
+                @test "bob" in got
+                @test "alice" in got
+            end
+
+            @testset "try_transition! fires only from the expected status" begin
+                store_t = RealPormGWorkerStore(model=MockTaskModel())
+                t = TaskInfo("alice::cas")
+                replace_task!(store_t, t.id, t)
+
+                @test try_transition!(store_t, "alice::cas", (PENDING, RUNNING), CANCELLED;
+                                      error="Cancelled") == true
+                @test get_task_info(store_t, "alice::cas").status == CANCELLED
+                # A task that finished elsewhere cannot be re-transitioned, and the
+                # failed attempt writes nothing.
+                @test try_transition!(store_t, "alice::cas", (PENDING, RUNNING), COMPLETED) == false
+                @test get_task_info(store_t, "alice::cas").status == CANCELLED
+                @test try_transition!(store_t, "absent", (PENDING,), CANCELLED) == false
+            end
+        end
+
+        @testset "add_watcher! reaches a running task's live info" begin
+            store_live = RealPormGWorkerStore(model=MockTaskModel())
+
+            running = TaskInfo("alice::live")
+            push!(running.watchers, "alice")
+            running.status = RUNNING
+            replace_task!(store_live, running.id, running)
+            # get_task_info serves this object for an active task, so a grant written
+            # only to the row would stay invisible until the task terminated.
+            register_active_task_info!(store_live, running.id, running)
+
+            @test add_watcher!(store_live, "alice::live", "bob") == true
+            @test "bob" in get_task_info(store_live, "alice::live").watchers
+            @test get_task_status("alice::live", Owner("bob"); store=store_live)[:id] == "alice::live"
         end
 
         @testset "the narrowed query still returns owned AND granted tasks" begin

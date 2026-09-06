@@ -261,6 +261,74 @@ end
     end
 end
 
+@testset "store write primitives are atomic and intent-scoped (#88)" begin
+    store = InMemoryWorkerStore()
+    try
+        info = TaskInfo("alice::job")
+        push!(info.watchers, "alice")
+        replace_task!(store, info.id, info)
+
+        @testset "add_watcher! is idempotent and reports absence" begin
+            @test add_watcher!(store, "alice::job", "bob") == true
+            @test add_watcher!(store, "alice::job", "bob") == true       # idempotent
+            @test get_task_info(store, "alice::job").watchers == ["alice", "bob"]
+            @test add_watcher!(store, "no-such-task", "bob") == false    # absent, not an error
+        end
+
+        @testset "set_task! carries state, never grants" begin
+            # The #88 regression, expressed against the store contract: an ordinary
+            # state transition must not carry a stale watcher list along with it.
+            # A caller holding a TaskInfo read *before* a grant was added...
+            stale = TaskInfo("alice::job")           # a view that predates the grant
+            push!(stale.watchers, "alice")
+            stale.status = COMPLETED
+
+            set_task!(store, "alice::job", stale)    # ...saves progress/status only
+
+            @test "bob" in get_task_info(store, "alice::job").watchers
+
+            # replace_task! is the one call that *may* reset them, and is what the
+            # documented "re-running a finished key resets watchers" path uses.
+            fresh = TaskInfo("alice::job")
+            push!(fresh.watchers, "carol")
+            replace_task!(store, "alice::job", fresh)
+            @test get_task_info(store, "alice::job").watchers == ["carol"]
+        end
+
+        @testset "try_transition! only fires from the expected status" begin
+            t = TaskInfo("alice::cas")
+            replace_task!(store, t.id, t)            # starts PENDING
+
+            @test try_transition!(store, "alice::cas", (PENDING, RUNNING), CANCELLED;
+                                  error="Cancelled", completed_at=Dates.now(Dates.UTC)) == true
+            after = get_task_info(store, "alice::cas")
+            @test after.status == CANCELLED
+            @test after.error == "Cancelled"
+
+            # Already left the `from` set: no second transition, and nothing written.
+            @test try_transition!(store, "alice::cas", (PENDING, RUNNING), COMPLETED) == false
+            @test get_task_info(store, "alice::cas").status == CANCELLED
+            @test try_transition!(store, "no-such-task", (PENDING,), CANCELLED) == false
+        end
+
+        @testset "concurrent add_watcher! loses no grant" begin
+            t = TaskInfo("alice::concurrent")
+            push!(t.watchers, "alice")
+            replace_task!(store, t.id, t)
+
+            @sync for i in 1:20
+                Threads.@spawn add_watcher!(store, "alice::concurrent", "u$(i)")
+            end
+
+            got = get_task_info(store, "alice::concurrent").watchers
+            @test length(got) == 21
+            @test Set(got) == Set(vcat("alice", ["u$(i)" for i in 1:20]))
+        end
+    finally
+        reset_store!(store)
+    end
+end
+
 @testset "queue introspection is an admin surface (#87)" begin
     store = InMemoryWorkerStore()
     try

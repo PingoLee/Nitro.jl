@@ -157,6 +157,17 @@ On startup, `RUNNING` tasks without a live in-memory `Task` are marked `FAILED` 
 
 > **Strict core isolation**: Never import `PormG` or run DB queries in `src/Workers`. Database logic belongs in `ext/NitroPormGExt.jl`.
 
+- **`lock_tasks` is process-local, so never build a read-modify-write on it.** For a
+  database-backed store it is a plain `ReentrantLock` in the struct: two processes sharing one
+  database each take their own and neither sees the other
+  ([#88](https://github.com/PingoLee/Nitro.jl/issues/88)). A write that must not lose a concurrent
+  update belongs in the store as a single atomic *intent* operation — `add_watcher!` (a
+  compare-and-set on the stored document) and `try_transition!` (a conditional status change) are
+  the pattern. Composing `get_task_info` + mutate + `set_task!` under the lock is exactly the bug.
+- **`set_task!` writes state; `replace_task!` writes the whole record.** `set_task!` must never
+  write `watchers` — grants are not volatile state, and carrying them on every transition is how
+  they got clobbered. `replace_task!` has exactly one caller: re-running a finished key, which by
+  design resets the watcher list.
 - Add abstract stubs in `src/Workers/registry.jl`.
 - Implement in `InMemoryWorkerStore` **and** `PormGWorkerStore` — a hook implemented in only one of
   them is a store that silently behaves differently, which for the authorizer pair means a silently

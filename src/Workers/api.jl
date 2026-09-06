@@ -193,16 +193,19 @@ function _register_or_watch!(store::AbstractWorkerStore, task_key::String, owner
         end
 
         if task_info !== nothing && task_info.status in (RUNNING, PENDING)
-            if !(uid in task_info.watchers)
-                push!(task_info.watchers, uid)
-                set_task!(store, task_key, task_info)
-            end
+            # Atomic and idempotent in the store. Composing this out of
+            # get + push! + set_task! under `lock_tasks` is what #88 was: that lock is
+            # process-local for a database-backed store, so the read-modify-write was
+            # last-write-wins across processes.
+            add_watcher!(store, task_key, uid)
             return false
         end
 
+        # Re-running a finished key replaces the record and resets its watchers to the
+        # resubmitter — the one place a whole record, watchers included, is written.
         task_info = TaskInfo(task_key; queue_name)
         push!(task_info.watchers, uid)
-        set_task!(store, task_key, task_info)
+        replace_task!(store, task_key, task_info)
         return true
     end
 end
@@ -347,6 +350,21 @@ function cancel_task(task_id::AbstractString, authority::TaskAuthority; store::A
             return Dict{Symbol, Any}(:error => "Task already finished with status $(task_info.status)")
         end
 
+        # Claim the transition *before* interrupting anything. The status precondition
+        # and the write are one atomic step in the store, so a task finishing
+        # concurrently — in this process or another one sharing the database — either
+        # loses the race and stays cancelled, or wins it and we report the truth.
+        # Doing this with a read, a decision, and a full-record save under `lock_tasks`
+        # was #88: that lock does not span processes.
+        claimed = try_transition!(store, task_info.id, (PENDING, RUNNING), CANCELLED;
+                                  error="Cancelled", completed_at=current_time_utc())
+
+        if !claimed
+            latest = get_task_info(store, task_info.id)
+            latest === nothing && return Dict{Symbol, Any}(:error => "Task not found")
+            return Dict{Symbol, Any}(:error => "Task already finished with status $(latest.status)")
+        end
+
         sys_task = get_active_task(store, task_info.id)
         if sys_task !== nothing && !istaskdone(sys_task)
             try
@@ -355,10 +373,6 @@ function cancel_task(task_id::AbstractString, authority::TaskAuthority; store::A
             end
         end
 
-        task_info.error = "Cancelled"
-        task_info.completed_at = current_time_utc()
-        task_info.status = CANCELLED
-        set_task!(store, task_info.id, task_info)
         deregister_active_task!(store, task_info.id)
         deregister_active_task_info!(store, task_info.id)
 

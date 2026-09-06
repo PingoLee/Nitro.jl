@@ -361,6 +361,21 @@ worker_store = pormg_nitro_worker(db_key="workers")
 
 Task metadata will now be persisted to that database, while live running threads are managed safely in memory to prevent serialization issues.
 
+!!! note "Multiple processes sharing one database"
+    Because the store persists across restarts, it invites deployments where several
+    processes share one database — two app instances behind a load balancer, or a web
+    process plus a worker process. Writes that must not lose a concurrent update go
+    through the store as single atomic operations rather than read-modify-write: watcher
+    grants use a compare-and-set on the stored document, and cancellation uses a
+    conditional status transition. An ordinary state save (`set_task!`) never writes the
+    watcher list at all, so a task finishing in one process cannot drop a grant another
+    process just added.
+
+    The store's `lock_tasks` is a plain `ReentrantLock` and therefore **process-local** —
+    it orders writes within one process and gives you nothing across processes. Do not
+    build a read-modify-write on top of it and assume it is safe; use the atomic store
+    operations, or add one.
+
 ### 3. Start workers with the persistent store
 Pass the store into the worker startup middleware:
 

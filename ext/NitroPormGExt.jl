@@ -14,7 +14,8 @@ import Nitro: pormg_nitro_session
 import Nitro.Workers: AbstractWorkerStore, TaskInfo, TaskStatus, TaskOptions, SequentialQueue, CleanupScheduler,
     PENDING, RUNNING, COMPLETED, FAILED, CANCELLED,
     TaskAuthority, Owner, System, owner_of, _is_authorized, TASK_KEY_DELIMITER,
-    get_task_info, set_task!, delete_task!, cleanup_tasks!, get_all_tasks,
+    get_task_info, set_task!, replace_task!, add_watcher!, try_transition!,
+    delete_task!, cleanup_tasks!, get_all_tasks,
     get_active_task, register_active_task!, deregister_active_task!,
     get_active_task_info, register_active_task_info!, deregister_active_task_info!,
     get_queue_authorizer, set_queue_authorizer!,
@@ -525,11 +526,13 @@ function get_task_info(store::PormGWorkerStore, task_id::String)
     end
 end
 
-function set_task!(store::PormGWorkerStore, task_id::String, task_info::TaskInfo)
+function _write_task!(store::PormGWorkerStore, task_id::String, task_info::TaskInfo, replace_watchers::Bool)
     record = _to_db_record(task_info)
     try
         existing = _task_objects(store).filter("id" => task_id).first()
         if isnothing(existing)
+            # A fresh row has no watchers to preserve, so the create branch always
+            # writes them whichever entry point we came through.
             _task_objects(store).create(
                 "id" => record["id"],
                 "status" => record["status"],
@@ -543,7 +546,7 @@ function set_task!(store::PormGWorkerStore, task_id::String, task_info::TaskInfo
                 "queue_name" => record["queue_name"],
             )
         else
-            _task_objects(store).filter("id" => task_id).update(
+            columns = Pair{String, Any}[
                 "status" => record["status"],
                 "progress" => record["progress"],
                 "result" => record["result"],
@@ -551,15 +554,99 @@ function set_task!(store::PormGWorkerStore, task_id::String, task_info::TaskInfo
                 "created_at" => record["created_at"],
                 "started_at" => record["started_at"],
                 "completed_at" => record["completed_at"],
-                "watchers" => record["watchers"],
                 "queue_name" => record["queue_name"],
-            )
+            ]
+            # `watchers` rides along ONLY for `replace_task!`. Including it on every
+            # save is what made ordinary state transitions clobber grants appended by
+            # another process since this one last read the row (#88) — and transitions
+            # are far more frequent than appends, so that was the dominant loss path.
+            replace_watchers && push!(columns, "watchers" => record["watchers"])
+            _task_objects(store).filter("id" => task_id).update(columns...)
         end
     catch e
         @warn "PormGWorkerStore: failed to write task" exception=(e, catch_backtrace())
         rethrow()
     end
     return task_info
+end
+
+set_task!(store::PormGWorkerStore, task_id::String, task_info::TaskInfo) =
+    _write_task!(store, task_id, task_info, false)
+
+replace_task!(store::PormGWorkerStore, task_id::String, task_info::TaskInfo) =
+    _write_task!(store, task_id, task_info, true)
+
+# How many attempts the watcher compare-and-set gets before giving up. Contention on one
+# task row is bounded by the number of processes appending to it, so this is generous.
+const _WATCHER_CAS_ATTEMPTS = 8
+
+# Read the ROW, never the live in-memory object. `get_task_info` serves the live
+# `active_task_info` for a running task, whose watchers may already differ from what is
+# stored — and a compare-and-set has to compare against the value the UPDATE will match.
+function _read_db_task(store::PormGWorkerStore, task_id::String)
+    row = _task_objects(store).filter("id" => task_id).first()
+    return isnothing(row) ? nothing : _from_db_record(row)
+end
+
+# Keep a running task's live object in step with a grant written to the row. Without
+# this, `get_task_info` and `get_all_tasks` would serve the live object and the new
+# watcher would stay invisible until the task terminated.
+function _sync_live_watcher!(store::PormGWorkerStore, task_id::String, user_id::String)
+    lock(store.active_lock) do
+        live = Base.get(store.active_task_infos, task_id, nothing)
+        if live !== nothing && !(user_id in live.watchers)
+            push!(live.watchers, user_id)
+        end
+    end
+    return nothing
+end
+
+function add_watcher!(store::PormGWorkerStore, task_id::String, user_id::String)
+    for _ in 1:_WATCHER_CAS_ATTEMPTS
+        task = _read_db_task(store, task_id)
+        task === nothing && return false
+
+        if user_id in task.watchers
+            _sync_live_watcher!(store, task_id, user_id)
+            return true
+        end
+
+        expected = JSON.json(task.watchers)
+        updated = JSON.json(vcat(task.watchers, user_id))
+
+        # The `watchers` term in the filter is the *compare* half of the CAS: if another
+        # process wrote between our read and this statement, zero rows match and we retry
+        # against the value they left. So we can never overwrite an append we did not see.
+        matched = _task_objects(store).filter("id" => task_id, "watchers" => expected)
+        changed = matched.update("watchers" => updated)
+
+        if changed isa Integer && changed >= 1
+            # Durable record first: a crash between the two leaves the row correct, and
+            # the row is what `get_all_tasks` reads watchers from.
+            _sync_live_watcher!(store, task_id, user_id)
+            return true
+        end
+    end
+
+    error("PormGWorkerStore: could not append watcher '$user_id' to task '$task_id' after " *
+          "$(_WATCHER_CAS_ATTEMPTS) attempts — either the row is under heavy contention, or its " *
+          "`watchers` column is not in the canonical JSON form this store writes")
+end
+
+function try_transition!(store::PormGWorkerStore, task_id::String, from, to::TaskStatus;
+                         error::Union{Nothing, String}=nothing,
+                         completed_at::Union{Nothing, DateTime}=nothing)
+    columns = Pair{String, Any}["status" => string(to)]
+    error === nothing || push!(columns, "error" => error)
+    completed_at === nothing || push!(columns, "completed_at" => completed_at)
+
+    # The status precondition lives in the WHERE clause, so the compare and the write are
+    # one statement. Zero rows affected means the task was absent or had already left
+    # `from` — and, crucially, that nothing was written.
+    matched = _task_objects(store).filter("id" => task_id, "status__@in" => [string(s) for s in from])
+    changed = matched.update(columns...)
+
+    return changed isa Integer && changed >= 1
 end
 
 function delete_task!(store::PormGWorkerStore, task_id::String)

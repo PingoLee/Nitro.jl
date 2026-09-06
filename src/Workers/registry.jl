@@ -2,7 +2,76 @@ abstract type AbstractWorkerStore end
 
 # -- Storage and Registry interface functions (Abstract protocols) --
 function get_task_info end
+
+"""
+    set_task!(store, task_id::String, task_info::TaskInfo)
+
+Persist a task's **volatile runtime state**: status, progress, result, error, timestamps.
+
+**It must not write `watchers`.** Grants are not volatile state, and a store that carries
+them along on every state transition loses them: `PormGWorkerStore` rewrote the whole row
+on each save, so a task completing in one process clobbered a watcher another process had
+appended since that process last read the row
+([#88](https://github.com/PingoLee/Nitro.jl/issues/88)). State transitions are far more
+frequent than watcher appends, so this was the dominant way a grant went missing.
+
+Use [`add_watcher!`](@ref) to add a grant and [`replace_task!`](@ref) to write a whole
+record, watchers included.
+"""
 function set_task! end
+
+"""
+    replace_task!(store, task_id::String, task_info::TaskInfo)
+
+Write a task record **in full, `watchers` included**, replacing whatever is stored.
+
+The counterpart to [`set_task!`](@ref), and the only sanctioned way to reset a watcher
+list. There is exactly one caller: re-running a *finished* task key, which by documented
+design replaces the record and resets its watchers to the resubmitter.
+
+A store that cannot distinguish this from `set_task!` has not implemented `set_task!`
+correctly — the whole point of the split is that ordinary saves leave grants alone.
+"""
+function replace_task! end
+
+"""
+    add_watcher!(store, task_id::String, user_id::String) -> Bool
+
+Grant `user_id` watch access to `task_id`. Returns `true`, or `false` when no such task
+exists. Idempotent.
+
+**This is an atomic intent operation, and implementing it as read + `push!` + `set_task!`
+defeats its purpose.** `_register_or_watch!` used to compose it exactly that way under
+`lock_tasks`, which for a database-backed store is a *process-local* `ReentrantLock`: two
+processes sharing one database each took their own and neither saw the other, so the
+read-modify-write was last-write-wins and an append could vanish
+([#88](https://github.com/PingoLee/Nitro.jl/issues/88)). A backend must make this a single
+atomic step against its own storage — a compare-and-set, a conditional update, or a lock
+the storage engine itself honours.
+
+Performs **no** authorization. The authorized public path for granting access is the
+`watchers=` keyword on `submit_task` / `submit_sequential_task`.
+"""
+function add_watcher! end
+
+"""
+    try_transition!(store, task_id::String, from, to::TaskStatus;
+                    error=nothing, completed_at=nothing) -> Bool
+
+Move `task_id` from any status in `from` to `to`, atomically. Returns `true` if this call
+made the transition, `false` if the task was absent or had already left `from` — in which
+case **nothing was written**.
+
+The compare-and-set counterpart to `set_task!` for the one write where losing the race
+matters: cancellation. `cancel_task` used to read the status, decide, and then save the
+whole record under `lock_tasks`; against a shared database that lock does not span
+processes, so a task completing in one process could overwrite a cancellation another
+process had just recorded ([#88](https://github.com/PingoLee/Nitro.jl/issues/88)).
+
+`from` is any iterable of `TaskStatus`. Like `set_task!`, this must not write `watchers`.
+"""
+function try_transition! end
+
 function delete_task! end
 function cleanup_tasks! end
 function get_all_tasks end
@@ -109,9 +178,52 @@ end
 
 function set_task!(store::InMemoryWorkerStore, task_id::String, task_info::TaskInfo)
     lock(store.task_lock) do
+        existing = Base.get(store.task_registry, task_id, nothing)
+        if existing !== nothing && existing !== task_info
+            # Callers almost always save the very object they read, in which case there
+            # is nothing to reconcile. When they do not, honour the same contract the
+            # serializing stores now do: a state save carries state, never grants. Both
+            # backends must agree here — a rule enforced by only one of them is a store
+            # that silently behaves differently.
+            empty!(task_info.watchers)
+            append!(task_info.watchers, existing.watchers)
+        end
         store.task_registry[task_id] = task_info
     end
     return task_info
+end
+
+function replace_task!(store::InMemoryWorkerStore, task_id::String, task_info::TaskInfo)
+    lock(store.task_lock) do
+        store.task_registry[task_id] = task_info
+    end
+    return task_info
+end
+
+function add_watcher!(store::InMemoryWorkerStore, task_id::String, user_id::String)
+    lock(store.task_lock) do
+        task_info = Base.get(store.task_registry, task_id, nothing)
+        task_info === nothing && return false
+        # Mutating the registered object *is* the store write — no round-trip, and so
+        # no window between the mutation and its publication.
+        user_id in task_info.watchers || push!(task_info.watchers, user_id)
+        return true
+    end
+end
+
+function try_transition!(store::InMemoryWorkerStore, task_id::String, from, to::TaskStatus;
+                         error::Union{Nothing, String}=nothing,
+                         completed_at::Union{Nothing, DateTime}=nothing)
+    lock(store.task_lock) do
+        task_info = Base.get(store.task_registry, task_id, nothing)
+        task_info === nothing && return false
+        task_info.status in from || return false
+
+        error === nothing || (task_info.error = error)
+        completed_at === nothing || (task_info.completed_at = completed_at)
+        task_info.status = to        # last, so no reader sees the new status early
+        return true
+    end
 end
 
 function delete_task!(store::InMemoryWorkerStore, task_id::String)
