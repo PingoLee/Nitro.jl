@@ -2,6 +2,7 @@
 using Test
 using UUIDs
 using Nitro.Core.Util
+using Nitro.Core.Util: mount_segments, mount_route
 using Nitro.Core: serverwelcome
 using Nitro: ValidationError
 
@@ -201,6 +202,43 @@ end
     @test !occursin("Environment:", output_without_env)
     @test occursin("Global prefix: /api", output_without_env)
     @test occursin("parallel mode:", output_without_env)
+end
+
+
+@testset "mount_segments canonicalization" begin
+    # The SINGLE normalization point for `mountdir` (#93). staticfiles/spafiles/dynamicfiles no
+    # longer strip anything themselves, so `mountfolder` and `spafiles`' history-mode fallback both
+    # derive their routes from the raw value through this one function and cannot drift apart.
+    for md in ("", "/", "//", "   ", "\t\n", " / ", "/ ", "/ / ")
+        @test mount_segments(md) == String[]
+    end
+
+    for md in ("static", "/static", "static/", "/static/", "//static//", " static ", " / static / ")
+        @test mount_segments(md) == ["static"]
+    end
+
+    # Interior separators are preserved -- a nested prefix is a real mount, not a spelling variant.
+    @test mount_segments("a/b") == ["a", "b"]
+    @test mount_segments("/a/b/") == ["a", "b"]
+
+    # `::Vector{String}`, not a vector of SubStrings: the String() conversion is load-bearing.
+    @test mount_segments("static") isa Vector{String}
+end
+
+@testset "mount_route joins segments" begin
+    # The empty vector is the router root, spelled explicitly. HTTP.jl treats "" and "/" alike, but
+    # relying on that made a root mount's bare-directory route correct only by accident (#94).
+    @test mount_route(String[]) == "/"
+    @test mount_route(["static"]) == "/static"
+    @test mount_route(["static", "app.js"]) == "/static/app.js"
+    @test mount_route(["a", "b", "c"]) == "/a/b/c"
+
+    # Joining cannot produce a doubled separator, whatever the mountdir spelling was.
+    for md in ("static", "/static", "static/", "/static/", "//static//", "", "/")
+        route = mount_route(vcat(mount_segments(md), "app.js"))
+        @test !occursin("//", route)
+        @test startswith(route, "/")
+    end
 end
 
 end

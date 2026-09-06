@@ -1277,9 +1277,6 @@ function staticfiles(
     include_hidden::Bool=false,
     allow_symlink_escape::Bool=false,
 )
-    if first(mountdir) == '/'
-        mountdir = mountdir[2:end]
-    end
     function addroute(currentroute, filepath)
         resp = file(filepath; loadfile=loadfile, headers=headers)
         register_internal(ctx, router, GET, currentroute, () -> resp)
@@ -1298,9 +1295,6 @@ function spafiles(
     include_hidden::Bool=false,
     allow_symlink_escape::Bool=false,
 )
-    if first(mountdir) == '/'
-        mountdir = mountdir[2:end]
-    end
 
     function addroute(currentroute, filepath)
         resp = file(filepath; loadfile=loadfile, headers=headers)
@@ -1312,13 +1306,14 @@ function spafiles(
     # (`isfile(joinpath(folder, "index.html"))`, which follows symlinks) reached straight past the
     # enumeration rules: a refused `index.html` was still served here on *every* unmatched path
     # under the mount, which is a strictly larger hole than the single route it was denied.
-    # Derive the prefix through the same helper `mountfolder` uses — spelling it separately here is
-    # how the two drifted for an all-whitespace `mountdir`, silently dropping the fallback.
-    prefix      = Util.mount_prefix(mountdir)
-    index_route = isempty(prefix) ? "/index.html" : "/$prefix/index.html"
+    # Derive the routes through the same helpers `mountfolder` uses, so the two cannot spell the
+    # mount differently — the property that keeps an all-whitespace `mountdir` from silently
+    # dropping the fallback, as it once did when each side normalized separately.
+    segments    = Util.mount_segments(mountdir)
+    index_route = Util.mount_route(vcat(segments, "index.html"))
     if index_route in mounted
         index_path     = joinpath(folder, "index.html")
-        fallback_route = isempty(prefix) ? "/**" : "/$prefix/**"
+        fallback_route = Util.mount_route(vcat(segments, "**"))
         register_internal(ctx, router, GET, fallback_route, (req::HTTP.Request) ->
             file(index_path; loadfile=loadfile, headers=headers))
     else
@@ -1338,9 +1333,6 @@ function dynamicfiles(
     include_hidden::Bool=false,
     allow_symlink_escape::Bool=false,
 )
-    if first(mountdir) == '/'
-        mountdir = mountdir[2:end]
-    end
     # Which files exist here is decided once, at mount time. Serving a directory whose contents an
     # attacker can change is out of scope for this layer — see docs/design/static-serving-boundary.md.
     function addroute(currentroute, filepath)

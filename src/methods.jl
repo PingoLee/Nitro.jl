@@ -84,6 +84,10 @@ Mount the servable files inside `folder` under `mountdir`, reading each one **on
 fast to serve, but a change on disk needs a restart. Use [`dynamicfiles`](@ref) to re-read per
 request, or [`spafiles`](@ref) for a single-page app.
 
+`mountdir` is normalized: surrounding whitespace and `/` are stripped, so `"static"`, `"/static"`,
+`"static/"` and `"/static/"` are the same mount, and `""`, `"/"` and whitespace all mount at the router
+root.
+
 Not every file in `folder` is served. These are refused:
 
 - **Hidden entries** — any path component starting with `.` *relative to `folder`*, so `.env` and
@@ -130,6 +134,10 @@ Mount `folder` for a Single Page Application. In addition to registering its ser
 registers a catch-all route under `mountdir` that serves `index.html` for any unmatched request,
 enabling SPA History Mode routing.
 
+`mountdir` is normalized: surrounding whitespace and `/` are stripped, so `"static"`, `"/static"`,
+`"static/"` and `"/static/"` are the same mount, and `""`, `"/"` and whitespace all mount at the router
+root.
+
 Which files are servable — and the `include_hidden` / `allow_symlink_escape` opt-outs — is described
 in [`staticfiles`](@ref); the same rules apply here. Two SPA-specific consequences:
 
@@ -156,6 +164,10 @@ spafiles(
 Mount the servable files inside `folder` under `mountdir`, re-reading each one **on every request**
 so changes on disk are picked up without a restart. Use [`staticfiles`](@ref) to snapshot at startup
 instead.
+
+`mountdir` is normalized: surrounding whitespace and `/` are stripped, so `"static"`, `"/static"`,
+`"static/"` and `"/static/"` are the same mount, and `""`, `"/"` and whitespace all mount at the router
+root.
 
 Which files are servable — and the `include_hidden` / `allow_symlink_escape` opt-outs — is described
 in [`staticfiles`](@ref); the same rules apply here. They are evaluated **once, at mount time**: this

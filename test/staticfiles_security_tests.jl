@@ -240,6 +240,89 @@ end
     @test "/assets" ∈ routes
 end
 
+@testset "every spelling of a mountdir names the same mount" begin
+    # `mountdir` is canonicalized once, in `mount_segments` -- the three public mount functions no
+    # longer strip anything themselves (#93). Driving `mountfolder` directly needs no router and no
+    # global state, so this is the cheap place to pin the whole equivalence class.
+    baseline = MOUNTFOLDER(root, "assets", (_r, _p) -> nothing)
+    for md in ("/assets", "assets/", "/assets/", "//assets//", " /assets/ ")
+        @test MOUNTFOLDER(root, md, (_r, _p) -> nothing) == baseline
+    end
+
+    # `""` used to throw a BoundsError at the entry point, while everything downstream already
+    # treated it as "mount at the root".
+    root_baseline = MOUNTFOLDER(root, "", (_r, _p) -> nothing)
+    for md in ("/", "   ", " / ")
+        @test MOUNTFOLDER(root, md, (_r, _p) -> nothing) == root_baseline
+    end
+    @test "/visible.txt" ∈ root_baseline
+    @test "/index.html" ∈ root_baseline
+
+    # Routes are rebuilt by joining segments, so a doubled separator is unrepresentable. Interior
+    # separators are still a real nested mount, not a spelling variant.
+    #
+    # NOTE: a root mount still emits one empty-string route here, for the bare directory path of a
+    # top-level index.html. That is #94's territory, not #93's -- `mountfolder` still derives it
+    # with `getbefore` -- so the "every route starts with /" assertion lands with that fix, and
+    # this loop stays green on its own.
+    for md in ("assets", "/assets/", "//assets//", "", "/", "a/b")
+        for route in MOUNTFOLDER(root, md, (_r, _p) -> nothing)
+            @test !occursin("//", route)
+        end
+    end
+    @test "/a/b/visible.txt" ∈ MOUNTFOLDER(root, "a/b", (_r, _p) -> nothing)
+end
+
+@testset "the three mount functions accept a root mountdir" begin
+    # The literal #93 report: `staticfiles(folder, "")` died on `first("")` before doing anything.
+    resetstate()
+    try
+        staticfiles(root, "")
+        @test internalrequest(HTTP.Request("GET", "/visible.txt")).status == 200
+        @test internalrequest(HTTP.Request("GET", "/.env")).status == 404
+    finally
+        resetstate()
+    end
+
+    # `"/"` alone would not discriminate here: the old code stripped it to `""` and `mount_prefix`
+    # accepted that. `""` is the spelling that used to throw.
+    resetstate()
+    try
+        dynamicfiles(root, "")
+        @test internalrequest(HTTP.Request("GET", "/visible.txt")).status == 200
+        @test internalrequest(HTTP.Request("GET", "/.env")).status == 404
+    finally
+        resetstate()
+    end
+
+    # spafiles registers `GET /**` for a root mount, which swallows every 404 -- so it gets its own
+    # block and asserts nothing negative.
+    resetstate()
+    try
+        spafiles(root, "")
+        @test internalrequest(HTTP.Request("GET", "/visible.txt")).status == 200
+        @test internalrequest(HTTP.Request("GET", "/index.html")).status == 200
+    finally
+        resetstate()
+    end
+end
+
+@testset "non-canonical mountdir spellings reach the router" begin
+    # The deleted leading-slash strips lived in the three *public* functions, so the equivalence
+    # class above -- which drives `mountfolder` directly -- cannot prove they are gone. These do.
+    for mountdir in ("assets", "/assets", "assets/", "/assets/", "//assets//", " /assets/ ")
+        resetstate()
+        try
+            staticfiles(root, mountdir)
+            @test internalrequest(HTTP.Request("GET", "/assets/visible.txt")).status == 200
+            @test internalrequest(HTTP.Request("GET", "/assets")).status == 200   # bare index.html
+            @test internalrequest(HTTP.Request("GET", "/assets/.env")).status == 404
+        finally
+            resetstate()
+        end
+    end
+end
+
 @testset "refused files are not reachable through the router" begin
     resetstate()
     try

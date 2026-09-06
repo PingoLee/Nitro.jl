@@ -92,6 +92,47 @@ port = get_free_port()
             resetstate()
         end
     end
+
+    @testset "spafiles mounts at the router root" begin
+        # `""` used to throw a BoundsError at the entry point (#93) -- that is what this testset
+        # catches on the old code; the `"/"` case is a contract test that passed before too. The
+        # deep link is the end-to-end check that `mountfolder` and the fallback still derive the
+        # same prefix, which is the property that must not regress now that neither pre-strips.
+        for mountdir in ("", "/")
+            resetstate()
+            try
+                spafiles(test_dir, mountdir)
+
+                @test internalrequest(HTTP.Request("GET", "/assets/app.js")).status == 200
+                @test String(internalrequest(HTTP.Request("GET", "/index.html")).body) == "<h1>SPA Index</h1>"
+                @test String(internalrequest(HTTP.Request("GET", "/")).body) == "<h1>SPA Index</h1>"
+                # The deep link can only resolve through the registered fallback.
+                @test String(internalrequest(HTTP.Request("GET", "/users/123")).body) == "<h1>SPA Index</h1>"
+            finally
+                resetstate()
+            end
+        end
+    end
+
+    @testset "spafiles fallback survives a non-canonical mountdir" begin
+        # The root cases above cannot show a prefix disagreement, because both sides collapse to
+        # nothing. A non-canonical *non-root* spelling is where `mountfolder` and the fallback
+        # derivation would visibly diverge if they ever stopped sharing `mount_segments`.
+        for mountdir in ("app", "/app", "app/", "/app/", " /app/ ")
+            resetstate()
+            try
+                spafiles(test_dir, mountdir)
+
+                @test internalrequest(HTTP.Request("GET", "/app/assets/app.js")).status == 200
+                @test String(internalrequest(HTTP.Request("GET", "/app")).body) == "<h1>SPA Index</h1>"
+                # Only the registered fallback can answer this.
+                @test String(internalrequest(HTTP.Request("GET", "/app/users/123")).body) == "<h1>SPA Index</h1>"
+                @test internalrequest(HTTP.Request("GET", "/elsewhere")).status == 404
+            finally
+                resetstate()
+            end
+        end
+    end
 end
 
 end
