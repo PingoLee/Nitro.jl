@@ -171,6 +171,8 @@ end
 #   `nworker_threads`, so `julia -t auto ... runtests.jl` still runs items multithreaded
 #   and CI's `JULIA_NUM_THREADS: 1` leg still runs them on one thread. `--workers 0` opts
 #   back in to the old in-process mode for debugging, at the cost of per-item timeouts.
+#   Running under `--code-coverage` also forces in-process, for the same reason -- see the
+#   `runtests` call for why coverage and worker timeouts cannot both be had.
 let args = copy(ARGS)
     paths     = String[]
     tags      = Symbol[]
@@ -220,11 +222,25 @@ let args = copy(ARGS)
     # omitting it would silently run every item on two threads and quietly delete CI's
     # `JULIA_NUM_THREADS: 1` leg -- the one that exists to catch thread-count-dependent
     # races. Forwarding the launcher's own thread count keeps `-t` meaningful.
+    #
+    # ...but a worker cannot produce coverage, so the two are mutually exclusive.
+    # ReTestItems' `terminate!` (workers.jl) always ends a worker with SIGTERM, escalating
+    # to SIGINT/SIGKILL -- there is no clean-exit path -- and Julia writes `.cov` files only
+    # on a clean exit. So on Linux the worker's coverage is discarded, and the run reports
+    # only what the coordinator itself executed: ~0.3% instead of ~86%. (Windows survives
+    # it, because `kill` there is `TerminateProcess` with different teardown -- the same
+    # platform split that function documents inline. CI measures coverage on ubuntu.)
+    #
+    # Coverage therefore wins in the one job that collects it, and timeouts win everywhere
+    # else. That is the right way round: exactly one CI job runs with `--code-coverage`,
+    # and the other seven keep a per-item ceiling, so a hang is still caught -- just not by
+    # the coverage job.
+    covering = Base.JLOptions().code_coverage != 0
     runtests(
         paths...;
         testitem_timeout = 600,
         test_end_expr = TEST_END,
-        nworkers = nworkers < 0 ? 1 : nworkers,
+        nworkers = covering ? 0 : (nworkers < 0 ? 1 : nworkers),
         nworker_threads = string(Threads.nthreads()),
         tags     = isempty(tags) ? nothing : tags,
         name     = isnothing(name_filt) ? nothing : name_filt,
