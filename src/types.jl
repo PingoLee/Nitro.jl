@@ -611,6 +611,47 @@ function Base.getproperty(request::LazyRequest, sym::Symbol)
     return getfield(request, sym)
 end
 
+# ── Per-request accessor cache (#38) ──────────────────────────────────────────
+#
+# `pathparams`, `queryvars` and `headers` were the only request accessors with no
+# memoization: each one re-decoded and rebuilt its whole `Dict` on every call, and the
+# param binder calls them once *per bound parameter*, so a handler with three query
+# params re-parsed the same unchanged target three times. `req.json`/`req.form` have
+# been memoized all along; this closes the gap.
+#
+# Deliberately reaches `getfield(req, :context)` — the raw `HTTP.RequestContext` —
+# rather than `req.context`. The property accessor calls `_request_context_metadata!`,
+# which *creates* the backing `Dict{Symbol,Any}` on first touch, so a plain cache
+# probe would allocate the very thing it is trying to save. `RequestContext`'s own
+# `haskey`/`getindex`/`setindex!` short-circuit on `metadata === nothing`, so a miss
+# on an untouched request costs nothing.
+#
+# `haskey` + `getindex` rather than `get(ctx, key, nothing)` so a legitimately-cached value
+# is never confused with a miss.
+#
+# `pathparams` is the one accessor that must NOT cache a `nothing`. `HTTP.getparams` reads
+# `req.context[:params]`, a slot the ROUTER fills -- and middleware runs *before* the router.
+# A pre-router read (a guard doing `req.params["user_id"]`, or anything touching `req.input`,
+# which merges path params in) would otherwise memoize `nothing` for the rest of the request,
+# and the path binder would then index into `nothing` and turn every parameterized route into
+# a 500. "Unrouted" is a transient state of the request, not a property of it, so it is
+# returned uncached and recomputed until the router has actually run.
+#
+# A throwing builder caches nothing and rethrows on the next touch. That is correct and
+# load-bearing: `queryvars` raises `ValidationError` on malformed percent-encoding, and
+# a memoized *value* would be the wrong shape for an error the caller turns into a 400.
+const REQUEST_PATHPARAMS_CACHE_KEY = :__nitro_request_pathparams
+const REQUEST_QUERY_CACHE_KEY      = :__nitro_request_query
+const REQUEST_HEADERS_CACHE_KEY    = :__nitro_request_headers
+
+@inline function request_cache!(builder::Function, req::HTTP.Request, key::Symbol)
+    ctx = getfield(req, :context)
+    haskey(ctx, key) && return ctx[key]
+    value = builder()
+    ctx[key] = value
+    return value
+end
+
 # Percent-decoding happens exactly ONCE, here at the boundary where the raw request becomes a
 # map. Everything downstream — `parseparam`, `parsetype`, `struct_builder` — is pure type
 # conversion and must never unescape again.
@@ -630,9 +671,11 @@ end
 # `create_param_parser` therefore infers `String` instead of `Any` — one dynamic dispatch fewer
 # on the request path, not a new instability. Do not "restore" the old shape.
 #
-# Each call returns a FRESH Dict (the decode cannot be done in place), so `req.params` is a
-# snapshot, not a handle: mutating it does not change what the next read returns. Use
-# `req.context` to pass values down a request. Caching it per request is #38's scope.
+# The decode cannot be done in place, so this builds a Dict — but it is built ONCE per request
+# and cached by the `pathparams` wrapper below (#38), which makes `req.params` a live handle
+# rather than a snapshot: mutating it is visible to every later read. Treat it as read-only and
+# use `req.context` to pass values down a request. `req.json`/`req.form` have always behaved
+# this way; this accessor and `queryvars` were the outliers.
 #
 # `HTTP.unescapeuri` THROWS on a malformed escape (`EOFError` for a trailing "%", `ArgumentError`
 # for "%ZZ"). That is client input, so it must be a 400 -- and the decode now runs here, outside
@@ -640,7 +683,7 @@ end
 # a malformed scalar param is a client error rather than a 500 with a logged backtrace.
 # The offending value is deliberately not interpolated: `.msg` is app-reachable and a path
 # segment can carry a token.
-function pathparams(req::HTTP.Request)
+function _pathparams_uncached(req::HTTP.Request)
     raw = HTTP.getparams(req)
     raw === nothing && return nothing
     decoded = Dict{String,String}()
@@ -665,7 +708,7 @@ end
 # escape, so `?q=%ZZ` was a 500 here too (pre-existing -- this accessor's decode was never
 # inside `parseparam_checked` either). Both accessors now owe their caller a well-formed map
 # or a `ValidationError`; neither leaks a raw decode failure into the server-error path.
-function queryvars(req::HTTP.Request)
+function _queryvars_uncached(req::HTTP.Request)
     # Deliberately OUTSIDE the guard: a `req.target` this malformed is a framework/router
     # problem, not client input, and must stay a logged 500 rather than be laundered into a 400.
     query = HTTP.URI(req.target).query
@@ -686,7 +729,32 @@ end
 # Header names are case-insensitive per RFC 9110, and downstream consumers (the
 # `Header` extractor's `struct_builder`, cookie lookups) match against lowercase
 # keys, so normalize to lowercase here for stable, case-insensitive access.
-headers(req::HTTP.Request)   = Dict(lowercase(String(k)) => String(v) for (k, v) in req.headers)
+_headers_uncached(req::HTTP.Request) = Dict(lowercase(String(k)) => String(v) for (k, v) in req.headers)
+
+# The cached public accessors. The return annotations are not decoration: the cache
+# round-trips through a `Dict{Symbol,Any}`, so without them every cached read would come
+# back as `Any` and hand back the type instability #37 just removed from this path.
+function pathparams(req::HTTP.Request) :: Nullable{Dict{String,String}}
+    ctx = getfield(req, :context)
+    haskey(ctx, REQUEST_PATHPARAMS_CACHE_KEY) &&
+        return ctx[REQUEST_PATHPARAMS_CACHE_KEY] :: Dict{String,String}
+    decoded = _pathparams_uncached(req)
+    # See the note above: `nothing` here means the router has not run yet, so caching it
+    # would poison every later read on this request.
+    decoded === nothing && return nothing
+    ctx[REQUEST_PATHPARAMS_CACHE_KEY] = decoded
+    return decoded
+end
+
+queryvars(req::HTTP.Request) =
+    request_cache!(req, REQUEST_QUERY_CACHE_KEY) do
+        _queryvars_uncached(req)
+    end :: Dict{String,String}
+
+headers(req::HTTP.Request) =
+    request_cache!(req, REQUEST_HEADERS_CACHE_KEY) do
+        _headers_uncached(req)
+    end :: Dict{String,String}
 
 jsonbody(req::HTTP.Request; kwargs...) = json(req; kwargs...)
 formbody(req::HTTP.Request)           = formdata(req)

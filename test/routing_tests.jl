@@ -517,3 +517,49 @@ end
 end
 
 end
+
+@testitem "Middleware may read path params before the router runs (#38)" tags=[:core] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+using Nitro.Core: ServerContext, internalrequest
+using Nitro.Core.Routing: urlpatterns
+
+# Regression for the per-request path-param cache. `HTTP.getparams` reads a context slot the
+# ROUTER fills, but middleware — global and per-route alike, including guards — runs before
+# the router. A cache that memoized the `nothing` such a read sees would make the path binder
+# index into `nothing`, turning every parameterized route into a 500. The middleware here is
+# the shape that made this reachable: an ownership guard reading `req.params`.
+ctx = ServerContext()
+urlpatterns(ctx, "", Nitro.RouteDefinition[
+    Nitro.path("/items/<int:id>", (req, id::Int) -> Res.json(Dict("id" => id)), method="GET"),
+])
+
+reads_params(handler) = function (req::HTTP.Request)
+    @test req.params === nothing        # pre-router: genuinely not populated yet
+    handler(req)
+end
+
+reads_input(handler) = function (req::HTTP.Request)
+    _ = req.input                       # merges path params, so it touches them too
+    handler(req)
+end
+
+@testset "no middleware" begin
+    r = internalrequest(ctx, HTTP.Request("GET", "/items/42"))
+    @test r.status == 200
+    @test String(r.body) == "{\"id\":42}"
+end
+
+@testset "middleware reading req.params does not brick the route" begin
+    r = internalrequest(ctx, HTTP.Request("GET", "/items/42"); middleware=[reads_params])
+    @test r.status == 200
+    @test String(r.body) == "{\"id\":42}"
+end
+
+@testset "middleware reading req.input does not brick the route" begin
+    r = internalrequest(ctx, HTTP.Request("GET", "/items/42"); middleware=[reads_input])
+    @test r.status == 200
+    @test String(r.body) == "{\"id\":42}"
+end
+end

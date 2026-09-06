@@ -67,15 +67,11 @@ _http_metadata(req::HTTP.Request)          = HTTP._request_context_metadata!(get
 _http_version(req::HTTP.Request)           = VersionNumber(Int(getfield(req, :proto_major)), Int(getfield(req, :proto_minor)))
 _http_stream_request(stream::HTTP.Stream)  = HTTP._buffered_stream_request(stream)
 
-function request_cache!(builder::Function, req::HTTP.Request, key::Symbol)
-    if haskey(req.context, key)
-        return req.context[key]
-    end
-
-    value = builder()
-    req.context[key] = value
-    return value
-end
+# One implementation, in `Types` (#38): it probes the raw `HTTP.RequestContext` instead
+# of `req.context`, so a cache miss no longer allocates the metadata `Dict` just to look
+# for a key that is not there. The body-parser caches below (`req.json`, `req.form`, …)
+# get that saving for free by sharing it.
+using .Types: request_cache!
 
 function merge_request_input!(merged::Dict{String,Any}, source)
     if source isa AbstractDict
@@ -202,9 +198,14 @@ HTTP.jl's router hands over raw, still-encoded segments; the single decode happe
 all observe the same value. Query parameters (`getquery`) are decoded once by `HTTP.queryparams`
 for the same reason. See #70.
 
-Returns a **fresh `Dict` on each call** — decoding cannot be done in place — so the result is a
-snapshot rather than a handle into the request. Mutating it does not change what a later call
-returns; pass values down a request through `req.context` instead.
+Returns the **same `Dict` for the lifetime of the request** — it is decoded once and cached
+(#38), so the result is a live handle, not a snapshot. Mutating it *does* change what a later
+call returns, and is visible to `req.input` and to every parameter binding that has not run
+yet. Treat it as read-only; pass values down a request through `req.context` instead.
+
+This matches `req.json` and `req.form`, which have always been memoized this way. It used to
+return a fresh `Dict` per call, which meant a handler with N path parameters re-decoded the
+whole table N times.
 
 A malformed escape (`/x/%ZZ`, a trailing `%`) or a sequence decoding to invalid UTF-8 raises
 `ValidationError`, which the error handler reports as `400 Bad Request` — not a `500`.
@@ -215,6 +216,10 @@ getparams(req::HTTP.Request) = Types.pathparams(req)
     getquery(req::HTTP.Request) -> Dict{String, String}
 
 Returns the query parameters for the request.
+
+Parsed once per request and cached (#38), so this returns the **same `Dict`** on every call —
+a live handle, not a snapshot. Treat it as read-only: a mutation is visible to `req.input` and
+to any query-parameter binding that has not run yet.
 """
 getquery(req::HTTP.Request) = Types.queryvars(req)
 
