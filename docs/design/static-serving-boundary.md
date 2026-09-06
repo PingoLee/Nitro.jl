@@ -163,7 +163,59 @@ Not planned, and a PR adding one should cite this section or change it:
   boot, so no mount can serve it. Caddy handles ACME internally; nginx needs a webroot location
 - Any per-request filesystem re-validation (§6)
 
-## 8. See also
+## 8. Mount paths are segments, not strings
+
+`mountdir` is canonicalized once, by `Nitro.Core.Util.mount_segments`, into a `Vector{String}` of
+path segments; routes are rebuilt from it with `mount_route` by **joining**, never by interpolating a
+prefix into `"/$prefix/$path"`. `staticfiles`, `spafiles` and `dynamicfiles` normalize nothing
+themselves.
+
+This replaced three separate string manipulations that produced two defects with one shared cause:
+
+- Each mount function stripped a single leading `/` with `first(mountdir)`, which threw a
+  `BoundsError` on `""` — a value everything downstream already understood as "mount at the root"
+  ([#93](https://github.com/PingoLee/Nitro.jl/issues/93)).
+- The bare directory route of an `index.html` was derived by stripping a `"/index.html"` suffix off
+  the mount path, matching the **first** occurrence of that substring. Any directory whose name
+  *starts with* `index.html`, at any depth, therefore hijacked the route above it — including a
+  plausible `index.html.bak/`: `/assets/index.html.bak/index.html` yielded `/assets`, so
+  `GET /assets` served a file from inside the backup directory
+  ([#94](https://github.com/PingoLee/Nitro.jl/issues/94)).
+
+Both are unrepresentable in segment form. The prefix is `["static"]` however many slashes or spaces
+were typed, and the bare route is `segments[1:end-1]`, which cannot mismatch. That is also why the
+root bare route is now spelled `"/"` rather than `""` — HTTP.jl's router splits with
+`keepempty=false` and treats the two alike, so the empty string worked only by accident.
+
+**The prior art is Phoenix's `Plug.Static`**, which canonicalizes its `at:` option into a segment
+list in `init/1` and never rejoins by interpolation. Go's `net/http` and Express's `serve-static`
+take a different route to the same place: they resolve the index per request from the directory and
+redirect to one canonical URL, so neither ever derives a directory URL from a file URL. Nitro
+registers a literal route per file at mount time (§1), so the per-request resolution those two rely
+on is not available here — canonical segments are the form that fits.
+
+Note this changes no URL that a *reachable* mount already served. HTTP.jl's `register!` and its
+request path both split on `/` with `keepempty=false`, so every slash-only spelling —
+`/static//app.js` versus `/static/app.js`, `""` versus `"/"` — was already the same router node.
+
+Three things do change, and none of them forces an app edit, which is why there is no
+`UPGRADING.md` entry.
+
+1. **The strings `mountfolder` and the three mount functions return.** A root mount's bare route is
+   now `"/"` rather than `""`, and no returned route carries a doubled separator.
+2. **A whitespace-bearing `mountdir` (`" assets "`) now serves.** It used to register a segment no
+   request could match — the router does not percent-decode, so a literal space is unreachable —
+   making the mount dead on arrival. A dead mount coming alive can collide with an
+   application-declared route at the same path, where HTTP.jl warns `replacing existing registered
+   route` and the later registration wins. That is a latent misconfiguration surfacing rather than a
+   regression, but it is a spelling whose *served* URLs differ.
+3. **The hijacked route stops being served.** This is the point of the second bullet above: where a
+   directory named `index.html*` existed, `GET /assets` served a file from inside it and now returns
+   404, while that file becomes reachable at its own path. A URL on a reachable mount does change —
+   but only one that was serving the wrong file, which is a shape no app can have intended, and the
+   file it was serving is still available at the route it should always have had.
+
+## 9. See also
 
 - [`docs/src/tutorial/reverse_proxy.md`](../src/tutorial/reverse_proxy.md) — the user-facing guide,
   including client-IP trust configuration and worked nginx/Caddy configs

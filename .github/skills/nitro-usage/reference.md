@@ -302,6 +302,11 @@ Enumeration is `Nitro.Core.Util.mountable_files(root; include_hidden, allow_syml
 `mountfolder` returns the routes it registered. `spafiles` registers its history-mode fallback only
 if `index.html` is itself servable. Only files present at startup get a route.
 
+**`mountdir` is canonicalized to path segments**, so surrounding whitespace and `/` are stripped:
+`"static"`, `"/static"`, `"static/"` and `"/static/"` are the same mount, and `""`, `"/"` and
+whitespace all mount at the router root. An `index.html` also claims its bare directory route —
+`/docs/index.html` registers `/docs` too, and a top-level one registers `/`.
+
 ---
 
 ## Workers

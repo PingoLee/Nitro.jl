@@ -111,7 +111,15 @@ end
     file(filepath::String; loadfile=nothing, status = 200, headers = []) :: HTTP.Response
 
 Reads a file and returns a HTTP.Response. The file is read as binary. If the file does not exist, 
-an ArgumentError is thrown. The MIME type and the size of the file are added to the headers.
+an ArgumentError is thrown. The MIME type and the size of the content being sent are added to
+the headers.
+
+`Content-Length` is measured from that content, never from a second `stat` of the path. A
+`dynamicfiles` mount re-reads on every request, so a file that changed between the read and the
+measurement used to put a length on the response that its own body did not have. HTTP.jl recomputes
+the header from the body when it serializes, so this never reached a client — but everything that
+reads the response *before* that point (middleware, `internalrequest`, header-copying helpers) saw
+the inconsistent value, and the invariant is cheaper to hold than to reason about.
 
 # Arguments
 - `filepath`: The path to the file to be read.
@@ -125,7 +133,7 @@ an ArgumentError is thrown. The MIME type and the size of the file are added to 
 function file(filepath::String; loadfile = nothing, status = 200, headers = []) :: HTTP.Response
     has_loadfile    = !isnothing(loadfile)
     content         = has_loadfile ? loadfile(filepath) : read(filepath, String)
-    content_length  = has_loadfile ? string(sizeof(content)) : string(filesize(filepath))
+    content_length  = string(sizeof(content))
     content_type    = mime_from_path(filepath, MIME"application/octet-stream"()) |> contenttype_from_mime
     response = HTTP.Response(status, headers, body = content)
     HTTP.setheader(response, "Content-Type" => content_type)
