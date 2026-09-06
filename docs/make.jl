@@ -38,11 +38,21 @@ makedocs(
     ]
 )
 
-# Documenter can also automatically deploy documentation to gh-pages.
-# See "Hosting Documentation" and deploydocs() in the Documenter manual
-# for more information.
+# Deploys to the `gh-pages` branch of THIS repository, which is what
+# https://pingolee.github.io/Nitro.jl/ serves.
+#
+# `repo` used to name `NitroFramework/Nitro.jl`, which does not exist. Documenter treats an
+# unreachable deploy target as "not deploying" and returns quietly rather than failing, so
+# every build went green and nothing was ever published: no `gh-pages` branch, Pages not
+# enabled, and the docs URL `UPGRADING.md` sends every upgrading app to returning 404.
+#
+# `devbranch` is pinned rather than left to Documenter's auto-detection. Current versions
+# resolve it by querying the remote's HEAD, which works but depends on the CI checkout having
+# a usable remote; naming it costs nothing and makes the `main`-not-`master` assumption
+# explicit, since that mismatch is what silently disabled the other docs workflow.
 deploydocs(
-    repo = "github.com/NitroFramework/Nitro.jl.git",
+    repo = "github.com/PingoLee/Nitro.jl.git",
+    devbranch = "main",
     push_preview = false
 )
 
