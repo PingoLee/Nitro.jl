@@ -279,15 +279,6 @@ mount_route(segments::AbstractVector{<:AbstractString})::String =
     isempty(segments) ? "/" : "/" * join(segments, "/")
 
 """
-Helper function that returns everything before a designated substring
-"""
-function getbefore(input::String, target) :: String
-    result = findfirst(target, input)
-    index = first(result) - 1
-    return input[begin:index]
-end
-
-"""
     mountfolder(folder::String, mountdir::String, addroute;
                 include_hidden=false, allow_symlink_escape=false) -> Vector{String}
 
@@ -328,13 +319,17 @@ function mountfolder(folder::String, mountdir::String, addroute;
         addroute(mountpath, filepath)
 
         # also register file to the root of each subpath if this file is an index.html
-        if endswith(mountpath, "/index.html")
+        if !isempty(segments) && last(segments) == "index.html"
 
             # /docs/metrics and /docs/metrics/ are the same path
             # when HTTP is considered.
 
-            # add the route without the trailing "/" character
-            bare_path = getbefore(mountpath, "/index.html")
+            # Drop the last segment rather than stripping a "/index.html" suffix off the route. The
+            # suffix form matched the *first* occurrence of the substring `/index.html`, so ANY
+            # directory whose name starts with `index.html`, at any depth, hijacked the route above
+            # it: `/assets/index.html.bak/index.html` yielded `/assets`, so `GET /assets` served a
+            # file from inside the backup directory. A root mount yielded `""` (#94).
+            bare_path = mount_route(segments[1:end-1])
             push!(routes, bare_path)
             addroute(bare_path, filepath)
         end
