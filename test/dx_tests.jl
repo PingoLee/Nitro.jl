@@ -45,6 +45,21 @@ const TEST_FILE_PATH = joinpath(@__DIR__, "content", "test.txt")
         @test any(h -> h[1] == "Content-Disposition" && occursin("download.txt", h[2]), named_file.headers)
         @test any(h -> h[1] == "X-Test" && h[2] == "1", named_file.headers)
 
+        # `Res.file` measures Content-Length the same way `Nitro.file` does (#92). `length` would be
+        # a *character* count for a `loadfile` returning a String, understating a multi-byte body.
+        mktempdir() do dir
+            utf8_path = joinpath(dir, "utf8.txt")
+            utf8_body = "héllo — wörld ✓"
+            write(utf8_path, utf8_body)
+
+            r_default = Res.file(utf8_path)
+            @test Dict(r_default.headers)["Content-Length"] == string(sizeof(utf8_body))
+
+            r_loaded = Res.file(utf8_path; loadfile = q -> read(q, String))
+            @test Dict(r_loaded.headers)["Content-Length"] == string(sizeof(utf8_body))
+            @test Dict(r_loaded.headers)["Content-Length"] != string(length(utf8_body))
+        end
+
         # Test Res.redirect()
         res_redirect = Res.redirect("/login")
         @test res_redirect.status == 302

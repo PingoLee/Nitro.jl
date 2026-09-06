@@ -1406,9 +1406,6 @@ function staticfiles(
     include_hidden::Bool=false,
     allow_symlink_escape::Bool=false,
 )
-    if first(mountdir) == '/'
-        mountdir = mountdir[2:end]
-    end
     function addroute(currentroute, filepath)
         resp = file(filepath; loadfile=loadfile, headers=headers)
         register_internal(ctx, router, GET, currentroute, () -> resp)
@@ -1427,9 +1424,6 @@ function spafiles(
     include_hidden::Bool=false,
     allow_symlink_escape::Bool=false,
 )
-    if first(mountdir) == '/'
-        mountdir = mountdir[2:end]
-    end
 
     function addroute(currentroute, filepath)
         resp = file(filepath; loadfile=loadfile, headers=headers)
@@ -1441,13 +1435,22 @@ function spafiles(
     # (`isfile(joinpath(folder, "index.html"))`, which follows symlinks) reached straight past the
     # enumeration rules: a refused `index.html` was still served here on *every* unmatched path
     # under the mount, which is a strictly larger hole than the single route it was denied.
-    # Derive the prefix through the same helper `mountfolder` uses — spelling it separately here is
-    # how the two drifted for an all-whitespace `mountdir`, silently dropping the fallback.
-    prefix      = Util.mount_prefix(mountdir)
-    index_route = isempty(prefix) ? "/index.html" : "/$prefix/index.html"
-    if index_route in mounted
-        index_path     = joinpath(folder, "index.html")
-        fallback_route = isempty(prefix) ? "/**" : "/$prefix/**"
+    # Derive the routes through the same helpers `mountfolder` uses, so the two cannot spell the
+    # mount differently — the property that keeps an all-whitespace `mountdir` from silently
+    # dropping the fallback, as it once did when each side normalized separately.
+    #
+    # `isfile` is an *additional* conjunct, never a replacement: the enumeration gate above still
+    # decides servability, and this only ever narrows. It is needed because a route name does not
+    # identify what produced it — a directory named `index.html` makes `mountfolder` register
+    # `/<prefix>/index.html` as the *bare* route of `index.html/index.html`, which would otherwise
+    # satisfy the check and point the fallback at a directory, 500ing every unmatched request.
+    # That failure is created by the #94 bare-path fix: the old derivation returned `/<prefix>` for
+    # this shape, so the check failed and the fallback was skipped. The two changes are coupled.
+    segments    = Util.mount_segments(mountdir)
+    index_route = Util.mount_route(vcat(segments, "index.html"))
+    index_path  = joinpath(folder, "index.html")
+    if index_route in mounted && isfile(index_path)
+        fallback_route = Util.mount_route(vcat(segments, "**"))
         register_internal(ctx, router, GET, fallback_route, (req::HTTP.Request) ->
             file(index_path; loadfile=loadfile, headers=headers))
     else
@@ -1467,9 +1470,6 @@ function dynamicfiles(
     include_hidden::Bool=false,
     allow_symlink_escape::Bool=false,
 )
-    if first(mountdir) == '/'
-        mountdir = mountdir[2:end]
-    end
     # Which files exist here is decided once, at mount time. Serving a directory whose contents an
     # attacker can change is out of scope for this layer — see docs/design/static-serving-boundary.md.
     function addroute(currentroute, filepath)

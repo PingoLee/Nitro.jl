@@ -240,6 +240,163 @@ end
     @test "/assets" ∈ routes
 end
 
+@testset "every spelling of a mountdir names the same mount" begin
+    # `mountdir` is canonicalized once, in `mount_segments` -- the three public mount functions no
+    # longer strip anything themselves (#93). Driving `mountfolder` directly needs no router and no
+    # global state, so this is the cheap place to pin the whole equivalence class.
+    baseline = MOUNTFOLDER(root, "assets", (_r, _p) -> nothing)
+    for md in ("/assets", "assets/", "/assets/", "//assets//", " /assets/ ")
+        @test MOUNTFOLDER(root, md, (_r, _p) -> nothing) == baseline
+    end
+
+    # `""` used to throw a BoundsError at the entry point, while everything downstream already
+    # treated it as "mount at the root".
+    root_baseline = MOUNTFOLDER(root, "", (_r, _p) -> nothing)
+    for md in ("/", "   ", " / ")
+        @test MOUNTFOLDER(root, md, (_r, _p) -> nothing) == root_baseline
+    end
+    @test "/visible.txt" ∈ root_baseline
+    @test "/index.html" ∈ root_baseline
+
+    # Routes are rebuilt by joining segments, so a doubled separator is unrepresentable. Interior
+    # separators are still a real nested mount, not a spelling variant.
+    for md in ("assets", "/assets/", "//assets//", "", "/", "a/b")
+        for route in MOUNTFOLDER(root, md, (_r, _p) -> nothing)
+            @test !occursin("//", route)
+            @test startswith(route, "/")
+        end
+    end
+    @test "/a/b/visible.txt" ∈ MOUNTFOLDER(root, "a/b", (_r, _p) -> nothing)
+end
+
+@testset "a directory named index.html does not claim the mount root" begin
+    # The bare directory route is the mount path minus its last segment. Deriving it by stripping a
+    # "/index.html" suffix took the *first* occurrence, so a directory literally named `index.html`
+    # hijacked the route above it (#94). `test/content/` cannot host this fixture: it is flat, and a
+    # committed directory named `index.html` would change `original_tests.jl`'s `/static/` case.
+    nested = mktempdir()
+    write(joinpath(nested, "app.js"), "console.log(1)")
+    mkpath(joinpath(nested, "index.html"))
+    write(joinpath(nested, "index.html", "index.html"), "<h1>nested</h1>")
+
+    routes = MOUNTFOLDER(nested, "assets", (_r, _p) -> nothing)
+    @test "/assets/index.html/index.html" ∈ routes
+    @test "/assets/index.html" ∈ routes   # the bare path of the NESTED index
+    @test "/assets" ∉ routes              # the hijack: this was the nested file's bare path
+    @test "" ∉ routes
+
+    # A root mount's bare directory route is spelled "/", not "".
+    root_routes = MOUNTFOLDER(nested, "", (_r, _p) -> nothing)
+    @test "/index.html/index.html" ∈ root_routes
+    @test "/index.html" ∈ root_routes
+    @test "/" ∉ root_routes               # nothing here is a *top-level* index.html
+    @test "" ∉ root_routes
+
+    # A genuine top-level index.html claims "/" rather than the empty string.
+    @test "/" ∈ MOUNTFOLDER(root, "", (_r, _p) -> nothing)
+    @test "" ∉ MOUNTFOLDER(root, "", (_r, _p) -> nothing)
+
+    resetstate()
+    try
+        staticfiles(nested, "assets")
+        r = internalrequest(HTTP.Request("GET", "/assets/index.html"))
+        @test r.status == 200
+        @test String(r.body) == "<h1>nested</h1>"
+        @test internalrequest(HTTP.Request("GET", "/assets")).status == 404
+    finally
+        resetstate()
+    end
+
+    # `spafiles` gates its history-mode fallback on the mount having registered an index route --
+    # but a route name does not say what produced it. Here `/assets/index.html` is the *bare* route
+    # of `index.html/index.html`, so the name matches while `<folder>/index.html` is a directory.
+    # Registering the fallback against it made every unmatched request 500 on `read(::dir)`.
+    resetstate()
+    try
+        @test_logs (:warn, r"no servable 'index.html'") spafiles(nested, "assets")
+        @test internalrequest(HTTP.Request("GET", "/assets/deep/link")).status == 404
+    finally
+        resetstate()
+    end
+end
+
+@testset "the index.html hijack was a prefix match, at any depth" begin
+    # The old derivation matched the first occurrence of the *substring* "/index.html", so it was
+    # never limited to a directory named exactly `index.html` -- `index.html.bak/` (an editor or
+    # build backup, entirely plausible) hijacked the route above it just the same, and a match
+    # deeper in the tree hijacked everything above that.
+    tree = mktempdir()
+    mkpath(joinpath(tree, "index.html.bak"))
+    write(joinpath(tree, "index.html.bak", "index.html"), "<h1>backup</h1>")
+    mkpath(joinpath(tree, "docs", "index.htmlx", "guide"))
+    write(joinpath(tree, "docs", "index.htmlx", "guide", "index.html"), "<h1>guide</h1>")
+
+    routes = MOUNTFOLDER(tree, "assets", (_r, _p) -> nothing)
+    @test "/assets/index.html.bak" ∈ routes            # old code produced "/assets"
+    @test "/assets/docs/index.htmlx/guide" ∈ routes    # old code produced "/assets/docs"
+    @test "/assets" ∉ routes
+    @test "" ∉ routes
+
+    resetstate()
+    try
+        staticfiles(tree, "assets")
+        @test String(internalrequest(HTTP.Request("GET", "/assets/index.html.bak")).body) == "<h1>backup</h1>"
+        @test internalrequest(HTTP.Request("GET", "/assets")).status == 404
+    finally
+        resetstate()
+    end
+end
+
+@testset "the three mount functions accept a root mountdir" begin
+    # The literal #93 report: `staticfiles(folder, "")` died on `first("")` before doing anything.
+    resetstate()
+    try
+        staticfiles(root, "")
+        @test internalrequest(HTTP.Request("GET", "/visible.txt")).status == 200
+        @test internalrequest(HTTP.Request("GET", "/.env")).status == 404
+    finally
+        resetstate()
+    end
+
+    # `"/"` alone would not discriminate here: the old code stripped it to `""` and `mount_prefix`
+    # accepted that. `""` is the spelling that used to throw.
+    resetstate()
+    try
+        dynamicfiles(root, "")
+        @test internalrequest(HTTP.Request("GET", "/visible.txt")).status == 200
+        @test internalrequest(HTTP.Request("GET", "/.env")).status == 404
+    finally
+        resetstate()
+    end
+
+    # spafiles registers `GET /**` for a root mount, which swallows every 404 -- so it gets its own
+    # block and asserts nothing negative.
+    resetstate()
+    try
+        spafiles(root, "")
+        @test internalrequest(HTTP.Request("GET", "/visible.txt")).status == 200
+        @test internalrequest(HTTP.Request("GET", "/index.html")).status == 200
+    finally
+        resetstate()
+    end
+end
+
+@testset "non-canonical mountdir spellings reach the router" begin
+    # The deleted leading-slash strips lived in the three *public* functions, so the equivalence
+    # class above -- which drives `mountfolder` directly -- cannot prove they are gone. These do.
+    for mountdir in ("assets", "/assets", "assets/", "/assets/", "//assets//", " /assets/ ")
+        resetstate()
+        try
+            staticfiles(root, mountdir)
+            @test internalrequest(HTTP.Request("GET", "/assets/visible.txt")).status == 200
+            @test internalrequest(HTTP.Request("GET", "/assets")).status == 200   # bare index.html
+            @test internalrequest(HTTP.Request("GET", "/assets/.env")).status == 404
+        finally
+            resetstate()
+        end
+    end
+end
+
 @testset "refused files are not reachable through the router" begin
     resetstate()
     try

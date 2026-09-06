@@ -63,7 +63,8 @@ function file(path::String; status::Int=200, headers::Vector=[], filename=nothin
     content_type = mime_from_path(path, MIME"application/octet-stream"()) |> contenttype_from_mime
 
     HTTP.setheader(response, "Content-Type" => content_type)
-    HTTP.setheader(response, "Content-Length" => string(length(body)))
+    # `sizeof`, not `length`: a `loadfile` returning a String makes `length` a *character* count.
+    HTTP.setheader(response, "Content-Length" => string(sizeof(body)))
     HTTP.setheader(response, "Content-Disposition" => content_disposition(resolved_filename, disposition))
     apply_headers!(response, headers)
     return response

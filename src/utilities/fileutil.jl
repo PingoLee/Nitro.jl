@@ -237,28 +237,46 @@ function mountable_files(root::String;
 end
 
 """
-    mount_prefix(mountdir) -> String
+    mount_segments(mountdir) -> Vector{String}
 
-The URL path segment a mount contributes, or `""` when it mounts at the root.
+The canonical URL path segments a mount contributes, or an empty vector when it mounts at the root.
 
-`mountfolder` and `spafiles` must derive this the *same* way. They used to spell it separately, and
-an all-whitespace `mountdir` made them disagree: the mount registered `/index.html` while `spafiles`
-looked for `"/  /index.html"`, so the history-mode fallback silently vanished behind a warning
-claiming no servable `index.html` existed.
+This is the one place `mountdir` is normalized: `staticfiles`, `spafiles` and `dynamicfiles` strip
+nothing themselves, so `mountfolder` and `spafiles`' history-mode fallback derive their routes from
+the raw value through this function and cannot spell it differently. Keeping that single-source
+property is why an earlier all-whitespace `mountdir` bug — the mount registering `/index.html` while
+`spafiles` looked for `"/  /index.html"`, dropping the fallback behind a warning claiming no
+servable `index.html` existed — cannot recur.
+
+Canonicalizing to *segments* rather than normalizing a string is what makes a whole class of route
+defect unrepresentable. Every spelling of the same mount reduces to the same value — `""`, `"/"` and
+whitespace to `String[]`; `"static"`, `"/static"`, `"static/"`, `"/static/"` and `" /static/ "` to
+`["static"]` — and routes are rebuilt with [`mount_route`](@ref) by joining, never by interpolating
+a prefix that might already carry a separator.
+
+It **normalizes, it does not validate.** Whitespace is stripped only at a segment's edges, so an
+interior space survives into a route that no request can match (the router does not percent-decode),
+and a `mountdir` containing router-pattern characters still becomes a pattern route — unlike a
+*filename*, which [`mountable_files`](@ref) refuses for exactly that reason.
 """
-function mount_prefix(mountdir)::String
-    (isnothing(mountdir) || isempty(mountdir) || all(isspace, mountdir) || mountdir == "/") && return ""
-    return String(mountdir)
+function mount_segments(mountdir::AbstractString)::Vector{String}
+    segments = String[]
+    for raw in split(mountdir, '/')
+        segment = strip(raw)
+        isempty(segment) || push!(segments, String(segment))
+    end
+    return segments
 end
 
 """
-Helper function that returns everything before a designated substring
+    mount_route(segments) -> String
+
+Join canonical mount segments into a route. The empty vector is the router root, spelled `"/"`
+rather than left as `""` — HTTP.jl happens to treat the two alike, but relying on that made the
+bare-directory route of a root mount correct only by accident.
 """
-function getbefore(input::String, target) :: String
-    result = findfirst(target, input)
-    index = first(result) - 1
-    return input[begin:index]
-end
+mount_route(segments::AbstractVector{<:AbstractString})::String =
+    isempty(segments) ? "/" : "/" * join(segments, "/")
 
 """
     mountfolder(folder::String, mountdir::String, addroute;
@@ -272,14 +290,17 @@ Returns the routes that were registered, in registration order. Callers need tha
 re-deriving paths from the filesystem: `spafiles` uses it to decide whether its history-mode
 fallback has a servable `index.html`, which keeps the fallback from drifting away from the mount
 rules and re-opening the hole they close.
+
+`mountdir` is canonicalized by [`mount_segments`](@ref), so `"static"`, `"/static"`, `"static/"` and
+`"/static/"` name the same mount, and `""`, `"/"` and whitespace all mount at the router root.
 """
 function mountfolder(folder::String, mountdir::String, addroute;
                      include_hidden::Bool=false,
                      allow_symlink_escape::Bool=false) :: Vector{String}
 
-    separator = Base.Filesystem.path_separator
-    prefix    = mount_prefix(mountdir)
-    routes    = String[]
+    separator       = Base.Filesystem.path_separator
+    prefix_segments = mount_segments(mountdir)
+    routes          = String[]
 
     for filepath in mountable_files(folder; include_hidden, allow_symlink_escape)
 
@@ -289,20 +310,26 @@ function mountfolder(folder::String, mountdir::String, addroute;
         # make sure to replace any system path separator with "/"
         cleanedmountpath = replace(cleanedmountpath, separator => "/")
 
-        # generate the path to mount the file to
-        mountpath = isempty(prefix) ? "/$cleanedmountpath" : "/$prefix/$cleanedmountpath"
+        # Build the route by joining canonical segments. Interpolating a prefix that might already
+        # carry a separator is what used to emit routes like `/static//app.js`.
+        segments  = vcat(prefix_segments, String.(split(cleanedmountpath, '/'; keepempty=false)))
+        mountpath = mount_route(segments)
 
         push!(routes, mountpath)
         addroute(mountpath, filepath)
 
         # also register file to the root of each subpath if this file is an index.html
-        if endswith(mountpath, "/index.html")
+        if !isempty(segments) && last(segments) == "index.html"
 
             # /docs/metrics and /docs/metrics/ are the same path
             # when HTTP is considered.
 
-            # add the route without the trailing "/" character
-            bare_path = getbefore(mountpath, "/index.html")
+            # Drop the last segment rather than stripping a "/index.html" suffix off the route. The
+            # suffix form matched the *first* occurrence of the substring `/index.html`, so ANY
+            # directory whose name starts with `index.html`, at any depth, hijacked the route above
+            # it: `/assets/index.html.bak/index.html` yielded `/assets`, so `GET /assets` served a
+            # file from inside the backup directory. A root mount yielded `""` (#94).
+            bare_path = mount_route(segments[1:end-1])
             push!(routes, bare_path)
             addroute(bare_path, filepath)
         end

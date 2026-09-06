@@ -267,12 +267,13 @@ the `X-CSRF-Token` header.
 
 ```julia
 staticfiles("public", "static")   # serve ./public at /static
-spafiles("dist", "/")             # SPA history-mode fallback to index.html
+spafiles("dist", "/")             # SPA history-mode fallback; "" and "/" both mean the root
 dynamicfiles("build", "media")    # re-read from disk per request
 ```
 
 `staticfiles` snapshots file contents at startup; `dynamicfiles` reads per request. Use `spafiles`
-for a Vue/React/Quasar build so client-side routes fall back to `index.html`.
+for a Vue/React/Quasar build so client-side routes fall back to `index.html`. `mountdir` is
+canonicalized, so `"static"`, `"/static"` and `"static/"` name the same mount.
 
 **Mounts do not serve everything in the folder.** Hidden entries (any path component starting with
 `.`, relative to the folder — so `.env` and all of `.git/`), symlinks resolving outside the folder,
