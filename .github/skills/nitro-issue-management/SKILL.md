@@ -5,8 +5,8 @@ description: >-
   issues and curate labels. GitHub Issues are the backlog's only home; release
   gating is the pre-publish label (a label query, not a synced index file).
   Covers the label taxonomy, the draft-before-create safety flow, scrubbing of
-  private/local references, and cross-reference discipline. Adapted from
-  PormG.jl's pormg-issue-management.
+  private/local references, the supersession convention, and cross-reference
+  discipline. Adapted from PormG.jl's pormg-issue-management.
 ---
 
 # Nitro.jl Issue Management
@@ -125,6 +125,30 @@ Creating issues publishes content on a public repo and notifies watchers — it 
    and are verified, the source checklist is removed — leaving a stale copy would recreate the
    two-homes problem this model exists to end.
 
+## Superseding an open issue
+
+A design or refactor issue frequently makes an open bug **unrepresentable** rather than fixed. That
+relationship has to exist somewhere a query can see: a superseded issue that still reads as ordinary
+open work gets scheduled and planned around at full cost. The sibling PormG repo's #444 named #431
+and #434 as superseded in its own opening line, and both stayed live on the board regardless,
+because nothing outside that sentence recorded it. Nitro's design issues — the `CONTEXT[]` singleton
+(#31), the `core.jl` split (#32), the store contracts (#33), the response API surface (#28) — are
+exactly the shape that supersedes: check them when a bug's cause is a representation rather than a
+branch.
+
+When you file (or notice) one issue superseding another:
+
+1. **The superseding issue names them up front** — `**Supersedes:** #A, #B — <what happens to them>`.
+   Say whether they become unrepresentable, merely lower priority, or still need a guard if the
+   proposal is rejected.
+2. **Edit each superseded issue** to point back: `gh issue comment <A> --body "Superseded by #C: …"`.
+   A back-reference the other direction is what makes it visible to anyone reading #A alone — and to
+   the board reconcile in [`nitro-issue-cluster`](../nitro-issue-cluster/SKILL.md) §0, which takes a
+   superseded issue off its session.
+3. **Do not close them on the strength of the proposal.** A design issue is not a decision. They
+   close when the superseding work actually lands — with `Closes #A` in that PR — or they come back
+   if the user rejects the design.
+
 ## Closing a resolved issue
 
 1. **Link the fix.** Prefer letting GitHub auto-close: put `Closes #N` (or `Fixes #N`) in the PR
@@ -147,6 +171,8 @@ Creating issues publishes content on a public repo and notifies watchers — it 
 - Close an issue that still has unfinished task-list items — check them off or split them out
   first.
 - Close an issue without a comment/PR/commit reference saying what resolved it.
+- Leave a supersession in prose only — the superseded issue gets its own back-reference comment,
+  and it stays open until the superseding change lands.
 - Put draft/placeholder numbers in issue bodies and leave them — resolve to real `#numbers`.
 - Inline rich bodies on the command line — use `--body-file`.
 - Commit repo changes unless the user asks; backlog edits follow the normal
