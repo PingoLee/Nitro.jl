@@ -309,6 +309,11 @@ julia -t auto --project=. test/runtests.jl --workers 2
 # Agent-docs reference lint (paths, links, symbols, § anchors, registry parity)
 julia .github/scripts/docs_lint.jl
 
+# Smoke test — loads, routes and serves using NOTHING test-only (Nitro + HTTP + stdlib).
+# Use it when ReTestItems cannot run on a Julia version: `Pkg.test()` then dies before the
+# first assertion, so the suite says nothing about whether `src/` actually works there.
+julia --project=. .github/scripts/smoke_test.jl
+
 # Docs build (the package env has no Documenter — `--project=.` fails)
 julia --project=docs -e 'using Pkg; Pkg.develop(PackageSpec(path=pwd())); Pkg.instantiate()'
 julia --project=docs docs/make.jl
