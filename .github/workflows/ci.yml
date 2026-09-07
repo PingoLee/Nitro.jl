@@ -18,9 +18,17 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       JULIA_NUM_THREADS: ${{ matrix.threads }}
-    # Nightly is informational: it breaks for reasons that are not ours, and a permanently
-    # red required check trains you to stop reading CI. Keep it out of the required set.
-    continue-on-error: ${{ matrix.version == 'nightly' }}
+    # Informational versions: these break for reasons that are not ours, and a permanently
+    # red required check trains you to stop reading CI. Keep them out of the required set.
+    #
+    #   nightly      — compiler and Base churn two releases out. Permanently advisory.
+    #   ~1.13.0-0    — TEMPORARY. ReTestItems cannot run on 1.13 at all, so this job fails
+    #                  before executing a single assertion; nothing in src/ is implicated.
+    #                  Real 1.13 coverage comes from the `smoke` job below, which does not
+    #                  use ReTestItems and IS blocking. Remove `~1.13.0-0` from this
+    #                  condition — putting the full suite back in the required set — as soon
+    #                  as a ReTestItems release supports 1.13.
+    continue-on-error: ${{ matrix.version == 'nightly' || matrix.version == '~1.13.0-0' }}
     strategy:
       fail-fast: false
       matrix:
@@ -36,10 +44,23 @@ jobs:
           - windows-latest
         threads: [1, 2]
         include:
-          # Latest stable. Identical to 1.12 today, which is the point: `^1.12` claims 1.13+
-          # is supported and nothing tests it, so this starts covering the claim by itself
-          # the day 1.13 ships rather than waiting for someone to notice.
-          - version: '1'
+          # The next release. `[compat]` promises `julia = "^1.12"`, i.e. 1.13+ as well, and
+          # this is the entry that actually tests that claim.
+          #
+          # It replaces a `version: '1'` (latest stable) entry, which sounded like it covered
+          # this but did not: `'1'` resolves to whatever is *released*, and that is still
+          # 1.12.7 — so it ran an exact duplicate of the floor jobs above while 1.13, already
+          # at rc4, went untested. Latest-stable is only useful here once it stops being the
+          # floor, and by then this entry already covers it.
+          #
+          # `~1.13.0-0` rather than `'1.13'` because plain semver ranges exclude
+          # pre-releases; the `-0` lower bound opts them in. It resolves to >=1.13.0-0 and
+          # <1.14.0, so it picks up the newest 1.13 pre-release now and keeps covering 1.13.x
+          # after release — no bump needed when 1.13.0 ships.
+          #
+          # MAINTENANCE: when 1.14 enters pre-release, bump this to `~1.14.0-0`. There is no
+          # self-maintaining "next release" spec (julia-actions/setup-julia#84 proposes one).
+          - version: '~1.13.0-0'
             os: ubuntu-latest
             threads: 2
           # Nitro is unusually exposed to compiler and Base churn: it redefines
@@ -76,6 +97,45 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           file: lcov.info
+  smoke:
+    # Real coverage for a Julia version whose `test/` suite cannot run.
+    #
+    # ReTestItems is a TEST-ONLY dependency, so when it does not support a Julia version
+    # `Pkg.test()` dies before the first assertion and Nitro has zero verification there —
+    # even though `src/` may be perfectly fine. That is the situation on 1.13 today.
+    #
+    # This job runs a script that depends on nothing test-only: Nitro + HTTP + stdlib,
+    # which is the surface a consuming application actually has. It loads the package
+    # (exercising the `__init__` `getproperty` redefinition and `queryparams` piracy),
+    # registers typed routes, serves over a real socket, and checks shutdown released the
+    # listener.
+    #
+    # Unlike the matrix's `~1.13.0-0` entry, this one is BLOCKING. It is the thing that can
+    # actually tell us Nitro is broken on the next release.
+    name: Smoke test (Julia ${{ matrix.version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        version:
+          - '~1.13.0-0'
+    steps:
+      - uses: actions/checkout@v4
+      # Same sibling-clone reason as the `test` job: PormG is a `[sources]` path dependency,
+      # so the project cannot resolve without it alongside this checkout.
+      - name: Check out PormG.jl (sibling path dependency)
+        shell: bash
+        run: git clone --depth 1 https://github.com/PingoLee/PormG.jl.git ../PormG.jl
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ matrix.version }}
+      - uses: julia-actions/cache@v3
+        with:
+          include-matrix: 'false'
+          cache-name: julia-cache;workflow=${{ github.workflow }};job=${{ github.job }};version=${{ matrix.version }}
+      - uses: julia-actions/julia-buildpkg@v1
+      - name: Load, route and serve without ReTestItems
+        run: julia --project=. .github/scripts/smoke_test.jl
   docs:
     name: Documentation
     runs-on: ubuntu-latest
