@@ -57,6 +57,7 @@ const TEST_FILES = [
 
     # ── Security & Robustness ─────────────────────────────────────────────────
     "security_tests.jl",
+    "ci_workflow_tests.jl",
 
     # ── Extension Tests ───────────────────────────────────────────────────────
     "extensions/timezone_tests.jl",
