@@ -209,8 +209,9 @@ Verify for changed behavior:
 - Worker authorization and store backends have targeted tests, not only happy-path submits
 - Assertions check the real contract — the actual body, status, header, or store state — not merely
   that a request completed
-- A new test file is listed in `TEST_FILES` in `test/runtests.jl`; one that is not is **dead in
-  CI** however green it runs by path
+- A new test file is listed in `TEST_FILES` in `test/harness_manifest.jl`; one that is not runs
+  green by path and never runs in CI. `test/harness_tests.jl` now fails on it, so a red there means
+  exactly this
 - Run or recommend `Pkg.test()` when the diff touches runtime behavior
 
 Flag these **green-theater smells** explicitly, and propose the assertion that would actually fail if
@@ -230,8 +231,9 @@ the behavior broke:
   or only the allow. It cannot prove the behavior fires *and only* when it should; require both.
 - **Snapshot drift** — an expected response or header string edited to match new output without
   confirming the new output is itself correct.
-- **Dead tests** — over-mocking, the wrong fixture, a test file missing from `TEST_FILES`, or a
-  hard-wired guard such as `shared_response_mutation_tests.jl` run green after adding a middleware
+- **Dead tests** — over-mocking, the wrong fixture, a test file missing from `TEST_FILES` (now in
+  `test/harness_manifest.jl`), or a hard-wired guard such as `shared_response_mutation_tests.jl` run
+  green after adding a middleware
   it does not enumerate ([`reference.md`](../nitro-issue-workflow/reference.md) §C). The test never
   reaches the changed code and would pass against the old code too.
 

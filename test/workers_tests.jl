@@ -1,4 +1,4 @@
-@testitem "Workers" tags=[:core] setup=[NitroCommon] begin
+@testitem "Workers" tags=[:core, :workers] setup=[NitroCommon] begin
 
 using Test
 using Dates

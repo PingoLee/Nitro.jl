@@ -214,7 +214,8 @@ end
         # `async=false` on purpose: that is the path carrying the cleanup `finally`. Run it on
         # a TASK, never inline — today the guard throws before anything binds, but if the guard
         # ever regresses this call reaches `startserver` and blocks in `wait()` forever, and
-        # `nworkers=0` (the default, and what CI uses) applies no per-item timeout. Inline, a
+        # `nworkers=0` (the in-process mode; the default has been 1 since #84) applies no
+        # per-item timeout. Inline, a
         # regression would wedge the whole run and orphan a port-holding process — the very
         # #73 symptom. On a task it is a red test in 20 seconds.
         blocked = Threads.@spawn Nitro.serve(port = get_free_port(), host = HOST,

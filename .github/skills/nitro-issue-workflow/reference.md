@@ -121,8 +121,8 @@ instead. That is green-theater one step earlier than the review step warns about
 
 **Thread-count-dependent failures are a known class.** CI runs at `JULIA_NUM_THREADS` **1 and 2**, so
 a change that only passes single-threaded is not green. A difference between `-t 1` and `-t 2` is a
-race, not flakiness — do not retry until it passes, and do not substitute `--workers N`, which is a
-different axis. Both are owned by
+race, not flakiness — do not retry until it passes, and do not reach for `--workers N`, which is a
+different axis and is now refused for N > 1. Both are owned by
 [`nitro-test-troubleshooting`](../nitro-test-troubleshooting/SKILL.md) §2 and §7.
 
 **PormG is why local green does not imply CI green.** `Manifest.toml` is gitignored, so you reuse

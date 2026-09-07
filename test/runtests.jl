@@ -46,86 +46,19 @@ using Nitro
 #   NitroCommon @testsetup that most test items depend on.
 #   When using the CLI (runtests.jl), setup_tests.jl is prepended automatically.
 #
-# NOTE: The explicit file list below is intentional. Several tests mutate the
-# global Nitro router via `urlpatterns(...)`, so execution order matters.
-# Do NOT replace with `runtests(Nitro)` — filesystem-walk order differs from
-# this safe sequence and will cause spurious failures.
+# -- Shared harness metadata --------------------------------------------------
+# `TEST_FILES` (the ordered run list) and `KNOWN_TAGS` (the tag vocabulary) live in
+# `harness_manifest.jl`, because `test/harness_tests.jl` must read the SAME objects to
+# check they are honest -- and that guard runs as a `@testitem`, in a worker process where
+# this file was never loaded. The header of that file explains why a guard that instead
+# text-parsed this one could pass while being wrong.
+#
+# The list is still hand-ordered and still must not become `runtests(Nitro)`: several items
+# mutate the global Nitro router via `urlpatterns(...)`, so execution order is load-bearing.
+# #31 is the design issue that would make it stop being load-bearing.
+include(joinpath(@__DIR__, "harness_manifest.jl"))
+using .NitroTestHarness: TEST_FILES, KNOWN_TAGS, discover_test_files, testitems
 
-const TEST_FILES = [
-    # ── Shared setup ──────────────────────────────────────────────────────────
-    "setup_tests.jl",
-
-    # ── Security & Robustness ─────────────────────────────────────────────────
-    "security_tests.jl",
-    "ci_workflow_tests.jl",
-
-    # ── Extension Tests ───────────────────────────────────────────────────────
-    "extensions/timezone_tests.jl",
-    "extensions/templating_tests.jl",
-    "extensions/protobuf/protobuf_tests.jl",
-    "extensions/crypto_tests.jl",
-    "extensions/pormg_session_tests.jl",
-    "extensions/pormg_worker_tests.jl",
-
-    # ── Special Handler Tests ─────────────────────────────────────────────────
-    "sse_tests.jl",
-    "websocket_tests.jl",
-    "streaming_tests.jl",
-    "handler_tests.jl",
-
-    # ── Core Tests ────────────────────────────────────────────────────────────
-    "util_tests.jl",
-    "upgrade_guide_tests.jl",
-    "docs_deploy_tests.jl",
-    "cookies_tests.jl",
-    "session_tests.jl",
-    "sessionstores_tests.jl",
-    "workers_tests.jl",
-    "reexports_tests.jl",
-    "http_internals_contract_tests.jl",
-    "precompilation_test.jl",
-    "extractor_tests.jl",
-    "reflection_tests.jl",
-    "render_tests.jl",
-    "bodyparser_tests.jl",
-    "ergonomics_tests.jl",
-    "instance_tests.jl",
-    "server_show_tests.jl",
-    "server_lifecycle_tests.jl",
-    "parallel_tests.jl",
-    "middleware_tests.jl",
-    "middleware_cache_tests.jl",
-    "middleware_cache_race_tests.jl",
-    "custommiddleware_tests.jl",
-    "appcontext_tests.jl",
-    "path_prefix_tests.jl",
-    "routing_tests.jl",
-    "original_tests.jl",
-    "spa_tests.jl",
-    "staticfiles_security_tests.jl",
-    "dx_tests.jl",
-    "auth_module_tests.jl",
-    "auth_tests.jl",
-    "revise_test.jl",
-
-    # ── Scenario Tests ────────────────────────────────────────────────────────
-    "scenarios/thunderingherd_test.jl",
-
-    # ── Prebuilt Middleware Tests ─────────────────────────────────────────────
-    "middleware/extract_ip_tests.jl",
-    "middleware/ratelimitter_tests.jl",
-    "middleware/ratelimitter_lru_tests.jl",
-    "middleware/authmiddleware_tests.jl",
-    "middleware/cors_middleware_tests.jl",
-    "middleware/lifecycle_middleware_tests.jl",
-    "middleware/access_log_tests.jl",
-    "middleware/session_middleware_tests.jl",
-    "middleware/shared_response_mutation_tests.jl",
-    "middleware/guards_tests.jl",
-
-    # ── Quality Gate ──────────────────────────────────────────────────────────
-    "aqua_tests.jl",
-]
 
 # ── Per-item cleanup net ───────────────────────────────────────────────────────
 # ReTestItems evaluates this in a `finally` after EVERY test item, whether it passed,
@@ -158,12 +91,21 @@ end
 #   julia --project=. test/runtests.jl test/sessionstores_tests.jl
 #   julia --project=. test/runtests.jl --tags core --name "Session stores"
 #   julia -t auto --project=. test/runtests.jl                 # in-process, multithreaded
-#   julia --project=. test/runtests.jl --workers 3             # parallel worker processes
+#   julia --project=. test/runtests.jl --workers 0             # in-process (no timeouts)
 #   julia --project=. test/runtests.jl test\middleware\ratelimitter_lru_tests.jl
 #
-#   Flags: --tags <tag>   filter by @testitem tag
-#          --name <name>  filter by test item name (substring)
-#          --workers <n>  number of ReTestItems worker processes
+#   Flags: --tags <tag>   filter by @testitem tag. REPEATABLE and AND-combined --
+#                         ReTestItems matches `issubset(requested, item.tags)`, so
+#                         `--tags core --tags network` means BOTH, not either.
+#          --name <name>  EXACT @testitem name, NOT a substring: ReTestItems compares
+#                         `name == ti.name`. This comment said "substring" for a long
+#                         time and was wrong (#34).
+#          --workers <n>  0 or 1 only; >1 is refused, see the guard after the arg loop.
+#
+#   A filter that selects nothing is an error. ReTestItems already throws its own
+#   `NoTestException("No test items found.")` in that case, so this is about the MESSAGE,
+#   not about catching a silent pass: the guard below names the tag vocabulary and the
+#   AND/exact-match semantics, which is what you actually need to know.
 #   Bare paths select files/dirs; Windows (\) and POSIX (/) separators both work.
 #
 #   Threads vs workers: test items always run in a worker process now (one by default),
@@ -194,6 +136,38 @@ let args = copy(ARGS)
         end
     end
 
+    # `--workers N` for N > 1 is REFUSED, not merely discouraged (#34).
+    #
+    # ReTestItems distributes items across worker PROCESSES in a non-deterministic order,
+    # and each worker gets its own `Nitro.CONTEXT[]`. This suite's isolation is the
+    # hand-ordered TEST_FILES sequence plus one shared, accumulating router: ~25 test files
+    # register routes on the global and never reset, 5 call `resetstate()`, and `TEST_END`
+    # only calls `terminate()`. Split those across processes and an item asserting on 404
+    # behaviour, or on the total route set, sees a router it would not see under the
+    # default run.
+    #
+    # The result is a spurious PASS or a spurious FAILURE, not a crash -- so a warning
+    # would leave a mode running that manufactures evidence. Refusing converts a rung-2
+    # defect (silently wrong) into a rung-3 one (loud), which is the whole trade.
+    #
+    # The diagnostic use documented in nitro-test-troubleshooting §7 is still available,
+    # just not through this launcher: call `ReTestItems.runtests` directly with `nworkers`.
+    #
+    # Delete this guard when #31 lands and router state stops being process-global.
+    # `--workers 0` (in-process; also forced by --code-coverage) and the default of 1 are
+    # unaffected -- both keep every item in one process, in TEST_FILES order.
+    if nworkers > 1
+        error(
+            "--workers $nworkers is not supported.\n\n" *
+            "The suite shares one process-global `Nitro.CONTEXT[]` and depends on the\n" *
+            "hand-ordered TEST_FILES sequence, so splitting items across processes\n" *
+            "silently changes what each item sees -- a spurious pass or failure that\n" *
+            "will not reproduce under `Pkg.test()`. Tracked as #34; the durable fix\n" *
+            "is #31.\n\n" *
+            "Use `--workers 0` (in-process, no per-item timeout), or omit the flag."
+        )
+    end
+
     if isempty(paths)
         paths = [joinpath(@__DIR__, f) for f in TEST_FILES]
     else
@@ -202,6 +176,65 @@ let args = copy(ARGS)
         if setup ∉ paths
             pushfirst!(paths, setup)
         end
+    end
+
+    # Explain a zero-selection filter instead of just reporting one (#34).
+    #
+    # ReTestItems does NOT pass silently here -- `runtests` throws
+    # `NoTestException("No test items found.")` once AST filtering leaves nothing. #34
+    # claimed otherwise ("ReTestItems reports that as a successful empty run"); that was
+    # checked against the shipped package and is false. What the bare exception does not
+    # tell you is WHY, and the three ways to get there are all easy to hit by accident:
+    # a mistyped tag, an AND-combined pair with an empty intersection, and a `--name` that
+    # is a substring rather than the exact item name.
+    #
+    # So this is a message-quality guard, and it is deliberately kept anyway: `--tags
+    # workers` used to fail with "No test items found." and no hint that `:workers` simply
+    # was not a tag anyone had applied.
+    #
+    # It cannot be a @testitem -- the same filter would delete the guard -- so it lives in
+    # the coordinator, which is also the only place that can name the vocabulary.
+    if !isempty(tags) || !isnothing(name_filt)
+        unknown = setdiff(Set(tags), KNOWN_TAGS)
+        isempty(unknown) || error(
+            "Unknown test tag(s): $(join(sort!(collect(unknown)), ", ")).\n" *
+            "Known tags: $(join(sort!(collect(KNOWN_TAGS)), ", ")).\n\n" *
+            "A tag matching no @testitem would fail anyway, with ReTestItems'\n" *
+            "`No test items found.` -- this message exists to name the vocabulary\n" *
+            "instead. `KNOWN_TAGS` lives in test/harness_manifest.jl and is checked\n" *
+            "against the suite by test/harness_tests.jl."
+        )
+
+        # A mistyped path must not be reported as a filter problem. Without this, a bad
+        # path contributes zero items and the user is sent to debug a filter that is fine.
+        # `validate_paths = true` on the `runtests` call catches it too, but only later.
+        scan = String[]
+        for p in paths
+            if isdir(p)
+                append!(scan, joinpath.(p, discover_test_files(p)))
+            elseif isfile(p)
+                push!(scan, p)
+            else
+                error("No such test path: $p")
+            end
+        end
+        selected = 0
+        for f in scan
+            isfile(f) || continue
+            for (nm, tg) in testitems(f)
+                (isempty(tags) || issubset(tags, tg)) || continue
+                (isnothing(name_filt) || nm == name_filt) || continue
+                selected += 1
+            end
+        end
+        selected == 0 && error(
+            "This filter selects 0 test items. ReTestItems would fail with the less\n" *
+            "specific `No test items found.`; the likely cause is one of these:\n" *
+            "  --tags $(isempty(tags) ? "(none)" : join(tags, " "))\n" *
+            "  --name $(something(name_filt, "(none)"))\n\n" *
+            "`--tags` are AND-combined, not OR. `--name` is an EXACT @testitem name,\n" *
+            "not a substring."
+        )
     end
 
     # `testitem_timeout` is applied ONLY on the worker path -- ReTestItems documents this
@@ -239,6 +272,21 @@ let args = copy(ARGS)
     covering = Base.JLOptions().code_coverage != 0
     runtests(
         paths...;
+        # THE silent zero-test hole, and the one #34 was really looking for.
+        #
+        # This defaults to `false`, and then `_validated_paths` only `@warn`s on "No such
+        # path" / "is not a test file" and DROPS the path. Give one good path and one
+        # typo, and the run is green having never executed the file you asked for:
+        #
+        #   $ julia --project=. test/runtests.jl test/harness_tests.jl test/middlware/guards_tests.jl
+        #   Warning: No such path ".../test/middlware/guards_tests.jl"
+        #   [ Tests Completed: 1/1 test items were run.
+        #        Testing Nitro tests passed
+        #
+        # (Worse, when EVERY path is invalid `runtests` returns `nothing` outright.) With
+        # `true`, each of those becomes a throw. This is the path-axis twin of the
+        # unlisted-file defect `test/harness_tests.jl` guards on the TEST_FILES axis.
+        validate_paths = true,
         testitem_timeout = 600,
         test_end_expr = TEST_END,
         nworkers = covering ? 0 : (nworkers < 0 ? 1 : nworkers),
