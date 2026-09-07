@@ -38,6 +38,23 @@ function _filtered_rows(qs::MockTaskQuerySet)
                 matches = row["completed_at"] !== nothing && row["completed_at"] > v
             elseif k == "completed_at__@isnull"
                 matches = (row["completed_at"] === nothing) == v
+            elseif k == "watchers"
+                # Exact match on the serialized document — the compare half of
+                # add_watcher!'s CAS. Without this branch the filter fell through and
+                # matched on `id` alone, so the CAS always appeared to win.
+                matches = row["watchers"] == v
+            elseif k == "id__startswith" || k == "id__@startswith"
+                matches = startswith(row["id"], v)
+            elseif k == "watchers__contains" || k == "watchers__@contains"
+                # Substring match on the serialized JSON, like the real backend.
+                matches = occursin(v, row["watchers"])
+            else
+                # Previously an unrecognised key fell through and left `matches` at
+                # whatever the last branch set, so a filter the mock did not model
+                # silently did not constrain — and any test relying on it passed
+                # vacuously. Fail loudly instead.
+                error("MockTaskQuerySet: unmodelled filter key '$k' — teach the mock " *
+                      "about it, or the query under test is not actually being exercised")
             end
             matches || break
         end
@@ -50,11 +67,18 @@ end
 function Base.getproperty(qs::MockTaskQuerySet, name::Symbol)
     if name === :filter
         return function(pairs::Pair{String,<:Any}...)
-            new_filters = copy(getfield(qs, :filters))
+            # ACCUMULATE onto this object and return it, exactly as PormG's `_filter!`
+            # does (`push!(q.filter, …)`; see its "Calls ACCUMULATE (ANDed)" note).
+            #
+            # This used to return a fresh queryset with a copied filter dict, which made
+            # `base.filter(A)` and `base.filter(B)` independent. Against real PormG they
+            # are not: the second call ANDs onto the first. A mock that branches where the
+            # real thing accumulates turns an intersection bug into a passing test.
+            filters = getfield(qs, :filters)
             for (k, v) in pairs
-                new_filters[k] = v
+                filters[k] = v
             end
-            return MockTaskQuerySet(getfield(qs, :table), new_filters)
+            return qs
         end
     elseif name === :db
         return function(_db_key::String)
@@ -80,12 +104,17 @@ function Base.getproperty(qs::MockTaskQuerySet, name::Symbol)
         end
     elseif name === :update
         return function(pairs::Pair{String,<:Any}...)
+            # Return the affected-row count, matching PormG's Django-style `update`.
+            # It used to return `nothing`, which would make every compare-and-set in
+            # the store read as a failure — or, worse, as an untested success.
+            touched = 0
             for row in _filtered_rows(qs)
                 for (k, v) in pairs
                     row[k] = v
                 end
+                touched += 1
             end
-            return nothing
+            return touched
         end
     elseif name === :delete
         return function()
@@ -194,6 +223,67 @@ function Base.getproperty(m::FlakyReadModel, name::Symbol)
     return getfield(m, name)
 end
 
+# A model that simulates another process appending a watcher in the window between our
+# read and our UPDATE.
+#
+# Deterministic on purpose. A thread-based race would be the obvious way to test this and
+# the wrong one: it passes or fails on scheduler luck, behaves differently at
+# `nthreads` 1 and 2 (CI runs both), and cannot prove the retry path ran at all. Injecting
+# the competing write exactly once, at exactly the vulnerable moment, forces the CAS to
+# match zero rows and take its retry — the whole point of #88's fix.
+struct RacingWatcherQuerySet
+    inner::MockTaskQuerySet
+    inject_next::Ref{Int}
+    intruder::String
+end
+
+function Base.getproperty(qs::RacingWatcherQuerySet, name::Symbol)
+    inner = getfield(qs, :inner)
+    inject_next = getfield(qs, :inject_next)
+    intruder = getfield(qs, :intruder)
+
+    if name === :db
+        return (key::String) -> RacingWatcherQuerySet(inner.db(key), inject_next, intruder)
+    elseif name === :filter
+        return (pairs::Pair{String,<:Any}...) ->
+            RacingWatcherQuerySet(inner.filter(pairs...), inject_next, intruder)
+    elseif name === :update
+        return function(pairs::Pair{String,<:Any}...)
+            # Only a watchers CAS is worth racing, and only once.
+            is_watcher_cas = any(p -> first(p) == "watchers", pairs) &&
+                             haskey(getfield(inner, :filters), "watchers")
+            if is_watcher_cas && inject_next[] > 0
+                inject_next[] -= 1
+                # The competing write lands first, so our compare value is now stale.
+                for row in values(getfield(inner, :table))
+                    current = JSON.parse(row["watchers"])
+                    intruder in current && continue
+                    row["watchers"] = JSON.json(vcat(current, intruder))
+                end
+            end
+            return inner.update(pairs...)
+        end
+    end
+    return getproperty(inner, name)
+end
+
+struct RacingWatcherModel
+    _table::Dict{String, Dict{String, Any}}
+    inject_next::Ref{Int}
+    intruder::String
+end
+
+function Base.getproperty(m::RacingWatcherModel, name::Symbol)
+    if name === :objects
+        return RacingWatcherQuerySet(
+            MockTaskQuerySet(getfield(m, :_table), Dict{String,Any}()),
+            getfield(m, :inject_next),
+            getfield(m, :intruder),
+        )
+    end
+    return getfield(m, name)
+end
+
 function _load_pormg_worker_store_type()
     try
         @eval using PormG
@@ -295,15 +385,287 @@ else
             push!(info_b.watchers, "user-b")
             set_task!(store3, "task-b", info_b)
 
-            tasks_a = get_all_tasks(store3, nothing, "user-a")
+            tasks_a = get_all_tasks(store3, Owner("user-a"))
             @test length(tasks_a) == 1
             @test tasks_a[1].id == "task-a"
 
-            tasks_b = get_all_tasks(store3, nothing, "user-b")
+            tasks_b = get_all_tasks(store3, Owner("user-b"))
             @test length(tasks_b) == 1
             @test tasks_b[1].id == "task-b"
 
-            @test length(get_all_tasks(store3)) == 2
+            @test length(get_all_tasks(store3, System())) == 2
+        end
+
+        @testset "watcher and status writes survive a concurrent writer (#88)" begin
+            store_cas = RealPormGWorkerStore(model=MockTaskModel())
+
+            base = TaskInfo("alice::job")
+            push!(base.watchers, "alice")
+            replace_task!(store_cas, base.id, base)
+
+            @testset "set_task! does not carry a stale watcher list" begin
+                add_watcher!(store_cas, "alice::job", "bob")
+
+                # The #88 mechanism, exactly: another process appended "bob" since this
+                # one last read the row, and now this one saves a state transition. It
+                # used to rewrite every column, dropping "bob". A transition happens on
+                # every start/progress/finish, so this was the dominant loss path —
+                # far more frequent than two appends racing each other.
+                stale = TaskInfo("alice::job")
+                push!(stale.watchers, "alice")
+                stale.status = COMPLETED
+                set_task!(store_cas, "alice::job", stale)
+
+                persisted = get_task_info(store_cas, "alice::job")
+                @test persisted.status == COMPLETED       # the state DID land
+                @test "bob" in persisted.watchers         # ...and the grant survived it
+            end
+
+            @testset "replace_task! is the one call that may reset watchers" begin
+                fresh = TaskInfo("alice::job")
+                push!(fresh.watchers, "carol")
+                replace_task!(store_cas, "alice::job", fresh)
+                @test get_task_info(store_cas, "alice::job").watchers == ["carol"]
+            end
+
+            @testset "add_watcher! retries rather than clobbering a racing append" begin
+                # Deterministic rather than threaded: a racing mock injects a competing
+                # watcher between our read and our UPDATE, so the CAS predicate matches
+                # zero rows and the retry loop is forced. This behaves identically at
+                # nthreads 1 and 2, unlike a spawn-based race.
+                table = Dict{String, Dict{String, Any}}()
+                racer = RacingWatcherModel(table, Ref(1), "intruder")
+                store_race = RealPormGWorkerStore(model=racer)
+
+                t = TaskInfo("alice::raced")
+                push!(t.watchers, "alice")
+                replace_task!(store_race, t.id, t)
+
+                @test add_watcher!(store_race, "alice::raced", "bob") == true
+
+                got = get_task_info(store_race, "alice::raced").watchers
+                # Both survive: the retry re-read the value the racer left behind and
+                # appended to *that*, instead of overwriting an append it never saw.
+                @test "intruder" in got
+                @test "bob" in got
+                @test "alice" in got
+            end
+
+            @testset "try_transition! fires only from the expected status" begin
+                store_t = RealPormGWorkerStore(model=MockTaskModel())
+                t = TaskInfo("alice::cas")
+                replace_task!(store_t, t.id, t)
+
+                @test try_transition!(store_t, "alice::cas", (PENDING, RUNNING), CANCELLED;
+                                      error="Cancelled") == true
+                @test get_task_info(store_t, "alice::cas").status == CANCELLED
+                # A task that finished elsewhere cannot be re-transitioned, and the
+                # failed attempt writes nothing.
+                @test try_transition!(store_t, "alice::cas", (PENDING, RUNNING), COMPLETED) == false
+                @test get_task_info(store_t, "alice::cas").status == CANCELLED
+                @test try_transition!(store_t, "absent", (PENDING,), CANCELLED) == false
+            end
+        end
+
+        @testset "a completing task cannot overwrite a cancellation from elsewhere (#88)" begin
+            store_x = RealPormGWorkerStore(model=MockTaskModel())
+
+            live = TaskInfo("alice::job")
+            push!(live.watchers, "alice")
+            live.status = RUNNING
+            replace_task!(store_x, live.id, live)
+            # This process is running the task, so `get_task_info` serves THIS object.
+            register_active_task_info!(store_x, live.id, live)
+
+            # Another process cancels: it writes the row and never touches our live object.
+            @test try_transition!(store_x, "alice::job", (PENDING, RUNNING), CANCELLED;
+                                  error="Cancelled") == true
+
+            # Our callback now returns normally. The old guard read `get_task_info`, which
+            # handed back our own live object still saying RUNNING, so the cancellation was
+            # invisible and the completion overwrote it: the canceller was told "cancelled"
+            # while the row said COMPLETED and served the result.
+            Nitro.Workers._complete_task!(store_x, live, "the-result")
+
+            persisted = reload_task(store_x, "alice::job")
+            @test persisted.status == CANCELLED
+            @test persisted.result != "the-result"
+        end
+
+        @testset "a failing task cannot overwrite a cancellation from elsewhere (#88)" begin
+            store_f = RealPormGWorkerStore(model=MockTaskModel())
+
+            live = TaskInfo("alice::flaky")
+            push!(live.watchers, "alice")
+            live.status = RUNNING
+            replace_task!(store_f, live.id, live)
+            register_active_task_info!(store_f, live.id, live)
+
+            try_transition!(store_f, "alice::flaky", (PENDING, RUNNING), CANCELLED; error="Cancelled")
+            # `_fail_task!` had no cancellation guard at all, not even the ineffective one.
+            Nitro.Workers._fail_task!(store_f, live, "boom")
+
+            persisted = reload_task(store_f, "alice::flaky")
+            @test persisted.status == CANCELLED
+            @test persisted.error == "Cancelled"
+        end
+
+        @testset "zombie recovery cannot clobber a result claimed elsewhere (#88)" begin
+            store_z = RealPormGWorkerStore(model=MockTaskModel())
+
+            t = TaskInfo("alice::job")
+            push!(t.watchers, "alice")
+            t.status = RUNNING
+            replace_task!(store_z, t.id, t)
+
+            # `get_active_task` is process-local, so this node sees another node's
+            # genuinely-running task as a zombie. Meanwhile that node finishes it.
+            @test try_transition!(store_z, "alice::job", (PENDING, RUNNING), COMPLETED;
+                                  result="real-result", progress=100.0) == true
+
+            # The sweep now claims rather than saves a stale decision, so it writes
+            # nothing: it used to overwrite both the status AND the result column.
+            @test recover_zombie_tasks!(; store=store_z) == 0
+            persisted = reload_task(store_z, "alice::job")
+            @test persisted.status == COMPLETED
+            @test persisted.result == "real-result"
+        end
+
+        @testset "a cross-process grantee still sees live progress (#96)" begin
+            store_p = RealPormGWorkerStore(model=MockTaskModel())
+
+            live = TaskInfo("alice::upload")
+            push!(live.watchers, "alice")
+            live.status = RUNNING
+            replace_task!(store_p, live.id, live)
+            register_active_task_info!(store_p, live.id, live)
+
+            add_watcher!(store_p, "alice::upload", "backend-service")
+            empty!(live.watchers)
+            push!(live.watchers, "alice")        # force the live copy stale again
+            update_progress!(live, 73)           # ...and let it run on
+
+            # The grantee is authorized by the durable row, but must be *served* the live
+            # record — otherwise the backend driving the progress bar, which is the whole
+            # motivating case, reads a bar frozen at whatever was last flushed.
+            granted = get_task_status("alice::upload", Owner("backend-service"); store=store_p)
+            @test granted[:progress] == 73.0
+            @test granted[:progress] == get_task_status("alice::upload", Owner("alice"); store=store_p)[:progress]
+        end
+
+        @testset "a failed task keeps the progress it reached (#88)" begin
+            store_pr = RealPormGWorkerStore(model=MockTaskModel())
+
+            t = TaskInfo("alice::flaky")
+            push!(t.watchers, "alice")
+            t.status = RUNNING
+            replace_task!(store_pr, t.id, t)
+            register_active_task_info!(store_pr, t.id, t)
+            update_progress!(t, 47)
+
+            Nitro.Workers._fail_task!(store_pr, t, "boom")
+
+            # A serializing store writes only the columns it is given, so omitting
+            # progress would reset "got to 47% then died" to zero here while the
+            # in-memory store kept it.
+            @test reload_task(store_pr, "alice::flaky").progress == 47.0
+        end
+
+        @testset "a grant made elsewhere is honoured despite a stale live record (#96)" begin
+            store_s = RealPormGWorkerStore(model=MockTaskModel())
+
+            live = TaskInfo("alice::upload")
+            push!(live.watchers, "alice")
+            live.status = RUNNING
+            replace_task!(store_s, live.id, live)
+            register_active_task_info!(store_s, live.id, live)
+
+            # Another process grants access. It writes the row; our live object, which
+            # `get_task_info` serves, knows nothing about it. This is #96's own motivating
+            # deployment: submitted on one node, polled from another.
+            @test add_watcher!(store_s, "alice::upload", "backend-service") == true
+            empty!(live.watchers)
+            push!(live.watchers, "alice")          # force the live copy stale
+
+            # Listing reads the row and admits the grantee...
+            @test only(get_all_tasks(store_s, Owner("backend-service"))).id == "alice::upload"
+            # ...and so must the point reads, or the grant works or not by which node answered.
+            @test get_task_status("alice::upload", Owner("backend-service"); store=store_s)[:id] == "alice::upload"
+            # A genuine stranger is still refused after the durable re-check.
+            @test_throws AuthorizationError get_task_status("alice::upload", Owner("stranger"); store=store_s)
+        end
+
+        @testset "watchers= grants persist through the store (#96)" begin
+            store_grant = RealPormGWorkerStore(model=MockTaskModel())
+
+            task_id = submit_task("import-42", () -> "imported", Owner("browser-client");
+                                  watchers=[Owner("backend-service")], store=store_grant)
+            @test timedwait(() -> get_task_status(task_id, Owner("browser-client"); store=store_grant)[:status] == "COMPLETED", 5.0) == :ok
+
+            # The grant has to survive serialization and round-trip back out of the store.
+            # (This is a #96 test, not a #88 regression test: within one process the saved
+            # object already carries both watchers, so it would pass against the unpatched
+            # `set_task!` too. The non-vacuous #88 cases are above and in workers_tests.jl.)
+            @test get_task_status(task_id, Owner("backend-service"); store=store_grant)[:result] == "imported"
+            @test only(get_all_tasks(store_grant, Owner("backend-service"))).id == task_id
+            @test_throws AuthorizationError get_task_status(task_id, Owner("stranger"); store=store_grant)
+        end
+
+        @testset "add_watcher! reaches a running task's live info" begin
+            store_live = RealPormGWorkerStore(model=MockTaskModel())
+
+            running = TaskInfo("alice::live")
+            push!(running.watchers, "alice")
+            running.status = RUNNING
+            replace_task!(store_live, running.id, running)
+            # get_task_info serves this object for an active task, so a grant written
+            # only to the row would stay invisible until the task terminated.
+            register_active_task_info!(store_live, running.id, running)
+
+            @test add_watcher!(store_live, "alice::live", "bob") == true
+            @test "bob" in get_task_info(store_live, "alice::live").watchers
+            @test get_task_status("alice::live", Owner("bob"); store=store_live)[:id] == "alice::live"
+        end
+
+        @testset "the narrowed query still returns owned AND granted tasks" begin
+            # `_authority_rows` narrows with two SQL filters — an id prefix for owned
+            # tasks and a watchers substring for granted ones. Both are supersets on
+            # purpose: the Julia predicate afterwards can discard an extra row, but it
+            # cannot recover one the query dropped. So the risk being covered here is
+            # a row going MISSING, not an extra one slipping through.
+            store_narrow = RealPormGWorkerStore(model=MockTaskModel())
+
+            # Owned: reachable only by the id prefix (its watcher entry is wiped).
+            owned = TaskInfo("alice::mine")
+            set_task!(store_narrow, owned.id, owned)
+
+            # Granted: a :global id, so there is no prefix to match — reachable only
+            # through the watchers filter.
+            granted = TaskInfo("shared-global")
+            push!(granted.watchers, "alice")
+            set_task!(store_narrow, granted.id, granted)
+
+            # Someone else's, matching neither filter.
+            other = TaskInfo("bob::theirs")
+            push!(other.watchers, "bob")
+            set_task!(store_narrow, other.id, other)
+
+            ids = Set(t.id for t in get_all_tasks(store_narrow, Owner("alice")))
+            @test ids == Set(["alice::mine", "shared-global"])
+
+            # A prefix that is not delimiter-terminated must not match: "ali" is not
+            # an owner of "alice::mine", and `owner_of` would never say it was.
+            @test isempty(get_all_tasks(store_narrow, Owner("ali")))
+
+            # The watchers filter matches the JSON-quoted id, so a longer name that
+            # merely starts with the same characters cannot collide.
+            bobby = TaskInfo("global-bobby")
+            push!(bobby.watchers, "bobby")
+            set_task!(store_narrow, bobby.id, bobby)
+            @test isempty(get_all_tasks(store_narrow, Owner("bob")) |>
+                          ts -> filter(t -> t.id == "global-bobby", ts))
+
+            @test length(get_all_tasks(store_narrow, System())) == 4
         end
 
         @testset "get_all_tasks filters by queue_name in the DB query" begin
@@ -323,15 +685,15 @@ else
                 set_task!(store4, t.id, t)
             end
 
-            reports = get_all_tasks(store4, PENDING, nothing, "reports")
+            reports = get_all_tasks(store4, System(); status=PENDING, queue_name="reports")
             @test length(reports) == 3
             @test all(t.queue_name == "reports" for t in reports)
 
-            invoices = get_all_tasks(store4, PENDING, nothing, "invoices")
+            invoices = get_all_tasks(store4, System(); status=PENDING, queue_name="invoices")
             @test length(invoices) == 2
             @test all(t.queue_name == "invoices" for t in invoices)
 
-            @test length(get_all_tasks(store4, PENDING)) == 5
+            @test length(get_all_tasks(store4, System(); status=PENDING)) == 5
         end
 
         @testset "get_all_tasks overlays live progress for active tasks" begin
@@ -350,12 +712,12 @@ else
             update_progress!(live, 73.0)
             register_active_task_info!(store5, live.id, live)
 
-            listed = only(get_all_tasks(store5, RUNNING))
+            listed = only(get_all_tasks(store5, System(); status=RUNNING))
             @test listed.progress == 73.0
 
             # After the task terminates the cache entry is gone and the DB value wins.
             deregister_active_task_info!(store5, live.id)
-            @test only(get_all_tasks(store5, RUNNING)).progress == 0.0
+            @test only(get_all_tasks(store5, System(); status=RUNNING)).progress == 0.0
         end
 
         @testset "_from_db_record raises on unknown status string" begin
@@ -409,34 +771,34 @@ else
                 owner_id = submit_task("shared-export", () -> begin
                     wait(release)
                     return "victim-secret"
-                end, "victim"; scope=:global, store=store_e2e)
+                end, Owner("victim"); scope=:global, store=store_e2e)
                 @test owner_id == "shared-export"
 
                 @test_throws AuthorizationError submit_task("shared-export", () -> begin
                     attacker_calls[] += 1
                     return "attacker-data"
-                end, "attacker"; scope=:global, store=store_e2e)
+                end, Owner("attacker"); scope=:global, store=store_e2e)
 
                 notify(release)
-                @test timedwait(() -> get_task_status(owner_id; store=store_e2e)[:status] == "COMPLETED", 5.0) == :ok
+                @test timedwait(() -> get_task_status(owner_id, Owner("victim"); store=store_e2e)[:status] == "COMPLETED", 5.0) == :ok
 
                 # Terminal state: replacing the row would destroy the owner's result.
                 @test_throws AuthorizationError submit_task("shared-export", () -> begin
                     attacker_calls[] += 1
                     return "attacker-data"
-                end, "attacker"; scope=:global, store=store_e2e)
+                end, Owner("attacker"); scope=:global, store=store_e2e)
 
-                persisted = get_task_status(owner_id, "victim"; store=store_e2e)
+                persisted = get_task_status(owner_id, Owner("victim"); store=store_e2e)
                 @test persisted[:result] == "victim-secret"
                 @test persisted[:watcher_count] == 1
                 @test attacker_calls[] == 0
 
                 # user scope keeps the two users on separate rows entirely
-                a = submit_task("report", () -> "a", "user-a"; store=store_e2e)
-                b = submit_task("report", () -> "b", "user-b"; store=store_e2e)
+                a = submit_task("report", () -> "a", Owner("user-a"); store=store_e2e)
+                b = submit_task("report", () -> "b", Owner("user-b"); store=store_e2e)
                 @test a == "user-a::report"
                 @test b == "user-b::report"
-                @test_throws AuthorizationError get_task_status(a, "user-b"; store=store_e2e)
+                @test_throws AuthorizationError get_task_status(a, Owner("user-b"); store=store_e2e)
             finally
                 notify(release)
                 reset_store!(store_e2e)
@@ -465,14 +827,14 @@ else
             # own probe then succeeds, which is what made this reachable.
             flaky.fail_next[] = 1
             @test_throws ErrorException submit_task(
-                "shared-export", () -> "attacker-data", "attacker"; scope=:global, store=store_fail)
+                "shared-export", () -> "attacker-data", Owner("attacker"); scope=:global, store=store_fail)
 
             # The victim's row survived intact and is still theirs.
             flaky.fail_next[] = 0
-            persisted = get_task_status("shared-export", "victim"; store=store_fail)
+            persisted = get_task_status("shared-export", Owner("victim"); store=store_fail)
             @test persisted[:result] == "victim-secret"
             @test persisted[:watcher_count] == 1
-            @test_throws AuthorizationError get_task_status("shared-export", "attacker"; store=store_fail)
+            @test_throws AuthorizationError get_task_status("shared-export", Owner("attacker"); store=store_fail)
         end
 
         @testset "a failed read of one queued item does not kill the processor (#19)" begin
@@ -494,8 +856,8 @@ else
             end
 
             try
-                first_id = submit_sequential_task("qfail", "k1", run_step, "u"; store=store_q)
-                second_id = submit_sequential_task("qfail", "k2", run_step, "u"; store=store_q)
+                first_id = submit_sequential_task("qfail", "k1", run_step, Owner("u"); store=store_q)
+                second_id = submit_sequential_task("qfail", "k2", run_step, Owner("u"); store=store_q)
                 @test first_id == "u::k1"
                 @test second_id == "u::k2"
 
@@ -503,7 +865,7 @@ else
                 push!(flaky.fail_ids, second_id)
                 notify(gate)
 
-                @test timedwait(() -> get_task_status(first_id; store=store_q)[:status] == "COMPLETED", 5.0) == :ok
+                @test timedwait(() -> get_task_status(first_id, Owner("u"); store=store_q)[:status] == "COMPLETED", 5.0) == :ok
 
                 # k2 is dropped, but the processor must still be alive and draining.
                 queue = get_sequential_queues(store_q)["qfail"]
@@ -511,9 +873,9 @@ else
                 @test !istaskdone(queue.processor_task)
 
                 delete!(flaky.fail_ids, second_id)
-                third_id = submit_sequential_task("qfail", "k3", run_step, "u"; store=store_q)
-                @test timedwait(() -> get_task_status(third_id; store=store_q)[:status] == "COMPLETED", 5.0) == :ok
-                @test get_task_status(third_id; store=store_q)[:result] == "ran-u::k3"
+                third_id = submit_sequential_task("qfail", "k3", run_step, Owner("u"); store=store_q)
+                @test timedwait(() -> get_task_status(third_id, Owner("u"); store=store_q)[:status] == "COMPLETED", 5.0) == :ok
+                @test get_task_status(third_id, Owner("u"); store=store_q)[:result] == "ran-u::k3"
             finally
                 notify(gate)
                 reset_store!(store_q)
@@ -526,7 +888,7 @@ else
             # covered here: MockTaskModel is a bare Dict and enforces no column length.)
             store7 = RealPormGWorkerStore(model=MockTaskModel())
 
-            scoped = scoped_task_key("export_report_42", "user-a")
+            scoped = scoped_task_key("export_report_42", Owner("user-a"))
             @test scoped == "user-a::export_report_42"
 
             info = TaskInfo(scoped; queue_name="reports")
@@ -539,14 +901,14 @@ else
             @test retrieved.watchers == ["user-a"]
 
             # The other user's same-key task is a distinct row.
-            other = scoped_task_key("export_report_42", "user-b")
+            other = scoped_task_key("export_report_42", Owner("user-b"))
             other_info = TaskInfo(other; queue_name="reports")
             push!(other_info.watchers, "user-b")
             set_task!(store7, other, other_info)
 
-            @test length(get_all_tasks(store7)) == 2
-            @test only(get_all_tasks(store7, nothing, "user-a")).id == scoped
-            @test only(get_all_tasks(store7, nothing, "user-b")).id == other
+            @test length(get_all_tasks(store7, System())) == 2
+            @test only(get_all_tasks(store7, Owner("user-a"))).id == scoped
+            @test only(get_all_tasks(store7, Owner("user-b"))).id == other
         end
 
         @testset "lock_tasks provides mutual exclusion for PormGWorkerStore" begin

@@ -39,7 +39,7 @@ function start_report(req::HTTP.Request)
     task_id = submit_task("report-42", task_info -> begin
         sleep(10)
         return Dict("report_id" => 42, "status" => "ready")
-    end, "user-1")
+    end, Owner("user-1"))
 
     return Res.status(202, Res.json(Dict("task_id" => task_id)))
 end
@@ -69,7 +69,7 @@ Use `submit_task(...)` when jobs can run independently.
 task_id = submit_task("refresh-dashboard", () -> begin
     sleep(2)
     return "ok"
-end, "user-1")
+end, Owner("user-1"))
 ```
 
 ### `submit_sequential_task`
@@ -83,7 +83,7 @@ Use `submit_sequential_task(...)` when only one job in a queue should run at a t
 task_id = submit_sequential_task("reports", "report-42", task_info -> begin
     sleep(2)
     return Dict("queue" => "reports", "task" => task_info.id)
-end, "user-1")
+end, Owner("user-1"))
 ```
 
 Different queues can still run independently.
@@ -104,7 +104,7 @@ function create_report(req::HTTP.Request)
     task_id = submit_sequential_task("reports", "report-" * report_id, task_info -> begin
         sleep(3)
         return Dict("report_id" => report_id, "status" => "ready")
-    end, "user-1")
+    end, Owner("user-1"))
 
     return Res.status(202, Res.json(Dict("task_id" => task_id)))
 end
@@ -112,7 +112,7 @@ end
 function report_status(req::HTTP.Request)
     task_id = string(req.params["task_id"])
     # Pass user_id to securely query task status
-    return Res.json(get_task_status(task_id, "user-1"))
+    return Res.json(get_task_status(task_id, Owner("user-1")))
 end
 
 urlpatterns("",
@@ -165,6 +165,7 @@ use it for every read and cancel.
 Returns a dictionary with fields such as:
 
 - `:id`
+- `:owner` — the owning user id, or `nothing` for a `:global` task
 - `:status`
 - `:progress`
 - `:result`
@@ -174,45 +175,101 @@ Returns a dictionary with fields such as:
 - `:completed_at`
 - `:queue_name`
 
+Every read takes an **authority** saying who is asking — see
+[User Access Control](#User-Access-Control) below.
+
 ```julia
-task_id = submit_task("report-42", () -> build_report(), "user-1")
-status = get_task_status(task_id, "user-1")
+task_id = submit_task("report-42", () -> build_report(), Owner("user-1"))
+status = get_task_status(task_id, Owner("user-1"))
 
 # Equivalent, when the returned id was not kept:
-status = get_task_status(scoped_task_key("report-42", "user-1"), "user-1")
+status = get_task_status(scoped_task_key("report-42", Owner("user-1")), Owner("user-1"))
 ```
 
 ### `get_all_tasks`
 
-Returns all tasks, optionally filtered by worker status.
+Returns the tasks the given authority may see, optionally filtered by worker status.
+For an `Owner` that is the tasks they own plus any they have been granted; for
+`System()` it is every task.
 
 ```julia
-all_tasks = get_all_tasks(nothing, "user-1")
-running_tasks = get_all_tasks(RUNNING, "user-1")
+my_tasks = get_all_tasks(Owner("user-1"))
+my_running = get_all_tasks(Owner("user-1"), RUNNING)
+every_task = get_all_tasks(System())
 ```
 
 ### `get_queue_status`
 
-Useful for sequential queues.
-
-```julia
-queue = get_queue_status("reports")
-```
-
-It reports information like:
+Queue-wide introspection for sequential queues, reporting:
 
 - current task
-- pending count
+- pending count and the ids of everything pending
 - queue state
 - total load
+
+**It is an admin surface and takes `System()` only** — an `Owner` is a `MethodError`:
+
+```julia
+queue = get_queue_status("reports", System())
+```
+
+Queue depth and the current task are facts about a *queue*, not about any one user, and
+the pending-id list carries owners in the `"<owner>::<key>"` prefix. Accepting an `Owner`
+and filtering that list would produce something that looks user-scoped while still
+reporting another tenant's queue depth. Put it behind the same authorization you would put
+in front of Sidekiq Web or a Hangfire dashboard, and keep it off user-facing routes.
+
+To show a user their own pending work, build it from a scoped read instead:
+
+```julia
+mine_pending = get_all_tasks(Owner("user-1"), PENDING)
+```
+
+!!! note "`is_task_running` was removed"
+    It took no user id at all, so any caller who could name an id learned whether it was
+    live. Use `get_task_status(task_id, Owner(user_id))[:status] in ("PENDING", "RUNNING")`,
+    which answers the same question with authorization applied. Note `:status` is a
+    `String`, not the `TaskStatus` enum.
 
 ## Cancellation And Retries
 
 Tasks can be cancelled by id — again, the id the submit call returned:
 
 ```julia
-cancel_task(task_id, "user-1")
+cancel_task(task_id, Owner("user-1"))
 ```
+
+!!! warning "Cancellation is cooperative"
+    `cancel_task` records the terminal state atomically and sends an `InterruptException`
+    to the worker task, but it **cannot force a running callback to stop**. A callback in a
+    tight loop that never yields, or one blocked in a `ccall` or an external process, keeps
+    running after `cancel_task` has returned `"Task cancelled"` and the status reads
+    `CANCELLED`.
+
+    Write cancellable work so it can notice: yield regularly, and check the status if the
+    job is long-running.
+
+    ```julia
+    submit_task("import", task_info -> begin
+        for chunk in chunks
+            task_info.status == CANCELLED && return "cancelled"
+            process(chunk)
+            update_progress!(task_info, 100 * done / total)
+        end
+    end, Owner("user-1"))
+    ```
+
+    **`task_info.status` is process-local.** With `PormGWorkerStore` and more than one
+    process, a cancel issued on another node writes the database row and never touches
+    this node's in-memory `TaskInfo`, so the check above will not fire. Poll the durable
+    record instead, sparingly — it is a database round-trip:
+
+    ```julia
+    get_task_status(task_info.id, System())[:status] == "CANCELLED" && return "cancelled"
+    ```
+
+    A callback that spawns an external process must kill it itself — see
+    [#49](https://github.com/PingoLee/Nitro.jl/issues/49).
 
 Tasks can also retry on failure by passing `TaskOptions`.
 
@@ -222,7 +279,7 @@ submit_task(
     () -> begin
         error("temporary failure")
     end,
-    "user-1";
+    Owner("user-1");
     options=TaskOptions(retry_on_failure=true, max_retries=3, timeout=300),
 )
 ```
@@ -242,10 +299,10 @@ task_id = submit_task("report-99", task_info -> begin
     sleep(1)
     update_progress!(task_info, 100)
     return "done"
-end, "user-1")
+end, Owner("user-1"))
 ```
 
-Clients can then poll `get_task_status(task_id)` and read `:progress`.
+Clients can then poll `get_task_status(task_id, Owner("user-1"))` and read `:progress`.
 
 ## Task Keys And Deduplication Scope
 
@@ -258,8 +315,8 @@ which means a key that two users can both produce is a key that leaks between th
 The key is namespaced by its owner, so `submit_task` returns `"<user_id>::<task_key>"`:
 
 ```julia
-a = submit_task("export_report_42", cb, "user-a")   # "user-a::export_report_42"
-b = submit_task("export_report_42", cb, "user-b")   # "user-b::export_report_42"
+a = submit_task("export_report_42", cb, Owner("user-a"))   # "user-a::export_report_42"
+b = submit_task("export_report_42", cb, Owner("user-b"))   # "user-b::export_report_42"
 ```
 
 Two independent tasks. Deduplication still collapses one user's repeat submissions onto
@@ -269,10 +326,10 @@ keys derived from resource ids, which are rarely secret.
 Rebuild the id with `scoped_task_key` if you did not keep the return value:
 
 ```julia
-scoped_task_key("export_report_42", "user-a")   # "user-a::export_report_42"
+scoped_task_key("export_report_42", Owner("user-a"))   # "user-a::export_report_42"
 ```
 
-A `user_id` may not contain `::`, and may not end in `:`. Both rules exist so that two
+An `Owner` id may not contain `::`, and may not end in `:`. Both rules exist so that two
 different `(user, key)` pairs can never resolve to the same id — without the second,
 `(":report", "alice")` and `("report", "alice:")` would collide on `"alice:::report"`. A
 colon anywhere else in the owner (`"google:12345"`) is fine.
@@ -283,7 +340,7 @@ Opt in when one expensive job really should be shared across users — a cache w
 nightly rollup, a tenant-wide index rebuild:
 
 ```julia
-task_id = submit_task("warm-price-cache", cb, user_id; scope=:global)
+task_id = submit_task("warm-price-cache", cb, Owner(user_id); scope=:global)
 ```
 
 The key is stored verbatim, so any user can name it. A caller who is **not already a
@@ -336,6 +393,32 @@ worker_store = pormg_nitro_worker(db_key="workers")
 
 Task metadata will now be persisted to that database, while live running threads are managed safely in memory to prevent serialization issues.
 
+!!! note "Multiple processes sharing one database"
+    Because the store persists across restarts, it invites deployments where several
+    processes share one database — two app instances behind a load balancer, or a web
+    process plus a worker process. Writes that must not lose a concurrent update go
+    through the store as single atomic operations rather than read-modify-write: watcher
+    grants use a compare-and-set on the stored document, and cancellation uses a
+    conditional status transition. An ordinary state save (`set_task!`) never writes the
+    watcher list at all, so a task finishing in one process cannot drop a grant another
+    process just added.
+
+    The store's `lock_tasks` is a plain `ReentrantLock` and therefore **process-local** —
+    it orders writes within one process and gives you nothing across processes. Do not
+    build a read-modify-write on top of it and assume it is safe; use the atomic store
+    operations, or add one.
+
+!!! warning "Nitro owns the format of the `watchers` column"
+    `nitro_task.watchers` holds a JSON array written by `JSON.json`, and its exact byte
+    form is load-bearing in two places: the watcher compare-and-set matches the stored
+    document, and user-scoped listing matches the JSON-quoted user id as a substring.
+
+    Do not rewrite that column by hand, from a migration, or from another language. A row
+    reformatted with different spacing or escaping — `["alice", "bob"]` rather than
+    `["alice","bob"]` — makes the compare-and-set exhaust its retries and raise on the next
+    grant, and can make a row silently drop out of a user's task list. Change watchers only
+    through the worker API.
+
 ### 3. Start workers with the persistent store
 Pass the store into the worker startup middleware:
 
@@ -354,43 +437,90 @@ serve(
 For direct calls, pass the same store explicitly:
 
 ```julia
-task_id = submit_task("report-42", run_report, "user-1"; store=worker_store)
-status = get_task_status(task_id, "user-1"; store=worker_store)
+task_id = submit_task("report-42", run_report, Owner("user-1"); store=worker_store)
+status = get_task_status(task_id, Owner("user-1"); store=worker_store)
 ```
 
 ## User Access Control
 
 To support multitenant backends, Nitro.jl workers include built-in authorization mechanisms.
 
-### Task Ownership & Watchers
-Task submission functions require a `user_id`, and that user is registered as the task's first **watcher**.
-- Status, cancellation, and listing functions accept an optional `user_id` parameter.
-- Passing a non-empty `user_id` enforces watcher-based access. Only task owners or designated watchers can query or cancel a task; unauthorized users get an `AuthorizationError`.
-- Omitting `user_id` bypasses watcher checks and should be reserved for explicit system/admin paths or app-level public worker endpoints.
+### Who is asking: `Owner` and `System`
+
+Every task API takes a **`TaskAuthority`**, and it is required — there is no arity that
+omits it:
+
+- **`Owner("user-123")`** — acts as that identity. It is a validated id: it may not be
+  empty, contain `::`, or end in `:`, so an identity you can grant is always one that can
+  be constructed again later to use the grant.
+- **`System()`** — the explicit bypass. Unscoped: every task, every result.
+
+`System()` is deliberately more to type than `Owner(...)`. Before, the bypass was an
+*omitted* argument, which made the unsafe call the shorter one and left a call site that
+had simply forgotten to scope indistinguishable from one that meant not to. Now the
+bypass is a value you name, greppable in review and in a security audit.
 
 ```julia
 using Nitro.Errors: AuthorizationError
 
-try
-    # Submit task with ownership
-    task_id = submit_task("my-task", heavy_job, "user-123")
+task_id = submit_task("my-task", heavy_job, Owner("user-123"))
 
-    # Authorized checks succeed
-    status = get_task_status(task_id, "user-123")
+status = get_task_status(task_id, Owner("user-123"))     # ok
+get_task_status(task_id, Owner("intruder-99"))           # AuthorizationError
+get_task_status(task_id, System())                       # ok — admin path, unscoped
 
-    # Unauthorized checks throw an error
-    unauthorized = get_task_status(task_id, "intruder-99")
-catch err
-    if err isa AuthorizationError
-        println("Access denied!")
-    end
-end
+get_task_status(task_id)                                 # MethodError, not a bypass
+get_task_status(task_id, "user-123")                     # MethodError — not an authority
 ```
 
-Because watcher membership is the whole gate, a user does not become a watcher of a task
-they did not create just by naming its key. Under the default `:user` scope they cannot
-name it at all; under `:global` scope they are refused unless a watch authorizer says
-otherwise.
+### Where authority comes from
+
+Two sources, and they are not equal:
+
+1. **The task id.** Under the default `:user` scope the id is `"<owner>::<key>"`, so
+   ownership is *derived*, not stored — `owner_of` reads it back. Nothing can
+   revoke it: not a lost watcher entry, not a concurrent write from another process.
+2. **The `watchers` list.** Additional grants layered on top. The submitter is added
+   automatically.
+
+A `:global` task is stored under its verbatim key and therefore has **no owner half**. For
+those, `watchers` remains the entire gate — including for the creator. That asymmetry is
+deliberate: deriving ownership adds an authority source for `:user` ids without removing
+one for `:global` ids.
+
+Because watcher membership is still the gate for `:global` tasks, a user does not become a
+watcher of a task they did not create just by naming its key. Under `:user` scope they
+cannot name it at all; under `:global` scope they are refused unless a watch authorizer
+says otherwise.
+
+### Granting access to a second identity
+
+The identity that *submits* a task is not always the identity that *polls* it. A browser
+may upload under a deliberately short-lived credential while your own backend, holding a
+different long-lived one, drives the progress bar — and extending the browser's credential
+to cover the whole job is the thing that split exists to prevent.
+
+Pass `watchers` at submit time:
+
+```julia
+task_id = submit_task("import-42", run_import, Owner("browser-client");
+                      watchers = [Owner("backend-service")])
+
+# The backend can now poll and cancel, under its own identity:
+get_task_status(task_id, Owner("backend-service"))
+```
+
+The grant is made **at submit time, by the owner**. That is the moment the owner is already
+resolved and authorized, so there is no second authorization question to answer — and no
+post-hoc public grant call that would become another route into the watcher list.
+
+Two things to know before you use it:
+
+- **A grantee can cancel, not just read.** `cancel_task` gates on the same list, so a grant
+  hands over the owner's rights minus ownership. There is no read-only grant.
+- **Grants do not survive a record reset.** Re-running a *finished* key replaces the record
+  and resets its watchers to the resubmitter, so pass `watchers` again on each such
+  resubmission. Granting an identity that is already a watcher is a no-op.
 
 ## Queue And Watch Authorization
 
@@ -469,7 +599,7 @@ Use `Nitro.Workers` when you need lightweight or persistent background execution
 
 - use `worker_startup(...)` to bootstrap workers with the server
 - use `PormGWorkerStore` to persist task state to your database
-- use `user_id` on submission, and pass it to read/manage APIs when routes are user-scoped
+- pass an `Owner(...)` on submission and on every read; `System()` is the named, unscoped bypass
 - use `submit_task(...)` for parallel jobs
 - use `submit_sequential_task(...)` for ordered queue processing
 - read and cancel with the id the submit call **returned**, not the `task_key` you passed

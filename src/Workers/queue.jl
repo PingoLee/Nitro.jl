@@ -13,51 +13,57 @@ function _mark_queue_current_task!(store::AbstractWorkerStore, queue::Sequential
     return queue
 end
 
-function _complete_task!(store::AbstractWorkerStore, task_info::TaskInfo, result)
+# Every terminal transition goes through the store's compare-and-set, so whichever writer
+# gets there first wins and the losers write nothing.
+#
+# Reading the status and then deciding does NOT work across processes, and reading it via
+# `get_task_info` does not work even in principle: for a database-backed store that serves
+# the live in-memory object of the very task being finished, so the "was I cancelled?"
+# guard would be inspecting this process's own copy and could never observe a cancellation
+# recorded elsewhere (#88).
+function _finish_task!(store::AbstractWorkerStore, task_info::TaskInfo, to::TaskStatus;
+                       error::Union{Nothing, String}=nothing,
+                       result=UNSUPPLIED,
+                       progress::Union{Nothing, Real}=nothing)
+    finished_at = current_time_utc()
     return lock_tasks(store) do
-        current = get_task_info(store, task_info.id)
-        if current !== nothing && current.status == CANCELLED
-            deregister_active_task!(store, task_info.id)
-            deregister_active_task_info!(store, task_info.id)
-            return current
+        claimed = try_transition!(store, task_info.id, (PENDING, RUNNING), to;
+                                  error, completed_at=finished_at, result, progress)
+
+        # Whether or not we won, this process is done running it.
+        deregister_active_task!(store, task_info.id)
+        deregister_active_task_info!(store, task_info.id)
+        task_info.sys_task = nothing
+
+        if !claimed
+            # Someone else reached a terminal state first — a cancellation, here or in
+            # another process. Their record stands; report it rather than ours.
+            latest = reload_task(store, task_info.id)
+            return latest === nothing ? task_info : latest
         end
-        task_info.result = result
-        task_info.completed_at = current_time_utc()
-        @atomic task_info.progress = 100.0
-        task_info.sys_task = nothing
-        task_info.status = COMPLETED
-        deregister_active_task!(store, task_info.id)
-        deregister_active_task_info!(store, task_info.id)
-        set_task!(store, task_info.id, task_info)
+
+        # Mirror onto the caller's object so an in-process reader holding it agrees with
+        # what was just written.
+        error === nothing || (task_info.error = error)
+        result === UNSUPPLIED || (task_info.result = result)
+        progress === nothing || (@atomic task_info.progress = Float64(progress))
+        task_info.completed_at = finished_at
+        task_info.status = to
         return task_info
     end
 end
 
-function _fail_task!(store::AbstractWorkerStore, task_info::TaskInfo, message::String)
-    return lock_tasks(store) do
-        task_info.error = message
-        task_info.completed_at = current_time_utc()
-        task_info.sys_task = nothing
-        task_info.status = FAILED
-        deregister_active_task!(store, task_info.id)
-        deregister_active_task_info!(store, task_info.id)
-        set_task!(store, task_info.id, task_info)
-        return task_info
-    end
-end
+_complete_task!(store::AbstractWorkerStore, task_info::TaskInfo, result) =
+    _finish_task!(store, task_info, COMPLETED; result, progress=100.0)
 
-function _cancel_task!(store::AbstractWorkerStore, task_info::TaskInfo; message::String="Cancelled")
-    return lock_tasks(store) do
-        task_info.error = message
-        task_info.completed_at = current_time_utc()
-        task_info.sys_task = nothing
-        task_info.status = CANCELLED
-        deregister_active_task!(store, task_info.id)
-        deregister_active_task_info!(store, task_info.id)
-        set_task!(store, task_info.id, task_info)
-        return task_info
-    end
-end
+# Carry the progress the task had reached. A serializing store writes only the columns it
+# is given, so omitting it would reset a failed job's "got to 47% and died" to zero there
+# while the in-memory store kept it — a store-parity gap and a diagnostic loss.
+_fail_task!(store::AbstractWorkerStore, task_info::TaskInfo, message::String) =
+    _finish_task!(store, task_info, FAILED; error=message, progress=task_info.progress)
+
+_cancel_task!(store::AbstractWorkerStore, task_info::TaskInfo; message::String="Cancelled") =
+    _finish_task!(store, task_info, CANCELLED; error=message, progress=task_info.progress)
 
 function _execute_queued_task(store::AbstractWorkerStore, item::QueueItem)
     task_info = get_task_info(store, item.task_key)

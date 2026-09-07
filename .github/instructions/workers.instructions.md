@@ -25,37 +25,57 @@ The worker system supports both volatile in-memory queues and persistent databas
 
 ## 2. Task API
 
-Task submission requires `user_id`. Read/manage APIs accept optional `user_id`.
-Passing a non-empty `user_id` enforces watcher-based access (`AuthorizationError` when denied). Omitting `user_id` is a deliberate system/public-endpoint bypass for routes that intentionally expose shared task visibility, not the default for user-scoped APIs.
+**Every task API takes a required `TaskAuthority`.** `Owner("user_123")` is a validated identity;
+`System()` is the explicit, unscoped bypass. There is no arity that omits it — a call that forgets
+to scope is a `MethodError`, not a silent bypass
+([#48](https://github.com/PingoLee/Nitro.jl/issues/48)). Never re-introduce an optional or
+defaulted authority argument, and never let a `String` stand in for one: `user_id=nothing` **and**
+`user_id=""` were both full bypasses, and the empty-string case was reachable by reading a missing
+claim into an empty string.
 
 **The submit call returns the id, and it is not the `task_key` you passed.** Task ids double as
-deduplication keys, so `scope` decides who can collide with whom — and since watcher membership is
-the sole gate on reading a `:result` and cancelling, a key two users can both produce is a key that
-leaks between them ([#19](https://github.com/PingoLee/Nitro.jl/issues/19)).
+deduplication keys, so `scope` decides who can collide with whom
+([#19](https://github.com/PingoLee/Nitro.jl/issues/19)).
 
 ```julia
 # scope=:user (the default) — id is "user_123::report_42"; no cross-user collision is possible
-task_id = submit_task("report_42", () -> work(), "user_123")
-task = get_task_status(task_id, "user_123")
-cancel_task(task_id, "user_123")
-user_tasks = get_all_tasks(nothing, "user_123")
+task_id = submit_task("report_42", () -> work(), Owner("user_123"))
+task = get_task_status(task_id, Owner("user_123"))
+cancel_task(task_id, Owner("user_123"))
+user_tasks = get_all_tasks(Owner("user_123"))
 
 # Rebuild the id when the return value was not kept
-task_id == scoped_task_key("report_42", "user_123")
+task_id == scoped_task_key("report_42", Owner("user_123"))
 
 # scope=:global — verbatim key, system-wide dedup. A caller who is not already a watcher is
 # refused (AuthorizationError) whether the task is live or finished, unless a watch authorizer
 # allows it. Finished counts: replacing the record would discard the owner's result.
-shared = submit_task("warm-cache", () -> work(), "user_123"; scope=:global)
+shared = submit_task("warm-cache", () -> work(), Owner("user_123"); scope=:global)
 
-# System/public endpoint bypass, only when the app intentionally allows it:
-public_status = get_task_status(task_id)
+# The bypass, only when the app intentionally allows it — and greppable because it is named:
+public_status = get_task_status(task_id, System())
 ```
 
-Never hand-build a scoped id by string concatenation. `scoped_task_key` rejects a `user_id` that
-contains `::` **or ends in `:`**, and a `:global` `task_key` that contains `::`. Those three rules
-together are what make `(user, key) → id` injective and keep the two scopes' id spaces disjoint;
-drop any one and two distinct pairs collide.
+**Grant a second identity at submit time, never after.** `submit_task(...; watchers=[Owner("svc")])`
+is the supported way to let a different identity poll or cancel a task
+([#96](https://github.com/PingoLee/Nitro.jl/issues/96)) — the owner is already resolved and
+authorized there, so no second authorization question arises. Do not add a public post-hoc
+`add_watcher!(task_id, ...)`: that would be a second route into the watcher list, which is the
+surface [#19](https://github.com/PingoLee/Nitro.jl/issues/19) closed. The store-level
+`add_watcher!` performs no authorization and is not that API. A grantee gets read, list **and**
+cancel, because `cancel_task` gates on the same list.
+
+**Authority comes from the id; `watchers` only adds to it.** `owner_of(id)` reads the owner half
+back out of a `:user` id, so ownership is derived and unclobberable — a lost watcher append or a
+full-row write from another process cannot evict an owner from their own task. A `:global` id has
+no owner half, so for those `watchers` remains the entire gate, including for the creator. Keep
+that asymmetry: it is what makes deriving ownership purely additive.
+
+Never hand-build a scoped id by string concatenation. `Owner` rejects a `user_id` that is empty,
+contains `::`, **or ends in `:`**, and `scoped_task_key` rejects a `:global` `task_key` that
+contains `::`. Those rules together are what make `(user, key) → id` injective, keep the two
+scopes' id spaces disjoint, and make `owner_of` a total inverse; drop any one and two distinct
+pairs collide.
 
 ### Reporting progress — never assign the field
 
@@ -83,7 +103,7 @@ you add anything:
 |-----|---------|
 | `submit_sequential_task`, `SequentialQueue` | Ordered, one-at-a-time execution within a queue |
 | `scoped_task_key`, `DEFAULT_QUEUE_NAME` | Resolve a `(task_key, user_id, scope)` to its stored id; the queue name `submit_task` authorizes against |
-| `is_task_running`, `get_queue_status` | Introspection without mutating |
+| `get_queue_status` | Queue-wide introspection — **admin only**, takes `System()`; an `Owner` is a `MethodError` |
 | `update_progress!` | The only safe write to `TaskInfo.progress` |
 | `cleanup_old_tasks`, `start_cleanup_scheduler`, `stop_cleanup_scheduler!` | Retention |
 | `shutdown!` | Graceful teardown — stop the cleanup scheduler and queue processors |
@@ -146,6 +166,17 @@ On startup, `RUNNING` tasks without a live in-memory `Task` are marked `FAILED` 
 
 > **Strict core isolation**: Never import `PormG` or run DB queries in `src/Workers`. Database logic belongs in `ext/NitroPormGExt.jl`.
 
+- **`lock_tasks` is process-local, so never build a read-modify-write on it.** For a
+  database-backed store it is a plain `ReentrantLock` in the struct: two processes sharing one
+  database each take their own and neither sees the other
+  ([#88](https://github.com/PingoLee/Nitro.jl/issues/88)). A write that must not lose a concurrent
+  update belongs in the store as a single atomic *intent* operation — `add_watcher!` (a
+  compare-and-set on the stored document) and `try_transition!` (a conditional status change) are
+  the pattern. Composing `get_task_info` + mutate + `set_task!` under the lock is exactly the bug.
+- **`set_task!` writes state; `replace_task!` writes the whole record.** `set_task!` must never
+  write `watchers` — grants are not volatile state, and carrying them on every transition is how
+  they got clobbered. `replace_task!` has exactly one caller: re-running a finished key, which by
+  design resets the watcher list.
 - Add abstract stubs in `src/Workers/registry.jl`.
 - Implement in `InMemoryWorkerStore` **and** `PormGWorkerStore` — a hook implemented in only one of
   them is a store that silently behaves differently, which for the authorizer pair means a silently

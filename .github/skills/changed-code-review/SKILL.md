@@ -103,7 +103,7 @@ Prioritize:
 - **Routing API drift**: reintroduced `@get`/`@post`, `serveparallel()`, or function-style `get()`/`post()` registrars
 - **Middleware order**: session/CSRF/guards applied after routing or in wrong pipeline position
 - **Extractor/handler mismatch**: path converters, typed extractors, or `validate` behavior inconsistent with route signature
-- **Workers API drift**: `submit_task` / `get_task_status` / `cancel_task` called without `user_id` where authorization is required
+- **Workers authority drift**: `System()` passed where the caller has a real user id, or a new/changed task API that makes its `TaskAuthority` optional or defaulted — the type exists so a missed scope is a `MethodError`, and an optional argument gives that back
 - **Store interface incompleteness**: new `AbstractWorkerStore` method in registry without both in-memory and PormG implementations
 - **Zombie recovery**: persistent `RUNNING` tasks left orphaned when startup recovery is disabled or bypassed
 - **Extension boundary violations**: `PormG` or SQL in `src/` instead of `ext/`

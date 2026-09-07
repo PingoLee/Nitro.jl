@@ -312,14 +312,20 @@ whitespace all mount at the router root. An `index.html` also claims its bare di
 ## Workers
 
 ```julia
-submit_task(task_key, callback::Function, user_id;            # user_id REQUIRED; RETURNS the stored id
-            scope::Symbol = :user,                            # :user namespaces the key by owner
-            options::TaskOptions = TaskOptions(), store = default_store())
-get_task_status(task_id, user_id = nothing; store = default_store())
-cancel_task(task_id,     user_id = nothing; store = default_store())
-get_all_tasks(filter_status = nothing, user_id = nothing; store = default_store())
+Owner(user_id)                                                # a validated identity; rejects "", "::", trailing ":"
+System()                                                      # the named, unscoped bypass
+owner_of(task_id)                                             # "user-a" | nothing (:global has no owner)
 
-scoped_task_key(task_key, user_id; scope = :user)             # "user-a::report_42"
+submit_task(task_key, callback::Function, owner::Owner;       # RETURNS the stored id
+            scope::Symbol = :user,                            # :user namespaces the key by owner
+            watchers::Vector{Owner} = Owner[],                # grant a 2nd identity read/list/cancel
+            options::TaskOptions = TaskOptions(), store = default_store())
+get_task_status(task_id, authority::TaskAuthority; store = default_store())
+cancel_task(task_id,     authority::TaskAuthority; store = default_store())
+get_all_tasks(authority::TaskAuthority, filter_status = nothing; store = default_store())
+# The authority is REQUIRED on all three — omitting it is a MethodError, not a bypass.
+
+scoped_task_key(task_key, owner::Owner; scope = :user)        # "user-a::report_42"
 worker_startup(; queues, store, recover_zombies)              # a middleware
 set_queue_authorizer!(store, authorizer)                      # (queue, user_id) -> Bool
 set_watch_authorizer!(store, authorizer)                      # (task_key, watchers, user_id) -> Bool

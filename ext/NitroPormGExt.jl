@@ -13,7 +13,9 @@ import Nitro: pormg_nitro_session
 
 import Nitro.Workers: AbstractWorkerStore, TaskInfo, TaskStatus, TaskOptions, SequentialQueue, CleanupScheduler,
     PENDING, RUNNING, COMPLETED, FAILED, CANCELLED,
-    get_task_info, set_task!, delete_task!, cleanup_tasks!, get_all_tasks,
+    TaskAuthority, Owner, System, UNSUPPLIED, owner_of, _is_authorized, TASK_KEY_DELIMITER,
+    get_task_info, reload_task, set_task!, replace_task!, add_watcher!, try_transition!,
+    delete_task!, cleanup_tasks!, get_all_tasks,
     get_active_task, register_active_task!, deregister_active_task!,
     get_active_task_info, register_active_task_info!, deregister_active_task_info!,
     get_queue_authorizer, set_queue_authorizer!,
@@ -435,6 +437,19 @@ function _parse_optional_db_datetime(val)
     return _parse_db_datetime(val)
 end
 
+"""
+The `id` of a raw row, without parsing the rest of it.
+
+Same symbol-or-string key handling as `_from_db_record`, so it works against both PormG
+rows and the test mocks — but it exists to let `_authority_rows` dedupe *before* paying
+for a full `_from_db_record`, which JSON-parses the `watchers` blob.
+"""
+function _row_task_id(row)
+    haskey(row, :id) && return string(row[:id])
+    haskey(row, "id") && return string(row["id"])
+    return nothing
+end
+
 function _from_db_record(row)::TaskInfo
     # Support both symbol lookup (PormG DB rows) and string dict (for mocks)
     get_val = (key_sym, key_str) -> haskey(row, key_sym) ? row[key_sym] : row[key_str]
@@ -511,11 +526,13 @@ function get_task_info(store::PormGWorkerStore, task_id::String)
     end
 end
 
-function set_task!(store::PormGWorkerStore, task_id::String, task_info::TaskInfo)
+function _write_task!(store::PormGWorkerStore, task_id::String, task_info::TaskInfo, replace_watchers::Bool)
     record = _to_db_record(task_info)
     try
         existing = _task_objects(store).filter("id" => task_id).first()
         if isnothing(existing)
+            # A fresh row has no watchers to preserve, so the create branch always
+            # writes them whichever entry point we came through.
             _task_objects(store).create(
                 "id" => record["id"],
                 "status" => record["status"],
@@ -529,7 +546,7 @@ function set_task!(store::PormGWorkerStore, task_id::String, task_info::TaskInfo
                 "queue_name" => record["queue_name"],
             )
         else
-            _task_objects(store).filter("id" => task_id).update(
+            columns = Pair{String, Any}[
                 "status" => record["status"],
                 "progress" => record["progress"],
                 "result" => record["result"],
@@ -537,15 +554,106 @@ function set_task!(store::PormGWorkerStore, task_id::String, task_info::TaskInfo
                 "created_at" => record["created_at"],
                 "started_at" => record["started_at"],
                 "completed_at" => record["completed_at"],
-                "watchers" => record["watchers"],
                 "queue_name" => record["queue_name"],
-            )
+            ]
+            # `watchers` rides along ONLY for `replace_task!`. Including it on every
+            # save is what made ordinary state transitions clobber grants appended by
+            # another process since this one last read the row (#88) — and transitions
+            # are far more frequent than appends, so that was the dominant loss path.
+            replace_watchers && push!(columns, "watchers" => record["watchers"])
+            _task_objects(store).filter("id" => task_id).update(columns...)
         end
     catch e
         @warn "PormGWorkerStore: failed to write task" exception=(e, catch_backtrace())
         rethrow()
     end
     return task_info
+end
+
+set_task!(store::PormGWorkerStore, task_id::String, task_info::TaskInfo) =
+    _write_task!(store, task_id, task_info, false)
+
+replace_task!(store::PormGWorkerStore, task_id::String, task_info::TaskInfo) =
+    _write_task!(store, task_id, task_info, true)
+
+# How many attempts the watcher compare-and-set gets before giving up. Contention on one
+# task row is bounded by the number of processes appending to it, so this is generous.
+const _WATCHER_CAS_ATTEMPTS = 8
+
+# Read the ROW, never the live in-memory object. `get_task_info` serves the live
+# `active_task_info` for a running task, whose watchers may already differ from what is
+# stored — and a compare-and-set has to compare against the value the UPDATE will match.
+function _read_db_task(store::PormGWorkerStore, task_id::String)
+    row = _task_objects(store).filter("id" => task_id).first()
+    return isnothing(row) ? nothing : _from_db_record(row)
+end
+
+# Keep a running task's live object in step with a grant written to the row. Without
+# this, `get_task_info` and `get_all_tasks` would serve the live object and the new
+# watcher would stay invisible until the task terminated.
+function _sync_live_watcher!(store::PormGWorkerStore, task_id::String, user_id::String)
+    lock(store.active_lock) do
+        live = Base.get(store.active_task_infos, task_id, nothing)
+        if live !== nothing && !(user_id in live.watchers)
+            push!(live.watchers, user_id)
+        end
+    end
+    return nothing
+end
+
+function add_watcher!(store::PormGWorkerStore, task_id::String, user_id::String)
+    for _ in 1:_WATCHER_CAS_ATTEMPTS
+        task = _read_db_task(store, task_id)
+        task === nothing && return false
+
+        if user_id in task.watchers
+            _sync_live_watcher!(store, task_id, user_id)
+            return true
+        end
+
+        expected = JSON.json(task.watchers)
+        updated = JSON.json(vcat(task.watchers, user_id))
+
+        # The `watchers` term in the filter is the *compare* half of the CAS: if another
+        # process wrote between our read and this statement, zero rows match and we retry
+        # against the value they left. So we can never overwrite an append we did not see.
+        matched = _task_objects(store).filter("id" => task_id, "watchers" => expected)
+        changed = matched.update("watchers" => updated)
+
+        if changed isa Integer && changed >= 1
+            # Durable record first: a crash between the two leaves the row correct, and
+            # the row is what `get_all_tasks` reads watchers from.
+            _sync_live_watcher!(store, task_id, user_id)
+            return true
+        end
+    end
+
+    error("PormGWorkerStore: could not append watcher '$user_id' to task '$task_id' after " *
+          "$(_WATCHER_CAS_ATTEMPTS) attempts — either the row is under heavy contention, or its " *
+          "`watchers` column is not in the canonical JSON form this store writes")
+end
+
+reload_task(store::PormGWorkerStore, task_id::String) = _read_db_task(store, task_id)
+
+function try_transition!(store::PormGWorkerStore, task_id::String, from, to::TaskStatus;
+                         error::Union{Nothing, String}=nothing,
+                         completed_at::Union{Nothing, DateTime}=nothing,
+                         result=UNSUPPLIED,
+                         progress::Union{Nothing, Real}=nothing)
+    columns = Pair{String, Any}["status" => string(to)]
+    error === nothing || push!(columns, "error" => error)
+    completed_at === nothing || push!(columns, "completed_at" => completed_at)
+    result === UNSUPPLIED ||
+        push!(columns, "result" => isnothing(result) ? "" : JSON.json(result))
+    progress === nothing || push!(columns, "progress" => Float64(progress))
+
+    # The status precondition lives in the WHERE clause, so the compare and the write are
+    # one statement. Zero rows affected means the task was absent or had already left
+    # `from` — and, crucially, that nothing was written.
+    matched = _task_objects(store).filter("id" => task_id, "status__@in" => [string(s) for s in from])
+    changed = matched.update(columns...)
+
+    return changed isa Integer && changed >= 1
 end
 
 function delete_task!(store::PormGWorkerStore, task_id::String)
@@ -573,14 +681,68 @@ function cleanup_tasks!(store::PormGWorkerStore, retain_days::Int)
     end
 end
 
-function get_all_tasks(store::PormGWorkerStore, status::Union{Nothing, TaskStatus}=nothing, user_id::Union{Nothing, String}=nothing, queue_name::Union{Nothing, String}=nothing)
+"""
+Rows an authority could possibly be entitled to, as a **superset**.
+
+This narrows the query; it is not the gate. The exact predicate still runs in Julia
+below, so both filters here must be supersets — the post-filter cannot recover a row
+SQL dropped, but it can discard an extra one.
+
+`System` fetches everything. An `Owner` fetches two sets, unioned:
+
+- `id__startswith "<owner>::"` — the owned tasks. `owner_of(id) == u` is equivalent to
+  `startswith(id, u * "::")` for any constructible `Owner`, because `u` contains no
+  `"::"` and `Owner("")` cannot exist.
+- `watchers__contains` the **JSON-quoted** id — the granted ones, which have no id
+  prefix, and every `:global` task, which is watcher-only. Quoting matters: searching
+  for `"bob"` with its quotes cannot match `["bobby"]`.
+
+Two Pair-only queries rather than one `Qor`, so the shape stays inside what a
+`Pair`-typed query mock can express.
+
+The win is rows fetched and `watchers` blobs JSON-parsed, not index usage: on
+PostgreSQL a `LIKE 'x%'` uses the primary-key index only under a C collation or a
+`text_pattern_ops` opclass, which `PormG.Dialect.create_index` cannot express. Do not
+add an index for this.
+"""
+_authority_rows(make_base::Function, ::System) = make_base().list()
+
+function _authority_rows(make_base::Function, authority::Owner)
+    # `make_base()` must mint a FRESH queryset per leg. PormG's `filter` accumulates onto
+    # the object and returns it (`push!(q.filter, …)`), so filtering one shared base twice
+    # ANDs the two legs together — `watched` would become `owned ∩ watched`, and every
+    # watcher-only task (all `:global` ones, and every `watchers=` grant) would silently
+    # vanish from the listing. That is an intersection where a union is required.
+    owned = make_base().filter("id__@startswith" => authority.user_id * TASK_KEY_DELIMITER).list()
+    watched = make_base().filter("watchers__@contains" => JSON.json(authority.user_id)).list()
+
+    rows = Any[]
+    seen = Set{String}()
+    for row in Iterators.flatten((owned, watched))
+        # Dedupe on the raw row, before `_from_db_record`: under `:user` scope the owner
+        # is also a watcher, so most rows appear in both sets and parsing twice would
+        # spend exactly the JSON work this narrowing exists to avoid.
+        id = _row_task_id(row)
+        id === nothing && continue
+        id in seen && continue
+        push!(seen, id)
+        push!(rows, row)
+    end
+    return rows
+end
+
+function get_all_tasks(store::PormGWorkerStore, authority::TaskAuthority; status::Union{Nothing, TaskStatus}=nothing, queue_name::Union{Nothing, String}=nothing)
     try
-        qs = _task_objects(store)
-        if status !== nothing
-            qs = qs.filter("status" => string(status))
-        end
-        if queue_name !== nothing
-            qs = qs.filter("queue_name" => queue_name)
+        # A factory, not a queryset: see `_authority_rows` on why each leg needs its own.
+        make_base = function()
+            qs = _task_objects(store)
+            if status !== nothing
+                qs = qs.filter("status" => string(status))
+            end
+            if queue_name !== nothing
+                qs = qs.filter("queue_name" => queue_name)
+            end
+            return qs
         end
 
         # Snapshot the live in-memory infos so running tasks report fresh
@@ -591,7 +753,7 @@ function get_all_tasks(store::PormGWorkerStore, status::Union{Nothing, TaskStatu
         end
 
         tasks = TaskInfo[]
-        for row in qs.list()
+        for row in _authority_rows(make_base, authority)
             task_info = _from_db_record(row)
             live = get(active, task_info.id, nothing)
             if live !== nothing
@@ -604,9 +766,9 @@ function get_all_tasks(store::PormGWorkerStore, status::Union{Nothing, TaskStatu
                 task_info.started_at = live.started_at
                 task_info.completed_at = live.completed_at
             end
-            if user_id !== nothing && !isempty(user_id) && !(user_id in task_info.watchers)
-                continue
-            end
+            # The gate. `_authority_rows` above only narrowed what was fetched; note the
+            # overlay has already run, so a live task cannot slip past this.
+            _is_authorized(authority, task_info) || continue
             push!(tasks, task_info)
         end
         return tasks

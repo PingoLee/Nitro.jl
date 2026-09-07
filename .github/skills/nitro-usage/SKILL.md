@@ -301,12 +301,14 @@ serve(middleware=[
 ])
 
 # Returns the STORED id ("<user_id>::report-42"), not the key you passed.
-task_id = submit_task("report-42", () -> build_report(id), user_id)
-status  = get_task_status(task_id, user_id)
-cancel_task(task_id, user_id)
+task_id = submit_task("report-42", () -> build_report(id), Owner(user_id))
+status  = get_task_status(task_id, Owner(user_id))
+cancel_task(task_id, Owner(user_id))
 ```
 
-Omitting `user_id` on a read is a deliberate system/public-endpoint bypass — never the default for a
+Every task API takes a required `TaskAuthority`: `Owner(user_id)` to act as that identity, or the
+named `System()` bypass. Omitting it is a `MethodError`, not a silent bypass — and a bare `String`
+is not an authority either. `System()` is for a deliberate admin path, never the default for a
 user-scoped route. Keep the returned id (or rebuild it with `scoped_task_key`) — under the default
 `:user` scope it is namespaced by owner, which is what stops one user reading or cancelling
 another's task by guessing a resource-derived key. For persistence,
@@ -358,8 +360,8 @@ query parameter with no default is **required**: omitting it is a 400, not `noth
 | Binding a request body to a struct with `is_admin` / `user_id` | A separate input struct; assign privileged fields server-side |
 | `if user.role == "admin"` inside a handler | `role_required("admin")` guard on the route |
 | `login_required()` on a route that loads a record by client id | Also verify ownership — otherwise IDOR |
-| `submit_task(key, cb)` without `user_id` | `submit_task(key, cb, user_id)` |
-| Polling `get_task_status(key, …)` with the key you submitted | Poll with the id `submit_task` returned, or `scoped_task_key(key, user_id)` |
+| `submit_task(key, cb)` without an authority | `submit_task(key, cb, Owner(user_id))` |
+| Polling `get_task_status(key, …)` with the key you submitted | Poll with the id `submit_task` returned, or `scoped_task_key(key, Owner(user_id))` |
 | Mutating a `Response` returned by inner middleware | `add_response_headers(resp, extra)` |
 | A global mutable config object | A typed struct passed via `serve(context=…)` |
 | `show_errors=false` "for security" | Leave it on — the client response is already generic |

@@ -42,6 +42,284 @@ consuming app, `nitro-cut-release` stamps every entry below with `0.3.0`, dates 
 
 ---
 
+## `AbstractWorkerStore` gains three atomic write methods; `set_task!` no longer writes watchers (#88)
+
+- **Version**: Unreleased
+- **Nitro ref**: #88; `src/Workers/registry.jl`, `src/Workers/api.jl`, `ext/NitroPormGExt.jl`
+- **Recorded**: 2026-09-06
+- **Severity**: **breaking for custom `AbstractWorkerStore` implementations only.** Apps
+  using `InMemoryWorkerStore` or `PormGWorkerStore` need no source edit.
+
+### What changed
+
+`PormGWorkerStore` stores `watchers` as a JSON array in one `TextField`, and every save
+rewrote the whole row. `_register_or_watch!` and `cancel_task` guarded their
+read-modify-write with `lock_tasks`, which for that store is a plain `ReentrantLock` held
+in the struct — **process-local**. Two processes sharing one database each took their own
+and neither saw the other, so the writes were last-write-wins.
+
+The fix is not a better lock. `lock_tasks` promised mutual exclusion its weakest backend
+cannot deliver, so the contended writes moved into the store as atomic *intent*
+operations, which every backend can honour with its own storage:
+
+- **`add_watcher!(store, task_id, user_id) -> Bool`** — idempotent, atomic. `PormGWorkerStore`
+  implements it as a bounded-retry compare-and-set: the expected `watchers` document is part
+  of the `WHERE` clause, so a racing append matches zero rows and the retry re-reads what the
+  other writer left instead of overwriting it.
+- **`try_transition!(store, task_id, from, to; error, completed_at, result, progress) -> Bool`**
+  — moves a task between statuses only if it is still in `from`, with the precondition and
+  the write in one statement. **Every** terminal transition now goes through it: `cancel_task`,
+  and completion, failure and cancellation inside the worker. Whichever writer arrives first
+  wins and the losers write nothing, so a task finishing concurrently — in this process or
+  another one sharing the database — cannot overwrite a cancellation.
+- **`reload_task(store, task_id)`** — reads the durable record, bypassing any in-process
+  cache. Read paths consult it before *denying*, so a grant issued by another process is not
+  refused merely because this process's cached record predates it.
+- **`replace_task!(store, task_id, task_info)`** — writes a whole record, watchers included.
+
+And the change that actually closes the issue: **`set_task!` no longer writes `watchers` at
+all.** Two watcher appends racing each other was the visible symptom, but the dominant loss
+path was an ordinary state transition — start, progress, finish — carrying a stale watcher
+list along with it. Those happen far more often than appends. Grants are not volatile state,
+so they no longer travel on the volatile-state write.
+
+`InMemoryWorkerStore` honours the same contract even though it never had the bug, because a
+rule enforced by only one backend is a store that silently behaves differently.
+
+### How to find the calls to migrate
+
+```bash
+# Only custom stores are affected. If this finds nothing, there is nothing to do.
+rg -n 'AbstractWorkerStore' --type julia
+# Anything composing an atomic write out of the lock is now the wrong shape:
+rg -n 'lock_tasks' --type julia
+```
+
+### Migrate your app
+
+```julia
+# ✗ before — a custom store needed these
+set_task!(store::MyStore, id, info)   # wrote every field, watchers included
+
+# ✓ after — three more methods, and set_task! narrows
+set_task!(store::MyStore, id, info)      # state only; MUST NOT write watchers
+replace_task!(store::MyStore, id, info)  # the whole record, watchers included
+add_watcher!(store::MyStore, id, uid)    # atomic + idempotent; false if absent
+try_transition!(store::MyStore, id, from, to; error=nothing, completed_at=nothing)
+
+# ✗ do not build this on lock_tasks — it is process-local
+lock_tasks(store) do
+    info = get_task_info(store, id)
+    push!(info.watchers, uid)
+    set_task!(store, id, info)
+end
+
+# ✓ let the store make it atomic
+add_watcher!(store, id, uid)
+```
+
+Operational notes:
+
+- The store stubs have no fallback method, so a custom store missing any of the three
+  fails with a `MethodError` at the call site rather than silently degrading.
+- No schema change and no data migration: the compare-and-set works on the existing
+  `watchers` text column. A `watchers_version` column was rejected because
+  `_ensure_task_table!` only issues `CREATE TABLE IF NOT EXISTS`, so an existing database
+  would never gain one.
+- PormG's `with_advisory_lock` was also rejected: it is Postgres-only and degrades to a
+  no-op with a warning on SQLite, which would give a silently different consistency
+  posture per backend.
+- **Nitro now owns the byte format of the `watchers` column.** It is a JSON array written by
+  `JSON.json`, and its exact form is load-bearing twice: the compare-and-set matches the
+  stored document, and user-scoped listing matches the JSON-quoted user id as a substring. A
+  row reformatted by hand, by a migration, or by another language — `["alice", "bob"]` rather
+  than `["alice","bob"]` — makes the next grant exhaust its retries and raise, and can make
+  the row silently drop out of that user's task list. Change watchers only through the worker
+  API.
+- A custom store that also runs its own terminal transitions must route them through
+  `try_transition!` rather than reading the status and then saving, or it reintroduces the
+  race for its own backend.
+- `try_transition!`'s `result` keyword defaults to the exported sentinel `UNSUPPLIED`,
+  which is how a store tells "leave the stored result alone" apart from "the task completed
+  with `nothing`". Compare with `===`, not `isnothing`.
+- If your store's `filter`-style query builder **accumulates** predicates onto one object
+  rather than returning a fresh one, a `get_all_tasks` implementation must build each leg
+  of the owned/granted union from its own query. Sharing one base ANDs the legs together
+  and silently drops every task the user only watches.
+
+---
+
+## `is_task_running` is removed; `get_queue_status` is admin-only (#87)
+
+- **Version**: Unreleased
+- **Nitro ref**: #87; `src/Workers/api.jl`, `src/Workers.jl`
+- **Recorded**: 2026-09-06
+- **Severity**: **breaking (one removal, one signature)** — security fix. Builds on #48.
+
+### What changed
+
+Two worker introspection APIs took no `user_id` at all, so unlike the read/manage trio in
+#48 there was not even a bypass to *omit* — there was no scoped form to reach for, while
+the surrounding API shape suggested the worker layer was user-scoped.
+
+**`is_task_running` is removed outright.** Any caller who could name an id learned whether
+it was live — an existence oracle over the whole task table, with no authorization
+anywhere in it. It had no tests and no documentation, so nothing pinned the behaviour;
+hardening it would have meant designing and testing a function no one used. Its docstring
+already admitted it "performs no authorization at all".
+
+**`get_queue_status` now takes `System()` and only `System()`.** Its `:pending_tasks` and
+`:current_task` enumerate every pending id on a queue regardless of owner — and since #19
+those ids carry their owner in the `"<owner>::<key>"` prefix, so the enumeration discloses
+*who* has work queued, not merely that work exists.
+
+Accepting an `Owner` and filtering the id list was the tempting fix and is the wrong one:
+queue depth, `:running` and `:current_task` are facts about a queue rather than about any
+one user, so the result would look user-scoped while still reporting another tenant's
+queue depth. Queue-wide introspection is an admin surface in every comparable framework —
+Sidekiq Web, Oban Web, Flower, Hangfire's dashboard — and is treated as one here. Passing
+an `Owner` is a `MethodError`.
+
+### How to find the calls to migrate
+
+```bash
+rg -n 'is_task_running' --type julia
+rg -n 'get_queue_status' --type julia
+```
+
+### Migrate your app
+
+```julia
+# ✗ before
+if is_task_running(task_id)
+    ...
+end
+queue = get_queue_status("reports")
+
+# ✓ after — the same question, with authorization applied.
+# NOTE `:status` is a String, not the TaskStatus enum.
+if get_task_status(task_id, Owner(user_id))[:status] in ("PENDING", "RUNNING")
+    ...
+end
+queue = get_queue_status("reports", System())
+
+# ✗ no longer compiles — there is no user-scoped queue view
+get_queue_status("reports", Owner(user_id))
+
+# ✓ for "show a user their own pending work", read it scoped instead
+mine_pending = get_all_tasks(Owner(user_id), PENDING)
+```
+
+Operational notes:
+
+- **Move `get_queue_status` off any user-facing route.** Put it behind the authorization
+  you would put in front of a Sidekiq or Hangfire dashboard: all-or-nothing, admin only.
+  If it currently sits behind a broad auth guard on a status endpoint, that endpoint is
+  disclosing other tenants' queued job ids today.
+- There is no deprecation shim for `is_task_running`; a stale call is an `UndefVarError`.
+
+---
+
+## Worker read/manage APIs require an explicit `TaskAuthority` (#48)
+
+- **Version**: Unreleased
+- **Nitro ref**: #48; `src/Workers/types.jl`, `src/Workers/api.jl`, `src/Workers/registry.jl`,
+  `src/Workers.jl`, `ext/NitroPormGExt.jl`
+- **Recorded**: 2026-09-06
+- **Severity**: **breaking (every worker call site)** — security fix.
+
+### What changed
+
+`get_task_status`, `cancel_task` and `get_all_tasks` took `user_id` as an *optional* trailing
+argument defaulting to `nothing`. Omitting it skipped the ownership check and returned or acted on
+**every** task, including each task's full `:result`. So the bypass was the *shortest* call, and a
+call site that had merely forgotten to scope was indistinguishable from one that meant not to. A
+second, quieter bypass sat next to it: the guard was `user_id !== nothing && !isempty(user_id)`, so
+an empty string — what you get from reading a missing JWT claim — also skipped the check while the
+call site still *looked* scoped.
+
+Authority is now a type, and it is required:
+
+1. **`Owner(user_id)`** is a validated task identity. It rejects an empty id, one containing `::`,
+   and one ending in `:` — the same rules `scoped_task_key` enforced, moved into the constructor so
+   they hold by construction. `Owner("")` cannot exist, which removes the empty-string bypass
+   rather than re-encoding it.
+2. **`System()`** is the bypass, unchanged in power but now a value you have to name — greppable in
+   review and in an audit.
+3. **Omitting the authority is a `MethodError`**, not a bypass. A bare `String` is not an authority
+   either, so a half-migrated call site fails loudly instead of silently widening.
+
+`submit_task` and `submit_sequential_task` also take `Owner` instead of a `String`. That is what
+closes a pre-existing hole: `scoped_task_key`'s `:global` branch returned *before* validating the
+owner, so `submit_task("k", cb, "bad::uid"; scope=:global)` used to succeed and write an identity
+into `watchers` that no later call could ever match.
+
+Two consequences fall out:
+
+- **Ownership is now derived from the task id, not read from `watchers`.** Under `:user` scope the
+  id is `"<owner>::<key>"`, so the new `owner_of(task_id)` reads it back. An owner can no longer be
+  evicted from their own task by a lost watcher entry or a full-row write from another process.
+  `watchers` is now purely *additional* grants.
+- **`:global` tasks are unaffected**: they have no owner half, so `watchers` remains their entire
+  gate, including for the creator. Deriving ownership adds an authority source for `:user` ids and
+  removes none for `:global` ones.
+
+`get_task_status` and `get_all_tasks` also gained an `:owner` key. `set_queue_authorizer!` and
+`set_watch_authorizer!` hook signatures are **unchanged** — they still receive plain `String` user
+ids.
+
+### How to find the calls to migrate
+
+```bash
+rg -n 'submit_task|submit_sequential_task|scoped_task_key' --type julia
+rg -n 'get_task_status|cancel_task|get_all_tasks' --type julia
+# The silent ones: an omitted or empty-string user id that used to mean "everything".
+rg -n 'get_task_status\([^,)]+\)|cancel_task\([^,)]+\)|get_all_tasks\(\s*(nothing)?\s*\)' --type julia
+```
+
+### Migrate your app
+
+```julia
+# ✗ before — the short call was the unscoped one
+task_id = submit_task("report_42", cb, user_id)
+status  = get_task_status(task_id, user_id)
+cancel_task(task_id, user_id)
+mine    = get_all_tasks(nothing, user_id)
+all     = get_all_tasks()                      # every task, every result
+key     = scoped_task_key("report_42", user_id)
+
+# ✓ after — the short call is the scoped one
+task_id = submit_task("report_42", cb, Owner(user_id))
+status  = get_task_status(task_id, Owner(user_id))
+cancel_task(task_id, Owner(user_id))
+mine    = get_all_tasks(Owner(user_id))
+all     = get_all_tasks(System())              # same power, now named
+key     = scoped_task_key("report_42", Owner(user_id))
+
+# ✗ these no longer compile — that is the point
+get_task_status(task_id)                       # MethodError
+get_task_status(task_id, user_id_string)       # MethodError — a String is not an authority
+get_all_tasks(RUNNING)                         # MethodError — a TaskStatus is not an authority
+
+# Status filtering moved behind the authority, which now leads:
+running = get_all_tasks(Owner(user_id), RUNNING)
+```
+
+Operational notes:
+
+- **Audit every `System()` you write during the migration.** A mechanical `nothing` → `System()`
+  translation reproduces the bug this entry exists to fix. `System()` is correct only where the
+  caller genuinely has no user identity — an admin dashboard, a cleanup job, a startup sweep.
+- If your app reads a user id out of a claim, `Owner` now rejects an empty one at the call site
+  instead of silently escalating it to full access. Handle the missing-claim case explicitly.
+- Stored task rows are unchanged; there is no data migration. Ownership is derived from ids that
+  already have this shape.
+- A custom `AbstractWorkerStore` must update its `get_all_tasks` method: the signature is now
+  `get_all_tasks(store, authority; status=nothing, queue_name=nothing)`, replacing the positional
+  `(store, status, user_id, queue_name)`.
+
+---
+
 ## `req.query`, `req.params` and `headers(req)` are cached per request, so they are live handles (#38)
 
 - **Version**: Unreleased
