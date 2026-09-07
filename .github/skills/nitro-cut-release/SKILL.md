@@ -59,10 +59,37 @@ Report anything unmet and stop. Do not "fix it while you're there."
 
 ## Steps
 
-### 1. List the wave, then choose the version
+### 1. List the wave — through the parser, not by eye — then choose the version
 
 Show every `## Unreleased` entry title with its `**Severity**`, so the maintainer sees exactly what
-is shipping. Count them.
+is shipping. Get the list from `upgrade_guide`, which is what a consumer will actually run. During a
+train `Project.toml` still carries the previous release, so `from = pkgversion(Nitro)` is exactly the
+uncut wave:
+
+```bash
+julia --project=. -e 'using Nitro
+  w = Nitro.upgrade_guide(from = pkgversion(Nitro), structured = true)
+  println(length(w), " entries")
+  for e in w
+    sev = match(r"(?m)^-[ \t]+\*\*Severity\*\*:[ \t]*(.+)$", e.body)
+    println("  ", e.title, "\n      ", sev === nothing ? "(no Severity bullet)" : sev[1])
+  end'
+```
+
+Then **cross-check that count against the file** — if they disagree, an entry is invisible to the
+guide and cutting would ship it unannounced:
+
+```bash
+grep -c '^- \*\*Version\*\*: Unreleased' UPGRADING.md   # the template block adds exactly 1
+```
+
+This is #89: the `## Unreleased` section had no `---` separators between its entries, so three
+collapsed into one block and `upgrade_guide` reported **one** title with the other two bodies
+silently attached — and in the other direction a block with no `- **Recorded**:` bullet is dropped
+without a warning. Every other step in this skill passed anyway. `test/upgrade_guide_tests.jl`
+cannot know how many entries the shipped file *should* hold, so it passes on a collapsed section
+(#89 tracks the hardening) — this count is the only thing that catches it. If the counts disagree,
+inspect the section by hand before touching anything.
 
 - **Default: bump the `y` slot** (`0.a.z → 0.(a+1).0`) — a train carrying any `breaking` or
   `behavior` entry is a migration checkpoint.
@@ -108,15 +135,19 @@ Use today's **real** date (`YYYY-MM-DD`) — never invent one; if unsure, ask.
   so there is nothing to sweep.
 - Leave already-stamped (older) entries untouched.
 
-### 4. Verify the parser
+### 4. Verify the parser — and assert the stamp landed
 
 ```bash
 julia --project=. test/runtests.jl test/upgrade_guide_tests.jl
-julia --project=. -e 'using Nitro; upgrade_guide(from = v"<previous>")'
+julia --project=. -e 'using Nitro
+  println("at <new>: ", length(Nitro.upgrade_guide(from = v"<previous>", to = v"<new>", structured = true)))
+  println("uncut   : ", count(e -> e.version == Nitro._UNRELEASED_VERSION, Nitro._read_upgrading_entries()))'
 ```
 
-The stamped entries must parse at `<new>`, and the empty `## Unreleased` must yield no entries. Fix
-any mismatch before committing.
+Expect `at <new>` **equal to the step-1 count** and `uncut` **equal to 0**. "The entries parse" is
+not the check — before the count was asserted, this step could pass while being false: the sibling
+PormG repo cut an 11-entry wave of which `upgrade_guide` returned 3, with every step green. Fix any
+mismatch before committing.
 
 ### 5. Commit, then get approval to push
 
@@ -162,6 +193,8 @@ The pin **is** the app's rollout state — there are no per-entry rollout tables
 - **One bump per cut.** Editing `Project.toml`'s version outside this skill is the per-PR churn this
   model removes.
 - **Never cut an empty `## Unreleased`.**
+- **The wave count is asserted twice** — from the parser in step 1, and again after stamping in
+  step 4. A count that disagrees with the file is a stop, not a note.
 - **Never** tag or push without explicit approval at that step.
 - **Never** rewrite historical entries while cutting — fix errors in a separate commit with its own
   review.

@@ -5,7 +5,8 @@ the step that points at it — the checklist in `SKILL.md` is complete on its ow
 so that the rationale is not paid for on every issue.
 
 Nothing here is optional-but-nice. Every section documents a failure that has actually bitten this
-repo, in a way that is invisible from reading the code.
+repo — or its sibling PormG.jl, whose workflow this one mirrors, named where that is the case — in a
+way that is invisible from reading the code.
 
 ---
 
@@ -80,6 +81,14 @@ like a code bug — see [`nitro-test-troubleshooting`](../nitro-test-troubleshoo
 **Stage explicit paths, never `git add -A`.** `Manifest.toml` is covered by this repo's `.gitignore`,
 but `.claude/settings.local.json` is **not** — it is ignored only by the maintainer's *global*
 gitignore, so it is one machine away from being staged into a PR.
+
+**Isolation is not selection.** A worktree keeps two sessions from corrupting each other's files; it
+does nothing to keep them off the same *function*. Receipt from the sibling PormG repo: two
+correctly-isolated worktrees, `fix/400-410-importer-degrades` and `fix/402-enum-scope-per-statement`,
+both edited PormG's Django-importer source file, its doc page, and its test file at the same time,
+and the second branch owed a merge (`ac0c57c` there). The `git worktree list` sweep in `SKILL.md` §2 exists
+because uncommitted work in another worktree is invisible to every `git log` and `git diff` you run
+from your own — `git status --porcelain` inside each worktree is the only view of it.
 
 ---
 
