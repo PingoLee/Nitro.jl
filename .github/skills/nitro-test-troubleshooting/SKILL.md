@@ -45,8 +45,9 @@ julia --project=. test/runtests.jl test/middleware/
 julia --project=. test/runtests.jl --tags core
 julia --project=. test/runtests.jl --name "Session stores"
 
-# Parallel workers (separate processes — changes isolation, see below)
-julia -t auto --project=. test/runtests.jl --workers 2
+# Multithreaded items (one worker process, TEST_FILES order preserved).
+# `--workers N` for N > 1 is refused — see §7.
+julia -t auto --project=. test/runtests.jl
 
 # Interactive REPL — setup_tests.jl MUST come first
 julia> using ReTestItems, Nitro
@@ -54,7 +55,14 @@ julia> runtests("test/setup_tests.jl", "test/middleware/guards_tests.jl")
 ```
 
 **Available tags:** `:core`, `:middleware`, `:auth`, `:security`, `:handler`, `:extension`,
-`:pormg`, `:network`, `:scenario`, `:slow`, `:aqua`.
+`:pormg`, `:network`, `:scenario`, `:slow`, `:aqua`, `:workers`.
+
+That list is prose; the machine-checked copy is `KNOWN_TAGS` in `test/harness_manifest.jl`, and
+`test/harness_tests.jl` asserts it matches the tags actually in use **in both directions**. An
+unknown `--tags` value is now an error naming the vocabulary. ReTestItems already fails a zero-match
+filter with `No test items found.`; the guard exists because that message names neither the
+vocabulary nor the AND/exact-match semantics. The genuinely silent case was a **mistyped path** —
+warned and dropped, run still green — which `validate_paths = true` now turns into a throw.
 
 Useful combination when you only want fast feedback: exclude the network-bound items by selecting a
 narrower tag rather than running everything.
@@ -70,14 +78,17 @@ narrower tag rather than running everything.
 `urlpatterns(...)` mutates the process-wide `CONTEXT[]` router (`src/Nitro.jl`, `src/methods.jl`).
 Test items that register routes therefore affect every later item in the same process.
 
-`test/runtests.jl` compensates with an **explicit, hand-ordered `TEST_FILES` list** and a comment
-saying so. Consequences:
+The suite compensates with an **explicit, hand-ordered `TEST_FILES` list**, which lives in
+`test/harness_manifest.jl` and is read by both `test/runtests.jl` and the guard below. Consequences:
 
 - **Do not** replace the list with `runtests(Nitro)` — filesystem-walk order differs and will produce
   spurious failures.
-- **A new test file that is not added to `TEST_FILES` is silently skipped.** It will never run, never
-  fail, and look like passing coverage. If a test you wrote "isn't running," check the list first.
-  (Tracked as [#34](https://github.com/PingoLee/Nitro.jl/issues/34).)
+- **A new test file that is not added to `TEST_FILES` no longer fails silently.**
+  `test/harness_tests.jl` walks `test/` the way ReTestItems does and fails naming any file that is
+  neither listed nor in `UNLISTED_OK`. It used to be silent: a middleware smoke test sat unlisted
+  and unexecuted for its whole life, and nothing said so ([#34](https://github.com/PingoLee/Nitro.jl/issues/34)).
+  The omission is still easy to make — rung 1 runs your file *by path*, so it passes either way —
+  but it is now caught before merge rather than never.
 - If your item registers routes, either give paths a prefix unique to that item, or call
   `resetstate()` — but be aware `resetstate()` clears state a *later* item may have expected.
 - Prefer `instance(...)` or the explicit `(ctx::ServerContext, …)` methods to keep a test off the
@@ -143,7 +154,7 @@ Items tagged `:network` bind real sockets. Failure shapes:
   listener and then loops until every tracked connection is gone, force-closing only *idle* ones —
   and HTTP 2.4 never marks a connection `HIJACKED`, so a WebSocket/SSE/STREAM handler (or a
   `terminate()` called from *inside* a handler) pinned its connection `ACTIVE` and that loop never
-  ended. With `nworkers = 0` — the default, and what CI runs — ReTestItems applies **no** per-item
+  ended. With `nworkers = 0` — the default at the time — ReTestItems applies **no** per-item
   timeout, so the run wedged, someone killed it, and the orphaned child kept the port. On Windows
   `SO_REUSEADDR` then let the next run bind the *same* port alongside the corpse, splitting traffic
   between two routers instead of failing.
@@ -170,11 +181,28 @@ the other's context ([#31](https://github.com/PingoLee/Nitro.jl/issues/31)).
 Symptom: a handler reads someone else's config, intermittently. Fix: use `instance(...)` or an
 explicit `ServerContext`, and don't interleave `internalrequest(context=…)` with a running server.
 
-### 7. `--workers N` changes isolation, and can hide or create failures
+### 7. `--workers N` is refused for N > 1
 
-Workers are separate processes, so global router state is *not* shared between them. A suite that is
-green with `--workers 2` but red in-process is telling you it has an ordering dependency (class 1),
-not that the in-process run is broken. Reproduce failures with the same worker setting CI used.
+Workers are separate processes, so each gets its own `CONTEXT[]` and global router state is *not*
+shared between them. That changes what every item sees: ~25 test files register routes on the global
+and never reset, so an item asserting on 404 behaviour or on the total route set behaves differently
+depending on which worker it landed on, and in what order.
+
+The result is a spurious **pass or failure**, not a crash — evidence-shaped output that will not
+reproduce under `Pkg.test()`. `test/runtests.jl` therefore **errors** on `--workers 2` rather than
+warning, turning a silently-wrong result into a loud one. `--workers 0` (in-process, no per-item
+timeout) and the default of 1 are unaffected.
+
+The old diagnostic use — green under `--workers 2` but red in-process means an ordering dependency,
+class 1 above — is still available, just not through the launcher:
+
+```julia
+julia> using ReTestItems, Nitro
+julia> runtests("test/setup_tests.jl", "test/<file>.jl"; nworkers = 2)
+```
+
+The guard exists because router state is process-global. It comes out when
+[#31](https://github.com/PingoLee/Nitro.jl/issues/31) lands and that stops being true.
 
 ### 8. Aqua and precompilation items
 
@@ -193,7 +221,8 @@ not that the in-process run is broken. Reproduce failures with the same worker s
    line.
 2. **Run the file alone.** Green alone ⇒ suspect class 1 (ordering/global state).
 3. **Vary thread count** (`-t 1` vs `-t 2`). A difference ⇒ class 2 (race).
-4. **Check `TEST_FILES`** if the item never appears in the output at all.
+4. **Check `TEST_FILES`** in `test/harness_manifest.jl` if the item never appears in the output
+   at all — though `test/harness_tests.jl` should have failed first.
 5. **Check the environment** — PormG sibling present, no orphaned server process, no second suite
    running.
 6. **Only then bisect your diff.** `git stash` and confirm the failure predates your change before
@@ -208,7 +237,8 @@ not that the in-process run is broken. Reproduce failures with the same worker s
 - Re-running a failing test until it passes and calling it flaky — thread-count failures are real
   races.
 - Adding `sleep()` to fix a network timing failure instead of waiting on readiness.
-- Adding a test file without adding it to `TEST_FILES` — it silently never runs.
+- Adding a test file without adding it to `TEST_FILES` in `test/harness_manifest.jl` — it never
+  runs. No longer silent (`test/harness_tests.jl` fails on it), but still your job to add.
 - Replacing the ordered `TEST_FILES` list with `runtests(Nitro)`.
 - Calling `resetstate()` inside an item to fix your own failure without checking what later items
   depend on.

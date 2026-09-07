@@ -1,4 +1,4 @@
-@testitem "PormG worker store" tags=[:extension, :pormg] setup=[NitroCommon] begin
+@testitem "PormG worker store" tags=[:extension, :pormg, :workers] setup=[NitroCommon] begin
 
 using Test
 using Dates

@@ -172,11 +172,12 @@ Follow the area rule file(s) you picked. Four workflow-level rules, at every tie
   instances. Finding the sibling case is part of the fix, not a follow-up.
 - **Public behavior changes ship code + tests + docs together.** A doc that describes the old
   behavior is a defect, not a follow-up.
-- **A new test file must be added to the `TEST_FILES` list in `test/runtests.jl`.** Rung 1 runs your
-  file **by path**, so it passes whether or not it is registered: a file you forget is green in every
-  check you run and absent from every check CI runs. Add it in its own neighbourhood — the list runs
-  setup → security → extensions → special-handler → core → scenarios → middleware → `aqua_tests.jl`
-  last. Why the list is hand-ordered, and why omission is silent, is owned by
+- **A new test file must be added to the `TEST_FILES` list in `test/harness_manifest.jl`.** Rung 1
+  runs your file **by path**, so it passes whether or not it is registered — a file you forget is
+  green in every check you run. `test/harness_tests.jl` now catches the omission, but *before* merge,
+  not before you wonder why coverage did not move; add it as you create the file. Its neighbourhood:
+  the list runs harness self-check → setup → security → extensions → special-handler → core →
+  scenarios → middleware → `aqua_tests.jl` last. Why the list is hand-ordered is owned by
   [`nitro-test-troubleshooting`](../nitro-test-troubleshooting/SKILL.md) §1.
 - **No runtime side effects in module bodies** — put load-time wiring in `__init__()`, `ext/`
   registration included.
@@ -316,7 +317,7 @@ widened and on whose say-so.
   reviewer's classification, a premise in your own approved plan. Reproduce it before building on it
 - Do not move an existing test's expectation to match your fix without a third source saying the
   test was wrong, and without saying so in the commit message
-- Do not add a test file without adding it to `TEST_FILES` in `test/runtests.jl`
+- Do not add a test file without adding it to `TEST_FILES` in `test/harness_manifest.jl`
 - Do not call it green on one thread count when the change is race-shaped
 - Do not assume CI sees your local `../PormG.jl` — it clones the published default branch
 - Do not review your own diff and call it an independent review

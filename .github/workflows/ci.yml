@@ -7,15 +7,39 @@ on:
     branches:
       - main
     tags: '*'
+# Least privilege by default. Only the `docs` job writes anything, and it neither clones
+# nor executes PormG. Every job that DOES execute the pinned sibling checkout runs with
+# `contents: read`, `persist-credentials: false`, and no token in its environment.
+#
+# All three are needed, and none substitutes for the others:
+#   * `permissions` decides what a leaked token can DO.
+#   * `persist-credentials: false` decides whether it is on DISK for foreign code to read
+#     (checkout writes it into `.git/config` by default).
+#   * dropping the workflow-level `env` keeps it out of the environment of steps that
+#     do not inject their own -- note `julia-actions/julia-buildpkg` DOES inject
+#     `GITHUB_TOKEN: ${{ github.token }}` on its own build step, which is precisely why
+#     the first two matter more than the third.
+# See the `docs` job for where the write scope and the secrets actually live.
 permissions:
-  actions: write
-  contents: write
+  contents: read
 env:
-  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  # PormG is pinned to an immutable commit rather than tracked at default-branch HEAD,
+  # because the `test` job below builds and EXECUTES this code under `Pkg.test()`. An
+  # unpinned clone makes a moving third-party input part of every CI run. (`smoke` also
+  # fetches it, but only so `[sources]` resolves -- see that job.) Declared once here so
+  # the two jobs cannot drift apart.
+  #
+  # BUMPING THIS: run `PormG.upgrade_guide(from = v"0.5.0")` from PormG's own env first and
+  # apply every entry. Pass the LOWER BOUND of the `[compat]` range -- that entry is `^0.5`,
+  # which is not itself a version literal. Same rule the `[compat]` pin already carries.
+  PORMG_REV: 6d708b4d4b9a1bdefca89fe44c29652574c931c0
 jobs:
   test:
     name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.threads }} thread(s)
     runs-on: ${{ matrix.os }}
+    # This job executes the PormG checkout. It gets no write scope and no token.
+    permissions:
+      contents: read
     env:
       JULIA_NUM_THREADS: ${{ matrix.threads }}
     # Informational versions: these break for reasons that are not ours, and a permanently
@@ -74,19 +98,37 @@ jobs:
             threads: 2
     steps:
       - uses: actions/checkout@v4
+        with:
+          # This job EXECUTES the PormG checkout. checkout's default
+          # `persist-credentials: true` writes an `AUTHORIZATION: basic <token>`
+          # extraheader into `$GITHUB_WORKSPACE/.git/config`, on disk, readable by
+          # every process in the job -- including the code fetched below. Dropping
+          # `permissions` to `contents: read` makes that token weak; this makes it
+          # absent. Nothing in this job pushes. (#21)
+          persist-credentials: false
       # PormG is a path dependency (`[sources] PormG = {path = "../PormG.jl"}`)
       # and a hard test dependency, so it must exist alongside this checkout for
       # `Pkg.test()` to resolve. checkout@v4 won't write outside the workspace,
-      # so clone it as a sibling directly.
-      - name: Check out PormG.jl (sibling path dependency)
+      # so fetch it as a sibling directly, pinned to `PORMG_REV` (top of this file).
+      # A `--depth 1` clone can only take a branch tip, so this fetches the one
+      # commit by SHA instead -- that is what makes the pin immutable.
+      - name: Check out PormG.jl (sibling path dependency, pinned)
         shell: bash
-        run: git clone --depth 1 https://github.com/PingoLee/PormG.jl.git ../PormG.jl
+        run: |
+          git init -q ../PormG.jl
+          git -C ../PormG.jl remote add origin https://github.com/PingoLee/PormG.jl.git
+          git -C ../PormG.jl fetch -q --depth 1 origin "$PORMG_REV"
+          git -C ../PormG.jl checkout -q --detach FETCH_HEAD
       - uses: julia-actions/setup-julia@v2
         with:
           version: ${{ matrix.version }}
       - uses: julia-actions/cache@v3
         with:
           include-matrix: 'false'
+          # Cache eviction is the ONLY thing julia-actions/cache needs `actions: write`
+          # for. Restore and save do not. Giving that up here is what lets this job run
+          # with no write scope at all while it executes third-party code.
+          delete-old-caches: 'false'
           cache-name: julia-cache;workflow=${{ github.workflow }};job=${{ github.job }};os=${{ matrix.os }};version=${{ matrix.version }};threads=${{ matrix.threads }}
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
@@ -114,6 +156,13 @@ jobs:
     # actually tell us Nitro is broken on the next release.
     name: Smoke test (Julia ${{ matrix.version }})
     runs-on: ubuntu-latest
+    # Unlike `test`, this job does not EXECUTE PormG: `smoke_test.jl` loads only Test,
+    # Sockets, HTTP and Nitro, PormG is a weakdep so `--project=.` never installs it, and
+    # PormG ships no `deps/build.jl`. The tree is read for `[sources]` resolution only.
+    # Hardened identically anyway -- the cost is nil, and the day that stops being true
+    # should not also be the day the hardening has to be invented.
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -121,17 +170,25 @@ jobs:
           - '~1.13.0-0'
     steps:
       - uses: actions/checkout@v4
-      # Same sibling-clone reason as the `test` job: PormG is a `[sources]` path dependency,
-      # so the project cannot resolve without it alongside this checkout.
-      - name: Check out PormG.jl (sibling path dependency)
+        with:
+          persist-credentials: false   # same reason as the `test` job
+      # Same sibling-checkout reason as the `test` job: PormG is a `[sources]` path
+      # dependency, so the project cannot resolve without it alongside this checkout.
+      # Pinned to the same `PORMG_REV`, for the same reason.
+      - name: Check out PormG.jl (sibling path dependency, pinned)
         shell: bash
-        run: git clone --depth 1 https://github.com/PingoLee/PormG.jl.git ../PormG.jl
+        run: |
+          git init -q ../PormG.jl
+          git -C ../PormG.jl remote add origin https://github.com/PingoLee/PormG.jl.git
+          git -C ../PormG.jl fetch -q --depth 1 origin "$PORMG_REV"
+          git -C ../PormG.jl checkout -q --detach FETCH_HEAD
       - uses: julia-actions/setup-julia@v2
         with:
           version: ${{ matrix.version }}
       - uses: julia-actions/cache@v3
         with:
           include-matrix: 'false'
+          delete-old-caches: 'false'   # same reason as the `test` job above
           cache-name: julia-cache;workflow=${{ github.workflow }};job=${{ github.job }};version=${{ matrix.version }}
       - uses: julia-actions/julia-buildpkg@v1
       - name: Load, route and serve without ReTestItems
@@ -139,14 +196,40 @@ jobs:
   docs:
     name: Documentation
     runs-on: ubuntu-latest
-    # Scoped to this job rather than the workflow. `deploydocs` is the only consumer,
-    # and every `test` job clones an unpinned sibling checkout and executes it under
-    # `permissions: contents: write` — so a workflow-level deploy key sits in the
-    # environment of code this repo does not control, on 8 jobs including nightly.
-    # Partial mitigation for #21; `GITHUB_TOKEN` stays at workflow level because
-    # julia-actions/cache needs it to evict caches (hence `permissions: actions: write`).
+    # The only job that WRITES anything, and the only one holding a job-wide secret. It
+    # fetches no PormG, so the third-party code #21 is about never runs here -- which is
+    # why the write scope and both secrets are parked in this job rather than at workflow
+    # level.
+    #
+    # Two things this comment deliberately does NOT claim:
+    #   * `test` is not credential-free -- it hands GITHUB_TOKEN to coveralls as a STEP
+    #     input, scoped to that one step, and now carrying only `contents: read`.
+    #   * this job is not third-party-code-free -- `docs/Manifest.toml` is gitignored, so
+    #     the `Pkg.instantiate()` below resolves Documenter and its whole transitive tree
+    #     from the General registry at floating versions and then runs it, while holding
+    #     DOCUMENTER_KEY. That is the residual supply-chain exposure after #21. It was
+    #     never pinned before either, and closing it is a separate decision.
+    #
+    # `actions: write` is cache eviction, which `test` and `smoke` give up
+    # (`delete-old-caches: 'false'`) so they need neither.
+    #
+    # `contents: write` + `GITHUB_TOKEN` are the FALLBACK deploy path, not the normal one.
+    # Documenter picks SSH whenever DOCUMENTER_KEY is non-empty and pushes `gh-pages` with
+    # the key, never the token -- so on the happy path neither is load-bearing. They stay
+    # because the day the key is empty (rotated, renamed) is the day Documenter falls back
+    # to HTTPS, and with no token it would instead print `Deploying: X` and return
+    # SUCCESSFULLY: a green job that published nothing (#105). Do not shave them to make
+    # the permission table look tidier -- and note an SSH deploy key is not governed by
+    # `permissions:` at all, so dropping them would not reduce the deploy surface anyway.
+    #
+    # `GITHUB_TOKEN` is job-scoped for the same reason the deploy key is: Documenter reads
+    # it from the environment, and no job executing foreign code should have it.
+    permissions:
+      contents: write
+      actions: write
     env:
       DOCUMENTER_KEY: ${{ secrets.DOCUMENTER_KEY }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - uses: julia-actions/setup-julia@v2
@@ -169,6 +252,8 @@ jobs:
   docs-lint:
     name: Docs reference lint
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: julia-actions/setup-julia@v2
