@@ -10,7 +10,7 @@ using Base64
 using HTTP
 
 # 1. Set a cookie
-@get "/login" function(req)
+function login(req)
     res = Response("Logged in")
     # Sets an encrypted cookie by default if secret_key is configured
     set_cookie!(res, "session_user", "alice", maxage=3600)
@@ -18,11 +18,16 @@ using HTTP
 end
 
 # 2. Read a cookie
-@get "/dashboard" function(req)
+function dashboard(req)
     # Reads and automatically decrypts the cookie
     user = get_cookie(req, "session_user")
     return "Hello, $user"
 end
+
+urlpatterns("",
+    path("/login", login, method="GET"),
+    path("/dashboard", dashboard, method="GET"),
+)
 
 serve()
 ```
@@ -82,7 +87,7 @@ count = get_cookie(req, "counter", default=0) # returns Int
 To "delete" a cookie, you set its `maxage` to `0`. This tells the browser to expire it immediately.
 
 ```julia
-@post "/logout" function(req)
+function logout(req)
     res = Response("Logged out")
     
     # Overwrite the cookie with empty data and immediate expiration
@@ -90,4 +95,8 @@ To "delete" a cookie, you set its `maxage` to `0`. This tells the browser to exp
     
     return res
 end
+
+urlpatterns("",
+    path("/logout", logout, method="POST"),
+)
 ```

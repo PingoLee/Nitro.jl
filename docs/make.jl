@@ -31,9 +31,7 @@ makedocs(
                 "tutorial/cookies/security.md",
                 "tutorial/cookies/sessions.md"
             ],  
-            "tutorial/cron_scheduling.md",
             "tutorial/bigger_applications.md",
-            "tutorial/oauth2.md"
         ]
     ]
 )

@@ -38,7 +38,7 @@ You can override global defaults for specific cookies by passing keyword argumen
 # Global default is HttpOnly=true
 configcookies(httponly=true)
 
-@get "/ui-settings" function(req)
+function ui_settings(req)
     res = Response("Settings")
     
     # Override: Allow JS to read this specific cookie
@@ -46,6 +46,10 @@ configcookies(httponly=true)
     
     return res
 end
+
+urlpatterns("",
+    path("/ui-settings", ui_settings, method="GET"),
+)
 ```
 
 ## Common Recipes
