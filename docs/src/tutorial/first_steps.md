@@ -55,13 +55,17 @@ For the duration of this guide, we will be working out of the `src/main.jl` file
 Here's an example of what a simple Nitro server could look like
 
 ```julia
-module Main 
+module Main
 using Nitro
 using HTTP
 
-@get "/greet" function(req::HTTP.Request)
+function greet(req::HTTP.Request)
     return "hello world!"
 end
+
+urlpatterns("",
+    path("/greet", greet, method="GET"),
+)
 
 serve()
 end
@@ -80,19 +84,33 @@ using Nitro
 using HTTP
 ```
 
-Here we pull in the both libraries our api depends on. The `@get` macro and `serve()` function come from Nitro
-and the `HTTP.Request` type comes from the HTTP library.
+Here we pull in the both libraries our api depends on. The `path()`, `urlpatterns()` and `serve()`
+functions come from Nitro, and the `HTTP.Request` type comes from the HTTP library.
 
-Next we move into the core snippet where we define a route for our api. This route is made up of several components.
-- http method  => from `@get` macro (it's a GET request)
-- path => the endpoint that will get added to our api which is `"/greet"`
-- request handler => The function that accepts a request and returns a response
+Next we define the handler. It is an ordinary function that takes a request and returns a response —
+nothing about it is Nitro-specific, which is what makes it easy to test on its own.
 
 ```julia
-@get "/greet" function(req::HTTP.Request)
+function greet(req::HTTP.Request)
     return "hello world!"
 end
 ```
+
+Then we register it. Routes are declared in one central `urlpatterns()` block rather than
+being attached to the handler where it is defined, so the whole URL surface of an app is
+readable in one place. Each `path()` is made up of several components.
+- path => the endpoint that will get added to our api, which is `"/greet"`
+- request handler => the function that accepts a request and returns a response
+- http method => the `method` keyword (`"GET"` here)
+
+```julia
+urlpatterns("",
+    path("/greet", greet, method="GET"),
+)
+```
+
+The first argument to `urlpatterns()` is a prefix applied to every route in the block. It is `""`
+here, so `/greet` is mounted at the root; passing `"/api"` would mount it at `/api/greet` instead.
 
 Finally at the bottom of our `Main` module we have this function to start up our brand new webserver.
 This function can take a number of keyword arguments such as the `host` & `port`, which can be helpful if you don't want to use the default values.

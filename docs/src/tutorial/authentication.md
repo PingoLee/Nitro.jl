@@ -209,7 +209,7 @@ into `req.user` are covered in [Sessions & Auth](sessions_and_auth.md).
 ## 8. Auth cookies & CSRF
 
 `set_auth_cookie!` / `clear_auth_cookie!` and `CSRFMiddleware` for cookie-authenticated
-browsers: see [Sessions & Auth](sessions_and_auth.md) and [Cookies](cookies.md).
+browsers: see [Sessions & Auth](sessions_and_auth.md) and [Cookies](cookies/basics.md).
 
 ## 9. Passwords
 
@@ -218,7 +218,13 @@ upgrade flows): see [Passwords](passwords.md).
 
 ## 10. OAuth2
 
-The authorization-code flow walkthrough: see [OAuth2](oauth2.md).
+Nitro ships no OAuth2 client. The authorization-code flow is an application concern: exchange
+the provider's `code` for tokens yourself, then mint your own session or JWT with the pieces
+above — `set_cookie!` and the session store (§7), or `jwt_encode` and a validator (§4).
+
+There used to be a walkthrough here built on [Umbrella.jl](https://github.com/jiachengzhang1/Umbrella.jl).
+It was inherited from Oxygen.jl and removed: Umbrella ships adapters for Genie, Oxygen and Mux,
+not for Nitro, so the page documented an integration that does not exist.
 
 ## 11. Hardening checklist
 
