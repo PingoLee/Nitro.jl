@@ -298,9 +298,13 @@ proxy, not behind these checks (`docs/design/static-serving-boundary.md`):
 | Anything that is not a regular file — symlinked directories, FIFOs, devices | none |
 
 The folder's own name is never tested, so `staticfiles("public/.well-known", ".well-known")` works.
-Enumeration is `Nitro.Core.Util.mountable_files(root; include_hidden, allow_symlink_escape)`;
-`mountfolder` returns the routes it registered. `spafiles` registers its history-mode fallback only
-if `index.html` is itself servable. Only files present at startup get a route.
+Enumeration is `Nitro.Core.Util.mountable_files(root; include_hidden, allow_symlink_escape)`.
+All three mount functions return `Vector{Pair{String,String}}` — `route => filepath`, in registration
+order; `first.(result)` gives the routes alone. `spafiles` registers its history-mode fallback only
+if `index.html` is itself servable, decided by looking that file up in what the mount registered
+rather than by re-probing the filesystem — so the fallback serves exactly the bytes the mount chose.
+The fallback route (`/<prefix>/**`) is not in the returned vector. Only files present at startup get
+a route.
 
 **`mountdir` is canonicalized to path segments**, so surrounding whitespace and `/` are stripped:
 `"static"`, `"/static"`, `"static/"` and `"/static/"` are the same mount, and `""`, `"/"` and

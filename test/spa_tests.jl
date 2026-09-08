@@ -93,6 +93,33 @@ port = get_free_port()
         end
     end
 
+    @testset "spafiles returns route => filepath pairs, and the fallback serves that file" begin
+        # #102: the mount's return value carries the file identity that `spafiles` used to re-derive
+        # by `joinpath` in parallel with a route-name lookup. Pinning the FILE, not just the route
+        # name, is the whole point -- a route name does not identify what produced it.
+        resetstate()
+        try
+            mounted = spafiles(test_dir, "app")
+
+            @test eltype(mounted) == Pair{String,String}
+            @test ("/app/index.html" => index_path) ∈ mounted
+            # An index.html also claims the bare directory route, and it names the SAME file.
+            @test ("/app" => index_path) ∈ mounted
+            @test ("/app/assets/app.js" => app_js_path) ∈ mounted
+
+            # The history-mode catch-all is registered but is NOT a mounted file, so it has no
+            # filepath to pair with and is deliberately absent from the return value.
+            @test "/app/**" ∉ first.(mounted)
+
+            # ...and it really is registered: only the fallback can answer this, and it must serve
+            # the bytes of the file the mount decided on, not of a path derived alongside it.
+            @test String(internalrequest(HTTP.Request("GET", "/app/deep/link")).body) ==
+                  read(index_path, String)
+        finally
+            resetstate()
+        end
+    end
+
     @testset "spafiles mounts at the router root" begin
         # `""` used to throw a BoundsError at the entry point (#93) -- that is what this testset
         # catches on the old code; the `"/"` case is a contract test that passed before too. The

@@ -96,6 +96,11 @@ byte and never percent-decodes, so `"my static"` and `"café"` are refused while
 `"caf%C3%A9"` mount and serve: the encoded spelling is the one a browser sends. A relative
 dot-segment (`.`, `..`) is refused too, because clients strip it before sending.
 
+Returns `Vector{Pair{String,String}}` — `route => filepath` for everything it registered, in
+registration order. An `index.html` contributes two pairs naming the *same* file: its own route and
+the bare directory route (`/docs/index.html` also registers `/docs`, and a top-level one registers
+`/`). Use `first.(result)` for the routes alone.
+
 Not every file in `folder` is served. These are refused:
 
 - **Hidden entries** — any path component starting with `.` *relative to `folder`*, so `.env` and
@@ -154,12 +159,20 @@ byte and never percent-decodes, so `"my static"` and `"café"` are refused while
 `"caf%C3%A9"` mount and serve: the encoded spelling is the one a browser sends. A relative
 dot-segment (`.`, `..`) is refused too, because clients strip it before sending.
 
+Returns `Vector{Pair{String,String}}` — `route => filepath` for everything it registered, in
+registration order. An `index.html` contributes two pairs naming the *same* file: its own route and
+the bare directory route (`/docs/index.html` also registers `/docs`, and a top-level one registers
+`/`). Use `first.(result)` for the routes alone.
+
 Which files are servable — and the `include_hidden` / `allow_symlink_escape` opt-outs — is described
 in [`staticfiles`](@ref); the same rules apply here. Two SPA-specific consequences:
 
 - The history-mode fallback is registered **only if `index.html` itself is servable.** If it is
   refused (an escaping symlink, say), the fallback is skipped and a warning is logged, rather than
-  serving through the mount rules on every unmatched path.
+  serving through the mount rules on every unmatched path. Servability is decided by looking the
+  file up in what the mount registered, so the fallback serves exactly the bytes the mount chose.
+- The fallback route (`/<prefix>/**`) is **not** in the returned vector. It is a catch-all rather
+  than a mounted file, and it has no filepath of its own to pair with.
 - Because the fallback answers any unmatched path under the mount, a file that *was* refused reads
   as `index.html` with a 200 rather than a 404. That is not a leak, but it can be confusing in logs.
 """
@@ -192,6 +205,11 @@ file may not — or when no request could ever match it. The router compares pat
 byte and never percent-decodes, so `"my static"` and `"café"` are refused while `"my%20static"` and
 `"caf%C3%A9"` mount and serve: the encoded spelling is the one a browser sends. A relative
 dot-segment (`.`, `..`) is refused too, because clients strip it before sending.
+
+Returns `Vector{Pair{String,String}}` — `route => filepath` for everything it registered, in
+registration order. An `index.html` contributes two pairs naming the *same* file: its own route and
+the bare directory route (`/docs/index.html` also registers `/docs`, and a top-level one registers
+`/`). Use `first.(result)` for the routes alone.
 
 Which files are servable — and the `include_hidden` / `allow_symlink_escape` opt-outs — is described
 in [`staticfiles`](@ref); the same rules apply here. They are evaluated **once, at mount time**: this

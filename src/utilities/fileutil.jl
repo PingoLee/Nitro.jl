@@ -215,6 +215,14 @@ Every refusal fails closed: a `realpath` that throws — a dangling link, `ELOOP
 — skips the entry rather than propagating. An unreadable *subdirectory* is logged and skipped too,
 which is why a missing `root` throws `ArgumentError` up front instead: a mount folder that does not
 exist is a programming error, and it must not be silently indistinguishable from an empty one.
+
+**Returned paths are `joinpath(dir, name)` for each kept `walkdir` entry, verbatim** — never
+`realpath`-resolved, `abspath`-ed or `normpath`-ed, whatever spelling of `root` the caller passed.
+`realpath` *is* computed for the symlink checks above and then deliberately discarded. That makes
+`joinpath(root, rel)` a valid key into this result, which is how `spafiles` identifies its index by
+file rather than by route name ([#102](https://github.com/PingoLee/Nitro.jl/issues/102)).
+Normalizing here would silently drop every SPA fallback — the lookup would miss, `spafiles` would
+warn and register nothing, and no test in the mount suite would fail.
 """
 function mountable_files(root::String;
                          include_hidden::Bool=false,
@@ -385,27 +393,36 @@ mount_route(segments::AbstractVector{<:AbstractString})::String =
 
 """
     mountfolder(folder::String, mountdir::String, addroute;
-                include_hidden=false, allow_symlink_escape=false) -> Vector{String}
+                include_hidden=false, allow_symlink_escape=false) -> Vector{Pair{String,String}}
 
 Discover the servable files under `folder` and register them, leaving the `addroute` function to
 determine *how* each one is registered. Enumeration — and therefore which files are exposed — is
 owned by [`mountable_files`](@ref); see it for what is refused and how to opt out.
 
-Returns the routes that were registered, in registration order. Callers need that set rather than
-re-deriving paths from the filesystem: `spafiles` uses it to decide whether its history-mode
-fallback has a servable `index.html`, which keeps the fallback from drifting away from the mount
-rules and re-opening the hole they close.
+Returns `route => filepath` for everything it registered, in registration order — the same two values
+it handed `addroute`. Callers need this rather than re-deriving paths from the filesystem: `spafiles`
+uses it to decide whether its history-mode fallback has a servable `index.html`, which keeps the
+fallback from drifting away from the mount rules and re-opening the hole they close.
+
+**Both halves are load-bearing, because a route name does not identify what produced it.** An
+`index.html` contributes *two* pairs naming the *same* file — its own route and the bare directory
+route — so `/<prefix>/index.html` is the direct route of `<folder>/index.html` and *also* the bare
+route of `<folder>/index.html/index.html`. A caller that matches on the route string alone cannot
+tell those apart, which is how the fallback once came to be registered against a directory
+([#94](https://github.com/PingoLee/Nitro.jl/issues/94)). Match on the filepath and the ambiguity is
+unrepresentable: a directory is never a `mountable_files` result
+([#102](https://github.com/PingoLee/Nitro.jl/issues/102)).
 
 `mountdir` is canonicalized by [`mount_segments`](@ref), so `"static"`, `"/static"`, `"static/"` and
 `"/static/"` name the same mount, and `""`, `"/"` and whitespace all mount at the router root.
 """
 function mountfolder(folder::String, mountdir::String, addroute;
                      include_hidden::Bool=false,
-                     allow_symlink_escape::Bool=false) :: Vector{String}
+                     allow_symlink_escape::Bool=false) :: Vector{Pair{String,String}}
 
     separator       = Base.Filesystem.path_separator
     prefix_segments = mount_segments(mountdir)
-    routes          = String[]
+    routes          = Pair{String,String}[]
 
     for filepath in mountable_files(folder; include_hidden, allow_symlink_escape)
 
@@ -420,7 +437,7 @@ function mountfolder(folder::String, mountdir::String, addroute;
         segments  = vcat(prefix_segments, String.(split(cleanedmountpath, '/'; keepempty=false)))
         mountpath = mount_route(segments)
 
-        push!(routes, mountpath)
+        push!(routes, mountpath => filepath)
         addroute(mountpath, filepath)
 
         # also register file to the root of each subpath if this file is an index.html
@@ -435,7 +452,7 @@ function mountfolder(folder::String, mountdir::String, addroute;
             # it: `/assets/index.html.bak/index.html` yielded `/assets`, so `GET /assets` served a
             # file from inside the backup directory. A root mount yielded `""` (#94).
             bare_path = mount_route(segments[1:end-1])
-            push!(routes, bare_path)
+            push!(routes, bare_path => filepath)
             addroute(bare_path, filepath)
         end
     end

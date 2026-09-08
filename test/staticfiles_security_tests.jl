@@ -7,6 +7,12 @@ using Nitro
 const MOUNTABLE   = Nitro.Core.Util.mountable_files
 const MOUNTFOLDER = Nitro.Core.Util.mountfolder
 
+# `mountfolder` returns `route => filepath` pairs (#102). Most assertions here are about the route
+# set alone, so unwrap once. This is not a convenience: a `String` is never `isequal` to a `Pair`, so
+# leaving a `∉` to compare against the raw pair vector makes it VACUOUSLY TRUE -- every negative
+# assertion below would keep passing while testing nothing, and the negatives are the security half.
+mountroutes(args...; kw...) = first.(MOUNTFOLDER(args...; kw...))
+
 # `symlink` needs Developer Mode or admin on Windows, and an unprivileged *file* symlink has no
 # equivalent there at all. A directory **junction** does (`mklink /J`), and Julia's `islink` reports
 # one as a link while `walkdir` classifies it as a file.
@@ -279,11 +285,37 @@ end
     @test_throws ArgumentError MOUNTABLE(joinpath(root, "visible.txt"))   # a file is not a folder
 end
 
-@testset "mountfolder reports the routes it registered" begin
-    registered = String[]
-    routes = MOUNTFOLDER(root, "assets", (route, _path) -> push!(registered, route))
+@testset "mountable_files returns joinpath(root, ...) verbatim" begin
+    # `spafiles` identifies its index by comparing `joinpath(folder, "index.html")` against this
+    # output (#102), so the un-normalized path is a contract, not an accident. A `realpath`,
+    # `abspath` or `normpath` added to the enumerator would silently drop every SPA fallback --
+    # the lookup misses, `spafiles` warns and registers nothing, and no assertion in this file
+    # would fail. Pinned for every spelling of the root, because both sides must agree byte for byte.
+    d = mktempdir()
+    write(joinpath(d, "index.html"), "<h1>i</h1>")
+    for folder in (d, d * "/", d * Base.Filesystem.path_separator)
+        @test joinpath(folder, "index.html") ∈ MOUNTABLE(folder)
+        @test joinpath(folder, "index.html") ∈ last.(MOUNTFOLDER(folder, "app", (_r, _p) -> nothing))
+    end
+end
 
-    @test routes == registered
+@testset "mountfolder reports the routes it registered" begin
+    registered = Pair{String,String}[]
+    pairs = MOUNTFOLDER(root, "assets", (route, path) -> push!(registered, route => path))
+
+    # The pair carries both halves (#102): the returned filepath must be exactly the one handed to
+    # `addroute`, or `spafiles` cannot trust it to identify the index by file.
+    @test pairs == registered
+    @test eltype(pairs) == Pair{String,String}
+    routes = first.(pairs)
+
+    # An index.html contributes TWO pairs naming the SAME file -- its own route and the bare
+    # directory route. That aliasing is precisely why a route *name* cannot identify a file, and it
+    # is the property `spafiles` must not depend on.
+    @test last(pairs[findfirst(p -> first(p) == "/assets/index.html", pairs)]) ==
+          last(pairs[findfirst(p -> first(p) == "/assets", pairs)]) ==
+          joinpath(root, "index.html")
+
     @test "/assets/visible.txt" ∈ routes
     @test "/assets/.env" ∉ routes
     @test "/assets/{id}.txt" ∉ routes
@@ -307,18 +339,24 @@ end
     for md in ("/", "   ", " / ")
         @test MOUNTFOLDER(root, md, (_r, _p) -> nothing) == root_baseline
     end
-    @test "/visible.txt" ∈ root_baseline
-    @test "/index.html" ∈ root_baseline
+    # The whole-vector `==` comparisons above hold unchanged on pairs, and get strictly stronger --
+    # two spellings must now agree on the filepaths as well as the routes. Membership tests do NOT
+    # survive: unwrap, or a String-vs-Pair comparison silently answers "not a member".
+    @test "/visible.txt" ∈ first.(root_baseline)
+    @test "/index.html" ∈ first.(root_baseline)
 
     # Routes are rebuilt by joining segments, so a doubled separator is unrepresentable. Interior
     # separators are still a real nested mount, not a spelling variant.
     for md in ("assets", "/assets/", "//assets//", "", "/", "a/b")
-        for route in MOUNTFOLDER(root, md, (_r, _p) -> nothing)
+        for (route, filepath) in MOUNTFOLDER(root, md, (_r, _p) -> nothing)
             @test !occursin("//", route)
             @test startswith(route, "/")
+            # The filepath half is a real, servable file for every route -- including the bare
+            # directory route, which reuses the index's path rather than naming a directory.
+            @test isfile(filepath)
         end
     end
-    @test "/a/b/visible.txt" ∈ MOUNTFOLDER(root, "a/b", (_r, _p) -> nothing)
+    @test "/a/b/visible.txt" ∈ mountroutes(root, "a/b", (_r, _p) -> nothing)
 end
 
 @testset "a directory named index.html does not claim the mount root" begin
@@ -331,22 +369,32 @@ end
     mkpath(joinpath(nested, "index.html"))
     write(joinpath(nested, "index.html", "index.html"), "<h1>nested</h1>")
 
-    routes = MOUNTFOLDER(nested, "assets", (_r, _p) -> nothing)
+    routes = mountroutes(nested, "assets", (_r, _p) -> nothing)
     @test "/assets/index.html/index.html" ∈ routes
     @test "/assets/index.html" ∈ routes   # the bare path of the NESTED index
     @test "/assets" ∉ routes              # the hijack: this was the nested file's bare path
     @test "" ∉ routes
 
+    # #102: identifying the index by ROUTE NAME resolves `/assets/index.html` to the NESTED file --
+    # a real, readable file -- and would silently register a fallback where #94 deliberately refuses
+    # one. Identifying it by FILE cannot: `<nested>/index.html` is a directory, and a directory is
+    # never a `mountable_files` result. This pair of assertions is why `spafiles` matches on the
+    # filepath half; the end-to-end consequence is pinned by the `@test_logs` block below.
+    pairs = MOUNTFOLDER(nested, "assets", (_r, _p) -> nothing)
+    @test last(pairs[findfirst(p -> first(p) == "/assets/index.html", pairs)]) ==
+          joinpath(nested, "index.html", "index.html")
+    @test findfirst(p -> last(p) == joinpath(nested, "index.html"), pairs) === nothing
+
     # A root mount's bare directory route is spelled "/", not "".
-    root_routes = MOUNTFOLDER(nested, "", (_r, _p) -> nothing)
+    root_routes = mountroutes(nested, "", (_r, _p) -> nothing)
     @test "/index.html/index.html" ∈ root_routes
     @test "/index.html" ∈ root_routes
     @test "/" ∉ root_routes               # nothing here is a *top-level* index.html
     @test "" ∉ root_routes
 
     # A genuine top-level index.html claims "/" rather than the empty string.
-    @test "/" ∈ MOUNTFOLDER(root, "", (_r, _p) -> nothing)
-    @test "" ∉ MOUNTFOLDER(root, "", (_r, _p) -> nothing)
+    @test "/" ∈ mountroutes(root, "", (_r, _p) -> nothing)
+    @test "" ∉ mountroutes(root, "", (_r, _p) -> nothing)
 
     resetstate()
     try
@@ -383,7 +431,7 @@ end
     mkpath(joinpath(tree, "docs", "index.htmlx", "guide"))
     write(joinpath(tree, "docs", "index.htmlx", "guide", "index.html"), "<h1>guide</h1>")
 
-    routes = MOUNTFOLDER(tree, "assets", (_r, _p) -> nothing)
+    routes = mountroutes(tree, "assets", (_r, _p) -> nothing)
     @test "/assets/index.html.bak" ∈ routes            # old code produced "/assets"
     @test "/assets/docs/index.htmlx/guide" ∈ routes    # old code produced "/assets/docs"
     @test "/assets" ∉ routes

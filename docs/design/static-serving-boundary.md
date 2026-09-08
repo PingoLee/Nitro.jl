@@ -251,6 +251,38 @@ the softer treatment: they arrive in bulk from the filesystem, `mountable_files`
 throws, and refusing one would silently drop a file from a mount that serves it today. That
 asymmetry is deliberate and is tracked separately.
 
+### A route name does not identify what produced it
+
+`mountfolder` returns `route => filepath` pairs, and the three mount functions return them through.
+The reason is that the route half is *ambiguous by construction*: an `index.html` contributes two
+routes naming the same file — its own and the bare directory route — so `/<prefix>/index.html` is
+the direct route of `<folder>/index.html` and equally the bare route of
+`<folder>/index.html/index.html`.
+
+`spafiles` used to gate its history-mode fallback on `index_route in mounted`, then re-derive the
+file with `joinpath(folder, "index.html")`. The two halves could disagree, and for a directory named
+`index.html` they did: the name matched while the path was a directory, so the fallback was
+registered against it and every unmatched request 500'd on `read(::dir)`
+([#94](https://github.com/PingoLee/Nitro.jl/issues/94)). That was closed by adding `isfile` as a
+second conjunct — a filesystem check that follows symlinks, reaching back past the enumeration rules
+this layer exists to own, and correct only for as long as nobody simplified it.
+
+Identifying the index by **file** removes the ambiguity instead of outvoting it
+([#102](https://github.com/PingoLee/Nitro.jl/issues/102)). A directory is never a `mountable_files`
+result, so no pair can name one; the `isfile` conjunct and its `stat` are gone. The escaping-symlink
+case is the clearest illustration: there `isfile(joinpath(folder, "index.html"))` is *true* — it
+resolves to a real file outside the mount — so only the route-name conjunct kept the catch-all from
+serving it on every unmatched path. Under the file lookup the enumerator already refused it, so no
+pair carries that path and the fallback simply cannot be registered.
+
+This makes `mountable_files`' un-normalized return an actual contract: it yields `joinpath(dir, name)`
+verbatim, never `realpath`/`abspath`/`normpath`, so `joinpath(root, rel)` is a valid key into it.
+Normalizing there would silently drop every SPA fallback. Both the contract and the aliasing are
+pinned in `test/staticfiles_security_tests.jl`.
+
+The fallback route (`/<prefix>/**`) is registered but is **not** in the returned vector — it is a
+catch-all, not a mounted file, and has no filepath to pair with.
+
 ## 9. See also
 
 - [`docs/src/tutorial/reverse_proxy.md`](../src/tutorial/reverse_proxy.md) — the user-facing guide,
