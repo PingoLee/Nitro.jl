@@ -236,9 +236,17 @@ end
         @test_throws ArgumentError mount_segments(md)
     end
 
-    # The second class, and the one that was silent: a segment that survives normalization but no
-    # request can ever match, because the router matches raw path segments and does not
-    # percent-decode. Such a mount registered and then served nothing at all.
+    # The second class: a segment that survives normalization but is not a legal URL path segment,
+    # so a conforming client's request and the registered route can never meet -- the router matches
+    # raw path segments and never percent-decodes.
+    #
+    # The cost is NOT uniform, and the honest split is worth recording next to the list. Measured by
+    # driving HTTP.jl 2.4 over a socket with hand-written request lines: `"my static"` really is
+    # unmatchable (400 -- a space cannot appear in a request line) and so is `"a?b"` (404 -- the
+    # query is split off first). The rest answered 200 to a client that sends raw bytes rather than
+    # encoding them, which curl does by default. So refusing `"café"` takes a working mount away
+    # from such a caller, and the encoded spelling is a different byte string that will not answer
+    # it. Deliberate: one rule, judged like a filename, and a prefix no browser can reach.
     for md in ("my static", "café", "a?b", "a#b", "a[b]", "a|b", "a<b>", "a\\b", "a\"b", "a^b", "a`b")
         @test_throws ArgumentError mount_segments(md)
     end
@@ -247,7 +255,9 @@ end
         @test_throws ArgumentError mount_segments(md)
     end
     # Non-ASCII is refused even where Julia's character predicates say "letter" or "digit":
-    # `isletter('Ａ')` is true for the fullwidth form, and it is still unreachable unencoded.
+    # `isletter('Ａ')` is true for the fullwidth form, so without the `isascii` guard in `_is_pchar`
+    # it would be accepted. Like `café` above, these are in the reachable-but-refused half -- a
+    # raw-byte client does reach them; no conforming one does.
     for md in ("Ａ", "٣", "naïve")
         @test_throws ArgumentError mount_segments(md)
     end

@@ -72,6 +72,11 @@ enumeration rules the mount owns, and correct only while nobody simplified it aw
 The fallback route (`/<prefix>/**`) is registered but is **not** in the returned vector, as before:
 it is a catch-all, not a mounted file, and has no filepath to pair with.
 
+One thing to look at even if you never bind the result: the value now carries **filesystem paths**,
+so `@info staticfiles(...)` or any log line that dumps it starts emitting local paths where it used
+to emit URL routes. These are your own `folder` spelling plus a relative path — not a resolved
+symlink target — but check any mount whose return value reaches a log.
+
 ### How to find the calls to migrate
 
 ```bash
@@ -140,9 +145,24 @@ registration; `*` was the one that came up clean.
 
 Rule 3 closes the silent half. The router compares path segments byte for byte and never
 percent-decodes, so `staticfiles(dir, "my static")` used to register routes that came up clean,
-reported themselves, and then matched nothing at all. It is not a lost capability: the *reachable*
-spelling is accepted, so `"my%20static"` and `"caf%C3%A9"` mount and serve — and those are what a
-browser actually sends. The rule turns a dead mount into either a working one or a loud error.
+reported themselves, and then matched nothing at all. The encoded spelling is accepted, so
+`"my%20static"` and `"caf%C3%A9"` mount and serve — and those are what a conforming client sends.
+
+**This is not purely a dead-mount cleanup, and one case needs a real decision from you.** The refused
+set splits in two:
+
+- `" "`, `"?"` and control characters are **strictly** unmatchable — the request line cannot carry
+  them. A mount spelled that way never served anything, so there is nothing to lose.
+- Everything else — `"café"`, `"a#b"`, `"a|b"`, `"a[b]"`, `"a^b"`, `"100%"` — **was reachable**, by a client
+  that sends raw bytes rather than percent-encoding them. `curl` does this by default. If you have a
+  mount with such a prefix *and* a non-browser client hitting it, that mount stops working, and
+  switching to the encoded spelling will **not** transparently fix it: `caf%C3%A9` and raw `café` are
+  different byte strings and the router matches bytes, so the encoded route does not answer the raw
+  client. You would have to change the client to percent-encode as well.
+
+The trade is deliberate: `mountdir` is judged by the same rule as a filename, and a prefix no browser
+can reach is a footgun whatever curl can do with it. But if you are deliberately serving a raw-byte
+path to a controlled client, this is a breaking change you must handle on both ends.
 
 Percent triplets are validated and passed through byte for byte; `"%2f"` is not rewritten to `"%2F"`.
 
@@ -156,12 +176,26 @@ the missing folder. Both are `ArgumentError`.
 # Every mount. The second argument is the one to check; a bare call uses the default "static".
 rg -n '(static|spa|dynamic)files\(' <app>/src
 
-# The spellings that now throw: a wildcard, a brace, a dot-segment, or a space in the prefix
+# Rules 1 and 2 — a wildcard, a brace, a dot-segment, or whitespace in the prefix
 rg -n '(static|spa|dynamic)files\([^)]*,\s*"[^"]*([*{}]|\s|\.\.)' <app>/src
+
+# Rule 3 — a prefix character outside RFC 3986 pchar. This is the class above that WAS
+# reachable ("café", "a|b", "a#b", "a[b]", "a^b"), so it is the one to check first.
+rg -n "(static|spa|dynamic)files\([^)]*,\s*\"[^\"]*[^-A-Za-z0-9/._~!\$&'()*+,;=:@%\"]" <app>/src
+
+# Rule 3, the percent case — a `%` that is not the head of a well-formed %XX triplet
+rg -nP '(static|spa|dynamic)files\([^)]*,\s*"[^"]*%(?![0-9A-Fa-f]{2})' <app>/src
 ```
 
-There is no silent case to hunt for — an affected mount throws `ArgumentError` at startup, and the
-message names the segment and why it was refused.
+The first pattern alone will **not** find the reachable-but-refused class — `"café"` and `"100%"`
+contain no wildcard, brace, dot-segment or space — which is why the second and third are here. The
+catch-all `rg` at the top finds every mount regardless; check each one's second argument by hand if
+you would rather not trust a character class.
+
+There is no silent case to hunt for on the *Nitro* side — an affected mount throws `ArgumentError` at
+startup, and the message names the segment and why it was refused. The silent case is on the
+**client** side: if a refused prefix was one of the reachable ones above, a non-browser caller that
+was hitting it starts getting 404s, so grep your clients too.
 
 ### Migrate your app
 
@@ -171,12 +205,21 @@ staticfiles("dist", "*")
 # ✓ after — name the prefix you actually meant
 staticfiles("dist", "assets")
 
-# ✗ before — registered, reported its routes, and matched nothing: the router never decodes
+# ✗ before — registered, reported its routes, and matched nothing: a space cannot appear
+#   in a request line at all, so this mount was dead however the client behaved
 staticfiles("dist", "my static")
-# ✓ after — the encoded spelling is the one a browser sends, and it serves
+# ✓ after — the encoded spelling is the one a conforming client sends, and it serves
 staticfiles("dist", "my%20static")
 # ✓ or avoid the question
 staticfiles("dist", "my-static")
+
+# ✗ before — this one DID serve, but only to a client sending raw UTF-8 (curl's default);
+#   no browser could ever reach it
+staticfiles("dist", "café")
+# ✓ after — serves every conforming client...
+staticfiles("dist", "caf%C3%A9")
+#   ...but NOT the raw-byte client that used to work: "café" and "caf%C3%A9" are different
+#   byte strings and the router matches bytes. Fix such a client to percent-encode too.
 
 # ✗ before — a dot-segment the client strips before the request is sent
 staticfiles("dist", "../public")

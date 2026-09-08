@@ -237,9 +237,26 @@ three grounds, in this order:
 Rule 3 is the one that changes the accepted behavior recorded in item 2 above. That item stands for
 *surrounding* whitespace, which is stripped and was never part of the segment; an **interior** one
 (`"my static"`) was accepted, unreachable, and silent — the mount registered, reported its routes,
-and served nothing. Refusing it is not a lost capability, because the reachable spelling is accepted:
-`"my%20static"` and `"caf%C3%A9"` mount and serve, and they are what a browser actually sends. So the
-rule converts a dead mount into either a working one or a loud error.
+and served nothing.
+
+**Rule 3's cost is not uniform, and the honest version matters.** Driving HTTP.jl 2.4 over a socket
+with hand-written request lines splits the refused set in two:
+
+| Registered segment | Raw request | Result |
+|---|---|---|
+| `my static` | `/my static/x.txt` | 400 — a space cannot appear in a request line |
+| `a?b` | `/a?b/x.txt` | 404 — the query is split off before matching |
+| `café`, `a#b`, `a\|b`, `a[b]`, `a^b` | raw bytes | **200 — these were working mounts** |
+
+So only space, `?` and control characters were *strictly* dead. The rest were reachable by any client
+that sends raw bytes rather than percent-encoding — `curl` by default — and refusing them genuinely
+takes that away. Nor is the encoded spelling a transparent migration: `caf%C3%A9` and raw `café` are
+different byte strings, and matching is a byte comparison (the same fact the no-re-encoding rule above
+depends on), so the encoded route does not answer the raw client.
+
+The trade is still worth making — `mountdir` is judged by the same rule as a filename, and a prefix no
+browser can reach is a footgun whatever a hand-rolled client can do with it — but it is a capability
+change, not just a dead-mount cleanup, and `UPGRADING.md`'s #101 entry says so.
 
 **Validated, never re-encoded.** A percent triplet is checked for well-formedness and passed through
 byte for byte. HTTP.jl matches path segments with a byte comparison rather than an RFC 3986

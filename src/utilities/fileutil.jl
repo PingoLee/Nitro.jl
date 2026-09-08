@@ -118,11 +118,13 @@ Whether `c` may stand unencoded in a URL path segment: RFC 3986's `pchar` minus 
 `unreserved / sub-delims / ":" / "@"`.
 
 The `isascii` guard is load-bearing, not defensive. Julia's `isletter` and friends are
-Unicode-aware, so `isletter('Ａ')` — the fullwidth `A` — is `true`, and a fullwidth `A` in a route is
-precisely the unreachable case: a client percent-encodes it, the router compares raw path segments,
-and the two never meet. `isdigit` and `isxdigit` are already ASCII-only in Julia, so only the letter
-test needs the guard; applying it to the whole predicate keeps that from being a detail a reader has
-to know.
+Unicode-aware, so `isletter('Ａ')` — the fullwidth `A` — is `true`, and without the guard a
+non-ASCII segment would be accepted as a literal route. A *conforming* client percent-encodes it and
+the router compares raw path segments, so the two never meet; a client that sends raw bytes does
+reach such a route, which is why refusing it is a deliberate trade rather than a free win — see
+[`mount_segments`](@ref). `isdigit` and `isxdigit` are already ASCII-only in Julia, so only the
+letter test needs the guard; applying it to the whole predicate keeps that from being a detail a
+reader has to know.
 """
 _is_pchar(c::Char) = isascii(c) && (isletter(c) || isdigit(c) || c in _PCHAR_PUNCT)
 
@@ -327,10 +329,18 @@ surviving segment is refused, with an `ArgumentError` naming it, when it is eith
   `/*/<file>` *and* a bare `/*`, so `GET /anything` was answered by the mount. `**` and `{id}` failed
   loudly at registration; `*` was the one that did not, which is what made it worth refusing here
   (#101); or
-- **unreachable unencoded** ([`_first_unroutable`](@ref)) — the router compares raw path segments and
-  never percent-decodes, so `"my static"` or `"café"` registered routes that no request could ever
-  match. The mount came up, reported its routes, and served nothing. Write such a prefix pre-encoded
-  (`"my%20static"`) and it mounts, because that spelling really is reachable.
+- **not a legal URL path segment** ([`_first_unroutable`](@ref)) — anything outside RFC 3986 `pchar`.
+  The router compares raw path segments and never percent-decodes, and a conforming client
+  percent-encodes these characters before sending, so the registered route and the request can never
+  meet. Write the prefix pre-encoded (`"my%20static"`, `"caf%C3%A9"`) and it mounts and serves.
+
+  Be precise about what this costs, because the two halves differ. `" "`, `"?"` and control
+  characters are **strictly** unmatchable — the request line cannot carry them, so such a mount was
+  always dead. The rest — `"café"`, `"a#b"`, `"a|b"`, `"a[b]"`, `"100%"` — *were* reachable by a client that
+  sends raw bytes rather than encoding them (curl does), so refusing them **does** take a working
+  mount away from those callers, and the encoded spelling is a different byte string that does not
+  answer them. That is a deliberate trade: one rule, judged like a filename, and a prefix no browser
+  can reach is a footgun whatever curl can do with it.
 
 A relative dot-segment (`.`, `..`) is refused for the same reason, separately: `.` is `unreserved`, so
 it passes the encoding test, and clients still strip it before sending.

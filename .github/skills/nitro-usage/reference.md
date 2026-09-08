@@ -316,7 +316,11 @@ it is a router pattern (`*`, `**`, `{`/`}` — the filename rule above, so a mou
 file may not), a relative dot-segment (`.`, `..`, which clients strip before sending), or contains
 anything outside RFC 3986 `pchar`. The router compares path segments byte for byte and never
 percent-decodes, so `"my static"` is refused while `"my%20static"` mounts and serves — the encoded
-spelling is the one a browser sends. Triplets are validated, never re-encoded: `"%2f"` stays `"%2f"`.
+spelling is the one a conforming client sends. Triplets are validated, never re-encoded: `"%2f"`
+stays `"%2f"`. Note only `" "`, `"?"` and control characters were *strictly* unreachable; `"café"`,
+`"a#b"`, `"a|b"` and friends did serve a raw-byte client (curl), so refusing them is a real
+capability change, and the encoded spelling is a different byte string that will not answer that
+client.
 
 ---
 

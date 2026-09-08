@@ -208,11 +208,14 @@ end
     end
 end
 
-@testset "a mountdir no request could match is refused" begin
+@testset "a mountdir that is not a legal URL path segment is refused" begin
     # HTTP.jl splits the request target on "/" and compares segments byte for byte; it never
-    # percent-decodes. A segment outside RFC 3986 pchar therefore registers routes that come up
-    # clean, report themselves, and then serve nothing at all -- the silent case #101 calls the
-    # worst of the three options. `..` is here because `.` is *unreserved*, so it passes the
+    # percent-decodes. A segment outside RFC 3986 pchar therefore registers routes no *conforming*
+    # client can reach. For `"my static"` that is absolute -- a space cannot appear in a request
+    # line at all -- which is the silent case #101 calls the worst of the three options. For
+    # `"café"` and the bracket/pipe family it is not: those answered a raw-byte client (curl), so
+    # refusing them is a real capability change, recorded in UPGRADING.md's #101 entry rather than
+    # papered over. `..` is here because `.` is *unreserved*, so it passes the
     # encoding test and is still stripped by the client before the request is sent.
     for md in ("my static", "café", "a?b", "a#b", "%", "a%2", "%GG", "100%", "a[b]", "a|b", "..")
         @test_throws ArgumentError MOUNTFOLDER(root, md, (_r, _p) -> nothing)
@@ -223,9 +226,10 @@ end
         @test !isempty(MOUNTFOLDER(root, md, (_r, _p) -> nothing))
     end
 
-    # The whole justification for allowing `%XX`: the encoded spelling is the one a browser actually
-    # sends, so refusing "my static" while accepting "my%20static" turns a dead mount into a working
-    # one rather than taking a capability away.
+    # The whole justification for allowing `%XX`: the encoded spelling is the one a conforming client
+    # actually sends, so refusing "my static" while accepting "my%20static" turns a dead mount into a
+    # working one. That framing holds for a space, which no request line can carry; it does NOT
+    # generalize to "café" and friends, which were reachable by a raw-byte client.
     resetstate()
     try
         staticfiles(root, "my%20static")
@@ -301,19 +305,19 @@ end
 
 @testset "mountfolder reports the routes it registered" begin
     registered = Pair{String,String}[]
-    pairs = MOUNTFOLDER(root, "assets", (route, path) -> push!(registered, route => path))
+    mounted_pairs = MOUNTFOLDER(root, "assets", (route, path) -> push!(registered, route => path))
 
     # The pair carries both halves (#102): the returned filepath must be exactly the one handed to
     # `addroute`, or `spafiles` cannot trust it to identify the index by file.
-    @test pairs == registered
-    @test eltype(pairs) == Pair{String,String}
-    routes = first.(pairs)
+    @test mounted_pairs == registered
+    @test eltype(mounted_pairs) == Pair{String,String}
+    routes = first.(mounted_pairs)
 
     # An index.html contributes TWO pairs naming the SAME file -- its own route and the bare
     # directory route. That aliasing is precisely why a route *name* cannot identify a file, and it
     # is the property `spafiles` must not depend on.
-    @test last(pairs[findfirst(p -> first(p) == "/assets/index.html", pairs)]) ==
-          last(pairs[findfirst(p -> first(p) == "/assets", pairs)]) ==
+    @test last(mounted_pairs[findfirst(p -> first(p) == "/assets/index.html", mounted_pairs)]) ==
+          last(mounted_pairs[findfirst(p -> first(p) == "/assets", mounted_pairs)]) ==
           joinpath(root, "index.html")
 
     @test "/assets/visible.txt" ∈ routes
@@ -380,10 +384,10 @@ end
     # one. Identifying it by FILE cannot: `<nested>/index.html` is a directory, and a directory is
     # never a `mountable_files` result. This pair of assertions is why `spafiles` matches on the
     # filepath half; the end-to-end consequence is pinned by the `@test_logs` block below.
-    pairs = MOUNTFOLDER(nested, "assets", (_r, _p) -> nothing)
-    @test last(pairs[findfirst(p -> first(p) == "/assets/index.html", pairs)]) ==
+    mounted_pairs = MOUNTFOLDER(nested, "assets", (_r, _p) -> nothing)
+    @test last(mounted_pairs[findfirst(p -> first(p) == "/assets/index.html", mounted_pairs)]) ==
           joinpath(nested, "index.html", "index.html")
-    @test findfirst(p -> last(p) == joinpath(nested, "index.html"), pairs) === nothing
+    @test findfirst(p -> last(p) == joinpath(nested, "index.html"), mounted_pairs) === nothing
 
     # A root mount's bare directory route is spelled "/", not "".
     root_routes = mountroutes(nested, "", (_r, _p) -> nothing)
