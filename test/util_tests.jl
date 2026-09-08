@@ -225,6 +225,72 @@ end
     @test mount_segments("static") isa Vector{String}
 end
 
+@testset "mount_segments refuses a segment the router cannot reach" begin
+    # `mountable_files` refuses a *filename* the router would read as a pattern, so a file cannot
+    # claim URLs other than its own. Nothing applied that rule to `mountdir`, which could do exactly
+    # what a file is forbidden from doing: `staticfiles(dir, "*")` registered `/*/<file>` AND a bare
+    # `/*`, so `GET /anything` was answered by the mount (#101). `**` and `{id}` already failed
+    # loudly at registration; refusing them here names the cause instead of surfacing as a router
+    # error three frames later.
+    for md in ("*", "/*/", "a/*", "*/a", "**", "{id}", "a{b", "b}c", "{}", "assets/{id}")
+        @test_throws ArgumentError mount_segments(md)
+    end
+
+    # The second class, and the one that was silent: a segment that survives normalization but no
+    # request can ever match, because the router matches raw path segments and does not
+    # percent-decode. Such a mount registered and then served nothing at all.
+    for md in ("my static", "café", "a?b", "a#b", "a[b]", "a|b", "a<b>", "a\\b", "a\"b", "a^b", "a`b")
+        @test_throws ArgumentError mount_segments(md)
+    end
+    # A bare `%` is not percent-encoding, and neither is a non-hex or truncated escape.
+    for md in ("100%", "%zz", "%4", "a%", "%g0")
+        @test_throws ArgumentError mount_segments(md)
+    end
+    # Non-ASCII is refused even where Julia's character predicates say "letter" or "digit":
+    # `isletter('Ａ')` is true for the fullwidth form, and it is still unreachable unencoded.
+    for md in ("Ａ", "٣", "naïve")
+        @test_throws ArgumentError mount_segments(md)
+    end
+
+    # A relative dot-segment is `pchar`-clean (`.` is unreserved) and still unreachable: the client
+    # removes it before sending, so nothing ever arrives that would match `/../x`.
+    for md in (".", "..", "a/../b", "./a")
+        @test_throws ArgumentError mount_segments(md)
+    end
+    # Only a *whole* segment is a dot-segment; a leading dot is an ordinary hidden-style name.
+    @test mount_segments(".well-known") == [".well-known"]
+    @test mount_segments("a..b") == ["a..b"]
+
+    # Everything RFC 3986 allows in a path segment unencoded still mounts — including a prefix the
+    # app pre-encoded itself, which IS reachable, so refusing it would be wrong.
+    @test mount_segments("my%20static") == ["my%20static"]
+    @test mount_segments("caf%C3%A9") == ["caf%C3%A9"]
+    # Validated, never re-encoded. HTTP.jl compares path segments byte for byte rather than by RFC
+    # 3986 equivalence, so case-normalizing `%2f` to `%2F` here would stop matching a client that
+    # sends the lowercase form.
+    @test mount_segments("%2f") == ["%2f"]
+    @test mount_segments("%41") == ["%41"]
+    @test mount_segments("v1.2~beta_x-y") == ["v1.2~beta_x-y"]
+    for md in ("a:b", "a@b", "a+b", "a,b", "a;b", "a=b", "a\$b", "a&b", "a'b", "a!b", "(a)")
+        @test mount_segments(md) == [md]
+    end
+    # `*` is a legal pchar, so the wildcard refusal is a *routing* rule, not an encoding one: only a
+    # whole segment of `*`/`**` is a wildcard, and an interior star stays a literal, servable segment.
+    @test mount_segments("a*b") == ["a*b"]
+
+    # The message names the offending segment and why it was refused, so a boot failure is
+    # self-diagnosing rather than a bare stack trace.
+    pattern_err = try; mount_segments("*"); catch e; e; end
+    @test pattern_err isa ArgumentError
+    @test occursin("\"*\"", pattern_err.msg)
+    @test occursin("route pattern", pattern_err.msg)
+
+    encoding_err = try; mount_segments("my static"); catch e; e; end
+    @test encoding_err isa ArgumentError
+    @test occursin("my static", encoding_err.msg)
+    @test occursin("percent-encoded", encoding_err.msg)
+end
+
 @testset "mount_route joins segments" begin
     # The empty vector is the router root, spelled explicitly. HTTP.jl treats "" and "/" alike, but
     # relying on that made a root mount's bare-directory route correct only by accident (#94).

@@ -177,6 +177,58 @@ end
     end
 end
 
+@testset "a mountdir that would register as a route pattern is refused" begin
+    # The rule above has always applied to *filenames*, on the grounds that a file must not claim
+    # URLs other than its own. Nothing applied it to `mountdir`, so a mount could do exactly what a
+    # file is forbidden from doing: `staticfiles(dir, "*")` registered `/*/<file>` **and** a bare
+    # `/*`, so `GET /anything` was answered by the mount's index.html. `**` and `{id}` already threw
+    # at registration; `*` was the one that came up clean, which is what made it worth closing (#101).
+    for md in ("*", "**", "{id}", "a/{id}/b", "assets/*", "}")
+        @test_throws ArgumentError MOUNTFOLDER(root, md, (_r, _p) -> nothing)
+    end
+
+    # The public entry points, not just the helper -- that is where the footgun was reachable.
+    resetstate()
+    try
+        @test_throws ArgumentError staticfiles(root, "*")
+        @test_throws ArgumentError spafiles(root, "*")
+        @test_throws ArgumentError dynamicfiles(root, "*")
+        # `mountdir` is canonicalized before enumeration, so a refusal registers nothing on the way
+        # out -- these are the two requests the wildcard mount used to answer.
+        @test internalrequest(HTTP.Request("GET", "/anything")).status == 404
+        @test internalrequest(HTTP.Request("GET", "/x/visible.txt")).status == 404
+    finally
+        resetstate()
+    end
+end
+
+@testset "a mountdir no request could match is refused" begin
+    # HTTP.jl splits the request target on "/" and compares segments byte for byte; it never
+    # percent-decodes. A segment outside RFC 3986 pchar therefore registers routes that come up
+    # clean, report themselves, and then serve nothing at all -- the silent case #101 calls the
+    # worst of the three options. `..` is here because `.` is *unreserved*, so it passes the
+    # encoding test and is still stripped by the client before the request is sent.
+    for md in ("my static", "café", "a?b", "a#b", "%", "a%2", "%GG", "100%", "a[b]", "a|b", "..")
+        @test_throws ArgumentError MOUNTFOLDER(root, md, (_r, _p) -> nothing)
+    end
+
+    # pchar, not "ASCII alphanumeric" -- these are legal path segments and must still mount.
+    for md in ("my%20static", "a:b", "a@b", "a+b", "a.b-c_d~e", "caf%C3%A9")
+        @test !isempty(MOUNTFOLDER(root, md, (_r, _p) -> nothing))
+    end
+
+    # The whole justification for allowing `%XX`: the encoded spelling is the one a browser actually
+    # sends, so refusing "my static" while accepting "my%20static" turns a dead mount into a working
+    # one rather than taking a capability away.
+    resetstate()
+    try
+        staticfiles(root, "my%20static")
+        @test internalrequest(HTTP.Request("GET", "/my%20static/visible.txt")).status == 200
+    finally
+        resetstate()
+    end
+end
+
 @testset "symlinks escaping the mount are refused" begin
     files = servable(root)
 

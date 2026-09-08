@@ -98,9 +98,66 @@ routing layer. Two distinct failures, both refused:
   HTTP.jl's own `isvariable`, so `{id}.txt` counts even though it is not a well-formed variable.
   Registration then throws `ArgumentError` because a mount's handler takes no such parameter, which
   means a single brace-named file made `serve()` fail to boot.
+
+Applied to two things, by two callers with different consequences. [`mountable_files`](@ref) *skips*
+a filename that matches, because filenames arrive in bulk from the filesystem. [`mount_segments`](@ref)
+*throws* on a `mountdir` segment that matches, because that is one app-authored value with an obvious
+correction — and until #101 it was not checked at all, so a mount could claim URLs a file may not.
 """
 _is_route_pattern(component::AbstractString) =
     component == "*" || component == "**" || occursin('{', component) || occursin('}', component)
+
+const _PCHAR_PUNCT = ('-', '.', '_', '~',                                          # unreserved
+                      '!', '$', '&', '\'', '(', ')', '*', '+', ',', ';', '=',      # sub-delims
+                      ':', '@')
+
+"""
+    _is_pchar(c::Char) -> Bool
+
+Whether `c` may stand unencoded in a URL path segment: RFC 3986's `pchar` minus `pct-encoded`, i.e.
+`unreserved / sub-delims / ":" / "@"`.
+
+The `isascii` guard is load-bearing, not defensive. Julia's `isletter` and friends are
+Unicode-aware, so `isletter('Ａ')` — the fullwidth `A` — is `true`, and a fullwidth `A` in a route is
+precisely the unreachable case: a client percent-encodes it, the router compares raw path segments,
+and the two never meet. `isdigit` and `isxdigit` are already ASCII-only in Julia, so only the letter
+test needs the guard; applying it to the whole predicate keeps that from being a detail a reader has
+to know.
+"""
+_is_pchar(c::Char) = isascii(c) && (isletter(c) || isdigit(c) || c in _PCHAR_PUNCT)
+
+"""
+    _first_unroutable(segment::AbstractString) -> Char or nothing
+
+The first character of `segment` that could not appear in a URL path unencoded, or `nothing` when
+every one of them could.
+
+`%` is accepted only as the head of a well-formed `%XX` triplet, so a prefix the app already encoded
+itself (`"my%20static"`) passes — it really is reachable — while a literal percent (`"100%"`), a
+non-hex escape (`"%zz"`) and a truncated one (`"a%"`) do not.
+
+The return type is deliberately unannotated rather than `Nullable{Char}`: `src/core.jl` includes
+`util.jl` *before* `types.jl`, so the `Nullable` alias does not exist yet at this point in the chain.
+"""
+function _first_unroutable(segment::AbstractString)
+    chars = collect(segment)
+    n = length(chars)
+    i = 1
+    while i <= n
+        c = chars[i]
+        if c == '%'
+            # A valid escape consumes three characters; anything else is a literal `%`, which is
+            # itself unroutable — report the `%` rather than the byte that followed it.
+            (i + 2 <= n && isxdigit(chars[i + 1]) && isxdigit(chars[i + 2])) || return '%'
+            i += 3
+        elseif !_is_pchar(c)
+            return c
+        else
+            i += 1
+        end
+    end
+    return nothing
+end
 
 """
     _mount_root_parts(root::String) -> Vector{String}
@@ -254,16 +311,64 @@ whitespace to `String[]`; `"static"`, `"/static"`, `"static/"`, `"/static/"` and
 `["static"]` — and routes are rebuilt with [`mount_route`](@ref) by joining, never by interpolating
 a prefix that might already carry a separator.
 
-It **normalizes, it does not validate.** Whitespace is stripped only at a segment's edges, so an
-interior space survives into a route that no request can match (the router does not percent-decode),
-and a `mountdir` containing router-pattern characters still becomes a pattern route — unlike a
-*filename*, which [`mountable_files`](@ref) refuses for exactly that reason.
+It normalizes **and** validates. A `mountdir` is judged by the same rule as a *filename* — see
+[`mountable_files`](@ref) — because a mount must not be able to claim URLs a file may not. Every
+surviving segment is refused, with an `ArgumentError` naming it, when it is either:
+
+- **a router pattern** ([`_is_route_pattern`](@ref)) — `staticfiles(dir, "*")` used to register
+  `/*/<file>` *and* a bare `/*`, so `GET /anything` was answered by the mount. `**` and `{id}` failed
+  loudly at registration; `*` was the one that did not, which is what made it worth refusing here
+  (#101); or
+- **unreachable unencoded** ([`_first_unroutable`](@ref)) — the router compares raw path segments and
+  never percent-decodes, so `"my static"` or `"café"` registered routes that no request could ever
+  match. The mount came up, reported its routes, and served nothing. Write such a prefix pre-encoded
+  (`"my%20static"`) and it mounts, because that spelling really is reachable.
+
+A relative dot-segment (`.`, `..`) is refused for the same reason, separately: `.` is `unreserved`, so
+it passes the encoding test, and clients still strip it before sending.
+
+Refusing is deliberate rather than warning: `mountdir` is a single app-authored value with an obvious
+correction, so failing at boot is cheaper than a dead mount nobody notices. Filenames keep the softer
+treatment — they arrive in bulk from the filesystem, and `mountable_files` skips rather than throws.
+
+**Validated, never re-encoded.** A percent triplet is checked for well-formedness and then passed
+through byte for byte — `"%2f"` stays `"%2f"`. Do not add case-normalization or decoding of
+unreserved triplets here, however much "the one place `mountdir` is normalized" invites it: HTTP.jl
+matches path segments with a byte comparison, not an RFC 3986 equivalence test, so rewriting `"%2f"`
+to `"%2F"` would stop matching the client that sends the lowercase form.
+
+Note this runs **before** enumeration: [`mountfolder`](@ref) calls this function first, so
+`staticfiles("does_not_exist", "*")` reports the bad `mountdir`, not the missing folder. Both are
+`ArgumentError`.
 """
 function mount_segments(mountdir::AbstractString)::Vector{String}
     segments = String[]
     for raw in split(mountdir, '/')
-        segment = strip(raw)
-        isempty(segment) || push!(segments, String(segment))
+        segment = String(strip(raw))
+        isempty(segment) && continue
+
+        # Order matters: `*` is a perfectly legal `pchar`, so the pattern test has to run first or a
+        # wildcard mount would be reported as an encoding problem, which is not what is wrong with it.
+        _is_route_pattern(segment) && throw(ArgumentError(
+            "mountdir segment $(repr(segment)) would register as a route pattern rather than a " *
+            "literal path: a mount may not claim URLs other than its own. Use a literal prefix."))
+
+        # `.` and `..` are `pchar`-clean — `.` is unreserved — so the encoding test below waves them
+        # through, and they are still unreachable: RFC 3986 §5.2.4 dot-segment removal is done by the
+        # client, so nothing that would match `/../x` ever reaches the router.
+        (segment == "." || segment == "..") && throw(ArgumentError(
+            "mountdir segment $(repr(segment)) is a relative dot-segment. Clients remove `.` and " *
+            "`..` from a path before sending it, so this mount would register routes no request " *
+            "could reach. Spell the prefix without it."))
+
+        bad = _first_unroutable(segment)
+        bad === nothing || throw(ArgumentError(
+            "mountdir segment $(repr(segment)) contains $(repr(bad)), which must be " *
+            "percent-encoded to appear in a URL path. The router matches raw path segments, so " *
+            "this mount would register routes no request could reach. Write the prefix " *
+            "pre-encoded (e.g. \"my%20static\") or choose a different one."))
+
+        push!(segments, segment)
     end
     return segments
 end

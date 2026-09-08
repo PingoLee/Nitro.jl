@@ -42,6 +42,85 @@ consuming app, `nitro-cut-release` stamps every entry below with `0.3.0`, dates 
 
 ---
 
+## `mountdir` is validated as a URL path prefix, so some mounts now throw at startup (#101)
+
+- **Version**: Unreleased
+- **Nitro ref**: #101; `src/utilities/fileutil.jl`, `src/methods.jl`
+- **Recorded**: 2026-09-07
+- **Severity**: **breaking (throws at mount time)** — affects apps whose `mountdir` was a wildcard,
+  a brace name, a dot-segment, or contained a character that has to be percent-encoded.
+
+### What changed
+
+`mountable_files` has always refused a **filename** the router would read as a pattern, because a
+file must not be able to claim URLs other than its own. Nothing applied that rule to `mountdir`, so a
+mount could do exactly what a file was forbidden from doing: `staticfiles(dir, "*")` registered
+`/*/<file>` **and** a bare `/*`, so `GET /anything` was answered by the mount's `index.html`. The
+blast radius was one path segment, not the whole router — but no one spelling `staticfiles(dir, "*")`
+can have meant it. `staticfiles(dir, "**")` and `staticfiles(dir, "{id}")` already failed loudly at
+registration; `*` was the one that came up clean.
+
+`mount_segments` now refuses a segment on three grounds, checked in this order:
+
+1. **A router pattern** — `*`, `**`, or a segment containing `{` or `}`. Checked first because `*` is
+   a legal URL path character, so the encoding rule below would otherwise let it through.
+2. **A relative dot-segment** — `.` or `..`. `.` is `unreserved`, so the encoding rule passes it too,
+   and clients remove dot-segments before sending: nothing that would match `/../x` ever arrives.
+3. **Not a legal URL path segment** — anything outside RFC 3986 `pchar`
+   (`unreserved / pct-encoded / sub-delims / ":" / "@"`).
+
+Rule 3 closes the silent half. The router compares path segments byte for byte and never
+percent-decodes, so `staticfiles(dir, "my static")` used to register routes that came up clean,
+reported themselves, and then matched nothing at all. It is not a lost capability: the *reachable*
+spelling is accepted, so `"my%20static"` and `"caf%C3%A9"` mount and serve — and those are what a
+browser actually sends. The rule turns a dead mount into either a working one or a loud error.
+
+Percent triplets are validated and passed through byte for byte; `"%2f"` is not rewritten to `"%2F"`.
+
+Because `mountdir` is canonicalized before the folder is enumerated, a call that is wrong in both
+respects — `staticfiles("does_not_exist", "*")` — now reports the `mountdir`, where it used to report
+the missing folder. Both are `ArgumentError`.
+
+### How to find the calls to migrate
+
+```bash
+# Every mount. The second argument is the one to check; a bare call uses the default "static".
+rg -n '(static|spa|dynamic)files\(' <app>/src
+
+# The spellings that now throw: a wildcard, a brace, a dot-segment, or a space in the prefix
+rg -n '(static|spa|dynamic)files\([^)]*,\s*"[^"]*([*{}]|\s|\.\.)' <app>/src
+```
+
+There is no silent case to hunt for — an affected mount throws `ArgumentError` at startup, and the
+message names the segment and why it was refused.
+
+### Migrate your app
+
+```julia
+# ✗ before — registered `/*/app.js` and a bare `/*`, so GET /anything hit the mount
+staticfiles("dist", "*")
+# ✓ after — name the prefix you actually meant
+staticfiles("dist", "assets")
+
+# ✗ before — registered, reported its routes, and matched nothing: the router never decodes
+staticfiles("dist", "my static")
+# ✓ after — the encoded spelling is the one a browser sends, and it serves
+staticfiles("dist", "my%20static")
+# ✓ or avoid the question
+staticfiles("dist", "my-static")
+
+# ✗ before — a dot-segment the client strips before the request is sent
+staticfiles("dist", "../public")
+# ✓ after — mount the folder you mean, at the prefix you mean
+staticfiles("../public", "public")
+```
+
+Filenames are unaffected by this change: `mountable_files` still *skips* an unservable file rather
+than throwing, because filenames arrive in bulk from the filesystem and refusing one would silently
+drop a file from a mount that serves it today.
+
+---
+
 ## `AbstractWorkerStore` gains three atomic write methods; `set_task!` no longer writes watchers (#88)
 
 - **Version**: Unreleased

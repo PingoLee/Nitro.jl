@@ -198,8 +198,9 @@ Note this changes no URL that a *reachable* mount already served. HTTP.jl's `reg
 request path both split on `/` with `keepempty=false`, so every slash-only spelling —
 `/static//app.js` versus `/static/app.js`, `""` versus `"/"` — was already the same router node.
 
-Three things do change, and none of them forces an app edit, which is why there is no
-`UPGRADING.md` entry.
+Three things changed **in #93/#94**, and none of them forced an app edit, which is why that pair
+carried no `UPGRADING.md` entry. (The later validation rule below does force one — see
+*Segments are validated, not only canonicalized*.)
 
 1. **The strings `mountfolder` and the three mount functions return.** A root mount's bare route is
    now `"/"` rather than `""`, and no returned route carries a doubled separator.
@@ -214,6 +215,41 @@ Three things do change, and none of them forces an app edit, which is why there 
    404, while that file becomes reachable at its own path. A URL on a reachable mount does change —
    but only one that was serving the wrong file, which is a shape no app can have intended, and the
    file it was serving is still available at the route it should always have had.
+
+### Segments are validated, not only canonicalized
+
+Canonicalization alone left `mountdir` exempt from the rule `mountable_files` has always applied to
+filenames — *a mount may not claim URLs other than its own*. `staticfiles(dir, "*")` registered
+`/*/<file>` and a bare `/*`, so `GET /anything` was answered by the mount. `**` and `{id}` threw at
+registration; `*` came up clean, which is what made it worth closing
+([#101](https://github.com/PingoLee/Nitro.jl/issues/101)). `mount_segments` now refuses a segment on
+three grounds, in this order:
+
+1. **It would register as a router pattern** — `*`, `**`, or a segment containing `{`/`}`. Checked
+   first because `*` is a perfectly legal `pchar`, so the encoding test below would wave it through
+   and, for a brace, would report the wrong cause.
+2. **It is a relative dot-segment** — `.` or `..`. `.` is `unreserved`, so the encoding test also
+   passes it, and RFC 3986 §5.2.4 dot-segment removal happens *in the client*: nothing that would
+   match `/../x` is ever sent.
+3. **It could not appear in a URL path unencoded** — anything outside RFC 3986 `pchar`
+   (`unreserved / pct-encoded / sub-delims / ":" / "@"`).
+
+Rule 3 is the one that changes the accepted behavior recorded in item 2 above. That item stands for
+*surrounding* whitespace, which is stripped and was never part of the segment; an **interior** one
+(`"my static"`) was accepted, unreachable, and silent — the mount registered, reported its routes,
+and served nothing. Refusing it is not a lost capability, because the reachable spelling is accepted:
+`"my%20static"` and `"caf%C3%A9"` mount and serve, and they are what a browser actually sends. So the
+rule converts a dead mount into either a working one or a loud error.
+
+**Validated, never re-encoded.** A percent triplet is checked for well-formedness and passed through
+byte for byte. HTTP.jl matches path segments with a byte comparison rather than an RFC 3986
+equivalence test, so case-normalizing `"%2f"` to `"%2F"`, or decoding unreserved triplets, would stop
+matching the client that sends the other spelling.
+
+`mountdir` is app-authored — a single value with an obvious correction — so it throws. Filenames keep
+the softer treatment: they arrive in bulk from the filesystem, `mountable_files` skips rather than
+throws, and refusing one would silently drop a file from a mount that serves it today. That
+asymmetry is deliberate and is tracked separately.
 
 ## 9. See also
 

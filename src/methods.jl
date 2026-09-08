@@ -88,6 +88,14 @@ request, or [`spafiles`](@ref) for a single-page app.
 `"static/"` and `"/static/"` are the same mount, and `""`, `"/"` and whitespace all mount at the router
 root.
 
+It is also **validated**, and throws `ArgumentError` at mount time rather than registering a mount
+that cannot work. A segment is refused when it would register as a router pattern (`*`, `**`, or one
+containing `{`/`}`) — the rule that has always applied to filenames, so a mount cannot claim URLs a
+file may not — or when no request could ever match it. The router compares path segments byte for
+byte and never percent-decodes, so `"my static"` and `"café"` are refused while `"my%20static"` and
+`"caf%C3%A9"` mount and serve: the encoded spelling is the one a browser sends. A relative
+dot-segment (`.`, `..`) is refused too, because clients strip it before sending.
+
 Not every file in `folder` is served. These are refused:
 
 - **Hidden entries** — any path component starting with `.` *relative to `folder`*, so `.env` and
@@ -138,6 +146,14 @@ enabling SPA History Mode routing.
 `"static/"` and `"/static/"` are the same mount, and `""`, `"/"` and whitespace all mount at the router
 root.
 
+It is also **validated**, and throws `ArgumentError` at mount time rather than registering a mount
+that cannot work. A segment is refused when it would register as a router pattern (`*`, `**`, or one
+containing `{`/`}`) — the rule that has always applied to filenames, so a mount cannot claim URLs a
+file may not — or when no request could ever match it. The router compares path segments byte for
+byte and never percent-decodes, so `"my static"` and `"café"` are refused while `"my%20static"` and
+`"caf%C3%A9"` mount and serve: the encoded spelling is the one a browser sends. A relative
+dot-segment (`.`, `..`) is refused too, because clients strip it before sending.
+
 Which files are servable — and the `include_hidden` / `allow_symlink_escape` opt-outs — is described
 in [`staticfiles`](@ref); the same rules apply here. Two SPA-specific consequences:
 
@@ -168,6 +184,14 @@ instead.
 `mountdir` is normalized: surrounding whitespace and `/` are stripped, so `"static"`, `"/static"`,
 `"static/"` and `"/static/"` are the same mount, and `""`, `"/"` and whitespace all mount at the router
 root.
+
+It is also **validated**, and throws `ArgumentError` at mount time rather than registering a mount
+that cannot work. A segment is refused when it would register as a router pattern (`*`, `**`, or one
+containing `{`/`}`) — the rule that has always applied to filenames, so a mount cannot claim URLs a
+file may not — or when no request could ever match it. The router compares path segments byte for
+byte and never percent-decodes, so `"my static"` and `"café"` are refused while `"my%20static"` and
+`"caf%C3%A9"` mount and serve: the encoded spelling is the one a browser sends. A relative
+dot-segment (`.`, `..`) is refused too, because clients strip it before sending.
 
 Which files are servable — and the `include_hidden` / `allow_symlink_escape` opt-outs — is described
 in [`staticfiles`](@ref); the same rules apply here. They are evaluated **once, at mount time**: this
