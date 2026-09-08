@@ -88,6 +88,25 @@ request, or [`spafiles`](@ref) for a single-page app.
 `"static/"` and `"/static/"` are the same mount, and `""`, `"/"` and whitespace all mount at the router
 root.
 
+It is also **validated**, and throws `ArgumentError` at mount time rather than registering a mount
+that cannot work. A segment is refused when it would register as a router pattern (`*`, `**`, or one
+containing `{`/`}`) — the rule that has always applied to filenames, so a mount cannot claim URLs a
+file may not — or when it is not a legal URL path segment (outside RFC 3986 `pchar`). The router
+compares path segments byte for byte and never percent-decodes, so `"my static"` and `"café"` are
+refused while `"my%20static"` and `"caf%C3%A9"` mount and serve: the encoded spelling is the one a
+conforming client sends. A relative dot-segment (`.`, `..`) is refused too, because clients strip it
+before sending.
+
+Note `"café"`, `"a#b"`, `"a|b"` and `"100%"` *were* reachable by a client that sends raw bytes instead
+of encoding them (curl does), so refusing them takes a working mount away from those callers, and the
+encoded spelling is a different byte string that will not answer them. Only a space, a `?` and
+control characters were strictly unmatchable.
+
+Returns `Vector{Pair{String,String}}` — `route => filepath` for everything it registered, in
+registration order. An `index.html` contributes two pairs naming the *same* file: its own route and
+the bare directory route (`/docs/index.html` also registers `/docs`, and a top-level one registers
+`/`). Use `first.(result)` for the routes alone.
+
 Not every file in `folder` is served. These are refused:
 
 - **Hidden entries** — any path component starting with `.` *relative to `folder`*, so `.env` and
@@ -138,12 +157,34 @@ enabling SPA History Mode routing.
 `"static/"` and `"/static/"` are the same mount, and `""`, `"/"` and whitespace all mount at the router
 root.
 
+It is also **validated**, and throws `ArgumentError` at mount time rather than registering a mount
+that cannot work. A segment is refused when it would register as a router pattern (`*`, `**`, or one
+containing `{`/`}`) — the rule that has always applied to filenames, so a mount cannot claim URLs a
+file may not — or when it is not a legal URL path segment (outside RFC 3986 `pchar`). The router
+compares path segments byte for byte and never percent-decodes, so `"my static"` and `"café"` are
+refused while `"my%20static"` and `"caf%C3%A9"` mount and serve: the encoded spelling is the one a
+conforming client sends. A relative dot-segment (`.`, `..`) is refused too, because clients strip it
+before sending.
+
+Note `"café"`, `"a#b"`, `"a|b"` and `"100%"` *were* reachable by a client that sends raw bytes instead
+of encoding them (curl does), so refusing them takes a working mount away from those callers, and the
+encoded spelling is a different byte string that will not answer them. Only a space, a `?` and
+control characters were strictly unmatchable.
+
+Returns `Vector{Pair{String,String}}` — `route => filepath` for everything it registered, in
+registration order. An `index.html` contributes two pairs naming the *same* file: its own route and
+the bare directory route (`/docs/index.html` also registers `/docs`, and a top-level one registers
+`/`). Use `first.(result)` for the routes alone.
+
 Which files are servable — and the `include_hidden` / `allow_symlink_escape` opt-outs — is described
-in [`staticfiles`](@ref); the same rules apply here. Two SPA-specific consequences:
+in [`staticfiles`](@ref); the same rules apply here. Three SPA-specific consequences:
 
 - The history-mode fallback is registered **only if `index.html` itself is servable.** If it is
   refused (an escaping symlink, say), the fallback is skipped and a warning is logged, rather than
-  serving through the mount rules on every unmatched path.
+  serving through the mount rules on every unmatched path. Servability is decided by looking the
+  file up in what the mount registered, so the fallback serves exactly the bytes the mount chose.
+- The fallback route (`/<prefix>/**`) is **not** in the returned vector. It is a catch-all rather
+  than a mounted file, and it has no filepath of its own to pair with.
 - Because the fallback answers any unmatched path under the mount, a file that *was* refused reads
   as `index.html` with a 200 rather than a 404. That is not a leak, but it can be confusing in logs.
 """
@@ -168,6 +209,25 @@ instead.
 `mountdir` is normalized: surrounding whitespace and `/` are stripped, so `"static"`, `"/static"`,
 `"static/"` and `"/static/"` are the same mount, and `""`, `"/"` and whitespace all mount at the router
 root.
+
+It is also **validated**, and throws `ArgumentError` at mount time rather than registering a mount
+that cannot work. A segment is refused when it would register as a router pattern (`*`, `**`, or one
+containing `{`/`}`) — the rule that has always applied to filenames, so a mount cannot claim URLs a
+file may not — or when it is not a legal URL path segment (outside RFC 3986 `pchar`). The router
+compares path segments byte for byte and never percent-decodes, so `"my static"` and `"café"` are
+refused while `"my%20static"` and `"caf%C3%A9"` mount and serve: the encoded spelling is the one a
+conforming client sends. A relative dot-segment (`.`, `..`) is refused too, because clients strip it
+before sending.
+
+Note `"café"`, `"a#b"`, `"a|b"` and `"100%"` *were* reachable by a client that sends raw bytes instead
+of encoding them (curl does), so refusing them takes a working mount away from those callers, and the
+encoded spelling is a different byte string that will not answer them. Only a space, a `?` and
+control characters were strictly unmatchable.
+
+Returns `Vector{Pair{String,String}}` — `route => filepath` for everything it registered, in
+registration order. An `index.html` contributes two pairs naming the *same* file: its own route and
+the bare directory route (`/docs/index.html` also registers `/docs`, and a top-level one registers
+`/`). Use `first.(result)` for the routes alone.
 
 Which files are servable — and the `include_hidden` / `allow_symlink_escape` opt-outs — is described
 in [`staticfiles`](@ref); the same rules apply here. They are evaluated **once, at mount time**: this

@@ -198,8 +198,9 @@ Note this changes no URL that a *reachable* mount already served. HTTP.jl's `reg
 request path both split on `/` with `keepempty=false`, so every slash-only spelling —
 `/static//app.js` versus `/static/app.js`, `""` versus `"/"` — was already the same router node.
 
-Three things do change, and none of them forces an app edit, which is why there is no
-`UPGRADING.md` entry.
+Three things changed **in #93/#94**, and none of them forced an app edit, which is why that pair
+carried no `UPGRADING.md` entry. (The later validation rule below does force one — see
+*Segments are validated, not only canonicalized*.)
 
 1. **The strings `mountfolder` and the three mount functions return.** A root mount's bare route is
    now `"/"` rather than `""`, and no returned route carries a doubled separator.
@@ -214,6 +215,90 @@ Three things do change, and none of them forces an app edit, which is why there 
    404, while that file becomes reachable at its own path. A URL on a reachable mount does change —
    but only one that was serving the wrong file, which is a shape no app can have intended, and the
    file it was serving is still available at the route it should always have had.
+
+### Segments are validated, not only canonicalized
+
+Canonicalization alone left `mountdir` exempt from the rule `mountable_files` has always applied to
+filenames — *a mount may not claim URLs other than its own*. `staticfiles(dir, "*")` registered
+`/*/<file>` and a bare `/*`, so `GET /anything` was answered by the mount. `**` and `{id}` threw at
+registration; `*` came up clean, which is what made it worth closing
+([#101](https://github.com/PingoLee/Nitro.jl/issues/101)). `mount_segments` now refuses a segment on
+three grounds, in this order:
+
+1. **It would register as a router pattern** — `*`, `**`, or a segment containing `{`/`}`. Checked
+   first because `*` is a perfectly legal `pchar`, so the encoding test below would wave it through
+   and, for a brace, would report the wrong cause.
+2. **It is a relative dot-segment** — `.` or `..`. `.` is `unreserved`, so the encoding test also
+   passes it, and RFC 3986 §5.2.4 dot-segment removal happens *in the client*: nothing that would
+   match `/../x` is ever sent.
+3. **It could not appear in a URL path unencoded** — anything outside RFC 3986 `pchar`
+   (`unreserved / pct-encoded / sub-delims / ":" / "@"`).
+
+Rule 3 is the one that changes the accepted behavior recorded in item 2 above. That item stands for
+*surrounding* whitespace, which is stripped and was never part of the segment; an **interior** one
+(`"my static"`) was accepted, unreachable, and silent — the mount registered, reported its routes,
+and served nothing.
+
+**Rule 3's cost is not uniform, and the honest version matters.** Driving HTTP.jl 2.4 over a socket
+with hand-written request lines splits the refused set in two:
+
+| Registered segment | Raw request | Result |
+|---|---|---|
+| `my static` | `/my static/x.txt` | 400 — a space cannot appear in a request line |
+| `a?b` | `/a?b/x.txt` | 404 — the query is split off before matching |
+| `café`, `a#b`, `a\|b`, `a[b]`, `a^b` | raw bytes | **200 — these were working mounts** |
+
+So only space, `?` and control characters were *strictly* dead. The rest were reachable by any client
+that sends raw bytes rather than percent-encoding — `curl` by default — and refusing them genuinely
+takes that away. Nor is the encoded spelling a transparent migration: `caf%C3%A9` and raw `café` are
+different byte strings, and matching is a byte comparison (the same fact the no-re-encoding rule above
+depends on), so the encoded route does not answer the raw client.
+
+The trade is still worth making — `mountdir` is judged by the same rule as a filename, and a prefix no
+browser can reach is a footgun whatever a hand-rolled client can do with it — but it is a capability
+change, not just a dead-mount cleanup, and `UPGRADING.md`'s #101 entry says so.
+
+**Validated, never re-encoded.** A percent triplet is checked for well-formedness and passed through
+byte for byte. HTTP.jl matches path segments with a byte comparison rather than an RFC 3986
+equivalence test, so case-normalizing `"%2f"` to `"%2F"`, or decoding unreserved triplets, would stop
+matching the client that sends the other spelling.
+
+`mountdir` is app-authored — a single value with an obvious correction — so it throws. Filenames keep
+the softer treatment: they arrive in bulk from the filesystem, `mountable_files` skips rather than
+throws, and refusing one would silently drop a file from a mount that serves it today. That
+asymmetry is deliberate and is tracked separately.
+
+### A route name does not identify what produced it
+
+`mountfolder` returns `route => filepath` pairs, and the three mount functions return them through.
+The reason is that the route half is *ambiguous by construction*: an `index.html` contributes two
+routes naming the same file — its own and the bare directory route — so `/<prefix>/index.html` is
+the direct route of `<folder>/index.html` and equally the bare route of
+`<folder>/index.html/index.html`.
+
+`spafiles` used to gate its history-mode fallback on `index_route in mounted`, then re-derive the
+file with `joinpath(folder, "index.html")`. The two halves could disagree, and for a directory named
+`index.html` they did: the name matched while the path was a directory, so the fallback was
+registered against it and every unmatched request 500'd on `read(::dir)`
+([#94](https://github.com/PingoLee/Nitro.jl/issues/94)). That was closed by adding `isfile` as a
+second conjunct — a filesystem check that follows symlinks, reaching back past the enumeration rules
+this layer exists to own, and correct only for as long as nobody simplified it.
+
+Identifying the index by **file** removes the ambiguity instead of outvoting it
+([#102](https://github.com/PingoLee/Nitro.jl/issues/102)). A directory is never a `mountable_files`
+result, so no pair can name one; the `isfile` conjunct and its `stat` are gone. The escaping-symlink
+case is the clearest illustration: there `isfile(joinpath(folder, "index.html"))` is *true* — it
+resolves to a real file outside the mount — so only the route-name conjunct kept the catch-all from
+serving it on every unmatched path. Under the file lookup the enumerator already refused it, so no
+pair carries that path and the fallback simply cannot be registered.
+
+This makes `mountable_files`' un-normalized return an actual contract: it yields `joinpath(dir, name)`
+verbatim, never `realpath`/`abspath`/`normpath`, so `joinpath(root, rel)` is a valid key into it.
+Normalizing there would silently drop every SPA fallback. Both the contract and the aliasing are
+pinned in `test/staticfiles_security_tests.jl`.
+
+The fallback route (`/<prefix>/**`) is registered but is **not** in the returned vector — it is a
+catch-all, not a mounted file, and has no filepath to pair with.
 
 ## 9. See also
 
