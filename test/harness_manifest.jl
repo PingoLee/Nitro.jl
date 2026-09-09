@@ -94,6 +94,7 @@ const TEST_FILES = [
     "middleware/cors_middleware_tests.jl",
     "middleware/lifecycle_middleware_tests.jl",
     "middleware/access_log_tests.jl",
+    "middleware/csrf_middleware_tests.jl",
     "middleware/session_middleware_tests.jl",
     "middleware/shared_response_mutation_tests.jl",
     "middleware/guards_tests.jl",
@@ -121,10 +122,11 @@ const UNLISTED_OK = String[]
 # `test/harness_tests.jl` asserts this set matches the tags actually in use, in BOTH
 # directions: a tag used but undocumented, and a tag documented but unused, are each a
 # defect. The second direction is what stops a speculative tag being added here for a
-# subsystem that has no test item to carry it -- which is why `:csrf` is absent (#118).
+# subsystem that has no test item to carry it -- `:csrf` was absent for exactly that reason
+# until `middleware/csrf_middleware_tests.jl` arrived to carry it (#118).
 const KNOWN_TAGS = Set([
     :core, :middleware, :network, :slow, :extension, :security,
-    :handler, :auth, :pormg, :scenario, :aqua, :workers,
+    :handler, :auth, :pormg, :scenario, :aqua, :workers, :csrf,
 ])
 
 # ── Discovery -- deliberately mirrors ReTestItems ─────────────────────────────────────

@@ -54,8 +54,8 @@ julia> using ReTestItems, Nitro
 julia> runtests("test/setup_tests.jl", "test/middleware/guards_tests.jl")
 ```
 
-**Available tags:** `:core`, `:middleware`, `:auth`, `:security`, `:handler`, `:extension`,
-`:pormg`, `:network`, `:scenario`, `:slow`, `:aqua`, `:workers`.
+**Available tags:** `:core`, `:middleware`, `:auth`, `:security`, `:csrf`, `:handler`,
+`:extension`, `:pormg`, `:network`, `:scenario`, `:slow`, `:aqua`, `:workers`.
 
 That list is prose; the machine-checked copy is `KNOWN_TAGS` in `test/harness_manifest.jl`, and
 `test/harness_tests.jl` asserts it matches the tags actually in use **in both directions**. An
