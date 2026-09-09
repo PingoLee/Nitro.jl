@@ -79,7 +79,7 @@ function get_product(req::HTTP.Request, id::Int)
     query = appM.Product.objects
     query.filter("id" => id)
     result = list(query)
-    isempty(result) && return Res.status(404, "not found")
+    isempty(result) && return Res.json(Dict("error" => "not found"); status=404)
     return Res.json(first(result))
 end
 
@@ -106,7 +106,7 @@ function multiply(req::HTTP.Request, a::Float64, b::Float64)
 end
 
 function divide(req::HTTP.Request, a::Float64, b::Float64)
-    a == 0 && return Res.status(400, "divisor cannot be zero")
+    a == 0 && return Res.json(Dict("error" => "divisor cannot be zero"); status=400)
     return Res.json(a / b)
 end
 
@@ -126,7 +126,7 @@ using Nitro
 import .MathHandlers
 import .ProductHandlers
 
-const urlpatterns = [
+const routes = [
     path("/api/math/multiply/<float:a>/<float:b>", MathHandlers.multiply, method="GET"),
     path("/api/math/divide/<float:a>/<float:b>",   MathHandlers.divide,   method="GET"),
 
@@ -167,14 +167,18 @@ using Nitro
 include("Routes/math_routes.jl")
 include("Routes/product_routes.jl")
 
-const urlpatterns = [
-    include_routes("/api/math",    math_routes),
+const routes = vcat(
+    include_routes("/api/math",     math_routes),
     include_routes("/api/products", product_routes),
-]
+)
 ```
 
 The prefix passed to `include_routes` is prepended to every path in the included list,
 so `/multiply/<float:a>/<float:b>` becomes `/api/math/multiply/<float:a>/<float:b>`.
+
+`include_routes` returns a `Vector{RouteDefinition}`, not a single route, so compose several
+groups with `vcat` — nesting them in a plain `[...]` would build a vector of vectors, which
+`urlpatterns()` does not accept.
 
 ---
 
@@ -188,11 +192,12 @@ include("Handlers/ProductHandlers.jl")
 include("Handlers/OrderHandlers.jl")
 include("Routes.jl")
 
-serve(urlpatterns, middleware=[SessionMiddleware, RateLimiter])
+urlpatterns("", routes)                                   # register first — prefix, then routes
+serve(middleware=[SessionMiddleware(), RateLimiter()])    # then start
 ```
 
-`serve()` accepts the `urlpatterns` vector and any global middleware. Global
-middleware runs before every route, regardless of which handler it targets.
+`urlpatterns()` registers the routes; [`serve`](@ref) is **keyword-only** and takes the global
+middleware. Global middleware runs before every route, regardless of which handler it targets.
 
 ---
 
@@ -210,7 +215,7 @@ global middleware → route middleware → handler
 ### Global middleware
 
 ```julia
-serve(urlpatterns, middleware=[SessionMiddleware, RateLimiter])
+serve(middleware=[SessionMiddleware(), RateLimiter()])
 ```
 
 ### Route-level middleware
@@ -218,7 +223,7 @@ serve(urlpatterns, middleware=[SessionMiddleware, RateLimiter])
 Apply middleware to individual routes by passing a `middleware=` vector to `path()`.
 
 ```julia
-const urlpatterns = [
+const routes = [
     # public — no extra middleware
     path("/api/products", ProductHandlers.list_products, method="GET"),
 

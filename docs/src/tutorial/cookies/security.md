@@ -77,7 +77,7 @@ function HSTSMiddleware(handle)
     end
 end
 
-serve(urlpatterns, middleware=[
+serve(middleware=[
     HSTSMiddleware,
     SessionMiddleware(secure=true),
 ])
