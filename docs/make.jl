@@ -32,6 +32,7 @@ makedocs(
                 "tutorial/cookies/sessions.md"
             ],  
             "tutorial/bigger_applications.md",
+            "tutorial/extension_points.md",
         ]
     ]
 )

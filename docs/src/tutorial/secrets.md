@@ -32,7 +32,7 @@ urlpatterns("",
 # 3. Pass the secret to the components that need it.
 #    SessionMiddleware must stay OUTSIDE CSRFMiddleware: CSRF tokens are bound to the
 #    session id, and without one the CSRF gate fails closed.
-serve(urlpatterns, middleware=[
+serve(middleware=[
     SessionMiddleware(),
     CSRFMiddleware(SECRET_KEY),
 ])

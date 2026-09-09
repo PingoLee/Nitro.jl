@@ -59,7 +59,7 @@ urlpatterns("/api",
     path("/logout", logout_handler, method="POST"),
 )
 
-serve(urlpatterns, middleware=[
+serve(middleware=[
     SessionMiddleware(store=store, max_age=3600, secure=false),
 ])
 ```
@@ -117,7 +117,7 @@ For local development:
 ```julia
 store = Nitro.Types.MemoryStore{String, Dict{String,Any}}()
 
-serve(urlpatterns, middleware=[
+serve(middleware=[
     SessionMiddleware(store=store, secure=false),
 ])
 ```
@@ -134,7 +134,7 @@ PormG.Configuration.load("db")
 
 store = pormg_nitro_session(db_key="db")
 
-serve(urlpatterns, middleware=[
+serve(middleware=[
     SessionMiddleware(store=store, max_age=3600, secure=true),
 ])
 ```

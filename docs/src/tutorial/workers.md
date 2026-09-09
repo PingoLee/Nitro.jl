@@ -41,7 +41,7 @@ function start_report(req::HTTP.Request)
         return Dict("report_id" => 42, "status" => "ready")
     end, Owner("user-1"))
 
-    return Res.status(202, Res.json(Dict("task_id" => task_id)))
+    return Res.json(Dict("task_id" => task_id); status=202)
 end
 ```
 
@@ -106,7 +106,7 @@ function create_report(req::HTTP.Request)
         return Dict("report_id" => report_id, "status" => "ready")
     end, Owner("user-1"))
 
-    return Res.status(202, Res.json(Dict("task_id" => task_id)))
+    return Res.json(Dict("task_id" => task_id); status=202)
 end
 
 function report_status(req::HTTP.Request)

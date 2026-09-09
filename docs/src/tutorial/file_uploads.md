@@ -72,7 +72,7 @@ function upload_mixed(req)
 
     # Single file field
     doc = get(parts, "document", nothing)         # => FormFile or nothing
-    isnothing(doc) && return Res.status(400, "document field is required")
+    isnothing(doc) && return Res.json(Dict("error" => "document field is required"); status=400)
 
     # Multiple files under the same field name
     attachments = get(parts, "attachments", FormFile[])

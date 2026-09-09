@@ -68,7 +68,7 @@ urlpatterns("/api",
 )
 
 # 5. Serve
-serve(urlpatterns, middleware=[
+serve(middleware=[
     SessionMiddleware(store=store, cookie_name="nitro_sess", secure=false, samesite="Lax"),
 ])
 ```
@@ -438,7 +438,7 @@ For cookie-authenticated browsers, load the CSRF secret from the environment and
 csrf_secret = get(ENV, "CSRF_SECRET", nothing)
 isnothing(csrf_secret) && error("CSRF_SECRET must be set")
 
-serve(urlpatterns, middleware=[
+serve(middleware=[
     SessionMiddleware(),                  # must be OUTSIDE CSRFMiddleware
     CSRFMiddleware(csrf_secret),
 ])
