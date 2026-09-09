@@ -48,6 +48,44 @@ end
     @test ca != cb                                      # …and B does NOT receive A's session id
     @test isempty(SHARED.headers)                       # the shared const carries no Set-Cookie of its own
 end
+
+@testset "CSRFMiddleware does not leak a Set-Cookie onto a shared const" begin
+    # CSRF issues its cookie on more paths than "safe method, no cookie": it re-issues whenever
+    # the presented cookie would not verify under the current session. Every one of those paths
+    # sits INSIDE the documented pipeline position of an auth middleware that returns a shared
+    # `const` rejection, so each has to own the headers first.
+    @test isempty(SHARED.headers)
+    store = MemoryStore{String, Dict{String,Any}}()
+    wrapped = SessionMiddleware(cookie_name="sid", max_age=3600, store=store, prune_probability=0.0)(
+        CSRFMiddleware("shared-const-secret")(req -> SHARED))
+
+    csrf_cookie(resp) = begin
+        hs = filter(h -> lowercase(h.first) == "set-cookie" && startswith(h.second, "__Host-csrf_token="),
+                    resp.headers)
+        isempty(hs) ? nothing : hs[1].second
+    end
+
+    respA = wrapped(HTTP.Request("GET", "/protected"))
+    respB = wrapped(HTTP.Request("GET", "/protected"))
+
+    @test respA.status == 401 && respB.status == 401
+    @test respA !== SHARED && respB !== SHARED
+    ta, tb = csrf_cookie(respA), csrf_cookie(respB)
+    @test ta !== nothing && tb !== nothing
+    @test ta != tb                                      # B does NOT receive A's CSRF token
+    @test isempty(SHARED.headers)                       # nothing was written to the shared const
+
+    # The stale-token re-issue path, which is the one this change widened.
+    # Pick the `sid` header by name: the response now carries two Set-Cookie headers, and the
+    # CSRF one is emitted first (the inner layer runs first on the way out).
+    sid_line = only(filter(h -> lowercase(h.first) == "set-cookie" && startswith(h.second, "sid="),
+                           respA.headers)).second
+    sid = match(r"sid=([^;]+)", sid_line).captures[1]
+    stale = HTTP.Request("GET", "/protected", ["Cookie" => "sid=$sid; __Host-csrf_token=bogus.sig"])
+    respC = wrapped(stale)
+    @test csrf_cookie(respC) !== nothing
+    @test isempty(SHARED.headers)
+end
 end
 
 @testitem "Header-adding middleware preserves non-header response fields" tags=[:middleware] setup=[NitroCommon] begin

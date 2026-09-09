@@ -171,13 +171,16 @@ CookieAuthMiddleware(validate_token::Function;
                      cookie_name = "auth_token",
                      secret_key  = nothing)
 
-CSRFMiddleware(secret::String;
-               cookie_name = "csrf_token",
+CSRFMiddleware(secret::String;                      # needs SessionMiddleware OUTSIDE it
+               cookie_name = "__Host-csrf_token",   # prefix => Secure + Path=/ + no Domain
                header_name = "X-CSRF-Token",
                form_field  = "_csrf",
                ttl::Int    = 3600,
                config      = CookieConfig(httponly=false, secure=true,
                                           samesite="Lax", path="/", maxage=ttl))
+# Tokens are HMAC'd over (raw_token | req.context[:session_id]). No session id => no token
+# issued and 403 on every unsafe method. Throws ArgumentError if a __Host-/__Secure- name is
+# paired with a config browsers would reject.
 
 SessionMiddleware(; cookie_name      = "nitro_session",
                     secret_key       = nothing,

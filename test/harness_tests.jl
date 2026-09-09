@@ -71,9 +71,8 @@ end
 
     # A documented tag nobody applies: `--tags <it>` then fails for every caller while the
     # vocabulary this file guards claims it exists. This is the direction that would have
-    # caught `:workers` before it was applied, and the reason `:csrf` is not in KNOWN_TAGS
-    # -- there is no CSRF test item to carry it, which is #118 rather than something to
-    # paper over here.
+    # caught `:workers` before it was applied, and the direction that kept `:csrf` out of
+    # KNOWN_TAGS until `middleware/csrf_middleware_tests.jl` existed to carry it (#118).
     @test setdiff(KNOWN_TAGS, used) == Set{Symbol}()
 
     # An untagged item is invisible to every filtered run, including `--tags core`.

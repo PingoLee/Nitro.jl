@@ -439,9 +439,53 @@ csrf_secret = get(ENV, "CSRF_SECRET", nothing)
 isnothing(csrf_secret) && error("CSRF_SECRET must be set")
 
 serve(urlpatterns, middleware=[
-    CSRFMiddleware(csrf_secret; config=CookieConfig(httponly=false, secure=true, samesite="Lax")),
+    SessionMiddleware(),                  # must be OUTSIDE CSRFMiddleware
+    CSRFMiddleware(csrf_secret),
 ])
 ```
 
 The middleware uses a signed double-submit cookie. Safe requests receive a CSRF cookie
-automatically; unsafe requests must echo the token in the `X-CSRF-Token` header.
+automatically; unsafe requests must echo the token in the `X-CSRF-Token` header, in a `_csrf`
+form field, or in a `_csrf` JSON body key.
+
+**`SessionMiddleware` must sit outside `CSRFMiddleware`.** The token's signature covers the
+session id as well as the random token value, so a token minted for one visitor does not
+validate for another. That binding is read from `req.context[:session_id]`, which only exists
+once `SessionMiddleware` has run. With no session available Nitro **fails closed**: it issues
+no token and rejects every unsafe request with `403`, after logging a warning naming this
+ordering rule. It does not silently fall back to an unbound token.
+
+The cookie is named `__Host-csrf_token` by default. The `__Host-` prefix is what stops a sibling
+subdomain from overwriting it — without it, an attacker who can write cookies for your domain can
+plant their own validly-signed token as the victim's. Browsers only accept the prefix on a
+`Secure`, `Path=/`, `Domain`-less cookie, so `CSRFMiddleware` throws an `ArgumentError` at
+construction if the config would violate that, rather than letting the browser discard the cookie
+in silence. Serving over plain HTTP in development? Pass a plain name:
+
+```julia
+CSRFMiddleware(csrf_secret;
+    cookie_name = "csrf_token",
+    config = CookieConfig(httponly=false, secure=false, samesite="Lax", path="/"))
+```
+
+Because the cookie is deliberately readable by JavaScript, only the *HMAC* of the session id
+travels in it — never the session id itself.
+
+A session rotation invalidates the token bound to the old session, so the middleware re-issues
+whenever the presented cookie would not verify under the current session. A handler that calls
+`regenerate_session!` gets a fresh, usable CSRF cookie in the same response.
+
+`SessionMiddleware`'s own `rotate_on_auth` is the awkward case: it rotates *after* `CSRFMiddleware`
+has returned, so the login response cannot carry the replacement and the client's token is orphaned
+the moment it lands. The next mutation is therefore refused — but that `403` carries a fresh, valid
+token, so the client retries once and continues. Without that, an SPA that only ever issues unsafe
+requests after login would never see a safe response and would stay locked out.
+
+That re-issue gives nothing away: the token is bound to the *requester's own* session and travels
+in the *requester's own* response, so it is exactly what a `GET` would have handed them. What keeps
+it from being used to churn someone else's token is the cookie configuration — `__Host-` means an
+attacker cannot plant a CSRF cookie in a victim's browser, and `SameSite=Lax` means a cross-site
+unsafe request does not carry the CSRF cookie at all, so the request is refused with no token
+attached. If you opt out of **both** (an unprefixed `cookie_name` *and* `samesite="None"`, which a
+cross-origin SPA needs), an attacker with a cookie-write position on a sibling origin can force a
+victim's CSRF token to rotate — a nuisance rather than a bypass, but weigh it before opting out.

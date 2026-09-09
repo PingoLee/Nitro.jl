@@ -65,7 +65,7 @@ routes = [
     path("/api/products",            ProductHandlers.list_products,  method="GET"),
     path("/api/products/<int:id>",   ProductHandlers.get_product,    method="GET", name="product-detail"),
     path("/api/products",            ProductHandlers.create_product, method="POST",
-         middleware=[CSRFMiddleware(SECRET)]),
+         middleware=[GuardMiddleware(login_required())]),   # route-scoped middleware
     path("/api/products/<int:id>",   ProductHandlers.update_product, methods=["PUT", "PATCH"]),
 ]
 
@@ -259,7 +259,22 @@ SessionMiddleware(
 Read and write through `req.session`. Call `regenerate_session!(req, store)` on any privilege
 change you perform manually. `CSRFMiddleware(secret)` is required for cookie-authenticated
 mutations; its cookie is deliberately **not** `httponly` so the SPA can read and echo the token in
-the `X-CSRF-Token` header.
+the `X-CSRF-Token` header (or a `_csrf` form field / JSON key).
+
+**`SessionMiddleware` must be outside `CSRFMiddleware`** — global, and listed first. The token's
+HMAC covers the session id from `req.context[:session_id]`, so a token minted for one visitor
+cannot be replayed for another. With no session id present the gate **fails closed**: no token is
+issued and every unsafe request gets `403`, with a warning naming the ordering rule — there is no
+unbound fallback.
+
+**Put `CSRFMiddleware` in the global pipeline, not on a route.** Tokens are minted on *safe*
+responses, so a `CSRFMiddleware` scoped to a `method="POST"` route never issues one and refuses
+every request it sees. Scope guards per route; scope CSRF per app.
+
+The cookie is `__Host-csrf_token` by default, so a sibling subdomain cannot overwrite it. Browsers
+accept that prefix only on a `Secure`, `Path=/`, `Domain`-less cookie, and `CSRFMiddleware` throws
+an `ArgumentError` at construction rather than let the browser discard the cookie silently. For
+plain-HTTP development pass `cookie_name="csrf_token"` with `secure=false`.
 
 ---
 
