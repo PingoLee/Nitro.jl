@@ -110,24 +110,42 @@ end
 end
 
 @testset "CSRF middleware" begin
-    middleware = CSRFMiddleware("csrf-secret"; config=Nitro.CookieConfig(httponly=false, secure=false, samesite="Lax", path="/", maxage=3600))
-    wrapped = middleware(req -> HTTP.Response(200, "ok"))
+    # SessionMiddleware goes OUTSIDE: CSRF tokens are bound to the session id it puts on the
+    # request context, so without it there is nothing to bind to and every mutation is refused.
+    store = Nitro.Types.MemoryStore{String, Dict{String,Any}}()
+    wrapped = SessionMiddleware(cookie_name="csrf_session", store=store, prune_probability=0.0)(
+        CSRFMiddleware("csrf-secret")(req -> HTTP.Response(200, "ok")))
+
+    set_cookies(res) = join([h.second for h in res.headers if lowercase(h.first) == "set-cookie"], "\n")
+    cookie_named(res, name) = String(match(Regex("$(name)=([^;]+)"), set_cookies(res)).captures[1])
 
     get_res = wrapped(HTTP.Request("GET", "/form"))
-    cookie_header = HTTP.header(get_res, "Set-Cookie")
-    cookie_value = match(r"csrf_token=([^;]+)", cookie_header).captures[1]
+    session_id = cookie_named(get_res, "csrf_session")
+    cookie_value = cookie_named(get_res, "__Host-csrf_token")
     raw_token = split(cookie_value, ".", limit=2)[1]
+    jar = "csrf_session=$session_id; __Host-csrf_token=$cookie_value"
 
     post_req = HTTP.Request("POST", "/form", [
-        "Cookie" => "csrf_token=$cookie_value",
+        "Cookie" => jar,
         "X-CSRF-Token" => raw_token,
     ])
     post_res = wrapped(post_req)
     @test post_res.status == 200
 
-    bad_req = HTTP.Request("POST", "/form", ["Cookie" => "csrf_token=$cookie_value"])
+    bad_req = HTTP.Request("POST", "/form", ["Cookie" => jar])
     bad_res = wrapped(bad_req)
     @test bad_res.status == 403
+
+    # The binding itself. A second visitor gets their own session; replaying the FIRST visitor's
+    # validly-signed cookie and matching header under it must fail. Every assertion above passes
+    # identically against the unbound implementation -- this one is the regression test for #23.
+    other_session = cookie_named(wrapped(HTTP.Request("GET", "/form")), "csrf_session")
+    @test other_session != session_id
+    stolen_req = HTTP.Request("POST", "/form", [
+        "Cookie" => "csrf_session=$other_session; __Host-csrf_token=$cookie_value",
+        "X-CSRF-Token" => raw_token,
+    ])
+    @test wrapped(stolen_req).status == 403
 end
 
 end
