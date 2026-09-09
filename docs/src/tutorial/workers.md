@@ -268,8 +268,32 @@ cancel_task(task_id, Owner("user-1"))
     get_task_status(task_info.id, System())[:status] == "CANCELLED" && return "cancelled"
     ```
 
-    A callback that spawns an external process must kill it itself — see
-    [#49](https://github.com/PingoLee/Nitro.jl/issues/49).
+    **A callback that spawns an external process must kill it itself.** The
+    `InterruptException` reaches the Julia task, never the children it started, so a
+    task that reports `CANCELLED` — or that hit its `timeout` — can leave that process
+    running and still mutating external state, with nothing to tell the operator.
+    Capture the handle and release it on the way out:
+
+    ```julia
+    submit_task("convert", task_info -> begin
+        p = run(`ffmpeg -i input.mov output.mp4`; wait = false)
+        try
+            wait(p)
+            return "converted"
+        finally
+            if process_running(p)
+                kill(p)       # SIGTERM
+                wait(p)       # kill() is asynchronous — without this the child
+            end               # may outlive the callback that spawned it
+        end
+    end, Owner("user-1"))
+    ```
+
+    The `finally` runs as the interrupt unwinds the callback, which is the last moment
+    the child is still reachable. `kill(p)` only *sends* the signal, so the `wait(p)`
+    after it is what actually reaps the process; escalate with `kill(p, 9)` for a child
+    that ignores `SIGTERM`. The same applies to any OS resource the callback owns — a
+    file lock, a socket, a temp directory.
 
 Tasks can also retry on failure by passing `TaskOptions`.
 
