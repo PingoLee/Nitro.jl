@@ -44,6 +44,48 @@ end
     end
 end
 
+@testset "Sequential callbacks defined after the processor spawned still run (#86)" begin
+    store = InMemoryWorkerStore()
+    auth = Owner("user-a")
+
+    try
+        # Defined BEFORE the processor spawns, so it is inside the processor's frozen world.
+        @eval mixed_cb() = "zero-arg (old)"
+
+        # The FIRST sequential submit spawns the queue processor, freezing its world age.
+        first_id = submit_sequential_task("wq86", "first", () -> "first", auth; store=store)
+        @test wait_for(() -> get_task_status(first_id, auth; store=store)[:status] == "COMPLETED") == :ok
+
+        # `@eval` is the whole point of this test: it defines methods at a world age LATER than
+        # the processor's. A closure literal written here would not -- it is compiled with the
+        # rest of this block, so it predates the processor and cannot reproduce #86. That is
+        # exactly why "Sequential queues preserve order" (one shared closure in a loop) missed it.
+        @eval late_one_arg(task_info) = "late one-arg"
+        @eval late_zero_arg() = "late zero-arg"
+
+        second_id = submit_sequential_task("wq86", "second", late_one_arg, auth; store=store)
+        @test wait_for(() -> get_task_status(second_id, auth; store=store)[:status] == "COMPLETED") == :ok
+        @test get_task_status(second_id, auth; store=store)[:result] == "late one-arg"
+
+        third_id = submit_sequential_task("wq86", "third", late_zero_arg, auth; store=store)
+        @test wait_for(() -> get_task_status(third_id, auth; store=store)[:status] == "COMPLETED") == :ok
+        @test get_task_status(third_id, auth; store=store)[:result] == "late zero-arg"
+
+        # The sharper half of #86: not just "throws for a method that exists", but SILENTLY
+        # CALLS THE WRONG ARITY. `mixed_cb` has a zero-arg method from before the processor
+        # spawned; the one-arg method arrives after. A world-age-frozen `applicable` cannot see
+        # the newer method, falls through to the zero-arg branch, and runs the callback WITHOUT
+        # its task_info -- no error, wrong behaviour. This is what Revise adding a parameter to
+        # a live callback looks like.
+        @eval mixed_cb(task_info) = "one-arg (new)"
+        fourth_id = submit_sequential_task("wq86", "fourth", mixed_cb, auth; store=store)
+        @test wait_for(() -> get_task_status(fourth_id, auth; store=store)[:status] == "COMPLETED") == :ok
+        @test get_task_status(fourth_id, auth; store=store)[:result] == "one-arg (new)"
+    finally
+        reset_store!(store)
+    end
+end
+
 @testset "Sequential queues preserve order" begin
     store = InMemoryWorkerStore()
     observed = String[]
