@@ -34,17 +34,19 @@ every consuming app. This file is that rollout checklist.
 
 ---
 
-## Unreleased — next `0.3.0`
+## Unreleased — next `0.4.0`
 
 _Changes merged but not yet cut into a release. A consumer dev'ing Nitro at HEAD is running these,
 and `Nitro.upgrade_guide` surfaces them by default. When the maintainer next rolls changes into a
-consuming app, `nitro-cut-release` stamps every entry below with `0.3.0`, dates them, and tags it._
+consuming app, `nitro-cut-release` stamps every entry below with `0.4.0`, dates them, and tags it._
 
 ---
 
+## 0.3.0 — 2026-09-09
+
 ## CSRF tokens are bound to the session and the cookie is renamed `__Host-csrf_token` (#23)
 
-- **Version**: Unreleased
+- **Version**: 0.3.0
 - **Nitro ref**: #23; `src/middleware/csrf_middleware.jl`, `docs/src/tutorial/sessions_and_auth.md`
 - **Recorded**: 2026-09-08
 - **Severity**: **breaking (pipeline order, cookie name, token format)** — a security fix; part of
@@ -133,7 +135,7 @@ document.cookie.match(/__Host-csrf_token=([^;]+)/)[1]
 
 ## `staticfiles`, `spafiles` and `dynamicfiles` return `route => filepath` pairs (#102)
 
-- **Version**: Unreleased
+- **Version**: 0.3.0
 - **Nitro ref**: #102; `src/utilities/fileutil.jl`, `src/core.jl`, `src/methods.jl`
 - **Recorded**: 2026-09-07
 - **Severity**: **breaking (return type)** — affects apps that use the value a mount returns.
@@ -207,7 +209,7 @@ end
 
 ## `mountdir` is validated as a URL path prefix, so some mounts now throw at startup (#101)
 
-- **Version**: Unreleased
+- **Version**: 0.3.0
 - **Nitro ref**: #101; `src/utilities/fileutil.jl`, `src/methods.jl`
 - **Recorded**: 2026-09-07
 - **Severity**: **breaking (throws at mount time)** — affects apps whose `mountdir` was a wildcard,
@@ -324,7 +326,7 @@ drop a file from a mount that serves it today.
 
 ## `AbstractWorkerStore` gains three atomic write methods; `set_task!` no longer writes watchers (#88)
 
-- **Version**: Unreleased
+- **Version**: 0.3.0
 - **Nitro ref**: #88; `src/Workers/registry.jl`, `src/Workers/api.jl`, `ext/NitroPormGExt.jl`
 - **Recorded**: 2026-09-06
 - **Severity**: **breaking for custom `AbstractWorkerStore` implementations only.** Apps
@@ -431,7 +433,7 @@ Operational notes:
 
 ## `is_task_running` is removed; `get_queue_status` is admin-only (#87)
 
-- **Version**: Unreleased
+- **Version**: 0.3.0
 - **Nitro ref**: #87; `src/Workers/api.jl`, `src/Workers.jl`
 - **Recorded**: 2026-09-06
 - **Severity**: **breaking (one removal, one signature)** — security fix. Builds on #48.
@@ -502,7 +504,7 @@ Operational notes:
 
 ## Worker read/manage APIs require an explicit `TaskAuthority` (#48)
 
-- **Version**: Unreleased
+- **Version**: 0.3.0
 - **Nitro ref**: #48; `src/Workers/types.jl`, `src/Workers/api.jl`, `src/Workers/registry.jl`,
   `src/Workers.jl`, `ext/NitroPormGExt.jl`
 - **Recorded**: 2026-09-06
@@ -602,7 +604,7 @@ Operational notes:
 
 ## `req.query`, `req.params` and `headers(req)` are cached per request, so they are live handles (#38)
 
-- **Version**: Unreleased
+- **Version**: 0.3.0
 - **Nitro ref**: #38; `src/types.jl`, `src/core.jl`
 - **Recorded**: 2026-09-05
 - **Severity**: **behavior** — a mutation that used to be silently discarded now persists.
@@ -718,7 +720,7 @@ existed.
 
 ## The `PormG` pin moves to `^0.5`, which is a breaking PormG release (#PormG 0.5.0)
 
-- **Version**: Unreleased
+- **Version**: 0.3.0
 - **Nitro ref**: `Project.toml` (`[compat]`); `ext/NitroPormGExt.jl` (unchanged)
 - **Recorded**: 2026-09-05
 - **Severity**: **breaking for the app, not for Nitro** — Nitro's own PormG surface needs no edit,
@@ -777,7 +779,7 @@ only loads when you load PormG yourself.
 
 ## `internalrequest`'s `catch_errors`/`serialize` are no longer ignored on a warm route (#79)
 
-- **Version**: Unreleased
+- **Version**: 0.3.0
 - **Nitro ref**: #79; `src/routerhof.jl`, `src/core.jl`, `src/types.jl`
 - **Recorded**: 2026-09-01
 - **Severity**: **behavior (a call that returned a `500` now throws)** — bug fix.
@@ -858,7 +860,7 @@ share a key space.
 
 ## Lifecycle hook order is now specified: registration order in, LIFO out (#74)
 
-- **Version**: Unreleased
+- **Version**: 0.3.0
 - **Nitro ref**: #74; `src/context.jl`, `src/core.jl`, `src/routerhof.jl`
 - **Recorded**: 2026-09-01
 - **Severity**: **breaking (two `Service` fields change container type) plus behavior (a
@@ -948,7 +950,7 @@ order is LIFO rather than FIFO.
 
 ## `Service.lifecycle_middleware` splits by owner; route-level startup hooks survive a restart (#82)
 
-- **Version**: Unreleased
+- **Version**: 0.3.0
 - **Nitro ref**: #82; `src/context.jl`, `src/core.jl`, `src/routerhof.jl`,
   `src/middleware/rate_limiter.jl`
 - **Recorded**: 2026-08-31
@@ -1042,7 +1044,7 @@ end
 
 ## Percent-decoding now happens once, at the boundary — query, `Path{T}`, and cookie values change (#70)
 
-- **Version**: Unreleased
+- **Version**: 0.3.0
 - **Nitro ref**: #70; `src/types.jl`, `src/core.jl`, `src/utilities/misc.jl`, `src/extractors.jl`,
   `ext/TimeZonesExt.jl`
 - **Recorded**: 2026-08-30
