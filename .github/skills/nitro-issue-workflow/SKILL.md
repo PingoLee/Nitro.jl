@@ -141,7 +141,8 @@ git branch -m fix/<N>-<slug>            # EnterWorktree produces branch `worktre
   without it — every Pkg operation dies with `expected package PormG [7d8d7541] to exist at path …`.
 - **The rename is not cosmetic**, and **the name must stay flat and dash-only**.
 - **`origin/<default-branch>` is the default, not a guarantee** — confirm with `git log --oneline -1`.
-- **One suite at a time** — `:network` items bind real sockets on fixed ports.
+- **One suite at a time** — `:network` items bind real sockets and contend for machine resources.
+  (Not fixed ports: every binding test calls `get_free_port()`.)
 - **Stage explicit paths, never `git add -A`.**
 
 Why each of those, with the failure it prevents: [`reference.md`](reference.md) §B.
@@ -208,7 +209,7 @@ the full suite, ask which of these your diff could reach:
 |---|---|
 | `test/aqua_tests.jl` | export a name with no definition, or add a `Project.toml` dep without a `[compat]` entry (also stale deps, piracy) |
 | `test/reexports_tests.jl` | change what Nitro re-exports from HTTP.jl |
-| `test/http_internals_contract_tests.jl` | touch `src/core.jl`'s `getproperty` overrides or the body hierarchy in `src/utilities/bodyparsers.jl`, or move the `HTTP = "~2.4"` pin |
+| `test/http_internals_contract_tests.jl` | touch `src/core.jl`'s `getproperty` overrides or the body hierarchy in `src/utilities/bodyparsers.jl`, or move the `HTTP = "~2.6"` pin |
 | `test/upgrade_guide_tests.jl` | **add or edit an `UPGRADING.md` entry** — two of its testsets parse the *shipped* file |
 | `test/precompilation_test.jl` | change route registration from a downstream package's `__init__()`, or `serve()`/`terminate()` startup |
 | `test/middleware/shared_response_mutation_tests.jl` | change `Cors`, `SessionMiddleware`, or the `*_response_headers` helpers — **not** a net for new middleware |

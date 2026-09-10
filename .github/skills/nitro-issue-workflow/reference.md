@@ -74,9 +74,11 @@ checked out into the "clean" worktree. Confirm with `git log --oneline -1`.
 because this repo is developed on Windows with `core.autocrlf`; a CRLF copy fails in bash with
 `$'\r': command not found`. Never "fix" that pin.
 
-**One suite at a time.** Items tagged `:network` bind real sockets on fixed ports. A suite running in
-the worktree while another runs in the main checkout produces *address already in use* that looks
-like a code bug — see [`nitro-test-troubleshooting`](../nitro-test-troubleshooting/SKILL.md).
+**One suite at a time.** Items tagged `:network` bind real sockets and contend for machine
+resources. Every binding test calls `get_free_port()`, so this is **not** a fixed-port collision —
+that class was removed with #73. What remains is resource contention, plus an orphan from an older
+build still holding a port, which presents as *address already in use* and looks like a code bug —
+see [`nitro-test-troubleshooting`](../nitro-test-troubleshooting/SKILL.md).
 
 **Stage explicit paths, never `git add -A`.** `Manifest.toml` is covered by this repo's `.gitignore`,
 but `.claude/settings.local.json` is **not** — it is ignored only by the maintainer's *global*

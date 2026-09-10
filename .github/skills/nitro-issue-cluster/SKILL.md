@@ -1,6 +1,6 @@
 ---
 name: nitro-issue-cluster
-description: Decide what to work on next and work it as a group — reconcile the project board against the issues, rank the sessions, build a cluster from contended files rather than shared labels, tier it by its worst member, order it by dependency then importance, land one commit and one UPGRADING entry per issue, and close out N issues at once. The selection-and-ordering layer above nitro-issue-workflow.
+description: Work several issues as one group — build a cluster from contended files rather than shared labels, tier it by its worst member, order it by dependency then importance, land one commit and one UPGRADING entry per issue, and close out N issues at once. Sits above nitro-issue-workflow; run nitro-board first to decide which cluster is next.
 ---
 
 # Nitro Issue Cluster
@@ -10,138 +10,43 @@ description: Decide what to work on next and work it as a group — reconcile th
 Use this skill when several open issues would **edit the same code**, and fixing them one at a time
 means the second fix rebases onto a function the first one rewrote.
 
-This skill owns **which cluster runs next, which issues go together, in what order, and what "done"
-means for a group**. It does not restate [`nitro-issue-workflow`](../nitro-issue-workflow/SKILL.md)
-— that skill still owns provenance, isolation, implementation, the verify rungs, review, and the
-approval gates. Read this one to pick and build the group; read that one for every step inside it.
-
-## Use This Skill For
-
-- "What should I pick up next?" — reconciling and re-ranking the board after a batch of new issues
-  (every session spawns follow-ups, so this happens constantly)
-- Two or more open issues whose fixes touch the same file, and ideally the same function
-- A set of issues that turn on **one design decision** made once (a scoping model, a cache protocol)
-- Mopping up the remainder of a subsystem right after a related fix merged
-
-Not for: a single issue (use `nitro-issue-workflow`), filing or closing an issue (use
-`nitro-issue-management`), issues that merely share a label, or a "let's clear the backlog" sweep
-across unrelated subsystems.
-
-## 0. Reconcile and rank the board
-
-The [Nitro project board](https://github.com/users/PingoLee/projects/8) is where the plan lives: its
-**Session** field holds the grouping, and execution order is stamped into each option's description.
-It is the *plan's* home, not the backlog's — the backlog is GitHub Issues, per
-[`nitro-issue-management`](../nitro-issue-management/SKILL.md).
+This skill owns **which issues go together, in what order, and what "done" means for a group**.
+*Which* cluster runs next is [`nitro-board`](../nitro-board/SKILL.md), not this skill. It does not
+restate [`nitro-issue-workflow`](../nitro-issue-workflow/SKILL.md) — that skill still owns
+provenance, isolation, implementation, the verify rungs, review, and the approval gates. Read this
+one to build the group; read that one for every step inside it.
 
 **Batching is the point.** The expensive part of an issue is not the diff — it is loading the
 subsystem, building the repro shape, and getting the review context right. A second issue in the
 same function pays almost none of that, which is why a session closes three issues instead of one.
-Everything below serves that: reconcile so nothing already done gets scheduled, rank so the
-highest-value batch runs first, and write it back so the next session does not recompute it.
+That economics is the whole reason to group: a cluster whose members do not share that cost is
+four solo `nitro-issue-workflow` runs wearing one branch.
 
-### Reconciliation is one-way
+## Use This Skill For
 
-The board may say things the issues do not — that #79 and #81 belong together, that Session 6 runs
-third. It may **not** disagree with the issues about **facts**: whether an issue is open, closed,
-labelled, or superseded. **On any question of fact, GitHub Issues are the source of truth and the
-board is corrected — never the reverse.** Never `gh issue close`, reopen, or relabel to make an issue
-agree with a board cell.
+- Two or more open issues whose fixes touch the same file, and ideally the same function
+- A set of issues that turn on **one design decision** made once (a scoping model, a cache protocol)
+- Mopping up the remainder of a subsystem right after a related fix merged
 
-Always reconcile before planning; a stale board schedules closed and superseded issues at full cost.
+Not for: **"what should I pick up next?", "update the board", or "plan the session" — those are
+[`nitro-board`](../nitro-board/SKILL.md), which answers them and stops.** Also not for: a single
+issue (use `nitro-issue-workflow`), filing or closing an issue (use `nitro-issue-management`),
+issues that merely share a label, or a "let's clear the backlog" sweep across unrelated subsystems.
 
-```bash
-gh api graphql -f query='{ user(login:"PingoLee"){ projectV2(number:8){
-  items(first:99){ nodes{ id content{ ... on Issue { number state } }
-    fieldValues(first:12){ nodes{ ... on ProjectV2ItemFieldSingleSelectValue {
-      name field{ ... on ProjectV2SingleSelectField { name } } } } } } } } } }'
-```
+## 0. Reconcile and rank the board
 
-Then, for every item:
+**Canonical: [`nitro-board`](../nitro-board/SKILL.md).** Reconciling the board against GitHub
+Issues, ranking the sessions, and writing the plan back live there — including the `Session`
+description grammar, the `updateProjectV2Field` replace-the-whole-list footgun, and the rules for
+scheduling parallel Claude sessions. Do not restate any of it here.
 
-| Issue state | Board Status | Action |
-|---|---|---|
-| `CLOSED` | not `Done` | set `Done` |
-| `OPEN` | `Done` | clear it — the issue was reopened, or the wrong item was marked |
-| `OPEN` | `In Progress` you did not set | **leave it.** Another session is working it. A status you did not write is a signal, not an error |
-| `OPEN`, superseded — see [`nitro-issue-management`](../nitro-issue-management/SKILL.md) → *Superseding an open issue* | on any session | take it off the session — a superseded issue is not work; it closes when the superseding change lands |
+Run it **before** §1. A stale board schedules closed and superseded issues at full cost, and §1's
+cluster is only meaningful once the ranking says this is the session that runs next.
 
-Also sweep for open issues that are on no board item at all, and compare against the item numbers
-from the query above:
-
-```bash
-gh issue list --state open --limit 100 --json number -q '.[].number' | sort -n
-```
-
-### Rank the sessions
-
-Group display order on the board is option order, which is numeric. Execution order is not, and
-neither the field nor the item ordering can say "run Session 8 before Session 6" — so rank
-explicitly, in descending priority:
-
-1. **Breaking changes, while the repo is pre-publish.** Cheapest now; every session built on the old
-   shape raises the cost. A session that changes a public signature or a `Service` field outranks
-   one that does not.
-2. **The publish gate.** `gh issue list --state open --label pre-publish` — empty is the gate. Its
-   size is a scheduling input: one issue from empty is worth finishing. This is the one place the
-   label ranks anything; *inside* a session it is a classification, never a promotion (§2).
-3. **The importance ladder's top rung across members** (§2): a session holding a rung-1 or rung-2
-   member — secret exposure, an authorization bypass, silently wrong behavior — outranks one whose
-   members are all loud failures, performance, or docs.
-4. **Leverage** — a session that taxes every other session. A test-harness fix that every
-   `:network` item trips over, or a CI change every PR waits on, ranks above its own severity.
-
-An area label describes the issue, never its blast radius. When you rank a session above where its
-labels would put it, state the override and the reason in the same line — an unexplained override
-reads as an error.
-
-### Write it back
-
-**Authentication.** Board writes need the `project` scope, which the default token does not carry:
-
-```bash
-gh auth status                 # look for 'project' in Token scopes
-gh auth refresh -s project     # interactive browser flow — the USER runs this, not you
-```
-
-**Discover the IDs — never hardcode them.** Project, field, and option IDs are opaque and change
-with the board. Resolve them every run:
-
-```bash
-gh api graphql -f query='{ user(login:"PingoLee"){ projectV2(number:8){ id
-  fields(first:20){ nodes{ ... on ProjectV2SingleSelectField { id name options{ id name color description } } } } } } }'
-```
-
-You want the project `id`, the **Status** field (`Todo` / `In Progress` / `Done`) and the
-**Session** field with its full option list — ids, colors, and descriptions included. You need all
-three per option for the next step.
-
-**Adding a Session option — the footgun.** `updateProjectV2Field` **replaces the entire option
-list**; it does not append. Sending only the new option deletes every existing one and orphans every
-item grouped under them. `ProjectV2SingleSelectFieldOptionInput` accepts an optional `id`, and that
-is what saves you: resend every existing option **with its `id`, `color`, and `description`**, then
-append the new one without an `id`. Matching ids keep items attached and let you rename a group
-safely. Pass it as a file — `-f` cannot express a list of objects:
-
-```bash
-gh api graphql --input payload.json      # {"query": "mutation ... updateProjectV2Field ...", "variables": {...}}
-```
-
-Verify the response lists every pre-existing option with its **original id** before moving on.
-
-**Adding and stamping items.** `gh project item-add 8 --owner PingoLee --url <issue-url>` adds an
-issue; then one `gh project item-edit` per field — Session and Status; the command is in §1. Add
-issues **in the order you want them displayed** — row order is insertion order.
-
-**Encode the rank in each option's description**, because the board cannot express it any other
-way: `RUN 3rd. #A -> #B. #A first: <forced or preferred, and why>.` It surfaces on hover and carries
-the forced-vs-preferred note (§2) with it. Restamp every description when the ranking changes; a
-stale `RUN 1st` is worse than none. Mark finished groups `DONE. #79, #81, #82, #74.` rather than
-deleting them — the history of what shipped together is what makes the next grouping decision easier.
-
-Receipt: board 8's first ten Session options were created with empty descriptions. With six of them
-done or partly done and four untouched, nothing on the board said which ran next, and the ranking had
-to be re-derived from scratch each session.
+**`nitro-board` is also a complete deliverable on its own.** If the request was "what should I pick
+up next?", "update the board", or "plan the session", that skill answers it and **stops** — see its
+§0. Continue into §1 below only when the user has asked to *work* an issue. Their agreeing with a
+ranking is not that request.
 
 ## 1. Build the cluster
 
@@ -204,7 +109,7 @@ sibling PormG board paid seven PRs on one join/CTE namespace before the map was 
 namespaces. Nitro's local instance is the global-router-state class: #34 and the two
 [`nitro-test-troubleshooting`](../nitro-test-troubleshooting/SKILL.md) classes that trace to
 `CONTEXT[]` all point at #31 as the design issue that makes them unrepresentable. A design issue
-ranks by the sum of what it supersedes (§0).
+ranks by the sum of what it supersedes ([`nitro-board`](../nitro-board/SKILL.md) §2).
 
 ### Confirm before starting
 
@@ -221,18 +126,14 @@ scratch next session. Once the user agrees, persist it as a `Session` option on 
 `Session <N>: <Edit Surface>` after the code it contends for, never after the label its members
 share. `Active` marks the session currently being worked.
 
-```bash
-# add the option (§0 — updateProjectV2Field replaces the whole list), then stamp each member
-gh project field-list 8 --owner PingoLee --limit 30      # get the Session field id
-gh project item-edit --id <item-id> --field-id <field-id>   --project-id <project-id> --single-select-option-id <option-id>
-```
+The mechanics — resolving ids, the `updateProjectV2Field` replace-the-whole-list footgun, and the
+`RUN / TIER / FILES / ORDER / WHY` description grammar — are in
+[`nitro-board`](../nitro-board/SKILL.md) §4. Stamp the new option the moment it exists; an option
+with no `RUN nth` is a session nobody can place, and one with no `FILES:` cannot be scheduled
+against a parallel session.
 
-Stamp the new option's description with its rank the moment it exists (§0 → *Write it back*); an
-option with no `RUN nth` is a session nobody can place.
-
-**The board records decisions, not speculation.** An option per agreed cluster; nothing for a
-grouping you merely considered. A member dropped under §4 loses its `Session` value and returns to
-the unassigned pool — leaving it stamped implies work that did not happen.
+A member dropped under §4 loses its `Session` value and returns to the unassigned pool — leaving it
+stamped implies work that did not happen.
 
 ## 2. Tier, then order
 
@@ -283,7 +184,8 @@ catch it — an unpinned dependency with `contents:write` in scope is rung 1 bec
 credential-exposure defect, not because of the label it carries. Meanwhile the set also holds
 open design questions, which belong at rung 4 however hard the gate presses.
 
-The publish gate is real, but it applies to **which cluster you pick next** (§0), not to the order
+The publish gate is real, but it applies to **which cluster you pick next**
+([`nitro-board`](../nitro-board/SKILL.md) §2), not to the order
 *inside* one. Do not let it reach into this table.
 
 State the resulting order and the reason for it before the first commit. Where a dependency forced a
@@ -387,13 +289,10 @@ Close-out follows [`nitro-issue-workflow`](../nitro-issue-workflow/SKILL.md) §7
 
 ## Anti-Patterns
 
-- Do not plan on an unreconciled board — closed and superseded issues get scheduled at full cost
-- Do not change an issue to agree with the board; the board is the derived view, always
-- Do not overwrite an `In Progress` you did not set
-- Do not call `updateProjectV2Field` without resending every existing option **with its id** — it
-  replaces the list, and the items grouped under the dropped options are orphaned
-- Do not hardcode project, field, or option ids into a script or a note — resolve them per run
-- Do not leave a `RUN nth` description stale after a re-rank
+- Do not plan on an unreconciled board — run [`nitro-board`](../nitro-board/SKILL.md) first
+- Do not continue past §0 into a cluster unless the user asked to *work* an issue; agreeing with a
+  ranking is a planning answer, not authorization
+- Do not restate the board mechanics here — `nitro-board` owns them, in one copy
 - Do not schedule a third patch into a cause-cluster two merged fixes already touched — file the
   design issue and supersede the members
 - Do not group by shared label — `bug` is not an edit surface

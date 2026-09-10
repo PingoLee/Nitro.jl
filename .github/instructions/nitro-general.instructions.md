@@ -153,7 +153,7 @@ These are canonical here — no other file owns them.
   comment line; no flag disables it. Rationale parked there survives only until the next dependency
   bump. Keep the file comment-free *on purpose*, and never "fix" a stripped comment by restoring it.
   The standing case: **`julia = "^1.12"` is intentional — do not lower it to the 1.10 LTS**, and
-  `HTTP = "~2.4"` is pinned tight because core depends on `HTTP.BytesBody` internals
+  `HTTP = "~2.6"` is pinned tight because core depends on `HTTP.BytesBody` internals
   (see nitro-core §4).
 
 - **Never log or serialize secrets.** No session payloads, CSRF tokens, JWTs, cookie values,
@@ -233,14 +233,19 @@ it, so every worktree shares one marketplace entry.
 | `deploy-checklist` | [`.github/skills/deploy-checklist/SKILL.md`](../skills/deploy-checklist/SKILL.md) | Pre-production env, deps, proxy, and test audit |
 | `nitro-issue-management` | [`.github/skills/nitro-issue-management/SKILL.md`](../skills/nitro-issue-management/SKILL.md) | GitHub backlog: file/label/close issues (`pre-publish` gating label) |
 | `nitro-issue-workflow` | [`.github/skills/nitro-issue-workflow/SKILL.md`](../skills/nitro-issue-workflow/SKILL.md) | Work issue #N end-to-end at a `quick`/`standard`/`high` tier: provenance, scope, isolation, verify rungs, review, land, close out |
-| `nitro-issue-cluster` | [`.github/skills/nitro-issue-cluster/SKILL.md`](../skills/nitro-issue-cluster/SKILL.md) | Decide what to work on next, then work it as a group: reconcile and rank the project board, build the cluster from contended files, tier it by its worst member, order it, land one commit per issue |
+| `nitro-board` | [`.github/skills/nitro-board/SKILL.md`](../skills/nitro-board/SKILL.md) | **Planning only, stops there:** reconcile the project board against the issues, rank the sessions, record each session's edit surface (which is what makes parallel Claude sessions schedulable), write the plan back |
+| `nitro-issue-cluster` | [`.github/skills/nitro-issue-cluster/SKILL.md`](../skills/nitro-issue-cluster/SKILL.md) | Work several issues as one group: build the cluster from contended files, tier it by its worst member, order it, land one commit per issue |
 | `nitro-cut-release` | [`.github/skills/nitro-cut-release/SKILL.md`](../skills/nitro-cut-release/SKILL.md) | Cut a release train: bump `Project.toml` once, stamp the `UPGRADING.md` entries, tag (maintainer-invoked) |
 
 Editing Nitro itself → the area's deep-dive rule file, plus `add-route` for new endpoints. Writing
 application code that *consumes* Nitro → `nitro-usage`. Reviews → `changed-code-review`. **"Fix issue
 #N", or any change that earns its own branch and PR → `nitro-issue-workflow`, which sequences the
-rest; several issues contending for the same file, or *"what should I pick up next?"* →
-`nitro-issue-cluster` above it.**
+rest; several issues contending for the same file → `nitro-issue-cluster` above it.**
+
+***"What should I pick up next?"*, "update the board", "plan the session" → `nitro-board`, which
+answers it and stops.** Planning the board is a deliverable in its own right: a user picking which
+work ranks first is answering a planning question, **not** authorizing the implementation. Work
+begins only when they ask for it in their own words.
 
 ## Subagents
 

@@ -143,8 +143,8 @@ When you file (or notice) one issue superseding another:
    proposal is rejected.
 2. **Edit each superseded issue** to point back: `gh issue comment <A> --body "Superseded by #C: …"`.
    A back-reference the other direction is what makes it visible to anyone reading #A alone — and to
-   the board reconcile in [`nitro-issue-cluster`](../nitro-issue-cluster/SKILL.md) §0, which takes a
-   superseded issue off its session.
+   the board reconcile in [`nitro-board`](../nitro-board/SKILL.md) §1, which takes a superseded
+   issue off its session.
 3. **Do not close them on the strength of the proposal.** A design issue is not a decision. They
    close when the superseding work actually lands — with `Closes #A` in that PR — or they come back
    if the user rejects the design.
