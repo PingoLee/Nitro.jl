@@ -153,7 +153,7 @@ These are canonical here — no other file owns them.
   comment line; no flag disables it. Rationale parked there survives only until the next dependency
   bump. Keep the file comment-free *on purpose*, and never "fix" a stripped comment by restoring it.
   The standing case: **`julia = "^1.12"` is intentional — do not lower it to the 1.10 LTS**, and
-  `HTTP = "~2.4"` is pinned tight because core depends on `HTTP.BytesBody` internals
+  `HTTP = "~2.6"` is pinned tight because core depends on `HTTP.BytesBody` internals
   (see nitro-core §4).
 
 - **Never log or serialize secrets.** No session payloads, CSRF tokens, JWTs, cookie values,
