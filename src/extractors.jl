@@ -81,33 +81,30 @@ end
 # Generic validation function - if no validate function is defined for a type, return true
 validate(type::T) where {T} = true
 
-# Render a bounded, byte-safe preview of a failed instance for error messages.
-# Validators can run on payloads holding raw file bytes (e.g. uploads via
-# `MultipartForm`/`Files`), so never interpolate the whole instance: `:limit`
-# elides long (incl. nested) arrays, and the char cap guards an unbounded field
-# such as a very long `String`. Keeps the message useful without dumping bytes.
-function _instance_preview(instance; limit::Int = 300)
-    s = sprint(show, instance; context = :limit => true)
-    return length(s) <= limit ? s : string(first(s, limit), " …")
-end
-
 """
 This function will try to validate an instance of a type using both global and local validators.
-If both validators pass, the instance is returned. If either fails, an ArgumentError is thrown.
+If both validators pass, the instance is returned. If either fails, a `ValidationError` is thrown.
 """
 function try_validate(param::Param{U}, instance::T) :: T where {T, U <: Extractor{T}}
+
+    # The message names the parameter, its type, and the validator that rejected it —
+    # never the instance. For a body-bound extractor the instance *is* the client's
+    # deserialized payload, so interpolating it put submitted credentials into `.msg`,
+    # which is app-reachable through `showerror` and any `catch ValidationError` (#72).
+    # This matches what `parseparam_checked` (src/utilities/misc.jl) already does for
+    # query and path parameters.
 
     # Case 1: Use global validate function - returns true if one isn't defined for this type
     if !validate(instance)
         impl = Base.which(validate, (T,))
-        throw(ValidationError("Validation failed for $(param.name): $T \n|> $(_instance_preview(instance)) \n|> $impl"))
+        throw(ValidationError("Validation failed for parameter '$(param.name)': $T rejected by $impl"))
     end
 
     # Case 2: Use custom validate function from an Extractor (if defined)
     if param.hasdefault && param.default isa U && !isnothing(param.default.validate)
         if !param.default.validate(instance)
             impl = Base.which(param.default.validate, (T,))
-            throw(ValidationError("Validation failed for $(param.name): $T \n|> $(_instance_preview(instance)) \n|> $impl"))
+            throw(ValidationError("Validation failed for parameter '$(param.name)': $T rejected by $impl"))
         end
     end
 
