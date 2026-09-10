@@ -205,7 +205,7 @@ end
 # Resolve a header to a single value, in one pass.
 #
 # RFC 9110 §5.3: repeated field lines are equivalent to the single comma-joined value, in order.
-# HTTP.jl only folds duplicates that are ADJACENT (`appendheader`, http_core.jl:902 — it compares
+# HTTP.jl only folds duplicates that are ADJACENT (`appendheader`, http_core.jl:953 — it compares
 # against `entries[end]`), so a client-sent `X-Forwarded-For` separated from the proxy-appended
 # one by any other field survives as its own entry. Reading only the first would hand the client
 # control of the result, which is the very bug #16 is about; HAProxy's `option forwardfor` appends
