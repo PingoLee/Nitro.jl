@@ -179,11 +179,16 @@ const DIR_RE  = r"`((?:src|ext|test|docs|\.github)/[A-Za-z0-9_./\-]+/)`"
 # B: markdown links `](target)` — capture the target.
 const LINK_RE = r"\]\(([^)]+)\)"
 
-# G: section pointers, both spellings.
-#   linked:   [nitro-core §4](nitro-core.instructions.md)
+# G: section pointers, all three spellings.
+#   linked:   [nitro-core §4](nitro-core.instructions.md)          -- § inside the brackets
 #   backtick: `nitro-core.instructions.md` §4
-const SECTION_LINK_RE = r"\[[^\]]*?§(\d+)\]\(([^)#]+)(?:#[^)]*)?\)"
-const SECTION_TICK_RE = r"`([A-Za-z0-9_\-]+\.instructions\.md)`[^\n]{0,12}?§(\d+)"
+#   trailing: [`nitro-board`](../nitro-board/SKILL.md) §1          -- § after the link
+# The trailing form is how every skill-to-skill pointer is written; without it the
+# check covered only the instruction-file pointers and skill cross-references rotted
+# silently.
+const SECTION_LINK_RE  = r"\[[^\]]*?§(\d+)\]\(([^)#]+)(?:#[^)]*)?\)"
+const SECTION_TICK_RE  = r"`([A-Za-z0-9_\-]+\.instructions\.md)`[^\n]{0,12}?§(\d+)"
+const SECTION_TRAIL_RE = r"\]\(([^)#\s]+\.md)(?:#[^)]*)?\)[ ]{0,2}§(\d+)"
 
 function lint_paths(file, text, errors)
     for re in (PATH_RE, DIR_RE), m in eachmatch(re, text)
@@ -244,6 +249,13 @@ function lint_sections(file, text, errors)
     for m in eachmatch(SECTION_TICK_RE, text)
         target, n = m.captures[1], m.captures[2]
         resolved = joinpath(INSTRUCTIONS_DIR, target)
+        has_section(resolved, n) ||
+            push!(errors, "$(relpath(file, ROOT)): §$(n) pointer into `$(target)` has no matching `## $(n).` heading")
+    end
+    for m in eachmatch(SECTION_TRAIL_RE, text)
+        target, n = strip(m.captures[1]), m.captures[2]
+        occursin("://", target) && continue
+        resolved = normpath(joinpath(dirname(file), target))
         has_section(resolved, n) ||
             push!(errors, "$(relpath(file, ROOT)): §$(n) pointer into `$(target)` has no matching `## $(n).` heading")
     end

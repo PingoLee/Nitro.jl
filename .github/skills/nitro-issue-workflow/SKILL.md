@@ -141,7 +141,8 @@ git branch -m fix/<N>-<slug>            # EnterWorktree produces branch `worktre
   without it — every Pkg operation dies with `expected package PormG [7d8d7541] to exist at path …`.
 - **The rename is not cosmetic**, and **the name must stay flat and dash-only**.
 - **`origin/<default-branch>` is the default, not a guarantee** — confirm with `git log --oneline -1`.
-- **One suite at a time** — `:network` items bind real sockets on fixed ports.
+- **One suite at a time** — `:network` items bind real sockets and contend for machine resources.
+  (Not fixed ports: every binding test calls `get_free_port()`.)
 - **Stage explicit paths, never `git add -A`.**
 
 Why each of those, with the failure it prevents: [`reference.md`](reference.md) §B.
