@@ -6,6 +6,8 @@ using Base64
 using UUIDs
 using ..Errors
 
+import JSON
+
 export encrypt_payload, decrypt_payload, secure_random_bytes, secure_uuid4,
        SecretString, reveal
 
@@ -163,11 +165,28 @@ ct_compare(a::AbstractString, b::AbstractString)::Bool =
 """
     SecretString(value::AbstractString)
 
-Wrapper for secrets (API keys, signing keys, tokens) that redacts itself under
-display: `show`, `repr`, string interpolation, logging, and the default recursive
+Wrapper for secrets (API keys, signing keys, tokens) that redacts itself under two
+paths — **display** and **JSON serialization**.
+
+*Display*: `show`, `repr`, string interpolation, logging, and the default recursive
 `show` of any *containing* struct all print `SecretString("****")` instead of the
-value. Use it for secret fields in app config structs passed via `serve(context=…)`
-so an accidental `@show config` or REPL display never prints the secret.
+value.
+
+*JSON*: `JSON.json` emits `"****"` for a `SecretString` in any **value** position —
+bare, as a struct field, or nested inside a `Dict`, `Vector` or `Tuple` — which
+covers `Res.json`, the automatic struct-to-JSON return path, and any structured
+logging that JSON-encodes a containing struct. A `SecretString` used as a `Dict`
+*key* throws instead (JSON routes keys through `StructUtils.lowerkey`, which has no
+method here); that is pre-existing and fails closed, so it never leaks.
+
+Serialization is one-way: there is no matching `lift`, so a struct holding a
+`SecretString` does not parse back from JSON. This is deliberate — reconstructing
+`SecretString("****")` would fail an auth comparison far from the parse site
+instead of throwing at it.
+
+Use it for secret fields in app config structs passed via `serve(context=…)`, so
+neither an accidental `@show config` nor a handler that returns the config struct
+can disclose the secret.
 
 Access the underlying value only via [`reveal`](@ref) — the explicit unwrap keeps
 every use of the raw secret greppable. `SecretString` is deliberately **not** an
@@ -178,8 +197,10 @@ constant-time in the content, making it safe for auth-style checks such as
 `config.api_key == request_token`.
 
 !!! warning
-    Redaction covers display, not reflection: `dump` and `getfield` still reach
-    the raw value. This guards against *accidental* disclosure only.
+    Redaction covers display and JSON, not reflection: `dump` and `getfield` still
+    reach the raw value, and serializers other than JSON (ProtoBuf, template
+    engines) see the underlying struct. This guards against *accidental*
+    disclosure only.
 """
 struct SecretString
     value::String
@@ -198,6 +219,14 @@ reveal(s::SecretString)::String = s.value
 
 Base.show(io::IO, ::SecretString) = print(io, "SecretString(\"****\")")
 Base.show(io::IO, ::MIME"text/plain", s::SecretString) = show(io, s)
+
+# Serialization mask, parallel to the `show` mask above (#25). Without it the
+# framework's primary output path — `Res.json`, and `format_response(::Any)` for a
+# raw struct return — reflects a SecretString's fields and ships the raw secret to
+# the client. JSON.jl routes every value through `StructUtils.lower` before writing,
+# so this single method covers the value bare, as a struct field, and nested in a
+# Dict/Vector/Tuple. Emit the same "****" the display mask uses.
+JSON.lower(::SecretString) = "****"
 
 # Constant-time equality (see ct_compare); mixed comparisons cover the common
 # auth shape `stored_secret == client_supplied_token`.

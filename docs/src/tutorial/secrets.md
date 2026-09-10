@@ -84,6 +84,29 @@ config = AppConfig(SecretString(required_env("SECRET_KEY")))
 "debug: $config"                # interpolates the mask, never the key
 ```
 
+The mask also covers **JSON serialization**, which is the path that actually reaches a
+client. A handler that returns a struct holding a secret — or calls `Res.json` on one —
+emits `"****"` rather than the key:
+
+```julia
+using JSON
+
+JSON.json(config)               # "{\"secret_key\":\"****\"}"
+
+# and the same through the response builder, whose body carries the masked JSON
+get_config(req) = Res.json(config)
+```
+
+This holds in any **value** position: bare, as a struct field, or nested inside a
+`Dict`, `Vector` or `Tuple`.
+
+!!! note
+    Serialization is one-way. A struct holding a `SecretString` will not parse back
+    out of JSON — `JSON.parse(str, AppConfig)` throws, because reconstructing a
+    masked `SecretString("****")` would fail an auth comparison somewhere far from
+    the parse site rather than failing loudly at it. Carry secrets between services
+    as an explicitly `reveal`ed field, not by round-tripping the wrapper.
+
 Read the value only where it is actually used, via `reveal`:
 
 ```julia
@@ -98,7 +121,9 @@ the raw secret is touched. Comparing a `SecretString` with `==` (against another
 !!! warning
     `SecretString` guards against *accidental* disclosure only. Deliberate
     introspection (`dump`, `getfield`) still reaches the raw value — nothing in a
-    running Julia process is hidden from reflection.
+    running Julia process is hidden from reflection. The mask covers display and
+    JSON; serializers other than JSON (ProtoBuf, template engines) see the
+    underlying struct, so do not hand one a config object and assume redaction.
 
 ## Do Sessions Need Encryption?
 

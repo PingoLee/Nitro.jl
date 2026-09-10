@@ -143,6 +143,7 @@ end
 @testitem "Security: SecretString redaction" tags=[:security, :core] setup=[NitroCommon] begin
 using Nitro
 using Test
+using JSON
 
 const RAW = "NITRO-RAW-SECRET-77aa1e"
 
@@ -194,5 +195,47 @@ end
     @test hash(SecretString("k1")) == hash("k1")    # consistent with mixed ==
     d = Dict(SecretString("k1") => 1)
     @test d[SecretString("k1")] == 1
+end
+
+# #25: `show` masked the value but JSON did not, so returning or logging a struct
+# holding a SecretString shipped the raw secret. Every shape below reflected the
+# underlying `value` field before the `JSON.lower` mask landed.
+@testset "every JSON shape masks the value" begin
+    cfg = SecretTestConfig("app", SecretString(RAW))
+    for encoded in (JSON.json(SecretString(RAW)),          # bare
+                    JSON.json(cfg),                        # struct field
+                    JSON.json(Dict("k" => SecretString(RAW))),
+                    JSON.json([SecretString(RAW)]),
+                    JSON.json((SecretString(RAW), 1)))
+        @test !occursin(RAW, encoded)
+        @test occursin("****", encoded)
+    end
+    # A mask that swallowed the whole struct would satisfy the loop above while
+    # breaking every caller, so pin that non-secret fields still serialize.
+    @test occursin("\"app\"", JSON.json(cfg))
+end
+
+# The mask is deliberately one-way: no `StructUtils.lift` accompanies the `lower`.
+# Reconstructing a `SecretString("****")` would parse cleanly and then fail an auth
+# comparison far from the parse site, so the throw here is the better failure. Pin
+# it, so adding a `lift` later is a deliberate decision rather than an accident.
+@testset "serialization is one-way" begin
+    encoded = JSON.json(SecretTestConfig("app", SecretString(RAW)))
+    @test_throws ArgumentError JSON.parse(encoded, SecretTestConfig)
+
+    # As a Dict *key* a SecretString routes through `StructUtils.lowerkey`, which
+    # has no method here. Pre-existing, and fails closed rather than leaking.
+    @test_throws ArgumentError JSON.json(Dict(SecretString(RAW) => 1))
+end
+
+@testset "the response path masks the value" begin
+    cfg = SecretTestConfig("app", SecretString(RAW))
+    # Res.json is the explicit builder; format_response is the automatic
+    # struct-to-JSON path a handler hits by returning the config struct directly.
+    for body in (text(Nitro.Res.json(cfg)), text(Nitro.Core.format_response(cfg)))
+        @test !occursin(RAW, body)
+        @test occursin("****", body)
+        @test occursin("app", body)
+    end
 end
 end
