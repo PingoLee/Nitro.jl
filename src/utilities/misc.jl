@@ -43,13 +43,22 @@ function handlerequest(getresponse::Function, catch_errors::Bool; show_errors::B
                 # compiled out at the default log level, so this costs nothing in
                 # production.
                 #
-                # `.msg` is deliberately NOT logged. Scalar parameter rejections carry only
-                # a name and a type, but `Extractors.try_validate` interpolates
-                # `_instance_preview(instance)` — up to 300 characters of the deserialized
-                # payload — so a `Json{Login}` validator failure would put the submitted
-                # password in the log. Scrubbing that message is tracked separately; until
-                # then this line reports only that a request was rejected.
-                show_errors && @debug "Request rejected (400 Bad Request)"
+                # `.msg` — and ONLY `.msg` — is safe to log as of #72: every
+                # `ValidationError` Nitro raises names the parameter, its source, and the
+                # expected type or the rejecting validator, never the submitted value.
+                # `try_validate` used to interpolate up to 300 characters of the
+                # deserialized payload, which put a submitted password on this line for a
+                # `Json{Login}` rejection; it no longer does. Keep that invariant when
+                # adding a `ValidationError` — `test/util_tests.jl` and
+                # `test/extractor_tests.jl` pin it.
+                #
+                # Do NOT widen this to `exception=error` or `sprint(showerror, error)`.
+                # `safe_extract` attaches the underlying exception as `.cause`, and
+                # `showerror` renders it: an `ArgumentError` from a failed JSON parse quotes
+                # the offending input, so a password containing a backslash comes back
+                # verbatim through that path. `.cause` is NOT value-free; scrubbing it is
+                # tracked in #130.
+                show_errors && @debug "Request rejected (400 Bad Request)" message=error.msg
             elseif show_errors && !isa(error, InterruptException)
                 @error "ERROR: " exception=(error, catch_backtrace())
             end

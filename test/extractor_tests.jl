@@ -30,6 +30,14 @@ end
 # Add a lower bound to age with a global validator
 validate(p::Person) = p.age >= 0
 
+# #72: the credential-carrying shape from the issue — a body-bound extractor whose
+# deserialized instance holds a submitted password.
+struct Login
+    username::String
+    password::String
+end
+validate(l::Login) = length(l.password) >= 12
+
 @testset "Extactor builder sytnax" begin 
 
     @test Json{Person}(x -> x.age >= 25) isa Extractor
@@ -545,6 +553,65 @@ end
     @test length(err.msg) < 2_000          # bounded, not ~200 KB
     @test !occursin(big, err.msg)          # the file bytes are not embedded
     @test occursin("ImportUpload", err.msg)  # still names the failing type
+end
+
+# #72: for a body-bound extractor the validated instance *is* the client's
+# deserialized payload, so interpolating it put submitted credentials into `.msg` —
+# which is app-reachable through `showerror` and any `catch ValidationError`. Both
+# `try_validate` branches had the same interpolation, so both are covered here.
+@testset "validation errors never echo the submitted payload (#72)" begin
+    extract_err(param, body) = try
+        extract(param, LazyRequest(request = HTTP.Request("POST", "/", [], body)))
+        nothing
+    catch e
+        e
+    end
+
+    # Case 1 — the global `validate(::Login)` rejects: password shorter than 12.
+    err1 = extract_err(Param(:credentials, Json{Login}, missing, false),
+                       """{"username":"u-c1-sentinel","password":"pw-c1"}""")
+    # Case 2 — the global validator passes; an extractor-local validator rejects.
+    err2 = extract_err(Param(:credentials, Json{Login}, Json{Login}(l -> false), true),
+                       """{"username":"u-c2-sentinel","password":"pw-c2-long-enough"}""")
+
+    for (err, secret, user) in ((err1, "pw-c1", "u-c1-sentinel"),
+                                (err2, "pw-c2-long-enough", "u-c2-sentinel"))
+        @test err isa Nitro.Core.Errors.ValidationError
+        @test !occursin(secret, err.msg)                 # the submitted password
+        @test !occursin(user, err.msg)                   # any other submitted value
+        @test !occursin(secret, sprint(showerror, err))  # showerror is app-reachable too
+        # Still diagnosable: the parameter and its type.
+        @test occursin("credentials", err.msg)
+        @test occursin("Login", err.msg)
+    end
+
+    # ...and the validator that rejected it, however it identifies itself: a named
+    # global `validate` method by name, an anonymous extractor-local one by source
+    # location. Neither identification carries a submitted value. The source-location
+    # assertion deliberately pins "the message identifies which validator rejected" —
+    # an anonymous function has no other identity, so hardening `impl` later must
+    # supply a replacement rather than simply dropping it.
+    @test occursin("validate", err1.msg)
+    @test occursin("extractor_tests.jl", err2.msg)
+
+    # The other branch: `safe_extract` wraps a deserialization failure. Its `.msg` is
+    # value-free too, which is what makes the `@debug message=error.msg` line in
+    # `handlerequest` safe.
+    #
+    # NOTE: `showerror` is deliberately NOT asserted here. `safe_extract` attaches the
+    # underlying exception as `.cause`, and `showerror` renders it — a JSON parse
+    # `ArgumentError` quotes the offending input, so the payload does come back that
+    # way. That is pre-existing and outside #72's fix, and is tracked in #130; asserting
+    # it clean here would fail, and asserting it dirty would enshrine the leak. When
+    # #130 lands, extend the `!occursin(secret, sprint(showerror, …))` assertion above
+    # to this branch and delete this note.
+    bs = Char(0x5c)   # one real backslash → an invalid JSON escape inside the password
+    parse_err = extract_err(Param(:credentials, Json{Login}, missing, false),
+                            string("{\"username\":\"u-c3\",\"password\":\"pw-c3", bs, "qX\"}"))
+    @test parse_err isa Nitro.Core.Errors.ValidationError
+    @test !occursin("pw-c3", parse_err.msg)
+    @test !occursin("u-c3", parse_err.msg)
+    @test occursin("credentials", parse_err.msg)
 end
 
 @testset "MultipartForm - non-multipart body throws" begin
