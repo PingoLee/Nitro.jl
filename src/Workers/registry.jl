@@ -80,6 +80,11 @@ process had just recorded ([#88](https://github.com/PingoLee/Nitro.jl/issues/88)
 `from` is any iterable of `TaskStatus`. Like `set_task!`, this must not write `watchers` or
 `run_id` — it *compares* the latter, it never sets it.
 
+It is not only for terminal states. **Starting** a task is a claimed transition too
+(`(PENDING,) → RUNNING`, carrying `started_at`), because an unconditional start write can land
+*after* a cancellation that already claimed the record and silently undo it
+([#142](https://github.com/PingoLee/Nitro.jl/issues/142)).
+
 # `run_id` — the precondition names a run, not just a status
 
 A task id outlives the run writing under it. Re-running a finished key replaces the record with a
@@ -258,6 +263,7 @@ function try_transition!(store::InMemoryWorkerStore, task_id::String, from, to::
                          run_id::Union{Nothing, UUID},
                          error::Union{Nothing, String}=nothing,
                          completed_at::Union{Nothing, DateTime}=nothing,
+                         started_at::Union{Nothing, DateTime}=nothing,
                          result=UNSUPPLIED,
                          progress::Union{Nothing, Real}=nothing)
     lock(store.task_lock) do
@@ -269,6 +275,7 @@ function try_transition!(store::InMemoryWorkerStore, task_id::String, from, to::
 
         error === nothing || (task_info.error = error)
         completed_at === nothing || (task_info.completed_at = completed_at)
+        started_at === nothing || (task_info.started_at = started_at)
         result === UNSUPPLIED || (task_info.result = result)
         progress === nothing || (@atomic task_info.progress = Float64(progress))
         task_info.status = to        # last, so no reader sees the new status early

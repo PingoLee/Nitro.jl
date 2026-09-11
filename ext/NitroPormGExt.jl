@@ -667,11 +667,13 @@ function try_transition!(store::PormGWorkerStore, task_id::String, from, to::Tas
                          run_id::Union{Nothing, UUIDs.UUID},
                          error::Union{Nothing, String}=nothing,
                          completed_at::Union{Nothing, DateTime}=nothing,
+                         started_at::Union{Nothing, DateTime}=nothing,
                          result=UNSUPPLIED,
                          progress::Union{Nothing, Real}=nothing)
     columns = Pair{String, Any}["status" => string(to)]
     error === nothing || push!(columns, "error" => error)
     completed_at === nothing || push!(columns, "completed_at" => completed_at)
+    started_at === nothing || push!(columns, "started_at" => started_at)
     result === UNSUPPLIED ||
         push!(columns, "result" => isnothing(result) ? "" : JSON.json(result))
     progress === nothing || push!(columns, "progress" => Float64(progress))

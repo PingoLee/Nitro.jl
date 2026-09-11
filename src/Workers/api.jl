@@ -305,12 +305,29 @@ function _execute_task_async(store::AbstractWorkerStore, task_key::String, callb
             return nothing
         end
 
+        # Starting is a CLAIMED transition, not an unconditional write. `set_task!` has no
+        # precondition, so a `cancel_task` that already claimed PENDING -> CANCELLED was simply
+        # overwritten here a moment later; the callback then ran and `_complete_task!`'s own CAS
+        # succeeded from RUNNING, reporting COMPLETED for a task whose caller had been told
+        # "Task cancelled". Silent, and not fixable by locking -- the two writes are strictly
+        # sequential (#142). The CAS *is* the write, so there is no `set_task!` after it.
+        #
+        # In the ASYNC path this was masked, not absent: `cancel_task` also interrupted the worker
+        # task, and a task that had not started yet never ran its body at all. The sequential path
+        # had no such cover -- its processor is already `Threads.@spawn`ed, and a cancel can land
+        # between its `get_task_info` and its start write. Removing the interrupt (#127) uncovers
+        # the async path too, which is why this lands FIRST.
+        started = current_time_utc()
+        if !try_transition!(store, task_key, (PENDING,), RUNNING;
+                            run_id=task_info.run_id, started_at=started)
+            return task_info
+        end
+
         task_info.status = RUNNING
-        task_info.started_at = current_time_utc()
+        task_info.started_at = started
         task_info.sys_task = current_task()
         register_active_task!(store, task_key, current_task())
         register_active_task_info!(store, task_key, task_info)
-        set_task!(store, task_key, task_info)
 
         max_attempts = options.retry_on_failure ? options.max_retries : 0
         for retry_count in 0:max_attempts

@@ -581,6 +581,75 @@ end
     end
 end
 
+@testset "a cancel that lands before the body starts is not overwritten (#142)" begin
+    @testset "the start write is a claim, so it cannot undo a cancellation" begin
+        store = InMemoryWorkerStore()
+        try
+            t = TaskInfo("alice::early")
+            replace_task!(store, t.id, t)
+
+            @test try_transition!(store, t.id, (PENDING,), CANCELLED;
+                                  run_id=t.run_id, error="Cancelled") == true
+
+            # THE property. Starting used to be an unconditional `set_task!`, so this write
+            # landed regardless and put the record back to RUNNING -- after which
+            # `_complete_task!`'s own CAS succeeded and reported COMPLETED for a task whose
+            # caller had been told "Task cancelled".
+            @test try_transition!(store, t.id, (PENDING,), RUNNING;
+                                  run_id=t.run_id,
+                                  started_at=Dates.now(Dates.UTC)) == false
+            @test get_task_info(store, t.id).status == CANCELLED
+            @test get_task_info(store, t.id).started_at === nothing
+        finally
+            reset_store!(store)
+        end
+    end
+
+    @testset "a claimed cancel is never followed by COMPLETED" begin
+        store = InMemoryWorkerStore()
+        try
+            # Cancel IMMEDIATELY after submit, without waiting for the callback to start --
+            # the window every other cancel test in this file deliberately closes by first
+            # waiting on an Event notified from *inside* the callback.
+            id = submit_task("race", () -> "done", Owner("u"); store=store)
+            @test cancel_task(id, Owner("u"); store=store)[:status] == "Task cancelled"
+
+            # A NEGATIVE, time-bounded assertion, and that direction is the point: a slow
+            # machine still times out, so this cannot flake into a false failure -- it can
+            # only fail if the status actually leaves CANCELLED, which is the bug. Asserting
+            # `wait_for(status == "CANCELLED")` instead would be useless here, since
+            # `timedwait` evaluates its predicate once up front and the record is already
+            # CANCELLED at that instant; the overwrite lands later.
+            @test timedwait(() -> get_task_status(id, Owner("u"); store=store)[:status] !=
+                                  "CANCELLED", 2.0) == :timed_out
+            @test get_task_status(id, Owner("u"); store=store)[:status] == "CANCELLED"
+        finally
+            reset_store!(store)
+        end
+    end
+
+    @testset "a queued item cancelled before it is dequeued never runs its callback" begin
+        store = InMemoryWorkerStore()
+        ran = Threads.Atomic{Bool}(false)
+        try
+            t = TaskInfo("alice::queued"; queue_name="reports")
+            replace_task!(store, t.id, t)
+            @test try_transition!(store, t.id, (PENDING,), CANCELLED;
+                                  run_id=t.run_id, error="Cancelled") == true
+
+            # Driven synchronously on purpose: the sequential processor calls exactly this,
+            # so the assertion is about the function rather than about scheduling.
+            item = Nitro.Workers.QueueItem(t.id, () -> (ran[] = true; "done"), TaskOptions())
+            Nitro.Workers._execute_queued_task(store, item)
+
+            @test ran[] == false
+            @test get_task_info(store, t.id).status == CANCELLED
+        finally
+            reset_store!(store)
+        end
+    end
+end
+
 @testset "queue introspection is an admin surface (#87)" begin
     store = InMemoryWorkerStore()
     try
