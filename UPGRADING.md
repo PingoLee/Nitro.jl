@@ -40,6 +40,380 @@ _Changes merged but not yet cut into a release. A consumer dev'ing Nitro at HEAD
 and `Nitro.upgrade_guide` surfaces them by default. When the maintainer next rolls changes into a
 consuming app, `nitro-cut-release` stamps every entry below with `0.4.0`, dates them, and tags it._
 
+## Cancellation no longer interrupts the callback — poll `cancel_requested` instead (#127)
+
+- **Version**: Unreleased
+- **Nitro ref**: #127 (unblocks #30; requires #142); `src/Workers/types.jl`,
+  `src/Workers/api.jl`, `src/Workers/execution.jl`, `src/Workers/queue.jl`,
+  `docs/src/tutorial/workers.md`
+- **Recorded**: 2026-09-11
+- **Severity**: **breaking (runtime behavior, and it breaks SILENTLY)** — part of the `0.1.x`
+  pre-publish wave. Nothing throws and nothing is logged; long-running callbacks simply stop being
+  stopped.
+
+### What changed
+
+`cancel_task` and the `TaskOptions(timeout=…)` monitor both used to do this:
+
+```julia
+schedule(sys_task, InterruptException(), error=true)
+```
+
+`schedule(t, exc; error=true)` sets `t.result`, sets `_isexception` and enqueues `t` — with **no
+check that `t` is currently running**. That was survivable only because worker bodies were
+`@async`, so the interrupter and its target were welded to the same thread and the target was
+always parked or done when the interrupt landed. Interrupt a task genuinely executing on another
+thread and it completes normally, overwrites `result` with its return value, leaves `_isexception`
+set — and `jl_finish_task` aborts the **process**. Julia's own documentation says it: *"It is
+incorrect to use `schedule` on an already started task."*
+
+This is not a Julia quirk. Java deprecated `Thread.stop()` in 1.2 and eventually made it throw
+unconditionally; .NET's `Thread.Abort` throws `PlatformNotSupportedException` on .NET Core. Both
+were withdrawn for the same reason, and nothing re-adopted the model. Go (`context.Context`),
+Sidekiq and River have always been cooperative. Celery and Oban can hard-kill only because they
+have a process boundary to kill across — an OS process and a BEAM process respectively — which a
+single-process framework does not.
+
+Both injections are gone. Cancellation is now a **token** the callback polls:
+
+```julia
+submit_task("import", task_info -> begin
+    for chunk in chunks
+        cancel_requested(task_info) && return "cancelled"   # ← new, exported
+        process(chunk)
+        update_progress!(task_info, 100 * done / total)
+    end
+end, Owner("user-1"))
+```
+
+`cancel_task`'s observable contract is unchanged — it still records the terminal state atomically
+and still returns `"Task cancelled"` — because the state was always claimed *before* the interrupt
+was sent. What is gone is a best-effort nudge that was unreliable even under `@async`: a CPU-bound
+callback also defeated the old timeout, because `timedwait` never got scheduled while the sticky
+child hogged their shared thread.
+
+**What this forces. Four shapes:**
+
+1. **A callback that was implicitly cancellable now is not, silently.** Anything parked in a long
+   `sleep`, a blocking `wait`, or IO used to be unwound by the injected exception without doing
+   anything itself. It now runs to completion. **This is the dangerous one** — there is no error,
+   no log, and no failing test; the job simply ignores cancellation from now on. The greps below
+   are aimed at finding these.
+2. **A `try`/`finally` runs only when the callback returns.** Releasing a file lock, killing a
+   child process, closing a socket — all of that used to run as the interrupt unwound the
+   callback. A callback that never polls never returns, so its `finally` never runs. The `ffmpeg`
+   example in the worker tutorial was written that way and has been rewritten.
+3. **`timeout` is advisory.** A timed-out callback keeps running and keeps a thread. Under #30
+   that thread is one of `Threads.nthreads()` on the `:default` pool — **the same pool `serve`
+   spawns every request into** — so `nthreads()` abandoned CPU-bound callbacks wedge the web
+   server. Nitro logs a `@warn` naming the task at the moment it abandons it; that warning is now
+   the only signal.
+4. **`retry_on_failure` no longer retries a timeout.** It cannot: nothing stops the attempt that
+   timed out, so `max_retries=3` would start four concurrent copies of one job against one
+   `task_info` and one set of external side effects. A timeout is terminal `FAILED` on the first
+   attempt, carrying the same `"Timeout of Ns exceeded"` message as before. Genuine failures still
+   retry exactly as they did.
+
+Two further notes:
+
+- **`cancel_requested` is process-local.** With `PormGWorkerStore` across several processes, a
+  cancel issued on another node writes the row and sets no token here. Cross-process callbacks
+  must poll the durable record — `get_task_status(task_info.id, System())[:status] == "CANCELLED"`
+  — sparingly, since it is a round-trip. That was already true of the previously documented
+  `task_info.status` check; the token is a fast path, not a distributed one.
+- **A callback that throws `InterruptException` is now `FAILED`, not `CANCELLED`.** Nothing
+  injects one any more, so the only way one arrives is that your code raised it, and recording
+  that as "Cancelled by user" was a lie about who stopped the job.
+
+### How to find the calls to migrate
+
+```bash
+# 1. THE IMPORTANT ONE: long-running callbacks with no cancellation check. Every hit here is a
+#    job that silently stopped being cancellable.
+rg -n -A15 'submit_task\(|submit_sequential_task\(' --type julia | rg -n 'sleep|wait\(|read\(|download'
+rg -n 'cancel_requested' --type julia          # ...and which of them now have a check
+
+# 2. Callbacks that assumed they would be unwound — a `finally` that releases something.
+rg -n -B2 -A8 'submit_task\(|submit_sequential_task\(' --type julia | rg -n 'finally|kill\(|close\(|unlock'
+
+# 3. Anything that treated `timeout` as a hard stop, and the retry+timeout combination whose
+#    behavior changed.
+rg -n 'TaskOptions\(' --type julia | rg -n 'timeout|retry_on_failure'
+
+# 4. Code matching on the old cancellation exception.
+rg -n 'InterruptException' --type julia
+```
+
+### Before → after
+
+```julia
+# ✗ before — the `finally` ran because the interrupt unwound the callback
+submit_task("convert", task_info -> begin
+    p = run(pipeline(`ffmpeg -i in.mov out.mp4`); wait = false)
+    try
+        wait(p)                      # blocks forever now; nothing interrupts it
+        return "converted"
+    finally
+        process_running(p) && (kill(p); wait(p))
+    end
+end, Owner("user-1"))
+
+# ✓ after — poll the token, and the `finally` still does the reaping
+submit_task("convert", task_info -> begin
+    p = run(pipeline(`ffmpeg -i in.mov out.mp4`); wait = false)
+    try
+        while process_running(p)
+            cancel_requested(task_info) && break
+            sleep(0.2)               # the poll interval IS the cancellation latency
+        end
+        return process_running(p) ? "cancelled" : "converted"
+    finally
+        process_running(p) && (kill(p); wait(p))
+    end
+end, Owner("user-1"))
+```
+
+```julia
+# ✗ before — a tight loop a timeout would eventually cut short
+submit_task("crunch", () -> begin
+    while more(); step(); end
+end, Owner("u"); options = TaskOptions(timeout = 300))
+
+# ✓ after — the deadline only works if the callback checks
+submit_task("crunch", task_info -> begin
+    while more()
+        cancel_requested(task_info) && return "stopped"
+        step()
+    end
+end, Owner("u"); options = TaskOptions(timeout = 300))
+```
+
+An app whose callbacks are short, or already poll the task status, needs no change beyond reading
+the retry note.
+
+---
+
+## Starting a task is a claimed transition; `try_transition!` gains `started_at` (#142)
+
+- **Version**: Unreleased
+- **Nitro ref**: #142 (builds on #108; prerequisite for #127); `src/Workers/api.jl`,
+  `src/Workers/queue.jl`, `src/Workers/registry.jl`, `ext/NitroPormGExt.jl`
+- **Recorded**: 2026-09-11
+- **Severity**: **breaking (custom `AbstractWorkerStore` implementations only)** — a correctness
+  fix; part of the `0.1.x` pre-publish wave. Apps using the bundled stores need **no code change**.
+
+### What changed
+
+A worker body used to announce itself with an unconditional write:
+
+```julia
+task_info.status = RUNNING
+task_info.started_at = current_time_utc()
+set_task!(store, task_key, task_info)     # no precondition
+```
+
+`set_task!` has no precondition, so a `cancel_task` that had *already* claimed
+`PENDING → CANCELLED` was overwritten a moment later. The callback then ran, and
+`_complete_task!`'s own compare-and-set succeeded from `RUNNING` — reporting `COMPLETED` for a task
+whose caller had been told `"Task cancelled"`. Nothing threw and nothing was logged.
+
+Locking does not help: the two writes are strictly sequential, and `cancel_task` holding the task
+lock for its whole body changes nothing about what happens after it releases.
+
+The start is now claimed, exactly like every terminal transition since #88:
+
+```julia
+started = current_time_utc()
+if !try_transition!(store, task_key, (PENDING,), RUNNING;
+                    run_id = task_info.run_id, started_at = started)
+    return task_info          # cancelled, or this run no longer owns the record
+end
+```
+
+`try_transition!` therefore takes a new `started_at` keyword, so the timestamp is written by the
+same statement that claims the status rather than by a follow-up save. There is no `set_task!`
+after it — the compare-and-set *is* the write.
+
+**On how reachable this was.** In the unqueued path it was masked rather than absent: `cancel_task`
+also interrupted the worker task, and a task that had not started yet never ran its body at all.
+The sequential path had no such cover — its queue processor is already `Threads.@spawn`ed, so a
+cancel can land between that path's `get_task_info` and its start write. Removing the interrupt
+(#127) uncovers the unqueued path too, which is why this fix lands **before** it. Had the two
+shipped in the other order, #127 would have introduced a silent cancellation loss.
+
+### How to find the calls to migrate
+
+```bash
+# Custom stores. If this finds nothing, nothing below applies to you.
+rg -n 'AbstractWorkerStore' --type julia
+rg -n 'try_transition!' --type julia
+
+# A store that writes `started_at` only from set_task! now has a column the claimed start
+# transition also needs to be able to write.
+rg -n 'started_at' --type julia
+```
+
+### Before → after
+
+```julia
+# ✗ before — #108's signature
+function try_transition!(store::MyStore, id, from, to::TaskStatus;
+                         run_id::Union{Nothing, UUID},
+                         error=nothing, completed_at=nothing,
+                         result=UNSUPPLIED, progress=nothing)
+
+# ✓ after — `started_at` joins the optional column set, alongside `completed_at`
+function try_transition!(store::MyStore, id, from, to::TaskStatus;
+                         run_id::Union{Nothing, UUID},
+                         error=nothing, completed_at=nothing,
+                         started_at=nothing,
+                         result=UNSUPPLIED, progress=nothing)
+```
+
+Nothing else moves: `started_at` is written only when supplied, the same rule `completed_at`,
+`result` and `progress` already follow. An app that only *uses* the bundled stores sees one
+behavior change and no API change — a cancellation issued before a task starts now sticks, where
+before it could be silently undone.
+
+---
+
+## `try_transition!` gains a required `run_id`; `nitro_task` gains a `run_id` column (#108)
+
+- **Version**: Unreleased
+- **Nitro ref**: #108 (builds on #88); `src/Workers/types.jl`, `src/Workers/registry.jl`,
+  `src/Workers/queue.jl`, `src/Workers/api.jl`, `ext/NitroPormGExt.jl`,
+  `docs/src/tutorial/workers.md`
+- **Recorded**: 2026-09-11
+- **Severity**: **breaking (custom `AbstractWorkerStore` implementations only)** — a correctness
+  fix; part of the `0.1.x` pre-publish wave. Apps using the bundled stores need **no code change**:
+  the `PormGWorkerStore` schema migration is applied automatically on boot.
+
+### What changed
+
+Re-running a *finished* task key replaces the record with a fresh `PENDING` one
+(`_register_or_watch!` → `replace_task!`). The previous run's worker task can still be in flight —
+parked in a `sleep`, blocked on IO, or simply mid-callback. When it finally finished, its terminal
+write went through `try_transition!`, whose only precondition was `status in (PENDING, RUNNING)` —
+which the **new** record satisfies. So a run that had nothing to do with the new submission stamped
+`CANCELLED` or its own stale result onto it, and the resubmitted run's real result was discarded:
+
+```
+resubmit                          -> status = PENDING   (new record)
+old run's terminal write arrives  -> status = CANCELLED (lands on the NEW run)
+new run completes                 -> its own claim fails; result discarded
+```
+
+#88 made terminal writes **atomic**. It did not make them **addressed**: they named a task id, and
+a task id outlives the run writing under it.
+
+Every `TaskInfo` now carries a `run_id::UUID` minted in its constructor, and `try_transition!` takes
+it as a **required** keyword and compares it in the same `WHERE` clause as the status. A write from
+a run that no longer owns the record matches zero rows and — as with the status precondition —
+**nothing is written**.
+
+`run_id` follows exactly the write split `watchers` follows: **`replace_task!` writes it,
+`set_task!` never does.** A store that carried it along on ordinary state saves would let whichever
+run wrote last adopt the record's identity, defeating the mechanism entirely.
+
+The runtime handle teardown in `_finish_task!` is fenced the same way. It used to
+`deregister_active_task!` by id unconditionally, so a late-finishing previous run deleted its
+*successor's* live handle — and `recover_zombie_tasks!` decides zombie-ness from exactly that
+handle, so the next sweep marked a genuinely-running task `FAILED`.
+
+**Why the keyword is required and not optional.** `run_id = nothing` is a legal value meaning "no
+run precondition", but you have to write it. An optional keyword defaulting to `nothing` would
+rebuild the shape #48 removed: the unfenced call becomes the *shorter* one, and a new terminal-write
+call site that simply forgot it is indistinguishable in review from one that meant to skip the
+fence.
+
+### How to find the calls to migrate
+
+```bash
+# Custom stores. If this finds nothing, nothing below applies to you.
+rg -n 'AbstractWorkerStore' --type julia
+
+# Every try_transition! definition and call in your tree.
+rg -n 'try_transition!' --type julia
+
+# Anything constructing or persisting a TaskInfo by hand — a hand-rolled deserializer is the one
+# that breaks SILENTLY rather than loudly. See the first operational note below.
+rg -n 'TaskInfo\(' --type julia
+```
+
+```sql
+-- Does your nitro_task table predate this change? (Informational: booting through
+-- `pormg_nitro_worker` adds the column for you.)
+SELECT * FROM nitro_task LIMIT 1;   -- no run_id column => yes
+```
+
+### Migrate your app
+
+**1. The database — automatic, with a manual fallback.** `_ensure_task_table!` only issues
+`CREATE TABLE IF NOT EXISTS`, so an existing table would never gain the column on its own. That is
+the same limitation which made #88 reject a `watchers_version` column, and #108 is paying the cost
+#88 declined. Because *every* read path goes through `_from_db_record`, an unmigrated table is
+**unreadable**, not merely degraded — so the migration is applied on boot rather than left to the
+operator. `pormg_nitro_worker` now also calls `_ensure_run_id_column!`, which issues the `ALTER` and
+establishes idempotency by *proving* the column exists rather than by matching a duplicate-column
+error string (the three dialects word it differently, and a `catch` broad enough to cover all three
+would swallow real failures).
+
+Pre-existing rows are backfilled with the **nil UUID**, which is exact: a row written before run ids
+existed belongs to no live run, and `uuid4()` can never produce the nil UUID, so no running task can
+accidentally adopt one.
+
+If you provision the table yourself rather than through `pormg_nitro_worker`, run it by hand — one
+statement, no dialect variants needed:
+
+```sql
+ALTER TABLE nitro_task
+  ADD COLUMN run_id VARCHAR(36) NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000';
+```
+
+**2. A custom store.**
+
+```julia
+# ✗ before
+function try_transition!(store::MyStore, id, from, to::TaskStatus;
+                         error=nothing, completed_at=nothing,
+                         result=UNSUPPLIED, progress=nothing)
+
+# ✓ after — run_id is required (no default) and joins the compare half
+function try_transition!(store::MyStore, id, from, to::TaskStatus;
+                         run_id::Union{Nothing, UUID},
+                         error=nothing, completed_at=nothing,
+                         result=UNSUPPLIED, progress=nothing)
+    # compare BOTH, in one atomic step:
+    #   stored.status in from  &&  (run_id === nothing || stored.run_id == run_id)
+end
+
+# ✗ before — set_task! wrote run_id along with everything else
+set_task!(store::MyStore, id, info)
+
+# ✓ after — run_id follows watchers
+set_task!(store::MyStore, id, info)      # state only; MUST NOT write run_id or watchers
+replace_task!(store::MyStore, id, info)  # the whole record: run_id and watchers included
+```
+
+Operational notes:
+
+- **Reading the column back is load-bearing, and getting it wrong fails silently.** A deserializer
+  that rebuilds a `TaskInfo` from a row via the constructor gets a *freshly minted* `run_id` for
+  free; if it does not then overwrite it from the row, every read invents a new run and **no worker
+  can ever finish its own task**, because every fence compares against an id nothing holds. Assign
+  it explicitly, and raise when the column is absent rather than keeping the invented one — which is
+  what the bundled `_from_db_record` now does.
+- An un-updated third-party store fails with a `MethodError` at the call site rather than silently
+  degrading — the same property #88's three methods have, and for the same reason: the interface
+  stubs in `src/Workers/registry.jl` carry no fallback method.
+- A store that accepts `run_id` and ignores it is not a conforming store. It reintroduces #108 for
+  its own backend, exactly as a store that reads the status and then saves reintroduces #88.
+- `run_id` is a plain `uuid4()`, deliberately **not** `Crypto.secure_uuid4()`. It is an internal
+  correlation value, never returned to a caller and never a capability; guessing one buys nothing,
+  since forging a write also requires being inside the process that calls `try_transition!`.
+
+---
+
 ## `ValidationError` no longer renders or serializes its `.cause` (#130)
 
 - **Version**: Unreleased

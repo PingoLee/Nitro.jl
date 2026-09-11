@@ -42,17 +42,40 @@ function _invoke_task_callback(callback::Function, task_info::TaskInfo)
     throw(MethodError(callback, (task_info,)))
 end
 
-function timeout_call(callback::Function; timeout::Int=3600)
+"""
+    timeout_call(callback, task_info; timeout=3600) -> Any
+
+Run `callback` under a deadline and return its value, or throw [`TaskTimeoutError`](@ref).
+
+`task_info` is taken rather than closed over so the deadline can reach the callback: on expiry
+this sets the run's cancellation token, which a cooperative callback polls with
+[`cancel_requested`](@ref). Taking it here also keeps the world-age probe in
+`_invoke_task_callback` at a single call site.
+
+**The deadline bounds the WAIT, not the work.** Nothing stops a Julia task, so a callback that
+does not poll the token runs to completion regardless — holding a thread the whole time. That is
+the same contract as Java's `Future.get(timeout)` and Go's `context.WithTimeout`, which likewise
+accept a leaked goroutine rather than an unsafe kill. Nitro used to also throw an
+`InterruptException` into the task, which was unusable for the CPU-bound callbacks this exists to
+bound and fatal once worker bodies migrate between threads
+([#127](https://github.com/PingoLee/Nitro.jl/issues/127)).
+"""
+function timeout_call(callback::Function, task_info::TaskInfo; timeout::Int=3600)
     if timeout <= 0
-        return callback()
+        return _invoke_task_callback(callback, task_info)
     end
 
     result_channel = Channel{Any}(1)
     error_channel = Channel{Any}(1)
 
-    task = @async begin
+    # `Threads.@spawn`, not `@async` (#30). Under `@async` this child was pinned to the
+    # monitoring task's own thread, so a CPU-bound callback -- precisely what a deadline exists
+    # to bound -- starved the `timedwait` below and the timeout mostly never fired at all. It
+    # fires now. The flip side is that an abandoned callback occupies a `:default`-pool slot,
+    # the same pool serving HTTP, until it returns; see the `@warn` on the timeout path.
+    task = Threads.@spawn begin
         try
-            put!(result_channel, callback())
+            put!(result_channel, _invoke_task_callback(callback, task_info))
         catch error
             put!(error_channel, error)
         end
@@ -60,11 +83,17 @@ function timeout_call(callback::Function; timeout::Int=3600)
 
     wait_result = timedwait(() -> isready(result_channel) || isready(error_channel), timeout)
     if wait_result == :timed_out
-        try
-            schedule(task, InterruptException(), error=true)
-        catch
-        end
-        throw(ErrorException("Timeout of $(timeout)s exceeded"))
+        # Ask, because we cannot tell. The task above keeps running until the callback
+        # returns; this is the only thing that can make it stop, and only if it polls.
+        @atomic task_info.cancel_requested = true
+
+        # The docs used to note that a timed-out task can go on mutating external state "with
+        # nothing to tell the operator". This is that signal, and it is now the only one.
+        @warn "Worker task timed out. Its callback was NOT stopped and keeps a thread " *
+              "until it returns; poll `cancel_requested(task_info)` in the callback to " *
+              "make the deadline effective." task_id=task_info.id timeout=timeout
+
+        throw(TaskTimeoutError(timeout))
     end
 
     if isready(error_channel)

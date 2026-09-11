@@ -1,6 +1,7 @@
 module Workers
 
 using Dates
+using UUIDs: UUID, uuid4
 using Base: @kwdef
 import Base.Threads: ReentrantLock, lock
 
@@ -22,7 +23,8 @@ export TaskStatus, PENDING, RUNNING, COMPLETED, FAILED, CANCELLED,
     install!, uninstall!, worker_store, default_store,
     start!, startup, recover_zombie_tasks!,
     submit_task, submit_sequential_task, get_task_status, cancel_task,
-    update_progress!, get_all_tasks, cleanup_old_tasks,
+    update_progress!, cancel_requested, TaskTimeoutError,
+    get_all_tasks, cleanup_old_tasks,
     start_cleanup_scheduler, stop_cleanup_scheduler!, get_queue_status,
     format_error, reset_store!, shutdown!,
     scoped_task_key, owner_of, DEFAULT_QUEUE_NAME,

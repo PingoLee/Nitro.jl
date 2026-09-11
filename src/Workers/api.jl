@@ -35,7 +35,11 @@ function recover_zombie_tasks!(; store::AbstractWorkerStore=default_store())
             # (or is cancelled) between the read and the write, the real outcome stands
             # and this sweep writes nothing — the same rule every other terminal write
             # now follows (#88).
+            # Addressed to the run this sweep actually inspected. Between the read above
+            # and this write the key may have been re-run (#108), and declaring someone else's
+            # live run dead is the same defect as clobbering its result.
             if try_transition!(store, task.id, (RUNNING,), FAILED;
+                               run_id=task.run_id,
                                error="Worker process terminated unexpectedly mid-execution.",
                                completed_at=current_time_utc())
                 count += 1
@@ -283,6 +287,13 @@ function _register_or_watch!(store::AbstractWorkerStore, task_key::String, owner
 
         # Re-running a finished key replaces the record and resets its watchers to the
         # resubmitter — the one place a whole record, watchers included, is written.
+        # The record we are about to discard may still have a live run behind it. `run_id`
+        # stops that run from writing (#108); this is the only thing that can reclaim the
+        # thread it is sitting on. In-process only -- a run hosted on another node is
+        # unreachable from here and will keep going until its callback returns.
+        previous = get_active_task_info(store, task_key)
+        previous === nothing || (@atomic previous.cancel_requested = true)
+
         task_info = TaskInfo(task_key; queue_name)
         push!(task_info.watchers, uid)
         for grant in grants
@@ -293,45 +304,146 @@ function _register_or_watch!(store::AbstractWorkerStore, task_key::String, owner
     end
 end
 
+# `Threads.@spawn`, not `@async` (#30). `@async` creates a **sticky** task, pinned for life to
+# the thread that created it -- here, a request-handling thread. A CPU-bound callback that never
+# yields therefore starved every other coroutine on that thread, including the requests
+# `parallel_stream_handler` had scheduled there, which is exactly the stall workers exist to
+# prevent. `Threads.@spawn` creates a migratable task on the `:default` pool, which is the model
+# nitro-core §2 asks for and the one `src/core.jl` already uses per request (#39).
+#
+# What made this unlandable before was not thread affinity but exception injection: cancellation
+# and timeout used to `schedule(…, error=true)` into this task, which is undefined behaviour
+# against a task executing on another thread and aborted the process. #127 removed both
+# injections, and that -- not any property of this function -- is what makes migration safe. Note
+# the criterion is "does anything inject into this task?", not "is this the request path": with
+# nothing injecting anywhere, `start_cleanup_scheduler` could migrate too, and stays `@async` only
+# because it runs no user code.
+#
+# Nothing in `src/Workers/` depends on thread affinity: no `Threads.threadid()`, no task-local
+# storage, no `SpinLock`. Every lock here is a `ReentrantLock`, which keys on `current_task()`, so
+# a migrating task keeps what it holds, and `TaskInfo.progress` is `@atomic`. An **app** callback
+# using the `buffers[Threads.threadid()]` pattern was already unsound under `@async` and is now
+# visibly so.
+#
+# The cost this adds, stated plainly: a cancelled or timed-out callback that never polls
+# `cancel_requested` now holds one of `Threads.nthreads()` `:default`-pool slots -- the same pool
+# serving HTTP -- until it returns, instead of starving one thread's coroutines. See the timeout
+# warning in `docs/src/tutorial/workers.md`.
 function _execute_task_async(store::AbstractWorkerStore, task_key::String, callback::Function, options::TaskOptions)
-    task = @async begin
+    task = Threads.@spawn begin
         task_info = get_task_info(store, task_key)
 
         if task_info === nothing
             return nothing
         end
 
-        task_info.status = RUNNING
-        task_info.started_at = current_time_utc()
+        # Starting is a CLAIMED transition, not an unconditional write. `set_task!` has no
+        # precondition, so a `cancel_task` that already claimed PENDING -> CANCELLED was simply
+        # overwritten here a moment later; the callback then ran and `_complete_task!`'s own CAS
+        # succeeded from RUNNING, reporting COMPLETED for a task whose caller had been told
+        # "Task cancelled". Silent, and not fixable by locking -- the two writes are strictly
+        # sequential (#142). The CAS *is* the write, so there is no `set_task!` after it.
+        #
+        # In the ASYNC path this was masked, not absent: `cancel_task` also interrupted the worker
+        # task, and a task that had not started yet never ran its body at all. The sequential path
+        # had no such cover -- its processor is already `Threads.@spawn`ed, and a cancel can land
+        # between its `get_task_info` and its start write. Removing the interrupt (#127) uncovers
+        # the async path too, which is why this lands FIRST.
+        started = current_time_utc()
+
+        # Register the handles BEFORE claiming RUNNING, not after. `recover_zombie_tasks!`
+        # decides a run is dead from exactly `status == RUNNING && isnothing(get_active_task(id))`
+        # and does not hold anything that excludes this function, so a store that reads RUNNING
+        # before the handle exists is a window in which a sweep marks a genuinely-live run FAILED
+        # -- and the run's real result is then discarded by its own losing CAS. The old
+        # unconditional `set_task!` wrote the store LAST and so never opened that window;
+        # claiming the start (#142) reversed the order, and this restores it. Registering while
+        # the record is still PENDING is harmless: that sweep only looks at RUNNING.
         task_info.sys_task = current_task()
         register_active_task!(store, task_key, current_task())
         register_active_task_info!(store, task_key, task_info)
-        set_task!(store, task_key, task_info)
+
+        if !try_transition!(store, task_key, (PENDING,), RUNNING;
+                            run_id=task_info.run_id, started_at=started)
+            # Cancelled, or this run no longer owns the record. Hand back the handles we just
+            # took -- fenced, so we cannot tear down a successor's (#108).
+            _deregister_run!(store, task_info)
+            task_info.sys_task = nothing
+            return task_info
+        end
+
+        task_info.status = RUNNING
+        task_info.started_at = started
 
         max_attempts = options.retry_on_failure ? options.max_retries : 0
         for retry_count in 0:max_attempts
             try
-                result = timeout_call(() -> _invoke_task_callback(callback, task_info); timeout=options.timeout)
+                result = timeout_call(callback, task_info; timeout=options.timeout)
                 return _complete_task!(store, task_info, result)
             catch error
                 unwrapped = _unwrap_exception(error)
+
+                # NOT dead code, however redundant it looks. `_fail_task!` below would lose
+                # its CAS against an already-CANCELLED record anyway -- but without this
+                # branch a cancelled task with `retry_on_failure` falls through to the
+                # backoff `sleep` and RE-RUNS. This is what short-circuits the retry loop.
+                #
+                # `unwrapped isa InterruptException` used to be an arm of this test, back when
+                # cancellation was delivered by injecting one. Nothing injects any more, so
+                # the only way one arrives is that the callback itself threw it -- recording
+                # that as "Cancelled by user" would be a lie about who stopped the job (#127).
                 latest_info = get_task_info(store, task_key)
-                if unwrapped isa InterruptException || (latest_info !== nothing && latest_info.status == CANCELLED)
+                if latest_info !== nothing && latest_info.status == CANCELLED
                     return _cancel_task!(store, task_info; message="Cancelled by user")
+                end
+
+                # A timeout is terminal on the first attempt. Retrying it cannot help and can
+                # harm: nothing stops the attempt that timed out, so `max_retries = 3` would
+                # put four copies of the callback on the thread pool at once, sharing one
+                # `task_info` and one set of external side effects (#127). The token is not
+                # reset between attempts either, so a retry would start pre-cancelled.
+                if unwrapped isa TaskTimeoutError
+                    return _fail_task!(store, task_info, format_error(unwrapped))
                 end
 
                 if retry_count == max_attempts
                     return _fail_task!(store, task_info, format_error(unwrapped))
                 end
 
-                sleep(2 ^ (retry_count + 1))
+                # Cancellation-aware backoff. The catch above checks CANCELLED before sleeping and
+                # never after, and the interrupt that used to abort this sleep is gone (#127) -- so a
+                # cancel landing inside a 2/4/8s window re-invoked the user callback on a task that was
+                # already cancelled. Polling the token instead of sleeping blind also cuts cancellation
+                # latency during a backoff from seconds to milliseconds.
+                deadline = time() + 2.0 ^ (retry_count + 1)
+                while time() < deadline && !cancel_requested(task_info)
+                    sleep(0.05)
+                end
+
+                # The token is process-local, so a cancel issued on another node sets nothing here. One
+                # durable read per ATTEMPT (not per poll) covers that without a round-trip every 50ms.
+                if cancel_requested(task_info)
+                    return _cancel_task!(store, task_info; message="Cancelled by user")
+                end
+                resumed = get_task_info(store, task_key)
+                if resumed !== nothing && resumed.status == CANCELLED
+                    return _cancel_task!(store, task_info; message="Cancelled by user")
+                end
             end
         end
 
         return task_info
     end
 
-    register_active_task!(store, task_key, task)
+    # No `register_active_task!` here. The body registers `current_task()` -- the very same Task
+    # object -- as part of claiming its start, so this was always a duplicate write of an
+    # identical value; under `@async` it merely happened first, because the parent could not
+    # yield between the spawn and this line. Under `Threads.@spawn` the body may complete and
+    # deregister BEFORE this line runs, re-registering a finished task that nothing will ever
+    # clean up. Its one non-duplicate effect was on the early-return path above, where it
+    # registered a handle for a key with no record at all -- a permanent leak that makes
+    # `recover_zombie_tasks!` skip a later genuinely-dead run under the same key, since that
+    # sweep asks only whether an entry exists.
     return task
 end
 
@@ -468,25 +580,66 @@ function cancel_task(task_id::AbstractString, authority::TaskAuthority; store::A
         # loses the race and stays cancelled, or wins it and we report the truth.
         # Doing this with a read, a decision, and a full-record save under `lock_tasks`
         # was #88: that lock does not span processes.
+        # Fencing this on `run_id` is an AUTHORIZATION fix, not merely bookkeeping.
+        # `_authorize_or_reload!` above decided against the watcher list of the run we read,
+        # and re-running a finished key RESETS that list (`replace_task!`). Cancelling the
+        # successor on the predecessor's grant would be an authorization the app never issued
+        # — reachable across processes, since `lock_tasks` is process-local for a
+        # database-backed store (#108).
+        cancelled_at = current_time_utc()
         claimed = try_transition!(store, task_info.id, (PENDING, RUNNING), CANCELLED;
-                                  error="Cancelled", completed_at=current_time_utc())
+                                  run_id=task_info.run_id,
+                                  error="Cancelled", completed_at=cancelled_at)
 
         if !claimed
             latest = get_task_info(store, task_info.id)
             latest === nothing && return Dict{Symbol, Any}(:error => "Task not found")
+            if latest.run_id != task_info.run_id
+                # Distinguished on purpose: reporting the successor's status here would say
+                # "Task already finished with status PENDING", which is nonsense.
+                return Dict{Symbol, Any}(
+                    :error => "Task was re-submitted; the run you asked to cancel has already ended")
+            end
             return Dict{Symbol, Any}(:error => "Task already finished with status $(latest.status)")
         end
 
-        sys_task = get_active_task(store, task_info.id)
-        if sys_task !== nothing && !istaskdone(sys_task)
-            try
-                schedule(sys_task, InterruptException(), error=true)
-            catch
-            end
-        end
+        # Ask the callback to stop. This replaces
+        # `schedule(sys_task, InterruptException(), error=true)`, which was only ever safe
+        # while worker tasks were thread-pinned: `schedule(t, exc; error=true)` does not
+        # check whether `t` is running, and injecting into a task executing on another
+        # thread aborts the process in `jl_finish_task` (#127, blocking #30).
+        #
+        # `get_active_task_info`, NOT `get_task_info`: the latter falls back to a database
+        # read for a database-backed store and hands back a throwaway object the callback
+        # does not hold, so the write would be a silent no-op. The `run_id` guard keeps the
+        # request off a successor run (#108).
+        #
+        # Nothing is deregistered here any more. That used to mean "this process is done
+        # running it", which was true a moment later under the old model and is false now --
+        # the callback keeps going. Leaving the handles in place keeps `get_active_task`
+        # honest for `recover_zombie_tasks!` and keeps `get_task_info` serving live progress
+        # for a task that is still producing it. `_finish_task!` tears them down whether or
+        # not it wins its CAS, so nothing leaks.
+        live = get_active_task_info(store, task_info.id)
+        if live !== nothing && live.run_id == task_info.run_id
+            @atomic live.cancel_requested = true
 
-        deregister_active_task!(store, task_info.id)
-        deregister_active_task_info!(store, task_info.id)
+            # Mirror the claim onto the live record, which is a REQUIREMENT now that this
+            # function no longer deregisters it. `PormGWorkerStore.try_transition!` writes
+            # only the database row, and its `get_task_info` prefers the live object -- so
+            # without this a cancelled task kept reporting RUNNING until its callback
+            # returned: `get_task_status` lied, a second `cancel_task` answered "already
+            # finished with status RUNNING", and `_register_or_watch!` saw RUNNING and
+            # silently refused to re-run the key. `InMemoryWorkerStore` never had the
+            # problem because its CAS mutates the very object the registry holds, so
+            # leaving this out made the two backends disagree.
+            #
+            # It also makes the `task_info.status == CANCELLED` poll that the tutorial has
+            # always documented actually work under PormG, which it never did.
+            live.status = CANCELLED
+            live.error = "Cancelled"
+            live.completed_at = cancelled_at
+        end
 
         return Dict{Symbol, Any}(:status => "Task cancelled")
     end
@@ -583,6 +736,12 @@ function start_cleanup_scheduler(; interval_hours::Real=24, retain_days::Int=7, 
 
     stop_signal = Channel{Nothing}(1)
     interval_seconds = max(interval_hours * 3600, 0.01)
+    # Deliberately `@async` while worker bodies are `Threads.@spawn` (#30). The old
+    # discriminator -- "does anything `schedule(…, error=true)` this task?" -- stopped
+    # discriminating when #127 removed every injection, so it is not the reason. The reason is
+    # that this task runs no user code: it sleeps in `timedwait` and calls `cleanup_old_tasks`
+    # once a day, so there is nothing here that could starve a thread and nothing to gain from
+    # migrating it. It is stopped by a `Channel` signal, never by an interrupt.
     task = @async begin
         while true
             wait_result = timedwait(() -> isready(stop_signal), interval_seconds)

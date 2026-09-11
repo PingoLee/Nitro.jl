@@ -130,9 +130,12 @@ end
         @test wait_for(() -> get_task_status(retry_id, Owner("user"); store=store)[:status] == "COMPLETED"; timeout=10.0) == :ok
         @test attempts[] == 3
 
+        # Cooperative, because cancellation IS cooperative now (#127). Nitro no longer
+        # interrupts the task, so a `while true` callback would outlive the testset and spin
+        # for the rest of the process.
         cancel_id = submit_task("cancel-task", task_info -> begin
             notify(started)
-            while true
+            while !cancel_requested(task_info)
                 sleep(0.01)
             end
             return task_info.id
@@ -229,6 +232,10 @@ end
 
 @testset "User access control and queue authorization" begin
     store = InMemoryWorkerStore()
+    # Declared out here so the `finally` below can release the callback -- see the note at
+    # the `task-access` submit.
+    access_started = Base.Event()
+    access_release = Base.Event()
     
     # Configure a mock queue authorizer
     set_queue_authorizer!(store, (queue_name, user_id) -> begin
@@ -249,7 +256,21 @@ end
 
         # 2. Task querying and watchers access control
         # submit a task by user-a (so user-a is the first watcher)
-        task_id = submit_task("task-access", () -> "data", Owner("user-a"); store=store)
+        #
+        # The callback is held open rather than returning immediately. This testset asserts an
+        # AUTHORIZATION property -- that the owner may cancel and a stranger may not -- and a
+        # cancel can only demonstrate that against a task still running. `() -> "data"` used to
+        # be safe here only by accident: under `@async` the body was pinned to the submitting
+        # thread and could not start until this test task yielded, so the cancel always won.
+        # Once worker bodies moved to `Threads.@spawn` (#30) it finishes first on the other
+        # thread and the cancel correctly reports "already finished" -- turning an
+        # authorization assertion into a race. Hold it open and the property is tested again.
+        task_id = submit_task("task-access", task_info -> begin
+            notify(access_started)
+            wait(access_release)
+            return "data"
+        end, Owner("user-a"); store=store)
+        wait(access_started)
         @test task_id == "user-a::task-access"
 
         # user-a can check status
@@ -299,6 +320,7 @@ end
         cancel_res = cancel_task(task_id, Owner("user-a"); store=store)
         @test cancel_res[:status] == "Task cancelled"
     finally
+        notify(access_release)
         reset_store!(store)
     end
 end
@@ -393,7 +415,7 @@ end
     try
         task_id = submit_task("long-job", task_info -> begin
             notify(started)
-            while true
+            while !cancel_requested(task_info)
                 sleep(0.01)
             end
         end, Owner("owner-a"); watchers=[Owner("helper")], store=store)
@@ -455,15 +477,18 @@ end
             replace_task!(store, t.id, t)            # starts PENDING
 
             @test try_transition!(store, "alice::cas", (PENDING, RUNNING), CANCELLED;
+                                  run_id=t.run_id,
                                   error="Cancelled", completed_at=Dates.now(Dates.UTC)) == true
             after = get_task_info(store, "alice::cas")
             @test after.status == CANCELLED
             @test after.error == "Cancelled"
 
             # Already left the `from` set: no second transition, and nothing written.
-            @test try_transition!(store, "alice::cas", (PENDING, RUNNING), COMPLETED) == false
+            @test try_transition!(store, "alice::cas", (PENDING, RUNNING), COMPLETED;
+                                  run_id=nothing) == false
             @test get_task_info(store, "alice::cas").status == CANCELLED
-            @test try_transition!(store, "no-such-task", (PENDING,), CANCELLED) == false
+            @test try_transition!(store, "no-such-task", (PENDING,), CANCELLED;
+                                  run_id=nothing) == false
         end
 
         @testset "concurrent add_watcher! loses no grant" begin
@@ -483,6 +508,390 @@ end
         reset_store!(store)
     end
 end
+
+@testset "terminal writes are addressed to a run, not just a task id (#108)" begin
+    store = InMemoryWorkerStore()
+    try
+        # Deliberately driven through the store primitives rather than through real tasks.
+        # The bug is a property of the compare-and-set, and asserting it directly makes the
+        # test deterministic -- no sleeps, no scheduling, nothing to flake.
+        @testset "a stale run's terminal write cannot land on its successor" begin
+            a = TaskInfo("alice::report")            # run A, still in flight
+            a.status = RUNNING
+            replace_task!(store, a.id, a)
+
+            b = TaskInfo("alice::report")            # the resubmit: fresh PENDING record
+            replace_task!(store, b.id, b)
+            @test b.run_id != a.run_id
+
+            # Verbatim the CAS `_finish_task!` issues. B's record satisfies the STATUS
+            # precondition -- PENDING is in `from` -- which is exactly why the status alone
+            # was never enough.
+            @test try_transition!(store, a.id, (PENDING, RUNNING), COMPLETED;
+                                  run_id=a.run_id, result="stale",
+                                  completed_at=Dates.now(Dates.UTC)) == false
+
+            live = get_task_info(store, a.id)
+            @test live.status == PENDING             # A's write landed nowhere...
+            @test live.result === nothing
+            @test live.run_id == b.run_id
+
+            # ...and B's own write still wins.
+            @test try_transition!(store, b.id, (PENDING, RUNNING), COMPLETED;
+                                  run_id=b.run_id, result="fresh") == true
+            @test get_task_info(store, b.id).result == "fresh"
+        end
+
+        @testset "run_id = nothing is the named, unconditional bypass" begin
+            c = TaskInfo("alice::bypass")
+            replace_task!(store, c.id, c)
+            @test try_transition!(store, c.id, (PENDING,), CANCELLED; run_id=nothing) == true
+            @test get_task_info(store, c.id).status == CANCELLED
+        end
+
+        @testset "every TaskInfo is its own run" begin
+            @test TaskInfo("alice::x").run_id != TaskInfo("alice::x").run_id
+        end
+
+        @testset "set_task! never writes run_id; replace_task! does" begin
+            original = TaskInfo("alice::split")
+            replace_task!(store, original.id, original)
+
+            # A DIFFERENT object carrying a different run id -- the shape a stale worker
+            # holds. `set_task!` must carry its state across and leave the identity alone,
+            # exactly as it already does for `watchers`.
+            stale = TaskInfo("alice::split")
+            stale.status = RUNNING
+            set_task!(store, stale.id, stale)
+
+            stored = get_task_info(store, "alice::split")
+            @test stored.run_id == original.run_id   # identity untouched
+            @test stored.status == RUNNING           # state carried
+
+            # ...and the one sanctioned way to publish a new run's identity.
+            replace_task!(store, stale.id, stale)
+            @test get_task_info(store, "alice::split").run_id == stale.run_id
+        end
+
+        @testset "a stale run's teardown cannot evict its successor's live handle" begin
+            a = TaskInfo("alice::handles")
+            a.status = RUNNING
+            replace_task!(store, a.id, a)
+            register_active_task!(store, a.id, @async sleep(0.01))
+
+            b = TaskInfo("alice::handles")           # the resubmit takes over the key
+            b.status = RUNNING
+            replace_task!(store, b.id, b)
+            b_handle = @async (sleep(30); nothing)
+            register_active_task!(store, b.id, b_handle)
+            register_active_task_info!(store, b.id, b)
+
+            # Run A finally finishes. Its CAS correctly writes nothing -- but before #108
+            # the teardown that follows was keyed by ID, so it deleted B's handle too.
+            Nitro.Workers._finish_task!(store, a, COMPLETED; result="stale")
+
+            @test get_active_task(store, "alice::handles") === b_handle
+            @test get_task_info(store, "alice::handles").status == RUNNING
+
+            # Why that mattered: zombie recovery decides liveness from exactly that handle,
+            # so an unfenced teardown made a genuinely-running successor look dead.
+            recover_zombie_tasks!(; store=store)
+            @test get_task_info(store, "alice::handles").status == RUNNING
+        end
+    finally
+        reset_store!(store)
+    end
+end
+
+@testset "a cancel that lands before the body starts is not overwritten (#142)" begin
+    @testset "the start write is a claim, so it cannot undo a cancellation" begin
+        store = InMemoryWorkerStore()
+        try
+            t = TaskInfo("alice::early")
+            replace_task!(store, t.id, t)
+
+            @test try_transition!(store, t.id, (PENDING,), CANCELLED;
+                                  run_id=t.run_id, error="Cancelled") == true
+
+            # THE property. Starting used to be an unconditional `set_task!`, so this write
+            # landed regardless and put the record back to RUNNING -- after which
+            # `_complete_task!`'s own CAS succeeded and reported COMPLETED for a task whose
+            # caller had been told "Task cancelled".
+            @test try_transition!(store, t.id, (PENDING,), RUNNING;
+                                  run_id=t.run_id,
+                                  started_at=Dates.now(Dates.UTC)) == false
+            @test get_task_info(store, t.id).status == CANCELLED
+            @test get_task_info(store, t.id).started_at === nothing
+        finally
+            reset_store!(store)
+        end
+    end
+
+    @testset "a claimed cancel is never followed by COMPLETED" begin
+        store = InMemoryWorkerStore()
+        try
+            # Cancel IMMEDIATELY after submit, without waiting for the callback to start --
+            # the window every other cancel test in this file deliberately closes by first
+            # waiting on an Event notified from *inside* the callback.
+            id = submit_task("race", () -> "done", Owner("u"); store=store)
+            @test cancel_task(id, Owner("u"); store=store)[:status] == "Task cancelled"
+
+            # A NEGATIVE, time-bounded assertion, and that direction is the point: a slow
+            # machine still times out, so this cannot flake into a false failure -- it can
+            # only fail if the status actually leaves CANCELLED, which is the bug. Asserting
+            # `wait_for(status == "CANCELLED")` instead would be useless here, since
+            # `timedwait` evaluates its predicate once up front and the record is already
+            # CANCELLED at that instant; the overwrite lands later.
+            @test timedwait(() -> get_task_status(id, Owner("u"); store=store)[:status] !=
+                                  "CANCELLED", 2.0) == :timed_out
+            @test get_task_status(id, Owner("u"); store=store)[:status] == "CANCELLED"
+        finally
+            reset_store!(store)
+        end
+    end
+
+    @testset "a queued item cancelled before it is dequeued never runs its callback" begin
+        store = InMemoryWorkerStore()
+        ran = Threads.Atomic{Bool}(false)
+        try
+            t = TaskInfo("alice::queued"; queue_name="reports")
+            replace_task!(store, t.id, t)
+            @test try_transition!(store, t.id, (PENDING,), CANCELLED;
+                                  run_id=t.run_id, error="Cancelled") == true
+
+            # Driven synchronously on purpose: the sequential processor calls exactly this,
+            # so the assertion is about the function rather than about scheduling.
+            item = Nitro.Workers.QueueItem(t.id, () -> (ran[] = true; "done"), TaskOptions())
+            Nitro.Workers._execute_queued_task(store, item)
+
+            @test ran[] == false
+            @test get_task_info(store, t.id).status == CANCELLED
+        finally
+            reset_store!(store)
+        end
+    end
+end
+
+@testset "cancellation is cooperative, never injected (#127)" begin
+    @testset "cancel_task sets the run's token, and the callback observes it" begin
+        store = InMemoryWorkerStore()
+        entered = Base.Event()
+        saw_token = Threads.Atomic{Bool}(false)
+        ran_finally = Threads.Atomic{Bool}(false)
+        try
+            id = submit_task("cooperative", task_info -> begin
+                notify(entered)
+                try
+                    while !cancel_requested(task_info)
+                        sleep(0.01)
+                    end
+                    saw_token[] = true
+                    return "stopped"
+                finally
+                    # Under the old model this ran because the injected exception unwound
+                    # the callback. Now it runs only because the callback RETURNS -- which
+                    # is the whole behavioural change apps have to absorb.
+                    ran_finally[] = true
+                end
+            end, Owner("u"); store=store)
+
+            wait(entered)
+            @test cancel_requested(get_task_info(store, id)) == false
+            @test cancel_task(id, Owner("u"); store=store)[:status] == "Task cancelled"
+
+            @test wait_for(() -> saw_token[]) == :ok
+            @test wait_for(() -> ran_finally[]) == :ok
+            @test get_task_status(id, Owner("u"); store=store)[:status] == "CANCELLED"
+        finally
+            reset_store!(store)
+        end
+    end
+
+    @testset "an uncooperative callback is not stopped, and cancel does not block on it" begin
+        store = InMemoryWorkerStore()
+        entered = Base.Event()
+        release = Base.Event()
+        returned = Threads.Atomic{Bool}(false)
+        try
+            id = submit_task("uncooperative", () -> begin
+                notify(entered)
+                wait(release)               # never polls the token
+                returned[] = true
+                return "finished anyway"
+            end, Owner("u"); store=store)
+
+            wait(entered)
+            # Returns immediately: the terminal state is recorded by the CAS, and there is
+            # nothing to wait for. This is the contract the docs claimed and the interrupt
+            # never actually delivered.
+            @test cancel_task(id, Owner("u"); store=store)[:status] == "Task cancelled"
+            @test get_task_status(id, Owner("u"); store=store)[:status] == "CANCELLED"
+            @test returned[] == false       # still running, as documented
+
+            notify(release)
+            @test wait_for(() -> returned[]) == :ok
+            # It ran to completion -- and still must not overwrite the cancellation.
+            @test wait_for(() -> get_task_status(id, Owner("u"); store=store)[:status] ==
+                                 "CANCELLED") == :ok
+        finally
+            notify(release)
+            reset_store!(store)
+        end
+    end
+
+    @testset "a timeout sets the token, records FAILED, and is never retried" begin
+        store = InMemoryWorkerStore()
+        entries = Threads.Atomic{Int}(0)
+        try
+            # retry_on_failure is ON on purpose: a timeout must still be terminal on the
+            # first attempt. Retrying would put a second copy of the callback beside the
+            # first, since nothing can stop the one that timed out.
+            # No `@suppress_err` here, deliberately. It would wrap only this call, which
+            # returns immediately, while the timeout `@warn` fires about a second later from
+            # the worker task -- so it suppressed nothing and merely looked like it did. The
+            # warning is expected output for this testset, and seeing it in CI is a feature:
+            # it is the only signal an abandoned callback produces.
+            id = submit_task("slow", () -> begin
+                Threads.atomic_add!(entries, 1)
+                sleep(2.0)                  # outruns the deadline, ignores the token
+                return "too late"
+            end, Owner("u");
+            options=TaskOptions(timeout=1, retry_on_failure=true, max_retries=2), store=store)
+
+            @test wait_for(() -> get_task_status(id, Owner("u"); store=store)[:status] ==
+                                 "FAILED"; timeout=10.0) == :ok
+            status = get_task_status(id, Owner("u"); store=store)
+            @test occursin("Timeout of 1s exceeded", status[:error])
+            @test entries[] == 1
+        finally
+            reset_store!(store)
+        end
+    end
+
+    @testset "a fast task leaves no handle behind" begin
+        # `_execute_task_async` used to also `register_active_task!` from the PARENT, after the
+        # spawn. Under `@async` that was a duplicate write of the same Task object and merely
+        # happened first; under `Threads.@spawn` the body can finish and deregister before the
+        # parent gets there, re-registering a completed task that nothing ever cleans up (#30).
+        store = InMemoryWorkerStore()
+        try
+            id = submit_task("quick", () -> "done", Owner("u"); store=store)
+            @test wait_for(() -> get_task_status(id, Owner("u"); store=store)[:status] ==
+                                 "COMPLETED") == :ok
+            @test wait_for(() -> !haskey(store.active_tasks, id)) == :ok
+        finally
+            reset_store!(store)
+        end
+    end
+
+    @testset "a cancelled task stops reporting RUNNING, on both backends" begin
+        # Regression guard for the store-parity gap that removing `cancel_task`'s
+        # deregisters opened. `PormGWorkerStore.try_transition!` writes only the row while
+        # its `get_task_info` prefers the live in-memory record, so without mirroring the
+        # claim onto that record a cancelled task kept reporting RUNNING until its callback
+        # returned -- and `_register_or_watch!` then refused to re-run the key.
+        store = InMemoryWorkerStore()
+        entered = Base.Event()
+        release = Base.Event()
+        try
+            id = submit_task("mirror", () -> (notify(entered); wait(release); "done"),
+                             Owner("u"); store=store)
+            wait(entered)
+            @test cancel_task(id, Owner("u"); store=store)[:status] == "Task cancelled"
+
+            # Asserted while the callback is STILL RUNNING -- that is the whole window.
+            live = get_active_task_info(store, id)
+            @test live === nothing || live.status == CANCELLED
+            @test get_task_status(id, Owner("u"); store=store)[:status] == "CANCELLED"
+
+            # The two downstream consequences the stale record caused.
+            @test haskey(cancel_task(id, Owner("u"); store=store), :error)
+            again = submit_task("mirror", () -> "second", Owner("u"); store=store)
+            @test again == id
+            @test wait_for(() -> get_task_status(id, Owner("u"); store=store)[:result] ==
+                                 "second") == :ok
+        finally
+            notify(release)
+            reset_store!(store)
+        end
+    end
+
+    @testset "a cancel during the retry backoff does not re-run the callback" begin
+        # The catch block checks CANCELLED before sleeping and never after, and #127 removed
+        # the interrupt that used to abort that sleep -- so a cancel landing inside a 2/4/8s
+        # backoff window used to burn another attempt against an already-cancelled task.
+        store = InMemoryWorkerStore()
+        attempts = Threads.Atomic{Int}(0)
+        entered = Base.Event()
+        try
+            id = submit_task("backoff", () -> begin
+                n = Threads.atomic_add!(attempts, 1) + 1
+                n == 1 && notify(entered)
+                error("attempt $n failed")
+            end, Owner("u");
+            options=TaskOptions(retry_on_failure=true, max_retries=3), store=store)
+
+            wait(entered)          # attempt 1 has STARTED; it has not necessarily failed yet
+
+            # Land the cancel INSIDE the backoff, which is the window under test. Without
+            # this pause the cancel usually arrives before the catch block evaluates its own
+            # CANCELLED check, that check short-circuits, and the retry loop is never
+            # reached -- so the test passed against the broken code. 0.3s is far more than
+            # the callback needs to throw and be caught, and far less than the 2s backoff.
+            sleep(0.3)
+            @test cancel_task(id, Owner("u"); store=store)[:status] == "Task cancelled"
+
+            @test wait_for(() -> get_task_status(id, Owner("u"); store=store)[:status] ==
+                                 "CANCELLED"; timeout=10.0) == :ok
+
+            # The point: the backoff was abandoned rather than slept through. This has to
+            # outlast the 2s first backoff, and it has to be a NEGATIVE assertion -- the
+            # obvious `@test attempts[] == 1` passes against the broken code too, because it
+            # is evaluated long before the sleep would have expired and the second attempt
+            # started. A time-bounded "this never happens" is the only form that discriminates,
+            # and it cannot flake into a false failure on a slow machine.
+            @test timedwait(() -> attempts[] > 1, 3.5) == :timed_out
+            @test attempts[] == 1
+        finally
+            reset_store!(store)
+        end
+    end
+
+    @testset "nothing in Workers injects an exception into a task" begin
+        # A source assertion, because the property is "no site in this module does this"
+        # rather than "this function behaves thus" -- and reintroducing the injection is
+        # the specific regression that would make worker bodies unsafe to migrate again.
+        for file in ("api.jl", "execution.jl", "queue.jl")
+            src = read(joinpath(pkgdir(Nitro), "src", "Workers", file), String)
+            # Comments are stripped first: the sites that were removed are DESCRIBED in
+            # comments right where they used to be, and a guard that cannot tell an
+            # explanation from a call would fail on its own documentation.
+            code = join((line for line in eachsplit(src, "
+")
+                         if !startswith(strip(line), "#")), "
+")
+            @test !occursin("error=true", code)
+            @test !occursin("error = true", code)
+        end
+    end
+end
+
+# NOT HERE: the probe #127 asked for -- "submit a CPU-bound callback, wait until it is provably
+# running, then cancel, at -t 2". It was written, and it wedged the ReTestItems worker into a
+# 600s timeout on roughly half of -t 2 runs. Recorded so the next attempt does not rediscover it:
+#
+#   * Nitro is not the stall. Tracing every branch of the worker path showed it reached
+#     `_invoke_task_callback` EVERY time and stopped before the callback's first statement.
+#     `body-claim-FAILED` never appeared once, so the claimed start (#142) is not implicated.
+#   * The same scenario runs 25/25 clean standalone at -t 2. It needs the full suite around it.
+#   * Disabling only this testset: 6/6 clean at -t 2. The swap itself is stable.
+#   * Three fixes were tried and NONE worked: `GC.safepoint()` in the spin, replacing the spin
+#     with allocating work, and pre-compiling the callback on the test task before submitting.
+#
+# So the gap is real and is written down rather than papered over: nothing here cancels a task
+# that is genuinely executing on another thread. Every cancel test above uses a `sleep` loop,
+# and a task in `sleep` is PARKED -- which is exactly the weak probe that let the first attempt
+# at #30 ship a process abort. Tracked in #143, with the full trace evidence.
 
 @testset "queue introspection is an admin surface (#87)" begin
     store = InMemoryWorkerStore()
@@ -919,7 +1328,7 @@ end
     try
         task_id2 = submit_task("cancel-fields-task", task_info -> begin
             notify(started)
-            while true; sleep(0.01); end
+            while !cancel_requested(task_info); sleep(0.01); end
         end, Owner("user"); store=store2)
 
         wait(started)

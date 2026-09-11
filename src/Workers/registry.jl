@@ -8,15 +8,20 @@ function get_task_info end
 
 Persist a task's **volatile runtime state**: status, progress, result, error, timestamps.
 
-**It must not write `watchers`.** Grants are not volatile state, and a store that carries
-them along on every state transition loses them: `PormGWorkerStore` rewrote the whole row
+**It must not write `watchers` or `run_id`.** Neither is volatile state, and a store that
+carries them along on every state transition loses them: `PormGWorkerStore` rewrote the whole row
 on each save, so a task completing in one process clobbered a watcher another process had
 appended since that process last read the row
 ([#88](https://github.com/PingoLee/Nitro.jl/issues/88)). State transitions are far more
 frequent than watcher appends, so this was the dominant way a grant went missing.
 
+`run_id` is excluded for a second, sharper reason: it is the precondition
+[`try_transition!`](@ref) fences terminal writes with, so a `set_task!` that carried it would let a
+re-run's identity be overwritten by whichever run wrote last — defeating the mechanism entirely
+([#108](https://github.com/PingoLee/Nitro.jl/issues/108)).
+
 Use [`add_watcher!`](@ref) to add a grant and [`replace_task!`](@ref) to write a whole
-record, watchers included.
+record, watchers and run id included.
 
 The return value is **unspecified** — a store may return the caller's object or the record
 it holds. Do not rely on it, and do not rely on it being the same across backends.
@@ -26,10 +31,11 @@ function set_task! end
 """
     replace_task!(store, task_id::String, task_info::TaskInfo)
 
-Write a task record **in full, `watchers` included**, replacing whatever is stored.
+Write a task record **in full, `watchers` and `run_id` included**, replacing whatever is
+stored.
 
 The counterpart to [`set_task!`](@ref), and the only sanctioned way to reset a watcher
-list. There is exactly one caller: re-running a *finished* task key, which by documented
+list — or to publish a new run's identity. There is exactly one caller: re-running a *finished* task key, which by documented
 design replaces the record and resets its watchers to the resubmitter.
 
 A store that cannot distinguish this from `set_task!` has not implemented `set_task!`
@@ -59,11 +65,11 @@ function add_watcher! end
 
 """
     try_transition!(store, task_id::String, from, to::TaskStatus;
-                    error=nothing, completed_at=nothing) -> Bool
+                    run_id, error=nothing, completed_at=nothing) -> Bool
 
 Move `task_id` from any status in `from` to `to`, atomically. Returns `true` if this call
-made the transition, `false` if the task was absent or had already left `from` — in which
-case **nothing was written**.
+made the transition, `false` if the task was absent, had already left `from`, or belongs to a
+run other than `run_id` — in which case **nothing was written**.
 
 The compare-and-set counterpart to `set_task!` for the one write where losing the race
 matters: cancellation. `cancel_task` used to read the status, decide, and then save the
@@ -71,7 +77,32 @@ whole record under `lock_tasks`; against a shared database that lock does not sp
 processes, so a task completing in one process could overwrite a cancellation another
 process had just recorded ([#88](https://github.com/PingoLee/Nitro.jl/issues/88)).
 
-`from` is any iterable of `TaskStatus`. Like `set_task!`, this must not write `watchers`.
+`from` is any iterable of `TaskStatus`. Like `set_task!`, this must not write `watchers` or
+`run_id` — it *compares* the latter, it never sets it.
+
+It is not only for terminal states. **Starting** a task is a claimed transition too
+(`(PENDING,) → RUNNING`, carrying `started_at`), because an unconditional start write can land
+*after* a cancellation that already claimed the record and silently undo it
+([#142](https://github.com/PingoLee/Nitro.jl/issues/142)).
+
+# `run_id` — the precondition names a run, not just a status
+
+A task id outlives the run writing under it. Re-running a finished key replaces the record with a
+fresh `PENDING` one ([`replace_task!`](@ref)) while the previous run's worker task may still be in
+flight; its terminal write then satisfies `status in (PENDING, RUNNING)` against a record it never
+ran, and stamps its stale result onto the new run
+([#108](https://github.com/PingoLee/Nitro.jl/issues/108)).
+
+`run_id` is therefore **required, with no default**. Passing `nothing` is legal and means "no run
+precondition — write whichever run owns the record", but you have to write it. A default would
+rebuild the shape [#48](https://github.com/PingoLee/Nitro.jl/issues/48) removed: the unfenced call
+would be the *shorter* one, and a new terminal-write call site that merely forgot the keyword would
+be indistinguishable in review from one that meant to skip the fence.
+
+A store that accepts `run_id` and ignores it is **not a conforming store** — it reintroduces #108
+for its own backend, exactly as a store that reads the status and then saves reintroduces #88. An
+un-updated third-party store fails loudly instead: these are bare interface stubs with no fallback
+method, so a call carrying the keyword raises `MethodError` at the call site.
 """
 function try_transition! end
 
@@ -190,8 +221,15 @@ function set_task!(store::InMemoryWorkerStore, task_id::String, task_info::TaskI
         end
 
         # A different object: copy the volatile state across and keep the *stored*
-        # record's watchers — precisely what the serializing store achieves by omitting
-        # the column. The caller's object is left untouched, so both backends agree on
+        # record's watchers, run_id AND cancel_requested — precisely what the serializing
+        # store achieves by omitting those columns. The list below is otherwise "copy every
+        # field", so those three absences ARE the rule.
+        #
+        # `run_id` is the value `try_transition!` fences on, so copying it off a caller's
+        # object would let a stale run adopt the current run's identity (#108).
+        # `cancel_requested` is worse: a stale object still carrying `false` would ERASE a
+        # cancel already requested, which is the #88 watcher clobber with the sign flipped
+        # (#127). The caller's object is left untouched, so both backends agree on
         # that too; a rule honoured by only one of them is a store that silently behaves
         # differently, which for this pair means a different security posture.
         existing.status = task_info.status
@@ -226,17 +264,22 @@ function add_watcher!(store::InMemoryWorkerStore, task_id::String, user_id::Stri
 end
 
 function try_transition!(store::InMemoryWorkerStore, task_id::String, from, to::TaskStatus;
+                         run_id::Union{Nothing, UUID},
                          error::Union{Nothing, String}=nothing,
                          completed_at::Union{Nothing, DateTime}=nothing,
+                         started_at::Union{Nothing, DateTime}=nothing,
                          result=UNSUPPLIED,
                          progress::Union{Nothing, Real}=nothing)
     lock(store.task_lock) do
         task_info = Base.get(store.task_registry, task_id, nothing)
         task_info === nothing && return false
         task_info.status in from || return false
+        # The run fence. `nothing` is the named opt-out, never a default (#108).
+        run_id === nothing || task_info.run_id == run_id || return false
 
         error === nothing || (task_info.error = error)
         completed_at === nothing || (task_info.completed_at = completed_at)
+        started_at === nothing || (task_info.started_at = started_at)
         result === UNSUPPLIED || (task_info.result = result)
         progress === nothing || (@atomic task_info.progress = Float64(progress))
         task_info.status = to        # last, so no reader sees the new status early

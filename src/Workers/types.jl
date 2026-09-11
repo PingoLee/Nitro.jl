@@ -110,8 +110,33 @@ function owner_of(task_id::AbstractString)
     return id[1:prevind(id, first(range))]
 end
 
+"""
+    TaskInfo(id; queue_name=nothing)
+
+One task record — and, crucially, **one run of it**.
+
+`id` names the task; `run_id` names *this attempt*. The two are not the same thing, because
+re-running a finished key replaces the record with a brand-new `TaskInfo` while keeping the id
+([`replace_task!`](@ref)). The previous run's worker task may still be in flight at that moment,
+and a terminal write that only names the id is indistinguishable from one belonging to the run
+that replaced it ([#108](https://github.com/PingoLee/Nitro.jl/issues/108)).
+
+So the invariant is: **one `TaskInfo` object is one run.** A re-run constructs a new object; it is
+never a mutation of the old one. Everything that identifies a run — `run_id` today — may therefore
+be set exactly once, in this constructor, and read freely without synchronisation.
+"""
 mutable struct TaskInfo
     id::String
+    # Identity of this run, not state of the task. Written only by `replace_task!`, never by
+    # `set_task!` — the same split that protects `watchers`, and for the same reason: a value
+    # carried along on every state transition is a value that gets clobbered.
+    #
+    # `uuid4()`, deliberately NOT `Crypto.secure_uuid4()`. A run id is an internal correlation
+    # value: it is never returned to a caller and is never a capability, so guessing one buys
+    # nothing — forging a terminal write also requires being inside the process that calls
+    # `try_transition!`. `src/crypto.jl` documents the opposite trade-off for session ids,
+    # which ARE capabilities.
+    run_id::UUID
     status::TaskStatus
     @atomic progress::Float64
     result::Any
@@ -122,11 +147,20 @@ mutable struct TaskInfo
     watchers::Vector{String}
     sys_task::Union{Nothing, Task}
     queue_name::Union{Nothing, String}
+    # The cancellation token. Process-local and NOT persisted: it is a request aimed at a
+    # callback running *here*, and the durable `status` is what carries a cancellation
+    # between processes. Read it with `cancel_requested`.
+    #
+    # Excluded from `set_task!`'s field copy for the same reason `watchers` is: a stale
+    # caller object carrying `false` would ERASE a cancel that had already been requested,
+    # which is the #88 clobber with the sign flipped.
+    @atomic cancel_requested::Bool
 
     function TaskInfo(id::String; queue_name::Union{Nothing, String}=nothing)
         created_at = current_time_utc()
         return new(
             id,
+            uuid4(),
             PENDING,
             0.0,
             nothing,
@@ -137,6 +171,7 @@ mutable struct TaskInfo
             String[],
             nothing,
             queue_name,
+            false,
         )
     end
 end
@@ -176,6 +211,61 @@ function update_progress!(task_info::TaskInfo, value::Real)
     @atomic task_info.progress = Float64(value)
     return task_info
 end
+
+"""
+    cancel_requested(task_info::TaskInfo) -> Bool
+
+`true` once cancellation has been requested for **this run**, in **this process**.
+
+Poll it from any long-running callback. It is the whole of Nitro's cancellation mechanism:
+`cancel_task` and an expired `TaskOptions(timeout=…)` both set it, and neither can stop a
+callback that never looks ([#127](https://github.com/PingoLee/Nitro.jl/issues/127)).
+
+```julia
+submit_task("import", task_info -> begin
+    for chunk in chunks
+        cancel_requested(task_info) && return "cancelled"
+        process(chunk)
+        update_progress!(task_info, 100 * done / total)
+    end
+end, Owner("user-1"))
+```
+
+Nitro used to throw an `InterruptException` into the worker task as well. That is what Java's
+`Thread.stop()` and .NET's `Thread.Abort()` did, and both were withdrawn as unfixable; in Julia
+`schedule(t, exc; error=true)` against a task that is *already executing* aborts the process in
+`jl_finish_task`. Go's `context.Context`, Sidekiq and River are all cooperative for the same
+reason, and a single-process framework has no isolation boundary to kill across.
+
+**It is process-local, and never reset.** A cancel issued on another node writes the durable
+row and sets nothing here, so a cross-process callback must poll the record instead —
+`get_task_status(task_info.id, System())[:status] == "CANCELLED"`, sparingly, since it is a
+round-trip. Re-running a key builds a fresh `TaskInfo`, so the token starts `false` by
+construction rather than by being cleared; see [`TaskInfo`](@ref).
+
+`true` on a `FAILED` task means the deadline fired, mirroring Go's `ctx.Err() ==
+DeadlineExceeded`. Reading the field directly also works — a relaxed read of a `Bool` is
+harmless — so unlike [`update_progress!`](@ref) this accessor is a convention, not an
+enforcement.
+"""
+cancel_requested(task_info::TaskInfo) = @atomic task_info.cancel_requested
+
+"""
+    TaskTimeoutError(timeout)
+
+A task callback outran its `TaskOptions(timeout=…)`.
+
+Distinct from a plain `ErrorException` because it is the one failure that must **not** be
+retried: nothing can stop the attempt that timed out, so retrying would run a second copy of the
+callback beside the first, against the same `task_info` and the same external state. Its
+`showerror` text is unchanged from the message this used to throw, so anything matching on the
+rendered string still matches.
+"""
+struct TaskTimeoutError <: Exception
+    timeout::Int
+end
+
+Base.showerror(io::IO, e::TaskTimeoutError) = print(io, "Timeout of $(e.timeout)s exceeded")
 
 @kwdef struct TaskOptions
     priority::Int = 5
