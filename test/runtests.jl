@@ -1,19 +1,104 @@
 ﻿# ── Bootstrap test-only dependencies ──────────────────────────────────────────
-# Test-only deps (Suppressor, ProtoBuf, …) live in `[extras]` / `[targets].test`,
-# so they are only on the load path under `Pkg.test()`. When this file is run
-# directly — `julia --project=. test/runtests.jl <args>` — those packages are
+# Test-only deps (Suppressor, ProtoBuf, PormG, …) live in `[extras]` /
+# `[targets].test`, so they are on the load path only under `Pkg.test()`. When this
+# file is run directly — `julia --project=. test/runtests.jl <args>` — they are
 # missing and every test item errors with "Package X not found in current path".
 # Detect that case and re-dispatch through `Pkg.test` once, forwarding the CLI
 # args, so all the documented commands below work without extra ceremony.
-if Base.identify_package("Suppressor") === nothing && get(ENV, "NITRO_TEST_REDISPATCH", "0") == "0"
-    import Pkg
-    withenv("NITRO_TEST_REDISPATCH" => "1") do
-        # Forward this launcher's thread count to the test subprocess, so
-        # `julia -t auto … runtests.jl` still runs test items multithreaded
-        # after the re-dispatch (relevant for in-process runs, i.e. no --workers).
-        Pkg.test(; test_args = ARGS, julia_args = `-t $(Threads.nthreads())`)
+#
+# PROBE EVERY TARGET, NOT ONE OF THEM (#128). This used to ask a single question --
+# `Base.identify_package("Suppressor") === nothing` -- and treat the answer as "am I
+# in the test environment?". That is a PROXY, and `Base.identify_package` searches the
+# whole `LOAD_PATH`, including the user's global `@v#.#` environment. So on a machine
+# with `Suppressor` installed globally the probe answered "already provisioned", the
+# re-dispatch never fired, and the run proceeded with the registry packages resolving
+# from the global env while `PormG` -- a `[sources]` path dep, which can never be
+# globally installed -- stayed missing.
+#
+# That combination is the one that does not announce itself. A missing `ReTestItems`
+# kills the run on line 1; a missing `PormG` only makes `extensions/pormg_worker_tests.jl`
+# take its skip branch, so 112 assertions vanish and the run still exits 0.
+#
+# Reading `[targets].test` keeps the probe honest by construction: adding a test
+# dependency to `Project.toml` extends this check with no edit here.
+#
+# `Pkg.TOML`, not the `TOML` stdlib: under `Pkg.test` the temporary test environment
+# declares only `[targets].test`, and an stdlib that is not among them is NOT importable
+# there. `Pkg` is on that list. (`test/revise_test.jl` reaches TOML the same way.)
+import Pkg
+let project_file = joinpath(@__DIR__, "..", "Project.toml"),
+    project = Pkg.TOML.parsefile(project_file)
+
+    targets = String[string(p) for p in get(get(project, "targets", Dict{String,Any}()),
+                                            "test", String[])]
+    missing_deps = filter(p -> Base.identify_package(p) === nothing, targets)
+
+    # "Have I already re-dispatched?" asked two ways, because the env var alone is a flag
+    # the PARENT sets and `Pkg.test()` does not. Invoked as `Pkg.test()` directly, the var
+    # is unset -- so a dependency unresolvable inside the temp env would make this spawn a
+    # SECOND `Pkg.test` from inside the first, and report that mess instead of the refusal
+    # written below. The active project is the durable signal: under `Pkg.test` it is a
+    # temporary environment, never this repo's own `Project.toml`.
+    #
+    # `samefile`, not string comparison. The two paths are built from different sources --
+    # `active` from however `--project` was spelled, `project_file` from `@__DIR__` -- so
+    # comparing text asks whether they were TYPED alike, when the question is whether they
+    # ARE the same file. On Windows that is case-insensitive, and this repo reaches its
+    # worktrees through directory junctions, either of which makes equal files compare
+    # unequal and turn a normal run into a refusal. `samefile` compares device + inode and
+    # returns false (rather than throwing) when a path does not exist.
+    # Named for what it actually tests. It is true for ANY active project that is not this
+    # repo's -- a `Pkg.test` temp env, the global `@v#.#` env, an unrelated project -- so a
+    # name like `in_test_env` would license the message below to assert "you are under
+    # Pkg.test", which is exactly the wrong thing to tell someone who simply forgot
+    # `--project=.`.
+    active = Base.active_project()
+    active_is_not_ours = active === nothing ||
+                         !Base.Filesystem.samefile(active, project_file)
+    redispatched = get(ENV, "NITRO_TEST_REDISPATCH", "0") != "0" || active_is_not_ours
+
+    if !isempty(missing_deps)
+        if !redispatched
+            withenv("NITRO_TEST_REDISPATCH" => "1") do
+                # Forward this launcher's thread count to the test subprocess, so
+                # `julia -t auto … runtests.jl` still runs test items multithreaded
+                # after the re-dispatch (relevant for in-process runs, i.e. no --workers).
+                Pkg.test(; test_args = ARGS, julia_args = `-t $(Threads.nthreads())`)
+            end
+            exit(0)
+        end
+
+        # Already inside `Pkg.test` and a declared test dependency is STILL missing.
+        # That is an environment bug, not a valid configuration -- and it must not be
+        # allowed to degrade quietly into a shorter suite. Refuse before a single item
+        # runs. This costs nobody a run they could otherwise have had: without a sibling
+        # `../PormG.jl` every Pkg operation already dies at resolve time.
+        error(
+            "Nitro test environment is incomplete.\n\n" *
+            "Missing declared `[targets].test` dependencies:\n" *
+            join(("  - $p" for p in missing_deps), "\n") * "\n\n" *
+            # Print both, always. Which environment is live is the single most useful fact
+            # here and the one the caller cannot see -- and when the two differ, that IS
+            # the diagnosis rather than any of the causes listed below.
+            "Active project: " * (active === nothing ? "(none)" : active) * "\n" *
+            "Expected:       " * abspath(project_file) * "\n\n" *
+            "Refusing to run. A suite missing a test dependency does not fail -- it runs\n" *
+            "SHORT and still exits 0, because the items behind that dependency skip\n" *
+            "instead of erroring. That is #128, and it hid 112 assertions.\n\n" *
+            "Likely causes:\n" *
+            # First, because it is the only one a reader can confirm from the two lines
+            # directly above, and because "every single target is missing" -- rather than a
+            # subset -- is the tell. Omitting it made this message confidently misdiagnose
+            # the most ordinary mistake there is.
+            "  * No Nitro environment is active -- you ran without `--project=.`. That is\n" *
+            "    this message when the two paths above differ and EVERY target is listed.\n" *
+            "  * `NITRO_TEST_REDISPATCH` is stale in your shell from an interrupted run.\n" *
+            "    Unset it and re-run.\n" *
+            "  * A worktree with no sibling `../PormG.jl`: `bash scripts/worktree_setup.sh`.\n" *
+            "  * The environment was re-resolved (`Pkg.update`, `Pkg.resolve`) and dropped a\n" *
+            "    path dependency. `Pkg.test()` re-provisions it."
+        )
     end
-    exit(0)
 end
 
 using ReTestItems

@@ -308,6 +308,13 @@ any code that must not touch the global.
 
 - **Run the narrowest relevant slice first; broaden only after green.**
 
+Every `test/runtests.jl` invocation below re-dispatches through `Pkg.test` to provision
+`[targets].test` (`PormG` included), so the `--project=.` and `Pkg.test()` forms are equivalent —
+not a cheap run versus a full one. What neither will do any more is run *short*: a missing declared
+test dependency is refused before the first item rather than skipped
+([#128](https://github.com/PingoLee/Nitro.jl/issues/128)). The smoke test is the deliberate
+exception and does not re-dispatch — that is the whole point of it, see its comment below.
+
 ```bash
 # Full suite
 julia --project -e 'using Pkg; Pkg.test()'
@@ -342,7 +349,15 @@ julia --project=docs docs/make.jl
   A change that only passes single-threaded is not green. Thread-count-dependent failures are a
   known class — see `nitro-test-troubleshooting`.
 - **`PormG` is a path dependency** (`[sources] PormG = {path = "../PormG.jl"}`) and a hard test
-  dependency: a sibling `../PormG.jl` checkout must exist for `Pkg.test()` to resolve.
+  dependency: a sibling `../PormG.jl` checkout must exist for `Pkg.test()` to resolve. It is also
+  the one test dependency whose absence used to be **quiet**: everything else errors on import,
+  while `PormG` merely made the `PormGWorkerStore` testset skip — 112 assertions gone from a run
+  that still exited 0. Both ends of that are closed now. `test/runtests.jl` probes every
+  `[targets].test` entry rather than one proxy package, and refuses an incomplete environment;
+  `test/harness_tests.jl` fails on any skip not written down in `SKIPS_OK`
+  (`test/harness_manifest.jl`) — `@test_skip`, `@test_broken`, and the keyword forms
+  `@test ex skip=true` / `@test ex broken=true`, which report as `Broken` just the same.
+  **A green suite is again evidence that the suite ran.**
 - When a test is red and the cause isn't obviously your change, read
   [`nitro-test-troubleshooting`](../skills/nitro-test-troubleshooting/SKILL.md) before bisecting.
 

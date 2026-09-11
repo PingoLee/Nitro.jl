@@ -111,6 +111,23 @@ const TEST_FILES = [
 # unexecuted, and nothing said so (#34).
 const UNLISTED_OK = String[]
 
+# Test files permitted to contain `@test_skip` / `@test_broken`, as "file.jl" entries.
+#
+# Empty today, and -- exactly like `UNLISTED_OK` above -- that is the point. A skip is a
+# decision to ship less coverage, so it should be a decision someone wrote down here and
+# can be argued with, not a branch added quietly inside a test file.
+#
+# The two that used to be here are gone rather than listed: `extensions/pormg_worker_tests.jl`
+# and `revise_test.jl` both guarded on a declared `[targets].test` dependency being
+# importable and skipped when it was not. That is an environment bug reporting itself as a
+# pass (#128); both now fail, and `test/runtests.jl` refuses the run even earlier.
+#
+# Before adding an entry, check it is genuinely not one of those. A skip is defensible when
+# the missing capability is a property of the PLATFORM (no symlink privilege, no /proc) that
+# no amount of provisioning can supply. It is not defensible when the missing capability is a
+# package the suite already declares it needs.
+const SKIPS_OK = String[]
+
 # The complete tag vocabulary.
 #
 # `--tags x` for an `x` outside this set is a typo, not a filter. ReTestItems does fail on
@@ -179,6 +196,71 @@ function testitems(path)
             name isa String && push!(out, (name, tags))
         end
         foreach(walk, e.args)
+    end
+    walk(Meta.parseall(read(path, String)))
+    return out
+end
+
+# ── Skip detection -- AST, not regex, for the same BOM reason as above ────────────────
+# A conditional skip turns missing coverage into a PASS. `@test_skip` and `@test_broken`
+# both report as `Broken`, which is one line in a 3,500-assertion summary and leaves the
+# exit code at 0 -- so the suite says "green" while being materially weaker. #128 is the
+# receipt: `extensions/pormg_worker_tests.jl` skipped its entire real-store testset (112
+# assertions, the only coverage the shipped `ext/NitroPormGExt.jl` store gets) whenever
+# PormG was missing from the environment, and every run still passed.
+#
+# `test/harness_tests.jl` asserts this finds nothing outside `SKIPS_OK`.
+#
+# THREE spellings, because a check that knows only one is a check you route around without
+# meaning to:
+#   * bare      -- `@test_skip ex`
+#   * qualified -- `Test.@test_skip ex`, arbitrarily nested (`Main.Test.@test_skip`)
+#   * KEYWORD   -- `@test ex skip=true` / `@test ex broken=true`
+#
+# The keyword form is the one that matters most, and it is not an exotic dodge: it is the
+# modern Test.jl idiom (Julia >= 1.7), it is what the Test stdlib documentation reaches for
+# first, and it reports as `Broken` exactly like `@test_skip`. `@test store() skip=(PormG
+# === nothing)` would have reconstituted #128 in full while this guard stayed green.
+#
+# Flagged regardless of the keyword's VALUE. `skip=false` is pointless to write, and
+# `skip=<expr>` is not statically evaluable -- which is precisely the conditional-skip case
+# that has to be argued for in `SKIPS_OK` rather than slipped in.
+const SKIP_MACROS = (Symbol("@test_skip"), Symbol("@test_broken"))
+const SKIP_KWARGS = (:skip, :broken)
+
+_macroname(x::Symbol) = x
+_macroname(x::Expr) = (x.head === :. && length(x.args) == 2 && x.args[2] isa QuoteNode) ?
+                      x.args[2].value : nothing
+_macroname(::Any) = nothing
+
+function skip_macros(path)
+    out = Tuple{Symbol, Int}[]
+    line = 0
+    function walk(e)
+        e isa Expr || return
+        if e.head === :macrocall && !isempty(e.args)
+            nm = _macroname(e.args[1])
+            ln = (length(e.args) >= 2 && e.args[2] isa LineNumberNode) ?
+                 e.args[2].line : line
+            if nm !== nothing && nm in SKIP_MACROS
+                push!(out, (nm, ln))
+            elseif nm === Symbol("@test")
+                # `@test ex skip=true` parses the keyword as `Expr(:(=), :skip, true)` --
+                # NOT `Expr(:kw, ...)`, which is what a function-call keyword produces.
+                #
+                # From args[4]: args[3] is the test-EXPRESSION slot, so scanning from 3
+                # reads `@test (skip = true)` -- an assignment written as the expression --
+                # as a keyword skip. Meaningless code, but the narrower range costs nothing.
+                for a in e.args[4:end]
+                    a isa Expr && a.head === :(=) && a.args[1] in SKIP_KWARGS || continue
+                    push!(out, (Symbol("@test ", a.args[1], "="), ln))
+                end
+            end
+        end
+        for a in e.args
+            a isa LineNumberNode && (line = a.line)
+            walk(a)
+        end
     end
     walk(Meta.parseall(read(path, String)))
     return out
