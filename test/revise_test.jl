@@ -17,8 +17,16 @@ project_toml = TOML.parsefile(joinpath(pkgdir(Nitro), "Project.toml"))
 @test get(project_toml["extensions"], "NitroReviseExt", nothing) == "Revise"
 
 revise_path = Base.find_package("Revise")
+# FAIL, do not skip (#128) -- the sibling of the `PormG` case in
+# `test/extensions/pormg_worker_tests.jl`. This was `@test_skip false`, which reports as
+# `Broken` and carries no message at all, so a run that never exercised the
+# `NitroReviseExt` hot-reload integration was indistinguishable from one that did.
+# `Revise` is a declared `[targets].test` dependency; its absence is an environment bug.
 if revise_path === nothing
-    @test_skip false
+    error("Revise is not available, so the NitroReviseExt integration cannot be " *
+          "exercised. Revise is a declared `[targets].test` dependency: this is a " *
+          "broken test environment, not a valid configuration, and failing here is " *
+          "deliberate (#128). Re-provision with `Pkg.test()`.")
 else
     integration_script = """
         using Revise

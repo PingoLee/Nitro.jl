@@ -297,8 +297,24 @@ end
 
 const RealPormGWorkerStore = _load_pormg_worker_store_type()
 
+# FAIL, do not skip (#128). This branch used to be
+# `@test_skip "PormG is not available, ..."`, which the Test stdlib reports as
+# `Broken 1` -- one line in a 3,500-assertion summary, with the run still exiting 0.
+# Everything below this point (~112 assertions across 24 testsets, the only coverage
+# the SHIPPED `ext/NitroPormGExt.jl` store ever gets) silently did not run.
+#
+# `PormG` is a declared `[targets].test` dependency, so it is present under every
+# supported way of invoking this suite. Its absence is an environment bug, not a
+# configuration this file should accommodate -- see the bootstrap guard in
+# `test/runtests.jl`, which refuses the run before any item starts. This assertion is
+# the defence in depth behind it, for a REPL or a direct `ReTestItems.runtests` call
+# that never goes through the coordinator.
 if RealPormGWorkerStore === nothing
-    @test_skip "PormG is not available, so NitroPormGExt.PormGWorkerStore cannot be loaded"
+    error("PormG is not available, so NitroPormGExt.PormGWorkerStore cannot be loaded. " *
+          "PormG is a declared `[targets].test` dependency: this is a broken test " *
+          "environment, not a valid configuration, and failing here is deliberate (#128). " *
+          "Run `bash scripts/worktree_setup.sh` in a worktree, unset a stale " *
+          "`NITRO_TEST_REDISPATCH`, or re-provision with `Pkg.test()`.")
 else
     @testset "PormGWorkerStore interface and persistence" begin
         store = RealPormGWorkerStore(model=MockTaskModel())

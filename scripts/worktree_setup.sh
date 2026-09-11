@@ -93,8 +93,13 @@ fi
 
 # Manifest.toml is gitignored, so a fresh worktree has none. Copying the main checkout's (when it
 # has one) reproduces the same resolution instead of re-resolving to whatever is newest.
+#
+# `copied_manifest` records whether the file below is OURS. Only a manifest this run created may be
+# thrown away on a resolve failure — see the fallback further down.
+copied_manifest=0
 if [[ "$MAIN" != "$WT" && -f "$MAIN/Manifest.toml" && ! -f "$WT/Manifest.toml" ]]; then
   cp "$MAIN/Manifest.toml" "$WT/Manifest.toml"
+  copied_manifest=1
   echo "manifest      : copied from the main checkout"
 fi
 
@@ -102,9 +107,47 @@ fi
 # and bare `instantiate` only warns about that ("dependencies or compat requirements have changed")
 # while leaving the stale manifest in place — the next `Pkg.test` then re-resolves mid-run. resolve
 # is conservative: it keeps the copied versions wherever they still satisfy Project.toml.
+#
+# ...and that conservatism is exactly why it can fail outright. `Pkg.resolve()` PRESERVES versions;
+# it will not upgrade one to satisfy a raised bound. So a manifest copied from a checkout that still
+# has HTTP 2.4.0, against a Project.toml that now says `HTTP = "~2.6"`, dies with:
+#
+#     ERROR: empty intersection between HTTP@2.4.0 and project compatibility 2.6
+#
+# The copy is an optimisation — reproduce the main checkout's resolution — never a requirement. When
+# it cannot be reconciled, discard it and resolve fresh rather than leaving the worktree unusable:
+# an unresolvable worktree means EVERY Pkg operation fails, which is the failure this script exists
+# to prevent. Silence on the happy path, one loud line when the copy is dropped, so a surprising
+# dependency version later is traceable to this (#128).
+#
+# TWO conditions on that discard, because deleting someone's manifest is not recoverable:
+#
+#   * only a manifest THIS RUN copied (`copied_manifest`). The script is safe to re-run and is
+#     explicitly supported in the main checkout, where the manifest is the real one — and a
+#     locally-resolved worktree manifest may hold `Pkg.develop`ed or pinned entries that no
+#     `[sources]` entry would restore. Not ours, not ours to delete: fail instead, as before.
+#   * only a RESOLVE failure. `resolve` and `instantiate` are separate commands here for exactly
+#     this reason: instantiate failures are usually a registry or artifact download hiccup, and
+#     deleting a good manifest over a flaky network — then re-resolving into the same network —
+#     leaves the checkout with no manifest at all, which is strictly worse than what it started
+#     with, under a message blaming a compat conflict that never happened.
 echo "resolving + instantiating (julia --project=.) ..."
-julia --project="$WT" -e 'import Pkg; Pkg.resolve(); Pkg.instantiate()'
+if ! julia --project="$WT" -e 'import Pkg; Pkg.resolve()'; then
+  if [[ "$copied_manifest" == "1" ]]; then
+    echo "manifest      : the copied manifest does not satisfy this branch's [compat] — discarding it and re-resolving"
+    rm -f "$WT/Manifest.toml"
+    julia --project="$WT" -e 'import Pkg; Pkg.resolve()'
+  else
+    echo "manifest      : resolve failed against an existing manifest this script did not create — leaving it alone." >&2
+    echo "                Raise it yourself (e.g. Pkg.update(\"HTTP\") after a [compat] bump), or delete it to re-resolve." >&2
+    exit 1
+  fi
+fi
+julia --project="$WT" -e 'import Pkg; Pkg.instantiate()'
 
 echo "done — worktree ready."
 echo "  julia --project=. test/runtests.jl                    # full suite"
 echo "  julia --project=. test/runtests.jl test/util_tests.jl  # single file"
+echo
+echo "Both re-dispatch through Pkg.test to provision [targets].test (PormG included),"
+echo "and now REFUSE to run if any of it is missing rather than skipping quietly (#128)."

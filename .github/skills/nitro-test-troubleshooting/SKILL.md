@@ -121,12 +121,45 @@ Test-only dependencies (`Suppressor`, `ProtoBuf`, `ReTestItems`, `Aqua`, …) li
 `[targets].test`, so they are on the load path **only** under `Pkg.test()`.
 
 `test/runtests.jl` detects a direct run and **re-dispatches through `Pkg.test`** once, forwarding CLI
-args and the launcher's thread count (guarded by the `NITRO_TEST_REDISPATCH` env var). So the direct
-commands work — but if you see this error anyway:
+args and the launcher's thread count (guarded by the `NITRO_TEST_REDISPATCH` env var). It decides by
+probing **every** `[targets].test` entry, read from `Project.toml`. It used to probe one package,
+`Suppressor`, as a stand-in for "am I in the test env?" — and `Base.identify_package` searches the
+whole `LOAD_PATH`, so on a machine with `Suppressor` installed in the global `@v#.#` environment the
+answer was "already provisioned", the re-dispatch never fired, and `PormG` (a `[sources]` path dep,
+never globally installable) stayed missing. See §3b. So the direct commands work — but if you see this error anyway:
 
 - You are running a test file *directly* (`julia --project=. test/foo_tests.jl`) instead of through
   `test/runtests.jl`. Go through the runner.
 - Or `NITRO_TEST_REDISPATCH` is stale in your shell from an interrupted run — unset it.
+
+### 3b. "Nitro test environment is incomplete" — the run refused to start
+
+Not a test failure: the suite declined to run because a package in `[targets].test` was not
+importable, *after* the `Pkg.test` re-dispatch had already been spent. The message lists exactly
+which ones.
+
+This is deliberate, and it replaced a silent failure mode. A missing `ReTestItems` kills the run
+immediately, but a missing `PormG` only made `test/extensions/pormg_worker_tests.jl` take a
+`@test_skip` branch — `Broken 1` in a 3,500-assertion summary, exit code 0, 112 assertions gone
+([#128](https://github.com/PingoLee/Nitro.jl/issues/128)). Refusing is the loud version of that.
+
+**Read the two paths the message prints first** — `Active project:` and `Expected:`. If they differ,
+that is the answer and the four causes below are noise. Then work through them in order:
+
+1. **No Nitro environment is active** — you ran `julia test/runtests.jl` without `--project=.`. The
+   tell is that *every* target is listed as missing rather than a subset, and the two paths above
+   disagree.
+2. **`NITRO_TEST_REDISPATCH` stale in your shell** from an interrupted run — `unset` it.
+3. **A worktree with no sibling `../PormG.jl`** — `bash scripts/worktree_setup.sh` (§4).
+4. **The environment was re-resolved and dropped a path dependency.** `Pkg.update("HTTP")` will do
+   this: it re-resolves the *project* env, where `PormG` is only a weakdep, and prunes it without a
+   word. `Pkg.test()` re-provisions it.
+
+Related, and the reason (3) is easy to hit: after a `[compat]` bound is raised, `Pkg.resolve()`
+**fails rather than upgrading** — it preserves versions, so a manifest still holding `HTTP@2.4.0`
+against `HTTP = "~2.6"` dies with `empty intersection between HTTP@2.4.0 and project compatibility
+2.6`. `scripts/worktree_setup.sh` now recovers from that by discarding the copied manifest and
+resolving fresh; by hand, `Pkg.update("HTTP")` is what moves the pin.
 
 ### 4. PormG sibling checkout missing
 
