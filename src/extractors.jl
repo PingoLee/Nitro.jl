@@ -122,7 +122,14 @@ function safe_extract(f::Function, param::Param{U}) :: T where {T, U <: Extracto
         if e isa ValidationError
             throw(e)
         end
-        # If the function fails, we throw a ValidationError with the parameter name and type
+        # If the function fails, we throw a ValidationError with the parameter name and type.
+        #
+        # `e` becomes `.cause`, and it is NOT value-free: for a body-bound extractor it is the
+        # deserializer's own error, and those quote their input -- a JSON parse `ArgumentError`
+        # echoes the submitted bytes, so this is the highest-severity of the four sites that
+        # attach a cause. Keeping it attached is safe as of #130, because none of `showerror`,
+        # `show` or `JSON.lower` renders a cause by default; it is reachable only through an
+        # explicit `showerror(io, err; cause=true)` or `Errors.cause_report`. Never log it.
         throw(ValidationError("Failed to serialize data for | parameter: $(param.name) | extractor: $U | type: $T", e))
     end
 end

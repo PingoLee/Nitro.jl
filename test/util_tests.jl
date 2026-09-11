@@ -5,6 +5,7 @@ using Nitro.Core.Util
 using Nitro.Core.Util: mount_segments, mount_route
 using Nitro.Core: serverwelcome
 using Nitro: ValidationError
+using Nitro.Core.Errors: cause_report   # unexported on purpose — see src/errors.jl
 
 @testset "join_url_path" begin
     # prefix == nothing returns route verbatim (current implementation)
@@ -163,6 +164,17 @@ end
     @test occursin("query", err.msg)
     @test !occursin("s3cr3t", err.msg)
 
+    # #130: the parse failure IS attached as `.cause` and DOES quote the value — JSON.jl
+    # renders it with a caret pointing at the offending byte. Neither rendered form may
+    # show it. Both halves asserted: the positive one is what keeps the negatives from
+    # passing for the wrong reason.
+    @test err.cause isa Exception
+    @test occursin("s3cr3t", sprint(showerror, err.cause))
+    @test !occursin("s3cr3t", sprint(showerror, err))
+    @test !occursin("Caused by", sprint(showerror, err))
+    @test !occursin("s3cr3t", sprint(show, err))
+    @test occursin("s3cr3t", cause_report(err))   # ...but the opt-in still reaches it
+
     # A ValidationError raised inside parseparam passes through unwrapped.
     capped = try
         parseparam_checked(Regex, repeat("x", 300), "pat", :path)
@@ -173,6 +185,68 @@ end
     @test capped isa ValidationError
     @test isnothing(capped.cause)
     @test occursin("maximum length", capped.msg)
+end
+
+# #130: the type-level contract, independent of any extractor. Four sites attach a `.cause`
+# (`safe_extract`, `parseparam_checked`, and both `Types.*` decode accessors) and every one of
+# them wraps CLIENT input, so the rule belongs to the type rather than to each site.
+@testset "ValidationError renders no cause by default (#130)" begin
+    plain = ValidationError("bad param 'limit'")
+    wrap  = ValidationError("bad param 'limit'", ArgumentError("SENTINEL-VALUE"))
+
+    # No cause: every form agrees, and `show` still round-trips as a constructor call.
+    @test sprint(showerror, plain) == "Validation Error: bad param 'limit'"
+    @test sprint(io -> showerror(io, plain; cause = true)) == sprint(showerror, plain)
+    @test cause_report(plain) == sprint(showerror, plain)
+    @test sprint(show, plain) == "ValidationError(\"bad param 'limit'\")"
+
+    # With a cause: the default is value-free, the opt-in renders it.
+    @test !occursin("SENTINEL-VALUE", sprint(showerror, wrap))
+    @test !occursin("Caused by", sprint(showerror, wrap))
+    @test occursin("bad param 'limit'", sprint(showerror, wrap))
+    @test occursin("SENTINEL-VALUE", sprint(io -> showerror(io, wrap; cause = true)))
+    @test cause_report(wrap) == sprint(io -> showerror(io, wrap; cause = true))
+
+    # `show` is a SECOND render path, not a restatement of the first. A logger that treats
+    # `exception=` as an ordinary value reaches `show`, and the default struct `show` prints
+    # every field — so masking `showerror` alone would have left the likeliest leak open.
+    # The cause's TYPE survives (it carries no input); its message does not.
+    @test !occursin("SENTINEL-VALUE", sprint(show, wrap))
+    @test occursin("ArgumentError", sprint(show, wrap))
+    @test !occursin("SENTINEL-VALUE", repr(wrap))
+    @test !occursin("SENTINEL-VALUE", repr("text/plain", wrap))
+
+    # Base's OWN paths — what an uncaught rejection and `@error … exception=err` go through.
+    # If the 2-arg method did not cover these the fix would be skin-deep.
+    bt = try throw(wrap) catch; catch_backtrace() end
+    @test !occursin("SENTINEL-VALUE", sprint(io -> showerror(io, wrap, bt; backtrace = false)))
+    @test !occursin("SENTINEL-VALUE", sprint(io -> Base.display_error(io, wrap, bt)))
+
+    # Both stdlib loggers, both `exception=` spellings. `SimpleLogger` renders the value with
+    # `show`; `ConsoleLogger` special-cases exceptions and renders with `showerror`. The two
+    # take genuinely different paths, which is why both are pinned.
+    for L in (Base.CoreLogging.SimpleLogger, Base.CoreLogging.ConsoleLogger)
+        for ex in (wrap, (wrap, bt))
+            buf = IOBuffer()
+            Base.CoreLogging.with_logger(L(buf, Base.CoreLogging.Debug)) do
+                @error "rejected" exception = ex
+            end
+            @test !occursin("SENTINEL-VALUE", String(take!(buf)))
+        end
+    end
+
+    # A nested chain renders whole under the opt-in — no silent truncation. Nothing in `src/`
+    # nests a ValidationError today, but an application can.
+    nested = ValidationError("outer", ValidationError("inner", ArgumentError("SENTINEL-VALUE")))
+    @test !occursin("SENTINEL-VALUE", sprint(showerror, nested))
+    @test occursin("inner", cause_report(nested))
+    @test occursin("SENTINEL-VALUE", cause_report(nested))
+
+    # Siblings are msg-only, have no wrap site, and are deliberately unchanged: a `cause`
+    # kwarg they would ignore is dead API implying a capability the type does not have.
+    @test sprint(showerror, Nitro.Core.Errors.CookieError("nope")) == "Cookie Error: nope"
+    @test sprint(showerror, Nitro.Core.Errors.AuthorizationError("nope")) ==
+          "Authorization Error: nope"
 end
 
 @testset "serverwelcome banner includes environment when available" begin

@@ -447,6 +447,26 @@ end
     bad.context[:params] = Dict("v" => "%ZZ")
     @test_throws Nitro.ValidationError Nitro.Types.pathparams(bad)
 
+    # #130: these two accessors are the third and fourth sites that attach a `.cause`, and the
+    # default render must not show it. Structural rather than sentinel-based on purpose —
+    # `unescapeuri` fails inside `parse(UInt8, "ZZ"; base=16)`, so this cause carries the two
+    # hex digits and never the segment; a `!occursin("SUPERSECRET", …)` assertion here would
+    # pass against the unpatched renderer and prove nothing. The invariant that DOES generalize
+    # across all four sites is "a cause is attached, and no default render shows it".
+    perr = try Nitro.Types.pathparams(bad); nothing catch e; e end
+    @test perr.cause isa Exception
+    @test !occursin("Caused by", sprint(showerror, perr))
+    @test !occursin("ZZ", sprint(show, perr))
+    @test occursin("Caused by", sprint(io -> showerror(io, perr; cause = true)))
+
+    # The query accessor has no direct-accessor test at all today — only the end-to-end
+    # `g3("/mq?v=%ZZ")` status check above. Pin it here so a fifth wrap site lands next to a
+    # test that states the rule.
+    qerr = try Nitro.Types.queryvars(HTTP.Request("GET", "/mq?v=%ZZ")); nothing catch e; e end
+    @test qerr isa Nitro.ValidationError
+    @test qerr.cause isa Exception
+    @test !occursin("Caused by", sprint(showerror, qerr))
+
     # Matched on MESSAGE, not type. `req.params` goes through the process-wide
     # `Base.getproperty(::HTTP.Request, ::Symbol)` override, and `test/instance_tests.jl` installs
     # its own via `instance()` -- so under the full suite the thrown value is that instance's

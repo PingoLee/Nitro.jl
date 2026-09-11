@@ -52,12 +52,22 @@ function handlerequest(getresponse::Function, catch_errors::Bool; show_errors::B
                 # adding a `ValidationError` — `test/util_tests.jl` and
                 # `test/extractor_tests.jl` pin it.
                 #
-                # Do NOT widen this to `exception=error` or `sprint(showerror, error)`.
-                # `safe_extract` attaches the underlying exception as `.cause`, and
-                # `showerror` renders it: an `ArgumentError` from a failed JSON parse quotes
-                # the offending input, so a password containing a backslash comes back
-                # verbatim through that path. `.cause` is NOT value-free; scrubbing it is
-                # tracked in #130.
+                # `.cause` is still attached -- by `safe_extract` (src/extractors.jl),
+                # `parseparam_checked` below, and both `Types.*` decode accessors -- and it
+                # still carries client input verbatim: a JSON parse `ArgumentError` quotes
+                # the offending bytes. As of #130 it no longer *renders* on any of Nitro's
+                # three output paths: `showerror` prints `.msg` only unless a caller passes
+                # `cause=true`, and `show` and `JSON.lower` mask the cause down to its type
+                # name. So neither `exception=error` nor `sprint(showerror, error)` can leak
+                # here any more, whatever the log sink does with the value.
+                #
+                # Keep the line as `message=error.msg` anyway. `exception=error` would carry
+                # nothing this does not -- it renders the same `.msg` behind a prefix, as a
+                # blob a log sink cannot index -- and it sits one careless edit away from
+                # `exception=(error, catch_backtrace())`: the per-request stack trace #18
+                # removed as a log-flood / disk-fill vector. `.msg` is also pinned value-free
+                # by tests directly, where the renderer's safety is only transitive; two
+                # independent guarantees cost nothing to keep separate.
                 show_errors && @debug "Request rejected (400 Bad Request)" message=error.msg
             elseif show_errors && !isa(error, InterruptException)
                 @error "ERROR: " exception=(error, catch_backtrace())
@@ -215,6 +225,11 @@ guard, `parseparam`'s bare `ArgumentError`/JSON errors — plus the `BoundsError
 there for an application that catches `ValidationError` and wants to say which parameter failed.
 The submitted **value is deliberately never interpolated** into the message: `.msg` is
 app-reachable and must stay value-free, because a parameter value can be a token or other secret.
+
+The wrapped parse failure *is* attached as `.cause`, and that one is **not** value-free -- it is the
+parser's own exception, which quotes its input. Since #130 none of `showerror`, `show` or
+`JSON.lower` renders a cause by default (see `ValidationError` for the opt-in), so it is safe to
+carry; reaching `.cause` directly and logging it is still on you.
 """
 function parseparam_checked(::Type{T}, str::String, name::String, source::Symbol) where {T}
     try

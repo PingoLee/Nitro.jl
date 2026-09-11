@@ -125,10 +125,39 @@ end
 
 ---
 
+## When Binding Fails
+
+A body Nitro cannot bind is **client input**, not a server fault: it becomes a `400 Bad Request`
+with a fixed body, never a `500` and never a logged backtrace.
+
+The `ValidationError` behind it names the parameter and its type and **never the submitted value**,
+so it is safe to log. The exception that actually failed — a JSON parse error, say — is kept on
+`.cause`, and that one *does* quote the payload. Every path Nitro renders it through masks it down
+to the cause's *type*:
+
+```julia
+sprint(showerror, err)                             # parameter and type only — safe
+repr(err)                                          # the cause's type, not its value — safe
+JSON.json(err)                                     # {"msg":"…","cause":"ArgumentError"} — safe
+sprint(io -> showerror(io, err; cause = true))     # ...plus the cause — a REPL, not a log
+```
+
+So `@error "rejected" exception = err` stays value-free whatever logger you use, and returning the
+error from a handler — `Res.json(Dict("error" => err))` — cannot put the submitted body back on the
+wire. If you reach for the opt-in while debugging, treat what comes back as the request body
+itself: do not log it, do not put it in a response, do not paste it into a bug report.
+
+!!! warning
+    The masking covers display and JSON, not reflection. `err.cause`, `dump`, and serializers other
+    than JSON still reach the wrapped exception.
+
+---
+
 ## API Reference
 
 ```@docs
 Json
 Form
 JsonFragment
+ValidationError
 ```
