@@ -1,6 +1,7 @@
 module Workers
 
 using Dates
+using UUIDs: UUID, uuid4
 using Base: @kwdef
 import Base.Threads: ReentrantLock, lock
 

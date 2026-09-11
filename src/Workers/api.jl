@@ -35,7 +35,11 @@ function recover_zombie_tasks!(; store::AbstractWorkerStore=default_store())
             # (or is cancelled) between the read and the write, the real outcome stands
             # and this sweep writes nothing — the same rule every other terminal write
             # now follows (#88).
+            # Addressed to the run this sweep actually inspected. Between the read above
+            # and this write the key may have been re-run (#108), and declaring someone else's
+            # live run dead is the same defect as clobbering its result.
             if try_transition!(store, task.id, (RUNNING,), FAILED;
+                               run_id=task.run_id,
                                error="Worker process terminated unexpectedly mid-execution.",
                                completed_at=current_time_utc())
                 count += 1
@@ -468,12 +472,25 @@ function cancel_task(task_id::AbstractString, authority::TaskAuthority; store::A
         # loses the race and stays cancelled, or wins it and we report the truth.
         # Doing this with a read, a decision, and a full-record save under `lock_tasks`
         # was #88: that lock does not span processes.
+        # Fencing this on `run_id` is an AUTHORIZATION fix, not merely bookkeeping.
+        # `_authorize_or_reload!` above decided against the watcher list of the run we read,
+        # and re-running a finished key RESETS that list (`replace_task!`). Cancelling the
+        # successor on the predecessor's grant would be an authorization the app never issued
+        # — reachable across processes, since `lock_tasks` is process-local for a
+        # database-backed store (#108).
         claimed = try_transition!(store, task_info.id, (PENDING, RUNNING), CANCELLED;
+                                  run_id=task_info.run_id,
                                   error="Cancelled", completed_at=current_time_utc())
 
         if !claimed
             latest = get_task_info(store, task_info.id)
             latest === nothing && return Dict{Symbol, Any}(:error => "Task not found")
+            if latest.run_id != task_info.run_id
+                # Distinguished on purpose: reporting the successor's status here would say
+                # "Task already finished with status PENDING", which is nonsense.
+                return Dict{Symbol, Any}(
+                    :error => "Task was re-submitted; the run you asked to cancel has already ended")
+            end
             return Dict{Symbol, Any}(:error => "Task already finished with status $(latest.status)")
         end
 

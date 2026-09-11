@@ -110,8 +110,33 @@ function owner_of(task_id::AbstractString)
     return id[1:prevind(id, first(range))]
 end
 
+"""
+    TaskInfo(id; queue_name=nothing)
+
+One task record — and, crucially, **one run of it**.
+
+`id` names the task; `run_id` names *this attempt*. The two are not the same thing, because
+re-running a finished key replaces the record with a brand-new `TaskInfo` while keeping the id
+([`replace_task!`](@ref)). The previous run's worker task may still be in flight at that moment,
+and a terminal write that only names the id is indistinguishable from one belonging to the run
+that replaced it ([#108](https://github.com/PingoLee/Nitro.jl/issues/108)).
+
+So the invariant is: **one `TaskInfo` object is one run.** A re-run constructs a new object; it is
+never a mutation of the old one. Everything that identifies a run — `run_id` today — may therefore
+be set exactly once, in this constructor, and read freely without synchronisation.
+"""
 mutable struct TaskInfo
     id::String
+    # Identity of this run, not state of the task. Written only by `replace_task!`, never by
+    # `set_task!` — the same split that protects `watchers`, and for the same reason: a value
+    # carried along on every state transition is a value that gets clobbered.
+    #
+    # `uuid4()`, deliberately NOT `Crypto.secure_uuid4()`. A run id is an internal correlation
+    # value: it is never returned to a caller and is never a capability, so guessing one buys
+    # nothing — forging a terminal write also requires being inside the process that calls
+    # `try_transition!`. `src/crypto.jl` documents the opposite trade-off for session ids,
+    # which ARE capabilities.
+    run_id::UUID
     status::TaskStatus
     @atomic progress::Float64
     result::Any
@@ -127,6 +152,7 @@ mutable struct TaskInfo
         created_at = current_time_utc()
         return new(
             id,
+            uuid4(),
             PENDING,
             0.0,
             nothing,

@@ -455,15 +455,18 @@ end
             replace_task!(store, t.id, t)            # starts PENDING
 
             @test try_transition!(store, "alice::cas", (PENDING, RUNNING), CANCELLED;
+                                  run_id=t.run_id,
                                   error="Cancelled", completed_at=Dates.now(Dates.UTC)) == true
             after = get_task_info(store, "alice::cas")
             @test after.status == CANCELLED
             @test after.error == "Cancelled"
 
             # Already left the `from` set: no second transition, and nothing written.
-            @test try_transition!(store, "alice::cas", (PENDING, RUNNING), COMPLETED) == false
+            @test try_transition!(store, "alice::cas", (PENDING, RUNNING), COMPLETED;
+                                  run_id=nothing) == false
             @test get_task_info(store, "alice::cas").status == CANCELLED
-            @test try_transition!(store, "no-such-task", (PENDING,), CANCELLED) == false
+            @test try_transition!(store, "no-such-task", (PENDING,), CANCELLED;
+                                  run_id=nothing) == false
         end
 
         @testset "concurrent add_watcher! loses no grant" begin
@@ -478,6 +481,100 @@ end
             got = get_task_info(store, "alice::concurrent").watchers
             @test length(got) == 21
             @test Set(got) == Set(vcat("alice", ["u$(i)" for i in 1:20]))
+        end
+    finally
+        reset_store!(store)
+    end
+end
+
+@testset "terminal writes are addressed to a run, not just a task id (#108)" begin
+    store = InMemoryWorkerStore()
+    try
+        # Deliberately driven through the store primitives rather than through real tasks.
+        # The bug is a property of the compare-and-set, and asserting it directly makes the
+        # test deterministic -- no sleeps, no scheduling, nothing to flake.
+        @testset "a stale run's terminal write cannot land on its successor" begin
+            a = TaskInfo("alice::report")            # run A, still in flight
+            a.status = RUNNING
+            replace_task!(store, a.id, a)
+
+            b = TaskInfo("alice::report")            # the resubmit: fresh PENDING record
+            replace_task!(store, b.id, b)
+            @test b.run_id != a.run_id
+
+            # Verbatim the CAS `_finish_task!` issues. B's record satisfies the STATUS
+            # precondition -- PENDING is in `from` -- which is exactly why the status alone
+            # was never enough.
+            @test try_transition!(store, a.id, (PENDING, RUNNING), COMPLETED;
+                                  run_id=a.run_id, result="stale",
+                                  completed_at=Dates.now(Dates.UTC)) == false
+
+            live = get_task_info(store, a.id)
+            @test live.status == PENDING             # A's write landed nowhere...
+            @test live.result === nothing
+            @test live.run_id == b.run_id
+
+            # ...and B's own write still wins.
+            @test try_transition!(store, b.id, (PENDING, RUNNING), COMPLETED;
+                                  run_id=b.run_id, result="fresh") == true
+            @test get_task_info(store, b.id).result == "fresh"
+        end
+
+        @testset "run_id = nothing is the named, unconditional bypass" begin
+            c = TaskInfo("alice::bypass")
+            replace_task!(store, c.id, c)
+            @test try_transition!(store, c.id, (PENDING,), CANCELLED; run_id=nothing) == true
+            @test get_task_info(store, c.id).status == CANCELLED
+        end
+
+        @testset "every TaskInfo is its own run" begin
+            @test TaskInfo("alice::x").run_id != TaskInfo("alice::x").run_id
+        end
+
+        @testset "set_task! never writes run_id; replace_task! does" begin
+            original = TaskInfo("alice::split")
+            replace_task!(store, original.id, original)
+
+            # A DIFFERENT object carrying a different run id -- the shape a stale worker
+            # holds. `set_task!` must carry its state across and leave the identity alone,
+            # exactly as it already does for `watchers`.
+            stale = TaskInfo("alice::split")
+            stale.status = RUNNING
+            set_task!(store, stale.id, stale)
+
+            stored = get_task_info(store, "alice::split")
+            @test stored.run_id == original.run_id   # identity untouched
+            @test stored.status == RUNNING           # state carried
+
+            # ...and the one sanctioned way to publish a new run's identity.
+            replace_task!(store, stale.id, stale)
+            @test get_task_info(store, "alice::split").run_id == stale.run_id
+        end
+
+        @testset "a stale run's teardown cannot evict its successor's live handle" begin
+            a = TaskInfo("alice::handles")
+            a.status = RUNNING
+            replace_task!(store, a.id, a)
+            register_active_task!(store, a.id, @async sleep(0.01))
+
+            b = TaskInfo("alice::handles")           # the resubmit takes over the key
+            b.status = RUNNING
+            replace_task!(store, b.id, b)
+            b_handle = @async (sleep(30); nothing)
+            register_active_task!(store, b.id, b_handle)
+            register_active_task_info!(store, b.id, b)
+
+            # Run A finally finishes. Its CAS correctly writes nothing -- but before #108
+            # the teardown that follows was keyed by ID, so it deleted B's handle too.
+            Nitro.Workers._finish_task!(store, a, COMPLETED; result="stale")
+
+            @test get_active_task(store, "alice::handles") === b_handle
+            @test get_task_info(store, "alice::handles").status == RUNNING
+
+            # Why that mattered: zombie recovery decides liveness from exactly that handle,
+            # so an unfenced teardown made a genuinely-running successor look dead.
+            recover_zombie_tasks!(; store=store)
+            @test get_task_info(store, "alice::handles").status == RUNNING
         end
     finally
         reset_store!(store)

@@ -15,7 +15,7 @@ The worker system supports both volatile in-memory queues and persistent databas
 - **`AbstractWorkerStore`**: Interface for storage backends.
 - **`InMemoryWorkerStore`**: Volatile, thread-safe store in `src/Workers/`.
 - **`PormGWorkerStore`**: Persistent store in `ext/NitroPormGExt.jl`.
-- **Volatile execution handles**: Running `Task` objects stay in `active_tasks::Dict{UUID, Task}`; metadata lives in the store.
+- **Volatile execution handles**: Running `Task` objects stay in `active_tasks::Dict{UUID, Task}`; metadata lives in the store. Entries are keyed by task id but describe one **run** — only the run that registered one may tear it down (see §6).
 - **Queue authorization hooks**: Optional `queue_authorizer(queue_name, user_id)::Bool`, consulted on
   **both** submit paths — `submit_task` has no sequential queue, so it passes `DEFAULT_QUEUE_NAME`.
 - **Watch authorization hooks**: Optional `watch_authorizer(task_key, watchers, user_id)::Bool`,
@@ -174,9 +174,17 @@ On startup, `RUNNING` tasks without a live in-memory `Task` are marked `FAILED` 
   compare-and-set on the stored document) and `try_transition!` (a conditional status change) are
   the pattern. Composing `get_task_info` + mutate + `set_task!` under the lock is exactly the bug.
 - **`set_task!` writes state; `replace_task!` writes the whole record.** `set_task!` must never
-  write `watchers` — grants are not volatile state, and carrying them on every transition is how
-  they got clobbered. `replace_task!` has exactly one caller: re-running a finished key, which by
-  design resets the watcher list.
+  write `watchers` **or `run_id`** — neither is volatile state, and carrying them on every
+  transition is how grants got clobbered. `replace_task!` has exactly one caller: re-running a
+  finished key, which by design resets the watcher list and publishes the new run's identity.
+- **A terminal write is addressed to a RUN, not to a task id.** A task id outlives the run writing
+  under it: re-running a finished key builds a fresh record while the previous run may still be in
+  flight, and a status-only precondition cannot tell the two apart
+  ([#108](https://github.com/PingoLee/Nitro.jl/issues/108)). `try_transition!` therefore takes a
+  **required** `run_id` — `nothing` is the named opt-out, never a default — and so does the runtime
+  handle teardown: only the run that owns `active_tasks[id]` may deregister it, because
+  `recover_zombie_tasks!` reads liveness from exactly that entry. One `TaskInfo` object is one run;
+  a re-run is a new object, never a mutated one.
 - Add abstract stubs in `src/Workers/registry.jl`.
 - Implement in `InMemoryWorkerStore` **and** `PormGWorkerStore` — a hook implemented in only one of
   them is a store that silently behaves differently, which for the authorizer pair means a silently

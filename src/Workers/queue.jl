@@ -13,6 +13,25 @@ function _mark_queue_current_task!(store::AbstractWorkerStore, queue::Sequential
     return queue
 end
 
+# `active_tasks` and `active_task_infos` are keyed by task id, but what they describe is a
+# RUN. A previous run that finishes late must not delete the handles of the run that replaced
+# it: `recover_zombie_tasks!` decides zombie-ness from exactly `isnothing(get_active_task(...))`
+# (`api.jl`), so an unfenced teardown makes a live successor look dead and the next sweep marks
+# it FAILED — a worse outcome than the stale write `run_id` was added to stop (#108).
+#
+# `get_active_task_info` is the right probe on both backends. `InMemoryWorkerStore` aliases it to
+# `get_task_info`, so it returns the registry record — whichever run currently owns the key.
+# `PormGWorkerStore` returns its process-local `active_task_infos` entry, and `nothing` there
+# means no local run, where both deregisters are already no-ops.
+function _deregister_run!(store::AbstractWorkerStore, task_info::TaskInfo)
+    live = get_active_task_info(store, task_info.id)
+    if live === nothing || live.run_id == task_info.run_id
+        deregister_active_task!(store, task_info.id)
+        deregister_active_task_info!(store, task_info.id)
+    end
+    return nothing
+end
+
 # Every terminal transition goes through the store's compare-and-set, so whichever writer
 # gets there first wins and the losers write nothing.
 #
@@ -27,12 +46,15 @@ function _finish_task!(store::AbstractWorkerStore, task_info::TaskInfo, to::Task
                        progress::Union{Nothing, Real}=nothing)
     finished_at = current_time_utc()
     return lock_tasks(store) do
+        # `run_id` is what makes this write ADDRESSED rather than merely atomic: #88 made
+        # terminal transitions compare-and-set, but they still named only a task id, and a task
+        # id outlives the run writing under it (#108).
         claimed = try_transition!(store, task_info.id, (PENDING, RUNNING), to;
+                                  run_id=task_info.run_id,
                                   error, completed_at=finished_at, result, progress)
 
-        # Whether or not we won, this process is done running it.
-        deregister_active_task!(store, task_info.id)
-        deregister_active_task_info!(store, task_info.id)
+        # Whether or not we won, THIS RUN is done — and only this run's handles may go.
+        _deregister_run!(store, task_info)
         task_info.sys_task = nothing
 
         if !claimed

@@ -3,6 +3,7 @@
 using Test
 using Dates
 using JSON
+using UUIDs
 using Nitro
 using Nitro.Workers
 using Nitro.Errors: AuthorizationError
@@ -26,6 +27,10 @@ function _filtered_rows(qs::MockTaskQuerySet)
         for (k, v) in filters
             if k == "id"
                 matches = row["id"] == v
+            elseif k == "run_id"
+                # The run half of try_transition!'s compare — see #108. Without this branch
+                # the mock would `error` on every fenced transition.
+                matches = row["run_id"] == v
             elseif k == "status"
                 matches = row["status"] == v
             elseif k == "status__@in"
@@ -473,14 +478,61 @@ else
                 replace_task!(store_t, t.id, t)
 
                 @test try_transition!(store_t, "alice::cas", (PENDING, RUNNING), CANCELLED;
-                                      error="Cancelled") == true
+                                      run_id=t.run_id, error="Cancelled") == true
                 @test get_task_info(store_t, "alice::cas").status == CANCELLED
                 # A task that finished elsewhere cannot be re-transitioned, and the
                 # failed attempt writes nothing.
-                @test try_transition!(store_t, "alice::cas", (PENDING, RUNNING), COMPLETED) == false
+                @test try_transition!(store_t, "alice::cas", (PENDING, RUNNING), COMPLETED;
+                                      run_id=nothing) == false
                 @test get_task_info(store_t, "alice::cas").status == CANCELLED
-                @test try_transition!(store_t, "absent", (PENDING,), CANCELLED) == false
+                @test try_transition!(store_t, "absent", (PENDING,), CANCELLED;
+                                      run_id=nothing) == false
             end
+        end
+
+        @testset "a stale run's terminal write cannot land on its successor (#108)" begin
+            # Store parity for the probe in `test/workers_tests.jl`. The fence lives in a WHERE
+            # clause here rather than in a Julia comparison, so it has to be exercised against
+            # the query builder -- a backend that dropped the term would pass every in-memory
+            # test in the suite and still reintroduce #108 for its own users.
+            store_r = RealPormGWorkerStore(model=MockTaskModel())
+
+            a = TaskInfo("alice::report")
+            a.status = RUNNING
+            replace_task!(store_r, a.id, a)
+
+            b = TaskInfo("alice::report")
+            replace_task!(store_r, b.id, b)
+            @test b.run_id != a.run_id
+
+            @test try_transition!(store_r, a.id, (PENDING, RUNNING), COMPLETED;
+                                  run_id=a.run_id, result="stale") == false
+            persisted = reload_task(store_r, a.id)
+            @test persisted.status == PENDING
+            @test persisted.result === nothing
+            @test persisted.run_id == b.run_id
+
+            @test try_transition!(store_r, b.id, (PENDING, RUNNING), COMPLETED;
+                                  run_id=b.run_id, result="fresh") == true
+            @test reload_task(store_r, b.id).result == "fresh"
+        end
+
+        @testset "replace_task! publishes a new run id; set_task! leaves it alone (#108)" begin
+            store_s = RealPormGWorkerStore(model=MockTaskModel())
+
+            original = TaskInfo("alice::split")
+            replace_task!(store_s, original.id, original)
+
+            stale = TaskInfo("alice::split")
+            stale.status = RUNNING
+            set_task!(store_s, stale.id, stale)
+
+            stored = reload_task(store_s, "alice::split")
+            @test stored.run_id == original.run_id
+            @test stored.status == RUNNING
+
+            replace_task!(store_s, stale.id, stale)
+            @test reload_task(store_s, "alice::split").run_id == stale.run_id
         end
 
         @testset "a completing task cannot overwrite a cancellation from elsewhere (#88)" begin
@@ -495,7 +547,7 @@ else
 
             # Another process cancels: it writes the row and never touches our live object.
             @test try_transition!(store_x, "alice::job", (PENDING, RUNNING), CANCELLED;
-                                  error="Cancelled") == true
+                                  run_id=live.run_id, error="Cancelled") == true
 
             # Our callback now returns normally. The old guard read `get_task_info`, which
             # handed back our own live object still saying RUNNING, so the cancellation was
@@ -517,7 +569,8 @@ else
             replace_task!(store_f, live.id, live)
             register_active_task_info!(store_f, live.id, live)
 
-            try_transition!(store_f, "alice::flaky", (PENDING, RUNNING), CANCELLED; error="Cancelled")
+            try_transition!(store_f, "alice::flaky", (PENDING, RUNNING), CANCELLED;
+                            run_id=live.run_id, error="Cancelled")
             # `_fail_task!` had no cancellation guard at all, not even the ineffective one.
             Nitro.Workers._fail_task!(store_f, live, "boom")
 
@@ -537,6 +590,7 @@ else
             # `get_active_task` is process-local, so this node sees another node's
             # genuinely-running task as a zombie. Meanwhile that node finishes it.
             @test try_transition!(store_z, "alice::job", (PENDING, RUNNING), COMPLETED;
+                                  run_id=t.run_id,
                                   result="real-result", progress=100.0) == true
 
             # The sweep now claims rather than saves a stale decision, so it writes
@@ -743,7 +797,8 @@ else
             from_db = getproperty(ext, :_from_db_record)
 
             good_row = Dict{String,Any}(
-                "id" => "t1", "status" => "COMPLETED", "progress" => 100.0,
+                "id" => "t1", "run_id" => string(UUIDs.uuid4()),
+                "status" => "COMPLETED", "progress" => 100.0,
                 "result" => "", "error" => "", "created_at" => Dates.now(Dates.UTC),
                 "started_at" => nothing, "completed_at" => nothing,
                 "watchers" => "[]", "queue_name" => "",
@@ -752,6 +807,31 @@ else
 
             bad_row = merge(good_row, Dict{String,Any}("id" => "t2", "status" => "RETRYING"))
             @test_throws ErrorException from_db(bad_row)
+        end
+
+        @testset "_from_db_record reads run_id back, and refuses a pre-#108 row" begin
+            ext = Base.get_extension(Nitro, :NitroPormGExt)
+            from_db = getproperty(ext, :_from_db_record)
+
+            run_id = UUIDs.uuid4()
+            row = Dict{String,Any}(
+                "id" => "t1", "run_id" => string(run_id),
+                "status" => "RUNNING", "progress" => 0.0,
+                "result" => "", "error" => "", "created_at" => Dates.now(Dates.UTC),
+                "started_at" => nothing, "completed_at" => nothing,
+                "watchers" => "[]", "queue_name" => "",
+            )
+
+            # The load-bearing assertion. `TaskInfo(id)` mints a fresh run_id in its
+            # constructor, so a deserializer that forgot to overwrite it would pass every
+            # other test in this file while making it impossible for any worker to finish
+            # its own task -- every fence would compare against an id nothing holds (#108).
+            @test from_db(row).run_id == run_id
+
+            # A table that predates the column fails loudly and names the fix, rather than
+            # silently keeping the invented run_id.
+            legacy = delete!(copy(row), "run_id")
+            @test_throws ErrorException from_db(legacy)
         end
 
         @testset "watch authorizer round-trips through the store (#19)" begin

@@ -427,6 +427,14 @@ Task metadata will now be persisted to that database, while live running threads
     watcher list at all, so a task finishing in one process cannot drop a grant another
     process just added.
 
+    **A terminal transition names a *run*, not just a task.** Re-running a finished key
+    replaces the record, and the previous run may still be in flight — so the conditional
+    transition compares a per-run id alongside the status, and a write from a run that no
+    longer owns the record changes nothing
+    ([#108](https://github.com/PingoLee/Nitro.jl/issues/108)). Booting through
+    `pormg_nitro_worker` adds the `run_id` column to an existing table for you; see
+    `UPGRADING.md` if you provision the table yourself.
+
     The store's `lock_tasks` is a plain `ReentrantLock` and therefore **process-local** —
     it orders writes within one process and gives you nothing across processes. Do not
     build a read-modify-write on top of it and assume it is safe; use the atomic store

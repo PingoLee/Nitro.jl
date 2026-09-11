@@ -321,6 +321,13 @@ Columns:
                    `CREATE TABLE IF NOT EXISTS`: a database created before this column
                    was widened keeps its old width and needs a manual `ALTER TABLE`
                    (SQLite ignores `VARCHAR` lengths, so only Postgres/MySQL care).
+- `run_id`       — VARCHAR(36), the identity of one *run* of this task. Fenced against in
+                   `try_transition!`'s WHERE clause so a previous run's terminal write cannot
+                   land on the record that replaced it
+                   ([#108](https://github.com/PingoLee/Nitro.jl/issues/108)). Deliberately
+                   **not** indexed: it only ever appears as an extra `AND` term beside the
+                   primary key, which the PK index already resolves. Added after the table
+                   shipped, so `_ensure_run_id_column!` backfills it on boot.
 - `status`       — VARCHAR(20)
 - `progress`     — FLOAT
 - `result`       — TEXT (JSON-serialized task results)
@@ -335,6 +342,7 @@ function _define_task_model()
     if isdefined(PormG, :Models)
         return PormG.Models.Model("nitro_task",
             id           = PormG.Models.CharField(max_length=255, primary_key=true),
+            run_id       = PormG.Models.CharField(max_length=36, default=""),
             status       = PormG.Models.CharField(max_length=20),
             progress     = PormG.Models.FloatField(default=0.0),
             result       = PormG.Models.TextField(default=""),
@@ -415,6 +423,7 @@ function _to_db_record(task::TaskInfo)
     watchers_str = JSON.json(task.watchers)
     return Dict{String, Any}(
         "id" => task.id,
+        "run_id" => string(task.run_id),
         "status" => string(task.status),
         "progress" => task.progress,
         "result" => result_str,
@@ -456,6 +465,18 @@ function _from_db_record(row)::TaskInfo
 
     id = string(get_val(:id, "id"))
     task = TaskInfo(id)
+
+    # The single most dangerous line in this file. `TaskInfo(id)` above MINTS a fresh `run_id`,
+    # so a deserializer that forgets to overwrite it from the row invents a new run on every
+    # read — and then no worker can ever finish its own task, because every `try_transition!`
+    # fence compares against an id nothing holds. Assign explicitly, and refuse a row that
+    # predates the column rather than silently keeping the invented one (#108).
+    if !(haskey(row, :run_id) || haskey(row, "run_id"))
+        error("PormGWorkerStore: task row '$(id)' has no `run_id` column — this nitro_task " *
+              "table predates #108. Boot through `pormg_nitro_worker`, which adds it, or run " *
+              "the ALTER TABLE in UPGRADING.md.")
+    end
+    task.run_id = UUIDs.UUID(string(get_val(:run_id, "run_id")))
 
     status_str = string(get_val(:status, "status"))
     if status_str == "PENDING"
@@ -526,7 +547,7 @@ function get_task_info(store::PormGWorkerStore, task_id::String)
     end
 end
 
-function _write_task!(store::PormGWorkerStore, task_id::String, task_info::TaskInfo, replace_watchers::Bool)
+function _write_task!(store::PormGWorkerStore, task_id::String, task_info::TaskInfo, full_record::Bool)
     record = _to_db_record(task_info)
     try
         existing = _task_objects(store).filter("id" => task_id).first()
@@ -535,6 +556,7 @@ function _write_task!(store::PormGWorkerStore, task_id::String, task_info::TaskI
             # writes them whichever entry point we came through.
             _task_objects(store).create(
                 "id" => record["id"],
+                "run_id" => record["run_id"],
                 "status" => record["status"],
                 "progress" => record["progress"],
                 "result" => record["result"],
@@ -556,11 +578,17 @@ function _write_task!(store::PormGWorkerStore, task_id::String, task_info::TaskI
                 "completed_at" => record["completed_at"],
                 "queue_name" => record["queue_name"],
             ]
-            # `watchers` rides along ONLY for `replace_task!`. Including it on every
-            # save is what made ordinary state transitions clobber grants appended by
-            # another process since this one last read the row (#88) — and transitions
-            # are far more frequent than appends, so that was the dominant loss path.
-            replace_watchers && push!(columns, "watchers" => record["watchers"])
+            # `watchers` and `run_id` ride along ONLY for `replace_task!`. Including
+            # `watchers` on every save is what made ordinary state transitions clobber grants
+            # appended by another process since this one last read the row (#88) — and
+            # transitions are far more frequent than appends, so that was the dominant loss
+            # path. `run_id` is excluded for a sharper reason: it is the value
+            # `try_transition!` fences on, so a state save that carried it would let whichever
+            # run wrote last adopt the record's identity and defeat the fence (#108).
+            if full_record
+                push!(columns, "watchers" => record["watchers"])
+                push!(columns, "run_id" => record["run_id"])
+            end
             _task_objects(store).filter("id" => task_id).update(columns...)
         end
     catch e
@@ -636,6 +664,7 @@ end
 reload_task(store::PormGWorkerStore, task_id::String) = _read_db_task(store, task_id)
 
 function try_transition!(store::PormGWorkerStore, task_id::String, from, to::TaskStatus;
+                         run_id::Union{Nothing, UUIDs.UUID},
                          error::Union{Nothing, String}=nothing,
                          completed_at::Union{Nothing, DateTime}=nothing,
                          result=UNSUPPLIED,
@@ -650,7 +679,16 @@ function try_transition!(store::PormGWorkerStore, task_id::String, from, to::Tas
     # The status precondition lives in the WHERE clause, so the compare and the write are
     # one statement. Zero rows affected means the task was absent or had already left
     # `from` — and, crucially, that nothing was written.
-    matched = _task_objects(store).filter("id" => task_id, "status__@in" => [string(s) for s in from])
+    #
+    # `run_id` joins the same WHERE clause, so "is this still my run?" is answered by the very
+    # statement that writes — not by a read the answer could go stale between (#108). `nothing`
+    # is the named opt-out and omits the term entirely.
+    matched = run_id === nothing ?
+        _task_objects(store).filter("id" => task_id,
+                                    "status__@in" => [string(s) for s in from]) :
+        _task_objects(store).filter("id" => task_id,
+                                    "run_id" => string(run_id),
+                                    "status__@in" => [string(s) for s in from])
     changed = matched.update(columns...)
 
     return changed isa Integer && changed >= 1
@@ -859,6 +897,47 @@ end
 # ============================================================================
 
 """
+The `run_id` a pre-#108 row is backfilled with: the nil UUID.
+
+Portable as a literal `DEFAULT` on every dialect, and semantically exact — a row written before
+run ids existed belongs to no live run. `uuid4()` never produces the nil UUID, so no running
+task can ever hold it, and a legacy row therefore cannot be adopted by a live run's fence.
+"""
+const _LEGACY_RUN_ID = "00000000-0000-0000-0000-000000000000"
+
+"""
+    _ensure_run_id_column!(conn)
+
+Add the `run_id` column to an existing `nitro_task` table, idempotently.
+
+`CREATE TABLE IF NOT EXISTS` cannot add a column to a table that already exists, and **every**
+read path goes through `_from_db_record`, so a table missing this column is unreadable rather
+than merely degraded — `get_task_info` and `get_all_tasks` both stop working. Bootstrapping the
+schema on boot is what this file already does for the table and its indexes, so extending that
+to one `ALTER` keeps the upgrade automatic instead of silently fatal
+([#108](https://github.com/PingoLee/Nitro.jl/issues/108)).
+
+Idempotency is established by **proving the column is there**, not by matching the error text of
+a duplicate-column failure: SQLite says "duplicate column name", Postgres "column ... already
+exists" (SQLSTATE 42701) and MySQL error 1060, and a `catch`-all broad enough to cover the three
+would also swallow a genuine failure. So: attempt the `ALTER`; if it throws, `SELECT` the column.
+Success means it already existed and the error was benign; failure rethrows the original.
+"""
+function _ensure_run_id_column!(conn)
+    try
+        PormG.ConnectionPool.fetch(conn,
+            "ALTER TABLE \"nitro_task\" ADD COLUMN \"run_id\" VARCHAR(36) NOT NULL DEFAULT '$(_LEGACY_RUN_ID)'")
+    catch e
+        try
+            PormG.ConnectionPool.fetch(conn, "SELECT \"run_id\" FROM \"nitro_task\" LIMIT 1")
+        catch
+            rethrow(e)
+        end
+    end
+    return nothing
+end
+
+"""
     _ensure_task_table!(conn, model)
 
 Execute `CREATE TABLE IF NOT EXISTS` and index creations for the `nitro_task` table.
@@ -866,6 +945,9 @@ Execute `CREATE TABLE IF NOT EXISTS` and index creations for the `nitro_task` ta
 function _ensure_task_table!(conn, model)
     create_table_sql = PormG.Dialect.create_table(conn, model)
     PormG.ConnectionPool.fetch(conn, create_table_sql)
+
+    # A table created before #108 does not get `run_id` from the statement above.
+    _ensure_run_id_column!(conn)
 
     create_index_sql1 = PormG.Dialect.create_index(
         conn,
