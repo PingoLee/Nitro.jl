@@ -111,6 +111,13 @@ gh issue list --state open --limit 100 --json number -q '.[].number' | sort -n
 **Every open issue belongs on the board.** An issue filed during a session — including follow-ups
 this session just filed — is invisible to the next planning pass until it is added.
 
+**Membership is not the whole sweep — also count the open items whose `Session` is empty.** They are
+as invisible to §2 as an issue never added: nothing ranks them. The query above already returns field
+values, so check it in the same pass.
+
+Receipt: reconciling board 8 after 16 sessions found **one** open issue off the board and **26** on it
+with no `Session` — it looked complete while two thirds of the backlog sat there unschedulable.
+
 ## 2. Rank the sessions
 
 Group display order on the board is option order, which is numeric. Execution order is not, and
@@ -259,6 +266,27 @@ Receipt: board 8's first ten Session options were created with empty description
 done or partly done and four untouched, nothing on the board said which ran next, and the ranking had
 to be re-derived from scratch each session.
 
+## 5. What to hand back
+
+The board is the durable artifact; the table in the conversation is what the user reads. Write the
+board back, then report **one ranked table, one row per session** — the question behind every
+invocation is "what can I work in one sitting?", and a session is the unit that answers it.
+
+| # | Issues (one session) | Session | Tier | Start now? |
+|---|---|---|---|---|
+| 3 | #108 → #127 → #30 | Worker Execution & Lifecycle | high | After #128 |
+| 5 | #55 → #31 → #32 | App Context & Bootstrap | high | #55 only — #31/#32 need the app-handle decision |
+
+`→` is a forced order inside the session; a comma means any order. **`Start now?` carries the
+blocker, never a bare yes/no.** Below the table add only what it cannot: which rows have disjoint edit
+surfaces (§3), and any ranking tension you resolved (§2).
+
+**Do not dump the board, and do not render a second copy of it.** The `FILES:`/`ORDER:`/`WHY:`
+descriptions are written for the next session to read off the board, which already has a URL.
+
+Receipt: a session that had just written 19 ranked options echoed them all back in full, twice, before
+the user asked plainly for a table of what fits in one Claude session.
+
 ## Anti-Patterns
 
 - **Do not implement anything from this skill** — §0 is the whole point
@@ -268,6 +296,8 @@ to be re-derived from scratch each session.
 - Do not change an issue to agree with the board; the board is the derived view, always
 - Do not overwrite an `In Progress` you did not set — but do check whether it is stale, and say so
 - Do not leave a newly filed issue off the board
+- Do not stop the sweep at board membership — an open item with an empty `Session` is unschedulable
+  in exactly the same way, and there are usually more of them
 - Do not call `updateProjectV2Field` without resending every existing option **with its id** — it
   replaces the list, and the items grouped under the dropped options are orphaned
 - Do not hardcode project, field, or option ids into a script or a note — resolve them per run
@@ -281,3 +311,6 @@ to be re-derived from scratch each session.
 - Do not promote a session because a member carries `pre-publish` — that is a release gate, not a
   severity
 - Do not leave an override of the ranking order unstated
+- Do not report the board by echoing every option's description, or by rendering a second copy of it
+  — §5's one-row-per-session table is the deliverable, and `Start now?` needs the blocker, not a bare
+  yes/no
