@@ -147,6 +147,14 @@ mutable struct TaskInfo
     watchers::Vector{String}
     sys_task::Union{Nothing, Task}
     queue_name::Union{Nothing, String}
+    # The cancellation token. Process-local and NOT persisted: it is a request aimed at a
+    # callback running *here*, and the durable `status` is what carries a cancellation
+    # between processes. Read it with `cancel_requested`.
+    #
+    # Excluded from `set_task!`'s field copy for the same reason `watchers` is: a stale
+    # caller object carrying `false` would ERASE a cancel that had already been requested,
+    # which is the #88 clobber with the sign flipped.
+    @atomic cancel_requested::Bool
 
     function TaskInfo(id::String; queue_name::Union{Nothing, String}=nothing)
         created_at = current_time_utc()
@@ -163,6 +171,7 @@ mutable struct TaskInfo
             String[],
             nothing,
             queue_name,
+            false,
         )
     end
 end
@@ -202,6 +211,61 @@ function update_progress!(task_info::TaskInfo, value::Real)
     @atomic task_info.progress = Float64(value)
     return task_info
 end
+
+"""
+    cancel_requested(task_info::TaskInfo) -> Bool
+
+`true` once cancellation has been requested for **this run**, in **this process**.
+
+Poll it from any long-running callback. It is the whole of Nitro's cancellation mechanism:
+`cancel_task` and an expired `TaskOptions(timeout=…)` both set it, and neither can stop a
+callback that never looks ([#127](https://github.com/PingoLee/Nitro.jl/issues/127)).
+
+```julia
+submit_task("import", task_info -> begin
+    for chunk in chunks
+        cancel_requested(task_info) && return "cancelled"
+        process(chunk)
+        update_progress!(task_info, 100 * done / total)
+    end
+end, Owner("user-1"))
+```
+
+Nitro used to throw an `InterruptException` into the worker task as well. That is what Java's
+`Thread.stop()` and .NET's `Thread.Abort()` did, and both were withdrawn as unfixable; in Julia
+`schedule(t, exc; error=true)` against a task that is *already executing* aborts the process in
+`jl_finish_task`. Go's `context.Context`, Sidekiq and River are all cooperative for the same
+reason, and a single-process framework has no isolation boundary to kill across.
+
+**It is process-local, and never reset.** A cancel issued on another node writes the durable
+row and sets nothing here, so a cross-process callback must poll the record instead —
+`get_task_status(task_info.id, System())[:status] == "CANCELLED"`, sparingly, since it is a
+round-trip. Re-running a key builds a fresh `TaskInfo`, so the token starts `false` by
+construction rather than by being cleared; see [`TaskInfo`](@ref).
+
+`true` on a `FAILED` task means the deadline fired, mirroring Go's `ctx.Err() ==
+DeadlineExceeded`. Reading the field directly also works — a relaxed read of a `Bool` is
+harmless — so unlike [`update_progress!`](@ref) this accessor is a convention, not an
+enforcement.
+"""
+cancel_requested(task_info::TaskInfo) = @atomic task_info.cancel_requested
+
+"""
+    TaskTimeoutError(timeout)
+
+A task callback outran its `TaskOptions(timeout=…)`.
+
+Distinct from a plain `ErrorException` because it is the one failure that must **not** be
+retried: nothing can stop the attempt that timed out, so retrying would run a second copy of the
+callback beside the first, against the same `task_info` and the same external state. Its
+`showerror` text is unchanged from the message this used to throw, so anything matching on the
+rendered string still matches.
+"""
+struct TaskTimeoutError <: Exception
+    timeout::Int
+end
+
+Base.showerror(io::IO, e::TaskTimeoutError) = print(io, "Timeout of $(e.timeout)s exceeded")
 
 @kwdef struct TaskOptions
     priority::Int = 5

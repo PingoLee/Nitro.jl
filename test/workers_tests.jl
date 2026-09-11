@@ -2,6 +2,7 @@
 
 using Test
 using Dates
+using Suppressor
 using Nitro
 using Nitro.Workers
 using Nitro.Errors: AuthorizationError
@@ -130,9 +131,12 @@ end
         @test wait_for(() -> get_task_status(retry_id, Owner("user"); store=store)[:status] == "COMPLETED"; timeout=10.0) == :ok
         @test attempts[] == 3
 
+        # Cooperative, because cancellation IS cooperative now (#127). Nitro no longer
+        # interrupts the task, so a `while true` callback would outlive the testset and spin
+        # for the rest of the process.
         cancel_id = submit_task("cancel-task", task_info -> begin
             notify(started)
-            while true
+            while !cancel_requested(task_info)
                 sleep(0.01)
             end
             return task_info.id
@@ -393,7 +397,7 @@ end
     try
         task_id = submit_task("long-job", task_info -> begin
             notify(started)
-            while true
+            while !cancel_requested(task_info)
                 sleep(0.01)
             end
         end, Owner("owner-a"); watchers=[Owner("helper")], store=store)
@@ -646,6 +650,116 @@ end
             @test get_task_info(store, t.id).status == CANCELLED
         finally
             reset_store!(store)
+        end
+    end
+end
+
+@testset "cancellation is cooperative, never injected (#127)" begin
+    @testset "cancel_task sets the run's token, and the callback observes it" begin
+        store = InMemoryWorkerStore()
+        entered = Base.Event()
+        saw_token = Threads.Atomic{Bool}(false)
+        ran_finally = Threads.Atomic{Bool}(false)
+        try
+            id = submit_task("cooperative", task_info -> begin
+                notify(entered)
+                try
+                    while !cancel_requested(task_info)
+                        sleep(0.01)
+                    end
+                    saw_token[] = true
+                    return "stopped"
+                finally
+                    # Under the old model this ran because the injected exception unwound
+                    # the callback. Now it runs only because the callback RETURNS -- which
+                    # is the whole behavioural change apps have to absorb.
+                    ran_finally[] = true
+                end
+            end, Owner("u"); store=store)
+
+            wait(entered)
+            @test cancel_requested(get_task_info(store, id)) == false
+            @test cancel_task(id, Owner("u"); store=store)[:status] == "Task cancelled"
+
+            @test wait_for(() -> saw_token[]) == :ok
+            @test wait_for(() -> ran_finally[]) == :ok
+            @test get_task_status(id, Owner("u"); store=store)[:status] == "CANCELLED"
+        finally
+            reset_store!(store)
+        end
+    end
+
+    @testset "an uncooperative callback is not stopped, and cancel does not block on it" begin
+        store = InMemoryWorkerStore()
+        entered = Base.Event()
+        release = Base.Event()
+        returned = Threads.Atomic{Bool}(false)
+        try
+            id = submit_task("uncooperative", () -> begin
+                notify(entered)
+                wait(release)               # never polls the token
+                returned[] = true
+                return "finished anyway"
+            end, Owner("u"); store=store)
+
+            wait(entered)
+            # Returns immediately: the terminal state is recorded by the CAS, and there is
+            # nothing to wait for. This is the contract the docs claimed and the interrupt
+            # never actually delivered.
+            @test cancel_task(id, Owner("u"); store=store)[:status] == "Task cancelled"
+            @test get_task_status(id, Owner("u"); store=store)[:status] == "CANCELLED"
+            @test returned[] == false       # still running, as documented
+
+            notify(release)
+            @test wait_for(() -> returned[]) == :ok
+            # It ran to completion -- and still must not overwrite the cancellation.
+            @test wait_for(() -> get_task_status(id, Owner("u"); store=store)[:status] ==
+                                 "CANCELLED") == :ok
+        finally
+            notify(release)
+            reset_store!(store)
+        end
+    end
+
+    @testset "a timeout sets the token, records FAILED, and is never retried" begin
+        store = InMemoryWorkerStore()
+        entries = Threads.Atomic{Int}(0)
+        try
+            # retry_on_failure is ON on purpose: a timeout must still be terminal on the
+            # first attempt. Retrying would put a second copy of the callback beside the
+            # first, since nothing can stop the one that timed out.
+            id = @suppress_err submit_task("slow", () -> begin
+                Threads.atomic_add!(entries, 1)
+                sleep(2.0)                  # outruns the deadline, ignores the token
+                return "too late"
+            end, Owner("u");
+            options=TaskOptions(timeout=1, retry_on_failure=true, max_retries=2), store=store)
+
+            @test wait_for(() -> get_task_status(id, Owner("u"); store=store)[:status] ==
+                                 "FAILED"; timeout=10.0) == :ok
+            status = get_task_status(id, Owner("u"); store=store)
+            @test occursin("Timeout of 1s exceeded", status[:error])
+            @test entries[] == 1
+        finally
+            reset_store!(store)
+        end
+    end
+
+    @testset "nothing in Workers injects an exception into a task" begin
+        # A source assertion, because the property is "no site in this module does this"
+        # rather than "this function behaves thus" -- and reintroducing the injection is
+        # the specific regression that would make worker bodies unsafe to migrate again.
+        for file in ("api.jl", "execution.jl", "queue.jl")
+            src = read(joinpath(pkgdir(Nitro), "src", "Workers", file), String)
+            # Comments are stripped first: the sites that were removed are DESCRIBED in
+            # comments right where they used to be, and a guard that cannot tell an
+            # explanation from a call would fail on its own documentation.
+            code = join((line for line in eachsplit(src, "
+")
+                         if !startswith(strip(line), "#")), "
+")
+            @test !occursin("error=true", code)
+            @test !occursin("error = true", code)
         end
     end
 end
@@ -1085,7 +1199,7 @@ end
     try
         task_id2 = submit_task("cancel-fields-task", task_info -> begin
             notify(started)
-            while true; sleep(0.01); end
+            while !cancel_requested(task_info); sleep(0.01); end
         end, Owner("user"); store=store2)
 
         wait(started)

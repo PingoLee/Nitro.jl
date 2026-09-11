@@ -189,4 +189,16 @@ On startup, `RUNNING` tasks without a live in-memory `Task` are marked `FAILED` 
 - Implement in `InMemoryWorkerStore` **and** `PormGWorkerStore` — a hook implemented in only one of
   them is a store that silently behaves differently, which for the authorizer pair means a silently
   different security posture.
+- **Nothing may inject an exception into a worker task.** `schedule(t, exc; error=true)` does
+  not check whether `t` is running, and injecting into a task executing on another thread aborts
+  the process in `jl_finish_task` — which is what blocked worker bodies from moving to
+  `Threads.@spawn` ([#127](https://github.com/PingoLee/Nitro.jl/issues/127),
+  [#30](https://github.com/PingoLee/Nitro.jl/issues/30)). Cancellation is a **token** the callback
+  polls (`cancel_requested`), set by `cancel_task` and by an expired `TaskOptions(timeout=…)`.
+  Never reintroduce the injection, and do not add a public setter for the token: `cancel_task` is
+  the authorized path, and a second route into it would bypass both the authorization check and
+  the status CAS. The token is process-local and never reset — a re-run gets a fresh `TaskInfo`.
+- **A timeout bounds the wait, not the work, and is never retried.** Nothing stops the attempt
+  that timed out, so retrying it runs a second copy of the callback beside the first against one
+  `task_info`. `TaskTimeoutError` is terminal on the first attempt.
 - **Never serialize running `Task` objects** to the database.

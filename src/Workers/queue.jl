@@ -125,13 +125,32 @@ function _execute_queued_task(store::AbstractWorkerStore, item::QueueItem)
     max_attempts = item.options.retry_on_failure ? item.options.max_retries : 0
     for retry_count in 0:max_attempts
         try
-            result = timeout_call(() -> _invoke_task_callback(item.callback, task_info); timeout=item.options.timeout)
+            result = timeout_call(item.callback, task_info; timeout=item.options.timeout)
             return _complete_task!(store, task_info, result)
         catch error
             unwrapped = _unwrap_exception(error)
+
+            # NOT dead code, however redundant it looks. `_fail_task!` below would lose
+            # its CAS against an already-CANCELLED record anyway -- but without this
+            # branch a cancelled task with `retry_on_failure` falls through to the
+            # backoff `sleep` and RE-RUNS. This is what short-circuits the retry loop.
+            #
+            # `unwrapped isa InterruptException` used to be an arm of this test, back when
+            # cancellation was delivered by injecting one. Nothing injects any more, so
+            # the only way one arrives is that the callback itself threw it -- recording
+            # that as "Cancelled by user" would be a lie about who stopped the job (#127).
             latest_info = get_task_info(store, task_info.id)
-            if unwrapped isa InterruptException || (latest_info !== nothing && latest_info.status == CANCELLED)
+            if latest_info !== nothing && latest_info.status == CANCELLED
                 return _cancel_task!(store, task_info)
+            end
+
+            # A timeout is terminal on the first attempt. Retrying it cannot help and can
+            # harm: nothing stops the attempt that timed out, so `max_retries = 3` would
+            # put four copies of the callback on the thread pool at once, sharing one
+            # `task_info` and one set of external side effects (#127). The token is not
+            # reset between attempts either, so a retry would start pre-cancelled.
+            if unwrapped isa TaskTimeoutError
+                return _fail_task!(store, task_info, format_error(unwrapped))
             end
 
             if retry_count == max_attempts

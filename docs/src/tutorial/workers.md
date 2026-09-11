@@ -239,61 +239,68 @@ Tasks can be cancelled by id — again, the id the submit call returned:
 cancel_task(task_id, Owner("user-1"))
 ```
 
-!!! warning "Cancellation is cooperative"
-    `cancel_task` records the terminal state atomically and sends an `InterruptException`
-    to the worker task, but it **cannot force a running callback to stop**. A callback in a
-    tight loop that never yields, or one blocked in a `ccall` or an external process, keeps
-    running after `cancel_task` has returned `"Task cancelled"` and the status reads
-    `CANCELLED`.
+!!! warning "Cancellation is cooperative — the callback has to notice"
+    `cancel_task` records the terminal state atomically and sets a **cancellation token** on
+    the run. It does not, and cannot, stop a running callback. `cancel_task` returns
+    `"Task cancelled"` and the status reads `CANCELLED` the moment the state is claimed —
+    while the callback carries on until it either notices or finishes.
 
-    Write cancellable work so it can notice: yield regularly, and check the status if the
-    job is long-running.
+    Poll the token. It is the whole mechanism:
 
     ```julia
     submit_task("import", task_info -> begin
         for chunk in chunks
-            task_info.status == CANCELLED && return "cancelled"
+            cancel_requested(task_info) && return "cancelled"
             process(chunk)
             update_progress!(task_info, 100 * done / total)
         end
     end, Owner("user-1"))
     ```
 
-    **`task_info.status` is process-local.** With `PormGWorkerStore` and more than one
-    process, a cancel issued on another node writes the database row and never touches
-    this node's in-memory `TaskInfo`, so the check above will not fire. Poll the durable
-    record instead, sparingly — it is a database round-trip:
+    Nitro used to throw an `InterruptException` into the worker task as well. That was
+    removed: `schedule(t, exc; error=true)` does not check whether `t` is running, and
+    injecting into a task executing on another thread aborts the whole process in
+    `jl_finish_task`. Java withdrew `Thread.stop()` and .NET withdrew `Thread.Abort()` for
+    the same reason; Go, Sidekiq and River have always been cooperative. A framework that
+    runs in one process has no isolation boundary to kill across, which is how Celery and
+    Oban get away with a hard stop.
+
+    **`cancel_requested` is process-local.** With `PormGWorkerStore` and more than one
+    process, a cancel issued on another node writes the database row and never touches this
+    node's `TaskInfo`, so the check above will not fire. Poll the durable record instead,
+    sparingly — it is a database round-trip:
 
     ```julia
     get_task_status(task_info.id, System())[:status] == "CANCELLED" && return "cancelled"
     ```
 
-    **A callback that spawns an external process must kill it itself.** The
-    `InterruptException` reaches the Julia task, never the children it started, so a
-    task that reports `CANCELLED` — or that hit its `timeout` — can leave that process
-    running and still mutating external state, with nothing to tell the operator.
-    Capture the handle and release it on the way out:
+    **A callback owns every resource it acquired, unconditionally.** Nothing reaches the
+    Julia task any more, so a `try`/`finally` runs when the callback *returns* — and a
+    callback that never polls never returns, so its `finally` never runs. This matters most
+    for child processes, which were never reachable even under the old model:
 
     ```julia
     submit_task("convert", task_info -> begin
         p = run(`ffmpeg -i input.mov output.mp4`; wait = false)
         try
-            wait(p)
-            return "converted"
+            while process_running(p)
+                cancel_requested(task_info) && break
+                sleep(0.2)        # the poll interval IS the cancellation latency
+            end
+            return process_running(p) ? "cancelled" : "converted"
         finally
             if process_running(p)
-                kill(p)       # SIGTERM
-                wait(p)       # kill() is asynchronous — without this the child
-            end               # may outlive the callback that spawned it
+                kill(p)           # SIGTERM
+                wait(p)           # kill() is asynchronous — without this the child
+            end                   # may outlive the callback that spawned it
         end
     end, Owner("user-1"))
     ```
 
-    The `finally` runs as the interrupt unwinds the callback, which is the last moment
-    the child is still reachable. `kill(p)` only *sends* the signal, so the `wait(p)`
-    after it is what actually reaps the process; escalate with `kill(p, 9)` for a child
-    that ignores `SIGTERM`. The same applies to any OS resource the callback owns — a
-    file lock, a socket, a temp directory.
+    Writing this as a bare `wait(p)` inside the `try` would now block forever: there is no
+    longer anything that can interrupt it. The loop is what makes the `finally` reachable.
+    The same applies to any OS resource the callback owns — a file lock, a socket, a temp
+    directory.
 
 Tasks can also retry on failure by passing `TaskOptions`.
 
@@ -307,6 +314,24 @@ submit_task(
     options=TaskOptions(retry_on_failure=true, max_retries=3, timeout=300),
 )
 ```
+
+!!! warning "`timeout` bounds the wait, not the work"
+    When the deadline expires Nitro sets the cancellation token, records the task `FAILED`
+    with `"Timeout of Ns exceeded"`, and logs a warning naming the task. The callback keeps
+    running — and keeps a thread — until it returns. This is the same contract as Java's
+    `Future.get(timeout)` and Go's `context.WithTimeout`: both accept an abandoned unit of
+    work rather than an unsafe kill.
+
+    Worker callbacks share the `:default` thread pool with the per-request tasks `serve`
+    spawns, so `Threads.nthreads()` abandoned CPU-bound callbacks will wedge the web server.
+    A callback that can outrun its deadline **must** poll `cancel_requested(task_info)`; the
+    logged warning is the only other signal you get.
+
+    **A timeout is never retried.** `retry_on_failure` covers genuine failures. Retrying a
+    timeout cannot help — nothing stopped the attempt that timed out, so `max_retries=3`
+    would put four copies of the callback on the pool at once, sharing one `task_info` and
+    one set of external side effects.
+
 
 ## Progress Updates
 
@@ -625,6 +650,8 @@ Even with database persistence, keep in mind that `Nitro.Workers` is an in-proce
 - cross-machine execution or horizontal scaling across separate nodes
 - extremely heavy CPU-bound job queues that should not compete with your web server thread pool
 
+That last point is load-bearing rather than advisory. Worker callbacks run on the `:default` thread pool — the same pool `serve` spawns every request into — and nothing can stop one: a cancelled or timed-out CPU-bound callback holds its thread until it returns of its own accord. `Threads.nthreads()` of those and the web server has no thread left to answer on. Either make every long callback poll `cancel_requested(task_info)`, or run the work out of process.
+
 ## Summary
 
 Use `Nitro.Workers` when you need lightweight or persistent background execution for Nitro requests.
@@ -635,6 +662,7 @@ Use `Nitro.Workers` when you need lightweight or persistent background execution
 - use `submit_task(...)` for parallel jobs
 - use `submit_sequential_task(...)` for ordered queue processing
 - read and cancel with the id the submit call **returned**, not the `task_key` you passed
+- poll `cancel_requested(task_info)` in any long-running callback — `cancel_task` and `timeout` do nothing without it
 - use `scope=:global` only when a job is genuinely shared, and pair it with `set_watch_authorizer!`
 - use `get_task_status(...)` and `get_queue_status(...)` to monitor work
 - use `TaskOptions(...)` for retries and timeouts

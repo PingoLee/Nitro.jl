@@ -287,6 +287,13 @@ function _register_or_watch!(store::AbstractWorkerStore, task_key::String, owner
 
         # Re-running a finished key replaces the record and resets its watchers to the
         # resubmitter — the one place a whole record, watchers included, is written.
+        # The record we are about to discard may still have a live run behind it. `run_id`
+        # stops that run from writing (#108); this is the only thing that can reclaim the
+        # thread it is sitting on. In-process only -- a run hosted on another node is
+        # unreachable from here and will keep going until its callback returns.
+        previous = get_active_task_info(store, task_key)
+        previous === nothing || (@atomic previous.cancel_requested = true)
+
         task_info = TaskInfo(task_key; queue_name)
         push!(task_info.watchers, uid)
         for grant in grants
@@ -332,13 +339,32 @@ function _execute_task_async(store::AbstractWorkerStore, task_key::String, callb
         max_attempts = options.retry_on_failure ? options.max_retries : 0
         for retry_count in 0:max_attempts
             try
-                result = timeout_call(() -> _invoke_task_callback(callback, task_info); timeout=options.timeout)
+                result = timeout_call(callback, task_info; timeout=options.timeout)
                 return _complete_task!(store, task_info, result)
             catch error
                 unwrapped = _unwrap_exception(error)
+
+                # NOT dead code, however redundant it looks. `_fail_task!` below would lose
+                # its CAS against an already-CANCELLED record anyway -- but without this
+                # branch a cancelled task with `retry_on_failure` falls through to the
+                # backoff `sleep` and RE-RUNS. This is what short-circuits the retry loop.
+                #
+                # `unwrapped isa InterruptException` used to be an arm of this test, back when
+                # cancellation was delivered by injecting one. Nothing injects any more, so
+                # the only way one arrives is that the callback itself threw it -- recording
+                # that as "Cancelled by user" would be a lie about who stopped the job (#127).
                 latest_info = get_task_info(store, task_key)
-                if unwrapped isa InterruptException || (latest_info !== nothing && latest_info.status == CANCELLED)
+                if latest_info !== nothing && latest_info.status == CANCELLED
                     return _cancel_task!(store, task_info; message="Cancelled by user")
+                end
+
+                # A timeout is terminal on the first attempt. Retrying it cannot help and can
+                # harm: nothing stops the attempt that timed out, so `max_retries = 3` would
+                # put four copies of the callback on the thread pool at once, sharing one
+                # `task_info` and one set of external side effects (#127). The token is not
+                # reset between attempts either, so a retry would start pre-cancelled.
+                if unwrapped isa TaskTimeoutError
+                    return _fail_task!(store, task_info, format_error(unwrapped))
                 end
 
                 if retry_count == max_attempts
@@ -511,16 +537,27 @@ function cancel_task(task_id::AbstractString, authority::TaskAuthority; store::A
             return Dict{Symbol, Any}(:error => "Task already finished with status $(latest.status)")
         end
 
-        sys_task = get_active_task(store, task_info.id)
-        if sys_task !== nothing && !istaskdone(sys_task)
-            try
-                schedule(sys_task, InterruptException(), error=true)
-            catch
-            end
+        # Ask the callback to stop. This replaces
+        # `schedule(sys_task, InterruptException(), error=true)`, which was only ever safe
+        # while worker tasks were thread-pinned: `schedule(t, exc; error=true)` does not
+        # check whether `t` is running, and injecting into a task executing on another
+        # thread aborts the process in `jl_finish_task` (#127, blocking #30).
+        #
+        # `get_active_task_info`, NOT `get_task_info`: the latter falls back to a database
+        # read for a database-backed store and hands back a throwaway object the callback
+        # does not hold, so the write would be a silent no-op. The `run_id` guard keeps the
+        # request off a successor run (#108).
+        #
+        # Nothing is deregistered here any more. That used to mean "this process is done
+        # running it", which was true a moment later under the old model and is false now --
+        # the callback keeps going. Leaving the handles in place keeps `get_active_task`
+        # honest for `recover_zombie_tasks!` and keeps `get_task_info` serving live progress
+        # for a task that is still producing it. `_finish_task!` tears them down whether or
+        # not it wins its CAS, so nothing leaks.
+        live = get_active_task_info(store, task_info.id)
+        if live !== nothing && live.run_id == task_info.run_id
+            @atomic live.cancel_requested = true
         end
-
-        deregister_active_task!(store, task_info.id)
-        deregister_active_task_info!(store, task_info.id)
 
         return Dict{Symbol, Any}(:status => "Task cancelled")
     end
