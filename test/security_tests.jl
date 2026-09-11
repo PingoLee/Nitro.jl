@@ -239,3 +239,113 @@ end
     end
 end
 end
+
+# #130: `ValidationError.cause` is the wrapped underlying exception, and parsers quote their
+# input -- a JSON parse `ArgumentError` echoes the submitted bytes. `showerror` was the leak the
+# issue was filed for; `show` and JSON are INDEPENDENT output paths that leaked the same value,
+# and the JSON one reaches the CLIENT rather than the log. Same pairing, same reasoning, and the
+# same test shape as the `SecretString` redaction item above (#25) -- the display-path contract
+# for this type lives in `test/util_tests.jl`.
+@testitem "Security: ValidationError cause redaction" tags=[:security, :core] setup=[NitroCommon] begin
+using Nitro
+using Test
+using JSON
+using Nitro: ValidationError
+
+const PAYLOAD = "NITRO-SUBMITTED-PASSWORD-91fe3c"
+
+# An app-level error envelope: the single most likely way a ValidationError is serialized.
+struct ErrorEnvelope
+    ok::Bool
+    error::ValidationError
+end
+
+err() = ValidationError("Invalid query parameter 'limit': expected Int64",
+                        ArgumentError("invalid JSON parsing type Any: $PAYLOAD"))
+
+@testset "every JSON shape masks the cause" begin
+    for encoded in (JSON.json(err()),                          # bare
+                    JSON.json(ErrorEnvelope(false, err())),    # struct field
+                    JSON.json(Dict("error" => err())),
+                    JSON.json([err()]),
+                    JSON.json((err(), 1)))
+        @test !occursin(PAYLOAD, encoded)
+        @test occursin("ArgumentError", encoded)               # the type survives
+    end
+
+    # A mask that swallowed the whole struct would satisfy the loop above while breaking every
+    # caller, so pin that `.msg` -- which #72 made value-free precisely so it could be shown --
+    # still serializes.
+    @test occursin("Invalid query parameter 'limit'", JSON.json(err()))
+
+    # No cause at all: the key is absent rather than null, and nothing else changes. Worth pinning
+    # because the unpatched reflection emitted `"cause":null` here, so this assertion is a guard
+    # rather than a restatement of the loop above.
+    bare = JSON.json(ValidationError("Missing required query parameter 'q'"))
+    @test occursin("Missing required query parameter 'q'", bare)
+    @test !occursin("cause", bare)
+
+    # A nested ValidationError does not recurse into the inner cause: `lower` hands back a String
+    # for the type, so the chain stops at one level and the inner payload is unreachable.
+    nested = ValidationError("outer", ValidationError("inner", ArgumentError(PAYLOAD)))
+    @test !occursin(PAYLOAD, JSON.json(nested))
+    @test occursin("ValidationError", JSON.json(nested))
+end
+
+# The mask is deliberately one-way and deliberately has no key form, matching `SecretString`
+# above. Both already hold; pin them so adding a `lowerkey` or a `lift` for convenience is a
+# deliberate decision rather than an accident that silently re-opens a path.
+@testset "serialization is one-way and has no key form" begin
+    # As a Dict *key* a ValidationError routes through `StructUtils.lowerkey`, which has no method
+    # here. Fails closed rather than falling back to field reflection.
+    @test_throws ArgumentError JSON.json(Dict(err() => 1))
+
+    # No `StructUtils.lift` accompanies the `lower`, so a struct holding one does not parse back.
+    @test_throws MethodError JSON.parse(JSON.json(ErrorEnvelope(false, err())), ErrorEnvelope)
+end
+
+@testset "the response path masks the cause" begin
+    # Res.json is the explicit builder an app writes in a `catch ValidationError`;
+    # format_response is the automatic struct-to-JSON path a handler hits by returning it.
+    for body in (text(Nitro.Res.json(Dict("error" => err()))),
+                 text(Nitro.Res.json(err())),
+                 text(Nitro.Core.format_response(err())))
+        @test !occursin(PAYLOAD, body)
+        @test occursin("ArgumentError", body)
+        @test occursin("Invalid query parameter 'limit'", body)
+    end
+end
+
+# The end-to-end shape the issue is actually about: a real rejected request, serialized by an
+# app that catches the error and reports it. Nothing synthetic -- the cause here is whatever
+# JSON.jl actually threw.
+#
+# The sentinel is chosen ON PURPOSE and the assertion order below is what enforces it, because
+# there are two ways a sentinel silently vanishes from the cause -- after which every negative
+# assertion here passes for the wrong reason:
+#
+#   1. A value whose FIRST character is `N`, `n`, `I` or `i` is read as a would-be `NaN`/`Inf`,
+#      and JSON.jl reports "possible `NaN`, `Inf`, or `-Inf`..." without quoting the input at all.
+#      That rules out the sentinel names one would naturally reach for: `name-...`, `id-...`,
+#      `nitro-...`. Measured, not assumed -- `true-...`, `7...` and `-1...` DO echo, so the rule is
+#      narrower than "looks like a JSON literal".
+#   2. Anything longer than 21 characters is truncated ("averyveryverylongsecr").
+#
+# So the POSITIVE assertion comes first: it fails loudly if a future edit picks a sentinel this
+# parser does not echo, rather than letting the guards quietly become theater. It already caught
+# one -- the first sentinel here began with "N".
+@testset "a real rejected body does not round-trip to the client" begin
+    echoed = "pw-91fe3c"
+    real_err = try
+        Nitro.Core.Util.parseparam_checked(Int, echoed, "limit", :query)
+        nothing
+    catch e
+        e
+    end
+    @test real_err isa ValidationError
+    @test occursin(echoed, sprint(showerror, real_err.cause))      # the cause DOES carry it
+    @test !occursin(echoed, JSON.json(real_err))                   # ...and JSON does not
+    @test !occursin(echoed, text(Nitro.Res.json(Dict("error" => real_err))))
+    @test !occursin(echoed, sprint(show, real_err))
+end
+end

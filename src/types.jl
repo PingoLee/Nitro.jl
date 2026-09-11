@@ -692,6 +692,10 @@ end
 # a malformed scalar param is a client error rather than a 500 with a logged backtrace.
 # The offending value is deliberately not interpolated: `.msg` is app-reachable and a path
 # segment can carry a token.
+# The decode failure itself IS attached as `.cause`. Unlike the body and scalar wrap sites this one
+# carries almost nothing -- `unescapeuri` fails inside `parse(UInt8, "ZZ"; base=16)` (the two hex
+# digits) or as a message-free `EOFError` -- but the rule is uniform: since #130 none of `showerror`,
+# `show` or `JSON.lower` renders a cause by default, at any of the four sites that attach one.
 function _pathparams_uncached(req::HTTP.Request)
     raw = HTTP.getparams(req)
     raw === nothing && return nothing
@@ -717,6 +721,7 @@ end
 # escape, so `?q=%ZZ` was a 500 here too (pre-existing -- this accessor's decode was never
 # inside `parseparam_checked` either). Both accessors now owe their caller a well-formed map
 # or a `ValidationError`; neither leaks a raw decode failure into the server-error path.
+# Same `.cause` rule as `pathparams` above (#130): attached, never rendered by default.
 function _queryvars_uncached(req::HTTP.Request)
     # Deliberately OUTSIDE the guard: a `req.target` this malformed is a framework/router
     # problem, not client input, and must stay a logged 500 rather than be laundered into a 400.

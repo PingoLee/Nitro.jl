@@ -594,17 +594,12 @@ end
     @test occursin("validate", err1.msg)
     @test occursin("extractor_tests.jl", err2.msg)
 
-    # The other branch: `safe_extract` wraps a deserialization failure. Its `.msg` is
-    # value-free too, which is what makes the `@debug message=error.msg` line in
-    # `handlerequest` safe.
-    #
-    # NOTE: `showerror` is deliberately NOT asserted here. `safe_extract` attaches the
-    # underlying exception as `.cause`, and `showerror` renders it — a JSON parse
-    # `ArgumentError` quotes the offending input, so the payload does come back that
-    # way. That is pre-existing and outside #72's fix, and is tracked in #130; asserting
-    # it clean here would fail, and asserting it dirty would enshrine the leak. When
-    # #130 lands, extend the `!occursin(secret, sprint(showerror, …))` assertion above
-    # to this branch and delete this note.
+    # The other branch: `safe_extract` wraps a deserialization failure and attaches the
+    # underlying exception as `.cause`. Its `.msg` is value-free too, which is what makes
+    # the `@debug message=error.msg` line in `handlerequest` safe — and as of #130 the
+    # rendered forms are value-free as well, so the payload cannot come back that way
+    # either. The cause is still ATTACHED and still carries the submitted bytes; only an
+    # explicit opt-in reaches it.
     bs = Char(0x5c)   # one real backslash → an invalid JSON escape inside the password
     parse_err = extract_err(Param(:credentials, Json{Login}, missing, false),
                             string("{\"username\":\"u-c3\",\"password\":\"pw-c3", bs, "qX\"}"))
@@ -612,6 +607,28 @@ end
     @test !occursin("pw-c3", parse_err.msg)
     @test !occursin("u-c3", parse_err.msg)
     @test occursin("credentials", parse_err.msg)
+
+    # #130 — the assertion this testset was written to be able to make. Both rendered
+    # forms, because a logger that treats `exception=` as a plain value reaches `show`
+    # rather than `showerror`, and the default struct `show` printed every field.
+    @test !occursin("pw-c3", sprint(showerror, parse_err))
+    @test !occursin("Caused by", sprint(showerror, parse_err))
+    @test !occursin("pw-c3", sprint(show, parse_err))
+    @test occursin("ArgumentError", sprint(show, parse_err))   # the type survives, not the value
+
+    # ...and these are real guards, not vacuous ones: the cause IS attached and DOES carry
+    # the submitted password, so all four assertions above fail against the unpatched
+    # renderers. If this pair ever goes red, the sentinel stopped being present and those
+    # four silently stopped proving anything — they do not quietly become theater.
+    @test parse_err.cause isa Exception
+    @test occursin("pw-c3", sprint(showerror, parse_err.cause))
+
+    # The opt-in still renders the chain, which is what makes keeping `.cause` worthwhile.
+    @test occursin("Caused by", sprint(io -> showerror(io, parse_err; cause = true)))
+    @test occursin("pw-c3", sprint(io -> showerror(io, parse_err; cause = true)))
+    # One formatter, not two: the helper must never drift from the kwarg it wraps.
+    @test Nitro.Core.Errors.cause_report(parse_err) ==
+          sprint(io -> showerror(io, parse_err; cause = true))
 end
 
 @testset "MultipartForm - non-multipart body throws" begin
