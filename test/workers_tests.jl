@@ -2,7 +2,6 @@
 
 using Test
 using Dates
-using Suppressor
 using Nitro
 using Nitro.Workers
 using Nitro.Errors: AuthorizationError
@@ -233,6 +232,10 @@ end
 
 @testset "User access control and queue authorization" begin
     store = InMemoryWorkerStore()
+    # Declared out here so the `finally` below can release the callback -- see the note at
+    # the `task-access` submit.
+    access_started = Base.Event()
+    access_release = Base.Event()
     
     # Configure a mock queue authorizer
     set_queue_authorizer!(store, (queue_name, user_id) -> begin
@@ -253,7 +256,21 @@ end
 
         # 2. Task querying and watchers access control
         # submit a task by user-a (so user-a is the first watcher)
-        task_id = submit_task("task-access", () -> "data", Owner("user-a"); store=store)
+        #
+        # The callback is held open rather than returning immediately. This testset asserts an
+        # AUTHORIZATION property -- that the owner may cancel and a stranger may not -- and a
+        # cancel can only demonstrate that against a task still running. `() -> "data"` used to
+        # be safe here only by accident: under `@async` the body was pinned to the submitting
+        # thread and could not start until this test task yielded, so the cancel always won.
+        # Once worker bodies moved to `Threads.@spawn` (#30) it finishes first on the other
+        # thread and the cancel correctly reports "already finished" -- turning an
+        # authorization assertion into a race. Hold it open and the property is tested again.
+        task_id = submit_task("task-access", task_info -> begin
+            notify(access_started)
+            wait(access_release)
+            return "data"
+        end, Owner("user-a"); store=store)
+        wait(access_started)
         @test task_id == "user-a::task-access"
 
         # user-a can check status
@@ -303,6 +320,7 @@ end
         cancel_res = cancel_task(task_id, Owner("user-a"); store=store)
         @test cancel_res[:status] == "Task cancelled"
     finally
+        notify(access_release)
         reset_store!(store)
     end
 end
@@ -728,7 +746,12 @@ end
             # retry_on_failure is ON on purpose: a timeout must still be terminal on the
             # first attempt. Retrying would put a second copy of the callback beside the
             # first, since nothing can stop the one that timed out.
-            id = @suppress_err submit_task("slow", () -> begin
+            # No `@suppress_err` here, deliberately. It would wrap only this call, which
+            # returns immediately, while the timeout `@warn` fires about a second later from
+            # the worker task -- so it suppressed nothing and merely looked like it did. The
+            # warning is expected output for this testset, and seeing it in CI is a feature:
+            # it is the only signal an abandoned callback produces.
+            id = submit_task("slow", () -> begin
                 Threads.atomic_add!(entries, 1)
                 sleep(2.0)                  # outruns the deadline, ignores the token
                 return "too late"
@@ -740,6 +763,22 @@ end
             status = get_task_status(id, Owner("u"); store=store)
             @test occursin("Timeout of 1s exceeded", status[:error])
             @test entries[] == 1
+        finally
+            reset_store!(store)
+        end
+    end
+
+    @testset "a fast task leaves no handle behind" begin
+        # `_execute_task_async` used to also `register_active_task!` from the PARENT, after the
+        # spawn. Under `@async` that was a duplicate write of the same Task object and merely
+        # happened first; under `Threads.@spawn` the body can finish and deregister before the
+        # parent gets there, re-registering a completed task that nothing ever cleans up (#30).
+        store = InMemoryWorkerStore()
+        try
+            id = submit_task("quick", () -> "done", Owner("u"); store=store)
+            @test wait_for(() -> get_task_status(id, Owner("u"); store=store)[:status] ==
+                                 "COMPLETED") == :ok
+            @test wait_for(() -> !haskey(store.active_tasks, id)) == :ok
         finally
             reset_store!(store)
         end
@@ -763,6 +802,23 @@ end
         end
     end
 end
+
+# NOT HERE: the probe #127 asked for -- "submit a CPU-bound callback, wait until it is provably
+# running, then cancel, at -t 2". It was written, and it wedged the ReTestItems worker into a
+# 600s timeout on roughly half of -t 2 runs. Recorded so the next attempt does not rediscover it:
+#
+#   * Nitro is not the stall. Tracing every branch of the worker path showed it reached
+#     `_invoke_task_callback` EVERY time and stopped before the callback's first statement.
+#     `body-claim-FAILED` never appeared once, so the claimed start (#142) is not implicated.
+#   * The same scenario runs 25/25 clean standalone at -t 2. It needs the full suite around it.
+#   * Disabling only this testset: 6/6 clean at -t 2. The swap itself is stable.
+#   * Three fixes were tried and NONE worked: `GC.safepoint()` in the spin, replacing the spin
+#     with allocating work, and pre-compiling the callback on the test task before submitting.
+#
+# So the gap is real and is written down rather than papered over: nothing here cancels a task
+# that is genuinely executing on another thread. Every cancel test above uses a `sleep` loop,
+# and a task in `sleep` is PARKED -- which is exactly the weak probe that let the first attempt
+# at #30 ship a process abort. See the follow-up issue.
 
 @testset "queue introspection is an admin surface (#87)" begin
     store = InMemoryWorkerStore()

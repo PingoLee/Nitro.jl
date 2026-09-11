@@ -68,7 +68,12 @@ function timeout_call(callback::Function, task_info::TaskInfo; timeout::Int=3600
     result_channel = Channel{Any}(1)
     error_channel = Channel{Any}(1)
 
-    task = @async begin
+    # `Threads.@spawn`, not `@async` (#30). Under `@async` this child was pinned to the
+    # monitoring task's own thread, so a CPU-bound callback -- precisely what a deadline exists
+    # to bound -- starved the `timedwait` below and the timeout mostly never fired at all. It
+    # fires now. The flip side is that an abandoned callback occupies a `:default`-pool slot,
+    # the same pool serving HTTP, until it returns; see the `@warn` on the timeout path.
+    task = Threads.@spawn begin
         try
             put!(result_channel, _invoke_task_callback(callback, task_info))
         catch error

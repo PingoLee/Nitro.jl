@@ -304,8 +304,33 @@ function _register_or_watch!(store::AbstractWorkerStore, task_key::String, owner
     end
 end
 
+# `Threads.@spawn`, not `@async` (#30). `@async` creates a **sticky** task, pinned for life to
+# the thread that created it -- here, a request-handling thread. A CPU-bound callback that never
+# yields therefore starved every other coroutine on that thread, including the requests
+# `parallel_stream_handler` had scheduled there, which is exactly the stall workers exist to
+# prevent. `Threads.@spawn` creates a migratable task on the `:default` pool, which is the model
+# nitro-core §2 asks for and the one `src/core.jl` already uses per request (#39).
+#
+# What made this unlandable before was not thread affinity but exception injection: cancellation
+# and timeout used to `schedule(…, error=true)` into this task, which is undefined behaviour
+# against a task executing on another thread and aborted the process. #127 removed both
+# injections, and that -- not any property of this function -- is what makes migration safe. Note
+# the criterion is "does anything inject into this task?", not "is this the request path": with
+# nothing injecting anywhere, `start_cleanup_scheduler` could migrate too, and stays `@async` only
+# because it runs no user code.
+#
+# Nothing in `src/Workers/` depends on thread affinity: no `Threads.threadid()`, no task-local
+# storage, no `SpinLock`. Every lock here is a `ReentrantLock`, which keys on `current_task()`, so
+# a migrating task keeps what it holds, and `TaskInfo.progress` is `@atomic`. An **app** callback
+# using the `buffers[Threads.threadid()]` pattern was already unsound under `@async` and is now
+# visibly so.
+#
+# The cost this adds, stated plainly: a cancelled or timed-out callback that never polls
+# `cancel_requested` now holds one of `Threads.nthreads()` `:default`-pool slots -- the same pool
+# serving HTTP -- until it returns, instead of starving one thread's coroutines. See the timeout
+# warning in `docs/src/tutorial/workers.md`.
 function _execute_task_async(store::AbstractWorkerStore, task_key::String, callback::Function, options::TaskOptions)
-    task = @async begin
+    task = Threads.@spawn begin
         task_info = get_task_info(store, task_key)
 
         if task_info === nothing
@@ -378,7 +403,15 @@ function _execute_task_async(store::AbstractWorkerStore, task_key::String, callb
         return task_info
     end
 
-    register_active_task!(store, task_key, task)
+    # No `register_active_task!` here. The body registers `current_task()` -- the very same Task
+    # object -- as part of claiming its start, so this was always a duplicate write of an
+    # identical value; under `@async` it merely happened first, because the parent could not
+    # yield between the spawn and this line. Under `Threads.@spawn` the body may complete and
+    # deregister BEFORE this line runs, re-registering a finished task that nothing will ever
+    # clean up. Its one non-duplicate effect was on the early-return path above, where it
+    # registered a handle for a key with no record at all -- a permanent leak that makes
+    # `recover_zombie_tasks!` skip a later genuinely-dead run under the same key, since that
+    # sweep asks only whether an entry exists.
     return task
 end
 
@@ -654,6 +687,12 @@ function start_cleanup_scheduler(; interval_hours::Real=24, retain_days::Int=7, 
 
     stop_signal = Channel{Nothing}(1)
     interval_seconds = max(interval_hours * 3600, 0.01)
+    # Deliberately `@async` while worker bodies are `Threads.@spawn` (#30). The old
+    # discriminator -- "does anything `schedule(…, error=true)` this task?" -- stopped
+    # discriminating when #127 removed every injection, so it is not the reason. The reason is
+    # that this task runs no user code: it sleeps in `timedwait` and calls `cleanup_old_tasks`
+    # once a day, so there is nothing here that could starve a thread and nothing to gain from
+    # migrating it. It is stopped by a `Channel` signal, never by an interrupt.
     task = @async begin
         while true
             wait_result = timedwait(() -> isready(stop_signal), interval_seconds)
