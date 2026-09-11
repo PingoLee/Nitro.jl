@@ -535,6 +535,40 @@ else
             @test reload_task(store_s, "alice::split").run_id == stale.run_id
         end
 
+        @testset "cancel_task mirrors the claim onto the live record (#127 follow-up)" begin
+            # The discriminating test for this, and it only discriminates HERE. The in-memory
+            # store's CAS mutates the very object its registry holds, so an in-memory version
+            # of this passes whether or not the mirror exists. `PormGWorkerStore` writes the
+            # ROW while `get_task_info` prefers the live `active_task_infos` object -- so once
+            # `cancel_task` stopped deregistering that object (#127), a cancelled task kept
+            # reporting RUNNING here until its callback returned.
+            store_m = RealPormGWorkerStore(model=MockTaskModel())
+
+            live = TaskInfo("alice::job")
+            push!(live.watchers, "alice")
+            live.status = RUNNING
+            replace_task!(store_m, live.id, live)
+            register_active_task_info!(store_m, live.id, live)
+
+            @test cancel_task("alice::job", Owner("alice"); store=store_m)[:status] ==
+                  "Task cancelled"
+
+            # The live object -- still registered, because the callback has not returned.
+            @test get_active_task_info(store_m, "alice::job") === live
+            @test live.status == CANCELLED
+            @test cancel_requested(live)
+
+            # ...so every read path agrees with the row instead of contradicting it.
+            @test get_task_info(store_m, "alice::job").status == CANCELLED
+            @test reload_task(store_m, "alice::job").status == CANCELLED
+            @test get_task_status("alice::job", Owner("alice"); store=store_m)[:status] ==
+                  "CANCELLED"
+
+            # And the consequence that made it more than cosmetic: a stale RUNNING record
+            # made `_register_or_watch!` treat a re-submit as a join, silently never re-running.
+            @test haskey(cancel_task("alice::job", Owner("alice"); store=store_m), :error)
+        end
+
         @testset "a completing task cannot overwrite a cancellation from elsewhere (#88)" begin
             store_x = RealPormGWorkerStore(model=MockTaskModel())
 

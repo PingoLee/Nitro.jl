@@ -784,6 +784,79 @@ end
         end
     end
 
+    @testset "a cancelled task stops reporting RUNNING, on both backends" begin
+        # Regression guard for the store-parity gap that removing `cancel_task`'s
+        # deregisters opened. `PormGWorkerStore.try_transition!` writes only the row while
+        # its `get_task_info` prefers the live in-memory record, so without mirroring the
+        # claim onto that record a cancelled task kept reporting RUNNING until its callback
+        # returned -- and `_register_or_watch!` then refused to re-run the key.
+        store = InMemoryWorkerStore()
+        entered = Base.Event()
+        release = Base.Event()
+        try
+            id = submit_task("mirror", () -> (notify(entered); wait(release); "done"),
+                             Owner("u"); store=store)
+            wait(entered)
+            @test cancel_task(id, Owner("u"); store=store)[:status] == "Task cancelled"
+
+            # Asserted while the callback is STILL RUNNING -- that is the whole window.
+            live = get_active_task_info(store, id)
+            @test live === nothing || live.status == CANCELLED
+            @test get_task_status(id, Owner("u"); store=store)[:status] == "CANCELLED"
+
+            # The two downstream consequences the stale record caused.
+            @test haskey(cancel_task(id, Owner("u"); store=store), :error)
+            again = submit_task("mirror", () -> "second", Owner("u"); store=store)
+            @test again == id
+            @test wait_for(() -> get_task_status(id, Owner("u"); store=store)[:result] ==
+                                 "second") == :ok
+        finally
+            notify(release)
+            reset_store!(store)
+        end
+    end
+
+    @testset "a cancel during the retry backoff does not re-run the callback" begin
+        # The catch block checks CANCELLED before sleeping and never after, and #127 removed
+        # the interrupt that used to abort that sleep -- so a cancel landing inside a 2/4/8s
+        # backoff window used to burn another attempt against an already-cancelled task.
+        store = InMemoryWorkerStore()
+        attempts = Threads.Atomic{Int}(0)
+        entered = Base.Event()
+        try
+            id = submit_task("backoff", () -> begin
+                n = Threads.atomic_add!(attempts, 1) + 1
+                n == 1 && notify(entered)
+                error("attempt $n failed")
+            end, Owner("u");
+            options=TaskOptions(retry_on_failure=true, max_retries=3), store=store)
+
+            wait(entered)          # attempt 1 has STARTED; it has not necessarily failed yet
+
+            # Land the cancel INSIDE the backoff, which is the window under test. Without
+            # this pause the cancel usually arrives before the catch block evaluates its own
+            # CANCELLED check, that check short-circuits, and the retry loop is never
+            # reached -- so the test passed against the broken code. 0.3s is far more than
+            # the callback needs to throw and be caught, and far less than the 2s backoff.
+            sleep(0.3)
+            @test cancel_task(id, Owner("u"); store=store)[:status] == "Task cancelled"
+
+            @test wait_for(() -> get_task_status(id, Owner("u"); store=store)[:status] ==
+                                 "CANCELLED"; timeout=10.0) == :ok
+
+            # The point: the backoff was abandoned rather than slept through. This has to
+            # outlast the 2s first backoff, and it has to be a NEGATIVE assertion -- the
+            # obvious `@test attempts[] == 1` passes against the broken code too, because it
+            # is evaluated long before the sleep would have expired and the second attempt
+            # started. A time-bounded "this never happens" is the only form that discriminates,
+            # and it cannot flake into a false failure on a slow machine.
+            @test timedwait(() -> attempts[] > 1, 3.5) == :timed_out
+            @test attempts[] == 1
+        finally
+            reset_store!(store)
+        end
+    end
+
     @testset "nothing in Workers injects an exception into a task" begin
         # A source assertion, because the property is "no site in this module does this"
         # rather than "this function behaves thus" -- and reintroducing the injection is
@@ -818,7 +891,7 @@ end
 # So the gap is real and is written down rather than papered over: nothing here cancels a task
 # that is genuinely executing on another thread. Every cancel test above uses a `sleep` loop,
 # and a task in `sleep` is PARKED -- which is exactly the weak probe that let the first attempt
-# at #30 ship a process abort. See the follow-up issue.
+# at #30 ship a process abort. Tracked in #143, with the full trace evidence.
 
 @testset "queue introspection is an admin surface (#87)" begin
     store = InMemoryWorkerStore()

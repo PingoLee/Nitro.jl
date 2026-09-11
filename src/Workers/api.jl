@@ -350,16 +350,30 @@ function _execute_task_async(store::AbstractWorkerStore, task_key::String, callb
         # between its `get_task_info` and its start write. Removing the interrupt (#127) uncovers
         # the async path too, which is why this lands FIRST.
         started = current_time_utc()
+
+        # Register the handles BEFORE claiming RUNNING, not after. `recover_zombie_tasks!`
+        # decides a run is dead from exactly `status == RUNNING && isnothing(get_active_task(id))`
+        # and does not hold anything that excludes this function, so a store that reads RUNNING
+        # before the handle exists is a window in which a sweep marks a genuinely-live run FAILED
+        # -- and the run's real result is then discarded by its own losing CAS. The old
+        # unconditional `set_task!` wrote the store LAST and so never opened that window;
+        # claiming the start (#142) reversed the order, and this restores it. Registering while
+        # the record is still PENDING is harmless: that sweep only looks at RUNNING.
+        task_info.sys_task = current_task()
+        register_active_task!(store, task_key, current_task())
+        register_active_task_info!(store, task_key, task_info)
+
         if !try_transition!(store, task_key, (PENDING,), RUNNING;
                             run_id=task_info.run_id, started_at=started)
+            # Cancelled, or this run no longer owns the record. Hand back the handles we just
+            # took -- fenced, so we cannot tear down a successor's (#108).
+            _deregister_run!(store, task_info)
+            task_info.sys_task = nothing
             return task_info
         end
 
         task_info.status = RUNNING
         task_info.started_at = started
-        task_info.sys_task = current_task()
-        register_active_task!(store, task_key, current_task())
-        register_active_task_info!(store, task_key, task_info)
 
         max_attempts = options.retry_on_failure ? options.max_retries : 0
         for retry_count in 0:max_attempts
@@ -396,7 +410,25 @@ function _execute_task_async(store::AbstractWorkerStore, task_key::String, callb
                     return _fail_task!(store, task_info, format_error(unwrapped))
                 end
 
-                sleep(2 ^ (retry_count + 1))
+                # Cancellation-aware backoff. The catch above checks CANCELLED before sleeping and
+                # never after, and the interrupt that used to abort this sleep is gone (#127) -- so a
+                # cancel landing inside a 2/4/8s window re-invoked the user callback on a task that was
+                # already cancelled. Polling the token instead of sleeping blind also cuts cancellation
+                # latency during a backoff from seconds to milliseconds.
+                deadline = time() + 2.0 ^ (retry_count + 1)
+                while time() < deadline && !cancel_requested(task_info)
+                    sleep(0.05)
+                end
+
+                # The token is process-local, so a cancel issued on another node sets nothing here. One
+                # durable read per ATTEMPT (not per poll) covers that without a round-trip every 50ms.
+                if cancel_requested(task_info)
+                    return _cancel_task!(store, task_info; message="Cancelled by user")
+                end
+                resumed = get_task_info(store, task_key)
+                if resumed !== nothing && resumed.status == CANCELLED
+                    return _cancel_task!(store, task_info; message="Cancelled by user")
+                end
             end
         end
 
@@ -554,9 +586,10 @@ function cancel_task(task_id::AbstractString, authority::TaskAuthority; store::A
         # successor on the predecessor's grant would be an authorization the app never issued
         # — reachable across processes, since `lock_tasks` is process-local for a
         # database-backed store (#108).
+        cancelled_at = current_time_utc()
         claimed = try_transition!(store, task_info.id, (PENDING, RUNNING), CANCELLED;
                                   run_id=task_info.run_id,
-                                  error="Cancelled", completed_at=current_time_utc())
+                                  error="Cancelled", completed_at=cancelled_at)
 
         if !claimed
             latest = get_task_info(store, task_info.id)
@@ -590,6 +623,22 @@ function cancel_task(task_id::AbstractString, authority::TaskAuthority; store::A
         live = get_active_task_info(store, task_info.id)
         if live !== nothing && live.run_id == task_info.run_id
             @atomic live.cancel_requested = true
+
+            # Mirror the claim onto the live record, which is a REQUIREMENT now that this
+            # function no longer deregisters it. `PormGWorkerStore.try_transition!` writes
+            # only the database row, and its `get_task_info` prefers the live object -- so
+            # without this a cancelled task kept reporting RUNNING until its callback
+            # returned: `get_task_status` lied, a second `cancel_task` answered "already
+            # finished with status RUNNING", and `_register_or_watch!` saw RUNNING and
+            # silently refused to re-run the key. `InMemoryWorkerStore` never had the
+            # problem because its CAS mutates the very object the registry holds, so
+            # leaving this out made the two backends disagree.
+            #
+            # It also makes the `task_info.status == CANCELLED` poll that the tutorial has
+            # always documented actually work under PormG, which it never did.
+            live.status = CANCELLED
+            live.error = "Cancelled"
+            live.completed_at = cancelled_at
         end
 
         return Dict{Symbol, Any}(:status => "Task cancelled")

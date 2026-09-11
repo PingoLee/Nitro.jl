@@ -89,7 +89,9 @@ function timeout_call(callback::Function, task_info::TaskInfo; timeout::Int=3600
 
         # The docs used to note that a timed-out task can go on mutating external state "with
         # nothing to tell the operator". This is that signal, and it is now the only one.
-        @warn "Worker task timed out. Its callback was NOT stopped and keeps a thread until it                returns; poll `cancel_requested(task_info)` in the callback to make the deadline                effective." task_id=task_info.id timeout=timeout
+        @warn "Worker task timed out. Its callback was NOT stopped and keeps a thread " *
+              "until it returns; poll `cancel_requested(task_info)` in the callback to " *
+              "make the deadline effective." task_id=task_info.id timeout=timeout
 
         throw(TaskTimeoutError(timeout))
     end

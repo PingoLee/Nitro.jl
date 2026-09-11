@@ -111,16 +111,30 @@ function _execute_queued_task(store::AbstractWorkerStore, item::QueueItem)
     # between its `get_task_info` and its start write. Removing the interrupt (#127) uncovers
     # the async path too, which is why this lands FIRST.
     started = current_time_utc()
+
+    # Register the handles BEFORE claiming RUNNING, not after. `recover_zombie_tasks!`
+    # decides a run is dead from exactly `status == RUNNING && isnothing(get_active_task(id))`
+    # and does not hold anything that excludes this function, so a store that reads RUNNING
+    # before the handle exists is a window in which a sweep marks a genuinely-live run FAILED
+    # -- and the run's real result is then discarded by its own losing CAS. The old
+    # unconditional `set_task!` wrote the store LAST and so never opened that window;
+    # claiming the start (#142) reversed the order, and this restores it. Registering while
+    # the record is still PENDING is harmless: that sweep only looks at RUNNING.
+    task_info.sys_task = current_task()
+    register_active_task!(store, task_info.id, current_task())
+    register_active_task_info!(store, task_info.id, task_info)
+
     if !try_transition!(store, task_info.id, (PENDING,), RUNNING;
                         run_id=task_info.run_id, started_at=started)
+        # Cancelled, or this run no longer owns the record. Hand back the handles we just
+        # took -- fenced, so we cannot tear down a successor's (#108).
+        _deregister_run!(store, task_info)
+        task_info.sys_task = nothing
         return task_info
     end
 
     task_info.status = RUNNING
     task_info.started_at = started
-    task_info.sys_task = current_task()
-    register_active_task!(store, task_info.id, current_task())
-    register_active_task_info!(store, task_info.id, task_info)
 
     max_attempts = item.options.retry_on_failure ? item.options.max_retries : 0
     for retry_count in 0:max_attempts
@@ -157,7 +171,25 @@ function _execute_queued_task(store::AbstractWorkerStore, item::QueueItem)
                 return _fail_task!(store, task_info, format_error(unwrapped))
             end
 
-            sleep(2 ^ (retry_count + 1))
+            # Cancellation-aware backoff. The catch above checks CANCELLED before sleeping and
+            # never after, and the interrupt that used to abort this sleep is gone (#127) -- so a
+            # cancel landing inside a 2/4/8s window re-invoked the user callback on a task that was
+            # already cancelled. Polling the token instead of sleeping blind also cuts cancellation
+            # latency during a backoff from seconds to milliseconds.
+            deadline = time() + 2.0 ^ (retry_count + 1)
+            while time() < deadline && !cancel_requested(task_info)
+                sleep(0.05)
+            end
+
+            # The token is process-local, so a cancel issued on another node sets nothing here. One
+            # durable read per ATTEMPT (not per poll) covers that without a round-trip every 50ms.
+            if cancel_requested(task_info)
+                return _cancel_task!(store, task_info)
+            end
+            resumed = get_task_info(store, task_info.id)
+            if resumed !== nothing && resumed.status == CANCELLED
+                return _cancel_task!(store, task_info)
+            end
         end
     end
 
