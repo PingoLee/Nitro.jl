@@ -161,6 +161,18 @@ These are canonical here — no other file owns them.
   structured logging (`@error "Msg" exception=e key=value`). Access logging redacts query strings by
   default (`serve(...; access_log_query=false)`) — keep it that way.
 
+- **No agent-session links in anything public — and this repo is public.** Keep `Claude-Session:`
+  trailers, `claude.ai/code/session_…` URLs, and any other agent-console or transcript link out of
+  **commit messages, PR titles and bodies, issue text, and code comments**. Such a link is
+  account-scoped, so this is not a credential leak — it is account-linked metadata published to
+  strangers. The commit trailer is the half that is hard to undo: this repo merges with **merge
+  commits**, so a branch commit's message reaches `main` verbatim and cannot be edited at merge
+  time the way a squash can. Removing one afterwards means rewriting public history.
+
+  A plain `Co-Authored-By:` trailer is fine and stays — it names a model, not a conversation.
+  **An agent's default attribution template may append the session link automatically, and that
+  default is not authorization**: strip it while drafting the message, not after pushing.
+
 - **Ship tests with behavior changes.** New or changed runtime behavior needs coverage under
   `test/`; changes to `ext/` need coverage under `test/extensions/`. See *Verification* below.
 
