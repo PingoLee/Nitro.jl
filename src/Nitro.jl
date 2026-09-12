@@ -54,8 +54,9 @@ export  # Server lifecycle
         staticfiles, dynamicfiles, spafiles,
         # Util
         getparams, getquery, getsession, setsession!, getip, setip!, getpeerip, getcontext, payload, getexternalurl,
-        redirect, formdata, multipart, format_sse_message,
-        html, text, json, file, xml, js, css, binary,
+        formdata, multipart, format_sse_message,
+        # Request body parsers (response building lives in `Res`, #28)
+        text, json, binary,
         # Extractors
         Path, Query, Header, Json, JsonFragment, Form, Body, Cookie, Session, Files, MultipartForm, FormFile, extract, validate,
         # Extractor extension surface (for app-layer custom extractors)

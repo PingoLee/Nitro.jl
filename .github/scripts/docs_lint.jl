@@ -110,8 +110,10 @@ const REQUIRED_SYMBOLS = String[
     "add_response_headers", "own_response_headers",
     "login_required", "role_required", "permission_required", "claim_required",
     "kid_required", "Principal",
-    # Response constructors — the markup sinks the security rules name.
-    "html", "js", "css", "xml", "text", "binary",
+    # Response builders. `html` is the markup sink the security rules name; `text`,
+    # `json` and `binary` are the request-body parsers (#28 removed the same-named
+    # response constructors, so these now resolve in `bodyparsers.jl`).
+    "html", "text", "binary",
     # Request/body plumbing the usage skill teaches.
     "formdata", "multipart", "payload", "getcontext", "regenerate_session!",
     "staticfiles", "spafiles", "dynamicfiles",

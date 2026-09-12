@@ -37,10 +37,10 @@ end
 
 urlpatterns("",
     path("/time/{time}", function(req, time::ZonedDateTime)
-        return "current date: $time" |> text
+        return "current date: $time" |> Res.send
     end, method="GET"),
     path("/time", function(req, payload::Json{TimePayload})
-        return "The date is $(payload.payload.time)" |> text
+        return "The date is $(payload.payload.time)" |> Res.send
     end, method="POST"),
 )
 

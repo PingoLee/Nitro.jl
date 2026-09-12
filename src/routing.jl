@@ -13,11 +13,11 @@ using Nitro
 
 # Define handlers
 function list_users(req)
-    json(Dict("users" => []))
+    Res.json(Dict("users" => []))
 end
 
 function get_user(req, id::Int)
-    json(Dict("id" => id))
+    Res.json(Dict("id" => id))
 end
 
 # Register routes

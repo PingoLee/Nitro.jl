@@ -9,7 +9,7 @@ port = get_free_port()
 localhost = "http://$HOST:$port"
 
 urlpatterns("",
-    path("/", function() return text("Ok") end, method="GET"),
+    path("/", function() return Res.send("Ok") end, method="GET"),
 )
 
 project_toml = TOML.parsefile(joinpath(pkgdir(Nitro), "Project.toml"))

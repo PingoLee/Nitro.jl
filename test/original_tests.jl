@@ -76,7 +76,8 @@ urlpatterns("",
     path("/anonymous",         function(; request, context) return "no args" end, method="GET"),
     path("/anyparams/{message}", function(req, message::Any; context) return message end, method="GET"),
     path("/test",              function(req) return "hello world!" end,     method="GET"),
-    path("/testredirect",      function(req) return redirect("/test") end,  method="GET"),
+    path("/testredirect",      function(req) return Res.redirect("/test") end,  method="GET"),
+    path("/testredirect307",   function(req) return Res.redirect("/test"; status=307) end, method="GET"),
     path("/middleware-error",  function() return "shouldn't get here" end,  method="GET", middleware=[errormiddleware]),
     path("/customerror",       function()
         function processtring(input::String)
@@ -89,7 +90,7 @@ urlpatterns("",
     path("/unsupported-struct", function() return Book("mobdy dick", "blah") end, method="GET"),
     path("/add/{a}/{b}",       function(req, a::Int32, b::Int64) return a + b end, method="GET"),
     path("/divide/{a}/{b}",    function(req, a, b; request, context) return parse(Float64, a) / parse(Float64, b) end, method="GET"),
-    path("/file",              function(req) return file("content/sample.html") end, method="GET"),
+    path("/file",              function(req) return Res.file("content/sample.html") end, method="GET"),
     path("/multiply/{a}/{b}",  function(req, a::Float64, b::Float64) return a * b end, method="GET"),
     path("/person",            function(req) return Person("joe", 20) end,  method="GET"),
     path("/text",              function(req) return text(req) end,          method="GET"),
@@ -97,7 +98,7 @@ urlpatterns("",
     path("/json",              function(req) return json(req) end,          method="GET"),
     path("/person-json",       function(req) return json(req, Person) end,  method="GET"),
     path("/html",              function(req)
-        return html("""
+        return Res.html("""
             <!DOCTYPE html>
                 <html>
                 <body>
@@ -175,6 +176,11 @@ r = internalrequest(HTTP.Request("GET", "/test"))
 @test text(r) == "hello world!"
 
 r = internalrequest(HTTP.Request("GET", "/testredirect"))
+# `Res.redirect` defaults to 302, not the 307 the deleted top-level `redirect` used (#28).
+@test r.status == 302
+@test Dict(r.headers)["Location"] == "/test"
+
+r = internalrequest(HTTP.Request("GET", "/testredirect307"))
 @test r.status == 307
 @test Dict(r.headers)["Location"] == "/test"
 
@@ -331,23 +337,23 @@ r = internalrequest(HTTP.Request("GET", "/static/test.txt"))
 body = text(r)
 @test r.status == 200
 @test Dict(r.headers)["Content-Type"] == "text/plain; charset=utf-8"
-@test body == file("content/test.txt") |> text
+@test body == Res.file("content/test.txt") |> text
 @test body == "this is a sample text file"
 
 r = internalrequest(HTTP.Request("GET", "/static/sample.html"))
 @test r.status == 200
 @test Dict(r.headers)["Content-Type"] == "text/html; charset=utf-8"
-@test text(r) == file("content/sample.html") |> text
+@test text(r) == Res.file("content/sample.html") |> text
 
 r = internalrequest(HTTP.Request("GET", "/static/index.html"))
 @test r.status == 200
 @test Dict(r.headers)["Content-Type"] == "text/html; charset=utf-8"
-@test text(r) == file("content/index.html") |> text
+@test text(r) == Res.file("content/index.html") |> text
 
 r = internalrequest(HTTP.Request("GET", "/static/"))
 @test r.status == 200
 @test Dict(r.headers)["Content-Type"] == "text/html; charset=utf-8"
-@test text(r) == file("content/index.html") |> text
+@test text(r) == Res.file("content/index.html") |> text
 
 
 # # Body transformation tests
@@ -385,7 +391,7 @@ function testfolder(prefix::String, folder::String)
         link =  "/$prefix/$(relpath(path, folder))"
         r = internalrequest(HTTP.Request("GET", link))
         @test r.status == 200
-        @test text(r) == file(path) |> text
+        @test text(r) == Res.file(path) |> text
     end
 end
 
@@ -407,19 +413,28 @@ end
 
 r = internalrequest(HTTP.Request("GET", "/file"))
 @test r.status == 200
-@test text(r) == file("content/sample.html") |> text
+@test text(r) == Res.file("content/sample.html") |> text
 
 r = internalrequest(HTTP.Request("GET", "/dynamic/sample.html"))
 @test r.status == 200
-@test text(r) == file("content/sample.html") |> text
+@test text(r) == Res.file("content/sample.html") |> text
 
 r = internalrequest(HTTP.Request("GET", "/dynamic2/sample.html"))
 @test r.status == 200
-@test text(r) == file("content/sample.html") |> text
+@test text(r) == Res.file("content/sample.html") |> text
 
 r = internalrequest(HTTP.Request("GET", "/static/sample.html"))
 @test r.status == 200
-@test text(r) == file("content/sample.html") |> text
+@test text(r) == Res.file("content/sample.html") |> text
+
+# Static mounts must serve INLINE. All three mount kinds route through `Res.file`, whose
+# `Content-Disposition` is opt-in (#28) -- an `attachment` default here would turn every
+# asset, an SPA index.html included, into a forced download.
+for mounted in ("/static/sample.html", "/dynamic/sample.html", "/dynamic2/sample.html")
+    resp = internalrequest(HTTP.Request("GET", mounted))
+    @test resp.status == 200
+    @test !any(h -> lowercase(h[1]) == "content-disposition", resp.headers)
+end
 
 # "a" is not a Float64 -> 400, not 500.
 @suppress global r = internalrequest(HTTP.Request("GET", "/multiply/a/8"))

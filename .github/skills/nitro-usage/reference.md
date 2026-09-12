@@ -66,42 +66,45 @@ Helper functions over the same data: `getparams`, `getquery`, `getsession`, `set
 
 ## Responses
 
-### `Res` — status/content builders (five, and only five)
+### `Res` — the response builders
 
 ```julia
-Res.json(data;  status::Int=200, headers::Vector=[])
-Res.status(code::Int;            headers::Vector=[])
-Res.send(body::String; status::Int=200, headers::Vector=[])
-Res.file(path::String;  status::Int=200, headers::Vector=[],
-         filename=nothing, disposition::String="attachment", loadfile=nothing)
-Res.redirect(url::String; status::Int=302, headers::Vector=[])
+Res.json(data;                status::Int=200, headers::Vector=[])
+Res.json(data::Vector{UInt8}; status::Int=200, headers::Vector=[])   # already-serialized JSON
+Res.html(content::String;     status::Int=200, headers::Vector=[])
+Res.send(body::String;        status::Int=200, headers::Vector=[],
+         content_type::String="text/plain; charset=utf-8")
+Res.send(body::Vector{UInt8}; status::Int=200, headers::Vector=[],
+         content_type::String="application/octet-stream")
+Res.status(code::Int;         headers::Vector=[])
+Res.file(path::String;        status::Int=200, headers::Vector=[], filename=nothing,
+         disposition::Union{Nothing,String}=nothing, loadfile=nothing)
+Res.redirect(url::String;     status::Int=302, headers::Vector=[])
 ```
 
-**`Res.html` and `Res.js` do not exist.**
+| Call | Content-Type | Notes |
+|------|-------------|-------|
+| `Res.html(s)` | `text/html` | **markup sink, escape first** |
+| `Res.send(s)` | `text/plain` | |
+| `Res.send(s; content_type=c)` | `c` | **markup sink when `c` is a markup/script type** |
+| `mustache(...)` / `otera(...)` | sniffed, or `mime_type=` | **markup sink** — templating does not escape by default |
+| `Res.send(b)` | octet-stream | `Vector{UInt8}`; **also a markup sink with `content_type=`** |
+| `Res.json(x)` | `application/json` | any value; `Vector{UInt8}` is sent verbatim |
+| `Res.file(p)` | sniffed from path | **inline**; `loadfile=` hook |
+| `Res.file(p; disposition="attachment")` | sniffed | forced download; `filename=` alone implies attachment |
+| `Res.status(n)` | — | empty body |
+| `Res.redirect(u)` | — | **302**; `status=307` preserves method + body |
 
-### Top-level content-type constructors
+Caller-supplied `headers` are applied **last** and override the defaults, `Content-Type` included.
 
-All take `(content; status=200, headers=[])`.
-
-| Function | Content-Type | Input |
-|----------|-------------|-------|
-| `html(s)` | `text/html` | `String` — **markup sink, escape first** |
-| `js(s)` | JavaScript | `String` — **script sink, escape first** |
-| `xml(s)` | `application/xml` | `String` — **markup sink** |
-| `css(s)` | `text/css` | `String` — **markup sink** |
-| `text(s)` | `text/plain` | `String` |
-| `json(x)` | `application/json` | any, or `Vector{UInt8}` |
-| `binary(b)` | octet-stream | `Vector{UInt8}` |
-| `file(p)` | sniffed from path | `String` path; `loadfile=` hook |
-
-> `json`, `file`, and `redirect` exist in **both** namespaces with different defaults —
-> `Res.file` defaults to `disposition="attachment"`, the `render.jl` `file` does not. Qualify the
-> call. Reconciliation is tracked in [#28](https://github.com/PingoLee/Nitro.jl/issues/28).
+Only `Res.file` sets `Content-Length` explicitly; the others leave it to HTTP.jl, which computes it
+from the body when the response is serialized.
 
 ### Request body parsers (same names, opposite direction)
 
-`text(req)`, `json(req)`, `json(req, T)`, `binary(req)`, `formdata(req)`, `multipart(req)`. Dispatch
-is on the argument type — an `HTTP.Request` parses, anything else constructs a response.
+`text(req)`, `json(req)`, `json(req, T)`, `binary(req)`, `formdata(req)`, `multipart(req)`, and the
+`HTTP.Response` forms of each. These bare names are **parsers only** — response building lives in
+`Res` (#28), so there is no longer a same-name builder to disambiguate against.
 
 ---
 

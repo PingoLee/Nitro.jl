@@ -334,15 +334,17 @@ That order matters for auth, session loading, rate limiting, and any request mut
 
 ## Response Helpers
 
-Nitro exposes `Res` helpers for explicit response construction:
+`Res` is the **only** response-building namespace:
 
-- `Res.json`
-- `Res.send`
-- `Res.status`
-- `Res.file`
-- `Res.redirect`
+- `Res.json` — `application/json`; a `Vector{UInt8}` is sent verbatim as pre-serialized JSON
+- `Res.html` — `text/html`
+- `Res.send` — `text/plain` by default; pass `content_type=` for any other type, or a
+  `Vector{UInt8}` for `application/octet-stream`
+- `Res.status` — bare status code, empty body
+- `Res.file` — serves **inline**; pass `disposition="attachment"` to force a download
+- `Res.redirect` — **302**; pass `status=307` to preserve the request method and body
 
-These are the preferred examples for new applications.
+The bare names `text`, `json` and `binary` are *request body parsers*, not response builders.
 
 ## Documentation
 

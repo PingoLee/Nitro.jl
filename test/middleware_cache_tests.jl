@@ -283,14 +283,14 @@ function tagging_middleware(tag::String)
         return function (req::HTTP.Request)
             yield()
             inner = handler(req)                        # router + serializer for this route
-            return text(tag * "|" * text(inner))        # NEW response; never mutate `inner`
+            return Res.send(tag * "|" * text(inner))        # NEW response; never mutate `inner`
         end
     end
 end
 
 ctx = ServerContext()
 Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
-    path("/warm/$i", (req::HTTP.Request) -> text("handler-$i"),
+    path("/warm/$i", (req::HTTP.Request) -> Res.send("handler-$i"),
          middleware = [tagging_middleware("route-$i")])
     for i in 1:K
 ])
@@ -356,7 +356,7 @@ end
 
     ctx2 = ServerContext()
     Nitro.Core.Routing.urlpatterns(ctx2, "", Nitro.RouteDefinition[
-        path("/once", (req::HTTP.Request) -> text("ok"), middleware = [counting_mw])
+        path("/once", (req::HTTP.Request) -> Res.send("ok"), middleware = [counting_mw])
     ])
 
     pipeline = Nitro.Core.setupmiddleware(ctx2; catch_errors=false)
@@ -414,7 +414,7 @@ end
 @testset "the two settings variants coexist as distinct entries" begin
     ctx = ServerContext()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
-        path("/ok", (req::HTTP.Request) -> text("h"),
+        path("/ok", (req::HTTP.Request) -> Res.send("h"),
              middleware = [handler -> (req::HTTP.Request -> handler(req))]),
     ])
     Nitro.Core.internalrequest(ctx, HTTP.Request("GET", "/ok"); catch_errors = true)
@@ -431,7 +431,7 @@ end
 @testset "serialize=false is its own variant" begin
     ctx = ServerContext()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
-        path("/s", (req::HTTP.Request) -> text("h"),
+        path("/s", (req::HTTP.Request) -> Res.send("h"),
              middleware = [handler -> (req::HTTP.Request -> handler(req))]),
     ])
     Nitro.Core.internalrequest(ctx, HTTP.Request("GET", "/s"); serialize = true)
@@ -447,9 +447,9 @@ end
     # pipeline, which is exactly the failure a per-key invalidation would reintroduce.
     ctx = ServerContext()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
-        path("/other", (req::HTTP.Request) -> text("o"),
+        path("/other", (req::HTTP.Request) -> Res.send("o"),
              middleware = [handler -> (req::HTTP.Request -> handler(req))]),
-        path("/v", (req::HTTP.Request) -> text("h")),
+        path("/v", (req::HTTP.Request) -> Res.send("h")),
     ])
     Nitro.Core.internalrequest(ctx, HTTP.Request("GET", "/other"); catch_errors = true)
     Nitro.Core.internalrequest(ctx, HTTP.Request("GET", "/v"); catch_errors = true)
@@ -457,8 +457,8 @@ end
     @test count(k -> startswith(k, "GET|/v|"), keys(snapshot(ctx.service.middleware_cache))) == 2
 
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
-        path("/v", (req::HTTP.Request) -> text("h"),
-             middleware = [handler -> (req::HTTP.Request -> text("late|" * text(handler(req))))]),
+        path("/v", (req::HTTP.Request) -> Res.send("h"),
+             middleware = [handler -> (req::HTTP.Request -> Res.send("late|" * text(handler(req))))]),
     ])
     entries = snapshot(ctx.service.middleware_cache)
     @test !any(startswith(k, "GET|/v|") for k in keys(entries))     # all variants dropped
@@ -487,9 +487,9 @@ end
 
     ctx = ServerContext()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
-        path("/a", (req::HTTP.Request) -> text("plain"),
+        path("/a", (req::HTTP.Request) -> Res.send("plain"),
              middleware = [handler -> (req::HTTP.Request -> handler(req))]),
-        path("/a" * cachetag(true, true, true), (req::HTTP.Request) -> text("pipe"),
+        path("/a" * cachetag(true, true, true), (req::HTTP.Request) -> Res.send("pipe"),
              middleware = [handler -> (req::HTTP.Request -> handler(req))]),
     ])
     for (target, want) in (("/a", "plain"), ("/a" * cachetag(true, true, true), "pipe")),

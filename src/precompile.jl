@@ -15,6 +15,16 @@ using PrecompileTools
     ])
     Core.internalrequest(ctx, Request("GET", "/precompile/items/42"); catch_errors=false)
 
+    # ── GET → Res.html / Res.send (the string-body builders) ────────────
+    # `Res.html` and `Res.send` are the markup/text sinks every migrating app reaches
+    # for (#28); both land in the same `format_response`/write path as `Res.json`.
+    Core.Routing.urlpatterns(ctx, "", RouteDefinition[
+        path("/precompile/page", (req::Request) -> Res.html("<h1>ok</h1>")),
+        path("/precompile/sheet", (req::Request) -> Res.send("a{}"; content_type="text/css")),
+    ])
+    Core.internalrequest(ctx, Request("GET", "/precompile/page"); catch_errors=false)
+    Core.internalrequest(ctx, Request("GET", "/precompile/sheet"); catch_errors=false)
+
     # ── POST with JSON body → Res.status(201) ───────────────────────────
     Core.Routing.urlpatterns(ctx, "", RouteDefinition[
         path("/precompile/items", (req::Request) -> Res.status(201), method="POST")

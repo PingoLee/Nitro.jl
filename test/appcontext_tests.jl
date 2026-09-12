@@ -13,12 +13,12 @@ end
 
 urlpatterns("",
     path("/test", function(req) return "Hello World" end, method="GET"),
-    path("/injected", function(req, ctx::Context{Person}) return json(ctx.payload) end, method="GET"),
-    path("/getcontext", function(req) return json(getcontext(req)) end, method="GET"),
-    path("/getcontext-typed", function(req) return json(getcontext(req, Person)) end, method="GET"),
-    path("/kwarg-only", function(req; context) return json(context) end, method="GET"),
-    path("/both-kwargs", function(; request::Request, context::Person) return json(context) end, method="GET"),
-    path("/method-only", function() return json(context()) end, method="GET"),
+    path("/injected", function(req, ctx::Context{Person}) return Res.json(ctx.payload) end, method="GET"),
+    path("/getcontext", function(req) return Res.json(getcontext(req)) end, method="GET"),
+    path("/getcontext-typed", function(req) return Res.json(getcontext(req, Person)) end, method="GET"),
+    path("/kwarg-only", function(req; context) return Res.json(context) end, method="GET"),
+    path("/both-kwargs", function(; request::Request, context::Person) return Res.json(context) end, method="GET"),
+    path("/method-only", function() return Res.json(context()) end, method="GET"),
 )
 
 serve(port=port, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)

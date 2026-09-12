@@ -130,40 +130,37 @@ is free, so don't hand-roll your own caching.
 
 ## 4. Responses
 
-Two namespaces, and they are not interchangeable:
-
-**`Res` — the status/content builders.** Exactly five: `Res.json`, `Res.status`, `Res.send`,
-`Res.file`, `Res.redirect`. **`Res.html` and `Res.js` do not exist.**
+**`Res` is the response-building namespace.** These six are what application handlers use:
 
 ```julia
-Res.json(Dict("id" => 1, "name" => "Widget"))       # 200 application/json
+Res.json(Dict("id" => 1, "name" => "Widget"))        # 200 application/json
 Res.json(payload; status=201)
-Res.status(404)                                      # bare status
-Res.send("plain body"; status=200)                   # text/plain
-Res.redirect("/login"; status=302)
-Res.file("report.pdf"; disposition="attachment")     # note: attachment by default
+Res.json(prebuilt_bytes)                             # already-serialized JSON, sent verbatim
+Res.html("<h1>$(escape(title))</h1>")                # text/html -- ONLY with escaped input
+Res.send("plain body")                               # text/plain
+Res.send(sheet; content_type="text/css")             # any other textual type
+Res.send(bytes)                                      # application/octet-stream
+Res.status(404)                                      # bare status, empty body
+Res.redirect("/login")                               # 302; pass status=307 to keep method+body
+Res.file("logo.png")                                 # inline -- what a browser renders
+Res.file("report.pdf"; disposition="attachment")     # forced download
 ```
 
-**Top-level constructors — the content-type builders** (exported by `Nitro`): `html`, `text`, `json`,
-`xml`, `js`, `css`, `binary`, `file`.
+The bare names `text`, `json` and `binary` are **request-body parsers**, not builders —
+`json(req)`, `json(req, T)`, `text(res)`. One name, one direction.
 
-```julia
-html("<h1>$(escape(title))</h1>")   # ONLY use with escaped input
-text("plain")
-xml(feed_string)
-binary(bytes)
-```
-
-> **The XSS rule.** `html`, `js`, `xml`, and `css` are the framework's **only** markup/script sinks.
-> Everything else — raw `String` returns, `Res.send`, `Res.json` — is served as `text/plain` or
-> `application/json` with no content-sniffing, so an attacker-influenced value can never be
-> reclassified as HTML. Escape before those four, always. Nowhere else needs escaping.
+> **The XSS rule — three sinks.** (1) `Res.html(...)`. (2) `Res.send(...; content_type=...)` naming
+> a markup or script type. (3) A template rendered by `mustache(...)` / `otera(...)`, which builds
+> through a **content-sniffing** helper and does not HTML-escape by default. Everything else — raw
+> `String` returns, a bare `Res.send`, `Res.json` — is served as `text/plain` or `application/json`
+> with no content-sniffing, so an attacker-influenced value can never be reclassified as HTML.
+> Escape before those three, always. Nowhere else needs escaping.
 
 Returning a raw `Dict` or `String` from a handler works (auto-formatted to JSON / `text/plain`) and
 is **safe**, but prefer a builder so status and content type are explicit rather than inferred.
 
-`json`, `file`, and `redirect` currently exist in *both* namespaces with different defaults. Name the
-namespace explicitly (`Res.file(...)` vs `Nitro.file(...)`) rather than relying on scope.
+**Two defaults worth knowing**, because both differ from what older code did: `Res.file` serves
+**inline** unless you ask for a disposition, and `Res.redirect` is **302**, not 307.
 
 ---
 
@@ -368,8 +365,8 @@ query parameter with no default is **required**: omitting it is a 400, not `noth
 |--------------|-----------|
 | `@get "/x" function ...` / `get("/x", handler)` | `path("/x", handler, method="GET")` |
 | `serveparallel()` | `serve()` — already multithreaded via `Threads.@spawn` |
-| `Res.html(...)` / `Res.js(...)` | `html(...)` / `js(...)` — the `Res` versions don't exist |
-| Unescaped interpolation into `html()` / `js()` | Escape first; or return JSON and render client-side |
+| `html(...)` / `js(...)` / `css(...)` / `xml(...)` / `text(...)` / `binary(...)` | `Res.html(...)` / `Res.send(...; content_type=...)` — the bare names are request parsers |
+| Unescaped interpolation into `Res.html()` or `Res.send(...; content_type=...)` | Escape first; or return JSON and render client-side |
 | `req.context[:session]` | `req.session` (likewise `req.user`, `req.ip`, `req.params`) |
 | Reaching into `req.json["field"]` for a typed body | `Json{T}` extractor + `validate` |
 | Binding a request body to a struct with `is_admin` / `user_id` | A separate input struct; assign privileged fields server-side |
