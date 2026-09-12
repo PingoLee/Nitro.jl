@@ -67,7 +67,15 @@ function load_config(env::String="dev")
         api_secret,
         Dict("default" => api_secret),
         ["default"],
-        env == "prod",
+        # NOT `env == "prod"`. A security flag must fail CLOSED: an environment variable
+        # missing on a production box would silently drop the cookie `Secure` attribute,
+        # and the environment name is exactly the value most likely to be absent.
+        #
+        # Note the polarity. The knob is named for the SECURE state and only the literal
+        # "0" turns it off, so every misspelling of "off" -- `false`, `no`, `FALSE` -- still
+        # leaves the cookie secure. A negatively-named `SESSION_INSECURE` would invert that:
+        # anything that is not exactly "0" would disable the protection.
+        get(ENV, "SESSION_SECURE", "1") != "0",
         3600
     )
 
@@ -92,6 +100,14 @@ end
 ```
 
 > **Tip on Dummy Fallback Values**: Notice that all secrets and configs use `get(ENV, "KEY", "fallback")`. This pattern is highly recommended. It ensures that your application won't crash when Documenter.jl (`docs/make.jl`) evaluates these blocks or when your CI suite runs basic tests without a `.env` file present.
+
+!!! warning "Do not gate security on the environment name"
+    `current_env()` selects *which config to load*. It must not decide whether a security
+    control is on — note that `session_secure` above defaults to secure and takes an explicit
+    `SESSION_SECURE=0` to relax, rather than testing `current_env() == "prod"`. An
+    environment variable that is missing on a production box is the normal failure, and a
+    control keyed off it fails open. See
+    [What this is *not* for](environment.md#What-this-is-*not*-for).
 
 ## Why This Lives In The App
 
@@ -132,7 +148,7 @@ urlpatterns("",
     path("/health", health, method="GET"),
 )
 
-config = load_config(get(ENV, "APP_ENV", "dev"))
+config = load_config(current_env())
 serve(host=config.server_host, port=config.server_port, context=config)
 ```
 
@@ -163,7 +179,9 @@ for everything downstream of it. On a hot path that difference is one dynamic
 ## Recommended Bootstrap Order
 
 1. Load YAML or TOML files in the app layer.
-2. Apply environment variable overrides.
+2. Apply environment variable overrides. Use [`current_env()`](environment.md) for the
+   environment name itself — Nitro resolves and validates it, so the app does not need
+   its own `get(ENV, "APP_ENV", "dev")`.
 3. Build `AppConfig`.
 4. Initialize external packages such as `PormG` from the app layer.
 5. Build routes, middleware, and worker hooks.

@@ -55,6 +55,8 @@ export  # Server lifecycle
         # Util
         getparams, getquery, getsession, setsession!, getip, setip!, getpeerip, getcontext, payload, getexternalurl,
         formdata, multipart, format_sse_message,
+        # Environment resolution (#55) -- reports the env, never gates on it
+        current_env,
         # Request body parsers (response building lives in `Res`, #28)
         text, json, binary,
         # Extractors

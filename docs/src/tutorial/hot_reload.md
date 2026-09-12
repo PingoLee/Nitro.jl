@@ -150,6 +150,9 @@ function start_server(env::String=current_env(); async=false)
 end
 ```
 
+(`current_env()` is Nitro's own — see [Environment](environment.md). The `env` parameter here
+is illustrative; this wrapper does not thread it anywhere.)
+
 to:
 
 ```julia

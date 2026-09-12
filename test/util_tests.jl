@@ -249,10 +249,20 @@ end
           "Authorization Error: nope"
 end
 
-@testset "serverwelcome banner includes environment when available" begin
+# ADJUDICATED (#55). This testset previously asserted `!occursin("Environment:", ...)` when
+# `NITRO_ENV` was unset -- an expectation written against the world where the variable was
+# COSMETIC and the environment was therefore sometimes unknown. #55 makes it functional, so
+# there is always a resolved environment and the banner always names it. Keeping the old
+# assertion would mean a production box that forgot `NITRO_ENV` prints nothing while silently
+# running as `dev`, which is the exact failure the issue exists to prevent. The expectation
+# moved deliberately; it was not stale-by-accident.
+#
+# Both blocks now pin `GENIE_ENV` too: it is a real fallback now, so a block that only pins
+# `NITRO_ENV` passes in CI and fails on any machine that exports `GENIE_ENV`.
+@testset "serverwelcome banner always names the resolved environment" begin
     output = mktemp() do path, io
         redirect_stdout(io) do
-            withenv("NITRO_ENV" => "dev") do
+            withenv("NITRO_ENV" => "dev", "GENIE_ENV" => nothing) do
                 serverwelcome("http://127.0.0.1:8080", nothing, false)
             end
         end
@@ -263,9 +273,9 @@ end
     @test occursin("Environment: dev", output)
     @test occursin("Starting server at http://127.0.0.1:8080", output)
 
-    output_without_env = mktemp() do path, io
+    output_env_unset = mktemp() do path, io
         redirect_stdout(io) do
-            withenv("NITRO_ENV" => nothing) do
+            withenv("NITRO_ENV" => nothing, "GENIE_ENV" => nothing) do
                 serverwelcome("http://127.0.0.1:8080", "/api", true)
             end
         end
@@ -273,9 +283,21 @@ end
         read(path, String)
     end
 
-    @test !occursin("Environment:", output_without_env)
-    @test occursin("Global prefix: /api", output_without_env)
-    @test occursin("parallel mode:", output_without_env)
+    @test occursin("Environment: dev", output_env_unset)   # the DEFAULT is announced too
+    @test occursin("Global prefix: /api", output_env_unset)
+    @test occursin("parallel mode:", output_env_unset)
+
+    # A non-default value is reported as itself, and the GENIE_ENV fallback reaches the banner.
+    output_prod = mktemp() do path, io
+        redirect_stdout(io) do
+            withenv("NITRO_ENV" => nothing, "GENIE_ENV" => "prod") do
+                serverwelcome("http://127.0.0.1:8080", nothing, false)
+            end
+        end
+        flush(io)
+        read(path, String)
+    end
+    @test occursin("Environment: prod", output_prod)
 end
 
 

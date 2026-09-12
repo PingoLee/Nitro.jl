@@ -23,7 +23,12 @@ When designing configuration, bootstrapping applications, or proposing developer
 - **Do not move app-specific config into Nitro `src/`**.
 
 ## 4. Environment strategy
-- Environment-specific files (`config/env/dev.jl`, etc.) are an **app** convention, not core Nitro.
+- Environment **files** (`config/env/dev.jl`, etc.) are an **app** convention, not core Nitro.
+  Environment **resolution** is core Nitro as of [#55](https://github.com/PingoLee/Nitro.jl/issues/55):
+  `current_env()` ([`src/environment.jl`](../../src/environment.jl)) resolves and validates
+  `NITRO_ENV` (then `GENIE_ENV`, then `"dev"`) against a closed set, and `NitroPormGExt`
+  publishes it to `ENV["PORMG_ENV"]` as a default. Apps consume the name; they no longer
+  derive it. `current_env()` **reports** and must never **gate** — see `src/errors.jl`.
 - **Secrets must not be committed**; use env vars or non-committed local config.
 - Allow env vars to override file-based app config for deployment.
 

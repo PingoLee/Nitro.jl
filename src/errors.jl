@@ -52,7 +52,8 @@ end
 # into every app that displayed the error (#130). Rendering is now per-call opt-in. There is
 # deliberately no global switch and no environment variable -- Django's `DEBUG` and Express's
 # `NODE_ENV` are the cautionary precedent: a process-wide flag is the thing that is on in production
-# once.
+# once. `current_env()` (#55) does not change this: it REPORTS the environment, for configuration
+# and the startup banner, and deliberately does not gate anything here.
 function Base.showerror(io::IO, e::ValidationError; cause::Bool = false)
     print(io, "Validation Error: $(e.msg)")
     # Bind the field to a local: the kwarg and the field deliberately share the name `cause`, which
