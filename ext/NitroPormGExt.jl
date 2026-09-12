@@ -9,7 +9,7 @@ using UUIDs
 import Nitro.Auth: make_password, check_password, password_needs_upgrade, is_password_usable
 import Nitro.Core.Types: AbstractSessionStore, SessionPayload, get_session, set_session!, delete_session!, cleanup_expired_sessions!
 import Nitro.Core.Cookies: storesession!, prunesessions!
-import Nitro: pormg_nitro_session
+import Nitro: pormg_nitro_session, sync_pormg_env!
 
 import Nitro.Workers: AbstractWorkerStore, TaskInfo, TaskStatus, TaskOptions, SequentialQueue, CleanupScheduler,
     PENDING, RUNNING, COMPLETED, FAILED, CANCELLED,
@@ -986,7 +986,22 @@ function pormg_nitro_worker(; db_key::String="db")
 end
 
 # ============================================================================
-# SECTION 9: Initialization
+# SECTION 9: Environment bridge
+# ============================================================================
+
+function sync_pormg_env!(; force::Bool = false)
+    # Blank counts as UNSET, matching how `current_env` treats `NITRO_ENV` -- and here it
+    # matters more, because PormG's `_effective_env` returns `""` on a bare `haskey` and then
+    # looks up a `""` section in connection.yml. Honouring an empty `PORMG_ENV` as if it were
+    # a deliberate choice would make the bridge worse than not existing.
+    if force || isempty(strip(get(ENV, "PORMG_ENV", "")))
+        ENV["PORMG_ENV"] = Nitro.current_env()
+    end
+    return ENV["PORMG_ENV"]
+end
+
+# ============================================================================
+# SECTION 10: Initialization
 # ============================================================================
 
 function __init__()
@@ -1008,6 +1023,39 @@ function __init__()
     # Pre-initialize the models so they're ready when needed
     _SESSION_MODEL[] = _define_session_model()
     _TASK_MODEL[] = _define_task_model()
+
+    # Bridge Nitro's resolved environment to PormG's, so an app can call
+    # `PormG.Configuration.load_many([...])` with no `env=` and get the environment Nitro
+    # resolved (#55). A DEFAULT, never a force: a pre-set `PORMG_ENV` and an explicit `env=`
+    # both still win.
+    #
+    # LAST in this function on purpose -- if it went first and threw, `_SESSION_MODEL[]` and
+    # `_TASK_MODEL[]` would be left unprimed and every later store construction would fail
+    # with a second, unrelated-looking error.
+    #
+    # Guarded, unlike the Ref priming above, because this is the only side effect here that
+    # ESCAPES THE MODULE: it mutates the OS process environment, which is inherited by any
+    # subprocess. The reason is NOT cache poisoning -- `ENV` is not serialized into a `.ji`,
+    # and PormG reads `PORMG_ENV` only inside function bodies. It is that a compile-only
+    # worker must not act on the world (the module-body/`__init__` non-negotiable), and that
+    # a package precompiled with `PORMG_ENV` seeded from whatever the build machine exported
+    # is a build whose behaviour depended on the builder's shell.
+    if ccall(:jl_generating_output, Cint, ()) == 0
+        try
+            sync_pormg_env!()
+        catch err
+            # Warn, never throw. An `__init__` that throws makes `using PormG` an `InitError`,
+            # so a typo in a shell variable would render the application -- and the REPL
+            # session you would diagnose it from -- unloadable. The authoritative, fatal check
+            # lives in `serve()`, which is where the process commits to being a server.
+            @warn "Nitro could not bridge its environment to PormG: " *
+                  sprint(showerror, err) *
+                  "\n`PORMG_ENV` is left unset, so PormG falls back to its own " *
+                  "resolution (`env=` kwarg, then `PORMG_ENV`, then `default_env:` in " *
+                  "connection.yml, then \"dev\").\nFix the variable and call " *
+                  "`sync_pormg_env!()`, or pass `env=` explicitly."
+        end
+    end
 end
 
 end # module NitroPormGExt

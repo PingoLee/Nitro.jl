@@ -100,6 +100,13 @@ SecretString
 reveal
 ```
 
+## Environment
+
+```@docs
+current_env
+sync_pormg_env!
+```
+
 ## Utilities
 
 ```@docs

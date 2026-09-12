@@ -347,6 +347,24 @@ serve(host="0.0.0.0", port=8080,         # serve() is keyword-only — no positi
 There is **no `Nitro.config`**. Applications own their typed config structs; inject through the app
 context, never a hidden global. Config must be swappable in tests without mutating framework state.
 
+**The environment name, though, is Nitro's.** `current_env()` returns `"dev"`, `"prod"` or
+`"test"`, resolved from `NITRO_ENV`, then `GENIE_ENV`, then `"dev"`, and validated — an
+unrecognised value throws at `serve()`. Do not write your own `get(ENV, "APP_ENV", "dev")`:
+
+```julia
+config = load_config(current_env())      # Nitro resolves the NAME; the app decides what it means
+```
+
+With PormG loaded, that value is published to `ENV["PORMG_ENV"]` as a default, so
+`PormG.Configuration.load_many(["db"])` needs no `env=`. A pre-set `PORMG_ENV` and an explicit
+`env=` both still win. Set `NITRO_ENV` **before** `using`, as with `RAILS_ENV`/`MIX_ENV`.
+
+`current_env()` **reports**; it must never **gate**. Selecting a config file, log verbosity, seed
+data: fine. Deciding whether a cookie gets `Secure`, whether CSRF is enforced, or whether error
+detail is rendered: no — those must fail closed on their own switch, because the environment
+variable is the thing most likely to be missing on the box that matters. Nitro ships no
+`isdev()`/`isprod()`/`istest()` for exactly this reason.
+
 Errors never leak: a throwing handler returns a generic `{"message": "500: Internal Server Error"}`.
 `serve(...; show_errors=true)` (the default) controls **server-side logging only** — turning it off
 does not harden the response, it just blinds your logs. Keep it on.

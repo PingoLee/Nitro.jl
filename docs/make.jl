@@ -20,6 +20,7 @@ makedocs(
             "tutorial/query_parameters.md",
             "tutorial/request_body.md",
             "tutorial/file_uploads.md",
+            "tutorial/environment.md",
             "tutorial/secrets.md",
             "tutorial/reverse_proxy.md",
             "tutorial/authentication.md",

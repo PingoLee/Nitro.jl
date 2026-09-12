@@ -297,6 +297,7 @@ any code that must not touch the global.
 | `src/instances.jl` | `Instances` module — `instance()` for a self-contained router/server per module |
 | `src/methods.jl` | Top-level convenience methods bound to the global `CONTEXT[]` |
 | `src/types.jl`, `src/constants.jl`, `src/errors.jl` | Shared vocabulary: `Nullable`, `Principal`, HTTP method constants, `ValidationError`/`CookieError`/`AuthorizationError` |
+| `src/environment.jl` | `Environment` module — `current_env()`, the `NITRO_ENV`/`GENIE_ENV` precedence and its closed value set. Reports the environment; deliberately gates nothing (#55) |
 | `src/response.jl` | The `Res` module — the response builders handlers use: `json`, `html`, `send`, `status`, `file`, `redirect` |
 | `src/utilities/bodyparsers.jl` | Request body parsing: `text`, `json`, `binary`, `formdata`, `multipart`, `FormFile` |
 | `src/utilities/misc.jl` | `parseparam`, `format_response`, `response` (content-sniffing builder used by the templating extensions — a markup sink), `add_response_headers`, `own_response_headers`, request plumbing |

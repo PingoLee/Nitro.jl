@@ -24,6 +24,7 @@ using .Types: snapshot
 include("crypto.jl");       @reexport using .Crypto
 include("cookies.jl");      @reexport using .Cookies
 include("constants.jl");    @reexport using .Constants
+include("environment.jl");  @reexport using .Environment
 include("context.jl");      @reexport using .AppContext
 
 function getparams end
@@ -380,16 +381,18 @@ end
 function serverwelcome(external_url::String, prefix::Nullable{String}, parallel::Bool)
     server_url = Util.join_url_path(external_url, prefix)
     curr_time = Dates.format(now(), "yyyy-mm-dd HH:MM:SS")
-    current_env = get(ENV, "NITRO_ENV", nothing)
+    # Renamed: `current_env` is now a function in this module (#55).
+    env = current_env()
     
     printstyled(" Nitro 1.10.0 ", color=:cyan, reverse=true, bold=true)
     if parallel
         printstyled(" (parallel mode: $(Threads.nthreads()) threads)", color=:light_black)
     end
     println("\n$curr_time")
-    if !isnothing(current_env)
-        println("Environment: $current_env")
-    end
+    # ALWAYS printed, including the defaulted case. A prod box that forgot `NITRO_ENV` must
+    # SEE that it is running as `dev` -- hiding the line when nobody set one reproduces exactly
+    # the silent-wrong-environment failure this became functional to prevent (#55).
+    println("Environment: $env")
     
     if !isnothing(prefix)
         println("Global prefix: $prefix")
@@ -538,6 +541,15 @@ function serve(ctx::ServerContext;
     # (`NaN >= 0` is false, so NaN is rejected here too.)
     shutdown_timeout >= 0 ||
         throw(ArgumentError("`shutdown_timeout` must be >= 0 seconds, got $shutdown_timeout"))
+
+    # Resolve (and therefore VALIDATE) the environment exactly once per `serve`, here rather
+    # than only in `serverwelcome`. The banner is the sole other caller and `startserver` runs
+    # it only `if show_banner` -- so any caller passing `show_banner=false` (embedded servers,
+    # most async starts, much of this suite) would never validate `NITRO_ENV` at all, and a
+    # typo would silently do nothing. That is the precise bug #55 exists to close, so the
+    # check belongs at the point the process commits to being a server, not in its console
+    # output.
+    current_env()
 
     if !ismissing(context)
         ctx.app_context[] = Context(context)

@@ -355,28 +355,38 @@ let args = copy(ARGS)
     # and the other seven keep a per-item ceiling, so a hang is still caught -- just not by
     # the coverage job.
     covering = Base.JLOptions().code_coverage != 0
-    runtests(
-        paths...;
-        # THE silent zero-test hole, and the one #34 was really looking for.
-        #
-        # This defaults to `false`, and then `_validated_paths` only `@warn`s on "No such
-        # path" / "is not a test file" and DROPS the path. Give one good path and one
-        # typo, and the run is green having never executed the file you asked for:
-        #
-        #   $ julia --project=. test/runtests.jl test/harness_tests.jl test/middlware/guards_tests.jl
-        #   Warning: No such path ".../test/middlware/guards_tests.jl"
-        #   [ Tests Completed: 1/1 test items were run.
-        #        Testing Nitro tests passed
-        #
-        # (Worse, when EVERY path is invalid `runtests` returns `nothing` outright.) With
-        # `true`, each of those becomes a throw. This is the path-axis twin of the
-        # unlisted-file defect `test/harness_tests.jl` guards on the TEST_FILES axis.
-        validate_paths = true,
-        testitem_timeout = 600,
-        test_end_expr = TEST_END,
-        nworkers = covering ? 0 : (nworkers < 0 ? 1 : nworkers),
-        nworker_threads = string(Threads.nthreads()),
-        tags     = isempty(tags) ? nothing : tags,
-        name     = isnothing(name_filt) ? nothing : name_filt,
-    )
+
+    # Pin the environment for the whole run (#55). `serve()` now resolves and VALIDATES
+    # `NITRO_ENV`/`GENIE_ENV`, and ~20 test files call `serve`. Without this, a developer with
+    # `GENIE_ENV=staging` exported -- exactly the Genie migrant the fallback exists for -- gets
+    # a broad, unrelated-looking suite failure, and every unpinned assertion about
+    # `current_env()` reads their shell instead of a known value. Items that care set their own
+    # value with `withenv`; workers inherit this one. `"test"` is the honest label for a run of
+    # the test suite.
+    withenv("NITRO_ENV" => "test", "GENIE_ENV" => nothing) do
+        runtests(
+            paths...;
+            # THE silent zero-test hole, and the one #34 was really looking for.
+            #
+            # This defaults to `false`, and then `_validated_paths` only `@warn`s on "No such
+            # path" / "is not a test file" and DROPS the path. Give one good path and one
+            # typo, and the run is green having never executed the file you asked for:
+            #
+            #   $ julia --project=. test/runtests.jl test/harness_tests.jl test/middlware/guards_tests.jl
+            #   Warning: No such path ".../test/middlware/guards_tests.jl"
+            #   [ Tests Completed: 1/1 test items were run.
+            #        Testing Nitro tests passed
+            #
+            # (Worse, when EVERY path is invalid `runtests` returns `nothing` outright.) With
+            # `true`, each of those becomes a throw. This is the path-axis twin of the
+            # unlisted-file defect `test/harness_tests.jl` guards on the TEST_FILES axis.
+            validate_paths = true,
+            testitem_timeout = 600,
+            test_end_expr = TEST_END,
+            nworkers = covering ? 0 : (nworkers < 0 ? 1 : nworkers),
+            nworker_threads = string(Threads.nthreads()),
+            tags     = isempty(tags) ? nothing : tags,
+            name     = isnothing(name_filt) ? nothing : name_filt,
+        )
+    end
 end

@@ -41,6 +41,7 @@ const TEST_FILES = [
     "extensions/crypto_tests.jl",
     "extensions/pormg_session_tests.jl",
     "extensions/pormg_worker_tests.jl",
+    "extensions/pormg_env_tests.jl",
 
     # ── Special Handler Tests ─────────────────────────────────────────────────
     "sse_tests.jl",
@@ -50,6 +51,7 @@ const TEST_FILES = [
 
     # ── Core Tests ────────────────────────────────────────────────────────────
     "util_tests.jl",
+    "environment_tests.jl",
     "upgrade_guide_tests.jl",
     "docs_deploy_tests.jl",
     "cookies_tests.jl",

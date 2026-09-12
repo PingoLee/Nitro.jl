@@ -107,6 +107,8 @@ const REQUIRED_SYMBOLS = String[
     "cancel_requested", "update_progress!",
     "TaskAuthority", "Owner", "System", "owner_of",
     "pormg_nitro_worker",
+    # Environment resolution (#55) and its PormG bridge.
+    "current_env", "sync_pormg_env!",
     "add_response_headers", "own_response_headers",
     "login_required", "role_required", "permission_required", "claim_required",
     "kid_required", "Principal",

@@ -25,6 +25,17 @@ Read `nitro-config.instructions.md` for config ownership rules before recommendi
       Keep it `true` in production so failures are recorded in your logs — setting
       `show_errors=false` does not harden the response (it is already generic); it only
       silences your own error logs.
+- [ ] **`NITRO_ENV` is set on the target box**, to one of `dev` / `prod` / `test`. Unset
+      resolves to `dev`, and `serve()` now *rejects* anything outside that set — so a
+      `staging` value that used to boot no longer does. Confirm it from the unit file /
+      Dockerfile / compose, not from a shell you happen to be in.
+- [ ] If the app uses PormG: the environment it connects with is the one you expect.
+      Nitro seeds `ENV["PORMG_ENV"]` from `NITRO_ENV` at `using PormG`, which **outranks**
+      `default_env:` in `connection.yml` — so a `default_env:` that used to decide is now
+      inert. The startup banner prints the resolved environment; read it once on the box.
+- [ ] No security control is keyed off `current_env()`. Cookie `Secure`, CSRF, and auth
+      must fail closed on their own switch, not on the environment name (which is the
+      value most likely to be missing). See `docs/src/tutorial/environment.md`.
 - [ ] Worker and DB connection strings use the correct env for the target (`nitro-config.instructions.md`).
 
 Report missing env vars by name; do not invent secret values.
