@@ -9,7 +9,7 @@ app1 = instance()
 
 app1.urlpatterns("",
     app1.path("/", () -> "welcome to server #1"),
-    app1.path("/subtract/<int:a>/<int:b>", (req, a::Int, b::Int) -> Dict("answer" => a - b) |> json)
+    app1.path("/subtract/<int:a>/<int:b>", (req, a::Int, b::Int) -> Dict("answer" => a - b) |> Res.json)
 )
 
 # Setup the second app
@@ -17,7 +17,7 @@ app2 = instance()
 
 app2.urlpatterns("",
     app2.path("/", () -> "welcome to server #2"),
-    app2.path("/add/<int:a>/<int:b>", (req, a::Int, b::Int) -> Dict("answer" => a + b) |> json)
+    app2.path("/add/<int:a>/<int:b>", (req, a::Int, b::Int) -> Dict("answer" => a + b) |> Res.json)
 )
 
 # start both servers together

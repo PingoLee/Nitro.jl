@@ -122,7 +122,7 @@ const TAG = cachetag(false, true, true)   # catch_errors=false, show_errors/seri
 ctx = ServerContext()
 key = genkey("GET", "/warm")
 
-v2_layer = handler -> (req::HTTP.Request -> text("v2|" * text(handler(req))))
+v2_layer = handler -> (req::HTTP.Request -> Res.send("v2|" * text(handler(req))))
 
 # Fires once, during chain construction — this IS the racing registration.
 registered = Ref(false)
@@ -131,11 +131,11 @@ v1_layer = function (handler)
         registered[] = true
         publish!(ctx.service.custommiddleware, key, (nothing, Function[v2_layer]))
     end
-    return (req::HTTP.Request -> text("v1|" * text(handler(req))))
+    return (req::HTTP.Request -> Res.send("v1|" * text(handler(req))))
 end
 
 Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
-    path("/warm", (req::HTTP.Request) -> text("handler"), middleware = [v1_layer]),
+    path("/warm", (req::HTTP.Request) -> Res.send("handler"), middleware = [v1_layer]),
 ])
 
 pipeline = Nitro.Core.setupmiddleware(ctx; catch_errors = false)
@@ -166,7 +166,7 @@ end
     # become refusing to publish at all. With no concurrent registration the cache fills.
     ctx2 = ServerContext()
     Nitro.Core.Routing.urlpatterns(ctx2, "", Nitro.RouteDefinition[
-        path("/quiet", (req::HTTP.Request) -> text("ok"),
+        path("/quiet", (req::HTTP.Request) -> Res.send("ok"),
              middleware = [handler -> (req::HTTP.Request -> handler(req))]),
     ])
     quiet = Nitro.Core.setupmiddleware(ctx2; catch_errors = false)

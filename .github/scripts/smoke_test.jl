@@ -76,7 +76,7 @@ end
             # validates that the signature matches the pattern, so this line exercises
             # the reflection machinery (`splitdef`/`parse_func_params`) before a request
             # is ever made.
-            path("/echo/<int:n>", (req, n::Int) -> Nitro.json(Dict("n" => n))),
+            path("/echo/<int:n>", (req, n::Int) -> Nitro.Res.json(Dict("n" => n))),
         ])
 
         port = free_port()

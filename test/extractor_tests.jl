@@ -193,15 +193,15 @@ end
 @testset "Api tests" begin
 
     urlpatterns("",
-        path("/", function() text("home") end, method="GET"),
+        path("/", function() Res.send("home") end, method="GET"),
         path("/headers", function(req, headers = Header(Sample, s -> s.limit > 5))
             return headers.payload
         end, method="GET"),
         path("/form", function(req, form::Form{Sample})
-            return form.payload |> json
+            return form.payload |> Res.json
         end, method="POST"),
         path("/query", function(req, query::Query{Sample})
-            return query.payload |> json
+            return query.payload |> Res.json
         end, method="GET"),
         path("/body/string", function(req, body::Body{String})
             return body.payload
@@ -216,7 +216,7 @@ end
             return protobuf(data.payload)
         end, method="POST"),
         path("/json/partial", function(req, p1::JsonFragment{PersonWithDefault}, p2::JsonFragment{PersonWithDefault})
-            return json((p1=p1.payload, p2=p2.payload))
+            return Res.json((p1=p1.payload, p2=p2.payload))
         end, method="POST"),
         path("/path/add/{a}/{b}", function(req, a::Int, path::Path{Parameters}, qparams::Query{Sample}, c::Nullable{Int}=23)
             return a + path.payload.b

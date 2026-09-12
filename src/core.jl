@@ -15,6 +15,9 @@ import Base.Threads: lock, nthreads
 import ..has_revise_hooks, ..revise_hooks
 
 include("errors.jl");       @reexport using .Errors
+# `Res` loads BEFORE `util.jl`: `Util`'s error formatter builds responses with `Res.json`,
+# and `Res` itself depends on nothing in Nitro (HTTP, MIMEs, JSON only).
+include("response.jl");     @reexport using .Res
 include("util.jl");         @reexport using .Util
 include("types.jl");        @reexport using .Types
 using .Types: snapshot
@@ -37,7 +40,6 @@ include("routerhof.jl");    @reexport using .RouterHOF
 using .RouterHOF: normalize_middleware, register_serve_lifecycle!, lifecycle_snapshot
 include("reflection.jl");   @reexport using .Reflection
 include("extractors.jl");   @reexport using .Extractors
-include("response.jl");     @reexport using .Res
 include("middleware.jl");   @reexport using .Middleware
 include("routing.jl");      @reexport using .Routing
 
@@ -1443,7 +1445,7 @@ function staticfiles(
     allow_symlink_escape::Bool=false,
 )
     function addroute(currentroute, filepath)
-        resp = file(filepath; loadfile=loadfile, headers=headers)
+        resp = Res.file(filepath; loadfile=loadfile, headers=headers)
         register_internal(ctx, router, GET, currentroute, () -> resp)
     end
     # The bytes are captured now, so the file this route serves cannot change on disk afterwards.
@@ -1462,7 +1464,7 @@ function spafiles(
 )
 
     function addroute(currentroute, filepath)
-        resp = file(filepath; loadfile=loadfile, headers=headers)
+        resp = Res.file(filepath; loadfile=loadfile, headers=headers)
         register_internal(ctx, router, GET, currentroute, () -> resp)
     end
     mounted = mountfolder(folder, mountdir, addroute; include_hidden, allow_symlink_escape)
@@ -1499,7 +1501,7 @@ function spafiles(
         index_path     = last(mounted[index_idx])
         fallback_route = Util.mount_route(vcat(segments, "**"))
         register_internal(ctx, router, GET, fallback_route, (req::HTTP.Request) ->
-            file(index_path; loadfile=loadfile, headers=headers))
+            Res.file(index_path; loadfile=loadfile, headers=headers))
     end
 
     # NOTE: the fallback route is deliberately NOT appended to `mounted` — it is a catch-all, not a
@@ -1521,7 +1523,7 @@ function dynamicfiles(
     # attacker can change is out of scope for this layer — see docs/design/static-serving-boundary.md.
     function addroute(currentroute, filepath)
         register_internal(ctx, router, GET, currentroute, () ->
-            file(filepath; loadfile=loadfile, headers=headers))
+            Res.file(filepath; loadfile=loadfile, headers=headers))
     end
     mountfolder(folder, mountdir, addroute; include_hidden, allow_symlink_escape)
 end

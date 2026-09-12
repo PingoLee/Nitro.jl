@@ -5,28 +5,20 @@ using Dates
 using ..Errors: ValidationError
 
 export recursive_merge, parseparam, parseparam_checked,
-    redirect, handlerequest,
+    handlerequest,
     format_response, header_name_isequal, set_content_size!, format_sse_message,
     join_url_path, is_test,
     own_response_headers, add_response_headers
 
 ### Request helper functions ###
 
-"""
-    redirect(path::String; code = 307)
-
-return a redirect response 
-"""
-function redirect(path::String; code = 307) :: HTTP.Response
-    return HTTP.Response(code, ["Location" => path])
-end
 
 function handle_error(::ValidationError)
-    return json(("message" => "400: Bad Request"), status = 400)    
+    return Res.json(("message" => "400: Bad Request"), status = 400)    
 end
 
 function handle_error(::Any)
-    return json(("message" => "500: Internal Server Error"), status = 500)    
+    return Res.json(("message" => "500: Internal Server Error"), status = 500)    
 end
 
 function handlerequest(getresponse::Function, catch_errors::Bool; show_errors::Bool = true)
@@ -258,7 +250,9 @@ function format_response(content::AbstractString)
     # here — `HTTP.sniff` would classify an attacker-influenced string that looks
     # like markup as text/html, turning a reflected value into stored/reflected
     # XSS. Handlers that intentionally return HTML/JS/etc. must opt in explicitly
-    # via the `Res.html`, `Res.js`, ... helpers, which set the type themselves.
+    # via `Res.html(...)` or `Res.send(...; content_type=...)`, which set the type
+    # themselves. Those two, plus template rendering through `response` below (which
+    # DOES sniff), are the framework's markup sinks.
     body = string(content)
     return HTTP.Response(200, [
         "Content-Type" => "text/plain; charset=utf-8",

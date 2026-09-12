@@ -93,7 +93,7 @@ end
     lf, started, stopped, ran = counting_lifecycle()
     ctx = ServerContext()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
-        path("/x", (req::HTTP.Request) -> text("ok"))
+        path("/x", (req::HTTP.Request) -> Res.send("ok"))
     ])
     for _ in 1:3
         Nitro.Core.internalrequest(ctx, HTTP.Request("GET", "/x");
@@ -123,7 +123,7 @@ end
     lf, _, _, _ = counting_lifecycle()
     ctx = ServerContext()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
-        path("/y", (req::HTTP.Request) -> text("ok"), middleware = [lf])
+        path("/y", (req::HTTP.Request) -> Res.send("ok"), middleware = [lf])
     ])
     @test lf in ctx.service.route_lifecycle
 
@@ -139,8 +139,8 @@ end
     lf, _, _, _ = counting_lifecycle()
     ctx = ServerContext()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
-        path("/p", (req::HTTP.Request) -> text("ok"), middleware = [lf]),
-        path("/q", (req::HTTP.Request) -> text("ok"), middleware = [lf]),
+        path("/p", (req::HTTP.Request) -> Res.send("ok"), middleware = [lf]),
+        path("/q", (req::HTTP.Request) -> Res.send("ok"), middleware = [lf]),
     ])
     @test length(ctx.service.route_lifecycle) == 1
 end
@@ -151,7 +151,7 @@ end
     lf, _, _, _ = counting_lifecycle()
     ctx = ServerContext()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
-        path("/shared", (req::HTTP.Request) -> text("ok"), middleware = [lf]),
+        path("/shared", (req::HTTP.Request) -> Res.send("ok"), middleware = [lf]),
     ])
     Nitro.Core.RouterHOF.register_serve_lifecycle!(ctx, Any[lf])
     @test lf in ctx.service.route_lifecycle
@@ -169,7 +169,7 @@ end
     @test lf in ctx.service.serve_lifecycle
 
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
-        path("/late", (req::HTTP.Request) -> text("ok"), middleware = [lf]),
+        path("/late", (req::HTTP.Request) -> Res.send("ok"), middleware = [lf]),
     ])
 
     @test lf in ctx.service.route_lifecycle
@@ -200,7 +200,7 @@ lf = LifecycleMiddleware(
 
 ctx = ServerContext()
 Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
-    path("/health", (req::HTTP.Request) -> text("ok"))
+    path("/health", (req::HTTP.Request) -> Res.send("ok"))
 ])
 
 port = get_free_port()
@@ -253,7 +253,7 @@ _serve(ctx, port) = Nitro.Core.serve(ctx; host = HOST, port = port, async = true
     lf, started, stopped = counting_lifecycle()
     ctx = ServerContext()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
-        path("/limited", (req::HTTP.Request) -> text("ok"), middleware = [lf])
+        path("/limited", (req::HTTP.Request) -> Res.send("ok"), middleware = [lf])
     ])
     @test lf in ctx.service.route_lifecycle
 
@@ -281,7 +281,7 @@ end
     lfb, started_b, _ = counting_lifecycle()
     ctx = ServerContext()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
-        path("/health", (req::HTTP.Request) -> text("ok"))
+        path("/health", (req::HTTP.Request) -> Res.send("ok"))
     ])
 
     Nitro.Core.serve(ctx; middleware = [lfa], host = HOST, port = get_free_port(),
@@ -312,7 +312,7 @@ end
     route_lf, serve_lf = mk("route"), mk("serve")
     ctx = ServerContext()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
-        path("/o", (req::HTTP.Request) -> text("ok"), middleware = [route_lf])
+        path("/o", (req::HTTP.Request) -> Res.send("ok"), middleware = [route_lf])
     ])
     Nitro.Core.serve(ctx; middleware = [serve_lf], host = HOST, port = get_free_port(),
                      async = true, show_banner = false, show_errors = false,
@@ -444,9 +444,9 @@ end
     lf = mk("shared")
     ctx = ServerContext()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
-        path("/p", (req::HTTP.Request) -> text("ok"), middleware = [lf]),
-        path("/q", (req::HTTP.Request) -> text("ok"), middleware = [lf]),
-        path("/r", (req::HTTP.Request) -> text("ok"), middleware = [lf]),
+        path("/p", (req::HTTP.Request) -> Res.send("ok"), middleware = [lf]),
+        path("/q", (req::HTTP.Request) -> Res.send("ok"), middleware = [lf]),
+        path("/r", (req::HTTP.Request) -> Res.send("ok"), middleware = [lf]),
     ])
     route_lf, _ = lifecycle_snapshot(ctx)
     @test length(route_lf) == 1

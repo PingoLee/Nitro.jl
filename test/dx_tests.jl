@@ -33,16 +33,25 @@ const TEST_FILE_PATH = joinpath(@__DIR__, "content", "test.txt")
         @test any(h -> h[1] == "Content-Type" && occursin("text/plain", h[2]), res_send.headers)
         @test String(res_send.body) == "Raw text"
 
-        # Test Res.file()
+        # Test Res.file() -- serves INLINE by default (#28). A static mount hands every asset
+        # through this path, so a default `attachment` would turn an SPA's index.html into a
+        # download. `Content-Disposition` is opt-in.
         res_file = Res.file(TEST_FILE_PATH)
         @test res_file.status == 200
         @test any(h -> h[1] == "Content-Type" && occursin("text/plain", h[2]), res_file.headers)
-        @test any(h -> h[1] == "Content-Disposition" && occursin("attachment", h[2]), res_file.headers)
+        @test !any(h -> h[1] == "Content-Disposition", res_file.headers)
         @test String(res_file.body) == read(TEST_FILE_PATH, String)
 
-        # Test Res.file() custom filename and headers
+        # Test Res.file() forced download -- the opt-in
+        attached = Res.file(TEST_FILE_PATH, disposition="attachment")
+        @test any(h -> h[1] == "Content-Disposition" && occursin("attachment", h[2]), attached.headers)
+        @test any(h -> h[1] == "Content-Disposition" && occursin(basename(TEST_FILE_PATH), h[2]), attached.headers)
+
+        # Test Res.file() custom filename and headers. `filename` alone still implies a
+        # disposition -- otherwise naming the download would be a silent no-op.
         named_file = Res.file(TEST_FILE_PATH, filename="download.txt", headers=["X-Test" => "1"])
         @test any(h -> h[1] == "Content-Disposition" && occursin("download.txt", h[2]), named_file.headers)
+        @test any(h -> h[1] == "Content-Disposition" && occursin("attachment", h[2]), named_file.headers)
         @test any(h -> h[1] == "X-Test" && h[2] == "1", named_file.headers)
 
         # `Res.file` measures Content-Length the same way `Nitro.file` does (#92). `length` would be

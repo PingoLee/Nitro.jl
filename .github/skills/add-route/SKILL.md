@@ -24,7 +24,7 @@ Follow routing and response rules from `nitro-core.instructions.md`.
 ### 1. Handler
 
 - Add a function with `req::HTTP.Request` and typed path parameters (`id::Int`, `slug::String`, etc.).
-- Return via `Res.json(...)`, `Res.status(...)`, or `Res.send(...)` so status and content type are explicit. A raw `Dict`/`String` return also works and is **safe** (auto-formatted; see `nitro-core.instructions.md` §4) — prefer the builder for intent, but do not treat a raw return as a defect.
+- Return via `Res.json(...)`, `Res.status(...)`, `Res.send(...)` or `Res.html(...)` so status and content type are explicit. `Res` is the response-building namespace handlers use. A raw `Dict`/`String` return also works and is **safe** (auto-formatted; see `nitro-core.instructions.md` §4) — prefer the builder for intent, but do not treat a raw return as a defect.
 - Use extractors (`Query{T}`, `Json{T}`, `Form{T}`, `Files{...}`) when the route has a typed body or query contract; unwrap with `.payload`.
 
 ### 2. Register the route

@@ -61,7 +61,7 @@ const TEST_FILES = [
     "precompilation_test.jl",
     "extractor_tests.jl",
     "reflection_tests.jl",
-    "render_tests.jl",
+    "response_tests.jl",
     "bodyparser_tests.jl",
     "ergonomics_tests.jl",
     "instance_tests.jl",

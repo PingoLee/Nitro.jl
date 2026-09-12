@@ -14,7 +14,7 @@ end
 
 function __init__()
     urlpatterns("",
-        path("/", function() text("hello world") end, method="GET"),
+        path("/", function() Res.send("hello world") end, method="GET"),
         path("/add", function(req::Request, a::Int, b::Int=3) a + b end, method="GET"),
         path("/add/extractor", function(req::Request, qparams::Query{Add})
             add = qparams.payload

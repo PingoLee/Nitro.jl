@@ -169,7 +169,7 @@ Check aggressively for the following. For any finding, trace a concrete attacker
 
 - Raw SQL string interpolation instead of parameterized queries or ORM APIs in `ext/`
 - Dynamic `eval`/`include`/`run` built from request input
-- **XSS via the deliberate escape hatches**: user-influenced data flowing into the top-level `html()`, `js()`, `xml()`, or `css()` constructors (`src/utilities/render.jl`) without escaping. Those four are the *only* markup/script sinks — raw `String` returns and `Res.send` are `text/plain` and safe by design (see `nitro-core.instructions.md` §4). Note `Res.html`/`Res.js` **do not exist**; a diff that calls them is a bug, not a sink.
+- **XSS via the deliberate escape hatches**: user-influenced data flowing unescaped into any of the **three** markup/script sinks — `Res.html(...)`; `Res.send(...; content_type=...)` naming a markup/script type; or a template rendered by `mustache()`/`otera()`, which build through the content-sniffing `Util.response` and do **not** escape by default. A raw `String` return is served `text/plain` without content-sniffing and is safe by design, as is `Res.send` **without** `content_type`. **Grepping for `html(` alone misses two of the three** — grep `content_type`, `mustache(` and `otera(` as well (see `nitro-core.instructions.md` §4).
 - **Open redirect / header (CRLF) injection**: user input reaching a `Location` redirect target, `Set-Cookie`, or other response header without validation
 - **SSRF**: outbound HTTP/DB/file requests whose URL, host, or path derives from request input
 - File upload/path handling without sanitization (path traversal via `FormFile.filename` or staged paths)

@@ -9,16 +9,16 @@ localhost = "http://$HOST:$port"
 urlpatterns("",
     path("/noarg", function(;request)
         @test isa(request, HTTP.Request)
-        return text("Hello World")
+        return Res.send("Hello World")
     end, method="GET"),
     path("/params/double/{a}", function(req, a::Float64; request::HTTP.Request)
         @test isa(request, HTTP.Request)
-        return text("$(a*2)")
+        return Res.send("$(a*2)")
     end, method="GET"),
     path("/singlearg", function(req; request)
         @test isa(req, HTTP.Request)
         @test isa(request, HTTP.Request)
-        return text("Hello World")
+        return Res.send("Hello World")
     end, method="GET"),
 )
 

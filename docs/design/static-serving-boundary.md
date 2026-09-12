@@ -135,7 +135,7 @@ not a boundary against an adversary who can write into the served directory. For
 An earlier revision of the #20 fix re-validated on every `dynamicfiles` request and on every SPA
 fallback request, to catch a file swapped for a symlink after startup. It was removed before landing.
 
-It could not close the race it targeted: the check resolves the path, and `file()` then re-opens the
+It could not close the race it targeted: the check resolves the path, and `Res.file()` then re-opens the
 **unresolved** path, so a swap landing between the two is still followed. A hard link to an outside
 file is undetectable regardless, because the resolved path genuinely is inside the mount. Meanwhile
 it cost a `realpath`, a `stat`, and a `splitpath` allocation on every request to a `dynamicfiles`

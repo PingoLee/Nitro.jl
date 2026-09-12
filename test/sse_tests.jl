@@ -8,7 +8,7 @@ port = get_free_port()
 localhost = "http://$HOST:$port"
 
 urlpatterns("",
-    path("/health", function() return text("I'm alive") end, method="GET"),
+    path("/health", function() return Res.send("I'm alive") end, method="GET"),
     path("/events/{name}", function(stream::HTTP.Stream, name::String)
         HTTP.setheader(stream, "Access-Control-Allow-Origin" => "*")
         HTTP.setheader(stream, "Access-Control-Allow-Methods" => "GET")

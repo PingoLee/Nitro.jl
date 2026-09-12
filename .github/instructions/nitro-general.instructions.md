@@ -185,7 +185,7 @@ exceptions on purpose — read the canonical section before writing code in that
 | Hard stop | Canonical |
 |-----------|-----------|
 | Routes are declared with `path()` / `urlpatterns()` / `include_routes()` only — no macro or function registrars | [nitro-core §3](nitro-core.instructions.md) |
-| Never feed unescaped user input into `html()`, `js()`, `xml()`, or `css()` — those are the only markup sinks | [nitro-core §4](nitro-core.instructions.md) |
+| Never feed unescaped user input into `Res.html()`, `Res.send(...; content_type=...)`, or a template rendered by `mustache()`/`otera()` — those are the markup sinks | [nitro-core §4](nitro-core.instructions.md) |
 | Never mutate a `Response` returned by an inner middleware layer — build a new one | [nitro-core §4](nitro-core.instructions.md) |
 | Never route response bodies through HTTP.jl's consuming write path | [nitro-core §4](nitro-core.instructions.md) |
 | `PormG` may be imported only inside `ext/NitroPormGExt.jl` — never in `src/` | [nitro-core §6](nitro-core.instructions.md) |
@@ -297,10 +297,9 @@ any code that must not touch the global.
 | `src/instances.jl` | `Instances` module — `instance()` for a self-contained router/server per module |
 | `src/methods.jl` | Top-level convenience methods bound to the global `CONTEXT[]` |
 | `src/types.jl`, `src/constants.jl`, `src/errors.jl` | Shared vocabulary: `Nullable`, `Principal`, HTTP method constants, `ValidationError`/`CookieError`/`AuthorizationError` |
-| `src/response.jl` | The `Res` module — `json`, `status`, `send`, `file`, `redirect` |
-| `src/utilities/render.jl` | Response constructors: `html`, `text`, `json`, `xml`, `js`, `css`, `binary`, `file` |
+| `src/response.jl` | The `Res` module — the response builders handlers use: `json`, `html`, `send`, `status`, `file`, `redirect` |
 | `src/utilities/bodyparsers.jl` | Request body parsing: `text`, `json`, `binary`, `formdata`, `multipart`, `FormFile` |
-| `src/utilities/misc.jl` | `redirect`, `parseparam`, `add_response_headers`, `own_response_headers`, request plumbing |
+| `src/utilities/misc.jl` | `parseparam`, `format_response`, `response` (content-sniffing builder used by the templating extensions — a markup sink), `add_response_headers`, `own_response_headers`, request plumbing |
 | `src/utilities/fileutil.jl` | `readfile`, `mountable_files`, `mountfolder` — static-mount helpers; `mountable_files` owns which files a mount will expose (dotfiles, symlink confinement, route-pattern names) |
 | `src/extractors.jl` | Typed extractors: `Path`, `Query`, `Header`, `Json`, `JsonFragment`, `Form`, `Body`, `Cookie`, `Session`, `Files`, `MultipartForm` |
 | `src/reflection.jl` | `struct_builder`, `splitdef`, `extract_struct_info` — the machinery extractors bind through |

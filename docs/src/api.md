@@ -28,23 +28,26 @@ Direct handler request ergonomics use `req.params`, `req.query`, `req.json`, `re
 Context
 context
 queryparams
+text
+json
+binary
 formdata
 ```
 
 ## Responses
 
-The `Res` module is the preferred response surface for handlers and includes `Res.json`, `Res.send`, `Res.status`, `Res.file`, and `Res.redirect`.
+`Res` is the response-building namespace for handlers: `Res.json`, `Res.html`, `Res.send`, `Res.status`,
+`Res.file` and `Res.redirect`. The bare names `text`, `json` and `binary` are *request body
+parsers* (see [Context And Requests](@ref)), not response builders.
 
 ```@docs
-html
-text
-json
-file
-xml
-js
-css
-binary
 Res
+Res.json
+Res.html
+Res.send
+Res.status
+Res.file
+Res.redirect
 ```
 
 ## Cookies And Sessions
@@ -100,6 +103,5 @@ reveal
 ## Utilities
 
 ```@docs
-redirect
 resetstate
 ```
