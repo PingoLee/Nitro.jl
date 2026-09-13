@@ -289,7 +289,7 @@ requests get up to `timeout` seconds (default 10, or `serve(shutdown_timeout=…
 left is force-closed. Long-lived WebSocket/SSE/STREAM handlers hold their connection for their whole
 lifetime and are therefore always cut at the timeout — if one must finish cleanly, notify it from a
 `LifecycleMiddleware`'s `on_shutdown`, which runs before the drain. Calling `serve()` on a context
-that is already serving throws; `terminate()` first, or give the second listener its own `App`.
+that is already serving throws; terminate THAT app first, or give the second listener its own `App`.
 
 ---
 

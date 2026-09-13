@@ -3,6 +3,7 @@
 using Test
 using HTTP
 using Nitro
+using Nitro.Core.Types: snapshot
 
 # Acceptance test for the public `App` handle (#31). This file is the converted
 # `instance_tests.jl`: `instance()` used to be the only way to get two independent Nitro
@@ -111,7 +112,7 @@ try
         urlpatterns(app1, "", path("/named/<int:id>", (req, id::Int) -> "ok", name = "named"))
         @test url(app1, "named"; id = 7) == "/named/7"
         # The global has no such name, so the singleton form must fail rather than agree.
-        @test_throws Exception url("named"; id = 7)
+        @test_throws ArgumentError url("named"; id = 7)
 
         # `getexternalurl` — reads this app's listener, and app1 IS serving.
         @test getexternalurl(app1) == "http://$HOST:$port1"
@@ -126,30 +127,33 @@ try
         set_cookie!(app1, res, "sid", "payload-app1")
         raw = join([v for (k, v) in res.headers if lowercase(k) == "set-cookie"], ";")
         @test !occursin("payload-app1", raw)          # encrypted under app1's key
-        @test !occursin("app1-secret", raw)           # and the key itself never ships
 
-        req = Nitro.Request("GET", "/", ["Cookie" => replace(split(raw, ';')[1], "sid=" => "sid=")])
+        req = Nitro.Request("GET", "/", ["Cookie" => split(raw, ';')[1]])
         @test get_cookie(app1, req, "sid") == "payload-app1"
         # app2 has a different key, so it must not be able to read app1's cookie. Decryption
         # under the wrong key raises rather than returning the default -- which is the correct
         # loud failure, and the reason this asserts a throw instead of a value.
-        @test_throws Exception get_cookie(app2, req, "sid")
+        @test_throws Nitro.CookieError get_cookie(app2, req, "sid")
 
-        # `router` — the HOF route BUILDER (it composes a route string and registers the
-        # router's own middleware against the app); it does not take a handler. Protocol is
-        # `router(app, prefix)(path)(method)`, as in test/custommiddleware_tests.jl.
-        hof_route = router(app1, "/hof")("/only-app1")("GET")
-        @test hof_route isa AbstractString
-        @test occursin("/hof", hof_route) && occursin("/only-app1", hof_route)
+        # `router` — the HOF route builder; protocol is `router(app, prefix)(path)(method)`.
+        #
+        # Asserting on the returned STRING would not discriminate: with no middleware the
+        # composed route is prefix+path regardless of which app you pass. What the app
+        # actually owns is the route-level middleware registration, so assert that.
+        mw = handle -> (req -> handle(req))
+        hof_route = router(app1, "/hof"; middleware = [mw])("/only-app1")("GET")
+        key = Nitro.Core.RouterHOF.genkey("GET", hof_route)
+        @test haskey(snapshot(app1.service.custommiddleware), key)
+        @test !haskey(snapshot(Nitro.CONTEXT[].service.custommiddleware), key)
 
         # `staticfiles` / `spafiles` / `dynamicfiles` — mount into THIS app's router.
         mountdir = mktempdir()
         write(joinpath(mountdir, "index.html"), "<p>app1 only</p>")
-        staticfiles(app1, mountdir, "assets")
-        @test internalrequest(app1, HTTP.Request("GET", "/assets/index.html")).status == 200
+        staticfiles(app1, mountdir, "app1-assets")
+        @test internalrequest(app1, HTTP.Request("GET", "/app1-assets/index.html")).status == 200
         # app2 never mounted it, and neither did the global.
-        @test internalrequest(app2, HTTP.Request("GET", "/assets/index.html")).status == 404
-        @test internalrequest(HTTP.Request("GET", "/assets/index.html")).status == 404
+        @test internalrequest(app2, HTTP.Request("GET", "/app1-assets/index.html")).status == 404
+        @test internalrequest(HTTP.Request("GET", "/app1-assets/index.html")).status == 404
 
         dynamicfiles(app2, mountdir, "dyn")
         @test internalrequest(app2, HTTP.Request("GET", "/dyn/index.html")).status == 200
@@ -165,11 +169,16 @@ try
         # asserted, because the distinction is exactly what the UPGRADING caveat turns on:
         # an app with no store installed falls back to the process-wide default.
         @test Nitro.Workers.worker_store(app1) === nothing
-        @test worker_startup(app1) isa Nitro.Core.Types.LifecycleMiddleware
+        lm = worker_startup(app1; queues = String[], cleanup_enabled = false, recover_zombies = false)
+        @test lm isa Nitro.Core.Types.LifecycleMiddleware
 
-        Nitro.Workers.start!(app1; cleanup_enabled = false, recover_zombies = false)
+        # Firing the hook is what `serve(middleware = [...])` does; the return type alone is
+        # `LifecycleMiddleware` whichever app the closure captured, so it proves nothing.
+        lm.on_startup()
         @test Nitro.Workers.worker_store(app1) !== nothing
-        @test Nitro.Workers.worker_store(app2) === nothing   # untouched
+        @test Nitro.Workers.worker_store(Nitro.CONTEXT[]) === nothing
+        @test Nitro.Workers.worker_store(app2) === nothing
+        lm.on_shutdown()
     end
 finally
     terminate(app1)

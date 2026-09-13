@@ -139,10 +139,17 @@ of that cost. Two differences are worth knowing before you port:
 - **Types are shared.** There is no separate module namespace, so `app1`'s `Request` *is*
   `Nitro.Request`. That is what you want — objects could not cross `instance()` boundaries.
 - **Worker stores are NOT isolated by default.** `_resolve_store` falls back to the process-wide
-  default store when an app has none installed, so two `App`s that never call `worker_startup`
-  share one queue — where two `instance()` modules got one each. Call
-  `worker_startup(app; ...)` (or `Nitro.Workers.start!(app; ...)`) on each app that uses workers
-  and each gets its own store.
+  default store when an app has none installed, so two `App`s that never install one share a
+  queue — where two `instance()` modules got one each.
+
+  To give an app its own store, put `worker_startup(app; ...)` in **that app's**
+  `serve(middleware = [...])` list, or call `Nitro.Workers.start!(app; ...)` directly.
+  `worker_startup` on its own installs nothing: it *returns* lifecycle middleware, and the store
+  is installed when `serve` fires its `on_startup`.
+
+  Once an app has its own store, use that app's worker API (`submit_task(app, ...)` and friends).
+  The argument-less `submit_task(...)` helpers keep writing to the process-wide default store, so
+  mixing the two silently splits submissions from the queue processors watching the app's store.
 
 ### How to find the calls to migrate
 
