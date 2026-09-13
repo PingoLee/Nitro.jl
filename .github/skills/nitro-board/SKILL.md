@@ -16,6 +16,12 @@ the ranking back. It is the planning layer *underneath*
 [`nitro-issue-cluster`](../nitro-issue-cluster/SKILL.md) — that skill builds and works a cluster and
 links here rather than restating any of this.
 
+The *rationale* behind the steps lives in [`reference.md`](reference.md) — each step points at the
+section to open when you reach it. Most invocations are "what should I pick up next?" and never reach
+§4, so the write-back footguns are not paid for on every run. **Every query below is projected
+through `--jq` on purpose:** the raw GraphQL responses are deeply nested and an unprojected read is
+the single largest cost in this skill.
+
 ## Use This Skill For
 
 - **"What should I pick up next?"** — the most common reason to be here
@@ -64,11 +70,8 @@ then the answer looks like a work order. In planning mode, ask about *the plan*:
 right, which grouping to record, whether a design direction is settled. Keep "shall I start work on
 X?" as its own separate question, asked in those words, after the board is written.
 
-Receipt: this rule exists because the board work and the cluster work lived in one skill with no
-boundary between them. A session invoked to plan the board asked "what should this session actually
-run?" as part of ranking, read the answer as authorization, and went on to write, test, review, and
-commit code the user had not asked for. The board half of that session was what they wanted; the
-rest was unrequested.
+The incident this rule was written from, and why the hand-off costs more since the merge-gate change:
+[`reference.md`](reference.md) §A.
 
 ## 1. Reconcile
 
@@ -86,8 +89,20 @@ Always reconcile before planning; a stale board schedules closed and superseded 
 gh api graphql -f query='{ user(login:"PingoLee"){ projectV2(number:8){
   items(first:99){ nodes{ id content{ ... on Issue { number state } }
     fieldValues(first:12){ nodes{ ... on ProjectV2ItemFieldSingleSelectValue {
-      name field{ ... on ProjectV2SingleSelectField { name } } } } } } } } } }'
+      name field{ ... on ProjectV2SingleSelectField { name } } } } } } } } } }' \
+  --jq '.data.user.projectV2.items.nodes[] | [
+      .id,
+      (.content.number // "-"),
+      (.content.state  // "-"),
+      ([.fieldValues.nodes[] | select(.field.name == "Status")  | .name] | first // "NO-STATUS"),
+      ([.fieldValues.nodes[] | select(.field.name == "Session") | .name] | first // "NO-SESSION")
+    ] | @tsv'
 ```
+
+One line per item: `<item-id> <issue#> <state> <status> <session>`. **Never run this unprojected** —
+the raw response is ~99 items × 12 nested field values and it is the most expensive read in the
+skill, for information that fits in five columns. `NO-SESSION` is not padding; it is the count §1
+below actually cares about.
 
 Then, for every item:
 
@@ -113,11 +128,15 @@ gh issue list --state open --limit 100 --json number -q '.[].number' | sort -n
 this session just filed — is invisible to the next planning pass until it is added.
 
 **Membership is not the whole sweep — also count the open items whose `Session` is empty.** They are
-as invisible to §2 as an issue never added: nothing ranks them. The query above already returns field
-values, so check it in the same pass.
+as invisible to §2 as an issue never added: nothing ranks them. The projection above already carries
+it, so it is one `grep`, not a second query:
 
-Receipt: reconciling board 8 after 16 sessions found **one** open issue off the board and **26** on it
-with no `Session` — it looked complete while two thirds of the backlog sat there unschedulable.
+```bash
+# ... | grep -c 'NO-SESSION'
+```
+
+Why that count is the one that says whether the board is usable at all:
+[`reference.md`](reference.md) §B.
 
 ## 2. Rank the sessions
 
@@ -158,19 +177,14 @@ O(n²) to maintain and silently goes stale the moment a session is added.
 Three constraints survive filesystem isolation, so clear all of them before calling two sessions
 parallel-safe:
 
-- **Verification serializes.** Two sessions cannot run the full suite (rungs 4–6) concurrently,
-  regardless of file disjointness. Note the reason is **contention for machine resources**, not port
-  collisions: no Nitro test uses a fixed port — `get_free_port()` is called at ~47 sites and
-  `PORT`/`localhost` were deliberately removed from `NitroCommon`. Sessions can *edit* in parallel
-  and must *queue* to verify. See
-  [`nitro-test-troubleshooting`](../nitro-test-troubleshooting/SKILL.md) §5.
-- **A worktree run is weaker than it reports.** Until [#128](https://github.com/PingoLee/Nitro.jl/issues/128)
-  lands, a worktree silently skips the entire `PormGWorkerStore` testset and still exits 0 — so a
-  parallel session verifying a store-interface change is not verifying what it thinks. #128 is a
-  prerequisite for trusting parallel sessions, not merely a leverage item.
-- **Uncommitted work is invisible.** `git log` and `git diff main...<branch>` do not show it. Check
-  what is actually in flight before starting, per
-  [`nitro-issue-workflow`](../nitro-issue-workflow/SKILL.md) §2.
+| Constraint | What it means for scheduling |
+|---|---|
+| **Verification serializes** | Sessions can *edit* in parallel and must *queue* to run rungs 4–6 — machine-resource contention, not port collisions |
+| **A worktree run is weaker than it reports** | Until [#128](https://github.com/PingoLee/Nitro.jl/issues/128) lands it silently skips `PormGWorkerStore` and still exits 0 — a prerequisite for trusting parallel sessions, not just a leverage item |
+| **Uncommitted work is invisible** | `git log` and `git diff main...<branch>` do not show it — check what is in flight per [`nitro-issue-workflow`](../nitro-issue-workflow/SKILL.md) §2 |
+
+The evidence behind each, and why a per-session surface beats a conflict matrix:
+[`reference.md`](reference.md) §F.
 
 ## 4. Write it back
 
@@ -182,29 +196,58 @@ gh auth refresh -s project     # interactive browser flow — the USER runs this
 ```
 
 **Discover the IDs — never hardcode them.** Project, field, and option IDs are opaque and change
-with the board. Resolve them every run:
+with the board. Resolve them every run, but **snapshot to a file rather than into the transcript** —
+the option list carries every description, and you need it byte-for-byte, not approximately:
 
 ```bash
 gh api graphql -f query='{ user(login:"PingoLee"){ projectV2(number:8){ id
-  fields(first:20){ nodes{ ... on ProjectV2SingleSelectField { id name options{ id name color description } } } } } } }'
+  fields(first:20){ nodes{ ... on ProjectV2SingleSelectField { id name options{ id name color description } } } } } } }' \
+  > .claude/worktrees/board.json          # gitignored scratch
+
+# Read only what you need to think with:
+jq -r '.data.user.projectV2 | "PROJECT \(.id)", (.fields.nodes[] | select(.name) | "FIELD \(.name) \(.id)")' \
+  .claude/worktrees/board.json
+jq -r '.data.user.projectV2.fields.nodes[] | select(.name=="Session") | .options[]
+       | "\(.id)\t\(.name)\t\(.description|length)"' .claude/worktrees/board.json
 ```
 
-You want the project `id`, the **Status** field (`Todo` / `In Progress` / `Done`) and the
-**Session** field with its full option list — ids, colors, and descriptions included. You need all
-three per option for the next step.
+That second line gives you the option ids **and** the length check the cap below needs, without a
+single description entering context.
 
-**Adding a Session option — the footgun.** `updateProjectV2Field` **replaces the entire option
-list**; it does not append. Sending only the new option deletes every existing one and orphans every
-item grouped under them. `ProjectV2SingleSelectFieldOptionInput` accepts an optional `id`, and that
-is what saves you: resend every existing option **with its `id`, `color`, and `description`**, then
-append the new one without an `id`. Matching ids keep items attached and let you rename a group
-safely. Pass it as a file — `-f` cannot express a list of objects:
+**`updateProjectV2Field` replaces the entire option list — it does not append.** Sending only the new
+option deletes every existing one and orphans every item grouped under them. The rule: resend every
+existing option **with its `id`, `color`, and `description`**, then append the new one without an
+`id`. Full reasoning, including why a rename needs the id: [`reference.md`](reference.md) §C.
+
+**Build that payload file-to-file, never by retyping.** `jq` carries the unchanged options straight
+from the snapshot, so only the description you are actually changing is written out:
 
 ```bash
-gh api graphql --input payload.json      # {"query": "mutation ... updateProjectV2Field ...", "variables": {...}}
+jq --arg target 'Session 4' \
+   --arg desc   'RUN 1st | TIER standard | READY. FILES: ... ORDER: ... WHY: ...' \
+   '{ query: "mutation($fid:ID!,$opts:[ProjectV2SingleSelectFieldOptionInput!]!){
+        updateProjectV2Field(input:{fieldId:$fid,singleSelectOptions:$opts}){
+          projectV2Field{ ... on ProjectV2SingleSelectField { options{ id name } } } } }",
+      variables: {
+        fid: (.data.user.projectV2.fields.nodes[] | select(.name=="Session") | .id),
+        opts: [ .data.user.projectV2.fields.nodes[] | select(.name=="Session") | .options[]
+                | {id, name, color, description}
+                | if .name == $target then .description = $desc else . end ]
+      } }' .claude/worktrees/board.json > .claude/worktrees/payload.json
+
+jq -e '[.variables.opts[] | select((.description|length) > 450)] | length == 0' \
+   .claude/worktrees/payload.json          # non-zero exit = something is over the cap
+
+gh api graphql --input .claude/worktrees/payload.json    # -f cannot express a list of objects
 ```
 
-Verify the response lists every pre-existing option with its **original id** before moving on.
+To **add** an option instead of editing one, append `+ [{name: "...", color: "GRAY", description: "..."}]`
+to `opts` — no `id` on the new entry, ids intact on every old one. Verify the response lists every
+pre-existing option with its **original id** before moving on.
+
+Re-ranking is the common case and it is the expensive one, because `RUN nth` lives inside a string
+that is otherwise stable. The recipe above makes that cheap; the structural fix, and why it has not
+been done, is [`reference.md`](reference.md) §E.
 
 **Adding and stamping items.** `gh project item-add 8 --owner PingoLee --url <issue-url>` adds an
 issue; then one `gh project item-edit` per field — Session and Status:
@@ -247,25 +290,17 @@ Session 4's #108.
   tiebreak) named explicitly.
 - **`WHY:`** — why this rank. The one line that stops the next session re-deriving it.
 
-**Descriptions are capped at ~450.** The API rejects the whole mutation over the limit — one long
-description fails *every* option in the batch, not just its own. Check lengths before submitting
-rather than discovering it in an error.
-
-Receipt, stated honestly because it matters for how you count: the limit is known only from the API
-rejecting a batch with the message *"Settings option description is too long (maximum is 450
-characters)"*. Whether it counts characters or bytes is **unconfirmed**. Keeping descriptions ASCII
-makes the two identical, which is why the grammar above says ASCII — a 445-character description
-with a dozen em-dashes is ~470 bytes and would fail the whole batch.
+**Descriptions are capped at ~450, and one long one fails *every* option in the batch.** The `jq -e`
+guard above is the check — run it before submitting, not after the error. Whether the API counts
+characters or bytes is unconfirmed, which is the real reason the grammar is ASCII:
+[`reference.md`](reference.md) §D.
 
 Mark finished groups `DONE. #79, #81, #82, #74.` rather than deleting them — the history of what
 shipped together is what makes the next grouping decision easier.
 
 **The board records decisions, not speculation.** An option per agreed cluster; nothing for a
-grouping you merely considered.
-
-Receipt: board 8's first ten Session options were created with empty descriptions. With six of them
-done or partly done and four untouched, nothing on the board said which ran next, and the ranking had
-to be re-derived from scratch each session.
+grouping you merely considered — and never an option with an empty description
+([`reference.md`](reference.md) §G).
 
 ## 5. What to hand back
 
@@ -283,10 +318,9 @@ blocker, never a bare yes/no.** Below the table add only what it cannot: which r
 surfaces (§3), and any ranking tension you resolved (§2).
 
 **Do not dump the board, and do not render a second copy of it.** The `FILES:`/`ORDER:`/`WHY:`
-descriptions are written for the next session to read off the board, which already has a URL.
-
-Receipt: a session that had just written 19 ranked options echoed them all back in full, twice, before
-the user asked plainly for a table of what fits in one Claude session.
+descriptions are written for the next session to read off the board, which already has a URL — and
+with the §4 recipe they never enter the transcript in the first place, so echoing them back means
+fetching them on purpose to do it. Receipt: [`reference.md`](reference.md) §G.
 
 ## Anti-Patterns
 
