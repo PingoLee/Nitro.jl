@@ -72,7 +72,7 @@ import Nitro: ServerContext, path, text
 # Regression test for #68 item 2. `process_middleware` used to `push!` into the shared
 # lifecycle Set, and `setupmiddleware` called it — from `serve`
 # once, but from `internalrequest` ON EVERY CALL. That made a per-request path a concurrent
-# writer to a Set that `startup.`/`shutdown.` broadcast over (src/core.jl).
+# writer to a Set that `startup.`/`shutdown.` broadcast over (src/core/lifecycle.jl).
 #
 # The fix is not a lock. `internalrequest` never reaches `startup.` — that lives only in
 # `startserver` — so anything it registered got an `on_shutdown` at the next `terminate`
@@ -402,7 +402,7 @@ end
 
 # NOTE on scope. The two testsets below pin the CONTAINER — that it is ordered, and that the
 # order is reproducible — which is #74 item 1's root cause. They do NOT pin `terminate`'s
-# reversal, because they supply the `Iterators.reverse` themselves; swapping `src/core.jl` to
+# reversal, because they supply the `Iterators.reverse` themselves; swapping `src/core/lifecycle.jl` to
 # FIFO leaves them green. The assertion that actually pins the teardown contract is
 # `order == ["up:route", "up:serve", "down:serve", "down:route"]` in the
 # "route-owned hooks survive a serve/terminate cycle" item above, which drives the real

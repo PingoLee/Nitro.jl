@@ -312,7 +312,15 @@ any code that must not touch the global.
 | Path | Role |
 |------|------|
 | `src/Nitro.jl` | Package root — include chain, the `CONTEXT[]` singleton, and the public `export` surface |
-| `src/core.jl` | `Core` module — `serve`/`terminate`, stream + request handling, error handling, static/SPA serving, and the **non-consuming response write path** |
+| `src/core.jl` | `Core` module hub — the submodule include chain, the accessor forward-declaration stubs, the public `export` surface, and the `src/core/` includes. No implementation of its own (#32) |
+| `src/core/request.jl` | Per-request caches and the exported request accessors — `getparams`/`getquery`/`getjson`/`getform`/`getfiles`/`getpost`/`getsession`/`getuser`/`getip`/`getpeerip`/`getcontext`, `payload` |
+| `src/core/transport.jl` | HTTP.jl v2 / Reseau internals: the stream-request shim, `_conn_fd`/`_peer_ip`, the **non-consuming response write path** (`_write_response_body!`), and the stream handlers |
+| `src/core/framework_middleware.jl` | The Core-owned layers `setupmiddleware` installs: `AccessLogMiddleware`, `PrefixStripMiddleware`, `DefaultSerializer` |
+| `src/core/pipeline.jl` | Middleware assembly — `setupmiddleware`, `_app_context_seed` — and the in-process entry point `internalrequest` |
+| `src/core/lifecycle.jl` | Server lifecycle — `serve`/`terminate`/`startserver`, the startup banner, Revise wiring, and the secret-safe `NitroStreamHandler` `show` |
+| `src/core/parambinding.jl` | Per-parameter binding strategies (#37) and `create_param_parser` |
+| `src/core/registration.jl` | Route registration and handler introspection: `parse_route`, `parse_func_params`, `register`/`register_internal`, `registerhandler` |
+| `src/core/staticfiles.jl` | Static, SPA and dynamic mounts — `staticfiles`, `spafiles`, `dynamicfiles` |
 | `src/routing.jl` | Django-style routing: `path`, `urlpatterns`, `include_routes`, `url`, the path-converter registry |
 | `src/routerhof.jl` | Higher-order router internals (`HOFRouter`) — plumbing, not public API |
 | `src/context.jl` | `AppContext` module — `ServerContext`, app-context storage, extension slots, lifecycle services |

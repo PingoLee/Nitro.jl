@@ -49,7 +49,7 @@ The tier is **high**, however small the diff looks, if it touches any of:
 |---|---|
 | `src/Auth.jl`, `src/Auth/`, `src/crypto.jl`, `src/cookies.jl` | authentication, JWT, password hashing, signed/encrypted cookies |
 | `src/middleware/` — session, CSRF, guards, CORS, rate limiting | an authorization bypass here is silent |
-| `src/core.jl` — stream handling, the response write path, error handling | load-bearing for the whole suite; see [nitro-core §4](../../instructions/nitro-core.instructions.md) |
+| `src/core.jl`, `src/core/` — stream handling, the response write path, error handling | load-bearing for the whole suite; see [nitro-core §4](../../instructions/nitro-core.instructions.md) |
 | Worker authorization — `user_id` checks, `AbstractWorkerStore` | [workers §2](../../instructions/workers.instructions.md) |
 | Anything concurrency-shaped — shared mutable state, `Threads.@spawn`, service registries, `src/context.jl` | thread-count-dependent failures are a known class |
 | An `UPGRADING.md` entry, a `[compat]` change, or a new public export | breaking-change surface |
@@ -227,7 +227,7 @@ the full suite, ask which of these your diff could reach:
 |---|---|
 | `test/aqua_tests.jl` | export a name with no definition, or add a `Project.toml` dep without a `[compat]` entry (also stale deps, piracy) |
 | `test/reexports_tests.jl` | change what Nitro re-exports from HTTP.jl |
-| `test/http_internals_contract_tests.jl` | touch `src/core.jl`'s `getproperty` overrides or the body hierarchy in `src/utilities/bodyparsers.jl`, or move the `HTTP = "~2.6"` pin |
+| `test/http_internals_contract_tests.jl` | touch `src/core/transport.jl`'s `getproperty` overrides or the body hierarchy in `src/utilities/bodyparsers.jl`, or move the `HTTP = "~2.6"` pin |
 | `test/upgrade_guide_tests.jl` | **add or edit an `UPGRADING.md` entry** — two of its testsets parse the *shipped* file |
 | `test/precompilation_test.jl` | change route registration from a downstream package's `__init__()`, or `serve()`/`terminate()` startup |
 | `test/middleware/shared_response_mutation_tests.jl` | change `Cors`, `SessionMiddleware`, or the `*_response_headers` helpers — **not** a net for new middleware |

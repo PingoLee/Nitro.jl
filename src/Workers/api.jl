@@ -309,7 +309,7 @@ end
 # yields therefore starved every other coroutine on that thread, including the requests
 # `parallel_stream_handler` had scheduled there, which is exactly the stall workers exist to
 # prevent. `Threads.@spawn` creates a migratable task on the `:default` pool, which is the model
-# nitro-core §2 asks for and the one `src/core.jl` already uses per request (#39).
+# nitro-core §2 asks for and the one `src/core/transport.jl` already uses per request (#39).
 #
 # What made this unlandable before was not thread affinity but exception injection: cancellation
 # and timeout used to `schedule(…, error=true)` into this task, which is undefined behaviour

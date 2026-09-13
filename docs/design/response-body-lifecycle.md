@@ -48,7 +48,7 @@ remainder — not a bug awaiting a fix (HTTP.jl #1272).
 ## 1.5. In Nitro, this footgun is neutralized in core
 
 Nitro does **not** use HTTP's consuming writer. Its custom stream adapter writes the
-body directly from `BytesBody.data` (`src/core.jl`, `_write_response_body!`):
+body directly from `BytesBody.data` (`src/core/transport.jl`, `_write_response_body!`):
 
 ```julia
 function _write_response_body!(stream::HTTP.Stream, body::HTTP.BytesBody)
@@ -217,7 +217,7 @@ layer expecting a later layer to still see it; if you need the bytes, materializ
 - Client response bodies (`HTTP.get(...).body`) are always materialized `Vector{UInt8}`
   — unaffected. The footgun is only **server responses built from a `String` and
   reused**, and Nitro neutralizes even that (§1.5).
-- Nitro specifics: `_write_response_body!` in `src/core.jl`; the non-mutating header
+- Nitro specifics: `_write_response_body!` in `src/core/transport.jl`; the non-mutating header
   helpers `own_response_headers` / `add_response_headers` in `src/utilities/misc.jl`
   (used by the CORS / session / CSRF / rate-limiter middleware); shared consts in
   `src/middleware/auth_middleware.jl`; guards in `test/http_internals_contract_tests.jl`,

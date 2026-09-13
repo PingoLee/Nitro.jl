@@ -44,7 +44,7 @@ end
 @testset "Nitro smoke test on Julia $(VERSION)" begin
 
     # ── 1. The package loads ──────────────────────────────────────────────────
-    # Not a formality on a new Julia. Nitro pirates `HTTP.queryparams` (src/core.jl) and
+    # Not a formality on a new Julia. Nitro pirates `HTTP.queryparams` (src/core/request.jl) and
     # treats type inference as an API property -- exactly the kind of thing a compiler or
     # Base change breaks. Reaching this line at all means load-time wiring survived.
     # (It used to also `@eval` a `Base.getproperty(::HTTP.Request, ::Symbol)` from

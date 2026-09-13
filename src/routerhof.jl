@@ -29,7 +29,7 @@ _has_layers(mw) = !isnothing(mw) && !isempty(mw)
 
 Flatten a middleware list to plain middleware functions, unwrapping each
 `LifecycleMiddleware` to its `.middleware`. **Pure — registers nothing.** This is what the
-per-request path (`setupmiddleware`, src/core.jl) uses.
+per-request path (`setupmiddleware`, src/core/pipeline.jl) uses.
 """
 function normalize_middleware(middleware::Vector) :: Vector{Function}
     processed = Function[]
@@ -114,7 +114,7 @@ Register every `LifecycleMiddleware` in `middleware` as **serve-owned** — decl
 server run, from the `serve(middleware = ...)` list. `terminate()` clears these, so
 `serve(middleware=[A]); terminate(); serve(middleware=[B])` does not also start `A` (#82).
 
-Call this ONLY from `serve` (src/core.jl), once per server.
+Call this ONLY from `serve` (src/core/lifecycle.jl), once per server.
 
 **Route ownership wins, in both directions.** A middleware object already route-owned is
 skipped here; and [`register_route_lifecycle!`](@ref) *promotes* — it removes the object from
@@ -143,7 +143,7 @@ end
 
 Copies of both lifecycle vectors, taken together under `lifecycle_lock` (#74).
 
-`startup.`/`shutdown.` (src/core.jl) broadcast over the result rather than over the live
+`startup.`/`shutdown.` (src/core/lifecycle.jl) broadcast over the result rather than over the live
 vectors, so an iteration can never overlap a `push!` from a concurrent registration — the
 `revise=:lazy` path that re-enters `urlpatterns` on a request-handling task. Copying rather than
 holding the lock across the hooks is deliberate: a user `on_startup` can block for as long as it

@@ -6,7 +6,7 @@ import Nitro
 # ── Canary for Nitro's coupling to HTTP.jl v2 private/undocumented surface ──────
 #
 # Nitro reaches into the HTTP internals asserted below from:
-#   • src/core.jl — `_buffered_stream_request`, and `getfield(req, :context)` on the raw
+#   • src/core/ — `_buffered_stream_request`, and `getfield(req, :context)` on the raw
 #       `HTTP.RequestContext` (`request_input`, `Types.request_cache!`).
 #   • `_request_context_metadata!` — reached TRANSITIVELY, which is why it is still canaried
 #       below. Nitro no longer calls it directly (the wrapper that did died with #151), but
@@ -92,7 +92,7 @@ end
     @test isdefined(HTTP, :_close_idle_conns!)
 end
 
-@testset "`reuseaddr` is a Server knob (src/core.jl `preprocesskwargs`)" begin
+@testset "`reuseaddr` is a Server knob (src/core/lifecycle.jl `preprocesskwargs`)" begin
     # Nitro injects `reuseaddr=false` on Windows, where SO_REUSEADDR lets a second process
     # bind a port another is actively listening on. It travels as a `listen!` kwarg and has
     # to land on this field, which `test/server_lifecycle_tests.jl` asserts against.
@@ -100,7 +100,7 @@ end
     @test fieldtype(HTTP.Server, :reuseaddr) === Bool
 end
 
-@testset "peer-IP field chain still present (src/core.jl `_peer_ip`/`_conn_fd`)" begin
+@testset "peer-IP field chain still present (src/core/transport.jl `_peer_ip`/`_conn_fd`)" begin
     # `_peer_ip` reaches `stream.tracked.conn.fd.raddr` for TCP and
     # `stream.tracked.conn.tcp.fd.raddr` for TLS. A silent rename anywhere on this
     # chain would send every client's IP to loopback (collapsing rate-limit buckets,
@@ -157,7 +157,7 @@ end
     # `:version` is HTTP's own derivation from the proto fields …
     @test req.version == VersionNumber(Int(getfield(req, :proto_major)), Int(getfield(req, :proto_minor)))
     @test req.version isa VersionNumber
-    # … `:context` is dict-like (core.jl does `Base.get(req.context, :session, nothing)`) …
+    # … `:context` is dict-like (core/request.jl does `Base.get(req.context, :session, nothing)`) …
     @test Base.get(req.context, :__contract_probe__, :sentinel) === :sentinel
     # … and an unknown symbol falls through to the real field.
     @test req.method == "GET"
