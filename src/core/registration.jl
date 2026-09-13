@@ -162,19 +162,19 @@ function parse_func_params(route::String, func::Function; type_hints::Dict{Symbo
     )
 end
 
-function register(ctx::ServerContext, httpmethod::String, route::Union{String,HOFRouter}, func::Function; type_hints::Dict{Symbol, Type}=Dict{Symbol, Type}())
+function register(ctx::App, httpmethod::String, route::Union{String,HOFRouter}, func::Function; type_hints::Dict{Symbol, Type}=Dict{Symbol, Type}())
     route = parse_route(httpmethod, route)
     func_details = parse_func_params(route, func; type_hints)
     registerhandler(ctx, ctx.service.router, httpmethod, route, func, func_details)
 end
 
-function register_internal(ctx::ServerContext, router::Router, httpmethod::String, route::Union{String,HOFRouter}, func::Function; type_hints::Dict{Symbol, Type}=Dict{Symbol, Type}())
+function register_internal(ctx::App, router::Router, httpmethod::String, route::Union{String,HOFRouter}, func::Function; type_hints::Dict{Symbol, Type}=Dict{Symbol, Type}())
     route = parse_route(httpmethod, route)
     func_details = parse_func_params(route, func; type_hints)
     registerhandler(ctx, router, httpmethod, route, func, func_details)
 end
 
-function registerhandler(ctx::ServerContext, router::Router, httpmethod::String, route::String, func::Function, func_details::NamedTuple)
+function registerhandler(ctx::App, router::Router, httpmethod::String, route::String, func::Function, func_details::NamedTuple)
     method = first(methods(func))
     no_args = method.nargs == 1
 

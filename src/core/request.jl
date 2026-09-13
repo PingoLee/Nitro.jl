@@ -295,7 +295,7 @@ end
 # payload — or `missing` when none was configured.
 #
 # `missing` rather than `nothing` on purpose: this is the request-side replacement for
-# reading `ServerContext.app_context[]`, whose empty value is `Ref{Any}(missing)`
+# reading `App.app_context[]`, whose empty value is `Ref{Any}(missing)`
 # (src/context.jl). Keeping the sentinel identical is what lets the parameter-binding
 # strategies and `extract` switch over without touching their own emptiness tests.
 #

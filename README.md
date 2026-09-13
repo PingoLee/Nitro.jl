@@ -264,8 +264,8 @@ serve(
 )
 ```
 
-If you need to prepare workers outside server startup, use `Nitro.Workers.start!(ctx; ...)`
-with a `ServerContext` directly.
+If you need to prepare workers outside server startup, use `Nitro.Workers.start!(app; ...)`
+with an `App` directly.
 
 ## Session Middleware
 

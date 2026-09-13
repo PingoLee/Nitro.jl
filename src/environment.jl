@@ -2,8 +2,8 @@ module Environment
 ## Nitro's resolved runtime environment (#55).
 ##
 ## The environment is a property of the OS PROCESS, not of an application instance: a single
-## Julia process cannot be `prod` and `test` at once the way it can host two `ServerContext`s.
-## That is why resolution lives here as a free function rather than on `ServerContext`, and why
+## Julia process cannot be `prod` and `test` at once the way it can host two `App`s.
+## That is why resolution lives here as a free function rather than on `App`, and why
 ## #55 lands independently of the app-as-an-object question (#31/#37). Phoenix draws the same
 ## line with `Mix.env()`.
 

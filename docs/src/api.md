@@ -3,6 +3,7 @@
 ## Server
 
 ```@docs
+App
 serve
 terminate
 internalrequest

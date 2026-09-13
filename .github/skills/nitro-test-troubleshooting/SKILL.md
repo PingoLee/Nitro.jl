@@ -91,7 +91,7 @@ The suite compensates with an **explicit, hand-ordered `TEST_FILES` list**, whic
   but it is now caught before merge rather than never.
 - If your item registers routes, either give paths a prefix unique to that item, or call
   `resetstate()` — but be aware `resetstate()` clears state a *later* item may have expected.
-- Prefer `instance(...)` or the explicit `(ctx::ServerContext, …)` methods to keep a test off the
+- Prefer an explicit `App(mod = @__MODULE__)` and the `(app::App, …)` methods to keep a test off the
   global router entirely. This is the durable fix, not a workaround.
 
 **Diagnosis:** run the file alone (`julia --project=. test/runtests.jl test/<file>.jl`). Green alone
@@ -211,8 +211,9 @@ Items tagged `:network` bind real sockets. Failure shapes:
 server started by another test item is running in the same process, the two race and either can see
 the other's context ([#31](https://github.com/PingoLee/Nitro.jl/issues/31)).
 
-Symptom: a handler reads someone else's config, intermittently. Fix: use `instance(...)` or an
-explicit `ServerContext`, and don't interleave `internalrequest(context=…)` with a running server.
+Symptom: a handler reads someone else's config, intermittently. Fix: give each app its own
+`App`. (The `internalrequest(context=…)` half of this was fixed in #31 — it no longer writes
+shared state — but two tests sharing one app still share a router.)
 
 ### 7. `--workers N` is refused for N > 1
 
@@ -276,5 +277,5 @@ The guard exists because router state is process-global. It comes out when
 - Calling `resetstate()` inside an item to fix your own failure without checking what later items
   depend on.
 - "Fixing" an ordering failure by reordering `TEST_FILES` when the real fix is to take the test off
-  the global router (`instance(...)` or an explicit `ServerContext`).
+  the global router (give the test its own `App`).
 - Reporting a suite as passing when only a tag subset was run — say which slice you ran.

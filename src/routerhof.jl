@@ -3,7 +3,7 @@
 using HTTP
 
 using ..Util: join_url_path
-using ..AppContext: ServerContext
+using ..AppContext: App
 using ..Types: Nullable, LifecycleMiddleware, CopyOnWriteDict, snapshot,
                 cache_if_current!, publish!
 
@@ -40,7 +40,7 @@ function normalize_middleware(middleware::Vector) :: Vector{Function}
 end
 
 """
-    register_route_lifecycle!(ctx::ServerContext, middleware::Vector) -> ServerContext
+    register_route_lifecycle!(ctx::App, middleware::Vector) -> App
 
 Register every `LifecycleMiddleware` in `middleware` as **route-owned** — declared by the
 context at `urlpatterns()`/`router()` time. These survive `terminate()` and are started again
@@ -82,7 +82,7 @@ Dedup is load-bearing, and moving off `Set` is what makes it explicit rather tha
 one shared `RateLimiter()` passed to N routes is one registration, so its cleanup task starts
 once, not N times. `∉` on a single-digit vector costs nothing.
 """
-function register_route_lifecycle!(ctx::ServerContext, middleware::Vector)
+function register_route_lifecycle!(ctx::App, middleware::Vector)
     lock(ctx.service.lifecycle_lock) do
         for mw in middleware
             mw isa LifecycleMiddleware || continue
@@ -108,7 +108,7 @@ function register_route_lifecycle!(ctx::ServerContext, middleware::Vector)
 end
 
 """
-    register_serve_lifecycle!(ctx::ServerContext, middleware::Vector) -> ServerContext
+    register_serve_lifecycle!(ctx::App, middleware::Vector) -> App
 
 Register every `LifecycleMiddleware` in `middleware` as **serve-owned** — declared by this
 server run, from the `serve(middleware = ...)` list. `terminate()` clears these, so
@@ -127,7 +127,7 @@ Route is the winning side because the entry then survives `terminate()`, which i
 #82 exists to restore — a shared object passed both to a route and to `serve(middleware = ...)`
 is still, in the app's own terms, that route's middleware.
 """
-function register_serve_lifecycle!(ctx::ServerContext, middleware::Vector)
+function register_serve_lifecycle!(ctx::App, middleware::Vector)
     lock(ctx.service.lifecycle_lock) do
         for mw in middleware
             mw isa LifecycleMiddleware || continue
@@ -139,7 +139,7 @@ function register_serve_lifecycle!(ctx::ServerContext, middleware::Vector)
 end
 
 """
-    lifecycle_snapshot(ctx::ServerContext) -> (route, serve)
+    lifecycle_snapshot(ctx::App) -> (route, serve)
 
 Copies of both lifecycle vectors, taken together under `lifecycle_lock` (#74).
 
@@ -149,21 +149,21 @@ vectors, so an iteration can never overlap a `push!` from a concurrent registrat
 holding the lock across the hooks is deliberate: a user `on_startup` can block for as long as it
 likes, and it must not be able to deadlock route registration by doing so.
 """
-function lifecycle_snapshot(ctx::ServerContext)
+function lifecycle_snapshot(ctx::App)
     return lock(ctx.service.lifecycle_lock) do
         (copy(ctx.service.route_lifecycle), copy(ctx.service.serve_lifecycle))
     end
 end
 
 """
-    process_middleware(ctx::ServerContext, middleware) -> Vector{Function}
+    process_middleware(ctx::App, middleware) -> Vector{Function}
 
 Registration-path helper: [`register_route_lifecycle!`](@ref) then
 [`normalize_middleware`](@ref). Semantics unchanged by #68 — the per-request path stopped
 calling *this*; it did not change what this does. Route-owned is the right half for every
 caller of this function: all of them are route-registration paths (#82).
 """
-function process_middleware(ctx::ServerContext, middleware::Vector) :: Vector{Function}
+function process_middleware(ctx::App, middleware::Vector) :: Vector{Function}
     register_route_lifecycle!(ctx, middleware)
     return normalize_middleware(middleware)
 end
@@ -178,7 +178,7 @@ end
 # those entries contribute zero layers but make the table permanently non-empty, which defeats
 # `compose`'s per-request fast path for the whole app — every request would then pay a second
 # `gethandler` for nothing.
-function process_middleware(::ServerContext, ::Nothing) end
+function process_middleware(::App, ::Nothing) end
 
 
 """
@@ -234,7 +234,7 @@ cachetag(catch_errors::Bool, show_errors::Bool, serialize::Bool)::String =
 const CACHE_TAGS = ntuple(i -> cachetag(isodd((i - 1) >> 2), isodd((i - 1) >> 1), isodd(i - 1)), 8)
 
 """
-    publish_route_middleware!(ctx::ServerContext, key::String, value::Tuple) -> Tuple
+    publish_route_middleware!(ctx::App, key::String, value::Tuple) -> Tuple
 
 Register `value` — a `(router middleware, route middleware)` pair — as the middleware for route
 `key`, and invalidate any chain already cached for it.
@@ -276,7 +276,7 @@ rests on — `delete!` must keep taking the lock even when the key is absent —
 Both halves are still needed. `delete!` handles the chain cached *before* registration; the
 identity check handles the chain built before but published after it.
 """
-function publish_route_middleware!(ctx::ServerContext, key::String, value::Tuple)
+function publish_route_middleware!(ctx::App, key::String, value::Tuple)
     publish!(ctx.service.custommiddleware, key, value)
     # Every settings variant, not just one (#79): the cache is keyed on route + pipeline
     # settings, so a route can hold up to `length(CACHE_TAGS)` chains and invalidation has to
@@ -476,7 +476,7 @@ This functions assists registering routes with a specific prefix.
 You can optionally assign tags either at the prefix and/or route level which
 are used to group and organize the autogenerated documentation
 """
-function router(ctx::ServerContext, prefix::String="";
+function router(ctx::App, prefix::String="";
     tags::Vector{String}=Vector{String}(),
     middleware::Nullable{Vector}=nothing)
 
@@ -509,7 +509,7 @@ end
 The router() function itself can be passed to routes and returns the OuterRouter struct
 """
 struct OuterRouter <: HOFRouter
-    ctx::ServerContext
+    ctx::App
     prefix::String
     tags::Vector{String}
     middleware::Nullable{Vector}
@@ -543,7 +543,7 @@ The "repeat()" function returns the InnerRouter function
 
 """
 struct InnerRouter <: HOFRouter
-    ctx::ServerContext
+    ctx::App
     outer::OuterRouter
     path::Union{Nothing, String}
     tags::Vector{String}

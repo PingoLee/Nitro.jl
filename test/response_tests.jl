@@ -219,7 +219,7 @@ using HTTP
 import JSON
 
 using Nitro
-import Nitro: ServerContext
+import Nitro: App
 
 # `Res.html`/`Res.send`/`Res.json` deliberately set NO `Content-Length` header (#28): HTTP.jl
 # computes `content_length` from the body and writes the header itself at serialization time, so a
@@ -227,16 +227,16 @@ import Nitro: ServerContext
 # path -- asserting it on the response object in-process proves nothing, so it has to go over a
 # socket. Bodies are deliberately multi-byte: a character count would be wrong here, a byte count right.
 #
-# Isolation: a fresh `ServerContext` rather than the global `CONTEXT[]`, so this cannot perturb the
-# shared router the rest of the suite depends on. (`instance()` would isolate too, but it re-evals a
-# whole second copy of the Nitro module into an anonymous module that is never freed.)
+# Isolation: a fresh `App` rather than the global `CONTEXT[]`, so this cannot perturb the
+# shared router the rest of the suite depends on. (`instance()` used to be the other way to do
+# this; #31 deleted it -- a fresh `App` is the supported form and costs no recompile.)
 
 const BODY_HTML = "<p>héllo — wörld</p>"
 const BODY_TEXT = "héllo — wörld ✓"
 # One key on purpose: with two, `JSON.json` ordering would make the expected string flaky.
 const BODY_JSON = Dict("gruß" => "wörld")
 
-ctx = ServerContext()
+ctx = App()
 Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
     path("/page",  (req::HTTP.Request) -> Res.html(BODY_HTML)),
     path("/plain", (req::HTTP.Request) -> Res.send(BODY_TEXT)),

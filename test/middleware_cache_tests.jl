@@ -248,10 +248,10 @@ using Random: randperm
 using Nitro
 using Nitro.Core.Types: snapshot
 using Nitro.Core.RouterHOF: cachetag
-import Nitro: ServerContext
+import Nitro: App
 
 # Companion to the unit item above: drives the real `compose` fast path (src/routerhof.jl)
-# on a LOCAL ServerContext, so this item touches no global CONTEXT[] router state and is
+# on a LOCAL App, so this item touches no global CONTEXT[] router state and is
 # order-independent within runtests.jl.
 #
 # One precondition to reach the cache: caching is on only when there is no per-call global
@@ -288,7 +288,7 @@ function tagging_middleware(tag::String)
     end
 end
 
-ctx = ServerContext()
+ctx = App()
 Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
     path("/warm/$i", (req::HTTP.Request) -> Res.send("handler-$i"),
          middleware = [tagging_middleware("route-$i")])
@@ -354,7 +354,7 @@ end
     factory_calls = Ref(0)
     counting_mw = handler -> (factory_calls[] += 1; req -> handler(req))
 
-    ctx2 = ServerContext()
+    ctx2 = App()
     Nitro.Core.Routing.urlpatterns(ctx2, "", Nitro.RouteDefinition[
         path("/once", (req::HTTP.Request) -> Res.send("ok"), middleware = [counting_mw])
     ])
@@ -377,7 +377,7 @@ using HTTP
 using Nitro
 using Nitro.Core.Types: snapshot
 using Nitro.Core.RouterHOF: cachetag, CACHE_TAGS, genkey
-import Nitro: ServerContext, path, text
+import Nitro: App, path, text
 
 # Regression test for #79. `middleware_cache` lives on `ctx.service` and outlives any single
 # pipeline, but the chain it stores closes over `handler` — the fold accumulator, which is
@@ -394,7 +394,7 @@ import Nitro: ServerContext, path, text
 # against a shared context.
 
 @testset "a later internalrequest's catch_errors is honoured" begin
-    ctx = ServerContext()
+    ctx = App()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/boom", (req::HTTP.Request) -> error("kaboom"),
              middleware = [handler -> (req::HTTP.Request -> handler(req))]),
@@ -412,7 +412,7 @@ import Nitro: ServerContext, path, text
 end
 
 @testset "the two settings variants coexist as distinct entries" begin
-    ctx = ServerContext()
+    ctx = App()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/ok", (req::HTTP.Request) -> Res.send("h"),
              middleware = [handler -> (req::HTTP.Request -> handler(req))]),
@@ -429,7 +429,7 @@ end
 end
 
 @testset "serialize=false is its own variant" begin
-    ctx = ServerContext()
+    ctx = App()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/s", (req::HTTP.Request) -> Res.send("h"),
              middleware = [handler -> (req::HTTP.Request -> handler(req))]),
@@ -445,7 +445,7 @@ end
     # The batch `delete!`. Invalidating only the variant that happens to match the registering
     # caller's settings would leave the others stranded — #71's symptom for every OTHER
     # pipeline, which is exactly the failure a per-key invalidation would reintroduce.
-    ctx = ServerContext()
+    ctx = App()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/other", (req::HTTP.Request) -> Res.send("o"),
              middleware = [handler -> (req::HTTP.Request -> handler(req))]),
@@ -485,7 +485,7 @@ end
     # invariant instead: a future "shorten the common tag" optimization trips here.
     @test all(length(t) == 4 for t in CACHE_TAGS)
 
-    ctx = ServerContext()
+    ctx = App()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/a", (req::HTTP.Request) -> Res.send("plain"),
              middleware = [handler -> (req::HTTP.Request -> handler(req))]),

@@ -136,15 +136,15 @@ This is the simplest setup for most Nitro applications.
 
 ## Manual Startup
 
-If your app needs explicit bootstrap control, use `Nitro.Workers.start!(ctx; ...)` with a `ServerContext`.
+If your app needs explicit bootstrap control, use `Nitro.Workers.start!(app; ...)` with an [`App`](@ref).
 
 ```julia
 using Nitro
 
-ctx = Nitro.CONTEXT[]
+app = App(mod = @__MODULE__)
 
 Nitro.Workers.start!(
-    ctx;
+    app;
     queues=["reports", "imports"],
     cleanup_enabled=true,
     cleanup_interval_hours=24,

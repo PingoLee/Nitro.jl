@@ -100,7 +100,7 @@ const IGNORE_PREFIXES = String[
 # Check C: API names the docs rely on. If any is renamed/removed, the docs that
 # name it are wrong — fail until either the code or the docs are updated.
 const REQUIRED_SYMBOLS = String[
-    "worker_startup", "serve", "terminate", "resetstate", "internalrequest", "instance",
+    "worker_startup", "serve", "terminate", "resetstate", "internalrequest",
     "path", "urlpatterns", "include_routes", "url",
     "submit_task", "submit_sequential_task", "get_task_status", "cancel_task", "get_all_tasks",
     "set_queue_authorizer!", "set_watch_authorizer!", "scoped_task_key", "DEFAULT_QUEUE_NAME",

@@ -19,12 +19,13 @@ against the tradition that owns that layer, and say which one you are appealing 
 | Typed binding, authorization, app context | **Spring Boot** | Extractors (`Json{T}`, `Query{T}`, `Path{T}`, `Form{T}`, `MultipartForm{T}`) + `validate` are `@RequestBody`/`@RequestParam`/`@Valid`; `Principal` and the `claim_required`/`role_required`/`kid_required` guards are Spring Security's declarative model; typed app-config structs are `@ConfigurationProperties` |
 
 **Where the lineages disagree, Spring's application-context model is the tiebreaker for lifecycle.**
-Nitro carries a process-wide `CONTEXT[]` singleton (`src/Nitro.jl`, `src/methods.jl`) that Django and
-Express both tolerate but Spring does not: an `ApplicationContext` is an *object*, so several can
-coexist and tests get their own. Nitro's `ServerContext` already supports that — the singleton is the
-legacy convenience layer on top. Prefer the explicit `(ctx::ServerContext, …)` methods in new code,
-and treat "make the app an object" proposals as aligned with the intended direction
-([#31](https://github.com/PingoLee/Nitro.jl/issues/31)), not as churn.
+Django and Express both tolerate a process-wide singleton; Spring does not, because an
+`ApplicationContext` is an *object*, so several can coexist and tests get their own. Nitro followed
+Spring here in [#31](https://github.com/PingoLee/Nitro.jl/issues/31): **`App` is the public
+application handle**, and every routing, serving and cookie function takes one as its first argument
+(`app = App(mod = @__MODULE__)`). The `CONTEXT[]` singleton (`src/Nitro.jl`, `src/methods.jl`)
+remains only as the argument-less convenience layer over one app — prefer an explicit `App` in new
+code and in tests.
 
 Julia adds a constraint none of them have: **precompilation and type stability are part of the API
 design**, not an optimization pass. A choice that is idiomatic in Express but forces `Any` through
@@ -305,9 +306,13 @@ abstract type, a constant, an exception type — belongs in `src/types.jl`, `src
 `src/errors.jl`, not part-way down the chain, or modules included earlier cannot name it.
 
 **`src/methods.jl` is where the API is coupled to global state.** The top-level convenience methods
-bind to the process-wide `CONTEXT[]` singleton declared in `src/Nitro.jl`. Every context-taking
-function has a `(ctx::ServerContext, …)` method underneath it — reach for that form in tests and in
+bind to the process-wide `CONTEXT[]` singleton declared in `src/Nitro.jl`. Every one of them also
+has an `(app::App, …)` method defined **in that same file** — reach for that form in tests and in
 any code that must not touch the global.
+
+That placement is load-bearing, not incidental: `methods.jl` defines these names inside `Nitro`, so
+they **shadow** the same-named functions `using .Core` brings in. An `(app, …)` method added only in
+`Core` is unreachable through `using Nitro`. Add it here.
 
 | Path | Role |
 |------|------|
@@ -323,9 +328,8 @@ any code that must not touch the global.
 | `src/core/staticfiles.jl` | Static, SPA and dynamic mounts — `staticfiles`, `spafiles`, `dynamicfiles` |
 | `src/routing.jl` | Django-style routing: `path`, `urlpatterns`, `include_routes`, `url`, the path-converter registry |
 | `src/routerhof.jl` | Higher-order router internals (`HOFRouter`) — plumbing, not public API |
-| `src/context.jl` | `AppContext` module — `ServerContext`, app-context storage, extension slots, lifecycle services |
-| `src/instances.jl` | `Instances` module — `instance()` for a self-contained router/server per module |
-| `src/methods.jl` | Top-level convenience methods bound to the global `CONTEXT[]` |
+| `src/context.jl` | `AppContext` module — the public **`App`** handle and its secret-safe `show`, plus `Service`, app-context storage, extension slots, lifecycle services |
+| `src/methods.jl` | The `(app::App, …)` public surface **and** the argument-less conveniences bound to the global `CONTEXT[]`. Both live here because definitions in `Nitro` shadow `Core`'s |
 | `src/types.jl`, `src/constants.jl`, `src/errors.jl` | Shared vocabulary: `Nullable`, `Principal`, HTTP method constants, `ValidationError`/`CookieError`/`AuthorizationError` |
 | `src/environment.jl` | `Environment` module — `current_env()`, the `NITRO_ENV`/`GENIE_ENV` precedence and its closed value set. Reports the environment; deliberately gates nothing (#55) |
 | `src/response.jl` | The `Res` module — the response builders handlers use: `json`, `html`, `send`, `status`, `file`, `redirect` |

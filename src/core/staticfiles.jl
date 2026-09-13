@@ -3,7 +3,7 @@
 # Included into `module Core` by src/core.jl — not a submodule; see the hub for why.
 
 function staticfiles(
-    ctx::ServerContext,
+    ctx::App,
     router::HTTP.Router,
     folder::String,
     mountdir::String="static";
@@ -21,7 +21,7 @@ function staticfiles(
 end
 
 function spafiles(
-    ctx::ServerContext,
+    ctx::App,
     router::HTTP.Router,
     folder::String,
     mountdir::String="static";
@@ -78,7 +78,7 @@ function spafiles(
 end
 
 function dynamicfiles(
-    ctx::ServerContext,
+    ctx::App,
     router::Router,
     folder::String,
     mountdir::String="static";

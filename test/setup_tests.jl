@@ -10,7 +10,7 @@ using UUIDs
 using Sockets
 using Suppressor
 
-import Nitro: PACKAGE_DIR, ServerContext, Nullable, HOFRouter
+import Nitro: PACKAGE_DIR, App, Nullable, HOFRouter
 import Nitro: GET, POST, PUT, DELETE, PATCH, STREAM, WEBSOCKET
 
 export HOST

@@ -53,7 +53,7 @@ end
         @test isdefined(Nitro, :serve)
         @test isdefined(Nitro, :path)
         @test isdefined(Nitro, :json)
-        @test Nitro.Core.ServerContext() isa Nitro.Core.ServerContext
+        @test Nitro.Core.App() isa Nitro.Core.App
     end
 
     # ── 2. The request accessors still work ───────────────────────────────────
@@ -74,7 +74,7 @@ end
     # internal, so "a request came back with the right body" is a real assertion
     # about version compatibility, not a tautology.
     @testset "serves over a real socket" begin
-        ctx = Nitro.Core.ServerContext()
+        ctx = Nitro.Core.App()
         Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
             path("/ping", req -> "pong"),
             # Typed converter bound to a declared handler argument. Registration itself

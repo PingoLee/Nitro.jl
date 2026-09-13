@@ -1067,7 +1067,7 @@ using Nitro: Cookie
         # Test indirectly by verifying the context is properly initialized
         # Note: We can't actually call serve() here as it would block,
         # but we can verify the initialization logic
-        ctx = Nitro.Core.ServerContext()
+        ctx = Nitro.Core.App()
         
         # Simulate what serve() does
         secret_key = "serve-test-key-1234567890123456"

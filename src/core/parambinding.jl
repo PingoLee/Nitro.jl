@@ -16,9 +16,9 @@
 # replaces is Spring's `HandlerMethodArgumentResolver`, which only survives on JIT
 # devirtualization the Julia runtime does not do. nitro-core §7.
 #
-# `ServerContext` is a concrete struct, so carrying it by value costs no indirection.
+# `App` is a concrete struct, so carrying it by value costs no indirection.
 
-# Carries no `ServerContext` (#31): the app context now travels on the request, so this
+# Carries no `App` (#31): the app context now travels on the request, so this
 # strategy is stateless and reads the same carrier every other consumer does. Returns the
 # `Context{T}` WRAPPER, not the payload — the bound parameter is declared `ctx::Context{T}`
 # and the handler unwraps it itself.
@@ -32,14 +32,14 @@ end
 
 struct CookieStrategy{T}
     param::Param{T}
-    ctx::ServerContext
+    ctx::App
 end
 (s::CookieStrategy)(lr::LazyRequest) =
     extract(s.param, lr, s.ctx.service.cookies[].secret_key)
 
 struct SessionStrategy{T}
     param::Param{T}
-    ctx::ServerContext
+    ctx::App
 end
 (s::SessionStrategy)(lr::LazyRequest) =
     extract(s.param, lr, s.ctx.service.cookies[].secret_key, request_app_context(lr.request))
@@ -101,7 +101,7 @@ function _make_param_parser(strats::S) where {S<:Tuple}
     end
 end
 
-function create_param_parser(ctx::ServerContext, func_details)
+function create_param_parser(ctx::App, func_details)
     info = func_details.info
     pathparams = func_details.pathnames
     queryparams = func_details.querynames

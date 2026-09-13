@@ -156,7 +156,7 @@ using .NitroTestHarness: TEST_FILES, KNOWN_TAGS, discover_test_files, testitems
 # the next `Pkg.test()` run — got answers from a server it never started.
 #
 # `terminate()` is a cheap no-op when nothing is serving. Items that use their own
-# `ServerContext`/`instance()` are NOT covered by this (it only reaches the global
+# `App` are NOT covered by this (it only reaches the global
 # `CONTEXT[]`) and must still clean up after themselves.
 const TEST_END = quote
     using Nitro

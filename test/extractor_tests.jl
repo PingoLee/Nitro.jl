@@ -676,7 +676,7 @@ using HTTP
 using Nitro
 using Nitro: path, FormFile, MultipartForm
 
-# Uses a *local* ServerContext + internalrequest, so this item mutates no global
+# Uses a *local* App + internalrequest, so this item mutates no global
 # router/server state and is safe to run in parallel with other test items.
 
 struct E2EUpload
@@ -717,7 +717,7 @@ function _multipart_request(target)
     return HTTP.Request("POST", target, ["Content-Type" => "multipart/form-data; boundary=$boundary"], take!(io))
 end
 
-ctx = Nitro.Core.ServerContext()
+ctx = Nitro.Core.App()
 Nitro.Core.Routing.urlpatterns(ctx, "/api", Nitro.RouteDefinition[
     path("/upload", upload_handler, method="POST"),
 ])
@@ -755,7 +755,7 @@ using Nitro: path
 struct PathBox;  v::String; end
 struct QueryBox; q::String; end
 
-ctx = Nitro.Core.ServerContext()
+ctx = Nitro.Core.App()
 Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
     path("/ext/{v}", (req, p::Nitro.Path{PathBox}, q::Nitro.Query{QueryBox}) ->
              Res.send("$(p.payload.v)|$(q.payload.q)"), method="GET"),

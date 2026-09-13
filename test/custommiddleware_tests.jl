@@ -3,7 +3,7 @@ using Test
 using HTTP
 using Nitro
 using Nitro.Core.Types: snapshot
-import Nitro: ServerContext, path, text
+import Nitro: App, path, text
 
 # Regression test for #68 item 1. `ctx.service.custommiddleware` maps a route key to that
 # route's `(router middleware, route middleware)` pair. It used to be a plain `Dict` written
@@ -15,7 +15,7 @@ import Nitro: ServerContext, path, text
 # install the NEW middleware, whereas a cached chain must never change identity. A port that
 # reached for `cache!` here passes every other test in the suite and fails this one.
 #
-# Local `ServerContext` throughout — no global `CONTEXT[]`, so these items are
+# Local `App` throughout — no global `CONTEXT[]`, so these items are
 # order-independent within runtests.jl.
 
 # `tag` MUST be captured. A factory returning `handler -> (req -> handler(req))` builds a
@@ -30,7 +30,7 @@ mkmw(tag) = handler -> (req::HTTP.Request -> Res.send(tag * "|" * text(handler(r
     mwA, mwB = mkmw("A"), mkmw("B")
     @test mwA !== mwB          # guards the tautology above; the rest is meaningless without it
 
-    ctx = ServerContext()
+    ctx = App()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/lww", (req::HTTP.Request) -> Res.send("h"), middleware = [mwA])
     ])
@@ -62,7 +62,7 @@ end
 
 @testset "the HOF router path publishes too" begin
     mwA, mwB = mkmw("A"), mkmw("B")
-    ctx = ServerContext()
+    ctx = App()
     Nitro.Core.router(ctx, "/hof"; middleware = [mwA])("/x")("GET")
     @test snapshot(ctx.service.custommiddleware)["GET|/hof/x"][1][1] === mwA
 
@@ -73,7 +73,7 @@ end
 end
 
 @testset "an unsynchronized publish is unwritable" begin
-    ctx = ServerContext()
+    ctx = App()
     @test_throws ConcurrencyViolationError ctx.service.custommiddleware.entries = Dict{String, Tuple}()
 end
 end
@@ -84,7 +84,7 @@ using Test
 using HTTP
 using Nitro
 using Nitro.Core.Types: snapshot
-import Nitro: ServerContext, path, text
+import Nitro: App, path, text
 
 # This is the configuration the #68 bug actually lives in, so it gets its own item.
 #
@@ -101,7 +101,7 @@ factory_calls = Ref(0)
 counting_mw = handler -> (factory_calls[] += 1; req::HTTP.Request -> handler(req))
 global_mw   = handler -> (req::HTTP.Request -> handler(req))
 
-ctx = ServerContext()
+ctx = App()
 Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
     path("/u/$i", (req::HTTP.Request) -> Res.send("h$i"), middleware = [mktag("r$i")])
     for i in 1:K
@@ -126,7 +126,7 @@ end
 end
 
 @testset "buildmiddleware runs once per request, not once per route" begin
-    ctx2 = ServerContext()
+    ctx2 = App()
     Nitro.Core.Routing.urlpatterns(ctx2, "", Nitro.RouteDefinition[
         path("/counted", (req::HTTP.Request) -> Res.send("ok"), middleware = [counting_mw])
     ])
@@ -146,7 +146,7 @@ end
     # compose time the table freezes for the life of the server and routes registered later
     # — Revise re-running `urlpatterns` — silently lose their middleware, with no error and
     # no other failing test.
-    ctx3 = ServerContext()
+    ctx3 = App()
     Nitro.Core.Routing.urlpatterns(ctx3, "", Nitro.RouteDefinition[
         path("/first", (req::HTTP.Request) -> Res.send("h1"), middleware = [mktag("r1")])
     ])
@@ -274,7 +274,7 @@ using Test
 using HTTP
 using Nitro
 using Nitro.Core.Types: snapshot
-import Nitro: ServerContext, path, text
+import Nitro: App, path, text
 
 # Regression test for #71. `setupmiddleware` used to decide ONCE whether to install
 # `compose`, gated on `custommiddleware` being non-empty — and `serve` calls it once. So an
@@ -294,7 +294,7 @@ mktag(tag) = handler -> (req::HTTP.Request -> Res.send(tag * "|" * text(handler(
 plain_global = handler -> (req::HTTP.Request -> handler(req))
 
 @testset "middleware registered after composition runs (use_cache == true)" begin
-    ctx = ServerContext()
+    ctx = App()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/plain", (req::HTTP.Request) -> Res.send("plain"))
     ])
@@ -318,7 +318,7 @@ plain_global = handler -> (req::HTTP.Request -> handler(req))
 end
 
 @testset "same at use_cache == false" begin
-    ctx = ServerContext()
+    ctx = App()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/plain", (req::HTTP.Request) -> Res.send("plain"))
     ])
@@ -337,35 +337,35 @@ end
     # `custommiddleware` permanently non-empty and kill the fast path above for EVERY request in
     # the application. Both registrars must gate on non-empty, not merely non-`nothing` — an
     # explicit `[]` normalizes to `Function[]`, which is not `nothing`.
-    ctx = ServerContext()
+    ctx = App()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/a", (req::HTTP.Request) -> Res.send("a"), middleware = [])
     ])
     @test isempty(snapshot(ctx.service.custommiddleware))
 
-    hof = ServerContext()
+    hof = App()
     Nitro.Core.router(hof, "/hof"; middleware = [])("/x")("GET")
     @test isempty(snapshot(hof.service.custommiddleware))
 
-    inner = ServerContext()
+    inner = App()
     Nitro.Core.router(inner, "/hof")("/x"; middleware = [])("GET")
     @test isempty(snapshot(inner.service.custommiddleware))
 
     # ...and real middleware still publishes, through both registrars.
     real_mw = handler -> (req::HTTP.Request -> handler(req))
-    r1 = ServerContext()
+    r1 = App()
     Nitro.Core.Routing.urlpatterns(r1, "", Nitro.RouteDefinition[
         path("/a", (req::HTTP.Request) -> Res.send("a"), middleware = [real_mw])
     ])
     @test !isempty(snapshot(r1.service.custommiddleware))
 
-    r2 = ServerContext()
+    r2 = App()
     Nitro.Core.router(r2, "/hof"; middleware = [real_mw])("/x")("GET")
     @test !isempty(snapshot(r2.service.custommiddleware))
 end
 
 @testset "nothing is cached while the table is empty" begin
-    ctx = ServerContext()
+    ctx = App()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/a", (req::HTTP.Request) -> Res.send("a")),
         path("/b", (req::HTTP.Request) -> Res.send("b")),
@@ -384,7 +384,7 @@ using Test
 using HTTP
 using Nitro
 using Nitro.Core.Types: snapshot
-import Nitro: ServerContext, path, text
+import Nitro: App, path, text
 
 # `compose`'s unmatched-route path used to `return handler(req)`, and `handler` is the fold
 # accumulator — the serializer wrapping the router — which contains NO global middleware
@@ -406,7 +406,7 @@ counting(ref) = handler -> (req::HTTP.Request -> (ref[] += 1; handler(req)))
     hits = Ref(0)
 
     # compose IS installed (this ctx has per-route middleware)
-    with_mw = ServerContext()
+    with_mw = App()
     Nitro.Core.Routing.urlpatterns(with_mw, "", Nitro.RouteDefinition[
         path("/has", (req::HTTP.Request) -> Res.send("ok"),
              middleware = [h -> (q::HTTP.Request -> h(q))])
@@ -418,7 +418,7 @@ counting(ref) = handler -> (req::HTTP.Request -> (ref[] += 1; handler(req)))
     @test hits[] == 1          # 0 on unpatched main
 
     # control: no per-route middleware anywhere
-    without_mw = ServerContext()
+    without_mw = App()
     Nitro.Core.Routing.urlpatterns(without_mw, "", Nitro.RouteDefinition[
         path("/has", (req::HTTP.Request) -> Res.send("ok"))
     ])
@@ -434,7 +434,7 @@ end
     # `missing !== nothing`, so a 405 used to take the *matched* branch: it keyed on the
     # empty path and wrote a junk "POST|" entry into the middleware cache.
     hits = Ref(0)
-    ctx = ServerContext()
+    ctx = App()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/only-get", (req::HTTP.Request) -> Res.send("ok"), method = "GET",
              middleware = [h -> (q::HTTP.Request -> h(q))])
@@ -448,7 +448,7 @@ end
     # The junk-key check needs its OWN context with NO per-call middleware: passing
     # `middleware=` sets `use_cache = false`, so nothing is cached at all and the assertion
     # could never fail. Measured on unpatched main, this context ends up holding "POST|".
-    keyctx = ServerContext()
+    keyctx = App()
     Nitro.Core.Routing.urlpatterns(keyctx, "", Nitro.RouteDefinition[
         path("/only-get", (req::HTTP.Request) -> Res.send("ok"), method = "GET",
              middleware = [h -> (q::HTTP.Request -> h(q))])
@@ -461,7 +461,7 @@ end
 @testset "a matched request still works and runs the global middleware once" begin
     # Guards against the 404 assertion passing because the middleware runs somewhere twice.
     hits = Ref(0)
-    ctx = ServerContext()
+    ctx = App()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/has", (req::HTTP.Request) -> Res.send("ok"),
              middleware = [h -> (q::HTTP.Request -> h(q))])
@@ -475,7 +475,7 @@ end
 end
 
 @testset "an unmatched request caches nothing (use_cache == true)" begin
-    ctx = ServerContext()
+    ctx = App()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/has", (req::HTTP.Request) -> Res.send("ok"),
              middleware = [h -> (q::HTTP.Request -> h(q))])
@@ -492,7 +492,7 @@ using HTTP
 using Nitro
 using Nitro.Core.Types: CopyOnWriteDict, snapshot, cache!, publish!
 using Nitro.Core.RouterHOF: cachetag
-import Nitro: ServerContext, path, text
+import Nitro: App, path, text
 
 const TAG = cachetag(false, true, true)   # catch_errors=false, show_errors/serialize default
 
@@ -506,7 +506,7 @@ const TAG = cachetag(false, true, true)   # catch_errors=false, show_errors/seri
 mktag(tag) = handler -> (req::HTTP.Request -> Res.send(tag * "|" * text(handler(req))))
 
 @testset "a warmed route picks up middleware registered afterwards" begin
-    ctx = ServerContext()
+    ctx = App()
     # Two routes so the table is non-empty from the start: this exercises the CACHE path, not
     # the empty-table fast path covered by the item above.
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
@@ -530,7 +530,7 @@ mktag(tag) = handler -> (req::HTTP.Request -> Res.send(tag * "|" * text(handler(
 end
 
 @testset "invalidation drops only the affected key" begin
-    ctx = ServerContext()
+    ctx = App()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/keep", (req::HTTP.Request) -> Res.send("k"), middleware = [mktag("keep")]),
         path("/drop", (req::HTTP.Request) -> Res.send("d")),
@@ -571,14 +571,14 @@ end
 using Test
 using HTTP
 using Nitro
-import Nitro: ServerContext, path, text
+import Nitro: App, path, text
 
 # Executable form of the ordering-equivalence argument behind #71: installing `compose`
 # unconditionally must not move global middleware relative to anything else, on ANY of the
 # three paths through it — the empty-table fast path, the matched path for a route with no
 # per-route middleware, and the matched path for a route that has some.
 #
-# Unlike test/middleware_tests.jl (the canary), this uses a local ServerContext and is
+# Unlike test/middleware_tests.jl (the canary), this uses a local App and is
 # order-independent within runtests.jl.
 
 invocation = Int[]
@@ -587,7 +587,7 @@ route_mw = handler -> (req::HTTP.Request -> (push!(invocation, 99); handler(req)
 globals() = [mk(1), mk(2), mk(3)]
 
 @testset "empty table — the fast path" begin
-    ctx = ServerContext()
+    ctx = App()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/x", (req::HTTP.Request) -> Res.send("ok"))
     ])
@@ -599,7 +599,7 @@ globals() = [mk(1), mk(2), mk(3)]
 end
 
 @testset "non-empty table, route without middleware — the gethandler path" begin
-    ctx = ServerContext()
+    ctx = App()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/x",     (req::HTTP.Request) -> Res.send("ok")),
         path("/other", (req::HTTP.Request) -> Res.send("o"), middleware = [route_mw]),
@@ -619,7 +619,7 @@ end
     # pipeline-construction time for every serialize=false app. `setupmiddleware` now starts the
     # fold from a Function adapter. All four combinations must work.
     for with_route_mw in (false, true)
-        ctx = ServerContext()
+        ctx = App()
         routes = with_route_mw ?
             Nitro.RouteDefinition[path("/x", (req::HTTP.Request) -> Res.send("ok"),
                                        middleware = [route_mw])] :
@@ -637,7 +637,7 @@ end
 end
 
 @testset "route WITH middleware — globals stay outermost" begin
-    ctx = ServerContext()
+    ctx = App()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/x", (req::HTTP.Request) -> Res.send("ok"), middleware = [route_mw])
     ])

@@ -264,7 +264,7 @@ end
 # a wrong lookup (one route's chain served for another), a `BoundsError`, or a segfault.
 #
 # Scope of the guarantee, stated honestly: `@atomic` makes the *publish* unwritable, but
-# nothing makes a returned *snapshot* unwritable. `ServerContext` is public, so app code can
+# nothing makes a returned *snapshot* unwritable. `App` is public, so app code can
 # reach `ctx.service.middleware_cache` / `ctx.service.custommiddleware` and `setindex!` a
 # snapshot, reintroducing this bug with no error. `snapshot`'s "immutable by convention" is
 # a convention, enforced by review rather than by the type.
@@ -643,7 +643,7 @@ end
 #
 # Note also that the FIRST non-`nothing` value wins for the rest of the request. Nothing
 # rewrites `req.context[:params]` after the router has set it -- there is one `HTTP.Router`
-# per `ServerContext` and routers do not nest -- but a future layer that did would not be
+# per `App` and routers do not nest -- but a future layer that did would not be
 # picked up here.
 #
 # A throwing builder caches nothing and rethrows on the next touch. That is correct and

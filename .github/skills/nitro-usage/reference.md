@@ -282,14 +282,14 @@ Keyword-only. Register routes with `urlpatterns(...)` first.
 | `secret_key`, `httponly`, `secure`, `samesite` | `nothing` | Cookie defaults |
 
 Lifecycle: `terminate(; timeout=…)`, `resetstate()`, `internalrequest(req; …)` (in-process request,
-no socket), `instance(...)` for a self-contained router isolated from the global one.
+no socket), `App(mod = @__MODULE__)` for a self-contained router isolated from the global one.
 
 `terminate` is a **bounded** graceful shutdown: the listener is released immediately, in-flight
 requests get up to `timeout` seconds (default 10, or `serve(shutdown_timeout=…)`), then whatever is
 left is force-closed. Long-lived WebSocket/SSE/STREAM handlers hold their connection for their whole
 lifetime and are therefore always cut at the timeout — if one must finish cleanly, notify it from a
 `LifecycleMiddleware`'s `on_shutdown`, which runs before the drain. Calling `serve()` on a context
-that is already serving throws; `terminate()` first, or use `instance()` for a second listener.
+that is already serving throws; `terminate()` first, or give the second listener its own `App`.
 
 ---
 
@@ -369,7 +369,7 @@ pormg_nitro_worker(; db_key = "db")                           # needs `using Por
 update_progress!(task_info, value)                            # NEVER assign .progress directly
 ```
 
-Every one of these also has a `(ctx::ServerContext, …)` method — use it to avoid the global
+Every one of these also has an `(app::App, …)` method — use it to avoid the global
 singleton in tests. Submission registers the submitting `user_id` as a watcher; passing a non-empty
 `user_id` to a read/manage call enforces watcher access and raises `AuthorizationError` when denied.
 Omitting it is a deliberate system/public-endpoint bypass.

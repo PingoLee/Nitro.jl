@@ -1,4 +1,4 @@
-# Bench route table on an isolated ServerContext (no global CONTEXT[] mutation).
+# Bench route table on an isolated App (no global CONTEXT[] mutation).
 # All requests go through Nitro.Core.internalrequest — the full middleware +
 # serializer + router pipeline, minus the socket/task layer (see taskpattern.jl
 # for a synthetic measurement of that layer).
@@ -6,7 +6,7 @@
 using Nitro
 using HTTP
 
-const BENCH_CTX = Nitro.Core.ServerContext()
+const BENCH_CTX = Nitro.Core.App()
 
 Nitro.Core.Routing.urlpatterns(BENCH_CTX, "", Nitro.RouteDefinition[
     Nitro.path("/bench/ping", (req) -> "pong", method="GET"),

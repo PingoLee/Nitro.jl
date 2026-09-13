@@ -39,10 +39,23 @@ When designing configuration, bootstrapping applications, or proposing developer
 ## 6. Developer experience
 - Document one recommended app bootstrap pattern in docs when touching tutorials.
 - Config must be swappable in tests without mutating framework-global state.
-- **Multiple Nitro apps in one process is the design target, not the current state.** The
-  process-wide `CONTEXT[]` singleton (`src/Nitro.jl`, `src/methods.jl`) still backs the top-level
-  API, so two apps in one process share a router and an app context, and
-  `internalrequest(context=…)` races a live server — tracked in
-  [#31](https://github.com/PingoLee/Nitro.jl/issues/31). Do not write docs or tests that assume it
-  already works. **Do** write new code against the explicit `(ctx::ServerContext, …)` methods (or
-  `instance(...)`), which is the path to closing that gap.
+- **Multiple Nitro apps in one process is supported — build on `App`, not the singleton
+  ([#31](https://github.com/PingoLee/Nitro.jl/issues/31)).** `App` is the public application
+  handle (`src/context.jl`): its own router, middleware, cookie config, lifecycle hooks and app
+  context. Every public routing, serving and cookie function takes one as its first argument.
+
+  ```julia
+  app = App(mod = @__MODULE__)
+  urlpatterns(app, "", Routes.urlpatterns(config))
+  serve(app; port = 8080, context = config)
+  ```
+
+  **Pass `mod = @__MODULE__` at the call site.** It is what `serve(revise = :lazy|:eager)`
+  tracks, and a `@__MODULE__` *default* would expand inside Nitro rather than in your module —
+  which is why `App` does not have one.
+
+  The process-wide `CONTEXT[]` singleton (`src/Nitro.jl`, `src/methods.jl`) still backs the
+  argument-less forms and is the single-app convenience layer. Prefer an explicit `App` in new
+  code and in tests: it is what lets two apps coexist, and it keeps a test off shared state that
+  `resetstate()` would otherwise have to scrub. `instance()` is **gone** — it re-included the
+  whole package from disk; `App` replaces it outright.

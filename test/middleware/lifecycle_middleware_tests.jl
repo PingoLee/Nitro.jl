@@ -67,7 +67,7 @@ using Test
 using HTTP
 using Nitro
 using Nitro.Core: LifecycleMiddleware, process_middleware
-import Nitro: ServerContext, path, text
+import Nitro: App, path, text
 
 # Regression test for #68 item 2. `process_middleware` used to `push!` into the shared
 # lifecycle Set, and `setupmiddleware` called it — from `serve`
@@ -91,7 +91,7 @@ end
 
 @testset "internalrequest runs the middleware but registers nothing" begin
     lf, started, stopped, ran = counting_lifecycle()
-    ctx = ServerContext()
+    ctx = App()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/x", (req::HTTP.Request) -> Res.send("ok"))
     ])
@@ -110,7 +110,7 @@ end
 
 @testset "process_middleware still registers — its contract is unchanged" begin
     lf, _, _, _ = counting_lifecycle()
-    ctx = ServerContext()
+    ctx = App()
     processed = process_middleware(ctx, [lf])
     @test length(processed) == 1
     @test processed[1] === lf.middleware
@@ -121,14 +121,14 @@ end
 
 @testset "route and HOF registration paths register" begin
     lf, _, _, _ = counting_lifecycle()
-    ctx = ServerContext()
+    ctx = App()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/y", (req::HTTP.Request) -> Res.send("ok"), middleware = [lf])
     ])
     @test lf in ctx.service.route_lifecycle
 
     lf2, _, _, _ = counting_lifecycle()
-    ctx2 = ServerContext()
+    ctx2 = App()
     Nitro.Core.router(ctx2, "/hof"; middleware = [lf2])
     @test lf2 in ctx2.service.route_lifecycle
 end
@@ -137,7 +137,7 @@ end
     # Load-bearing: a single `RateLimiter()` used by several routes must start its cleanup
     # task once, not once per route.
     lf, _, _, _ = counting_lifecycle()
-    ctx = ServerContext()
+    ctx = App()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/p", (req::HTTP.Request) -> Res.send("ok"), middleware = [lf]),
         path("/q", (req::HTTP.Request) -> Res.send("ok"), middleware = [lf]),
@@ -149,7 +149,7 @@ end
     # A single object handed both to a route and to `serve(middleware = ...)` must start
     # ONCE per cycle, not twice — and it must land on the half that survives `terminate`.
     lf, _, _, _ = counting_lifecycle()
-    ctx = ServerContext()
+    ctx = App()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/shared", (req::HTTP.Request) -> Res.send("ok"), middleware = [lf]),
     ])
@@ -164,7 +164,7 @@ end
     # promoting guard on the route side it lands in BOTH halves, and `terminate` calls its
     # `on_shutdown` twice in a single cycle — once per half.
     lf, _, _, _ = counting_lifecycle()
-    ctx = ServerContext()
+    ctx = App()
     Nitro.Core.RouterHOF.register_serve_lifecycle!(ctx, Any[lf])
     @test lf in ctx.service.serve_lifecycle
 
@@ -186,7 +186,7 @@ using Test
 using HTTP
 using Nitro
 using Nitro.Core: LifecycleMiddleware
-import Nitro: ServerContext, path, text
+import Nitro: App, path, text
 
 # The other half of #68 item 2: moving registration out of `setupmiddleware` must not break
 # the path that legitimately needs it. `serve` registers explicitly now, so `on_startup`
@@ -198,7 +198,7 @@ lf = LifecycleMiddleware(
     on_startup  = () -> (started[] += 1),
     on_shutdown = () -> (stopped[] += 1))
 
-ctx = ServerContext()
+ctx = App()
 Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
     path("/health", (req::HTTP.Request) -> Res.send("ok"))
 ])
@@ -223,7 +223,7 @@ using Test
 using HTTP
 using Nitro
 using Nitro.Core: LifecycleMiddleware
-import Nitro: ServerContext, path, text
+import Nitro: App, path, text
 
 # Regression test for #82. `terminate()` used to `empty!` a single `lifecycle_middleware` Set
 # that held two kinds of member with different lifetimes. Emptying is right for the
@@ -251,7 +251,7 @@ _serve(ctx, port) = Nitro.Core.serve(ctx; host = HOST, port = port, async = true
 
 @testset "route-level on_startup re-fires on the second serve()" begin
     lf, started, stopped = counting_lifecycle()
-    ctx = ServerContext()
+    ctx = App()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/limited", (req::HTTP.Request) -> Res.send("ok"), middleware = [lf])
     ])
@@ -279,7 +279,7 @@ end
     # start `A`.
     lfa, started_a, _ = counting_lifecycle()
     lfb, started_b, _ = counting_lifecycle()
-    ctx = ServerContext()
+    ctx = App()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/health", (req::HTTP.Request) -> Res.send("ok"))
     ])
@@ -310,7 +310,7 @@ end
         on_shutdown = () -> push!(order, "down:$name"))
 
     route_lf, serve_lf = mk("route"), mk("serve")
-    ctx = ServerContext()
+    ctx = App()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/o", (req::HTTP.Request) -> Res.send("ok"), middleware = [route_lf])
     ])
@@ -378,7 +378,7 @@ using Nitro
 using Nitro.Core: LifecycleMiddleware, startup, shutdown
 using Nitro.Core.RouterHOF: register_route_lifecycle!, register_serve_lifecycle!,
                             lifecycle_snapshot
-import Nitro: ServerContext, path, text
+import Nitro: App, path, text
 
 # Regression test for #74 item 1. `startup.`/`shutdown.` broadcast over a `Set`, which collects
 # in HASH order — and `LifecycleMiddleware` is an immutable struct whose fields are closures,
@@ -411,7 +411,7 @@ end
 @testset "the container preserves registration order" begin
     order, mk = recorder()
     a, b, c = mk("a"), mk("b"), mk("c")
-    ctx = ServerContext()
+    ctx = App()
     register_route_lifecycle!(ctx, Any[a, b, c])
 
     route_lf, _ = lifecycle_snapshot(ctx)
@@ -427,7 +427,7 @@ end
     # structurally-identical runs disagreed. Build the same registration twice and compare.
     runs = map(1:2) do _
         order, mk = recorder()
-        ctx = ServerContext()
+        ctx = App()
         register_route_lifecycle!(ctx, Any[mk("a"), mk("b"), mk("c")])
         route_lf, _ = lifecycle_snapshot(ctx)
         startup.(route_lf)
@@ -442,7 +442,7 @@ end
     # `RateLimiter()` on N routes must start its cleanup task once, not N times.
     _, mk = recorder()
     lf = mk("shared")
-    ctx = ServerContext()
+    ctx = App()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/p", (req::HTTP.Request) -> Res.send("ok"), middleware = [lf]),
         path("/q", (req::HTTP.Request) -> Res.send("ok"), middleware = [lf]),
@@ -452,7 +452,7 @@ end
     @test length(route_lf) == 1
 
     # ...and on the serve-owned side too, including across repeated registration.
-    ctx2 = ServerContext()
+    ctx2 = App()
     register_serve_lifecycle!(ctx2, Any[lf])
     register_serve_lifecycle!(ctx2, Any[lf])
     _, serve_lf = lifecycle_snapshot(ctx2)
@@ -467,7 +467,7 @@ end
     # `register_route` -> here. Same defect class as #68 item 1.
     _, mk = recorder()
     entries = [mk("m$i") for i in 1:64]
-    ctx = ServerContext()
+    ctx = App()
 
     @sync for e in entries
         Threads.@spawn register_route_lifecycle!(ctx, Any[e])
@@ -490,7 +490,7 @@ end
     # Guards the other half of the fix: broadcasting over `ctx.service.route_lifecycle`
     # directly would let a concurrent `push!` mutate the array mid-iteration.
     _, mk = recorder()
-    ctx = ServerContext()
+    ctx = App()
     register_route_lifecycle!(ctx, Any[mk("a")])
     snap, _ = lifecycle_snapshot(ctx)
     register_route_lifecycle!(ctx, Any[mk("b")])

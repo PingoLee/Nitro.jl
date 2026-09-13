@@ -6,7 +6,7 @@ using Nitro
 # Regression net for #31.
 #
 # `internalrequest(context = ...)` used to inject its per-call context by WRITING the
-# process-shared `ServerContext.app_context[]` Ref and restoring it in a `finally`. `serve()`
+# process-shared `App.app_context[]` Ref and restoring it in a `finally`. `serve()`
 # dispatches every request on `Threads.@spawn` (nitro-core §2) and the outermost pipeline
 # layer seeded each request out of that same cell, so any request that entered the pipeline
 # during the window was stamped with the *caller's* context — and `getcontext(req)` then

@@ -21,7 +21,7 @@
 # `haskey` + assignment rather than `get!`: `HTTP.RequestContext` is reached through
 # `haskey`/`getindex`/`setindex!`/`get` throughout `src/` (see `request_input`), and `get!`
 # is not part of that surface.
-function _app_context_seed(ctx::ServerContext)
+function _app_context_seed(ctx::App)
     return function(handler::Function)
         return function(req::HTTP.Request)
             haskey(req.context, REQUEST_CONTEXT_KEY) ||
@@ -31,7 +31,7 @@ function _app_context_seed(ctx::ServerContext)
     end
 end
 
-function setupmiddleware(ctx::ServerContext; middleware::Vector=[], serialize::Bool=true, catch_errors::Bool=true, show_errors::Bool=true, access_log=false, access_log_query::Bool=false)::Function
+function setupmiddleware(ctx::App; middleware::Vector=[], serialize::Bool=true, catch_errors::Bool=true, show_errors::Bool=true, access_log=false, access_log_query::Bool=false)::Function
     raw_middleware = reverse(middleware)
     # `normalize_middleware`, NOT `process_middleware`: this runs once per `serve` but ONCE
     # PER CALL from `internalrequest`, so it must have no registration side effect. `serve`
@@ -102,7 +102,7 @@ function setupmiddleware(ctx::ServerContext; middleware::Vector=[], serialize::B
     ])
 end
 
-function internalrequest(ctx::ServerContext, req::HTTP.Request; middleware::Vector=[], serialize::Bool=true, catch_errors=true, context=missing)::HTTP.Response
+function internalrequest(ctx::App, req::HTTP.Request; middleware::Vector=[], serialize::Bool=true, catch_errors=true, context=missing)::HTTP.Response
     req.context[:ip] = IPv4("127.0.0.1")
 
     # Stamp the per-call override onto THIS REQUEST, never onto `ctx.app_context[]` (#31).
