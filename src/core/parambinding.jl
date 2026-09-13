@@ -18,10 +18,12 @@
 #
 # `ServerContext` is a concrete struct, so carrying it by value costs no indirection.
 
-struct ContextStrategy
-    ctx::ServerContext
-end
-(s::ContextStrategy)(::LazyRequest) = s.ctx.app_context[]
+# Carries no `ServerContext` (#31): the app context now travels on the request, so this
+# strategy is stateless and reads the same carrier every other consumer does. Returns the
+# `Context{T}` WRAPPER, not the payload — the bound parameter is declared `ctx::Context{T}`
+# and the handler unwraps it itself.
+struct ContextStrategy end
+(::ContextStrategy)(lr::LazyRequest) = request_app_context(lr.request)
 
 struct ExtractorStrategy{T}
     param::Param{T}
@@ -40,7 +42,7 @@ struct SessionStrategy{T}
     ctx::ServerContext
 end
 (s::SessionStrategy)(lr::LazyRequest) =
-    extract(s.param, lr, s.ctx.service.cookies[].secret_key, s.ctx.app_context[])
+    extract(s.param, lr, s.ctx.service.cookies[].secret_key, request_app_context(lr.request))
 
 struct PathParamStrategy{T}
     param::Param{T}
@@ -112,7 +114,7 @@ function create_param_parser(ctx::ServerContext, func_details)
         # Order matters: `Session` and `Cookie` are both `<: Extractor`, so they must be
         # tested before the generic extractor branch.
         if param.type <: Context
-            push!(strategies, ContextStrategy(ctx))
+            push!(strategies, ContextStrategy())
         elseif param.type <: Session
             push!(strategies, SessionStrategy(param, ctx))
         elseif param.type <: Cookie

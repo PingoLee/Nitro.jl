@@ -81,7 +81,7 @@ export  # Server lifecycle
         # Streaming primitives (re-exported from HTTP for STREAM/SSE handlers)
         startread, startwrite, closeread, closewrite,
         # Context Types and methods
-        Context, context,
+        Context,
         # Django-style Routing (THE routing API)
         path, urlpatterns, include_routes, RouteDefinition, url,
         # Response Abstractions

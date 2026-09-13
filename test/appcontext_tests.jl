@@ -18,7 +18,11 @@ urlpatterns("",
     path("/getcontext-typed", function(req) return Res.json(getcontext(req, Person)) end, method="GET"),
     path("/kwarg-only", function(req; context) return Res.json(context) end, method="GET"),
     path("/both-kwargs", function(; request::Request, context::Person) return Res.json(context) end, method="GET"),
-    path("/method-only", function() return Res.json(context()) end, method="GET"),
+    # No positional argument at all, reaching the app context through the `context` kwarg.
+    # This is `no_args && has_ctx_kwarg && !has_req_kwarg` in `select_handler` — a distinct
+    # dispatch branch from `/kwarg-only` (which takes `req`) and `/both-kwargs`. It used to
+    # call the global `context()`, removed in #31.
+    path("/method-only", function(; context) return Res.json(context) end, method="GET"),
 )
 
 serve(port=port, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
@@ -31,21 +35,16 @@ serve(port=port, host=HOST, async=true, show_errors=false, show_banner=false, ac
         @test e.status == 500
     end
 
-    try
-        response = HTTP.get("$localhost/method-only")
-    catch e
-        @test e isa HTTP.Exception
-        @test e.status == 500
-    end
+    # The `context` kwarg resolves to `getcontext(req)`, which is `nothing` when no context
+    # was configured — so these two do NOT fail, they serve `null`. Asserted directly rather
+    # than left in a `try`/`catch` that runs no assertion on the non-throwing path (#31).
+    response = HTTP.get("$localhost/method-only")
+    @test response.status == 200
+    @test text(response) == "null"
 
-    try
-        response = HTTP.get("$localhost/kwarg-only")
-    catch e
-        @test e isa HTTP.Exception
-        @test e.status == 500
-    end
-
-    @test context() isa Missing
+    response = HTTP.get("$localhost/kwarg-only")
+    @test response.status == 200
+    @test text(response) == "null"
 end
 
 @testset "getcontext null context" begin
@@ -69,11 +68,6 @@ terminate()
 person = Person("John", 25)
 
 serve(port=port, host=HOST, async=true, show_errors=true, show_banner=false, access_log=nothing, context=person)
-
-@testset "context() tests" begin
-    @test context() isa Person
-    @test context() == person
-end
 
 @testset "standard get requests" begin 
     response = HTTP.get("$localhost/test")
@@ -109,7 +103,7 @@ end
     @test json(response, Person) == person
 end
 
-@testset "context() method only" begin
+@testset "context kwarg on a no-argument handler" begin
     response = HTTP.get("$localhost/method-only")
     @test response.status == 200
     @test json(response, Person) == person

@@ -40,6 +40,80 @@ _Changes merged but not yet cut into a release. A consumer dev'ing Nitro at HEAD
 and `Nitro.upgrade_guide` surfaces them by default. When the maintainer next rolls changes into a
 consuming app, `nitro-cut-release` stamps every entry below with `0.4.0`, dates them, and tags it._
 
+## `context()` is removed — read the app context from the request with `getcontext(req)` (#31)
+
+- **Version**: Unreleased
+- **Nitro ref**: #31; `src/methods.jl`, `src/Nitro.jl`, `src/handlers.jl`,
+  `src/core/pipeline.jl`, `src/core/parambinding.jl`, `src/core/request.jl`,
+  `test/appcontext_race_tests.jl` (new)
+- **Recorded**: 2026-09-13
+- **Severity**: **breaking, and it fails LOUDLY.** `context()` no longer exists, so a call site
+  raises `UndefVarError: context not defined`. There is no silent-wrong-value path: the name is
+  gone, not repurposed. The `Context{T}` *type* and the `ctx::Context{T}` handler parameter are
+  untouched — only the zero-argument accessor function is removed.
+
+### What changed
+
+`context()` read the app context out of the process-wide `Nitro.CONTEXT[]` singleton. That made
+it the last reader of a shared mutable cell on the request path, and the cell was exactly the
+thing #31 had to stop being read: `internalrequest(context = ...)` used to inject its per-call
+context by *writing* it and restoring it in a `finally`, while `serve()` dispatches every request
+on `Threads.@spawn`. A live request entering the pipeline inside that window was seeded with
+another caller's context, and `getcontext(req)` then returned the wrong tenant's config for that
+request's whole lifetime.
+
+The app context is now carried **on the request**. Nothing downstream of the pipeline's outermost
+layer reads `ServerContext.app_context[]` any more, so there is no shared state left to observe
+mid-flight. A function that takes no request cannot participate in that, which is why `context()`
+goes rather than being rewired.
+
+### How to find the calls to migrate
+
+```bash
+# 1. The call itself. Note the word boundary — `ServerContext()` and `RequestContext()`
+#    are unrelated and must NOT be rewritten.
+rg -n '\bcontext\(\)' --type julia
+
+# 2. Explicit imports of the name, which will now fail at load time rather than at the call.
+rg -n 'import\s+Nitro:.*\bcontext\b|using\s+Nitro:.*\bcontext\b' --type julia
+
+# 3. NOT matches to rewrite: the `Context{T}` type and the `ctx::Context{T}` parameter are
+#    unchanged. This grep should come back with things you LEAVE ALONE.
+rg -n 'Context\{' --type julia
+```
+
+### Migrate your app
+
+| before | after | note |
+|---|---|---|
+| `context()` | `getcontext(req)` | needs the request in scope |
+| `context()` in a no-argument handler | declare `function(; context)` | the kwarg resolves per request |
+| `context()` returning `missing` when unset | `getcontext(req)` returns `nothing` | the sentinel changed too |
+
+```julia
+# ✗ before
+path("/whoami", function() return Res.json(context()) end, method="GET")
+
+function audit(req)
+    cfg = context()
+    log_to(cfg.audit_sink, req.target)
+end
+
+# ✓ after
+path("/whoami", function(; context) return Res.json(context) end, method="GET")
+
+function audit(req)
+    cfg = getcontext(req)          # or getcontext(req, AppConfig) on the request path
+    log_to(cfg.audit_sink, req.target)
+end
+```
+
+Note the sentinel change: `context()` returned `missing` when no context was configured,
+`getcontext(req)` returns `nothing`. If you tested with `ismissing(...)`, switch to
+`isnothing(...)`.
+
+---
+
 ## The `req.<property>` shorthands are removed — read the request through exported functions (#151)
 
 - **Version**: Unreleased

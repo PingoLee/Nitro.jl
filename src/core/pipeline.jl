@@ -7,10 +7,20 @@
 # pipeline — global/custom middleware, per-route middleware, and handlers alike.
 # Runs before any other middleware, so the app context is visible from the very
 # first hook a request passes through.
+# Seeds only when the key is ABSENT (#31). `internalrequest(context = ...)` stamps its
+# per-call override onto the request before handing it to this pipeline, and that override
+# must win — this layer supplies the server's default, it does not overwrite a caller's
+# choice. Reading `ctx.app_context[]` here is the ONE remaining read of that shared cell on
+# the request path, and it happens once, outermost, before anything can observe it.
+#
+# `haskey` + assignment rather than `get!`: `HTTP.RequestContext` is reached through
+# `haskey`/`getindex`/`setindex!`/`get` throughout `src/` (see `request_input`), and `get!`
+# is not part of that surface.
 function _app_context_seed(ctx::ServerContext)
     return function(handler::Function)
         return function(req::HTTP.Request)
-            req.context[REQUEST_CONTEXT_KEY] = ctx.app_context[]
+            haskey(req.context, REQUEST_CONTEXT_KEY) ||
+                (req.context[REQUEST_CONTEXT_KEY] = ctx.app_context[])
             return handler(req)
         end
     end
@@ -90,16 +100,22 @@ end
 function internalrequest(ctx::ServerContext, req::HTTP.Request; middleware::Vector=[], serialize::Bool=true, catch_errors=true, context=missing)::HTTP.Response
     req.context[:ip] = IPv4("127.0.0.1")
 
-    old_ctx = ctx.app_context[]
+    # Stamp the per-call override onto THIS REQUEST, never onto `ctx.app_context[]` (#31).
+    #
+    # The old shape was save / overwrite the shared `Ref` / restore in a `finally`. Because
+    # `serve()` dispatches every request on `Threads.@spawn` and `_app_context_seed` read that
+    # same cell per request, any live request entering the pipeline inside the window was
+    # seeded with THIS caller's context — `getcontext(req)` then returned the wrong tenant's
+    # object for that request's whole lifetime. Worse, `old_ctx` was snapshotted without
+    # synchronisation, so two overlapping calls clobbered the original permanently: the second
+    # `finally` wrote back whatever the first had installed.
+    #
+    # Carrying it on the request removes the window by construction rather than narrowing it —
+    # there is no shared mutable state left for a concurrent request to observe. Regression:
+    # test/appcontext_race_tests.jl.
     if !ismissing(context)
-        ctx.app_context[] = Context(context)
+        req.context[REQUEST_CONTEXT_KEY] = Context(context)
     end
 
-    try
-        return req |> setupmiddleware(ctx; middleware, serialize, catch_errors)
-    finally
-        if !ismissing(context)
-            ctx.app_context[] = old_ctx
-        end
-    end
+    return req |> setupmiddleware(ctx; middleware, serialize, catch_errors)
 end

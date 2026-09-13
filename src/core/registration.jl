@@ -184,7 +184,7 @@ function registerhandler(ctx::ServerContext, router::Router, httpmethod::String,
     has_path_params = !isempty(info.args)
 
     arg_type = first_arg_type(method, httpmethod)
-    func_handle = select_handler(arg_type, has_ctx_kwarg, has_req_kwarg, has_path_params, ctx; no_args=no_args)
+    func_handle = select_handler(arg_type, has_ctx_kwarg, has_req_kwarg, has_path_params; no_args=no_args)
     parse_params = create_param_parser(ctx, func_details)
 
     if isempty(info.sig)

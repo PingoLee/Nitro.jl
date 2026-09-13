@@ -268,12 +268,16 @@ end
 Use [`getcontext(req, T)`](@ref) when you want the value statically typed as `T`.
 
 !!! warning "Prefer the typed form on the request path"
-    The app context is stored as `Ref{Any}` and can be reassigned after route
-    registration (`serve(context = ...)`, `internalrequest(context = ...)`), so its
-    payload type is genuinely unknown when a route is registered and this accessor
-    can only return `Any`. Every field access on the result is therefore a dynamic
-    `getfield`, once per request — the one remaining `Any` on the parameter-binding
-    path after #37.
+    The server's app context is stored as `Ref{Any}` and can be reassigned after route
+    registration by `serve(context = ...)`, so its payload type is genuinely unknown
+    when a route is registered and this accessor can only return `Any`. Every field
+    access on the result is therefore a dynamic `getfield`, once per request — the one
+    remaining `Any` on the parameter-binding path after #37.
+
+    `internalrequest(context = ...)` no longer reassigns that `Ref` — it stamps the
+    override onto the request instead, because writing the process-shared cell raced
+    the multithreaded `serve` pipeline (#31). It is not a source of type instability
+    here either way: the carrier is `Ref{Any}` regardless of who set it.
 
     In a handler or middleware that runs per request, reach for
     `getcontext(req, AppConfig)` instead: the `::T` assertion is a function barrier,
@@ -283,9 +287,24 @@ Use [`getcontext(req, T)`](@ref) when you want the value statically typed as `T`
     [#31](https://github.com/PingoLee/Nitro.jl/issues/31).
 """
 function getcontext(req::HTTP.Request)
-    ctx = Base.get(req.context, REQUEST_CONTEXT_KEY, missing)
+    ctx = request_app_context(req)
     return ctx isa Context ? ctx.payload : nothing
 end
+
+# The app-context CARRIER for this request — the `Context{T}` wrapper itself, not its
+# payload — or `missing` when none was configured.
+#
+# `missing` rather than `nothing` on purpose: this is the request-side replacement for
+# reading `ServerContext.app_context[]`, whose empty value is `Ref{Any}(missing)`
+# (src/context.jl). Keeping the sentinel identical is what lets the parameter-binding
+# strategies and `extract` switch over without touching their own emptiness tests.
+#
+# THIS IS THE SINGLE SOURCE OF TRUTH for which app context a request sees (#31). Nothing
+# downstream of the pipeline's outermost layer may read `ctx.app_context[]` again: that cell
+# is process-shared, `serve()` dispatches on `Threads.@spawn` (nitro-core §2), and
+# `internalrequest(context = ...)` used to swap it mid-flight — so a concurrent request got
+# stamped with another caller's tenant config. Read the request instead; it cannot race.
+request_app_context(req::HTTP.Request) = Base.get(req.context, REQUEST_CONTEXT_KEY, missing)
 
 """
     getcontext(req::HTTP.Request, ::Type{T}) -> T
