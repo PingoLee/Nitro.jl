@@ -349,7 +349,7 @@ function start_server(env::String = "development")
     serve(
         host       = config.server[:host],
         port       = config.server[:port],
-        context    = config,          # accessible via Nitro.CONTEXT[] in middleware
+        context    = config,          # read it with getcontext(req) in middleware
         middleware = [startup_middleware(config)],
     )
 end

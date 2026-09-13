@@ -7,10 +7,25 @@
 # pipeline — global/custom middleware, per-route middleware, and handlers alike.
 # Runs before any other middleware, so the app context is visible from the very
 # first hook a request passes through.
+# Seeds only when the key is ABSENT (#31). `internalrequest(context = ...)` stamps its
+# per-call override onto the request before handing it to this pipeline, and that override
+# must win — this layer supplies the server's default, it does not overwrite a caller's
+# choice.
+#
+# There are exactly two reads of `ctx.app_context[]` left on the request path — this one and
+# `internalrequest`'s — plus `serve`'s one-shot startup write (src/core/lifecycle.jl). Both
+# reads happen ONCE per request, before any middleware or handler runs, and each immediately
+# copies the value onto the request. Nothing downstream of here touches the shared cell, which
+# is what removes the window a concurrent request could observe.
+#
+# `haskey` + assignment rather than `get!`: `HTTP.RequestContext` is reached through
+# `haskey`/`getindex`/`setindex!`/`get` throughout `src/` (see `request_input`), and `get!`
+# is not part of that surface.
 function _app_context_seed(ctx::ServerContext)
     return function(handler::Function)
         return function(req::HTTP.Request)
-            req.context[REQUEST_CONTEXT_KEY] = ctx.app_context[]
+            haskey(req.context, REQUEST_CONTEXT_KEY) ||
+                (req.context[REQUEST_CONTEXT_KEY] = ctx.app_context[])
             return handler(req)
         end
     end
@@ -90,16 +105,30 @@ end
 function internalrequest(ctx::ServerContext, req::HTTP.Request; middleware::Vector=[], serialize::Bool=true, catch_errors=true, context=missing)::HTTP.Response
     req.context[:ip] = IPv4("127.0.0.1")
 
-    old_ctx = ctx.app_context[]
-    if !ismissing(context)
-        ctx.app_context[] = Context(context)
-    end
+    # Stamp the per-call override onto THIS REQUEST, never onto `ctx.app_context[]` (#31).
+    #
+    # The old shape was save / overwrite the shared `Ref` / restore in a `finally`. Because
+    # `serve()` dispatches every request on `Threads.@spawn` and `_app_context_seed` read that
+    # same cell per request, any live request entering the pipeline inside the window was
+    # seeded with THIS caller's context — `getcontext(req)` then returned the wrong tenant's
+    # object for that request's whole lifetime. Worse, `old_ctx` was snapshotted without
+    # synchronisation, so two overlapping calls clobbered the original permanently: the second
+    # `finally` wrote back whatever the first had installed.
+    #
+    # Carrying it on the request removes the window by construction rather than narrowing it —
+    # there is no shared mutable state left for a concurrent request to observe. Regression:
+    # test/appcontext_race_tests.jl.
+    # ALWAYS stamp, even with no override — the value is then just what `_app_context_seed`
+    # would have supplied. Writing unconditionally is what makes the outcome independent of
+    # whatever the caller's `req` was already carrying.
+    #
+    # The conditional version of this leaked: `_app_context_seed` seeds only when the key is
+    # absent, so re-running a request object that had picked up an override on an earlier call
+    # kept the STALE context instead of resolving to the server's. That is the same class of
+    # defect this commit exists to remove — a request observing a context that is not its own —
+    # just reached by reuse rather than by a data race. Covered by the "a reused request object
+    # does not inherit a previous call's context" item in test/appcontext_race_tests.jl.
+    req.context[REQUEST_CONTEXT_KEY] = ismissing(context) ? ctx.app_context[] : Context(context)
 
-    try
-        return req |> setupmiddleware(ctx; middleware, serialize, catch_errors)
-    finally
-        if !ismissing(context)
-            ctx.app_context[] = old_ctx
-        end
-    end
+    return req |> setupmiddleware(ctx; middleware, serialize, catch_errors)
 end

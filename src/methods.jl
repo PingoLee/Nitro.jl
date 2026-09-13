@@ -13,11 +13,6 @@ function resetstate()
     end
 end
 
-function context()
-    app_ctx = CONTEXT[].app_context[]
-    return ismissing(app_ctx) ? missing : app_ctx.payload
-end
-
 function serve(; kwargs...)
     async = Base.get(kwargs, :async, false)
     # Whether the server this `finally` would tear down is OURS to tear down. Decided from
