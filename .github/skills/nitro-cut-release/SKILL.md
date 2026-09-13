@@ -156,8 +156,11 @@ git add UPGRADING.md Project.toml
 git commit -m "chore(release): cut <new>"          # entry titles in the body
 ```
 
-**Stop here and show the diff.** The commit/push gate applies: pushing and tagging are
-outward-facing and need explicit approval at that step, separately from approval to prepare the cut.
+**Stop here and show the diff.** A release is the exception to the merge-gate rule in
+[`nitro-general.instructions.md`](../../instructions/nitro-general.instructions.md): an ordinary
+issue runs straight through to an open PR, but `git tag` and `gh release create` publish something
+that cannot be taken back, so they stay on their own explicit approval — separate from approval to
+prepare the cut.
 
 ### 6. Tag and push
 
@@ -195,7 +198,8 @@ The pin **is** the app's rollout state — there are no per-entry rollout tables
 - **Never cut an empty `## Unreleased`.**
 - **The wave count is asserted twice** — from the parser in step 1, and again after stamping in
   step 4. A count that disagrees with the file is a stop, not a note.
-- **Never** tag or push without explicit approval at that step.
+- **Never** tag or publish a release without explicit approval at that step — `git tag` and
+  `gh release create` are the two commands the merge-gate rule does *not* hand you.
 - **Never** rewrite historical entries while cutting — fix errors in a separate commit with its own
   review.
 - **Never** cut from a branch other than `main`, or with a dirty tree, or when CI is red or unknown.

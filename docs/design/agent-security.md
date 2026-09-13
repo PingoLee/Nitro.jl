@@ -80,35 +80,39 @@ keep out.
 
 ## Permission tiers
 
-Sorted by reach and reversibility, not by whether the command writes.
+Sorted by reach and reversibility, not by whether the command writes. This block lives in the
+**committed** `.claude/settings.json`, not in the gitignored `.claude/settings.local.json` — a policy
+that only exists on one machine is not a policy, and the local file silently overrode it for months.
 
 ```json
 {
   "permissions": {
     "allow": [
       "Bash(julia .github/scripts/docs_lint.jl)",
+      "Bash(julia .github/scripts/smoke_test.jl)",
       "Bash(julia --project=. test/runtests.jl:*)",
-      "Bash(git status)",
-      "Bash(git diff)",
-      "Bash(git diff --staged)",
+      "Bash(git status)", "Bash(git status --porcelain:*)",
+      "Bash(git diff)", "Bash(git diff --staged)",
       "Bash(git log --oneline:*)",
-      "Bash(gh issue list:*)",
-      "Bash(gh issue view:*)",
-      "Bash(gh run list:*)",
-      "Bash(gh run view:*)"
+      "Bash(git switch:*)", "Bash(git branch:*)", "Bash(git worktree list:*)",
+      "Bash(git add:*)", "Bash(git commit:*)", "Bash(git push:*)",
+      "Bash(gh pr create:*)", "Bash(gh pr view:*)", "Bash(gh pr diff:*)",
+      "Bash(gh issue list:*)", "Bash(gh issue view:*)",
+      "Bash(gh run list:*)", "Bash(gh run view:*)"
     ],
     "ask": [
-      "Bash(gh issue create:*)",
-      "Bash(gh issue edit:*)",
-      "Bash(gh issue close:*)",
-      "Bash(gh issue comment:*)",
-      "Bash(git commit:*)"
+      "Bash(gh issue create:*)", "Bash(gh issue edit:*)",
+      "Bash(gh issue close:*)", "Bash(gh issue comment:*)",
+      "Bash(git tag:*)", "Bash(gh release create:*)",
+      "Edit(./.github/workflows/**)",   "Write(./.github/workflows/**)",
+      "Edit(./.github/instructions/**)", "Write(./.github/instructions/**)",
+      "Edit(./.github/skills/**)",      "Write(./.github/skills/**)",
+      "Edit(./.claude/**)",             "Write(./.claude/**)"
     ],
     "deny": [
-      "Bash(git push:*)",
-      "Bash(git tag:*)",
-      "Bash(gh release create:*)",
       "Bash(gh pr merge:*)",
+      "Bash(git push --force:*)", "Bash(git push -f:*)",
+      "Bash(git push --force-with-lease:*)", "Bash(git push --delete:*)",
       "Read(./.env)",
       "Read(./.env.*)",
       "Read(./**/connection.yml)"
@@ -122,10 +126,24 @@ Notes on specific entries:
 - **`gh issue` writes are on `ask`, not `allow`.** They publish to a public tracker and notify
   watchers. Combined with the fact that the agent also *reads* that tracker, allowlisting them
   closes a read-attacker-text → act-on-it → publish loop.
-- **`git push` and `git tag` are denied, not asked.** The commit/push gate in the general
-  instructions is prose, and prose is not enforcement. `nitro-cut-release` documents
-  `git push origin main` and `gh release create` as workflow steps; under auto-accept those need a
-  real gate rather than a paragraph asking nicely.
+- **`git commit`, `git push` and `gh pr create` are allowed, and that is the merge gate's design, not
+  a hole in it.** The general instructions moved from three step approvals to one gate at the merge:
+  every branch is discardable and `main` is reachable only through a human `gh pr merge`, which stays
+  **denied**. The trade is that the PR is now the maintainer's *first* look, so the verify rungs in
+  `nitro-issue-workflow` §4 are what pays for the autonomy — a skipped rung spends the only remaining
+  check.
+- **Force-push is denied while plain push is allowed.** Deny beats allow, so the narrow
+  `--force`/`-f`/`--force-with-lease`/`--delete` entries carve the irreversible half out of
+  `Bash(git push:*)`. Discardable branch history is the property that makes the merge gate sufficient;
+  rewriting a pushed branch removes it.
+- **`git tag` and `gh release create` stay on `ask`.** `nitro-cut-release` documents them as workflow
+  steps, and a published tag cannot be taken back — the one place where prose asking nicely is not
+  enough.
+- **The guardrail files are on `ask`, including this repo's own agent instructions.** Automation that
+  can widen its own permissions has no gate at all. `.github/workflows/`, `.github/instructions/`,
+  `.github/skills/` and `.claude/` change when the maintainer asks for it in conversation, never as a
+  side effect of working an issue — the `ask` entries are what makes that structural rather than
+  aspirational.
 - **Avoid broad trailing wildcards.** `Bash(git diff*)` is wider than `Bash(git diff)` — prefer the
   narrow form when the surface is this asymmetric.
 - **`Read` denials cover secrets at rest.** `connection.yml` is PormG's connection config.

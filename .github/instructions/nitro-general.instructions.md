@@ -70,11 +70,30 @@ These are canonical here — no other file owns them.
   [`pre-publish` label](https://github.com/PingoLee/Nitro.jl/issues?q=is%3Aopen+label%3Apre-publish);
   the publish gate is that query coming back empty. *(Remove this bullet once published.)*
 
-- **Commit/push gate — review first.** Never run `git commit`, `git push`, or open/update a PR
-  without the user's **explicit approval at that step**. Plan approval (including `ExitPlanMode`)
-  authorizes *implementing* the change, **not** committing it — finish the work, show the diff, and
-  wait for an explicit go-ahead. Pushing and opening PRs are a *separate* confirmation again.
-  Outward-facing backlog operations (issue create/edit/close) follow the same rule.
+- **Merge gate — the PR is the review point, and it is the only gate on the happy path.** Plan
+  approval (including `ExitPlanMode`) authorizes the **whole run**: implement, verify at the tier's
+  rungs, review, `git commit`, `git push`, open the PR. No per-step approval, no stopping to show a
+  diff and wait. **Never merge**, and never close an issue by hand — put `Closes #N` in the PR body
+  (only when the PR actually completes the issue) and let the maintainer's merge do it.
+
+  **Autonomy is bought with verification, not instead of it.** The PR is now the *first* time the
+  maintainer sees the work, so the verify rungs and the review step in
+  [`nitro-issue-workflow`](../skills/nitro-issue-workflow/SKILL.md) §4 are not negotiable and do not
+  scale down alongside the tier's other costs. A PR that arrives unverified makes the merge gate the
+  only check in the system, which is strictly worse than the three-step gate it replaced.
+
+  **Still gated, because they are irreversible or outward-facing:** `gh pr merge` · `git tag` and
+  `gh release create` (see [`nitro-cut-release`](../skills/nitro-cut-release/SKILL.md)) ·
+  force-push or any history rewrite on a pushed branch · issue create/edit/close beyond a single
+  follow-up the user asked for · **edits to the guardrails themselves** — `.github/workflows/`,
+  `.github/instructions/`, `.github/skills/`, `.claude/`. That last exclusion is load-bearing:
+  automation that can widen its own permissions has no gate at all. Those files change when the user
+  asks for it *in conversation*, never as a side effect of working an issue.
+
+  **Stop mid-run and ask** the moment the plan stops being true: the premise does not reproduce; the
+  fix needs a breaking change or an `UPGRADING.md` entry that was not in the plan; the escalation
+  table raises the tier above what the plan assumed; scope must grow materially; a previously-green
+  test is red and no third source adjudicates it; or you are blocked. Otherwise finish and report.
 
 - **Upgrade-log contract — release trains, not per-PR bumps.** A **breaking or behavior** change is
   **done** when it ships code + tests + docs **and** prepends its entry to the **`## Unreleased`**
