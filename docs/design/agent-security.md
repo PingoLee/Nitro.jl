@@ -98,11 +98,11 @@ that only exists on one machine is not a policy, and the local file silently ove
       "Bash(git add:*)", "Bash(git commit:*)", "Bash(git push:*)",
       "Bash(gh pr create:*)", "Bash(gh pr view:*)", "Bash(gh pr diff:*)",
       "Bash(gh issue list:*)", "Bash(gh issue view:*)",
+      "Bash(gh issue create:*)", "Bash(gh issue comment:*)",
       "Bash(gh run list:*)", "Bash(gh run view:*)"
     ],
     "ask": [
-      "Bash(gh issue create:*)", "Bash(gh issue edit:*)",
-      "Bash(gh issue close:*)", "Bash(gh issue comment:*)",
+      "Bash(gh issue edit:*)", "Bash(gh issue close:*)",
       "Bash(git tag:*)", "Bash(gh release create:*)",
       "Edit(./.github/workflows/**)",   "Write(./.github/workflows/**)",
       "Edit(./.github/instructions/**)", "Write(./.github/instructions/**)",
@@ -123,9 +123,18 @@ that only exists on one machine is not a policy, and the local file silently ove
 
 Notes on specific entries:
 
-- **`gh issue` writes are on `ask`, not `allow`.** They publish to a public tracker and notify
-  watchers. Combined with the fact that the agent also *reads* that tracker, allowlisting them
-  closes a read-attacker-text → act-on-it → publish loop.
+- **`gh issue` writes are split, and the split is by what an injected instruction would want.** The
+  agent both reads that tracker and writes to it, so allowlisting the whole surface would close a
+  read-attacker-text → act-on-it → publish loop. But the two halves are not equally attractive
+  targets. `create` and `comment` are **`allow`**: they only add, they are trivially undone, and
+  `nitro-issue-workflow` §7 tells the agent to file follow-ups for deferred work — gating a step the
+  workflow mandates is friction, not safety. `edit` and `close` stay **`ask`**: editing overwrites
+  the maintainer's own words, and *"close #12"* is the canonical payload — closing loses tracked
+  work and looks like housekeeping while doing it. The legitimate close path is `Closes #N` in a PR
+  body, which rides the merge gate.
+- **The limit that permissions cannot express is volume.** One follow-up issue and a forty-issue
+  sweep are the same string to a glob. The bulk-draft-and-confirm rule in `nitro-issue-management`
+  is the only control on that, which makes it load-bearing prose rather than a nicety.
 - **`git commit`, `git push` and `gh pr create` are allowed, and that is the merge gate's design, not
   a hole in it.** The general instructions moved from three step approvals to one gate at the merge:
   every branch is discardable and `main` is reachable only through a human `gh pr merge`, which stays

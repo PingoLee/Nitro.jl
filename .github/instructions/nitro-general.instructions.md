@@ -84,8 +84,11 @@ These are canonical here — no other file owns them.
 
   **Still gated, because they are irreversible or outward-facing:** `gh pr merge` · `git tag` and
   `gh release create` (see [`nitro-cut-release`](../skills/nitro-cut-release/SKILL.md)) ·
-  force-push or any history rewrite on a pushed branch · issue create/edit/close beyond a single
-  follow-up the user asked for · **edits to the guardrails themselves** — `.github/workflows/`,
+  force-push or any history rewrite on a pushed branch · `gh issue edit` and `gh issue close`
+  (`Closes #N` in the PR body is the sanctioned way to close one, and it rides the merge) ·
+  **bulk issue creation** — a follow-up or two from the work you just did is free, a sweep is drafted
+  and confirmed first ([`nitro-issue-management`](../skills/nitro-issue-management/SKILL.md)) ·
+  **edits to the guardrails themselves** — `.github/workflows/`,
   `.github/instructions/`, `.github/skills/`, `.claude/`. That last exclusion is load-bearing:
   automation that can widen its own permissions has no gate at all. Those files change when the user
   asks for it *in conversation*, never as a side effect of working an issue.
