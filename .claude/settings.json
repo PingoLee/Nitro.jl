@@ -34,13 +34,9 @@
       "Bash(git tag:*)",
       "Bash(gh release create:*)",
       "Edit(./.github/workflows/**)",
-      "Write(./.github/workflows/**)",
       "Edit(./.github/instructions/**)",
-      "Write(./.github/instructions/**)",
       "Edit(./.github/skills/**)",
-      "Write(./.github/skills/**)",
-      "Edit(./.claude/**)",
-      "Write(./.claude/**)"
+      "Edit(./.claude/**)"
     ],
     "deny": [
       "Bash(gh pr merge:*)",

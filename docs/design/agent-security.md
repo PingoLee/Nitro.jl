@@ -104,10 +104,10 @@ that only exists on one machine is not a policy, and the local file silently ove
     "ask": [
       "Bash(gh issue edit:*)", "Bash(gh issue close:*)",
       "Bash(git tag:*)", "Bash(gh release create:*)",
-      "Edit(./.github/workflows/**)",   "Write(./.github/workflows/**)",
-      "Edit(./.github/instructions/**)", "Write(./.github/instructions/**)",
-      "Edit(./.github/skills/**)",      "Write(./.github/skills/**)",
-      "Edit(./.claude/**)",             "Write(./.claude/**)"
+      "Edit(./.github/workflows/**)",
+      "Edit(./.github/instructions/**)",
+      "Edit(./.github/skills/**)",
+      "Edit(./.claude/**)"
     ],
     "deny": [
       "Bash(gh pr merge:*)",
@@ -148,6 +148,13 @@ Notes on specific entries:
 - **`git tag` and `gh release create` stay on `ask`.** `nitro-cut-release` documents them as workflow
   steps, and a published tag cannot be taken back — the one place where prose asking nicely is not
   enough.
+- **File rules are written `Edit(path)` only — never `Write(path)`.** `Edit(path)` covers *all*
+  file-editing tools, `Write` included; a `Write(path)` rule matches nothing and Claude Code prints a
+  warning about it on **every** invocation in the repo. Writing both looks belt-and-braces and is
+  actually one dead rule plus permanent console noise. This was shipped that way in
+  [#152](https://github.com/PingoLee/Nitro.jl/pull/152) and corrected in
+  [#153](https://github.com/PingoLee/Nitro.jl/pull/153) — the coverage was never lost, since the
+  `Edit` twin was always doing the work.
 - **The guardrail files are on `ask`, including this repo's own agent instructions.** Automation that
   can widen its own permissions has no gate at all. `.github/workflows/`, `.github/instructions/`,
   `.github/skills/` and `.claude/` change when the maintainer asks for it in conversation, never as a
