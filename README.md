@@ -86,16 +86,23 @@ serve()
 
 ## Request Ergonomics
 
-Nitro adds shorthand accessors to `HTTP.Request`:
+Nitro reads the request through exported accessor functions. Each one is parsed once per
+request and cached, so calling it twice is free:
 
-- `req.params` for path parameters
-- `req.query` for query parameters
-- `req.json` for JSON request bodies (`nothing` on empty or malformed JSON)
-- `req.form` for form-encoded request bodies (`Dict()` on empty or non-form bodies)
-- `req.input` for a merged `Dict{String,Any}` view of params, form, JSON, and query data
-- `req.session` for session state injected by middleware
-- `req.user` for the authenticated principal injected by session or bearer auth middleware
-- `req.ip` for the caller IP
+- `getparams(req)` for path parameters
+- `getquery(req)` for query parameters
+- `getjson(req)` for JSON request bodies (`nothing` on empty or malformed JSON)
+- `getform(req)` for form-encoded request bodies (`Dict()` on empty or non-form bodies)
+- `getfiles(req)` for the file parts of a multipart body (Django `request.FILES`)
+- `getpost(req)` for the text fields of a multipart body (Django `request.POST`)
+- `payload(req)` for a merged `Dict{String,Any}` view of params, form, JSON, and query data
+- `getsession(req)` for session state injected by middleware
+- `getuser(req)` for the authenticated principal injected by session or bearer auth middleware
+- `getip(req)` for the caller IP
+
+They are plain functions, not property sugar: `req.params` and friends do **not** exist. An
+earlier version installed them as `Base.getproperty` overrides, which replaced HTTP.jl's own
+method for the whole Julia process — see [`UPGRADING.md`](UPGRADING.md) if you are migrating.
 
 ```julia
 using HTTP
@@ -104,12 +111,12 @@ using Nitro
 function show_request(req::HTTP.Request, id::Int)
     return Res.json(Dict(
         "id" => id,
-        "params" => req.params,
-        "query" => req.query,
-        "json" => req.json,
-        "input" => req.input,
-        "session" => req.session,
-        "ip" => string(req.ip),
+        "params" => getparams(req),
+        "query" => getquery(req),
+        "json" => getjson(req),
+        "input" => payload(req),
+        "session" => getsession(req),
+        "ip" => string(getip(req)),
     ))
 end
 
@@ -120,19 +127,19 @@ urlpatterns("",
 serve()
 ```
 
-For direct handler access, prefer `req.json`, `req.form`, and `req.input`. `LazyRequest` still exists for extractors and app-level wrappers, but handler code no longer needs to wrap `HTTP.Request` just to parse a body.
+For direct handler access, use `getjson(req)`, `getform(req)`, and `payload(req)`. `LazyRequest` still exists for extractors and app-level wrappers, but handler code no longer needs to wrap `HTTP.Request` just to parse a body.
 
 ### Genie Migration
 
 If you are migrating simple Genie handlers, the rough mapping is:
 
-- `params(:id)` or route params -> `req.params["id"]`
-- query string lookups -> `req.query["key"]`
-- parsed JSON body -> `req.json`
-- parsed form body -> `req.form`
-- a single merged view for simple CRUD handlers -> `req.input`
+- `params(:id)` or route params -> `getparams(req)["id"]`
+- query string lookups -> `getquery(req)["key"]`
+- parsed JSON body -> `getjson(req)`
+- parsed form body -> `getform(req)`
+- a single merged view for simple CRUD handlers -> `payload(req)`
 
-For complex validation or typed conversion, prefer Nitro extractors over manually pulling values out of `req.input`.
+For complex validation or typed conversion, prefer Nitro extractors over manually pulling values out of `payload(req)`.
 
 ## App Context
 
@@ -269,12 +276,13 @@ using HTTP
 using Nitro
 
 function login(req::HTTP.Request)
-    req.session["user_id"] = 42
+    getsession(req)["user_id"] = 42
     return Res.json(Dict("logged_in" => true))
 end
 
 function profile(req::HTTP.Request)
-    user_id = isnothing(req.session) ? nothing : get(req.session, "user_id", nothing)
+    session = getsession(req)
+    user_id = isnothing(session) ? nothing : get(session, "user_id", nothing)
     return isnothing(user_id) ? Res.send("Unauthorized", status=401) : Res.json(Dict("user_id" => user_id))
 end
 
@@ -296,7 +304,7 @@ serve(middleware=[
 
 Use `secure=false` for local HTTP development only. Keep `secure=true` in production.
 
-`SessionMiddleware` now accepts any `AbstractSessionStore`, not just the built-in in-memory store. Both `SessionMiddleware` and `BearerAuth` converge on `req.user`, so guards can stay agnostic to whether auth came from a server-side session or a JWT.
+`SessionMiddleware` accepts any `AbstractSessionStore`, not just the built-in in-memory store. Both `SessionMiddleware` and `BearerAuth` converge on `getuser(req)`, so guards can stay agnostic to whether auth came from a server-side session or a JWT.
 
 ## Auth Helpers
 
@@ -311,7 +319,7 @@ token = encode_jwt(Dict("sub" => "42", "role" => "admin", "exp" => trunc(Int, ti
 validator = jwt_validator("secret")
 
 function profile(req::HTTP.Request)
-    return Res.json(Dict("user" => req.user))
+    return Res.json(Dict("user" => getuser(req)))
 end
 
 urlpatterns("",

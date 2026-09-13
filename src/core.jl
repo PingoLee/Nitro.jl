@@ -29,8 +29,13 @@ include("context.jl");      @reexport using .AppContext
 
 function getparams end
 function getquery end
+function getjson end
+function getform end
+function getfiles end
+function getpost end
 function getsession end
 function setsession! end
+function getuser end
 function getip end
 function setip! end
 function getpeerip end
@@ -46,7 +51,8 @@ include("routing.jl");      @reexport using .Routing
 
 export serve, terminate,
     internalrequest, staticfiles, dynamicfiles, spafiles,
-    getparams, getquery, getsession, setsession!, getip, setip!, getpeerip, getcontext, payload
+    getparams, getquery, getjson, getform, getfiles, getpost,
+    getsession, setsession!, getuser, getip, setip!, getpeerip, getcontext, payload
 
 const REQUEST_JSON_CACHE_KEY = :__nitro_request_json
 const REQUEST_FORM_CACHE_KEY = :__nitro_request_form
@@ -63,16 +69,12 @@ const REQUEST_CONTEXT_KEY = :__nitro_app_context
 #
 # Deliberately NOT centralized here: the `HTTP.EmptyBody`/`HTTP.BytesBody` body
 # *types* (dispatched on inline in bodyparsers.jl / core.jl) and the `_peer_ip`
-# stream-layout reach (below) — both carry their own canary coverage. Each wrapper
-# uses `getfield` (not property access) so it never re-enters the overridden
-# `getproperty` defined in `_install_request_getproperty!`.
-_http_metadata(req::HTTP.Request)          = HTTP._request_context_metadata!(getfield(req, :context))
-_http_version(req::HTTP.Request)           = VersionNumber(Int(getfield(req, :proto_major)), Int(getfield(req, :proto_minor)))
+# stream-layout reach (below) — both carry their own canary coverage.
 _http_stream_request(stream::HTTP.Stream)  = HTTP._buffered_stream_request(stream)
 
 # One implementation, in `Types` (#38): it probes the raw `HTTP.RequestContext` instead
 # of `req.context`, so a cache miss no longer allocates the metadata `Dict` just to look
-# for a key that is not there. The body-parser caches below (`req.json`, `req.form`, …)
+# for a key that is not there. The body-parser caches below (`getjson`, `getform`, …)
 # get that saving for free by sharing it.
 using .Types: request_cache!
 
@@ -89,7 +91,8 @@ const REQUEST_MULTIPART_CACHE_KEY = :__nitro_request_multipart
 
 """
 Parse the `multipart/form-data` body once per request and cache the raw result, so that
-`req.files` and `req.post` can both read it without re-parsing (and re-reading) the body.
+[`getfiles`](@ref) and [`getpost`](@ref) can both read it without re-parsing (and
+re-reading) the body.
 """
 function request_multipart(req::HTTP.Request)
     return request_cache!(req, REQUEST_MULTIPART_CACHE_KEY) do
@@ -97,117 +100,36 @@ function request_multipart(req::HTTP.Request)
     end
 end
 
-# `req.params` is `nothing` until the router populates it, and `merge_request_input!` above
+# `getparams(req)` is `nothing` until the router populates it, and `merge_request_input!` above
 # silently skips a non-`AbstractDict` source — so a merge performed before the router ran
 # produces an input map with the path params missing, and caching that unconditionally hands
 # every later reader the truncated version. A middleware calling the public `payload(req)`, or
-# a guard reading `req.input["tenant"]`, was enough to do it.
+# a guard reading `payload(req)["tenant"]`, was enough to do it.
 #
 # That fails *silently* with wrong data rather than loudly, which is the worse shape, so the
 # cached merge is invalidated exactly once: if the value was built while path params were
 # absent and they have since appeared, it is rebuilt and then pinned. `pathparams` solves the
 # same transient-state problem by refusing to cache the `nothing` (see `src/types.jl`); this
-# one cannot, because a route with *no* path parameters leaves `req.params === nothing`
+# one cannot, because a route with *no* path parameters leaves `getparams(req) === nothing`
 # permanently, and gating on that would disable this cache for every such route.
 const REQUEST_INPUT_ROUTED_KEY = :__nitro_request_input_routed
 
 function request_input(req::HTTP.Request) :: Dict{String,Any}
     ctx = getfield(req, :context)
-    params = req.params
+    params = Types.pathparams(req)
     if haskey(ctx, REQUEST_INPUT_CACHE_KEY) &&
        (params === nothing || haskey(ctx, REQUEST_INPUT_ROUTED_KEY))
         return ctx[REQUEST_INPUT_CACHE_KEY] :: Dict{String,Any}
     end
     merged = Dict{String,Any}()
-    merge_request_input!(merged, req.query)
-    merge_request_input!(merged, req.json)
-    merge_request_input!(merged, req.form)
-    merge_request_input!(merged, req.post)
+    merge_request_input!(merged, Types.queryvars(req))
+    merge_request_input!(merged, getjson(req))
+    merge_request_input!(merged, getform(req))
+    merge_request_input!(merged, getpost(req))
     merge_request_input!(merged, params)
     ctx[REQUEST_INPUT_CACHE_KEY] = merged
     params === nothing || (ctx[REQUEST_INPUT_ROUTED_KEY] = true)
     return merged
-end
-
-"""
-Extend HTTP.Request to provide DX-friendly shorthand access to common properties:
-- `req.params`: Returns path parameters, percent-decoded (exactly once)
-- `req.query`: Returns query parameters 
-- `req.session`: Returns the session dictionary from context (if present)
-- `req.user`: Returns the authenticated user from context (if present)
-- `req.ip`: Returns the caller's IP address from context
-- `req.json`: Returns the parsed JSON body (cached per request)
-- `req.form`: Returns parsed form data (cached per request)
-- `req.files`: Returns the file parts of a multipart body, `Dict{String, Union{FormFile, Vector{FormFile}}}` (cached per request) — Django `request.FILES`
-- `req.post`: Returns the text fields of a multipart body, `Dict{String, Union{String, Vector{String}}}` (cached per request) — Django `request.POST`
-- `req.input`: Returns merged request input (params > post > form > json > query, where `post` is the multipart text fields)
-"""
-# HTTP.jl v2 defines its own `Base.getproperty(::Request, ::Symbol)` (special-casing
-# `:context` and `:version`). Nitro extends this with DX shorthands, but a same-signature
-# definition would *overwrite* HTTP's method — which Julia forbids during precompilation.
-# We therefore install Nitro's version (a strict superset that still honors HTTP's
-# `:context`/`:version` semantics) at load time from `__init__`.
-function _install_request_getproperty!()
-    @eval Core function Base.getproperty(req::HTTP.Request, sym::Symbol)
-        if sym === :params
-            # Via `Types.pathparams`, not `HTTP.getparams`, so path params are percent-decoded
-            # exactly once — the same value the scalar and `Path{T}` binding paths see (#70).
-            return Types.pathparams(req)
-        elseif sym === :query
-            return Types.queryvars(req)
-        elseif sym === :json
-            return request_cache!(req, REQUEST_JSON_CACHE_KEY) do
-                Types.jsonbody(req)
-            end
-        elseif sym === :form
-            return request_cache!(req, REQUEST_FORM_CACHE_KEY) do
-                Types.formbody(req)
-            end
-        elseif sym === :input || sym === :data
-            return request_input(req)
-        elseif sym === :files
-            # Django request.FILES — only the file parts of a multipart body, cached.
-            return request_cache!(req, REQUEST_FILES_CACHE_KEY) do
-                parsed = request_multipart(req)
-                Dict{String, Union{FormFile, Vector{FormFile}}}(
-                    k => v for (k, v) in parsed
-                    if v isa FormFile || v isa Vector{FormFile}
-                )
-            end
-        elseif sym === :post
-            # Django request.POST for multipart — the text fields of a multipart body, cached.
-            return request_cache!(req, REQUEST_POST_CACHE_KEY) do
-                parsed = request_multipart(req)
-                Dict{String, Union{String, Vector{String}}}(
-                    k => v for (k, v) in parsed
-                    if v isa String || v isa Vector{String}
-                )
-            end
-        elseif sym === :session
-            return Base.get(req.context, :session, nothing)
-        elseif sym === :user
-            return Base.get(req.context, :user, nothing)
-        elseif sym === :ip
-            return Base.get(req.context, :ip, nothing)
-        elseif sym === :context
-            # Preserve HTTP.jl v2 semantics: `.context` returns the metadata view.
-            return _http_metadata(req)
-        elseif sym === :version
-            return _http_version(req)
-        else
-            return getfield(req, sym)
-        end
-    end
-end
-
-function __init__()
-    # Only install at real load time. During precompilation (of Nitro itself or any
-    # dependent package/extension), `jl_generating_output` is 1 — mutating the already
-    # serialized `Core` module via `@eval` then would break incremental compilation.
-    # The method is (re)installed every time Nitro is loaded into a live session.
-    if ccall(:jl_generating_output, Cint, ()) == 0
-        _install_request_getproperty!()
-    end
 end
 
 """
@@ -216,19 +138,19 @@ end
 Returns the path parameters for the request, **percent-decoded exactly once**.
 
 HTTP.jl's router hands over raw, still-encoded segments; the single decode happens in
-`Types.pathparams`, which every path-parameter consumer goes through — this accessor, the
-`req.params` shorthand, scalar handler parameters, and the `Path{T}` extractor. They therefore
-all observe the same value. Query parameters (`getquery`) are decoded once by `HTTP.queryparams`
-for the same reason. See #70.
+`Types.pathparams`, which every path-parameter consumer goes through — this accessor, scalar
+handler parameters, and the `Path{T}` extractor. They therefore all observe the same value.
+Query parameters ([`getquery`](@ref)) are decoded once by `HTTP.queryparams` for the same
+reason. See #70.
 
 Returns the **same `Dict` for the lifetime of the request** — it is decoded once and cached
 (#38), so the result is a live handle, not a snapshot. Mutating it *does* change what a later
-call returns, and is visible to `req.input` and to every parameter binding that has not run
-yet. Treat it as read-only; pass values down a request through `req.context` instead.
+call returns, and is visible to [`payload`](@ref) and to every parameter binding that has not
+run yet. Treat it as read-only; pass values down a request through `req.context` instead.
 
-This matches `req.json` and `req.form`, which have always been memoized this way. It used to
-return a fresh `Dict` per call, which meant a handler with N path parameters re-decoded the
-whole table N times.
+This matches [`getjson`](@ref) and [`getform`](@ref), which have always been memoized this
+way. It used to return a fresh `Dict` per call, which meant a handler with N path parameters
+re-decoded the whole table N times.
 
 A malformed escape (`/x/%ZZ`, a trailing `%`) or a sequence decoding to invalid UTF-8 raises
 `ValidationError`, which the error handler reports as `400 Bad Request` — not a `500`.
@@ -241,10 +163,80 @@ getparams(req::HTTP.Request) = Types.pathparams(req)
 Returns the query parameters for the request.
 
 Parsed once per request and cached (#38), so this returns the **same `Dict`** on every call —
-a live handle, not a snapshot. Treat it as read-only: a mutation is visible to `req.input` and
-to any query-parameter binding that has not run yet.
+a live handle, not a snapshot. Treat it as read-only: a mutation is visible to
+[`payload`](@ref) and to any query-parameter binding that has not run yet.
 """
 getquery(req::HTTP.Request) = Types.queryvars(req)
+
+"""
+    getjson(req::HTTP.Request) -> Any
+
+Returns the parsed JSON request body, or `nothing` when the body is empty or malformed.
+
+Parsed **once per request and cached**, so reading it twice is free and both reads return the
+same object — a live handle, not a snapshot. This is the accessor handler code wants.
+
+Contrast [`json(req)`](@ref), the body *parser*: it re-reads and re-parses the body on every
+call, takes `kwargs`, has a typed `json(req, T)` form, and also works on an `HTTP.Response`.
+The relationship mirrors `getparams(req)` (cached, decoded) versus `HTTP.getparams(req)` (raw).
+"""
+getjson(req::HTTP.Request) = request_cache!(req, REQUEST_JSON_CACHE_KEY) do
+    Types.jsonbody(req)
+end
+
+"""
+    getform(req::HTTP.Request) -> Dict{String, String}
+
+Returns the parsed urlencoded form body, or an empty `Dict` when the body is empty or is not
+form-encoded. A `multipart/form-data` body is **not** parsed here — use [`getpost`](@ref) and
+[`getfiles`](@ref) for those.
+
+Parsed **once per request and cached**, like [`getjson`](@ref). [`formdata(req)`](@ref) is the
+uncached parser underneath it.
+"""
+getform(req::HTTP.Request) = request_cache!(req, REQUEST_FORM_CACHE_KEY) do
+    Types.formbody(req)
+end
+
+"""
+    getfiles(req::HTTP.Request) -> Dict{String, Union{FormFile, Vector{FormFile}}}
+
+Returns the **file parts** of a `multipart/form-data` body — Django's `request.FILES`. Text
+fields are excluded; read those with [`getpost`](@ref).
+
+Returns an empty `Dict` for a non-multipart or unparseable body. The body is parsed once per
+request and shared with `getpost`, so reading both costs one parse.
+
+Note this is a *filtered view*: [`multipart(req)`](@ref) returns files and text fields
+together, so it is not a drop-in substitute.
+"""
+getfiles(req::HTTP.Request) = request_cache!(req, REQUEST_FILES_CACHE_KEY) do
+    parsed = request_multipart(req)
+    Dict{String, Union{FormFile, Vector{FormFile}}}(
+        k => v for (k, v) in parsed
+        if v isa FormFile || v isa Vector{FormFile}
+    )
+end
+
+"""
+    getpost(req::HTTP.Request) -> Dict{String, Union{String, Vector{String}}}
+
+Returns the **text fields** of a `multipart/form-data` body — Django's `request.POST`. File
+parts are excluded; read those with [`getfiles`](@ref).
+
+Returns an empty `Dict` for a non-multipart or unparseable body. The body is parsed once per
+request and shared with `getfiles`, so reading both costs one parse.
+
+Note this is a *filtered view*: [`multipart(req)`](@ref) returns files and text fields
+together, so it is not a drop-in substitute.
+"""
+getpost(req::HTTP.Request) = request_cache!(req, REQUEST_POST_CACHE_KEY) do
+    parsed = request_multipart(req)
+    Dict{String, Union{String, Vector{String}}}(
+        k => v for (k, v) in parsed
+        if v isa String || v isa Vector{String}
+    )
+end
 
 # HTTP.jl v1 shipped `queryparams(::Request)` / `queryparams(::Response)`; v2 only provides
 # the URIs `queryparams(::AbstractString)` / `(::URI)`. Re-add the message overloads (which
@@ -269,6 +261,22 @@ getsession(req::HTTP.Request) = Base.get(req.context, :session, nothing)
 Assigns the session dictionary to the request context.
 """
 setsession!(req::HTTP.Request, val) = (req.context[:session] = val)
+
+"""
+    getuser(req::HTTP.Request) -> Any
+
+Returns the authenticated user attached to the request context by an auth middleware, or
+`nothing` when the request is unauthenticated.
+
+**The type is deliberately open.** `BearerAuth`/`CookieAuthMiddleware` store whatever their
+validator returned: `jwt_validator` without a `user_validator` stores the [`Principal`](@ref),
+but with one it stores the *application's* user object and the `Principal` moves to
+`req.context[:auth_claims]`. A custom validator may return anything at all. Guards
+(`login_required`, `role_required`, …) do their own normalization; this accessor does not.
+
+`SessionMiddleware` populates the session, not the user — see [`getsession`](@ref).
+"""
+getuser(req::HTTP.Request) = Base.get(req.context, :user, nothing)
 
 """
     getip(req::HTTP.Request) -> Union{Sockets.IPAddr, Nothing}
@@ -375,7 +383,7 @@ Returns a merged dictionary containing the JSON body, form data, multipart text
 fields, and query parameters from the incoming request.
 """
 function payload(req::HTTP.Request)::Dict{String, Any}
-    return req.input
+    return request_input(req)
 end
 
 function serverwelcome(external_url::String, prefix::Nullable{String}, parallel::Bool)

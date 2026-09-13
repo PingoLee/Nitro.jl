@@ -30,7 +30,7 @@ abstract type AbstractSessionStore{K, V} end
     Principal(claims; id=nothing, kid=nothing, source=:claim)
 
 The normalized authenticated principal that Nitro auth middleware attaches at
-`req.context[:user]` (readable as `req.user`).
+`req.context[:user]` (readable as `getuser(req)`).
 
 Behaves as a **read-only** claims dictionary — `principal["sub"]`, `get`, `haskey`,
 iteration, and JSON serialization all read through to the verified claims — with
@@ -616,7 +616,7 @@ end
 # `pathparams`, `queryvars` and `headers` were the only request accessors with no
 # memoization: each one re-decoded and rebuilt its whole `Dict` on every call, and the
 # param binder calls them once *per bound parameter*, so a handler with three query
-# params re-parsed the same unchanged target three times. `req.json`/`req.form` have
+# params re-parsed the same unchanged target three times. `getjson`/`getform` have
 # been memoized all along; this closes the gap.
 #
 # Deliberately reaches `getfield(req, :context)` — the raw `HTTP.RequestContext` —
@@ -631,13 +631,13 @@ end
 #
 # `pathparams` is the one accessor that must NOT cache a `nothing`. `HTTP.getparams` reads
 # `req.context[:params]`, a slot the ROUTER fills -- and middleware runs *before* the router.
-# A pre-router read -- a guard doing `req.params["user_id"]`, or anything touching `req.input`,
+# A pre-router read -- a guard doing `getparams(req)["user_id"]`, or anything touching `payload(req)`,
 # which merges path params in -- would otherwise memoize `nothing` for the rest of the request,
 # and the path binder would then index into `nothing` and turn every parameterized route into
 # a 500. "Unrouted" is a transient state of the request, not a property of it, so it is
 # returned uncached until the router has actually run.
 #
-# `req.input` needs its own handling on top of this and does not get it for free here: it
+# `payload(req)` needs its own handling on top of this and does not get it for free here: it
 # merges a *copy* of the params, so refusing to cache the `nothing` is not enough to keep its
 # merged map correct. `Core.request_input` carries that rule.
 #
@@ -672,7 +672,7 @@ end
 #   - `HTTP.queryparams` already decodes, so `queryvars` must NOT decode again (#70).
 #
 # `HTTP.getparams` returns `nothing` for a request that never went through the router, and
-# callers (`Core.merge_request_input!`, `req.input`) rely on that passthrough — so the `nothing`
+# callers (`Core.merge_request_input!`, `payload(req)`) rely on that passthrough — so the `nothing`
 # is preserved rather than normalized to an empty Dict.
 #
 # Inference NARROWS here: `HTTP.getparams` reads a `Dict{Symbol,Any}` metadata table and infers
@@ -681,9 +681,9 @@ end
 # on the request path, not a new instability. Do not "restore" the old shape.
 #
 # The decode cannot be done in place, so this builds a Dict — but it is built ONCE per request
-# and cached by the `pathparams` wrapper below (#38), which makes `req.params` a live handle
+# and cached by the `pathparams` wrapper below (#38), which makes `getparams(req)` a live handle
 # rather than a snapshot: mutating it is visible to every later read. Treat it as read-only and
-# use `req.context` to pass values down a request. `req.json`/`req.form` have always behaved
+# use `req.context` to pass values down a request. `getjson`/`getform` have always behaved
 # this way; this accessor and `queryvars` were the outliers.
 #
 # `HTTP.unescapeuri` THROWS on a malformed escape (`EOFError` for a trailing "%", `ArgumentError`

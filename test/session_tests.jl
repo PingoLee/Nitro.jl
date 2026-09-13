@@ -181,7 +181,7 @@ end
     @testset "SessionMiddleware validator contract (#4)" begin
         # The `validator` kwarg is a FALLBACK identity resolver for session-fixation
         # detection: consulted only when `auth_key` is absent, used purely to decide
-        # whether the session ID must be regenerated. It never populates req.user.
+        # whether the session ID must be regenerated. It never populates the request user.
 
         cookie_of(resp) = match(r"app_session=([^;]+)", HTTP.header(resp, "Set-Cookie", "")).captures[1]
 
@@ -239,14 +239,15 @@ end
         @test cookie_of(resp_authkey) != "existing-id"
 
         # Single-arity validators are supported via arity dispatch, and the validator
-        # never writes req.user (it is not an auth-context populator).
+        # never writes the request user (it is not an auth-context populator).
         req_probe, resp_probe = run_with_existing(
             validator = session_id -> session_id,               # 1-arg form
             seed=Dict{String,Any}("cart" => [1]),
             mutate! = s -> (s["cart"] = [1, 2]),
         )
         @test resp_probe.status == 200
-        @test !haskey(req_probe.context, :user)                 # never populates req.user
+        @test !haskey(req_probe.context, :user)                 # never populates the user slot
+        @test getuser(req_probe) === nothing                    # ... and the accessor agrees
     end
 
 end

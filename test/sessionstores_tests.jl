@@ -260,10 +260,10 @@ end
     @test_throws "session delete failed" Nitro.regenerate_session!(req, store; ttl=3600)
 end
 
-@testset "req.user shorthand" begin
+@testset "getuser accessor" begin
     req = HTTP.Request("GET", "/")
     req.context[:user] = Dict{String,Any}("id" => 7)
-    @test req.user["id"] == 7
+    @test getuser(req)["id"] == 7
 end
 
 end

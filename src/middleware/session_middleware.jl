@@ -19,7 +19,7 @@ const DEFAULT_STORE = MemoryStore{String, Dict{String,Any}}()
                         rotate_on_auth, auth_key, validator, ...)
 
 Creates a middleware that manages server-side sessions with cookie-based session IDs. The
-mutable session dictionary is exposed as `req.session` (`req.context[:session]`).
+mutable session dictionary is read with `getsession(req)` (`req.context[:session]`).
 
 # Session fixation defense (`rotate_on_auth`, `auth_key`, `validator`)
 
@@ -31,7 +31,7 @@ session. The identity is captured before the handler runs and compared after.
 How that identity is resolved, in order:
 
 - `auth_key::String = "user_id"` — the session key whose value *is* the identity. This is
-  the common case: your login handler sets `req.session["user_id"] = …` and logout clears
+  the common case: your login handler sets `getsession(req)["user_id"] = …` and logout clears
   it; the change triggers regeneration.
 - `validator::Union{Function, Nothing} = nothing` — an optional **fallback identity
   resolver**, consulted *only* when `auth_key` is absent from the session (and a session ID
@@ -40,8 +40,8 @@ How that identity is resolved, in order:
   used for change detection.
 
 The `validator` participates in fixation detection **only**; it never populates
-`req.user`. Authenticating a request (attaching a principal) is the job of `BearerAuth` /
-`CookieAuthMiddleware`, and guards read `req.user` / the raw session there. This separation
+`getuser(req)`. Authenticating a request (attaching a principal) is the job of `BearerAuth` /
+`CookieAuthMiddleware`, and guards read `getuser(req)` / the raw session there. This separation
 is deliberate: `SessionMiddleware` owns session *state and rotation*, not the auth identity
 contract.
 

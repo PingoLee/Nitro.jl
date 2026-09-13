@@ -100,7 +100,7 @@ using Nitro
 using Nitro.Workers
 
 function create_report(req::HTTP.Request)
-    report_id = string(req.params["id"])
+    report_id = string(getparams(req)["id"])
     task_id = submit_sequential_task("reports", "report-" * report_id, task_info -> begin
         sleep(3)
         return Dict("report_id" => report_id, "status" => "ready")
@@ -110,7 +110,7 @@ function create_report(req::HTTP.Request)
 end
 
 function report_status(req::HTTP.Request)
-    task_id = string(req.params["task_id"])
+    task_id = string(getparams(req)["task_id"])
     # Pass user_id to securely query task status
     return Res.json(get_task_status(task_id, Owner("user-1")))
 end

@@ -48,7 +48,7 @@ end
 urlpatterns("/auth",
     path("/protected", function(req)
         # Return user info from context
-        user = req.user
+        user = getuser(req)
         return HTTP.Response(200, "Hello, $(user[:name])!")
     end, method="GET", middleware=[BearerAuth(validate_token)]),
 )

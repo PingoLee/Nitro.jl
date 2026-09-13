@@ -9,7 +9,9 @@ The public API documented here is:
   `serve(shutdown_timeout=…)` or `terminate(timeout=…)`
 - `serve(revise=:lazy)` and `serve(revise=:eager)` for optional development hot reload with `Revise.jl`
 - `path()`, `urlpatterns()`, and `include_routes()` for route registration
-- `req.params`, `req.query`, `req.json`, `req.form`, `req.input`, `req.session`, `req.user`, and `req.ip` for request ergonomics
+- `getparams(req)`, `getquery(req)`, `getjson(req)`, `getform(req)`, `getfiles(req)`,
+  `getpost(req)`, `payload(req)`, `getsession(req)`, `getuser(req)`, and `getip(req)` for
+  reading the request
 - `serve(context=...)` for typed application configuration
 - `worker_startup(...)` and `Nitro.Workers` for in-process task execution
 - `Nitro.Auth` for JWT, auth cookies, password hashing, and auth validator helpers
@@ -89,7 +91,8 @@ serve()
 
 ## Request Accessors
 
-Nitro extends `HTTP.Request` with common accessors:
+Nitro reads an `HTTP.Request` through exported accessor functions. Each parses once per request
+and caches the result, so calling one twice is free and both calls return the same object:
 
 ```julia
 using HTTP
@@ -98,13 +101,13 @@ using Nitro
 function inspect_request(req::HTTP.Request, id::Int)
     return Res.json(Dict(
         "id" => id,
-        "params" => req.params,
-        "query" => req.query,
-        "json" => req.json,
-        "input" => req.input,
-        "session" => req.session,
-        "user" => req.user,
-        "ip" => string(req.ip),
+        "params" => getparams(req),
+        "query" => getquery(req),
+        "json" => getjson(req),
+        "input" => payload(req),
+        "session" => getsession(req),
+        "user" => getuser(req),
+        "ip" => string(getip(req)),
     ))
 end
 
@@ -115,15 +118,15 @@ urlpatterns("",
 serve()
 ```
 
-For direct handler access, use `req.json`, `req.form`, and `req.input`. `LazyRequest` remains useful for extractors, but ordinary handlers should usually stay on plain `HTTP.Request`.
+For direct handler access, use `getjson(req)`, `getform(req)`, and `payload(req)`. `LazyRequest` remains useful for extractors, but ordinary handlers should usually stay on plain `HTTP.Request`.
 
 ### Genie Migration Notes
 
-- route params -> `req.params`
-- query string -> `req.query`
-- parsed JSON body -> `req.json`
-- parsed form body -> `req.form`
-- merged request data for simple handlers -> `req.input`
+- route params -> `getparams(req)`
+- query string -> `getquery(req)`
+- parsed JSON body -> `getjson(req)`
+- parsed form body -> `getform(req)`
+- merged request data for simple handlers -> `payload(req)`
 
 Use extractors when you need typed validation instead of a merged dictionary.
 
@@ -169,12 +172,12 @@ using HTTP
 using Nitro
 
 function login(req::HTTP.Request)
-    req.session["user_id"] = 42
+    getsession(req)["user_id"] = 42
     return Res.json(Dict("logged_in" => true))
 end
 
 function profile(req::HTTP.Request)
-    session = req.session
+    session = getsession(req)
     if isnothing(session) || !haskey(session, "user_id")
         return Res.send("Unauthorized", status=401)
     end
@@ -208,4 +211,4 @@ Middleware runs in this order:
 3. Default serializer/error middleware
 4. Router dispatch
 
-Place IP extraction before rate limiting and session/auth middleware before guards that rely on `req.user`.
+Place IP extraction before rate limiting and session/auth middleware before guards that rely on `getuser(req)`.

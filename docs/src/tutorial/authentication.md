@@ -11,7 +11,7 @@ split follows RFC 6750.
 
 | Model | Credential | Typical client | Identity | Start here |
 |---|---|---|---|---|
-| **Session auth** | Session cookie | Browsers (stateful) | `user_id` in `req.session` | [Sessions & Auth](sessions_and_auth.md) |
+| **Session auth** | Session cookie | Browsers (stateful) | `user_id` in `getsession(req)` | [Sessions & Auth](sessions_and_auth.md) |
 | **Bearer / JWT** | `Authorization: Bearer <jwt>` | SPAs, mobile, APIs | `sub` claim | §4 below |
 | **Service / capability token** | Bearer JWT, no `sub` | Machine-to-machine | the `action`/scope claim | §5 below |
 | **Key-scoped (signer) auth** | Bearer JWT signed by a per-caller key | Multi-tenant services | the verified `kid` | §5 below |
@@ -23,12 +23,12 @@ API routes. Whatever the model, the result of authentication is the same artifac
 ## 2. The principal
 
 Auth middleware (`BearerAuth`, `CookieAuthMiddleware`) attaches the authenticated identity
-at `req.context[:user]`, readable as `req.user`. With `jwt_validator` the attached value
+at `req.context[:user]`, read with `getuser(req)`. With `jwt_validator` the attached value
 is a `Principal` — an immutable, dict-like wrapper over the **verified** claims:
 
 ```julia
 function whoami(req::HTTP.Request)
-    user = req.user
+    user = getuser(req)
     user["sub"]      # claims read through dict-style
     user.id          # normalized identity (the configured identity claim, default "sub")
     user.kid         # keyset-verified key id, or nothing
@@ -44,7 +44,7 @@ The contract:
   demand one (`required_claims=["sub"]`).
 - **A `Principal` is read-only.** It is a verified security artifact; enrich it by
   building your own user object in a `user_validator`, or copy it with `Dict(principal)`.
-- **Two context slots.** Without a `user_validator`, the `Principal` *is* `req.user`. With
+- **Two context slots.** Without a `user_validator`, the `Principal` *is* `getuser(req)`. With
   one, your returned user object lands in `req.context[:user]` and the `Principal` rides
   along at `req.context[:auth_claims]` — so guards like `kid_required` still see the
   verified metadata.
@@ -52,7 +52,7 @@ The contract:
   `(user, principal)` tuple).
 - **Guards resolve the principal** from `req.context[:user]` first. Only when no auth
   middleware attached one do `login_required`/`claim_required` fall back to the raw
-  `req.session` dict — that fallback serves session-based apps, and `login_required`
+  `getsession(req)` dict — that fallback serves session-based apps, and `login_required`
   accepts it only when it carries the login marker (`session_key`, default `"user_id"`).
 
 ## 3. The error contract
@@ -135,7 +135,7 @@ validator = jwt_validator(keyset)
 ```
 
 `decode_jwt` selects the key by the token's `kid` header, and the *verified* key id is
-exposed as `req.user.kid`. The trust boundary matters: **a `kid` is only trusted when it
+exposed as `getuser(req).kid`. The trust boundary matters: **a `kid` is only trusted when it
 was resolved against a keyset** — with a single string secret the header `kid` is an
 attacker-writable label, so it is never exposed on the `Principal`, `kid_required` denies,
 and `identity_from=:kid` is a construction-time `ArgumentError`.
@@ -203,8 +203,8 @@ Notes:
 
 ## 7. Session-based auth
 
-`SessionMiddleware`, the `req.session` API, session regeneration, and bridging sessions
-into `req.user` are covered in [Sessions & Auth](sessions_and_auth.md).
+`SessionMiddleware`, the `getsession(req)` API, session regeneration, and bridging sessions
+into `getuser(req)` are covered in [Sessions & Auth](sessions_and_auth.md).
 
 ## 8. Auth cookies & CSRF
 

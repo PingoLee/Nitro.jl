@@ -47,7 +47,7 @@ function login_required(; redirect_url::String="/login", session_key::String="us
 		#      contain `session_key` (a JWT-claims identity is keyed by `sub`, not
 		#      `user_id`), and it may be a struct rather than a Dict.
 		#
-		#   2. The raw `req.session` dict, used only as a fallback when no middleware
+		#   2. The raw `getsession(req)` dict, used only as a fallback when no middleware
 		#      set `:user`. This is NOT an authenticated identity — an anonymous
 		#      visitor accumulates session data (e.g. a cart) — so it counts as
 		#      logged in only when it carries the login marker (`session_key`).

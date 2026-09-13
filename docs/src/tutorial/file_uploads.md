@@ -239,10 +239,11 @@ const STAGING_DIR = "data/tmp"
 function submit_import(req, upload::Files{FormFile})
     file = upload.payload
 
-    # Scope the task to its owner. `req.user` is `nothing` unless auth middleware
+    # Scope the task to its owner. `getuser(req)` is `nothing` unless auth middleware
     # ran, so check before reaching into it — the route below carries
     # `login_required()`, which is what makes the Principal branch the real one.
-    user_id = req.user === nothing ? "anonymous" : something(req.user.id, "anonymous")
+    principal = getuser(req)
+    user_id = principal === nothing ? "anonymous" : something(principal.id, "anonymous")
 
     # 1. Stage to disk — the UUID task_key is the real identity; the original
     #    filename is sanitized to a bare basename so it can't traverse paths.

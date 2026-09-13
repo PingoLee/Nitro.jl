@@ -376,7 +376,7 @@ end
     store = MemoryStore{String, Dict{String,Any}}()
     # Only the POST logs in; a GET that also set `user_id` would leave the auth marker unchanged
     # on the POST and nothing would rotate -- the fixture has to model a real login.
-    login(req) = (req.method == "POST" && (req.session["user_id"] = "u1"); HTTP.Response(200, "ok"))
+    login(req) = (req.method == "POST" && (getsession(req)["user_id"] = "u1"); HTTP.Response(200, "ok"))
     layer = SessionMiddleware(cookie_name = "unit_session", store = store, prune_probability = 0.0)(
         CSRFMiddleware(SECRET)(login))
 
