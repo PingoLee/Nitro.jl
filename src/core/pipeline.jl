@@ -10,8 +10,13 @@
 # Seeds only when the key is ABSENT (#31). `internalrequest(context = ...)` stamps its
 # per-call override onto the request before handing it to this pipeline, and that override
 # must win — this layer supplies the server's default, it does not overwrite a caller's
-# choice. Reading `ctx.app_context[]` here is the ONE remaining read of that shared cell on
-# the request path, and it happens once, outermost, before anything can observe it.
+# choice.
+#
+# There are exactly two reads of `ctx.app_context[]` left on the request path — this one and
+# `internalrequest`'s — plus `serve`'s one-shot startup write (src/core/lifecycle.jl). Both
+# reads happen ONCE per request, before any middleware or handler runs, and each immediately
+# copies the value onto the request. Nothing downstream of here touches the shared cell, which
+# is what removes the window a concurrent request could observe.
 #
 # `haskey` + assignment rather than `get!`: `HTTP.RequestContext` is reached through
 # `haskey`/`getindex`/`setindex!`/`get` throughout `src/` (see `request_input`), and `get!`
