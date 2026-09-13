@@ -28,7 +28,7 @@ using Nitro: BearerAuth, GuardMiddleware, SessionMiddleware, login_required, rol
     @test Nitro.text(res) == "session-ok"
 end
 
-@testset "Bearer auth populates req.user" begin
+@testset "Bearer auth populates getuser(req)" begin
     validator = Nitro.Auth.jwt_validator("jwt-secret")
     token = Nitro.Auth.encode_jwt(Dict(
         "sub" => "17",
@@ -41,14 +41,14 @@ end
         login_required(),
         role_required("admin"),
         permission_required("reports:read"),
-    )(req -> HTTP.Response(200, req.user["sub"])))
+    )(req -> HTTP.Response(200, getuser(req)["sub"])))
 
     req = HTTP.Request("GET", "/secure", ["Authorization" => "Bearer $token"])
     res = handler(req)
     @test res.status == 200
     @test Nitro.text(res) == "17"
 
-    # req.user is the normalized Principal: claims read through, identity is typed
+    # getuser(req) is the normalized Principal: claims read through, identity is typed
     @test req.context[:user] isa Principal
     @test req.context[:user].id == "17"
 end
@@ -79,7 +79,7 @@ end
 
     handler = BearerAuth(validator)(GuardMiddleware(
         kid_required(["service-a"]),
-    )(req -> HTTP.Response(200, req.user.id)))
+    )(req -> HTTP.Response(200, getuser(req).id)))
 
     # Token signed by an allowed key → pass, and the signer is the principal
     token_a = Nitro.Auth.encode_jwt(Dict("action" => "sync"), keyset; kid="service-a", expires_in=60)
@@ -95,11 +95,11 @@ end
     @test handler(req_b).status == 403
 end
 
-@testset "Handler returning req.user serializes as the claims object" begin
+@testset "Handler returning getuser(req) serializes as the claims object" begin
     validator = Nitro.Auth.jwt_validator("jwt-secret")
     token = Nitro.Auth.encode_jwt(Dict("sub" => "17", "role" => "admin"), "jwt-secret"; expires_in=60)
 
-    handler = BearerAuth(validator)(req -> Nitro.Res.json(req.user))
+    handler = BearerAuth(validator)(req -> Nitro.Res.json(getuser(req)))
     req = HTTP.Request("GET", "/me", ["Authorization" => "Bearer $token"])
     res = handler(req)
     @test res.status == 200

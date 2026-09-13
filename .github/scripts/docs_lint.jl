@@ -118,6 +118,10 @@ const REQUIRED_SYMBOLS = String[
     "html", "text", "binary",
     # Request/body plumbing the usage skill teaches.
     "formdata", "multipart", "payload", "getcontext", "regenerate_session!",
+    # The request accessors (#151 removed the `req.<prop>` shorthands these replaced, so the
+    # docs now name the functions directly -- every one of them has to keep existing).
+    "getparams", "getquery", "getjson", "getform", "getfiles", "getpost",
+    "getsession", "setsession!", "getuser", "getip", "setip!",
     "staticfiles", "spafiles", "dynamicfiles",
     # Middleware constructors.
     "SessionMiddleware", "CSRFMiddleware", "Cors", "RateLimiter", "ExtractIP",

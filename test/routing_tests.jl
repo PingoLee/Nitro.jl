@@ -403,9 +403,9 @@ struct MalformedBox; v::String; end
     ctx2 = Nitro.Core.ServerContext()
     Nitro.Core.Routing.urlpatterns(ctx2, "", Nitro.RouteDefinition[
         path("/p/{v}", (req, v::String) -> Res.send(v), method="GET"),
-        # Reads the scalar binding and the `req.params` shorthand in one handler: both must
+        # Reads the scalar binding and the `getparams(req)` accessor in one handler: both must
         # agree, since they are now the same decoded value.
-        path("/agree/{v}", (req, v::String) -> Res.send("$v|$(req.params["v"])"), method="GET"),
+        path("/agree/{v}", (req, v::String) -> Res.send("$v|$(getparams(req)["v"])"), method="GET"),
     ])
     g2(t) = Nitro.Core.internalrequest(ctx2, HTTP.Request("GET", t))
 
@@ -440,7 +440,7 @@ end
 
     @test Nitro.text(g3("/ex/a%20b")) == "a b"
 
-    # `req.params` and `req.input` cannot be pinned through a route -- registration requires a
+    # `getparams(req)` and `payload(req)` cannot be pinned through a route -- registration requires a
     # declared handler parameter for every brace, and that parameter's own decode throws first.
     # Assert at the accessor instead, with the router's slot populated by hand.
     bad = HTTP.Request("GET", "/raw/%ZZ")
@@ -467,23 +467,28 @@ end
     @test qerr.cause isa Exception
     @test !occursin("Caused by", sprint(showerror, qerr))
 
-    # Matched on MESSAGE, not type. `req.params` goes through the process-wide
-    # `Base.getproperty(::HTTP.Request, ::Symbol)` override, and `test/instance_tests.jl` installs
-    # its own via `instance()` -- so under the full suite the thrown value is that instance's
-    # `ValidationError`, a distinct type from this module's. That is #32's getproperty piracy,
-    # not a fault here; a type-identity assertion would be order-dependent (green alone, red in
-    # the suite). The direct `Types.pathparams` call above still pins the exact type.
-    @test_throws "Malformed percent-encoding in path parameter 'v'" bad.params
-    @test_throws "Malformed percent-encoding in path parameter 'v'" bad.input
+    # These assert the TYPE again. The old spelling was `bad.params`, which had to be matched
+    # on MESSAGE: it went through the process-wide `Base.getproperty(::HTTP.Request, ::Symbol)`
+    # override, and `test/instance_tests.jl` builds a second Nitro via `instance()` whose
+    # `__init__` re-installed *its* override -- so under the full suite the thrown value was
+    # that instance's `ValidationError`, a distinct type from this module's, and a type
+    # assertion was order-dependent (green alone, red in the suite). #151 deleted the override
+    # and the call sites here now name `getparams`/`payload`, ordinary generics that always
+    # resolved in this module. So the constraint is gone, not merely relaxed.
+    # (These would pass under the unpatched code too -- `getparams` was never pirated. What
+    # changed is that the test can be *written* this way now.)
+    @test_throws Nitro.ValidationError getparams(bad)
+    @test_throws Nitro.ValidationError payload(bad)
+    @test_throws "Malformed percent-encoding in path parameter 'v'" getparams(bad)
 
     bad8 = HTTP.Request("GET", "/raw/%80")
     bad8.context[:params] = Dict("v" => "%80")
     @test_throws Nitro.ValidationError Nitro.Types.pathparams(bad8)
-    @test_throws "Invalid UTF-8 in path parameter 'v'" bad8.params
+    @test_throws "Invalid UTF-8 in path parameter 'v'" getparams(bad8)
 
     ok = HTTP.Request("GET", "/raw/a%20b")
     ok.context[:params] = Dict("v" => "a%20b")
-    @test ok.params["v"] == "a b"
+    @test getparams(ok)["v"] == "a b"
 
     # `unescapeuri` does NOT throw on "%80" -- it returns an invalid-UTF-8 String, which would
     # surface as a 500 the moment anything serialized it. The boundary rejects it instead.
@@ -556,12 +561,12 @@ using Nitro.Core.Routing: urlpatterns
 #
 # The route echoes BOTH maps, so the assertions observe what the handler actually sees rather
 # than only that the request survived: a handler binding `id::Int` goes through the path
-# binder, never through `req.input`, so asserting on the bound value alone would pass even
-# with `req.input` poisoned.
+# binder, never through `payload(req)`, so asserting on the bound value alone would pass even
+# with `payload(req)` poisoned.
 ctx = ServerContext()
 urlpatterns(ctx, "", Nitro.RouteDefinition[
     Nitro.path("/items/<int:id>", function (req, id::Int)
-        Res.json(Dict("id" => id, "params" => req.params, "input" => req.input))
+        Res.json(Dict("id" => id, "params" => getparams(req), "input" => payload(req)))
     end, method="GET"),
 ])
 
@@ -570,12 +575,12 @@ expected = Dict("id" => 42,
                 "input" => Dict("id" => "42"))
 
 reads_params(handler) = function (req::HTTP.Request)
-    @test req.params === nothing        # pre-router: genuinely not populated yet
+    @test getparams(req) === nothing        # pre-router: genuinely not populated yet
     handler(req)
 end
 
 reads_input(handler) = function (req::HTTP.Request)
-    _ = req.input                       # merges path params -- so it touches them too
+    _ = payload(req)                       # merges path params -- so it touches them too
     handler(req)
 end
 
@@ -590,12 +595,12 @@ roundtrip(mw) = Nitro.json(internalrequest(ctx, HTTP.Request("GET", "/items/42")
     @test roundtrip(Function[]) == expected
 end
 
-@testset "middleware reading req.params does not brick the route" begin
+@testset "middleware reading getparams(req) does not brick the route" begin
     # Pre-fix: `pathparams` cached the `nothing`, the binder did `nothing["id"]`, 500.
     @test roundtrip([reads_params]) == expected
 end
 
-@testset "middleware reading req.input keeps path params in the handler's input" begin
+@testset "middleware reading payload(req) keeps path params in the handler's input" begin
     # Pre-fix: 200, but `input` came back `{}` -- silently wrong rather than loud.
     @test roundtrip([reads_input]) == expected
 end

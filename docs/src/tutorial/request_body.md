@@ -4,14 +4,14 @@ A request body is data sent by the client to your API — usually JSON or a form
 Used when inputs are too complex or large for a URL.
 
 Nitro.jl offers two layers of body access:
-1. **Low-level** — `req.json` / `req.form` on `HTTP.Request` (simple, flexible)
+1. **Low-level** — `getjson(req)` / `getform(req)` on `HTTP.Request` (simple, flexible)
 2. **Extractors** — `Json{T}`, `Form{T}`, `JsonFragment{T}` (typed, validated, recommended)
 
 ---
 
-## Low-level: `req.json` and `req.form`
+## Low-level: `getjson(req)` and `getform(req)`
 
-Nitro extends `HTTP.Request` with body accessors. This is the simplest approach
+Nitro provides exported body accessors that take the request. This is the simplest approach
 when you need to inspect the raw payload before deciding what to do.
 
 ```julia
@@ -26,7 +26,7 @@ import ..appM  # your app's model module
 export get_product
 
 function get_product(req::HTTP.Request)
-    payload = req.json  # Dict{String, Any} or nothing
+    payload = getjson(req)  # Dict{String, Any} or nothing
     if !(payload isa AbstractDict)
         return Res.json(Dict("error" => "Invalid JSON payload"), status=400)
     end

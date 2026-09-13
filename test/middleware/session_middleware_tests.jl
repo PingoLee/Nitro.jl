@@ -192,7 +192,7 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
             session = getsession(req)
             @test session["user_id"] == 99
             @test session["role"] == "admin"
-            # Note: SessionMiddleware populates req.session, not req.user
+            # Note: SessionMiddleware populates the session, not the user (getuser stays nothing)
             return HTTP.Response(200, "read")
         end
 

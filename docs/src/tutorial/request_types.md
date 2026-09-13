@@ -62,7 +62,7 @@ preferred for lookups when the input is too large for a URL (e.g. a batch of IDs
 ```julia
 # src/Handlers/ProductHandlers.jl
 function find_by_skus(req::HTTP.Request)
-    payload = req.json
+    payload = getjson(req)
     skus = get(payload, "skus", String[])
 
     # PormG's __@in operator for batch lookup

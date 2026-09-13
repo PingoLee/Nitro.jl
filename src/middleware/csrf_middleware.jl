@@ -8,7 +8,7 @@ using ...Types: CookieConfig, Nullable
 using ...Cookies: get_cookie, set_cookie!
 using ...Crypto: secure_random_bytes
 using ...Res: json
-using ...Core: own_response_headers
+using ...Core: own_response_headers, getjson, getform
 
 export CSRFMiddleware, issue_csrf_token!, validate_csrf_token
 
@@ -91,7 +91,7 @@ end
 The value a token is bound to: the session id `SessionMiddleware` puts on the request context.
 
 It is the only identifier present on *every* request, anonymous first visits included -- a user
-id is not (`Principal.id` is nullable, and a session-only app never populates `req.user`).
+id is not (`Principal.id` is nullable, and a session-only app never populates `getuser(req)`).
 `nothing` means the pipeline cannot bind, and every caller here fails closed on that.
 """
 function _binding(req::HTTP.Request)::Nullable{String}
@@ -160,7 +160,7 @@ function _presented_token(req::HTTP.Request, header_name::String, form_field::St
     end
 
     form = try
-        req.form
+        getform(req)
     catch
         nothing
     end
@@ -173,7 +173,7 @@ function _presented_token(req::HTTP.Request, header_name::String, form_field::St
     end
 
     json = try
-        req.json
+        getjson(req)
     catch
         nothing
     end

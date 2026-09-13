@@ -44,10 +44,11 @@ end
 @testset "Nitro smoke test on Julia $(VERSION)" begin
 
     # ── 1. The package loads ──────────────────────────────────────────────────
-    # Not a formality on a new Julia. `__init__` redefines
-    # `Base.getproperty(::HTTP.Request, ::Symbol)` via `@eval` and pirates
-    # `HTTP.queryparams` (src/core.jl); both are exactly the kind of thing a compiler
-    # or Base change breaks. Reaching this line at all means load-time wiring survived.
+    # Not a formality on a new Julia. Nitro pirates `HTTP.queryparams` (src/core.jl) and
+    # treats type inference as an API property -- exactly the kind of thing a compiler or
+    # Base change breaks. Reaching this line at all means load-time wiring survived.
+    # (It used to also `@eval` a `Base.getproperty(::HTTP.Request, ::Symbol)` from
+    # `__init__`; #151 deleted that, and `Core.__init__` with it.)
     @testset "loads and exposes its public surface" begin
         @test isdefined(Nitro, :serve)
         @test isdefined(Nitro, :path)
@@ -55,13 +56,17 @@ end
         @test Nitro.Core.ServerContext() isa Nitro.Core.ServerContext
     end
 
-    # ── 2. Request property overrides still work ──────────────────────────────
-    # The `getproperty` override is the single most version-fragile thing in src/.
-    @testset "request property overrides" begin
+    # ── 2. The request accessors still work ───────────────────────────────────
+    # These reach into HTTP's request internals (`getfield(req, :context)` for the cache,
+    # the body hierarchy for parsing), which is the version-fragile part of src/.
+    @testset "request accessors" begin
         req = HTTP.Request("GET", "/x?a=1&b=2", ["X-Trace" => "abc"])
-        @test req.query == Dict("a" => "1", "b" => "2")
+        @test getquery(req) == Dict("a" => "1", "b" => "2")
         req2 = HTTP.Request("POST", "/x", [], "{\"n\":7}")
-        @test req2.json["n"] == 7
+        @test getjson(req2)["n"] == 7
+        # #151: the property shorthands are gone, and HTTP owns `getproperty` again.
+        @test_throws FieldError getproperty(req2, :json)
+        @test only(methods(Base.getproperty, (HTTP.Request, Symbol))).module !== Nitro.Core
     end
 
     # ── 3. Routing + the response write path, over a real socket ──────────────

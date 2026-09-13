@@ -72,7 +72,7 @@ Read the html form data from the body of a HTTP.Request
 """
 function formdata(req::HTTP.Request) :: Dict{String,String}
     # multipart/form-data is not urlencoded — parsing it here yields a garbage
-    # key. Use `multipart(req)` (`req.files` / `req.post`) for multipart bodies.
+    # key. Use `getfiles(req)` / `getpost(req)` (or `multipart(req)`) for multipart bodies.
     if occursin("multipart/form-data", HTTP.header(req, "Content-Type", ""))
         return copy(EMPTY_FORM_DATA)
     end
@@ -221,7 +221,7 @@ function multipart(req::HTTP.Request) :: Dict{String, Union{FormFile, Vector{For
     # `Vector{String}`) and, crucially, prevents a field name that anomalously
     # carries both a file part and a text part from collapsing into a
     # `Vector{Any}` — which the typed result Dict cannot hold and which used to
-    # throw a `MethodError` (a client-triggerable 500 via `req.files`/`req.post`).
+    # throw a `MethodError` (a client-triggerable 500 via `getfiles`/`getpost`).
     files = Dict{String, Vector{FormFile}}()
     texts = Dict{String, Vector{String}}()
     for part in parts

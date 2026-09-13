@@ -53,7 +53,8 @@ export  # Server lifecycle
         # File serving
         staticfiles, dynamicfiles, spafiles,
         # Util
-        getparams, getquery, getsession, setsession!, getip, setip!, getpeerip, getcontext, payload, getexternalurl,
+        getparams, getquery, getjson, getform, getfiles, getpost,
+        getsession, setsession!, getuser, getip, setip!, getpeerip, getcontext, payload, getexternalurl,
         formdata, multipart, format_sse_message,
         # Environment resolution (#55) -- reports the env, never gates on it
         current_env,

@@ -116,8 +116,8 @@ end
 ## Percent-encoding
 
 Path parameters are **percent-decoded exactly once**, before your handler sees them. This holds
-for every spelling — a scalar argument, `req.params`, `getparams(req)`, and `Path{T}` fields —
-so all four observe the same value:
+for every spelling — a scalar argument, `getparams(req)`, and `Path{T}` fields —
+so all three observe the same value:
 
 ```
 GET /files/my%20report.pdf   →  "my report.pdf"
@@ -281,7 +281,7 @@ path("/api/report/<int:report_id>", ReportHandlers.report, methods=["GET", "POST
 # src/Handlers/ReportHandlers.jl
 function report(req, report_id::Int)
     if req.method == "POST"
-        data = req.json
+        data = getjson(req)
         # ... save / trigger generation
         return Res.json(Dict("status" => "queued", "id" => report_id))
     end

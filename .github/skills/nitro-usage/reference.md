@@ -43,24 +43,34 @@ Exactly five. An unknown name throws at `path()` time.
 
 ## The request object
 
-Shorthand properties installed on `HTTP.Request`. Prefer these over `req.context` lookups.
+Exported accessor **functions** over the request. Prefer these over `req.context` lookups. The
+param and body accessors (`getparams`, `getquery`, `getjson`, `getform`, `getpost`, `getfiles`,
+`payload`) parse once per request and cache, returning a live handle — treat it as read-only.
+`getsession`, `getuser` and `getip` are plain context lookups, not parsed or cached.
 
-| Property | Type | Notes |
+| Accessor | Type | Notes |
 |----------|------|-------|
-| `req.params` | `Dict` | Path parameters, converted to the declared type |
-| `req.query` | `Dict` | Query-string parameters |
-| `req.json` | parsed JSON | **Cached** per request |
-| `req.form` | `Dict` | urlencoded body — **cached** |
-| `req.post` | `Dict{String, Union{String, Vector{String}}}` | Multipart *text* fields (Django `request.POST`) — **cached** |
-| `req.files` | `Dict{String, Union{FormFile, Vector{FormFile}}}` | Multipart *file* parts (Django `request.FILES`) — **cached** |
-| `req.input` / `req.data` | `Dict` | Merged: `params > post > form > json > query` |
-| `req.session` | `Dict` or `nothing` | Needs `SessionMiddleware` |
-| `req.user` | `Principal` or `nothing` | Set by an auth middleware |
-| `req.ip` | IP or `nothing` | Needs `ExtractIP` |
-| `req.context` | metadata view | HTTP.jl v2 semantics, preserved |
+| `getparams(req)` | `Dict` or `nothing` | Path parameters, percent-decoded once; `nothing` before the router runs |
+| `getquery(req)` | `Dict` | Query-string parameters |
+| `getjson(req)` | parsed JSON or `nothing` | **Cached** per request |
+| `getform(req)` | `Dict` | urlencoded body — **cached** |
+| `getpost(req)` | `Dict{String, Union{String, Vector{String}}}` | Multipart *text* fields (Django `request.POST`) — **cached** |
+| `getfiles(req)` | `Dict{String, Union{FormFile, Vector{FormFile}}}` | Multipart *file* parts (Django `request.FILES`) — **cached** |
+| `payload(req)` | `Dict{String,Any}` | Merged: `params > post > form > json > query` |
+| `getsession(req)` | `Dict` or `nothing` | Needs `SessionMiddleware` |
+| `getuser(req)` | anything, or `nothing` | Set by an auth middleware; a `Principal` only when `jwt_validator` ran without a `user_validator` |
+| `getip(req)` | IP or `nothing` | Needs `ExtractIP`; `getpeerip(req)` for the socket peer |
+| `getcontext(req)` / `getcontext(req, T)` | app context | The object passed to `serve(context = …)`; use the typed form on the request path |
+| `setsession!(req, v)` / `setip!(req, v)` | — | The two writers |
 
-Helper functions over the same data: `getparams`, `getquery`, `getsession`, `setsession!`, `getip`,
-`setip!`, `getcontext(req)` / `getcontext(req, T)`, `payload(req)`.
+**There are no `req.<property>` shorthands.** `req.params`, `req.json`, `req.session` and the rest
+were removed in #151 — a same-signature `Base.getproperty(::HTTP.Request, ::Symbol)` replaced
+HTTP.jl's own method process-wide, which is type piracy on a foreign type. `req.<prop>` now raises
+`FieldError`.
+
+What still works on the request, because it is HTTP.jl's own: `req.context` (the metadata view —
+the sanctioned place to pass values down a request), `req.version`, and the real fields
+`req.method`, `req.target`, `req.body`, `req.headers`.
 
 ---
 
@@ -105,6 +115,11 @@ from the body when the response is serialized.
 `text(req)`, `json(req)`, `json(req, T)`, `binary(req)`, `formdata(req)`, `multipart(req)`, and the
 `HTTP.Response` forms of each. These bare names are **parsers only** — response building lives in
 `Res` (#28), so there is no longer a same-name builder to disambiguate against.
+
+They differ from the `get*` accessors above in that they **re-parse on every call**, accept keyword
+arguments, and also take an `HTTP.Response`. In a handler reach for `getjson(req)` / `getform(req)`;
+reach for `json(req; …)` when you need a one-off parse with options. `multipart(req)` returns files
+and text fields *together*, so it is not a substitute for `getfiles` or `getpost`.
 
 ---
 

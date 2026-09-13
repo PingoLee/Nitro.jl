@@ -1,5 +1,5 @@
 # `queryvars` used to re-parse `HTTP.URI(req.target)` and rebuild its Dict on EVERY call, so
-# anything touching `req.query` more than once — a handler, or the param binder running once
+# anything touching `getquery(req)` more than once — a handler, or the param binder running once
 # per bound query parameter — paid the whole decode again. Since #38 it is parsed once per
 # request and cached in the request context (src/types.jl).
 SUITE["query"] = BenchmarkGroup()

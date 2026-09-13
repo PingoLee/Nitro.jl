@@ -1,6 +1,6 @@
 ﻿# Working with Sessions
 
-Nitro sessions are server-side by default. The browser receives only a session ID cookie, while the data you assign to `req.session` stays in the configured store.
+Nitro sessions are server-side by default. The browser receives only a session ID cookie, while the data you assign to `getsession(req)` stays in the configured store.
 
 For the broader auth story, including guards and JWT helpers, see [Sessions and Auth](../sessions_and_auth.md).
 
@@ -14,7 +14,7 @@ using Nitro
 store = Nitro.Types.MemoryStore{String, Dict{String,Any}}()
 
 function login_handler(req::HTTP.Request)
-    body = req.json
+    body = getjson(req)
     username = get(body, "username", "")
     password = get(body, "password", "")
 
@@ -26,29 +26,29 @@ function login_handler(req::HTTP.Request)
     # Persist the authenticated principal in the session.
     # With the default `auth_key="user_id"`, SessionMiddleware
     # will rotate an existing anonymous session ID automatically.
-    req.session["user_id"] = 1
-    req.session["username"] = username
-    req.session["cart"] = Int[]
+    getsession(req)["user_id"] = 1
+    getsession(req)["username"] = username
+    getsession(req)["cart"] = Int[]
 
     return Res.json(Dict("message" => "logged in"))
 end
 
 function dashboard_handler(req::HTTP.Request)
-    user_id = get(req.session, "user_id", nothing)
+    user_id = get(getsession(req), "user_id", nothing)
     if isnothing(user_id)
         return Res.json(Dict("error" => "login required"); status=401)
     end
 
     return Res.json(Dict(
         "user_id" => user_id,
-        "username" => req.session["username"],
-        "cart_items" => length(get(req.session, "cart", Int[])),
+        "username" => getsession(req)["username"],
+        "cart_items" => length(get(getsession(req), "cart", Int[])),
     ))
 end
 
 function logout_handler(req::HTTP.Request)
     # Clear the payload, then rotate so the previous authenticated ID is retired.
-    empty!(req.session)
+    empty!(getsession(req))
     regenerate_session!(req, store; ttl=3600)
     return Res.json(Dict("message" => "logged out"))
 end
@@ -69,7 +69,7 @@ The `secure=false` example is only for local HTTP development. Keep `secure=true
 ## What SessionMiddleware Does
 
 1. Reads the session ID cookie.
-2. Loads the server-side payload into `req.session`.
+2. Loads the server-side payload into `getsession(req)`.
 3. Persists any changes at the end of the request.
 4. Writes a new cookie when the session is created or the session ID rotates.
 
@@ -98,8 +98,8 @@ If you keep the default `auth_key="user_id"`, `SessionMiddleware` also rotates a
 
 ```julia
 function elevate_handler(req::HTTP.Request)
-    req.session["user_id"] = 42
-    req.session["role"] = "admin"
+    getsession(req)["user_id"] = 42
+    getsession(req)["role"] = "admin"
 
     # Use explicit rotation if the handler must retire the old ID immediately.
     regenerate_session!(req, store; ttl=3600)
@@ -156,7 +156,7 @@ four methods above is enough for custom backends.
 
 ## Logout Semantics
 
-With `SessionMiddleware`, `empty!(req.session)` only clears the current payload. To retire the old authenticated session ID, pair it with `regenerate_session!`.
+With `SessionMiddleware`, `empty!(getsession(req))` only clears the current payload. To retire the old authenticated session ID, pair it with `regenerate_session!`.
 
 If you manage sessions manually without `SessionMiddleware`, delete the old server-side record and invalidate the client cookie yourself.
 

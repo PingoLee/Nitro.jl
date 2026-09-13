@@ -108,23 +108,36 @@ end
 end
 ```
 
-The request exposes Django-style shorthands — prefer these over digging into `req.context`:
+Read the request through these exported **functions** — prefer them over digging into
+`req.context`:
 
-| Property | Gives you |
+| Accessor | Gives you |
 |----------|-----------|
-| `req.params` | Path parameters, already converted to the declared type |
-| `req.query` | Query-string parameters |
-| `req.json` | Parsed JSON body (cached per request) |
-| `req.form` | Parsed urlencoded form body (cached) |
-| `req.post` | Text fields of a multipart body (Django `request.POST`, cached) |
-| `req.files` | File parts of a multipart body (Django `request.FILES`, cached) |
-| `req.input` / `req.data` | Merged input — `params > post > form > json > query` |
-| `req.session` | Session dict, when `SessionMiddleware` is in the pipeline |
-| `req.user` | The authenticated `Principal`, when an auth middleware ran |
-| `req.ip` | Client IP, when `ExtractIP` is in the pipeline (`getpeerip(req)` for the socket peer) |
+| `getparams(req)` | Path parameters, percent-decoded once; `nothing` before the router runs |
+| `getquery(req)` | Query-string parameters |
+| `getjson(req)` | Parsed JSON body (cached per request) |
+| `getform(req)` | Parsed urlencoded form body (cached) |
+| `getpost(req)` | Text fields of a multipart body (Django `request.POST`, cached) |
+| `getfiles(req)` | File parts of a multipart body (Django `request.FILES`, cached) |
+| `payload(req)` | Merged input — `params > post > form > json > query` |
+| `getsession(req)` | Session dict, when `SessionMiddleware` is in the pipeline |
+| `getuser(req)` | The authenticated user, when an auth middleware ran |
+| `getip(req)` | Client IP, when `ExtractIP` is in the pipeline (`getpeerip(req)` for the socket peer) |
 
-`req.json`, `req.form`, `req.post`, and `req.files` are **cached per request** — reading them twice
-is free, so don't hand-roll your own caching.
+The body and param accessors — `getparams`, `getquery`, `getjson`, `getform`, `getpost`,
+`getfiles`, `payload` — are **cached per request**, so reading one twice is free; don't hand-roll
+your own caching. (`getparams` deliberately refuses to cache the pre-router `nothing`.)
+`getsession`, `getuser` and `getip` are plain context lookups, cheap for the same reason. Treat
+what they return as read-only; pass values down a request through `req.context`.
+
+**There is no `req.params` / `req.json` / `req.session` property sugar** — those shorthands were
+removed in #151 and `req.<prop>` now raises `FieldError`. `req.context`, `req.method`, `req.body`,
+`req.headers` and `req.target` are HTTP.jl's own and still work.
+
+`getjson`/`getform` are the *cached accessors*; the bare `json(req)` / `formdata(req)` body parsers
+re-parse on every call, take keyword arguments, and also accept an `HTTP.Response`. `getfiles` and
+`getpost` are filtered views of a multipart body — `multipart(req)` returns files and text fields
+together and is not a substitute for either.
 
 ---
 
@@ -233,7 +246,7 @@ Guards: `login_required(; redirect_url, session_key)`, `role_required(role; role
 `claim_required`.
 
 The authenticated principal is a `Principal` — an immutable, dict-like wrapper over *verified* claims
-with typed `id` and `kid` fields. Read it from `req.user`.
+with typed `id` and `kid` fields. Read it with `getuser(req)`.
 
 > **Authentication is not authorization.** A route that loads a record by a client-supplied id must
 > verify the caller *owns* it. `login_required()` alone is an IDOR waiting to happen.
@@ -253,7 +266,7 @@ SessionMiddleware(
 )
 ```
 
-Read and write through `req.session`. Call `regenerate_session!(req, store)` on any privilege
+Read and write through `getsession(req)`. Call `regenerate_session!(req, store)` on any privilege
 change you perform manually. `CSRFMiddleware(secret)` is required for cookie-authenticated
 mutations; its cookie is deliberately **not** `httponly` so the SPA can read and echo the token in
 the `X-CSRF-Token` header (or a `_csrf` form field / JSON key).
@@ -385,8 +398,8 @@ query parameter with no default is **required**: omitting it is a 400, not `noth
 | `serveparallel()` | `serve()` — already multithreaded via `Threads.@spawn` |
 | `html(...)` / `js(...)` / `css(...)` / `xml(...)` / `text(...)` / `binary(...)` | `Res.html(...)` / `Res.send(...; content_type=...)` — the bare names are request parsers |
 | Unescaped interpolation into `Res.html()` or `Res.send(...; content_type=...)` | Escape first; or return JSON and render client-side |
-| `req.context[:session]` | `req.session` (likewise `req.user`, `req.ip`, `req.params`) |
-| Reaching into `req.json["field"]` for a typed body | `Json{T}` extractor + `validate` |
+| `req.context[:session]` | `getsession(req)` (likewise `getuser`, `getip`, `getparams`) |
+| Reaching into `getjson(req)["field"]` for a typed body | `Json{T}` extractor + `validate` |
 | Binding a request body to a struct with `is_admin` / `user_id` | A separate input struct; assign privileged fields server-side |
 | `if user.role == "admin"` inside a handler | `role_required("admin")` guard on the route |
 | `login_required()` on a route that loads a record by client id | Also verify ownership — otherwise IDOR |

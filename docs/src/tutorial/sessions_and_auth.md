@@ -2,9 +2,9 @@
 
 Nitro treats session storage and authenticated user resolution as separate concerns.
 
-- `SessionMiddleware` manages server-side session state via `req.session`.
+- `SessionMiddleware` manages server-side session state via `getsession(req)`.
 - `BearerAuth` extracts credentials and attaches the authenticated principal.
-- Guards read `req.user`, so they work the same way for session-backed and JWT-backed routes.
+- Guards read `getuser(req)`, so they work the same way for session-backed and JWT-backed routes.
 
 ## Quick Start
 
@@ -22,7 +22,7 @@ store = pormg_nitro_session(db_key="db")
 
 # 3. Define handlers
 function login_handler(req::HTTP.Request)
-    payload = req.json
+    payload = getjson(req)
     username = get(payload, "username", "")
     password = get(payload, "password", "")
 
@@ -32,9 +32,9 @@ function login_handler(req::HTTP.Request)
     end
 
     # Store data in the session — like Django's request.session
-    req.session["user_id"]  = user[:id]
-    req.session["username"] = user[:username]
-    req.session["role"]     = user[:is_staff] ? "staff" : "user"
+    getsession(req)["user_id"]  = user[:id]
+    getsession(req)["username"] = user[:username]
+    getsession(req)["role"]     = user[:is_staff] ? "staff" : "user"
 
     # Rotate the session ID after authentication to prevent fixation.
     regenerate_session!(req, store; ttl=3600)
@@ -43,19 +43,19 @@ function login_handler(req::HTTP.Request)
 end
 
 function me_handler(req::HTTP.Request)
-    user_id = get(req.session, "user_id", nothing)
+    user_id = get(getsession(req), "user_id", nothing)
     if isnothing(user_id)
         return Res.json(Dict("error" => "Not authenticated"); status=401)
     end
     return Res.json(Dict(
         "user_id"  => user_id,
-        "username" => req.session["username"],
-        "role"     => req.session["role"],
+        "username" => getsession(req)["username"],
+        "role"     => getsession(req)["role"],
     ))
 end
 
 function logout_handler(req::HTTP.Request)
-    empty!(req.session)
+    empty!(getsession(req))
     regenerate_session!(req, store; ttl=3600)
     return Res.json(Dict("message" => "Logged out"))
 end
@@ -76,7 +76,7 @@ serve(middleware=[
 The `secure=false` example is for local HTTP development only. Keep `secure=true` in production.
 
 With the default `rotate_on_auth=true` and `auth_key="user_id"`, `SessionMiddleware`
-also rotates an existing session automatically when `req.session["user_id"]` is added,
+also rotates an existing session automatically when `getsession(req)["user_id"]` is added,
 removed, or changed. Keep `regenerate_session!` in login/logout flows when you want the
 rotation to happen immediately inside the handler or when your authenticated principal
 uses a different session key.
@@ -127,23 +127,23 @@ delete_session!(store::S, session_id::String)           # → remove a session
 cleanup_expired_sessions!(store::S)                     # → prune expired entries
 ```
 
-## Using `req.session` — Django-style
+## Using `getsession(req)` — Django-style
 
-`req.session` is a `Dict{String, Any}` injected by `SessionMiddleware`.
+`getsession(req)` is a `Dict{String, Any}` injected by `SessionMiddleware`.
 It works exactly like Django's `request.session`:
 
 | Django (Python) | Nitro (Julia) |
 |---|---|
-| `request.session["user_id"] = 42` | `req.session["user_id"] = 42` |
-| `request.session.get("role", "guest")` | `get(req.session, "role", "guest")` |
-| `del request.session["cart"]` | `delete!(req.session, "cart")` |
-| `request.session.flush()` | `empty!(req.session); regenerate_session!(req, store; ttl=3600)` |
-| `"user_id" in request.session` | `haskey(req.session, "user_id")` |
+| `request.session["user_id"] = 42` | `getsession(req)["user_id"] = 42` |
+| `request.session.get("role", "guest")` | `get(getsession(req), "role", "guest")` |
+| `del request.session["cart"]` | `delete!(getsession(req), "cart")` |
+| `request.session.flush()` | `empty!(getsession(req)); regenerate_session!(req, store; ttl=3600)` |
+| `"user_id" in request.session` | `haskey(getsession(req), "user_id")` |
 
 Changes are automatically detected and persisted at the end of the request.
 You do not need to call a save method.
 
-`empty!(req.session)` only clears the current payload. For the default `user_id`-based flow,
+`empty!(getsession(req))` only clears the current payload. For the default `user_id`-based flow,
 `SessionMiddleware` now rotates an existing session automatically when auth state changes.
 Call `regenerate_session!` explicitly if you want that rotation to happen immediately in the
 current handler or if your authenticated principal uses a different session key.
@@ -153,9 +153,9 @@ current handler or if your authenticated principal uses a different session key.
 ```julia
 function login_handler(req::HTTP.Request)
     # ... validate credentials ...
-    req.session["user_id"]   = user[:id]
-    req.session["username"]  = user[:username]
-    req.session["logged_in"] = string(Dates.now())
+    getsession(req)["user_id"]   = user[:id]
+    getsession(req)["username"]  = user[:username]
+    getsession(req)["logged_in"] = string(Dates.now())
     return Res.json(Dict("status" => "ok"))
 end
 ```
@@ -164,7 +164,7 @@ end
 
 ```julia
 function dashboard_handler(req::HTTP.Request)
-    user_id = get(req.session, "user_id", nothing)
+    user_id = get(getsession(req), "user_id", nothing)
     if isnothing(user_id)
         return Res.json(Dict("error" => "Login required"); status=401)
     end
@@ -174,14 +174,14 @@ end
 
 ### Update / append data
 
-Because `req.session` is a plain `Dict{String, Any}`, you update or append with
+Because `getsession(req)` is a plain `Dict{String, Any}`, you update or append with
 the same Julia idioms you would use on any dictionary.
 
 **Overwrite a key:**
 
 ```julia
 function update_role_handler(req::HTTP.Request)
-    req.session["role"] = "admin"       # replaces previous value
+    getsession(req)["role"] = "admin"       # replaces previous value
     return Res.json(Dict("status" => "role updated"))
 end
 ```
@@ -190,9 +190,9 @@ end
 
 ```julia
 function add_to_cart_handler(req::HTTP.Request, product_id::Int)
-    cart = get(req.session, "cart", Int[])   # default to empty list
+    cart = get(getsession(req), "cart", Int[])   # default to empty list
     push!(cart, product_id)
-    req.session["cart"] = cart               # write back
+    getsession(req)["cart"] = cart               # write back
     return Res.json(Dict("cart" => cart))
 end
 ```
@@ -201,10 +201,10 @@ end
 
 ```julia
 function update_prefs_handler(req::HTTP.Request)
-    patch = req.json                         # e.g. Dict("theme" => "dark")
-    prefs = get(req.session, "prefs", Dict{String,Any}())
+    patch = getjson(req)                         # e.g. Dict("theme" => "dark")
+    prefs = get(getsession(req), "prefs", Dict{String,Any}())
     merge!(prefs, patch)
-    req.session["prefs"] = prefs
+    getsession(req)["prefs"] = prefs
     return Res.json(Dict("prefs" => prefs))
 end
 ```
@@ -215,7 +215,7 @@ All changes are automatically persisted at the end of the request by `SessionMid
 
 ```julia
 function remove_cart_handler(req::HTTP.Request)
-    delete!(req.session, "cart")
+    delete!(getsession(req), "cart")
     return Res.json(Dict("status" => "cart cleared"))
 end
 ```
@@ -224,7 +224,7 @@ end
 
 ```julia
 function logout_handler(req::HTTP.Request)
-    empty!(req.session)
+    empty!(getsession(req))
     regenerate_session!(req, store; ttl=3600)
     return Res.json(Dict("message" => "Logged out"))
 end
@@ -239,7 +239,7 @@ After login or any privilege change, regenerate the session ID to prevent sessio
 ```julia
 function login_handler(req::HTTP.Request)
     # ... validate credentials ...
-    req.session["user_id"] = user[:id]
+    getsession(req)["user_id"] = user[:id]
 
     # Cycle the session ID — works with any store backend.
     regenerate_session!(req, store; ttl=3600)
@@ -259,13 +259,13 @@ the rotation to happen before the handler finishes.
 
 ## Unified Auth Context
 
-`SessionMiddleware` manages state (`req.session`) but does not automatically
-populate `req.user`. Write a small middleware to bridge them:
+`SessionMiddleware` manages state (`getsession(req)`) but does not automatically
+populate `getuser(req)`. Write a small middleware to bridge them:
 
 ```julia
 function SessionAuthMiddleware(handle)
     return function(req::HTTP.Request)
-        session = req.session
+        session = getsession(req)
         if !isnothing(session) && haskey(session, "user_id")
             req.context[:user] = Dict(
                 "id"   => session["user_id"],
@@ -298,7 +298,7 @@ isnothing(jwt_secret) && error("JWT_SECRET must be set")
 validator = jwt_validator(jwt_secret)
 
 function profile(req::HTTP.Request)
-    return Res.json(Dict("sub" => req.user["sub"]))
+    return Res.json(Dict("sub" => getuser(req)["sub"]))
 end
 
 urlpatterns("",
@@ -307,8 +307,8 @@ urlpatterns("",
 ```
 
 `jwt_validator` returns a normalized [`Principal`](authentication.md): the
-verified claims stay readable dict-style (`req.user["sub"]`, as above), and the resolved
-identity is available as a typed field — `req.user.id` is the `sub` claim by default
+verified claims stay readable dict-style (`getuser(req)["sub"]`, as above), and the resolved
+identity is available as a typed field — `getuser(req).id` is the `sub` claim by default
 (configurable via `identity_claim`, or derive it from the verified key id with
 `identity_from=:kid`). See [Authentication](authentication.md) for the full contract.
 
@@ -347,22 +347,22 @@ token = encode_jwt(Dict(
 ```
 
 `BearerAuth(jwt_validator(jwt_secret))` verifies the signature and attaches the decoded
-claims as `req.user`. Because the claims *are* the identity here, `req.user` has no
+claims as `getuser(req)`. Because the claims *are* the identity here, `getuser(req)` has no
 `sub`/`user_id` — and that is fine:
 
 - **`login_required` only checks that a validly-signed token is present.** It trusts any
   principal an auth middleware attached, so an `action`-keyed token (no `user_id`) passes.
-  The `user_id` marker is required only on the raw-`req.session` fallback, never on a
+  The `user_id` marker is required only on the raw-`getsession(req)` fallback, never on a
   principal that `BearerAuth` already authenticated.
 
 To authorize the specific action, declare it with `claim_required`:
 
 ```julia
-# 403 unless req.user["action"] == "reports:generate"
+# 403 unless getuser(req)["action"] == "reports:generate"
 authorize_generate = claim_required("action", "reports:generate")
 
 function generate_report(req::HTTP.Request)
-    return Res.json(Dict("status" => "queued", "requested_by" => req.user["app"]))
+    return Res.json(Dict("status" => "queued", "requested_by" => getuser(req)["app"]))
 end
 
 urlpatterns("",
@@ -376,7 +376,7 @@ urlpatterns("",
 For list-shaped claims (permissions, scopes), use `kind=:contains`:
 
 ```julia
-# 403 unless "reports:read" in req.user["scopes"]
+# 403 unless "reports:read" in getuser(req)["scopes"]
 GuardMiddleware(claim_required("scopes", "reports:read"; kind=:contains))
 ```
 
@@ -406,14 +406,14 @@ keys = Dict("primary" => primary_secret, "rotated" => rotated_secret)
 validator = jwt_validator(keys)
 ```
 
-With a keyset, the *verified* key id is exposed as `req.user.kid`, which unlocks two more
+With a keyset, the *verified* key id is exposed as `getuser(req).kid`, which unlocks two more
 patterns (both covered in depth in [Authentication](authentication.md)):
 
 ```julia
 # Authorize by signer: only tokens signed by these keys may reach this route.
 GuardMiddleware(kid_required(["service-a", "service-b"]))
 
-# One key per caller? Make the signer the principal: req.user.id == verified kid.
+# One key per caller? Make the signer the principal: getuser(req).id == verified kid.
 validator = jwt_validator(keys; identity_from=:kid)
 ```
 
