@@ -54,8 +54,9 @@ work on X?" — after the board is written; a yes to *that* is the authorization
 
 If the ranking makes the next step obvious, say what it is and offer it. Do not take it. Hand off to
 [`nitro-issue-cluster`](../nitro-issue-cluster/SKILL.md) for a multi-issue session or
-[`nitro-issue-workflow`](../nitro-issue-workflow/SKILL.md) for a single issue, whose three approval
-gates (commit, push, PR) still apply on top.
+[`nitro-issue-workflow`](../nitro-issue-workflow/SKILL.md) for a single issue. Note what that hand-off
+costs: once the user says yes, that workflow runs to an open PR without stopping again, so the yes
+you collect here is the last one before a branch exists.
 
 **Do not ask a question whose answer doubles as consent.** "What should this session run?", offered
 as a menu of implementation options, reads as a planning question and gets answered as one — and

@@ -13,7 +13,7 @@ means the second fix rebases onto a function the first one rewrote.
 This skill owns **which issues go together, in what order, and what "done" means for a group**.
 *Which* cluster runs next is [`nitro-board`](../nitro-board/SKILL.md), not this skill. It does not
 restate [`nitro-issue-workflow`](../nitro-issue-workflow/SKILL.md) — that skill still owns
-provenance, isolation, implementation, the verify rungs, review, and the approval gates. Read this
+provenance, isolation, implementation, the verify rungs, review, and the merge gate. Read this
 one to build the group; read that one for every step inside it.
 
 **Batching is the point.** The expensive part of an issue is not the diff — it is loading the
@@ -264,10 +264,11 @@ Review per [`changed-code-review`](../changed-code-review/SKILL.md) at the group
 reviewer **the member list and the commit-per-issue structure**, and ask it to review the diff
 commit by commit — a reviewer handed a 4-issue diff as one blob reviews none of them well.
 
-The three approval gates in
-[`nitro-general.instructions.md`](../../instructions/nitro-general.instructions.md) — commit, push,
-open PR — are unchanged and still separate. The commit gate covers the group's commits as one
-approval; do not re-ask per member unless the user asked you to.
+Then land it without stopping: commit (one per member) → push → open the PR → report. The plan that
+authorized the cluster authorized all of it; the merge gate in
+[`nitro-general.instructions.md`](../../instructions/nitro-general.instructions.md) is the only stop,
+and it is the maintainer's. A cluster makes the no-stopping rule matter more, not less — asking per
+member would be four interruptions for one review.
 
 **The PR body carries one `Closes #N` line per member**, plus the group's tier, the order you worked
 in, the rungs CI is covering, and any member dropped under §4.

@@ -1,5 +1,56 @@
 {
   "enabledPlugins": {
     "nitro-skills@nitro": true
+  },
+  "permissions": {
+    "allow": [
+      "Bash(julia .github/scripts/docs_lint.jl)",
+      "Bash(julia .github/scripts/smoke_test.jl)",
+      "Bash(julia --project=. test/runtests.jl:*)",
+      "Bash(git status)",
+      "Bash(git status --porcelain:*)",
+      "Bash(git diff)",
+      "Bash(git diff --staged)",
+      "Bash(git log --oneline:*)",
+      "Bash(git switch:*)",
+      "Bash(git branch:*)",
+      "Bash(git worktree list:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(gh pr create:*)",
+      "Bash(gh pr view:*)",
+      "Bash(gh pr diff:*)",
+      "Bash(gh issue list:*)",
+      "Bash(gh issue view:*)",
+      "Bash(gh run list:*)",
+      "Bash(gh run view:*)"
+    ],
+    "ask": [
+      "Bash(gh issue create:*)",
+      "Bash(gh issue edit:*)",
+      "Bash(gh issue close:*)",
+      "Bash(gh issue comment:*)",
+      "Bash(git tag:*)",
+      "Bash(gh release create:*)",
+      "Edit(./.github/workflows/**)",
+      "Write(./.github/workflows/**)",
+      "Edit(./.github/instructions/**)",
+      "Write(./.github/instructions/**)",
+      "Edit(./.github/skills/**)",
+      "Write(./.github/skills/**)",
+      "Edit(./.claude/**)",
+      "Write(./.claude/**)"
+    ],
+    "deny": [
+      "Bash(gh pr merge:*)",
+      "Bash(git push --force:*)",
+      "Bash(git push -f:*)",
+      "Bash(git push --force-with-lease:*)",
+      "Bash(git push --delete:*)",
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(./**/connection.yml)"
+    ]
   }
 }
