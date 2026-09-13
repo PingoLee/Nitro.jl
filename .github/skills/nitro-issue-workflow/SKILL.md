@@ -49,7 +49,7 @@ The tier is **high**, however small the diff looks, if it touches any of:
 |---|---|
 | `src/Auth.jl`, `src/Auth/`, `src/crypto.jl`, `src/cookies.jl` | authentication, JWT, password hashing, signed/encrypted cookies |
 | `src/middleware/` — session, CSRF, guards, CORS, rate limiting | an authorization bypass here is silent |
-| `src/core.jl` — stream handling, the response write path, error handling | load-bearing for the whole suite; see [nitro-core §4](../../instructions/nitro-core.instructions.md) |
+| `src/core.jl`, `src/core/` — stream handling, the response write path, error handling | load-bearing for the whole suite; see [nitro-core §4](../../instructions/nitro-core.instructions.md) |
 | Worker authorization — `user_id` checks, `AbstractWorkerStore` | [workers §2](../../instructions/workers.instructions.md) |
 | Anything concurrency-shaped — shared mutable state, `Threads.@spawn`, service registries, `src/context.jl` | thread-count-dependent failures are a known class |
 | An `UPGRADING.md` entry, a `[compat]` change, or a new public export | breaking-change surface |

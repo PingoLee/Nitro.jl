@@ -86,7 +86,7 @@ end
     # `Response` objects (String bodies) on every rejection. HTTP.jl's own write path would
     # consume the String body's single-use `BytesBody` cursor on first send and serve an
     # empty/truncated body on every reuse afterwards; Nitro's `_write_response_body!`
-    # (src/core.jl) writes `BytesBody.data` directly, non-destructively. Hit each shared
+    # (src/core/transport.jl) writes `BytesBody.data` directly, non-destructively. Hit each shared
     # const several times on a kept-alive connection and assert the body is intact every
     # time — a regression to HTTP's consuming writer would empty or truncate these here.
     for _ in 1:4

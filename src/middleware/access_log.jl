@@ -1,5 +1,5 @@
 # NOTE on naming: `Nitro.Core` already owns the name `AccessLogMiddleware` — the
-# console line-logger behind `serve(access_log=true)` (core.jl). This module is the
+# console line-logger behind `serve(access_log=true)` (core/framework_middleware.jl). This module is the
 # *structured* counterpart (records to an app-supplied sink), so it carries a
 # distinct name to keep the two from shadowing each other.
 module StructuredAccessLogMiddleware

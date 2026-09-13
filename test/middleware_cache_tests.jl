@@ -138,7 +138,7 @@ end
     reader = snapshot(c)                     # an in-flight request during shutdown
     @test empty!(c) === c
     @test isempty(snapshot(c))
-    # `terminate` (src/core.jl) calls this while requests are still in `compose`. An
+    # `terminate` (src/core/lifecycle.jl) calls this while requests are still in `compose`. An
     # in-place `empty!(::Dict)` would have pulled the table out from under `reader`.
     @test length(reader) == 2
     @test reader["GET|/a"] isa Function

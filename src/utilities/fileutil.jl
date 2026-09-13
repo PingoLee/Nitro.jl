@@ -94,7 +94,7 @@ routing layer. Two distinct failures, both refused:
 - `*` and `**` are HTTP.jl wildcards. A file named `*` shadows its siblings — a request for any
   unmatched path under the mount is answered with that file's body.
 - A component containing `{` or `}` is read as a path parameter by `parse_func_params`
-  (`src/core.jl`), whose brace test is `contains(value, r"({)|(})")` — deliberately broader than
+  (`src/core/registration.jl`), whose brace test is `contains(value, r"({)|(})")` — deliberately broader than
   HTTP.jl's own `isvariable`, so `{id}.txt` counts even though it is not a well-formed variable.
   Registration then throws `ArgumentError` because a mount's handler takes no such parameter, which
   means a single brace-named file made `serve()` fail to boot.

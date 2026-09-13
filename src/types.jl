@@ -252,7 +252,7 @@ end
 #       middleware)`. Written at route registration via `publish!` (LAST-writer-wins):
 #       re-running `urlpatterns` for a path must install the new middleware. "Registration"
 #       is not necessarily startup-only: under `revise=:lazy`, `Revise.revise()` runs on a
-#       request-handling task (src/core.jl), so re-registration can land while OTHER request
+#       request-handling task (src/core/lifecycle.jl), so re-registration can land while OTHER request
 #       tasks are inside `buildmiddleware` reading this table.
 #
 # Shape: copy-on-write behind an atomic reference, NOT a lock around the read. A reader
@@ -546,7 +546,7 @@ end
     empty!(d::CopyOnWriteDict{V}) -> CopyOnWriteDict{V}
 
 Drop every entry by publishing a fresh table. Deliberately NOT an in-place `empty!` of the
-live `Dict`: `terminate` (src/core.jl) calls this on `middleware_cache` with requests still
+live `Dict`: `terminate` (src/core/lifecycle.jl) calls this on `middleware_cache` with requests still
 in `compose`, and an in-flight reader must be able to finish against a table nobody mutates.
 
 The fresh table takes its value type from the parameter. (Belt and braces rather than a

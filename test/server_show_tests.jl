@@ -3,7 +3,7 @@ using Test
 using HTTP
 using Nitro
 
-# Regression test for the `NitroStreamHandler` secret-safe `show` (src/core.jl):
+# Regression test for the `NitroStreamHandler` secret-safe `show` (src/core/lifecycle.jl):
 # displaying the server handle returned by `serve(async=true)` must never print
 # secrets captured in middleware/handler closures.
 
