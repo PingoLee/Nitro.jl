@@ -97,6 +97,22 @@ try
         fetch(call)
         @test Nitro.CONTEXT[].app_context[].payload == tenant_a
     end
+
+    @testset "a reused request object does not inherit a previous call's context" begin
+        # Carrying the context ON the request means the request is now state that outlives a
+        # call. `_app_context_seed` seeds only when the key is absent, so if `internalrequest`
+        # stamped only when given an override, re-running a request object that had picked one
+        # up would keep the STALE context — the same defect as the race, reached by reuse.
+        # `internalrequest` therefore stamps unconditionally.
+        req = HTTP.Request("GET", "/probe")
+
+        overridden = internalrequest(req; context = tenant_b)
+        @test json(overridden)["tenant"] == "B"
+
+        # Same object, no override: must resolve to the server's context, not tenant_b.
+        plain = internalrequest(req)
+        @test json(plain)["tenant"] == "A"
+    end
 finally
     terminate()
     resetstate()

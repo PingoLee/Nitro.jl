@@ -113,9 +113,17 @@ function internalrequest(ctx::ServerContext, req::HTTP.Request; middleware::Vect
     # Carrying it on the request removes the window by construction rather than narrowing it —
     # there is no shared mutable state left for a concurrent request to observe. Regression:
     # test/appcontext_race_tests.jl.
-    if !ismissing(context)
-        req.context[REQUEST_CONTEXT_KEY] = Context(context)
-    end
+    # ALWAYS stamp, even with no override — the value is then just what `_app_context_seed`
+    # would have supplied. Writing unconditionally is what makes the outcome independent of
+    # whatever the caller's `req` was already carrying.
+    #
+    # The conditional version of this leaked: `_app_context_seed` seeds only when the key is
+    # absent, so re-running a request object that had picked up an override on an earlier call
+    # kept the STALE context instead of resolving to the server's. That is the same class of
+    # defect this commit exists to remove — a request observing a context that is not its own —
+    # just reached by reuse rather than by a data race. Covered by the "a reused request object
+    # does not inherit a previous call's context" item in test/appcontext_race_tests.jl.
+    req.context[REQUEST_CONTEXT_KEY] = ismissing(context) ? ctx.app_context[] : Context(context)
 
     return req |> setupmiddleware(ctx; middleware, serialize, catch_errors)
 end
