@@ -89,8 +89,16 @@ ones idempotently with `gh label create <name> --color <hex> --description "…"
 Creating issues publishes content on a public repo and notifies watchers — it is noisy to undo.
 
 - **For any bulk creation (more than a couple of issues), draft first and get explicit
-  confirmation before hitting the API.** A single targeted issue the user asked for can be
-  created directly.
+  confirmation before hitting the API.** A single targeted issue — one the user asked for, or a
+  follow-up recording what you deliberately left out of the work you just finished — is created
+  directly, no ceremony.
+
+  **This is the one limit the permission layer cannot enforce.** `gh issue create` and
+  `gh issue comment` are on `allow` (see the merge-gate non-negotiable in
+  [`nitro-general.instructions.md`](../../instructions/nitro-general.instructions.md)), and a glob
+  cannot count — nothing stops a sweep except this rule. `gh issue edit` and `gh issue close` stay
+  on `ask`: editing overwrites the maintainer's own words, and closing loses tracked work. Close via
+  `Closes #N` in a PR body, which rides the merge gate.
 - **Scrub private/local references before posting.** Working notes may contain local machine
   paths, private reference-app internals (file names and layout of the internal Genie app), and
   personal workflow notes. None of that goes into a public issue body verbatim — generalize

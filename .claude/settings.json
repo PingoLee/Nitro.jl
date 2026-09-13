@@ -23,24 +23,20 @@
       "Bash(gh pr diff:*)",
       "Bash(gh issue list:*)",
       "Bash(gh issue view:*)",
+      "Bash(gh issue create:*)",
+      "Bash(gh issue comment:*)",
       "Bash(gh run list:*)",
       "Bash(gh run view:*)"
     ],
     "ask": [
-      "Bash(gh issue create:*)",
       "Bash(gh issue edit:*)",
       "Bash(gh issue close:*)",
-      "Bash(gh issue comment:*)",
       "Bash(git tag:*)",
       "Bash(gh release create:*)",
       "Edit(./.github/workflows/**)",
-      "Write(./.github/workflows/**)",
       "Edit(./.github/instructions/**)",
-      "Write(./.github/instructions/**)",
       "Edit(./.github/skills/**)",
-      "Write(./.github/skills/**)",
-      "Edit(./.claude/**)",
-      "Write(./.claude/**)"
+      "Edit(./.claude/**)"
     ],
     "deny": [
       "Bash(gh pr merge:*)",

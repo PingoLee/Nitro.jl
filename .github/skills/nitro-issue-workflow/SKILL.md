@@ -304,7 +304,7 @@ you deliberately did not do and why — deferred work, declined findings, scope 
 whose say-so.
 
 **Still gated, even mid-run:** `git tag` and `gh release create` · force-push or history rewrite on a
-pushed branch · `gh pr merge` · issue create/edit/close beyond a single follow-up the user asked for ·
+pushed branch · `gh pr merge` · `gh issue edit` and `gh issue close` · bulk issue creation ·
 any edit to `.github/workflows/`, `.github/instructions/`, `.github/skills/`, or `.claude/`. The
 canonical list, and why the guardrail files are on it, is the merge-gate non-negotiable in
 [`nitro-general.instructions.md`](../../instructions/nitro-general.instructions.md).
