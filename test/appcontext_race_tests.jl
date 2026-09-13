@@ -17,10 +17,12 @@ using Nitro
 # shared cell is never written at all, and — because the context is now state that outlives a
 # call — a reused request object does not inherit a previous call's override.
 #
-# The first two are DETERMINISTIC: they synchronise on a latch, never on sleeps. What makes the
-# window observable without racing the test itself is parking an `internalrequest` *inside its
-# own handler* — under the old code the global is swapped at that moment and stays swapped until
-# the handler returns, so the concurrent observation lands squarely in the gap.
+# The first two are DETERMINISTIC in the sense that matters: no assertion depends on a sleep
+# duration, and the observation cannot land outside the window. The wait is `timedwait`, which
+# polls — the timeout is a ceiling that turns a stuck handler into a failure, not a schedule the
+# test races against. What makes the window observable without racing the test itself is parking
+# an `internalrequest` *inside its own handler* — under the old code the global is swapped at
+# that moment and stays swapped until the handler returns, so the observation lands in the gap.
 
 struct Tenant
     name::String
@@ -29,15 +31,32 @@ end
 tenant_a = Tenant("A")
 tenant_b = Tenant("B")
 
-# The latches are single-use and both testsets park the same route, so they live behind Refs
-# the handler dereferences at call time; each testset installs fresh ones.
+# The latches are single-use and the two parking testsets share one route, so they live behind
+# Refs the handler dereferences at call time; each installs fresh ones via `fresh_latches!`.
 #
 # `parked` is a Channel rather than an Event so the test can wait on it with a TIMEOUT. A test
 # that hangs is strictly worse than one that fails: `runtests.jl`'s `testitem_timeout` covers
 # the default worker path but not `--workers 0`, so a handler that never reaches `put!` (route
 # gone, 404, a throw before this line) would otherwise wedge the run instead of reporting.
-parked  = Ref(Channel{Nothing}(1))
+# Capacity > 1 deliberately: nothing ever drains this channel, so a second entry into `/park`
+# within one testset would block forever on `put!` — and `notify(release[])` cannot rescue a
+# blocked `put!`. Unreachable today (one spawned call per testset, no client targets `/park`),
+# but a capacity-1 channel is a trap for the next person to add a request here.
+parked  = Ref(Channel{Nothing}(4))
 release = Ref(Base.Event())
+
+# Every `release` event ever issued, so teardown can free a task parked against a SUPERSEDED
+# one. `release[]` is reassigned per testset, and `@testset` records an exception and continues —
+# so notifying only the current event would leave a task from an earlier testset waiting on an
+# object the `finally` can no longer reach.
+issued_releases = Base.Event[]
+
+function fresh_latches!()
+    parked[]  = Channel{Nothing}(4)
+    release[] = Base.Event()
+    push!(issued_releases, release[])
+    return nothing
+end
 
 # Returns true if the parked handler signalled within the budget.
 reached_handler(ch) = timedwait(() -> isready(ch), 30.0) === :ok
@@ -63,8 +82,7 @@ serve(port=port, host=HOST, async=true, show_errors=false, show_banner=false,
 
 try
     @testset "a live request is not stamped with a concurrent internalrequest's context" begin
-        parked[]  = Channel{Nothing}(1)
-        release[] = Base.Event()
+        fresh_latches!()
 
         # Park an `internalrequest(context = tenant_b)` inside its handler. On the unpatched
         # code the process-wide cell reads tenant_b from here until the handler returns.
@@ -87,8 +105,7 @@ try
     end
 
     @testset "internalrequest never mutates the shared app context cell" begin
-        parked[]  = Channel{Nothing}(1)
-        release[] = Base.Event()
+        fresh_latches!()
 
         cell = Nitro.CONTEXT[].app_context[]
         @test cell isa Nitro.Context
@@ -123,9 +140,10 @@ try
         @test json(plain)["tenant"] == "A"
     end
 finally
-    # Free any still-parked handler before tearing down. A plain `@test` failure is safe,
-    # but an EXCEPTION inside a testset would otherwise skip the `notify` and strand the task.
-    notify(release[])
+    # Free every still-parked handler before tearing down, including any waiting on a release
+    # event that a later testset superseded. A plain `@test` failure is safe; an EXCEPTION inside
+    # a testset is what this covers.
+    foreach(notify, issued_releases)
     terminate()
     resetstate()
 end
