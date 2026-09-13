@@ -5,7 +5,7 @@ using UUIDs: UUID, uuid4
 using Base: @kwdef
 import Base.Threads: ReentrantLock, lock
 
-using ..Core: ServerContext, LifecycleMiddleware
+using ..Core: App, LifecycleMiddleware
 using ..Core.AppContext: set_extension!, get_extension, delete_extension!
 using ..Core: AuthorizationError
 

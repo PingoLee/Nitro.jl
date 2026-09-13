@@ -1,7 +1,7 @@
 using PrecompileTools
 
 @compile_workload begin
-    ctx = ServerContext()
+    ctx = App()
 
     # ── GET → Res.json (no path params) ─────────────────────────────────
     Core.Routing.urlpatterns(ctx, "", RouteDefinition[

@@ -9,7 +9,7 @@ using ..Types
 using ..Types: CopyOnWriteDict
 using ..Constants: SHUTDOWN_TIMEOUT_SECONDS
 
-export ServerContext, EagerReviseService, Service, wait, close, isopen
+export App, EagerReviseService, Service, wait, close, isopen
 export set_extension!, get_extension, delete_extension!, has_extension
 
 
@@ -74,11 +74,59 @@ end
     shutdown_timeout      :: Ref{Float64}           = Ref{Float64}(SHUTDOWN_TIMEOUT_SECONDS)
 end
 
-@kwdef struct ServerContext
-    service :: Service          = Service()    
+"""
+    App(; mod = nothing) -> App
+
+A Nitro application: its own router, middleware, cookie config, lifecycle hooks and app
+context. Several can coexist in one process, each serving independently.
+
+```julia
+using Nitro
+
+app = App(mod = @__MODULE__)
+urlpatterns(app, "", Routes.urlpatterns(config))
+serve(app; host = "127.0.0.1", port = 8080, context = config)
+```
+
+Every routing, serving and cookie function takes an `App` as its first argument:
+`urlpatterns`, `serve`, `terminate`, `internalrequest`,
+`url`, `staticfiles`, `configcookies`, `getexternalurl`.
+The argument-less forms of those functions are a convenience layer over one process-wide
+`App`; reach for an explicit handle whenever a second app, or an isolated test, would
+otherwise have to mutate that global.
+
+# Keyword arguments
+- `mod = nothing`: the module whose code Revise should track for `serve(revise = :lazy|:eager)`.
+  **Pass `@__MODULE__` from your own module** — writing it at the call site is the only way it
+  can be correct, because a `@__MODULE__` *default* would expand where `App` is defined (inside
+  Nitro) rather than where it is called. Only `revise` reads this; leaving it `nothing` is fine
+  for everything else and `serve` says so if you ask for `revise` without it.
+
+The remaining fields are internal: `service` holds the router and per-server state, and
+`app_context` carries the payload passed to `serve(context = ...)` — read that through
+`getcontext` on the request, never off the `App`, or you reintroduce the race #31
+removed.
+"""
+@kwdef struct App
+    service :: Service          = Service()
     mod     :: Nullable{Module} = nothing
     app_context :: Ref{Any}     = Ref{Any}(missing) # This stores a reference to an Context{T} object
 end
+
+# SECURITY: `App` is public now, so it lands in REPL auto-display, `@show`, and interpolated
+# log lines. The default `show` would walk `service`, whose router and middleware closures
+# capture the cookie/JWT `secret_key`, DB credentials and API keys — the same disclosure the
+# `NitroStreamHandler` override exists to prevent for `HTTP.Server` (src/core/lifecycle.jl).
+# Print only the module and whether it is serving. (`dump` still walks raw fields; that is
+# explicit introspection, not accidental disclosure.)
+function Base.show(io::IO, app::App)
+    print(io, "App(")
+    app.mod === nothing || print(io, "mod=", app.mod, ", ")
+    print(io, isopen(app.service) ?
+              "serving on $(something(app.service.external_url[], "an open listener"))" :
+              "not serving", ")")
+end
+Base.show(io::IO, ::MIME"text/plain", app::App) = show(io, app)
 
 Base.isopen(service::Service)   = !isnothing(service.server[]) && isopen(service.server[])
 Base.wait(service::Service)     = !isnothing(service.server[]) && wait(service.server[])
@@ -202,20 +250,20 @@ function Base.close(service::Service; timeout::Real = service.shutdown_timeout[]
     return nothing
 end
 
-function set_extension!(ctx::ServerContext, key::Symbol, value)
+function set_extension!(ctx::App, key::Symbol, value)
     lock(ctx.service.extensions_lock) do
         ctx.service.extensions[key] = value
     end
     return value
 end
 
-function get_extension(ctx::ServerContext, key::Symbol, default=nothing)
+function get_extension(ctx::App, key::Symbol, default=nothing)
     lock(ctx.service.extensions_lock) do
         return Base.get(ctx.service.extensions, key, default)
     end
 end
 
-function delete_extension!(ctx::ServerContext, key::Symbol)
+function delete_extension!(ctx::App, key::Symbol)
     lock(ctx.service.extensions_lock) do
         if haskey(ctx.service.extensions, key)
             delete!(ctx.service.extensions, key)
@@ -224,22 +272,11 @@ function delete_extension!(ctx::ServerContext, key::Symbol)
     return nothing
 end
 
-function has_extension(ctx::ServerContext, key::Symbol)
+function has_extension(ctx::App, key::Symbol)
     lock(ctx.service.extensions_lock) do
         return haskey(ctx.service.extensions, key)
     end
 end
 
-
-# @eval begin
-#     """
-#         ServerContext(ctx::ServerContext; kwargs...)
-
-#     Create a new `ServerContext` object by copying an existing one and optionally overriding some of its fields with keyword arguments.
-#     """
-#     function ServerContext(ctx::ServerContext; $([Expr(:kw ,k, :(ctx.$k)) for k in fieldnames(ServerContext)]...))
-#         return ServerContext($(fieldnames(ServerContext)...))
-#     end
-# end
 
 end

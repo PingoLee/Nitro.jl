@@ -8,7 +8,7 @@ Reset all the internal state variables
 function resetstate()
     # prevent context reset when created at compile-time
     if (@__MODULE__) == Nitro
-        CONTEXT[] = Nitro.Core.ServerContext()
+        CONTEXT[] = Nitro.Core.App()
         Nitro.Workers.reset_store!()
     end
 end
@@ -354,7 +354,7 @@ end
 # No docstring here on purpose: the loop below reassigns `@doc(Nitro.Core.terminate)` onto this
 # binding, so anything written here is silently discarded (it is why `terminate` rendered with an
 # empty body in `docs/src/api.md`). The canonical docstring lives on `Nitro.Core.terminate`.
-terminate(context::ServerContext; timeout::Nullable{Real} = nothing) =
+terminate(context::App; timeout::Nullable{Real} = nothing) =
     Nitro.Core.terminate(context; timeout)
 terminate(; timeout::Nullable{Real} = nothing) = terminate(CONTEXT[]; timeout)
 
@@ -373,3 +373,102 @@ end
 
 
 
+
+# ── The explicit `App` surface (#31) ────────────────────────────────────────────────────
+#
+# Everything above this line is the SINGLETON convenience layer: one-argument-shorter forms
+# that read and write the process-wide `CONTEXT[]`. Every one of them is defined HERE, in
+# `Nitro`, which means it SHADOWS the same-named function `using .Core` brought in from
+# `Nitro.Core` — so before this block, `Nitro.urlpatterns` had only the `CONTEXT[]` methods
+# and `Core`'s `(ctx, …)` methods were unreachable through `using Nitro`. Exporting `App`
+# without these forwards would have produced a public type with no public API taking it.
+#
+# Each forward is deliberately thin: it adds the `App` method to the `Nitro`-level function
+# and hands straight to the implementation, which already took an app-shaped first argument.
+# No behavior is defined here.
+#
+# `route` is absent on purpose -- it is plumbing for `path`/`urlpatterns`, not public API
+# (nitro-core §3). `resetstate` is absent because it is singleton-shaped by definition: the
+# `App` equivalent is constructing a new `App`.
+
+"""
+    serve(app::App; kwargs...)
+
+Serve `app`. Same keywords as [`serve()`](@ref); see [`App`](@ref) for the handle.
+
+Unlike the singleton form this never calls `resetstate()` on exit — that resets the global
+context, which has nothing to do with `app`. A blocking call still terminates the listener
+it started.
+"""
+function serve(app::App; kwargs...)
+    async = Base.get(kwargs, :async, false)
+    # Same reasoning as the singleton form above: decide ownership BEFORE the call, so a
+    # rejected `serve` never tears down the healthy server that caused the rejection.
+    ours = !isopen(app.service)
+    try
+        return Nitro.Core.serve(app; kwargs...)
+    finally
+        !async && ours && terminate(app)
+    end
+end
+
+worker_startup(app::App; kwargs...) = Nitro.Workers.startup(app; kwargs...)
+
+"""
+    getexternalurl(app::App) -> String
+
+The URL `app` is serving on. Throws if it is not running.
+"""
+function getexternalurl(app::App) :: String
+    external_url = app.service.external_url[]
+    isnothing(external_url) && error("getexternalurl is only available while the app is serving")
+    return external_url
+end
+
+url(app::App, name::String; kwargs...) = Nitro.Core.Routing.url(app, name; kwargs...)
+
+internalrequest(app::App, req::Nitro.Request; middleware::Vector=[], serialize::Bool=true,
+                catch_errors=true, context=missing) =
+    Nitro.Core.internalrequest(app, req; middleware, serialize, catch_errors, context)
+
+router(app::App, prefix::String = "";
+       tags::Vector{String} = Vector{String}(),
+       middleware::Nullable{Vector} = nothing) =
+    Nitro.Core.router(app, prefix; tags, middleware)
+
+urlpatterns(app::App, prefix::String, routes::Nitro.Core.Routing.RouteDefinition...) =
+    Nitro.Core.Routing.urlpatterns(app, prefix, routes...)
+
+urlpatterns(app::App, prefix::String, routes::Vector{Nitro.Core.Routing.RouteDefinition}) =
+    Nitro.Core.Routing.urlpatterns(app, prefix, routes)
+
+staticfiles(app::App, folder::String, mountdir::String="static"; kwargs...) =
+    Nitro.Core.staticfiles(app, app.service.router, folder, mountdir; kwargs...)
+
+spafiles(app::App, folder::String, mountdir::String="static"; kwargs...) =
+    Nitro.Core.spafiles(app, app.service.router, folder, mountdir; kwargs...)
+
+dynamicfiles(app::App, folder::String, mountdir::String="static"; kwargs...) =
+    Nitro.Core.dynamicfiles(app, app.service.router, folder, mountdir; kwargs...)
+
+"""
+    configcookies(app::App, defaults::Dict)
+    configcookies(app::App; kwargs...)
+
+Set `app`'s cookie defaults. The only one of these forms that MUTATES the app.
+"""
+configcookies(app::App, defaults::Dict) =
+    (app.service.cookies[] = Nitro.Core.load_cookie_settings!(defaults))
+
+configcookies(app::App; kwargs...) =
+    configcookies(app, Dict(string(k) => v for (k, v) in kwargs))
+
+function get_cookie(app::App, req::Nitro.Request, name::String, default::Any=nothing; kwargs...)
+    secret_key = app.service.cookies[].secret_key
+    # Mirrors the singleton form: `encrypted` defaults to whatever the app's config implies.
+    encrypted = Base.get(kwargs, :encrypted, !isnothing(secret_key))
+    return Nitro.Core.get_cookie(req, name, default; secret_key=secret_key, encrypted=encrypted, kwargs...)
+end
+
+set_cookie!(app::App, res::Nitro.Response, name::String, value::Any; kwargs...) =
+    Nitro.Core.set_cookie!(res, name, value; config=app.service.cookies[], kwargs...)

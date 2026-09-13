@@ -92,11 +92,11 @@ using HTTP
 using Nitro
 using Nitro.Core.Types: snapshot, publish!
 using Nitro.Core.RouterHOF: genkey, cachetag
-import Nitro: ServerContext, path, text
+import Nitro: App, path, text
 
 const TAG = cachetag(false, true, true)   # catch_errors=false, show_errors/serialize default
 
-# Integration half of #81, driven through the real `compose` on a LOCAL ServerContext so the
+# Integration half of #81, driven through the real `compose` on a LOCAL App so the
 # item is order-independent. Reproducing the interleaving with real threads would be a flake
 # generator; instead the straddle is constructed DETERMINISTICALLY, by exploiting where the
 # window actually is.
@@ -119,7 +119,7 @@ const TAG = cachetag(false, true, true)   # catch_errors=false, show_errors/seri
 # (no global middleware at all, hence no `middleware=` kwarg) and registration must race a live
 # request.
 
-ctx = ServerContext()
+ctx = App()
 key = genkey("GET", "/warm")
 
 v2_layer = handler -> (req::HTTP.Request -> Res.send("v2|" * text(handler(req))))
@@ -164,7 +164,7 @@ end
 @testset "warmup still caches on the quiet path" begin
     # Guards the obvious over-correction: refusing to publish whenever anything raced must not
     # become refusing to publish at all. With no concurrent registration the cache fills.
-    ctx2 = ServerContext()
+    ctx2 = App()
     Nitro.Core.Routing.urlpatterns(ctx2, "", Nitro.RouteDefinition[
         path("/quiet", (req::HTTP.Request) -> Res.send("ok"),
              middleware = [handler -> (req::HTTP.Request -> handler(req))]),

@@ -304,10 +304,10 @@ using Nitro
 using UUIDs
 using Nitro: path
 
-# Uses a *local* ServerContext + internalrequest, so this item mutates no global
+# Uses a *local* App + internalrequest, so this item mutates no global
 # router/server state and is safe to run in parallel with other test items.
 
-ctx = Nitro.Core.ServerContext()
+ctx = Nitro.Core.App()
 Nitro.Core.Routing.urlpatterns(ctx, "/api", Nitro.RouteDefinition[
     path("/items/<int:id>",   (req, id::Int)   -> Res.send(string(id)),   method="GET"),
     path("/toggle/<bool:on>", (req, on::Bool)  -> Res.send(string(on)),   method="GET"),
@@ -400,7 +400,7 @@ struct MalformedBox; v::String; end
 
     # Path params come in still-encoded from HTTP.jl's router, so they get their single
     # decode at the accessor. Same one-decode rule, opposite starting state.
-    ctx2 = Nitro.Core.ServerContext()
+    ctx2 = Nitro.Core.App()
     Nitro.Core.Routing.urlpatterns(ctx2, "", Nitro.RouteDefinition[
         path("/p/{v}", (req, v::String) -> Res.send(v), method="GET"),
         # Reads the scalar binding and the `getparams(req)` accessor in one handler: both must
@@ -421,7 +421,7 @@ end
     # decodes now happen in the `Types.*` accessors -- OUTSIDE `parseparam_checked`, which is
     # what used to convert those into a 400. Without the guard in the accessors this is a 500
     # with a logged backtrace, which is exactly what #18 removed.
-    ctx3 = Nitro.Core.ServerContext()
+    ctx3 = Nitro.Core.App()
     Nitro.Core.Routing.urlpatterns(ctx3, "", Nitro.RouteDefinition[
         path("/m/{v}", (req, v::String) -> Res.send(v), method="GET"),
         path("/mq",    (req, v::String) -> Res.send(v), method="GET"),
@@ -469,7 +469,7 @@ end
 
     # These assert the TYPE again. The old spelling was `bad.params`, which had to be matched
     # on MESSAGE: it went through the process-wide `Base.getproperty(::HTTP.Request, ::Symbol)`
-    # override, and `test/instance_tests.jl` builds a second Nitro via `instance()` whose
+    # override, and the since-deleted `test/instance_tests.jl` built a second Nitro via `instance()` whose
     # `__init__` re-installed *its* override -- so under the full suite the thrown value was
     # that instance's `ValidationError`, a distinct type from this module's, and a type
     # assertion was order-dependent (green alone, red in the suite). #151 deleted the override
@@ -547,7 +547,7 @@ end
 using Test
 using HTTP
 using Nitro
-using Nitro.Core: ServerContext, internalrequest
+using Nitro.Core: App, internalrequest
 using Nitro.Core.Routing: urlpatterns
 
 # Regression for the per-request caches. `HTTP.getparams` reads a context slot the ROUTER
@@ -563,7 +563,7 @@ using Nitro.Core.Routing: urlpatterns
 # than only that the request survived: a handler binding `id::Int` goes through the path
 # binder, never through `payload(req)`, so asserting on the bound value alone would pass even
 # with `payload(req)` poisoned.
-ctx = ServerContext()
+ctx = App()
 urlpatterns(ctx, "", Nitro.RouteDefinition[
     Nitro.path("/items/<int:id>", function (req, id::Int)
         Res.json(Dict("id" => id, "params" => getparams(req), "input" => payload(req)))

@@ -10,7 +10,7 @@ fast and deterministic.
 bench/
 ├── Project.toml        # deps: BenchmarkTools, HTTP, JSON; Nitro dev'd from ".."
 ├── runbenchmarks.jl    # entry point: builds the SUITE, tunes, runs, prints a table, saves JSON
-├── setup.jl            # a fresh ServerContext + bench routes (no global CONTEXT[] mutation)
+├── setup.jl            # a fresh App + bench routes (no global CONTEXT[] mutation)
 ├── suite/              # one file per benchmark group
 │   ├── routing.jl      # full-pipeline static route + genkey
 │   ├── params.jl       # parseparam + <int:id> pipeline

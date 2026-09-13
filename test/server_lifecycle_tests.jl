@@ -6,7 +6,7 @@ using Sockets
 using Nitro
 using Nitro: path
 
-# Almost every testset here runs on a *private* `ServerContext`, so it mutates no global
+# Almost every testset here runs on a *private* `App`, so it mutates no global
 # router/server state. That also means the `test_end_expr` net in `test/runtests.jl` (which
 # calls the global `Nitro.terminate()`) does NOT cover these servers — each testset cleans
 # up in its own `finally`.
@@ -22,7 +22,7 @@ connection is pinned `ACTIVE`. HTTP 2.4 declares `_ConnState.HIJACKED` and never
 so this is exactly the shape that made the pre-#73 `terminate()` spin forever.
 """
 function _pinning_context(entered::Base.Event, release::Base.Event)
-    ctx = Nitro.Core.ServerContext()
+    ctx = Nitro.Core.App()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/hang", function(stream::HTTP.Stream)
             HTTP.setheader(stream, "Content-Type" => "text/plain")
@@ -113,7 +113,7 @@ end
 end
 
 @testset "a clean server drains gracefully instead of being forced" begin
-    ctx  = Nitro.Core.ServerContext()
+    ctx  = Nitro.Core.App()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/ok", (req) -> Res.send("ok"), method="GET"),
     ])
@@ -134,7 +134,7 @@ end
 end
 
 @testset "serve() refuses to start over a live server" begin
-    ctx  = Nitro.Core.ServerContext()
+    ctx  = Nitro.Core.App()
     port = get_free_port()
     srv  = _serve(ctx, port)
     try
@@ -248,7 +248,7 @@ end
     # Validating only inside `_shutdown_server` would be far too late: the stored value is read
     # on every `terminate()`, so a bad one made `terminate()` throw *before* clearing the
     # handle — a running server that the normal API could never stop again.
-    ctx = Nitro.Core.ServerContext()
+    ctx = Nitro.Core.App()
     for bad in (-5, -0.001, NaN)
         @test_throws ArgumentError _serve(ctx, get_free_port(); shutdown_timeout = bad)
         @test !isopen(ctx.service)              # nothing was started
@@ -276,7 +276,7 @@ end
 end
 
 @testset "reuseaddr reaches the Server" begin
-    ctx = Nitro.Core.ServerContext()
+    ctx = Nitro.Core.App()
     srv = _serve(ctx, get_free_port())
     try
         @test srv.reuseaddr == !Sys.iswindows()
@@ -291,7 +291,7 @@ end
     # `preprocesskwargs` mentions it. The unit assertion above (`preprocesskwargs(pairs((;)))`)
     # is what fails on a revert; the end-to-end revert guard is the platform-default check on
     # the previous server, which only discriminates on Windows.
-    ctx2 = Nitro.Core.ServerContext()
+    ctx2 = Nitro.Core.App()
     srv2 = _serve(ctx2, get_free_port(); reuseaddr = false)
     try
         @test srv2.reuseaddr === false
@@ -299,7 +299,7 @@ end
         Nitro.Core.terminate(ctx2)
     end
 
-    ctx3 = Nitro.Core.ServerContext()
+    ctx3 = Nitro.Core.App()
     srv3 = _serve(ctx3, get_free_port(); reuseaddr = true)
     try
         @test srv3.reuseaddr === true      # an explicit value always wins over the platform default

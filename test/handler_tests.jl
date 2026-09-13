@@ -53,9 +53,9 @@ end
 using Test
 using HTTP
 using Nitro
-using Nitro.Core: ServerContext, create_param_parser, parse_func_params
+using Nitro.Core: App, create_param_parser, parse_func_params
 
-ctx = ServerContext()
+ctx = App()
 
 # One of every scalar strategy at once: a path param, a required query param and a
 # defaulted query param.

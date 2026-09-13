@@ -40,6 +40,149 @@ _Changes merged but not yet cut into a release. A consumer dev'ing Nitro at HEAD
 and `Nitro.upgrade_guide` surfaces them by default. When the maintainer next rolls changes into a
 consuming app, `nitro-cut-release` stamps every entry below with `0.4.0`, dates them, and tags it._
 
+## `ServerContext` is now the exported `App`, and every public function takes one (#31)
+
+- **Version**: Unreleased
+- **Nitro ref**: #31; `src/context.jl`, `src/methods.jl`, `src/Nitro.jl`, and every `src/` file
+  that named the type; `test/app_tests.jl` (new), `docs/src/`
+- **Recorded**: 2026-09-13
+- **Severity**: **breaking, and it fails LOUDLY.** `ServerContext` no longer exists under that
+  name, so every reference raises `UndefVarError: ServerContext not defined`. There is no
+  silent-wrong-value path — the name is gone, not repurposed, and `App` is a straight rename of
+  the same concrete struct with the same three fields.
+
+### What changed
+
+Every public API bound to the process-wide `CONTEXT[]` singleton, so two apps with different
+config could not coexist. `ServerContext` already supported that, but it was not exported and its
+name read like internals — and, more to the point, the `(ctx, …)` methods were defined in
+`Nitro.Core` while `src/methods.jl` *shadowed* those names in `Nitro`, so `using Nitro` could not
+reach a single one of them.
+
+`App` is now exported, and `src/methods.jl` carries an `(app::App, …)` method for all fourteen
+public functions: `serve`, `terminate`, `internalrequest`, `urlpatterns`, `url`, `router`,
+`staticfiles`, `spafiles`, `dynamicfiles`, `configcookies`, `get_cookie`, `set_cookie!`,
+`getexternalurl`, `worker_startup`.
+
+The singleton stays. The argument-less forms are unchanged and still work; `App` is what you reach
+for when you want a second app, or a test that touches no global.
+
+`App` also gains a `show` that prints only its module and serving state. The default would have
+walked `service`, whose router and middleware closures capture the cookie/JWT `secret_key`, DB
+credentials and API keys — the same disclosure the `NitroStreamHandler` override prevents for
+`HTTP.Server`.
+
+### How to find the calls to migrate
+
+```bash
+# 1. The type name, anywhere.
+rg -n '\bServerContext\b' --type julia
+
+# 2. Direct reads of the singleton. These still WORK, but each one is a place an explicit
+#    `App` is now the better answer -- especially in tests.
+rg -n 'Nitro\.CONTEXT\[\]' --type julia
+
+# 3. NOT a match to rewrite: `Context{T}`, `getcontext`, and `serve(context = ...)` are the
+#    app-context PAYLOAD and are unchanged. Only the handle was renamed.
+rg -n 'Context\{|getcontext' --type julia
+```
+
+### Migrate your app
+
+| before | after | note |
+|---|---|---|
+| `Nitro.Core.ServerContext()` | `App(mod = @__MODULE__)` | now exported; no `Nitro.Core.` prefix |
+| `ServerContext(service=…, mod=…)` | `App(service=…, mod=…)` | same fields, same order |
+| `Nitro.CONTEXT[]` in app code | `app` you constructed | the singleton still exists, but an explicit handle is preferable |
+| `urlpatterns("", routes)` | `urlpatterns(app, "", routes)` | argument-less form still works |
+
+```julia
+# ✗ before
+ctx = Nitro.Core.ServerContext()
+Nitro.Core.Routing.urlpatterns(ctx, "", Routes.urlpatterns(config))
+Nitro.Core.serve(ctx; port = 8080, context = config)
+
+# ✓ after
+app = App(mod = @__MODULE__)
+urlpatterns(app, "", Routes.urlpatterns(config))
+serve(app; port = 8080, context = config)
+```
+
+**Pass `mod = @__MODULE__` yourself.** It is what `serve(revise = :lazy|:eager)` tracks, and `App`
+deliberately has no default for it: a `@__MODULE__` default would expand where `App` is *defined*
+(inside Nitro) rather than where it is called, silently binding every app to the framework module.
+Leaving it `nothing` is fine if you do not use `revise`; `serve` warns if you ask for `revise`
+without it.
+
+---
+
+## `instance()` is removed — construct a second `App` instead (#31)
+
+- **Version**: Unreleased
+- **Nitro ref**: #31; `src/instances.jl` (deleted), `src/Nitro.jl`,
+  `test/instance_tests.jl` → `test/app_tests.jl`
+- **Recorded**: 2026-09-13
+- **Severity**: **breaking, and it fails LOUDLY.** `instance` is no longer exported or defined, so
+  a call site raises `UndefVarError: instance not defined`.
+
+### What changed
+
+`instance()` was the only way to get two independent Nitro apps. It bought that by reading
+`src/Nitro.jl` off disk, rewriting its `include` paths and `include_string`ing the **entire
+package** into a fresh anonymous module — a full recompile per instance, a second copy of every
+method table, and a hard failure on any deployment where the package source is not present or
+readable at runtime (system images, relocated installs).
+
+`App` gives you an independent router, middleware stack, cookie config and app context, with none
+of that cost. Two differences are worth knowing before you port:
+
+- **Types are shared.** There is no separate module namespace, so `app1`'s `Request` *is*
+  `Nitro.Request`. That is what you want — objects could not cross `instance()` boundaries.
+- **Worker stores are NOT isolated by default.** `_resolve_store` falls back to the process-wide
+  default store when an app has none installed, so two `App`s that never install one share a
+  queue — where two `instance()` modules got one each.
+
+  To give an app its own store, put `worker_startup(app; ...)` in **that app's**
+  `serve(middleware = [...])` list, or call `Nitro.Workers.start!(app; ...)` directly.
+  `worker_startup` on its own installs nothing: it *returns* lifecycle middleware, and the store
+  is installed when `serve` fires its `on_startup`.
+
+  Once an app has its own store, use that app's worker API (`submit_task(app, ...)` and friends).
+  The argument-less `submit_task(...)` helpers keep writing to the process-wide default store, so
+  mixing the two silently splits submissions from the queue processors watching the app's store.
+
+### How to find the calls to migrate
+
+```bash
+# 1. The call. Note the word boundary -- `internalrequest`, `instances` and any local
+#    variable named `instance` are NOT matches.
+rg -n '\binstance\(\)' --type julia
+
+# 2. Module-qualified calls through the returned instance, which have no direct equivalent:
+#    `app.urlpatterns(...)` becomes `urlpatterns(app, ...)`.
+rg -n '\w+\.(urlpatterns|serve|terminate|internalrequest|path)\(' --type julia
+```
+
+### Migrate your app
+
+```julia
+# ✗ before
+app1 = instance()
+app1.urlpatterns("", app1.path("/", () -> "hello"))
+app1.serve(port = 8080, async = true)
+
+# ✓ after
+app1 = App(mod = @__MODULE__)
+urlpatterns(app1, "", path("/", () -> "hello"))
+serve(app1; port = 8080, async = true)
+```
+
+The call shape changes from method-on-module to function-on-value: `app.f(x)` becomes `f(app, x)`.
+`path` and `include_routes` take no app at all — they build route definitions, and
+`urlpatterns(app, …)` is what binds them to one.
+
+---
+
 ## `context()` is removed — read the app context from the request with `getcontext(req)` (#31)
 
 - **Version**: Unreleased

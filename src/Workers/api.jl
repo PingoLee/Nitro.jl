@@ -1,4 +1,4 @@
-function _resolve_store(ctx::ServerContext; key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
+function _resolve_store(ctx::App; key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
     if !isnothing(store)
         return store
     end
@@ -7,7 +7,7 @@ function _resolve_store(ctx::ServerContext; key::Symbol=DEFAULT_EXTENSION_KEY, s
     return isnothing(ctx_store) ? default_store() : ctx_store
 end
 
-function _install_or_resolve_store!(ctx::ServerContext; key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
+function _install_or_resolve_store!(ctx::App; key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
     if isnothing(store)
         existing_store = worker_store(ctx; key)
         return isnothing(existing_store) ? install!(ctx; key) : existing_store
@@ -49,11 +49,11 @@ function recover_zombie_tasks!(; store::AbstractWorkerStore=default_store())
     end
 end
 
-function recover_zombie_tasks!(ctx::ServerContext; key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
+function recover_zombie_tasks!(ctx::App; key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
     return recover_zombie_tasks!(; store=_resolve_store(ctx; key, store))
 end
 
-function start!(ctx::ServerContext;
+function start!(ctx::App;
     queues::AbstractVector{<:AbstractString}=String[],
     cleanup_enabled::Bool=true,
     cleanup_interval_hours::Real=24,
@@ -81,7 +81,7 @@ function start!(ctx::ServerContext;
     return resolved_store
 end
 
-function startup(ctx::ServerContext;
+function startup(ctx::App;
     queues::AbstractVector{<:AbstractString}=String[],
     cleanup_enabled::Bool=true,
     cleanup_interval_hours::Real=24,
@@ -498,7 +498,7 @@ function submit_task(task_key::AbstractString, callback::Function, owner::Owner;
     return key
 end
 
-function submit_task(ctx::ServerContext, task_key::AbstractString, callback::Function, owner::Owner; scope::Symbol=:user, watchers::AbstractVector{Owner}=Owner[], options::TaskOptions=TaskOptions(), key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
+function submit_task(ctx::App, task_key::AbstractString, callback::Function, owner::Owner; scope::Symbol=:user, watchers::AbstractVector{Owner}=Owner[], options::TaskOptions=TaskOptions(), key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
     resolved_store = _resolve_store(ctx; key, store)
     return submit_task(task_key, callback, owner; scope, watchers, options, store=resolved_store)
 end
@@ -529,7 +529,7 @@ function submit_sequential_task(queue_name::AbstractString, task_key::AbstractSt
     return key
 end
 
-function submit_sequential_task(ctx::ServerContext, queue_name::AbstractString, task_key::AbstractString, callback::Function, owner::Owner; scope::Symbol=:user, watchers::AbstractVector{Owner}=Owner[], options::TaskOptions=TaskOptions(), key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
+function submit_sequential_task(ctx::App, queue_name::AbstractString, task_key::AbstractString, callback::Function, owner::Owner; scope::Symbol=:user, watchers::AbstractVector{Owner}=Owner[], options::TaskOptions=TaskOptions(), key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
     resolved_store = _resolve_store(ctx; key, store)
     return submit_sequential_task(queue_name, task_key, callback, owner; scope, watchers, options, store=resolved_store)
 end
@@ -557,7 +557,7 @@ function get_task_status(task_id::AbstractString, authority::TaskAuthority; stor
     )
 end
 
-function get_task_status(ctx::ServerContext, task_id::AbstractString, authority::TaskAuthority; key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
+function get_task_status(ctx::App, task_id::AbstractString, authority::TaskAuthority; key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
     return get_task_status(task_id, authority; store=_resolve_store(ctx; key, store))
 end
 
@@ -645,7 +645,7 @@ function cancel_task(task_id::AbstractString, authority::TaskAuthority; store::A
     end
 end
 
-function cancel_task(ctx::ServerContext, task_id::AbstractString, authority::TaskAuthority; key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
+function cancel_task(ctx::App, task_id::AbstractString, authority::TaskAuthority; key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
     return cancel_task(task_id, authority; store=_resolve_store(ctx; key, store))
 end
 
@@ -668,7 +668,7 @@ function get_all_tasks(authority::TaskAuthority, filter_status::Union{Nothing, T
     return tasks
 end
 
-function get_all_tasks(ctx::ServerContext, authority::TaskAuthority, filter_status::Union{Nothing, TaskStatus}=nothing; key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
+function get_all_tasks(ctx::App, authority::TaskAuthority, filter_status::Union{Nothing, TaskStatus}=nothing; key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
     return get_all_tasks(authority, filter_status; store=_resolve_store(ctx; key, store))
 end
 
@@ -676,7 +676,7 @@ function cleanup_old_tasks(days::Int=7; store::AbstractWorkerStore=default_store
     return cleanup_tasks!(store, days)
 end
 
-function cleanup_old_tasks(ctx::ServerContext, days::Int=7; key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
+function cleanup_old_tasks(ctx::App, days::Int=7; key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
     return cleanup_old_tasks(days; store=_resolve_store(ctx; key, store))
 end
 
@@ -723,7 +723,7 @@ function get_queue_status(queue_name::AbstractString, ::System; store::AbstractW
     end
 end
 
-function get_queue_status(ctx::ServerContext, queue_name::AbstractString, authority::System; key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
+function get_queue_status(ctx::App, queue_name::AbstractString, authority::System; key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
     return get_queue_status(queue_name, authority; store=_resolve_store(ctx; key, store))
 end
 
@@ -757,7 +757,7 @@ function start_cleanup_scheduler(; interval_hours::Real=24, retain_days::Int=7, 
     return scheduler
 end
 
-function start_cleanup_scheduler(ctx::ServerContext; interval_hours::Real=24, retain_days::Int=7, key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
+function start_cleanup_scheduler(ctx::App; interval_hours::Real=24, retain_days::Int=7, key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
     return start_cleanup_scheduler(; interval_hours, retain_days, store=_resolve_store(ctx; key, store))
 end
 

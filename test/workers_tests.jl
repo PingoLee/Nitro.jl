@@ -162,8 +162,8 @@ end
 
 @testset "Cleanup scheduler and per-context stores" begin
     store = InMemoryWorkerStore()
-    ctx_one = Nitro.Core.ServerContext()
-    ctx_two = Nitro.Core.ServerContext()
+    ctx_one = Nitro.Core.App()
+    ctx_two = Nitro.Core.App()
 
     try
         install!(ctx_one; store=store)
@@ -196,7 +196,7 @@ end
 end
 
 @testset "Public worker startup API bootstraps lifecycle" begin
-    ctx = Nitro.Core.ServerContext()
+    ctx = Nitro.Core.App()
 
     lifecycle = startup(
         ctx;

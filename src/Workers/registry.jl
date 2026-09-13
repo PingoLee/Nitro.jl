@@ -431,21 +431,21 @@ function lock_tasks(callback::Function, store::InMemoryWorkerStore)
     end
 end
 
-# -- Core extension management (ServerContext integration) --
+# -- Core extension management (App integration) --
 
 const DEFAULT_STORE = Ref(InMemoryWorkerStore())
 
 default_store() = DEFAULT_STORE[]
 
-function worker_store(ctx::ServerContext; key::Symbol=DEFAULT_EXTENSION_KEY)
+function worker_store(ctx::App; key::Symbol=DEFAULT_EXTENSION_KEY)
     return get_extension(ctx, key, nothing)
 end
 
-function install!(ctx::ServerContext; key::Symbol=DEFAULT_EXTENSION_KEY, store::AbstractWorkerStore=InMemoryWorkerStore())
+function install!(ctx::App; key::Symbol=DEFAULT_EXTENSION_KEY, store::AbstractWorkerStore=InMemoryWorkerStore())
     return set_extension!(ctx, key, store)
 end
 
-function uninstall!(ctx::ServerContext; key::Symbol=DEFAULT_EXTENSION_KEY)
+function uninstall!(ctx::App; key::Symbol=DEFAULT_EXTENSION_KEY)
     store = worker_store(ctx; key)
     if store isa AbstractWorkerStore
         shutdown!(store)

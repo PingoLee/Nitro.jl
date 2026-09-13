@@ -103,9 +103,9 @@ is explicit introspection, not accidental disclosure.)
   `SO_REUSEADDR` instead lets a second process bind a port another is actively listening
   on — turning a port conflict into two servers silently splitting the traffic.
 
-Calling `serve` on a context that is **already serving** throws an `ArgumentError`: the
-second call would overwrite the running server's handle and strand its port. Call
-`terminate` first, or give the second listener its own context via `instance`.
+Calling `serve` on an app that is **already serving** throws an `ArgumentError`: the second
+call would overwrite the running server's handle and strand its port. Terminate that app
+first, or give the second listener its own `App`.
 
 IP-based controls (rate limiting, audit logging) key on the socket peer address,
 resolved for both plain-HTTP and direct-TLS listeners. Behind a reverse proxy,
@@ -114,7 +114,7 @@ configure `ExtractIP`/`RateLimiter` with both `trusted_proxies` and the
 
 See also `terminate`, `RateLimiter`, and `ExtractIP`.
 """
-function serve(ctx::ServerContext;
+function serve(ctx::App;
     middleware=[],
     handler=stream_handler,
     host="127.0.0.1",
@@ -146,11 +146,11 @@ function serve(ctx::ServerContext;
     # the first server's in-flight requests.
     if isopen(ctx.service)
         throw(ArgumentError(
-            "This ServerContext is already serving on " *
+            "This App is already serving on " *
             "$(something(ctx.service.external_url[], "an open listener")). A second `serve()` " *
             "would overwrite the running server's handle, leaving it unreachable and its port " *
-            "bound until the process exits. Call `terminate()` first, or give the second " *
-            "listener its own context (`instance()`, or `Nitro.Core.serve(ServerContext(); …)`)."))
+            "bound until the process exits. Terminate THIS app first, or give the second " *
+            "listener its own: `app = App(mod = @__MODULE__); serve(app; …)`."))
     end
 
     if revise ∉ (:none, :lazy, :eager)
@@ -206,7 +206,7 @@ function serve(ctx::ServerContext;
             error("Revise support is unavailable. Load Revise.jl in your development session before using the `revise` option")
         end
         if ctx.mod === nothing
-            @warn "You are trying to use the `revise` option, but no module was provided to track. Code in the `Main` module may not be tracked and revised."
+            @warn "`revise` was requested but this App tracks no module, so code in `Main` may not be revised. Construct it as `App(mod = @__MODULE__)` from the module you want tracked."
         end
         middleware = convert(Vector{Any}, middleware)
         insert!(middleware, 1, ReviseHandler())
@@ -283,7 +283,7 @@ function start_revise_service()
 end
 
 """
-    terminate(context::ServerContext; timeout = nothing)
+    terminate(context::App; timeout = nothing)
     terminate(; timeout = nothing)
 
 Stop the running server: run every `LifecycleMiddleware` shutdown hook, drop the composed
@@ -308,7 +308,7 @@ notified from a `LifecycleMiddleware`'s `on_shutdown`, which runs *before* the d
 
 See also `serve`.
 """
-function terminate(context::ServerContext; timeout::Nullable{Real} = nothing)
+function terminate(context::App; timeout::Nullable{Real} = nothing)
     if isopen(context.service)
         # LIFO (#74): the exact reverse of `startserver`'s startup sequence, which ran
         # route-owned then serve-owned, each in registration order. So: serve-owned reversed,
@@ -342,7 +342,7 @@ function terminate(context::ServerContext; timeout::Nullable{Real} = nothing)
     return nothing
 end
 
-function startserver(ctx::ServerContext; host, port, show_banner=false, parallel=false, async=false, kwargs, start)::Union{Server, Nothing}
+function startserver(ctx::App; host, port, show_banner=false, parallel=false, async=false, kwargs, start)::Union{Server, Nothing}
     show_banner && serverwelcome(ctx.service.external_url[], ctx.service.prefix[], parallel)
     ctx.service.server[] = start(preprocesskwargs(kwargs))
     # Route-owned first, then serve-owned: that is declaration order — routes are registered at

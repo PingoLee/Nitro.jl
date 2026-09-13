@@ -31,7 +31,7 @@ urlpatterns(CONTEXT[], "/api/v1",
 using HTTP
 using UUIDs: UUID
 
-using ..AppContext: ServerContext
+using ..AppContext: App
 using ..Types: Nullable, RouteDefinition
 using ..Util: join_url_path
 using ..RouterHOF: genkey, process_middleware, publish_route_middleware!, _has_layers
@@ -110,13 +110,13 @@ end
 
 Register a group of `RouteDefinition`s under a common URL prefix.
 """
-function urlpatterns(ctx::ServerContext, prefix::String, routes::RouteDefinition...)
+function urlpatterns(ctx::App, prefix::String, routes::RouteDefinition...)
     for route_def in routes
         register_route(ctx, prefix, route_def)
     end
 end
 
-function urlpatterns(ctx::ServerContext, prefix::String, routes::Vector{RouteDefinition})
+function urlpatterns(ctx::App, prefix::String, routes::Vector{RouteDefinition})
     for route_def in routes
         register_route(ctx, prefix, route_def)
     end
@@ -144,7 +144,7 @@ function include_routes(prefix::String, routes::RouteDefinition...)
 end
 
 
-function register_named_route!(ctx::ServerContext, name::String, full_path::String)
+function register_named_route!(ctx::App, name::String, full_path::String)
     return Base.lock(ctx.service.named_routes_lock) do
         existing_path = get(ctx.service.named_routes, name, nothing)
         if isnothing(existing_path)
@@ -193,7 +193,7 @@ end
 Build a URL path for a named route by substituting `{param}` placeholders from
 the registered route pattern.
 """
-function url(ctx::ServerContext, name::String; kwargs...)
+function url(ctx::App, name::String; kwargs...)
     pattern = Base.lock(ctx.service.named_routes_lock) do
         get(ctx.service.named_routes, name, nothing)
     end
@@ -213,7 +213,7 @@ Register a single RouteDefinition by calling the parent Core.register().
 We use `parentmodule` to late-bind to the `register` function, avoiding
 circular dependency issues at include-time.
 """
-function register_route(ctx::ServerContext, prefix::String, route_def::RouteDefinition)
+function register_route(ctx::App, prefix::String, route_def::RouteDefinition)
     full_path = join_url_path(prefix, route_def.pattern)
 
     if !isnothing(route_def.name)

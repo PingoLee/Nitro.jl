@@ -25,8 +25,6 @@ include("core.jl")
 using .Core
 include("Auth.jl")
 using .Auth
-include("instances.jl")
-using .Instances
 include("Workers.jl")
 using .Workers
 
@@ -36,19 +34,21 @@ import HTTP: Request, Response, Stream, queryparams
 # handlers can call them unqualified, as before.
 import HTTP: startread, startwrite, closeread, closewrite
 import HTTP.WebSockets: WebSocket
-using .Core: ServerContext, Nullable, HOFRouter
+using .Core: App, Nullable, HOFRouter
 using .Core: GET, POST, PUT, DELETE, PATCH
 
-const CONTEXT::Ref{ServerContext} = Ref(ServerContext())
+const CONTEXT::Ref{App} = Ref(App())
 
 include("exts.jl")
 include("methods.jl")
 include("upgrading.jl")
 
-export  # Server lifecycle
+export  # The application handle
+        App,
+        # Server lifecycle
         serve, terminate, internalrequest,
         worker_startup,
-        resetstate, instance, router,
+        resetstate, router,
         register_revise_hooks!, clear_revise_hooks!,
         # File serving
         staticfiles, dynamicfiles, spafiles,
