@@ -71,19 +71,105 @@ try
     end
 
     @testset "neither app touched the global singleton" begin
-        # The point of the handle: no global mutation. `resetstate()` is not called anywhere
-        # in this item, so a leak here would be a real regression.
-        @test internalrequest(HTTP.Request("GET", "/")).status == 404
+        # The point of the handle: no global mutation.
+        #
+        # Asserted on a route UNIQUE to this item, not on "/". ReTestItems runs items in
+        # alphabetical file order, not `TEST_FILES` order, and `extractor_tests.jl` registers
+        # `path("/", …)` on the global context without resetting — so a "/" assertion here is
+        # green only because `app_tests` sorts first, and would flip on a rename.
+        @test internalrequest(HTTP.Request("GET", "/subtract/1/2")).status == 404
+        @test internalrequest(HTTP.Request("GET", "/add/1/2")).status == 404
     end
 
     @testset "an App does not leak secrets when displayed" begin
-        # `App` is public now, so it reaches REPL auto-display and interpolated log lines.
-        # Its `service` holds router/middleware closures that capture the cookie and JWT
-        # `secret_key`; the custom `show` must not walk them.
-        shown = sprint(show, app1)
+        # `App` is public now, so it reaches REPL auto-display and interpolated log lines. Its
+        # `service` holds the cookie config, whose `secret_key` is the FIRST positional field —
+        # so the default field-walking `show` prints it verbatim. (That is not hypothetical: it
+        # is what `@show Nitro.CONTEXT[]` did before this type had a `show`.)
+        #
+        # The assertion has to name the literal secret. `!occursin("secret_key", …)` does NOT
+        # discriminate — Julia's default `show` prints field VALUES, not names, so that form
+        # passes with the override deleted. Verified before rewriting it.
+        secret = "SUPERSECRET_CANARY_9f2a"
+        leaky = App(mod = @__MODULE__)
+        configcookies(leaky; secret_key = secret)
+
+        shown = sprint(show, leaky)
         @test occursin("App(", shown)
+        @test !occursin(secret, shown)
         @test !occursin("Service", shown)
-        @test !occursin("secret_key", shown)
+
+        # And the default path really would have leaked it, so the override is load-bearing.
+        @test occursin(secret, sprint(io -> invoke(Base.show, Tuple{IO,Any}, io, leaky)))
+    end
+    @testset "every (app, …) forward reaches the app, not the global" begin
+        # The forwards are one-liners, which is exactly why they need this: a typo swapping
+        # `app` for `CONTEXT[]` compiles, passes every other test, and silently operates on
+        # the wrong app. Each assertion below distinguishes the two.
+
+        # `url` — resolves a named route from THIS app's table.
+        urlpatterns(app1, "", path("/named/<int:id>", (req, id::Int) -> "ok", name = "named"))
+        @test url(app1, "named"; id = 7) == "/named/7"
+        # The global has no such name, so the singleton form must fail rather than agree.
+        @test_throws Exception url("named"; id = 7)
+
+        # `getexternalurl` — reads this app's listener, and app1 IS serving.
+        @test getexternalurl(app1) == "http://$HOST:$port1"
+        @test getexternalurl(app2) == "http://$HOST:$port2"
+
+        # `configcookies` / `get_cookie` / `set_cookie!` — the cookie config must be per-app.
+        configcookies(app1; secret_key = "app1-secret-000000000000000000000")
+        configcookies(app2; secret_key = "app2-secret-111111111111111111111")
+        @test app1.service.cookies[].secret_key != app2.service.cookies[].secret_key
+
+        res = Nitro.Response(200, [], "")
+        set_cookie!(app1, res, "sid", "payload-app1")
+        raw = join([v for (k, v) in res.headers if lowercase(k) == "set-cookie"], ";")
+        @test !occursin("payload-app1", raw)          # encrypted under app1's key
+        @test !occursin("app1-secret", raw)           # and the key itself never ships
+
+        req = Nitro.Request("GET", "/", ["Cookie" => replace(split(raw, ';')[1], "sid=" => "sid=")])
+        @test get_cookie(app1, req, "sid") == "payload-app1"
+        # app2 has a different key, so it must not be able to read app1's cookie. Decryption
+        # under the wrong key raises rather than returning the default -- which is the correct
+        # loud failure, and the reason this asserts a throw instead of a value.
+        @test_throws Exception get_cookie(app2, req, "sid")
+
+        # `router` — the HOF route BUILDER (it composes a route string and registers the
+        # router's own middleware against the app); it does not take a handler. Protocol is
+        # `router(app, prefix)(path)(method)`, as in test/custommiddleware_tests.jl.
+        hof_route = router(app1, "/hof")("/only-app1")("GET")
+        @test hof_route isa AbstractString
+        @test occursin("/hof", hof_route) && occursin("/only-app1", hof_route)
+
+        # `staticfiles` / `spafiles` / `dynamicfiles` — mount into THIS app's router.
+        mountdir = mktempdir()
+        write(joinpath(mountdir, "index.html"), "<p>app1 only</p>")
+        staticfiles(app1, mountdir, "assets")
+        @test internalrequest(app1, HTTP.Request("GET", "/assets/index.html")).status == 200
+        # app2 never mounted it, and neither did the global.
+        @test internalrequest(app2, HTTP.Request("GET", "/assets/index.html")).status == 404
+        @test internalrequest(HTTP.Request("GET", "/assets/index.html")).status == 404
+
+        dynamicfiles(app2, mountdir, "dyn")
+        @test internalrequest(app2, HTTP.Request("GET", "/dyn/index.html")).status == 200
+        @test internalrequest(app1, HTTP.Request("GET", "/dyn/index.html")).status == 404
+
+        spa = mktempdir()
+        write(joinpath(spa, "index.html"), "<p>spa</p>")
+        spafiles(app2, spa, "spa")
+        @test internalrequest(app2, HTTP.Request("GET", "/spa/index.html")).status == 200
+
+        # `worker_startup` returns LIFECYCLE MIDDLEWARE for the `serve(middleware = [...])`
+        # list -- it does not install a store by itself; `Workers.start!` does that. Both are
+        # asserted, because the distinction is exactly what the UPGRADING caveat turns on:
+        # an app with no store installed falls back to the process-wide default.
+        @test Nitro.Workers.worker_store(app1) === nothing
+        @test worker_startup(app1) isa Nitro.Core.Types.LifecycleMiddleware
+
+        Nitro.Workers.start!(app1; cleanup_enabled = false, recover_zombies = false)
+        @test Nitro.Workers.worker_store(app1) !== nothing
+        @test Nitro.Workers.worker_store(app2) === nothing   # untouched
     end
 finally
     terminate(app1)

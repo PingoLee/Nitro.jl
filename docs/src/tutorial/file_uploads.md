@@ -257,7 +257,7 @@ function submit_import(req, upload::Files{FormFile})
     # Returns the STORED id ("<user_id>::import_<uuid>"), not task_key — stage the
     # file under task_key, but hand the client back what the submit returned.
     task_id = Nitro.Workers.submit_sequential_task(
-        app,
+        Nitro.CONTEXT[],
         "import_queue",
         task_key,
         (task) -> MyImportModule.process(staged_path),

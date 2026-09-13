@@ -136,15 +136,16 @@ This is the simplest setup for most Nitro applications.
 
 ## Manual Startup
 
-If your app needs explicit bootstrap control, use `Nitro.Workers.start!(app; ...)` with an [`App`](@ref).
+If your app needs explicit bootstrap control, call `Nitro.Workers.start!` yourself. Pass the
+same app you serve — with an explicit [`App`](@ref) that is `app`, and with the argument-less
+`serve()` it is `Nitro.CONTEXT[]`. Starting a store on an app you never serve gives you queues
+nothing submits to.
 
 ```julia
 using Nitro
 
-app = App(mod = @__MODULE__)
-
 Nitro.Workers.start!(
-    app;
+    Nitro.CONTEXT[];
     queues=["reports", "imports"],
     cleanup_enabled=true,
     cleanup_interval_hours=24,

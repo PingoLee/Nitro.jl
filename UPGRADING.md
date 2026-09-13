@@ -133,9 +133,16 @@ package** into a fresh anonymous module — a full recompile per instance, a sec
 method table, and a hard failure on any deployment where the package source is not present or
 readable at runtime (system images, relocated installs).
 
-`App` gives the same isolation — independent router, middleware, cookie config and app context —
-with none of that. What it does *not* reproduce is a separate module namespace, so types are
-shared: `app1`'s `Request` is `Nitro.Request`, which is what you want.
+`App` gives you an independent router, middleware stack, cookie config and app context, with none
+of that cost. Two differences are worth knowing before you port:
+
+- **Types are shared.** There is no separate module namespace, so `app1`'s `Request` *is*
+  `Nitro.Request`. That is what you want — objects could not cross `instance()` boundaries.
+- **Worker stores are NOT isolated by default.** `_resolve_store` falls back to the process-wide
+  default store when an app has none installed, so two `App`s that never call `worker_startup`
+  share one queue — where two `instance()` modules got one each. Call
+  `worker_startup(app; ...)` (or `Nitro.Workers.start!(app; ...)`) on each app that uses workers
+  and each gets its own store.
 
 ### How to find the calls to migrate
 

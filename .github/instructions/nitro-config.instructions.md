@@ -42,7 +42,10 @@ When designing configuration, bootstrapping applications, or proposing developer
 - **Multiple Nitro apps in one process is supported — build on `App`, not the singleton
   ([#31](https://github.com/PingoLee/Nitro.jl/issues/31)).** `App` is the public application
   handle (`src/context.jl`): its own router, middleware, cookie config, lifecycle hooks and app
-  context. Every public routing, serving and cookie function takes one as its first argument.
+  context. `serve`, `terminate`, `internalrequest`, `urlpatterns`, `url`, `router`, `staticfiles`,
+  `spafiles`, `dynamicfiles`, `configcookies`, `get_cookie`, `set_cookie!`, `getexternalurl`
+  and `worker_startup` all take one as their first argument. `path` and `include_routes` do
+  **not** — they build route definitions, and `urlpatterns(app, …)` is what binds them.
 
   ```julia
   app = App(mod = @__MODULE__)

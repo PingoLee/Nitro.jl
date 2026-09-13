@@ -103,9 +103,9 @@ is explicit introspection, not accidental disclosure.)
   `SO_REUSEADDR` instead lets a second process bind a port another is actively listening
   on — turning a port conflict into two servers silently splitting the traffic.
 
-Calling `serve` on a context that is **already serving** throws an `ArgumentError`: the
-second call would overwrite the running server's handle and strand its port. Call
-`terminate` first, or give the second listener its own context via `instance`.
+Calling `serve` on an app that is **already serving** throws an `ArgumentError`: the second
+call would overwrite the running server's handle and strand its port. Terminate that app
+first, or give the second listener its own `App`.
 
 IP-based controls (rate limiting, audit logging) key on the socket peer address,
 resolved for both plain-HTTP and direct-TLS listeners. Behind a reverse proxy,
@@ -149,8 +149,8 @@ function serve(ctx::App;
             "This App is already serving on " *
             "$(something(ctx.service.external_url[], "an open listener")). A second `serve()` " *
             "would overwrite the running server's handle, leaving it unreachable and its port " *
-            "bound until the process exits. Call `terminate()` first, or give the second " *
-            "listener its own app: `app = App(mod = @__MODULE__); serve(app; …)`."))
+            "bound until the process exits. Terminate THIS app first, or give the second " *
+            "listener its own: `app = App(mod = @__MODULE__); serve(app; …)`."))
     end
 
     if revise ∉ (:none, :lazy, :eager)

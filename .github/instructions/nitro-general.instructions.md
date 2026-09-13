@@ -308,7 +308,8 @@ abstract type, a constant, an exception type — belongs in `src/types.jl`, `src
 **`src/methods.jl` is where the API is coupled to global state.** The top-level convenience methods
 bind to the process-wide `CONTEXT[]` singleton declared in `src/Nitro.jl`. Every one of them also
 has an `(app::App, …)` method defined **in that same file** — reach for that form in tests and in
-any code that must not touch the global.
+any code that must not touch the global. The exceptions are `resetstate` and `serveparallel`
+(singleton-shaped by definition) and `route` (plumbing, not public API).
 
 That placement is load-bearing, not incidental: `methods.jl` defines these names inside `Nitro`, so
 they **shadow** the same-named functions `using .Core` brings in. An `(app, …)` method added only in
