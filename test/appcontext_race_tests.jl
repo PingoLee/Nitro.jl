@@ -13,13 +13,14 @@ using Nitro
 # returned the wrong tenant's object for that request's whole lifetime.
 #
 # The fix carries the app context on the REQUEST instead, so there is no shared cell left to
-# observe mid-flight. These items pin that shut from both sides: one asserts a live HTTP
-# request keeps its own context, the other asserts the shared cell is never written at all.
+# observe mid-flight. Three items pin that shut: a live HTTP request keeps its own context, the
+# shared cell is never written at all, and — because the context is now state that outlives a
+# call — a reused request object does not inherit a previous call's override.
 #
-# Both are DETERMINISTIC — they synchronise on `Base.Event`, never on sleeps. The trick that
-# makes the window observable without racing the test itself is parking an `internalrequest`
-# *inside its own handler*: under the old code the global is swapped at that moment and stays
-# swapped until the handler returns, so the concurrent observation lands squarely in the gap.
+# The first two are DETERMINISTIC: they synchronise on a latch, never on sleeps. What makes the
+# window observable without racing the test itself is parking an `internalrequest` *inside its
+# own handler* — under the old code the global is swapped at that moment and stays swapped until
+# the handler returns, so the concurrent observation lands squarely in the gap.
 
 struct Tenant
     name::String
@@ -28,17 +29,25 @@ end
 tenant_a = Tenant("A")
 tenant_b = Tenant("B")
 
-# `Base.Event` is single-use, and both testsets park the same route, so the latches live
-# behind Refs the handler dereferences at call time and each testset installs fresh ones.
-parked  = Ref(Base.Event())
+# The latches are single-use and both testsets park the same route, so they live behind Refs
+# the handler dereferences at call time; each testset installs fresh ones.
+#
+# `parked` is a Channel rather than an Event so the test can wait on it with a TIMEOUT. A test
+# that hangs is strictly worse than one that fails: `runtests.jl`'s `testitem_timeout` covers
+# the default worker path but not `--workers 0`, so a handler that never reaches `put!` (route
+# gone, 404, a throw before this line) would otherwise wedge the run instead of reporting.
+parked  = Ref(Channel{Nothing}(1))
 release = Ref(Base.Event())
+
+# Returns true if the parked handler signalled within the budget.
+reached_handler(ch) = timedwait(() -> isready(ch), 30.0) === :ok
 
 port = get_free_port()
 localhost = "http://$HOST:$port"
 
 urlpatterns("",
     path("/park", function(req)
-        notify(parked[])
+        put!(parked[], nothing)
         wait(release[])
         c = getcontext(req)
         return Res.json(Dict("tenant" => c === nothing ? "none" : c.name))
@@ -54,13 +63,13 @@ serve(port=port, host=HOST, async=true, show_errors=false, show_banner=false,
 
 try
     @testset "a live request is not stamped with a concurrent internalrequest's context" begin
-        parked[]  = Base.Event()
+        parked[]  = Channel{Nothing}(1)
         release[] = Base.Event()
 
         # Park an `internalrequest(context = tenant_b)` inside its handler. On the unpatched
         # code the process-wide cell reads tenant_b from here until the handler returns.
         call = Threads.@spawn internalrequest(HTTP.Request("GET", "/park"); context = tenant_b)
-        wait(parked[])
+        @test reached_handler(parked[])
 
         # A real HTTP request, served by the live server off the same context, entering the
         # pipeline squarely inside that window.
@@ -78,7 +87,7 @@ try
     end
 
     @testset "internalrequest never mutates the shared app context cell" begin
-        parked[]  = Base.Event()
+        parked[]  = Channel{Nothing}(1)
         release[] = Base.Event()
 
         cell = Nitro.CONTEXT[].app_context[]
@@ -86,7 +95,7 @@ try
         @test cell.payload == tenant_a
 
         call = Threads.@spawn internalrequest(HTTP.Request("GET", "/park"); context = tenant_b)
-        wait(parked[])
+        @test reached_handler(parked[])
 
         # Observed from a concurrent task, mid-call. Two overlapping `internalrequest`s used
         # to be able to clobber this permanently, because `old_ctx` was snapshotted without
@@ -114,6 +123,9 @@ try
         @test json(plain)["tenant"] == "A"
     end
 finally
+    # Free any still-parked handler before tearing down. A plain `@test` failure is safe,
+    # but an EXCEPTION inside a testset would otherwise skip the `notify` and strand the task.
+    notify(release[])
     terminate()
     resetstate()
 end

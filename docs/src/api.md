@@ -47,7 +47,6 @@ a one-off parse with options. `LazyRequest` remains the extractor-facing wrapper
 
 ```@docs
 Context
-context
 queryparams
 getparams
 getquery

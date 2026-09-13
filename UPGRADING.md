@@ -70,9 +70,12 @@ goes rather than being rewired.
 ### How to find the calls to migrate
 
 ```bash
-# 1. The call itself. Note the word boundary — `ServerContext()` and `RequestContext()`
-#    are unrelated and must NOT be rewritten.
+# 1. The call itself. `ServerContext()`/`RequestContext()` are excluded by CASE, and the
+#    `\b` is what keeps this off `getcontext()`.
 rg -n '\bcontext\(\)' --type julia
+
+# 1b. Reading the singleton directly, which is the same change by another route.
+rg -n 'CONTEXT\[\]\.app_context' --type julia
 
 # 2. Explicit imports of the name, which will now fail at load time rather than at the call.
 rg -n 'import\s+Nitro:.*\bcontext\b|using\s+Nitro:.*\bcontext\b' --type julia
@@ -111,6 +114,16 @@ end
 Note the sentinel change: `context()` returned `missing` when no context was configured,
 `getcontext(req)` returns `nothing`. If you tested with `ismissing(...)`, switch to
 `isnothing(...)`.
+
+### One more behavior change, if you read the singleton directly
+
+Middleware that reached `Nitro.CONTEXT[].app_context[]` instead of the request used to observe
+the **override** while an `internalrequest(context = ...)` was in flight — that is precisely the
+leak this change removes. It now observes the server's context, always. If a test relied on
+driving middleware through `internalrequest(context = ...)` and reading the global, it will now
+see the `serve(context = ...)` value; read `getcontext(req)` instead and it gets the override as
+intended. Reading the singleton from the request path is no longer supported: the app context is
+carried on the request, and nothing downstream of the pipeline's outermost layer reads that cell.
 
 ---
 

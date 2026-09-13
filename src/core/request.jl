@@ -326,7 +326,7 @@ end
 ```
 """
 function getcontext(req::HTTP.Request, ::Type{T}) where {T}
-    ctx = Base.get(req.context, REQUEST_CONTEXT_KEY, missing)
+    ctx = request_app_context(req)
     ctx isa Context || throw(ArgumentError(
         "No application context on request; pass `context = ...` to `serve()`."))
     return ctx.payload::T
