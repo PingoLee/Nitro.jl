@@ -19,8 +19,7 @@ using Nitro.Workers    # the contract names are not re-exported from `Nitro`
 
 | Method | Contract |
 |---|---|
-| `get_task_info(store, task_id::String)` | `TaskInfo` or `nothing`; may serve a live object, see *Live objects* |
-| `reload_task(store, task_id::String)` | `TaskInfo` or `nothing`, bypassing any in-process cache |
+| `get_task_info(store, task_id::String)` | The **durable** record: `TaskInfo` or `nothing`, see *Live objects* |
 | `set_task!(store, task_id::String, task_info::TaskInfo)` | Write volatile state; must never write `watchers` or `run_id` |
 | `replace_task!(store, task_id::String, task_info::TaskInfo)` | Write the whole record, `watchers` and `run_id` included |
 | `add_watcher!(store, task_id::String, user_id::String)` | Atomic compare-and-set append, returns `Bool` |
@@ -28,19 +27,6 @@ using Nitro.Workers    # the contract names are not re-exported from `Nitro`
 | `delete_task!(store, task_id::String)` | Remove one record |
 | `cleanup_tasks!(store, retain_days::Int)` | Prune finished records, returns how many went |
 | `get_all_tasks(store, authority::TaskAuthority; status, queue_name)` | `Vector{TaskInfo}` |
-
-# Process-local runtime handles
-
-These describe one **run** on this process, never durable state, and must not be serialized.
-
-| Method | Contract |
-|---|---|
-| `get_active_task(store, task_id::String)` | The running `Task`, or `nothing`. This is the whole zombie-recovery criterion |
-| `register_active_task!(store, task_id::String, task::Task)` | Record the handle for the current run |
-| `deregister_active_task!(store, task_id::String)` | Drop it — only the run that registered it may |
-| `get_active_task_info(store, task_id::String)` | The live `TaskInfo` the callback holds, or `nothing` |
-| `register_active_task_info!(store, task_id::String, task_info::TaskInfo)` | Publish that object |
-| `deregister_active_task_info!(store, task_id::String)` | Drop it; a no-op is valid when the store has no such cache |
 
 # Authorization hooks
 
@@ -51,24 +37,35 @@ Both are plain slots the application writes and the framework reads through `Bas
 | `get_queue_authorizer(store)` / `set_queue_authorizer!(store, f)` | `f(queue_name::String, user_id::String)::Bool`, or `nothing` |
 | `get_watch_authorizer(store)` / `set_watch_authorizer!(store, f)` | `f(task_key, watchers, user_id)::Bool`, or `nothing` |
 
-# Queues, locking and lifecycle
+# Locking
 
 | Method | Contract |
 |---|---|
-| `get_sequential_queues(store)` | The `Dict{String, SequentialQueue}` itself — callers mutate it in place |
-| `get_queue_lock(store)` | The `ReentrantLock` guarding that dict |
-| `get_cleanup_scheduler(store)` | An **assignable** `Ref{Union{Nothing, CleanupScheduler}}`; callers write through it |
 | `lock_tasks(callback::Function, store)` | **Callback-first**, so it is called `lock_tasks(store) do … end` |
+
+# What a store is NOT asked for
+
+Nothing here runs, schedules, or holds a handle to a live `Task`. The sequential queues and their
+processor tasks, the cleanup scheduler, and the process-local run handles belong to
+[`WorkerRuntime`](@ref) ([#167](https://github.com/PingoLee/Nitro.jl/issues/167)) — so a backend
+cannot leak them by forgetting a teardown method, which is what
+[#29](https://github.com/PingoLee/Nitro.jl/issues/29) was. There is no `shutdown!` to implement.
+
+Two optional methods exist and both default to a no-op: `clear_records!(store)`, which
+[`reset_runtime!`](@ref) calls and only a volatile backend should implement, and nothing else.
 
 # Obligations that are not methods
 
-- **Live objects.** `get_task_info` and `get_active_task_info` may return the very `TaskInfo` a
-  running callback holds, and callers mutate it expecting other in-process readers to see the
-  change. A store that reconstructs a fresh object on every read must mirror terminal writes onto
-  the live one, or progress and cancellation stop propagating.
+- **Live objects.** `get_task_info` is the **durable** read and is free to reconstruct a fresh
+  object every time; a store must *not* cache live ones. Serving a running callback's own object
+  to a reader is [`WorkerRuntime`](@ref)'s job, and doing it here instead breaks run-start, which
+  needs the durable record to fence its own transition (#167).
+
+  `InMemoryWorkerStore` is not an exception: its records simply *are* the objects callbacks hold,
+  because it stores whatever it is handed.
 - **`run_id` round-trips, but `try_transition!` never writes it.** It is a precondition, not state.
 - **`watchers` is populated on every read path.** Authorization reads it off whatever
-  `get_task_info` and `reload_task` return, so a store that omits it silently denies everyone.
+  `get_task_info` returns, so a store that omits it silently denies everyone.
 - **`lock_tasks` is process-local.** For a database-backed store it guards this process only, so
   never build a read-modify-write on it; express such a write as a single atomic store operation.
 
@@ -202,34 +199,10 @@ diagnosing one of these, check for a missing `run_id` parameter before believing
 """
 function try_transition! end
 
-"""
-    reload_task(store, task_id::String) -> Union{Nothing, TaskInfo}
-
-Read the **durable** record, bypassing any in-process cache.
-
-Distinct from [`get_task_info`](@ref), which is free to serve a live in-memory object for a
-running task so callers see fresh progress without a round-trip. That cache is per process,
-so its `watchers` can be stale the moment another process issues a grant — and an
-authorization check that consults only the cache refuses a user who *is* authorized in the
-durable record. Read paths therefore fall back to this before denying.
-
-Used only on the denial path, so the common case still costs nothing.
-"""
-function reload_task end
-
 function delete_task! end
 function cleanup_tasks! end
 function get_all_tasks end
 
-# -- Active task / local runtime cache interface functions --
-function get_active_task end
-function register_active_task! end
-function deregister_active_task! end
-function get_active_task_info end
-function register_active_task_info! end
-function deregister_active_task_info! end
-
-# -- Queue permission checks interface functions --
 function get_queue_authorizer end
 function set_queue_authorizer! end
 
@@ -318,63 +291,7 @@ after the worker started is still seen.
 """
 function set_error_redactor! end
 
-# -- Queue management helper functions --
-function get_sequential_queues end
-function get_queue_lock end
-
-# -- Lifecycle --
-
-"""
-    shutdown!(store)
-
-Release everything the store owns on this process: stop its cleanup scheduler, close its
-sequential-queue channels, and drop its process-local runtime handles.
-
-**Required, not an optional extra.** This used to have a no-op fallback on
-`AbstractWorkerStore`, and `PormGWorkerStore` never overrode it — so `uninstall!` on a
-PormG-backed app dispatched to the no-op and the scheduler kept issuing DB `DELETE`s while
-queue processors kept blocking on `take!`, after the app had stopped
-([#29](https://github.com/PingoLee/Nitro.jl/issues/29)). Every bootstrap/teardown cycle
-leaked another set. A backend that genuinely owns nothing still has to say so, with
-`shutdown!(::MyStore) = nothing`; the point is that it is written down rather than inherited
-by accident.
-
-Most of the work is backend-independent and lives in [`_stop_scheduler_and_queues!`](@ref),
-which reaches everything it needs through the contract accessors. An implementation is
-usually that call plus clearing whatever active-task caches the store itself holds.
-
-Called by `uninstall!` and `reset_store!`.
-
-# This releases; it does not drain
-
-`shutdown!` does not wait for runs still executing, and nothing can stop them — a Julia task
-cannot be killed, which is why cancellation here is a token a callback polls. What it does do is
-clear the process-local handle caches, and that has a consequence worth knowing before relying on
-teardown-then-restart *within one process* (a dev reload, or several apps sharing a process):
-
-`recover_zombie_tasks!` decides liveness purely from `get_active_task(store, id)`. Clearing the
-handle cache therefore makes a run that is still executing look dead, so the next
-`start!(recover_zombies=true)` marks it `FAILED`; when the real callback finishes, its run-fenced
-terminal write loses against that record and the result is discarded.
-
-That consequence is **parity, not a regression**: `InMemoryWorkerStore` has always emptied
-`active_tasks` in `shutdown!`, and
-[#29](https://github.com/PingoLee/Nitro.jl/issues/29) asked for a backend that behaves like it.
-Closing it means a graceful drain — waiting for, or re-registering, in-flight runs — which is a
-design change rather than a teardown fix. Until then, treat a restart in the same process as
-unsafe for tasks that are still running.
-
-Cancellation is a **separate** question, and the answer there is the opposite, which is why the
-two must not be stated together. `cancel_task` resolves the live `TaskInfo` through
-`get_active_task_info`, and the in-memory store answers that from `task_registry`, which
-`shutdown!` does *not* empty — so cancellation survives an in-memory teardown. Any backend keeping
-a distinct live-object cache must therefore leave it alone in `shutdown!`, or it becomes the only
-store on which a surviving run cannot be cancelled. `PormGWorkerStore` does exactly that.
-"""
-function shutdown! end
-
-# -- Cleanup and Locking helper functions --
-function get_cleanup_scheduler end
+# -- Locking --
 function lock_tasks end
 
 # ============================================================================
@@ -404,7 +321,6 @@ passed the wrong argument.
 const WORKER_STORE_INTERFACE = (
     # -- Durable task records --
     (get_task_info,                 (AbstractWorkerStore, String)),
-    (reload_task,                   (AbstractWorkerStore, String)),
     (set_task!,                     (AbstractWorkerStore, String, TaskInfo)),
     (replace_task!,                 (AbstractWorkerStore, String, TaskInfo)),
     (add_watcher!,                  (AbstractWorkerStore, String, String)),
@@ -412,26 +328,15 @@ const WORKER_STORE_INTERFACE = (
     (delete_task!,                  (AbstractWorkerStore, String)),
     (cleanup_tasks!,                (AbstractWorkerStore, Int)),
     (get_all_tasks,                 (AbstractWorkerStore, TaskAuthority)),
-    # -- Process-local runtime handles --
-    (get_active_task,               (AbstractWorkerStore, String)),
-    (register_active_task!,         (AbstractWorkerStore, String, Task)),
-    (deregister_active_task!,       (AbstractWorkerStore, String)),
-    (get_active_task_info,          (AbstractWorkerStore, String)),
-    (register_active_task_info!,    (AbstractWorkerStore, String, TaskInfo)),
-    (deregister_active_task_info!,  (AbstractWorkerStore, String)),
     # -- Authorization hooks --
     (get_queue_authorizer,          (AbstractWorkerStore,)),
     (set_queue_authorizer!,         (AbstractWorkerStore, Any)),
     (get_watch_authorizer,          (AbstractWorkerStore,)),
     (set_watch_authorizer!,         (AbstractWorkerStore, Any)),
-    # -- Queues, locking and lifecycle --
-    (get_sequential_queues,         (AbstractWorkerStore,)),
-    (get_queue_lock,                (AbstractWorkerStore,)),
-    (get_cleanup_scheduler,         (AbstractWorkerStore,)),
-    (lock_tasks,                    (Function, AbstractWorkerStore)),
     (get_error_redactor,            (AbstractWorkerStore,)),
     (set_error_redactor!,           (AbstractWorkerStore, Any)),
-    (shutdown!,                     (AbstractWorkerStore,)),
+    # -- Process-local serialization of store operations --
+    (lock_tasks,                    (Function, AbstractWorkerStore)),
 )
 
 _store_arg_index(argtypes) = something(findfirst(T -> T === AbstractWorkerStore, argtypes))
@@ -488,14 +393,22 @@ end
 # InMemoryWorkerStore Implementation
 # ============================================================================
 
+"""
+    InMemoryWorkerStore()
+
+The volatile backend: task records in a `Dict`, nothing durable, nothing persisted.
+
+Records are the live objects — `set_task!` stores whatever object it is handed — so a running
+callback's `update_progress!` is visible to a reader here without any live-object cache. That is
+also why this is the one backend that implements [`clear_records!`](@ref): its registry is
+process state, so discarding it on [`reset_runtime!`](@ref) is a reset rather than a destructive
+delete.
+
+It owns no queues, no scheduler and no run handles; those belong to [`WorkerRuntime`](@ref) (#167).
+"""
 mutable struct InMemoryWorkerStore <: AbstractWorkerStore
     task_registry::Dict{String, TaskInfo}
     task_lock::ReentrantLock
-    sequential_queues::Dict{String, SequentialQueue}
-    queue_lock::ReentrantLock
-    cleanup_scheduler::Ref{Union{Nothing, CleanupScheduler}}
-    active_tasks::Dict{String, Task}
-    active_lock::ReentrantLock
     queue_authorizer::Ref{Any}
     watch_authorizer::Ref{Any}
     error_redactor::Ref{Any}
@@ -503,11 +416,6 @@ mutable struct InMemoryWorkerStore <: AbstractWorkerStore
     function InMemoryWorkerStore()
         return new(
             Dict{String, TaskInfo}(),
-            ReentrantLock(),
-            Dict{String, SequentialQueue}(),
-            ReentrantLock(),
-            Ref{Union{Nothing, CleanupScheduler}}(nothing),
-            Dict{String, Task}(),
             ReentrantLock(),
             Ref{Any}(nothing),
             Ref{Any}(nothing),
@@ -553,7 +461,6 @@ function set_task!(store::InMemoryWorkerStore, task_id::String, task_info::TaskI
         existing.created_at = task_info.created_at
         existing.started_at = task_info.started_at
         existing.completed_at = task_info.completed_at
-        existing.sys_task = task_info.sys_task
         existing.queue_name = task_info.queue_name
         return existing
     end
@@ -601,9 +508,6 @@ function try_transition!(store::InMemoryWorkerStore, task_id::String, from, to::
     end
 end
 
-# Nothing is cached: the registry *is* the durable record.
-reload_task(store::InMemoryWorkerStore, task_id::String) = get_task_info(store, task_id)
-
 function delete_task!(store::InMemoryWorkerStore, task_id::String)
     lock(store.task_lock) do
         delete!(store.task_registry, task_id)
@@ -639,7 +543,7 @@ function get_all_tasks(store::InMemoryWorkerStore, authority::TaskAuthority; sta
             end
             # Deliberately no owner -> ids index: the registry is already in RAM, so this
             # is a Dict scan either way, and an index would be new mutable state to keep
-            # consistent across set_task!, delete_task!, cleanup_tasks! and reset_store!.
+            # consistent across set_task!, delete_task!, cleanup_tasks! and clear_records!.
             _is_authorized(authority, task_info) || continue
             if queue_name !== nothing && task_info.queue_name != queue_name
                 continue
@@ -648,50 +552,6 @@ function get_all_tasks(store::InMemoryWorkerStore, authority::TaskAuthority; sta
         end
         return tasks
     end
-end
-
-function get_active_task(store::InMemoryWorkerStore, task_id::String)
-    lock(store.active_lock) do
-        return get(store.active_tasks, task_id, nothing)
-    end
-end
-
-function get_active_task_info(store::InMemoryWorkerStore, task_id::String)
-    return get_task_info(store, task_id)
-end
-
-function register_active_task!(store::InMemoryWorkerStore, task_id::String, task::Task)
-    lock(store.active_lock) do
-        store.active_tasks[task_id] = task
-    end
-    lock(store.task_lock) do
-        task_info = get(store.task_registry, task_id, nothing)
-        if task_info !== nothing
-            task_info.sys_task = task
-        end
-    end
-    return task
-end
-
-function register_active_task_info!(store::InMemoryWorkerStore, task_id::String, task_info::TaskInfo)
-    return set_task!(store, task_id, task_info)
-end
-
-function deregister_active_task!(store::InMemoryWorkerStore, task_id::String)
-    lock(store.active_lock) do
-        delete!(store.active_tasks, task_id)
-    end
-    lock(store.task_lock) do
-        task_info = get(store.task_registry, task_id, nothing)
-        if task_info !== nothing
-            task_info.sys_task = nothing
-        end
-    end
-    return nothing
-end
-
-function deregister_active_task_info!(store::InMemoryWorkerStore, task_id::String)
-    return nothing
 end
 
 function get_queue_authorizer(store::InMemoryWorkerStore)
@@ -721,120 +581,11 @@ function set_watch_authorizer!(store::InMemoryWorkerStore, authorizer)
     return authorizer
 end
 
-function get_sequential_queues(store::InMemoryWorkerStore)
-    return store.sequential_queues
-end
-
-function get_queue_lock(store::InMemoryWorkerStore)
-    return store.queue_lock
-end
-
-function get_cleanup_scheduler(store::InMemoryWorkerStore)
-    return store.cleanup_scheduler
-end
+# The registry is process state, so a reset may discard it -- see `clear_records!`.
+clear_records!(store::InMemoryWorkerStore) = (lock(() -> empty!(store.task_registry), store.task_lock); nothing)
 
 function lock_tasks(callback::Function, store::InMemoryWorkerStore)
     return lock(store.task_lock) do
         callback()
     end
-end
-
-# -- Core extension management (App integration) --
-
-const DEFAULT_STORE = Ref(InMemoryWorkerStore())
-
-default_store() = DEFAULT_STORE[]
-
-function worker_store(ctx::App; key::Symbol=DEFAULT_EXTENSION_KEY)
-    return get_extension(ctx, key, nothing)
-end
-
-function install!(ctx::App; key::Symbol=DEFAULT_EXTENSION_KEY, store::AbstractWorkerStore=InMemoryWorkerStore())
-    return set_extension!(ctx, key, store)
-end
-
-function uninstall!(ctx::App; key::Symbol=DEFAULT_EXTENSION_KEY)
-    store = worker_store(ctx; key)
-    if store isa AbstractWorkerStore
-        shutdown!(store)
-    end
-    delete_extension!(ctx, key)
-    return nothing
-end
-
-"""
-    _stop_scheduler_and_queues!(store)
-
-The backend-independent half of [`shutdown!`](@ref), written entirely against the contract
-accessors so every store inherits it instead of copying it.
-
-Stops the cleanup scheduler and clears its `Ref`, then closes every sequential queue's channel
-and clears the queue registry. Closing the channel is the stop signal for a queue processor:
-its `take!` throws `InvalidStateException`, which the processor loop catches and breaks on.
-
-**The queue dict is emptied, not just drained.** A queue whose channel is closed is dead, but
-`_get_or_create_queue` uses `get!` — so leaving the entry behind means a store reused after
-shutdown hands back the dead queue, spawns a processor that immediately breaks, and then throws
-on `put!`. Emptying makes the teardown total, so a store can be shut down and started again.
-"""
-function _stop_scheduler_and_queues!(store::AbstractWorkerStore)
-    scheduler_ref = get_cleanup_scheduler(store)
-    scheduler = scheduler_ref[]
-    if !isnothing(scheduler)
-        stop_cleanup_scheduler!(scheduler)
-        scheduler_ref[] = nothing
-    end
-
-    lock(get_queue_lock(store)) do
-        queues = get_sequential_queues(store)
-        for queue in values(queues)
-            if isopen(queue.channel)
-                close(queue.channel)
-            end
-            queue.running = false
-            queue.current_task = nothing
-            queue.processor_task = nothing
-        end
-        empty!(queues)
-    end
-
-    return nothing
-end
-
-function shutdown!(store::InMemoryWorkerStore)
-    _stop_scheduler_and_queues!(store)
-
-    lock(store.active_lock) do
-        empty!(store.active_tasks)
-    end
-
-    return nothing
-end
-
-"""
-    reset_store!(store = default_store()) -> store
-
-Tear the store down and discard its task records, returning it to a freshly-constructed state.
-
-[`shutdown!`](@ref) does the process-local half — scheduler, queue channels, active-task caches
-— for every backend. What stays conditional here is discarding the task records themselves,
-because only a volatile store *has* records to discard: for a database-backed store the registry
-is durable rows that outlive the process, and wiping them on a reset would be a destructive
-delete of live data rather than a teardown. A persistent backend prunes through
-`cleanup_tasks!`, on its own retention policy.
-
-This used to gate the whole body on `store isa InMemoryWorkerStore`, which — combined with
-`shutdown!` having a silent no-op fallback — made `reset_store!` on a PormG store a complete
-no-op that returned the store unchanged ([#29](https://github.com/PingoLee/Nitro.jl/issues/29)).
-"""
-function reset_store!(store::AbstractWorkerStore=default_store())
-    shutdown!(store)
-
-    if store isa InMemoryWorkerStore
-        lock(store.task_lock) do
-            empty!(store.task_registry)
-        end
-    end
-
-    return store
 end

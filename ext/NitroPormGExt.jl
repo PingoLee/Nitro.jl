@@ -11,18 +11,15 @@ import Nitro.Core.Types: AbstractSessionStore, SessionPayload, get_session, set_
 import Nitro.Core.Cookies: storesession!, prunesessions!
 import Nitro: pormg_nitro_session, sync_pormg_env!
 
-import Nitro.Workers: AbstractWorkerStore, TaskInfo, TaskStatus, TaskOptions, SequentialQueue, CleanupScheduler,
+import Nitro.Workers: AbstractWorkerStore, TaskInfo, TaskStatus, TaskOptions,
     PENDING, RUNNING, COMPLETED, FAILED, CANCELLED,
     TaskAuthority, Owner, System, UNSUPPLIED, owner_of, _is_authorized, TASK_KEY_DELIMITER,
-    get_task_info, reload_task, set_task!, replace_task!, add_watcher!, try_transition!,
+    get_task_info, set_task!, replace_task!, add_watcher!, try_transition!,
     delete_task!, cleanup_tasks!, get_all_tasks,
-    get_active_task, register_active_task!, deregister_active_task!,
-    get_active_task_info, register_active_task_info!, deregister_active_task_info!,
     get_queue_authorizer, set_queue_authorizer!,
     get_error_redactor, set_error_redactor!,
     get_watch_authorizer, set_watch_authorizer!,
-    get_sequential_queues, get_queue_lock, get_cleanup_scheduler, lock_tasks,
-    shutdown!, _stop_scheduler_and_queues!
+    lock_tasks
 import Nitro: pormg_nitro_worker
 
 export PormGWorkerStore, pormg_nitro_worker
@@ -367,13 +364,7 @@ A PormG-backed worker store that implements Nitro's `AbstractWorkerStore`.
 struct PormGWorkerStore <: AbstractWorkerStore
     model::Any
     db_key::String
-    active_tasks::Dict{String, Task}
-    active_task_infos::Dict{String, TaskInfo}
-    active_lock::ReentrantLock
     task_lock::ReentrantLock
-    sequential_queues::Dict{String, SequentialQueue}
-    queue_lock::ReentrantLock
-    cleanup_scheduler::Ref{Union{Nothing, CleanupScheduler}}
     queue_authorizer::Ref{Any}
     watch_authorizer::Ref{Any}
     error_redactor::Ref{Any}
@@ -387,13 +378,7 @@ function PormGWorkerStore(; model=nothing, db_key::String="db")
     return PormGWorkerStore(
         m,
         db_key,
-        Dict{String, Task}(),
-        Dict{String, TaskInfo}(),
         ReentrantLock(),
-        ReentrantLock(),
-        Dict{String, SequentialQueue}(),
-        ReentrantLock(),
-        Ref{Union{Nothing, CleanupScheduler}}(nothing),
         Ref{Any}(nothing),
         Ref{Any}(nothing),
         Ref{Any}(nothing),
@@ -508,17 +493,12 @@ end
 
 # -- AbstractWorkerStore Interface Methods --
 
+# The DURABLE read, and only that. This used to prefer a process-local live-`TaskInfo`
+# cache, which made it the wrong function for run-start: re-running a key whose record was
+# terminal while its previous run still executed handed the new run its predecessor's object,
+# so the new run failed its own `run_id` fence forever (#167). Serving a running callback's
+# object to a reader is `WorkerRuntime`'s job now, and it does it for every backend.
 function get_task_info(store::PormGWorkerStore, task_id::String)
-    # Return the live in-memory info for an active task so callers see fresh
-    # progress (the field is atomic, so concurrent reads are race-free). We do
-    # NOT write `sys_task` back onto this shared object: nothing reads that field
-    # (cancellation resolves the running task via `get_active_task`), and writing
-    # it from a reader thread would mutate the worker's own task object.
-    active_info = get_active_task_info(store, task_id)
-    if active_info !== nothing
-        return active_info
-    end
-
     # Log and rethrow, matching `set_task!`. Returning `nothing` here would make a
     # failed read indistinguishable from an absent row, and `_register_or_watch!`
     # reads absence as "this key is free" — so one swallowed connection blip would
@@ -598,34 +578,16 @@ replace_task!(store::PormGWorkerStore, task_id::String, task_info::TaskInfo) =
 # task row is bounded by the number of processes appending to it, so this is generous.
 const _WATCHER_CAS_ATTEMPTS = 8
 
-# Read the ROW, never the live in-memory object. `get_task_info` serves the live
-# `active_task_info` for a running task, whose watchers may already differ from what is
-# stored — and a compare-and-set has to compare against the value the UPDATE will match.
-function _read_db_task(store::PormGWorkerStore, task_id::String)
-    row = _task_objects(store).filter("id" => task_id).first()
-    return isnothing(row) ? nothing : _from_db_record(row)
-end
-
-# Keep a running task's live object in step with a grant written to the row. Without
-# this, `get_task_info` and `get_all_tasks` would serve the live object and the new
-# watcher would stay invisible until the task terminated.
-function _sync_live_watcher!(store::PormGWorkerStore, task_id::String, user_id::String)
-    lock(store.active_lock) do
-        live = Base.get(store.active_task_infos, task_id, nothing)
-        if live !== nothing && !(user_id in live.watchers)
-            push!(live.watchers, user_id)
-        end
-    end
-    return nothing
-end
-
+# `get_task_info` is the ROW read, which is what a compare-and-set needs: it has to compare
+# against the value the UPDATE will match. It used to serve a live in-memory object for a
+# running task, whose watchers could already differ from what was stored, so this comment used
+# to be a warning rather than a statement of fact (#167).
 function add_watcher!(store::PormGWorkerStore, task_id::String, user_id::String)
     for _ in 1:_WATCHER_CAS_ATTEMPTS
-        task = _read_db_task(store, task_id)
+        task = get_task_info(store, task_id)
         task === nothing && return false
 
         if user_id in task.watchers
-            _sync_live_watcher!(store, task_id, user_id)
             return true
         end
 
@@ -639,9 +601,6 @@ function add_watcher!(store::PormGWorkerStore, task_id::String, user_id::String)
         changed = matched.update("watchers" => updated)
 
         if changed isa Integer && changed >= 1
-            # Durable record first: a crash between the two leaves the row correct, and
-            # the row is what `get_all_tasks` reads watchers from.
-            _sync_live_watcher!(store, task_id, user_id)
             return true
         end
     end
@@ -650,8 +609,6 @@ function add_watcher!(store::PormGWorkerStore, task_id::String, user_id::String)
           "$(_WATCHER_CAS_ATTEMPTS) attempts — either the row is under heavy contention, or its " *
           "`watchers` column is not in the canonical JSON form this store writes")
 end
-
-reload_task(store::PormGWorkerStore, task_id::String) = _read_db_task(store, task_id)
 
 function try_transition!(store::PormGWorkerStore, task_id::String, from, to::TaskStatus;
                          run_id::Union{Nothing, UUIDs.UUID},
@@ -775,29 +732,12 @@ function get_all_tasks(store::PormGWorkerStore, authority::TaskAuthority; status
             return qs
         end
 
-        # Snapshot the live in-memory infos so running tasks report fresh
-        # progress/status instead of the last value flushed to the database
-        # (the worker only writes to the DB at RUNNING-start and on completion).
-        active = lock(store.active_lock) do
-            copy(store.active_task_infos)
-        end
-
+        # Durable rows only. Overlaying live progress onto them is `WorkerRuntime`'s job
+        # and is now done for every backend rather than this one (#167).
         tasks = TaskInfo[]
         for row in _authority_rows(make_base, authority)
             task_info = _from_db_record(row)
-            live = get(active, task_info.id, nothing)
-            if live !== nothing
-                # Overlay volatile fields only; keep the DB-derived object so
-                # we never leak the running `sys_task` into serialized output.
-                task_info.status = live.status
-                @atomic task_info.progress = live.progress
-                task_info.result = live.result
-                task_info.error = live.error
-                task_info.started_at = live.started_at
-                task_info.completed_at = live.completed_at
-            end
-            # The gate. `_authority_rows` above only narrowed what was fetched; note the
-            # overlay has already run, so a live task cannot slip past this.
+            # The gate. `_authority_rows` above only narrowed what was fetched.
             _is_authorized(authority, task_info) || continue
             push!(tasks, task_info)
         end
@@ -806,46 +746,6 @@ function get_all_tasks(store::PormGWorkerStore, authority::TaskAuthority; status
         @warn "PormGWorkerStore: failed to list tasks" exception=(e, catch_backtrace())
         return TaskInfo[]
     end
-end
-
-function get_active_task(store::PormGWorkerStore, task_id::String)
-    lock(store.active_lock) do
-        return get(store.active_tasks, task_id, nothing)
-    end
-end
-
-function register_active_task!(store::PormGWorkerStore, task_id::String, task::Task)
-    lock(store.active_lock) do
-        store.active_tasks[task_id] = task
-    end
-    return task
-end
-
-function get_active_task_info(store::PormGWorkerStore, task_id::String)
-    lock(store.active_lock) do
-        return get(store.active_task_infos, task_id, nothing)
-    end
-end
-
-function register_active_task_info!(store::PormGWorkerStore, task_id::String, task_info::TaskInfo)
-    lock(store.active_lock) do
-        store.active_task_infos[task_id] = task_info
-    end
-    return task_info
-end
-
-function deregister_active_task!(store::PormGWorkerStore, task_id::String)
-    lock(store.active_lock) do
-        delete!(store.active_tasks, task_id)
-    end
-    return nothing
-end
-
-function deregister_active_task_info!(store::PormGWorkerStore, task_id::String)
-    lock(store.active_lock) do
-        delete!(store.active_task_infos, task_id)
-    end
-    return nothing
 end
 
 function get_queue_authorizer(store::PormGWorkerStore)
@@ -875,62 +775,10 @@ function set_watch_authorizer!(store::PormGWorkerStore, authorizer)
     return authorizer
 end
 
-function get_sequential_queues(store::PormGWorkerStore)
-    return store.sequential_queues
-end
-
-function get_queue_lock(store::PormGWorkerStore)
-    return store.queue_lock
-end
-
-function get_cleanup_scheduler(store::PormGWorkerStore)
-    return store.cleanup_scheduler
-end
-
 function lock_tasks(callback::Function, store::PormGWorkerStore)
     return lock(store.task_lock) do
         callback()
     end
-end
-
-"""
-    shutdown!(store::PormGWorkerStore)
-
-Release everything this store owns on the current process.
-
-`shutdown!` is part of the `AbstractWorkerStore` lifecycle contract, and this backend used to
-have no method for it at all: `uninstall!` fell through to a no-op fallback, so the cleanup
-scheduler kept issuing `DELETE`s against `nitro_task` and the queue processors kept blocking on
-`take!` long after the app had stopped, leaking another set on every bootstrap/teardown cycle
-([#29](https://github.com/PingoLee/Nitro.jl/issues/29)).
-
-The scheduler and queue teardown is shared with every other backend through
-`_stop_scheduler_and_queues!`, and `active_tasks` is cleared exactly as `InMemoryWorkerStore`
-clears its own.
-
-**`active_task_infos` is deliberately NOT cleared**, even though it is a process-local cache and
-clearing it looks like the obvious completion of the teardown. It has no `InMemoryWorkerStore`
-field to mirror — but it does have an in-memory *counterpart*: that store's
-`get_active_task_info` is an alias for `get_task_info` and reads `task_registry`, which
-`shutdown!` does not empty either. So clearing this dict would not be parity with the in-memory
-store, it would be a PormG-only behaviour change, and a harmful one: `cancel_task` resolves the
-live `TaskInfo` through `get_active_task_info`, so a run still executing across a teardown would
-become uncancellable on this backend and on no other.
-
-Nothing leaks by leaving it: each run removes its own entry through
-`deregister_active_task_info!` when it finishes.
-
-The durable rows are untouched: they outlive the process by design, which is the whole reason to
-use this store.
-"""
-function shutdown!(store::PormGWorkerStore)
-    _stop_scheduler_and_queues!(store)
-
-    lock(store.active_lock) do
-        empty!(store.active_tasks)
-    end
-
-    return nothing
 end
 
 # ============================================================================

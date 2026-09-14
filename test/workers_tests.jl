@@ -30,6 +30,87 @@ Nitro.Workers.try_transition!(::StaleKwStore, ::String, from, ::TaskStatus;
 struct StaleNoKwStore <: AbstractWorkerStore end
 Nitro.Workers.try_transition!(::StaleNoKwStore, ::String, from, ::TaskStatus) = false
 
+# A conforming backend that implements the 15 data-and-policy rows and NOTHING else: no
+# `shutdown!`, no queue or scheduler accessor, no run-handle cache, no `clear_records!`. It is
+# the proof that #167 closed the CLASS of the #29 leak rather than one instance of it — under
+# the pre-#167 contract this type could not be written at all, because teardown was the store's
+# job and a store that forgot it leaked silently.
+#
+# Deliberately the naive implementation a third party would write: it stores whatever object it
+# is handed, exactly as `InMemoryWorkerStore` does.
+struct DataOnlyStore <: AbstractWorkerStore
+    rows::Dict{String, TaskInfo}
+    lk::ReentrantLock
+    qa::Base.RefValue{Any}
+    wa::Base.RefValue{Any}
+    er::Base.RefValue{Any}
+
+    DataOnlyStore() = new(Dict{String, TaskInfo}(), ReentrantLock(),
+                          Ref{Any}(nothing), Ref{Any}(nothing), Ref{Any}(nothing))
+end
+
+Nitro.Workers.lock_tasks(callback::Function, s::DataOnlyStore) = lock(callback, s.lk)
+Nitro.Workers.get_task_info(s::DataOnlyStore, id::String) = lock(() -> get(s.rows, id, nothing), s.lk)
+Nitro.Workers.set_task!(s::DataOnlyStore, id::String, t::TaskInfo) = lock(() -> (s.rows[id] = t), s.lk)
+Nitro.Workers.replace_task!(s::DataOnlyStore, id::String, t::TaskInfo) = lock(() -> (s.rows[id] = t), s.lk)
+Nitro.Workers.delete_task!(s::DataOnlyStore, id::String) = (lock(() -> delete!(s.rows, id), s.lk); nothing)
+
+function Nitro.Workers.add_watcher!(s::DataOnlyStore, id::String, user_id::String)
+    lock(s.lk) do
+        t = get(s.rows, id, nothing)
+        t === nothing && return false
+        user_id in t.watchers || push!(t.watchers, user_id)
+        return true
+    end
+end
+
+function Nitro.Workers.try_transition!(s::DataOnlyStore, id::String, from, to::TaskStatus;
+                                       run_id, error=nothing, completed_at=nothing,
+                                       started_at=nothing, result=Nitro.Workers.UNSUPPLIED,
+                                       progress=nothing)
+    lock(s.lk) do
+        t = get(s.rows, id, nothing)
+        t === nothing && return false
+        t.status in from || return false
+        run_id === nothing || t.run_id == run_id || return false
+        error === nothing || (t.error = error)
+        completed_at === nothing || (t.completed_at = completed_at)
+        started_at === nothing || (t.started_at = started_at)
+        result === Nitro.Workers.UNSUPPLIED || (t.result = result)
+        progress === nothing || (@atomic t.progress = Float64(progress))
+        t.status = to
+        return true
+    end
+end
+
+function Nitro.Workers.cleanup_tasks!(s::DataOnlyStore, retain_days::Int)
+    cutoff = Dates.now(Dates.UTC) - Dates.Day(retain_days)
+    lock(s.lk) do
+        gone = [k for (k, t) in s.rows
+                if t.completed_at !== nothing && t.completed_at < cutoff &&
+                   t.status in (COMPLETED, FAILED, CANCELLED)]
+        foreach(k -> delete!(s.rows, k), gone)
+        return length(gone)
+    end
+end
+
+function Nitro.Workers.get_all_tasks(s::DataOnlyStore, authority::TaskAuthority;
+                                     status=nothing, queue_name=nothing)
+    lock(s.lk) do
+        return TaskInfo[t for t in values(s.rows)
+                        if (status === nothing || t.status == status) &&
+                           (queue_name === nothing || t.queue_name == queue_name) &&
+                           Nitro.Workers._is_authorized(authority, t)]
+    end
+end
+
+Nitro.Workers.get_queue_authorizer(s::DataOnlyStore) = s.qa[]
+Nitro.Workers.set_queue_authorizer!(s::DataOnlyStore, f) = (s.qa[] = f)
+Nitro.Workers.get_watch_authorizer(s::DataOnlyStore) = s.wa[]
+Nitro.Workers.set_watch_authorizer!(s::DataOnlyStore, f) = (s.wa[] = f)
+Nitro.Workers.get_error_redactor(s::DataOnlyStore) = s.er[]
+Nitro.Workers.set_error_redactor!(s::DataOnlyStore, f) = (s.er[] = f)
+
 @testset "Worker store contract is discoverable and loud" begin
     # The shipped backend conforms. This is the assertion a third-party store copies.
     @test isempty(missing_store_methods(InMemoryWorkerStore))
@@ -39,7 +120,15 @@ Nitro.Workers.try_transition!(::StaleNoKwStore, ::String, from, ::TaskStatus) = 
     @test length(missing_names) == length(Nitro.Workers.WORKER_STORE_INTERFACE)
     @test :get_task_info in missing_names
     @test :lock_tasks in missing_names          # the callback-first row
-    @test :get_cleanup_scheduler in missing_names
+    @test :try_transition! in missing_names
+
+    # The lifecycle rows LEFT the contract in #167, so a store owes none of them.
+    for gone in (:shutdown!, :reload_task, :get_cleanup_scheduler, :get_sequential_queues,
+                 :get_queue_lock, :get_active_task, :register_active_task!,
+                 :deregister_active_task!, :get_active_task_info,
+                 :register_active_task_info!, :deregister_active_task_info!)
+        @test !(gone in missing_names)
+    end
 
     # Reaching a contract method on an incomplete store names the method and the type.
     err = try
@@ -59,6 +148,7 @@ Nitro.Workers.try_transition!(::StaleNoKwStore, ::String, from, ::TaskStatus) = 
     # `store_contract_error` is what tells the two apart, by asking whether the store's own type
     # contributed a method at all.
     store = InMemoryWorkerStore()
+    rt_store = WorkerRuntime(store)
     @test_throws MethodError get_task_info(store, 42)
     @test_throws MethodError cleanup_tasks!(store, "not-a-day-count")
 
@@ -128,54 +218,153 @@ end
           length(Nitro.Workers.WORKER_STORE_INTERFACE) - 1
 end
 
-@testset "shutdown! releases the scheduler, the queues and the active handles" begin
+@testset "shutdown! releases the scheduler, the queues and the active handles (#167)" begin
     store = InMemoryWorkerStore()
+    rt_store = WorkerRuntime(store)
 
     try
         # A real sequential queue with a live processor, and a real cleanup scheduler.
         owner = Owner("user-teardown")
-        task_id = submit_sequential_task("teardown-q", "one", () -> "done", owner; store=store)
-        @test wait_for(() -> get_task_status(task_id, owner; store=store)[:status] == "COMPLETED") == :ok
+        task_id = submit_sequential_task("teardown-q", "one", () -> "done", owner; runtime=rt_store)
+        @test wait_for(() -> get_task_status(task_id, owner; runtime=rt_store)[:status] == "COMPLETED") == :ok
 
-        scheduler = start_cleanup_scheduler(; interval_hours=1, retain_days=7, store=store)
-        @test get_cleanup_scheduler(store)[] === scheduler
+        scheduler = start_cleanup_scheduler(; interval_hours=1, retain_days=7, runtime=rt_store)
+        @test get_cleanup_scheduler(rt_store)[] === scheduler
 
-        queues = get_sequential_queues(store)
+        queues = get_sequential_queues(rt_store)
         @test haskey(queues, "teardown-q")
         channel = queues["teardown-q"].channel
         @test isopen(channel)
 
-        shutdown!(store)
+        # A run handle and its live object, as an executing task would have published them.
+        # The two must be treated differently below, which is the whole point of the pairing.
+        in_flight = TaskInfo("in-flight")
+        register_active_task!(rt_store, "in-flight", @async nothing)
+        register_active_task_info!(rt_store, "in-flight", in_flight)
+
+        shutdown!(rt_store)
 
         # The scheduler is stopped AND its slot cleared, so a restart does not see a dead one.
-        @test get_cleanup_scheduler(store)[] === nothing
+        @test get_cleanup_scheduler(rt_store)[] === nothing
         @test istaskdone(scheduler.task)
 
         # The channel is closed -- that is the processor's stop signal -- and the registry is
         # emptied, not merely drained. A closed-but-present queue is the reuse hazard: `get!` in
         # `_get_or_create_queue` would hand the dead one straight back.
         @test !isopen(channel)
-        @test isempty(get_sequential_queues(store))
-        @test isempty(store.active_tasks)
+        @test isempty(get_sequential_queues(rt_store))
+        @test isempty(rt_store.active_tasks)
 
-        # So the store is genuinely reusable, rather than poisoned for sequential work.
-        again = submit_sequential_task("teardown-q", "two", () -> "again", owner; store=store)
-        @test wait_for(() -> get_task_status(again, owner; store=store)[:status] == "COMPLETED") == :ok
-        @test get_sequential_queues(store)["teardown-q"].channel !== channel
+        # ...but the live-`TaskInfo` cache SURVIVES, because `cancel_task` resolves a run's
+        # object through it. Clearing it would make a run that outlives a teardown the one
+        # thing it must never be: uncancellable. This used to be asserted for PormG only, and
+        # `InMemoryWorkerStore` satisfied it by accident -- its `get_active_task_info` aliased
+        # the registry, which `shutdown!` also left alone. One mechanism now, asserted here.
+        @test haskey(rt_store.active_task_infos, "in-flight")
+        @test get_active_task_info(rt_store, "in-flight") === in_flight
+
+        # So the runtime is genuinely reusable, rather than poisoned for sequential work.
+        again = submit_sequential_task("teardown-q", "two", () -> "again", owner; runtime=rt_store)
+        @test wait_for(() -> get_task_status(again, owner; runtime=rt_store)[:status] == "COMPLETED") == :ok
+        @test get_sequential_queues(rt_store)["teardown-q"].channel !== channel
+
+        # A RESET is total where a teardown is not: it also drops the live cache.
+        reset_runtime!(rt_store)
+        @test isempty(rt_store.active_task_infos)
+        @test isempty(store.task_registry)
     finally
-        reset_store!(store)
+        reset_runtime!(rt_store)
     end
 end
 
-@testset "shutdown! is required of every backend, not silently skipped" begin
-    # It used to have a no-op fallback on the abstract type, which is how PormGWorkerStore came
-    # to leak its scheduler and processors on every teardown without anyone noticing (#29). A
-    # backend that owns nothing must now say `shutdown!(::MyStore) = nothing` out loud.
-    @test :shutdown! in missing_store_methods(NothingWorkerStore)
-    @test_throws StoreInterfaceError shutdown!(NothingWorkerStore())
+@testset "a store that implements no lifecycle method at all still works (#167)" begin
+    # The inversion of #29/#166. That pair made `shutdown!` a REQUIRED store method, so a
+    # backend owning nothing had to write `shutdown!(::MyStore) = nothing` out loud -- which
+    # closed the instance and left the class open: every future backend still had to get
+    # teardown right. `DataOnlyStore` below implements the 15 data-and-policy rows and NOTHING
+    # else, and it cannot exist on the pre-#167 contract.
+    @test isempty(missing_store_methods(DataOnlyStore))
+    @test !hasmethod(shutdown!, Tuple{DataOnlyStore})
+    # `hasmethod` would say `true` here: the point is that the only method it finds is the
+    # abstract no-op, i.e. this store contributed none of its own.
+    @test !Nitro.Core.Errors.implements_contract_method(clear_records!, DataOnlyStore, AbstractWorkerStore, 1)
 
-    # `reset_store!` reaches it too, so the silent path is closed from both entry points.
-    @test_throws StoreInterfaceError reset_store!(NothingWorkerStore())
+    rt = WorkerRuntime(DataOnlyStore())
+    owner = Owner("user-dataonly")
+
+    try
+        # A sequential queue (a `Channel` plus a spawned processor) and a cleanup scheduler --
+        # the exact resources #29 leaked -- over a store that knows about none of them.
+        task_id = submit_sequential_task("dataonly-q", "one", () -> "done", owner; runtime=rt)
+        @test wait_for(() -> get_task_status(task_id, owner; runtime=rt)[:status] == "COMPLETED") == :ok
+
+        scheduler = start_cleanup_scheduler(; interval_hours=1, retain_days=7, runtime=rt)
+        channel = get_sequential_queues(rt)["dataonly-q"].channel
+
+        # Does not raise, and actually releases: teardown is the runtime's, not the backend's.
+        shutdown!(rt)
+
+        @test istaskdone(scheduler.task)
+        @test !isopen(channel)
+        @test isempty(get_sequential_queues(rt))
+        @test get_cleanup_scheduler(rt)[] === nothing
+    finally
+        reset_runtime!(rt)
+    end
+
+    # `clear_records!` defaults to a no-op in the SAFE direction: for a durable backend the
+    # registry is rows that outlive the process, so a reset must not delete them.
+    keeper = DataOnlyStore()
+    keeper.rows["kept"] = TaskInfo("kept")
+    reset_runtime!(WorkerRuntime(keeper))
+    @test haskey(keeper.rows, "kept")
+end
+
+@testset "one store can back several runtimes (#167)" begin
+    # Inexpressible before the split: the queues and the scheduler were fields ON the store, so
+    # two apps sharing a backend shared one set of processors and either one's `uninstall!` shut
+    # the other's down. This is the sharpest single proof that ownership moved -- and it is the
+    # shape Sidekiq and River have, where several `Launcher`s/`Client`s can sit over one datastore.
+    store = InMemoryWorkerStore()
+    rt_a = WorkerRuntime(store)
+    rt_b = WorkerRuntime(store)
+    owner = Owner("user-shared")
+
+    try
+        a_id = submit_sequential_task("shared-q", "from-a", () -> "a", owner; runtime=rt_a)
+        b_id = submit_sequential_task("shared-q", "from-b", () -> "b", owner; runtime=rt_b)
+        @test wait_for(() -> get_task_status(a_id, owner; runtime=rt_a)[:status] == "COMPLETED") == :ok
+        @test wait_for(() -> get_task_status(b_id, owner; runtime=rt_b)[:status] == "COMPLETED") == :ok
+
+        # Same queue NAME, two independent queues -- the resources are per runtime.
+        @test get_sequential_queues(rt_a)["shared-q"] !== get_sequential_queues(rt_b)["shared-q"]
+
+        # ...but one set of records, because the store is shared.
+        @test get_task_status(a_id, owner; runtime=rt_b)[:result] == "a"
+
+        b_channel = get_sequential_queues(rt_b)["shared-q"].channel
+        shutdown!(rt_a)
+
+        # Tearing one down leaves the other running, which is the whole point.
+        @test isempty(get_sequential_queues(rt_a))
+        @test isopen(b_channel)
+        again = submit_sequential_task("shared-q", "still-b", () -> "b2", owner; runtime=rt_b)
+        @test wait_for(() -> get_task_status(again, owner; runtime=rt_b)[:status] == "COMPLETED") == :ok
+        @test get_sequential_queues(rt_b)["shared-q"].channel === b_channel
+    finally
+        reset_runtime!(rt_a)
+        reset_runtime!(rt_b)
+    end
+end
+
+@testset "the default runtime stays concretely typed (#167)" begin
+    # `DEFAULT_RUNTIME` is `Ref(WorkerRuntime(...))`, NOT `Ref{WorkerRuntime}(...)`, so this
+    # infers a concrete type and the store calls behind it devirtualize. Widening the Ref would
+    # make every default-argument `submit_task` a dynamic dispatch on the request path, which is
+    # the nitro-core §7 hard stop -- and it would do so silently.
+    @test only(Base.return_types(default_runtime, ())) === WorkerRuntime{InMemoryWorkerStore}
+    @test isconcretetype(typeof(default_runtime()))
+    @test only(Base.return_types(worker_store, (WorkerRuntime{InMemoryWorkerStore},))) === InMemoryWorkerStore
 end
 
 @testset "Stored task error text is bounded and redactable (#140)" begin
@@ -188,13 +377,14 @@ end
 
     @testset "the cap holds, and does not fire on ordinary messages" begin
         store = InMemoryWorkerStore()
+        rt_store = WorkerRuntime(store)
         owner = Owner("user-cap")
         try
             long_tail = repeat("x", MAX_STORED_ERROR_CHARS * 2)
-            id = submit_task("capped", () -> throw(ArgumentError(long_tail)), owner; store=store)
-            @test wait_for(() -> get_task_status(id, owner; store=store)[:status] == "FAILED") == :ok
+            id = submit_task("capped", () -> throw(ArgumentError(long_tail)), owner; runtime=rt_store)
+            @test wait_for(() -> get_task_status(id, owner; runtime=rt_store)[:status] == "FAILED") == :ok
 
-            stored = get_task_status(id, owner; store=store)[:error]
+            stored = get_task_status(id, owner; runtime=rt_store)[:error]
             # Exactly the cap, not the cap plus slack: the truncation marker counts against
             # MAX_STORED_ERROR_CHARS rather than being appended past it, so the knowable bound is
             # the one to assert. A `<= MAX + 64` bound passes even when the constant is not the cap.
@@ -205,18 +395,19 @@ end
             @test isvalid(stored)
             @test occursin("ArgumentError", stored)
 
-            short_id = submit_task("uncapped", () -> throw(ArgumentError("plain failure")), owner; store=store)
-            @test wait_for(() -> get_task_status(short_id, owner; store=store)[:status] == "FAILED") == :ok
-            short_stored = get_task_status(short_id, owner; store=store)[:error]
+            short_id = submit_task("uncapped", () -> throw(ArgumentError("plain failure")), owner; runtime=rt_store)
+            @test wait_for(() -> get_task_status(short_id, owner; runtime=rt_store)[:status] == "FAILED") == :ok
+            short_stored = get_task_status(short_id, owner; runtime=rt_store)[:error]
             @test occursin("plain failure", short_stored)
             @test !occursin("truncated", short_stored)
         finally
-            reset_store!(store)
+            reset_runtime!(rt_store)
         end
     end
 
     @testset "a redactor sees the full text and keeps it out of the store" begin
         store = InMemoryWorkerStore()
+        rt_store = WorkerRuntime(store)
         owner = Owner("user-redact")
         seen = Ref("")
         try
@@ -228,8 +419,8 @@ end
             end)
             @test get_error_redactor(store) !== nothing
 
-            id = submit_task("redacted", () -> throw(ArgumentError("bad token: $(sentinel)")), owner; store=store)
-            @test wait_for(() -> get_task_status(id, owner; store=store)[:status] == "FAILED") == :ok
+            id = submit_task("redacted", () -> throw(ArgumentError("bad token: $(sentinel)")), owner; runtime=rt_store)
+            @test wait_for(() -> get_task_status(id, owner; runtime=rt_store)[:status] == "FAILED") == :ok
 
             # POSITIVE: the sentinel really is in the raw exception, so the negative below means
             # something.
@@ -237,16 +428,17 @@ end
             @test occursin(sentinel, format_error(ArgumentError("bad token: $(sentinel)")))
 
             # NEGATIVE: and it does not survive into the stored value.
-            stored = get_task_status(id, owner; store=store)[:error]
+            stored = get_task_status(id, owner; runtime=rt_store)[:error]
             @test !occursin(sentinel, stored)
             @test stored == "ArgumentError (details withheld)"
         finally
-            reset_store!(store)
+            reset_runtime!(rt_store)
         end
     end
 
     @testset "a redactor that throws loses the detail, not the failure -- and does not log it" begin
         store = InMemoryWorkerStore()
+        rt_store = WorkerRuntime(store)
         owner = Owner("user-throwing")
         try
             # The redactor INTERPOLATES what it was handed into its own exception. That is not a
@@ -256,15 +448,15 @@ end
             set_error_redactor!(store, (exc, rendered) -> error("refusing to handle: $(rendered)"))
 
             logged, id = Test.collect_test_logs() do
-                inner = submit_task("boom", () -> throw(ArgumentError("bad token: $(sentinel)")), owner; store=store)
-                @test wait_for(() -> get_task_status(inner, owner; store=store)[:status] == "FAILED") == :ok
+                inner = submit_task("boom", () -> throw(ArgumentError("bad token: $(sentinel)")), owner; runtime=rt_store)
+                @test wait_for(() -> get_task_status(inner, owner; runtime=rt_store)[:status] == "FAILED") == :ok
                 inner
             end
 
             # The task still reports FAILED, and the stored text degrades to the exception type --
             # never back to the unredacted rendering, which is the content the app just told us it
             # did not want stored.
-            stored = get_task_status(id, owner; store=store)[:error]
+            stored = get_task_status(id, owner; runtime=rt_store)[:error]
             @test stored == "ArgumentError"
             @test !occursin(sentinel, stored)
 
@@ -284,32 +476,34 @@ end
             @test !occursin(sentinel, rendered_logs)
             @test any(r -> occursin("redactor threw", string(r.message)), logged)
         finally
-            reset_store!(store)
+            reset_runtime!(rt_store)
         end
     end
 
     @testset "a redactor that returns a non-string degrades instead of poisoning the field" begin
         store = InMemoryWorkerStore()
+        rt_store = WorkerRuntime(store)
         owner = Owner("user-nonstring")
         try
             # A Julia function falls off its end into its last expression, so returning `nothing`
             # is an easy mistake. Stringifying it would store the literal "nothing".
             set_error_redactor!(store, (exc, rendered) -> nothing)
 
-            id = submit_task("nonstring", () -> throw(ArgumentError("bad token: $(sentinel)")), owner; store=store)
-            @test wait_for(() -> get_task_status(id, owner; store=store)[:status] == "FAILED") == :ok
+            id = submit_task("nonstring", () -> throw(ArgumentError("bad token: $(sentinel)")), owner; runtime=rt_store)
+            @test wait_for(() -> get_task_status(id, owner; runtime=rt_store)[:status] == "FAILED") == :ok
 
-            stored = get_task_status(id, owner; store=store)[:error]
+            stored = get_task_status(id, owner; runtime=rt_store)[:error]
             @test stored == "ArgumentError"
             @test stored != "nothing"
             @test !occursin(sentinel, stored)
         finally
-            reset_store!(store)
+            reset_runtime!(rt_store)
         end
     end
 
     @testset "no redactor is still the default, and format_error stays unbounded" begin
         store = InMemoryWorkerStore()
+        rt_store = WorkerRuntime(store)
         @test get_error_redactor(store) === nothing
 
         # `format_error` is exported and is the plain rendering utility; #140 bounds what is
@@ -321,6 +515,7 @@ end
 
 @testset "Immediate task execution and deduplication" begin
     store = InMemoryWorkerStore()
+    rt_store = WorkerRuntime(store)
     calls = Ref(0)
     gate = Base.Event()
 
@@ -329,32 +524,33 @@ end
             calls[] += 1
             wait(gate)
             return "done"
-        end, Owner("user-a"); store=store)
+        end, Owner("user-a"); runtime=rt_store)
 
         # Same user, same key, still running: deduplicates onto the live task.
         duplicate_id = submit_task("immediate-task", () -> begin
             calls[] += 100
             return "duplicate"
-        end, Owner("user-a"); store=store)
+        end, Owner("user-a"); runtime=rt_store)
 
         @test task_id == "user-a::immediate-task"
         @test duplicate_id == task_id
 
         notify(gate)
-        @test wait_for(() -> get_task_status(task_id, Owner("user-a"); store=store)[:status] == "COMPLETED") == :ok
+        @test wait_for(() -> get_task_status(task_id, Owner("user-a"); runtime=rt_store)[:status] == "COMPLETED") == :ok
 
-        status = get_task_status(task_id, Owner("user-a"); store=store)
+        status = get_task_status(task_id, Owner("user-a"); runtime=rt_store)
         @test status[:result] == "done"
         @test status[:watcher_count] == 1
         @test calls[] == 1
     finally
         notify(gate)
-        reset_store!(store)
+        reset_runtime!(rt_store)
     end
 end
 
 @testset "Sequential callbacks defined after the processor spawned still run (#86)" begin
     store = InMemoryWorkerStore()
+    rt_store = WorkerRuntime(store)
     auth = Owner("user-a")
 
     try
@@ -362,8 +558,8 @@ end
         @eval mixed_cb() = "zero-arg (old)"
 
         # The FIRST sequential submit spawns the queue processor, freezing its world age.
-        first_id = submit_sequential_task("wq86", "first", () -> "first", auth; store=store)
-        @test wait_for(() -> get_task_status(first_id, auth; store=store)[:status] == "COMPLETED") == :ok
+        first_id = submit_sequential_task("wq86", "first", () -> "first", auth; runtime=rt_store)
+        @test wait_for(() -> get_task_status(first_id, auth; runtime=rt_store)[:status] == "COMPLETED") == :ok
 
         # `@eval` is the whole point of this test: it defines methods at a world age LATER than
         # the processor's. A closure literal written here would not -- it is compiled with the
@@ -372,13 +568,13 @@ end
         @eval late_one_arg(task_info) = "late one-arg"
         @eval late_zero_arg() = "late zero-arg"
 
-        second_id = submit_sequential_task("wq86", "second", late_one_arg, auth; store=store)
-        @test wait_for(() -> get_task_status(second_id, auth; store=store)[:status] == "COMPLETED") == :ok
-        @test get_task_status(second_id, auth; store=store)[:result] == "late one-arg"
+        second_id = submit_sequential_task("wq86", "second", late_one_arg, auth; runtime=rt_store)
+        @test wait_for(() -> get_task_status(second_id, auth; runtime=rt_store)[:status] == "COMPLETED") == :ok
+        @test get_task_status(second_id, auth; runtime=rt_store)[:result] == "late one-arg"
 
-        third_id = submit_sequential_task("wq86", "third", late_zero_arg, auth; store=store)
-        @test wait_for(() -> get_task_status(third_id, auth; store=store)[:status] == "COMPLETED") == :ok
-        @test get_task_status(third_id, auth; store=store)[:result] == "late zero-arg"
+        third_id = submit_sequential_task("wq86", "third", late_zero_arg, auth; runtime=rt_store)
+        @test wait_for(() -> get_task_status(third_id, auth; runtime=rt_store)[:status] == "COMPLETED") == :ok
+        @test get_task_status(third_id, auth; runtime=rt_store)[:result] == "late zero-arg"
 
         # The sharper half of #86: not just "throws for a method that exists", but SILENTLY
         # CALLS THE WRONG ARITY. `mixed_cb` has a zero-arg method from before the processor
@@ -387,16 +583,17 @@ end
         # its task_info -- no error, wrong behaviour. This is what Revise adding a parameter to
         # a live callback looks like.
         @eval mixed_cb(task_info) = "one-arg (new)"
-        fourth_id = submit_sequential_task("wq86", "fourth", mixed_cb, auth; store=store)
-        @test wait_for(() -> get_task_status(fourth_id, auth; store=store)[:status] == "COMPLETED") == :ok
-        @test get_task_status(fourth_id, auth; store=store)[:result] == "one-arg (new)"
+        fourth_id = submit_sequential_task("wq86", "fourth", mixed_cb, auth; runtime=rt_store)
+        @test wait_for(() -> get_task_status(fourth_id, auth; runtime=rt_store)[:status] == "COMPLETED") == :ok
+        @test get_task_status(fourth_id, auth; runtime=rt_store)[:result] == "one-arg (new)"
     finally
-        reset_store!(store)
+        reset_runtime!(rt_store)
     end
 end
 
 @testset "Sequential queues preserve order" begin
     store = InMemoryWorkerStore()
+    rt_store = WorkerRuntime(store)
     observed = String[]
 
     try
@@ -406,24 +603,25 @@ end
                 push!(observed, task_info.id)
                 sleep(0.05)
                 return task_info.id
-            end, Owner("user"); store=store))
+            end, Owner("user"); runtime=rt_store))
         end
 
         @test ids == ["user::queued-1", "user::queued-2", "user::queued-3"]
-        @test wait_for(() -> all(get_task_status(id, Owner("user"); store=store)[:status] == "COMPLETED" for id in ids)) == :ok
+        @test wait_for(() -> all(get_task_status(id, Owner("user"); runtime=rt_store)[:status] == "COMPLETED" for id in ids)) == :ok
         @test observed == ids
 
-        queue_status = get_queue_status("reports", System(); store=store)
+        queue_status = get_queue_status("reports", System(); runtime=rt_store)
         @test queue_status[:running] == true
         @test queue_status[:current_task] === nothing
         @test queue_status[:total_load] == 0
     finally
-        reset_store!(store)
+        reset_runtime!(rt_store)
     end
 end
 
 @testset "Retry, cancellation, and cleanup" begin
     store = InMemoryWorkerStore()
+    rt_store = WorkerRuntime(store)
     attempts = Ref(0)
     started = Base.Event()
 
@@ -434,9 +632,9 @@ end
                 error("retry me")
             end
             return "ok"
-        end, Owner("user"); options=TaskOptions(retry_on_failure=true, max_retries=2), store=store)
+        end, Owner("user"); options=TaskOptions(retry_on_failure=true, max_retries=2), runtime=rt_store)
 
-        @test wait_for(() -> get_task_status(retry_id, Owner("user"); store=store)[:status] == "COMPLETED"; timeout=10.0) == :ok
+        @test wait_for(() -> get_task_status(retry_id, Owner("user"); runtime=rt_store)[:status] == "COMPLETED"; timeout=10.0) == :ok
         @test attempts[] == 3
 
         # Cooperative, because cancellation IS cooperative now (#127). Nitro no longer
@@ -448,12 +646,12 @@ end
                 sleep(0.01)
             end
             return task_info.id
-        end, Owner("user"); store=store)
+        end, Owner("user"); runtime=rt_store)
 
         wait(started)
-        cancel_result = cancel_task(cancel_id, Owner("user"); store=store)
+        cancel_result = cancel_task(cancel_id, Owner("user"); runtime=rt_store)
         @test cancel_result[:status] == "Task cancelled"
-        @test wait_for(() -> get_task_status(cancel_id, Owner("user"); store=store)[:status] == "CANCELLED") == :ok
+        @test wait_for(() -> get_task_status(cancel_id, Owner("user"); runtime=rt_store)[:status] == "CANCELLED") == :ok
 
         lock(store.task_lock) do
             expired = TaskInfo("expired-task")
@@ -462,24 +660,25 @@ end
             store.task_registry[expired.id] = expired
         end
 
-        @test cleanup_old_tasks(7; store=store) == 1
-        @test get_task_status("expired-task", System(); store=store)[:status] == "NOT_FOUND"
+        @test cleanup_old_tasks(7; runtime=rt_store) == 1
+        @test get_task_status("expired-task", System(); runtime=rt_store)[:status] == "NOT_FOUND"
     finally
-        reset_store!(store)
+        reset_runtime!(rt_store)
     end
 end
 
 @testset "Cleanup scheduler and per-context stores" begin
     store = InMemoryWorkerStore()
+    rt_store = WorkerRuntime(store)
     ctx_one = Nitro.Core.App()
     ctx_two = Nitro.Core.App()
 
     try
         install!(ctx_one; store=store)
-        other_store = install!(ctx_two)
+        other_runtime = install!(ctx_two)
 
         @test worker_store(ctx_one) === store
-        @test worker_store(ctx_two) === other_store
+        @test worker_store(ctx_two) === other_runtime.store
 
         lock(store.task_lock) do
             expired = TaskInfo("scheduled-expired")
@@ -488,8 +687,8 @@ end
             store.task_registry[expired.id] = expired
         end
 
-        scheduler = start_cleanup_scheduler(; interval_hours=0.00005, retain_days=7, store=store)
-        @test wait_for(() -> get_task_status("scheduled-expired", System(); store=store)[:status] == "NOT_FOUND") == :ok
+        scheduler = start_cleanup_scheduler(; interval_hours=0.00005, retain_days=7, runtime=rt_store)
+        @test wait_for(() -> get_task_status("scheduled-expired", System(); runtime=rt_store)[:status] == "NOT_FOUND") == :ok
         stop_cleanup_scheduler!(scheduler)
 
         ctx_task_id = submit_task(ctx_one, "ctx-task", () -> "ctx-one", Owner("user"))
@@ -500,7 +699,7 @@ end
     finally
         uninstall!(ctx_one)
         uninstall!(ctx_two)
-        reset_store!(store)
+        reset_runtime!(rt_store)
     end
 end
 
@@ -524,7 +723,7 @@ end
     store = worker_store(ctx)
     @test store isa InMemoryWorkerStore
     @test get_queue_status(ctx, "reports", System())[:running] == true
-    @test store.cleanup_scheduler[] isa CleanupScheduler
+    @test get_cleanup_scheduler(worker_runtime(ctx))[] isa CleanupScheduler
 
     lock(store.task_lock) do
         expired = TaskInfo("lifecycle-expired")
@@ -541,6 +740,7 @@ end
 
 @testset "User access control and queue authorization" begin
     store = InMemoryWorkerStore()
+    rt_store = WorkerRuntime(store)
     # Declared out here so the `finally` below can release the callback -- see the note at
     # the `task-access` submit.
     access_started = Base.Event()
@@ -557,11 +757,11 @@ end
     try
         # 1. Queue Authorization test
         # Authorized user succeeds
-        task1 = submit_sequential_task("admin-queue", "task-auth-ok", () -> "ok", Owner("admin-user"); store=store)
+        task1 = submit_sequential_task("admin-queue", "task-auth-ok", () -> "ok", Owner("admin-user"); runtime=rt_store)
         @test task1 == "admin-user::task-auth-ok"
 
         # Unauthorized user throws AuthorizationError
-        @test_throws AuthorizationError submit_sequential_task("admin-queue", "task-auth-fail", () -> "fail", Owner("other-user"); store=store)
+        @test_throws AuthorizationError submit_sequential_task("admin-queue", "task-auth-fail", () -> "fail", Owner("other-user"); runtime=rt_store)
 
         # 2. Task querying and watchers access control
         # submit a task by user-a (so user-a is the first watcher)
@@ -578,104 +778,106 @@ end
             notify(access_started)
             wait(access_release)
             return "data"
-        end, Owner("user-a"); store=store)
+        end, Owner("user-a"); runtime=rt_store)
         wait(access_started)
         @test task_id == "user-a::task-access"
 
         # user-a can check status
-        status_a = get_task_status(task_id, Owner("user-a"); store=store)
+        status_a = get_task_status(task_id, Owner("user-a"); runtime=rt_store)
         @test status_a[:id] == task_id
 
         # user-b cannot check status (throws AuthorizationError)
-        @test_throws AuthorizationError get_task_status(task_id, Owner("user-b"); store=store)
+        @test_throws AuthorizationError get_task_status(task_id, Owner("user-b"); runtime=rt_store)
 
         # The bypass still exists, but it is now a value you have to name.
-        @test get_task_status(task_id, System(); store=store)[:id] == task_id
+        @test get_task_status(task_id, System(); runtime=rt_store)[:id] == task_id
 
         # ...and there is no arity that reaches it by omission. This is #48: the
         # unsafe call used to be the SHORTER one, so a call site that had merely
         # forgotten to scope was indistinguishable from one that meant not to.
-        @test_throws MethodError get_task_status(task_id; store=store)
-        @test_throws MethodError cancel_task(task_id; store=store)
-        @test_throws MethodError get_all_tasks(; store=store)
-        @test_throws MethodError get_all_tasks(RUNNING; store=store)
+        @test_throws MethodError get_task_status(task_id; runtime=rt_store)
+        @test_throws MethodError cancel_task(task_id; runtime=rt_store)
+        @test_throws MethodError get_all_tasks(; runtime=rt_store)
+        @test_throws MethodError get_all_tasks(RUNNING; runtime=rt_store)
         # A bare user id is not an authority either — `""` used to be a second,
         # quieter bypass, reachable by reading a missing claim into an empty string.
-        @test_throws MethodError get_task_status(task_id, "user-a"; store=store)
+        @test_throws MethodError get_task_status(task_id, "user-a"; runtime=rt_store)
 
         # 3. Listing tasks (get_all_tasks)
         # add another task by user-b
-        task_b_id = submit_task("task-user-b", () -> "data", Owner("user-b"); store=store)
+        task_b_id = submit_task("task-user-b", () -> "data", Owner("user-b"); runtime=rt_store)
 
         # get_all_tasks for user-a only returns task-access
-        tasks_a = get_all_tasks(Owner("user-a"); store=store)
+        tasks_a = get_all_tasks(Owner("user-a"); runtime=rt_store)
         @test length(tasks_a) == 1
         @test tasks_a[1][:id] == task_id
 
         # get_all_tasks for user-b only returns task-user-b
-        tasks_b = get_all_tasks(Owner("user-b"); store=store)
+        tasks_b = get_all_tasks(Owner("user-b"); runtime=rt_store)
         @test length(tasks_b) == 1
         @test tasks_b[1][:id] == task_b_id
 
         # get_all_tasks without user returns both
-        all_tasks = get_all_tasks(System(); store=store)
+        all_tasks = get_all_tasks(System(); runtime=rt_store)
         @test length(all_tasks) == 3 # task-auth-ok + task-access + task-user-b
 
         # 4. Cancellation access control
         # user-b cannot cancel user-a's task
-        @test_throws AuthorizationError cancel_task(task_id, Owner("user-b"); store=store)
+        @test_throws AuthorizationError cancel_task(task_id, Owner("user-b"); runtime=rt_store)
 
         # user-a can cancel their own task
-        cancel_res = cancel_task(task_id, Owner("user-a"); store=store)
+        cancel_res = cancel_task(task_id, Owner("user-a"); runtime=rt_store)
         @test cancel_res[:status] == "Task cancelled"
     finally
         notify(access_release)
-        reset_store!(store)
+        reset_runtime!(rt_store)
     end
 end
 
 @testset "watchers= grants a second identity access at submit time (#96)" begin
     store = InMemoryWorkerStore()
+    rt_store = WorkerRuntime(store)
     try
         # The motivating case: the identity that submits is not the one that polls.
         # A browser uploads under a short-lived credential; the backend, holding a
         # different long-lived one, drives the progress bar.
         task_id = submit_task("import-42", () -> "imported", Owner("browser-client");
-                              watchers=[Owner("backend-service")], store=store)
+                              watchers=[Owner("backend-service")], runtime=rt_store)
 
-        @test wait_for(() -> get_task_status(task_id, Owner("browser-client"); store=store)[:status] == "COMPLETED") == :ok
+        @test wait_for(() -> get_task_status(task_id, Owner("browser-client"); runtime=rt_store)[:status] == "COMPLETED") == :ok
 
         # The grantee can read and list...
-        @test get_task_status(task_id, Owner("backend-service"); store=store)[:result] == "imported"
-        @test only(get_all_tasks(Owner("backend-service"); store=store))[:id] == task_id
+        @test get_task_status(task_id, Owner("backend-service"); runtime=rt_store)[:result] == "imported"
+        @test only(get_all_tasks(Owner("backend-service"); runtime=rt_store))[:id] == task_id
         # ...but ownership stays with the submitter: it is derived from the id.
-        @test get_task_status(task_id, Owner("backend-service"); store=store)[:owner] == "browser-client"
+        @test get_task_status(task_id, Owner("backend-service"); runtime=rt_store)[:owner] == "browser-client"
 
         # Nobody else is admitted by the grant.
-        @test_throws AuthorizationError get_task_status(task_id, Owner("stranger"); store=store)
+        @test_throws AuthorizationError get_task_status(task_id, Owner("stranger"); runtime=rt_store)
 
         # Granting an identity that is already a watcher is a no-op, owner included.
         again = submit_task("solo", () -> "x", Owner("alice");
-                            watchers=[Owner("alice")], store=store)
-        @test get_task_status(again, Owner("alice"); store=store)[:watcher_count] == 1
+                            watchers=[Owner("alice")], runtime=rt_store)
+        @test get_task_status(again, Owner("alice"); runtime=rt_store)[:watcher_count] == 1
     finally
-        reset_store!(store)
+        reset_runtime!(rt_store)
     end
 end
 
 @testset "a :global grant is still subject to the watch authorizer (#96)" begin
     store = InMemoryWorkerStore()
+    rt_store = WorkerRuntime(store)
     org = Dict("victim" => "A", "bob" => "A", "mallory" => "B")
     set_watch_authorizer!(store, (task_key, watchers, user_id) ->
         get(org, first(watchers), nothing) == get(org, user_id, nothing))
 
     try
         gid = submit_task("shared-index", () -> "secret", Owner("victim");
-                          scope=:global, store=store)
+                          scope=:global, runtime=rt_store)
 
         # A direct join by an out-of-org user is refused — that is #19's gate.
         @test_throws AuthorizationError submit_task("shared-index", () -> "x", Owner("mallory");
-                                                   scope=:global, store=store)
+                                                   scope=:global, runtime=rt_store)
 
         # ...so a grant must not be a way around it. For a :global task there is no owner
         # in the id, which makes the watch authorizer the entire access policy; letting an
@@ -683,43 +885,45 @@ end
         # approved — and it would carry cancel rights too.
         @test_throws AuthorizationError submit_task("shared-index", () -> "x", Owner("bob");
                                                    scope=:global, watchers=[Owner("mallory")],
-                                                   store=store)
-        @test_throws AuthorizationError get_task_status(gid, Owner("mallory"); store=store)
+                                                   runtime=rt_store)
+        @test_throws AuthorizationError get_task_status(gid, Owner("mallory"); runtime=rt_store)
 
         # The refused submit must not have persisted the grants that preceded the
         # refusal: a submit that raised should not have handed out any access.
         @test_throws AuthorizationError submit_task("shared-index", () -> "x", Owner("victim");
                                                    scope=:global,
                                                    watchers=[Owner("bob"), Owner("mallory")],
-                                                   store=store)
-        @test_throws AuthorizationError get_task_status(gid, Owner("bob"); store=store)
+                                                   runtime=rt_store)
+        @test_throws AuthorizationError get_task_status(gid, Owner("bob"); runtime=rt_store)
 
         # An in-org grantee the authorizer accepts still goes through.
         @test submit_task("shared-index", () -> "x", Owner("victim");
-                          scope=:global, watchers=[Owner("bob")], store=store) == gid
-        @test get_task_status(gid, Owner("bob"); store=store)[:id] == gid
+                          scope=:global, watchers=[Owner("bob")], runtime=rt_store) == gid
+        @test get_task_status(gid, Owner("bob"); runtime=rt_store)[:id] == gid
     finally
-        reset_store!(store)
+        reset_runtime!(rt_store)
     end
 end
 
 @testset "a :user grant needs no authorizer — the owner owns the task (#96)" begin
     store = InMemoryWorkerStore()
+    rt_store = WorkerRuntime(store)
     # An authorizer that refuses everyone. It governs :global key reuse only, so it must
     # not reach a :user-scoped owner sharing their own task.
     set_watch_authorizer!(store, (task_key, watchers, user_id) -> false)
 
     try
         task_id = submit_task("report", () -> "mine", Owner("alice");
-                              watchers=[Owner("helper")], store=store)
-        @test get_task_status(task_id, Owner("helper"); store=store)[:id] == task_id
+                              watchers=[Owner("helper")], runtime=rt_store)
+        @test get_task_status(task_id, Owner("helper"); runtime=rt_store)[:id] == task_id
     finally
-        reset_store!(store)
+        reset_runtime!(rt_store)
     end
 end
 
 @testset "watchers= grants cancel too, and does not survive a record reset (#96)" begin
     store = InMemoryWorkerStore()
+    rt_store = WorkerRuntime(store)
     started = Base.Event()
     try
         task_id = submit_task("long-job", task_info -> begin
@@ -727,28 +931,29 @@ end
             while !cancel_requested(task_info)
                 sleep(0.01)
             end
-        end, Owner("owner-a"); watchers=[Owner("helper")], store=store)
+        end, Owner("owner-a"); watchers=[Owner("helper")], runtime=rt_store)
         wait(started)
 
         # A grantee gets the owner's rights minus ownership, and `cancel_task` gates on
         # the same list -- so the grant carries cancel. Documented, not incidental.
-        @test cancel_task(task_id, Owner("helper"); store=store)[:status] == "Task cancelled"
-        @test wait_for(() -> get_task_status(task_id, Owner("owner-a"); store=store)[:status] == "CANCELLED") == :ok
+        @test cancel_task(task_id, Owner("helper"); runtime=rt_store)[:status] == "Task cancelled"
+        @test wait_for(() -> get_task_status(task_id, Owner("owner-a"); runtime=rt_store)[:status] == "CANCELLED") == :ok
 
         # Re-running a finished key replaces the record, so its watcher list resets to
         # the resubmitter and grants must be passed again.
-        again = submit_task("long-job", () -> "second", Owner("owner-a"); store=store)
+        again = submit_task("long-job", () -> "second", Owner("owner-a"); runtime=rt_store)
         @test again == task_id
-        @test wait_for(() -> get_task_status(task_id, Owner("owner-a"); store=store)[:result] == "second") == :ok
-        @test_throws AuthorizationError get_task_status(task_id, Owner("helper"); store=store)
+        @test wait_for(() -> get_task_status(task_id, Owner("owner-a"); runtime=rt_store)[:result] == "second") == :ok
+        @test_throws AuthorizationError get_task_status(task_id, Owner("helper"); runtime=rt_store)
     finally
         notify(started)
-        reset_store!(store)
+        reset_runtime!(rt_store)
     end
 end
 
 @testset "store write primitives are atomic and intent-scoped (#88)" begin
     store = InMemoryWorkerStore()
+    rt_store = WorkerRuntime(store)
     try
         info = TaskInfo("alice::job")
         push!(info.watchers, "alice")
@@ -814,12 +1019,13 @@ end
             @test Set(got) == Set(vcat("alice", ["u$(i)" for i in 1:20]))
         end
     finally
-        reset_store!(store)
+        reset_runtime!(rt_store)
     end
 end
 
 @testset "terminal writes are addressed to a run, not just a task id (#108)" begin
     store = InMemoryWorkerStore()
+    rt_store = WorkerRuntime(store)
     try
         # Deliberately driven through the store primitives rather than through real tasks.
         # The bug is a property of the compare-and-set, and asserting it directly makes the
@@ -886,35 +1092,36 @@ end
             a = TaskInfo("alice::handles")
             a.status = RUNNING
             replace_task!(store, a.id, a)
-            register_active_task!(store, a.id, @async sleep(0.01))
+            register_active_task!(rt_store, a.id, @async sleep(0.01))
 
             b = TaskInfo("alice::handles")           # the resubmit takes over the key
             b.status = RUNNING
             replace_task!(store, b.id, b)
             b_handle = @async (sleep(30); nothing)
-            register_active_task!(store, b.id, b_handle)
-            register_active_task_info!(store, b.id, b)
+            register_active_task!(rt_store, b.id, b_handle)
+            register_active_task_info!(rt_store, b.id, b)
 
             # Run A finally finishes. Its CAS correctly writes nothing -- but before #108
             # the teardown that follows was keyed by ID, so it deleted B's handle too.
-            Nitro.Workers._finish_task!(store, a, COMPLETED; result="stale")
+            Nitro.Workers._finish_task!(rt_store, a, COMPLETED; result="stale")
 
-            @test get_active_task(store, "alice::handles") === b_handle
+            @test get_active_task(rt_store, "alice::handles") === b_handle
             @test get_task_info(store, "alice::handles").status == RUNNING
 
             # Why that mattered: zombie recovery decides liveness from exactly that handle,
             # so an unfenced teardown made a genuinely-running successor look dead.
-            recover_zombie_tasks!(; store=store)
+            recover_zombie_tasks!(; runtime=rt_store)
             @test get_task_info(store, "alice::handles").status == RUNNING
         end
     finally
-        reset_store!(store)
+        reset_runtime!(rt_store)
     end
 end
 
 @testset "a cancel that lands before the body starts is not overwritten (#142)" begin
     @testset "the start write is a claim, so it cannot undo a cancellation" begin
         store = InMemoryWorkerStore()
+        rt_store = WorkerRuntime(store)
         try
             t = TaskInfo("alice::early")
             replace_task!(store, t.id, t)
@@ -932,18 +1139,19 @@ end
             @test get_task_info(store, t.id).status == CANCELLED
             @test get_task_info(store, t.id).started_at === nothing
         finally
-            reset_store!(store)
+            reset_runtime!(rt_store)
         end
     end
 
     @testset "a claimed cancel is never followed by COMPLETED" begin
         store = InMemoryWorkerStore()
+        rt_store = WorkerRuntime(store)
         try
             # Cancel IMMEDIATELY after submit, without waiting for the callback to start --
             # the window every other cancel test in this file deliberately closes by first
             # waiting on an Event notified from *inside* the callback.
-            id = submit_task("race", () -> "done", Owner("u"); store=store)
-            @test cancel_task(id, Owner("u"); store=store)[:status] == "Task cancelled"
+            id = submit_task("race", () -> "done", Owner("u"); runtime=rt_store)
+            @test cancel_task(id, Owner("u"); runtime=rt_store)[:status] == "Task cancelled"
 
             # A NEGATIVE, time-bounded assertion, and that direction is the point: a slow
             # machine still times out, so this cannot flake into a false failure -- it can
@@ -951,16 +1159,17 @@ end
             # `wait_for(status == "CANCELLED")` instead would be useless here, since
             # `timedwait` evaluates its predicate once up front and the record is already
             # CANCELLED at that instant; the overwrite lands later.
-            @test timedwait(() -> get_task_status(id, Owner("u"); store=store)[:status] !=
+            @test timedwait(() -> get_task_status(id, Owner("u"); runtime=rt_store)[:status] !=
                                   "CANCELLED", 2.0) == :timed_out
-            @test get_task_status(id, Owner("u"); store=store)[:status] == "CANCELLED"
+            @test get_task_status(id, Owner("u"); runtime=rt_store)[:status] == "CANCELLED"
         finally
-            reset_store!(store)
+            reset_runtime!(rt_store)
         end
     end
 
     @testset "a queued item cancelled before it is dequeued never runs its callback" begin
         store = InMemoryWorkerStore()
+        rt_store = WorkerRuntime(store)
         ran = Threads.Atomic{Bool}(false)
         try
             t = TaskInfo("alice::queued"; queue_name="reports")
@@ -971,12 +1180,12 @@ end
             # Driven synchronously on purpose: the sequential processor calls exactly this,
             # so the assertion is about the function rather than about scheduling.
             item = Nitro.Workers.QueueItem(t.id, () -> (ran[] = true; "done"), TaskOptions())
-            Nitro.Workers._execute_queued_task(store, item)
+            Nitro.Workers._execute_queued_task(rt_store, item)
 
             @test ran[] == false
             @test get_task_info(store, t.id).status == CANCELLED
         finally
-            reset_store!(store)
+            reset_runtime!(rt_store)
         end
     end
 end
@@ -984,6 +1193,7 @@ end
 @testset "cancellation is cooperative, never injected (#127)" begin
     @testset "cancel_task sets the run's token, and the callback observes it" begin
         store = InMemoryWorkerStore()
+        rt_store = WorkerRuntime(store)
         entered = Base.Event()
         saw_token = Threads.Atomic{Bool}(false)
         ran_finally = Threads.Atomic{Bool}(false)
@@ -1002,22 +1212,23 @@ end
                     # is the whole behavioural change apps have to absorb.
                     ran_finally[] = true
                 end
-            end, Owner("u"); store=store)
+            end, Owner("u"); runtime=rt_store)
 
             wait(entered)
             @test cancel_requested(get_task_info(store, id)) == false
-            @test cancel_task(id, Owner("u"); store=store)[:status] == "Task cancelled"
+            @test cancel_task(id, Owner("u"); runtime=rt_store)[:status] == "Task cancelled"
 
             @test wait_for(() -> saw_token[]) == :ok
             @test wait_for(() -> ran_finally[]) == :ok
-            @test get_task_status(id, Owner("u"); store=store)[:status] == "CANCELLED"
+            @test get_task_status(id, Owner("u"); runtime=rt_store)[:status] == "CANCELLED"
         finally
-            reset_store!(store)
+            reset_runtime!(rt_store)
         end
     end
 
     @testset "an uncooperative callback is not stopped, and cancel does not block on it" begin
         store = InMemoryWorkerStore()
+        rt_store = WorkerRuntime(store)
         entered = Base.Event()
         release = Base.Event()
         returned = Threads.Atomic{Bool}(false)
@@ -1027,29 +1238,30 @@ end
                 wait(release)               # never polls the token
                 returned[] = true
                 return "finished anyway"
-            end, Owner("u"); store=store)
+            end, Owner("u"); runtime=rt_store)
 
             wait(entered)
             # Returns immediately: the terminal state is recorded by the CAS, and there is
             # nothing to wait for. This is the contract the docs claimed and the interrupt
             # never actually delivered.
-            @test cancel_task(id, Owner("u"); store=store)[:status] == "Task cancelled"
-            @test get_task_status(id, Owner("u"); store=store)[:status] == "CANCELLED"
+            @test cancel_task(id, Owner("u"); runtime=rt_store)[:status] == "Task cancelled"
+            @test get_task_status(id, Owner("u"); runtime=rt_store)[:status] == "CANCELLED"
             @test returned[] == false       # still running, as documented
 
             notify(release)
             @test wait_for(() -> returned[]) == :ok
             # It ran to completion -- and still must not overwrite the cancellation.
-            @test wait_for(() -> get_task_status(id, Owner("u"); store=store)[:status] ==
+            @test wait_for(() -> get_task_status(id, Owner("u"); runtime=rt_store)[:status] ==
                                  "CANCELLED") == :ok
         finally
             notify(release)
-            reset_store!(store)
+            reset_runtime!(rt_store)
         end
     end
 
     @testset "a timeout sets the token, records FAILED, and is never retried" begin
         store = InMemoryWorkerStore()
+        rt_store = WorkerRuntime(store)
         entries = Threads.Atomic{Int}(0)
         try
             # retry_on_failure is ON on purpose: a timeout must still be terminal on the
@@ -1065,15 +1277,15 @@ end
                 sleep(2.0)                  # outruns the deadline, ignores the token
                 return "too late"
             end, Owner("u");
-            options=TaskOptions(timeout=1, retry_on_failure=true, max_retries=2), store=store)
+            options=TaskOptions(timeout=1, retry_on_failure=true, max_retries=2), runtime=rt_store)
 
-            @test wait_for(() -> get_task_status(id, Owner("u"); store=store)[:status] ==
+            @test wait_for(() -> get_task_status(id, Owner("u"); runtime=rt_store)[:status] ==
                                  "FAILED"; timeout=10.0) == :ok
-            status = get_task_status(id, Owner("u"); store=store)
+            status = get_task_status(id, Owner("u"); runtime=rt_store)
             @test occursin("Timeout of 1s exceeded", status[:error])
             @test entries[] == 1
         finally
-            reset_store!(store)
+            reset_runtime!(rt_store)
         end
     end
 
@@ -1083,13 +1295,14 @@ end
         # happened first; under `Threads.@spawn` the body can finish and deregister before the
         # parent gets there, re-registering a completed task that nothing ever cleans up (#30).
         store = InMemoryWorkerStore()
+        rt_store = WorkerRuntime(store)
         try
-            id = submit_task("quick", () -> "done", Owner("u"); store=store)
-            @test wait_for(() -> get_task_status(id, Owner("u"); store=store)[:status] ==
+            id = submit_task("quick", () -> "done", Owner("u"); runtime=rt_store)
+            @test wait_for(() -> get_task_status(id, Owner("u"); runtime=rt_store)[:status] ==
                                  "COMPLETED") == :ok
-            @test wait_for(() -> !haskey(store.active_tasks, id)) == :ok
+            @test wait_for(() -> !haskey(rt_store.active_tasks, id)) == :ok
         finally
-            reset_store!(store)
+            reset_runtime!(rt_store)
         end
     end
 
@@ -1100,28 +1313,29 @@ end
         # claim onto that record a cancelled task kept reporting RUNNING until its callback
         # returned -- and `_register_or_watch!` then refused to re-run the key.
         store = InMemoryWorkerStore()
+        rt_store = WorkerRuntime(store)
         entered = Base.Event()
         release = Base.Event()
         try
             id = submit_task("mirror", () -> (notify(entered); wait(release); "done"),
-                             Owner("u"); store=store)
+                             Owner("u"); runtime=rt_store)
             wait(entered)
-            @test cancel_task(id, Owner("u"); store=store)[:status] == "Task cancelled"
+            @test cancel_task(id, Owner("u"); runtime=rt_store)[:status] == "Task cancelled"
 
             # Asserted while the callback is STILL RUNNING -- that is the whole window.
-            live = get_active_task_info(store, id)
+            live = get_active_task_info(rt_store, id)
             @test live === nothing || live.status == CANCELLED
-            @test get_task_status(id, Owner("u"); store=store)[:status] == "CANCELLED"
+            @test get_task_status(id, Owner("u"); runtime=rt_store)[:status] == "CANCELLED"
 
             # The two downstream consequences the stale record caused.
-            @test haskey(cancel_task(id, Owner("u"); store=store), :error)
-            again = submit_task("mirror", () -> "second", Owner("u"); store=store)
+            @test haskey(cancel_task(id, Owner("u"); runtime=rt_store), :error)
+            again = submit_task("mirror", () -> "second", Owner("u"); runtime=rt_store)
             @test again == id
-            @test wait_for(() -> get_task_status(id, Owner("u"); store=store)[:result] ==
+            @test wait_for(() -> get_task_status(id, Owner("u"); runtime=rt_store)[:result] ==
                                  "second") == :ok
         finally
             notify(release)
-            reset_store!(store)
+            reset_runtime!(rt_store)
         end
     end
 
@@ -1130,6 +1344,7 @@ end
         # the interrupt that used to abort that sleep -- so a cancel landing inside a 2/4/8s
         # backoff window used to burn another attempt against an already-cancelled task.
         store = InMemoryWorkerStore()
+        rt_store = WorkerRuntime(store)
         attempts = Threads.Atomic{Int}(0)
         entered = Base.Event()
         try
@@ -1138,7 +1353,7 @@ end
                 n == 1 && notify(entered)
                 error("attempt $n failed")
             end, Owner("u");
-            options=TaskOptions(retry_on_failure=true, max_retries=3), store=store)
+            options=TaskOptions(retry_on_failure=true, max_retries=3), runtime=rt_store)
 
             wait(entered)          # attempt 1 has STARTED; it has not necessarily failed yet
 
@@ -1148,9 +1363,9 @@ end
             # reached -- so the test passed against the broken code. 0.3s is far more than
             # the callback needs to throw and be caught, and far less than the 2s backoff.
             sleep(0.3)
-            @test cancel_task(id, Owner("u"); store=store)[:status] == "Task cancelled"
+            @test cancel_task(id, Owner("u"); runtime=rt_store)[:status] == "Task cancelled"
 
-            @test wait_for(() -> get_task_status(id, Owner("u"); store=store)[:status] ==
+            @test wait_for(() -> get_task_status(id, Owner("u"); runtime=rt_store)[:status] ==
                                  "CANCELLED"; timeout=10.0) == :ok
 
             # The point: the backoff was abandoned rather than slept through. This has to
@@ -1162,7 +1377,7 @@ end
             @test timedwait(() -> attempts[] > 1, 3.5) == :timed_out
             @test attempts[] == 1
         finally
-            reset_store!(store)
+            reset_runtime!(rt_store)
         end
     end
 
@@ -1204,23 +1419,24 @@ end
 
 @testset "queue introspection is an admin surface (#87)" begin
     store = InMemoryWorkerStore()
+    rt_store = WorkerRuntime(store)
     try
-        submit_sequential_task("reports", "job", () -> "ok", Owner("user-a"); store=store)
+        submit_sequential_task("reports", "job", () -> "ok", Owner("user-a"); runtime=rt_store)
 
         # `:pending_tasks` and `:current_task` enumerate ids that carry their owner in
         # the "<owner>::<key>" prefix, and queue depth is a fact about the queue rather
         # than about any one user. So there is no scoped form: an Owner does not compile.
-        @test get_queue_status("reports", System(); store=store)[:running] == true
-        @test_throws MethodError get_queue_status("reports", Owner("user-a"); store=store)
+        @test get_queue_status("reports", System(); runtime=rt_store)[:running] == true
+        @test_throws MethodError get_queue_status("reports", Owner("user-a"); runtime=rt_store)
         # ...and, as everywhere else, omitting the authority is not a way in either.
-        @test_throws MethodError get_queue_status("reports"; store=store)
+        @test_throws MethodError get_queue_status("reports"; runtime=rt_store)
 
         # `is_task_running` took no user id at all — any caller who could name an id
         # learned whether it was live. Retired rather than hardened; it had no tests and
         # no docs, and `get_task_status` answers the same question with authorization.
         @test !isdefined(Nitro.Workers, :is_task_running)
     finally
-        reset_store!(store)
+        reset_runtime!(rt_store)
     end
 end
 
@@ -1262,58 +1478,60 @@ end
 
 @testset "ownership comes from the id, watchers only add to it" begin
     store = InMemoryWorkerStore()
+    rt_store = WorkerRuntime(store)
     try
         # A :user task: the owner is derivable from the id, so emptying `watchers`
         # cannot revoke it. That is the authorization half of #88 — a lost append,
         # or a full-row write from another process, can no longer evict an owner
         # from their own task.
-        uid = submit_task("report", () -> "secret", Owner("alice"); store=store)
+        uid = submit_task("report", () -> "secret", Owner("alice"); runtime=rt_store)
         info = get_task_info(store, uid)
         empty!(info.watchers)
         set_task!(store, uid, info)
 
         @test isempty(get_task_info(store, uid).watchers)
-        @test get_task_status(uid, Owner("alice"); store=store)[:id] == uid
-        @test get_task_status(uid, Owner("alice"); store=store)[:owner] == "alice"
-        @test_throws AuthorizationError get_task_status(uid, Owner("mallory"); store=store)
+        @test get_task_status(uid, Owner("alice"); runtime=rt_store)[:id] == uid
+        @test get_task_status(uid, Owner("alice"); runtime=rt_store)[:owner] == "alice"
+        @test_throws AuthorizationError get_task_status(uid, Owner("mallory"); runtime=rt_store)
         # It still lists for its owner, with no watcher entry backing that up.
-        @test length(get_all_tasks(Owner("alice"); store=store)) == 1
+        @test length(get_all_tasks(Owner("alice"); runtime=rt_store)) == 1
 
         # A :global task has no owner half, so `watchers` remains the whole gate and
         # emptying it authorizes nobody — including the submitter. The asymmetry is
         # deliberate: B adds an authority source for :user ids, it removes none.
-        gid = submit_task("shared", () -> "x", Owner("gus"); scope=:global, store=store)
+        gid = submit_task("shared", () -> "x", Owner("gus"); scope=:global, runtime=rt_store)
         @test owner_of(gid) === nothing
         ginfo = get_task_info(store, gid)
         empty!(ginfo.watchers)
         set_task!(store, gid, ginfo)
 
-        @test_throws AuthorizationError get_task_status(gid, Owner("gus"); store=store)
-        @test get_task_status(gid, System(); store=store)[:id] == gid
-        @test isempty(get_all_tasks(Owner("gus"); store=store))
+        @test_throws AuthorizationError get_task_status(gid, Owner("gus"); runtime=rt_store)
+        @test get_task_status(gid, System(); runtime=rt_store)[:id] == gid
+        @test isempty(get_all_tasks(Owner("gus"); runtime=rt_store))
     finally
-        reset_store!(store)
+        reset_runtime!(rt_store)
     end
 end
 
 @testset "get_all_tasks returns owned and granted tasks, and nothing else" begin
     store = InMemoryWorkerStore()
+    rt_store = WorkerRuntime(store)
     try
-        mine = submit_task("mine", () -> "a", Owner("alice"); store=store)
-        theirs = submit_task("theirs", () -> "b", Owner("bob"); store=store)
+        mine = submit_task("mine", () -> "a", Owner("alice"); runtime=rt_store)
+        theirs = submit_task("theirs", () -> "b", Owner("bob"); runtime=rt_store)
         # A :global task alice is a watcher of but does not own.
-        shared = submit_task("shared", () -> "c", Owner("carol"); scope=:global, store=store)
+        shared = submit_task("shared", () -> "c", Owner("carol"); scope=:global, runtime=rt_store)
         info = get_task_info(store, shared)
         push!(info.watchers, "alice")
         set_task!(store, shared, info)
 
-        ids = Set(t[:id] for t in get_all_tasks(Owner("alice"); store=store))
+        ids = Set(t[:id] for t in get_all_tasks(Owner("alice"); runtime=rt_store))
         @test ids == Set([mine, shared])       # owned by prefix, granted by watchers
         @test !(theirs in ids)
-        @test Set(t[:id] for t in get_all_tasks(Owner("bob"); store=store)) == Set([theirs])
-        @test length(get_all_tasks(System(); store=store)) == 3
+        @test Set(t[:id] for t in get_all_tasks(Owner("bob"); runtime=rt_store)) == Set([theirs])
+        @test length(get_all_tasks(System(); runtime=rt_store)) == 3
     finally
-        reset_store!(store)
+        reset_runtime!(rt_store)
     end
 end
 
@@ -1342,49 +1560,52 @@ end
 
     # The submit paths route through it, including the validation.
     store = InMemoryWorkerStore()
+    rt_store = WorkerRuntime(store)
     try
-        @test submit_task("k", () -> 1, Owner("u"); scope=:global, store=store) == "k"
-        @test_throws ArgumentError submit_task("k3", () -> 1, Owner("u"); scope=:tenant, store=store)
-        @test_throws ArgumentError submit_sequential_task("q", "k4", () -> 1, Owner("u"); scope=:tenant, store=store)
+        @test submit_task("k", () -> 1, Owner("u"); scope=:global, runtime=rt_store) == "k"
+        @test_throws ArgumentError submit_task("k3", () -> 1, Owner("u"); scope=:tenant, runtime=rt_store)
+        @test_throws ArgumentError submit_sequential_task("q", "k4", () -> 1, Owner("u"); scope=:tenant, runtime=rt_store)
 
         # A global submit cannot squat a user-scoped id.
-        @test_throws ArgumentError submit_task("victim::k5", () -> 1, Owner("attacker"); scope=:global, store=store)
-        @test_throws ArgumentError submit_sequential_task("q", "victim::k6", () -> 1, Owner("attacker"); scope=:global, store=store)
+        @test_throws ArgumentError submit_task("victim::k5", () -> 1, Owner("attacker"); scope=:global, runtime=rt_store)
+        @test_throws ArgumentError submit_sequential_task("q", "victim::k6", () -> 1, Owner("attacker"); scope=:global, runtime=rt_store)
     finally
-        reset_store!(store)
+        reset_runtime!(rt_store)
     end
 end
 
 @testset "Sequential submits share the cross-user gate (#19)" begin
     store = InMemoryWorkerStore()
+    rt_store = WorkerRuntime(store)
     release = Base.Event()
 
     try
         owner_id = submit_sequential_task("reports", "nightly-rollup", task_info -> begin
             wait(release)
             return "owner-result"
-        end, Owner("owner"); scope=:global, store=store)
+        end, Owner("owner"); scope=:global, runtime=rt_store)
         @test owner_id == "nightly-rollup"
 
         @test_throws AuthorizationError submit_sequential_task(
-            "reports", "nightly-rollup", () -> "noop", Owner("attacker"); scope=:global, store=store)
+            "reports", "nightly-rollup", () -> "noop", Owner("attacker"); scope=:global, runtime=rt_store)
 
         notify(release)
-        @test wait_for(() -> get_task_status(owner_id, Owner("owner"); store=store)[:status] == "COMPLETED") == :ok
-        @test get_task_status(owner_id, Owner("owner"); store=store)[:result] == "owner-result"
-        @test_throws AuthorizationError get_task_status(owner_id, Owner("attacker"); store=store)
+        @test wait_for(() -> get_task_status(owner_id, Owner("owner"); runtime=rt_store)[:status] == "COMPLETED") == :ok
+        @test get_task_status(owner_id, Owner("owner"); runtime=rt_store)[:result] == "owner-result"
+        @test_throws AuthorizationError get_task_status(owner_id, Owner("attacker"); runtime=rt_store)
 
         # Terminal state is gated on the sequential path too.
         @test_throws AuthorizationError submit_sequential_task(
-            "reports", "nightly-rollup", () -> "noop", Owner("attacker"); scope=:global, store=store)
+            "reports", "nightly-rollup", () -> "noop", Owner("attacker"); scope=:global, runtime=rt_store)
     finally
         notify(release)
-        reset_store!(store)
+        reset_runtime!(rt_store)
     end
 end
 
 @testset "User-scoped keys isolate same-key submissions across users (#19)" begin
     store = InMemoryWorkerStore()
+    rt_store = WorkerRuntime(store)
     a_calls = Ref(0)
     b_calls = Ref(0)
     release = Base.Event()
@@ -1395,13 +1616,13 @@ end
             a_calls[] += 1
             wait(release)
             return "victim-secret"
-        end, Owner("user-a"); store=store)
+        end, Owner("user-a"); runtime=rt_store)
 
         b_id = submit_task("export_report_42", () -> begin
             b_calls[] += 1
             wait(release)
             return "attacker-data"
-        end, Owner("user-b"); store=store)
+        end, Owner("user-b"); runtime=rt_store)
 
         @test a_id == "user-a::export_report_42"
         @test b_id == "user-b::export_report_42"
@@ -1409,27 +1630,28 @@ end
 
         # Two independent tasks: no deduplication across users, so both run.
         notify(release)
-        @test wait_for(() -> get_task_status(a_id, Owner("user-a"); store=store)[:status] == "COMPLETED") == :ok
-        @test wait_for(() -> get_task_status(b_id, Owner("user-b"); store=store)[:status] == "COMPLETED") == :ok
+        @test wait_for(() -> get_task_status(a_id, Owner("user-a"); runtime=rt_store)[:status] == "COMPLETED") == :ok
+        @test wait_for(() -> get_task_status(b_id, Owner("user-b"); runtime=rt_store)[:status] == "COMPLETED") == :ok
         @test a_calls[] == 1
         @test b_calls[] == 1
 
         # Neither user became a watcher of the other's task.
-        @test get_task_status(a_id, Owner("user-a"); store=store)[:watcher_count] == 1
-        @test get_task_status(b_id, Owner("user-b"); store=store)[:watcher_count] == 1
+        @test get_task_status(a_id, Owner("user-a"); runtime=rt_store)[:watcher_count] == 1
+        @test get_task_status(b_id, Owner("user-b"); runtime=rt_store)[:watcher_count] == 1
 
         # The escalation the issue reports: reading and cancelling across users.
-        @test get_task_status(a_id, Owner("user-a"); store=store)[:result] == "victim-secret"
-        @test_throws AuthorizationError get_task_status(a_id, Owner("user-b"); store=store)
-        @test_throws AuthorizationError cancel_task(a_id, Owner("user-b"); store=store)
+        @test get_task_status(a_id, Owner("user-a"); runtime=rt_store)[:result] == "victim-secret"
+        @test_throws AuthorizationError get_task_status(a_id, Owner("user-b"); runtime=rt_store)
+        @test_throws AuthorizationError cancel_task(a_id, Owner("user-b"); runtime=rt_store)
     finally
         notify(release)
-        reset_store!(store)
+        reset_runtime!(rt_store)
     end
 end
 
 @testset "Global-scoped keys refuse cross-user join and reuse (#19)" begin
     store = InMemoryWorkerStore()
+    rt_store = WorkerRuntime(store)
     release = Base.Event()
     attacker_calls = Ref(0)
 
@@ -1437,48 +1659,49 @@ end
         owner_id = submit_task("shared-export", () -> begin
             wait(release)
             return "victim-secret"
-        end, Owner("victim"); scope=:global, store=store)
+        end, Owner("victim"); scope=:global, runtime=rt_store)
         @test owner_id == "shared-export"
 
         # Case 1 — the task is live. Joining it would hand over read/cancel rights.
         @test_throws AuthorizationError submit_task("shared-export", () -> begin
             attacker_calls[] += 1
             return "noop"
-        end, Owner("attacker"); scope=:global, store=store)
+        end, Owner("attacker"); scope=:global, runtime=rt_store)
 
         # The refused submit left no trace on the victim's task.
-        @test get_task_status(owner_id, Owner("victim"); store=store)[:watcher_count] == 1
-        @test_throws AuthorizationError get_task_status(owner_id, Owner("attacker"); store=store)
-        @test_throws AuthorizationError cancel_task(owner_id, Owner("attacker"); store=store)
+        @test get_task_status(owner_id, Owner("victim"); runtime=rt_store)[:watcher_count] == 1
+        @test_throws AuthorizationError get_task_status(owner_id, Owner("attacker"); runtime=rt_store)
+        @test_throws AuthorizationError cancel_task(owner_id, Owner("attacker"); runtime=rt_store)
 
         notify(release)
-        @test wait_for(() -> get_task_status(owner_id, Owner("victim"); store=store)[:status] == "COMPLETED") == :ok
+        @test wait_for(() -> get_task_status(owner_id, Owner("victim"); runtime=rt_store)[:status] == "COMPLETED") == :ok
 
         # Case 2 — the task is finished. Re-running the key would overwrite the
         # owner's stored result and drop them from the watcher list.
         @test_throws AuthorizationError submit_task("shared-export", () -> begin
             attacker_calls[] += 1
             return "noop"
-        end, Owner("attacker"); scope=:global, store=store)
+        end, Owner("attacker"); scope=:global, runtime=rt_store)
 
-        after = get_task_status(owner_id, Owner("victim"); store=store)
+        after = get_task_status(owner_id, Owner("victim"); runtime=rt_store)
         @test after[:status] == "COMPLETED"
         @test after[:result] == "victim-secret"
         @test after[:watcher_count] == 1
         @test attacker_calls[] == 0
 
         # The owner may still re-run their own finished key.
-        again = submit_task("shared-export", () -> "second-run", Owner("victim"); scope=:global, store=store)
+        again = submit_task("shared-export", () -> "second-run", Owner("victim"); scope=:global, runtime=rt_store)
         @test again == owner_id
-        @test wait_for(() -> get_task_status(owner_id, Owner("victim"); store=store)[:result] == "second-run") == :ok
+        @test wait_for(() -> get_task_status(owner_id, Owner("victim"); runtime=rt_store)[:result] == "second-run") == :ok
     finally
         notify(release)
-        reset_store!(store)
+        reset_runtime!(rt_store)
     end
 end
 
 @testset "Watch authorizer opts back into cross-user sharing" begin
     store = InMemoryWorkerStore()
+    rt_store = WorkerRuntime(store)
     release = Base.Event()
     seen = Ref{Any}(nothing)
 
@@ -1491,44 +1714,45 @@ end
         owner_id = submit_task("team-export", () -> begin
             wait(release)
             return "shared-result"
-        end, Owner("owner"); scope=:global, store=store)
+        end, Owner("owner"); scope=:global, runtime=rt_store)
 
         # Denied: the hook says no.
-        @test_throws AuthorizationError submit_task("team-export", () -> "noop", Owner("stranger"); scope=:global, store=store)
+        @test_throws AuthorizationError submit_task("team-export", () -> "noop", Owner("stranger"); scope=:global, runtime=rt_store)
         @test seen[] == ("team-export", ["owner"], "stranger")
 
         # Allowed: the hook says yes, so the teammate joins as a watcher and
         # deduplicates onto the running task rather than starting a second one.
-        joined = submit_task("team-export", () -> error("must not run"), Owner("teammate"); scope=:global, store=store)
+        joined = submit_task("team-export", () -> error("must not run"), Owner("teammate"); scope=:global, runtime=rt_store)
         @test joined == owner_id
 
         notify(release)
-        @test wait_for(() -> get_task_status(owner_id, Owner("owner"); store=store)[:status] == "COMPLETED") == :ok
+        @test wait_for(() -> get_task_status(owner_id, Owner("owner"); runtime=rt_store)[:status] == "COMPLETED") == :ok
 
-        status = get_task_status(owner_id, Owner("teammate"); store=store)
+        status = get_task_status(owner_id, Owner("teammate"); runtime=rt_store)
         @test status[:result] == "shared-result"
         @test status[:watcher_count] == 2
-        @test_throws AuthorizationError get_task_status(owner_id, Owner("stranger"); store=store)
+        @test_throws AuthorizationError get_task_status(owner_id, Owner("stranger"); runtime=rt_store)
 
         # The hook is not consulted for a user who already watches the task.
         seen[] = nothing
-        @test submit_task("team-export", () -> "re-run", Owner("owner"); scope=:global, store=store) == owner_id
+        @test submit_task("team-export", () -> "re-run", Owner("owner"); scope=:global, runtime=rt_store) == owner_id
         @test seen[] === nothing
 
         # Re-running a finished key REPLACES the record, so the watcher list resets to
         # the submitter and previously-authorized sharers are evicted. Documented on
         # set_watch_authorizer! — asserted here so the behavior cannot drift silently.
-        @test wait_for(() -> get_task_status(owner_id, Owner("owner"); store=store)[:result] == "re-run") == :ok
-        @test get_task_status(owner_id, Owner("owner"); store=store)[:watcher_count] == 1
-        @test_throws AuthorizationError get_task_status(owner_id, Owner("teammate"); store=store)
+        @test wait_for(() -> get_task_status(owner_id, Owner("owner"); runtime=rt_store)[:result] == "re-run") == :ok
+        @test get_task_status(owner_id, Owner("owner"); runtime=rt_store)[:watcher_count] == 1
+        @test_throws AuthorizationError get_task_status(owner_id, Owner("teammate"); runtime=rt_store)
     finally
         notify(release)
-        reset_store!(store)
+        reset_runtime!(rt_store)
     end
 end
 
 @testset "submit_task is subject to the queue authorizer under DEFAULT_QUEUE_NAME" begin
     store = InMemoryWorkerStore()
+    rt_store = WorkerRuntime(store)
     calls = Ref(Tuple{String, String}[])
 
     set_queue_authorizer!(store, (queue_name, user_id) -> begin
@@ -1539,23 +1763,24 @@ end
     try
         @test DEFAULT_QUEUE_NAME == "default"
 
-        ok_id = submit_task("job", () -> "ran", Owner("allowed"); store=store)
+        ok_id = submit_task("job", () -> "ran", Owner("allowed"); runtime=rt_store)
         @test ok_id == "allowed::job"
-        @test wait_for(() -> get_task_status(ok_id, Owner("allowed"); store=store)[:status] == "COMPLETED") == :ok
+        @test wait_for(() -> get_task_status(ok_id, Owner("allowed"); runtime=rt_store)[:status] == "COMPLETED") == :ok
 
-        @test_throws AuthorizationError submit_task("job", () -> "ran", Owner("denied"); store=store)
+        @test_throws AuthorizationError submit_task("job", () -> "ran", Owner("denied"); runtime=rt_store)
 
         # The denied submission never reached the store.
-        @test get_task_status("denied::job", System(); store=store)[:status] == "NOT_FOUND"
+        @test get_task_status("denied::job", System(); runtime=rt_store)[:status] == "NOT_FOUND"
 
         @test calls[] == [(DEFAULT_QUEUE_NAME, "allowed"), (DEFAULT_QUEUE_NAME, "denied")]
     finally
-        reset_store!(store)
+        reset_runtime!(rt_store)
     end
 end
 
 @testset "Zombie task recovery on startup" begin
     store = InMemoryWorkerStore()
+    rt_store = WorkerRuntime(store)
 
     try
         # Setup a running task that has NO live execution handle
@@ -1572,83 +1797,86 @@ end
             store.task_registry[t2.id] = t2
 
             # Register in-memory active task
-            store.active_tasks[t2.id] = @async sleep(0.05)
+            rt_store.active_tasks[t2.id] = @async sleep(0.05)
         end
 
         # Run recovery
-        recovered_count = recover_zombie_tasks!(; store=store)
+        recovered_count = recover_zombie_tasks!(; runtime=rt_store)
         @test recovered_count == 1
 
         # Test zombie is marked FAILED
-        zombie_status = get_task_status("zombie-running", System(); store=store)
+        zombie_status = get_task_status("zombie-running", System(); runtime=rt_store)
         @test zombie_status[:status] == "FAILED"
         @test zombie_status[:error] == "Worker process terminated unexpectedly mid-execution."
         @test zombie_status[:completed_at] isa DateTime
 
         # Test active running task is untouched
-        active_status = get_task_status("active-running", System(); store=store)
+        active_status = get_task_status("active-running", System(); runtime=rt_store)
         @test active_status[:status] == "RUNNING"
 
         # Cleanup active task
-        wait(store.active_tasks["active-running"])
+        wait(rt_store.active_tasks["active-running"])
     finally
-        reset_store!(store)
+        reset_runtime!(rt_store)
     end
 end
 
 @testset "cancel_task is atomic: completed task result is never overwritten" begin
     store = InMemoryWorkerStore()
+    rt_store = WorkerRuntime(store)
     try
         # Regression: cancel_task used to read status outside the task lock,
         # so a concurrent _complete_task! could overwrite COMPLETED→CANCELLED.
-        task_id = submit_task("race-task", () -> "safe-result", Owner("user"); store=store)
-        @test wait_for(() -> get_task_status(task_id, Owner("user"); store=store)[:status] == "COMPLETED") == :ok
+        task_id = submit_task("race-task", () -> "safe-result", Owner("user"); runtime=rt_store)
+        @test wait_for(() -> get_task_status(task_id, Owner("user"); runtime=rt_store)[:status] == "COMPLETED") == :ok
 
         # Cancelling an already-completed task must return an error, not overwrite the result.
-        result = cancel_task(task_id, Owner("user"); store=store)
+        result = cancel_task(task_id, Owner("user"); runtime=rt_store)
         @test haskey(result, :error)
 
-        final = get_task_status(task_id, Owner("user"); store=store)
+        final = get_task_status(task_id, Owner("user"); runtime=rt_store)
         @test final[:status] == "COMPLETED"
         @test final[:result] == "safe-result"
     finally
-        reset_store!(store)
+        reset_runtime!(rt_store)
     end
 end
 
 @testset "terminal state fields are consistent: error and completed_at visible with status" begin
     store = InMemoryWorkerStore()
+    rt_store = WorkerRuntime(store)
     try
         # Regression: _fail_task! and _cancel_task! used to write status before error/completed_at,
         # so concurrent readers could observe status=FAILED with error=nothing.
-        task_id = submit_task("fail-task", () -> error("boom"), Owner("user"); store=store)
-        @test wait_for(() -> get_task_status(task_id, Owner("user"); store=store)[:status] == "FAILED"; timeout=10.0) == :ok
+        task_id = submit_task("fail-task", () -> error("boom"), Owner("user"); runtime=rt_store)
+        @test wait_for(() -> get_task_status(task_id, Owner("user"); runtime=rt_store)[:status] == "FAILED"; timeout=10.0) == :ok
 
-        status = get_task_status(task_id, Owner("user"); store=store)
+        status = get_task_status(task_id, Owner("user"); runtime=rt_store)
         @test status[:error] !== nothing
         @test occursin("boom", status[:error])
         @test status[:completed_at] !== nothing
     finally
-        reset_store!(store)
+        reset_runtime!(rt_store)
     end
 
     store2 = InMemoryWorkerStore()
+    rt_store2 = WorkerRuntime(store2)
     started = Base.Event()
     try
         task_id2 = submit_task("cancel-fields-task", task_info -> begin
             notify(started)
             while !cancel_requested(task_info); sleep(0.01); end
-        end, Owner("user"); store=store2)
+        end, Owner("user"); runtime=rt_store2)
 
         wait(started)
-        cancel_task(task_id2, Owner("user"); store=store2)
-        @test wait_for(() -> get_task_status(task_id2, Owner("user"); store=store2)[:status] == "CANCELLED") == :ok
+        cancel_task(task_id2, Owner("user"); runtime=rt_store2)
+        @test wait_for(() -> get_task_status(task_id2, Owner("user"); runtime=rt_store2)[:status] == "CANCELLED") == :ok
 
-        status2 = get_task_status(task_id2, Owner("user"); store=store2)
+        status2 = get_task_status(task_id2, Owner("user"); runtime=rt_store2)
         @test status2[:error] !== nothing
         @test status2[:completed_at] !== nothing
     finally
-        reset_store!(store2)
+        reset_runtime!(rt_store2)
     end
 end
 
@@ -1657,24 +1885,25 @@ end
     # Without the lock_tasks fix both could write to the same task, leaving it
     # CANCELLED with result=nothing even though the callback completed.
     store = InMemoryWorkerStore()
+    rt_store = WorkerRuntime(store)
     try
         for trial in 1:30
-            reset_store!(store)
+            reset_runtime!(rt_store)
             gate = Base.Event()
 
             task_id = submit_task("race-$(trial)", () -> begin
                 notify(gate)
                 sleep(0.001)
                 return "result-$(trial)"
-            end, Owner("user"); store=store)
+            end, Owner("user"); runtime=rt_store)
 
             wait(gate)
-            cancel_task(task_id, Owner("user"); store=store)
+            cancel_task(task_id, Owner("user"); runtime=rt_store)
 
             # Let either path finish.
-            wait_for(() -> get_task_status(task_id, Owner("user"); store=store)[:status] in ("COMPLETED", "CANCELLED"))
+            wait_for(() -> get_task_status(task_id, Owner("user"); runtime=rt_store)[:status] in ("COMPLETED", "CANCELLED"))
 
-            final = get_task_status(task_id, Owner("user"); store=store)
+            final = get_task_status(task_id, Owner("user"); runtime=rt_store)
             @test final[:status] in ("COMPLETED", "CANCELLED")
             if final[:status] == "COMPLETED"
                 @test final[:result] == "result-$(trial)"
@@ -1684,7 +1913,7 @@ end
             end
         end
     finally
-        reset_store!(store)
+        reset_runtime!(rt_store)
     end
 end
 

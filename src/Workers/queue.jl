@@ -1,13 +1,13 @@
-function _get_or_create_queue(store::AbstractWorkerStore, queue_name::String)
-    lock(get_queue_lock(store)) do
-        return get!(get_sequential_queues(store), queue_name) do
+function _get_or_create_queue(runtime::WorkerRuntime, queue_name::String)
+    lock(get_queue_lock(runtime)) do
+        return get!(get_sequential_queues(runtime), queue_name) do
             SequentialQueue()
         end
     end
 end
 
-function _mark_queue_current_task!(store::AbstractWorkerStore, queue::SequentialQueue, task_id::Union{Nothing, String})
-    lock(get_queue_lock(store)) do
+function _mark_queue_current_task!(runtime::WorkerRuntime, queue::SequentialQueue, task_id::Union{Nothing, String})
+    lock(get_queue_lock(runtime)) do
         queue.current_task = task_id
     end
     return queue
@@ -19,15 +19,16 @@ end
 # (`api.jl`), so an unfenced teardown makes a live successor look dead and the next sweep marks
 # it FAILED — a worse outcome than the stale write `run_id` was added to stop (#108).
 #
-# `get_active_task_info` is the right probe on both backends. `InMemoryWorkerStore` aliases it to
-# `get_task_info`, so it returns the registry record — whichever run currently owns the key.
-# `PormGWorkerStore` returns its process-local `active_task_infos` entry, and `nothing` there
-# means no local run, where both deregisters are already no-ops.
-function _deregister_run!(store::AbstractWorkerStore, task_info::TaskInfo)
-    live = get_active_task_info(store, task_info.id)
+# `get_active_task_info` is now one mechanism rather than a per-backend one: the runtime publishes
+# the object the executing run itself registered, so the probe answers with whichever run currently
+# owns the key, and `nothing` means no local run — where both deregisters are already no-ops. It
+# used to be an alias for the in-memory registry and a private PormG cache, which looked equivalent
+# and was not (#167).
+function _deregister_run!(runtime::WorkerRuntime, task_info::TaskInfo)
+    live = get_active_task_info(runtime, task_info.id)
     if live === nothing || live.run_id == task_info.run_id
-        deregister_active_task!(store, task_info.id)
-        deregister_active_task_info!(store, task_info.id)
+        deregister_active_task!(runtime, task_info.id)
+        deregister_active_task_info!(runtime, task_info.id)
     end
     return nothing
 end
@@ -40,27 +41,26 @@ end
 # the live in-memory object of the very task being finished, so the "was I cancelled?"
 # guard would be inspecting this process's own copy and could never observe a cancellation
 # recorded elsewhere (#88).
-function _finish_task!(store::AbstractWorkerStore, task_info::TaskInfo, to::TaskStatus;
+function _finish_task!(runtime::WorkerRuntime, task_info::TaskInfo, to::TaskStatus;
                        error::Union{Nothing, String}=nothing,
                        result=UNSUPPLIED,
                        progress::Union{Nothing, Real}=nothing)
     finished_at = current_time_utc()
-    return lock_tasks(store) do
+    return lock_tasks(runtime) do
         # `run_id` is what makes this write ADDRESSED rather than merely atomic: #88 made
         # terminal transitions compare-and-set, but they still named only a task id, and a task
         # id outlives the run writing under it (#108).
-        claimed = try_transition!(store, task_info.id, (PENDING, RUNNING), to;
+        claimed = try_transition!(runtime.store, task_info.id, (PENDING, RUNNING), to;
                                   run_id=task_info.run_id,
                                   error, completed_at=finished_at, result, progress)
 
         # Whether or not we won, THIS RUN is done — and only this run's handles may go.
-        _deregister_run!(store, task_info)
-        task_info.sys_task = nothing
+        _deregister_run!(runtime, task_info)
 
         if !claimed
             # Someone else reached a terminal state first — a cancellation, here or in
             # another process. Their record stands; report it rather than ours.
-            latest = reload_task(store, task_info.id)
+            latest = get_task_info(runtime.store, task_info.id)
             return latest === nothing ? task_info : latest
         end
 
@@ -75,20 +75,23 @@ function _finish_task!(store::AbstractWorkerStore, task_info::TaskInfo, to::Task
     end
 end
 
-_complete_task!(store::AbstractWorkerStore, task_info::TaskInfo, result) =
-    _finish_task!(store, task_info, COMPLETED; result, progress=100.0)
+_complete_task!(runtime::WorkerRuntime, task_info::TaskInfo, result) =
+    _finish_task!(runtime, task_info, COMPLETED; result, progress=100.0)
 
 # Carry the progress the task had reached. A serializing store writes only the columns it
 # is given, so omitting it would reset a failed job's "got to 47% and died" to zero there
 # while the in-memory store kept it — a store-parity gap and a diagnostic loss.
-_fail_task!(store::AbstractWorkerStore, task_info::TaskInfo, message::String) =
-    _finish_task!(store, task_info, FAILED; error=message, progress=task_info.progress)
+_fail_task!(runtime::WorkerRuntime, task_info::TaskInfo, message::String) =
+    _finish_task!(runtime, task_info, FAILED; error=message, progress=task_info.progress)
 
-_cancel_task!(store::AbstractWorkerStore, task_info::TaskInfo; message::String="Cancelled") =
-    _finish_task!(store, task_info, CANCELLED; error=message, progress=task_info.progress)
+_cancel_task!(runtime::WorkerRuntime, task_info::TaskInfo; message::String="Cancelled") =
+    _finish_task!(runtime, task_info, CANCELLED; error=message, progress=task_info.progress)
 
-function _execute_queued_task(store::AbstractWorkerStore, item::QueueItem)
-    task_info = get_task_info(store, item.task_key)
+function _execute_queued_task(runtime::WorkerRuntime, item::QueueItem)
+    # The DURABLE read: a live-preferring one here would hand this run its predecessor's
+    # `TaskInfo` when a terminal-but-still-executing key is re-run, and the fenced start below
+    # would then fail forever (#167).
+    task_info = get_task_info(runtime.store, item.task_key)
 
     if task_info === nothing
         return nothing
@@ -120,16 +123,14 @@ function _execute_queued_task(store::AbstractWorkerStore, item::QueueItem)
     # unconditional `set_task!` wrote the store LAST and so never opened that window;
     # claiming the start (#142) reversed the order, and this restores it. Registering while
     # the record is still PENDING is harmless: that sweep only looks at RUNNING.
-    task_info.sys_task = current_task()
-    register_active_task!(store, task_info.id, current_task())
-    register_active_task_info!(store, task_info.id, task_info)
+    register_active_task!(runtime, task_info.id, current_task())
+    register_active_task_info!(runtime, task_info.id, task_info)
 
-    if !try_transition!(store, task_info.id, (PENDING,), RUNNING;
+    if !try_transition!(runtime.store, task_info.id, (PENDING,), RUNNING;
                         run_id=task_info.run_id, started_at=started)
         # Cancelled, or this run no longer owns the record. Hand back the handles we just
         # took -- fenced, so we cannot tear down a successor's (#108).
-        _deregister_run!(store, task_info)
-        task_info.sys_task = nothing
+        _deregister_run!(runtime, task_info)
         return task_info
     end
 
@@ -140,7 +141,7 @@ function _execute_queued_task(store::AbstractWorkerStore, item::QueueItem)
     for retry_count in 0:max_attempts
         try
             result = timeout_call(item.callback, task_info; timeout=item.options.timeout)
-            return _complete_task!(store, task_info, result)
+            return _complete_task!(runtime, task_info, result)
         catch error
             unwrapped = _unwrap_exception(error)
 
@@ -153,9 +154,9 @@ function _execute_queued_task(store::AbstractWorkerStore, item::QueueItem)
             # cancellation was delivered by injecting one. Nothing injects any more, so
             # the only way one arrives is that the callback itself threw it -- recording
             # that as "Cancelled by user" would be a lie about who stopped the job (#127).
-            latest_info = get_task_info(store, task_info.id)
+            latest_info = get_task_info(runtime, task_info.id)
             if latest_info !== nothing && latest_info.status == CANCELLED
-                return _cancel_task!(store, task_info)
+                return _cancel_task!(runtime, task_info)
             end
 
             # A timeout is terminal on the first attempt. Retrying it cannot help and can
@@ -164,11 +165,11 @@ function _execute_queued_task(store::AbstractWorkerStore, item::QueueItem)
             # `task_info` and one set of external side effects (#127). The token is not
             # reset between attempts either, so a retry would start pre-cancelled.
             if unwrapped isa TaskTimeoutError
-                return _fail_task!(store, task_info, _store_error_text(store, unwrapped))
+                return _fail_task!(runtime, task_info, _store_error_text(runtime.store, unwrapped))
             end
 
             if retry_count == max_attempts
-                return _fail_task!(store, task_info, _store_error_text(store, unwrapped))
+                return _fail_task!(runtime, task_info, _store_error_text(runtime.store, unwrapped))
             end
 
             # Cancellation-aware backoff. The catch above checks CANCELLED before sleeping and
@@ -184,11 +185,11 @@ function _execute_queued_task(store::AbstractWorkerStore, item::QueueItem)
             # The token is process-local, so a cancel issued on another node sets nothing here. One
             # durable read per ATTEMPT (not per poll) covers that without a round-trip every 50ms.
             if cancel_requested(task_info)
-                return _cancel_task!(store, task_info)
+                return _cancel_task!(runtime, task_info)
             end
-            resumed = get_task_info(store, task_info.id)
+            resumed = get_task_info(runtime.store, task_info.id)
             if resumed !== nothing && resumed.status == CANCELLED
-                return _cancel_task!(store, task_info)
+                return _cancel_task!(runtime, task_info)
             end
         end
     end
@@ -196,9 +197,9 @@ function _execute_queued_task(store::AbstractWorkerStore, item::QueueItem)
     return task_info
 end
 
-function _start_queue_processor(store::AbstractWorkerStore, queue_name::String)
-    queue = _get_or_create_queue(store, queue_name)
-    qlock = get_queue_lock(store)
+function _start_queue_processor(runtime::WorkerRuntime, queue_name::String)
+    queue = _get_or_create_queue(runtime, queue_name)
+    qlock = get_queue_lock(runtime)
 
     lock(qlock) do
         if queue.running && !isnothing(queue.processor_task) && !istaskdone(queue.processor_task)
@@ -218,9 +219,9 @@ function _start_queue_processor(store::AbstractWorkerStore, queue_name::String)
                     end
 
                     lock(queue.exec_lock) do
-                        _mark_queue_current_task!(store, queue, item.task_key)
+                        _mark_queue_current_task!(runtime, queue, item.task_key)
                         try
-                            _execute_queued_task(store, item)
+                            _execute_queued_task(runtime, item)
                         catch error
                             # One bad item must never take the processor down. This
                             # loop is the only thing draining the queue and nothing
@@ -232,7 +233,7 @@ function _start_queue_processor(store::AbstractWorkerStore, queue_name::String)
                             # item, keep draining.
                             @error "Worker queue item aborted outside task execution" exception=(error, catch_backtrace()) queue_name=queue_name task_key=item.task_key
                         finally
-                            _mark_queue_current_task!(store, queue, nothing)
+                            _mark_queue_current_task!(runtime, queue, nothing)
                         end
                     end
                 end

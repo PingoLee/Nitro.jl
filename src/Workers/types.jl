@@ -145,7 +145,6 @@ mutable struct TaskInfo
     started_at::Union{Nothing, DateTime}
     completed_at::Union{Nothing, DateTime}
     watchers::Vector{String}
-    sys_task::Union{Nothing, Task}
     queue_name::Union{Nothing, String}
     # The cancellation token. Process-local and NOT persisted: it is a request aimed at a
     # callback running *here*, and the durable `status` is what carries a cancellation
@@ -169,7 +168,6 @@ mutable struct TaskInfo
             nothing,
             nothing,
             String[],
-            nothing,
             queue_name,
             false,
         )

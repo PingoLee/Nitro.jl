@@ -138,13 +138,13 @@ This is the simplest setup for most Nitro applications.
 
 If your app needs explicit bootstrap control, call `Nitro.Workers.start!` yourself. Pass the
 same app you serve — with an explicit [`App`](@ref) that is `app`, and with the argument-less
-`serve()` it is `Nitro.CONTEXT[]`. Starting a store on an app you never serve gives you queues
+`serve()` it is `Nitro.CONTEXT[]`. Starting workers on an app you never serve gives you queues
 nothing submits to.
 
 ```julia
 using Nitro
 
-Nitro.Workers.start!(
+runtime = Nitro.Workers.start!(
     Nitro.CONTEXT[];
     queues=["reports", "imports"],
     cleanup_enabled=true,
@@ -153,7 +153,51 @@ Nitro.Workers.start!(
 )
 ```
 
-That is useful in custom bootstraps, test setup, or app wrappers that manage the Nitro context directly.
+That is useful in custom bootstraps, test setup, or app wrappers that manage the Nitro context
+directly. `start!` returns a [`WorkerRuntime`](#The-Store-And-The-Runtime) — hold it if you want
+to pass `runtime=` explicitly rather than letting each call resolve one from the app.
+
+## The Store And The Runtime
+
+Workers are two objects, and which one you reach for follows from one question:
+
+| | Answers | Holds |
+|---|---|---|
+| **Store** (`AbstractWorkerStore`) | *"what does the record say?"* | Task rows, watcher lists, and the policy hooks — the queue and watch authorizers, the error redactor |
+| **Runtime** (`WorkerRuntime`) | *"what is this process doing right now?"* | The sequential queues and their processor tasks, the cleanup scheduler, and the handles of runs executing here |
+
+You choose a **store** when you choose a backend, and that is the only place `store=` appears:
+`worker_startup(...; store=...)`, `Workers.start!(app; store=...)`, `install!(app; store=...)`.
+Everything else takes `runtime=`, or resolves one from the `App` you pass as the first argument.
+
+```julia
+# App-first: nothing to pass. This is what a handler should do.
+task_id = submit_task(app, "report-42", run_report, Owner("user-1"))
+
+# Explicit handle, for tests and library code.
+runtime = Nitro.Workers.start!(app; queues=["reports"])
+task_id = submit_task("report-42", run_report, Owner("user-1"); runtime=runtime)
+```
+
+The split means a backend cannot leak background work by forgetting to tear it down, because it
+never owns any — `shutdown!` takes a runtime, and there is nothing for a store to implement. It
+also means **one store can back several runtimes**: two apps sharing a database get their own
+queues and scheduler each, and `uninstall!` on one cannot stop the other's processors.
+
+Policy stays on the store, so those two apps correctly share one security posture:
+
+```julia
+set_queue_authorizer!(worker_store(app), my_queue_authorizer)
+```
+
+!!! warning "Teardown releases; it does not drain"
+    `shutdown!` — which `uninstall!` and the `worker_startup` middleware both call on server
+    stop — does not wait for runs still executing, because nothing can stop a Julia task;
+    cancellation is a token the callback polls. It drops the run handles, and
+    `recover_zombie_tasks!` decides liveness from exactly those, so a run still executing across
+    a teardown/restart **in one process** (a dev reload, several apps per process, a test suite
+    resetting between cases) is marked `FAILED` and its real result is discarded. Let in-flight
+    tasks finish first, or start with `recover_zombies=false`.
 
 ## Polling Task Status
 
@@ -492,11 +536,21 @@ serve(
 )
 ```
 
-For direct calls, pass the same store explicitly:
+For direct calls, prefer the App-first form — it resolves the runtime `worker_startup` installed,
+so there is nothing to thread through:
 
 ```julia
-task_id = submit_task("report-42", run_report, Owner("user-1"); store=worker_store)
-status = get_task_status(task_id, Owner("user-1"); store=worker_store)
+task_id = submit_task(app, "report-42", run_report, Owner("user-1"))
+status = get_task_status(app, task_id, Owner("user-1"))
+```
+
+Outside a request — a test, a script, a bootstrap — hold the runtime `start!` hands back and pass
+it as `runtime=`. Note that this is the *runtime*, not the store: a store cannot run anything.
+
+```julia
+runtime = Nitro.Workers.start!(app; queues=["reports"], store=worker_store)
+task_id = submit_task("report-42", run_report, Owner("user-1"); runtime=runtime)
+status = get_task_status(task_id, Owner("user-1"); runtime=runtime)
 ```
 
 ## What A Failed Task Stores

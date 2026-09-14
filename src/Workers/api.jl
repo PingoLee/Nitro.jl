@@ -1,34 +1,27 @@
-function _resolve_store(ctx::App; key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
-    if !isnothing(store)
-        return store
+function _resolve_runtime(ctx::App; key::Symbol=DEFAULT_EXTENSION_KEY, runtime::Union{Nothing, WorkerRuntime}=nothing)
+    if !isnothing(runtime)
+        return runtime
     end
 
-    ctx_store = worker_store(ctx; key)
-    return isnothing(ctx_store) ? default_store() : ctx_store
-end
-
-function _install_or_resolve_store!(ctx::App; key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
-    if isnothing(store)
-        existing_store = worker_store(ctx; key)
-        return isnothing(existing_store) ? install!(ctx; key) : existing_store
-    end
-
-    install!(ctx; key, store)
-    return store
+    installed = worker_runtime(ctx; key)
+    return installed isa WorkerRuntime ? installed : default_runtime()
 end
 
 """
-    recover_zombie_tasks!(; store::AbstractWorkerStore=default_store())
+    recover_zombie_tasks!(; runtime::WorkerRuntime=default_runtime())
 
-Sweeps the active store and transitions any tasks in `RUNNING` state that do 
-not have an active local thread executing them into a `FAILED` state.
+Sweeps the store and transitions any tasks in `RUNNING` state that do not have an active local
+thread executing them into a `FAILED` state.
+
+Reads the **durable** listing, not the live-overlaid one: this is a decision about durable state,
+and `get_active_task` is the whole liveness criterion either way.
 """
-function recover_zombie_tasks!(; store::AbstractWorkerStore=default_store())
-    return lock_tasks(store) do
-        running_tasks = get_all_tasks(store, System(); status=RUNNING)
+function recover_zombie_tasks!(; runtime::WorkerRuntime=default_runtime())
+    return lock_tasks(runtime) do
+        running_tasks = get_all_tasks(runtime.store, System(); status=RUNNING)
         count = 0
         for task in running_tasks
-            isnothing(get_active_task(store, task.id)) || continue
+            isnothing(get_active_task(runtime, task.id)) || continue
             # `get_active_task` is process-local, so in a multi-process deployment this
             # sweep sees another node's genuinely-running task as a zombie. Claiming the
             # transition rather than saving a decision means that if the task finishes
@@ -38,7 +31,7 @@ function recover_zombie_tasks!(; store::AbstractWorkerStore=default_store())
             # Addressed to the run this sweep actually inspected. Between the read above
             # and this write the key may have been re-run (#108), and declaring someone else's
             # live run dead is the same defect as clobbering its result.
-            if try_transition!(store, task.id, (RUNNING,), FAILED;
+            if try_transition!(runtime.store, task.id, (RUNNING,), FAILED;
                                run_id=task.run_id,
                                error="Worker process terminated unexpectedly mid-execution.",
                                completed_at=current_time_utc())
@@ -49,10 +42,34 @@ function recover_zombie_tasks!(; store::AbstractWorkerStore=default_store())
     end
 end
 
-function recover_zombie_tasks!(ctx::App; key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
-    return recover_zombie_tasks!(; store=_resolve_store(ctx; key, store))
+function recover_zombie_tasks!(ctx::App; key::Symbol=DEFAULT_EXTENSION_KEY, runtime::Union{Nothing, WorkerRuntime}=nothing)
+    return recover_zombie_tasks!(; runtime=_resolve_runtime(ctx; key, runtime))
 end
 
+# `store` selects a BACKEND and builds a runtime over it; `runtime` adopts one that already
+# exists. Passing both is a contradiction rather than a precedence puzzle, so it is refused.
+function _start_runtime_for!(ctx::App, key::Symbol,
+                             store::Union{Nothing, AbstractWorkerStore},
+                             runtime::Union{Nothing, WorkerRuntime})
+    if !isnothing(store) && !isnothing(runtime)
+        throw(ArgumentError(
+            "pass `store` (build a runtime over this backend) or `runtime` (use this one), not both"))
+    end
+    !isnothing(runtime) && return install!(ctx, runtime; key)
+    !isnothing(store) && return install!(ctx, WorkerRuntime(store); key)
+
+    existing = worker_runtime(ctx; key)
+    return existing isa WorkerRuntime ? existing : install!(ctx; key)
+end
+
+"""
+    start!(ctx::App; queues, cleanup_enabled, ..., store=nothing, runtime=nothing) -> WorkerRuntime
+
+Install a runtime on `ctx` and start it: sweep zombies, spawn a processor per named queue, and
+start (or stop) the cleanup scheduler.
+
+Returns the `WorkerRuntime` — that is the handle to pass as `runtime=` to the task API.
+"""
 function start!(ctx::App;
     queues::AbstractVector{<:AbstractString}=String[],
     cleanup_enabled::Bool=true,
@@ -61,24 +78,25 @@ function start!(ctx::App;
     recover_zombies::Bool=true,
     key::Symbol=DEFAULT_EXTENSION_KEY,
     store::Union{Nothing, AbstractWorkerStore}=nothing,
+    runtime::Union{Nothing, WorkerRuntime}=nothing,
 )
-    resolved_store = _install_or_resolve_store!(ctx; key, store)
+    resolved = _start_runtime_for!(ctx, key, store, runtime)
 
     if recover_zombies
-        recover_zombie_tasks!(; store=resolved_store)
+        recover_zombie_tasks!(; runtime=resolved)
     end
 
     for queue_name in queues
-        _start_queue_processor(resolved_store, String(queue_name))
+        _start_queue_processor(resolved, String(queue_name))
     end
 
     if cleanup_enabled
-        start_cleanup_scheduler(; interval_hours=cleanup_interval_hours, retain_days=cleanup_retain_days, store=resolved_store)
+        start_cleanup_scheduler(; interval_hours=cleanup_interval_hours, retain_days=cleanup_retain_days, runtime=resolved)
     else
-        stop_cleanup_scheduler!(resolved_store)
+        stop_cleanup_scheduler!(resolved)
     end
 
-    return resolved_store
+    return resolved
 end
 
 function startup(ctx::App;
@@ -89,6 +107,7 @@ function startup(ctx::App;
     recover_zombies::Bool=true,
     key::Symbol=DEFAULT_EXTENSION_KEY,
     store::Union{Nothing, AbstractWorkerStore}=nothing,
+    runtime::Union{Nothing, WorkerRuntime}=nothing,
 )
     queue_names = String.(collect(queues))
 
@@ -107,6 +126,7 @@ function startup(ctx::App;
             recover_zombies=recover_zombies,
             key=key,
             store=store,
+            runtime=runtime,
         )
         return nothing
     end
@@ -206,7 +226,7 @@ function _authorize_or_reload!(store::AbstractWorkerStore, authority::TaskAuthor
     # it would admit the cross-process grantee and then hand them a frozen progress bar —
     # the exact field #96 exists to expose. The decision needs the durable record; the
     # payload does not.
-    durable = reload_task(store, task_info.id)
+    durable = get_task_info(store, task_info.id)
     durable !== nothing && _is_authorized(authority, durable) && return nothing
 
     _authorize_task!(authority, task_info, action)   # raises
@@ -232,12 +252,12 @@ function _authorize_grant!(store::AbstractWorkerStore, task_key::String,
     return nothing
 end
 
-function _register_or_watch!(store::AbstractWorkerStore, task_key::String, owner::Owner;
+function _register_or_watch!(runtime::WorkerRuntime, task_key::String, owner::Owner;
                              queue_name::Union{Nothing, String}=nothing,
                              grants::AbstractVector{Owner}=Owner[])
     uid = owner.user_id
-    return lock_tasks(store) do
-        task_info = get_task_info(store, task_key)
+    return lock_tasks(runtime) do
+        task_info = get_task_info(runtime, task_key)
 
         # Gates both branches below: joining a live task grants the caller the
         # owner's read/cancel rights, and replacing a finished one destroys the
@@ -246,12 +266,12 @@ function _register_or_watch!(store::AbstractWorkerStore, task_key::String, owner
             # Same staleness trap as the read paths: a cached record can lack a grant
             # another process issued, which would send an already-authorized watcher to
             # the authorizer and have it refused.
-            durable = reload_task(store, task_key)
+            durable = get_task_info(runtime.store, task_key)
             durable !== nothing && (task_info = durable)
         end
 
         if task_info !== nothing && !_is_authorized(owner, task_info)
-            if !_watch_allowed(store, task_key, copy(task_info.watchers), uid)
+            if !_watch_allowed(runtime.store, task_key, copy(task_info.watchers), uid)
                 throw(AuthorizationError(
                     "User '$uid' is not authorized to join or reuse task '$task_key'"))
             end
@@ -270,7 +290,7 @@ function _register_or_watch!(store::AbstractWorkerStore, task_key::String, owner
         # throws with the earlier grants already durably written — and a submit that
         # raised would still have handed out access.
         for grant in grants
-            _authorize_grant!(store, task_key, seen, grant)
+            _authorize_grant!(runtime.store, task_key, seen, grant)
         end
 
         if task_info !== nothing && task_info.status in (RUNNING, PENDING)
@@ -278,9 +298,9 @@ function _register_or_watch!(store::AbstractWorkerStore, task_key::String, owner
             # get + push! + set_task! under `lock_tasks` is what #88 was: that lock is
             # process-local for a database-backed store, so the read-modify-write was
             # last-write-wins across processes.
-            add_watcher!(store, task_key, uid)
+            add_watcher!(runtime, task_key, uid)
             for grant in grants
-                add_watcher!(store, task_key, grant.user_id)
+                add_watcher!(runtime, task_key, grant.user_id)
             end
             return false
         end
@@ -291,7 +311,7 @@ function _register_or_watch!(store::AbstractWorkerStore, task_key::String, owner
         # stops that run from writing (#108); this is the only thing that can reclaim the
         # thread it is sitting on. In-process only -- a run hosted on another node is
         # unreachable from here and will keep going until its callback returns.
-        previous = get_active_task_info(store, task_key)
+        previous = get_active_task_info(runtime, task_key)
         previous === nothing || (@atomic previous.cancel_requested = true)
 
         task_info = TaskInfo(task_key; queue_name)
@@ -299,7 +319,7 @@ function _register_or_watch!(store::AbstractWorkerStore, task_key::String, owner
         for grant in grants
             grant.user_id in task_info.watchers || push!(task_info.watchers, grant.user_id)
         end
-        replace_task!(store, task_key, task_info)
+        replace_task!(runtime.store, task_key, task_info)
         return true
     end
 end
@@ -329,9 +349,10 @@ end
 # `cancel_requested` now holds one of `Threads.nthreads()` `:default`-pool slots -- the same pool
 # serving HTTP -- until it returns, instead of starving one thread's coroutines. See the timeout
 # warning in `docs/src/tutorial/workers.md`.
-function _execute_task_async(store::AbstractWorkerStore, task_key::String, callback::Function, options::TaskOptions)
+function _execute_task_async(runtime::WorkerRuntime, task_key::String, callback::Function, options::TaskOptions)
     task = Threads.@spawn begin
-        task_info = get_task_info(store, task_key)
+        # The DURABLE read -- see `_execute_queued_task` and #167.
+        task_info = get_task_info(runtime.store, task_key)
 
         if task_info === nothing
             return nothing
@@ -359,16 +380,14 @@ function _execute_task_async(store::AbstractWorkerStore, task_key::String, callb
         # unconditional `set_task!` wrote the store LAST and so never opened that window;
         # claiming the start (#142) reversed the order, and this restores it. Registering while
         # the record is still PENDING is harmless: that sweep only looks at RUNNING.
-        task_info.sys_task = current_task()
-        register_active_task!(store, task_key, current_task())
-        register_active_task_info!(store, task_key, task_info)
+        register_active_task!(runtime, task_key, current_task())
+        register_active_task_info!(runtime, task_key, task_info)
 
-        if !try_transition!(store, task_key, (PENDING,), RUNNING;
+        if !try_transition!(runtime.store, task_key, (PENDING,), RUNNING;
                             run_id=task_info.run_id, started_at=started)
             # Cancelled, or this run no longer owns the record. Hand back the handles we just
             # took -- fenced, so we cannot tear down a successor's (#108).
-            _deregister_run!(store, task_info)
-            task_info.sys_task = nothing
+            _deregister_run!(runtime, task_info)
             return task_info
         end
 
@@ -379,7 +398,7 @@ function _execute_task_async(store::AbstractWorkerStore, task_key::String, callb
         for retry_count in 0:max_attempts
             try
                 result = timeout_call(callback, task_info; timeout=options.timeout)
-                return _complete_task!(store, task_info, result)
+                return _complete_task!(runtime, task_info, result)
             catch error
                 unwrapped = _unwrap_exception(error)
 
@@ -392,9 +411,9 @@ function _execute_task_async(store::AbstractWorkerStore, task_key::String, callb
                 # cancellation was delivered by injecting one. Nothing injects any more, so
                 # the only way one arrives is that the callback itself threw it -- recording
                 # that as "Cancelled by user" would be a lie about who stopped the job (#127).
-                latest_info = get_task_info(store, task_key)
+                latest_info = get_task_info(runtime, task_key)
                 if latest_info !== nothing && latest_info.status == CANCELLED
-                    return _cancel_task!(store, task_info; message="Cancelled by user")
+                    return _cancel_task!(runtime, task_info; message="Cancelled by user")
                 end
 
                 # A timeout is terminal on the first attempt. Retrying it cannot help and can
@@ -403,11 +422,11 @@ function _execute_task_async(store::AbstractWorkerStore, task_key::String, callb
                 # `task_info` and one set of external side effects (#127). The token is not
                 # reset between attempts either, so a retry would start pre-cancelled.
                 if unwrapped isa TaskTimeoutError
-                    return _fail_task!(store, task_info, _store_error_text(store, unwrapped))
+                    return _fail_task!(runtime, task_info, _store_error_text(runtime.store, unwrapped))
                 end
 
                 if retry_count == max_attempts
-                    return _fail_task!(store, task_info, _store_error_text(store, unwrapped))
+                    return _fail_task!(runtime, task_info, _store_error_text(runtime.store, unwrapped))
                 end
 
                 # Cancellation-aware backoff. The catch above checks CANCELLED before sleeping and
@@ -423,11 +442,11 @@ function _execute_task_async(store::AbstractWorkerStore, task_key::String, callb
                 # The token is process-local, so a cancel issued on another node sets nothing here. One
                 # durable read per ATTEMPT (not per poll) covers that without a round-trip every 50ms.
                 if cancel_requested(task_info)
-                    return _cancel_task!(store, task_info; message="Cancelled by user")
+                    return _cancel_task!(runtime, task_info; message="Cancelled by user")
                 end
-                resumed = get_task_info(store, task_key)
+                resumed = get_task_info(runtime.store, task_key)
                 if resumed !== nothing && resumed.status == CANCELLED
-                    return _cancel_task!(store, task_info; message="Cancelled by user")
+                    return _cancel_task!(runtime, task_info; message="Cancelled by user")
                 end
             end
         end
@@ -449,7 +468,7 @@ end
 
 """
     submit_task(task_key, callback, owner::Owner; scope=:user, watchers=Owner[],
-                options=TaskOptions(), store=default_store())
+                options=TaskOptions(), runtime=default_runtime())
 
 Run `callback` on its own task and return the id it was stored under.
 
@@ -487,25 +506,24 @@ Re-running a *finished* key replaces the record and resets its watchers, so gran
 passed again on each such resubmission. Granting an identity that is already a watcher —
 including the owner — is a no-op.
 """
-function submit_task(task_key::AbstractString, callback::Function, owner::Owner; scope::Symbol=:user, watchers::AbstractVector{Owner}=Owner[], options::TaskOptions=TaskOptions(), store::AbstractWorkerStore=default_store())
-    _authorize_queue!(store, DEFAULT_QUEUE_NAME, owner)
+function submit_task(task_key::AbstractString, callback::Function, owner::Owner; scope::Symbol=:user, watchers::AbstractVector{Owner}=Owner[], options::TaskOptions=TaskOptions(), runtime::WorkerRuntime=default_runtime())
+    _authorize_queue!(runtime.store, DEFAULT_QUEUE_NAME, owner)
 
     key = scoped_task_key(task_key, owner; scope)
-    should_start = _register_or_watch!(store, key, owner; grants=watchers)
+    should_start = _register_or_watch!(runtime, key, owner; grants=watchers)
     if should_start
-        _execute_task_async(store, key, callback, options)
+        _execute_task_async(runtime, key, callback, options)
     end
     return key
 end
 
-function submit_task(ctx::App, task_key::AbstractString, callback::Function, owner::Owner; scope::Symbol=:user, watchers::AbstractVector{Owner}=Owner[], options::TaskOptions=TaskOptions(), key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
-    resolved_store = _resolve_store(ctx; key, store)
-    return submit_task(task_key, callback, owner; scope, watchers, options, store=resolved_store)
+function submit_task(ctx::App, task_key::AbstractString, callback::Function, owner::Owner; scope::Symbol=:user, watchers::AbstractVector{Owner}=Owner[], options::TaskOptions=TaskOptions(), key::Symbol=DEFAULT_EXTENSION_KEY, runtime::Union{Nothing, WorkerRuntime}=nothing)
+    return submit_task(task_key, callback, owner; scope, watchers, options, runtime=_resolve_runtime(ctx; key, runtime))
 end
 
 """
     submit_sequential_task(queue_name, task_key, callback, owner::Owner; scope=:user,
-                           watchers=Owner[], options=TaskOptions(), store=default_store())
+                           watchers=Owner[], options=TaskOptions(), runtime=default_runtime())
 
 Queue `callback` for one-at-a-time execution on `queue_name` and return the id it was
 stored under.
@@ -514,13 +532,13 @@ Identical to [`submit_task`](@ref) in how `scope` namespaces `task_key` and in w
 return value is for; the difference is ordered execution and that the queue authorizer
 sees the real `queue_name`.
 """
-function submit_sequential_task(queue_name::AbstractString, task_key::AbstractString, callback::Function, owner::Owner; scope::Symbol=:user, watchers::AbstractVector{Owner}=Owner[], options::TaskOptions=TaskOptions(), store::AbstractWorkerStore=default_store())
+function submit_sequential_task(queue_name::AbstractString, task_key::AbstractString, callback::Function, owner::Owner; scope::Symbol=:user, watchers::AbstractVector{Owner}=Owner[], options::TaskOptions=TaskOptions(), runtime::WorkerRuntime=default_runtime())
     queue_id = String(queue_name)
 
-    _authorize_queue!(store, queue_id, owner)
+    _authorize_queue!(runtime.store, queue_id, owner)
 
     key = scoped_task_key(task_key, owner; scope)
-    should_start = _register_or_watch!(store, key, owner; queue_name=queue_id, grants=watchers)
+    should_start = _register_or_watch!(runtime, key, owner; queue_name=queue_id, grants=watchers)
     if should_start
         # One lookup, not two. `_start_queue_processor` already returns the queue it spawned a
         # processor for, and a second `_get_or_create_queue` can return a DIFFERENT object: since
@@ -528,24 +546,23 @@ function submit_sequential_task(queue_name::AbstractString, task_key::AbstractSt
         # second lookup mint a fresh queue with an open channel and no processor. The `put!` would
         # then succeed and the task would sit PENDING with nothing draining it -- a silent hang in
         # place of the loud `InvalidStateException` a closed channel raises.
-        queue = _start_queue_processor(store, queue_id)
+        queue = _start_queue_processor(runtime, queue_id)
         put!(queue.channel, QueueItem(key, callback, options))
     end
     return key
 end
 
-function submit_sequential_task(ctx::App, queue_name::AbstractString, task_key::AbstractString, callback::Function, owner::Owner; scope::Symbol=:user, watchers::AbstractVector{Owner}=Owner[], options::TaskOptions=TaskOptions(), key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
-    resolved_store = _resolve_store(ctx; key, store)
-    return submit_sequential_task(queue_name, task_key, callback, owner; scope, watchers, options, store=resolved_store)
+function submit_sequential_task(ctx::App, queue_name::AbstractString, task_key::AbstractString, callback::Function, owner::Owner; scope::Symbol=:user, watchers::AbstractVector{Owner}=Owner[], options::TaskOptions=TaskOptions(), key::Symbol=DEFAULT_EXTENSION_KEY, runtime::Union{Nothing, WorkerRuntime}=nothing)
+    return submit_sequential_task(queue_name, task_key, callback, owner; scope, watchers, options, runtime=_resolve_runtime(ctx; key, runtime))
 end
 
-function get_task_status(task_id::AbstractString, authority::TaskAuthority; store::AbstractWorkerStore=default_store())
-    task_info = get_task_info(store, String(task_id))
+function get_task_status(task_id::AbstractString, authority::TaskAuthority; runtime::WorkerRuntime=default_runtime())
+    task_info = get_task_info(runtime, String(task_id))
     if task_info === nothing
         return Dict{Symbol, Any}(:error => "Task not found", :status => "NOT_FOUND")
     end
 
-    _authorize_or_reload!(store, authority, task_info, "view")
+    _authorize_or_reload!(runtime.store, authority, task_info, "view")
 
     return Dict{Symbol, Any}(
         :id => task_info.id,
@@ -562,18 +579,18 @@ function get_task_status(task_id::AbstractString, authority::TaskAuthority; stor
     )
 end
 
-function get_task_status(ctx::App, task_id::AbstractString, authority::TaskAuthority; key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
-    return get_task_status(task_id, authority; store=_resolve_store(ctx; key, store))
+function get_task_status(ctx::App, task_id::AbstractString, authority::TaskAuthority; key::Symbol=DEFAULT_EXTENSION_KEY, runtime::Union{Nothing, WorkerRuntime}=nothing)
+    return get_task_status(task_id, authority; runtime=_resolve_runtime(ctx; key, runtime))
 end
 
-function cancel_task(task_id::AbstractString, authority::TaskAuthority; store::AbstractWorkerStore=default_store())
-    return lock_tasks(store) do
-        task_info = get_task_info(store, String(task_id))
+function cancel_task(task_id::AbstractString, authority::TaskAuthority; runtime::WorkerRuntime=default_runtime())
+    return lock_tasks(runtime) do
+        task_info = get_task_info(runtime, String(task_id))
         if task_info === nothing
             return Dict{Symbol, Any}(:error => "Task not found")
         end
 
-        _authorize_or_reload!(store, authority, task_info, "cancel")
+        _authorize_or_reload!(runtime.store, authority, task_info, "cancel")
 
         if task_info.status in (COMPLETED, FAILED, CANCELLED)
             return Dict{Symbol, Any}(:error => "Task already finished with status $(task_info.status)")
@@ -592,12 +609,12 @@ function cancel_task(task_id::AbstractString, authority::TaskAuthority; store::A
         # — reachable across processes, since `lock_tasks` is process-local for a
         # database-backed store (#108).
         cancelled_at = current_time_utc()
-        claimed = try_transition!(store, task_info.id, (PENDING, RUNNING), CANCELLED;
+        claimed = try_transition!(runtime.store, task_info.id, (PENDING, RUNNING), CANCELLED;
                                   run_id=task_info.run_id,
                                   error="Cancelled", completed_at=cancelled_at)
 
         if !claimed
-            latest = get_task_info(store, task_info.id)
+            latest = get_task_info(runtime, task_info.id)
             latest === nothing && return Dict{Symbol, Any}(:error => "Task not found")
             if latest.run_id != task_info.run_id
                 # Distinguished on purpose: reporting the successor's status here would say
@@ -609,7 +626,7 @@ function cancel_task(task_id::AbstractString, authority::TaskAuthority; store::A
         end
 
         # Ask the callback to stop. This replaces
-        # `schedule(sys_task, InterruptException(), error=true)`, which was only ever safe
+        # `schedule(worker_task, InterruptException(), error=true)`, which was only ever safe
         # while worker tasks were thread-pinned: `schedule(t, exc; error=true)` does not
         # check whether `t` is running, and injecting into a task executing on another
         # thread aborts the process in `jl_finish_task` (#127, blocking #30).
@@ -625,7 +642,7 @@ function cancel_task(task_id::AbstractString, authority::TaskAuthority; store::A
         # honest for `recover_zombie_tasks!` and keeps `get_task_info` serving live progress
         # for a task that is still producing it. `_finish_task!` tears them down whether or
         # not it wins its CAS, so nothing leaks.
-        live = get_active_task_info(store, task_info.id)
+        live = get_active_task_info(runtime, task_info.id)
         if live !== nothing && live.run_id == task_info.run_id
             @atomic live.cancel_requested = true
 
@@ -650,12 +667,12 @@ function cancel_task(task_id::AbstractString, authority::TaskAuthority; store::A
     end
 end
 
-function cancel_task(ctx::App, task_id::AbstractString, authority::TaskAuthority; key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
-    return cancel_task(task_id, authority; store=_resolve_store(ctx; key, store))
+function cancel_task(ctx::App, task_id::AbstractString, authority::TaskAuthority; key::Symbol=DEFAULT_EXTENSION_KEY, runtime::Union{Nothing, WorkerRuntime}=nothing)
+    return cancel_task(task_id, authority; runtime=_resolve_runtime(ctx; key, runtime))
 end
 
-function get_all_tasks(authority::TaskAuthority, filter_status::Union{Nothing, TaskStatus}=nothing; store::AbstractWorkerStore=default_store())
-    task_infos = get_all_tasks(store, authority; status=filter_status)
+function get_all_tasks(authority::TaskAuthority, filter_status::Union{Nothing, TaskStatus}=nothing; runtime::WorkerRuntime=default_runtime())
+    task_infos = get_all_tasks(runtime, authority; status=filter_status)
     tasks = Vector{Dict{Symbol, Any}}()
     for task_info in task_infos
         push!(tasks, Dict{Symbol, Any}(
@@ -673,20 +690,20 @@ function get_all_tasks(authority::TaskAuthority, filter_status::Union{Nothing, T
     return tasks
 end
 
-function get_all_tasks(ctx::App, authority::TaskAuthority, filter_status::Union{Nothing, TaskStatus}=nothing; key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
-    return get_all_tasks(authority, filter_status; store=_resolve_store(ctx; key, store))
+function get_all_tasks(ctx::App, authority::TaskAuthority, filter_status::Union{Nothing, TaskStatus}=nothing; key::Symbol=DEFAULT_EXTENSION_KEY, runtime::Union{Nothing, WorkerRuntime}=nothing)
+    return get_all_tasks(authority, filter_status; runtime=_resolve_runtime(ctx; key, runtime))
 end
 
-function cleanup_old_tasks(days::Int=7; store::AbstractWorkerStore=default_store())
-    return cleanup_tasks!(store, days)
+function cleanup_old_tasks(days::Int=7; runtime::WorkerRuntime=default_runtime())
+    return cleanup_tasks!(runtime.store, days)
 end
 
-function cleanup_old_tasks(ctx::App, days::Int=7; key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
-    return cleanup_old_tasks(days; store=_resolve_store(ctx; key, store))
+function cleanup_old_tasks(ctx::App, days::Int=7; key::Symbol=DEFAULT_EXTENSION_KEY, runtime::Union{Nothing, WorkerRuntime}=nothing)
+    return cleanup_old_tasks(days; runtime=_resolve_runtime(ctx; key, runtime))
 end
 
 """
-    get_queue_status(queue_name, ::System; store=default_store()) -> Dict{Symbol, Any}
+    get_queue_status(queue_name, ::System; runtime=default_runtime()) -> Dict{Symbol, Any}
 
 Queue-wide introspection: depth, whether the processor is running, the current task, and
 the ids of everything pending on `queue_name`.
@@ -704,9 +721,9 @@ a Hangfire dashboard — all-or-nothing, and not on a user-facing route. If you 
 a user *their* place in a queue, build that from `get_all_tasks(Owner(uid), PENDING)`,
 which reports only what they may see.
 """
-function get_queue_status(queue_name::AbstractString, ::System; store::AbstractWorkerStore=default_store())
-    qlock = get_queue_lock(store)
-    queues = get_sequential_queues(store)
+function get_queue_status(queue_name::AbstractString, ::System; runtime::WorkerRuntime=default_runtime())
+    qlock = get_queue_lock(runtime)
+    queues = get_sequential_queues(runtime)
 
     lock(qlock) do
         queue = Base.get(queues, String(queue_name), nothing)
@@ -714,7 +731,7 @@ function get_queue_status(queue_name::AbstractString, ::System; store::AbstractW
             return Dict{Symbol, Any}(:error => "Queue not found")
         end
 
-        pending_tasks = [task.id for task in get_all_tasks(store, System(); status=PENDING, queue_name=String(queue_name))]
+        pending_tasks = [task.id for task in get_all_tasks(runtime, System(); status=PENDING, queue_name=String(queue_name))]
         processing = queue.current_task !== nothing
         return Dict{Symbol, Any}(
             :queue_name => String(queue_name),
@@ -728,12 +745,12 @@ function get_queue_status(queue_name::AbstractString, ::System; store::AbstractW
     end
 end
 
-function get_queue_status(ctx::App, queue_name::AbstractString, authority::System; key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
-    return get_queue_status(queue_name, authority; store=_resolve_store(ctx; key, store))
+function get_queue_status(ctx::App, queue_name::AbstractString, authority::System; key::Symbol=DEFAULT_EXTENSION_KEY, runtime::Union{Nothing, WorkerRuntime}=nothing)
+    return get_queue_status(queue_name, authority; runtime=_resolve_runtime(ctx; key, runtime))
 end
 
-function start_cleanup_scheduler(; interval_hours::Real=24, retain_days::Int=7, store::AbstractWorkerStore=default_store())
-    scheduler_ref = get_cleanup_scheduler(store)
+function start_cleanup_scheduler(; interval_hours::Real=24, retain_days::Int=7, runtime::WorkerRuntime=default_runtime())
+    scheduler_ref = get_cleanup_scheduler(runtime)
     existing = scheduler_ref[]
     if !isnothing(existing) && !istaskdone(existing.task)
         return existing
@@ -755,7 +772,7 @@ function start_cleanup_scheduler(; interval_hours::Real=24, retain_days::Int=7, 
             if wait_result == :ok
                 break
             end
-            cleanup_old_tasks(retain_days; store=store)
+            cleanup_old_tasks(retain_days; runtime=runtime)
         end
     end
 
@@ -764,8 +781,8 @@ function start_cleanup_scheduler(; interval_hours::Real=24, retain_days::Int=7, 
     return scheduler
 end
 
-function start_cleanup_scheduler(ctx::App; interval_hours::Real=24, retain_days::Int=7, key::Symbol=DEFAULT_EXTENSION_KEY, store::Union{Nothing, AbstractWorkerStore}=nothing)
-    return start_cleanup_scheduler(; interval_hours, retain_days, store=_resolve_store(ctx; key, store))
+function start_cleanup_scheduler(ctx::App; interval_hours::Real=24, retain_days::Int=7, key::Symbol=DEFAULT_EXTENSION_KEY, runtime::Union{Nothing, WorkerRuntime}=nothing)
+    return start_cleanup_scheduler(; interval_hours, retain_days, runtime=_resolve_runtime(ctx; key, runtime))
 end
 
 function stop_cleanup_scheduler!(scheduler::CleanupScheduler)
@@ -773,14 +790,14 @@ function stop_cleanup_scheduler!(scheduler::CleanupScheduler)
     # `Channel(1)` that already holds the token blocks the next `put!` forever, and the
     # `isopen && !isready` guard is a check-then-act that two concurrent teardowns can both pass.
     # That race was previously hard to reach; `shutdown!` is now called for every backend, from
-    # both `uninstall!` and `reset_store!`, so it is not. Closing is idempotent and needs no guard.
+    # both `uninstall!` and `reset_runtime!`, so it is not. Closing is idempotent and needs no guard.
     close(scheduler.stop_signal)
     wait(scheduler.task)
     return nothing
 end
 
-function stop_cleanup_scheduler!(store::AbstractWorkerStore=default_store())
-    scheduler_ref = get_cleanup_scheduler(store)
+function stop_cleanup_scheduler!(runtime::WorkerRuntime=default_runtime())
+    scheduler_ref = get_cleanup_scheduler(runtime)
     scheduler = scheduler_ref[]
     if !isnothing(scheduler)
         stop_cleanup_scheduler!(scheduler)
