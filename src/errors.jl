@@ -180,6 +180,63 @@ struct StoreInterfaceError <: Exception
     store_type::Type
 end
 
+"""
+    implements_contract_method(f, S::Type, abstract_store_type::Type, store_index::Int) -> Bool
+
+Whether `S` itself contributed a method of `f` — that is, a method whose store-position parameter
+is something narrower than `abstract_store_type` and that `S` satisfies.
+
+This is what both store contracts use to answer "did this backend implement the method", and it
+deliberately asks about *presence*, not about signature compatibility. Checking the exact call
+signature instead sounds stricter and is worse: a contract method is written
+`(::MyStore{K,V}, ::K, ::V)` as often as `(::MyStore, ::String, ::Any)`, and a probe pinned to
+either shape reports the other as missing.
+
+`store_index` is 1-based over the *arguments*, so it is 2 for a callback-first method such as
+`lock_tasks(callback, store)`.
+"""
+function implements_contract_method(f::Function, S::Type, abstract_store_type::Type, store_index::Int)
+    for m in methods(f)
+        params = Base.unwrap_unionall(m.sig).parameters
+        length(params) >= store_index + 1 || continue
+        # Re-apply the method's `where` clause before testing. A method written
+        # `(::MemoryStore{K,V}, ::K, ::V) where {K,V}` has FREE type variables in its unwrapped
+        # store parameter, and `MemoryStore{String,Dict} <: MemoryStore{K,V}` is not true of a
+        # free `K`/`V` -- so an unwrapped test reports every parametric backend as missing.
+        P = Base.rewrap_unionall(params[store_index + 1], m.sig)
+        P isa Type || continue
+        P === abstract_store_type && continue
+        S <: P && return true
+    end
+    return false
+end
+
+"""
+    store_contract_error(f, abstract_store_type, store_index, args...)
+
+Decide, at the moment a contract fallback is reached, whether this is a missing backend method or
+a caller-side mistake — and raise the honest one.
+
+A fallback is defined on the abstract store type with every other parameter left at `Any`. That
+width is required: a fallback pinned to the contract's exact argument types is *ambiguous* with a
+backend that types one of its own parameters more loosely (`::AbstractString` where the contract
+says `::String` — which is how Nitro's own public API is written), and Julia may then resolve the
+call to the fallback instead of to the store's method. Ambiguity is a far worse failure than an
+imprecise error message.
+
+The cost of that width is that the fallback also catches a caller who passed the wrong positional
+type to a perfectly conforming store. Hence this check: if the store's type contributed a method
+of its own, the arguments are what did not match, so an ordinary `MethodError` carrying the real
+arguments is raised. Only a store that implemented nothing gets `StoreInterfaceError`.
+"""
+@noinline function store_contract_error(f::Function, abstract_store_type::Type, store_index::Int, args...)
+    store = args[store_index]
+    if implements_contract_method(f, typeof(store), abstract_store_type, store_index)
+        throw(MethodError(f, args))
+    end
+    throw(StoreInterfaceError(f, typeof(store)))
+end
+
 function Base.showerror(io::IO, e::StoreInterfaceError)
     name = nameof(e.f)
     println(io, "StoreInterfaceError: `", e.store_type, "` does not implement `", name,

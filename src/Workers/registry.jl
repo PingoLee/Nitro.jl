@@ -352,10 +352,14 @@ Two consumers read it and must not drift apart — the fallback methods generate
 [`missing_store_methods`](@ref). Adding a method to the contract means adding a row here; nothing
 else.
 
-The types are the ones the framework actually calls with, deliberately not widened supertypes. A
-fallback typed at `args...` would also catch a caller who passed the wrong positional type and
-misreport that as an unimplemented backend method. Typed exactly, a mismatched call still raises an
-ordinary `MethodError`, which is what it is.
+The types here document the contract and fix each method's **arity** and store position; the
+generated fallbacks widen every non-store parameter to `Any`. That widening is not laziness. A
+fallback pinned to these exact types is *ambiguous* with a backend that types one of its own
+parameters more loosely — `(::MyStore, ::AbstractString)` against a contract that says `::String`,
+which is how Nitro's own public API is written — and Julia may then resolve the call to the
+fallback rather than to the store's method. The imprecision that widening costs is bought back at
+runtime by `store_contract_error`, which tells a missing backend method apart from a caller who
+passed the wrong argument.
 """
 const WORKER_STORE_INTERFACE = (
     # -- Durable task records --
@@ -392,26 +396,22 @@ const WORKER_STORE_INTERFACE = (
 
 _store_arg_index(argtypes) = something(findfirst(T -> T === AbstractWorkerStore, argtypes))
 
-# Generate one fallback per row. These are the only methods in the package defined *on* the abstract
-# type, which is also how `missing_store_methods` recognizes them: a conforming backend's method is
-# narrower in the store slot, so it always wins dispatch and the fallback is never reached.
+# Generate one fallback per row: the store slot typed at the abstract type, every other parameter
+# widened to `Any` so a backend's own method is strictly more specific in every slot and can never
+# be ambiguous with this one. See `store_contract_error` for why the width is required and how the
+# precision is recovered.
 #
-# `kwargs...` is accepted and ignored on purpose. It never swallows a keyword mistake, because a
-# store that defines the method at all is more specific on the positional arguments and so is the
-# one that gets to reject the keyword.
+# `kwargs...` is accepted and ignored on purpose. It never swallows a keyword mistake: a store that
+# defines the method at all is more specific on the positional arguments, so it is the one that
+# gets to reject the keyword.
 for (f, argtypes) in WORKER_STORE_INTERFACE
     local idx = _store_arg_index(argtypes)
-    local params = [Expr(:(::), Symbol("a", i), T) for (i, T) in enumerate(argtypes)]
-    local store_arg = Symbol("a", idx)
+    local names = [Symbol("a", i) for i in eachindex(argtypes)]
+    local params = [i == idx ? Expr(:(::), names[i], AbstractWorkerStore) : names[i]
+                    for i in eachindex(argtypes)]
     @eval @noinline function $(nameof(f))($(params...); kwargs...)
-        throw(StoreInterfaceError($f, typeof($store_arg)))
+        store_contract_error($f, AbstractWorkerStore, $idx, $(names...))
     end
-end
-
-function _is_contract_fallback(m::Method, store_index::Int)
-    sig = Base.unwrap_unionall(m.sig).parameters
-    # sig[1] is the function's own type, so positional argument `i` sits at `sig[i + 1]`.
-    return length(sig) >= store_index + 1 && sig[store_index + 1] === AbstractWorkerStore
 end
 
 """
@@ -427,20 +427,17 @@ purpose, so it ships with the package and costs a third-party store nothing to c
 @test isempty(missing_store_methods(MyWorkerStore))
 ```
 
-A name appears here when dispatch for `S` lands on the fallback defined on the abstract type — that
-is, when `S` itself contributed nothing. Note that it answers about a *type*, so it can be run at
-load time, in a test, or in a REPL, without constructing a store.
+A name appears here when `S` contributed no method of its own for it. It answers about a *type*, so
+it runs at load time, in a test, or in a REPL, without constructing a store.
+
+It asks about presence, not signature compatibility — see `implements_contract_method` for why
+checking the exact call signature is the less useful question.
 """
 function missing_store_methods(S::Type{<:AbstractWorkerStore})
     names = Symbol[]
     for (f, argtypes) in WORKER_STORE_INTERFACE
         idx = _store_arg_index(argtypes)
-        concrete = Any[argtypes...]
-        concrete[idx] = S
-        sig = Tuple{concrete...}
-        if !hasmethod(f, sig)
-            push!(names, nameof(f))
-        elseif _is_contract_fallback(which(f, sig), idx)
+        if !implements_contract_method(f, S, AbstractWorkerStore, idx)
             push!(names, nameof(f))
         end
     end

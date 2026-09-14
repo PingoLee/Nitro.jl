@@ -14,6 +14,14 @@ end
 # `@testset` body would still work, but this one is referenced from two testsets.
 struct NothingWorkerStore <: AbstractWorkerStore end
 
+# Types its task id more loosely than the contract does, which is legal and common.
+struct WideStore <: AbstractWorkerStore end
+Nitro.Workers.get_task_info(::WideStore, ::AbstractString) = "wide"
+
+# Implements only the one contract method whose store argument is not first.
+struct OnlyLockStore <: AbstractWorkerStore end
+Nitro.Workers.lock_tasks(callback::Function, ::OnlyLockStore) = callback()
+
 @testset "Worker store contract is discoverable and loud" begin
     # The shipped backend conforms. This is the assertion a third-party store copies.
     @test isempty(missing_store_methods(InMemoryWorkerStore))
@@ -38,9 +46,10 @@ struct NothingWorkerStore <: AbstractWorkerStore end
     @test occursin("get_task_info", rendered)
     @test occursin("NothingWorkerStore", rendered)
 
-    # The fallbacks are typed at the contract's documented argument types rather than `args...`,
-    # precisely so a CALLER-side mistake is not mislabelled as a missing backend method. Against a
-    # fully conforming store, a wrong positional type must still be an ordinary `MethodError`.
+    # A CALLER-side mistake must not be mislabelled as a missing backend method. The fallbacks
+    # widen every non-store parameter to `Any` (see below for why), so they do catch these calls;
+    # `store_contract_error` is what tells the two apart, by asking whether the store's own type
+    # contributed a method at all.
     store = InMemoryWorkerStore()
     @test_throws MethodError get_task_info(store, 42)
     @test_throws MethodError cleanup_tasks!(store, "not-a-day-count")
@@ -50,6 +59,27 @@ struct NothingWorkerStore <: AbstractWorkerStore end
     # This is the guarantee `try_transition!`'s docstring makes about stale third-party stores.
     @test_throws MethodError try_transition!(store, "task-1", (PENDING,), RUNNING;
                                              run_id=nothing, no_such_keyword=1)
+end
+
+@testset "Contract fallbacks never shadow a backend that types its arguments differently" begin
+    # The fallbacks CANNOT be pinned to the contract's exact argument types. `(WideStore,
+    # AbstractString)` and `(AbstractWorkerStore, String)` are mutually ambiguous -- neither is
+    # more specific -- so an exact-typed fallback can win the call and the store's own method
+    # never runs. `::AbstractString` is not a contrived choice either: Nitro's own
+    # `submit_task`/`submit_sequential_task` are written that way.
+    @test get_task_info(WideStore(), "id") == "wide"
+    @test !(:get_task_info in missing_store_methods(WideStore))
+
+    # ...and the same for a backend parameterized over its own types, whose method signature
+    # carries a `where` clause. Testing it without re-applying that clause makes every parametric
+    # store look unimplemented -- which is how `MemoryStore` briefly reported itself broken.
+    @test isempty(Nitro.Types.missing_session_methods(Nitro.Types.MemoryStore{String, Dict{String,Any}}))
+
+    # The callback-first row is the one whose store is not the first argument, so a detector that
+    # assumed position 1 would mis-handle exactly this method and nothing else.
+    @test !(:lock_tasks in missing_store_methods(OnlyLockStore))
+    @test length(missing_store_methods(OnlyLockStore)) ==
+          length(Nitro.Workers.WORKER_STORE_INTERFACE) - 1
 end
 
 @testset "shutdown! releases the scheduler, the queues and the active handles" begin

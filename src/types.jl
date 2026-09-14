@@ -10,7 +10,7 @@ using Dates
 using Base: @kwdef
 using DataStructures: CircularDeque
 using ..Util
-using ..Errors: ValidationError, StoreInterfaceError
+using ..Errors: ValidationError, StoreInterfaceError, implements_contract_method, store_contract_error
 
 export Server, Nullable, Context,
     LifecycleMiddleware, startup, shutdown,
@@ -144,52 +144,29 @@ function get_session(store::AbstractSessionStore{K, V}, session_id::K) where {K,
 end
 
 # Required-method fallbacks. `Base.get` is not piracy: the store argument is our own type.
+#
+# Every non-store parameter is left untyped so a backend's own method is strictly more specific in
+# every slot and can never be ambiguous with these. `store_contract_error` then separates "this
+# backend implemented nothing" from "the caller passed the wrong arguments to a conforming store".
 @noinline Base.get(store::AbstractSessionStore, session_id, default) =
-    throw(StoreInterfaceError(Base.get, typeof(store)))
+    store_contract_error(Base.get, AbstractSessionStore, 1, store, session_id, default)
 
 @noinline function set_session!(store::AbstractSessionStore, session_id, data; ttl::Int = 3600)
-    throw(StoreInterfaceError(set_session!, typeof(store)))
+    store_contract_error(set_session!, AbstractSessionStore, 1, store, session_id, data)
 end
 
 @noinline function delete_session!(store::AbstractSessionStore, session_id)
-    throw(StoreInterfaceError(delete_session!, typeof(store)))
+    store_contract_error(delete_session!, AbstractSessionStore, 1, store, session_id)
 end
 
 """
     SESSION_STORE_INTERFACE
 
 The *required* half of the [`AbstractSessionStore`](@ref) contract as data, read by
-[`missing_session_methods`](@ref). Each row is the function plus the argument types that follow the
-store, written against the store's own type parameters: `:K` is the session-id type, `:V` the
-payload type.
-
-Those placeholders are the point. A probe hard-coded at `Any` reports a perfectly conforming
-`MemoryStore{String, Dict{String,Any}}` as missing `set_session!`, because its method is typed
-`(::MemoryStore{K,V}, ::K, ::V)` and `Any` does not match `K`.
-
-`cleanup_expired_sessions!` is absent on purpose — it is optional, and its default is the no-op
-below.
+[`missing_session_methods`](@ref) and by the fallbacks above. `cleanup_expired_sessions!` is absent
+on purpose — it is optional, and its default is the no-op below.
 """
-const SESSION_STORE_INTERFACE = (
-    (Base.get,        (:K, :Any)),
-    (set_session!,    (:K, :V)),
-    (delete_session!, (:K,)),
-)
-
-# The `AbstractSessionStore{K, V}` parameters `S` was instantiated with, or `(Any, Any)` when `S`
-# left them free.
-function _session_kv(S::Type)
-    T = Base.unwrap_unionall(S)
-    while T isa DataType
-        if T.name.wrapper === AbstractSessionStore
-            K, V = T.parameters[1], T.parameters[2]
-            return (K isa Type ? K : Any, V isa Type ? V : Any)
-        end
-        T === Any && break
-        T = supertype(T)
-    end
-    return (Any, Any)
-end
+const SESSION_STORE_INTERFACE = (Base.get, set_session!, delete_session!)
 
 """
     cleanup_expired_sessions!(store::AbstractSessionStore)
@@ -218,17 +195,9 @@ conforming. `cleanup_expired_sessions!` is never reported: it is optional.
 ```
 """
 function missing_session_methods(S::Type{<:AbstractSessionStore})
-    K, V = _session_kv(S)
     names = Symbol[]
-    for (f, argspec) in SESSION_STORE_INTERFACE
-        args = Any[p === :K ? K : p === :V ? V : Any for p in argspec]
-        sig = Tuple{S, args...}
-        if !hasmethod(f, sig)
-            push!(names, nameof(f))
-            continue
-        end
-        params = Base.unwrap_unionall(which(f, sig).sig).parameters
-        if length(params) >= 2 && params[2] === AbstractSessionStore
+    for f in SESSION_STORE_INTERFACE
+        if !implements_contract_method(f, S, AbstractSessionStore, 1)
             push!(names, nameof(f))
         end
     end

@@ -8,6 +8,7 @@ import Base.Threads: ReentrantLock, lock
 using ..Core: App, LifecycleMiddleware
 using ..Core.AppContext: set_extension!, get_extension, delete_extension!
 using ..Core: AuthorizationError, StoreInterfaceError
+using ..Core.Errors: implements_contract_method, store_contract_error
 
 const DEFAULT_EXTENSION_KEY = :workers
 
