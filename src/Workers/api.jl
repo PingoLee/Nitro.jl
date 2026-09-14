@@ -257,18 +257,18 @@ function _register_or_watch!(runtime::WorkerRuntime, task_key::String, owner::Ow
                              grants::AbstractVector{Owner}=Owner[])
     uid = owner.user_id
     return lock_tasks(runtime) do
-        task_info = get_task_info(runtime, task_key)
+        # The DURABLE read, not the live-preferring one, by the rule in `get_task_info`: this is
+        # a CLAIMING call -- it decides whether to build a new run and replace the record. It
+        # consults only `status` and `watchers`, both of which the row carries authoritatively,
+        # since `add_watcher!` writes the row first.
+        task_info = get_task_info(runtime.store, task_key)
 
         # Gates both branches below: joining a live task grants the caller the
         # owner's read/cancel rights, and replacing a finished one destroys the
         # owner's stored result. `copy` keeps an app callback off the live list.
-        if task_info !== nothing && !_is_authorized(owner, task_info)
-            # Same staleness trap as the read paths: a cached record can lack a grant
-            # another process issued, which would send an already-authorized watcher to
-            # the authorizer and have it refused.
-            durable = get_task_info(runtime.store, task_key)
-            durable !== nothing && (task_info = durable)
-        end
+        #
+        # There is no stale-cache re-read here, unlike the read paths: the record above already
+        # IS the durable one, so a second read could only return the same answer.
 
         if task_info !== nothing && !_is_authorized(owner, task_info)
             if !_watch_allowed(runtime.store, task_key, copy(task_info.watchers), uid)
@@ -319,7 +319,9 @@ function _register_or_watch!(runtime::WorkerRuntime, task_key::String, owner::Ow
         for grant in grants
             grant.user_id in task_info.watchers || push!(task_info.watchers, grant.user_id)
         end
-        replace_task!(runtime.store, task_key, task_info)
+        # Through the RUNTIME: publishing a successor also evicts the run it displaced from
+        # the live caches, so nothing later reads a run that no longer owns this key.
+        replace_task!(runtime, task_key, task_info)
         return true
     end
 end

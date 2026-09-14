@@ -320,6 +320,75 @@ end
     @test haskey(keeper.rows, "kept")
 end
 
+@testset "publishing a successor evicts the run it displaced from the live caches (#167)" begin
+    # The live caches are keyed by task id but each entry describes one RUN, and `replace_task!`
+    # is the moment a run stops owning its key. Leaving the predecessor behind opens a window
+    # between that write and the successor's `register_active_task_info!` in which every reader
+    # sees a run that no longer owns the record -- usually a terminal one. `cancel_task` then
+    # refuses to cancel a live successor, `get_task_status` reports it finished, and a concurrent
+    # submit replaces the record again instead of deduplicating onto it.
+    store = InMemoryWorkerStore()
+    rt_store = WorkerRuntime(store)
+    owner = Owner("user-displaced")
+    key = scoped_task_key("displaced", owner)
+
+    try
+        predecessor = TaskInfo(key)
+        predecessor.status = CANCELLED
+        push!(predecessor.watchers, owner.user_id)
+        replace_task!(store, key, predecessor)
+        handle = @async nothing
+        register_active_task_info!(rt_store, key, predecessor)
+        register_active_task!(rt_store, key, handle)
+
+        successor = TaskInfo(key)
+        successor.status = PENDING
+        push!(successor.watchers, owner.user_id)
+        @test successor.run_id != predecessor.run_id
+
+        # Through the RUNTIME -- the path `_register_or_watch!` takes.
+        replace_task!(rt_store, key, successor)
+
+        # Both caches, together: `_deregister_run!` assumes they agree about which run owns the
+        # key, so a half-eviction would strand the handle until the successor finished.
+        @test get_active_task_info(rt_store, key) === nothing
+        @test get_active_task(rt_store, key) === nothing
+
+        # Every reader now sees the run that actually owns the record.
+        @test get_task_info(rt_store, key).run_id == successor.run_id
+        @test get_task_status(key, owner; runtime=rt_store)[:status] == "PENDING"
+        @test cancel_task(key, owner; runtime=rt_store)[:status] == "Task cancelled"
+        @test get_task_info(store, key).status == CANCELLED
+
+        wait(handle)
+    finally
+        reset_runtime!(rt_store)
+    end
+end
+
+@testset "a re-submit deduplicates onto a pending successor rather than replacing it (#167)" begin
+    # The claiming half of the same rule: `_register_or_watch!` reads the STORE, because it
+    # decides whether to build a new run, and it consults only `status` and `watchers` -- which
+    # the row carries authoritatively. `false` means "watch the run that already exists", which
+    # is the whole point of deduplicating on a task key.
+    store = InMemoryWorkerStore()
+    rt_store = WorkerRuntime(store)
+    owner = Owner("user-window")
+    key = scoped_task_key("windowed", owner)
+
+    try
+        successor = TaskInfo(key)
+        successor.status = PENDING
+        push!(successor.watchers, owner.user_id)
+        replace_task!(store, key, successor)
+
+        @test Nitro.Workers._register_or_watch!(rt_store, key, owner) == false
+        @test get_task_info(store, key).run_id == successor.run_id
+    finally
+        reset_runtime!(rt_store)
+    end
+end
+
 @testset "one store can back several runtimes (#167)" begin
     # Inexpressible before the split: the queues and the scheduler were fields ON the store, so
     # two apps sharing a backend shared one set of processors and either one's `uninstall!` shut

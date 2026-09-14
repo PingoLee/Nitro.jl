@@ -201,6 +201,44 @@ function get_all_tasks(runtime::WorkerRuntime, authority::TaskAuthority;
 end
 
 """
+    replace_task!(runtime::WorkerRuntime, task_id::String, task_info::TaskInfo)
+
+Publish a new run's whole record, and evict the run it displaced from the live caches.
+
+The eviction is what keeps `get_task_info(runtime, ·)` honest. The live caches are keyed by task
+id, but each entry describes one **run** — and `replace_task!` is precisely the moment a run stops
+owning its key. Leaving the predecessor behind opens a window between this write and the
+successor's `register_active_task_info!` in which the live slot holds a run that no longer owns the
+record, usually a terminal one: a concurrent `cancel_task` then refuses to cancel a live successor
+("already finished"), a concurrent submit concludes the key is finished and replaces the record
+again, and `get_task_status` reports the predecessor's terminal status for a task that is pending.
+
+This is the mirror image of [`_deregister_run!`](@ref)'s fence, not a contradiction of it. There, a
+*predecessor* must not tear down a *successor*'s handles; here a successor displaces a predecessor,
+which is safe because the store has already been told the successor owns the key. Both rules say
+the same thing: the live entry belongs to whichever run currently owns the record.
+
+The predecessor's cancellation token is set by the caller *before* this runs, and its callback
+holds its own reference to the object, so evicting the cache entry does not lose the request.
+"""
+function replace_task!(runtime::WorkerRuntime, task_id::String, task_info::TaskInfo)
+    replace_task!(runtime.store, task_id, task_info)
+
+    lock(runtime.active_lock) do
+        live = Base.get(runtime.active_task_infos, task_id, nothing)
+        if live !== nothing && live.run_id != task_info.run_id
+            # Both, together: `_deregister_run!` assumes the two caches agree about which run
+            # owns the key, and a half-evicted pair would strand the handle until the successor
+            # finished.
+            delete!(runtime.active_task_infos, task_id)
+            delete!(runtime.active_tasks, task_id)
+        end
+    end
+
+    return task_info
+end
+
+"""
     add_watcher!(runtime::WorkerRuntime, task_id::String, user_id::String) -> Bool
 
 Grant through the store, then mirror onto the live object if a run is executing here.
