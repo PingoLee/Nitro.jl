@@ -69,7 +69,7 @@ export  # The application handle
         regenerate_session!, SecretString, reveal,
         # Middleware
         BearerAuth, CookieAuthMiddleware, Cors, RateLimiter, ExtractIP, extract_ip,
-        SessionMiddleware, GuardMiddleware, login_required, role_required, permission_required,
+        SessionMiddleware, SessionPruner, GuardMiddleware, login_required, role_required, permission_required,
         claim_required, kid_required, Principal, CSRFMiddleware,
         AccessLog, AccessRecord,
         # Optional app extensions

@@ -126,7 +126,19 @@ serve(middleware = [TraceRequests])
 
 To take options, write a **factory** — a function whose *return value* is the middleware above.
 This is the shape every middleware Nitro ships uses (`SessionMiddleware()`, `RateLimiter()`,
-`ExtractIP()`), which is why they appear **called** in a middleware list:
+`ExtractIP()`), which is why they appear **called** in a middleware list.
+
+Several of them (`RateLimiter`, `AccessLog`, `SessionMiddleware`, `SessionPruner`) go one step
+further and wrap that function in a `LifecycleMiddleware`, so they can own a background
+task that starts with `serve()` and stops with `terminate()`. A middleware list accepts either
+form. Only code that composes a middleware **by hand** has to care: the request function is then
+the `.middleware` field, not the value itself.
+
+```julia
+serve(middleware = [SessionMiddleware(store = store)])          # either form works here
+wrapped = SessionMiddleware(store = store).middleware(handler)  # composing by hand
+```
+
 
 ```julia
 function RequireApiKey(; header::String = "X-Api-Key", key::String)

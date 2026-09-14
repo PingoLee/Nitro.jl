@@ -140,6 +140,25 @@ refuses a payload whose expiry has passed — so a store that never prunes accum
 rows but never serves a stale session. Implement it for any store whose rows outlive the
 process.
 
+`SessionMiddleware` calls it from a **background janitor**, not from the request path: the
+janitor starts on `serve()`, stops on `terminate()`, and ticks every `prune_interval`
+(default 10 minutes).
+
+```julia
+SessionMiddleware(store = store, prune_interval = Minute(5))
+```
+
+If you reach sessions *without* `SessionMiddleware` — the `Session{T}` extractor reads the
+store straight off the app context — add [`SessionPruner`](@ref) instead, or the store
+grows for the life of the process:
+
+```julia
+serve(middleware = [SessionPruner(store; interval = Minute(5))], context = store)
+```
+
+Your implementation runs on a background task, so keep it safe to call concurrently with
+reads and writes, and keep the work it does under any lock bounded.
+
 Omitting a required method raises `StoreInterfaceError`, which names the method and your
 store type, rather than a bare `MethodError` from somewhere inside the middleware. Check a
 store against the whole contract with `missing_session_methods`, which takes the type and

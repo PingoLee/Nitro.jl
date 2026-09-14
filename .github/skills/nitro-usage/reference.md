@@ -204,7 +204,7 @@ SessionMiddleware(; cookie_name      = "nitro_session",
                     secret_key       = nothing,
                     max_age::Int     = 86400,
                     store            = DEFAULT_STORE,
-                    prune_probability= 0.01,
+                    prune_interval   = Minute(10),   # background janitor period (#36)
                     secure           = true,
                     httponly         = true,
                     samesite         = "Lax",
@@ -212,6 +212,16 @@ SessionMiddleware(; cookie_name      = "nitro_session",
                     domain           = nothing,
                     rotate_on_auth   = true,
                     auth_key         = "user_id")
+# Returns a LifecycleMiddleware, not a bare function: expired sessions are pruned by a
+# background janitor that starts on serve() and stops on terminate(). A middleware list
+# accepts it as-is; only hand-composition needs `.middleware`:
+#     SessionMiddleware(store=store).middleware(handler)
+# `prune_probability` was REMOVED -- pruning no longer runs on the request path.
+# `prune_interval` must be a fixed-length Period; Month/Quarter/Year are an ArgumentError.
+
+SessionPruner(store; interval = Minute(10))
+# Janitor only, pass-through middleware. For apps that reach sessions through the Session{T}
+# extractor without installing SessionMiddleware -- that path never prunes on its own.
 
 GuardMiddleware(guards::Function...)
 

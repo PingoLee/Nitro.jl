@@ -154,6 +154,16 @@ cleanup_expired_sessions!(store::S)
 delegate to `set_session!` and `cleanup_expired_sessions!` by default. Implementing the
 four methods above is enough for custom backends.
 
+`cleanup_expired_sessions!` is called from a background janitor owned by
+`SessionMiddleware`'s lifecycle hooks — it never runs on the request path. Use
+`prune_interval` to set its period, and `SessionPruner(store; interval)` when you use a
+store without `SessionMiddleware`:
+
+```julia
+SessionMiddleware(store = store, prune_interval = Minute(5))   # janitor included
+SessionPruner(store; interval = Minute(5))                     # janitor only
+```
+
 ## Logout Semantics
 
 With `SessionMiddleware`, `empty!(getsession(req))` only clears the current payload. To retire the old authenticated session ID, pair it with `regenerate_session!`.

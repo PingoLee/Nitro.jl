@@ -381,6 +381,33 @@ serve(middleware = [
 ])
 ```
 
+#### Which addresses share a bucket
+
+The limiter keys its buckets on a **network prefix** of the client address, not on the address
+itself. The defaults are `/32` for IPv4 — one bucket per host, i.e. no grouping — and **`/64` for
+IPv6**:
+
+```julia
+RateLimiter(rate_limit = 100, window = Minute(1),
+            ipv4_prefix = 32,   # default
+            ipv6_prefix = 64)   # default
+```
+
+IPv6 is grouped because a single host is normally handed an entire `/64` — 2^64 addresses it can
+pick from freely. Keying on the full `/128` means a client sends every request from a different
+source address inside *its own* allocation, lands in a brand-new bucket each time, and is never
+limited, while the `X-RateLimit-*` headers keep reporting that limiting is in effect. Grouping the
+allocation into one bucket is what makes the limit apply at all. `django-ratelimit` and HAProxy
+default to this same `32`/`64` pair.
+
+Widen `ipv6_prefix` if your clients are larger than a `/64` — a hosting customer may hold a whole
+`/48`, which is why Let's Encrypt rate-limits at that size — and narrow it only if you know your
+addressing. `/0` is rejected for either family: it puts every client on the internet into one
+shared bucket while still looking per-client.
+
+An IPv4-mapped IPv6 peer (`::ffff:203.0.113.7`) is folded onto its IPv4 form first, so it shares a
+bucket with the plain spelling rather than opening a second one.
+
 ### Auditing: the socket peer is preserved
 
 `ExtractIP` records the address that actually connected before it overwrites the client IP:

@@ -498,3 +498,48 @@ end
     @test length(lifecycle_snapshot(ctx)[1]) == 2
 end
 end # @testitem
+
+
+@testitem "SessionMiddleware — serve()/terminate() own the prune janitor" tags=[:middleware, :network, :slow] setup=[NitroCommon] begin
+using Test
+using Dates
+using Nitro
+using Nitro.Types: MemoryStore
+
+# The unit tests in test/session_tests.jl drive `on_startup`/`on_shutdown` directly, which
+# proves the janitor works but NOT that anything calls it. This is the wiring test: pruning
+# only actually happens in a real app if `serve()` runs the startup hook of the
+# `LifecycleMiddleware` that `SessionMiddleware` now returns (#36). Against the previous
+# bare-closure version there is no hook to run at all.
+
+store = MemoryStore{String, Dict{String,Any}}()
+for i in 1:20
+    Nitro.Cookies.storesession!(store, "dead-$i", Dict{String,Any}("i" => i), ttl=1)
+end
+Nitro.Cookies.storesession!(store, "live", Dict{String,Any}("i" => 0), ttl=3600)
+sleep(1.2)                       # let the 20 short-TTL entries expire
+@test length(store.data) == 21   # nothing has pruned them yet
+
+port = get_free_port()
+app = App(mod = @__MODULE__)
+urlpatterns(app, "", Nitro.RouteDefinition[path("/ping", (req) -> "pong", method="GET")])
+
+serve(app;
+      middleware = [SessionMiddleware(store = store, prune_interval = Millisecond(100),
+                                      secure = false)],
+      port = port, host = HOST, async = true,
+      show_banner = false, show_errors = false, access_log = nothing)
+try
+    # serve() must have started the janitor.
+    @test timedwait(() -> length(store.data) == 1, 10.0) === :ok
+    @test haskey(store.data, "live")      # unexpired sessions are never touched
+finally
+    terminate(app)
+end
+sleep(0.5)
+
+# ...and terminate() must have stopped it: a newly expired entry is NOT reaped.
+Nitro.Cookies.storesession!(store, "post", Dict{String,Any}("i" => 9), ttl=1)
+sleep(1.6)
+@test haskey(store.data, "post")
+end # @testitem
