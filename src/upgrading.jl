@@ -31,8 +31,62 @@ const _UpgradeEntry = @NamedTuple{version::VersionNumber, title::String, body::S
 # guide. Both forms the cut writes carry the separator, so requiring it costs nothing.
 const _RELEASE_MARKER = r"^(?:Unreleased|\d+\.\d+\.\d+)\s+—"
 
+# The bullets a change entry writes at column 0. A block carrying any of them is *claiming to be an
+# entry*, and that claim is what separates a malformed entry — worth reporting, because otherwise it
+# vanishes from `upgrade_guide` without a trace — from legitimate non-entry prose: the file header,
+# the `## Writing an entry` recipe, a bare `## Unreleased` marker with nothing cut under it yet.
+#
+# Structural, not positional, on purpose. "Everything above the first `---` is preamble" also
+# describes today's file, but it is a fact about layout rather than content: it cannot be exercised
+# on the single-block texts this parser's own tests hand it, it would warn forever on any prose
+# section added elsewhere in the file, and `_parse_upgrading` is documented as parsing hand-fed text,
+# so it has no business acquiring a notion of position within a file.
+#
+# The recipe in the header survives this because it writes its example indented AND inside backticks,
+# so the anchored `^-` never matches it. `test/upgrade_guide_tests.jl` pins that, so a reformat fails
+# loudly there instead of spraying a warning at every consuming app.
+const _ENTRY_BULLET = r"(?m)^-[ \t]+\*\*(?:Version|Recorded|Severity|Nitro ref)\*\*:"
+
+const _WHY_NO_RECORDED = "missing its `- **Recorded**:` bullet"
+const _WHY_NO_HEADING  = "entry bullets under no `## ` heading of its own"
+const _WHY_SWALLOWED   = "missing its own trailing `---`, so it was absorbed into the entry above"
+
+# `title` is the entry that failed to reach the guide, empty when the block had no heading to name
+# it with. `near` is where to go looking: the block's first non-blank line when there is no title,
+# or the title of the entry that swallowed this one.
+const _UpgradeProblem = @NamedTuple{title::String, near::String, reason::String}
+
+# First non-blank line of a block, truncated — locates a problem block that has no heading to name.
+function _first_line(block::AbstractString, width::Int = 60)
+    for ln in eachsplit(block, '\n')
+        s = strip(ln)
+        isempty(s) || return String(first(s, width))
+    end
+    return ""
+end
+
+# One line per problem for the warning's `missing_entries` field.
+function _describe(p::_UpgradeProblem)
+    isempty(p.title) && return "(no heading, near \"$(p.near)\") — $(p.reason)"
+    isempty(p.near)  && return "$(p.title) — $(p.reason)"
+    return "$(p.title) — $(p.reason): \"$(p.near)\""
+end
+
 _asver(v::VersionNumber) = v
 _asver(v::AbstractString) = VersionNumber(v)
+
+"""
+    _upgrading_path() -> String
+
+Absolute path to the `UPGRADING.md` bundled with the resolved Nitro install. Split out so the test
+suite reads the same file the parser does, instead of recomputing the join and drifting from it.
+"""
+function _upgrading_path()
+    path = joinpath(Base.pkgdir(@__MODULE__), "UPGRADING.md")
+    isfile(path) || throw(ArgumentError(
+        "UPGRADING.md not found next to the installed Nitro (looked in $(dirname(path)))."))
+    return path
+end
 
 """
     _read_upgrading_entries() -> Vector{_UpgradeEntry}
@@ -40,24 +94,26 @@ _asver(v::AbstractString) = VersionNumber(v)
 Parse the `UPGRADING.md` bundled with the resolved Nitro install into change entries, newest-first.
 """
 function _read_upgrading_entries()
-    path = joinpath(Base.pkgdir(@__MODULE__), "UPGRADING.md")
-    isfile(path) || throw(ArgumentError(
-        "UPGRADING.md not found next to the installed Nitro (looked in $(dirname(path)))."))
-    return _parse_upgrading(read(path, String))
+    path = _upgrading_path()
+    return _parse_upgrading(read(path, String); source = path)
 end
 
 """
-    _parse_upgrading(text::AbstractString) -> Vector{_UpgradeEntry}
+    _scan_upgrading(text::AbstractString) -> (; entries, problems)
 
-Parse raw `UPGRADING.md` text into change entries, newest-first (see `_read_upgrading_entries`).
-Split out so the parser can be exercised on hand-fed text — the CRLF-robustness case in particular
-— without touching the on-disk file.
+One pass over `UPGRADING.md` text producing both halves: the accepted change entries, and the change
+entries that never reached the guide (`problems`) — a block that looked like an entry and was
+rejected, or an entry absorbed into its neighbour because its trailing `---` is missing.
+
+The diagnostic is built here, in the same branch as the acceptance rule, so the two cannot drift — a
+reason to reject a block and a reason to report it are literally the same condition. `problems` is
+observation only: it never changes which entries come back.
 
 Line endings are normalized to `\\n` up front: a Windows checkout can store `UPGRADING.md` with
 `\\r\\n`, and the `(?m)^---[ \\t]*\$` block separator never matches a `---\\r` line — without this
 the whole file collapses into a single bogus entry and every scoped lookup comes back empty.
 """
-function _parse_upgrading(text::AbstractString)
+function _scan_upgrading(text::AbstractString)
     text = replace(text, "\r\n" => "\n", "\r" => "\n")
 
     # Drop the "## Template for new entries" section: its body is an HTML comment holding a
@@ -65,23 +121,33 @@ function _parse_upgrading(text::AbstractString)
     tmpl = findfirst("## Template for new entries", text)
     tmpl === nothing || (text = text[1:prevind(text, first(tmpl))])
 
-    entries = _UpgradeEntry[]
+    entries  = _UpgradeEntry[]
+    problems = _UpgradeProblem[]
+
     for block in split(text, r"(?m)^---[ \t]*$")
         # A cut writes the release marker (`## 0.1.0 — 2026-07-31`) directly above the first entry
         # of that release with NO `---` between them, so the first `##` in a block is not
         # necessarily the entry's own heading. Take the first non-marker heading instead —
         # otherwise the first entry of every release is titled with the release date and its real
         # title is lost (visible via `structured = true`).
-        title_m = nothing
-        for h in eachmatch(r"(?m)^##[ \t]+(.+)$", block)
-            occursin(_RELEASE_MARKER, strip(h[1])) && continue
-            title_m = h
-            break
-        end
+        heads = [h for h in eachmatch(r"(?m)^##[ \t]+(.+)$", block)
+                 if !occursin(_RELEASE_MARKER, strip(h[1]))]
+        title_m = isempty(heads) ? nothing : first(heads)
 
         # A real change entry has a non-marker `## ` heading AND a `- **Recorded**:` bullet — this
         # rejects the header/recipe prose and any stray section, regardless of `---` placement.
-        (title_m === nothing || !occursin(r"(?m)^-[ \t]+\*\*Recorded\*\*:", block)) && continue
+        if title_m === nothing || !occursin(r"(?m)^-[ \t]+\*\*Recorded\*\*:", block)
+            # #89: this used to be a bare `continue`, which made a MALFORMED entry and an ABSENT
+            # entry indistinguishable — the entry simply stopped existing, in the guide and in
+            # `structured = true`, with nothing said in either direction. Record the blocks that
+            # were *trying* to be entries (`_ENTRY_BULLET`). The acceptance test above is
+            # unchanged; this branch only observes.
+            occursin(_ENTRY_BULLET, block) && push!(problems, (
+                title  = title_m === nothing ? "" : String(strip(title_m[1])),
+                near   = title_m === nothing ? _first_line(block) : "",
+                reason = title_m === nothing ? _WHY_NO_HEADING : _WHY_NO_RECORDED))
+            continue
+        end
 
         ver_m = match(r"(?m)^-[ \t]+\*\*Version\*\*:[ \t]*(\S+)", block)
         version = ver_m === nothing        ? _UNSTAMPED_VERSION  :
@@ -97,9 +163,69 @@ function _parse_upgrading(text::AbstractString)
         push!(entries, (version = version,
                         title = String(strip(title_m[1])),
                         body = String(strip(body))))
+
+        # #89's other half, and the one that actually shipped: at 49f1a23 the `## Unreleased`
+        # section ran #71, #18 and #16 with no `---` between them, so all three parsed as #71 and
+        # the last two vanished. An entry prepended without its trailing `---` lands in THIS block,
+        # so the block still satisfies acceptance above — as its neighbour. The swallowed entry's
+        # prose renders under the wrong title and `structured = true` loses it outright, with
+        # nothing said. (That same block is the missing-`Recorded` case too: #71's header carried
+        # only `- **Version**: Unreleased`, and it survived solely by being glued to its
+        # neighbours' bullets. Both halves of #89 came out of one block.)
+        for (i, h) in Iterators.drop(enumerate(heads), 1)
+            # Only a heading that carries entry bullets of its own is a swallowed *entry*. A `## `
+            # line inside a fenced code block in an entry body is not — an entry showing the
+            # markdown it changes would otherwise report itself.
+            stop = i < length(heads) ? prevind(block, heads[i + 1].offset) : lastindex(block)
+            occursin(_ENTRY_BULLET, block[h.offset:stop]) || continue
+
+            push!(problems, (title  = String(strip(h[1])),
+                             near   = String(strip(title_m[1])),
+                             reason = _WHY_SWALLOWED))
+        end
     end
+    return (entries = entries, problems = problems)
+end
+
+"""
+    _parse_upgrading(text::AbstractString; source = "UPGRADING.md") -> Vector{_UpgradeEntry}
+
+Parse raw `UPGRADING.md` text into change entries, newest-first (see `_read_upgrading_entries`), and
+`@warn` about any change entry that did not reach the guide — a block that looked like an entry and
+was rejected, or an entry absorbed into its neighbour for want of a `---`. Split out from
+`_read_upgrading_entries` so the parser can be exercised on hand-fed text — the CRLF-robustness case
+in particular — without touching the on-disk file. `source` only labels the warning.
+
+Warn rather than throw: a defect in the log must not take `upgrade_guide` down for a consuming app
+that had nothing to do with it, and the other entries are still correct and still needed. The
+entries returned are byte-identical to what this returned before the diagnostic existed.
+"""
+function _parse_upgrading(text::AbstractString; source::AbstractString = "UPGRADING.md")
+    (; entries, problems) = _scan_upgrading(text)
+
+    # One aggregate record, deliberately without `maxlog`: `maxlog` keys on the call SITE, not the
+    # message, so `maxlog = 1` would hide a second, *different* malformed block, and would report
+    # all-clear on a re-parse after a failed fix attempt — the one answer that must never be wrong
+    # here. Entry titles are public `UPGRADING.md` prose, so no secret reaches this log.
+    isempty(problems) || @warn(
+        "UPGRADING.md holds change entries that `upgrade_guide` could not emit — each was either " *
+        "skipped outright or absorbed into the entry above it, so it does NOT appear in the " *
+        "output above. An entry needs a non-release-marker `## ` heading, a `- **Recorded**:` " *
+        "bullet, and its own trailing `---`. If you are a consuming app rather than a Nitro " *
+        "maintainer, please report this: the upgrade slice you were shown is incomplete.",
+        source           = source,
+        missing_entries  = _describe.(problems))
+
     return entries
 end
+
+"""
+    _upgrading_problems(text::AbstractString) -> Vector{_UpgradeProblem}
+
+The blocks `_parse_upgrading` would warn about, as data and **without logging** — so a test can
+assert on them, including asserting there are none, without wrapping every call in `@test_logs`.
+"""
+_upgrading_problems(text::AbstractString) = _scan_upgrading(text).problems
 
 """
     upgrade_guide([io::IO = stdout]; from, to = <current code>, structured = false)
@@ -114,6 +240,12 @@ depends on — not a latest-on-GitHub copy that may not match.
 
 Entries print newest-first; each keeps its "How to find the calls to migrate" grep and its
 `before → after`.
+
+If Nitro's `UPGRADING.md` holds an entry this cannot emit, `upgrade_guide` warns and names it —
+either the entry was rejected outright, or it lost the `---` in front of it and was absorbed into
+the entry above (its prose then renders under that entry's title, and `structured = true` drops it).
+Either way it is missing from the slice you were shown, so read it directly in the log and report
+it.
 
 `from` is required — pass the Nitro version your app currently depends on. Both `from` and `to`
 accept a `VersionNumber` or a version string (`v"0.1"` or `"0.1"`).
