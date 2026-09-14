@@ -28,6 +28,13 @@ every consuming app. This file is that rollout checklist.
 - **Keep the prose version-neutral.** Write *"part of the `0.1.x` pre-publish wave"*, never *"part of
   the current `## Unreleased` wave"* — stamping rewrites the `- **Version**:` bullet, not the body,
   so self-referential prose ships stale.
+- **Every entry needs its own trailing `---`, and a `- **Recorded**:` bullet.** Without the
+  separator the entry is absorbed into the one above it — its prose renders under that title and
+  `upgrade_guide` never lists it; without the bullet it is dropped outright. Both now warn at run
+  time and fail the suite, but they are cheaper to get right than to diagnose.
+- **Keep `## ` out of column 0 inside an entry body.** A fenced example showing a literal markdown
+  heading must indent it, or the entry-title scan in `test/upgrade_guide_tests.jl` counts it as a
+  second entry and the suite goes red.
 - Entries are version-stamped from **`0.1.0`** onward. `0.1.0` is the baseline of the release-train
   policy: earlier `Project.toml` numbers (`0.2.0`–`0.4.0`) and their tags predate it and were
   reclaimed, so nothing below `0.1.0` exists to port from.

@@ -85,11 +85,17 @@ grep -c '^- \*\*Version\*\*: Unreleased' UPGRADING.md   # the template block add
 
 This is #89: the `## Unreleased` section had no `---` separators between its entries, so three
 collapsed into one block and `upgrade_guide` reported **one** title with the other two bodies
-silently attached — and in the other direction a block with no `- **Recorded**:` bullet is dropped
-without a warning. Every other step in this skill passed anyway. `test/upgrade_guide_tests.jl`
-cannot know how many entries the shipped file *should* hold, so it passes on a collapsed section
-(#89 tracks the hardening) — this count is the only thing that catches it. If the counts disagree,
-inspect the section by hand before touching anything.
+silently attached — and in the other direction a block with no `- **Recorded**:` bullet was dropped
+without a warning. Every other step in this skill passed anyway.
+
+Both failures are now caught automatically, and in two places: `test/upgrade_guide_tests.jl` asserts
+the full set of entry titles in the shipped file against what the parser produces (*"every shipped
+entry heading becomes an entry"*), naming any entry that went missing, and `_parse_upgrading` warns
+at run time — for a block carrying entry bullets that was skipped, **and** for an entry swallowed by
+its neighbour for want of a `---`. The runtime half is the one that reaches a consuming app, which
+never runs Nitro's suite. Keep this count anyway — it is a **pre-flight**: it runs here, before the
+suite and against the un-stamped file, and it is still the only check the sibling PormG repo has by
+hand. If the counts disagree, inspect the section before touching anything.
 
 - **Default: bump the `y` slot** (`0.a.z → 0.(a+1).0`) — a train carrying any `breaking` or
   `behavior` entry is a migration checkpoint.
