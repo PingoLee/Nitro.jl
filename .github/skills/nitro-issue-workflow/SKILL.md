@@ -228,7 +228,7 @@ the full suite, ask which of these your diff could reach:
 | `test/aqua_tests.jl` | export a name with no definition, or add a `Project.toml` dep without a `[compat]` entry (also stale deps, piracy) |
 | `test/reexports_tests.jl` | change what Nitro re-exports from HTTP.jl |
 | `test/http_internals_contract_tests.jl` | touch `src/core.jl`'s `getproperty` overrides or the body hierarchy in `src/utilities/bodyparsers.jl`, or move the `HTTP = "~2.6"` pin |
-| `test/upgrade_guide_tests.jl` | **add or edit an `UPGRADING.md` entry** — two of its testsets parse the *shipped* file |
+| `test/upgrade_guide_tests.jl` | **add or edit an `UPGRADING.md` entry** — several of its testsets parse the *shipped* file, one of them asserting the full entry-title set against it |
 | `test/precompilation_test.jl` | change route registration from a downstream package's `__init__()`, or `serve()`/`terminate()` startup |
 | `test/middleware/shared_response_mutation_tests.jl` | change `Cors`, `SessionMiddleware`, or the `*_response_headers` helpers — **not** a net for new middleware |
 | `.github/scripts/docs_lint.jl` | rename a path, add a skill, edit a `§` pointer, or change a subagent's tool list |

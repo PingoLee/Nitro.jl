@@ -96,15 +96,33 @@ from your own — `git status --porcelain` inside each worktree is the only view
 
 ## C. Three guard tests that fire on work this skill tells you to do (SKILL.md §4)
 
-**`test/upgrade_guide_tests.jl` is the guard the `UPGRADING.md` step walks you into.** Most of it runs
-against an inline `SAMPLE` fixture, but two testsets — *"scoping against the real UPGRADING.md"* and
-*"shipped UPGRADING.md parses"* — call `_read_upgrading_entries()` on the real file and assert every
-entry stamps to `>= v"0.1.0"`, in newest-first order, with the template block not parsing as an
-entry. Two distinct failure shapes come out of a bad `- **Version**:` bullet (`src/upgrading.jl`):
-**omit** it and the entry parses as `_UNSTAMPED_VERSION = v"0.1.0-"`, failing the assertion;
-**misspell the value** (`TBD` instead of `Unreleased` or a version) and `VersionNumber` throws an
-`ArgumentError` out of the parser, so the test *errors* rather than fails. Neither message will
-mention your entry.
+**`test/upgrade_guide_tests.jl` is the guard the `UPGRADING.md` step walks you into.** Much of it
+runs against an inline `SAMPLE` fixture, but several testsets read the *real* file, each asserting
+something different about it:
+
+- *"scoping against the real UPGRADING.md"* and *"shipped UPGRADING.md parses"* — every entry stamps
+  to `>= v"0.1.0"`, in newest-first order, with the template block not parsing as an entry.
+- *"every shipped entry heading becomes an entry"* — the full set of entry titles in the file equals
+  the set the parser emits, so nothing is dropped or swallowed.
+- *"no shipped entry swallows the next one"* — no entry's body carries a foreign heading.
+- *"legitimate non-entry prose stays silent"* — the parser reports **no** problems on the shipped
+  file, which also pins the indentation that keeps the `## Writing an entry` recipe from reading as
+  a malformed entry.
+
+Three distinct failure shapes come out of a bad entry header (`src/upgrading.jl`):
+
+- **Omit the `- **Version**:` bullet** and the entry parses as `_UNSTAMPED_VERSION = v"0.1.0-"`,
+  failing the stamping assertion.
+- **Misspell its value** (`TBD` instead of `Unreleased` or a version) and `VersionNumber` throws an
+  `ArgumentError` out of the parser, so the test *errors* rather than fails.
+- **Omit the `- **Recorded**:` bullet** and the block is rejected outright — the entry is simply not
+  in the guide. **Omit the trailing `---`** and it is worse than that: the block still parses, as
+  its *neighbour*, so your prose renders under someone else's title and `structured = true` loses
+  the entry entirely. Both are the #89 shapes.
+
+The first two messages will not mention your entry. The #89 shapes now do, twice over:
+*"every shipped entry heading becomes an entry"* fails printing the missing title, and
+`_parse_upgrading` warns at runtime naming the entry and which of the two happened.
 
 **`test/precompilation_test.jl` is not about `src/precompile.jl`.** It loads `test/.TestPackage`, a
 downstream package that registers routes with `urlpatterns(...)` inside its `__init__()`, then starts
