@@ -410,4 +410,47 @@ end
     # Drain the in-flight requests so the testset doesn't leak running tasks.
     @test all(r -> r.status == 200, fetch.(inflight))
 end
+
+# ── Lock striping: the size-bounded store must not evict early (#22) ──────────
+# The sliding limiter's LRU is size-bounded, and striping divides `max_clients` across
+# the stripes. Naively splitting a small cache 16 ways would evict a client while the
+# store held a fraction of what the caller asked for -- silently, and looking like the
+# limit simply reset. `_bounded_stripe_count` collapses small caches to a single stripe
+# to keep the caller's bound meaningful.
+
+@testset "Sliding limiter: stripe count keeps max_clients honest" begin
+    bsc = Nitro.Core.RateLimiterMiddleware._bounded_stripe_count
+
+    # Too small to divide: one stripe, i.e. exactly the pre-striping behaviour.
+    @test bsc(1) == 1
+    @test bsc(100) == 1
+    @test bsc(127) == 1
+
+    # Large enough to divide, and always a power of two (stripe selection is a mask).
+    @test bsc(128) == 2
+    @test bsc(10_000) == 16
+    for m in (128, 500, 1024, 10_000, 1_000_000)
+        n = bsc(m)
+        @test ispow2(n)
+        @test n <= 16
+        # Never fewer than ~64 entries per stripe.
+        @test cld(m, n) >= 64
+    end
+end
+
+@testset "Sliding limiter: distinct clients keep their buckets under the default bound" begin
+    # 1000 distinct clients into the default max_clients=10000 (16 stripes x 625). No
+    # stripe can reach 625 with only 1000 keys, so every bucket must survive: a client
+    # that already spent its quota must still be rejected on a later request.
+    limit = 1
+    wrapped = RateLimiter(strategy=:sliding_window, rate_limit=limit, window=Minute(1),
+                          auto_extract_ip=false)(_ -> HTTP.Response(200, "ok"))
+    req_from(ip) = (r = HTTP.Request("GET", "/"); setip!(r, ip); r)
+    ips = [IPv4("10.$(div(i, 256)).$(mod(i, 256)).1") for i in 0:999]
+
+    @test all(ip -> wrapped(req_from(ip)).status == 200, ips)
+    # Every one of them is now out of quota; none may have been evicted.
+    @test all(ip -> wrapped(req_from(ip)).status == 429, ips)
+end
+
 end
