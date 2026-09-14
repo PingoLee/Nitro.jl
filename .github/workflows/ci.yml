@@ -46,13 +46,12 @@ jobs:
     # red required check trains you to stop reading CI. Keep them out of the required set.
     #
     #   nightly      — compiler and Base churn two releases out. Permanently advisory.
-    #   ~1.13.0-0    — TEMPORARY. ReTestItems cannot run on 1.13 at all, so this job fails
-    #                  before executing a single assertion; nothing in src/ is implicated.
-    #                  Real 1.13 coverage comes from the `smoke` job below, which does not
-    #                  use ReTestItems and IS blocking. Remove `~1.13.0-0` from this
-    #                  condition — putting the full suite back in the required set — as soon
-    #                  as a ReTestItems release supports 1.13.
-    continue-on-error: ${{ matrix.version == 'nightly' || matrix.version == '~1.13.0-0' }}
+    #
+    # `~1.13.0-0` used to be listed here too, because no ReTestItems release could run on
+    # 1.13 and the job died before the first assertion. v1.35.3 runs there — the job now
+    # executes the whole suite — so that entry is back in the required set and is BLOCKING
+    # like the rest.
+    continue-on-error: ${{ matrix.version == 'nightly' }}
     strategy:
       fail-fast: false
       matrix:
@@ -144,7 +143,9 @@ jobs:
     #
     # ReTestItems is a TEST-ONLY dependency, so when it does not support a Julia version
     # `Pkg.test()` dies before the first assertion and Nitro has zero verification there —
-    # even though `src/` may be perfectly fine. That is the situation on 1.13 today.
+    # even though `src/` may be perfectly fine. That was the situation on 1.13 until
+    # ReTestItems v1.35.3; the `test` job covers 1.13 properly now, and this job stands as
+    # the standing guard for the next version where it happens again.
     #
     # This job runs a script that depends on nothing test-only: Nitro + HTTP + stdlib,
     # which is the surface a consuming application actually has. It loads the package
@@ -152,8 +153,9 @@ jobs:
     # registers typed routes, serves over a real socket, and checks shutdown released the
     # listener.
     #
-    # Unlike the matrix's `~1.13.0-0` entry, this one is BLOCKING. It is the thing that can
-    # actually tell us Nitro is broken on the next release.
+    # BLOCKING, and cheap enough to stay that way even while the matrix's `~1.13.0-0` entry
+    # is green: it is the one check that keeps reporting if a ReTestItems release ever
+    # stops supporting the next Julia.
     name: Smoke test (Julia ${{ matrix.version }})
     runs-on: ubuntu-latest
     # Unlike `test`, this job does not EXECUTE PormG: `smoke_test.jl` loads only Test,
