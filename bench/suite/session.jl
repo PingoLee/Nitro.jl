@@ -1,5 +1,5 @@
 # Session MemoryStore: every read locks one global ReentrantLock and copies the
-# payload container (src/types.jl:129-155). Read cost therefore scales with the
+# payload container (src/types.jl:268-301). Read cost therefore scales with the
 # SESSION PAYLOAD size (keys in the session's own Dict), independent of store size.
 SUITE["session"] = BenchmarkGroup()
 

@@ -49,7 +49,7 @@ end
 """A real SessionMiddleware wrapped around CSRFMiddleware, plus its store."""
 function session_layer(; csrf_kwargs = (;), handler = ok_handler)
     store = MemoryStore{String, Dict{String,Any}}()
-    layer = SessionMiddleware(cookie_name = "unit_session", store = store, prune_probability = 0.0)(
+    layer = SessionMiddleware(cookie_name = "unit_session", store = store).middleware(
         CSRFMiddleware(SECRET; csrf_kwargs...)(handler))
     return layer, store
 end
@@ -349,7 +349,7 @@ end
     # every later mutation. The re-issue below is what prevents that.
     store = MemoryStore{String, Dict{String,Any}}()
     rotating(req) = (regenerate_session!(req, store); HTTP.Response(200, "ok"))
-    layer = SessionMiddleware(cookie_name = "unit_session", store = store, prune_probability = 0.0)(
+    layer = SessionMiddleware(cookie_name = "unit_session", store = store).middleware(
         CSRFMiddleware(SECRET)(rotating))
 
     res = layer(HTTP.Request("GET", "/form"))
@@ -377,7 +377,7 @@ end
     # Only the POST logs in; a GET that also set `user_id` would leave the auth marker unchanged
     # on the POST and nothing would rotate -- the fixture has to model a real login.
     login(req) = (req.method == "POST" && (getsession(req)["user_id"] = "u1"); HTTP.Response(200, "ok"))
-    layer = SessionMiddleware(cookie_name = "unit_session", store = store, prune_probability = 0.0)(
+    layer = SessionMiddleware(cookie_name = "unit_session", store = store).middleware(
         CSRFMiddleware(SECRET)(login))
 
     first = layer(HTTP.Request("GET", "/form"))

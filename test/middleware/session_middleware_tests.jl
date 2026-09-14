@@ -16,8 +16,7 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
             cookie_name="test_session",
             max_age=3600,
             store=store,
-            prune_probability=0.0  # disable probabilistic pruning in tests
-        )
+        ).middleware
 
         # Simulate a handler that reads the session
         handler = function(req::HTTP.Request)
@@ -53,11 +52,10 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
             cookie_name="dev_session",
             max_age=3600,
             store=store,
-            prune_probability=0.0,
             secure=false,
             httponly=false,
             samesite="Strict"
-        )
+        ).middleware
 
         handler = function(req::HTTP.Request)
             getsession(req)["mode"] = "dev"
@@ -85,8 +83,7 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
             cookie_name="mod_session",
             max_age=3600,
             store=store,
-            prune_probability=0.0
-        )
+        ).middleware
 
         # Handler that sets session data
         set_handler = function(req::HTTP.Request)
@@ -122,9 +119,8 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
             cookie_name="stacked_session",
             max_age=3600,
             store=store,
-            prune_probability=0.0,
             secure=false,
-        )
+        ).middleware
 
         handler = function(req::HTTP.Request)
             response = HTTP.Response(200, "OK")
@@ -150,9 +146,8 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
             cookie_name="auth_session",
             max_age=3600,
             store=store,
-            prune_probability=0.0,
             secure=false,
-        )
+        ).middleware
 
         handler = function(req::HTTP.Request)
             getsession(req)["user_id"] = 99
@@ -184,8 +179,7 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
             cookie_name="retrieve_session",
             max_age=3600,
             store=store,
-            prune_probability=0.0
-        )
+        ).middleware
 
         # Handler that reads the session
         read_handler = function(req::HTTP.Request)
@@ -220,8 +214,7 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
             cookie_name="exp_session",
             max_age=3600,
             store=store,
-            prune_probability=0.0
-        )
+        ).middleware
 
         # Handler checks session is fresh (empty)
         handler = function(req::HTTP.Request)
@@ -253,8 +246,7 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
             cookie_name="nomod_session",
             max_age=3600,
             store=store,
-            prune_probability=0.0
-        )
+        ).middleware
 
         # Handler that doesn't modify the session
         handler = function(req::HTTP.Request)
@@ -301,8 +293,7 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
         mw = SessionMiddleware(
             cookie_name="custom_session",
             store=store,
-            prune_probability=0.0
-        )
+        ).middleware
 
         handler = function(req::HTTP.Request)
             getsession(req)["custom_backend"] = true

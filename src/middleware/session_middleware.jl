@@ -5,21 +5,135 @@ using Dates
 using JSON
 using UUIDs
 using ...Types: AbstractSessionStore, MemoryStore, SessionPayload, Nullable
-using ...Types: CookieConfig
+using ...Types: CookieConfig, LifecycleMiddleware
 using ...Cookies: get_cookie, set_cookie!, storesession!, prunesessions!, regenerate_session!
 using ...Crypto: secure_uuid4
 using ...Core: own_response_headers
 
-export SessionMiddleware
+export SessionMiddleware, SessionPruner
 
 const DEFAULT_STORE = MemoryStore{String, Dict{String,Any}}()
 
+# ── Background pruning (#36) ───────────────────────────────────────────────────────────────
+#
+# Pruning used to run INLINE on the request path: `rand() < prune_probability` (default 0.01)
+# made roughly 1 request in 100 pay a full O(N) scan of the store, and `MemoryStore` runs that
+# scan under the single lock every other session read and write also needs. At 100k live
+# sessions every concurrent request blocked behind that scan — periodic p99 spikes and a
+# throughput cliff, caused by the component that is on every stateful request.
+#
+# That design is PHP's `session.gc_probability`/`gc_divisor`, and PHP is where the evidence
+# against it comes from too: Debian and Ubuntu ship PHP with `session.gc_probability=0` and a
+# cron job instead, for exactly this reason. Django (`manage.py clearsessions`) and Rails
+# (`rake db:sessions:trim`) never prune on the request path at all. Nitro can do better than
+# an external cron because it already has `LifecycleMiddleware`: the prune becomes an
+# in-process janitor tied to server startup and shutdown, which is the Go idiom (`go-cache`'s
+# janitor goroutine).
+#
+# Note what this does NOT need to fix: expiry is already enforced lazily on the read path
+# (`get_session` refuses a payload whose `expires` has passed, src/types.jl), so an unpruned
+# store has never served a stale session. Pruning is purely about reclaiming memory.
+
+
+
+# Builds the `(on_startup, on_shutdown)` pair for a store-pruning janitor.
+#
+# The per-activation stop-token discipline is `FixedRateLimiter`'s, verbatim and for the same
+# reason (src/middleware/rate_limiter.jl): `on_shutdown` cannot wait for the task — it may be
+# parked in `sleep(interval)`, up to a whole interval from its next check — so a
+# `serve(); terminate(); serve()` cycle overlaps the old task with the new activation. A single
+# shared `running` flag leaked one task per restart, because the stale task woke, read the flag
+# the NEW activation had just set true, and kept looping. Giving each activation its own `Ref`
+# means a stale task can only ever observe its own token, which `on_shutdown` already set false.
+#
+# `Threads.@spawn`, not `@async` — and this is where the janitor differs from the rate
+# limiter's sweep. That sweep touches only the limiter's own in-memory Dict; this one calls
+# `cleanup_expired_sessions!` on a store the CALLER supplied, and for `PormGSessionStore` that
+# is a blocking SQL DELETE. Per src/Workers/api.jl, `@async` is acceptable only for a task that
+# runs no user code, so a janitor over a user store must not share a thread with request
+# handlers.
+function _prune_janitor(store::AbstractSessionStore, interval::Period, label::String)
+    Dates.value(interval) > 0 ||
+        throw(ArgumentError("$label: prune_interval must be a positive duration, got $interval"))
+
+    active = Ref{Union{Ref{Bool},Nothing}}(nothing)
+    prune_task = Ref{Union{Task,Nothing}}(nothing)
+
+    # Returns the `Task` it spawned, or `nothing` if one was already running. `startup` discards
+    # it; tests call `lf.on_startup()` directly to observe that a stale task actually exits.
+    on_startup = function ()
+        isnothing(active[]) || return nothing      # idempotent across restarts
+        token = Ref(true)
+        active[] = token
+        prune_task[] = errormonitor(Threads.@spawn while token[]
+            sleep(interval)
+            # Re-check AFTER the sleep: `on_shutdown` may have fired while we were parked, and
+            # this is where a stale activation's task leaves for good.
+            token[] || break
+            try
+                prunesessions!(store)
+            catch e
+                # A failing store must not kill the janitor — the next tick may well succeed,
+                # and a dead janitor is a silent memory leak.
+                @error "Nitro.SessionMiddleware: session prune failed" exception=(e, catch_backtrace())
+            end
+        end)
+        return prune_task[]
+    end
+
+    # Signalling is all this can do; blocking `terminate` for up to a whole interval would be
+    # worse than letting the task drain.
+    on_shutdown = function ()
+        token = active[]
+        isnothing(token) || (token[] = false)
+        stopped = prune_task[]
+        active[] = nothing
+        prune_task[] = nothing
+        return stopped
+    end
+
+    return (on_startup, on_shutdown)
+end
+
 """
-    SessionMiddleware(; cookie_name, secret_key, max_age, store, prune_probability,
+    SessionPruner(store::AbstractSessionStore; interval::Period = Minute(10))
+
+A `LifecycleMiddleware` that periodically removes expired sessions from `store` and does
+nothing else to the request — a pass-through with a background janitor attached.
+
+`SessionMiddleware` already installs one of these internally, so you only need `SessionPruner`
+when you reach sessions **without** it: the `Session{T}` extractor and `storesession!` both
+work against a store passed through the app context, and nothing on that path ever prunes. A
+long-lived `MemoryStore` used that way grows until the process runs out of memory. (It never
+serves a stale session — expiry is checked on read — so this is a memory concern, not a
+correctness one.)
+
+```julia
+store = MemoryStore{String, Dict{String,Any}}()
+serve(app, middleware = [SessionPruner(store; interval = Minute(5))], context = store)
+```
+
+The janitor starts on `serve()` and stops on `terminate()`. Its hooks are idempotent, so a
+`serve(); terminate(); serve()` cycle does not leak a task.
+"""
+function SessionPruner(store::AbstractSessionStore; interval::Period = Minute(10))
+    on_startup, on_shutdown = _prune_janitor(store, interval, "SessionPruner")
+    return LifecycleMiddleware(;
+        middleware = handle -> (req -> handle(req)),
+        on_startup = on_startup,
+        on_shutdown = on_shutdown)
+end
+
+"""
+    SessionMiddleware(; cookie_name, secret_key, max_age, store, prune_interval,
                         rotate_on_auth, auth_key, validator, ...)
 
-Creates a middleware that manages server-side sessions with cookie-based session IDs. The
-mutable session dictionary is read with `getsession(req)` (`req.context[:session]`).
+Creates a `LifecycleMiddleware` that manages server-side sessions with cookie-based session
+IDs. The mutable session dictionary is read with `getsession(req)` (`req.context[:session]`).
+
+Expired sessions are reclaimed by a background janitor that starts on `serve()` and stops on
+`terminate()` — see `prune_interval` below and [`SessionPruner`](@ref). Nothing prunes on the
+request path.
 
 # Session fixation defense (`rotate_on_auth`, `auth_key`, `validator`)
 
@@ -47,16 +161,23 @@ contract.
 
 # Other keyword arguments
 
-- `cookie_name::String = "nitro_session"`, `store`, `max_age::Int`, `prune_probability::Float64`.
+- `cookie_name::String = "nitro_session"`, `store`, `max_age::Int`.
+- `prune_interval::Period = Minute(10)` — how often the background janitor removes expired
+  sessions from `store`. This replaced a `prune_probability` that ran the prune inline on a
+  fraction of requests; see the comment above `_prune_janitor` for why that had to go.
 - Cookie attributes (`secure`, `httponly`, `samesite`, `path`, `domain`, `secret_key`) or a
   fully-formed `config::CookieConfig`.
+
+# Returns
+A `LifecycleMiddleware`. `serve()` and `urlpatterns()` accept it directly; if you are composing
+the chain by hand, the request function is its `.middleware` field.
 """
 function SessionMiddleware(;
     cookie_name::String = "nitro_session",
     secret_key::Nullable{String} = nothing,
     max_age::Int = 86400,
     store::AbstractSessionStore{String, Dict{String,Any}} = DEFAULT_STORE,
-    prune_probability::Float64 = 0.01,
+    prune_interval::Period = Minute(10),
     secure::Bool = true,
     httponly::Bool = true,
     samesite::String = "Lax",
@@ -75,13 +196,10 @@ function SessionMiddleware(;
     ),
     validator::Union{Function, Nothing} = nothing)
 
-    return function(handle::Function)
-        return function(req::HTTP.Request)
-            # Keep pruning cheap by only cleaning expired sessions occasionally.
-            if rand() < prune_probability
-                prunesessions!(store)
-            end
+    on_startup, on_shutdown = _prune_janitor(store, prune_interval, "SessionMiddleware")
 
+    middleware = function(handle::Function)
+        return function(req::HTTP.Request)
             # Load the current payload and remember the auth marker before the handler runs.
             session_id = _get_session_id(req, cookie_name)
             session_data, is_new = _load_session(store, session_id)
@@ -128,6 +246,8 @@ function SessionMiddleware(;
             return response
         end
     end
+
+    return LifecycleMiddleware(; middleware, on_startup, on_shutdown)
 end
 
 function _get_session_id(req::HTTP.Request, cookie_name::String)

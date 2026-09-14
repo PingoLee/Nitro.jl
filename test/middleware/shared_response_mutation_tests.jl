@@ -35,7 +35,7 @@ end
 @testset "SessionMiddleware does not leak a Set-Cookie onto a shared const" begin
     @test isempty(SHARED.headers)
     store = MemoryStore{String, Dict{String,Any}}()
-    wrapped = SessionMiddleware(cookie_name="sid", max_age=3600, store=store, prune_probability=0.0)(req -> SHARED)
+    wrapped = SessionMiddleware(cookie_name="sid", max_age=3600, store=store).middleware(req -> SHARED)
 
     # Two distinct new visitors (no session cookie) both get the shared 401 const back.
     respA = wrapped(HTTP.Request("GET", "/protected"))
@@ -56,7 +56,7 @@ end
     # `const` rejection, so each has to own the headers first.
     @test isempty(SHARED.headers)
     store = MemoryStore{String, Dict{String,Any}}()
-    wrapped = SessionMiddleware(cookie_name="sid", max_age=3600, store=store, prune_probability=0.0)(
+    wrapped = SessionMiddleware(cookie_name="sid", max_age=3600, store=store).middleware(
         CSRFMiddleware("shared-const-secret")(req -> SHARED))
 
     csrf_cookie(resp) = begin
@@ -149,7 +149,7 @@ end
     @test cors(HTTP.Request("GET", "/")).close == true
 
     store = MemoryStore{String, Dict{String,Any}}()
-    sess = SessionMiddleware(cookie_name="sid", max_age=3600, store=store, prune_probability=0.0)(handler)
+    sess = SessionMiddleware(cookie_name="sid", max_age=3600, store=store).middleware(handler)
     @test sess(HTTP.Request("GET", "/")).close == true
 end
 end

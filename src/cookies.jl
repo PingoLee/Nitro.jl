@@ -735,6 +735,12 @@ Delegates to `cleanup_expired_sessions!`, which is an optional part of the
 `AbstractSessionStore` contract and defaults to a no-op — so a store that does not
 support background cleanup needs nothing here.
 
+This runs **off** the request path (#36). `SessionMiddleware` and `SessionPruner` call it
+from a background janitor tied to server startup/shutdown; it used to run inline on a
+`prune_probability` fraction of requests, which made ~1 request in 100 pay a full O(N)
+store scan — under `MemoryStore`'s single lock, blocking every concurrent session read
+and write for the duration.
+
 This used to wrap the call in a `try`/`catch` that swallowed any `MethodError` whose
 `.f` was `cleanup_expired_sessions!`, which is how the optionality was expressed before
 the default existed. That rescue also swallowed a *genuine* `MethodError` raised inside a

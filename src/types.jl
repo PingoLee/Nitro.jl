@@ -307,13 +307,21 @@ function delete_session!(store::MemoryStore{K, V}, key) where {K, V}
     return nothing
 end
 
-function cleanup_expired_sessions!(store::MemoryStore)
+function cleanup_expired_sessions!(store::MemoryStore{K, V}) where {K, V}
     current_time = Dates.now(Dates.UTC)
     lock(store.lock) do
+        # Collect first, delete after. Mutating a `Dict` while iterating it is not defined
+        # behaviour in Julia — the rehash a `delete!` can trigger invalidates the iteration
+        # state, so entries may be skipped or visited twice. The rate limiter's sweep
+        # (src/middleware/rate_limiter.jl) does the same two-pass for the same reason.
+        expired = K[]
         for (key, payload) in store.data
             if payload.expires <= current_time
-                delete!(store.data, key)
+                push!(expired, key)
             end
+        end
+        for key in expired
+            delete!(store.data, key)
         end
     end
     return nothing
