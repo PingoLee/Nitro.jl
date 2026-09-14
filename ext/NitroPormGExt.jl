@@ -19,6 +19,7 @@ import Nitro.Workers: AbstractWorkerStore, TaskInfo, TaskStatus, TaskOptions, Se
     get_active_task, register_active_task!, deregister_active_task!,
     get_active_task_info, register_active_task_info!, deregister_active_task_info!,
     get_queue_authorizer, set_queue_authorizer!,
+    get_error_redactor, set_error_redactor!,
     get_watch_authorizer, set_watch_authorizer!,
     get_sequential_queues, get_queue_lock, get_cleanup_scheduler, lock_tasks,
     shutdown!, _stop_scheduler_and_queues!
@@ -376,6 +377,7 @@ struct PormGWorkerStore <: AbstractWorkerStore
     cleanup_scheduler::Ref{Union{Nothing, CleanupScheduler}}
     queue_authorizer::Ref{Any}
     watch_authorizer::Ref{Any}
+    error_redactor::Ref{Any}
 end
 
 function PormGWorkerStore(; model=nothing, db_key::String="db")
@@ -393,6 +395,7 @@ function PormGWorkerStore(; model=nothing, db_key::String="db")
         Dict{String, SequentialQueue}(),
         ReentrantLock(),
         Ref{Union{Nothing, CleanupScheduler}}(nothing),
+        Ref{Any}(nothing),
         Ref{Any}(nothing),
         Ref{Any}(nothing),
     )
@@ -853,6 +856,15 @@ end
 function set_queue_authorizer!(store::PormGWorkerStore, authorizer)
     store.queue_authorizer[] = authorizer
     return authorizer
+end
+
+function get_error_redactor(store::PormGWorkerStore)
+    return store.error_redactor[]
+end
+
+function set_error_redactor!(store::PormGWorkerStore, redactor)
+    store.error_redactor[] = redactor
+    return redactor
 end
 
 function get_watch_authorizer(store::PormGWorkerStore)

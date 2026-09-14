@@ -14,11 +14,72 @@ function _unwrap_exception(error)
     return error
 end
 
+"""
+    format_error(error) -> String
+
+Render an exception the way a failed task reports it, unwrapping the task/captured/composite
+wrappers first.
+
+This is the plain rendering utility and is unbounded on purpose — it is exported, and capping it
+would change what every existing caller gets back. What gets *stored* goes through
+`_store_error_text` instead, which redacts and truncates.
+"""
 function format_error(error)
     unwrapped = _unwrap_exception(error)
     io = IOBuffer()
     showerror(io, unwrapped)
     return String(take!(io))
+end
+
+"""
+    MAX_STORED_ERROR_CHARS
+
+The cap on a failed task's stored `error` text.
+
+Counted in **characters**, not bytes, so truncation can never split a multi-byte codepoint and
+leave invalid UTF-8 in the store. The value is a judgement call rather than a derived limit: long
+enough for a stack-free `showerror` of any ordinary exception, short enough that a runaway message
+cannot dominate the row. Spring Batch pins the analogous `exitDescription` at 2500 via its column
+width; nothing here is that principled, so the number is stated rather than inferred.
+"""
+const MAX_STORED_ERROR_CHARS = 2048
+
+function _truncate_error(text::AbstractString)
+    total = length(text)
+    total <= MAX_STORED_ERROR_CHARS && return String(text)
+    return string(first(text, MAX_STORED_ERROR_CHARS), " …[truncated, ", total, " chars total]")
+end
+
+"""
+    _store_error_text(store, error) -> String
+
+What a failed task actually writes to its `error` field: `format_error`, then the store's
+redaction hook, then the length cap.
+
+The order is load-bearing. The hook is handed the **full** rendering so it can decide about the
+whole message rather than a prefix, and the cap runs afterwards so a redactor cannot exceed it.
+
+A task reaching here has already failed; a throwing redactor must not lose the failure on top of
+that. It is caught, and the log line deliberately carries neither the text nor the exception — the
+whole reason a redactor exists is that the app considers that content unsafe to emit, so the
+failure path must not emit it as a consolation prize. The stored value degrades to the exception
+type, which is the most that is knowably safe.
+"""
+function _store_error_text(store::AbstractWorkerStore, error)
+    unwrapped = _unwrap_exception(error)
+    rendered = format_error(unwrapped)
+
+    redactor = get_error_redactor(store)
+    isnothing(redactor) && return _truncate_error(rendered)
+
+    redacted = try
+        Base.invokelatest(redactor, unwrapped, rendered)
+    catch redactor_error
+        @error "Worker error redactor threw; storing the exception type only." exception=redactor_error store_type=typeof(store)
+        return string(nameof(typeof(unwrapped)))
+    end
+
+    return _truncate_error(string(redacted))
 end
 
 function _invoke_task_callback(callback::Function, task_info::TaskInfo)

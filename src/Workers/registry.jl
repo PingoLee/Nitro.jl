@@ -261,6 +261,49 @@ end)
 """
 function set_watch_authorizer! end
 
+# -- Stored-error redaction --
+
+function get_error_redactor end
+
+"""
+    set_error_redactor!(store, redactor)
+
+Install the hook that rewrites a failed task's error text before it is stored, and return it.
+
+    redactor(exception, rendered::String)::String
+
+A task's stored `error` is rendered from the exception the **application's** callback threw, and
+exceptions quote their input. A callback that parses user-submitted data hands its parser's
+`ArgumentError` the offending bytes, and those bytes land in the store — for `PormGWorkerStore`,
+in a `TEXT` column, kept until the retention sweep removes the row
+([#140](https://github.com/PingoLee/Nitro.jl/issues/140)).
+
+Nitro cannot know which parts of an app's exception messages are sensitive, so it bounds the
+text (see `MAX_STORED_ERROR_CHARS`) and offers this hook for the rest. `nothing`, the default,
+means no redaction.
+
+`rendered` is the **full** text, before truncation, so a redactor sees what it is deciding about
+rather than a prefix. The cap is applied to whatever it returns, so a redactor cannot exceed it.
+
+```julia
+# Keep the exception type, drop everything it quoted.
+set_error_redactor!(store, (exc, rendered) -> string(nameof(typeof(exc))))
+
+# Or redact selectively, leaving ordinary failures diagnosable.
+set_error_redactor!(store, function(exc, rendered)
+    exc isa MyApp.UserDataError ? "UserDataError (details withheld)" : rendered
+end)
+```
+
+The hook runs on the failure path of a task that has already failed, so a redactor that throws
+must not lose the failure as well: Nitro catches it, logs that it threw **without the text it
+was handed**, and stores the exception type alone.
+
+Like the authorizer hooks, this is invoked through `Base.invokelatest`, so a redactor defined
+after the worker started is still seen.
+"""
+function set_error_redactor! end
+
 # -- Queue management helper functions --
 function get_sequential_queues end
 function get_queue_lock end
@@ -342,6 +385,8 @@ const WORKER_STORE_INTERFACE = (
     (get_queue_lock,                (AbstractWorkerStore,)),
     (get_cleanup_scheduler,         (AbstractWorkerStore,)),
     (lock_tasks,                    (Function, AbstractWorkerStore)),
+    (get_error_redactor,            (AbstractWorkerStore,)),
+    (set_error_redactor!,           (AbstractWorkerStore, Any)),
     (shutdown!,                     (AbstractWorkerStore,)),
 )
 
@@ -416,6 +461,7 @@ mutable struct InMemoryWorkerStore <: AbstractWorkerStore
     active_lock::ReentrantLock
     queue_authorizer::Ref{Any}
     watch_authorizer::Ref{Any}
+    error_redactor::Ref{Any}
 
     function InMemoryWorkerStore()
         return new(
@@ -426,6 +472,7 @@ mutable struct InMemoryWorkerStore <: AbstractWorkerStore
             Ref{Union{Nothing, CleanupScheduler}}(nothing),
             Dict{String, Task}(),
             ReentrantLock(),
+            Ref{Any}(nothing),
             Ref{Any}(nothing),
             Ref{Any}(nothing),
         )
@@ -617,6 +664,15 @@ end
 function set_queue_authorizer!(store::InMemoryWorkerStore, authorizer)
     store.queue_authorizer[] = authorizer
     return authorizer
+end
+
+function get_error_redactor(store::InMemoryWorkerStore)
+    return store.error_redactor[]
+end
+
+function set_error_redactor!(store::InMemoryWorkerStore, redactor)
+    store.error_redactor[] = redactor
+    return redactor
 end
 
 function get_watch_authorizer(store::InMemoryWorkerStore)

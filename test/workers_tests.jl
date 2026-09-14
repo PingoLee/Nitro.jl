@@ -102,6 +102,101 @@ end
     @test_throws StoreInterfaceError reset_store!(NothingWorkerStore())
 end
 
+@testset "Stored task error text is bounded and redactable (#140)" begin
+    # The sentinel is chosen so the POSITIVE assertion below can actually fail: it has to be
+    # something an ordinary exception really does echo. `ArgumentError` interpolates whatever it
+    # is handed, so it does. The positive assertion comes first on purpose -- without it, every
+    # negative assertion here would pass just as happily against a sentinel that never reached
+    # the message in the first place, and the guard would be theater.
+    sentinel = "tok-91fe3c"
+
+    @testset "the cap holds, and does not fire on ordinary messages" begin
+        store = InMemoryWorkerStore()
+        owner = Owner("user-cap")
+        try
+            long_tail = repeat("x", MAX_STORED_ERROR_CHARS * 2)
+            id = submit_task("capped", () -> throw(ArgumentError(long_tail)), owner; store=store)
+            @test wait_for(() -> get_task_status(id, owner; store=store)[:status] == "FAILED") == :ok
+
+            stored = get_task_status(id, owner; store=store)[:error]
+            @test length(stored) <= MAX_STORED_ERROR_CHARS + 64   # + the truncation marker
+            @test occursin("truncated", stored)
+            # Truncation is by character, so what lands is still valid UTF-8 and still says what
+            # kind of failure it was.
+            @test isvalid(stored)
+            @test occursin("ArgumentError", stored)
+
+            short_id = submit_task("uncapped", () -> throw(ArgumentError("plain failure")), owner; store=store)
+            @test wait_for(() -> get_task_status(short_id, owner; store=store)[:status] == "FAILED") == :ok
+            short_stored = get_task_status(short_id, owner; store=store)[:error]
+            @test occursin("plain failure", short_stored)
+            @test !occursin("truncated", short_stored)
+        finally
+            reset_store!(store)
+        end
+    end
+
+    @testset "a redactor sees the full text and keeps it out of the store" begin
+        store = InMemoryWorkerStore()
+        owner = Owner("user-redact")
+        seen = Ref("")
+        try
+            # The hook is handed the FULL rendering, before truncation, so it can decide about the
+            # whole message rather than a prefix.
+            set_error_redactor!(store, function(exc, rendered)
+                seen[] = rendered
+                return string(nameof(typeof(exc)), " (details withheld)")
+            end)
+            @test get_error_redactor(store) !== nothing
+
+            id = submit_task("redacted", () -> throw(ArgumentError("bad token: $(sentinel)")), owner; store=store)
+            @test wait_for(() -> get_task_status(id, owner; store=store)[:status] == "FAILED") == :ok
+
+            # POSITIVE: the sentinel really is in the raw exception, so the negative below means
+            # something.
+            @test occursin(sentinel, seen[])
+            @test occursin(sentinel, format_error(ArgumentError("bad token: $(sentinel)")))
+
+            # NEGATIVE: and it does not survive into the stored value.
+            stored = get_task_status(id, owner; store=store)[:error]
+            @test !occursin(sentinel, stored)
+            @test stored == "ArgumentError (details withheld)"
+        finally
+            reset_store!(store)
+        end
+    end
+
+    @testset "a redactor that throws loses the detail, not the failure" begin
+        store = InMemoryWorkerStore()
+        owner = Owner("user-throwing")
+        try
+            set_error_redactor!(store, (exc, rendered) -> error("redactor is broken"))
+
+            id = submit_task("boom", () -> throw(ArgumentError("bad token: $(sentinel)")), owner; store=store)
+            @test wait_for(() -> get_task_status(id, owner; store=store)[:status] == "FAILED") == :ok
+
+            # The task still reports FAILED, and the stored text degrades to the exception type --
+            # never back to the unredacted rendering, which is the content the app just told us it
+            # did not want stored.
+            stored = get_task_status(id, owner; store=store)[:error]
+            @test stored == "ArgumentError"
+            @test !occursin(sentinel, stored)
+        finally
+            reset_store!(store)
+        end
+    end
+
+    @testset "no redactor is still the default, and format_error stays unbounded" begin
+        store = InMemoryWorkerStore()
+        @test get_error_redactor(store) === nothing
+
+        # `format_error` is exported and is the plain rendering utility; #140 bounds what is
+        # STORED, not what this returns. Capping it here would silently change every caller.
+        long_tail = repeat("y", MAX_STORED_ERROR_CHARS * 2)
+        @test length(format_error(ArgumentError(long_tail))) > MAX_STORED_ERROR_CHARS
+    end
+end
+
 @testset "Immediate task execution and deduplication" begin
     store = InMemoryWorkerStore()
     calls = Ref(0)

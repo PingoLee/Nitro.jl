@@ -949,6 +949,41 @@ else
             end
         end
 
+        @testset "stored error text is bounded and redactable in the TEXT column (#140)" begin
+            # The persistent store is the whole reason #140 matters: `error` is a TEXT column that
+            # outlives the process, so this asserts against the raw stored row rather than the
+            # `get_task_status` view.
+            sentinel = "tok-91fe3c"
+            store_err = RealPormGWorkerStore(model=MockTaskModel())
+            owner = Owner("user-err")
+
+            try
+                @test get_error_redactor(store_err) === nothing
+
+                long_tail = repeat("x", MAX_STORED_ERROR_CHARS * 2)
+                capped_id = submit_task("capped", () -> throw(ArgumentError(long_tail)), owner; store=store_err)
+                @test timedwait(() -> get_task_status(capped_id, owner; store=store_err)[:status] == "FAILED", 5.0) == :ok
+
+                column = store_err.model._table[capped_id]["error"]
+                @test length(column) <= MAX_STORED_ERROR_CHARS + 64
+                @test isvalid(column)
+                @test occursin("truncated", column)
+
+                set_error_redactor!(store_err, (exc, rendered) -> string(nameof(typeof(exc))))
+                redacted_id = submit_task("redacted", () -> throw(ArgumentError("bad token: $(sentinel)")), owner; store=store_err)
+                @test timedwait(() -> get_task_status(redacted_id, owner; store=store_err)[:status] == "FAILED", 5.0) == :ok
+
+                # POSITIVE first: the sentinel really is in the raw rendering, so the negative
+                # assertion below is not passing for the wrong reason.
+                @test occursin(sentinel, format_error(ArgumentError("bad token: $(sentinel)")))
+                # NEGATIVE: and it never reaches the column.
+                @test store_err.model._table[redacted_id]["error"] == "ArgumentError"
+                @test !occursin(sentinel, store_err.model._table[redacted_id]["error"])
+            finally
+                reset_store!(store_err)
+            end
+        end
+
         @testset "shutdown! tears the persistent store down instead of no-opping (#29)" begin
             store_td = RealPormGWorkerStore(model=MockTaskModel())
             owner = Owner("user-td")

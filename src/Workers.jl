@@ -26,7 +26,7 @@ export TaskStatus, PENDING, RUNNING, COMPLETED, FAILED, CANCELLED,
     update_progress!, cancel_requested, TaskTimeoutError,
     get_all_tasks, cleanup_old_tasks,
     start_cleanup_scheduler, stop_cleanup_scheduler!, get_queue_status,
-    format_error, reset_store!, shutdown!,
+    format_error, MAX_STORED_ERROR_CHARS, reset_store!, shutdown!,
     scoped_task_key, owner_of, DEFAULT_QUEUE_NAME,
     TaskAuthority, Owner, System, UNSUPPLIED,
     # Abstract store interface
@@ -35,6 +35,7 @@ export TaskStatus, PENDING, RUNNING, COMPLETED, FAILED, CANCELLED,
     get_active_task, register_active_task!, deregister_active_task!,
     get_active_task_info, register_active_task_info!, deregister_active_task_info!,
     get_queue_authorizer, set_queue_authorizer!,
+    get_error_redactor, set_error_redactor!,
     get_watch_authorizer, set_watch_authorizer!,
     get_sequential_queues, get_queue_lock, get_cleanup_scheduler, lock_tasks
 
