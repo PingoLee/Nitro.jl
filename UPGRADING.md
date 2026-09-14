@@ -79,7 +79,9 @@ Six things a consuming app can observe:
 
 - **The public keyword is `runtime=`, not `store=`**, on `submit_task`, `submit_sequential_task`,
   `get_task_status`, `cancel_task`, `get_all_tasks`, `cleanup_old_tasks`, `get_queue_status`,
-  `recover_zombie_tasks!`, `start_cleanup_scheduler` and `stop_cleanup_scheduler!`. `store=`
+  `recover_zombie_tasks!` and `start_cleanup_scheduler`. `stop_cleanup_scheduler!` takes its
+  runtime **positionally** — `stop_cleanup_scheduler!(store)` becomes
+  `stop_cleanup_scheduler!(runtime)` — so grep for the call, not for a keyword. `store=`
   survives only where it *selects a backend* — `install!`, `Workers.start!`, `Workers.startup` and
   therefore `worker_startup` — so the documented bootstrap line is unchanged. There is **no
   compatibility alias**: Nitro is pre-registry, and `store=` on a submission call would now be a
@@ -99,6 +101,12 @@ Six things a consuming app can observe:
   `get_cleanup_scheduler`, and drop the fields behind them. `missing_store_methods` reports
   against the new rows, so `@test isempty(missing_store_methods(MyStore))` is still the
   conformance check.
+
+  The four `*_active_task*` **registrars are also no longer exported** from `Nitro.Workers` —
+  reach them as `Nitro.Workers.register_active_task!(…)` if you need them. A run publishes its
+  handle and its live record together through the exported `register_run!`, and writing one
+  without the other is the state that makes a late-finishing predecessor delete its successor's
+  handle. `get_active_task` and `get_active_task_info` stay exported; they only read.
 - **`get_task_info(store, id)` is now defined as the DURABLE read** — which is what `reload_task`
   was, and why `reload_task` is gone: once no store caches live objects the two are the same
   function. Serving a running callback's own object to a reader is the runtime's job, through
@@ -133,8 +141,9 @@ Two behaviour fixes ride along, both on `PormGWorkerStore` only, both caused by 
 #    worker_startup / Workers.start! / Workers.startup / install! stays exactly as it is.
 grep -rn "store *=" --include=*.jl . | grep -E "submit_task|submit_sequential_task|get_task_status|cancel_task|get_all_tasks|cleanup_old_tasks|get_queue_status|recover_zombie_tasks!|cleanup_scheduler"
 
-# 2. The renamed reset, the removed field, and anything shutting a STORE down.
-grep -rn "reset_store!\|shutdown!\|sys_task" --include=*.jl .
+# 2. The renamed reset, the removed field, and the calls that take a store POSITIONALLY --
+#    `stop_cleanup_scheduler!(store)` and `shutdown!(store)` have no `store =` for grep 1 to find.
+grep -rn "reset_store!\|shutdown!\|stop_cleanup_scheduler!\|sys_task" --include=*.jl .
 
 # 3. Custom backends: every one of these must be deleted, along with its fields.
 grep -rn "<: AbstractWorkerStore" --include=*.jl .

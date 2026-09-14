@@ -377,21 +377,23 @@ else
             # It used to be a `PormGWorkerStore` field with no `InMemoryWorkerStore` counterpart,
             # which is how #166 came to treat the two backends' live-object handling as
             # equivalent when it was not. The store must now contribute no method at all.
-            for gone in (get_active_task, register_active_task!, deregister_active_task!,
-                         get_active_task_info, register_active_task_info!,
-                         deregister_active_task_info!)
+            for gone in (get_active_task, get_active_task_info,
+                         Nitro.Workers.register_active_task!,
+                         Nitro.Workers.deregister_active_task!,
+                         Nitro.Workers.register_active_task_info!,
+                         Nitro.Workers.deregister_active_task_info!)
                 @test !hasmethod(gone, Tuple{RealPormGWorkerStore, String})
             end
             @test !hasmethod(shutdown!, Tuple{RealPormGWorkerStore})
 
             mock_task = @async sleep(0.01)
-            register_active_task!(rt_store, "task-1", mock_task)
+            Nitro.Workers.register_active_task!(rt_store, "task-1", mock_task)
 
             @test get_active_task(rt_store, "task-1") === mock_task
             # A live `Task` can never reach the row, because no field on this store holds one.
             @test !haskey(store.model._table["task-1"], "sys_task")
 
-            deregister_active_task!(rt_store, "task-1")
+            Nitro.Workers.deregister_active_task!(rt_store, "task-1")
             @test get_active_task(rt_store, "task-1") === nothing
             wait(mock_task)
         end
@@ -578,7 +580,7 @@ else
             push!(live.watchers, "alice")
             live.status = RUNNING
             replace_task!(store_m, live.id, live)
-            register_active_task_info!(rt_store_m, live.id, live)
+            Nitro.Workers.register_active_task_info!(rt_store_m, live.id, live)
 
             @test cancel_task("alice::job", Owner("alice"); runtime=rt_store_m)[:status] ==
                   "Task cancelled"
@@ -608,7 +610,7 @@ else
             live.status = RUNNING
             replace_task!(store_x, live.id, live)
             # This process is running the task, so `get_task_info` serves THIS object.
-            register_active_task_info!(rt_store_x, live.id, live)
+            Nitro.Workers.register_active_task_info!(rt_store_x, live.id, live)
 
             # Another process cancels: it writes the row and never touches our live object.
             @test try_transition!(store_x, "alice::job", (PENDING, RUNNING), CANCELLED;
@@ -633,7 +635,7 @@ else
             push!(live.watchers, "alice")
             live.status = RUNNING
             replace_task!(store_f, live.id, live)
-            register_active_task_info!(rt_store_f, live.id, live)
+            Nitro.Workers.register_active_task_info!(rt_store_f, live.id, live)
 
             try_transition!(store_f, "alice::flaky", (PENDING, RUNNING), CANCELLED;
                             run_id=live.run_id, error="Cancelled")
@@ -676,7 +678,7 @@ else
             push!(live.watchers, "alice")
             live.status = RUNNING
             replace_task!(store_p, live.id, live)
-            register_active_task_info!(rt_store_p, live.id, live)
+            Nitro.Workers.register_active_task_info!(rt_store_p, live.id, live)
 
             add_watcher!(store_p, "alice::upload", "backend-service")
             empty!(live.watchers)
@@ -699,7 +701,7 @@ else
             push!(t.watchers, "alice")
             t.status = RUNNING
             replace_task!(store_pr, t.id, t)
-            register_active_task_info!(rt_store_pr, t.id, t)
+            Nitro.Workers.register_active_task_info!(rt_store_pr, t.id, t)
             update_progress!(t, 47)
 
             Nitro.Workers._fail_task!(rt_store_pr, t, "boom")
@@ -718,7 +720,7 @@ else
             push!(live.watchers, "alice")
             live.status = RUNNING
             replace_task!(store_s, live.id, live)
-            register_active_task_info!(rt_store_s, live.id, live)
+            Nitro.Workers.register_active_task_info!(rt_store_s, live.id, live)
 
             # Another process grants access. It writes the row; our live object, which
             # `get_task_info` serves, knows nothing about it. This is #96's own motivating
@@ -762,7 +764,7 @@ else
             replace_task!(store_live, running.id, running)
             # get_task_info serves this object for an active task, so a grant written
             # only to the row would stay invisible until the task terminated.
-            register_active_task_info!(rt_store_live, running.id, running)
+            Nitro.Workers.register_active_task_info!(rt_store_live, running.id, running)
 
             @test add_watcher!(store_live, "alice::live", "bob") == true
             @test "bob" in get_task_info(store_live, "alice::live").watchers
@@ -853,7 +855,7 @@ else
             live = TaskInfo("task-live"; queue_name="reports")
             live.status = RUNNING
             update_progress!(live, 73.0)
-            register_active_task_info!(rt_store5, live.id, live)
+            Nitro.Workers.register_active_task_info!(rt_store5, live.id, live)
 
             listed = only(get_all_tasks(rt_store5, System(); status=RUNNING))
             @test listed.progress == 73.0
@@ -863,7 +865,7 @@ else
             @test only(get_all_tasks(store5, System(); status=RUNNING)).progress == 0.0
 
             # After the task terminates the cache entry is gone and the DB value wins.
-            deregister_active_task_info!(rt_store5, live.id)
+            Nitro.Workers.deregister_active_task_info!(rt_store5, live.id)
             @test only(get_all_tasks(rt_store5, System(); status=RUNNING)).progress == 0.0
         end
 
@@ -1041,8 +1043,8 @@ else
                 # Stand in for a run still in flight. A FINISHED run deregisters itself, so the
                 # caches are empty by then -- registering directly is both deterministic and the
                 # exact state a mid-flight shutdown finds.
-                register_active_task!(rt_store_td, "in-flight", current_task())
-                register_active_task_info!(rt_store_td, "in-flight", TaskInfo("in-flight"))
+                Nitro.Workers.register_active_task!(rt_store_td, "in-flight", current_task())
+                Nitro.Workers.register_active_task_info!(rt_store_td, "in-flight", TaskInfo("in-flight"))
                 @test !isempty(rt_store_td.active_tasks)
                 @test !isempty(rt_store_td.active_task_infos)
 
@@ -1239,8 +1241,8 @@ else
                     # -- register / get / deregister round-trip
                     handle = @async sleep(0.01)
                     info = TaskInfo("alice::parity")
-                    register_active_task!(rt, info.id, handle)
-                    register_active_task_info!(rt, info.id, info)
+                    Nitro.Workers.register_active_task!(rt, info.id, handle)
+                    Nitro.Workers.register_active_task_info!(rt, info.id, info)
                     @test get_active_task(rt, info.id) === handle
                     @test get_active_task_info(rt, info.id) === info
 
@@ -1269,7 +1271,7 @@ else
                     #    predecessor's late teardown must be a no-op.
                     successor = TaskInfo("alice::parity")
                     @test successor.run_id != info.run_id
-                    register_active_task_info!(rt, successor.id, successor)
+                    Nitro.Workers.register_active_task_info!(rt, successor.id, successor)
                     Nitro.Workers._deregister_run!(rt, info)
                     @test get_active_task(rt, info.id) === handle
                     @test get_active_task_info(rt, info.id) === successor

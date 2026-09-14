@@ -25,8 +25,12 @@ export TaskStatus, PENDING, RUNNING, COMPLETED, FAILED, CANCELLED,
     # The live half: queues, scheduler, run handles (#167)
     WorkerRuntime, default_runtime, worker_runtime, reset_runtime!, shutdown!,
     get_sequential_queues, get_queue_lock, get_cleanup_scheduler,
-    get_active_task, register_active_task!, deregister_active_task!,
-    get_active_task_info, register_active_task_info!, deregister_active_task_info!,
+    get_active_task, get_active_task_info, register_run!,
+    # NOT exported: `register_active_task!` / `register_active_task_info!` and their
+    # deregistrars. They have no production callers, and writing one dict without the other is
+    # exactly the state `register_run!` exists to make unbuildable -- an exported API whose
+    # documented correct use is "never use this alone" is the same shape as the `shutdown!` a
+    # backend could forget, which is what #167 removed. Reach them qualified, from tests.
     install!, uninstall!, worker_store, default_store,
     start!, startup, recover_zombie_tasks!,
     submit_task, submit_sequential_task, get_task_status, cancel_task,

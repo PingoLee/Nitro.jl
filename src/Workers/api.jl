@@ -56,9 +56,18 @@ function _start_runtime_for!(ctx::App, key::Symbol,
             "pass `store` (build a runtime over this backend) or `runtime` (use this one), not both"))
     end
     !isnothing(runtime) && return install!(ctx, runtime; key)
-    !isnothing(store) && return install!(ctx, WorkerRuntime(store); key)
 
     existing = worker_runtime(ctx; key)
+
+    if !isnothing(store)
+        # Reuse the installed runtime when it already wraps this very backend, so repeated
+        # `start!(app; store = s)` stays idempotent. Minting a fresh runtime each time would
+        # displace the previous one mid-flight -- and a displaced runtime that nobody shut down
+        # is the #29 leak, rebuilt one level up.
+        existing isa WorkerRuntime && existing.store === store && return existing
+        return install!(ctx, WorkerRuntime(store); key)
+    end
+
     return existing isa WorkerRuntime ? existing : install!(ctx; key)
 end
 
@@ -208,8 +217,9 @@ end
 
 # Authorize against the cached record, and only if that denies, re-check the durable one.
 #
-# `get_task_info` may serve a live in-memory object for a running task so pollers see fresh
-# progress without a round-trip. That cache is per process, so a grant issued *elsewhere*
+# The `task_info` handed in reached its caller through `get_task_info(runtime, ·)`, so for a
+# running task it may be the live in-memory object, which pollers read to see fresh progress
+# without a round-trip. That cache is per process, so a grant issued *elsewhere*
 # is not in it — and #96's whole motivating case is a task submitted on one node and polled
 # from another. Denying on the cache alone would refuse a user who is authorized in the
 # durable record, making the grant work or not depending on which node answered.
@@ -221,6 +231,8 @@ function _authorize_or_reload!(store::AbstractWorkerStore, authority::TaskAuthor
                                task_info::TaskInfo, action::AbstractString)
     _is_authorized(authority, task_info) && return nothing
 
+    # `get_task_info(store, ·)` is the DURABLE read -- it is what `reload_task` used to be, and
+    # no store caches live objects any more (#167).
     # Authorize against the durable record, but keep serving the cached one: the durable
     # row for a *running* task holds only what was flushed at RUNNING-start, so returning
     # it would admit the cross-process grantee and then hand them a frozen progress bar —
@@ -280,10 +292,11 @@ function _register_or_watch!(runtime::WorkerRuntime, task_key::String, owner::Ow
         # Snapshot the watcher list ONCE, before anything is written, and show every
         # grant the same value. Reading it live instead made the app's authorizer hook
         # see a different `watchers` argument per backend and per timing: the in-memory
-        # store's `add_watcher!` mutates the very object we hold, while the database
-        # store's only patches a live copy when the task is already registered as active.
-        # A hook written as `all(w -> same_org(w, uid), watchers)` would then reach
-        # different verdicts on different nodes — parity that a security hook must have.
+        # store's `add_watcher!` mutated the very object we hold, while the database store's
+        # only patched a live copy when the task was already registered as active. Both now take
+        # the single `add_watcher!(runtime, ·)` store-then-mirror path, so that particular
+        # divergence is gone -- but the snapshot stays, because a hook written as
+        # `all(w -> same_org(w, uid), watchers)` must see one value per call regardless.
         seen = task_info === nothing ? String[] : copy(task_info.watchers)
 
         # Authorize every grant before applying any. Otherwise a refusal partway through
@@ -382,8 +395,10 @@ function _execute_task_async(runtime::WorkerRuntime, task_key::String, callback:
         # unconditional `set_task!` wrote the store LAST and so never opened that window;
         # claiming the start (#142) reversed the order, and this restores it. Registering while
         # the record is still PENDING is harmless: that sweep only looks at RUNNING.
-        register_active_task!(runtime, task_key, current_task())
-        register_active_task_info!(runtime, task_key, task_info)
+        # ONE atomic publish, not two writes: `_deregister_run!` fences on `run_id` read off the
+        # info, so a handle visible without its info is invisible to the fence -- and a predecessor
+        # finishing in that window deletes the SUCCESSOR's handle (#167). See `register_run!`.
+        register_run!(runtime, task_key, task_info, current_task())
 
         if !try_transition!(runtime.store, task_key, (PENDING,), RUNNING;
                             run_id=task_info.run_id, started_at=started)
@@ -456,11 +471,11 @@ function _execute_task_async(runtime::WorkerRuntime, task_key::String, callback:
         return task_info
     end
 
-    # No `register_active_task!` here. The body registers `current_task()` -- the very same Task
-    # object -- as part of claiming its start, so this was always a duplicate write of an
-    # identical value; under `@async` it merely happened first, because the parent could not
-    # yield between the spawn and this line. Under `Threads.@spawn` the body may complete and
-    # deregister BEFORE this line runs, re-registering a finished task that nothing will ever
+    # No handle registration here. The body registers `current_task()` -- the very same Task
+    # object -- as part of claiming its start (through `register_run!`), so this was always a
+    # duplicate write of an identical value; under `@async` it merely happened first, because
+    # the parent could not yield between the spawn and this line. Under `Threads.@spawn` the
+    # body may complete and deregister BEFORE this line runs, re-registering a finished task that nothing will ever
     # clean up. Its one non-duplicate effect was on the early-return path above, where it
     # registered a handle for a key with no record at all -- a permanent leak that makes
     # `recover_zombie_tasks!` skip a later genuinely-dead run under the same key, since that
@@ -616,7 +631,10 @@ function cancel_task(task_id::AbstractString, authority::TaskAuthority; runtime:
                                   error="Cancelled", completed_at=cancelled_at)
 
         if !claimed
-            latest = get_task_info(runtime, task_info.id)
+            # DURABLE: reaching here means the row is no longer in `(PENDING, RUNNING)`, or
+            # failed the run fence. A live object still reporting RUNNING would render as
+            # "already finished with status RUNNING" -- a sentence the CAS above just disproved.
+            latest = get_task_info(runtime.store, task_info.id)
             latest === nothing && return Dict{Symbol, Any}(:error => "Task not found")
             if latest.run_id != task_info.run_id
                 # Distinguished on purpose: reporting the successor's status here would say

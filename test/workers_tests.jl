@@ -239,8 +239,8 @@ end
         # A run handle and its live object, as an executing task would have published them.
         # The two must be treated differently below, which is the whole point of the pairing.
         in_flight = TaskInfo("in-flight")
-        register_active_task!(rt_store, "in-flight", @async nothing)
-        register_active_task_info!(rt_store, "in-flight", in_flight)
+        Nitro.Workers.register_active_task!(rt_store, "in-flight", @async nothing)
+        Nitro.Workers.register_active_task_info!(rt_store, "in-flight", in_flight)
 
         shutdown!(rt_store)
 
@@ -323,7 +323,7 @@ end
 @testset "publishing a successor evicts the run it displaced from the live caches (#167)" begin
     # The live caches are keyed by task id but each entry describes one RUN, and `replace_task!`
     # is the moment a run stops owning its key. Leaving the predecessor behind opens a window
-    # between that write and the successor's `register_active_task_info!` in which every reader
+    # between that write and the successor's `register_run!` in which every reader
     # sees a run that no longer owns the record -- usually a terminal one. `cancel_task` then
     # refuses to cancel a live successor, `get_task_status` reports it finished, and a concurrent
     # submit replaces the record again instead of deduplicating onto it.
@@ -338,8 +338,8 @@ end
         push!(predecessor.watchers, owner.user_id)
         replace_task!(store, key, predecessor)
         handle = @async nothing
-        register_active_task_info!(rt_store, key, predecessor)
-        register_active_task!(rt_store, key, handle)
+        Nitro.Workers.register_active_task_info!(rt_store, key, predecessor)
+        Nitro.Workers.register_active_task!(rt_store, key, handle)
 
         successor = TaskInfo(key)
         successor.status = PENDING
@@ -377,6 +377,14 @@ end
     key = scoped_task_key("windowed", owner)
 
     try
+        # Deliberately registered and deliberately NOT evicted: this is the stale state the rule
+        # is about, and without it the live and durable reads return the same object and the
+        # assertion below cannot tell the two apart.
+        predecessor = TaskInfo(key)
+        predecessor.status = CANCELLED
+        push!(predecessor.watchers, owner.user_id)
+        Nitro.Workers.register_active_task_info!(rt_store, key, predecessor)
+
         successor = TaskInfo(key)
         successor.status = PENDING
         push!(successor.watchers, owner.user_id)
@@ -386,6 +394,92 @@ end
         @test get_task_info(store, key).run_id == successor.run_id
     finally
         reset_runtime!(rt_store)
+    end
+end
+
+@testset "a late predecessor cannot evict a live successor's run handle (#167)" begin
+    # `_deregister_run!` fences on `run_id` read off the live `TaskInfo`, and probes and deletes
+    # in ONE critical section. This covers that fence: a predecessor finishing after a successor
+    # has published must not drop the successor's handle, because `recover_zombie_tasks!` reads
+    # exactly that as death -- marking a genuinely running task FAILED, the #108 defect the fence
+    # exists to prevent.
+    #
+    # It does NOT cover the other half of that fix, and cannot: publishing the handle and the info
+    # as two writes rather than one left a window in which the handle was visible and the fence's
+    # oracle was not, and that window is not observable from outside the runtime. `register_run!`
+    # closes it structurally instead -- it is the single publish path, so the state simply cannot
+    # be built. Reviewing that is reading the call sites, not running this.
+    store = InMemoryWorkerStore()
+    rt_store = WorkerRuntime(store)
+    owner = Owner("user-fence")
+    key = scoped_task_key("fenced", owner)
+    handles = Task[]
+
+    try
+        predecessor = TaskInfo(key)
+        predecessor.status = RUNNING
+        push!(predecessor.watchers, owner.user_id)
+        replace_task!(store, key, predecessor)
+        p_handle = @async nothing
+        push!(handles, p_handle)
+        Nitro.Workers.register_active_task_info!(rt_store, key, predecessor)
+        Nitro.Workers.register_active_task!(rt_store, key, p_handle)
+
+        successor = TaskInfo(key)
+        successor.status = PENDING
+        push!(successor.watchers, owner.user_id)
+        replace_task!(rt_store, key, successor)
+
+        # The successor starts. ONE atomic publish, which is what the execute paths do -- a
+        # handle can never be visible without the info the fence reads its `run_id` from.
+        s_handle = @async nothing
+        push!(handles, s_handle)
+        register_run!(rt_store, key, successor, s_handle)
+
+        # ...and only now does the predecessor finish.
+        Nitro.Workers._deregister_run!(rt_store, predecessor)
+
+        @test get_active_task(rt_store, key) === s_handle
+        @test get_active_task_info(rt_store, key) === successor
+
+
+        # The proof that it matters: the sweep must not claim a live run.
+        successor.status = RUNNING
+        set_task!(store, key, successor)
+        @test recover_zombie_tasks!(; runtime=rt_store) == 0
+        @test get_task_info(store, key).status == RUNNING
+    finally
+        foreach(wait, handles)
+        reset_runtime!(rt_store)
+    end
+end
+
+@testset "displacing a runtime tears the old one down (#167)" begin
+    # The extension slot IS the ownership handle, so a runtime the app no longer points at is
+    # unreachable -- and `uninstall!` only ever sees the occupant. Leaving it running would be
+    # the #29 leak with one more level of indirection, which is the leak this whole issue closes.
+    app = Nitro.Core.App()
+    store = InMemoryWorkerStore()
+
+    try
+        first_runtime = start!(app; queues=["displaced-q"], store=store, recover_zombies=false)
+        scheduler = get_cleanup_scheduler(first_runtime)[]
+        channel = get_sequential_queues(first_runtime)["displaced-q"].channel
+
+        # Same backend: `start!` must be idempotent rather than mint a second runtime over it.
+        @test start!(app; queues=["displaced-q"], store=store, recover_zombies=false) === first_runtime
+        @test !istaskdone(scheduler.task)
+        @test isopen(channel)
+
+        # A genuinely different runtime displaces it -- and takes it down on the way.
+        second_runtime = WorkerRuntime(store)
+        @test install!(app, second_runtime) === second_runtime
+        @test worker_runtime(app) === second_runtime
+        @test istaskdone(scheduler.task)
+        @test !isopen(channel)
+        @test isempty(get_sequential_queues(first_runtime))
+    finally
+        uninstall!(app)
     end
 end
 
@@ -1161,14 +1255,14 @@ end
             a = TaskInfo("alice::handles")
             a.status = RUNNING
             replace_task!(store, a.id, a)
-            register_active_task!(rt_store, a.id, @async sleep(0.01))
+            Nitro.Workers.register_active_task!(rt_store, a.id, @async sleep(0.01))
 
             b = TaskInfo("alice::handles")           # the resubmit takes over the key
             b.status = RUNNING
             replace_task!(store, b.id, b)
             b_handle = @async (sleep(30); nothing)
-            register_active_task!(rt_store, b.id, b_handle)
-            register_active_task_info!(rt_store, b.id, b)
+            Nitro.Workers.register_active_task!(rt_store, b.id, b_handle)
+            Nitro.Workers.register_active_task_info!(rt_store, b.id, b)
 
             # Run A finally finishes. Its CAS correctly writes nothing -- but before #108
             # the teardown that follows was keyed by ID, so it deleted B's handle too.

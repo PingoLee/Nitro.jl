@@ -28,14 +28,15 @@ using Nitro.Workers    # the contract names are not re-exported from `Nitro`
 | `cleanup_tasks!(store, retain_days::Int)` | Prune finished records, returns how many went |
 | `get_all_tasks(store, authority::TaskAuthority; status, queue_name)` | `Vector{TaskInfo}` |
 
-# Authorization hooks
+# Application hooks
 
-Both are plain slots the application writes and the framework reads through `Base.invokelatest`.
+Each is a plain slot the application writes and the framework reads through `Base.invokelatest`.
 
 | Method | Contract |
 |---|---|
 | `get_queue_authorizer(store)` / `set_queue_authorizer!(store, f)` | `f(queue_name::String, user_id::String)::Bool`, or `nothing` |
 | `get_watch_authorizer(store)` / `set_watch_authorizer!(store, f)` | `f(task_key, watchers, user_id)::Bool`, or `nothing` |
+| `get_error_redactor(store)` / `set_error_redactor!(store, f)` | `f(exception, rendered)::String`, or `nothing` |
 
 # Locking
 
@@ -51,8 +52,9 @@ processor tasks, the cleanup scheduler, and the process-local run handles belong
 cannot leak them by forgetting a teardown method, which is what
 [#29](https://github.com/PingoLee/Nitro.jl/issues/29) was. There is no `shutdown!` to implement.
 
-Two optional methods exist and both default to a no-op: `clear_records!(store)`, which
-[`reset_runtime!`](@ref) calls and only a volatile backend should implement, and nothing else.
+One optional method exists, and its default is a no-op: `clear_records!(store)`, which
+[`reset_runtime!`](@ref) calls. Only a volatile backend should implement it — for a durable one
+the registry is rows that outlive the process, so the no-op default is the safe direction.
 
 # Obligations that are not methods
 

@@ -21,14 +21,25 @@ end
 #
 # `get_active_task_info` is now one mechanism rather than a per-backend one: the runtime publishes
 # the object the executing run itself registered, so the probe answers with whichever run currently
-# owns the key, and `nothing` means no local run — where both deregisters are already no-ops. It
-# used to be an alias for the in-memory registry and a private PormG cache, which looked equivalent
-# and was not (#167).
+# owns the key. It used to be an alias for the in-memory registry and a private PormG cache, which
+# looked equivalent and was not (#167).
+#
+# **Probe and delete in ONE critical section.** Three separate `active_lock` acquisitions let a
+# successor register between the probe and the deletes, so the predecessor deleted handles it had
+# just been told it did not own.
+#
+# The `live === nothing` branch is safe because of [`register_run!`](@ref), not because of any
+# ordering convention: a handle and its info are published together, so that branch cannot find a
+# handle to delete. There is deliberately no "register the info first" rule to remember — the
+# window is not observable from outside the runtime, so a convention could not be tested and the
+# next refactor would silently reintroduce it.
 function _deregister_run!(runtime::WorkerRuntime, task_info::TaskInfo)
-    live = get_active_task_info(runtime, task_info.id)
-    if live === nothing || live.run_id == task_info.run_id
-        deregister_active_task!(runtime, task_info.id)
-        deregister_active_task_info!(runtime, task_info.id)
+    lock(runtime.active_lock) do
+        live = Base.get(runtime.active_task_infos, task_info.id, nothing)
+        if live === nothing || live.run_id == task_info.run_id
+            delete!(runtime.active_tasks, task_info.id)
+            delete!(runtime.active_task_infos, task_info.id)
+        end
     end
     return nothing
 end
@@ -123,8 +134,10 @@ function _execute_queued_task(runtime::WorkerRuntime, item::QueueItem)
     # unconditional `set_task!` wrote the store LAST and so never opened that window;
     # claiming the start (#142) reversed the order, and this restores it. Registering while
     # the record is still PENDING is harmless: that sweep only looks at RUNNING.
-    register_active_task!(runtime, task_info.id, current_task())
-    register_active_task_info!(runtime, task_info.id, task_info)
+    # ONE atomic publish, not two writes: `_deregister_run!` fences on `run_id` read off the
+    # info, so a handle visible without its info is invisible to the fence -- and a predecessor
+    # finishing in that window deletes the SUCCESSOR's handle (#167). See `register_run!`.
+    register_run!(runtime, task_info.id, task_info, current_task())
 
     if !try_transition!(runtime.store, task_info.id, (PENDING,), RUNNING;
                         run_id=task_info.run_id, started_at=started)

@@ -96,6 +96,31 @@ function get_active_task(runtime::WorkerRuntime, task_id::String)
     end
 end
 
+"""
+    register_run!(runtime::WorkerRuntime, task_id::String, task_info::TaskInfo, task::Task)
+
+Publish a run's live `TaskInfo` **and** its `Task` handle as one atomic step.
+
+The two must not be published separately, and the reason is [`_deregister_run!`](@ref): it decides
+whose handles it may drop by comparing `run_id` on the *info*, so the info is the fence's only
+oracle. A run that had published its handle but not yet its oracle was invisible to the fence, and
+a predecessor finishing in that window deleted the **successor's** handle — which
+`recover_zombie_tasks!` reads as death, marking a genuinely running task `FAILED` (#167). That is
+the #108 defect the fence exists to prevent, arriving through the back door.
+
+Ordering the two writes correctly would also fix it, but only by convention, and the window is not
+observable from outside the runtime — so a test cannot hold the convention in place. Publishing
+both under one `active_lock` makes "a handle never exists without its info" structural instead, and
+`_deregister_run!`'s `live === nothing` branch sound by construction rather than by inspection.
+"""
+function register_run!(runtime::WorkerRuntime, task_id::String, task_info::TaskInfo, task::Task)
+    lock(runtime.active_lock) do
+        runtime.active_task_infos[task_id] = task_info
+        runtime.active_tasks[task_id] = task
+    end
+    return task_info
+end
+
 function register_active_task!(runtime::WorkerRuntime, task_id::String, task::Task)
     lock(runtime.active_lock) do
         runtime.active_tasks[task_id] = task
@@ -175,6 +200,15 @@ authorization gate stay in the store — the overlay writes only volatile fields
 
 When the live object *is* the stored record — `InMemoryWorkerStore`, where the registry holds the
 same objects — the overlay is skipped rather than assigning each field to itself.
+
+That identity guard is also what keeps this loop, which runs outside the store's task lock, from
+mutating a record another reader holds. On the in-memory backend the two can never *disagree* for
+one id: a run registers the very object `get_task_info(store, ·)` returned, and the one operation
+that swaps the stored object for a different one — [`replace_task!`](@ref) on a re-run — evicts the
+live entry in the same breath, so there is no interval in which the cache names one object and the
+registry another. (`set_task!` also swaps, but only when there was no entry to disagree with.) On a
+serializing backend the two always differ, and there the objects being written are fresh ones this
+call just deserialized, owned by nobody else.
 """
 function get_all_tasks(runtime::WorkerRuntime, authority::TaskAuthority;
                        status::Union{Nothing, TaskStatus}=nothing,
@@ -207,9 +241,9 @@ Publish a new run's whole record, and evict the run it displaced from the live c
 
 The eviction is what keeps `get_task_info(runtime, ·)` honest. The live caches are keyed by task
 id, but each entry describes one **run** — and `replace_task!` is precisely the moment a run stops
-owning its key. Leaving the predecessor behind opens a window between this write and the
-successor's `register_active_task_info!` in which the live slot holds a run that no longer owns the
-record, usually a terminal one: a concurrent `cancel_task` then refuses to cancel a live successor
+owning its key. Leaving the predecessor behind opens a window between this write and the successor's
+[`register_run!`](@ref) in which the live slot holds a run that no longer owns the record, usually
+a terminal one: a concurrent `cancel_task` then refuses to cancel a live successor
 ("already finished"), a concurrent submit concludes the key is finished and replaces the record
 again, and `get_task_status` reports the predecessor's terminal status for a task that is pending.
 
@@ -427,6 +461,12 @@ The slot holds the **runtime**, not the store, because `uninstall!` is the teard
 the thing in the slot has to be the thing that owns teardown.
 
 Registration only — nothing is started here. `start!` does that.
+
+**A `WorkerRuntime` belongs to exactly one slot.** Displacing one shuts it down, so installing the
+same runtime object into a second `App` and then displacing it there leaves the first app holding a
+runtime whose queues are closed and whose scheduler is stopped, with nothing to say so. To share a
+backend across apps, give each its own runtime over the same store — which is the supported pattern
+and the one that makes `uninstall!` on one app leave the other running.
 """
 function install!(ctx::App; key::Symbol=DEFAULT_EXTENSION_KEY,
                   store::AbstractWorkerStore=InMemoryWorkerStore())
@@ -434,6 +474,15 @@ function install!(ctx::App; key::Symbol=DEFAULT_EXTENSION_KEY,
 end
 
 function install!(ctx::App, runtime::WorkerRuntime; key::Symbol=DEFAULT_EXTENSION_KEY)
+    # Displacing a runtime tears it down. The slot IS the ownership handle, so a runtime the app
+    # no longer points at is unreachable — and an unreachable runtime with a live scheduler and
+    # live queue processors is the #29 leak with one more level of indirection. `uninstall!`
+    # cannot clean it up afterwards either: it only ever sees the occupant.
+    existing = worker_runtime(ctx; key)
+    if existing isa WorkerRuntime && existing !== runtime
+        shutdown!(existing)
+    end
+
     set_extension!(ctx, key, runtime)
     return runtime
 end
