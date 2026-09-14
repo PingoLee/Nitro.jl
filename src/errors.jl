@@ -3,7 +3,7 @@ module Errors
 
 import JSON
 
-export ValidationError, CookieError, AuthorizationError
+export ValidationError, CookieError, AuthorizationError, StoreInterfaceError
 
 """
     ValidationError(msg::String)
@@ -152,6 +152,43 @@ end
 
 function Base.showerror(io::IO, e::AuthorizationError)
     print(io, "Authorization Error: $(e.msg)")
+end
+
+
+"""
+    StoreInterfaceError(f::Function, store_type::Type)
+
+The exception a pluggable store backend raises when it is handed a call it never implemented.
+
+Nitro has two store contracts — [`AbstractWorkerStore`](@ref) for the worker queue and
+[`AbstractSessionStore`](@ref) for sessions — and both are open for third-party backends. Each
+required method carries a fallback defined on the *abstract* type; reaching that fallback means the
+concrete store did not define the method, so this is thrown instead of letting the call fail far
+downstream with a bare `MethodError` that names neither the contract nor the missing piece.
+
+The message names the method, the offending store type, and where the contract is documented.
+
+# Not a substitute for `MethodError`
+
+The fallbacks are typed at the contract's *documented* argument types, never `args...`. A call whose
+positional arguments do not match the contract at all therefore still raises an ordinary
+`MethodError` — a caller-side mistake keeps reporting as one, rather than being mislabelled as a
+missing backend method.
+"""
+struct StoreInterfaceError <: Exception
+    f::Function
+    store_type::Type
+end
+
+function Base.showerror(io::IO, e::StoreInterfaceError)
+    name = nameof(e.f)
+    println(io, "StoreInterfaceError: `", e.store_type, "` does not implement `", name,
+                "`, which its store contract requires.")
+    print(io, "Define a method `", name, "(::", e.store_type, ", ...)`. ",
+              "The full contract is in the docstring of the abstract store type ",
+              "(`?AbstractWorkerStore` or `?AbstractSessionStore`); ",
+              "`missing_store_methods` / `missing_session_methods` list everything a type is ",
+              "still missing.")
 end
 
 end

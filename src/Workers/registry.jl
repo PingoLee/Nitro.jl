@@ -1,3 +1,83 @@
+"""
+    AbstractWorkerStore
+
+The storage contract behind Nitro's worker queue. Two backends ship — [`InMemoryWorkerStore`](@ref)
+and `PormGWorkerStore` (in `NitroPormGExt`) — and an application may add its own.
+
+Every method below is **required**. Each has a fallback defined on this abstract type that raises
+`StoreInterfaceError` naming the missing method, so an incomplete backend fails with a message
+saying what to implement rather than a bare `MethodError` from deep inside task execution.
+[`missing_store_methods`](@ref) lists what a type still owes and is the intended conformance check
+for a backend's own test suite:
+
+```julia
+@test isempty(missing_store_methods(MyWorkerStore))
+```
+
+# Durable task records
+
+| Method | Contract |
+|---|---|
+| `get_task_info(store, task_id::String)` | `TaskInfo` or `nothing`; may serve a live object, see *Live objects* |
+| `reload_task(store, task_id::String)` | `TaskInfo` or `nothing`, bypassing any in-process cache |
+| `set_task!(store, task_id::String, task_info::TaskInfo)` | Write volatile state; must never write `watchers` or `run_id` |
+| `replace_task!(store, task_id::String, task_info::TaskInfo)` | Write the whole record, `watchers` and `run_id` included |
+| `add_watcher!(store, task_id::String, user_id::String)` | Atomic compare-and-set append, returns `Bool` |
+| `try_transition!(store, task_id::String, from, to::TaskStatus; run_id, …)` | Atomic conditional status change, returns `Bool` |
+| `delete_task!(store, task_id::String)` | Remove one record |
+| `cleanup_tasks!(store, retain_days::Int)` | Prune finished records, returns how many went |
+| `get_all_tasks(store, authority::TaskAuthority; status, queue_name)` | `Vector{TaskInfo}` |
+
+# Process-local runtime handles
+
+These describe one **run** on this process, never durable state, and must not be serialized.
+
+| Method | Contract |
+|---|---|
+| `get_active_task(store, task_id::String)` | The running `Task`, or `nothing`. This is the whole zombie-recovery criterion |
+| `register_active_task!(store, task_id::String, task::Task)` | Record the handle for the current run |
+| `deregister_active_task!(store, task_id::String)` | Drop it — only the run that registered it may |
+| `get_active_task_info(store, task_id::String)` | The live `TaskInfo` the callback holds, or `nothing` |
+| `register_active_task_info!(store, task_id::String, task_info::TaskInfo)` | Publish that object |
+| `deregister_active_task_info!(store, task_id::String)` | Drop it; a no-op is valid when the store has no such cache |
+
+# Authorization hooks
+
+Both are plain slots the application writes and the framework reads through `Base.invokelatest`.
+
+| Method | Contract |
+|---|---|
+| `get_queue_authorizer(store)` / `set_queue_authorizer!(store, f)` | `f(queue_name::String, user_id::String)::Bool`, or `nothing` |
+| `get_watch_authorizer(store)` / `set_watch_authorizer!(store, f)` | `f(task_key, watchers, user_id)::Bool`, or `nothing` |
+
+# Queues, locking and lifecycle
+
+| Method | Contract |
+|---|---|
+| `get_sequential_queues(store)` | The `Dict{String, SequentialQueue}` itself — callers mutate it in place |
+| `get_queue_lock(store)` | The `ReentrantLock` guarding that dict |
+| `get_cleanup_scheduler(store)` | An **assignable** `Ref{Union{Nothing, CleanupScheduler}}`; callers write through it |
+| `lock_tasks(callback::Function, store)` | **Callback-first**, so it is called `lock_tasks(store) do … end` |
+
+# Obligations that are not methods
+
+- **Live objects.** `get_task_info` and `get_active_task_info` may return the very `TaskInfo` a
+  running callback holds, and callers mutate it expecting other in-process readers to see the
+  change. A store that reconstructs a fresh object on every read must mirror terminal writes onto
+  the live one, or progress and cancellation stop propagating.
+- **`run_id` round-trips, but `try_transition!` never writes it.** It is a precondition, not state.
+- **`watchers` is populated on every read path.** Authorization reads it off whatever
+  `get_task_info` and `reload_task` return, so a store that omits it silently denies everyone.
+- **`lock_tasks` is process-local.** For a database-backed store it guards this process only, so
+  never build a read-modify-write on it; express such a write as a single atomic store operation.
+
+# `TaskInfo.error` is application-controlled free text
+
+A failed task's `error` is rendered from the exception the **application's** callback threw. If that
+callback interpolates user data into an exception message, that data reaches this store. Nitro
+bounds the text and offers a redaction hook — see `set_error_redactor!` — but the store is where it
+lands, so a backend that persists it is persisting attacker-influenceable input.
+"""
 abstract type AbstractWorkerStore end
 
 # -- Storage and Registry interface functions (Abstract protocols) --
@@ -101,10 +181,27 @@ be indistinguishable in review from one that meant to skip the fence.
 
 A store that accepts `run_id` and ignores it is **not a conforming store** — it reintroduces #108
 for its own backend, exactly as a store that reads the status and then saves reintroduces #88. An
-un-updated third-party store fails loudly instead: these are bare interface stubs with no fallback
-method, so a call carrying the keyword raises `MethodError` at the call site.
+un-updated third-party store fails loudly instead. The contract fallbacks below are typed at the
+store's *abstract* type, so a stale concrete method still wins dispatch on its positional arguments
+and the unsupported `run_id` keyword still raises `MethodError` at the call site — the fallback
+never masks it.
 """
 function try_transition! end
+
+"""
+    reload_task(store, task_id::String) -> Union{Nothing, TaskInfo}
+
+Read the **durable** record, bypassing any in-process cache.
+
+Distinct from [`get_task_info`](@ref), which is free to serve a live in-memory object for a
+running task so callers see fresh progress without a round-trip. That cache is per process,
+so its `watchers` can be stale the moment another process issues a grant — and an
+authorization check that consults only the cache refuses a user who *is* authorized in the
+durable record. Read paths therefore fall back to this before denying.
+
+Used only on the denial path, so the common case still costs nothing.
+"""
+function reload_task end
 
 function delete_task! end
 function cleanup_tasks! end
@@ -171,6 +268,113 @@ function get_queue_lock end
 # -- Cleanup and Locking helper functions --
 function get_cleanup_scheduler end
 function lock_tasks end
+
+# ============================================================================
+# The contract, as data
+# ============================================================================
+
+"""
+    WORKER_STORE_INTERFACE
+
+The [`AbstractWorkerStore`](@ref) contract as data: one row per required method, holding the
+function and its **documented** positional argument types, with `AbstractWorkerStore` standing in
+the store slot.
+
+Two consumers read it and must not drift apart — the fallback methods generated directly below, and
+[`missing_store_methods`](@ref). Adding a method to the contract means adding a row here; nothing
+else.
+
+The types are the ones the framework actually calls with, deliberately not widened supertypes. A
+fallback typed at `args...` would also catch a caller who passed the wrong positional type and
+misreport that as an unimplemented backend method. Typed exactly, a mismatched call still raises an
+ordinary `MethodError`, which is what it is.
+"""
+const WORKER_STORE_INTERFACE = (
+    # -- Durable task records --
+    (get_task_info,                 (AbstractWorkerStore, String)),
+    (reload_task,                   (AbstractWorkerStore, String)),
+    (set_task!,                     (AbstractWorkerStore, String, TaskInfo)),
+    (replace_task!,                 (AbstractWorkerStore, String, TaskInfo)),
+    (add_watcher!,                  (AbstractWorkerStore, String, String)),
+    (try_transition!,               (AbstractWorkerStore, String, Any, TaskStatus)),
+    (delete_task!,                  (AbstractWorkerStore, String)),
+    (cleanup_tasks!,                (AbstractWorkerStore, Int)),
+    (get_all_tasks,                 (AbstractWorkerStore, TaskAuthority)),
+    # -- Process-local runtime handles --
+    (get_active_task,               (AbstractWorkerStore, String)),
+    (register_active_task!,         (AbstractWorkerStore, String, Task)),
+    (deregister_active_task!,       (AbstractWorkerStore, String)),
+    (get_active_task_info,          (AbstractWorkerStore, String)),
+    (register_active_task_info!,    (AbstractWorkerStore, String, TaskInfo)),
+    (deregister_active_task_info!,  (AbstractWorkerStore, String)),
+    # -- Authorization hooks --
+    (get_queue_authorizer,          (AbstractWorkerStore,)),
+    (set_queue_authorizer!,         (AbstractWorkerStore, Any)),
+    (get_watch_authorizer,          (AbstractWorkerStore,)),
+    (set_watch_authorizer!,         (AbstractWorkerStore, Any)),
+    # -- Queues, locking and lifecycle --
+    (get_sequential_queues,         (AbstractWorkerStore,)),
+    (get_queue_lock,                (AbstractWorkerStore,)),
+    (get_cleanup_scheduler,         (AbstractWorkerStore,)),
+    (lock_tasks,                    (Function, AbstractWorkerStore)),
+)
+
+_store_arg_index(argtypes) = something(findfirst(T -> T === AbstractWorkerStore, argtypes))
+
+# Generate one fallback per row. These are the only methods in the package defined *on* the abstract
+# type, which is also how `missing_store_methods` recognizes them: a conforming backend's method is
+# narrower in the store slot, so it always wins dispatch and the fallback is never reached.
+#
+# `kwargs...` is accepted and ignored on purpose. It never swallows a keyword mistake, because a
+# store that defines the method at all is more specific on the positional arguments and so is the
+# one that gets to reject the keyword.
+for (f, argtypes) in WORKER_STORE_INTERFACE
+    local idx = _store_arg_index(argtypes)
+    local params = [Expr(:(::), Symbol("a", i), T) for (i, T) in enumerate(argtypes)]
+    local store_arg = Symbol("a", idx)
+    @eval @noinline function $(nameof(f))($(params...); kwargs...)
+        throw(StoreInterfaceError($f, typeof($store_arg)))
+    end
+end
+
+function _is_contract_fallback(m::Method, store_index::Int)
+    sig = Base.unwrap_unionall(m.sig).parameters
+    # sig[1] is the function's own type, so positional argument `i` sits at `sig[i + 1]`.
+    return length(sig) >= store_index + 1 && sig[store_index + 1] === AbstractWorkerStore
+end
+
+"""
+    missing_store_methods(S::Type{<:AbstractWorkerStore}) -> Vector{Symbol}
+
+The [`AbstractWorkerStore`](@ref) methods `S` has not implemented, in contract order. Empty means
+`S` is conforming.
+
+This is the conformance check a backend runs in its own test suite. It uses no test framework on
+purpose, so it ships with the package and costs a third-party store nothing to call:
+
+```julia
+@test isempty(missing_store_methods(MyWorkerStore))
+```
+
+A name appears here when dispatch for `S` lands on the fallback defined on the abstract type — that
+is, when `S` itself contributed nothing. Note that it answers about a *type*, so it can be run at
+load time, in a test, or in a REPL, without constructing a store.
+"""
+function missing_store_methods(S::Type{<:AbstractWorkerStore})
+    names = Symbol[]
+    for (f, argtypes) in WORKER_STORE_INTERFACE
+        idx = _store_arg_index(argtypes)
+        concrete = Any[argtypes...]
+        concrete[idx] = S
+        sig = Tuple{concrete...}
+        if !hasmethod(f, sig)
+            push!(names, nameof(f))
+        elseif _is_contract_fallback(which(f, sig), idx)
+            push!(names, nameof(f))
+        end
+    end
+    return names
+end
 
 # ============================================================================
 # InMemoryWorkerStore Implementation
@@ -286,21 +490,6 @@ function try_transition!(store::InMemoryWorkerStore, task_id::String, from, to::
         return true
     end
 end
-
-"""
-    reload_task(store, task_id::String) -> Union{Nothing, TaskInfo}
-
-Read the **durable** record, bypassing any in-process cache.
-
-Distinct from [`get_task_info`](@ref), which is free to serve a live in-memory object for a
-running task so callers see fresh progress without a round-trip. That cache is per process,
-so its `watchers` can be stale the moment another process issues a grant — and an
-authorization check that consults only the cache refuses a user who *is* authorized in the
-durable record. Read paths therefore fall back to this before denying.
-
-Used only on the denial path, so the common case still costs nothing.
-"""
-function reload_task end
 
 # Nothing is cached: the registry *is* the durable record.
 reload_task(store::InMemoryWorkerStore, task_id::String) = get_task_info(store, task_id)

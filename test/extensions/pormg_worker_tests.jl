@@ -327,6 +327,20 @@ else
         @test store isa AbstractWorkerStore
         @test store.db_key == "db"
 
+        # The shipped persistent backend satisfies the whole contract. This is the check a
+        # third-party store (#9's Redis backend, say) runs in its own suite, and it is the only
+        # thing standing between "PormG forgot a method" and an opaque `MethodError` raised while
+        # serving a live task -- which is exactly how the missing `shutdown!` went unnoticed.
+        @test isempty(missing_store_methods(RealPormGWorkerStore))
+
+        # The session half of the same contract, checked here because this is where the extension
+        # is actually loaded; `pormg_session_tests.jl` exercises a local replica rather than the
+        # shipped type.
+        let ext = Base.get_extension(Nitro, :NitroPormGExt)
+            @test !isnothing(ext)
+            @test isempty(Nitro.Types.missing_session_methods(getproperty(ext, :PormGSessionStore)))
+        end
+
         @testset "create and read task" begin
             info = TaskInfo("task-1"; queue_name="reports")
             push!(info.watchers, "user-x")

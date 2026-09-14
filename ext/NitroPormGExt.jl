@@ -281,22 +281,9 @@ function _ensure_session_table!(conn, model)
     return nothing
 end
 
-"""
-    pormg_nitro_session(; db_key="db") -> PormGSessionStore
-
-One-call setup for PormG-backed sessions.  Creates the `nitro_session` table
-(if it doesn't exist), creates the expiry index, and returns a ready-to-use
-`PormGSessionStore`.
-
-## Example
-```julia
-using Nitro, PormG
-PormG.Configuration.load("db")
-
-store = pormg_nitro_session()
-serve(middleware=[SessionMiddleware(store=store)])
-```
-"""
+# Deliberately no docstring: the authoritative one is on the weakdep stub in `src/exts.jl`, which
+# is also what `?pormg_nitro_session` resolves to. Two docstrings on one function render as two
+# conflicting help entries and drift apart independently (#33).
 function pormg_nitro_session(; db_key::String="db")
     model = session_model()
     if isnothing(model)
@@ -969,12 +956,7 @@ function _ensure_task_table!(conn, model)
     return nothing
 end
 
-"""
-    pormg_nitro_worker(; db_key="db") -> PormGWorkerStore
-
-One-call setup for PormG-backed workers. Creates the `nitro_task` table (if it doesn't exist),
-creates indexes, and returns a ready-to-use `PormGWorkerStore`.
-"""
+# Deliberately no docstring -- see the note on `pormg_nitro_session` above; `src/exts.jl` owns it.
 function pormg_nitro_worker(; db_key::String="db")
     model = task_model()
     if isnothing(model)

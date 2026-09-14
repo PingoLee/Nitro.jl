@@ -731,24 +731,17 @@ end
 """
 Remove expired sessions from a store.
 
-If the store implements `cleanup_expired_sessions!`, delegate to it. Otherwise,
-leave pruning as a no-op for stores that do not support background cleanup.
+Delegates to `cleanup_expired_sessions!`, which is an optional part of the
+`AbstractSessionStore` contract and defaults to a no-op — so a store that does not
+support background cleanup needs nothing here.
+
+This used to wrap the call in a `try`/`catch` that swallowed any `MethodError` whose
+`.f` was `cleanup_expired_sessions!`, which is how the optionality was expressed before
+the default existed. That rescue also swallowed a *genuine* `MethodError` raised inside a
+conforming store's own cleanup body, turning a real bug into a silent no-op. Errors from a
+store that does implement cleanup now propagate.
 """
 function prunesessions!(store::AbstractSessionStore)
-    try
-        return cleanup_expired_sessions!(store)
-    catch e
-        if e isa MethodError && e.f === cleanup_expired_sessions!
-            return nothing
-        end
-        rethrow()
-    end
-end
-
-"""
-Remove expired sessions from a MemoryStore.
-"""
-function prunesessions!(store::MemoryStore)
     return cleanup_expired_sessions!(store)
 end
 

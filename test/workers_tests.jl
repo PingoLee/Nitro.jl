@@ -4,10 +4,52 @@ using Test
 using Dates
 using Nitro
 using Nitro.Workers
-using Nitro.Errors: AuthorizationError
+using Nitro.Errors: AuthorizationError, StoreInterfaceError
 
 function wait_for(predicate::Function; timeout::Real=5.0)
     return timedwait(predicate, timeout)
+end
+
+# A store that implements nothing. Declared at item scope because a bare `struct` inside a
+# `@testset` body would still work, but this one is referenced from two testsets.
+struct NothingWorkerStore <: AbstractWorkerStore end
+
+@testset "Worker store contract is discoverable and loud" begin
+    # The shipped backend conforms. This is the assertion a third-party store copies.
+    @test isempty(missing_store_methods(InMemoryWorkerStore))
+
+    # ...and the check can actually fail, which is what makes the line above mean something.
+    missing_names = missing_store_methods(NothingWorkerStore)
+    @test length(missing_names) == length(Nitro.Workers.WORKER_STORE_INTERFACE)
+    @test :get_task_info in missing_names
+    @test :lock_tasks in missing_names          # the callback-first row
+    @test :get_cleanup_scheduler in missing_names
+
+    # Reaching a contract method on an incomplete store names the method and the type.
+    err = try
+        get_task_info(NothingWorkerStore(), "task-1")
+        nothing
+    catch e
+        e
+    end
+    @test err isa StoreInterfaceError
+    @test err.store_type === NothingWorkerStore
+    rendered = sprint(showerror, err)
+    @test occursin("get_task_info", rendered)
+    @test occursin("NothingWorkerStore", rendered)
+
+    # The fallbacks are typed at the contract's documented argument types rather than `args...`,
+    # precisely so a CALLER-side mistake is not mislabelled as a missing backend method. Against a
+    # fully conforming store, a wrong positional type must still be an ordinary `MethodError`.
+    store = InMemoryWorkerStore()
+    @test_throws MethodError get_task_info(store, 42)
+    @test_throws MethodError cleanup_tasks!(store, "not-a-day-count")
+
+    # A store that implements the contract never reaches a fallback, even for a keyword it does
+    # not accept: it is more specific on the positional arguments, so it is the one that rejects.
+    # This is the guarantee `try_transition!`'s docstring makes about stale third-party stores.
+    @test_throws MethodError try_transition!(store, "task-1", (PENDING,), RUNNING;
+                                             run_id=nothing, no_such_keyword=1)
 end
 
 @testset "Immediate task execution and deduplication" begin

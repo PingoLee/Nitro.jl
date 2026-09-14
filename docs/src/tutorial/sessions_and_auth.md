@@ -118,14 +118,40 @@ Sessions are stored as JSON in the database with a fixed-point expiry timestamp
 
 ### Custom Stores
 
-Implement these four methods for your store type `S <: AbstractSessionStore{String, Dict{String,Any}}`:
+Three methods are **required** for your store type `S <: AbstractSessionStore{String, Dict{String,Any}}`:
 
 ```julia
-Base.get(store::S, session_id::String, default)       # → SessionPayload or default
+Base.get(store::S, session_id::String, default)        # → SessionPayload or default
 set_session!(store::S, session_id::String, data; ttl)  # → persist data with TTL
-delete_session!(store::S, session_id::String)           # → remove a session
-cleanup_expired_sessions!(store::S)                     # → prune expired entries
+delete_session!(store::S, session_id::String)          # → remove a session
 ```
+
+`Base.get` is easy to overlook and is not optional — both `get_session` and the session
+middleware's own load path call it directly.
+
+A fourth is **optional**:
+
+```julia
+cleanup_expired_sessions!(store::S)                    # → prune expired entries
+```
+
+It defaults to doing nothing. Expiry is enforced when a session is *read* — `get_session`
+refuses a payload whose expiry has passed — so a store that never prunes accumulates dead
+rows but never serves a stale session. Implement it for any store whose rows outlive the
+process.
+
+Omitting a required method raises `StoreInterfaceError`, which names the method and your
+store type, rather than a bare `MethodError` from somewhere inside the middleware. Check a
+store against the whole contract with `missing_session_methods`, which takes the type and
+needs no instance:
+
+```julia
+using Test
+@test isempty(missing_session_methods(MySessionStore))
+```
+
+`Nitro.missing_store_methods` is the equivalent for the worker-queue contract
+([`AbstractWorkerStore`](workers.md)).
 
 ## Using `getsession(req)` — Django-style
 

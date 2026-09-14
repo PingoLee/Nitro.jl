@@ -7,7 +7,7 @@ import Base.Threads: ReentrantLock, lock
 
 using ..Core: App, LifecycleMiddleware
 using ..Core.AppContext: set_extension!, get_extension, delete_extension!
-using ..Core: AuthorizationError
+using ..Core: AuthorizationError, StoreInterfaceError
 
 const DEFAULT_EXTENSION_KEY = :workers
 
@@ -19,7 +19,7 @@ include("Workers/api.jl")
 
 export TaskStatus, PENDING, RUNNING, COMPLETED, FAILED, CANCELLED,
     TaskInfo, TaskOptions, QueueItem, SequentialQueue, CleanupScheduler,
-    AbstractWorkerStore, InMemoryWorkerStore,
+    AbstractWorkerStore, InMemoryWorkerStore, missing_store_methods,
     install!, uninstall!, worker_store, default_store,
     start!, startup, recover_zombie_tasks!,
     submit_task, submit_sequential_task, get_task_status, cancel_task,
