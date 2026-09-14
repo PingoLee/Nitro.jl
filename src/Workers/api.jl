@@ -403,11 +403,11 @@ function _execute_task_async(store::AbstractWorkerStore, task_key::String, callb
                 # `task_info` and one set of external side effects (#127). The token is not
                 # reset between attempts either, so a retry would start pre-cancelled.
                 if unwrapped isa TaskTimeoutError
-                    return _fail_task!(store, task_info, format_error(unwrapped))
+                    return _fail_task!(store, task_info, _store_error_text(store, unwrapped))
                 end
 
                 if retry_count == max_attempts
-                    return _fail_task!(store, task_info, format_error(unwrapped))
+                    return _fail_task!(store, task_info, _store_error_text(store, unwrapped))
                 end
 
                 # Cancellation-aware backoff. The catch above checks CANCELLED before sleeping and
@@ -522,8 +522,13 @@ function submit_sequential_task(queue_name::AbstractString, task_key::AbstractSt
     key = scoped_task_key(task_key, owner; scope)
     should_start = _register_or_watch!(store, key, owner; queue_name=queue_id, grants=watchers)
     if should_start
-        _start_queue_processor(store, queue_id)
-        queue = _get_or_create_queue(store, queue_id)
+        # One lookup, not two. `_start_queue_processor` already returns the queue it spawned a
+        # processor for, and a second `_get_or_create_queue` can return a DIFFERENT object: since
+        # `shutdown!` empties the registry, a teardown landing between the two calls makes the
+        # second lookup mint a fresh queue with an open channel and no processor. The `put!` would
+        # then succeed and the task would sit PENDING with nothing draining it -- a silent hang in
+        # place of the loud `InvalidStateException` a closed channel raises.
+        queue = _start_queue_processor(store, queue_id)
         put!(queue.channel, QueueItem(key, callback, options))
     end
     return key
@@ -744,7 +749,9 @@ function start_cleanup_scheduler(; interval_hours::Real=24, retain_days::Int=7, 
     # migrating it. It is stopped by a `Channel` signal, never by an interrupt.
     task = @async begin
         while true
-            wait_result = timedwait(() -> isready(stop_signal), interval_seconds)
+            # Closed counts as stopped: `stop_cleanup_scheduler!` signals by closing, and an
+            # empty closed channel is never `isready`.
+            wait_result = timedwait(() -> isready(stop_signal) || !isopen(stop_signal), interval_seconds)
             if wait_result == :ok
                 break
             end
@@ -762,9 +769,12 @@ function start_cleanup_scheduler(ctx::App; interval_hours::Real=24, retain_days:
 end
 
 function stop_cleanup_scheduler!(scheduler::CleanupScheduler)
-    if isopen(scheduler.stop_signal) && !isready(scheduler.stop_signal)
-        put!(scheduler.stop_signal, nothing)
-    end
+    # `close`, not `put!`. Nothing ever `take!`s this signal -- the scheduler only polls it -- so a
+    # `Channel(1)` that already holds the token blocks the next `put!` forever, and the
+    # `isopen && !isready` guard is a check-then-act that two concurrent teardowns can both pass.
+    # That race was previously hard to reach; `shutdown!` is now called for every backend, from
+    # both `uninstall!` and `reset_store!`, so it is not. Closing is idempotent and needs no guard.
+    close(scheduler.stop_signal)
     wait(scheduler.task)
     return nothing
 end

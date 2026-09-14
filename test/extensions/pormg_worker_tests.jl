@@ -327,6 +327,20 @@ else
         @test store isa AbstractWorkerStore
         @test store.db_key == "db"
 
+        # The shipped persistent backend satisfies the whole contract. This is the check a
+        # third-party store (#9's Redis backend, say) runs in its own suite, and it is the only
+        # thing standing between "PormG forgot a method" and an opaque `MethodError` raised while
+        # serving a live task -- which is exactly how the missing `shutdown!` went unnoticed.
+        @test isempty(missing_store_methods(RealPormGWorkerStore))
+
+        # The session half of the same contract, checked here because this is where the extension
+        # is actually loaded; `pormg_session_tests.jl` exercises a local replica rather than the
+        # shipped type.
+        let ext = Base.get_extension(Nitro, :NitroPormGExt)
+            @test !isnothing(ext)
+            @test isempty(Nitro.Types.missing_session_methods(getproperty(ext, :PormGSessionStore)))
+        end
+
         @testset "create and read task" begin
             info = TaskInfo("task-1"; queue_name="reports")
             push!(info.watchers, "user-x")
@@ -932,6 +946,104 @@ else
             finally
                 notify(release)
                 reset_store!(store_e2e)
+            end
+        end
+
+        @testset "stored error text is bounded and redactable in the TEXT column (#140)" begin
+            # The persistent store is the whole reason #140 matters: `error` is a TEXT column that
+            # outlives the process, so this asserts against the raw stored row rather than the
+            # `get_task_status` view.
+            sentinel = "tok-91fe3c"
+            store_err = RealPormGWorkerStore(model=MockTaskModel())
+            owner = Owner("user-err")
+
+            try
+                @test get_error_redactor(store_err) === nothing
+
+                long_tail = repeat("x", MAX_STORED_ERROR_CHARS * 2)
+                capped_id = submit_task("capped", () -> throw(ArgumentError(long_tail)), owner; store=store_err)
+                @test timedwait(() -> get_task_status(capped_id, owner; store=store_err)[:status] == "FAILED", 5.0) == :ok
+
+                column = store_err.model._table[capped_id]["error"]
+                @test length(column) <= MAX_STORED_ERROR_CHARS + 64
+                @test isvalid(column)
+                @test occursin("truncated", column)
+
+                set_error_redactor!(store_err, (exc, rendered) -> string(nameof(typeof(exc))))
+                redacted_id = submit_task("redacted", () -> throw(ArgumentError("bad token: $(sentinel)")), owner; store=store_err)
+                @test timedwait(() -> get_task_status(redacted_id, owner; store=store_err)[:status] == "FAILED", 5.0) == :ok
+
+                # POSITIVE first: the sentinel really is in the raw rendering, so the negative
+                # assertion below is not passing for the wrong reason.
+                @test occursin(sentinel, format_error(ArgumentError("bad token: $(sentinel)")))
+                # NEGATIVE: and it never reaches the column.
+                @test store_err.model._table[redacted_id]["error"] == "ArgumentError"
+                @test !occursin(sentinel, store_err.model._table[redacted_id]["error"])
+            finally
+                reset_store!(store_err)
+            end
+        end
+
+        @testset "shutdown! tears the persistent store down instead of no-opping (#29)" begin
+            store_td = RealPormGWorkerStore(model=MockTaskModel())
+            owner = Owner("user-td")
+
+            try
+                # `shutdown!` used to have a no-op fallback on AbstractWorkerStore and this
+                # backend never overrode it, so `uninstall!` left the cleanup scheduler issuing
+                # DELETEs against nitro_task and the queue processors blocking on `take!` after
+                # the app had stopped -- another set leaked on every bootstrap/teardown cycle.
+                @test hasmethod(shutdown!, Tuple{RealPormGWorkerStore})
+
+                task_id = submit_sequential_task("td-queue", "one", () -> "done", owner; store=store_td)
+                @test timedwait(() -> get_task_status(task_id, owner; store=store_td)[:status] == "COMPLETED", 5.0) == :ok
+
+                scheduler = start_cleanup_scheduler(; interval_hours=1, retain_days=7, store=store_td)
+                @test get_cleanup_scheduler(store_td)[] === scheduler
+
+                channel = get_sequential_queues(store_td)["td-queue"].channel
+                @test isopen(channel)
+
+                # Stand in for a run still in flight. A FINISHED run deregisters itself, so the
+                # caches are empty by then -- registering directly is both deterministic and the
+                # exact state a mid-flight shutdown finds.
+                register_active_task!(store_td, "in-flight", current_task())
+                register_active_task_info!(store_td, "in-flight", TaskInfo("in-flight"))
+                @test !isempty(store_td.active_tasks)
+                @test !isempty(store_td.active_task_infos)
+
+                shutdown!(store_td)
+
+                @test get_cleanup_scheduler(store_td)[] === nothing
+                @test istaskdone(scheduler.task)
+                @test !isopen(channel)
+                @test isempty(get_sequential_queues(store_td))
+                @test isempty(store_td.active_tasks)
+
+                # `active_task_infos` must SURVIVE, which is the opposite of what "finish the
+                # teardown" suggests. `cancel_task` resolves the live TaskInfo through
+                # `get_active_task_info`, and the in-memory store answers that from its
+                # `task_registry` -- which `shutdown!` does not empty. So clearing this dict would
+                # not be parity with InMemoryWorkerStore; it would make PormG the only backend on
+                # which a run surviving a teardown cannot be cancelled.
+                @test haskey(store_td.active_task_infos, "in-flight")
+                @test get_active_task_info(store_td, "in-flight") isa TaskInfo
+
+                # The durable rows survive: they outlive the process by design, and that is the
+                # whole reason to use this store rather than the in-memory one.
+                @test haskey(store_td.model._table, task_id)
+
+                # ...and `reset_store!` is no longer a complete no-op on a persistent store. It
+                # runs the teardown while still declining to delete the durable rows, which would
+                # be a destructive delete of live data rather than a reset.
+                second = submit_sequential_task("td-queue", "two", () -> "again", owner; store=store_td)
+                @test timedwait(() -> get_task_status(second, owner; store=store_td)[:status] == "COMPLETED", 5.0) == :ok
+                reset_store!(store_td)
+                @test isempty(get_sequential_queues(store_td))
+                @test isempty(store_td.active_tasks)
+                @test haskey(store_td.model._table, second)
+            finally
+                reset_store!(store_td)
             end
         end
 

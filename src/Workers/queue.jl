@@ -164,11 +164,11 @@ function _execute_queued_task(store::AbstractWorkerStore, item::QueueItem)
             # `task_info` and one set of external side effects (#127). The token is not
             # reset between attempts either, so a retry would start pre-cancelled.
             if unwrapped isa TaskTimeoutError
-                return _fail_task!(store, task_info, format_error(unwrapped))
+                return _fail_task!(store, task_info, _store_error_text(store, unwrapped))
             end
 
             if retry_count == max_attempts
-                return _fail_task!(store, task_info, format_error(unwrapped))
+                return _fail_task!(store, task_info, _store_error_text(store, unwrapped))
             end
 
             # Cancellation-aware backoff. The catch above checks CANCELLED before sleeping and

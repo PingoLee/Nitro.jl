@@ -19,8 +19,10 @@ import Nitro.Workers: AbstractWorkerStore, TaskInfo, TaskStatus, TaskOptions, Se
     get_active_task, register_active_task!, deregister_active_task!,
     get_active_task_info, register_active_task_info!, deregister_active_task_info!,
     get_queue_authorizer, set_queue_authorizer!,
+    get_error_redactor, set_error_redactor!,
     get_watch_authorizer, set_watch_authorizer!,
-    get_sequential_queues, get_queue_lock, get_cleanup_scheduler, lock_tasks
+    get_sequential_queues, get_queue_lock, get_cleanup_scheduler, lock_tasks,
+    shutdown!, _stop_scheduler_and_queues!
 import Nitro: pormg_nitro_worker
 
 export PormGWorkerStore, pormg_nitro_worker
@@ -252,9 +254,8 @@ function storesession!(store::PormGSessionStore, key::String, value::Dict{String
     return set_session!(store, key, value; ttl=ttl)
 end
 
-function prunesessions!(store::PormGSessionStore)
-    return cleanup_expired_sessions!(store)
-end
+# No `prunesessions!` override: the generic `AbstractSessionStore` method in `src/cookies.jl` is
+# now exactly this body, so a copy here is duplication that can only drift.
 
 # ============================================================================
 # SECTION 4: Table Bootstrap & Convenience Constructor
@@ -281,22 +282,9 @@ function _ensure_session_table!(conn, model)
     return nothing
 end
 
-"""
-    pormg_nitro_session(; db_key="db") -> PormGSessionStore
-
-One-call setup for PormG-backed sessions.  Creates the `nitro_session` table
-(if it doesn't exist), creates the expiry index, and returns a ready-to-use
-`PormGSessionStore`.
-
-## Example
-```julia
-using Nitro, PormG
-PormG.Configuration.load("db")
-
-store = pormg_nitro_session()
-serve(middleware=[SessionMiddleware(store=store)])
-```
-"""
+# Deliberately no docstring: the authoritative one is on the weakdep stub in `src/exts.jl`, which
+# is also what `?pormg_nitro_session` resolves to. Two docstrings on one function render as two
+# conflicting help entries and drift apart independently (#33).
 function pormg_nitro_session(; db_key::String="db")
     model = session_model()
     if isnothing(model)
@@ -388,6 +376,7 @@ struct PormGWorkerStore <: AbstractWorkerStore
     cleanup_scheduler::Ref{Union{Nothing, CleanupScheduler}}
     queue_authorizer::Ref{Any}
     watch_authorizer::Ref{Any}
+    error_redactor::Ref{Any}
 end
 
 function PormGWorkerStore(; model=nothing, db_key::String="db")
@@ -405,6 +394,7 @@ function PormGWorkerStore(; model=nothing, db_key::String="db")
         Dict{String, SequentialQueue}(),
         ReentrantLock(),
         Ref{Union{Nothing, CleanupScheduler}}(nothing),
+        Ref{Any}(nothing),
         Ref{Any}(nothing),
         Ref{Any}(nothing),
     )
@@ -867,6 +857,15 @@ function set_queue_authorizer!(store::PormGWorkerStore, authorizer)
     return authorizer
 end
 
+function get_error_redactor(store::PormGWorkerStore)
+    return store.error_redactor[]
+end
+
+function set_error_redactor!(store::PormGWorkerStore, redactor)
+    store.error_redactor[] = redactor
+    return redactor
+end
+
 function get_watch_authorizer(store::PormGWorkerStore)
     return store.watch_authorizer[]
 end
@@ -892,6 +891,46 @@ function lock_tasks(callback::Function, store::PormGWorkerStore)
     return lock(store.task_lock) do
         callback()
     end
+end
+
+"""
+    shutdown!(store::PormGWorkerStore)
+
+Release everything this store owns on the current process.
+
+`shutdown!` is part of the `AbstractWorkerStore` lifecycle contract, and this backend used to
+have no method for it at all: `uninstall!` fell through to a no-op fallback, so the cleanup
+scheduler kept issuing `DELETE`s against `nitro_task` and the queue processors kept blocking on
+`take!` long after the app had stopped, leaking another set on every bootstrap/teardown cycle
+([#29](https://github.com/PingoLee/Nitro.jl/issues/29)).
+
+The scheduler and queue teardown is shared with every other backend through
+`_stop_scheduler_and_queues!`, and `active_tasks` is cleared exactly as `InMemoryWorkerStore`
+clears its own.
+
+**`active_task_infos` is deliberately NOT cleared**, even though it is a process-local cache and
+clearing it looks like the obvious completion of the teardown. It has no `InMemoryWorkerStore`
+field to mirror — but it does have an in-memory *counterpart*: that store's
+`get_active_task_info` is an alias for `get_task_info` and reads `task_registry`, which
+`shutdown!` does not empty either. So clearing this dict would not be parity with the in-memory
+store, it would be a PormG-only behaviour change, and a harmful one: `cancel_task` resolves the
+live `TaskInfo` through `get_active_task_info`, so a run still executing across a teardown would
+become uncancellable on this backend and on no other.
+
+Nothing leaks by leaving it: each run removes its own entry through
+`deregister_active_task_info!` when it finishes.
+
+The durable rows are untouched: they outlive the process by design, which is the whole reason to
+use this store.
+"""
+function shutdown!(store::PormGWorkerStore)
+    _stop_scheduler_and_queues!(store)
+
+    lock(store.active_lock) do
+        empty!(store.active_tasks)
+    end
+
+    return nothing
 end
 
 # ============================================================================
@@ -969,12 +1008,7 @@ function _ensure_task_table!(conn, model)
     return nothing
 end
 
-"""
-    pormg_nitro_worker(; db_key="db") -> PormGWorkerStore
-
-One-call setup for PormG-backed workers. Creates the `nitro_task` table (if it doesn't exist),
-creates indexes, and returns a ready-to-use `PormGWorkerStore`.
-"""
+# Deliberately no docstring -- see the note on `pormg_nitro_session` above; `src/exts.jl` owns it.
 function pormg_nitro_worker(; db_key::String="db")
     model = task_model()
     if isnothing(model)

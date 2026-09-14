@@ -3,7 +3,7 @@ module Errors
 
 import JSON
 
-export ValidationError, CookieError, AuthorizationError
+export ValidationError, CookieError, AuthorizationError, StoreInterfaceError
 
 """
     ValidationError(msg::String)
@@ -152,6 +152,114 @@ end
 
 function Base.showerror(io::IO, e::AuthorizationError)
     print(io, "Authorization Error: $(e.msg)")
+end
+
+
+"""
+    StoreInterfaceError(f::Function, store_type::Type)
+
+The exception a pluggable store backend raises when it is handed a call it never implemented.
+
+Nitro has two store contracts — [`AbstractWorkerStore`](@ref) for the worker queue and
+[`AbstractSessionStore`](@ref) for sessions — and both are open for third-party backends. Each
+required method carries a fallback defined on the *abstract* type; reaching that fallback means the
+concrete store did not define the method, so this is thrown instead of letting the call fail far
+downstream with a bare `MethodError` that names neither the contract nor the missing piece.
+
+The message names the method, the offending store type, and where the contract is documented.
+
+# Not a substitute for `MethodError`
+
+The fallbacks are typed at the contract's *documented* argument types, never `args...`. A call whose
+positional arguments do not match the contract at all therefore still raises an ordinary
+`MethodError` — a caller-side mistake keeps reporting as one, rather than being mislabelled as a
+missing backend method.
+"""
+struct StoreInterfaceError <: Exception
+    f::Function
+    store_type::Type
+end
+
+"""
+    implements_contract_method(f, S::Type, abstract_store_type::Type, store_index::Int) -> Bool
+
+Whether `S` itself contributed a method of `f` — that is, a method whose store-position parameter
+is something narrower than `abstract_store_type` and that `S` satisfies.
+
+This is what both store contracts use to answer "did this backend implement the method", and it
+deliberately asks about *presence*, not about signature compatibility. Checking the exact call
+signature instead sounds stricter and is worse: a contract method is written
+`(::MyStore{K,V}, ::K, ::V)` as often as `(::MyStore, ::String, ::Any)`, and a probe pinned to
+either shape reports the other as missing.
+
+`store_index` is 1-based over the *arguments*, so it is 2 for a callback-first method such as
+`lock_tasks(callback, store)`.
+
+It errs toward **over**-reporting, never under-reporting, which is the safe direction for a
+conformance check: a method typed on a union that reaches outside the contract's hierarchy —
+`f(::Union{MyStore, Nothing}, …)` — satisfies dispatch but is not counted here, so such a backend
+sees a spurious name in `missing_store_methods`. Narrowing the search to the contract's own
+hierarchy is what makes the opposite mistake impossible, and a false "you are conforming" is the
+one that turns the check into theater.
+"""
+function implements_contract_method(f::Function, S::Type, abstract_store_type::Type, store_index::Int)
+    for m in methods(f)
+        params = Base.unwrap_unionall(m.sig).parameters
+        length(params) >= store_index + 1 || continue
+        # Re-apply the method's `where` clause before testing. A method written
+        # `(::MemoryStore{K,V}, ::K, ::V) where {K,V}` has FREE type variables in its unwrapped
+        # store parameter, and `MemoryStore{String,Dict} <: MemoryStore{K,V}` is not true of a
+        # free `K`/`V` -- so an unwrapped test reports every parametric backend as missing.
+        P = Base.rewrap_unionall(params[store_index + 1], m.sig)
+        P isa Type || continue
+        P === abstract_store_type && continue
+        # `P` must sit INSIDE the contract's own hierarchy. Without this, any method of `f` that
+        # happens to accept `S` counts -- which is harmless for the functions Nitro owns, but
+        # `Base.get` is part of the session contract and belongs to Base. One unrelated package
+        # defining a `Base.get` broad enough to accept a store would make every store report as
+        # conforming: a false NEGATIVE, which is the failure mode that turns a conformance check
+        # into theater.
+        P <: abstract_store_type || continue
+        S <: P && return true
+    end
+    return false
+end
+
+"""
+    store_contract_error(f, abstract_store_type, store_index, args...)
+
+Decide, at the moment a contract fallback is reached, whether this is a missing backend method or
+a caller-side mistake — and raise the honest one.
+
+A fallback is defined on the abstract store type with every other parameter left at `Any`. That
+width is required: a fallback pinned to the contract's exact argument types is *ambiguous* with a
+backend that types one of its own parameters more loosely (`::AbstractString` where the contract
+says `::String` — which is how Nitro's own public API is written), and Julia may then resolve the
+call to the fallback instead of to the store's method. Ambiguity is a far worse failure than an
+imprecise error message.
+
+The cost of that width is that the fallback also catches a caller who passed the wrong positional
+type to a perfectly conforming store. Hence this check: if the store's type contributed a method
+of its own, the arguments are what did not match, so an ordinary `MethodError` carrying the real
+arguments is raised. Only a store that implemented nothing gets `StoreInterfaceError`.
+"""
+@noinline function store_contract_error(f::Function, abstract_store_type::Type, store_index::Int, args...)
+    store = args[store_index]
+    if implements_contract_method(f, typeof(store), abstract_store_type, store_index)
+        throw(MethodError(f, args))
+    end
+    throw(StoreInterfaceError(f, typeof(store)))
+end
+
+function Base.showerror(io::IO, e::StoreInterfaceError)
+    name = nameof(e.f)
+    println(io, "StoreInterfaceError: `", e.store_type, "` does not implement `", name,
+                "`, which its store contract requires.")
+    print(io, "Define a method `", name, "(::", e.store_type, ", ...)`. ",
+              "The full contract is in the docstring of the abstract store type ",
+              "(`?AbstractWorkerStore` or `?AbstractSessionStore`); ",
+              "`missing_store_methods` / `missing_session_methods` list everything a type is ",
+              "still missing.")
 end
 
 end

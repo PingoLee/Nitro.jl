@@ -47,6 +47,263 @@ _Changes merged but not yet cut into a release. A consumer dev'ing Nitro at HEAD
 and `Nitro.upgrade_guide` surfaces them by default. When the maintainer next rolls changes into a
 consuming app, `nitro-cut-release` stamps every entry below with `0.4.0`, dates them, and tags it._
 
+## Store contracts raise `StoreInterfaceError`, and session cleanup is explicitly optional (#33)
+
+- **Version**: Unreleased
+- **Nitro ref**: #33; `src/errors.jl`, `src/types.jl`, `src/cookies.jl`, `src/Workers/registry.jl`,
+  `src/exts.jl`, `ext/NitroPormGExt.jl`, `docs/src/tutorial/sessions_and_auth.md`
+- **Recorded**: 2026-09-13
+- **Severity**: **behavior, and it fails LOUDLY** where it fails at all. An app only has to act if
+  it implements its own `AbstractWorkerStore` / `AbstractSessionStore`, or catches `MethodError`
+  around store calls. One change goes the *other* way and is silent — see the third bullet.
+
+### What changed
+
+Both store contracts were declared as bare stubs with no fallback and no docstring, so an
+incomplete backend failed with an opaque `MethodError` raised from deep inside request or task
+handling. `AbstractSessionStore` did not even declare `Base.get`, which it requires. Both contracts
+are now data — `WORKER_STORE_INTERFACE` and `SESSION_STORE_INTERFACE` — with generated fallbacks
+and a conformance helper reading the same rows.
+
+Four things a consuming app can observe:
+
+- **A missing required method now raises `StoreInterfaceError`, not `MethodError`**, naming the
+  method and your store type. Code that catches `MethodError` around store calls to detect an
+  unimplemented backend must catch `Nitro.Core.Errors.StoreInterfaceError` instead. (A *caller*
+  mistake — wrong argument types against a store that does implement the method — still raises
+  `MethodError`, carrying the real arguments.)
+- **`prunesessions!` no longer swallows a `MethodError` raised inside a store's own
+  `cleanup_expired_sessions!` body.** It used to catch any `MethodError` whose `.f` was that
+  function, which discarded genuine bugs in a conforming store's cleanup. Those now propagate — and
+  `prunesessions!` runs on the request path, so a store whose cleanup was quietly broken will start
+  surfacing it.
+- **`cleanup_expired_sessions!` gained a no-op default and is now explicitly optional.** This is the
+  one change that is silent and goes the other way: a custom session store that did *not* implement
+  it previously raised inside `prunesessions!`'s rescue and returned `nothing`; it now returns
+  `nothing` without raising at all. Behaviour is unchanged, but `missing_session_methods` will never
+  report it, so do not read "conforming" as "prunes".
+- **The abstract types now carry fallback methods**, so a third-party store sees a different
+  exception on a wrong-argument call than it did.
+
+`pormg_nitro_worker` and `pormg_nitro_session` also lost their duplicate docstrings on the concrete
+methods; `?pormg_nitro_worker` now resolves to one entry instead of two conflicting ones. Nothing to
+migrate.
+
+### How to find the calls to migrate
+
+```bash
+# Custom backends of either contract.
+grep -rn "<: AbstractWorkerStore\|<: AbstractSessionStore" --include=*.jl .
+
+# Code that treats a MethodError as "this store did not implement it".
+grep -rn "MethodError" --include=*.jl .
+```
+
+```julia
+using Nitro.Workers: missing_store_methods
+using Nitro.Types: missing_session_methods
+
+missing_store_methods(MyWorkerStore)      # empty means conforming
+missing_session_methods(MySessionStore)   # required methods only; cleanup is optional
+```
+
+### Before → after
+
+```julia
+# BEFORE — detecting an unimplemented backend by exception type
+try
+    cleanup_expired_sessions!(store)
+catch e
+    e isa MethodError || rethrow()
+    # ...treat as "not implemented"
+end
+
+# AFTER — ask the type directly, before anything runs
+using Nitro.Types: missing_session_methods
+isempty(missing_session_methods(typeof(store))) || error("store is incomplete")
+
+# AFTER — and if you really are catching the not-implemented case at a call site:
+using Nitro.Core.Errors: StoreInterfaceError
+try
+    set_session!(store, id, data; ttl = 60)
+catch e
+    e isa StoreInterfaceError || rethrow()
+    # ...
+end
+```
+
+---
+
+## Worker stores implement `get_error_redactor` / `set_error_redactor!`, and stored error text is capped (#140)
+
+- **Version**: Unreleased
+- **Nitro ref**: #140; `src/Workers/registry.jl`, `src/Workers/execution.jl`, `src/Workers/api.jl`,
+  `src/Workers/queue.jl`, `ext/NitroPormGExt.jl`, `docs/src/tutorial/workers.md`
+- **Recorded**: 2026-09-13
+- **Severity**: **breaking for custom worker stores, and it fails LOUDLY** — a store without the
+  two new methods raises `StoreInterfaceError` naming them. For apps using a shipped store this is
+  a **behaviour** change only: a failed task's stored `error` is now truncated past
+  `MAX_STORED_ERROR_CHARS`.
+
+### What changed
+
+A failed task's `error` is rendered from the exception the **application's** callback threw, and
+exceptions quote their input. A callback that parses user-submitted data hands its parser's
+`ArgumentError` the offending bytes, and those bytes reached the store — for `PormGWorkerStore`, a
+`TEXT` column — with no cap, no redaction path, and nothing in the store docs warning that the
+field is attacker-influenceable.
+
+This is the same shape #130 closed on `ValidationError.cause`, at a different trust boundary. There
+Nitro created the situation by deserializing a client payload, so Nitro owed the mask; here the
+exception is the app's own, so the answer is a bound plus a hook rather than a blanket mask.
+
+Three parts:
+
+- `MAX_STORED_ERROR_CHARS` (2048) caps the stored text, counted in **characters** so truncation
+  cannot split a codepoint. `format_error` is unchanged and still unbounded — it is exported, and
+  capping it would have changed what every existing caller gets back.
+- `get_error_redactor` / `set_error_redactor!` are new required `AbstractWorkerStore` methods,
+  shaped exactly like the existing `queue_authorizer` / `watch_authorizer` pairs: a `Ref{Any}` slot
+  invoked through `Base.invokelatest`. The redactor receives `(exception, rendered)` with the
+  **full** text and its result is then capped. A redactor that throws is caught; the task still
+  reports `FAILED` and the stored text degrades to the exception type.
+- Retention was already bounded when cleanup is on (`worker_startup` defaults to
+  `cleanup_enabled=true`, `cleanup_interval_hours=24`), so this closes the cap and the hook, not
+  the lifetime.
+
+### How to find the calls to migrate
+
+```bash
+# Custom worker stores owe the two new methods.
+grep -rn "<: AbstractWorkerStore" --include=*.jl .
+
+# Task callbacks that interpolate data into an exception are the ones this protects.
+grep -rn "submit_task\|submit_sequential_task" --include=*.jl .
+```
+
+```julia
+using Nitro.Workers
+missing_store_methods(MyWorkerStore)   # :get_error_redactor / :set_error_redactor! in here
+```
+
+### Before → after
+
+```julia
+# BEFORE — no such hook; whatever the app threw was stored verbatim
+struct MyWorkerStore <: AbstractWorkerStore
+    # ...
+    queue_authorizer::Ref{Any}
+    watch_authorizer::Ref{Any}
+end
+
+# AFTER — one more slot, and the pair that reads it
+struct MyWorkerStore <: AbstractWorkerStore
+    # ...
+    queue_authorizer::Ref{Any}
+    watch_authorizer::Ref{Any}
+    error_redactor::Ref{Any}
+end
+
+Nitro.Workers.get_error_redactor(store::MyWorkerStore) = store.error_redactor[]
+function Nitro.Workers.set_error_redactor!(store::MyWorkerStore, redactor)
+    store.error_redactor[] = redactor
+    return redactor
+end
+```
+
+An app whose task callbacks can carry user data into an exception message should also install one:
+
+```julia
+set_error_redactor!(store, (exc, rendered) -> string(nameof(typeof(exc))))
+```
+
+---
+
+## `shutdown!` is required of every `AbstractWorkerStore` (#29)
+
+- **Version**: Unreleased
+- **Nitro ref**: #29; `src/Workers/registry.jl`, `ext/NitroPormGExt.jl`, `test/workers_tests.jl`,
+  `test/extensions/pormg_worker_tests.jl`
+- **Recorded**: 2026-09-13
+- **Severity**: **breaking, and it fails LOUDLY.** A custom worker store that does not define
+  `shutdown!` now raises `StoreInterfaceError` naming the method and your type, at the first
+  `uninstall!` or `reset_store!`. Previously it silently did nothing — which is the bug.
+
+### What changed
+
+`shutdown!(::AbstractWorkerStore) = nothing` was a silent no-op fallback, so a backend that
+forgot the method inherited "teardown succeeded" for free. The shipped `PormGWorkerStore` did
+exactly that: `uninstall!` dispatched to the no-op, its cleanup scheduler kept issuing `DELETE`s
+against `nitro_task`, and its queue processors kept blocking on `take!` after the app had
+stopped. Every bootstrap/teardown cycle — tests, multi-app-per-process, a dev reload — leaked
+another set.
+
+The no-op is gone and `shutdown!` is part of the contract like every other store method.
+`PormGWorkerStore` now implements it.
+
+Two behaviour changes ride along, both to `InMemoryWorkerStore` as well:
+
+- `shutdown!` now **empties** the sequential-queue registry rather than only closing each
+  channel. A closed-but-present queue was handed straight back by `_get_or_create_queue`, so a
+  store reused after shutdown threw on the next `submit_sequential_task`. Teardown is now total
+  and a store can be shut down and started again.
+- `reset_store!` no longer gates its whole body on `store isa InMemoryWorkerStore`, which had
+  made it a complete no-op on a persistent store. It runs the teardown for every backend and
+  keeps only the *discard the task records* step in-memory-specific — for a database-backed
+  store those are durable rows, and deleting them on a reset would be destructive rather than a
+  teardown. Persistent backends prune through `cleanup_tasks!`.
+
+**If you use `PormGWorkerStore`, this is the part that may force an edit.** `uninstall!` and
+`reset_store!` used to be no-ops on that store and now perform a real teardown, so restarting
+**in the same process** while tasks are still running is no longer harmless. A run whose handle is
+cleared looks dead to `recover_zombie_tasks!`, so the next `start!(recover_zombies=true)` marks it
+`FAILED` and the real result is discarded when it finishes. That has always been true of
+`InMemoryWorkerStore`; it is new for PormG only because PormG never tore down at all before.
+`shutdown!` releases, it does not drain — nothing stops a running Julia task. If your app relies on
+teardown/restart cycles in one process (a dev reload, several apps per process, a test suite that
+calls `reset_store!` between cases), let in-flight tasks finish first, or start with
+`recover_zombies=false`.
+
+Cancellation is deliberately *not* affected: `PormGWorkerStore.shutdown!` leaves
+`active_task_infos` populated, so `cancel_task` still reaches a run that survives a teardown, the
+same way it does in memory.
+
+### How to find the calls to migrate
+
+```bash
+grep -rn "<: AbstractWorkerStore" --include=*.jl .
+```
+
+For each custom store, check whether it defines `shutdown!`:
+
+```julia
+using Nitro.Workers
+missing_store_methods(MyWorkerStore)   # :shutdown! in here means you owe a method
+```
+
+### Before → after
+
+```julia
+# BEFORE — nothing; the no-op fallback covered it
+struct MyWorkerStore <: AbstractWorkerStore
+    # ...
+end
+
+# AFTER — a store that owns background resources releases them
+function Nitro.Workers.shutdown!(store::MyWorkerStore)
+    Nitro.Workers._stop_scheduler_and_queues!(store)   # scheduler + queue channels, via the accessors
+    lock(store.active_lock) do
+        empty!(store.active_tasks)
+    end
+    return nothing
+end
+
+# AFTER — a store that genuinely owns nothing still says so out loud
+Nitro.Workers.shutdown!(::MyWorkerStore) = nothing
+```
+
+---
+
 ## `ServerContext` is now the exported `App`, and every public function takes one (#31)
 
 - **Version**: Unreleased

@@ -499,6 +499,63 @@ task_id = submit_task("report-42", run_report, Owner("user-1"); store=worker_sto
 status = get_task_status(task_id, Owner("user-1"); store=worker_store)
 ```
 
+## What A Failed Task Stores
+
+When a task fails, Nitro renders the exception your callback threw and stores the text in
+`TaskInfo.error`. With `PormGWorkerStore` that is a `TEXT` column, read back by
+`get_task_status` and kept until the retention sweep removes the row.
+
+**Exceptions quote their input.** If your callback parses user-submitted data, the parser's
+`ArgumentError` echoes the offending bytes — and those bytes are what gets stored:
+
+```julia
+submit_task("import", Owner(user_id)) do
+    # If `payload` is user-supplied, this exception carries it into the store.
+    parse(Int, payload)
+end
+```
+
+Nitro is not the one putting user data in that message, so it cannot know which parts are
+sensitive. What it does do is bound the text and give you a hook.
+
+### The length cap
+
+Stored error text is truncated to `MAX_STORED_ERROR_CHARS` characters, with a marker naming
+the original length. Truncation is by character, never by byte, so a multi-byte message
+cannot be cut into invalid UTF-8. `format_error` itself is unbounded — the cap applies to
+what is *stored*.
+
+### The redaction hook
+
+`set_error_redactor!` installs a function that rewrites the text before it is stored:
+
+```julia
+# Keep the exception type, drop everything it quoted.
+set_error_redactor!(store, (exc, rendered) -> string(nameof(typeof(exc))))
+
+# Or redact selectively, leaving ordinary failures diagnosable.
+set_error_redactor!(store, function(exc, rendered)
+    exc isa MyApp.UserDataError ? "UserDataError (details withheld)" : rendered
+end)
+```
+
+The hook receives the **full** rendering, before truncation, so it decides about the whole
+message rather than a prefix; the cap is applied to whatever it returns. A redactor that
+throws does not lose the failure — the task still reports `FAILED`, and the stored text
+degrades to the exception type alone.
+
+### Retention
+
+`worker_startup` runs a cleanup scheduler by default (`cleanup_enabled=true`,
+`cleanup_interval_hours=24`), so finished rows — error text included — are pruned on the
+retention window rather than kept forever. If you set `cleanup_enabled=false`, you own
+retention, and stored error text lives as long as the row does.
+
+!!! warning "Treat `TaskInfo.error` as attacker-influenceable"
+    It is free text derived from an exception your own code raised. The safest posture is to
+    keep user data out of exception messages in task callbacks; the hook above is the
+    fallback for when you cannot.
+
 ## User Access Control
 
 To support multitenant backends, Nitro.jl workers include built-in authorization mechanisms.

@@ -6,6 +6,8 @@ using Dates
 using Nitro
 using Nitro.Types: AbstractSessionStore, MemoryStore, SessionPayload
 using Nitro.Types: get_session, set_session!, delete_session!, cleanup_expired_sessions!
+using Nitro.Types: missing_session_methods
+using Nitro.Errors: StoreInterfaceError
 
 struct FailingSessionStore <: AbstractSessionStore{String, Dict{String,Any}} end
 
@@ -55,6 +57,58 @@ end
 function Nitro.Types.cleanup_expired_sessions!(store::DelegatingSessionStore)
     store.prune_calls += 1
     return nothing
+end
+
+# Implements nothing at all -- the shape a half-finished custom backend has.
+struct BareSessionStore <: AbstractSessionStore{String, Dict{String,Any}} end
+
+# Implements cleanup, but its body raises a `MethodError` whose `.f` is
+# `cleanup_expired_sessions!` itself. The old `prunesessions!` rescue matched on exactly that
+# identity and silently discarded it.
+struct SelfMethodErrorStore <: AbstractSessionStore{String, Dict{String,Any}} end
+
+function Nitro.Types.cleanup_expired_sessions!(store::SelfMethodErrorStore)
+    return cleanup_expired_sessions!(store, :an_unsupported_arity)
+end
+
+@testset "Session store contract is discoverable and loud" begin
+    @test isempty(missing_session_methods(MemoryStore{String, Dict{String,Any}}))
+
+    # The probe is written against the store's own `K`/`V`, not `Any`. `MemoryStore`'s
+    # `set_session!` is typed `(::MemoryStore{K,V}, ::K, ::V)`, so an `Any` probe would report
+    # a conforming store as broken -- the line above would then pass for the wrong reason only
+    # because it is checking something that can fail here.
+    missing_names = missing_session_methods(BareSessionStore)
+    @test :get in missing_names
+    @test :set_session! in missing_names
+    @test :delete_session! in missing_names
+
+    # `cleanup_expired_sessions!` is optional, so it is never reported and never throws.
+    @test !(:cleanup_expired_sessions! in missing_names)
+    @test cleanup_expired_sessions!(BareSessionStore()) === nothing
+
+    # `Base.get` is the one required method the declared contract used to omit entirely; a store
+    # that forgets it used to fail with a bare `MethodError` raised from inside `get_session`.
+    for thunk in (() -> Base.get(BareSessionStore(), "sid", nothing),
+                  () -> set_session!(BareSessionStore(), "sid", Dict{String,Any}(); ttl=60),
+                  () -> delete_session!(BareSessionStore(), "sid"))
+        err = try
+            thunk()
+            nothing
+        catch e
+            e
+        end
+        @test err isa StoreInterfaceError
+        @test err.store_type === BareSessionStore
+        @test occursin("BareSessionStore", sprint(showerror, err))
+    end
+
+    # A store with no cleanup prunes to a no-op rather than an error...
+    @test Nitro.Core.Cookies.prunesessions!(BareSessionStore()) === nothing
+
+    # ...but a genuine `MethodError` from inside a store that DOES implement cleanup now
+    # propagates instead of being swallowed by an identity match on `.f`.
+    @test_throws MethodError Nitro.Core.Cookies.prunesessions!(SelfMethodErrorStore())
 end
 
 @testset "Session store interface" begin

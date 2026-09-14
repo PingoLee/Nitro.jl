@@ -25,10 +25,17 @@ function pdf end
 """
     pormg_nitro_session(; db_key="db") -> PormGSessionStore
 
-Create a database-backed session store using PormG.
-Automatically ensures the `nitro_session` table and index exist (IF NOT EXISTS).
+One-call setup for PormG-backed sessions: creates the `nitro_session` table and its expiry
+index if they do not already exist (`IF NOT EXISTS`), and returns a ready-to-use
+`PormGSessionStore`. Sessions are stored as JSON with a fixed-point expiry timestamp; there
+is no sliding expiry.
 
-Requires `using PormG` and a configured PormG connection.
+Requires `using PormG` and a configured PormG connection; without the extension loaded this
+is a `MethodError`, exactly like `pormg_nitro_worker`.
+
+This docstring is the only one for this function. The concrete method in `NitroPormGExt`
+deliberately carries none, so there is one place to keep accurate — see `sync_pormg_env!`
+below for the same arrangement.
 
 ## Example
 ```julia
@@ -78,9 +85,26 @@ function sync_pormg_env! end
 """
     pormg_nitro_worker(; db_key="db") -> PormGWorkerStore
 
-Create a database-backed worker task store using PormG.
-Automatically ensures the `nitro_task` table and index exist (IF NOT EXISTS).
+One-call setup for PormG-backed workers: creates the `nitro_task` table and **two** indexes if
+they do not already exist (`IF NOT EXISTS`), and returns a ready-to-use `PormGWorkerStore`.
 
-Requires `using PormG` and a configured PormG connection.
+Table setup is not purely additive. Bootstrapping also issues an unconditional
+`ALTER TABLE … ADD COLUMN run_id` against a pre-existing table that predates the run-id
+column, and tolerates the error when the column is already there.
+
+Requires `using PormG` and a configured PormG connection; without the extension loaded this
+is a `MethodError`.
+
+This docstring is the only one for this function — the concrete method in `NitroPormGExt`
+deliberately carries none.
+
+## Example
+```julia
+using Nitro, PormG
+PormG.Configuration.load("db")
+
+store = pormg_nitro_worker(db_key="db")
+serve(middleware=[worker_startup(queues=["reports"], store=store)])
+```
 """
 function pormg_nitro_worker end

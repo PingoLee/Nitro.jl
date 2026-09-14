@@ -14,11 +14,97 @@ function _unwrap_exception(error)
     return error
 end
 
+"""
+    format_error(error) -> String
+
+Render an exception the way a failed task reports it, unwrapping the task/captured/composite
+wrappers first.
+
+This is the plain rendering utility and is unbounded on purpose — it is exported, and capping it
+would change what every existing caller gets back. What gets *stored* goes through
+`_store_error_text` instead, which redacts and truncates.
+"""
 function format_error(error)
     unwrapped = _unwrap_exception(error)
     io = IOBuffer()
     showerror(io, unwrapped)
     return String(take!(io))
+end
+
+"""
+    MAX_STORED_ERROR_CHARS
+
+The cap on a failed task's stored `error` text.
+
+Counted in **characters**, not bytes, so truncation can never split a multi-byte codepoint and
+leave invalid UTF-8 in the store. The value is a judgement call rather than a derived limit: long
+enough for a stack-free `showerror` of any ordinary exception, short enough that a runaway message
+cannot dominate the row. Spring Batch pins the analogous `exitDescription` at 2500 via its column
+width; nothing here is that principled, so the number is stated rather than inferred.
+"""
+const MAX_STORED_ERROR_CHARS = 2048
+
+function _truncate_error(text::AbstractString)
+    total = length(text)
+    total <= MAX_STORED_ERROR_CHARS && return String(text)
+
+    # The marker counts against the cap rather than being appended past it. Appending after
+    # truncating makes `MAX_STORED_ERROR_CHARS` not actually the cap -- the stored string comes out
+    # at `MAX + length(marker)` -- which makes the constant's own docstring untrue and forces every
+    # test to assert a slack bound instead of the exact, knowable one.
+    marker = string(" …[truncated, ", total, " chars total]")
+    keep = MAX_STORED_ERROR_CHARS - length(marker)
+    keep <= 0 && return String(first(text, MAX_STORED_ERROR_CHARS))
+    return string(first(text, keep), marker)
+end
+
+"""
+    _store_error_text(store, error) -> String
+
+What a failed task actually writes to its `error` field: `format_error`, then the store's
+redaction hook, then the length cap.
+
+The order is load-bearing. The hook is handed the **full** rendering so it can decide about the
+whole message rather than a prefix, and the cap runs afterwards so a redactor cannot exceed it.
+
+A task reaching here has already failed; a redactor that throws, or that returns something other
+than a string, must not lose the failure on top of that. Both are caught and the stored value
+degrades to the exception type, which is the most that is knowably safe.
+
+**The log line carries only the redactor failure's TYPE, never the failure itself.** That is not
+over-caution: a redactor that inspects the text it was handed — `parse`, `JSON.parse`, an
+`@assert` with an interpolated message — raises an exception whose own message quotes `rendered`,
+so logging `exception=` would republish, on the error channel, exactly the content the redactor
+exists to suppress. It is the same "exceptions quote their input" mechanism this whole function is
+here to contain, arriving one level up.
+"""
+function _store_error_text(store::AbstractWorkerStore, error)
+    unwrapped = _unwrap_exception(error)
+    rendered = format_error(unwrapped)
+
+    redactor = get_error_redactor(store)
+    isnothing(redactor) && return _truncate_error(rendered)
+
+    fallback = string(nameof(typeof(unwrapped)))
+
+    redacted = try
+        Base.invokelatest(redactor, unwrapped, rendered)
+    catch redactor_error
+        # Deliberately NOT `exception=redactor_error`: its message may quote the text it was
+        # handed, which is the content the redactor was installed to keep out of everything.
+        @error "Worker error redactor threw; storing the exception type only. The redactor failure is not logged, because its message may quote the text it was given." redactor_error_type=typeof(redactor_error) store_type=typeof(store)
+        return fallback
+    end
+
+    if !(redacted isa AbstractString)
+        # A Julia function falls off its end into whatever the last expression returned, so a
+        # redactor can silently hand back `nothing` or a number. Stringifying that would store
+        # `"nothing"` -- a poisoned field rather than an honest degradation.
+        @error "Worker error redactor returned a non-string; storing the exception type only." returned_type=typeof(redacted) store_type=typeof(store)
+        return fallback
+    end
+
+    return _truncate_error(redacted)
 end
 
 function _invoke_task_callback(callback::Function, task_info::TaskInfo)

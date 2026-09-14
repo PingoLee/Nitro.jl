@@ -10,20 +10,55 @@ using Dates
 using Base: @kwdef
 using DataStructures: CircularDeque
 using ..Util
-using ..Errors: ValidationError
+using ..Errors: ValidationError, StoreInterfaceError, implements_contract_method, store_contract_error
 
 export Server, Nullable, Context,
     LifecycleMiddleware, startup, shutdown,
     Param, isrequired, LazyRequest, headers, pathparams, queryvars, jsonbody, formbody, textbody, multipartbody,
     CookieConfig, Cookie, Session, SessionPayload,
     AbstractSessionStore, get_session, set_session!, delete_session!, cleanup_expired_sessions!,
-    MemoryStore, Extractor,
+    MemoryStore, Extractor, missing_session_methods,
     RouteDefinition, Principal
 
 const Nullable{T} = Union{T, Nothing}
 const Server = HTTP.Server
 
 abstract type Extractor{T} end
+"""
+    AbstractSessionStore{K, V}
+
+The storage contract behind [`SessionMiddleware`](@ref). `MemoryStore` ships in core and
+`PormGSessionStore` in `NitroPormGExt`; an application may add its own. `K` is the session-id type
+and `V` the payload type — the middleware pins both to `AbstractSessionStore{String, Dict{String,Any}}`.
+
+# Required
+
+| Method | Contract |
+|---|---|
+| `Base.get(store, session_id, default)` | The stored `SessionPayload`, or `default` when absent |
+| `set_session!(store, session_id, data; ttl::Int)` | Persist `data` under a fixed-point expiry, returns `data` |
+| `delete_session!(store, session_id)` | Remove one session |
+
+`Base.get` is easy to miss and is genuinely mandatory: both the generic `get_session` and the
+middleware's own load path call it directly. Each of the three has a fallback on this abstract type
+raising `StoreInterfaceError`, and [`missing_session_methods`](@ref) lists what a type still owes:
+
+```julia
+@test isempty(missing_session_methods(MySessionStore))
+```
+
+# Optional
+
+`cleanup_expired_sessions!(store)` prunes expired rows and **defaults to a no-op**. That is the one
+asymmetry with `AbstractWorkerStore`, where every method including `shutdown!` is required, and it
+is deliberate: expiry here is enforced on the *read* path — `get_session` refuses a payload whose
+`expires` has passed — so a store that never prunes wastes rows but never serves a stale session. A
+worker store that skips `shutdown!`, by contrast, leaks live tasks. Implement it for any store whose
+rows outlive the process.
+
+`storesession!` and `prunesessions!` are the framework's entry points and delegate here; a store may
+override those instead if it has a cheaper path.
+"""
 abstract type AbstractSessionStore{K, V} end
 
 """
@@ -108,16 +143,65 @@ function get_session(store::AbstractSessionStore{K, V}, session_id::K) where {K,
     return payload
 end
 
-function set_session!(store::AbstractSessionStore, session_id, data; ttl::Int = 3600)
-    throw(MethodError(set_session!, (store, session_id, data)))
+# Required-method fallbacks. `Base.get` is not piracy: the store argument is our own type.
+#
+# Every non-store parameter is left untyped so a backend's own method is strictly more specific in
+# every slot and can never be ambiguous with these. `store_contract_error` then separates "this
+# backend implemented nothing" from "the caller passed the wrong arguments to a conforming store".
+@noinline Base.get(store::AbstractSessionStore, session_id, default) =
+    store_contract_error(Base.get, AbstractSessionStore, 1, store, session_id, default)
+
+@noinline function set_session!(store::AbstractSessionStore, session_id, data; ttl::Int = 3600)
+    store_contract_error(set_session!, AbstractSessionStore, 1, store, session_id, data)
 end
 
-function delete_session!(store::AbstractSessionStore, session_id)
-    throw(MethodError(delete_session!, (store, session_id)))
+@noinline function delete_session!(store::AbstractSessionStore, session_id)
+    store_contract_error(delete_session!, AbstractSessionStore, 1, store, session_id)
 end
 
-function cleanup_expired_sessions!(store::AbstractSessionStore)
-    throw(MethodError(cleanup_expired_sessions!, (store,)))
+"""
+    SESSION_STORE_INTERFACE
+
+The *required* half of the [`AbstractSessionStore`](@ref) contract as data, read by
+[`missing_session_methods`](@ref) and by the fallbacks above. `cleanup_expired_sessions!` is absent
+on purpose — it is optional, and its default is the no-op below.
+"""
+const SESSION_STORE_INTERFACE = (Base.get, set_session!, delete_session!)
+
+"""
+    cleanup_expired_sessions!(store::AbstractSessionStore)
+
+Prune expired sessions. **Optional** — this default does nothing and returns `nothing`.
+
+Optionality used to be encoded in `prunesessions!` (`src/cookies.jl`), which called this and
+swallowed any `MethodError` whose `.f` was this function. That was two bugs in one: a conforming
+store whose cleanup body happened to raise such a `MethodError` internally had it silently
+discarded, and the contract's optionality was discoverable only by reading the rescuer. Stating it
+as a default method puts it in the type system, where `methods` and `which` can see it.
+
+See [`AbstractSessionStore`](@ref) for why this one is optional while every `AbstractWorkerStore`
+method is required.
+"""
+cleanup_expired_sessions!(store::AbstractSessionStore) = nothing
+
+"""
+    missing_session_methods(S::Type{<:AbstractSessionStore}) -> Vector{Symbol}
+
+The **required** [`AbstractSessionStore`](@ref) methods `S` has not implemented. Empty means `S` is
+conforming. `cleanup_expired_sessions!` is never reported: it is optional.
+
+```julia
+@test isempty(missing_session_methods(MySessionStore))
+```
+"""
+function missing_session_methods(S::Type{<:AbstractSessionStore})
+    names = Symbol[]
+    for f in SESSION_STORE_INTERFACE
+        if !implements_contract_method(f, S, AbstractSessionStore, 1)
+            push!(names, nameof(f))
+        end
+    end
+    return names
 end
 
 # Generic cookie configuration
