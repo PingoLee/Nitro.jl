@@ -440,4 +440,145 @@ end
     end
 end
 
+
+# ── Bucket keying: IPv6 prefix normalization (#22) ────────────────────────────
+# A single IPv6 host normally controls an entire /64. Keying buckets on the full /128
+# meant a client could rotate source addresses inside its OWN allocation and get a fresh
+# bucket every request — the limit was never reached, while `X-RateLimit-*` kept
+# reporting that limiting was in effect. This is the IPv6 analogue of the #16 spoofed
+# `X-Forwarded-For` rotation regression above, except no header is involved: the
+# addresses are genuinely the client's.
+#
+# In-process (`auto_extract_ip=false` + `setip!`) so the source address is chosen
+# directly rather than being whatever the loopback socket reports.
+
+@testset "Rate limiter: rotating inside one IPv6 /64 cannot buy quota" begin
+    ok_handler = _ -> HTTP.Response(200, "ok")
+    req_from(ip) = (r = HTTP.Request("GET", "/ok"); setip!(r, ip); r)
+    unwrap(x) = x isa Nitro.LifecycleMiddleware ? x.middleware : x
+
+    for strategy in (:fixed_window, :sliding_window)
+        limit = 5
+        wrapped = unwrap(RateLimiter(; strategy, rate_limit=limit, window=Minute(1),
+                                     auto_extract_ip=false))(ok_handler)
+
+        # Every request comes from a DIFFERENT address inside 2001:db8:: /64.
+        statuses = [wrapped(req_from(IPv6("2001:db8::$(string(i, base=16))"))).status
+                    for i in 1:(2 * limit)]
+
+        @test count(==(200), statuses) == limit
+        @test count(==(429), statuses) == limit
+    end
 end
+
+@testset "Rate limiter: distinct IPv6 /64s keep independent buckets" begin
+    ok_handler = _ -> HTTP.Response(200, "ok")
+    req_from(ip) = (r = HTTP.Request("GET", "/ok"); setip!(r, ip); r)
+    unwrap(x) = x isa Nitro.LifecycleMiddleware ? x.middleware : x
+
+    for strategy in (:fixed_window, :sliding_window)
+        limit = 3
+        wrapped = unwrap(RateLimiter(; strategy, rate_limit=limit, window=Minute(1),
+                                     auto_extract_ip=false))(ok_handler)
+
+        # Exhaust one /64...
+        for _ in 1:limit
+            @test wrapped(req_from(IPv6("2001:db8:0:1::5"))).status == 200
+        end
+        @test wrapped(req_from(IPv6("2001:db8:0:1::9"))).status == 429
+
+        # ...a neighbouring /64 is a different client and still has its full quota.
+        @test wrapped(req_from(IPv6("2001:db8:0:2::5"))).status == 200
+    end
+end
+
+@testset "Rate limiter: IPv4 keying is unchanged, and mapped peers fold onto it" begin
+    ok_handler = _ -> HTTP.Response(200, "ok")
+    req_from(ip) = (r = HTTP.Request("GET", "/ok"); setip!(r, ip); r)
+    unwrap(x) = x isa Nitro.LifecycleMiddleware ? x.middleware : x
+
+    for strategy in (:fixed_window, :sliding_window)
+        # limit=3 is load-bearing: the 203.0.113.7 bucket receives exactly 4 requests
+        # below, so only a limit of 3 makes the last one discriminate. At limit=4 the
+        # test passes whether or not the mapped address folds onto the v4 bucket.
+        limit = 3
+        wrapped = unwrap(RateLimiter(; strategy, rate_limit=limit, window=Minute(1),
+                                     auto_extract_ip=false))(ok_handler)
+
+        # Default ipv4_prefix is /32, so neighbouring IPv4 hosts stay separate buckets.
+        @test wrapped(req_from(IPv4("203.0.113.7"))).status == 200
+        @test wrapped(req_from(IPv4("203.0.113.8"))).status == 200
+
+        # A dual-stack listener can report an IPv4 peer as `::ffff:a.b.c.d`. `_norm`
+        # demotes it, so it must share the bucket with the plain v4 spelling rather
+        # than opening a second one.
+        @test wrapped(req_from(IPv6("::ffff:203.0.113.7"))).status == 200
+        @test wrapped(req_from(IPv4("203.0.113.7"))).status == 200
+        @test wrapped(req_from(IPv6("::ffff:203.0.113.7"))).status == 429
+    end
+end
+
+@testset "Rate limiter: prefix lengths are configurable and validated" begin
+    ok_handler = _ -> HTTP.Response(200, "ok")
+    req_from(ip) = (r = HTTP.Request("GET", "/ok"); setip!(r, ip); r)
+    unwrap(x) = x isa Nitro.LifecycleMiddleware ? x.middleware : x
+
+    for strategy in (:fixed_window, :sliding_window)
+        # Widened to /48: two DIFFERENT /64s inside one /48 now share a bucket.
+        limit = 2
+        wrapped = unwrap(RateLimiter(; strategy, rate_limit=limit, window=Minute(1),
+                                     auto_extract_ip=false, ipv6_prefix=48))(ok_handler)
+        @test wrapped(req_from(IPv6("2001:db8:0:1::1"))).status == 200
+        @test wrapped(req_from(IPv6("2001:db8:0:2::1"))).status == 200
+        @test wrapped(req_from(IPv6("2001:db8:0:3::1"))).status == 429
+
+        # Narrowed IPv4 to /24: neighbouring hosts collapse onto one bucket.
+        w4 = unwrap(RateLimiter(; strategy, rate_limit=limit, window=Minute(1),
+                                auto_extract_ip=false, ipv4_prefix=24))(ok_handler)
+        @test w4(req_from(IPv4("198.51.100.1"))).status == 200
+        @test w4(req_from(IPv4("198.51.100.2"))).status == 200
+        @test w4(req_from(IPv4("198.51.100.3"))).status == 429
+        # A different /24 is still its own client.
+        @test w4(req_from(IPv4("198.51.101.1"))).status == 200
+
+        # Out-of-range prefixes are rejected at construction. /0 in particular would put
+        # every client on the internet in one shared bucket.
+        @test_throws ArgumentError RateLimiter(; strategy, ipv6_prefix=0)
+        @test_throws ArgumentError RateLimiter(; strategy, ipv4_prefix=0)
+        @test_throws ArgumentError RateLimiter(; strategy, ipv4_prefix=33)
+        @test_throws ArgumentError RateLimiter(; strategy, ipv6_prefix=129)
+        @test_throws ArgumentError RateLimiter(; strategy, ipv6_prefix=-1)
+    end
+end
+
+
+@testset "Rate limiter: Period keywords reject calendar durations" begin
+    # `Dates.value(p) > 0` was the old check and it does NOT catch these: `Dates.value(Month(1))`
+    # is 1, so a calendar period passed validation. What it broke depends on the keyword:
+    #   cleanup_period    -> `sleep(Month(1))` throws in the un-monitored `@async` sweep, so
+    #                        the background cleanup dies on tick 1, silently, for the life of
+    #                        the process — in the component whose whole job is bounding memory.
+    #   cleanup_threshold -> the `current_time - last_reset > threshold` comparison throws
+    #                        (Millisecond vs Month), same silent dead sweep.
+    #   window            -> the same comparison, but ON THE REQUEST PATH. The limiter's own
+    #                        catch turns it into 503 for EVERY request (or fail-open, letting
+    #                        everything through). This is the most severe of the three.
+    # Same defect class as the session janitor (#36); fixed in both.
+    for bad in (Month(1), Year(1), Quarter(1))
+        @test_throws ArgumentError RateLimiter(cleanup_period=bad)
+        @test_throws ArgumentError RateLimiter(cleanup_threshold=bad)
+        @test_throws ArgumentError RateLimiter(window=bad)
+        @test_throws ArgumentError RateLimiter(strategy=:sliding_window, window=bad)
+    end
+    # Sub-millisecond rounds to a zero-length sleep and spins.
+    @test_throws ArgumentError RateLimiter(cleanup_period=Nanosecond(500))
+    # Fixed periods, including the sub-second ones other tests rely on, still build.
+    @test RateLimiter(window=Second(3)) isa Nitro.LifecycleMiddleware
+    @test RateLimiter(cleanup_period=Millisecond(50),
+                      cleanup_threshold=Millisecond(50)) isa Nitro.LifecycleMiddleware
+    # SlidingRateLimiter returns a bare Function, not a LifecycleMiddleware.
+    @test RateLimiter(strategy=:sliding_window, window=Minute(1)) isa Function
+end
+
+end
+

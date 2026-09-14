@@ -13,7 +13,7 @@ using ..Util
 using ..Errors: ValidationError, StoreInterfaceError, implements_contract_method, store_contract_error
 
 export Server, Nullable, Context,
-    LifecycleMiddleware, startup, shutdown,
+    LifecycleMiddleware, startup, shutdown, require_fixed_period,
     Param, isrequired, LazyRequest, headers, pathparams, queryvars, jsonbody, formbody, textbody, multipartbody,
     CookieConfig, Cookie, Session, SessionPayload,
     AbstractSessionStore, get_session, set_session!, delete_session!, cleanup_expired_sessions!,
@@ -307,13 +307,25 @@ function delete_session!(store::MemoryStore{K, V}, key) where {K, V}
     return nothing
 end
 
-function cleanup_expired_sessions!(store::MemoryStore)
+function cleanup_expired_sessions!(store::MemoryStore{K, V}) where {K, V}
     current_time = Dates.now(Dates.UTC)
     lock(store.lock) do
+        # Collect first, delete after. Mutating a collection while iterating it is not a
+        # supported pattern in Julia and `Dict` promises nothing about it.
+        #
+        # Honest scope: on the current implementation `delete!` only tombstones a slot and
+        # never rehashes, so the one-pass form did NOT observably skip entries — measured, it
+        # is correct today. This is hygiene against a documented-unsafe pattern whose validity
+        # rests on an internal detail, not a fix for a reproduced bug. The rate limiter's
+        # sweep (src/middleware/rate_limiter.jl) is two-pass for the same reason.
+        expired = K[]
         for (key, payload) in store.data
             if payload.expires <= current_time
-                delete!(store.data, key)
+                push!(expired, key)
             end
+        end
+        for key in expired
+            delete!(store.data, key)
         end
     end
     return nothing
@@ -649,6 +661,39 @@ struct Context{T}
     payload::T
 end
 
+
+
+"""
+    require_fixed_period(name::String, p::Period) -> Period
+
+Validate a `Period` keyword that will be slept on or compared against a wall-clock duration.
+
+Two checks, and both exist because the obvious `Dates.value(p) > 0` catches neither:
+
+- **Calendar periods are rejected.** `Dates.value` is unit-relative, so `Dates.value(Month(1))`
+  is `1` and sails past a positivity test — then `sleep(Month(1))` throws a `MethodError`
+  (`Month` has no fixed length, so it cannot convert to `Second`). In a background task that
+  throw lands *outside* the caller's control: the task dies at its first tick and the feature
+  is silently off for the life of the process. `Dates.toms` is not a usable test either — it
+  happily returns an *average* month for `Month(1)`.
+- **Periods that round to a zero-length sleep are rejected**, since they would spin. Note this
+  is a ~500 µs floor rather than exactly 1 ms: `Dates.toms` rounds to nearest, so
+  `Microsecond(999)` survives as 1 ms while `Nanosecond(500)` does not.
+
+Throwing here puts the error on the constructor call that is actually wrong, which is the same
+reason `build_ip_extractor` validates trust configuration at construction rather than at
+`serve()` (src/middleware/rate_limiter.jl).
+"""
+function require_fixed_period(name::String, p::Dates.Period)
+    p isa Dates.FixedPeriod || throw(ArgumentError(
+        "$name must be a fixed-length Period (Week, Day, Hour, Minute, Second, Millisecond, " *
+        "Microsecond, Nanosecond), got $(typeof(p)). Calendar periods (Month, Quarter, Year) " *
+        "have no fixed length, so they can neither be slept on nor compared against a " *
+        "wall-clock duration — a background task using one dies on its first tick."))
+    Dates.toms(p) > 0 || throw(ArgumentError(
+        "$name must be at least 1 millisecond, got $p."))
+    return p
+end
 
 @kwdef struct LifecycleMiddleware 
     # The middleware function itself (handles incoming requests)

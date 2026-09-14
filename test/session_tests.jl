@@ -4,6 +4,7 @@ using Nitro
 using Nitro.Types
 using Test
 using HTTP
+using Dates
 
 struct User
     id::Int
@@ -157,12 +158,10 @@ end
         middleware = SessionMiddleware(
             cookie_name="local_session",
             max_age=120,
-            store=store,
-            prune_probability=0.0,
-            secure=false,
+            store=store, secure=false,
             httponly=false,
             samesite="Strict"
-        )
+        ).middleware
 
         handler = function(req::HTTP.Request)
             getsession(req)["user_id"] = 77
@@ -190,8 +189,7 @@ end
         function run_with_existing(; validator, auth_key="user_id", seed::Dict{String,Any}, mutate!)
             store = MemoryStore{String, Dict{String,Any}}()
             set_session!(store, "existing-id", seed; ttl=120)
-            mw = SessionMiddleware(cookie_name="app_session", store=store, prune_probability=0.0,
-                                   secure=false, auth_key=auth_key, validator=validator)
+            mw = SessionMiddleware(cookie_name="app_session", store=store, secure=false, auth_key=auth_key, validator=validator).middleware
             handler = function(req::HTTP.Request)
                 mutate!(getsession(req))
                 return HTTP.Response(200, "ok")
@@ -251,4 +249,176 @@ end
     end
 
 end
+
+    # ── Background pruning (#36) ──────────────────────────────────────────────
+    # Pruning used to happen inline on ~1% of requests, holding MemoryStore's single
+    # lock across a full O(N) scan. It is a lifecycle-owned background janitor now, so
+    # these testsets drive the hooks directly rather than sending traffic.
+
+    @testset "Session janitor prunes with no request traffic at all" begin
+        store = MemoryStore{String, Dict{String,Any}}()
+        for i in 1:5
+            Nitro.Cookies.storesession!(store, "gone-$i", Dict{String,Any}("i" => i), ttl=1)
+        end
+        Nitro.Cookies.storesession!(store, "stays", Dict{String,Any}("i" => 0), ttl=3600)
+        @test length(store.data) == 6
+
+        lf = SessionMiddleware(store=store, prune_interval=Millisecond(50))
+        @test lf isa Nitro.LifecycleMiddleware
+
+        sleep(1.1)                      # let the five short-TTL entries expire
+        @test length(store.data) == 6   # still there: nothing prunes until the janitor runs
+
+        task = lf.on_startup()
+        @test task isa Task
+        try
+            # The janitor ticks every 50ms; give it several ticks of headroom.
+            deadline = time() + 5.0
+            while length(store.data) > 1 && time() < deadline
+                sleep(0.05)
+            end
+            @test length(store.data) == 1
+            @test haskey(store.data, "stays")
+        finally
+            lf.on_shutdown()
+        end
+    end
+
+    @testset "Session janitor hooks are idempotent across a restart" begin
+        # Same shape as the RateLimiter regression in lifecycle_middleware_tests.jl: a
+        # single shared `running` flag leaked one task per serve/terminate cycle, because
+        # the stale task woke and read the flag the NEW activation had just set.
+        store = MemoryStore{String, Dict{String,Any}}()
+        lf = SessionMiddleware(store=store, prune_interval=Millisecond(50))
+
+        t1 = lf.on_startup()
+        @test t1 isa Task
+        @test lf.on_startup() === nothing     # already running: no second task
+        @test lf.on_shutdown() === t1
+
+        t2 = lf.on_startup()                  # restart gets its own token and task
+        @test t2 isa Task
+        @test t2 !== t1
+        lf.on_shutdown()
+        @test lf.on_shutdown() === nothing    # idempotent when already stopped
+
+        # The first activation's task must actually exit rather than loop forever.
+        deadline = time() + 5.0
+        while !istaskdone(t1) && time() < deadline
+            sleep(0.05)
+        end
+        @test istaskdone(t1)
+    end
+
+    @testset "SessionPruner prunes a store used without SessionMiddleware" begin
+        # The `Session{T}` extractor reads the store straight off the app context, so an
+        # app on that path never installs SessionMiddleware and nothing ever pruned.
+        store = MemoryStore{String, Dict{String,Any}}()
+        Nitro.Cookies.storesession!(store, "expired", Dict{String,Any}("a" => 1), ttl=1)
+        Nitro.Cookies.storesession!(store, "live", Dict{String,Any}("a" => 2), ttl=3600)
+        sleep(1.1)
+        @test length(store.data) == 2
+
+        pruner = SessionPruner(store; interval=Millisecond(50))
+        @test pruner isa Nitro.LifecycleMiddleware
+        # It is a pass-through: the request function must not alter the response.
+        @test pruner.middleware(req -> "untouched")(Request("GET", "/")) == "untouched"
+
+        pruner.on_startup()
+        try
+            deadline = time() + 5.0
+            while length(store.data) > 1 && time() < deadline
+                sleep(0.05)
+            end
+            @test length(store.data) == 1
+            @test haskey(store.data, "live")
+        finally
+            pruner.on_shutdown()
+        end
+    end
+
+    @testset "prune_interval is validated at construction, not in the janitor" begin
+        store = MemoryStore{String, Dict{String,Any}}()
+        @test_throws ArgumentError SessionMiddleware(store=store, prune_interval=Second(0))
+        @test_throws ArgumentError SessionPruner(store; interval=Second(-1))
+
+        # Calendar periods are the dangerous case, and `Dates.value(p) > 0` does NOT catch
+        # them: `Dates.value(Month(1))` is 1, so it passes — and then `sleep(Month(1))` throws
+        # a MethodError inside the spawned task, where nothing is waiting on it. The janitor
+        # would be dead for the life of the process while `serve()` reported success, i.e.
+        # exactly the unbounded growth #36 exists to remove, silent instead of slow.
+        for bad in (Month(1), Year(1), Quarter(1))
+            @test_throws ArgumentError SessionMiddleware(store=store, prune_interval=bad)
+            @test_throws ArgumentError SessionPruner(store; interval=bad)
+        end
+        # Sub-millisecond rounds to a zero-length sleep and spins.
+        @test_throws ArgumentError SessionMiddleware(store=store, prune_interval=Nanosecond(500))
+
+        # Fixed periods, including sub-second ones the tests above rely on, still build.
+        @test SessionMiddleware(store=store, prune_interval=Millisecond(50)) isa Nitro.LifecycleMiddleware
+        @test SessionMiddleware(store=store, prune_interval=Minute(10)) isa Nitro.LifecycleMiddleware
+        @test SessionPruner(store; interval=Second(1)) isa Nitro.LifecycleMiddleware
+    end
+
+    @testset "A throwing store does not kill the janitor" begin
+        # The `try` sits INSIDE the janitor's loop so a transient store failure costs one tick,
+        # not the process's remaining pruning. Hoisting it outside the loop would turn a single
+        # DB blip into a permanently dead janitor with a still-green suite — this is the test
+        # that would catch that refactor.
+        mutable struct FlakyStore <: Nitro.Types.AbstractSessionStore{String, Dict{String,Any}}
+            inner::MemoryStore{String, Dict{String,Any}}
+            failures_left::Int
+            calls::Int
+        end
+        Nitro.Types.cleanup_expired_sessions!(s::FlakyStore) = begin
+            s.calls += 1
+            if s.failures_left > 0
+                s.failures_left -= 1
+                error("simulated store failure")
+            end
+            Nitro.Types.cleanup_expired_sessions!(s.inner)
+        end
+
+        inner = MemoryStore{String, Dict{String,Any}}()
+        Nitro.Cookies.storesession!(inner, "dead", Dict{String,Any}("i" => 1), ttl=1)
+        Nitro.Cookies.storesession!(inner, "live", Dict{String,Any}("i" => 2), ttl=3600)
+        sleep(1.1)
+
+        flaky = FlakyStore(inner, 3, 0)
+        pruner = SessionPruner(flaky; interval=Millisecond(50))
+        task = pruner.on_startup()
+        try
+            # It must survive the first three throwing ticks and still prune afterwards.
+            @test timedwait(() -> length(inner.data) == 1, 10.0) === :ok
+            @test haskey(inner.data, "live")
+            @test flaky.calls > 3          # it really did keep ticking past the failures
+            @test !istaskdone(task)        # and the janitor is still alive
+        finally
+            pruner.on_shutdown()
+        end
+    end
+
+    @testset "cleanup_expired_sessions! removes every expired entry" begin
+        # NOTE: this does NOT discriminate the one-pass/two-pass rewrite in
+        # `cleanup_expired_sessions!` — measured, Julia's `delete!` only tombstones a slot and
+        # never rehashes, so the old one-pass form skipped nothing. It is kept as a plain
+        # behavioural assertion on the prune (every expired row goes, every live row stays) at
+        # a store size the other tests do not cover.
+        store = MemoryStore{String, Dict{String,Any}}()
+        for i in 1:200
+            Nitro.Cookies.storesession!(store, "dead-$i", Dict{String,Any}("i" => i), ttl=1)
+        end
+        for i in 1:50
+            Nitro.Cookies.storesession!(store, "live-$i", Dict{String,Any}("i" => i), ttl=3600)
+        end
+        sleep(1.1)
+
+        Nitro.Cookies.prunesessions!(store)
+
+        @test length(store.data) == 50
+        @test all(i -> haskey(store.data, "live-$i"), 1:50)
+        @test !any(i -> haskey(store.data, "dead-$i"), 1:200)
+    end
+
 end
+

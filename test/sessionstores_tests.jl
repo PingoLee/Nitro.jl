@@ -225,9 +225,8 @@ end
         cookie_name="sid",
         max_age=3600,
         store=store,
-        prune_probability=0.0,
         secure=false,
-    )
+    ).middleware
 
     # 1. Login handler: creates session, then regenerates
     login_handler = function(req::HTTP.Request)
@@ -270,9 +269,8 @@ end
         cookie_name="sid",
         max_age=3600,
         store=store,
-        prune_probability=0.0,
         secure=false,
-    )
+    ).middleware
 
     login_handler = function(req::HTTP.Request)
         getsession(req)["user_id"] = 77
@@ -293,9 +291,8 @@ end
         cookie_name="sid",
         max_age=3600,
         store=FailingSessionStore(),
-        prune_probability=0.0,
         secure=false,
-    )
+    ).middleware
 
     handler = function(req::HTTP.Request)
         getsession(req)["user_id"] = 99

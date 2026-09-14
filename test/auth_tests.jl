@@ -15,7 +15,7 @@ using Nitro: BearerAuth, GuardMiddleware, SessionMiddleware, login_required, rol
         "permissions" => ["reports:read"],
     ); ttl=60)
 
-    middleware = SessionMiddleware(cookie_name="auth_session", store=store, prune_probability=0.0)
+    middleware = SessionMiddleware(cookie_name="auth_session", store=store).middleware
     handler = GuardMiddleware(
         login_required(),
         role_required("admin"),
@@ -113,7 +113,7 @@ end
     # SessionMiddleware goes OUTSIDE: CSRF tokens are bound to the session id it puts on the
     # request context, so without it there is nothing to bind to and every mutation is refused.
     store = Nitro.Types.MemoryStore{String, Dict{String,Any}}()
-    wrapped = SessionMiddleware(cookie_name="csrf_session", store=store, prune_probability=0.0)(
+    wrapped = SessionMiddleware(cookie_name="csrf_session", store=store).middleware(
         CSRFMiddleware("csrf-secret")(req -> HTTP.Response(200, "ok")))
 
     set_cookies(res) = join([h.second for h in res.headers if lowercase(h.first) == "set-cookie"], "\n")

@@ -91,6 +91,7 @@ set_cookie!
 Cookie
 Session
 SessionMiddleware
+SessionPruner
 ```
 
 ## Middleware
