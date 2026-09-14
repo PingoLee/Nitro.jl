@@ -67,7 +67,12 @@ function Base.getproperty(qs::MockQuerySet, name::Symbol)
             return nothing
         end
     elseif name === :delete
-        return function(; allow_delete_all::Bool=false)
+        # Bound to a local instead of returned directly: Julia 1.13's parser drops the
+        # parameter block of a keyword-only `return function(; kw=default)` written inside
+        # a `function ... end` body, lowering it to `function kw = default` and erroring
+        # with `invalid assignment location`. 1.12 parses it fine. `f = function(; …)` then
+        # `return f` parses correctly on both.
+        delete_fn = function(; allow_delete_all::Bool=false)
             table = getfield(qs, :table)
             filters = getfield(qs, :filters)
             if haskey(filters, "session_key")
@@ -86,6 +91,7 @@ function Base.getproperty(qs::MockQuerySet, name::Symbol)
             end
             return nothing
         end
+        return delete_fn
     else
         return getfield(qs, name)
     end
