@@ -227,6 +227,47 @@ jobs:
     permissions:
       contents: write
       actions: write
+    # Serializes docs deploys so a release cut stops racing itself (#124). `deploydocs` pushes to
+    # the single `gh-pages` ref, does not force-push, and does not retry. A cut pushes `main` and
+    # then the `vX.Y.Z` tag at the SAME commit, and `on.push` above matches both -- so two runs
+    # fire, each with a full `docs` job, and whichever arrives second is rejected non-fast-forward,
+    # reddening the release CI for a reason that has nothing to do with the release.
+    #
+    # The two are NOT redundant, so gating to one trigger is the wrong fix: the `main` run
+    # publishes `dev/`, the tag run publishes `vX.Y.Z/` and repoints `stable/`. The tag run is the
+    # one that loses -- `gh-pages` holds only `dev/` today, with `DOC_VERSIONS = ["dev"]` and the
+    # site root redirecting to `./dev/`. v0.3.0 is the only real instance of the race: v0.1.0 and
+    # v0.2.0 were batch-retagged on 2026-08-10, before #105 (df77e2b) pointed `deploydocs` at a
+    # repository that exists, so nothing could publish then for an unrelated reason.
+    #
+    # Serializing is SUFFICIENT because Documenter fetches `gh-pages` at the END of the job, inside
+    # `git_push` (`git init` + `git fetch upstream` + `git checkout -b`, in a tempdir) rather than
+    # at job start -- so run 2 fetches after run 1's push has landed, and fast-forwards. main-vs-tag
+    # also converges in either order: they write different subfolders, and `versions.js` and the
+    # `stable` pointer are rebuilt from a `readdir` of whatever version folders exist.
+    #
+    # `cancel-in-progress: false` because both deploys must land -- cancelling either is the bug,
+    # not the fix. `queue: max` raises the pending cap from 1 to 100, FIFO. That is load-bearing,
+    # not belt-and-braces: under the default `queue: single` a third push arriving while two were
+    # already in the group CANCELS the pending one, which is the tag deploy -- silently losing the
+    # exact run this block exists to protect. (`queue: max` requires `cancel-in-progress: false`.)
+    #
+    # Only deploying events share the group. A `pull_request` docs job returns before touching git
+    # (`push_preview = false` in `docs/make.jl` makes `deploydocs` a no-op on a preview build), so
+    # it would hold the lock through minutes of doctests and building while never deploying,
+    # widening the window in which real deploys contend. `!= 'pull_request'` rather than
+    # `== 'push'` on purpose: Documenter also deploys on `workflow_dispatch` and `schedule`, so an
+    # allowlist of one event would hand those a private group and reinstate the race if either
+    # trigger is added later.
+    #
+    # Two ordinary `main` pushes in quick succession are serialized by this too, and that is a
+    # behavior CHANGE worth knowing: they write the SAME `dev/` folder, so rather than the loser
+    # failing loudly, both now succeed and a stale `dev/` can win if the runs reach the gate out of
+    # commit order. It self-heals on the next push to `main`.
+    concurrency:
+      group: docs-deploy-${{ github.event_name != 'pull_request' && 'shared' || github.run_id }}
+      cancel-in-progress: false
+      queue: max
     env:
       DOCUMENTER_KEY: ${{ secrets.DOCUMENTER_KEY }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
