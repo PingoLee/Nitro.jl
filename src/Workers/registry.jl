@@ -265,6 +265,31 @@ function set_watch_authorizer! end
 function get_sequential_queues end
 function get_queue_lock end
 
+# -- Lifecycle --
+
+"""
+    shutdown!(store)
+
+Release everything the store owns on this process: stop its cleanup scheduler, close its
+sequential-queue channels, and drop its process-local runtime handles.
+
+**Required, not an optional extra.** This used to have a no-op fallback on
+`AbstractWorkerStore`, and `PormGWorkerStore` never overrode it — so `uninstall!` on a
+PormG-backed app dispatched to the no-op and the scheduler kept issuing DB `DELETE`s while
+queue processors kept blocking on `take!`, after the app had stopped
+([#29](https://github.com/PingoLee/Nitro.jl/issues/29)). Every bootstrap/teardown cycle
+leaked another set. A backend that genuinely owns nothing still has to say so, with
+`shutdown!(::MyStore) = nothing`; the point is that it is written down rather than inherited
+by accident.
+
+Most of the work is backend-independent and lives in [`_stop_scheduler_and_queues!`](@ref),
+which reaches everything it needs through the contract accessors. An implementation is
+usually that call plus clearing whatever active-task caches the store itself holds.
+
+Called by `uninstall!` and `reset_store!`.
+"""
+function shutdown! end
+
 # -- Cleanup and Locking helper functions --
 function get_cleanup_scheduler end
 function lock_tasks end
@@ -317,6 +342,7 @@ const WORKER_STORE_INTERFACE = (
     (get_queue_lock,                (AbstractWorkerStore,)),
     (get_cleanup_scheduler,         (AbstractWorkerStore,)),
     (lock_tasks,                    (Function, AbstractWorkerStore)),
+    (shutdown!,                     (AbstractWorkerStore,)),
 )
 
 _store_arg_index(argtypes) = something(findfirst(T -> T === AbstractWorkerStore, argtypes))
@@ -643,17 +669,32 @@ function uninstall!(ctx::App; key::Symbol=DEFAULT_EXTENSION_KEY)
     return nothing
 end
 
-shutdown!(::AbstractWorkerStore) = nothing
+"""
+    _stop_scheduler_and_queues!(store)
 
-function shutdown!(store::InMemoryWorkerStore)
-    scheduler = store.cleanup_scheduler[]
+The backend-independent half of [`shutdown!`](@ref), written entirely against the contract
+accessors so every store inherits it instead of copying it.
+
+Stops the cleanup scheduler and clears its `Ref`, then closes every sequential queue's channel
+and clears the queue registry. Closing the channel is the stop signal for a queue processor:
+its `take!` throws `InvalidStateException`, which the processor loop catches and breaks on.
+
+**The queue dict is emptied, not just drained.** A queue whose channel is closed is dead, but
+`_get_or_create_queue` uses `get!` — so leaving the entry behind means a store reused after
+shutdown hands back the dead queue, spawns a processor that immediately breaks, and then throws
+on `put!`. Emptying makes the teardown total, so a store can be shut down and started again.
+"""
+function _stop_scheduler_and_queues!(store::AbstractWorkerStore)
+    scheduler_ref = get_cleanup_scheduler(store)
+    scheduler = scheduler_ref[]
     if !isnothing(scheduler)
         stop_cleanup_scheduler!(scheduler)
-        store.cleanup_scheduler[] = nothing
+        scheduler_ref[] = nothing
     end
 
-    lock(store.queue_lock) do
-        for queue in values(store.sequential_queues)
+    lock(get_queue_lock(store)) do
+        queues = get_sequential_queues(store)
+        for queue in values(queues)
             if isopen(queue.channel)
                 close(queue.channel)
             end
@@ -661,7 +702,14 @@ function shutdown!(store::InMemoryWorkerStore)
             queue.current_task = nothing
             queue.processor_task = nothing
         end
+        empty!(queues)
     end
+
+    return nothing
+end
+
+function shutdown!(store::InMemoryWorkerStore)
+    _stop_scheduler_and_queues!(store)
 
     lock(store.active_lock) do
         empty!(store.active_tasks)
@@ -670,18 +718,28 @@ function shutdown!(store::InMemoryWorkerStore)
     return nothing
 end
 
+"""
+    reset_store!(store = default_store()) -> store
+
+Tear the store down and discard its task records, returning it to a freshly-constructed state.
+
+[`shutdown!`](@ref) does the process-local half — scheduler, queue channels, active-task caches
+— for every backend. What stays conditional here is discarding the task records themselves,
+because only a volatile store *has* records to discard: for a database-backed store the registry
+is durable rows that outlive the process, and wiping them on a reset would be a destructive
+delete of live data rather than a teardown. A persistent backend prunes through
+`cleanup_tasks!`, on its own retention policy.
+
+This used to gate the whole body on `store isa InMemoryWorkerStore`, which — combined with
+`shutdown!` having a silent no-op fallback — made `reset_store!` on a PormG store a complete
+no-op that returned the store unchanged ([#29](https://github.com/PingoLee/Nitro.jl/issues/29)).
+"""
 function reset_store!(store::AbstractWorkerStore=default_store())
     shutdown!(store)
 
     if store isa InMemoryWorkerStore
         lock(store.task_lock) do
             empty!(store.task_registry)
-        end
-        lock(store.queue_lock) do
-            empty!(store.sequential_queues)
-        end
-        lock(store.active_lock) do
-            empty!(store.active_tasks)
         end
     end
 

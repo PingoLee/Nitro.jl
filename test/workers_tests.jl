@@ -52,6 +52,56 @@ struct NothingWorkerStore <: AbstractWorkerStore end
                                              run_id=nothing, no_such_keyword=1)
 end
 
+@testset "shutdown! releases the scheduler, the queues and the active handles" begin
+    store = InMemoryWorkerStore()
+
+    try
+        # A real sequential queue with a live processor, and a real cleanup scheduler.
+        owner = Owner("user-teardown")
+        task_id = submit_sequential_task("teardown-q", "one", () -> "done", owner; store=store)
+        @test wait_for(() -> get_task_status(task_id, owner; store=store)[:status] == "COMPLETED") == :ok
+
+        scheduler = start_cleanup_scheduler(; interval_hours=1, retain_days=7, store=store)
+        @test get_cleanup_scheduler(store)[] === scheduler
+
+        queues = get_sequential_queues(store)
+        @test haskey(queues, "teardown-q")
+        channel = queues["teardown-q"].channel
+        @test isopen(channel)
+
+        shutdown!(store)
+
+        # The scheduler is stopped AND its slot cleared, so a restart does not see a dead one.
+        @test get_cleanup_scheduler(store)[] === nothing
+        @test istaskdone(scheduler.task)
+
+        # The channel is closed -- that is the processor's stop signal -- and the registry is
+        # emptied, not merely drained. A closed-but-present queue is the reuse hazard: `get!` in
+        # `_get_or_create_queue` would hand the dead one straight back.
+        @test !isopen(channel)
+        @test isempty(get_sequential_queues(store))
+        @test isempty(store.active_tasks)
+
+        # So the store is genuinely reusable, rather than poisoned for sequential work.
+        again = submit_sequential_task("teardown-q", "two", () -> "again", owner; store=store)
+        @test wait_for(() -> get_task_status(again, owner; store=store)[:status] == "COMPLETED") == :ok
+        @test get_sequential_queues(store)["teardown-q"].channel !== channel
+    finally
+        reset_store!(store)
+    end
+end
+
+@testset "shutdown! is required of every backend, not silently skipped" begin
+    # It used to have a no-op fallback on the abstract type, which is how PormGWorkerStore came
+    # to leak its scheduler and processors on every teardown without anyone noticing (#29). A
+    # backend that owns nothing must now say `shutdown!(::MyStore) = nothing` out loud.
+    @test :shutdown! in missing_store_methods(NothingWorkerStore)
+    @test_throws StoreInterfaceError shutdown!(NothingWorkerStore())
+
+    # `reset_store!` reaches it too, so the silent path is closed from both entry points.
+    @test_throws StoreInterfaceError reset_store!(NothingWorkerStore())
+end
+
 @testset "Immediate task execution and deduplication" begin
     store = InMemoryWorkerStore()
     calls = Ref(0)

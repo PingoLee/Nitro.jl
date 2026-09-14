@@ -20,7 +20,8 @@ import Nitro.Workers: AbstractWorkerStore, TaskInfo, TaskStatus, TaskOptions, Se
     get_active_task_info, register_active_task_info!, deregister_active_task_info!,
     get_queue_authorizer, set_queue_authorizer!,
     get_watch_authorizer, set_watch_authorizer!,
-    get_sequential_queues, get_queue_lock, get_cleanup_scheduler, lock_tasks
+    get_sequential_queues, get_queue_lock, get_cleanup_scheduler, lock_tasks,
+    shutdown!, _stop_scheduler_and_queues!
 import Nitro: pormg_nitro_worker
 
 export PormGWorkerStore, pormg_nitro_worker
@@ -879,6 +880,38 @@ function lock_tasks(callback::Function, store::PormGWorkerStore)
     return lock(store.task_lock) do
         callback()
     end
+end
+
+"""
+    shutdown!(store::PormGWorkerStore)
+
+Release everything this store owns on the current process.
+
+`shutdown!` is part of the `AbstractWorkerStore` lifecycle contract, and this backend used to
+have no method for it at all: `uninstall!` fell through to a no-op fallback, so the cleanup
+scheduler kept issuing `DELETE`s against `nitro_task` and the queue processors kept blocking on
+`take!` long after the app had stopped, leaking another set on every bootstrap/teardown cycle
+([#29](https://github.com/PingoLee/Nitro.jl/issues/29)).
+
+The scheduler and queue teardown is shared with every other backend through
+`_stop_scheduler_and_queues!`. What is specific here is `active_task_infos`, which has no
+`InMemoryWorkerStore` counterpart — that store's `deregister_active_task_info!` is a no-op
+because its registry *is* the live object. Leaving this dict populated would let `get_task_info`
+and `get_all_tasks` keep serving stale live `TaskInfo`s, overlaid on top of the durable rows,
+after shutdown.
+
+The durable rows themselves are untouched: they outlive the process by design, which is the
+whole reason to use this store.
+"""
+function shutdown!(store::PormGWorkerStore)
+    _stop_scheduler_and_queues!(store)
+
+    lock(store.active_lock) do
+        empty!(store.active_tasks)
+        empty!(store.active_task_infos)
+    end
+
+    return nothing
 end
 
 # ============================================================================

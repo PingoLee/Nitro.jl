@@ -949,6 +949,64 @@ else
             end
         end
 
+        @testset "shutdown! tears the persistent store down instead of no-opping (#29)" begin
+            store_td = RealPormGWorkerStore(model=MockTaskModel())
+            owner = Owner("user-td")
+
+            try
+                # `shutdown!` used to have a no-op fallback on AbstractWorkerStore and this
+                # backend never overrode it, so `uninstall!` left the cleanup scheduler issuing
+                # DELETEs against nitro_task and the queue processors blocking on `take!` after
+                # the app had stopped -- another set leaked on every bootstrap/teardown cycle.
+                @test hasmethod(shutdown!, Tuple{RealPormGWorkerStore})
+
+                task_id = submit_sequential_task("td-queue", "one", () -> "done", owner; store=store_td)
+                @test timedwait(() -> get_task_status(task_id, owner; store=store_td)[:status] == "COMPLETED", 5.0) == :ok
+
+                scheduler = start_cleanup_scheduler(; interval_hours=1, retain_days=7, store=store_td)
+                @test get_cleanup_scheduler(store_td)[] === scheduler
+
+                channel = get_sequential_queues(store_td)["td-queue"].channel
+                @test isopen(channel)
+
+                # Stand in for a run still in flight. A FINISHED run deregisters itself, so the
+                # caches are empty by then -- registering directly is both deterministic and the
+                # exact state a mid-flight shutdown finds. `active_task_infos` is the one with no
+                # InMemoryWorkerStore counterpart at all, which is why copying that store's
+                # teardown verbatim would have left it behind: `get_task_info` and `get_all_tasks`
+                # overlay this dict on the durable rows, so a stale entry keeps being served.
+                register_active_task!(store_td, "in-flight", current_task())
+                register_active_task_info!(store_td, "in-flight", TaskInfo("in-flight"))
+                @test !isempty(store_td.active_tasks)
+                @test !isempty(store_td.active_task_infos)
+
+                shutdown!(store_td)
+
+                @test get_cleanup_scheduler(store_td)[] === nothing
+                @test istaskdone(scheduler.task)
+                @test !isopen(channel)
+                @test isempty(get_sequential_queues(store_td))
+                @test isempty(store_td.active_tasks)
+                @test isempty(store_td.active_task_infos)
+
+                # The durable rows survive: they outlive the process by design, and that is the
+                # whole reason to use this store rather than the in-memory one.
+                @test haskey(store_td.model._table, task_id)
+
+                # ...and `reset_store!` is no longer a complete no-op on a persistent store. It
+                # runs the teardown while still declining to delete the durable rows, which would
+                # be a destructive delete of live data rather than a reset.
+                second = submit_sequential_task("td-queue", "two", () -> "again", owner; store=store_td)
+                @test timedwait(() -> get_task_status(second, owner; store=store_td)[:status] == "COMPLETED", 5.0) == :ok
+                reset_store!(store_td)
+                @test isempty(get_sequential_queues(store_td))
+                @test isempty(store_td.active_task_infos)
+                @test haskey(store_td.model._table, second)
+            finally
+                reset_store!(store_td)
+            end
+        end
+
         @testset "one transient read failure denies the key instead of granting it (#19)" begin
             # Regression: get_task_info used to log a failed read and return `nothing`,
             # which _register_or_watch! reads as "no such task" — so a single connection
