@@ -5,7 +5,7 @@ using Dates
 using JSON
 using UUIDs
 using ...Types: AbstractSessionStore, MemoryStore, SessionPayload, Nullable
-using ...Types: CookieConfig, LifecycleMiddleware
+using ...Types: CookieConfig, LifecycleMiddleware, require_fixed_period
 using ...Cookies: get_cookie, set_cookie!, storesession!, prunesessions!, regenerate_session!
 using ...Crypto: secure_uuid4
 using ...Core: own_response_headers
@@ -52,9 +52,11 @@ const DEFAULT_STORE = MemoryStore{String, Dict{String,Any}}()
 # is a blocking SQL DELETE. Per src/Workers/api.jl, `@async` is acceptable only for a task that
 # runs no user code, so a janitor over a user store must not share a thread with request
 # handlers.
-function _prune_janitor(store::AbstractSessionStore, interval::Period, label::String)
-    Dates.value(interval) > 0 ||
-        throw(ArgumentError("$label: prune_interval must be a positive duration, got $interval"))
+function _prune_janitor(store::AbstractSessionStore, interval::Period, label::String,
+                       kwname::String)
+    # `kwname`, not a hardcoded "prune_interval": `SessionPruner`'s keyword is `interval`, and
+    # an error naming a keyword the caller's function does not have sends them hunting.
+    require_fixed_period("$label: $kwname", interval)
 
     active = Ref{Union{Ref{Bool},Nothing}}(nothing)
     prune_task = Ref{Union{Task,Nothing}}(nothing)
@@ -75,7 +77,7 @@ function _prune_janitor(store::AbstractSessionStore, interval::Period, label::St
             catch e
                 # A failing store must not kill the janitor — the next tick may well succeed,
                 # and a dead janitor is a silent memory leak.
-                @error "Nitro.SessionMiddleware: session prune failed" exception=(e, catch_backtrace())
+                @error "Nitro.$label: session prune failed" exception=(e, catch_backtrace())
             end
         end)
         return prune_task[]
@@ -117,7 +119,7 @@ The janitor starts on `serve()` and stops on `terminate()`. Its hooks are idempo
 `serve(); terminate(); serve()` cycle does not leak a task.
 """
 function SessionPruner(store::AbstractSessionStore; interval::Period = Minute(10))
-    on_startup, on_shutdown = _prune_janitor(store, interval, "SessionPruner")
+    on_startup, on_shutdown = _prune_janitor(store, interval, "SessionPruner", "interval")
     return LifecycleMiddleware(;
         middleware = handle -> (req -> handle(req)),
         on_startup = on_startup,
@@ -163,7 +165,8 @@ contract.
 
 - `cookie_name::String = "nitro_session"`, `store`, `max_age::Int`.
 - `prune_interval::Period = Minute(10)` — how often the background janitor removes expired
-  sessions from `store`. This replaced a `prune_probability` that ran the prune inline on a
+  sessions from `store`. Must be a positive fixed-length `Period`; calendar periods (`Month`,
+  `Quarter`, `Year`) are rejected, since they cannot be slept on. This replaced a `prune_probability` that ran the prune inline on a
   fraction of requests; see the comment above `_prune_janitor` for why that had to go.
 - Cookie attributes (`secure`, `httponly`, `samesite`, `path`, `domain`, `secret_key`) or a
   fully-formed `config::CookieConfig`.
@@ -196,7 +199,8 @@ function SessionMiddleware(;
     ),
     validator::Union{Function, Nothing} = nothing)
 
-    on_startup, on_shutdown = _prune_janitor(store, prune_interval, "SessionMiddleware")
+    on_startup, on_shutdown = _prune_janitor(store, prune_interval, "SessionMiddleware",
+                                             "prune_interval")
 
     middleware = function(handle::Function)
         return function(req::HTTP.Request)

@@ -192,9 +192,9 @@ Creates a middleware function that enforces rate limiting based on IP address, w
 
 # Arguments
 - `rate_limit::Int`: Maximum number of requests allowed per IP within the window period. Default is 100. Must be positive.
-- `window::Period`: Time window for rate limiting. Default is 1 minute. Must be positive.
-- `cleanup_period::Period`: Interval for running the background cleanup task. Default is 10 minutes. Must be positive.
-- `cleanup_threshold::Period`: Minimum age of inactive IP entries before deletion during cleanup. Default is 10 minutes. Must be positive.
+- `window::Period`: Time window for rate limiting. Default is 1 minute. Must be a positive fixed-length `Period`; calendar periods (`Month`, `Quarter`, `Year`) are rejected.
+- `cleanup_period::Period`: Interval for running the background cleanup task. Default is 10 minutes. Must be a positive fixed-length `Period`.
+- `cleanup_threshold::Period`: Minimum age of inactive IP entries before deletion during cleanup. Default is 10 minutes. Must be a positive fixed-length `Period`.
 - `auto_extract_ip::Bool`: If `true` (default), the middleware will automatically extract the client IP address from the request using the built-in extractor. Setting `false` is incompatible with `forwarded_header`/`trusted_proxies`, since nothing would then apply them.
 - `forwarded_header::Symbol`: Forwarded to [`ExtractIP`](@ref) — the single header your reverse proxy writes. One of `:none` (default), `:x_forwarded_for`, `:x_real_ip`, `:cf_connecting_ip`, `:true_client_ip`. Must be set together with `trusted_proxies`.
 - `trusted_proxies`: Forwarded to [`ExtractIP`](@ref) — the proxies whose forwarding header may be believed, as `IPAddr` values or CIDR strings (`"10.244.0.0/16"`). The header is read only when the socket peer matches one of them.
@@ -240,9 +240,12 @@ function FixedRateLimiter(;
 
     # Validate parameters
     rate_limit > 0 || throw(ArgumentError("rate_limit must be positive, got $rate_limit"))
-    Dates.value(window) > 0 || throw(ArgumentError("window must be a positive duration"))
-    Dates.value(cleanup_period) > 0 || throw(ArgumentError("cleanup_period must be a positive duration"))
-    Dates.value(cleanup_threshold) > 0 || throw(ArgumentError("cleanup_threshold must be a positive duration"))
+    # `Dates.value(...) > 0` was the old test and it admits calendar periods: `Month(1)` has
+    # value 1, so it passed, and then `sleep(cleanup_period)` threw inside the un-monitored
+    # `@async` sweep — killing the background cleanup silently, for the life of the process.
+    require_fixed_period("window", window)
+    require_fixed_period("cleanup_period", cleanup_period)
+    require_fixed_period("cleanup_threshold", cleanup_threshold)
     v4mask, v6mask = _prefix_masks(ipv4_prefix, ipv6_prefix)
 
     # Validates the trust configuration here, not at `serve()` — see `build_ip_extractor`.
@@ -295,8 +298,10 @@ function FixedRateLimiter(;
             for stripe in stripes
                 lock(stripe.lock) do
                     to_delete = BucketKey[]
-                    # Collect first, delete after — mutating a `Dict` while iterating it is
-                    # not defined behaviour in Julia.
+                    # Collect first, delete after — mutating a collection while iterating it
+                    # is not a supported pattern. (On the current `Dict` a `delete!` only
+                    # tombstones and never rehashes, so the one-pass form happens to work;
+                    # this does not depend on that.)
                     for (key, (_, last_reset)) in stripe.store
                         if current_time - last_reset > cleanup_threshold
                             push!(to_delete, key)
@@ -442,7 +447,7 @@ offering more precise rate limiting than fixed windows but with higher memory us
 
 # Arguments
 - `rate_limit::Int`: Maximum requests per client per window. Default 100. Must be positive.
-- `window::Period`: Sliding time window duration. Default 1 minute. Must be positive.
+- `window::Period`: Sliding time window duration. Default 1 minute. Must be a positive fixed-length `Period`; calendar periods (`Month`, `Quarter`, `Year`) are rejected.
 - `max_clients::Int`: Maximum distinct client buckets in LRU cache. Default 10000. Must be positive.
 - `exempt_paths::Vector{String}`: Request path prefixes to skip rate limiting. Default empty.
 - `auto_extract_ip::Bool`: If true, automatically extract IP address from request. Default true. Setting `false` is incompatible with `forwarded_header`/`trusted_proxies`, since nothing would then apply them.
@@ -471,7 +476,8 @@ Uses a sliding window approach where:
 4. LRU eviction prevents unbounded memory growth
 
 The store is striped across independent locks (see `_Stripe`), and `max_clients` is divided
-among the stripes. The total bound is preserved, but eviction is per stripe: a stripe holding
+among the stripes, so the total bound holds to within one entry per stripe (the per-stripe
+quota is rounded up). Eviction becomes per stripe: a stripe holding
 an unusually busy share of the key space evicts at its own quota rather than globally. Caches
 too small to divide (under 128 entries) use a single stripe and behave exactly as before.
 
@@ -497,7 +503,7 @@ function SlidingRateLimiter(;
 
     # Validate parameters
     rate_limit > 0 || throw(ArgumentError("rate_limit must be positive, got $rate_limit"))
-    Dates.value(window) > 0 || throw(ArgumentError("window must be a positive duration"))
+    require_fixed_period("window", window)   # see FixedRateLimiter — calendar periods are unusable
     max_clients > 0 || throw(ArgumentError("max_clients must be positive, got $max_clients"))
     v4mask, v6mask = _prefix_masks(ipv4_prefix, ipv6_prefix)
 
@@ -505,7 +511,8 @@ function SlidingRateLimiter(;
     extract_client_ip = build_ip_extractor(auto_extract_ip, forwarded_header, trusted_proxies)
 
     # Striped LRU: BucketKey -> Vector of request timestamps. `max_clients` is split across the
-    # stripes, so the TOTAL bound is preserved but eviction becomes per-stripe — a hot stripe
+    # stripes (rounded up, so the total may exceed `max_clients` by at most `nstripes - 1`)
+    # and eviction becomes per-stripe — a hot stripe
     # evicts at its own share rather than globally. That is the standard sharded-cache trade;
     # `_bounded_stripe_count` keeps it honest by collapsing to a single stripe for small caches.
     nstripes = _bounded_stripe_count(max_clients)

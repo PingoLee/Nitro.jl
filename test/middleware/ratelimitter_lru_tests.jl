@@ -438,19 +438,60 @@ end
     end
 end
 
-@testset "Sliding limiter: distinct clients keep their buckets under the default bound" begin
-    # 1000 distinct clients into the default max_clients=10000 (16 stripes x 625). No
-    # stripe can reach 625 with only 1000 keys, so every bucket must survive: a client
-    # that already spent its quota must still be rejected on a later request.
+@testset "Sliding limiter: stripes evict independently" begin
+    # The property striping actually introduces: each stripe has its OWN LRU budget, so
+    # flooding one stripe must not evict buckets held by another -- otherwise the victim
+    # silently gets a fresh quota, which is a rate-limit bypass.
+    #
+    # Which assertion catches which regression (simulated against both buggy shapes):
+    #   selection collapsed onto one stripe -> the MIDDLE assertion fires (victim evicted
+    #     by the other stripe's flood).
+    #   stripes sharing one store of 128    -> the middle assertion still passes (85 entries
+    #     in a 128 store evicts nothing); the FINAL assertion is what fires.
+    # So the non-vacuousness check at the end is load-bearing, not decoration.
+    #
+    # White-box on purpose: the stripe index is `hash(key) & (n-1)`, so the keys are sorted
+    # into stripes here the same way the limiter does it. max_clients=128 gives exactly
+    # 2 stripes of 64 (asserted below, so this test fails loudly if the sizing changes).
+    RL = Nitro.Core.RateLimiterMiddleware
+    nstripes = RL._bounded_stripe_count(128)
+    @test nstripes == 2
+    per_stripe = cld(128, nstripes)
+    @test per_stripe == 64
+
+    v4mask, v6mask = RL._prefix_masks(32, 64)
+    stripe_of(ip) = (hash(RL._bucket_key(ip, v4mask, v6mask)) & UInt(nstripes - 1)) + 1
+
+    ips = [IPv4("10.$(div(i, 256)).$(mod(i, 256)).1") for i in 0:1499]
+    by_stripe = Dict(k => filter(ip -> stripe_of(ip) == k, ips) for k in 1:nstripes)
+    # Must cover the `per_stripe + 20` slices taken below, or a hash change turns a clean
+    # failure into a BoundsError.
+    @test all(length(v) > per_stripe + 20 for v in values(by_stripe))
+
     limit = 1
     wrapped = RateLimiter(strategy=:sliding_window, rate_limit=limit, window=Minute(1),
-                          auto_extract_ip=false)(_ -> HTTP.Response(200, "ok"))
+                          max_clients=128, auto_extract_ip=false)(_ -> HTTP.Response(200, "ok"))
     req_from(ip) = (r = HTTP.Request("GET", "/"); setip!(r, ip); r)
-    ips = [IPv4("10.$(div(i, 256)).$(mod(i, 256)).1") for i in 0:999]
 
-    @test all(ip -> wrapped(req_from(ip)).status == 200, ips)
-    # Every one of them is now out of quota; none may have been evicted.
-    @test all(ip -> wrapped(req_from(ip)).status == 429, ips)
+    # A victim on stripe 1 spends its single request.
+    victim = by_stripe[1][1]
+    @test wrapped(req_from(victim)).status == 200
+    @test wrapped(req_from(victim)).status == 429
+
+    # Flood stripe 2 with far more than its own budget. None of these touch stripe 1.
+    for ip in by_stripe[2][1:(per_stripe + 20)]
+        wrapped(req_from(ip))
+    end
+
+    # The victim's bucket must be untouched -- still out of quota.
+    @test wrapped(req_from(victim)).status == 429
+
+    # And flooding the victim's OWN stripe past its budget does evict it, which is what
+    # proves the assertion above was not vacuous.
+    for ip in by_stripe[1][2:(per_stripe + 20)]
+        wrapped(req_from(ip))
+    end
+    @test wrapped(req_from(victim)).status == 200
 end
 
 end

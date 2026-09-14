@@ -158,8 +158,7 @@ end
         middleware = SessionMiddleware(
             cookie_name="local_session",
             max_age=120,
-            store=store,
-            secure=false,
+            store=store, secure=false,
             httponly=false,
             samesite="Strict"
         ).middleware
@@ -190,7 +189,7 @@ end
         function run_with_existing(; validator, auth_key="user_id", seed::Dict{String,Any}, mutate!)
             store = MemoryStore{String, Dict{String,Any}}()
             set_session!(store, "existing-id", seed; ttl=120)
-            mw = SessionMiddleware(cookie_name="app_session", store=store,                                   secure=false, auth_key=auth_key, validator=validator).middleware
+            mw = SessionMiddleware(cookie_name="app_session", store=store, secure=false, auth_key=auth_key, validator=validator).middleware
             handler = function(req::HTTP.Request)
                 mutate!(getsession(req))
                 return HTTP.Response(200, "ok")
@@ -338,16 +337,73 @@ end
         end
     end
 
-    @testset "prune_interval must be positive" begin
+    @testset "prune_interval is validated at construction, not in the janitor" begin
         store = MemoryStore{String, Dict{String,Any}}()
         @test_throws ArgumentError SessionMiddleware(store=store, prune_interval=Second(0))
         @test_throws ArgumentError SessionPruner(store; interval=Second(-1))
+
+        # Calendar periods are the dangerous case, and `Dates.value(p) > 0` does NOT catch
+        # them: `Dates.value(Month(1))` is 1, so it passes — and then `sleep(Month(1))` throws
+        # a MethodError inside the spawned task, where nothing is waiting on it. The janitor
+        # would be dead for the life of the process while `serve()` reported success, i.e.
+        # exactly the unbounded growth #36 exists to remove, silent instead of slow.
+        for bad in (Month(1), Year(1), Quarter(1))
+            @test_throws ArgumentError SessionMiddleware(store=store, prune_interval=bad)
+            @test_throws ArgumentError SessionPruner(store; interval=bad)
+        end
+        # Sub-millisecond rounds to a zero-length sleep and spins.
+        @test_throws ArgumentError SessionMiddleware(store=store, prune_interval=Nanosecond(500))
+
+        # Fixed periods, including sub-second ones the tests above rely on, still build.
+        @test SessionMiddleware(store=store, prune_interval=Millisecond(50)) isa Nitro.LifecycleMiddleware
+        @test SessionMiddleware(store=store, prune_interval=Minute(10)) isa Nitro.LifecycleMiddleware
+        @test SessionPruner(store; interval=Second(1)) isa Nitro.LifecycleMiddleware
+    end
+
+    @testset "A throwing store does not kill the janitor" begin
+        # The `try` sits INSIDE the janitor's loop so a transient store failure costs one tick,
+        # not the process's remaining pruning. Hoisting it outside the loop would turn a single
+        # DB blip into a permanently dead janitor with a still-green suite — this is the test
+        # that would catch that refactor.
+        mutable struct FlakyStore <: Nitro.Types.AbstractSessionStore{String, Dict{String,Any}}
+            inner::MemoryStore{String, Dict{String,Any}}
+            failures_left::Int
+            calls::Int
+        end
+        Nitro.Types.cleanup_expired_sessions!(s::FlakyStore) = begin
+            s.calls += 1
+            if s.failures_left > 0
+                s.failures_left -= 1
+                error("simulated store failure")
+            end
+            Nitro.Types.cleanup_expired_sessions!(s.inner)
+        end
+
+        inner = MemoryStore{String, Dict{String,Any}}()
+        Nitro.Cookies.storesession!(inner, "dead", Dict{String,Any}("i" => 1), ttl=1)
+        Nitro.Cookies.storesession!(inner, "live", Dict{String,Any}("i" => 2), ttl=3600)
+        sleep(1.1)
+
+        flaky = FlakyStore(inner, 3, 0)
+        pruner = SessionPruner(flaky; interval=Millisecond(50))
+        task = pruner.on_startup()
+        try
+            # It must survive the first three throwing ticks and still prune afterwards.
+            @test timedwait(() -> length(inner.data) == 1, 10.0) === :ok
+            @test haskey(inner.data, "live")
+            @test flaky.calls > 3          # it really did keep ticking past the failures
+            @test !istaskdone(task)        # and the janitor is still alive
+        finally
+            pruner.on_shutdown()
+        end
     end
 
     @testset "cleanup_expired_sessions! removes every expired entry" begin
-        # The scan used to `delete!` while iterating the Dict, which Julia does not define
-        # as safe: the rehash a delete can trigger invalidates the iteration state, so
-        # entries could be skipped. Needs MANY expired entries to be reachable at all.
+        # NOTE: this does NOT discriminate the one-pass/two-pass rewrite in
+        # `cleanup_expired_sessions!` — measured, Julia's `delete!` only tombstones a slot and
+        # never rehashes, so the old one-pass form skipped nothing. It is kept as a plain
+        # behavioural assertion on the prune (every expired row goes, every live row stays) at
+        # a store size the other tests do not cover.
         store = MemoryStore{String, Dict{String,Any}}()
         for i in 1:200
             Nitro.Cookies.storesession!(store, "dead-$i", Dict{String,Any}("i" => i), ttl=1)

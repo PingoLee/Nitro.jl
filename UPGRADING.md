@@ -90,7 +90,8 @@ pruned at all.
 grep -rn "prune_probability" --include=*.jl .
 
 # 2. Calling the middleware directly. Composing it by hand is what breaks; passing it to
-#    serve()/urlpatterns() is fine. This finds the call form:
+#    serve()/urlpatterns() is fine. This finds the single-line call form ONLY -- multi-line
+#    calls are caught by (3), which is how most call sites are actually written:
 grep -rnE "SessionMiddleware\([^)]*\)\s*\(" --include=*.jl .
 
 # 3. And the two-step form, where the result is bound and then applied.

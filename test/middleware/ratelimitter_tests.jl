@@ -551,4 +551,34 @@ end
     end
 end
 
+
+@testset "Rate limiter: Period keywords reject calendar durations" begin
+    # `Dates.value(p) > 0` was the old check and it does NOT catch these: `Dates.value(Month(1))`
+    # is 1, so a calendar period passed validation. What it broke depends on the keyword:
+    #   cleanup_period    -> `sleep(Month(1))` throws in the un-monitored `@async` sweep, so
+    #                        the background cleanup dies on tick 1, silently, for the life of
+    #                        the process — in the component whose whole job is bounding memory.
+    #   cleanup_threshold -> the `current_time - last_reset > threshold` comparison throws
+    #                        (Millisecond vs Month), same silent dead sweep.
+    #   window            -> the same comparison, but ON THE REQUEST PATH. The limiter's own
+    #                        catch turns it into 503 for EVERY request (or fail-open, letting
+    #                        everything through). This is the most severe of the three.
+    # Same defect class as the session janitor (#36); fixed in both.
+    for bad in (Month(1), Year(1), Quarter(1))
+        @test_throws ArgumentError RateLimiter(cleanup_period=bad)
+        @test_throws ArgumentError RateLimiter(cleanup_threshold=bad)
+        @test_throws ArgumentError RateLimiter(window=bad)
+        @test_throws ArgumentError RateLimiter(strategy=:sliding_window, window=bad)
+    end
+    # Sub-millisecond rounds to a zero-length sleep and spins.
+    @test_throws ArgumentError RateLimiter(cleanup_period=Nanosecond(500))
+    # Fixed periods, including the sub-second ones other tests rely on, still build.
+    @test RateLimiter(window=Second(3)) isa Nitro.LifecycleMiddleware
+    @test RateLimiter(cleanup_period=Millisecond(50),
+                      cleanup_threshold=Millisecond(50)) isa Nitro.LifecycleMiddleware
+    # SlidingRateLimiter returns a bare Function, not a LifecycleMiddleware.
+    @test RateLimiter(strategy=:sliding_window, window=Minute(1)) isa Function
 end
+
+end
+
