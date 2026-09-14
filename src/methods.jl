@@ -9,7 +9,7 @@ function resetstate()
     # prevent context reset when created at compile-time
     if (@__MODULE__) == Nitro
         CONTEXT[] = Nitro.Core.App()
-        Nitro.Workers.reset_store!()
+        Nitro.Workers.reset_runtime!()
     end
 end
 

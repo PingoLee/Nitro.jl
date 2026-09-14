@@ -11,11 +11,27 @@ This rule applies when changing the Workers queue, `NitroPormGExt` worker storag
 
 The worker system supports both volatile in-memory queues and persistent database stores with access control.
 
-### Storage backends
-- **`AbstractWorkerStore`**: Interface for storage backends.
-- **`InMemoryWorkerStore`**: Volatile, thread-safe store in `src/Workers/`.
+### Two objects: the store and the runtime
+
+Split in [#167](https://github.com/PingoLee/Nitro.jl/issues/167). One question decides which one a
+change belongs to: **the store answers *"what does the record say?"*; the runtime answers *"what is
+this process doing right now?"***.
+
+- **`AbstractWorkerStore`** (`src/Workers/registry.jl`): data access plus policy hooks, 15 required
+  methods. It owns **nothing that runs** — no queue, no scheduler, no `Task` handle — which is what
+  makes the #29 leak unrepresentable rather than merely fixed.
+- **`WorkerRuntime`** (`src/Workers/runtime.jl`): the sequential queues and their processor tasks,
+  the cleanup scheduler, and `active_tasks` / `active_task_infos`. `shutdown!` takes one. It is
+  parametric on the store type so `rt.store` stays concrete.
+- **One store may back several runtimes.** Two `App`s over one `PormGWorkerStore` get their own
+  queues and scheduler, and `uninstall!` on one cannot stop the other's processors. Policy stays on
+  the store, so they correctly share one security posture.
+- **`InMemoryWorkerStore`**: Volatile, thread-safe store in `src/Workers/registry.jl`. Its records
+  *are* the objects callbacks hold, so it is the one backend that implements `clear_records!`.
 - **`PormGWorkerStore`**: Persistent store in `ext/NitroPormGExt.jl`.
-- **Volatile execution handles**: Running `Task` objects stay in `active_tasks::Dict{UUID, Task}`; metadata lives in the store. Entries are keyed by task id but describe one **run** — only the run that registered one may tear it down (see §6).
+- **Volatile execution handles**: running `Task` objects and the live `TaskInfo` cache live on the
+  **runtime**, in `active_tasks` / `active_task_infos`. Entries are keyed by task id but describe one
+  **run** — only the run that registered one may tear it down (see §6).
 - **Queue authorization hooks**: Optional `queue_authorizer(queue_name, user_id)::Bool`, consulted on
   **both** submit paths — `submit_task` has no sequential queue, so it passes `DEFAULT_QUEUE_NAME`.
 - **Watch authorization hooks**: Optional `watch_authorizer(task_key, watchers, user_id)::Bool`,
@@ -106,13 +122,28 @@ you add anything:
 | `get_queue_status` | Queue-wide introspection — **admin only**, takes `System()`; an `Owner` is a `MethodError` |
 | `update_progress!` | The only safe write to `TaskInfo.progress` |
 | `cleanup_old_tasks`, `start_cleanup_scheduler`, `stop_cleanup_scheduler!` | Retention |
-| `shutdown!` | Graceful teardown — stop the cleanup scheduler and queue processors |
-| `reset_store!`, `install!`, `uninstall!`, `worker_store`, `default_store` | Store lifecycle |
+| `shutdown!`, `reset_runtime!` | Teardown — takes a `WorkerRuntime`, never a store |
+| `WorkerRuntime`, `default_runtime`, `worker_runtime`, `install!`, `uninstall!`, `worker_store`, `default_store` | Lifecycle and resolution |
 
-**`shutdown!` is part of the store contract, not an optional extra.** A store that does not
-implement it leaks its cleanup scheduler and queue processors on shutdown — which is exactly what
-`PormGWorkerStore` does today ([#29](https://github.com/PingoLee/Nitro.jl/issues/29)). Any new
-backend must implement it.
+**`runtime=` is the public keyword; `store=` only selects a backend.** Every read and submit call
+takes `runtime::WorkerRuntime=default_runtime()`, or resolves one from an `App` first argument.
+`store=` survives on exactly four entry points — `install!`, `start!`, `startup`, `worker_startup`
+— because that is where a backend is *chosen*. A `store=` on a submission call would be a lie: a
+store cannot run anything.
+
+**A new backend implements no teardown method at all.** `shutdown!` is a concrete method on
+`WorkerRuntime`, so there is no fallback to forget — which is what closes
+[#29](https://github.com/PingoLee/Nitro.jl/issues/29) as a *class* rather than an instance. Two
+optional store methods exist, both no-op by default: `clear_records!` (volatile backends only;
+`reset_runtime!` calls it, and the default must stay a no-op so a reset can never delete durable
+rows) and nothing else.
+
+**`get_task_info(store, id)` is the DURABLE read.** A store must not cache live objects. Serving a
+running callback's own object to a reader is `get_task_info(runtime, id)`, and the split is
+load-bearing: run-start reads durably, because a live-preferring read there hands a re-run its
+predecessor's `TaskInfo` and the `run_id` fence then strands it at `PENDING` forever. That was a
+real `PormGWorkerStore` defect (#167). The rule: **a call about to *claim* a run reads the store; a
+call that is *reporting* reads the runtime.**
 
 ## 3. Database Persistence
 
@@ -182,13 +213,22 @@ On startup, `RUNNING` tasks without a live in-memory `Task` are marked `FAILED` 
   flight, and a status-only precondition cannot tell the two apart
   ([#108](https://github.com/PingoLee/Nitro.jl/issues/108)). `try_transition!` therefore takes a
   **required** `run_id` — `nothing` is the named opt-out, never a default — and so does the runtime
-  handle teardown: only the run that owns `active_tasks[id]` may deregister it, because
-  `recover_zombie_tasks!` reads liveness from exactly that entry. One `TaskInfo` object is one run;
-  a re-run is a new object, never a mutated one.
-- Add abstract stubs in `src/Workers/registry.jl`.
+  handle teardown: only the run that owns the runtime's `active_tasks[id]` may deregister it,
+  because `recover_zombie_tasks!` reads liveness from exactly that entry. One `TaskInfo` object is
+  one run; a re-run is a new object, never a mutated one.
+- **`shutdown!` releases; it does not drain.** It drops the run handles without waiting, so a run
+  still executing across a teardown/restart in one process looks dead to `recover_zombie_tasks!`.
+  `active_task_infos` is deliberately left populated, or such a run would also be uncancellable.
+  A graceful drain is now *buildable* — the object that owns the tasks is the object being shut
+  down — but it is a separate lifecycle decision, not a teardown patch.
+- Add abstract stubs in `src/Workers/registry.jl` — **for data and policy only.** Anything that
+  runs, schedules, or holds a `Task` belongs on `WorkerRuntime`, where there is one implementation
+  and no way for a backend to get it wrong.
 - Implement in `InMemoryWorkerStore` **and** `PormGWorkerStore` — a hook implemented in only one of
   them is a store that silently behaves differently, which for the authorizer pair means a silently
-  different security posture.
+  different security posture. Assert cross-backend parity in a shared test body rather than by
+  inspection: #166's cancellation regression came from two backends whose live-object handling
+  looked equivalent and was not.
 - **Nothing may inject an exception into a worker task.** `schedule(t, exc; error=true)` does
   not check whether `t` is running, and injecting into a task executing on another thread aborts
   the process in `jl_finish_task` — which is what blocked worker bodies from moving to
