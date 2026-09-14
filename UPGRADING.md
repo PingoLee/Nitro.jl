@@ -253,6 +253,21 @@ Two behaviour changes ride along, both to `InMemoryWorkerStore` as well:
   store those are durable rows, and deleting them on a reset would be destructive rather than a
   teardown. Persistent backends prune through `cleanup_tasks!`.
 
+**If you use `PormGWorkerStore`, this is the part that may force an edit.** `uninstall!` and
+`reset_store!` used to be no-ops on that store and now perform a real teardown, so restarting
+**in the same process** while tasks are still running is no longer harmless. A run whose handle is
+cleared looks dead to `recover_zombie_tasks!`, so the next `start!(recover_zombies=true)` marks it
+`FAILED` and the real result is discarded when it finishes. That has always been true of
+`InMemoryWorkerStore`; it is new for PormG only because PormG never tore down at all before.
+`shutdown!` releases, it does not drain — nothing stops a running Julia task. If your app relies on
+teardown/restart cycles in one process (a dev reload, several apps per process, a test suite that
+calls `reset_store!` between cases), let in-flight tasks finish first, or start with
+`recover_zombies=false`.
+
+Cancellation is deliberately *not* affected: `PormGWorkerStore.shutdown!` leaves
+`active_task_infos` populated, so `cancel_task` still reaches a run that survives a teardown, the
+same way it does in memory.
+
 ### How to find the calls to migrate
 
 ```bash

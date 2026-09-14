@@ -905,21 +905,29 @@ scheduler kept issuing `DELETE`s against `nitro_task` and the queue processors k
 ([#29](https://github.com/PingoLee/Nitro.jl/issues/29)).
 
 The scheduler and queue teardown is shared with every other backend through
-`_stop_scheduler_and_queues!`. What is specific here is `active_task_infos`, which has no
-`InMemoryWorkerStore` counterpart — that store's `deregister_active_task_info!` is a no-op
-because its registry *is* the live object. Leaving this dict populated would let `get_task_info`
-and `get_all_tasks` keep serving stale live `TaskInfo`s, overlaid on top of the durable rows,
-after shutdown.
+`_stop_scheduler_and_queues!`, and `active_tasks` is cleared exactly as `InMemoryWorkerStore`
+clears its own.
 
-The durable rows themselves are untouched: they outlive the process by design, which is the
-whole reason to use this store.
+**`active_task_infos` is deliberately NOT cleared**, even though it is a process-local cache and
+clearing it looks like the obvious completion of the teardown. It has no `InMemoryWorkerStore`
+field to mirror — but it does have an in-memory *counterpart*: that store's
+`get_active_task_info` is an alias for `get_task_info` and reads `task_registry`, which
+`shutdown!` does not empty either. So clearing this dict would not be parity with the in-memory
+store, it would be a PormG-only behaviour change, and a harmful one: `cancel_task` resolves the
+live `TaskInfo` through `get_active_task_info`, so a run still executing across a teardown would
+become uncancellable on this backend and on no other.
+
+Nothing leaks by leaving it: each run removes its own entry through
+`deregister_active_task_info!` when it finishes.
+
+The durable rows are untouched: they outlive the process by design, which is the whole reason to
+use this store.
 """
 function shutdown!(store::PormGWorkerStore)
     _stop_scheduler_and_queues!(store)
 
     lock(store.active_lock) do
         empty!(store.active_tasks)
-        empty!(store.active_task_infos)
     end
 
     return nothing

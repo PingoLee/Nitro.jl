@@ -194,6 +194,13 @@ either shape reports the other as missing.
 
 `store_index` is 1-based over the *arguments*, so it is 2 for a callback-first method such as
 `lock_tasks(callback, store)`.
+
+It errs toward **over**-reporting, never under-reporting, which is the safe direction for a
+conformance check: a method typed on a union that reaches outside the contract's hierarchy —
+`f(::Union{MyStore, Nothing}, …)` — satisfies dispatch but is not counted here, so such a backend
+sees a spurious name in `missing_store_methods`. Narrowing the search to the contract's own
+hierarchy is what makes the opposite mistake impossible, and a false "you are conforming" is the
+one that turns the check into theater.
 """
 function implements_contract_method(f::Function, S::Type, abstract_store_type::Type, store_index::Int)
     for m in methods(f)

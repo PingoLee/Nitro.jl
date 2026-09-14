@@ -193,9 +193,12 @@ instead. `store_contract_error` recognizes that the store did implement the meth
 `MethodError` carrying the positional arguments rather than mislabelling the backend as
 unimplemented. Both routes throw; neither silently accepts a call that would reintroduce #108.
 
-What the second route does *not* do is name `run_id` in its message, because a `MethodError` built
-from positional arguments cannot. If you are diagnosing one, the missing keyword is the thing to
-check first.
+The second route's message is the one to be careful with. It cannot name `run_id`, because a
+`MethodError` built from positional arguments has no keywords to report — and Julia appends *"This
+error has been manually thrown, explicitly, so the method may exist but be intentionally marked as
+unimplemented"* to any hand-built `MethodError`, which reads as a flat contradiction of the
+situation: the method does exist, and the problem is a keyword it cannot accept. If you are
+diagnosing one of these, check for a missing `run_id` parameter before believing that sentence.
 """
 function try_transition! end
 
@@ -349,16 +352,24 @@ cannot be killed, which is why cancellation here is a token a callback polls. Wh
 clear the process-local handle caches, and that has a consequence worth knowing before relying on
 teardown-then-restart *within one process* (a dev reload, or several apps sharing a process):
 
-`recover_zombie_tasks!` decides liveness purely from `get_active_task(store, id)`. A run whose
-handle was just cleared therefore looks dead, so the next `start!(recover_zombies=true)` marks it
-`FAILED`; when the real callback finishes, its run-fenced terminal write loses against that record
-and the result is discarded. `cancel_task` likewise can no longer reach the live `TaskInfo`.
+`recover_zombie_tasks!` decides liveness purely from `get_active_task(store, id)`. Clearing the
+handle cache therefore makes a run that is still executing look dead, so the next
+`start!(recover_zombies=true)` marks it `FAILED`; when the real callback finishes, its run-fenced
+terminal write loses against that record and the result is discarded.
 
-`InMemoryWorkerStore` has always behaved this way and
-[#29](https://github.com/PingoLee/Nitro.jl/issues/29) asked for parity with it, so this is a known
-limitation rather than a regression. Closing it means a graceful drain — waiting for, or
-re-registering, in-flight runs — which is a design change, not a teardown fix. Until then, treat a
-restart in the same process as unsafe for tasks that are still running.
+That consequence is **parity, not a regression**: `InMemoryWorkerStore` has always emptied
+`active_tasks` in `shutdown!`, and
+[#29](https://github.com/PingoLee/Nitro.jl/issues/29) asked for a backend that behaves like it.
+Closing it means a graceful drain — waiting for, or re-registering, in-flight runs — which is a
+design change rather than a teardown fix. Until then, treat a restart in the same process as
+unsafe for tasks that are still running.
+
+Cancellation is a **separate** question, and the answer there is the opposite, which is why the
+two must not be stated together. `cancel_task` resolves the live `TaskInfo` through
+`get_active_task_info`, and the in-memory store answers that from `task_registry`, which
+`shutdown!` does *not* empty — so cancellation survives an in-memory teardown. Any backend keeping
+a distinct live-object cache must therefore leave it alone in `shutdown!`, or it becomes the only
+store on which a surviving run cannot be cancelled. `PormGWorkerStore` does exactly that.
 """
 function shutdown! end
 

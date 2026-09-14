@@ -97,7 +97,10 @@ end
         e
     end
     @test stale_nokw isa MethodError
-    @test !(stale_nokw isa StoreInterfaceError)
+    # Assert the SEPARATION, not just one side of it. The discrimination above lives in an upstream
+    # message string, so a reworded Julia release could make both routes match and the route-1
+    # assertion would silently stop discriminating instead of failing.
+    @test !occursin("keyword argument", sprint(showerror, stale_nokw))
 
     # Both stores implement the method, so neither is reported missing.
     @test !(:try_transition! in missing_store_methods(StaleKwStore))

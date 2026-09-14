@@ -1006,10 +1006,7 @@ else
 
                 # Stand in for a run still in flight. A FINISHED run deregisters itself, so the
                 # caches are empty by then -- registering directly is both deterministic and the
-                # exact state a mid-flight shutdown finds. `active_task_infos` is the one with no
-                # InMemoryWorkerStore counterpart at all, which is why copying that store's
-                # teardown verbatim would have left it behind: `get_task_info` and `get_all_tasks`
-                # overlay this dict on the durable rows, so a stale entry keeps being served.
+                # exact state a mid-flight shutdown finds.
                 register_active_task!(store_td, "in-flight", current_task())
                 register_active_task_info!(store_td, "in-flight", TaskInfo("in-flight"))
                 @test !isempty(store_td.active_tasks)
@@ -1022,7 +1019,15 @@ else
                 @test !isopen(channel)
                 @test isempty(get_sequential_queues(store_td))
                 @test isempty(store_td.active_tasks)
-                @test isempty(store_td.active_task_infos)
+
+                # `active_task_infos` must SURVIVE, which is the opposite of what "finish the
+                # teardown" suggests. `cancel_task` resolves the live TaskInfo through
+                # `get_active_task_info`, and the in-memory store answers that from its
+                # `task_registry` -- which `shutdown!` does not empty. So clearing this dict would
+                # not be parity with InMemoryWorkerStore; it would make PormG the only backend on
+                # which a run surviving a teardown cannot be cancelled.
+                @test haskey(store_td.active_task_infos, "in-flight")
+                @test get_active_task_info(store_td, "in-flight") isa TaskInfo
 
                 # The durable rows survive: they outlive the process by design, and that is the
                 # whole reason to use this store rather than the in-memory one.
@@ -1035,7 +1040,7 @@ else
                 @test timedwait(() -> get_task_status(second, owner; store=store_td)[:status] == "COMPLETED", 5.0) == :ok
                 reset_store!(store_td)
                 @test isempty(get_sequential_queues(store_td))
-                @test isempty(store_td.active_task_infos)
+                @test isempty(store_td.active_tasks)
                 @test haskey(store_td.model._table, second)
             finally
                 reset_store!(store_td)
