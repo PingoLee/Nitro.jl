@@ -47,7 +47,15 @@ const MAX_STORED_ERROR_CHARS = 2048
 function _truncate_error(text::AbstractString)
     total = length(text)
     total <= MAX_STORED_ERROR_CHARS && return String(text)
-    return string(first(text, MAX_STORED_ERROR_CHARS), " …[truncated, ", total, " chars total]")
+
+    # The marker counts against the cap rather than being appended past it. Appending after
+    # truncating makes `MAX_STORED_ERROR_CHARS` not actually the cap -- the stored string comes out
+    # at `MAX + length(marker)` -- which makes the constant's own docstring untrue and forces every
+    # test to assert a slack bound instead of the exact, knowable one.
+    marker = string(" …[truncated, ", total, " chars total]")
+    keep = MAX_STORED_ERROR_CHARS - length(marker)
+    keep <= 0 && return String(first(text, MAX_STORED_ERROR_CHARS))
+    return string(first(text, keep), marker)
 end
 
 """
@@ -59,11 +67,16 @@ redaction hook, then the length cap.
 The order is load-bearing. The hook is handed the **full** rendering so it can decide about the
 whole message rather than a prefix, and the cap runs afterwards so a redactor cannot exceed it.
 
-A task reaching here has already failed; a throwing redactor must not lose the failure on top of
-that. It is caught, and the log line deliberately carries neither the text nor the exception — the
-whole reason a redactor exists is that the app considers that content unsafe to emit, so the
-failure path must not emit it as a consolation prize. The stored value degrades to the exception
-type, which is the most that is knowably safe.
+A task reaching here has already failed; a redactor that throws, or that returns something other
+than a string, must not lose the failure on top of that. Both are caught and the stored value
+degrades to the exception type, which is the most that is knowably safe.
+
+**The log line carries only the redactor failure's TYPE, never the failure itself.** That is not
+over-caution: a redactor that inspects the text it was handed — `parse`, `JSON.parse`, an
+`@assert` with an interpolated message — raises an exception whose own message quotes `rendered`,
+so logging `exception=` would republish, on the error channel, exactly the content the redactor
+exists to suppress. It is the same "exceptions quote their input" mechanism this whole function is
+here to contain, arriving one level up.
 """
 function _store_error_text(store::AbstractWorkerStore, error)
     unwrapped = _unwrap_exception(error)
@@ -72,14 +85,26 @@ function _store_error_text(store::AbstractWorkerStore, error)
     redactor = get_error_redactor(store)
     isnothing(redactor) && return _truncate_error(rendered)
 
+    fallback = string(nameof(typeof(unwrapped)))
+
     redacted = try
         Base.invokelatest(redactor, unwrapped, rendered)
     catch redactor_error
-        @error "Worker error redactor threw; storing the exception type only." exception=redactor_error store_type=typeof(store)
-        return string(nameof(typeof(unwrapped)))
+        # Deliberately NOT `exception=redactor_error`: its message may quote the text it was
+        # handed, which is the content the redactor was installed to keep out of everything.
+        @error "Worker error redactor threw; storing the exception type only. The redactor failure is not logged, because its message may quote the text it was given." redactor_error_type=typeof(redactor_error) store_type=typeof(store)
+        return fallback
     end
 
-    return _truncate_error(string(redacted))
+    if !(redacted isa AbstractString)
+        # A Julia function falls off its end into whatever the last expression returned, so a
+        # redactor can silently hand back `nothing` or a number. Stringifying that would store
+        # `"nothing"` -- a poisoned field rather than an honest degradation.
+        @error "Worker error redactor returned a non-string; storing the exception type only." returned_type=typeof(redacted) store_type=typeof(store)
+        return fallback
+    end
+
+    return _truncate_error(redacted)
 end
 
 function _invoke_task_callback(callback::Function, task_info::TaskInfo)

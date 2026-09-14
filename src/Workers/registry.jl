@@ -11,6 +11,7 @@ saying what to implement rather than a bare `MethodError` from deep inside task 
 for a backend's own test suite:
 
 ```julia
+using Nitro.Workers    # the contract names are not re-exported from `Nitro`
 @test isempty(missing_store_methods(MyWorkerStore))
 ```
 
@@ -181,10 +182,20 @@ be indistinguishable in review from one that meant to skip the fence.
 
 A store that accepts `run_id` and ignores it is **not a conforming store** — it reintroduces #108
 for its own backend, exactly as a store that reads the status and then saves reintroduces #88. An
-un-updated third-party store fails loudly instead. The contract fallbacks below are typed at the
-store's *abstract* type, so a stale concrete method still wins dispatch on its positional arguments
-and the unsupported `run_id` keyword still raises `MethodError` at the call site — the fallback
-never masks it.
+un-updated third-party store fails loudly instead — but by a different route than you might expect,
+so it is worth stating exactly.
+
+A stale store whose `try_transition!` still takes the *other* keywords wins dispatch normally and
+rejects `run_id` itself, with Julia's "does not support all of the given keyword arguments". A
+stale store whose method has **no keyword parameters at all** is invisible to keyword dispatch —
+Julia only considers methods that accept keywords — so the call reaches the contract fallback
+instead. `store_contract_error` recognizes that the store did implement the method and raises a
+`MethodError` carrying the positional arguments rather than mislabelling the backend as
+unimplemented. Both routes throw; neither silently accepts a call that would reintroduce #108.
+
+What the second route does *not* do is name `run_id` in its message, because a `MethodError` built
+from positional arguments cannot. If you are diagnosing one, the missing keyword is the thing to
+check first.
 """
 function try_transition! end
 
@@ -330,6 +341,24 @@ which reaches everything it needs through the contract accessors. An implementat
 usually that call plus clearing whatever active-task caches the store itself holds.
 
 Called by `uninstall!` and `reset_store!`.
+
+# This releases; it does not drain
+
+`shutdown!` does not wait for runs still executing, and nothing can stop them — a Julia task
+cannot be killed, which is why cancellation here is a token a callback polls. What it does do is
+clear the process-local handle caches, and that has a consequence worth knowing before relying on
+teardown-then-restart *within one process* (a dev reload, or several apps sharing a process):
+
+`recover_zombie_tasks!` decides liveness purely from `get_active_task(store, id)`. A run whose
+handle was just cleared therefore looks dead, so the next `start!(recover_zombies=true)` marks it
+`FAILED`; when the real callback finishes, its run-fenced terminal write loses against that record
+and the result is discarded. `cancel_task` likewise can no longer reach the live `TaskInfo`.
+
+`InMemoryWorkerStore` has always behaved this way and
+[#29](https://github.com/PingoLee/Nitro.jl/issues/29) asked for parity with it, so this is a known
+limitation rather than a regression. Closing it means a graceful drain — waiting for, or
+re-registering, in-flight runs — which is a design change, not a teardown fix. Until then, treat a
+restart in the same process as unsafe for tasks that are still running.
 """
 function shutdown! end
 

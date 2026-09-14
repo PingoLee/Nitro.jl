@@ -206,6 +206,13 @@ function implements_contract_method(f::Function, S::Type, abstract_store_type::T
         P = Base.rewrap_unionall(params[store_index + 1], m.sig)
         P isa Type || continue
         P === abstract_store_type && continue
+        # `P` must sit INSIDE the contract's own hierarchy. Without this, any method of `f` that
+        # happens to accept `S` counts -- which is harmless for the functions Nitro owns, but
+        # `Base.get` is part of the session contract and belongs to Base. One unrelated package
+        # defining a `Base.get` broad enough to accept a store would make every store report as
+        # conforming: a false NEGATIVE, which is the failure mode that turns a conformance check
+        # into theater.
+        P <: abstract_store_type || continue
         S <: P && return true
     end
     return false

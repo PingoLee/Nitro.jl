@@ -254,9 +254,8 @@ function storesession!(store::PormGSessionStore, key::String, value::Dict{String
     return set_session!(store, key, value; ttl=ttl)
 end
 
-function prunesessions!(store::PormGSessionStore)
-    return cleanup_expired_sessions!(store)
-end
+# No `prunesessions!` override: the generic `AbstractSessionStore` method in `src/cookies.jl` is
+# now exactly this body, so a copy here is duplication that can only drift.
 
 # ============================================================================
 # SECTION 4: Table Bootstrap & Convenience Constructor

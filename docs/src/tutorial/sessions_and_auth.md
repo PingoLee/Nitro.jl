@@ -147,10 +147,12 @@ needs no instance:
 
 ```julia
 using Test
+using Nitro.Types: missing_session_methods   # not exported from `Nitro` itself
+
 @test isempty(missing_session_methods(MySessionStore))
 ```
 
-`Nitro.missing_store_methods` is the equivalent for the worker-queue contract
+`Nitro.Workers.missing_store_methods` is the equivalent for the worker-queue contract
 ([`AbstractWorkerStore`](workers.md)).
 
 ## Using `getsession(req)` — Django-style

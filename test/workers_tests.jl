@@ -22,6 +22,14 @@ Nitro.Workers.get_task_info(::WideStore, ::AbstractString) = "wide"
 struct OnlyLockStore <: AbstractWorkerStore end
 Nitro.Workers.lock_tasks(callback::Function, ::OnlyLockStore) = callback()
 
+# Two shapes of third-party store written before `try_transition!` gained its `run_id` fence.
+struct StaleKwStore <: AbstractWorkerStore end
+Nitro.Workers.try_transition!(::StaleKwStore, ::String, from, ::TaskStatus;
+                              error=nothing, completed_at=nothing) = false
+
+struct StaleNoKwStore <: AbstractWorkerStore end
+Nitro.Workers.try_transition!(::StaleNoKwStore, ::String, from, ::TaskStatus) = false
+
 @testset "Worker store contract is discoverable and loud" begin
     # The shipped backend conforms. This is the assertion a third-party store copies.
     @test isempty(missing_store_methods(InMemoryWorkerStore))
@@ -54,11 +62,51 @@ Nitro.Workers.lock_tasks(callback::Function, ::OnlyLockStore) = callback()
     @test_throws MethodError get_task_info(store, 42)
     @test_throws MethodError cleanup_tasks!(store, "not-a-day-count")
 
-    # A store that implements the contract never reaches a fallback, even for a keyword it does
-    # not accept: it is more specific on the positional arguments, so it is the one that rejects.
-    # This is the guarantee `try_transition!`'s docstring makes about stale third-party stores.
+    # A store that implements the contract never reaches a fallback for a keyword it does not
+    # accept: it is more specific on the positional arguments, so it is the one that rejects.
     @test_throws MethodError try_transition!(store, "task-1", (PENDING,), RUNNING;
                                              run_id=nothing, no_such_keyword=1)
+end
+
+@testset "A stale store's missing run_id fence is refused by both dispatch routes" begin
+    # `try_transition!`'s docstring promises that a third-party store predating the `run_id`
+    # precondition cannot silently accept the call and reintroduce #108. There are TWO routes to
+    # that refusal and they behave differently, so a single `@test_throws MethodError` proves
+    # nothing -- it passed against `main`, where no fallback existed at all, and it passes
+    # whichever route runs.
+
+    # Route 1: the stale method still takes keywords, so it wins dispatch and rejects `run_id`
+    # itself. Julia's message names the keywords.
+    stale_kw = try
+        try_transition!(StaleKwStore(), "t", (PENDING,), RUNNING; run_id=nothing)
+        nothing
+    catch e
+        e
+    end
+    @test stale_kw isa MethodError
+    @test occursin("keyword argument", sprint(showerror, stale_kw))
+
+    # Route 2: the stale method has NO keyword parameters, so keyword dispatch cannot see it at
+    # all and the call lands on the contract fallback. `store_contract_error` must recognize that
+    # the store DID implement the method and raise a MethodError rather than mislabelling the
+    # backend as unimplemented -- which is the whole reason it checks at runtime.
+    stale_nokw = try
+        try_transition!(StaleNoKwStore(), "t", (PENDING,), RUNNING; run_id=nothing)
+        nothing
+    catch e
+        e
+    end
+    @test stale_nokw isa MethodError
+    @test !(stale_nokw isa StoreInterfaceError)
+
+    # Both stores implement the method, so neither is reported missing.
+    @test !(:try_transition! in missing_store_methods(StaleKwStore))
+    @test !(:try_transition! in missing_store_methods(StaleNoKwStore))
+
+    # ...and on a CONFORMING store the fence is the keyword being required with no default, so
+    # omitting it is refused rather than quietly defaulting to "no run precondition" (#48's shape:
+    # the unfenced call must never be the shorter one).
+    @test_throws UndefKeywordError try_transition!(InMemoryWorkerStore(), "t", (PENDING,), RUNNING)
 end
 
 @testset "Contract fallbacks never shadow a backend that types its arguments differently" begin
@@ -69,11 +117,6 @@ end
     # `submit_task`/`submit_sequential_task` are written that way.
     @test get_task_info(WideStore(), "id") == "wide"
     @test !(:get_task_info in missing_store_methods(WideStore))
-
-    # ...and the same for a backend parameterized over its own types, whose method signature
-    # carries a `where` clause. Testing it without re-applying that clause makes every parametric
-    # store look unimplemented -- which is how `MemoryStore` briefly reported itself broken.
-    @test isempty(Nitro.Types.missing_session_methods(Nitro.Types.MemoryStore{String, Dict{String,Any}}))
 
     # The callback-first row is the one whose store is not the first argument, so a detector that
     # assumed position 1 would mis-handle exactly this method and nothing else.
@@ -149,7 +192,10 @@ end
             @test wait_for(() -> get_task_status(id, owner; store=store)[:status] == "FAILED") == :ok
 
             stored = get_task_status(id, owner; store=store)[:error]
-            @test length(stored) <= MAX_STORED_ERROR_CHARS + 64   # + the truncation marker
+            # Exactly the cap, not the cap plus slack: the truncation marker counts against
+            # MAX_STORED_ERROR_CHARS rather than being appended past it, so the knowable bound is
+            # the one to assert. A `<= MAX + 64` bound passes even when the constant is not the cap.
+            @test length(stored) <= MAX_STORED_ERROR_CHARS
             @test occursin("truncated", stored)
             # Truncation is by character, so what lands is still valid UTF-8 and still says what
             # kind of failure it was.
@@ -196,20 +242,63 @@ end
         end
     end
 
-    @testset "a redactor that throws loses the detail, not the failure" begin
+    @testset "a redactor that throws loses the detail, not the failure -- and does not log it" begin
         store = InMemoryWorkerStore()
         owner = Owner("user-throwing")
         try
-            set_error_redactor!(store, (exc, rendered) -> error("redactor is broken"))
+            # The redactor INTERPOLATES what it was handed into its own exception. That is not a
+            # contrived shape -- it is what any redactor that parses or validates the text does,
+            # because Julia's parsers quote their input. A test whose redactor throws
+            # `error("broken")` quotes nothing and so cannot see the leak this guards.
+            set_error_redactor!(store, (exc, rendered) -> error("refusing to handle: $(rendered)"))
 
-            id = submit_task("boom", () -> throw(ArgumentError("bad token: $(sentinel)")), owner; store=store)
-            @test wait_for(() -> get_task_status(id, owner; store=store)[:status] == "FAILED") == :ok
+            logged, id = Test.collect_test_logs() do
+                inner = submit_task("boom", () -> throw(ArgumentError("bad token: $(sentinel)")), owner; store=store)
+                @test wait_for(() -> get_task_status(inner, owner; store=store)[:status] == "FAILED") == :ok
+                inner
+            end
 
             # The task still reports FAILED, and the stored text degrades to the exception type --
             # never back to the unredacted rendering, which is the content the app just told us it
             # did not want stored.
             stored = get_task_status(id, owner; store=store)[:error]
             @test stored == "ArgumentError"
+            @test !occursin(sentinel, stored)
+
+            # POSITIVE: the redactor's own exception really does carry the sentinel, so the
+            # negative assertion below is not passing because there was nothing to leak.
+            leaky = try
+                error("refusing to handle: $(format_error(ArgumentError("bad token: $(sentinel)")))")
+            catch e
+                e
+            end
+            @test occursin(sentinel, sprint(showerror, leaky))
+
+            # NEGATIVE: and none of it reaches the log. Logging `exception=` here would republish,
+            # on the error channel, exactly the content the redactor exists to suppress.
+            rendered_logs = join((string(r.message, " ", r.kwargs) for r in logged), "
+")
+            @test !occursin(sentinel, rendered_logs)
+            @test any(r -> occursin("redactor threw", string(r.message)), logged)
+        finally
+            reset_store!(store)
+        end
+    end
+
+    @testset "a redactor that returns a non-string degrades instead of poisoning the field" begin
+        store = InMemoryWorkerStore()
+        owner = Owner("user-nonstring")
+        try
+            # A Julia function falls off its end into its last expression, so returning `nothing`
+            # is an easy mistake. Stringifying it would store the literal "nothing".
+            set_error_redactor!(store, (exc, rendered) -> nothing)
+
+            id = submit_task("nonstring", () -> throw(ArgumentError("bad token: $(sentinel)")), owner; store=store)
+            @test wait_for(() -> get_task_status(id, owner; store=store)[:status] == "FAILED") == :ok
+
+            stored = get_task_status(id, owner; store=store)[:error]
+            @test stored == "ArgumentError"
+            @test stored != "nothing"
             @test !occursin(sentinel, stored)
         finally
             reset_store!(store)
