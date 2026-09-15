@@ -8,6 +8,10 @@ This is the right pattern for a BI-style app that uses Nitro for HTTP, `Nitro.Au
 authentication helpers, `Nitro.Workers` for in-process jobs, and `PormG` as an external
 package dependency.
 
+Every secret on this page is a [`SecretString`](secrets.md#Keeping-Secrets-Out-of-Logs-and-REPL-Output)
+and is required from the environment rather than defaulted. [Managing Secrets](secrets.md) is the
+canonical page for *why*; this one shows the shape a full `AppConfig` takes.
+
 ## Recommended Shape
 
 Split the config by responsibility instead of using one large untyped dictionary.
@@ -15,7 +19,15 @@ Split the config by responsibility instead of using one large untyped dictionary
 ```julia
 module BIAppConfig
 
-export AppConfig, DatabaseConfig, AuthConfig, WorkerConfig, load_config
+using Nitro: SecretString
+
+export AppConfig, DatabaseConfig, AuthConfig, WorkerConfig, load_config, required_env
+
+# Secrets are REQUIRED, never defaulted. A `get(ENV, "API_SECRET_KEY", "dev-secret")` ships a
+# known key to production the first time the variable is missing there, and nothing reports it.
+# This fails at boot instead. See `secrets.md`.
+required_env(name::String) =
+    get(ENV, name, nothing) === nothing ? error("$name must be set") : ENV[name]
 
 struct DatabaseConfig
     adapter::String
@@ -23,12 +35,12 @@ struct DatabaseConfig
     port::Int
     database::String
     username::String
-    password::String
+    password::SecretString
 end
 
 struct AuthConfig
-    secret_key::String
-    api_keys::Dict{String, String}
+    secret_key::SecretString
+    api_keys::Dict{String, SecretString}
     allowed_kids::Vector{String}
     session_secure::Bool
     session_timeout::Int
@@ -57,14 +69,17 @@ function load_config(env::String="dev")
         parse(Int, get(ENV, "DB_PORT", "5432")),
         get(ENV, "DB_NAME", "bi_db"),
         get(ENV, "DB_USER", "postgres"),
-        get(ENV, "DB_PASS", "")
+        SecretString(required_env("DB_PASS"))
     )
 
-    api_secret = get(ENV, "API_SECRET_KEY", nothing)
-    isnothing(api_secret) && error("API_SECRET_KEY must be set")
+    api_secret = SecretString(required_env("API_SECRET_KEY"))
 
     auth = AuthConfig(
         api_secret,
+        # The keyset holds the WRAPPER, not a revealed copy. Copying `reveal(...)` into a plain
+        # `Dict` puts the raw secret straight back onto the display and JSON paths that
+        # `SecretString` exists to close -- the field would be masked and the Dict entry would
+        # not. Add one entry per key id as you rotate.
         Dict("default" => api_secret),
         ["default"],
         # NOT `env == "prod"`. A security flag must fail CLOSED: an environment variable
@@ -99,7 +114,19 @@ end
 end
 ```
 
-> **Tip on Dummy Fallback Values**: Notice that all secrets and configs use `get(ENV, "KEY", "fallback")`. This pattern is highly recommended. It ensures that your application won't crash when Documenter.jl (`docs/make.jl`) evaluates these blocks or when your CI suite runs basic tests without a `.env` file present.
+Note which values are defaulted and which are not. `DB_HOST`, `DB_PORT`, `HOST`, `PORT` and
+`WORKER_CONCURRENCY` are ordinary configuration and carry sensible defaults. `API_SECRET_KEY` and
+`DB_PASS` are secrets and go through `required_env`, so a missing one is a boot failure rather than
+a silent fallback.
+
+!!! danger "Never commit a fallback for a secret"
+    `get(ENV, "API_SECRET_KEY", "dev-secret")` looks convenient and is the single most common way
+    a known key reaches production: the variable is simply absent on one box and nothing reports
+    it. [Managing Secrets](secrets.md) states the rule — for local development put a
+    non-checked-in value in `.env`, never a literal in the source.
+
+    This applies to CI too. A suite that needs the app to boot sets the variables in its own
+    environment; it does not get them from a default baked into the config module.
 
 !!! warning "Do not gate security on the environment name"
     `current_env()` selects *which config to load*. It must not decide whether a security
@@ -151,6 +178,30 @@ urlpatterns("",
 config = load_config(current_env())
 serve(host=config.server_host, port=config.server_port, context=config)
 ```
+
+### Reading A Secret Back Out
+
+`SecretString` is deliberately **not** an `AbstractString`, so it cannot flow into a string
+operation or a log line unnoticed. Framework components that need the raw key — `CSRFMiddleware`,
+`encode_jwt`, `jwt_validator`, `set_cookie!(..., encrypted=true)` — take a plain `String`, so
+unwrap with `reveal` at the call itself rather than storing a revealed copy in the config:
+
+```julia
+serve(
+    host=config.server_host,
+    port=config.server_port,
+    context=config,
+    middleware=[
+        SessionMiddleware(store=MemoryStore()),
+        CSRFMiddleware(reveal(config.auth.secret_key)),
+    ],
+)
+```
+
+Because `reveal` is the only unwrap point, `grep -rn "reveal("` over the app audits every place the
+raw secret is touched — which is why the revealed value should never be assigned to a config field
+or copied into a `Dict`. The masking rules, and what they do and do not cover, are in
+[Managing Secrets](secrets.md#Keeping-Secrets-Out-of-Logs-and-REPL-Output).
 
 ### Reaching The Config From `req` Alone
 

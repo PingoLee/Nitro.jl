@@ -127,12 +127,19 @@ request time.
 ### Key rotation and the `kid` trust model
 
 ```julia
+required_env(name::String) = get(ENV, name, nothing) === nothing ? error("$name must be set") : ENV[name]
+
 keyset = Dict(
-    "primary" => get(ENV, "JWT_SECRET_PRIMARY", ""),
-    "rotated" => get(ENV, "JWT_SECRET_ROTATED", ""),
+    "primary" => required_env("JWT_SECRET_PRIMARY"),
+    "rotated" => required_env("JWT_SECRET_ROTATED"),
 )
 validator = jwt_validator(keyset)
 ```
+
+`required_env`, not `get(ENV, "JWT_SECRET_PRIMARY", "")`. An empty-string fallback does not
+disable the key — it installs `""` as a live HMAC signing key under a trusted `kid`, so a token
+signed with the empty secret verifies. Every key in a keyset must be required from the
+environment; see [Managing Secrets](secrets.md).
 
 `decode_jwt` selects the key by the token's `kid` header, and the *verified* key id is
 exposed as `getuser(req).kid`. The trust boundary matters: **a `kid` is only trusted when it

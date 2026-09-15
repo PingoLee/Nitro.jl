@@ -119,6 +119,14 @@ function safe_extract(f::Function, param::Param{U}) :: T where {T, U <: Extracto
     try 
         return f()
     catch e
+        # An interrupt is not client input and must not become a 400. This is the fourth of the
+        # four sites that wrap an exception into a `ValidationError`, and the last to get the
+        # guard -- `parseparam_checked` (src/utilities/misc.jl) and both `Types.*` decode
+        # accessors (src/types.jl) have carried it all along. Without it a Ctrl-C landing inside
+        # a body deserialization is reported as a rejected request, and neither `handlerequest`
+        # nor `serve` -- both of which special-case `InterruptException` -- ever sees it. A fifth
+        # wrap site must copy this line too.
+        e isa InterruptException && rethrow()
         if e isa ValidationError
             throw(e)
         end
