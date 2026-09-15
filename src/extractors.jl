@@ -308,7 +308,7 @@ function extract(param::Param{Session{T}}, request::LazyRequest, secret_key::Nul
 
     # Handle built-in SessionPayload with expiry checking
     if instance isa SessionPayload
-        if instance.expires < Dates.now(Dates.UTC)
+        if is_expired(instance)
             return Session(session_cookie_name, T)
         end
         instance = instance.data

@@ -69,7 +69,7 @@ export  # The application handle
         regenerate_session!, SecretString, reveal,
         # Session stores. `SessionMiddleware` has no default store (#171), so the type a caller
         # needs to satisfy it -- and the abstract type a custom store subtypes -- are public.
-        AbstractSessionStore, MemoryStore,
+        AbstractSessionStore, MemoryStore, is_expired,
         # Middleware
         BearerAuth, CookieAuthMiddleware, Cors, RateLimiter, ExtractIP, extract_ip,
         SessionMiddleware, SessionPruner, GuardMiddleware, login_required, role_required, permission_required,

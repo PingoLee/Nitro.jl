@@ -282,7 +282,7 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
         function Nitro.Core.Cookies.prunesessions!(store::MockStore)
             current_time = Dates.now(Dates.UTC)
             for (k,v) in store.data
-                if v.expires <= current_time
+                if Nitro.Types.is_expired(v, current_time)
                     delete!(store.data, k)
                 end
             end

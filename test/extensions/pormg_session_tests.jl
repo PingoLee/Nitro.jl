@@ -156,7 +156,7 @@ function Nitro.Types.get_session(store::TestPormGSessionStore, session_id::Strin
         return nothing
     end
     if payload isa SessionPayload
-        if payload.expires <= Dates.now(Dates.UTC)
+        if Nitro.Types.is_expired(payload)
             return nothing
         end
         return copy(payload.data)

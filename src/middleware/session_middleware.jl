@@ -4,7 +4,7 @@ using HTTP
 using Dates
 using JSON
 using UUIDs
-using ...Types: AbstractSessionStore, MemoryStore, SessionPayload, Nullable
+using ...Types: AbstractSessionStore, MemoryStore, SessionPayload, Nullable, is_expired
 using ...Types: CookieConfig, LifecycleMiddleware, require_fixed_period
 using ...Cookies: get_cookie, set_cookie!, storesession!, prunesessions!, regenerate_session!
 using ...Crypto: secure_uuid4
@@ -288,7 +288,7 @@ function _load_session(store::AbstractSessionStore{String, Dict{String,Any}}, se
     end
 
     if payload isa SessionPayload
-        if payload.expires <= Dates.now(Dates.UTC)
+        if is_expired(payload)
             return Dict{String,Any}(), true
         end
         return copy(payload.data), false

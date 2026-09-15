@@ -140,6 +140,32 @@ refuses a payload whose expiry has passed — so a store that never prunes accum
 rows but never serves a stale session. Implement it for any store whose rows outlive the
 process.
 
+**Deciding whether a payload has expired: call `is_expired`, do not compare `expires`
+yourself.**
+
+```julia
+is_expired(payload)                 # against the current clock
+is_expired(payload, current_time)   # against a clock you read once, for a prune sweep
+```
+
+The boundary counts as **expired**: a payload whose `expires` is exactly the instant you
+compare against is refused, so a session is served only while `expires` is strictly in the
+future. That one-character distinction is why the helper exists — the comparison used to be
+written out at six sites and one of them drifted to the lenient form, which meant the
+`Session{T}` extractor could serve a session the janitor had already deleted.
+
+Pass the second argument when sweeping a whole store, so the clock is read once for the
+sweep rather than once per row:
+
+```julia
+function cleanup_expired_sessions!(store::S)
+    current_time = now(UTC)
+    for (id, payload) in rows(store)
+        is_expired(payload, current_time) && delete_session!(store, id)
+    end
+end
+```
+
 `SessionMiddleware` calls it from a **background janitor**, not from the request path: the
 janitor starts on `serve()`, stops on `terminate()`, and ticks every `prune_interval`
 (default 10 minutes).
