@@ -445,17 +445,19 @@ function set_task!(store::InMemoryWorkerStore, task_id::String, task_info::TaskI
         end
 
         # A different object: copy the volatile state across and keep the *stored*
-        # record's watchers, run_id AND cancel_requested — precisely what the serializing
+        # record's watchers, run_id AND cancel_reason — precisely what the serializing
         # store achieves by omitting those columns. The list below is otherwise "copy every
         # field", so those three absences ARE the rule.
         #
         # `run_id` is the value `try_transition!` fences on, so copying it off a caller's
         # object would let a stale run adopt the current run's identity (#108).
-        # `cancel_requested` is worse: a stale object still carrying `false` would ERASE a
+        # `cancel_reason` is worse: a stale object still carrying `:none` would ERASE a
         # cancel already requested, which is the #88 watcher clobber with the sign flipped
-        # (#127). The caller's object is left untouched, so both backends agree on
-        # that too; a rule honoured by only one of them is a store that silently behaves
-        # differently, which for this pair means a different security posture.
+        # (#127). (It was `cancel_requested::Bool` until #183; the field carries the cause
+        # now, and the exclusion rule is unchanged.) The caller's object is left untouched,
+        # so both backends agree on that too; a rule honoured by only one of them is a store
+        # that silently behaves differently, which for this pair means a different security
+        # posture.
         existing.status = task_info.status
         @atomic existing.progress = task_info.progress
         existing.result = task_info.result

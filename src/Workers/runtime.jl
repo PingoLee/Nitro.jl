@@ -419,12 +419,15 @@ end
     shutdown!(runtime::WorkerRuntime; drain_timeout = WORKER_DRAIN_TIMEOUT_SECONDS) -> Bool
 
 Release everything this process is running: stop the cleanup scheduler, close and discard the
-sequential queues, then **drain** the runs still executing here — ask them to stop, wait up to
-`drain_timeout` seconds, and release the handles of the ones that finished.
+sequential queues — recording their unstarted backlog as `CANCELLED` rather than executing it —
+then **drain** the runs still executing here, asking them to stop, waiting up to `drain_timeout`
+seconds, and releasing the handles of the ones that finished.
 
 Returns `true` when every run that was in flight settled, `false` when the wait ran out and
 something was still going. (An expired wait can still return `true`: a run that settles between the
-deadline and the check counts, and then nothing is warned about either.)
+deadline and the check counts, and then nothing is warned about either.) Abandoned backlog items
+never affect that value — they are terminal by the time this returns, so they are settled by
+definition; the return is about *runs*.
 
 **A concrete method on a concrete type.** There is no abstract dispatch here and no fallback, so
 there is nothing a backend author can forget — which is the difference between this and the
@@ -466,19 +469,36 @@ fix. Reuse means `worker_startup(runtime = …)`, `install!(ctx, runtime)`, or a
 `shutdown!`-then-reuse.
 
 `drain_timeout = 0` skips both the tokens and the wait and drops every handle: the pre-#176
-behaviour, exactly. It still reports honestly — `false` when it abandoned a live run — because the
-return value means *was everything settled*, not *did I try*.
+behaviour for in-flight runs, exactly. It still reports honestly — `false` when it abandoned a live
+run — because the return value means *was everything settled*, not *did I try*. It does **not**
+opt out of the backlog handling below; see #182.
 
 # What this does NOT bound
 
 `drain_timeout` bounds the drain, not the call. `stop_cleanup_scheduler!` waits on the scheduler
 task with no deadline of its own, and that happens first.
 
-A **closed sequential queue keeps executing its backlog.** Closing the channel stops new
-submissions, but the processor drains what is already buffered — so runs can start during and
-after the drain that were never in its snapshot and get neither a token nor a wait. That is
-unchanged from before this drain existed; the alternative, discarding the backlog, strands those
-records at `PENDING`, which no sweep looks at.
+# The sequential backlog is abandoned, not executed (#182)
+
+Closing a queue's channel stops new *submissions*; it never stopped the **processor**, which kept
+`take!`-ing whatever was already buffered. So a teardown used to start runs that were never in the
+drain's snapshot: no token, no wait, and a `RUNNING` record published into a runtime being torn
+down. This now stops fetching first, the way Sidekiq's quiet-then-`-t` and River's `Client.Stop`
+both do.
+
+Every queued task still buffered when this is called is recorded **`CANCELLED`** with
+`"Cancelled by worker shutdown"` — the same string an in-flight run parked in its retry backoff
+gets, so one teardown produces one vocabulary. The write is a compare-and-set from `PENDING`
+fenced on `run_id`, so a key re-run since it was queued keeps its successor's record.
+
+`CANCELLED` rather than silence, because silence is not free: an abandoned record sits at
+`PENDING` and `recover_zombie_tasks!` only sweeps `RUNNING`, so nothing would ever reap it.
+`CANCELLED` rather than `FAILED`, because nothing failed and `FAILED` is what the zombie sweep
+writes — reusing it would put two causes under one status again.
+
+**This happens at `drain_timeout = 0` too.** That keyword means *do not wait*; abandoning the
+backlog costs no wait, so declining the wait is not a request to execute the backlog on the way
+out. It is the one respect in which `0` is no longer byte-for-byte the pre-#176 behaviour.
 
 # What a drained run records
 
@@ -489,18 +509,22 @@ failure mode — so the outcome is whatever the run reaches on its own:
 |---|---|
 | running its callback, which returns on the token | `COMPLETED`, carrying whatever it returned |
 | running its callback, which throws | `FAILED` with that message (or a retry, if one is left) |
-| **between retries**, parked in the cancellation-aware backoff | **`CANCELLED`** — see the note on its message |
+| **between retries**, parked in the cancellation-aware backoff | **`CANCELLED`**, error `"Cancelled by worker shutdown"` |
 
 That third row surprises people, so it is stated rather than implied: the retry backoff polls this
 very token, so a drain landing inside one ends the run as cancelled. Reaching a terminal state
-there is the useful behaviour — the alternative is a job that restarts during teardown — but the
-record cannot distinguish "cancelled by a person" from "stopped by a shutdown", and the message is
-actively misleading: the async path passes `"Cancelled by user"` and the sequential queue takes
-`_cancel_task!`'s `"Cancelled"` default, so it names a user who did nothing on one path and says
-nothing about provenance on the other. That split predates this drain.
+there is the useful behaviour — the alternative is a job that restarts during teardown.
 
-A callback that wants a shutdown-truncated run to be recognisable should therefore say so in the
-value it returns or the error it raises, rather than relying on the status.
+**The message names the shutdown, and that is new in #183.** The drain sets the token with
+reason `:shutdown` ([`CANCEL_REASONS`](@ref)) and `_cancel_task!` renders the stored text from it,
+so a teardown is distinguishable from a person's `cancel_task` — which is the only thing that
+records `"Cancelled by user"`. Before #183 it was the other way round on the async path: a real
+`cancel_task` claims `CANCELLED` first and the run's own write lost its CAS, so `"Cancelled by
+user"` reached the record *only* when a drain had put it there. Alerting that reads `CANCELLED` as
+"a person did this" can now filter on the message instead.
+
+A callback that wants to do something *other* than stop — checkpoint, say — can read
+[`cancel_reason`](@ref) and branch on `:shutdown`.
 
 **The run calling this is excluded.** `_snapshot_runs` skips it (see `CURRENT_RUN_KEY`), so a
 `shutdown!` invoked from inside a callback neither waits for nor reports on its own run — and can
@@ -521,16 +545,73 @@ function shutdown!(runtime::WorkerRuntime; drain_timeout::Real = WORKER_DRAIN_TI
         scheduler_ref[] = nothing
     end
 
-    lock(runtime.queue_lock) do
+    # Stop the queues taking work, and collect whatever was still buffered so it can be recorded
+    # as abandoned rather than executed on the way out (#182). Three steps, in this order:
+    #
+    #   1. `draining = true` -- covers the one item a processor may have ALREADY taken. It has to
+    #      be set before the close, or that item slips through into `_execute_queued_task`.
+    #   2. `close` -- `put!` on a closed channel throws, so nothing more can arrive.
+    #   3. collect -- anything that raced in before the close is in the buffer, and nothing can be
+    #      added after it. Closing before collecting is what makes that airtight; the reverse
+    #      order leaves a window for a submit between the collect and the close.
+    abandoned_items = lock(runtime.queue_lock) do
+        pending = Vector{QueueItem}()
         for queue in values(runtime.sequential_queues)
+            @atomic queue.draining = true
             if isopen(queue.channel)
                 close(queue.channel)
             end
+
+            # `take!` until the channel says it is empty, NEVER `while isready(...)`.
+            # `isready` is `n_avail > 0`, and `n_avail` counts tasks blocked in `put!` as well as
+            # buffered items -- so on a full `Channel(100)` with one submitter waiting it reports
+            # 101 with 100 to take, and the last `take!` throws `InvalidStateException` on the
+            # now-empty closed channel. That exception escapes this whole `lock` block: the
+            # collected items are discarded (stranding every one of them `PENDING`, which is the
+            # outcome this function exists to prevent), the registry is never emptied, and the
+            # #176 drain below never runs at all. A closed queue with a blocked submitter is
+            # exactly the state a busy deploy tears down. The processor racing us for the last
+            # item reaches the same throw by a different route.
+            #
+            # This is the shape `_start_queue_processor`'s own loop already uses, for the same
+            # reason: on a closed channel, `take!` drains what is buffered and then raises.
+            while true
+                item = try
+                    take!(queue.channel)
+                catch error
+                    error isa InvalidStateException || rethrow()
+                    break
+                end
+                push!(pending, item)
+            end
+
             queue.running = false
             queue.current_task = nothing
             queue.processor_task = nothing
         end
         empty!(runtime.sequential_queues)
+        return pending
+    end
+
+    # OUTSIDE `queue_lock`, deliberately. These are store writes, and the queue processor takes
+    # the store lock (`_finish_task!`) and then `queue_lock` (its own `finally`); holding
+    # `queue_lock` across a store write here is that pair in the opposite order. One `lock_tasks`
+    # for the whole batch rather than one per item, which is the shape `recover_zombie_tasks!`
+    # already uses for a sweep.
+    #
+    # Unconditional -- this runs at `drain_timeout = 0` too. That keyword means "do not WAIT", and
+    # abandoning the backlog costs no wait; letting a teardown silently execute a queue's backlog
+    # is not something anyone opted into by declining to wait for in-flight runs.
+    if !isempty(abandoned_items)
+        lock_tasks(runtime) do
+            for item in abandoned_items
+                try
+                    _abandon_queued_item!(runtime, item)
+                catch error
+                    @error "Worker queued task abandoned but not recorded during teardown" exception=(error, catch_backtrace()) task_key=item.task_key
+                end
+            end
+        end
     end
 
     if iszero(drain_timeout)
@@ -561,7 +642,7 @@ function shutdown!(runtime::WorkerRuntime; drain_timeout::Real = WORKER_DRAIN_TI
     # status change. This is a request aimed at the callback, not a claim about the record.
     for entry in snapshot
         entry.info === nothing && continue
-        @atomic entry.info.cancel_requested = true
+        _request_cancel!(entry.info, :shutdown)
     end
 
     # No lock is held across the wait, and none may be. `active_lock` would deadlock against

@@ -1344,6 +1344,79 @@ else
 
             @test counter[] == n
         end
+
+        @testset "teardown abandons a queued item identically on both backends (#182, #183)" begin
+            # workers §6: parity is ASSERTED, not inferred. `_abandon_queued_item!` adds no store
+            # method, so the in-memory and serializing backends "obviously" agree -- which is the
+            # exact reasoning that produced #166's cancellation regression. The discriminating
+            # half is here: PormG goes through its column mapping and a filtered update, so the
+            # `(PENDING,)` from-set and the `run_id` WHERE term have to be expressed as real query
+            # terms rather than as an in-memory field check. `MockTaskModel` errors loudly on an
+            # unmodelled filter key, so a regression in either term fails here. (It is a Dict, not
+            # SQL -- this does not exercise column types or PormG's UTC canonicalization.)
+            store_ab = RealPormGWorkerStore(model=MockTaskModel())
+            rt_ab = WorkerRuntime(store_ab)
+
+            record = TaskInfo("alice::queued-at-teardown"; queue_name="reports")
+            push!(record.watchers, "alice")
+            replace_task!(store_ab, record.id, record)
+            item = Nitro.Workers.QueueItem(record.id, record.run_id,
+                                           task_info -> "never", TaskOptions())
+
+            before = Nitro.Workers.current_time_utc()
+            @test Nitro.Workers._abandon_queued_item!(rt_ab, item) == true
+
+            persisted = get_task_info(store_ab, record.id)
+            @test persisted.status == CANCELLED
+            # The #183 string, read back out of the stored record rather than off a live object.
+            @test persisted.error == "Cancelled by worker shutdown"
+            # Bounded, not merely non-`nothing`: exact equality is not available, but a window is,
+            # and "it is set to something" would pass on a stamp carried over from another write.
+            @test persisted.completed_at !== nothing
+            @test before <= persisted.completed_at <= Nitro.Workers.current_time_utc()
+
+            # Idempotent through the DB CAS too -- `shutdown!` and the processor's `draining`
+            # branch can both reach one item.
+            @test Nitro.Workers._abandon_queued_item!(rt_ab, item) == false
+
+            # And run-fenced through the DB's WHERE term: a key re-run while the item sat buffered
+            # belongs to its successor, and cancelling by id would kill a run about to start.
+            fenced = TaskInfo("alice::fenced-at-teardown"; queue_name="reports")
+            push!(fenced.watchers, "alice")
+            replace_task!(store_ab, fenced.id, fenced)
+            stale = Nitro.Workers.QueueItem(fenced.id, fenced.run_id,
+                                            task_info -> "never", TaskOptions())
+
+            successor = TaskInfo("alice::fenced-at-teardown"; queue_name="reports")
+            push!(successor.watchers, "alice")
+            replace_task!(store_ab, successor.id, successor)
+
+            @test Nitro.Workers._abandon_queued_item!(rt_ab, stale) == false
+            still_live = get_task_info(store_ab, fenced.id)
+            @test still_live.status == PENDING
+            @test still_live.run_id == successor.run_id
+        end
+
+        @testset "a user's cancel records \"Cancelled by user\" in the row (#183)" begin
+            # The other half of the parity claim: `cancel_task`'s durable write now renders the
+            # `:user` message, and `PormGWorkerStore` writes it to a column while preferring the
+            # live object on read. Both have to agree, or the in-memory backend passes and the
+            # persistent one reports a different string to an operator reading the table.
+            store_u = RealPormGWorkerStore(model=MockTaskModel())
+            rt_u = WorkerRuntime(store_u)
+
+            live = TaskInfo("alice::cancelled-by-a-person")
+            push!(live.watchers, "alice")
+            live.status = RUNNING
+            replace_task!(store_u, live.id, live)
+            Nitro.Workers.register_active_task_info!(rt_u, live.id, live)
+
+            @test cancel_task(live.id, Owner("alice"); runtime=rt_u)[:status] == "Task cancelled"
+
+            @test cancel_reason(live) === :user
+            @test live.error == "Cancelled by user"                       # the live mirror
+            @test get_task_info(store_u, live.id).error == "Cancelled by user"   # the row
+        end
     end
 end
 

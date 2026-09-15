@@ -282,6 +282,15 @@ function _authorize_grant!(store::AbstractWorkerStore, task_key::String,
     return nothing
 end
 
+# Returns the new run's `run_id` when the caller should START it, and `nothing` when the caller
+# merely joined an existing one as a watcher.
+#
+# It returned a `Bool` until #182. The identity is what `submit_sequential_task` puts on the
+# `QueueItem`, so that a teardown abandoning the backlog writes a terminal state ADDRESSED TO THE
+# RUN that queued the item rather than to its key (workers §6). Deriving it at the abandon site by
+# re-reading the record does not work: by then the record may belong to a successor, and the write
+# would cancel a run that is about to start. This is the only place the identity is known for
+# certain, because it is where the run is minted.
 function _register_or_watch!(runtime::WorkerRuntime, task_key::String, owner::Owner;
                              queue_name::Union{Nothing, String}=nothing,
                              grants::AbstractVector{Owner}=Owner[])
@@ -333,7 +342,7 @@ function _register_or_watch!(runtime::WorkerRuntime, task_key::String, owner::Ow
             for grant in grants
                 add_watcher!(runtime, task_key, grant.user_id)
             end
-            return false
+            return nothing
         end
 
         # Re-running a finished key replaces the record and resets its watchers to the
@@ -343,7 +352,7 @@ function _register_or_watch!(runtime::WorkerRuntime, task_key::String, owner::Ow
         # thread it is sitting on. In-process only -- a run hosted on another node is
         # unreachable from here and will keep going until its callback returns.
         previous = get_active_task_info(runtime, task_key)
-        previous === nothing || (@atomic previous.cancel_requested = true)
+        previous === nothing || _request_cancel!(previous, :superseded)
 
         task_info = TaskInfo(task_key; queue_name)
         push!(task_info.watchers, uid)
@@ -353,7 +362,7 @@ function _register_or_watch!(runtime::WorkerRuntime, task_key::String, owner::Ow
         # Through the RUNTIME: publishing a successor also evicts the run it displaced from
         # the live caches, so nothing later reads a run that no longer owns this key.
         replace_task!(runtime, task_key, task_info)
-        return true
+        return task_info.run_id
     end
 end
 
@@ -456,11 +465,12 @@ function _execute_task_async(runtime::WorkerRuntime, task_key::String, callback:
                     #
                     # `unwrapped isa InterruptException` used to be an arm of this test, back when
                     # cancellation was delivered by injecting one. Nothing injects any more, so
-                    # the only way one arrives is that the callback itself threw it -- recording
-                    # that as "Cancelled by user" would be a lie about who stopped the job (#127).
+                    # the only way one arrives is that the callback itself threw it -- and nothing
+                    # set a cancel reason for it, so recording it as a cancellation would be a lie
+                    # about who stopped the job (#127).
                     latest_info = get_task_info(runtime, task_key)
                     if latest_info !== nothing && latest_info.status == CANCELLED
-                        return _cancel_task!(runtime, task_info; message="Cancelled by user")
+                        return _cancel_task!(runtime, task_info)
                     end
 
                     # A timeout is terminal on the first attempt. Retrying it cannot help and can
@@ -489,11 +499,11 @@ function _execute_task_async(runtime::WorkerRuntime, task_key::String, callback:
                     # The token is process-local, so a cancel issued on another node sets nothing here. One
                     # durable read per ATTEMPT (not per poll) covers that without a round-trip every 50ms.
                     if cancel_requested(task_info)
-                        return _cancel_task!(runtime, task_info; message="Cancelled by user")
+                        return _cancel_task!(runtime, task_info)
                     end
                     resumed = get_task_info(runtime.store, task_key)
                     if resumed !== nothing && resumed.status == CANCELLED
-                        return _cancel_task!(runtime, task_info; message="Cancelled by user")
+                        return _cancel_task!(runtime, task_info)
                     end
                 end
             end
@@ -560,8 +570,10 @@ function submit_task(task_key::AbstractString, callback::Function, owner::Owner;
     _authorize_queue!(runtime.store, DEFAULT_QUEUE_NAME, owner)
 
     key = scoped_task_key(task_key, owner; scope)
-    should_start = _register_or_watch!(runtime, key, owner; grants=watchers)
-    if should_start
+    # The async path does not carry the run identity: `_execute_task_async` re-reads the record
+    # durably at run-start, which is the claiming read the rule requires. Only a QUEUED item needs
+    # it plumbed, because it may sit in a buffer long enough for the record to move on.
+    if _register_or_watch!(runtime, key, owner; grants=watchers) !== nothing
         _execute_task_async(runtime, key, callback, options)
     end
     return key
@@ -588,8 +600,8 @@ function submit_sequential_task(queue_name::AbstractString, task_key::AbstractSt
     _authorize_queue!(runtime.store, queue_id, owner)
 
     key = scoped_task_key(task_key, owner; scope)
-    should_start = _register_or_watch!(runtime, key, owner; queue_name=queue_id, grants=watchers)
-    if should_start
+    run_id = _register_or_watch!(runtime, key, owner; queue_name=queue_id, grants=watchers)
+    if run_id !== nothing
         # One lookup, not two. `_start_queue_processor` already returns the queue it spawned a
         # processor for, and a second `_get_or_create_queue` can return a DIFFERENT object: since
         # `shutdown!` empties the registry, a teardown landing between the two calls makes the
@@ -597,7 +609,31 @@ function submit_sequential_task(queue_name::AbstractString, task_key::AbstractSt
         # then succeed and the task would sit PENDING with nothing draining it -- a silent hang in
         # place of the loud `InvalidStateException` a closed channel raises.
         queue = _start_queue_processor(runtime, queue_id)
-        put!(queue.channel, QueueItem(key, callback, options))
+        item = QueueItem(key, run_id, callback, options)
+
+        # A teardown landing between resolving the queue and handing it the item makes this
+        # `put!` throw, and the record written a moment ago by `_register_or_watch!` is then
+        # `PENDING` with nothing that will ever run it -- the same orphan #182 removes from the
+        # buffered backlog, arriving through the one door closing the channel leaves open. It is
+        # not rare: `close` raises in every submitter already blocked on a full `Channel(100)`,
+        # so a busy queue torn down mid-deploy produces one of these per waiter.
+        #
+        # The exception still propagates -- the caller has to learn the submission failed, which
+        # is the whole argument for the loud close over a silent hang -- but the record is now
+        # terminal rather than abandoned.
+        try
+            put!(queue.channel, item)
+        catch error
+            error isa InvalidStateException || rethrow()
+            try
+                _abandon_queued_item!(runtime, item)
+            catch abandon_error
+                # Never let bookkeeping replace the caller's exception: the `put!` failure is
+                # what they must see, and a store that is also down would otherwise mask it.
+                @error "Worker task orphaned by a teardown could not be recorded" exception=(abandon_error, catch_backtrace()) task_key=key
+            end
+            rethrow()
+        end
     end
     return key
 end
@@ -661,7 +697,7 @@ function cancel_task(task_id::AbstractString, authority::TaskAuthority; runtime:
         cancelled_at = current_time_utc()
         claimed = try_transition!(runtime.store, task_info.id, (PENDING, RUNNING), CANCELLED;
                                   run_id=task_info.run_id,
-                                  error="Cancelled", completed_at=cancelled_at)
+                                  error=_cancel_message(:user), completed_at=cancelled_at)
 
         if !claimed
             # DURABLE: reaching here means the row is no longer in `(PENDING, RUNNING)`, or
@@ -697,7 +733,13 @@ function cancel_task(task_id::AbstractString, authority::TaskAuthority; runtime:
         # not it wins its CAS, so nothing leaks.
         live = get_active_task_info(runtime, task_info.id)
         if live !== nothing && live.run_id == task_info.run_id
-            @atomic live.cancel_requested = true
+            # AFTER the durable claim above, which is why that write renders `:user` directly
+            # rather than reading the token back. The two can legitimately disagree: if a drain
+            # had already asked (`:shutdown`) without claiming anything, this CAS loses and the
+            # token keeps `:shutdown` while the record says "Cancelled by user". Both are true of
+            # what they describe -- the token says who asked FIRST, the record says who CLAIMED
+            # it -- and the claim is the half an operator reads.
+            _request_cancel!(live, :user)
 
             # Mirror the claim onto the live record, which is a REQUIREMENT now that this
             # function no longer deregisters it. `PormGWorkerStore.try_transition!` writes
@@ -712,7 +754,7 @@ function cancel_task(task_id::AbstractString, authority::TaskAuthority; runtime:
             # It also makes the `task_info.status == CANCELLED` poll that the tutorial has
             # always documented actually work under PormG, which it never did.
             live.status = CANCELLED
-            live.error = "Cancelled"
+            live.error = _cancel_message(:user)
             live.completed_at = cancelled_at
         end
 

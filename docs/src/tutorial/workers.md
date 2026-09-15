@@ -214,30 +214,41 @@ the wait.
     `drain_timeout` **plus** `serve(shutdown_timeout = …)`, 15 seconds with both defaults. Size
     them together against your container's stop grace period.
 
-Two limits worth knowing:
+Two things worth knowing:
 
 - A run abandoned past the deadline **keeps its handle registered**, so `recover_zombie_tasks!`
   will not declare it dead — but that only helps a runtime that is *reused*. A
   `serve → terminate → serve` cycle with `store=` builds a fresh `WorkerRuntime` each time, whose
   handles start empty; there, finishing the run inside the drain is the only thing that saves it.
-- Closing a sequential queue stops new submissions but the processor still works through what is
-  already buffered, so runs can start during and after the drain. They get neither the token nor
-  the wait.
+- **A sequential queue's unstarted backlog is abandoned, not executed.** Closing the channel stops
+  new submissions; the teardown also stops the processor taking work, and records every task still
+  queued as `CANCELLED` with `"Cancelled by worker shutdown"`. It used to let the processor work
+  through the buffer, so a teardown could *start* jobs that got neither the token nor the wait.
+  Resubmit them when the process comes back — they have a terminal status, so a re-submit under
+  the same key builds a fresh run rather than joining a ghost.
 
-The drain claims no terminal state itself — that write would race the run's own — so a drained run
-records whatever it reaches on its own:
+  This happens even at `drain_timeout=0`: that setting means "do not wait", and abandoning a
+  backlog costs no wait.
+
+The drain claims no terminal state for a **running** task — that write would race the run's own —
+so a drained run records whatever it reaches on its own:
 
 | The run was… | It records |
 |---|---|
+| queued, never started | `CANCELLED`, error `"Cancelled by worker shutdown"` |
 | running its callback, which returns on the token | `COMPLETED`, carrying whatever it returned |
 | running its callback, which throws | `FAILED` with that message (or a retry, if one is left) |
-| parked **between retries**, in the cancellation-aware backoff | `CANCELLED` — error `"Cancelled by user"` on the async path, `"Cancelled"` on a sequential queue |
+| parked **between retries**, in the cancellation-aware backoff | `CANCELLED`, error `"Cancelled by worker shutdown"` |
 
 The third row is easy to miss: the retry backoff polls this same token, so a shutdown landing
 inside one ends the run as cancelled. Reaching a terminal state there is the useful outcome —
-better than a job restarting during teardown — but the status alone cannot tell you a person's
-cancel from a shutdown's, and the error text is no help either: it differs by path and names a user
-on neither. Put anything you need to recognise later into the value you return:
+better than a job restarting during teardown.
+
+The error text names the shutdown, so alerting that treats `CANCELLED` as "a person did this" can
+filter on it. That is the same string on both submit paths, and `"Cancelled by user"` now means a
+person and nothing else — see [Why a cancellation happened](@ref) below. A callback that wants to
+do something other than stop can branch on `cancel_reason(task_info)`; one that just wants a
+partial result recognisable downstream returns it:
 
 ```julia
 submit_task("import", task_info -> begin
@@ -397,6 +408,44 @@ cancel_task(task_id, Owner("user-1"))
     longer anything that can interrupt it. The loop is what makes the `finally` reachable.
     The same applies to any OS resource the callback owns — a file lock, a socket, a temp
     directory.
+
+### Why a cancellation happened
+
+Four different things set that token, and the record used to be unable to tell them apart — so a
+rolling restart and a person clicking *cancel* both read as `CANCELLED`, and the stored message
+named a user on an event no user caused. `cancel_reason(task_info)` reports which one it was:
+
+| `cancel_reason` | Who asked | What the record says |
+|---|---|---|
+| `:user` | `cancel_task` | `CANCELLED`, error `"Cancelled by user"` |
+| `:shutdown` | a teardown drain (`shutdown!`, `uninstall!`, server stop) | `CANCELLED`, error `"Cancelled by worker shutdown"` — or nothing at all, if the callback returned normally |
+| `:timeout` | an expired `TaskOptions(timeout=…)` | `FAILED`, error `"Timeout of Ns exceeded"` — a deadline is never recorded as a cancellation |
+| `:superseded` | re-running a key whose previous run is still executing | nothing: the record already belongs to the new run |
+| `:none` | nobody — it was not cancelled | — |
+
+`cancel_requested(task_info)` is exactly `cancel_reason(task_info) !== :none`, so polling either
+costs the same single atomic read. Use the reason when a callback should react *differently* to a
+deploy than to a person:
+
+```julia
+submit_task("import", task_info -> begin
+    for chunk in chunks
+        if cancel_requested(task_info)
+            # A shutdown means we are coming back: checkpoint so the next process resumes.
+            cancel_reason(task_info) === :shutdown && return checkpoint(done)
+            return "cancelled"
+        end
+        process(chunk)
+    end
+    return "done"
+end, Owner("user-1"))
+```
+
+**The first cause wins.** A job someone cancelled a second before a deploy still reports `:user` —
+the person did stop it, and the shutdown merely arrived afterwards.
+
+Like the token itself, the reason is **process-local**: a cancel issued on another node reads as
+`:none` here, and a cross-process callback has to poll the durable record instead.
 
 Tasks can also retry on failure by passing `TaskOptions`.
 

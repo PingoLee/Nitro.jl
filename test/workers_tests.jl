@@ -650,16 +650,293 @@ end
         end
     end
 
+    @testset "a teardown abandons the queue backlog instead of running it (#182)" begin
+        # Closing the channel only stopped SUBMISSIONS. The processor kept `take!`-ing what was
+        # already buffered, so a teardown started runs that were never in the drain's snapshot --
+        # no token, no wait, a RUNNING record published into a runtime being torn down.
+        store = InMemoryWorkerStore()
+        rt = WorkerRuntime(store)
+        owner = Owner("u")
+        entered = Base.Event()
+        backlog_ran = Threads.Atomic{Int}(0)
+        try
+            # One run in flight, holding the processor until the drain asks it to stop.
+            slow_id = submit_sequential_task("reports", "slow", function (task_info)
+                notify(entered)
+                while !cancel_requested(task_info)
+                    sleep(0.01)
+                end
+                return "stopped on $(cancel_reason(task_info))"
+            end, owner; runtime=rt)
+
+            wait(entered)
+
+            # ...and three behind it, which must never execute.
+            backlog = [submit_sequential_task("reports", "backlog-$i", function (task_info)
+                           Threads.atomic_add!(backlog_ran, 1)
+                           return "ran"
+                       end, owner; runtime=rt) for i in 1:3]
+
+            @test shutdown!(rt; drain_timeout=8.0) == true
+
+            # The whole point. Not a timing assertion: `draining` is set and the buffer collected
+            # under `queue_lock` BEFORE any token is set, so the processor cannot be released back
+            # to the channel until there is nothing left in it to take.
+            @test backlog_ran[] == 0
+
+            for id in backlog
+                status = get_task_status(id, System(); runtime=rt)
+                @test status[:status] == "CANCELLED"
+                @test status[:error] == "Cancelled by worker shutdown"
+            end
+
+            # The in-flight run is unaffected: it returned on the token, so it records its own
+            # outcome -- and the string proves the drain, not this test, is what stopped it.
+            slow = get_task_status(slow_id, System(); runtime=rt)
+            @test slow[:status] == "COMPLETED"
+            @test slow[:result] == "stopped on shutdown"
+        finally
+            reset_runtime!(rt)
+        end
+    end
+
+    @testset "drain_timeout=0 still abandons the backlog (#182)" begin
+        # `drain_timeout=0` means "do not WAIT". Abandoning the backlog costs no wait, so
+        # declining the wait is not a request to execute a queue's backlog on the way out. This is
+        # the one respect in which 0 is no longer byte-for-byte the pre-#176 behaviour, and the
+        # UPGRADING entry says so.
+        store = InMemoryWorkerStore()
+        rt = WorkerRuntime(store)
+        owner = Owner("u")
+        entered = Base.Event()
+        release = Base.Event()
+        ran = Threads.Atomic{Int}(0)
+        try
+            submit_sequential_task("q0", "holder", function (task_info)
+                notify(entered)
+                wait(release)          # deliberately does NOT poll the token: 0 never sets one
+                return "held"
+            end, owner; runtime=rt)
+            wait(entered)
+
+            queued = submit_sequential_task("q0", "queued", function (task_info)
+                Threads.atomic_add!(ran, 1)
+                return "ran"
+            end, owner; runtime=rt)
+
+            @test shutdown!(rt; drain_timeout=0) == false   # it abandoned a live run, honestly
+            @test get_task_status(queued, System(); runtime=rt)[:status] == "CANCELLED"
+            @test get_task_status(queued, System(); runtime=rt)[:error] ==
+                  "Cancelled by worker shutdown"
+            @test ran[] == 0
+        finally
+            notify(release)
+            reset_runtime!(rt)
+        end
+    end
+
+    @testset "abandoning a queued item is run-fenced and idempotent (#182)" begin
+        # White-box, and it has to be. `shutdown!` drains the buffer itself, so the processor's
+        # `draining` check only ever catches an item it had ALREADY taken when the teardown began
+        # -- a window not reachable deterministically from the public API. Both properties of the
+        # abandon write are asserted here directly instead of being inferred from a race.
+        store = InMemoryWorkerStore()
+        rt = WorkerRuntime(store)
+        try
+            # A queued item whose key is re-run before the teardown records it. The successor owns
+            # the record, so this write must LOSE -- an id-addressed write here would clobber a
+            # live successor, the #108/#167 defect through a teardown-wide door.
+            predecessor = Nitro.Workers.TaskInfo("u::fenced")
+            push!(predecessor.watchers, "u")
+            replace_task!(store, predecessor.id, predecessor)
+            # Queued FOR the predecessor -- the identity `_register_or_watch!` handed the submit.
+            item = Nitro.Workers.QueueItem("u::fenced", predecessor.run_id,
+                                           task_info -> "never", TaskOptions())
+
+            # The key moves on while the item is still buffered, and the successor is PENDING:
+            # about to be started, possibly on the async path where nothing is abandoning it.
+            successor = Nitro.Workers.TaskInfo("u::fenced")
+            push!(successor.watchers, "u")
+            replace_task!(store, successor.id, successor)
+
+            @test Nitro.Workers._abandon_queued_item!(rt, item) == false
+            @test get_task_info(store, "u::fenced").run_id == successor.run_id
+            @test get_task_info(store, "u::fenced").status == PENDING
+
+            # It writes once and only once: `shutdown!`'s own sweep and the processor's `draining`
+            # branch can both reach one item, so a second call must be a no-op rather than a
+            # second terminal write.
+            plain = Nitro.Workers.TaskInfo("u::plain")
+            push!(plain.watchers, "u")
+            replace_task!(store, plain.id, plain)
+            plain_item = Nitro.Workers.QueueItem("u::plain", plain.run_id,
+                                                 task_info -> "never", TaskOptions())
+
+            @test Nitro.Workers._abandon_queued_item!(rt, plain_item) == true
+            @test Nitro.Workers._abandon_queued_item!(rt, plain_item) == false
+            @test get_task_info(store, "u::plain").status == CANCELLED
+            @test get_task_info(store, "u::plain").error == "Cancelled by worker shutdown"
+
+            # A record that vanished between queueing and teardown is not an error.
+            gone = Nitro.Workers.QueueItem("u::gone", Nitro.Workers.uuid4(),
+                                           task_info -> "never", TaskOptions())
+            @test Nitro.Workers._abandon_queued_item!(rt, gone) == false
+        finally
+            reset_runtime!(rt)
+        end
+    end
+
+    @testset "a full queue with a blocked submitter still tears down (#182)" begin
+        # The regression the first version of this patch shipped. The collect loop was
+        # `while isready(channel)`, and `isready` is `n_avail > 0` -- which counts tasks blocked
+        # in `put!` as well as buffered items. On a full `Channel(100)` with one submitter waiting
+        # it reports 101 with 100 to take, so the last `take!` threw on the empty closed channel:
+        # every collected item was discarded back to PENDING, the registry was never emptied, and
+        # the whole #176 drain never ran. A busy queue torn down mid-deploy is exactly that state.
+        store = InMemoryWorkerStore()
+        rt = WorkerRuntime(store)
+        owner = Owner("u")
+        entered = Base.Event()
+        ran = Threads.Atomic{Int}(0)
+        try
+            # Fill the buffer to its 100-item ceiling, with one run in flight holding the
+            # processor so nothing is consumed.
+            submit_sequential_task("full", "holder", function (task_info)
+                notify(entered)
+                while !cancel_requested(task_info)
+                    sleep(0.01)
+                end
+                return "stopped"
+            end, owner; runtime=rt)
+            wait(entered)
+
+            queued = [submit_sequential_task("full", "buffered-$i", function (task_info)
+                          Threads.atomic_add!(ran, 1)
+                          return "ran"
+                      end, owner; runtime=rt) for i in 1:100]
+
+            # ...and one more submitter parked in `put!`, which is what inflates `n_avail`.
+            blocked_key = scoped_task_key("blocked", owner)
+            blocked = Threads.@spawn try
+                submit_sequential_task("full", "blocked", task_info -> "ran", owner; runtime=rt)
+            catch error
+                error                     # InvalidStateException once the channel closes
+            end
+            @test timedwait(() -> Base.n_avail(
+                                Nitro.Workers._get_or_create_queue(rt, "full").channel) > 100,
+                            10.0; pollint=0.02) === :ok
+
+            # Before the fix this THREW instead of returning.
+            @test shutdown!(rt; drain_timeout=8.0) == true
+
+            # ...and the teardown was total: registry emptied, nothing executed, every record
+            # terminal rather than stranded PENDING.
+            @test isempty(Nitro.Workers.get_sequential_queues(rt))
+            @test ran[] == 0
+            for id in queued
+                status = get_task_status(id, System(); runtime=rt)
+                @test status[:status] == "CANCELLED"
+                @test status[:error] == "Cancelled by worker shutdown"
+            end
+
+            # The submitter `close` woke with an exception owns a record too, and it must not be
+            # left PENDING either -- the one orphan closing the channel leaves behind.
+            @test fetch(blocked) isa InvalidStateException
+            @test get_task_status(blocked_key, System(); runtime=rt)[:status] == "CANCELLED"
+            @test get_task_status(blocked_key, System(); runtime=rt)[:error] ==
+                  "Cancelled by worker shutdown"
+        finally
+            reset_runtime!(rt)
+        end
+    end
+
+    @testset "the processor abandons an item it had already taken when draining (#182)" begin
+        # White-box on purpose. `shutdown!` collects the buffer itself, so the processor's
+        # `draining` branch only ever sees an item it had ALREADY taken -- not reachable
+        # deterministically through the public API, but trivially reachable here. Without this the
+        # branch can be deleted outright and the suite stays green, which is what the reviewer
+        # found.
+        store = InMemoryWorkerStore()
+        rt = WorkerRuntime(store)
+        owner = Owner("u")
+        ran = Threads.Atomic{Int}(0)
+        try
+            # Start a processor, then mark its queue draining WITHOUT closing the channel, so the
+            # `take!` still succeeds and the `draining` check is what decides.
+            queue = Nitro.Workers._start_queue_processor(rt, "manual")
+            @atomic queue.draining = true
+
+            key = scoped_task_key("taken-while-draining", owner)
+            record = Nitro.Workers.TaskInfo(key; queue_name="manual")
+            push!(record.watchers, owner.user_id)
+            replace_task!(store, key, record)
+
+            put!(queue.channel, Nitro.Workers.QueueItem(key, record.run_id, function (task_info)
+                Threads.atomic_add!(ran, 1)
+                return "ran"
+            end, TaskOptions()))
+
+            @test timedwait(() -> get_task_info(store, key).status == CANCELLED,
+                            10.0; pollint=0.02) === :ok
+            @test get_task_info(store, key).error == "Cancelled by worker shutdown"
+            @test ran[] == 0
+
+            # It kept draining rather than stopping: the branch `continue`s. Asserted by feeding
+            # it a SECOND item rather than by `!istaskdone`, which only says the task has not
+            # finished *yet* -- a `break` regression would be caught by that solely because the
+            # poll interval usually beats it, which is a race dressed up as an invariant.
+            second = scoped_task_key("second-while-draining", owner)
+            second_record = Nitro.Workers.TaskInfo(second; queue_name="manual")
+            push!(second_record.watchers, owner.user_id)
+            replace_task!(store, second, second_record)
+            put!(queue.channel, Nitro.Workers.QueueItem(second, second_record.run_id,
+                                                        function (task_info)
+                Threads.atomic_add!(ran, 1)
+                return "ran"
+            end, TaskOptions()))
+
+            @test timedwait(() -> get_task_info(store, second).status == CANCELLED,
+                            10.0; pollint=0.02) === :ok
+            @test ran[] == 0
+        finally
+            reset_runtime!(rt)
+        end
+    end
+
+    @testset "a runtime reused after shutdown! gets a queue that is not draining (#182)" begin
+        # The reason `draining` lives on the SequentialQueue and not on the WorkerRuntime: a
+        # runtime-level flag would need resetting here, and the reset races a concurrent submit.
+        # `shutdown!` empties the registry, so the fresh queue is not draining by construction.
+        store = InMemoryWorkerStore()
+        rt = WorkerRuntime(store)
+        owner = Owner("u")
+        try
+            @test shutdown!(rt) == true      # no queues at all yet
+
+            done = Base.Event()
+            id = submit_sequential_task("after", "runs-normally", function (task_info)
+                notify(done)
+                return "ok"
+            end, owner; runtime=rt)
+
+            @test timedwait(() -> get_task_status(id, System(); runtime=rt)[:status] == "COMPLETED",
+                            15.0; pollint=0.05) === :ok
+            @test get_task_status(id, System(); runtime=rt)[:result] == "ok"
+        finally
+            reset_runtime!(rt)
+        end
+    end
+
     @testset "a drain landing in the retry backoff ends the run CANCELLED" begin
         # The drain writes no terminal state itself, but it still decides one: the retry backoff
         # polls the SAME token (`api.jl`, `queue.jl`), so a shutdown landing inside one exits the
-        # backoff and takes the `_cancel_task!` branch -- recording `CANCELLED` with the stock
-        # "Cancelled by user", for a shutdown no user asked for.
+        # backoff and takes the `_cancel_task!` branch.
         #
-        # Pinned rather than fixed. Reaching a terminal state there is the useful outcome (the
-        # alternative is a job restarting mid-teardown), and making the record say *which* kind of
-        # stop it was needs a reason carried on the token, which is a separate change. This test
-        # exists so the documents describing this contract cannot drift from it silently.
+        # #176 pinned this recording "Cancelled by user" on the async path and "Cancelled" on the
+        # sequential one, deliberately -- the record could not name its cause, and inventing a
+        # string was out of that issue's scope. #183 gave the token a reason, so BOTH paths now
+        # render "Cancelled by worker shutdown" from `:shutdown` and the asymmetry is gone.
+        # Overwriting #176's recorded intent is the point of #183, not a convenience.
         store = InMemoryWorkerStore()
         rt = WorkerRuntime(store)
         entered = Base.Event()
@@ -684,17 +961,16 @@ end
 
             status = get_task_status(id, System(); runtime=rt)
             @test status[:status] == "CANCELLED"
-            @test status[:error] == "Cancelled by user"     # the ASYNC path's message
+            @test status[:error] == "Cancelled by worker shutdown"   # NOT "Cancelled by user"
             # And it did NOT run a second attempt: the backoff bailed instead of retrying.
             @test attempts[] == 1
         finally
             reset_runtime!(rt)
         end
 
-        # The sequential path records a DIFFERENT string -- `queue.jl` takes `_cancel_task!`'s
-        # `"Cancelled"` default where `api.jl` passes `"Cancelled by user"`. The asymmetry
-        # predates #176 and looks accidental, but the upgrade note tells operators what a drained
-        # job looks like in their records, so both strings are pinned rather than one.
+        # The sequential path records the SAME string, which is the half #183 fixed. `_cancel_task!`
+        # no longer takes a message at all -- it renders from the run's own reason -- so there is no
+        # longer a parameter the two paths could pass differently.
         store_q = InMemoryWorkerStore()
         rt_q = WorkerRuntime(store_q)
         owner_q = Owner("u")
@@ -712,10 +988,143 @@ end
 
             status_q = get_task_status(qid, System(); runtime=rt_q)
             @test status_q[:status] == "CANCELLED"
-            @test status_q[:error] == "Cancelled"           # NOT "Cancelled by user"
+            @test status_q[:error] == "Cancelled by worker shutdown"  # identical to the async path
             @test attempts_q[] == 1
         finally
             reset_runtime!(rt_q)
+        end
+    end
+
+    @testset "the four cancellation causes are distinguishable (#183)" begin
+        # The vocabulary itself, unit-level: `cancel_requested` is exactly "the reason is not
+        # :none", so the flag and the cause cannot disagree -- which is the whole argument for one
+        # field over two. A second field would need every setter to write reason-before-flag, a
+        # convention no test can hold in place.
+        t = Nitro.Workers.TaskInfo("u::k")
+        @test cancel_reason(t) === :none
+        @test cancel_requested(t) == false
+
+        # Pinned exactly, not iterated. The loop below walks `CANCEL_REASONS` itself, so dropping
+        # a member would silently shrink what it tests and stay green.
+        @test Nitro.Workers.CANCEL_REASONS === (:user, :timeout, :superseded, :shutdown)
+
+        for reason in Nitro.Workers.CANCEL_REASONS
+            fresh = Nitro.Workers.TaskInfo("u::k")
+            @test Nitro.Workers._request_cancel!(fresh, reason) == true
+            @test cancel_reason(fresh) === reason
+            @test cancel_requested(fresh) == true
+        end
+
+        # FIRST cause wins, and the setter reports whether it was the one that won. A person who
+        # cancels a job seconds before a deploy must still read as `:user`: the drain fires on
+        # every in-flight run at once, so last-write-wins would make a shutdown the most likely
+        # writer to land last and would rewrite that attribution wholesale.
+        first_wins = Nitro.Workers.TaskInfo("u::k")
+        @test Nitro.Workers._request_cancel!(first_wins, :user) == true
+        @test Nitro.Workers._request_cancel!(first_wins, :shutdown) == false
+        @test cancel_reason(first_wins) === :user
+
+        # One renderer, and `:none` still yields a sentence rather than an error: the durable-read
+        # branches of the retry loop cancel on a record another process wrote, so nothing set a
+        # local token. Those writes always lose their CAS, so the text is never stored -- but it
+        # must not be a crash on the way to losing.
+        @test Nitro.Workers._cancel_message(:user) == "Cancelled by user"
+        @test Nitro.Workers._cancel_message(:timeout) == "Cancelled by timeout"
+        @test Nitro.Workers._cancel_message(:superseded) == "Cancelled by a re-run of this task key"
+        @test Nitro.Workers._cancel_message(:shutdown) == "Cancelled by worker shutdown"
+        @test Nitro.Workers._cancel_message(:none) == "Cancelled"
+    end
+
+    @testset "a user's cancel is the ONLY thing that records \"Cancelled by user\" (#183)" begin
+        # The inversion #183 exists to fix, pinned from the correct side. Before it, a genuine
+        # `cancel_task` stored "Cancelled" -- its own CAS claims the record first, so the run's
+        # `_cancel_task!` lost and its "Cancelled by user" was never written. The only cause that
+        # writes nothing of its own is a drain, so "Cancelled by user" reached a record ONLY when
+        # no user had cancelled anything. It is now exactly the other way round.
+        store = InMemoryWorkerStore()
+        rt = WorkerRuntime(store)
+        owner = Owner("u")
+        entered = Base.Event()
+        # Captured rather than returned: the callback's value is discarded here, because
+        # `cancel_task` already claimed CANCELLED and `_complete_task!`'s CAS loses.
+        seen = Ref{Symbol}(:unset)
+        try
+            id = submit_task("cancellable", function (task_info)
+                notify(entered)
+                while !cancel_requested(task_info)
+                    sleep(0.01)
+                end
+                seen[] = cancel_reason(task_info)
+                return "stopped"
+            end, owner; runtime=rt)
+
+            wait(entered)
+            @test cancel_task(id, owner; runtime=rt)[:status] == "Task cancelled"
+
+            status = get_task_status(id, System(); runtime=rt)
+            @test status[:status] == "CANCELLED"
+            @test status[:error] == "Cancelled by user"
+
+            # The callback saw :user too, so the token and the record agree about provenance.
+            @test timedwait(() -> seen[] !== :unset, 10.0; pollint=0.02) === :ok
+            @test seen[] === :user
+        finally
+            reset_runtime!(rt)
+        end
+    end
+
+    @testset "a superseding re-run marks its predecessor :superseded (#183)" begin
+        # `_register_or_watch!` sets the token on the run it is displacing. That run's own terminal
+        # write then fails the `run_id` fence (#108), so the reason never reaches a record -- it
+        # exists so the displaced CALLBACK can tell "I was replaced" from "a person cancelled me".
+        store = InMemoryWorkerStore()
+        rt = WorkerRuntime(store)
+        owner = Owner("u")
+        try
+            predecessor = Nitro.Workers.TaskInfo("u::job")
+            push!(predecessor.watchers, "u")
+            predecessor.status = COMPLETED          # finished record, still-live run
+            replace_task!(store, predecessor.id, predecessor)
+            Nitro.Workers.register_active_task_info!(rt, predecessor.id, predecessor)
+
+            # Re-running the finished key replaces the record and asks the predecessor to stop.
+            submit_task("job", task_info -> "second run", owner; runtime=rt)
+
+            @test cancel_requested(predecessor) == true
+            @test cancel_reason(predecessor) === :superseded
+        finally
+            reset_runtime!(rt)
+        end
+    end
+
+    @testset "a timeout marks the run :timeout and still records FAILED (#183)" begin
+        # A deadline is the one cause that must NOT start rendering a cancel message: it throws
+        # `TaskTimeoutError`, which is terminal FAILED on the first attempt because nothing can
+        # stop the attempt that timed out (#127). The reason exists for the callback's benefit --
+        # `cancel_requested` on a FAILED task has always meant "the deadline fired", and this is
+        # what says so outright instead of leaving it to be inferred from the status.
+        store = InMemoryWorkerStore()
+        rt = WorkerRuntime(store)
+        seen = Ref{Symbol}(:unset)
+        try
+            id = submit_task("slow", function (task_info)
+                while !cancel_requested(task_info)
+                    sleep(0.02)
+                end
+                seen[] = cancel_reason(task_info)
+                return "noticed"
+            end, Owner("u"); options=TaskOptions(timeout=1), runtime=rt)
+
+            @test timedwait(() -> get_task_status(id, System(); runtime=rt)[:status] == "FAILED",
+                            15.0; pollint=0.05) === :ok
+            status = get_task_status(id, System(); runtime=rt)
+            @test status[:error] == "Timeout of 1s exceeded"
+            @test !occursin("Cancelled", something(status[:error], ""))
+
+            @test timedwait(() -> seen[] !== :unset, 10.0; pollint=0.05) === :ok
+            @test seen[] === :timeout
+        finally
+            reset_runtime!(rt)
         end
     end
 
@@ -897,7 +1306,10 @@ end
         push!(successor.watchers, owner.user_id)
         replace_task!(store, key, successor)
 
-        @test Nitro.Workers._register_or_watch!(rt_store, key, owner) == false
+        # `nothing` is "joined, do not start" -- this returned `false` until #182 gave it the new
+        # run's `run_id` to hand the queue. The meaning under test is unchanged: the successor is
+        # PENDING, so this joins it rather than minting a third run.
+        @test Nitro.Workers._register_or_watch!(rt_store, key, owner) === nothing
         @test get_task_info(store, key).run_id == successor.run_id
     finally
         reset_runtime!(rt_store)
@@ -1849,7 +2261,7 @@ end
 
             # Driven synchronously on purpose: the sequential processor calls exactly this,
             # so the assertion is about the function rather than about scheduling.
-            item = Nitro.Workers.QueueItem(t.id, () -> (ran[] = true; "done"), TaskOptions())
+            item = Nitro.Workers.QueueItem(t.id, t.run_id, () -> (ran[] = true; "done"), TaskOptions())
             Nitro.Workers._execute_queued_task(rt_store, item)
 
             @test ran[] == false

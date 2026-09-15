@@ -222,6 +222,12 @@ is also what keeps a genuine process crash recoverable.
   handle teardown: only the run that owns the runtime's `active_tasks[id]` may deregister it,
   because `recover_zombie_tasks!` reads liveness from exactly that entry. One `TaskInfo` object is
   one run; a re-run is a new object, never a mutated one.
+  - **A write that fences on a run it just re-read is not fenced.** `_abandon_queued_item!` (#182)
+    writes a terminal state for a task that never started, and re-reading the record to get a
+    `run_id` would agree with whatever currently owns the key — precisely the successor the fence
+    exists to spare. So `QueueItem` carries the `run_id` `_register_or_watch!` minted for it. The
+    rule generalises: a fence value must come from *before* the window it guards, never from
+    inside it.
 - **`shutdown!` drains, within a bound, and releases only what settled**
   ([#176](https://github.com/PingoLee/Nitro.jl/issues/176)). It sets every in-flight run's
   cancellation token **first**, waits up to `drain_timeout` seconds, then deletes the handles of
@@ -231,6 +237,26 @@ is also what keeps a genuine process crash recoverable.
   `recover_zombie_tasks!` declaring a live run dead; `_finish_task!` reclaims it when the callback
   returns. The sweep touches `active_tasks` only — `active_task_infos` stays populated, or a run
   outliving a teardown would be uncancellable.
+  - **A teardown stops the queues FETCHING before it drains the runs**
+    ([#182](https://github.com/PingoLee/Nitro.jl/issues/182)). Closing a channel only stops
+    submissions; the processor kept working through the buffer, so a teardown started runs that
+    were never in the snapshot — no token, no wait, `RUNNING` rows nothing awaited. `shutdown!` now
+    sets `queue.draining`, closes, **collects the buffer**, and records every collected item
+    `CANCELLED` / `"Cancelled by worker shutdown"`. Three rules hold it together:
+    - **`draining` lives on the `SequentialQueue`, never on the `WorkerRuntime`.** A runtime-level
+      flag would need resetting for the documented shutdown-then-reuse case, and the reset races a
+      concurrent submit. `shutdown!` empties the registry, so a reused runtime mints queues that
+      are not draining *by construction*.
+    - **Set `draining` → close → collect, in that order.** `put!` on a closed channel throws, so
+      collecting after the close is airtight; collecting first leaves a window for a submit.
+    - **The abandon write happens OUTSIDE `queue_lock`.** It is a store write, and the processor
+      takes the store lock (`_finish_task!`) and then `queue_lock` (its `finally`) — holding
+      `queue_lock` across a store write is that pair inverted. One `lock_tasks` for the batch.
+
+    It is **unconditional, including at `drain_timeout = 0`**: that keyword means *do not wait*,
+    and abandoning a backlog costs no wait. It is the one respect in which `0` is no longer
+    byte-for-byte pre-#176. The return value is unaffected — it still means *did every in-flight
+    run settle*, and abandoned items are terminal before it returns.
   - **In `_run_settled`, the info clause is what terminates every production wait; `istaskdone` is
     a backstop.** A real run clears both caches through `_deregister_run!` *before* its task
     completes, so for anything `register_run!` published, clause 2 always fires first — on the
@@ -265,26 +291,43 @@ is also what keeps a genuine process crash recoverable.
   the process in `jl_finish_task` — which is what blocked worker bodies from moving to
   `Threads.@spawn` ([#127](https://github.com/PingoLee/Nitro.jl/issues/127),
   [#30](https://github.com/PingoLee/Nitro.jl/issues/30)). Cancellation is a **token** the callback
-  polls (`cancel_requested`). Four things set it: `cancel_task`, an expired
-  `TaskOptions(timeout=…)`, `_register_or_watch!` displacing a still-executing predecessor on a
-  re-run, and a teardown drain (the `shutdown!` bullet above, #176). Never reintroduce the
-  injection, and do not add a public setter for the token: `cancel_task` is the authorized path,
-  and a second route into it would bypass both the authorization check and the status CAS — those
-  four are not that route, because none of them takes a caller-supplied identity. The token is
-  process-local and never reset — a re-run gets a fresh `TaskInfo`.
+  polls (`cancel_requested`). Four things set it — `cancel_task` (`:user`), an expired
+  `TaskOptions(timeout=…)` (`:timeout`), `_register_or_watch!` displacing a still-executing
+  predecessor on a re-run (`:superseded`), and a teardown drain (`:shutdown`, the `shutdown!`
+  bullet above, #176) — and since
+  [#183](https://github.com/PingoLee/Nitro.jl/issues/183) the token **carries which**. Never
+  reintroduce the injection, and do not add a public setter for the token: `cancel_task` is the
+  authorized path, and a second route into it would bypass both the authorization check and the
+  status CAS — those four are not that route, because none of them takes a caller-supplied
+  identity. The token is process-local and never reset — a re-run gets a fresh `TaskInfo`.
+  - **The reason IS the token — `@atomic cancel_reason::Symbol`, `:none` for "not cancelled".**
+    Not a second field beside a `Bool`, because two atomics need every setter to write
+    reason-before-flag or a reader sees a set token with no cause, and a convention across four
+    sites plus every future one is not a shape a test can hold. `cancel_requested(t)` is exactly
+    `cancel_reason(t) !== :none`.
+  - **`_request_cancel!` is the only writer, it is private, and the FIRST cause wins.** It is a
+    CAS off `:none`, not an assignment: a drain fires on every in-flight run at once, so
+    last-write-wins would make a shutdown the likeliest final writer and would overwrite a
+    person's cancel. Keep it unexported — a public setter for the reason would be exactly the
+    second route into the token the bullet above forbids.
+  - **`_cancel_task!` renders the stored message from the reason and takes no `message`.** That
+    parameter is what let `api.jl` and `queue.jl` record different text for one event; deleting it
+    is why they cannot diverge again. Add a new cause to `CANCEL_REASONS` and `_cancel_message`
+    together, never a new string at a call site.
 - **A drain writes no terminal state of its own, but it still decides one.** `cancel_task` claims
   `CANCELLED` before setting the token and an expired deadline throws; a drain claims nothing,
   because a terminal write there would race the run's own — the #88/#108 failure mode. What the run
   then records is its own doing: `COMPLETED` with whatever it returns, `FAILED` if it throws with
   no retry left, **or `CANCELLED` if the token lands while it is parked in the retry backoff**,
-  which polls the same token. That last one is worth knowing before you document this contract
-  anywhere: reaching a terminal state there is right (better than a job restarting mid-teardown),
-  but the stock message names a user who did nothing, and the record cannot distinguish a person's
-  cancel from a shutdown's. **The message is not even the same on both paths** — `api.jl` passes
-  `"Cancelled by user"`, `queue.jl` takes `_cancel_task!`'s `"Cancelled"` default. That asymmetry
-  predates #176 and looks accidental; do not write either string into documentation as though it
-  were the one. Do not "fix" the race by pre-claiming a
-  status; if the provenance matters, that is a reason on the token, not a write from the drain.
+  which polls the same token. Reaching a terminal state there is right — better than a job
+  restarting mid-teardown — and since #183 the record says so: the drain sets `:shutdown`, so that
+  run stores `"Cancelled by worker shutdown"` on **both** submit paths. Do not "fix" the race by
+  pre-claiming a status from the drain; the provenance rides on the token, which is what #183 did.
+  - Before #183 this stored `"Cancelled by user"` on the async path and `"Cancelled"` on the
+    sequential one — and the string naming a user was reachable *only* from a shutdown, since
+    every other cause either claims the record first or loses the `run_id` fence, leaving the
+    run's own write to lose its CAS. Worth remembering when reading pre-#183 records: there, a
+    `CANCELLED` task whose error says "by user" was almost certainly a deploy.
 - **A timeout bounds the wait, not the work, and is never retried.** Nothing stops the attempt
   that timed out, so retrying it runs a second copy of the callback beside the first against one
   `task_info`. `TaskTimeoutError` is terminal on the first attempt.
