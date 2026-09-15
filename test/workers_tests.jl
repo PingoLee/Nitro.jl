@@ -218,7 +218,7 @@ end
           length(Nitro.Workers.WORKER_STORE_INTERFACE) - 1
 end
 
-@testset "shutdown! releases the scheduler, the queues and the active handles (#167)" begin
+@testset "shutdown! releases the scheduler, the queues and every settled handle (#167, #176)" begin
     store = InMemoryWorkerStore()
     rt_store = WorkerRuntime(store)
 
@@ -238,11 +238,19 @@ end
 
         # A run handle and its live object, as an executing task would have published them.
         # The two must be treated differently below, which is the whole point of the pairing.
+        #
+        # `wait` before the teardown, deliberately. Since #176 a handle is released only once its
+        # task is DONE, so "the handles are gone" is now a claim about a finished task -- and
+        # letting `shutdown!`'s own yielding be what completes this one would make the assertion
+        # below true by timing rather than by contract, and silently false the next time this
+        # function yields less. A handle that is still live is covered by its own testset.
         in_flight = TaskInfo("in-flight")
-        Nitro.Workers.register_active_task!(rt_store, "in-flight", @async nothing)
+        settled_handle = @async nothing
+        wait(settled_handle)
+        Nitro.Workers.register_active_task!(rt_store, "in-flight", settled_handle)
         Nitro.Workers.register_active_task_info!(rt_store, "in-flight", in_flight)
 
-        shutdown!(rt_store)
+        @test shutdown!(rt_store) == true
 
         # The scheduler is stopped AND its slot cleared, so a restart does not see a dead one.
         @test get_cleanup_scheduler(rt_store)[] === nothing
@@ -276,6 +284,505 @@ end
         reset_runtime!(rt_store)
     end
 end
+
+@testset "Graceful worker drain (#176)" begin
+    # Every callback below PARKS -- on the cancellation token via `timedwait`, or on a
+    # `Base.Event` the test releases. None of them spins. #143 records that a CPU-bound spin
+    # probe wedges the ReTestItems worker into its 600s timeout on roughly half of `-t 2` runs
+    # once the full suite is around it, and a drain needs no spinning to be observable.
+    #
+    # Elapsed-time bounds are deliberately loose. The first `@warn` on the expiry path compiles
+    # inside the measured region and can cost a second on its own, so timing is only ever used
+    # to separate "waited" from "did not wait" -- never to pin a duration. The contract itself
+    # is asserted through state.
+
+    @testset "a cooperative run finishes inside the drain" begin
+        store = InMemoryWorkerStore()
+        rt = WorkerRuntime(store)
+        entered = Base.Event()
+        saw_token = Threads.Atomic{Bool}(false)
+        try
+            id = submit_task("coop", function (task_info)
+                notify(entered)
+                # Parks until asked to stop -- the shape the tutorial documents.
+                timedwait(() -> cancel_requested(task_info), 10.0; pollint=0.02)
+                saw_token[] = cancel_requested(task_info)
+                return "stopped early"
+            end, Owner("u"); runtime=rt)
+
+            wait(entered)
+            @test get_task_status(id, Owner("u"); runtime=rt)[:status] == "RUNNING"
+
+            # The whole point: when this returns, the run is over. Before #176 `shutdown!`
+            # returned with the callback still parked and the record still RUNNING.
+            @test shutdown!(rt) == true
+            @test get_task_status(id, System(); runtime=rt)[:status] == "COMPLETED"
+            @test isempty(rt.active_tasks)
+
+            # The token is set BEFORE the wait, not as a parting nudge on expiry. Were it set
+            # afterwards, the callback above could never have returned in time.
+            @test saw_token[] == true
+        finally
+            reset_runtime!(rt)
+        end
+    end
+
+    @testset "a run that outlives the drain keeps its handle, so the sweep spares it" begin
+        # THE issue. Against the pre-#176 `empty!(active_tasks)` the handle is gone here, the
+        # sweep counts 1, the record reads FAILED, and the callback's real result is discarded
+        # when its own run-fenced write loses.
+        store = InMemoryWorkerStore()
+        rt = WorkerRuntime(store)
+        entered = Base.Event()
+        release = Base.Event()
+        try
+            id = submit_task("uncoop", function (task_info)
+                notify(entered)
+                wait(release)            # never polls the token
+                return "finished anyway"
+            end, Owner("u"); runtime=rt)
+
+            wait(entered)
+            @test shutdown!(rt; drain_timeout=0.2) == false
+
+            @test get_active_task(rt, id) !== nothing
+            @test recover_zombie_tasks!(; runtime=rt) == 0
+            @test get_task_status(id, System(); runtime=rt)[:status] == "RUNNING"
+
+            # Keeping the handle is a deferral, not a leak: the run reclaims it through
+            # `_finish_task!` the moment the callback actually returns.
+            notify(release)
+            @test wait_for(() -> get_active_task(rt, id) === nothing) == :ok
+            @test wait_for(() -> get_task_status(id, System(); runtime=rt)[:status] ==
+                                 "COMPLETED") == :ok
+        finally
+            notify(release)
+            reset_runtime!(rt)
+        end
+    end
+
+    @testset "drain_timeout=0 is the pre-#176 behaviour, exactly" begin
+        store = InMemoryWorkerStore()
+        rt = WorkerRuntime(store)
+        entered = Base.Event()
+        release = Base.Event()
+        token_at_exit = Threads.Atomic{Bool}(true)
+        returned = Threads.Atomic{Bool}(false)
+        try
+            submit_task("old-way", function (task_info)
+                notify(entered)
+                wait(release)
+                token_at_exit[] = cancel_requested(task_info)
+                returned[] = true
+                return "x"
+            end, Owner("u"); runtime=rt)
+
+            wait(entered)
+            started = time()
+            # `false`, because it abandoned a live run rather than settling it -- the same thing
+            # `_shutdown_server` reports when `timeout = 0` sends it straight to a force-close.
+            @test shutdown!(rt; drain_timeout=0) == false
+            @test time() - started < 2.0          # did not wait on anything
+
+            # Handles dropped, so the sweep still declares the live run dead. That is the old
+            # damage, kept reachable on purpose as the documented escape hatch.
+            @test isempty(rt.active_tasks)
+            @test recover_zombie_tasks!(; runtime=rt) == 1
+
+            # And no token was set: asking a callback to abandon work on the way out of a
+            # teardown that was never going to wait for the answer is pure harm.
+            notify(release)
+            @test wait_for(() -> returned[]) == :ok
+            @test token_at_exit[] == false
+        finally
+            notify(release)
+            reset_runtime!(rt)
+        end
+    end
+
+    @testset "a sequential run settles on its info, not on the shared processor task" begin
+        # The sequential path registers `current_task()` -- the long-lived queue processor. If
+        # `_run_settled` probed only `istaskdone`, this drain could not finish until the
+        # processor had also worked through `b`, which is parked on an Event the test holds.
+        store = InMemoryWorkerStore()
+        rt = WorkerRuntime(store)
+        owner = Owner("u")
+        hold = Base.Event()
+        try
+            a = submit_sequential_task("q", "a", function (task_info)
+                timedwait(() -> cancel_requested(task_info), 10.0; pollint=0.02)
+                return "a"
+            end, owner; runtime=rt)
+            submit_sequential_task("q", "b", (task_info) -> (wait(hold); "b"), owner; runtime=rt)
+
+            @test wait_for(() -> get_task_status(a, owner; runtime=rt)[:status] == "RUNNING") == :ok
+
+            started = time()
+            @test shutdown!(rt; drain_timeout=8.0) == true
+            @test time() - started < 8.0           # did not ride the ceiling out
+            @test get_task_status(a, System(); runtime=rt)[:status] == "COMPLETED"
+        finally
+            notify(hold)
+            reset_runtime!(rt)
+        end
+    end
+
+    @testset "the release sweep is fenced, so it cannot evict a successor's handle" begin
+        # White-box, because the interleaving it guards is not reachable deterministically from
+        # outside: the drain spans seconds, so a snapshotted run can finish and a re-run publish
+        # a NEW run under the same key entirely inside the window. An id-keyed delete would then
+        # tear down the live successor -- the #108/#167 defect through a much wider door.
+        store = InMemoryWorkerStore()
+        rt = WorkerRuntime(store)
+        park = Base.Event()
+        try
+            predecessor = TaskInfo("alice::drain-fence")
+            predecessor.status = RUNNING
+            replace_task!(store, predecessor.id, predecessor)
+            finished = @async nothing
+            wait(finished)
+            snapshot = [Nitro.Workers.DrainEntry(predecessor.id, predecessor.run_id,
+                                                 predecessor, finished)]
+
+            # The successor takes over the key while the "drain" is notionally still waiting.
+            successor = TaskInfo("alice::drain-fence")
+            successor.status = RUNNING
+            replace_task!(store, successor.id, successor)
+            successor_handle = @async wait(park)
+            register_run!(rt, successor.id, successor, successor_handle)
+
+            Nitro.Workers._release_settled_handles!(rt, snapshot)
+
+            @test get_active_task(rt, "alice::drain-fence") === successor_handle
+            @test recover_zombie_tasks!(; runtime=rt) == 0
+            @test get_task_info(store, "alice::drain-fence").status == RUNNING
+        finally
+            notify(park)
+            reset_runtime!(rt)
+        end
+    end
+
+    @testset "the drain releases handles but never the live TaskInfo cache" begin
+        # `cancel_task` resolves a run's live object through `active_task_infos`, so a teardown
+        # that cleared it would make a run outliving the teardown uncancellable. The sweep is
+        # `active_tasks`-only for exactly that reason.
+        store = InMemoryWorkerStore()
+        rt = WorkerRuntime(store)
+        try
+            info = TaskInfo("settled")
+            handle = @async nothing
+            wait(handle)
+            register_run!(rt, "settled", info, handle)
+
+            @test shutdown!(rt) == true
+            @test get_active_task(rt, "settled") === nothing
+            @test get_active_task_info(rt, "settled") === info
+        finally
+            reset_runtime!(rt)
+        end
+    end
+
+    @testset "shutdown! from inside a callback does not wait for its own run" begin
+        # Reachable through `resetstate()` and through an app callback calling `terminate()`.
+        # The caller's run cannot settle while it is blocked in the wait, so without the
+        # re-entrancy skip this stalls for the whole window and then warns about itself.
+        #
+        # `task === current_task()` alone does NOT catch it: with a deadline (the default)
+        # `timeout_call` runs the callback on a child task while the registered handle is the
+        # parent parked in `timedwait`. The task-local `CURRENT_RUN_KEY` marker closes that.
+        store = InMemoryWorkerStore()
+        rt = WorkerRuntime(store)
+        elapsed = Threads.Atomic{Float64}(-1.0)
+        try
+            submit_task("self-teardown", function (task_info)
+                started = time()
+                shutdown!(rt; drain_timeout=8.0)
+                elapsed[] = time() - started
+                return "ok"
+            end, Owner("u"); runtime=rt)
+
+            @test wait_for(() -> elapsed[] >= 0; timeout=20.0) == :ok
+            @test elapsed[] < 8.0
+        finally
+            reset_runtime!(rt)
+        end
+    end
+
+    @testset "reset_runtime! does not drain by default, but honours drain_timeout" begin
+        store = InMemoryWorkerStore()
+        rt = WorkerRuntime(store)
+        entered = Base.Event()
+        release = Base.Event()
+        token_at_exit = Threads.Atomic{Bool}(true)
+        returned = Threads.Atomic{Bool}(false)
+        try
+            submit_task("reset-me", function (task_info)
+                notify(entered)
+                wait(release)
+                token_at_exit[] = cancel_requested(task_info)
+                returned[] = true
+                return "x"
+            end, Owner("u"); runtime=rt)
+            wait(entered)
+
+            # A reset is TOTAL -- it erases the live cache and, here, the records themselves --
+            # so waiting for an outcome it is about to delete buys nothing. It also keeps every
+            # `finally` in this file, and `resetstate()`, off the drain path.
+            started = time()
+            reset_runtime!(rt)
+            @test time() - started < 2.0
+            @test isempty(rt.active_tasks)
+            @test isempty(rt.active_task_infos)
+
+            # "Returned fast with both dicts empty" is ALSO true of the pre-#176 code, which never
+            # drained and always emptied both -- so on its own it constrains nothing. The token is
+            # what discriminates: a reset that had drained would have set it.
+            notify(release)
+            @test wait_for(() -> returned[]) == :ok
+            @test token_at_exit[] == false
+        finally
+            notify(release)
+            reset_runtime!(rt)
+        end
+
+        rt2 = WorkerRuntime(InMemoryWorkerStore())
+        entered2 = Base.Event()
+        drained_at = Threads.Atomic{Bool}(false)
+        try
+            submit_task("reset-drain", function (task_info)
+                notify(entered2)
+                timedwait(() -> cancel_requested(task_info), 10.0; pollint=0.02)
+                drained_at[] = cancel_requested(task_info)
+                return "x"
+            end, Owner("u"); runtime=rt2)
+            wait(entered2)
+
+            reset_runtime!(rt2; drain_timeout=8.0)
+            # It waited: the callback had returned before the reset did.
+            @test drained_at[] == true
+            @test isempty(rt2.active_tasks)
+        finally
+            reset_runtime!(rt2)
+        end
+    end
+
+    @testset "uninstall! drains, and displacement drains the runtime it displaces" begin
+        app = Nitro.Core.App()
+        rt_a = WorkerRuntime(InMemoryWorkerStore())
+        entered = Base.Event()
+        try
+            start!(app; runtime=rt_a, cleanup_enabled=false, recover_zombies=false)
+            id = submit_task("via-app", function (task_info)
+                notify(entered)
+                timedwait(() -> cancel_requested(task_info), 10.0; pollint=0.02)
+                return "done"
+            end, Owner("u"); runtime=rt_a)
+            wait(entered)
+
+            uninstall!(app)
+            @test get_task_status(id, System(); runtime=rt_a)[:status] == "COMPLETED"
+            @test worker_runtime(app) === nothing
+        finally
+            reset_runtime!(rt_a)
+        end
+
+        # Displacement is the teardown-then-restart-in-one-process shape: `start!` runs the
+        # zombie sweep against the SAME store microseconds later, so not draining here is the
+        # bug firing immediately.
+        app2 = Nitro.Core.App()
+        shared = InMemoryWorkerStore()
+        rt_b = WorkerRuntime(shared)
+        rt_c = WorkerRuntime(shared)
+        entered2 = Base.Event()
+        try
+            install!(app2, rt_b)
+            id2 = submit_task("displaced", function (task_info)
+                notify(entered2)
+                timedwait(() -> cancel_requested(task_info), 10.0; pollint=0.02)
+                return "done"
+            end, Owner("u"); runtime=rt_b)
+            wait(entered2)
+
+            install!(app2, rt_c)
+            @test get_task_status(id2, System(); runtime=rt_c)[:status] == "COMPLETED"
+            @test recover_zombie_tasks!(; runtime=rt_c) == 0
+        finally
+            reset_runtime!(rt_b)
+            reset_runtime!(rt_c)
+        end
+    end
+
+    @testset "worker_startup's shutdown hook carries drain_timeout" begin
+        # The kwarg has to survive being captured by `startup`'s `on_shutdown` closure; that is
+        # the only path a served app ever takes.
+        app = Nitro.Core.App()
+        rt = WorkerRuntime(InMemoryWorkerStore())
+        entered = Base.Event()
+        try
+            lifecycle = Nitro.Workers.startup(app; runtime=rt, cleanup_enabled=false,
+                                              recover_zombies=false, drain_timeout=8.0)
+            Nitro.Core.Types.startup(lifecycle)
+
+            id = submit_task("served", function (task_info)
+                notify(entered)
+                timedwait(() -> cancel_requested(task_info), 10.0; pollint=0.02)
+                return "done"
+            end, Owner("u"); runtime=rt)
+            wait(entered)
+
+            Nitro.Core.Types.shutdown(lifecycle)
+            @test get_task_status(id, System(); runtime=rt)[:status] == "COMPLETED"
+        finally
+            reset_runtime!(rt)
+        end
+    end
+
+    @testset "drain_timeout is validated, and a quiet runtime tears down silently" begin
+        rt = WorkerRuntime(InMemoryWorkerStore())
+        try
+            @test_throws ArgumentError shutdown!(rt; drain_timeout=-1)
+            # Nothing in flight: no wait, no warning. This is the path every `finally` in this
+            # file takes, so it has to stay free.
+            @test (@test_logs shutdown!(rt)) == true
+            @test (@test_logs shutdown!(rt; drain_timeout=0)) == true
+        finally
+            reset_runtime!(rt)
+        end
+    end
+
+    @testset "a drain landing in the retry backoff ends the run CANCELLED" begin
+        # The drain writes no terminal state itself, but it still decides one: the retry backoff
+        # polls the SAME token (`api.jl`, `queue.jl`), so a shutdown landing inside one exits the
+        # backoff and takes the `_cancel_task!` branch -- recording `CANCELLED` with the stock
+        # "Cancelled by user", for a shutdown no user asked for.
+        #
+        # Pinned rather than fixed. Reaching a terminal state there is the useful outcome (the
+        # alternative is a job restarting mid-teardown), and making the record say *which* kind of
+        # stop it was needs a reason carried on the token, which is a separate change. This test
+        # exists so the documents describing this contract cannot drift from it silently.
+        store = InMemoryWorkerStore()
+        rt = WorkerRuntime(store)
+        entered = Base.Event()
+        attempts = Threads.Atomic{Int}(0)
+        try
+            id = submit_task("retrying", function (task_info)
+                Threads.atomic_add!(attempts, 1)
+                attempts[] == 1 && notify(entered)
+                error("transient failure")
+            end, Owner("u"); options=TaskOptions(retry_on_failure=true, max_retries=2), runtime=rt)
+
+            wait(entered)
+            # No further synchronisation, and none is available: `notify` fires inside attempt 1,
+            # so anything polling `attempts[] == 1` here is a tautology that would only look like
+            # a guarantee. What actually holds the test up is that the outcome is the SAME on
+            # either side of the throw -- if the token lands before the exception finishes
+            # unwinding, the catch block runs, the record is still RUNNING, it is not a timeout,
+            # a retry remains, and the backoff's `while` condition is evaluated before its first
+            # `sleep`, so an already-set token falls straight through to the same `_cancel_task!`.
+            # The budget is the 2s first backoff, which these adjacent statements cannot outrun.
+            @test shutdown!(rt; drain_timeout=3.0) == true
+
+            status = get_task_status(id, System(); runtime=rt)
+            @test status[:status] == "CANCELLED"
+            @test status[:error] == "Cancelled by user"     # the ASYNC path's message
+            # And it did NOT run a second attempt: the backoff bailed instead of retrying.
+            @test attempts[] == 1
+        finally
+            reset_runtime!(rt)
+        end
+
+        # The sequential path records a DIFFERENT string -- `queue.jl` takes `_cancel_task!`'s
+        # `"Cancelled"` default where `api.jl` passes `"Cancelled by user"`. The asymmetry
+        # predates #176 and looks accidental, but the upgrade note tells operators what a drained
+        # job looks like in their records, so both strings are pinned rather than one.
+        store_q = InMemoryWorkerStore()
+        rt_q = WorkerRuntime(store_q)
+        owner_q = Owner("u")
+        entered_q = Base.Event()
+        attempts_q = Threads.Atomic{Int}(0)
+        try
+            qid = submit_sequential_task("retry-q", "retrying", function (task_info)
+                Threads.atomic_add!(attempts_q, 1)
+                attempts_q[] == 1 && notify(entered_q)
+                error("transient failure")
+            end, owner_q; options=TaskOptions(retry_on_failure=true, max_retries=2), runtime=rt_q)
+
+            wait(entered_q)
+            @test shutdown!(rt_q; drain_timeout=3.0) == true
+
+            status_q = get_task_status(qid, System(); runtime=rt_q)
+            @test status_q[:status] == "CANCELLED"
+            @test status_q[:error] == "Cancelled"           # NOT "Cancelled by user"
+            @test attempts_q[] == 1
+        finally
+            reset_runtime!(rt_q)
+        end
+    end
+
+    @testset "the run marker is restored, so a long-lived task carries no stale one" begin
+        # `_invoke_task_callback` marks the executing task with its run id and restores the
+        # previous value on the way out. With `TaskOptions(timeout=0)` the callback runs directly
+        # on the long-lived sequential queue PROCESSOR, so without the restore that processor
+        # keeps a finished run's id between items -- and an entry wrongly skipped from a drain's
+        # snapshot is never token-set, never waited for, and has its handle released, which is
+        # #176 itself arriving silently.
+        #
+        # Asserted against the processor task's own storage, because that is the task that
+        # outlives a run. Reading `task_local_storage()` from inside a callback would prove
+        # nothing: the marker for the *current* run is written before the callback is invoked, so
+        # it reads the same with or without the restore.
+        store = InMemoryWorkerStore()
+        rt = WorkerRuntime(store)
+        owner = Owner("u")
+        marker_during = Ref{Any}(:unset)
+        try
+            id = submit_sequential_task("marker-q", "one", function (task_info)
+                marker_during[] = Base.get(task_local_storage(),
+                                           Nitro.Workers.CURRENT_RUN_KEY, :absent)
+                return "one"
+            end, owner; options=TaskOptions(timeout=0), runtime=rt)
+            @test wait_for(() -> get_task_status(id, owner; runtime=rt)[:status] ==
+                                 "COMPLETED") == :ok
+
+            # Set while the callback ran...
+            @test marker_during[] isa Base.UUID
+
+            # ...and gone once it returned. `processor_task` is the task the callback ran on,
+            # since `timeout=0` bypasses `timeout_call`'s child.
+            processor = get_sequential_queues(rt)["marker-q"].processor_task
+            @test processor !== nothing
+            storage = processor.storage
+            @test storage === nothing || !haskey(storage, Nitro.Workers.CURRENT_RUN_KEY)
+        finally
+            reset_runtime!(rt)
+        end
+    end
+    @testset "a run that ends without a terminal write still releases its handle" begin
+        # `TaskOptions` does not validate `max_retries`, so `retry_on_failure=true` with a
+        # negative count is reachable: `for retry_count in 0:-1` never runs, and the execute
+        # path returns having written no terminal state at all. Before #176 wrapped that path in
+        # `try`/`finally`, the registration leaked -- and `shutdown!`'s unconditional
+        # `empty!(active_tasks)` swept the orphan up by accident. Now that a teardown KEEPS live
+        # handles, such an orphan could never settle: every later teardown on this runtime would
+        # burn its whole window and then warn about a run that ended long ago.
+        store = InMemoryWorkerStore()
+        rt = WorkerRuntime(store)
+        try
+            submit_task("no-terminal-write", () -> "never reached", Owner("u");
+                        options=TaskOptions(retry_on_failure=true, max_retries=-1), runtime=rt)
+
+            @test wait_for(() -> isempty(rt.active_tasks)) == :ok
+            @test isempty(rt.active_task_infos)
+
+            started = time()
+            @test (@test_logs shutdown!(rt)) == true
+            @test time() - started < 2.0
+        finally
+            reset_runtime!(rt)
+        end
+    end
+end
+
 
 @testset "a store that implements no lifecycle method at all still works (#167)" begin
     # The inversion of #29/#166. That pair made `shutdown!` a REQUIRED store method, so a

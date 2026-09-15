@@ -127,6 +127,7 @@ serve(
             cleanup_interval_hours=24,
             cleanup_retain_days=7,
             recover_zombies=true, # Automatically fails tasks stuck in RUNNING on process crashes
+            drain_timeout=5,      # Seconds to wait for in-flight tasks on shutdown; 0 to skip
         ),
     ],
 )
@@ -190,14 +191,64 @@ Policy stays on the store, so those two apps correctly share one security postur
 set_queue_authorizer!(worker_store(app), my_queue_authorizer)
 ```
 
-!!! warning "Teardown releases; it does not drain"
-    `shutdown!` — which `uninstall!` and the `worker_startup` middleware both call on server
-    stop — does not wait for runs still executing, because nothing can stop a Julia task;
-    cancellation is a token the callback polls. It drops the run handles, and
-    `recover_zombie_tasks!` decides liveness from exactly those, so a run still executing across
-    a teardown/restart **in one process** (a dev reload, several apps per process, a test suite
-    resetting between cases) is marked `FAILED` and its real result is discarded. Let in-flight
-    tasks finish first, or start with `recover_zombies=false`.
+### Teardown drains, within a bound
+
+`shutdown!` — which `uninstall!` and the `worker_startup` middleware both call on server stop —
+asks every run still executing to stop, then waits up to `drain_timeout` seconds for them. It
+returns `true` if they all finished and `false` if the wait expired.
+
+```julia
+serve(middleware=[worker_startup(queues=["reports"], drain_timeout=5)])
+```
+
+Nothing can *stop* a Julia task, so the request half is the cancellation token — the same one
+`cancel_task` sets. A callback that polls it finishes inside the window; one that does not is
+abandoned when the window closes, keeps its thread until it returns, and logs a warning naming it.
+
+**Set `drain_timeout=0` for the old release-immediately behaviour.** That skips both the token and
+the wait.
+
+!!! warning "The worker drain and the HTTP drain add up"
+    `terminate()` runs every lifecycle shutdown hook — `worker_startup`'s among them — *before* it
+    closes the listener and drains in-flight requests. So worst-case process exit is
+    `drain_timeout` **plus** `serve(shutdown_timeout = …)`, 15 seconds with both defaults. Size
+    them together against your container's stop grace period.
+
+Two limits worth knowing:
+
+- A run abandoned past the deadline **keeps its handle registered**, so `recover_zombie_tasks!`
+  will not declare it dead — but that only helps a runtime that is *reused*. A
+  `serve → terminate → serve` cycle with `store=` builds a fresh `WorkerRuntime` each time, whose
+  handles start empty; there, finishing the run inside the drain is the only thing that saves it.
+- Closing a sequential queue stops new submissions but the processor still works through what is
+  already buffered, so runs can start during and after the drain. They get neither the token nor
+  the wait.
+
+The drain claims no terminal state itself — that write would race the run's own — so a drained run
+records whatever it reaches on its own:
+
+| The run was… | It records |
+|---|---|
+| running its callback, which returns on the token | `COMPLETED`, carrying whatever it returned |
+| running its callback, which throws | `FAILED` with that message (or a retry, if one is left) |
+| parked **between retries**, in the cancellation-aware backoff | `CANCELLED` — error `"Cancelled by user"` on the async path, `"Cancelled"` on a sequential queue |
+
+The third row is easy to miss: the retry backoff polls this same token, so a shutdown landing
+inside one ends the run as cancelled. Reaching a terminal state there is the useful outcome —
+better than a job restarting during teardown — but the status alone cannot tell you a person's
+cancel from a shutdown's, and the error text is no help either: it differs by path and names a user
+on neither. Put anything you need to recognise later into the value you return:
+
+```julia
+submit_task("import", task_info -> begin
+    for chunk in chunks
+        # Returns COMPLETED carrying a result the caller can recognise as partial.
+        cancel_requested(task_info) && return (done=done, total=total, truncated=true)
+        process(chunk)
+    end
+    return "done"
+end, Owner("user-1"))
+```
 
 ## Polling Task Status
 
@@ -753,6 +804,12 @@ To protect databases from stuck `RUNNING` tasks when a server or worker process 
 * For each task, it checks if there is a live, in-memory execution thread running in the current process.
 * If there is no live execution (meaning the task is a "zombie" orphaned by a previous crash), it marks the task status as `FAILED` with the error: `"Worker process terminated unexpectedly mid-execution."`
 * By default, automatic recovery is enabled (`recover_zombies=true`).
+
+The sweep is process-local: it asks whether *this* runtime holds a live handle for the task. Since
+the teardown drain (see *Teardown drains, within a bound*, above) keeps
+the handle of a run it could not finish, restarting a **reused** runtime no longer marks such a run
+`FAILED`. A restart that builds a *new* runtime still sweeps it, because handles never cross
+runtimes — which is also why a genuine crash is still recovered.
 
 ## When Not To Use Workers
 
