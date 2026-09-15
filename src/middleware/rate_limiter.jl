@@ -266,6 +266,10 @@ function _cleanup_loop(token::Ref{Bool}, stripes::Vector{<:_Stripe},
         try
             _sweep_expired!(stripes, cleanup_threshold, now(UTC))
         catch e
+            # Rethrow guard, per the idiom in src/utilities/misc.jl and src/types.jl: a
+            # catch-all that eats `InterruptException` makes Ctrl-C during a sweep a no-op.
+            # The window is narrow (the `sleep` is outside the `try`), but the guard is free.
+            e isa InterruptException && rethrow()
             @error "Nitro.RateLimiter: bucket cleanup sweep failed" exception=(e, catch_backtrace())
         end
     end

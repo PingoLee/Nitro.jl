@@ -374,7 +374,6 @@ end # @testitem
 @testitem "RateLimiter — a throwing cleanup sweep costs one tick, not all of them" tags=[:middleware, :slow] setup=[NitroCommon] begin
 using Test
 using Dates
-using Suppressor
 using Nitro
 using Nitro.Core.Middleware.RateLimiterMiddleware: BucketKey, _Stripe, _cleanup_loop
 
@@ -422,8 +421,16 @@ Base.delete!(s::FlakyBucketStore, k)     = (delete!(s.inner, k); s)
     stripes = [_Stripe(ReentrantLock(), store)]
 
     token = Ref(true)
-    task = @suppress_err Threads.@spawn _cleanup_loop(token, stripes, Millisecond(20),
-                                                      Minute(10))
+    # Silence the loop's OWN logger, not the spawn expression: `@suppress_err` restores stderr
+    # the moment `Threads.@spawn` hands back the Task, microseconds before the first tick, so
+    # it would leave all three deliberate `@error` lines (with backtraces) in the worker log.
+    # ReTestItems flushes that log when an item goes red — exactly when the one line that
+    # matters must not be buried under failures the test caused on purpose.
+    # `Base.CoreLogging`, not `using Logging`: Logging is not a declared test dependency, and
+    # adding one for a null logger would trip the Aqua [compat] guard for no reason.
+    task = Threads.@spawn Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
+        _cleanup_loop(token, stripes, Millisecond(20), Minute(10))
+    end
     try
         # The assertion that fails against the unpatched code: the loop must survive its three
         # throwing ticks and still reap afterwards.
@@ -437,15 +444,24 @@ Base.delete!(s::FlakyBucketStore, k)     = (delete!(s.inner, k); s)
     @test timedwait(() -> istaskdone(task), 10.0) === :ok
 end
 
-@testset "the spawned task is monitored, so a fatal death is not silent" begin
-    # `errormonitor` returns its argument, which is what keeps `on_startup`'s documented
-    # "returns the Task it spawned" contract intact. Assert the wiring end-to-end rather than
-    # the log line, which errormonitor emits asynchronously on a task nothing waits on.
+@testset "the sweep is spawned migratable, not pinned to a request thread" begin
+    # #169 chose `Threads.@spawn` over `@async`, diverging from the issue's own lean, and that
+    # choice had NO test: `t isa Task` and `timedwait(istaskdone)` pass identically against the
+    # old `@async` version, and both are already covered by the restart testitem above. The
+    # `sticky` flag is what actually discriminates — `@async` pins the task to the spawning
+    # thread for life (`sticky == true`), which for this O(total-buckets) sweep means a
+    # request-handling thread. Without this assertion, "simplifying" it back to `@async` is a
+    # green run.
+    #
+    # `errormonitor` itself is deliberately NOT asserted here. Its only observable effect is an
+    # async log on a fatal death, which the per-tick `try` above now prevents from happening at
+    # all; there is no seam to observe it through that would not be theater.
     lf = RateLimiter(rate_limit = 5, window = Second(1),
                      cleanup_period = Millisecond(50), cleanup_threshold = Millisecond(50))
     t = lf.on_startup()
     try
         @test t isa Task
+        @test t.sticky === false
     finally
         lf.on_shutdown()
     end
