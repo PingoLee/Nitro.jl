@@ -467,6 +467,47 @@ end
     @test qerr.cause isa Exception
     @test !occursin("Caused by", sprint(showerror, qerr))
 
+    # #132: the query KEY is percent-decoded client input, unlike the path-parameter name just
+    # above, and it was interpolated into `.msg` raw -- which #72 put on the `@debug` log path.
+    # `?a%0AFAKE=%80` therefore wrote a literal newline into a log field.
+    #
+    # `isvalid(k)` alone would NOT have caught this: `isvalid("a\nFAKE") === true`, so the fix
+    # escapes through `repr` instead. The assertion is pinned on the newline rather than on the
+    # key text for that reason -- a UTF-8-only fix passes a `!occursin(raw_key, …)` test and
+    # still leaves the injection open.
+    keyerr = try
+        Nitro.Types.queryvars(HTTP.Request("GET", "/mq?a%0AFAKE=%80"))
+        nothing
+    catch e
+        e
+    end
+    @test keyerr isa Nitro.ValidationError
+    @test !occursin("\n", keyerr.msg)                      # THE defect: no raw control char
+    @test !occursin("a\nFAKE", keyerr.msg)                 # nor the raw key
+    @test occursin("a\\nFAKE", keyerr.msg)                 # ...but escaped, so still diagnosable
+    @test !occursin("\n", sprint(showerror, keyerr))       # showerror is app-reachable too
+    # Guard the premise: a control character IS valid UTF-8, so this test proves something a
+    # key-side `isvalid` check would not have delivered.
+    @test isvalid("a\nFAKE")
+
+    # An over-long key degrades to a positional report rather than writing 4 KB into one log
+    # line. The value must still be the thing that fails, so the key is well-formed here.
+    longkey = repeat("k", Nitro.Types.MAX_QUERY_KEY_REPORT + 1)
+    longerr = try
+        Nitro.Types.queryvars(HTTP.Request("GET", "/mq?$longkey=%80"))
+        nothing
+    catch e
+        e
+    end
+    @test longerr isa Nitro.ValidationError
+    @test occursin("(name too long)", longerr.msg)
+    @test !occursin(longkey, longerr.msg)
+
+    # A well-formed key on a rejected value is still named, so the fix costs no diagnostics.
+    namederr = try Nitro.Types.queryvars(HTTP.Request("GET", "/mq?token=%80")); nothing catch e; e end
+    @test namederr isa Nitro.ValidationError
+    @test occursin("token", namederr.msg)
+
     # These assert the TYPE again. The old spelling was `bad.params`, which had to be matched
     # on MESSAGE: it went through the process-wide `Base.getproperty(::HTTP.Request, ::Symbol)`
     # override, and the since-deleted `test/instance_tests.jl` built a second Nitro via `instance()` whose

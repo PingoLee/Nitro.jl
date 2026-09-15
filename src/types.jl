@@ -1001,6 +1001,12 @@ function _pathparams_uncached(req::HTTP.Request)
     end
     return decoded
 end
+# Upper bound on how much of a client-supplied query-parameter NAME may be echoed into a
+# `ValidationError.msg`, which is reachable from the `@debug` line in `handlerequest` (#72).
+# Same shape as `MAX_REGEX_PARAM_LENGTH` in `src/utilities/misc.jl`: a cap defined beside the
+# guard it serves, so the reason travels with it.
+const MAX_QUERY_KEY_REPORT = 64
+
 # Same guard, same reason: `HTTP.queryparams` decodes internally and throws on a malformed
 # escape, so `?q=%ZZ` was a 500 here too (pre-existing -- this accessor's decode was never
 # inside `parseparam_checked` either). Both accessors now owe their caller a well-formed map
@@ -1019,7 +1025,20 @@ function _queryvars_uncached(req::HTTP.Request)
     # Same UTF-8 rule as `pathparams` — the two accessors must not disagree about what counts
     # as a well-formed value, which is the whole point of #70.
     for (k, v) in vars
-        isvalid(v) || throw(ValidationError("Invalid UTF-8 in query parameter '$k'"))
+        isvalid(v) && continue
+        # #132: unlike `pathparams`, whose `k` is a ROUTE-DECLARED name, this key is
+        # percent-decoded client input -- and `.msg` is on a log path since #72
+        # (`@debug "Request rejected (400 Bad Request)" message=error.msg`). Interpolating it
+        # raw let `?a%0AFAKE=%80` put a literal newline into a log field.
+        #
+        # `repr` rather than `isvalid(k)`: a control character IS valid UTF-8, so a UTF-8 check
+        # alone leaves the newline. `repr` escapes control characters and invalid bytes alike,
+        # which makes the escaping a property of this boundary rather than of whichever logger
+        # the app happened to install -- `ConsoleLogger` escapes through `show` today, a
+        # structured JSON logger interpolating the value need not. The cap bounds how much one
+        # request can write into one log line; a key that long is not a useful diagnostic anyway.
+        name = ncodeunits(k) > MAX_QUERY_KEY_REPORT ? "(name too long)" : repr(k)
+        throw(ValidationError("Invalid UTF-8 in query parameter $name"))
     end
     return vars
 end
