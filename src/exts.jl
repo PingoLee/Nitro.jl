@@ -30,6 +30,11 @@ index if they do not already exist (`IF NOT EXISTS`), and returns a ready-to-use
 `PormGSessionStore`. Sessions are stored as JSON with a fixed-point expiry timestamp; there
 is no sliding expiry.
 
+`db_key` names the PormG connection, defaulting to `"db"`. It governs **both** halves: the
+table is created on that connection, and the returned store routes every session query — read,
+write, delete and prune — to the same one. Pass a different key when your session database uses
+another PormG connection, for example `db_key="sessions"`.
+
 Requires `using PormG` and a configured PormG connection; without the extension loaded this
 is a `MethodError`, exactly like `pormg_nitro_worker`.
 
