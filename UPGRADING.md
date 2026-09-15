@@ -91,20 +91,20 @@ it.
 ### How to find the calls to migrate
 
 ```bash
-# 1. The sliding strategy, called directly -- always needs an edit. This finds the single-line
-#    form; most real call sites are multi-line and are caught by (2).
-grep -rnE "RateLimiter\([^)]*sliding_window[^)]*\)\s*\(" --include=*.jl .
+# 1. Every construction site, qualified or not. Read each hit: the ones needing an edit are
+#    those that CALL the result -- `RateLimiter(...)(handler)`, or a binding applied later.
+#    Passing it to serve()/path()/urlpatterns() needs no change.
+#
+#    One deliberately broad grep, because no narrower regex is honest here. Matching the
+#    call form directly fails on the two commonest spellings: `[^)]*` cannot cross the inner
+#    paren in `RateLimiter(strategy = :sliding_window, window = Minute(1))(handler)`, and
+#    most real call sites are multi-line. A qualified `Nitro.RateLimiter(` also escapes any
+#    pattern anchored on the bare name -- that spelling is what Nitro's own bench file uses.
+grep -rnE "(Nitro\.)?(Fixed|Sliding)?RateLimiter\(" --include=*.jl .
 
-# 2. The two-step form, where the result is bound and then applied.
-grep -rn "= *RateLimiter(" --include=*.jl .
-
-# 3. The unwrap idiom, which is now dead code -- it still works, but the branch never
-#    takes the second arm.
-grep -rn "isa Nitro.LifecycleMiddleware" --include=*.jl .
-
-# 4. Passing it to serve()/path()/urlpatterns() -- these are already fine, listed so you can
-#    rule them out without reading each one.
-grep -rn -B2 -A2 "RateLimiter(" --include=*.jl . | grep -E "serve\(|middleware *= *\["
+# 2. The unwrap idiom, now dead code: the second arm is unreachable, both strategies return
+#    a LifecycleMiddleware.
+grep -rnE "isa +(Nitro\.)?LifecycleMiddleware" --include=*.jl .
 ```
 
 ### Before → after
