@@ -801,10 +801,13 @@ So a middleware may rely on anything registered before it still being up during 
 `on_shutdown`.
 
 The one exception is **promotion**: hand the *same* object to both `serve(middleware = ...)`
-and a route, and route ownership wins — it is appended to the route-owned half, so in that one
-cycle it starts in the serve phase but tears down in the route phase, ahead of serve-owned
-entries that followed it at startup. Every later cycle is settled, because `terminate()` clears
-only the serve-owned half. See `register_route_lifecycle!` (`src/routerhof.jl`).
+and a route, and route ownership wins — it moves to the end of the route-owned half. Since
+`terminate()` unwinds the serve-owned half first and the route-owned half second, a promoted
+object is torn down **after every serve-owned entry** — including ones that started *before* it,
+which LIFO would have torn down after it. For that object, in that one cycle, the guarantee above
+is inverted: middleware it was registered after may already be down when its own `on_shutdown`
+runs. Later cycles are settled, because `terminate()` clears only the serve-owned half. See
+`register_route_lifecycle!` (`src/routerhof.jl`).
 
 **The hooks must be idempotent across a `serve(); terminate(); serve()` cycle.** Route-owned
 entries are registered once and survive `terminate()`, so a second `serve()` calls `on_startup`

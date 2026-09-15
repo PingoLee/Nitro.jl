@@ -453,6 +453,10 @@ end
     # request-handling thread. Without this assertion, "simplifying" it back to `@async` is a
     # green run.
     #
+    # `Task.sticky` is a Base INTERNAL field, like `HTTP.BytesBody.data` in
+    # test/http_internals_contract_tests.jl. If a future Julia renames it this fails with an
+    # unhelpful `FieldError` — the fix is to find the new spelling, not to drop the assertion.
+    #
     # `errormonitor` itself is deliberately NOT asserted here. Its only observable effect is an
     # async log on a fatal death, which the per-tick `try` above now prevents from happening at
     # all; there is no seam to observe it through that would not be theater.
