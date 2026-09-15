@@ -893,7 +893,24 @@ function start_cleanup_scheduler(; interval_hours::Real=24, retain_days::Int=7, 
     # that this task runs no user code: it sleeps in `timedwait` and calls `cleanup_old_tasks`
     # once a day, so there is nothing here that could starve a thread and nothing to gain from
     # migrating it. It is stopped by a `Channel` signal, never by an interrupt.
-    task = @async begin
+    #
+    # This is Nitro's fourth background janitor, and it stays hand-rolled rather than going
+    # through `_janitor` (src/middleware/janitor.jl) on purpose: it is channel-signalled and
+    # waited-on (`stop_cleanup_scheduler!` joins it, with no deadline), which is the second
+    # shape #190 explicitly refused to fold into that helper. What it must share with the other
+    # three is the discipline, not the helper -- and before #195 it shared none of it:
+    #
+    #   * `errormonitor`, because nothing waits on this task until teardown. Without it a throw
+    #     that escapes the loop is stored in the `Task` and surfaces HOURS later, as a
+    #     `TaskFailedException` out of `shutdown!` (#193) -- causally unrelated-looking to the
+    #     03:00 fault that actually killed the sweep.
+    #   * the `try` INSIDE the `while`. `cleanup_old_tasks` is `cleanup_tasks!` on a
+    #     caller-supplied store -- for `PormGWorkerStore` a database DELETE -- so a connection
+    #     blip, a lock timeout or a migration running against the table all throw. A throw must
+    #     cost one tick, never the scheduler: this is the component whose entire job is bounding
+    #     the task table, and with the `try` hoisted out (or absent, as it was) one transient
+    #     error left rows accumulating for the life of the process (#169, #190, #195).
+    task = errormonitor(@async begin
         while true
             # Closed counts as stopped: `stop_cleanup_scheduler!` signals by closing, and an
             # empty closed channel is never `isready`.
@@ -901,9 +918,17 @@ function start_cleanup_scheduler(; interval_hours::Real=24, retain_days::Int=7, 
             if wait_result == :ok
                 break
             end
-            cleanup_old_tasks(retain_days; runtime=runtime)
+            try
+                cleanup_old_tasks(retain_days; runtime=runtime)
+            catch e
+                # Rethrow guard, per the idiom in src/utilities/misc.jl and
+                # src/middleware/janitor.jl: a catch-all that eats `InterruptException` makes
+                # Ctrl-C during a sweep a no-op.
+                e isa InterruptException && rethrow()
+                @error "Nitro.Workers: task retention sweep failed" exception=(e, catch_backtrace())
+            end
         end
-    end
+    end)
 
     scheduler = CleanupScheduler(task, stop_signal)
     scheduler_ref[] = scheduler
@@ -921,7 +946,22 @@ function stop_cleanup_scheduler!(scheduler::CleanupScheduler)
     # That race was previously hard to reach; `shutdown!` is now called for every backend, from
     # both `uninstall!` and `reset_runtime!`, so it is not. Closing is idempotent and needs no guard.
     close(scheduler.stop_signal)
-    wait(scheduler.task)
+    # `wait` on a task that has already FAILED rethrows its exception as a `TaskFailedException`,
+    # and before #193 that escaped here -- straight out of `shutdown!`, whose first step this is,
+    # ahead of the queue close, the #182 backlog abandon and the #176 drain. A scheduler that had
+    # died at 03:00 therefore made the 17:00 teardown throw, skip the entire drain, and leave the
+    # slot populated so the next `start_cleanup_scheduler` respawned over a runtime that was never
+    # torn down. Since #195 the loop cannot die from a sweep failure, so this is a backstop; but a
+    # teardown propagating a scheduler fault ahead of the drain is the wrong order of priorities
+    # whatever killed it. Only `TaskFailedException` is caught -- it is the one that means "the
+    # task was already dead". An `InterruptException` delivered to the WAITING task is not that,
+    # and still propagates.
+    try
+        wait(scheduler.task)
+    catch e
+        e isa TaskFailedException || rethrow()
+        @error "Nitro.Workers: the retention scheduler had already died; teardown continues" exception=(e, catch_backtrace())
+    end
     return nothing
 end
 

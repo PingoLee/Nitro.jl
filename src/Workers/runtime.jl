@@ -476,7 +476,9 @@ opt out of the backlog handling below; see #182.
 # What this does NOT bound
 
 `drain_timeout` bounds the drain, not the call. `stop_cleanup_scheduler!` waits on the scheduler
-task with no deadline of its own, and that happens first.
+task with no deadline of its own, and that happens first. A scheduler task that died earlier is
+logged there, not rethrown, so the teardown below it always runs
+([#193](https://github.com/PingoLee/Nitro.jl/issues/193)).
 
 # The sequential backlog is abandoned, not executed (#182)
 
@@ -540,7 +542,9 @@ function shutdown!(runtime::WorkerRuntime; drain_timeout::Real = WORKER_DRAIN_TI
     if !isnothing(scheduler)
         # This wait carries no deadline, so it sits OUTSIDE `drain_timeout`'s budget. It is short
         # in practice -- the scheduler task runs no user code, only `timedwait` and a retention
-        # sweep -- but `drain_timeout` is not a bound on this function's total time.
+        # sweep -- but `drain_timeout` is not a bound on this function's total time. A scheduler
+        # whose task already died is logged in there and does NOT throw out of here (#193), so
+        # everything below still runs.
         stop_cleanup_scheduler!(scheduler)
         scheduler_ref[] = nothing
     end
