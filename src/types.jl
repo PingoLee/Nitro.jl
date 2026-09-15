@@ -800,6 +800,12 @@ reverse — **LIFO**, matching Spring's `SmartLifecycle`, OTP supervisors and `d
 So a middleware may rely on anything registered before it still being up during its own
 `on_shutdown`.
 
+The one exception is **promotion**: hand the *same* object to both `serve(middleware = ...)`
+and a route, and route ownership wins — it is appended to the route-owned half, so in that one
+cycle it starts in the serve phase but tears down in the route phase, ahead of serve-owned
+entries that followed it at startup. Every later cycle is settled, because `terminate()` clears
+only the serve-owned half. See `register_route_lifecycle!` (`src/routerhof.jl`).
+
 **The hooks must be idempotent across a `serve(); terminate(); serve()` cycle.** Route-owned
 entries are registered once and survive `terminate()`, so a second `serve()` calls `on_startup`
 again on the same object. A hook that spawns unconditionally leaks one task per restart. Give
