@@ -90,6 +90,7 @@ const TEST_FILES = [
     "scenarios/thunderingherd_test.jl",
 
     # ── Prebuilt Middleware Tests ─────────────────────────────────────────────
+    "middleware/janitor_tests.jl",
     "middleware/extract_ip_tests.jl",
     "middleware/ratelimitter_tests.jl",
     "middleware/ratelimitter_lru_tests.jl",
