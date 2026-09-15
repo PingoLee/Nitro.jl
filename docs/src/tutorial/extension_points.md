@@ -129,12 +129,12 @@ This is the shape every middleware Nitro ships uses (`SessionMiddleware(store=st
 `RateLimiter()`, `ExtractIP()`), which is why they appear **called** in a middleware list.
 
 Several of them (`RateLimiter`, `AccessLog`, `SessionMiddleware`, `SessionPruner`) go one step
-further and wrap that function in a `LifecycleMiddleware`, which can own a background task that
-starts with `serve()` and stops with `terminate()`. The hooks are optional — `RateLimiter`
-returns the same type for both strategies so that `strategy` picks the algorithm and nothing
-else, but only `:fixed_window` has a task to hook. A middleware list accepts either form. Only
-code that composes a middleware **by hand** has to care: the request function is then the
-`.middleware` field, not the value itself.
+further and wrap that function in a [`LifecycleMiddleware`](@ref Nitro.Core.Types.LifecycleMiddleware),
+which can own a background task that starts with `serve()` and stops with `terminate()`. The
+hooks are optional — `RateLimiter` returns the same type for both strategies so that `strategy`
+picks the algorithm and nothing else, but only `:fixed_window` has a task to hook. A middleware
+list accepts either form. Only code that composes a middleware **by hand** has to care: the
+request function is then the `.middleware` field, not the value itself.
 
 ```julia
 serve(middleware = [SessionMiddleware(store = store)])          # either form works here

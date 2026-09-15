@@ -18,7 +18,7 @@ SERVICE_UNAVAILABLE() = HTTP.Response(503, "Service Unavailable")
 """
     RateLimiter(; strategy::Symbol = :fixed_window, kwargs...)
 
-Per-client request rate limiting, as a [`LifecycleMiddleware`](@ref Nitro.LifecycleMiddleware).
+Per-client request rate limiting, as a [`LifecycleMiddleware`](@ref).
 Every keyword other than `strategy` is forwarded to the chosen strategy.
 
 `strategy` picks the algorithm, and **only the algorithm** — both strategies return the same
@@ -310,7 +310,7 @@ This implementation uses UTC time to avoid timezone and DST issues. Significant 
 Concurrency: the store is striped across independent locks chosen by bucket-key hash, so two clients contend only when their keys collide. The background sweep walks one stripe at a time and therefore never stalls more than its share of the traffic.
 
 # Returns
-A [`LifecycleMiddleware`](@ref Nitro.LifecycleMiddleware). Its `on_startup` spawns the background
+A [`LifecycleMiddleware`](@ref). Its `on_startup` spawns the background
 cleanup sweep and `on_shutdown` signals it to stop, so `serve()` and `terminate()` own the task's
 lifetime. Pass it straight to `serve(middleware = [...])` or `path(...; middleware = [...])`; only
 hand-composition needs its `.middleware` field.
@@ -567,7 +567,7 @@ too small to divide (under 128 entries) use a single stripe and behave exactly a
 - Concurrency: the downstream handler runs **outside** the limiter's internal lock, so a slow handler delays only its own request. The lock guards only the per-client timestamp bucket; `X-RateLimit-Remaining`/`-Reset` are sampled when the request is admitted.
 
 # Returns
-A [`LifecycleMiddleware`](@ref Nitro.LifecycleMiddleware) whose `on_startup`/`on_shutdown` are
+A [`LifecycleMiddleware`](@ref) whose `on_startup`/`on_shutdown` are
 both `nothing` — this strategy owns no background task. Pass it straight to `serve(middleware =
 [...])` or `path(...; middleware = [...])`; only hand-composition needs its `.middleware` field.
 """

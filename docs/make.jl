@@ -4,7 +4,16 @@ using Nitro
 makedocs(
     sitename = "Nitro.jl",
     format = Documenter.HTML(),
-    warnonly = true,  # everything is just a warning
+    # `checkdocs = :exports`, not Documenter's `:all` default: `:all` demands that EVERY
+    # docstring under `src/`+`ext/` appear in a `@docs` block, which is ~200 internal helpers
+    # (`rename_key!`, `build_ip_extractor`, …) that are deliberately not public API.
+    checkdocs = :exports,
+    # `warnonly` is a NARROWED list, not `true` (#170). `:cross_references` is a hard error,
+    # because a dangling `@ref` is exactly the failure that let `LifecycleMiddleware` sit
+    # undocumented while `extension_points.md` silently could not link to it. `:missing_docs`
+    # and `:docs_block` stay warnings only because there is a pre-existing backlog of exported
+    # names with no docstring; shrink this list, never grow it.
+    warnonly = [:missing_docs, :docs_block],
     modules = [Nitro],
     pages = [
         "Overview" => "index.md",

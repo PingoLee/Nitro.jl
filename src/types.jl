@@ -28,7 +28,7 @@ abstract type Extractor{T} end
 """
     AbstractSessionStore{K, V}
 
-The storage contract behind [`SessionMiddleware`](@ref). `MemoryStore` ships in core and
+The storage contract behind `SessionMiddleware`. `MemoryStore` ships in core and
 `PormGSessionStore` in `NitroPormGExt`; an application may add its own. `K` is the session-id type
 and `V` the payload type — the middleware pins both to `AbstractSessionStore{String, Dict{String,Any}}`.
 
@@ -302,7 +302,7 @@ end
     MemoryStore()
 
 Build a `MemoryStore{String, Dict{String,Any}}` -- the exact type parameters
-[`SessionMiddleware`](@ref) pins its `store` keyword to, so this is the store to reach for
+`SessionMiddleware` pins its `store` keyword to, so this is the store to reach for
 when you just want in-process sessions:
 
 ```julia
@@ -747,6 +747,69 @@ function require_fixed_period(name::String, p::Dates.Period)
     return p
 end
 
+"""
+    LifecycleMiddleware(; middleware, on_startup = nothing, on_shutdown = nothing)
+
+A middleware that owns a resource for as long as the server runs — a background task, a
+connection, a buffer to flush. Bundles the request function with the hooks that start and stop
+whatever sits behind it.
+
+This is a **return type users meet**, not something most apps construct: `RateLimiter`,
+`AccessLog`, `SessionMiddleware`, `SessionPruner` and `worker_startup` all hand one back.
+
+# Fields
+
+- `middleware::Function` — the request function, `handle -> req -> resp`. This is the part the
+  chain actually runs.
+- `on_startup::Union{Function,Nothing}` — called once by `serve()`, with no arguments. Its
+  return value is discarded.
+- `on_shutdown::Union{Function,Nothing}` — called once by `terminate()`, with no arguments.
+
+Both hooks are optional; `nothing` means "nothing to do", which is why a middleware with no
+resource to own can still be one of these rather than a bare function (`RateLimiter`'s
+`:sliding_window` strategy is exactly that case).
+
+# A middleware list accepts either form
+
+```julia
+serve(app, middleware = [RateLimiter(), SessionMiddleware(store = store)])
+path("/api", handler, middleware = [RateLimiter()])
+```
+
+Only code composing a chain **by hand** needs the request function, and then it is the
+`.middleware` field:
+
+```julia
+wrapped = SessionMiddleware(store = store).middleware(handler)
+```
+
+The type is not exported, so spell it `Nitro.LifecycleMiddleware` if you construct one:
+
+```julia
+serve(app, middleware = [Nitro.LifecycleMiddleware(
+    middleware  = handle -> (req -> handle(req)),
+    on_startup  = () -> @info("up"),
+    on_shutdown = () -> @info("down"))])
+```
+
+# Ordering, and the idempotency requirement
+
+Startup runs route-owned entries (declared via `path`/`urlpatterns`) before serve-owned ones
+(declared via `serve(middleware = ...)`), each in registration order. Teardown is the exact
+reverse — **LIFO**, matching Spring's `SmartLifecycle`, OTP supervisors and `defer`/`atexit`.
+So a middleware may rely on anything registered before it still being up during its own
+`on_shutdown`.
+
+**The hooks must be idempotent across a `serve(); terminate(); serve()` cycle.** Route-owned
+entries are registered once and survive `terminate()`, so a second `serve()` calls `on_startup`
+again on the same object. A hook that spawns unconditionally leaks one task per restart. Give
+each activation its own state and have `on_shutdown` retire it — see `FixedRateLimiter`
+(`src/middleware/rate_limiter.jl`) for the per-activation token, or `AccessLog` for the
+per-activation run struct.
+
+A hook that throws is logged and swallowed — see [`startup`](@ref) and
+[`shutdown`](@ref).
+"""
 @kwdef struct LifecycleMiddleware 
     # The middleware function itself (handles incoming requests)
     middleware :: Function
@@ -756,6 +819,16 @@ end
     on_shutdown :: Union{Function,Nothing} = nothing
 end
 
+"""
+    startup(lf::LifecycleMiddleware)
+
+Run `lf.on_startup` if it has one. Called by `serve()` for every registered
+[`LifecycleMiddleware`](@ref); apps do not normally call it.
+
+A `nothing` hook is a no-op. A **throwing** hook is logged and swallowed, never rethrown: one
+middleware failing to start must not abort the server and leave the middlewares already started
+without their paired `on_shutdown`. The hook's return value is discarded.
+"""
 function startup(lf::LifecycleMiddleware)
     if !isnothing(lf.on_startup)
         try 
@@ -766,6 +839,17 @@ function startup(lf::LifecycleMiddleware)
     end
 end
 
+"""
+    shutdown(lf::LifecycleMiddleware)
+
+Run `lf.on_shutdown` if it has one. Called by `terminate()` for every registered
+[`LifecycleMiddleware`](@ref), in the reverse of startup order; apps
+do not normally call it.
+
+A `nothing` hook is a no-op. A **throwing** hook is logged and swallowed, never rethrown — one
+middleware failing to stop must not prevent the rest from being torn down. The hook's return
+value is discarded.
+"""
 function shutdown(lf::LifecycleMiddleware)
     if !isnothing(lf.on_shutdown)
         try
