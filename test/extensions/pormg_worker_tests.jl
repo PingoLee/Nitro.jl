@@ -334,13 +334,10 @@ else
         # serving a live task -- which is exactly how the missing `shutdown!` went unnoticed.
         @test isempty(missing_store_methods(RealPormGWorkerStore))
 
-        # The session half of the same contract, checked here because this is where the extension
-        # is actually loaded; `pormg_session_tests.jl` exercises a local replica rather than the
-        # shipped type.
-        let ext = Base.get_extension(Nitro, :NitroPormGExt)
-            @test !isnothing(ext)
-            @test isempty(Nitro.Types.missing_session_methods(getproperty(ext, :PormGSessionStore)))
-        end
+        # The session half of the same contract used to be checked here, because this was the
+        # only file that loaded the extension -- `pormg_session_tests.jl` exercised a local
+        # replica rather than the shipped type. Since #180 it drives the shipped
+        # `PormGSessionStore` and owns that assertion.
 
         @testset "create and read task" begin
             info = TaskInfo("task-1"; queue_name="reports")
