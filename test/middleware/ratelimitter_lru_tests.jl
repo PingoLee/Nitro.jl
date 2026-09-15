@@ -291,8 +291,10 @@ using Nitro: setip!
 #
 # Driven in-process (cf. test/middleware/shared_response_mutation_tests.jl) rather than
 # through a live server, so the measurement isn't polluted by HTTP.jl's connection pool
-# and accept loop. `auto_extract_ip=false` makes RateLimiter return the bare
-# `handle -> req -> resp` closure; with no ExtractIP in front, each synthetic request
+# and accept loop. `RateLimiter` returns a `LifecycleMiddleware` whichever strategy you pick
+# (#172), so the `handle -> req -> resp` closure is its `.middleware` field;
+# `auto_extract_ip=false` makes that closure the bare limiter with no `ExtractIP` composed in
+# front of it, so each synthetic request
 # must carry its own IP via `setip!` — a request with no IP is caught by the limiter's
 # explicit guard, which fail-closes to 503 (or passes through under `fail_open=true`).
 # See the "no client IP" testset in test/middleware/ratelimitter_tests.jl.
@@ -311,7 +313,7 @@ end
 @testset "Handler runs outside store_lock" begin
     slow = req -> (sleep(DELAY); HTTP.Response(200, "ok"))
     wrapped = RateLimiter(strategy=:sliding_window, rate_limit=100,
-                          window=Minute(1), auto_extract_ip=false)(slow)
+                          window=Minute(1), auto_extract_ip=false).middleware(slow)
     ip = IPv4("10.0.0.1")
 
     # Warm up: JIT the limiter closure, own_response_headers and set_rate_headers!
@@ -340,7 +342,7 @@ end
 @testset "Counter is still serialized under concurrency" begin
     limit = 100
     wrapped = RateLimiter(strategy=:sliding_window, rate_limit=limit,
-                          window=Minute(1), auto_extract_ip=false)(
+                          window=Minute(1), auto_extract_ip=false).middleware(
         req -> (yield(); HTTP.Response(200, "ok")))
     ip = IPv4("10.0.0.2")
 
@@ -362,7 +364,7 @@ end
 @testset "Exactly rate_limit requests are admitted" begin
     limit = 50
     wrapped = RateLimiter(strategy=:sliding_window, rate_limit=limit,
-                          window=Minute(1), auto_extract_ip=false)(
+                          window=Minute(1), auto_extract_ip=false).middleware(
         req -> (yield(); HTTP.Response(200, "ok")))
     ip = IPv4("10.0.0.3")
 
@@ -379,7 +381,7 @@ end
 @testset "429 is served while slow handlers are in flight" begin
     limit = 2
     wrapped = RateLimiter(strategy=:sliding_window, rate_limit=limit,
-                          window=Minute(1), auto_extract_ip=false)(
+                          window=Minute(1), auto_extract_ip=false).middleware(
         req -> (sleep(DELAY); HTTP.Response(200, "ok")))
 
     # Warm both the admit and reject paths on a throwaway limiter with a fast handler.
@@ -387,7 +389,7 @@ end
     # timed section below needs without spending the real limiter's quota — and keeps
     # this testset independent of whether testset 3 ran first.
     warmup = RateLimiter(strategy=:sliding_window, rate_limit=1, window=Minute(1),
-                         auto_extract_ip=false)(req -> HTTP.Response(200, "ok"))
+                         auto_extract_ip=false).middleware(req -> HTTP.Response(200, "ok"))
     @test warmup(make_request(IPv4("10.0.0.4"))).status == 200
     @test warmup(make_request(IPv4("10.0.0.4"))).status == 429
 
@@ -470,7 +472,8 @@ end
 
     limit = 1
     wrapped = RateLimiter(strategy=:sliding_window, rate_limit=limit, window=Minute(1),
-                          max_clients=128, auto_extract_ip=false)(_ -> HTTP.Response(200, "ok"))
+                          max_clients=128, auto_extract_ip=false).middleware(
+        _ -> HTTP.Response(200, "ok"))
     req_from(ip) = (r = HTTP.Request("GET", "/"); setip!(r, ip); r)
 
     # A victim on stripe 1 spends its single request.

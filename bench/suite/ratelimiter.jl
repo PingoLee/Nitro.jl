@@ -26,13 +26,12 @@ SUITE["ratelimiter"] = BenchmarkGroup()
 const RL_HANDLER = (req) -> HTTP.Response(200, "ok")
 const RL_NTASKS = 64
 
-# `FixedRateLimiter` returns a LifecycleMiddleware; `SlidingRateLimiter` a bare function.
-rl_mw(x) = x isa Nitro.LifecycleMiddleware ? x.middleware : x
-
+# Both strategies return a `LifecycleMiddleware` (#172), so the request closure is always the
+# `.middleware` field -- no `isa` branch needed any more.
 rl_build(strategy::Symbol; kwargs...) =
-    rl_mw(Nitro.RateLimiter(; strategy, auto_extract_ip = false,
-                              rate_limit = 10^9, window = Dates.Millisecond(10),
-                              kwargs...))(RL_HANDLER)
+    Nitro.RateLimiter(; strategy, auto_extract_ip = false,
+                        rate_limit = 10^9, window = Dates.Millisecond(10),
+                        kwargs...).middleware(RL_HANDLER)
 
 function rl_req(ip::Sockets.IPAddr, target::String = "/bench/rl")
     r = HTTP.Request("GET", target)

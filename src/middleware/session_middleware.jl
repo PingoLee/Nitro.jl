@@ -51,12 +51,15 @@ export SessionMiddleware, SessionPruner
 # the NEW activation had just set true, and kept looping. Giving each activation its own `Ref`
 # means a stale task can only ever observe its own token, which `on_shutdown` already set false.
 #
-# `Threads.@spawn`, not `@async` — and this is where the janitor differs from the rate
-# limiter's sweep. That sweep touches only the limiter's own in-memory Dict; this one calls
-# `cleanup_expired_sessions!` on a store the CALLER supplied, and for `PormGSessionStore` that
-# is a blocking SQL DELETE. Per src/Workers/api.jl, `@async` is acceptable only for a task that
-# runs no user code, so a janitor over a user store must not share a thread with request
-# handlers.
+# `Threads.@spawn`, not `@async`. This one calls `cleanup_expired_sessions!` on a store the
+# CALLER supplied, and for `PormGSessionStore` that is a blocking SQL DELETE. Per
+# src/Workers/api.jl, `@async` is acceptable only for a task that runs no user code, so a
+# janitor over a user store must not share a thread with request handlers.
+#
+# `FixedRateLimiter`'s sweep is also `Threads.@spawn` (#169), for a different reason: it runs no
+# user code, but its store is unbounded and only that sweep reaps it, so it is CPU-bound rather
+# than I/O-bound under attack. Two routes to the same answer — there is no janitor left in
+# Nitro that legitimately wants a sticky task.
 function _prune_janitor(store::AbstractSessionStore, interval::Period, label::String,
                        kwname::String)
     # `kwname`, not a hardcoded "prune_interval": `SessionPruner`'s keyword is `interval`, and

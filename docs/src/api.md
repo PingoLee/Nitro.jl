@@ -66,6 +66,10 @@ binary
 formdata
 ```
 
+```@docs
+Nitro.Principal
+```
+
 ## Responses
 
 `Res` is the response-building namespace for handlers: `Res.json`, `Res.html`, `Res.send`, `Res.status`,
@@ -94,14 +98,24 @@ SessionMiddleware
 SessionPruner
 AbstractSessionStore
 MemoryStore
+Nitro.Core.Types.missing_session_methods
 ```
 
 ## Middleware
+
+A middleware is a function `handle -> req -> resp`, and a middleware list accepts one directly.
+Several of the factories below instead return a [`LifecycleMiddleware`](@ref Nitro.Core.Types.LifecycleMiddleware) — a request function bundled with `on_startup`/`on_shutdown` hooks
+that `serve()` and `terminate()` run, so the middleware can own a background task for as long as
+the server is up. `serve()`, `path()` and `urlpatterns()` take either form; only code composing
+a chain by hand needs the `.middleware` field. The type is not exported, so construct one as
+`Nitro.LifecycleMiddleware(...)`.
 
 ```@docs
 BearerAuth
 Cors
 RateLimiter
+Nitro.Core.Middleware.RateLimiterMiddleware.FixedRateLimiter
+Nitro.Core.Middleware.RateLimiterMiddleware.SlidingRateLimiter
 ExtractIP
 extract_ip
 getpeerip
@@ -110,6 +124,9 @@ login_required
 role_required
 AccessLog
 AccessRecord
+Nitro.Core.Types.LifecycleMiddleware
+Nitro.Core.Types.startup
+Nitro.Core.Types.shutdown
 ```
 
 ## Files

@@ -71,7 +71,9 @@ from `serve_lifecycle` in the same critical section, so it is never in both halv
 !!! note "Promotion is not order-preserving"
     A promoted object is appended to the end of `route_lifecycle`, so in the cycle where the
     promotion happens it was started in the *serve* phase but is torn down in the *route*
-    phase — ahead of any serve-owned entries that followed it at startup. Teardown is the exact
+    phase — that is, **after every serve-owned entry**, including ones that started before it
+    and that LIFO would therefore have torn down after it. The entries that followed it at
+    startup are unaffected; the ones it followed are the ones now gone too early. Teardown is the exact
     reverse of startup **in any cycle where no promotion occurred**, which is every cycle after
     the first: `terminate` empties `serve_lifecycle`, so the next `serve()` starts from a
     settled split. This is inherent to route ownership winning — an object cannot both move to

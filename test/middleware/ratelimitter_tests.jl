@@ -358,13 +358,13 @@ terminate()
     for strategy in (:fixed_window, :sliding_window)
         # Fails closed by default — a request that cannot be limited is not admitted.
         closed = RateLimiter(; strategy, rate_limit=5, window=Second(5), auto_extract_ip=false)
-        mw = closed isa Nitro.LifecycleMiddleware ? closed.middleware : closed
+        mw = closed.middleware
         @test mw(ok_handler)(bare()).status == 503
 
         # ...and passes through when the operator opted into availability instead.
         open_ = RateLimiter(; strategy, rate_limit=5, window=Second(5),
                             auto_extract_ip=false, fail_open=true)
-        mwo = open_ isa Nitro.LifecycleMiddleware ? open_.middleware : open_
+        mwo = open_.middleware
         @test mwo(ok_handler)(bare()).status == 200
 
         # A request that DOES carry an IP is unaffected by the guard.
@@ -455,12 +455,10 @@ end
 @testset "Rate limiter: rotating inside one IPv6 /64 cannot buy quota" begin
     ok_handler = _ -> HTTP.Response(200, "ok")
     req_from(ip) = (r = HTTP.Request("GET", "/ok"); setip!(r, ip); r)
-    unwrap(x) = x isa Nitro.LifecycleMiddleware ? x.middleware : x
-
     for strategy in (:fixed_window, :sliding_window)
         limit = 5
-        wrapped = unwrap(RateLimiter(; strategy, rate_limit=limit, window=Minute(1),
-                                     auto_extract_ip=false))(ok_handler)
+        wrapped = RateLimiter(; strategy, rate_limit=limit, window=Minute(1),
+                              auto_extract_ip=false).middleware(ok_handler)
 
         # Every request comes from a DIFFERENT address inside 2001:db8:: /64.
         statuses = [wrapped(req_from(IPv6("2001:db8::$(string(i, base=16))"))).status
@@ -474,12 +472,10 @@ end
 @testset "Rate limiter: distinct IPv6 /64s keep independent buckets" begin
     ok_handler = _ -> HTTP.Response(200, "ok")
     req_from(ip) = (r = HTTP.Request("GET", "/ok"); setip!(r, ip); r)
-    unwrap(x) = x isa Nitro.LifecycleMiddleware ? x.middleware : x
-
     for strategy in (:fixed_window, :sliding_window)
         limit = 3
-        wrapped = unwrap(RateLimiter(; strategy, rate_limit=limit, window=Minute(1),
-                                     auto_extract_ip=false))(ok_handler)
+        wrapped = RateLimiter(; strategy, rate_limit=limit, window=Minute(1),
+                              auto_extract_ip=false).middleware(ok_handler)
 
         # Exhaust one /64...
         for _ in 1:limit
@@ -495,15 +491,13 @@ end
 @testset "Rate limiter: IPv4 keying is unchanged, and mapped peers fold onto it" begin
     ok_handler = _ -> HTTP.Response(200, "ok")
     req_from(ip) = (r = HTTP.Request("GET", "/ok"); setip!(r, ip); r)
-    unwrap(x) = x isa Nitro.LifecycleMiddleware ? x.middleware : x
-
     for strategy in (:fixed_window, :sliding_window)
         # limit=3 is load-bearing: the 203.0.113.7 bucket receives exactly 4 requests
         # below, so only a limit of 3 makes the last one discriminate. At limit=4 the
         # test passes whether or not the mapped address folds onto the v4 bucket.
         limit = 3
-        wrapped = unwrap(RateLimiter(; strategy, rate_limit=limit, window=Minute(1),
-                                     auto_extract_ip=false))(ok_handler)
+        wrapped = RateLimiter(; strategy, rate_limit=limit, window=Minute(1),
+                              auto_extract_ip=false).middleware(ok_handler)
 
         # Default ipv4_prefix is /32, so neighbouring IPv4 hosts stay separate buckets.
         @test wrapped(req_from(IPv4("203.0.113.7"))).status == 200
@@ -521,20 +515,18 @@ end
 @testset "Rate limiter: prefix lengths are configurable and validated" begin
     ok_handler = _ -> HTTP.Response(200, "ok")
     req_from(ip) = (r = HTTP.Request("GET", "/ok"); setip!(r, ip); r)
-    unwrap(x) = x isa Nitro.LifecycleMiddleware ? x.middleware : x
-
     for strategy in (:fixed_window, :sliding_window)
         # Widened to /48: two DIFFERENT /64s inside one /48 now share a bucket.
         limit = 2
-        wrapped = unwrap(RateLimiter(; strategy, rate_limit=limit, window=Minute(1),
-                                     auto_extract_ip=false, ipv6_prefix=48))(ok_handler)
+        wrapped = RateLimiter(; strategy, rate_limit=limit, window=Minute(1),
+                              auto_extract_ip=false, ipv6_prefix=48).middleware(ok_handler)
         @test wrapped(req_from(IPv6("2001:db8:0:1::1"))).status == 200
         @test wrapped(req_from(IPv6("2001:db8:0:2::1"))).status == 200
         @test wrapped(req_from(IPv6("2001:db8:0:3::1"))).status == 429
 
         # Narrowed IPv4 to /24: neighbouring hosts collapse onto one bucket.
-        w4 = unwrap(RateLimiter(; strategy, rate_limit=limit, window=Minute(1),
-                                auto_extract_ip=false, ipv4_prefix=24))(ok_handler)
+        w4 = RateLimiter(; strategy, rate_limit=limit, window=Minute(1),
+                         auto_extract_ip=false, ipv4_prefix=24).middleware(ok_handler)
         @test w4(req_from(IPv4("198.51.100.1"))).status == 200
         @test w4(req_from(IPv4("198.51.100.2"))).status == 200
         @test w4(req_from(IPv4("198.51.100.3"))).status == 429
@@ -576,8 +568,19 @@ end
     @test RateLimiter(window=Second(3)) isa Nitro.LifecycleMiddleware
     @test RateLimiter(cleanup_period=Millisecond(50),
                       cleanup_threshold=Millisecond(50)) isa Nitro.LifecycleMiddleware
-    # SlidingRateLimiter returns a bare Function, not a LifecycleMiddleware.
-    @test RateLimiter(strategy=:sliding_window, window=Minute(1)) isa Function
+    # Both strategies return a LifecycleMiddleware (#172): `strategy` picks the algorithm, not
+    # the return type. The sliding one owns no background task, so its hooks are `nothing`.
+    sliding = RateLimiter(strategy=:sliding_window, window=Minute(1))
+    @test sliding isa Nitro.LifecycleMiddleware
+    @test sliding.on_startup === nothing
+    @test sliding.on_shutdown === nothing
+    @test typeof(sliding) === typeof(RateLimiter(strategy=:fixed_window, window=Minute(1)))
+    # ...and the wrapper changed nothing about the request path: `.middleware` is still the
+    # composed limiter chain, which admits a request under the limit and reaches the handler.
+    bare_sliding = RateLimiter(strategy=:sliding_window, rate_limit=5, window=Minute(1),
+                               auto_extract_ip=false)
+    req = HTTP.Request("GET", "/ok"); setip!(req, IPv4("198.51.100.9"))
+    @test bare_sliding.middleware(_ -> HTTP.Response(200, "reached"))(req).status == 200
 end
 
 end
