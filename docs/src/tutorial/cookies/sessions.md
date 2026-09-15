@@ -139,6 +139,10 @@ serve(middleware=[
 ])
 ```
 
+The default `db_key` is `"db"`. Use a different one when your session database uses another
+PormG connection, for example `db_key="sessions"` — the key selects the connection the table is
+created on *and* the one every session query runs against.
+
 ### Custom Store Interface
 
 Implement these methods for your own backend:

@@ -67,16 +67,46 @@ function _reject_filter_key(k::String)
 end
 
 mutable struct MockQuerySet
-    table::Dict{String, Dict{Symbol,Any}}
+    # One table PER CONNECTION, not one table. A single-table mock cannot express #199 at all --
+    # "created the table on `sessions`, then read and wrote every row on `db`" is not a statement
+    # about anything unless there are two tables to tell apart, so no assertion written against
+    # such a mock could have failed on the shipped code.
+    tables::Dict{String, Dict{String, Dict{Symbol,Any}}}   # db key -> session_key -> row
+    db_key::Union{Nothing,String}                          # `nothing` until `.db(key)` runs
     filters::Dict{String, Any}
     seen::Vector{Dict{String,Any}}
+end
+
+# The connection this query runs on. `nothing` means the store reached `m.objects` directly
+# instead of routing through `_session_objects(store)`.
+#
+# Erroring here is not the mock inventing a rule PormG does not have -- it is the closest
+# FAITHFUL model of the configuration #199 is about. PormG resolves a query's connection as
+# `q.connect_key !== nothing ? q.connect_key : q.model.connect_key` and, when both are `nothing`,
+# uses the sole loaded connection or throws `InvalidConfigurationError`
+# (`PormG/src/querybuilder/build_helpers.jl`). The ext builds its session model with a bare
+# `PormG.Models.Model("nitro_session", ...)` in `_define_session_model()` and never passes it to
+# `set_models`, so `model.connect_key` IS `nothing` (`PormG/src/Models.jl`). Therefore, with a
+# `db` and a `sessions` connection both loaded, every unrouted session query THROWS -- into
+# `Base.get`'s and `cleanup_expired_sessions!`'s catch blocks, which swallow, and out of
+# `set_session!`/`delete_session!`, which rethrow. Modelling a silent fallback instead would mean
+# inventing a binding the ext does not make.
+function _selected_table(qs::MockQuerySet)
+    key = getfield(qs, :db_key)
+    key === nothing && error("MockSessionQuerySet: query ran without selecting a connection -- " *
+        "every session query must go through `_session_objects(store)` (`.db(store.db_key)`), " *
+        "not `m.objects` directly. See #199.")
+    tables = getfield(qs, :tables)
+    haskey(tables, key) || error("MockSessionQuerySet: no table registered for db key '$key' -- " *
+        "PormG throws `InvalidConfigurationError` for a key that was never loaded. Build the " *
+        "model as `MockModel(\"$key\")` if the test means to use that connection.")
+    return tables[key]
 end
 
 # The keys of every row the accumulated filter selects. Recording the filter here rather than in
 # `filter` is deliberate: this is the filter a query actually RAN with, which is what a test
 # wants to assert about.
 function _matching_keys(qs::MockQuerySet)
-    table = getfield(qs, :table)
     filters = getfield(qs, :filters)
     push!(getfield(qs, :seen), copy(filters))
 
@@ -87,6 +117,10 @@ function _matching_keys(qs::MockQuerySet)
     for k in keys(filters)
         k in MODELLED_FILTER_KEYS || _reject_filter_key(k)
     end
+
+    # AFTER the filter-key check: a misspelled filter is the more specific diagnosis, and the two
+    # `@test_throws` in "the mock refuses a filter it does not model" drive `m.objects` directly.
+    table = _selected_table(qs)
 
     matched = String[]
     for (key, row) in table
@@ -137,12 +171,18 @@ function Base.getproperty(qs::MockQuerySet, name::Symbol)
             end
             return qs
         end
+    elseif name === :db
+        return function(db_key::String)
+            # PormG's `_db!` assigns `q.connect_key` and returns the SAME object -- the
+            # mutate-and-return-self shape `filter` above uses, not a fresh queryset.
+            setfield!(qs, :db_key, db_key)
+            return qs
+        end
     elseif name === :first
         return function()
-            table = getfield(qs, :table)
             matched = _matching_keys(qs)
             isempty(matched) && return nothing
-            return _as_db_row(table[first(matched)])
+            return _as_db_row(_selected_table(qs)[first(matched)])
         end
     elseif name === :create
         return function(pairs::Pair{String,<:Any}...)
@@ -150,7 +190,7 @@ function Base.getproperty(qs::MockQuerySet, name::Symbol)
             for (k, v) in pairs
                 row[Symbol(k)] = v
             end
-            getfield(qs, :table)[row[:session_key]] = row
+            _selected_table(qs)[row[:session_key]] = row
             # PormG's `.create` returns a fully-populated row that reads back canonicalised like
             # any other, so go through the same conversion rather than aliasing what was stored.
             return _as_db_row(row)
@@ -162,7 +202,7 @@ function Base.getproperty(qs::MockQuerySet, name::Symbol)
             isempty(getfield(qs, :filters)) &&
                 error("MockSessionQuerySet: update() requires a filter -- refusing to update " *
                       "every row, as PormG does.")
-            table = getfield(qs, :table)
+            table = _selected_table(qs)
             touched = 0
             for key in _matching_keys(qs)
                 for (k, v) in pairs
@@ -183,8 +223,8 @@ function Base.getproperty(qs::MockQuerySet, name::Symbol)
             (!allow_delete_all && isempty(getfield(qs, :filters))) &&
                 error("MockSessionQuerySet: delete() must have a filter -- pass " *
                       "allow_delete_all = true to delete every row, as PormG requires.")
-            table = getfield(qs, :table)
             matched = _matching_keys(qs)
+            table = _selected_table(qs)
             for key in matched
                 delete!(table, key)
             end
@@ -199,15 +239,32 @@ function Base.getproperty(qs::MockQuerySet, name::Symbol)
 end
 
 struct MockModel
-    _table::Dict{String, Dict{Symbol,Any}}
+    _tables::Dict{String, Dict{String, Dict{Symbol,Any}}}
     _filters_seen::Vector{Dict{String,Any}}
 end
 
-MockModel() = MockModel(Dict{String, Dict{Symbol,Any}}(), Dict{String,Any}[])
+# Every connection this model may be queried on. A test that exercises routing names both
+# (`MockModel("db", "sessions")`); the no-argument form is the single connection every test that
+# does not care about routing uses.
+MockModel(db_keys::String...) = MockModel(
+    Dict{String, Dict{String, Dict{Symbol,Any}}}(
+        k => Dict{String, Dict{Symbol,Any}}() for k in (isempty(db_keys) ? ("db",) : db_keys)),
+    Dict{String,Any}[],
+)
 
 function Base.getproperty(m::MockModel, name::Symbol)
     if name === :objects
-        return MockQuerySet(getfield(m, :_table), Dict{String,Any}(), getfield(m, :_filters_seen))
+        # No connection selected yet -- exactly what PormG's `model.objects` hands back.
+        # `.db(key)` is what picks one.
+        return MockQuerySet(getfield(m, :_tables), nothing, Dict{String,Any}(),
+                            getfield(m, :_filters_seen))
+    elseif name === :_table
+        # The DEFAULT connection's table: what every assertion that does not care about routing
+        # means, kept as an alias rather than rewritten at twenty-odd call sites. A test that DOES
+        # care names its connection (`m._tables["sessions"]`) -- and the routing testsets below
+        # assert `_table` stays EMPTY for a store configured elsewhere, which makes this alias an
+        # assertion asset rather than a way to read the wrong table by accident.
+        return getfield(m, :_tables)["db"]
     else
         return getfield(m, name)
     end
@@ -217,9 +274,14 @@ end
 # `cleanup_expired_sessions!` swallow; `set_session!` and `delete_session!` rethrow.
 struct FailingMockModel end
 
-function Base.getproperty(::FailingMockModel, name::Symbol)
+function Base.getproperty(m::FailingMockModel, name::Symbol)
     if name === :objects
-        return FailingMockModel()
+        return m
+    elseif name === :db
+        # Selecting a connection SUCCEEDS; it is the QUERY that fails. Without this branch the
+        # throw would come out of `.db(...)` itself, so the four assertions below would stay green
+        # even if every query under them were deleted.
+        return (_db_key::String) -> m
     end
     return function(args...; kwargs...)
         error("mock persistence failure")
@@ -252,14 +314,38 @@ if RealPormGSessionStore === nothing
           "environment, not a valid configuration, and failing here is deliberate (#128). " *
           "Run `bash scripts/worktree_setup.sh` in a worktree, unset a stale " *
           "`NITRO_TEST_REDISPATCH`, or re-provision with `Pkg.test()`.")
-else
+end
 
 const PormGExt = Base.get_extension(Nitro, :NitroPormGExt)
 
+# -- A stand-in PormG connection, for `pormg_nitro_session` ---------------
+#
+# `PormG.connection(key=k)` is just `config[k].connections` (`PormG/src/Configuration.jl`),
+# `config` is a `Dict{String,PormGSettings}` and `PormGSettings` is an ABSTRACT type
+# (`PormG/src/Kernel.jl`), so an entry registered under a test-only key is enough to run
+# `pormg_nitro_session` end to end with nothing behind it.
+#
+# `FakeSessionPool <: PormG.PormGSQLite` on purpose rather than a bare struct: subtyping means
+# `_ensure_session_table!` runs PormG's REAL `create_table`/`create_index` against the REAL
+# session model, so this covers the bootstrap SQL too. Only `fetch` is overridden -- it is the
+# one step that would touch a driver -- and the method is on our own concrete type, so it is
+# more specific than PormG's `Union{PormGPostgres,PormGSQLite}` method rather than piracy.
+struct FakeSessionPool <: PormG.PormGSQLite
+    sql::Vector{String}
+end
+
+struct FakeSessionSettings <: PormG.PormGSettings
+    connections::FakeSessionPool
+end
+
+PormG.ConnectionPool.fetch(c::FakeSessionPool, sql::String; kwargs...) =
+    (push!(c.sql, sql); nothing)
+
 # Seed a row directly, the way a prior process would have left one behind. `expires_at` is a
 # naive UTC `DateTime`, which is what `set_session!` writes.
-function _seed_row!(model::MockModel, key::String, data::Dict{String,Any}, expires_at::DateTime)
-    model._table[key] = Dict{Symbol,Any}(
+function _seed_row!(model::MockModel, key::String, data::Dict{String,Any}, expires_at::DateTime;
+                    db_key::String="db")
+    model._tables[db_key][key] = Dict{Symbol,Any}(
         :session_key  => key,
         :session_data => JSON.json(data),
         :expires_at   => expires_at,
@@ -275,6 +361,11 @@ end
     # AbstractSessionStore` is not asserted beside it: `missing_session_methods` is typed
     # `::Type{<:AbstractSessionStore}`, so it could not dispatch if that were false.)
     @test isempty(missing_session_methods(RealPormGSessionStore))
+
+    # The default connection key, mirroring `pormg_worker_tests.jl`'s `@test store.db_key == "db"`.
+    # On its own this proves only that the field exists -- the routing testsets below are what
+    # prove it is USED.
+    @test store.db_key == "db"
 
     @testset "create and read" begin
         set_session!(store, "sess-1", Dict{String,Any}("user_id" => 1); ttl=3600)
@@ -307,6 +398,39 @@ end
         delete_session!(store, "sess-1")
         @test !haskey(store.model._table, "sess-1")
         @test get_session(store, "sess-1") === nothing
+    end
+
+    @testset "every query runs on the store's db_key, not the model's default (#199)" begin
+        # The regression test for #199 proper. `pormg_nitro_session(db_key="sessions")` created
+        # `nitro_session` on `sessions` and then read, wrote, deleted and pruned on whatever
+        # connection the model resolved to -- because `PormGSessionStore` had nowhere to put the
+        # key and all four sites called `m.objects` directly.
+        m = MockModel("db", "sessions")
+        store = RealPormGSessionStore(model=m, db_key="sessions")
+
+        # CREATE -- `set_session!`'s insert branch.
+        set_session!(store, "routed", Dict{String,Any}("user_id" => 7); ttl=3600)
+        @test haskey(m._tables["sessions"], "routed")
+        @test isempty(m._tables["db"])
+
+        # READ -- `Base.get`. A DECOY under the SAME session key on the other connection, so a
+        # store that reads from the wrong one hands back the decoy and this assertion NAMES the
+        # defect instead of merely failing to find a row. It also keeps the read site covered
+        # independently: a fix that routed the writes and missed `Base.get` still fails here.
+        _seed_row!(m, "routed", Dict{String,Any}("user_id" => 999),
+                   Dates.now(Dates.UTC) + Dates.Hour(1); db_key="db")
+        @test get_session(store, "routed") == Dict{String,Any}("user_id" => 7)
+
+        # UPDATE -- `set_session!`'s overwrite branch is a SEPARATE query site from its insert.
+        set_session!(store, "routed", Dict{String,Any}("user_id" => 8); ttl=3600)
+        @test JSON.parse(m._tables["sessions"]["routed"][:session_data])["user_id"] == 8
+        @test JSON.parse(m._tables["db"]["routed"][:session_data])["user_id"] == 999
+        @test length(m._tables["sessions"]) == 1   # updated in place, on the right connection
+
+        # DELETE.
+        delete_session!(store, "routed")
+        @test !haskey(m._tables["sessions"], "routed")
+        @test haskey(m._tables["db"], "routed")    # the decoy survives: a different database
     end
 
     @testset "an expired payload is refused on the read path" begin
@@ -369,6 +493,32 @@ end
         @test cutoff isa DateTime && before <= cutoff <= after
     end
 
+    @testset "cleanup_expired_sessions! prunes the store's connection only (#199)" begin
+        m = MockModel("db", "sessions")
+        store = RealPormGSessionStore(model=m, db_key="sessions")
+
+        _seed_row!(m, "stale", Dict{String,Any}(), Dates.now(Dates.UTC) - Dates.Hour(1);
+                   db_key="sessions")
+        _seed_row!(m, "stale-elsewhere", Dict{String,Any}(), Dates.now(Dates.UTC) - Dates.Hour(1);
+                   db_key="db")
+
+        # The prune CATCHES everything and returns `nothing`, so a mock error raised inside it is
+        # invisible from out here -- `=== nothing` passes either way, which is why the sibling
+        # testsets above assert on the table rather than on the return. Three nets, in order of
+        # what each one distinguishes:
+        #   1. nothing was logged at all, i.e. the swallow never fired;
+        @test_logs min_level=Base.CoreLogging.Warn cleanup_expired_sessions!(store)
+        #   2. the rows on THIS connection are gone and the ones on the other are untouched;
+        @test isempty(m._tables["sessions"])
+        @test haskey(m._tables["db"], "stale-elsewhere")
+        #   3. the filter carried the operator the sibling testset pins. NOT a proof that a query
+        #      reached a table: `_matching_keys` records `seen` before it resolves the connection,
+        #      so an unrouted prune records one entry and then throws. Nets 1 and 2 are what
+        #      discriminate; this one pins the operator.
+        @test length(m._filters_seen) == 1
+        @test collect(keys(m._filters_seen[1])) == ["expires_at__@lte"]
+    end
+
     @testset "JSON round-trip preserves data types" begin
         s = RealPormGSessionStore(model=MockModel())
         data = Dict{String,Any}(
@@ -424,6 +574,23 @@ end
     @test parse_dt("2026-09-15T02:42:01+00:00") == expected
 end
 
+@testset "the mock refuses a query with no connection selected (#199)" begin
+    # The guard that makes this file able to detect the next #199, and the reason the routing
+    # testsets above are worth anything: without it an ext that dropped `.db(store.db_key)` would
+    # keep every assertion in this file green, because one table cannot tell two databases apart.
+    # `pormg_worker_tests.jl` models `.db` as a no-op passthrough and has exactly that hole (#203).
+    # The mock alone, deliberately: these assertions are about the MOCK's guard, so wrapping a
+    # store around it would only add a way for this testset to fail for an unrelated reason.
+    m = MockModel("db", "sessions")
+
+    @test_throws "without selecting a connection" m.objects.filter("session_key" => "x").first()
+    @test_throws "no table registered for db key" m.objects.db("nope").filter("session_key" => "x").first()
+
+    # ... and the routed spelling works, so this is pinned as a guard rather than as
+    # "a query never works".
+    @test m.objects.db("sessions").filter("session_key" => "x").first() === nothing
+end
+
 @testset "the mock refuses a filter it does not model" begin
     # The guard that makes this file able to detect the next #180. The pre-#180 mock had no
     # `else` branch, so an unrecognised filter deleted nothing and returned quietly.
@@ -438,10 +605,77 @@ end
     @test_throws "must have a filter" s.model.objects.delete()
     @test_throws "requires a filter" s.model.objects.update("session_data" => "{}")
     @test haskey(s.model._table, "doomed")
-    @test s.model.objects.delete(allow_delete_all=true) == (1, Dict{String,Integer}("nitro_session" => 1))
+    # `.db("db")` here and not on the two guards above: those fire before any table is touched,
+    # while `allow_delete_all` deliberately gets all the way to the rows -- so this one has to be
+    # driven the way the store drives it.
+    @test s.model.objects.db("db").delete(allow_delete_all=true) == (1, Dict{String,Integer}("nitro_session" => 1))
     @test isempty(s.model._table)
 end
 
-end  # RealPormGSessionStore available
+@testset "PREMISE: an unrouted session query is a THROW, not a silent default (#199)" begin
+    # The premise the whole fix rests on, pinned against the real PormG rather than asserted in a
+    # comment. `_define_session_model()` builds the session model with a bare `PormG.Models.Model`
+    # and never passes it to `set_models`, so the model carries NO connection binding of its own.
+    # PormG then resolves a query with no `.db(key)` as: the sole loaded connection if there is
+    # exactly one, otherwise `InvalidConfigurationError`
+    # (`PormG/src/querybuilder/build_helpers.jl`).
+    #
+    # So the shipped symptom of #199 was not "wrote to the wrong database". For any app with two
+    # or more PormG connections loaded it was every session query THROWING -- swallowed by
+    # `Base.get` and `cleanup_expired_sessions!` (silent logout, one `@warn` per read) and
+    # rethrown by `set_session!`/`delete_session!`. If PormG ever makes this a silent fallback
+    # instead, this test goes red and the mock's error-on-unrouted design needs revisiting.
+    @test getproperty(PormGExt, :session_model)().connect_key === nothing
+
+    k1, k2 = "nitro-test-unrouted-1", "nitro-test-unrouted-2"
+    # `error`, not `@test`: a failed `@test` does not stop the testset, so an assertion here
+    # would go red and then overwrite -- and later `delete!` -- somebody's real connection.
+    (haskey(PormG.config, k1) || haskey(PormG.config, k2)) &&
+        error("test-only PormG connection keys are already registered: $k1 / $k2")
+    PormG.config[k1] = FakeSessionSettings(FakeSessionPool(String[]))
+    PormG.config[k2] = FakeSessionSettings(FakeSessionPool(String[]))
+    try
+        # Two connections loaded, model unbound: PormG refuses to guess. This throw never reaches
+        # the driver, so the fake pools are never actually queried.
+        @test_throws PormG.Kernel.InvalidConfigurationError getproperty(PormGExt, :session_model)().objects.filter("session_key" => "x").first()
+    finally
+        delete!(PormG.config, k1)
+        delete!(PormG.config, k2)
+    end
+end
+
+@testset "pormg_nitro_session hands its db_key to the store it returns (#199)" begin
+    # #199 is two defects sharing one cause. The store half is covered above; this is the other
+    # half: `pormg_nitro_session` used `db_key` to reach a connection, created the table on it,
+    # and then built `PormGSessionStore(model=model)` -- dropping the argument on the floor. Every
+    # mock above would happily pass a store that was simply never told which database it is on.
+    key = "nitro-test-session-conn"
+    # `error`, not `@test`, for the same reason as the testset above: a red assertion that then
+    # clobbers and deletes a real `PormG.config` entry turns one failure into a broken process.
+    haskey(PormG.config, key) && error("test-only PormG connection key is already registered: $key")
+    conn = FakeSessionPool(String[])
+    PormG.config[key] = FakeSessionSettings(conn)
+    try
+        store = pormg_nitro_session(db_key=key)
+
+        # THE assertion. `store.db_key == "db"` here is the shipped bug.
+        @test store.db_key == key
+
+        # ... and it really is the shipped function under test: the real session model,
+        # bootstrapped on the connection it was asked for.
+        @test store.model === getproperty(PormGExt, :session_model)()
+        @test length(conn.sql) == 2
+        @test any(q -> occursin("nitro_session", q), conn.sql)
+        @test any(q -> occursin("nitro_session_expires_at_idx", q), conn.sql)
+    finally
+        # `config` is process-global and PormG falls back to `first(keys(config))` when a model is
+        # unbound and exactly one connection is loaded, so a leaked entry could silently be picked
+        # up by a later test item.
+        delete!(PormG.config, key)
+    end
+
+    # The default is still the default, and is not a function of what ran above.
+    @test !haskey(PormG.config, key)
+end
 
 end

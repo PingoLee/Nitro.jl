@@ -116,6 +116,10 @@ serve(middleware=[
 Sessions are stored as JSON in the database with a fixed-point expiry timestamp
 (no sliding expiry). Works with any PormG-supported backend (SQLite, PostgreSQL).
 
+The default `db_key` is `"db"`. Use a different one when your session database uses another
+PormG connection, for example `db_key="sessions"` — the key selects the connection the table is
+created on *and* the one every session query runs against, so the two can never disagree.
+
 ### Custom Stores
 
 Three methods are **required** for your store type `S <: AbstractSessionStore{String, Dict{String,Any}}`:

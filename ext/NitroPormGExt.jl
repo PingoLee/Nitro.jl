@@ -102,33 +102,64 @@ end
 # ============================================================================
 
 """
-    PormGSessionStore(; table_name="nitro_session")
+    PormGSessionStore(; model=nothing, db_key="db")
 
 A PormG-backed session store that implements Nitro's `AbstractSessionStore{String, Dict{String,Any}}`.
 
 Sessions are stored as JSON text in the database and expire at a fixed timestamp
 from the last write (no sliding expiry).
 
+`db_key` is the PormG connection key **every** session query runs on — read, write, delete and
+prune alike — and it must name the connection whose `nitro_session` table you bootstrapped.
+Prefer `pormg_nitro_session(db_key=...)`, which creates the table and returns a store already
+pointed at the same connection.
+
 ## Usage
 
 ```julia
 using Nitro, PormG
 
-store = PormGSessionStore()
+# Preferred: creates the table and returns a store pointed at the same connection.
+store = pormg_nitro_session()
 serve(middleware=[SessionMiddleware(store=store, secure=false)])
+```
+
+Constructing the type directly skips the table bootstrap, so do it only when the
+`nitro_session` table already exists on that connection. The type is not exported, so application
+code reaches it through the extension module:
+
+```julia
+ext = Base.get_extension(Nitro, :NitroPormGExt)
+store = ext.PormGSessionStore(db_key="sessions")
 ```
 """
 struct PormGSessionStore <: AbstractSessionStore{String, Dict{String,Any}}
     model::Any  # PormG Model reference
+    db_key::String
 end
 
-function PormGSessionStore(; model=nothing)
+function PormGSessionStore(; model=nothing, db_key::String="db")
     m = isnothing(model) ? session_model() : model
     if isnothing(m)
         error("PormGSessionStore requires PormG.Models to be available. Ensure PormG is properly loaded.")
     end
-    return PormGSessionStore(m)
+    return PormGSessionStore(m, db_key)
 end
+
+# Route every session query to the store's configured connection, exactly as `_task_objects`
+# does for the worker store. Without this the query falls back to the model's own
+# `connect_key` -- which is `nothing`, because `_define_session_model()` never goes through
+# `set_models` -- and PormG then either uses the sole loaded connection or throws
+# `InvalidConfigurationError` when several are loaded. Both outcomes ignore `db_key`, and the
+# throw is swallowed by the read paths below, so sessions silently stop persisting (#199).
+#
+# This routes the QUERY, not the model. PormG's `ensure_model_transaction_scope` gates on
+# `model.connect_key` rather than on the key set here, so a session query issued while a PormG
+# transaction is active on the calling task still raises -- swallowed on the read paths and
+# propagated on the write paths, exactly as above -- and `db_key` cannot help, because the
+# model is unbound either way. `PormGWorkerStore` has the identical gap; binding both models
+# through `set_models` is the fix, and it is a larger change than #199 -- tracked as #202.
+_session_objects(store::PormGSessionStore) = store.model.objects.db(store.db_key)
 
 # -- Serialization helpers --
 
@@ -144,9 +175,8 @@ end
 # -- Store interface implementation --
 
 function Base.get(store::PormGSessionStore, session_id::String, default)
-    m = store.model
     try
-        result = m.objects.filter("session_key" => session_id).first()
+        result = _session_objects(store).filter("session_key" => session_id).first()
         if isnothing(result)
             return default
         end
@@ -200,20 +230,19 @@ function get_session(store::PormGSessionStore, session_id::String)
 end
 
 function set_session!(store::PormGSessionStore, session_id::String, data::Dict{String,Any}; ttl::Int=3600)
-    m = store.model
     expires_at = Dates.now(Dates.UTC) + Dates.Second(ttl)
     serialized = _serialize_session(data)
 
     try
-        existing = m.objects.filter("session_key" => session_id).first()
+        existing = _session_objects(store).filter("session_key" => session_id).first()
         if isnothing(existing)
-            m.objects.create(
+            _session_objects(store).create(
                 "session_key"  => session_id,
                 "session_data" => serialized,
                 "expires_at"   => expires_at,
             )
         else
-            m.objects.filter("session_key" => session_id).update(
+            _session_objects(store).filter("session_key" => session_id).update(
                 "session_data" => serialized,
                 "expires_at"   => expires_at,
             )
@@ -226,9 +255,8 @@ function set_session!(store::PormGSessionStore, session_id::String, data::Dict{S
 end
 
 function delete_session!(store::PormGSessionStore, session_id::String)
-    m = store.model
     try
-        m.objects.filter("session_key" => session_id).delete()
+        _session_objects(store).filter("session_key" => session_id).delete()
     catch e
         @warn "PormGSessionStore: failed to delete session" exception=(e, catch_backtrace())
         rethrow()
@@ -237,10 +265,9 @@ function delete_session!(store::PormGSessionStore, session_id::String)
 end
 
 function cleanup_expired_sessions!(store::PormGSessionStore)
-    m = store.model
     now_utc = Dates.now(Dates.UTC)
     try
-        m.objects.filter("expires_at__@lte" => now_utc).delete()
+        _session_objects(store).filter("expires_at__@lte" => now_utc).delete()
     catch e
         @warn "PormGSessionStore: failed to cleanup expired sessions" exception=(e, catch_backtrace())
     end
@@ -289,7 +316,7 @@ function pormg_nitro_session(; db_key::String="db")
     end
     conn = PormG.connection(key=db_key)
     _ensure_session_table!(conn, model)
-    return PormGSessionStore(model=model)
+    return PormGSessionStore(model=model, db_key=db_key)
 end
 
 # ============================================================================
