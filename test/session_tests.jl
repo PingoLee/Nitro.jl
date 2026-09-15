@@ -11,6 +11,23 @@ struct User
     name::String
 end
 
+# A minimal store that implements only the `Base.get` half of the contract, so `get_session`
+# resolves to the GENERIC `AbstractSessionStore` method rather than a specialisation. Mints on
+# read for the same reason `SameTickStore` does (#173).
+struct BoundaryStore <: Nitro.Types.AbstractSessionStore{String, Dict{String,Any}} end
+Base.get(::BoundaryStore, ::String, default) =
+    SessionPayload(Dict{String,Any}("user_id" => 7), Dates.now(Dates.UTC))
+
+# Stages the boundary case `expires == now` against the real clock, which is otherwise
+# unstageable: the payload is minted ON READ, so its `expires` clock read and the read path's
+# own `Dates.now(UTC)` are microseconds apart. `DateTime` has millisecond resolution, so the
+# two land in the SAME tick nearly every time -- exactly the payload `<` served and `<=`
+# refuses. Deliberately NOT an AbstractSessionStore: that is what routes the `Session{T}`
+# extractor down its `SessionPayload` fallback (#173).
+struct SameTickStore end
+Base.get(::SameTickStore, ::String, default) =
+    SessionPayload(Dict{String,Any}("user_id" => 7), Dates.now(Dates.UTC))
+
 @testset "Nitro Session via App Context Tests" begin
 
     # 1. Setup a simple store in App Context
@@ -128,6 +145,112 @@ end
         @test length(store.data) == 1
         Nitro.Cookies.prunesessions!(store)
         @test length(store.data) == 0
+    end
+
+    # ── #173: one expiry predicate, and the boundary belongs to the expired side ──
+    #
+    # Expiry was written out at six sites. Five spelled `<=`; the `Session{T}` extractor's
+    # `SessionPayload` fallback spelled `<`, so a payload landing on exactly the current
+    # instant was served there and refused everywhere else. Every read path calls
+    # `Dates.now(UTC)` internally, so the boundary is only stageable through the two-arg
+    # `is_expired` -- which is why the helper takes an `at`.
+    @testset "is_expired: the boundary is expired (#173)" begin
+        at = DateTime(2030, 1, 1, 12, 0, 0)
+        d  = Dict{String,Any}("user_id" => 7)
+
+        @test is_expired(SessionPayload(d, at), at) === true                      # the boundary
+        @test is_expired(SessionPayload(d, at + Millisecond(1)), at) === false    # not yet
+        @test is_expired(SessionPayload(d, at - Millisecond(1)), at) === true     # long gone
+
+        # The one-arg form is the two-arg form against the clock.
+        @test is_expired(SessionPayload(d, Dates.now(Dates.UTC) - Second(10))) === true
+        @test is_expired(SessionPayload(d, Dates.now(Dates.UTC) + Hour(1))) === false
+
+        # Public, so a third-party `AbstractSessionStore` has something to call instead of
+        # re-deriving the comparison -- which is how the six sites drifted apart.
+        @test :is_expired in names(Nitro)
+    end
+
+    @testset "every read path refuses a payload on the boundary (#173)" begin
+        configcookies(secret_key=nothing)
+        d = Dict{String,Any}("user_id" => 7)
+        mint() = SessionPayload(d, Dates.now(Dates.UTC))
+        N = 200
+
+        # Every path below is exercised in a WARM loop with the payload minted immediately
+        # before the read, so `expires` and the read path's own `Dates.now(UTC)` land in the
+        # same millisecond tick -- the true `expires == now` boundary.
+        #
+        # Two things that look equivalent and are not, both of which silently turn this into
+        # a past-dated test where `<` and `<=` agree:
+        #   * `sleep()` before the read -- puts the payload strictly in the past.
+        #   * a single COLD call -- JIT compilation between the two clock reads takes far
+        #     more than the 1ms of DateTime resolution.
+        # Zero tolerance: one served session means a read path is back on the lenient `<`.
+
+        # 1. get_session(::MemoryStore, ...) -- the concrete store method.
+        mem = MemoryStore()
+        mem.data["sid"] = mint(); get_session(mem, "sid")                    # warm up
+        @test count(1:N) do _
+            mem.data["sid"] = mint()
+            get_session(mem, "sid") !== nothing
+        end == 0
+
+        # 2. The generic get_session(::AbstractSessionStore, ...) fallback: `BoundaryStore`
+        #    does not specialise `get_session`, so it resolves to the generic method.
+        get_session(BoundaryStore(), "sid")                                  # warm up
+        @test count(1:N) do _
+            get_session(BoundaryStore(), "sid") !== nothing
+        end == 0
+
+        # 3. `_load_session`, the SessionMiddleware read path: a boundary payload must be
+        #    treated as a brand-new session, not resumed. A resumed one carries the payload's
+        #    data, so a non-empty session dict is a served session.
+        store = MemoryStore()
+        seen = Ref{Any}(nothing)
+        wrapped = SessionMiddleware(cookie_name="b_session", store=store).middleware(
+            function (req::HTTP.Request)
+                seen[] = copy(getsession(req))
+                return HTTP.Response(200, "ok")
+            end)
+        probe() = begin
+            store.data["boundary-id"] = mint()
+            wrapped(HTTP.Request("GET", "/", ["Cookie" => "b_session=boundary-id"]))
+            seen[]
+        end
+        probe()                                                              # warm up
+        @test count(_ -> !isempty(probe()), 1:N) == 0
+
+        # 4. The `Session{T}` extractor's SessionPayload fallback -- the site that said `<`.
+        #    Reachable ONLY through a store that is NOT an AbstractSessionStore but DOES hold
+        #    SessionPayloads; an AbstractSessionStore takes the `get_session` branch above and
+        #    never reaches it, which is why this line had no coverage at all before #173.
+        urlpatterns("",
+            path("/boundary", function(req, session::Session{Dict{String,Any}})
+                return isnothing(session.payload) ? "Expired" : "Active"
+            end, method="GET"),
+        )
+
+        # A payload comfortably in the past, and one comfortably in the future -- basic
+        # regression cover for a branch that had none. NOTE: these two pass under `<` too;
+        # they are coverage, not the boundary.
+        raw = Dict{String, SessionPayload{Dict{String,Any}}}()
+        raw["past-id"] = SessionPayload(d, Dates.now(Dates.UTC) - Second(10))
+        raw["live-id"] = SessionPayload(d, Dates.now(Dates.UTC) + Hour(1))
+        @test text(internalrequest(
+            Request("GET", "/boundary", ["Cookie" => "session=past-id"]); context=raw)) == "Expired"
+        @test text(internalrequest(
+            Request("GET", "/boundary", ["Cookie" => "session=live-id"]); context=raw)) == "Active"
+
+        # THE boundary, on the extractor. Assumes only that the wall clock does not step
+        # BACKWARDS between the store's clock read and the extractor's; an NTP step back
+        # between the two would serve one iteration and read as a mysterious flake.
+        same_tick = SameTickStore()
+        served = count(1:N) do _
+            text(internalrequest(
+                Request("GET", "/boundary", ["Cookie" => "session=any"]); context=same_tick)) == "Active"
+        end
+        @test served == 0
     end
 
     @testset "MemoryStore Thread Safety" begin

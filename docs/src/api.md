@@ -92,6 +92,8 @@ Cookie
 Session
 SessionMiddleware
 SessionPruner
+AbstractSessionStore
+MemoryStore
 ```
 
 ## Middleware

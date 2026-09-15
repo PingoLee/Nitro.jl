@@ -17,6 +17,7 @@ export Server, Nullable, Context,
     Param, isrequired, LazyRequest, headers, pathparams, queryvars, jsonbody, formbody, textbody, multipartbody,
     CookieConfig, Cookie, Session, SessionPayload,
     AbstractSessionStore, get_session, set_session!, delete_session!, cleanup_expired_sessions!,
+    is_expired,
     MemoryStore, Extractor, missing_session_methods,
     RouteDefinition, Principal
 
@@ -134,7 +135,7 @@ function get_session(store::AbstractSessionStore{K, V}, session_id::K) where {K,
     end
 
     if payload isa SessionPayload{V}
-        if payload.expires <= Dates.now(Dates.UTC)
+        if is_expired(payload)
             return nothing
         end
         return _copy_session_value(payload.data)
@@ -258,12 +259,59 @@ struct SessionPayload{T}
     expires::DateTime
 end
 
+"""
+    is_expired(payload::SessionPayload, at::DateTime = Dates.now(Dates.UTC)) -> Bool
+
+Whether `payload` has expired as of `at`. **The boundary counts as expired**: a payload whose
+`expires` is exactly `at` is refused, so a session is served only while `expires` is strictly in
+the future.
+
+This is the single definition of session expiry (#173). It used to be written out at six call
+sites -- five spelled `<=` and the `Session{T}` extractor spelled `<`, so a payload landing on
+exactly the current millisecond was served by the extractor and refused by every store. The
+window was one millisecond wide and nothing was exploitable, but expiry is a security-adjacent
+predicate and a seventh site would have drifted the same way.
+
+Pass `at` explicitly when sweeping a whole store, so the clock is read once rather than once per
+entry -- [`cleanup_expired_sessions!`](@ref) does exactly this. It is also what makes the
+boundary itself testable: every read path reads the clock internally, so `expires == now` cannot
+otherwise be staged.
+
+Implementing [`AbstractSessionStore`](@ref)? Call this rather than comparing `expires` yourself.
+
+```julia
+payload = SessionPayload(Dict{String,Any}("user_id" => 7), Dates.now(Dates.UTC) + Dates.Hour(1))
+is_expired(payload)                            # false
+is_expired(payload, payload.expires)           # true -- the boundary is expired
+```
+"""
+is_expired(payload::SessionPayload, at::DateTime = Dates.now(Dates.UTC)) = payload.expires <= at
+
 # A thread-safe in-memory store for sessions
 struct MemoryStore{K, V} <: AbstractSessionStore{K, V}
     data::Dict{K, SessionPayload{V}}
     lock::Base.ReentrantLock
     MemoryStore{K, V}() where {K, V} = new{K, V}(Dict{K, SessionPayload{V}}(), Base.ReentrantLock())
 end
+
+"""
+    MemoryStore()
+
+Build a `MemoryStore{String, Dict{String,Any}}` -- the exact type parameters
+[`SessionMiddleware`](@ref) pins its `store` keyword to, so this is the store to reach for
+when you just want in-process sessions:
+
+```julia
+serve(middleware = [SessionMiddleware(store = MemoryStore())])
+```
+
+Sessions live in this process only: they are lost on restart and not shared between processes.
+Use a persistent store (`pormg_nitro_session()`) behind more than one worker.
+
+Each call builds a **separate** store. There is no shared default (#171) -- two `App`s that each
+want their own session table simply call this twice.
+"""
+MemoryStore() = MemoryStore{String, Dict{String,Any}}()
 
 function Base.get(store::MemoryStore, key, default)
     lock(store.lock) do
@@ -285,7 +333,7 @@ function get_session(store::MemoryStore{K, V}, key::K) where {K, V}
             return nothing
         end
 
-        if payload.expires <= Dates.now(Dates.UTC)
+        if is_expired(payload)
             return nothing
         end
 
@@ -320,7 +368,7 @@ function cleanup_expired_sessions!(store::MemoryStore{K, V}) where {K, V}
         # sweep (src/middleware/rate_limiter.jl) is two-pass for the same reason.
         expired = K[]
         for (key, payload) in store.data
-            if payload.expires <= current_time
+            if is_expired(payload, current_time)
                 push!(expired, key)
             end
         end

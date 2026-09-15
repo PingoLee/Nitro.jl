@@ -102,8 +102,8 @@ end
 function _warn_unbound()
     @warn "CSRFMiddleware has no session to bind tokens to: `:session_id` is missing from the " *
           "request context. Put SessionMiddleware OUTSIDE CSRFMiddleware in the pipeline " *
-          "(`middleware=[SessionMiddleware(), CSRFMiddleware(secret)]`). Until then no token is " *
-          "issued and every unsafe request is rejected." maxlog=1
+          "(`middleware=[SessionMiddleware(store = MemoryStore()), CSRFMiddleware(secret)]`). Until " *
+          "then no token is issued and every unsafe request is rejected." maxlog=1
     return nothing
 end
 

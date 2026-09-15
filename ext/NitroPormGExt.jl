@@ -7,7 +7,7 @@ using JSON
 using UUIDs
 
 import Nitro.Auth: make_password, check_password, password_needs_upgrade, is_password_usable
-import Nitro.Core.Types: AbstractSessionStore, SessionPayload, get_session, set_session!, delete_session!, cleanup_expired_sessions!
+import Nitro.Core.Types: AbstractSessionStore, SessionPayload, get_session, set_session!, delete_session!, cleanup_expired_sessions!, is_expired
 import Nitro.Core.Cookies: storesession!, prunesessions!
 import Nitro: pormg_nitro_session, sync_pormg_env!
 
@@ -191,7 +191,7 @@ function get_session(store::PormGSessionStore, session_id::String)
         return nothing
     end
     if payload isa SessionPayload
-        if payload.expires <= Dates.now(Dates.UTC)
+        if is_expired(payload)
             return nothing
         end
         return copy(payload.data)

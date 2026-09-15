@@ -11,7 +11,7 @@ using HTTP
 using Nitro
 
 # Use the in-memory store for local development.
-store = Nitro.Types.MemoryStore{String, Dict{String,Any}}()
+store = MemoryStore()
 
 function login_handler(req::HTTP.Request)
     body = getjson(req)
@@ -115,7 +115,7 @@ end
 For local development:
 
 ```julia
-store = Nitro.Types.MemoryStore{String, Dict{String,Any}}()
+store = MemoryStore()
 
 serve(middleware=[
     SessionMiddleware(store=store, secure=false),
