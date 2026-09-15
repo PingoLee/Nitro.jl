@@ -946,7 +946,22 @@ function stop_cleanup_scheduler!(scheduler::CleanupScheduler)
     # That race was previously hard to reach; `shutdown!` is now called for every backend, from
     # both `uninstall!` and `reset_runtime!`, so it is not. Closing is idempotent and needs no guard.
     close(scheduler.stop_signal)
-    wait(scheduler.task)
+    # `wait` on a task that has already FAILED rethrows its exception as a `TaskFailedException`,
+    # and before #193 that escaped here -- straight out of `shutdown!`, whose first step this is,
+    # ahead of the queue close, the #182 backlog abandon and the #176 drain. A scheduler that had
+    # died at 03:00 therefore made the 17:00 teardown throw, skip the entire drain, and leave the
+    # slot populated so the next `start_cleanup_scheduler` respawned over a runtime that was never
+    # torn down. Since #195 the loop cannot die from a sweep failure, so this is a backstop; but a
+    # teardown propagating a scheduler fault ahead of the drain is the wrong order of priorities
+    # whatever killed it. Only `TaskFailedException` is caught -- it is the one that means "the
+    # task was already dead". An `InterruptException` delivered to the WAITING task is not that,
+    # and still propagates.
+    try
+        wait(scheduler.task)
+    catch e
+        e isa TaskFailedException || rethrow()
+        @error "Nitro.Workers: the retention scheduler had already died; teardown continues" exception=(e, catch_backtrace())
+    end
     return nothing
 end
 

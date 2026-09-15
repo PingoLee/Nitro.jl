@@ -702,8 +702,10 @@ degrades to the exception type alone.
 
 `worker_startup` runs a cleanup scheduler by default (`cleanup_enabled=true`,
 `cleanup_interval_hours=24`), so finished rows — error text included — are pruned on the
-retention window rather than kept forever. If you set `cleanup_enabled=false`, you own
-retention, and stored error text lives as long as the row does.
+retention window rather than kept forever. A sweep that throws — a transient store error,
+say — is logged and retried on the next interval: it neither stops the scheduler nor makes
+`shutdown!` throw. If you set `cleanup_enabled=false`, you own retention, and stored error
+text lives as long as the row does.
 
 !!! warning "Treat `TaskInfo.error` as attacker-influenceable"
     It is free text derived from an exception your own code raised. The safest posture is to

@@ -1847,6 +1847,65 @@ end
     end
 end
 
+@testset "shutdown! drains even when the retention scheduler already died (#193)" begin
+    # #193. `stop_cleanup_scheduler!` closes the signal and then `wait`s on the task, and `wait`
+    # on a task that failed rethrows `TaskFailedException`. `shutdown!` called it unguarded, as
+    # its FIRST step, so a scheduler that died at 03:00 made the 17:00 teardown throw before the
+    # queue close, the #182 backlog abandon and the #176 drain -- in-flight runs neither drained
+    # nor recorded, `scheduler_ref[]` left populated -- hours after, and causally
+    # unrelated-looking to, the fault that actually killed the sweep.
+    #
+    # Since #195 the loop cannot die from a sweep failure, so the dead task is CONSTRUCTED here
+    # rather than provoked: a `CleanupScheduler` over a task that has already failed is exactly
+    # the state the unpatched code met, whatever produced it.
+    store = InMemoryWorkerStore()
+    rt = WorkerRuntime(store)
+
+    try
+        owner = Owner("user-dead-sweep")
+        task_id = submit_sequential_task("dead-sweep-q", "one", () -> "done", owner; runtime=rt)
+        @test wait_for(() -> get_task_status(task_id, owner; runtime=rt)[:status] == "COMPLETED") == :ok
+        channel = get_sequential_queues(rt)["dead-sweep-q"].channel
+        @test isopen(channel)
+
+        # A settled run handle, as in the #167 testset above: it must be released by the drain.
+        settled_handle = @async nothing
+        wait(settled_handle)
+        Nitro.Workers.register_active_task!(rt, "dead-sweep-handle", settled_handle)
+        Nitro.Workers.register_active_task_info!(rt, "dead-sweep-handle", TaskInfo("dead-sweep-handle"))
+
+        dead = @async error("simulated: the sweep died hours ago")
+        @test wait_for(() -> istaskdone(dead)) == :ok
+        @test istaskfailed(dead)
+        get_cleanup_scheduler(rt)[] = CleanupScheduler(dead, Channel{Nothing}(1))
+
+        # Against the unpatched code this line throws `TaskFailedException` and nothing below it
+        # happens: the queue stays open, the registry stays populated, the handle stays.
+        @test (@test_logs (:error, r"retention scheduler had already died") match_mode=:any shutdown!(rt)) == true
+
+        @test get_cleanup_scheduler(rt)[] === nothing
+        @test !isopen(channel)
+        @test isempty(get_sequential_queues(rt))
+        @test !haskey(rt.active_tasks, "dead-sweep-handle")
+
+        # The runtime is reusable afterwards: a fresh scheduler, alive, that stops cleanly.
+        fresh = start_cleanup_scheduler(; interval_hours=1, retain_days=7, runtime=rt)
+        @test fresh.task !== dead
+        @test !istaskdone(fresh.task)
+        stop_cleanup_scheduler!(fresh)
+        @test istaskdone(fresh.task)
+        @test !istaskfailed(fresh.task)
+
+        # The runtime-argument form -- what `startup(cleanup_enabled=false)` calls -- clears the
+        # slot for a dead task too, instead of throwing before it gets there.
+        get_cleanup_scheduler(rt)[] = CleanupScheduler(dead, Channel{Nothing}(1))
+        @test (@test_logs (:error, r"retention scheduler had already died") match_mode=:any stop_cleanup_scheduler!(rt)) === nothing
+        @test get_cleanup_scheduler(rt)[] === nothing
+    finally
+        reset_runtime!(rt)
+    end
+end
+
 @testset "Public worker startup API bootstraps lifecycle" begin
     ctx = Nitro.Core.App()
 
