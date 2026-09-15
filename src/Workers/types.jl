@@ -198,14 +198,23 @@ mutable struct TaskInfo
     completed_at::Union{Nothing, DateTime}
     watchers::Vector{String}
     queue_name::Union{Nothing, String}
-    # The cancellation token. Process-local and NOT persisted: it is a request aimed at a
-    # callback running *here*, and the durable `status` is what carries a cancellation
-    # between processes. Read it with `cancel_requested`.
+    # The cancellation token, and the CAUSE of the cancellation in one field. Process-local and
+    # NOT persisted: it is a request aimed at a callback running *here*, and the durable `status`
+    # is what carries a cancellation between processes. Read it with `cancel_requested` /
+    # `cancel_reason`; write it only through `_request_cancel!`.
+    #
+    # `:none` means "not cancelled", so the flag and the reason cannot disagree. This was
+    # `@atomic cancel_requested::Bool` until #183, with the reason nowhere — four different causes
+    # all rendered as one of two strings, neither of which named the cause. Keeping them as two
+    # fields was the obvious shape and is the worse one: a reader that observed the flag could
+    # observe a reason not yet written, so every setter would owe a write ORDER, enforced by
+    # review across four sites and every future one. One field makes a set token with no cause
+    # unrepresentable instead.
     #
     # Excluded from `set_task!`'s field copy for the same reason `watchers` is: a stale
-    # caller object carrying `false` would ERASE a cancel that had already been requested,
+    # caller object carrying `:none` would ERASE a cancel that had already been requested,
     # which is the #88 clobber with the sign flipped.
-    @atomic cancel_requested::Bool
+    @atomic cancel_reason::Symbol
 
     function TaskInfo(id::String; queue_name::Union{Nothing, String}=nothing)
         created_at = current_time_utc()
@@ -221,7 +230,7 @@ mutable struct TaskInfo
             nothing,
             String[],
             queue_name,
-            false,
+            :none,
         )
     end
 end
@@ -263,26 +272,64 @@ function update_progress!(task_info::TaskInfo, value::Real)
 end
 
 """
+    CANCEL_REASONS
+
+The four things that can request a cancellation, as the symbols [`cancel_reason`](@ref) reports.
+
+| Reason | Who set it | What it already did to the record |
+|---|---|---|
+| `:user` | `cancel_task` | claimed `CANCELLED` **before** setting the token |
+| `:timeout` | an expired `TaskOptions(timeout=…)` | nothing yet — it throws [`TaskTimeoutError`](@ref), which is terminal `FAILED` |
+| `:superseded` | re-running a key whose predecessor is still executing | replaced the record, so the predecessor's `run_id` fence now fails |
+| `:shutdown` | a teardown drain ([`shutdown!`](@ref), #176) | **nothing** — a terminal write there would race the run's own, the #88/#108 failure mode |
+
+That last column is why the reason exists. Three of the four have already decided the record by
+the time the callback notices, so only a drain leaves the run to write its own terminal state —
+and before #183 it wrote `"Cancelled by user"` for a shutdown no user asked for. See
+[`cancel_reason`](@ref).
+"""
+const CANCEL_REASONS = (:user, :timeout, :superseded, :shutdown)
+
+# The ONLY write path into the token. Deliberately not exported and not public: workers §6 keeps
+# `cancel_task` the authorized route into a cancellation, because it is the one that performs the
+# authorization check and the status CAS. A public setter for the reason would be a second route
+# into the token that skipped both.
+#
+# **First cause wins**, via CAS rather than assignment. A user cancel followed a second later by a
+# teardown must still read `:user` — the person did cancel it, and the shutdown merely arrived
+# afterwards. Last-write-wins would rewrite that attribution, and the drain is the write most
+# likely to land last, since it fires on every in-flight run at once.
+#
+# Returns whether THIS call was the one that set it, which is what makes the rule testable.
+function _request_cancel!(task_info::TaskInfo, reason::Symbol)
+    @assert reason in CANCEL_REASONS "unknown cancellation reason :$reason"
+    _, won = @atomicreplace task_info.cancel_reason :none => reason
+    return won
+end
+
+# One renderer, so no call site can invent a string. `_cancel_task!` reads the reason off the
+# `TaskInfo` rather than taking a message, which is what structurally closed the api.jl/queue.jl
+# split -- there is no longer a parameter to pass differently on the two paths (#183).
+#
+# `:none` is reachable here: the durable-read branches of the retry loop cancel on a record that
+# another process wrote, so nothing set a local token. Those writes always lose their CAS, so the
+# text is never stored -- but it must still be a sentence rather than an error.
+function _cancel_message(reason::Symbol)
+    reason === :user && return "Cancelled by user"
+    reason === :timeout && return "Cancelled by timeout"
+    reason === :superseded && return "Cancelled by a re-run of this task key"
+    reason === :shutdown && return "Cancelled by worker shutdown"
+    return "Cancelled"
+end
+
+"""
     cancel_requested(task_info::TaskInfo) -> Bool
 
 `true` once cancellation has been requested for **this run**, in **this process**.
 
 Poll it from any long-running callback. It is the whole of Nitro's cancellation mechanism, and
-**four** things set it: `cancel_task`, an expired `TaskOptions(timeout=…)`, re-running a key whose
-predecessor is still executing, and a teardown drain ([`shutdown!`](@ref), #176) asking in-flight
-runs to stop. None of them can stop a callback that never looks
-([#127](https://github.com/PingoLee/Nitro.jl/issues/127)).
-
-They do not all mean the same thing about the *record*. `cancel_task` has already claimed
-`CANCELLED` before it sets the token; the deadline throws `TaskTimeoutError`; a re-run has already
-replaced the record. A **drain claims nothing on its own** — a terminal write there would race the
-run's own, the #88/#108 failure mode — so what a drained run records is whatever it reaches by
-itself: `COMPLETED` with the value it returns, `FAILED` if it throws with no retry left, **or
-`CANCELLED` if the token arrives while it is parked in the retry backoff**, which polls this same
-token — and records a message that says nothing true about provenance (`"Cancelled by user"` on the
-async path, `"Cancelled"` on a sequential queue, whoever actually asked). See [`shutdown!`](@ref)
-for that table. Make a shutdown-truncated run legible in the value you return rather than relying
-on the status to say which of the four happened.
+four things set it — see [`CANCEL_REASONS`](@ref). None of them can stop a callback that never
+looks ([#127](https://github.com/PingoLee/Nitro.jl/issues/127)).
 
 ```julia
 submit_task("import", task_info -> begin
@@ -303,15 +350,51 @@ reason, and a single-process framework has no isolation boundary to kill across.
 **It is process-local, and never reset.** A cancel issued on another node writes the durable
 row and sets nothing here, so a cross-process callback must poll the record instead —
 `get_task_status(task_info.id, System())[:status] == "CANCELLED"`, sparingly, since it is a
-round-trip. Re-running a key builds a fresh `TaskInfo`, so the token starts `false` by
+round-trip. Re-running a key builds a fresh `TaskInfo`, so the token starts unset by
 construction rather than by being cleared; see [`TaskInfo`](@ref).
 
 `true` on a `FAILED` task means the deadline fired, mirroring Go's `ctx.Err() ==
-DeadlineExceeded`. Reading the field directly also works — a relaxed read of a `Bool` is
-harmless — so unlike [`update_progress!`](@ref) this accessor is a convention, not an
-enforcement.
+DeadlineExceeded` — and [`cancel_reason`](@ref) now says so outright rather than leaving it to
+be inferred from the status.
+
+**This is a function, not a field read.** It was `task_info.cancel_requested` until #183, which
+replaced the `Bool` field with `@atomic cancel_reason::Symbol`; the accessor is unchanged in
+name and meaning, the field is gone.
 """
-cancel_requested(task_info::TaskInfo) = @atomic task_info.cancel_requested
+cancel_requested(task_info::TaskInfo) = (@atomic task_info.cancel_reason) !== :none
+
+"""
+    cancel_reason(task_info::TaskInfo) -> Symbol
+
+*Why* this run was asked to stop — one of [`CANCEL_REASONS`](@ref) — or `:none` if it was not.
+
+`cancel_requested(t)` is exactly `cancel_reason(t) !== :none`; this is the same token read for
+its cause instead of its truth value, so polling either costs one atomic load.
+
+Use it to make a callback react differently to a deploy than to a person:
+
+```julia
+submit_task("import", task_info -> begin
+    for chunk in chunks
+        if cancel_requested(task_info)
+            # A shutdown will restart us; checkpoint and let the next process resume.
+            cancel_reason(task_info) === :shutdown && return checkpoint(done)
+            return "cancelled"
+        end
+        process(chunk)
+    end
+end, Owner("user-1"))
+```
+
+**The first cause wins.** A run cancelled by a user and then caught by a teardown reports
+`:user`, because that is who stopped it; the shutdown merely arrived afterwards.
+
+It is process-local, exactly like the flag: a cancel issued on another node sets nothing here, so
+a cross-process callback reads `:none` and must poll the record. And it says nothing about what
+was *stored* — three of the four causes have already written the record, or will never write a
+cancellation at all. [`shutdown!`](@ref) has the table.
+"""
+cancel_reason(task_info::TaskInfo) = @atomic task_info.cancel_reason
 
 """
     TaskTimeoutError(timeout)

@@ -47,6 +47,102 @@ _Changes merged but not yet cut into a release. A consumer dev'ing Nitro at HEAD
 and `Nitro.upgrade_guide` surfaces them by default. When the maintainer next rolls changes into a
 consuming app, `nitro-cut-release` stamps every entry below with `0.4.0`, dates them, and tags it._
 
+## A cancellation now records its cause, and `cancel_requested` is no longer a field (#183)
+
+- **Version**: Unreleased
+- **Nitro ref**: #183 (follow-up to #176); `src/Workers/types.jl`, `src/Workers/queue.jl`,
+  `src/Workers/api.jl`, `src/Workers/execution.jl`, `src/Workers/runtime.jl`, `src/Workers.jl`,
+  `docs/src/tutorial/workers.md`, `.github/instructions/workers.instructions.md`,
+  `test/workers_tests.jl`
+- **Recorded**: 2026-09-15
+- **Severity**: **breaking for direct field reads, behaviour for everyone else.**
+  `task_info.cancel_requested` no longer exists and raises immediately; the accessor
+  `cancel_requested(task_info)` is unchanged. Separately, the text stored in a cancelled task's
+  `error` field changes on **every** path — if you match on it, you must update the strings.
+
+### What changed
+
+Four things request a cancellation — `cancel_task`, an expired `TaskOptions(timeout=…)`, a re-run
+displacing a still-executing predecessor, and (since #176) a teardown drain. The token recorded
+only *that* one of them had fired, never *which*, and the stored message was worse than uninformative:
+
+- `submit_task` passed `"Cancelled by user"`; `submit_sequential_task` took `_cancel_task!`'s
+  `"Cancelled"` default. The same event recorded different text depending on which submit function
+  the caller happened to use.
+- And `"Cancelled by user"` was reachable **only when no user had cancelled anything**. A real
+  `cancel_task` claims `CANCELLED` *before* setting the token, so the run's own terminal write
+  loses its compare-and-set and stores nothing; a timeout is terminal `FAILED`; a supersede fails
+  its `run_id` fence. The one cause that writes no record of its own is a drain — so the string
+  naming a user was, in practice, the shutdown's.
+
+Two changes fix it together:
+
+1. **`TaskInfo`'s `@atomic cancel_requested::Bool` becomes `@atomic cancel_reason::Symbol`**, where
+   `:none` means "not cancelled". One field rather than two, so a token that is set can never be
+   missing its cause; two fields would have made correctness depend on every setter writing
+   reason-before-flag. New accessor `cancel_reason(task_info)` returns `:none`, `:user`,
+   `:timeout`, `:superseded` or `:shutdown` (exported as `CANCEL_REASONS`).
+   **The first cause wins**: a job cancelled by a person a second before a deploy still reports
+   `:user`.
+2. **`_cancel_task!` renders the stored message from that reason** instead of taking one, so the
+   two submit paths cannot diverge again. The strings are now:
+
+   | Cause | Stored `error` |
+   |---|---|
+   | `:user` | `"Cancelled by user"` — and now *only* a person produces this |
+   | `:shutdown` | `"Cancelled by worker shutdown"` — both submit paths |
+   | `:superseded` | `"Cancelled by a re-run of this task key"` (rarely stored; the fence usually wins) |
+   | `:timeout` | not stored — a deadline records `FAILED` with `"Timeout of Ns exceeded"`, unchanged |
+
+`cancel_task`'s own durable write also moves from `"Cancelled"` to `"Cancelled by user"`, so a
+user cancellation reads the same whichever writer got there first.
+
+### How to find the calls to migrate
+
+```bash
+# 1. Direct field access — this is the breaking half. Raises immediately; there is no silent case.
+grep -rn "\.cancel_requested" --include=*.jl .
+
+# 2. Anything matching on the stored message. These keep working but now compare against
+#    strings that no longer occur.
+grep -rn '"Cancelled by user"\|"Cancelled"' --include=*.jl .
+
+# 3. Alerting, dashboards and reports that read CANCELLED as "a person did this" — they can
+#    now discriminate, and probably should.
+grep -rn "CANCELLED" --include=*.jl .
+```
+
+### Before → after
+
+```julia
+# BEFORE — the field read, and no way to tell a deploy from a person.
+if task_info.cancel_requested
+    return "cancelled"
+end
+
+# AFTER — the accessor was always the documented form and is unchanged.
+if cancel_requested(task_info)
+    return "cancelled"
+end
+
+# AFTER — and the callback can now act on WHY it was asked to stop.
+if cancel_requested(task_info)
+    cancel_reason(task_info) === :shutdown && return checkpoint(done)  # we are coming back
+    return "cancelled"
+end
+```
+
+```julia
+# BEFORE — matching the stored text, which named a user for a shutdown.
+status[:error] == "Cancelled by user"      # true for a DRAIN, never for cancel_task
+
+# AFTER — it means what it says, and a shutdown has its own string.
+status[:error] == "Cancelled by user"              # a person cancelled it
+status[:error] == "Cancelled by worker shutdown"   # a teardown stopped it
+```
+
+---
+
 ## Worker teardown drains in-flight runs instead of releasing them (#176)
 
 - **Version**: Unreleased
@@ -93,11 +189,11 @@ Three consequences worth planning for:
   its own: `COMPLETED` with the value it returned, `FAILED` if it threw, **or `CANCELLED` if the
   shutdown landed while the run was parked in its retry backoff**, which polls the same token. If
   you have alerting or reporting that reads `CANCELLED` as "a person cancelled this", a deploy can
-  now produce that status on a retrying job — and you cannot filter it out by message, because the
-  stored text is `"Cancelled by user"` for `submit_task` and `"Cancelled"` for
-  `submit_sequential_task`, neither of which says how the stop was requested. The drain writes no
-  terminal state itself — that would race the run's own write — so the fix is to put what you need
-  into the value the callback returns, not to expect a distinct status.
+  now produce that status on a retrying job. **#183, later in this same wave, is what makes that
+  filterable**: a drained run records `"Cancelled by worker shutdown"` and only `cancel_task`
+  produces `"Cancelled by user"`. Apply that entry too and alert on the message. The drain still
+  writes no terminal state itself — that would race the run's own write — so a callback that needs
+  something richer than a status still puts it in the value it returns.
 - **Keeping the handle only helps a runtime that is reused.** A `serve → terminate → serve` cycle
   with `store=` builds a fresh `WorkerRuntime` whose handles start empty, so an abandoned run from
   the previous cycle is still swept. There, finishing the run inside the drain is the only thing

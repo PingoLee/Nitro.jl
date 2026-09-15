@@ -489,18 +489,22 @@ failure mode — so the outcome is whatever the run reaches on its own:
 |---|---|
 | running its callback, which returns on the token | `COMPLETED`, carrying whatever it returned |
 | running its callback, which throws | `FAILED` with that message (or a retry, if one is left) |
-| **between retries**, parked in the cancellation-aware backoff | **`CANCELLED`** — see the note on its message |
+| **between retries**, parked in the cancellation-aware backoff | **`CANCELLED`**, error `"Cancelled by worker shutdown"` |
 
 That third row surprises people, so it is stated rather than implied: the retry backoff polls this
 very token, so a drain landing inside one ends the run as cancelled. Reaching a terminal state
-there is the useful behaviour — the alternative is a job that restarts during teardown — but the
-record cannot distinguish "cancelled by a person" from "stopped by a shutdown", and the message is
-actively misleading: the async path passes `"Cancelled by user"` and the sequential queue takes
-`_cancel_task!`'s `"Cancelled"` default, so it names a user who did nothing on one path and says
-nothing about provenance on the other. That split predates this drain.
+there is the useful behaviour — the alternative is a job that restarts during teardown.
 
-A callback that wants a shutdown-truncated run to be recognisable should therefore say so in the
-value it returns or the error it raises, rather than relying on the status.
+**The message names the shutdown, and that is new in #183.** The drain sets the token with
+reason `:shutdown` ([`CANCEL_REASONS`](@ref)) and `_cancel_task!` renders the stored text from it,
+so a teardown is distinguishable from a person's `cancel_task` — which is the only thing that
+records `"Cancelled by user"`. Before #183 it was the other way round on the async path: a real
+`cancel_task` claims `CANCELLED` first and the run's own write lost its CAS, so `"Cancelled by
+user"` reached the record *only* when a drain had put it there. Alerting that reads `CANCELLED` as
+"a person did this" can now filter on the message instead.
+
+A callback that wants to do something *other* than stop — checkpoint, say — can read
+[`cancel_reason`](@ref) and branch on `:shutdown`.
 
 **The run calling this is excluded.** `_snapshot_runs` skips it (see `CURRENT_RUN_KEY`), so a
 `shutdown!` invoked from inside a callback neither waits for nor reports on its own run — and can
@@ -561,7 +565,7 @@ function shutdown!(runtime::WorkerRuntime; drain_timeout::Real = WORKER_DRAIN_TI
     # status change. This is a request aimed at the callback, not a claim about the record.
     for entry in snapshot
         entry.info === nothing && continue
-        @atomic entry.info.cancel_requested = true
+        _request_cancel!(entry.info, :shutdown)
     end
 
     # No lock is held across the wait, and none may be. `active_lock` would deadlock against

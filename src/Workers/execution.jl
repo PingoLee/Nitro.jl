@@ -193,7 +193,7 @@ function timeout_call(callback::Function, task_info::TaskInfo; timeout::Int=3600
     if wait_result == :timed_out
         # Ask, because we cannot tell. The task above keeps running until the callback
         # returns; this is the only thing that can make it stop, and only if it polls.
-        @atomic task_info.cancel_requested = true
+        _request_cancel!(task_info, :timeout)
 
         # The docs used to note that a timed-out task can go on mutating external state "with
         # nothing to tell the operator". This is that signal, and it is now the only one.

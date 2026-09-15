@@ -95,8 +95,20 @@ _complete_task!(runtime::WorkerRuntime, task_info::TaskInfo, result) =
 _fail_task!(runtime::WorkerRuntime, task_info::TaskInfo, message::String) =
     _finish_task!(runtime, task_info, FAILED; error=message, progress=task_info.progress)
 
-_cancel_task!(runtime::WorkerRuntime, task_info::TaskInfo; message::String="Cancelled") =
-    _finish_task!(runtime, task_info, CANCELLED; error=message, progress=task_info.progress)
+# The message is RENDERED from the run's own token, never passed in. Until #183 this took a
+# `message::String="Cancelled"`, and the two execution paths disagreed about it: `api.jl` passed
+# `"Cancelled by user"` at all three of its call sites while `queue.jl` took the default. Same
+# event, two strings, decided by which submit function the caller happened to use.
+#
+# Worse, the string that named a user was the one no user could produce. A real `cancel_task`
+# claims CANCELLED *before* setting the token, so the run's own write here loses its CAS and
+# stores nothing; likewise a timeout (terminal FAILED) and a supersede (fails the `run_id` fence).
+# The one cause that writes nothing of its own is a teardown drain -- so `"Cancelled by user"` was
+# reachable only when no user had cancelled anything. Reading the reason off the task removes the
+# parameter that made the two paths differ, rather than asking both to remember one string.
+_cancel_task!(runtime::WorkerRuntime, task_info::TaskInfo) =
+    _finish_task!(runtime, task_info, CANCELLED;
+                  error=_cancel_message(cancel_reason(task_info)), progress=task_info.progress)
 
 function _execute_queued_task(runtime::WorkerRuntime, item::QueueItem)
     # The DURABLE read: a live-preferring one here would hand this run its predecessor's
@@ -177,8 +189,9 @@ function _execute_queued_task(runtime::WorkerRuntime, item::QueueItem)
                 #
                 # `unwrapped isa InterruptException` used to be an arm of this test, back when
                 # cancellation was delivered by injecting one. Nothing injects any more, so
-                # the only way one arrives is that the callback itself threw it -- recording
-                # that as "Cancelled by user" would be a lie about who stopped the job (#127).
+                # the only way one arrives is that the callback itself threw it -- and nothing
+                # set a cancel reason for it, so recording it as a cancellation would be a lie
+                # about who stopped the job (#127).
                 latest_info = get_task_info(runtime, task_info.id)
                 if latest_info !== nothing && latest_info.status == CANCELLED
                     return _cancel_task!(runtime, task_info)

@@ -653,13 +653,13 @@ end
     @testset "a drain landing in the retry backoff ends the run CANCELLED" begin
         # The drain writes no terminal state itself, but it still decides one: the retry backoff
         # polls the SAME token (`api.jl`, `queue.jl`), so a shutdown landing inside one exits the
-        # backoff and takes the `_cancel_task!` branch -- recording `CANCELLED` with the stock
-        # "Cancelled by user", for a shutdown no user asked for.
+        # backoff and takes the `_cancel_task!` branch.
         #
-        # Pinned rather than fixed. Reaching a terminal state there is the useful outcome (the
-        # alternative is a job restarting mid-teardown), and making the record say *which* kind of
-        # stop it was needs a reason carried on the token, which is a separate change. This test
-        # exists so the documents describing this contract cannot drift from it silently.
+        # #176 pinned this recording "Cancelled by user" on the async path and "Cancelled" on the
+        # sequential one, deliberately -- the record could not name its cause, and inventing a
+        # string was out of that issue's scope. #183 gave the token a reason, so BOTH paths now
+        # render "Cancelled by worker shutdown" from `:shutdown` and the asymmetry is gone.
+        # Overwriting #176's recorded intent is the point of #183, not a convenience.
         store = InMemoryWorkerStore()
         rt = WorkerRuntime(store)
         entered = Base.Event()
@@ -684,17 +684,16 @@ end
 
             status = get_task_status(id, System(); runtime=rt)
             @test status[:status] == "CANCELLED"
-            @test status[:error] == "Cancelled by user"     # the ASYNC path's message
+            @test status[:error] == "Cancelled by worker shutdown"   # NOT "Cancelled by user"
             # And it did NOT run a second attempt: the backoff bailed instead of retrying.
             @test attempts[] == 1
         finally
             reset_runtime!(rt)
         end
 
-        # The sequential path records a DIFFERENT string -- `queue.jl` takes `_cancel_task!`'s
-        # `"Cancelled"` default where `api.jl` passes `"Cancelled by user"`. The asymmetry
-        # predates #176 and looks accidental, but the upgrade note tells operators what a drained
-        # job looks like in their records, so both strings are pinned rather than one.
+        # The sequential path records the SAME string, which is the half #183 fixed. `_cancel_task!`
+        # no longer takes a message at all -- it renders from the run's own reason -- so there is no
+        # longer a parameter the two paths could pass differently.
         store_q = InMemoryWorkerStore()
         rt_q = WorkerRuntime(store_q)
         owner_q = Owner("u")
@@ -712,10 +711,139 @@ end
 
             status_q = get_task_status(qid, System(); runtime=rt_q)
             @test status_q[:status] == "CANCELLED"
-            @test status_q[:error] == "Cancelled"           # NOT "Cancelled by user"
+            @test status_q[:error] == "Cancelled by worker shutdown"  # identical to the async path
             @test attempts_q[] == 1
         finally
             reset_runtime!(rt_q)
+        end
+    end
+
+    @testset "the four cancellation causes are distinguishable (#183)" begin
+        # The vocabulary itself, unit-level: `cancel_requested` is exactly "the reason is not
+        # :none", so the flag and the cause cannot disagree -- which is the whole argument for one
+        # field over two. A second field would need every setter to write reason-before-flag, a
+        # convention no test can hold in place.
+        t = Nitro.Workers.TaskInfo("u::k")
+        @test cancel_reason(t) === :none
+        @test cancel_requested(t) == false
+
+        for reason in Nitro.Workers.CANCEL_REASONS
+            fresh = Nitro.Workers.TaskInfo("u::k")
+            @test Nitro.Workers._request_cancel!(fresh, reason) == true
+            @test cancel_reason(fresh) === reason
+            @test cancel_requested(fresh) == true
+        end
+
+        # FIRST cause wins, and the setter reports whether it was the one that won. A person who
+        # cancels a job seconds before a deploy must still read as `:user`: the drain fires on
+        # every in-flight run at once, so last-write-wins would make a shutdown the most likely
+        # writer to land last and would rewrite that attribution wholesale.
+        first_wins = Nitro.Workers.TaskInfo("u::k")
+        @test Nitro.Workers._request_cancel!(first_wins, :user) == true
+        @test Nitro.Workers._request_cancel!(first_wins, :shutdown) == false
+        @test cancel_reason(first_wins) === :user
+
+        # One renderer, and `:none` still yields a sentence rather than an error: the durable-read
+        # branches of the retry loop cancel on a record another process wrote, so nothing set a
+        # local token. Those writes always lose their CAS, so the text is never stored -- but it
+        # must not be a crash on the way to losing.
+        @test Nitro.Workers._cancel_message(:user) == "Cancelled by user"
+        @test Nitro.Workers._cancel_message(:timeout) == "Cancelled by timeout"
+        @test Nitro.Workers._cancel_message(:superseded) == "Cancelled by a re-run of this task key"
+        @test Nitro.Workers._cancel_message(:shutdown) == "Cancelled by worker shutdown"
+        @test Nitro.Workers._cancel_message(:none) == "Cancelled"
+    end
+
+    @testset "a user's cancel is the ONLY thing that records \"Cancelled by user\" (#183)" begin
+        # The inversion #183 exists to fix, pinned from the correct side. Before it, a genuine
+        # `cancel_task` stored "Cancelled" -- its own CAS claims the record first, so the run's
+        # `_cancel_task!` lost and its "Cancelled by user" was never written. The only cause that
+        # writes nothing of its own is a drain, so "Cancelled by user" reached a record ONLY when
+        # no user had cancelled anything. It is now exactly the other way round.
+        store = InMemoryWorkerStore()
+        rt = WorkerRuntime(store)
+        owner = Owner("u")
+        entered = Base.Event()
+        # Captured rather than returned: the callback's value is discarded here, because
+        # `cancel_task` already claimed CANCELLED and `_complete_task!`'s CAS loses.
+        seen = Ref{Symbol}(:unset)
+        try
+            id = submit_task("cancellable", function (task_info)
+                notify(entered)
+                while !cancel_requested(task_info)
+                    sleep(0.01)
+                end
+                seen[] = cancel_reason(task_info)
+                return "stopped"
+            end, owner; runtime=rt)
+
+            wait(entered)
+            @test cancel_task(id, owner; runtime=rt)[:status] == "Task cancelled"
+
+            status = get_task_status(id, System(); runtime=rt)
+            @test status[:status] == "CANCELLED"
+            @test status[:error] == "Cancelled by user"
+
+            # The callback saw :user too, so the token and the record agree about provenance.
+            @test timedwait(() -> seen[] !== :unset, 10.0; pollint=0.02) === :ok
+            @test seen[] === :user
+        finally
+            reset_runtime!(rt)
+        end
+    end
+
+    @testset "a superseding re-run marks its predecessor :superseded (#183)" begin
+        # `_register_or_watch!` sets the token on the run it is displacing. That run's own terminal
+        # write then fails the `run_id` fence (#108), so the reason never reaches a record -- it
+        # exists so the displaced CALLBACK can tell "I was replaced" from "a person cancelled me".
+        store = InMemoryWorkerStore()
+        rt = WorkerRuntime(store)
+        owner = Owner("u")
+        try
+            predecessor = Nitro.Workers.TaskInfo("u::job")
+            push!(predecessor.watchers, "u")
+            predecessor.status = COMPLETED          # finished record, still-live run
+            replace_task!(store, predecessor.id, predecessor)
+            Nitro.Workers.register_active_task_info!(rt, predecessor.id, predecessor)
+
+            # Re-running the finished key replaces the record and asks the predecessor to stop.
+            submit_task("job", task_info -> "second run", owner; runtime=rt)
+
+            @test cancel_requested(predecessor) == true
+            @test cancel_reason(predecessor) === :superseded
+        finally
+            reset_runtime!(rt)
+        end
+    end
+
+    @testset "a timeout marks the run :timeout and still records FAILED (#183)" begin
+        # A deadline is the one cause that must NOT start rendering a cancel message: it throws
+        # `TaskTimeoutError`, which is terminal FAILED on the first attempt because nothing can
+        # stop the attempt that timed out (#127). The reason exists for the callback's benefit --
+        # `cancel_requested` on a FAILED task has always meant "the deadline fired", and this is
+        # what says so outright instead of leaving it to be inferred from the status.
+        store = InMemoryWorkerStore()
+        rt = WorkerRuntime(store)
+        seen = Ref{Symbol}(:unset)
+        try
+            id = submit_task("slow", function (task_info)
+                while !cancel_requested(task_info)
+                    sleep(0.02)
+                end
+                seen[] = cancel_reason(task_info)
+                return "noticed"
+            end, Owner("u"); options=TaskOptions(timeout=1), runtime=rt)
+
+            @test timedwait(() -> get_task_status(id, System(); runtime=rt)[:status] == "FAILED",
+                            15.0; pollint=0.05) === :ok
+            status = get_task_status(id, System(); runtime=rt)
+            @test status[:error] == "Timeout of 1s exceeded"
+            @test !occursin("Cancelled", something(status[:error], ""))
+
+            @test timedwait(() -> seen[] !== :unset, 10.0; pollint=0.05) === :ok
+            @test seen[] === :timeout
+        finally
+            reset_runtime!(rt)
         end
     end
 

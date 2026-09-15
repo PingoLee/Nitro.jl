@@ -343,7 +343,7 @@ function _register_or_watch!(runtime::WorkerRuntime, task_key::String, owner::Ow
         # thread it is sitting on. In-process only -- a run hosted on another node is
         # unreachable from here and will keep going until its callback returns.
         previous = get_active_task_info(runtime, task_key)
-        previous === nothing || (@atomic previous.cancel_requested = true)
+        previous === nothing || _request_cancel!(previous, :superseded)
 
         task_info = TaskInfo(task_key; queue_name)
         push!(task_info.watchers, uid)
@@ -456,11 +456,12 @@ function _execute_task_async(runtime::WorkerRuntime, task_key::String, callback:
                     #
                     # `unwrapped isa InterruptException` used to be an arm of this test, back when
                     # cancellation was delivered by injecting one. Nothing injects any more, so
-                    # the only way one arrives is that the callback itself threw it -- recording
-                    # that as "Cancelled by user" would be a lie about who stopped the job (#127).
+                    # the only way one arrives is that the callback itself threw it -- and nothing
+                    # set a cancel reason for it, so recording it as a cancellation would be a lie
+                    # about who stopped the job (#127).
                     latest_info = get_task_info(runtime, task_key)
                     if latest_info !== nothing && latest_info.status == CANCELLED
-                        return _cancel_task!(runtime, task_info; message="Cancelled by user")
+                        return _cancel_task!(runtime, task_info)
                     end
 
                     # A timeout is terminal on the first attempt. Retrying it cannot help and can
@@ -489,11 +490,11 @@ function _execute_task_async(runtime::WorkerRuntime, task_key::String, callback:
                     # The token is process-local, so a cancel issued on another node sets nothing here. One
                     # durable read per ATTEMPT (not per poll) covers that without a round-trip every 50ms.
                     if cancel_requested(task_info)
-                        return _cancel_task!(runtime, task_info; message="Cancelled by user")
+                        return _cancel_task!(runtime, task_info)
                     end
                     resumed = get_task_info(runtime.store, task_key)
                     if resumed !== nothing && resumed.status == CANCELLED
-                        return _cancel_task!(runtime, task_info; message="Cancelled by user")
+                        return _cancel_task!(runtime, task_info)
                     end
                 end
             end
@@ -661,7 +662,7 @@ function cancel_task(task_id::AbstractString, authority::TaskAuthority; runtime:
         cancelled_at = current_time_utc()
         claimed = try_transition!(runtime.store, task_info.id, (PENDING, RUNNING), CANCELLED;
                                   run_id=task_info.run_id,
-                                  error="Cancelled", completed_at=cancelled_at)
+                                  error=_cancel_message(:user), completed_at=cancelled_at)
 
         if !claimed
             # DURABLE: reaching here means the row is no longer in `(PENDING, RUNNING)`, or
@@ -697,7 +698,13 @@ function cancel_task(task_id::AbstractString, authority::TaskAuthority; runtime:
         # not it wins its CAS, so nothing leaks.
         live = get_active_task_info(runtime, task_info.id)
         if live !== nothing && live.run_id == task_info.run_id
-            @atomic live.cancel_requested = true
+            # AFTER the durable claim above, which is why that write renders `:user` directly
+            # rather than reading the token back. The two can legitimately disagree: if a drain
+            # had already asked (`:shutdown`) without claiming anything, this CAS loses and the
+            # token keeps `:shutdown` while the record says "Cancelled by user". Both are true of
+            # what they describe -- the token says who asked FIRST, the record says who CLAIMED
+            # it -- and the claim is the half an operator reads.
+            _request_cancel!(live, :user)
 
             # Mirror the claim onto the live record, which is a REQUIREMENT now that this
             # function no longer deregisters it. `PormGWorkerStore.try_transition!` writes
@@ -712,7 +719,7 @@ function cancel_task(task_id::AbstractString, authority::TaskAuthority; runtime:
             # It also makes the `task_info.status == CANCELLED` poll that the tutorial has
             # always documented actually work under PormG, which it never did.
             live.status = CANCELLED
-            live.error = "Cancelled"
+            live.error = _cancel_message(:user)
             live.completed_at = cancelled_at
         end
 

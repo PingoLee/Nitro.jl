@@ -265,26 +265,43 @@ is also what keeps a genuine process crash recoverable.
   the process in `jl_finish_task` — which is what blocked worker bodies from moving to
   `Threads.@spawn` ([#127](https://github.com/PingoLee/Nitro.jl/issues/127),
   [#30](https://github.com/PingoLee/Nitro.jl/issues/30)). Cancellation is a **token** the callback
-  polls (`cancel_requested`). Four things set it: `cancel_task`, an expired
-  `TaskOptions(timeout=…)`, `_register_or_watch!` displacing a still-executing predecessor on a
-  re-run, and a teardown drain (the `shutdown!` bullet above, #176). Never reintroduce the
-  injection, and do not add a public setter for the token: `cancel_task` is the authorized path,
-  and a second route into it would bypass both the authorization check and the status CAS — those
-  four are not that route, because none of them takes a caller-supplied identity. The token is
-  process-local and never reset — a re-run gets a fresh `TaskInfo`.
+  polls (`cancel_requested`). Four things set it — `cancel_task` (`:user`), an expired
+  `TaskOptions(timeout=…)` (`:timeout`), `_register_or_watch!` displacing a still-executing
+  predecessor on a re-run (`:superseded`), and a teardown drain (`:shutdown`, the `shutdown!`
+  bullet above, #176) — and since
+  [#183](https://github.com/PingoLee/Nitro.jl/issues/183) the token **carries which**. Never
+  reintroduce the injection, and do not add a public setter for the token: `cancel_task` is the
+  authorized path, and a second route into it would bypass both the authorization check and the
+  status CAS — those four are not that route, because none of them takes a caller-supplied
+  identity. The token is process-local and never reset — a re-run gets a fresh `TaskInfo`.
+  - **The reason IS the token — `@atomic cancel_reason::Symbol`, `:none` for "not cancelled".**
+    Not a second field beside a `Bool`, because two atomics need every setter to write
+    reason-before-flag or a reader sees a set token with no cause, and a convention across four
+    sites plus every future one is not a shape a test can hold. `cancel_requested(t)` is exactly
+    `cancel_reason(t) !== :none`.
+  - **`_request_cancel!` is the only writer, it is private, and the FIRST cause wins.** It is a
+    CAS off `:none`, not an assignment: a drain fires on every in-flight run at once, so
+    last-write-wins would make a shutdown the likeliest final writer and would overwrite a
+    person's cancel. Keep it unexported — a public setter for the reason would be exactly the
+    second route into the token the bullet above forbids.
+  - **`_cancel_task!` renders the stored message from the reason and takes no `message`.** That
+    parameter is what let `api.jl` and `queue.jl` record different text for one event; deleting it
+    is why they cannot diverge again. Add a new cause to `CANCEL_REASONS` and `_cancel_message`
+    together, never a new string at a call site.
 - **A drain writes no terminal state of its own, but it still decides one.** `cancel_task` claims
   `CANCELLED` before setting the token and an expired deadline throws; a drain claims nothing,
   because a terminal write there would race the run's own — the #88/#108 failure mode. What the run
   then records is its own doing: `COMPLETED` with whatever it returns, `FAILED` if it throws with
   no retry left, **or `CANCELLED` if the token lands while it is parked in the retry backoff**,
-  which polls the same token. That last one is worth knowing before you document this contract
-  anywhere: reaching a terminal state there is right (better than a job restarting mid-teardown),
-  but the stock message names a user who did nothing, and the record cannot distinguish a person's
-  cancel from a shutdown's. **The message is not even the same on both paths** — `api.jl` passes
-  `"Cancelled by user"`, `queue.jl` takes `_cancel_task!`'s `"Cancelled"` default. That asymmetry
-  predates #176 and looks accidental; do not write either string into documentation as though it
-  were the one. Do not "fix" the race by pre-claiming a
-  status; if the provenance matters, that is a reason on the token, not a write from the drain.
+  which polls the same token. Reaching a terminal state there is right — better than a job
+  restarting mid-teardown — and since #183 the record says so: the drain sets `:shutdown`, so that
+  run stores `"Cancelled by worker shutdown"` on **both** submit paths. Do not "fix" the race by
+  pre-claiming a status from the drain; the provenance rides on the token, which is what #183 did.
+  - Before #183 this stored `"Cancelled by user"` on the async path and `"Cancelled"` on the
+    sequential one — and the string naming a user was reachable *only* from a shutdown, since
+    every other cause either claims the record first or loses the `run_id` fence, leaving the
+    run's own write to lose its CAS. Worth remembering when reading pre-#183 records: there, a
+    `CANCELLED` task whose error says "by user" was almost certainly a deploy.
 - **A timeout bounds the wait, not the work, and is never retried.** Nothing stops the attempt
   that timed out, so retrying it runs a second copy of the callback beside the first against one
   `task_info`. `TaskTimeoutError` is terminal on the first attempt.
