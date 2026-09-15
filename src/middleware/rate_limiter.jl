@@ -15,6 +15,37 @@ export RateLimiter
 # call so callers can't mutate a shared response object's headers.
 SERVICE_UNAVAILABLE() = HTTP.Response(503, "Service Unavailable")
 
+"""
+    RateLimiter(; strategy::Symbol = :fixed_window, kwargs...)
+
+Per-client request rate limiting, as a [`LifecycleMiddleware`](@ref Nitro.LifecycleMiddleware).
+Every keyword other than `strategy` is forwarded to the chosen strategy.
+
+`strategy` picks the algorithm, and **only the algorithm** — both strategies return the same
+type (#172), so nothing about composing the result depends on which one you chose:
+
+- `:fixed_window` (default) — [`FixedRateLimiter`](@ref). One counter per client per window, in
+  an unbounded striped `Dict` reaped by a background sweep that `serve()` starts and
+  `terminate()` stops. Cheapest per request; a client can burst across a window boundary.
+- `:sliding_window` — [`SlidingRateLimiter`](@ref). One timestamp per request per client in a
+  size-bounded striped LRU, pruned inline. No background task, so both lifecycle hooks are
+  `nothing`. More precise, more memory, and `max_clients` bounds it rather than a sweep.
+
+Both key on a *prefix* of the client address — `/32` for IPv4 and `/64` for IPv6 by default —
+so an IPv6 client cannot buy quota by rotating source addresses inside its own allocation
+(#22). See the two strategy docstrings for the full keyword list.
+
+```julia
+serve(app, middleware = [RateLimiter(rate_limit = 100, window = Minute(1))])
+
+# Behind a proxy, name the proxy and the one header it writes:
+RateLimiter(strategy = :sliding_window, rate_limit = 100,
+            forwarded_header = :x_forwarded_for, trusted_proxies = [ip"127.0.0.1"])
+```
+
+`serve()` and `path()`/`urlpatterns()` accept the result directly; only code composing a
+middleware chain by hand needs the `.middleware` field.
+"""
 function RateLimiter(;strategy::Symbol = :fixed_window, kwargs...)
     # The element type is load-bearing: `Dict(kwargs)` narrows to the value type it happens to
     # see, so `RateLimiter(rate_limit=100)` built a `Dict{Symbol, Int64}` and missed the
@@ -279,7 +310,10 @@ This implementation uses UTC time to avoid timezone and DST issues. Significant 
 Concurrency: the store is striped across independent locks chosen by bucket-key hash, so two clients contend only when their keys collide. The background sweep walks one stripe at a time and therefore never stalls more than its share of the traffic.
 
 # Returns
-An `LifecycleMiddleware` struct containing the middleware function and a cleanup function to stop the background task on server shutdown.
+A [`LifecycleMiddleware`](@ref Nitro.LifecycleMiddleware). Its `on_startup` spawns the background
+cleanup sweep and `on_shutdown` signals it to stop, so `serve()` and `terminate()` own the task's
+lifetime. Pass it straight to `serve(middleware = [...])` or `path(...; middleware = [...])`; only
+hand-composition needs its `.middleware` field.
 """
 function FixedRateLimiter(;
     rate_limit          :: Int = 100,
@@ -533,7 +567,9 @@ too small to divide (under 128 entries) use a single stripe and behave exactly a
 - Concurrency: the downstream handler runs **outside** the limiter's internal lock, so a slow handler delays only its own request. The lock guards only the per-client timestamp bucket; `X-RateLimit-Remaining`/`-Reset` are sampled when the request is admitted.
 
 # Returns
-A middleware function with signature: `handle -> req -> response`
+A [`LifecycleMiddleware`](@ref Nitro.LifecycleMiddleware) whose `on_startup`/`on_shutdown` are
+both `nothing` — this strategy owns no background task. Pass it straight to `serve(middleware =
+[...])` or `path(...; middleware = [...])`; only hand-composition needs its `.middleware` field.
 """
 function SlidingRateLimiter(;
     rate_limit      :: Int = 100,
@@ -673,11 +709,18 @@ function SlidingRateLimiter(;
     end
 
     # Compose with IP extraction if auto_extract_ip is enabled
-    function extract_ip_and_rate_limit(handle::Function)
+    function extract_ip_and_rate_limit(handle::Function) :: Function
         return reduce(|>, [handle, rate_limit_only, extract_client_ip])
     end
 
-    return auto_extract_ip ? extract_ip_and_rate_limit : rate_limit_only
+    # A `LifecycleMiddleware` with both hooks left `nothing` (#172). This strategy owns no
+    # background task — its LRU evicts by size, so there is nothing to start or stop — but
+    # `RateLimiter(strategy = ...)` must not hand back a different TYPE depending on which
+    # algorithm you picked. `startup`/`shutdown` already no-op on a `nothing` hook
+    # (src/types.jl), so the wrapper costs one allocation at construction and nothing per
+    # request.
+    return LifecycleMiddleware(;
+        middleware = auto_extract_ip ? extract_ip_and_rate_limit : rate_limit_only)
 end
 
 
