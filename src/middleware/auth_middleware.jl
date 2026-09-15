@@ -86,7 +86,9 @@ Responses follow the auth error contract: missing/malformed credentials or a fai
 throwing) validator yields a `401`; authorization denials are the guards' `403`.
 
 # Returns
-A `LifecycleMiddleware` struct containing the middleware function and a no-op shutdown function.
+A plain middleware closure, `handle -> req -> resp`. Unlike `RateLimiter`, `AccessLog` and
+`SessionMiddleware`, this one owns no background resource, so there is nothing to hook and it is
+not a `LifecycleMiddleware` — pass it to `serve(middleware = [...])` or `path(...)` as-is.
 """
 function BearerAuth(validate_token::Function; header::String = "Authorization", scheme::String = "Bearer", cookie_name::Nullable{String} = nothing)
 

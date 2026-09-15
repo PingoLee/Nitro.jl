@@ -168,7 +168,9 @@ end
 
 `SessionMiddleware` calls it from a **background janitor**, not from the request path: the
 janitor starts on `serve()`, stops on `terminate()`, and ticks every `prune_interval`
-(default 10 minutes).
+(default 10 minutes). That is what the [`LifecycleMiddleware`](@ref Nitro.Core.Types.LifecycleMiddleware)
+`SessionMiddleware` returns is for — its `on_startup`/`on_shutdown` hooks own the janitor's
+lifetime.
 
 ```julia
 SessionMiddleware(store = store, prune_interval = Minute(5))

@@ -15,6 +15,37 @@ export RateLimiter
 # call so callers can't mutate a shared response object's headers.
 SERVICE_UNAVAILABLE() = HTTP.Response(503, "Service Unavailable")
 
+"""
+    RateLimiter(; strategy::Symbol = :fixed_window, kwargs...)
+
+Per-client request rate limiting, as a [`LifecycleMiddleware`](@ref).
+Every keyword other than `strategy` is forwarded to the chosen strategy.
+
+`strategy` picks the algorithm, and **only the algorithm** — both strategies return the same
+type (#172), so nothing about composing the result depends on which one you chose:
+
+- `:fixed_window` (default) — [`FixedRateLimiter`](@ref). One counter per client per window, in
+  an unbounded striped `Dict` reaped by a background sweep that `serve()` starts and
+  `terminate()` stops. Cheapest per request; a client can burst across a window boundary.
+- `:sliding_window` — [`SlidingRateLimiter`](@ref). One timestamp per request per client in a
+  size-bounded striped LRU, pruned inline. No background task, so both lifecycle hooks are
+  `nothing`. More precise, more memory, and `max_clients` bounds it rather than a sweep.
+
+Both key on a *prefix* of the client address — `/32` for IPv4 and `/64` for IPv6 by default —
+so an IPv6 client cannot buy quota by rotating source addresses inside its own allocation
+(#22). See the two strategy docstrings for the full keyword list.
+
+```julia
+serve(app, middleware = [RateLimiter(rate_limit = 100, window = Minute(1))])
+
+# Behind a proxy, name the proxy and the one header it writes:
+RateLimiter(strategy = :sliding_window, rate_limit = 100,
+            forwarded_header = :x_forwarded_for, trusted_proxies = [ip"127.0.0.1"])
+```
+
+`serve()` and `path()`/`urlpatterns()` accept the result directly; only code composing a
+middleware chain by hand needs the `.middleware` field.
+"""
 function RateLimiter(;strategy::Symbol = :fixed_window, kwargs...)
     # The element type is load-bearing: `Dict(kwargs)` narrows to the value type it happens to
     # see, so `RateLimiter(rate_limit=100)` built a `Dict{Symbol, Int64}` and missed the
@@ -185,6 +216,66 @@ function _bounded_stripe_count(max_entries::Int)
     return min(_DEFAULT_STRIPES, prevpow(2, fld(max_entries, _MIN_ENTRIES_PER_STRIPE)))
 end
 
+# Reaps every bucket whose window last reset more than `cleanup_threshold` ago.
+#
+# A named function rather than an inline loop so the janitor's `try` wraps ONE call, the same
+# shape `_prune_janitor` has around `prunesessions!` (src/middleware/session_middleware.jl). An
+# inline body invites a later edit to hoist the `try` outside the `while`, which turns a single
+# transient failure into a permanently dead sweep with a still-green suite (#169).
+function _sweep_expired!(stripes::Vector{<:_Stripe}, cleanup_threshold::Period,
+                         current_time::DateTime)
+    # One stripe at a time: the sweep is O(N) in that stripe, and holding all of them
+    # would reinstate exactly the global stall striping exists to remove.
+    for stripe in stripes
+        lock(stripe.lock) do
+            to_delete = BucketKey[]
+            # Collect first, delete after — mutating a collection while iterating it
+            # is not a supported pattern. (On the current `Dict` a `delete!` only
+            # tombstones and never rehashes, so the one-pass form happens to work;
+            # this does not depend on that.)
+            for (key, (_, last_reset)) in stripe.store
+                if current_time - last_reset > cleanup_threshold
+                    push!(to_delete, key)
+                end
+            end
+            for key in to_delete
+                delete!(stripe.store, key)
+            end
+        end
+    end
+    return nothing
+end
+
+# The janitor loop `on_startup` spawns. Named, rather than written inline into the
+# `Threads.@spawn`, for two reasons: the `try` placement is the whole point of #169 and a named
+# function lets a test drive the loop over a deliberately-failing store (the limiter's own
+# stripes are closure-local and cannot be reached any other way), and it keeps `on_startup`
+# short enough that the spawn's rationale comment stays next to the spawn.
+#
+# `token` is per activation, never a shared `running` flag — see `FixedRateLimiter`.
+function _cleanup_loop(token::Ref{Bool}, stripes::Vector{<:_Stripe},
+                       cleanup_period::Period, cleanup_threshold::Period)
+    while token[]
+        sleep(cleanup_period)
+        # Re-check AFTER the sleep: `on_shutdown` may have fired while we were parked, and
+        # this is the point a stale task from a previous activation leaves for good.
+        token[] || break
+        # The `try` is INSIDE the `while` on purpose. Hoisting it out turns one transient
+        # failure into a permanently dead sweep — silently, since nothing waits on this task —
+        # in the component whose entire job is bounding memory. That is #169.
+        try
+            _sweep_expired!(stripes, cleanup_threshold, now(UTC))
+        catch e
+            # Rethrow guard, per the idiom in src/utilities/misc.jl and src/types.jl: a
+            # catch-all that eats `InterruptException` makes Ctrl-C during a sweep a no-op.
+            # The window is narrow (the `sleep` is outside the `try`), but the guard is free.
+            e isa InterruptException && rethrow()
+            @error "Nitro.RateLimiter: bucket cleanup sweep failed" exception=(e, catch_backtrace())
+        end
+    end
+    return nothing
+end
+
 """
     FixedRateLimiter(; rate_limit::Int = 100, window::Period = Minute(1), cleanup_period::Period = Minute(10), cleanup_threshold::Period = Minute(10), auto_extract_ip::Bool = true, forwarded_header::Symbol = :none, trusted_proxies = nothing, fail_open::Bool = false, exempt_paths::Vector{String} = String[], ipv4_prefix::Int = 32, ipv6_prefix::Int = 64)
 
@@ -223,7 +314,10 @@ This implementation uses UTC time to avoid timezone and DST issues. Significant 
 Concurrency: the store is striped across independent locks chosen by bucket-key hash, so two clients contend only when their keys collide. The background sweep walks one stripe at a time and therefore never stalls more than its share of the traffic.
 
 # Returns
-An `LifecycleMiddleware` struct containing the middleware function and a cleanup function to stop the background task on server shutdown.
+A [`LifecycleMiddleware`](@ref). Its `on_startup` spawns the background
+cleanup sweep and `on_shutdown` signals it to stop, so `serve()` and `terminate()` own the task's
+lifetime. Pass it straight to `serve(middleware = [...])` or `path(...; middleware = [...])`; only
+hand-composition needs its `.middleware` field.
 """
 function FixedRateLimiter(;
     rate_limit          :: Int = 100,
@@ -241,8 +335,10 @@ function FixedRateLimiter(;
     # Validate parameters
     rate_limit > 0 || throw(ArgumentError("rate_limit must be positive, got $rate_limit"))
     # `Dates.value(...) > 0` was the old test and it admits calendar periods: `Month(1)` has
-    # value 1, so it passed, and then `sleep(cleanup_period)` threw inside the un-monitored
-    # `@async` sweep — killing the background cleanup silently, for the life of the process.
+    # value 1, so it passed, and then `sleep(cleanup_period)` threw inside the sweep — which was
+    # an un-monitored `@async` at the time, so the background cleanup died silently for the life
+    # of the process. #169 closed that second half; this check still closes the first, and
+    # rejecting at construction still beats reporting from a background task.
     require_fixed_period("window", window)
     require_fixed_period("cleanup_period", cleanup_period)
     require_fixed_period("cleanup_threshold", cleanup_threshold)
@@ -286,33 +382,21 @@ function FixedRateLimiter(;
         token = Ref(true)
         active[] = token
 
-        # Start Background cleanup task
-        cleanup_task[] = @async while token[]
-            sleep(cleanup_period)
-            # Re-check AFTER the sleep: `on_shutdown` may have fired while we were parked, and
-            # this is the point a stale task from a previous activation leaves for good.
-            token[] || break
-            current_time = now(UTC)
-            # One stripe at a time: the sweep is O(N) in that stripe, and holding all of them
-            # would reinstate exactly the global stall striping exists to remove.
-            for stripe in stripes
-                lock(stripe.lock) do
-                    to_delete = BucketKey[]
-                    # Collect first, delete after — mutating a collection while iterating it
-                    # is not a supported pattern. (On the current `Dict` a `delete!` only
-                    # tombstones and never rehashes, so the one-pass form happens to work;
-                    # this does not depend on that.)
-                    for (key, (_, last_reset)) in stripe.store
-                        if current_time - last_reset > cleanup_threshold
-                            push!(to_delete, key)
-                        end
-                    end
-                    for key in to_delete
-                        delete!(stripe.store, key)
-                    end
-                end
-            end
-        end
+        # `Threads.@spawn`, not `@async` (#169). `@async` produces a STICKY task, pinned for life
+        # to the thread that ran `startserver` — which is also serving requests. The fixed
+        # limiter's store is unbounded: nothing but this sweep reaps it, so under exactly the
+        # rotating-source-address traffic #22 exists to bound, the sweep is O(total buckets) of
+        # CPU work stuck on a request-handling thread. Migration is free here by the criterion
+        # in src/Workers/api.jl: nothing injects into this task, every lock is a `ReentrantLock`
+        # (which keys on `current_task()`, so a migrating task keeps what it holds), and there
+        # is no `Threads.threadid()` or task-local state anywhere in the sweep.
+        #
+        # `errormonitor` for the reason `_prune_janitor` has it: nothing waits on this task, so
+        # without the monitor a throw is stored in the `Task` and never surfaces — the sweep
+        # dies mute and the store stops being reaped for the life of the process. The loop's
+        # own per-tick `try` is in `_cleanup_loop`.
+        cleanup_task[] = errormonitor(
+            Threads.@spawn _cleanup_loop(token, stripes, cleanup_period, cleanup_threshold))
         return cleanup_task[]
     end
 
@@ -487,7 +571,9 @@ too small to divide (under 128 entries) use a single stripe and behave exactly a
 - Concurrency: the downstream handler runs **outside** the limiter's internal lock, so a slow handler delays only its own request. The lock guards only the per-client timestamp bucket; `X-RateLimit-Remaining`/`-Reset` are sampled when the request is admitted.
 
 # Returns
-A middleware function with signature: `handle -> req -> response`
+A [`LifecycleMiddleware`](@ref) whose `on_startup`/`on_shutdown` are
+both `nothing` — this strategy owns no background task. Pass it straight to `serve(middleware =
+[...])` or `path(...; middleware = [...])`; only hand-composition needs its `.middleware` field.
 """
 function SlidingRateLimiter(;
     rate_limit      :: Int = 100,
@@ -627,11 +713,18 @@ function SlidingRateLimiter(;
     end
 
     # Compose with IP extraction if auto_extract_ip is enabled
-    function extract_ip_and_rate_limit(handle::Function)
+    function extract_ip_and_rate_limit(handle::Function) :: Function
         return reduce(|>, [handle, rate_limit_only, extract_client_ip])
     end
 
-    return auto_extract_ip ? extract_ip_and_rate_limit : rate_limit_only
+    # A `LifecycleMiddleware` with both hooks left `nothing` (#172). This strategy owns no
+    # background task — its LRU evicts by size, so there is nothing to start or stop — but
+    # `RateLimiter(strategy = ...)` must not hand back a different TYPE depending on which
+    # algorithm you picked. `startup`/`shutdown` already no-op on a `nothing` hook
+    # (src/types.jl), so the wrapper costs one allocation at construction and nothing per
+    # request.
+    return LifecycleMiddleware(;
+        middleware = auto_extract_ip ? extract_ip_and_rate_limit : rate_limit_only)
 end
 
 
