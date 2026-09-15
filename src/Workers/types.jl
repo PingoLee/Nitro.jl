@@ -422,12 +422,23 @@ end
 
 struct QueueItem
     task_key::String
+    # The run this item was queued FOR, not merely the key it was queued under. A queued item can
+    # sit in the buffer while its key moves on — `cancel_task` makes the record terminal, a
+    # re-submit then replaces it with a fresh run — so by the time a teardown abandons the backlog
+    # the record under `task_key` may belong to somebody else. Writing a terminal state addressed
+    # to the key rather than to the run is the #108/#167 defect, and workers §6 forbids it
+    # outright; `_abandon_queued_item!` fences on this ([#182](https://github.com/PingoLee/Nitro.jl/issues/182)).
+    #
+    # `_execute_queued_task` deliberately does NOT use it: run-start re-reads the record durably
+    # and claims from whatever it finds, which is the correct claiming read (#167). This exists
+    # for the write that happens when the item is never run at all.
+    run_id::UUID
     callback::Function
     options::TaskOptions
     created_at::DateTime
 
-    function QueueItem(task_key::String, callback::Function, options::TaskOptions)
-        return new(task_key, callback, options, current_time_utc())
+    function QueueItem(task_key::String, run_id::UUID, callback::Function, options::TaskOptions)
+        return new(task_key, run_id, callback, options, current_time_utc())
     end
 end
 
@@ -437,9 +448,22 @@ mutable struct SequentialQueue
     current_task::Union{Nothing, String}
     exec_lock::ReentrantLock
     processor_task::Union{Nothing, Task}
+    # Set by `shutdown!` before it closes the channel: this queue is being torn down, so the
+    # processor must record whatever it has already taken as abandoned rather than start it
+    # ([#182](https://github.com/PingoLee/Nitro.jl/issues/182)).
+    #
+    # **On the QUEUE, not on the runtime**, and that placement is the whole design. A
+    # runtime-level flag would have to be RESET for the documented shutdown-then-reuse case, and
+    # the reset races a concurrent `submit_sequential_task` -- clearing it mid-teardown re-opens
+    # exactly the window this closes. `shutdown!` empties the queue registry, so a reused runtime
+    # mints fresh `SequentialQueue`s that are not draining *by construction*, and the only reader
+    # of a dead queue's flag is its own processor, which is precisely who should see it.
+    #
+    # `@atomic` because the writer is `shutdown!` and the reader is the processor task.
+    @atomic draining::Bool
 
     function SequentialQueue(size::Int=100)
-        return new(Channel{QueueItem}(size), false, nothing, ReentrantLock(), nothing)
+        return new(Channel{QueueItem}(size), false, nothing, ReentrantLock(), nothing, false)
     end
 end
 

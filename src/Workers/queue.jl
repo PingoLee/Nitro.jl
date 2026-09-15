@@ -110,6 +110,39 @@ _cancel_task!(runtime::WorkerRuntime, task_info::TaskInfo) =
     _finish_task!(runtime, task_info, CANCELLED;
                   error=_cancel_message(cancel_reason(task_info)), progress=task_info.progress)
 
+# Record a queued task that a teardown will never run (#182).
+#
+# Closing a queue's channel stops new SUBMISSIONS; it does not stop the processor, which keeps
+# `take!`-ing whatever is already buffered until the channel raises. So before this, a teardown
+# could START runs that were never in the drain's snapshot: no cancellation token, no wait, and a
+# `RUNNING` record published into a runtime that was being torn down. Discarding the backlog
+# silently is not the alternative -- those records strand at `PENDING`, and `recover_zombie_tasks!`
+# only ever looks at `RUNNING`, so nothing would reap them. Sidekiq and River both stop FETCHING
+# first and then settle what is left; this is the settling half.
+#
+# CANCELLED rather than FAILED: nothing failed, and `FAILED` is what the zombie sweep writes, so
+# reusing it would merge two causes under one status again -- the defect #183 just removed. The run
+# never started, so there is no handle, no `register_run!`, and no token to set.
+#
+# **Fenced on the ITEM's `run_id`, and a CAS from `PENDING` only.** This is a terminal write, so
+# workers §6 addresses it to a RUN, never to a task id. Re-reading the record and fencing on what
+# comes back would be no fence at all -- it would agree with whatever currently owns the key, which
+# is exactly the successor this must not cancel. A queued item can outlive its run: `cancel_task`
+# makes the record terminal while the item is still buffered, a re-submit then replaces it with a
+# fresh run, and that successor may be about to start on the async path where no queue item is
+# abandoning anything.
+#
+# `item.run_id` is what `_register_or_watch!` minted for this item, so no read can drift from it.
+# The CAS also makes this idempotent, which it must be: `shutdown!` drains the buffer itself AND
+# the processor checks `draining` for anything it had already taken, so one item can reach here
+# twice and the second call writes nothing.
+function _abandon_queued_item!(runtime::WorkerRuntime, item::QueueItem)
+    return try_transition!(runtime.store, item.task_key, (PENDING,), CANCELLED;
+                           run_id=item.run_id,
+                           error=_cancel_message(:shutdown),
+                           completed_at=current_time_utc())
+end
+
 function _execute_queued_task(runtime::WorkerRuntime, item::QueueItem)
     # The DURABLE read: a live-preferring one here would hand this run its predecessor's
     # `TaskInfo` when a terminal-but-still-executing key is re-run, and the fenced start below
@@ -257,6 +290,26 @@ function _start_queue_processor(runtime::WorkerRuntime, queue_name::String)
                             break
                         end
                         rethrow(error)
+                    end
+
+                    # BEFORE `_mark_queue_current_task!` and before `_execute_queued_task`'s
+                    # `register_run!`, so once `draining` is visible no further run starts,
+                    # publishes a handle into the runtime being torn down, and claims RUNNING with
+                    # nothing waiting on it (#182). A processor that read `false` a moment before
+                    # `shutdown!` set it can still register after `_snapshot_runs` -- the window is
+                    # narrowed, not closed, exactly as workers §5 says of the zombie sweep.
+                    #
+                    # `shutdown!` drains the buffer itself, so what this actually catches is the
+                    # narrow case that loop cannot reach: an item this processor had ALREADY taken
+                    # when the teardown began. `_abandon_queued_item!` is idempotent, so the two
+                    # abandoners cannot fight over one item.
+                    if (@atomic queue.draining)
+                        try
+                            _abandon_queued_item!(runtime, item)
+                        catch error
+                            @error "Worker queue item abandoned but not recorded during teardown" exception=(error, catch_backtrace()) queue_name=queue_name task_key=item.task_key
+                        end
+                        continue
                     end
 
                     lock(queue.exec_lock) do

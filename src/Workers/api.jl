@@ -282,6 +282,15 @@ function _authorize_grant!(store::AbstractWorkerStore, task_key::String,
     return nothing
 end
 
+# Returns the new run's `run_id` when the caller should START it, and `nothing` when the caller
+# merely joined an existing one as a watcher.
+#
+# It returned a `Bool` until #182. The identity is what `submit_sequential_task` puts on the
+# `QueueItem`, so that a teardown abandoning the backlog writes a terminal state ADDRESSED TO THE
+# RUN that queued the item rather than to its key (workers §6). Deriving it at the abandon site by
+# re-reading the record does not work: by then the record may belong to a successor, and the write
+# would cancel a run that is about to start. This is the only place the identity is known for
+# certain, because it is where the run is minted.
 function _register_or_watch!(runtime::WorkerRuntime, task_key::String, owner::Owner;
                              queue_name::Union{Nothing, String}=nothing,
                              grants::AbstractVector{Owner}=Owner[])
@@ -333,7 +342,7 @@ function _register_or_watch!(runtime::WorkerRuntime, task_key::String, owner::Ow
             for grant in grants
                 add_watcher!(runtime, task_key, grant.user_id)
             end
-            return false
+            return nothing
         end
 
         # Re-running a finished key replaces the record and resets its watchers to the
@@ -353,7 +362,7 @@ function _register_or_watch!(runtime::WorkerRuntime, task_key::String, owner::Ow
         # Through the RUNTIME: publishing a successor also evicts the run it displaced from
         # the live caches, so nothing later reads a run that no longer owns this key.
         replace_task!(runtime, task_key, task_info)
-        return true
+        return task_info.run_id
     end
 end
 
@@ -561,8 +570,10 @@ function submit_task(task_key::AbstractString, callback::Function, owner::Owner;
     _authorize_queue!(runtime.store, DEFAULT_QUEUE_NAME, owner)
 
     key = scoped_task_key(task_key, owner; scope)
-    should_start = _register_or_watch!(runtime, key, owner; grants=watchers)
-    if should_start
+    # The async path does not carry the run identity: `_execute_task_async` re-reads the record
+    # durably at run-start, which is the claiming read the rule requires. Only a QUEUED item needs
+    # it plumbed, because it may sit in a buffer long enough for the record to move on.
+    if _register_or_watch!(runtime, key, owner; grants=watchers) !== nothing
         _execute_task_async(runtime, key, callback, options)
     end
     return key
@@ -589,8 +600,8 @@ function submit_sequential_task(queue_name::AbstractString, task_key::AbstractSt
     _authorize_queue!(runtime.store, queue_id, owner)
 
     key = scoped_task_key(task_key, owner; scope)
-    should_start = _register_or_watch!(runtime, key, owner; queue_name=queue_id, grants=watchers)
-    if should_start
+    run_id = _register_or_watch!(runtime, key, owner; queue_name=queue_id, grants=watchers)
+    if run_id !== nothing
         # One lookup, not two. `_start_queue_processor` already returns the queue it spawned a
         # processor for, and a second `_get_or_create_queue` can return a DIFFERENT object: since
         # `shutdown!` empties the registry, a teardown landing between the two calls makes the
@@ -598,7 +609,31 @@ function submit_sequential_task(queue_name::AbstractString, task_key::AbstractSt
         # then succeed and the task would sit PENDING with nothing draining it -- a silent hang in
         # place of the loud `InvalidStateException` a closed channel raises.
         queue = _start_queue_processor(runtime, queue_id)
-        put!(queue.channel, QueueItem(key, callback, options))
+        item = QueueItem(key, run_id, callback, options)
+
+        # A teardown landing between resolving the queue and handing it the item makes this
+        # `put!` throw, and the record written a moment ago by `_register_or_watch!` is then
+        # `PENDING` with nothing that will ever run it -- the same orphan #182 removes from the
+        # buffered backlog, arriving through the one door closing the channel leaves open. It is
+        # not rare: `close` raises in every submitter already blocked on a full `Channel(100)`,
+        # so a busy queue torn down mid-deploy produces one of these per waiter.
+        #
+        # The exception still propagates -- the caller has to learn the submission failed, which
+        # is the whole argument for the loud close over a silent hang -- but the record is now
+        # terminal rather than abandoned.
+        try
+            put!(queue.channel, item)
+        catch error
+            error isa InvalidStateException || rethrow()
+            try
+                _abandon_queued_item!(runtime, item)
+            catch abandon_error
+                # Never let bookkeeping replace the caller's exception: the `put!` failure is
+                # what they must see, and a store that is also down would otherwise mask it.
+                @error "Worker task orphaned by a teardown could not be recorded" exception=(abandon_error, catch_backtrace()) task_key=key
+            end
+            rethrow()
+        end
     end
     return key
 end

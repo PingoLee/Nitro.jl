@@ -214,21 +214,28 @@ the wait.
     `drain_timeout` **plus** `serve(shutdown_timeout = …)`, 15 seconds with both defaults. Size
     them together against your container's stop grace period.
 
-Two limits worth knowing:
+Two things worth knowing:
 
 - A run abandoned past the deadline **keeps its handle registered**, so `recover_zombie_tasks!`
   will not declare it dead — but that only helps a runtime that is *reused*. A
   `serve → terminate → serve` cycle with `store=` builds a fresh `WorkerRuntime` each time, whose
   handles start empty; there, finishing the run inside the drain is the only thing that saves it.
-- Closing a sequential queue stops new submissions but the processor still works through what is
-  already buffered, so runs can start during and after the drain. They get neither the token nor
-  the wait.
+- **A sequential queue's unstarted backlog is abandoned, not executed.** Closing the channel stops
+  new submissions; the teardown also stops the processor taking work, and records every task still
+  queued as `CANCELLED` with `"Cancelled by worker shutdown"`. It used to let the processor work
+  through the buffer, so a teardown could *start* jobs that got neither the token nor the wait.
+  Resubmit them when the process comes back — they have a terminal status, so a re-submit under
+  the same key builds a fresh run rather than joining a ghost.
 
-The drain claims no terminal state itself — that write would race the run's own — so a drained run
-records whatever it reaches on its own:
+  This happens even at `drain_timeout=0`: that setting means "do not wait", and abandoning a
+  backlog costs no wait.
+
+The drain claims no terminal state for a **running** task — that write would race the run's own —
+so a drained run records whatever it reaches on its own:
 
 | The run was… | It records |
 |---|---|
+| queued, never started | `CANCELLED`, error `"Cancelled by worker shutdown"` |
 | running its callback, which returns on the token | `COMPLETED`, carrying whatever it returned |
 | running its callback, which throws | `FAILED` with that message (or a retry, if one is left) |
 | parked **between retries**, in the cancellation-aware backoff | `CANCELLED`, error `"Cancelled by worker shutdown"` |

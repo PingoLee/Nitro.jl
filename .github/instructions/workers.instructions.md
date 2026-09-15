@@ -222,6 +222,12 @@ is also what keeps a genuine process crash recoverable.
   handle teardown: only the run that owns the runtime's `active_tasks[id]` may deregister it,
   because `recover_zombie_tasks!` reads liveness from exactly that entry. One `TaskInfo` object is
   one run; a re-run is a new object, never a mutated one.
+  - **A write that fences on a run it just re-read is not fenced.** `_abandon_queued_item!` (#182)
+    writes a terminal state for a task that never started, and re-reading the record to get a
+    `run_id` would agree with whatever currently owns the key — precisely the successor the fence
+    exists to spare. So `QueueItem` carries the `run_id` `_register_or_watch!` minted for it. The
+    rule generalises: a fence value must come from *before* the window it guards, never from
+    inside it.
 - **`shutdown!` drains, within a bound, and releases only what settled**
   ([#176](https://github.com/PingoLee/Nitro.jl/issues/176)). It sets every in-flight run's
   cancellation token **first**, waits up to `drain_timeout` seconds, then deletes the handles of
@@ -231,6 +237,26 @@ is also what keeps a genuine process crash recoverable.
   `recover_zombie_tasks!` declaring a live run dead; `_finish_task!` reclaims it when the callback
   returns. The sweep touches `active_tasks` only — `active_task_infos` stays populated, or a run
   outliving a teardown would be uncancellable.
+  - **A teardown stops the queues FETCHING before it drains the runs**
+    ([#182](https://github.com/PingoLee/Nitro.jl/issues/182)). Closing a channel only stops
+    submissions; the processor kept working through the buffer, so a teardown started runs that
+    were never in the snapshot — no token, no wait, `RUNNING` rows nothing awaited. `shutdown!` now
+    sets `queue.draining`, closes, **collects the buffer**, and records every collected item
+    `CANCELLED` / `"Cancelled by worker shutdown"`. Three rules hold it together:
+    - **`draining` lives on the `SequentialQueue`, never on the `WorkerRuntime`.** A runtime-level
+      flag would need resetting for the documented shutdown-then-reuse case, and the reset races a
+      concurrent submit. `shutdown!` empties the registry, so a reused runtime mints queues that
+      are not draining *by construction*.
+    - **Set `draining` → close → collect, in that order.** `put!` on a closed channel throws, so
+      collecting after the close is airtight; collecting first leaves a window for a submit.
+    - **The abandon write happens OUTSIDE `queue_lock`.** It is a store write, and the processor
+      takes the store lock (`_finish_task!`) and then `queue_lock` (its `finally`) — holding
+      `queue_lock` across a store write is that pair inverted. One `lock_tasks` for the batch.
+
+    It is **unconditional, including at `drain_timeout = 0`**: that keyword means *do not wait*,
+    and abandoning a backlog costs no wait. It is the one respect in which `0` is no longer
+    byte-for-byte pre-#176. The return value is unaffected — it still means *did every in-flight
+    run settle*, and abandoned items are terminal before it returns.
   - **In `_run_settled`, the info clause is what terminates every production wait; `istaskdone` is
     a backstop.** A real run clears both caches through `_deregister_run!` *before* its task
     completes, so for anything `register_run!` published, clause 2 always fires first — on the
