@@ -1785,6 +1785,68 @@ end
     end
 end
 
+@testset "a throwing retention sweep costs one tick, not the scheduler (#195)" begin
+    # #195, the fourth instance of #169. The sweep was a bare `@async` loop with no `try` around
+    # the tick and no `errormonitor`, so ANY throw from `cleanup_tasks!` -- on a
+    # `PormGWorkerStore`, a transient DB error -- ended the loop, mute, for the life of the
+    # process, while the task table it exists to bound kept growing.
+    #
+    # A store whose `cleanup_tasks!` throws on its first `failures_left` sweeps and then forwards
+    # to the `InMemoryWorkerStore` it wraps. Mirrors `FlakyStore` (test/session_tests.jl) and
+    # `FlakyBucketStore` (test/middleware/lifecycle_middleware_tests.jl), which guard the same
+    # property for the middleware janitors. The scheduler calls `cleanup_tasks!` and nothing
+    # else; `lock_tasks` and `get_task_info` are forwarded defensively, so the wrapper stays a
+    # valid store if the `finally` teardown below ever reaches one of them.
+    mutable struct FlakyCleanupStore <: AbstractWorkerStore
+        inner         :: InMemoryWorkerStore
+        failures_left :: Int
+        sweeps        :: Int
+    end
+    function Nitro.Workers.cleanup_tasks!(s::FlakyCleanupStore, retain_days::Int)
+        s.sweeps += 1
+        if s.failures_left > 0
+            s.failures_left -= 1
+            error("simulated sweep failure")
+        end
+        return Nitro.Workers.cleanup_tasks!(s.inner, retain_days)
+    end
+    Nitro.Workers.lock_tasks(f::Function, s::FlakyCleanupStore) = Nitro.Workers.lock_tasks(f, s.inner)
+    Nitro.Workers.get_task_info(s::FlakyCleanupStore, id::String) = Nitro.Workers.get_task_info(s.inner, id)
+
+    inner = InMemoryWorkerStore()
+    lock(inner.task_lock) do
+        expired = TaskInfo("flaky-expired")
+        expired.status = COMPLETED
+        expired.completed_at = Dates.now(Dates.UTC) - Dates.Day(10)
+        inner.task_registry[expired.id] = expired
+    end
+    store = FlakyCleanupStore(inner, 3, 0)
+    rt = WorkerRuntime(store)
+
+    try
+        # Started INSIDE `@test_logs`, so the spawned task inherits the capturing logger: a
+        # failing tick must be LOGGED, not swallowed -- silence was #169's other half.
+        scheduler = @test_logs (:error, r"task retention sweep failed") match_mode=:any begin
+            scheduler = start_cleanup_scheduler(; interval_hours=0.00005, retain_days=7, runtime=rt)
+            # Against the unpatched loop the first throw ends the task: `sweeps` stays at 1, the
+            # expired row is never reaped, and both of these time out.
+            @test wait_for(() -> store.sweeps > 3) == :ok
+            @test wait_for(() -> Nitro.Workers.get_task_info(inner, "flaky-expired") === nothing) == :ok
+            scheduler
+        end
+        @test store.sweeps > 3
+        @test !istaskdone(scheduler.task)     # survived every failing tick and is still sweeping
+        @test Nitro.Workers.get_task_info(inner, "flaky-expired") === nothing
+
+        # A scheduler that survived its failures stops cleanly, exactly as a healthy one does.
+        @test stop_cleanup_scheduler!(scheduler) === nothing
+        @test istaskdone(scheduler.task)
+        @test !istaskfailed(scheduler.task)
+    finally
+        reset_runtime!(rt)
+    end
+end
+
 @testset "Public worker startup API bootstraps lifecycle" begin
     ctx = Nitro.Core.App()
 
