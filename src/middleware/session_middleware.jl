@@ -5,7 +5,8 @@ using Dates
 using JSON
 using UUIDs
 using ...Types: AbstractSessionStore, MemoryStore, SessionPayload, Nullable, is_expired
-using ...Types: CookieConfig, LifecycleMiddleware, require_fixed_period
+using ...Types: CookieConfig, LifecycleMiddleware
+using ..JanitorMiddleware: _janitor
 using ...Cookies: get_cookie, set_cookie!, storesession!, prunesessions!, regenerate_session!
 using ...Crypto: secure_uuid4
 using ...Core: own_response_headers
@@ -43,66 +44,20 @@ export SessionMiddleware, SessionPruner
 
 # Builds the `(on_startup, on_shutdown)` pair for a store-pruning janitor.
 #
-# The per-activation stop-token discipline is `FixedRateLimiter`'s, verbatim and for the same
-# reason (src/middleware/rate_limiter.jl): `on_shutdown` cannot wait for the task — it may be
-# parked in `sleep(interval)`, up to a whole interval from its next check — so a
-# `serve(); terminate(); serve()` cycle overlaps the old task with the new activation. A single
-# shared `running` flag leaked one task per restart, because the stale task woke, read the flag
-# the NEW activation had just set true, and kept looping. Giving each activation its own `Ref`
-# means a stale task can only ever observe its own token, which `on_shutdown` already set false.
+# The whole lifecycle discipline — `Threads.@spawn`/`errormonitor`, the per-activation stop token,
+# the post-`sleep` re-check, the per-tick `try` with its `InterruptException` rethrow, and the
+# `finally` that retires the activation so a later `on_startup()` can respawn — lives in
+# `_janitor` (src/middleware/janitor.jl) and is shared with `FixedRateLimiter`. This used to be a
+# hand-rolled copy of it, and the copies had drifted: only the rate limiter's rethrew
+# `InterruptException`, and a session prune over a user store (a blocking SQL DELETE for
+# `PormGSessionStore`) is by far the more interruptible of the two (#190, #185).
 #
-# `Threads.@spawn`, not `@async`. This one calls `cleanup_expired_sessions!` on a store the
-# CALLER supplied, and for `PormGSessionStore` that is a blocking SQL DELETE. Per
-# src/Workers/api.jl, `@async` is acceptable only for a task that runs no user code, so a
-# janitor over a user store must not share a thread with request handlers.
-#
-# `FixedRateLimiter`'s sweep is also `Threads.@spawn` (#169), for a different reason: it runs no
-# user code, but its store is unbounded and only that sweep reaps it, so it is CPU-bound rather
-# than I/O-bound under attack. Two routes to the same answer — there is no janitor left in
-# Nitro that legitimately wants a sticky task.
+# What stays here is the only part that is actually session-specific: the work, and the labels.
+# `kwname`, not a hardcoded "prune_interval": `SessionPruner`'s keyword is `interval`, and an
+# error naming a keyword the caller's function does not have sends them hunting.
 function _prune_janitor(store::AbstractSessionStore, interval::Period, label::String,
                        kwname::String)
-    # `kwname`, not a hardcoded "prune_interval": `SessionPruner`'s keyword is `interval`, and
-    # an error naming a keyword the caller's function does not have sends them hunting.
-    require_fixed_period("$label: $kwname", interval)
-
-    active = Ref{Union{Ref{Bool},Nothing}}(nothing)
-    prune_task = Ref{Union{Task,Nothing}}(nothing)
-
-    # Returns the `Task` it spawned, or `nothing` if one was already running. `startup` discards
-    # it; tests call `lf.on_startup()` directly to observe that a stale task actually exits.
-    on_startup = function ()
-        isnothing(active[]) || return nothing      # idempotent across restarts
-        token = Ref(true)
-        active[] = token
-        prune_task[] = errormonitor(Threads.@spawn while token[]
-            sleep(interval)
-            # Re-check AFTER the sleep: `on_shutdown` may have fired while we were parked, and
-            # this is where a stale activation's task leaves for good.
-            token[] || break
-            try
-                prunesessions!(store)
-            catch e
-                # A failing store must not kill the janitor — the next tick may well succeed,
-                # and a dead janitor is a silent memory leak.
-                @error "Nitro.$label: session prune failed" exception=(e, catch_backtrace())
-            end
-        end)
-        return prune_task[]
-    end
-
-    # Signalling is all this can do; blocking `terminate` for up to a whole interval would be
-    # worse than letting the task drain.
-    on_shutdown = function ()
-        token = active[]
-        isnothing(token) || (token[] = false)
-        stopped = prune_task[]
-        active[] = nothing
-        prune_task[] = nothing
-        return stopped
-    end
-
-    return (on_startup, on_shutdown)
+    return _janitor(() -> prunesessions!(store), interval, label, "session prune", kwname)
 end
 
 """

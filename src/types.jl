@@ -812,9 +812,9 @@ runs. Later cycles are settled, because `terminate()` clears only the serve-owne
 **The hooks must be idempotent across a `serve(); terminate(); serve()` cycle.** Route-owned
 entries are registered once and survive `terminate()`, so a second `serve()` calls `on_startup`
 again on the same object. A hook that spawns unconditionally leaks one task per restart. Give
-each activation its own state and have `on_shutdown` retire it — see `FixedRateLimiter`
-(`src/middleware/rate_limiter.jl`) for the per-activation token, or `AccessLog` for the
-per-activation run struct.
+each activation its own state and have `on_shutdown` retire it — see `_janitor`
+(`src/middleware/janitor.jl`) for the per-activation token every periodic janitor in Nitro shares,
+or `AccessLog` for the per-activation run struct.
 
 A hook that throws is logged and swallowed — see [`startup`](@ref) and
 [`shutdown`](@ref).
@@ -837,6 +837,16 @@ Run `lf.on_startup` if it has one. Called by `serve()` for every registered
 A `nothing` hook is a no-op. A **throwing** hook is logged and swallowed, never rethrown: one
 middleware failing to start must not abort the server and leave the middlewares already started
 without their paired `on_shutdown`. The hook's return value is discarded.
+
+!!! note "This includes `InterruptException`, unlike Nitro's other catch-alls — see #185"
+    The `e isa InterruptException && rethrow()` idiom used in `src/utilities/misc.jl` and in the
+    janitor loop (`src/middleware/janitor.jl`) is deliberately **not** used here. Those are *leaf*
+    catch-alls: rethrowing kills one operation and nothing else. `startup` and `shutdown` are
+    *sequencers*, broadcast over every registered hook by `startserver` and `terminate`
+    (`src/core/lifecycle.jl`), so an escape here abandons the rest of the sequence — on the
+    teardown path it skips `close(service)` outright and leaves the server listening. Honoring
+    Ctrl-C *without* stranding the sequence is a change to the broadcast sites, not to this
+    `catch`, and that is what #185 still tracks.
 """
 function startup(lf::LifecycleMiddleware)
     if !isnothing(lf.on_startup)

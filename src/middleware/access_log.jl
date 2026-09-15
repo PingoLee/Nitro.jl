@@ -156,6 +156,15 @@ end
 # Closes over exactly the `_Run` it was spawned for, so a stale task from a prior
 # activation drains its own (closed) channel to completion and exits, untouched by any
 # restart that installs a new `_Run`.
+#
+# This writer deliberately does NOT use the shared `_janitor` helper that #190 extracted from
+# `SessionMiddleware`'s prune and `FixedRateLimiter`'s sweep. It is EVENT-driven, not
+# interval-driven: it parks on `take!` rather than `sleep(interval)`, is stopped by `close`ing
+# the channel rather than by a stop token, and because closing takes effect immediately its
+# `on_shutdown` can bound-WAIT for the drain (`timedwait(..., 5.0)`) where those two can only
+# signal and let the task finish its nap. Widening `_janitor` to cover a blocking-wait loop with
+# a bounded shutdown would put a second shape back into the helper, which is exactly what
+# extracting it removed. This divergence is by design; the three that collapsed were not.
 function _run(sink, r::_Run, max_batch::Int)
     while true
         local rec

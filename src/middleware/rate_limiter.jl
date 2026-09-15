@@ -8,6 +8,7 @@ using ...Core: getip, header_name_isequal, own_response_headers
 # Import top level types module
 using ...Types 
 using ..ExtractIPMiddleware: ExtractIP, _norm, _full_mask
+using ..JanitorMiddleware: _janitor, _janitor_loop
 
 export RateLimiter
 
@@ -218,10 +219,11 @@ end
 
 # Reaps every bucket whose window last reset more than `cleanup_threshold` ago.
 #
-# A named function rather than an inline loop so the janitor's `try` wraps ONE call, the same
-# shape `_prune_janitor` has around `prunesessions!` (src/middleware/session_middleware.jl). An
-# inline body invites a later edit to hoist the `try` outside the `while`, which turns a single
-# transient failure into a permanently dead sweep with a still-green suite (#169).
+# A named function rather than an inline loop so the janitor's `try` wraps ONE call — the shape
+# `_janitor_loop` (src/middleware/janitor.jl) now enforces for every janitor in Nitro, and which
+# `_prune_janitor` feeds the same way with `prunesessions!`. An inline body invites a later edit
+# to hoist the `try` outside the `while`, which turns a single transient failure into a
+# permanently dead sweep with a still-green suite (#169).
 function _sweep_expired!(stripes::Vector{<:_Stripe}, cleanup_threshold::Period,
                          current_time::DateTime)
     # One stripe at a time: the sweep is O(N) in that stripe, and holding all of them
@@ -246,34 +248,27 @@ function _sweep_expired!(stripes::Vector{<:_Stripe}, cleanup_threshold::Period,
     return nothing
 end
 
-# The janitor loop `on_startup` spawns. Named, rather than written inline into the
-# `Threads.@spawn`, for two reasons: the `try` placement is the whole point of #169 and a named
-# function lets a test drive the loop over a deliberately-failing store (the limiter's own
-# stripes are closure-local and cannot be reached any other way), and it keeps `on_startup`
-# short enough that the spawn's rationale comment stays next to the spawn.
+# This limiter's janitor `work`, and the labels its failures are logged under — defined once so
+# `_cleanup_loop` and `FixedRateLimiter` cannot drift apart the way the three janitors #190
+# collapsed did. `now(UTC)` is evaluated per tick, inside the closure, not captured here.
+const _SWEEP_LABEL = "RateLimiter"
+const _SWEEP_WHAT  = "bucket cleanup sweep"
+_sweep_work(stripes::Vector{<:_Stripe}, cleanup_threshold::Period) =
+    () -> _sweep_expired!(stripes, cleanup_threshold, now(UTC))
+
+# The janitor loop, now this limiter's `work` bound to the shared loop in `_janitor_loop`
+# (src/middleware/janitor.jl), which owns the `try` placement (#169), the post-`sleep` token
+# re-check and the `InterruptException` rethrow for every janitor in Nitro (#190).
 #
-# `token` is per activation, never a shared `running` flag — see `FixedRateLimiter`.
+# Still a named function with this signature, for the reason it always had one: it lets a test
+# drive the loop over a deliberately-failing store, which is the only way in — the limiter's own
+# stripes are closure-local. `test/middleware/lifecycle_middleware_tests.jl` imports it by name.
+#
+# `token` is per activation, never a shared `running` flag — see `_janitor`.
 function _cleanup_loop(token::Ref{Bool}, stripes::Vector{<:_Stripe},
                        cleanup_period::Period, cleanup_threshold::Period)
-    while token[]
-        sleep(cleanup_period)
-        # Re-check AFTER the sleep: `on_shutdown` may have fired while we were parked, and
-        # this is the point a stale task from a previous activation leaves for good.
-        token[] || break
-        # The `try` is INSIDE the `while` on purpose. Hoisting it out turns one transient
-        # failure into a permanently dead sweep — silently, since nothing waits on this task —
-        # in the component whose entire job is bounding memory. That is #169.
-        try
-            _sweep_expired!(stripes, cleanup_threshold, now(UTC))
-        catch e
-            # Rethrow guard, per the idiom in src/utilities/misc.jl and src/types.jl: a
-            # catch-all that eats `InterruptException` makes Ctrl-C during a sweep a no-op.
-            # The window is narrow (the `sleep` is outside the `try`), but the guard is free.
-            e isa InterruptException && rethrow()
-            @error "Nitro.RateLimiter: bucket cleanup sweep failed" exception=(e, catch_backtrace())
-        end
-    end
-    return nothing
+    return _janitor_loop(_sweep_work(stripes, cleanup_threshold),
+                         token, cleanup_period, _SWEEP_LABEL, _SWEEP_WHAT)
 end
 
 """
@@ -351,66 +346,23 @@ function FixedRateLimiter(;
     # takes the full stripe count regardless of load.
     stripes = _make_stripes(() -> Dict{BucketKey, Tuple{Int, DateTime}}(), _DEFAULT_STRIPES)
     
-    # PER-ACTIVATION stop token, not a single shared `running` flag. `on_shutdown` cannot wait
-    # for the cleanup task — it is parked in `sleep(cleanup_period)`, up to `cleanup_period`
-    # away from its next flag check — so a `serve(); terminate(); serve()` cycle overlaps the
-    # old task with the new activation. With one shared flag the sequence was:
+    # The hooks, and every piece of discipline behind them, come from `_janitor`
+    # (src/middleware/janitor.jl): the per-activation stop token that stops a restart leaking a
+    # task (#82), `Threads.@spawn`-not-`@async` and `errormonitor` (#169), the per-tick `try`, and
+    # the `finally` that retires the activation so a janitor whose loop died can be restarted
+    # (#185). All three of Nitro's janitors were hand-rolled copies of this and had drifted, which
+    # is #190 — read that file for the full rationale rather than re-deciding any of it here.
     #
-    #   on_shutdown : running[] = false ; cleanup_task[] = nothing   (old task still sleeping)
-    #   on_startup  : running[] = true  ; isnothing(cleanup_task[]) -> spawns a SECOND task
-    #   old task    : wakes, reads running[] == true, keeps looping
+    # `on_startup` returns the `Task` it spawned (or `nothing` if one was live); `on_shutdown`
+    # returns the `Task` it signalled. `startup(::LifecycleMiddleware)` discards both, but tests
+    # call the hooks directly to get task handles, which is the only way to observe that a stale
+    # activation's task actually exits. Keep these return values.
     #
-    # i.e. one extra cleanup task leaked per restart, unbounded, in the component whose entire
-    # job is to bound resource use. Giving each activation its own `Ref` means a stale task can
-    # only ever observe *its own* token, which `on_shutdown` already set to `false`, so it exits
-    # on its next wake no matter what the current activation is doing. Same shape as
-    # `AccessLog`'s per-activation `_Run` (src/middleware/access_log.jl).
-    #
-    # Hooks stay idempotent across cycles, which is what `startserver`/`terminate` rely on now
-    # that route-owned lifecycle middleware survives a restart (#82).
-    active = Ref{Union{Ref{Bool},Nothing}}(nothing)
-    cleanup_task = Ref{Union{Task,Nothing}}(nothing)
-
-    # Returns the cleanup `Task` it spawned, or `nothing` if one was already running.
-    # `startup(::LifecycleMiddleware)` discards the value; tests call `lf.on_startup()`
-    # directly to get a handle on the task, which is the only way to observe that a stale
-    # activation's task actually exits. Keep this return value.
-    function on_startup()
-        # Already running: `startup` is idempotent, so do not spawn a second task.
-        isnothing(active[]) || return nothing
-
-        token = Ref(true)
-        active[] = token
-
-        # `Threads.@spawn`, not `@async` (#169). `@async` produces a STICKY task, pinned for life
-        # to the thread that ran `startserver` — which is also serving requests. The fixed
-        # limiter's store is unbounded: nothing but this sweep reaps it, so under exactly the
-        # rotating-source-address traffic #22 exists to bound, the sweep is O(total buckets) of
-        # CPU work stuck on a request-handling thread. Migration is free here by the criterion
-        # in src/Workers/api.jl: nothing injects into this task, every lock is a `ReentrantLock`
-        # (which keys on `current_task()`, so a migrating task keeps what it holds), and there
-        # is no `Threads.threadid()` or task-local state anywhere in the sweep.
-        #
-        # `errormonitor` for the reason `_prune_janitor` has it: nothing waits on this task, so
-        # without the monitor a throw is stored in the `Task` and never surfaces — the sweep
-        # dies mute and the store stops being reaped for the life of the process. The loop's
-        # own per-tick `try` is in `_cleanup_loop`.
-        cleanup_task[] = errormonitor(
-            Threads.@spawn _cleanup_loop(token, stripes, cleanup_period, cleanup_threshold))
-        return cleanup_task[]
-    end
-
-    # Stop function to halt the task. Returns the `Task` it signalled, or `nothing` if none
-    # was running. Signalling is all it can do — the task may be mid-`sleep`, and blocking
-    # `terminate` for up to a whole `cleanup_period` would be worse than letting it drain.
-    function on_shutdown()
-        token = active[]
-        isnothing(token) || (token[] = false)
-        stopped = cleanup_task[]
-        active[] = nothing
-        cleanup_task[] = nothing
-        return stopped
-    end
+    # `require_fixed_period("RateLimiter: cleanup_period", ...)` fires inside `_janitor` too; the
+    # explicit call above stays because it must also reject `window` and `cleanup_threshold`, and
+    # because it names the keyword the caller actually typed.
+    on_startup, on_shutdown = _janitor(_sweep_work(stripes, cleanup_threshold), cleanup_period,
+                                       _SWEEP_LABEL, _SWEEP_WHAT, "cleanup_period")
 
     function rate_limit_only(handle::Function)
         return function(req::HTTP.Request)
