@@ -371,6 +371,89 @@ lf.on_shutdown()
 end # @testitem
 
 
+@testitem "RateLimiter — a throwing cleanup sweep costs one tick, not all of them" tags=[:middleware, :slow] setup=[NitroCommon] begin
+using Test
+using Dates
+using Suppressor
+using Nitro
+using Nitro.Core.Middleware.RateLimiterMiddleware: BucketKey, _Stripe, _cleanup_loop
+
+# #169. The sweep used to be a bare `@async` with no `errormonitor` and no `try` inside the
+# loop, so ANY throw in the sweep body was stored in a Task nobody waits on: the sweep died
+# mute and the bucket store was never reaped again for the life of the process. The component
+# whose entire job is bounding memory failed open, silently.
+#
+# `_cleanup_loop` is a named function precisely so this is testable — the limiter's own stripes
+# are closure-local, so a limiter built through `RateLimiter(...)` offers no seam to inject a
+# failure through. Driving the loop directly over a deliberately-failing store tests the thing
+# that actually matters: WHERE the `try` sits.
+#
+# Against the unpatched shape — `try` hoisted outside the `while`, or absent — the loop exits
+# on the first throw, `stale` is never deleted, and the `timedwait` below times out.
+
+# A store that throws on its first `failures` iterations, then behaves like the Dict it wraps.
+# Mirrors `FlakyStore` in test/session_tests.jl, which guards the same property for the
+# session janitor.
+mutable struct FlakyBucketStore <: AbstractDict{BucketKey, Tuple{Int, DateTime}}
+    inner         :: Dict{BucketKey, Tuple{Int, DateTime}}
+    failures_left :: Int
+    sweeps        :: Int
+end
+
+function Base.iterate(s::FlakyBucketStore)
+    s.sweeps += 1
+    if s.failures_left > 0
+        s.failures_left -= 1
+        error("simulated sweep failure")
+    end
+    return iterate(s.inner)
+end
+Base.iterate(s::FlakyBucketStore, state) = iterate(s.inner, state)
+Base.length(s::FlakyBucketStore)         = length(s.inner)
+Base.delete!(s::FlakyBucketStore, k)     = (delete!(s.inner, k); s)
+
+@testset "the loop survives a throwing sweep and keeps reaping" begin
+    old = now(UTC) - Minute(30)          # older than the threshold -> must be reaped
+    fresh = now(UTC)                     # inside the threshold -> must be left alone
+    store = FlakyBucketStore(
+        Dict{BucketKey, Tuple{Int, DateTime}}((false, UInt128(1)) => (1, old),
+                                              (false, UInt128(2)) => (1, fresh)),
+        3, 0)
+    stripes = [_Stripe(ReentrantLock(), store)]
+
+    token = Ref(true)
+    task = @suppress_err Threads.@spawn _cleanup_loop(token, stripes, Millisecond(20),
+                                                      Minute(10))
+    try
+        # The assertion that fails against the unpatched code: the loop must survive its three
+        # throwing ticks and still reap afterwards.
+        @test timedwait(() -> length(store) == 1, 10.0) === :ok
+        @test haskey(store.inner, (false, UInt128(2)))   # fresh bucket untouched
+        @test store.sweeps > 3                           # it really kept ticking past the failures
+        @test !istaskdone(task)                          # ...and the janitor is still alive
+    finally
+        token[] = false
+    end
+    @test timedwait(() -> istaskdone(task), 10.0) === :ok
+end
+
+@testset "the spawned task is monitored, so a fatal death is not silent" begin
+    # `errormonitor` returns its argument, which is what keeps `on_startup`'s documented
+    # "returns the Task it spawned" contract intact. Assert the wiring end-to-end rather than
+    # the log line, which errormonitor emits asynchronously on a task nothing waits on.
+    lf = RateLimiter(rate_limit = 5, window = Second(1),
+                     cleanup_period = Millisecond(50), cleanup_threshold = Millisecond(50))
+    t = lf.on_startup()
+    try
+        @test t isa Task
+    finally
+        lf.on_shutdown()
+    end
+    @test timedwait(() -> istaskdone(t), 10.0) === :ok
+end
+end # @testitem
+
+
 @testitem "Lifecycle middleware — order is registration order, teardown is LIFO" tags=[:middleware] setup=[NitroCommon] begin
 using Test
 using HTTP

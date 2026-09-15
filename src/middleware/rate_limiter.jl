@@ -185,6 +185,62 @@ function _bounded_stripe_count(max_entries::Int)
     return min(_DEFAULT_STRIPES, prevpow(2, fld(max_entries, _MIN_ENTRIES_PER_STRIPE)))
 end
 
+# Reaps every bucket whose window last reset more than `cleanup_threshold` ago.
+#
+# A named function rather than an inline loop so the janitor's `try` wraps ONE call, the same
+# shape `_prune_janitor` has around `prunesessions!` (src/middleware/session_middleware.jl). An
+# inline body invites a later edit to hoist the `try` outside the `while`, which turns a single
+# transient failure into a permanently dead sweep with a still-green suite (#169).
+function _sweep_expired!(stripes::Vector{<:_Stripe}, cleanup_threshold::Period,
+                         current_time::DateTime)
+    # One stripe at a time: the sweep is O(N) in that stripe, and holding all of them
+    # would reinstate exactly the global stall striping exists to remove.
+    for stripe in stripes
+        lock(stripe.lock) do
+            to_delete = BucketKey[]
+            # Collect first, delete after — mutating a collection while iterating it
+            # is not a supported pattern. (On the current `Dict` a `delete!` only
+            # tombstones and never rehashes, so the one-pass form happens to work;
+            # this does not depend on that.)
+            for (key, (_, last_reset)) in stripe.store
+                if current_time - last_reset > cleanup_threshold
+                    push!(to_delete, key)
+                end
+            end
+            for key in to_delete
+                delete!(stripe.store, key)
+            end
+        end
+    end
+    return nothing
+end
+
+# The janitor loop `on_startup` spawns. Named, rather than written inline into the
+# `Threads.@spawn`, for two reasons: the `try` placement is the whole point of #169 and a named
+# function lets a test drive the loop over a deliberately-failing store (the limiter's own
+# stripes are closure-local and cannot be reached any other way), and it keeps `on_startup`
+# short enough that the spawn's rationale comment stays next to the spawn.
+#
+# `token` is per activation, never a shared `running` flag — see `FixedRateLimiter`.
+function _cleanup_loop(token::Ref{Bool}, stripes::Vector{<:_Stripe},
+                       cleanup_period::Period, cleanup_threshold::Period)
+    while token[]
+        sleep(cleanup_period)
+        # Re-check AFTER the sleep: `on_shutdown` may have fired while we were parked, and
+        # this is the point a stale task from a previous activation leaves for good.
+        token[] || break
+        # The `try` is INSIDE the `while` on purpose. Hoisting it out turns one transient
+        # failure into a permanently dead sweep — silently, since nothing waits on this task —
+        # in the component whose entire job is bounding memory. That is #169.
+        try
+            _sweep_expired!(stripes, cleanup_threshold, now(UTC))
+        catch e
+            @error "Nitro.RateLimiter: bucket cleanup sweep failed" exception=(e, catch_backtrace())
+        end
+    end
+    return nothing
+end
+
 """
     FixedRateLimiter(; rate_limit::Int = 100, window::Period = Minute(1), cleanup_period::Period = Minute(10), cleanup_threshold::Period = Minute(10), auto_extract_ip::Bool = true, forwarded_header::Symbol = :none, trusted_proxies = nothing, fail_open::Bool = false, exempt_paths::Vector{String} = String[], ipv4_prefix::Int = 32, ipv6_prefix::Int = 64)
 
@@ -241,8 +297,10 @@ function FixedRateLimiter(;
     # Validate parameters
     rate_limit > 0 || throw(ArgumentError("rate_limit must be positive, got $rate_limit"))
     # `Dates.value(...) > 0` was the old test and it admits calendar periods: `Month(1)` has
-    # value 1, so it passed, and then `sleep(cleanup_period)` threw inside the un-monitored
-    # `@async` sweep — killing the background cleanup silently, for the life of the process.
+    # value 1, so it passed, and then `sleep(cleanup_period)` threw inside the sweep — which was
+    # an un-monitored `@async` at the time, so the background cleanup died silently for the life
+    # of the process. #169 closed that second half; this check still closes the first, and
+    # rejecting at construction still beats reporting from a background task.
     require_fixed_period("window", window)
     require_fixed_period("cleanup_period", cleanup_period)
     require_fixed_period("cleanup_threshold", cleanup_threshold)
@@ -286,33 +344,21 @@ function FixedRateLimiter(;
         token = Ref(true)
         active[] = token
 
-        # Start Background cleanup task
-        cleanup_task[] = @async while token[]
-            sleep(cleanup_period)
-            # Re-check AFTER the sleep: `on_shutdown` may have fired while we were parked, and
-            # this is the point a stale task from a previous activation leaves for good.
-            token[] || break
-            current_time = now(UTC)
-            # One stripe at a time: the sweep is O(N) in that stripe, and holding all of them
-            # would reinstate exactly the global stall striping exists to remove.
-            for stripe in stripes
-                lock(stripe.lock) do
-                    to_delete = BucketKey[]
-                    # Collect first, delete after — mutating a collection while iterating it
-                    # is not a supported pattern. (On the current `Dict` a `delete!` only
-                    # tombstones and never rehashes, so the one-pass form happens to work;
-                    # this does not depend on that.)
-                    for (key, (_, last_reset)) in stripe.store
-                        if current_time - last_reset > cleanup_threshold
-                            push!(to_delete, key)
-                        end
-                    end
-                    for key in to_delete
-                        delete!(stripe.store, key)
-                    end
-                end
-            end
-        end
+        # `Threads.@spawn`, not `@async` (#169). `@async` produces a STICKY task, pinned for life
+        # to the thread that ran `startserver` — which is also serving requests. The fixed
+        # limiter's store is unbounded: nothing but this sweep reaps it, so under exactly the
+        # rotating-source-address traffic #22 exists to bound, the sweep is O(total buckets) of
+        # CPU work stuck on a request-handling thread. Migration is free here by the criterion
+        # in src/Workers/api.jl: nothing injects into this task, every lock is a `ReentrantLock`
+        # (which keys on `current_task()`, so a migrating task keeps what it holds), and there
+        # is no `Threads.threadid()` or task-local state anywhere in the sweep.
+        #
+        # `errormonitor` for the reason `_prune_janitor` has it: nothing waits on this task, so
+        # without the monitor a throw is stored in the `Task` and never surfaces — the sweep
+        # dies mute and the store stops being reaped for the life of the process. The loop's
+        # own per-tick `try` is in `_cleanup_loop`.
+        cleanup_task[] = errormonitor(
+            Threads.@spawn _cleanup_loop(token, stripes, cleanup_period, cleanup_threshold))
         return cleanup_task[]
     end
 
