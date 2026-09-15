@@ -33,6 +33,12 @@ end
 # handle to delete. There is deliberately no "register the info first" rule to remember — the
 # window is not observable from outside the runtime, so a convention could not be tested and the
 # next refactor would silently reintroduce it.
+#
+# The `live.run_id == task_info.run_id` branch is honest for a second reason from the same
+# function: `register_run!` refuses to publish over a foreign run (#198), and `_claim_run!` only
+# calls it under the lock every supersede holds. So an info naming this run was put there by this
+# run — never by a stale predecessor that overwrote a live successor a moment ago, which is the
+# case where this match would have deleted handles belonging to someone else.
 function _deregister_run!(runtime::WorkerRuntime, task_info::TaskInfo)
     lock(runtime.active_lock) do
         live = Base.get(runtime.active_task_infos, task_info.id, nothing)
@@ -82,6 +88,93 @@ function _finish_task!(runtime::WorkerRuntime, task_info::TaskInfo, to::TaskStat
         progress === nothing || (@atomic task_info.progress = Float64(progress))
         task_info.completed_at = finished_at
         task_info.status = to
+        return task_info
+    end
+end
+
+# Claim the start of a run: read the record durably, verify it still belongs to the run the caller
+# carries, and publish the run's handles -- as ONE critical section under the store lock. Returns
+# the run's `TaskInfo` when the handles were published and `nothing` when this run must not start.
+# The contract callers rely on: `try`/`finally _deregister_run!` is entered if and only if
+# `register_run!` succeeded.
+#
+# Three decisions, each of which was a defect once:
+#
+# **The DURABLE read** (`get_task_info(runtime.store, ·)`, never the live-preferring one). A run
+# start is a CLAIMING call. Re-running a key whose record is terminal while its previous run is
+# still executing is reachable -- cancellation is cooperative -- and a live-preferring read there
+# hands the new run its PREDECESSOR's `TaskInfo`; its start CAS then fails its own `run_id` fence
+# and the task sits `PENDING` forever (#167). That rule decides WHICH RECORD to read. It is silent
+# about WHOSE RUN the reader is.
+#
+# **The identity check, fenced on the CARRIED `run_id`** (#191). Reading durably does not
+# authenticate the reader: a queued item can outlive its run (`cancel_task` makes the record
+# terminal while the item is still buffered, a re-submit replaces it with a fresh run), and a
+# stale item that read the SUCCESSOR's record ran the superseded callback against it -- storing
+# its value as the successor's result while the successor's own item lost its `(PENDING,)` claim.
+# The identity therefore comes in from `_register_or_watch!`, which minted it, and is compared
+# BEFORE the publish: `register_run!` makes `task_info` the oracle for every fence this run
+# performs afterwards (`_deregister_run!`, `_finish_task!`, `_cancel_task!`, `_snapshot_runs`,
+# `_run_settled`), so a run that registers a record it does not own has ADOPTED the successor's
+# identity for all of them.
+#
+# It drops no work: `_register_or_watch!` mints a `run_id` only on its `replace_task!` branch and
+# each such call yields at most one item or one spawn, so run -> item is 1:1 and a mismatch proves
+# a successor exists whose own submit will run it -- or, if its `put!` lost a teardown race, will
+# record it terminal instead, or failing both is logged as an orphan (#182 territory).
+#
+# **Everything under `lock_tasks`** (#198). The check and the publish used to be two steps with
+# no lock between them, and a supersede landing in that gap -- `cancel_task` plus a re-submit,
+# which need only `lock_tasks`, free by then -- let a run that had just verified its ownership
+# publish over the LIVE SUCCESSOR's entries. Its `finally` then deleted them on a fence that now
+# matched, leaving a genuinely-running job with no handle: `recover_zombie_tasks!` reads exactly
+# that as death and writes FAILED over it, and `cancel_task` can no longer reach its live object.
+# The window was nanoseconds and the safety argument was an ordering coincidence.
+#
+# Every supersede holds `lock_tasks` (`_register_or_watch!`), and the eviction that makes the
+# successor own the slot -- `replace_task!(runtime, ·)` -- happens under it. So a run that reads
+# and verifies its ownership under the same lock finds the slot empty or its own BY CONSTRUCTION;
+# no supersede can interleave. This is the process-local half of what workers §6 says about that
+# lock: it cannot make a read-then-durable-write atomic across processes, which is why the run's
+# durable write (`try_transition!`, below in each caller) stays a `run_id`-fenced CAS outside
+# this section. What it CAN do is serialise this process's run-handle caches against this
+# process's supersede path -- and those caches have no other writer. The lock order it adds,
+# `lock_tasks` -> `active_lock`, is the one `_finish_task!` -> `_deregister_run!` already uses.
+#
+# `register_run!` being a compare-and-set as well is the guard on that argument: under this lock a
+# refusal is unreachable in production, so a hit means out-of-band state (the test-only
+# registrars) or a refactor that moved the read back outside the lock. That is why it is a
+# `@warn` where the identity failure is a `@debug` -- the second is a normal race outcome, the
+# first is an invariant that has stopped holding.
+#
+# **The `PENDING` pre-check.** The only status a record can hold under this run's `run_id` before
+# the run starts, other than `PENDING`, is `CANCELLED` -- a `cancel_task` or an abandoned queue
+# item (#182) that claimed it first. Declining here rather than at the start CAS means a cancelled
+# run never publishes handles at all. The sequential path always checked this; the async path used
+# to register, lose its CAS, and deregister, which was correct but published for nothing.
+#
+# `nothing` on every decline, never the record: handing the caller the SUCCESSOR's record under
+# this run's name is the same "a value escapes under the wrong run's identity" error #191 fixed.
+# No caller reads the return except to test it against `nothing`.
+function _claim_run!(runtime::WorkerRuntime, task_key::String, run_id::UUID)
+    return lock_tasks(runtime) do
+        task_info = get_task_info(runtime.store, task_key)
+        task_info === nothing && return nothing
+
+        if task_info.run_id != run_id
+            @debug "Run superseded before it started; not running it" task_key run_id record_run=task_info.run_id
+            return nothing
+        end
+
+        task_info.status == PENDING || return nothing
+
+        if !register_run!(runtime, task_key, task_info, current_task())
+            @warn "Nitro: run-handle slot for a task is held by a foreign run at claim time; " *
+                  "declining the run. This is unreachable through the public API -- something " *
+                  "registered a live TaskInfo outside `_claim_run!`." task_key run_id
+            return nothing
+        end
+
         return task_info
     end
 end
@@ -144,82 +237,21 @@ function _abandon_queued_item!(runtime::WorkerRuntime, item::QueueItem)
 end
 
 function _execute_queued_task(runtime::WorkerRuntime, item::QueueItem)
-    # The DURABLE read: a live-preferring one here would hand this run its predecessor's
-    # `TaskInfo` when a terminal-but-still-executing key is re-run, and the fenced start below
-    # would then fail forever (#167).
-    #
-    # That rule decides WHICH RECORD to read. It is silent about WHOSE RUN the reader is, and
-    # conflating the two was #191: reading durably does not authenticate the reader, so the
-    # identity has to be carried in rather than derived here. `item.run_id` is that identity.
-    task_info = get_task_info(runtime.store, item.task_key)
-
-    if task_info === nothing
-        return nothing
-    end
-
-    # Is this record still the run that queued this callback? A queued item can outlive its run:
-    # `cancel_task` makes the record terminal while the item is still buffered, and a re-submit
-    # then replaces it with a fresh run. Without this, a stale item read the SUCCESSOR's record
-    # and ran the superseded callback against it -- silently, storing its value as the
-    # successor's result while the successor's own item failed its `(PENDING,)` claim and
-    # returned (#191).
-    #
-    # **Before `register_run!`, not merely before the claim.** That call (below) makes
-    # `task_info` the oracle for every fence this run performs afterwards -- `_deregister_run!`,
-    # `_finish_task!`, `_cancel_task!`, `_snapshot_runs`, `_run_settled`. A run that registers a
-    # record it does not own has not just lost one CAS; it has ADOPTED the successor's identity
-    # for all of them. Two consequences, both reachable because a successor can run concurrently
-    # via `submit_task` or a second queue (`queue_name` is metadata, and both submit paths share
-    # `_register_or_watch!`):
-    #   - this run's `finally _deregister_run!` matches on the successor's `run_id` and deletes
-    #     its LIVE handles, so `recover_zombie_tasks!` sees RUNNING with no active task and
-    #     writes FAILED over a genuinely-running job -- #167 exactly; and
-    #   - in the other interleaving `register_run!` OVERWRITES `active_task_infos[id]` with this
-    #     object, which on `PormGWorkerStore` is a throwaway deserialized copy. `cancel_task`'s
-    #     live lookup then passes its own `run_id` guard and sets the token on an object the
-    #     successor's callback does not hold, so the successor becomes silently UNCANCELLABLE --
-    #     the precise failure that lookup exists to avoid.
-    #
-    # **It narrows that window; it does not close it.** `register_run!` publishes
-    # unconditionally, so a supersede landing between this check and that call still overwrites
-    # the successor's entries, and this run's `finally` then deletes them on a fence that now
-    # matches. What the check removes is the unbounded case -- a buffered item superseded long
-    # before it was dequeued -- leaving a window with no yield point in it: closed outright on a
-    # single-threaded run, since no other Julia task can interleave at all, and on a
-    # multithreaded one bounded in INSTRUCTIONS rather than wall-clock, because an OS preemption
-    # or a GC pause between the two lines stretches it. It predates this fix.
-    # Closing it structurally means making `register_run!` refuse to publish over a
-    # different live `run_id`, which is a change to a core publish primitive and belongs in its
-    # own issue, not here.
-    #
-    # It drops no work: `_register_or_watch!` mints a `run_id` only on the `replace_task!`
-    # branch and each such call yields at most one item, so run -> item is 1:1 and a mismatch
-    # proves a successor exists whose own submit will queue its item or spawn its task -- or,
-    # if that submit's `put!` loses a teardown race, will record it terminal instead, or failing
-    # both is logged as an orphan (#182 territory, not this fence's to answer for).
-    #
-    # `nothing`, not `task_info`: handing the caller the SUCCESSOR's record under this run's name
-    # is the same "a value escapes under the wrong run's identity" error being fixed here, and
-    # it would be indistinguishable from the lost-claim return below. No caller reads either.
-    if task_info.run_id != item.run_id
-        @debug "Queued item superseded before it was dequeued; not running it" task_key=item.task_key item_run=item.run_id record_run=task_info.run_id
-        return nothing
-    end
+    # The durable read, the #191 identity check against the ITEM's carried `run_id`, and the
+    # handle publish, as one critical section under the store lock -- see `_claim_run!` for why
+    # each of those is the way it is. `nothing` means this run must not start: the record is
+    # gone, it belongs to a successor, or it was cancelled before it was dequeued.
+    task_info = _claim_run!(runtime, item.task_key, item.run_id)
+    task_info === nothing && return nothing
 
     # From here `task_info` is a snapshot of THIS run's record -- on `InMemoryWorkerStore` the
     # very object the registry holds, on `PormGWorkerStore` a fresh deserialization of its row.
     # A snapshot, not the record: `progress` and `watchers` can move on before the claim below.
-    # Progress is harmless -- the run overwrites it itself. A concurrent grant is harmless for a
-    # different reason than the mirror: `replace_task!` already evicted the predecessor from
-    # `active_task_infos` and this run has not registered yet, so `add_watcher!`'s mirror writes
-    # to nothing. On `PormGWorkerStore` this object therefore never receives the append, and
-    # `watcher_count` under-reports until the run ends; on `InMemoryWorkerStore` it does receive
-    # it, because the store mutates the very registry object this aliases -- not through the
-    # mirror. Authorization survives either way, because `_authorize_or_reload!` re-reads the
-    # durable record whenever the cached one denies.
-    if task_info.status == CANCELLED
-        return task_info
-    end
+    # Progress is harmless -- the run overwrites it itself. A concurrent grant lands on this
+    # object through `add_watcher!`'s mirror, now that the handles are already published; before
+    # the claim was atomic there was a window in which it wrote to nothing. Authorization
+    # survives either way, because `_authorize_or_reload!` re-reads the durable record whenever
+    # the cached one denies.
 
     # Starting is a CLAIMED transition, not an unconditional write. `set_task!` has no
     # precondition, so a `cancel_task` that already claimed PENDING -> CANCELLED was simply
@@ -235,19 +267,16 @@ function _execute_queued_task(runtime::WorkerRuntime, item::QueueItem)
     # the async path too, which is why this lands FIRST.
     started = current_time_utc()
 
-    # Register the handles BEFORE claiming RUNNING, not after. `recover_zombie_tasks!`
-    # decides a run is dead from exactly `status == RUNNING && isnothing(get_active_task(id))`
-    # and does not hold anything that excludes this function, so a store that reads RUNNING
-    # before the handle exists is a window in which a sweep marks a genuinely-live run FAILED
-    # -- and the run's real result is then discarded by its own losing CAS. The old
-    # unconditional `set_task!` wrote the store LAST and so never opened that window;
-    # claiming the start (#142) reversed the order, and this restores it. Registering while
-    # the record is still PENDING is harmless: that sweep only looks at RUNNING.
-    # ONE atomic publish, not two writes: `_deregister_run!` fences on `run_id` read off the
-    # info, so a handle visible without its info is invisible to the fence -- and a predecessor
-    # finishing in that window deletes the SUCCESSOR's handle (#167). See `register_run!`.
-    register_run!(runtime, task_info.id, task_info, current_task())
-
+    # The handles are already published -- `_claim_run!` did it BEFORE this claim of RUNNING,
+    # not after. `recover_zombie_tasks!` decides a run is dead from exactly
+    # `status == RUNNING && isnothing(get_active_task(id))` and does not hold anything that
+    # excludes this function, so a store that reads RUNNING before the handle exists is a window
+    # in which a sweep marks a genuinely-live run FAILED -- and the run's real result is then
+    # discarded by its own losing CAS. The old unconditional `set_task!` wrote the store LAST and
+    # so never opened that window; claiming the start (#142) reversed the order, and publishing
+    # first restores it. Registering while the record is still PENDING is harmless: that sweep
+    # only looks at RUNNING.
+    #
     # `try`/`finally`, so this run's handles are released on EVERY exit -- including the two
     # that no terminal write covers: a store exception escaping the claim below (the processor
     # logs it and drops the item, `_start_queue_processor`), and the `0:max_attempts` loop
@@ -261,17 +290,18 @@ function _execute_queued_task(runtime::WorkerRuntime, item::QueueItem)
     # `_deregister_run!` is fenced on `run_id` and idempotent, so this is a no-op on every path
     # `_finish_task!` already covered.
     try
-        # Fenced on the ITEM's identity, never on the record's. The check above already proved
+        # Fenced on the ITEM's identity, never on the record's. `_claim_run!` already proved
         # the two are equal, so this is the same VALUE -- but not the same provenance, and
         # provenance is the rule: workers §6 asks that a fence value come from before the window
         # it guards, and `item.run_id` visibly does while `task_info.run_id` requires the reader
-        # to first reconstruct the invariant above. It is also what survives a refactor that
+        # to first reconstruct the claim's invariant. It is also what survives a refactor that
         # moves or weakens that check.
         if !try_transition!(runtime.store, task_info.id, (PENDING,), RUNNING;
                             run_id=item.run_id, started_at=started)
-            # Cancelled, or the record moved on between the read and this CAS. (A stale item
-            # never reaches here any more -- it returned above.) The `finally` hands the handles
-            # back -- fenced, so we cannot tear down a successor's (#108).
+            # Cancelled, or the record moved on between the claim and this CAS -- a cross-process
+            # cancel, or a supersede that landed after the claim released the lock. (A stale or
+            # already-cancelled item never reaches here -- the claim declined it.) The `finally`
+            # hands the handles back -- fenced, so we cannot tear down a successor's (#108).
             return task_info
         end
 
@@ -364,7 +394,7 @@ function _start_queue_processor(runtime::WorkerRuntime, queue_name::String)
                     end
 
                     # BEFORE `_mark_queue_current_task!` and before `_execute_queued_task`'s
-                    # `register_run!`, so once `draining` is visible no further run starts,
+                    # `_claim_run!`, so once `draining` is visible no further run starts,
                     # publishes a handle into the runtime being torn down, and claims RUNNING with
                     # nothing waiting on it (#182). A processor that read `false` a moment before
                     # `shutdown!` set it can still register after `_snapshot_runs` -- the window is

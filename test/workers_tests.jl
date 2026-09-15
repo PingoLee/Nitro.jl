@@ -2568,6 +2568,185 @@ end
     end
 end
 
+@testset "a stale run cannot publish over a live successor's handles (#198)" begin
+    # `register_run!` used to ASSIGN both caches with no precondition. Both execute paths verify
+    # that the record still belongs to their run before calling it (#191), but that check and
+    # the publish were two steps: a cancel plus a re-submit landing between them let the stale
+    # predecessor overwrite the live successor's entries, and the predecessor's own fenced
+    # `finally` then deleted them -- a genuinely-running job with no handle, which
+    # `recover_zombie_tasks!` reads as death and `cancel_task` can no longer reach.
+    #
+    # Two halves close it. `register_run!` is a compare-and-set on the live `run_id`, so a
+    # foreign publish is REFUSED rather than applied; and `_claim_run!` performs the durable
+    # read, the identity check and the publish under `lock_tasks` -- the lock every supersede
+    # holds -- so a run that verifies ownership finds the slot empty or its own by construction.
+    # The first half is what these tests can hold in place; the second is a lock discipline,
+    # reviewed by reading `_claim_run!`, for the same reason the #167 two-write window was.
+    @testset "register_run! is a compare-and-set on the live run" begin
+        store = InMemoryWorkerStore()
+        rt_store = WorkerRuntime(store)
+        handles = Task[]
+        try
+            key = "alice::cas"
+            successor = TaskInfo(key)
+            successor.status = RUNNING
+            push!(successor.watchers, "alice")
+            replace_task!(store, key, successor)
+            s_handle = @async sleep(0.05)
+            push!(handles, s_handle)
+
+            # An empty slot accepts the publish.
+            @test register_run!(rt_store, key, successor, s_handle) == true
+            @test get_active_task(rt_store, key) === s_handle
+            @test get_active_task_info(rt_store, key) === successor
+
+            # A different run under the same key is refused, and the slot is untouched.
+            # Before the fix this returned the stale info and overwrote both entries.
+            stale = TaskInfo(key)
+            stale.status = RUNNING
+            @test stale.run_id != successor.run_id
+            p_handle = @async nothing
+            push!(handles, p_handle)
+            @test register_run!(rt_store, key, stale, p_handle) == false
+            @test get_active_task(rt_store, key) === s_handle
+            @test get_active_task_info(rt_store, key) === successor
+
+            # Re-publishing one's OWN run is idempotent, not refused.
+            @test register_run!(rt_store, key, successor, s_handle) == true
+            @test get_active_task(rt_store, key) === s_handle
+
+            # The refused predecessor finishes. Its fence does not match the live run, so the
+            # successor's handles survive and the sweep has nothing to claim. Before the fix
+            # the fence MATCHED -- the slot held the predecessor's own object -- and this
+            # deleted a live run's handles.
+            Nitro.Workers._deregister_run!(rt_store, stale)
+            @test get_active_task(rt_store, key) === s_handle
+            @test get_active_task_info(rt_store, key) === successor
+            @test recover_zombie_tasks!(; runtime=rt_store) == 0
+            @test get_task_info(store, key).status == RUNNING
+        finally
+            foreach(wait, handles)
+            reset_runtime!(rt_store)
+        end
+    end
+
+    @testset "a predecessor publishing after its successor cannot strand the successor" begin
+        # The issue's interleaving on the real objects. P read its record and passed the #191
+        # identity check (T0); a cancel and a re-submit minted S, and S registered and claimed
+        # RUNNING (T1); only then does P reach `register_run!` with the record it read (T2).
+        store = InMemoryWorkerStore()
+        rt_store = WorkerRuntime(store)
+        owner = Owner("u")
+        handles = Task[]
+        try
+            key = scoped_task_key("K", owner)
+            predecessor_run = Nitro.Workers._register_or_watch!(rt_store, key, owner; queue_name="q")
+            p_info = get_task_info(store, key)            # what P read at T0
+            @test p_info.run_id == predecessor_run
+            @test cancel_task(key, owner; runtime=rt_store)[:status] == "Task cancelled"
+
+            successor_run = Nitro.Workers._register_or_watch!(rt_store, key, owner; queue_name="q")
+            @test successor_run != predecessor_run
+            s_info = get_task_info(store, key)
+            @test s_info.run_id == successor_run
+            s_handle = @async sleep(0.05)
+            push!(handles, s_handle)
+            @test register_run!(rt_store, key, s_info, s_handle) == true
+            @test try_transition!(store, key, (PENDING,), RUNNING; run_id=successor_run) == true
+
+            # T2: P publishes late. Before the fix this overwrote S's entries...
+            p_handle = @async nothing
+            push!(handles, p_handle)
+            @test register_run!(rt_store, key, p_info, p_handle) == false
+            # ...P's start CAS then correctly lost on `run_id`...
+            @test try_transition!(store, key, (PENDING,), RUNNING; run_id=predecessor_run) == false
+            # ...and P's own fenced teardown found its own object in the slot and deleted it.
+            Nitro.Workers._deregister_run!(rt_store, p_info)
+
+            @test get_active_task(rt_store, key) === s_handle
+            @test get_active_task_info(rt_store, key) === s_info
+            @test recover_zombie_tasks!(; runtime=rt_store) == 0
+            @test get_task_info(store, key).status == RUNNING
+
+            # S is still cancellable: the live lookup reaches S's own object and sets ITS token.
+            @test cancel_task(key, owner; runtime=rt_store)[:status] == "Task cancelled"
+            @test cancel_reason(s_info) == :user
+            @test cancel_reason(p_info) == :none
+        finally
+            foreach(wait, handles)
+            reset_runtime!(rt_store)
+        end
+    end
+
+    @testset "a run whose slot is held by a foreign run declines at claim time" begin
+        # The out-of-band state the CAS guards. Under `lock_tasks` nothing in production can put
+        # a foreign run in the slot between the identity check and the publish -- every mint
+        # goes through `replace_task!(runtime, ·)`, which evicts under that same lock -- so a
+        # refusal here means either test-only state, as below, or a refactor that moved the read
+        # back outside the lock. That is why it is a `@warn` and not a `@debug`.
+        store = InMemoryWorkerStore()
+        rt_store = WorkerRuntime(store)
+        owner = Owner("u")
+        ran = Threads.Atomic{Bool}(false)
+        never = task_info -> (ran[] = true; "never")
+        try
+            key = scoped_task_key("K", owner)
+            run = Nitro.Workers._register_or_watch!(rt_store, key, owner; queue_name="q")
+            item = Nitro.Workers.QueueItem(key, run, never, TaskOptions())
+
+            foreign = TaskInfo(key)
+            @test foreign.run_id != run
+            Nitro.Workers.register_active_task_info!(rt_store, key, foreign)
+
+            # Sequential path. Before the fix it overwrote the foreign info and ran to COMPLETED.
+            @test (@test_logs (:warn, r"foreign run") Nitro.Workers._execute_queued_task(rt_store, item)) === nothing
+            @test ran[] == false
+            record = get_task_info(store, key)
+            @test record.status == PENDING
+            @test record.run_id == run
+            @test record.started_at === nothing
+            @test get_active_task_info(rt_store, key) === foreign
+            @test get_active_task(rt_store, key) === nothing
+
+            # Async path, same claim. The spawned body inherits the test logger.
+            @test_logs (:warn, r"foreign run") wait(Nitro.Workers._execute_task_async(rt_store, key, never, TaskOptions(), run))
+            @test ran[] == false
+            @test get_task_info(store, key).status == PENDING
+            @test get_active_task_info(rt_store, key) === foreign
+            @test get_active_task(rt_store, key) === nothing
+        finally
+            reset_runtime!(rt_store)
+        end
+    end
+
+    @testset "a cancelled record is declined at claim time on both paths" begin
+        # The sequential path used to check CANCELLED before publishing; the async path
+        # published, lost its start CAS, and deregistered. Both now decline inside the claim,
+        # so a cancelled run never has handles at all, and the claim's return says so.
+        store = InMemoryWorkerStore()
+        rt_store = WorkerRuntime(store)
+        owner = Owner("u")
+        ran = Threads.Atomic{Bool}(false)
+        never = task_info -> (ran[] = true; "never")
+        try
+            key = scoped_task_key("K", owner)
+            run = Nitro.Workers._register_or_watch!(rt_store, key, owner; queue_name="q")
+            @test cancel_task(key, owner; runtime=rt_store)[:status] == "Task cancelled"
+
+            @test Nitro.Workers._claim_run!(rt_store, key, run) === nothing
+            @test get_active_task_info(rt_store, key) === nothing
+
+            @test Nitro.Workers._execute_queued_task(rt_store, Nitro.Workers.QueueItem(key, run, never, TaskOptions())) === nothing
+            wait(Nitro.Workers._execute_task_async(rt_store, key, never, TaskOptions(), run))
+            @test ran[] == false
+            @test get_task_info(store, key).status == CANCELLED
+            @test get_active_task(rt_store, key) === nothing
+        finally
+            reset_runtime!(rt_store)
+        end
+    end
+end
+
 @testset "cancellation is cooperative, never injected (#127)" begin
     @testset "cancel_task sets the run's token, and the callback observes it" begin
         store = InMemoryWorkerStore()
