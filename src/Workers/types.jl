@@ -429,9 +429,18 @@ struct QueueItem
     # to the key rather than to the run is the #108/#167 defect, and workers §6 forbids it
     # outright; `_abandon_queued_item!` fences on this ([#182](https://github.com/PingoLee/Nitro.jl/issues/182)).
     #
-    # `_execute_queued_task` deliberately does NOT use it: run-start re-reads the record durably
-    # and claims from whatever it finds, which is the correct claiming read (#167). This exists
-    # for the write that happens when the item is never run at all.
+    # `_execute_queued_task` fences on it too, and the comment here used to say the opposite --
+    # that run-start "deliberately does NOT use it" because re-reading the record durably is the
+    # correct claiming read (#167). That was #191, a bug recorded as design. The two rules are
+    # ORTHOGONAL: the durable read decides WHICH RECORD to consult, this value decides WHOSE RUN
+    # is consulting it. Claiming from whatever the read finds agrees with whoever currently owns
+    # the key -- precisely the successor the fence exists to distinguish this run from -- so a
+    # superseded item ran its callback against the successor's record and stored the result
+    # under it, silently.
+    #
+    # The identity therefore has to be CARRIED from where it was minted, which is the general
+    # rule workers §6 states: a fence value must come from before the window it guards, never
+    # from inside it.
     run_id::UUID
     callback::Function
     options::TaskOptions

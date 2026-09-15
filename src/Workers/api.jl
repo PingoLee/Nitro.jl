@@ -285,12 +285,17 @@ end
 # Returns the new run's `run_id` when the caller should START it, and `nothing` when the caller
 # merely joined an existing one as a watcher.
 #
-# It returned a `Bool` until #182. The identity is what `submit_sequential_task` puts on the
-# `QueueItem`, so that a teardown abandoning the backlog writes a terminal state ADDRESSED TO THE
-# RUN that queued the item rather than to its key (workers §6). Deriving it at the abandon site by
-# re-reading the record does not work: by then the record may belong to a successor, and the write
-# would cancel a run that is about to start. This is the only place the identity is known for
-# certain, because it is where the run is minted.
+# It returned a `Bool` until #182. **This is the only place a run's identity is known for certain,
+# because it is where the run is minted**, so every fence downstream carries it from here rather
+# than re-deriving it. Both submit paths do: `submit_sequential_task` puts it on the `QueueItem`,
+# `submit_task` hands it to `_execute_task_async`.
+#
+# Three writes depend on that. A teardown abandoning the backlog records a terminal state
+# ADDRESSED TO THE RUN that queued the item rather than to its key (#182, workers §6), and both
+# execution paths check it before registering their run handles and fence their start claim on it
+# (#191). Deriving any of them by re-reading the record does not work: by then the record may
+# belong to a successor, so the abandon would cancel a run about to start and the start claim
+# would agree with a run that is not the caller's.
 function _register_or_watch!(runtime::WorkerRuntime, task_key::String, owner::Owner;
                              queue_name::Union{Nothing, String}=nothing,
                              grants::AbstractVector{Owner}=Owner[])
@@ -391,12 +396,34 @@ end
 # `cancel_requested` now holds one of `Threads.nthreads()` `:default`-pool slots -- the same pool
 # serving HTTP -- until it returns, instead of starving one thread's coroutines. See the timeout
 # warning in `docs/src/tutorial/workers.md`.
-function _execute_task_async(runtime::WorkerRuntime, task_key::String, callback::Function, options::TaskOptions)
+#
+# `run_id` is POSITIONAL and REQUIRED, never a defaulted keyword: the unfenced call must not be
+# the shorter one to write (#48, #108). It is the identity `_register_or_watch!` minted for this
+# run, and it is the only thing that makes the read below this run's own.
+function _execute_task_async(runtime::WorkerRuntime, task_key::String, callback::Function, options::TaskOptions, run_id::UUID)
     task = Threads.@spawn begin
-        # The DURABLE read -- see `_execute_queued_task` and #167.
+        # The DURABLE read -- see `_execute_queued_task` and #167. It decides WHICH RECORD;
+        # `run_id` decides WHOSE RUN.
         task_info = get_task_info(runtime.store, task_key)
 
         if task_info === nothing
+            return nothing
+        end
+
+        # The same fence as `_execute_queued_task`. This path is DIFFERENTLY exposed, not simply
+        # narrower: its window is shorter in wall-clock -- a lock release, a `Threads.@spawn`
+        # scheduling hand-off, and on `PormGWorkerStore` a database round-trip, against a queued
+        # item that can sit in a `Channel(100)` behind a long job for minutes -- but its
+        # CONSEQUENCE is worse. Where the sequential path usually serializes a stale item against
+        # its successor on `exec_lock`, here both runs are spawned tasks by construction, so
+        # nothing serializes them and the interleaving in which one stole the other's handles was
+        # the ordinary case rather than an edge. A concurrent `cancel_task` plus re-submit needs
+        # only `lock_tasks`, which is free by then (#191).
+        #
+        # See `_execute_queued_task` for why this must precede `register_run!` and why it
+        # returns `nothing`.
+        if task_info.run_id != run_id
+            @debug "Task superseded before its run started; not running it" task_key=task_key run_id=run_id record_run=task_info.run_id
             return nothing
         end
 
@@ -440,10 +467,12 @@ function _execute_task_async(runtime::WorkerRuntime, task_key::String, callback:
         # `_deregister_run!` is fenced on `run_id` and idempotent, so this is a no-op on every
         # path `_finish_task!` already covered.
         try
+            # The CARRIED identity, not the one read back a moment ago -- see the matching
+            # comment in `_execute_queued_task` (#191).
             if !try_transition!(runtime.store, task_key, (PENDING,), RUNNING;
-                                run_id=task_info.run_id, started_at=started)
-                # Cancelled, or this run no longer owns the record. The `finally` hands the
-                # handles back -- fenced, so we cannot tear down a successor's (#108).
+                                run_id=run_id, started_at=started)
+                # Cancelled, or the record moved on between the read and this CAS. The `finally`
+                # hands the handles back -- fenced, so we cannot tear down a successor's (#108).
                 return task_info
             end
 
@@ -570,11 +599,16 @@ function submit_task(task_key::AbstractString, callback::Function, owner::Owner;
     _authorize_queue!(runtime.store, DEFAULT_QUEUE_NAME, owner)
 
     key = scoped_task_key(task_key, owner; scope)
-    # The async path does not carry the run identity: `_execute_task_async` re-reads the record
-    # durably at run-start, which is the claiming read the rule requires. Only a QUEUED item needs
-    # it plumbed, because it may sit in a buffer long enough for the record to move on.
-    if _register_or_watch!(runtime, key, owner; grants=watchers) !== nothing
-        _execute_task_async(runtime, key, callback, options)
+    # The run identity is PLUMBED here, exactly as `submit_sequential_task` plumbs it onto the
+    # `QueueItem`. This used to read "the async path does not carry the run identity ... only a
+    # QUEUED item needs it, because it may sit in a buffer long enough for the record to move
+    # on", and both halves were wrong (#191). A durable read is a LOOKUP, not a fence -- #167
+    # says which record to read, never that reading it authenticates the reader. And "long
+    # enough" is not a correctness criterion: the window here is a lock release plus a `@spawn`
+    # scheduling hand-off, not a buffer wait, and it is unbounded under thread pressure.
+    run_id = _register_or_watch!(runtime, key, owner; grants=watchers)
+    if run_id !== nothing
+        _execute_task_async(runtime, key, callback, options, run_id)
     end
     return key
 end

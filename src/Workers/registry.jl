@@ -165,6 +165,12 @@ It is not only for terminal states. **Starting** a task is a claimed transition 
 *after* a cancellation that already claimed the record and silently undo it
 ([#142](https://github.com/PingoLee/Nitro.jl/issues/142)).
 
+A start claim is therefore fenced on the same terms as a terminal one, and the `run_id` it passes
+must name the run the caller **intends to start** — never the one it just read back. Reading the
+record and fencing on what comes back is not a fence at all: it agrees with whoever currently owns
+the key, which is exactly the successor the caller must be distinguished from
+([#191](https://github.com/PingoLee/Nitro.jl/issues/191)).
+
 # `run_id` — the precondition names a run, not just a status
 
 A task id outlives the run writing under it. Re-running a finished key replaces the record with a

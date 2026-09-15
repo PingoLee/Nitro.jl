@@ -147,12 +147,76 @@ function _execute_queued_task(runtime::WorkerRuntime, item::QueueItem)
     # The DURABLE read: a live-preferring one here would hand this run its predecessor's
     # `TaskInfo` when a terminal-but-still-executing key is re-run, and the fenced start below
     # would then fail forever (#167).
+    #
+    # That rule decides WHICH RECORD to read. It is silent about WHOSE RUN the reader is, and
+    # conflating the two was #191: reading durably does not authenticate the reader, so the
+    # identity has to be carried in rather than derived here. `item.run_id` is that identity.
     task_info = get_task_info(runtime.store, item.task_key)
 
     if task_info === nothing
         return nothing
     end
 
+    # Is this record still the run that queued this callback? A queued item can outlive its run:
+    # `cancel_task` makes the record terminal while the item is still buffered, and a re-submit
+    # then replaces it with a fresh run. Without this, a stale item read the SUCCESSOR's record
+    # and ran the superseded callback against it -- silently, storing its value as the
+    # successor's result while the successor's own item failed its `(PENDING,)` claim and
+    # returned (#191).
+    #
+    # **Before `register_run!`, not merely before the claim.** That call (below) makes
+    # `task_info` the oracle for every fence this run performs afterwards -- `_deregister_run!`,
+    # `_finish_task!`, `_cancel_task!`, `_snapshot_runs`, `_run_settled`. A run that registers a
+    # record it does not own has not just lost one CAS; it has ADOPTED the successor's identity
+    # for all of them. Two consequences, both reachable because a successor can run concurrently
+    # via `submit_task` or a second queue (`queue_name` is metadata, and both submit paths share
+    # `_register_or_watch!`):
+    #   - this run's `finally _deregister_run!` matches on the successor's `run_id` and deletes
+    #     its LIVE handles, so `recover_zombie_tasks!` sees RUNNING with no active task and
+    #     writes FAILED over a genuinely-running job -- #167 exactly; and
+    #   - in the other interleaving `register_run!` OVERWRITES `active_task_infos[id]` with this
+    #     object, which on `PormGWorkerStore` is a throwaway deserialized copy. `cancel_task`'s
+    #     live lookup then passes its own `run_id` guard and sets the token on an object the
+    #     successor's callback does not hold, so the successor becomes silently UNCANCELLABLE --
+    #     the precise failure that lookup exists to avoid.
+    #
+    # **It narrows that window; it does not close it.** `register_run!` publishes
+    # unconditionally, so a supersede landing between this check and that call still overwrites
+    # the successor's entries, and this run's `finally` then deletes them on a fence that now
+    # matches. What the check removes is the unbounded case -- a buffered item superseded long
+    # before it was dequeued -- leaving a window with no yield point in it: closed outright on a
+    # single-threaded run, since no other Julia task can interleave at all, and on a
+    # multithreaded one bounded in INSTRUCTIONS rather than wall-clock, because an OS preemption
+    # or a GC pause between the two lines stretches it. It predates this fix.
+    # Closing it structurally means making `register_run!` refuse to publish over a
+    # different live `run_id`, which is a change to a core publish primitive and belongs in its
+    # own issue, not here.
+    #
+    # It drops no work: `_register_or_watch!` mints a `run_id` only on the `replace_task!`
+    # branch and each such call yields at most one item, so run -> item is 1:1 and a mismatch
+    # proves a successor exists whose own submit will queue its item or spawn its task -- or,
+    # if that submit's `put!` loses a teardown race, will record it terminal instead, or failing
+    # both is logged as an orphan (#182 territory, not this fence's to answer for).
+    #
+    # `nothing`, not `task_info`: handing the caller the SUCCESSOR's record under this run's name
+    # is the same "a value escapes under the wrong run's identity" error being fixed here, and
+    # it would be indistinguishable from the lost-claim return below. No caller reads either.
+    if task_info.run_id != item.run_id
+        @debug "Queued item superseded before it was dequeued; not running it" task_key=item.task_key item_run=item.run_id record_run=task_info.run_id
+        return nothing
+    end
+
+    # From here `task_info` is a snapshot of THIS run's record -- on `InMemoryWorkerStore` the
+    # very object the registry holds, on `PormGWorkerStore` a fresh deserialization of its row.
+    # A snapshot, not the record: `progress` and `watchers` can move on before the claim below.
+    # Progress is harmless -- the run overwrites it itself. A concurrent grant is harmless for a
+    # different reason than the mirror: `replace_task!` already evicted the predecessor from
+    # `active_task_infos` and this run has not registered yet, so `add_watcher!`'s mirror writes
+    # to nothing. On `PormGWorkerStore` this object therefore never receives the append, and
+    # `watcher_count` under-reports until the run ends; on `InMemoryWorkerStore` it does receive
+    # it, because the store mutates the very registry object this aliases -- not through the
+    # mirror. Authorization survives either way, because `_authorize_or_reload!` re-reads the
+    # durable record whenever the cached one denies.
     if task_info.status == CANCELLED
         return task_info
     end
@@ -197,10 +261,17 @@ function _execute_queued_task(runtime::WorkerRuntime, item::QueueItem)
     # `_deregister_run!` is fenced on `run_id` and idempotent, so this is a no-op on every path
     # `_finish_task!` already covered.
     try
+        # Fenced on the ITEM's identity, never on the record's. The check above already proved
+        # the two are equal, so this is the same VALUE -- but not the same provenance, and
+        # provenance is the rule: workers §6 asks that a fence value come from before the window
+        # it guards, and `item.run_id` visibly does while `task_info.run_id` requires the reader
+        # to first reconstruct the invariant above. It is also what survives a refactor that
+        # moves or weakens that check.
         if !try_transition!(runtime.store, task_info.id, (PENDING,), RUNNING;
-                            run_id=task_info.run_id, started_at=started)
-            # Cancelled, or this run no longer owns the record. The `finally` hands the
-            # handles back -- fenced, so we cannot tear down a successor's (#108).
+                            run_id=item.run_id, started_at=started)
+            # Cancelled, or the record moved on between the read and this CAS. (A stale item
+            # never reaches here any more -- it returned above.) The `finally` hands the handles
+            # back -- fenced, so we cannot tear down a successor's (#108).
             return task_info
         end
 
