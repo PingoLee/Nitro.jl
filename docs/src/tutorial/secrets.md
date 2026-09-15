@@ -33,7 +33,7 @@ urlpatterns("",
 #    SessionMiddleware must stay OUTSIDE CSRFMiddleware: CSRF tokens are bound to the
 #    session id, and without one the CSRF gate fails closed.
 serve(middleware=[
-    SessionMiddleware(),
+    SessionMiddleware(store=MemoryStore()),
     CSRFMiddleware(SECRET_KEY),
 ])
 ```
@@ -152,6 +152,7 @@ browser keeps using HTTPS after the first secure response.
 ```julia
 # Secure session configuration for production
 SessionMiddleware(
+    store = MemoryStore(),
     secure = true,
     httponly = true,
     samesite = "Lax"

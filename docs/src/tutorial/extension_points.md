@@ -125,8 +125,8 @@ serve(middleware = [TraceRequests])
 ### Configurable middleware
 
 To take options, write a **factory** — a function whose *return value* is the middleware above.
-This is the shape every middleware Nitro ships uses (`SessionMiddleware()`, `RateLimiter()`,
-`ExtractIP()`), which is why they appear **called** in a middleware list.
+This is the shape every middleware Nitro ships uses (`SessionMiddleware(store=store)`,
+`RateLimiter()`, `ExtractIP()`), which is why they appear **called** in a middleware list.
 
 Several of them (`RateLimiter`, `AccessLog`, `SessionMiddleware`, `SessionPruner`) go one step
 further and wrap that function in a `LifecycleMiddleware`, so they can own a background
@@ -157,7 +157,8 @@ serve(middleware = [RequireApiKey(key = ENV["API_KEY"])])
 !!! warning "`RateLimiter` and `RateLimiter()` are not the same thing"
     Nitro's built-in middleware are keyword-only factories. Listing one **uncalled** passes the
     factory itself, and the chain then tries to apply it to a handler — a `MethodError` when the
-    pipeline is built, not a quiet no-op. Write `middleware = [SessionMiddleware(), RateLimiter()]`.
+    pipeline is built, not a quiet no-op. Write
+    `middleware = [SessionMiddleware(store=MemoryStore()), RateLimiter()]`.
 
 ### Execution order
 

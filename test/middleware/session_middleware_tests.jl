@@ -312,6 +312,53 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
         @test payload.data["custom_backend"] == true
     end
 
+    # ── #171: no implicit process-global store ────────────────────────────────
+    #
+    # `const DEFAULT_STORE = MemoryStore{String, Dict{String,Any}}()` used to be the `store`
+    # default, so every `SessionMiddleware()` in the process shared one session table.
+    #
+    # What pins #171 is the `@test_throws` pair: restore the const and the default kwarg and
+    # those two fail, because the call succeeds. NOTE: the isolation block at the end passes
+    # under the old design too -- it hands both middlewares an explicit store, so its outcome
+    # never depended on whether a default existed. It is regression cover for explicit-store
+    # isolation, not a demonstration of the defect.
+    @testset "store is required — no shared process-global (#171)" begin
+        @test_throws UndefKeywordError SessionMiddleware()
+        @test_throws UndefKeywordError SessionMiddleware(cookie_name="no_store", max_age=60)
+
+        # `MemoryStore()` builds exactly the parameters the `store` keyword is pinned to.
+        @test MemoryStore() isa MemoryStore{String, Dict{String,Any}}
+        @test MemoryStore() !== MemoryStore()      # a fresh table every call, never shared
+
+        # Both types must be EXPORTED, not merely present in `Nitro`'s namespace: they were
+        # already reachable as `Nitro.MemoryStore` before #171 (via `using .Core`), so
+        # `isdefined` would pass against the unpatched code. `names()` lists exports only,
+        # and that is what makes a required `store` satisfiable after a bare `using Nitro`.
+        @test :MemoryStore in names(Nitro)
+        @test :AbstractSessionStore in names(Nitro)
+        @test MemoryStore() isa Nitro.AbstractSessionStore{String, Dict{String,Any}}
+
+        # Two middlewares built the way an app with two `App`s would build them.
+        storeA, storeB = MemoryStore(), MemoryStore()
+        write_session(mw, marker) = begin
+            wrapped = mw.middleware(function (req::HTTP.Request)
+                getsession(req)["marker"] = marker
+                return HTTP.Response(200, "ok")
+            end)
+            wrapped(HTTP.Request("GET", "/"))
+        end
+
+        write_session(SessionMiddleware(cookie_name="app_a", store=storeA), "A")
+        write_session(SessionMiddleware(cookie_name="app_b", store=storeB), "B")
+
+        @test length(storeA.data) == 1
+        @test length(storeB.data) == 1
+        @test first(values(storeA.data)).data["marker"] == "A"
+        @test first(values(storeB.data)).data["marker"] == "B"
+        # The session ids are distinct, so neither store can be holding the other's row.
+        @test isempty(intersect(keys(storeA.data), keys(storeB.data)))
+    end
+
 end
 
 end

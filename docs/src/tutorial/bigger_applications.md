@@ -192,8 +192,10 @@ include("Handlers/ProductHandlers.jl")
 include("Handlers/OrderHandlers.jl")
 include("Routes.jl")
 
+store = MemoryStore()                                     # `store` is required
+
 urlpatterns("", routes)                                   # register first — prefix, then routes
-serve(middleware=[SessionMiddleware(), RateLimiter()])    # then start
+serve(middleware=[SessionMiddleware(store=store), RateLimiter()])    # then start
 ```
 
 `urlpatterns()` registers the routes; [`serve`](@ref) is **keyword-only** and takes the global
@@ -215,7 +217,7 @@ global middleware → route middleware → handler
 ### Global middleware
 
 ```julia
-serve(middleware=[SessionMiddleware(), RateLimiter()])
+serve(middleware=[SessionMiddleware(store=MemoryStore()), RateLimiter()])
 ```
 
 ### Route-level middleware

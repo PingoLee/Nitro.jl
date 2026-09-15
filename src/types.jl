@@ -265,6 +265,25 @@ struct MemoryStore{K, V} <: AbstractSessionStore{K, V}
     MemoryStore{K, V}() where {K, V} = new{K, V}(Dict{K, SessionPayload{V}}(), Base.ReentrantLock())
 end
 
+"""
+    MemoryStore()
+
+Build a `MemoryStore{String, Dict{String,Any}}` -- the exact type parameters
+[`SessionMiddleware`](@ref) pins its `store` keyword to, so this is the store to reach for
+when you just want in-process sessions:
+
+```julia
+serve(middleware = [SessionMiddleware(store = MemoryStore())])
+```
+
+Sessions live in this process only: they are lost on restart and not shared between processes.
+Use a persistent store (`pormg_nitro_session()`) behind more than one worker.
+
+Each call builds a **separate** store. There is no shared default (#171) -- two `App`s that each
+want their own session table simply call this twice.
+"""
+MemoryStore() = MemoryStore{String, Dict{String,Any}}()
+
 function Base.get(store::MemoryStore, key, default)
     lock(store.lock) do
         return Base.get(store.data, key, default)

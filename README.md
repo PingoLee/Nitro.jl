@@ -291,8 +291,11 @@ urlpatterns("",
     path("/profile", profile, method="GET"),
 )
 
+store = MemoryStore()          # in-process sessions; `store` is required
+
 serve(middleware=[
     SessionMiddleware(
+        store=store,
         cookie_name="nitro_session",
         max_age=3600,
         secure=false,

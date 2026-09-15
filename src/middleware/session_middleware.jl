@@ -12,7 +12,12 @@ using ...Core: own_response_headers
 
 export SessionMiddleware, SessionPruner
 
-const DEFAULT_STORE = MemoryStore{String, Dict{String,Any}}()
+# There is deliberately NO default store (#171). A `const DEFAULT_STORE` used to live here, and
+# every `SessionMiddleware()` built without `store=` shared that one process-wide instance --
+# so two notionally-independent `App`s in one process shared a session table, and each
+# activation spawned its own prune janitor over it. That is the same class of process-global
+# #31 removed when `App` replaced the `CONTEXT[]` singleton. `store` is now required, and
+# omitting it is an `UndefKeywordError` rather than a silent share.
 
 # ── Background pruning (#36) ───────────────────────────────────────────────────────────────
 #
@@ -127,11 +132,21 @@ function SessionPruner(store::AbstractSessionStore; interval::Period = Minute(10
 end
 
 """
-    SessionMiddleware(; cookie_name, secret_key, max_age, store, prune_interval,
+    SessionMiddleware(; store, cookie_name, secret_key, max_age, prune_interval,
                         rotate_on_auth, auth_key, validator, ...)
 
 Creates a `LifecycleMiddleware` that manages server-side sessions with cookie-based session
 IDs. The mutable session dictionary is read with `getsession(req)` (`req.context[:session]`).
+
+# Required keyword
+
+- `store::AbstractSessionStore{String, Dict{String,Any}}` — where sessions are persisted.
+  [`MemoryStore()`](@ref) for in-process sessions, `pormg_nitro_session()` for a database.
+
+  **There is no default, on purpose (#171).** A shared process-global store would be silently
+  shared by every `App` in the process — several can coexist — and by every test that forgot to
+  pass one. Omitting `store` is an `UndefKeywordError` at construction, never a silent share.
+  Two apps that each want their own session table each call `MemoryStore()`.
 
 Expired sessions are reclaimed by a background janitor that starts on `serve()` and stops on
 `terminate()` — see `prune_interval` below and [`SessionPruner`](@ref). Nothing prunes on the
@@ -163,7 +178,7 @@ contract.
 
 # Other keyword arguments
 
-- `cookie_name::String = "nitro_session"`, `store`, `max_age::Int`.
+- `cookie_name::String = "nitro_session"`, `max_age::Int`.
 - `prune_interval::Period = Minute(10)` — how often the background janitor removes expired
   sessions from `store`. Must be a positive fixed-length `Period`; calendar periods (`Month`,
   `Quarter`, `Year`) are rejected, since they cannot be slept on. This replaced a `prune_probability` that ran the prune inline on a
@@ -179,7 +194,7 @@ function SessionMiddleware(;
     cookie_name::String = "nitro_session",
     secret_key::Nullable{String} = nothing,
     max_age::Int = 86400,
-    store::AbstractSessionStore{String, Dict{String,Any}} = DEFAULT_STORE,
+    store::AbstractSessionStore{String, Dict{String,Any}},
     prune_interval::Period = Minute(10),
     secure::Bool = true,
     httponly::Bool = true,

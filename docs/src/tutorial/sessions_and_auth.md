@@ -89,7 +89,7 @@ The built-in `MemoryStore` keeps sessions in a process-local dictionary.
 Sessions are lost on restart.
 
 ```julia
-store = MemoryStore{String, Dict{String,Any}}()
+store = MemoryStore()
 
 serve(middleware=[
     SessionMiddleware(store=store, secure=false),
@@ -486,7 +486,7 @@ csrf_secret = get(ENV, "CSRF_SECRET", nothing)
 isnothing(csrf_secret) && error("CSRF_SECRET must be set")
 
 serve(middleware=[
-    SessionMiddleware(),                  # must be OUTSIDE CSRFMiddleware
+    SessionMiddleware(store=store),       # must be OUTSIDE CSRFMiddleware
     CSRFMiddleware(csrf_secret),
 ])
 ```

@@ -222,7 +222,7 @@ own response unless you need a custom body.
 ```julia
 serve(middleware=[
     ExtractIP(forwarded_header=:x_forwarded_for, trusted_proxies=[ip"127.0.0.1"]),
-    SessionMiddleware(secret_key=ENV["SECRET_KEY"]),
+    SessionMiddleware(store=MemoryStore(), secret_key=ENV["SECRET_KEY"]),
     BearerAuth(jwt_validator(secret; issuer="myapp", audience="api", profile=:strict)),
     CSRFMiddleware(ENV["CSRF_SECRET"]),
 ])
@@ -257,6 +257,7 @@ with typed `id` and `kid` fields. Read it with `getuser(req)`.
 
 ```julia
 SessionMiddleware(
+    store      = MemoryStore(),   # REQUIRED -- there is no default store (#171)
     secret_key = ENV["SECRET_KEY"],
     max_age    = 86400,
     secure     = true,      # keep true in production
