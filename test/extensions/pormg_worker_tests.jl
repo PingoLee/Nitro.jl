@@ -1394,6 +1394,86 @@ else
             @test still_live.run_id == successor.run_id
         end
 
+        @testset "run-start is fenced on the carried run identity on both backends (#191)" begin
+            # workers §6: parity is ASSERTED, not inferred. The fix adds no store method, so the
+            # two backends "obviously" agree -- the exact reasoning that produced #166's
+            # cancellation regression. The body runs unchanged over both, so a divergence fails
+            # rather than hiding behind "it looked equivalent".
+            #
+            # What makes PormG the discriminating half here is precisely one thing:
+            # `get_task_info(store, ·)` returns a FRESH object built by `_from_db_record`, so the
+            # `run_id` both checks below compare is one that survived a serialize/deserialize
+            # round trip rather than being read off the very object the in-memory registry
+            # aliases. That is what #191's checklist says to verify rather than assume. Break
+            # `_from_db_record`'s `run_id` and the SURVIVING item fails its own check here,
+            # pormg-only.
+            #
+            # It deliberately does NOT claim to exercise the `run_id` WHERE term in
+            # `try_transition!`: after the fix a stale item returns before reaching the CAS, so
+            # that term is covered by the #108/#182 testsets above, not by this one.
+            for (label, backend) in (("in-memory", InMemoryWorkerStore()),
+                                     ("pormg", RealPormGWorkerStore(model=MockTaskModel())))
+                rt_fence = WorkerRuntime(backend)
+                owner = Owner("alice")
+                ran = String[]
+                stale_cb = task_info -> (push!(ran, "STALE"); "stale")
+                live_cb = task_info -> (push!(ran, "LIVE"); "live")
+                # Named per backend, so a one-sided failure says WHICH one broke. The whole
+                # point of a parity body is that the two halves can disagree.
+                @testset "$label" begin
+                    try
+                        key = scoped_task_key("run-fence", owner)
+
+                        predecessor_run = Nitro.Workers._register_or_watch!(rt_fence, key, owner; queue_name="reports")
+                        stale = Nitro.Workers.QueueItem(key, predecessor_run, stale_cb, TaskOptions())
+                        @test cancel_task(key, owner; runtime=rt_fence)[:status] == "Task cancelled"
+
+                        successor_run = Nitro.Workers._register_or_watch!(rt_fence, key, owner; queue_name="reports")
+                        @test successor_run != predecessor_run
+                        surviving = Nitro.Workers.QueueItem(key, successor_run, live_cb, TaskOptions())
+
+                        # The record the stale item reads back belongs to the successor. On PormG
+                        # that is a fresh object built by `_from_db_record`; on the in-memory store
+                        # it is the registry's own. Either way the item must decline.
+                        @test Nitro.Workers._execute_queued_task(rt_fence, stale) === nothing
+                        @test ran == String[]
+
+                        pending = get_task_info(backend, key)
+                        @test pending.status == PENDING
+                        @test pending.run_id == successor_run
+                        @test pending.started_at === nothing
+                        @test get_active_task_info(rt_fence, key) === nothing
+
+                        # The surviving run still starts and completes, so the fence does not strand
+                        # the key on either backend.
+                        Nitro.Workers._execute_queued_task(rt_fence, surviving)
+                        @test ran == ["LIVE"]
+                        done = get_task_info(backend, key)
+                        @test done.status == COMPLETED
+                        @test done.result == "live"
+                        @test done.run_id == successor_run
+
+                        # The async path carries the identity the same way, and on PormG reads it
+                        # back through the same `_from_db_record` round trip.
+                        async_key = scoped_task_key("run-fence-async", owner)
+                        async_ran = Threads.Atomic{Bool}(false)
+                        async_predecessor = Nitro.Workers._register_or_watch!(rt_fence, async_key, owner)
+                        cancel_task(async_key, owner; runtime=rt_fence)
+                        async_successor = Nitro.Workers._register_or_watch!(rt_fence, async_key, owner)
+                        wait(Nitro.Workers._execute_task_async(rt_fence, async_key,
+                                                               task_info -> (async_ran[] = true; "stale"),
+                                                               TaskOptions(), async_predecessor))
+                        @test async_ran[] == false
+                        async_record = get_task_info(backend, async_key)
+                        @test async_record.status == PENDING
+                        @test async_record.run_id == async_successor
+                    finally
+                        reset_runtime!(rt_fence)
+                    end
+                end
+            end
+        end
+
         @testset "a user's cancel records \"Cancelled by user\" in the row (#183)" begin
             # The other half of the parity claim: `cancel_task`'s durable write now renders the
             # `:user` message, and `PormGWorkerStore` writes it to a column while preferring the

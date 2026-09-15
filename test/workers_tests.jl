@@ -2270,6 +2270,181 @@ end
             reset_runtime!(rt_store)
         end
     end
+
+    @testset "a queued item does not run against a successor's record (#191)" begin
+        # The run-start claim used to fence on the `run_id` it read out of the record it had
+        # just read, which agrees with whoever currently owns the key -- so it was no fence.
+        # Driven synchronously: the sequential processor calls exactly this, and the whole
+        # scenario is deterministic because a cancel and a re-submit need no concurrency.
+        store = InMemoryWorkerStore()
+        rt_store = WorkerRuntime(store)
+        owner = Owner("u")
+        ran = String[]
+        first_cb = task_info -> (push!(ran, "FIRST"); "first")
+        second_cb = task_info -> (push!(ran, "SECOND"); "second")
+        try
+            key = scoped_task_key("K", owner)
+
+            # The predecessor: registered, queued, then cancelled while still buffered.
+            predecessor_run = Nitro.Workers._register_or_watch!(rt_store, key, owner; queue_name="q")
+            @test predecessor_run !== nothing
+            stale = Nitro.Workers.QueueItem(key, predecessor_run, first_cb, TaskOptions())
+            @test cancel_task(key, owner; runtime=rt_store)[:status] == "Task cancelled"
+
+            # The re-submit replaces the terminal record with a fresh run, and queues its own
+            # item. Both items are now buffered; the STALE one is at the head.
+            successor_run = Nitro.Workers._register_or_watch!(rt_store, key, owner; queue_name="q")
+            @test successor_run !== nothing
+            @test successor_run != predecessor_run
+            surviving = Nitro.Workers.QueueItem(key, successor_run, second_cb, TaskOptions())
+
+            # The stale item must decline. Before the fix it ran `first_cb` here and stored
+            # "first" as the SUCCESSOR's result.
+            @test Nitro.Workers._execute_queued_task(rt_store, stale) === nothing
+            @test ran == String[]
+
+            record = get_task_info(store, key)
+            @test record.status == PENDING
+            @test record.run_id == successor_run
+            @test record.result === nothing
+            @test record.started_at === nothing
+
+            # It registered no handles either -- the check runs BEFORE `register_run!`, so the
+            # stale run never becomes the oracle for the successor's later fences (#167).
+            @test get_active_task(rt_store, key) === nothing
+            @test get_active_task_info(rt_store, key) === nothing
+
+            # And the surviving item still runs, which is the half a bare "the stale one did
+            # nothing" assertion would miss: the fix must not strand the key.
+            Nitro.Workers._execute_queued_task(rt_store, surviving)
+            @test ran == ["SECOND"]
+            finished = get_task_info(store, key)
+            @test finished.status == COMPLETED
+            @test finished.result == "second"
+            @test finished.run_id == successor_run
+        finally
+            reset_runtime!(rt_store)
+        end
+    end
+
+    @testset "a stale queued item leaves a live successor's handles alone (#191, #167)" begin
+        # The collateral harm, and the reason the identity check precedes `register_run!`
+        # rather than merely the claim. A stale item that registered would publish the
+        # SUCCESSOR's `run_id` into the runtime, and its own `finally _deregister_run!` would
+        # then match that fence and delete handles belonging to a genuinely-running job --
+        # after which `recover_zombie_tasks!` sees RUNNING with no active task and writes FAILED.
+        store = InMemoryWorkerStore()
+        rt_store = WorkerRuntime(store)
+        owner = Owner("u")
+        stale_ran = Threads.Atomic{Bool}(false)
+        never = task_info -> (stale_ran[] = true; "never")
+        try
+            key = scoped_task_key("K", owner)
+            predecessor_run = Nitro.Workers._register_or_watch!(rt_store, key, owner; queue_name="q")
+            stale = Nitro.Workers.QueueItem(key, predecessor_run, never, TaskOptions())
+            cancel_task(key, owner; runtime=rt_store)
+
+            # A successor that is genuinely RUNNING with its handles published, as it would be
+            # a moment after starting on the async path or on a second queue.
+            successor_run = Nitro.Workers._register_or_watch!(rt_store, key, owner; queue_name="q")
+            live_info = get_task_info(store, key)
+            @test live_info.run_id == successor_run
+            handle = @async sleep(0.05)
+            Nitro.Workers.register_run!(rt_store, key, live_info, handle)
+            @test try_transition!(store, key, (PENDING,), RUNNING; run_id=successor_run) == true
+
+            Nitro.Workers._execute_queued_task(rt_store, stale)
+
+            @test stale_ran[] == false
+
+            # The successor still owns its handles, so the zombie sweep leaves it alone.
+            @test get_active_task(rt_store, key) === handle
+            @test get_active_task_info(rt_store, key) === live_info
+            @test recover_zombie_tasks!(runtime=rt_store) == 0
+            @test get_task_info(store, key).status == RUNNING
+            wait(handle)
+        finally
+            reset_runtime!(rt_store)
+        end
+    end
+
+    @testset "cancel-then-resubmit on a held queue runs the surviving callback (#191)" begin
+        # The issue's own reproduction, end to end through the public API. Worth having beside
+        # the synchronous test: it is the shape a caller actually hits, and it also pins that
+        # the surviving item is reached at all rather than stranded behind the stale one.
+        #
+        # Both callbacks are defined before the processor spawns -- `_invoke_task_callback`
+        # gates on `applicable`, which is world-age sensitive.
+        store = InMemoryWorkerStore()
+        rt_store = WorkerRuntime(store)
+        owner = Owner("u")
+        gate = Base.Event()
+        entered = Base.Event()
+        order_lock = ReentrantLock()
+        ran = String[]
+        note(name) = lock(order_lock) do
+            push!(ran, name)
+        end
+        holder_cb = task_info -> (notify(entered); wait(gate); "held")
+        first_cb = task_info -> (note("FIRST"); "first")
+        second_cb = task_info -> (note("SECOND"); "second")
+        try
+            # Hold the processor so nothing is consumed while the scenario is set up. This is
+            # the "busy queue" the issue notes is all the buffering the bug needs.
+            submit_sequential_task("q", "holder", holder_cb, owner; runtime=rt_store)
+            wait(entered)
+
+            id = submit_sequential_task("q", "K", first_cb, owner; runtime=rt_store)
+            @test cancel_task(id, owner; runtime=rt_store)[:status] == "Task cancelled"
+            id2 = submit_sequential_task("q", "K", second_cb, owner; runtime=rt_store)
+            # Same key, so the caller's surviving submission is the second callback.
+            @test id2 == id
+
+            notify(gate)
+            @test timedwait(() -> get_task_info(store, id).status == COMPLETED, 10.0;
+                            pollint=0.02) === :ok
+
+            # Before the fix this was ["FIRST"], with "first" stored as the second run's result.
+            @test ran == ["SECOND"]
+            @test get_task_info(store, id).result == "second"
+        finally
+            notify(gate)
+            reset_runtime!(rt_store)
+        end
+    end
+
+    @testset "an async task superseded before its run starts does not run (#191)" begin
+        # `submit_task` has no queue, so the window is the `@spawn` hand-off rather than a
+        # buffer wait -- narrower in wall-clock, wider in consequence, since both runs are
+        # spawned tasks and neither serializes against the other. Driven directly for the same
+        # reason the queued test is: the window is not deterministically reachable from outside.
+        store = InMemoryWorkerStore()
+        rt_store = WorkerRuntime(store)
+        owner = Owner("u")
+        ran = Threads.Atomic{Bool}(false)
+        never = task_info -> (ran[] = true; "first")
+        try
+            key = scoped_task_key("async-K", owner)
+            predecessor_run = Nitro.Workers._register_or_watch!(rt_store, key, owner)
+            cancel_task(key, owner; runtime=rt_store)
+            successor_run = Nitro.Workers._register_or_watch!(rt_store, key, owner)
+            @test successor_run != predecessor_run
+
+            # The spawned body carries the identity it was submitted with, which no longer owns
+            # the record. It must decline rather than claim the successor's PENDING record.
+            wait(Nitro.Workers._execute_task_async(rt_store, key, never, TaskOptions(), predecessor_run))
+
+            @test ran[] == false
+            record = get_task_info(store, key)
+            @test record.status == PENDING
+            @test record.run_id == successor_run
+            @test record.started_at === nothing
+            @test get_active_task(rt_store, key) === nothing
+            @test get_active_task_info(rt_store, key) === nothing
+        finally
+            reset_runtime!(rt_store)
+        end
+    end
 end
 
 @testset "cancellation is cooperative, never injected (#127)" begin
