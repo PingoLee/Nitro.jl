@@ -631,6 +631,45 @@ end
           sprint(io -> showerror(io, parse_err; cause = true))
 end
 
+# #141: `safe_extract` is a wrap site, and a wrap site must not launder control flow. An
+# interrupt arriving while a body-bound extractor deserializes is not client input -- turning
+# it into a `ValidationError` means `handlerequest` never excludes it from the `@error` branch
+# and `serve` never shuts down on it. `test/util_tests.jl` covers the same rule for the sibling
+# site `parseparam_checked`.
+@testset "safe_extract rethrows InterruptException instead of wrapping it (#141)" begin
+    param = Param(:credentials, Json{Login}, missing, false)
+
+    # The defect. Against the unpatched code this raised ValidationError, so the assertion
+    # fails there rather than passing for the wrong reason.
+    @test_throws InterruptException Nitro.Extractors.safe_extract(param) do
+        throw(InterruptException())
+    end
+
+    # The guard must be narrow: every OTHER exception still becomes a 400 with the original
+    # attached as `.cause`. Without this half, `catch e; rethrow(); end` would pass the test above.
+    wrapped = try
+        Nitro.Extractors.safe_extract(param) do
+            throw(ArgumentError("DESERIALIZER-SENTINEL"))
+        end
+        nothing
+    catch e
+        e
+    end
+    @test wrapped isa Nitro.Core.Errors.ValidationError
+    @test wrapped.cause isa ArgumentError
+    # ...and a ValidationError raised inside still passes through unwrapped, not double-wrapped.
+    inner = Nitro.Core.Errors.ValidationError("inner")
+    rethrown = try
+        Nitro.Extractors.safe_extract(param) do
+            throw(inner)
+        end
+        nothing
+    catch e
+        e
+    end
+    @test rethrown === inner
+end
+
 @testset "MultipartForm - non-multipart body throws" begin
     req = HTTP.Request("POST", "/", ["Content-Type" => "application/json"], """{}""")
     param = Param(:payload, MultipartForm{ImportUpload}, missing, false)
