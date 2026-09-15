@@ -200,10 +200,10 @@ CSRFMiddleware(secret::String;                      # needs SessionMiddleware OU
 # issued and 403 on every unsafe method. Throws ArgumentError if a __Host-/__Secure- name is
 # paired with a config browsers would reject.
 
-SessionMiddleware(; cookie_name      = "nitro_session",
+SessionMiddleware(; store,                           # REQUIRED -- no default (#171)
+                    cookie_name      = "nitro_session",
                     secret_key       = nothing,
                     max_age::Int     = 86400,
-                    store            = DEFAULT_STORE,
                     prune_interval   = Minute(10),   # background janitor period (#36)
                     secure           = true,
                     httponly         = true,

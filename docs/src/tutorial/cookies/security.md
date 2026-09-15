@@ -79,7 +79,7 @@ end
 
 serve(middleware=[
     HSTSMiddleware,
-    SessionMiddleware(secure=true),
+    SessionMiddleware(store=MemoryStore(), secure=true),
 ])
 ```
 
