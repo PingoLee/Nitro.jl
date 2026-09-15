@@ -52,8 +52,9 @@ A bare `task === current_task()` check does not find it. `timeout_call` runs the
 the task the callback is running on — the identity comparison misses on every path that has a
 deadline, which is the default. Marking the run is what survives that indirection.
 
-Written by `_invoke_task_callback` (`execution.jl`) rather than at the two `register_run!` sites,
-because that is the single point both execution paths funnel through, with or without a deadline.
+Written by `_invoke_task_callback` (`execution.jl`) rather than in `_claim_run!` or at the two
+execute paths, because that is the single point both of them funnel through, with or without a
+deadline.
 
 Task-local storage is per-task and is **not** inherited by a spawned child, so two runs can never
 see each other's marker. It is **not** enough on its own to keep the marker current, though: a

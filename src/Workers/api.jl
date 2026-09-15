@@ -402,30 +402,22 @@ end
 # run, and it is the only thing that makes the read below this run's own.
 function _execute_task_async(runtime::WorkerRuntime, task_key::String, callback::Function, options::TaskOptions, run_id::UUID)
     task = Threads.@spawn begin
-        # The DURABLE read -- see `_execute_queued_task` and #167. It decides WHICH RECORD;
-        # `run_id` decides WHOSE RUN.
-        task_info = get_task_info(runtime.store, task_key)
-
-        if task_info === nothing
-            return nothing
-        end
-
-        # The same fence as `_execute_queued_task`. This path is DIFFERENTLY exposed, not simply
-        # narrower: its window is shorter in wall-clock -- a lock release, a `Threads.@spawn`
+        # The durable read, the #191 identity check against the CARRIED `run_id`, and the handle
+        # publish, as one critical section under the store lock -- `_claim_run!` (`queue.jl`)
+        # owns the rationale. Runs INSIDE the spawned task, because the handle it publishes is
+        # `current_task()`.
+        #
+        # This path is DIFFERENTLY exposed to a supersede than the sequential one, not simply
+        # less: its window is shorter in wall-clock -- a lock release, a `Threads.@spawn`
         # scheduling hand-off, and on `PormGWorkerStore` a database round-trip, against a queued
         # item that can sit in a `Channel(100)` behind a long job for minutes -- but its
         # CONSEQUENCE is worse. Where the sequential path usually serializes a stale item against
         # its successor on `exec_lock`, here both runs are spawned tasks by construction, so
         # nothing serializes them and the interleaving in which one stole the other's handles was
         # the ordinary case rather than an edge. A concurrent `cancel_task` plus re-submit needs
-        # only `lock_tasks`, which is free by then (#191).
-        #
-        # See `_execute_queued_task` for why this must precede `register_run!` and why it
-        # returns `nothing`.
-        if task_info.run_id != run_id
-            @debug "Task superseded before its run started; not running it" task_key=task_key run_id=run_id record_run=task_info.run_id
-            return nothing
-        end
+        # only `lock_tasks` -- which is exactly why the claim takes it (#191, #198).
+        task_info = _claim_run!(runtime, task_key, run_id)
+        task_info === nothing && return nothing
 
         # Starting is a CLAIMED transition, not an unconditional write. `set_task!` has no
         # precondition, so a `cancel_task` that already claimed PENDING -> CANCELLED was simply
@@ -441,19 +433,9 @@ function _execute_task_async(runtime::WorkerRuntime, task_key::String, callback:
         # the async path too, which is why this lands FIRST.
         started = current_time_utc()
 
-        # Register the handles BEFORE claiming RUNNING, not after. `recover_zombie_tasks!`
-        # decides a run is dead from exactly `status == RUNNING && isnothing(get_active_task(id))`
-        # and does not hold anything that excludes this function, so a store that reads RUNNING
-        # before the handle exists is a window in which a sweep marks a genuinely-live run FAILED
-        # -- and the run's real result is then discarded by its own losing CAS. The old
-        # unconditional `set_task!` wrote the store LAST and so never opened that window;
-        # claiming the start (#142) reversed the order, and this restores it. Registering while
-        # the record is still PENDING is harmless: that sweep only looks at RUNNING.
-        # ONE atomic publish, not two writes: `_deregister_run!` fences on `run_id` read off the
-        # info, so a handle visible without its info is invisible to the fence -- and a predecessor
-        # finishing in that window deletes the SUCCESSOR's handle (#167). See `register_run!`.
-        register_run!(runtime, task_key, task_info, current_task())
-
+        # The handles are already published -- `_claim_run!` did it BEFORE this claim of RUNNING,
+        # not after; `_execute_queued_task` says why that order matters to `recover_zombie_tasks!`.
+        #
         # `try`/`finally`, so this run's handles are released on EVERY exit -- including the
         # two that no terminal write covers: a store exception escaping the claim below (the
         # spawned task simply fails), and the `0:max_attempts` loop falling through when

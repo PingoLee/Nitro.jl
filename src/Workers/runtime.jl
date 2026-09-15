@@ -97,9 +97,10 @@ function get_active_task(runtime::WorkerRuntime, task_id::String)
 end
 
 """
-    register_run!(runtime::WorkerRuntime, task_id::String, task_info::TaskInfo, task::Task)
+    register_run!(runtime::WorkerRuntime, task_id::String, task_info::TaskInfo, task::Task) -> Bool
 
-Publish a run's live `TaskInfo` **and** its `Task` handle as one atomic step.
+Publish a run's live `TaskInfo` **and** its `Task` handle as one atomic step — **unless the slot
+already holds a different run**, in which case nothing is written and the return is `false`.
 
 The two must not be published separately, and the reason is [`_deregister_run!`](@ref): it decides
 whose handles it may drop by comparing `run_id` on the *info*, so the info is the fence's only
@@ -112,13 +113,33 @@ Ordering the two writes correctly would also fix it, but only by convention, and
 observable from outside the runtime — so a test cannot hold the convention in place. Publishing
 both under one `active_lock` makes "a handle never exists without its info" structural instead, and
 `_deregister_run!`'s `live === nothing` branch sound by construction rather than by inspection.
+
+# A compare-and-set, not an assignment (#198)
+
+The same fence has a second precondition: the info in the slot must be the run that currently
+owns the key, or `_deregister_run!` matching on it proves nothing. An unconditional assignment
+could not keep that true. A run that had verified its ownership (#191) and was then superseded
+before it published overwrote the successor's live entries with its own, and its `finally` then
+deleted them on a fence that now matched — leaving a genuinely-running job with no handle, which
+the zombie sweep marks `FAILED` and `cancel_task` can no longer reach.
+
+So this refuses to publish over a foreign `run_id`. Re-publishing one's **own** run is allowed and
+idempotent; an empty slot accepts anything. The return is `Bool` since #198 — it used to hand back
+`task_info`, which no caller read. The refusal is a *guard*, not the fix: the fix is `_claim_run!`
+(`src/Workers/queue.jl`), which performs the durable read, the identity check and this publish
+under `lock_tasks` — the lock every supersede holds and evicts under — so a production run always
+finds the slot empty or its own. What the CAS adds is that the fence stays honest even for a publish
+that did not come through the claim: the test-only registrars, or a refactor that moves the read
+back outside the lock. Either way the slot never names a run the record does not.
 """
 function register_run!(runtime::WorkerRuntime, task_id::String, task_info::TaskInfo, task::Task)
     lock(runtime.active_lock) do
+        live = Base.get(runtime.active_task_infos, task_id, nothing)
+        (live === nothing || live.run_id == task_info.run_id) || return false
         runtime.active_task_infos[task_id] = task_info
         runtime.active_tasks[task_id] = task
+        return true
     end
-    return task_info
 end
 
 function register_active_task!(runtime::WorkerRuntime, task_id::String, task::Task)
@@ -309,7 +330,9 @@ snapshot time, its live `TaskInfo`, and the `Task` handle registered for it.
 `run_id` and `info` are `nothing` only for a handle registered without one — which
 [`register_run!`](@ref) makes unreachable for a real run, and which in practice means the
 test-only `register_active_task!`. Both halves are captured under one `active_lock` acquisition,
-so an entry can never name a handle from one run and an info from another.
+so an entry can never name a handle from one run and an info from another — and since
+`register_run!` refuses to publish over a different live run (#198), the info it captures is the
+run that actually owns the key, not one that overwrote it.
 """
 struct DrainEntry
     id::String
@@ -401,7 +424,9 @@ end
 #
 # `live === nothing` is safe to delete for the same reason it is in `_deregister_run!`:
 # `register_run!` publishes a handle and its info together, so no live run can be holding a handle
-# whose info is absent.
+# whose info is absent. And `live.run_id == entry.run_id` is a real match rather than a coincidence
+# for the same reason too: `register_run!` never publishes over a foreign run (#198), so an info
+# naming this run was put there by this run, not by a stale predecessor that arrived later.
 function _release_settled_handles!(runtime::WorkerRuntime, snapshot::Vector{DrainEntry})
     lock(runtime.active_lock) do
         for entry in snapshot

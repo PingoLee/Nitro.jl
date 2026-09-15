@@ -1474,6 +1474,77 @@ else
             end
         end
 
+        @testset "register_run! refuses a foreign live run on both backends (#198)" begin
+            # workers §6: parity is ASSERTED. The caches are runtime-owned, so the CAS is one
+            # shared body rather than two store methods -- which is exactly the "obviously
+            # equivalent" reasoning the rule warns about. What PormG discriminates: every
+            # `TaskInfo` the runtime sees is a FRESH deserialization, so the `run_id` the CAS
+            # compares has survived a round trip rather than being read off the object the
+            # in-memory registry aliases. Same body as `workers_tests.jl`'s #198 group, over both.
+            for (label, backend) in (("in-memory", InMemoryWorkerStore()),
+                                     ("pormg", RealPormGWorkerStore(model=MockTaskModel())))
+                rt_cas = WorkerRuntime(backend)
+                owner = Owner("alice")
+                handles = Task[]
+                ran = Threads.Atomic{Bool}(false)
+                never = task_info -> (ran[] = true; "never")
+                @testset "$label" begin
+                    try
+                        # The issue's interleaving: P read its record (T0), a cancel and a
+                        # re-submit minted S which registered and claimed RUNNING (T1), and
+                        # only then does P publish (T2).
+                        key = scoped_task_key("cas", owner)
+                        predecessor_run = Nitro.Workers._register_or_watch!(rt_cas, key, owner; queue_name="reports")
+                        p_info = get_task_info(backend, key)
+                        @test p_info.run_id == predecessor_run
+                        @test cancel_task(key, owner; runtime=rt_cas)[:status] == "Task cancelled"
+
+                        successor_run = Nitro.Workers._register_or_watch!(rt_cas, key, owner; queue_name="reports")
+                        s_info = get_task_info(backend, key)
+                        @test s_info.run_id == successor_run
+                        s_handle = @async sleep(0.05)
+                        push!(handles, s_handle)
+                        @test register_run!(rt_cas, key, s_info, s_handle) == true
+                        @test try_transition!(backend, key, (PENDING,), RUNNING; run_id=successor_run) == true
+
+                        p_handle = @async nothing
+                        push!(handles, p_handle)
+                        @test register_run!(rt_cas, key, p_info, p_handle) == false
+                        @test register_run!(rt_cas, key, s_info, s_handle) == true
+                        Nitro.Workers._deregister_run!(rt_cas, p_info)
+
+                        @test get_active_task(rt_cas, key) === s_handle
+                        @test get_active_task_info(rt_cas, key) === s_info
+                        @test recover_zombie_tasks!(; runtime=rt_cas) == 0
+                        @test get_task_info(backend, key).status == RUNNING
+                        @test cancel_task(key, owner; runtime=rt_cas)[:status] == "Task cancelled"
+                        @test cancel_reason(s_info) == :user
+                        @test cancel_reason(p_info) == :none
+
+                        # A foreign run in the slot at claim time is declined on both paths.
+                        # On PormG the record read inside the claim is a fresh object; the
+                        # CAS compares its `run_id` against the foreign info's.
+                        key2 = scoped_task_key("cas-claim", owner)
+                        run2 = Nitro.Workers._register_or_watch!(rt_cas, key2, owner; queue_name="reports")
+                        foreign = TaskInfo(key2)
+                        Nitro.Workers.register_active_task_info!(rt_cas, key2, foreign)
+                        item = Nitro.Workers.QueueItem(key2, run2, never, TaskOptions())
+                        @test (@test_logs (:warn, r"foreign run") Nitro.Workers._execute_queued_task(rt_cas, item)) === nothing
+                        @test_logs (:warn, r"foreign run") wait(Nitro.Workers._execute_task_async(rt_cas, key2, never, TaskOptions(), run2))
+                        @test ran[] == false
+                        pending = get_task_info(backend, key2)
+                        @test pending.status == PENDING
+                        @test pending.run_id == run2
+                        @test get_active_task_info(rt_cas, key2) === foreign
+                        @test get_active_task(rt_cas, key2) === nothing
+                    finally
+                        foreach(wait, handles)
+                        reset_runtime!(rt_cas)
+                    end
+                end
+            end
+        end
+
         @testset "a user's cancel records \"Cancelled by user\" in the row (#183)" begin
             # The other half of the parity claim: `cancel_task`'s durable write now renders the
             # `:user` message, and `PormGWorkerStore` writes it to a column while preferring the
