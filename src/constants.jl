@@ -51,6 +51,10 @@ Ten seconds is far more than a healthy shutdown needs — the drain is normally 
 since it only has to reap idle keep-alive connections — while still bounding a pathological
 shutdown to something a CI job survives. Override per server with `serve(shutdown_timeout = …)`
 or per call with `terminate(timeout = …)`.
+
+`terminate` runs the lifecycle shutdown hooks first, so a blocking hook adds to this. The one in
+the box is the worker drain (`Nitro.Workers.WORKER_DRAIN_TIMEOUT_SECONDS`, 5 seconds), which is
+sized at half this figure precisely because the two add up.
 """
 const SHUTDOWN_TIMEOUT_SECONDS :: Float64 = 10.0
 

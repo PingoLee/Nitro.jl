@@ -297,6 +297,11 @@ whatever remains.
 `timeout` defaults to the server's own `serve(shutdown_timeout = …)`, itself defaulting to
 `Nitro.Core.SHUTDOWN_TIMEOUT_SECONDS` (10 seconds). `timeout = 0` skips the graceful phase.
 
+**This budget is not the whole exit time.** Every `LifecycleMiddleware` shutdown hook runs *before*
+the drain begins, and a hook may block: `worker_startup`'s drains in-flight background tasks for up
+to `WORKER_DRAIN_TIMEOUT_SECONDS` (5 seconds) of its own. The two are consecutive, so size them
+together against a container's stop grace period.
+
 **Long-lived connections are always cut at the timeout.** A WebSocket, SSE, or STREAM handler
 holds its connection for its whole lifetime, so the drain can never wait it out. If such a
 handler has to finish cleanly, give it a shutdown signal of its own — an `Event` or `Channel`

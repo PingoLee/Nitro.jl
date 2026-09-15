@@ -17,6 +17,58 @@ A `TaskInfo.queue_name` stays `nothing` for these tasks: that field records the
 const DEFAULT_QUEUE_NAME = "default"
 
 """
+    WORKER_DRAIN_TIMEOUT_SECONDS
+
+Default ceiling, in seconds, on [`shutdown!`](@ref)'s graceful drain before it stops waiting for
+in-flight runs and warns.
+
+**Half of `Nitro.Core.SHUTDOWN_TIMEOUT_SECONDS`, on purpose.** The HTTP drain only has to reap idle
+keep-alive connections, so ten seconds is an outer bound it essentially never approaches. A worker
+drain is the opposite: background jobs are long by definition, so a callback that does not poll
+[`cancel_requested`](@ref) will sit against this ceiling as a matter of course rather than as a
+pathology. And the two budgets **add** — `terminate` runs every `LifecycleMiddleware` shutdown hook,
+`worker_startup`'s among them, *before* it closes the listener, so worst-case process exit is this
+plus the HTTP timeout. Five seconds keeps that sum inside a default container stop grace period.
+
+Override per teardown with `shutdown!(runtime; drain_timeout = …)`, or for a served app with
+`worker_startup(...; drain_timeout = …)`. `0` restores the pre-#176 behaviour: release the handles
+and return without waiting.
+"""
+const WORKER_DRAIN_TIMEOUT_SECONDS :: Float64 = 5.0
+
+"""
+    CURRENT_RUN_KEY
+
+Task-local key naming the run whose callback is executing on the current task.
+
+It has exactly one reader — `_snapshot_runs` (`runtime.jl`), which must not make a drain wait for
+the run that is *calling* that drain. `shutdown!` is reachable from inside a callback:
+`resetstate()` goes through `reset_runtime!`, and an app callback may call `terminate()`. Such a
+run can never settle while it is blocked in the wait, so without this the call stalls for the whole
+`drain_timeout` and then warns about itself (#176).
+
+A bare `task === current_task()` check does not find it. `timeout_call` runs the callback on a
+**child** task, so the handle in `active_tasks` is the parent wrapper parked in `timedwait`, not
+the task the callback is running on — the identity comparison misses on every path that has a
+deadline, which is the default. Marking the run is what survives that indirection.
+
+Written by `_invoke_task_callback` (`execution.jl`) rather than at the two `register_run!` sites,
+because that is the single point both execution paths funnel through, with or without a deadline.
+
+Task-local storage is per-task and is **not** inherited by a spawned child, so two runs can never
+see each other's marker. It is **not** enough on its own to keep the marker current, though: a
+sequential queue processor with `TaskOptions(timeout=0)` runs many callbacks on one long-lived
+task, so `_invoke_task_callback` saves and restores the previous value around each invocation.
+Staleness is prevented by that `finally`, not by the language — do not remove it on the theory that
+one task runs one callback.
+
+Non-inheritance does bound what the marker covers: a callback that spawns its own task and calls
+`shutdown!` from *there* is not recognised, and waits out the window. That is a deliberate floor,
+not an oversight — the wait is bounded, so the cost is a slow teardown rather than a hang.
+"""
+const CURRENT_RUN_KEY = :nitro_worker_run_id
+
+"""
     TASK_KEY_DELIMITER
 
 Separator between the owner and the caller-supplied key in a `:user`-scoped task
@@ -215,9 +267,22 @@ end
 
 `true` once cancellation has been requested for **this run**, in **this process**.
 
-Poll it from any long-running callback. It is the whole of Nitro's cancellation mechanism:
-`cancel_task` and an expired `TaskOptions(timeout=…)` both set it, and neither can stop a
-callback that never looks ([#127](https://github.com/PingoLee/Nitro.jl/issues/127)).
+Poll it from any long-running callback. It is the whole of Nitro's cancellation mechanism, and
+**four** things set it: `cancel_task`, an expired `TaskOptions(timeout=…)`, re-running a key whose
+predecessor is still executing, and a teardown drain ([`shutdown!`](@ref), #176) asking in-flight
+runs to stop. None of them can stop a callback that never looks
+([#127](https://github.com/PingoLee/Nitro.jl/issues/127)).
+
+They do not all mean the same thing about the *record*. `cancel_task` has already claimed
+`CANCELLED` before it sets the token; the deadline throws `TaskTimeoutError`; a re-run has already
+replaced the record. A **drain claims nothing on its own** — a terminal write there would race the
+run's own, the #88/#108 failure mode — so what a drained run records is whatever it reaches by
+itself: `COMPLETED` with the value it returns, `FAILED` if it throws with no retry left, **or
+`CANCELLED` if the token arrives while it is parked in the retry backoff**, which polls this same
+token — and records a message that says nothing true about provenance (`"Cancelled by user"` on the
+async path, `"Cancelled"` on a sequential queue, whoever actually asked). See [`shutdown!`](@ref)
+for that table. Make a shutdown-truncated run legible in the value you return rather than relying
+on the status to say which of the four happened.
 
 ```julia
 submit_task("import", task_info -> begin

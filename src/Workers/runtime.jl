@@ -34,7 +34,7 @@ data and the tenant, so two runtimes over one store correctly share one security
 | `store` | The backend. Concrete via the type parameter, so store calls stay statically dispatched |
 | `sequential_queues` / `queue_lock` | `SequentialQueue` per queue name, each owning a `Channel` and a processor `Task` |
 | `cleanup_scheduler` | The retention sweep, or `nothing` |
-| `active_tasks` / `active_task_infos` / `active_lock` | Process-local run handles. Keyed by task id, but each entry describes one **run** |
+| `active_tasks` / `active_task_infos` / `active_lock` | Process-local run handles. Keyed by task id, but each entry describes one **run**. [`shutdown!`](@ref) drains against these and keeps whatever outlives the wait (#176) |
 
 `active_task_infos` is the live-`TaskInfo` cache, and it lives here for **both** backends. It was
 previously a `PormGWorkerStore` field with no in-memory counterpart — the in-memory store answered
@@ -301,10 +301,130 @@ end
 # ============================================================================
 
 """
-    shutdown!(runtime::WorkerRuntime)
+    DrainEntry
+
+One in-flight run as [`shutdown!`](@ref) found it: the key, the run that owned that key at
+snapshot time, its live `TaskInfo`, and the `Task` handle registered for it.
+
+`run_id` and `info` are `nothing` only for a handle registered without one — which
+[`register_run!`](@ref) makes unreachable for a real run, and which in practice means the
+test-only `register_active_task!`. Both halves are captured under one `active_lock` acquisition,
+so an entry can never name a handle from one run and an info from another.
+"""
+struct DrainEntry
+    id::String
+    run_id::Union{Nothing, UUID}
+    info::Union{Nothing, TaskInfo}
+    task::Task
+end
+
+# Capture the in-flight runs in ONE critical section, so a handle and its info cannot come from
+# different runs.
+#
+# The run that is CALLING the drain is deliberately skipped. `shutdown!` is reachable from inside a
+# worker callback -- `resetstate()` (`src/methods.jl`) goes through `reset_runtime!`, and an app
+# callback may call `terminate()` -- and such a run cannot finish while it is blocked here, nor
+# deregister itself. Waiting for it is a guaranteed full-timeout stall followed by a warning naming
+# the very run that was doing the waiting.
+#
+# TWO probes, because one does not cover it. `task === current_task()` catches a run whose callback
+# runs directly on its registered handle, which happens only when `TaskOptions(timeout = 0)`
+# disables the deadline. With a deadline -- the default -- `timeout_call` runs the callback on a
+# CHILD task and the registered handle is the parent parked in `timedwait`, so the identity check
+# misses. `CURRENT_RUN_KEY` (`types.jl`) is the task-local marker that survives that indirection.
+function _snapshot_runs(runtime::WorkerRuntime)
+    me = current_task()
+    my_run = Base.get(task_local_storage(), CURRENT_RUN_KEY, nothing)
+    return lock(runtime.active_lock) do
+        entries = Vector{DrainEntry}()
+        for (task_id, task) in runtime.active_tasks
+            task === me && continue
+            info = Base.get(runtime.active_task_infos, task_id, nothing)
+            run_id = info === nothing ? nothing : info.run_id
+            run_id !== nothing && run_id == my_run && continue
+            push!(entries, DrainEntry(task_id, run_id, info, task))
+        end
+        return entries
+    end
+end
+
+# Has this run stopped being this runtime's problem?
+#
+# **The info clause is what terminates every production wait.** A real run clears BOTH caches
+# through `_deregister_run!` -- inside `_finish_task!`, and again in the `finally` around each
+# execute path -- and it does that *before* its task completes. So for a run registered by
+# `register_run!`, clause 2 always fires first and `istaskdone` never gets to decide. That holds
+# for both shapes:
+#
+#   - The ASYNC path registers the run's OWN spawned task (`_execute_task_async`).
+#   - The SEQUENTIAL path registers `current_task()` -- the long-lived, SHARED queue processor
+#     (`_execute_queued_task`). `istaskdone` on that is true only once the processor has finished
+#     this item, drained every item still buffered behind it, and broken out of `take!`, so here
+#     the info clause is not merely first but *necessary*: narrowing this predicate to
+#     `istaskdone` alone would turn every sequential teardown into a full-timeout stall.
+#
+# **`istaskdone` is the backstop, not the probe.** It decides only for a handle whose info nothing
+# will ever remove -- the `register_active_task!` / `register_active_task_info!` pair, which has no
+# production caller and exists for tests. There clause 2 is permanently false (the info is present
+# and still names this run), so without `istaskdone` such an entry could never settle and every
+# teardown would ride the ceiling. It also gates the delete in `_release_settled_handles!`, which
+# is where it does its real work.
+#
+# The info clause reads "this run no longer owns its key", not "the callback returned" -- a run
+# displaced mid-drain by a re-run (`replace_task!` evicts both caches) settles here while its
+# callback is still going. That is correct: the drain no longer owns that run, and in the
+# sequential case cannot even find its handle.
+function _run_settled(runtime::WorkerRuntime, entry::DrainEntry)
+    istaskdone(entry.task) && return true
+    return lock(runtime.active_lock) do
+        live = Base.get(runtime.active_task_infos, entry.id, nothing)
+        return live === nothing || live.run_id != entry.run_id
+    end
+end
+
+# Release the handles of runs that actually finished, and ONLY those.
+#
+# Two properties, both required; dropping either is a regression.
+#
+# **Fenced on `run_id`**, because this runs after a wait measured in seconds. A snapshotted run A
+# can finish, and a re-run publish run B under the same key, entirely inside the drain window --
+# and an id-keyed `delete!` would then evict the LIVE SUCCESSOR's handle, which
+# `recover_zombie_tasks!` reads as death. That is exactly the #108/#167 defect
+# [`_deregister_run!`](@ref) exists to prevent, arriving through a window far wider than the one
+# it was written for.
+#
+# **`active_tasks` only.** `active_task_infos` is what `cancel_task` resolves a live object
+# through, so clearing it would make a run that outlives a teardown uncancellable -- the rule
+# `shutdown!` has always kept. A real run deregisters BOTH itself, through `_deregister_run!`,
+# before its task completes; what actually reaches this loop is the leftover half of a handle
+# registered with no run behind it.
+#
+# `live === nothing` is safe to delete for the same reason it is in `_deregister_run!`:
+# `register_run!` publishes a handle and its info together, so no live run can be holding a handle
+# whose info is absent.
+function _release_settled_handles!(runtime::WorkerRuntime, snapshot::Vector{DrainEntry})
+    lock(runtime.active_lock) do
+        for entry in snapshot
+            istaskdone(entry.task) || continue
+            live = Base.get(runtime.active_task_infos, entry.id, nothing)
+            if live === nothing || live.run_id == entry.run_id
+                delete!(runtime.active_tasks, entry.id)
+            end
+        end
+    end
+    return nothing
+end
+
+"""
+    shutdown!(runtime::WorkerRuntime; drain_timeout = WORKER_DRAIN_TIMEOUT_SECONDS) -> Bool
 
 Release everything this process is running: stop the cleanup scheduler, close and discard the
-sequential queues, and drop the run handles.
+sequential queues, then **drain** the runs still executing here — ask them to stop, wait up to
+`drain_timeout` seconds, and release the handles of the ones that finished.
+
+Returns `true` when every run that was in flight settled, `false` when the wait ran out and
+something was still going. (An expired wait can still return `true`: a run that settles between the
+deadline and the check counts, and then nothing is warned about either.)
 
 **A concrete method on a concrete type.** There is no abstract dispatch here and no fallback, so
 there is nothing a backend author can forget — which is the difference between this and the
@@ -321,24 +441,82 @@ through it, so clearing it would make a run that outlives a teardown uncancellab
 by leaving it — each run removes its own entry when it finishes. [`reset_runtime!`](@ref) does
 clear it, because a reset is total where a teardown is not.
 
-# This releases; it does not drain
+# The drain (#176)
 
-Nothing stops a running Julia task — cancellation here is a token a callback polls — so this
-returns without waiting for in-flight runs, and clearing `active_tasks` makes a run that is still
-executing look dead to `recover_zombie_tasks!`, which decides liveness from exactly
-`get_active_task`. A teardown-then-restart **in one process** (a dev reload, several apps per
-process, a test suite resetting between cases) therefore marks such a run `FAILED`, and its real
-result is discarded when its own run-fenced terminal write loses.
+Nothing stops a running Julia task — cancellation here is a token a callback polls — so a drain is
+a *request* plus a bounded wait, never a kill. In order:
 
-Closing that means a graceful drain — waiting for, or re-registering, in-flight runs — which is a
-lifecycle design decision rather than a teardown fix. It is now *buildable*, which it was not
-before: the object that owns the tasks is the object being shut down. `active_tasks` is the set to
-wait on and `active_task_infos` the set of tokens to set first.
+1. Every in-flight run's `cancel_requested` token is set, **before** the wait rather than after
+   it, so a cooperative callback has the whole window in which to notice and return.
+2. `timedwait` polls until each snapshotted run has either finished or stopped owning its key.
+3. If anything is still unsettled after that, a `@warn` names it and the wait is not retried.
+
+A run that did **not** settle keeps its handle registered, and that is the half of this which
+fixes the issue. `recover_zombie_tasks!` decides liveness from exactly `get_active_task`, so the
+old unconditional `empty!(active_tasks)` made a still-executing run look dead to the next
+`start!(recover_zombies = true)`, which marked it `FAILED` and discarded the real result when the
+run's own fenced terminal write lost. Leaving the handle in place is not a leak: `_finish_task!`
+removes it when the callback eventually returns.
+
+**That second half only helps a runtime that is reused.** `uninstall!` empties the extension slot,
+so a `serve → terminate → serve` cycle with `store = …` builds a *new* `WorkerRuntime` whose
+`active_tasks` is empty by construction, and an abandoned run from the previous cycle is swept as
+before. For that shape the drain itself — finishing the run before teardown returns — is the whole
+fix. Reuse means `worker_startup(runtime = …)`, `install!(ctx, runtime)`, or a direct
+`shutdown!`-then-reuse.
+
+`drain_timeout = 0` skips both the tokens and the wait and drops every handle: the pre-#176
+behaviour, exactly. It still reports honestly — `false` when it abandoned a live run — because the
+return value means *was everything settled*, not *did I try*.
+
+# What this does NOT bound
+
+`drain_timeout` bounds the drain, not the call. `stop_cleanup_scheduler!` waits on the scheduler
+task with no deadline of its own, and that happens first.
+
+A **closed sequential queue keeps executing its backlog.** Closing the channel stops new
+submissions, but the processor drains what is already buffered — so runs can start during and
+after the drain that were never in its snapshot and get neither a token nor a wait. That is
+unchanged from before this drain existed; the alternative, discarding the backlog, strands those
+records at `PENDING`, which no sweep looks at.
+
+# What a drained run records
+
+The drain itself writes no terminal state — that would race the run's own write, the #88/#108
+failure mode — so the outcome is whatever the run reaches on its own:
+
+| The run was… | It records |
+|---|---|
+| running its callback, which returns on the token | `COMPLETED`, carrying whatever it returned |
+| running its callback, which throws | `FAILED` with that message (or a retry, if one is left) |
+| **between retries**, parked in the cancellation-aware backoff | **`CANCELLED`** — see the note on its message |
+
+That third row surprises people, so it is stated rather than implied: the retry backoff polls this
+very token, so a drain landing inside one ends the run as cancelled. Reaching a terminal state
+there is the useful behaviour — the alternative is a job that restarts during teardown — but the
+record cannot distinguish "cancelled by a person" from "stopped by a shutdown", and the message is
+actively misleading: the async path passes `"Cancelled by user"` and the sequential queue takes
+`_cancel_task!`'s `"Cancelled"` default, so it names a user who did nothing on one path and says
+nothing about provenance on the other. That split predates this drain.
+
+A callback that wants a shutdown-truncated run to be recognisable should therefore say so in the
+value it returns or the error it raises, rather than relying on the status.
+
+**The run calling this is excluded.** `_snapshot_runs` skips it (see `CURRENT_RUN_KEY`), so a
+`shutdown!` invoked from inside a callback neither waits for nor reports on its own run — and can
+return `true` while that one run is still going. It has to: that run cannot finish while it is
+blocked here.
 """
-function shutdown!(runtime::WorkerRuntime)
+function shutdown!(runtime::WorkerRuntime; drain_timeout::Real = WORKER_DRAIN_TIMEOUT_SECONDS)
+    drain_timeout < 0 && throw(ArgumentError(
+        "drain_timeout must be >= 0 (got $(drain_timeout)); 0 releases without waiting"))
+
     scheduler_ref = runtime.cleanup_scheduler
     scheduler = scheduler_ref[]
     if !isnothing(scheduler)
+        # This wait carries no deadline, so it sits OUTSIDE `drain_timeout`'s budget. It is short
+        # in practice -- the scheduler task runs no user code, only `timedwait` and a retention
+        # sweep -- but `drain_timeout` is not a bound on this function's total time.
         stop_cleanup_scheduler!(scheduler)
         scheduler_ref[] = nothing
     end
@@ -355,12 +533,65 @@ function shutdown!(runtime::WorkerRuntime)
         empty!(runtime.sequential_queues)
     end
 
-    # A graceful drain would go HERE, before the handles are dropped.
-    lock(runtime.active_lock) do
-        empty!(runtime.active_tasks)
+    if iszero(drain_timeout)
+        # The pre-#176 path, unchanged: no tokens, no wait, every handle dropped. Setting tokens
+        # without waiting would be pure harm -- it asks live callbacks to abandon work on the way
+        # out of a teardown that was never going to wait for the answer.
+        #
+        # The return value still has to be honest, though: it means "was everything settled when
+        # this returned", and dropping a live run's handle does not settle it. So this reports
+        # `false` exactly when it abandoned something -- the same thing `_shutdown_server`
+        # (`src/context.jl`) does on its own `iszero(timeout)` force-close branch.
+        abandoned = _snapshot_runs(runtime)
+        settled = all(entry -> _run_settled(runtime, entry), abandoned)
+        lock(runtime.active_lock) do
+            empty!(runtime.active_tasks)
+        end
+        return settled
     end
 
-    return nothing
+    snapshot = _snapshot_runs(runtime)
+    isempty(snapshot) && return true
+
+    # Ask first, THEN wait. The token is the only thing that can make a callback stop, so setting
+    # it after the wait -- the shape `timeout_call` uses, where by then there is nothing left to
+    # wait for -- would tell a cooperative callback to stop at the exact moment we stopped caring.
+    #
+    # A direct field write, NOT `cancel_task`: no store write, no authorization question, no
+    # status change. This is a request aimed at the callback, not a claim about the record.
+    for entry in snapshot
+        entry.info === nothing && continue
+        @atomic entry.info.cancel_requested = true
+    end
+
+    # No lock is held across the wait, and none may be. `active_lock` would deadlock against
+    # `_deregister_run!`, which is how a run settles; `queue_lock` is re-acquired by the queue
+    # processor's own `finally`, so holding it would block the very completion being waited for.
+    # The predicate runs inside a `Timer` callback, so it stays cheap and total and touches no
+    # store. The BOUND is what makes a pathological case a stall rather than a deadlock -- which
+    # is why `drain_timeout` must stay finite.
+    settled = timedwait(() -> all(e -> _run_settled(runtime, e), snapshot),
+                        Float64(drain_timeout); pollint = 0.05) === :ok
+
+    if !settled
+        # Re-read rather than trusting the expiry: a run can settle in the moment between
+        # `timedwait` giving up and this line. Reporting `false` and warning about an empty list
+        # would be an operator-facing warning that names nothing, so a late settle is promoted to
+        # a clean drain here rather than being rounded down.
+        stragglers = [entry.id for entry in snapshot if !_run_settled(runtime, entry)]
+        settled = isempty(stragglers)
+    end
+
+    if !settled
+        @warn "Nitro: worker runs did not drain within $(drain_timeout)s — their handles stay " *
+              "registered, so zombie recovery will not declare them dead, and their callbacks " *
+              "keep a thread until they return. A callback that must honour a shutdown has to " *
+              "poll `cancel_requested(task_info)`. Tune with `shutdown!(runtime; " *
+              "drain_timeout = …)` or `worker_startup(...; drain_timeout = …)`." task_ids=stragglers
+    end
+
+    _release_settled_handles!(runtime, snapshot)
+    return settled
 end
 
 """
@@ -381,23 +612,35 @@ to live in the backend regardless.
 clear_records!(::AbstractWorkerStore) = nothing
 
 """
-    reset_runtime!(runtime = default_runtime()) -> runtime
+    reset_runtime!(runtime = default_runtime(); drain_timeout = 0) -> runtime
 
 Tear the runtime down and return it to a freshly-constructed state, discarding the store's task
 records if the backend is volatile.
 
-[`shutdown!`](@ref) does the process-local half. This adds the two things a *reset* means and a
-teardown does not: the live-`TaskInfo` cache is cleared, and [`clear_records!`](@ref) is called —
-a no-op unless the backend opts in.
+[`shutdown!`](@ref) does the process-local half. This adds the three things a *reset* means and a
+teardown does not: the live-`TaskInfo` cache is cleared, the run handles are dropped
+unconditionally, and [`clear_records!`](@ref) is called — a no-op unless the backend opts in.
+
+**`drain_timeout` defaults to `0` here, unlike everywhere else**, and that asymmetry is the point
+of the word *reset*. A teardown promises to leave a surviving run cancellable and visible to
+`recover_zombie_tasks!`; a reset promises the opposite — it erases the live cache and, on a
+volatile backend, the records themselves. Waiting for a run to report an outcome that is about to
+be deleted buys nothing, and would make every test `finally` and every `resetstate()`
+(`src/methods.jl`) pay a drain window for it. Pass `drain_timeout` explicitly to reset *after*
+letting in-flight work finish.
 
 Was `reset_store!`, which took a store. It resets a runtime and takes one, so the old name would
 have named the wrong thing.
 """
-function reset_runtime!(runtime::WorkerRuntime=default_runtime())
-    shutdown!(runtime)
+function reset_runtime!(runtime::WorkerRuntime=default_runtime(); drain_timeout::Real = 0)
+    shutdown!(runtime; drain_timeout)
 
     lock(runtime.active_lock) do
         empty!(runtime.active_task_infos)
+        # `shutdown!` no longer guarantees this: with a non-zero `drain_timeout` it deliberately
+        # KEEPS the handles of runs that outlived the wait (#176). A reset is total, so it drops
+        # them regardless -- otherwise a reset runtime could still report a run as live.
+        empty!(runtime.active_tasks)
     end
 
     clear_records!(runtime.store)
@@ -452,8 +695,8 @@ function worker_store(ctx::App; key::Symbol=DEFAULT_EXTENSION_KEY)
 end
 
 """
-    install!(ctx::App; key=:workers, store=InMemoryWorkerStore()) -> WorkerRuntime
-    install!(ctx::App, runtime::WorkerRuntime; key=:workers) -> WorkerRuntime
+    install!(ctx::App; key=:workers, store=InMemoryWorkerStore(), drain_timeout=WORKER_DRAIN_TIMEOUT_SECONDS) -> WorkerRuntime
+    install!(ctx::App, runtime::WorkerRuntime; key=:workers, drain_timeout=WORKER_DRAIN_TIMEOUT_SECONDS) -> WorkerRuntime
 
 Put a runtime in `ctx`'s extension slot. The `store=` form builds one over that backend.
 
@@ -467,20 +710,27 @@ same runtime object into a second `App` and then displacing it there leaves the 
 runtime whose queues are closed and whose scheduler is stopped, with nothing to say so. To share a
 backend across apps, give each its own runtime over the same store — which is the supported pattern
 and the one that makes `uninstall!` on one app leave the other running.
+
+`drain_timeout` is handed to the displaced runtime's [`shutdown!`](@ref). Displacement is exactly
+the teardown-then-restart-in-one-process shape #176 is about — `start!` runs
+`recover_zombie_tasks!` against the *same store* microseconds later — so it drains by default like
+every other teardown. It costs nothing when nothing is in flight.
 """
 function install!(ctx::App; key::Symbol=DEFAULT_EXTENSION_KEY,
-                  store::AbstractWorkerStore=InMemoryWorkerStore())
-    return install!(ctx, WorkerRuntime(store); key)
+                  store::AbstractWorkerStore=InMemoryWorkerStore(),
+                  drain_timeout::Real=WORKER_DRAIN_TIMEOUT_SECONDS)
+    return install!(ctx, WorkerRuntime(store); key, drain_timeout)
 end
 
-function install!(ctx::App, runtime::WorkerRuntime; key::Symbol=DEFAULT_EXTENSION_KEY)
+function install!(ctx::App, runtime::WorkerRuntime; key::Symbol=DEFAULT_EXTENSION_KEY,
+                  drain_timeout::Real=WORKER_DRAIN_TIMEOUT_SECONDS)
     # Displacing a runtime tears it down. The slot IS the ownership handle, so a runtime the app
     # no longer points at is unreachable — and an unreachable runtime with a live scheduler and
     # live queue processors is the #29 leak with one more level of indirection. `uninstall!`
     # cannot clean it up afterwards either: it only ever sees the occupant.
     existing = worker_runtime(ctx; key)
     if existing isa WorkerRuntime && existing !== runtime
-        shutdown!(existing)
+        shutdown!(existing; drain_timeout)
     end
 
     set_extension!(ctx, key, runtime)
@@ -488,14 +738,20 @@ function install!(ctx::App, runtime::WorkerRuntime; key::Symbol=DEFAULT_EXTENSIO
 end
 
 """
-    uninstall!(ctx::App; key=:workers)
+    uninstall!(ctx::App; key=:workers, drain_timeout=WORKER_DRAIN_TIMEOUT_SECONDS)
 
 Shut the installed runtime down and drop it from `ctx`.
+
+This is what `worker_startup`'s `on_shutdown` calls, so `drain_timeout` is the knob that decides
+how long a served app waits for in-flight background work on the way out — and `terminate` runs
+every lifecycle shutdown hook *before* it closes the listener, so this budget and
+`serve(shutdown_timeout = …)` add up. `0` restores the pre-#176 release-immediately behaviour.
 """
-function uninstall!(ctx::App; key::Symbol=DEFAULT_EXTENSION_KEY)
+function uninstall!(ctx::App; key::Symbol=DEFAULT_EXTENSION_KEY,
+                    drain_timeout::Real=WORKER_DRAIN_TIMEOUT_SECONDS)
     runtime = worker_runtime(ctx; key)
     if runtime isa WorkerRuntime
-        shutdown!(runtime)
+        shutdown!(runtime; drain_timeout)
     end
     delete_extension!(ctx, key)
     return nothing

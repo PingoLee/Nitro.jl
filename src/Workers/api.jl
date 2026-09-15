@@ -15,6 +15,13 @@ thread executing them into a `FAILED` state.
 
 Reads the **durable** listing, not the live-overlaid one: this is a decision about durable state,
 and `get_active_task` is the whole liveness criterion either way.
+
+Since #176 that criterion is *correct* rather than conditionally correct: `shutdown!` drains, and
+keeps the handle of a run it could not finish, so a teardown no longer manufactures zombies out of
+tasks that are still executing. The window is narrower, not gone — handles never cross runtimes, so
+a restart that builds a **new** `WorkerRuntime` over the same store still sees the previous
+runtime's abandoned runs as dead. That is also what makes a genuine process crash recoverable, and
+why this stays process-local rather than trying to be authoritative.
 """
 function recover_zombie_tasks!(; runtime::WorkerRuntime=default_runtime())
     return lock_tasks(runtime) do
@@ -50,12 +57,13 @@ end
 # exists. Passing both is a contradiction rather than a precedence puzzle, so it is refused.
 function _start_runtime_for!(ctx::App, key::Symbol,
                              store::Union{Nothing, AbstractWorkerStore},
-                             runtime::Union{Nothing, WorkerRuntime})
+                             runtime::Union{Nothing, WorkerRuntime},
+                             drain_timeout::Real)
     if !isnothing(store) && !isnothing(runtime)
         throw(ArgumentError(
             "pass `store` (build a runtime over this backend) or `runtime` (use this one), not both"))
     end
-    !isnothing(runtime) && return install!(ctx, runtime; key)
+    !isnothing(runtime) && return install!(ctx, runtime; key, drain_timeout)
 
     existing = worker_runtime(ctx; key)
 
@@ -65,19 +73,23 @@ function _start_runtime_for!(ctx::App, key::Symbol,
         # displace the previous one mid-flight -- and a displaced runtime that nobody shut down
         # is the #29 leak, rebuilt one level up.
         existing isa WorkerRuntime && existing.store === store && return existing
-        return install!(ctx, WorkerRuntime(store); key)
+        return install!(ctx, WorkerRuntime(store); key, drain_timeout)
     end
 
-    return existing isa WorkerRuntime ? existing : install!(ctx; key)
+    return existing isa WorkerRuntime ? existing : install!(ctx; key, drain_timeout)
 end
 
 """
-    start!(ctx::App; queues, cleanup_enabled, ..., store=nothing, runtime=nothing) -> WorkerRuntime
+    start!(ctx::App; queues, cleanup_enabled, ..., store=nothing, runtime=nothing,
+           drain_timeout=WORKER_DRAIN_TIMEOUT_SECONDS) -> WorkerRuntime
 
 Install a runtime on `ctx` and start it: sweep zombies, spawn a processor per named queue, and
 start (or stop) the cleanup scheduler.
 
 Returns the `WorkerRuntime` — that is the handle to pass as `runtime=` to the task API.
+
+`drain_timeout` reaches only [`install!`](@ref)'s displacement path: starting over a runtime that
+is already installed tears the old one down first, and that teardown drains like any other (#176).
 """
 function start!(ctx::App;
     queues::AbstractVector{<:AbstractString}=String[],
@@ -88,8 +100,9 @@ function start!(ctx::App;
     key::Symbol=DEFAULT_EXTENSION_KEY,
     store::Union{Nothing, AbstractWorkerStore}=nothing,
     runtime::Union{Nothing, WorkerRuntime}=nothing,
+    drain_timeout::Real=WORKER_DRAIN_TIMEOUT_SECONDS,
 )
-    resolved = _start_runtime_for!(ctx, key, store, runtime)
+    resolved = _start_runtime_for!(ctx, key, store, runtime, drain_timeout)
 
     if recover_zombies
         recover_zombie_tasks!(; runtime=resolved)
@@ -117,6 +130,7 @@ function startup(ctx::App;
     key::Symbol=DEFAULT_EXTENSION_KEY,
     store::Union{Nothing, AbstractWorkerStore}=nothing,
     runtime::Union{Nothing, WorkerRuntime}=nothing,
+    drain_timeout::Real=WORKER_DRAIN_TIMEOUT_SECONDS,
 )
     queue_names = String.(collect(queues))
 
@@ -136,12 +150,16 @@ function startup(ctx::App;
             key=key,
             store=store,
             runtime=runtime,
+            drain_timeout=drain_timeout,
         )
         return nothing
     end
 
     on_shutdown = () -> begin
-        uninstall!(ctx; key)
+        # `terminate` runs this BEFORE it closes the listener, so this drain and
+        # `serve(shutdown_timeout = …)` are consecutive, not concurrent — the two budgets add
+        # into the process's worst-case exit time (#176).
+        uninstall!(ctx; key, drain_timeout)
         return nothing
     end
 
@@ -400,75 +418,90 @@ function _execute_task_async(runtime::WorkerRuntime, task_key::String, callback:
         # finishing in that window deletes the SUCCESSOR's handle (#167). See `register_run!`.
         register_run!(runtime, task_key, task_info, current_task())
 
-        if !try_transition!(runtime.store, task_key, (PENDING,), RUNNING;
-                            run_id=task_info.run_id, started_at=started)
-            # Cancelled, or this run no longer owns the record. Hand back the handles we just
-            # took -- fenced, so we cannot tear down a successor's (#108).
-            _deregister_run!(runtime, task_info)
-            return task_info
-        end
+        # `try`/`finally`, so this run's handles are released on EVERY exit -- including the
+        # two that no terminal write covers: a store exception escaping the claim below (the
+        # spawned task simply fails), and the `0:max_attempts` loop falling through when
+        # `retry_on_failure=true` with a negative `max_retries`, which `TaskOptions` does not
+        # reject. Both leaked a registration nothing ever removed. `shutdown!` used to sweep
+        # those up by accident with `empty!(active_tasks)`; now that it drains and deliberately
+        # KEEPS live handles, a leaked one can never settle -- so every later teardown on this
+        # runtime would burn its whole `drain_timeout` and then warn about a run that ended long
+        # ago (#176).
+        #
+        # `_deregister_run!` is fenced on `run_id` and idempotent, so this is a no-op on every
+        # path `_finish_task!` already covered.
+        try
+            if !try_transition!(runtime.store, task_key, (PENDING,), RUNNING;
+                                run_id=task_info.run_id, started_at=started)
+                # Cancelled, or this run no longer owns the record. The `finally` hands the
+                # handles back -- fenced, so we cannot tear down a successor's (#108).
+                return task_info
+            end
 
-        task_info.status = RUNNING
-        task_info.started_at = started
+            task_info.status = RUNNING
+            task_info.started_at = started
 
-        max_attempts = options.retry_on_failure ? options.max_retries : 0
-        for retry_count in 0:max_attempts
-            try
-                result = timeout_call(callback, task_info; timeout=options.timeout)
-                return _complete_task!(runtime, task_info, result)
-            catch error
-                unwrapped = _unwrap_exception(error)
+            max_attempts = options.retry_on_failure ? options.max_retries : 0
+            for retry_count in 0:max_attempts
+                try
+                    result = timeout_call(callback, task_info; timeout=options.timeout)
+                    return _complete_task!(runtime, task_info, result)
+                catch error
+                    unwrapped = _unwrap_exception(error)
 
-                # NOT dead code, however redundant it looks. `_fail_task!` below would lose
-                # its CAS against an already-CANCELLED record anyway -- but without this
-                # branch a cancelled task with `retry_on_failure` falls through to the
-                # backoff `sleep` and RE-RUNS. This is what short-circuits the retry loop.
-                #
-                # `unwrapped isa InterruptException` used to be an arm of this test, back when
-                # cancellation was delivered by injecting one. Nothing injects any more, so
-                # the only way one arrives is that the callback itself threw it -- recording
-                # that as "Cancelled by user" would be a lie about who stopped the job (#127).
-                latest_info = get_task_info(runtime, task_key)
-                if latest_info !== nothing && latest_info.status == CANCELLED
-                    return _cancel_task!(runtime, task_info; message="Cancelled by user")
-                end
+                    # NOT dead code, however redundant it looks. `_fail_task!` below would lose
+                    # its CAS against an already-CANCELLED record anyway -- but without this
+                    # branch a cancelled task with `retry_on_failure` falls through to the
+                    # backoff `sleep` and RE-RUNS. This is what short-circuits the retry loop.
+                    #
+                    # `unwrapped isa InterruptException` used to be an arm of this test, back when
+                    # cancellation was delivered by injecting one. Nothing injects any more, so
+                    # the only way one arrives is that the callback itself threw it -- recording
+                    # that as "Cancelled by user" would be a lie about who stopped the job (#127).
+                    latest_info = get_task_info(runtime, task_key)
+                    if latest_info !== nothing && latest_info.status == CANCELLED
+                        return _cancel_task!(runtime, task_info; message="Cancelled by user")
+                    end
 
-                # A timeout is terminal on the first attempt. Retrying it cannot help and can
-                # harm: nothing stops the attempt that timed out, so `max_retries = 3` would
-                # put four copies of the callback on the thread pool at once, sharing one
-                # `task_info` and one set of external side effects (#127). The token is not
-                # reset between attempts either, so a retry would start pre-cancelled.
-                if unwrapped isa TaskTimeoutError
-                    return _fail_task!(runtime, task_info, _store_error_text(runtime.store, unwrapped))
-                end
+                    # A timeout is terminal on the first attempt. Retrying it cannot help and can
+                    # harm: nothing stops the attempt that timed out, so `max_retries = 3` would
+                    # put four copies of the callback on the thread pool at once, sharing one
+                    # `task_info` and one set of external side effects (#127). The token is not
+                    # reset between attempts either, so a retry would start pre-cancelled.
+                    if unwrapped isa TaskTimeoutError
+                        return _fail_task!(runtime, task_info, _store_error_text(runtime.store, unwrapped))
+                    end
 
-                if retry_count == max_attempts
-                    return _fail_task!(runtime, task_info, _store_error_text(runtime.store, unwrapped))
-                end
+                    if retry_count == max_attempts
+                        return _fail_task!(runtime, task_info, _store_error_text(runtime.store, unwrapped))
+                    end
 
-                # Cancellation-aware backoff. The catch above checks CANCELLED before sleeping and
-                # never after, and the interrupt that used to abort this sleep is gone (#127) -- so a
-                # cancel landing inside a 2/4/8s window re-invoked the user callback on a task that was
-                # already cancelled. Polling the token instead of sleeping blind also cuts cancellation
-                # latency during a backoff from seconds to milliseconds.
-                deadline = time() + 2.0 ^ (retry_count + 1)
-                while time() < deadline && !cancel_requested(task_info)
-                    sleep(0.05)
-                end
+                    # Cancellation-aware backoff. The catch above checks CANCELLED before sleeping and
+                    # never after, and the interrupt that used to abort this sleep is gone (#127) -- so a
+                    # cancel landing inside a 2/4/8s window re-invoked the user callback on a task that was
+                    # already cancelled. Polling the token instead of sleeping blind also cuts cancellation
+                    # latency during a backoff from seconds to milliseconds.
+                    deadline = time() + 2.0 ^ (retry_count + 1)
+                    while time() < deadline && !cancel_requested(task_info)
+                        sleep(0.05)
+                    end
 
-                # The token is process-local, so a cancel issued on another node sets nothing here. One
-                # durable read per ATTEMPT (not per poll) covers that without a round-trip every 50ms.
-                if cancel_requested(task_info)
-                    return _cancel_task!(runtime, task_info; message="Cancelled by user")
-                end
-                resumed = get_task_info(runtime.store, task_key)
-                if resumed !== nothing && resumed.status == CANCELLED
-                    return _cancel_task!(runtime, task_info; message="Cancelled by user")
+                    # The token is process-local, so a cancel issued on another node sets nothing here. One
+                    # durable read per ATTEMPT (not per poll) covers that without a round-trip every 50ms.
+                    if cancel_requested(task_info)
+                        return _cancel_task!(runtime, task_info; message="Cancelled by user")
+                    end
+                    resumed = get_task_info(runtime.store, task_key)
+                    if resumed !== nothing && resumed.status == CANCELLED
+                        return _cancel_task!(runtime, task_info; message="Cancelled by user")
+                    end
                 end
             end
-        end
 
-        return task_info
+            return task_info
+        finally
+            _deregister_run!(runtime, task_info)
+        end
     end
 
     # No handle registration here. The body registers `current_task()` -- the very same Task

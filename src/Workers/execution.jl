@@ -108,24 +108,46 @@ function _store_error_text(store::AbstractWorkerStore, error)
 end
 
 function _invoke_task_callback(callback::Function, task_info::TaskInfo)
-    # The arity probe must run in the SAME world age as the call (#86). `invokelatest` is
-    # world-age-agnostic; bare `applicable` is not -- it answers in the world age of its
-    # caller. The sequential queue processor is a long-lived `Threads.@spawn`ed task created
-    # by the FIRST `submit_sequential_task` (`queue.jl`), so it carries that world age for its
-    # entire life. A callback whose method is first defined afterwards -- a REPL session, a
-    # `@testitem` body, Revise redefining a handler -- was invisible to both bare checks. The
-    # function then either threw `MethodError` for a method that exists, or silently picked
-    # the WRONG arity: a callback that gained a `task_info` parameter after the processor
-    # spawned still matched the older zero-arg method and was called without its `task_info`.
-    if Base.invokelatest(applicable, callback, task_info)
-        return Base.invokelatest(callback, task_info)
-    end
+    # Mark this task as belonging to this run, so a `shutdown!` the callback itself triggers does
+    # not wait for the run doing the triggering. See `CURRENT_RUN_KEY` (`types.jl`) for why the
+    # marker is needed and an identity check on `current_task()` is not enough.
+    #
+    # Restored on the way out, not merely overwritten on the way in. With `TaskOptions(timeout=0)`
+    # the callback runs directly on the long-lived SEQUENTIAL QUEUE PROCESSOR, which would then
+    # carry a finished run's id between items -- and an entry wrongly skipped from a drain's
+    # snapshot is never token-set, never waited for, and has its handle released: #176 itself,
+    # silently. Nothing reaches that today (the only reader runs after this function has rewritten
+    # the marker), so this makes the guarantee structural instead of incidental.
+    storage = task_local_storage()
+    previous = Base.get(storage, CURRENT_RUN_KEY, nothing)
+    storage[CURRENT_RUN_KEY] = task_info.run_id
+    try
 
-    if Base.invokelatest(applicable, callback)
-        return Base.invokelatest(callback)
-    end
+        # The arity probe must run in the SAME world age as the call (#86). `invokelatest` is
+        # world-age-agnostic; bare `applicable` is not -- it answers in the world age of its
+        # caller. The sequential queue processor is a long-lived `Threads.@spawn`ed task created
+        # by the FIRST `submit_sequential_task` (`queue.jl`), so it carries that world age for its
+        # entire life. A callback whose method is first defined afterwards -- a REPL session, a
+        # `@testitem` body, Revise redefining a handler -- was invisible to both bare checks. The
+        # function then either threw `MethodError` for a method that exists, or silently picked
+        # the WRONG arity: a callback that gained a `task_info` parameter after the processor
+        # spawned still matched the older zero-arg method and was called without its `task_info`.
+        if Base.invokelatest(applicable, callback, task_info)
+            return Base.invokelatest(callback, task_info)
+        end
 
-    throw(MethodError(callback, (task_info,)))
+        if Base.invokelatest(applicable, callback)
+            return Base.invokelatest(callback)
+        end
+
+        throw(MethodError(callback, (task_info,)))
+    finally
+        if previous === nothing
+            delete!(storage, CURRENT_RUN_KEY)
+        else
+            storage[CURRENT_RUN_KEY] = previous
+        end
+    end
 end
 
 """

@@ -122,7 +122,7 @@ you add anything:
 | `get_queue_status` | Queue-wide introspection — **admin only**, takes `System()`; an `Owner` is a `MethodError` |
 | `update_progress!` | The only safe write to `TaskInfo.progress` |
 | `cleanup_old_tasks`, `start_cleanup_scheduler`, `stop_cleanup_scheduler!` | Retention |
-| `shutdown!`, `reset_runtime!` | Teardown — takes a `WorkerRuntime`, never a store |
+| `shutdown!`, `reset_runtime!` | Teardown — takes a `WorkerRuntime`, never a store. Both take `drain_timeout`; `shutdown!` defaults to `WORKER_DRAIN_TIMEOUT_SECONDS`, `reset_runtime!` to `0` |
 | `WorkerRuntime`, `default_runtime`, `worker_runtime`, `install!`, `uninstall!`, `worker_store`, `default_store` | Lifecycle and resolution |
 
 **`runtime=` is the public keyword; `store=` only selects a backend.** Every read and submit call
@@ -193,6 +193,12 @@ pair — see §6.
 
 On startup, `RUNNING` tasks without a live in-memory `Task` are marked `FAILED` when `recover_zombies=true`.
 
+Since [#176](https://github.com/PingoLee/Nitro.jl/issues/176) that criterion is correct rather than
+conditionally correct: a teardown no longer manufactures zombies out of runs that are still
+executing. The window is narrower, not gone — run handles are per-runtime, so a restart that builds
+a **new** `WorkerRuntime` over the same store still sweeps the previous one's abandoned runs. That
+is also what keeps a genuine process crash recoverable.
+
 ## 6. Developer Rules
 
 > **Strict core isolation**: Never import `PormG` or run DB queries in `src/Workers`. Database logic belongs in `ext/NitroPormGExt.jl`.
@@ -216,11 +222,36 @@ On startup, `RUNNING` tasks without a live in-memory `Task` are marked `FAILED` 
   handle teardown: only the run that owns the runtime's `active_tasks[id]` may deregister it,
   because `recover_zombie_tasks!` reads liveness from exactly that entry. One `TaskInfo` object is
   one run; a re-run is a new object, never a mutated one.
-- **`shutdown!` releases; it does not drain.** It drops the run handles without waiting, so a run
-  still executing across a teardown/restart in one process looks dead to `recover_zombie_tasks!`.
-  `active_task_infos` is deliberately left populated, or such a run would also be uncancellable.
-  A graceful drain is now *buildable* — the object that owns the tasks is the object being shut
-  down — but it is a separate lifecycle decision, not a teardown patch.
+- **`shutdown!` drains, within a bound, and releases only what settled**
+  ([#176](https://github.com/PingoLee/Nitro.jl/issues/176)). It sets every in-flight run's
+  cancellation token **first**, waits up to `drain_timeout` seconds, then deletes the handles of
+  runs that finished — **fenced on `run_id`**, because that window is seconds wide and a re-run can
+  publish a successor inside it; an id-keyed delete there is the #108/#167 defect through a wider
+  door. A run that outlives the wait **keeps its handle**, which is what stops
+  `recover_zombie_tasks!` declaring a live run dead; `_finish_task!` reclaims it when the callback
+  returns. The sweep touches `active_tasks` only — `active_task_infos` stays populated, or a run
+  outliving a teardown would be uncancellable.
+  - **In `_run_settled`, the info clause is what terminates every production wait; `istaskdone` is
+    a backstop.** A real run clears both caches through `_deregister_run!` *before* its task
+    completes, so for anything `register_run!` published, clause 2 always fires first — on the
+    async path as much as the sequential one. On the sequential path it is also *necessary*, since
+    the registered handle is the shared queue processor and `istaskdone` on that is false until the
+    whole backlog has drained; narrowing the predicate to `istaskdone` alone stalls every
+    sequential teardown for the full window. `istaskdone` decides only for a handle whose info
+    nothing will ever remove — the test-only `register_active_task!` + `register_active_task_info!`
+    pair, where clause 2 is permanently false — and it is what gates the delete in
+    `_release_settled_handles!`.
+  - **`reset_runtime!` defaults to `drain_timeout = 0`**, unlike every other teardown entry point.
+    A reset erases the live cache and the volatile records, so waiting for an outcome it is about
+    to delete buys nothing — and it keeps `resetstate()` and every test `finally` off the drain
+    path.
+  - **The drain's budget is not the call's.** `stop_cleanup_scheduler!` waits without a deadline
+    and runs first, and a closed sequential queue keeps executing its buffered backlog, starting
+    runs that were never in the snapshot. Say so rather than implying `drain_timeout` bounds
+    teardown.
+  - **Hold no lock across the wait.** `active_lock` deadlocks against `_deregister_run!`, which is
+    how a run settles; `queue_lock` is re-acquired by the processor's own `finally`. The predicate
+    runs in a `Timer` callback, so it must stay cheap, total, and store-free.
 - Add abstract stubs in `src/Workers/registry.jl` — **for data and policy only.** Anything that
   runs, schedules, or holds a `Task` belongs on `WorkerRuntime`, where there is one implementation
   and no way for a backend to get it wrong.
@@ -234,10 +265,26 @@ On startup, `RUNNING` tasks without a live in-memory `Task` are marked `FAILED` 
   the process in `jl_finish_task` — which is what blocked worker bodies from moving to
   `Threads.@spawn` ([#127](https://github.com/PingoLee/Nitro.jl/issues/127),
   [#30](https://github.com/PingoLee/Nitro.jl/issues/30)). Cancellation is a **token** the callback
-  polls (`cancel_requested`), set by `cancel_task` and by an expired `TaskOptions(timeout=…)`.
-  Never reintroduce the injection, and do not add a public setter for the token: `cancel_task` is
-  the authorized path, and a second route into it would bypass both the authorization check and
-  the status CAS. The token is process-local and never reset — a re-run gets a fresh `TaskInfo`.
+  polls (`cancel_requested`). Four things set it: `cancel_task`, an expired
+  `TaskOptions(timeout=…)`, `_register_or_watch!` displacing a still-executing predecessor on a
+  re-run, and a teardown drain (the `shutdown!` bullet above, #176). Never reintroduce the
+  injection, and do not add a public setter for the token: `cancel_task` is the authorized path,
+  and a second route into it would bypass both the authorization check and the status CAS — those
+  four are not that route, because none of them takes a caller-supplied identity. The token is
+  process-local and never reset — a re-run gets a fresh `TaskInfo`.
+- **A drain writes no terminal state of its own, but it still decides one.** `cancel_task` claims
+  `CANCELLED` before setting the token and an expired deadline throws; a drain claims nothing,
+  because a terminal write there would race the run's own — the #88/#108 failure mode. What the run
+  then records is its own doing: `COMPLETED` with whatever it returns, `FAILED` if it throws with
+  no retry left, **or `CANCELLED` if the token lands while it is parked in the retry backoff**,
+  which polls the same token. That last one is worth knowing before you document this contract
+  anywhere: reaching a terminal state there is right (better than a job restarting mid-teardown),
+  but the stock message names a user who did nothing, and the record cannot distinguish a person's
+  cancel from a shutdown's. **The message is not even the same on both paths** — `api.jl` passes
+  `"Cancelled by user"`, `queue.jl` takes `_cancel_task!`'s `"Cancelled"` default. That asymmetry
+  predates #176 and looks accidental; do not write either string into documentation as though it
+  were the one. Do not "fix" the race by pre-claiming a
+  status; if the provenance matters, that is a reason on the token, not a write from the drain.
 - **A timeout bounds the wait, not the work, and is never retried.** Nothing stops the attempt
   that timed out, so retrying it runs a second copy of the callback beside the first against one
   `task_info`. `TaskTimeoutError` is terminal on the first attempt.

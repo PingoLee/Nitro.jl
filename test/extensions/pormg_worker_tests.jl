@@ -1042,19 +1042,56 @@ else
 
                 # Stand in for a run still in flight. A FINISHED run deregisters itself, so the
                 # caches are empty by then -- registering directly is both deterministic and the
-                # exact state a mid-flight shutdown finds.
-                Nitro.Workers.register_active_task!(rt_store_td, "in-flight", current_task())
-                Nitro.Workers.register_active_task_info!(rt_store_td, "in-flight", TaskInfo("in-flight"))
+                # exact state a mid-flight shutdown finds. It parks rather than polling the
+                # token, so it is the case the drain cannot win: the wait expires.
+                #
+                # It used to be `current_task()`, which no longer stands in for anything:
+                # `_snapshot_runs` skips the caller's own run on purpose (#176), so registering
+                # the test's own task would exercise the re-entrancy guard instead of the drain.
+                #
+                # The record is written RUNNING, not left at the constructor's PENDING. That is
+                # what makes the zombie-sweep assertion below mean anything: the sweep only reads
+                # rows whose stored status is RUNNING, so a PENDING stand-in would come back `0`
+                # whether or not the handle survived, and prove nothing.
+                in_flight_info = TaskInfo("in-flight")
+                in_flight_info.status = RUNNING
+                replace_task!(store_td, in_flight_info.id, in_flight_info)
+
+                release_td = Base.Event()
+                in_flight_handle = Threads.@spawn wait(release_td)
+                Nitro.Workers.register_active_task!(rt_store_td, "in-flight", in_flight_handle)
+                Nitro.Workers.register_active_task_info!(rt_store_td, "in-flight", in_flight_info)
                 @test !isempty(rt_store_td.active_tasks)
                 @test !isempty(rt_store_td.active_task_infos)
+                @test get_task_info(store_td, "in-flight").status == RUNNING
 
-                shutdown!(rt_store_td)
+                # Teardown DRAINS now (#176). This testset asserted `isempty(active_tasks)` back
+                # when `shutdown!` released unconditionally; that assertion encoded the contract
+                # #176 changed, so it moves with the contract rather than the fix bending around
+                # it.
+                drained = shutdown!(rt_store_td; drain_timeout=0.2)
 
                 @test get_cleanup_scheduler(rt_store_td)[] === nothing
                 @test istaskdone(scheduler.task)
                 @test !isopen(channel)
                 @test isempty(get_sequential_queues(rt_store_td))
-                @test isempty(rt_store_td.active_tasks)
+
+                # The run outlived the wait, so its handle STAYS -- on this backend exactly as in
+                # memory. That is the whole of #176: `recover_zombie_tasks!` reads liveness from
+                # this handle and nothing else, so dropping it is what used to make a genuinely
+                # running task look dead and get marked FAILED on the next start. The sweep is
+                # the assertion that matters, because it is the thing that used to do the damage.
+                @test drained == false
+                @test get_active_task(rt_store_td, "in-flight") === in_flight_handle
+                @test recover_zombie_tasks!(; runtime=rt_store_td) == 0
+                @test get_task_info(store_td, "in-flight").status == RUNNING
+
+                # Release the stand-in. (A *real* run clears its own handle through
+                # `_finish_task!`; this one has no run behind it, so asserting that here would
+                # only be asserting the test's own cleanup. The in-memory suite covers it with a
+                # genuine submission.)
+                notify(release_td)
+                wait(in_flight_handle)
 
                 # `active_task_infos` must SURVIVE, which is the opposite of what "finish the
                 # teardown" suggests: `cancel_task` resolves the live TaskInfo through

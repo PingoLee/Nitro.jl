@@ -50,11 +50,15 @@ raising `StoreInterfaceError`, and [`missing_session_methods`](@ref) lists what 
 # Optional
 
 `cleanup_expired_sessions!(store)` prunes expired rows and **defaults to a no-op**. That is the one
-asymmetry with `AbstractWorkerStore`, where every method including `shutdown!` is required, and it
+asymmetry with `AbstractWorkerStore`, whose fifteen data-and-policy methods are all required, and it
 is deliberate: expiry here is enforced on the *read* path — `get_session` refuses a payload whose
-`expires` has passed — so a store that never prunes wastes rows but never serves a stale session. A
-worker store that skips `shutdown!`, by contrast, leaks live tasks. Implement it for any store whose
-rows outlive the process.
+`expires` has passed — so a store that never prunes wastes rows but never serves a stale session.
+Implement it for any store whose rows outlive the process.
+
+(This paragraph used to cite `shutdown!` as the required worker-store method a backend could forget
+and thereby leak live tasks. That has not been true since #167 moved every running resource onto
+`WorkerRuntime`: a worker store owns nothing that runs, so there is no teardown method on it to
+require or to forget.)
 
 `storesession!` and `prunesessions!` are the framework's entry points and delegate here; a store may
 override those instead if it has a cheaper path.
