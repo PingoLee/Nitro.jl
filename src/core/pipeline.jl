@@ -31,6 +31,45 @@ function _app_context_seed(ctx::App)
     end
 end
 
+"""
+    _dispatch_resolved(r, req) -> response
+
+The pipeline's innermost layer: dispatch `req` to its handler, reusing the lookup `compose`
+already did when there is one (#80).
+
+`compose` (src/routerhof.jl) must call `HTTP.Handlers.gethandler` before it can key the
+middleware cache, so by the time a request reaches the bottom of the chain the route has already
+been resolved once. This used to call `(r::Router)(req)` regardless, which resolved it a second
+time — two `split`s of the target, two trie walks, two `Params()` dicts per request, for every
+app with per-route middleware. `compose` now leaves a [`Types.RouteResolution`](@ref) on the
+request and this reads it.
+
+**The three lines in the fast branch are `(r::Router)(req)`'s matched branch, deliberately
+verbatim** (HTTP.jl `http_handlers.jl`): set `:route`, set `:params` only when non-empty, call
+the handler. Keeping the *position* matters as much as the values — these land immediately
+before the handler, after every middleware layer has run, which is what
+`request_input`/`pathparams` (src/core/request.jl, src/types.jl) build their
+"params appeared late" cache-invalidation rule on. A stash written by `compose` does not move
+that transition, because nothing reads it until here.
+
+The `res.target === req.target` guard (a *value* comparison — Julia strings are egal by
+contents), and why a stale stash is unreachable, are documented on `RouteResolution` itself.
+Falling through to `r(req)` is always correct — it is exactly the old behavior — so every path
+that declines the hand-off degrades to the previous cost, never to a wrong route.
+
+`r` is deliberately untyped: `Service.router` is declared as the unparameterized `Router`, and
+the caller `let`-binds it to keep that dynamic dispatch out of the request path.
+"""
+function _dispatch_resolved(r, req::HTTP.Request)
+    res = get(req.context, Types.ROUTE_RESOLUTION_KEY, nothing)
+    if res isa Types.RouteResolution && res.target === req.target
+        req.context[:route] = res.route
+        isempty(res.params) || (req.context[:params] = res.params)
+        return res.handler(req)
+    end
+    return r(req)
+end
+
 function setupmiddleware(ctx::App; middleware::Vector=[], serialize::Bool=true, catch_errors::Bool=true, show_errors::Bool=true, access_log=false, access_log_query::Bool=false)::Function
     raw_middleware = reverse(middleware)
     # `normalize_middleware`, NOT `process_middleware`: this runs once per `serve` but ONCE
@@ -78,7 +117,7 @@ function setupmiddleware(ctx::App; middleware::Vector=[], serialize::Bool=true, 
     # dynamic dispatch at the innermost layer of every request. `Service` is immutable, so the
     # value is fixed at construction and hoisting it out is free.
     router_entry = let r = ctx.service.router
-        (req::HTTP.Request) -> r(req)
+        (req::HTTP.Request) -> _dispatch_resolved(r, req)
     end
 
     return reduce(|>, [

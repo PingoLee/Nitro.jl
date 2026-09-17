@@ -39,7 +39,9 @@ using PrecompileTools
     # `compose` is installed unconditionally (#71), so the blocks above already exercise its
     # empty-table fast path (`snapshot` + `isempty` + the prebuilt chain). THIS block is the
     # only one that gets past that check and reaches `gethandler`, `cachetag`, `genkey`,
-    # `buildmiddleware`, `cache_if_current!` and the cache-hit read. Two requests: the first
+    # `buildmiddleware`, `cache_if_current!`, the cache-hit read, and the `RouteResolution`
+    # hand-off (#80) — the blocks above compile only `_dispatch_resolved`'s fall-through
+    # branch, since nothing stashes a resolution for them. Two requests: the first
     # takes the cache miss + publish path, the second the cache-hit read path. Honest scope: only this generic plumbing
     # carries over — the composed chain itself specializes on the app's own handler/middleware
     # closure types, per the NOTE below.

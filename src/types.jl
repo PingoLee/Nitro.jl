@@ -1104,4 +1104,64 @@ RouteDefinition(pattern::String, handler::Function, methods::Vector{String}, nam
 RouteDefinition(path::String, method::String, handler::Function, middleware::Vector{Function}, name::Nullable{String}) =
     RouteDefinition(; pattern=path, handler, methods=[method], name, middleware, type_hints=Dict{Symbol, Type}())
 
+"""
+    ROUTE_RESOLUTION_KEY
+
+`req.context` key carrying the [`RouteResolution`](@ref) `compose` produced for this request
+(#80). Internal — never part of the handler-facing context surface, which is `:route`,
+`:params` and HTTP.jl's own keys.
+"""
+const ROUTE_RESOLUTION_KEY = :__nitro_route_resolution
+
+"""
+    RouteResolution(target, handler, route, params)
+
+One request's route lookup, handed from `compose` (src/routerhof.jl) to the innermost layer of
+the pipeline (`_dispatch_resolved`, src/core/pipeline.jl) so the route is resolved **once**
+(#80).
+
+`compose` has to call `HTTP.Handlers.gethandler` before it can build a middleware-cache key, and
+used to keep only `leaf.path` from it — discarding the handler and the `Params()` dict, which
+`(r::Router)(req)` then recomputed at the bottom of the chain. That is two
+`_router_request_path` + `split`, two trie walks and two `Dict{String,String}` per request, on
+every app that registers per-route middleware. This struct is what carries the first lookup down
+to where the second one used to happen.
+
+# `target` is the guard
+
+Every layer between `compose` and the pipeline's terminal — global, router-level and route-level
+middleware alike — folds *outside* the accumulator `compose` receives, so any of them may
+rewrite `req.target` before the terminal runs. Today that rewrite changes which handler runs,
+because the router resolves after them. `_dispatch_resolved` preserves exactly that by checking
+`res.target === req.target` before honouring the hand-off: a middleware that retargets the
+request fails the check and the router resolves the new target, as it always did.
+
+**`===` on `String` compares contents, not addresses** — Julia's strings are egal by value, so
+this asks "is the target still the one I resolved against?" rather than "is it the same
+object". That is the right question, and it is the reason a rewrite to a *byte-identical*
+target correctly keeps the hand-off: same target, same route, nothing to redo. The check is
+still cheap, because the pointer-equal case — which is every request nothing rewrote — short
+circuits before any comparison of contents.
+
+(`PrefixStripMiddleware` is not in that set either way: it folds *outside* `compose`
+(src/core/pipeline.jl), so it has already run by the time any of this happens.)
+
+# Why a stale stash cannot be read
+
+`internalrequest` may be called twice with the same `HTTP.Request` object, so the context can
+outlive a single pass. `compose` overwrites this entry on every request it matches, so the only
+way to reach `_dispatch_resolved` holding an entry from an *earlier* pass is a pass that wrote
+none: the emptiness fast path, or a 404/405. Neither is reachable after a match on the same
+object, because both tables involved only ever grow — nothing in `src/` removes a key from
+`custommiddleware`, and `HTTP.register!` replaces a leaf rather than deleting one. So a target
+that matched once still matches, and a non-empty `custommiddleware` never becomes empty.
+Regression: the reused-request item in test/custommiddleware_tests.jl.
+"""
+struct RouteResolution
+    target  :: String
+    handler :: Function
+    route   :: String
+    params  :: Dict{String,String}
+end
+
 end # module Types

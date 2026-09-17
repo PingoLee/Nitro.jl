@@ -5,7 +5,7 @@ using HTTP
 using ..Util: join_url_path
 using ..AppContext: App
 using ..Types: Nullable, LifecycleMiddleware, CopyOnWriteDict, snapshot,
-                cache_if_current!, publish!
+                cache_if_current!, publish!, RouteResolution, ROUTE_RESOLUTION_KEY
 
 export router, compose, genkey, cachetag, process_middleware, HOFRouter, OuterRouter, InnerRouter
 
@@ -395,7 +395,12 @@ function compose(router::HTTP.Router, globalmiddleware::Vector,
             custom_snap = snapshot(custommiddleware)
             isempty(custom_snap) && return nocustom(req)
 
-            innerhandler, path, _ = HTTP.Handlers.gethandler(router, req)
+            # `params` is BOUND now, not discarded (#80). `gethandler` allocates it either
+            # way — a fresh `Params()` per call, populated for a parametrized route — and the
+            # router at the bottom of the chain used to allocate a second one because this
+            # one was thrown away. Handing it down is what makes the second lookup
+            # unnecessary; see `RouteResolution` (src/types.jl) for the full argument.
+            innerhandler, path, params = HTTP.Handlers.gethandler(router, req)
 
             # `missing` is HTTP.jl's method-mismatch sentinel — a path that matched but not for
             # this method (405). It is NOT a match: it carries an empty `path`, so treating it
@@ -403,6 +408,21 @@ function compose(router::HTTP.Router, globalmiddleware::Vector,
             # registered at the empty path. `nothing` is a true miss (404). Both take the
             # unmatched path below.
             if !isnothing(innerhandler) && !ismissing(innerhandler)
+
+                # Hand this lookup to the pipeline's terminal instead of letting it redo the
+                # work (#80). `_dispatch_resolved` (src/core/pipeline.jl) consumes it; the
+                # `target` field is what makes a middleware that rewrites `req.target` still
+                # get the route it rewrote to. Written HERE — before the chain runs — because
+                # the chain is what eventually reaches the terminal.
+                #
+                # Stashed unconditionally on this branch, cache hit or miss, since the chain
+                # is cached but the resolution is per request. `isa Function` keeps
+                # `RouteResolution.handler` concrete: HTTP.jl types `leaf.handler` as `Any`,
+                # and everything Nitro registers is a closure, but a callable struct arriving
+                # some other way simply declines the hand-off and takes the old double-lookup
+                # rather than widening the field.
+                innerhandler isa Function && (req.context[ROUTE_RESOLUTION_KEY] =
+                    RouteResolution(req.target, innerhandler, path, params))
 
                 # Check if we already have a cached middleware function for this specific
                 # route AND this pipeline's serializer settings. Skipped entirely when per-call

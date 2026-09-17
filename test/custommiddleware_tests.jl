@@ -649,3 +649,221 @@ end
     @test invocation == [1, 2, 3, 99]
 end
 end
+
+
+@testitem "Route resolution — the terminal reuses compose's lookup (#80)" tags=[:core, :middleware] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+using Nitro.Core.Types: RouteResolution, ROUTE_RESOLUTION_KEY
+import Nitro: App, path, text, getparams
+
+# #80: `compose` (src/routerhof.jl) has to call `gethandler` before it can key the middleware
+# cache, and used to throw the resolved handler and `Params()` away — so `(r::Router)(req)` at
+# the bottom of the chain resolved the same request a second time. It now leaves a
+# `RouteResolution` on the request and `_dispatch_resolved` (src/core/pipeline.jl) consumes it.
+#
+# A `gethandler` call count is not observable from a handler, so the load-bearing assertions
+# here are UNIT tests of `_dispatch_resolved` against a router registered with a DIFFERENT
+# handler than the stash names. If the terminal re-resolved, the router's handler would answer;
+# only a terminal that honours the hand-off returns the stash's. Those three assertions fail
+# against the unpatched code. The pipeline-level testsets below are guards on the semantics the
+# hand-off must not change — they pass either way, by design.
+
+const DISPATCH = Nitro.Core._dispatch_resolved
+
+function router_with(body::String)
+    r = HTTP.Router()
+    HTTP.register!(r, "GET", "/x", (::HTTP.Request) -> HTTP.Response(200, body))
+    return r
+end
+
+stash_handler(body::String) = (::HTTP.Request) -> HTTP.Response(200, body)
+
+@testset "a matching stash is used, and the router is not consulted" begin
+    router = router_with("ROUTER")
+    req = HTTP.Request("GET", "/x")
+    # `req.target` itself, so the identity guard holds by construction.
+    req.context[ROUTE_RESOLUTION_KEY] =
+        RouteResolution(req.target, stash_handler("STASH"), "/stashroute", Dict{String,String}())
+
+    @test text(DISPATCH(router, req)) == "STASH"
+    # `:route` comes from the stash too — this is `(r::Router)(req)`'s matched branch,
+    # relocated, not merely a shortcut around the lookup.
+    @test req.context[:route] == "/stashroute"
+    # Empty params must leave `:params` ABSENT, exactly as HTTP.jl does. `pathparams`
+    # (src/types.jl) distinguishes "no path variables" from "not routed yet" on this.
+    @test !haskey(req.context, :params)
+end
+
+@testset "non-empty params land on the request" begin
+    router = router_with("ROUTER")
+    req = HTTP.Request("GET", "/x")
+    req.context[ROUTE_RESOLUTION_KEY] =
+        RouteResolution(req.target, stash_handler("STASH"), "/p/{id}", Dict("id" => "7"))
+
+    @test text(DISPATCH(router, req)) == "STASH"
+    @test req.context[:params] == Dict("id" => "7")
+    @test HTTP.getparams(req) == Dict("id" => "7")
+end
+
+@testset "a rewritten target declines the stash and re-resolves" begin
+    router = router_with("ROUTER")
+    req = HTTP.Request("GET", "/y")
+    req.context[ROUTE_RESOLUTION_KEY] =
+        RouteResolution(req.target, stash_handler("STASH"), "/stashroute", Dict{String,String}())
+
+    # The rewrite `PrefixStripMiddleware` performs: assign a different target. The guard is a
+    # VALUE comparison (Julia strings are egal by contents, so `===` is not an address test),
+    # which is what makes this a decline rather than an accident of allocation.
+    req.target = "/x"
+    @test text(DISPATCH(router, req)) == "ROUTER"
+    @test req.context[:route] == "/x"
+end
+
+@testset "a rewrite to a byte-identical target keeps the hand-off" begin
+    # The flip side of the guard being a value comparison, asserted rather than left implicit:
+    # a middleware that reassigns an equal target has not changed the route, so re-resolving
+    # would be pure waste. A freshly built object is used so this is not testing `x === x`.
+    router = router_with("ROUTER")
+    req = HTTP.Request("GET", "/x")
+    req.context[ROUTE_RESOLUTION_KEY] =
+        RouteResolution(req.target, stash_handler("STASH"), "/stashroute", Dict{String,String}())
+
+    suffix = "x"
+    req.target = "/" * suffix
+    @test text(DISPATCH(router, req)) == "STASH"
+end
+
+@testset "no stash at all falls through to the router" begin
+    router = router_with("ROUTER")
+    @test text(DISPATCH(router, HTTP.Request("GET", "/x"))) == "ROUTER"
+    # And an unmatched target still reaches the router's own 404.
+    @test DISPATCH(router, HTTP.Request("GET", "/nope")).status == 404
+end
+
+@testset "a middleware that rewrites req.target still reaches the rewritten route" begin
+    # Route middleware folds OUTSIDE the terminal, so it runs between compose's lookup and the
+    # dispatch. Before #80 the router resolved after it and the rewrite won; the target guard
+    # is what keeps that true.
+    ctx = App()
+    rewrite = handler -> (req::HTTP.Request -> begin
+        suffix = "b"
+        req.target = "/" * suffix
+        handler(req)
+    end)
+    Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+        path("/a", (req::HTTP.Request) -> Res.send("A"), middleware = [rewrite]),
+        path("/b", (req::HTTP.Request) -> Res.send("B")),
+    ])
+
+    r = Nitro.Core.internalrequest(ctx, HTTP.Request("GET", "/a"); catch_errors = false)
+    @test r.status == 200
+    @test text(r) == "B"
+end
+
+@testset "params and route are unchanged on a parametrized route with per-route middleware" begin
+    ctx = App()
+    passthrough = handler -> (req::HTTP.Request -> handler(req))
+    seen = Dict{String,Any}()
+    Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+        path("/p/<int:id>", function (req::HTTP.Request, id::Int)
+            seen["id"] = id
+            seen["route"] = HTTP.getroute(req)
+            seen["raw"] = HTTP.getparams(req)
+            seen["decoded"] = getparams(req)
+            return Res.send("ok")
+        end, method = "GET", middleware = [passthrough]),
+    ])
+
+    r = Nitro.Core.internalrequest(ctx, HTTP.Request("GET", "/p/42"); catch_errors = false)
+    @test r.status == 200
+    @test seen["id"] == 42
+    @test seen["route"] == "/p/{id}"
+    @test seen["raw"] == Dict("id" => "42")
+    @test seen["decoded"]["id"] == "42"
+end
+
+@testset "route middleware still sees params as absent — the stash does not move that" begin
+    # `request_input` (src/core/request.jl) invalidates its cache exactly once, on the
+    # transition from "no path params" to "path params present", and that transition happens at
+    # the terminal. Writing the stash earlier must NOT make params visible to middleware, or
+    # that rule fires at the wrong moment.
+    ctx = App()
+    params_in_mw = Ref{Any}(:unset)
+    probe = handler -> (req::HTTP.Request -> begin
+        params_in_mw[] = HTTP.getparams(req)
+        handler(req)
+    end)
+    Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+        path("/q/<int:id>", (req::HTTP.Request, id::Int) -> Res.send(string(id)),
+             method = "GET", middleware = [probe]),
+    ])
+
+    r = Nitro.Core.internalrequest(ctx, HTTP.Request("GET", "/q/9"); catch_errors = false)
+    @test text(r) == "9"
+    @test params_in_mw[] === nothing
+end
+
+@testset "a reused request object picks up a handler registered between passes" begin
+    # The hand-off carries a per-request LOOKUP, never a cached handler: the chain in
+    # `middleware_cache` still bottoms out in a live resolution. Re-registering `/x` WITHOUT a
+    # `middleware=` kwarg skips `publish_route_middleware!`, so the cached chain is NOT
+    # invalidated — and the second call must still reach the new handler. A design that baked
+    # the resolved handler into the cached chain returns "v1" here.
+    ctx = App()
+    passthrough = handler -> (req::HTTP.Request -> handler(req))
+    Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+        path("/x", (req::HTTP.Request) -> Res.send("v1"), middleware = [passthrough]),
+    ])
+
+    req = HTTP.Request("GET", "/x")
+    @test text(Nitro.Core.internalrequest(ctx, req; catch_errors = false)) == "v1"
+
+    Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+        path("/x", (req::HTTP.Request) -> Res.send("v2")),
+    ])
+    # Same request OBJECT, so it still carries the first pass's stash on entry.
+    @test text(Nitro.Core.internalrequest(ctx, req; catch_errors = false)) == "v2"
+end
+
+@testset "a request that took the empty-table fast path writes no stash" begin
+    # The fast path returns before `gethandler`, so nothing is stashed; a later pass on the
+    # same object, after the table has become non-empty, must resolve normally.
+    ctx = App()
+    passthrough = handler -> (req::HTTP.Request -> handler(req))
+    Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+        path("/r", (req::HTTP.Request) -> Res.send("r")),
+    ])
+
+    req = HTTP.Request("GET", "/r")
+    @test text(Nitro.Core.internalrequest(ctx, req; catch_errors = false)) == "r"
+    @test !haskey(req.context, ROUTE_RESOLUTION_KEY)
+
+    # Publishing on a DIFFERENT route is enough to make the table non-empty app-wide.
+    Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+        path("/other", (req::HTTP.Request) -> Res.send("o"), middleware = [passthrough]),
+    ])
+    @test text(Nitro.Core.internalrequest(ctx, req; catch_errors = false)) == "r"
+    @test haskey(req.context, ROUTE_RESOLUTION_KEY)
+end
+
+@testset "404 and 405 write no stash" begin
+    ctx = App()
+    passthrough = handler -> (req::HTTP.Request -> handler(req))
+    Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+        path("/only", (req::HTTP.Request) -> Res.send("ok"), method = "GET",
+             middleware = [passthrough]),
+    ])
+
+    miss = HTTP.Request("GET", "/absent")
+    @test Nitro.Core.internalrequest(ctx, miss; catch_errors = false).status == 404
+    @test !haskey(miss.context, ROUTE_RESOLUTION_KEY)
+
+    # `missing` is the method-mismatch sentinel and carries an EMPTY path — stashing it would
+    # hand the terminal a resolution for the route registered at "".
+    mismatch = HTTP.Request("POST", "/only")
+    @test Nitro.Core.internalrequest(ctx, mismatch; catch_errors = false).status == 405
+    @test !haskey(mismatch.context, ROUTE_RESOLUTION_KEY)
+end
+end
