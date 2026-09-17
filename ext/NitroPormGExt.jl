@@ -96,11 +96,16 @@ overwrite each other's binding, and the loser would then throw `TransactionError
 being fixed. Building a model is a handful of allocations and happens about twice per
 application, so there is nothing to cache and no shared mutable state to lock.
 
-The caller must pass the key the store will query on — `_session_objects`/`_task_objects`
-derive the query's `.db(...)` from the same `store.db_key` field, so the two cannot diverge.
-That matters: a model bound to `A` queried with `.db(B)` inside `run_in_transaction(A)`
-*passes* the guard and then silently runs outside the transaction on B's pool, and PormG has
-no guard for that direction.
+The caller must pass the key the store will query on. On the path where a store *builds* its
+own model — the factories, and either constructor called without `model=` — both this key and
+the query's `.db(...)` come from the one `store.db_key` field, so they cannot diverge. That
+matters: a model bound to `A` queried with `.db(B)` inside `run_in_transaction(A)` *passes*
+the guard and then silently runs outside the transaction on B's pool, and PormG has no guard
+for that direction.
+
+Passing `model=` explicitly opts out of that coupling — the caller then owns keeping the
+model's `connect_key` and the store's `db_key` in agreement, and nothing checks it. The test
+doubles rely on this, since they carry no `connect_key` at all.
 """
 function _bind_model!(model, db_key::String)
     model.connect_key = db_key
@@ -133,7 +138,7 @@ end
 
 A `nitro_session` model bound to `db_key`. One model per store, never a process-wide
 singleton: `connect_key` names exactly one connection, so a shared model cannot serve two
-stores on different keys — see [`_bind_model!`](@ref).
+stores on different keys — see `_bind_model!`.
 """
 session_model(db_key::String="db") = _define_session_model(db_key)
 
@@ -369,7 +374,7 @@ end
 # ============================================================================
 
 """
-PormG model for the `nitro_task` table.
+PormG model for the `nitro_task` table, bound to `db_key`.
 
 Columns:
 - `id`           — VARCHAR(255), primary key. Holds the *scoped* task id, which under
@@ -420,7 +425,7 @@ end
     task_model(db_key="db")
 
 A `nitro_task` model bound to `db_key`. One model per store, never a process-wide
-singleton — see [`_bind_model!`](@ref).
+singleton — see `_bind_model!`.
 """
 task_model(db_key::String="db") = _define_task_model(db_key)
 
@@ -439,7 +444,7 @@ you bootstrapped. Prefer `pormg_nitro_worker(db_key=...)`, which creates the tab
 returns a store pointed at the same connection.
 
 A `model` passed explicitly is used as given, including its `connect_key`; omit it and the
-store builds one bound to `db_key` (see [`_bind_model!`](@ref)).
+store builds one bound to `db_key` (see `_bind_model!`).
 """
 struct PormGWorkerStore <: AbstractWorkerStore
     model::Any

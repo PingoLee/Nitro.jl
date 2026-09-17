@@ -1672,7 +1672,6 @@ else
             # read -- the decoy is what a dropped `.db` would return
             fetched = get_task_info(store_r, "alice::routed")
             @test fetched.queue_name == "reports"
-            @test fetched.queue_name != "decoy"
 
             # update
             info.status = RUNNING
@@ -1680,8 +1679,9 @@ else
             @test m._tables["tasks"]["alice::routed"]["status"] == "RUNNING"
             @test m._tables["db"]["alice::routed"]["status"] == "COMPLETED"
 
-            # watcher CAS
-            add_watcher!(store_r, "alice::routed", "bob")
+            # watcher CAS -- assert the CAS itself won, or a `false` return that still left
+            # "bob" on the row would read as a pass.
+            @test add_watcher!(store_r, "alice::routed", "bob") == true
             @test occursin("bob", m._tables["tasks"]["alice::routed"]["watchers"])
             @test !occursin("bob", m._tables["db"]["alice::routed"]["watchers"])
 
@@ -1784,7 +1784,17 @@ else
                 delete!(PormG.config, key)
             end
             @test !haskey(PormG.config, key)
+
+            # The constructor's OWN model-building branch. Every other store in this file
+            # passes `model=`, and both factories build the model themselves and pass it in
+            # too, so without this the `isnothing(model)` arm of `PormGWorkerStore` has no
+            # coverage at all -- regressing it to `task_model()` would leave a store at
+            # `db_key="tasks"` carrying a model bound to `"db"` and the suite would stay green.
+            # Neither constructor touches `PormG.config`, so no fixture is needed.
+            @test RealPormGWorkerStore(db_key="tasks").model.connect_key == "tasks"
+            @test RealPormGWorkerStore().model.connect_key == "db"
         end
+
     end
 end
 

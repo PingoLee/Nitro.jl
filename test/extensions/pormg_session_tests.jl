@@ -659,6 +659,15 @@ end
         delete!(PormG.config, key)
     end
     @test !haskey(PormG.config, key)
+
+    # The constructor's OWN model-building branch. Every store elsewhere in this file passes
+    # `model=`, and `pormg_nitro_session` builds the model itself and passes it in too, so
+    # without this the `isnothing(model)` arm of `PormGSessionStore` has no coverage --
+    # regressing it to `session_model()` would leave a store at `db_key="sessions"` carrying a
+    # model bound to `"db"` and the suite would stay green. The constructor touches no
+    # `PormG.config` entry, so no fixture is needed.
+    @test RealPormGSessionStore(db_key="sessions").model.connect_key == "sessions"
+    @test RealPormGSessionStore().model.connect_key == "db"
 end
 
 @testset "pormg_nitro_session hands its db_key to the store it returns (#199)" begin

@@ -587,14 +587,32 @@ worker_store = pormg_nitro_worker(db_key="workers")
 
 Task metadata will now be persisted to that database, while live running threads are managed safely in memory to prevent serialization issues.
 
-!!! note "Submitting inside a PormG transaction"
-    The store's `nitro_task` model is bound to `db_key`, so `submit_task` and the rest of the
-    task API work inside a `PormG.run_in_transaction(db_key)` block — enqueueing a job in the
-    same transaction that writes the row it will process, for instance.
+!!! warning "Do not submit a task from inside a PormG transaction"
+    The store's `nitro_task` model is bound to `db_key`, so the task API no longer *throws*
+    inside a `PormG.run_in_transaction(db_key)` block. That does not make it safe.
+
+    `submit_task` spawns the run with `Threads.@spawn` **synchronously, inside the caller's
+    dynamic scope**, and PormG tracks transaction state in a `ScopedValue` — which spawned
+    tasks inherit. So the worker run, starting with its own run-start write before any of your
+    callback code, executes on the submitting transaction's connection. Either it writes inside
+    your transaction and is rolled back with it, or your block commits first and the worker
+    keeps writing on a connection already returned to the pool.
+
+    Submit **after** the transaction block closes, and pass the committed row's id rather than
+    the row:
+
+    ```julia
+    id = PormG.run_in_transaction("db") do
+        write_audit_row()          # returns the id
+    end
+    submit_task("report_42", () -> render(id), Owner(uid))
+    ```
+
+    The same applies to `worker_startup` / `install!`, which pin a long-lived sequential queue
+    processor for the life of the process.
 
     A task call inside a transaction opened on a **different** connection raises PormG's
-    `TransactionError`, which names the `run_in_transaction` call you need. Note that the
-    *callback* runs later on its own task and is not covered by the submitting transaction.
+    `TransactionError`, which names the `run_in_transaction` call you would need.
 
 !!! note "Multiple processes sharing one database"
     Because the store persists across restarts, it invites deployments where several
