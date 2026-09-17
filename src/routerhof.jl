@@ -5,7 +5,8 @@ using HTTP
 using ..Util: join_url_path
 using ..AppContext: App
 using ..Types: Nullable, LifecycleMiddleware, CopyOnWriteDict, snapshot,
-                cache_if_current!, publish!
+                cache_if_current!, publish!, RouteResolution, ROUTE_RESOLUTION_KEY,
+                RouteMiddleware, NO_ROUTE_MIDDLEWARE
 
 export router, compose, genkey, cachetag, process_middleware, HOFRouter, OuterRouter, InnerRouter
 
@@ -13,10 +14,11 @@ export router, compose, genkey, cachetag, process_middleware, HOFRouter, OuterRo
 # ever appends *from* it, never to it, so one instance is safe to share.
 #
 # The win is allocation, not inference: a fresh `[]` per sanitized slot cost a `Vector{Any}` on
-# every `buildmiddleware` call. (It does NOT make the destructure type-stable — the values come
-# out of a `Dict{String,Tuple}` whose `Tuple` is abstract, so both slots infer as `Any` either
-# way. That is #76's territory.) Measured: 224 -> 192 bytes with route middleware present,
-# 192 -> 128 without.
+# every `buildmiddleware` call. Measured: 224 -> 192 bytes with route middleware present,
+# 192 -> 128 without. (Inference was the *other* half of the same line, and it was fixed
+# separately in #76 by narrowing the table's value type — see `RouteMiddleware`, src/types.jl.
+# Until then both slots came out of a `Dict{String,Tuple}` and inferred as `Any` whatever this
+# constant did.)
 const EMPTY_LAYERS = Function[]
 
 # "This slot carries at least one middleware." Both registrars gate on this rather than on
@@ -178,10 +180,49 @@ end
 # `[]` here and that guard becomes always-true, so every HOF route publishes a
 # `(Function[], Function[])` entry into `custommiddleware`. Secondarily, and sharper since #71:
 # those entries contribute zero layers but make the table permanently non-empty, which defeats
-# `compose`'s per-request fast path for the whole app — every request would then pay a second
-# `gethandler` for nothing.
+# `compose`'s per-request fast path for the whole app — every request would then pay a
+# `gethandler`, a cache-key string and a cache lookup for nothing, plus the chain fold on the
+# first request for each route. (Before #80 it also paid a SECOND `gethandler`; the fast path
+# is still worth defending without it.)
 function process_middleware(::App, ::Nothing) end
 
+
+"""
+    _clear_resolution!(req) -> Nothing
+
+Retract any [`RouteResolution`](@ref) an earlier pass left on `req` (#80).
+
+`compose` writes the stash on the matched path; every *other* path that got as far as calling
+`gethandler` calls this instead, so the rule is "ran the lookup ⟹ wrote or cleared", with no
+third outcome. That is what makes a stale hand-off structurally impossible rather than
+impossible-by-argument — and the argument is why this exists: the first version reasoned that a
+pass which writes no stash is unreachable after a match, because `HTTP.register!` replaces a leaf
+rather than removing one. **That is not true in general.** Upstream `insert!` matches an existing
+leaf with `eq = (x, y) -> x == "*" || x == y`, so registering a method-specific route *replaces*
+a wildcard-method one — removing it for every other method. `path(…; method = "*")` reaches that,
+so a `(method, target)` that matched once really can stop matching:
+
+    path("/w", h,  method = "*")    → POST /w matches, stash written
+    path("/w", h2, method = "GET")  → replaces the "*" leaf; POST /w is now a 405
+    same request object, 2nd pass   → 405 path wrote nothing, stale stash honoured, 200
+
+Writing `nothing` rather than deleting: `HTTP.RequestContext` has no `delete!` in the
+`haskey`/`getindex`/`setindex!`/`get` surface the rest of `src/` uses, and the terminal's
+`res isa RouteResolution` test rejects `nothing` anyway. The `haskey` guard keeps the common
+case — a 404 on a request that never carried a stash — to one probe that cannot allocate the
+metadata `Dict`, since `Base.haskey(::RequestContext, ::Symbol)` returns early when `metadata`
+is `nothing`.
+
+`compose`'s emptiness fast path deliberately does NOT call this: it returns before `gethandler`,
+and it can only be taken by a request whose every earlier pass also took it, because
+`custommiddleware` never shrinks — nothing in `src/` removes a key from it, and `empty!` is
+called only on `middleware_cache`. That one invariant is load-bearing and holds; the route-table
+one did not, which is why this function exists.
+"""
+function _clear_resolution!(req::HTTP.Request)
+    haskey(req.context, ROUTE_RESOLUTION_KEY) && (req.context[ROUTE_RESOLUTION_KEY] = nothing)
+    return nothing
+end
 
 """
 This function is used to generate dictionary keys which lookup middleware for routes
@@ -236,10 +277,14 @@ cachetag(catch_errors::Bool, show_errors::Bool, serialize::Bool)::String =
 const CACHE_TAGS = ntuple(i -> cachetag(isodd((i - 1) >> 2), isodd((i - 1) >> 1), isodd(i - 1)), 8)
 
 """
-    publish_route_middleware!(ctx::App, key::String, value::Tuple) -> Tuple
+    publish_route_middleware!(ctx::App, key::String, value::RouteMiddleware) -> RouteMiddleware
 
 Register `value` — a `(router middleware, route middleware)` pair — as the middleware for route
 `key`, and invalidate any chain already cached for it.
+
+`value` is typed as [`RouteMiddleware`](@ref) rather than `Tuple` (#76), so a pair of the wrong
+arity is rejected *here*, at the one sanctioned write site, instead of surfacing as a
+`MethodError` inside `buildmiddleware`'s destructure on some later request.
 
 **Use this instead of writing `ctx.service.custommiddleware` directly.** Publishing alone is not
 enough: `middleware_cache` is first-writer-wins, so a chain composed before the registration
@@ -278,7 +323,7 @@ rests on — `delete!` must keep taking the lock even when the key is absent —
 Both halves are still needed. `delete!` handles the chain cached *before* registration; the
 identity check handles the chain built before but published after it.
 """
-function publish_route_middleware!(ctx::App, key::String, value::Tuple)
+function publish_route_middleware!(ctx::App, key::String, value::RouteMiddleware)
     publish!(ctx.service.custommiddleware, key, value)
     # Every settings variant, not just one (#79): the cache is keyed on route + pipeline
     # settings, so a route can hold up to `length(CACHE_TAGS)` chains and invalidation has to
@@ -315,8 +360,8 @@ end
 """
 This function is used to build up the middleware chain for all our endpoints
 """
-function buildmiddleware(key::String, handler::Function, globalmiddleware::Vector,
-                         custommiddleware::CopyOnWriteDict{Tuple}) :: Function
+function buildmiddleware(key::String, handler::Function, globalmiddleware::Vector{Function},
+                         custommiddleware::CopyOnWriteDict{RouteMiddleware}) :: Function
 
     # lookup the middleware for this path.
     #
@@ -330,7 +375,12 @@ function buildmiddleware(key::String, handler::Function, globalmiddleware::Vecto
     # Taking the wrapper rather than a pre-snapshotted `Dict` is the point: it leaves no
     # `snapshot(...)` expression at any call site for a future refactor to lift out of the
     # request path. See `CopyOnWriteDict` (src/types.jl) for why this read needs no lock.
-    routermiddleware, routemiddleware = get(snapshot(custommiddleware), key, (nothing, nothing))
+    # Both slots infer as `Union{Nothing, Vector{Function}}` here since #76; before it, the
+    # table's `Tuple` value type was abstract and this line inferred `Tuple{Any, Any}` —
+    # which is dispatch on every request whenever `use_cache` is false. `NO_ROUTE_MIDDLEWARE`
+    # is the miss-path default; a `(nothing, nothing)` literal infers the same today, and
+    # that constant's docstring says why it is still the one to use.
+    routermiddleware, routemiddleware = get(snapshot(custommiddleware), key, NO_ROUTE_MIDDLEWARE)
 
     # sanitize outputs (either value can be nothing)
     routermiddleware = isnothing(routermiddleware) ? EMPTY_LAYERS : routermiddleware
@@ -347,8 +397,8 @@ This function dynamically determines which middleware functions to apply to a re
 If router or route specific middleware is defined, then it's used instead of the globally defined
 middleware. 
 """
-function compose(router::HTTP.Router, globalmiddleware::Vector,
-                 custommiddleware::CopyOnWriteDict{Tuple},
+function compose(router::HTTP.Router, globalmiddleware::Vector{Function},
+                 custommiddleware::CopyOnWriteDict{RouteMiddleware},
                  middleware_cache::CopyOnWriteDict{Function};
                  catch_errors::Bool = true, show_errors::Bool = true, serialize::Bool = true)
     use_cache = isempty(globalmiddleware)
@@ -395,7 +445,12 @@ function compose(router::HTTP.Router, globalmiddleware::Vector,
             custom_snap = snapshot(custommiddleware)
             isempty(custom_snap) && return nocustom(req)
 
-            innerhandler, path, _ = HTTP.Handlers.gethandler(router, req)
+            # `params` is BOUND now, not discarded (#80). `gethandler` allocates it either
+            # way — a fresh `Params()` per call, populated for a parametrized route — and the
+            # router at the bottom of the chain used to allocate a second one because this
+            # one was thrown away. Handing it down is what makes the second lookup
+            # unnecessary; see `RouteResolution` (src/types.jl) for the full argument.
+            innerhandler, path, params = HTTP.Handlers.gethandler(router, req)
 
             # `missing` is HTTP.jl's method-mismatch sentinel — a path that matched but not for
             # this method (405). It is NOT a match: it carries an empty `path`, so treating it
@@ -403,6 +458,27 @@ function compose(router::HTTP.Router, globalmiddleware::Vector,
             # registered at the empty path. `nothing` is a true miss (404). Both take the
             # unmatched path below.
             if !isnothing(innerhandler) && !ismissing(innerhandler)
+
+                # Hand this lookup to the pipeline's terminal instead of letting it redo the
+                # work (#80). `_dispatch_resolved` (src/core/pipeline.jl) consumes it, and
+                # honours it only if `(router, method, target)` all still match — every input
+                # `gethandler` just read. `router` is in there because this stash rides on the
+                # REQUEST while the invariant that makes it safe belongs to the App; see
+                # `RouteResolution` (src/types.jl). Written HERE — before the chain runs —
+                # because the chain is what eventually reaches the terminal.
+                #
+                # Stashed unconditionally on this branch, cache hit or miss, since the chain
+                # is cached but the resolution is per request. `isa Function` keeps
+                # `RouteResolution.handler` concrete: HTTP.jl types `leaf.handler` as `Any`,
+                # and everything Nitro registers is a closure, but a callable struct arriving
+                # some other way simply declines the hand-off and takes the old double-lookup
+                # rather than widening the field — so that case CLEARS instead of stashing.
+                if innerhandler isa Function
+                    req.context[ROUTE_RESOLUTION_KEY] =
+                        RouteResolution(router, req.method, req.target, innerhandler, path, params)
+                else
+                    _clear_resolution!(req)
+                end
 
                 # Check if we already have a cached middleware function for this specific
                 # route AND this pipeline's serializer settings. Skipped entirely when per-call
@@ -467,6 +543,11 @@ function compose(router::HTTP.Router, globalmiddleware::Vector,
             # here is what used to exempt them, and only for apps that had per-route middleware
             # somewhere — an app without it ran global middleware on 404s all along. This
             # restores parity between the two.
+            #
+            # Clear first (#80): this pass ran `gethandler` and got no route, so any stash on
+            # the request belongs to an EARLIER pass over the same object and must not be
+            # honoured by the terminal.
+            _clear_resolution!(req)
             return nocustom(req)
         end
     end
@@ -514,7 +595,13 @@ struct OuterRouter <: HOFRouter
     ctx::App
     prefix::String
     tags::Vector{String}
-    middleware::Nullable{Vector}
+    # PROCESSED middleware, not the user's raw list: `router()` passes this through
+    # `process_middleware`, whose two methods return exactly `Vector{Function}` or `nothing`.
+    # Declaring that (#76) is what lets `(inner::InnerRouter)` publish straight into a
+    # `CopyOnWriteDict{RouteMiddleware}` — the `router(...; middleware = ...)` KEYWORD stays
+    # `Nullable{Vector}`, because that one really is the user's list and may hold
+    # `LifecycleMiddleware` objects.
+    middleware::Nullable{Vector{Function}}
 end
 
 function (outer::OuterRouter)(
@@ -549,7 +636,7 @@ struct InnerRouter <: HOFRouter
     outer::OuterRouter
     path::Union{Nothing, String}
     tags::Vector{String}
-    middleware::Nullable{Vector}
+    middleware::Nullable{Vector{Function}}      # processed — see `OuterRouter.middleware`
 end
 
 function (inner::InnerRouter)(http_method::String)

@@ -396,8 +396,8 @@ end
 #       chain. Written during cache warmup only, once per route, via `cache!`
 #       (FIRST-writer-wins): a cached chain must never change identity underneath a reader.
 #
-#   `custommiddleware :: CopyOnWriteDict{Tuple}` — route key → `(router middleware, route
-#       middleware)`. Written at route registration via `publish!` (LAST-writer-wins):
+#   `custommiddleware :: CopyOnWriteDict{RouteMiddleware}` — route key → `(router middleware,
+#       route middleware)`. Written at route registration via `publish!` (LAST-writer-wins):
 #       re-running `urlpatterns` for a path must install the new middleware. "Registration"
 #       is not necessarily startup-only: under `revise=:lazy`, `Revise.revise()` runs on a
 #       request-handling task (src/core/lifecycle.jl), so re-registration can land while OTHER request
@@ -1103,5 +1103,183 @@ RouteDefinition(pattern::String, handler::Function, methods::Vector{String}, nam
 
 RouteDefinition(path::String, method::String, handler::Function, middleware::Vector{Function}, name::Nullable{String}) =
     RouteDefinition(; pattern=path, handler, methods=[method], name, middleware, type_hints=Dict{Symbol, Type}())
+
+"""
+    RouteMiddleware
+
+One route's middleware, as `ctx.service.custommiddleware` stores it: `(router-level,
+route-level)`, each present or absent (#76).
+
+The field used to be declared `CopyOnWriteDict{Tuple}`. Unparameterized `Tuple` is **abstract**,
+so `buildmiddleware`'s destructure (src/routerhof.jl) inferred `Any` in both slots — followed by
+two `append!` calls on values of unknown type. That is not a once-per-route cost: whenever
+`use_cache == false` —
+`serve(middleware = [...])`, `internalrequest(...; middleware = [...])`, and every
+`revise=:lazy|:eager` session — `buildmiddleware` runs on **every request, forever** (#68). So
+this was steady-state dynamic dispatch on the hot path for the normal production configuration,
+which is what put it under the "no `Any` in the request hot path" rule rather than under
+cosmetics.
+
+Exactly two shapes are ever stored, from the only two write sites, and both go through
+`publish_route_middleware!`:
+
+  - `register_route` (src/routing.jl)      → `(nothing, route middleware)`
+  - `(inner::InnerRouter)` (src/routerhof.jl) → `(router middleware, route middleware)`
+
+Naming that type also **enforces the 2-arity**, which `Tuple` left entirely unchecked — a
+three-slot or one-slot write is now a conversion error at the publish site instead of a
+`MethodError` inside the destructure on some later request. That is a correctness property, and
+it is worth more here than the inference is.
+
+!!! note "What did NOT change: storage layout"
+    `RouteMiddleware` is itself non-concrete — `isconcretetype` and `Base.allocatedinline` are
+    both `false`, because each slot is a `Union` — so `Dict{String,RouteMiddleware}` still
+    stores boxed values, exactly as `Dict{String,Tuple}` did. The win is entirely at the
+    destructure, which is what the benchmark and `test/custommiddleware_tests.jl` measure. Do
+    not read this narrowing as an inline-storage change; it is not one.
+
+See [`NO_ROUTE_MIDDLEWARE`](@ref) for the lookup default.
+"""
+const RouteMiddleware = Tuple{Nullable{Vector{Function}}, Nullable{Vector{Function}}}
+
+"""
+    NO_ROUTE_MIDDLEWARE
+
+The `get` default for a route absent from `custommiddleware` — "no middleware of either kind".
+
+!!! note "#76's issue body is wrong about why this exists, and the correction is worth keeping"
+    It argues that `get(table, key, (nothing, nothing))` would infer a `Union`, because
+    `Tuple{Nothing,Nothing}` "is not a subtype of the pair type". **Julia's tuple types are
+    covariant**, so `Tuple{Nothing,Nothing} <: RouteMiddleware` is in fact true, and a bare
+    literal default infers exactly the same
+    `Tuple{Union{Nothing,Vector{Function}}, Union{Nothing,Vector{Function}}}` this constant
+    does. Measured, not argued. The narrowing's real win is the other end — before #76 the
+    same destructure inferred `Tuple{Any, Any}`.
+
+What the constant is still worth: it pins the miss path to whatever
+[`RouteMiddleware`](@ref) is *declared* to be, rather than to a literal that happens to be a
+subtype of today's declaration. Narrow the pair further later — say, to non-optional slots —
+and a `(nothing, nothing)` literal would quietly widen the lookup's inferred type back out
+while every test stayed green; this cannot, because it would stop constructing.
+"""
+const NO_ROUTE_MIDDLEWARE = RouteMiddleware((nothing, nothing))
+
+"""
+    ROUTE_RESOLUTION_KEY
+
+`req.context` key carrying the [`RouteResolution`](@ref) `compose` produced for this request
+(#80). Internal — never part of the handler-facing context surface, which is `:route`,
+`:params` and HTTP.jl's own keys.
+"""
+const ROUTE_RESOLUTION_KEY = :__nitro_route_resolution
+
+"""
+    RouteResolution(router, method, target, handler, route, params)
+
+One request's route lookup, handed from `compose` (src/routerhof.jl) to the innermost layer of
+the pipeline (`_dispatch_resolved`, src/core/pipeline.jl) so the route is resolved **once**
+(#80).
+
+`compose` has to call `HTTP.Handlers.gethandler` before it can build a middleware-cache key, and
+used to keep only `leaf.path` from it — discarding the handler and the `Params()` dict, which
+`(r::Router)(req)` then recomputed at the bottom of the chain. That is two
+`_router_request_path` + `split`, two trie walks and two `Dict{String,String}` per request, on
+every app that registers per-route middleware. This struct is what carries the first lookup down
+to where the second one used to happen.
+
+# The guard is `(router, method, target)` — every input the lookup read
+
+`_dispatch_resolved` honours this hand-off only when all three still match. That set is not a
+judgement call: `HTTP.Handlers.gethandler` resolves from exactly `r.routes`, `req.method` and
+`req.target`, so re-checking those three is what makes "reuse the lookup" indistinguishable
+from "do the lookup again". Any mismatch falls through to `r(req)`, which is the old behavior
+and always correct.
+
+**`router`** — because the stash lives on the *request*, while the invariant that makes it safe
+lives on the *`App`*. A single `HTTP.Request` object can be passed to `internalrequest` more
+than once, and nothing stops the second call naming a **different `App`** — or the same
+`CONTEXT[]` after `resetstate()` replaced it. Those have their own `custommiddleware` and their
+own router, so "the tables only grow" says nothing about them. Without this field, App A's
+resolution is honoured by App B: B serves A's handler, skipping B's own route middleware, and
+an `App` that never registered the path at all answers `200` instead of `404`.
+
+The identity check assumes **one `Router` per `App`**, which is how `Service` is constructed
+(`router = Router()` per instance). `Service` is exported and takes `router` as a keyword, so two
+`App`s deliberately built around one shared `Router` but separate `custommiddleware` tables would
+defeat it and reinstate the misroute. Nothing in `src/`, `test/` or `docs/` does that; it is
+recorded here so the assumption is written down rather than inferred. Found in review;
+regression: the cross-`App` items in test/custommiddleware_tests.jl, at both the
+`_dispatch_resolved` and the `internalrequest` level. (The `resetstate()` variant is the same
+mechanism — the dispatching router is not the one that stashed — and is deliberately *not* a
+test; the note at that testset says why.)
+
+!!! note "`router` is declared as the `UnionAll`, and parameterizing it was measured and rejected"
+    `HTTP.Router` is not concrete — every real instance is a
+    `Router{typeof(default404),typeof(default405),Nothing}` — so this field is a boxed
+    pointer. An isolated microbenchmark of the constructor makes `struct RouteResolution{R}`
+    with `router::R` look like it saves an allocation per matched request. **It does not, in
+    the pipeline**: measured through a built `setupmiddleware` chain, both shapes come out at
+    exactly 40 allocations and 1936 bytes per served request. `Service.router` is itself
+    declared as the unparameterized `Router`, so the concrete type is not known where it
+    matters anyway. Left unparameterized on purpose — do not re-derive the microbenchmark and
+    "fix" it.
+
+**`method`** — `gethandler` matches on the method too, and `Request.method` is a mutable field.
+A middleware doing the classic `X-HTTP-Method-Override` rewrite (`req.method = "PUT"`) used to
+change which handler ran, because the router resolved after every middleware layer. Guarding on
+it keeps that true. Nothing in `src/` rewrites the method today; this is for user middleware.
+
+**`target`** — the one every layer actually touches. Global, router-level and route-level
+middleware all fold *outside* the accumulator `compose` receives, so any of them may retarget
+the request before the terminal runs; the rewrite then decides the route, as it always did.
+(`PrefixStripMiddleware` is not in that set either way: it folds *outside* `compose`
+(src/core/pipeline.jl), so it has already run by the time any of this happens.)
+
+**`===` on `String` compares contents, not addresses** — Julia's strings are egal by value, so
+the method and target checks ask "is this still what I resolved against?" rather than "is it
+the same object". That is the right question, and it is why a rewrite to a *byte-identical*
+target correctly keeps the hand-off: same target, same route, nothing to redo. Still cheap —
+the pointer-equal case, which is every request nothing rewrote, short circuits before comparing
+contents. The `router` check is a true identity compare, which is what it should be.
+
+# Staleness within one `App`
+
+`compose` overwrites this entry on every request it matches — cache hit or miss alike, since
+the write sits above the `use_cache` branch — so a later pass that re-resolves the same
+`(router, method, target)` always installs the fresh handler. Re-registration is therefore
+handled by construction, not by invalidation, which is why the chain in `middleware_cache` can
+stay cached while the handler it reaches changes.
+
+That leaves passes that write **no** stash, and those do not rely on an argument at all:
+`compose` calls `_clear_resolution!` (src/routerhof.jl) on every path that reached `gethandler`
+and did not stash — a 404, a 405, and a non-`Function` leaf. Ran the lookup ⟹ wrote or cleared,
+no third outcome, so a stale hand-off is structurally impossible rather than argued away.
+
+It was argued away, once, and the argument was wrong. The claim was that a pass writing no
+stash is unreachable after a match, because `HTTP.register!` replaces a leaf rather than
+removing one. Upstream `insert!` matches an existing leaf with
+`eq = (x, y) -> x == "*" || x == y`, so a method-specific registration **replaces a
+wildcard-method one**, removing the route for every other method — and `path(…; method = "*")`
+reaches it from ordinary Nitro code. `_clear_resolution!`'s docstring carries the reproduction.
+
+One invariant of that shape survives, because `compose`'s **emptiness fast path** returns before
+`gethandler` and so cannot clear: a request can only take it if every earlier pass took it too,
+since `custommiddleware` never shrinks — nothing in `src/` removes a key from it, and `empty!`
+is called only on `middleware_cache` (src/core/lifecycle.jl, which carries an explicit comment
+*not* to symmetrize it). That one holds.
+
+**And all of it is scoped per router, which is the other half.** Reading the old version as
+unconditional is how the cross-`App` defect above got written; the `router` field is what
+confines a stash to the router this reasoning is about.
+
+"""
+struct RouteResolution
+    router  :: HTTP.Router
+    method  :: String
+    target  :: String
+    handler :: Function
+    route   :: String
+    params  :: Dict{String,String}
+end
 
 end # module Types
