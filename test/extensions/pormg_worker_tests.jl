@@ -1794,7 +1794,6 @@ else
             @test RealPormGWorkerStore(db_key="tasks").model.connect_key == "tasks"
             @test RealPormGWorkerStore().model.connect_key == "db"
         end
-
     end
 end
 

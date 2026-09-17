@@ -587,7 +587,7 @@ worker_store = pormg_nitro_worker(db_key="workers")
 
 Task metadata will now be persisted to that database, while live running threads are managed safely in memory to prevent serialization issues.
 
-!!! warning "Do not submit a task from inside a PormG transaction"
+!!! warning "Do not spawn worker tasks from inside a PormG transaction"
     The store's `nitro_task` model is bound to `db_key`, so the task API no longer *throws*
     inside a `PormG.run_in_transaction(db_key)` block. That does not make it safe.
 
@@ -597,6 +597,9 @@ Task metadata will now be persisted to that database, while live running threads
     callback code, executes on the submitting transaction's connection. Either it writes inside
     your transaction and is rolled back with it, or your block commits first and the worker
     keeps writing on a connection already returned to the pool.
+
+    **This is about the spawn, not about the store.** A callback that queries PormG has the
+    same problem on `InMemoryWorkerStore`, with no Nitro store write involved at all.
 
     Submit **after** the transaction block closes, and pass the committed row's id rather than
     the row:
@@ -608,11 +611,14 @@ Task metadata will now be persisted to that database, while live running threads
     submit_task("report_42", () -> render(id), Owner(uid))
     ```
 
-    The same applies to `worker_startup` / `install!`, which pin a long-lived sequential queue
-    processor for the life of the process.
+    The same applies to anything else that spawns inside the block: `worker_startup` /
+    `startup` / `start!`, which spawn the queue processors and the cleanup scheduler, and the
+    first `submit_sequential_task` into a queue that is not yet running, which spawns that
+    queue's processor. Each of those pins a task for the life of the process.
 
     A task call inside a transaction opened on a **different** connection raises PormG's
-    `TransactionError`, which names the `run_in_transaction` call you would need.
+    `TransactionError` instead of corrupting quietly — but matching the connection is not the
+    fix. Submit after the block closes.
 
 !!! note "Multiple processes sharing one database"
     Because the store persists across restarts, it invites deployments where several
