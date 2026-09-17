@@ -188,6 +188,43 @@ function process_middleware(::App, ::Nothing) end
 
 
 """
+    _clear_resolution!(req) -> Nothing
+
+Retract any [`RouteResolution`](@ref) an earlier pass left on `req` (#80).
+
+`compose` writes the stash on the matched path; every *other* path that got as far as calling
+`gethandler` calls this instead, so the rule is "ran the lookup ⟹ wrote or cleared", with no
+third outcome. That is what makes a stale hand-off structurally impossible rather than
+impossible-by-argument — and the argument is why this exists: the first version reasoned that a
+pass which writes no stash is unreachable after a match, because `HTTP.register!` replaces a leaf
+rather than removing one. **That is not true in general.** Upstream `insert!` matches an existing
+leaf with `eq = (x, y) -> x == "*" || x == y`, so registering a method-specific route *replaces*
+a wildcard-method one — removing it for every other method. `path(…; method = "*")` reaches that,
+so a `(method, target)` that matched once really can stop matching:
+
+    path("/w", h,  method = "*")    → POST /w matches, stash written
+    path("/w", h2, method = "GET")  → replaces the "*" leaf; POST /w is now a 405
+    same request object, 2nd pass   → 405 path wrote nothing, stale stash honoured, 200
+
+Writing `nothing` rather than deleting: `HTTP.RequestContext` has no `delete!` in the
+`haskey`/`getindex`/`setindex!`/`get` surface the rest of `src/` uses, and the terminal's
+`res isa RouteResolution` test rejects `nothing` anyway. The `haskey` guard keeps the common
+case — a 404 on a request that never carried a stash — to one probe that cannot allocate the
+metadata `Dict`, since `Base.haskey(::RequestContext, ::Symbol)` returns early when `metadata`
+is `nothing`.
+
+`compose`'s emptiness fast path deliberately does NOT call this: it returns before `gethandler`,
+and it can only be taken by a request whose every earlier pass also took it, because
+`custommiddleware` never shrinks — nothing in `src/` removes a key from it, and `empty!` is
+called only on `middleware_cache`. That one invariant is load-bearing and holds; the route-table
+one did not, which is why this function exists.
+"""
+function _clear_resolution!(req::HTTP.Request)
+    haskey(req.context, ROUTE_RESOLUTION_KEY) && (req.context[ROUTE_RESOLUTION_KEY] = nothing)
+    return nothing
+end
+
+"""
 This function is used to generate dictionary keys which lookup middleware for routes
 """
 function genkey(http_method::String, path::String)::String
@@ -435,9 +472,13 @@ function compose(router::HTTP.Router, globalmiddleware::Vector{Function},
                 # `RouteResolution.handler` concrete: HTTP.jl types `leaf.handler` as `Any`,
                 # and everything Nitro registers is a closure, but a callable struct arriving
                 # some other way simply declines the hand-off and takes the old double-lookup
-                # rather than widening the field.
-                innerhandler isa Function && (req.context[ROUTE_RESOLUTION_KEY] =
-                    RouteResolution(router, req.method, req.target, innerhandler, path, params))
+                # rather than widening the field — so that case CLEARS instead of stashing.
+                if innerhandler isa Function
+                    req.context[ROUTE_RESOLUTION_KEY] =
+                        RouteResolution(router, req.method, req.target, innerhandler, path, params)
+                else
+                    _clear_resolution!(req)
+                end
 
                 # Check if we already have a cached middleware function for this specific
                 # route AND this pipeline's serializer settings. Skipped entirely when per-call
@@ -502,6 +543,11 @@ function compose(router::HTTP.Router, globalmiddleware::Vector{Function},
             # here is what used to exempt them, and only for apps that had per-route middleware
             # somewhere — an app without it ran global middleware on 404s all along. This
             # restores parity between the two.
+            #
+            # Clear first (#80): this pass ran `gethandler` and got no route, so any stash on
+            # the request belongs to an EARLIER pass over the same object and must not be
+            # honoured by the terminal.
+            _clear_resolution!(req)
             return nocustom(req)
         end
     end

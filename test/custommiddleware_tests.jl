@@ -930,6 +930,39 @@ end
     @test haskey(req.context, ROUTE_RESOLUTION_KEY)
 end
 
+@testset "a route that stops matching does not leave a stash behind" begin
+    # REGRESSION. The first version of this argued that a pass writing no stash is unreachable
+    # after a match, because `HTTP.register!` replaces a leaf rather than removing one. Upstream
+    # `insert!` matches with `eq = (x, y) -> x == "*" || x == y`, so a method-specific
+    # registration REPLACES a wildcard-method one — removing the route for every other method —
+    # and `path(…; method = "*")` reaches that from ordinary Nitro code. `compose` therefore
+    # clears the stash on the 404/405 path rather than relying on the argument.
+    passthrough = handler -> (req::HTTP.Request -> handler(req))
+    ctx = App()
+    Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+        path("/w", (req::HTTP.Request) -> Res.send("WILDCARD"), method = "*",
+             middleware = [passthrough]),
+    ])
+
+    req = HTTP.Request("POST", "/w")
+    @test text(Nitro.Core.internalrequest(ctx, req; catch_errors = false)) == "WILDCARD"
+    @test haskey(req.context, ROUTE_RESOLUTION_KEY)
+
+    # Replaces the "*" leaf, so POST is no longer routed. (HTTP.jl warns on the replacement.)
+    Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+        path("/w", (req::HTTP.Request) -> Res.send("GET-ONLY"), method = "GET",
+             middleware = [passthrough]),
+    ])
+
+    fresh = Nitro.Core.internalrequest(ctx, HTTP.Request("POST", "/w"); catch_errors = false)
+    reused = Nitro.Core.internalrequest(ctx, req; catch_errors = false)
+    # The reused object must agree with the fresh one. Before the clear it answered 200
+    # "WILDCARD" — the old handler — while a fresh request correctly got 405.
+    @test fresh.status == 405
+    @test reused.status == fresh.status
+    @test text(reused) == text(fresh)
+end
+
 @testset "404 and 405 write no stash" begin
     ctx = App()
     passthrough = handler -> (req::HTTP.Request -> handler(req))

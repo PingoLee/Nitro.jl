@@ -1201,7 +1201,13 @@ than once, and nothing stops the second call naming a **different `App`** — or
 `CONTEXT[]` after `resetstate()` replaced it. Those have their own `custommiddleware` and their
 own router, so "the tables only grow" says nothing about them. Without this field, App A's
 resolution is honoured by App B: B serves A's handler, skipping B's own route middleware, and
-an `App` that never registered the path at all answers `200` instead of `404`. Found in review;
+an `App` that never registered the path at all answers `200` instead of `404`.
+
+The identity check assumes **one `Router` per `App`**, which is how `Service` is constructed
+(`router = Router()` per instance). `Service` is exported and takes `router` as a keyword, so two
+`App`s deliberately built around one shared `Router` but separate `custommiddleware` tables would
+defeat it and reinstate the misroute. Nothing in `src/`, `test/` or `docs/` does that; it is
+recorded here so the assumption is written down rather than inferred. Found in review;
 regression: the cross-`App` items in test/custommiddleware_tests.jl, at both the
 `_dispatch_resolved` and the `internalrequest` level. (The `resetstate()` variant is the same
 mechanism — the dispatching router is not the one that stashed — and is deliberately *not* a
@@ -1244,26 +1250,27 @@ the write sits above the `use_cache` branch — so a later pass that re-resolves
 handled by construction, not by invalidation, which is why the chain in `middleware_cache` can
 stay cached while the handler it reaches changes.
 
-That leaves passes that write **no** stash. Within one router there are exactly three, and
-this enumeration is the load-bearing part of the argument:
+That leaves passes that write **no** stash, and those do not rely on an argument at all:
+`compose` calls `_clear_resolution!` (src/routerhof.jl) on every path that reached `gethandler`
+and did not stash — a 404, a 405, and a non-`Function` leaf. Ran the lookup ⟹ wrote or cleared,
+no third outcome, so a stale hand-off is structurally impossible rather than argued away.
 
-1. **The emptiness fast path** — returns before `gethandler`. Unreachable after a match on the
-   same object: `custommiddleware` only ever grows. Nothing in `src/` removes a key from it,
-   and `empty!` is called only on `middleware_cache` (src/core/lifecycle.jl, which carries an
-   explicit comment *not* to symmetrize it).
-2. **A 404 or 405** — `HTTP.register!` `insert!`s, replacing a leaf rather than deleting one,
-   so a `(method, target)` that matched once still matches and adding routes cannot unmatch it.
-   Unreachable for the same reason.
-3. **`innerhandler isa Function` being false** — the one path that is *not* structurally
-   unreachable. It needs the leaf for that exact `(method, target)` to be replaced by a
-   callable that is not a `Function`, which means bypassing `path()`/`urlpatterns()` and
-   calling `HTTP.register!` on `ctx.service.router` directly: Nitro's own `registerhandler`
-   (src/core/registration.jl) always builds a closure. Out of reach in-tree, and the cost if
-   someone did it is one pass served by the previous handler — not a foreign application's.
+It was argued away, once, and the argument was wrong. The claim was that a pass writing no
+stash is unreachable after a match, because `HTTP.register!` replaces a leaf rather than
+removing one. Upstream `insert!` matches an existing leaf with
+`eq = (x, y) -> x == "*" || x == y`, so a method-specific registration **replaces a
+wildcard-method one**, removing the route for every other method — and `path(…; method = "*")`
+reaches it from ordinary Nitro code. `_clear_resolution!`'s docstring carries the reproduction.
 
-**The whole argument is scoped, and reading it as unconditional is how the cross-`App` defect
-above got written.** It holds *per router*; the `router` field is what confines the stash to
-the one this reasoning is about.
+One invariant of that shape survives, because `compose`'s **emptiness fast path** returns before
+`gethandler` and so cannot clear: a request can only take it if every earlier pass took it too,
+since `custommiddleware` never shrinks — nothing in `src/` removes a key from it, and `empty!`
+is called only on `middleware_cache` (src/core/lifecycle.jl, which carries an explicit comment
+*not* to symmetrize it). That one holds.
+
+**And all of it is scoped per router, which is the other half.** Reading the old version as
+unconditional is how the cross-`App` defect above got written; the `router` field is what
+confines a stash to the router this reasoning is about.
 
 """
 struct RouteResolution
