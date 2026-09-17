@@ -587,6 +587,39 @@ worker_store = pormg_nitro_worker(db_key="workers")
 
 Task metadata will now be persisted to that database, while live running threads are managed safely in memory to prevent serialization issues.
 
+!!! warning "Do not spawn worker tasks from inside a PormG transaction"
+    The store's `nitro_task` model is bound to `db_key`, so the task API no longer *throws*
+    inside a `PormG.run_in_transaction(db_key)` block. That does not make it safe.
+
+    `submit_task` spawns the run with `Threads.@spawn` **synchronously, inside the caller's
+    dynamic scope**, and PormG tracks transaction state in a `ScopedValue` — which spawned
+    tasks inherit. So the worker run, starting with its own run-start write before any of your
+    callback code, executes on the submitting transaction's connection. Either it writes inside
+    your transaction and is rolled back with it, or your block commits first and the worker
+    keeps writing on a connection already returned to the pool.
+
+    **This is about the spawn, not about the store.** A callback that queries PormG has the
+    same problem on `InMemoryWorkerStore`, with no Nitro store write involved at all.
+
+    Submit **after** the transaction block closes, and pass the committed row's id rather than
+    the row:
+
+    ```julia
+    id = PormG.run_in_transaction("db") do
+        write_audit_row()          # returns the id
+    end
+    submit_task("report_42", () -> render(id), Owner(uid))
+    ```
+
+    The same applies to anything else that spawns inside the block: `worker_startup` /
+    `startup` / `start!`, which spawn the queue processors and the cleanup scheduler, and the
+    first `submit_sequential_task` into a queue that is not yet running, which spawns that
+    queue's processor. Each of those pins a task for the life of the process.
+
+    A task call inside a transaction opened on a **different** connection raises PormG's
+    `TransactionError` instead of corrupting quietly — but matching the connection is not the
+    fix. Submit after the block closes.
+
 !!! note "Multiple processes sharing one database"
     Because the store persists across restarts, it invites deployments where several
     processes share one database — two app instances behind a load balancer, or a web

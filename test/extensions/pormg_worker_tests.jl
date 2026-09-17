@@ -13,12 +13,31 @@ using Nitro.Errors: AuthorizationError
 # the database layer; store methods come from ext/NitroPormGExt.jl.
 
 mutable struct MockTaskQuerySet
-    table::Dict{String, Dict{String, Any}}
+    # One table PER CONNECTION, not one table. A single-table mock cannot express #203 at
+    # all: "created the table on `tasks`, then read and wrote every row on `db`" is not a
+    # statement about anything unless there are two tables to tell apart, so no assertion
+    # written against such a mock could have failed on code that dropped `.db(db_key)`.
+    tables::Dict{String, Dict{String, Dict{String, Any}}}   # db key -> task id -> row
+    db_key::Union{Nothing, String}                          # `nothing` until `.db(key)` runs
     filters::Dict{String, Any}
 end
 
+# The one place a connection is resolved. Every terminal op goes through here, so a query
+# that never called `.db(key)` fails loudly instead of silently reading the default table.
+function _selected_table(qs::MockTaskQuerySet)
+    key = getfield(qs, :db_key)
+    key === nothing && error("MockTaskQuerySet: query ran without selecting a connection -- " *
+        "every task query must go through `_task_objects(store)` (`.db(store.db_key)`), " *
+        "not `m.objects` directly. See #203.")
+    tables = getfield(qs, :tables)
+    haskey(tables, key) || error("MockTaskQuerySet: no table registered for db key '$key' -- " *
+        "PormG throws `InvalidConfigurationError` for a key that was never loaded. Build the " *
+        "model as `MockTaskModel(\"$key\")` if the test means to use that connection.")
+    return tables[key]
+end
+
 function _filtered_rows(qs::MockTaskQuerySet)
-    table = getfield(qs, :table)
+    table = _selected_table(qs)
     filters = getfield(qs, :filters)
     rows = Dict{String, Any}[]
 
@@ -86,7 +105,14 @@ function Base.getproperty(qs::MockTaskQuerySet, name::Symbol)
             return qs
         end
     elseif name === :db
-        return function(_db_key::String)
+        return function(db_key::String)
+            # PormG's `_db!` assigns `q.connect_key` and returns the SAME object -- the
+            # mutate-and-return-self shape `filter` above uses, not a fresh queryset.
+            #
+            # This used to be `(_db_key) -> qs`: the key was accepted and thrown away, so
+            # `_task_objects(store)` was indistinguishable from `store.model.objects` and
+            # deleting `.db(store.db_key)` from the ext kept this whole file green (#203).
+            setfield!(qs, :db_key, db_key)
             return qs
         end
     elseif name === :list
@@ -104,7 +130,7 @@ function Base.getproperty(qs::MockTaskQuerySet, name::Symbol)
             for (k, v) in pairs
                 row[k] = v
             end
-            getfield(qs, :table)[row["id"]] = row
+            _selected_table(qs)[row["id"]] = row
             return row
         end
     elseif name === :update
@@ -123,7 +149,7 @@ function Base.getproperty(qs::MockTaskQuerySet, name::Symbol)
         end
     elseif name === :delete
         return function()
-            table = getfield(qs, :table)
+            table = _selected_table(qs)
             count = 0
             for row in _filtered_rows(qs)
                 delete!(table, row["id"])
@@ -140,14 +166,25 @@ Base.iterate(qs::MockTaskQuerySet) = iterate(_filtered_rows(qs))
 Base.iterate(qs::MockTaskQuerySet, state) = iterate(_filtered_rows(qs), state)
 
 struct MockTaskModel
-    _table::Dict{String, Dict{String, Any}}
+    _tables::Dict{String, Dict{String, Dict{String, Any}}}
 end
 
-MockTaskModel() = MockTaskModel(Dict{String, Dict{String, Any}}())
+# Every connection this model may be queried on. A test that exercises routing names both
+# (`MockTaskModel("db", "tasks")`); the no-argument form is the single connection every test
+# that does not care about routing uses.
+MockTaskModel(db_keys::String...) = MockTaskModel(
+    Dict{String, Dict{String, Dict{String, Any}}}(
+        k => Dict{String, Dict{String, Any}}() for k in (isempty(db_keys) ? ("db",) : db_keys)))
 
 function Base.getproperty(m::MockTaskModel, name::Symbol)
     if name === :objects
-        return MockTaskQuerySet(getfield(m, :_table), Dict{String,Any}())
+        # No connection selected yet -- exactly what PormG's `model.objects` hands back.
+        # `.db(key)` is what picks one.
+        return MockTaskQuerySet(getfield(m, :_tables), nothing, Dict{String,Any}())
+    elseif name === :_table
+        # The DEFAULT connection's table: what every assertion that does not care about
+        # routing means, kept as an alias rather than rewritten at ~30 call sites.
+        return getfield(m, :_tables)["db"]
     end
     return getfield(m, name)
 end
@@ -210,20 +247,25 @@ function Base.getproperty(qs::FlakyReadQuerySet, name::Symbol)
 end
 
 struct FlakyReadModel
-    _table::Dict{String, Dict{String, Any}}
+    _tables::Dict{String, Dict{String, Dict{String, Any}}}
     fail_next::Ref{Int}
     fail_ids::Set{String}
 end
 
-FlakyReadModel() = FlakyReadModel(Dict{String, Dict{String, Any}}(), Ref(0), Set{String}())
+FlakyReadModel(db_keys::String...) = FlakyReadModel(
+    Dict{String, Dict{String, Dict{String, Any}}}(
+        k => Dict{String, Dict{String, Any}}() for k in (isempty(db_keys) ? ("db",) : db_keys)),
+    Ref(0), Set{String}())
 
 function Base.getproperty(m::FlakyReadModel, name::Symbol)
     if name === :objects
         return FlakyReadQuerySet(
-            MockTaskQuerySet(getfield(m, :_table), Dict{String,Any}()),
+            MockTaskQuerySet(getfield(m, :_tables), nothing, Dict{String,Any}()),
             getfield(m, :fail_next),
             getfield(m, :fail_ids),
         )
+    elseif name === :_table
+        return getfield(m, :_tables)["db"]
     end
     return getfield(m, name)
 end
@@ -260,7 +302,9 @@ function Base.getproperty(qs::RacingWatcherQuerySet, name::Symbol)
             if is_watcher_cas && inject_next[] > 0
                 inject_next[] -= 1
                 # The competing write lands first, so our compare value is now stale.
-                for row in values(getfield(inner, :table))
+                # `_selected_table`, not the raw tables dict: the intruder must land on the
+                # SAME connection the store is querying, or the CAS would never see it.
+                for row in values(_selected_table(inner))
                     current = JSON.parse(row["watchers"])
                     intruder in current && continue
                     row["watchers"] = JSON.json(vcat(current, intruder))
@@ -273,18 +317,24 @@ function Base.getproperty(qs::RacingWatcherQuerySet, name::Symbol)
 end
 
 struct RacingWatcherModel
-    _table::Dict{String, Dict{String, Any}}
+    _tables::Dict{String, Dict{String, Dict{String, Any}}}
     inject_next::Ref{Int}
     intruder::String
 end
 
+RacingWatcherModel(table::Dict{String, Dict{String, Any}}, inject_next::Ref{Int}, intruder::String) =
+    RacingWatcherModel(
+        Dict{String, Dict{String, Dict{String, Any}}}("db" => table), inject_next, intruder)
+
 function Base.getproperty(m::RacingWatcherModel, name::Symbol)
     if name === :objects
         return RacingWatcherQuerySet(
-            MockTaskQuerySet(getfield(m, :_table), Dict{String,Any}()),
+            MockTaskQuerySet(getfield(m, :_tables), nothing, Dict{String,Any}()),
             getfield(m, :inject_next),
             getfield(m, :intruder),
         )
+    elseif name === :_table
+        return getfield(m, :_tables)["db"]
     end
     return getfield(m, name)
 end
@@ -301,6 +351,29 @@ function _load_pormg_worker_store_type()
 end
 
 const RealPormGWorkerStore = _load_pormg_worker_store_type()
+
+# -- A stand-in PormG connection, for `pormg_nitro_worker` and the #202 guard ------
+#
+# Mirrors `FakeSessionPool` in `pormg_session_tests.jl`; see the rationale there.
+# `PormG.connection(key=k)` is just `config[k].connections`, `config` is a
+# `Dict{String,PormGSettings}` and `PormGSettings` is an ABSTRACT type, so an entry under a
+# test-only key is enough. Subtyping `PormG.PormGSQLite` rather than using a bare struct means
+# the REAL `create_table`/`create_index` run against the REAL task model; only `fetch` is
+# overridden, and on our own concrete type, so it is more specific than PormG's method rather
+# than piracy.
+struct FakeTaskPool <: PormG.PormGSQLite
+    sql::Vector{String}
+end
+
+struct FakeTaskSettings <: PormG.PormGSettings
+    connections::FakeTaskPool
+end
+
+PormG.ConnectionPool.fetch(c::FakeTaskPool, sql::String; kwargs...) =
+    (push!(c.sql, sql); nothing)
+
+# The extension module itself, for the private `task_model` accessor the #202 guard drives.
+const PormGExt = Base.get_extension(Nitro, :NitroPormGExt)
 
 # FAIL, do not skip (#128). This branch used to be
 # `@test_skip "PormG is not available, ..."`, which the Test stdlib reports as
@@ -1564,6 +1637,162 @@ else
             @test cancel_reason(live) === :user
             @test live.error == "Cancelled by user"                       # the live mirror
             @test get_task_info(store_u, live.id).error == "Cancelled by user"   # the row
+        end
+
+        @testset "every task query runs on the store's db_key, not a default (#203)" begin
+            # Until #203 the mock modelled `.db(key)` as a passthrough that discarded the key,
+            # so `_task_objects(store)` and `store.model.objects` were the same thing and
+            # deleting the routing call from the ext kept all 43 testsets in this file green.
+            # `PormGWorkerStore`'s routing was pinned by nothing.
+            #
+            # Two tables and a DECOY: the wrong-connection read finds a row under the same id
+            # on `db` and hands it back, so a routing regression names itself instead of just
+            # reporting "missing".
+            m = MockTaskModel("db", "tasks")
+            store_r = RealPormGWorkerStore(model=m, db_key="tasks")
+
+            @test store_r.db_key == "tasks"
+
+            decoy = Dict{String,Any}(
+                "id" => "alice::routed", "run_id" => "decoy-run", "status" => "COMPLETED",
+                "progress" => 100.0, "result" => "\"decoy\"", "error" => "",
+                "created_at" => now(UTC), "started_at" => nothing, "completed_at" => nothing,
+                "watchers" => JSON.json(["mallory"]), "queue_name" => "decoy",
+            )
+            m._tables["db"]["alice::routed"] = decoy
+
+            # create
+            info = TaskInfo("alice::routed"; queue_name="reports")
+            push!(info.watchers, "alice")
+            replace_task!(store_r, info.id, info)
+            @test haskey(m._tables["tasks"], "alice::routed")
+            @test m._tables["db"]["alice::routed"] === decoy          # untouched
+            @test m._tables["db"]["alice::routed"]["queue_name"] == "decoy"
+
+            # read -- the decoy is what a dropped `.db` would return
+            fetched = get_task_info(store_r, "alice::routed")
+            @test fetched.queue_name == "reports"
+
+            # update
+            info.status = RUNNING
+            set_task!(store_r, info.id, info)
+            @test m._tables["tasks"]["alice::routed"]["status"] == "RUNNING"
+            @test m._tables["db"]["alice::routed"]["status"] == "COMPLETED"
+
+            # watcher CAS -- assert the CAS itself won, or a `false` return that still left
+            # "bob" on the row would read as a pass.
+            @test add_watcher!(store_r, "alice::routed", "bob") == true
+            @test occursin("bob", m._tables["tasks"]["alice::routed"]["watchers"])
+            @test !occursin("bob", m._tables["db"]["alice::routed"]["watchers"])
+
+            # fenced transition
+            @test try_transition!(store_r, "alice::routed", (PENDING, RUNNING), COMPLETED;
+                                  run_id=info.run_id)
+            @test m._tables["tasks"]["alice::routed"]["status"] == "COMPLETED"
+            # The decoy started life COMPLETED, so its status proves nothing here -- its
+            # run_id does: the fenced write never reached this connection.
+            @test m._tables["db"]["alice::routed"]["run_id"] == "decoy-run"
+
+            # list
+            listed = get_all_tasks(store_r, Owner("alice"))
+            @test length(listed) == 1
+            @test first(listed).queue_name == "reports"
+
+            # delete
+            delete_task!(store_r, "alice::routed")
+            @test !haskey(m._tables["tasks"], "alice::routed")
+            @test m._tables["db"]["alice::routed"] === decoy          # still untouched
+        end
+
+        @testset "cleanup_tasks! prunes the store's connection only (#203)" begin
+            m = MockTaskModel("db", "tasks")
+            store_c = RealPormGWorkerStore(model=m, db_key="tasks")
+
+            old = now(UTC) - Day(30)
+            for tbl in ("db", "tasks")
+                m._tables[tbl]["stale"] = Dict{String,Any}(
+                    "id" => "stale", "run_id" => "", "status" => "COMPLETED",
+                    "progress" => 100.0, "result" => "", "error" => "",
+                    "created_at" => old, "started_at" => old, "completed_at" => old,
+                    "watchers" => "[]", "queue_name" => "default",
+                )
+            end
+
+            @test cleanup_tasks!(store_c, 1) == 1
+            @test !haskey(m._tables["tasks"], "stale")
+            @test haskey(m._tables["db"], "stale")    # the other connection is not ours to prune
+        end
+
+        @testset "the mock refuses a query with no connection selected (#203)" begin
+            # A meta-test on the guard itself. Without it the assertions above are theatre:
+            # they would pass just as well against a mock that ignored `.db` entirely, which
+            # is precisely the state this file was in before #203.
+            m = MockTaskModel("db", "tasks")
+
+            @test_throws "without selecting a connection" m.objects.filter("id" => "x").first()
+            @test_throws "without selecting a connection" m.objects.filter("id" => "x").list()
+            @test_throws "no table registered for db key" m.objects.db("nope").filter("id" => "x").first()
+
+            # ...and the routed form works, so the guard is not simply refusing everything.
+            @test m.objects.db("tasks").filter("id" => "x").first() === nothing
+        end
+
+        @testset "the task model is BOUND to its store's connection (#202)" begin
+            # `_define_task_model()` used to build a bare `PormG.Models.Model` that never went
+            # through `set_models`, so `connect_key` was `nothing`. PormG's
+            # `ensure_model_transaction_scope` gates on the MODEL's key and never consults the
+            # query's `.db()` override, so while any transaction was open on the calling task
+            # EVERY `nitro_task` query threw `InvalidConfigurationError` -- `submit_task` inside
+            # an app's own `run_in_transaction` block, for instance.
+            #
+            # Mirrors the session-side guard in `pormg_session_tests.jl`; the two stores had the
+            # identical gap and #202 closes both.
+            @test getproperty(PormGExt, :task_model)().connect_key == "db"
+            @test getproperty(PormGExt, :task_model)("tasks").connect_key == "tasks"
+
+            # One model per store, never a shared singleton -- `connect_key` names exactly one
+            # connection, so two stores on different keys could not share an object.
+            @test getproperty(PormGExt, :task_model)() !== getproperty(PormGExt, :task_model)()
+
+            key = "nitro-test-task-tx"
+            haskey(PormG.config, key) &&
+                error("test-only PormG connection key is already registered: $key")
+            conn = FakeTaskPool(String[])
+            PormG.config[key] = FakeTaskSettings(conn)
+            try
+                bound = getproperty(PormGExt, :task_model)(key)
+                unbound = getproperty(PormGExt, :task_model)(key)
+                unbound.connect_key = nothing
+
+                # Outside a transaction the guard returns immediately for both -- which is
+                # precisely why this defect never showed up in the suite.
+                @test PormG.Configuration.ensure_model_transaction_scope(unbound) === nothing
+                @test PormG.Configuration.ensure_model_transaction_scope(bound) === nothing
+
+                # `with_tx_context` is PormG's own seam onto the `ScopedValue` that
+                # `run_in_transaction` sets, so the guard runs without a live driver.
+                PormG.with_tx_context(conn, nothing) do
+                    @test_throws PormG.Kernel.InvalidConfigurationError PormG.Configuration.ensure_model_transaction_scope(unbound)
+                    @test PormG.Configuration.ensure_model_transaction_scope(bound) === nothing
+                end
+
+                # And the factory hands the store a model bound to the key it was asked for.
+                store_b = pormg_nitro_worker(db_key=key)
+                @test store_b.db_key == key
+                @test store_b.model.connect_key == key
+            finally
+                delete!(PormG.config, key)
+            end
+            @test !haskey(PormG.config, key)
+
+            # The constructor's OWN model-building branch. Every other store in this file
+            # passes `model=`, and both factories build the model themselves and pass it in
+            # too, so without this the `isnothing(model)` arm of `PormGWorkerStore` has no
+            # coverage at all -- regressing it to `task_model()` would leave a store at
+            # `db_key="tasks"` carrying a model bound to `"db"` and the suite would stay green.
+            # Neither constructor touches `PormG.config`, so no fixture is needed.
+            @test RealPormGWorkerStore(db_key="tasks").model.connect_key == "tasks"
+            @test RealPormGWorkerStore().model.connect_key == "db"
         end
     end
 end

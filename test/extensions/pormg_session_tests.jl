@@ -612,36 +612,62 @@ end
     @test isempty(s.model._table)
 end
 
-@testset "PREMISE: an unrouted session query is a THROW, not a silent default (#199)" begin
-    # The premise the whole fix rests on, pinned against the real PormG rather than asserted in a
-    # comment. `_define_session_model()` builds the session model with a bare `PormG.Models.Model`
-    # and never passes it to `set_models`, so the model carries NO connection binding of its own.
-    # PormG then resolves a query with no `.db(key)` as: the sole loaded connection if there is
-    # exactly one, otherwise `InvalidConfigurationError`
-    # (`PormG/src/querybuilder/build_helpers.jl`).
+@testset "PREMISE: the session model is BOUND to its store's connection (#202)" begin
+    # This testset used to pin the opposite: `session_model().connect_key === nothing`, and an
+    # unrouted query throwing `InvalidConfigurationError` because PormG refuses to guess between
+    # two loaded connections. That was a faithful record of the shipped behaviour and it is what
+    # #202 deliberately changes, so the expectation moves with the code rather than the code
+    # being bent to keep it. The `.db(key)` routing half it guarded is unaffected and is still
+    # covered by the mock testsets above.
     #
-    # So the shipped symptom of #199 was not "wrote to the wrong database". For any app with two
-    # or more PormG connections loaded it was every session query THROWING -- swallowed by
-    # `Base.get` and `cleanup_expired_sessions!` (silent logout, one `@warn` per read) and
-    # rethrown by `set_session!`/`delete_session!`. If PormG ever makes this a silent fallback
-    # instead, this test goes red and the mock's error-on-unrouted design needs revisiting.
-    @test getproperty(PormGExt, :session_model)().connect_key === nothing
+    # Why the binding has to exist: PormG's `ensure_model_transaction_scope` gates on the
+    # MODEL's `connect_key` and never consults the query's `.db()` override, so while any
+    # transaction is open on the calling task an unbound model throws for EVERY query --
+    # swallowed by `Base.get` (a live session silently reads as absent) and rethrown by
+    # `set_session!`/`delete_session!`.
+    @test getproperty(PormGExt, :session_model)().connect_key == "db"
+    @test getproperty(PormGExt, :session_model)("sessions").connect_key == "sessions"
 
-    k1, k2 = "nitro-test-unrouted-1", "nitro-test-unrouted-2"
-    # `error`, not `@test`: a failed `@test` does not stop the testset, so an assertion here
-    # would go red and then overwrite -- and later `delete!` -- somebody's real connection.
-    (haskey(PormG.config, k1) || haskey(PormG.config, k2)) &&
-        error("test-only PormG connection keys are already registered: $k1 / $k2")
-    PormG.config[k1] = FakeSessionSettings(FakeSessionPool(String[]))
-    PormG.config[k2] = FakeSessionSettings(FakeSessionPool(String[]))
+    # One model per store, never a shared singleton: `connect_key` names exactly one
+    # connection, so two stores on different keys sharing an object would overwrite each
+    # other's binding.
+    @test getproperty(PormGExt, :session_model)() !== getproperty(PormGExt, :session_model)()
+
+    key = "nitro-test-session-tx"
+    (haskey(PormG.config, key)) &&
+        error("test-only PormG connection key is already registered: $key")
+    conn = FakeSessionPool(String[])
+    PormG.config[key] = FakeSessionSettings(conn)
     try
-        # Two connections loaded, model unbound: PormG refuses to guess. This throw never reaches
-        # the driver, so the fake pools are never actually queried.
-        @test_throws PormG.Kernel.InvalidConfigurationError getproperty(PormGExt, :session_model)().objects.filter("session_key" => "x").first()
+        bound = getproperty(PormGExt, :session_model)(key)
+        unbound = getproperty(PormGExt, :session_model)(key)
+        unbound.connect_key = nothing
+
+        # `with_tx_context` is PormG's own seam onto the `ScopedValue` that `run_in_transaction`
+        # sets, so the guard can be driven without a live driver. Outside a transaction the
+        # guard returns immediately -- which is exactly why #202 never showed up in the suite.
+        @test PormG.Configuration.ensure_model_transaction_scope(unbound) === nothing
+        @test PormG.Configuration.ensure_model_transaction_scope(bound) === nothing
+
+        PormG.with_tx_context(conn, nothing) do
+            # The shipped defect, pinned: unbound + any open transaction == throw.
+            @test_throws PormG.Kernel.InvalidConfigurationError PormG.Configuration.ensure_model_transaction_scope(unbound)
+            # ... and the fix: a model bound to the transaction's own connection passes.
+            @test PormG.Configuration.ensure_model_transaction_scope(bound) === nothing
+        end
     finally
-        delete!(PormG.config, k1)
-        delete!(PormG.config, k2)
+        delete!(PormG.config, key)
     end
+    @test !haskey(PormG.config, key)
+
+    # The constructor's OWN model-building branch. Every store elsewhere in this file passes
+    # `model=`, and `pormg_nitro_session` builds the model itself and passes it in too, so
+    # without this the `isnothing(model)` arm of `PormGSessionStore` has no coverage --
+    # regressing it to `session_model()` would leave a store at `db_key="sessions"` carrying a
+    # model bound to `"db"` and the suite would stay green. The constructor touches no
+    # `PormG.config` entry, so no fixture is needed.
+    @test RealPormGSessionStore(db_key="sessions").model.connect_key == "sessions"
+    @test RealPormGSessionStore().model.connect_key == "db"
 end
 
 @testset "pormg_nitro_session hands its db_key to the store it returns (#199)" begin
@@ -663,7 +689,13 @@ end
 
         # ... and it really is the shipped function under test: the real session model,
         # bootstrapped on the connection it was asked for.
-        @test store.model === getproperty(PormGExt, :session_model)()
+        #
+        # An identity check against `session_model()` used to stand here, back when the model
+        # was a process-wide singleton. Since #202 each store gets its OWN model bound to its
+        # own key -- a shared one could not carry two different `connect_key`s -- so the
+        # meaningful assertion is the binding, not the object.
+        @test store.model.name == "nitro_session"
+        @test store.model.connect_key == key
         @test length(conn.sql) == 2
         @test any(q -> occursin("nitro_session", q), conn.sql)
         @test any(q -> occursin("nitro_session_expires_at_idx", q), conn.sql)
