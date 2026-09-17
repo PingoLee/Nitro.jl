@@ -81,3 +81,12 @@ const BENCH_PIPELINE = Nitro.Core.setupmiddleware(BENCH_CTX)
 
 run_bench_served(req::HTTP.Request) = BENCH_PIPELINE(req)
 run_bench_mw_served(req::HTTP.Request) = BENCH_MW_PIPELINE(req)
+
+# `use_cache == false`, `serve`-shaped: the pipeline is built once, but global middleware is
+# present, so nothing is cached and `buildmiddleware` — including the `custommiddleware`
+# destructure (#76) — runs on every request. This is `serve(middleware = [...])` and every
+# `revise=:lazy|:eager` session, which is to say the normal production configuration.
+const BENCH_MW_NOCACHE_PIPELINE =
+    Nitro.Core.setupmiddleware(BENCH_MW_CTX; middleware = BENCH_GLOBAL_MW)
+
+run_bench_mw_served_nocache(req::HTTP.Request) = BENCH_MW_NOCACHE_PIPELINE(req)

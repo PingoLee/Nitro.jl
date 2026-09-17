@@ -5,7 +5,8 @@ using HTTP
 using ..Util: join_url_path
 using ..AppContext: App
 using ..Types: Nullable, LifecycleMiddleware, CopyOnWriteDict, snapshot,
-                cache_if_current!, publish!, RouteResolution, ROUTE_RESOLUTION_KEY
+                cache_if_current!, publish!, RouteResolution, ROUTE_RESOLUTION_KEY,
+                RouteMiddleware, NO_ROUTE_MIDDLEWARE
 
 export router, compose, genkey, cachetag, process_middleware, HOFRouter, OuterRouter, InnerRouter
 
@@ -13,10 +14,11 @@ export router, compose, genkey, cachetag, process_middleware, HOFRouter, OuterRo
 # ever appends *from* it, never to it, so one instance is safe to share.
 #
 # The win is allocation, not inference: a fresh `[]` per sanitized slot cost a `Vector{Any}` on
-# every `buildmiddleware` call. (It does NOT make the destructure type-stable — the values come
-# out of a `Dict{String,Tuple}` whose `Tuple` is abstract, so both slots infer as `Any` either
-# way. That is #76's territory.) Measured: 224 -> 192 bytes with route middleware present,
-# 192 -> 128 without.
+# every `buildmiddleware` call. Measured: 224 -> 192 bytes with route middleware present,
+# 192 -> 128 without. (Inference was the *other* half of the same line, and it was fixed
+# separately in #76 by narrowing the table's value type — see `RouteMiddleware`, src/types.jl.
+# Until then both slots came out of a `Dict{String,Tuple}` and inferred as `Any` whatever this
+# constant did.)
 const EMPTY_LAYERS = Function[]
 
 # "This slot carries at least one middleware." Both registrars gate on this rather than on
@@ -236,10 +238,14 @@ cachetag(catch_errors::Bool, show_errors::Bool, serialize::Bool)::String =
 const CACHE_TAGS = ntuple(i -> cachetag(isodd((i - 1) >> 2), isodd((i - 1) >> 1), isodd(i - 1)), 8)
 
 """
-    publish_route_middleware!(ctx::App, key::String, value::Tuple) -> Tuple
+    publish_route_middleware!(ctx::App, key::String, value::RouteMiddleware) -> RouteMiddleware
 
 Register `value` — a `(router middleware, route middleware)` pair — as the middleware for route
 `key`, and invalidate any chain already cached for it.
+
+`value` is typed as [`RouteMiddleware`](@ref) rather than `Tuple` (#76), so a pair of the wrong
+arity is rejected *here*, at the one sanctioned write site, instead of surfacing as a
+`MethodError` inside `buildmiddleware`'s destructure on some later request.
 
 **Use this instead of writing `ctx.service.custommiddleware` directly.** Publishing alone is not
 enough: `middleware_cache` is first-writer-wins, so a chain composed before the registration
@@ -278,7 +284,7 @@ rests on — `delete!` must keep taking the lock even when the key is absent —
 Both halves are still needed. `delete!` handles the chain cached *before* registration; the
 identity check handles the chain built before but published after it.
 """
-function publish_route_middleware!(ctx::App, key::String, value::Tuple)
+function publish_route_middleware!(ctx::App, key::String, value::RouteMiddleware)
     publish!(ctx.service.custommiddleware, key, value)
     # Every settings variant, not just one (#79): the cache is keyed on route + pipeline
     # settings, so a route can hold up to `length(CACHE_TAGS)` chains and invalidation has to
@@ -315,8 +321,8 @@ end
 """
 This function is used to build up the middleware chain for all our endpoints
 """
-function buildmiddleware(key::String, handler::Function, globalmiddleware::Vector,
-                         custommiddleware::CopyOnWriteDict{Tuple}) :: Function
+function buildmiddleware(key::String, handler::Function, globalmiddleware::Vector{Function},
+                         custommiddleware::CopyOnWriteDict{RouteMiddleware}) :: Function
 
     # lookup the middleware for this path.
     #
@@ -330,7 +336,12 @@ function buildmiddleware(key::String, handler::Function, globalmiddleware::Vecto
     # Taking the wrapper rather than a pre-snapshotted `Dict` is the point: it leaves no
     # `snapshot(...)` expression at any call site for a future refactor to lift out of the
     # request path. See `CopyOnWriteDict` (src/types.jl) for why this read needs no lock.
-    routermiddleware, routemiddleware = get(snapshot(custommiddleware), key, (nothing, nothing))
+    # Both slots infer as `Union{Nothing, Vector{Function}}` here since #76; before it, the
+    # table's `Tuple` value type was abstract and this line inferred `Tuple{Any, Any}` —
+    # which is dispatch on every request whenever `use_cache` is false. `NO_ROUTE_MIDDLEWARE`
+    # is the miss-path default; a `(nothing, nothing)` literal infers the same today, and
+    # that constant's docstring says why it is still the one to use.
+    routermiddleware, routemiddleware = get(snapshot(custommiddleware), key, NO_ROUTE_MIDDLEWARE)
 
     # sanitize outputs (either value can be nothing)
     routermiddleware = isnothing(routermiddleware) ? EMPTY_LAYERS : routermiddleware
@@ -347,8 +358,8 @@ This function dynamically determines which middleware functions to apply to a re
 If router or route specific middleware is defined, then it's used instead of the globally defined
 middleware. 
 """
-function compose(router::HTTP.Router, globalmiddleware::Vector,
-                 custommiddleware::CopyOnWriteDict{Tuple},
+function compose(router::HTTP.Router, globalmiddleware::Vector{Function},
+                 custommiddleware::CopyOnWriteDict{RouteMiddleware},
                  middleware_cache::CopyOnWriteDict{Function};
                  catch_errors::Bool = true, show_errors::Bool = true, serialize::Bool = true)
     use_cache = isempty(globalmiddleware)
@@ -534,7 +545,13 @@ struct OuterRouter <: HOFRouter
     ctx::App
     prefix::String
     tags::Vector{String}
-    middleware::Nullable{Vector}
+    # PROCESSED middleware, not the user's raw list: `router()` passes this through
+    # `process_middleware`, whose two methods return exactly `Vector{Function}` or `nothing`.
+    # Declaring that (#76) is what lets `(inner::InnerRouter)` publish straight into a
+    # `CopyOnWriteDict{RouteMiddleware}` — the `router(...; middleware = ...)` KEYWORD stays
+    # `Nullable{Vector}`, because that one really is the user's list and may hold
+    # `LifecycleMiddleware` objects.
+    middleware::Nullable{Vector{Function}}
 end
 
 function (outer::OuterRouter)(
@@ -569,7 +586,7 @@ struct InnerRouter <: HOFRouter
     outer::OuterRouter
     path::Union{Nothing, String}
     tags::Vector{String}
-    middleware::Nullable{Vector}
+    middleware::Nullable{Vector{Function}}      # processed — see `OuterRouter.middleware`
 end
 
 function (inner::InnerRouter)(http_method::String)

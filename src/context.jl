@@ -6,7 +6,7 @@ using HTTP: Server, Router
 using ..Types
 # Unexported from `Types` on purpose: `CopyOnWriteDict` is internal plumbing for `compose`,
 # so it is named explicitly here rather than widened onto `Core`'s reexport surface.
-using ..Types: CopyOnWriteDict
+using ..Types: CopyOnWriteDict, RouteMiddleware
 using ..Constants: SHUTDOWN_TIMEOUT_SECONDS
 
 export App, EagerReviseService, Service, wait, close, isopen
@@ -26,7 +26,7 @@ end
 @kwdef struct Service
     server              :: Ref{Nullable{Server}}    = Ref{Nullable{Server}}(nothing)
     router              :: Router                   = Router()
-    custommiddleware    :: CopyOnWriteDict{Tuple}   = CopyOnWriteDict{Tuple}()
+    custommiddleware    :: CopyOnWriteDict{RouteMiddleware} = CopyOnWriteDict{RouteMiddleware}()
     named_routes        :: Dict{String, String}     = Dict{String, String}()
     middleware_cache    :: CopyOnWriteDict{Function} = CopyOnWriteDict{Function}()
     external_url        :: Ref{Nullable{String}}    = Ref{Nullable{String}}(nothing)

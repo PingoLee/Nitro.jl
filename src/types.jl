@@ -396,8 +396,8 @@ end
 #       chain. Written during cache warmup only, once per route, via `cache!`
 #       (FIRST-writer-wins): a cached chain must never change identity underneath a reader.
 #
-#   `custommiddleware :: CopyOnWriteDict{Tuple}` — route key → `(router middleware, route
-#       middleware)`. Written at route registration via `publish!` (LAST-writer-wins):
+#   `custommiddleware :: CopyOnWriteDict{RouteMiddleware}` — route key → `(router middleware,
+#       route middleware)`. Written at route registration via `publish!` (LAST-writer-wins):
 #       re-running `urlpatterns` for a path must install the new middleware. "Registration"
 #       is not necessarily startup-only: under `revise=:lazy`, `Revise.revise()` runs on a
 #       request-handling task (src/core/lifecycle.jl), so re-registration can land while OTHER request
@@ -1103,6 +1103,59 @@ RouteDefinition(pattern::String, handler::Function, methods::Vector{String}, nam
 
 RouteDefinition(path::String, method::String, handler::Function, middleware::Vector{Function}, name::Nullable{String}) =
     RouteDefinition(; pattern=path, handler, methods=[method], name, middleware, type_hints=Dict{Symbol, Type}())
+
+"""
+    RouteMiddleware
+
+One route's middleware, as `ctx.service.custommiddleware` stores it: `(router-level,
+route-level)`, each present or absent (#76).
+
+The field used to be declared `CopyOnWriteDict{Tuple}`. Unparameterized `Tuple` is **abstract**,
+so the backing `Dict`'s values were boxed and `buildmiddleware`'s destructure
+(src/routerhof.jl) inferred `Any` in both slots — followed by two `append!` calls on values of
+unknown type. That is not a once-per-route cost: whenever `use_cache == false` —
+`serve(middleware = [...])`, `internalrequest(...; middleware = [...])`, and every
+`revise=:lazy|:eager` session — `buildmiddleware` runs on **every request, forever** (#68). So
+this was steady-state dynamic dispatch on the hot path for the normal production configuration,
+which is what put it under the "no `Any` in the request hot path" rule rather than under
+cosmetics.
+
+Exactly two shapes are ever stored, from the only two write sites, and both go through
+`publish_route_middleware!`:
+
+  - `register_route` (src/routing.jl)      → `(nothing, route middleware)`
+  - `(inner::InnerRouter)` (src/routerhof.jl) → `(router middleware, route middleware)`
+
+Naming that type also **enforces the 2-arity**, which `Tuple` left entirely unchecked — a
+three-slot or one-slot write is now a conversion error at the publish site instead of a
+`MethodError` inside the destructure on some later request. That is a correctness property, and
+it is worth more here than the inference is.
+
+See [`NO_ROUTE_MIDDLEWARE`](@ref) for the lookup default.
+"""
+const RouteMiddleware = Tuple{Nullable{Vector{Function}}, Nullable{Vector{Function}}}
+
+"""
+    NO_ROUTE_MIDDLEWARE
+
+The `get` default for a route absent from `custommiddleware` — "no middleware of either kind".
+
+!!! note "#76's issue body is wrong about why this exists, and the correction is worth keeping"
+    It argues that `get(table, key, (nothing, nothing))` would infer a `Union`, because
+    `Tuple{Nothing,Nothing}` "is not a subtype of the pair type". **Julia's tuple types are
+    covariant**, so `Tuple{Nothing,Nothing} <: RouteMiddleware` is in fact true, and a bare
+    literal default infers exactly the same
+    `Tuple{Union{Nothing,Vector{Function}}, Union{Nothing,Vector{Function}}}` this constant
+    does. Measured, not argued. The narrowing's real win is the other end — before #76 the
+    same destructure inferred `Tuple{Any, Any}`.
+
+What the constant is still worth: it pins the miss path to whatever
+[`RouteMiddleware`](@ref) is *declared* to be, rather than to a literal that happens to be a
+subtype of today's declaration. Narrow the pair further later — say, to non-optional slots —
+and a `(nothing, nothing)` literal would quietly widen the lookup's inferred type back out
+while every test stayed green; this cannot, because it would stop constructing.
+"""
+const NO_ROUTE_MIDDLEWARE = RouteMiddleware((nothing, nothing))
 
 """
     ROUTE_RESOLUTION_KEY

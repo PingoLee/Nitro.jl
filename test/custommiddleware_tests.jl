@@ -2,7 +2,7 @@
 using Test
 using HTTP
 using Nitro
-using Nitro.Core.Types: snapshot
+using Nitro.Core.Types: snapshot, RouteMiddleware
 import Nitro: App, path, text
 
 # Regression test for #68 item 1. `ctx.service.custommiddleware` maps a route key to that
@@ -10,7 +10,8 @@ import Nitro: App, path, text
 # with a bare `setindex!` — no lock on either side — while `buildmiddleware`
 # (src/routerhof.jl) read it lock-free on the request path.
 #
-# It is now a `CopyOnWriteDict{Tuple}` written via `publish!`. The semantic that separates it
+# It is now a `CopyOnWriteDict{RouteMiddleware}` written via `publish!` (the value type was
+# narrowed from an abstract `Tuple` in #76). The semantic that separates it
 # from `middleware_cache` is LAST-writer-wins: re-running `urlpatterns` for a path must
 # install the NEW middleware, whereas a cached chain must never change identity. A port that
 # reached for `cache!` here passes every other test in the suite and fails this one.
@@ -74,7 +75,7 @@ end
 
 @testset "an unsynchronized publish is unwritable" begin
     ctx = App()
-    @test_throws ConcurrencyViolationError ctx.service.custommiddleware.entries = Dict{String, Tuple}()
+    @test_throws ConcurrencyViolationError ctx.service.custommiddleware.entries = Dict{String, RouteMiddleware}()
 end
 end
 
@@ -169,7 +170,7 @@ end
 
 @testitem "Custom middleware table — lock-free readers under a concurrent publisher" tags=[:core, :middleware] setup=[NitroCommon] begin
 using Test
-using Nitro.Core.Types: CopyOnWriteDict, snapshot, publish!
+using Nitro.Core.Types: CopyOnWriteDict, snapshot, publish!, RouteMiddleware
 
 # The #68 race itself, at the container level.
 #
@@ -197,7 +198,7 @@ val(tag) = (nothing, Function[mkf(tag)])
 if Threads.nthreads() > 1
     bad = Threads.Atomic{Int}(0)
     for _ in 1:10
-        d = CopyOnWriteDict{Tuple}()
+        d = CopyOnWriteDict{RouteMiddleware}()
         for i in 1:8
             publish!(d, "GET|/seed$i", val("seed$i"))
         end
@@ -250,7 +251,7 @@ if Threads.nthreads() > 1
 else
     # `-t 1`: no parallelism to be had. Assert the same invariants sequentially so the item
     # is never vacuously green (cf. test/parallel_tests.jl's both-branches shape).
-    d = CopyOnWriteDict{Tuple}()
+    d = CopyOnWriteDict{RouteMiddleware}()
     for i in 1:8
         publish!(d, "GET|/seed$i", val("seed$i"))
     end
@@ -865,5 +866,106 @@ end
     mismatch = HTTP.Request("POST", "/only")
     @test Nitro.Core.internalrequest(ctx, mismatch; catch_errors = false).status == 405
     @test !haskey(mismatch.context, ROUTE_RESOLUTION_KEY)
+end
+end
+
+
+@testitem "Custom middleware table — the value type is a concrete pair (#76)" tags=[:core, :middleware] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+using Nitro.Core.Types: CopyOnWriteDict, snapshot, publish!, RouteMiddleware, NO_ROUTE_MIDDLEWARE
+using Nitro.Core.RouterHOF: publish_route_middleware!, buildmiddleware, genkey, router
+import Nitro: App, path, text
+
+# #76: the field was `CopyOnWriteDict{Tuple}`. Unparameterized `Tuple` is abstract, so
+# `buildmiddleware`'s destructure (src/routerhof.jl) inferred `Any` in both slots — and that
+# runs on EVERY request whenever `use_cache == false` (`serve(middleware=[...])`, every
+# `revise=:lazy|:eager` session), not once per route.
+
+@testset "the Service field and its snapshot carry the narrowed type" begin
+    ctx = App()
+    @test ctx.service.custommiddleware isa CopyOnWriteDict{RouteMiddleware}
+    @test valtype(snapshot(ctx.service.custommiddleware)) === RouteMiddleware
+end
+
+@testset "the lookup infers the optional pair, where it used to infer Any" begin
+    # The assertion the issue is actually about — and it is asserted against BOTH shapes, so
+    # it records the size of the change rather than just the end state. The pre-#76 line is
+    # the one that would go green again if the field were ever widened back.
+    probe(d, key::String) = get(snapshot(d), key, NO_ROUTE_MIDDLEWARE)
+    slots(d, key::String) = (probe(d, key)[1], probe(d, key)[2])
+    OPTIONAL = Union{Nothing, Vector{Function}}
+
+    @test Base.infer_return_type(probe, (CopyOnWriteDict{RouteMiddleware}, String)) ===
+          Tuple{OPTIONAL, OPTIONAL}
+    @test Base.infer_return_type(slots, (CopyOnWriteDict{RouteMiddleware}, String)) ===
+          Tuple{OPTIONAL, OPTIONAL}
+
+    # Pre-#76: abstract `Tuple` value type, so the destructure handed `buildmiddleware` two
+    # values of static type `Any` — and that runs per request whenever `use_cache` is false.
+    @test Base.infer_return_type(probe, (CopyOnWriteDict{Tuple}, String)) === Tuple
+    @test Base.infer_return_type(slots, (CopyOnWriteDict{Tuple}, String)) === Tuple{Any, Any}
+
+    # NOT asserted, because it is false and #76's issue body says otherwise: that a
+    # `(nothing, nothing)` literal default would infer a `Union` here. Julia's tuple types are
+    # covariant, so `Tuple{Nothing,Nothing} <: RouteMiddleware` and the literal infers exactly
+    # the same thing. `NO_ROUTE_MIDDLEWARE` earns its place for a different reason — see its
+    # docstring — and this line is the receipt for that correction.
+    lit(d, key::String) = get(snapshot(d), key, (nothing, nothing))
+    @test Base.infer_return_type(lit, (CopyOnWriteDict{RouteMiddleware}, String)) ===
+          Base.infer_return_type(probe, (CopyOnWriteDict{RouteMiddleware}, String))
+end
+
+@testset "both real write sites produce a value of that type" begin
+    mw = handler -> (req::HTTP.Request -> handler(req))
+
+    # Declarative: `register_route` stores `(nothing, processed)`.
+    ctx = App()
+    Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+        path("/d", (req::HTTP.Request) -> Res.send("d"), middleware = [mw]),
+    ])
+    @test snapshot(ctx.service.custommiddleware)[genkey("GET", "/d")] isa RouteMiddleware
+
+    # HOF: `(inner::InnerRouter)` stores `(outer.middleware, inner.middleware)`. Both halves
+    # are `Nullable{Vector{Function}}` FIELDS now, which is what lets this land in the
+    # narrowed table without a conversion at the publish site.
+    hctx = App()
+    outer = router(hctx, "/h"; middleware = [mw])
+    inner = outer("/x"; middleware = [mw])
+    inner("GET")
+    @test snapshot(hctx.service.custommiddleware)[genkey("GET", "/h/x")] isa RouteMiddleware
+    @test fieldtype(Nitro.Core.RouterHOF.OuterRouter, :middleware) === Union{Nothing, Vector{Function}}
+    @test fieldtype(Nitro.Core.RouterHOF.InnerRouter, :middleware) === Union{Nothing, Vector{Function}}
+end
+
+@testset "a wrong-arity or wrong-element pair is rejected at the publish site" begin
+    # The correctness half of the narrowing, and the reason it is worth landing regardless of
+    # what the benchmark says: `Tuple` left the 2-arity completely unchecked, so a bad write
+    # surfaced as a `MethodError` inside `buildmiddleware`'s destructure on some later
+    # request — far from the registration that caused it.
+    ctx = App()
+    @test_throws MethodError publish_route_middleware!(
+        ctx, "GET|/bad", (nothing, Function[], Function[]))
+    @test_throws MethodError publish_route_middleware!(ctx, "GET|/bad", (nothing,))
+    @test_throws MethodError publish_route_middleware!(ctx, "GET|/bad", ("not middleware", nothing))
+    # Nothing was published by any of the three.
+    @test isempty(snapshot(ctx.service.custommiddleware))
+end
+
+@testset "behavior is unchanged: both slots still compose, in the same order" begin
+    ctx = App()
+    order = Int[]
+    mk(i) = handler -> (req::HTTP.Request -> (push!(order, i); handler(req)))
+    outer = router(ctx, "/h"; middleware = [mk(1)])
+    inner = outer("/x"; middleware = [mk(2)])
+    route = inner("GET")
+    Nitro.Core.register(ctx, "GET", route, (req::HTTP.Request) -> Res.send("ok"))
+
+    r = Nitro.Core.internalrequest(ctx, HTTP.Request("GET", "/h/x"); catch_errors = false)
+    @test text(r) == "ok"
+    # Router-level outside route-level — `buildmiddleware` appends route first, so it lands
+    # innermost after the fold.
+    @test order == [1, 2]
 end
 end

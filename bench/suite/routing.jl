@@ -48,3 +48,8 @@ SUITE["routing"]["mw_served"] = @benchmarkable run_bench_mw_served(req) setup=(
 
 SUITE["routing"]["mw_served_param"] = @benchmarkable run_bench_mw_served(req) setup=(
     req = bench_request("GET", "/bench/mw/items/42")) evals=1
+
+# `use_cache == false`, pipeline built once: `buildmiddleware` and its `custommiddleware`
+# destructure run per request here, which is the only place #76 is observable.
+SUITE["routing"]["mw_served_nocache"] = @benchmarkable run_bench_mw_served_nocache(req) setup=(
+    req = bench_request("GET", "/bench/mw/items/42")) evals=1

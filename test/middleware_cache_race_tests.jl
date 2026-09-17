@@ -1,6 +1,7 @@
 @testitem "cache_if_current! — refuses a chain built from a superseded table" tags=[:core, :middleware] setup=[NitroCommon] begin
 using Test
-using Nitro.Core.Types: CopyOnWriteDict, snapshot, cache!, cache_if_current!, publish!, delete!
+using Nitro.Core.Types: CopyOnWriteDict, snapshot, cache!, cache_if_current!, publish!, delete!,
+                        RouteMiddleware
 
 # Unit half of #81. `middleware_cache` is first-writer-wins, so a chain published from a
 # `custommiddleware` snapshot that route registration has since replaced is not merely stale —
@@ -20,7 +21,7 @@ using Nitro.Core.Types: CopyOnWriteDict, snapshot, cache!, cache_if_current!, pu
 mkf(tag) = (req -> tag)
 
 @testset "unchanged source publishes" begin
-    src   = CopyOnWriteDict{Tuple}();    publish!(src, "GET|/a", (nothing, Function[]))
+    src   = CopyOnWriteDict{RouteMiddleware}(); publish!(src, "GET|/a", (nothing, Function[]))
     cache = CopyOnWriteDict{Function}()
     snap  = snapshot(src)
     @test cache_if_current!(cache, "GET|/a", mkf("fresh"), src, snap)
@@ -28,7 +29,7 @@ mkf(tag) = (req -> tag)
 end
 
 @testset "source moved between snapshot and publish — refuses" begin
-    src   = CopyOnWriteDict{Tuple}();    publish!(src, "GET|/a", (nothing, Function[]))
+    src   = CopyOnWriteDict{RouteMiddleware}(); publish!(src, "GET|/a", (nothing, Function[]))
     cache = CopyOnWriteDict{Function}()
     snap  = snapshot(src)                       # what the chain would have been built from
 
@@ -46,7 +47,7 @@ end
 @testset "a delete! elsewhere in the source also counts as movement" begin
     # Conservative on purpose: any write to the source invalidates the stamp, not just a write
     # to this key. Refusing to cache is always safe; caching something stale never is.
-    src   = CopyOnWriteDict{Tuple}()
+    src   = CopyOnWriteDict{RouteMiddleware}()
     publish!(src, "GET|/a", (nothing, Function[]))
     publish!(src, "GET|/b", (nothing, Function[]))
     cache = CopyOnWriteDict{Function}()
@@ -56,7 +57,7 @@ end
 end
 
 @testset "first-writer-wins is preserved" begin
-    src   = CopyOnWriteDict{Tuple}();    publish!(src, "GET|/a", (nothing, Function[]))
+    src   = CopyOnWriteDict{RouteMiddleware}(); publish!(src, "GET|/a", (nothing, Function[]))
     cache = CopyOnWriteDict{Function}()
     snap  = snapshot(src)
     @test cache_if_current!(cache, "GET|/a", mkf("first"), src, snap)

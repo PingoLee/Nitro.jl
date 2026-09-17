@@ -1,22 +1,26 @@
 @testitem "Copy-on-write dict — parametric container at both instantiations" tags=[:core, :middleware] setup=[NitroCommon] begin
 using Test
-using Nitro.Core.Types: CopyOnWriteDict, snapshot, cache!, publish!
+using Nitro.Core.Types: CopyOnWriteDict, snapshot, cache!, publish!, RouteMiddleware
 
 # #68 generalized `MiddlewareCache` into `CopyOnWriteDict{V}`, serving two `Service` fields
 # with deliberately different write semantics:
-#   `middleware_cache :: CopyOnWriteDict{Function}` — `cache!`, FIRST-writer-wins
-#   `custommiddleware :: CopyOnWriteDict{Tuple}`    — `publish!`, LAST-writer-wins
+#   `middleware_cache :: CopyOnWriteDict{Function}`        — `cache!`, FIRST-writer-wins
+#   `custommiddleware :: CopyOnWriteDict{RouteMiddleware}` — `publish!`, LAST-writer-wins
 # These assertions pin the container itself. The per-field behavior lives in the item below
 # and in test/custommiddleware_tests.jl.
+#
+# The second V is spelled `RouteMiddleware` rather than the bare `Tuple` it was before #76
+# on purpose: "both instantiations" in the title means the two `Service` fields, so testing a
+# V that nothing instantiates any more would quietly stop backing that claim.
 
 probe(d) = snapshot(d)                     # a call boundary, so @inferred/@allocated mean something
 mkf(tag) = (req -> tag)
 
 @testset "snapshot is type-stable and allocation-free at both V" begin
     cf = CopyOnWriteDict{Function}(); cache!(cf, "k", mkf("f"))
-    ct = CopyOnWriteDict{Tuple}();    publish!(ct, "k", (nothing, Function[]))
+    ct = CopyOnWriteDict{RouteMiddleware}(); publish!(ct, "k", (nothing, Function[]))
     @test @inferred(probe(cf)) isa Dict{String, Function}
-    @test @inferred(probe(ct)) isa Dict{String, Tuple}
+    @test @inferred(probe(ct)) isa Dict{String, RouteMiddleware}
     probe(cf); probe(ct)                   # warm up before measuring
     # The reader fast path is on every request; if this ever regresses we want to hear it.
     @test (@allocated probe(cf)) == 0
@@ -27,9 +31,10 @@ end
     # Documents the field type after a clear; it does NOT guard a port hazard, and an
     # earlier draft of this comment wrongly claimed it did. Because `entries` is declared
     # `@atomic entries :: Dict{String, V}`, `setfield!` *converts* — so even a `Base.empty!`
-    # body that hard-coded `Dict{String,Function}()` would still yield a `Dict{String,Tuple}`
-    # on a `CopyOnWriteDict{Tuple}`. Verified by mutation: that revert leaves this green.
-    @test typeof(snapshot(empty!(CopyOnWriteDict{Tuple}())))    === Dict{String, Tuple}
+    # body that hard-coded `Dict{String,Function}()` would still yield a
+    # `Dict{String,RouteMiddleware}` on a `CopyOnWriteDict{RouteMiddleware}`. Verified by
+    # mutation: that revert leaves this green.
+    @test typeof(snapshot(empty!(CopyOnWriteDict{RouteMiddleware}()))) === Dict{String, RouteMiddleware}
     @test typeof(snapshot(empty!(CopyOnWriteDict{Function}()))) === Dict{String, Function}
 end
 
@@ -37,7 +42,7 @@ end
     # Asserted at BOTH V, so the verb pair is proven generic rather than accidentally
     # correct only for `Function`.
     for (V, v1, v2) in ((Function, mkf("a"), mkf("b")),
-                        (Tuple, (nothing, Function[]), (Function[], nothing)))
+                        (RouteMiddleware, (nothing, Function[]), (Function[], nothing)))
         p = CopyOnWriteDict{V}()
         publish!(p, "k", v1); publish!(p, "k", v2)
         @test snapshot(p)["k"] === v2                  # LWW: overwritten
@@ -52,7 +57,7 @@ end
 @testset "publish! never mutates a held snapshot" begin
     # The LWW analogue of the cache's invariant, and the property that makes the race
     # impossible for `custommiddleware`.
-    d = CopyOnWriteDict{Tuple}()
+    d = CopyOnWriteDict{RouteMiddleware}()
     v1, v2 = (nothing, Function[]), (Function[], nothing)
     publish!(d, "k", v1)
     reader = snapshot(d)
@@ -62,9 +67,9 @@ end
     @test snapshot(d)["k"] === v2
 end
 
-@testset "an unsynchronized publish is unwritable at V = Tuple" begin
-    d = CopyOnWriteDict{Tuple}()
-    @test_throws ConcurrencyViolationError d.entries = Dict{String, Tuple}()
+@testset "an unsynchronized publish is unwritable at V = RouteMiddleware" begin
+    d = CopyOnWriteDict{RouteMiddleware}()
+    @test_throws ConcurrencyViolationError d.entries = Dict{String, RouteMiddleware}()
 end
 
 @testset "cache! tolerates a nothing value" begin
