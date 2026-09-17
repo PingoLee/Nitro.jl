@@ -420,6 +420,31 @@ end
     end
 end
 
+@testset "Rate limiter: an unknown strategy names the valid ones" begin
+    # `strategy` was the last unvalidated keyword on the constructor: with no fallback method,
+    # a typo produced a raw `MethodError` naming the internal `dispatch_rate_limiter`, which
+    # says nothing about which argument is wrong or what it accepts (#187).
+    err = try RateLimiter(strategy=:slidingwindow, rate_limit=100); nothing catch e; e end
+    @test err isa ArgumentError
+    @test occursin("slidingwindow", err.msg)      # the value the caller actually passed
+    @test occursin(":fixed_window", err.msg)      # ...and both valid values, so the fix is in the message
+    @test occursin(":sliding_window", err.msg)
+    @test !occursin("dispatch_rate_limiter", err.msg)   # no internal in a user-facing error
+
+    # The fallback is `::Val{S} where {S}`, so it must stay strictly less specific than the two
+    # concrete methods — if it ever shadows them, both lines below throw instead of returning.
+    #
+    # Asserting on the HOOKS rather than on `!== nothing` is what makes these pin strategy
+    # SELECTION too. Both strategies return the same type on purpose (#172), so the type says
+    # nothing about which one you got; the background task does. `FixedRateLimiter` owns a
+    # cleanup sweep and sets both hooks, `SlidingRateLimiter` prunes inline and leaves both
+    # `nothing` — so swapping the two method bodies above goes red here rather than silently
+    # handing every caller the other algorithm.
+    @test RateLimiter(strategy=:fixed_window).on_startup    !== nothing
+    @test RateLimiter(strategy=:sliding_window).on_startup  === nothing
+    @test RateLimiter(strategy=:sliding_window).on_shutdown === nothing
+end
+
 @testset "Rate limiter: trust configuration is validated at construction, not at serve" begin
     for strategy in (:fixed_window, :sliding_window)
         # Each of these previously constructed a limiter and only threw later, when `serve`

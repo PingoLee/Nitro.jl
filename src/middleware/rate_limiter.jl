@@ -76,6 +76,26 @@ end
 dispatch_rate_limiter(::Val{:fixed_window}; kwargs...) = FixedRateLimiter(;kwargs...)
 dispatch_rate_limiter(::Val{:sliding_window}; kwargs...) = SlidingRateLimiter(;kwargs...)
 
+# `strategy` was the last value this constructor READ without validating. With no fallback here,
+# `strategy=:slidingwindow` produced a raw `MethodError` naming `dispatch_rate_limiter` -- an
+# internal the caller has never heard of, cannot find in the docs, and which says nothing about
+# `strategy` being the wrong argument or what the valid values are. Same reasoning as
+# `reject_key!` below, applied to a value instead of a key: name the fix, not the mechanism.
+# Every misconfiguration this constructor INSPECTS now throws an `ArgumentError` that names it --
+# `trust_forwarded`, the `auto_extract_ip`/`forwarded_header`/`trusted_proxies` combination, the
+# numeric bounds, and now `strategy` (#187).
+#
+# Not every misconfiguration, and deliberately so: neither strategy takes a catch-all `kwargs...`,
+# so a keyword that does not exist on the chosen one -- `max_clients` under `:fixed_window`, say,
+# or a plain typo -- still surfaces as Julia's keyword `MethodError`. That one at least names the
+# offending keyword; this one named nothing the caller could act on.
+#
+# `::Val{S} where {S}`, not a bare `::Val`, so this is strictly less specific than the two methods
+# above and can never shadow them.
+dispatch_rate_limiter(::Val{S}; kwargs...) where {S} = throw(ArgumentError(
+    "RateLimiter: unknown strategy $(repr(S)). Valid strategies are :fixed_window (default) " *
+    "and :sliding_window."))
+
 """
 Updates the key name inside a dictionary
 """
