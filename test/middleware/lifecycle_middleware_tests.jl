@@ -511,6 +511,11 @@ end
 # "route-owned hooks survive a serve/terminate cycle" item above, which drives the real
 # `serve`/`terminate` — and it is tagged `:network`, so a run filtered away from `:network`
 # does not check the teardown order at all.
+#
+# The promotion testset further down has the same scope: it pins the SPLIT that promotion leaves
+# behind — which half each object ends up in AND its position within that half, and therefore
+# what order the two broadcasts visit them in — and likewise supplies its own `Iterators.reverse`
+# rather than pinning `terminate`'s.
 @testset "the container preserves registration order" begin
     order, mk = recorder()
     a, b, c = mk("a"), mk("b"), mk("c")
@@ -538,6 +543,77 @@ end
         order
     end
     @test runs[1] == runs[2]
+end
+
+@testset "a promoted entry tears down out of LIFO in its own cycle, and the next one is settled" begin
+    # #188. `register_route_lifecycle!` PROMOTES: an object handed both to `serve(middleware=…)`
+    # and to a route is moved out of the serve-owned half and APPENDED to the route-owned half.
+    # `terminate` unwinds serve-owned first and route-owned second, so in that one cycle the
+    # promoted object is torn down after every serve-owned entry — including ones that started
+    # BEFORE it, which LIFO required to be torn down after it.
+    #
+    # Until now the only assertion about promotion was `lf ∉ ctx.service.serve_lifecycle`, i.e.
+    # membership. Nothing pinned the ORDER, which is how `routerhof.jl`'s "Promotion is not
+    # order-preserving" note described the exception BACKWARDS from #82 until 5086684 — and how
+    # that wrong sentence got copied into the public `LifecycleMiddleware` docstring in PR #184
+    # before the delta review caught it. A wrong ordering claim survived two releases and became
+    # a published contract because no test disagreed with it.
+    #
+    # This block MIRRORS three pieces of policy that live in `src/core/lifecycle.jl`, with
+    # nothing linking them but this comment: `startserver`'s route-then-serve startup
+    # (lines 359-361), `terminate`'s reverse-serve-then-reverse-route teardown (lines 322-324),
+    # and `terminate` clearing ONLY the serve half (line 335). Change any of those and update
+    # this too — the `:network` item above is what actually pins them, and it has no promoted
+    # object in it.
+    order, mk = recorder()
+    a, rl, b, c = mk("a"), mk("rl"), mk("b"), mk("c")
+    ctx = App()
+
+    # ── Cycle 1: promotion happens mid-cycle ──────────────────────────────────────────────
+    # `c` is route-owned from the start, so the route half is NOT empty when the promotion
+    # lands. That is what makes the append position below an assertion rather than a claim:
+    # with one entry, `push!` and `pushfirst!` are indistinguishable.
+    register_route_lifecycle!(ctx, Any[c])
+    # `a`, `rl` and `b` arrive via `serve(middleware=…)`, then a route claims `rl`. That is the
+    # runtime `include_routes` / `revise=:lazy` shape — route registration FOLLOWING serve —
+    # which is the case the promoting guard exists for.
+    register_serve_lifecycle!(ctx, Any[a, rl, b])
+    route_lf, serve_lf = lifecycle_snapshot(ctx)
+    startup.(route_lf); startup.(serve_lf)        # `startserver`'s order: route-owned, then serve-owned
+    @test order == ["up:c", "up:a", "up:rl", "up:b"]
+
+    register_route_lifecycle!(ctx, Any[rl])       # PROMOTION
+    route_lf, serve_lf = lifecycle_snapshot(ctx)
+    @test serve_lf == [a, b]                      # `rl` removed from here, in place
+    @test route_lf == [c, rl]                     # ...and APPENDED here, behind `c` — not prepended
+
+    empty!(order)
+    shutdown.(Iterators.reverse(serve_lf))        # `terminate`'s order, exactly
+    shutdown.(Iterators.reverse(route_lf))
+
+    # This is NOT LIFO, and that is accepted rather than a bug. Startup was `c, a, rl, b`, so
+    # LIFO would be `b, rl, a, c`. `rl` moved to the route half, which tears down LAST, so `a`
+    # — which started BEFORE `rl` — is now torn down before it. `b`, which started after it, is
+    # unaffected. Route ownership winning and the promoted object keeping its old serve-phase
+    # position are mutually exclusive, which is why the ordering contract is stated per cycle
+    # (`register_route_lifecycle!`, src/routerhof.jl).
+    @test order == ["down:b", "down:a", "down:rl", "down:c"]
+
+    # ── Cycle 2: settled, and exact LIFO again ────────────────────────────────────────────
+    # `terminate` clears ONLY the serve-owned half (#82), so the split no longer moves: `rl`
+    # stays route-owned across the restart and nothing is promoted again.
+    lock(() -> empty!(ctx.service.serve_lifecycle), ctx.service.lifecycle_lock)
+    register_serve_lifecycle!(ctx, Any[a, b])     # what the next `serve(middleware=…)` does
+    route_lf, serve_lf = lifecycle_snapshot(ctx)
+
+    empty!(order)
+    startup.(route_lf); startup.(serve_lf)
+    @test order == ["up:c", "up:rl", "up:a", "up:b"]   # route-owned first now — `c`, then `rl`
+
+    empty!(order)
+    shutdown.(Iterators.reverse(serve_lf))
+    shutdown.(Iterators.reverse(route_lf))
+    @test order == ["down:b", "down:a", "down:rl", "down:c"]   # the exact reverse of startup
 end
 
 @testset "dedup survives the container change" begin
