@@ -69,33 +69,73 @@ end
 # ============================================================================
 
 """
-PormG model for the `nitro_session` table.
+    _bind_model!(model, db_key) -> model
+
+Bind one of Nitro's infrastructure models (`nitro_session`, `nitro_task`) to a PormG
+connection key, by assigning `connect_key` directly.
+
+**Why not `set_models`.** That is PormG's documented binder, but it does far more than bind:
+it writes the `REGISTERED_MODULES` global, `Core.eval`s a `const __pormg_init_path__` into
+the calling module, may implicitly `Configuration.load(path)`, and wires reverse accessors
+onto *other* models. None of that is wanted for two tables that
+`register_ignore_tables!` deliberately keeps out of migrations. `set_models` itself binds by
+doing exactly this assignment (`PormG/src/Models.jl`), and PormG's own `src/precompile.jl`
+binds the same way, so this is the narrow half of a supported operation rather than a
+workaround. It is migration-neutral: `makemigrations` reads `models.jl` from disk and never
+consults `REGISTERED_MODULES`.
+
+**Why bind at all, when `.db(key)` already routes the query.** PormG's
+`ensure_model_transaction_scope` gates on the **model's** `connect_key` and never consults
+the query's `.db()` override. Unbound, it throws `InvalidConfigurationError` for *every*
+query issued while any transaction is open on the calling task — swallowed on the read paths
+and rethrown on the writes, which is #202.
+
+**Why the model is per store and never a process-wide singleton.** `connect_key` names
+exactly one connection. Two stores on different keys sharing one model object would
+overwrite each other's binding, and the loser would then throw `TransactionError` instead of
+being fixed. Building a model is a handful of allocations and happens about twice per
+application, so there is nothing to cache and no shared mutable state to lock.
+
+The caller must pass the key the store will query on — `_session_objects`/`_task_objects`
+derive the query's `.db(...)` from the same `store.db_key` field, so the two cannot diverge.
+That matters: a model bound to `A` queried with `.db(B)` inside `run_in_transaction(A)`
+*passes* the guard and then silently runs outside the transaction on B's pool, and PormG has
+no guard for that direction.
+"""
+function _bind_model!(model, db_key::String)
+    model.connect_key = db_key
+    return model
+end
+
+"""
+PormG model for the `nitro_session` table, bound to `db_key`.
 
 Columns:
 - `session_key`  — VARCHAR(40), primary key (the session ID)
 - `session_data` — TEXT (JSON-serialized session payload)
 - `expires_at`   — TIMESTAMPTZ, indexed for efficient cleanup
 """
-function _define_session_model()
+function _define_session_model(db_key::String)
     if isdefined(PormG, :Models)
-        return PormG.Models.Model("nitro_session",
+        m = PormG.Models.Model("nitro_session",
             session_key  = PormG.Models.CharField(max_length=40, primary_key=true),
             session_data = PormG.Models.TextField(default="{}"),
             expires_at   = PormG.Models.DateTimeField(db_index=true),
         )
+        _bind_model!(m, db_key)
+        return m
     end
     return nothing
 end
 
-# Lazily initialised after __init__
-const _SESSION_MODEL = Ref{Any}(nothing)
+"""
+    session_model(db_key="db")
 
-function session_model()
-    if isnothing(_SESSION_MODEL[])
-        _SESSION_MODEL[] = _define_session_model()
-    end
-    return _SESSION_MODEL[]
-end
+A `nitro_session` model bound to `db_key`. One model per store, never a process-wide
+singleton: `connect_key` names exactly one connection, so a shared model cannot serve two
+stores on different keys — see [`_bind_model!`](@ref).
+"""
+session_model(db_key::String="db") = _define_session_model(db_key)
 
 # ============================================================================
 # SECTION 3: PormGSessionStore
@@ -139,7 +179,10 @@ struct PormGSessionStore <: AbstractSessionStore{String, Dict{String,Any}}
 end
 
 function PormGSessionStore(; model=nothing, db_key::String="db")
-    m = isnothing(model) ? session_model() : model
+    # A SUPPLIED model is used exactly as given -- the caller owns its `connect_key`, and
+    # the test doubles that pass one here are immutable structs that could not take the
+    # assignment anyway. Only a model this constructor builds gets bound (#202).
+    m = isnothing(model) ? session_model(db_key) : model
     if isnothing(m)
         error("PormGSessionStore requires PormG.Models to be available. Ensure PormG is properly loaded.")
     end
@@ -148,17 +191,19 @@ end
 
 # Route every session query to the store's configured connection, exactly as `_task_objects`
 # does for the worker store. Without this the query falls back to the model's own
-# `connect_key` -- which is `nothing`, because `_define_session_model()` never goes through
-# `set_models` -- and PormG then either uses the sole loaded connection or throws
-# `InvalidConfigurationError` when several are loaded. Both outcomes ignore `db_key`, and the
-# throw is swallowed by the read paths below, so sessions silently stop persisting (#199).
+# `connect_key`, and before #199 that was `nothing` -- PormG then either used the sole loaded
+# connection or threw `InvalidConfigurationError` when several were loaded. Both outcomes
+# ignored `db_key`, and the throw is swallowed by the read paths below, so sessions silently
+# stopped persisting (#199).
 #
-# This routes the QUERY, not the model. PormG's `ensure_model_transaction_scope` gates on
-# `model.connect_key` rather than on the key set here, so a session query issued while a PormG
-# transaction is active on the calling task still raises -- swallowed on the read paths and
-# propagated on the write paths, exactly as above -- and `db_key` cannot help, because the
-# model is unbound either way. `PormGWorkerStore` has the identical gap; binding both models
-# through `set_models` is the fix, and it is a larger change than #199 -- tracked as #202.
+# Since #202 the model carries `connect_key == store.db_key` too, so this call is redundant
+# for ROUTING and is kept anyway, for two reasons. It is the only thing the mock in
+# `test/extensions/pormg_worker_tests.jl` can pin (#203). And PormG reads the two keys from
+# different places -- `ensure_model_transaction_scope` reads the model's, `get_settings` reads
+# the query's -- so a model bound to A queried with `.db(B)` inside `run_in_transaction(A)`
+# passes the guard and then silently runs OUTSIDE the transaction on B's pool, with no guard
+# for that direction. Deriving both from the single `store.db_key` field is what makes that
+# divergence unrepresentable.
 _session_objects(store::PormGSessionStore) = store.model.objects.db(store.db_key)
 
 # -- Serialization helpers --
@@ -310,7 +355,7 @@ end
 # is also what `?pormg_nitro_session` resolves to. Two docstrings on one function render as two
 # conflicting help entries and drift apart independently (#33).
 function pormg_nitro_session(; db_key::String="db")
-    model = session_model()
+    model = session_model(db_key)
     if isnothing(model)
         error("pormg_nitro_session: PormG.Models is not available. Ensure PormG is properly loaded.")
     end
@@ -350,9 +395,9 @@ Columns:
 - `watchers`     — TEXT (JSON-serialized list of watchers)
 - `queue_name`   — VARCHAR(100)
 """
-function _define_task_model()
+function _define_task_model(db_key::String)
     if isdefined(PormG, :Models)
-        return PormG.Models.Model("nitro_task",
+        m = PormG.Models.Model("nitro_task",
             id           = PormG.Models.CharField(max_length=255, primary_key=true),
             run_id       = PormG.Models.CharField(max_length=36, default=""),
             status       = PormG.Models.CharField(max_length=20),
@@ -365,28 +410,36 @@ function _define_task_model()
             watchers     = PormG.Models.TextField(default="[]"),
             queue_name   = PormG.Models.CharField(max_length=100),
         )
+        _bind_model!(m, db_key)
+        return m
     end
     return nothing
 end
 
-# Lazily initialised after __init__
-const _TASK_MODEL = Ref{Any}(nothing)
+"""
+    task_model(db_key="db")
 
-function task_model()
-    if isnothing(_TASK_MODEL[])
-        _TASK_MODEL[] = _define_task_model()
-    end
-    return _TASK_MODEL[]
-end
+A `nitro_task` model bound to `db_key`. One model per store, never a process-wide
+singleton — see [`_bind_model!`](@ref).
+"""
+task_model(db_key::String="db") = _define_task_model(db_key)
 
 # ============================================================================
 # SECTION 7: PormGWorkerStore
 # ============================================================================
 
 """
-    PormGWorkerStore(; model=nothing)
+    PormGWorkerStore(; model=nothing, db_key="db")
 
 A PormG-backed worker store that implements Nitro's `AbstractWorkerStore`.
+
+`db_key` is the PormG connection key **every** task query runs on — read, write, transition,
+delete and retention sweep alike — and it must name the connection whose `nitro_task` table
+you bootstrapped. Prefer `pormg_nitro_worker(db_key=...)`, which creates the table and
+returns a store pointed at the same connection.
+
+A `model` passed explicitly is used as given, including its `connect_key`; omit it and the
+store builds one bound to `db_key` (see [`_bind_model!`](@ref)).
 """
 struct PormGWorkerStore <: AbstractWorkerStore
     model::Any
@@ -398,7 +451,8 @@ struct PormGWorkerStore <: AbstractWorkerStore
 end
 
 function PormGWorkerStore(; model=nothing, db_key::String="db")
-    m = isnothing(model) ? task_model() : model
+    # A supplied model is used as given -- see the note in `PormGSessionStore` (#202).
+    m = isnothing(model) ? task_model(db_key) : model
     if isnothing(m)
         error("PormGWorkerStore requires PormG.Models to be available. Ensure PormG is properly loaded.")
     end
@@ -412,10 +466,11 @@ function PormGWorkerStore(; model=nothing, db_key::String="db")
     )
 end
 
-# Route every task query to the store's configured connection. PormG's query
-# manager always supports `.db(key)`, so we call it directly rather than
-# silently falling back to the model's default connection (which would write
-# tasks to the wrong database).
+# Route every task query to the store's configured connection. PormG's query manager always
+# supports `.db(key)`, so we call it directly rather than silently falling back to the model's
+# default connection (which would write tasks to the wrong database). Since #202 the model is
+# bound to the same key, and the reasoning for keeping both -- one field, two readers -- is on
+# `_session_objects` above.
 _task_objects(store::PormGWorkerStore) = store.model.objects.db(store.db_key)
 
 # -- Serialization Helpers --
@@ -885,7 +940,7 @@ end
 
 # Deliberately no docstring -- see the note on `pormg_nitro_session` above; `src/exts.jl` owns it.
 function pormg_nitro_worker(; db_key::String="db")
-    model = task_model()
+    model = task_model(db_key)
     if isnothing(model)
         error("pormg_nitro_worker: PormG.Models is not available. Ensure PormG is properly loaded.")
     end
@@ -929,20 +984,18 @@ function __init__()
         PormG.register_ignore_tables!(["nitro_session", "nitro_task"])
     end
 
-    # Pre-initialize the models so they're ready when needed
-    _SESSION_MODEL[] = _define_session_model()
-    _TASK_MODEL[] = _define_task_model()
+    # There is no model priming here any more. Both models carry a `connect_key` since #202,
+    # and the key is only known when a store is constructed -- so a model built at load time
+    # could not be bound, and one process-wide model could not serve two stores on different
+    # keys. `session_model(db_key)` / `task_model(db_key)` build a bound model per store
+    # instead, which is a handful of allocations about twice per application.
 
     # Bridge Nitro's resolved environment to PormG's, so an app can call
     # `PormG.Configuration.load_many([...])` with no `env=` and get the environment Nitro
     # resolved (#55). A DEFAULT, never a force: a pre-set `PORMG_ENV` and an explicit `env=`
     # both still win.
     #
-    # LAST in this function on purpose -- if it went first and threw, `_SESSION_MODEL[]` and
-    # `_TASK_MODEL[]` would be left unprimed and every later store construction would fail
-    # with a second, unrelated-looking error.
-    #
-    # Guarded, unlike the Ref priming above, because this is the only side effect here that
+    # Guarded, unlike the registration above, because this is the only side effect here that
     # ESCAPES THE MODULE: it mutates the OS process environment, which is inherited by any
     # subprocess. The reason is NOT cache poisoning -- `ENV` is not serialized into a `.ji`,
     # and PormG reads `PORMG_ENV` only inside function bodies. It is that a compile-only

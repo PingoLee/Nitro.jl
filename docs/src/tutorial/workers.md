@@ -587,6 +587,15 @@ worker_store = pormg_nitro_worker(db_key="workers")
 
 Task metadata will now be persisted to that database, while live running threads are managed safely in memory to prevent serialization issues.
 
+!!! note "Submitting inside a PormG transaction"
+    The store's `nitro_task` model is bound to `db_key`, so `submit_task` and the rest of the
+    task API work inside a `PormG.run_in_transaction(db_key)` block — enqueueing a job in the
+    same transaction that writes the row it will process, for instance.
+
+    A task call inside a transaction opened on a **different** connection raises PormG's
+    `TransactionError`, which names the `run_in_transaction` call you need. Note that the
+    *callback* runs later on its own task and is not covered by the submitting transaction.
+
 !!! note "Multiple processes sharing one database"
     Because the store persists across restarts, it invites deployments where several
     processes share one database — two app instances behind a load balancer, or a web

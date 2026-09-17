@@ -143,6 +143,12 @@ The default `db_key` is `"db"`. Use a different one when your session database u
 PormG connection, for example `db_key="sessions"` — the key selects the connection the table is
 created on *and* the one every session query runs against.
 
+!!! note "Sessions inside a PormG transaction"
+    The store's `nitro_session` model is bound to `db_key`, so session reads and writes work
+    inside a `PormG.run_in_transaction(db_key)` block. A session call inside a transaction
+    opened on a **different** connection raises PormG's `TransactionError`, which names the
+    `run_in_transaction` call you need.
+
 ### Custom Store Interface
 
 Implement these methods for your own backend:

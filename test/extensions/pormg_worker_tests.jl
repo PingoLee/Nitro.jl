@@ -352,6 +352,29 @@ end
 
 const RealPormGWorkerStore = _load_pormg_worker_store_type()
 
+# -- A stand-in PormG connection, for `pormg_nitro_worker` and the #202 guard ------
+#
+# Mirrors `FakeSessionPool` in `pormg_session_tests.jl`; see the rationale there.
+# `PormG.connection(key=k)` is just `config[k].connections`, `config` is a
+# `Dict{String,PormGSettings}` and `PormGSettings` is an ABSTRACT type, so an entry under a
+# test-only key is enough. Subtyping `PormG.PormGSQLite` rather than using a bare struct means
+# the REAL `create_table`/`create_index` run against the REAL task model; only `fetch` is
+# overridden, and on our own concrete type, so it is more specific than PormG's method rather
+# than piracy.
+struct FakeTaskPool <: PormG.PormGSQLite
+    sql::Vector{String}
+end
+
+struct FakeTaskSettings <: PormG.PormGSettings
+    connections::FakeTaskPool
+end
+
+PormG.ConnectionPool.fetch(c::FakeTaskPool, sql::String; kwargs...) =
+    (push!(c.sql, sql); nothing)
+
+# The extension module itself, for the private `task_model` accessor the #202 guard drives.
+const PormGExt = Base.get_extension(Nitro, :NitroPormGExt)
+
 # FAIL, do not skip (#128). This branch used to be
 # `@test_skip "PormG is not available, ..."`, which the Test stdlib reports as
 # `Broken 1` -- one line in a 3,500-assertion summary, with the run still exiting 0.
@@ -1712,6 +1735,55 @@ else
 
             # ...and the routed form works, so the guard is not simply refusing everything.
             @test m.objects.db("tasks").filter("id" => "x").first() === nothing
+        end
+
+        @testset "the task model is BOUND to its store's connection (#202)" begin
+            # `_define_task_model()` used to build a bare `PormG.Models.Model` that never went
+            # through `set_models`, so `connect_key` was `nothing`. PormG's
+            # `ensure_model_transaction_scope` gates on the MODEL's key and never consults the
+            # query's `.db()` override, so while any transaction was open on the calling task
+            # EVERY `nitro_task` query threw `InvalidConfigurationError` -- `submit_task` inside
+            # an app's own `run_in_transaction` block, for instance.
+            #
+            # Mirrors the session-side guard in `pormg_session_tests.jl`; the two stores had the
+            # identical gap and #202 closes both.
+            @test getproperty(PormGExt, :task_model)().connect_key == "db"
+            @test getproperty(PormGExt, :task_model)("tasks").connect_key == "tasks"
+
+            # One model per store, never a shared singleton -- `connect_key` names exactly one
+            # connection, so two stores on different keys could not share an object.
+            @test getproperty(PormGExt, :task_model)() !== getproperty(PormGExt, :task_model)()
+
+            key = "nitro-test-task-tx"
+            haskey(PormG.config, key) &&
+                error("test-only PormG connection key is already registered: $key")
+            conn = FakeTaskPool(String[])
+            PormG.config[key] = FakeTaskSettings(conn)
+            try
+                bound = getproperty(PormGExt, :task_model)(key)
+                unbound = getproperty(PormGExt, :task_model)(key)
+                unbound.connect_key = nothing
+
+                # Outside a transaction the guard returns immediately for both -- which is
+                # precisely why this defect never showed up in the suite.
+                @test PormG.Configuration.ensure_model_transaction_scope(unbound) === nothing
+                @test PormG.Configuration.ensure_model_transaction_scope(bound) === nothing
+
+                # `with_tx_context` is PormG's own seam onto the `ScopedValue` that
+                # `run_in_transaction` sets, so the guard runs without a live driver.
+                PormG.with_tx_context(conn, nothing) do
+                    @test_throws PormG.Kernel.InvalidConfigurationError PormG.Configuration.ensure_model_transaction_scope(unbound)
+                    @test PormG.Configuration.ensure_model_transaction_scope(bound) === nothing
+                end
+
+                # And the factory hands the store a model bound to the key it was asked for.
+                store_b = pormg_nitro_worker(db_key=key)
+                @test store_b.db_key == key
+                @test store_b.model.connect_key == key
+            finally
+                delete!(PormG.config, key)
+            end
+            @test !haskey(PormG.config, key)
         end
     end
 end
