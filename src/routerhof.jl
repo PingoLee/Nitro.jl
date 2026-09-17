@@ -180,8 +180,10 @@ end
 # `[]` here and that guard becomes always-true, so every HOF route publishes a
 # `(Function[], Function[])` entry into `custommiddleware`. Secondarily, and sharper since #71:
 # those entries contribute zero layers but make the table permanently non-empty, which defeats
-# `compose`'s per-request fast path for the whole app — every request would then pay a second
-# `gethandler` for nothing.
+# `compose`'s per-request fast path for the whole app — every request would then pay a
+# `gethandler`, a cache-key string and a cache lookup for nothing, plus the chain fold on the
+# first request for each route. (Before #80 it also paid a SECOND `gethandler`; the fast path
+# is still worth defending without it.)
 function process_middleware(::App, ::Nothing) end
 
 
@@ -421,10 +423,12 @@ function compose(router::HTTP.Router, globalmiddleware::Vector{Function},
             if !isnothing(innerhandler) && !ismissing(innerhandler)
 
                 # Hand this lookup to the pipeline's terminal instead of letting it redo the
-                # work (#80). `_dispatch_resolved` (src/core/pipeline.jl) consumes it; the
-                # `target` field is what makes a middleware that rewrites `req.target` still
-                # get the route it rewrote to. Written HERE — before the chain runs — because
-                # the chain is what eventually reaches the terminal.
+                # work (#80). `_dispatch_resolved` (src/core/pipeline.jl) consumes it, and
+                # honours it only if `(router, method, target)` all still match — every input
+                # `gethandler` just read. `router` is in there because this stash rides on the
+                # REQUEST while the invariant that makes it safe belongs to the App; see
+                # `RouteResolution` (src/types.jl). Written HERE — before the chain runs —
+                # because the chain is what eventually reaches the terminal.
                 #
                 # Stashed unconditionally on this branch, cache hit or miss, since the chain
                 # is cached but the resolution is per request. `isa Function` keeps
@@ -433,7 +437,7 @@ function compose(router::HTTP.Router, globalmiddleware::Vector{Function},
                 # some other way simply declines the hand-off and takes the old double-lookup
                 # rather than widening the field.
                 innerhandler isa Function && (req.context[ROUTE_RESOLUTION_KEY] =
-                    RouteResolution(req.target, innerhandler, path, params))
+                    RouteResolution(router, req.method, req.target, innerhandler, path, params))
 
                 # Check if we already have a cached middleware function for this specific
                 # route AND this pipeline's serializer settings. Skipped entirely when per-call

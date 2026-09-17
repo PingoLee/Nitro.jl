@@ -16,8 +16,9 @@ SUITE["routing"]["genkey"] = @benchmarkable Nitro.Core.RouterHOF.genkey("GET", "
 # this. The three below run on `BENCH_MW_CTX`, where the table is non-empty:
 #
 #   mw_cache_hit   — the chain is cached, so the request pays `compose`'s `gethandler` plus
-#                    whatever the chain's terminal does. This is where #80's second trie
-#                    walk lives.
+#                    whatever the chain's terminal does. This is where #80's second trie walk
+#                    USED to live; these exist to show it no longer does, and to catch it
+#                    coming back.
 #   mw_cache_hit_param — same, on a route with a path variable, so `Params()` is populated
 #                    rather than just allocated.
 #   mw_nocache     — `use_cache == false`, so `buildmiddleware` runs per request and the
@@ -38,8 +39,12 @@ SUITE["routing"]["mw_nocache"] = @benchmarkable run_bench_mw_nocache_request(req
 # entirely. These call a pre-built pipeline, which is what a served request actually does,
 # so a change to the request path shows up as a change here.
 #
-# `served_ping` is the no-per-route-middleware control (compose's emptiness fast path, one
-# `gethandler`); the `mw_served_*` pair is the path that resolves twice today.
+# `served_ping` is the no-per-route-middleware control (compose's emptiness fast path, which
+# returns BEFORE `gethandler`); the `mw_served_*` pair is the path that resolved twice before
+# #80. Both now resolve once, so the gap between them is one `gethandler`, the cache-key
+# string, the cache snapshot and lookup, the chain call, and the per-route middleware layer
+# itself — not the middleware layer alone. A regression on #80 shows up as that gap widening
+# by a second trie walk and a second `Params()`.
 SUITE["routing"]["served_ping"] = @benchmarkable run_bench_served(req) setup=(
     req = bench_request("GET", "/bench/ping")) evals=1
 

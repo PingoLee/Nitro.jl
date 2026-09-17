@@ -52,17 +52,21 @@ before the handler, after every middleware layer has run, which is what
 "params appeared late" cache-invalidation rule on. A stash written by `compose` does not move
 that transition, because nothing reads it until here.
 
-The `res.target === req.target` guard (a *value* comparison — Julia strings are egal by
-contents), and why a stale stash is unreachable, are documented on `RouteResolution` itself.
-Falling through to `r(req)` is always correct — it is exactly the old behavior — so every path
-that declines the hand-off degrades to the previous cost, never to a wrong route.
+The guard is `(router, method, target)` — every input `gethandler` reads — and
+`RouteResolution` documents why each one is there, including the cross-`App` misroute the
+`router` check exists to prevent. Falling through to `r(req)` is always correct: it is exactly
+the old behavior, so every path that declines the hand-off degrades to the previous cost, never
+to a wrong route.
 
 `r` is deliberately untyped: `Service.router` is declared as the unparameterized `Router`, and
-the caller `let`-binds it to keep that dynamic dispatch out of the request path.
+the caller `let`-binds it to keep that dynamic dispatch out of the request path. It doubles as
+the identity the stash is checked against, so this function needs nothing else to know which
+application it belongs to.
 """
 function _dispatch_resolved(r, req::HTTP.Request)
     res = get(req.context, Types.ROUTE_RESOLUTION_KEY, nothing)
-    if res isa Types.RouteResolution && res.target === req.target
+    if res isa Types.RouteResolution && res.router === r &&
+       res.method === req.method && res.target === req.target
         req.context[:route] = res.route
         isempty(res.params) || (req.context[:params] = res.params)
         return res.handler(req)
@@ -89,7 +93,9 @@ function setupmiddleware(ctx::App; middleware::Vector=[], serialize::Bool=true, 
     # and that middleware silently never ran. The emptiness test now lives inside `compose`,
     # per request, where it also short-circuits to a prebuilt global-middleware-only chain
     # BEFORE `gethandler` — so an app with no per-route middleware does strictly less routing
-    # work here than the old compose branch did (one `gethandler`, not two). Against the old
+    # work here than the old compose branch did (one `gethandler`, not two). Since #80 the
+    # matched path resolves once as well, so that contrast is with the PRE-#80 compose branch,
+    # not with the other path through this pipeline today. Against the old
     # non-compose branch it costs one closure call, one acquire-load and an `isempty` per
     # request, and no extra allocation. (Deliberately no wall-clock figure: this comment already
     # carried one that went stale the moment `router_entry` was added below.)

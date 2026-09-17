@@ -681,12 +681,17 @@ end
 
 stash_handler(body::String) = (::HTTP.Request) -> HTTP.Response(200, body)
 
+# Builds a stash that legitimately matches: THIS router, and this request's own method and
+# target objects. Each testset below then perturbs exactly one of the three guarded inputs, so
+# a failure names which part of the guard moved.
+stash!(req, router; handler, route = "/stashroute", params = Dict{String,String}()) =
+    req.context[ROUTE_RESOLUTION_KEY] =
+        RouteResolution(router, req.method, req.target, handler, route, params)
+
 @testset "a matching stash is used, and the router is not consulted" begin
     router = router_with("ROUTER")
     req = HTTP.Request("GET", "/x")
-    # `req.target` itself, so the identity guard holds by construction.
-    req.context[ROUTE_RESOLUTION_KEY] =
-        RouteResolution(req.target, stash_handler("STASH"), "/stashroute", Dict{String,String}())
+    stash!(req, router; handler = stash_handler("STASH"))
 
     @test text(DISPATCH(router, req)) == "STASH"
     # `:route` comes from the stash too — this is `(r::Router)(req)`'s matched branch,
@@ -700,8 +705,8 @@ end
 @testset "non-empty params land on the request" begin
     router = router_with("ROUTER")
     req = HTTP.Request("GET", "/x")
-    req.context[ROUTE_RESOLUTION_KEY] =
-        RouteResolution(req.target, stash_handler("STASH"), "/p/{id}", Dict("id" => "7"))
+    stash!(req, router; handler = stash_handler("STASH"), route = "/p/{id}",
+           params = Dict("id" => "7"))
 
     @test text(DISPATCH(router, req)) == "STASH"
     @test req.context[:params] == Dict("id" => "7")
@@ -711,8 +716,7 @@ end
 @testset "a rewritten target declines the stash and re-resolves" begin
     router = router_with("ROUTER")
     req = HTTP.Request("GET", "/y")
-    req.context[ROUTE_RESOLUTION_KEY] =
-        RouteResolution(req.target, stash_handler("STASH"), "/stashroute", Dict{String,String}())
+    stash!(req, router; handler = stash_handler("STASH"))
 
     # The rewrite `PrefixStripMiddleware` performs: assign a different target. The guard is a
     # VALUE comparison (Julia strings are egal by contents, so `===` is not an address test),
@@ -728,12 +732,55 @@ end
     # would be pure waste. A freshly built object is used so this is not testing `x === x`.
     router = router_with("ROUTER")
     req = HTTP.Request("GET", "/x")
-    req.context[ROUTE_RESOLUTION_KEY] =
-        RouteResolution(req.target, stash_handler("STASH"), "/stashroute", Dict{String,String}())
+    stash!(req, router; handler = stash_handler("STASH"))
 
     suffix = "x"
     req.target = "/" * suffix
     @test text(DISPATCH(router, req)) == "STASH"
+end
+
+@testset "a rewritten method declines the stash and re-resolves" begin
+    # `gethandler` matches on `req.method` as well as the target, and `Request.method` is a
+    # mutable field — the `X-HTTP-Method-Override` rewrite is the shape that hits this. Before
+    # #80 the router resolved after every middleware layer, so such a rewrite changed which
+    # handler ran; guarding on the method is what keeps that true.
+    router = HTTP.Router()
+    HTTP.register!(router, "GET",  "/x", (::HTTP.Request) -> HTTP.Response(200, "GET-ROUTER"))
+    HTTP.register!(router, "POST", "/x", (::HTTP.Request) -> HTTP.Response(200, "POST-ROUTER"))
+
+    req = HTTP.Request("GET", "/x")
+    stash!(req, router; handler = stash_handler("STASH"))
+    req.method = "POST"
+
+    @test text(DISPATCH(router, req)) == "POST-ROUTER"
+end
+
+@testset "a stash from another App's router is declined" begin
+    # REGRESSION, found in review. The stash rides on `req.context`, which belongs to the
+    # REQUEST; the "tables only ever grow" argument that makes reuse safe belongs to the App.
+    # A request object handed to a second `App` — `internalrequest` is public — therefore
+    # arrives carrying the first App's resolution. Without the router in the guard, App B
+    # serves App A's handler.
+    router_a = router_with("A-ROUTER")
+    router_b = router_with("B-ROUTER")
+
+    req = HTTP.Request("GET", "/x")
+    stash!(req, router_a; handler = stash_handler("A-STASH"))
+
+    @test text(DISPATCH(router_a, req)) == "A-STASH"     # its own router still honours it
+    @test text(DISPATCH(router_b, req)) == "B-ROUTER"    # a foreign one must not
+end
+
+@testset "a stash from another App cannot resurrect a route that App never had" begin
+    # The sharper half of the same defect: the foreign App 404s, so honouring the stash turns
+    # a 404 into a 200 serving a handler from an application this request never reached.
+    router_a = router_with("A-ROUTER")
+    empty_router = HTTP.Router()
+
+    req = HTTP.Request("GET", "/x")
+    stash!(req, router_a; handler = stash_handler("A-STASH"))
+
+    @test DISPATCH(empty_router, req).status == 404
 end
 
 @testset "no stash at all falls through to the router" begin
@@ -828,6 +875,40 @@ end
     @test text(Nitro.Core.internalrequest(ctx, req; catch_errors = false)) == "v2"
 end
 
+@testset "the same request object through two Apps gets each App's own handler" begin
+    # The end-to-end form of the cross-App regression above, through public `internalrequest`.
+    # App A has per-route middleware (so it stashes); App B registers the same path with a
+    # different handler and no per-route middleware anywhere; App C never registers it.
+    passthrough = handler -> (req::HTTP.Request -> handler(req))
+
+    a = App()
+    Nitro.Core.Routing.urlpatterns(a, "", Nitro.RouteDefinition[
+        path("/shared", (req::HTTP.Request) -> Res.send("A-HANDLER"), middleware = [passthrough]),
+    ])
+    b = App()
+    Nitro.Core.Routing.urlpatterns(b, "", Nitro.RouteDefinition[
+        path("/shared", (req::HTTP.Request) -> Res.send("B-HANDLER")),
+    ])
+    c = App()
+    Nitro.Core.Routing.urlpatterns(c, "", Nitro.RouteDefinition[
+        path("/elsewhere", (req::HTTP.Request) -> Res.send("C-HANDLER")),
+    ])
+
+    req = HTTP.Request("GET", "/shared")
+    @test text(Nitro.Core.internalrequest(a, req; catch_errors = false)) == "A-HANDLER"
+    @test haskey(req.context, ROUTE_RESOLUTION_KEY)          # A really did stash
+
+    @test text(Nitro.Core.internalrequest(b, req; catch_errors = false)) == "B-HANDLER"
+    # 404, not 200 with A's body. This is the assertion that was red before the review fix.
+    @test Nitro.Core.internalrequest(c, req; catch_errors = false).status == 404
+
+    # The `resetstate()` variant — reuse a request across a replacement of the global
+    # `CONTEXT[]` — is deliberately NOT added here. It is the same mechanism (the dispatching
+    # router is no longer the one that stashed) and the router-identity guard above covers it
+    # directly, whereas mutating `CONTEXT[]` would make this file order-dependent, which its
+    # header comment explicitly relies on it not being.
+end
+
 @testset "a request that took the empty-table fast path writes no stash" begin
     # The fast path returns before `gethandler`, so nothing is stashed; a later pass on the
     # same object, after the table has become non-empty, must resolve normally.
@@ -875,7 +956,7 @@ using Test
 using HTTP
 using Nitro
 using Nitro.Core.Types: CopyOnWriteDict, snapshot, publish!, RouteMiddleware, NO_ROUTE_MIDDLEWARE
-using Nitro.Core.RouterHOF: publish_route_middleware!, buildmiddleware, genkey, router
+using Nitro.Core.RouterHOF: publish_route_middleware!, genkey, router
 import Nitro: App, path, text
 
 # #76: the field was `CopyOnWriteDict{Tuple}`. Unparameterized `Tuple` is abstract, so
@@ -945,10 +1026,22 @@ end
     # surfaced as a `MethodError` inside `buildmiddleware`'s destructure on some later
     # request — far from the registration that caused it.
     ctx = App()
-    @test_throws MethodError publish_route_middleware!(
-        ctx, "GET|/bad", (nothing, Function[], Function[]))
-    @test_throws MethodError publish_route_middleware!(ctx, "GET|/bad", (nothing,))
-    @test_throws MethodError publish_route_middleware!(ctx, "GET|/bad", ("not middleware", nothing))
+    # The `err.f` check is not ceremony: a bare `@test_throws MethodError` would also pass if
+    # the call were misspelled, making the assertion vacuous.
+    # Each value below IS a `Tuple`, so each published successfully under the old
+    # `value::Tuple` signature — that is what makes these rejections the actual change.
+    for bad in ((nothing, Function[], Function[]),      # wrong arity, too many
+                (nothing,),                             # wrong arity, too few
+                ("not middleware", nothing))            # right arity, wrong element type
+        err = try
+            publish_route_middleware!(ctx, "GET|/bad", bad)
+            nothing
+        catch e
+            e
+        end
+        @test err isa MethodError
+        @test err.f === publish_route_middleware!
+    end
     # Nothing was published by any of the three.
     @test isempty(snapshot(ctx.service.custommiddleware))
 end
