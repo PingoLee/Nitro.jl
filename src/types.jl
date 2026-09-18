@@ -816,8 +816,10 @@ each activation its own state and have `on_shutdown` retire it — see `_janitor
 (`src/middleware/janitor.jl`) for the per-activation token every periodic janitor in Nitro shares,
 or `AccessLog` for the per-activation run struct.
 
-A hook that throws is logged and swallowed — see [`startup`](@ref) and
-[`shutdown`](@ref).
+A hook that throws is logged and swallowed, and the rest of the sequence still runs — see
+[`startup`](@ref) and [`shutdown`](@ref). Ctrl-C is the one throw that is not discarded: the
+sequence still runs to completion, and `serve()`/`terminate()` then re-raise the interrupt
+once (#185).
 """
 @kwdef struct LifecycleMiddleware 
     # The middleware function itself (handles incoming requests)
@@ -828,55 +830,86 @@ A hook that throws is logged and swallowed — see [`startup`](@ref) and
     on_shutdown :: Union{Function,Nothing} = nothing
 end
 
+# Report an interrupt caught by `startup`/`shutdown`, and hand it back to the broadcast site.
+#
+# Logged HERE, once per occurrence, because a broadcast re-raises only the FIRST one it collects:
+# an interrupt from a later hook in the same sequence would otherwise vanish completely. No
+# backtrace — an interrupt's stack is wherever the signal happened to land, which says nothing
+# about the hook. One shared site so the two callers' wording cannot drift apart.
+function _report_interrupt(e::InterruptException, which::String)
+    @warn "Nitro: interrupt during LifecycleMiddleware.$which — the rest of the lifecycle " *
+          "sequence still runs, then the interrupt is re-raised."
+    return e
+end
+
 """
-    startup(lf::LifecycleMiddleware)
+    startup(lf::LifecycleMiddleware) -> Union{Nothing, InterruptException}
 
 Run `lf.on_startup` if it has one. Called by `serve()` for every registered
 [`LifecycleMiddleware`](@ref); apps do not normally call it.
 
 A `nothing` hook is a no-op. A **throwing** hook is logged and swallowed, never rethrown: one
 middleware failing to start must not abort the server and leave the middlewares already started
-without their paired `on_shutdown`. The hook's return value is discarded.
+without their paired `on_shutdown`. The hook's own return value is discarded — `startup` returns
+`nothing`, or the interrupt described below.
 
-!!! note "This includes `InterruptException`, unlike Nitro's other catch-alls — see #185"
-    The `e isa InterruptException && rethrow()` idiom used in `src/utilities/misc.jl` and in the
-    janitor loop (`src/middleware/janitor.jl`) is deliberately **not** used here. Those are *leaf*
-    catch-alls: rethrowing kills one operation and nothing else. `startup` and `shutdown` are
-    *sequencers*, broadcast over every registered hook by `startserver` and `terminate`
-    (`src/core/lifecycle.jl`), so an escape here abandons the rest of the sequence — on the
-    teardown path it skips `close(service)` outright and leaves the server listening. Honoring
-    Ctrl-C *without* stranding the sequence is a change to the broadcast sites, not to this
-    `catch`, and that is what #185 still tracks.
+`InterruptException` is the one exception that is neither swallowed nor rethrown here: it is
+**deferred**. `startup` logs it and *returns* it, and `startserver` (`src/core/lifecycle.jl`)
+finishes broadcasting over the remaining hooks, unwinds through `terminate` — so the listener it
+just opened does not stay open — and re-raises the interrupt once. Ctrl-C during startup is
+honored without stranding the sequence (#185).
+
+!!! note "Why not `e isa InterruptException && rethrow()`"
+    That idiom (`src/utilities/misc.jl`, `src/middleware/janitor.jl`) is for *leaf* catch-alls,
+    where rethrowing kills one operation and nothing else. `startup`/`shutdown` are *sequencers*,
+    broadcast over every registered hook, so an escape from this frame abandons the rest of the
+    sequence — on the teardown path it would skip `close(service)` outright and leave the server
+    listening. Same intent, different mechanism: report and defer instead of rethrowing in place.
+
+A hook that `fetch`es an interrupted task raises `TaskFailedException`, not `InterruptException`,
+and is deliberately **not** unwrapped — the same narrowness the leaf idiom has.
 """
-function startup(lf::LifecycleMiddleware)
-    if !isnothing(lf.on_startup)
-        try 
-            lf.on_startup()
-        catch error
-            @error "Error in LifecycleMiddleware.on_startup: " exception=(error, catch_backtrace())
-        end
+function startup(lf::LifecycleMiddleware)::Union{Nothing,InterruptException}
+    isnothing(lf.on_startup) && return nothing
+    try
+        lf.on_startup()
+    catch error
+        error isa InterruptException && return _report_interrupt(error, "on_startup")
+        @error "Error in LifecycleMiddleware.on_startup: " exception=(error, catch_backtrace())
     end
+    # NOT the hook's value. The docstring has always said it is discarded, but this frame used to
+    # return it anyway — `_janitor`'s `on_startup` hands back a `Task`, which leaked through here
+    # into a slot that now means "was this hook interrupted?".
+    return nothing
 end
 
 """
-    shutdown(lf::LifecycleMiddleware)
+    shutdown(lf::LifecycleMiddleware) -> Union{Nothing, InterruptException}
 
 Run `lf.on_shutdown` if it has one. Called by `terminate()` for every registered
 [`LifecycleMiddleware`](@ref), in the reverse of startup order; apps
 do not normally call it.
 
 A `nothing` hook is a no-op. A **throwing** hook is logged and swallowed, never rethrown — one
-middleware failing to stop must not prevent the rest from being torn down. The hook's return
+middleware failing to stop must not prevent the rest from being torn down. The hook's own return
 value is discarded.
+
+`InterruptException` is **deferred** the same way [`startup`](@ref) defers it: `shutdown` logs it
+and returns it, and `terminate()` completes **both** shutdown broadcasts, clears the serve-owned
+lifecycle list and the middleware cache, closes the listener — escalating an interrupted drain to
+a force-close — and only then re-raises it. If more than one hook is interrupted, each is logged
+and the first is re-raised; the rest are dropped, since an `InterruptException` carries nothing to
+tell them apart (#185).
 """
-function shutdown(lf::LifecycleMiddleware)
-    if !isnothing(lf.on_shutdown)
-        try
-            lf.on_shutdown()
-        catch error
-            @error "Error in LifecycleMiddleware.on_shutdown: " exception=(error, catch_backtrace())
-        end
+function shutdown(lf::LifecycleMiddleware)::Union{Nothing,InterruptException}
+    isnothing(lf.on_shutdown) && return nothing
+    try
+        lf.on_shutdown()
+    catch error
+        error isa InterruptException && return _report_interrupt(error, "on_shutdown")
+        @error "Error in LifecycleMiddleware.on_shutdown: " exception=(error, catch_backtrace())
     end
+    return nothing  # not the hook's value — see `startup`
 end
 
 

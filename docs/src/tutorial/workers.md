@@ -214,6 +214,10 @@ the wait.
     `drain_timeout` **plus** `serve(shutdown_timeout = …)`, 15 seconds with both defaults. Size
     them together against your container's stop grace period.
 
+    Ctrl-C during that window no longer abandons the teardown: the remaining shutdown hooks still
+    run, the drain escalates straight to a force-close, and `terminate()` rethrows the interrupt
+    once the listener is actually closed.
+
 Two things worth knowing:
 
 - A run abandoned past the deadline **keeps its handle registered**, so `recover_zombie_tasks!`
