@@ -107,6 +107,12 @@ Calling `serve` on an app that is **already serving** throws an `ArgumentError`:
 call would overwrite the running server's handle and strand its port. Terminate that app
 first, or give the second listener its own `App`.
 
+**Ctrl-C is honored at both points it can land (#185).** An interrupt inside a startup hook lets
+the remaining hooks finish, then unwinds through `terminate` and rethrows — so the app is left
+not-serving and `serve` can simply be retried. An interrupt out of the blocking wait
+(`async = false`) is the documented way to stop the server, and now tears it down before
+returning rather than leaving the listener up.
+
 IP-based controls (rate limiting, audit logging) key on the socket peer address,
 resolved for both plain-HTTP and direct-TLS listeners. Behind a reverse proxy,
 configure `ExtractIP`/`RateLimiter` with both `trusted_proxies` and the
@@ -282,6 +288,63 @@ function start_revise_service()
     EagerReviseService(revise_task, revise_task_done)
 end
 
+# Broadcast `hook` (`startup` or `shutdown`) over `entries`, deferring any interrupt (#185).
+#
+# `startup`/`shutdown` (src/types.jl) HAND BACK an `InterruptException` instead of throwing it,
+# precisely so this loop decides what happens next: the sequence always runs to completion, and
+# the FIRST interrupt is carried out to the caller, which re-raises it once the sequence is
+# settled. Later ones were already logged by `_report_interrupt` at the moment they happened, and
+# an `InterruptException` carries no payload, so which one escapes is not observable.
+#
+# Named rather than written out at each of the four broadcast halves for two reasons: the
+# "first one wins" guard is easy to get wrong four times, and a named function is testable
+# without binding a port — the same argument `_janitor_loop` makes in src/middleware/janitor.jl.
+function _broadcast_lifecycle(hook::Function, entries,
+                              interrupt::Nullable{InterruptException} = nothing)
+    for lf in entries
+        raised = hook(lf)
+        isnothing(interrupt) && (interrupt = raised)
+    end
+    return interrupt
+end
+
+# The same deferral for the LAST step of the teardown, which is not a broadcast but is just as
+# abandonable: `close(::Service)` blocks the calling task in `timedwait` for up to
+# `shutdown_timeout` (`_shutdown_server`, src/context.jl), and an interrupt there escapes before
+# the compare-and-clear that follows it — leaving `service.server[]` populated, so the next
+# `terminate()` is a silent no-op, and leaking the eager-Revise watcher.
+function _close_deferring_interrupt(service, timeout::Real,
+                                    interrupt::Nullable{InterruptException})
+    try
+        close(service; timeout)
+    catch e
+        e isa InterruptException || rethrow()
+        # Ctrl-C during the drain IS the operator saying "stop waiting", so the retry skips the
+        # graceful phase rather than re-entering a fresh full budget. `close`/`forceclose`
+        # overlap safely and `close(::EagerReviseService)` is a flag write, so the retry is
+        # idempotent against whatever the first call already got through.
+        @warn "Nitro: interrupt during the shutdown drain — force-closing the remaining connections."
+        try
+            close(service; timeout = 0)
+        catch forced
+            # Both arms leave `service.server[]` populated, because the compare-and-clear is the
+            # last statement of `close` and was never reached. Say so out loud in each: the
+            # interrupt this function returns is swallowed by every caller on the Ctrl-C path, so
+            # a log line is the ONLY signal a half-closed listener ever produces. Contrast
+            # `_shutdown_server` (src/context.jl), which can afford to stay loud because nothing
+            # is already unwinding through it.
+            if forced isa InterruptException
+                @warn "Nitro: a second interrupt during the force-close — the server handle may \
+                       still be set and the listener may still be open. Check before re-serving."
+            else
+                @error "Nitro: force-close after an interrupted drain failed" exception=(forced, catch_backtrace())
+            end
+        end
+        return something(interrupt, e)
+    end
+    return interrupt
+end
+
 """
     terminate(context::App; timeout = nothing)
     terminate(; timeout = nothing)
@@ -311,6 +374,13 @@ notified from a `LifecycleMiddleware`'s `on_shutdown`, which runs *before* the d
     Do not call `terminate()` from inside a request handler. The handler's own connection is
     what the drain is waiting on, so the graceful phase is guaranteed to reach its timeout.
 
+!!! note "Ctrl-C during shutdown"
+    An interrupt raised inside a shutdown hook or during the drain does not abandon the teardown:
+    every remaining hook still runs, the lifecycle state is still cleared, and the listener is
+    still closed — an interrupted drain escalates straight to a force-close, cutting in-flight
+    requests rather than waiting out the remaining budget. `terminate` then rethrows the
+    `InterruptException`, so it is the one documented way this function throws (#185).
+
 See also `serve`.
 """
 function terminate(context::App; timeout::Nullable{Real} = nothing)
@@ -320,8 +390,29 @@ function terminate(context::App; timeout::Nullable{Real} = nothing)
         # then route-owned reversed. Teardown order is a specified contract now, not hash
         # order — see `Service` (src/context.jl) for why LIFO and not something else.
         route_lf, serve_lf = lifecycle_snapshot(context)
-        shutdown.(Iterators.reverse(serve_lf))
-        shutdown.(Iterators.reverse(route_lf))
+        # Deferred, not broadcast-and-pray (#185): an interrupt from any hook is carried past the
+        # rest of the sequence and re-raised at the very bottom of this function, so the clears
+        # and the `close` below are unconditional exactly as they were before.
+        #
+        # The `try` is around the broadcasts, not inside them, because `startup`/`shutdown` can
+        # only catch an interrupt that lands INSIDE a hook frame. SIGINT is delivered at
+        # safepoints, and the loop itself has several — so a press between two hooks would
+        # otherwise escape bare and skip everything below, which is the exact failure this issue
+        # is about, reached by a different door. Catching here costs the remaining hooks (they
+        # are unreachable once the stack has unwound) but never the teardown *below*.
+        #
+        # The snapshot above and the clears below stay bare, deliberately. No user code runs in
+        # either, so the window is bounded by `lifecycle_lock` contention rather than by a hook,
+        # and extending the `try` over them would be protecting statements that are themselves
+        # partial-state transitions — a half-run clear is worse than a skipped one.
+        interrupt = nothing
+        try
+            interrupt = _broadcast_lifecycle(shutdown, Iterators.reverse(serve_lf))
+            interrupt = _broadcast_lifecycle(shutdown, Iterators.reverse(route_lf), interrupt)
+        catch e
+            e isa InterruptException || rethrow()
+            interrupt = something(interrupt, e)
+        end
         # Only the SERVE-owned half is cleared (#82). These came from this run's
         # `serve(middleware = ...)` list and `serve` re-registers them on the next call, so
         # keeping them would start a previous run's middleware alongside the new one.
@@ -342,7 +433,10 @@ function terminate(context::App; timeout::Nullable{Real} = nothing)
         # finish against a table nobody mutates.
         empty!(context.service.middleware_cache)
         context.service.external_url[] = nothing
-        close(context.service; timeout = something(timeout, context.service.shutdown_timeout[]))
+        interrupt = _close_deferring_interrupt(context.service,
+            something(timeout, context.service.shutdown_timeout[]), interrupt)
+        # Re-raised only now: everything a later `serve()` depends on has already been done.
+        isnothing(interrupt) || throw(interrupt)
     end
     return nothing
 end
@@ -357,8 +451,45 @@ function startserver(ctx::App; host, port, show_banner=false, parallel=false, as
     # Over a snapshot, not the live vectors: a `revise=:lazy` re-registration runs on a
     # request-handling task and could otherwise `push!` while this broadcast iterates.
     route_lf, serve_lf = lifecycle_snapshot(ctx)
-    startup.(route_lf)
-    startup.(serve_lf)
+    # Around the broadcasts for the same reason `terminate` wraps its own: a hook frame is the
+    # only place `startup` can catch an interrupt, and a press landing between two hooks would
+    # otherwise skip the unwind below and strand the listener `start(...)` just opened.
+    interrupt = nothing
+    try
+        interrupt = _broadcast_lifecycle(startup, route_lf)
+        interrupt = _broadcast_lifecycle(startup, serve_lf, interrupt)
+    catch e
+        # A non-interrupt escaping here strands the listener, because the unwind below is gated
+        # on `!isnothing(interrupt)`. Deliberate: `startup` catches everything from the hook
+        # frame, so reaching this line at all means something structural is broken (a throwing
+        # logger, an async failure), and a loud strand is a more honest signal than a quiet
+        # cleanup that hides it. Pre-existing behavior; named here because the `catch` now makes
+        # unwinding look like it would be one line away.
+        e isa InterruptException || rethrow()
+        interrupt = something(interrupt, e)
+    end
+    if !isnothing(interrupt)
+        # `start(...)` above already opened the listener. Throwing bare here strands it: live,
+        # with half its middleware started, no `on_shutdown` ever run, and every later `serve()`
+        # rejected by the already-serving guard with nothing left able to close it. Unwind
+        # through the REAL teardown — it pairs every hook that just ran and closes the listener
+        # — then re-raise once (#185).
+        #
+        # "Pairs every hook" includes the INTERRUPTED one, whose `on_startup` only got part-way.
+        # Its `on_shutdown` is called against half-built state, which is exactly what the
+        # idempotency contract on `LifecycleMiddleware` (src/types.jl) exists to make safe —
+        # `_janitor` and `AccessLog` both no-op on an inactive activation.
+        try
+            terminate(ctx)
+        catch e
+            # A SECOND Ctrl-C during the unwind. `terminate` finishes its own sequence BEFORE it
+            # rethrows, so by the time this lands there is nothing left to clean up, and one
+            # `InterruptException` is indistinguishable from another. Anything else is a real
+            # teardown failure: it stays loud and supersedes the interrupt.
+            e isa InterruptException || rethrow()
+        end
+        throw(interrupt)
+    end
 
     if !async
         try
@@ -367,6 +498,19 @@ function startserver(ctx::App; host, port, show_banner=false, parallel=false, as
             !isa(error, InterruptException) && @error "ERROR: " exception=(error, catch_backtrace())
         finally
             println()
+            # Ctrl-C out of the blocking wait is THE documented way to stop a blocking `serve` —
+            # the banner says so. Without this the listener survives the interrupt and only a
+            # process restart clears it, which also made an interrupt one instant earlier (in the
+            # startup broadcast above, which unwinds) behave better than one an instant later.
+            # `terminate` is a no-op when nothing is serving, so this is safe on the normal exit
+            # path too, and idempotent against the `finally terminate()` in `src/methods.jl`.
+            try
+                terminate(ctx)
+            catch e
+                # `terminate` completes its teardown before rethrowing, so a second interrupt
+                # here has nothing left to do and should not print over a clean shutdown.
+                e isa InterruptException || rethrow()
+            end
         end
         # The blocking path only returns after shutdown (Ctrl-C), so a server handle here
         # would be useless. Return `nothing` to keep the REPL clean. (Secret disclosure via

@@ -32,9 +32,19 @@ function serve(; kwargs...)
     finally
         # close server on exit if we aren't running asynchronously
         if !async && ours
-            terminate()
-            # only reset state on exit if we aren't running asynchronously & are running it interactively
-            isinteractive() && resetstate()
+            try
+                terminate()
+            catch e
+                # This path's contract is already "Ctrl-C is the quiet exit". `terminate` now
+                # rethrows an interrupt raised inside a shutdown hook or the drain (#185), but it
+                # does so only AFTER completing the teardown, so there is nothing left to clean
+                # up — and printing a stacktrace over a clean shutdown would be noise. Anything
+                # else is a real teardown failure and stays loud.
+                e isa InterruptException || rethrow()
+            finally
+                # only reset state on exit if we aren't running asynchronously & are running it interactively
+                isinteractive() && resetstate()
+            end
         end
     end
 end
@@ -408,7 +418,18 @@ function serve(app::App; kwargs...)
     try
         return Nitro.Core.serve(app; kwargs...)
     finally
-        !async && ours && terminate(app)
+        if !async && ours
+            try
+                terminate(app)
+            catch e
+                # Same guard as the singleton form above, and for a sharper reason: an exception
+                # out of a `finally` REPLACES whatever was propagating. Unguarded, a second Ctrl-C
+                # landing in this teardown would overwrite the interrupt `startserver` is already
+                # carrying — or print a stacktrace over a clean shutdown. `terminate` completes
+                # its sequence before rethrowing (#185), so there is nothing left to do here.
+                e isa InterruptException || rethrow()
+            end
+        end
     end
 end
 

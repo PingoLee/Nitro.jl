@@ -34,9 +34,12 @@ end
         on_shutdown = () -> begin error("shutdown boom"); dflag2[] = true end
     )
 
-    @testset "startup with throwing hook does not rethrow" begin
+    # Both hooks throw an ORDINARY `ErrorException`, which is still logged and swallowed after
+    # #185 — only `InterruptException` is deferred. The titles say "ordinary" so they stop
+    # implying a claim about every throw; the assertions are unchanged.
+    @testset "startup with an ordinary throwing hook does not rethrow" begin
         try
-            @suppress_err begin 
+            @suppress_err begin
                 startup(lf2)
                 @test true  # no exception bubbled out
             end
@@ -44,11 +47,14 @@ end
             @test false
         end
         @test sflag2[] == false
+        # An ordinary failure must NOT be reported as a deferred interrupt: `catch e; return e`
+        # without the `isa` check would turn every failing hook into an aborted server (#185).
+        @suppress_err @test startup(lf2) === nothing
     end
 
-    @testset "shutdown with throwing hook does not rethrow" begin
+    @testset "shutdown with an ordinary throwing hook does not rethrow" begin
         try
-            @suppress_err begin 
+            @suppress_err begin
                 shutdown(lf2)
                 @test true  # no exception bubbled out
             end
@@ -56,6 +62,7 @@ end
             @test false
         end
         @test dflag2[] == false
+        @suppress_err @test shutdown(lf2) === nothing
     end
 end
 
@@ -560,11 +567,13 @@ end
     # a published contract because no test disagreed with it.
     #
     # This block MIRRORS three pieces of policy that live in `src/core/lifecycle.jl`, with
-    # nothing linking them but this comment: `startserver`'s route-then-serve startup
-    # (lines 359-361), `terminate`'s reverse-serve-then-reverse-route teardown (lines 322-324),
-    # and `terminate` clearing ONLY the serve half (line 335). Change any of those and update
-    # this too — the `:network` item above is what actually pins them, and it has no promoted
-    # object in it.
+    # nothing linking them but this comment: `startserver`'s route-then-serve startup (its two
+    # `_broadcast_lifecycle(startup, …)` calls, lines 426-427), `terminate`'s
+    # reverse-serve-then-reverse-route teardown (its two `_broadcast_lifecycle(shutdown, …)`
+    # calls, lines 386-387), and `terminate` clearing ONLY the serve half (line 398). Change any
+    # of those and update this too — the `:network` item above is what actually pins them, and it
+    # has no promoted object in it. (The line numbers moved once already, in #185; the call
+    # names are the durable half of this pointer.)
     order, mk = recorder()
     a, rl, b, c = mk("a"), mk("rl"), mk("b"), mk("c")
     ctx = App()
@@ -722,3 +731,268 @@ Nitro.Cookies.storesession!(store, "post", Dict{String,Any}("i" => 9), ttl=1)
 sleep(1.6)
 @test haskey(store.data, "post")
 end # @testitem
+
+
+# ── #185: the lifecycle interrupt broadcast ──────────────────────────────────────────────────
+#
+# `startup`/`shutdown` used to catch EVERYTHING, `InterruptException` included, and lose it: a
+# Ctrl-C landing inside a hook was logged as an `@error` and the server carried on as if nothing
+# had happened. A bare `rethrow()` there would have been worse — it abandons the rest of the
+# sequence, and on the teardown path it skips `close(service)` and leaves the listener up. So the
+# interrupt is DEFERRED: every sequence runs to completion, then exactly one is re-raised.
+#
+# Every item below drives the interrupt with a hook that is literally
+# `() -> throw(InterruptException())`, the same way `test/middleware/janitor_tests.jl` reaches the
+# stranded state on purpose. No signals, no timing, no flake.
+
+@testitem "Lifecycle interrupt — startup/shutdown defer instead of swallowing (#185)" tags=[:middleware] setup=[NitroCommon] begin
+using Test
+using Dates
+using HTTP
+using Nitro
+using Nitro.Core: LifecycleMiddleware, startup, shutdown
+using Nitro.Core.Middleware.JanitorMiddleware: _janitor
+
+_pass(handler) = (req::HTTP.Request -> handler(req))
+# The deferral logs a `@warn` at the moment it happens. Silence it where it is expected.
+_quiet(f) = Base.CoreLogging.with_logger(f, Base.CoreLogging.NullLogger())
+
+@testset "an interrupted hook is returned, not swallowed" begin
+    boom = LifecycleMiddleware(middleware = _pass,
+                               on_startup  = () -> throw(InterruptException()),
+                               on_shutdown = () -> throw(InterruptException()))
+
+    # Against the unpatched code both of these are `nothing` — the interrupt was eaten by the
+    # catch-all's `@error` and there was no way for a caller to learn it had happened.
+    @test _quiet(() -> startup(boom)) isa InterruptException
+    @test _quiet(() -> shutdown(boom)) isa InterruptException
+end
+
+@testset "everything else still returns nothing" begin
+    none = LifecycleMiddleware(middleware = _pass)
+    @test startup(none) === nothing
+    @test shutdown(none) === nothing
+
+    ran = Ref(0)
+    plain = LifecycleMiddleware(middleware = _pass,
+                                on_startup  = () -> (ran[] += 1),
+                                on_shutdown = () -> (ran[] += 1))
+    @test startup(plain) === nothing
+    @test shutdown(plain) === nothing
+    @test ran[] == 2
+
+    # The slot means "was this hook interrupted?", so a hook's own return value must not reach
+    # it. `_janitor`'s `on_startup` really does hand back a `Task`, and it leaked through this
+    # frame until #185 — the one case where the pre-existing docstring was simply false.
+    on_up, on_down = _janitor(() -> nothing, Millisecond(50), "TestJanitor", "test tick", "interval")
+    janitor = LifecycleMiddleware(middleware = _pass, on_startup = on_up, on_shutdown = on_down)
+    @test on_up() isa Task                 # the hook itself: still a Task, unchanged
+    @test startup(janitor) === nothing     # through `startup`: discarded, as documented
+    @test shutdown(janitor) === nothing
+    on_down()                              # stop any activation this testset left running
+end
+
+@testset "_broadcast_lifecycle completes the sequence and keeps the FIRST interrupt" begin
+    order = String[]
+    mk(name) = LifecycleMiddleware(middleware = _pass, on_startup = () -> push!(order, name))
+    boom = LifecycleMiddleware(middleware = _pass,
+                               on_startup = () -> throw(InterruptException()))
+
+    got = _quiet(() -> Nitro.Core._broadcast_lifecycle(startup, [mk("a"), boom, mk("b")]))
+    @test got isa InterruptException
+    # The whole point of deferring: `b` ran anyway. A `break`-on-interrupt loses it.
+    @test order == ["a", "b"]
+
+    # A pre-existing interrupt from an earlier half of the same sequence is not overwritten.
+    # Without the `isnothing(interrupt) &&` guard the last one would win instead.
+    first_one = InterruptException()
+    @test _quiet(() -> Nitro.Core._broadcast_lifecycle(startup, [boom], first_one)) === first_one
+    @test Nitro.Core._broadcast_lifecycle(startup, [mk("c")], first_one) === first_one
+    @test Nitro.Core._broadcast_lifecycle(startup, LifecycleMiddleware[]) === nothing
+end
+
+end # @testitem
+
+
+@testitem "Lifecycle interrupt — a startup interrupt unwinds instead of stranding the listener (#185)" tags=[:middleware, :network] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+using Nitro.Core: LifecycleMiddleware
+import Nitro: App, path
+
+_pass(handler) = (req::HTTP.Request -> handler(req))
+
+# Route-owned hooks run FIRST, so this interrupt lands before the serve-owned half has started.
+# `armed` disarms it for the re-serve at the bottom: route-owned entries survive `terminate` by
+# design (#82), so without this the second `serve` would simply interrupt again and the
+# re-servability check would assert nothing about being stranded.
+armed = Ref(true)
+boom_stopped = Ref(0)
+boom = LifecycleMiddleware(middleware = _pass,
+                           on_startup  = () -> (armed[] && throw(InterruptException())),
+                           on_shutdown = () -> (boom_stopped[] += 1))
+later_started, later_stopped = Ref(0), Ref(0)
+later = LifecycleMiddleware(middleware = _pass,
+                            on_startup  = () -> (later_started[] += 1),
+                            on_shutdown = () -> (later_stopped[] += 1))
+
+ctx = App()
+Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+    path("/health", (req::HTTP.Request) -> Res.send("ok"), middleware = [boom])
+])
+
+# The fixture is what it claims to be: two DISTINCT entries, so `later` really does land in the
+# serve half. Pinned rather than assumed — `LifecycleMiddleware` is an immutable struct, so two
+# entries built from the same closure over the same `Ref` compare EQUAL, and the promotion rule
+# ("route ownership wins", #82) would then fold the serve-owned one into the route half and leave
+# the assertions below silently measuring one hook instead of two.
+@test boom != later
+
+Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
+    # Against the unpatched code nothing is thrown at all: the interrupt is eaten and `serve`
+    # returns a running server.
+    @test_throws InterruptException Nitro.Core.serve(ctx; middleware = [later], host = HOST,
+        port = get_free_port(), async = true, show_banner = false, show_errors = false,
+        access_log = nothing)
+end
+
+# The sequence completed past the interrupt — a bare `rethrow()` leaves this at 0.
+@test later_started[] == 1
+# ...and the unwind paired every hook that had started, including the one that interrupted.
+@test boom_stopped[] == 1
+@test later_stopped[] == 1
+
+# The listener `start(...)` had already opened is closed, not stranded.
+@test !Base.isopen(ctx.service)
+@test ctx.service.server[] === nothing
+@test isempty(ctx.service.serve_lifecycle)
+@test ctx.service.external_url[] === nothing
+
+# The operator-visible assertion. Against a bare `rethrow()` this dies with
+# `ArgumentError("This App is already serving on …")` and nothing can close the old listener.
+armed[] = false
+Nitro.Core.serve(ctx; host = HOST, port = get_free_port(), async = true,
+                 show_banner = false, show_errors = false, access_log = nothing)
+@test timedwait(() -> Base.isopen(ctx.service), 10.0) === :ok
+Nitro.Core.terminate(ctx)
+@test !Base.isopen(ctx.service)
+
+end # @testitem
+
+
+@testitem "Lifecycle interrupt — terminate completes its teardown before re-raising (#185)" tags=[:middleware, :network] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+using Nitro.Core: LifecycleMiddleware
+import Nitro: App, path
+
+_pass(handler) = (req::HTTP.Request -> handler(req))
+
+@testset "a serve-owned interrupt does not abandon the route-owned half" begin
+    # `terminate` unwinds serve-owned first, so B interrupts BEFORE A's hook runs — which is
+    # exactly the ordering a bare `rethrow()` destroys.
+    a_down = Ref(0)
+    a = LifecycleMiddleware(middleware = _pass, on_shutdown = () -> (a_down[] += 1))
+    b = LifecycleMiddleware(middleware = _pass,
+                            on_shutdown = () -> throw(InterruptException()))
+    @test a != b        # distinct entries, or promotion folds `b` into the route half — see below
+
+    ctx = App()
+    Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+        path("/health", (req::HTTP.Request) -> Res.send("ok"), middleware = [a])
+    ])
+    Nitro.Core.serve(ctx; middleware = [b], host = HOST, port = get_free_port(), async = true,
+                     show_banner = false, show_errors = false, access_log = nothing)
+    @test timedwait(() -> Base.isopen(ctx.service), 10.0) === :ok
+
+    Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
+        # Unpatched: `terminate` swallows it and does not throw at all.
+        @test_throws InterruptException Nitro.Core.terminate(ctx)
+    end
+
+    @test a_down[] == 1                        # the later half of the sequence still ran
+    @test isempty(ctx.service.serve_lifecycle)  # the clears still ran
+    @test ctx.service.external_url[] === nothing
+    @test !Base.isopen(ctx.service)             # `close` still ran
+    @test ctx.service.server[] === nothing
+
+    # Not stranded: the app serves and stops cleanly afterwards.
+    Nitro.Core.serve(ctx; host = HOST, port = get_free_port(), async = true,
+                     show_banner = false, show_errors = false, access_log = nothing)
+    @test timedwait(() -> Base.isopen(ctx.service), 10.0) === :ok
+    Nitro.Core.terminate(ctx)
+    @test !Base.isopen(ctx.service)
+end
+
+@testset "both halves interrupt: one escapes, both are reported" begin
+    # A counter EACH, deliberately. `LifecycleMiddleware` is an immutable struct, so two entries
+    # built from the same closure over the same `Ref` compare EQUAL — and the promotion rule
+    # ("route ownership wins", #82) then folds the serve-owned one into the route half, leaving
+    # the serve half empty and this testset silently measuring one hook instead of two.
+    a_entered, b_entered = Ref(0), Ref(0)
+    a = LifecycleMiddleware(middleware = _pass,
+        on_shutdown = () -> (a_entered[] += 1; throw(InterruptException())))
+    b = LifecycleMiddleware(middleware = _pass,
+        on_shutdown = () -> (b_entered[] += 1; throw(InterruptException())))
+
+    ctx = App()
+    Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+        path("/both", (req::HTTP.Request) -> Res.send("ok"), middleware = [a])
+    ])
+    Nitro.Core.serve(ctx; middleware = [b], host = HOST, port = get_free_port(), async = true,
+                     show_banner = false, show_errors = false, access_log = nothing)
+    @test timedwait(() -> Base.isopen(ctx.service), 10.0) === :ok
+    # The fixture is what it claims to be: one interrupting hook in EACH half.
+    _rlf, _slf = Nitro.Core.lifecycle_snapshot(ctx)
+    @test length(_rlf) == 1
+    @test length(_slf) == 1
+
+    logger = Test.TestLogger(min_level = Base.CoreLogging.Warn)
+    Base.CoreLogging.with_logger(logger) do
+        @test_throws InterruptException Nitro.Core.terminate(ctx)
+    end
+
+    # Both hooks ran; neither was skipped. `b` is serve-owned so it interrupts FIRST, and `a`
+    # runs anyway — a bare `rethrow()` leaves `a_entered[]` at 0.
+    @test b_entered[] == 1
+    @test a_entered[] == 1
+    @test !Base.isopen(ctx.service)             # the teardown still completed
+    # The dropped interrupt is REPORTED, not silently discarded: `_report_interrupt` logs at the
+    # moment each one happens, precisely because only the first is re-raised.
+    reported = count(r -> occursin("interrupt during LifecycleMiddleware.on_shutdown", r.message),
+                     logger.logs)
+    @test reported == 2
+end
+
+end # @testitem
+
+
+# NOT TESTED HERE, and stated rather than faked: the `finally terminate(ctx)` that #185 added to
+# `startserver`'s `!async` branch (`src/core/lifecycle.jl`), which stops a BLOCKING `serve` from
+# returning with its listener still open after Ctrl-C.
+#
+# Two reasons no test here is worth its cost:
+#
+#  1. The interrupt has to arrive in a task already parked in `wait(ctx.service)`, and
+#     `schedule(t, exc; error = true)` is documented as incorrect for a started, blocked task.
+#     Doing it anyway does not fail this item — it tears down the ReTestItems runner itself with
+#     a `TaskFailedException`, which is how this comment came to be written.
+#  2. No IN-PROCESS test is honest, and the out-of-process one is not portable. A subprocess that
+#     opts in with `Base.exit_on_sigint(false)` WOULD reproduce it — that is a normal pattern for
+#     a containerized server wanting graceful SIGINT shutdown, and it is precisely the deployment
+#     this `finally` helps. But it costs a process per run and leans on SIGINT delivery to a
+#     child process, which is unlikely to be portable to the Windows leg of the CI matrix —
+#     Windows has no POSIX signals and maps `kill` onto console control events. That last point
+#     is a judgement, not a measurement: nobody has spot-checked it on the Windows runner. If
+#     this coverage is ever wanted badly enough, measure it there first.
+#
+# Note what reason 2 does NOT claim. Julia's *default* non-interactive posture is
+# `exit_on_sigint(true)` (`base/client.jl`), under which SIGINT calls `jl_exit` and no
+# `InterruptException` is ever constructed — that is why this is not an upgrade-note-worthy
+# behavior change. It is a default, not a law, and an app may opt out of it.
+#
+# Reviewed by eye, the same call `janitor_tests.jl` makes about `errormonitor`. What the items
+# above DO pin is the half that is reachable in-process: an interrupt inside a startup or
+# shutdown hook.
