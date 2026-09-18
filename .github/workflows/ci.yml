@@ -8,7 +8,7 @@ on:
       - main
     tags: '*'
 # Least privilege by default. Only the `docs` job writes anything, and it neither clones
-# nor executes PormG. Every job that DOES execute the pinned sibling checkout runs with
+# nor executes PormG. Every job that DOES build and execute the pinned PormG source runs with
 # `contents: read`, `persist-credentials: false`, and no token in its environment.
 #
 # All three are needed, and none substitutes for the others:
@@ -22,22 +22,30 @@ on:
 # See the `docs` job for where the write scope and the secrets actually live.
 permissions:
   contents: read
-env:
-  # PormG is pinned to an immutable commit rather than tracked at default-branch HEAD,
-  # because the `test` job below builds and EXECUTES this code under `Pkg.test()`. An
-  # unpinned clone makes a moving third-party input part of every CI run. (`smoke` also
-  # fetches it, but only so `[sources]` resolves -- see that job.) Declared once here so
-  # the two jobs cannot drift apart.
-  #
-  # BUMPING THIS: run `PormG.upgrade_guide(from = v"0.5.0")` from PormG's own env first and
-  # apply every entry. Pass the LOWER BOUND of the `[compat]` range -- that entry is `^0.5`,
-  # which is not itself a version literal. Same rule the `[compat]` pin already carries.
-  PORMG_REV: 6d708b4d4b9a1bdefca89fe44c29652574c931c0
+# There is ONE PormG pin now, and it lives in `Project.toml`:
+#
+#     [sources]
+#     PormG = {url = "https://github.com/PingoLee/PormG.jl.git", rev = "<sha>"}
+#
+# `PORMG_REV` and the two sibling-checkout steps that consumed it are gone. They existed only
+# because a `[sources]` PATH dep gives Pkg nothing to pin against (#21), so the immutable rev had
+# to be enforced here, out of band, by a hand-rolled clone -- and the two pins then had to be
+# moved together or CI tested a configuration nobody ships. A `url` + `rev` source gives Pkg the
+# pin directly: it fetches that exact commit itself, records its tree hash in the manifest, and
+# every job that instantiates the project gets the same code with no workflow step at all.
+#
+# BUMPING IT: run `PormG.upgrade_guide(from = v"<lower bound of [compat]>")` from PormG's own env
+# first and apply every entry. That entry reads `^0.5`, so the argument is `v"0.5.0"` -- the range
+# is not itself a version literal. `[compat]` and `[sources]` still move together, but they are
+# now both in one file.
+#
+# Use a full 40-character SHA, never a tag: a tag is mutable and can be re-pointed, which is
+# precisely the immutability this pin exists to provide.
 jobs:
   test:
     name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.threads }} thread(s)
     runs-on: ${{ matrix.os }}
-    # This job executes the PormG checkout. It gets no write scope and no token.
+    # This job builds and executes the pinned PormG source. No write scope, no token.
     permissions:
       contents: read
     env:
@@ -98,26 +106,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # This job EXECUTES the PormG checkout. checkout's default
+          # This job EXECUTES the pinned PormG source. checkout's default
           # `persist-credentials: true` writes an `AUTHORIZATION: basic <token>`
           # extraheader into `$GITHUB_WORKSPACE/.git/config`, on disk, readable by
-          # every process in the job -- including the code fetched below. Dropping
+          # every process in the job -- including the code Pkg fetches below. Dropping
           # `permissions` to `contents: read` makes that token weak; this makes it
           # absent. Nothing in this job pushes. (#21)
           persist-credentials: false
-      # PormG is a path dependency (`[sources] PormG = {path = "../PormG.jl"}`)
-      # and a hard test dependency, so it must exist alongside this checkout for
-      # `Pkg.test()` to resolve. checkout@v4 won't write outside the workspace,
-      # so fetch it as a sibling directly, pinned to `PORMG_REV` (top of this file).
-      # A `--depth 1` clone can only take a branch tip, so this fetches the one
-      # commit by SHA instead -- that is what makes the pin immutable.
-      - name: Check out PormG.jl (sibling path dependency, pinned)
-        shell: bash
-        run: |
-          git init -q ../PormG.jl
-          git -C ../PormG.jl remote add origin https://github.com/PingoLee/PormG.jl.git
-          git -C ../PormG.jl fetch -q --depth 1 origin "$PORMG_REV"
-          git -C ../PormG.jl checkout -q --detach FETCH_HEAD
+      # No PormG checkout step. `[sources]` pins it by url + rev, so `julia-buildpkg` below
+      # fetches that exact commit itself. This job still EXECUTES that code under `Pkg.test()`,
+      # which is why it keeps `contents: read` and `persist-credentials: false` above (#21).
       - uses: julia-actions/setup-julia@v2
         with:
           version: ${{ matrix.version }}
@@ -174,16 +172,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false   # same reason as the `test` job
-      # Same sibling-checkout reason as the `test` job: PormG is a `[sources]` path
-      # dependency, so the project cannot resolve without it alongside this checkout.
-      # Pinned to the same `PORMG_REV`, for the same reason.
-      - name: Check out PormG.jl (sibling path dependency, pinned)
-        shell: bash
-        run: |
-          git init -q ../PormG.jl
-          git -C ../PormG.jl remote add origin https://github.com/PingoLee/PormG.jl.git
-          git -C ../PormG.jl fetch -q --depth 1 origin "$PORMG_REV"
-          git -C ../PormG.jl checkout -q --detach FETCH_HEAD
+      # No PormG checkout step, same as the `test` job: `[sources]` pins it by url + rev and
+      # `julia-buildpkg` fetches it. This job does not run PormG's code -- the smoke test
+      # touches nothing test-only -- but the project still has to resolve.
       - uses: julia-actions/setup-julia@v2
         with:
           version: ${{ matrix.version }}
@@ -202,6 +193,25 @@ jobs:
     # fetches no PormG, so the third-party code #21 is about never runs here -- which is
     # why the write scope and both secrets are parked in this job rather than at workflow
     # level.
+    #
+    # That property is now a FACT ABOUT PKG rather than a structural impossibility, and the
+    # difference is worth knowing. Under the old path dep it was fail-closed: a job that
+    # somehow pulled PormG's `[sources]` would have died at resolve, because no
+    # `../PormG.jl` exists on a runner. Under a url + rev source the same slip would clone
+    # PormG -- and potentially build and execute it -- while holding DOCUMENTER_KEY. Two
+    # independent things stop that, both checked in Pkg 1.12's `Operations.jl`:
+    #
+    #   * PormG is a WEAKDEP. `collect_project` resolves `[sources]` (via `get_path_repo`)
+    #     only in its `project.deps` loop; the `project.weakdeps` loop builds a bare
+    #     `PackageSpec(name, uuid, vspec)` with no path and no repo. So a `Pkg.develop`'d
+    #     Nitro never has its PormG source consulted at all.
+    #   * `[sources]` crosses a project boundary in exactly ONE place --
+    #     `test_project.sources = source_env.project.sources`, where `Pkg.test` copies the
+    #     tested package's sources into the env it generates. That is why `test` fetches
+    #     PormG and why this job, which never calls `Pkg.test`, structurally cannot.
+    #
+    # `ci_workflow_tests.jl` cannot guard this: its counter keys off `julia-buildpkg`, which
+    # this job does not use. If either Pkg behaviour changes, this is the job to re-read.
     #
     # Two things this comment deliberately does NOT claim:
     #   * `test` is not credential-free -- it hands GITHUB_TOKEN to coveralls as a STEP

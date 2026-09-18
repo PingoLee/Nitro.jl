@@ -764,10 +764,10 @@ SQL dropped, but it can discard an extra one.
 
 `System` fetches everything. An `Owner` fetches two sets, unioned:
 
-- `id__startswith "<owner>::"` — the owned tasks. `owner_of(id) == u` is equivalent to
+- `id__@startswith "<owner>::"` — the owned tasks. `owner_of(id) == u` is equivalent to
   `startswith(id, u * "::")` for any constructible `Owner`, because `u` contains no
   `"::"` and `Owner("")` cannot exist.
-- `watchers__contains` the **JSON-quoted** id — the granted ones, which have no id
+- `watchers__@contains` the **JSON-quoted** id — the granted ones, which have no id
   prefix, and every `:global` task, which is watcher-only. Quoting matters: searching
   for `"bob"` with its quotes cannot match `["bobby"]`.
 

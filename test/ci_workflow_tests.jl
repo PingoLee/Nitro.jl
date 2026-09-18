@@ -72,24 +72,43 @@ end
 # rather than hard-coding 2, so adding a third such job cannot leave a hardening step
 # behind -- the counts have to keep up with it.
 #
-# Two independent counters, and the larger wins. The fetch line is the direct evidence, but
-# it only matches when `fetch` and a bare `$PORMG_REV` share a line; a future job spelling
-# it `"${PORMG_REV}"` or `${{ env.PORMG_REV }}` would count zero and quietly shrink the
-# floor. `git init ../PormG.jl` is invariant to how the revision is spelled.
-const PORMG_JOBS = max(count(r"fetch[^\n]*\$PORMG_REV", CI_SRC),
-                       count(r"init[^\n]*\.\./PormG\.jl", CI_SRC))
+# The counter moved with the mechanism. It used to key off the hand-rolled checkout step
+# (`git init ../PormG.jl` + `fetch $PORMG_REV`), which no longer exists: `[sources]` pins
+# PormG by url + rev, so whatever instantiates the project fetches it. That is
+# `julia-actions/julia-buildpkg`, and it is therefore the honest marker for "this job
+# materialises and may execute PormG's code". `docs` does not use it -- it instantiates
+# `--project=docs`, which does not carry Nitro's `[sources]` -- which is what keeps the
+# write scope and both secrets parked there, exactly as before.
+const PORMG_JOBS = count(r"julia-actions/julia-buildpkg", CI_SRC)
 
 @testset "PormG is pinned to an immutable commit, defined exactly once" begin
-    revs = collect(eachmatch(r"PORMG_REV:\s*([0-9a-f]{40})\b", CI_SRC))
-    # Exactly one definition, so the jobs consuming it cannot drift apart. This one IS an
-    # equality on purpose -- a second definition is the drift being prevented.
-    @test length(revs) == 1
-    # ...and it is consumed by the `test` and `smoke` jobs.
-    @test PORMG_JOBS >= 2
-    @test count(r"\$PORMG_REV", CI_SRC) >= PORMG_JOBS
-    # A branch-tip clone is the defect being guarded: `--depth 1` can only fetch a tip,
-    # which is why the pinned form is init + fetch-by-SHA instead.
+    # The pin lives in Project.toml now, not in the workflow. Read the SHIPPED file, for
+    # the same reason every other assertion here does.
+    project_src = read(joinpath(pkgdir(Nitro), "Project.toml"), String)
+    sources = collect(eachmatch(r"(?m)^PormG\s*=\s*\{(.+)\}\s*$", project_src))
+    # Exactly one `[sources]` entry for PormG, so nothing can drift apart.
+    @test length(sources) == 1
+    entry = sources[1][1]
+    # A url + a full 40-hex commit. A TAG would satisfy "pinned" to the eye and not in
+    # fact: tags are mutable and can be re-pointed, which is the whole property this is
+    # for. So is a branch name.
+    @test occursin("https://github.com/PingoLee/PormG.jl.git", entry)
+    @test occursin(r"rev\s*=\s*\"[0-9a-f]{40}\"", entry)
+    # ...and it is not a path dep any more. A path dep is what made the second, out-of-band
+    # pin necessary (#21), and it is also what made resolution depend on whatever state a
+    # sibling working tree happened to be in.
+    @test !occursin("path", entry)
+
+    # The workflow carries no PormG pin of its own. A second one is the drift being
+    # prevented -- `PORMG_REV` had to be moved in lockstep with `[compat]` or CI tested a
+    # configuration nobody ships.
+    @test !occursin("PORMG_REV", CI_SRC)
+    # ...and no hand-rolled checkout creeps back in, by clone or by init+fetch.
     @test !occursin(r"clone[^\n]*PormG\.jl\.git", CI_SRC)
+    @test !occursin(r"init[^\n]*\.\./PormG\.jl", CI_SRC)
+
+    # The jobs that build the project are still the two that did.
+    @test PORMG_JOBS >= 2
 end
 
 @testset "every job that fetches the PormG tree is hardened" begin

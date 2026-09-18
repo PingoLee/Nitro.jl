@@ -401,7 +401,9 @@ end
 # the shorter one to write (#48, #108). It is the identity `_register_or_watch!` minted for this
 # run, and it is the only thing that makes the read below this run's own.
 function _execute_task_async(runtime::WorkerRuntime, task_key::String, callback::Function, options::TaskOptions, run_id::UUID)
-    task = Threads.@spawn begin
+    # `_spawn_detached`, not `Threads.@spawn`: the run must not inherit the submitter's dynamic
+    # scope, or `_claim_run!` below writes on the submitter's open PormG transaction (#209).
+    task = _spawn_detached() do
         # The durable read, the #191 identity check against the CARRIED `run_id`, and the handle
         # publish, as one critical section under the store lock -- `_claim_run!` (`queue.jl`)
         # owns the rationale. Runs INSIDE the spawned task, because the handle it publishes is
@@ -892,7 +894,11 @@ function start_cleanup_scheduler(; interval_hours::Real=24, retain_days::Int=7, 
     #     cost one tick, never the scheduler: this is the component whose entire job is bounding
     #     the task table, and with the `try` hoisted out (or absent, as it was) one transient
     #     error left rows accumulating for the life of the process (#169, #190, #195).
-    task = errormonitor(@async begin
+    #   * `_schedule_detached`, not a bare `@async` (#209). The scheduler is started from
+    #     `start!`, which an app may well call inside its own bootstrap transaction, and it then
+    #     issues a store DELETE on every tick for the life of the process. `@async`'s stickiness
+    #     is kept; only the inherited dynamic scope is dropped.
+    task = errormonitor(_schedule_detached() do
         while true
             # Closed counts as stopped: `stop_cleanup_scheduler!` signals by closing, and an
             # empty closed channel is never `isready`.

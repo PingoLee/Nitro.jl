@@ -381,7 +381,13 @@ function _start_queue_processor(runtime::WorkerRuntime, queue_name::String)
             return queue
         end
         queue.running = true
-        queue.processor_task = Threads.@spawn begin
+        # `_spawn_detached`, not `Threads.@spawn` (#209). This one matters more than the async
+        # path, not less: the processor is spawned by whoever submits FIRST into an unstarted
+        # queue (`submit_sequential_task` -> `_start_queue_processor`), and it then runs for the
+        # life of the process. Inheriting that caller's scope would pin every item this queue
+        # ever executes -- including ones submitted hours later, by anyone -- to a transaction
+        # connection that was returned to the pool long ago.
+        queue.processor_task = _spawn_detached() do
             try
                 while true
                     item = try

@@ -12,6 +12,43 @@ using Nitro.Errors: AuthorizationError
 # available in the active test environment. The mock model below replaces only
 # the database layer; store methods come from ext/NitroPormGExt.jl.
 
+# Operator names this mock DIAGNOSES SPECIFICALLY. Spelling one of these without the `@` is the
+# drift #180 is about, so it gets its own message rather than being lumped in with any other
+# unmodelled key. Ported from `pormg_session_tests.jl`, which grew the guard first (#208).
+#
+# Deliberately a subset of the real `PormGsuffix` (`PormG/src/constants.jl`), which also carries
+# `istartswith`, `iendswith`, the negated `n*` family, the unaccent forms and the JSON
+# predicates. Nothing is weakened by the gap: an unlisted suffix still throws, just with the
+# generic "unmodelled filter key" text instead of the `@`-prefix diagnosis. Widen it when the
+# ext starts using one of those.
+const PORMG_OPERATOR_NAMES = Set([
+    "gte", "gt", "lte", "lt", "ne", "isnull", "in", "nin",
+    "contains", "icontains", "startswith", "endswith", "range",
+])
+
+# Every filter key the mock knows how to evaluate. Anything else is a query the mock is not
+# actually exercising, and must say so. These are exactly the keys `ext/NitroPormGExt.jl`
+# builds -- adding one here without the matching branch below is how the guard rots.
+const MODELLED_FILTER_KEYS = Set([
+    "id", "run_id", "status", "status__@in", "queue_name",
+    "completed_at__@lte", "completed_at__@isnull",
+    "watchers", "id__@startswith", "watchers__@contains",
+])
+
+function _reject_filter_key(k::String)
+    parts = split(k, "__")
+    suffix = String(parts[end])
+    if length(parts) > 1 && !startswith(suffix, "@") && suffix in PORMG_OPERATOR_NAMES
+        error("MockTaskQuerySet: filter key '$k' is missing PormG's `@` operator prefix. " *
+              "Real PormG throws `FilterError` here (\"requires '@' prefix\"), so against a " *
+              "database this spelling matches nothing and the store's query silently does not " *
+              "constrain -- the #180 defect class. Use " *
+              "'$(join(parts[1:end-1], "__"))__@$(suffix)'.")
+    end
+    error("MockTaskQuerySet: unmodelled filter key '$k' -- teach the mock about it, or the " *
+          "query under test is not actually being exercised.")
+end
+
 mutable struct MockTaskQuerySet
     # One table PER CONNECTION, not one table. A single-table mock cannot express #203 at
     # all: "created the table on `tasks`, then read and wrote every row on `db`" is not a
@@ -20,6 +57,11 @@ mutable struct MockTaskQuerySet
     tables::Dict{String, Dict{String, Dict{String, Any}}}   # db key -> task id -> row
     db_key::Union{Nothing, String}                          # `nothing` until `.db(key)` runs
     filters::Dict{String, Any}
+    # Every filter a query actually RAN with, shared across a `.db(k).filter(a).filter(b)`
+    # chain and across every queryset the owning model mints. Without it a test can only
+    # check the rows that came back, never that the query carried the run-id fence, the
+    # scope prefix or the status set it was supposed to (#208).
+    seen::Vector{Dict{String, Any}}
 end
 
 # The one place a connection is resolved. Every terminal op goes through here, so a query
@@ -37,8 +79,26 @@ function _selected_table(qs::MockTaskQuerySet)
 end
 
 function _filtered_rows(qs::MockTaskQuerySet)
-    table = _selected_table(qs)
     filters = getfield(qs, :filters)
+
+    # Validate EVERY key BEFORE looking at any row, and before resolving the connection.
+    # Checking inside the row loop -- which is where this started -- makes the guard vanish on
+    # an empty table, and an empty table is precisely the state a retention sweep runs against
+    # once it has worked. It also let an earlier non-matching key `break` out before an
+    # unmodelled one was ever reached.
+    for k in keys(filters)
+        k in MODELLED_FILTER_KEYS || _reject_filter_key(k)
+    end
+
+    # Recorded AFTER validation, so `_filters_seen` holds only filters a query could actually
+    # run with -- otherwise an assertion written against it alone could be satisfied by a query
+    # that threw. Recorded here rather than in `filter` because accumulation means only the
+    # terminal op knows the whole of it.
+    push!(getfield(qs, :seen), copy(filters))
+
+    # AFTER the filter-key check: a misspelled filter is the more specific diagnosis, and the
+    # `@test_throws` in "the mock refuses what PormG refuses" drive `m.objects` directly.
+    table = _selected_table(qs)
     rows = Dict{String, Any}[]
 
     for row in values(table)
@@ -56,10 +116,8 @@ function _filtered_rows(qs::MockTaskQuerySet)
                 matches = row["status"] in v
             elseif k == "queue_name"
                 matches = row["queue_name"] == v
-            elseif k == "completed_at__lte" || k == "completed_at__@lte"
+            elseif k == "completed_at__@lte"
                 matches = row["completed_at"] !== nothing && row["completed_at"] <= v
-            elseif k == "completed_at__gt" || k == "completed_at__@gt"
-                matches = row["completed_at"] !== nothing && row["completed_at"] > v
             elseif k == "completed_at__@isnull"
                 matches = (row["completed_at"] === nothing) == v
             elseif k == "watchers"
@@ -67,18 +125,17 @@ function _filtered_rows(qs::MockTaskQuerySet)
                 # add_watcher!'s CAS. Without this branch the filter fell through and
                 # matched on `id` alone, so the CAS always appeared to win.
                 matches = row["watchers"] == v
-            elseif k == "id__startswith" || k == "id__@startswith"
+            elseif k == "id__@startswith"
                 matches = startswith(row["id"], v)
-            elseif k == "watchers__contains" || k == "watchers__@contains"
+            elseif k == "watchers__@contains"
                 # Substring match on the serialized JSON, like the real backend.
                 matches = occursin(v, row["watchers"])
             else
-                # Previously an unrecognised key fell through and left `matches` at
-                # whatever the last branch set, so a filter the mock did not model
-                # silently did not constrain — and any test relying on it passed
-                # vacuously. Fail loudly instead.
-                error("MockTaskQuerySet: unmodelled filter key '$k' — teach the mock " *
-                      "about it, or the query under test is not actually being exercised")
+                # Unreachable: the loop above rejected every key not in
+                # `MODELLED_FILTER_KEYS`. Kept as the belt to that braces, so adding a key to
+                # the constant without a branch here fails loudly instead of leaving `matches`
+                # at whatever the previous key set.
+                _reject_filter_key(k)
             end
             matches || break
         end
@@ -135,6 +192,11 @@ function Base.getproperty(qs::MockTaskQuerySet, name::Symbol)
         end
     elseif name === :update
         return function(pairs::Pair{String,<:Any}...)
+            # PormG refuses an unfiltered update outright (`UnsafeMutationError`). A store bug
+            # that lost its `.filter(...)` and rewrote every row used to read as a pass here.
+            isempty(getfield(qs, :filters)) &&
+                error("MockTaskQuerySet: update() requires a filter -- refusing to update " *
+                      "every row, as PormG does.")
             # Return the affected-row count, matching PormG's Django-style `update`.
             # It used to return `nothing`, which would make every compare-and-set in
             # the store read as a failure — or, worse, as an untested success.
@@ -148,7 +210,16 @@ function Base.getproperty(qs::MockTaskQuerySet, name::Symbol)
             return touched
         end
     elseif name === :delete
-        return function()
+        # Bound to a local instead of returned directly: Julia 1.13's parser drops the
+        # parameter block of a keyword-only `return function(; kw=default)` written inside
+        # a `function ... end` body, lowering it to `function kw = default` and erroring
+        # with `invalid assignment location`. 1.12 parses it fine. `f = function(; …)` then
+        # `return f` parses correctly on both.
+        delete_fn = function(; allow_delete_all::Bool=false)
+            # PormG's real guard: an unfiltered delete throws unless opted into explicitly.
+            (!allow_delete_all && isempty(getfield(qs, :filters))) &&
+                error("MockTaskQuerySet: delete() must have a filter -- pass " *
+                      "allow_delete_all = true to delete every row, as PormG requires.")
             table = _selected_table(qs)
             count = 0
             for row in _filtered_rows(qs)
@@ -157,6 +228,7 @@ function Base.getproperty(qs::MockTaskQuerySet, name::Symbol)
             end
             return count, Dict{String, Integer}("nitro_task" => count)
         end
+        return delete_fn
     else
         return getfield(qs, name)
     end
@@ -167,6 +239,7 @@ Base.iterate(qs::MockTaskQuerySet, state) = iterate(_filtered_rows(qs), state)
 
 struct MockTaskModel
     _tables::Dict{String, Dict{String, Dict{String, Any}}}
+    _filters_seen::Vector{Dict{String, Any}}
 end
 
 # Every connection this model may be queried on. A test that exercises routing names both
@@ -174,13 +247,15 @@ end
 # that does not care about routing uses.
 MockTaskModel(db_keys::String...) = MockTaskModel(
     Dict{String, Dict{String, Dict{String, Any}}}(
-        k => Dict{String, Dict{String, Any}}() for k in (isempty(db_keys) ? ("db",) : db_keys)))
+        k => Dict{String, Dict{String, Any}}() for k in (isempty(db_keys) ? ("db",) : db_keys)),
+    Dict{String, Any}[])
 
 function Base.getproperty(m::MockTaskModel, name::Symbol)
     if name === :objects
         # No connection selected yet -- exactly what PormG's `model.objects` hands back.
         # `.db(key)` is what picks one.
-        return MockTaskQuerySet(getfield(m, :_tables), nothing, Dict{String,Any}())
+        return MockTaskQuerySet(getfield(m, :_tables), nothing, Dict{String,Any}(),
+                                getfield(m, :_filters_seen))
     elseif name === :_table
         # The DEFAULT connection's table: what every assertion that does not care about
         # routing means, kept as an alias rather than rewritten at ~30 call sites.
@@ -250,17 +325,19 @@ struct FlakyReadModel
     _tables::Dict{String, Dict{String, Dict{String, Any}}}
     fail_next::Ref{Int}
     fail_ids::Set{String}
+    _filters_seen::Vector{Dict{String, Any}}
 end
 
 FlakyReadModel(db_keys::String...) = FlakyReadModel(
     Dict{String, Dict{String, Dict{String, Any}}}(
         k => Dict{String, Dict{String, Any}}() for k in (isempty(db_keys) ? ("db",) : db_keys)),
-    Ref(0), Set{String}())
+    Ref(0), Set{String}(), Dict{String, Any}[])
 
 function Base.getproperty(m::FlakyReadModel, name::Symbol)
     if name === :objects
         return FlakyReadQuerySet(
-            MockTaskQuerySet(getfield(m, :_tables), nothing, Dict{String,Any}()),
+            MockTaskQuerySet(getfield(m, :_tables), nothing, Dict{String,Any}(),
+                             getfield(m, :_filters_seen)),
             getfield(m, :fail_next),
             getfield(m, :fail_ids),
         )
@@ -320,16 +397,19 @@ struct RacingWatcherModel
     _tables::Dict{String, Dict{String, Dict{String, Any}}}
     inject_next::Ref{Int}
     intruder::String
+    _filters_seen::Vector{Dict{String, Any}}
 end
 
 RacingWatcherModel(table::Dict{String, Dict{String, Any}}, inject_next::Ref{Int}, intruder::String) =
     RacingWatcherModel(
-        Dict{String, Dict{String, Dict{String, Any}}}("db" => table), inject_next, intruder)
+        Dict{String, Dict{String, Dict{String, Any}}}("db" => table), inject_next, intruder,
+        Dict{String, Any}[])
 
 function Base.getproperty(m::RacingWatcherModel, name::Symbol)
     if name === :objects
         return RacingWatcherQuerySet(
-            MockTaskQuerySet(getfield(m, :_tables), nothing, Dict{String,Any}()),
+            MockTaskQuerySet(getfield(m, :_tables), nothing, Dict{String,Any}(),
+                             getfield(m, :_filters_seen)),
             getfield(m, :inject_next),
             getfield(m, :intruder),
         )
@@ -491,6 +571,20 @@ else
             @test get_task_info(store2, "task-recent") !== nothing
             @test get_task_info(store2, "task-expired") === nothing
             @test cleanup_tasks!(store2, 7) == 0
+
+            # ...and the sweep got there by ASKING for that, not by the rows happening to
+            # line up. Checking only the survivors cannot tell a correct three-part
+            # predicate from a `delete` that lost one of its legs and was rescued by the
+            # fixture (#208).
+            pruned = filter(f -> haskey(f, "completed_at__@lte"), store2.model._filters_seen)
+            @test !isempty(pruned)
+            @test all(f -> haskey(f, "status__@in"), pruned)
+            @test all(f -> haskey(f, "completed_at__@isnull") && f["completed_at__@isnull"] == false,
+                      pruned)
+            # Stringified, as `cleanup_tasks!` builds them -- and terminal statuses only,
+            # which is the leg that keeps a RUNNING row with an old `completed_at` alive.
+            @test all(f -> Set(f["status__@in"]) ==
+                           Set(string.((COMPLETED, FAILED, CANCELLED))), pruned)
         end
 
         @testset "get_all_tasks lists with user watchers constraint" begin
@@ -513,6 +607,17 @@ else
             @test tasks_b[1].id == "task-b"
 
             @test length(get_all_tasks(store3, System())) == 2
+
+            # The narrowing query carried both legs, with the exact spellings the docstring
+            # on `_authority_rows` promises: the `::`-terminated id prefix, and the
+            # JSON-QUOTED watcher id. Row assertions alone cannot see either -- `"bob"`
+            # unquoted would still return the right rows here and match `["bobby"]` in
+            # production (#208).
+            seen3 = store3.model._filters_seen
+            @test any(f -> Base.get(f, "id__@startswith", nothing) == "user-a::", seen3)
+            @test any(f -> Base.get(f, "watchers__@contains", nothing) == "\"user-a\"", seen3)
+            # `System()` narrows nothing: its leg is a bare `.list()`.
+            @test any(isempty, seen3)
         end
 
         @testset "watcher and status writes survive a concurrent writer (#88)" begin
@@ -586,6 +691,19 @@ else
                 @test get_task_info(store_t, "alice::cas").status == CANCELLED
                 @test try_transition!(store_t, "absent", (PENDING,), CANCELLED;
                                       run_id=nothing) == false
+
+                # The fence and the status precondition rode the SAME filter -- the whole
+                # point of #108 is that they are one statement, not a read then a write.
+                # A row assertion cannot distinguish that from a `run_id` term dropped
+                # against a single-run fixture (#208).
+                fenced = filter(f -> haskey(f, "run_id"), store_t.model._filters_seen)
+                @test !isempty(fenced)
+                @test all(f -> haskey(f, "status__@in") && haskey(f, "id"), fenced)
+                @test all(f -> f["run_id"] == string(t.run_id), fenced)
+                # `run_id=nothing` is the named opt-out: it omits the term rather than
+                # filtering on a missing value.
+                @test any(f -> haskey(f, "status__@in") && !haskey(f, "run_id"),
+                          store_t.model._filters_seen)
             end
         end
 
@@ -1721,6 +1839,13 @@ else
             @test cleanup_tasks!(store_c, 1) == 1
             @test !haskey(m._tables["tasks"], "stale")
             @test haskey(m._tables["db"], "stale")    # the other connection is not ours to prune
+
+            # The routed sweep still carried all three legs. `cleanup_tasks!` swallows its
+            # own exceptions (`@warn` + `return 0`), so a mock complaint here would surface
+            # only as a wrong count -- the recorded filter is what says the predicate was
+            # right rather than merely survivable (#208).
+            @test any(f -> haskey(f, "completed_at__@lte") && haskey(f, "status__@in") &&
+                           haskey(f, "completed_at__@isnull"), m._filters_seen)
         end
 
         @testset "the mock refuses a query with no connection selected (#203)" begin
@@ -1735,6 +1860,65 @@ else
 
             # ...and the routed form works, so the guard is not simply refusing everything.
             @test m.objects.db("tasks").filter("id" => "x").first() === nothing
+        end
+
+        @testset "the mock refuses what PormG refuses (#208)" begin
+            # The guard that makes this file able to detect the next #180. Driven through
+            # `m.objects` directly, never through a store method: `cleanup_tasks!` and
+            # `get_task_info` wrap their queries in `try`/`catch` blocks that WARN AND
+            # SWALLOW, so a store-level call would hide exactly the complaint under test.
+            m = MockTaskModel()
+
+            # 1. `@`-less operator spellings. PormG accepts only the `@` form; the mock used
+            #    to treat the bare one as an alias, so a store change that dropped an `@`
+            #    stayed green here and matched nothing against a database.
+            @test_throws "missing PormG's `@` operator prefix" m.objects.db("db").filter(
+                "completed_at__lte" => now(UTC)).list()
+            @test_throws "missing PormG's `@` operator prefix" m.objects.db("db").filter(
+                "id__startswith" => "alice::").list()
+            @test_throws "missing PormG's `@` operator prefix" m.objects.db("db").filter(
+                "watchers__contains" => "\"alice\"").list()
+            @test_throws "unmodelled filter key" m.objects.db("db").filter("nonsense" => 1).first()
+
+            # 2. The check runs on an EMPTY table. Inside the row loop -- where it started --
+            #    the guard vanishes exactly when the sweep has been working.
+            @test isempty(m._tables["db"])
+
+            # ...and it does not short-circuit past a later bad key when an earlier one
+            # would not have matched.
+            @test_throws "unmodelled filter key" m.objects.db("db").filter(
+                "id" => "no-such-row", "nonsense" => 1).list()
+
+            # 3. Unfiltered mutation. PormG refuses both; `delete` has one named hatch.
+            m._tables["db"]["doomed"] = Dict{String,Any}(
+                "id" => "doomed", "run_id" => "", "status" => "COMPLETED",
+                "progress" => 100.0, "result" => "", "error" => "",
+                "created_at" => now(UTC), "started_at" => nothing, "completed_at" => now(UTC),
+                "watchers" => "[]", "queue_name" => "default",
+            )
+            @test_throws "requires a filter" m.objects.db("db").update("status" => "FAILED")
+            @test_throws "must have a filter" m.objects.db("db").delete()
+            @test m._tables["db"]["doomed"]["status"] == "COMPLETED"   # nothing was written
+
+            # The hatch, so the guard is pinned as a guard rather than as "delete never
+            # works without a filter".
+            @test m.objects.db("db").delete(allow_delete_all=true) ==
+                  (1, Dict{String,Integer}("nitro_task" => 1))
+            @test isempty(m._tables["db"])
+
+            # 4. Filter recording is shared across a chain and across querysets.
+            m2 = MockTaskModel()
+            m2.objects.db("db").filter("id" => "a").filter("status" => "PENDING").list()
+            m2.objects.db("db").filter("queue_name" => "reports").list()
+            @test length(m2._filters_seen) == 2
+            @test m2._filters_seen[1] == Dict{String,Any}("id" => "a", "status" => "PENDING")
+            @test m2._filters_seen[2] == Dict{String,Any}("queue_name" => "reports")
+            # A copy, not the live dict: a later `.filter` on the same queryset must not
+            # rewrite what an earlier query was recorded as having run with.
+            qs = m2.objects.db("db").filter("id" => "b")
+            qs.list()
+            qs.filter("status" => "RUNNING").list()
+            @test m2._filters_seen[3] == Dict{String,Any}("id" => "b")
         end
 
         @testset "the task model is BOUND to its store's connection (#202)" begin
@@ -1793,6 +1977,43 @@ else
             # Neither constructor touches `PormG.config`, so no fixture is needed.
             @test RealPormGWorkerStore(db_key="tasks").model.connect_key == "tasks"
             @test RealPormGWorkerStore().model.connect_key == "db"
+        end
+
+        @testset "a run does not inherit the submitter's PormG transaction (#209)" begin
+            # The store-side half of the scope detach. `test/workers_tests.jl` proves the
+            # mechanism against a plain `ScopedValue`; this proves it against the actual value
+            # the hazard is about -- PormG's `_tx_context`, reached through its own public
+            # `with_tx_context` seam, so no live driver is needed.
+            #
+            # Before #209 the spawned run inherited this context, so `_claim_run!`'s durable
+            # read and the run-start CAS -- both BEFORE any callback code -- resolved onto the
+            # submitter's transaction connection, and kept writing on it after the block
+            # committed and returned it to the pool.
+            store_tx = RealPormGWorkerStore(model=MockTaskModel())
+            rt_tx = WorkerRuntime(store_tx)
+            conn = FakeTaskPool(String[])
+            seen = Channel{Tuple{Bool, Int}}(1)
+            try
+                PormG.with_tx_context(conn, nothing) do
+                    # The submitter really is inside a transaction...
+                    @test PormG.Configuration.in_transaction_context() == true
+                    @test PormG.Configuration.current_transaction_depth() == 1
+
+                    submit_task("tx-scope", () -> begin
+                        put!(seen, (PormG.Configuration.in_transaction_context(),
+                                    PormG.Configuration.current_transaction_depth()))
+                        return "done"
+                    end, Owner("user-tx"); runtime=rt_tx)
+                end
+
+                @test timedwait(() -> isready(seen), 5.0) == :ok
+                in_tx, depth = take!(seen)
+                # ...and the run it spawned is not.
+                @test in_tx == false
+                @test depth == 0
+            finally
+                reset_runtime!(rt_tx)
+            end
         end
     end
 end
