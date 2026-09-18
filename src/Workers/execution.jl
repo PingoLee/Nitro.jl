@@ -1,3 +1,84 @@
+# ── Detached spawning (#209) ──────────────────────────────────────────────────────────────
+#
+# `Threads.@spawn` and `@async` inherit the spawning task's **dynamic scope**, so every
+# `ScopedValue` open at the submit site is still open inside the run. PormG tracks transaction
+# state in exactly such a value (`PormG.Configuration._tx_context`), which made a task submitted
+# inside `PormG.run_in_transaction(...)` resolve its FIRST store write -- the run-start CAS,
+# before any user callback code -- onto the **submitter's** transaction connection. Either that
+# write was rolled back with the caller's block, or the block committed first and the run kept
+# writing on a connection already returned to the pool, racing whoever borrowed it next.
+#
+# It was never store-specific: a callback that queries PormG has the identical use-after-release
+# on `InMemoryWorkerStore`, with no Nitro store write involved. So the fix belongs here, in the
+# spawn, and not behind an extension seam -- which also keeps `src/Workers/` free of any PormG
+# reference (workers §6).
+#
+# The seam is `Task.scope`. `Base.setproperty!(::Task, :scope)` explicitly permits the write on
+# an **unstarted** task and refuses it on a started one, so building the `Task`, clearing its
+# scope, and only then scheduling is the sanctioned order. `Base.ScopedValues` is in Base from
+# 1.11 and Nitro pins `julia = "^1.12"`, so nothing is added to `Project.toml`.
+#
+# A worker run therefore sees the DEFAULT of every `ScopedValue`, not the submitter's binding --
+# with one deliberate exception, the logger, immediately below. That is the intended semantics
+# (a background run outlives the request that queued it) and it is a behaviour change carrying an
+# `UPGRADING.md` entry.
+
+# The LOGGER is carried in that same dynamic scope, and it is the one binding we put back.
+#
+# `Base.CoreLogging.CURRENT_LOGSTATE` is a `ScopedValue`, so clearing the scope also detaches a
+# run from any `with_logger(...)` block its submitter was inside — an app that configures
+# logging that way would silently lose every worker `@warn` and `@error`, which is a diagnostic
+# regression and no part of what #209 is about. A logger is not a pooled resource: nothing is
+# returned to a pool, nothing goes stale, so there is no reason to drop it. The connection state
+# is what had to go.
+#
+# Captured in the CALLER's scope and re-established inside the fresh one. `nothing` means no
+# scoped logger was set, and the detached task falls through to the global logstate on its own —
+# the same logger it would have used — so the wrapper is skipped entirely.
+function _detached_thunk(f::Function)
+    logstate = Base.ScopedValues.get(Base.CoreLogging.CURRENT_LOGSTATE)
+    logstate === nothing && return f
+    return () -> Base.CoreLogging.with_logstate(f, something(logstate))
+end
+
+"""
+    _spawn_detached(f) -> Task
+
+`Threads.@spawn f()`, but detached from the caller's dynamic scope (#209) — except for the
+logger, which is carried across deliberately.
+
+Matches `Threads.@spawn` in every other respect: non-sticky, `:default` thread pool. The
+`:default` pool is set explicitly because a bare `Task` does **not** default to it — see the
+parity assertion in `test/workers_tests.jl`, which is what fails if `_spawn_set_thrpool` or the
+`Task.scope` setter moves. (`_detached_thunk` reaches a third Base internal,
+`CoreLogging.CURRENT_LOGSTATE`; that one announces itself as an `UndefVarError` on the first
+spawn rather than as a silent behaviour change, so no assertion guards it.)
+"""
+function _spawn_detached(f::Function)
+    task = Task(_detached_thunk(f))
+    task.sticky = false
+    Base.Threads._spawn_set_thrpool(task, :default)
+    task.scope = nothing
+    schedule(task)
+    return task
+end
+
+"""
+    _schedule_detached(f) -> Task
+
+`@async f()`, but detached from the caller's dynamic scope (#209) — except for the logger, as
+above.
+
+Sticky, like `@async`: the caller chose `@async` over `Threads.@spawn` deliberately, and this
+must not change which pool the task lands in — only what scope it inherits.
+"""
+function _schedule_detached(f::Function)
+    task = Task(_detached_thunk(f))
+    task.scope = nothing
+    schedule(task)
+    return task
+end
+
 function _unwrap_exception(error)
     if error isa TaskFailedException
         return _unwrap_exception(error.task.exception)

@@ -5,10 +5,37 @@ using Dates
 using Nitro
 using Nitro.Workers
 using Nitro.Errors: AuthorizationError, StoreInterfaceError
+using Base.ScopedValues: ScopedValue, with
 
 function wait_for(predicate::Function; timeout::Real=5.0)
     return timedwait(predicate, timeout)
 end
+
+# A stand-in for any `ScopedValue` an app might have open at submit time -- PormG's
+# `_tx_context` is the one #209 is about, but nothing here needs PormG to say what a spawn
+# inherits. `:outer` is the default, i.e. what a correctly DETACHED worker run must observe.
+const _SCOPE_PROBE = ScopedValue(:outer)
+
+# Records the dynamic scope its retention sweep runs under.
+#
+# Implements ONLY `cleanup_tasks!` on purpose: the cleanup scheduler reaches nothing else on
+# the store, and the contract's missing-method errors are raised lazily at the call rather than
+# at construction — so a one-method store is the smallest thing that can observe `api.jl`'s
+# scheduler spawn without dragging in a 15-method backend.
+struct ScopeProbeStore <: AbstractWorkerStore
+    seen::Channel{Symbol}
+
+    ScopeProbeStore() = new(Channel{Symbol}(8))
+end
+
+# `isready ||`, so the sweep NEVER blocks. `timedwait`'s poll interval has a 0.1s floor, so a
+# scheduler asked for a 0.01s tick fires ~10x a second while the test takes exactly one entry.
+# An unguarded `put!` on a bounded channel would fill it within a second and then block the
+# scheduler INSIDE `cleanup_tasks!` -- no longer parked in `timedwait`, so it never observes the
+# stop signal, and `stop_cleanup_scheduler!` joins it with no deadline (workers §6). That hangs
+# the CI leg instead of failing it, which is the worse outcome by a distance.
+Nitro.Workers.cleanup_tasks!(s::ScopeProbeStore, ::Int) =
+    (isready(s.seen) || put!(s.seen, _SCOPE_PROBE[]); 0)
 
 # A store that implements nothing. Declared at item scope because a bare `struct` inside a
 # `@testset` body would still work, but this one is referenced from two testsets.
@@ -3471,6 +3498,156 @@ end
         end
     finally
         reset_runtime!(rt_store)
+    end
+end
+
+@testset "a worker run does not inherit the submitter's dynamic scope (#209)" begin
+    # `Threads.@spawn` inherits the spawning task's `ScopedValue` bindings. PormG tracks
+    # transaction state in one, so a task submitted inside `run_in_transaction` used to run its
+    # run-start write -- before any callback code -- on the submitter's transaction connection,
+    # and kept writing on it after the block committed and returned it to the pool.
+    #
+    # Everything here is backend-agnostic by construction: the hazard is the spawn, not the
+    # store, and an app on `InMemoryWorkerStore` whose callback queries PormG had it too.
+    # `test/extensions/pormg_worker_tests.jl` carries the PormG-specific proof.
+
+    @testset "the control: a plain Threads.@spawn DOES inherit" begin
+        # Without this, every assertion below would pass just as well against an unpatched
+        # `_spawn_detached` that did nothing -- `:outer` is also what you see when no scope
+        # was ever opened. This is the assertion that makes the rest mean something.
+        inherited = with(_SCOPE_PROBE => :inner) do
+            fetch(Threads.@spawn _SCOPE_PROBE[])
+        end
+        @test inherited === :inner
+    end
+
+    @testset "_spawn_detached drops the scope and nothing else" begin
+        detached = with(_SCOPE_PROBE => :inner) do
+            fetch(Nitro.Workers._spawn_detached(() -> _SCOPE_PROBE[]))
+        end
+        @test detached === :outer
+
+        # Parity with `Threads.@spawn` on every other axis. `_spawn_detached` reaches two Base
+        # internals -- the `Task.scope` setter and `Threads._spawn_set_thrpool` -- and a bare
+        # `Task` does NOT land in the `:default` pool on its own, so this is the assertion that
+        # goes red if either moves, instead of worker runs quietly migrating pools.
+        probe = Nitro.Workers._spawn_detached(() -> nothing)
+        reference = Threads.@spawn nothing
+        wait(probe); wait(reference)
+        @test Threads.threadpool(probe) === Threads.threadpool(reference) === :default
+        @test probe.sticky === reference.sticky === false
+    end
+
+    @testset "the LOGGER survives the detach, because it is scope-carried too" begin
+        # `Base.CoreLogging.CURRENT_LOGSTATE` is a `ScopedValue`, so a blanket detach would
+        # also cut a run off from any `with_logger(...)` its submitter was inside — every
+        # worker `@warn` and `@error` silently lost for an app that configures logging that
+        # way. A logger is not a pooled resource, so there was never a reason to drop it; the
+        # connection state is what had to go. Three testsets in this file failed exactly this
+        # way before the logstate was carried across.
+        sink = Test.TestLogger()
+        got = Base.CoreLogging.with_logger(sink) do
+            fetch(Nitro.Workers._spawn_detached() do
+                @warn "from a detached run"
+                return _SCOPE_PROBE[]
+            end)
+        end
+
+        # The scope is still gone...
+        @test got === :outer
+        # ...but the log reached the submitter's logger.
+        @test any(r -> occursin("from a detached run", string(r.message)), sink.logs)
+    end
+
+    @testset "_schedule_detached drops the scope and keeps @async's stickiness" begin
+        detached = with(_SCOPE_PROBE => :inner) do
+            fetch(Nitro.Workers._schedule_detached(() -> _SCOPE_PROBE[]))
+        end
+        @test detached === :outer
+
+        probe = Nitro.Workers._schedule_detached(() -> nothing)
+        reference = @async nothing
+        wait(probe); wait(reference)
+        @test probe.sticky === reference.sticky === true
+    end
+
+    @testset "submit_task" begin
+        rt = WorkerRuntime(InMemoryWorkerStore())
+        try
+            seen = Channel{Symbol}(1)
+            id = with(_SCOPE_PROBE => :inner) do
+                submit_task("scope-async", () -> (put!(seen, _SCOPE_PROBE[]); "done"),
+                            Owner("user-1"); runtime=rt)
+            end
+            @test wait_for(() -> isready(seen)) == :ok
+            @test take!(seen) === :outer
+            @test wait_for(() -> get_task_status(id, Owner("user-1"); runtime=rt)[:status] == "COMPLETED") == :ok
+        finally
+            reset_runtime!(rt)
+        end
+    end
+
+    @testset "the FIRST submit_sequential_task into an unstarted queue" begin
+        # This submit is the one that spawns the queue's processor (`_start_queue_processor`),
+        # so before #209 it pinned a PROCESS-LIFETIME task in one caller's scope -- and every
+        # item that queue ever ran afterwards inherited it, whoever submitted them.
+        rt = WorkerRuntime(InMemoryWorkerStore())
+        try
+            @test isempty(get_sequential_queues(rt))       # nothing spawned yet
+            seen = Channel{Symbol}(2)
+            with(_SCOPE_PROBE => :inner) do
+                submit_sequential_task("reports", "scope-seq-1",
+                                       () -> (put!(seen, _SCOPE_PROBE[]); nothing),
+                                       Owner("user-1"); runtime=rt)
+            end
+            @test wait_for(() -> isready(seen)) == :ok
+            @test take!(seen) === :outer
+
+            # ...and a later item on that same processor is unaffected too.
+            submit_sequential_task("reports", "scope-seq-2",
+                                   () -> (put!(seen, _SCOPE_PROBE[]); nothing),
+                                   Owner("user-2"); runtime=rt)
+            @test wait_for(() -> isready(seen)) == :ok
+            @test take!(seen) === :outer
+        finally
+            reset_runtime!(rt)
+        end
+    end
+
+    @testset "a processor spawned by start! inside a scope" begin
+        app = Nitro.Core.App()
+        rt = WorkerRuntime(InMemoryWorkerStore())
+        try
+            with(_SCOPE_PROBE => :inner) do
+                start!(app; queues=["reports"], cleanup_enabled=false,
+                       recover_zombies=false, runtime=rt)
+            end
+            seen = Channel{Symbol}(1)
+            # Submitted from OUTSIDE the scope: only the processor could carry it in.
+            submit_sequential_task("reports", "scope-started",
+                                   () -> (put!(seen, _SCOPE_PROBE[]); nothing),
+                                   Owner("user-1"); runtime=rt)
+            @test wait_for(() -> isready(seen)) == :ok
+            @test take!(seen) === :outer
+        finally
+            reset_runtime!(rt)
+        end
+    end
+
+    @testset "the cleanup scheduler" begin
+        # `start!` is the call an app makes from its bootstrap, which may well be inside a
+        # transaction; the scheduler it spawns then issues a store DELETE on every tick for the
+        # life of the process.
+        rt = WorkerRuntime(ScopeProbeStore())
+        try
+            with(_SCOPE_PROBE => :inner) do
+                start_cleanup_scheduler(interval_hours=0, retain_days=1, runtime=rt)
+            end
+            @test wait_for(() -> isready(rt.store.seen); timeout=10.0) == :ok
+            @test take!(rt.store.seen) === :outer
+        finally
+            stop_cleanup_scheduler!(rt)
+        end
     end
 end
 

@@ -587,22 +587,37 @@ worker_store = pormg_nitro_worker(db_key="workers")
 
 Task metadata will now be persisted to that database, while live running threads are managed safely in memory to prevent serialization issues.
 
-!!! warning "Do not spawn worker tasks from inside a PormG transaction"
-    The store's `nitro_task` model is bound to `db_key`, so the task API no longer *throws*
-    inside a `PormG.run_in_transaction(db_key)` block. That does not make it safe.
+!!! note "Worker runs are detached from the submitter's dynamic scope"
+    Nitro spawns every worker task — the async run, each sequential queue's processor, and the
+    cleanup scheduler — under a **fresh dynamic scope** rather than the caller's. PormG tracks
+    transaction state in a `ScopedValue`, and `Threads.@spawn` inherits those, so without the
+    detach a run would execute its own run-start write on the submitting transaction's
+    connection: rolled back with your block if it got there first, or writing on a connection
+    already returned to the pool if your block committed first. That was never store-specific —
+    a callback that queries PormG had the same problem on `InMemoryWorkerStore`, with no Nitro
+    store write involved at all.
 
-    `submit_task` spawns the run with `Threads.@spawn` **synchronously, inside the caller's
-    dynamic scope**, and PormG tracks transaction state in a `ScopedValue` — which spawned
-    tasks inherit. So the worker run, starting with its own run-start write before any of your
-    callback code, executes on the submitting transaction's connection. Either it writes inside
-    your transaction and is rolled back with it, or your block commits first and the worker
-    keeps writing on a connection already returned to the pool.
+    **The consequence: a callback sees the *default* of every `ScopedValue`, not your binding.**
+    A background run outlives the request that queued it, so this is the intended semantics —
+    but anything scope-carried that a callback needs must be captured into the closure
+    explicitly.
 
-    **This is about the spawn, not about the store.** A callback that queries PormG has the
-    same problem on `InMemoryWorkerStore`, with no Nitro store write involved at all.
+    **The logger is the one exception, on purpose.** `with_logger` is itself scope-carried, so a
+    blanket detach would cut worker `@warn`/`@error` out of a logger an app had configured that
+    way. A logger is not a pooled connection — nothing goes stale — so it is captured at the
+    submit site and re-established inside the run.
 
-    Submit **after** the transaction block closes, and pass the committed row's id rather than
-    the row:
+!!! warning "Still submit after the transaction block closes"
+    The detach removes the corruption, not the ordering problem. `submit_task` writes the task
+    record **synchronously, on your task** — so inside your transaction — while the run it
+    spawns reads that record on a *different* connection. Until your block commits, the run
+    cannot see its own record, declines the claim, and silently does nothing; the row then
+    commits and sits at `PENDING` forever, where zombie recovery (which looks only at `RUNNING`)
+    will never reach it. On SQLite that read may instead hit a busy/locked error, in which case
+    the store logs a warning and the run dies on the exception — same stuck `PENDING` row, with
+    a log line to find it by.
+
+    So submit **after** the block closes, and pass the committed row's id rather than the row:
 
     ```julia
     id = PormG.run_in_transaction("db") do
@@ -611,14 +626,13 @@ Task metadata will now be persisted to that database, while live running threads
     submit_task("report_42", () -> render(id), Owner(uid))
     ```
 
-    The same applies to anything else that spawns inside the block: `worker_startup` /
-    `startup` / `start!`, which spawn the queue processors and the cleanup scheduler, and the
-    first `submit_sequential_task` into a queue that is not yet running, which spawns that
-    queue's processor. Each of those pins a task for the life of the process.
+    The same applies to `worker_startup` / `startup` / `start!` and to the first
+    `submit_sequential_task` into a queue that is not yet running — each spawns a task that
+    lives for the rest of the process.
 
-    A task call inside a transaction opened on a **different** connection raises PormG's
-    `TransactionError` instead of corrupting quietly — but matching the connection is not the
-    fix. Submit after the block closes.
+    A task call inside a transaction opened on a **different** connection still raises PormG's
+    `TransactionError`: the *submitting* call runs on your task, so it is governed by your
+    transaction even though the run it spawns is not.
 
 !!! note "Multiple processes sharing one database"
     Because the store persists across restarts, it invites deployments where several

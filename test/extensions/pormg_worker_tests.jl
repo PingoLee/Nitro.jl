@@ -1978,6 +1978,43 @@ else
             @test RealPormGWorkerStore(db_key="tasks").model.connect_key == "tasks"
             @test RealPormGWorkerStore().model.connect_key == "db"
         end
+
+        @testset "a run does not inherit the submitter's PormG transaction (#209)" begin
+            # The store-side half of the scope detach. `test/workers_tests.jl` proves the
+            # mechanism against a plain `ScopedValue`; this proves it against the actual value
+            # the hazard is about -- PormG's `_tx_context`, reached through its own public
+            # `with_tx_context` seam, so no live driver is needed.
+            #
+            # Before #209 the spawned run inherited this context, so `_claim_run!`'s durable
+            # read and the run-start CAS -- both BEFORE any callback code -- resolved onto the
+            # submitter's transaction connection, and kept writing on it after the block
+            # committed and returned it to the pool.
+            store_tx = RealPormGWorkerStore(model=MockTaskModel())
+            rt_tx = WorkerRuntime(store_tx)
+            conn = FakeTaskPool(String[])
+            seen = Channel{Tuple{Bool, Int}}(1)
+            try
+                PormG.with_tx_context(conn, nothing) do
+                    # The submitter really is inside a transaction...
+                    @test PormG.Configuration.in_transaction_context() == true
+                    @test PormG.Configuration.current_transaction_depth() == 1
+
+                    submit_task("tx-scope", () -> begin
+                        put!(seen, (PormG.Configuration.in_transaction_context(),
+                                    PormG.Configuration.current_transaction_depth()))
+                        return "done"
+                    end, Owner("user-tx"); runtime=rt_tx)
+                end
+
+                @test timedwait(() -> isready(seen), 5.0) == :ok
+                in_tx, depth = take!(seen)
+                # ...and the run it spawned is not.
+                @test in_tx == false
+                @test depth == 0
+            finally
+                reset_runtime!(rt_tx)
+            end
+        end
     end
 end
 
