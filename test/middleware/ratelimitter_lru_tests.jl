@@ -6,11 +6,14 @@ using Nitro
 port = get_free_port()
 localhost = "http://$HOST:$port"
 
+# Route-level limiters, sized by the same enforcement/recovery split the comment below
+# describes — it was applied to the two global-middleware testsets and never carried to
+# these two, which kept racing 51- and 26-request bursts against a 3s window (#212).
 urlpatterns("/limited",
     path("/goodbye", function() return "goodbye" end, method="GET",
-        middleware=[RateLimiter(strategy=:sliding_window, rate_limit=25, window=Second(3))]),
+        middleware=[RateLimiter(strategy=:sliding_window, rate_limit=1, window=Second(3))]),
     path("/greet", function() return "hello" end, method="GET",
-        middleware=[RateLimiter(strategy=:sliding_window, rate_limit=50, window=Second(3))]),
+        middleware=[RateLimiter(strategy=:sliding_window, rate_limit=3, window=Minute(1))]),
 )
 urlpatterns("",
     path("/ok", function() return "ok" end, method="GET"),
@@ -86,88 +89,66 @@ terminate()
 
 
 # Create a server without global middleware but with route-level middleware on /limited/*
+# The JIT warmup and the inter-testset sleeps that used to sit here are gone: both existed
+# only to service the burst-vs-window race the limits at the top removed (#212).
 serve(port=port, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
-
-# Warm up the route + middleware code paths before the timed bursts below, so first-request
-# JIT compilation isn't spent inside the 3s rate-limit window. These warmup hits age out of
-# the window during the sleeps below, so they don't affect the bucket assertions.
-HTTP.get("$localhost/limited/greet")
-HTTP.get("$localhost/limited/goodbye")
-
-sleep(5) # Ensure rate limiter window is completely reset and any background cleanup is done
 
 @testset "Limited Greet Endpoint Rate Limiter" begin
     # First request: verify headers
     r = HTTP.get("$localhost/limited/greet")
     @test r.status == 200
     @test text(r) == "hello"
-    @test HTTP.header(r, "X-RateLimit-Limit") == "50"
-    @test HTTP.header(r, "X-RateLimit-Remaining") == "49"
+    @test HTTP.header(r, "X-RateLimit-Limit") == "3"
+    @test HTTP.header(r, "X-RateLimit-Remaining") == "2"
     reset_time = parse(Int, HTTP.header(r, "X-RateLimit-Reset"))
-    @test reset_time > 0 && reset_time <= 3
+    @test reset_time > 0 && reset_time <= 60
 
-    # Exhaust remaining quota
-    for _ in 2:50
-        HTTP.get("$localhost/limited/greet")
-    end
+    # Exhaust the remaining quota one deterministic decrement at a time
+    @test HTTP.header(HTTP.get("$localhost/limited/greet"), "X-RateLimit-Remaining") == "1"
+    @test HTTP.header(HTTP.get("$localhost/limited/greet"), "X-RateLimit-Remaining") == "0"
 
-    # 51st request should be rate limited (429)
+    # 4th request should be rate limited (429)
     try
         HTTP.get("$localhost/limited/greet"; retry=false)
         @test false
     catch e
         @test e isa HTTP.StatusError
         @test e.response.status == 429
-        @test HTTP.header(e.response, "X-RateLimit-Limit") == "50"
+        @test HTTP.header(e.response, "X-RateLimit-Limit") == "3"
         @test HTTP.header(e.response, "X-RateLimit-Remaining") == "0"
         reset_time = parse(Int, HTTP.header(e.response, "X-RateLimit-Reset"))
-        @test reset_time > 0 && reset_time <= 3
+        @test reset_time > 0 && reset_time <= 60
     end
-
-    # Wait for reset and verify recovery
-    sleep(3.1)
-    r = HTTP.get("$localhost/limited/greet")
-    @test r.status == 200
-    @test HTTP.header(r, "X-RateLimit-Remaining") == "49"
 end
 
-sleep(3.1) # Ensure rate limiter window is reset before starting next testset
-
 @testset "Limited Other Endpoint Rate Limiter" begin
-    # First request: verify route-level rate limiting headers. Use `HTTP.get` (pooled
-    # keep-alive) rather than bare `HTTP.request`, so the 25-request burst stays well
-    # inside the 3s window — see the "Limited Greet Endpoint" testset above.
+    # Route-level recovery. `rate_limit=1` keeps this to single requests, so the 3s window
+    # is waited out rather than raced against a burst — the route-level mirror of the
+    # "Sliding Window Recovery" testset above, which covers the global-middleware case.
     r = HTTP.get("$localhost/limited/goodbye")
     @test r.status == 200
     @test text(r) == "goodbye"
-    @test HTTP.header(r, "X-RateLimit-Limit") == "25"
-    @test HTTP.header(r, "X-RateLimit-Remaining") == "24"
+    @test HTTP.header(r, "X-RateLimit-Limit") == "1"
+    @test HTTP.header(r, "X-RateLimit-Remaining") == "0"
     reset_time = parse(Int, HTTP.header(r, "X-RateLimit-Reset"))
     @test reset_time > 0 && reset_time <= 3
 
-    # Exhaust remaining quota
-    for _ in 2:25
-        HTTP.get("$localhost/limited/goodbye")
-    end
-
-    # 26th request should be rate limited (429)
+    # An immediate follow-up is refused
     try
         HTTP.get("$localhost/limited/goodbye"; retry=false)
         @test false
     catch e
         @test e isa HTTP.StatusError
         @test e.response.status == 429
-        @test HTTP.header(e.response, "X-RateLimit-Limit") == "25"
+        @test HTTP.header(e.response, "X-RateLimit-Limit") == "1"
         @test HTTP.header(e.response, "X-RateLimit-Remaining") == "0"
-        reset_time = parse(Int, HTTP.header(e.response, "X-RateLimit-Reset"))
-        @test reset_time > 0 && reset_time <= 3
     end
 
     # Wait for reset and verify recovery
     sleep(3.1)
     r = HTTP.get("$localhost/limited/goodbye")
     @test r.status == 200
-    @test HTTP.header(r, "X-RateLimit-Remaining") == "24"
+    @test HTTP.header(r, "X-RateLimit-Remaining") == "0"
 end
 
 terminate()
@@ -178,34 +159,36 @@ urlpatterns("",
     path("/exempt",  function() return "exempt" end,  method="GET"),
 )
 
-serve(middleware=[RateLimiter(strategy=:sliding_window, rate_limit=10, window=Second(1), exempt_paths=["/exempt"])], port=port, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
+# Subject is exempt-path behaviour, not window expiry, so the window is sized to be
+# unreachable by the burst rather than raced against it — the sibling of the assertion
+# that flaked on macOS at -t 1 in ratelimitter_tests.jl (#212).
+serve(middleware=[RateLimiter(strategy=:sliding_window, rate_limit=3, window=Minute(1), exempt_paths=["/exempt"])], port=port, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
 
 @testset "Exempt Paths Test" begin
     # First request to /limited should succeed with headers
     r = HTTP.get("$localhost/limited")
     @test r.status == 200
     @test text(r) == "limited"
-    @test HTTP.header(r, "X-RateLimit-Limit") == "10"
-    @test HTTP.header(r, "X-RateLimit-Remaining") == "9"
+    @test HTTP.header(r, "X-RateLimit-Limit") == "3"
+    @test HTTP.header(r, "X-RateLimit-Remaining") == "2"
     reset_time = parse(Int, HTTP.header(r, "X-RateLimit-Reset"))
-    @test reset_time > 0 && reset_time <= 1
+    @test reset_time > 0 && reset_time <= 60
 
-    # Exhaust remaining quota
-    for _ in 2:10
-        HTTP.get("$localhost/limited")
-    end
+    # Exhaust the remaining quota one deterministic decrement at a time
+    @test HTTP.header(HTTP.get("$localhost/limited"), "X-RateLimit-Remaining") == "1"
+    @test HTTP.header(HTTP.get("$localhost/limited"), "X-RateLimit-Remaining") == "0"
 
-    # 11th request should be rate limited (429)
+    # 4th request should be rate limited (429)
     try
         HTTP.get("$localhost/limited"; retry=false)
         @test false
     catch e
         @test e isa HTTP.StatusError
         @test e.response.status == 429
-        @test HTTP.header(e.response, "X-RateLimit-Limit") == "10"
+        @test HTTP.header(e.response, "X-RateLimit-Limit") == "3"
         @test HTTP.header(e.response, "X-RateLimit-Remaining") == "0"
         reset_time = parse(Int, HTTP.header(e.response, "X-RateLimit-Reset"))
-        @test reset_time > 0 && reset_time <= 1
+        @test reset_time > 0 && reset_time <= 60
     end
 
     # Exempt path should succeed and have no rate limit headers
@@ -227,19 +210,21 @@ urlpatterns("",
     path("/notexempt", function() return "notexempt" end, method="GET"),
 )
 
-serve(middleware=[RateLimiter(strategy=:sliding_window, rate_limit=5, window=Second(1), exempt_paths=["/exempt1", "/exempt2"])], port=port, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
+# Same sizing as the single-exempt-path testset above: the window cannot be spanned by
+# the burst, so the per-request decrements are deterministic (#212).
+serve(middleware=[RateLimiter(strategy=:sliding_window, rate_limit=3, window=Minute(1), exempt_paths=["/exempt1", "/exempt2"])], port=port, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
 
 @testset "Multiple Exempt Paths Test" begin
-    # First 5 requests to /limited should succeed
-    for i in 1:5
+    # First 3 requests to /limited should succeed
+    for i in 1:3
         r = HTTP.get("$localhost/limited")
         @test r.status == 200
         @test text(r) == "limited"
-        @test HTTP.header(r, "X-RateLimit-Limit") == "5"
-        @test HTTP.header(r, "X-RateLimit-Remaining") == string(5 - i)
+        @test HTTP.header(r, "X-RateLimit-Limit") == "3"
+        @test HTTP.header(r, "X-RateLimit-Remaining") == string(3 - i)
     end
 
-    # 6th request to /limited should be rate limited
+    # 4th request to /limited should be rate limited
     try
         HTTP.get("$localhost/limited"; retry=false)
         @test false
