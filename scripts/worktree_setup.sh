@@ -25,6 +25,12 @@
 # committed. Windows uses a directory JUNCTION rather than a symlink: junctions need no
 # administrator rights and no Developer Mode, unlike `mklink /D`.
 #
+# NOTE (#21): PormG is no longer a path dep — `[sources]` pins it by url + rev, which
+# Pkg fetches into the depot, so the relative-path breakage described above no longer happens for
+# it and the linking loop below finds nothing to do. Everything after it (Manifest copy, resolve,
+# instantiate) is still what makes a fresh worktree usable, so the script stays. The loop is kept
+# generic rather than deleted: it costs nothing and a future path source would need it again.
+#
 # Usage:
 #   bash scripts/worktree_setup.sh [<worktree-path>]     # defaults to $(pwd)
 
