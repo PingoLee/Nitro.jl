@@ -379,8 +379,12 @@ end # @testitem "Rate limiter"
 
 # Everything below this line is server-free: no `serve`, no port binding, no sleeping.
 # It lives in its own `@testitem` so it does NOT inherit `:network`/`:slow` from the item
-# above — tags apply per item, not per testset, and while these shared one item a run
-# filtered away from `:network` validated no `RateLimiter` argument at all (#210). The
+# above — tags apply per item, not per testset, so while these shared one item the tags
+# overstated what they describe and 115 socket-free assertions were filed as `:network`
+# and `:slow` (#210). Note that the issue frames the cost the other way round, as a
+# filtered run validating no `RateLimiter` argument; that does not reproduce, because
+# `--tags` here is AND-combined subset matching with no exclusion operator (see
+# `test/runtests.jl`), so `--tags middleware` always selected the whole-file item. The
 # last `terminate()` above is the file's network/non-network seam, so the boundary cannot
 # drift back. `ratelimitter_lru_tests.jl` already carries a second item on this pattern.
 #
