@@ -13,7 +13,7 @@ urlpatterns("/limited",
     path("/goodbye", function() return "goodbye" end, method="GET",
         middleware=[RateLimiter(strategy=:sliding_window, rate_limit=1, window=Second(3))]),
     path("/greet", function() return "hello" end, method="GET",
-        middleware=[RateLimiter(strategy=:sliding_window, rate_limit=3, window=Minute(1))]),
+        middleware=[RateLimiter(strategy=:sliding_window, rate_limit=3, window=Second(30))]),
 )
 urlpatterns("",
     path("/ok", function() return "ok" end, method="GET"),
@@ -79,11 +79,17 @@ serve(middleware=[RateLimiter(strategy=:sliding_window, rate_limit=1, window=Sec
         @test e.response.status == 429
     end
 
-    # After the window elapses the slot frees up again
+    # After the window elapses the slot frees up again. `retry=false` matters: HTTP.jl
+    # treats 429 as retryable and would silently retry a still-throttled GET four times
+    # with backoff, turning "recovered within 3.1s" into "recovered within ~5s".
     sleep(3.1)
-    r = HTTP.get("$localhost/ok")
+    r = HTTP.get("$localhost/ok"; retry=false)
     @test r.status == 200
     @test HTTP.header(r, "X-RateLimit-Remaining") == "0"
+    # At rate_limit=1 the remaining counter reads "0" both when throttled and when freshly
+    # reset, so it discriminates nothing on its own. The reset header does: the only live
+    # timestamp is the one this request just added, so the slot frees a full window out.
+    @test HTTP.header(r, "X-RateLimit-Reset") == "3"
 end
 terminate()
 
@@ -101,7 +107,7 @@ serve(port=port, host=HOST, async=true, show_errors=false, show_banner=false, ac
     @test HTTP.header(r, "X-RateLimit-Limit") == "3"
     @test HTTP.header(r, "X-RateLimit-Remaining") == "2"
     reset_time = parse(Int, HTTP.header(r, "X-RateLimit-Reset"))
-    @test reset_time > 0 && reset_time <= 60
+    @test reset_time > 0 && reset_time <= 30
 
     # Exhaust the remaining quota one deterministic decrement at a time
     @test HTTP.header(HTTP.get("$localhost/limited/greet"), "X-RateLimit-Remaining") == "1"
@@ -117,7 +123,7 @@ serve(port=port, host=HOST, async=true, show_errors=false, show_banner=false, ac
         @test HTTP.header(e.response, "X-RateLimit-Limit") == "3"
         @test HTTP.header(e.response, "X-RateLimit-Remaining") == "0"
         reset_time = parse(Int, HTTP.header(e.response, "X-RateLimit-Reset"))
-        @test reset_time > 0 && reset_time <= 60
+        @test reset_time > 0 && reset_time <= 30
     end
 end
 
@@ -144,11 +150,13 @@ end
         @test HTTP.header(e.response, "X-RateLimit-Remaining") == "0"
     end
 
-    # Wait for reset and verify recovery
+    # Wait for reset and verify recovery. See "Sliding Window Recovery" above for why
+    # `retry=false` and the reset-header assertion are both load-bearing here.
     sleep(3.1)
-    r = HTTP.get("$localhost/limited/goodbye")
+    r = HTTP.get("$localhost/limited/goodbye"; retry=false)
     @test r.status == 200
     @test HTTP.header(r, "X-RateLimit-Remaining") == "0"
+    @test HTTP.header(r, "X-RateLimit-Reset") == "3"
 end
 
 terminate()
@@ -162,7 +170,7 @@ urlpatterns("",
 # Subject is exempt-path behaviour, not window expiry, so the window is sized to be
 # unreachable by the burst rather than raced against it — the sibling of the assertion
 # that flaked on macOS at -t 1 in ratelimitter_tests.jl (#212).
-serve(middleware=[RateLimiter(strategy=:sliding_window, rate_limit=3, window=Minute(1), exempt_paths=["/exempt"])], port=port, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
+serve(middleware=[RateLimiter(strategy=:sliding_window, rate_limit=3, window=Second(30), exempt_paths=["/exempt"])], port=port, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
 
 @testset "Exempt Paths Test" begin
     # First request to /limited should succeed with headers
@@ -172,7 +180,7 @@ serve(middleware=[RateLimiter(strategy=:sliding_window, rate_limit=3, window=Min
     @test HTTP.header(r, "X-RateLimit-Limit") == "3"
     @test HTTP.header(r, "X-RateLimit-Remaining") == "2"
     reset_time = parse(Int, HTTP.header(r, "X-RateLimit-Reset"))
-    @test reset_time > 0 && reset_time <= 60
+    @test reset_time > 0 && reset_time <= 30
 
     # Exhaust the remaining quota one deterministic decrement at a time
     @test HTTP.header(HTTP.get("$localhost/limited"), "X-RateLimit-Remaining") == "1"
@@ -188,7 +196,7 @@ serve(middleware=[RateLimiter(strategy=:sliding_window, rate_limit=3, window=Min
         @test HTTP.header(e.response, "X-RateLimit-Limit") == "3"
         @test HTTP.header(e.response, "X-RateLimit-Remaining") == "0"
         reset_time = parse(Int, HTTP.header(e.response, "X-RateLimit-Reset"))
-        @test reset_time > 0 && reset_time <= 60
+        @test reset_time > 0 && reset_time <= 30
     end
 
     # Exempt path should succeed and have no rate limit headers
@@ -212,7 +220,7 @@ urlpatterns("",
 
 # Same sizing as the single-exempt-path testset above: the window cannot be spanned by
 # the burst, so the per-request decrements are deterministic (#212).
-serve(middleware=[RateLimiter(strategy=:sliding_window, rate_limit=3, window=Minute(1), exempt_paths=["/exempt1", "/exempt2"])], port=port, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
+serve(middleware=[RateLimiter(strategy=:sliding_window, rate_limit=3, window=Second(30), exempt_paths=["/exempt1", "/exempt2"])], port=port, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
 
 @testset "Multiple Exempt Paths Test" begin
     # First 3 requests to /limited should succeed

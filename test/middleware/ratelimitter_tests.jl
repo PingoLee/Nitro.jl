@@ -12,12 +12,18 @@ localhost = "http://$HOST:$port"
 # decrements deterministically however slow the runner is. `/goodbye` is the recovery
 # case: `rate_limit=1` means it only ever issues single requests, so the 3s window it
 # waits out is never something a burst has to fit inside.
-# `window_period=` on `/greet` is the deprecated alias, deliberately exercised here.
+#
+# `/greet` uses the deprecated `window_period=` alias, and its window must stay a
+# NON-default value: the constructor defaults to `window = Minute(1)`, so passing
+# `window_period=Minute(1)` would be satisfied by an alias that silently dropped its
+# value. `Second(30)` keeps the alias falsifiable — drop the rename and the reset header
+# reports 60, which the `<= 30` assertions below reject — while still giving the 4-request
+# burst a 7.5s-per-request budget.
 urlpatterns("/limited",
     path("/goodbye", function() return "goodbye" end, method="GET",
         middleware=[RateLimiter(rate_limit=1, window=Second(3))]),
     path("/greet", function() return "hello" end, method="GET",
-        middleware=[RateLimiter(rate_limit=3, window_period=Minute(1))]),
+        middleware=[RateLimiter(rate_limit=3, window_period=Second(30))]),
 )
 urlpatterns("",
     path("/ok", function() return "ok" end, method="GET"),
@@ -30,7 +36,7 @@ urlpatterns("",
 # correct code whenever it slipped (#212). Recovery is covered separately below, so
 # neither testset depends on a burst-vs-window race. This is the same split
 # `ratelimitter_lru_tests.jl` already documents for the sliding strategy.
-serve(middleware=[RateLimiter(rate_limit=3, window=Minute(1))], port=port, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
+serve(middleware=[RateLimiter(rate_limit=3, window=Second(30))], port=port, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
 
 @testset "Rate Limiter Tests" begin
 
@@ -41,7 +47,7 @@ serve(middleware=[RateLimiter(rate_limit=3, window=Minute(1))], port=port, host=
     @test HTTP.header(r, "X-RateLimit-Limit") == "3"
     @test HTTP.header(r, "X-RateLimit-Remaining") == "2"
     reset_time = parse(Int, HTTP.header(r, "X-RateLimit-Reset"))
-    @test reset_time > 0 && reset_time <= 60
+    @test reset_time > 0 && reset_time <= 30
 
     # Exhaust the remaining quota, asserting each decrement rather than looping: under a
     # 1-minute window every one of these is deterministic.
@@ -58,7 +64,7 @@ serve(middleware=[RateLimiter(rate_limit=3, window=Minute(1))], port=port, host=
         @test HTTP.header(e.response, "X-RateLimit-Limit") == "3"
         @test HTTP.header(e.response, "X-RateLimit-Remaining") == "0"
         reset_time = parse(Int, HTTP.header(e.response, "X-RateLimit-Reset"))
-        @test reset_time > 0 && reset_time <= 60
+        @test reset_time > 0 && reset_time <= 30
     end
 
 end
@@ -86,11 +92,17 @@ serve(middleware=[RateLimiter(rate_limit=1, window=Second(3))], port=port, host=
         @test e.response.status == 429
     end
 
-    # After the window elapses the slot frees up again
+    # After the window elapses the slot frees up again. `retry=false` matters: HTTP.jl
+    # treats 429 as retryable and would silently retry a still-throttled GET four times
+    # with backoff, turning "recovered within 3.1s" into "recovered within ~5s".
     sleep(3.1)
-    r = HTTP.get("$localhost/ok")
+    r = HTTP.get("$localhost/ok"; retry=false)
     @test r.status == 200
     @test HTTP.header(r, "X-RateLimit-Remaining") == "0"
+    # At rate_limit=1 the remaining counter reads "0" both when throttled and when freshly
+    # reset, so it discriminates nothing on its own. The reset header does: an expired
+    # window re-anchors `last_reset` to now, so this reports the full window again.
+    @test HTTP.header(r, "X-RateLimit-Reset") == "3"
 end
 terminate()
 
@@ -108,7 +120,7 @@ serve(port=port, host=HOST, async=true, show_errors=false, show_banner=false, ac
     @test HTTP.header(r, "X-RateLimit-Limit") == "3"
     @test HTTP.header(r, "X-RateLimit-Remaining") == "2"
     reset_time = parse(Int, HTTP.header(r, "X-RateLimit-Reset"))
-    @test reset_time > 0 && reset_time <= 60
+    @test reset_time > 0 && reset_time <= 30
 
     # Exhaust the remaining quota one deterministic decrement at a time
     @test HTTP.header(HTTP.get("$localhost/limited/greet"), "X-RateLimit-Remaining") == "1"
@@ -124,7 +136,7 @@ serve(port=port, host=HOST, async=true, show_errors=false, show_banner=false, ac
         @test HTTP.header(e.response, "X-RateLimit-Limit") == "3"
         @test HTTP.header(e.response, "X-RateLimit-Remaining") == "0"
         reset_time = parse(Int, HTTP.header(e.response, "X-RateLimit-Reset"))
-        @test reset_time > 0 && reset_time <= 60
+        @test reset_time > 0 && reset_time <= 30
     end
 end
 
@@ -151,11 +163,13 @@ end
         @test HTTP.header(e.response, "X-RateLimit-Remaining") == "0"
     end
 
-    # Wait for reset and verify recovery
+    # Wait for reset and verify recovery. See "Fixed Window Recovery" above for why
+    # `retry=false` and the reset-header assertion are both load-bearing here.
     sleep(3.1)
-    r = HTTP.get("$localhost/limited/goodbye")
+    r = HTTP.get("$localhost/limited/goodbye"; retry=false)
     @test r.status == 200
     @test HTTP.header(r, "X-RateLimit-Remaining") == "0"
+    @test HTTP.header(r, "X-RateLimit-Reset") == "3"
 end
 
 terminate()
@@ -215,7 +229,7 @@ urlpatterns("",
 # assertion that flaked on macOS at -t 1 (#212): 11 live requests had to land inside one
 # wall-clock second, and when the window rolled over mid-sequence the 11th was correctly
 # admitted and the test failed against correct code.
-serve(middleware=[RateLimiter(rate_limit=3, window=Minute(1), exempt_paths=["/exempt"])], port=port, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
+serve(middleware=[RateLimiter(rate_limit=3, window=Second(30), exempt_paths=["/exempt"])], port=port, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
 
 @testset "Exempt Paths Test" begin
     # First request to /limited should succeed with headers
@@ -225,7 +239,7 @@ serve(middleware=[RateLimiter(rate_limit=3, window=Minute(1), exempt_paths=["/ex
     @test HTTP.header(r, "X-RateLimit-Limit") == "3"
     @test HTTP.header(r, "X-RateLimit-Remaining") == "2"
     reset_time = parse(Int, HTTP.header(r, "X-RateLimit-Reset"))
-    @test reset_time > 0 && reset_time <= 60
+    @test reset_time > 0 && reset_time <= 30
 
     # Exhaust the remaining quota one deterministic decrement at a time
     @test HTTP.header(HTTP.get("$localhost/limited"), "X-RateLimit-Remaining") == "1"
@@ -241,7 +255,7 @@ serve(middleware=[RateLimiter(rate_limit=3, window=Minute(1), exempt_paths=["/ex
         @test HTTP.header(e.response, "X-RateLimit-Limit") == "3"
         @test HTTP.header(e.response, "X-RateLimit-Remaining") == "0"
         reset_time = parse(Int, HTTP.header(e.response, "X-RateLimit-Reset"))
-        @test reset_time > 0 && reset_time <= 60
+        @test reset_time > 0 && reset_time <= 30
     end
 
     # Exempt path should succeed and have no rate limit headers
@@ -261,7 +275,10 @@ terminate()
 # the operator trusts the proxy. The live server's socket peer is the loopback
 # address (HOST = "127.0.0.1"), which stands in for the reverse proxy.
 
-sleep(3.1) # ensure any prior window/cleanup state is gone
+# No inter-server sleep is needed: each `RateLimiter(...)` builds its own stripe store as
+# a closure local, so a fresh `serve()` below cannot see the previous limiter's buckets.
+# The waits that used to sit here claimed to "ensure any prior window/cleanup state is
+# gone" and were clearing nothing (#212).
 
 # Default: no trust configured → X-Forwarded-For is IGNORED. Distinct forwarded
 # client IPs all collapse onto the proxy's socket IP and share a single bucket.
@@ -287,8 +304,6 @@ serve(middleware=[RateLimiter(rate_limit=3, window=Second(5))], port=port, host=
 end
 
 terminate()
-
-sleep(3.1)
 
 # Trusted proxy: when the socket peer is a configured trusted proxy, the limiter
 # honors X-Forwarded-For and buckets each forwarded client independently.
@@ -317,8 +332,6 @@ serve(middleware=[RateLimiter(rate_limit=2, window=Second(5),
 end
 
 terminate()
-
-sleep(3.1)
 
 # Regression #16, end to end. The client prepends its own X-Forwarded-For entry; the loopback
 # "proxy" appends the address it actually saw, exactly as nginx's proxy_add_x_forwarded_for
