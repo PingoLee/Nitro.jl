@@ -361,6 +361,26 @@ end
 
 terminate()
 
+end # @testitem "Rate limiter"
+
+
+# Everything below this line is server-free: no `serve`, no port binding, no sleeping.
+# It lives in its own `@testitem` so it does NOT inherit `:network`/`:slow` from the item
+# above — tags apply per item, not per testset, and while these shared one item a run
+# filtered away from `:network` validated no `RateLimiter` argument at all (#210). The
+# last `terminate()` above is the file's network/non-network seam, so the boundary cannot
+# drift back. `ratelimitter_lru_tests.jl` already carries a second item on this pattern.
+#
+# `@testitem` bodies do not share scope, so the preamble is repeated: `Dates` for the
+# `Period` keywords, `Sockets` for the `ip"…"` literals and `IPv4`, `HTTP` for the
+# synthetic `HTTP.Request`s.
+@testitem "Rate limiter construction and keying" tags=[:middleware] setup=[NitroCommon] begin
+using HTTP
+using Dates
+using Sockets
+using Nitro
+using Nitro: setip!
+
 # ── No client IP on the request ───────────────────────────────────────────────
 # Driven in-process: `auto_extract_ip=false` returns the bare `handle -> req -> resp`
 # closure, so a synthetic request with no `:ip` reaches the limiter unresolved. There is
@@ -624,5 +644,5 @@ end
     @test bare_sliding.middleware(_ -> HTTP.Response(200, "reached"))(req).status == 200
 end
 
-end
+end # @testitem "Rate limiter construction and keying"
 
