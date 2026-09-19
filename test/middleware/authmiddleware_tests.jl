@@ -179,6 +179,20 @@ end
     HTTP.setheader(reqH, "Cookie" => "my_auth_cookie=$good_token")
     @test twoarg_handler(reqH).status == 200
     @test seen_req[] === reqH
+
+    # Case I (#24): a tuple whose USER half is nothing is unauthenticated, not a request
+    # with a nil user. This matches `jwt_validator`, which maps a `user_validator`
+    # returning nothing to a 401 rather than to a `(nothing, principal)` tuple.
+    nil_user_mw = CookieAuthMiddleware(token -> (nothing, Dict("sub" => "1")), cookie_name="my_auth_cookie")
+    nil_user_handler = nil_user_mw(req->HTTP.Response(200, "ok"))
+    reqI = HTTP.Request("GET", "/")
+    HTTP.setheader(reqI, "Cookie" => "my_auth_cookie=$good_token")
+    resI = nil_user_handler(reqI)
+    @test resI.status == 401
+    @test contains(text(resI), "Invalid or expired token")
+    # Neither slot is populated — the handler never ran.
+    @test !haskey(reqI.context, :user)
+    @test !haskey(reqI.context, :auth_claims)
 end
 
 terminate()

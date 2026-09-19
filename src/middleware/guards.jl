@@ -27,11 +27,27 @@ function GuardMiddleware(guards::Function...)
 	end
 end
 
-function _request_user(req::HTTP.Request)
+# Claims resolution for the claim guards. Mirrors `_request_kid`'s two-slot lookup: a
+# `user_validator` parks the app's user object at `:user` and the verified `Principal` at
+# `:auth_claims`, so reading only `:user` denies a correctly-authenticated request (#24).
+#
+# The precedence is deliberate and asymmetric. If the app's user object is READABLE as
+# claims it is authoritative, and an absent claim means denial — a token's `role=admin` is
+# verified but STALE, while an app dict that dropped the key after a demotion is fresh.
+# Only when the app user is not a claims source at all do we fall back to the token's
+# verified claims. An app that wants token claims honored merges them into the object its
+# `user_validator` returns.
+function _request_claims(req::HTTP.Request)::Nullable{AbstractDict}
 	user = Base.get(req.context, :user, nothing)
-	if !isnothing(user)
-		return user
-	end
+	user isa AbstractDict && return user          # incl. `Principal`
+
+	claims = Base.get(req.context, :auth_claims, nothing)
+	claims isa AbstractDict && return claims
+
+	# `:user` is the vouching slot: if an auth middleware put a non-claims identity there,
+	# the raw session is not a claims source for that identity, so deny rather than fall
+	# back. A non-dict `:auth_claims` alone does NOT gate the fallback — nothing vouched.
+	user === nothing || return nothing
 
 	session = getsession(req)
 	return session isa AbstractDict ? session : nothing
@@ -81,23 +97,34 @@ principal's `claim` matches `value`.
 - `kind = :equals` — the claim's value must `==` `value` (e.g. a role or action claim).
 - `kind = :contains` — the claim must be a list containing `value` (e.g. permissions/scopes).
 
-The principal is resolved like the other guards (`req.context[:user]` set by auth
-middleware, with the raw-session fallback for session-based apps). `role_required` and
-`permission_required` are thin aliases over this guard.
+The claims are resolved in three steps: `req.context[:user]` when an auth middleware set
+something dict-like there (a `Principal`, or your own claims dict); otherwise the verified
+`Principal` at `req.context[:auth_claims]`, which is where a `user_validator`'s token claims
+ride; otherwise the raw `getsession(req)` dict, for session-based apps. A non-dict `:user`
+(a plain user struct with no accompanying claims) denies rather than falling through to the
+session. `role_required` and `permission_required` are thin aliases over this guard.
+
+!!! warning "A struct user authorizes off the token, not off your lookup"
+    Those first two steps decide how fast a revocation takes effect. A dict-like `:user` is
+    authoritative — an absent claim denies, so a demotion applies on the next request. A
+    struct `:user` is not a claims source, so the guard reads the token's claims instead:
+    verified, but issued in the past and never re-checked against your `user_validator`'s
+    result. A demoted user keeps what the token says until it expires. Return a dict merging
+    your fresh state if revocation must take effect within the token TTL.
 """
 function claim_required(claim::String, value; kind::Symbol=:equals)
 	if kind === :equals
 		return function(req::HTTP.Request)
-			user = _request_user(req)
-			if !(user isa AbstractDict) || get(user, claim, nothing) != value
+			claims = _request_claims(req)
+			if claims === nothing || get(claims, claim, nothing) != value
 				return FORBIDDEN
 			end
 			return nothing
 		end
 	elseif kind === :contains
 		return function(req::HTTP.Request)
-			user = _request_user(req)
-			container = user isa AbstractDict ? get(user, claim, nothing) : nothing
+			claims = _request_claims(req)
+			container = claims === nothing ? nothing : get(claims, claim, nothing)
 			if !(container isa AbstractVector) || !(value in container)
 				return FORBIDDEN
 			end

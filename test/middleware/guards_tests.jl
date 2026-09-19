@@ -178,7 +178,8 @@ using Nitro: GuardMiddleware, login_required, role_required, permission_required
             req_wrong.context[:user] = Dict{String,Any}("action" => "reports:read")
             @test guard(req_wrong).status == 403
 
-            # Non-dict user → 403
+            # Non-dict user with NO claims source anywhere → 403. A plain user struct is
+            # an identity, not a claims collection; it fails closed.
             req_struct = HTTP.Request("GET", "/test")
             req_struct.context[:user] = (action = "reports:generate",)
             @test guard(req_struct).status == 403
@@ -239,6 +240,80 @@ using Nitro: GuardMiddleware, login_required, role_required, permission_required
         req_empty = HTTP.Request("GET", "/test")
         req_empty.context[:user] = Principal(Dict{String,Any}())
         @test login_required()(req_empty).status == 302
+    end
+
+    # #24: a `user_validator` parks the app's user object at `:user` and the VERIFIED
+    # `Principal` at `:auth_claims`. `kid_required` always read both slots; the claim
+    # guards read only `:user`, so a correctly-authenticated struct user got a 403.
+    @testset "claim guards resolve :auth_claims when :user is not a claims source" begin
+        # The app's own user object — a non-dict identity, as a `user_validator` commonly
+        # returns. `Principal` rides along at `:auth_claims`.
+        app_user = (id = 7, name = "alice")
+        principal = Principal(
+            Dict{String,Any}("sub" => "u7", "role" => "admin", "permissions" => ["reports:read"]);
+            id="u7",
+        )
+
+        # The fix: every claim guard reads through to the verified claims.
+        req = HTTP.Request("GET", "/test")
+        req.context[:user] = app_user
+        req.context[:auth_claims] = principal
+        @test isnothing(role_required("admin")(req))
+        @test isnothing(permission_required("reports:read")(req))
+        @test isnothing(claim_required("sub", "u7")(req))
+        # ...and a claim the token does NOT carry is still denied.
+        @test role_required("superuser")(req).status == 403
+
+        # No silent escalation: a dict `:user` IS a claims source, so it stays
+        # authoritative and an absent claim means denial. The token's claims are verified
+        # but STALE — a demoted user's unexpired token must not out-rank the app's fresh
+        # lookup, and dropping the key is a legitimate way for the app to say "no".
+        req_demoted = HTTP.Request("GET", "/test")
+        req_demoted.context[:user] = Dict{String,Any}("sub" => "u7")   # role deliberately absent
+        req_demoted.context[:auth_claims] = principal                   # still says role=admin
+        @test role_required("admin")(req_demoted).status == 403
+
+        # A non-claims `:user` suppresses the raw-session fallback: a middleware vouched
+        # for this request with a struct identity, so an unauthenticated session dict is
+        # not promoted into a claims source for it.
+        req_session = HTTP.Request("GET", "/test")
+        req_session.context[:user] = app_user
+        req_session.context[:session] = Dict{String,Any}("role" => "admin")
+        @test role_required("admin")(req_session).status == 403
+
+        # `:user` is the VOUCHING slot, and only it gates the session fallback. A non-dict
+        # `:auth_claims` is not a claims source and vouches for nothing, so with no `:user`
+        # the session is still consulted...
+        req_bad_claims_session = HTTP.Request("GET", "/test")
+        req_bad_claims_session.context[:auth_claims] = "not-a-claims-object"
+        req_bad_claims_session.context[:session] = Dict{String,Any}("role" => "admin")
+        @test isnothing(role_required("admin")(req_bad_claims_session))
+
+        # ...whereas a non-dict `:user` does gate it, whatever `:auth_claims` holds.
+        req_bad_claims = HTTP.Request("GET", "/test")
+        req_bad_claims.context[:user] = app_user
+        req_bad_claims.context[:auth_claims] = "not-a-claims-object"
+        req_bad_claims.context[:session] = Dict{String,Any}("role" => "admin")
+        @test role_required("admin")(req_bad_claims).status == 403
+
+        # `:auth_claims` alone (no `:user`) resolves — same trust tier as an app-set
+        # `:user`, and strictly more trustworthy than the session fallback below it.
+        req_claims_only = HTTP.Request("GET", "/test")
+        req_claims_only.context[:auth_claims] = Dict{String,Any}("role" => "admin")
+        @test isnothing(role_required("admin")(req_claims_only))
+
+        # Fail-closed behavior change (#24): `:auth_claims` now outranks the session, so a
+        # non-matching claims object denies instead of falling through to a matching
+        # session. Reachable only if app code sets `:auth_claims` without a `:user`.
+        req_claims_over_session = HTTP.Request("GET", "/test")
+        req_claims_over_session.context[:auth_claims] = Dict{String,Any}("role" => "viewer")
+        req_claims_over_session.context[:session] = Dict{String,Any}("role" => "admin")
+        @test role_required("admin")(req_claims_over_session).status == 403
+
+        # Unchanged: `login_required` does not route through the claims resolver, so a
+        # struct identity still authenticates regardless of `:auth_claims`.
+        @test isnothing(login_required()(req))
+        @test isnothing(login_required()(req_session))
     end
 
     @testset "kid_required guard" begin
