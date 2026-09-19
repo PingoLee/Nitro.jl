@@ -382,11 +382,13 @@ end # @testitem "Rate limiter"
 # above — tags apply per item, not per testset, so while these shared one item the tags
 # overstated what they describe and 115 socket-free assertions were filed as `:network`
 # and `:slow` (#210). Note that the issue frames the cost the other way round, as a
-# filtered run validating no `RateLimiter` argument; that does not reproduce, because
-# `--tags` here is AND-combined subset matching with no exclusion operator (see
-# `test/runtests.jl`), so `--tags middleware` always selected the whole-file item. The
-# last `terminate()` above is the file's network/non-network seam, so the boundary cannot
-# drift back. `ratelimitter_lru_tests.jl` already carries a second item on this pattern.
+# filtered run validating no `RateLimiter` argument; that did not reproduce at the time,
+# because `--tags` is AND-combined subset matching and the launcher had no exclusion
+# operator, so `--tags middleware` always selected the whole-file item too. #214 added
+# one: `--tags middleware --skip-tags network` now runs THIS item and not the one above,
+# which is the payoff the split was for. The last `terminate()` above is the file's
+# network/non-network seam, so the boundary cannot drift back.
+# `ratelimitter_lru_tests.jl` already carries a second item on this pattern.
 #
 # `@testitem` bodies do not share scope, so the preamble is repeated: `Dates` for the
 # `Period` keywords, `Sockets` for the `ip"…"` literals and `IPv4`, `HTTP` for the
