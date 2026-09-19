@@ -23,7 +23,7 @@
 
 include(joinpath(pkgdir(Nitro), "test", "harness_manifest.jl"))
 using .NitroTestHarness: TEST_FILES, UNLISTED_OK, SKIPS_OK, KNOWN_TAGS, discover_test_files,
-                         testitems, skip_macros
+                         testitems, skip_macros, selects
 
 const TEST_ROOT = joinpath(pkgdir(Nitro), "test")
 
@@ -78,6 +78,103 @@ end
 
     # An untagged item is invisible to every filtered run, including `--tags core`.
     @test untagged == String[]
+end
+
+@testset "the selection rule matches ReTestItems' semantics" begin
+    # `selects` is what `test/runtests.jl` uses to decide whether a filter would select
+    # nothing, and it has to agree with what ReTestItems will then actually run. Before
+    # #214 that rule was an inline loop in the coordinator, which no test could reach --
+    # so "the replica drifted from the real filter" was a defect with no guard at all,
+    # and #214's own sketch called teaching the replica about exclusion "the half that is
+    # easy to miss".
+    #
+    # Asserted against the DOCUMENTED semantics with synthetic items rather than by
+    # calling `ReTestItems.TestItemFilter`, for the same reason `testitems` and
+    # `skip_macros` are reimplemented: a guard on the suite must not depend on a private
+    # function of the package it is guarding. The three references are
+    # `ReTestItems/src/filtering.jl`:
+    #   `_shouldrun(tags::AbstractVector{Symbol}, ti) = issubset(tags, ti.tags)`
+    #   `_shouldrun(name::AbstractString, ti)         = name == ti.name`
+    #   `(f::TestItemFilter)(ti) = f.shouldrun(ti) && _shouldrun(f.tags, ti) && ...`
+
+    # No filter at all selects everything, including an untagged item.
+    @test selects("anything", [:core])
+    @test selects("anything", Symbol[])
+
+    # `--tags` is AND-combined subset matching: ALL requested tags must be present, and
+    # extra tags on the item are irrelevant.
+    @test selects("x", [:middleware, :network]; tags = [:middleware])
+    @test selects("x", [:middleware, :network]; tags = [:middleware, :network])
+    @test !selects("x", [:middleware];          tags = [:middleware, :network])
+
+    # `--skip-tags` is the DUAL, not the mirror image: `isdisjoint` drops an item
+    # carrying ANY listed tag, where `issubset` demands ALL of them. This asymmetry is
+    # the one thing about the flag that is genuinely easy to get backwards, so it is
+    # asserted directly rather than inferred from the cases above.
+    @test !selects("x", [:middleware, :network]; skip_tags = [:network])
+    @test  selects("x", [:middleware];           skip_tags = [:network])
+    @test !selects("x", [:middleware, :slow];    skip_tags = [:network, :slow])
+    @test  selects("x", [:middleware];           skip_tags = [:network, :slow])
+
+    # `--name` is EXACT, never a substring (#34).
+    @test  selects("Session stores", [:core]; name = "Session stores")
+    @test !selects("Session stores", [:core]; name = "Session")
+
+    # The axes AND together, which is what makes `--tags m --skip-tags network` -- the
+    # combination #214 exists for -- mean "middleware, but not the socket-bound ones".
+    @test  selects("x", [:middleware];           tags = [:middleware], skip_tags = [:network])
+    @test !selects("x", [:middleware, :network]; tags = [:middleware], skip_tags = [:network])
+
+    # A tag in both lists can only ever select nothing. `runtests.jl` diagnoses this by
+    # name rather than letting it surface as a generic zero-selection message, but the
+    # BEHAVIOUR has to be this way round -- exclusion wins -- whatever the message says.
+    @test !selects("x", [:network]; tags = [:network], skip_tags = [:network])
+    @test !selects("x", Symbol[];   tags = [:network], skip_tags = [:network])
+end
+
+@testset "tag exclusion partitions the real suite" begin
+    # The unit tests above prove the rule; this proves it says something true about THIS
+    # suite. Without it the rule could be perfect and still select nothing useful --
+    # e.g. if no item carried `:network` at all, `--skip-tags network` would be an
+    # elaborate no-op and every assertion above would still pass.
+    items = Tuple{String, Vector{Symbol}}[]
+    for f in TEST_FILES
+        append!(items, testitems(joinpath(TEST_ROOT, f)))
+    end
+    @test length(items) > 50   # same vacuity floor as the testsets above
+
+    # Exclusion and requirement partition the suite exactly: every item either carries
+    # `:network` or does not. Read this as a VACUITY floor, not as evidence about the
+    # asymmetry: for a SINGLE tag, `isdisjoint([:network], tg)` and
+    # `!issubset([:network], tg)` are the same predicate, so this would also pass against
+    # a mirror-image `issubset`-based exclusion. What it does discriminate against is
+    # `skip_tags` being ignored outright -- `kept` would then be `length(items)` and the
+    # sum would overshoot. The asymmetry itself is covered by the two-tag cases in the
+    # testset above.
+    kept    = count(((nm, tg),) -> selects(nm, tg; skip_tags = [:network]), items)
+    dropped = count(((nm, tg),) -> selects(nm, tg; tags      = [:network]), items)
+    @test kept + dropped == length(items)
+    @test 0 < dropped < length(items)   # both halves are non-empty, so the flag does work
+
+    # The exact pair #210 created and #214 exists to make usable. Before exclusion,
+    # `--tags middleware` selected BOTH of these, because the socket-bound item genuinely
+    # carries `:middleware` -- so splitting the file bought a `--name` escape hatch and
+    # nothing more. Named items rather than counts: a count drifts with every test added,
+    # whereas these two names are the receipt for the split.
+    #
+    # Looked up by scanning, NOT through a `Dict`. ReTestItems enforces unique item names
+    # only WITHIN a file (`testitem_names` is per `FileNode`), so a cross-file duplicate
+    # is legal and a `Dict` would silently keep the last one -- checking an item that has
+    # nothing to do with #210's split, and reporting a failure that points at the wrong
+    # file. Asserting the match is unique keeps the receipt honest instead.
+    tags_of(nm) = [tg for (n, tg) in items if n == nm]
+    @test length(tags_of("Rate limiter")) == 1
+    @test length(tags_of("Rate limiter construction and keying")) == 1
+    @test !selects("Rate limiter", only(tags_of("Rate limiter"));
+                   tags = [:middleware], skip_tags = [:network])
+    @test  selects("Rate limiter construction and keying",
+                   only(tags_of("Rate limiter construction and keying"));
+                   tags = [:middleware], skip_tags = [:network])
 end
 
 @testset "no test file skips its way to a pass" begin
@@ -184,6 +281,51 @@ end
     # which survives deleting the entire guard -- so it was green theater. This text exists
     # only inside the guard body.
     @test occursin("Unknown test tag(s)", body)
+
+    # `--skip-tags` (#214), anchored on the QUOTED literal so it pins the arg-loop branch
+    # specifically. The bare string survives in three non-comment places -- the parse
+    # branch and twice inside the zero-selection message's interpolated lines -- so
+    # `occursin("--skip-tags", body)` would stay green with the parse branch deleted,
+    # which is the flag ceasing to exist. The quoted form appears only where the argument
+    # is compared. The predicate BODY is deliberately not anchored on: `isdisjoint`,
+    # `!any(in(...))` and a hoisted local are all the same guard, per the note above.
+    @test occursin("\"--skip-tags\"", body)
+
+    # THE load-bearing token, and the one the rest of this file cannot see (#214). The
+    # feature is one positional argument: delete `shouldrun,` from the `runtests(` call
+    # and everything else survives -- the flag still parses, the guards still fire, every
+    # `selects` unit assertion still passes -- while `--skip-tags network` silently runs
+    # the whole suite, sockets and all, and exits 0. That is the exact fail-open this
+    # flag's own validation exists to prevent, arrived at from the other direction.
+    #
+    # `shouldrun` is ReTestItems' parameter name and the POSITIONAL SLOT is the contract,
+    # so this is one spelling in the `validate_paths = true` sense, not a condition with
+    # many equivalent forms.
+    @test occursin(r"runtests\(\s*shouldrun\s*,", body)
+
+    # The launcher's zero-selection replica must call the SHARED rule rather than inline
+    # its own. Inlining it again is how `--tags` and `--skip-tags` drift apart: the guard
+    # would count items by one rule and ReTestItems run them by another, so a valid filter
+    # gets refused or a doomed one gets through to a bare `No test items found.`.
+    #
+    # `\bselects\(` and not `selects`: the bare name also appears in the
+    # `using .NitroTestHarness: ...` import at the top of runtests.jl, which survives
+    # deleting the entire guard -- the same green theater this testset already avoids with
+    # `KNOWN_TAGS`. Only the CALL form discriminates.
+    @test occursin(r"\bselects\(", body)
+
+    # A recognised flag with no value must be refused, not dropped. Dropping `--skip-tags`
+    # is fail-open in the same way a mistyped one is: nothing is excluded and the run
+    # looks normal.
+    @test occursin("requires a value", body)
+
+    # The both-lists diagnosis. Exclusion winning is the BEHAVIOUR (`issubset` demands the
+    # tag, `isdisjoint` forbids it, so the selection is empty by construction, and
+    # "the selection rule matches ReTestItems' semantics" above asserts that directly).
+    # What this anchors is that the caller is TOLD so by name, instead of being handed the
+    # generic "selects 0 test items, maybe a typo?" message, which is actively misleading
+    # for a filter that is spelled correctly and simply contradicts itself.
+    @test occursin("both --tags and --skip-tags", body)
 
     # The incomplete-environment guard (#128). Both anchors are user-visible message text
     # with one spelling each, per the note above -- NOT the condition, which has many

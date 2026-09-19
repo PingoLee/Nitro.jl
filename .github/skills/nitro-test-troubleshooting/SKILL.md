@@ -45,6 +45,11 @@ julia --project=. test/runtests.jl test/middleware/
 julia --project=. test/runtests.jl --tags core
 julia --project=. test/runtests.jl --name "Session stores"
 
+# Exclude by tag. Repeatable, and the DUAL of `--tags`: an item is dropped if it carries
+# ANY listed tag, where `--tags` demands ALL of them.
+julia --project=. test/runtests.jl --skip-tags network --skip-tags slow
+julia --project=. test/runtests.jl --tags middleware --skip-tags network
+
 # Multithreaded items (one worker process, TEST_FILES order preserved).
 # `--workers N` for N > 1 is refused — see §7.
 julia -t auto --project=. test/runtests.jl
@@ -59,13 +64,20 @@ julia> runtests("test/setup_tests.jl", "test/middleware/guards_tests.jl")
 
 That list is prose; the machine-checked copy is `KNOWN_TAGS` in `test/harness_manifest.jl`, and
 `test/harness_tests.jl` asserts it matches the tags actually in use **in both directions**. An
-unknown `--tags` value is now an error naming the vocabulary. ReTestItems already fails a zero-match
-filter with `No test items found.`; the guard exists because that message names neither the
-vocabulary nor the AND/exact-match semantics. The genuinely silent case was a **mistyped path** —
-warned and dropped, run still green — which `validate_paths = true` now turns into a throw.
+unknown `--tags` **or `--skip-tags`** value is now an error naming the vocabulary. ReTestItems
+already fails a zero-match filter with `No test items found.`; the guard exists because that message
+names neither the vocabulary nor the AND/exact-match semantics. The genuinely silent case was a
+**mistyped path** — warned and dropped, run still green — which `validate_paths = true` now turns
+into a throw.
 
-Useful combination when you only want fast feedback: exclude the network-bound items by selecting a
-narrower tag rather than running everything.
+`--skip-tags` is validated for a second reason: it fails **open**. A mistyped `--tags` selects
+nothing and is loud; a mistyped `--skip-tags` excludes nothing, runs the very items you meant to
+skip, and reports an ordinary green.
+
+**For fast feedback, subtract rather than narrow:** `--skip-tags network --skip-tags slow` is a
+socket-free pass over the *whole* suite. Selecting a narrower tag was the old workaround and it
+could not do this — `--tags` is subset matching, so `--tags middleware` still selected the
+socket-bound items that genuinely carry `:middleware` (#214).
 
 ---
 

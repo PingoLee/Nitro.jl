@@ -136,9 +136,29 @@ end
         myjson = json(req, rank)
         @test myjson.power == 9000.1
 
-        # test invalid json
+        # A body that omits a required field must FAIL rather than hand back a
+        # partially-initialised struct. That is the contract; the exception TYPE is not,
+        # and pinning it is what made this assertion red on every CI job (#218).
+        #
+        # StructUtils owns that type and changed it deliberately:
+        #   <= 2.8  `fielddefault(style, T, i)::fieldtype(T, i)` -- with no default,
+        #           `fielddefault` returns `nothing`, so `nothing::String` fails the type
+        #           ASSERT. The `TypeError` was incidental, and named the type, not the field.
+        #   >= 2.9  an explicit `_absentfield_error(name)` throwing `ArgumentError` that
+        #           names the missing FIELD. Its source comment says the message deliberately
+        #           carries no type, "so it is safe under `juliac --trim`".
+        #
+        # So this is an upstream improvement, not a regression -- do not narrow `[compat]`
+        # to dodge it. The union accepts both spellings, since `[compat] JSON = "^1.3"`
+        # admits resolves on either side of the change.
+        #
+        # The contract that actually reaches an app is asserted elsewhere and is already
+        # type-agnostic: `test/extractor_tests.jl` ("user_id has no default and is absent")
+        # pins missing-required-field -> `ValidationError` -> 400, because `safe_extract`
+        # wraps ANY non-`InterruptException` throw. That is why this dependency change
+        # altered no HTTP behaviour, only this line's expectation.
         req = Request("GET","/", [],"""{}""")
-        @test_throws TypeError json(req, rank) 
+        @test_throws Union{TypeError, ArgumentError} json(req, rank)
 
         # test extra key
         req = Request("GET","/", [],"""{"title": "viscount", "power": 9000.1, "extra": "hi"}""")
@@ -217,9 +237,10 @@ end
         myjson = json(req, rank)
         @test myjson.power == 9000.1
 
-        # test invalid json
+        # Same contract on the Response side, same reasoning -- see the Request testset
+        # above for why the exception type is a union and not `TypeError` (#218).
         req = Response("""{}""")
-        @test_throws TypeError json(req, rank) 
+        @test_throws Union{TypeError, ArgumentError} json(req, rank)
 
         # test extra key
         req = Response("""{"title": "viscount", "power": 9000.1, "extra": "hi"}""")

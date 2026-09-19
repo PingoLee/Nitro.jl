@@ -385,6 +385,13 @@ julia --project=. test/runtests.jl test/middleware/
 # A filter matching nothing is an error, not an empty pass.
 julia --project=. test/runtests.jl --tags core --name "Session stores"
 
+# By tag EXCLUSION -- `--skip-tags` is repeatable and is the DUAL of `--tags`, not its
+# mirror: an item is dropped if it carries ANY listed tag, where `--tags` demands ALL of
+# them. The first line is the fast socket-free pass over the whole suite; the second is
+# what honest per-item tags buy -- the same tag, minus the items that bind a port.
+julia --project=. test/runtests.jl --skip-tags network --skip-tags slow
+julia --project=. test/runtests.jl --tags middleware --skip-tags network
+
 # `--workers N` for N > 1 is refused -- the suite shares one global router and depends on
 # the TEST_FILES order, so splitting items across processes silently changes what they see.
 # `julia -t auto` still runs the items themselves multithreaded.
