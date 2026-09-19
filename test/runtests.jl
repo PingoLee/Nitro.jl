@@ -120,6 +120,15 @@ using Nitro
 #   julia --project=. test/runtests.jl --tags core
 #   julia --project=. test/runtests.jl --name "Session stores"
 #
+# ── Exclude by tag (CLI) ──────────────────────────────────────────────────────
+#
+#   julia --project=. test/runtests.jl --skip-tags network --skip-tags slow
+#   julia --project=. test/runtests.jl --tags middleware --skip-tags network
+#
+# The first is the fast, socket-free pass over the WHOLE suite -- the thing honest
+# `:network`/`:slow` tags are actually for, and what `--tags` alone can never express
+# (#214). See the `--skip-tags` entry in the Flags block below for the semantics.
+#
 # ── Interactive REPL (single file) ────────────────────────────────────────────
 #
 #   $ julia --project=.        (or: julia; pkg> activate .)
@@ -142,7 +151,7 @@ using Nitro
 # mutate the global Nitro router via `urlpatterns(...)`, so execution order is load-bearing.
 # #31 is the design issue that would make it stop being load-bearing.
 include(joinpath(@__DIR__, "harness_manifest.jl"))
-using .NitroTestHarness: TEST_FILES, KNOWN_TAGS, discover_test_files, testitems
+using .NitroTestHarness: TEST_FILES, KNOWN_TAGS, discover_test_files, testitems, selects
 
 
 # ── Per-item cleanup net ───────────────────────────────────────────────────────
@@ -175,6 +184,7 @@ end
 # Supports (test deps are auto-provisioned via the bootstrap block above):
 #   julia --project=. test/runtests.jl test/sessionstores_tests.jl
 #   julia --project=. test/runtests.jl --tags core --name "Session stores"
+#   julia --project=. test/runtests.jl --skip-tags network --skip-tags slow
 #   julia -t auto --project=. test/runtests.jl                 # in-process, multithreaded
 #   julia --project=. test/runtests.jl --workers 0             # in-process (no timeouts)
 #   julia --project=. test/runtests.jl test\middleware\ratelimitter_lru_tests.jl
@@ -182,6 +192,18 @@ end
 #   Flags: --tags <tag>   filter by @testitem tag. REPEATABLE and AND-combined --
 #                         ReTestItems matches `issubset(requested, item.tags)`, so
 #                         `--tags core --tags network` means BOTH, not either.
+#          --skip-tags <tag>
+#                         EXCLUDE items carrying the tag. REPEATABLE, and the DUAL of
+#                         `--tags` rather than its mirror image: exclusion is
+#                         `isdisjoint`, so `--skip-tags network --skip-tags slow` drops
+#                         an item carrying EITHER, while `--tags` would demand BOTH.
+#                         Threaded in through `runtests`' `shouldrun` positional, which
+#                         ReTestItems ANDs with its own tag and name filters -- so a tag
+#                         named in both lists can only ever select nothing, and the arg
+#                         guard below says so by name instead of letting it look like a
+#                         typo. A MISSPELLED `--skip-tags` fails OPEN (it excludes
+#                         nothing and the run looks normal), which is why it is validated
+#                         against KNOWN_TAGS as strictly as `--tags` is (#214).
 #          --name <name>  EXACT @testitem name, NOT a substring: ReTestItems compares
 #                         `name == ti.name`. This comment said "substring" for a long
 #                         time and was wrong (#34).
@@ -204,6 +226,7 @@ end
 let args = copy(ARGS)
     paths     = String[]
     tags      = Symbol[]
+    skip_tags = Symbol[]
     name_filt = nothing
     nworkers  = -1   # sentinel: `--workers` not given (see the `runtests` call below)
 
@@ -211,10 +234,33 @@ let args = copy(ARGS)
         a = popfirst!(args)
         if a == "--tags" && !isempty(args)
             push!(tags, Symbol(popfirst!(args)))
+        elseif a == "--skip-tags" && !isempty(args)
+            push!(skip_tags, Symbol(popfirst!(args)))
         elseif a == "--name" && !isempty(args)
             name_filt = popfirst!(args)
         elseif a == "--workers" && !isempty(args)
             nworkers = parse(Int, popfirst!(args))
+        elseif a in ("--tags", "--skip-tags", "--name", "--workers")
+            # Reached ONLY when a recognised flag is last with nothing after it -- every
+            # branch above also requires a value. Without this the flag falls through all
+            # of them (the bare-path branch rejects anything starting with `--`) and is
+            # silently discarded.
+            #
+            # Refused rather than warned, because of where `--skip-tags` lands when it is
+            # dropped: `skip_tags` stays empty, so the validation block below never runs,
+            # `shouldrun` is `Returns(true)`, and the full suite executes -- including the
+            # `:network` items the caller asked to skip -- and reports an ordinary green.
+            # That is the same fail-OPEN shape as a mistyped `--skip-tags`, which the
+            # guard below goes to some trouble to close; leaving this hole open would make
+            # that guard's promise false by one case. A dangling `--tags` merely runs MORE
+            # than asked, but all four are refused together: one rule is easier to keep
+            # true than an exception for the one flag whose failure direction is worse.
+            error(
+                "`$a` requires a value, and nothing followed it.\n\n" *
+                "It would otherwise be dropped silently. For `--skip-tags` that means\n" *
+                "excluding nothing and running the very items you asked to skip, with a\n" *
+                "perfectly ordinary green at the end."
+            )
         elseif !startswith(a, "--")
             a = replace(a, '\\' => '/')   # accept Windows-style separators on any OS
             push!(paths, isabspath(a) ? a : joinpath(@__DIR__, "..", a))
@@ -269,9 +315,10 @@ let args = copy(ARGS)
     # `NoTestException("No test items found.")` once AST filtering leaves nothing. #34
     # claimed otherwise ("ReTestItems reports that as a successful empty run"); that was
     # checked against the shipped package and is false. What the bare exception does not
-    # tell you is WHY, and the three ways to get there are all easy to hit by accident:
-    # a mistyped tag, an AND-combined pair with an empty intersection, and a `--name` that
-    # is a substring rather than the exact item name.
+    # tell you is WHY, and the four ways to get there are all easy to hit by accident:
+    # a mistyped tag, an AND-combined pair with an empty intersection, a `--name` that
+    # is a substring rather than the exact item name, and a tag named in both `--tags`
+    # and `--skip-tags`.
     #
     # So this is a message-quality guard, and it is deliberately kept anyway: `--tags
     # workers` used to fail with "No test items found." and no hint that `:workers` simply
@@ -279,15 +326,38 @@ let args = copy(ARGS)
     #
     # It cannot be a @testitem -- the same filter would delete the guard -- so it lives in
     # the coordinator, which is also the only place that can name the vocabulary.
-    if !isempty(tags) || !isnothing(name_filt)
-        unknown = setdiff(Set(tags), KNOWN_TAGS)
+    if !isempty(tags) || !isempty(skip_tags) || !isnothing(name_filt)
+        # BOTH tag lists, in one check. `--skip-tags` is the half that needs it more:
+        # `--tags netwrok` fails CLOSED -- zero items, and this guard names the
+        # vocabulary -- whereas `--skip-tags netwrok` fails OPEN. It would exclude
+        # nothing, run the whole suite including the `:network` items the caller meant to
+        # skip, and report a perfectly ordinary green. A filter that silently stops
+        # filtering is the same shape of defect as #128's silently-shorter suite (#214).
+        unknown = setdiff(Set([tags; skip_tags]), KNOWN_TAGS)
         isempty(unknown) || error(
             "Unknown test tag(s): $(join(sort!(collect(unknown)), ", ")).\n" *
             "Known tags: $(join(sort!(collect(KNOWN_TAGS)), ", ")).\n\n" *
             "A tag matching no @testitem would fail anyway, with ReTestItems'\n" *
             "`No test items found.` -- this message exists to name the vocabulary\n" *
-            "instead. `KNOWN_TAGS` lives in test/harness_manifest.jl and is checked\n" *
-            "against the suite by test/harness_tests.jl."
+            "instead. A mistyped `--skip-tags` would NOT fail on its own: it excludes\n" *
+            "nothing and the run looks normal, which is why it is checked here too.\n" *
+            "`KNOWN_TAGS` lives in test/harness_manifest.jl and is checked against the\n" *
+            "suite by test/harness_tests.jl."
+        )
+
+        # A tag in both lists is diagnosed by name rather than left to look like one of
+        # the other three causes. It needs no special handling to BEHAVE correctly --
+        # `issubset` demands the tag and `isdisjoint` forbids it, so the selection is
+        # necessarily empty and exclusion wins by construction. What it needs is to not
+        # be reported as "your filter selected 0 items, maybe a typo?", which is the
+        # generic message below and is actively misleading here.
+        conflict = intersect(Set(tags), Set(skip_tags))
+        isempty(conflict) || error(
+            "Tag(s) in both --tags and --skip-tags: " *
+            "$(join(sort!(collect(conflict)), ", ")).\n\n" *
+            "Exclusion wins, so this filter can only ever select 0 test items:\n" *
+            "`--tags` requires an item to carry the tag and `--skip-tags` requires it\n" *
+            "not to. Drop whichever half you did not mean."
         )
 
         # A mistyped path must not be reported as a filter problem. Without this, a bad
@@ -303,22 +373,30 @@ let args = copy(ARGS)
                 error("No such test path: $p")
             end
         end
+        # `selects` is the SHARED rule, in test/harness_manifest.jl -- not an inline
+        # reimplementation. This loop has to agree with what ReTestItems will actually do,
+        # and the way that agreement breaks is by someone adding a filter axis here and
+        # not there, or there and not here (#214 is exactly that: `--skip-tags` threaded
+        # into the real run and forgotten in the replica would have made this guard report
+        # "selects 0 test items" for perfectly valid runs). Sharing the predicate makes the
+        # drift unrepresentable, and lets test/harness_tests.jl unit-test the rule, which
+        # an inline loop in the coordinator could never be.
         selected = 0
         for f in scan
             isfile(f) || continue
             for (nm, tg) in testitems(f)
-                (isempty(tags) || issubset(tags, tg)) || continue
-                (isnothing(name_filt) || nm == name_filt) || continue
-                selected += 1
+                selects(nm, tg; tags, skip_tags, name = name_filt) && (selected += 1)
             end
         end
         selected == 0 && error(
             "This filter selects 0 test items. ReTestItems would fail with the less\n" *
             "specific `No test items found.`; the likely cause is one of these:\n" *
-            "  --tags $(isempty(tags) ? "(none)" : join(tags, " "))\n" *
-            "  --name $(something(name_filt, "(none)"))\n\n" *
-            "`--tags` are AND-combined, not OR. `--name` is an EXACT @testitem name,\n" *
-            "not a substring."
+            "  --tags      $(isempty(tags) ? "(none)" : join(tags, " "))\n" *
+            "  --skip-tags $(isempty(skip_tags) ? "(none)" : join(skip_tags, " "))\n" *
+            "  --name      $(something(name_filt, "(none)"))\n\n" *
+            "`--tags` are AND-combined, not OR -- an item must carry ALL of them.\n" *
+            "`--skip-tags` is the dual: an item is dropped if it carries ANY of them.\n" *
+            "`--name` is an EXACT @testitem name, not a substring."
         )
     end
 
@@ -356,6 +434,26 @@ let args = copy(ARGS)
     # the coverage job.
     covering = Base.JLOptions().code_coverage != 0
 
+    # Tag EXCLUSION, which ReTestItems' own filters cannot express (#214).
+    #
+    # `tags=` is `issubset(requested, item.tags)` -- always "has at least these" -- so no
+    # combination of it says "run everything except `:network`". `runtests` takes a
+    # `shouldrun` predicate as its FIRST POSITIONAL argument and ANDs it with the tag and
+    # name filters (`ReTestItems/src/filtering.jl`):
+    #
+    #     f.shouldrun(ti)::Bool && _shouldrun(f.tags, ti) && _shouldrun(f.name, ti)
+    #
+    # Nitro passed no predicate, so the slot was free and exclusion needs no upstream
+    # change and no fork. The closure is safe to allocate here: ReTestItems applies the
+    # filter while INCLUDING each test file, under `Threads.@spawn` in this process
+    # (`Base.include($ti_filter, Main, $filepath)`), so it never has to cross a process
+    # boundary to the worker and never has to serialize.
+    #
+    # `Returns(true)` rather than an always-true closure when nothing is excluded: that is
+    # exactly what `runtests(paths...; kw...)` forwards today, so the no-flag path is
+    # unchanged rather than merely equivalent.
+    shouldrun = isempty(skip_tags) ? Returns(true) : (ti -> isdisjoint(skip_tags, ti.tags))
+
     # Pin the environment for the whole run (#55). `serve()` now resolves and VALIDATES
     # `NITRO_ENV`/`GENIE_ENV`, and ~20 test files call `serve`. Without this, a developer with
     # `GENIE_ENV=staging` exported -- exactly the Genie migrant the fallback exists for -- gets
@@ -365,6 +463,7 @@ let args = copy(ARGS)
     # the test suite.
     withenv("NITRO_ENV" => "test", "GENIE_ENV" => nothing) do
         runtests(
+            shouldrun,
             paths...;
             # THE silent zero-test hole, and the one #34 was really looking for.
             #

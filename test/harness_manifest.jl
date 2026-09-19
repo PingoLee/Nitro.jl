@@ -2,7 +2,7 @@
 # tags exist. Two consumers need it, and neither can see the other:
 #
 #   * `test/runtests.jl` -- the coordinator. Builds the run list from TEST_FILES, and
-#     refuses a `--tags`/`--name` filter that would select nothing.
+#     refuses a `--tags`/`--skip-tags`/`--name` filter that would select nothing.
 #   * `test/harness_tests.jl` -- a `@testitem`, which ReTestItems evaluates in a WORKER
 #     process where `runtests.jl` was never loaded. It re-includes this file by absolute
 #     path, the same way `docs_deploy_tests.jl` reads the shipped `docs/make.jl`.
@@ -204,6 +204,32 @@ function testitems(path)
     walk(Meta.parseall(read(path, String)))
     return out
 end
+
+# ── Selection -- the one rule both the launcher and its guard read ────────────────────
+# `test/runtests.jl` re-implements ReTestItems' filter so it can say WHY a filter selected
+# nothing, instead of leaving the caller with `No test items found.`. A replica that drifts
+# from the real run is worse than no replica: it either refuses a run ReTestItems would have
+# happily executed, or waves through one ReTestItems then rejects. #214 is the receipt --
+# adding `--skip-tags` without teaching the replica about exclusion is exactly that drift.
+#
+# So the rule lives HERE, where the coordinator and the `@testitem` guard can both call it,
+# and the guard can unit-test it -- which an inline loop inside `runtests.jl` could not be.
+#
+# The three clauses mirror `ReTestItems`' `TestItemFilter` (`src/filtering.jl`):
+#
+#   tags       AND-combined, `issubset(requested, item.tags)` -- "has AT LEAST all of these"
+#   name       EXACT, `name == ti.name`, never a substring (#34)
+#   skip_tags  the DUAL of `tags`, and NOT its mirror image: `isdisjoint` drops an item that
+#              carries ANY listed tag, where `issubset` demands ALL of them. So
+#              `--skip-tags network --skip-tags slow` means "neither", while
+#              `--tags network --tags slow` means "both". Threaded into the run through
+#              `runtests`' `shouldrun` positional, which is ANDed with the two above.
+#
+# Reimplemented rather than calling ReTestItems' internals, for the same reason `testitems`
+# above is: a guard on the suite must not depend on a private function of the package it is
+# guarding. `TestItemFilter` and `_shouldrun` are both unexported.
+selects(nm, tg; tags = Symbol[], skip_tags = Symbol[], name = nothing) =
+    issubset(tags, tg) && isdisjoint(skip_tags, tg) && (isnothing(name) || nm == name)
 
 # ── Skip detection -- AST, not regex, for the same BOM reason as above ────────────────
 # A conditional skip turns missing coverage into a PASS. `@test_skip` and `@test_broken`
