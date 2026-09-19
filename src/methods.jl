@@ -122,6 +122,21 @@ Not every file in `folder` is served. These are refused:
   which would stop the server booting.
 - **Anything that is not a regular file** — symlinked directories, FIFOs, devices.
 
+A filename that needs percent-encoding is **not** refused — it is served at its **encoded route**.
+`café.txt` mounts at `/static/caf%C3%A9.txt` and `my file.txt` at `/static/my%20file.txt`, which are
+the URLs a conforming client sends; the router compares path segments byte for byte and never
+decodes, so **no conforming client** could reach the unencoded spellings. The returned pair carries
+the encoded route and the raw filesystem path, so **do not re-derive one from the other** — read the
+route from `first(pair)` rather than rebuilding it from the filename.
+
+Only characters that RFC 3986 forbids in a path segment are encoded, so a name that already works
+keeps its exact URL: `report(1).txt`, `a+b.txt`, `v1.2~beta.txt`, `a:b.txt` and `a@b.txt` are all
+unchanged. The two costs, both real: a **literal `%`** in a filename is itself encoded, so
+`my%20file.txt` moves to `/static/my%2520file.txt` (it has to — otherwise one URL would name both
+that file and the encoded form of `my file.txt`); and a non-browser client that was sending raw
+UTF-8 bytes to reach `café.txt` gets a 404, because `café` and `caf%C3%A9` are different byte
+strings under a byte-exact matcher.
+
 `include_hidden=true` serves dotfiles and `allow_symlink_escape=true` serves escaping symlinks; both
 widen what is publicly reachable, so set them deliberately. Note they interact: with
 `allow_symlink_escape=true`, a link pointing at a dotfile *outside* the folder is served regardless
@@ -192,6 +207,9 @@ in [`staticfiles`](@ref); the same rules apply here. Three SPA-specific conseque
   than a mounted file, and it has no filepath of its own to pair with.
 - Because the fallback answers any unmatched path under the mount, a file that *was* refused reads
   as `index.html` with a 200 rather than a 404. That is not a leak, but it can be confusing in logs.
+  A filename needing percent-encoding is no longer in that class: it is mounted at its encoded
+  route, so `/<prefix>/caf%C3%A9.txt` serves the asset rather than silently resolving to the app
+  shell ([#121](https://github.com/PingoLee/Nitro.jl/issues/121)).
 """
 spafiles(
     folder::String,

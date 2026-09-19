@@ -263,10 +263,74 @@ byte for byte. HTTP.jl matches path segments with a byte comparison rather than 
 equivalence test, so case-normalizing `"%2f"` to `"%2F"`, or decoding unreserved triplets, would stop
 matching the client that sends the other spelling.
 
-`mountdir` is app-authored — a single value with an obvious correction — so it throws. Filenames keep
-the softer treatment: they arrive in bulk from the filesystem, `mountable_files` skips rather than
-throws, and refusing one would silently drop a file from a mount that serves it today. That
-asymmetry is deliberate and is tracked separately.
+`mountdir` is app-authored — a single value with an obvious correction — so it throws. Filenames are
+not refused at all; they are **encoded**, which is the next sub-section.
+
+### A filename is data; a mountdir is authored
+
+#101 left the filename side of the encoding defect open on purpose, and
+[#121](https://github.com/PingoLee/Nitro.jl/issues/121) closed it the other way round: a `mountdir`
+segment that is not a legal URL path segment **throws**, while a *filename* that is not one is
+**percent-encoded and served at the encoded route**. `café.txt` mounts at `/static/caf%C3%A9.txt`,
+`my file.txt` at `/static/my%20file.txt`, and a directory named `sub dir/` is encoded the same way.
+
+The four options were: leave it; warn; skip the file; or encode the route. Encoding is the only one
+that *fixes* the case rather than reporting it, and it was only expressible after
+[#102](https://github.com/PingoLee/Nitro.jl/issues/102) made `mountfolder` return `route => filepath`
+pairs — before that the route and the filesystem name were the same string. Skipping was the
+consistent-with-#101 option and was rejected: refusals at that layer *skip*, so a mount would boot
+serving strictly less than before with no error, trading a route nobody can reach for a file nobody
+can reach.
+
+**The asymmetry is about the kind of input, not about strictness.** A `mountdir` is *authored*:
+`"my%20static"` is someone spelling a space deliberately, so the triplet is validated and passed
+through. A filename is *data*: a file named `my%20file.txt` contains the three characters `%`, `2`,
+`0`, and the URL that names it is `my%2520file.txt`. Passing a triplet through on that side would
+make one URL mean two different files — the literal `my%20file.txt` and the encoded form of
+`my file.txt`. One rule cannot serve both inputs without losing information, so `%` is encoded on
+the filename side and preserved on the `mountdir` side. This is the only case where a route a
+*browser* could already reach moves, and `UPGRADING.md`'s #121 entry says so.
+
+**The safe set is `_is_pchar` exactly, and that choice is what bounds the blast radius.**
+`HTTP.escapeuri` would have been the obvious tool and is the wrong one: `URIs.issafe` keeps only
+`A-Za-z0-9-._`, so it also encodes `~` and every sub-delim plus `:` and `@` — all legal `pchar` that
+browsers send raw. Measured over a socket with hand-written request lines, before and after:
+
+| File on disk | Route before | Route after | Browser before → after |
+|---|---|---|---|
+| `report(1).txt`, `a+b.txt`, `v1.2~beta.txt`, `a:b.txt`, `a@b.txt` | literal | **unchanged** | 200 → 200 |
+| `café.txt` | `/static/café.txt` | `/static/caf%C3%A9.txt` | **404 → 200** |
+| `my file.txt` | `/static/my file.txt` | `/static/my%20file.txt` | **404 → 200** (raw spelling was a 400, so it was reachable by nobody) |
+| `100%.txt` | `/static/100%.txt` | `/static/100%25.txt` | **404 → 200** |
+| `my%20file.txt` | `/static/my%20file.txt` | `/static/my%2520file.txt` | 200 → **moved** |
+
+So encoding with `escapeuri` would have broken five working shapes to fix three. With `_is_pchar`,
+every pchar-clean name keeps its route byte for byte. The cost that remains is the `%` row above,
+plus the #101 cost in the other direction: a client sending raw UTF-8 to reach `café.txt` now gets a
+404, and cannot be migrated by changing the server alone.
+
+**The route-pattern refusal survives, and has to.** `*` and `**` are legal `pchar`, so the encoder
+leaves them alone — nothing else stops a file named `*` from shadowing its siblings. `{` and `}`
+*would* be encoded, but the refusal runs first, so `{id}.txt` stays skipped rather than becoming
+servable at `%7Bid%7D.txt`. Encoding braces would change *what* a mount serves rather than only
+where, which is a separate decision.
+
+**This is the emit side of a problem no other framework has to solve.** A survey done for #121:
+Go's `net/http.FileServer`, Express's `serve-static`/`send`, Phoenix's `Plug.Static`, Django's
+`static.serve` and nginx all mount **one prefix handler** and resolve the **percent-decoded** request
+path per request — Go stores `URL.Path` decoded and matches `ServeMux` on it; `send` runs
+`decodeURIComponent` and 400s on malformed input; `Plug.Static` decodes each segment after
+subtracting `:at` and *then* validates. None of them registers a literal route per enumerated file,
+so none of them can register an unreachable one. Nitro does (§1), so the decoding side is not
+available to it — but the *emitting* side is, and there the same frameworks agree: Go's `dirList`
+writes hrefs through `url.URL.String()` and Django's `static` tag through `quote`. Encoding at
+registration is that step, moved to mount time because that is when Nitro emits its URLs.
+
+Adopting the prefix-handler shape instead would make this whole class unrepresentable rather than
+handled, and is tracked as its own issue; it interacts with the ETag/304
+([#40](https://github.com/PingoLee/Nitro.jl/issues/40)) and streaming
+([#41](https://github.com/PingoLee/Nitro.jl/issues/41)) work, which is scheduled against the
+current shape.
 
 ### A route name does not identify what produced it
 

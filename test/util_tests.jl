@@ -2,7 +2,7 @@
 using Test
 using UUIDs
 using Nitro.Core.Util
-using Nitro.Core.Util: mount_segments, mount_route
+using Nitro.Core.Util: mount_segments, mount_route, _route_encode
 using Nitro.Core: serverwelcome
 using Nitro: ValidationError
 using Nitro.Core.Errors: cause_report   # unexported on purpose — see src/errors.jl
@@ -395,6 +395,64 @@ end
     @test encoding_err isa ArgumentError
     @test occursin("my static", encoding_err.msg)
     @test occursin("percent-encoded", encoding_err.msg)
+end
+
+@testset "_route_encode encodes a filename into a reachable path segment" begin
+    # The filename counterpart of the rule above: `mount_segments` THROWS on a segment that is not
+    # legal `pchar`, `_route_encode` ENCODES it. A `mountdir` is one authored value with an obvious
+    # correction; a filename is data arriving in bulk from the filesystem (#121).
+
+    # Identity on everything that is legal `pchar` -- this is the property that keeps every
+    # currently-reachable static URL byte-identical.
+    for name in ("plain.txt", "file.min.js", "myfile", "report(1).txt", "a+b.txt", "v1.2~beta.txt",
+                 "a:b.txt", "a@b.txt", "a!b.txt", "a\$b.txt", "a&b.txt", "a'b.txt", "a,b;c=d.txt",
+                 "index.html", "a*b.txt", "-_.~", "A1")
+        @test _route_encode(name) == name
+    end
+
+    # Encoded: uppercase hex, one triplet per UTF-8 byte.
+    @test _route_encode("my file.txt")  == "my%20file.txt"
+    @test _route_encode("café.txt")     == "caf%C3%A9.txt"      # é is two bytes
+    @test _route_encode("日本.txt")      == "%E6%97%A5%E6%9C%AC.txt"  # three bytes each
+    @test _route_encode("a#b.txt")      == "a%23b.txt"
+    @test _route_encode("a?b.txt")      == "a%3Fb.txt"
+    @test _route_encode("a|b.txt")      == "a%7Cb.txt"
+    @test _route_encode("a[b].txt")     == "a%5Bb%5D.txt"
+    @test _route_encode("a^b.txt")      == "a%5Eb.txt"
+    @test _route_encode("a\\b.txt")     == "a%5Cb.txt"
+    @test _route_encode("a\"b.txt")     == "a%22b.txt"
+    @test _route_encode("a\tb.txt")     == "a%09b.txt"          # control character
+
+    # Non-ASCII that Julia's Unicode-aware `isletter` would accept -- the `isascii` guard in
+    # `_is_pchar` is what keeps these out of the safe set (see its docstring).
+    @test _route_encode("Ａ.txt") == "%EF%BC%A1.txt"             # fullwidth A
+    @test _route_encode("٣.txt")  == "%D9%A3.txt"               # Arabic-Indic digit three
+
+    # `%` is ALWAYS encoded here, unlike in `mount_segments`, where a well-formed triplet is
+    # validated and passed through. A file named `my%20file.txt` contains `%`, `2`, `0`; leaving the
+    # triplet alone would make one URL name both it and the encoded form of `my file.txt`.
+    @test _route_encode("100%.txt")      == "100%25.txt"
+    @test _route_encode("my%20file.txt") == "my%2520file.txt"
+    @test _route_encode("%GG")           == "%25GG"
+    @test mount_segments("my%20static")  == ["my%20static"]     # the authored side, unchanged
+
+    # Injective: `%` being encoded is what makes the image unambiguous, so two names can never be
+    # given the same route.
+    @test _route_encode("a b")   != _route_encode("a%20b")
+    @test _route_encode("a%2Fb") != _route_encode("a/b")
+
+    # Invalid UTF-8, which is the stated reason the implementation iterates BYTES rather than
+    # `Char`s: `readdir` can hand back a name that is not valid UTF-8, and `codepoint` on a
+    # malformed `Char` throws. A `for c in name` rewrite passes every other assertion here and
+    # fails only in production, on a non-UTF-8 filesystem.
+    @test _route_encode(String(UInt8[0x61, 0xff, 0x62]))       == "a%FFb"
+    @test _route_encode(String(UInt8[0x61, 0xff, 0xfe, 0x62])) == "a%FF%FEb"
+
+    # Idempotence is deliberately NOT a property: encoding an already-encoded name encodes its `%`
+    # again. Nothing in `mountfolder` encodes twice, and asserting this pins that it must not.
+    @test _route_encode(_route_encode("café.txt")) == "caf%25C3%25A9.txt"
+
+    @test _route_encode("") == ""
 end
 
 @testset "mount_route joins segments" begin

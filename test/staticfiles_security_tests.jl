@@ -239,6 +239,279 @@ end
     end
 end
 
+# ── #121: the filename half of the same defect, answered the other way round ──────────────────────
+#
+# A `mountdir` that is not a legal URL path segment THROWS (#101, above). A *filename* that is not
+# one is percent-ENCODED and served at the encoded route, because filenames arrive in bulk from the
+# filesystem and a refusal at that layer skips silently -- which would trade a route nobody can
+# reach for a file nobody can reach.
+#
+# Its own tree, not the shared `root`: these names would otherwise change the route sets that the
+# `mountfolder`/`mountdir`-spelling testsets above and below assert against.
+enc_root = mktempdir()
+
+# Every fixture below is created through this, and a name only enters the assertion set if the
+# filesystem actually produced *that* name. Two distinct hazards, and `isfile` catches neither:
+#
+#  - `write` can THROW. `a:b.txt` is legal `pchar` but reserved on Windows, where `<tmp>\a:b.txt` is
+#    NTFS alternate-data-stream syntax (base file `a`, stream `b.txt`). An unguarded write there
+#    either throws -- taking every assertion in this test item down with it, including the symlink
+#    and hidden-file security ones -- or silently creates a file named `a`.
+#  - A NORMALIZING filesystem can create the file under a *different* name. On an NFD-normalizing
+#    volume `isfile("café.txt")` is true while `readdir` returns the NFD spelling, so the route
+#    would be `cafe%CC%81.txt` and the assertion would fail confusingly rather than skip.
+#
+# Checking membership in `readdir` is what distinguishes "not created" from "created under another
+# name". Same reason the `has_star` guard above exists -- `:` is just the one that is easy to miss.
+function make_fixture(dir, name, content)
+    try
+        write(joinpath(dir, name), content)
+        return name ∈ readdir(dir)
+    catch
+        return false
+    end
+end
+
+# Names that must survive byte for byte. Every one of these is legal `pchar`, so a conforming client
+# sends it raw and it already worked -- this is the half that must NOT move.
+#
+# Against the full Windows rule set (reserved `< > : " / \ | ? *`, device names, trailing dot or
+# space) exactly one of these is hostile: `a:b.txt`, where `<tmp>\a:b.txt` is ADS syntax. Parens,
+# `+` and `@` are unreserved there, and `~` is special only in 8.3 short-name *generation*, never in
+# a literal name. `a:b.txt`'s route property is a pure string fact and is pinned filesystem-free in
+# test/util_tests.jl, so nothing is lost by not writing that file.
+const PCHAR_CANDIDATES = ["plain.txt", "report(1).txt", "a+b.txt", "v1.2~beta.txt", "a:b.txt",
+                          "a@b.txt", "file.min.js", "myfile"]
+const PCHAR_SKIPPABLE  = Sys.iswindows() ? ["a:b.txt"] : String[]
+pchar_clean = String[]
+for n in PCHAR_CANDIDATES
+    make_fixture(enc_root, n, "BODY:" * n) && push!(pchar_clean, n)
+end
+
+# Names that need encoding, paired with the route they must register.
+made_encoding = Dict{String,String}()
+for (name, route) in ("café.txt"      => "caf%C3%A9.txt",
+                      "my file.txt"   => "my%20file.txt",
+                      "100%.txt"      => "100%25.txt",
+                      "my%20file.txt" => "my%2520file.txt")
+    make_fixture(enc_root, name, "BODY:" * name) && (made_encoding[name] = route)
+end
+
+# A directory whose own name needs encoding, holding both an ordinary file and an `index.html`.
+# The `index.html` is not decoration: `mountfolder` derives the bare directory route from the
+# ENCODED segments while testing the RAW leaf name, and this is the only fixture in the suite that
+# exercises that combination.
+has_spaced_dir = try
+    mkpath(joinpath(enc_root, "sub dir"))
+    a = make_fixture(joinpath(enc_root, "sub dir"), "x.txt", "BODY:sub dir/x.txt")
+    b = make_fixture(joinpath(enc_root, "sub dir"), "index.html", "BODY:sub dir/index.html")
+    a && b
+catch
+    false
+end
+
+# A vacuity tripwire, and it must sit AFTER every guard it checks. All of these names are legal on
+# ext4, APFS and NTFS (bar the one Windows exception noted above), so no supported platform should skip
+# them -- and a guard that ever did fire would turn its testsets into silent no-ops while the run
+# still reported green. `has_spaced_dir` is the one that matters most: the assertions behind it are
+# the ONLY coverage anywhere in the suite of the branch this change edited (`mountfolder` testing
+# the raw leaf name while `bare_path` derives from the encoded segments).
+@testset "the #121 fixtures were actually created" begin
+    @test has_spaced_dir
+    # `setdiff` rather than a count, so a failure names the missing fixture. A count of 7 cannot
+    # tell "Windows skipped `a:b.txt`" from "some host silently skipped `a@b.txt` instead".
+    @test setdiff(PCHAR_CANDIDATES, pchar_clean) ⊆ PCHAR_SKIPPABLE
+    @test length(made_encoding) == 4
+end
+
+@testset "a filename that must be percent-encoded mounts at its encoded route" begin
+    routes = Set(mountroutes(enc_root, "enc", (_r, _p) -> nothing))
+
+    encoded_routes = Set("/enc/" * e for e in values(made_encoding))
+    for (name, encoded) in made_encoding
+        @test "/enc/$encoded" ∈ routes
+        # The discriminating half: the raw spelling is NOT registered. Without this the assertion
+        # above would pass on unpatched code for any name that needed no encoding.
+        #
+        # Guarded, because the two namespaces overlap in exactly one direction: the raw name
+        # `my%20file.txt` IS a registered route -- it is the *encoded* route of the sibling file
+        # `my file.txt`. So skip the negative where a name collides with another fixture's encoded
+        # route, and let the injectivity testset below pin that the two resolve to different files.
+        if "/enc/$name" ∉ encoded_routes
+            @test "/enc/$name" ∉ routes
+        end
+    end
+
+    if has_spaced_dir
+        # An intermediate directory segment is encoded too -- a directory named `sub dir/` is as
+        # unreachable as a file would be.
+        @test "/enc/sub%20dir/x.txt" ∈ routes
+        @test "/enc/sub dir/x.txt" ∉ routes
+
+        # The BARE directory route of an encoded directory. This is the line `mountfolder` changed:
+        # the `index.html` test now reads the RAW leaf name while `bare_path` is still built from
+        # the ENCODED segments. Revert either half and this is the assertion that catches it --
+        # otherwise the bare route of every space-bearing SPA subdirectory goes unreachable, or the
+        # two spellings drift apart, with nothing else in the suite noticing.
+        @test "/enc/sub%20dir/index.html" ∈ routes
+        @test "/enc/sub%20dir"            ∈ routes
+        @test "/enc/sub dir"              ∉ routes
+    end
+
+    # Through the router, which is the claim that actually matters: the encoded URL is the one a
+    # browser sends, and before #121 it was a 404.
+    resetstate()
+    try
+        staticfiles(enc_root, "enc")
+        for (name, encoded) in made_encoding
+            resp = internalrequest(HTTP.Request("GET", "/enc/$encoded"))
+            @test resp.status == 200
+            # Not just a 200 -- the *right* file. `my file.txt` and `my%20file.txt` both exist in
+            # this tree and their routes are one `%25` apart, so a body check is what proves the
+            # encoding did not collapse them onto each other.
+            @test String(resp.body) == "BODY:" * name
+        end
+        if has_spaced_dir
+            @test internalrequest(HTTP.Request("GET", "/enc/sub%20dir/x.txt")).status == 200
+            # The bare directory route serves the index, through the router.
+            bare = internalrequest(HTTP.Request("GET", "/enc/sub%20dir"))
+            @test bare.status == 200
+            @test String(bare.body) == "BODY:sub dir/index.html"
+        end
+
+        # The raw spelling is a 404 through the ROUTER, not merely absent from the route vector.
+        #
+        # This is the assertion that pins the mechanism the whole fix rests on: HTTP.jl matches path
+        # segments byte for byte and percent-decodes NOTHING. Under a hypothetical decoding router
+        # every other router assertion in these testsets would pass identically -- registration and
+        # lookup would decode symmetrically -- so without this one, nothing distinguishes the two.
+        if haskey(made_encoding, "café.txt")
+            @test internalrequest(HTTP.Request("GET", "/enc/café.txt")).status == 404
+        end
+    finally
+        resetstate()
+    end
+end
+
+@testset "a pchar-clean filename keeps its route byte for byte" begin
+    # The invariance half of #121, and the reason the encoder's safe set is `_is_pchar` rather than
+    # `HTTP.escapeuri`'s. `escapeuri` keeps only `A-Za-z0-9-._`, so it would also encode `~` and
+    # every sub-delim plus `:` and `@` -- measured over a socket, all of the names below serve today
+    # at their literal routes and 404 at the over-encoded ones. Encoding with `escapeuri` would have
+    # broken five working shapes to fix three.
+    #
+    # These assertions pass against unpatched code by design: that IS the property under test.
+    # The discriminating siblings are in the testset above.
+    routes = Set(mountroutes(enc_root, "enc", (_r, _p) -> nothing))
+    for n in pchar_clean
+        @test "/enc/$n" ∈ routes
+    end
+
+    # And the over-encoded spellings `escapeuri` would have produced are NOT registered.
+    for bad in ("report%281%29.txt", "a%2Bb.txt", "v1.2%7Ebeta.txt", "a%3Ab.txt", "a%40b.txt")
+        @test "/enc/$bad" ∉ routes
+    end
+end
+
+@testset "a literal percent in a filename is encoded, not passed through" begin
+    # The one place the filename rule deliberately disagrees with the `mountdir` rule, and the one
+    # case where a route a *browser* could already reach moves.
+    #
+    # A `mountdir` is AUTHORED: `"my%20static"` is someone spelling a space on purpose, so the
+    # triplet is validated and passed through (the #101 testset above pins that).
+    # A filename is DATA: a file named `my%20file.txt` contains the three characters `%`, `2`, `0`,
+    # so its route is `my%2520file.txt`. Passing the triplet through here would make one URL name
+    # two different files.
+    if haskey(made_encoding, "my%20file.txt") && haskey(made_encoding, "my file.txt")
+        routes = Set(mountroutes(enc_root, "enc", (_r, _p) -> nothing))
+        @test "/enc/my%2520file.txt" ∈ routes      # the literal-% file
+        @test "/enc/my%20file.txt"   ∈ routes      # `my file.txt`, whose encoded form this is
+        # Both present, and each resolves to its own file -- pinned by body in the first testset.
+        # Before #121 the literal-% file owned `/enc/my%20file.txt` and `my file.txt` owned nothing
+        # a client could send.
+
+        # Side by side with the mountdir half, so the asymmetry is pinned in one place rather than
+        # inferred from two testsets that never meet.
+        @test Nitro.Core.Util.mount_segments("my%20static") == ["my%20static"]
+        @test Nitro.Core.Util._route_encode("my%20static") == "my%2520static"
+    end
+end
+
+@testset "distinct filenames cannot collapse onto one route" begin
+    # `_route_encode` is injective because `%` is itself encoded, so no two names can be given the
+    # same route -- which would otherwise mean one file silently shadowing another through HTTP.jl's
+    # `replacing existing registered route` path.
+    inj = mktempdir()
+    # Derived from what landed on disk, not asserted by writing `true` -- a name that failed to be
+    # created would otherwise make this whole testset a no-op that still reports green.
+    ok = make_fixture(inj, "a b.txt", "BODY:space") &&
+         make_fixture(inj, "a%20b.txt", "BODY:literal")
+    @test ok          # both names are legal everywhere; a skip here would be a silent no-op
+    if ok
+        routes = mountroutes(inj, "i", (_r, _p) -> nothing)
+        @test length(routes) == length(Set(routes))
+        @test Set(routes) == Set(["/i/a%20b.txt", "/i/a%2520b.txt"])
+
+        resetstate()
+        try
+            staticfiles(inj, "i")
+            @test String(internalrequest(HTTP.Request("GET", "/i/a%20b.txt")).body)   == "BODY:space"
+            @test String(internalrequest(HTTP.Request("GET", "/i/a%2520b.txt")).body) == "BODY:literal"
+        finally
+            resetstate()
+        end
+    end
+end
+
+@testset "route-pattern filenames are refused, not encoded" begin
+    # `*` and `**` are legal `pchar`, so `_route_encode` leaves them alone -- nothing but the
+    # `_is_route_pattern` refusal stops a file named `*` from shadowing its siblings. Braces WOULD
+    # be encoded, but the refusal runs first, so `{id}.txt` stays skipped rather than becoming
+    # servable at `%7Bid%7D.txt`. Encoding braces would change WHAT a mount serves, not only where.
+    routes = Set(mountroutes(root, "x", (_r, _p) -> nothing))
+    @test "/x/{id}.txt"      ∉ routes
+    @test "/x/%7Bid%7D.txt"  ∉ routes
+    if has_star
+        @test "/x/**"   ∉ routes
+        @test "/x/%2A%2A" ∉ routes
+    end
+end
+
+@testset "the encoded route pairs with the raw filesystem path" begin
+    # #102's contract survives #121: the route half may now be encoded, but the filepath half is
+    # still `joinpath(root, name)` verbatim, so `joinpath` remains a valid key into the pair vector.
+    # That is what `spafiles` relies on to find its index by file.
+    pairs_ = MOUNTFOLDER(enc_root, "enc", (_r, _p) -> nothing)
+    for (name, encoded) in made_encoding
+        idx = findfirst(p -> last(p) == joinpath(enc_root, name), pairs_)
+        @test idx !== nothing
+        @test first(pairs_[idx]) == "/enc/$encoded"
+    end
+end
+
+@testset "spafiles serves an encoded asset instead of falling back to index.html" begin
+    # The masking case, and the reason #121 is worse than a 404 under `spafiles`: the `/<prefix>/**`
+    # history fallback answered the encoded asset URL with `index.html` and a 200, so the asset
+    # silently resolved to the app shell.
+    spa = mktempdir()
+    write(joinpath(spa, "index.html"), "BODY:SHELL")
+    ok = make_fixture(spa, "café.txt", "BODY:asset")
+    @test ok          # legal everywhere; a skip here would be a silent no-op
+    if ok
+        resetstate()
+        try
+            spafiles(spa, "app")
+            resp = internalrequest(HTTP.Request("GET", "/app/caf%C3%A9.txt"))
+            @test resp.status == 200
+            @test String(resp.body) == "BODY:asset"
+            # The fallback itself still works for a genuinely unmatched path.
+            @test String(internalrequest(HTTP.Request("GET", "/app/no/such/route")).body) == "BODY:SHELL"
+        finally
+            resetstate()
+        end
+    end
+end
+
 @testset "symlinks escaping the mount are refused" begin
     files = servable(root)
 
