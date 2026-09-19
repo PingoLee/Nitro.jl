@@ -103,6 +103,11 @@ Applied to two things, by two callers with different consequences. [`mountable_f
 a filename that matches, because filenames arrive in bulk from the filesystem. [`mount_segments`](@ref)
 *throws* on a `mountdir` segment that matches, because that is one app-authored value with an obvious
 correction — and until #101 it was not checked at all, so a mount could claim URLs a file may not.
+
+This rule survived #121's route encoding, and has to. `*` and `**` are legal `pchar`, so
+[`_route_encode`](@ref) leaves them untouched: nothing but this refusal stops a file named `*` from
+shadowing every sibling URL under the mount. Braces *would* be encoded, but are caught here first,
+so `{id}.txt` stays skipped rather than becoming servable at `%7Bid%7D.txt`.
 """
 _is_route_pattern(component::AbstractString) =
     component == "*" || component == "**" || occursin('{', component) || occursin('}', component)
@@ -162,6 +167,91 @@ function _first_unroutable(segment::AbstractString)
 end
 
 """
+    _route_encode(name::AbstractString) -> String
+
+Percent-encode a *filename* into a URL path segment: every byte that could not stand unencoded
+becomes an uppercase `%XX` triplet. `name` is returned unchanged when every byte is already
+[`_is_pchar`](@ref), which is the overwhelmingly common case.
+
+Triplets are **uppercase**, and because the router matches bytes rather than testing RFC 3986
+equivalence, a client that sends the lowercase spelling (`caf%c3%a9.txt`) gets a 404. Browsers emit
+uppercase, so this is a compatibility footnote rather than a defect — and it is the same fact that
+forbids case-normalizing a `mountdir`'s triplets in [`mount_segments`](@ref), so the two rules agree.
+
+This is the filename half of the rule [`mount_segments`](@ref) enforces on `mountdir`. The router
+compares path segments byte for byte and never percent-decodes, so a file whose name needs encoding
+used to register a route that no conforming client could ever match — enumerated, registered,
+counted and logged as served, and a 404 in every browser
+([#121](https://github.com/PingoLee/Nitro.jl/issues/121)). Encoding the route is the only one of the
+available responses that *fixes* that rather than reporting it, and it is only expressible because
+`mountfolder` returns `route => filepath` pairs, so the route no longer has to equal the filesystem
+name ([#102](https://github.com/PingoLee/Nitro.jl/issues/102)).
+
+Three properties are load-bearing; changing any of them changes which URLs a mount answers.
+
+**The safe set is [`_is_pchar`](@ref) exactly — not `HTTP.escapeuri`'s.** `URIs.issafe` keeps only
+`A-Za-z0-9`, `-`, `.` and `_`, so it also encodes `~` and every sub-delim (`!`, `\$`, `&`, `'`, `(`,
+`)`, `*`, `+`, `,`, `;`, `=`) plus `:` and `@`. Those are all legal `pchar`, browsers send them raw,
+and measurement over a socket confirms `report(1).txt`, `a+b.txt`, `v1.2~beta.txt`, `a:b.txt` and
+`a@b.txt` serve today at their literal routes and 404 at the over-encoded ones. Using `escapeuri`
+here would therefore *break* five working shapes to fix three broken ones. With `_is_pchar`, a
+pchar-clean filename keeps its route byte for byte, so no route a *conforming* client could already
+reach moves — the sole exception being the literal-`%` case below.
+
+**A literal `%` is always encoded, and that is the one place this deliberately disagrees with
+[`mount_segments`](@ref).** A `mountdir` is *authored*, so `"my%20static"` is someone spelling a
+space on purpose and the triplet is validated and passed through. A filename is *data*: a file named
+`my%20file.txt` contains the three characters `%`, `2`, `0`, and the URL that names it is
+`my%2520file.txt`. Passing the triplet through would make one URL mean two different files — the
+literal `my%20file.txt` and the encoded form of `my file.txt` — so `%` is not in `_PCHAR_PUNCT` and
+is encoded like any other non-`pchar` byte. This is the one case where a route that a *browser* could
+reach does move; it is recorded in `UPGRADING.md`'s #121 entry.
+
+**It does not replace the [`_is_route_pattern`](@ref) refusal, which still runs first.** `*` and `**`
+are perfectly legal `pchar`, so this function leaves them alone and a file named `*` would still
+shadow every sibling URL under the mount. `{` and `}` *would* be encoded here, but the refusal
+catches them earlier and keeps `{id}.txt` skipped — encoding them instead would change *what* a
+mount serves rather than only where, which is a separate decision.
+
+Encoding is **injective** on byte strings (`%` itself is encoded, so the image decodes
+unambiguously), so two distinct filenames can never collapse onto one route. Checked exhaustively:
+all 256 single bytes agree between the fast-path guard and the loop, and all 65536 two-byte names
+produce 65536 distinct routes.
+
+Sweeping every **one-byte name** leaves exactly two whose output is not an inert literal *segment*,
+and neither needs a rule here — worth writing down, since the dot-segment half is the class #101's
+review found late for `mountdir`:
+
+- A name that **is** `"*"` (or `"**"`) is refused by [`_is_route_pattern`](@ref) before enumeration
+  reaches encoding. Note that rule tests the *whole* segment, so an **embedded** `*` — `a*b.txt`,
+  the common case — does reach this function and is deliberately passed through: HTTP.jl gives `*`
+  meaning only as a complete segment, so `/x/a*b.txt` matches `/x/a*b.txt` and nothing else.
+- `"."` and `".."` can never *be* a name segment at all: `readdir` does not report them, and
+  `relpath` runs both arguments through `normpath`, so a path `walkdir` produced under `root` cannot
+  relativize to a `..` component.
+
+A change to either upstream guard would need a rule here.
+
+Iteration is over **bytes**, not `Char`s, for two reasons: it is the level the router compares at, so
+one non-ASCII character correctly yields one triplet per UTF-8 byte; and `readdir` can hand back a
+name that is not valid UTF-8, where `codepoint` on a malformed `Char` would throw.
+"""
+function _route_encode(name::AbstractString)
+    bytes = codeunits(name)
+    all(b -> b < 0x80 && _is_pchar(Char(b)), bytes) && return String(name)
+
+    io = IOBuffer()
+    for b in bytes
+        if b < 0x80 && _is_pchar(Char(b))
+            write(io, b)
+        else
+            print(io, '%', uppercase(string(b; base = 16, pad = 2)))
+        end
+    end
+    return String(take!(io))
+end
+
+"""
     _mount_root_parts(root::String) -> Vector{String}
 
 The `splitpath` of `root` resolved through `realpath`, for use as the left-hand side of
@@ -212,6 +302,12 @@ This is the single enumerator behind [`mountfolder`](@ref) and therefore behind 
   a file, so without this a route would be registered whose target is a directory and the eager read
   in `staticfiles` would throw at startup), plus FIFOs, sockets and devices, where the per-request
   read in `dynamicfiles` would block or grow without bound.
+
+A name that is not a legal URL path segment is **not** in that list: `café.txt` and `my file.txt` are
+enumerated and served, at their percent-encoded routes. That is [`mountfolder`](@ref)'s job via
+[`_route_encode`](@ref), not a refusal here
+([#121](https://github.com/PingoLee/Nitro.jl/issues/121)) — the alternative was dropping a file a
+mount serves today, and refusals at this layer skip rather than throw, so it would have been silent.
 
 Every refusal fails closed: a `realpath` that throws — a dangling link, `ELOOP`, a permission error
 — skips the entry rather than propagating. An unreadable *subdirectory* is logged and skipped too,
@@ -346,8 +442,13 @@ A relative dot-segment (`.`, `..`) is refused for the same reason, separately: `
 it passes the encoding test, and clients still strip it before sending.
 
 Refusing is deliberate rather than warning: `mountdir` is a single app-authored value with an obvious
-correction, so failing at boot is cheaper than a dead mount nobody notices. Filenames keep the softer
-treatment — they arrive in bulk from the filesystem, and `mountable_files` skips rather than throws.
+correction, so failing at boot is cheaper than a dead mount nobody notices. **Filenames are handled
+the other way round — they are encoded, not refused** ([`_route_encode`](@ref),
+[#121](https://github.com/PingoLee/Nitro.jl/issues/121)), because they arrive in bulk from the
+filesystem and a refusal at that layer skips silently. The split is not inconsistency: a `mountdir`
+is *authored*, so `"my%20static"` is someone spelling a space deliberately and the triplet is passed
+through, while a filename is *data*, so a file named `my%20file.txt` really does contain `%`, `2`,
+`0` and its route must be `my%2520file.txt`. One rule cannot do both without losing information.
 
 **Validated, never re-encoded.** A percent triplet is checked for well-formedness and then passed
 through byte for byte — `"%2f"` stays `"%2f"`. Do not add case-normalization or decoding of
@@ -425,6 +526,15 @@ unrepresentable: a directory is never a `mountable_files` result
 
 `mountdir` is canonicalized by [`mount_segments`](@ref), so `"static"`, `"/static"`, `"static/"` and
 `"/static/"` name the same mount, and `""`, `"/"` and whitespace all mount at the router root.
+
+**File-derived segments are percent-encoded; the `mountdir` prefix is not.** A name that could not
+stand unencoded in a URL path is routed at its encoded spelling by [`_route_encode`](@ref), so
+`café.txt` registers `/<prefix>/caf%C3%A9.txt` — the route a conforming client actually sends —
+while the pair's second half stays the raw filesystem path
+([#121](https://github.com/PingoLee/Nitro.jl/issues/121)). That is the other half of why both halves
+are load-bearing: for such a file the route is no longer *derivable* from the filename by joining,
+and a caller re-deriving one from the other would miss. `prefix_segments` is left alone because
+`mount_segments` validated it and it may already carry `%XX` of its own.
 """
 function mountfolder(folder::String, mountdir::String, addroute;
                      include_hidden::Bool=false,
@@ -433,6 +543,7 @@ function mountfolder(folder::String, mountdir::String, addroute;
     separator       = Base.Filesystem.path_separator
     prefix_segments = mount_segments(mountdir)
     routes          = Pair{String,String}[]
+    n_encoded       = 0
 
     for filepath in mountable_files(folder; include_hidden, allow_symlink_escape)
 
@@ -444,14 +555,33 @@ function mountfolder(folder::String, mountdir::String, addroute;
 
         # Build the route by joining canonical segments. Interpolating a prefix that might already
         # carry a separator is what used to emit routes like `/static//app.js`.
-        segments  = vcat(prefix_segments, String.(split(cleanedmountpath, '/'; keepempty=false)))
-        mountpath = mount_route(segments)
+        #
+        # Every file-derived segment is percent-encoded (#121) — intermediate directories too, since
+        # a directory named `my assets/` is as unreachable as a file would be. `prefix_segments` is
+        # deliberately NOT re-encoded: `mount_segments` already validated it and it may legitimately
+        # carry its own `%XX`, which encoding again would turn into `%25XX`.
+        name_segments    = String.(split(cleanedmountpath, '/'; keepempty=false))
+        encoded_segments = map(_route_encode, name_segments)
+        segments         = vcat(prefix_segments, encoded_segments)
+        mountpath        = mount_route(segments)
+
+        if encoded_segments != name_segments
+            n_encoded += 1
+            # Capped like the route-pattern warning above, and for the same reason: these names can
+            # come from a user-writable upload directory. `@info`, not `@warn` — the file IS served,
+            # and at the only route a conforming client can reach it by.
+            n_encoded <= 5 && @info "mountfolder: serving a file at its percent-encoded route, because its name is not a legal URL path segment" name=cleanedmountpath route=mountpath
+        end
 
         push!(routes, mountpath => filepath)
         addroute(mountpath, filepath)
 
         # also register file to the root of each subpath if this file is an index.html
-        if !isempty(segments) && last(segments) == "index.html"
+        #
+        # Tested against the *raw* leaf name, not the encoded one. `index.html` is pchar-clean so the
+        # two are identical today; comparing the raw name is what keeps `bare_path` and the direct
+        # route from drifting apart if `_route_encode`'s safe set is ever narrowed.
+        if !isempty(name_segments) && last(name_segments) == "index.html"
 
             # /docs/metrics and /docs/metrics/ are the same path
             # when HTTP is considered.
@@ -466,6 +596,12 @@ function mountfolder(folder::String, mountdir::String, addroute;
             addroute(bare_path, filepath)
         end
     end
+
+    # The per-file lines above stop at 5, so without this a mount with 40 encoded names reports 5
+    # and never says the other 35 exist -- and the `UPGRADING.md` entry points app authors at this
+    # log to find what moved. `mountable_files` solves the same problem the same way, with a
+    # trailing summary carrying the total.
+    n_encoded > 5 && @info "mountfolder: $n_encoded file(s) under $folder are mounted at a percent-encoded route" shown=5
 
     return routes
 end
