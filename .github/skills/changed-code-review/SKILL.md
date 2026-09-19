@@ -138,7 +138,8 @@ order by hand.
 
 **Slice 5 must stay an exclusion, never a hand-written folder list.** A list like
 `git diff -- docs .github` silently drops every changed file at the repo root — including
-`Project.toml` and `UPGRADING.md`, the two this skill has explicit heuristics for. Reconcile slice 5
+`Project.toml` and `UPGRADING.md`, the two this skill has explicit heuristics for, and the whole
+`upgrading/` log alongside them. Reconcile slice 5
 against the `--name-only` output before moving on: every path not under `src`, `ext`, or `test`
 must have appeared.
 

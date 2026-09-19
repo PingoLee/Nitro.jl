@@ -52,7 +52,7 @@ The tier is **high**, however small the diff looks, if it touches any of:
 | `src/core.jl`, `src/core/` — stream handling, the response write path, error handling | load-bearing for the whole suite; see [nitro-core §4](../../instructions/nitro-core.instructions.md) |
 | Worker authorization — `user_id` checks, `AbstractWorkerStore` | [workers §2](../../instructions/workers.instructions.md) |
 | Anything concurrency-shaped — shared mutable state, `Threads.@spawn`, service registries, `src/context.jl` | thread-count-dependent failures are a known class |
-| An `UPGRADING.md` entry, a `[compat]` change, or a new public export | breaking-change surface |
+| An upgrade-log entry, a `[compat]` change, or a new public export | breaking-change surface |
 | A non-maintainer issue (see §1) | scope itself is unverified |
 
 **The table only raises the tier; it never lowers it.** A user can name a lower tier than the table
@@ -115,12 +115,15 @@ coming from issue text.
 4. **Decide the test layers now**, before writing code: runtime behavior in `src/` → a `@testitem`
    under `test/` with the right tag; anything in `ext/` → `test/extensions/`; middleware →
    `test/middleware/`; a bug spanning a unit *and* a request-path layer earns coverage at **both**.
-5. **Decide whether `UPGRADING.md` is owed** — and note that owing one puts you at tier `high`. Only
-   a **breaking or behavior** change that *forces* a consuming-app source edit gets an entry,
-   prepended to `## Unreleased` with `- **Version**: Unreleased`, carrying a *"How to find the calls
-   to migrate"* grep and a concrete `before → after`. A new opt-in capability, a new kwarg, a fix to
-   something already broken — all additive: **no entry, and never a `Project.toml` bump.** Version
-   bumps happen once per release train via [`nitro-cut-release`](../nitro-cut-release/SKILL.md).
+5. **Decide whether an upgrade-log entry is owed** — and note that owing one puts you at tier
+   `high`. Only a **breaking or behavior** change that *forces* a consuming-app source edit gets an
+   entry: **one new file** `upgrading/<YYYY-MM-DD>-<slug>.md` with `- **Version**: Unreleased`,
+   carrying a *"How to find the calls to migrate"* grep and a concrete `before → after`. A new
+   opt-in capability, a new kwarg, a fix to something already broken — all additive: **no entry,
+   and never a `Project.toml` bump.** Version bumps happen once per release train via
+   [`nitro-cut-release`](../nitro-cut-release/SKILL.md). Copy the template from
+   [`UPGRADING.md`](../../../UPGRADING.md), which is the contract and no longer holds entries —
+   **do not append to it.**
 
 ## 2. Isolate
 
@@ -191,7 +194,7 @@ the plan does. Come back to the user — do not improvise past it — when:
 | Trigger | Why it voids the plan |
 |---|---|
 | The premise does not reproduce | You were authorized to fix a bug that may not be the bug |
-| The fix needs a breaking change or an `UPGRADING.md` entry that was not in the plan | Compatibility surface the user did not agree to, and it moves the tier to `high` |
+| The fix needs a breaking change or an upgrade-log entry that was not in the plan | Compatibility surface the user did not agree to, and it moves the tier to `high` |
 | The escalation table raises the tier above what the plan assumed | The plan priced a cheaper run than the change deserves |
 | Scope must grow materially beyond the issue's task list | Narrowing needs disclosure; *widening* needs consent |
 | A previously-green test is red and no third source adjudicates it | §4 forbids moving the goalposts on your own authority |
@@ -228,7 +231,7 @@ the full suite, ask which of these your diff could reach:
 | `test/aqua_tests.jl` | export a name with no definition, or add a `Project.toml` dep without a `[compat]` entry (also stale deps, piracy) |
 | `test/reexports_tests.jl` | change what Nitro re-exports from HTTP.jl |
 | `test/http_internals_contract_tests.jl` | touch `src/core.jl`'s `getproperty` overrides or the body hierarchy in `src/utilities/bodyparsers.jl`, or move the `HTTP = "~2.6"` pin |
-| `test/upgrade_guide_tests.jl` | **add or edit an `UPGRADING.md` entry** — several of its testsets parse the *shipped* file, one of them asserting the full entry-title set against it |
+| `test/upgrade_guide_tests.jl` | **add or edit a file under `upgrading/`** — several of its testsets parse the *shipped* log, asserting the full entry-title set, one entry per file, and the `YYYY-MM-DD-<slug>.md` name against it |
 | `test/precompilation_test.jl` | change route registration from a downstream package's `__init__()`, or `serve()`/`terminate()` startup |
 | `test/middleware/shared_response_mutation_tests.jl` | change `Cors`, `SessionMiddleware`, or the `*_response_headers` helpers — **not** a net for new middleware |
 | `.github/scripts/docs_lint.jl` | rename a path, add a skill, edit a `§` pointer, or change a subagent's tool list |
@@ -242,7 +245,7 @@ the bug half fixed. *"My fix is newer, so the test must be stale"* is how goalpo
 encode the defect — an expectation written against the buggy output, with a comment documenting it
 as design. Derive the correct answer from a source that is **neither** the test nor your change: for
 a race, the `-t 1` versus `-t 2` differential; for a response shape or header, the HTTP spec and the
-contract documented in `docs/`; for an upgrade entry, the shipped `UPGRADING.md`; for a value, an
+contract documented in `docs/`; for an upgrade entry, the shipped `upgrading/` log; for a value, an
 independent computation. Only then decide which side moves. If it is the test, say so **in the
 commit message** — you are overwriting someone's recorded intent, and the next reader needs to know
 it was deliberate rather than convenient.
@@ -298,7 +301,12 @@ No approval in between, and no "here is the diff, shall I commit?". The merge ga
 point: the maintainer reads the PR, and the PR is what they read *first*. Which is exactly why §4 and
 §5 are not optional — arriving unverified spends the only check that is left.
 
-Stage explicit paths. Put `Closes #N` in the PR body so the issue auto-closes with a back-reference.
+Stage explicit paths — and **if you owe an upgrade-log entry, `git add upgrading/<your file>`
+explicitly.** It is a *new, untracked* file since #192, so `git commit -a` does not pick it up and
+`git add -A` is forbidden in a worktree. Nothing catches the omission: the suite passes locally
+because the file is in your working tree, and passes on CI because every assertion is relative to
+the files that *are* there. The behavior change would merge with no entry and nothing would say so.
+Put `Closes #N` in the PR body so the issue auto-closes with a back-reference.
 Record in the PR body **the tier you worked at and which rungs CI is covering for you**, plus what
 you deliberately did not do and why — deferred work, declined findings, scope you widened and on
 whose say-so.
@@ -357,4 +365,4 @@ canonical list, and why the guardrail files are on it, is the merge-gate non-neg
 - Do not merge, tag, force-push, or edit `.github/`/`.claude/` guardrails mid-run
 - Do not `git add -A` in a worktree
 - Do not narrow an issue's task list without saying so
-- Do not add an `UPGRADING.md` entry for an additive change, or bump `Project.toml` in a fix PR
+- Do not add an upgrade-log entry for an additive change, or bump `Project.toml` in a fix PR

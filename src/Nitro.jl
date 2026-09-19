@@ -89,7 +89,7 @@ export  # The application handle
         path, urlpatterns, include_routes, RouteDefinition, url,
         # Response Abstractions
         Res,
-        # Version-scoped UPGRADING.md emitter (release-train rollout)
+        # Version-scoped `upgrading/` change-log emitter (release-train rollout)
         upgrade_guide
 
 include("precompile.jl")

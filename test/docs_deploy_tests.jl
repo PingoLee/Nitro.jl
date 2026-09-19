@@ -10,7 +10,7 @@
 #
 # That is the defining property of this defect class: it is invisible from inside a
 # green build. So it gets a guard that reads the *shipped* file, the same way
-# `upgrade_guide_tests.jl` parses the shipped UPGRADING.md, rather than trusting the
+# `upgrade_guide_tests.jl` parses the shipped upgrading/ log, rather than trusting the
 # docs build to complain.
 #
 # These are deliberately text assertions, not a Documenter call: Documenter lives in

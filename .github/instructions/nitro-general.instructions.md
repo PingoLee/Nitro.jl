@@ -95,24 +95,37 @@ These are canonical here — no other file owns them.
   asks for it *in conversation*, never as a side effect of working an issue.
 
   **Stop mid-run and ask** the moment the plan stops being true: the premise does not reproduce; the
-  fix needs a breaking change or an `UPGRADING.md` entry that was not in the plan; the escalation
+  fix needs a breaking change or an upgrade-log entry that was not in the plan; the escalation
   table raises the tier above what the plan assumed; scope must grow materially; a previously-green
   test is red and no third source adjudicates it; or you are blocked. Otherwise finish and report.
 
 - **Upgrade-log contract — release trains, not per-PR bumps.** A **breaking or behavior** change is
-  **done** when it ships code + tests + docs **and** prepends its entry to the **`## Unreleased`**
-  section of [`UPGRADING.md`](../../UPGRADING.md) with `- **Version**: Unreleased` — and **it does
-  not bump `Project.toml`.** Each entry carries a *"How to find the calls to migrate"* grep and a
+  **done** when it ships code + tests + docs **and** adds **one new file** to
+  [`upgrading/`](../../upgrading/) with `- **Version**: Unreleased` — and **it does not bump
+  `Project.toml`.** Each entry carries a *"How to find the calls to migrate"* grep and a
   concrete `before → after`; Nitro is pre-registry, so that migration note *is* the compatibility
   story. No per-app rollout tables — a consuming app's dependency pin **is** its rollout state.
   The maintainer cuts a train via [`nitro-cut-release`](../skills/nitro-cut-release/SKILL.md): bump
-  the `y` slot **once**, stamp every `Unreleased` entry, date + `git tag` it, open a fresh
-  `## Unreleased`. `z` is a purely-additive train or a hotfix to a tagged one.
+  the `y` slot **once**, stamp every `Unreleased` entry, date + `git tag` it. `z` is a
+  purely-additive train or a hotfix to a tagged one.
 
-  **`UPGRADING.md` is not a changelog.** It carries only what *forces* an app edit — a new opt-in
+  **One file per entry, named `YYYY-MM-DD-<slug>.md`** — the date is the entry's own
+  `- **Recorded**:` bullet, and the slug leads with the issue number when there is one. This is
+  not cosmetic ([#192](https://github.com/PingoLee/Nitro.jl/issues/192)): the log used to be a
+  single `UPGRADING.md` whose `## Unreleased` header was **one anchor line**, so any two concurrent
+  sessions that both owed an entry conflicted *every time*. A file per entry makes that conflict
+  unrepresentable, which is what lets the board schedule two breaking-change sessions at once.
+  **Write one entry per file and no column-0 `---` inside it** — the parser still splits on it, so
+  a stray horizontal rule truncates the entry and a second `## ` entry is absorbed into the first.
+  [`UPGRADING.md`](../../UPGRADING.md) is now the authoring **contract** and the release-train
+  table; it is no longer parsed.
+
+  **The upgrade log is not a changelog.** It carries only what *forces* an app edit — a new opt-in
   capability needs no entry, because nothing breaks without it; document those in `docs/`. There is
-  deliberately **no `CHANGELOG.md`**; do not reintroduce one, and do not mirror the log into a second
-  file. The read side is `upgrade_guide(from = v"<pin>")` ([`src/upgrading.jl`](../../src/upgrading.jl)),
+  deliberately **no `CHANGELOG.md`**; do not reintroduce one, and do not mirror the log into a
+  second *log* — `upgrading/` is the one source, and the per-entry files are that source, not a
+  copy of it. The read side is `upgrade_guide(from = v"<pin>")`
+  ([`src/upgrading.jl`](../../src/upgrading.jl)),
   which renders only the slice newer than a given pin; the *user-facing* explanation of the model
   lives in [`docs/src/upgrading.md`](../../docs/src/upgrading.md) — extend that page rather than
   restating it here.
@@ -279,7 +292,7 @@ it, so every worktree shares one marketplace entry.
 | `nitro-issue-workflow` | [`.github/skills/nitro-issue-workflow/SKILL.md`](../skills/nitro-issue-workflow/SKILL.md) | Work issue #N end-to-end at a `quick`/`standard`/`high` tier: provenance, scope, isolation, verify rungs, review, land, close out |
 | `nitro-board` | [`.github/skills/nitro-board/SKILL.md`](../skills/nitro-board/SKILL.md) | **Planning only, stops there:** reconcile the project board against the issues, rank the sessions, record each session's edit surface (which is what makes parallel Claude sessions schedulable), write the plan back |
 | `nitro-issue-cluster` | [`.github/skills/nitro-issue-cluster/SKILL.md`](../skills/nitro-issue-cluster/SKILL.md) | Work several issues as one group: build the cluster from contended files, tier it by its worst member, order it, land one commit per issue |
-| `nitro-cut-release` | [`.github/skills/nitro-cut-release/SKILL.md`](../skills/nitro-cut-release/SKILL.md) | Cut a release train: bump `Project.toml` once, stamp the `UPGRADING.md` entries, tag (maintainer-invoked) |
+| `nitro-cut-release` | [`.github/skills/nitro-cut-release/SKILL.md`](../skills/nitro-cut-release/SKILL.md) | Cut a release train: bump `Project.toml` once, stamp the `upgrading/` entries, tag (maintainer-invoked) |
 
 Editing Nitro itself → the area's deep-dive rule file, plus `add-route` for new endpoints. Writing
 application code that *consumes* Nitro → `nitro-usage`. Reviews → `changed-code-review`. **"Fix issue
@@ -361,6 +374,7 @@ they **shadow** the same-named functions `using .Core` brings in. An `(app, …)
 | `test/` | `ReTestItems` suite driven by the explicit ordered list in `test/runtests.jl` |
 | `docs/src/` | User documentation (Documenter) |
 | `docs/design/` | Design records — accepted rationale and open proposals that are not user docs |
+| `upgrading/` | The change log `upgrade_guide` reads — **one file per breaking/behavior entry**, `YYYY-MM-DD-<slug>.md`. Every `.md` here is an entry; nothing else belongs in it |
 
 ## Verification
 

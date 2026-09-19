@@ -653,8 +653,9 @@ Task metadata will now be persisted to that database, while live running threads
     transition compares a per-run id alongside the status, and a write from a run that no
     longer owns the record changes nothing
     ([#108](https://github.com/PingoLee/Nitro.jl/issues/108)). Booting through
-    `pormg_nitro_worker` adds the `run_id` column to an existing table for you; see
-    `UPGRADING.md` if you provision the table yourself.
+    `pormg_nitro_worker` adds the `run_id` column to an existing table for you; run
+    [`upgrade_guide`](@ref Nitro.upgrade_guide) for the `ALTER TABLE` if you provision the table
+    yourself.
 
     The store's `lock_tasks` is a plain `ReentrantLock` and therefore **process-local** —
     it orders writes within one process and gives you nothing across processes. Do not

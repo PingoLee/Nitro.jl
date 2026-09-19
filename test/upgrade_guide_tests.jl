@@ -3,10 +3,13 @@ using Test
 using Nitro
 using Nitro: _parse_upgrading, _read_upgrading_entries, _version_label,
              _UNRELEASED_VERSION, _UNSTAMPED_VERSION, _RELEASE_MARKER,
-             _upgrading_path, _upgrading_problems, _UpgradeProblem,
+             _upgrading_dir, _upgrading_files, _upgrading_problems, _UpgradeProblem,
              _WHY_NO_RECORDED, _WHY_NO_HEADING, _WHY_SWALLOWED
 
-# A miniature UPGRADING.md exercising the shapes the real file (and a cut) produce:
+# A miniature single-file log exercising every shape the parser must handle. It is deliberately
+# NOT the shape the shipped log has any more — #192 gives each entry its own file, but the grammar
+# below is unchanged, so these fixtures keep pinning the release-marker filter, the `---` split and
+# the #89 diagnostics on text the shipped log can no longer produce:
 # a header block with no `- **Recorded**:`, a release marker glued to its first entry,
 # a second entry in the same release, an older release, and the template comment.
 const SAMPLE = """
@@ -153,7 +156,7 @@ end
     @test occursin("requires `from`", err.msg)
 end
 
-@testset "scoping against the real UPGRADING.md" begin
+@testset "scoping against the shipped log" begin
     # A consumer already pinned to the current release has nothing to do. Both bounds are derived
     # from `pkgversion` on purpose: a literal `from` couples this test to the release state and
     # starts failing the moment a train is cut and its entries are stamped with the new version.
@@ -189,46 +192,111 @@ end
     @test all(e -> !isempty(e.title) && !isempty(e.body), entries)
 end
 
-@testset "shipped UPGRADING.md parses" begin
+@testset "shipped log parses" begin
     entries = _read_upgrading_entries()
     @test !isempty(entries)
-    # Every entry carries a real stamp — no unstamped strays, and the `## Unreleased`
-    # section is either empty or holds genuinely uncut work.
+    # Every entry carries a real stamp — no unstamped strays, and the uncut entries are
+    # either absent or genuinely uncut work.
     @test all(e -> e.version >= v"0.1.0", entries)
-    # The template block must never parse as an entry.
+    # The authoring template lives in UPGRADING.md, which is no longer parsed. If it ever
+    # leaks into `upgrading/` it would parse as a bogus entry, so keep asserting it does not.
     @test !any(e -> occursin("<api>", e.title), entries)
 end
 
+@testset "the log directory holds one entry per file" begin
+    # #192 replaced a single `## Unreleased` anchor with a file per entry, which is only a real
+    # fix while the invariant holds. Two entries in one file re-create the swallow case that
+    # #89 is about, and a stray column-0 `---` splits a body and silently truncates it — the
+    # parser keeps the `^---$` split, so that hazard moved into the file rather than vanishing.
+    files = _upgrading_files()
+    @test !isempty(files)
+    @test isdir(_upgrading_dir())
+
+    # `_upgrading_files` keeps only `.md`, and that extension filter is the one selection step the
+    # reader still has. It has to be asserted HERE, against a raw `readdir`, because every other
+    # check in this file — including *"every shipped entry heading becomes an entry"*, the #89 net
+    # — now derives its expected set by iterating `_upgrading_files()` too. A file the filter drops
+    # therefore disappears from BOTH sides of that comparison and every assertion passes while the
+    # entry is missing from the guide: `foo.markdown`, `foo.MD` on a case-sensitive filesystem, a
+    # `foo.md.orig` merge leftover, or an entry filed into a subdirectory. Under the single-file
+    # layout this was unrepresentable — there was no file-selection step to share. This is the
+    # assertion that keeps the #89 net independent of the reader.
+    for f in readdir(_upgrading_dir())
+        @test (f, endswith(f, ".md")) == (f, true)
+    end
+
+    for path in files
+        text = read(path, String)
+        name = basename(path)
+        # `== 1`, not `>= 1`: a second entry here is exactly the silent-loss shape.
+        @test length(_parse_upgrading(text; source = name)) == 1
+        @test _upgrading_problems(text) == _UpgradeProblem[]
+        # Named in the message via the interpolation so a failure says WHICH file.
+        @test (name, occursin(r"(?m)^---[ \t]*$", text)) == (name, false)
+    end
+end
+
+@testset "entry filenames sort the log newest-first" begin
+    # The date prefix is not decoration: `_upgrading_files` sorts by filename, and that is what
+    # orders entries sharing a version. A file named anything else still parses — the reader has
+    # no name gate, deliberately — but it would sort arbitrarily, so pin the convention here,
+    # where the failure is loud.
+    for path in _upgrading_files()
+        name = basename(path)
+        @test (name, occursin(r"^\d{4}-\d{2}-\d{2}-[a-z0-9.-]+\.md$", name)) == (name, true)
+    end
+
+    # Every file's prefix must be the date the entry itself records, or the sort is a lie.
+    for path in _upgrading_files()
+        name = basename(path)
+        m = match(r"(?m)^-[ \t]+\*\*Recorded\*\*:[ \t]*(\d{4}-\d{2}-\d{2})", read(path, String))
+        @test (name, m === nothing ? "" : m[1]) == (name, first(name, 10))
+    end
+end
+
+@testset "every cut release is recorded in the Release trains table" begin
+    # A release's DATE used to live in a `## <ver> — <date>` marker sitting in the same file as its
+    # entries, so forgetting one was visible in the diff that stamped them. #192 moved it into a
+    # table in `UPGRADING.md` — a file nothing parses and, without this, nothing tests. That would
+    # leave `nitro-cut-release`'s "skipping it loses the date for good" as the only guard, which is
+    # exactly the say-so-only shape this suite exists to replace.
+    contract = read(joinpath(pkgdir(Nitro), "UPGRADING.md"), String)
+    cut = sort(unique(e.version for e in _read_upgrading_entries() if e.version != _UNRELEASED_VERSION))
+    @test !isempty(cut)
+
+    for v in cut
+        # Match the row, not just the number: a bare `occursin` would be satisfied by any prose
+        # mentioning the version, and the thing being guarded is that a DATE was recorded with it.
+        row = Regex("(?m)^\\|\\s*`" * replace(string(v), "." => "\\.") * "`\\s*\\|\\s*\\d{4}-\\d{2}-\\d{2}\\s*\\|")
+        @test (string(v), occursin(row, contract)) == (string(v), true)
+    end
+end
+
 @testset "every shipped entry heading becomes an entry" begin
-    # #89: the parser loses an entry in two invisible ways. A missing trailing `---` merges it into
-    # its neighbour — the prose still renders, under the wrong title, and `structured = true` never
-    # sees it. A header with no `- **Recorded**:` is dropped outright. Both leave a guide that looks
-    # perfectly well-formed, so a "does it parse" check passes either way.
+    # #89: the parser loses an entry in two invisible ways. A second entry sharing a block merges
+    # into its neighbour — the prose still renders, under the wrong title, and `structured = true`
+    # never sees it. A header with no `- **Recorded**:` is dropped outright. Both leave a guide
+    # that looks perfectly well-formed, so a "does it parse" check passes either way.
     #
     # The expected set below is derived WITHOUT splitting on `---`, and that independence is the
     # whole point: no separator can move a heading, so a swallowed entry surfaces here as a title
     # the parser failed to produce. Deriving it from `_scan_upgrading` instead would make this a
     # tautology that passes on a collapsed file — do NOT "dedupe" it into `src/upgrading.jl`.
     #
+    # #192 made this *simpler*, not weaker: with a file per entry there is no preamble to skip and
+    # no template section to truncate, so the derivation is now "every non-marker `## ` heading in
+    # the log directory" with no positional reasoning at all.
+    #
     # Known limitation, deliberate: this scan is text-level and would also pick up a `^## ` line
-    # inside a fenced code block in an entry body. None exists (every heading in the file is a
-    # release marker, an entry, or the preamble's recipe), and an entry needing to show a literal
-    # `## ` example must indent it. The failure is loud and the fix obvious — the right trade for
-    # keeping this derivation independent of the parser.
-    text = replace(read(_upgrading_path(), String), "\r\n" => "\n", "\r" => "\n")
-
-    tmpl = findfirst("## Template for new entries", text)
-    @test tmpl !== nothing                        # the truncation the parser depends on
-    text = text[1:prevind(text, first(tmpl))]
-
-    # Everything above the first `---` is the file preamble — the title, the `> 🚀` callout and the
-    # `## Writing an entry` recipe. Legitimately not entries.
-    sep = findfirst(r"(?m)^---[ \t]*$", text)
-    @test sep !== nothing
-    log = text[nextind(text, last(sep)):end]
-
-    expected = [String(strip(m[1])) for m in eachmatch(r"(?m)^##[ \t]+(.+)$", log)
-                if !occursin(_RELEASE_MARKER, strip(m[1]))]
+    # inside a fenced code block in an entry body. None exists, and an entry needing to show a
+    # literal `## ` example must indent it. The failure is loud and the fix obvious — the right
+    # trade for keeping this derivation independent of the parser.
+    expected = String[]
+    for path in _upgrading_files()
+        text = replace(read(path, String), "\r\n" => "\n", "\r" => "\n")
+        append!(expected, [String(strip(m[1])) for m in eachmatch(r"(?m)^##[ \t]+(.+)$", text)
+                           if !occursin(_RELEASE_MARKER, strip(m[1]))])
+    end
     parsed = [e.title for e in _read_upgrading_entries()]
 
     @test !isempty(expected)                      # the derivation itself still finds headings
@@ -245,15 +313,19 @@ end
 @testset "no shipped entry swallows the next one" begin
     # The swallow half of #89, kept as the *diagnostic* companion to the set check above. That one
     # is the net — it catches this and the silent-drop direction too — but it can only say which
-    # title went missing. This one names the entry that ATE it, which is where the missing `---`
-    # goes. When both fail together the diagnosis is free.
+    # title went missing. This one names the entry that ATE it, which is where the second entry
+    # needs splitting out into a file of its own. When both fail together the diagnosis is free.
     #
-    # `_parse_upgrading` splits on `---` and takes ONE entry per block, so an entry prepended
-    # without its trailing separator is silently absorbed into the previous entry's body: its
-    # prose still renders, but under the wrong title, and `structured = true` loses it entirely.
-    # That is invisible to a "does it parse" check — it shipped once (at 49f1a23 the `## Unreleased`
+    # `_parse_upgrading` splits on `---` and takes ONE entry per block, so a second entry written
+    # into an existing file is silently absorbed into the first entry's body: its prose still
+    # renders, but under the wrong title, and `structured = true` loses it entirely. That is
+    # invisible to a "does it parse" check — it shipped once (at 49f1a23 the `## Unreleased`
     # section ran #71, #18 and #16 with no `---` between them, so #18 and #16 were lost), so assert
     # the shape directly. A body may only carry its own heading.
+    #
+    # Kept after #192 even though "one entry per file" is asserted directly above, because these
+    # catch different things: that one counts entries per file, this one catches a heading the
+    # parser folded into a body without ever counting it as an entry.
     for e in _read_upgrading_entries()
         swallowed = [strip(m[1]) for m in eachmatch(r"(?m)^##[ \t]+(.+)$", e.body)
                      if strip(m[1]) != e.title && !occursin(_RELEASE_MARKER, strip(m[1]))]
@@ -275,7 +347,7 @@ end
     ### What changed
     Body.
     """
-    entries = @test_logs (:warn, r"UPGRADING\.md") _parse_upgrading(missing_recorded)
+    entries = @test_logs (:warn, r"upgrade log") _parse_upgrading(missing_recorded)
     @test isempty(entries)                        # acceptance identical to before this landed
 
     probs = _upgrading_problems(missing_recorded)
@@ -295,7 +367,7 @@ end
     - **Version**: 0.3.0
     - **Recorded**: 2026-09-09
     """
-    @test_logs (:warn, r"UPGRADING\.md") _parse_upgrading(no_heading)
+    @test_logs (:warn, r"upgrade log") _parse_upgrading(no_heading)
     probs = _upgrading_problems(no_heading)
     @test length(probs) == 1
     @test probs[1].title == ""
@@ -333,7 +405,7 @@ end
     ### What changed
     Second body.
     """
-    entries = @test_logs (:warn, r"UPGRADING\.md") _parse_upgrading(swallowed)
+    entries = @test_logs (:warn, r"upgrade log") _parse_upgrading(swallowed)
 
     # Acceptance is unchanged: this still parses as one entry, exactly as it did before #89.
     @test length(entries) == 1
@@ -395,14 +467,14 @@ end
     @test _upgrading_problems(SAMPLE) == _UpgradeProblem[]
     @test_logs min_level = Base.CoreLogging.Warn _parse_upgrading(SAMPLE)
 
-    # And the shipped file: a consumer running `upgrade_guide` must never see this.
+    # And the shipped log: a consumer running `upgrade_guide` must never see this.
     #
-    # This also pins something that is one reformat away from breaking. The `## Writing an entry`
-    # recipe writes its example INDENTED and inside backticks, so the anchored `_ENTRY_BULLET`
-    # does not see it and the header is not mistaken for a malformed entry. Un-indent that line,
-    # or lift it to its own bullet, and this fails here with a clear reason instead of spraying a
-    # warning at every consuming app.
-    @test _upgrading_problems(read(_upgrading_path(), String)) == _UpgradeProblem[]
+    # Asserted per file. Concatenating the log and scanning it once reports every entry after the
+    # first as swallowed — which says nothing about the log and everything about the concatenation.
+    for path in _upgrading_files()
+        name = basename(path)
+        @test (name, _upgrading_problems(read(path, String))) == (name, _UpgradeProblem[])
+    end
 
     # The consumer's actual command, end to end.
     io = IOBuffer()
