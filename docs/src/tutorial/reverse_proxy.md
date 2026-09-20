@@ -11,7 +11,7 @@ box, and how to recover the real client IP afterwards without letting anyone for
 |---|---|
 | TLS termination and certificates | **Proxy** — Nitro speaks plain HTTP and has no TLS story |
 | Static assets, SPA history fallback | **Proxy** in production (see below) |
-| Request body caps, connection timeouts, compression | **Proxy first, app second** — Nitro has no body cap of its own yet, so a deployment without a proxy has none at all |
+| Request body caps, connection timeouts, compression | **Proxy first, app second** — Nitro caps request bodies at 64 MiB by default (`serve(max_body_bytes = …)`), but the proxy rejects an oversized upload before it reaches Julia at all |
 | Coarse per-IP rate limiting | **Proxy first, app second** — `RateLimiter` still matters in development and as a second layer |
 | Per-user rate limiting, quotas | **App** — needs identity |
 | **Authentication and authorization** | **App, always** |
@@ -61,7 +61,8 @@ Nitro runs every request on its own thread — there is no event loop. A slow cl
 a **thread**, not a cheap continuation. nginx buffers request and response bodies by default, so
 Nitro only ever sees complete requests; the proxy absorbs the slow-client cost that would otherwise
 sit in your thread pool. Treat request timeouts and body caps at the proxy as capacity protection,
-not just hygiene.
+not just hygiene — Nitro's own `max_body_bytes` bounds the memory a single request can claim, but
+it cannot bound how long a slow client occupies the thread sending it.
 
 ## nginx
 
@@ -458,7 +459,9 @@ the pipeline the two are the same value.
 - [ ] TLS terminates at the proxy; Nitro listens on plain HTTP behind it.
 - [ ] Static assets and the SPA fallback are served by the proxy, not by `staticfiles`/`spafiles`.
 - [ ] Dotfiles are denied explicitly — nginx does not do it for you.
-- [ ] A request body cap is set at the proxy (`client_max_body_size` / `request_body max_size`).
+- [ ] A request body cap is set at the proxy (`client_max_body_size` / `request_body max_size`),
+      and it is **not larger** than Nitro's own `serve(max_body_bytes = …)` — otherwise the proxy
+      forwards uploads that Nitro will only reject after buffering them.
 - [ ] SSE routes disable response buffering; WebSocket routes pass `Upgrade`/`Connection`.
 - [ ] The Nitro port is not reachable except through the proxy — check the container's published
       ports and any network policy, not just `host`.

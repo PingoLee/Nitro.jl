@@ -6,8 +6,9 @@ import Nitro
 # ── Canary for Nitro's coupling to HTTP.jl v2 private/undocumented surface ──────
 #
 # Nitro reaches into the HTTP internals asserted below from:
-#   • src/core/ — `_buffered_stream_request`, and `getfield(req, :context)` on the raw
-#       `HTTP.RequestContext` (`request_input`, `Types.request_cache!`).
+#   • src/core/ — `getfield(req, :context)` on the raw `HTTP.RequestContext`
+#       (`request_input`, `Types.request_cache!`), and the `Stream` head/body split that
+#       `_http_stream_request` reads to cap a request body (#17).
 #   • `_request_context_metadata!` — reached TRANSITIVELY, which is why it is still canaried
 #       below. Nitro no longer calls it directly (the wrapper that did died with #151), but
 #       every `req.context[…]` read and write in `src/` now goes through HTTP's own
@@ -34,14 +35,63 @@ import Nitro
 
 @testset "private functions still exist" begin
     @test isdefined(HTTP, :_request_context_metadata!)
-    @test isdefined(HTTP, :_buffered_stream_request)
+    # `_buffered_stream_request` deliberately is NOT asserted here any more. Until #17 Nitro
+    # delegated its whole request build to it; the body cap replaced that call with a
+    # reimplementation over supported API, so the reach is gone and canarying it would pin a
+    # symbol nothing uses. That is a net REDUCTION in private surface, which is the part worth
+    # remembering if the delegation is ever tempting again.
+end
+
+@testset "the request-building API the body cap depends on is still supported" begin
+    # These are not private reaches -- `startread` is exported, `readbytes!` is the Base IO
+    # interface, and `get_request_context` is declared public. They are asserted anyway because
+    # `_http_stream_request` reimplements `_buffered_stream_request` on top of them (#17), so a
+    # signature change upstream breaks every request rather than one call site. A failure here
+    # is a smoke test, not the structural alarm the private canaries above raise.
+    # `hasmethod(f, Tuple{HTTP.Stream})` is the wrong tool twice over, and both traps are worth
+    # naming because the obvious spelling fails silently in opposite directions. `HTTP.Stream` is
+    # a UnionAll over `{ISCLIENT, Req}` while the server methods are defined on `Stream{false}`,
+    # so `hasmethod` answers FALSE for a method that plainly exists. And `readbytes!` answers TRUE
+    # for any `IO` because of Base's own fallback -- which would make the assertion vacuous, since
+    # it would keep passing after HTTP dropped its method entirely. Matching on the signature and
+    # filtering by defining module avoids both.
+    # `Stream{false}`, not `HTTP.Stream`. The UnionAll covers `Stream{true}` too, and HTTP defines
+    # BOTH -- so matching on it stays green if the fork drops only the server dispatch, which is
+    # the exact method `_http_stream_request` calls. The 3-arg arity is pinned for the same reason:
+    # it is the form Nitro uses.
+    defines_server_stream_method(f, arity) =
+        any(m -> m.sig <: Tuple{Any, HTTP.Stream{false}, Vararg{Any}} &&
+                 parentmodule(m) === HTTP &&
+                 m.nargs - 1 == arity,
+            methods(f))
+
+    @test :startread in names(HTTP)
+    @test defines_server_stream_method(HTTP.startread, 1)
+    @test defines_server_stream_method(Base.readbytes!, 3)
+    @test hasmethod(HTTP.get_request_context, Tuple{HTTP.Request})
+
+    # Control: the matcher must be capable of answering false, or none of the above means anything.
+    @test !defines_server_stream_method(Base.countlines, 1)
+end
+
+@testset "Stream keeps the head and the body separate" begin
+    # The mechanism the body cap rests on: `Stream`'s constructor splits the parsed request, so
+    # `message` carries the head (headers, `content_length`) with an `EmptyBody` substituted while
+    # the live reader stays on `request_body`. That is what lets `_http_stream_request` read a
+    # declared Content-Length and refuse an oversized upload with ZERO bytes read -- and it is
+    # what keeps an `Expect: 100-continue` client from ever being told to send.
+    flds = fieldnames(HTTP.Stream)
+    @test :message      in flds
+    @test :request_body in flds
 end
 
 @testset "Request struct still exposes the fields we read" begin
     flds = fieldnames(HTTP.Request)
-    @test :proto_major in flds
-    @test :proto_minor in flds
-    @test :context     in flds
+    @test :proto_major    in flds
+    @test :proto_minor    in flds
+    @test :context        in flds
+    # Read by `_http_stream_request` as the declared body length: -1 chunked, 0 none, >0 fixed.
+    @test :content_length in flds
 end
 
 @testset "router hands over STILL-ENCODED path segments" begin

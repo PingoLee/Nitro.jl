@@ -19,7 +19,7 @@ application code.
 | TLS termination, certificate lifecycle | **Proxy** | Nitro has no TLS story and should not acquire one. Caddy does ACME automatically |
 | Static assets in production | **Proxy** | `sendfile` and compression, which Nitro does not implement. Cache headers, conditional GETs and byte ranges it now does (§10) — the proxy is still cheaper and upstream |
 | SPA history-mode fallback in production | **Proxy** | `try_files $uri /index.html` is one directive |
-| Request body size caps | **Proxy first**, app second | Rejecting before the request reaches Julia is strictly better; the app still needs its own (see [#41](https://github.com/PingoLee/Nitro.jl/issues/41), [#17](https://github.com/PingoLee/Nitro.jl/issues/17)) |
+| Request body size caps | **Proxy first**, app second | Rejecting before the request reaches Julia is strictly better, but the app needs its own floor and now has one: `serve(max_body_bytes = …)`, 64 MiB by default ([#17](https://github.com/PingoLee/Nitro.jl/issues/17), [#41](https://github.com/PingoLee/Nitro.jl/issues/41)) |
 | Slow-client / connection timeouts | **Proxy** | See §4 — this one is load-bearing for Nitro's concurrency model |
 | Coarse per-IP rate limiting | **Proxy** | Cheaper, and upstream of the Julia process |
 | Per-user / per-key rate limiting | **App** | Needs identity, which the proxy does not have |

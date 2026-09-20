@@ -218,6 +218,14 @@ If your system processes very large files (e.g. 100MB+ `.dbf` or `.xlsx` files) 
 complex validation/import steps, **never process the file directly in the request handler.**
 This blocks the thread and causes client timeouts.
 
+!!! warning "Raise `max_body_bytes` first"
+    `serve()` refuses a request body over **64 MiB** with a `413` before your handler runs, so a
+    100 MB upload is rejected by default and the pattern below never gets a chance to stage it.
+    Raise the ceiling to at least the largest file you accept — `serve(max_body_bytes = 200 *
+    1024 * 1024)` — or pass `max_body_bytes = nothing` when a reverse proxy already caps bodies
+    upstream. Note the whole body is still buffered in memory before staging, so the ceiling you
+    choose is also the memory a single upload can claim.
+
 Instead, follow this **Stage & Work** pattern:
 
 1. **Stage** — write the file bytes to a temporary directory and get a path.
