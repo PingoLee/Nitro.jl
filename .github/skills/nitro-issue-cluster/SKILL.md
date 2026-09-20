@@ -1,6 +1,6 @@
 ---
 name: nitro-issue-cluster
-description: Work several issues as one group — build a cluster from contended files rather than shared labels, tier it by its worst member, order it by dependency then importance, land one commit and one UPGRADING entry per issue, and close out N issues at once. Sits above nitro-issue-workflow; run nitro-board first to decide which cluster is next.
+description: Work several issues as one group — build a cluster from contended files rather than shared labels, tier it by its worst member, order it by dependency then importance, land one commit and one upgrade-log entry per issue, and close out N issues at once. Sits above nitro-issue-workflow; run nitro-board first to decide which cluster is next.
 ---
 
 # Nitro Issue Cluster
@@ -210,15 +210,17 @@ git branch -m fix/cluster-<subsystem>-<slug>
 
 ### Commit discipline — this is what makes the group reviewable
 
-**One commit per issue, and one `UPGRADING.md` entry per issue that owes one.** Never a single
+**One commit per issue, and one upgrade-log entry per issue that owes one.** Never a single
 squashed "fix middleware bugs" commit.
 
 - Each commit message references its own issue: `fix(middleware): <what> (#79)`.
 - Each commit is self-contained — its code *and* its tests *and* its docs.
-- A member that owes an upgrade entry gets its **own** entry prepended to `## Unreleased`, carrying
-  its own *"How to find the calls to migrate"* grep and `before → after`. The
-  [`UPGRADING.md`](../../../UPGRADING.md) contract is per behavior change, not per branch — merging
-  two changes into one entry makes `upgrade_guide` describe a migration nobody can follow.
+- A member that owes an upgrade entry gets its **own file** under
+  [`upgrading/`](../../../upgrading/), carrying its own *"How to find the calls to migrate"* grep
+  and `before → after`. The [`UPGRADING.md`](../../../UPGRADING.md) contract is per behavior
+  change, not per branch — merging two changes into one entry makes `upgrade_guide` describe a
+  migration nobody can follow. One file per entry makes that concrete: two entries cannot share a
+  file without the second being swallowed.
 
 This is the whole reason a 4-issue PR stays reviewable: it reads commit by commit, and any single
 member can be reverted without unpicking the others.
@@ -307,7 +309,7 @@ Close-out follows [`nitro-issue-workflow`](../nitro-issue-workflow/SKILL.md) §7
 - Do not leave the ordering unstated, or the one case where a dependency demoted the important work
 - Do not start implementing before the user has agreed to the cluster
 - Do not add a fifth issue mid-session because it is adjacent
-- Do not squash the group into one commit, or merge two members into one `UPGRADING.md` entry
+- Do not squash the group into one commit, or merge two members into one upgrade-log entry
 - Do not skip a member's rung 1 and 2 because the group's full suite will run later
 - Do not implement a half-fix to avoid breaking up the group
 - Do not hold completed members back because a sibling stalled

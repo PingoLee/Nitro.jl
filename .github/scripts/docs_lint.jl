@@ -183,8 +183,8 @@ normalize_ws(s) = replace(strip(s), r"\s+" => " ")
 # A: repo-relative paths inside backticks.
 #   PATH_RE — file-ish, ends in an extension, e.g. `src/utilities/misc.jl`
 #   DIR_RE  — directory-ish, trailing slash, e.g. `ext/NitroPormGExt/`
-const PATH_RE = r"`((?:src|ext|test|docs|\.github)/[A-Za-z0-9_./\-]+\.[A-Za-z0-9]+)`"
-const DIR_RE  = r"`((?:src|ext|test|docs|\.github)/[A-Za-z0-9_./\-]+/)`"
+const PATH_RE = r"`((?:src|ext|test|docs|upgrading|\.github)/[A-Za-z0-9_./\-]+\.[A-Za-z0-9]+)`"
+const DIR_RE  = r"`((?:src|ext|test|docs|upgrading|\.github)/[A-Za-z0-9_./\-]+/)`"
 
 # B: markdown links `](target)` — capture the target.
 const LINK_RE = r"\]\(([^)]+)\)"

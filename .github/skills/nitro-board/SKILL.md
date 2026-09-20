@@ -308,19 +308,39 @@ The board is the durable artifact; the table in the conversation is what the use
 board back, then report **one ranked table, one row per session** — the question behind every
 invocation is "what can I work in one sitting?", and a session is the unit that answers it.
 
+**Every session gets a row, rank 1 through n.** No top-N, no truncation, and above all no
+parenthetical standing in for the rows you dropped — *"8th–14th unchanged in relative order: 40, 27,
+29, 30, 31, 25, 26"* is not a report, it is seven missing rows. A rank means nothing except against
+the full list, and an issue whose number appears nowhere in the table reads as missing from the
+**board**: that is how a user came to report issue #7 as absent when it had been on the board, in
+Session 25 at rank 13, for three weeks. Sessions nobody will start this week still get a row —
+`Start now?` is exactly where "not this week, and here is why" belongs. A session you deliberately
+left unranked gets a row too, with `—` in the `#` column.
+
 | # | Issues (one session) | Session | Tier | Start now? |
 |---|---|---|---|---|
 | 3 | #108 → #127 → #30 | Worker Execution & Lifecycle | high | After #128 |
-| 5 | #55 → #31 → #32 | App Context & Bootstrap | high | #55 only — #31/#32 need the app-handle decision |
+| 4 | #55 → #31 → #32 | App Context & Bootstrap | high | #55 only — #31/#32 need the app-handle decision |
+| 5 | #66, #7, #117 | Publish Gate Decisions | high | No — all three are open decisions, not code |
+
+(Three *contiguous* rows, shown to fix the column format. A real report carries every rank.)
 
 `→` is a forced order inside the session; a comma means any order. **`Start now?` carries the
 blocker, never a bare yes/no.** Below the table add only what it cannot: which rows have disjoint edit
 surfaces (§3), and any ranking tension you resolved (§2).
 
-**Do not dump the board, and do not render a second copy of it.** The `FILES:`/`ORDER:`/`WHY:`
-descriptions are written for the next session to read off the board, which already has a URL — and
-with the §4 recipe they never enter the transcript in the first place, so echoing them back means
-fetching them on purpose to do it. Receipt: [`reference.md`](reference.md) §G.
+**Check the table adds up before sending it, the way §4 checks the payload before submitting it.**
+Every open issue in §1's projection appears in exactly one row. Sum the `Issues` column, compare it
+against the open count you already have, and state the result in the report — *"14 sessions, 31 open
+issues, all accounted for"*. A table that silently omits work is the one failure mode the reader
+cannot detect for themselves, and that sum is the whole guard against it.
+
+**Do not dump the board, and do not render a second copy of it.** This constrains the
+**descriptions**, never the row count. The `FILES:`/`ORDER:`/`WHY:` strings are written for the next
+session to read off the board, which already has a URL — and with the §4 recipe they never enter the
+transcript in the first place, so echoing them back means fetching them on purpose to do it.
+**Dropping rows is not a way to comply with this rule**; the two constraints point in opposite
+directions on purpose. Receipt: [`reference.md`](reference.md) §G.
 
 ## Anti-Patterns
 
@@ -349,3 +369,6 @@ fetching them on purpose to do it. Receipt: [`reference.md`](reference.md) §G.
 - Do not report the board by echoing every option's description, or by rendering a second copy of it
   — §5's one-row-per-session table is the deliverable, and `Start now?` needs the blocker, not a bare
   yes/no
+- Do not truncate that table, or compress the rows you dropped into a parenthetical — every session
+  is a row, and an issue number absent from the table reads as absent from the board
+- Do not send the table without stating the issue count it accounts for

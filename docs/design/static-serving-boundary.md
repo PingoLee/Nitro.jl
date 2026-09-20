@@ -199,7 +199,7 @@ request path both split on `/` with `keepempty=false`, so every slash-only spell
 `/static//app.js` versus `/static/app.js`, `""` versus `"/"` — was already the same router node.
 
 Three things changed **in #93/#94**, and none of them forced an app edit, which is why that pair
-carried no `UPGRADING.md` entry. (The later validation rule below does force one — see
+carried no upgrade-log entry. (The later validation rule below does force one — see
 *Segments are validated, not only canonicalized*.)
 
 1. **The strings `mountfolder` and the three mount functions return.** A root mount's bare route is
@@ -256,7 +256,7 @@ depends on), so the encoded route does not answer the raw client.
 
 The trade is still worth making — `mountdir` is judged by the same rule as a filename, and a prefix no
 browser can reach is a footgun whatever a hand-rolled client can do with it — but it is a capability
-change, not just a dead-mount cleanup, and `UPGRADING.md`'s #101 entry says so.
+change, not just a dead-mount cleanup, and the #101 upgrade-log entry says so.
 
 **Validated, never re-encoded.** A percent triplet is checked for well-formedness and passed through
 byte for byte. HTTP.jl matches path segments with a byte comparison rather than an RFC 3986
@@ -289,7 +289,7 @@ through. A filename is *data*: a file named `my%20file.txt` contains the three c
 make one URL mean two different files — the literal `my%20file.txt` and the encoded form of
 `my file.txt`. One rule cannot serve both inputs without losing information, so `%` is encoded on
 the filename side and preserved on the `mountdir` side. This is the only case where a route a
-*browser* could already reach moves, and `UPGRADING.md`'s #121 entry says so.
+*browser* could already reach moves, and the #121 upgrade-log entry says so.
 
 **The safe set is `_is_pchar` exactly, and that choice is what bounds the blast radius.**
 `HTTP.escapeuri` would have been the obvious tool and is the wrong one: `URIs.issafe` keeps only
@@ -368,6 +368,6 @@ catch-all, not a mounted file, and has no filepath to pair with.
 
 - [`docs/src/tutorial/reverse_proxy.md`](../src/tutorial/reverse_proxy.md) — the user-facing guide,
   including client-IP trust configuration and worked nginx/Caddy configs
-- [`UPGRADING.md`](../../UPGRADING.md) — the #20 entry and its migration notes
+- [`upgrading/`](../../upgrading/) — the #20 entry and its migration notes
 - [`docs/design/agent-security.md`](agent-security.md) — the analogous "trust is decided at the
   boundary" reasoning for agent tooling

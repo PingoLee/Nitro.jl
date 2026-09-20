@@ -138,7 +138,7 @@ the pairing keeps one source of truth per session.
 
 ---
 
-## G. Two reporting failures worth not repeating (SKILL.md §5)
+## G. Three reporting failures worth not repeating (SKILL.md §5)
 
 A session that had just written 19 ranked options echoed them all back in full, **twice**, before the
 user asked plainly for a table of what fits in one Claude session. The descriptions are written for
@@ -149,3 +149,13 @@ Separately, board 8's first ten Session options were created with **empty descri
 them done or partly done and four untouched, nothing on the board said which ran next, and the
 ranking had to be re-derived from scratch every session. That is what the `RUN`/`WHY` grammar exists
 to prevent — an option with no description is not a plan, it is a label.
+
+Third, and it is the first failure over-corrected: a session reported **7 of 14** ranked rows and
+compressed the remainder into *"8th–14th unchanged in relative order: 40, 27, 29, 30, 31, 25, 26"*.
+The user came back asking why issue #7 was "not in the board" — it was in Session 25 at rank 13, an
+item added 2026-08-31, `Status=Todo`, never archived. Nothing was wrong with the board; the report
+had no row carrying that number, and a reader has no way to tell those two apart. Note the shape of
+the mistake, because the brevity rule above is what produced it: **rows are mandatory and complete,
+descriptions are omitted entirely.** Those pull in opposite directions by design, and §5's "do not
+dump the board" governs only the second. The `n` sessions / `m` open issues sum exists so the next
+agent cannot make this one quietly.
