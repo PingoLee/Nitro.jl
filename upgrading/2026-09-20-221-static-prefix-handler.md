@@ -82,21 +82,31 @@ route, and an unmatched path under a mount now *matches* a route rather than fal
 served response for a miss is unchanged: the mount defers to the router's own not-found handler, so
 a custom one supplied through `Service(router = Router(my404))` keeps working.
 
-**5. A non-GET request under a mount prefix is now `405`, not `404`.** The catch-all matches the
-path and its leaf carries `GET` only, so HTTP.jl reports a method mismatch rather than a miss:
+**5. A non-GET request naming a real mounted file is now `405`; one naming nothing is still
+`404`.** The catch-all matches a path for every method, so the mount — not the router — decides:
 
 ```
-POST /static/does-not-exist.txt   404  ->  405
-PUT  /static/does-not-exist.txt   404  ->  405
-HEAD /static/does-not-exist.txt   404  ->  405
-GET  /static/does-not-exist.txt   404  ->  404   (unchanged)
+POST /static/app.js            404  ->  405   + Allow: GET, HEAD   (the file exists)
+POST /static/does-not-exist    404  ->  404                        (unchanged)
+GET  /static/does-not-exist    404  ->  404                        (unchanged)
+HEAD /static/app.js            404  ->  200   + Content-Length     (newly served)
 ```
 
-`spafiles` already behaved this way — it registered a `/<prefix>/**` catch-all before this change —
-but `staticfiles` and `dynamicfiles` did not. **At a root mount this covers the whole
-application**: with `staticfiles(dir, "")`, `POST /api/anything` is a `405` where it used to be a
-`404`. If you mount at the root and rely on `404` for unrouted non-GET requests, mount under a
-prefix instead, or declare the routes explicitly.
+A mount deliberately does **not** claim a request it cannot serve, which is what every comparable
+framework does: Express's `serve-static` calls `next()` for non-GET/HEAD by default
+(`fallthrough !== false`) and only answers 405 when that is switched off; Phoenix's `Plug.Static`
+returns the `conn` unchanged so a later plug answers; Go's `FileServer` does not inspect the method
+at all. Nitro cannot literally fall through — the router has already matched — so it reproduces the
+outcome: a miss defers to your own not-found handler whatever the method. That is *more*
+informative than Express's default, which 404s even for a file that exists.
+
+**`HEAD` is newly served**, with `Content-Length`, where a mount previously had no HEAD route at
+all. That is additive.
+
+**`spafiles` no longer hands the app shell to a non-navigation.** `POST /app/some/route` was
+answered with `index.html` and a `200`; it now defers like any other miss. Answering a form post
+with HTML and a success status was the wrong report.
+
 
 **6. On Linux/macOS, a filename containing a literal `\` becomes unreachable.** `\` is a legal
 filename character there, and such a file is still *enumerated* and still appears in the mount's

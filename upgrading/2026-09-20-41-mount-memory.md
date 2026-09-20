@@ -34,6 +34,15 @@ and for a hundred concurrent ones.
 `:lazy` is what makes memory track the **working set** rather than the folder. The bound is a byte
 budget, not an entry count, because 200 icons and 200 videos are not the same working set.
 
+**`etag = :strong` with `cache = :none` now warns at mount time.** That combination recomputes the
+tag per request from a per-request read, so it hashes the whole body on every hit —
+`dynamicfiles(dir; etag = :strong)` over a 100 MB file is a 100 MB sha256 per request. No comparable
+framework hashes file content for an ETag at all: Express's `send` uses `etag(stat)`, Phoenix's
+`Plug.Static` uses `phash2({size, mtime})`, nginx emits `"<mtime-hex>-<size-hex>"`, and Go's
+`FileServer` emits none and leaves it to the caller. `:weak_stat` is that default and is exactly as
+good for `If-None-Match`, which compares weakly; `:strong` earns its cost only for
+`If-Range`/`If-Match`, paired with a policy that holds the bytes.
+
 `Res.file(req, path; stream = true)` exposes the same transport to handlers, which is the
 user-download case:
 
@@ -52,6 +61,14 @@ staticfiles("media", "media"; stream_threshold = 512 * 1024 * 1024)   # buffer u
 staticfiles("media", "media"; stream_threshold = 0)                   # never stream (old behaviour)
 ```
 
+**Streaming trades memory for a file descriptor.** The handle stays open for the whole transfer, so
+a slow client now costs a descriptor where it used to cost RAM. Keep `proxy_buffering on` (nginx's
+default) for routes that serve files: the proxy drains Nitro at LAN speed, Nitro releases the handle
+at once, and the proxy feeds the slow client. Without it, the default `ulimit -n` of 1024 becomes
+your concurrency limit for downloads. Nitro's side is cheap otherwise — a Julia task blocked in
+`write` yields rather than pinning an OS thread — and the descriptor is now released on **every**
+exit, including a `304` or `HEAD` that carries no body at all.
+
 A streamed response is **single-use** — the body is a cursor over an open file, not a buffer — so it
 can never be cached or shared. `etag = :strong` is therefore **refused** with an `ArgumentError`
 rather than silently downgraded when `stream = true` on `Res.file`, because hashing the body means
@@ -61,8 +78,10 @@ oversized file should not fail a whole mount.
 #### Not a change: which files exist
 
 Enumeration is still mount-time (`docs/design/static-serving-boundary.md` §6, §7). `:none` and
-`:lazy` re-read **content**, exactly as `dynamicfiles` always has; they do not re-evaluate the mount
-rules, and validators still describe the mount-time snapshot.
+`:lazy` re-read **content**, exactly as `dynamicfiles` always has, and they do not re-evaluate the
+mount rules. Their validators describe the bytes they read, not the mount-time snapshot — see the
+#40 entry; a frozen tag on a re-reading policy is what made a changed file answer `304` under its
+old ETag.
 
 ### How to find the calls to migrate
 

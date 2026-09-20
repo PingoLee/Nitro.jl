@@ -547,6 +547,30 @@ Two consequences worth stating, because both are places a plausible implementati
 downgraded: hashing the body means reading all of it, which is the thing the threshold exists to
 avoid. A mount that asks for both logs the downgrade and uses the weak tag.
 
+### What streaming costs instead, and why §1 is the answer
+
+Streaming trades **memory** for **an open file descriptor and a live task, held for the duration of
+the transfer**. That is a better trade — memory was O(filesize × concurrency) and this is O(1) per
+request — but it moves the ceiling rather than removing it, and it is worth naming which ceiling.
+
+A slow client downloading a large file now holds, for as long as it takes: one file descriptor, one
+64 KiB buffer, and one Julia task blocked in `write`. The descriptor is the binding constraint —
+a default `ulimit -n` of 1024 is reached long before 64 MiB of buffers matters. Nitro's task is
+cheap by comparison: Julia tasks are green threads over the `-t` pool and a socket write yields
+rather than pinning an OS thread, so this is not the thread-per-connection exhaustion it resembles.
+
+**This is precisely the row §1 assigns to the proxy, and the reason not to move it.** nginx buffers
+responses by default (`proxy_buffering on`): it drains the upstream at LAN speed, Nitro finishes and
+releases the descriptor immediately, and nginx then feeds the slow client from its own buffer and
+disk. The slow-client cost lands on the layer built to hold ten thousand idle connections cheaply,
+which is the same argument §4 already makes for *request* bodies — this is its response-side twin.
+
+Every comparable framework holds a descriptor per in-flight file too; Go's `serveFile`, Express's
+`send` and nginx all do. What differs is how many idle connections the layer holding them is built
+for, which is why the recommendation is unchanged: **serve assets from the proxy in production**,
+and treat `stream_threshold` as protection for the development case and for handler-issued
+downloads the proxy never sees.
+
 **The precompile workload now covers this path.** It previously exercised only `Res.json`-shaped
 handlers, so `mountable_files`, `mountfolder`, `_route_encode`, `mount_remainder`, `servecontent`
 and the router's `doublestar` branch were all compiled on the **first asset request** — which, for

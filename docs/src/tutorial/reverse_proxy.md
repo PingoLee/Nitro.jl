@@ -39,6 +39,22 @@ spafiles("dist", "";        cache_control = "no-cache")   # the shell must reval
 There is deliberately no default — a `max-age` guessed on your behalf is wrong more often than
 right, and guessing high pins clients to a stale asset with no way to recover.
 
+### Large files hold a descriptor, and `proxy_buffering` is why that is fine
+
+A mounted file over `stream_threshold` (8 MiB by default), and any `Res.file(req, path;
+stream = true)`, is sent in chunks from an open handle rather than buffered in memory. Peak memory
+stops scaling with file size — but the handle stays open for as long as the transfer takes, so a
+slow client now costs a **file descriptor** where it used to cost RAM.
+
+Keep nginx's default `proxy_buffering on` for these routes. nginx drains Nitro at LAN speed, Nitro
+closes the handle immediately, and nginx feeds the slow client from its own buffers. Without
+buffering, Nitro holds one descriptor per in-flight download for the client's full transfer time,
+and the default `ulimit -n` of 1024 becomes your real concurrency limit for downloads.
+
+The two places you may have turned buffering **off** are SSE and WebSockets, and the worked config
+above already scopes `proxy_buffering off` to those locations only. Do not widen it to a location
+that serves files.
+
 ## Why this matters more than usual for Nitro
 
 Nitro runs every request on its own thread — there is no event loop. A slow client therefore occupies
