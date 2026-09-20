@@ -71,7 +71,7 @@ export  # The application handle
         # needs to satisfy it -- and the abstract type a custom store subtypes -- are public.
         AbstractSessionStore, MemoryStore, is_expired,
         # Middleware
-        BearerAuth, CookieAuthMiddleware, Cors, RateLimiter, ExtractIP, extract_ip,
+        BearerAuth, CookieAuthMiddleware, Cors, SecurityHeaders, RateLimiter, ExtractIP, extract_ip,
         SessionMiddleware, SessionPruner, GuardMiddleware, login_required, role_required, permission_required,
         claim_required, kid_required, Principal, CSRFMiddleware,
         AccessLog, AccessRecord,

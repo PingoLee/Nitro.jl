@@ -66,22 +66,30 @@ but it does not tell the browser to avoid plaintext HTTP on the first visit. For
 HTTPS deployments, also set `Strict-Transport-Security` at your reverse proxy or in an
 application middleware.
 
-```julia
-using HTTP
+Use [`SecurityHeaders`](@ref), which carries HSTS alongside the rest of the baseline set:
 
-function HSTSMiddleware(handle)
-    return function(req::HTTP.Request)
-        response = handle(req)
-        HTTP.setheader(response, "Strict-Transport-Security" => "max-age=31536000; includeSubDomains")
-        return response
-    end
-end
+```julia
+using Dates
 
 serve(middleware=[
-    HSTSMiddleware,
+    SecurityHeaders(hsts = Day(365)),
     SessionMiddleware(store=MemoryStore(), secure=true),
 ])
 ```
 
+HSTS is **off** unless you ask for it, and deliberately so: a browser honours `max-age` even
+after you stop sending the header, so a value sent by mistake keeps a hostname HTTPS-only for
+that long with no way to recall it. Nitro speaks plain HTTP behind a proxy and cannot detect
+whether TLS terminated upstream, so enable it only when you know it did.
+
+!!! warning "Do not hand-roll this by mutating the response"
+    A middleware that calls `HTTP.setheader(response, ...)` on the response an inner layer
+    returned is a bug, even though it appears to work. That response may be a shared module-level
+    `const` — Nitro's auth rejections are exactly that — and Nitro serves every request on its own
+    thread, so mutating it in place both leaks headers across requests and races. Build a new
+    response with `add_response_headers` instead, which is what `SecurityHeaders` does. This page
+    used to show the mutating version.
+
 If TLS terminates at a load balancer or reverse proxy, prefer setting HSTS there so every
-response is covered consistently.
+response is covered consistently — and if you set it in both places, keep the two values in
+agreement.

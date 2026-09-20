@@ -97,6 +97,7 @@ const TEST_FILES = [
     "middleware/ratelimitter_lru_tests.jl",
     "middleware/authmiddleware_tests.jl",
     "middleware/cors_middleware_tests.jl",
+    "middleware/security_headers_tests.jl",
     "middleware/lifecycle_middleware_tests.jl",
     "middleware/access_log_tests.jl",
     "middleware/csrf_middleware_tests.jl",
