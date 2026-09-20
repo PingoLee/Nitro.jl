@@ -53,6 +53,106 @@ end
     @test req.context[:user].id == "17"
 end
 
+# The app's own domain user — deliberately NOT a dict, which is the whole point of #24.
+struct AppUser
+    id::Int
+    name::String
+end
+
+@testset "user_validator returning a struct still passes the claim guards (#24)" begin
+    # The issue's literal failure scenario: a `user_validator` returns a domain struct, so
+    # `req.context[:user]` is not a claims source and the verified `Principal` rides along
+    # at `req.context[:auth_claims]`. Before the fix every claim guard returned 403 here
+    # while `kid_required` on the same request worked.
+    validator = Nitro.Auth.jwt_validator(
+        "struct-secret";
+        user_validator = principal -> AppUser(parse(Int, principal.id), "alice"),
+    )
+    token = Nitro.Auth.encode_jwt(Dict(
+        "sub" => "42",
+        "role" => "admin",
+        "permissions" => ["reports:read"],
+        "exp" => trunc(Int, time()) + 60,
+    ), "struct-secret")
+
+    handler = BearerAuth(validator)(GuardMiddleware(
+        login_required(),
+        role_required("admin"),
+        permission_required("reports:read"),
+        claim_required("sub", "42"),
+    )(req -> HTTP.Response(200, getuser(req).name)))
+
+    req = HTTP.Request("GET", "/secure", ["Authorization" => "Bearer $token"])
+    res = handler(req)
+    @test res.status == 200
+    @test Nitro.text(res) == "alice"
+
+    # Both slots are populated, and the handler sees the APP's user, not the Principal.
+    @test req.context[:user] isa AppUser
+    @test req.context[:user].id == 42
+    @test req.context[:auth_claims] isa Principal
+    @test req.context[:auth_claims]["role"] == "admin"
+
+    # A claim the token does not carry is still a 403 on the same wiring.
+    denied_handler = BearerAuth(validator)(GuardMiddleware(
+        role_required("superuser"),
+    )(req -> HTTP.Response(200, "unreachable")))
+    denied = denied_handler(HTTP.Request("GET", "/secure", ["Authorization" => "Bearer $token"]))
+    @test denied.status == 403
+end
+
+@testset "An inner auth layer does not inherit an outer layer's :auth_claims" begin
+    # Two stacked auth middlewares. The outer one authenticates identity 1 and parks its
+    # Principal at :auth_claims; the inner one re-authenticates as identity 2 and, having
+    # produced no claims of its own, must CLEAR that slot. Otherwise identity 2 would be
+    # authorized off identity 1's token — the claim guards read :auth_claims whenever
+    # :user is not itself a claims source.
+    outer = BearerAuth(_ -> ((id = 1,), Principal(Dict{String,Any}("role" => "admin"); id="1")))
+    inner = Nitro.CookieAuthMiddleware(_ -> (id = 2,), cookie_name="c")
+
+    handler = outer(inner(GuardMiddleware(
+        role_required("admin"),
+    )(req -> HTTP.Response(200, "granted"))))
+
+    req = HTTP.Request("GET", "/secure", [
+        "Authorization" => "Bearer outer-token",
+        "Cookie" => "c=inner-token",
+    ])
+    res = handler(req)
+    @test res.status == 403
+    @test req.context[:user] == (id = 2,)
+    @test !haskey(req.context, :auth_claims)
+
+    # A nil claims half clears the slot too, rather than parking `nothing` in it, so
+    # `haskey` stays a truthful signal for "this request carries verified claims".
+    nil_claims = Nitro.CookieAuthMiddleware(_ -> ((id = 3,), nothing), cookie_name="c")
+    nil_handler = outer(nil_claims(GuardMiddleware(
+        role_required("admin"),
+    )(req -> HTTP.Response(200, "granted"))))
+    req_nil = HTTP.Request("GET", "/secure", [
+        "Authorization" => "Bearer outer-token",
+        "Cookie" => "c=inner-token",
+    ])
+    @test nil_handler(req_nil).status == 403
+    @test !haskey(req_nil.context, :auth_claims)
+
+    # And an inner layer that DOES produce claims replaces the outer layer's, rather than
+    # merging with them: the inner viewer must not inherit the outer admin.
+    inner_claims = Nitro.CookieAuthMiddleware(
+        _ -> ((id = 4,), Principal(Dict{String,Any}("role" => "viewer"); id="4")),
+        cookie_name="c",
+    )
+    replaced_handler = outer(inner_claims(GuardMiddleware(
+        role_required("admin"),
+    )(req -> HTTP.Response(200, "granted"))))
+    req_replaced = HTTP.Request("GET", "/secure", [
+        "Authorization" => "Bearer outer-token",
+        "Cookie" => "c=inner-token",
+    ])
+    @test replaced_handler(req_replaced).status == 403
+    @test req_replaced.context[:auth_claims]["role"] == "viewer"
+end
+
 @testset "Service tokens: claim-based authorization" begin
     validator = Nitro.Auth.jwt_validator("svc-secret")
     token = Nitro.Auth.encode_jwt(Dict("action" => "reports:generate"), "svc-secret"; expires_in=60)

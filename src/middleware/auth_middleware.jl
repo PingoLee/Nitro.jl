@@ -15,18 +15,38 @@ const MISSING_COOKIE = HTTP.Response(401, "Unauthorized: Missing or invalid auth
 # validated identity is attached to the request. `nothing`/`missing` (including a
 # validator that threw, mapped by the callers) → 401; a `(user, claims)` 2-tuple →
 # `req.context[:user]` + `req.context[:auth_claims]`; anything else → `req.context[:user]`.
+# A 2-tuple whose user half is `nothing` is ALSO a 401: a nil user is no user, which is
+# what `jwt_validator` already means when its `user_validator` returns nothing (#24).
 # Auth error contract: 401 = unauthenticated (this layer), 403 = authenticated but not
 # authorized (guards), 302 = browser redirect (`login_required`). A throwing validator is
 # always a 401, never a 500.
+# Keeps `:user` and `:auth_claims` describing the SAME principal. Whatever was on the
+# request belongs to an outer auth layer (or to application middleware) and describes a
+# different identity, so this validator's claims always replace it — and when it produced
+# none, the key is removed rather than set to `nothing`, so `haskey` stays a truthful
+# signal. Without this, the claim guards and `kid_required` would authorize the identity in
+# `:user` against someone else's verified token (#24).
+function _set_auth_claims!(req::HTTP.Request, claims)
+    if claims === nothing
+        delete!(req.context, :auth_claims)
+    else
+        req.context[:auth_claims] = claims
+    end
+    return nothing
+end
+
 function _handle_validated(handle::Function, req::HTTP.Request, user_info)
     if user_info === nothing || user_info === missing
         return EXPIRED_TOKEN
     elseif user_info isa Tuple && length(user_info) == 2
-        req.context[:user] = user_info[1]
-        req.context[:auth_claims] = user_info[2]
+        user, claims = user_info
+        (user === nothing || user === missing) && return EXPIRED_TOKEN
+        req.context[:user] = user
+        _set_auth_claims!(req, claims)
         return handle(req)
     else
         req.context[:user] = user_info
+        _set_auth_claims!(req, nothing)
         return handle(req)
     end
 end
@@ -37,12 +57,16 @@ end
 Creates a middleware function for authentication using a pluggable token validation function based on cookies.
 
 # Arguments
-- `validate_token::Function`: A function that takes a token string from the cookie (and optionally the request) and returns user info, a `(user, claims)` tuple, or `nothing` if invalid.
+- `validate_token::Function`: A function that takes a token string from the cookie (and optionally the request) and returns user info, a `(user, claims)` tuple, or `nothing` if invalid. A tuple whose *user* half is `nothing` counts as invalid too — a nil user is no user.
 - `cookie_name::String = "auth_token"`: The name of the cookie to extract the token from.
 - `secret_key::Union{String, Nothing} = nothing`: If provided, the cookie will be decrypted before validation.
 
 Responses follow the auth error contract: missing/invalid cookie or a failed (or
 throwing) validator yields a `401`; authorization denials are the guards' `403`.
+
+On success the validator's claims replace anything already at `req.context[:auth_claims]`,
+and a validator returning a plain user object clears that slot — the two slots always
+describe the same principal, so a second auth layer cannot authorize against the first's.
 """
 function CookieAuthMiddleware(validate_token::Function; cookie_name::String = "auth_token", secret_key::Union{String, Nothing} = nothing)
     return function (handle::Function)
@@ -78,12 +102,16 @@ end
 Creates a middleware function for authentication using a pluggable token validation function.
 
 # Arguments
-- `validate_token::Function`: A function that takes a token string (and optionally the request) and returns user info, a `(user, claims)` tuple, or `nothing` if invalid.
+- `validate_token::Function`: A function that takes a token string (and optionally the request) and returns user info, a `(user, claims)` tuple, or `nothing` if invalid. A tuple whose *user* half is `nothing` counts as invalid too — a nil user is no user.
 - `header::String = "Authorization"`: The name of the header to check for the token.
 - `scheme::String = "Bearer"`: The authentication scheme prefix in the header (e.g., "Bearer" for "Bearer <token>").
 
 Responses follow the auth error contract: missing/malformed credentials or a failed (or
 throwing) validator yields a `401`; authorization denials are the guards' `403`.
+
+On success the validator's claims replace anything already at `req.context[:auth_claims]`,
+and a validator returning a plain user object clears that slot — the two slots always
+describe the same principal, so a second auth layer cannot authorize against the first's.
 
 # Returns
 A plain middleware closure, `handle -> req -> resp`. Unlike `RateLimiter`, `AccessLog` and

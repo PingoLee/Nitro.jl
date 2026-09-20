@@ -46,14 +46,55 @@ The contract:
   building your own user object in a `user_validator`, or copy it with `Dict(principal)`.
 - **Two context slots.** Without a `user_validator`, the `Principal` *is* `getuser(req)`. With
   one, your returned user object lands in `req.context[:user]` and the `Principal` rides
-  along at `req.context[:auth_claims]` — so guards like `kid_required` still see the
-  verified metadata.
+  along at `req.context[:auth_claims]` — so the guards still see the verified metadata even
+  when your user object is a plain struct.
 - **Custom validators** can opt into the same contract by returning a `Principal` (or a
-  `(user, principal)` tuple).
-- **Guards resolve the principal** from `req.context[:user]` first. Only when no auth
-  middleware attached one do `login_required`/`claim_required` fall back to the raw
-  `getsession(req)` dict — that fallback serves session-based apps, and `login_required`
-  accepts it only when it carries the login marker (`session_key`, default `"user_id"`).
+  `(user, principal)` tuple). A `(nothing, principal)` tuple is *not* authenticated — a nil
+  user is a 401, the same as returning `nothing`.
+- **The claim guards resolve claims in three steps.** `claim_required` (and its
+  `role_required`/`permission_required` aliases) reads `req.context[:user]` when it is
+  dict-like; otherwise `req.context[:auth_claims]`; otherwise the raw `getsession(req)` dict,
+  which serves session-based apps.
+- **A dict-like `:user` is authoritative, and an absent claim means denial.** It is *not*
+  topped up from `:auth_claims`: the token's claims are verified but **stale**, while your
+  user object is the result of a fresh lookup, so a demoted user's unexpired `role=admin`
+  must not out-rank it. If you want token claims authorized on, merge them into the object
+  your `user_validator` returns.
+- **A non-dict `:user` blocks the session fallback.** An auth middleware vouched for the
+  request with a struct identity, so an unauthenticated session dict is never promoted into
+  a claims source for it — the guard denies instead.
+- **`login_required` is authentication, not authorization**, so it does not use that
+  resolution: it trusts any non-empty `req.context[:user]` as-is, and falls back to the
+  session only when it carries the login marker (`session_key`, default `"user_id"`).
+
+!!! warning "Revocation and the struct-user path"
+
+    The two rules above are deliberately asymmetric, and the asymmetry decides how fast a
+    revocation takes effect. With a **dict-like** user object your fresh lookup is what the
+    guards read, so a demotion applies on the next request. With a **struct** user object the
+    guards read the token's claims instead — verified, but issued in the past and *not*
+    re-checked against your lookup — so a demoted user keeps whatever the token says for the
+    rest of its TTL.
+
+    ```julia
+    # `user_validator` does a fresh lookup on every request...
+    jwt_validator(secret; user_validator = p -> load_user(p["sub"]))
+    ```
+
+    If `load_user` returns a struct, `role_required("admin")` still authorizes off the token.
+    To make revocation effective within the token TTL, return a **dict** that merges your
+    fresh state, and keep the token's claims out of it unless you mean them:
+
+    ```julia
+    user_validator = function (p)
+        u = load_user(p["sub"])
+        u === nothing && return nothing            # 401 — user is gone
+        Dict{String,Any}("sub" => p["sub"], "role" => u.role, "permissions" => u.permissions)
+    end
+    ```
+
+    Short token lifetimes are the other half of this; Nitro cannot revoke a signed token it
+    did not issue.
 
 ## 3. The error contract
 
@@ -202,7 +243,9 @@ returns `nothing` (pass) or a response (deny). They run after auth middleware, i
 Notes:
 
 - The claim guards read any dict-like principal — a `Principal`, a plain claims dict from
-  a custom validator, or (fallback) the raw session dict of a session-authenticated app.
+  a custom validator, the `Principal` at `req.context[:auth_claims]` when your
+  `user_validator` returned a non-dict user object, or (last) the raw session dict of a
+  session-authenticated app. Full precedence and its rationale: §2.
 - `kid_required` has **no** session fallback and never trusts a claim named `"kid"` —
   only the keyset-verified key id carried by a `Principal`. No trusted kid ⇒ 403.
 - Guards deny with a shared constant `403 Forbidden` response; bodies are stable and safe

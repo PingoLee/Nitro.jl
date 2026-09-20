@@ -54,6 +54,11 @@ dict-like, so validators written against claims dictionaries keep working — an
 validator returns `(user, principal)`, so auth middleware attaches the app user at
 `req.context[:user]` and the normalized principal at `req.context[:auth_claims]`.
 
+A `user_validator` returning `nothing` — "the token verified, but there is no such user" —
+makes the whole validator return `nothing`, which auth middleware renders as a `401`. That
+is the precedent custom validators follow: never hand back a `(nothing, claims)` tuple,
+because a nil user is no user and is rejected the same way.
+
 The validator is a pure function of the token: it never mutates the request.
 """
 function jwt_validator(secret_or_keyset;
