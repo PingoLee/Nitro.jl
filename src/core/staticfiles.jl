@@ -66,13 +66,63 @@ end
 
 # Resolve a request against a mount table.
 #
-# Returns the filesystem path, or `nothing` for a miss. `mount_remainder` throws `ValidationError`
+# Returns the value, or `nothing` for a miss. `mount_remainder` throws `ValidationError`
 # (a 400) on a malformed escape or invalid UTF-8; that propagates, deliberately — it is the same
 # boundary rule `Types.pathparams` applies to `{var}` routes (#70).
-function _lookup_mount(files::Dict{String,String}, target::AbstractString, n_prefix::Int)
+function _lookup_mount(table::Dict{String,V}, target::AbstractString, n_prefix::Int) where {V}
     key = Util.mount_remainder(target, n_prefix)
     key === nothing && return nothing
-    return get(files, key, nothing)
+    return get(table, key, nothing)
+end
+
+# One mounted file, with everything a response needs precomputed at mount time.
+#
+# `bytes` is the snapshot `staticfiles`/`spafiles` capture; `dynamicfiles` leaves it `nothing` and
+# re-reads per request. The validators and content type are computed once either way, because a
+# mount's answer to "what is this file" does not change between requests — which files exist is
+# decided at mount time and stays decided (docs/design/static-serving-boundary.md §6).
+struct MountedFile
+    path::String
+    bytes::Nullable{Vector{UInt8}}
+    etag::Nullable{String}
+    modtime::Nullable{DateTime}
+    content_type::String
+end
+
+function MountedFile(path::String; capture::Bool, etag, loadfile)
+    body = if !capture
+        nothing
+    elseif isnothing(loadfile)
+        read(path)
+    else
+        raw = loadfile(path)
+        raw isa Vector{UInt8} ? raw : Vector{UInt8}(codeunits(raw))
+    end
+    tag, modtime = Res.file_validators(path; etag = etag, bytes = body)
+    return MountedFile(path, body, tag, modtime, Res.file_content_type(path))
+end
+
+# Build the response for one mounted file, for THIS request.
+#
+# A response can no longer be prebuilt and handed out unchanged: whether it is a 200, a 304 or a
+# 206 depends on the request's `If-None-Match` / `If-Modified-Since` / `Range`. `servecontent`
+# decides that, and it is HTTP.jl public API precisely so callers do not re-derive the precondition
+# table — weak-versus-strong tag comparison and the order the four preconditions are evaluated in
+# are both easy to get plausibly wrong.
+function _serve_mounted(req::HTTP.Request, mf::MountedFile, headers::Vector, loadfile, cache_control)
+    source = if mf.bytes !== nothing
+        mf.bytes
+    elseif isnothing(loadfile)
+        read(mf.path)
+    else
+        raw = loadfile(mf.path)
+        raw isa Vector{UInt8} ? raw : Vector{UInt8}(codeunits(raw))
+    end
+    extra = isnothing(cache_control) ? Pair{String,String}[] :
+            Pair{String,String}["Cache-Control" => String(cache_control)]
+    resp = HTTP.servecontent(req, source; name = basename(mf.path), modtime = mf.modtime,
+                             content_type = mf.content_type, etag = mf.etag, headers = extra)
+    return Res.apply_headers!(resp, headers)
 end
 
 function staticfiles(
@@ -84,16 +134,16 @@ function staticfiles(
     loadfile::Nullable{Function}=nothing,
     include_hidden::Bool=false,
     allow_symlink_escape::Bool=false,
+    etag = :weak_stat,
+    cache_control::Union{Nothing,AbstractString}=nothing,
 )
-    files     = Dict{String,String}()
-    responses = Dict{String,HTTP.Response}()
+    files = Dict{String,String}()
+    table = Dict{String,MountedFile}()
 
     # The bytes are captured now, so the file this mount serves cannot change on disk afterwards.
-    # One `Response` per file, reused for every request to it — safe because Nitro's write path
-    # (`src/core/transport.jl::_write_response_body!`) does not consume a body.
     function addroute(_route, filepath, key)
         _table_insert!(files, key, filepath)
-        responses[key] = Res.file(filepath; loadfile=loadfile, headers=headers)
+        table[key] = MountedFile(filepath; capture = true, etag = etag, loadfile = loadfile)
         return nothing
     end
     mounted = mountfolder(folder, mountdir, addroute; include_hidden, allow_symlink_escape)
@@ -107,10 +157,9 @@ function staticfiles(
     notfound = router._404
 
     handler = function (req::HTTP.Request)
-        key = Util.mount_remainder(req.target, nprefix)
-        key === nothing && return notfound(req)
-        resp = get(responses, key, nothing)
-        return resp === nothing ? notfound(req) : resp
+        mf = _lookup_mount(table, req.target, nprefix)
+        mf === nothing && return notfound(req)
+        return _serve_mounted(req, mf, headers, loadfile, cache_control)
     end
     _register_mount(ctx, router, segments, handler; bare = haskey(files, ""))
 
@@ -126,13 +175,15 @@ function spafiles(
     loadfile::Nullable{Function}=nothing,
     include_hidden::Bool=false,
     allow_symlink_escape::Bool=false,
+    etag = :weak_stat,
+    cache_control::Union{Nothing,AbstractString}=nothing,
 )
-    files     = Dict{String,String}()
-    responses = Dict{String,HTTP.Response}()
+    files = Dict{String,String}()
+    table = Dict{String,MountedFile}()
 
     function addroute(_route, filepath, key)
         _table_insert!(files, key, filepath)
-        responses[key] = Res.file(filepath; loadfile=loadfile, headers=headers)
+        table[key] = MountedFile(filepath; capture = true, etag = etag, loadfile = loadfile)
         return nothing
     end
     mounted = mountfolder(folder, mountdir, addroute; include_hidden, allow_symlink_escape)
@@ -165,29 +216,27 @@ function spafiles(
         # the same as not registering one — but it is here, because the handler defers to the
         # router's own not-found rather than inventing a response.
         function (req::HTTP.Request)
-            key = Util.mount_remainder(req.target, nprefix)
-            key === nothing && return notfound(req)
-            resp = get(responses, key, nothing)
-            return resp === nothing ? notfound(req) : resp
+            mf = _lookup_mount(table, req.target, nprefix)
+            mf === nothing && return notfound(req)
+            return _serve_mounted(req, mf, headers, loadfile, cache_control)
         end
     else
-        # Bind outside the closure, and build the fallback response ONCE. The history fallback is
-        # an SPA server's hottest path — every deep link and client-route refresh lands on it — and
-        # it used to re-`read` index.html from disk and allocate a fresh `Response` per request
-        # while the directly-mounted `/index.html` was served from a cached object (#40). Caching it
-        # is safe for the same reason the mounted responses are: the write path does not consume a
-        # body.
-        index_path  = last(mounted[index_idx])
-        index_resp  = Res.file(index_path; loadfile=loadfile, headers=headers)
+        # Bind the index's `MountedFile` outside the closure. The history fallback is an SPA
+        # server's hottest path — every deep link and client-route refresh lands on it — and it used
+        # to re-`read` index.html from disk per request while the directly-mounted `/index.html`
+        # came from a captured snapshot (#40). It now shares the same snapshot, the same validators,
+        # and therefore the same 304 behaviour as the direct route: a client that has the shell
+        # cached revalidates a deep link with a 304 instead of refetching it.
+        index_path = last(mounted[index_idx])
+        index_mf   = MountedFile(index_path; capture = true, etag = etag, loadfile = loadfile)
         function (req::HTTP.Request)
-            key = Util.mount_remainder(req.target, nprefix)
-            # An unnameable path (`..`, an encoded separator) is a client asking for something no
-            # mounted file can be called. Under history mode that is still a client route, so it
-            # gets the shell — matching `try_files $uri /index.html`, which does not inspect the
-            # path either.
-            key === nothing && return index_resp
-            resp = get(responses, key, nothing)
-            return resp === nothing ? index_resp : resp
+            mf = _lookup_mount(table, req.target, nprefix)
+            # A miss — or an unnameable path (`..`, an encoded separator) — is a client asking for
+            # something no mounted file can be called. Under history mode that is still a client
+            # route, so it gets the shell, matching `try_files $uri /index.html`, which does not
+            # inspect the path either.
+            target = mf === nothing ? index_mf : mf
+            return _serve_mounted(req, target, headers, loadfile, cache_control)
         end
     end
     _register_mount(ctx, router, segments, handler; bare = haskey(files, ""))
@@ -206,12 +255,20 @@ function dynamicfiles(
     loadfile::Nullable{Function}=nothing,
     include_hidden::Bool=false,
     allow_symlink_escape::Bool=false,
+    etag = :weak_stat,
+    cache_control::Union{Nothing,AbstractString}=nothing,
 )
     # Which files exist here is decided once, at mount time. Serving a directory whose contents an
     # attacker can change is out of scope for this layer — see docs/design/static-serving-boundary.md.
     files = Dict{String,String}()
+    table = Dict{String,MountedFile}()
     function addroute(_route, filepath, key)
         _table_insert!(files, key, filepath)
+        # `capture = false`: the CONTENT is re-read per request, which is the whole point of this
+        # mount. The validators are still computed at mount time, as everywhere else — they
+        # describe the snapshot the mount decided on, and re-`stat`ing per request is the
+        # per-request filesystem work §6 removed on purpose.
+        table[key] = MountedFile(filepath; capture = false, etag = etag, loadfile = loadfile)
         return nothing
     end
     mounted = mountfolder(folder, mountdir, addroute; include_hidden, allow_symlink_escape)
@@ -221,9 +278,9 @@ function dynamicfiles(
     notfound = router._404
 
     handler = function (req::HTTP.Request)
-        filepath = _lookup_mount(files, req.target, nprefix)
-        filepath === nothing && return notfound(req)
-        return Res.file(filepath; loadfile=loadfile, headers=headers)
+        mf = _lookup_mount(table, req.target, nprefix)
+        mf === nothing && return notfound(req)
+        return _serve_mounted(req, mf, headers, loadfile, cache_control)
     end
     _register_mount(ctx, router, segments, handler; bare = haskey(files, ""))
 

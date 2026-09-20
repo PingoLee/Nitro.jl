@@ -913,6 +913,80 @@ end
     end
 end
 
+@testset "mounts answer conditional GETs and ranges (#40)" begin
+    resetstate()
+    try
+        staticfiles(root, "static"; cache_control = "public, max-age=60")
+
+        r = internalrequest(HTTP.Request("GET", "/static/visible.txt"))
+        etag, lastmod = HTTP.header(r, "ETag"), HTTP.header(r, "Last-Modified")
+        @test r.status == 200
+        @test bodystr(r) == "visible"
+        @test !isempty(etag)
+        @test !isempty(lastmod)
+        @test HTTP.header(r, "Accept-Ranges") == "bytes"
+        @test HTTP.header(r, "Cache-Control") == "public, max-age=60"
+
+        fresh = internalrequest(HTTP.Request("GET", "/static/visible.txt", ["If-None-Match" => etag]))
+        @test fresh.status == 304
+        @test isempty(bodystr(fresh))
+
+        @test internalrequest(HTTP.Request("GET", "/static/visible.txt",
+                                           ["If-Modified-Since" => lastmod])).status == 304
+        # A non-matching validator must still send the body, or "always 304" would satisfy the
+        # assertions above.
+        stale = internalrequest(HTTP.Request("GET", "/static/visible.txt",
+                                             ["If-None-Match" => "\"nope\""]))
+        @test stale.status == 200
+        @test bodystr(stale) == "visible"
+
+        part = internalrequest(HTTP.Request("GET", "/static/visible.txt", ["Range" => "bytes=0-2"]))
+        @test part.status == 206
+        @test bodystr(part) == "vis"
+        @test internalrequest(HTTP.Request("GET", "/static/visible.txt",
+                                           ["Range" => "bytes=900-"])).status == 416
+    finally
+        resetstate()
+    end
+
+    # No Cache-Control unless the mount asked for one: guessing a max-age on an app's behalf pins
+    # clients to a stale asset with no way to recover.
+    resetstate()
+    try
+        staticfiles(root, "static")
+        @test HTTP.header(internalrequest(HTTP.Request("GET", "/static/visible.txt")),
+                          "Cache-Control", "") == ""
+    finally
+        resetstate()
+    end
+end
+
+@testset "the SPA fallback carries validators, like the file it serves" begin
+    # The history fallback is an SPA server's hottest path. It used to re-`read` index.html per
+    # request and emit no validators at all, so every deep link cost a full body (#40).
+    spa = mktempdir()
+    write(joinpath(spa, "index.html"), "SHELL")
+    write(joinpath(spa, "app.js"), "APP")
+    resetstate()
+    try
+        spafiles(spa, "app")
+        deep = internalrequest(HTTP.Request("GET", "/app/some/client/route"))
+        etag = HTTP.header(deep, "ETag")
+        @test deep.status == 200
+        @test bodystr(deep) == "SHELL"
+        @test !isempty(etag)
+
+        @test internalrequest(HTTP.Request("GET", "/app/other/route",
+                                           ["If-None-Match" => etag])).status == 304
+        # The fallback and the direct index route describe the same file, so they must agree on
+        # its validator -- otherwise a client revalidating a deep link would refetch the shell.
+        direct = internalrequest(HTTP.Request("GET", "/app/index.html"))
+        @test HTTP.header(direct, "ETag") == etag
+    finally
+        resetstate()
+    end
+end
+
 @testset "include_hidden=true is a real opt-in" begin
     resetstate()
     try

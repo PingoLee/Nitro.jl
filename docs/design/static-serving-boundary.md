@@ -8,15 +8,16 @@ application code.
 > convenience with a safe floor**, not a production asset pipeline. They must stay safe by default —
 > the API is exported, and dev machines have no proxy — but they will not grow filesystem-semantics
 > features to chase edge cases a real web server already solved. Concretely: mount-time checks are
-> in scope; per-request re-validation, symlinked-directory traversal, byte-range serving,
-> compression, and cache negotiation are not. Production serves assets from the proxy.
+> in scope; per-request **filesystem** re-validation, symlinked-directory traversal and compression
+> are not. Cache validation and byte ranges *are* in scope since §10, because HTTP.jl ships them as
+> public API and Nitro no longer has to write them. Production still serves assets from the proxy.
 
 ## 1. The decision
 
 | Concern | Owner | Rationale |
 |---|---|---|
 | TLS termination, certificate lifecycle | **Proxy** | Nitro has no TLS story and should not acquire one. Caddy does ACME automatically |
-| Static assets in production | **Proxy** | `sendfile`, cache headers, compression, byte ranges, conditional GETs — none of which Nitro implements |
+| Static assets in production | **Proxy** | `sendfile` and compression, which Nitro does not implement. Cache headers, conditional GETs and byte ranges it now does (§10) — the proxy is still cheaper and upstream |
 | SPA history-mode fallback in production | **Proxy** | `try_files $uri /index.html` is one directive |
 | Request body size caps | **Proxy first**, app second | Rejecting before the request reaches Julia is strictly better; the app still needs its own (see [#41](https://github.com/PingoLee/Nitro.jl/issues/41), [#17](https://github.com/PingoLee/Nitro.jl/issues/17)) |
 | Slow-client / connection timeouts | **Proxy** | See §4 — this one is load-bearing for Nitro's concurrency model |
@@ -93,8 +94,9 @@ Two consequences worth stating:
 - Slowloris-style exhaustion is a *concurrency-model* problem here, not just a bandwidth one. The
   proxy is the correct mitigation.
 - `staticfiles` reads every mounted file into memory at startup and holds it for process lifetime.
-  For a real SPA `dist/` that is resident RAM with no `sendfile`, no ranges, and no conditional GETs.
-  This is acceptable for development and wasteful in production.
+  For a real SPA `dist/` that is resident RAM with no `sendfile`. Ranges and conditional GETs are
+  handled since §10, so a warm client costs a 304 rather than a body — but the resident copy is
+  still there. This is acceptable for development and wasteful in production.
 
 ## 5. What the app layer keeps, and why there is a floor at all
 
@@ -156,7 +158,11 @@ error-handling improvement, not a security control, and should be argued on thos
 
 Not planned, and a PR adding one should cite this section or change it:
 
-- Byte-range requests, ETag/`If-None-Match`, `Last-Modified` negotiation, on-the-fly compression
+- On-the-fly compression. §1 gives it to the proxy, and unlike cache validation it is not
+  something HTTP.jl hands us — it would be a codec, a negotiation and a cache of its own
+  - *(Byte ranges and ETag/`Last-Modified` negotiation were listed here until §10. They moved
+    because `HTTP.servecontent` is public API: adopting them stopped meaning "write and maintain
+    the precondition table" and started meaning "call a function.")*
 - Traversing symlinked directories inside a mount (needs a custom walk with cycle detection)
 - Serving files created after startup — mounts register a snapshot; use a handler
 - ACME `http-01` support. `.well-known/acme-challenge/<token>` is written at renewal time, long after
@@ -431,7 +437,55 @@ branch, so it can never match zero. It is registered only when the mount can act
 i.e. when a mount-root `index.html` was enumerated — so a mount never claims `/<prefix>` with
 nothing to serve there.
 
-## 10. See also
+## 10. Conditional GET and byte ranges, via `HTTP.servecontent`
+
+[#40](https://github.com/PingoLee/Nitro.jl/issues/40). Mounts and the new
+`Res.file(req, path)` emit `ETag`, `Last-Modified` and `Accept-Ranges`, answer `304` to a matching
+`If-None-Match` / `If-Modified-Since`, and serve `206` for a `Range`. `412` and `416` come with
+them.
+
+**What changed the answer was not the value, it was the price.** §7 listed these as non-goals on a
+cost argument — the same argument §2 makes about filesystem semantics: a framework should not
+accumulate protocol code that a real web server already solved. That argument held while adopting
+them meant *writing and maintaining* the precondition table. HTTP.jl 2.6 ships `servecontent` as
+**declared public API** (`Expr(:public, …)` in `HTTP.jl` — "documented, non-exported public API …
+supported entry points"), and it implements the whole of RFC 9110 §13: strong-versus-weak tag
+comparison, the order `If-Match` / `If-Unmodified-Since` / `If-None-Match` / `If-Modified-Since`
+must be evaluated in, single-range parsing, and which headers a `304` may carry (it strips
+`Content-Type`, `Content-Length` and `Content-Encoding`, and drops `Last-Modified` when an `ETag` is
+present). Adopting it costs one function call, so the cost argument no longer applies and the
+non-goal was changed rather than cited.
+
+Every one of those details is somewhere a hand-rolled implementation is plausibly wrong rather than
+obviously wrong — `If-None-Match` compares **weakly** while `If-Range` compares **strongly**, and an
+implementation that used one comparison for both would pass every simple test.
+
+**Compression did not move with them**, and the distinction is the same one: HTTP.jl does not hand
+us a content-negotiated compressor. That would be a codec, an `Accept-Encoding` negotiation and a
+cache of precompressed bodies — real code to own, for something §1 gives to the proxy.
+
+**Validators are computed at mount time, not per request.** `MountedFile` holds the `ETag`,
+`Last-Modified` and `Content-Type` alongside the captured bytes. Re-`stat`ing per request to notice
+a changed file is exactly the per-request filesystem work §6 removed, and it would contradict §7's
+"mounts register a snapshot" in any case: the validators describe what the mount decided to serve.
+
+The default tag is **`W/"<size>-<mtime>"`**, which is what Go's `net/http` and nginx both use. A
+strong tag means hashing every byte — once per file at startup for a mount, which is free for a
+small `dist/` and a visible pause for a folder of media — and buys nothing for `If-None-Match`,
+which compares weakly anyway. `etag = :strong` is available per mount and per `Res.file` call for
+when `If-Range` or `If-Match` needs to be exact.
+
+**`Cache-Control` has no default.** It is emitted only when asked for. A `max-age` guessed on an
+application's behalf is wrong more often than right — hashed build output wants a year, an
+unhashed `index.html` wants zero — and the failure mode of guessing high is a client pinned to a
+stale asset with no way to recover.
+
+**A response can no longer be prebuilt.** Whether a request gets `200`, `304` or `206` depends on
+its own headers, so the mount caches *bytes* and builds the response per request. This removes the
+shared-`Response`-object pattern from the static path entirely, and with it any exposure to HTTP
+2.7's new spent-body check — a fresh `BytesBody` per request is never spent.
+
+## 11. See also
 
 - [`docs/src/tutorial/reverse_proxy.md`](../src/tutorial/reverse_proxy.md) — the user-facing guide,
   including client-IP trust configuration and worked nginx/Caddy configs

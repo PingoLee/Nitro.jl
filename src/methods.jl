@@ -1,4 +1,4 @@
-﻿# This is where methods are coupled to a global state
+# This is where methods are coupled to a global state
 
 """
     resetstate()
@@ -161,8 +161,10 @@ staticfiles(
     headers::Vector=[],
     loadfile::Nullable{Function}=nothing,
     include_hidden::Bool=false,
-    allow_symlink_escape::Bool=false
-) = Nitro.Core.staticfiles(CONTEXT[], CONTEXT[].service.router, folder, mountdir; headers, loadfile, include_hidden, allow_symlink_escape)
+    allow_symlink_escape::Bool=false,
+    etag = :weak_stat,
+    cache_control::Union{Nothing,AbstractString}=nothing
+) = Nitro.Core.staticfiles(CONTEXT[], CONTEXT[].service.router, folder, mountdir; headers, loadfile, include_hidden, allow_symlink_escape, etag, cache_control)
 
 
 """
@@ -217,8 +219,10 @@ spafiles(
     headers::Vector=[],
     loadfile::Nullable{Function}=nothing,
     include_hidden::Bool=false,
-    allow_symlink_escape::Bool=false
-) = Nitro.Core.spafiles(CONTEXT[], CONTEXT[].service.router, folder, mountdir; headers, loadfile, include_hidden, allow_symlink_escape)
+    allow_symlink_escape::Bool=false,
+    etag = :weak_stat,
+    cache_control::Union{Nothing,AbstractString}=nothing
+) = Nitro.Core.spafiles(CONTEXT[], CONTEXT[].service.router, folder, mountdir; headers, loadfile, include_hidden, allow_symlink_escape, etag, cache_control)
 
 
 """
@@ -267,8 +271,10 @@ dynamicfiles(
     headers::Vector=[],
     loadfile::Nullable{Function}=nothing,
     include_hidden::Bool=false,
-    allow_symlink_escape::Bool=false
-) = Nitro.Core.dynamicfiles(CONTEXT[], CONTEXT[].service.router, folder, mountdir; headers, loadfile, include_hidden, allow_symlink_escape)
+    allow_symlink_escape::Bool=false,
+    etag = :weak_stat,
+    cache_control::Union{Nothing,AbstractString}=nothing
+) = Nitro.Core.dynamicfiles(CONTEXT[], CONTEXT[].service.router, folder, mountdir; headers, loadfile, include_hidden, allow_symlink_escape, etag, cache_control)
 
 """
     getexternalurl()
