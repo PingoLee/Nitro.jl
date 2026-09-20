@@ -214,7 +214,7 @@ end
     # client can reach. For `"my static"` that is absolute -- a space cannot appear in a request
     # line at all -- which is the silent case #101 calls the worst of the three options. For
     # `"café"` and the bracket/pipe family it is not: those answered a raw-byte client (curl), so
-    # refusing them is a real capability change, recorded in UPGRADING.md's #101 entry rather than
+    # refusing them is a real capability change, recorded in the #101 upgrade-log entry rather than
     # papered over. `..` is here because `.` is *unreserved*, so it passes the
     # encoding test and is still stripped by the client before the request is sent.
     for md in ("my static", "café", "a?b", "a#b", "%", "a%2", "%GG", "100%", "a[b]", "a|b", "..")

@@ -21,7 +21,7 @@
 # A worker run therefore sees the DEFAULT of every `ScopedValue`, not the submitter's binding --
 # with one deliberate exception, the logger, immediately below. That is the intended semantics
 # (a background run outlives the request that queued it) and it is a behaviour change carrying an
-# `UPGRADING.md` entry.
+# upgrade-log entry.
 
 # The LOGGER is carried in that same dynamic scope, and it is the one binding we put back.
 #

@@ -5,6 +5,11 @@
 #
 # Deliberately narrow: *.jl and *.md are NOT pinned. Julia does not care about line endings, and
 # normalizing them would rewrite every file in the repo on its next touch for no benefit. Markdown
-# that is *parsed* (UPGRADING.md, read by `_parse_upgrading` in src/upgrading.jl) handles CRLF in
-# the parser instead, which also covers files that never went through git.
+# that is *parsed* (the entry files under upgrading/, read by `_parse_upgrading` in
+# src/upgrading.jl) handles CRLF in the parser instead, which also covers files that never went
+# through git.
+#
+# `upgrading/*.md merge=union` is deliberately NOT set either. It would resolve the case where two
+# sessions add entries, but silently DUPLICATE lines when one edits an existing entry while another
+# changes it — and one file per entry (#192) removes the conflict outright rather than resolving it.
 *.sh text eol=lf

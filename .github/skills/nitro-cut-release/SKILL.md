@@ -2,8 +2,8 @@
 name: nitro-cut-release
 description: >-
   Cut a Nitro.jl release train — verify the pre-publish gate, bump Project.toml once, stamp the
-  UPGRADING.md "Unreleased" entries with the new version, date and tag it, and open a fresh
-  Unreleased. Maintainer-invoked; never run as a side effect of finishing a feature.
+  "Unreleased" entry files under upgrading/ with the new version, then date, record and tag it.
+  Maintainer-invoked; never run as a side effect of finishing a feature.
 ---
 
 # Nitro.jl — Cut a Release Train
@@ -12,10 +12,10 @@ description: >-
 
 Nitro versions **per release train, not per PR** (see the *Upgrade-log contract* non-negotiable in
 [`nitro-general.instructions.md`](../../instructions/nitro-general.instructions.md) and the
-[`UPGRADING.md`](../../../UPGRADING.md) header). During a train, breaking/behavior PRs only append to
-the **`## Unreleased`** section of `UPGRADING.md` and never touch `Project.toml`. This skill performs
-the **cut**: the single, deliberate, maintainer-triggered step where the accumulated `Unreleased`
-work becomes a numbered, tagged release.
+[`UPGRADING.md`](../../../UPGRADING.md) contract). During a train, breaking/behavior PRs only add a
+**new file** to [`upgrading/`](../../../upgrading/) carrying `- **Version**: Unreleased`, and never
+touch `Project.toml`. This skill performs the **cut**: the single, deliberate, maintainer-triggered
+step where the accumulated `Unreleased` work becomes a numbered, tagged release.
 
 **Maintainer-invoked only.** The natural trigger is *"I'm about to roll these changes into a
 consuming app"* — the version marks that migration checkpoint. Never cut as the tail end of a feature
@@ -28,9 +28,9 @@ task, and never bump `Project.toml` outside this skill.
   next breaking release.
 - The version is chosen **at cut time**, not when work starts — so during a train `Project.toml`
   still carries the *previous* release's number. That is correct, not drift.
-- `UPGRADING.md` carries only what **forces** an app edit. Additive features are documented in
-  `docs/` and never appear here, so an empty `Unreleased` after a productive month is possible and
-  simply means nothing broke.
+- The upgrade log carries only what **forces** an app edit. Additive features are documented in
+  `docs/` and never appear here, so a train with no `Unreleased` entries after a productive month is
+  possible and simply means nothing broke.
 - Tag history starts at `v0.1.0`. Earlier `Project.toml` numbers (`0.2.0`–`0.4.0`) and their
   `v0.1.0`/`v0.2.0` tags predate the policy, were per-PR bumps, and were deleted and reclaimed.
 
@@ -41,13 +41,13 @@ task, and never bump `Project.toml` outside this skill.
 ```bash
 git status --porcelain                 # must be clean
 git rev-parse --abbrev-ref HEAD        # expect main, up to date with origin
-grep -n '\*\*Version\*\*: Unreleased' UPGRADING.md    # must match at least once
+grep -l '\*\*Version\*\*: Unreleased' upgrading/*.md   # must list at least one file
 gh issue list --label pre-publish      # the publish gate (informational for 0.y releases)
 ```
 
 1. **Working tree clean, on `main`, synced with `origin`.** Stop otherwise.
-2. **`## Unreleased` is non-empty.** If nothing carries `- **Version**: Unreleased`, **stop** —
-   there is nothing to cut. An empty train is not a release.
+2. **At least one entry is uncut.** If no file under `upgrading/` carries
+   `- **Version**: Unreleased`, **stop** — there is nothing to cut. An empty train is not a release.
 3. **The suite is green on CI** for the commit you are about to tag — not just locally. CI covers
    Julia 1.12 on three OSes at 1 and 2 threads.
 4. **Every entry carries its grep and its `before → after`.** Add missing ones now.
@@ -61,7 +61,7 @@ Report anything unmet and stop. Do not "fix it while you're there."
 
 ### 1. List the wave — through the parser, not by eye — then choose the version
 
-Show every `## Unreleased` entry title with its `**Severity**`, so the maintainer sees exactly what
+Show every uncut entry title with its `**Severity**`, so the maintainer sees exactly what
 is shipping. Get the list from `upgrade_guide`, which is what a consumer will actually run. During a
 train `Project.toml` still carries the previous release, so `from = pkgversion(Nitro)` is exactly the
 uncut wave:
@@ -76,12 +76,15 @@ julia --project=. -e 'using Nitro
   end'
 ```
 
-Then **cross-check that count against the file** — if they disagree, an entry is invisible to the
-guide and cutting would ship it unannounced:
+Then **cross-check that count against the log directory** — if they disagree, an entry is invisible
+to the guide and cutting would ship it unannounced:
 
 ```bash
-grep -c '^- \*\*Version\*\*: Unreleased' UPGRADING.md   # the template block adds exactly 1
+grep -l '^- \*\*Version\*\*: Unreleased' upgrading/*.md | wc -l   # one file per entry, exactly
 ```
+
+No fudge factor any more: the authoring template lives in `UPGRADING.md`, which is not parsed and is
+not in `upgrading/`, so this count is the wave count with nothing to subtract.
 
 This is #89: the `## Unreleased` section had no `---` separators between its entries, so three
 collapsed into one block and `upgrade_guide` reported **one** title with the other two bodies
@@ -89,13 +92,14 @@ silently attached — and in the other direction a block with no `- **Recorded**
 without a warning. Every other step in this skill passed anyway.
 
 Both failures are now caught automatically, and in two places: `test/upgrade_guide_tests.jl` asserts
-the full set of entry titles in the shipped file against what the parser produces (*"every shipped
-entry heading becomes an entry"*), naming any entry that went missing, and `_parse_upgrading` warns
-at run time — for a block carrying entry bullets that was skipped, **and** for an entry swallowed by
-its neighbour for want of a `---`. The runtime half is the one that reaches a consuming app, which
-never runs Nitro's suite. Keep this count anyway — it is a **pre-flight**: it runs here, before the
-suite and against the un-stamped file, and it is still the only check the sibling PormG repo has by
-hand. If the counts disagree, inspect the section before touching anything.
+the full set of entry titles in the shipped log against what the parser produces (*"every shipped
+entry heading becomes an entry"*), naming any entry that went missing, plus *"the log directory
+holds one entry per file"*; and `_parse_upgrading` warns at run time — for a block carrying entry
+bullets that was skipped, **and** for an entry swallowed by a neighbour sharing its file. The
+runtime half is the one that reaches a consuming app, which never runs Nitro's suite. Keep this
+count anyway — it is a **pre-flight**: it runs here, before the suite and against the un-stamped
+log, and it is still the only check the sibling PormG repo has by hand. If the counts disagree,
+inspect the directory before touching anything.
 
 - **Default: bump the `y` slot** (`0.a.z → 0.(a+1).0`) — a train carrying any `breaking` or
   `behavior` entry is a migration checkpoint.
@@ -122,23 +126,31 @@ repo, and the failure only surfaces in CI. This has bitten twice — `docs/Proje
 rg -n 'Nitro\s*=\s*"' docs/Project.toml   # expect a floor (>= 0.1), not an enumerated list
 ```
 
-### 3. Stamp `UPGRADING.md`
+### 3. Stamp the uncut entries
 
 Use today's **real** date (`YYYY-MM-DD`) — never invent one; if unsure, ask.
 
-- For **each** entry under `## Unreleased`, replace `- **Version**: Unreleased` with
-  `- **Version**: <new>`.
-- Replace the `## Unreleased — next \`<x>\`` heading (and its italic placeholder note) with
-  `## <new> — <YYYY-MM-DD>`.
-- Insert a **fresh empty** `## Unreleased — next \`<next-y>\`` block above the just-stamped section,
-  carrying the same placeholder note the previous one had.
+- For **each** file listed by the precondition grep, replace its `- **Version**: Unreleased` bullet
+  with `- **Version**: <new>`. That is the whole stamp — there is no section heading to rewrite and
+  no fresh `## Unreleased` to open, because an entry's release lives only in its own bullet
+  (#192).
+- **Record the train** in the *Release trains* table in [`UPGRADING.md`](../../../UPGRADING.md):
+  change the `Unreleased — next \`<x>\`` row to `\`<new>\` | <YYYY-MM-DD>` and add a fresh
+  `Unreleased — next \`<next-y>\`` row above it. This table is the only place a release **date** is
+  recorded now, so skipping it loses the date for good.
 - **Sweep the prose.** Stamping the `- **Version**:` bullet does *not* fix an entry **body** that
-  refers to itself as unreleased — that ships stale and points readers at a now-empty section:
+  refers to itself as unreleased — that ships stale:
   ```bash
-  awk '/^## <new> —/,/^## [0-9]/' UPGRADING.md | grep -n 'Unreleased'   # expect: no prose hits
+  grep -l '^- \*\*Version\*\*: <new>' upgrading/*.md |
+    while read -r f; do grep -Hn 'Unreleased' "$f"; done     # expect: no hits
   ```
+  The loop, not `$(...)` or `xargs -r`: an empty file list would leave a bare `grep` reading stdin
+  and the step would hang rather than report, and `xargs -r` is a GNU extension that BSD/macOS
+  `xargs` rejects outright. `-H` so a hit names its file even when only one matched.
   Prefer version-neutral phrasing when *writing* an entry (``part of the `<y>.x` pre-publish wave``)
   so there is nothing to sweep.
+- **Never rename an entry file while stamping.** The filename carries the `- **Recorded**:` date,
+  not the release, and `test/upgrade_guide_tests.jl` asserts the two agree.
 - Leave already-stamped (older) entries untouched.
 
 ### 4. Verify the parser — and assert the stamp landed
@@ -158,7 +170,7 @@ mismatch before committing.
 ### 5. Commit, then get approval to push
 
 ```bash
-git add UPGRADING.md Project.toml
+git add upgrading/ UPGRADING.md Project.toml
 git commit -m "chore(release): cut <new>"          # entry titles in the body
 ```
 
@@ -201,9 +213,9 @@ The pin **is** the app's rollout state — there are no per-entry rollout tables
 
 - **One bump per cut.** Editing `Project.toml`'s version outside this skill is the per-PR churn this
   model removes.
-- **Never cut an empty `## Unreleased`.**
+- **Never cut a train with no `Unreleased` entries.**
 - **The wave count is asserted twice** — from the parser in step 1, and again after stamping in
-  step 4. A count that disagrees with the file is a stop, not a note.
+  step 4. A count that disagrees with the log directory is a stop, not a note.
 - **Never** tag or publish a release without explicit approval at that step — `git tag` and
   `gh release create` are the two commands the merge-gate rule does *not* hand you.
 - **Never** rewrite historical entries while cutting — fix errors in a separate commit with its own
@@ -213,9 +225,12 @@ The pin **is** the app's rollout state — there are no per-entry rollout tables
   [`src/upgrading.jl`](../../../src/upgrading.jl) maps it to a high sentinel so uncut entries sort
   newest and `upgrade_guide` surfaces them by default. Stamping replaces it with a real
   `VersionNumber`.
-- **The release marker needs its em-dash.** Write `## <new> — <date>`, never `## <new> <date>`: the
-  parser tells a release marker from an entry title by that separator, and a marker without it
-  swallows the release's first entry silently.
+- **Do not write a `## <new> — <date>` release marker into an entry file.** Release markers no
+  longer exist in the log (#192); the release lives in each entry's `- **Version**:` bullet and its
+  date in the *Release trains* table. The parser still filters marker-shaped headings, so one added
+  by hand would not become an entry title — it would simply be ignored, silently.
+- **One entry per file, no column-0 `---`.** Both are asserted by `test/upgrade_guide_tests.jl`; a
+  second entry in a file is swallowed by the first, and a stray `---` truncates the body.
 - **Never** invent a version to make a downstream pin work. If an app needs a different bound, that
   is a conversation, not a release.
 - Once Nitro is published to General, this skill needs a registration step

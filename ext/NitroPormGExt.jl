@@ -536,7 +536,7 @@ function _from_db_record(row)::TaskInfo
     if !(haskey(row, :run_id) || haskey(row, "run_id"))
         error("PormGWorkerStore: task row '$(id)' has no `run_id` column — this nitro_task " *
               "table predates #108. Boot through `pormg_nitro_worker`, which adds it, or run " *
-              "the ALTER TABLE in UPGRADING.md.")
+              "the ALTER TABLE from the #108 entry — `Nitro.upgrade_guide(from = v\"<your pin>\")`.")
     end
     task.run_id = UUIDs.UUID(string(get_val(:run_id, "run_id")))
 

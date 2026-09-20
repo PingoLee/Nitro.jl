@@ -205,7 +205,7 @@ space on purpose and the triplet is validated and passed through. A filename is 
 `my%2520file.txt`. Passing the triplet through would make one URL mean two different files — the
 literal `my%20file.txt` and the encoded form of `my file.txt` — so `%` is not in `_PCHAR_PUNCT` and
 is encoded like any other non-`pchar` byte. This is the one case where a route that a *browser* could
-reach does move; it is recorded in `UPGRADING.md`'s #121 entry.
+reach does move; it is recorded in the #121 upgrade-log entry.
 
 **It does not replace the [`_is_route_pattern`](@ref) refusal, which still runs first.** `*` and `**`
 are perfectly legal `pchar`, so this function leaves them alone and a file named `*` would still
@@ -598,7 +598,7 @@ function mountfolder(folder::String, mountdir::String, addroute;
     end
 
     # The per-file lines above stop at 5, so without this a mount with 40 encoded names reports 5
-    # and never says the other 35 exist -- and the `UPGRADING.md` entry points app authors at this
+    # and never says the other 35 exist -- and the upgrade-log entry points app authors at this
     # log to find what moved. `mountable_files` solves the same problem the same way, with a
     # trailing summary carrying the total.
     n_encoded > 5 && @info "mountfolder: $n_encoded file(s) under $folder are mounted at a percent-encoded route" shown=5

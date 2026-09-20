@@ -102,7 +102,8 @@ request and cached, so calling it twice is free:
 
 They are plain functions, not property sugar: `req.params` and friends do **not** exist. An
 earlier version installed them as `Base.getproperty` overrides, which replaced HTTP.jl's own
-method for the whole Julia process — see [`UPGRADING.md`](UPGRADING.md) if you are migrating.
+method for the whole Julia process — run `Nitro.upgrade_guide(from = v"<your pin>")`, or read the
+[`upgrading/`](upgrading/) log, if you are migrating.
 
 ```julia
 using HTTP
