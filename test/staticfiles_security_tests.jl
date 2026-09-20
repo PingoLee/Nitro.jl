@@ -1114,7 +1114,12 @@ end
         end
 
         reads2 = Dict{String,Int}()
-        counting2 = p -> (reads2[basename(p)] = get(reads2, basename(p), 0) + 1; read(p))
+        # The `* 4` is load-bearing, not decoration: it makes the BODY a different size from the
+        # FILE. A weak tag built from `stat` rather than from the cached bytes is identical to a
+        # correct one whenever those two agree -- which they do for a plain `read` -- so without
+        # a size-changing `loadfile` the drift this block exists to catch is unobservable.
+        counting2 = p -> (reads2[basename(p)] = get(reads2, basename(p), 0) + 1;
+                          vcat(read(p), Vector{UInt8}("XXXX")))
         evict_dir = mktempdir()
         write(joinpath(evict_dir, "a.bin"), rand(UInt8, 50_000))
         write(joinpath(evict_dir, "b.bin"), rand(UInt8, 50_000))
@@ -1126,13 +1131,33 @@ end
             internalrequest(HTTP.Request("GET", "/ev/a.bin"))
             @test reads2["a.bin"] == 1                  # cached
 
+            tag_a = HTTP.header(internalrequest(HTTP.Request("GET", "/ev/a.bin")), "ETag")
+
             internalrequest(HTTP.Request("GET", "/ev/b.bin"))   # 100 KB > 80 KB budget
-            internalrequest(HTTP.Request("GET", "/ev/a.bin"))
-            # a.bin was evicted to make room for b.bin, so it had to be read again. A COUNT-based
-            # bound of two entries would have kept both and left this at 1 -- which is exactly
-            # what distinguishes a byte budget from an entry count.
+            # a.bin was evicted to make room for b.bin. Change it on disk BEFORE the re-read, so
+            # the re-read produces different bytes than the first one did. This is the exact
+            # scenario `CachedBody` exists for: a tag derived from a `stat` rather than from the
+            # cached bytes survives every other assertion here and fails only this one.
+            sleep(1.1)
+            write(joinpath(evict_dir, "a.bin"), rand(UInt8, 70_000))
+
+            r_a = internalrequest(HTTP.Request("GET", "/ev/a.bin"))
+            # It had to be read again -- a COUNT-based bound of two entries would have kept both
+            # and left this at 1, which is what distinguishes a byte budget from an entry count.
             @test reads2["a.bin"] == 2
             @test reads2["b.bin"] == 1
+            @test length(r_a.body) == 70_004          # 70 000 on disk + the loadfile's 4 bytes
+            # The tag describes the BODY in hand -- not the one cached before, and not the file on
+            # disk. `70004` vs `70000` is what separates a tag built from the cached bytes from one
+            # built from a `stat`; they are indistinguishable whenever the two sizes agree.
+            @test HTTP.header(r_a, "ETag") != tag_a
+            @test occursin("70004", HTTP.header(r_a, "ETag"))
+            @test !occursin("70000-", HTTP.header(r_a, "ETag"))
+            # ... and the pre-eviction tag no longer short-circuits, while the current one does.
+            @test internalrequest(HTTP.Request("GET", "/ev/a.bin",
+                                               ["If-None-Match" => tag_a])).status == 200
+            @test internalrequest(HTTP.Request("GET", "/ev/a.bin",
+                                   ["If-None-Match" => HTTP.header(r_a, "ETag")])).status == 304
         finally
             resetstate()
         end

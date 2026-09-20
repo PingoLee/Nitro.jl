@@ -146,12 +146,16 @@ _mount_cache(policy::MountPolicy) =
         LRU{String,CachedBody}(maxsize = policy.cache_max_bytes, by = cb -> sizeof(cb.bytes)) :
         nothing
 
-# One mounted file, with everything a response needs precomputed at mount time.
+# One mounted file, with what a response needs that can be decided once.
 #
-# The validators and content type are computed once, because a mount's answer to "what is this
-# file" does not change between requests — which files exist is decided at mount time and stays
-# decided (docs/design/static-serving-boundary.md §6). `bytes` is the eager snapshot; `stream` is
-# fixed at mount time too, from the file's size against the policy.
+# `content_type` and `stream` are always mount-time: the first is a property of the name, and the
+# second of the file's size against the policy. Which files exist is decided at mount time and
+# stays decided (docs/design/static-serving-boundary.md §6).
+#
+# `bytes`, `etag` and `modtime` are the EAGER snapshot and are all three `nothing` under `:lazy`,
+# `:none` and for a streamed file. They travel together on purpose: a validator is only safe to
+# freeze when the body it describes is frozen with it, and `_serve_mounted` reads these fields
+# only on the branch where `bytes !== nothing`.
 struct MountedFile
     path::String
     bytes::Nullable{Vector{UInt8}}
@@ -414,9 +418,15 @@ function dynamicfiles(
     function addroute(_route, filepath, key)
         _table_insert!(files, key, filepath)
         # `cache = :none` by default here: the CONTENT is re-read per request, which is the whole
-        # point of this mount. The validators are still computed at mount time, as everywhere else
-        # — they describe the snapshot the mount decided on, and re-`stat`ing per request is the
-        # per-request filesystem work §6 removed on purpose.
+        # point of this mount — and therefore so are the VALIDATORS, computed from that read in
+        # `_serve_mounted`. Freezing them at mount time is what made a changed file answer `304`
+        # under its old tag, pinning a client to content that no longer exists.
+        #
+        # That is not the per-request work §6 removed. §6 is about re-checking *containment* —
+        # `realpath`, symlink re-resolution — to detect a file swapped after startup. Nothing here
+        # re-evaluates the mount rules, and no mount ever re-`stat`s to *discover* a change: which
+        # files exist is still decided once, at mount time. A policy that re-reads content simply
+        # describes what it read.
         table[key] = MountedFile(filepath, policy; loadfile = loadfile)
         return nothing
     end
