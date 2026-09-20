@@ -253,7 +253,7 @@ preconditions call for it.
 
 | Kwarg | Effect |
 |---|---|
-| `etag` | `:weak_stat` (default), `:strong`, a `String`, or `nothing` — see [`file_validators`](@ref) |
+| `etag` | `:weak_stat` (default), `:strong`, a `String`, or `nothing` — see `Nitro.Res.file_validators` |
 | `cache_control` | emitted verbatim when given. **No default**: a `max-age` guessed on your behalf is wrong more often than it is right |
 | `allow_ranges` | `false` suppresses `Accept-Ranges` and serves the whole body |
 | `loadfile` | as in [`file(path)`](@ref) — decides the body, and therefore the validators |
