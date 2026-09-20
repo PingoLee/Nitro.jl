@@ -221,6 +221,13 @@ getuser(req::HTTP.Request) = Base.get(req.context, :user, nothing)
     getip(req::HTTP.Request) -> Union{Sockets.IPAddr, Nothing}
 
 Returns the caller's IP address from the request context, if present.
+
+The address is **canonical**: a dual-stack listener that reports an IPv4 client as
+`::ffff:203.0.113.7` is seeded as `203.0.113.7`, so one host has one spelling whether it arrived
+directly or through a proxy (#66). Canonicalization happens where `serve` reads the socket, not in
+middleware, so it applies with or without `ExtractIP` in the pipeline — and, for the same reason,
+it is a guarantee about what *Nitro* seeds. A custom middleware calling `setip!` can write
+any address it likes, including a non-canonical one.
 """
 getip(req::HTTP.Request) = Base.get(req.context, :ip, nothing)
 
@@ -239,7 +246,8 @@ Returns the address of the socket that actually connected, as opposed to the cli
 
 The two differ only when `ExtractIP` resolved the client from a forwarding header: it records the
 socket peer here before overwriting `getip(req)`. Without `ExtractIP` in the pipeline the two are
-the same value, because `serve` seeds the request context from the real TCP connection.
+the same value, because `serve` seeds the request context from the real TCP connection — in the
+same canonical form `getip` documents, since the seed is where that form is decided.
 
 Use it to tell a proxied request from a direct one when auditing — that distinction is what makes
 an access log usable after an incident, since a forged forwarding header changes `getip` but can

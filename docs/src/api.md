@@ -39,7 +39,7 @@ through `req.context`.
 | `payload(req)` | Merged input — `params > post > form > json > query` |
 | `getsession(req)` | Session dict, with `SessionMiddleware` in the pipeline |
 | `getuser(req)` | The authenticated user, once an auth middleware has run |
-| `getip(req)` | Client IP, with `ExtractIP` in the pipeline |
+| `getip(req)` | Client IP — the socket peer, or the forwarded client with `ExtractIP` |
 
 The bare `text`, `json`, `binary`, `formdata` and `multipart` below are the *body parsers* those
 accessors are built on: they re-read and re-parse on every call, take keyword arguments, and also

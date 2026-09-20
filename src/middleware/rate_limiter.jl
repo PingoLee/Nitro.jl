@@ -163,8 +163,10 @@ end
 # a universal one: Let's Encrypt rate-limits by /48 because a single customer may hold one.
 #
 # `_norm` (src/middleware/extract_ip.jl) returns the family-tagged `(v6, host)` pair this masks,
-# and already demotes IPv4-mapped `::ffff:a.b.c.d` to its IPv4 form — so a dual-stack listener
-# reporting a v4 peer as v6 still lands in the same bucket as the plain v4 spelling.
+# and demotes IPv4-mapped `::ffff:a.b.c.d` to its IPv4 form, so the mapped and plain spellings of
+# one host share a bucket. Since #66 the socket peer already arrives demoted from the transport,
+# but the fold still matters here: the key is built from `getip(req)`, which behind a trusted
+# proxy is the HEADER-derived address, and which any middleware may have written with `setip!`.
 #
 # The key type is CONCRETE. The stores were previously `Dict{IPAddr,…}`/`LRU{IPAddr,…}`, whose
 # key type is abstract, so every lookup boxed on the request hot path (nitro-core §7).

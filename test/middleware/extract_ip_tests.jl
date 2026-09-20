@@ -217,8 +217,11 @@ end
 end
 
 @testset "IPv4-mapped IPv6 peers match IPv4 proxies" begin
-    # A dual-stack listener reports an IPv4 peer as ::ffff:127.0.0.1 on some platforms. Without
-    # demotion this silently fails to match and every client collapses onto one bucket.
+    # Trust matching folds the mapped form, and must keep doing so after #66. The transport no
+    # longer hands this layer a mapped PEER (see the pass-through test below), but a mapped
+    # address still reaches `_norm` from a chain hop, from a `trusted_proxies` literal, and from
+    # any middleware that wrote one with `setip!` — which is what the peers below stand in for.
+    # Without the fold these silently fail to match and every client collapses onto one bucket.
     @test xff(create_request(["X-Forwarded-For" => "$CLIENT"], IPv6("::ffff:127.0.0.1"))) == CLIENT
     @test xff(create_request(["X-Forwarded-For" => "$CLIENT"], IPv6("::ffff:10.244.3.9"));
               proxies = ["10.244.0.0/16"]) == CLIENT
@@ -261,6 +264,17 @@ end
 
     # Without ExtractIP at all, getpeerip still reports what serve() seeded.
     @test getpeerip(create_request(String[], CLIENT)) == CLIENT
+
+    # ExtractIP does NOT canonicalize the peer, and that is correct since #66: the socket
+    # peer arrives already demoted from `_ipaddr_from_bytes` in src/core/transport.jl, so
+    # this layer has nothing to do. Seeding a mapped address directly — which only a custom
+    # middleware calling `setip!` can now produce — must therefore pass straight through.
+    # This pins the pass-through property option (b) in #66 would have cost, and is what
+    # stops the demotion being moved back up into the middleware later.
+    MAPPED = IPv6("::ffff:203.0.113.7")
+    ExtractIP()(handler)(create_request(String[], MAPPED))
+    @test getip(seen[]) === MAPPED
+    @test getpeerip(seen[]) === MAPPED
 
     # A request with no peer must not have `nothing` written into :ip.
     bare = HTTP.Request("GET", "/", String[], "")

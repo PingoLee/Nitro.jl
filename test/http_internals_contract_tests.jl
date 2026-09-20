@@ -2,6 +2,7 @@
 using Test
 import HTTP
 import Nitro
+import Sockets
 
 # ── Canary for Nitro's coupling to HTTP.jl v2 private/undocumented surface ──────
 #
@@ -255,6 +256,58 @@ struct _FakeUnknown; whatever; end
     @test Nitro.Core._conn_fd(_FakeTCP(:tcp_fd)) === :tcp_fd            # TCP → conn.fd
     @test Nitro.Core._conn_fd(_FakeTLS(_FakeTCP(:tls_fd))) === :tls_fd  # TLS → conn.tcp.fd
     @test_throws ErrorException Nitro.Core._conn_fd(_FakeUnknown(1))    # structural break raises
+end
+
+@testset "_ipaddr_from_bytes gives one canonical spelling per host (#66)" begin
+    # The socket peer reaches Nitro as raw bytes, and ONE IPv4 host can arrive in two
+    # shapes: four bytes from an AF_INET socket, or sixteen in the `::ffff:0:0/96` block
+    # when a dual-stack AF_INET6 listener reports an IPv4 client. #66 decided that the
+    # demotion happens HERE, at the transport boundary, rather than in `ExtractIP` — which
+    # is what makes it apply to a pipeline with no `ExtractIP` installed at all, and what
+    # keeps `getip == getpeerip` holding when no forwarding header was read.
+    v4       = UInt8[203, 0, 113, 7]
+    mapped   = UInt8[0,0,0,0, 0,0,0,0, 0,0, 0xff,0xff, 203, 0, 113, 7]   # ::ffff:203.0.113.7
+    loopback = UInt8[0,0,0,0, 0,0,0,0, 0,0, 0xff,0xff, 127, 0,   0, 1]   # ::ffff:127.0.0.1
+    real_v6  = UInt8[0x20,0x01, 0x0d,0xb8, 0,0,0,0, 0,0,0,0, 0,0,0,0x01] # 2001:db8::1
+    compat   = UInt8[0,0,0,0, 0,0,0,0, 0,0,0,0, 203, 0, 113, 7]          # ::203.0.113.7
+
+    # Four bytes: unchanged, and still the common case.
+    @test Nitro.Core._ipaddr_from_bytes(v4) === Sockets.IPv4("203.0.113.7")
+
+    # Sixteen mapped bytes: demoted. This is the assertion #66 turns on — against the
+    # unpatched code it returns IPv6("::ffff:203.0.113.7") and fails.
+    got = Nitro.Core._ipaddr_from_bytes(mapped)
+    @test got isa Sockets.IPv4
+    @test got === Sockets.IPv4("203.0.113.7")
+
+    # The loopback spelling matters on its own: `trusted_proxies=[ip"127.0.0.1"]` is the
+    # single most common proxy configuration there is.
+    @test Nitro.Core._ipaddr_from_bytes(loopback) === Sockets.IPv4("127.0.0.1")
+
+    # A genuine IPv6 address is untouched.
+    v6 = Nitro.Core._ipaddr_from_bytes(real_v6)
+    @test v6 isa Sockets.IPv6
+    @test v6 === Sockets.IPv6("2001:db8::1")
+
+    # The deprecated IPv4-COMPATIBLE form (`::a.b.c.d`, no `ffff`) is deliberately NOT
+    # demoted — it is not a reliable indicator of an IPv4 peer. `_norm` in
+    # src/middleware/extract_ip.jl refuses it for the same reason; the two must stay in step.
+    compat_addr = Nitro.Core._ipaddr_from_bytes(compat)
+    @test compat_addr isa Sockets.IPv6
+    @test compat_addr === Sockets.IPv6("::203.0.113.7")
+
+    # DRIFT GUARD. #66 deliberately did NOT share one helper between this function and
+    # `_canonical`/`_norm` in src/middleware/extract_ip.jl: Core must not depend upward on a
+    # middleware module for a one-line predicate. The price of that decision is two copies of
+    # the `::ffff:0:0/96` rule, and the only thing keeping them honest is this assertion.
+    # Without it, widening one copy leaves the whole suite green while a direct dual-stack
+    # client and the same host via X-Forwarded-For diverge again — #66, silently reopened.
+    canonical = Nitro.Middleware.ExtractIPMiddleware._canonical
+    for b in (v4, mapped, loopback, real_v6, compat)
+        acc = foldl((a, x) -> (a << 8) | UInt128(x), b; init = UInt128(0))
+        parsed = length(b) == 4 ? Sockets.IPv4(b...) : Sockets.IPv6(acc)
+        @test Nitro.Core._ipaddr_from_bytes(b) === canonical(parsed)
+    end
 end
 
 @testset "HTTP owns getproperty(::Request, ::Symbol), and Nitro does not (#151)" begin

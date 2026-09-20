@@ -34,6 +34,36 @@ function _conn_fd(conn)
     error("Nitro: unrecognized Reseau connection type $(typeof(conn)) — no `:fd` or `:tcp` field")
 end
 
+# The peer address as a Julia value, in ONE canonical spelling per host. Two byte forms of
+# the same IPv4 host reach here: four bytes from an AF_INET socket, and sixteen bytes in the
+# `::ffff:0:0/96` block when a dual-stack AF_INET6 listener reports an IPv4 client. Without
+# demoting the second, one host occupies two `getip`/`getpeerip` values — two access-log
+# spellings, and a split in any application that keys off `getip` (#66). Nitro's own rate
+# limiter was already immune: `_bucket_key` folds the mapped form itself via `_norm`. This
+# closes the gap for everyone else.
+#
+# Demoting HERE, where the OS's bytes first become a Julia value, is what keeps the choice a
+# *representation* decision at the transport boundary rather than a rewrite of an
+# observation. `ExtractIP()` keeps its property of never touching the peer, and
+# `getip == getpeerip` keeps holding when no forwarding header was read — the two things
+# option (b) in #66 would have cost. It is the same rule as `_canonical`/`_norm` in
+# src/middleware/extract_ip.jl, applied one layer earlier and to raw bytes rather than a
+# parsed address; that copy still owns the header-derived half, and the two are deliberately
+# not shared (Core must not depend upward on a middleware module for a one-line predicate).
+# `test/http_internals_contract_tests.jl` asserts the two agree, which is what makes keeping
+# them separate safe.
+#
+# The deprecated IPv4-COMPATIBLE form (`::a.b.c.d`, no `ffff`) is deliberately NOT demoted,
+# matching `_norm`: it is not a reliable indicator of an IPv4 peer.
+function _ipaddr_from_bytes(bytes)::IPAddr
+    length(bytes) == 4 && return IPv4(bytes[1], bytes[2], bytes[3], bytes[4])
+    acc = UInt128(0)
+    for b in bytes
+        acc = (acc << 8) | UInt128(b)
+    end
+    return (acc >> 32) == 0x0000_0000_0000_ffff ? IPv4(UInt32(acc & 0xffff_ffff)) : IPv6(acc)
+end
+
 # HTTP.jl v1's `Sockets.getpeername(::HTTP.Stream)` no longer works in v2 — server streams
 # are not raw sockets. The peer address is reachable through the server connection that v2
 # tracks on the stream (`stream.tracked.conn`, a Reseau `TCP.Conn`/`TLS.Conn`, whose backing
@@ -57,16 +87,7 @@ function _peer_ip(stream::HTTP.Stream)::IPAddr
                   "checks are degraded for affected requests." maxlog=1
             return Sockets.localhost
         end
-        ip = getfield(raddr, :ip)
-        if length(ip) == 4
-            return IPv4(ip[1], ip[2], ip[3], ip[4])
-        else
-            acc = UInt128(0)
-            for b in ip
-                acc = (acc << 8) | UInt128(b)
-            end
-            return IPv6(acc)
-        end
+        return _ipaddr_from_bytes(getfield(raddr, :ip))
     catch err
         @error "Nitro: could not read the peer IP from HTTP stream internals — the " *
                "HTTP.jl/Reseau stream layout `_peer_ip` reaches into may have changed. " *

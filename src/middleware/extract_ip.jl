@@ -146,10 +146,9 @@ rate-limit bucket — rather than letting a client choose its own address.
 
 An address resolved *out of a header* is canonicalized (an IPv4-mapped `::ffff:203.0.113.7`
 becomes `203.0.113.7`), so one host cannot occupy several buckets. The **peer is returned exactly
-as the server observed it** — this function never rewrites what `serve` seeded. On a dual-stack
-listener that means a direct client can be keyed as `::ffff:203.0.113.7` while the same host
-arriving through a proxy is keyed as `203.0.113.7`; they are separate paths into the server, and
-preserving the socket's own spelling keeps `getip` and [`getpeerip`](@ref) agreeing when no
+as the server observed it** — this function never rewrites what `serve` seeded. Since #66 it does
+not need to: `serve` seeds an already-canonical address, so a direct client and the same host
+arriving through a proxy key the same way, and `getip` and [`getpeerip`](@ref) still agree when no
 header was read.
 
 See [`ExtractIP`](@ref) for configuration and [`getpeerip`](@ref) for the preserved socket peer.
@@ -264,6 +263,12 @@ end
 # and `203.0.113.7` are the same host, and `_is_trusted` already treats them as one — without
 # this the *returned* value would still differ, splitting one client across several rate-limit
 # buckets and several access-log spellings.
+#
+# This owns the HEADER-derived half only. The socket peer is canonicalized by
+# `_ipaddr_from_bytes` in src/core/transport.jl, where the OS's bytes become a Julia value (#66);
+# the two are deliberately separate, since Core must not depend upward on this module and the
+# inputs differ (raw bytes vs. a parsed address). Keep the `::ffff:0:0/96` rule below in step
+# with that copy.
 _canonical(a::IPv4) = a
 function _canonical(a::IPv6)
     v6, h = _norm(a)
@@ -274,10 +279,18 @@ _norm(a::IPv4) = (false, UInt128(a.host))
 
 function _norm(a::IPv6)
     h = a.host
-    # ::ffff:0:0/96 — IPv4-mapped. A dual-stack listener reports IPv4 peers this way on some
-    # platforms; without demoting, `trusted_proxies=[ip"127.0.0.1"]` would silently fail to
-    # match a real loopback proxy. The deprecated IPv4-compatible `::a.b.c.d` form is NOT
-    # demoted — it is not a reliable indicator of an IPv4 peer.
+    # ::ffff:0:0/96 — IPv4-mapped. DO NOT DELETE THIS BRANCH. Since #66 the socket peer
+    # arrives already demoted from `_ipaddr_from_bytes` (src/core/transport.jl), so the case
+    # this comment used to cite — a dual-stack listener whose mapped peer failed to match
+    # `trusted_proxies=[ip"127.0.0.1"]` — can no longer arise from the transport. Three live
+    # callers still depend on the fold, and none of them sees a transport-seeded address:
+    #   * `_walk_chain` (:196) — a hop a proxy wrote into X-Forwarded-For as `::ffff:10.0.0.8`;
+    #   * `_parse_prefix` (:368/:379/:387) — a mapped literal or CIDR in `trusted_proxies`;
+    #   * `_resolve` (:171) — a peer a custom middleware wrote with `setip!`.
+    # Removing it would stop `_is_trusted` recognizing a mapped hop, so the walk would fall
+    # back to the proxy's own address and collapse every client behind it into one bucket.
+    # The deprecated IPv4-compatible `::a.b.c.d` form is NOT demoted — it is not a reliable
+    # indicator of an IPv4 peer. Keep this rule in step with `_ipaddr_from_bytes`.
     (h >> 32) == 0x0000_0000_0000_ffff && return (false, h & 0xffff_ffff)
     return (true, h)
 end
