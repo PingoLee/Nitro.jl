@@ -987,6 +987,118 @@ end
     end
 end
 
+@testset "cache policy and streaming threshold (#41)" begin
+    big_dir = mktempdir()
+    write(joinpath(big_dir, "small.txt"), "small")
+    # Comfortably over the threshold used below, and over one 64 KiB write chunk, so the
+    # streaming loop actually iterates rather than completing in a single pass.
+    big_bytes = rand(UInt8, 300_000)
+    write(joinpath(big_dir, "big.bin"), big_bytes)
+
+    @testset "policy validation rejects nonsense rather than silently defaulting" begin
+        MP = Nitro.Core.MountPolicy
+        @test_throws ArgumentError MP(:sometimes, 1024, 1024)
+        @test_throws ArgumentError MP(:eager, -1, 1024)
+        @test_throws ArgumentError MP(:eager, 1024, 0)
+        # The validating constructor must be INNER: an outer method with this signature would be
+        # less specific than the compiler-generated one for `Int` arguments, which is exactly how
+        # it is called, and every check above would be skipped.
+        @test MP(:eager, 1024, 1024) isa MP
+        @test_throws ArgumentError staticfiles(big_dir, "x"; cache = :sometimes)
+    end
+
+    @testset "a file over the threshold is streamed, not held" begin
+        resetstate()
+        try
+            staticfiles(big_dir, "big"; stream_threshold = 100_000)
+            tbl = nothing   # reach the mount table only through behaviour, not internals
+
+            r = internalrequest(HTTP.Request("GET", "/big/big.bin"))
+            @test r.status == 200
+            # The body is a streaming cursor, not a byte buffer -- that IS the observable
+            # difference. Drain it the way the write path does.
+            @test r.body isa HTTP.AbstractBody
+            @test !(r.body isa HTTP.BytesBody)
+            buf = UInt8[]
+            chunk = Vector{UInt8}(undef, 64 * 1024)
+            while !HTTP.body_closed(r.body)
+                n = HTTP.body_read!(r.body, chunk)
+                n == 0 && break
+                append!(buf, @view(chunk[1:n]))
+            end
+            @test buf == big_bytes
+            @test HTTP.header(r, "Content-Length") == string(length(big_bytes))
+
+            # A small file under the same mount is still buffered.
+            s = internalrequest(HTTP.Request("GET", "/big/small.txt"))
+            @test s.status == 200
+            @test !(s.body isa HTTP.AbstractBody) || s.body isa HTTP.BytesBody
+            @test bodystr(s) == "small"
+
+            # A streamed file still answers conditional GETs -- the 304 path carries no body at
+            # all, which is where a leaked handle would otherwise accumulate fastest.
+            etag = HTTP.header(r, "ETag")
+            @test !isempty(etag)
+            for _ in 1:5
+                @test internalrequest(HTTP.Request("GET", "/big/big.bin",
+                                                   ["If-None-Match" => etag])).status == 304
+            end
+        finally
+            resetstate()
+        end
+    end
+
+    @testset "stream_threshold = 0 disables streaming entirely" begin
+        resetstate()
+        try
+            staticfiles(big_dir, "big"; stream_threshold = 0)
+            r = internalrequest(HTTP.Request("GET", "/big/big.bin"))
+            @test r.status == 200
+            @test !(r.body isa HTTP.AbstractBody) || r.body isa HTTP.BytesBody
+        finally
+            resetstate()
+        end
+    end
+
+    @testset ":lazy reads on first request and serves the same bytes thereafter" begin
+        resetstate()
+        try
+            # A budget smaller than the mount forces eviction, which is the case a count-based
+            # bound would get wrong and a byte-based one gets right.
+            staticfiles(big_dir, "big"; cache = :lazy, stream_threshold = 0,
+                        cache_max_bytes = 128 * 1024)
+            for _ in 1:3
+                @test bodystr(internalrequest(HTTP.Request("GET", "/big/small.txt"))) == "small"
+                r = internalrequest(HTTP.Request("GET", "/big/big.bin"))
+                @test r.status == 200
+                @test length(r.body) == length(big_bytes)
+            end
+        finally
+            resetstate()
+        end
+    end
+
+    @testset ":none re-reads content, like dynamicfiles" begin
+        d = mktempdir()
+        f = joinpath(d, "changing.txt")
+        write(f, "first")
+        resetstate()
+        try
+            staticfiles(d, "s"; cache = :none)
+            @test bodystr(internalrequest(HTTP.Request("GET", "/s/changing.txt"))) == "first"
+            write(f, "second")
+            @test bodystr(internalrequest(HTTP.Request("GET", "/s/changing.txt"))) == "second"
+            # :eager is the opposite, and still the default -- the mount serves its snapshot.
+            resetstate()
+            staticfiles(d, "e")
+            write(f, "third")
+            @test bodystr(internalrequest(HTTP.Request("GET", "/e/changing.txt"))) == "second"
+        finally
+            resetstate()
+        end
+    end
+end
+
 @testset "include_hidden=true is a real opt-in" begin
     resetstate()
     try

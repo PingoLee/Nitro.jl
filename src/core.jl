@@ -11,6 +11,7 @@ using Base
 using Dates
 using Reexport
 using DataStructures: CircularDeque
+using LRUCache: LRU
 import Base.Threads: lock, nthreads
 import ..has_revise_hooks, ..revise_hooks
 

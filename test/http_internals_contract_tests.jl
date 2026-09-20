@@ -128,6 +128,21 @@ end
         @test isdefined(HTTP, sym)
     end
 
+    # `Res.adopt_stream_io!` sets `owns_io` so a streamed body releases the file handle when it is
+    # drained -- the job HTTP's own `servefile` does through a private `_finalize_servefile_source!`.
+    # It is written with `hasfield` so it does not name the private body type, which means a rename
+    # upstream would make it degrade SILENTLY into an unbounded descriptor leak rather than fail.
+    # This is the assertion that makes that loud instead.
+    let io = IOBuffer(Vector{UInt8}("streamed"))
+        streamed = HTTP.servecontent(HTTP.Request("GET", "/x"), io; name = "x.bin")
+        @test streamed.body isa HTTP.AbstractBody
+        @test !(streamed.body isa HTTP.BytesBody)          # a cursor, not a buffer
+        @test hasfield(typeof(streamed.body), :owns_io)
+        @test streamed.body.owns_io === false              # servecontent does NOT claim it
+        Nitro.Res.adopt_stream_io!(streamed, io)
+        @test streamed.body.owns_io === true               # ... and we do
+    end
+
     # The two outcomes the mount handler relies on, end to end.
     src = Vector{UInt8}("hello")
     etag = "\"v1\""

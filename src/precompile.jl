@@ -68,6 +68,45 @@ using PrecompileTools
     # `catch_errors=false` nothing is thrown.
     Core.internalrequest(ctx, Request("GET", "/precompile/missing"); catch_errors=false)
 
+    # ── A static mount, end to end ──────────────────────────────────────────────
+    #
+    # Nothing above touches the file-serving stack at all (#41): not `mountable_files`, not
+    # `mountfolder`, not `_route_encode`, not `mount_remainder`, not `servecontent`, and not the
+    # router's `doublestar` branch — a mount is the only thing in Nitro that registers a `**`
+    # route. A server whose main job is serving an SPA therefore paid full JIT latency on the very
+    # first asset request, which is the *first page load*, after a package that was precompiled.
+    #
+    # This is cheap to warm because it goes through `internalrequest`, exactly like every block
+    # above: no socket, no live-server round trip (see the NOTE at the end for why that stays out).
+    #
+    # The temp directory is created and removed INSIDE the workload. `@compile_workload` bodies run
+    # in the precompile worker, which is the sanctioned place for this — a top-level `mktempdir`
+    # would be a module-body side effect that never runs again when the cache is loaded.
+    mktempdir() do dir
+        write(joinpath(dir, "index.html"), "<!doctype html><title>precompile</title>")
+        write(joinpath(dir, "app.js"), "console.log(1)")
+        # A name that needs percent-encoding, so `_route_encode` and the decode side of
+        # `mount_remainder` are both compiled rather than only the ASCII-clean fast paths.
+        write(joinpath(dir, "café.txt"), "accented")
+
+        staticfiles(ctx, dir, "precompile-static")
+        # A hit, the bare mount route, an encoded name, and a miss — the four branches the mount
+        # handler has.
+        Core.internalrequest(ctx, Request("GET", "/precompile-static/app.js"); catch_errors=false)
+        Core.internalrequest(ctx, Request("GET", "/precompile-static"); catch_errors=false)
+        Core.internalrequest(ctx, Request("GET", "/precompile-static/caf%C3%A9.txt"); catch_errors=false)
+        Core.internalrequest(ctx, Request("GET", "/precompile-static/none.txt"); catch_errors=false)
+        # The conditional-GET short circuit (#40): a different `servecontent` exit than the 200s
+        # above, and the one a warm client actually takes.
+        Core.internalrequest(ctx, Request("GET", "/precompile-static/app.js",
+                                          ["If-None-Match" => "W/\"x\""]); catch_errors=false)
+
+        # `spafiles` shares the handler but takes the fallback branch, which is an SPA server's
+        # hot path.
+        spafiles(ctx, dir, "precompile-spa")
+        Core.internalrequest(ctx, Request("GET", "/precompile-spa/deep/link"); catch_errors=false)
+    end
+
     # NOTE: a live-server round-trip (serve! + loopback HTTP.get) is intentionally NOT added
     # here. As of HTTP 2.3.0 / Reseau 1.3.1 it no longer hangs precompilation (the earlier
     # precompile-context Reseau loopback deadlock is fixed), but it gives no benefit: the

@@ -101,6 +101,31 @@ function file_validators(path::AbstractString; etag = :weak_stat, bytes = nothin
 end
 
 """
+    adopt_stream_io!(response, io) -> response
+
+Hand ownership of `io` to a streaming response body, or close it when there is no body.
+
+`HTTP.servecontent(req, ::IO)` builds its streaming body with `owns_io = false`, because it does
+not know whether the caller wants the handle back. HTTP's own `servefile` then claims it through a
+private helper; this is that step, done without naming the private body type — the field is set
+only if it exists, which is exactly the condition under which a body will be drained.
+
+**The `else` branch is not defensive padding.** A `304`, `412` or `416` carries *no* body, so
+nothing will ever drain it and the handle would leak until finalization. Under load that is an
+unbounded file-descriptor leak in precisely the common case: a client that already has the file
+cached.
+"""
+function adopt_stream_io!(response::HTTP.Response, io::IO)
+    body = response.body
+    if body isa HTTP.AbstractBody && hasfield(typeof(body), :owns_io)
+        body.owns_io = true
+    else
+        close(io)
+    end
+    return response
+end
+
+"""
     json(data; status=200, headers=[])
 
 Return an HTTP.Response with the provided data serialized to JSON and the Content-Type header set to application/json.
@@ -232,9 +257,14 @@ preconditions call for it.
 | `cache_control` | emitted verbatim when given. **No default**: a `max-age` guessed on your behalf is wrong more often than it is right |
 | `allow_ranges` | `false` suppresses `Accept-Ranges` and serves the whole body |
 | `loadfile` | as in [`file(path)`](@ref) — decides the body, and therefore the validators |
+| `stream` | `true` sends the file in 64 KiB chunks — peak memory is a buffer, not the file |
 
-The body is read whole. Bounded-memory streaming for large files is
-[#41](https://github.com/PingoLee/Nitro.jl/issues/41).
+**`stream = true` is what makes a large download safe.** Without it the whole file is read into
+memory before the first byte goes out, so N concurrent downloads of an N-gigabyte file need N×
+that resident. With it, memory is bounded by the chunk buffer regardless of file size or
+concurrency. The trade is that a streamed response is **single-use** — it is a cursor over an open
+file, not a buffer — so it can never be cached or shared, and `etag = :strong` is refused because
+hashing the body would mean reading all of it, which is the thing being avoided.
 
 `Content-Disposition` is opt-in exactly as in [`file(path)`](@ref), and caller `headers` are
 applied last so they override anything computed here.
@@ -253,7 +283,14 @@ end)
 function file(req::HTTP.Request, path::String; headers::Vector=[], filename=nothing,
               disposition::Union{Nothing,String}=nothing, loadfile=nothing,
               etag = :weak_stat, cache_control::Union{Nothing,AbstractString}=nothing,
-              allow_ranges::Bool=true)
+              allow_ranges::Bool=true, stream::Bool=false)
+    if stream && !isnothing(loadfile)
+        throw(ArgumentError("Res.file: `stream=true` and `loadfile` are mutually exclusive — `loadfile` produces the whole body in memory, which is what streaming avoids"))
+    end
+    if stream && etag === :strong
+        throw(ArgumentError("Res.file: `stream=true` and `etag=:strong` are mutually exclusive — a strong tag hashes the whole body, which is what streaming avoids. Use `:weak_stat`, or pass a tag you computed yourself"))
+    end
+
     extra = Vector{Pair{String,String}}()
     if !isnothing(cache_control)
         push!(extra, "Cache-Control" => String(cache_control))
@@ -265,6 +302,21 @@ function file(req::HTTP.Request, path::String; headers::Vector=[], filename=noth
         resolved_filename = isnothing(filename) ? basename(path) : filename
         push!(extra, "Content-Disposition" =>
             content_disposition(resolved_filename, something(wanted, "attachment")))
+    end
+
+    if stream
+        io = open(path, "r")
+        try
+            tag, modtime = file_validators(path; etag = etag)
+            resp = HTTP.servecontent(req, io; name = basename(path), modtime = modtime,
+                                     content_type = file_content_type(path), etag = tag,
+                                     headers = extra, allow_ranges = allow_ranges)
+            adopt_stream_io!(resp, io)
+            return apply_headers!(resp, headers)
+        catch
+            close(io)
+            rethrow()
+        end
     end
 
     body = isnothing(loadfile) ? read(path) : loadfile(path)

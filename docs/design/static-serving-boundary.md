@@ -485,7 +485,54 @@ its own headers, so the mount caches *bytes* and builds the response per request
 shared-`Response`-object pattern from the static path entirely, and with it any exposure to HTTP
 2.7's new spent-body check — a fresh `BytesBody` per request is never spent.
 
-## 11. See also
+## 11. Memory: a cache policy and a streaming threshold
+
+[#41](https://github.com/PingoLee/Nitro.jl/issues/41). §4 said `staticfiles` "reads every mounted
+file into memory at startup and holds it for process lifetime … acceptable for development and
+wasteful in production", and left it there. It is now bounded from both ends.
+
+**Above `stream_threshold` (8 MiB by default) a file is streamed, whatever the cache policy says.**
+`HTTP.servecontent` with a seekable `IO` produces a body Nitro's write path drains in 64 KiB chunks,
+so peak memory is a buffer rather than the file — for one request *and* for a hundred concurrent
+ones. The old shape was quadratic in the wrong place: the mount held the bytes, and `Res.file` then
+materialised the whole body again per response, so N concurrent downloads of an N-gigabyte file cost
+N× that resident on top of the mount's own copy. There is no cache policy under which buffering a
+2 GB file per request is right, which is why the threshold overrides the policy rather than being
+one of its settings.
+
+**Below it, `cache` chooses where the bytes come from:** `:eager` (the default, and the historical
+behaviour) reads at mount time; `:lazy` reads on first request into an LRU bounded by a **byte
+budget**, so memory tracks the working set rather than the folder; `:none` reads per request, which
+is what `dynamicfiles` has always done. The budget is bytes and not an entry count because 200 icons
+and 200 videos are not the same working set — a count-based bound is a bound on nothing.
+
+**Streaming is where consuming the body is correct**, and it is the one place in Nitro that is true.
+Everything in nitro-core §4 exists so a `Response` can be written repeatedly; a streamed body is a
+cursor over an open file, so reading it *is* sending it and a second send would truncate. That is
+not a violation of §4 — it is why §4 is phrased about **shared** responses. A streamed response can
+never be cached or shared, and HTTP 2.7's `_check_response_body_unsent` enforces that with a 500
+rather than a silent truncation.
+
+Two consequences worth stating, because both are places a plausible implementation leaks:
+
+- **The handle must be adopted.** `servecontent` builds its IO body with `owns_io = false`, so
+  without `Res.adopt_stream_io!` nothing ever closes the file. HTTP's own `servefile` does the same
+  step through a private helper.
+- **A `304`, `412` or `416` carries no body at all**, so nothing will drain it and the handle must
+  be closed directly. That is the *cheapest* request a client can make and the one a warm client
+  makes constantly, so getting it wrong leaks descriptors fastest under exactly the load the cache
+  is supposed to make cheap.
+
+**`etag = :strong` and streaming are mutually exclusive**, and refused rather than silently
+downgraded: hashing the body means reading all of it, which is the thing the threshold exists to
+avoid. A mount that asks for both logs the downgrade and uses the weak tag.
+
+**The precompile workload now covers this path.** It previously exercised only `Res.json`-shaped
+handlers, so `mountable_files`, `mountfolder`, `_route_encode`, `mount_remainder`, `servecontent`
+and the router's `doublestar` branch were all compiled on the **first asset request** — which, for
+an SPA server, is the first page load.
+
+## 12. See also
 
 - [`docs/src/tutorial/reverse_proxy.md`](../src/tutorial/reverse_proxy.md) — the user-facing guide,
   including client-IP trust configuration and worked nginx/Caddy configs

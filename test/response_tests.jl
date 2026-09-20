@@ -341,12 +341,21 @@ const BODY_TEXT = "héllo — wörld ✓"
 # One key on purpose: with two, `JSON.json` ordering would make the expected string flaky.
 const BODY_JSON = Dict("gruß" => "wörld")
 
+# Several 64 KiB write chunks, so the streaming loop in `_write_response_body!` actually
+# iterates. Random bytes rather than a repeated pattern: a truncated or duplicated chunk would
+# survive an equality check against a compressible fixture far too easily.
+const STREAM_BYTES = rand(UInt8, 300_000)
+const STREAM_PATH  = joinpath(mktempdir(), "big.bin")
+write(STREAM_PATH, STREAM_BYTES)
+
 ctx = App()
 Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
     path("/page",  (req::HTTP.Request) -> Res.html(BODY_HTML)),
     path("/plain", (req::HTTP.Request) -> Res.send(BODY_TEXT)),
     path("/sheet", (req::HTTP.Request) -> Res.send(BODY_TEXT; content_type = "text/css; charset=utf-8")),
     path("/data",  (req::HTTP.Request) -> Res.json(BODY_JSON)),
+    path("/stream", (req::HTTP.Request) -> Res.file(req, STREAM_PATH; stream = true)),
+    path("/buffered", (req::HTTP.Request) -> Res.file(req, STREAM_PATH)),
 ])
 
 port = get_free_port()
@@ -369,6 +378,46 @@ try
             @test HTTP.header(r, "Content-Length") == string(sizeof(expected))
             @test String(r.body) == expected
         end
+    end
+
+    @testset "a streamed body reaches the client whole (#41)" begin
+        # This is the ONLY coverage of `_write_response_body!(::HTTP.Stream, ::HTTP.AbstractBody)`,
+        # and it has to be over a socket: in-process, `internalrequest` never reaches the write
+        # path at all, so a chunking bug there is invisible to every other assertion in the suite.
+        r = HTTP.get("http://$HOST:$port/stream")
+        @test r.status == 200
+        @test r.body == STREAM_BYTES
+        @test HTTP.header(r, "Content-Length") == string(length(STREAM_BYTES))
+        @test HTTP.header(r, "Accept-Ranges") == "bytes"
+
+        # Byte-identical to the buffered path -- the transport must not be observable in the body.
+        @test HTTP.get("http://$HOST:$port/buffered").body == STREAM_BYTES
+
+        # A streamed body is a CURSOR and is single-use, so each request must open its own. Three
+        # in a row catches a body accidentally shared across requests, which would truncate the
+        # second one, and a handle that is never released.
+        for _ in 1:3
+            @test HTTP.get("http://$HOST:$port/stream").body == STREAM_BYTES
+        end
+
+        etag = HTTP.header(r, "ETag")
+        @test !isempty(etag)
+        cached = HTTP.get("http://$HOST:$port/stream", ["If-None-Match" => etag];
+                          status_exception = false)
+        @test cached.status == 304
+        @test isempty(cached.body)
+
+        ranged = HTTP.get("http://$HOST:$port/stream", ["Range" => "bytes=1000-1099"];
+                          status_exception = false)
+        @test ranged.status == 206
+        @test ranged.body == STREAM_BYTES[1001:1100]
+
+        # Interleave 304s (no body at all) with full downloads: if `adopt_stream_io!` failed to
+        # close the handle on the bodyless path, this is where descriptors would pile up.
+        for _ in 1:10
+            HTTP.get("http://$HOST:$port/stream", ["If-None-Match" => etag]; status_exception = false)
+        end
+        @test HTTP.get("http://$HOST:$port/stream").body == STREAM_BYTES
     end
 finally
     Nitro.Core.terminate(ctx)

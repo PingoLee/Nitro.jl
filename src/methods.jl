@@ -163,8 +163,11 @@ staticfiles(
     include_hidden::Bool=false,
     allow_symlink_escape::Bool=false,
     etag = :weak_stat,
-    cache_control::Union{Nothing,AbstractString}=nothing
-) = Nitro.Core.staticfiles(CONTEXT[], CONTEXT[].service.router, folder, mountdir; headers, loadfile, include_hidden, allow_symlink_escape, etag, cache_control)
+    cache_control::Union{Nothing,AbstractString}=nothing,
+    cache::Symbol=:eager,
+    stream_threshold::Integer=Nitro.Core.MOUNT_STREAM_THRESHOLD,
+    cache_max_bytes::Integer=Nitro.Core.MOUNT_CACHE_MAX_BYTES
+) = Nitro.Core.staticfiles(CONTEXT[], CONTEXT[].service.router, folder, mountdir; headers, loadfile, include_hidden, allow_symlink_escape, etag, cache_control, cache, stream_threshold, cache_max_bytes)
 
 
 """
@@ -221,8 +224,11 @@ spafiles(
     include_hidden::Bool=false,
     allow_symlink_escape::Bool=false,
     etag = :weak_stat,
-    cache_control::Union{Nothing,AbstractString}=nothing
-) = Nitro.Core.spafiles(CONTEXT[], CONTEXT[].service.router, folder, mountdir; headers, loadfile, include_hidden, allow_symlink_escape, etag, cache_control)
+    cache_control::Union{Nothing,AbstractString}=nothing,
+    cache::Symbol=:eager,
+    stream_threshold::Integer=Nitro.Core.MOUNT_STREAM_THRESHOLD,
+    cache_max_bytes::Integer=Nitro.Core.MOUNT_CACHE_MAX_BYTES
+) = Nitro.Core.spafiles(CONTEXT[], CONTEXT[].service.router, folder, mountdir; headers, loadfile, include_hidden, allow_symlink_escape, etag, cache_control, cache, stream_threshold, cache_max_bytes)
 
 
 """
@@ -273,8 +279,11 @@ dynamicfiles(
     include_hidden::Bool=false,
     allow_symlink_escape::Bool=false,
     etag = :weak_stat,
-    cache_control::Union{Nothing,AbstractString}=nothing
-) = Nitro.Core.dynamicfiles(CONTEXT[], CONTEXT[].service.router, folder, mountdir; headers, loadfile, include_hidden, allow_symlink_escape, etag, cache_control)
+    cache_control::Union{Nothing,AbstractString}=nothing,
+    cache::Symbol=:none,
+    stream_threshold::Integer=Nitro.Core.MOUNT_STREAM_THRESHOLD,
+    cache_max_bytes::Integer=Nitro.Core.MOUNT_CACHE_MAX_BYTES
+) = Nitro.Core.dynamicfiles(CONTEXT[], CONTEXT[].service.router, folder, mountdir; headers, loadfile, include_hidden, allow_symlink_escape, etag, cache_control, cache, stream_threshold, cache_max_bytes)
 
 """
     getexternalurl()

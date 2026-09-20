@@ -75,31 +75,92 @@ function _lookup_mount(table::Dict{String,V}, target::AbstractString, n_prefix::
     return get(table, key, nothing)
 end
 
+# Default size above which a mounted file is STREAMED rather than held in memory (#41).
+#
+# `staticfiles` used to read every mounted file at startup and hold it for the process lifetime,
+# with no cap: a folder holding a 500 MB video pinned 500 MB resident whether or not anything ever
+# asked for it, and `Res.file` then materialised the whole body again per response, so N concurrent
+# downloads cost N × filesize. 8 MiB is comfortably above any realistic SPA bundle — which is the
+# case the capture exists to make fast — and far below the sizes where holding the bytes is the
+# problem rather than the solution.
+const MOUNT_STREAM_THRESHOLD = 8 * 1024 * 1024
+
+# Default budget for `cache = :lazy`. Bytes, across the whole mount.
+const MOUNT_CACHE_MAX_BYTES = 64 * 1024 * 1024
+
+# How a mount decides where a file's bytes come from.
+#
+# `:eager`  — read at mount time and hold for the process lifetime. The historical behaviour, and
+#             still the default: a dev server should serve its bundle from RAM.
+# `:lazy`   — read on first request into a size-bounded LRU. Memory tracks the WORKING SET rather
+#             than the folder, which is what #41 asked for: mounting a large media directory no
+#             longer costs its full size at startup just in case.
+# `:none`   — read per request, never held. What `dynamicfiles` has always done.
+#
+# Files over `stream_threshold` are streamed regardless of policy — there is no cache policy under
+# which buffering a 2 GB file per concurrent request is the right answer.
+struct MountPolicy
+    cache::Symbol
+    stream_threshold::Int
+    cache_max_bytes::Int
+
+    # INNER constructor, so it replaces the default one rather than competing with it. An outer
+    # method with this signature would be *less* specific than the compiler-generated
+    # `MountPolicy(::Symbol, ::Int, ::Int)` for `Int` arguments — which is exactly how it would be
+    # called — so every validation below would be silently skipped.
+    function MountPolicy(cache::Symbol, stream_threshold::Integer, cache_max_bytes::Integer)
+        cache in (:eager, :lazy, :none) ||
+            throw(ArgumentError("static mount: `cache` must be :eager, :lazy or :none — got $(repr(cache))"))
+        stream_threshold >= 0 || throw(ArgumentError("static mount: `stream_threshold` must be >= 0, got $stream_threshold"))
+        cache_max_bytes  >  0 || throw(ArgumentError("static mount: `cache_max_bytes` must be > 0, got $cache_max_bytes"))
+        return new(cache, Int(stream_threshold), Int(cache_max_bytes))
+    end
+end
+
+# The read-through cache for `:lazy`, or `nothing` for the policies that do not have one.
+#
+# `by = sizeof` makes the bound a BYTE budget rather than an entry count, which is the only bound
+# that means anything here: 200 icons and 200 videos are not the same working set. LRUCache's own
+# lock makes concurrent `get!` safe, which matters because every request runs on its own thread.
+_mount_cache(policy::MountPolicy) =
+    policy.cache === :lazy ?
+        LRU{String,Vector{UInt8}}(maxsize = policy.cache_max_bytes, by = sizeof) : nothing
+
 # One mounted file, with everything a response needs precomputed at mount time.
 #
-# `bytes` is the snapshot `staticfiles`/`spafiles` capture; `dynamicfiles` leaves it `nothing` and
-# re-reads per request. The validators and content type are computed once either way, because a
-# mount's answer to "what is this file" does not change between requests — which files exist is
-# decided at mount time and stays decided (docs/design/static-serving-boundary.md §6).
+# The validators and content type are computed once, because a mount's answer to "what is this
+# file" does not change between requests — which files exist is decided at mount time and stays
+# decided (docs/design/static-serving-boundary.md §6). `bytes` is the eager snapshot; `stream` is
+# fixed at mount time too, from the file's size against the policy.
 struct MountedFile
     path::String
     bytes::Nullable{Vector{UInt8}}
     etag::Nullable{String}
     modtime::Nullable{DateTime}
     content_type::String
+    stream::Bool
 end
 
-function MountedFile(path::String; capture::Bool, etag, loadfile)
-    body = if !capture
-        nothing
-    elseif isnothing(loadfile)
-        read(path)
-    else
-        raw = loadfile(path)
-        raw isa Vector{UInt8} ? raw : Vector{UInt8}(codeunits(raw))
+function MountedFile(path::String, policy::MountPolicy; etag, loadfile)
+    # `loadfile` decides the body, so its result cannot be streamed from disk and its size is not
+    # the file's size. Such a mount keeps the old read-it-all behaviour.
+    streamed = isnothing(loadfile) && policy.stream_threshold > 0 &&
+               filesize(path) > policy.stream_threshold
+    body = (streamed || policy.cache !== :eager) ? nothing : _read_mount(path, loadfile)
+    # A strong tag over a streamed file would mean hashing every byte at mount — exactly the whole
+    # -file read the threshold exists to avoid. Fall back to the weak one and say so.
+    effective_etag = (streamed && etag === :strong) ? :weak_stat : etag
+    if streamed && etag === :strong
+        @info "mountfolder: using a weak ETag for a streamed file; a strong tag would hash it whole" path=basename(path) size=filesize(path)
     end
-    tag, modtime = Res.file_validators(path; etag = etag, bytes = body)
-    return MountedFile(path, body, tag, modtime, Res.file_content_type(path))
+    tag, modtime = Res.file_validators(path; etag = effective_etag, bytes = body)
+    return MountedFile(path, body, tag, modtime, Res.file_content_type(path), streamed)
+end
+
+function _read_mount(path::String, loadfile)
+    isnothing(loadfile) && return read(path)
+    raw = loadfile(path)
+    return raw isa Vector{UInt8} ? raw : Vector{UInt8}(codeunits(raw))
 end
 
 # Build the response for one mounted file, for THIS request.
@@ -109,17 +170,36 @@ end
 # decides that, and it is HTTP.jl public API precisely so callers do not re-derive the precondition
 # table — weak-versus-strong tag comparison and the order the four preconditions are evaluated in
 # are both easy to get plausibly wrong.
-function _serve_mounted(req::HTTP.Request, mf::MountedFile, headers::Vector, loadfile, cache_control)
-    source = if mf.bytes !== nothing
-        mf.bytes
-    elseif isnothing(loadfile)
-        read(mf.path)
-    else
-        raw = loadfile(mf.path)
-        raw isa Vector{UInt8} ? raw : Vector{UInt8}(codeunits(raw))
-    end
+function _serve_mounted(req::HTTP.Request, mf::MountedFile, policy::MountPolicy, cache,
+                        headers::Vector, loadfile, cache_control)
     extra = isnothing(cache_control) ? Pair{String,String}[] :
             Pair{String,String}["Cache-Control" => String(cache_control)]
+
+    if mf.stream
+        # Peak memory is one chunk buffer, not the file. The body is a cursor over an open handle
+        # and is therefore single-use — which is why a streamed file is never cached, and why
+        # `adopt_stream_io!` must hand the handle over (or close it when a 304/416 carries no body
+        # at all, or the descriptor leaks on exactly the cheapest request).
+        io = open(mf.path, "r")
+        try
+            resp = HTTP.servecontent(req, io; name = basename(mf.path), modtime = mf.modtime,
+                                     content_type = mf.content_type, etag = mf.etag,
+                                     headers = extra)
+            Res.adopt_stream_io!(resp, io)
+            return Res.apply_headers!(resp, headers)
+        catch
+            close(io)
+            rethrow()
+        end
+    end
+
+    source = if mf.bytes !== nothing
+        mf.bytes
+    elseif cache !== nothing
+        get!(() -> _read_mount(mf.path, loadfile), cache, mf.path)
+    else
+        _read_mount(mf.path, loadfile)
+    end
     resp = HTTP.servecontent(req, source; name = basename(mf.path), modtime = mf.modtime,
                              content_type = mf.content_type, etag = mf.etag, headers = extra)
     return Res.apply_headers!(resp, headers)
@@ -136,14 +216,19 @@ function staticfiles(
     allow_symlink_escape::Bool=false,
     etag = :weak_stat,
     cache_control::Union{Nothing,AbstractString}=nothing,
+    cache::Symbol=:eager,
+    stream_threshold::Integer=MOUNT_STREAM_THRESHOLD,
+    cache_max_bytes::Integer=MOUNT_CACHE_MAX_BYTES,
 )
-    files = Dict{String,String}()
-    table = Dict{String,MountedFile}()
+    files  = Dict{String,String}()
+    table  = Dict{String,MountedFile}()
+    policy = MountPolicy(cache, stream_threshold, cache_max_bytes)
+    lru    = _mount_cache(policy)
 
     # The bytes are captured now, so the file this mount serves cannot change on disk afterwards.
     function addroute(_route, filepath, key)
         _table_insert!(files, key, filepath)
-        table[key] = MountedFile(filepath; capture = true, etag = etag, loadfile = loadfile)
+        table[key] = MountedFile(filepath, policy; etag = etag, loadfile = loadfile)
         return nothing
     end
     mounted = mountfolder(folder, mountdir, addroute; include_hidden, allow_symlink_escape)
@@ -159,7 +244,7 @@ function staticfiles(
     handler = function (req::HTTP.Request)
         mf = _lookup_mount(table, req.target, nprefix)
         mf === nothing && return notfound(req)
-        return _serve_mounted(req, mf, headers, loadfile, cache_control)
+        return _serve_mounted(req, mf, policy, lru, headers, loadfile, cache_control)
     end
     _register_mount(ctx, router, segments, handler; bare = haskey(files, ""))
 
@@ -177,13 +262,18 @@ function spafiles(
     allow_symlink_escape::Bool=false,
     etag = :weak_stat,
     cache_control::Union{Nothing,AbstractString}=nothing,
+    cache::Symbol=:eager,
+    stream_threshold::Integer=MOUNT_STREAM_THRESHOLD,
+    cache_max_bytes::Integer=MOUNT_CACHE_MAX_BYTES,
 )
-    files = Dict{String,String}()
-    table = Dict{String,MountedFile}()
+    files  = Dict{String,String}()
+    table  = Dict{String,MountedFile}()
+    policy = MountPolicy(cache, stream_threshold, cache_max_bytes)
+    lru    = _mount_cache(policy)
 
     function addroute(_route, filepath, key)
         _table_insert!(files, key, filepath)
-        table[key] = MountedFile(filepath; capture = true, etag = etag, loadfile = loadfile)
+        table[key] = MountedFile(filepath, policy; etag = etag, loadfile = loadfile)
         return nothing
     end
     mounted = mountfolder(folder, mountdir, addroute; include_hidden, allow_symlink_escape)
@@ -218,7 +308,7 @@ function spafiles(
         function (req::HTTP.Request)
             mf = _lookup_mount(table, req.target, nprefix)
             mf === nothing && return notfound(req)
-            return _serve_mounted(req, mf, headers, loadfile, cache_control)
+            return _serve_mounted(req, mf, policy, lru, headers, loadfile, cache_control)
         end
     else
         # Bind the index's `MountedFile` outside the closure. The history fallback is an SPA
@@ -228,7 +318,7 @@ function spafiles(
         # and therefore the same 304 behaviour as the direct route: a client that has the shell
         # cached revalidates a deep link with a 304 instead of refetching it.
         index_path = last(mounted[index_idx])
-        index_mf   = MountedFile(index_path; capture = true, etag = etag, loadfile = loadfile)
+        index_mf   = MountedFile(index_path, policy; etag = etag, loadfile = loadfile)
         function (req::HTTP.Request)
             mf = _lookup_mount(table, req.target, nprefix)
             # A miss — or an unnameable path (`..`, an encoded separator) — is a client asking for
@@ -236,7 +326,7 @@ function spafiles(
             # route, so it gets the shell, matching `try_files $uri /index.html`, which does not
             # inspect the path either.
             target = mf === nothing ? index_mf : mf
-            return _serve_mounted(req, target, headers, loadfile, cache_control)
+            return _serve_mounted(req, target, policy, lru, headers, loadfile, cache_control)
         end
     end
     _register_mount(ctx, router, segments, handler; bare = haskey(files, ""))
@@ -257,18 +347,23 @@ function dynamicfiles(
     allow_symlink_escape::Bool=false,
     etag = :weak_stat,
     cache_control::Union{Nothing,AbstractString}=nothing,
+    cache::Symbol=:none,
+    stream_threshold::Integer=MOUNT_STREAM_THRESHOLD,
+    cache_max_bytes::Integer=MOUNT_CACHE_MAX_BYTES,
 )
     # Which files exist here is decided once, at mount time. Serving a directory whose contents an
     # attacker can change is out of scope for this layer — see docs/design/static-serving-boundary.md.
-    files = Dict{String,String}()
-    table = Dict{String,MountedFile}()
+    files  = Dict{String,String}()
+    table  = Dict{String,MountedFile}()
+    policy = MountPolicy(cache, stream_threshold, cache_max_bytes)
+    lru    = _mount_cache(policy)
     function addroute(_route, filepath, key)
         _table_insert!(files, key, filepath)
-        # `capture = false`: the CONTENT is re-read per request, which is the whole point of this
-        # mount. The validators are still computed at mount time, as everywhere else — they
-        # describe the snapshot the mount decided on, and re-`stat`ing per request is the
+        # `cache = :none` by default here: the CONTENT is re-read per request, which is the whole
+        # point of this mount. The validators are still computed at mount time, as everywhere else
+        # — they describe the snapshot the mount decided on, and re-`stat`ing per request is the
         # per-request filesystem work §6 removed on purpose.
-        table[key] = MountedFile(filepath; capture = false, etag = etag, loadfile = loadfile)
+        table[key] = MountedFile(filepath, policy; etag = etag, loadfile = loadfile)
         return nothing
     end
     mounted = mountfolder(folder, mountdir, addroute; include_hidden, allow_symlink_escape)
@@ -280,7 +375,7 @@ function dynamicfiles(
     handler = function (req::HTTP.Request)
         mf = _lookup_mount(table, req.target, nprefix)
         mf === nothing && return notfound(req)
-        return _serve_mounted(req, mf, headers, loadfile, cache_control)
+        return _serve_mounted(req, mf, policy, lru, headers, loadfile, cache_control)
     end
     _register_mount(ctx, router, segments, handler; bare = haskey(files, ""))
 
