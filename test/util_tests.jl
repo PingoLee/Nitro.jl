@@ -2,7 +2,7 @@
 using Test
 using UUIDs
 using Nitro.Core.Util
-using Nitro.Core.Util: mount_segments, mount_route, _route_encode
+using Nitro.Core.Util: mount_segments, mount_route, _route_encode, mount_remainder
 using Nitro.Core: serverwelcome
 using Nitro: ValidationError
 using Nitro.Core.Errors: cause_report   # unexported on purpose — see src/errors.jl
@@ -468,6 +468,89 @@ end
         route = mount_route(vcat(mount_segments(md), "app.js"))
         @test !occursin("//", route)
         @test startswith(route, "/")
+    end
+end
+
+@testset "mount_remainder decodes the request into a mount key (#221)" begin
+    # The request side of the mount. `mount_route`/`_route_encode` above build the URL a mount
+    # EMITS; this turns the URL a client SENDS back into the raw, `/`-separated, mount-relative
+    # key `mountfolder` tabled the file under. The two are different alphabets on purpose.
+
+    @testset "the prefix is dropped, the remainder decoded exactly once" begin
+        @test mount_remainder("/static/app.js", 1) == "app.js"
+        @test mount_remainder("/static/sub/nested.txt", 1) == "sub/nested.txt"
+        @test mount_remainder("/a/b/app.js", 2) == "app.js"
+        @test mount_remainder("/app.js", 0) == "app.js"          # root mount
+
+        # Decoded ONCE -- never twice. `%2520` is the encoding of the literal text "%20", so it
+        # must decode to "%20" and stop. A second pass would turn it into a space and make one
+        # URL name two different files, which is the collision `_route_encode` avoids by being
+        # injective (#121).
+        @test mount_remainder("/static/caf%C3%A9.txt", 1) == "café.txt"
+        @test mount_remainder("/static/my%20file.txt", 1) == "my file.txt"
+        @test mount_remainder("/static/my%2520file.txt", 1) == "my%20file.txt"
+        @test mount_remainder("/static/100%25.txt", 1) == "100%.txt"
+
+        # Both spellings of a name that needs encoding reach the SAME key. This is the property
+        # per-file registration could not have -- the router compares bytes, so the encoded and
+        # raw routes were disjoint strings and #101/#121 each had to pick one client to serve.
+        @test mount_remainder("/static/café.txt", 1) == mount_remainder("/static/caf%C3%A9.txt", 1)
+    end
+
+    @testset "a target that stops at the prefix is the bare route" begin
+        # `""` is the key `mountfolder` gives a mount-root `index.html`, which is what lets one
+        # handler answer both `/static/**` and the bare `/static`.
+        @test mount_remainder("/static", 1) == ""
+        @test mount_remainder("/static/", 1) == ""
+        @test mount_remainder("/", 0) == ""
+        @test mount_remainder("", 0) == ""
+    end
+
+    @testset "the query and fragment are not part of the key" begin
+        @test mount_remainder("/static/app.js?v=1", 1) == "app.js"
+        @test mount_remainder("/static/app.js?a=1&b=2", 1) == "app.js"
+        @test mount_remainder("/static/app.js#frag", 1) == "app.js"
+        # Absolute-form targets are legal in a request line and fall back to the URI parser,
+        # which also does not unescape.
+        @test mount_remainder("http://example.test/static/caf%C3%A9.txt", 1) == "café.txt"
+    end
+
+    @testset "a segment that cannot name one path component yields nothing" begin
+        # `nothing` means "no mounted file can be called this" -> a 404, never a 400. The
+        # containment itself comes from the enumerated table, not from these checks: `../` is
+        # simply not a key. This is defence in depth, and it is what stops an ENCODED separator
+        # from crossing a level -- `%2F` survives the split on '/' as one segment and only
+        # becomes a separator after decoding.
+        @test mount_remainder("/static/..", 1) === nothing
+        @test mount_remainder("/static/.", 1) === nothing
+        @test mount_remainder("/static/%2e%2e", 1) === nothing
+        @test mount_remainder("/static/%2e%2e%2fetc", 1) === nothing
+        @test mount_remainder("/static/sub%2Fnested.txt", 1) === nothing
+        @test mount_remainder("/static/sub%5Cnested.txt", 1) === nothing
+        @test mount_remainder("/static/a%00b", 1) === nothing
+        # A dot INSIDE a name is ordinary and must survive -- `..` is a whole segment, not a
+        # substring.
+        @test mount_remainder("/static/a..b.txt", 1) == "a..b.txt"
+        @test mount_remainder("/static/.env", 1) == ".env"   # refused by ENUMERATION, not here
+    end
+
+    @testset "malformed input is a ValidationError, not a silent miss" begin
+        # Same boundary rule `Types.pathparams` applies to `{var}` routes (#70): a malformed
+        # escape is client error (400), not a missing file (404). `unescapeuri` throws EOFError
+        # on a trailing '%' and ArgumentError on "%ZZ"; both are wrapped.
+        @test_throws ValidationError mount_remainder("/static/%ZZ.txt", 1)
+        @test_throws ValidationError mount_remainder("/static/%.txt", 1)
+        @test_throws ValidationError mount_remainder("/static/app%", 1)
+        # `unescapeuri` does NOT throw on bytes that are not valid UTF-8 -- it returns an invalid
+        # String. Left alone it would simply miss the table and report a 404, hiding a malformed
+        # request as a missing file.
+        @test_throws ValidationError mount_remainder("/static/%80.txt", 1)
+
+        # The offending segment must NOT be echoed: `.msg` is app-reachable and a path segment
+        # can carry a token (#72).
+        err = try; mount_remainder("/static/sekrit%ZZ.txt", 1); catch e; e; end
+        @test err isa ValidationError
+        @test !occursin("sekrit", err.msg)
     end
 end
 

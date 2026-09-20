@@ -303,6 +303,17 @@ This is the single enumerator behind [`mountfolder`](@ref) and therefore behind 
   in `staticfiles` would throw at startup), plus FIFOs, sockets and devices, where the per-request
   read in `dynamicfiles` would block or grow without bound.
 
+  A symlinked **directory** is warned about **by name**, unlike the rest of that class
+  ([#95](https://github.com/PingoLee/Nitro.jl/issues/95)). It is the one entry whose refusal hides a
+  whole *subtree* rather than one file, and `dist/assets -> ../shared/assets` is an ordinary deploy
+  layout — so folded into a count, the only signal that a hundred files were dropped was the number
+  going up. Traversing it stays a non-goal (`docs/design/static-serving-boundary.md` §7):
+  `walkdir(follow_symlinks=true)` has no cycle detection, and every intermediate component would
+  become checkable surface, voiding the "walkdir never descends a link, so testing the leaf is
+  complete" invariant this function rests on. **Mount the target separately instead** —
+  `staticfiles("shared/assets", "assets")` works today and needs no new code — or serve it from the
+  proxy.
+
 A name that is not a legal URL path segment is **not** in that list: `café.txt` and `my file.txt` are
 enumerated and served, at their percent-encoded routes. That is [`mountfolder`](@ref)'s job via
 [`_route_encode`](@ref), not a refusal here
@@ -329,7 +340,7 @@ function mountable_files(root::String;
     root_parts = _mount_root_parts(root)
     kept       = String[]
     examples   = String[]
-    n_hidden = n_escaped = n_pattern = n_unresolvable = n_irregular = 0
+    n_hidden = n_escaped = n_pattern = n_unresolvable = n_irregular = n_linkdir = 0
 
     # Default is `onerror=throw`, which makes one unreadable subdirectory anywhere under the mount
     # abort `serve()`. Logging and continuing fails closed — fewer files get served, never more.
@@ -383,7 +394,32 @@ function mountable_files(root::String;
             end
 
             if !isfile(path)
-                n_irregular += 1; note!(); continue
+                n_irregular += 1; note!()
+                # A symlinked DIRECTORY is the one irregular entry that is almost always a
+                # mistake rather than a deliberate exclusion, and the only one whose refusal
+                # silently hides a whole subtree instead of a single file
+                # ([#95](https://github.com/PingoLee/Nitro.jl/issues/95)). `dist/assets ->
+                # ../shared/assets` is an ordinary deploy layout and `current -> releases/N` is
+                # the standard atomic-release shape, so someone will hit this; folded into the
+                # `not_a_regular_file` count below, the only signal was a number.
+                #
+                # Traversing it is a deliberate NON-GOAL (docs/design/static-serving-boundary.md
+                # §7): `walkdir(follow_symlinks=true)` has no cycle detection, so `a -> .`
+                # descends until the OS refuses, and every intermediate component would become
+                # checkable surface — the "walkdir never descends a link, so testing the leaf is
+                # complete" invariant this function rests on would be void. Naming the directory
+                # is the cheap half, and #95 says it is worth doing whether or not traversal ever
+                # lands.
+                #
+                # Capped at five like the route-pattern and percent-encoding warnings, for the
+                # same reason: a user-writable upload directory would otherwise be an
+                # attacker-controlled log flood. Only the mount-relative path is logged, never
+                # the resolved target, which may name something sensitive.
+                if islink(path) && isdir(path)
+                    n_linkdir += 1
+                    n_linkdir <= 5 && @warn "mountable_files: skipping a symlinked directory — its whole subtree is unreachable. Mount it separately (`staticfiles(\"<target>\", \"<prefix>\")`) or serve it from the proxy; traversal is a non-goal, see docs/design/static-serving-boundary.md §7" path=rel
+                end
+                continue
             end
 
             push!(kept, path)
@@ -392,8 +428,9 @@ function mountable_files(root::String;
 
     n_skipped = n_hidden + n_escaped + n_pattern + n_unresolvable + n_irregular
     if n_skipped > 0
-        @info "mountable_files: $n_skipped entry/entries under $root will not be served" hidden=n_hidden symlink_escape=n_escaped route_pattern=n_pattern unresolvable_link=n_unresolvable not_a_regular_file=n_irregular examples=examples
+        @info "mountable_files: $n_skipped entry/entries under $root will not be served" hidden=n_hidden symlink_escape=n_escaped route_pattern=n_pattern unresolvable_link=n_unresolvable not_a_regular_file=n_irregular symlinked_directory=n_linkdir examples=examples
     end
+    n_linkdir > 5 && @warn "mountable_files: $n_linkdir symlinked directories under $root were skipped; their subtrees are not served" shown=5
     isempty(kept) && @warn "mountable_files: no servable files found under $root"
 
     return kept
@@ -502,18 +539,115 @@ bare-directory route of a root mount correct only by accident.
 mount_route(segments::AbstractVector{<:AbstractString})::String =
     isempty(segments) ? "/" : "/" * join(segments, "/")
 
+# The request path, without the query or fragment, and still percent-encoded.
+#
+# Origin-form (`/static/app.js`) is the overwhelmingly common case and is handled by a scan
+# rather than by building an `HTTP.URI`, because this runs on every request to a mount.
+# Absolute-form targets (`http://host/static/app.js`) are legal in a request line and fall back
+# to the URI parser, which also does not unescape.
+function _target_path(target::AbstractString)::SubString{String}
+    s = String(target)
+    if !isempty(s) && first(s) == '/'
+        cut = findfirst(c -> c === '?' || c === '#', s)
+        return cut === nothing ? SubString(s, 1) : SubString(s, 1, prevind(s, cut))
+    end
+    return SubString(String(HTTP.URI(s).path), 1)
+end
+
+# Whether a DECODED segment can name a single mounted path component.
+#
+# This runs after `unescapeuri`, which is the only reason it can see a separator at all: `%2F`
+# and `%5C` survive the split on '/' as one segment and decode into one afterwards. Without this,
+# `/static/a%2Fb` would be keyed `"a/b"` and match the nested file `a/b` — letting one URL name a
+# file whose own route is a different URL. `.`/`..` are refused for the same reason (`%2e%2e%2f`
+# decodes to `"../"`), and NUL because it truncates paths in the C layer beneath `stat`.
+#
+# Note this is defence in depth, not the containment boundary. Containment comes from resolving
+# against the ENUMERATED set: a key that is not in the mount table is a 404 whatever it spells,
+# and the filesystem is never consulted. That is what `mountable_files` already decided.
+_is_nameable_segment(s::AbstractString)::Bool =
+    !isempty(s) && s != "." && s != ".." &&
+    !occursin('/', s) && !occursin('\\', s) && !occursin('\0', s)
+
+"""
+    mount_remainder(target, n_prefix) -> Union{String,Nothing}
+
+The mount-relative key a request names, decoded exactly once, or `nothing` when the request
+cannot name a mounted file at all.
+
+`n_prefix` is the number of leading path segments the mount's own prefix occupies
+([`mount_segments`](@ref)); they are dropped without being decoded, because
+[`mount_segments`](@ref) validated them and they may legitimately carry their own `%XX`.
+A target that stops at the prefix yields `""`, which is the key of the mount's bare route.
+
+The returned key is in the same alphabet as [`mountfolder`](@ref)'s table: the raw, `/`-separated,
+mount-relative filesystem path. So a file is reachable by **every** spelling a client can send —
+`café.txt` answers both `/static/caf%C3%A9.txt` and raw `/static/café.txt`, which per-file route
+registration could not do ([#121](https://github.com/PingoLee/Nitro.jl/issues/121),
+[#101](https://github.com/PingoLee/Nitro.jl/issues/101)) because the router compares bytes.
+
+**Decoding here is not a new rule.** It is the boundary discipline
+[#70](https://github.com/PingoLee/Nitro.jl/issues/70) established — *percent-decoding happens
+exactly once, where the raw request becomes a value* — applied to the one path that never got it.
+`Types.pathparams` does the same for `{var}` routes, and for the same reasons this raises
+`ValidationError` (a **400**) on a malformed escape or on bytes that are not valid UTF-8, rather
+than letting either reach a handler. Express's `send` also answers 400 here.
+
+`nothing` means *"no mounted file can have this name"* and is a **404**, not a 400: it is a miss,
+and reporting it as a client error would tell an unauthenticated caller which spellings are
+structurally interesting.
+"""
+function mount_remainder(target::AbstractString, n_prefix::Int)::Union{String,Nothing}
+    segments = split(_target_path(target), '/'; keepempty=false)
+    length(segments) <= n_prefix && return ""
+
+    parts = Vector{String}(undef, length(segments) - n_prefix)
+    for i in (n_prefix + 1):length(segments)
+        decoded = try
+            HTTP.unescapeuri(String(segments[i]))
+        catch e
+            e isa InterruptException && rethrow()
+            # The offending segment is deliberately NOT interpolated: `.msg` is app-reachable
+            # and a path segment can carry a token. Same rule as `Types.pathparams`.
+            throw(ValidationError("Malformed percent-encoding in static mount path", e))
+        end
+        # `unescapeuri` does not validate what the bytes decode TO — "%80" yields an invalid
+        # `String` with no error — and a `Dict` lookup on an invalid `String` would simply miss,
+        # turning a malformed request into a silent 404. Refuse it at the boundary instead.
+        isvalid(decoded) || throw(ValidationError("Invalid UTF-8 in static mount path"))
+        _is_nameable_segment(decoded) || return nothing
+        parts[i - n_prefix] = decoded
+    end
+    return join(parts, "/")
+end
+
 """
     mountfolder(folder::String, mountdir::String, addroute;
                 include_hidden=false, allow_symlink_escape=false) -> Vector{Pair{String,String}}
 
-Discover the servable files under `folder` and register them, leaving the `addroute` function to
-determine *how* each one is registered. Enumeration — and therefore which files are exposed — is
-owned by [`mountable_files`](@ref); see it for what is refused and how to opt out.
+Discover the servable files under `folder` and hand each one to `addroute`, leaving it to decide
+*how* the file is served. Enumeration — and therefore which files are exposed — is owned by
+[`mountable_files`](@ref); see it for what is refused and how to opt out.
 
-Returns `route => filepath` for everything it registered, in registration order — the same two values
-it handed `addroute`. Callers need this rather than re-deriving paths from the filesystem: `spafiles`
-uses it to decide whether its history-mode fallback has a servable `index.html`, which keeps the
-fallback from drifting away from the mount rules and re-opening the hole they close.
+`addroute` is called as `addroute(route, filepath, key)`:
+
+| Argument | Spelling | Used for |
+|---|---|---|
+| `route` | percent-**encoded** (#121) | the URL the mount *emits*, and the first half of the returned pair |
+| `filepath` | raw filesystem path | opening the file |
+| `key` | raw, `/`-separated, mount-relative | the mount **table**, looked up by [`mount_remainder`](@ref) |
+
+**`route` and `key` are different alphabets on purpose.** Since
+[#221](https://github.com/PingoLee/Nitro.jl/issues/221) a mount registers one `/<prefix>/**` handler
+rather than a literal route per file, and that handler decodes the request before looking it up —
+so the table is keyed by the decoded name while the emitted URL stays encoded. Keying the table by
+`route` would 404 every name that needed encoding, which is the defect #121 fixed from the other
+side.
+
+Returns `route => filepath` for everything it enumerated, in enumeration order. Callers need this
+rather than re-deriving paths from the filesystem: `spafiles` uses it to decide whether its
+history-mode fallback has a servable `index.html`, which keeps the fallback from drifting away from
+the mount rules and re-opening the hole they close.
 
 **Both halves are load-bearing, because a route name does not identify what produced it.** An
 `index.html` contributes *two* pairs naming the *same* file — its own route and the bare directory
@@ -574,7 +708,11 @@ function mountfolder(folder::String, mountdir::String, addroute;
         end
 
         push!(routes, mountpath => filepath)
-        addroute(mountpath, filepath)
+        # The third argument is the mount-relative path in its RAW spelling, which is the key
+        # `mount_remainder` produces from a decoded request. It is deliberately not the route:
+        # the route is percent-ENCODED for emission (#121), while lookup happens after decoding,
+        # so the two are different alphabets and conflating them would 404 every encoded name.
+        addroute(mountpath, filepath, cleanedmountpath)
 
         # also register file to the root of each subpath if this file is an index.html
         #
@@ -593,7 +731,9 @@ function mountfolder(folder::String, mountdir::String, addroute;
             # file from inside the backup directory. A root mount yielded `""` (#94).
             bare_path = mount_route(segments[1:end-1])
             push!(routes, bare_path => filepath)
-            addroute(bare_path, filepath)
+            # The bare route's key is the parent directory — `""` at the mount root, which is
+            # exactly what `mount_remainder` returns for a request that stops at the prefix.
+            addroute(bare_path, filepath, join(name_segments[1:end-1], "/"))
         end
     end
 

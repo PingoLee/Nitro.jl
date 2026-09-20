@@ -185,15 +185,27 @@ end
         # already correct before #92, so these are *contract* tests, not regression tests -- they
         # cannot fail on the old code. What they pin is the future: an unconditional `filesize`
         # here would put a length on the response that its body does not have.
+        # `sizeof`, not `length`, and that distinction became OBSERVABLE at HTTP 2.7 (#225).
+        # HTTP.jl #1364 stores a String body as-is instead of wrapping it in a byte-backed
+        # `BytesBody`, so `resp.body` is now a `String` here and `length` counts CHARACTERS.
+        # These assertions used `length` and passed only because the old wrapping made the two
+        # agree; on a multibyte body they now differ (15 bytes vs 13 characters). `Content-Length`
+        # is a byte count, so `Res.file` was always right to use `sizeof` -- see its own comment --
+        # and the test was measuring the wrong thing.
         grown = Res.file(utf8_path; loadfile = p -> read(p, String) * "!!")
-        @test Dict(grown.headers)["Content-Length"] == string(length(grown.body))
+        @test Dict(grown.headers)["Content-Length"] == string(sizeof(grown.body))
         @test Dict(grown.headers)["Content-Length"] != string(filesize(utf8_path))
+        # Pin the divergence itself, so a future bump that re-wraps String bodies is visible here
+        # rather than silently making `length` correct again.
+        @test grown.body isa AbstractString
+        @test sizeof(grown.body) != length(grown.body)
 
         # ... and smaller than the file on disk, the other direction of the same inconsistency.
         shrunk = Res.file(utf8_path; loadfile = _ -> "hi")
-        @test Dict(shrunk.headers)["Content-Length"] == string(length(shrunk.body))
+        @test Dict(shrunk.headers)["Content-Length"] == string(sizeof(shrunk.body))
         @test Dict(shrunk.headers)["Content-Length"] != string(filesize(utf8_path))
     end
+
 
     # The assertions above are contract tests, not regression tests: for any stable regular file
     # `read(path, String)` and `filesize(path)` agree by construction, and the `loadfile` branch was
@@ -208,6 +220,99 @@ end
         @test Dict(response.headers)["Content-Length"] != string(filesize("/proc/version"))
     else
         @info "Res.file: no zero-stat/non-empty-read file on this host, so the #92 discriminator is skipped; the Content-Length invariants above still ran" islinux = Sys.islinux()
+    end
+end
+
+@testset "Res.file(req, path) — conditional GET and ranges (#40)" begin
+    dir  = mktempdir()
+    path = joinpath(dir, "app.js")
+    write(path, "console.log('x');")
+    body = "console.log('x');"
+    get(target = "/app.js"; hdrs = Pair{String,String}[]) = HTTP.Request("GET", target, hdrs)
+    bodystr(r) = (b = r.body; b isa AbstractString ? String(b) :
+                  b isa AbstractVector{UInt8} ? String(copy(b)) :
+                  b isa HTTP.BytesBody ? String(copy(b.data)) : "")
+
+    @testset "the request-less builder is unchanged" begin
+        # `Res.file(path)` is a pure builder: it cannot see `If-None-Match`, so it must not start
+        # claiming validators it cannot honour. All of #40 lives on the `req` method.
+        plain = Res.file(path)
+        @test HTTP.header(plain, "ETag", "") == ""
+        @test HTTP.header(plain, "Last-Modified", "") == ""
+        @test HTTP.header(plain, "Accept-Ranges", "") == ""
+        @test plain.status == 200
+    end
+
+    @testset "validators are emitted and honoured" begin
+        r = Res.file(get(), path)
+        etag, lastmod = HTTP.header(r, "ETag"), HTTP.header(r, "Last-Modified")
+        @test r.status == 200
+        @test bodystr(r) == body
+        @test startswith(etag, "W/\"")            # weak by default -- see `file_validators`
+        @test !isempty(lastmod)
+        @test HTTP.header(r, "Accept-Ranges") == "bytes"
+        @test startswith(HTTP.header(r, "Content-Type"), "text/javascript")
+
+        fresh = Res.file(get(; hdrs = ["If-None-Match" => etag]), path)
+        @test fresh.status == 304
+        @test isempty(bodystr(fresh))
+        # A 304 must not carry entity headers describing a body it is not sending.
+        @test HTTP.header(fresh, "Content-Length", "") == ""
+        @test HTTP.header(fresh, "Content-Type", "") == ""
+
+        @test Res.file(get(; hdrs = ["If-Modified-Since" => lastmod]), path).status == 304
+        # A validator that does NOT match must still send the body -- otherwise "always 304"
+        # would pass every assertion above.
+        stale = Res.file(get(; hdrs = ["If-None-Match" => "\"nope\""]), path)
+        @test stale.status == 200
+        @test bodystr(stale) == body
+    end
+
+    @testset "byte ranges" begin
+        part = Res.file(get(; hdrs = ["Range" => "bytes=0-6"]), path)
+        @test part.status == 206
+        @test bodystr(part) == "console"
+        @test HTTP.header(part, "Content-Range") == "bytes 0-6/$(sizeof(body))"
+
+        @test Res.file(get(; hdrs = ["Range" => "bytes=9999-"]), path).status == 416
+        # `allow_ranges=false` opts out entirely -- the whole body, and no advertisement.
+        whole = Res.file(get(; hdrs = ["Range" => "bytes=0-6"]), path; allow_ranges = false)
+        @test whole.status == 200
+        @test bodystr(whole) == body
+        @test HTTP.header(whole, "Accept-Ranges", "") == ""
+    end
+
+    @testset "etag strategies" begin
+        weak, _   = Res.file_validators(path)
+        strong, _ = Res.file_validators(path; etag = :strong)
+        none, _   = Res.file_validators(path; etag = nothing)
+        fixed, _  = Res.file_validators(path; etag = "\"pinned\"")
+        @test startswith(weak, "W/\"")
+        @test startswith(strong, "\"") && !startswith(strong, "W/")
+        @test length(strong) == 66                 # 64 hex chars of sha256 plus two quotes
+        @test none === nothing
+        @test fixed == "\"pinned\""
+        @test_throws ArgumentError Res.file_validators(path; etag = :nonsense)
+
+        # A strong tag follows the BODY, not the file, when `loadfile` decides the body.
+        a = Res.file(get(), path; etag = :strong)
+        b = Res.file(get(), path; etag = :strong, loadfile = p -> read(p) )
+        c = Res.file(get(), path; etag = :strong, loadfile = _ -> Vector{UInt8}("different"))
+        @test HTTP.header(a, "ETag") == HTTP.header(b, "ETag")
+        @test HTTP.header(a, "ETag") != HTTP.header(c, "ETag")
+    end
+
+    @testset "Cache-Control is opt-in, Content-Disposition still is too" begin
+        @test HTTP.header(Res.file(get(), path), "Cache-Control", "") == ""
+        cc = Res.file(get(), path; cache_control = "public, max-age=60")
+        @test HTTP.header(cc, "Cache-Control") == "public, max-age=60"
+
+        @test HTTP.header(Res.file(get(), path), "Content-Disposition", "") == ""
+        dl = Res.file(get(), path; disposition = "attachment")
+        @test HTTP.header(dl, "Content-Disposition") == "attachment; filename=\"app.js\""
+        # Caller headers are applied LAST and override what the builder computed.
+        over = Res.file(get(), path; headers = ["Content-Type" => "text/plain"])
+        @test HTTP.header(over, "Content-Type") == "text/plain"
     end
 end
 
@@ -236,12 +341,21 @@ const BODY_TEXT = "héllo — wörld ✓"
 # One key on purpose: with two, `JSON.json` ordering would make the expected string flaky.
 const BODY_JSON = Dict("gruß" => "wörld")
 
+# Several 64 KiB write chunks, so the streaming loop in `_write_response_body!` actually
+# iterates. Random bytes rather than a repeated pattern: a truncated or duplicated chunk would
+# survive an equality check against a compressible fixture far too easily.
+const STREAM_BYTES = rand(UInt8, 300_000)
+const STREAM_PATH  = joinpath(mktempdir(), "big.bin")
+write(STREAM_PATH, STREAM_BYTES)
+
 ctx = App()
 Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
     path("/page",  (req::HTTP.Request) -> Res.html(BODY_HTML)),
     path("/plain", (req::HTTP.Request) -> Res.send(BODY_TEXT)),
     path("/sheet", (req::HTTP.Request) -> Res.send(BODY_TEXT; content_type = "text/css; charset=utf-8")),
     path("/data",  (req::HTTP.Request) -> Res.json(BODY_JSON)),
+    path("/stream", (req::HTTP.Request) -> Res.file(req, STREAM_PATH; stream = true)),
+    path("/buffered", (req::HTTP.Request) -> Res.file(req, STREAM_PATH)),
 ])
 
 port = get_free_port()
@@ -264,6 +378,46 @@ try
             @test HTTP.header(r, "Content-Length") == string(sizeof(expected))
             @test String(r.body) == expected
         end
+    end
+
+    @testset "a streamed body reaches the client whole (#41)" begin
+        # This is the ONLY coverage of `_write_response_body!(::HTTP.Stream, ::HTTP.AbstractBody)`,
+        # and it has to be over a socket: in-process, `internalrequest` never reaches the write
+        # path at all, so a chunking bug there is invisible to every other assertion in the suite.
+        r = HTTP.get("http://$HOST:$port/stream")
+        @test r.status == 200
+        @test r.body == STREAM_BYTES
+        @test HTTP.header(r, "Content-Length") == string(length(STREAM_BYTES))
+        @test HTTP.header(r, "Accept-Ranges") == "bytes"
+
+        # Byte-identical to the buffered path -- the transport must not be observable in the body.
+        @test HTTP.get("http://$HOST:$port/buffered").body == STREAM_BYTES
+
+        # A streamed body is a CURSOR and is single-use, so each request must open its own. Three
+        # in a row catches a body accidentally shared across requests, which would truncate the
+        # second one, and a handle that is never released.
+        for _ in 1:3
+            @test HTTP.get("http://$HOST:$port/stream").body == STREAM_BYTES
+        end
+
+        etag = HTTP.header(r, "ETag")
+        @test !isempty(etag)
+        cached = HTTP.get("http://$HOST:$port/stream", ["If-None-Match" => etag];
+                          status_exception = false)
+        @test cached.status == 304
+        @test isempty(cached.body)
+
+        ranged = HTTP.get("http://$HOST:$port/stream", ["Range" => "bytes=1000-1099"];
+                          status_exception = false)
+        @test ranged.status == 206
+        @test ranged.body == STREAM_BYTES[1001:1100]
+
+        # Interleave 304s (no body at all) with full downloads: if `adopt_stream_io!` failed to
+        # close the handle on the bodyless path, this is where descriptors would pile up.
+        for _ in 1:10
+            HTTP.get("http://$HOST:$port/stream", ["If-None-Match" => etag]; status_exception = false)
+        end
+        @test HTTP.get("http://$HOST:$port/stream").body == STREAM_BYTES
     end
 finally
     Nitro.Core.terminate(ctx)

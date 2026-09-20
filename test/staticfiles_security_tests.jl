@@ -3,6 +3,7 @@
 using Test
 using HTTP
 using Nitro
+import SHA
 
 const MOUNTABLE   = Nitro.Core.Util.mountable_files
 const MOUNTFOLDER = Nitro.Core.Util.mountfolder
@@ -12,6 +13,22 @@ const MOUNTFOLDER = Nitro.Core.Util.mountfolder
 # leaving a `∉` to compare against the raw pair vector makes it VACUOUSLY TRUE -- every negative
 # assertion below would keep passing while testing nothing, and the negatives are the security half.
 mountroutes(args...; kw...) = first.(MOUNTFOLDER(args...; kw...))
+
+# Read a response body WITHOUT consuming it.
+#
+# `String(::Vector{UInt8})` takes ownership and leaves the source vector empty. `staticfiles` and
+# `spafiles` hand back ONE cached `Response` per file, so a plain `String(resp.body)` drains it for
+# every later request that resolves to the same file -- and since #221 several URLs legitimately do
+# (an encoded name and its raw spelling, a mount-root `index.html` and the bare mount route, every
+# unmatched path under an SPA mount). The next read then sees `""` and the failure looks like a
+# serving bug rather than a test one.
+function bodystr(r)
+    b = r.body
+    b isa AbstractString        && return String(b)
+    b isa AbstractVector{UInt8} && return String(copy(b))
+    b isa HTTP.BytesBody        && return String(copy(b.data))
+    return ""   # HTTP.EmptyBody -- what a bare `Response(404)` carries
+end
 
 # `symlink` needs Developer Mode or admin on Windows, and an unprivileged *file* symlink has no
 # equivalent there at all. A directory **junction** does (`mklink /J`), and Julia's `islink` reports
@@ -132,7 +149,7 @@ end
             staticfiles(root, "static")
             r = internalrequest(HTTP.Request("GET", "/static/innocent.txt"))
             @test r.status == 404
-            @test !occursin("hunter2", String(r.body))
+            @test !occursin("hunter2", bodystr(r))
         finally
             resetstate()
         end
@@ -190,7 +207,7 @@ end
     # `/*`, so `GET /anything` was answered by the mount's index.html. `**` and `{id}` already threw
     # at registration; `*` was the one that came up clean, which is what made it worth closing (#101).
     for md in ("*", "**", "{id}", "a/{id}/b", "assets/*", "}")
-        @test_throws ArgumentError MOUNTFOLDER(root, md, (_r, _p) -> nothing)
+        @test_throws ArgumentError MOUNTFOLDER(root, md, (_r, _p, _k) -> nothing)
     end
 
     # The public entry points, not just the helper -- that is where the footgun was reachable.
@@ -218,12 +235,12 @@ end
     # papered over. `..` is here because `.` is *unreserved*, so it passes the
     # encoding test and is still stripped by the client before the request is sent.
     for md in ("my static", "café", "a?b", "a#b", "%", "a%2", "%GG", "100%", "a[b]", "a|b", "..")
-        @test_throws ArgumentError MOUNTFOLDER(root, md, (_r, _p) -> nothing)
+        @test_throws ArgumentError MOUNTFOLDER(root, md, (_r, _p, _k) -> nothing)
     end
 
     # pchar, not "ASCII alphanumeric" -- these are legal path segments and must still mount.
     for md in ("my%20static", "a:b", "a@b", "a+b", "a.b-c_d~e", "caf%C3%A9")
-        @test !isempty(MOUNTFOLDER(root, md, (_r, _p) -> nothing))
+        @test !isempty(MOUNTFOLDER(root, md, (_r, _p, _k) -> nothing))
     end
 
     # The whole justification for allowing `%XX`: the encoded spelling is the one a conforming client
@@ -325,7 +342,7 @@ end
 end
 
 @testset "a filename that must be percent-encoded mounts at its encoded route" begin
-    routes = Set(mountroutes(enc_root, "enc", (_r, _p) -> nothing))
+    routes = Set(mountroutes(enc_root, "enc", (_r, _p, _k) -> nothing))
 
     encoded_routes = Set("/enc/" * e for e in values(made_encoding))
     for (name, encoded) in made_encoding
@@ -369,24 +386,46 @@ end
             # Not just a 200 -- the *right* file. `my file.txt` and `my%20file.txt` both exist in
             # this tree and their routes are one `%25` apart, so a body check is what proves the
             # encoding did not collapse them onto each other.
-            @test String(resp.body) == "BODY:" * name
+            @test bodystr(resp) == "BODY:" * name
         end
         if has_spaced_dir
             @test internalrequest(HTTP.Request("GET", "/enc/sub%20dir/x.txt")).status == 200
             # The bare directory route serves the index, through the router.
             bare = internalrequest(HTTP.Request("GET", "/enc/sub%20dir"))
             @test bare.status == 200
-            @test String(bare.body) == "BODY:sub dir/index.html"
+            @test bodystr(bare) == "BODY:sub dir/index.html"
         end
 
-        # The raw spelling is a 404 through the ROUTER, not merely absent from the route vector.
+        # BOTH spellings now serve the file, and this assertion is REVERSED from what it asserted
+        # before #221.
         #
-        # This is the assertion that pins the mechanism the whole fix rests on: HTTP.jl matches path
-        # segments byte for byte and percent-decodes NOTHING. Under a hypothetical decoding router
-        # every other router assertion in these testsets would pass identically -- registration and
-        # lookup would decode symmetrically -- so without this one, nothing distinguishes the two.
+        # It used to read `status == 404` for the raw spelling, and that was correct for its design:
+        # a mount registered one literal route per file, HTTP.jl matched path segments byte for
+        # byte, and `caf%C3%A9.txt` and `café.txt` are disjoint byte strings -- so #101 and #121
+        # each had to CHOOSE which of the two clients to serve, and both chose the browser. The
+        # `upgrading/2026-09-18-121-encoded-filename-routes.md` entry records the other half as a
+        # cost it could not avoid: "A non-browser client sending raw bytes loses `café.txt` ...
+        # Changing the server does not migrate such a client."
+        #
+        # #221 removes the choice instead of making it. The mount registers ONE `/<prefix>/**`
+        # handler and decodes the remainder before looking it up in the enumerated table, so both
+        # spellings normalize to the one key `café.txt` and both are served. That is the behaviour
+        # every comparable framework has, and it is why the whole #101/#94/#121 class is gone rather
+        # than handled.
+        #
+        # The router's byte-exactness is UNCHANGED and is still load-bearing -- `Types.pathparams`
+        # would double-decode if it ever went away. It is pinned where it belongs, on the router
+        # itself, in `test/http_internals_contract_tests.jl` ("router hands over STILL-ENCODED path
+        # segments"), rather than indirectly through a mount that no longer depends on it.
         if haskey(made_encoding, "café.txt")
-            @test internalrequest(HTTP.Request("GET", "/enc/café.txt")).status == 404
+            encoded = internalrequest(HTTP.Request("GET", "/enc/caf%C3%A9.txt"))
+            raw     = internalrequest(HTTP.Request("GET", "/enc/café.txt"))
+            @test encoded.status == 200
+            @test raw.status == 200
+            # `bodystr` copies: both spellings resolve to the SAME cached `Response`, and
+            # `String(::Vector{UInt8})` takes ownership of the vector it is handed.
+            @test bodystr(raw) == "BODY:café.txt"
+            @test bodystr(encoded) == "BODY:café.txt"
         end
     finally
         resetstate()
@@ -402,7 +441,7 @@ end
     #
     # These assertions pass against unpatched code by design: that IS the property under test.
     # The discriminating siblings are in the testset above.
-    routes = Set(mountroutes(enc_root, "enc", (_r, _p) -> nothing))
+    routes = Set(mountroutes(enc_root, "enc", (_r, _p, _k) -> nothing))
     for n in pchar_clean
         @test "/enc/$n" ∈ routes
     end
@@ -423,7 +462,7 @@ end
     # so its route is `my%2520file.txt`. Passing the triplet through here would make one URL name
     # two different files.
     if haskey(made_encoding, "my%20file.txt") && haskey(made_encoding, "my file.txt")
-        routes = Set(mountroutes(enc_root, "enc", (_r, _p) -> nothing))
+        routes = Set(mountroutes(enc_root, "enc", (_r, _p, _k) -> nothing))
         @test "/enc/my%2520file.txt" ∈ routes      # the literal-% file
         @test "/enc/my%20file.txt"   ∈ routes      # `my file.txt`, whose encoded form this is
         # Both present, and each resolves to its own file -- pinned by body in the first testset.
@@ -448,7 +487,7 @@ end
          make_fixture(inj, "a%20b.txt", "BODY:literal")
     @test ok          # both names are legal everywhere; a skip here would be a silent no-op
     if ok
-        routes = mountroutes(inj, "i", (_r, _p) -> nothing)
+        routes = mountroutes(inj, "i", (_r, _p, _k) -> nothing)
         @test length(routes) == length(Set(routes))
         @test Set(routes) == Set(["/i/a%20b.txt", "/i/a%2520b.txt"])
 
@@ -468,7 +507,7 @@ end
     # `_is_route_pattern` refusal stops a file named `*` from shadowing its siblings. Braces WOULD
     # be encoded, but the refusal runs first, so `{id}.txt` stays skipped rather than becoming
     # servable at `%7Bid%7D.txt`. Encoding braces would change WHAT a mount serves, not only where.
-    routes = Set(mountroutes(root, "x", (_r, _p) -> nothing))
+    routes = Set(mountroutes(root, "x", (_r, _p, _k) -> nothing))
     @test "/x/{id}.txt"      ∉ routes
     @test "/x/%7Bid%7D.txt"  ∉ routes
     if has_star
@@ -481,7 +520,7 @@ end
     # #102's contract survives #121: the route half may now be encoded, but the filepath half is
     # still `joinpath(root, name)` verbatim, so `joinpath` remains a valid key into the pair vector.
     # That is what `spafiles` relies on to find its index by file.
-    pairs_ = MOUNTFOLDER(enc_root, "enc", (_r, _p) -> nothing)
+    pairs_ = MOUNTFOLDER(enc_root, "enc", (_r, _p, _k) -> nothing)
     for (name, encoded) in made_encoding
         idx = findfirst(p -> last(p) == joinpath(enc_root, name), pairs_)
         @test idx !== nothing
@@ -503,7 +542,7 @@ end
             spafiles(spa, "app")
             resp = internalrequest(HTTP.Request("GET", "/app/caf%C3%A9.txt"))
             @test resp.status == 200
-            @test String(resp.body) == "BODY:asset"
+            @test bodystr(resp) == "BODY:asset"
             # The fallback itself still works for a genuinely unmatched path.
             @test String(internalrequest(HTTP.Request("GET", "/app/no/such/route")).body) == "BODY:SHELL"
         finally
@@ -572,13 +611,13 @@ end
     write(joinpath(d, "index.html"), "<h1>i</h1>")
     for folder in (d, d * "/", d * Base.Filesystem.path_separator)
         @test joinpath(folder, "index.html") ∈ MOUNTABLE(folder)
-        @test joinpath(folder, "index.html") ∈ last.(MOUNTFOLDER(folder, "app", (_r, _p) -> nothing))
+        @test joinpath(folder, "index.html") ∈ last.(MOUNTFOLDER(folder, "app", (_r, _p, _k) -> nothing))
     end
 end
 
 @testset "mountfolder reports the routes it registered" begin
     registered = Pair{String,String}[]
-    mounted_pairs = MOUNTFOLDER(root, "assets", (route, path) -> push!(registered, route => path))
+    mounted_pairs = MOUNTFOLDER(root, "assets", (route, path, _k) -> push!(registered, route => path))
 
     # The pair carries both halves (#102): the returned filepath must be exactly the one handed to
     # `addroute`, or `spafiles` cannot trust it to identify the index by file.
@@ -605,16 +644,16 @@ end
     # `mountdir` is canonicalized once, in `mount_segments` -- the three public mount functions no
     # longer strip anything themselves (#93). Driving `mountfolder` directly needs no router and no
     # global state, so this is the cheap place to pin the whole equivalence class.
-    baseline = MOUNTFOLDER(root, "assets", (_r, _p) -> nothing)
+    baseline = MOUNTFOLDER(root, "assets", (_r, _p, _k) -> nothing)
     for md in ("/assets", "assets/", "/assets/", "//assets//", " /assets/ ")
-        @test MOUNTFOLDER(root, md, (_r, _p) -> nothing) == baseline
+        @test MOUNTFOLDER(root, md, (_r, _p, _k) -> nothing) == baseline
     end
 
     # `""` used to throw a BoundsError at the entry point, while everything downstream already
     # treated it as "mount at the root".
-    root_baseline = MOUNTFOLDER(root, "", (_r, _p) -> nothing)
+    root_baseline = MOUNTFOLDER(root, "", (_r, _p, _k) -> nothing)
     for md in ("/", "   ", " / ")
-        @test MOUNTFOLDER(root, md, (_r, _p) -> nothing) == root_baseline
+        @test MOUNTFOLDER(root, md, (_r, _p, _k) -> nothing) == root_baseline
     end
     # The whole-vector `==` comparisons above hold unchanged on pairs, and get strictly stronger --
     # two spellings must now agree on the filepaths as well as the routes. Membership tests do NOT
@@ -625,7 +664,7 @@ end
     # Routes are rebuilt by joining segments, so a doubled separator is unrepresentable. Interior
     # separators are still a real nested mount, not a spelling variant.
     for md in ("assets", "/assets/", "//assets//", "", "/", "a/b")
-        for (route, filepath) in MOUNTFOLDER(root, md, (_r, _p) -> nothing)
+        for (route, filepath) in MOUNTFOLDER(root, md, (_r, _p, _k) -> nothing)
             @test !occursin("//", route)
             @test startswith(route, "/")
             # The filepath half is a real, servable file for every route -- including the bare
@@ -633,7 +672,7 @@ end
             @test isfile(filepath)
         end
     end
-    @test "/a/b/visible.txt" ∈ mountroutes(root, "a/b", (_r, _p) -> nothing)
+    @test "/a/b/visible.txt" ∈ mountroutes(root, "a/b", (_r, _p, _k) -> nothing)
 end
 
 @testset "a directory named index.html does not claim the mount root" begin
@@ -646,7 +685,7 @@ end
     mkpath(joinpath(nested, "index.html"))
     write(joinpath(nested, "index.html", "index.html"), "<h1>nested</h1>")
 
-    routes = mountroutes(nested, "assets", (_r, _p) -> nothing)
+    routes = mountroutes(nested, "assets", (_r, _p, _k) -> nothing)
     @test "/assets/index.html/index.html" ∈ routes
     @test "/assets/index.html" ∈ routes   # the bare path of the NESTED index
     @test "/assets" ∉ routes              # the hijack: this was the nested file's bare path
@@ -657,28 +696,28 @@ end
     # one. Identifying it by FILE cannot: `<nested>/index.html` is a directory, and a directory is
     # never a `mountable_files` result. This pair of assertions is why `spafiles` matches on the
     # filepath half; the end-to-end consequence is pinned by the `@test_logs` block below.
-    mounted_pairs = MOUNTFOLDER(nested, "assets", (_r, _p) -> nothing)
+    mounted_pairs = MOUNTFOLDER(nested, "assets", (_r, _p, _k) -> nothing)
     @test last(mounted_pairs[findfirst(p -> first(p) == "/assets/index.html", mounted_pairs)]) ==
           joinpath(nested, "index.html", "index.html")
     @test findfirst(p -> last(p) == joinpath(nested, "index.html"), mounted_pairs) === nothing
 
     # A root mount's bare directory route is spelled "/", not "".
-    root_routes = mountroutes(nested, "", (_r, _p) -> nothing)
+    root_routes = mountroutes(nested, "", (_r, _p, _k) -> nothing)
     @test "/index.html/index.html" ∈ root_routes
     @test "/index.html" ∈ root_routes
     @test "/" ∉ root_routes               # nothing here is a *top-level* index.html
     @test "" ∉ root_routes
 
     # A genuine top-level index.html claims "/" rather than the empty string.
-    @test "/" ∈ mountroutes(root, "", (_r, _p) -> nothing)
-    @test "" ∉ mountroutes(root, "", (_r, _p) -> nothing)
+    @test "/" ∈ mountroutes(root, "", (_r, _p, _k) -> nothing)
+    @test "" ∉ mountroutes(root, "", (_r, _p, _k) -> nothing)
 
     resetstate()
     try
         staticfiles(nested, "assets")
         r = internalrequest(HTTP.Request("GET", "/assets/index.html"))
         @test r.status == 200
-        @test String(r.body) == "<h1>nested</h1>"
+        @test bodystr(r) == "<h1>nested</h1>"
         @test internalrequest(HTTP.Request("GET", "/assets")).status == 404
     finally
         resetstate()
@@ -708,7 +747,7 @@ end
     mkpath(joinpath(tree, "docs", "index.htmlx", "guide"))
     write(joinpath(tree, "docs", "index.htmlx", "guide", "index.html"), "<h1>guide</h1>")
 
-    routes = mountroutes(tree, "assets", (_r, _p) -> nothing)
+    routes = mountroutes(tree, "assets", (_r, _p, _k) -> nothing)
     @test "/assets/index.html.bak" ∈ routes            # old code produced "/assets"
     @test "/assets/docs/index.htmlx/guide" ∈ routes    # old code produced "/assets/docs"
     @test "/assets" ∉ routes
@@ -787,10 +826,488 @@ end
         if has_escape_file
             r = internalrequest(HTTP.Request("GET", "/static/escape.csv"))
             @test r.status == 404
-            @test !occursin("TOP SECRET", String(r.body))
+            @test !occursin("TOP SECRET", bodystr(r))
         end
     finally
         resetstate()
+    end
+end
+
+@testset "one prefix handler resolves the DECODED request against the enumeration (#221)" begin
+    # A mount registers `/<prefix>/**` plus the bare route, and resolves the decoded remainder
+    # against the table `mountable_files` produced. These are the properties that shape buys and
+    # per-file registration could not have.
+    resetstate()
+    try
+        staticfiles(root, "static")
+
+        @testset "the mount registers a catch-all, not a route per file" begin
+            # The route TABLE is unchanged -- still one pair per enumerated file, still encoded,
+            # still no `**` in it (#102/#121). What changed is what is registered with the router.
+            pairs_ = MOUNTFOLDER(root, "static", (_r, _p, _k) -> nothing)
+            @test !isempty(pairs_)
+            @test "/static/**" ∉ first.(pairs_)
+            @test "/static/visible.txt" ∈ first.(pairs_)
+        end
+
+        @testset "traversal resolves to a key that does not exist, never to the filesystem" begin
+            # `%2e%2e%2f` decodes to `../`, which is not a nameable segment and therefore not a
+            # key. Nothing is `stat`ed; there is no `safe_join` to get wrong. This is the half
+            # that is strictly stronger than the surveyed frameworks, which resolve against the
+            # filesystem and must defend the join.
+            for target in ("/static/%2e%2e%2fetc%2fpasswd",
+                           "/static/..%2fetc",
+                           "/static/../../etc/passwd",
+                           "/static/%2e%2e/%2e%2e/etc",
+                           "/static/sub%2Fnested.txt",   # encoded separator must not cross a level
+                           "/static/sub%5Cnested.txt",   # ... nor a Windows one
+                           "/static/%00visible.txt")
+                r = internalrequest(HTTP.Request("GET", target))
+                @test r.status == 404
+                @test !occursin("TOP SECRET", bodystr(r))
+                @test !occursin("hunter2", bodystr(r))
+            end
+            # The nested file IS reachable by its honest spelling -- otherwise the assertions
+            # above would pass on a mount that simply serves nothing.
+            @test internalrequest(HTTP.Request("GET", "/static/sub/nested.txt")).status == 200
+        end
+
+        @testset "a malformed escape is a 400, not a 500 or a silent 404" begin
+            # Same boundary rule `Types.pathparams` applies to `{var}` routes (#70), and the same
+            # answer Express's `send` gives. A silent 404 would be the wrong report: the request
+            # is not naming a missing file, it is not a well-formed request target.
+            for target in ("/static/%ZZ.txt", "/static/%.txt", "/static/visible%.txt")
+                @test internalrequest(HTTP.Request("GET", target)).status == 400
+            end
+            # Invalid UTF-8 that `unescapeuri` accepts without throwing is refused too, rather
+            # than being allowed to miss quietly against a `Dict` keyed by valid Strings.
+            @test internalrequest(HTTP.Request("GET", "/static/%80.txt")).status == 400
+        end
+
+        @testset "the query string is not part of the key" begin
+            r = internalrequest(HTTP.Request("GET", "/static/visible.txt?v=deadbeef&x=1"))
+            @test r.status == 200
+            @test bodystr(r) == "visible"
+        end
+
+        @testset "a miss still goes through the router's own not-found handler" begin
+            # The `**` route MATCHES every unmatched path under the prefix, so the mount handler
+            # -- not the router -- decides what a miss returns. It must defer rather than invent
+            # a response, or an app that supplied `Service(router = Router(my404))` would find it
+            # silently disabled underneath every mount.
+            @test internalrequest(HTTP.Request("GET", "/static/nope.txt")).status == 404
+            # ... and a path outside the mount is untouched by any of this.
+            @test internalrequest(HTTP.Request("GET", "/elsewhere/nope.txt")).status == 404
+
+            # Asserting `status == 404` alone is NOT the property: a hardcoded
+            # `HTTP.Response(404)` in the mount handler satisfies it while silently disabling the
+            # app's own handler. Give the router a custom 404 with a recognisable body and
+            # require the mount's miss to carry it.
+            custom = Nitro.Core.App(service = Nitro.Core.Service(
+                router = HTTP.Router(_ -> HTTP.Response(404, "CUSTOM-NOT-FOUND"))))
+            staticfiles(custom, root, "static")
+            miss = internalrequest(custom, HTTP.Request("GET", "/static/nope.txt"))
+            @test miss.status == 404
+            @test bodystr(miss) == "CUSTOM-NOT-FOUND"
+            # A hit is unaffected.
+            @test bodystr(internalrequest(custom, HTTP.Request("GET", "/static/visible.txt"))) == "visible"
+        end
+
+        @testset "an application route still beats the mount at the same path" begin
+            # Exact literal beats `**` in HTTP.jl's matcher (exact -> conditional -> wildcard ->
+            # doublestar), which is what keeps a catch-all mount from swallowing app routes that
+            # live under its prefix.
+            urlpatterns("", [path("/static/api/ping", req -> Res.json(Dict("pong" => true)))])
+            r = internalrequest(HTTP.Request("GET", "/static/api/ping"))
+            @test r.status == 200
+            @test occursin("pong", bodystr(r))
+        end
+    finally
+        resetstate()
+    end
+end
+
+@testset "mounts answer conditional GETs and ranges (#40)" begin
+    resetstate()
+    try
+        staticfiles(root, "static"; cache_control = "public, max-age=60")
+
+        r = internalrequest(HTTP.Request("GET", "/static/visible.txt"))
+        etag, lastmod = HTTP.header(r, "ETag"), HTTP.header(r, "Last-Modified")
+        @test r.status == 200
+        @test bodystr(r) == "visible"
+        @test !isempty(etag)
+        @test !isempty(lastmod)
+        @test HTTP.header(r, "Accept-Ranges") == "bytes"
+        @test HTTP.header(r, "Cache-Control") == "public, max-age=60"
+
+        fresh = internalrequest(HTTP.Request("GET", "/static/visible.txt", ["If-None-Match" => etag]))
+        @test fresh.status == 304
+        @test isempty(bodystr(fresh))
+
+        @test internalrequest(HTTP.Request("GET", "/static/visible.txt",
+                                           ["If-Modified-Since" => lastmod])).status == 304
+        # A non-matching validator must still send the body, or "always 304" would satisfy the
+        # assertions above.
+        stale = internalrequest(HTTP.Request("GET", "/static/visible.txt",
+                                             ["If-None-Match" => "\"nope\""]))
+        @test stale.status == 200
+        @test bodystr(stale) == "visible"
+
+        part = internalrequest(HTTP.Request("GET", "/static/visible.txt", ["Range" => "bytes=0-2"]))
+        @test part.status == 206
+        @test bodystr(part) == "vis"
+        @test internalrequest(HTTP.Request("GET", "/static/visible.txt",
+                                           ["Range" => "bytes=900-"])).status == 416
+    finally
+        resetstate()
+    end
+
+    # No Cache-Control unless the mount asked for one: guessing a max-age on an app's behalf pins
+    # clients to a stale asset with no way to recover.
+    resetstate()
+    try
+        staticfiles(root, "static")
+        @test HTTP.header(internalrequest(HTTP.Request("GET", "/static/visible.txt")),
+                          "Cache-Control", "") == ""
+    finally
+        resetstate()
+    end
+end
+
+@testset "the SPA fallback carries validators, like the file it serves" begin
+    # The history fallback is an SPA server's hottest path. It used to re-`read` index.html per
+    # request and emit no validators at all, so every deep link cost a full body (#40).
+    spa = mktempdir()
+    write(joinpath(spa, "index.html"), "SHELL")
+    write(joinpath(spa, "app.js"), "APP")
+    resetstate()
+    try
+        spafiles(spa, "app")
+        deep = internalrequest(HTTP.Request("GET", "/app/some/client/route"))
+        etag = HTTP.header(deep, "ETag")
+        @test deep.status == 200
+        @test bodystr(deep) == "SHELL"
+        @test !isempty(etag)
+
+        @test internalrequest(HTTP.Request("GET", "/app/other/route",
+                                           ["If-None-Match" => etag])).status == 304
+        # The fallback and the direct index route describe the same file, so they must agree on
+        # its validator -- otherwise a client revalidating a deep link would refetch the shell.
+        direct = internalrequest(HTTP.Request("GET", "/app/index.html"))
+        @test HTTP.header(direct, "ETag") == etag
+    finally
+        resetstate()
+    end
+end
+
+@testset "cache policy and streaming threshold (#41)" begin
+    big_dir = mktempdir()
+    write(joinpath(big_dir, "small.txt"), "small")
+    # Comfortably over the threshold used below, and over one 64 KiB write chunk, so the
+    # streaming loop actually iterates rather than completing in a single pass.
+    big_bytes = rand(UInt8, 300_000)
+    write(joinpath(big_dir, "big.bin"), big_bytes)
+
+    @testset "policy validation rejects nonsense rather than silently defaulting" begin
+        MP = Nitro.Core.MountPolicy
+        @test_throws ArgumentError MP(:sometimes, 1024, 1024, :weak_stat)
+        @test_throws ArgumentError MP(:eager, -1, 1024, :weak_stat)
+        @test_throws ArgumentError MP(:eager, 1024, 0, :weak_stat)
+        # The validating constructor must be INNER: an outer method with this signature would be
+        # less specific than the compiler-generated one for `Int` arguments, which is exactly how
+        # it is called, and every check above would be skipped.
+        @test_throws ArgumentError MP(:eager, 1024, 1024, :nonsense)
+        @test MP(:eager, 1024, 1024, :weak_stat) isa MP
+        @test_throws ArgumentError staticfiles(big_dir, "x"; cache = :sometimes)
+    end
+
+    @testset "a file over the threshold is streamed, not held" begin
+        resetstate()
+        try
+            staticfiles(big_dir, "big"; stream_threshold = 100_000)
+            tbl = nothing   # reach the mount table only through behaviour, not internals
+
+            r = internalrequest(HTTP.Request("GET", "/big/big.bin"))
+            @test r.status == 200
+            # The body is a streaming cursor, not a byte buffer -- that IS the observable
+            # difference. Drain it the way the write path does.
+            @test r.body isa HTTP.AbstractBody
+            @test !(r.body isa HTTP.BytesBody)
+            buf = UInt8[]
+            chunk = Vector{UInt8}(undef, 64 * 1024)
+            while !HTTP.body_closed(r.body)
+                n = HTTP.body_read!(r.body, chunk)
+                n == 0 && break
+                append!(buf, @view(chunk[1:n]))
+            end
+            @test buf == big_bytes
+            @test HTTP.header(r, "Content-Length") == string(length(big_bytes))
+
+            # A small file under the same mount is still buffered.
+            s = internalrequest(HTTP.Request("GET", "/big/small.txt"))
+            @test s.status == 200
+            @test !(s.body isa HTTP.AbstractBody) || s.body isa HTTP.BytesBody
+            @test bodystr(s) == "small"
+
+            # A streamed file still answers conditional GETs -- the 304 path carries no body at
+            # all, which is where a leaked handle would otherwise accumulate fastest.
+            etag = HTTP.header(r, "ETag")
+            @test !isempty(etag)
+            for _ in 1:5
+                @test internalrequest(HTTP.Request("GET", "/big/big.bin",
+                                                   ["If-None-Match" => etag])).status == 304
+            end
+        finally
+            resetstate()
+        end
+    end
+
+    @testset "stream_threshold = 0 disables streaming entirely" begin
+        resetstate()
+        try
+            staticfiles(big_dir, "big"; stream_threshold = 0)
+            r = internalrequest(HTTP.Request("GET", "/big/big.bin"))
+            @test r.status == 200
+            @test !(r.body isa HTTP.AbstractBody) || r.body isa HTTP.BytesBody
+        finally
+            resetstate()
+        end
+    end
+
+    @testset ":lazy actually caches, and the byte budget actually evicts" begin
+        # A `loadfile` counter is what makes this DISCRIMINATING: asserting only that the right
+        # bytes come back passes identically if `:lazy` silently degrades to `:none` (re-read
+        # every time) or to `:eager` (read everything at mount). Counting reads separates all
+        # three.
+        reads = Dict{String,Int}()
+        counting_loadfile = p -> (reads[basename(p)] = get(reads, basename(p), 0) + 1; read(p))
+
+        resetstate()
+        try
+            staticfiles(big_dir, "big"; cache = :lazy, stream_threshold = 0,
+                        cache_max_bytes = 128 * 1024, loadfile = counting_loadfile)
+            # Nothing is read at mount time -- that is what makes it lazy rather than eager.
+            @test isempty(reads)
+
+            for _ in 1:3
+                @test bodystr(internalrequest(HTTP.Request("GET", "/big/small.txt"))) == "small"
+            end
+            # Read ONCE across three hits: the cache is real.
+            @test reads["small.txt"] == 1
+
+            # big.bin is 300 KB against a 128 KB budget. LRUCache does NOT evict to make room for
+            # an entry larger than `maxsize` -- it declines to store it and leaves the cache
+            # intact -- so this is the "oversized entry cannot wedge the cache" case: it is
+            # served correctly, re-read every time, and small.txt keeps its slot.
+            for _ in 1:2
+                r = internalrequest(HTTP.Request("GET", "/big/big.bin"))
+                @test r.status == 200
+                @test length(r.body) == length(big_bytes)
+            end
+            @test reads["big.bin"] == 2          # never cached, so re-read each time
+            @test reads["small.txt"] == 1        # ... and it did not displace small.txt
+
+            # Eviction proper needs entries that each FIT but together do not -- next block.
+        finally
+            resetstate()
+        end
+
+        reads2 = Dict{String,Int}()
+        # The `* 4` is load-bearing, not decoration: it makes the BODY a different size from the
+        # FILE. A weak tag built from `stat` rather than from the cached bytes is identical to a
+        # correct one whenever those two agree -- which they do for a plain `read` -- so without
+        # a size-changing `loadfile` the drift this block exists to catch is unobservable.
+        counting2 = p -> (reads2[basename(p)] = get(reads2, basename(p), 0) + 1;
+                          vcat(read(p), Vector{UInt8}("XXXX")))
+        evict_dir = mktempdir()
+        write(joinpath(evict_dir, "a.bin"), rand(UInt8, 50_000))
+        write(joinpath(evict_dir, "b.bin"), rand(UInt8, 50_000))
+        resetstate()
+        try
+            staticfiles(evict_dir, "ev"; cache = :lazy, stream_threshold = 0,
+                        cache_max_bytes = 80_000, loadfile = counting2)
+            internalrequest(HTTP.Request("GET", "/ev/a.bin"))
+            internalrequest(HTTP.Request("GET", "/ev/a.bin"))
+            @test reads2["a.bin"] == 1                  # cached
+
+            tag_a = HTTP.header(internalrequest(HTTP.Request("GET", "/ev/a.bin")), "ETag")
+
+            internalrequest(HTTP.Request("GET", "/ev/b.bin"))   # 100 KB > 80 KB budget
+            # a.bin was evicted to make room for b.bin. Change it on disk BEFORE the re-read, so
+            # the re-read produces different bytes than the first one did. This is the exact
+            # scenario `CachedBody` exists for: a tag derived from a `stat` rather than from the
+            # cached bytes survives every other assertion here and fails only this one.
+            sleep(1.1)
+            write(joinpath(evict_dir, "a.bin"), rand(UInt8, 70_000))
+
+            r_a = internalrequest(HTTP.Request("GET", "/ev/a.bin"))
+            # It had to be read again -- a COUNT-based bound of two entries would have kept both
+            # and left this at 1, which is what distinguishes a byte budget from an entry count.
+            @test reads2["a.bin"] == 2
+            @test reads2["b.bin"] == 1
+            @test length(r_a.body) == 70_004          # 70 000 on disk + the loadfile's 4 bytes
+            # The tag describes the BODY in hand -- not the one cached before, and not the file on
+            # disk. `70004` vs `70000` is what separates a tag built from the cached bytes from one
+            # built from a `stat`; they are indistinguishable whenever the two sizes agree.
+            @test HTTP.header(r_a, "ETag") != tag_a
+            @test occursin("70004", HTTP.header(r_a, "ETag"))
+            @test !occursin("70000-", HTTP.header(r_a, "ETag"))
+            # ... and the pre-eviction tag no longer short-circuits, while the current one does.
+            @test internalrequest(HTTP.Request("GET", "/ev/a.bin",
+                                               ["If-None-Match" => tag_a])).status == 200
+            @test internalrequest(HTTP.Request("GET", "/ev/a.bin",
+                                   ["If-None-Match" => HTTP.header(r_a, "ETag")])).status == 304
+        finally
+            resetstate()
+        end
+    end
+
+    @testset "validators describe the bytes actually sent, not the mount-time snapshot" begin
+        # The regression this guards is severe and silent: with the tag frozen at mount time, a
+        # re-reading mount served changed content under the OLD ETag and then answered 304 to a
+        # client holding it -- pinning that client to content the server no longer has. It
+        # defeats the single property `dynamicfiles` exists for.
+        # `:none` re-reads content, so BOTH the body and the validator must track the disk.
+        d = mktempdir(); f = joinpath(d, "page.txt"); write(f, "first")
+        resetstate()
+        try
+            staticfiles(d, "m"; cache = :none, stream_threshold = 0)
+            r1 = internalrequest(HTTP.Request("GET", "/m/page.txt"))
+            tag1 = HTTP.header(r1, "ETag")
+            @test bodystr(r1) == "first"
+            @test !isempty(tag1)
+
+            sleep(1.1)                                       # mtime granularity
+            write(f, "second-much-longer-content")
+            r2 = internalrequest(HTTP.Request("GET", "/m/page.txt"))
+            @test bodystr(r2) == "second-much-longer-content"
+            # The tag MOVED with the content. Without this, the assertion below is the bug.
+            @test HTTP.header(r2, "ETag") != tag1
+            # The stale validator no longer short-circuits -- this is the regression that would
+            # otherwise pin a client to content the server no longer has.
+            @test internalrequest(HTTP.Request("GET", "/m/page.txt",
+                                               ["If-None-Match" => tag1])).status == 200
+            # ... while the CURRENT tag still does, or conditional GET would be broken outright.
+            @test internalrequest(HTTP.Request("GET", "/m/page.txt",
+                                   ["If-None-Match" => HTTP.header(r2, "ETag")])).status == 304
+        finally
+            resetstate()
+        end
+
+        # `:eager` and `:lazy` both serve a SNAPSHOT -- eager from mount time, lazy from first
+        # request -- so neither is expected to notice a disk change while it holds the bytes.
+        # The property that matters for them is SELF-CONSISTENCY: the tag must describe the body
+        # being sent. Before the fix, a `:lazy` mount's tag came from a `stat` taken at mount
+        # time with no bytes in hand, so after an eviction re-read the two could disagree.
+        for policy in (:eager, :lazy)
+            d2 = mktempdir(); f2 = joinpath(d2, "page.txt"); write(f2, "first")
+            resetstate()
+            try
+                staticfiles(d2, "e"; cache = policy, stream_threshold = 0)
+                r0 = internalrequest(HTTP.Request("GET", "/e/page.txt"))
+                tag = HTTP.header(r0, "ETag")
+                @test bodystr(r0) == "first"
+
+                sleep(1.1); write(f2, "changed on disk")
+                r = internalrequest(HTTP.Request("GET", "/e/page.txt"))
+                @test bodystr(r) == "first"                  # snapshot, by design
+                @test HTTP.header(r, "ETag") == tag          # ... and the tag agrees with it
+                # The tag it emits is the one that revalidates. A tag describing the file on
+                # disk rather than the body in hand would fail here.
+                @test internalrequest(HTTP.Request("GET", "/e/page.txt",
+                                       ["If-None-Match" => tag])).status == 304
+            finally
+                resetstate()
+            end
+        end
+    end
+
+    @testset "a strong ETag hashes the bytes served, under every cache policy" begin
+        # `loadfile` decides the body, so hashing the file on disk would identify a
+        # representation that was never sent -- and a strong tag is exactly what `If-Match` and
+        # `If-Range` rely on to splice a resumed download correctly.
+        d = mktempdir(); write(joinpath(d, "a.txt"), "RAW")
+        want = "\"" * bytes2hex(SHA.sha256("TRANSFORMED")) * "\""
+        raw  = "\"" * bytes2hex(SHA.sha256("RAW")) * "\""
+        @test want != raw
+        for policy in (:eager, :lazy, :none)
+            resetstate()
+            try
+                staticfiles(d, "s"; cache = policy, etag = :strong,
+                            loadfile = _ -> "TRANSFORMED")
+                r = internalrequest(HTTP.Request("GET", "/s/a.txt"))
+                @test bodystr(r) == "TRANSFORMED"
+                @test HTTP.header(r, "ETag") == want
+                @test HTTP.header(r, "ETag") != raw
+            finally
+                resetstate()
+            end
+        end
+    end
+
+    @testset ":none re-reads content, like dynamicfiles" begin
+        d = mktempdir()
+        f = joinpath(d, "changing.txt")
+        write(f, "first")
+        resetstate()
+        try
+            staticfiles(d, "s"; cache = :none)
+            @test bodystr(internalrequest(HTTP.Request("GET", "/s/changing.txt"))) == "first"
+            write(f, "second")
+            @test bodystr(internalrequest(HTTP.Request("GET", "/s/changing.txt"))) == "second"
+            # :eager is the opposite, and still the default -- the mount serves its snapshot.
+            resetstate()
+            staticfiles(d, "e")
+            write(f, "third")
+            @test bodystr(internalrequest(HTTP.Request("GET", "/e/changing.txt"))) == "second"
+        finally
+            resetstate()
+        end
+    end
+end
+
+@testset "a skipped symlinked directory is named, not folded into a count (#95)" begin
+    # `walkdir(follow_symlinks=false)` reports every link as a FILE, so a link pointing at a
+    # directory fails the regular-file check and its whole subtree silently disappears.
+    # `dist/assets -> ../shared/assets` is an ordinary deploy layout, so this is not exotic.
+    if has_inside_dir
+        logs = Test.collect_test_logs() do
+            MOUNTABLE(root)
+        end
+        msgs = [string(r.message) for r in logs[1]]
+        named = filter(m -> occursin("skipping a symlinked directory", m), msgs)
+        @test !isempty(named)
+        # The point of the change: the offending directory is identified. A count cannot be
+        # acted on; a name can.
+        linkdir_records = [r for r in logs[1] if occursin("skipping a symlinked directory", string(r.message))]
+        reported = reduce(vcat, [collect(keys(r.kwargs)) for r in linkdir_records]; init = Symbol[])
+        @test :path in reported
+        paths = [string(r.kwargs[:path]) for r in linkdir_records]
+        has_inside_dir && @test "sub_link" in paths
+        # Only the mount-relative path, never an absolute or resolved one -- a link may point
+        # at something whose name is itself sensitive. `isabspath` is the discriminating check;
+        # comparing against `outside` would be trivially true for a relative name.
+        @test all(p -> !isabspath(p), paths)
+        # The workaround has to be in the message, or naming the directory just relocates the
+        # puzzle.
+        @test any(m -> occursin("Mount it separately", m), named)
+
+        # The summary line still carries the class, so the two agree.
+        summary = filter(m -> occursin("will not be served", m), msgs)
+        @test !isempty(summary)
+        summary_rec = first(r for r in logs[1] if occursin("will not be served", string(r.message)))
+        @test haskey(summary_rec.kwargs, :symlinked_directory)
+        @test summary_rec.kwargs[:symlinked_directory] >= 1
+    end
+
+    # Traversal itself stays refused -- this issue was closed by naming the case, not by
+    # following it (docs/design/static-serving-boundary.md §7).
+    if has_inside_dir
+        files = servable(root)
+        @test "sub_link" ∉ files                 # the link itself is not served ...
+        @test "sub_link/nested.txt" ∉ files      # ... and neither is anything under it
+        @test "sub/nested.txt" ∈ files           # while the real directory still is
     end
 end
 
@@ -800,7 +1317,7 @@ end
         staticfiles(root, "static"; include_hidden=true)
         r = internalrequest(HTTP.Request("GET", "/static/.env"))
         @test r.status == 200
-        @test occursin("hunter2", String(r.body))
+        @test occursin("hunter2", bodystr(r))
     finally
         resetstate()
     end
@@ -821,7 +1338,7 @@ end
 
         r = internalrequest(HTTP.Request("GET", "/media/page.txt"))
         @test r.status == 200
-        @test String(r.body) == "first"
+        @test bodystr(r) == "first"
 
         write(joinpath(live, "page.txt"), "second")
         @test String(internalrequest(HTTP.Request("GET", "/media/page.txt")).body) == "second"
@@ -845,7 +1362,7 @@ end
             @test internalrequest(HTTP.Request("GET", "/app/index.html")).status == 404
             r = internalrequest(HTTP.Request("GET", "/app/deep/link"))
             @test r.status == 404
-            @test !occursin("TOP SECRET", String(r.body))
+            @test !occursin("TOP SECRET", bodystr(r))
         finally
             resetstate()
         end
@@ -861,7 +1378,7 @@ end
         spafiles(ok, "app2")
         r = internalrequest(HTTP.Request("GET", "/app2/deep/link"))
         @test r.status == 200
-        @test occursin("spa", String(r.body))
+        @test occursin("spa", bodystr(r))
     finally
         resetstate()
     end

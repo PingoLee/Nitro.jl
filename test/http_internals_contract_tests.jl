@@ -20,7 +20,7 @@ import Nitro
 #
 # None of these are part of HTTP's public, SemVer-guaranteed API, so a 2.x bump
 # can rename or remove them WITHOUT a breaking-version signal. The compat pin
-# (`HTTP = "~2.6"`) caps that exposure to 2.6 patch releases; this testset is the
+# (`HTTP = "~2.7"`) caps that exposure to 2.7 patch releases; this testset is the
 # canary — if an upgrade moves the ground, it fails HERE, loud and naming the
 # missing symbol, instead of deep inside request handling.
 #
@@ -72,6 +72,119 @@ end
     @test isdefined(HTTP, :EmptyBody)
     @test isdefined(HTTP, :BytesBody)
     @test :data in fieldnames(HTTP.BytesBody)
+    # `next_index` and `closed` are what `_check_response_body_unsent` reads to decide a body
+    # is spent (below). `_write_response_body!` must leave both alone.
+    @test :next_index in fieldnames(HTTP.BytesBody)
+    @test :closed     in fieldnames(HTTP.BytesBody)
+end
+
+@testset "reading BytesBody.data does not spend the body (HTTP 2.7 pre-send check)" begin
+    # HTTP 2.7.0 (#1364) added `_check_response_body_unsent`, called from `write_response!`
+    # before the response head goes out. It answers **500** for a `BytesBody`/`CallbackBody`
+    # already sent or closed. Nitro's whole non-consuming write path
+    # (`src/core/transport.jl::_write_response_body!`) depends on `BytesBody.data` being
+    # readable without tripping that check, because `staticfiles` and every module-level
+    # `const` error response hand the SAME `Response` object to the writer repeatedly.
+    #
+    # #1364 says only that reading `.data` directly "isn't explicitly restricted" — an absence
+    # of prohibition, not a guarantee. So pin the mechanism rather than trusting the note.
+    @test isdefined(HTTP, :_check_response_body_unsent)
+
+    # Since #1364 a String or Vector{UInt8} body is stored AS-IS — `HTTP.Response(200, "x")`
+    # no longer wraps it in a `BytesBody` at all, which is why `_write_response_body!` carries
+    # an `AbstractString`/`AbstractVector{UInt8}` method alongside the `BytesBody` one. Pin
+    # that, then build the `BytesBody` explicitly: `HTTP.servecontent` returns one for a byte
+    # source, so it is still the cursor-bearing shape the static mounts hand to the writer.
+    @test HTTP.Response(200, "abc").body isa AbstractString
+    @test HTTP.Response(200, Vector{UInt8}("abc")).body isa AbstractVector{UInt8}
+
+    body = HTTP.BytesBody(Vector{UInt8}("shared-body"))
+    resp = HTTP.Response(200, body)
+    @test resp.body isa HTTP.BytesBody
+    before_index, before_closed = body.next_index, body.closed
+
+    # Exactly what `_write_response_body!(::HTTP.Stream, ::HTTP.BytesBody)` does.
+    buf = IOBuffer()
+    for _ in 1:3
+        isempty(body.data) || write(buf, body.data)
+    end
+
+    @test body.next_index == before_index   # cursor untouched
+    @test body.closed     == before_closed  # never closed
+    @test String(take!(buf)) == "shared-body"^3
+    @test HTTP._check_response_body_unsent(resp) === nothing  # still sendable after 3 writes
+end
+
+@testset "public static-serving API (src/core/staticfiles.jl, src/response.jl)" begin
+    # `servecontent` builds Nitro's file responses: it owns ETag/Last-Modified, the whole
+    # precondition table (If-None-Match/-Modified-Since/-Match/-Unmodified-Since/-Range),
+    # 304/412/416, and byte ranges. `body_read!`/`body_closed` drive the streaming write path.
+    #
+    # These are DECLARED PUBLIC by HTTP.jl (`Expr(:public, …)` in HTTP.jl), unlike everything
+    # above — so they carry a SemVer promise and this testset is a smoke check, not a canary.
+    # It is here so a bump that moves them fails in the same place as the internals.
+    for sym in (:servecontent, :servefile, :fileserver, :AbstractBody, :CallbackBody,
+                :body_read!, :body_close!, :body_closed)
+        @test isdefined(HTTP, sym)
+    end
+
+    # `Res.adopt_stream_io!` sets `owns_io` so a streamed body releases the file handle when it is
+    # drained -- the job HTTP's own `servefile` does through a private `_finalize_servefile_source!`.
+    # It is written with `hasfield` so it does not name the private body type, which means a rename
+    # upstream would make it degrade SILENTLY into an unbounded descriptor leak rather than fail.
+    # This is the assertion that makes that loud instead.
+    let io = IOBuffer(Vector{UInt8}("streamed"))
+        streamed = HTTP.servecontent(HTTP.Request("GET", "/x"), io; name = "x.bin")
+        @test streamed.body isa HTTP.AbstractBody
+        @test !(streamed.body isa HTTP.BytesBody)          # a cursor, not a buffer
+        @test hasfield(typeof(streamed.body), :owns_io)
+        @test streamed.body.owns_io === false              # servecontent does NOT claim it
+        Nitro.Res.adopt_stream_io!(streamed, io)
+        @test streamed.body.owns_io === true               # ... and we do
+    end
+
+    # The OTHER branch, which is the one that leaks if it is wrong. A 304/412/416 carries no body
+    # at all, so nothing will ever drain it and the handle has to be closed directly -- on the
+    # cheapest request a client can make, and the one a warm client makes constantly.
+    #
+    # This asserts `!isopen(io)`, which is the only thing that fails if `else close(io)` is
+    # deleted. Asserting `status == 304` (as the mount-level tests do) passes either way.
+    let path = joinpath(mktempdir(), "x.bin")
+        write(path, "some streamable bytes")
+        tag = "\"pinned\""
+        io  = open(path, "r")
+        resp = HTTP.servecontent(HTTP.Request("GET", "/x", ["If-None-Match" => tag]), io;
+                                 name = "x.bin", etag = tag)
+        @test resp.status == 304
+        @test isopen(io)                                   # servecontent leaves it to the caller
+        Nitro.Res.adopt_stream_io!(resp, io)
+        @test !isopen(io)                                  # <-- the branch under test
+
+        # And the streamed counterpart: the handle stays open until the body is drained, then
+        # `body_close!` releases it because `owns_io` was adopted.
+        io2 = open(path, "r")
+        full = HTTP.servecontent(HTTP.Request("GET", "/x"), io2; name = "x.bin", etag = tag)
+        Nitro.Res.adopt_stream_io!(full, io2)
+        @test isopen(io2)
+        buf = Vector{UInt8}(undef, 4096)
+        while !HTTP.body_closed(full.body)
+            HTTP.body_read!(full.body, buf) == 0 && break
+        end
+        HTTP.body_close!(full.body)
+        @test !isopen(io2)
+    end
+
+    # The two outcomes the mount handler relies on, end to end.
+    src = Vector{UInt8}("hello")
+    etag = "\"v1\""
+    plain = HTTP.servecontent(HTTP.Request("GET", "/x"), src; name="x.txt", etag=etag)
+    @test plain.status == 200
+    @test HTTP.header(plain, "ETag") == etag
+
+    cond = HTTP.servecontent(HTTP.Request("GET", "/x", ["If-None-Match" => etag]), src;
+                             name="x.txt", etag=etag)
+    @test cond.status == 304
+    @test isempty(HTTP.header(cond, "Content-Length"))  # `_not_modified_headers` strips it
 end
 
 @testset "bounded-shutdown surface (src/context.jl `_shutdown_server`)" begin

@@ -23,9 +23,21 @@ address; it cannot know whether the authenticated caller owns the record they as
 `location /admin/ { allow 10.0.0.0/8; }` block is a fine *second* layer and a dangerous *only* one.
 
 Nitro's file mounts — `staticfiles`, `spafiles`, `dynamicfiles` — are a development convenience with
-a safe floor, not a production asset pipeline. They read files into memory, do not do byte ranges,
-conditional GETs or compression, and register only the files that existed at startup. The reasoning
-is recorded in `docs/design/static-serving-boundary.md`.
+a safe floor, not a production asset pipeline. They read files into memory, do not compress, and
+serve only the files that existed at startup. They *do* handle conditional GETs (`ETag`,
+`Last-Modified`, `304`) and byte ranges, so a warm client costs a `304` rather than a body — but a
+proxy still does all of it upstream, and with `sendfile`. The reasoning is recorded in
+`docs/design/static-serving-boundary.md`.
+
+Cache lifetime is yours to state, because only you know which assets are content-hashed:
+
+```julia
+staticfiles("dist/assets", "assets"; cache_control = "public, immutable, max-age=31536000")
+spafiles("dist", "";        cache_control = "no-cache")   # the shell must revalidate
+```
+
+There is deliberately no default — a `max-age` guessed on your behalf is wrong more often than
+right, and guessing high pins clients to a stale asset with no way to recover.
 
 ## Why this matters more than usual for Nitro
 

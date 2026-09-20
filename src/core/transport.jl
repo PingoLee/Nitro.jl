@@ -89,13 +89,24 @@ end
 # (e.g. module-level `const` error responses). Reading `BytesBody.data` directly is
 # cursor-independent, so a shared response can be written any number of times.
 #
-# The consume-and-close-on-write of a String→`BytesBody` body is *intentional* upstream
-# behavior (HTTP.jl #1272), not a bug to wait on; `Vector{UInt8}` bodies are written
-# non-destructively by HTTP itself (HTTP.jl #1254). Nitro depends on neither — it writes
-# the bytes here. The `BytesBody.data` field this reaches into is an HTTP internal,
-# canaried in test/http_internals_contract_tests.jl; the reuse-safety it buys is covered
-# behaviorally in test/middleware/authmiddleware_tests.jl. Do not route response bodies
-# back through HTTP's consuming writer.
+# Upstream has moved on this, in both directions, which is exactly why Nitro does not depend
+# on it. The consume-and-close-on-write of a String→`BytesBody` body was declared *intentional*
+# in HTTP.jl #1272 — and then reversed by HTTP.jl #1364 (2.7.0), which stores String bodies
+# as-is, "exactly like `Vector{UInt8}` bodies"; `Vector{UInt8}` was already non-destructive
+# (HTTP.jl #1254). Nitro depends on neither state of that question — it writes the bytes here,
+# so the reuse guarantee is ours and does not move when upstream's does.
+#
+# 2.7.0 also added `_check_response_body_unsent`, which runs in `write_response!` before the
+# head is written and answers 500 for a `BytesBody`/`CallbackBody` that is already sent or
+# closed. Reading `.data` never advances `next_index` nor sets `closed`, so a shared response
+# is never seen as spent — pinned behaviorally in test/http_internals_contract_tests.jl,
+# because #1364's note that reading `.data` directly "isn't explicitly restricted" is an
+# absence of prohibition rather than a guarantee.
+#
+# The `BytesBody.data` field this reaches into is an HTTP internal, canaried in
+# test/http_internals_contract_tests.jl; the reuse-safety it buys is covered behaviorally in
+# test/middleware/authmiddleware_tests.jl. Do not route response bodies back through HTTP's
+# consuming writer.
 _write_response_body!(stream::HTTP.Stream, ::HTTP.EmptyBody) = nothing
 _write_response_body!(stream::HTTP.Stream, ::Nothing) = nothing
 function _write_response_body!(stream::HTTP.Stream, body::HTTP.BytesBody)
@@ -104,6 +115,52 @@ function _write_response_body!(stream::HTTP.Stream, body::HTTP.BytesBody)
 end
 function _write_response_body!(stream::HTTP.Stream, body::Union{AbstractVector{UInt8}, AbstractString})
     isempty(body) || write(stream, body)
+    return nothing
+end
+
+# Size of one streaming chunk. Peak memory for a streamed response is this buffer, not the file,
+# which is the whole point of the method below. 64 KiB is `io.Copy`'s default in Go's `net/http`
+# — the tradition Nitro took its concurrency model from — and comfortably above a typical MTU or
+# socket send buffer, so a chunk is not split into a pathological number of writes.
+const _STREAM_CHUNK_BYTES = 64 * 1024
+
+# Write a STREAMING body — the one case where consuming IS the contract (#41).
+#
+# Everything above exists so a `Response` can be written repeatedly: `staticfiles` and every
+# module-level `const` error response hand the same object to the writer again and again, and
+# reading `BytesBody.data` leaves the cursor alone so they can. This method is the deliberate
+# opposite. An `HTTP.AbstractBody` that is not a `BytesBody` — `_SeekableResponseBody` from
+# `HTTP.servecontent(req, ::IO)`, or a `CallbackBody` — is a *cursor over a source*, not a buffer.
+# Reading it is the only way to send it, and a second send would produce a truncated body.
+#
+# That is not a violation of nitro-core §4; it is why §4 is phrased about SHARED responses. A
+# streamed body cannot be shared, so the rule it protects does not apply — and the rule it *does*
+# obey is HTTP 2.7's `_check_response_body_unsent`, which refuses to resend a spent body with a
+# 500 rather than silently truncating. Never cache a response built this way.
+#
+# `body_read!` / `body_closed` / `body_close!` are HTTP.jl **public** API (declared through
+# `Expr(:public, …)`), unlike the `BytesBody.data` field above — so this method depends on a
+# supported interface rather than on a layout canary.
+function _write_response_body!(stream::HTTP.Stream, body::HTTP.AbstractBody)
+    buffer = Vector{UInt8}(undef, _STREAM_CHUNK_BYTES)
+    try
+        while !HTTP.body_closed(body)
+            n = HTTP.body_read!(body, buffer)
+            n == 0 && break
+            # A view, not a copy: `body_read!` fills a prefix of the buffer and reports how much.
+            write(stream, @view(buffer[1:n]))
+        end
+    finally
+        # `finally`, not a trailing call: `write` throwing on a client disconnect is the EXPECTED
+        # event on a large download, not an exceptional one, and without this the file handle
+        # would leak on exactly the requests most likely to be interrupted. HTTP.jl does not
+        # rescue it for us — `_write_all_response!` closes bodies only on its own request-handler
+        # path, and Nitro serves through `HTTP.listen!` with its own `stream_handler`.
+        #
+        # Releases the underlying handle when the body owns it. Idempotent, and a no-op for a body
+        # that already closed itself on the final short read.
+        HTTP.body_close!(body)
+    end
     return nothing
 end
 

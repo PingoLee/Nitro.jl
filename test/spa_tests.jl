@@ -1,4 +1,4 @@
-﻿@testitem "SPA History Mode" tags=[:core, :network] setup=[NitroCommon] begin
+@testitem "SPA History Mode" tags=[:core, :network] setup=[NitroCommon] begin
 
 using Test
 using HTTP
@@ -6,6 +6,19 @@ using Nitro
 using Nitro: spafiles, GET
 
 port = get_free_port()
+
+# Read a response body WITHOUT consuming it. `String(::Vector{UInt8})` takes ownership and leaves
+# the source vector empty, and since #221 the SPA fallback closes over ONE cached `Response` --
+# every deep link resolves to the same object, so the second `String(...)` would see `""`. The
+# fallback used to re-`read` index.html per request, which is precisely the cost #40 flagged and
+# this mount no longer pays.
+function bodystr(r)
+    b = r.body
+    b isa AbstractString        && return String(b)
+    b isa AbstractVector{UInt8} && return String(copy(b))
+    b isa HTTP.BytesBody        && return String(copy(b.data))
+    return ""   # HTTP.EmptyBody -- what a bare `Response(404)` carries
+end
 
 @testset "SPA History Mode Tests" begin
     # Create a temporary directory structure to simulate an SPA build
@@ -38,23 +51,23 @@ port = get_free_port()
             # 1. Existing file request should return the exact file
             r_js = internalrequest(HTTP.Request("GET", "/app/assets/app.js"))
             @test r_js.status == 200
-            @test String(r_js.body) == "console.log('App loaded');"
+            @test bodystr(r_js) == "console.log('App loaded');"
             
             # 2. Existing index.html
             r_idx = internalrequest(HTTP.Request("GET", "/app/index.html"))
             @test r_idx.status == 200
-            @test String(r_idx.body) == "<h1>SPA Index</h1>"
+            @test bodystr(r_idx) == "<h1>SPA Index</h1>"
             
             # 3. Requesting a non-existent file inside the SPA mount (e.g., deep linking /app/users/123)
             # This should FALL BACK to index.html
             r_fallback = internalrequest(HTTP.Request("GET", "/app/users/123"))
             @test r_fallback.status == 200
-            @test String(r_fallback.body) == "<h1>SPA Index</h1>"
+            @test bodystr(r_fallback) == "<h1>SPA Index</h1>"
             
             # 4. Another random deep link
             r_fallback_2 = internalrequest(HTTP.Request("GET", "/app/login"))
             @test r_fallback_2.status == 200
-            @test String(r_fallback_2.body) == "<h1>SPA Index</h1>"
+            @test bodystr(r_fallback_2) == "<h1>SPA Index</h1>"
 
             # 5. Check missing file outside of mount (should 404 naturally)
             r_outside = internalrequest(HTTP.Request("GET", "/other/path"))

@@ -1,4 +1,4 @@
-﻿# This is where methods are coupled to a global state
+# This is where methods are coupled to a global state
 
 """
     resetstate()
@@ -83,7 +83,9 @@ route(func::Function, methods::Vector{String}, path::Union{String,HOFRouter}) = 
 
 """
     staticfiles(folder::String, mountdir::String="static"; headers::Vector=[], loadfile::Nullable{Function}=nothing,
-                include_hidden::Bool=false, allow_symlink_escape::Bool=false)
+                include_hidden::Bool=false, allow_symlink_escape::Bool=false,
+                etag=:weak_stat, cache_control=nothing, cache=:eager,
+                stream_threshold=8*1024*1024, cache_max_bytes=64*1024*1024)
 
 Mount the servable files inside `folder` under `mountdir`, reading each one **once at startup** —
 fast to serve, but a change on disk needs a restart. Use [`dynamicfiles`](@ref) to re-read per
@@ -154,6 +156,33 @@ staticfiles("public/.well-known", ".well-known")
 
 Note this registers only the files present at startup; anything written later (an ACME
 `acme-challenge` token, say) needs its own route.
+
+# Caching, validators and memory
+
+| Keyword | Default | Effect |
+|---|---|---|
+| `etag` | `:weak_stat` | `W/"<size>-<mtime>"`. Also `:strong` (sha256 of the body served), a `String` used verbatim, or `nothing` for no `ETag` |
+| `cache_control` | `nothing` | emitted verbatim when given. **No default is invented** — hashed build output wants a year and an unhashed `index.html` wants zero, and guessing high pins a client to a stale asset |
+| `cache` | ``:eager`` | `:eager` reads at mount and holds; `:lazy` reads on first request into a byte-bounded LRU; `:none` re-reads per request |
+| `stream_threshold` | 8 MiB | a file larger than this is streamed in chunks rather than buffered, so peak memory is a buffer and not the file. `0` disables streaming |
+| `cache_max_bytes` | 64 MiB | the `:lazy` budget, in bytes across the whole mount |
+
+The mount answers conditional GETs (`If-None-Match` / `If-Modified-Since` → `304`) and byte ranges
+(`Range` → `206`, an unsatisfiable one → `416`). [`Res.file`](@ref) gives a handler the same thing.
+
+**Validators describe the bytes actually sent.** Under `:eager` and `:lazy` those are a snapshot,
+so a change on disk is not picked up and the `ETag` does not move either; under `:none` both track
+the file. A mount never re-`stat`s to *detect* a change — which files exist is decided once, at
+mount time.
+
+**`etag = :strong` costs what it measures.** It hashes the body it is about to send, so under
+`:eager` that is once per file at mount, but under `:none` — and for an entry too large for the
+`:lazy` budget — it is a full hash **on every request**. `dynamicfiles(dir; etag = :strong)` over a
+100 MB file hashes 100 MB per request. `:weak_stat` is the default for this reason.
+
+**A non-GET request under the mount prefix is a `405`, not a `404`**, because the mount's
+catch-all matches the path and carries `GET` only.
+
 """
 staticfiles(
     folder::String,
@@ -161,8 +190,13 @@ staticfiles(
     headers::Vector=[],
     loadfile::Nullable{Function}=nothing,
     include_hidden::Bool=false,
-    allow_symlink_escape::Bool=false
-) = Nitro.Core.staticfiles(CONTEXT[], CONTEXT[].service.router, folder, mountdir; headers, loadfile, include_hidden, allow_symlink_escape)
+    allow_symlink_escape::Bool=false,
+    etag = :weak_stat,
+    cache_control::Union{Nothing,AbstractString}=nothing,
+    cache::Symbol=:eager,
+    stream_threshold::Integer=Nitro.Core.MOUNT_STREAM_THRESHOLD,
+    cache_max_bytes::Integer=Nitro.Core.MOUNT_CACHE_MAX_BYTES
+) = Nitro.Core.staticfiles(CONTEXT[], CONTEXT[].service.router, folder, mountdir; headers, loadfile, include_hidden, allow_symlink_escape, etag, cache_control, cache, stream_threshold, cache_max_bytes)
 
 
 """
@@ -210,6 +244,33 @@ in [`staticfiles`](@ref); the same rules apply here. Three SPA-specific conseque
   A filename needing percent-encoding is no longer in that class: it is mounted at its encoded
   route, so `/<prefix>/caf%C3%A9.txt` serves the asset rather than silently resolving to the app
   shell ([#121](https://github.com/PingoLee/Nitro.jl/issues/121)).
+
+# Caching, validators and memory
+
+| Keyword | Default | Effect |
+|---|---|---|
+| `etag` | `:weak_stat` | `W/"<size>-<mtime>"`. Also `:strong` (sha256 of the body served), a `String` used verbatim, or `nothing` for no `ETag` |
+| `cache_control` | `nothing` | emitted verbatim when given. **No default is invented** — hashed build output wants a year and an unhashed `index.html` wants zero, and guessing high pins a client to a stale asset |
+| `cache` | ``:eager`` | `:eager` reads at mount and holds; `:lazy` reads on first request into a byte-bounded LRU; `:none` re-reads per request |
+| `stream_threshold` | 8 MiB | a file larger than this is streamed in chunks rather than buffered, so peak memory is a buffer and not the file. `0` disables streaming |
+| `cache_max_bytes` | 64 MiB | the `:lazy` budget, in bytes across the whole mount |
+
+The mount answers conditional GETs (`If-None-Match` / `If-Modified-Since` → `304`) and byte ranges
+(`Range` → `206`, an unsatisfiable one → `416`). [`Res.file`](@ref) gives a handler the same thing.
+
+**Validators describe the bytes actually sent.** Under `:eager` and `:lazy` those are a snapshot,
+so a change on disk is not picked up and the `ETag` does not move either; under `:none` both track
+the file. A mount never re-`stat`s to *detect* a change — which files exist is decided once, at
+mount time.
+
+**`etag = :strong` costs what it measures.** It hashes the body it is about to send, so under
+`:eager` that is once per file at mount, but under `:none` — and for an entry too large for the
+`:lazy` budget — it is a full hash **on every request**. `dynamicfiles(dir; etag = :strong)` over a
+100 MB file hashes 100 MB per request. `:weak_stat` is the default for this reason.
+
+**A non-GET request under the mount prefix is a `405`, not a `404`**, because the mount's
+catch-all matches the path and carries `GET` only.
+
 """
 spafiles(
     folder::String,
@@ -217,13 +278,20 @@ spafiles(
     headers::Vector=[],
     loadfile::Nullable{Function}=nothing,
     include_hidden::Bool=false,
-    allow_symlink_escape::Bool=false
-) = Nitro.Core.spafiles(CONTEXT[], CONTEXT[].service.router, folder, mountdir; headers, loadfile, include_hidden, allow_symlink_escape)
+    allow_symlink_escape::Bool=false,
+    etag = :weak_stat,
+    cache_control::Union{Nothing,AbstractString}=nothing,
+    cache::Symbol=:eager,
+    stream_threshold::Integer=Nitro.Core.MOUNT_STREAM_THRESHOLD,
+    cache_max_bytes::Integer=Nitro.Core.MOUNT_CACHE_MAX_BYTES
+) = Nitro.Core.spafiles(CONTEXT[], CONTEXT[].service.router, folder, mountdir; headers, loadfile, include_hidden, allow_symlink_escape, etag, cache_control, cache, stream_threshold, cache_max_bytes)
 
 
 """
     dynamicfiles(folder::String, mountdir::String="static"; headers::Vector=[], loadfile::Nullable{Function}=nothing,
-                 include_hidden::Bool=false, allow_symlink_escape::Bool=false)
+                 include_hidden::Bool=false, allow_symlink_escape::Bool=false,
+                 etag=:weak_stat, cache_control=nothing, cache=:none,
+                 stream_threshold=8*1024*1024, cache_max_bytes=64*1024*1024)
 
 Mount the servable files inside `folder` under `mountdir`, re-reading each one **on every request**
 so changes on disk are picked up without a restart. Use [`staticfiles`](@ref) to snapshot at startup
@@ -260,6 +328,33 @@ startup get a route, so a directory that gains files at runtime needs a handler,
 That makes this the wrong tool for a directory untrusted users can write to — a file swapped for a
 symlink after startup is not re-checked. Put a reverse proxy in front of such a directory; see
 `docs/design/static-serving-boundary.md`.
+
+# Caching, validators and memory
+
+| Keyword | Default | Effect |
+|---|---|---|
+| `etag` | `:weak_stat` | `W/"<size>-<mtime>"`. Also `:strong` (sha256 of the body served), a `String` used verbatim, or `nothing` for no `ETag` |
+| `cache_control` | `nothing` | emitted verbatim when given. **No default is invented** — hashed build output wants a year and an unhashed `index.html` wants zero, and guessing high pins a client to a stale asset |
+| `cache` | ``:none`` | `:eager` reads at mount and holds; `:lazy` reads on first request into a byte-bounded LRU; `:none` re-reads per request |
+| `stream_threshold` | 8 MiB | a file larger than this is streamed in chunks rather than buffered, so peak memory is a buffer and not the file. `0` disables streaming |
+| `cache_max_bytes` | 64 MiB | the `:lazy` budget, in bytes across the whole mount |
+
+The mount answers conditional GETs (`If-None-Match` / `If-Modified-Since` → `304`) and byte ranges
+(`Range` → `206`, an unsatisfiable one → `416`). [`Res.file`](@ref) gives a handler the same thing.
+
+**Validators describe the bytes actually sent.** Under `:eager` and `:lazy` those are a snapshot,
+so a change on disk is not picked up and the `ETag` does not move either; under `:none` both track
+the file. A mount never re-`stat`s to *detect* a change — which files exist is decided once, at
+mount time.
+
+**`etag = :strong` costs what it measures.** It hashes the body it is about to send, so under
+`:eager` that is once per file at mount, but under `:none` — and for an entry too large for the
+`:lazy` budget — it is a full hash **on every request**. `dynamicfiles(dir; etag = :strong)` over a
+100 MB file hashes 100 MB per request. `:weak_stat` is the default for this reason.
+
+**A non-GET request under the mount prefix is a `405`, not a `404`**, because the mount's
+catch-all matches the path and carries `GET` only.
+
 """
 dynamicfiles(
     folder::String,
@@ -267,8 +362,13 @@ dynamicfiles(
     headers::Vector=[],
     loadfile::Nullable{Function}=nothing,
     include_hidden::Bool=false,
-    allow_symlink_escape::Bool=false
-) = Nitro.Core.dynamicfiles(CONTEXT[], CONTEXT[].service.router, folder, mountdir; headers, loadfile, include_hidden, allow_symlink_escape)
+    allow_symlink_escape::Bool=false,
+    etag = :weak_stat,
+    cache_control::Union{Nothing,AbstractString}=nothing,
+    cache::Symbol=:none,
+    stream_threshold::Integer=Nitro.Core.MOUNT_STREAM_THRESHOLD,
+    cache_max_bytes::Integer=Nitro.Core.MOUNT_CACHE_MAX_BYTES
+) = Nitro.Core.dynamicfiles(CONTEXT[], CONTEXT[].service.router, folder, mountdir; headers, loadfile, include_hidden, allow_symlink_escape, etag, cache_control, cache, stream_threshold, cache_max_bytes)
 
 """
     getexternalurl()
@@ -297,6 +397,14 @@ end
     internalrequest(req::Nitro.Request; middleware::Vector=[], serialize::Bool=true, catch_errors=true, context=missing)
 
 Sends an internal request to the server, allowing for communication between different parts of the application.
+
+!!! warning "A streamed response body is yours to close"
+    This runs the whole pipeline **minus the socket layer**, so it never reaches the write path
+    that drains and closes a streaming body. A handler using `Res.file(req, path; stream = true)`,
+    or a mounted file above `stream_threshold`, therefore hands back a response whose body is an
+    **open cursor**. Drain it with `HTTP.body_read!` until it returns `0`, or call
+    `HTTP.body_close!` — otherwise the file handle stays open, which on Windows also blocks
+    deleting the file. Over a real socket this never applies: the write path always closes.
 """
 internalrequest(req::Nitro.Request; middleware::Vector=[], serialize::Bool=true, catch_errors=true, context=missing) = 
     Nitro.Core.internalrequest(CONTEXT[], req; middleware, serialize, catch_errors, context)
