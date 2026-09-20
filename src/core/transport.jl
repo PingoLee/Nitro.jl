@@ -89,13 +89,24 @@ end
 # (e.g. module-level `const` error responses). Reading `BytesBody.data` directly is
 # cursor-independent, so a shared response can be written any number of times.
 #
-# The consume-and-close-on-write of a String→`BytesBody` body is *intentional* upstream
-# behavior (HTTP.jl #1272), not a bug to wait on; `Vector{UInt8}` bodies are written
-# non-destructively by HTTP itself (HTTP.jl #1254). Nitro depends on neither — it writes
-# the bytes here. The `BytesBody.data` field this reaches into is an HTTP internal,
-# canaried in test/http_internals_contract_tests.jl; the reuse-safety it buys is covered
-# behaviorally in test/middleware/authmiddleware_tests.jl. Do not route response bodies
-# back through HTTP's consuming writer.
+# Upstream has moved on this, in both directions, which is exactly why Nitro does not depend
+# on it. The consume-and-close-on-write of a String→`BytesBody` body was declared *intentional*
+# in HTTP.jl #1272 — and then reversed by HTTP.jl #1364 (2.7.0), which stores String bodies
+# as-is, "exactly like `Vector{UInt8}` bodies"; `Vector{UInt8}` was already non-destructive
+# (HTTP.jl #1254). Nitro depends on neither state of that question — it writes the bytes here,
+# so the reuse guarantee is ours and does not move when upstream's does.
+#
+# 2.7.0 also added `_check_response_body_unsent`, which runs in `write_response!` before the
+# head is written and answers 500 for a `BytesBody`/`CallbackBody` that is already sent or
+# closed. Reading `.data` never advances `next_index` nor sets `closed`, so a shared response
+# is never seen as spent — pinned behaviorally in test/http_internals_contract_tests.jl,
+# because #1364's note that reading `.data` directly "isn't explicitly restricted" is an
+# absence of prohibition rather than a guarantee.
+#
+# The `BytesBody.data` field this reaches into is an HTTP internal, canaried in
+# test/http_internals_contract_tests.jl; the reuse-safety it buys is covered behaviorally in
+# test/middleware/authmiddleware_tests.jl. Do not route response bodies back through HTTP's
+# consuming writer.
 _write_response_body!(stream::HTTP.Stream, ::HTTP.EmptyBody) = nothing
 _write_response_body!(stream::HTTP.Stream, ::Nothing) = nothing
 function _write_response_body!(stream::HTTP.Stream, body::HTTP.BytesBody)

@@ -185,13 +185,24 @@ end
         # already correct before #92, so these are *contract* tests, not regression tests -- they
         # cannot fail on the old code. What they pin is the future: an unconditional `filesize`
         # here would put a length on the response that its body does not have.
+        # `sizeof`, not `length`, and that distinction became OBSERVABLE at HTTP 2.7 (#225).
+        # HTTP.jl #1364 stores a String body as-is instead of wrapping it in a byte-backed
+        # `BytesBody`, so `resp.body` is now a `String` here and `length` counts CHARACTERS.
+        # These assertions used `length` and passed only because the old wrapping made the two
+        # agree; on a multibyte body they now differ (15 bytes vs 13 characters). `Content-Length`
+        # is a byte count, so `Res.file` was always right to use `sizeof` -- see its own comment --
+        # and the test was measuring the wrong thing.
         grown = Res.file(utf8_path; loadfile = p -> read(p, String) * "!!")
-        @test Dict(grown.headers)["Content-Length"] == string(length(grown.body))
+        @test Dict(grown.headers)["Content-Length"] == string(sizeof(grown.body))
         @test Dict(grown.headers)["Content-Length"] != string(filesize(utf8_path))
+        # Pin the divergence itself, so a future bump that re-wraps String bodies is visible here
+        # rather than silently making `length` correct again.
+        @test grown.body isa AbstractString
+        @test sizeof(grown.body) != length(grown.body)
 
         # ... and smaller than the file on disk, the other direction of the same inconsistency.
         shrunk = Res.file(utf8_path; loadfile = _ -> "hi")
-        @test Dict(shrunk.headers)["Content-Length"] == string(length(shrunk.body))
+        @test Dict(shrunk.headers)["Content-Length"] == string(sizeof(shrunk.body))
         @test Dict(shrunk.headers)["Content-Length"] != string(filesize(utf8_path))
     end
 
