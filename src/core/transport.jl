@@ -143,15 +143,24 @@ const _STREAM_CHUNK_BYTES = 64 * 1024
 # supported interface rather than on a layout canary.
 function _write_response_body!(stream::HTTP.Stream, body::HTTP.AbstractBody)
     buffer = Vector{UInt8}(undef, _STREAM_CHUNK_BYTES)
-    while !HTTP.body_closed(body)
-        n = HTTP.body_read!(body, buffer)
-        n == 0 && break
-        # A view, not a copy: `body_read!` fills a prefix of the buffer and reports how much.
-        write(stream, @view(buffer[1:n]))
+    try
+        while !HTTP.body_closed(body)
+            n = HTTP.body_read!(body, buffer)
+            n == 0 && break
+            # A view, not a copy: `body_read!` fills a prefix of the buffer and reports how much.
+            write(stream, @view(buffer[1:n]))
+        end
+    finally
+        # `finally`, not a trailing call: `write` throwing on a client disconnect is the EXPECTED
+        # event on a large download, not an exceptional one, and without this the file handle
+        # would leak on exactly the requests most likely to be interrupted. HTTP.jl does not
+        # rescue it for us — `_write_all_response!` closes bodies only on its own request-handler
+        # path, and Nitro serves through `HTTP.listen!` with its own `stream_handler`.
+        #
+        # Releases the underlying handle when the body owns it. Idempotent, and a no-op for a body
+        # that already closed itself on the final short read.
+        HTTP.body_close!(body)
     end
-    # Releases the underlying handle when the body owns it. Idempotent, and a no-op for a body
-    # that already closed itself on the final short read.
-    HTTP.body_close!(body)
     return nothing
 end
 

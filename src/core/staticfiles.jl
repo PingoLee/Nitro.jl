@@ -103,28 +103,48 @@ struct MountPolicy
     cache::Symbol
     stream_threshold::Int
     cache_max_bytes::Int
+    # The ETag strategy, kept on the policy rather than baked into each `MountedFile`, because a
+    # mount whose content is re-read per request has to recompute its validators per request too.
+    # A small declared union, not `Any` (nitro-core §7).
+    etag::Union{Nothing,Symbol,String}
 
     # INNER constructor, so it replaces the default one rather than competing with it. An outer
     # method with this signature would be *less* specific than the compiler-generated
-    # `MountPolicy(::Symbol, ::Int, ::Int)` for `Int` arguments — which is exactly how it would be
-    # called — so every validation below would be silently skipped.
-    function MountPolicy(cache::Symbol, stream_threshold::Integer, cache_max_bytes::Integer)
+    # `MountPolicy(::Symbol, ::Int, ::Int, …)` for `Int` arguments — which is exactly how it would
+    # be called — so every validation below would be silently skipped.
+    function MountPolicy(cache::Symbol, stream_threshold::Integer, cache_max_bytes::Integer, etag)
         cache in (:eager, :lazy, :none) ||
             throw(ArgumentError("static mount: `cache` must be :eager, :lazy or :none — got $(repr(cache))"))
         stream_threshold >= 0 || throw(ArgumentError("static mount: `stream_threshold` must be >= 0, got $stream_threshold"))
         cache_max_bytes  >  0 || throw(ArgumentError("static mount: `cache_max_bytes` must be > 0, got $cache_max_bytes"))
-        return new(cache, Int(stream_threshold), Int(cache_max_bytes))
+        etag === nothing || etag === :weak_stat || etag === :strong || etag isa AbstractString ||
+            throw(ArgumentError("static mount: `etag` must be :weak_stat, :strong, a String, or nothing — got $(repr(etag))"))
+        normalized = etag isa AbstractString ? String(etag) : etag
+        return new(cache, Int(stream_threshold), Int(cache_max_bytes), normalized)
     end
+end
+
+# A cached body together with the validators that describe **it**.
+#
+# Caching bytes alone is what made a re-reading mount emit a stale `ETag` — the tag has to travel
+# with the representation it identifies, or a client is told two different bodies are the same one.
+struct CachedBody
+    bytes::Vector{UInt8}
+    etag::Nullable{String}
+    modtime::Nullable{DateTime}
 end
 
 # The read-through cache for `:lazy`, or `nothing` for the policies that do not have one.
 #
-# `by = sizeof` makes the bound a BYTE budget rather than an entry count, which is the only bound
-# that means anything here: 200 icons and 200 videos are not the same working set. LRUCache's own
-# lock makes concurrent `get!` safe, which matters because every request runs on its own thread.
+# The bound is a BYTE budget rather than an entry count, which is the only bound that means
+# anything here: 200 icons and 200 videos are not the same working set. `by` measures the body, not
+# the wrapper, so the budget still means what it says. LRUCache locks around both the probe and the
+# insert; it releases the lock while computing a missing value, so a cold-key stampede reads the
+# file twice and last-write-wins with identical bytes — benign.
 _mount_cache(policy::MountPolicy) =
     policy.cache === :lazy ?
-        LRU{String,Vector{UInt8}}(maxsize = policy.cache_max_bytes, by = sizeof) : nothing
+        LRU{String,CachedBody}(maxsize = policy.cache_max_bytes, by = cb -> sizeof(cb.bytes)) :
+        nothing
 
 # One mounted file, with everything a response needs precomputed at mount time.
 #
@@ -141,21 +161,38 @@ struct MountedFile
     stream::Bool
 end
 
-function MountedFile(path::String, policy::MountPolicy; etag, loadfile)
+function MountedFile(path::String, policy::MountPolicy; loadfile)
     # `loadfile` decides the body, so its result cannot be streamed from disk and its size is not
     # the file's size. Such a mount keeps the old read-it-all behaviour.
     streamed = isnothing(loadfile) && policy.stream_threshold > 0 &&
                filesize(path) > policy.stream_threshold
-    body = (streamed || policy.cache !== :eager) ? nothing : _read_mount(path, loadfile)
-    # A strong tag over a streamed file would mean hashing every byte at mount — exactly the whole
-    # -file read the threshold exists to avoid. Fall back to the weak one and say so.
-    effective_etag = (streamed && etag === :strong) ? :weak_stat : etag
-    if streamed && etag === :strong
+    if streamed && policy.etag === :strong
+        # A strong tag over a streamed file means hashing every byte — exactly the whole-file read
+        # the threshold exists to avoid. Downgraded rather than refused: one oversized file should
+        # not fail a whole mount. `Res.file(req, path; stream=true, etag=:strong)` DOES refuse,
+        # because there the caller named one file and can be told.
         @info "mountfolder: using a weak ETag for a streamed file; a strong tag would hash it whole" path=basename(path) size=filesize(path)
     end
-    tag, modtime = Res.file_validators(path; etag = effective_etag, bytes = body)
+
+    # Validators are frozen ONLY when the body is. `:eager` captures the bytes, so its tag
+    # describes exactly what every later request will send. `:none` and `:lazy` re-read content,
+    # and a frozen tag there is a correctness bug, not an optimization: `dynamicfiles` would serve
+    # a changed file under its old `ETag` and then answer `304` to a client holding that tag,
+    # pinning it to content that no longer exists. Those policies compute per request, from the
+    # bytes actually being sent.
+    body = (streamed || policy.cache !== :eager) ? nothing : _read_mount(path, loadfile)
+    tag, modtime = if body === nothing
+        (nothing, nothing)
+    else
+        Res.file_validators(path; etag = policy.etag, bytes = body)
+    end
     return MountedFile(path, body, tag, modtime, Res.file_content_type(path), streamed)
 end
+
+# The ETag strategy for a representation whose bytes are NOT held: a streamed file cannot be
+# hashed without reading it whole, which is the thing streaming avoids.
+_effective_etag(policy::MountPolicy, streamed::Bool) =
+    (streamed && policy.etag === :strong) ? :weak_stat : policy.etag
 
 function _read_mount(path::String, loadfile)
     isnothing(loadfile) && return read(path)
@@ -180,10 +217,14 @@ function _serve_mounted(req::HTTP.Request, mf::MountedFile, policy::MountPolicy,
         # and is therefore single-use — which is why a streamed file is never cached, and why
         # `adopt_stream_io!` must hand the handle over (or close it when a 304/416 carries no body
         # at all, or the descriptor leaks on exactly the cheapest request).
+        #
+        # Validators are computed PER REQUEST here: the file is re-opened each time, so a
+        # mount-time tag would describe a representation this response is not sending.
         io = open(mf.path, "r")
         try
-            resp = HTTP.servecontent(req, io; name = basename(mf.path), modtime = mf.modtime,
-                                     content_type = mf.content_type, etag = mf.etag,
+            tag, modtime = Res.file_validators(mf.path; etag = _effective_etag(policy, true))
+            resp = HTTP.servecontent(req, io; name = basename(mf.path), modtime = modtime,
+                                     content_type = mf.content_type, etag = tag,
                                      headers = extra)
             Res.adopt_stream_io!(resp, io)
             return Res.apply_headers!(resp, headers)
@@ -193,15 +234,28 @@ function _serve_mounted(req::HTTP.Request, mf::MountedFile, policy::MountPolicy,
         end
     end
 
-    source = if mf.bytes !== nothing
-        mf.bytes
+    source, tag, modtime = if mf.bytes !== nothing
+        # `:eager` — the snapshot and its validators were both taken at mount time and agree.
+        (mf.bytes, mf.etag, mf.modtime)
     elseif cache !== nothing
-        get!(() -> _read_mount(mf.path, loadfile), cache, mf.path)
+        # `:lazy` — the tag is cached WITH the bytes, so it always identifies the body in hand
+        # even after an eviction re-reads a file that has since changed on disk.
+        cb = get!(cache, mf.path) do
+            body = _read_mount(mf.path, loadfile)
+            t, m = Res.file_validators(mf.path; etag = policy.etag, bytes = body)
+            CachedBody(body, t, m)
+        end
+        (cb.bytes, cb.etag, cb.modtime)
     else
-        _read_mount(mf.path, loadfile)
+        # `:none` — re-read per request, so the validators are derived from that read. This is the
+        # whole point of `dynamicfiles`: a change on disk must be visible, and a validator that
+        # did not move would hide it behind a 304.
+        body = _read_mount(mf.path, loadfile)
+        t, m = Res.file_validators(mf.path; etag = policy.etag, bytes = body)
+        (body, t, m)
     end
-    resp = HTTP.servecontent(req, source; name = basename(mf.path), modtime = mf.modtime,
-                             content_type = mf.content_type, etag = mf.etag, headers = extra)
+    resp = HTTP.servecontent(req, source; name = basename(mf.path), modtime = modtime,
+                             content_type = mf.content_type, etag = tag, headers = extra)
     return Res.apply_headers!(resp, headers)
 end
 
@@ -222,13 +276,13 @@ function staticfiles(
 )
     files  = Dict{String,String}()
     table  = Dict{String,MountedFile}()
-    policy = MountPolicy(cache, stream_threshold, cache_max_bytes)
+    policy = MountPolicy(cache, stream_threshold, cache_max_bytes, etag)
     lru    = _mount_cache(policy)
 
     # The bytes are captured now, so the file this mount serves cannot change on disk afterwards.
     function addroute(_route, filepath, key)
         _table_insert!(files, key, filepath)
-        table[key] = MountedFile(filepath, policy; etag = etag, loadfile = loadfile)
+        table[key] = MountedFile(filepath, policy; loadfile = loadfile)
         return nothing
     end
     mounted = mountfolder(folder, mountdir, addroute; include_hidden, allow_symlink_escape)
@@ -268,12 +322,12 @@ function spafiles(
 )
     files  = Dict{String,String}()
     table  = Dict{String,MountedFile}()
-    policy = MountPolicy(cache, stream_threshold, cache_max_bytes)
+    policy = MountPolicy(cache, stream_threshold, cache_max_bytes, etag)
     lru    = _mount_cache(policy)
 
     function addroute(_route, filepath, key)
         _table_insert!(files, key, filepath)
-        table[key] = MountedFile(filepath, policy; etag = etag, loadfile = loadfile)
+        table[key] = MountedFile(filepath, policy; loadfile = loadfile)
         return nothing
     end
     mounted = mountfolder(folder, mountdir, addroute; include_hidden, allow_symlink_escape)
@@ -318,7 +372,7 @@ function spafiles(
         # and therefore the same 304 behaviour as the direct route: a client that has the shell
         # cached revalidates a deep link with a 304 instead of refetching it.
         index_path = last(mounted[index_idx])
-        index_mf   = MountedFile(index_path, policy; etag = etag, loadfile = loadfile)
+        index_mf   = MountedFile(index_path, policy; loadfile = loadfile)
         function (req::HTTP.Request)
             mf = _lookup_mount(table, req.target, nprefix)
             # A miss — or an unnameable path (`..`, an encoded separator) — is a client asking for
@@ -355,7 +409,7 @@ function dynamicfiles(
     # attacker can change is out of scope for this layer — see docs/design/static-serving-boundary.md.
     files  = Dict{String,String}()
     table  = Dict{String,MountedFile}()
-    policy = MountPolicy(cache, stream_threshold, cache_max_bytes)
+    policy = MountPolicy(cache, stream_threshold, cache_max_bytes, etag)
     lru    = _mount_cache(policy)
     function addroute(_route, filepath, key)
         _table_insert!(files, key, filepath)
@@ -363,7 +417,7 @@ function dynamicfiles(
         # point of this mount. The validators are still computed at mount time, as everywhere else
         # — they describe the snapshot the mount decided on, and re-`stat`ing per request is the
         # per-request filesystem work §6 removed on purpose.
-        table[key] = MountedFile(filepath, policy; etag = etag, loadfile = loadfile)
+        table[key] = MountedFile(filepath, policy; loadfile = loadfile)
         return nothing
     end
     mounted = mountfolder(folder, mountdir, addroute; include_hidden, allow_symlink_escape)

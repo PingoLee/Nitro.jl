@@ -475,10 +475,19 @@ implementation that used one comparison for both would pass every simple test.
 us a content-negotiated compressor. That would be a codec, an `Accept-Encoding` negotiation and a
 cache of precompressed bodies — real code to own, for something §1 gives to the proxy.
 
-**Validators are computed at mount time, not per request.** `MountedFile` holds the `ETag`,
-`Last-Modified` and `Content-Type` alongside the captured bytes. Re-`stat`ing per request to notice
-a changed file is exactly the per-request filesystem work §6 removed, and it would contradict §7's
-"mounts register a snapshot" in any case: the validators describe what the mount decided to serve.
+**A validator describes the bytes being sent — which is not always the mount-time snapshot.**
+`:eager` captures the body at mount, so its tag is computed once and frozen with it. `:none` and
+`:lazy` re-read content, so freezing the tag there was a real defect rather than an optimization:
+`dynamicfiles` would serve a changed file under its old `ETag` and then answer `304` to a client
+holding that tag, pinning it to content the server no longer has — defeating the one property
+`dynamicfiles` exists for. Those policies compute validators from the bytes they actually read, and
+`:lazy` caches the tag *with* the body so the two cannot drift apart across an eviction.
+
+This is **not** the per-request filesystem re-validation §6 removed. §6 is about re-checking
+*containment* — `realpath`, symlink re-resolution — to detect a file swapped after startup. Nothing
+here re-evaluates the mount rules, and no mount ever re-`stat`s to *discover* a change: which files
+exist is still decided once, at mount time. A policy that re-reads content simply describes what it
+read.
 
 The default tag is **`W/"<size>-<mtime>"`**, which is what Go's `net/http` and nginx both use. A
 strong tag means hashing every byte — once per file at startup for a mount, which is free for a

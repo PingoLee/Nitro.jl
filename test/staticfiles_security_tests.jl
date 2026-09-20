@@ -3,6 +3,7 @@
 using Test
 using HTTP
 using Nitro
+import SHA
 
 const MOUNTABLE   = Nitro.Core.Util.mountable_files
 const MOUNTFOLDER = Nitro.Core.Util.mountfolder
@@ -897,6 +898,19 @@ end
             @test internalrequest(HTTP.Request("GET", "/static/nope.txt")).status == 404
             # ... and a path outside the mount is untouched by any of this.
             @test internalrequest(HTTP.Request("GET", "/elsewhere/nope.txt")).status == 404
+
+            # Asserting `status == 404` alone is NOT the property: a hardcoded
+            # `HTTP.Response(404)` in the mount handler satisfies it while silently disabling the
+            # app's own handler. Give the router a custom 404 with a recognisable body and
+            # require the mount's miss to carry it.
+            custom = Nitro.Core.App(service = Nitro.Core.Service(
+                router = HTTP.Router(_ -> HTTP.Response(404, "CUSTOM-NOT-FOUND"))))
+            staticfiles(custom, root, "static")
+            miss = internalrequest(custom, HTTP.Request("GET", "/static/nope.txt"))
+            @test miss.status == 404
+            @test bodystr(miss) == "CUSTOM-NOT-FOUND"
+            # A hit is unaffected.
+            @test bodystr(internalrequest(custom, HTTP.Request("GET", "/static/visible.txt"))) == "visible"
         end
 
         @testset "an application route still beats the mount at the same path" begin
@@ -997,13 +1011,14 @@ end
 
     @testset "policy validation rejects nonsense rather than silently defaulting" begin
         MP = Nitro.Core.MountPolicy
-        @test_throws ArgumentError MP(:sometimes, 1024, 1024)
-        @test_throws ArgumentError MP(:eager, -1, 1024)
-        @test_throws ArgumentError MP(:eager, 1024, 0)
+        @test_throws ArgumentError MP(:sometimes, 1024, 1024, :weak_stat)
+        @test_throws ArgumentError MP(:eager, -1, 1024, :weak_stat)
+        @test_throws ArgumentError MP(:eager, 1024, 0, :weak_stat)
         # The validating constructor must be INNER: an outer method with this signature would be
         # less specific than the compiler-generated one for `Int` arguments, which is exactly how
         # it is called, and every check above would be skipped.
-        @test MP(:eager, 1024, 1024) isa MP
+        @test_throws ArgumentError MP(:eager, 1024, 1024, :nonsense)
+        @test MP(:eager, 1024, 1024, :weak_stat) isa MP
         @test_throws ArgumentError staticfiles(big_dir, "x"; cache = :sometimes)
     end
 
@@ -1060,21 +1075,149 @@ end
         end
     end
 
-    @testset ":lazy reads on first request and serves the same bytes thereafter" begin
+    @testset ":lazy actually caches, and the byte budget actually evicts" begin
+        # A `loadfile` counter is what makes this DISCRIMINATING: asserting only that the right
+        # bytes come back passes identically if `:lazy` silently degrades to `:none` (re-read
+        # every time) or to `:eager` (read everything at mount). Counting reads separates all
+        # three.
+        reads = Dict{String,Int}()
+        counting_loadfile = p -> (reads[basename(p)] = get(reads, basename(p), 0) + 1; read(p))
+
         resetstate()
         try
-            # A budget smaller than the mount forces eviction, which is the case a count-based
-            # bound would get wrong and a byte-based one gets right.
             staticfiles(big_dir, "big"; cache = :lazy, stream_threshold = 0,
-                        cache_max_bytes = 128 * 1024)
+                        cache_max_bytes = 128 * 1024, loadfile = counting_loadfile)
+            # Nothing is read at mount time -- that is what makes it lazy rather than eager.
+            @test isempty(reads)
+
             for _ in 1:3
                 @test bodystr(internalrequest(HTTP.Request("GET", "/big/small.txt"))) == "small"
+            end
+            # Read ONCE across three hits: the cache is real.
+            @test reads["small.txt"] == 1
+
+            # big.bin is 300 KB against a 128 KB budget. LRUCache does NOT evict to make room for
+            # an entry larger than `maxsize` -- it declines to store it and leaves the cache
+            # intact -- so this is the "oversized entry cannot wedge the cache" case: it is
+            # served correctly, re-read every time, and small.txt keeps its slot.
+            for _ in 1:2
                 r = internalrequest(HTTP.Request("GET", "/big/big.bin"))
                 @test r.status == 200
                 @test length(r.body) == length(big_bytes)
             end
+            @test reads["big.bin"] == 2          # never cached, so re-read each time
+            @test reads["small.txt"] == 1        # ... and it did not displace small.txt
+
+            # Eviction proper needs entries that each FIT but together do not -- next block.
         finally
             resetstate()
+        end
+
+        reads2 = Dict{String,Int}()
+        counting2 = p -> (reads2[basename(p)] = get(reads2, basename(p), 0) + 1; read(p))
+        evict_dir = mktempdir()
+        write(joinpath(evict_dir, "a.bin"), rand(UInt8, 50_000))
+        write(joinpath(evict_dir, "b.bin"), rand(UInt8, 50_000))
+        resetstate()
+        try
+            staticfiles(evict_dir, "ev"; cache = :lazy, stream_threshold = 0,
+                        cache_max_bytes = 80_000, loadfile = counting2)
+            internalrequest(HTTP.Request("GET", "/ev/a.bin"))
+            internalrequest(HTTP.Request("GET", "/ev/a.bin"))
+            @test reads2["a.bin"] == 1                  # cached
+
+            internalrequest(HTTP.Request("GET", "/ev/b.bin"))   # 100 KB > 80 KB budget
+            internalrequest(HTTP.Request("GET", "/ev/a.bin"))
+            # a.bin was evicted to make room for b.bin, so it had to be read again. A COUNT-based
+            # bound of two entries would have kept both and left this at 1 -- which is exactly
+            # what distinguishes a byte budget from an entry count.
+            @test reads2["a.bin"] == 2
+            @test reads2["b.bin"] == 1
+        finally
+            resetstate()
+        end
+    end
+
+    @testset "validators describe the bytes actually sent, not the mount-time snapshot" begin
+        # The regression this guards is severe and silent: with the tag frozen at mount time, a
+        # re-reading mount served changed content under the OLD ETag and then answered 304 to a
+        # client holding it -- pinning that client to content the server no longer has. It
+        # defeats the single property `dynamicfiles` exists for.
+        # `:none` re-reads content, so BOTH the body and the validator must track the disk.
+        d = mktempdir(); f = joinpath(d, "page.txt"); write(f, "first")
+        resetstate()
+        try
+            staticfiles(d, "m"; cache = :none, stream_threshold = 0)
+            r1 = internalrequest(HTTP.Request("GET", "/m/page.txt"))
+            tag1 = HTTP.header(r1, "ETag")
+            @test bodystr(r1) == "first"
+            @test !isempty(tag1)
+
+            sleep(1.1)                                       # mtime granularity
+            write(f, "second-much-longer-content")
+            r2 = internalrequest(HTTP.Request("GET", "/m/page.txt"))
+            @test bodystr(r2) == "second-much-longer-content"
+            # The tag MOVED with the content. Without this, the assertion below is the bug.
+            @test HTTP.header(r2, "ETag") != tag1
+            # The stale validator no longer short-circuits -- this is the regression that would
+            # otherwise pin a client to content the server no longer has.
+            @test internalrequest(HTTP.Request("GET", "/m/page.txt",
+                                               ["If-None-Match" => tag1])).status == 200
+            # ... while the CURRENT tag still does, or conditional GET would be broken outright.
+            @test internalrequest(HTTP.Request("GET", "/m/page.txt",
+                                   ["If-None-Match" => HTTP.header(r2, "ETag")])).status == 304
+        finally
+            resetstate()
+        end
+
+        # `:eager` and `:lazy` both serve a SNAPSHOT -- eager from mount time, lazy from first
+        # request -- so neither is expected to notice a disk change while it holds the bytes.
+        # The property that matters for them is SELF-CONSISTENCY: the tag must describe the body
+        # being sent. Before the fix, a `:lazy` mount's tag came from a `stat` taken at mount
+        # time with no bytes in hand, so after an eviction re-read the two could disagree.
+        for policy in (:eager, :lazy)
+            d2 = mktempdir(); f2 = joinpath(d2, "page.txt"); write(f2, "first")
+            resetstate()
+            try
+                staticfiles(d2, "e"; cache = policy, stream_threshold = 0)
+                r0 = internalrequest(HTTP.Request("GET", "/e/page.txt"))
+                tag = HTTP.header(r0, "ETag")
+                @test bodystr(r0) == "first"
+
+                sleep(1.1); write(f2, "changed on disk")
+                r = internalrequest(HTTP.Request("GET", "/e/page.txt"))
+                @test bodystr(r) == "first"                  # snapshot, by design
+                @test HTTP.header(r, "ETag") == tag          # ... and the tag agrees with it
+                # The tag it emits is the one that revalidates. A tag describing the file on
+                # disk rather than the body in hand would fail here.
+                @test internalrequest(HTTP.Request("GET", "/e/page.txt",
+                                       ["If-None-Match" => tag])).status == 304
+            finally
+                resetstate()
+            end
+        end
+    end
+
+    @testset "a strong ETag hashes the bytes served, under every cache policy" begin
+        # `loadfile` decides the body, so hashing the file on disk would identify a
+        # representation that was never sent -- and a strong tag is exactly what `If-Match` and
+        # `If-Range` rely on to splice a resumed download correctly.
+        d = mktempdir(); write(joinpath(d, "a.txt"), "RAW")
+        want = "\"" * bytes2hex(SHA.sha256("TRANSFORMED")) * "\""
+        raw  = "\"" * bytes2hex(SHA.sha256("RAW")) * "\""
+        @test want != raw
+        for policy in (:eager, :lazy, :none)
+            resetstate()
+            try
+                staticfiles(d, "s"; cache = policy, etag = :strong,
+                            loadfile = _ -> "TRANSFORMED")
+                r = internalrequest(HTTP.Request("GET", "/s/a.txt"))
+                @test bodystr(r) == "TRANSFORMED"
+                @test HTTP.header(r, "ETag") == want
+                @test HTTP.header(r, "ETag") != raw
+            finally
+                resetstate()
+            end
         end
     end
 
@@ -1103,7 +1246,7 @@ end
     # `walkdir(follow_symlinks=false)` reports every link as a FILE, so a link pointing at a
     # directory fails the regular-file check and its whole subtree silently disappears.
     # `dist/assets -> ../shared/assets` is an ordinary deploy layout, so this is not exotic.
-    if has_inside_dir || has_escape_dir
+    if has_inside_dir
         logs = Test.collect_test_logs() do
             MOUNTABLE(root)
         end
@@ -1117,9 +1260,10 @@ end
         @test :path in reported
         paths = [string(r.kwargs[:path]) for r in linkdir_records]
         has_inside_dir && @test "sub_link" in paths
-        # Only the mount-relative path, never the resolved target -- a link may point at
-        # something whose name is itself sensitive.
-        @test all(p -> !occursin(outside, p), paths)
+        # Only the mount-relative path, never an absolute or resolved one -- a link may point
+        # at something whose name is itself sensitive. `isabspath` is the discriminating check;
+        # comparing against `outside` would be trivially true for a relative name.
+        @test all(p -> !isabspath(p), paths)
         # The workaround has to be in the message, or naming the directory just relocates the
         # puzzle.
         @test any(m -> occursin("Mount it separately", m), named)

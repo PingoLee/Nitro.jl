@@ -147,6 +147,13 @@ function setupmiddleware(ctx::App; middleware::Vector=[], serialize::Bool=true, 
     ])
 end
 
+# NOTE on STREAMING response bodies (#41). This runs the whole pipeline *minus* the socket layer,
+# so it never reaches `_write_response_body!` — which is what drains and closes a streaming body.
+# A handler or mount that streams (`Res.file(req, path; stream=true)`, or a mounted file above
+# `stream_threshold`) therefore hands back a response whose body is an OPEN cursor, and the caller
+# owns it: drain it with `HTTP.body_read!` until it reports 0, or call `HTTP.body_close!`. Until
+# then the file handle stays open, which on Windows also blocks deleting the file. Over a real
+# socket none of this applies — the write path always closes.
 function internalrequest(ctx::App, req::HTTP.Request; middleware::Vector=[], serialize::Bool=true, catch_errors=true, context=missing)::HTTP.Response
     req.context[:ip] = IPv4("127.0.0.1")
 

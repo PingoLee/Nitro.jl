@@ -88,7 +88,12 @@ function file_validators(path::AbstractString; etag = :weak_stat, bytes = nothin
     tag = if etag === nothing
         nothing
     elseif etag === :weak_stat
-        string("W/\"", st.size, "-", round(Int64, st.mtime), "\"")
+        # `sizeof(bytes)` when the caller has the body, `st.size` only when it does not. A
+        # `loadfile` decides the body, so the file's own size is not the representation's size —
+        # the same rule `Res.file` applies to `Content-Length` (#92). Using `st.size` here would
+        # emit a validator for a representation that was never sent.
+        size = bytes === nothing ? st.size : sizeof(bytes)
+        string("W/\"", size, "-", round(Int64, st.mtime), "\"")
     elseif etag === :strong
         body = bytes === nothing ? read(path) : bytes
         string("\"", bytes2hex(sha256(body)), "\"")

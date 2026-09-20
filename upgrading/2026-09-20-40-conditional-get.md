@@ -67,10 +67,13 @@ tag is exactly as good for `If-None-Match`, which compares weakly. Use `:strong`
 still gives it to the proxy. Cache validation and ranges moved off that list only because HTTP.jl
 ships them; a content-negotiated compressor would be a codec, a negotiation and a cache to own.
 
-Also unchanged: validators are computed **at mount time**, not per request. A mount serves a
-snapshot (§6, §7), so re-`stat`ing per request to notice a changed file would be exactly the
-per-request filesystem work that was removed on purpose. A `dynamicfiles` mount still re-reads
-*content* per request; its validators still describe the mount-time snapshot.
+Validators always describe **the bytes being sent**. Under `cache = :eager` (the default for
+`staticfiles`/`spafiles`) that is the mount-time snapshot, so the `ETag` does not move when the file
+changes on disk — the snapshot is what is served. Under `cache = :none` (the default for
+`dynamicfiles`) content is re-read per request, so the validator is recomputed from that read and
+**does** track the file; anything else would let a stale `304` pin a client to content the server no
+longer has. No mount re-`stat`s to *detect* a change — which files exist is still decided once, at
+mount time (§6, §7).
 
 ### How to find the calls to migrate
 

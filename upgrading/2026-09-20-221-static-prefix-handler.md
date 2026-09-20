@@ -6,7 +6,7 @@
   `test/util_tests.jl`, `test/spa_tests.jl`
 - **Recorded**: 2026-09-20
 - **Severity**: **behavior.** Most of this is repair — URLs that answered nobody now answer
-  everybody — but four things change for an app that was relying on the old shape, and they are
+  everybody — but six things change for an app that was relying on the old shape, and they are
   called out below.
 
 ### What changed
@@ -52,7 +52,7 @@ It no longer has to be migrated: both spellings decode to one key and both are s
 changed a client to percent-encode because of the #121 entry, that change is still correct and
 still works; it simply is no longer required.
 
-#### Four things that do change
+#### Six things that do change
 
 **1. An application route now always beats a mount at the same path.** HTTP.jl matches
 `exact → conditional → wildcard → doublestar`, so a literal app route under a mount prefix wins
@@ -82,6 +82,34 @@ route, and an unmatched path under a mount now *matches* a route rather than fal
 served response for a miss is unchanged: the mount defers to the router's own not-found handler, so
 a custom one supplied through `Service(router = Router(my404))` keeps working.
 
+**5. A non-GET request under a mount prefix is now `405`, not `404`.** The catch-all matches the
+path and its leaf carries `GET` only, so HTTP.jl reports a method mismatch rather than a miss:
+
+```
+POST /static/does-not-exist.txt   404  ->  405
+PUT  /static/does-not-exist.txt   404  ->  405
+HEAD /static/does-not-exist.txt   404  ->  405
+GET  /static/does-not-exist.txt   404  ->  404   (unchanged)
+```
+
+`spafiles` already behaved this way — it registered a `/<prefix>/**` catch-all before this change —
+but `staticfiles` and `dynamicfiles` did not. **At a root mount this covers the whole
+application**: with `staticfiles(dir, "")`, `POST /api/anything` is a `405` where it used to be a
+`404`. If you mount at the root and rely on `404` for unrouted non-GET requests, mount under a
+prefix instead, or declare the routes explicitly.
+
+**6. On Linux/macOS, a filename containing a literal `\` becomes unreachable.** `\` is a legal
+filename character there, and such a file is still *enumerated* and still appears in the mount's
+return value at its encoded route `/static/a%5Cb.txt` — but the handler refuses any decoded segment
+containing a separator, so that URL now `404`s. It was served before, because the literal route
+matched byte for byte.
+
+The refusal is deliberate and platform-independent: `%5C` survives the split on `/` as one segment
+and only becomes a separator after decoding, so accepting it would let one URL name a file whose own
+route is a different URL. Phoenix's `Plug.Static` and HTTP.jl's own file server both reject `\` on
+every platform for the same reason. On Windows the case cannot arise — `mountfolder` normalises the
+separator, so no table key can contain one. **Rename such a file, or serve it from a handler.**
+
 #### Internal API: `mountfolder`'s callback takes a third argument
 
 `Nitro.Core.Util.mountfolder(folder, mountdir, addroute)` now calls
@@ -105,6 +133,12 @@ rg -n '%[0-9A-Za-z]{0,2}[^0-9A-Fa-f].*404|404.*%ZZ' <app>/test
 # 4. Anything asserting on the NUMBER of registered routes, or reading req.context[:route]
 #    for a static request.
 rg -n 'context\[:route\]' <app>/src <app>/test
+
+# 5. Tests asserting 404 for a NON-GET request under a mount prefix -- these want 405 now.
+rg -n '"(POST|PUT|PATCH|DELETE|HEAD)".*(static|assets)' <app>/test
+
+# 6. POSIX only: mounted filenames containing a literal backslash, which stop being reachable.
+find <mounted-folder> -name '*\*'
 ```
 
 Nitro also tells you about collision case 2 at mount time — grep your startup log for

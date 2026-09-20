@@ -143,6 +143,37 @@ end
         @test streamed.body.owns_io === true               # ... and we do
     end
 
+    # The OTHER branch, which is the one that leaks if it is wrong. A 304/412/416 carries no body
+    # at all, so nothing will ever drain it and the handle has to be closed directly -- on the
+    # cheapest request a client can make, and the one a warm client makes constantly.
+    #
+    # This asserts `!isopen(io)`, which is the only thing that fails if `else close(io)` is
+    # deleted. Asserting `status == 304` (as the mount-level tests do) passes either way.
+    let path = joinpath(mktempdir(), "x.bin")
+        write(path, "some streamable bytes")
+        tag = "\"pinned\""
+        io  = open(path, "r")
+        resp = HTTP.servecontent(HTTP.Request("GET", "/x", ["If-None-Match" => tag]), io;
+                                 name = "x.bin", etag = tag)
+        @test resp.status == 304
+        @test isopen(io)                                   # servecontent leaves it to the caller
+        Nitro.Res.adopt_stream_io!(resp, io)
+        @test !isopen(io)                                  # <-- the branch under test
+
+        # And the streamed counterpart: the handle stays open until the body is drained, then
+        # `body_close!` releases it because `owns_io` was adopted.
+        io2 = open(path, "r")
+        full = HTTP.servecontent(HTTP.Request("GET", "/x"), io2; name = "x.bin", etag = tag)
+        Nitro.Res.adopt_stream_io!(full, io2)
+        @test isopen(io2)
+        buf = Vector{UInt8}(undef, 4096)
+        while !HTTP.body_closed(full.body)
+            HTTP.body_read!(full.body, buf) == 0 && break
+        end
+        HTTP.body_close!(full.body)
+        @test !isopen(io2)
+    end
+
     # The two outcomes the mount handler relies on, end to end.
     src = Vector{UInt8}("hello")
     etag = "\"v1\""
