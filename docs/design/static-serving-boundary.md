@@ -191,8 +191,11 @@ root bare route is now spelled `"/"` rather than `""` — HTTP.jl's router split
 list in `init/1` and never rejoins by interpolation. Go's `net/http` and Express's `serve-static`
 take a different route to the same place: they resolve the index per request from the directory and
 redirect to one canonical URL, so neither ever derives a directory URL from a file URL. Nitro
-registers a literal route per file at mount time (§1), so the per-request resolution those two rely
-on is not available here — canonical segments are the form that fits.
+registered a literal route per file at mount time, so the per-request resolution those two rely on
+was not available here — canonical segments are the form that fits. Since §9 the per-request
+resolution *is* available, but segments stayed: they are what `mount_remainder` counts to know how
+much of the request path the prefix occupies, and a mount is still one canonicalized value rather
+than a string that each function re-derives.
 
 Note this changes no URL that a *reachable* mount already served. HTTP.jl's `register!` and its
 request path both split on `/` with `keepempty=false`, so every slash-only spelling —
@@ -315,22 +318,23 @@ leaves them alone — nothing else stops a file named `*` from shadowing its sib
 servable at `%7Bid%7D.txt`. Encoding braces would change *what* a mount serves rather than only
 where, which is a separate decision.
 
-**This is the emit side of a problem no other framework has to solve.** A survey done for #121:
+**This was the emit side of a problem no other framework has to solve.** A survey done for #121:
 Go's `net/http.FileServer`, Express's `serve-static`/`send`, Phoenix's `Plug.Static`, Django's
 `static.serve` and nginx all mount **one prefix handler** and resolve the **percent-decoded** request
 path per request — Go stores `URL.Path` decoded and matches `ServeMux` on it; `send` runs
 `decodeURIComponent` and 400s on malformed input; `Plug.Static` decodes each segment after
 subtracting `:at` and *then* validates. None of them registers a literal route per enumerated file,
-so none of them can register an unreachable one. Nitro does (§1), so the decoding side is not
-available to it — but the *emitting* side is, and there the same frameworks agree: Go's `dirList`
-writes hrefs through `url.URL.String()` and Django's `static` tag through `quote`. Encoding at
-registration is that step, moved to mount time because that is when Nitro emits its URLs.
+so none of them can register an unreachable one. Nitro did, so the decoding side was not available
+to it — but the *emitting* side was, and there the same frameworks agree: Go's `dirList` writes
+hrefs through `url.URL.String()` and Django's `static` tag through `quote`. Encoding at registration
+is that step, moved to mount time because that is when Nitro emits its URLs.
 
-Adopting the prefix-handler shape instead would make this whole class unrepresentable rather than
-handled, and is tracked as its own issue; it interacts with the ETag/304
-([#40](https://github.com/PingoLee/Nitro.jl/issues/40)) and streaming
-([#41](https://github.com/PingoLee/Nitro.jl/issues/41)) work, which is scheduled against the
-current shape.
+**Nitro has since adopted the prefix-handler shape too
+([#221](https://github.com/PingoLee/Nitro.jl/issues/221)), which makes the whole class
+unrepresentable rather than handled** — see §9. `_route_encode` survives and is still correct,
+but its job narrowed: it decides the URL a mount **emits**, not the route it registers. The
+encoded and raw spellings of a name now both resolve, so the choice #101 and #121 each had to make
+between a browser and a raw-byte client is gone.
 
 ### A route name does not identify what produced it
 
@@ -362,9 +366,72 @@ Normalizing there would silently drop every SPA fallback. Both the contract and 
 pinned in `test/staticfiles_security_tests.jl`.
 
 The fallback route (`/<prefix>/**`) is registered but is **not** in the returned vector — it is a
-catch-all, not a mounted file, and has no filepath to pair with.
+catch-all, not a mounted file, and has no filepath to pair with. Since §9 that is true of both
+routes a mount registers.
 
-## 9. See also
+## 9. One prefix handler, resolved against the enumeration
+
+[#221](https://github.com/PingoLee/Nitro.jl/issues/221). A mount registers **two** routes —
+`/<prefix>/**` and the bare `/<prefix>` — and resolves the **percent-decoded** remainder against a
+`Dict` built from `mountable_files`. It no longer registers a route per enumerated file.
+
+**Why the change was worth making.** #101, #94, #121 and part of #95 are four instances of one
+cause: the router compares path segments byte for byte and never percent-decodes, so the route a
+mount registered and the request a conforming client sent were two independent strings that had to
+be made to agree. Each was fixed correctly and locally, and the cluster kept reopening, because the
+cause is a *representation* rather than a branch. §8 already recorded that every comparable
+framework resolves the decoded request instead, and that Nitro could not because of the shape. This
+changes the shape.
+
+**The load-bearing choice is resolving against the ENUMERATED SET, not the filesystem.** Go,
+Express, Plug, Django and nginx all decode and then join onto a document root, which is why each
+needs a containment defence — `safe_join`, `UP_PATH_REGEXP`, `invalid_path?`, `disable_symlinks`.
+Nitro decodes and then looks the result up in the table `mountable_files` produced. `%2e%2e%2f`
+decodes to `../`, which is simply not a key: the request 404s without a `stat`, and nothing outside
+the enumeration can be named *at all*. That is strictly stronger than a join defence, and it is why
+the mount rules in §2 and §5 did not have to move.
+
+**This is also why `HTTP.fileserver` is not used.** HTTP.jl 2.6 ships `fileserver`, `servefile` and
+`servecontent` as public API, and `servecontent` is genuinely worth adopting (§7). `fileserver` is
+not: it resolves against the filesystem and implements none of §2's refusals — its
+`_is_unsafe_request_path_segment` rejects `.`, `..`, separators, colons and absolute paths, but
+**not** a leading-dot name, and it has no `realpath` containment at all (`_join_request_path` uses
+`normpath`, which is lexical). Adopting it would serve `.env` and escaping symlinks again, which is
+#20 reopened. Nitro keeps the enumeration and delegates only response construction.
+
+**Decoding here is not a new rule.** It is the boundary discipline
+[#70](https://github.com/PingoLee/Nitro.jl/issues/70) established — *percent-decoding happens
+exactly once, where the raw request becomes a value* — applied to the one path that never got it.
+`mount_remainder` raises `ValidationError` (a 400) on a malformed escape or on bytes that are not
+valid UTF-8, exactly as `Types.pathparams` does for `{var}` routes, and exactly as Express's `send`
+does. A segment that cannot name one path component — `.`, `..`, or one containing a decoded
+separator or NUL — is a **404**: it is a miss, and reporting it as a client error would tell an
+unauthenticated caller which spellings are structurally interesting.
+
+**This is not the per-request re-validation §6 removed.** §6 is about re-checking the *filesystem*
+— `realpath`, `stat`, containment — to catch a file swapped after startup. That remains removed and
+remains a non-goal: the lookup consults a `Dict` and touches no filesystem at all. Which files exist
+is still decided once, at mount time.
+
+**What it costs.** Two things, both recorded in the #221 upgrade entry rather than fixed:
+
+- **Route-count visibility.** A mount no longer collides *loudly* with an application route at a
+  file path. HTTP.jl's `replacing existing registered route` warning was doing real work there.
+  Exact routes beat `**`, so an app route now wins regardless of registration order — a better
+  default, but a silent change of winner where the mount registered last. The intra-mount case (an
+  `index.html` directory colliding with the file beside it) is warned about explicitly instead.
+- **Per-request work returns.** A decode and a `Dict` lookup, where registration-time resolution
+  had neither. It is small and it is bounded, but it is not zero, and §6's removal of per-request
+  cost was deliberate. The difference is that §6's check was *incomplete* as well as costly — it
+  could not close the race it targeted — whereas this one is the resolution itself.
+
+The bare `/<prefix>` route is a separate registration because HTTP.jl's `**` matches **one or more**
+trailing segments: `match` advances the cursor straight to `length(segments) + 1` on the doublestar
+branch, so it can never match zero. It is registered only when the mount can actually answer it —
+i.e. when a mount-root `index.html` was enumerated — so a mount never claims `/<prefix>` with
+nothing to serve there.
+
+## 10. See also
 
 - [`docs/src/tutorial/reverse_proxy.md`](../src/tutorial/reverse_proxy.md) — the user-facing guide,
   including client-IP trust configuration and worked nginx/Caddy configs
