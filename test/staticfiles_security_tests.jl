@@ -1311,6 +1311,138 @@ end
     end
 end
 
+@testset "a mount does not claim a request it cannot serve" begin
+    # The catch-all matches a path for EVERY method, so the handler -- not the router -- decides.
+    # Registering `GET` alone made HTTP.jl answer 405 for every other method under the prefix, and
+    # at a root mount that covered the whole application.
+    #
+    # No comparable framework claims such a request: `serve-static` calls `next()` by default,
+    # `Plug.Static` returns the conn unchanged, Go's `FileServer` ignores the method entirely.
+    resetstate()
+    try
+        staticfiles(root, "static")
+        urlpatterns("", [path("/static/api/ping", req -> Res.json(Dict("ok" => true)), method = "POST")])
+
+        @test internalrequest(HTTP.Request("GET",  "/static/visible.txt")).status == 200
+        # A path naming a real file answers 405 WITH `Allow` -- more informative than falling
+        # through to a 404, which is what Express does by default even for a file that exists.
+        mna = internalrequest(HTTP.Request("POST", "/static/visible.txt"))
+        @test mna.status == 405
+        @test HTTP.header(mna, "Allow") == "GET, HEAD"
+        # A path naming NOTHING defers to the app's not-found handler, whatever the method. This
+        # is the assertion that fails if the catch-all goes back to being GET-only.
+        @test internalrequest(HTTP.Request("POST",   "/static/nope.txt")).status == 404
+        @test internalrequest(HTTP.Request("PUT",    "/static/nope.txt")).status == 404
+        @test internalrequest(HTTP.Request("DELETE", "/static/nope.txt")).status == 404
+        # An application route under the prefix still wins, on its own method.
+        @test internalrequest(HTTP.Request("POST", "/static/api/ping")).status == 200
+
+        # HEAD is served, and keeps its Content-Length. `servecontent` sets the header explicitly,
+        # which is why this does not hit #146 (where builders that omit it lose it on HEAD).
+        head = internalrequest(HTTP.Request("HEAD", "/static/visible.txt"))
+        @test head.status == 200
+        @test HTTP.header(head, "Content-Length") == string(sizeof("visible"))
+    finally
+        resetstate()
+    end
+
+    @testset "a ROOT mount does not turn every unrouted non-GET into a 405" begin
+        # The severe case: with `staticfiles(dir, "")` the catch-all is `/**`, so a GET-only
+        # registration made `POST /api/anything` a 405 across the whole application.
+        resetstate()
+        try
+            staticfiles(root, "")
+            urlpatterns("", [path("/api/thing", req -> Res.json(Dict("ok" => true)), method = "POST")])
+            for m in ("POST", "PUT", "DELETE", "PATCH")
+                @test internalrequest(HTTP.Request(m, "/api/unrouted")).status == 404
+            end
+            @test internalrequest(HTTP.Request("POST", "/api/thing")).status == 200
+            @test internalrequest(HTTP.Request("GET",  "/visible.txt")).status == 200
+            @test internalrequest(HTTP.Request("POST", "/visible.txt")).status == 405
+        finally
+            resetstate()
+        end
+    end
+
+    @testset "spafiles does not hand the app shell to a non-navigation" begin
+        spa = mktempdir()
+        write(joinpath(spa, "index.html"), "SHELL")
+        write(joinpath(spa, "app.js"), "APP")
+        resetstate()
+        try
+            spafiles(spa, "app")
+            # A navigation gets the shell ...
+            @test bodystr(internalrequest(HTTP.Request("GET", "/app/users/1"))) == "SHELL"
+            # ... a POST to the same client route does not. Answering it with HTML and a 200
+            # would tell a form post that it succeeded.
+            @test internalrequest(HTTP.Request("POST", "/app/users/1")).status == 404
+            @test internalrequest(HTTP.Request("POST", "/app/app.js")).status == 405
+        finally
+            resetstate()
+        end
+    end
+end
+
+@testset "a streamed body is released even when it is never written (#41)" begin
+    # `_write_response_body!` closes what it drains, but a 304, a HEAD, or a response a middleware
+    # discards never reaches it. Those are the CHEAP requests a warm client makes constantly, so a
+    # leak there accumulates fastest. `stream_handler`'s `finally` is the net -- the same place Go
+    # (`defer f.Close()`) and Express (`onFinished(res, cleanup)`) put it.
+    #
+    # On Windows an open handle blocks deletion, which is what makes this observable without
+    # counting descriptors.
+    d = mktempdir()
+    big = joinpath(d, "big.bin")
+    write(big, rand(UInt8, 300_000))
+
+    release = Nitro.Core._release_response_body!
+
+    @testset "buffered bodies are NOT closed -- that would break shared responses" begin
+        # Load-bearing exclusion: `body_close!` on a `BytesBody` sets `closed`, and HTTP 2.7's
+        # pre-send check then answers 500 the next time a shared response is sent.
+        bb = HTTP.BytesBody(Vector{UInt8}("shared"))
+        release(bb)
+        @test !HTTP.body_closed(bb)
+        @test HTTP._check_response_body_unsent(HTTP.Response(200, bb)) === nothing
+        release(HTTP.EmptyBody())            # must not throw
+        release(Vector{UInt8}("plain"))      # nor for a raw body
+        release("a string")
+    end
+
+    @testset "a streaming body IS closed, and its handle released" begin
+        io = open(big, "r")
+        resp = HTTP.servecontent(HTTP.Request("GET", "/x"), io; name = "big.bin")
+        Nitro.Res.adopt_stream_io!(resp, io)
+        @test isopen(io)
+        release(resp.body)                   # what `stream_handler`'s `finally` does
+        @test HTTP.body_closed(resp.body)
+        @test !isopen(io)
+        # Idempotent: the write path usually closes first, and the net runs anyway.
+        release(resp.body)
+        @test !isopen(io)
+    end
+
+    @testset "a mounted streamed file leaves nothing open after a 304" begin
+        resetstate()
+        try
+            staticfiles(d, "big"; stream_threshold = 100_000)
+            first = internalrequest(HTTP.Request("GET", "/big/big.bin"))
+            etag  = HTTP.header(first, "ETag")
+            HTTP.body_close!(first.body)     # `internalrequest` never reaches the write path
+            # A 304 carries no body at all, so nothing would ever drain it.
+            for _ in 1:20
+                r = internalrequest(HTTP.Request("GET", "/big/big.bin", ["If-None-Match" => etag]))
+                @test r.status == 304
+            end
+            # If any of those 20 held a handle, Windows would refuse this.
+            GC.gc()
+            @test (rm(big); true)
+        finally
+            resetstate()
+        end
+    end
+end
+
 @testset "include_hidden=true is a real opt-in" begin
     resetstate()
     try

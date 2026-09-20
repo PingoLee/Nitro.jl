@@ -164,6 +164,29 @@ function _write_response_body!(stream::HTTP.Stream, body::HTTP.AbstractBody)
     return nothing
 end
 
+# Release a STREAMING response body, whether or not it was ever written.
+#
+# `_write_response_body!` closes what it drains, but it only runs when a body is actually written.
+# Three paths produce a streaming body and never write it: a handler that already called
+# `startwrite` (`_response_started`), a `HEAD` or `304` whose body HTTP suppresses, and any
+# middleware that replaces or discards the response after it was built. Each of those leaks an open
+# file descriptor, and the last two are the *cheap* requests a warm client makes constantly.
+#
+# **This is where every comparable framework puts it: on the response lifecycle, not on the write.**
+# Go's `serveFile` uses `defer f.Close()` in the handler, so it runs on every return path; Express's
+# `send` registers `onFinished(res, cleanup)` plus an `error` handler, so the stream is destroyed on
+# completion *or* client abort; Django's `FileResponse` relies on the WSGI server calling
+# `response.close()`. Nitro's equivalent hook is this handler's `finally`.
+#
+# `BytesBody` and `EmptyBody` are excluded by dispatch, and that exclusion is load-bearing: they are
+# buffers rather than cursors, and `body_close!` on one sets `closed`, which makes HTTP 2.7's
+# `_check_response_body_unsent` answer **500** the next time a SHARED response is sent. Closing them
+# here would break exactly the reuse pattern nitro-core §4 exists to protect.
+_release_response_body!(::HTTP.BytesBody) = nothing
+_release_response_body!(::HTTP.EmptyBody) = nothing
+_release_response_body!(body::HTTP.AbstractBody) = (HTTP.body_close!(body); nothing)
+_release_response_body!(_) = nothing
+
 function stream_handler(middleware::Function)
     return function(stream::HTTP.Stream)
         ip = _peer_ip(stream)
@@ -172,12 +195,20 @@ function stream_handler(middleware::Function)
         req.context[:stream] = stream
 
         result = middleware(req)
+        produced = result isa HTTP.Response ? result : nothing
 
-        if !_response_started(stream)
-            resp = result isa HTTP.Response ? result : HTTP.Response(200)
-            resp.request = req
-            stream.response = resp
-            _write_response_body!(stream, resp.body)
+        try
+            if !_response_started(stream)
+                resp = produced === nothing ? HTTP.Response(200) : produced
+                resp.request = req
+                stream.response = resp
+                _write_response_body!(stream, resp.body)
+            end
+        finally
+            # Idempotent, and a no-op for the buffered bodies that are the overwhelming majority.
+            # `_write_response_body!` has usually already done this — releasing as soon as the body
+            # is drained keeps descriptor pressure down — so this is the net, not the owner.
+            produced === nothing || _release_response_body!(produced.body)
         end
         return nothing
     end

@@ -41,12 +41,34 @@
 # `/static` even when it has nothing to serve there, replacing an application route at that exact
 # path (HTTP.jl's `register!` warns and the later registration wins). Under per-file registration
 # the bare route appeared only when `mountfolder` emitted one, and that is preserved here.
+# Registered for ANY method (`"*"`), not for `GET` alone — and the handler decides.
+#
+# Registering `GET` only made HTTP.jl answer **405** for every other method under the prefix,
+# because the catch-all matched the path while its leaf carried one method. At a ROOT mount that
+# covered the whole application: `POST /api/anything` became a 405 where it had been a 404.
+#
+# **No comparable framework claims a request it cannot serve.** Express's `serve-static` calls
+# `next()` for non-GET/HEAD by default (`fallthrough !== false`) and only 405s when that is switched
+# off; Phoenix's `Plug.Static` returns the `conn` *unchanged* so a later plug answers; Go's
+# `FileServer` does not look at the method at all. Nitro cannot literally fall through — the router
+# has already matched — so it reproduces the observable outcome instead: a path that names no
+# mounted file defers to the application's own not-found handler whatever the method, and only a
+# path that *does* name one answers 405, with `Allow`. That is strictly more informative than
+# Express's default, which 404s even for a file that exists.
 function _register_mount(ctx::App, router::HTTP.Router, segments::Vector{String}, handler::F;
                          bare::Bool) where {F}
-    register_internal(ctx, router, GET, Util.mount_route(vcat(segments, "**")), handler)
-    bare && register_internal(ctx, router, GET, Util.mount_route(segments), handler)
+    register_internal(ctx, router, "*", Util.mount_route(vcat(segments, "**")), handler)
+    bare && register_internal(ctx, router, "*", Util.mount_route(segments), handler)
     return nothing
 end
+
+# GET and HEAD, the set `Plug.Static` calls `@allowed_methods` and `serve-static` spells inline.
+_is_mount_method(method::AbstractString) = method == GET || method == HEAD
+
+# Built per call rather than shared: this is a rare path, and a module-level `const` response is the
+# one shape nitro-core §4 asks you to think twice about.
+_mount_method_not_allowed() =
+    HTTP.Response(405, ["Allow" => "GET, HEAD", "Content-Length" => "0"])
 
 # Fill the mount table, warning when two enumerated files claim one key.
 #
@@ -120,6 +142,21 @@ struct MountPolicy
         etag === nothing || etag === :weak_stat || etag === :strong || etag isa AbstractString ||
             throw(ArgumentError("static mount: `etag` must be :weak_stat, :strong, a String, or nothing — got $(repr(etag))"))
         normalized = etag isa AbstractString ? String(etag) : etag
+        if cache === :none && normalized === :strong
+            # Correct, but expensive in a way that is easy not to notice: `:none` re-reads content
+            # per request, so the tag must be recomputed per request too — which means hashing the
+            # whole body on every hit. `dynamicfiles(dir; etag = :strong)` over a 100 MB file is a
+            # 100 MB sha256 per request.
+            #
+            # **No comparable framework hashes file content for an ETag at all.** Express's `send`
+            # uses `etag(stat)` — size and mtime; Phoenix's `Plug.Static` uses
+            # `phash2({size, mtime})`; nginx emits `"<mtime-hex>-<size-hex>"`; Go's `FileServer`
+            # emits no ETag whatever and leaves it to the caller. `:weak_stat` is that default, and
+            # it is exactly as good for `If-None-Match`, which compares weakly. `:strong` exists
+            # for `If-Range`/`If-Match`, where the comparison is strong — pair it with a policy
+            # that holds the bytes.
+            @warn "static mount: `etag = :strong` with `cache = :none` hashes the whole body on every request. Use `:weak_stat` (what Express, nginx and Plug.Static all do), or `cache = :eager`/`:lazy` so the hash is paid once" maxlog=1
+        end
         return new(cache, Int(stream_threshold), Int(cache_max_bytes), normalized)
     end
 end
@@ -301,7 +338,10 @@ function staticfiles(
 
     handler = function (req::HTTP.Request)
         mf = _lookup_mount(table, req.target, nprefix)
+        # A miss defers to the application's own not-found handler for EVERY method -- the mount
+        # does not claim a path it cannot serve (see `_register_mount`).
         mf === nothing && return notfound(req)
+        _is_mount_method(req.method) || return _mount_method_not_allowed()
         return _serve_mounted(req, mf, policy, lru, headers, loadfile, cache_control)
     end
     _register_mount(ctx, router, segments, handler; bare = haskey(files, ""))
@@ -366,6 +406,7 @@ function spafiles(
         function (req::HTTP.Request)
             mf = _lookup_mount(table, req.target, nprefix)
             mf === nothing && return notfound(req)
+            _is_mount_method(req.method) || return _mount_method_not_allowed()
             return _serve_mounted(req, mf, policy, lru, headers, loadfile, cache_control)
         end
     else
@@ -383,6 +424,11 @@ function spafiles(
             # something no mounted file can be called. Under history mode that is still a client
             # route, so it gets the shell, matching `try_files $uri /index.html`, which does not
             # inspect the path either.
+            # History mode answers a *navigation*, which is a GET (or HEAD). A POST to a client
+            # route is not a request for the app shell, so it defers like any other mount rather
+            # than being handed HTML with a 200.
+            _is_mount_method(req.method) ||
+                return mf === nothing ? notfound(req) : _mount_method_not_allowed()
             target = mf === nothing ? index_mf : mf
             return _serve_mounted(req, target, policy, lru, headers, loadfile, cache_control)
         end
@@ -438,7 +484,10 @@ function dynamicfiles(
 
     handler = function (req::HTTP.Request)
         mf = _lookup_mount(table, req.target, nprefix)
+        # A miss defers to the application's own not-found handler for EVERY method -- the mount
+        # does not claim a path it cannot serve (see `_register_mount`).
         mf === nothing && return notfound(req)
+        _is_mount_method(req.method) || return _mount_method_not_allowed()
         return _serve_mounted(req, mf, policy, lru, headers, loadfile, cache_control)
     end
     _register_mount(ctx, router, segments, handler; bare = haskey(files, ""))
