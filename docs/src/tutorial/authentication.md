@@ -7,6 +7,21 @@ principal mirrors ASP.NET's `ClaimsPrincipal` / Spring's `Authentication` (ident
 defaults to `sub`), `claim_required` mirrors ASP.NET's `RequireClaim`, and the 401/403
 split follows RFC 6750.
 
+!!! note "Scope: Nitro verifies tokens, your application issues them"
+
+    Nitro.Auth is the **resource-server** half of a token system. It verifies an access
+    token's signature and claims, builds a `Principal` from them, and authorizes routes on
+    that principal. **Refresh-token lifecycles, rotation, revocation and denylisting are
+    your application's** — Nitro ships no refresh endpoint, no `jti`, and no revocation
+    store, and `encode_jwt` is a signing primitive rather than a token service.
+
+    That split is deliberate and follows Spring, whose declarative model this page's guards
+    already mirror: token *validation* lives in Spring Security, while refresh issuance and
+    rotation live in Spring Authorization Server — a separate project, because rotation with
+    reuse detection needs server-side state that a stateless verifier must not pretend to
+    have. §4's *[Token lifetime and renewal](#Token-lifetime-and-renewal)* shows the two
+    routes Nitro supports for keeping a user signed in past one token's lifetime.
+
 ## 1. Pick your model
 
 | Model | Credential | Typical client | Identity | Start here |
@@ -191,6 +206,58 @@ and `identity_from=:kid` is a construction-time `ArgumentError`.
 Lower-level pieces (`encode_jwt`, `decode_jwt`, claim validation for
 `exp`/`iat`/`nbf`/`iss`/`aud`) are covered in [Sessions & Auth](sessions_and_auth.md).
 
+### Token lifetime and renewal
+
+A token lives exactly as long as its `exp` says, or — with no `exp` — until
+`iat + exp_timeout` (15 minutes by default). After that the validator throws and the request
+is a 401. **Nitro never re-issues a token**, and it cannot: verifying a signature says
+nothing about whether the subject is still entitled to a new one. Two routes keep a user
+signed in past that point, and both already exist.
+
+**A browser app: make the session the long-lived thing, not the token.** `SessionMiddleware`
+and a session store are what Nitro ships for this, with `regenerate_session!` /
+`rotate_on_auth` covering fixation on login — see
+[Sessions & Auth](sessions_and_auth.md). A cookie-borne session is renewed by the store,
+so there is no second token to rotate.
+
+**An API or SPA that needs a refresh endpoint: your application owns it.** Mint two tokens
+that differ by a claim, and let an ordinary guard keep the long-lived one away from your
+ordinary routes:
+
+```julia
+# At login: a short access token, and a long-lived one marked for one purpose only.
+access  = encode_jwt(Dict("sub" => user.id, "token_use" => "access"),  secret; expires_in=900)
+refresh = encode_jwt(Dict("sub" => user.id, "token_use" => "refresh"), secret; expires_in=60*60*24*14)
+
+# The refresh endpoint accepts ONLY the refresh token — a stolen access token cannot mint more.
+urlpatterns("",
+    path("/auth/refresh", refresh_handler, method="POST", middleware=[
+        BearerAuth(validator),
+        GuardMiddleware(claim_required("token_use", "refresh")),
+    ]),
+)
+
+# ...and every ordinary route refuses the refresh token in the other direction.
+GuardMiddleware(claim_required("token_use", "access"))
+```
+
+`token_use` is the claim name AWS Cognito uses for exactly this discriminator. Prefer it to
+`typ`: `encode_jwt` already writes a JOSE header `typ: "JWT"`, and a payload claim of the
+same name reads as that header to anyone debugging a token.
+
+What the recipe above does **not** give you, and what your `refresh_handler` still owns:
+
+- **Rotation** — issuing a new refresh token with each use, so a captured one has a bounded life.
+- **Reuse detection** — recognizing that an already-spent refresh token came back, which is the
+  signal that it was stolen, and invalidating the whole family when it does. This is the part
+  that needs a store; [RFC 6749 §6](https://www.rfc-editor.org/rfc/rfc6749#section-6) and the
+  OAuth 2.0 Security BCP describe the shape.
+- **Revocation** — the same limit §2's *Revocation and the struct-user path* describes: Nitro
+  cannot revoke a signed token it did not issue, so a fresh lookup in your `user_validator` is
+  what makes a demotion take effect inside the token's TTL.
+
+Short access-token lifetimes are what keep all three from being urgent.
+
 ## 5. Service & capability tokens
 
 Tokens that authorize an *action* rather than identify a *user* carry an `action` (or
@@ -270,7 +337,7 @@ upgrade flows): see [Passwords](passwords.md).
 
 Nitro ships no OAuth2 client. The authorization-code flow is an application concern: exchange
 the provider's `code` for tokens yourself, then mint your own session or JWT with the pieces
-above — `set_cookie!` and the session store (§7), or `jwt_encode` and a validator (§4).
+above — `set_cookie!` and the session store (§7), or `encode_jwt` and a validator (§4).
 
 There used to be a walkthrough here built on [Umbrella.jl](https://github.com/jiachengzhang1/Umbrella.jl).
 It was inherited from Oxygen.jl and removed: Umbrella ships adapters for Genie, Oxygen and Mux,
@@ -280,8 +347,9 @@ not for Nitro, so the page documented an integration that does not exist.
 
 - Secrets from the environment, never committed; rotate via keysets — [Secrets](secrets.md).
 - `profile=:strict` (+ `required_claims`) on production validators (§4).
-- Access tokens only, short-lived (`expires_in`/`exp`); refresh-token lifecycles are an
-  application concern today.
+- Access tokens only, short-lived (`expires_in`/`exp`). Refresh, rotation and revocation
+  are your application's — see the scope note at the top of this page and §4's *Token
+  lifetime and renewal*.
 - Behind a reverse proxy, declare `trusted_proxies` **and** the `forwarded_header` your proxy
   writes before trusting client IPs for auth-adjacent rate limiting —
   [Behind a Reverse Proxy](reverse_proxy.md).
