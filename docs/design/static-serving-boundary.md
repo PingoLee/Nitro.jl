@@ -163,7 +163,18 @@ Not planned, and a PR adding one should cite this section or change it:
   - *(Byte ranges and ETag/`Last-Modified` negotiation were listed here until §10. They moved
     because `HTTP.servecontent` is public API: adopting them stopped meaning "write and maintain
     the precondition table" and started meaning "call a function.")*
-- Traversing symlinked directories inside a mount (needs a custom walk with cycle detection)
+- Traversing symlinked directories inside a mount (needs a custom walk with cycle detection).
+  **Reaffirmed, and the case is now reported rather than silent**
+  ([#95](https://github.com/PingoLee/Nitro.jl/issues/95)): `mountable_files` names each skipped
+  symlinked directory and points at the workaround, instead of folding it into a
+  `not_a_regular_file` count. `dist/assets -> ../shared/assets` is an ordinary deploy layout and
+  `current -> releases/N` is the standard atomic-release shape, so a silent count was the wrong
+  report. Traversing is still refused: `walkdir(follow_symlinks=true)` has **no** cycle detection,
+  so `a -> .` descends until the OS refuses; every intermediate component would need its own
+  containment check; and the invariant the whole enumerator rests on — *walkdir never descends a
+  link, so testing the leaf is complete* — would be void. §2's bug-density argument applies
+  directly: the simpler version of this code needed two independent review passes. The workaround
+  is one line, `staticfiles("shared/assets", "assets")`
 - Serving files created after startup — mounts register a snapshot; use a handler
 - ACME `http-01` support. `.well-known/acme-challenge/<token>` is written at renewal time, long after
   boot, so no mount can serve it. Caddy handles ACME internally; nginx needs a webroot location

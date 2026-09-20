@@ -1099,6 +1099,49 @@ end
     end
 end
 
+@testset "a skipped symlinked directory is named, not folded into a count (#95)" begin
+    # `walkdir(follow_symlinks=false)` reports every link as a FILE, so a link pointing at a
+    # directory fails the regular-file check and its whole subtree silently disappears.
+    # `dist/assets -> ../shared/assets` is an ordinary deploy layout, so this is not exotic.
+    if has_inside_dir || has_escape_dir
+        logs = Test.collect_test_logs() do
+            MOUNTABLE(root)
+        end
+        msgs = [string(r.message) for r in logs[1]]
+        named = filter(m -> occursin("skipping a symlinked directory", m), msgs)
+        @test !isempty(named)
+        # The point of the change: the offending directory is identified. A count cannot be
+        # acted on; a name can.
+        linkdir_records = [r for r in logs[1] if occursin("skipping a symlinked directory", string(r.message))]
+        reported = reduce(vcat, [collect(keys(r.kwargs)) for r in linkdir_records]; init = Symbol[])
+        @test :path in reported
+        paths = [string(r.kwargs[:path]) for r in linkdir_records]
+        has_inside_dir && @test "sub_link" in paths
+        # Only the mount-relative path, never the resolved target -- a link may point at
+        # something whose name is itself sensitive.
+        @test all(p -> !occursin(outside, p), paths)
+        # The workaround has to be in the message, or naming the directory just relocates the
+        # puzzle.
+        @test any(m -> occursin("Mount it separately", m), named)
+
+        # The summary line still carries the class, so the two agree.
+        summary = filter(m -> occursin("will not be served", m), msgs)
+        @test !isempty(summary)
+        summary_rec = first(r for r in logs[1] if occursin("will not be served", string(r.message)))
+        @test haskey(summary_rec.kwargs, :symlinked_directory)
+        @test summary_rec.kwargs[:symlinked_directory] >= 1
+    end
+
+    # Traversal itself stays refused -- this issue was closed by naming the case, not by
+    # following it (docs/design/static-serving-boundary.md §7).
+    if has_inside_dir
+        files = servable(root)
+        @test "sub_link" ∉ files                 # the link itself is not served ...
+        @test "sub_link/nested.txt" ∉ files      # ... and neither is anything under it
+        @test "sub/nested.txt" ∈ files           # while the real directory still is
+    end
+end
+
 @testset "include_hidden=true is a real opt-in" begin
     resetstate()
     try

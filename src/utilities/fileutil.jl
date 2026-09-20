@@ -303,6 +303,17 @@ This is the single enumerator behind [`mountfolder`](@ref) and therefore behind 
   in `staticfiles` would throw at startup), plus FIFOs, sockets and devices, where the per-request
   read in `dynamicfiles` would block or grow without bound.
 
+  A symlinked **directory** is warned about **by name**, unlike the rest of that class
+  ([#95](https://github.com/PingoLee/Nitro.jl/issues/95)). It is the one entry whose refusal hides a
+  whole *subtree* rather than one file, and `dist/assets -> ../shared/assets` is an ordinary deploy
+  layout — so folded into a count, the only signal that a hundred files were dropped was the number
+  going up. Traversing it stays a non-goal (`docs/design/static-serving-boundary.md` §7):
+  `walkdir(follow_symlinks=true)` has no cycle detection, and every intermediate component would
+  become checkable surface, voiding the "walkdir never descends a link, so testing the leaf is
+  complete" invariant this function rests on. **Mount the target separately instead** —
+  `staticfiles("shared/assets", "assets")` works today and needs no new code — or serve it from the
+  proxy.
+
 A name that is not a legal URL path segment is **not** in that list: `café.txt` and `my file.txt` are
 enumerated and served, at their percent-encoded routes. That is [`mountfolder`](@ref)'s job via
 [`_route_encode`](@ref), not a refusal here
@@ -329,7 +340,7 @@ function mountable_files(root::String;
     root_parts = _mount_root_parts(root)
     kept       = String[]
     examples   = String[]
-    n_hidden = n_escaped = n_pattern = n_unresolvable = n_irregular = 0
+    n_hidden = n_escaped = n_pattern = n_unresolvable = n_irregular = n_linkdir = 0
 
     # Default is `onerror=throw`, which makes one unreadable subdirectory anywhere under the mount
     # abort `serve()`. Logging and continuing fails closed — fewer files get served, never more.
@@ -383,7 +394,32 @@ function mountable_files(root::String;
             end
 
             if !isfile(path)
-                n_irregular += 1; note!(); continue
+                n_irregular += 1; note!()
+                # A symlinked DIRECTORY is the one irregular entry that is almost always a
+                # mistake rather than a deliberate exclusion, and the only one whose refusal
+                # silently hides a whole subtree instead of a single file
+                # ([#95](https://github.com/PingoLee/Nitro.jl/issues/95)). `dist/assets ->
+                # ../shared/assets` is an ordinary deploy layout and `current -> releases/N` is
+                # the standard atomic-release shape, so someone will hit this; folded into the
+                # `not_a_regular_file` count below, the only signal was a number.
+                #
+                # Traversing it is a deliberate NON-GOAL (docs/design/static-serving-boundary.md
+                # §7): `walkdir(follow_symlinks=true)` has no cycle detection, so `a -> .`
+                # descends until the OS refuses, and every intermediate component would become
+                # checkable surface — the "walkdir never descends a link, so testing the leaf is
+                # complete" invariant this function rests on would be void. Naming the directory
+                # is the cheap half, and #95 says it is worth doing whether or not traversal ever
+                # lands.
+                #
+                # Capped at five like the route-pattern and percent-encoding warnings, for the
+                # same reason: a user-writable upload directory would otherwise be an
+                # attacker-controlled log flood. Only the mount-relative path is logged, never
+                # the resolved target, which may name something sensitive.
+                if islink(path) && isdir(path)
+                    n_linkdir += 1
+                    n_linkdir <= 5 && @warn "mountable_files: skipping a symlinked directory — its whole subtree is unreachable. Mount it separately (`staticfiles(\"<target>\", \"<prefix>\")`) or serve it from the proxy; traversal is a non-goal, see docs/design/static-serving-boundary.md §7" path=rel
+                end
+                continue
             end
 
             push!(kept, path)
@@ -392,8 +428,9 @@ function mountable_files(root::String;
 
     n_skipped = n_hidden + n_escaped + n_pattern + n_unresolvable + n_irregular
     if n_skipped > 0
-        @info "mountable_files: $n_skipped entry/entries under $root will not be served" hidden=n_hidden symlink_escape=n_escaped route_pattern=n_pattern unresolvable_link=n_unresolvable not_a_regular_file=n_irregular examples=examples
+        @info "mountable_files: $n_skipped entry/entries under $root will not be served" hidden=n_hidden symlink_escape=n_escaped route_pattern=n_pattern unresolvable_link=n_unresolvable not_a_regular_file=n_irregular symlinked_directory=n_linkdir examples=examples
     end
+    n_linkdir > 5 && @warn "mountable_files: $n_linkdir symlinked directories under $root were skipped; their subtrees are not served" shown=5
     isempty(kept) && @warn "mountable_files: no servable files found under $root"
 
     return kept
