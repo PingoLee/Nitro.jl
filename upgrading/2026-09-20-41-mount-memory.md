@@ -1,6 +1,6 @@
 ## Large mounted files are streamed instead of held in memory (#41)
 
-- **Version**: Unreleased
+- **Version**: 0.4.0
 - **Nitro ref**: #41; `src/core/staticfiles.jl`, `src/core/transport.jl`, `src/response.jl`,
   `src/methods.jl`, `src/precompile.jl`, `src/core.jl`,
   `docs/design/static-serving-boundary.md`

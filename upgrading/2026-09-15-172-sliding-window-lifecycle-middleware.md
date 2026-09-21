@@ -1,6 +1,6 @@
 ## `RateLimiter(strategy = :sliding_window)` returns a `LifecycleMiddleware`, like the fixed one (#172)
 
-- **Version**: Unreleased
+- **Version**: 0.4.0
 - **Nitro ref**: #172 (follow-up to #22 / PR #168); `src/middleware/rate_limiter.jl`,
   `docs/src/tutorial/extension_points.md`, `test/middleware/ratelimitter_tests.jl`,
   `test/middleware/ratelimitter_lru_tests.jl`, `bench/suite/ratelimiter.jl`

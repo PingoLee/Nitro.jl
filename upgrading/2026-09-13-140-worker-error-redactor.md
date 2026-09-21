@@ -1,6 +1,6 @@
 ## Worker stores implement `get_error_redactor` / `set_error_redactor!`, and stored error text is capped (#140)
 
-- **Version**: Unreleased
+- **Version**: 0.4.0
 - **Nitro ref**: #140; `src/Workers/registry.jl`, `src/Workers/execution.jl`, `src/Workers/api.jl`,
   `src/Workers/queue.jl`, `ext/NitroPormGExt.jl`, `docs/src/tutorial/workers.md`
 - **Recorded**: 2026-09-13

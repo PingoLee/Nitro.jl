@@ -1,6 +1,6 @@
 ## `ServerContext` is now the exported `App`, and every public function takes one (#31)
 
-- **Version**: Unreleased
+- **Version**: 0.4.0
 - **Nitro ref**: #31; `src/context.jl`, `src/methods.jl`, `src/Nitro.jl`, and every `src/` file
   that named the type; `test/app_tests.jl` (new), `docs/src/`
 - **Recorded**: 2026-09-13

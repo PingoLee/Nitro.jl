@@ -1,6 +1,6 @@
 ## The `req.<property>` shorthands are removed — read the request through exported functions (#151)
 
-- **Version**: Unreleased
+- **Version**: 0.4.0
 - **Nitro ref**: #151 (splits out of #32); `src/core.jl`, `src/Nitro.jl`,
   `src/middleware/csrf_middleware.jl`, `test/http_internals_contract_tests.jl`, `README.md`,
   `docs/src/`

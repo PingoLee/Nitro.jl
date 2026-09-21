@@ -1,6 +1,6 @@
 ## `WorkerRuntime` owns the queues, scheduler and run handles; worker calls take `runtime=` (#167)
 
-- **Version**: Unreleased
+- **Version**: 0.4.0
 - **Nitro ref**: #167 (follow-up to #29); `src/Workers.jl`, `src/Workers/runtime.jl` (new),
   `src/Workers/registry.jl`, `src/Workers/api.jl`, `src/Workers/queue.jl`, `src/Workers/types.jl`,
   `src/methods.jl`, `ext/NitroPormGExt.jl`, `docs/src/tutorial/workers.md`

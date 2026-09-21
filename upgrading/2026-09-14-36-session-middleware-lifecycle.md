@@ -1,6 +1,6 @@
 ## `SessionMiddleware` returns a `LifecycleMiddleware`; `prune_probability` is gone (#36)
 
-- **Version**: Unreleased
+- **Version**: 0.4.0
 - **Nitro ref**: #36; `src/middleware/session_middleware.jl`, `src/types.jl`, `src/cookies.jl`,
   `src/Nitro.jl`, `docs/src/tutorial/sessions_and_auth.md`,
   `docs/src/tutorial/cookies/sessions.md`

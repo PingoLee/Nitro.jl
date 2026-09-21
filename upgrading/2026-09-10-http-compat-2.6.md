@@ -1,6 +1,6 @@
 ## HTTP compat moves to `~2.6` — an app pinning `~2.4` must move too
 
-- **Version**: Unreleased
+- **Version**: 0.4.0
 - **Nitro ref**: `Project.toml` `[compat]`; `src/core.jl`, `src/utilities/bodyparsers.jl`
 - **Recorded**: 2026-09-10
 - **Severity**: **breaking (dependency resolution)** — an app carrying its own `HTTP = "~2.4"`

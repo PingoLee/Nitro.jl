@@ -1,6 +1,6 @@
 ## `SessionMiddleware` requires an explicit `store`; the shared default store is gone (#171)
 
-- **Version**: Unreleased
+- **Version**: 0.4.0
 - **Nitro ref**: #171 (follow-up to #36 / PR #168); `src/middleware/session_middleware.jl`,
   `src/middleware/csrf_middleware.jl`, `src/types.jl`, `src/Nitro.jl`, `docs/src/index.md`,
   `docs/src/tutorial/`, `README.md`, `.github/skills/nitro-usage/`

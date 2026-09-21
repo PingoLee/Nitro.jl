@@ -1,6 +1,6 @@
 ## A validator returning `(nothing, claims)` is now a 401, not an authenticated request (#24)
 
-- **Version**: Unreleased
+- **Version**: 0.4.0
 - **Nitro ref**: #24; `src/middleware/auth_middleware.jl`, `src/middleware/guards.jl`,
   `docs/src/tutorial/authentication.md`, `test/middleware/authmiddleware_tests.jl`,
   `test/middleware/guards_tests.jl`, `test/auth_tests.jl`

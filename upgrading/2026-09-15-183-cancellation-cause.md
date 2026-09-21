@@ -1,6 +1,6 @@
 ## A cancellation now records its cause, and `cancel_requested` is no longer a field (#183)
 
-- **Version**: Unreleased
+- **Version**: 0.4.0
 - **Nitro ref**: #183 (follow-up to #176); `src/Workers/types.jl`, `src/Workers/queue.jl`,
   `src/Workers/api.jl`, `src/Workers/execution.jl`, `src/Workers/runtime.jl`, `src/Workers.jl`,
   `docs/src/tutorial/workers.md`, `.github/instructions/workers.instructions.md`,

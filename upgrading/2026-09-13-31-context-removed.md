@@ -1,6 +1,6 @@
 ## `context()` is removed — read the app context from the request with `getcontext(req)` (#31)
 
-- **Version**: Unreleased
+- **Version**: 0.4.0
 - **Nitro ref**: #31; `src/methods.jl`, `src/Nitro.jl`, `src/handlers.jl`,
   `src/core/pipeline.jl`, `src/core/parambinding.jl`, `src/core/request.jl`,
   `test/appcontext_race_tests.jl` (new)

@@ -1,6 +1,6 @@
 ## `NITRO_ENV` now seeds `ENV["PORMG_ENV"]`, which overrides `default_env:` in `connection.yml` (#55)
 
-- **Version**: Unreleased
+- **Version**: 0.4.0
 - **Nitro ref**: #55; `src/environment.jl` (new), `src/core.jl`, `src/exts.jl`,
   `ext/NitroPormGExt.jl`, `docs/src/tutorial/environment.md`
 - **Recorded**: 2026-09-12

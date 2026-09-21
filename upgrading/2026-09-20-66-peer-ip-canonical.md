@@ -1,6 +1,6 @@
 ## `getip`/`getpeerip` report one canonical address per host (#66)
 
-- **Version**: Unreleased
+- **Version**: 0.4.0
 - **Nitro ref**: #66; `src/core/transport.jl`, `src/core/request.jl`,
   `src/middleware/extract_ip.jl`, `docs/src/tutorial/reverse_proxy.md`
 - **Recorded**: 2026-09-20

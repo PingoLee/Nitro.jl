@@ -1,6 +1,6 @@
 ## Static mounts register one prefix handler instead of a route per file (#221)
 
-- **Version**: Unreleased
+- **Version**: 0.4.0
 - **Nitro ref**: #221; `src/core/staticfiles.jl`, `src/utilities/fileutil.jl`,
   `docs/design/static-serving-boundary.md`, `test/staticfiles_security_tests.jl`,
   `test/util_tests.jl`, `test/spa_tests.jl`

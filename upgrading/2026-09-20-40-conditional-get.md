@@ -1,6 +1,6 @@
 ## Static mounts answer conditional GETs and byte ranges (#40)
 
-- **Version**: Unreleased
+- **Version**: 0.4.0
 - **Nitro ref**: #40; `src/response.jl`, `src/core/staticfiles.jl`, `src/methods.jl`,
   `docs/design/static-serving-boundary.md`, `docs/src/tutorial/reverse_proxy.md`
 - **Recorded**: 2026-09-20

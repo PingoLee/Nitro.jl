@@ -1,6 +1,6 @@
 ## `instance()` is removed — construct a second `App` instead (#31)
 
-- **Version**: Unreleased
+- **Version**: 0.4.0
 - **Nitro ref**: #31; `src/instances.jl` (deleted), `src/Nitro.jl`,
   `test/instance_tests.jl` → `test/app_tests.jl`
 - **Recorded**: 2026-09-13

@@ -1,6 +1,6 @@
 ## A filename that must be percent-encoded now mounts at its encoded route (#121)
 
-- **Version**: Unreleased
+- **Version**: 0.4.0
 - **Nitro ref**: #121; `src/utilities/fileutil.jl`, `src/methods.jl`,
   `docs/design/static-serving-boundary.md`, `test/staticfiles_security_tests.jl`,
   `test/util_tests.jl`

@@ -1,6 +1,6 @@
 ## Store contracts raise `StoreInterfaceError`, and session cleanup is explicitly optional (#33)
 
-- **Version**: Unreleased
+- **Version**: 0.4.0
 - **Nitro ref**: #33; `src/errors.jl`, `src/types.jl`, `src/cookies.jl`, `src/Workers/registry.jl`,
   `src/exts.jl`, `ext/NitroPormGExt.jl`, `docs/src/tutorial/sessions_and_auth.md`
 - **Recorded**: 2026-09-13

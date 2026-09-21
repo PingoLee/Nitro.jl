@@ -74,7 +74,8 @@ Nitro at HEAD is running them, and `upgrade_guide` surfaces them by default.
 
 | Train | Cut |
 |---|---|
-| Unreleased — next `0.4.0` | — |
+| Unreleased — next `0.5.0` | — |
+| `0.4.0` | 2026-09-21 |
 | `0.3.0` | 2026-09-09 |
 | `0.2.0` | 2026-08-10 |
 | `0.1.0` | 2026-07-31 |

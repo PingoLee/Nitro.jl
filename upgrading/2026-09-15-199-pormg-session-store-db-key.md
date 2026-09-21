@@ -1,6 +1,6 @@
 ## `PormGSessionStore` routes every query to its `db_key` (#199)
 
-- **Version**: Unreleased
+- **Version**: 0.4.0
 - **Nitro ref**: #199; `ext/NitroPormGExt.jl`, `src/exts.jl`,
   `docs/src/tutorial/sessions_and_auth.md`, `docs/src/tutorial/cookies/sessions.md`,
   `test/extensions/pormg_session_tests.jl`

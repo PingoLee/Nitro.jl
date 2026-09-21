@@ -1,6 +1,6 @@
 ## Starting a task is a claimed transition; `try_transition!` gains `started_at` (#142)
 
-- **Version**: Unreleased
+- **Version**: 0.4.0
 - **Nitro ref**: #142 (builds on #108; prerequisite for #127); `src/Workers/api.jl`,
   `src/Workers/queue.jl`, `src/Workers/registry.jl`, `ext/NitroPormGExt.jl`
 - **Recorded**: 2026-09-11

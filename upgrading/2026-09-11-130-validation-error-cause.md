@@ -1,6 +1,6 @@
 ## `ValidationError` no longer renders or serializes its `.cause` (#130)
 
-- **Version**: Unreleased
+- **Version**: 0.4.0
 - **Nitro ref**: #130 (follow-up to #72); `src/errors.jl`, `docs/src/tutorial/request_body.md`
 - **Recorded**: 2026-09-11
 - **Severity**: **breaking (JSON output shape)** — a security fix; part of the `0.1.x` pre-publish

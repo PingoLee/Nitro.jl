@@ -1,6 +1,6 @@
 ## Response building consolidates into `Res` — the top-level `html`/`js`/`css`/`xml`/`text`/`binary`/`file`/`redirect` builders are gone (#28)
 
-- **Version**: Unreleased
+- **Version**: 0.4.0
 - **Nitro ref**: #28; `src/response.jl`, `src/utilities/render.jl` (deleted), `src/util.jl`,
   `src/utilities/misc.jl`, `src/Nitro.jl`, `src/core.jl`
 - **Recorded**: 2026-09-11

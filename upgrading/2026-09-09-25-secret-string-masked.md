@@ -1,6 +1,6 @@
 ## `SecretString` now serializes to `"****"` instead of its raw value (#25)
 
-- **Version**: Unreleased
+- **Version**: 0.4.0
 - **Nitro ref**: #25; `src/crypto.jl`, `docs/src/tutorial/secrets.md`
 - **Recorded**: 2026-09-09
 - **Severity**: **breaking (JSON output shape)** — a security fix; part of the `0.1.x` pre-publish

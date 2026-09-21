@@ -1,6 +1,6 @@
 ## A teardown abandons a sequential queue's backlog instead of executing it (#182)
 
-- **Version**: Unreleased
+- **Version**: 0.4.0
 - **Nitro ref**: #182 (follow-up to #176; builds on #183); `src/Workers/runtime.jl`,
   `src/Workers/queue.jl`, `src/Workers/types.jl`, `src/Workers/api.jl`,
   `docs/src/tutorial/workers.md`, `.github/instructions/workers.instructions.md`,

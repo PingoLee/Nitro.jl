@@ -1,6 +1,6 @@
 ## Worker runs no longer inherit the submitter's dynamic scope (#209)
 
-- **Version**: Unreleased
+- **Version**: 0.4.0
 - **Nitro ref**: #209; `src/Workers/execution.jl`, `src/Workers/api.jl`, `src/Workers/queue.jl`,
   `docs/src/tutorial/workers.md`, `test/workers_tests.jl`,
   `test/extensions/pormg_worker_tests.jl`

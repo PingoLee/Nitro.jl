@@ -1,6 +1,6 @@
 ## HTTP compat moves to `~2.7` — an app pinning `~2.6` must move too
 
-- **Version**: Unreleased
+- **Version**: 0.4.0
 - **Nitro ref**: #225; `Project.toml` `[compat]`, `src/core/transport.jl`,
   `test/http_internals_contract_tests.jl`
 - **Recorded**: 2026-09-20

@@ -1,6 +1,6 @@
 ## Cancellation no longer interrupts the callback — poll `cancel_requested` instead (#127)
 
-- **Version**: Unreleased
+- **Version**: 0.4.0
 - **Nitro ref**: #127 (unblocks #30; requires #142); `src/Workers/types.jl`,
   `src/Workers/api.jl`, `src/Workers/execution.jl`, `src/Workers/queue.jl`,
   `docs/src/tutorial/workers.md`

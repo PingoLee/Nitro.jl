@@ -1,6 +1,6 @@
 ## `shutdown!` is required of every `AbstractWorkerStore` (#29)
 
-- **Version**: Unreleased
+- **Version**: 0.4.0
 - **Nitro ref**: #29; `src/Workers/registry.jl`, `ext/NitroPormGExt.jl`, `test/workers_tests.jl`,
   `test/extensions/pormg_worker_tests.jl`
 - **Recorded**: 2026-09-13

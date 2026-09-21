@@ -1,6 +1,6 @@
 ## `try_transition!` gains a required `run_id`; `nitro_task` gains a `run_id` column (#108)
 
-- **Version**: Unreleased
+- **Version**: 0.4.0
 - **Nitro ref**: #108 (builds on #88); `src/Workers/types.jl`, `src/Workers/registry.jl`,
   `src/Workers/queue.jl`, `src/Workers/api.jl`, `ext/NitroPormGExt.jl`,
   `docs/src/tutorial/workers.md`

@@ -1,6 +1,6 @@
 ## Worker teardown drains in-flight runs instead of releasing them (#176)
 
-- **Version**: Unreleased
+- **Version**: 0.4.0
 - **Nitro ref**: #176 (follow-up to #167); `src/Workers/runtime.jl`, `src/Workers/types.jl`,
   `src/Workers/execution.jl`, `src/Workers/queue.jl`, `src/Workers/api.jl`,
   `docs/src/tutorial/workers.md`, `.github/instructions/workers.instructions.md`,

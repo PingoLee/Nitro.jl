@@ -1,6 +1,6 @@
 ## `serve()` now caps request bodies at 64 MiB and answers 413 (#17)
 
-- **Version**: Unreleased
+- **Version**: 0.4.0
 - **Nitro ref**: #17; `src/core/transport.jl`, `src/core/lifecycle.jl`, `src/constants.jl`
 - **Recorded**: 2026-09-20
 - **Severity**: **behavior (new default ceiling)** — a request whose body exceeds 64 MiB is now
