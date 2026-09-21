@@ -583,9 +583,10 @@ end
         @test wrapped(req_from(IPv4("203.0.113.7"))).status == 200
         @test wrapped(req_from(IPv4("203.0.113.8"))).status == 200
 
-        # A dual-stack listener can report an IPv4 peer as `::ffff:a.b.c.d`. `_norm`
-        # demotes it, so it must share the bucket with the plain v4 spelling rather
-        # than opening a second one.
+        # A mapped address must share a bucket with the plain v4 spelling rather than
+        # opening a second one. Since #66 the socket peer arrives already demoted, so what
+        # this now pins is the fold `_bucket_key` applies to whatever `getip(req)` holds —
+        # a header-derived address behind a proxy, or one written with `setip!`.
         @test wrapped(req_from(IPv6("::ffff:203.0.113.7"))).status == 200
         @test wrapped(req_from(IPv4("203.0.113.7"))).status == 200
         @test wrapped(req_from(IPv6("::ffff:203.0.113.7"))).status == 429

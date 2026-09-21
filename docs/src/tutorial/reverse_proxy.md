@@ -382,7 +382,10 @@ ExtractIP(forwarded_header = :x_forwarded_for,
 A catch-all range (`"0.0.0.0/0"`, `"::/0"`) is rejected at construction — it would trust the
 forwarding header from every peer on the internet, which is exactly what the gate exists to
 prevent. IPv4 and IPv6 ranges never match across families, and an IPv4-mapped IPv6 peer
-(`::ffff:127.0.0.1`, which some dual-stack listeners report) matches an IPv4 entry as you'd expect.
+(`::ffff:127.0.0.1`) matches an IPv4 entry as you'd expect. Nitro already demotes that form when it
+reads the socket, so a *peer* reaches this matching in its IPv4 spelling — but the fold still does
+real work on the other two inputs: a hop your proxy wrote into `X-Forwarded-For` as
+`::ffff:10.0.0.8`, and a mapped literal or CIDR you put in `trusted_proxies` yourself.
 
 ### Rate limiting
 
@@ -434,7 +437,9 @@ addressing. `/0` is rejected for either family: it puts every client on the inte
 shared bucket while still looking per-client.
 
 An IPv4-mapped IPv6 peer (`::ffff:203.0.113.7`) is folded onto its IPv4 form first, so it shares a
-bucket with the plain spelling rather than opening a second one.
+bucket with the plain spelling rather than opening a second one. This is not made redundant by the
+socket peer already arriving demoted: the bucket key is built from `getip(req)`, which behind a
+trusted proxy is the address resolved out of the header, not the peer.
 
 ### Auditing: the socket peer is preserved
 
@@ -450,6 +455,12 @@ end
 A forged header can change `getip`, but nothing a client sends can change `getpeerip`. Logging both
 is what lets you tell a proxied request from a direct one after an incident. Without `ExtractIP` in
 the pipeline the two are the same value.
+
+"Preserved" is about *which* address, not which spelling of it. Both accessors report one canonical
+form per host: a dual-stack listener that reports an IPv4 client as `::ffff:203.0.113.7` is seeded
+as `203.0.113.7`, so the same host logs identically whether it connected directly or came through
+your proxy. That demotion happens where `serve` reads the socket, so it applies even with no
+`ExtractIP` in the pipeline.
 
 ## Checklist
 
