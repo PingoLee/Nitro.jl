@@ -66,16 +66,41 @@ function _reject_filter_key(k::String)
           "query under test is not actually being exercised.")
 end
 
-mutable struct MockQuerySet
+# One database: the state every queryset the owning model mints SHARES, plus the lock that makes
+# sharing safe. Same shape, same reasoning and the same statement-level granularity as
+# `MockDB` in `pormg_worker_tests.jl` -- read the comment there, it is the canonical one.
+#
+# PROPHYLACTIC HERE, and worth being honest about: this file contains no `Threads.@spawn`, no
+# `@async` and no `timedwait`, so `PormGSessionStore` is only ever driven from the test task and
+# the race #226 is about cannot fire. The lock is here so the invariant "the mock serializes,
+# because the database it stands in for does" holds for BOTH mocks -- this one is where the
+# worker mock was ported from, and the next concurrent session test would otherwise reintroduce
+# a bug that has already been fixed once.
+struct SessionMockDB
     # One table PER CONNECTION, not one table. A single-table mock cannot express #199 at all --
     # "created the table on `sessions`, then read and wrote every row on `db`" is not a statement
     # about anything unless there are two tables to tell apart, so no assertion written against
     # such a mock could have failed on the shipped code.
     tables::Dict{String, Dict{String, Dict{Symbol,Any}}}   # db key -> session_key -> row
-    db_key::Union{Nothing,String}                          # `nothing` until `.db(key)` runs
-    filters::Dict{String, Any}
     seen::Vector{Dict{String,Any}}
+    lock::ReentrantLock
 end
+
+SessionMockDB(db_keys::String...) = SessionMockDB(
+    Dict{String, Dict{String, Dict{Symbol,Any}}}(
+        k => Dict{String, Dict{Symbol,Any}}() for k in (isempty(db_keys) ? ("db",) : db_keys)),
+    Dict{String,Any}[],
+    ReentrantLock())
+
+mutable struct MockQuerySet
+    mdb::SessionMockDB
+    db_key::Union{Nothing,String}                          # `nothing` until `.db(key)` runs
+    # Per-queryset: `model.objects` mints a fresh one per access, so a chain is confined to the
+    # task that built it.
+    filters::Dict{String, Any}
+end
+
+_mock_lock(qs::MockQuerySet) = getfield(qs, :mdb).lock
 
 # The connection this query runs on. `nothing` means the store reached `m.objects` directly
 # instead of routing through `_session_objects(store)`.
@@ -96,7 +121,7 @@ function _selected_table(qs::MockQuerySet)
     key === nothing && error("MockSessionQuerySet: query ran without selecting a connection -- " *
         "every session query must go through `_session_objects(store)` (`.db(store.db_key)`), " *
         "not `m.objects` directly. See #199.")
-    tables = getfield(qs, :tables)
+    tables = getfield(qs, :mdb).tables
     haskey(tables, key) || error("MockSessionQuerySet: no table registered for db key '$key' -- " *
         "PormG throws `InvalidConfigurationError` for a key that was never loaded. Build the " *
         "model as `MockModel(\"$key\")` if the test means to use that connection.")
@@ -106,9 +131,12 @@ end
 # The keys of every row the accumulated filter selects. Recording the filter here rather than in
 # `filter` is deliberate: this is the filter a query actually RAN with, which is what a test
 # wants to assert about.
-function _matching_keys(qs::MockQuerySet)
+# MUST be called with the database lock held: it reads the shared table and appends to the
+# shared `seen` vector. Appends exactly once per call, and every terminal op calls it exactly
+# once -- `_filters_seen` carries exact-count assertions.
+function _matching_keys_locked(qs::MockQuerySet)
     filters = getfield(qs, :filters)
-    push!(getfield(qs, :seen), copy(filters))
+    push!(getfield(qs, :mdb).seen, copy(filters))
 
     # Validate EVERY key BEFORE looking at any row. Checking inside the row loop -- which is
     # where this started -- makes the guard vanish on an empty table, and an empty table is
@@ -180,9 +208,10 @@ function Base.getproperty(qs::MockQuerySet, name::Symbol)
         end
     elseif name === :first
         return function()
-            matched = _matching_keys(qs)
-            isempty(matched) && return nothing
-            return _as_db_row(_selected_table(qs)[first(matched)])
+            return lock(_mock_lock(qs)) do
+                matched = _matching_keys_locked(qs)
+                isempty(matched) ? nothing : _as_db_row(_selected_table(qs)[first(matched)])
+            end
         end
     elseif name === :create
         return function(pairs::Pair{String,<:Any}...)
@@ -190,10 +219,13 @@ function Base.getproperty(qs::MockQuerySet, name::Symbol)
             for (k, v) in pairs
                 row[Symbol(k)] = v
             end
-            _selected_table(qs)[row[:session_key]] = row
-            # PormG's `.create` returns a fully-populated row that reads back canonicalised like
-            # any other, so go through the same conversion rather than aliasing what was stored.
-            return _as_db_row(row)
+            return lock(_mock_lock(qs)) do
+                _selected_table(qs)[row[:session_key]] = row
+                # PormG's `.create` returns a fully-populated row that reads back canonicalised
+                # like any other, so go through the same conversion rather than aliasing what
+                # was stored. `_as_db_row` merges into a new Dict, so it is already a snapshot.
+                _as_db_row(row)
+            end
         end
     elseif name === :update
         return function(pairs::Pair{String,<:Any}...)
@@ -202,15 +234,18 @@ function Base.getproperty(qs::MockQuerySet, name::Symbol)
             isempty(getfield(qs, :filters)) &&
                 error("MockSessionQuerySet: update() requires a filter -- refusing to update " *
                       "every row, as PormG does.")
-            table = _selected_table(qs)
-            touched = 0
-            for key in _matching_keys(qs)
-                for (k, v) in pairs
-                    table[key][Symbol(k)] = v
+            # The compare and the set in ONE lock hold -- that is what an UPDATE ... WHERE is.
+            return lock(_mock_lock(qs)) do
+                table = _selected_table(qs)
+                touched = 0
+                for key in _matching_keys_locked(qs)
+                    for (k, v) in pairs
+                        table[key][Symbol(k)] = v
+                    end
+                    touched += 1
                 end
-                touched += 1
+                touched
             end
-            return touched
         end
     elseif name === :delete
         # Bound to a local instead of returned directly: Julia 1.13's parser drops the
@@ -223,14 +258,17 @@ function Base.getproperty(qs::MockQuerySet, name::Symbol)
             (!allow_delete_all && isempty(getfield(qs, :filters))) &&
                 error("MockSessionQuerySet: delete() must have a filter -- pass " *
                       "allow_delete_all = true to delete every row, as PormG requires.")
-            matched = _matching_keys(qs)
-            table = _selected_table(qs)
-            for key in matched
-                delete!(table, key)
+            return lock(_mock_lock(qs)) do
+                matched = _matching_keys_locked(qs)
+                table = _selected_table(qs)
+                for key in matched
+                    delete!(table, key)
+                end
+                # PormG returns `(total, per-table breakdown)`. The mock used to return
+                # `nothing`, so a store that started reading the count would have been testing
+                # a fiction.
+                (length(matched), Dict{String,Integer}("nitro_session" => length(matched)))
             end
-            # PormG returns `(total, per-table breakdown)`. The mock used to return `nothing`,
-            # so a store that started reading the count would have been testing a fiction.
-            return length(matched), Dict{String,Integer}("nitro_session" => length(matched))
         end
         return delete_fn
     else
@@ -239,32 +277,30 @@ function Base.getproperty(qs::MockQuerySet, name::Symbol)
 end
 
 struct MockModel
-    _tables::Dict{String, Dict{String, Dict{Symbol,Any}}}
-    _filters_seen::Vector{Dict{String,Any}}
+    mdb::SessionMockDB
 end
 
 # Every connection this model may be queried on. A test that exercises routing names both
 # (`MockModel("db", "sessions")`); the no-argument form is the single connection every test that
 # does not care about routing uses.
-MockModel(db_keys::String...) = MockModel(
-    Dict{String, Dict{String, Dict{Symbol,Any}}}(
-        k => Dict{String, Dict{Symbol,Any}}() for k in (isempty(db_keys) ? ("db",) : db_keys)),
-    Dict{String,Any}[],
-)
+MockModel(db_keys::String...) = MockModel(SessionMockDB(db_keys...))
 
 function Base.getproperty(m::MockModel, name::Symbol)
     if name === :objects
         # No connection selected yet -- exactly what PormG's `model.objects` hands back.
         # `.db(key)` is what picks one.
-        return MockQuerySet(getfield(m, :_tables), nothing, Dict{String,Any}(),
-                            getfield(m, :_filters_seen))
+        return MockQuerySet(getfield(m, :mdb), nothing, Dict{String,Any}())
     elseif name === :_table
         # The DEFAULT connection's table: what every assertion that does not care about routing
         # means, kept as an alias rather than rewritten at twenty-odd call sites. A test that DOES
         # care names its connection (`m._tables["sessions"]`) -- and the routing testsets below
         # assert `_table` stays EMPTY for a store configured elsewhere, which makes this alias an
         # assertion asset rather than a way to read the wrong table by accident.
-        return getfield(m, :_tables)["db"]
+        return getfield(m, :mdb).tables["db"]
+    elseif name === :_tables
+        return getfield(m, :mdb).tables
+    elseif name === :_filters_seen
+        return getfield(m, :mdb).seen
     else
         return getfield(m, name)
     end
