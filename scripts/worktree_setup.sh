@@ -1,35 +1,31 @@
 #!/usr/bin/env bash
 # Provision a fresh Nitro worktree with the local state it needs to run tests. Safe to re-run.
 #
-# THE PROBLEM THIS SOLVES
+# WHAT IT DOES, AND WHY
 #
-# `Project.toml` declares a path-sourced dependency:
+# `Manifest.toml` is gitignored, so a fresh worktree has none. Left alone, Pkg resolves to
+# whatever is newest — a version difference between your worktree and the main checkout that
+# nothing announces and that later reads as a flake. This script copies the main checkout's
+# manifest, runs `Pkg.resolve()` (conservative: it keeps the copied versions wherever they still
+# satisfy Project.toml), and only then `Pkg.instantiate()`. When the copy cannot be reconciled
+# with a `[compat]` edit on this branch it discards it and resolves fresh — but only a manifest
+# THIS RUN created, and only on a resolve failure. Both conditions are argued at the call site.
 #
-#     [sources]
-#     PormG = {path = "../PormG.jl"}
-#
-# Pkg resolves that path relative to the *project directory*. In the main checkout
-# (`…/Nitro.jl`) it lands on the real sibling clone (`…/PormG.jl`). In a worktree
-# (`…/Nitro.jl/.claude/worktrees/<name>`) the same string points at
-# `…/Nitro.jl/.claude/worktrees/PormG.jl`, which does not exist — so EVERY Pkg operation in a
-# fresh worktree dies with:
-#
-#     ERROR: expected package `PormG [7d8d7541]` to exist at path `…/.claude/worktrees/PormG.jl`
-#
-# That is not a test failure, it is a resolve failure: nothing runs at all, including tests that
-# have nothing to do with PormG. This script makes the relative path resolve by creating a
-# directory link at the location the worktree expects, pointing back at the real clone. One link
-# per `[sources]` entry, placed so that all sibling worktrees share it.
-#
-# The link is created inside `.claude/worktrees/`, which is gitignored — nothing here is ever
-# committed. Windows uses a directory JUNCTION rather than a symlink: junctions need no
+# It also links any `[sources]` PATH dependency into place. Pkg resolves such a path relative to
+# the *project directory*, so from a worktree `../Foo.jl` points at `.claude/worktrees/Foo.jl`
+# rather than at the real sibling clone, and EVERY Pkg operation then dies at resolve time with
+# `expected package Foo [uuid] to exist at path …` — a resolve failure, not a test failure:
+# nothing runs, including tests that have nothing to do with Foo. The link goes in
+# `.claude/worktrees/` (gitignored, never committed), one per entry, placed so all sibling
+# worktrees share it. Windows uses a directory JUNCTION rather than a symlink: junctions need no
 # administrator rights and no Developer Mode, unlike `mklink /D`.
 #
-# NOTE (#21): PormG is no longer a path dep — `[sources]` pins it by url + rev, which
-# Pkg fetches into the depot, so the relative-path breakage described above no longer happens for
-# it and the linking loop below finds nothing to do. Everything after it (Manifest copy, resolve,
-# instantiate) is still what makes a fresh worktree usable, so the script stays. The loop is kept
-# generic rather than deleted: it costs nothing and a future path source would need it again.
+# `Project.toml` HAS NO PATH SOURCE TODAY, so that loop finds nothing to link. PormG used to be
+# one; `[sources]` now pins it by url + an immutable `rev` that Pkg fetches into the depot (#21),
+# and it must never go back — a path entry is committable, so it breaks every other checkout, and
+# it was a registry-publication blocker (#117, and docs/design/registry-publication.md). The loop
+# is kept generic rather than deleted: it costs nothing and is the only thing standing between a
+# future path source and an unusable worktree.
 #
 # Usage:
 #   bash scripts/worktree_setup.sh [<worktree-path>]     # defaults to $(pwd)

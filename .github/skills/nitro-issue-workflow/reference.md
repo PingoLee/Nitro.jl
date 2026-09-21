@@ -43,17 +43,22 @@ The reasoning, and the tiered permission model behind it, is in
 
 ## B. Why the worktree setup script comes first (SKILL.md §2)
 
-**A fresh worktree cannot resolve at all without it.** `Project.toml` declares
-`[sources] PormG = {path = "../PormG.jl"}`, and Pkg resolves that path relative to the *project
-directory*. From a worktree it points at `.claude/worktrees/PormG.jl`, which does not exist, so
-**every** Pkg operation dies with `expected package PormG [7d8d7541] to exist at path …`. That is a
-resolve failure, not a test failure: nothing runs, including tests that have nothing to do with
-PormG.
+**It is no longer PormG that makes it necessary.** `Project.toml` used to declare
+`[sources] PormG = {path = "../PormG.jl"}`, and Pkg resolves a `[sources]` path relative to the
+*project directory* — from a worktree that pointed at `.claude/worktrees/PormG.jl`, which does not
+exist, so **every** Pkg operation died with `expected package PormG [7d8d7541] to exist at path …`
+before a single test ran. `[sources]` now pins PormG by url + an immutable `rev`
+([#21](https://github.com/PingoLee/Nitro.jl/issues/21)) that Pkg fetches into the depot, so a fresh
+worktree resolves, instantiates and precompiles on its own.
 
-`scripts/worktree_setup.sh` creates the link (a directory **junction** on Windows — no admin rights
-or Developer Mode needed), copies the main checkout's `Manifest.toml`, then runs `Pkg.resolve()`
-before `Pkg.instantiate()` so a copied manifest that predates a `[compat]` edit on your branch is
-corrected up front rather than re-resolved mid-`Pkg.test`.
+**What the script buys now is reproducibility.** `Manifest.toml` is gitignored, so a fresh worktree
+has none and would re-resolve to whatever is newest — a version difference between your worktree and
+the main checkout that nothing announces and that later reads as a flake. The script copies the main
+checkout's manifest, then runs `Pkg.resolve()` **before** `Pkg.instantiate()` so a copy predating a
+`[compat]` edit on your branch is corrected up front rather than re-resolved mid-`Pkg.test`; when
+the copy cannot be reconciled at all (`empty intersection between HTTP@2.4.0 and project
+compatibility …`) it discards **only** a manifest it created this run and resolves fresh. Running
+Pkg before it is no longer fatal — it is just how two checkouts silently diverge.
 
 **Why the branch rename is not cosmetic.** `EnterWorktree` names the branch `worktree-<name>`, so
 without the rename you commit and open the PR from `worktree-fix-42-foo`. Verified in this repo's
@@ -61,10 +66,12 @@ reflog: `Branch: renamed refs/heads/worktree-fix+16-extract-ip-trusted-proxies t
 refs/heads/fix/16-extract-ip-trusted-proxies`.
 
 **Why the name must be flat and dash-only.** A `/` in the name is encoded as `+` in the directory
-(hence `fix+16-…` above), so the worktree never nests. That matters because `worktree_setup.sh`
-places the `[sources]` link at `<worktree>/../PormG.jl` — with a flat name that resolves to
-`.claude/worktrees/PormG.jl`, one link **every** sibling worktree shares, which is what the script's
-header says it is for.
+(hence `fix+16-…` above), so every worktree is a direct child of `.claude/worktrees/` at one
+predictable depth rather than nesting. The original reason was load-bearing: the setup script placed
+the `[sources]` path link at `<worktree>/../PormG.jl`, and only a flat name made that resolve to
+`.claude/worktrees/PormG.jl`, one link every sibling worktree shared. That link is gone with the
+path dep, so this is now a convention — keep it anyway, because `git worktree list` and the teardown
+step both read very badly once worktrees nest.
 
 **`origin/<default-branch>` is the default, not a guarantee.** It is the `worktree.baseRef` setting
 (`fresh`); under `head` you branch from your current local HEAD, silently carrying whatever you had
@@ -149,12 +156,15 @@ race, not flakiness — do not retry until it passes, and do not reach for `--wo
 different axis and is now refused for N > 1. Both are owned by
 [`nitro-test-troubleshooting`](../nitro-test-troubleshooting/SKILL.md) §2 and §7.
 
-**PormG is why local green does not imply CI green.** `Manifest.toml` is gitignored, so you reuse
-whatever was resolved once while CI resolves fresh. More sharply: `.github/workflows/ci.yml` clones
-PormG from `https://github.com/PingoLee/PormG.jl.git` at `--depth 1` — **CI does not see your local
-`../PormG.jl` working tree.** A Nitro change that depends on unpushed PormG work passes locally and
-fails CI with no obvious cause. If the issue involves the PormG boundary, confirm the PormG side is
-pushed before you call it done.
+**PormG is still why local green does not imply CI green, but the mechanism changed.**
+`Manifest.toml` is gitignored, so you reuse whatever was resolved once while CI resolves fresh.
+`[sources]` pins PormG to **one immutable commit** that Pkg fetches into the depot — CI builds
+exactly that commit and so do you, so the old trap ("CI clones the default branch, you have a dirty
+`../PormG.jl`") is gone. A new one replaces it: **unpushed PormG work is invisible to both of you.**
+Co-developing the two means `Pkg.develop`ing a local PormG into the worktree's manifest — supported,
+and uncommitted by design — at which point "works locally" stops being evidence about CI until the
+`rev` in `Project.toml` is bumped to a **pushed** commit. If the issue touches the PormG boundary:
+push the PormG side, then move the pin, then call it done.
 
 Raising the `PormG` `[compat]` pin is its own procedure — run
 `PormG.upgrade_guide(from = v"<current pin>")` from PormG's env first and apply every entry, per the
@@ -197,5 +207,6 @@ Verify against `origin/main` explicitly — `git fetch && git merge-base --is-an
 origin/main` — and only then override deliberately. Never reach for `-D` or `discard_changes: true`
 without that check.
 
-The `.claude/worktrees/PormG.jl` link is shared by sibling worktrees — leave it in place when you
-tear one down.
+A worktree leaves nothing PormG-specific behind any more — the shared `.claude/worktrees/PormG.jl`
+link the old path dep needed no longer exists. Its only untracked state is `Manifest.toml`, which
+goes with the directory.

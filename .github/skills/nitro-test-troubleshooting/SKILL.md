@@ -3,8 +3,8 @@ name: nitro-test-troubleshooting
 description: >-
   Diagnose failing, flaky, or environment-dependent Nitro.jl tests — global router state leaking
   across test items, ordering dependencies in the explicit runtests.jl list, thread-count-dependent
-  failures, port binding and network tests, the Pkg.test re-dispatch, and the PormG sibling
-  dependency. Read when a test is red and the cause isn't an obvious code regression.
+  failures, port binding and network tests, the Pkg.test re-dispatch, and the git-pinned PormG
+  source. Read when a test is red and the cause isn't an obvious code regression.
 ---
 
 # Nitro.jl Test Troubleshooting
@@ -137,8 +137,9 @@ args and the launcher's thread count (guarded by the `NITRO_TEST_REDISPATCH` env
 probing **every** `[targets].test` entry, read from `Project.toml`. It used to probe one package,
 `Suppressor`, as a stand-in for "am I in the test env?" — and `Base.identify_package` searches the
 whole `LOAD_PATH`, so on a machine with `Suppressor` installed in the global `@v#.#` environment the
-answer was "already provisioned", the re-dispatch never fired, and `PormG` (a `[sources]` path dep,
-never globally installable) stayed missing. See §3b. So the direct commands work — but if you see this error anyway:
+answer was "already provisioned", the re-dispatch never fired, and `PormG` — which reaches the load
+path only through the env `Pkg.test` generates — stayed missing. See §3b. So the direct commands
+work — but if you see this error anyway:
 
 - You are running a test file *directly* (`julia --project=. test/foo_tests.jl`) instead of through
   `test/runtests.jl`. Go through the runner.
@@ -162,30 +163,50 @@ that is the answer and the four causes below are noise. Then work through them i
    tell is that *every* target is listed as missing rather than a subset, and the two paths above
    disagree.
 2. **`NITRO_TEST_REDISPATCH` stale in your shell** from an interrupted run — `unset` it.
-3. **A worktree with no sibling `../PormG.jl`** — `bash scripts/worktree_setup.sh` (§4).
-4. **The environment was re-resolved and dropped a path dependency.** `Pkg.update("HTTP")` will do
-   this: it re-resolves the *project* env, where `PormG` is only a weakdep, and prunes it without a
-   word. `Pkg.test()` re-provisions it.
+3. **The pinned PormG commit was never fetched** — a cold depot with no network, or a checkout that
+   has never been instantiated (§4). `bash scripts/worktree_setup.sh`.
+4. **The environment was re-resolved and dropped the weak dependency.** `Pkg.update("HTTP")` will do
+   this: it re-resolves the *project* env, where `PormG` is only a weakdep and is therefore not
+   installed at all, and prunes it without a word. `Pkg.test()` re-provisions it — `[sources]`
+   crosses a project boundary in exactly one place, `Pkg.test` copying the tested package's sources
+   into the env it generates, and that is why the test env has PormG when the project env does not.
 
-Related, and the reason (3) is easy to hit: after a `[compat]` bound is raised, `Pkg.resolve()`
-**fails rather than upgrading** — it preserves versions, so a manifest still holding `HTTP@2.4.0`
-against `HTTP = "~2.6"` dies with `empty intersection between HTTP@2.4.0 and project compatibility
-2.6`. `scripts/worktree_setup.sh` now recovers from that by discarding the copied manifest and
-resolving fresh; by hand, `Pkg.update("HTTP")` is what moves the pin.
+Related, and the reason a fresh worktree is where these show up: after a `[compat]` bound is
+raised, `Pkg.resolve()` **fails rather than upgrading** — it preserves versions, so a manifest
+still holding `HTTP@2.4.0` against `HTTP = "~2.6"` dies with `empty intersection between
+HTTP@2.4.0 and project compatibility 2.6`. `scripts/worktree_setup.sh` now recovers from that by
+discarding the copied manifest and resolving fresh; by hand, `Pkg.update("HTTP")` is what moves
+the pin.
 
-### 4. PormG sibling checkout missing
+### 4. PormG will not fetch, or fetched the wrong thing
 
-`Project.toml` declares `[sources] PormG = {path = "../PormG.jl"}` and PormG is a **hard test
-dependency**. Resolution fails without a sibling `../PormG.jl` checkout — CI clones one explicitly
-before building.
+`Project.toml` pins PormG by **url + an immutable 40-hex `rev`** in `[sources]`, and PormG is a
+**hard test dependency**. Pkg fetches that exact commit into the depot itself, so **no sibling
+`../PormG.jl` is needed by anyone** — not locally, not in a worktree, not on a CI runner. What it
+does need is a reachable remote on a cold depot, and a `rev` that still exists.
 
-Symptoms: `Pkg` resolver errors naming PormG, or every `:pormg` / `:extension` item erroring at load.
-Fix: clone or symlink PormG next to the Nitro checkout. Note this also means **a worktree under
-`.claude/worktrees/` does not have PormG as a sibling** — the relative path resolves to
-`.claude/worktrees/PormG.jl`, which does not exist, so *every* Pkg operation fails before any test
-runs. Fix it with `bash scripts/worktree_setup.sh`, which links the real clone into place (a
-directory junction on Windows) and instantiates. Never point `[sources]` at an absolute path — that
-change is committable and would break every other checkout.
+| Symptom | Cause | Fix |
+|---|---|---|
+| `failed to clone from https://github.com/PingoLee/PormG.jl.git`, a TLS error, or a hang at "Updating git-repo" | No network, on a depot that has never fetched this commit | Get network, or warm the depot from a machine that has it. There is no offline path — the commit is not vendored |
+| `Object not found — no match for id (054b90f…)` | The pinned commit was force-pushed away, or lived only on a deleted branch | Fix the **pin**, do not work around it. Bumping it is its own procedure — run `PormG.upgrade_guide(from = v"<lower bound of [compat]>")` from PormG's env first, and move `[compat]` with it |
+| Everything resolves, `PormG` still not importable | Not this section — that is the test env. See §3b |
+
+**A fresh worktree no longer fails PormG-specifically.** Under the old
+`[sources] PormG = {path = "../PormG.jl"}`, Pkg resolved that path against the *project directory*,
+so from a worktree it landed on `.claude/worktrees/PormG.jl` — which does not exist — and *every*
+Pkg operation died before any test ran. That is gone
+([#21](https://github.com/PingoLee/Nitro.jl/issues/21)); a fresh worktree now resolves,
+instantiates and precompiles on its own. `scripts/worktree_setup.sh` still earns its keep: it copies
+the main checkout's `Manifest.toml` and runs `Pkg.resolve()` before `Pkg.instantiate()`, so a fresh
+worktree reproduces the main checkout's resolution instead of re-resolving to whatever is newest.
+Skipping it is no longer fatal — it just leaves you comparing a worktree resolution against a
+main-checkout one and calling the difference a flake.
+
+**Never point `[sources]` at a path again.** It is committable, so it breaks every other checkout —
+and it was a hard registry-publication blocker
+([#117](https://github.com/PingoLee/Nitro.jl/issues/117)). The full analysis, including what
+*actually* blocks publication today, is in
+[`docs/design/registry-publication.md`](../../../docs/design/registry-publication.md).
 
 ### 5. Network and port-binding tests
 
@@ -269,7 +290,7 @@ The guard exists because router state is process-global. It comes out when
 3. **Vary thread count** (`-t 1` vs `-t 2`). A difference ⇒ class 2 (race).
 4. **Check `TEST_FILES`** in `test/harness_manifest.jl` if the item never appears in the output
    at all — though `test/harness_tests.jl` should have failed first.
-5. **Check the environment** — PormG sibling present, no orphaned server process, no second suite
+5. **Check the environment** — the pinned PormG commit fetched (§4), no orphaned server process
    running.
 6. **Only then bisect your diff.** `git stash` and confirm the failure predates your change before
    attributing it.

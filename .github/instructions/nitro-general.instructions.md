@@ -69,7 +69,12 @@ These are canonical here — no other file owns them.
   deprecation shims or compatibility aliases to preserve a design you believe is wrong; propose the
   clean break. Release gating is the
   [`pre-publish` label](https://github.com/PingoLee/Nitro.jl/issues?q=is%3Aopen+label%3Apre-publish);
-  the publish gate is that query coming back empty. *(Remove this bullet once published.)*
+  the publish gate is that query coming back empty. The one issue carrying it today is
+  [#117](https://github.com/PingoLee/Nitro.jl/issues/117), and what actually blocks registration —
+  **`PormG` sits in `[weakdeps]`, no registry knows it, and RegistryTools' `check_deps!` errors on
+  that; the `[sources]` form is irrelevant to it** — is recorded in
+  [`docs/design/registry-publication.md`](../../docs/design/registry-publication.md). No route is
+  chosen. *(Remove this bullet once published.)*
 
 - **Merge gate — the PR is the review point, and it is the only gate on the happy path.** Plan
   approval (including `ExitPlanMode`) authorizes the **whole run**: implement, verify at the tier's
@@ -144,7 +149,7 @@ These are canonical here — no other file owns them.
   timestamp columns Nitro's session and worker stores write.
 
   **The two pins move together, and pass the guide the LOWER BOUND** of the `[compat]` range, not
-  the range: the entry reads `PormG = "^0.5"`, so the argument is `v"0.5.0"`. Raising only
+  the range: if the entry reads `PormG = "^0.6"`, the argument is `v"0.6.0"`. Raising only
   `[compat]` leaves the resolver admitting code nothing fetches; raising only `[sources]` leaves a
   commit `[compat]` does not admit — both make CI say something about a configuration nobody ships.
 

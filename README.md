@@ -6,8 +6,12 @@ The current public routing contract is centered on `path()`, `urlpatterns()`, an
 
 ## Installation
 
+Nitro is not in Julia's General registry yet
+([#117](https://github.com/PingoLee/Nitro.jl/issues/117)), so `add Nitro` will not find it —
+install it by URL:
+
 ```julia
-pkg> add Nitro
+pkg> add https://github.com/PingoLee/Nitro.jl
 ```
 
 ## Quick Start

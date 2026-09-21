@@ -35,7 +35,7 @@ permissions:
 # every job that instantiates the project gets the same code with no workflow step at all.
 #
 # BUMPING IT: run `PormG.upgrade_guide(from = v"<lower bound of [compat]>")` from PormG's own env
-# first and apply every entry. That entry reads `^0.5`, so the argument is `v"0.5.0"` -- the range
+# first and apply every entry. If that entry reads `^0.6`, the argument is `v"0.6.0"` -- the range
 # is not itself a version literal. `[compat]` and `[sources]` still move together, but they are
 # now both in one file.
 #

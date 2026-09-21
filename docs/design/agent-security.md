@@ -173,10 +173,18 @@ layer 1 does the work and layer 2 stays an escalation path.
 Re-read this document when any of the following becomes true:
 
 - The first issue or PR from someone other than the maintainer arrives.
-- The package is published to the General registry (external users file issues).
+- The package is published to the General registry (external users file issues). What blocks that
+  today, and the routes out of it, are in
+  [`docs/design/registry-publication.md`](registry-publication.md) — no route is chosen yet.
 - CI gains a workflow that runs agent tooling against a fork PR.
 - Anyone besides the maintainer gains write access.
 
-Related: [#21](https://github.com/PingoLee/Nitro.jl/issues/21) — CI clones an unpinned personal
-PormG fork at default-branch HEAD with `contents:write` and the Documenter deploy key in scope. That
-is the same trust question at the supply-chain layer, and it is not addressed here.
+Related, and **closed**: [#21](https://github.com/PingoLee/Nitro.jl/issues/21) was the same trust
+question at the supply-chain layer — CI cloned an unpinned personal PormG fork at default-branch
+HEAD in jobs carrying `contents: write` and the Documenter deploy key. It is fixed twice over: the
+write scope and both secrets now live only in the `docs` job, and the workflow no longer clones
+PormG at all — `Project.toml`'s `[sources]` pins it by url plus an immutable 40-hex `rev` that Pkg
+fetches itself. `test/ci_workflow_tests.jl` asserts both properties against the shipped `ci.yml`.
+
+What that did **not** settle is publication: a `[weakdeps]` entry no registry knows still blocks
+registration outright. See [`docs/design/registry-publication.md`](registry-publication.md).
