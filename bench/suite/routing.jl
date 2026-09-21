@@ -5,8 +5,20 @@ SUITE["routing"] = BenchmarkGroup()
 SUITE["routing"]["full_pipeline_ping"] = @benchmarkable run_bench_request(req) setup=(
     req = bench_request("GET", "/bench/ping")) evals=1
 
-# genkey allocates a String cache key on EVERY request, cache hit or not
-# (src/routerhof.jl `genkey`, called from `compose` just before the middleware-cache lookup).
+# `genkey` IN ISOLATION — which since #79 is no longer the shape of the request path, so read
+# this number as a floor on the key cost and not as a per-request cost. What `compose` actually
+# builds (src/routerhof.jl, see #250):
+#
+#   * cache HIT  — `cachekey = string(req.method, '|', path, cache_suffix)`, not `genkey`; and
+#                  only when `use_cache`, i.e. when the app passes NO global middleware.
+#   * cache MISS — that, plus `genkey`. `genkey` sits outside the `use_cache` branch, so it also
+#                  runs on every request of an app that DOES have global middleware.
+#   * neither    — an app with an empty `custommiddleware` returns from the emptiness fast path
+#                  before `gethandler`, and builds no key at all. That is `full_pipeline_ping`
+#                  and `served_ping` below, and it is the common shape.
+#
+# So this benchmarkable is comparable across commits, but the `mw_served*` / `served_ping` gap is
+# what says whether a key change moved a served request.
 SUITE["routing"]["genkey"] = @benchmarkable Nitro.Core.RouterHOF.genkey("GET", "/bench/ping")
 
 # ── The per-route-middleware path (#80, #76) ────────────────────────────────
