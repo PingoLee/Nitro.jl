@@ -2,6 +2,14 @@
 # Peer-IP resolution, the non-consuming response write path, and the stream handlers.
 # Included into `module Core` by src/core.jl — not a submodule; see the hub for why.
 
+# Size of one transfer chunk, used in both directions: the streaming response writer below, and
+# the bounded request-body read in `_http_stream_request`. Peak memory for a streamed response is
+# this buffer rather than the file, which is the whole point of that writer. 64 KiB is `io.Copy`'s
+# default in Go's `net/http` — the tradition Nitro took its concurrency model from — and
+# comfortably above a typical MTU or socket send buffer, so a chunk is not split into a
+# pathological number of writes.
+const _STREAM_CHUNK_BYTES = 64 * 1024
+
 # ── HTTP.jl v2 compatibility shim ───────────────────────────────────────────────
 # The HTTP private/undocumented *functions* Nitro's request layer reaches into are
 # wrapped here, so an HTTP upgrade that renames one is a single-line fix instead of
@@ -11,7 +19,116 @@
 # Deliberately NOT centralized here: the `HTTP.EmptyBody`/`HTTP.BytesBody` body
 # *types* (dispatched on inline in bodyparsers.jl / core/transport.jl) and the `_peer_ip`
 # stream-layout reach (below) — both carry their own canary coverage.
-_http_stream_request(stream::HTTP.Stream)  = HTTP._buffered_stream_request(stream)
+#
+# Since #17 the request builder is no longer a one-line delegation to
+# `HTTP._buffered_stream_request`; what is wrapped here is that function's *shape*, rebuilt
+# over supported API so the body can be capped. See the docstring below.
+"""
+    _http_stream_request(stream, max_body_bytes) -> Nullable{HTTP.Request}
+
+Buffer the request body into an `HTTP.Request`, refusing to exceed `max_body_bytes` (`0` means
+unlimited). Returns `nothing` when the ceiling was passed, which `stream_handler` turns into a 413.
+
+This replaces the `HTTP._buffered_stream_request` call Nitro made until #17. That function is
+`startread` + `read(stream)`, and `read` on a server stream is an unbounded `append!` loop. The
+fork's own 64 MiB cap (`_check_server_body_size!`) runs only on the `serve!` Request-handler
+branch, and the fork's docs call stream handlers "application-managed large uploads" — so the cap
+was never Nitro's, and an unauthenticated client could buffer a multi-gigabyte body into RAM
+before a single middleware ran.
+
+**The reimplementation reaches FEWER HTTP internals than the call it replaces.** `startread` is
+exported, `readbytes!` is the Base IO interface, `get_request_context` and `Request` are public;
+only `EmptyBody`/`BytesBody` stay private, and they were already canaried. Going through
+`readbytes!` instead of hand-rolling a loop over the private `_stream_request_body_read!` is
+load-bearing rather than stylistic: `readbytes!` calls `_maybe_write_continue!`, and skipping that
+hangs every `Expect: 100-continue` client until its own timeout fires.
+"""
+# Returned instead of a `Request` when the body passed the ceiling. `drain` records whether the
+# client is already sending — see `_reject_oversized_body!`, which needs it to decide between
+# swallowing the remainder and leaving the socket alone.
+struct _BodyRejected
+    drain :: Bool
+end
+
+function _http_stream_request(stream::HTTP.Stream, max_body_bytes::Int64)::Union{HTTP.Request, _BodyRejected}
+    # Pure accessor: `_server_startread` returns `stream.message`, the parsed head that `Stream`'s
+    # constructor split off from the live body reader. It reads nothing and cannot block, which is
+    # what makes the declared-length check below free.
+    head = HTTP.startread(stream)
+    declared = Int64(head.content_length)   # -1 chunked, 0 no body, >0 fixed length
+
+    # Declared-length fast reject, BEFORE any read. The ordering is the whole value of this branch:
+    # `_maybe_write_continue!` fires from the first `readbytes!`, so refusing here means an
+    # `Expect: 100-continue` client never receives its `100 Continue` and therefore never sends the
+    # body. It is the one path on which an oversized upload costs neither side the bytes.
+    if max_body_bytes > 0 && declared > max_body_bytes
+        # `drain = false` only when the client is still waiting for permission to send: swallowing
+        # would call `_maybe_write_continue!` and thereby *invite* the very body we just refused.
+        expects_continue = occursin("100-continue", lowercase(HTTP.header(head, "Expect", "")))
+        return _BodyRejected(!expects_continue)
+    end
+
+    body_bytes = UInt8[]
+    # `EmptyBody` already reports itself fully consumed, so skipping the read does NOT make HTTP's
+    # `startwrite` force `Connection: close` — which is precisely what a bodyless GET, the most
+    # common request there is, must avoid.
+    if !(stream.request_body isa HTTP.EmptyBody)
+        # Content-Length is a client *claim*, and a chunked body declares nothing at all
+        # (`content_length == -1`; `ChunkedBody` bounds only the chunk-size line, never the total).
+        # So the ceiling is enforced a second time while reading. The pre-check above is an
+        # optimization — THIS loop is the guarantee.
+        chunk = declared > 0 ? min(declared, Int64(_STREAM_CHUNK_BYTES)) : Int64(_STREAM_CHUNK_BYTES)
+        scratch = Vector{UInt8}(undef, chunk)
+        # CLAMPED, and the clamp is the whole point. `declared` is an unverified client claim, so
+        # hinting it directly would let one header line commit the heap: `Content-Length:` at the
+        # ceiling reserves the ceiling before a single body byte arrives, and with
+        # `max_body_bytes = nothing` the claim is unbounded, so `Content-Length: 1099511627776`
+        # buys a 1 TiB reservation for a few hundred bytes on the wire. That is a cheaper version
+        # of the exact attack this function exists to stop. Hinting one chunk keeps the win where
+        # it mattered — small and medium bodies, where `append!` doubling is a real fraction of
+        # request cost — while peak memory stays tied to bytes RECEIVED rather than bytes claimed.
+        declared > 0 && sizehint!(body_bytes, min(declared, chunk))
+        received = Int64(0)
+        while true
+            # `_server_readbytes!` allocates `want` bytes internally, so capping `want` keeps a
+            # small fixed-length POST to one allocation of its own size rather than a full chunk,
+            # and holds peak buffering at `max_body_bytes + 1` rather than a chunk beyond it.
+            # `remaining + 1` -- one past the ceiling, so the loop can SEE an over-limit body
+            # rather than stopping exactly at the limit and mistaking a truncation for a fit. It is
+            # spelled this way rather than as `min(chunk, remaining + 1)` because `remaining + 1`
+            # overflows to `typemin` when the limit is `typemax(Int64)`, which `min` would then
+            # happily pick -- handing `readbytes!` a negative `nb` and 500-ing every request with a
+            # body. Adding only on the branch where `remaining < chunk <= 65536` makes that
+            # unrepresentable.
+            remaining = max_body_bytes - received
+            want = (max_body_bytes > 0 && remaining < chunk) ? remaining + one(Int64) : chunk
+            n = readbytes!(stream, scratch, want)
+            n == 0 && break
+            received += n
+            max_body_bytes > 0 && received > max_body_bytes && return _BodyRejected(true)
+            append!(body_bytes, @view(scratch[1:n]))
+            # A fixed-length body is complete here, so break rather than spend a second
+            # `readbytes!` purely to observe the terminal 0. `FixedLengthBody.remaining` has
+            # already reached 0, so `read_closed` is set and keep-alive survives.
+            declared >= 0 && received >= declared && break
+        end
+    end
+
+    body = isempty(body_bytes) ? HTTP.EmptyBody() : HTTP.BytesBody(body_bytes)
+    return HTTP.Request(
+        head.method,
+        head.target;
+        headers        = head.headers,
+        trailers       = head.trailers,
+        body           = body,
+        host           = head.host,
+        content_length = length(body_bytes),
+        proto_major    = Int(head.proto_major),
+        proto_minor    = Int(head.proto_minor),
+        close          = head.close,
+        context        = HTTP.get_request_context(head),
+    )
+end
 
 # True once a handler has begun writing the response on the raw stream (e.g. a STREAM
 # route that called `startwrite`, or a WebSocket upgrade). Used to decide whether the
@@ -139,11 +256,6 @@ function _write_response_body!(stream::HTTP.Stream, body::Union{AbstractVector{U
     return nothing
 end
 
-# Size of one streaming chunk. Peak memory for a streamed response is this buffer, not the file,
-# which is the whole point of the method below. 64 KiB is `io.Copy`'s default in Go's `net/http`
-# — the tradition Nitro took its concurrency model from — and comfortably above a typical MTU or
-# socket send buffer, so a chunk is not split into a pathological number of writes.
-const _STREAM_CHUNK_BYTES = 64 * 1024
 
 # Write a STREAMING body — the one case where consuming IS the contract (#41).
 #
@@ -208,10 +320,108 @@ _release_response_body!(::HTTP.EmptyBody) = nothing
 _release_response_body!(body::HTTP.AbstractBody) = (HTTP.body_close!(body); nothing)
 _release_response_body!(_) = nothing
 
-function stream_handler(middleware::Function)
+# How much of a refused body to read and discard before closing, so the client can actually
+# receive its 413.
+#
+# Closing a socket that still holds unread received data sends a **RST**, and an RST discards
+# whatever is sitting in the send buffer — including the 413 we just wrote. The client then sees a
+# connection reset instead of a status code, which is strictly worse than no limit at all: it
+# cannot tell "too large" from "server crashed". Reading the remainder first lets the close be an
+# orderly FIN.
+#
+# This is Tomcat's `maxSwallowSize`, and 2 MiB is its default. nginx spells the same idea
+# `lingering_close`; Go's `net/http` drains on close for the same reason. The budget is what keeps
+# it a courtesy rather than a second denial-of-service vector — past it, a client sending gigabytes
+# has already declared its intent, and eating an RST is the correct outcome for it.
+const _MAX_SWALLOW_BYTES = 2 * 1024 * 1024
+
+function _swallow_request_body!(stream::HTTP.Stream, budget::Int)
+    scratch = Vector{UInt8}(undef, min(budget, _STREAM_CHUNK_BYTES))
+    spent = 0
+    try
+        while spent < budget
+            n = readbytes!(stream, scratch, min(length(scratch), budget - spent))
+            n == 0 && break
+            spent += n
+        end
+    catch err
+        # A client that disconnects while being swallowed is the expected case on this path, not an
+        # exceptional one — it is already being refused. Never let it mask the 413. An interrupt is
+        # not that: the janitor discipline in src/middleware/janitor.jl (#190) makes rethrowing it
+        # a house rule, and this runs on a request task where a Ctrl-C must still land.
+        err isa InterruptException && rethrow()
+    end
+    return nothing
+end
+
+# Answer 413 for a body that passed `max_body_bytes`, and close the connection.
+#
+# Built fresh on every rejection rather than hoisted to a module-level `const`, which is otherwise
+# Nitro's endorsed pattern for a fixed error response (nitro-core §4). The difference is that this
+# response is assigned to `stream.response`, and HTTP writes to that object IN PLACE on the way
+# out — `startwrite` sets `.close` when the request body was not fully consumed (which is exactly
+# our case) and back-fills `.content_length`, `_server_closeread` sets `.close` again, and
+# `_serve_h1_conn!`'s error path calls `removeheader(stream.response.headers, …)`. A shared `const`
+# would take all of that concurrently, across every rejecting connection. A rejection is rare by
+# construction, so the allocation costs nothing worth saving.
+#
+# Note it is NOT the `Connection: close` header that does this: `_write_server_stream_head!` copies
+# the headers vector before calling `setheader` on it. That was this comment's original claim and
+# it was wrong about HTTP 2.7.1 — the conclusion survived the correction, the reason did not.
+#
+# The connection always closes, even when the swallow above consumed the whole body and keep-alive
+# would technically survive. `_serve_h1_conn!` checks `_response_wants_close` and returns, so the
+# undrained remainder of an abusive body can never be mistaken for the next request on the
+# connection — and a client that just sent an oversized body has nothing to gain from being handed
+# the same socket to retry on. `close = true` is set explicitly rather than left to HTTP's
+# `startwrite`, which would infer it from the unconsumed body: that inference is a private
+# implementation detail, while `_response_wants_close` honours the flag as public behavior.
+function _reject_oversized_body!(stream::HTTP.Stream, limit::Int64, drain::Bool)
+    # The only server-side signal that a request was refused: the rejection returns before the
+    # middleware chain, so there is no access-log line and no handler. Tomcat, nginx and Django all
+    # record a rejected oversize body.
+    #
+    # Split in two on purpose. `maxlog` is a **process-lifetime** budget, not a rate limit — past
+    # it the site is silent for the life of the process — so a single `maxlog=N` warning is a
+    # first-sighting alarm and nothing more. Worse, at any N an unauthenticated client can spend N
+    # cheap requests to buy permanent silence for every later rejection. So the warning fires once
+    # to say the server is refusing bodies at all, and the per-request detail goes to `@debug`,
+    # which is compiled out by default and can be switched on by whoever is actually investigating.
+    # An unbounded `@warn` is not an option here: this path is reachable pre-auth, which would make
+    # the body cap a log-flood amplifier.
+    #
+    # The method and the declared length are safe to record — HTTP validates the method as an RFC
+    # 7230 token at parse time, so it cannot carry CR/LF. The target is deliberately NOT logged:
+    # access logging redacts query strings by default and a rejected request is no exception.
+    @warn("Refusing request bodies over max_body_bytes with 413 (detail at debug level)",
+          limit = limit, maxlog = 1)
+    @debug("Request body exceeds max_body_bytes; refused with 413",
+           method = stream.message.method,
+           declared_content_length = stream.message.content_length,
+           limit = limit)
+    # BEFORE the write, not after: swallowing calls `_maybe_write_continue!`, which would try to
+    # emit a `100 Continue` interim *after* the final response had already gone out. Draining first
+    # keeps the two in legal order, and in every reachable combination the continue is either a
+    # no-op (no `Expect` header, or already sent during the read) or skipped entirely (`drain`
+    # is false precisely when the client is still waiting for it).
+    drain && _swallow_request_body!(stream, _MAX_SWALLOW_BYTES)
+
+    resp = HTTP.Response(413, "Request body exceeds the configured limit of $(limit) bytes")
+    resp.close = true
+    stream.response = resp
+    _write_response_body!(stream, resp.body)
+    return nothing
+end
+
+function stream_handler(middleware::Function; max_body_bytes::Int64 = DEFAULT_MAX_BODY_BYTES)
     return function(stream::HTTP.Stream)
         ip = _peer_ip(stream)
-        req = _http_stream_request(stream)
+        req = _http_stream_request(stream, max_body_bytes)
+        # Short-circuits BEFORE the middleware chain, so an oversized request produces no access-log
+        # line, no CORS headers and no custom error formatting. That is the correct trade: the
+        # alternative is handing middleware a truncated body, which is strictly worse than handing
+        # it nothing.
+        req isa _BodyRejected && return _reject_oversized_body!(stream, max_body_bytes, req.drain)
         req.context[:ip] = ip
         req.context[:stream] = stream
 

@@ -98,6 +98,16 @@ is explicit introspection, not accidental disclosure.)
 - `secret_key`, `httponly`, `secure`, `samesite`: override cookie defaults for this run.
 - `shutdown_timeout=10.0`: seconds `terminate` waits for in-flight requests to drain
   before force-closing what remains. `0` skips the graceful phase entirely.
+- `max_body_bytes=64*1024*1024`: ceiling on a buffered request body. A request declaring or
+  sending more is answered **413** before any middleware runs, and its connection is closed.
+  Pass `nothing` to buffer without a ceiling. The default matches the cap the bundled HTTP fork
+  already enforces on its non-streaming path, which Nitro's stream handler bypasses (#17).
+  Two limits of the check are worth knowing: it does **not** cover WebSocket frames, which leave
+  the HTTP stream entirely at upgrade and are bounded by HTTP's own `maxframesize`; and it is a
+  floor, not a replacement for `client_max_body_size` at your reverse proxy, which rejects
+  oversized uploads before they reach Julia at all. Asking for a ceiling alongside a custom
+  `handler` throws, because the handler reads the body itself and Nitro cannot enforce one there;
+  pass `max_body_bytes = nothing` if you want to state that explicitly.
 - `reuseaddr`: forwarded to `HTTP.listen!`. Defaults to `true` on Linux/macOS, where it
   allows rebinding a port still in `TIME_WAIT`, and to **`false` on Windows**, where
   `SO_REUSEADDR` instead lets a second process bind a port another is actively listening
@@ -142,6 +152,7 @@ function serve(ctx::App;
     secure=nothing,
     samesite=nothing,
     shutdown_timeout=SHUTDOWN_TIMEOUT_SECONDS,
+    max_body_bytes=missing,
     kwargs...)::Union{Server, Nothing}
 
     # FIRST, before any validation or context mutation, so a rejected call leaves the context
@@ -171,6 +182,36 @@ function serve(ctx::App;
     # (`NaN >= 0` is false, so NaN is rejected here too.)
     shutdown_timeout >= 0 ||
         throw(ArgumentError("`shutdown_timeout` must be >= 0 seconds, got $shutdown_timeout"))
+
+    # Same reasoning as above, one layer earlier: `max_body_bytes` is read on every request, so a
+    # bad value must be refused at the call site that contains the typo rather than per-request.
+    #
+    # The default is `missing`, NOT `DEFAULT_MAX_BODY_BYTES`, so that "the caller said nothing" and
+    # "the caller asked for the default value" stay distinguishable — the custom-handler check
+    # below is only meaningful if it can tell them apart. (`context=missing` above is the same
+    # idea.) `nothing` means no cap; internally the limit travels as `0`, the convention the
+    # bundled fork's own `max_body_bytes` uses, which keeps the hot-path check a plain integer
+    # comparison rather than a branch on `Union{Nothing, Int64}` (nitro-core §7).
+    if !ismissing(max_body_bytes)
+        max_body_bytes === nothing || max_body_bytes >= 0 ||
+            throw(ArgumentError("`max_body_bytes` must be >= 0 bytes or `nothing`, got $max_body_bytes"))
+
+        # A custom `handler` does its own body reading, so Nitro cannot cap it. Erroring makes that
+        # boundary explicit; silently dropping the limit would hand back a server the caller
+        # believes is protected. `nothing` is exempt on purpose — it asks for no ceiling, which is
+        # precisely what a custom handler already provides, so refusing it would be a false alarm.
+        if max_body_bytes !== nothing && handler !== stream_handler
+            throw(ArgumentError(
+                "`max_body_bytes` cannot be applied to a custom `handler`: the request body is " *
+                "read inside the handler, so only Nitro's own `stream_handler` can enforce a " *
+                "ceiling. Either cap the body inside your handler and pass " *
+                "`max_body_bytes = nothing`, or drop `handler`."
+            ))
+        end
+    end
+
+    body_limit = ismissing(max_body_bytes) ? DEFAULT_MAX_BODY_BYTES :
+                 max_body_bytes === nothing ? zero(Int64) : Int64(max_body_bytes)
 
     # Resolve (and therefore VALIDATE) the environment exactly once per `serve`, here rather
     # than only in `serverwelcome`. The banner is the sole other caller and `startserver` runs
@@ -234,7 +275,9 @@ function serve(ctx::App;
     register_serve_lifecycle!(ctx, middleware)
 
     configured_middelware = setupmiddleware(ctx; middleware, serialize, catch_errors, show_errors, access_log, access_log_query)
-    handle_stream = handler(configured_middelware)
+    handle_stream = handler === stream_handler ?
+        stream_handler(configured_middelware; max_body_bytes = body_limit) :
+        handler(configured_middelware)
 
     if parallel
         if Threads.nthreads() <= 1 && !is_test()

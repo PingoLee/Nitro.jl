@@ -113,6 +113,7 @@ a chain by hand needs the `.middleware` field. The type is not exported, so cons
 ```@docs
 BearerAuth
 Cors
+SecurityHeaders
 RateLimiter
 Nitro.Core.Middleware.RateLimiterMiddleware.FixedRateLimiter
 Nitro.Core.Middleware.RateLimiterMiddleware.SlidingRateLimiter
