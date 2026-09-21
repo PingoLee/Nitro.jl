@@ -5,6 +5,7 @@ using Nitro.Core.Util
 using Nitro.Core.Util: mount_segments, mount_route, _route_encode, mount_remainder
 using Nitro.Core: serverwelcome
 using Nitro: ValidationError
+import Nitro                          # for `pkgversion(Nitro)` below
 using Nitro.Core.Errors: cause_report   # unexported on purpose — see src/errors.jl
 
 @testset "join_url_path" begin
@@ -300,6 +301,29 @@ end
     @test occursin("Environment: prod", output_prod)
 end
 
+# The banner used to print a hardcoded `Nitro 1.10.0` -- an Oxygen.jl-era literal that never
+# matched this package (#240). It is the only place in the repo that claims a version at
+# runtime, so a wrong one there is worse than none: it is what an operator reads during an
+# incident. Derived from `pkgversion` now, and asserted against the same source, so a release
+# cut never has to remember this line.
+@testset "serverwelcome banner reports the package version" begin
+    output = mktemp() do path, io
+        redirect_stdout(io) do
+            # Pin BOTH, per the block above: `serverwelcome` resolves the environment, and a
+            # block pinning only `NITRO_ENV` fails on any machine that exports `GENIE_ENV`.
+            withenv("NITRO_ENV" => "dev", "GENIE_ENV" => nothing) do
+                serverwelcome("http://127.0.0.1:8080", nothing, false)
+            end
+        end
+        flush(io)
+        read(path, String)
+    end
+
+    @test occursin(" Nitro $(pkgversion(Nitro)) ", output)
+    # Guards the regression directly: a re-hardcode of the fork-era literal fails here even if
+    # someone also bumps `Project.toml` to match it.
+    @test !occursin("1.10.0", output)
+end
 
 @testset "mount_segments canonicalization" begin
     # The SINGLE normalization point for `mountdir` (#93). staticfiles/spafiles/dynamicfiles no

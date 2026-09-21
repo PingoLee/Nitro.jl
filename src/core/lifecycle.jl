@@ -8,7 +8,15 @@ function serverwelcome(external_url::String, prefix::Nullable{String}, parallel:
     # Renamed: `current_env` is now a function in this module (#55).
     env = current_env()
     
-    printstyled(" Nitro 1.10.0 ", color=:cyan, reverse=true, bold=true)
+    # Read at CALL time, never folded into a `const` (#240). `const v = pkgversion(...)` is
+    # evaluated in the precompile worker, and Julia does NOT treat `Project.toml`'s `version`
+    # field as a staleness input for the cache -- so the const survives a release bump and the
+    # banner freezes at whatever version the cache was built from. Measured: bumping a package
+    # 0.4.0 -> 0.5.0 -> 0.6.0 left the const reading 0.4.0 while a call-time read tracked, both
+    # as the active project and as a dependency. That is the exact defect class of the
+    # `1.10.0` literal this replaces, just with a longer fuse.
+    version = something(Base.pkgversion(@__MODULE__), "unknown")
+    printstyled(" Nitro $version ", color=:cyan, reverse=true, bold=true)
     if parallel
         printstyled(" (parallel mode: $(Threads.nthreads()) threads)", color=:light_black)
     end
