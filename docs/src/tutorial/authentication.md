@@ -144,11 +144,39 @@ urlpatterns("",
 )
 ```
 
-Every token is **always** signature-verified (HMAC-SHA256 — the header `alg` is never
-trusted) and **always** time-bounded: an `exp` claim is honored, and a token without one
-is accepted only as a short-lived access token bounded by `iat + exp_timeout` (15 minutes
-by default). There is no permissive mode; hardening below is opt-in *on top of* these
-defaults.
+Every token is **always** signature-verified and **always** time-bounded: an `exp` claim is
+honored, and a token without one is accepted only as a short-lived access token bounded by
+`iat + exp_timeout` (15 minutes by default). There is no permissive mode; hardening below is
+opt-in *on top of* these defaults.
+
+**HMAC-SHA256 is the only algorithm, and a header that says otherwise is rejected** — not
+ignored. A token whose header advertises anything but `alg: "HS256"` (including `"none"`, or
+no `alg` at all) fails with `AuthError("Unsupported JWT algorithm")` before any key is
+resolved. Nitro never loads a public key and never dispatches on `alg`, so the classic
+RS256→HS256 confusion attack does not apply either way; the explicit check is there so the
+guarantee is *stated* rather than emergent, and so a later refactor cannot weaken it
+silently. The `alg` gate sits inside the `verify` branch, so
+`decode_jwt(...; verify=false)` — offline inspection, not authentication — still parses a
+token whatever algorithm its header claims.
+
+A `kid` that is **present** in the header but absent from the keyset is
+`AuthError("Unknown JWT key id")` — no falling back to another key, which is what would let a
+revoked signer keep working.
+
+A token carrying **no** `kid` at all is a different case, and the framework is less strict
+there than the paragraph above may suggest: it resolves to the keyset's `"default"` entry, or,
+failing that, to an arbitrary first key — and it verifies against **only** that one key. A
+kid-less token signed with a *different* key in the same keyset is therefore rejected as
+`AuthError("Invalid JWT signature")`, which points at the signature rather than at key
+selection. If you accept kid-less tokens from an external issuer, have it stamp a `kid`.
+
+**Structural checks are not scoped to `verify`, and that includes `verify=false`.** A token
+whose header or claims segment is not a JSON *object*, or whose `kid` is not a string, is
+rejected as malformed on both paths — `AuthError("Invalid JWT header")`,
+`AuthError("Invalid JWT claims")`, `AuthError("Invalid JWT key id")`. These are the same
+kind of check as "a JWT has three segments", not a policy decision about algorithms, and
+`with_kid=true` promises a `String` it cannot deliver from a numeric `kid`. If you inspect
+foreign tokens offline, this is the one part of the path that got stricter.
 
 ### Configuring identity
 
