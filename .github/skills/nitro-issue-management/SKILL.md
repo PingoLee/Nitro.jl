@@ -2,8 +2,9 @@
 name: nitro-issue-management
 description: >-
   Manage the Nitro.jl backlog with the gh CLI — create/update/close GitHub
-  issues and curate labels. GitHub Issues are the backlog's only home; release
-  gating is the pre-publish label (a label query, not a synced index file).
+  issues and curate labels. GitHub Issues are the backlog's only home; the
+  pre-publish label flags long-lead publication blockers (a label query, not a
+  synced index file, and not a release gate).
   Covers the label taxonomy, the draft-before-create safety flow, scrubbing of
   private/local references, the supersession convention, and cross-reference
   discipline. Adapted from PormG.jl's pormg-issue-management.
@@ -30,9 +31,14 @@ This is a process skill, not a code skill — it does not touch `src/`.
   repo, and none should be created — a file that must mirror a label query is manual-sync
   duplication that rots. Views come from labels: `gh issue list --label workers`,
   `gh issue list --label pre-publish`, etc.
-- **Release gating is the `pre-publish` label, nothing more.** "What must be settled before
-  Nitro's first General-registry publish?" is answered live by
-  `gh issue list --label pre-publish`.
+- **`pre-publish` flags long-lead publication blockers — it is not a release gate.** "What would
+  have to be settled before a first General-registry publish?" is answered live by
+  `gh issue list --label pre-publish`. An **empty query does not mean ready**, and a non-empty one
+  does not forbid anything: whether to publish is the maintainer's judgment and no query answers
+  it (Pre-publish non-negotiable in
+  [`nitro-general.instructions.md`](../../instructions/nitro-general.instructions.md)). Label an
+  issue `pre-publish` when its fix has real lead time — a public, irreversible act or an
+  architectural split — not merely because it would be nice to have done first.
 - **The migration is done.** `todo.md` was the pre-migration backlog; it has been converted to
   issues and deleted, and no file in the repo mirrors the tracker any more. If you find a
   checklist file that looks like a backlog, it is stale — surface it for deletion rather than
@@ -82,7 +88,7 @@ ones idempotently with `gh label create <name> --color <hex> --description "…"
 |------|--------|
 | Type | `enhancement`, `bug`, `documentation`, `tech-debt` |
 | Subsystem | `routing`, `middleware`, `auth`, `sessions`, `workers`, `pormg-ext`, `performance`, `infrastructure` |
-| Release gating | `pre-publish` (must be settled before Nitro's first General-registry publish) |
+| Publication lead time | `pre-publish` (a long-lead blocker to a first General-registry publish — a warning, never a gate) |
 
 ## Safety: issues are public and outward-facing
 

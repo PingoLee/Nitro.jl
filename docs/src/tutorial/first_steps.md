@@ -25,11 +25,23 @@ Activate your current environment
 pkg> activate .
 ```
 
-Install the latest version of Nitro and HTTP
+Install Nitro and HTTP.
+
+Nitro is **not in Julia's General registry yet**, so `add Nitro` will not find it — install it by
+URL. HTTP is registered and installs by name.
 
 ```
-pkg> add Nitro HTTP
+pkg> add https://github.com/PingoLee/Nitro.jl
+pkg> add HTTP
 ```
+
+That tracks Nitro's default branch. To pin, append a tag or commit to the URL:
+`add https://github.com/PingoLee/Nitro.jl#v0.4.0`.
+
+!!! note
+    Nitro's PormG (ORM) integration is a **weak** dependency: it is not installed with Nitro and
+    you do not need it unless you use that integration. If you do, add PormG yourself — it is
+    also unregistered, so also by URL.
 
 Press the backspace button to exit the package manager and return to the julia repl
 

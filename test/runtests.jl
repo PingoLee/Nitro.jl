@@ -71,8 +71,8 @@ let project_file = joinpath(@__DIR__, "..", "Project.toml"),
         # Already inside `Pkg.test` and a declared test dependency is STILL missing.
         # That is an environment bug, not a valid configuration -- and it must not be
         # allowed to degrade quietly into a shorter suite. Refuse before a single item
-        # runs. This costs nobody a run they could otherwise have had: without a sibling
-        # `../PormG.jl` every Pkg operation already dies at resolve time.
+        # runs. This costs nobody a run they could otherwise have had: if the environment
+        # could not be provisioned, `Pkg.test` already failed before reaching this point.
         error(
             "Nitro test environment is incomplete.\n\n" *
             "Missing declared `[targets].test` dependencies:\n" *
@@ -94,9 +94,11 @@ let project_file = joinpath(@__DIR__, "..", "Project.toml"),
             "    this message when the two paths above differ and EVERY target is listed.\n" *
             "  * `NITRO_TEST_REDISPATCH` is stale in your shell from an interrupted run.\n" *
             "    Unset it and re-run.\n" *
-            "  * A worktree with no sibling `../PormG.jl`: `bash scripts/worktree_setup.sh`.\n" *
-            "  * The environment was re-resolved (`Pkg.update`, `Pkg.resolve`) and dropped a\n" *
-            "    path dependency. `Pkg.test()` re-provisions it."
+            "  * A checkout or worktree that has never been instantiated, or a cold depot with\n" *
+            "    no network -- `[sources]` fetches the pinned PormG commit from GitHub.\n" *
+            "    Run: bash scripts/worktree_setup.sh\n" *
+            "  * The environment was re-resolved (`Pkg.update`, `Pkg.resolve`) and dropped the\n" *
+            "    weak dependency. `Pkg.test()` re-provisions it."
         )
     end
 end

@@ -147,9 +147,13 @@ explicitly, in descending priority:
 1. **Breaking changes, while the repo is pre-publish.** Cheapest now; every session built on the old
    shape raises the cost. A session that changes a public signature or a `Service` field outranks
    one that does not.
-2. **The publish gate.** `gh issue list --state open --label pre-publish` — empty is the gate. Its
-   size is a scheduling input: one issue from empty is worth finishing. This is the one place the
-   label ranks anything; *inside* a session it is a classification, never a promotion.
+2. **Long-lead publication blockers.** `gh issue list --state open --label pre-publish`. The label
+   is a **lead-time warning, not a gate**, and its *size* ranks nothing — "one issue from empty" is
+   not a reason to finish anything, because an empty query does not mean ready and publishing is
+   the maintainer's judgment alone (see the Pre-publish non-negotiable). What ranks is an
+   individual member's **lead time**: a blocker whose fix is a public, irreversible act or an
+   architectural split is worth surfacing early, because it cannot be done in the week someone
+   decides. Rank on that, never on the label itself.
 3. **The importance ladder's top rung across members** (see
    [`nitro-issue-cluster`](../nitro-issue-cluster/SKILL.md) §2, which owns the ladder): a session
    holding a rung-1 or rung-2 member — secret exposure, an authorization bypass, silently wrong
@@ -363,8 +367,8 @@ directions on purpose. Receipt: [`reference.md`](reference.md) §G.
 - Do not promise two sessions can run fully in parallel — verification serializes on machine
   resources, and disjoint files are only the first gate
 - Do not rank a loud crash above a silent wrong answer because it looks more urgent
-- Do not promote a session because a member carries `pre-publish` — that is a release gate, not a
-  severity
+- Do not promote a session because a member carries `pre-publish` — it is a lead-time warning, not
+  a severity, and not a gate
 - Do not leave an override of the ranking order unstated
 - Do not report the board by echoing every option's description, or by rendering a second copy of it
   — §5's one-row-per-session table is the deliverable, and `Start now?` needs the blocker, not a bare

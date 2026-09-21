@@ -184,9 +184,9 @@ catch it — an unpinned dependency with `contents:write` in scope is rung 1 bec
 credential-exposure defect, not because of the label it carries. Meanwhile the set also holds
 open design questions, which belong at rung 4 however hard the gate presses.
 
-The publish gate is real, but it applies to **which cluster you pick next**
-([`nitro-board`](../nitro-board/SKILL.md) §2), not to the order
-*inside* one. Do not let it reach into this table.
+A long-lead publication blocker can bear on **which cluster you pick next**
+([`nitro-board`](../nitro-board/SKILL.md) §2) — on its own lead time, never on the label — but it
+never bears on the order *inside* one. Do not let it reach into this table.
 
 State the resulting order and the reason for it before the first commit. Where a dependency forced a
 low-importance member to the front, say that explicitly — it is the one case where the branch's

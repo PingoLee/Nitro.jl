@@ -136,12 +136,14 @@ live under `.claude/worktrees/`, which is gitignored.
 Call `EnterWorktree` with a **flat, dash-only** name (`fix-<N>-<slug>`), then from inside it:
 
 ```bash
-bash scripts/worktree_setup.sh          # [sources] link, Manifest copy, resolve + instantiate
+bash scripts/worktree_setup.sh          # Manifest copy, then resolve + instantiate
 git branch -m fix/<N>-<slug>            # EnterWorktree produces branch `worktree-<name>`
 ```
 
-- **Run the setup script before any Pkg or test command.** A fresh worktree cannot resolve at all
-  without it — every Pkg operation dies with `expected package PormG [7d8d7541] to exist at path …`.
+- **Run the setup script before any Pkg or test command.** A fresh worktree has no `Manifest.toml`,
+  so without it Pkg resolves to whatever is newest and your worktree silently diverges from the main
+  checkout. (It used to be worse: under the old PormG path dep every Pkg operation died before any
+  test ran. That is fixed — see [`reference.md`](reference.md) §B.)
 - **The rename is not cosmetic**, and **the name must stay flat and dash-only**.
 - **`origin/<default-branch>` is the default, not a guarantee** — confirm with `git log --oneline -1`.
 - **One suite at a time** — `:network` items bind real sockets and contend for machine resources.
@@ -255,9 +257,11 @@ two commands are in *Verification* in
 [`nitro-general.instructions.md`](../../instructions/nitro-general.instructions.md); run them from the
 repo root, not the worktree, if you have not instantiated `docs/` there.
 
-**Local green ≠ CI green, and PormG is why** — CI clones PormG from GitHub and does not see your local
-`../PormG.jl` working tree. If the issue involves the PormG boundary, confirm the PormG side is pushed
-before you call it done. Details in [`reference.md`](reference.md) §D.
+**Local green ≠ CI green, and PormG is still part of why** — `[sources]` pins PormG to one immutable
+commit that you and CI both fetch, so you build the same code. What neither of you sees is
+**unpushed** PormG work, or a local `Pkg.develop` override sitting in your uncommitted manifest. If
+the issue touches the PormG boundary, push the PormG side and bump the `rev` before you call it
+done. Details in [`reference.md`](reference.md) §D.
 
 When a test is red and the cause is not obviously your change, read
 [`nitro-test-troubleshooting`](../nitro-test-troubleshooting/SKILL.md) before bisecting.
@@ -323,9 +327,10 @@ canonical list, and why the guardrail files are on it, is the merge-gate non-neg
 - **Watch CI on `main`**, not just the PR checks — a merge does not wait for them, and at `quick` and
   `standard` CI is running rungs you deliberately skipped. A tier that hands work to CI owes CI a
   look.
-- If the change closed the last `pre-publish` issue, say so — the publish gate is that label query
-  coming back empty. Do not cut a release as a side effect; that is the maintainer's call via
-  [`nitro-cut-release`](../nitro-cut-release/SKILL.md).
+- If the change closed a `pre-publish` issue, say so plainly and stop there. An empty label query
+  is **not** a signal to publish — readiness is the maintainer's judgment and no query answers it
+  (Pre-publish non-negotiable). Never propose publishing, and never cut a release as a side effect;
+  that is the maintainer's call via [`nitro-cut-release`](../nitro-cut-release/SKILL.md).
 - File follow-ups for anything deferred, using
   [`nitro-issue-management`](../nitro-issue-management/SKILL.md). A single targeted issue the user
   asked for can be created directly; anything bulk gets drafted and confirmed first.
@@ -356,7 +361,8 @@ canonical list, and why the guardrail files are on it, is the merge-gate non-neg
   test was wrong, and without saying so in the commit message
 - Do not add a test file without adding it to `TEST_FILES` in `test/harness_manifest.jl`
 - Do not call it green on one thread count when the change is race-shaped
-- Do not assume CI sees your local `../PormG.jl` — it clones the published default branch
+- Do not assume CI sees unpushed PormG work, or a local `Pkg.develop` override — it builds the `rev`
+  pinned in `Project.toml`
 - Do not review your own diff and call it an independent review
 - Do not stop after the diff to ask permission to commit, push, or open the PR — the plan already
   authorized all three; asking again is the friction this workflow removed

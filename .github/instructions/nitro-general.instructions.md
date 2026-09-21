@@ -67,9 +67,24 @@ These are canonical here — no other file owns them.
 - **Pre-publish (not on Julia General; single maintainer, no external users):** breaking changes are
   cheap — get the API, naming, and architecture *right* over backward compatibility. Do not add
   deprecation shims or compatibility aliases to preserve a design you believe is wrong; propose the
-  clean break. Release gating is the
-  [`pre-publish` label](https://github.com/PingoLee/Nitro.jl/issues?q=is%3Aopen+label%3Apre-publish);
-  the publish gate is that query coming back empty. *(Remove this bullet once published.)*
+  clean break.
+
+  **Whether to publish is the maintainer's judgment, and no query answers it.** The
+  [`pre-publish` label](https://github.com/PingoLee/Nitro.jl/issues?q=is%3Aopen+label%3Apre-publish)
+  is a **lead-time warning, not a gate.** This bullet used to say the gate was that query coming
+  back empty; that was wrong twice over — it read "no known blockers" as "ready for strangers to
+  depend on", and it let closing a checklist item *trigger* a decision that should come first.
+  Readiness is subjective (is the API stable enough for semver promises? do you want to field
+  outside issues?) and it is not an agent's call: **never propose publishing, and never rank work
+  because it carries the label.**
+
+  The label's real job is the half that is objective and slow. Registration fails outright today —
+  `PormG` is in `[weakdeps]`, no registry knows it, and RegistryTools' `check_deps!` errors on that
+  (the `[sources]` form is irrelevant to it). Clearing it means a public, irreversible registration
+  or an architectural split, not a week's work, so it wants to be known long before anyone decides.
+  The durable record is
+  [`docs/design/registry-publication.md`](../../docs/design/registry-publication.md); no route is
+  chosen. *(Remove this bullet once published.)*
 
 - **Merge gate — the PR is the review point, and it is the only gate on the happy path.** Plan
   approval (including `ExitPlanMode`) authorizes the **whole run**: implement, verify at the tier's
@@ -144,7 +159,7 @@ These are canonical here — no other file owns them.
   timestamp columns Nitro's session and worker stores write.
 
   **The two pins move together, and pass the guide the LOWER BOUND** of the `[compat]` range, not
-  the range: the entry reads `PormG = "^0.5"`, so the argument is `v"0.5.0"`. Raising only
+  the range: if the entry reads `PormG = "^0.6"`, the argument is `v"0.6.0"`. Raising only
   `[compat]` leaves the resolver admitting code nothing fetches; raising only `[sources]` leaves a
   commit `[compat]` does not admit — both make CI say something about a configuration nobody ships.
 
@@ -288,7 +303,7 @@ it, so every worktree shares one marketplace entry.
 | `changed-code-review` | [`.github/skills/changed-code-review/SKILL.md`](../skills/changed-code-review/SKILL.md) | Pre-push / pre-PR git diff review in ordered slices |
 | `nitro-test-troubleshooting` | [`.github/skills/nitro-test-troubleshooting/SKILL.md`](../skills/nitro-test-troubleshooting/SKILL.md) | A test is red, flaky, or order-dependent and it isn't an obvious regression |
 | `deploy-checklist` | [`.github/skills/deploy-checklist/SKILL.md`](../skills/deploy-checklist/SKILL.md) | Pre-production env, deps, proxy, and test audit |
-| `nitro-issue-management` | [`.github/skills/nitro-issue-management/SKILL.md`](../skills/nitro-issue-management/SKILL.md) | GitHub backlog: file/label/close issues (`pre-publish` gating label) |
+| `nitro-issue-management` | [`.github/skills/nitro-issue-management/SKILL.md`](../skills/nitro-issue-management/SKILL.md) | GitHub backlog: file/label/close issues (`pre-publish` lead-time label) |
 | `nitro-issue-workflow` | [`.github/skills/nitro-issue-workflow/SKILL.md`](../skills/nitro-issue-workflow/SKILL.md) | Work issue #N end-to-end at a `quick`/`standard`/`high` tier: provenance, scope, isolation, verify rungs, review, land, close out |
 | `nitro-board` | [`.github/skills/nitro-board/SKILL.md`](../skills/nitro-board/SKILL.md) | **Planning only, stops there:** reconcile the project board against the issues, rank the sessions, record each session's edit surface (which is what makes parallel Claude sessions schedulable), write the plan back |
 | `nitro-issue-cluster` | [`.github/skills/nitro-issue-cluster/SKILL.md`](../skills/nitro-issue-cluster/SKILL.md) | Work several issues as one group: build the cluster from contended files, tier it by its worst member, order it, land one commit per issue |
