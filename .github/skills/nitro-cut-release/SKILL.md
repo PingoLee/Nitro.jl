@@ -1,7 +1,7 @@
 ---
 name: nitro-cut-release
 description: >-
-  Cut a Nitro.jl release train — verify the pre-publish gate, bump Project.toml once, stamp the
+  Cut a Nitro.jl release train — bump Project.toml once, stamp the
   "Unreleased" entry files under upgrading/ with the new version, then date, record and tag it.
   Maintainer-invoked; never run as a side effect of finishing a feature.
 ---
@@ -42,7 +42,7 @@ task, and never bump `Project.toml` outside this skill.
 git status --porcelain                 # must be clean
 git rev-parse --abbrev-ref HEAD        # expect main, up to date with origin
 grep -l '\*\*Version\*\*: Unreleased' upgrading/*.md   # must list at least one file
-gh issue list --label pre-publish      # the publish gate (informational for 0.y releases)
+gh issue list --label pre-publish      # informational only -- a lead-time warning, never a gate
 ```
 
 1. **Working tree clean, on `main`, synced with `origin`.** Stop otherwise.

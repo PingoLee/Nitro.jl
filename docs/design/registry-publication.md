@@ -2,18 +2,20 @@
 
 Design record for why `@JuliaRegistrator register` on Nitro fails today, which mechanism is
 responsible, which plausible mechanisms are *not*, and what each escape route actually costs.
-Written for [#117](https://github.com/PingoLee/Nitro.jl/issues/117), which is the only open
-`pre-publish` issue and is therefore the publish gate itself.
+Written out of [#117](https://github.com/PingoLee/Nitro.jl/issues/117), **which this record
+replaces** — the issue is closed, and this file is the durable memory. Publishing is not gated on a
+label query: it is the maintainer's judgment, and the time has not come. What follows is the
+lead-time half, so the decision is not made in ignorance of it.
 
 > **TL;DR for Nitro contributors:** #117's three "Done when" boxes are all satisfied at HEAD —
 > `3aac753` replaced the `[sources]` **path** entry with `url` + `rev` and deleted `PORMG_REV` and
-> both sibling-checkout steps. The issue is still open and its premise is still true, for a reason
-> nobody had written down: **`[sources]` is not what blocks publication, and never was.**
+> both sibling-checkout steps. But its premise was still true, for a reason nobody had written
+> down: **`[sources]` is not what blocks publication, and never was.**
 > Registrator reads `[deps]` **and `[weakdeps]`**, and errors on any UUID in either that no registry
 > knows. `PormG` is a weakdep and is not in General, so registration fails at the front door —
 > before `[sources]` is ever looked at, which it never is. §4 lists everything else that was checked
-> and cleared, so it is not re-investigated. **No route is chosen here**; the decision is
-> deliberately left open on #117.
+> and cleared, so it is not re-investigated. **No route is chosen here, and no timetable is
+> implied** — publishing is the maintainer's judgment, not something a backlog clears the way for.
 
 ## 1. The single gate: for registration, a weakdep is a dep
 
@@ -79,7 +81,7 @@ not care what `[sources]` says.
 Once PormG is registered, the `[sources]` entry becomes dead weight for consumers and survives only
 to feed `Pkg.test`'s generated environment.
 
-## 3. Why `3aac753` was right anyway, and why #117 is still open
+## 3. Why `3aac753` was right anyway, and why the issue outlived it
 
 This record is not a regression report. The url + rev migration removed the second pin
 (`PORMG_REV`), deleted the hand-rolled sibling checkout, stopped Nitro's resolvability depending on
@@ -88,8 +90,13 @@ three of #117's "Done when" boxes, and each was worth having on its own terms.
 
 It simply answered a different question from the one in the issue's title. The commit cited
 [#21](https://github.com/PingoLee/Nitro.jl/issues/21) and closed #208/#209; it never referenced
-#117, so the merge never closed it. The right outcome is that **#117 stays open as the route
-decision**, with its premise amended — not as the `[sources]` cleanup, which is done.
+#117, so the merge never closed it and the issue sat on — carrying a title whose causal claim §2
+disproves.
+
+**It is closed now, and this record replaces it.** Keeping it open would have implied a to-do with a
+due date, and there is none: the `[sources]` cleanup is genuinely done, and what remains is a
+standing cost to be paid *if and when* someone decides to publish. That is a thing to know, not a
+thing to finish, which makes it a design record rather than a backlog item.
 
 ## 4. Cleared, so nobody re-investigates
 
@@ -180,9 +187,14 @@ the whole gate.
 
 ## 7. Decision: not taken
 
-The finding is what ships. The route is left open on #117 deliberately — it is a maintainer decision
-with a public, irreversible arm (A) and an architectural arm (D), and neither should be taken as a
-side effect of documenting the blocker.
+The finding is what ships. **No route is chosen, and no timetable is implied** — it is a maintainer
+decision with a public, irreversible arm (A) and an architectural arm (D), and neither should be
+taken as a side effect of documenting the blocker. Readiness to publish is subjective and separate
+from this record: nothing here says Nitro *should* be published, only what it would cost when
+someone decides it should be.
+
+This record is the memory, not an open issue. It is deliberately not tracked as a to-do, because a
+standing open item invites someone to "clear" it and treat an empty backlog as permission.
 
 Re-read this record when any of the following becomes true:
 
@@ -193,7 +205,8 @@ Re-read this record when any of the following becomes true:
 
 ## 8. See also
 
-- [#117](https://github.com/PingoLee/Nitro.jl/issues/117) — the tracker, and the publish gate.
+- [#117](https://github.com/PingoLee/Nitro.jl/issues/117) — closed in favour of this record; its
+  title asserted a cause (`[sources]`) that §2 disproves.
 - [#12](https://github.com/PingoLee/Nitro.jl/issues/12) — closed as a two-line stub; §5B is why it
   is not a substitute for this record.
 - [#21](https://github.com/PingoLee/Nitro.jl/issues/21) — the supply-chain half, closed by the same

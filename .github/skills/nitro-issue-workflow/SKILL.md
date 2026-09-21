@@ -327,9 +327,10 @@ canonical list, and why the guardrail files are on it, is the merge-gate non-neg
 - **Watch CI on `main`**, not just the PR checks — a merge does not wait for them, and at `quick` and
   `standard` CI is running rungs you deliberately skipped. A tier that hands work to CI owes CI a
   look.
-- If the change closed the last `pre-publish` issue, say so — the publish gate is that label query
-  coming back empty. Do not cut a release as a side effect; that is the maintainer's call via
-  [`nitro-cut-release`](../nitro-cut-release/SKILL.md).
+- If the change closed a `pre-publish` issue, say so plainly and stop there. An empty label query
+  is **not** a signal to publish — readiness is the maintainer's judgment and no query answers it
+  (Pre-publish non-negotiable). Never propose publishing, and never cut a release as a side effect;
+  that is the maintainer's call via [`nitro-cut-release`](../nitro-cut-release/SKILL.md).
 - File follow-ups for anything deferred, using
   [`nitro-issue-management`](../nitro-issue-management/SKILL.md). A single targeted issue the user
   asked for can be created directly; anything bulk gets drafted and confirmed first.
