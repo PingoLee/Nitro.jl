@@ -8,6 +8,23 @@ using Nitro
 using Nitro.Workers
 using Nitro.Errors: AuthorizationError
 
+# Poll until a task settles, and let a timeout report as ONE failure.
+#
+# The bare `@test timedwait(...) == :ok` this replaces left every following assertion about the
+# terminal record running anyway -- and those are all downstream of the same cause, so one lost
+# race surfaced as three or four unrelated-looking failures. CI showed exactly that on #226: a
+# `timed_out` at the poll, then `persisted[:result] == nothing` immediately below it, on a
+# branch that touches no worker code.
+#
+# Returns whether it settled, so the caller can skip precisely the assertions that are only
+# meaningful once it did -- with a plain `if`, never `@test_skip`. `SKIPS_OK` in
+# `test/harness_manifest.jl` is deliberately empty and `harness_tests.jl` fails on any skip,
+# including the `skip=true` / `broken=true` keyword forms.
+#
+# This is a REPORTING fix, not the fix for #226. The race that made these polls time out was in
+# the mock itself; see `MockDB`.
+_settled(predicate::Function; timeout::Real = 5.0) = timedwait(predicate, timeout) === :ok
+
 # These tests exercise the real NitroPormGExt.PormGWorkerStore when PormG is
 # available in the active test environment. The mock model below replaces only
 # the database layer; store methods come from ext/NitroPormGExt.jl.
@@ -49,20 +66,58 @@ function _reject_filter_key(k::String)
           "query under test is not actually being exercised.")
 end
 
-mutable struct MockTaskQuerySet
+# One database: the state every queryset the owning model mints SHARES, plus the lock that
+# makes sharing safe. A queryset is minted per `m.objects` access; the data behind it is not.
+#
+# The lock is not decoration, and its GRANULARITY is the whole design. `PormGWorkerStore` leaves
+# its data methods unlocked on purpose: `try_transition!` and `add_watcher!` are compare-and-set
+# through a single filtered `UPDATE`, correct precisely because a real database makes each
+# STATEMENT atomic -- `ext/NitroPormGExt.jl` says so in as many words ("the compare and the
+# write are one statement"). A mock built on bare `Dict`s offered no such guarantee, so each of
+# those statements degraded into an unguarded read-modify-write and this file flaked at `-t 2`
+# with a different subset of testsets failing each run (#226).
+#
+# So: the lock is held for the duration of ONE terminal operation and never across two. That is
+# what SQLite's serialized mode gives, and it restores the atomicity the ext is written against
+# WITHOUT making `read -> decide -> write` sequences atomic -- which would quietly make the
+# #88 / #108 / #167 assertions vacuous, since those exist to test exactly the window between two
+# statements.
+#
+# It is a LEAF lock: nothing is acquired while holding it and no callback runs under it. That,
+# and only that, is what makes an order inversion unrepresentable -- NOT any claim about
+# `store.task_lock` being held on the way in. It frequently is not: `get_task_status` and
+# `get_all_tasks` reach the store through no `lock_tasks` at all, and #226 was precisely a
+# lock-free polling read interleaving with a worker task that did hold it. Anyone who reads a
+# "production always locks first" guarantee into this will conclude the lock below is redundant.
+struct MockDB
     # One table PER CONNECTION, not one table. A single-table mock cannot express #203 at
     # all: "created the table on `tasks`, then read and wrote every row on `db`" is not a
     # statement about anything unless there are two tables to tell apart, so no assertion
     # written against such a mock could have failed on code that dropped `.db(db_key)`.
     tables::Dict{String, Dict{String, Dict{String, Any}}}   # db key -> task id -> row
-    db_key::Union{Nothing, String}                          # `nothing` until `.db(key)` runs
-    filters::Dict{String, Any}
     # Every filter a query actually RAN with, shared across a `.db(k).filter(a).filter(b)`
     # chain and across every queryset the owning model mints. Without it a test can only
     # check the rows that came back, never that the query carried the run-id fence, the
     # scope prefix or the status set it was supposed to (#208).
     seen::Vector{Dict{String, Any}}
+    lock::ReentrantLock
 end
+
+MockDB(db_keys::String...) = MockDB(
+    Dict{String, Dict{String, Dict{String, Any}}}(
+        k => Dict{String, Dict{String, Any}}() for k in (isempty(db_keys) ? ("db",) : db_keys)),
+    Dict{String, Any}[],
+    ReentrantLock())
+
+mutable struct MockTaskQuerySet
+    mdb::MockDB
+    db_key::Union{Nothing, String}                          # `nothing` until `.db(key)` runs
+    # Per-queryset, and deliberately NOT under the lock: `model.objects` mints a fresh queryset
+    # on every access, so an accumulating chain is confined to the task that built it.
+    filters::Dict{String, Any}
+end
+
+_mock_lock(qs::MockTaskQuerySet) = getfield(qs, :mdb).lock
 
 # The one place a connection is resolved. Every terminal op goes through here, so a query
 # that never called `.db(key)` fails loudly instead of silently reading the default table.
@@ -71,14 +126,21 @@ function _selected_table(qs::MockTaskQuerySet)
     key === nothing && error("MockTaskQuerySet: query ran without selecting a connection -- " *
         "every task query must go through `_task_objects(store)` (`.db(store.db_key)`), " *
         "not `m.objects` directly. See #203.")
-    tables = getfield(qs, :tables)
+    tables = getfield(qs, :mdb).tables
     haskey(tables, key) || error("MockTaskQuerySet: no table registered for db key '$key' -- " *
         "PormG throws `InvalidConfigurationError` for a key that was never loaded. Build the " *
         "model as `MockTaskModel(\"$key\")` if the test means to use that connection.")
     return tables[key]
 end
 
-function _filtered_rows(qs::MockTaskQuerySet)
+# The ONE place `seen` is recorded and rows are matched. MUST be called with the database lock
+# held: it reads the shared table, appends to the shared `seen` vector, and hands back the LIVE
+# row objects so `update` and `delete` can mutate them inside the same critical section.
+#
+# `seen` is appended exactly once per call and every terminal op calls this exactly once. That
+# is load-bearing, not tidiness: the `_filters_seen` assertions below are exact-count and
+# positional, so a second push per operation would break them.
+function _filtered_rows_locked(qs::MockTaskQuerySet)
     filters = getfield(qs, :filters)
 
     # Validate EVERY key BEFORE looking at any row, and before resolving the connection.
@@ -94,7 +156,7 @@ function _filtered_rows(qs::MockTaskQuerySet)
     # run with -- otherwise an assertion written against it alone could be satisfied by a query
     # that threw. Recorded here rather than in `filter` because accumulation means only the
     # terminal op knows the whole of it.
-    push!(getfield(qs, :seen), copy(filters))
+    push!(getfield(qs, :mdb).seen, copy(filters))
 
     # AFTER the filter-key check: a misspelled filter is the more specific diagnosis, and the
     # `@test_throws` in "the mock refuses what PormG refuses" drive `m.objects` directly.
@@ -145,6 +207,15 @@ function _filtered_rows(qs::MockTaskQuerySet)
     return rows
 end
 
+# Rows handed OUT are snapshots. A live row stays readable field-by-field after the lock is
+# dropped, while another thread's `update` writes it field-by-field -- a torn read inside
+# `_from_db_record` that locking the table alone would not prevent.
+#
+# `copy` is shallow, and that is an exact snapshot ONLY because every column this mock stores is
+# an immutable scalar (String, Float64, DateTime, nothing) -- `watchers` is the serialized JSON
+# string, not a vector. Put a mutable value in a column and this quietly becomes an alias again.
+_snapshot(row::Dict{String, Any}) = copy(row)
+
 function Base.getproperty(qs::MockTaskQuerySet, name::Symbol)
     if name === :filter
         return function(pairs::Pair{String,<:Any}...)
@@ -174,12 +245,16 @@ function Base.getproperty(qs::MockTaskQuerySet, name::Symbol)
         end
     elseif name === :list
         return function()
-            return _filtered_rows(qs)
+            return lock(_mock_lock(qs)) do
+                Dict{String,Any}[_snapshot(r) for r in _filtered_rows_locked(qs)]
+            end
         end
     elseif name === :first
         return function()
-            rows = _filtered_rows(qs)
-            return isempty(rows) ? nothing : first(rows)
+            return lock(_mock_lock(qs)) do
+                rows = _filtered_rows_locked(qs)
+                isempty(rows) ? nothing : _snapshot(first(rows))
+            end
         end
     elseif name === :create
         return function(pairs::Pair{String,<:Any}...)
@@ -187,8 +262,13 @@ function Base.getproperty(qs::MockTaskQuerySet, name::Symbol)
             for (k, v) in pairs
                 row[k] = v
             end
-            _selected_table(qs)[row["id"]] = row
-            return row
+            return lock(_mock_lock(qs)) do
+                _selected_table(qs)[row["id"]] = row
+                # A snapshot like every other read. The ext discards this return value, so
+                # nothing observes the difference -- which is exactly why this should not be the
+                # one method that leaks a live row out from under the lock.
+                _snapshot(row)
+            end
         end
     elseif name === :update
         return function(pairs::Pair{String,<:Any}...)
@@ -200,14 +280,21 @@ function Base.getproperty(qs::MockTaskQuerySet, name::Symbol)
             # Return the affected-row count, matching PormG's Django-style `update`.
             # It used to return `nothing`, which would make every compare-and-set in
             # the store read as a failure — or, worse, as an untested success.
-            touched = 0
-            for row in _filtered_rows(qs)
-                for (k, v) in pairs
-                    row[k] = v
+            # The compare (`_filtered_rows_locked`) and the set (`row[k] = v`) happen in ONE
+            # lock hold, because that is what an UPDATE ... WHERE is -- and it is the premise
+            # `try_transition!` and `add_watcher!` build their compare-and-set on. Holding the
+            # lock any WIDER than this would be wrong: the window between a store's read and its
+            # update is the thing #88 and #108 exist to test.
+            return lock(_mock_lock(qs)) do
+                touched = 0
+                for row in _filtered_rows_locked(qs)
+                    for (k, v) in pairs
+                        row[k] = v
+                    end
+                    touched += 1
                 end
-                touched += 1
+                touched
             end
-            return touched
         end
     elseif name === :delete
         # Bound to a local instead of returned directly: Julia 1.13's parser drops the
@@ -220,13 +307,15 @@ function Base.getproperty(qs::MockTaskQuerySet, name::Symbol)
             (!allow_delete_all && isempty(getfield(qs, :filters))) &&
                 error("MockTaskQuerySet: delete() must have a filter -- pass " *
                       "allow_delete_all = true to delete every row, as PormG requires.")
-            table = _selected_table(qs)
-            count = 0
-            for row in _filtered_rows(qs)
-                delete!(table, row["id"])
-                count += 1
+            return lock(_mock_lock(qs)) do
+                table = _selected_table(qs)
+                count = 0
+                for row in _filtered_rows_locked(qs)
+                    delete!(table, row["id"])
+                    count += 1
+                end
+                (count, Dict{String, Integer}("nitro_task" => count))
             end
-            return count, Dict{String, Integer}("nitro_task" => count)
         end
         return delete_fn
     else
@@ -234,32 +323,45 @@ function Base.getproperty(qs::MockTaskQuerySet, name::Symbol)
     end
 end
 
-Base.iterate(qs::MockTaskQuerySet) = iterate(_filtered_rows(qs))
-Base.iterate(qs::MockTaskQuerySet, state) = iterate(_filtered_rows(qs), state)
+# Iterating a queryset is NOT supported, and saying so beats the plausible-looking
+# implementation that used to be here. That one called `_filtered_rows` per STEP: it re-ran the
+# whole filter for every element and appended a fresh `seen` entry for every element, so the
+# exact-count `_filters_seen` assertions would have broken the moment anything used it. Nothing
+# does -- the ext's two `for row in` sites iterate the Vectors `.list()` returns, and no test
+# iterates a queryset. Fail loudly rather than look supported, exactly as this file already does
+# for an unmodelled filter key.
+Base.iterate(::MockTaskQuerySet, args...) =
+    error("MockTaskQuerySet: a queryset is not iterable -- call `.list()` and iterate that. " *
+          "A per-step re-filter would also append one `_filters_seen` entry per row.")
 
 struct MockTaskModel
-    _tables::Dict{String, Dict{String, Dict{String, Any}}}
-    _filters_seen::Vector{Dict{String, Any}}
+    mdb::MockDB
 end
 
 # Every connection this model may be queried on. A test that exercises routing names both
 # (`MockTaskModel("db", "tasks")`); the no-argument form is the single connection every test
 # that does not care about routing uses.
-MockTaskModel(db_keys::String...) = MockTaskModel(
-    Dict{String, Dict{String, Dict{String, Any}}}(
-        k => Dict{String, Dict{String, Any}}() for k in (isempty(db_keys) ? ("db",) : db_keys)),
-    Dict{String, Any}[])
+MockTaskModel(db_keys::String...) = MockTaskModel(MockDB(db_keys...))
 
 function Base.getproperty(m::MockTaskModel, name::Symbol)
     if name === :objects
         # No connection selected yet -- exactly what PormG's `model.objects` hands back.
         # `.db(key)` is what picks one.
-        return MockTaskQuerySet(getfield(m, :_tables), nothing, Dict{String,Any}(),
-                                getfield(m, :_filters_seen))
+        return MockTaskQuerySet(getfield(m, :mdb), nothing, Dict{String,Any}())
     elseif name === :_table
         # The DEFAULT connection's table: what every assertion that does not care about
         # routing means, kept as an alias rather than rewritten at ~30 call sites.
-        return getfield(m, :_tables)["db"]
+        #
+        # LIVE, not a snapshot -- `_tables` carries identity assertions and the routing testsets
+        # write rows through it directly. So a direct read through these aliases is only valid
+        # once the runtime is quiesced or the task under test has reached a terminal state. That
+        # holds at every existing call site; preserve it when adding one, or go through
+        # `.objects` and take the lock.
+        return getfield(m, :mdb).tables["db"]
+    elseif name === :_tables
+        return getfield(m, :mdb).tables
+    elseif name === :_filters_seen
+        return getfield(m, :mdb).seen
     end
     return getfield(m, name)
 end
@@ -283,17 +385,25 @@ function _flaky_guard(qs::FlakyReadQuerySet)
     fail_next = getfield(qs, :fail_next)
     fail_ids = getfield(qs, :fail_ids)
 
-    # Targeted: fail only reads filtered to a specific task id, so a test can
-    # break one row's read without disturbing the writes around it.
-    id = Base.get(getfield(inner, :filters), "id", nothing)
-    if id !== nothing && id in fail_ids
-        error("simulated database read failure for '$id'")
-    end
+    # Under the database lock, for two reasons. `fail_ids` is mutated by the test task while the
+    # queue processor is live (see `fail_id!` below), so the membership test races it. And the
+    # counted branch is a read-decide-decrement -- "exactly one read fails" is an assertion a
+    # lost update would quietly break. This is a SEPARATE hold from the `inner.first()` that
+    # follows, not a nested one: the guard models a failed connection, which is its own event
+    # and not part of the read it precedes.
+    lock(getfield(inner, :mdb).lock) do
+        # Targeted: fail only reads filtered to a specific task id, so a test can
+        # break one row's read without disturbing the writes around it.
+        id = Base.get(getfield(inner, :filters), "id", nothing)
+        if id !== nothing && id in fail_ids
+            error("simulated database read failure for '$id'")
+        end
 
-    # Counted: fail the next N reads whatever they touch.
-    if fail_next[] > 0
-        fail_next[] -= 1
-        error("simulated transient database read failure")
+        # Counted: fail the next N reads whatever they touch.
+        if fail_next[] > 0
+            fail_next[] -= 1
+            error("simulated transient database read failure")
+        end
     end
     return nothing
 end
@@ -322,27 +432,38 @@ function Base.getproperty(qs::FlakyReadQuerySet, name::Symbol)
 end
 
 struct FlakyReadModel
-    _tables::Dict{String, Dict{String, Dict{String, Any}}}
+    mdb::MockDB
+    # Assigned directly by the test task (`flaky.fail_next[] = 1`). That is safe WITHOUT the
+    # lock only because every testset doing so is sequential -- nothing is in flight at that
+    # point. `fail_ids` is the opposite case and has helpers below.
     fail_next::Ref{Int}
     fail_ids::Set{String}
-    _filters_seen::Vector{Dict{String, Any}}
 end
 
-FlakyReadModel(db_keys::String...) = FlakyReadModel(
-    Dict{String, Dict{String, Dict{String, Any}}}(
-        k => Dict{String, Dict{String, Any}}() for k in (isempty(db_keys) ? ("db",) : db_keys)),
-    Ref(0), Set{String}(), Dict{String, Any}[])
+FlakyReadModel(db_keys::String...) =
+    FlakyReadModel(MockDB(db_keys...), Ref(0), Set{String}())
+
+# The test-side writers to `fail_ids`. Guarding only the READ in `_flaky_guard` would be a
+# no-op: these fire either side of a `timedwait` with a queued task in flight, so the `Set` is
+# genuinely mutated while the processor is testing membership in it.
+fail_id!(m::FlakyReadModel, id::String) =
+    lock(() -> push!(getfield(m, :fail_ids), id), getfield(m, :mdb).lock)
+unfail_id!(m::FlakyReadModel, id::String) =
+    lock(() -> delete!(getfield(m, :fail_ids), id), getfield(m, :mdb).lock)
 
 function Base.getproperty(m::FlakyReadModel, name::Symbol)
     if name === :objects
         return FlakyReadQuerySet(
-            MockTaskQuerySet(getfield(m, :_tables), nothing, Dict{String,Any}(),
-                             getfield(m, :_filters_seen)),
+            MockTaskQuerySet(getfield(m, :mdb), nothing, Dict{String,Any}()),
             getfield(m, :fail_next),
             getfield(m, :fail_ids),
         )
     elseif name === :_table
-        return getfield(m, :_tables)["db"]
+        return getfield(m, :mdb).tables["db"]
+    elseif name === :_tables
+        return getfield(m, :mdb).tables
+    elseif name === :_filters_seen
+        return getfield(m, :mdb).seen
     end
     return getfield(m, name)
 end
@@ -376,15 +497,37 @@ function Base.getproperty(qs::RacingWatcherQuerySet, name::Symbol)
             # Only a watchers CAS is worth racing, and only once.
             is_watcher_cas = any(p -> first(p) == "watchers", pairs) &&
                              haskey(getfield(inner, :filters), "watchers")
-            if is_watcher_cas && inject_next[] > 0
-                inject_next[] -= 1
-                # The competing write lands first, so our compare value is now stale.
-                # `_selected_table`, not the raw tables dict: the intruder must land on the
-                # SAME connection the store is querying, or the CAS would never see it.
-                for row in values(_selected_table(inner))
-                    current = JSON.parse(row["watchers"])
-                    intruder in current && continue
-                    row["watchers"] = JSON.json(vcat(current, intruder))
+            # Under the lock: this is the ONE other place a row is written, so leaving it out
+            # would make "rows are only touched under the lock" false the day it lands, however
+            # single-threaded this particular testset is.
+            #
+            # A SEPARATE hold from the `inner.update` below, deliberately. The intruder's write
+            # is a different statement that lands FIRST -- that is the whole point -- and fusing
+            # the two would make the CAS see its own injection and never take its retry.
+            if is_watcher_cas
+                lock(getfield(inner, :mdb).lock) do
+                    # Read, decide and decrement in ONE hold -- the same read-modify-write
+                    # `_flaky_guard` locks `fail_next` for. Testing the counter outside the hold
+                    # and decrementing inside it would let two injections both pass the test and
+                    # drive it to -1.
+                    #
+                    # Nested rather than an early `return`: inside a `do` block a `return` exits
+                    # the closure, not `update`, so `inner.update` below still runs -- but that
+                    # is exactly the Julia footgun a later rewrite of `lock(l) do ... end` into
+                    # `lock(l); try ... finally unlock(l) end` would silently invert, skipping
+                    # the CAS on every retry. Six lines nest for free; do not trade them back.
+                    if inject_next[] > 0
+                        inject_next[] -= 1
+                        # The competing write lands first, so our compare value is now stale.
+                        # `_selected_table`, not the raw tables dict: the intruder must land on
+                        # the SAME connection the store is querying, or the CAS would never
+                        # see it.
+                        for row in values(_selected_table(inner))
+                            current = JSON.parse(row["watchers"])
+                            intruder in current && continue
+                            row["watchers"] = JSON.json(vcat(current, intruder))
+                        end
+                    end
                 end
             end
             return inner.update(pairs...)
@@ -394,27 +537,30 @@ function Base.getproperty(qs::RacingWatcherQuerySet, name::Symbol)
 end
 
 struct RacingWatcherModel
-    _tables::Dict{String, Dict{String, Dict{String, Any}}}
+    mdb::MockDB
     inject_next::Ref{Int}
     intruder::String
-    _filters_seen::Vector{Dict{String, Any}}
 end
 
 RacingWatcherModel(table::Dict{String, Dict{String, Any}}, inject_next::Ref{Int}, intruder::String) =
     RacingWatcherModel(
-        Dict{String, Dict{String, Dict{String, Any}}}("db" => table), inject_next, intruder,
-        Dict{String, Any}[])
+        MockDB(Dict{String, Dict{String, Dict{String, Any}}}("db" => table),
+               Dict{String, Any}[], ReentrantLock()),
+        inject_next, intruder)
 
 function Base.getproperty(m::RacingWatcherModel, name::Symbol)
     if name === :objects
         return RacingWatcherQuerySet(
-            MockTaskQuerySet(getfield(m, :_tables), nothing, Dict{String,Any}(),
-                             getfield(m, :_filters_seen)),
+            MockTaskQuerySet(getfield(m, :mdb), nothing, Dict{String,Any}()),
             getfield(m, :inject_next),
             getfield(m, :intruder),
         )
     elseif name === :_table
-        return getfield(m, :_tables)["db"]
+        return getfield(m, :mdb).tables["db"]
+    elseif name === :_tables
+        return getfield(m, :mdb).tables
+    elseif name === :_filters_seen
+        return getfield(m, :mdb).seen
     end
     return getfield(m, name)
 end
@@ -1144,18 +1290,23 @@ else
                 end, Owner("attacker"); scope=:global, runtime=rt_store_e2e)
 
                 notify(release)
-                @test timedwait(() -> get_task_status(owner_id, Owner("victim"); runtime=rt_store_e2e)[:status] == "COMPLETED", 5.0) == :ok
+                ok = _settled(() -> get_task_status(owner_id, Owner("victim"); runtime=rt_store_e2e)[:status] == "COMPLETED")
+                @test ok
 
-                # Terminal state: replacing the row would destroy the owner's result.
-                @test_throws AuthorizationError submit_task("shared-export", () -> begin
-                    attacker_calls[] += 1
-                    return "attacker-data"
-                end, Owner("attacker"); scope=:global, runtime=rt_store_e2e)
+                # Everything below is about the TERMINAL record, so it is all downstream of the
+                # poll above. This is the exact cascade CI reported on #226.
+                if ok
+                    # Terminal state: replacing the row would destroy the owner's result.
+                    @test_throws AuthorizationError submit_task("shared-export", () -> begin
+                        attacker_calls[] += 1
+                        return "attacker-data"
+                    end, Owner("attacker"); scope=:global, runtime=rt_store_e2e)
 
-                persisted = get_task_status(owner_id, Owner("victim"); runtime=rt_store_e2e)
-                @test persisted[:result] == "victim-secret"
-                @test persisted[:watcher_count] == 1
-                @test attacker_calls[] == 0
+                    persisted = get_task_status(owner_id, Owner("victim"); runtime=rt_store_e2e)
+                    @test persisted[:result] == "victim-secret"
+                    @test persisted[:watcher_count] == 1
+                    @test attacker_calls[] == 0
+                end
 
                 # user scope keeps the two users on separate rows entirely
                 a = submit_task("report", () -> "a", Owner("user-a"); runtime=rt_store_e2e)
@@ -1183,23 +1334,34 @@ else
 
                 long_tail = repeat("x", MAX_STORED_ERROR_CHARS * 2)
                 capped_id = submit_task("capped", () -> throw(ArgumentError(long_tail)), owner; runtime=rt_store_err)
-                @test timedwait(() -> get_task_status(capped_id, owner; runtime=rt_store_err)[:status] == "FAILED", 5.0) == :ok
+                capped_ok = _settled(() -> get_task_status(capped_id, owner; runtime=rt_store_err)[:status] == "FAILED")
+                @test capped_ok
 
-                column = store_err.model._table[capped_id]["error"]
-                @test length(column) <= MAX_STORED_ERROR_CHARS + 64
-                @test isvalid(column)
-                @test occursin("truncated", column)
+                # The row exists either way -- `_register_or_watch!` writes it synchronously
+                # inside `submit_task` -- so a timeout here does not raise, it just leaves
+                # `error` empty and fails all three assertions below for one reason (#226).
+                if capped_ok
+                    column = store_err.model._table[capped_id]["error"]
+                    @test length(column) <= MAX_STORED_ERROR_CHARS + 64
+                    @test isvalid(column)
+                    @test occursin("truncated", column)
+                end
 
                 set_error_redactor!(store_err, (exc, rendered) -> string(nameof(typeof(exc))))
                 redacted_id = submit_task("redacted", () -> throw(ArgumentError("bad token: $(sentinel)")), owner; runtime=rt_store_err)
-                @test timedwait(() -> get_task_status(redacted_id, owner; runtime=rt_store_err)[:status] == "FAILED", 5.0) == :ok
+                redacted_ok = _settled(() -> get_task_status(redacted_id, owner; runtime=rt_store_err)[:status] == "FAILED")
+                @test redacted_ok
 
                 # POSITIVE first: the sentinel really is in the raw rendering, so the negative
-                # assertion below is not passing for the wrong reason.
+                # assertion below is not passing for the wrong reason. This one is about
+                # `format_error` alone, so it is NOT downstream of the poll and stays outside
+                # the guard -- a timeout must not silently take the positive control with it.
                 @test occursin(sentinel, format_error(ArgumentError("bad token: $(sentinel)")))
                 # NEGATIVE: and it never reaches the column.
-                @test store_err.model._table[redacted_id]["error"] == "ArgumentError"
-                @test !occursin(sentinel, store_err.model._table[redacted_id]["error"])
+                if redacted_ok
+                    @test store_err.model._table[redacted_id]["error"] == "ArgumentError"
+                    @test !occursin(sentinel, store_err.model._table[redacted_id]["error"])
+                end
             finally
                 reset_runtime!(rt_store_err)
             end
@@ -1367,7 +1529,7 @@ else
                 @test second_id == "u::k2"
 
                 # Break only k2's read, then let k1 finish so the processor picks k2 up.
-                push!(flaky.fail_ids, second_id)
+                fail_id!(flaky, second_id)
                 notify(gate)
 
                 @test timedwait(() -> get_task_status(first_id, Owner("u"); runtime=rt_store_q)[:status] == "COMPLETED", 5.0) == :ok
@@ -1377,7 +1539,7 @@ else
                 @test queue.processor_task !== nothing
                 @test !istaskdone(queue.processor_task)
 
-                delete!(flaky.fail_ids, second_id)
+                unfail_id!(flaky, second_id)
                 third_id = submit_sequential_task("qfail", "k3", run_step, Owner("u"); runtime=rt_store_q)
                 @test timedwait(() -> get_task_status(third_id, Owner("u"); runtime=rt_store_q)[:status] == "COMPLETED", 5.0) == :ok
                 @test get_task_status(third_id, Owner("u"); runtime=rt_store_q)[:result] == "ran-u::k3"
@@ -1531,6 +1693,62 @@ else
             foreach(wait, tasks)
 
             @test counter[] == n
+        end
+
+        @testset "the mock database is serialized, so concurrent queries cannot lose a write (#226)" begin
+            # The guard for #226. `PormGWorkerStore` leaves its data methods unlocked because a
+            # real database makes each statement atomic; this mock is what stands in for that
+            # database in every testset above, and it used to offer no such guarantee. At `-t 2`
+            # the worker task and the polling loop genuinely interleaved inside it, and a
+            # different subset of this file failed on each run.
+            #
+            # The assertions are chosen to be TRUE and cheap at one thread and only VIOLABLE at
+            # two. Be precise about that: at `-t 1` Julia's tasks are cooperative and none of
+            # `create`/`first`/`update` yields, so the racers run strictly serially and this
+            # testset is UNFALSIFIABLE there rather than merely passing. CI runs both legs; the
+            # `-t 2` leg is the one holding this. `seen` gains one entry per filtering op, so
+            # the total is `ntasks * nops * 2` whatever the interleaving; the id set and the
+            # final statuses are likewise interleaving-independent. Against the unlocked mock at
+            # `-t 2` the `seen` vector either threw `ConcurrencyViolationError` on a concurrent
+            # resize or came back short, and the table lost rows to a concurrent rehash.
+            #
+            # Deliberately NOT asserted: the ORDER of `seen`, which rows a concurrent `.list()`
+            # returned, or anything about timing. None of those is a property the lock
+            # guarantees, so each would be the next flake rather than a regression guard.
+            #
+            # Driven against `MockTaskModel` directly, not through a store, so a failure names
+            # the mock rather than the ext.
+            ntasks, nops = 4, 40
+            expected_ids = Set("t$t-op$i" for t in 1:ntasks for i in 1:nops)
+
+            for _ in 1:8
+                m = MockTaskModel()
+                barrier = Base.Event()
+                racers = map(1:ntasks) do t
+                    Threads.@spawn begin
+                        wait(barrier)   # maximise the overlap rather than hope for it
+                        for i in 1:nops
+                            id = "t$t-op$i"
+                            m.objects.db("db").create(
+                                "id" => id, "run_id" => "run-$t", "status" => "PENDING",
+                                "progress" => 0.0, "result" => "", "error" => "",
+                                "created_at" => nothing, "started_at" => nothing,
+                                "completed_at" => nothing, "watchers" => "[]",
+                                "queue_name" => "default")
+                            m.objects.db("db").filter("id" => id).first()
+                            m.objects.db("db").filter("id" => id).update("status" => "RUNNING")
+                        end
+                    end
+                end
+                notify(barrier)
+                foreach(wait, racers)
+
+                # `create` records no filter; `first` and `update` record exactly one each.
+                @test length(m._filters_seen) == ntasks * nops * 2
+                @test Set(keys(m._table)) == expected_ids
+                # Every row was updated by the one task that owns it, so a lost write shows.
+                @test all(r -> r["status"] == "RUNNING", values(m._table))
+            end
         end
 
         @testset "teardown abandons a queued item identically on both backends (#182, #183)" begin
