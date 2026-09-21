@@ -75,15 +75,37 @@ const NOW_TS = trunc(Int, time())
 
 @testset "Auth module cookie helpers" begin
     res = HTTP.Response(200)
-    Nitro.Auth.set_auth_cookie!(res, "token-123"; secure=false)
+    Nitro.Auth.set_auth_cookie!(res, "token-123"; ttl=900, secure=false)
     cookie_header = HTTP.header(res, "Set-Cookie")
     @test occursin("auth_token=token-123", cookie_header)
     @test !occursin("Secure", cookie_header)
+    # The caller's `ttl` reaches the wire verbatim -- nothing rounds it or clamps it.
+    @test occursin("Max-Age=900", cookie_header)
 
     logout = HTTP.Response(200)
     Nitro.Auth.clear_auth_cookie!(logout; secure=false)
     cleared = HTTP.header(logout, "Set-Cookie")
     @test occursin("Max-Age=0", cleared)
+end
+
+@testset "set_auth_cookie! refuses to guess a TTL (#232)" begin
+    # The defect was a 24h default on a helper that never decodes the token, against a
+    # 15-minute default token bound: the browser kept sending a credential guaranteed to
+    # 401, which reads as a server fault rather than an expired session. The fix is that
+    # `ttl` has no default at all, so the two regression guards are (a) omitting it is an
+    # error and (b) no constant exists for anyone to restore one from.
+    res = HTTP.Response(200)
+    @test_throws UndefKeywordError Nitro.Auth.set_auth_cookie!(res, "token-123"; secure=false)
+
+    # Asserted on the MODULE, not on a call: a reintroduced default would otherwise only
+    # surface once some call site started relying on it again.
+    @test !isdefined(Nitro.Auth, :DEFAULT_AUTH_COOKIE_TTL)
+
+    # A caller that mints with its own lifetime gets that lifetime on the cookie, which is
+    # the case the old default was always wrong for.
+    minted = HTTP.Response(200)
+    Nitro.Auth.set_auth_cookie!(minted, "token-abc"; ttl=60, secure=false)
+    @test occursin("Max-Age=60", HTTP.header(minted, "Set-Cookie"))
 end
 
 @testset "JWT encode/decode and validation" begin

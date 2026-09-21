@@ -11,7 +11,7 @@ const NOW_TS = trunc(Int, time())
 @testset "All Auth Module Tests" begin
   @testset "Auth module cookie helpers" begin
     res = HTTP.Response(200)
-    Nitro.Auth.set_auth_cookie!(res, "token-123"; secure=false)
+    Nitro.Auth.set_auth_cookie!(res, "token-123"; ttl=900, secure=false)
     cookie_header = HTTP.header(res, "Set-Cookie")
     @test occursin("auth_token=token-123", cookie_header)
     @test !occursin("Secure", cookie_header)

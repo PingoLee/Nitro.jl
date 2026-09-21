@@ -517,8 +517,21 @@ Use the higher-level cookie helpers for auth tokens:
 using Nitro.Auth
 
 res = HTTP.Response(200)
-set_auth_cookie!(res, "jwt-token"; secure=false)
+token = encode_jwt(Dict("sub" => "42"), secret; expires_in = 900)
+set_auth_cookie!(res, token; ttl = 900, secure = false)
 ```
+
+**`ttl` is required and has no default.** `set_auth_cookie!` is handed an opaque string and
+never decodes it, so it cannot know when the credential inside dies — pass the same number
+you passed to `encode_jwt` as `expires_in`. A cookie that outlives its token is not an
+authorization hole (the token still fails validation), but it is the confusing shape: the
+browser keeps sending a credential guaranteed to `401`, so every request looks like a server
+fault rather than an expired session. If you minted without `expires_in`, the token is bounded
+by `decode_jwt`'s `iat + exp_timeout` fallback instead, which defaults to 900 seconds.
+
+One exception: when you re-set a token minted in an *earlier* request — a refresh flow, or a
+re-login that reuses a live token — `expires_in` is too long, because `Max-Age` counts from
+delivery while `exp` counts from `iat`. Pass what is left, `claims["exp"] - trunc(Int, time())`.
 
 For cookie-authenticated browsers, load the CSRF secret from the environment and add `CSRFMiddleware` to unsafe routes:
 
