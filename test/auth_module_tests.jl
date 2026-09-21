@@ -166,6 +166,190 @@ end
     @test Nitro.Auth.validate_claims(Dict(:sub => "1", :exp => NOW_TS + 60); required_claims=["sub"]) isa AbstractDict
 end
 
+@testset "JWT algorithm and key-id rejection (#45)" begin
+    # These properties were sound on `main` and completely untested: the string "alg"
+    # appeared exactly once in all of test/, as scaffolding for an unrelated case. An
+    # audit found the verification path safe, which is precisely when it is cheapest for
+    # a later refactor to weaken it silently. This testset is the pin.
+
+    secret = "secret-a"
+    b64json(data) = replace(replace(replace(Base64.base64encode(Vector{UInt8}(codeunits(JSON.json(data)))), '+' => '-'), '/' => '_'), '=' => "")
+
+    # Build a token with an arbitrary header but a genuinely valid HS256 signature. This
+    # is the whole point of the suite: a forged-header token whose MAC actually checks
+    # out, which no amount of signature verification can reject.
+    function signed(header, claims; key = secret)
+        input = string(b64json(header), ".", b64json(claims))
+        return string(input, ".", Nitro.Auth._base64url_encode(Nitro.Auth._hmac_sha256(key, input)))
+    end
+    payload = Dict("sub" => "42", "exp" => NOW_TS + 3600)
+
+    caught(f) = try; f(); nothing; catch err; err; end
+
+    # -- Control. Identical machinery, correct alg: the only difference between this and
+    # the RS256 case below is the header string, so a failure there cannot be blamed on
+    # the hand-rolled signing.
+    ok = signed(Dict("alg" => "HS256", "typ" => "JWT"), payload)
+    @test Nitro.Auth.decode_jwt(ok, secret)["sub"] == "42"
+
+    # -- Algorithm confusion. Before #45 this was ACCEPTED: `decode_jwt` parsed the
+    # header's alg and never read it, so an RS256-advertising token verified fine as long
+    # as its signature was a valid HS256 MAC. Nitro never loads a public key, so this was
+    # not the classic RS256->HS256 downgrade -- but "safe by omission" is exactly what a
+    # refactor erases without noticing.
+    confused = signed(Dict("alg" => "RS256", "typ" => "JWT"), payload)
+    err = caught(() -> Nitro.Auth.decode_jwt(confused, secret))
+    @test err isa Nitro.Auth.AuthError
+    # Pinned on the message too: rejecting for the RIGHT reason is the property. A future
+    # signature-check regression would also throw AuthError here and look like a pass.
+    @test occursin("Unsupported JWT algorithm", sprint(showerror, err))
+
+    # -- alg=none, both shapes. BOTH of these already threw AuthError before #45 --
+    # `_constant_time_equals` compares a 32-byte HMAC against 0 or 9 bytes and loses on the
+    # length check -- so a bare `@test_throws AuthError` here would be green theater: it
+    # passes against the unfixed code and constrains nothing. The property that is actually
+    # new is WHICH rejection fires: the algorithm, before any key is resolved.
+    none_empty = string(b64json(Dict("alg" => "none", "typ" => "JWT")), ".", b64json(payload), ".")
+    err = caught(() -> Nitro.Auth.decode_jwt(none_empty, secret))
+    @test err isa Nitro.Auth.AuthError
+    @test occursin("Unsupported JWT algorithm", sprint(showerror, err))
+
+    none_garbage = string(b64json(Dict("alg" => "none", "typ" => "JWT")), ".", b64json(payload), ".bm90LWEtc2ln")
+    err = caught(() -> Nitro.Auth.decode_jwt(none_garbage, secret))
+    @test err isa Nitro.Auth.AuthError
+    @test occursin("Unsupported JWT algorithm", sprint(showerror, err))
+
+    # -- A header with no alg at all is not a free pass either. This one DOES discriminate
+    # on the type alone (it was accepted outright before #45), but pin the message too so
+    # it matches its neighbours and cannot drift into passing for the wrong reason.
+    no_alg = signed(Dict("typ" => "JWT"), payload)
+    err = caught(() -> Nitro.Auth.decode_jwt(no_alg, secret))
+    @test err isa Nitro.Auth.AuthError
+    @test occursin("Unsupported JWT algorithm", sprint(showerror, err))
+
+    # -- A non-string alg must not inherit the malformed-header MethodError class below:
+    # `== "HS256"` is false for any type, so this is an ordinary rejection.
+    @test_throws Nitro.Auth.AuthError Nitro.Auth.decode_jwt(signed(Dict("alg" => 123, "typ" => "JWT"), payload), secret)
+
+    # -- Offline inspection still parses anything. `verify=false` is the documented
+    # escape hatch for reading a token you are not authenticating, so the alg gate lives
+    # inside `if verify` and must not reach it.
+    @test Nitro.Auth.decode_jwt(confused, secret; verify=false)["sub"] == "42"
+
+    # -- Key id. An unknown kid resolves against no key and must never fall back to a
+    # default one; that silent fallback is how a revoked signer keeps working. This held
+    # before #45 too -- it is a PIN on existing behavior, not a regression guard for this
+    # commit, and it is here because #45 is about locking the guarantees down.
+    keyset = Dict("default" => "secret-a", "rotated" => "secret-b")
+    ghost = signed(Dict("alg" => "HS256", "typ" => "JWT", "kid" => "ghost"), payload)
+    err = caught(() -> Nitro.Auth.decode_jwt(ghost, keyset))
+    @test err isa Nitro.Auth.AuthError
+    @test occursin("Unknown JWT key id", sprint(showerror, err))
+
+    # -- A JSON kid is whatever the token's author typed. A number used to reach
+    # `_resolve_secret`, whose `kid` parameter is itself typed, as a MethodError -- so it
+    # fired for a plain STRING secret exactly as it did for a keyset. Auth middleware
+    # renders any throw as 401, so this was never an authz hole, but a direct `decode_jwt`
+    # caller got an exception type the API does not document.
+    numeric_kid = signed(Dict("alg" => "HS256", "typ" => "JWT", "kid" => 123), payload)
+    for verifier in (keyset, secret)
+        err = caught(() -> Nitro.Auth.decode_jwt(numeric_kid, verifier))
+        @test err isa Nitro.Auth.AuthError
+        @test occursin("Invalid JWT key id", sprint(showerror, err))
+    end
+    list_kid = signed(Dict("alg" => "HS256", "typ" => "JWT", "kid" => ["a"]), payload)
+    err = caught(() -> Nitro.Auth.decode_jwt(list_kid, keyset))
+    @test err isa Nitro.Auth.AuthError
+    @test occursin("Invalid JWT key id", sprint(showerror, err))
+
+    # Checked before `verify`, like the three-segment check: a non-string kid is a
+    # malformed header, not an algorithm choice, and `with_kid=true` promises a String.
+    # This is a REAL behavior change on the offline path -- before #45 this call returned
+    # the claims with no error at all -- so the upgrade entry says so rather than claiming
+    # `verify=false` is untouched.
+    @test_throws Nitro.Auth.AuthError Nitro.Auth.decode_jwt(numeric_kid, keyset; verify=false)
+
+    # -- Same defect class, one level up: neither segment is necessarily a JSON object.
+    # A header of `[]` made `get(::Vector{Any}, "alg", nothing)` a MethodError, and a
+    # non-object claims segment made `validate_claims(::AbstractDict)` one. Fixing only the
+    # kid would have left the class half closed.
+    arr = "W10"                                   # base64url of `[]`
+    err = caught(() -> Nitro.Auth.decode_jwt(string(arr, ".", b64json(payload), ".x"), secret))
+    @test err isa Nitro.Auth.AuthError
+    @test occursin("Invalid JWT header", sprint(showerror, err))
+
+    err = caught(() -> Nitro.Auth.decode_jwt(string(b64json(Dict("alg" => "HS256")), ".", arr, ".x"), secret))
+    @test err isa Nitro.Auth.AuthError
+    @test occursin("Invalid JWT claims", sprint(showerror, err))
+
+    # The header case is reachable from an attacker-controlled bearer token; the CLAIMS case
+    # is not, on `verify=true` -- you cannot reach `validate_claims` without first passing
+    # the signature check, so an attacker gets "Invalid JWT signature". It is reachable
+    # offline, and by a secret-holder. Both must stay AuthError on both paths.
+    @test_throws Nitro.Auth.AuthError Nitro.Auth.decode_jwt("W10.W10.x", secret)
+    @test_throws Nitro.Auth.AuthError Nitro.Auth.decode_jwt("W10.W10.x", secret; verify=false)
+
+    # -- The rest of the same class: the DECODERS are sinks too, and both run before the
+    # `isa AbstractDict` guards above. `base64decode` throws ArgumentError on a bad alphabet
+    # or an unpaddable length, `JSON.parse` on anything that is not JSON. Guarding only the
+    # parsed value left the class half closed, and length-dependently so -- which is exactly
+    # what makes a partial fix read as complete.
+    raw64(str) = replace(replace(replace(Base64.base64encode(Vector{UInt8}(codeunits(str))), '+' => '-'), '/' => '_'), '=' => "")
+    good_claims = b64json(payload)
+    good_header = b64json(Dict("alg" => "HS256", "typ" => "JWT"))
+    # Note which sink each case actually reaches -- `base64decode("!!!!")` and
+    # `base64decode("")` do NOT throw, they return bytes that then fail to parse, so four
+    # of these five land on `JSON.parse`. Only an UNPADDABLE length reaches base64decode's
+    # own throw, which is why "header unpaddable" is here and not folded into the first row.
+    malformed = [
+        ("header unpaddable",     string("x", ".", good_claims, ".x")),      # -> base64decode
+        ("header bad alphabet",   string("!!!!", ".", good_claims, ".x")),   # -> JSON.parse
+        ("header not JSON",       string(raw64("foo"), ".", good_claims, ".x")),
+        ("header truncated JSON", string(raw64("{\"alg\":"), ".", good_claims, ".x")),
+        ("header empty",          string("", ".", good_claims, ".x")),
+        ("claims not JSON",       string(good_header, ".", raw64("foo"), ".x")),
+    ]
+    for (label, tok) in malformed, v in (true, false)
+        err = caught(() -> Nitro.Auth.decode_jwt(tok, secret; verify=v))
+        @test (label, v, err isa Nitro.Auth.AuthError) == (label, v, true)
+        # Pin the message, like every other assertion in this testset: `err isa AuthError`
+        # alone is satisfied by any rejection, including one for the wrong reason.
+        @test (label, v, occursin("Invalid JWT encoding", sprint(showerror, err))) == (label, v, true)
+    end
+
+    # The sharpest instance, and the one that is NOT length-independent: a well-formed
+    # header and claims with a one-character signature segment. `_base64url_decode("x")`
+    # pads to "x===", which `base64decode` refuses -- on the authenticated path. The
+    # four-character case is the contrast that makes the point: it decodes fine and reaches
+    # the comparison, so it was ALREADY a clean AuthError before this change (a pin), while
+    # the one-character case escaped as ArgumentError (a guard).
+    #
+    # The two carry different messages on purpose. An undecodable signature is what a
+    # TRUNCATED token looks like -- a cookie past the 4KB limit, a proxy trimming a header --
+    # and sending the operator to check transport rather than key rotation is worth one word.
+    for (sig, want) in (("x", "Invalid JWT signature encoding"), ("!!!!", "Invalid JWT signature"))
+        err = caught(() -> Nitro.Auth.decode_jwt(string(good_header, ".", good_claims, ".", sig), secret))
+        @test (sig, err isa Nitro.Auth.AuthError) == (sig, true)
+        @test (sig, sprint(showerror, err)) == (sig, want)
+    end
+
+    # -- An empty keyset has nothing to fall back to. `first(keys(...))` raised a
+    # BoundsError from inside `_resolve_kid`.
+    kidless = Nitro.Auth.encode_jwt(payload, secret)
+    err = caught(() -> Nitro.Auth.decode_jwt(kidless, Dict{String, String}()))
+    @test err isa Nitro.Auth.AuthError
+    @test occursin("Unknown JWT key id", sprint(showerror, err))
+
+    # -- A valid kid still resolves, and a token signed under one key is not accepted
+    # under another key's id. Also a pin on pre-existing behavior; it constrains the
+    # kid -> secret mapping, which the alg gate sits directly upstream of.
+    rotated = Nitro.Auth.encode_jwt(payload, keyset; kid="rotated")
+    claims, kid = Nitro.Auth.decode_jwt(rotated, keyset; with_kid=true)
+    @test (claims["sub"], kid) == ("42", "rotated")
+    mislabeled = signed(Dict("alg" => "HS256", "typ" => "JWT", "kid" => "default"), payload; key = "secret-b")
+    @test_throws Nitro.Auth.AuthError Nitro.Auth.decode_jwt(mislabeled, keyset)
+end
+
 @testset "Password helpers" begin
     hash = Nitro.Auth.make_password("ValidPass1!")
     @test Nitro.Auth.check_password("ValidPass1!", hash)

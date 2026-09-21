@@ -173,6 +173,55 @@ end
     @test denied_handler(req_denied).status == 403
 end
 
+@testset "A mislabeled alg is a 401 at the middleware, not a 500 (#45)" begin
+    # The upgrade entry promises that through BearerAuth the symptom of a non-HS256 `alg`
+    # is a 401. Everything else in #45 asserts on `decode_jwt` directly, so without this
+    # the promise is untested -- and `_handle_validated`'s catch-all is what turns the
+    # AuthError into a 401 rather than letting it escape as a 500.
+    validator = Nitro.Auth.jwt_validator("jwt-secret")
+    handler = BearerAuth(validator)(req -> HTTP.Response(200, "reached"))
+
+    # Hand-built so the header can lie while the HMAC stays genuinely valid -- the shape
+    # `encode_jwt` cannot produce and the shape that used to be accepted.
+    b64(d) = Nitro.Auth._base64url_encode(Vector{UInt8}(codeunits(JSON.json(d))))
+    claims = Dict("sub" => "17", "exp" => trunc(Int, time()) + 60)
+    function mint(alg)
+        input = string(b64(Dict("alg" => alg, "typ" => "JWT")), ".", b64(claims))
+        return string(input, ".", Nitro.Auth._base64url_encode(Nitro.Auth._hmac_sha256("jwt-secret", input)))
+    end
+
+    # Control: identical machinery, honest label -> the request goes through, so a 401
+    # below cannot be blamed on the hand-rolled signing.
+    ok = HTTP.Request("GET", "/x", ["Authorization" => "Bearer $(mint("HS256"))"])
+    @test handler(ok).status == 200
+
+    for alg in ("RS256", "none")
+        req = HTTP.Request("GET", "/x", ["Authorization" => "Bearer $(mint(alg))"])
+        res = handler(req)
+        @test (alg, res.status) == (alg, 401)
+    end
+
+    # Everything below this line is a PIN, not a guard, and it is worth stating once rather
+    # than per-assertion: at the middleware level a malformed token can only ever prove
+    # "not a 500". `_handle_validated`'s catch-all erases the exception type, so a
+    # MethodError, an ArgumentError and an AuthError all arrive as the same 401 -- these
+    # cases were 401 before #45 too. The alg cases ABOVE are categorically different and do
+    # discriminate, because there the pre-fix behavior was 200.
+    #
+    # They earn their place anyway: a 500 is what a reader fears from a hand-built token,
+    # and nothing else in the suite asserts it cannot happen through the middleware.
+    bad = HTTP.Request("GET", "/x", ["Authorization" => "Bearer W10.W10.x"])
+    @test handler(bad).status == 401
+
+    # A well-formed header and claims with one junk character of signature -- what a
+    # truncated token looks like. Built by replacing the third segment so the token keeps
+    # exactly three.
+    segs = split(mint("HS256"), '.')
+    truncated = join([segs[1], segs[2], "x"], '.')
+    bad_sig = HTTP.Request("GET", "/x", ["Authorization" => "Bearer $truncated"])
+    @test handler(bad_sig).status == 401
+end
+
 @testset "Keyset auth: kid_required authorization" begin
     keyset = Dict("service-a" => "ka-secret", "service-b" => "kb-secret")
     validator = Nitro.Auth.jwt_validator(keyset; identity_from=:kid)
