@@ -3405,6 +3405,38 @@ end
     end
 end
 
+@testset "the recovery scan is an optional store method with a working default (#236)" begin
+    started = DateTime(2026, 1, 2, 3, 4, 5)
+    seed_rows!(store_rows) = begin
+        running = TaskInfo("scan-running"); running.status = RUNNING; running.started_at = started
+        pending = TaskInfo("scan-pending")
+        done = TaskInfo("scan-done"); done.status = COMPLETED
+        for t in (running, pending, done)
+            store_rows[t.id] = t
+        end
+        running
+    end
+
+    # The in-memory backend implements it, and reports only RUNNING records, with the run id
+    # the fenced transition is addressed to and the start time.
+    mem = InMemoryWorkerStore()
+    running = lock(() -> seed_rows!(mem.task_registry), mem.task_lock)
+    @test Nitro.Core.Errors.implements_contract_method(list_running_task_refs, InMemoryWorkerStore, AbstractWorkerStore, 1)
+    @test list_running_task_refs(mem) == [RunningTaskRef((running.id, running.run_id, started))]
+
+    # A backend that never heard of it still conforms, and still recovers: the default reads the
+    # listing. Adding it as a REQUIRED row would have broken every third-party store for a method
+    # whose whole purpose is an optimization.
+    legacy = DataOnlyStore()
+    legacy_running = seed_rows!(legacy.rows)
+    @test isempty(missing_store_methods(DataOnlyStore))
+    @test !(:list_running_task_refs in [nameof(f) for (f, _) in Nitro.Workers.WORKER_STORE_INTERFACE])
+    @test !Nitro.Core.Errors.implements_contract_method(list_running_task_refs, DataOnlyStore, AbstractWorkerStore, 1)
+    @test list_running_task_refs(legacy) == [RunningTaskRef((legacy_running.id, legacy_running.run_id, started))]
+    @test recover_zombie_tasks!(; runtime=WorkerRuntime(legacy)) == 1
+    @test legacy.rows["scan-running"].status == FAILED
+end
+
 @testset "cancel_task is atomic: completed task result is never overwritten" begin
     store = InMemoryWorkerStore()
     rt_store = WorkerRuntime(store)

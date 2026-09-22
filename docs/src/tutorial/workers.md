@@ -922,6 +922,13 @@ the handle of a run it could not finish, restarting a **reused** runtime no long
 `FAILED`. A restart that builds a *new* runtime still sweeps it, because handles never cross
 runtimes — which is also why a genuine crash is still recovered.
 
+The sweep reads only three columns of each `RUNNING` record (its id, run id and start time),
+through the store method `list_running_task_refs`. It never deserializes a task's `result` or
+`watchers`, so a record with a malformed blob is still recovered rather than hiding every other
+zombie behind it. If that read fails, the sweep logs the error and recovers nothing on this boot.
+Startup carries on either way. A custom store that does not implement `list_running_task_refs`
+still works: the default derives it from `get_all_tasks`, at the cost of a full read of each record.
+
 ## When Not To Use Workers
 
 Do not use `InMemoryWorkerStore` for jobs that must survive server restarts. For durable in-process queues, always configure the `PormGWorkerStore` extension.

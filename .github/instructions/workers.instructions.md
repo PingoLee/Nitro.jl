@@ -134,9 +134,17 @@ store cannot run anything.
 **A new backend implements no teardown method at all.** `shutdown!` is a concrete method on
 `WorkerRuntime`, so there is no fallback to forget — which is what closes
 [#29](https://github.com/PingoLee/Nitro.jl/issues/29) as a *class* rather than an instance. Two
-optional store methods exist, both no-op by default: `clear_records!` (volatile backends only;
-`reset_runtime!` calls it, and the default must stay a no-op so a reset can never delete durable
-rows) and nothing else.
+optional store methods exist, and neither is a `WORKER_STORE_INTERFACE` row, so `missing_store_methods`
+never lists them:
+
+- `clear_records!`: volatile backends only. `reset_runtime!` calls it, and the default must stay a
+  no-op so a reset can never delete durable rows.
+- `list_running_task_refs`: the zombie-recovery scan
+  ([#236](https://github.com/PingoLee/Nitro.jl/issues/236)). The default derives it from
+  `get_all_tasks`, which is correct but deserializes every `RUNNING` record in full. A serializing
+  backend implements it as a projection of `id`, `run_id` and `started_at`. It must **rethrow** a
+  read failure: an empty result means "nothing to recover", so a swallowed error would pass for a
+  clean sweep.
 
 **`get_task_info(store, id)` is the DURABLE read.** A store must not cache live objects. Serving a
 running callback's own object to a reader is `get_task_info(runtime, id)`, and the split is

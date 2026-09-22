@@ -115,7 +115,14 @@ mutable struct MockTaskQuerySet
     # Per-queryset, and deliberately NOT under the lock: `model.objects` mints a fresh queryset
     # on every access, so an accumulating chain is confined to the task that built it.
     filters::Dict{String, Any}
+    # `.values(cols...)`, or `nothing` for every column. Like PormG's `_values!`, the last call
+    # wins. A projected read hands back ONLY these keys, which is what makes "the recovery scan
+    # never parses `result`" observable: a row whose blob is not JSON is harmless to it (#236).
+    projection::Union{Nothing, Vector{String}}
 end
+
+MockTaskQuerySet(mdb::MockDB, db_key, filters::Dict{String, Any}) =
+    MockTaskQuerySet(mdb, db_key, filters, nothing)
 
 _mock_lock(qs::MockTaskQuerySet) = getfield(qs, :mdb).lock
 
@@ -216,6 +223,12 @@ end
 # string, not a vector. Put a mutable value in a column and this quietly becomes an alias again.
 _snapshot(row::Dict{String, Any}) = copy(row)
 
+function _snapshot(qs::MockTaskQuerySet, row::Dict{String, Any})
+    cols = getfield(qs, :projection)
+    cols === nothing && return _snapshot(row)
+    return Dict{String, Any}(c => row[c] for c in cols)
+end
+
 function Base.getproperty(qs::MockTaskQuerySet, name::Symbol)
     if name === :filter
         return function(pairs::Pair{String,<:Any}...)
@@ -243,17 +256,23 @@ function Base.getproperty(qs::MockTaskQuerySet, name::Symbol)
             setfield!(qs, :db_key, db_key)
             return qs
         end
+    elseif name === :values
+        return function(cols::String...)
+            # Mutate-and-return-self, like `filter` and `db`.
+            setfield!(qs, :projection, collect(String, cols))
+            return qs
+        end
     elseif name === :list
         return function()
             return lock(_mock_lock(qs)) do
-                Dict{String,Any}[_snapshot(r) for r in _filtered_rows_locked(qs)]
+                Dict{String,Any}[_snapshot(qs, r) for r in _filtered_rows_locked(qs)]
             end
         end
     elseif name === :first
         return function()
             return lock(_mock_lock(qs)) do
                 rows = _filtered_rows_locked(qs)
-                isempty(rows) ? nothing : _snapshot(first(rows))
+                isempty(rows) ? nothing : _snapshot(qs, first(rows))
             end
         end
     elseif name === :create
@@ -417,6 +436,10 @@ function Base.getproperty(qs::FlakyReadQuerySet, name::Symbol)
         return (key::String) -> FlakyReadQuerySet(inner.db(key), fail_next, fail_ids)
     elseif name === :filter
         return (pairs::Pair{String,<:Any}...) -> FlakyReadQuerySet(inner.filter(pairs...), fail_next, fail_ids)
+    elseif name === :values
+        # Re-wrapped like `filter`: falling through to `inner` here would hand back the bare
+        # queryset, and the `.list()` after a projection would bypass the guard entirely.
+        return (cols::String...) -> FlakyReadQuerySet(inner.values(cols...), fail_next, fail_ids)
     elseif name === :first
         return function()
             _flaky_guard(qs)
@@ -1002,6 +1025,70 @@ else
             persisted = get_task_info(store_z, "alice::job")
             @test persisted.status == COMPLETED
             @test persisted.result == "real-result"
+        end
+
+        @testset "zombie recovery reads a projection, so a malformed blob cannot blind it (#236)" begin
+            m = MockTaskModel()
+            store_b = RealPormGWorkerStore(model=m)
+            rt_b = WorkerRuntime(store_b)
+
+            for id in ("alice::good", "alice::bad")
+                t = TaskInfo(id)
+                push!(t.watchers, "alice")
+                t.status = RUNNING
+                replace_task!(store_b, id, t)
+            end
+            bad_run = get_task_info(store_b, "alice::bad").run_id
+            # Corrupt both blobs the full deserializer parses, behind the store's back -- the
+            # way an app-side write or a hand edit would leave them. Direct table access is safe
+            # here: nothing is in flight.
+            m._table["alice::bad"]["result"] = "{not json"
+            m._table["alice::bad"]["watchers"] = "also not json"
+
+            # The premise, pinned. The listing parses every row, and swallows the one that fails
+            # into an EMPTY result, so a sweep built on it saw no candidates at all -- the good
+            # zombie stranded alongside the bad one.
+            @test isempty(@test_logs (:warn, r"failed to list tasks") match_mode=:any get_all_tasks(store_b, System(); status=RUNNING))
+
+            refs = list_running_task_refs(store_b)
+            @test refs isa Vector{RunningTaskRef}
+            @test sort([r.id for r in refs]) == ["alice::bad", "alice::good"]
+            @test only(filter(r -> r.id == "alice::bad", refs)).run_id == bad_run
+
+            @test recover_zombie_tasks!(; runtime=rt_b) == 2
+            @test m._table["alice::good"]["status"] == "FAILED"
+            @test m._table["alice::bad"]["status"] == "FAILED"
+        end
+
+        @testset "a RUNNING row whose run_id does not parse is skipped, not guessed at (#236)" begin
+            m = MockTaskModel()
+            store_u = RealPormGWorkerStore(model=m)
+            t = TaskInfo("alice::unfenceable")
+            t.status = RUNNING
+            replace_task!(store_u, t.id, t)
+            m._table[t.id]["run_id"] = "not-a-uuid"
+
+            refs = @test_logs (:warn, r"run_id does not parse") list_running_task_refs(store_u)
+            @test isempty(refs)
+        end
+
+        @testset "a failed recovery read is logged and costs the sweep, not the boot (#236)" begin
+            flaky = FlakyReadModel()
+            store_f = RealPormGWorkerStore(model=flaky)
+            rt_f = WorkerRuntime(store_f)
+            t = TaskInfo("alice::stranded")
+            t.status = RUNNING
+            replace_task!(store_f, t.id, t)
+
+            flaky.fail_next[] = 1
+            # The listing used to swallow this into "no candidates", indistinguishable from a
+            # clean sweep. It now surfaces as an @error, and startup still carries on.
+            recovered = @test_logs (:warn, r"failed to list running tasks") (:error, r"zombie recovery could not read") match_mode=:any recover_zombie_tasks!(; runtime=rt_f)
+            @test recovered == 0
+            @test flaky._table[t.id]["status"] == "RUNNING"
+
+            # The failure was transient, so the next sweep recovers it.
+            @test recover_zombie_tasks!(; runtime=rt_f) == 1
         end
 
         @testset "a cross-process grantee still sees live progress (#96)" begin

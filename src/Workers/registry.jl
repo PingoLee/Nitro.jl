@@ -52,9 +52,15 @@ processor tasks, the cleanup scheduler, and the process-local run handles belong
 cannot leak them by forgetting a teardown method, which is what
 [#29](https://github.com/PingoLee/Nitro.jl/issues/29) was. There is no `shutdown!` to implement.
 
-One optional method exists, and its default is a no-op: `clear_records!(store)`, which
-[`reset_runtime!`](@ref) calls. Only a volatile backend should implement it — for a durable one
-the registry is rows that outlive the process, so the no-op default is the safe direction.
+Two optional methods exist, and neither is in the table above because each has a working default:
+
+- `clear_records!(store)`, which [`reset_runtime!`](@ref) calls. The default is a no-op. Only a
+  volatile backend should implement it — for a durable one the registry is rows that outlive the
+  process, so the no-op default is the safe direction.
+- [`list_running_task_refs`](@ref)`(store)`, the zombie-recovery scan. The default derives it from
+  `get_all_tasks`, which is correct but deserializes every `RUNNING` record in full; a serializing
+  backend should implement it as a projection
+  ([#236](https://github.com/PingoLee/Nitro.jl/issues/236)).
 
 # Obligations that are not methods
 
@@ -210,6 +216,38 @@ function try_transition! end
 function delete_task! end
 function cleanup_tasks! end
 function get_all_tasks end
+
+"""
+    RunningTaskRef
+
+What zombie recovery needs to know about one `RUNNING` record, and nothing more: its `id`, the
+`run_id` a fenced [`try_transition!`](@ref) is addressed to, and the `started_at` its run claimed
+it at (`nothing` when the record carries none).
+"""
+const RunningTaskRef = @NamedTuple{id::String, run_id::UUID, started_at::Union{Nothing, DateTime}}
+
+_running_ref(task::TaskInfo) = RunningTaskRef((task.id, task.run_id, task.started_at))
+
+"""
+    list_running_task_refs(store) -> Vector{RunningTaskRef}
+
+Every `RUNNING` record, as a [`RunningTaskRef`](@ref): the scan behind
+[`recover_zombie_tasks!`](@ref).
+
+**Optional.** The default below derives the refs from `get_all_tasks(store, System();
+status=RUNNING)`, so a backend that does not implement this still recovers its zombies. It just
+pays for the listing API to do it, and the listing materializes every record in full.
+Recovery asks a three-column question, and a serializing store answering it through the listing
+deserializes each row's `result` and `watchers` only to throw them away
+([#236](https://github.com/PingoLee/Nitro.jl/issues/236)). A backend that serializes should
+implement this as a projection of those three columns.
+
+It is a **recovery scan, not a listing**: it takes no `TaskAuthority` and hands out no record
+contents, only the identity a fenced transition needs. Do not build a user-facing surface on it.
+"""
+function list_running_task_refs(store::AbstractWorkerStore)
+    return RunningTaskRef[_running_ref(task) for task in get_all_tasks(store, System(); status=RUNNING)]
+end
 
 function get_queue_authorizer end
 function set_queue_authorizer! end
@@ -561,6 +599,14 @@ function get_all_tasks(store::InMemoryWorkerStore, authority::TaskAuthority; sta
             push!(tasks, task_info)
         end
         return tasks
+    end
+end
+
+# Implemented rather than left to the default for parity with `PormGWorkerStore`, not for speed:
+# the registry is already in RAM, so the default's listing would cost the same Dict scan.
+function list_running_task_refs(store::InMemoryWorkerStore)
+    lock(store.task_lock) do
+        return RunningTaskRef[_running_ref(t) for t in values(store.task_registry) if t.status == RUNNING]
     end
 end
 

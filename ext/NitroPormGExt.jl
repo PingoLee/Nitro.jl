@@ -16,6 +16,7 @@ import Nitro.Workers: AbstractWorkerStore, TaskInfo, TaskStatus, TaskOptions,
     TaskAuthority, Owner, System, UNSUPPLIED, owner_of, _is_authorized, TASK_KEY_DELIMITER,
     get_task_info, set_task!, replace_task!, add_watcher!, try_transition!,
     delete_task!, cleanup_tasks!, get_all_tasks,
+    list_running_task_refs, RunningTaskRef,
     get_queue_authorizer, set_queue_authorizer!,
     get_error_redactor, set_error_redactor!,
     get_watch_authorizer, set_watch_authorizer!,
@@ -832,6 +833,44 @@ function get_all_tasks(store::PormGWorkerStore, authority::TaskAuthority; status
     catch e
         @warn "PormGWorkerStore: failed to list tasks" exception=(e, catch_backtrace())
         return TaskInfo[]
+    end
+end
+
+# One projected row -> a ref, or `nothing` for a row that cannot be fenced. Same symbol-or-string
+# key handling as `_from_db_record`, and deliberately none of its parsing.
+function _running_ref_from_row(row)
+    get_val = (key_sym, key_str) -> haskey(row, key_sym) ? row[key_sym] : row[key_str]
+    id = string(get_val(:id, "id"))
+    run_id = tryparse(UUIDs.UUID, string(get_val(:run_id, "run_id")))
+    if run_id === nothing
+        # Skipped, not guessed at. A fenced transition needs the row's real run id, and inventing
+        # one is the #108 defect `_from_db_record` refuses loudly. Ids only -- never row contents.
+        @warn "PormGWorkerStore: skipping a RUNNING task whose run_id does not parse; zombie recovery cannot fence it" task_id=id
+        return nothing
+    end
+    return RunningTaskRef((id, run_id, _parse_optional_db_datetime(get_val(:started_at, "started_at"))))
+end
+
+# Zombie recovery's scan (#236): a projection of exactly the three columns it reads. No row's
+# `result` or `watchers` blob is fetched, let alone parsed, and `_from_db_record` is never called.
+# Its full parse, behind `get_all_tasks`'s swallow-into-empty, is what let one malformed row
+# blind the whole sweep.
+#
+# Logs and RETHROWS, like `get_task_info`, and unlike the listing above. An empty result here
+# reads as "nothing to recover", so a swallowed read error would be indistinguishable from a
+# clean sweep, which is the silence #238 is about.
+function list_running_task_refs(store::PormGWorkerStore)
+    try
+        rows = _task_objects(store).filter("status" => string(RUNNING)).values("id", "run_id", "started_at").list()
+        refs = RunningTaskRef[]
+        for row in rows
+            ref = _running_ref_from_row(row)
+            ref === nothing || push!(refs, ref)
+        end
+        return refs
+    catch e
+        @warn "PormGWorkerStore: failed to list running tasks" exception=(e, catch_backtrace())
+        rethrow()
     end
 end
 

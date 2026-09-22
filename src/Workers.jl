@@ -43,6 +43,7 @@ export TaskStatus, PENDING, RUNNING, COMPLETED, FAILED, CANCELLED,
     # Abstract store interface
     get_task_info, set_task!, replace_task!, add_watcher!, try_transition!,
     delete_task!, cleanup_tasks!, clear_records!,
+    list_running_task_refs, RunningTaskRef,
     get_queue_authorizer, set_queue_authorizer!,
     get_error_redactor, set_error_redactor!,
     get_watch_authorizer, set_watch_authorizer!,

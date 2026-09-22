@@ -13,8 +13,13 @@ end
 Sweeps the store and transitions any tasks in `RUNNING` state that do not have an active local
 thread executing them into a `FAILED` state.
 
-Reads the **durable** listing, not the live-overlaid one: this is a decision about durable state,
-and `get_active_task` is the whole liveness criterion either way.
+Reads the **durable** records, not the live-overlaid listing: this is a decision about durable
+state, and `get_active_task` is the whole liveness criterion either way. It reads them through
+[`list_running_task_refs`](@ref), which asks only for the id, run id and start time of each
+`RUNNING` record, never through the listing API. The listing deserializes every record in full,
+and on `PormGWorkerStore` it swallowed a read error into an empty result. So one record with a
+malformed `result` blob used to make this sweep see no candidates at all
+([#236](https://github.com/PingoLee/Nitro.jl/issues/236)).
 
 Since #176 that criterion is *correct* rather than conditionally correct: `shutdown!` drains, and
 keeps the handle of a run it could not finish, so a teardown no longer manufactures zombies out of
@@ -25,7 +30,16 @@ why this stays process-local rather than trying to be authoritative.
 """
 function recover_zombie_tasks!(; runtime::WorkerRuntime=default_runtime())
     return lock_tasks(runtime) do
-        running_tasks = get_all_tasks(runtime.store, System(); status=RUNNING)
+        # A failed read costs this sweep, never the boot that runs it: before #236 the PormG
+        # listing swallowed the error into an empty result, so startup carried on regardless, and
+        # that stays true. What changes is that it now says so.
+        running_tasks = try
+            list_running_task_refs(runtime.store)
+        catch e
+            e isa InterruptException && rethrow()
+            @error "Nitro.Workers: zombie recovery could not read the RUNNING tasks; none were recovered" exception=(e, catch_backtrace())
+            return 0
+        end
         count = 0
         for task in running_tasks
             isnothing(get_active_task(runtime, task.id)) || continue
