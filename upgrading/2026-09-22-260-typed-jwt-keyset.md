@@ -56,7 +56,7 @@ rg -n -A3 'encode_jwt\(' <app>/src <app>/test | rg 'kid\s*='
 # 2. Keysets that may have no "default" entry. Check each Dict: two or more keys and no
 #    "default" is now refused, wherever it is used.
 rg -n -A6 'jwt_validator\(|decode_jwt\(|encode_jwt\(' <app>/src
-rg -n -B2 -A6 '(keys?|keyset|api_keys)\s*=\s*Dict\(' <app>/src
+rg -n -B2 -A6 '=\s*Dict(\{[^}]*\})?\(' <app>/src | rg -i 'secret|key'
 
 # 3. Direct decode_jwt calls with a Dict. Move the keyset construction to config.
 rg -n 'decode_jwt\(' <app>/src

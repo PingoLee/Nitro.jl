@@ -58,6 +58,14 @@ end
     @test kids(JWTKeyset(Dict(:default => "s1", :other => "s2"))) == ["default", "other"]
     @test kids(JWTKeyset(Dict("default" => SecretString("s1")))) == ["default"]
 
+    # A Symbol-keyed Dict resolves a String header kid end to end -- the job the deleted
+    # `_lookup_key`'s `Symbol(kid)` fallback used to do, now done once by the lift.
+    symbolic = Dict(:default => "s1", :other => "s2")
+    as_other = encode_jwt(Dict("sub" => "1"), JWTKeyset(:other => "s2"))
+    @test header_kid(as_other) == "other"
+    @test decode_jwt(as_other, symbolic; with_kid = true)[2] == "other"
+    @test jwt_validator(symbolic; identity_from = :kid)(as_other).kid == "other"
+
     msg = message(() -> JWTKeyset(Dict("primary" => "s1", "rotated" => "s2")))
     @test occursin("no \"default\"", msg) && occursin("JWTKeyset(", msg)
     @test occursin("empty", message(() -> JWTKeyset(Dict{String, String}())))

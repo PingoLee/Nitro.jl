@@ -912,9 +912,14 @@ end
         @test signer.kid == "service-a"
         @test signer.source === :kid
 
-        # A kid header on a SINGLE-SECRET token is an unverified label → never exposed
+        # A kid header on a SINGLE-SECRET token is an unverified label → never exposed.
+        # The token must actually CARRY a header kid for this to pin anything: signed with the
+        # validator's own secret, but stamped "service-b" by a one-key keyset.
         single_validator = Nitro.Auth.jwt_validator("secret-a")
-        spoofable = single_validator(Nitro.Auth.encode_jwt(Dict("sub" => "9"), "secret-a"; expires_in=3600))
+        labelled = Nitro.Auth.encode_jwt(Dict("sub" => "9"), Nitro.Auth.JWTKeyset("service-b" => "secret-a");
+                                         expires_in=3600)
+        @test Nitro.Auth.decode_jwt(labelled, "secret-a"; with_kid=true)[2] == "service-b"
+        spoofable = single_validator(labelled)
         @test spoofable.kid === nothing
     end
 

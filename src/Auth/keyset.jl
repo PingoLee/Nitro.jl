@@ -76,6 +76,8 @@ encode_jwt(claims, outbound; expires_in = 60)
 `show` and `JSON.lower` report key ids and roles only, never a secret.
 """
 struct JWTKeyset
+    # Internal. The constructor's invariants hold only for what it built; code that mutates
+    # these containers directly is outside the contract, like reflection on a SecretString.
     keys::Vector{JWTKey}         # keys[1] signs; the rest are sorted by kid
     index::Dict{String, Int}
 

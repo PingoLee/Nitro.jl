@@ -7,6 +7,11 @@
   reports a different value for kid-less tokens, and `jwt_validator` gains a construction-time
   `ArgumentError`. No app *has* to change, but three things an app may depend on moved.
 
+> **Read with [#260](2026-09-22-260-typed-jwt-keyset.md), in the same train.** The trial
+> behavior below stands, but #260 moved these checks into `JWTKeyset` and refuses a multi-key
+> `Dict` with no `"default"` entry — so the keysets in the snippets below now name the key that
+> signs.
+
 ### What changed
 
 `decode_jwt` used to resolve a kid-less token to exactly one key — the keyset's `"default"` entry,
@@ -32,14 +37,14 @@ Three consequences:
 
    Related, same guard: it is the first code in `jwt_validator` to inspect keyset **values**, so
    a keyset whose values are not `String`s now fails at construction with a named `ArgumentError`
-   instead of surfacing later. Unwrap a `SecretString` before building the validator.
+   instead of surfacing later. (Since #260 a `SecretString` value is accepted as is.)
 
    One of those shapes was worse than a bad error message. `Vector{UInt8}` values used to be
    *accepted*: `String(::Vector{UInt8})` takes ownership of the buffer and leaves it empty, so
    reading the keyset blanked every secret in the caller's own `Dict` — after which a token signed
    with the empty string authenticated as any `kid`. That shape is now refused before anything
-   reads it. The same trap still exists for code calling `decode_jwt` directly with a byte-vector
-   keyset; tracked separately.
+   reads it. Code calling `decode_jwt` directly with a byte-vector keyset kept the trap until
+   #260, which refuses the shape on every path.
 
    A keyset whose **keys** are neither `String` nor `Symbol` (an integer-keyed `Dict`) is also
    refused now — no key id could ever resolve, so every request was a 401 with no startup signal.
@@ -74,16 +79,16 @@ Most apps need no edit. These three do:
 ```julia
 # ✗ before -- two names, one secret. Silently resolved to whichever came first.
 keyset = Dict(
-    "primary" => required_env("JWT_SECRET"),
+    "default" => required_env("JWT_SECRET"),
     "legacy"  => required_env("JWT_SECRET"),
 )
 jwt_validator(keyset)   # ✓ before -- built fine
                         # ✗ after  -- ArgumentError at startup
 
-# ✓ after -- give them distinct secrets
-keyset = Dict(
-    "primary" => required_env("JWT_SECRET_PRIMARY"),
-    "legacy"  => required_env("JWT_SECRET_LEGACY"),
+# ✓ after -- give them distinct secrets (and, per #260, say which key signs)
+keyset = JWTKeyset(
+    "primary" => required_env("JWT_SECRET_PRIMARY");
+    verify = ["legacy" => required_env("JWT_SECRET_LEGACY")],
 )
 ```
 
