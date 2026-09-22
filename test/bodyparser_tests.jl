@@ -407,3 +407,161 @@ end
 end
 
 end
+
+# -- #254 -----------------------------------------------------------------------------------
+#
+# The unauthenticated half of #254, tested against a REAL `StackOverflowError` -- the only way
+# to test this site honestly.
+#
+# A synthetic `throw(StackOverflowError())` works for the auth middleware because the thing it
+# guards is a user callback, so the throw originates inside the guarded block. It does NOT work
+# here: `_request_payload`/`text` run *outside* the `try`, and the guarded expression is
+# `JSON.parse` itself. Anything faked from the outside throws before the catch and would pass
+# identically against the unpatched code -- test theater. The real trigger is the only trigger.
+#
+# Which means the hazard the issue warns about is real: after a stack overflow Julia reports
+# "program state may be corrupted", and a ReTestItems worker is reused by every item scheduled
+# after this one. So it runs in a **disposable subprocess**. The corruption is confined to a
+# process that exits immediately, and the parent asserts on its output.
+#
+# The child script carries NO backslash-escaped quote on purpose. Julia's `raw"""` is raw about
+# every backslash EXCEPT one before a quote, so an escaped-quote JSON literal written here
+# arrives at the child with the backslashes gone and dies on a parse error that says nothing
+# about this test. `[1]` is valid JSON needing no inner quote, so the question does not arise.
+@testitem "Body parsers -- a deeply-nested body is not swallowed (#254)" tags=[:core, :network, :slow] setup=[NitroCommon] begin
+using Nitro
+
+script = raw"""
+using Nitro, HTTP, Sockets, Base64
+
+# ~20 KB -- well inside any default body limit, and deep enough that JSON.parse exhausts the
+# stack. This is the whole attack: no credentials, no unusual size, any route.
+deep = repeat("[", 10_000) * repeat("]", 10_000)
+
+# 1. The parser itself.
+req = HTTP.Request("POST", "/j", ["Content-Type" => "application/json"], deep)
+try
+    r = json(req)
+    println("PARSER=SWALLOWED:", r === nothing)
+catch e
+    println("PARSER=PROPAGATED:", typeof(e))
+end
+
+# 2. The memoizing accessor handlers actually call.
+req2 = HTTP.Request("POST", "/j", ["Content-Type" => "application/json"], deep)
+try
+    r = getjson(req2)
+    println("ACCESSOR=SWALLOWED:", r === nothing)
+catch e
+    println("ACCESSOR=PROPAGATED:", typeof(e))
+end
+
+# 2b. Scalar path/query parameters. `parseparam` tries `parse(T, str)` first and falls
+# through to `JSON.parse(str, T)`, so this fires for an ordinary `Int` parameter -- the
+# route shape `path("/p/<int:n>", …)` produces. Called directly rather than over a socket
+# because a 20 KB URI is a transport question, not the one under test.
+try
+    Nitro.parseparam_checked(Int, deep, "n", :query)
+    println("SCALAR=SWALLOWED")
+catch e
+    println("SCALAR=PROPAGATED:", typeof(e))
+end
+
+# 3. End to end over a real socket: the defect was that the handler went on to serve a normal
+# 200 off a worker Julia had just declared possibly corrupt.
+app = App(mod = @__MODULE__)
+urlpatterns(app, "",
+    path("/j", req -> Res.json(Dict("parsed" => getjson(req) !== nothing)); method="POST"),
+    # #254 finding: an extractor route resolves through the same parser, but `safe_extract`
+    # used to relabel the rethrow as a `ValidationError` -> 400. Same input must not produce
+    # two different verdicts depending on how the handler reads the body.
+    path("/x", (req, body::Json{Dict{String,Any}}) -> Res.json(Dict("ok" => true)); method="POST"),
+)
+
+# Pick a free port rather than a literal: :network items in this suite never pin one, because
+# a fixed port turns a parallel run into a flake.
+probe = Sockets.listen(Sockets.InetAddr(Sockets.ip"127.0.0.1", 0))
+port = Sockets.getsockname(probe)[2]
+close(probe)
+
+serve(app; port=port, async=true, show_banner=false)
+sleep(2)
+resp = HTTP.post("http://127.0.0.1:$port/j", ["Content-Type" => "application/json"], deep;
+                 status_exception=false, request_timeout=20, retry=false)
+println("SERVED=", resp.status)
+
+# The server must still be answering afterwards -- "louder" must not mean "dead".
+ok = HTTP.post("http://127.0.0.1:$port/j", ["Content-Type" => "application/json"], "[1]";
+               status_exception=false, request_timeout=20, retry=false)
+println("NEXT=", ok.status)
+xr = HTTP.post("http://127.0.0.1:$port/x", ["Content-Type" => "application/json"], deep;
+               status_exception=false, request_timeout=20, retry=false)
+println("EXTRACTOR=", xr.status)
+terminate(app)
+
+# 4. The AUTH half of #254, end to end -- the claim the issue, both docstrings, the tutorial
+# and the upgrade entry all rest on. The synthetic throws in the auth testitem prove the catch
+# block dispatches; only this proves a real bearer token gets there.
+#
+# LAST on purpose. Unlike the `SERVED=`/`EXTRACTOR=` overflows, which happen on server request
+# tasks, this one lands on the child's own ROOT task -- the task that would then be driving
+# every later assertion, in a process Julia has just called possibly corrupt. Running it after
+# everything else keeps that hazard from reaching the other checks, which is the same reason
+# this whole item is a subprocess in the first place.
+hdr = replace(base64encode(deep), "+" => "-", "/" => "_", "=" => "")
+token = hdr * ".ey.AAAA"
+bearer = BearerAuth(t -> Nitro.Auth.decode_jwt(t, "secret"))(r -> Res.json(Dict("ok" => true)))
+authreq = HTTP.Request("GET", "/")
+HTTP.setheader(authreq, "Authorization" => "Bearer " * token)
+try
+    r = bearer(authreq)
+    println("AUTH=SWALLOWED:", r.status)
+catch e
+    println("AUTH=PROPAGATED:", typeof(e))
+end
+"""
+
+# `--code-coverage=none` explicitly, matching test/extensions/pormg_env_tests.jl: CI runs
+# `julia-actions/julia-runtest` with its default `coverage: true`, and `Base.julia_cmd()`
+# propagates that flag. Inheriting it costs the child its pkgimages, so it reloads all of
+# Nitro from source -- and `test/runtests.jl` sets `nworkers = 0` under coverage, which is
+# the one configuration where `testitem_timeout` does not apply, so a slow or wedged child
+# would have no ceiling at all (#84). Everything else must come FROM `julia_cmd()`, notably
+# `--check-bounds=yes`, or the child lands in a different cache and recompiles anyway.
+out = read(`$(Base.julia_cmd()) --code-coverage=none --project=$(Base.active_project()) --startup-file=no -e $script`, String)
+
+@test contains(out, "PARSER=PROPAGATED:StackOverflowError")
+@test contains(out, "ACCESSOR=PROPAGATED:StackOverflowError")
+# Scalar parameters take the same fall-through into JSON.parse, and used to answer 400.
+@test contains(out, "SCALAR=PROPAGATED:StackOverflowError")
+# Not a 200. The old behaviour served one, having quietly discarded the overflow.
+@test contains(out, "SERVED=500")
+# The auth half, against a real token rather than a synthetic throw.
+@test contains(out, "AUTH=PROPAGATED:StackOverflowError")
+# And the worker keeps serving -- this is what makes rethrowing the safe choice rather than
+# merely the loud one.
+@test contains(out, "NEXT=200")
+# Not 400: `safe_extract` must not relabel a corrupted worker as a client mistake.
+@test contains(out, "EXTRACTOR=500")
+end
+
+# `formdata` and `multipart` take the same narrowing, and deliberately ship WITHOUT a dedicated
+# test: neither `HTTP.queryparams` nor `HTTP.parse_multipart_form` parses recursively, so no
+# request input reaches their guarded block with any of the three types, and the only test that
+# could be written would pass against the unpatched code too. They are covered by
+# `is_unrecoverable`'s own contract and by the regression testitem below, which pins the half
+# that CAN break -- that ordinary malformed input still yields the empty default.
+@testitem "Body parsers -- malformed input still yields the empty default (#254)" tags=[:core] setup=[NitroCommon] begin
+using HTTP
+using Nitro
+
+@test json(HTTP.Request("POST", "/j", [], "not json at all")) === nothing
+@test json(HTTP.Request("POST", "/j", [], "{\"a\": ")) === nothing
+@test json(HTTP.Request("POST", "/j", [], "{\"a\":1}")) == Dict("a" => 1)
+
+@test formdata(HTTP.Request("POST", "/f", [], "no-equals-sign")) == Dict{String,String}()
+@test formdata(HTTP.Request("POST", "/f", [], "a=1&b=2")) == Dict("a" => "1", "b" => "2")
+
+@test isempty(multipart(HTTP.Request("POST", "/m",
+    ["Content-Type" => "multipart/form-data; boundary=xyz"], "garbage")))
+end

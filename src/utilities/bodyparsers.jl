@@ -3,6 +3,7 @@ module BodyParsers
 using HTTP 
 using JSON
 using ..Util
+using ...Errors: is_unrecoverable
 
 export text, binary, json, formdata, multipart, FormFile
 
@@ -82,7 +83,10 @@ function formdata(req::HTTP.Request) :: Dict{String,String}
     end
     try
         return HTTP.queryparams(body)
-    catch
+    catch e
+        # An unparseable form is "no form", which is this function's contract. A corrupted
+        # process is not (#254) -- see `is_unrecoverable` (src/errors.jl).
+        is_unrecoverable(e) && rethrow()
         return copy(EMPTY_FORM_DATA)
     end
 end
@@ -94,7 +98,9 @@ function formdata(res::HTTP.Response) :: Dict{String,String}
     end
     try
         return HTTP.queryparams(body)
-    catch
+    catch e
+        # Same narrowing as the `Request` method above (#254).
+        is_unrecoverable(e) && rethrow()
         return copy(EMPTY_FORM_DATA)
     end
 end
@@ -133,7 +139,15 @@ function json(req::HTTP.Request; kwargs...)
     end
     try
         return JSON.parse(IOBuffer(payload); kwargs...)
-    catch
+    catch e
+        # `nothing` means "the body was not JSON", and that is the whole contract here.
+        #
+        # It used to also mean "the body was 20 KB of `[[[[…`, `JSON.parse` blew the stack,
+        # and Julia says program state may be corrupted" -- swallowed, unlogged, on a route
+        # needing no credentials at all, after which the handler served a normal 200 off
+        # that worker (#254). This is the same defect as the auth middleware's, one layer
+        # out and reachable by anyone.
+        is_unrecoverable(e) && rethrow()
         return nothing
     end
 end
@@ -145,7 +159,11 @@ function json(res::HTTP.Response; kwargs...)
     end
     try
         return JSON.parse(IOBuffer(payload); kwargs...)
-    catch
+    catch e
+        # Same narrowing as the `Request` method above (#254). This one reads a RESPONSE
+        # body, so it is not the attacker-reachable path -- it is here because the contract
+        # ("not JSON" -> `nothing`) is the same and the two must not drift.
+        is_unrecoverable(e) && rethrow()
         return nothing
     end
 end
@@ -208,7 +226,9 @@ function multipart(req::HTTP.Request) :: Dict{String, Union{FormFile, Vector{For
 
     parts = try
         HTTP.parse_multipart_form(req)
-    catch
+    catch e
+        # A malformed multipart body is "no parts"; a corrupted process is not (#254).
+        is_unrecoverable(e) && rethrow()
         return result
     end
 

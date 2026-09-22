@@ -7,6 +7,7 @@ using Base64
 using ...Types: CookieConfig, Nullable
 using ...Cookies: get_cookie, set_cookie!
 using ...Crypto: secure_random_bytes
+using ...Errors: is_unrecoverable
 using ...Res: json
 using ...Core: own_response_headers, getjson, getform
 
@@ -161,7 +162,10 @@ function _presented_token(req::HTTP.Request, header_name::String, form_field::St
 
     form = try
         getform(req)
-    catch
+    catch e
+        # A body that will not parse carries no CSRF token, which is a 403 either way. A
+        # corrupted process is not a missing token (#254).
+        is_unrecoverable(e) && rethrow()
         nothing
     end
     if form isa AbstractDict
@@ -174,7 +178,8 @@ function _presented_token(req::HTTP.Request, header_name::String, form_field::St
 
     json = try
         getjson(req)
-    catch
+    catch e
+        is_unrecoverable(e) && rethrow()
         nothing
     end
     if json isa AbstractDict

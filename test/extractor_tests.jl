@@ -825,3 +825,55 @@ end
 end
 
 end
+
+
+# -- #254 -----------------------------------------------------------------------------------
+#
+# The `Session` extractor looks a session id up in an application-supplied store through a
+# `Base.get` the store owns. "It threw" therefore means "no session for this id", and the
+# extractor falls back to an empty `Session` -- right for a store that is down or picky, wrong
+# for the three conditions the runtime raises about itself.
+#
+# Synthetic throws are honest here, unlike in the body parsers: the guarded expression IS the
+# user callback, so `throw(StackOverflowError())` from the store originates inside the `try`
+# exactly where a real one would.
+@testitem "Session extractor -- unrecoverable errors are not swallowed (#254)" tags=[:core] setup=[NitroCommon] begin
+using HTTP
+using Nitro
+using Nitro: LazyRequest, Param, Session, extract
+
+struct ThrowingStore
+    ex::Exception
+end
+Base.get(s::ThrowingStore, ::String, ::Any) = throw(s.ex)
+
+struct FakeContext
+    payload::Any
+end
+
+function session_param()
+    return Param{Session{Dict{String,Any}}}(:s, Session{Dict{String,Any}}, Session("session", Dict{String,Any}), true)
+end
+
+function request_with_session_cookie()
+    req = HTTP.Request("GET", "/")
+    HTTP.setheader(req, "Cookie" => "session=abc123")
+    return LazyRequest(request=req)
+end
+
+@testset "propagates $(typeof(ex))" for ex in (InterruptException(), StackOverflowError(), OutOfMemoryError())
+    ctx = FakeContext(ThrowingStore(ex))
+    @test_throws typeof(ex) extract(session_param(), request_with_session_cookie(), nothing, ctx)
+end
+
+# The contract that must not regress: an ordinary store failure is still an empty session, not
+# an exception reaching the handler.
+@testset "an ordinary store failure still yields an empty session" begin
+    for ex in (ErrorException("db down"), KeyError(:nope), ArgumentError("bad id"))
+        ctx = FakeContext(ThrowingStore(ex))
+        result = extract(session_param(), request_with_session_cookie(), nothing, ctx)
+        @test result.payload === nothing
+        @test result.name == "session"
+    end
+end
+end

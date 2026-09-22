@@ -199,3 +199,72 @@ terminate()
 
 
 end
+# ── #254 ────────────────────────────────────────────────────────────────────────────────────
+#
+# Deliberately a SEPARATE testitem, and deliberately NOT tagged `:network`: every assertion
+# calls the middleware closure directly, so it binds no socket and the `--skip-tags network`
+# fast pass over the suite covers it.
+#
+# These all throw the exception SYNTHETICALLY rather than exhausting a real stack. That is not
+# a shortcut around a hazard, it is the correct test: the narrowing is `isa` dispatch inside a
+# catch block, so `throw(StackOverflowError())` exercises the identical branch, while a real
+# stack overflow would leave the ReTestItems worker in the state Julia itself describes as
+# "possibly corrupted" — poisoning every item scheduled after it in that process. The
+# end-to-end path (a real `[[[[…` bearer token through `jwt_validator`) is verified outside
+# the suite, in a disposable process; see the PR.
+@testitem "Auth middleware — unrecoverable errors are not swallowed (#254)" tags=[:middleware, :auth] setup=[NitroCommon] begin
+using HTTP
+using Nitro
+
+# The three conditions the runtime raises about ITSELF, not about the token.
+const UNRECOVERABLE = (InterruptException(), StackOverflowError(), OutOfMemoryError())
+
+@testset "BearerAuth propagates $(typeof(ex))" for ex in UNRECOVERABLE
+    handler = BearerAuth(_ -> throw(ex))(req -> HTTP.Response(200, "ok"))
+    req = HTTP.Request("GET", "/")
+    HTTP.setheader(req, "Authorization" => "Bearer whatever")
+    @test_throws typeof(ex) handler(req)
+end
+
+@testset "CookieAuthMiddleware propagates $(typeof(ex))" for ex in UNRECOVERABLE
+    handler = CookieAuthMiddleware(_ -> throw(ex), cookie_name="my_auth_cookie")(req -> HTTP.Response(200, "ok"))
+    req = HTTP.Request("GET", "/")
+    HTTP.setheader(req, "Cookie" => "my_auth_cookie=whatever")
+    @test_throws typeof(ex) handler(req)
+end
+
+# The contract that must NOT regress. The carve-out is three named types, not "throwing
+# validators now 500" — an ordinary failure (a DB lookup, an expired token, a bad secret) is
+# still the documented 401, and that is the whole reason this is a deny-list and not the
+# allow-list `decode_jwt` uses one layer down.
+@testset "ordinary validator failures are still 401" begin
+    for thrower in (_ -> error("boom"),
+                    _ -> throw(ArgumentError("bad")),
+                    _ -> throw(KeyError(:missing)),
+                    _ -> throw(Nitro.Auth.AuthError("expired")))
+        bearer = BearerAuth(thrower)(req -> HTTP.Response(200, "ok"))
+        reqB = HTTP.Request("GET", "/")
+        HTTP.setheader(reqB, "Authorization" => "Bearer whatever")
+        resB = bearer(reqB)
+        @test resB.status == 401
+        @test contains(text(resB), "Invalid or expired token")
+
+        cookie = CookieAuthMiddleware(thrower, cookie_name="my_auth_cookie")(req -> HTTP.Response(200, "ok"))
+        reqC = HTTP.Request("GET", "/")
+        HTTP.setheader(reqC, "Cookie" => "my_auth_cookie=whatever")
+        resC = cookie(reqC)
+        @test resC.status == 401
+        @test contains(text(resC), "Invalid or expired token")
+    end
+end
+
+# A validator that succeeds is untouched by any of this.
+@testset "a working validator is unaffected" begin
+    handler = BearerAuth(t -> Dict(:id => 1))(req -> HTTP.Response(200, "ok"))
+    req = HTTP.Request("GET", "/")
+    HTTP.setheader(req, "Authorization" => "Bearer good")
+    @test handler(req).status == 200
+    @test req.context[:user] == Dict(:id => 1)
+end
+
+end

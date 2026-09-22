@@ -262,4 +262,90 @@ function Base.showerror(io::IO, e::StoreInterfaceError)
               "still missing.")
 end
 
+
+"""
+    is_unrecoverable(e) -> Bool
+
+True for the exceptions that are **not failures of the guarded operation** — the conditions the
+runtime raises about *itself*. A `try`/`catch` on a request path exists to turn a failure into a
+response; these three are not failures, so swallowing one reports a broken process as a routine
+outcome and keeps serving:
+
+- `StackOverflowError` — Julia's own report is *"program state may be corrupted, so further
+  execution might be unreliable"*. Reachable from request input: `JSON.parse` raises it on a
+  deeply-nested value. Measured on a `Threads.@spawn` task, which is the stack every Nitro
+  request runs on, the threshold is nesting depth ~3100 — about **6.2 KB** of `[[[[…` as a
+  body or query string. (Through a JWT header segment it is ~8.3 KB once base64url-encoded,
+  which most reverse proxies refuse by default; the body is the ungated path.)
+- `OutOfMemoryError` — same class, one resource over.
+- `InterruptException` — a catch that eats it makes Ctrl-C a no-op. Rethrowing *it* was already
+  the house rule (`src/middleware/janitor.jl` #190, `src/core/transport.jl`); #254 is where the
+  other two joined it on the request path.
+
+### Which sites use this, and which deliberately do not
+
+The criterion is **"a request can make this block raise one of the three"**. In practice that
+means the guarded expression reaches `JSON.parse`, which is the only recursive parser on
+Nitro's request path and so the only source of a request-driven `StackOverflowError`:
+
+| site | guarded expression |
+|---|---|
+| `src/middleware/auth_middleware.jl` ×2 | the user's `validate_token` (reaches `decode_jwt` → `JSON.parse`) |
+| `src/utilities/bodyparsers.jl` ×5 | `JSON.parse` — plus `HTTP.queryparams`/`HTTP.parse_multipart_form`, which do NOT recurse and ride along so the five parsers in one file cannot drift apart |
+| `src/utilities/misc.jl` ×3 | `parseparam`'s `JSON.parse(str, T)` fall-through — reached by **any** scalar path/query parameter, since `parse(Int, str)` fails first and lands there |
+| `src/extractors.jl` ×2 | `safe_extract`'s `f()` (the extractor body, i.e. the parsers above) and the app's session store |
+| `src/middleware/csrf_middleware.jl` ×2 | `getform`/`getjson` |
+
+`src/extractors.jl`'s `safe_extract` is the load-bearing one: without it the parser fix is a
+no-op for `Json{T}`/`JsonFragment{T}`/`Body{T}` routes, because the rethrow would be caught one
+frame later and relabelled a `ValidationError` → 400.
+
+The sites that keep the narrower `e isa InterruptException && rethrow()` do so for **two
+different reasons**, and conflating them is how this list rots:
+
+1. **Nothing recursive is reachable.** `src/types.jl:1024,1055` (`unescapeuri`, `queryparams`),
+   `src/utilities/fileutil.jl:609`, `src/core/framework_middleware.jl:43` (`HTTP.URI`), and
+   `src/core/transport.jl:352` (`readbytes!`). All scan-based; no request input makes them
+   overflow, so widening them would be churn.
+2. **Not a request path — a supervisor loop, where continuing IS the contract.**
+   `src/middleware/janitor.jl:76` and `src/Workers/api.jl:915`. Both call application-supplied
+   store code, so by the argument below they would otherwise qualify. They stay narrow because
+   the #190 janitor discipline is that one bad tick must not kill the janitor: there is no
+   request to fail, and a dead sweeper is worse than a swallowed tick. Do not "fix" these to
+   match the table above.
+
+`src/middleware/extract_ip.jl` uses the predicate despite belonging to group 1, for consistency
+within a file this change already touched.
+
+Those six plus the sites in the table are every `e isa InterruptException && rethrow()` in
+`src/`; `grep -rn 'isa InterruptException && rethrow()' src/` is the audit.
+
+Use it as a **predicate with a lexical `rethrow()`**, never wrapped in a helper that rethrows for
+you — the no-argument `rethrow()` preserves the original backtrace, which is what
+`handlerequest`'s `exception=(error, catch_backtrace())` ends up logging:
+
+```julia
+catch e
+    is_unrecoverable(e) && rethrow()
+    nothing
+end
+```
+
+### Why a deny-list, when `decode_jwt` argues for an allow-list
+
+`src/Auth/jwt.jl` catches `ArgumentError` and rethrows the rest, and says why: *"Naming the
+exceptions to rethrow means keeping that list correct forever; naming the one to catch cannot
+rot."* That is right **there** and does not generalize. The expression `decode_jwt` guards is
+Nitro's own code — a closed set, so an allow-list is expressible. The call sites here guard
+**arbitrary application code** (a user's `validate_token`, a user's session store) or a parser
+whose full error surface is a dependency's business. There is no closed set to name, so an
+allow-list would turn every ordinary failure into a 500 — a far bigger break of the contract than
+the one this closes. The deny-list is not the weaker choice at these sites; it is the only
+representable one.
+
+Deliberately **not exported**: this is internal vocabulary, imported explicitly per call site.
+"""
+@inline is_unrecoverable(e) =
+    e isa InterruptException || e isa StackOverflowError || e isa OutOfMemoryError
+
 end

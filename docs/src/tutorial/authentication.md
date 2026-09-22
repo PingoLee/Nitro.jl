@@ -126,6 +126,43 @@ exceptions (e.g. `jwt_validator` throwing `AuthError` on an expired token) and r
 same 401 as any other invalid credential. This matches RFC 6750: `invalid_token` → 401,
 `insufficient_scope` → 403.
 
+!!! warning "Three exceptions propagate instead (#254)"
+    `InterruptException`, `StackOverflowError` and `OutOfMemoryError` are **not** mapped to a
+    401 — they travel on to the server's error path as a `500`. They are not failures of the
+    credential; they are the runtime reporting on itself, and Julia describes a stack overflow
+    as *"program state may be corrupted, so further execution might be unreliable"*. A worker in
+    that state must not quietly go on authenticating people.
+
+    Be aware of what that `500` looks like from the client: auth middleware runs *outside*
+    Nitro's serializer, so the response is a **bodyless `500` with no log line and no
+    access-log entry** — unlike a `500` raised inside a handler, which is logged with a
+    backtrace and carries the usual JSON body. The server itself keeps serving normally.
+
+    This is request-reachable, not theoretical: `JSON.parse` raises `StackOverflowError` on a
+    deeply-nested value, so a bearer token whose header segment is base64url of `[[[[…` gets
+    there. Reaching it through *this* path takes an `Authorization` header of about 8.3 KB
+    (nesting depth ~3100 on a request task) — above nginx's default 8k header buffer and
+    Apache's `LimitRequestFieldSize` of 8190, so a default-configured proxy refuses it, and a
+    cookie cannot carry it at all at the 4 KB browser cap. Nitro served directly accepts it.
+    The same overflow reached through a request **body** or a query parameter needs only
+    ~6.2 KB and nothing gates that, which is why the body parsers take the same narrowing.
+
+    If your own validator wraps work in a `try`, narrow it the same way — catch the failures you
+    expect, not everything:
+
+    ```julia
+    # ✗ a bare catch also eats a corrupted-state condition
+    user = try lookup(token) catch; nothing end
+
+    # ✓ name what you are handling
+    user = try
+        lookup(token)
+    catch e
+        e isa MyDBError || rethrow()
+        nothing
+    end
+    ```
+
 ## 4. JWT validation
 
 ### Quick start — safe by default

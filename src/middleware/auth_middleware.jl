@@ -3,7 +3,7 @@ module AuthMiddleware
 using HTTP
 using ...Types
 using ...Cookies: get_cookie
-using ...Errors: CookieError
+using ...Errors: CookieError, is_unrecoverable
 
 export BearerAuth, CookieAuthMiddleware
 
@@ -18,8 +18,33 @@ const MISSING_COOKIE = HTTP.Response(401, "Unauthorized: Missing or invalid auth
 # A 2-tuple whose user half is `nothing` is ALSO a 401: a nil user is no user, which is
 # what `jwt_validator` already means when its `user_validator` returns nothing (#24).
 # Auth error contract: 401 = unauthenticated (this layer), 403 = authenticated but not
-# authorized (guards), 302 = browser redirect (`login_required`). A throwing validator is
-# always a 401, never a 500.
+# authorized (guards), 302 = browser redirect (`login_required`). A validator that throws is a
+# 401 — because a failed credential lookup is exactly what this layer exists to turn into a
+# response.
+#
+# THE ONE CARVE-OUT, and it is the same at both catch sites below (#254): the three types
+# `is_unrecoverable` (`src/errors.jl`) names are rethrown instead. A bare `catch` also ate
+# `StackOverflowError`, which Julia reports as "program state may be corrupted, so further
+# execution might be unreliable" — and which arrives from request input, because `JSON.parse`
+# raises it on a deeply-nested value and a credential whose JWT header segment is base64url of
+# `[[[[…` reaches that inside `decode_jwt`. The request came back 401 and the worker carried
+# on authenticating people. #252 stopped `decode_jwt` mislabelling it an encoding error; this
+# stops this layer absorbing it anyway.
+#
+# Measure the reach before citing it. On a `Threads.@spawn` task — the stack a real request
+# runs on — `JSON.parse` overflows at nesting depth ~3100, which is an `Authorization` header
+# of ~8.3 KB. That is ABOVE nginx's default `large_client_header_buffers` 8k and Apache's
+# `LimitRequestFieldSize` 8190, and far above the 4 KB per-cookie browser cap, so a
+# default-configured proxy in front of Nitro stops this particular vector and a cookie cannot
+# carry it at all. It reaches a directly-served Nitro. The same overflow needs only a ~6.2 KB
+# request BODY or query string, which nothing gates — which is why the sibling narrowing in
+# `src/utilities/bodyparsers.jl` and `src/utilities/misc.jl` matters more than this one.
+#
+# It is a deny-list, where `decode_jwt` one layer down uses an allow-list, and the difference
+# is the guarded expression rather than taste: that one guards Nitro's own code, a closed set;
+# these guard an arbitrary user callback whose error surface is unknowable, so there is no set
+# to allow-list. `is_unrecoverable`'s docstring carries the full argument.
+#
 # Keeps `:user` and `:auth_claims` describing the SAME principal. Whatever was on the
 # request belongs to an outer auth layer (or to application middleware) and describes a
 # different identity, so this validator's claims always replace it — and when it produced
@@ -64,6 +89,12 @@ Creates a middleware function for authentication using a pluggable token validat
 Responses follow the auth error contract: missing/invalid cookie or a failed (or
 throwing) validator yields a `401`; authorization denials are the guards' `403`.
 
+`InterruptException`, `StackOverflowError` and `OutOfMemoryError` are the exception, and
+**propagate** rather than becoming a `401` (#254): Julia reports a stack overflow as *"program
+state may be corrupted"*, which is not an authentication outcome and must not be served as one.
+They reach the server's error path as a `500`. If your validator wraps anything in its own
+`try`, do the same there — catch the failures you expect, not everything.
+
 On success the validator's claims replace anything already at `req.context[:auth_claims]`,
 and a validator returning a plain user object clears that slot — the two slots always
 describe the same principal, so a second auth layer cannot authorize against the first's.
@@ -78,17 +109,22 @@ function CookieAuthMiddleware(validate_token::Function; cookie_name::String = "a
                 if e isa CookieError
                     return MISSING_COOKIE
                 end
-                rethrow(e)
+                # No-argument `rethrow()`: it preserves the original backtrace, which
+                # `handlerequest` logs. `rethrow(e)` would reset it to this line (#254).
+                rethrow()
             end
             if isnothing(token) || isempty(token)
                 return MISSING_COOKIE
             end
 
             # Validate or Reject incoming request. A throwing validator (e.g.
-            # `jwt_validator` on an expired token) is a 401, never a 500.
+            # `jwt_validator` on an expired token) is a 401, never a 500 — except for the
+            # three `is_unrecoverable` names, which propagate. Both halves of that contract,
+            # and why the carve-out is a deny-list, are at the top of this file (#254).
             user_info = try
                 _validate_token(validate_token, req, token)
-            catch
+            catch e
+                is_unrecoverable(e) && rethrow()
                 nothing
             end
             return _handle_validated(handle, req, user_info)
@@ -108,6 +144,14 @@ Creates a middleware function for authentication using a pluggable token validat
 
 Responses follow the auth error contract: missing/malformed credentials or a failed (or
 throwing) validator yields a `401`; authorization denials are the guards' `403`.
+
+`InterruptException`, `StackOverflowError` and `OutOfMemoryError` are the exception, and
+**propagate** rather than becoming a `401` (#254): Julia reports a stack overflow as *"program
+state may be corrupted"*, which is not an authentication outcome and must not be served as one.
+A bearer token whose header segment is base64url of `[[[[…` reaches one through `JSON.parse`,
+so this is request-reachable, not theoretical — though for *this* path it takes an ~8.3 KB
+`Authorization` header, which nginx's and Apache's default per-header caps refuse. Nitro served
+directly accepts it. They arrive at the server's error path as a `500`.
 
 On success the validator's claims replace anything already at `req.context[:auth_claims]`,
 and a validator returning a plain user object clears that slot — the two slots always
@@ -132,10 +176,13 @@ function BearerAuth(validate_token::Function; header::String = "Authorization", 
             end
 
             # Validate or Reject incoming request. A throwing validator (e.g.
-            # `jwt_validator` on an expired token) is a 401, never a 500.
+            # `jwt_validator` on an expired token) is a 401, never a 500 — except for the
+            # three `is_unrecoverable` names, which propagate. Both halves of that contract,
+            # and why the carve-out is a deny-list, are at the top of this file (#254).
             user_info = try
                 _validate_token(validate_token, req, token)
-            catch
+            catch e
+                is_unrecoverable(e) && rethrow()
                 nothing
             end
             return _handle_validated(handle, req, user_info)
