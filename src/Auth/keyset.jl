@@ -37,7 +37,7 @@ Every pair is `kid => secret`. A `kid` is a `String` or `Symbol`; a secret is an
 
 - a secret of any other type — a `Vector{UInt8}` in particular is refused **without being
   read**, so the caller's buffer is left intact;
-- an empty secret;
+- an empty secret, or one HMAC treats as empty (a short run of `"\\0"` bytes);
 - two keys with the same `kid`;
 - two keys that are the same HMAC key. The comparison is by HMAC key, not by string:
   HMAC-SHA256 pre-hashes a key longer than its block and zero-pads a shorter one, so `K` and
@@ -104,7 +104,7 @@ struct JWTKeyset
             # equality is the wrong equivalence (see the docstring). Two entries that are
             # one key make a kid-less token attributable to either, depending on order.
             # Hashing also keeps plaintext secrets out of this Dict's keys.
-            fingerprint = SHA.hmac_sha256(Vector{UInt8}(codeunits(reveal(key.secret))), UInt8[])
+            fingerprint = _hmac_fingerprint(key.secret)
             previous = get(by_hmac, fingerprint, nothing)
             previous === nothing || throw(ArgumentError(
                 "JWTKeyset: $(repr(previous)) and $(repr(key.kid)) are the same HMAC key, so a " *
@@ -166,11 +166,20 @@ function _keyset_entry(pair::Pair, use::Symbol)
             "an AbstractString or a SecretString. A Vector{UInt8} in particular is refused " *
             "without being read -- converting one empties the caller's buffer"))
     end
-    isempty(reveal(wrapped)) && throw(ArgumentError(
-        "JWTKeyset: the secret for kid $(repr(kid)) is empty; a token signed with the empty " *
-        "string would verify against it"))
+    # By HMAC key, not by `isempty`, for the same reason the duplicate check is: HMAC
+    # zero-pads a short key, so "\0" (or any run of NULs up to the block size) IS the empty
+    # key, and a token signed with "" would verify against it.
+    _hmac_fingerprint(wrapped) == _EMPTY_KEY_FINGERPRINT && throw(ArgumentError(
+        "JWTKeyset: the secret for kid $(repr(kid)) is empty, or equivalent to the empty HMAC " *
+        "key; a token signed with the empty string would verify against it"))
     return (kid, wrapped, use)
 end
+
+# HMAC-of-empty-message under a key: equal fingerprints mean the same HMAC key.
+_hmac_fingerprint(secret::SecretString) =
+    SHA.hmac_sha256(Vector{UInt8}(codeunits(reveal(secret))), UInt8[])
+
+const _EMPTY_KEY_FINGERPRINT = SHA.hmac_sha256(UInt8[], UInt8[])
 
 _signing_key(keyset::JWTKeyset) = @inbounds keyset.keys[1]
 

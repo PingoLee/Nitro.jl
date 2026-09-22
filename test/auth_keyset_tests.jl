@@ -33,6 +33,9 @@ end
             ("same HMAC key", () -> JWTKeyset("a" => "s"; verify = ["b" => "s"]), "same HMAC key"),
             ("zero-padded twin", () -> JWTKeyset("a" => "k"; verify = ["b" => "k\0"]), "same HMAC key"),
             ("empty secret", () -> JWTKeyset("a" => ""), "empty"),
+            # HMAC zero-pads a short key, so NULs are the empty key under another spelling.
+            ("NUL secret", () -> JWTKeyset("a" => "\0"), "equivalent to the empty HMAC key"),
+            ("NUL verify secret", () -> JWTKeyset("a" => "s"; verify = ["b" => "\0\0\0"]), "empty"),
             ("empty kid", () -> JWTKeyset("" => "s"), "must not be empty"),
             ("integer kid", () -> JWTKeyset(1 => "s"), "String or Symbol"),
             ("integer secret", () -> JWTKeyset("a" => 42), "Int64"),

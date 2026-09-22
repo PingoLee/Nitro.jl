@@ -87,7 +87,7 @@ jwt_validator(keyset)   # ✓ before -- built fine
 
 # ✓ after -- give them distinct secrets (and, per #260, say which key signs)
 keyset = JWTKeyset(
-    "primary" => required_env("JWT_SECRET_PRIMARY");
+    "default" => required_env("JWT_SECRET_PRIMARY");
     verify = ["legacy" => required_env("JWT_SECRET_LEGACY")],
 )
 ```
