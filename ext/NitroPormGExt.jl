@@ -14,6 +14,7 @@ import Nitro: pormg_nitro_session, sync_pormg_env!
 import Nitro.Workers: AbstractWorkerStore, TaskInfo, TaskStatus, TaskOptions,
     PENDING, RUNNING, COMPLETED, FAILED, CANCELLED,
     TaskAuthority, Owner, System, UNSUPPLIED, owner_of, _is_authorized, TASK_KEY_DELIMITER,
+    _check_page,
     get_task_info, set_task!, replace_task!, add_watcher!, try_transition!,
     delete_task!, cleanup_tasks!, get_all_tasks,
     list_running_task_refs, RunningTaskRef,
@@ -779,6 +780,11 @@ The win is rows fetched and `watchers` blobs JSON-parsed, not index usage: on
 PostgreSQL a `LIKE 'x%'` uses the primary-key index only under a C collation or a
 `text_pattern_ops` opclass, which `PormG.Dialect.create_index` cannot express. Do not
 add an index for this.
+
+**Unpaged listings only.** Two legs merged in Julia are a correct union only while nothing
+depends on their order, and a paged listing depends on nothing else. `get_all_tasks` with `after`
+or `limit` therefore asks for the same superset as ONE `Qor` query (`_authority_query`) and lets
+the database order it. See *Keyset paging* below ([#237](https://github.com/PingoLee/Nitro.jl/issues/237)).
 """
 _authority_rows(make_base::Function, ::System) = make_base().list()
 
@@ -806,20 +812,78 @@ function _authority_rows(make_base::Function, authority::Owner)
     return rows
 end
 
-function get_all_tasks(store::PormGWorkerStore, authority::TaskAuthority; status::Union{Nothing, TaskStatus}=nothing, queue_name::Union{Nothing, String}=nothing)
-    try
-        # A factory, not a queryset: see `_authority_rows` on why each leg needs its own.
-        make_base = function()
-            qs = _task_objects(store)
-            if status !== nothing
-                qs = qs.filter("status" => string(status))
-            end
-            if queue_name !== nothing
-                qs = qs.filter("queue_name" => queue_name)
-            end
-            return qs
-        end
+# -- Keyset paging (#237) --
+#
+# The shape `_authority_rows` above does not have: a page is `id > after ORDER BY id LIMIT n`,
+# and ALL of it runs in SQL. The database orders and compares under one collation, the column's.
+# On an `en_US` PostgreSQL database that is not Julia's codepoint order, so any Julia-side sort or
+# merge on a paged path would disagree with the next page's `id > after` and skip rows. That is
+# also why the paged Owner listing is ONE `Qor` query rather than `_authority_rows`' two legs.
+# Merging two separately-limited legs is a correct union only under an order Julia can reproduce.
 
+function _keyset!(qs, after, limit)
+    after === nothing || (qs = qs.filter("id__@gt" => after))
+    qs = qs.order_by("id")
+    limit === nothing || (qs = qs.limit(limit))
+    return qs
+end
+
+# Up to `limit` KEPT rows past `after`, in the database's id order. `keep!(out, row)` decides per
+# row. A row it drops is made up from past the cursor, so the result is short of `limit` only when
+# the query ran out of rows. That is the contract both paged methods publish, and a caller reads a
+# short page as the end. With `limit === nothing` this is one unbounded query past `after`.
+function _keyset_collect!(keep!::Function, out::AbstractVector, query::Function, after, limit)
+    cursor = after
+    while true
+        want = limit === nothing ? nothing : limit - length(out)
+        rows = _keyset!(query(), cursor, want).list()
+        for row in rows
+            keep!(out, row)
+        end
+        (want === nothing || length(rows) < want || length(out) >= limit) && return out
+        cursor = _row_task_id(last(rows))
+    end
+end
+
+# The same superset `_authority_rows` fetches, as one query.
+_authority_query(make_base::Function, ::System) = make_base()
+_authority_query(make_base::Function, authority::Owner) = make_base().filter(PormG.Qor(
+    "id__@startswith" => authority.user_id * TASK_KEY_DELIMITER,
+    "watchers__@contains" => JSON.json(authority.user_id),
+))
+
+function get_all_tasks(store::PormGWorkerStore, authority::TaskAuthority;
+                       status::Union{Nothing, TaskStatus}=nothing, queue_name::Union{Nothing, String}=nothing,
+                       after::Union{Nothing, String}=nothing, limit::Union{Nothing, Int}=nothing)
+    # A factory, not a queryset: see `_authority_rows` on why each leg needs its own.
+    make_base = function()
+        qs = _task_objects(store)
+        if status !== nothing
+            qs = qs.filter("status" => string(status))
+        end
+        if queue_name !== nothing
+            qs = qs.filter("queue_name" => queue_name)
+        end
+        return qs
+    end
+
+    if _check_page(after, limit)
+        # A paged read RETHROWS, unlike the unpaged one below. A caller reads an empty page as
+        # "no more rows", so a swallowed error would quietly end the iteration part-way.
+        try
+            return _keyset_collect!(TaskInfo[], () -> _authority_query(make_base, authority), after, limit) do out, row
+                task_info = _from_db_record(row)
+                # The gate, after the fetch as always. Rows it drops are made up by
+                # `_keyset_collect!`, so a page is short only when the listing is exhausted.
+                _is_authorized(authority, task_info) && push!(out, task_info)
+            end
+        catch e
+            @warn "PormGWorkerStore: failed to list a page of tasks" exception=(e, catch_backtrace())
+            rethrow()
+        end
+    end
+
+    try
         # Durable rows only. Overlaying live progress onto them is `WorkerRuntime`'s job
         # and is now done for every backend rather than this one (#167).
         tasks = TaskInfo[]
@@ -859,15 +923,18 @@ end
 # Logs and RETHROWS, like `get_task_info`, and unlike the listing above. An empty result here
 # reads as "nothing to recover", so a swallowed read error would be indistinguishable from a
 # clean sweep, which is the silence #238 is about.
-function list_running_task_refs(store::PormGWorkerStore)
+#
+# Paged by keyset like the listing (#237). A skipped row is made up from past the cursor by
+# `_keyset_collect!`, so recovery never mistakes a page an unfenceable row shortened for the end.
+function list_running_task_refs(store::PormGWorkerStore; after::Union{Nothing, String}=nothing,
+                                limit::Union{Nothing, Int}=nothing)
+    _check_page(after, limit)
+    query = () -> _task_objects(store).filter("status" => string(RUNNING)).values("id", "run_id", "started_at")
     try
-        rows = _task_objects(store).filter("status" => string(RUNNING)).values("id", "run_id", "started_at").list()
-        refs = RunningTaskRef[]
-        for row in rows
+        return _keyset_collect!(RunningTaskRef[], query, after, limit) do refs, row
             ref = _running_ref_from_row(row)
             ref === nothing || push!(refs, ref)
         end
-        return refs
     catch e
         @warn "PormGWorkerStore: failed to list running tasks" exception=(e, catch_backtrace())
         rethrow()

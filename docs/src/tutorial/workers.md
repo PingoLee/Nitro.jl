@@ -309,6 +309,24 @@ my_running = get_all_tasks(Owner("user-1"), RUNNING)
 every_task = get_all_tasks(System())
 ```
 
+The unpaged call materializes the whole listing, and the task table only grows between retention
+sweeps. A task that never finishes is never swept at all. On a large table, read it a page at a
+time instead. Pass `limit`, then pass the last entry's `:id` as `after` to get the next page:
+
+```julia
+page = get_all_tasks(System(); limit = 500)
+while !isempty(page)
+    foreach(show_row, page)
+    length(page) < 500 && break           # a short page is the last one
+    page = get_all_tasks(System(); limit = 500, after = last(page)[:id])
+end
+```
+
+A paged result is ordered by `:id`, not by `:created_at`, because the page boundary is a cursor
+on the id. The cursor is keyset rather than an offset, so rows that change status while you page
+do not shift later pages. The same `after` / `limit` keywords work with an `Owner` and with a
+status filter.
+
 ### `get_queue_status`
 
 Queue-wide introspection for sequential queues, reporting:
@@ -925,7 +943,10 @@ runtimes — which is also why a genuine crash is still recovered.
 The sweep reads only three columns of each `RUNNING` record (its id, run id and start time),
 through the store method `list_running_task_refs`. It never deserializes a task's `result` or
 `watchers`, so a record with a malformed blob is still recovered rather than hiding every other
-zombie behind it. If that read fails, the sweep logs the error and recovers nothing on this boot.
+zombie behind it. It reads them `ZOMBIE_SWEEP_BATCH` (500) at a time, keyset-paged on the id, so a
+large crash backlog is worked through in bounded steps rather than loaded whole. Pass
+`batch_size` to `recover_zombie_tasks!` to change that. If a read fails, the sweep logs the error
+and stops for this boot, keeping what it already recovered.
 Startup carries on either way. A custom store that does not implement `list_running_task_refs`
 still works: the default derives it from `get_all_tasks`, at the cost of a full read of each record.
 

@@ -207,6 +207,23 @@ executing. The window is narrower, not gone — run handles are per-runtime, so 
 a **new** `WorkerRuntime` over the same store still sweeps the previous one's abandoned runs. That
 is also what keeps a genuine process crash recoverable.
 
+**The sweep is bounded, and paged listings are keyset in SQL**
+([#236](https://github.com/PingoLee/Nitro.jl/issues/236),
+[#237](https://github.com/PingoLee/Nitro.jl/issues/237)). It reads `list_running_task_refs`, a
+three-column projection, never the listing, and walks it `ZOMBIE_SWEEP_BATCH` records at a time
+under one `lock_tasks`.
+
+Paging is keyset on the id (`id > after ORDER BY id LIMIT n`), never offset: the sweep moves every
+row it adjudicates out of `RUNNING`, so an offset page would skip rows.
+
+A database backend pages **in SQL and never re-sorts in Julia**. `ORDER BY` and `>` share the
+column's collation, which on a non-C PostgreSQL collation is not Julia's codepoint order. That is
+why the paged `Owner` listing is one `Qor` query and not the unpaged path's two legs merged in
+Julia.
+
+A paged method returns fewer than `limit` only when nothing is left. A row it skips, whether
+through the authority gate or an unparseable `run_id`, is made up from past the cursor.
+
 ## 6. Developer Rules
 
 > **Strict core isolation**: Never import `PormG` or run DB queries in `src/Workers`. Database logic belongs in `ext/NitroPormGExt.jl`.

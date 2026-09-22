@@ -3437,6 +3437,72 @@ end
     @test legacy.rows["scan-running"].status == FAILED
 end
 
+@testset "listings and the recovery scan page by keyset on the id (#237)" begin
+    store = InMemoryWorkerStore()
+    rt = WorkerRuntime(store)
+    owner = Owner("alice")
+    try
+        lock(store.task_lock) do
+            # Inserted out of order, so a page that came back in Dict order would show it.
+            for (id, watchers, status) in (("alice::3", ["alice"], RUNNING), ("a-global", ["alice"], PENDING),
+                                           ("bob::1", ["bob"], RUNNING), ("alice::1", String[], RUNNING),
+                                           ("alice~w", ["carol", "alice"], RUNNING), ("alice::2", ["alice"], RUNNING))
+                t = TaskInfo(id)
+                append!(t.watchers, watchers)
+                t.status = status
+                store.task_registry[id] = t
+            end
+        end
+        expected = ["a-global", "alice::1", "alice::2", "alice::3", "alice~w"]
+
+        walk(fetch, limit) = begin
+            ids, after = String[], nothing
+            while true
+                page = fetch(after, limit)
+                @test length(page) <= limit
+                append!(ids, page)
+                length(page) < limit && return ids
+                after = last(page)
+            end
+        end
+
+        for limit in (1, 2, 5)
+            # The store, the runtime, and the public Dict API page identically. Paging is applied
+            # after the authority gate, so bob's task never takes a slot in a page.
+            @test walk((a, n) -> [t.id for t in get_all_tasks(store, owner; after=a, limit=n)], limit) == expected
+            @test walk((a, n) -> [t.id for t in get_all_tasks(rt, owner; after=a, limit=n)], limit) == expected
+            @test walk((a, n) -> [t[:id] for t in get_all_tasks(owner; runtime=rt, after=a, limit=n)], limit) == expected
+        end
+        # Unpaged keeps its contract: everything, sorted by created_at rather than by id.
+        @test sort([t[:id] for t in get_all_tasks(owner; runtime=rt)]) == expected
+        @test_throws ArgumentError get_all_tasks(owner; runtime=rt, limit=0)
+
+        # The scan pages the same way, over RUNNING only and with no authority.
+        @test walk((a, n) -> [r.id for r in list_running_task_refs(store; after=a, limit=n)], 2) ==
+              ["alice::1", "alice::2", "alice::3", "alice~w", "bob::1"]
+
+        # Recovery walks the backlog one record at a time and still reaches all of it.
+        @test recover_zombie_tasks!(; runtime=rt, batch_size=1) == 5
+        @test isempty(list_running_task_refs(store))
+        @test_throws ArgumentError recover_zombie_tasks!(; runtime=rt, batch_size=0)
+    finally
+        reset_runtime!(rt)
+    end
+
+    # A store written before paging existed keeps every UNPAGED call: the runtime only forwards
+    # the keywords when one is set. Recovery over it pages through the default scan, which hands
+    # back the whole remainder in one page, and still reaches every row.
+    legacy = DataOnlyStore()
+    for i in 1:3
+        t = TaskInfo("legacy::$i"); t.status = RUNNING
+        legacy.rows[t.id] = t
+    end
+    rt_legacy = WorkerRuntime(legacy)
+    @test length(get_all_tasks(rt_legacy, System())) == 3
+    @test_throws MethodError get_all_tasks(rt_legacy, System(); limit=1)
+    @test recover_zombie_tasks!(; runtime=rt_legacy, batch_size=1) == 3
+end
+
 @testset "cancel_task is atomic: completed task result is never overwritten" begin
     store = InMemoryWorkerStore()
     rt_store = WorkerRuntime(store)

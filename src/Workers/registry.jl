@@ -26,7 +26,23 @@ using Nitro.Workers    # the contract names are not re-exported from `Nitro`
 | `try_transition!(store, task_id::String, from, to::TaskStatus; run_id, …)` | Atomic conditional status change, returns `Bool` |
 | `delete_task!(store, task_id::String)` | Remove one record |
 | `cleanup_tasks!(store, retain_days::Int)` | Prune finished records, returns how many went |
-| `get_all_tasks(store, authority::TaskAuthority; status, queue_name)` | `Vector{TaskInfo}` |
+| `get_all_tasks(store, authority::TaskAuthority; status, queue_name, after, limit)` | `Vector{TaskInfo}`; see *Paging* |
+
+## Paging
+
+`after::Union{Nothing,String}` and `limit::Union{Nothing,Int}` page the listing by keyset on the
+id ([#237](https://github.com/PingoLee/Nitro.jl/issues/237)): ids strictly greater than `after`,
+**in id order**, at most `limit`. Paging is applied **after** the authority gate, so a page holds
+fewer than `limit` records only when nothing is left. Neither keyword set means the whole listing,
+in any order, exactly as before.
+
+A database backend pages **in SQL** and must not re-sort in Julia. Its `ORDER BY id` and its
+`id > after` use the column's collation, which is not Julia's codepoint order on, say, an
+`en_US` PostgreSQL database. A Julia-side merge would then disagree with the next page's
+cursor and skip rows.
+
+The paging keywords are opt-in for a backend too. [`WorkerRuntime`](@ref) forwards them only when
+the caller set one, so a store written before them keeps serving every unpaged call.
 
 # Application hooks
 
@@ -228,11 +244,35 @@ const RunningTaskRef = @NamedTuple{id::String, run_id::UUID, started_at::Union{N
 
 _running_ref(task::TaskInfo) = RunningTaskRef((task.id, task.run_id, task.started_at))
 
-"""
-    list_running_task_refs(store) -> Vector{RunningTaskRef}
+# -- Keyset paging (#237) --
+#
+# `after` is a cursor on the task id and `limit` a page size, and a page means
+# `id > after ORDER BY id LIMIT limit`. Keyset, never offset: an offset counts rows, and the
+# rows a scan is working through change underneath it -- zombie recovery moves every row it
+# adjudicates out of `RUNNING`, so an offset page would skip a row per transition. A cursor on the
+# primary key is unaffected by rows leaving the result set behind it.
 
-Every `RUNNING` record, as a [`RunningTaskRef`](@ref): the scan behind
-[`recover_zombie_tasks!`](@ref).
+# Validates, and answers "is this a paged call?".
+function _check_page(after::Union{Nothing, AbstractString}, limit::Union{Nothing, Integer})
+    limit === nothing || limit >= 1 || throw(ArgumentError("`limit` must be at least 1, got $limit"))
+    return after !== nothing || limit !== nothing
+end
+
+# A page of records already in hand: what a database does with `id > after ORDER BY id LIMIT n`.
+# Only for stores whose records ARE in hand. A database store must page in SQL, and must not
+# re-sort in Julia either -- its `ORDER BY` and its `>` share the column's collation, which on a
+# non-C PostgreSQL collation is not Julia's codepoint order.
+function _keyset_page(items::AbstractVector, after, limit)
+    page = sort!(filter(x -> after === nothing || x.id > after, items); by = x -> x.id)
+    limit === nothing || length(page) <= limit || resize!(page, limit)
+    return page
+end
+
+"""
+    list_running_task_refs(store; after=nothing, limit=nothing) -> Vector{RunningTaskRef}
+
+The `RUNNING` records, as [`RunningTaskRef`](@ref)s: the scan behind
+[`recover_zombie_tasks!`](@ref), which walks it a page at a time.
 
 **Optional.** The default below derives the refs from `get_all_tasks(store, System();
 status=RUNNING)`, so a backend that does not implement this still recovers its zombies. It just
@@ -242,11 +282,26 @@ deserializes each row's `result` and `watchers` only to throw them away
 ([#236](https://github.com/PingoLee/Nitro.jl/issues/236)). A backend that serializes should
 implement this as a projection of those three columns.
 
+# Paging
+
+`after` / `limit` page by keyset on the id, like the store's `get_all_tasks`: ids strictly
+greater than `after`, in id order, at most `limit` of them. An implementation returns **fewer
+than `limit` only when nothing is left** — a row it has to skip must be made up from past the
+cursor, or the caller reads a short page as the end
+([#237](https://github.com/PingoLee/Nitro.jl/issues/237)).
+
+The default honours `after` and ignores `limit`: it has already read the whole listing, so it
+returns everything past the cursor in one page instead of re-reading the listing for each page.
+A caller must therefore accept a page longer than `limit`. Recovery does.
+
 It is a **recovery scan, not a listing**: it takes no `TaskAuthority` and hands out no record
 contents, only the identity a fenced transition needs. Do not build a user-facing surface on it.
 """
-function list_running_task_refs(store::AbstractWorkerStore)
-    return RunningTaskRef[_running_ref(task) for task in get_all_tasks(store, System(); status=RUNNING)]
+function list_running_task_refs(store::AbstractWorkerStore; after::Union{Nothing, String}=nothing,
+                                 limit::Union{Nothing, Int}=nothing)
+    _check_page(after, limit)
+    refs = RunningTaskRef[_running_ref(task) for task in get_all_tasks(store, System(); status=RUNNING)]
+    return after === nothing ? refs : _keyset_page(refs, after, nothing)
 end
 
 function get_queue_authorizer end
@@ -582,7 +637,17 @@ function cleanup_tasks!(store::InMemoryWorkerStore, retain_days::Int)
     return length(removed)
 end
 
-function get_all_tasks(store::InMemoryWorkerStore, authority::TaskAuthority; status::Union{Nothing, TaskStatus}=nothing, queue_name::Union{Nothing, String}=nothing)
+function get_all_tasks(store::InMemoryWorkerStore, authority::TaskAuthority;
+                       status::Union{Nothing, TaskStatus}=nothing, queue_name::Union{Nothing, String}=nothing,
+                       after::Union{Nothing, String}=nothing, limit::Union{Nothing, Int}=nothing)
+    paged = _check_page(after, limit)
+    tasks = _in_memory_listing(store, authority, status, queue_name)
+    # Paged AFTER the authority gate, so a page is `limit` rows the caller may see, never
+    # fewer because the gate thinned it.
+    return paged ? _keyset_page(tasks, after, limit) : tasks
+end
+
+function _in_memory_listing(store::InMemoryWorkerStore, authority::TaskAuthority, status, queue_name)
     lock(store.task_lock) do
         tasks = TaskInfo[]
         for task_info in values(store.task_registry)
@@ -604,10 +669,13 @@ end
 
 # Implemented rather than left to the default for parity with `PormGWorkerStore`, not for speed:
 # the registry is already in RAM, so the default's listing would cost the same Dict scan.
-function list_running_task_refs(store::InMemoryWorkerStore)
-    lock(store.task_lock) do
-        return RunningTaskRef[_running_ref(t) for t in values(store.task_registry) if t.status == RUNNING]
+function list_running_task_refs(store::InMemoryWorkerStore; after::Union{Nothing, String}=nothing,
+                                 limit::Union{Nothing, Int}=nothing)
+    paged = _check_page(after, limit)
+    refs = lock(store.task_lock) do
+        RunningTaskRef[_running_ref(t) for t in values(store.task_registry) if t.status == RUNNING]
     end
+    return paged ? _keyset_page(refs, after, limit) : refs
 end
 
 function get_queue_authorizer(store::InMemoryWorkerStore)

@@ -37,6 +37,16 @@ and return without waiting.
 const WORKER_DRAIN_TIMEOUT_SECONDS :: Float64 = 5.0
 
 """
+    ZOMBIE_SWEEP_BATCH
+
+How many `RUNNING` records [`recover_zombie_tasks!`](@ref) reads per page (its `batch_size`
+default). It bounds what one step of the boot-time sweep holds in memory, not how many records the
+sweep reaches: it keeps paging until the backlog is exhausted
+([#237](https://github.com/PingoLee/Nitro.jl/issues/237)).
+"""
+const ZOMBIE_SWEEP_BATCH :: Int = 500
+
+"""
     CURRENT_RUN_KEY
 
 Task-local key naming the run whose callback is executing on the current task.
