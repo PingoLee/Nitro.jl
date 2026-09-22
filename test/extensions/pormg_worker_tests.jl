@@ -1202,6 +1202,11 @@ else
                 ("alice::1",  String["alice"]),          # both legs
                 ("alice::2",  String[]),                 # owned only (grant list lost)
                 ("alice~w",   String["carol", "alice"]), # watched only
+                # FETCHED but not authorized: its one watcher serializes to `["x\",\"alice"]`,
+                # which contains `"alice"`, so the SQL superset matches and the gate drops it.
+                # A page it lands on must be topped up from past the cursor, not returned short --
+                # a short page reads as the end, and would hide everything after it.
+                ("b-decoy",   String["x\",\"alice"]),
                 ("bob::1",    String["bob"]),            # neither: must never appear
                 ("c-global",  String["alice"]),          # watched only
             ]

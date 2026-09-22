@@ -3501,6 +3501,17 @@ end
     @test length(get_all_tasks(rt_legacy, System())) == 3
     @test_throws MethodError get_all_tasks(rt_legacy, System(); limit=1)
     @test recover_zombie_tasks!(; runtime=rt_legacy, batch_size=1) == 3
+
+    # The default scan's FIRST page is id-ordered too, not the store's Dict order: the sweep's
+    # cursor is that page's last id, so an unsorted page would leave unadjudicated rows below it
+    # and read them again on the next page. Twenty ids, so a Dict order cannot pass by luck.
+    many = DataOnlyStore()
+    ids = ["many::$(lpad(i, 2, '0'))" for i in 1:20]
+    for id in ids
+        t = TaskInfo(id); t.status = RUNNING
+        many.rows[id] = t
+    end
+    @test [r.id for r in list_running_task_refs(many; limit=1)] == ids
 end
 
 @testset "the zombie sweep always says it ran, and what it did (#238)" begin

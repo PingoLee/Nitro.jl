@@ -299,9 +299,13 @@ contents, only the identity a fenced transition needs. Do not build a user-facin
 """
 function list_running_task_refs(store::AbstractWorkerStore; after::Union{Nothing, String}=nothing,
                                  limit::Union{Nothing, Int}=nothing)
-    _check_page(after, limit)
+    paged = _check_page(after, limit)
     refs = RunningTaskRef[_running_ref(task) for task in get_all_tasks(store, System(); status=RUNNING)]
-    return after === nothing ? refs : _keyset_page(refs, after, nothing)
+    # Sorted on EVERY paged call, the first one included. The listing comes back in whatever
+    # order the store keeps (a `Dict`'s, for most), and a caller's cursor is the last id of this
+    # page: an unsorted first page would put rows below that cursor that it never adjudicated,
+    # and the next page would read them a second time.
+    return paged ? _keyset_page(refs, after, nothing) : refs
 end
 
 function get_queue_authorizer end
