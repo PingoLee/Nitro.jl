@@ -88,6 +88,62 @@ function jwt_validator(secret_or_keyset;
         throw(ArgumentError("identity_from=:kid requires a keyset (Dict of kid => secret); a header kid is not verified against a single secret"))
     end
 
+    # Two keyset entries that are the SAME HMAC key make selection observable: a kid-less
+    # token verifies against whichever is tried first, so the same token attributes to a
+    # different signer depending on iteration order (#253). A configuration mistake, not a
+    # runtime case to tie-break, so it is refused where every other auth misconfiguration
+    # in this file is refused -- at construction, which is app startup.
+    #
+    # Keyed on HMAC-of-empty-message, NOT on the secret string, because string equality is
+    # the WRONG equivalence here. HMAC-SHA256 pre-hashes any key longer than its 64-byte
+    # block and zero-pads any key shorter, so `K` and `sha256(K)` are the same key for
+    # |K| > 64, and so are `"a"` and `"a\0"`. Two textually different entries can be one
+    # key, and a string comparison waves them through. Hashing under each key collapses
+    # exactly those classes -- and has the side benefit of not parking plaintext secrets
+    # in a Dict as hash keys.
+    #
+    # With this guard, at most one candidate in `_verify_candidates` can match a token, so
+    # the trial order is not load-bearing for correctness. A direct `decode_jwt` caller
+    # bypasses it, because `decode_jwt` has no construction time; accepted rather than
+    # bought with a per-request check on the hot path.
+    if kid_trusted
+        by_key = Dict{Vector{UInt8}, String}()
+        usable = 0
+        for name in sort!(unique!(String[string(k) for k in keys(secret_or_keyset)]))
+            # The RAW value, deliberately not `_lookup_key`, which coerces with
+            # `String(...)`. That coercion is a trap for one type in particular:
+            # `String(::Vector{UInt8})` TAKES OWNERSHIP of the buffer and leaves it empty,
+            # so merely reading such a keyset destroys the caller's secrets -- after which
+            # every entry is `""` and a token signed with the empty string authenticates
+            # as any kid. Refuse the shape instead of touching it. (`_lookup_key` itself
+            # still has this on the direct-`decode_jwt` path; filed separately.)
+            raw = get(secret_or_keyset, name, nothing)
+            raw === nothing && (raw = get(secret_or_keyset, Symbol(name), nothing))
+            # `nothing` when `string(k)` does not round-trip -- an integer-keyed keyset,
+            # say. Not an error on its own; a keyset with NO readable entry is, below.
+            raw === nothing && continue
+            raw isa AbstractString || throw(ArgumentError(
+                "jwt_validator: keyset entry $(repr(name)) holds a $(typeof(raw)); keyset values must " *
+                "be strings. Unwrap a SecretString before building the validator, and never pass a " *
+                "Vector{UInt8} -- converting one empties the caller's buffer, leaving every secret " *
+                "blank and letting a token signed with the empty string authenticate"))
+            usable += 1
+            fingerprint = SHA.hmac_sha256(Vector{UInt8}(codeunits(String(raw))), UInt8[])
+            previous = get(by_key, fingerprint, nothing)
+            previous === nothing || throw(ArgumentError(
+                "jwt_validator: keyset entries $(repr(previous)) and $(repr(name)) are the same HMAC key, " *
+                "so a token carrying no kid could not be attributed to either; give them distinct secrets " *
+                "or drop one"))
+            by_key[fingerprint] = name
+        end
+        # A keyset whose keys are neither Strings nor Symbols resolves to nothing usable,
+        # so every request would 401 with `Unknown JWT key id` and no startup signal at
+        # all. Misconfiguration belongs at construction, like everything else here.
+        usable == 0 && throw(ArgumentError(
+            "jwt_validator: the keyset has $(length(secret_or_keyset)) entries but none with a String " *
+            "or Symbol key, so no key id can ever resolve; keyset keys must be strings"))
+    end
+
     # Concrete NamedTuple capture — all profile resolution happens here, once, at
     # construction; the per-request closure does no configuration branching.
     decode_kwargs = values(kwargs)

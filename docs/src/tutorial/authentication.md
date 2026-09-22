@@ -231,6 +231,38 @@ was resolved against a keyset** — with a single string secret the header `kid`
 attacker-writable label, so it is never exposed on the `Principal`, `kid_required` denies,
 and `identity_from=:kid` is a construction-time `ArgumentError`.
 
+#### Tokens that carry no `kid`
+
+A `kid` is a *hint*, not a requirement, and a foreign issuer may omit it. When a token names
+no key, **every key in the keyset is tried**, `"default"` first and then the rest by name, and
+`principal.kid` reports whichever key actually verified the signature — which is honest, because
+that key *is* the signer. This is what makes a rotation window work: while an external issuer
+is still signing with the old secret, its kid-less tokens keep authenticating.
+
+A token that *does* name a `kid` is checked against that key and no other, so naming one is
+still both faster and more precise.
+
+Two consequences worth knowing:
+
+  * A **keyset may not hold the same secret under two names.** If it did, a kid-less token could
+    be attributed to either. `jwt_validator` refuses such a keyset at construction — and it
+    compares keys the way HMAC does, not the way `String` does — HMAC-SHA256 pre-hashes any key
+    longer than its 64-byte block and zero-pads any key shorter, so for a secret over 64 bytes `K`
+    and `sha256(K)` are one key, as are `"a"` and `"a\0"`, even though each pair reads as two.
+    Keyset **values** must be `String`s, too: a `SecretString` must be unwrapped, and a
+    `Vector{UInt8}` is refused outright. All of this is checked **when the validator is built**,
+    not per request — so if you mutate a keyset in place to rotate without a restart, rebuild the
+    validator, or the check does not run against what you changed. Calling `decode_jwt` directly bypasses that check,
+    because it has no construction time; there, selection is at least deterministic rather than
+    ambiguous.
+  * A forged **kid-less** token costs one HMAC per key in the set. Keysets are small and operator
+    controlled, and a forged token that names a `kid` still costs exactly one.
+
+When no key verifies a kid-less token against a multi-key keyset, the error says so
+(`No key in the JWT keyset verified this token`) rather than `Invalid JWT signature` — the
+signature may be perfectly valid, and the operator should be looking at key selection, not at
+clock skew and shared secrets.
+
 Lower-level pieces (`encode_jwt`, `decode_jwt`, claim validation for
 `exp`/`iat`/`nbf`/`iss`/`aud`) are covered in [Sessions & Auth](sessions_and_auth.md).
 
