@@ -487,7 +487,11 @@ validator = jwt_validator(jwt_secret; exp_timeout=300)
 ### Key rotation with `kid`
 
 When the signer sets a `kid` header, pass a keyset instead of a single secret; `decode_jwt`
-reads the header's `kid` to select the matching key:
+reads the header's `kid` to select the matching key. A token that carries **no** `kid` is tried
+against every key in the set — `"default"` first, then the rest by name — so a foreign issuer
+still signing with the old secret keeps working through the rotation window. See
+[Key rotation and the `kid` trust model](authentication.md#Key-rotation-and-the-kid-trust-model)
+for the full contract, including why a keyset may not hold one secret under two names.
 
 ```julia
 keys = Dict("primary" => primary_secret, "rotated" => rotated_secret)

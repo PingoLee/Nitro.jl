@@ -245,6 +245,41 @@ validator = jwt_validator(jwt_secret;
 any named claim. All configuration errors surface at construction — app startup — not at
 request time.
 
+### Observing a claim before you require it
+
+A claim has three positions, not two:
+
+| Tier | How | Token missing the claim |
+|------|-----|-------------------------|
+| ignored | not named | authenticates, nothing said |
+| **observed** | `warn_claims = [...]` | **authenticates, and the issuer is reported once** |
+| required | `required_claims = [...]` | rejected |
+
+The middle tier is for a claim you intend to enforce but cannot yet, because a legacy issuer
+still omits it. Without it the only way to run that window is to not ask for the claim at all —
+so the app learns nothing, you flip `required_claims`, and you find out who was non-compliant
+from the resulting 401s in production.
+
+```julia
+validator = jwt_validator(keyset;
+    required_claims = ["iss"],   # enforced today
+    warn_claims     = ["sub"],   # expected; still missing from one legacy issuer
+)
+```
+
+A token missing an observed claim still authenticates. The first time the validator sees a given
+`(claim, kid, iss)` combination it logs one warning naming that issuer; after that the same
+combination goes only to `@debug`, so a chatty legacy issuer cannot flood the log. When the
+warnings stop, the rollout is finished and the claim can move to `required_claims` — a claim may
+not be in both lists, and trying is a construction-time `ArgumentError`.
+
+The signal carries the claim name, the **keyset-verified** `kid`, and `iss`. Never the token, and
+never any other claim value. With a single string secret the header `kid` is an unverified label,
+so it is reported as `nothing` rather than repeated back.
+
+`identity_claim` is just a claim name, so this is also how you watch for tokens that produce a
+`Principal` with no `id`: put that claim — `"sub"` by default — in `warn_claims`.
+
 ### Key rotation and the `kid` trust model
 
 ```julia
@@ -267,6 +302,52 @@ exposed as `getuser(req).kid`. The trust boundary matters: **a `kid` is only tru
 was resolved against a keyset** — with a single string secret the header `kid` is an
 attacker-writable label, so it is never exposed on the `Principal`, `kid_required` denies,
 and `identity_from=:kid` is a construction-time `ArgumentError`.
+
+#### Tokens that carry no `kid`
+
+A `kid` is a *hint*, not a requirement, and a foreign issuer may omit it. When a token names
+no key, **every key in the keyset is tried**, `"default"` first and then the rest by name, and
+`principal.kid` reports whichever key actually verified the signature — which is honest, because
+that key *is* the signer. This is what makes a rotation window work: while an external issuer
+is still signing with the old secret, its kid-less tokens keep authenticating.
+
+A token that *does* name a `kid` is checked against that key and no other, so naming one is
+still both faster and more precise.
+
+Two consequences worth knowing:
+
+  * A **keyset may not hold the same secret under two names.** If it did, a kid-less token could
+    be attributed to either. `jwt_validator` refuses such a keyset at construction — and it
+    compares keys the way HMAC does, not the way `String` does — HMAC-SHA256 pre-hashes any key
+    longer than its 64-byte block and zero-pads any key shorter, so for a secret over 64 bytes `K`
+    and `sha256(K)` are one key, as are `"a"` and `"a\0"`, even though each pair reads as two.
+    Keyset **values** must be `String`s, too: a `SecretString` must be unwrapped, and a
+    `Vector{UInt8}` is refused outright. All of this is checked **when the validator is built**,
+    not per request — so if you mutate a keyset in place to rotate without a restart, rebuild the
+    validator, or the check does not run against what you changed. Calling `decode_jwt` directly bypasses that check,
+    because it has no construction time; there, selection is at least deterministic rather than
+    ambiguous.
+  * A forged **kid-less** token costs one HMAC per key in the set. Keysets are small and operator
+    controlled, and a forged token that names a `kid` still costs exactly one.
+
+#### Signing with a keyset
+
+Verifying may be ambiguous; **signing may not**. `encode_jwt` needs exactly one key, and it finds
+it in one of three ways — an explicit `kid=`, a `"default"` entry, or a keyset holding a single
+key. A keyset with several keys and no `"default"`, called without `kid=`, is an `ArgumentError`
+rather than an arbitrary choice:
+
+```julia
+keyset = Dict("primary" => ..., "rotated" => ...)
+
+encode_jwt(claims, keyset)                    # ✗ ArgumentError — which key?
+encode_jwt(claims, keyset; kid = "primary")   # ✓ signs with, and stamps, "primary"
+```
+
+When no key verifies a kid-less token against a multi-key keyset, the error says so
+(`No key in the JWT keyset verified this token`) rather than `Invalid JWT signature` — the
+signature may be perfectly valid, and the operator should be looking at key selection, not at
+clock skew and shared secrets.
 
 Lower-level pieces (`encode_jwt`, `decode_jwt`, claim validation for
 `exp`/`iat`/`nbf`/`iss`/`aud`) are covered in [Sessions & Auth](sessions_and_auth.md).

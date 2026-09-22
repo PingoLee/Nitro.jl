@@ -29,28 +29,95 @@ function _lookup_key(keyset::AbstractDict, kid::String)
     return nothing
 end
 
-function _resolve_kid(keyset::AbstractDict, header_kid::Union{String, Nothing})
+# ── Key selection ────────────────────────────────────────────────────────────────
+#
+# Signing and verifying ask DIFFERENT questions of a keyset, and one helper used to
+# answer both. `_resolve_kid` returned exactly one key, which is the right shape for
+# signing and the wrong shape for verifying (#253):
+#
+#   sign   -- "which ONE key do I sign with?" There has to be exactly one answer.
+#   verify -- "which keys COULD have signed this?" For a token that names a `kid`,
+#             that is one key. For a token that names none it is every distinct key
+#             NAME in the set: RFC 7517 treats `kid` as a hint, and a recipient holding
+#             a set is expected to try it. Trying only `"default"` rejected valid tokens
+#             for the whole of a rotation window -- exactly when a keyset holds more
+#             than one entry and an external issuer may still be signing with the old
+#             key. ("Name", not "entry", because `_lookup_key` resolves `"a"` and `:a`
+#             to one name and prefers the String; a keyset mixing both shadows one.)
+#
+# Both helpers are guards around a keyset type that does not exist. A JWK Set gives
+# each key a role (`use`, `key_ops`), so "which key signs" has one answer by
+# construction and "which keys verify" is a filter rather than a fallback chain. A
+# bare `Dict{String,String}` can express neither, which is why the question has been
+# answered three times in this file by hand. See the typed-keyset design issue.
+
+function _signing_kid(keyset::AbstractDict, header_kid::Union{String, Nothing})
     if header_kid !== nothing
         _lookup_key(keyset, header_kid) === nothing && throw(AuthError("Unknown JWT key id"))
         return header_kid
     end
-    fallback = _lookup_key(keyset, "default")
-    if fallback !== nothing
-        return "default"
-    end
-    # An empty keyset has no key to fall back to. `first(keys(...))` raises a BoundsError
-    # here, which escapes `decode_jwt` as something no caller catches -- auth middleware
-    # renders any throw as 401, but a direct `decode_jwt` caller sees the wrong type.
+    _lookup_key(keyset, "default") === nothing || return "default"
+    # An empty keyset has no key to sign with. `first(keys(...))` raised a BoundsError
+    # here, which escapes as something no caller catches.
     isempty(keyset) && throw(AuthError("Unknown JWT key id"))
-    first_key = first(keys(keyset))
-    return string(first_key)
+    # Exactly one key is unambiguous; take it. More than one, with no `"default"` and no
+    # `kid=`, is not a case to tie-break -- `first(keys(...))` made the signing key, and
+    # therefore the `kid` stamped into the header, a coin flip under `Dict` iteration
+    # order. Refuse, at the call that mints the token, and name the fix.
+    length(keyset) == 1 && return string(first(keys(keyset)))
+    throw(ArgumentError(
+        "encode_jwt: the keyset has $(length(keyset)) keys and no \"default\" entry, " *
+        "so there is no unambiguous signing key; pass kid= to choose one"))
+end
+
+"""
+    _verify_candidates(secret_or_keyset, header_kid) -> Vector{Tuple{Nullable{String}, String}}
+
+The ordered `(kid, secret)` pairs a token may be verified against. Concretely typed
+because this is the request path (nitro-core §7).
+"""
+function _verify_candidates(secret_or_keyset, header_kid::Nullable{String})
+    if secret_or_keyset isa AbstractString
+        # A single secret verifies everything, and the header `kid` stays an unverified
+        # label passed straight back -- `jwt_validator` discards it via `kid_trusted`.
+        return Tuple{Nullable{String}, String}[(header_kid, String(secret_or_keyset))]
+    elseif secret_or_keyset isa AbstractDict
+        if header_kid !== nothing
+            # A token that names its key gets that key and no other. Unchanged, and
+            # deliberately so: the steady-state path gains no trial loop, so a forged
+            # token still costs exactly one HMAC.
+            secret = _lookup_key(secret_or_keyset, header_kid)
+            secret === nothing && throw(AuthError("Unknown JWT key id"))
+            return Tuple{Nullable{String}, String}[(header_kid, secret)]
+        end
+        isempty(secret_or_keyset) && throw(AuthError("Unknown JWT key id"))
+        candidates = Tuple{Nullable{String}, String}[]
+        sizehint!(candidates, length(secret_or_keyset))
+        # `"default"` first, then the rest by name. The sort costs one small allocation
+        # on a path that is BY DEFINITION the rotation window; a token bearing a `kid`
+        # returned above without reaching it. Order is not load-bearing for
+        # correctness -- `jwt_validator` refuses a keyset whose entries share a secret,
+        # so at most one candidate can match -- but it is load-bearing for
+        # reproducibility, of tests and of the `kid` that reaches an operator's log.
+        default_secret = _lookup_key(secret_or_keyset, "default")
+        default_secret === nothing || push!(candidates, ("default", default_secret))
+        for name in sort!(unique!(String[string(k) for k in keys(secret_or_keyset)]))
+            name == "default" && continue
+            secret = _lookup_key(secret_or_keyset, name)
+            secret === nothing && continue
+            push!(candidates, (name, secret))
+        end
+        isempty(candidates) && throw(AuthError("Unknown JWT key id"))
+        return candidates
+    end
+    throw(ArgumentError("JWT secret must be a string or dictionary"))
 end
 
 function _resolve_secret(secret_or_keyset, kid::Union{String, Nothing}=nothing)
     if secret_or_keyset isa AbstractString
         return (String(secret_or_keyset), kid)
     elseif secret_or_keyset isa AbstractDict
-        resolved_kid = _resolve_kid(secret_or_keyset, kid)
+        resolved_kid = _signing_kid(secret_or_keyset, kid)
         secret = _lookup_key(secret_or_keyset, resolved_kid)
         secret === nothing && throw(AuthError("Unknown JWT key id"))
         return (secret, resolved_kid)
@@ -137,9 +204,9 @@ function decode_jwt(token::AbstractString, secret_or_keyset; issuer=nothing, aud
     claims isa AbstractDict || throw(AuthError("Invalid JWT claims"))
 
     # Same class, one level down: a JSON `kid` is whatever the token's author typed --
-    # `123`, `["a"]`, `null`. Anything but a string is a MethodError on `_resolve_secret`,
-    # whose `kid` parameter is itself typed -- so it fires for a plain string secret just
-    # as it does for a keyset.
+    # `123`, `["a"]`, `null`. Anything but a string is a MethodError on
+    # `_verify_candidates`, whose `header_kid` parameter is itself typed -- so it fires
+    # for a plain string secret just as it does for a keyset.
     raw_kid = get(header, "kid", nothing)
     (raw_kid === nothing || raw_kid isa AbstractString) ||
         throw(AuthError("Invalid JWT key id"))
@@ -160,8 +227,12 @@ function decode_jwt(token::AbstractString, secret_or_keyset; issuer=nothing, aud
         get(header, "alg", nothing) == "HS256" ||
             throw(AuthError("Unsupported JWT algorithm"))
 
-        secret, resolved_kid = _resolve_secret(secret_or_keyset, kid)
-        signature = _hmac_sha256(secret, string(segments[1], ".", segments[2]))
+        # Resolved BEFORE the signature is decoded, so a token naming an unknown `kid`
+        # still reports "Unknown JWT key id" and is not pre-empted by a signature that
+        # also happens to be malformed. That is the error ordering `_resolve_secret`
+        # had when it stood here, and it is worth preserving.
+        candidates = _verify_candidates(secret_or_keyset, kid)
+
         # The third sink, and the sharpest one: a well-formed header and claims with a
         # signature segment that is not decodable base64 -- `Bearer <hdr>.<claims>.x` --
         # reached `base64decode` as an ArgumentError on the authenticated path.
@@ -178,8 +249,30 @@ function decode_jwt(token::AbstractString, secret_or_keyset; issuer=nothing, aud
             # to check transport rather than key rotation and clock skew.
             throw(AuthError("Invalid JWT signature encoding"))
         end
-        _constant_time_equals(signature, provided) || throw(AuthError("Invalid JWT signature"))
-        kid = resolved_kid
+
+        # Hoisted: one string for the whole trial, not one per candidate. Decoding
+        # `provided` ahead of the loop also means a garbage signature costs zero HMACs
+        # rather than one per key.
+        signing_input = string(segments[1], ".", segments[2])
+        matched_kid::Nullable{String} = nothing
+        verified = false
+        for (candidate_kid, secret) in candidates
+            _constant_time_equals(_hmac_sha256(secret, signing_input), provided) || continue
+            matched_kid = candidate_kid
+            verified = true
+            break
+        end
+        if !verified
+            # The message names key selection ONLY when key selection was actually in
+            # play. With one candidate -- a string secret, a single-key keyset, or any
+            # token that named its `kid` -- the answer is still "the signature does not
+            # match", byte-identical to before, so the common case does not churn. It
+            # reaches no client either way: auth middleware answers with a fixed 401.
+            throw(AuthError(length(candidates) == 1 ?
+                "Invalid JWT signature" :
+                "No key in the JWT keyset verified this token"))
+        end
+        kid = matched_kid
     end
 
     validate_claims(claims; exp_timeout=exp_timeout, iat_skew=iat_skew, issuer=issuer, audience=audience, require_exp=require_exp, required_claims=required_claims)
