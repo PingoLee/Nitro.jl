@@ -258,6 +258,20 @@ Two consequences worth knowing:
   * A forged **kid-less** token costs one HMAC per key in the set. Keysets are small and operator
     controlled, and a forged token that names a `kid` still costs exactly one.
 
+#### Signing with a keyset
+
+Verifying may be ambiguous; **signing may not**. `encode_jwt` needs exactly one key, and it finds
+it in one of three ways — an explicit `kid=`, a `"default"` entry, or a keyset holding a single
+key. A keyset with several keys and no `"default"`, called without `kid=`, is an `ArgumentError`
+rather than an arbitrary choice:
+
+```julia
+keyset = Dict("primary" => ..., "rotated" => ...)
+
+encode_jwt(claims, keyset)                    # ✗ ArgumentError — which key?
+encode_jwt(claims, keyset; kid = "primary")   # ✓ signs with, and stamps, "primary"
+```
+
 When no key verifies a kid-less token against a multi-key keyset, the error says so
 (`No key in the JWT keyset verified this token`) rather than `Invalid JWT signature` — the
 signature may be perfectly valid, and the operator should be looking at key selection, not at

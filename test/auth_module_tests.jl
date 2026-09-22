@@ -473,6 +473,40 @@ end
     @test Nitro.Auth.jwt_validator("s") isa Function
 end
 
+@testset "encode_jwt refuses an ambiguous signing key (#253)" begin
+    caught(f) = try; f(); nothing; catch err; err; end
+    payload = Dict("sub" => "42")
+
+    # -- More than one key, no "default", no kid= : `first(keys(...))` used to pick one
+    # under Dict iteration order and stamp it into the header, so the token's stated
+    # signer was a coin flip. Refuse at the call that mints it.
+    err = caught(() -> Nitro.Auth.encode_jwt(payload, Dict("alpha" => "s1", "bravo" => "s2")))
+    @test err isa ArgumentError
+    @test occursin("pass kid=", sprint(showerror, err))
+
+    # -- The three unambiguous cases still sign, and stamp the key they used.
+    header_kid(tok) = get(
+        JSON.parse(String(Nitro.Auth._base64url_decode(split(tok, '.')[1]))), "kid", nothing)
+
+    @test header_kid(Nitro.Auth.encode_jwt(payload, Dict("only" => "s1"))) == "only"
+    @test header_kid(Nitro.Auth.encode_jwt(payload, Dict("default" => "s1", "other" => "s2"))) == "default"
+    @test header_kid(Nitro.Auth.encode_jwt(payload, Dict("alpha" => "s1", "bravo" => "s2");
+                                           kid="bravo")) == "bravo"
+    # A plain string secret stamps no kid at all.
+    @test header_kid(Nitro.Auth.encode_jwt(payload, "s1")) === nothing
+
+    # -- Unchanged: a kid that is not in the keyset, and an empty keyset. Messages pinned,
+    # per this file's own convention -- `err isa AuthError` alone is satisfied by any
+    # rejection, including the new ArgumentError path arriving for the wrong reason.
+    for (label, call) in (
+            ("unknown kid", () -> Nitro.Auth.encode_jwt(payload, Dict("alpha" => "s1"); kid="ghost")),
+            ("empty keyset", () -> Nitro.Auth.encode_jwt(payload, Dict{String, String}())))
+        err = caught(call)
+        @test (label, err isa Nitro.Auth.AuthError) == (label, true)
+        @test (label, sprint(showerror, err)) == (label, "Unknown JWT key id")
+    end
+end
+
 @testset "Password helpers" begin
     hash = Nitro.Auth.make_password("ValidPass1!")
     @test Nitro.Auth.check_password("ValidPass1!", hash)
@@ -748,7 +782,8 @@ end
 
         # A rejecting user_validator still yields nothing
         rejecting = Nitro.Auth.jwt_validator(keyset; user_validator = _ -> nothing)
-        @test rejecting(Nitro.Auth.encode_jwt(Dict("sub" => "7"), keyset; expires_in=3600)) === nothing
+        # `kid=` is now required to sign with a multi-key keyset that has no "default".
+        @test rejecting(Nitro.Auth.encode_jwt(Dict("sub" => "7"), keyset; kid="service-a", expires_in=3600)) === nothing
     end
 
     @testset "construction-time validation" begin

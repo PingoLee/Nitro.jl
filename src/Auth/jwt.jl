@@ -57,12 +57,17 @@ function _signing_kid(keyset::AbstractDict, header_kid::Union{String, Nothing})
         return header_kid
     end
     _lookup_key(keyset, "default") === nothing || return "default"
-    # An empty keyset has no key to fall back to. `first(keys(...))` raises a BoundsError
-    # here, which escapes as something no caller catches -- auth middleware renders any
-    # throw as 401, but a direct caller sees the wrong type.
+    # An empty keyset has no key to sign with. `first(keys(...))` raised a BoundsError
+    # here, which escapes as something no caller catches.
     isempty(keyset) && throw(AuthError("Unknown JWT key id"))
-    first_key = first(keys(keyset))
-    return string(first_key)
+    # Exactly one key is unambiguous; take it. More than one, with no `"default"` and no
+    # `kid=`, is not a case to tie-break -- `first(keys(...))` made the signing key, and
+    # therefore the `kid` stamped into the header, a coin flip under `Dict` iteration
+    # order. Refuse, at the call that mints the token, and name the fix.
+    length(keyset) == 1 && return string(first(keys(keyset)))
+    throw(ArgumentError(
+        "encode_jwt: the keyset has $(length(keyset)) keys and no \"default\" entry, " *
+        "so there is no unambiguous signing key; pass kid= to choose one"))
 end
 
 """
