@@ -7,7 +7,7 @@ using Dates
 
 using ..Util: text, json, formdata, multipart, parseparam, FormFile
 using ..Reflection: struct_builder, extract_struct_info
-using ..Errors: ValidationError
+using ..Errors: ValidationError, is_unrecoverable
 using ..Types
 using ..Cookies
 # HTTP.jl v2 newly exports `Cookie` at the top level, which collides with Nitro's
@@ -119,14 +119,23 @@ function safe_extract(f::Function, param::Param{U}) :: T where {T, U <: Extracto
     try 
         return f()
     catch e
-        # An interrupt is not client input and must not become a 400. This is the fourth of the
-        # four sites that wrap an exception into a `ValidationError`, and the last to get the
-        # guard -- `parseparam_checked` (src/utilities/misc.jl) and both `Types.*` decode
-        # accessors (src/types.jl) have carried it all along. Without it a Ctrl-C landing inside
-        # a body deserialization is reported as a rejected request, and neither `handlerequest`
-        # nor `serve` -- both of which special-case `InterruptException` -- ever sees it. A fifth
-        # wrap site must copy this line too.
-        e isa InterruptException && rethrow()
+        # None of these is client input, so none may become a 400. Without this line a Ctrl-C
+        # landing inside a body deserialization is reported as a rejected request, and neither
+        # `handlerequest` nor `serve` -- both of which special-case `InterruptException` --
+        # ever sees it.
+        #
+        # Widened from `InterruptException` alone in #254, and this site is the reason that
+        # issue's fix is not confined to the parsers. `Json{T}`/`JsonFragment{T}`/`Body{T}`
+        # resolve through `Types.jsonbody` -> `BodyParsers.json`, which now rethrows a
+        # `StackOverflowError` from a deeply-nested body instead of answering `nothing`. If
+        # this guard still named only `InterruptException`, that rethrow would be caught one
+        # frame later and laundered into a `ValidationError` -- so every extractor-based
+        # route, the most idiomatic shape in the framework, would still answer 400 for a
+        # corrupted worker while a bare `getjson` handler answered 500. Same input, two
+        # verdicts, and the narrowing a no-op exactly where routes actually are.
+        #
+        # A further wrap site must copy this line too.
+        is_unrecoverable(e) && rethrow()
         if e isa ValidationError
             throw(e)
         end
@@ -306,7 +315,10 @@ function extract(param::Param{Session{T}}, request::LazyRequest, secret_key::Nul
         else
             nothing
         end
-    catch
+    catch e
+        # The store is application code, so "it threw" means "no session for this id" and the
+        # extractor falls back. The three in `is_unrecoverable` are not that (#254).
+        is_unrecoverable(e) && rethrow()
         nothing
     end
 

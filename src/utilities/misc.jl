@@ -2,7 +2,7 @@ using HTTP
 using JSON
 using Dates
 
-using ..Errors: ValidationError
+using ..Errors: ValidationError, is_unrecoverable
 
 export recursive_merge, parseparam, parseparam_checked,
     handlerequest,
@@ -171,8 +171,9 @@ function parseparam(type::Union, str::String)
             return parseparam(current_type, str)
         catch e
             # A member type failing is the normal case — but do not let the blanket catch
-            # swallow an interrupt, which would defeat the guard in `parseparam_checked`.
-            e isa InterruptException && rethrow()
+            # swallow a condition that is not a member type failing, which would defeat the
+            # guard in `parseparam_checked`. Widened past `InterruptException` in #254.
+            is_unrecoverable(e) && rethrow()
             continue
         end
     end
@@ -191,10 +192,16 @@ function parseparam(::Type{T}, str::String) where {T}
         return parse(T, str)
     catch e
         # This is the method every scalar type below the specialized ones lands in, so it is
-        # where an interrupt would actually be swallowed — falling through to `JSON.parse`
-        # and, one layer up, being reported as a client error. The matching guard in
+        # where the swallow would actually happen — falling through to `JSON.parse` and, one
+        # layer up, being reported as a client error. The matching guard in
         # `parseparam_checked` never sees it without this rethrow.
-        e isa InterruptException && rethrow()
+        #
+        # Widened past `InterruptException` in #254, and the fall-through below is precisely
+        # why: `JSON.parse` raises `StackOverflowError` on a deeply-nested value, so a ~20 KB
+        # query string of `[[[[…` reaches it through ANY scalar parameter -- `parse(Int, str)`
+        # fails first, lands here, and overflows. That was reported as `400 Bad Request` off a
+        # worker Julia had just called possibly corrupt.
+        is_unrecoverable(e) && rethrow()
         return JSON.parse(str, T)
     end
 end
@@ -227,7 +234,10 @@ function parseparam_checked(::Type{T}, str::String, name::String, source::Symbol
     try
         return parseparam(T, str)
     catch e
-        e isa InterruptException && rethrow()
+        # #254: not just an interrupt. A deeply-nested query value overflows the stack inside
+        # `parseparam`'s `JSON.parse` fall-through; wrapping that in a `ValidationError` calls
+        # a corrupted worker a client mistake.
+        is_unrecoverable(e) && rethrow()
         # Already well-formed (e.g. the `Regex` length cap above) — do not double-wrap.
         e isa ValidationError && rethrow()
         throw(ValidationError("Invalid $source parameter '$name': expected $T", e))

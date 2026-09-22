@@ -129,8 +129,10 @@ function decode_jwt(token::AbstractString, secret_or_keyset; issuer=nothing, aud
     # Decoding succeeding does not make either segment an object. A header of `[]` (`W10`)
     # makes `get(::Vector{Any}, "alg", nothing)` a MethodError; a non-object claims segment
     # makes `validate_claims(::AbstractDict)` one. None of this is an authz hole -- auth
-    # middleware renders any throw as 401 -- but a direct `decode_jwt` caller was getting
-    # exceptions the API does not document.
+    # middleware renders these as 401 -- but a direct `decode_jwt` caller was getting
+    # exceptions the API does not document. (It used to render ANY throw as 401; since #254
+    # the three in `is_unrecoverable` propagate instead. Every type on this path is an
+    # `AuthError` or a `MethodError`, so none of them is affected.)
     header isa AbstractDict || throw(AuthError("Invalid JWT header"))
     claims isa AbstractDict || throw(AuthError("Invalid JWT claims"))
 

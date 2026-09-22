@@ -6,6 +6,7 @@ using Sockets
 # but importing it lets the `@ref` cross-references in the docstrings below resolve.
 using ...Core: getip, setip!, getpeerip, header_name_isequal
 using ...Types: Nullable
+using ...Errors: is_unrecoverable
 
 export ExtractIP, extract_ip
 
@@ -252,7 +253,12 @@ function _try_parse_ip(value::Union{AbstractString, Nothing})::Nullable{IPAddr}
     # `IPAddr`, so guard against malformed input ourselves.
     return try
         parse(IPAddr, String(value))
-    catch
+    catch e
+        # A malformed address is `nothing`; the three in `is_unrecoverable` are not (#254).
+        # `parse(IPAddr, …)` does not recurse, so no request input reaches this block with
+        # one of them -- this ships for consistency, and deliberately without a test, since
+        # any test written for it would pass against the unpatched code too.
+        is_unrecoverable(e) && rethrow()
         nothing
     end
 end
