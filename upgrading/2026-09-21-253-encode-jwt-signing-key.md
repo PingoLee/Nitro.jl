@@ -12,6 +12,11 @@
   a server that refuses to start. Restarting the app and watching it come up does not verify the
   migration; exercising the route that mints tokens does.
 
+> **Superseded in this train by [#260](2026-09-22-260-typed-jwt-keyset.md).** `kid=` no longer
+> exists, so the `kid = "primary"` migration below would now be a `MethodError`. If you have
+> not applied this entry yet, apply #260's instead: it covers the same calls and ends in the
+> same place — a keyset that says which key signs. The `"default"` route below is still valid.
+
 ### What changed
 
 `encode_jwt(claims, keyset)` with no `kid=` resolved the signing key through the same helper the

@@ -32,8 +32,7 @@ const NOW_TS = trunc(Int, time())
             "exp" => NOW_TS + 60,
             "nbf" => NOW_TS - 1,
         ),
-        keyset;
-        kid="rotated"
+        Nitro.Auth.JWTKeyset("rotated" => "secret-b")
     )
 
     claims, kid = Nitro.Auth.decode_jwt(token, keyset; issuer="nitro-tests", audience="nitro", with_kid=true)

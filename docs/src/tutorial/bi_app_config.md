@@ -20,6 +20,7 @@ Split the config by responsibility instead of using one large untyped dictionary
 module BIAppConfig
 
 using Nitro: SecretString
+using Nitro.Auth: JWTKeyset
 
 export AppConfig, DatabaseConfig, AuthConfig, WorkerConfig, load_config, required_env
 
@@ -40,7 +41,7 @@ end
 
 struct AuthConfig
     secret_key::SecretString
-    api_keys::Dict{String, SecretString}
+    api_keys::JWTKeyset
     allowed_kids::Vector{String}
     session_secure::Bool
     session_timeout::Int
@@ -76,11 +77,11 @@ function load_config(env::String="dev")
 
     auth = AuthConfig(
         api_secret,
-        # The keyset holds the WRAPPER, not a revealed copy. Copying `reveal(...)` into a plain
-        # `Dict` puts the raw secret straight back onto the display and JSON paths that
-        # `SecretString` exists to close -- the field would be masked and the Dict entry would
-        # not. Add one entry per key id as you rotate.
-        Dict("default" => api_secret),
+        # Built ONCE, here, so a keyset mistake -- two key ids sharing a secret, say -- stops
+        # the app at boot instead of turning every request into a 401. It takes the
+        # `SecretString` WRAPPER, not a revealed copy, so the raw secret never lands on a
+        # display or JSON path. Add a `verify = [...]` key per retired or client key id.
+        JWTKeyset("default" => api_secret),
         ["default"],
         # NOT `env == "prod"`. A security flag must fail CLOSED: an environment variable
         # missing on a production box would silently drop the cookie `Secure` attribute,
@@ -182,9 +183,11 @@ serve(host=config.server_host, port=config.server_port, context=config)
 ### Reading A Secret Back Out
 
 `SecretString` is deliberately **not** an `AbstractString`, so it cannot flow into a string
-operation or a log line unnoticed. Framework components that need the raw key — `CSRFMiddleware`,
-`encode_jwt`, `jwt_validator`, `set_cookie!(..., encrypted=true)` — take a plain `String`, so
-unwrap with `reveal` at the call itself rather than storing a revealed copy in the config:
+operation or a log line unnoticed. A `JWTKeyset` takes `SecretString`s directly, so
+`encode_jwt(claims, config.auth.api_keys)` and `jwt_validator(config.auth.api_keys)` need no
+unwrapping. Framework components that need a single raw key — `CSRFMiddleware`, `encode_jwt` or
+`jwt_validator` with one plain secret, `set_cookie!(..., encrypted=true)` — take a plain `String`,
+so unwrap with `reveal` at the call itself rather than storing a revealed copy in the config:
 
 ```julia
 serve(

@@ -200,12 +200,8 @@ A `kid` that is **present** in the header but absent from the keyset is
 `AuthError("Unknown JWT key id")` — no falling back to another key, which is what would let a
 revoked signer keep working.
 
-A token carrying **no** `kid` at all is a different case, and the framework is less strict
-there than the paragraph above may suggest: it resolves to the keyset's `"default"` entry, or,
-failing that, to an arbitrary first key — and it verifies against **only** that one key. A
-kid-less token signed with a *different* key in the same keyset is therefore rejected as
-`AuthError("Invalid JWT signature")`, which points at the signature rather than at key
-selection. If you accept kid-less tokens from an external issuer, have it stamp a `kid`.
+A token carrying **no** `kid` at all is a different case: it is tried against every key in the
+keyset — see [Tokens that carry no `kid`](#Tokens-that-carry-no-kid) below.
 
 **Structural checks are not scoped to `verify`, and that includes `verify=false`.** A token
 whose header or claims segment is not a JSON *object*, or whose `kid` is not a string, is
@@ -282,20 +278,45 @@ so it is reported as `nothing` rather than repeated back.
 
 ### Key rotation and the `kid` trust model
 
+A keyset is a [`JWTKeyset`](@ref Nitro.Auth.JWTKeyset): **exactly one signing key**, plus any
+number of keys that only verify. The signing key verifies too.
+
 ```julia
 required_env(name::String) = get(ENV, name, nothing) === nothing ? error("$name must be set") : ENV[name]
 
-keyset = Dict(
-    "primary" => required_env("JWT_SECRET_PRIMARY"),
-    "rotated" => required_env("JWT_SECRET_ROTATED"),
+keyset = JWTKeyset(
+    "current" => required_env("JWT_SECRET_CURRENT");                # signs and verifies
+    verify = ["previous" => required_env("JWT_SECRET_PREVIOUS")],   # verifies only
 )
 validator = jwt_validator(keyset)
 ```
 
-`required_env`, not `get(ENV, "JWT_SECRET_PRIMARY", "")`. An empty-string fallback does not
-disable the key — it installs `""` as a live HMAC signing key under a trusted `kid`, so a token
-signed with the empty secret verifies. Every key in a keyset must be required from the
-environment; see [Managing Secrets](secrets.md).
+`required_env`, not `get(ENV, "JWT_SECRET_CURRENT", "")`. An empty-string fallback does not
+disable the key — it would install `""` as a live HMAC key under a trusted `kid`, so a token
+signed with the empty secret verifies. `JWTKeyset` refuses an empty secret for exactly that
+reason, but the error then surfaces as a missing key rather than a missing variable; require
+every key from the environment. See [Managing Secrets](secrets.md).
+
+The roles describe what a key is **for**, not where it is in a rotation. A rotation window is
+"the new key signs, the old one verifies". A registry of service identities — each caller signs
+with its own key, and `identity_from=:kid` makes the signer the principal — is "this service's
+key signs, every client's key verifies".
+
+A plain `Dict` of `kid => secret` still works, and is lifted into a `JWTKeyset`:
+
+| `Dict` shape | Result |
+|---|---|
+| has a `"default"` entry | `"default"` signs; every other entry verifies |
+| exactly one entry | that entry signs |
+| two or more entries, no `"default"` | `ArgumentError` — no key is marked to sign |
+| empty | `ArgumentError` |
+
+`jwt_validator` lifts a `Dict` **once, at construction** — app startup — and keeps that
+snapshot: mutating the `Dict` afterwards does not change what a running validator accepts. A
+direct `decode_jwt` or `encode_jwt` call with a `Dict` lifts it on **every** call. Build the
+keyset once, next to your configuration, so a misconfiguration fails at startup — a request-time
+auth check that wraps `decode_jwt` in a bare `catch` would otherwise turn it into a 401 on every
+request, with nothing at startup to say why.
 
 `decode_jwt` selects the key by the token's `kid` header, and the *verified* key id is
 exposed as `getuser(req).kid`. The trust boundary matters: **a `kid` is only trusted when it
@@ -303,45 +324,46 @@ was resolved against a keyset** — with a single string secret the header `kid`
 attacker-writable label, so it is never exposed on the `Principal`, `kid_required` denies,
 and `identity_from=:kid` is a construction-time `ArgumentError`.
 
+#### What a keyset refuses
+
+The constructor owns every check, so they apply on every path — `jwt_validator`, and a direct
+`decode_jwt` or `encode_jwt` call alike:
+
+  * **Two keys that are the same HMAC key.** A kid-less token could otherwise be attributed to
+    either. Keys are compared the way HMAC does, not the way `String` does — HMAC-SHA256
+    pre-hashes any key longer than its 64-byte block and zero-pads any key shorter, so for a
+    secret over 64 bytes `K` and `sha256(K)` are one key, as are `"a"` and `"a\0"`, even though
+    each pair reads as two.
+  * **A secret that is not a string.** A value must be an `AbstractString` or a `SecretString`
+    (which is accepted as is — no need to `reveal` it). A `Vector{UInt8}` is refused **without
+    being read**: converting one to a `String` empties the caller's buffer.
+  * **An empty secret, a duplicate `kid`, and a `kid` that is not a `String` or `Symbol`.**
+
 #### Tokens that carry no `kid`
 
 A `kid` is a *hint*, not a requirement, and a foreign issuer may omit it. When a token names
-no key, **every key in the keyset is tried**, `"default"` first and then the rest by name, and
-`principal.kid` reports whichever key actually verified the signature — which is honest, because
-that key *is* the signer. This is what makes a rotation window work: while an external issuer
-is still signing with the old secret, its kid-less tokens keep authenticating.
+no key, **every key in the keyset is tried**, the signing key first and then the rest by name,
+and `principal.kid` reports whichever key actually verified the signature — which is honest,
+because that key *is* the signer. This is what makes a rotation window work: while an external
+issuer is still signing with the old secret, its kid-less tokens keep authenticating.
 
 A token that *does* name a `kid` is checked against that key and no other, so naming one is
-still both faster and more precise.
-
-Two consequences worth knowing:
-
-  * A **keyset may not hold the same secret under two names.** If it did, a kid-less token could
-    be attributed to either. `jwt_validator` refuses such a keyset at construction — and it
-    compares keys the way HMAC does, not the way `String` does — HMAC-SHA256 pre-hashes any key
-    longer than its 64-byte block and zero-pads any key shorter, so for a secret over 64 bytes `K`
-    and `sha256(K)` are one key, as are `"a"` and `"a\0"`, even though each pair reads as two.
-    Keyset **values** must be `String`s, too: a `SecretString` must be unwrapped, and a
-    `Vector{UInt8}` is refused outright. All of this is checked **when the validator is built**,
-    not per request — so if you mutate a keyset in place to rotate without a restart, rebuild the
-    validator, or the check does not run against what you changed. Calling `decode_jwt` directly bypasses that check,
-    because it has no construction time; there, selection is at least deterministic rather than
-    ambiguous.
-  * A forged **kid-less** token costs one HMAC per key in the set. Keysets are small and operator
-    controlled, and a forged token that names a `kid` still costs exactly one.
+still both faster and more precise. A forged **kid-less** token costs one HMAC per key in the
+set; keysets are small and operator controlled, and a forged token that names a `kid` still
+costs exactly one.
 
 #### Signing with a keyset
 
-Verifying may be ambiguous; **signing may not**. `encode_jwt` needs exactly one key, and it finds
-it in one of three ways — an explicit `kid=`, a `"default"` entry, or a keyset holding a single
-key. A keyset with several keys and no `"default"`, called without `kid=`, is an `ArgumentError`
-rather than an arbitrary choice:
+A keyset signs with its signing key and stamps that key's `kid` into the header; a plain string
+secret signs a token with no `kid`. There is no `kid=` keyword — which key signs is the keyset's
+to say, not the call site's. To call another service **as** one identity of a shared registry,
+build a one-key keyset for that purpose, once:
 
 ```julia
-keyset = Dict("primary" => ..., "rotated" => ...)
+encode_jwt(claims, keyset)                         # signs with, and stamps, "current"
 
-encode_jwt(claims, keyset)                    # ✗ ArgumentError — which key?
-encode_jwt(claims, keyset; kid = "primary")   # ✓ signs with, and stamps, "primary"
+as_partner = JWTKeyset("partner-caller" => required_env("JWT_SECRET_PARTNER"))
+encode_jwt(claims, as_partner; expires_in = 60)    # signs as "partner-caller"
 ```
 
 When no key verifies a kid-less token against a multi-key keyset, the error says so

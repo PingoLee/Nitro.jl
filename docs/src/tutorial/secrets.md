@@ -165,4 +165,4 @@ While standard sessions don't need a secret, other parts of Nitro do rely heavil
 
 1. **CSRF Protection**: `CSRFMiddleware(secret)` uses your secret to HMAC-SHA256 the CSRF token *together with the current session id*, so a token is valid only for the visitor it was minted for — a signature alone would prove the server issued the token, not that it issued it to this client. See [Sessions & Auth](sessions_and_auth.md#Auth-Cookies-and-CSRF).
 2. **Encrypted Cookies**: If you manually call `set_cookie!(..., encrypted=true)`, the `Cookies` module uses AES-256-GCM to fully encrypt the payload using the `secret_key` you provide to the framework.
-3. **JWT and Auth**: If you use the `Nitro.Auth` module helpers like `encode_jwt(payload, keys)` or `jwt_validator`, you use your secrets to sign the tokens.
+3. **JWT and Auth**: If you use the `Nitro.Auth` module helpers like `encode_jwt(payload, keyset)` or `jwt_validator`, you use your secrets to sign the tokens. A `JWTKeyset` accepts `SecretString` values directly and refuses an empty one — see [Authentication](authentication.md#Key-rotation-and-the-kid-trust-model).
