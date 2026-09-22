@@ -33,6 +33,11 @@ import HTTP: Request, Response, Stream, queryparams
 # the top level the way v1 did; re-export them (with the read side) so Nitro STREAM/SSE
 # handlers can call them unqualified, as before.
 import HTTP: startread, startwrite, closeread, closewrite
+# `SSEEvent` is the value `Res.sse`'s producer writes, so it has to be reachable without
+# qualifying HTTP — same reasoning as `Request`/`Response`/`Stream` above. `SSEStream` and
+# `sse_stream` are NOT re-exported: the stream arrives as an argument to the producer, and
+# building the response is `Res.sse`'s job.
+import HTTP: SSEEvent
 import HTTP.WebSockets: WebSocket
 using .Core: App, Nullable, HOFRouter
 using .Core: GET, POST, PUT, DELETE, PATCH
@@ -55,7 +60,7 @@ export  # The application handle
         # Util
         getparams, getquery, getjson, getform, getfiles, getpost,
         getsession, setsession!, getuser, getip, setip!, getpeerip, getcontext, payload, getexternalurl,
-        formdata, multipart, format_sse_message,
+        formdata, multipart,
         # Environment resolution (#55) -- reports the env, never gates on it
         current_env,
         # Request body parsers (response building lives in `Res`, #28)
@@ -81,8 +86,9 @@ export  # The application handle
         Auth,
         # Common HTTP Types
         Request, Response, Stream, WebSocket, queryparams,
-        # Streaming primitives (re-exported from HTTP for STREAM/SSE handlers)
-        startread, startwrite, closeread, closewrite,
+        # Streaming primitives (re-exported from HTTP for STREAM/SSE handlers).
+        # `SSEEvent` is what a `Res.sse` producer writes; the builder itself is `Res.sse`.
+        startread, startwrite, closeread, closewrite, SSEEvent,
         # Context Types and methods
         Context,
         # Django-style Routing (THE routing API)

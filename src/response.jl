@@ -12,6 +12,12 @@ for lives here:
 | [`Res.status`](@ref) | none — bare status code, empty body |
 | [`Res.file`](@ref) | sniffed from the path; serves **inline** unless `disposition=`/`filename=` is given |
 | [`Res.redirect`](@ref) | none — sets `Location`; **302** by default, `status=307` preserves method and body |
+| [`Res.sse`](@ref) | `text/event-stream` — a long-lived Server-Sent Events stream, chunked and flushed per event |
+
+`Res.sse` is the one builder whose body is **not** materialized when it returns: it hands back a
+response whose body is an open `HTTP.SSEStream` cursor that a producer fills afterwards. That makes
+it single-use — never cache or share an SSE response — and it is why it is the only builder with a
+background task behind it. See the streaming tutorial for the shape.
 
 The bare names `text`, `json` and `binary` are *request body parsers*
 (`Nitro.BodyParsers`), not response builders. One name, one direction.
@@ -345,6 +351,175 @@ function redirect(url::String; status::Int=302, headers::Vector=[])
     response = HTTP.Response(status, body="")
     HTTP.setheader(response, "Location" => url)
     apply_headers!(response, headers)
+    return response
+end
+
+
+"""
+Default ceiling, in bytes, on **one serialized SSE event** — `HTTP.SSEStream`'s `max_len`.
+
+16 MiB is HTTP.jl's own `SSEStream` default. It is spelled out here rather than inherited because
+`_DEFAULT_SSE_STREAM_MAX_LEN` is private, while the three names [`sse`](@ref) actually builds on —
+`HTTP.sse_stream`, `HTTP.SSEStream` and `HTTP.SSEEvent` — are public API.
+
+This caps a single event, **not** the stream's buffer. See [`sse`](@ref) on pacing.
+"""
+const SSE_MAX_EVENT_BYTES = 16 * 1024 * 1024
+
+# Is `err` a write that failed because the SSE stream was already closed?
+#
+# The bare shape is `Base.IOError`, which is what a closed `Base.BufferStream` raises — measured
+# both for a stream closed before the write and one closed during a blocked write. But a producer
+# that fans its writes out over tasks (`@sync` + `Threads.@spawn`, a perfectly reasonable shape for
+# one that multiplexes several sources) gets that wrapped: `CompositeException` →
+# `TaskFailedException` → `IOError`. Classifying the wrapper as "not a disconnect" would log an
+# error for every departing client, which is the noise this classification exists to prevent.
+#
+# Bounded depth rather than a `while true`: these wrappers nest at most a couple of levels in
+# practice, and a fixed bound cannot be walked into a cycle by an exception type that holds itself.
+function _is_closed_stream_error(err, depth::Int = 0)::Bool
+    err isa Base.IOError && return true
+    depth >= 4 && return false
+    if err isa CompositeException
+        # `any`, not `first`: a fan-out can fail on several tasks and only one needs to be the
+        # disconnect for the rest to be its consequence.
+        return any(e -> _is_closed_stream_error(e, depth + 1), err.exceptions)
+    end
+    err isa TaskFailedException && return _is_closed_stream_error(err.task.result, depth + 1)
+    return false
+end
+
+# Run a `Res.sse` producer on its own task and close the stream when it finishes.
+#
+# Closing in `finally` is not hygiene, it is what ENDS the response: the transport's drain parks in
+# `body_read!` → `eof(buffer)` until a byte arrives or the stream closes, so a producer that
+# returned (or threw) without closing would hold the connection open forever.
+#
+# `errormonitor` at the call site, plus `InterruptException` rethrow here, per the one background-task
+# discipline in src/middleware/janitor.jl: nothing waits on this task, so a throw that is neither
+# caught nor monitored dies mute.
+function _run_sse_producer(producer::Function, events::HTTP.SSEStream)
+    try
+        producer(events)
+    catch err
+        err isa InterruptException && rethrow()
+        # A write that failed BECAUSE the stream was closed is the expected end, not a fault. The
+        # transport closes the body when the client disconnects — and `terminate` force-closes the
+        # socket on a long-lived handler by design (src/core/lifecycle.jl) — after which the
+        # producer's next `write` throws. Reporting that at error level would make the most common
+        # way an SSE connection ends look like a bug, once per connected client.
+        #
+        # BOTH halves of the predicate are load-bearing, and `!isopen` alone was wrong. The
+        # docstring below teaches `try … finally close(events) end`, so a producer that throws for
+        # its OWN reasons routinely reaches this `catch` with the stream already closed by its own
+        # `finally` — and keying on the state alone silently demoted that to `@debug`, which is
+        # compiled out by default. The operator got nothing and the client got a clean short stream.
+        #
+        # `_is_closed_stream_error` is the second half, and it is what keeps a genuine fault
+        # visible: HTTP's own SSE faults — an oversized event, a CR in `event`/`id` — are
+        # `ArgumentError`, so they stay at error level even when the stream is closed, which is
+        # exactly the case that used to be swallowed.
+        if !isopen(events) && _is_closed_stream_error(err)
+            @debug "Nitro.Res.sse: producer stopped because the event stream was closed" exception=err
+            return nothing
+        end
+        # Deliberately no event payload in the message — an SSE body carries whatever the
+        # application chose to stream, which may be session- or user-scoped.
+        @error "Nitro.Res.sse: the event producer failed" exception=(err, catch_backtrace())
+    finally
+        HTTP.body_close!(events)
+    end
+    return nothing
+end
+
+"""
+    sse(; status=200, headers=[], max_len=SSE_MAX_EVENT_BYTES) -> HTTP.Response
+    sse(producer; status=200, headers=[], max_len=SSE_MAX_EVENT_BYTES) -> HTTP.Response
+
+Return a Server-Sent Events response: `Content-Type: text/event-stream`, `Cache-Control: no-cache`,
+`X-Accel-Buffering: no`, no `Content-Length`, and `Transfer-Encoding: chunked` — one chunk per
+event, flushed as it is written.
+
+The body is an `HTTP.SSEStream`. Write `HTTP.SSEEvent` values to it (`SSEEvent` is re-exported, so
+`using Nitro` is enough) and **close it to end the response**.
+
+The `producer` form is the usual one: Nitro runs it on its own task, closes the stream when it
+returns, and treats a client disconnect as a normal ending rather than an error.
+
+```julia
+function ticks(req)
+    return Res.sse() do events
+        for i in 1:10
+            isopen(events) || break          # the client hung up
+            write(events, SSEEvent(string(i); event = "tick", id = string(i)))
+            sleep(1)
+        end
+    end
+end
+
+path("/events", ticks; method = "GET")
+```
+
+The argument-less form hands the response back with the stream still open, for a caller that wants
+to own the producing task itself. Closing it is then **your** responsibility.
+
+# Why this is a `Res` builder and not a `STREAM` route
+
+A `method = "STREAM"` handler writes on the raw `HTTP.Stream`, which sets `response_started` — so
+Nitro's stream handler discards whatever the middleware chain returned, and `Cors`,
+`SecurityHeaders` and a session `Set-Cookie` are all silently dropped. `Res.sse` returns an
+ordinary `HTTP.Response`, so the whole chain applies to an event stream exactly as it does to JSON.
+Prefer this; reach for `STREAM` only when you need to control the response head yourself.
+
+# Pacing, and what `max_len` does not cover
+
+`max_len` caps one serialized event. It does **not** bound the stream's buffer, which is a
+`Base.BufferStream` and grows without limit — so a producer that writes far faster than the client
+reads accumulates in memory. Pace the producer (as the loop above does) and check `isopen(events)`
+each iteration; that check is also how a disconnected client stops the work rather than merely
+stopping the writes.
+
+# Keeping the connection alive
+
+Nitro sets none of HTTP.jl's read/write/idle timeouts, so nothing here closes an idle stream — but
+proxies do. Emit a periodic event (`SSEEvent(""; event = "ping")`) if your stream can be quiet for
+longer than the proxy's idle timeout, and see the reverse-proxy guide: nginx buffers proxied
+responses by default, which `X-Accel-Buffering: no` asks it not to do for this route.
+
+# Shutdown
+
+A long-lived stream is **always cut at `serve(shutdown_timeout = …)`** — the graceful drain cannot
+wait out a handler that holds its connection for its whole lifetime. A producer parked in `write`
+unwinds as soon as the socket is torn down; one parked on a `sleep` or a `Channel` does not, so give
+it a shutdown signal of its own from a `LifecycleMiddleware`'s `on_shutdown`. See
+[`terminate`](@ref Nitro.terminate).
+
+Caller-supplied `headers` are applied last, so they override the defaults above — a
+`Cache-Control` you pass wins.
+"""
+function sse(; status::Int=200, headers::Vector=[], max_len::Integer=SSE_MAX_EVENT_BYTES)
+    response = HTTP.sse_stream(status; max_len = max_len)
+    # Nitro's one addition to HTTP's SSE header set. nginx buffers a proxied response by default,
+    # and an event stream that arrives in one lump at the end is indistinguishable from a hung
+    # endpoint — so the hint ships with the builder rather than being left to every deployment.
+    HTTP.setheader(response, "X-Accel-Buffering" => "no")
+    apply_headers!(response, headers)
+    return response
+end
+
+function sse(producer::Function; status::Int=200, headers::Vector=[],
+             max_len::Integer=SSE_MAX_EVENT_BYTES)
+    # Built through the method above, NOT through `HTTP.sse_stream(response, f)`. That overload
+    # re-runs HTTP's `_configure_sse_response!`, which would `setheader` `Content-Type` and
+    # `Cache-Control` back over anything the caller passed — breaking the `Res` contract that
+    # caller headers apply last. It also logs every client disconnect as an error; see
+    # `_run_sse_producer`.
+    response = sse(; status = status, headers = headers, max_len = max_len)
+    events = response.body::HTTP.SSEStream
+    # Spawned, not sticky: the producer runs for the connection's whole life and must not pin the
+    # thread that served the request. Same reasoning as `parallel_stream_handler`
+    # (src/core/transport.jl) and the janitor discipline (src/middleware/janitor.jl).
+    errormonitor(Threads.@spawn _run_sse_producer(producer, events))
     return response
 end
 

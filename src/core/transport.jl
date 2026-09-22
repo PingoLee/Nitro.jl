@@ -274,10 +274,42 @@ end
 # `body_read!` / `body_closed` / `body_close!` are HTTP.jl **public** API (declared through
 # `Expr(:public, …)`), unlike the `BytesBody.data` field above — so this method depends on a
 # supported interface rather than on a layout canary.
+#
+# ── The loop terminates on the SHORT READ, never on `body_closed` (#160) ──
+#
+# This used to read `while !HTTP.body_closed(body)`, and that pre-check silently dropped the whole
+# body whenever a producer finished before the drain began. "Closed" and "drained" are different
+# states: for `HTTP.SSEStream` — whose buffer is a `Base.BufferStream` — `close` flips `isopen`
+# immediately while the written bytes are still queued, so the pre-check saw a closed body with
+# 22 bytes pending and never entered the loop. Nothing errored; the client just received an empty
+# event stream. `Res.sse`'s producer closes the stream to *end the response*, so for SSE that is
+# not an edge case, it is the common path whenever the producer outruns the socket.
+#
+# Three independent sources say the short read is the terminator, which is what makes this a fix
+# rather than a preference:
+#
+#   1. `body_read!`'s own docstring — "Returns `0` on EOF".
+#   2. Every concrete implementation returns 0 once exhausted: `_SeekableResponseBody` and
+#      `CallbackBody` both open with `body_closed(body) && return 0`, and `SSEStream` with
+#      `eof(buf) && return 0` — which blocks until a byte arrives or the stream closes AND drains.
+#   3. HTTP.jl's own `_write_response_body_to_stream!` is this exact loop, with no pre-check.
+#
+# The bug was latent rather than visible because `SSEStream` is the only body Nitro serves that can
+# hold bytes *after* reporting itself closed — its buffer is a `Base.BufferStream`, where `isopen`
+# flips on `close` while `eof` stays false until the queue drains. The others never reach the
+# pre-check in that state: `_SeekableResponseBody` and `CallbackBody` open `body_read!` with
+# `body_closed(body) && return 0`, so the two conditions agree, and `FixedLengthBody`/`EOFBody`
+# report 0 on exhaustion without ever setting `closed` at all — for which the short read is strictly
+# the more correct terminator. (`BytesBody`/`EmptyBody` are excluded by dispatch.)
+#
+# Do NOT reintroduce the pre-check, and do not add HTTP's companion `body_closed` →
+# `ArgumentError("body is closed")` guard either: a closed-with-pending `SSEStream` is legitimate,
+# and that throw would reject exactly the case this comment exists to protect. Regression: the
+# fast-producer testset in test/sse_tests.jl, which writes and closes before `serve` ever drains.
 function _write_response_body!(stream::HTTP.Stream, body::HTTP.AbstractBody)
     buffer = Vector{UInt8}(undef, _STREAM_CHUNK_BYTES)
     try
-        while !HTTP.body_closed(body)
+        while true
             n = HTTP.body_read!(body, buffer)
             n == 0 && break
             # A view, not a copy: `body_read!` fills a prefix of the buffer and reports how much.
@@ -300,10 +332,16 @@ end
 # Release a STREAMING response body, whether or not it was ever written.
 #
 # `_write_response_body!` closes what it drains, but it only runs when a body is actually written.
-# Three paths produce a streaming body and never write it: a handler that already called
-# `startwrite` (`_response_started`), a `HEAD` or `304` whose body HTTP suppresses, and any
-# middleware that replaces or discards the response after it was built. Each of those leaks an open
-# file descriptor, and the last two are the *cheap* requests a warm client makes constantly.
+# Three paths produce a streaming body and never drain it: a handler that already called
+# `startwrite` (`_response_started`), a `HEAD` — which `stream_handler` now skips outright (#160) —
+# and any middleware that replaces or discards the response after it was built. Each of those leaks
+# an open file descriptor, and `HEAD` is one of the *cheap* requests a warm client makes constantly.
+#
+# A `304` is NOT on that list, and the wording here used to say it was. HTTP suppresses its body at
+# the socket (`ignore_writes`), but the drain still ran and still consumed the cursor to completion,
+# so the handle was released by `_write_response_body!`'s own `finally` rather than by this net. The
+# distinction matters now that `HEAD` genuinely does skip the drain: for `HEAD` this net is the
+# owner, not the backstop.
 #
 # **This is where every comparable framework puts it: on the response lifecycle, not on the write.**
 # Go's `serveFile` uses `defer f.Close()` in the handler, so it runs on every return path; Express's
@@ -433,7 +471,36 @@ function stream_handler(middleware::Function; max_body_bytes::Int64 = DEFAULT_MA
                 resp = produced === nothing ? HTTP.Response(200) : produced
                 resp.request = req
                 stream.response = resp
-                _write_response_body!(stream, resp.body)
+                # `HEAD` gets the head and no body, so there is nothing to drain — and draining it
+                # anyway is not merely wasted work, it can pin the process (#160). HTTP's
+                # `startwrite` sets `ignore_writes` for a bodyless response and `_server_write`
+                # then returns without touching the socket, so for an open-ended body — an
+                # `HTTP.SSEStream` whose producer is still running — this loop consumes events
+                # forever. Because it never touches the socket, `terminate`'s force-close cannot
+                # unblock it either: the request task, the connection task (`parallel_stream_handler`
+                # waits on it) and the producer task are all pinned for the life of the process.
+                # One `curl -I` against a route registered for HEAD is enough.
+                #
+                # Skipping the drain is equivalent for every buffered body — those writes were
+                # already being discarded — and the `finally` below still releases a streaming one,
+                # which is what lets an SSE producer notice and unwind. The response head is
+                # unaffected: the server loop's `closewrite` calls `startwrite` regardless.
+                #
+                # Deliberately narrow: `HEAD` only, keyed on the request method. Status-based
+                # suppression (204/304) is the same class of hazard, but `Res.sse` cannot produce
+                # those statuses and the `Content-Length`-on-HEAD question is #146's, not this
+                # change's — widening here would collide with it.
+                #
+                # `stream.message.method`, NOT `req.method`. They are equal at entry and are two
+                # different mutable objects: `_http_stream_request` builds a fresh `Request` from
+                # `head.method`, while HTTP's own suppression keys on `stream.message`. A
+                # middleware that rewrites the method — an app mapping `HEAD` onto its `GET`
+                # handlers, or an `X-HTTP-Method-Override` layer — would otherwise desynchronize
+                # the two: rewriting `HEAD → GET` reinstates the drain HTTP is still ignoring, and
+                # the pin this guard exists to remove comes back. Reading the value HTTP itself
+                # branches on makes that unrepresentable. `_reject_oversized_body!` above already
+                # reads it the same way.
+                stream.message.method == "HEAD" || _write_response_body!(stream, resp.body)
             end
         finally
             # Idempotent, and a no-op for the buffered bodies that are the overwhelming majority.

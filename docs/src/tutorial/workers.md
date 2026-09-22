@@ -502,6 +502,14 @@ end, Owner("user-1"))
 
 Clients can then poll `get_task_status(task_id, Owner("user-1"))` and read `:progress`.
 
+Polling from the browser is the simplest thing that works, but it scales badly: every client asks
+every second whether anything changed, and the answer is usually no. To push instead, keep the
+polling on the server and stream the changes over Server-Sent Events — there is a worked endpoint,
+with its three limits, in [Streaming And Server-Sent Events](@ref). The most important of those
+limits belongs here too: **`update_progress!` writes the in-process `TaskInfo` and not the store**,
+so intermediate progress is only visible to code running in the same process as the task. The
+durable row receives progress at a terminal transition.
+
 ## Task Keys And Deduplication Scope
 
 Task ids are also deduplication keys, so their scope decides who can collide with whom.

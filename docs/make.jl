@@ -39,6 +39,7 @@ makedocs(
             "tutorial/query_parameters.md",
             "tutorial/request_body.md",
             "tutorial/file_uploads.md",
+            "tutorial/streaming.md",
             "tutorial/environment.md",
             "tutorial/secrets.md",
             "tutorial/reverse_proxy.md",
