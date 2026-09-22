@@ -912,7 +912,17 @@ function _running_ref_from_row(row)
         @warn "PormGWorkerStore: skipping a RUNNING task whose run_id does not parse; zombie recovery cannot fence it" task_id=id
         return nothing
     end
-    return RunningTaskRef((id, run_id, _parse_optional_db_datetime(get_val(:started_at, "started_at"))))
+    # An unreadable timestamp must not fail the whole scan: `list_running_task_refs` rethrows, so
+    # one hand-edited row would stop the sweep at its page on every boot, which is #236's poison
+    # pill again. Read as "no start time", the case the sweep already treats as always eligible.
+    started_at = try
+        _parse_optional_db_datetime(get_val(:started_at, "started_at"))
+    catch e
+        e isa InterruptException && rethrow()
+        @warn "PormGWorkerStore: a RUNNING task's started_at does not parse; treating it as unstamped" task_id=id
+        nothing
+    end
+    return RunningTaskRef((id, run_id, started_at))
 end
 
 # Zombie recovery's scan (#236): a projection of exactly the three columns it reads. No row's

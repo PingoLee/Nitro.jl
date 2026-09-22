@@ -1147,6 +1147,17 @@ else
 
             refs = @test_logs (:warn, r"run_id does not parse") list_running_task_refs(store_u)
             @test isempty(refs)
+
+            # An unreadable start time is not a reason to skip -- the row can still be fenced --
+            # and certainly not a reason to fail the scan, which would stop the sweep there on
+            # every boot. It reads as unstamped.
+            t2 = TaskInfo("alice::garbled-start")
+            t2.status = RUNNING
+            replace_task!(store_u, t2.id, t2)
+            m._table[t2.id]["started_at"] = "not a timestamp"
+            refs = @test_logs (:warn, r"run_id does not parse") (:warn, r"started_at does not parse") match_mode=:any list_running_task_refs(store_u)
+            @test only(refs).id == t2.id
+            @test only(refs).started_at === nothing
         end
 
         @testset "a failed recovery read is logged and costs the sweep, not the boot (#236)" begin
