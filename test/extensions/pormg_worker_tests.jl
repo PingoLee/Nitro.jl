@@ -1276,6 +1276,46 @@ else
             end
         end
 
+        @testset "zombie_min_age adjudicates only claims old enough to be dead (#239)" begin
+            for (label, backend) in (("in-memory", InMemoryWorkerStore()),
+                                     ("pormg", RealPormGWorkerStore(model=MockTaskModel())))
+                @testset "$label" begin
+                    now_utc = Dates.now(Dates.UTC)
+                    for (id, started) in (("age::old", now_utc - Hour(3)),
+                                          ("age::young", now_utc - Minute(1)),
+                                          ("age::unstamped", nothing))
+                        t = TaskInfo(id)
+                        t.status = RUNNING
+                        t.started_at = started
+                        replace_task!(backend, id, t)
+                    end
+                    status_of(id) = get_task_info(backend, id).status
+
+                    # Through `start!`, so the keyword is plumbed and not merely accepted. Only
+                    # the old claim, and the one nothing shows is recent, are adjudicated: a node
+                    # booting beside a peer's hour-long run no longer declares it dead.
+                    app = Nitro.Core.App()
+                    rt = start!(app; store=backend, zombie_min_age=Hour(1), cleanup_enabled=false)
+                    try
+                        @test status_of("age::old") == FAILED
+                        @test status_of("age::unstamped") == FAILED
+                        @test status_of("age::young") == RUNNING
+
+                        # The default bounds nothing, exactly as before #239.
+                        @test recover_zombie_tasks!(; runtime=rt) == 1
+                        @test status_of("age::young") == FAILED
+                    finally
+                        reset_runtime!(rt)
+                    end
+                end
+            end
+
+            @test_throws ArgumentError recover_zombie_tasks!(; runtime=WorkerRuntime(InMemoryWorkerStore()),
+                                                              zombie_min_age=Hour(-1))
+            # Refused where the middleware is built, not later from the startup hook.
+            @test_throws ArgumentError Nitro.Workers.startup(Nitro.Core.App(); zombie_min_age=Minute(-5))
+        end
+
         @testset "a cross-process grantee still sees live progress (#96)" begin
             store_p = RealPormGWorkerStore(model=MockTaskModel())
             rt_store_p = WorkerRuntime(store_p)

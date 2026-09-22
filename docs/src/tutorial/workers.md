@@ -950,6 +950,22 @@ and stops for this boot, keeping what it already recovered.
 Startup carries on either way. A custom store that does not implement `list_running_task_refs`
 still works: the default derives it from `get_all_tasks`, at the cost of a full read of each record.
 
+!!! warning "Several processes sharing one store: set `zombie_min_age`"
+    "No live handle" is a fact about *this* process only. A node that boots while another node's
+    task is genuinely mid-run sees that task as a zombie and marks it `FAILED`. Bound the sweep to
+    claims too old to belong to any live run:
+
+    ```julia
+    worker_startup(queues = ["reports"], store = persistent_store,
+                   zombie_min_age = Hour(2))   # longer than any task legitimately runs
+    ```
+
+    Records claimed more recently are left `RUNNING` for a later boot's sweep. A record with no
+    `started_at` is always adjudicated. The default, `nothing`, bounds nothing, which suits a
+    single process: its crashed tasks are recovered on the very next start. With a bound, a crash
+    followed by a quick restart leaves those tasks `RUNNING` until a boot that comes after the
+    window, because the sweep runs only at startup.
+
 ## When Not To Use Workers
 
 Do not use `InMemoryWorkerStore` for jobs that must survive server restarts. For durable in-process queues, always configure the `PormGWorkerStore` extension.

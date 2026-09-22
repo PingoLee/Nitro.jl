@@ -9,10 +9,42 @@ end
 
 """
     recover_zombie_tasks!(; runtime::WorkerRuntime=default_runtime(),
+                          zombie_min_age::Union{Nothing, Dates.Period}=nothing,
                           batch_size::Int=ZOMBIE_SWEEP_BATCH) -> Int
 
 Sweeps the store and transitions any tasks in `RUNNING` state that do not have an active local
 thread executing them into a `FAILED` state. Returns how many it transitioned.
+
+# `zombie_min_age`: only adjudicate claims old enough to be dead
+
+With `zombie_min_age = Hour(1)` the sweep considers only records whose run claimed them **more
+than an hour ago** (`started_at` older than `now - zombie_min_age`). Younger ones are left
+`RUNNING` for a later sweep. A record with no `started_at` is always considered: nothing shows
+it is recent, and Nitro's own claims always stamp one.
+
+`nothing`, the default, bounds nothing, which is exactly what this sweep did before
+([#239](https://github.com/PingoLee/Nitro.jl/issues/239)).
+
+**Set it in a multi-process deployment.** The liveness check below is process-local, so a node
+that boots while another node's task is genuinely mid-run sees that task as a zombie and marks it
+`FAILED`. The run-id fence (#88, #108) spares only a task that *finishes* between the read and the
+write, not one that keeps running. An age bound turns "no local handle" back into evidence of
+death: choose a window longer than any task legitimately runs, and a claim older than that cannot
+belong to a live run anywhere.
+
+The bound deliberately points this way, at **old** claims, and not the other way (only adjudicate
+recent ones). A lower bound would leave every genuinely stranded old record `RUNNING` forever.
+That is exactly the backlog [#237](https://github.com/PingoLee/Nitro.jl/issues/237) is about,
+and it is invisible to retention, which retires only records with a `completed_at`.
+
+The cost is on the single-process side. A task stranded by a crash is recovered only by a sweep
+that runs after its claim is `zombie_min_age` old, and the sweep runs only at [`start!`](@ref). A
+single process that restarts right after a crash therefore leaves that crash's tasks `RUNNING`
+until a later boot. That is why the default stays `nothing`.
+
+Nothing else needs to grow for this. Once the sweep marks a record `FAILED` it carries a
+`completed_at`, and the retention sweep retires it like any other finished task. `cleanup_tasks!`
+does not need a `RUNNING` escape hatch.
 
 It walks the `RUNNING` records `batch_size` at a time, by keyset on the id
 ([#237](https://github.com/PingoLee/Nitro.jl/issues/237)), so no step of it materializes the
@@ -37,8 +69,13 @@ runtime's abandoned runs as dead. That is also what makes a genuine process cras
 why this stays process-local rather than trying to be authoritative.
 """
 function recover_zombie_tasks!(; runtime::WorkerRuntime=default_runtime(),
+                               zombie_min_age::Union{Nothing, Dates.Period}=nothing,
                                batch_size::Int=ZOMBIE_SWEEP_BATCH)
     batch_size >= 1 || throw(ArgumentError("`batch_size` must be at least 1, got $batch_size"))
+    _check_zombie_min_age(zombie_min_age)
+    # One cutoff for the whole sweep, taken before the first read: a claim is "old enough" against
+    # the moment the sweep began, however long the backlog takes to walk.
+    cutoff = zombie_min_age === nothing ? nothing : current_time_utc() - zombie_min_age
     return lock_tasks(runtime) do
         count = 0
         cursor = nothing
@@ -54,7 +91,7 @@ function recover_zombie_tasks!(; runtime::WorkerRuntime=default_runtime(),
                 @error "Nitro.Workers: zombie recovery could not read the RUNNING tasks; stopping early" recovered=count exception=(e, catch_backtrace())
                 return count
             end
-            count += _recover_zombie_page!(runtime, page)
+            count += _recover_zombie_page!(runtime, page, cutoff)
             # Short means exhausted: an implementation returns fewer than `limit` only when
             # nothing is left. A LONGER page is the default method's whole remainder, and the
             # next read past it comes back empty.
@@ -64,11 +101,19 @@ function recover_zombie_tasks!(; runtime::WorkerRuntime=default_runtime(),
     end
 end
 
+_check_zombie_min_age(age) =
+    age === nothing || age >= zero(age) ||
+        throw(ArgumentError("`zombie_min_age` must not be negative, got $age"))
+
 # One batch. Its transitions move rows out of `RUNNING` at ids at or below the cursor, so they
 # cannot disturb the next page, which starts strictly past it.
-function _recover_zombie_page!(runtime::WorkerRuntime, page::AbstractVector)
+function _recover_zombie_page!(runtime::WorkerRuntime, page::AbstractVector, cutoff::Union{Nothing, DateTime})
     count = 0
     for task in page
+        # Too recent to call dead: see `zombie_min_age`. Checked in Julia over the projected
+        # `started_at` rather than in SQL, so a row it excludes is still SEEN, and the sweep can
+        # say how many it left for later.
+        cutoff === nothing || task.started_at === nothing || task.started_at <= cutoff || continue
         isnothing(get_active_task(runtime, task.id)) || continue
         # `get_active_task` is process-local, so in a multi-process deployment this
         # sweep sees another node's genuinely-running task as a zombie. Claiming the
@@ -90,8 +135,9 @@ function _recover_zombie_page!(runtime::WorkerRuntime, page::AbstractVector)
 end
 
 function recover_zombie_tasks!(ctx::App; key::Symbol=DEFAULT_EXTENSION_KEY, runtime::Union{Nothing, WorkerRuntime}=nothing,
+                               zombie_min_age::Union{Nothing, Dates.Period}=nothing,
                                batch_size::Int=ZOMBIE_SWEEP_BATCH)
-    return recover_zombie_tasks!(; runtime=_resolve_runtime(ctx; key, runtime), batch_size)
+    return recover_zombie_tasks!(; runtime=_resolve_runtime(ctx; key, runtime), zombie_min_age, batch_size)
 end
 
 # `store` selects a BACKEND and builds a runtime over it; `runtime` adopts one that already
@@ -131,6 +177,10 @@ Returns the `WorkerRuntime` — that is the handle to pass as `runtime=` to the 
 
 `drain_timeout` reaches only [`install!`](@ref)'s displacement path: starting over a runtime that
 is already installed tears the old one down first, and that teardown drains like any other (#176).
+
+`zombie_min_age` bounds the zombie sweep to claims older than that period. Leave it `nothing` for
+a single process; **set it when several processes share one store**. The reasoning, and the
+trade, are on [`recover_zombie_tasks!`](@ref) (#239).
 """
 function start!(ctx::App;
     queues::AbstractVector{<:AbstractString}=String[],
@@ -138,6 +188,7 @@ function start!(ctx::App;
     cleanup_interval_hours::Real=24,
     cleanup_retain_days::Int=7,
     recover_zombies::Bool=true,
+    zombie_min_age::Union{Nothing, Dates.Period}=nothing,
     key::Symbol=DEFAULT_EXTENSION_KEY,
     store::Union{Nothing, AbstractWorkerStore}=nothing,
     runtime::Union{Nothing, WorkerRuntime}=nothing,
@@ -146,7 +197,7 @@ function start!(ctx::App;
     resolved = _start_runtime_for!(ctx, key, store, runtime, drain_timeout)
 
     if recover_zombies
-        recover_zombie_tasks!(; runtime=resolved)
+        recover_zombie_tasks!(; runtime=resolved, zombie_min_age)
     end
 
     for queue_name in queues
@@ -168,11 +219,14 @@ function startup(ctx::App;
     cleanup_interval_hours::Real=24,
     cleanup_retain_days::Int=7,
     recover_zombies::Bool=true,
+    zombie_min_age::Union{Nothing, Dates.Period}=nothing,
     key::Symbol=DEFAULT_EXTENSION_KEY,
     store::Union{Nothing, AbstractWorkerStore}=nothing,
     runtime::Union{Nothing, WorkerRuntime}=nothing,
     drain_timeout::Real=WORKER_DRAIN_TIMEOUT_SECONDS,
 )
+    # Refused here, where the middleware is built, not from the startup hook once serving began.
+    _check_zombie_min_age(zombie_min_age)
     queue_names = String.(collect(queues))
 
     passthrough = function(handle::Function)
@@ -188,6 +242,7 @@ function startup(ctx::App;
             cleanup_interval_hours=cleanup_interval_hours,
             cleanup_retain_days=cleanup_retain_days,
             recover_zombies=recover_zombies,
+            zombie_min_age=zombie_min_age,
             key=key,
             store=store,
             runtime=runtime,

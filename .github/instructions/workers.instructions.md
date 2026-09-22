@@ -224,6 +224,16 @@ Julia.
 A paged method returns fewer than `limit` only when nothing is left. A row it skips, whether
 through the authority gate or an unparseable `run_id`, is made up from past the cursor.
 
+**`zombie_min_age` bounds OLD claims in, never recent ones**
+([#239](https://github.com/PingoLee/Nitro.jl/issues/239)). It is a keyword on `start!` / `startup`
+/ `recover_zombie_tasks!`, `nothing` by default. The sweep then adjudicates only records whose
+`started_at` is older than `now - zombie_min_age`; a NULL `started_at` is always eligible. The
+opposite bound ("only recent claims") would strand every old record `RUNNING` forever, and retention
+never retires those, since it needs a `completed_at`.
+
+The filter runs **in Julia over the projected `started_at`**, not in SQL, so a row it excludes is
+still seen and counted. Do not "optimize" it into the query without keeping that count.
+
 ## 6. Developer Rules
 
 > **Strict core isolation**: Never import `PormG` or run DB queries in `src/Workers`. Database logic belongs in `ext/NitroPormGExt.jl`.
