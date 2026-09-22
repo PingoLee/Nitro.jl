@@ -119,8 +119,9 @@ end
             "exp" => NOW_TS + 3600,
             "nbf" => NOW_TS - 1,
         ),
-        keyset;
-        kid="rotated"
+        # `kid=` is gone (#260): a token signed AS "rotated" comes from a keyset whose
+        # signing key is "rotated".
+        Nitro.Auth.JWTKeyset("rotated" => "secret-b")
     )
 
     claims, kid = Nitro.Auth.decode_jwt(token, keyset; issuer="nitro-tests", audience="nitro", with_kid=true)
@@ -335,16 +336,18 @@ end
     end
 
     # -- An empty keyset has nothing to fall back to. `first(keys(...))` raised a
-    # BoundsError from inside `_resolve_kid`.
+    # BoundsError from inside `_resolve_kid`; #45 made it `AuthError("Unknown JWT key id")`.
+    # Since #260 an empty keyset is not a keyset at all: lifting it is a named
+    # ArgumentError, so it is a configuration error rather than a per-token rejection.
     kidless = Nitro.Auth.encode_jwt(payload, secret)
     err = caught(() -> Nitro.Auth.decode_jwt(kidless, Dict{String, String}()))
-    @test err isa Nitro.Auth.AuthError
-    @test occursin("Unknown JWT key id", sprint(showerror, err))
+    @test err isa ArgumentError
+    @test occursin("empty", sprint(showerror, err))
 
     # -- A valid kid still resolves, and a token signed under one key is not accepted
     # under another key's id. Also a pin on pre-existing behavior; it constrains the
     # kid -> secret mapping, which the alg gate sits directly upstream of.
-    rotated = Nitro.Auth.encode_jwt(payload, keyset; kid="rotated")
+    rotated = Nitro.Auth.encode_jwt(payload, Nitro.Auth.JWTKeyset("rotated" => "secret-b"))
     claims, kid = Nitro.Auth.decode_jwt(rotated, keyset; with_kid=true)
     @test (claims["sub"], kid) == ("42", "rotated")
     mislabeled = signed(Dict("alg" => "HS256", "typ" => "JWT", "kid" => "default"), payload; key = "secret-b")
@@ -365,18 +368,16 @@ end
     claims, kid = Nitro.Auth.decode_jwt(kidless_rotated, keyset; with_kid=true)
     @test (claims["sub"], kid) == ("42", "rotated")
 
-    # -- Ordering. These fixtures deliberately hold ONE secret under TWO names, because
-    # that is the only shape in which trial order is observable: with distinct secrets
-    # exactly one key can match and the assertion would pass under any order, pinning
-    # nothing. `jwt_validator` refuses such a keyset at construction, so the fixture has
-    # to go through `decode_jwt`, which has no construction time to refuse it at.
-    #
-    # Reverse the sort or move the "default" push to the end of `_verify_candidates` and
-    # these two fail. Nothing else in this file does.
-    @test Nitro.Auth.decode_jwt(kidless_rotated, Dict("zulu" => "secret-b", "alpha" => "secret-b");
-                                with_kid=true)[2] == "alpha"      # sorted by name
-    @test Nitro.Auth.decode_jwt(kidless_rotated, Dict("zebra" => "secret-b", "default" => "secret-b");
-                                with_kid=true)[2] == "default"    # ... but "default" first
+    # -- Ordering. Trial order is only observable through `decode_jwt` when two entries
+    # hold the same HMAC key, and since #260 no keyset can: `JWTKeyset` refuses that shape
+    # on every path, not only in `jwt_validator`. So the order is pinned where it is now
+    # decided -- the candidate list, fixed once at construction: the signing key first,
+    # then the rest by kid. Reverse the sort, or stop putting the signing key first, and
+    # these fail.
+    trial_order(ks) = [kid for (kid, _) in Nitro.Auth._verify_candidates(Nitro.Auth.JWTKeyset(ks), nothing)]
+    @test trial_order(Dict("zulu" => "s1", "default" => "s2", "alpha" => "s3")) == ["default", "alpha", "zulu"]
+    @test trial_order(Nitro.Auth.JWTKeyset("zulu" => "s1"; verify = ["bravo" => "s2", "alpha" => "s3"])) ==
+        ["zulu", "alpha", "bravo"]
 
     # -- And the ordinary case still resolves: a kid-less token signed with the default key.
     kidless_default = Nitro.Auth.encode_jwt(payload, "secret-a")
@@ -389,13 +390,13 @@ end
         err = caught(() -> Nitro.Auth.decode_jwt(kidless_rotated, key))
         @test (label, sprint(showerror, err)) == (label, "Invalid JWT signature")
     end
-    err = caught(() -> Nitro.Auth.decode_jwt(kidless_rotated, Dict("a" => "x", "b" => "y")))
+    err = caught(() -> Nitro.Auth.decode_jwt(kidless_rotated, Dict("default" => "x", "b" => "y")))
     @test sprint(showerror, err) == "No key in the JWT keyset verified this token"
 
     # -- A token that NAMES its key gets that key and no other: no trial loop, so a
     # forged kid-bearing token still costs exactly one HMAC, and a token signed under
     # one key is still not accepted under another key's id.
-    mislabeled = Nitro.Auth.encode_jwt(payload, Dict("default" => "secret-b"); kid="default")
+    mislabeled = Nitro.Auth.encode_jwt(payload, Dict("default" => "secret-b"))
     err = caught(() -> Nitro.Auth.decode_jwt(mislabeled, keyset))
     @test sprint(showerror, err) == "Invalid JWT signature"
     err = caught(() -> Nitro.Auth.decode_jwt(mislabeled, Dict("elsewhere" => "secret-b")))
@@ -405,21 +406,23 @@ end
     # unknown kid is reported as such and not pre-empted by a signature that also happens
     # to be malformed. One token, two keysets, two different answers -- move the `provided`
     # decode above the candidate resolution in `decode_jwt` and the first line fails.
-    parts = split(Nitro.Auth.encode_jwt(payload, keyset; kid="rotated"), '.')
+    parts = split(Nitro.Auth.encode_jwt(payload, Nitro.Auth.JWTKeyset("rotated" => "secret-b")), '.')
     undecodable = string(parts[1], ".", parts[2], ".x")
     @test sprint(showerror, caught(() -> Nitro.Auth.decode_jwt(undecodable, Dict("elsewhere" => "s")))) ==
         "Unknown JWT key id"
     @test sprint(showerror, caught(() -> Nitro.Auth.decode_jwt(undecodable, keyset))) ==
         "Invalid JWT signature encoding"
 
-    # -- Pins from #252 that the rewrite must not drop.
+    # -- Pins from #252. The empty keyset is still refused, but since #260 as a named
+    # ArgumentError from the lift -- an empty keyset is a configuration error, not a token
+    # that failed to verify. A non-keyset secret is still an ArgumentError.
     err = caught(() -> Nitro.Auth.decode_jwt(kidless_rotated, Dict{String, String}()))
-    @test sprint(showerror, err) == "Unknown JWT key id"
+    @test err isa ArgumentError
     @test_throws ArgumentError Nitro.Auth.decode_jwt(kidless_rotated, 42)
 
     # -- verify=false bypasses key selection entirely and passes the RAW header kid
     # through, unverified. `_verify_candidates` is never reached.
-    labelled = Nitro.Auth.encode_jwt(payload, "secret-b"; kid="not-in-any-keyset")
+    labelled = Nitro.Auth.encode_jwt(payload, Nitro.Auth.JWTKeyset("not-in-any-keyset" => "secret-b"))
     @test Nitro.Auth.decode_jwt(labelled, keyset; verify=false, with_kid=true)[2] == "not-in-any-keyset"
 
     # -- The principal reports the key that actually verified, which is what makes
@@ -430,15 +433,22 @@ end
     @test (signer.id, signer.kid, signer.source) == ("rotated", "rotated", :kid)
 end
 
-@testset "jwt_validator refuses a keyset with duplicate secrets (#253)" begin
+@testset "a keyset refuses duplicate secrets on every path (#253, #260)" begin
     caught(f) = try; f(); nothing; catch err; err; end
     # Trial order is only observable when two entries hold the SAME secret -- and then
-    # the same token attributes to a different signer run to run. Refused at
-    # construction, which is app startup, so at most one candidate can ever match.
-    err = caught(() -> Nitro.Auth.jwt_validator(Dict("alpha" => "s", "bravo" => "s")))
-    @test err isa ArgumentError
-    msg = sprint(showerror, err)
-    @test occursin("\"alpha\"", msg) && occursin("\"bravo\"", msg)
+    # the same token attributes to a different signer run to run. #253 refused that in
+    # `jwt_validator`; since #260 `JWTKeyset` owns the check, so a direct `decode_jwt`
+    # caller is covered too instead of bypassing it.
+    token = Nitro.Auth.encode_jwt(Dict("sub" => "42"), "s")
+    for (label, entry) in (
+            ("jwt_validator", ks -> Nitro.Auth.jwt_validator(ks)),
+            ("decode_jwt", ks -> Nitro.Auth.decode_jwt(token, ks)),
+            ("JWTKeyset", ks -> Nitro.Auth.JWTKeyset(ks)))
+        err = caught(() -> entry(Dict("default" => "s", "bravo" => "s")))
+        @test (label, err isa ArgumentError) == (label, true)
+        msg = sprint(showerror, err)
+        @test (label, occursin("\"default\"", msg) && occursin("\"bravo\"", msg)) == (label, true)
+    end
 
     # String equality is the WRONG equivalence: HMAC-SHA256 pre-hashes any key past its
     # 64-byte block, so `K` and `sha256(K)` are one key, and zero-padding makes `"a"` and
@@ -446,70 +456,83 @@ end
     # otherwise a holder of one entry's secret authenticates as the other entry.
     long_key = repeat("abcdefghij", 10)
     @test caught(() -> Nitro.Auth.jwt_validator(
-        Dict("long" => long_key, "short" => String(SHA.sha256(long_key))))) isa ArgumentError
-    @test caught(() -> Nitro.Auth.jwt_validator(Dict("bare" => "a", "padded" => "a\0"))) isa ArgumentError
+        Dict("default" => long_key, "short" => String(SHA.sha256(long_key))))) isa ArgumentError
+    @test caught(() -> Nitro.Auth.jwt_validator(Dict("default" => "a", "padded" => "a\0"))) isa ArgumentError
 
-    # A keyset whose keys are neither String nor Symbol resolves to no name at all, so
-    # every request would 401 with no startup signal. Refused at construction instead --
-    # and with a named ArgumentError, not the MethodError this used to be.
+    # A keyset whose keys are neither String nor Symbol could never resolve a header kid,
+    # so every request would 401 with no startup signal. Refused, with a named error.
     err = caught(() -> Nitro.Auth.jwt_validator(Dict(1 => "s1", 2 => "s2")))
     @test err isa ArgumentError
-    @test occursin("none with a String or Symbol key", sprint(showerror, err))
-    @test Nitro.Auth.jwt_validator(Dict(:alpha => "s1", :bravo => "s2")) isa Function
+    @test occursin("a kid must be a String or Symbol", sprint(showerror, err))
+    @test Nitro.Auth.jwt_validator(Dict(:default => "s1", :bravo => "s2")) isa Function
 
     # A `Vector{UInt8}` value is refused WITHOUT being read. `String(::Vector{UInt8})`
     # takes ownership and empties the buffer, so merely inspecting such a keyset would
     # blank every secret -- after which a token signed with "" authenticates as any kid.
-    # The assertion that matters is the second one: the caller's bytes survive.
-    bytes = Dict("prod" => Vector{UInt8}(codeunits("real-prod-secret")),
-                 "old"  => Vector{UInt8}(codeunits("real-old-secret")))
-    err = caught(() -> Nitro.Auth.jwt_validator(bytes))
-    @test err isa ArgumentError
-    @test all(!isempty, values(bytes))
+    # The assertion that matters is the second one: the caller's bytes survive. #253 only
+    # closed this for `jwt_validator`; the direct `decode_jwt` path read the value through
+    # `_lookup_key` until #260 deleted it.
+    for (label, entry) in (
+            ("jwt_validator", ks -> Nitro.Auth.jwt_validator(ks)),
+            ("decode_jwt", ks -> Nitro.Auth.decode_jwt(token, ks)),
+            ("encode_jwt", ks -> Nitro.Auth.encode_jwt(Dict("sub" => "1"), ks)))
+        bytes = Dict("default" => Vector{UInt8}(codeunits("real-prod-secret")),
+                     "old"     => Vector{UInt8}(codeunits("real-old-secret")))
+        err = caught(() -> entry(bytes))
+        @test (label, err isa ArgumentError) == (label, true)
+        @test (label, bytes["default"] == codeunits("real-prod-secret") &&
+                      bytes["old"] == codeunits("real-old-secret")) == (label, true)
+    end
 
     # Distinct secrets, a single-key keyset, and a plain string secret are unaffected.
-    @test Nitro.Auth.jwt_validator(Dict("alpha" => "s1", "bravo" => "s2")) isa Function
+    @test Nitro.Auth.jwt_validator(Dict("default" => "s1", "bravo" => "s2")) isa Function
     @test Nitro.Auth.jwt_validator(Dict("only" => "s")) isa Function
     @test Nitro.Auth.jwt_validator("s") isa Function
 end
 
-@testset "encode_jwt refuses an ambiguous signing key (#253)" begin
+@testset "the signing key is the keyset's to say, not the call site's (#253, #260)" begin
     caught(f) = try; f(); nothing; catch err; err; end
     payload = Dict("sub" => "42")
 
-    # -- More than one key, no "default", no kid= : `first(keys(...))` used to pick one
-    # under Dict iteration order and stamp it into the header, so the token's stated
-    # signer was a coin flip. Refuse at the call that mints it.
+    # -- #260's acceptance test. #253 guarded "which key signs?" with an ArgumentError in
+    # `_signing_kid` for a multi-key keyset with no "default" and no `kid=`. A `JWTKeyset`
+    # has exactly one signing key by construction, so the helper -- and `kid=` -- are gone.
+    @test !isdefined(Nitro.Auth, :_signing_kid)
+    @test !isdefined(Nitro.Auth, :_resolve_secret)
+    @test !isdefined(Nitro.Auth, :_lookup_key)
+    @test_throws MethodError Nitro.Auth.encode_jwt(payload, Dict("only" => "s1"); kid="only")
+
+    # The ambiguous Dict is now refused where it is LIFTED -- once, at configuration --
+    # and the message names both ways out.
     err = caught(() -> Nitro.Auth.encode_jwt(payload, Dict("alpha" => "s1", "bravo" => "s2")))
     @test err isa ArgumentError
-    @test occursin("pass kid=", sprint(showerror, err))
+    msg = sprint(showerror, err)
+    @test occursin("no \"default\"", msg) && occursin("JWTKeyset(", msg)
 
-    # -- The three unambiguous cases still sign, and stamp the key they used.
+    # -- Every keyset that can exist signs, and stamps the key it used.
     header_kid(tok) = get(
         JSON.parse(String(Nitro.Auth._base64url_decode(split(tok, '.')[1]))), "kid", nothing)
 
     @test header_kid(Nitro.Auth.encode_jwt(payload, Dict("only" => "s1"))) == "only"
     @test header_kid(Nitro.Auth.encode_jwt(payload, Dict("default" => "s1", "other" => "s2"))) == "default"
-    @test header_kid(Nitro.Auth.encode_jwt(payload, Dict("alpha" => "s1", "bravo" => "s2");
-                                           kid="bravo")) == "bravo"
+    @test header_kid(Nitro.Auth.encode_jwt(payload,
+        Nitro.Auth.JWTKeyset("bravo" => "s2"; verify = ["alpha" => "s1"]))) == "bravo"
     # A plain string secret stamps no kid at all.
     @test header_kid(Nitro.Auth.encode_jwt(payload, "s1")) === nothing
 
-    # -- Unchanged: a kid that is not in the keyset, and an empty keyset. Messages pinned,
-    # per this file's own convention -- `err isa AuthError` alone is satisfied by any
-    # rejection, including the new ArgumentError path arriving for the wrong reason.
-    for (label, call) in (
-            ("unknown kid", () -> Nitro.Auth.encode_jwt(payload, Dict("alpha" => "s1"); kid="ghost")),
-            ("empty keyset", () -> Nitro.Auth.encode_jwt(payload, Dict{String, String}())))
-        err = caught(call)
-        @test (label, err isa Nitro.Auth.AuthError) == (label, true)
-        @test (label, sprint(showerror, err)) == (label, "Unknown JWT key id")
-    end
+    # An empty keyset is a named configuration error, not a BoundsError (#45).
+    err = caught(() -> Nitro.Auth.encode_jwt(payload, Dict{String, String}()))
+    @test err isa ArgumentError
+    @test occursin("empty", sprint(showerror, err))
 end
 
 @testset "jwt_validator warn_claims observability tier (#134)" begin
     caught(f) = try; f(); nothing; catch err; err; end
-    keyset = Dict("issuer-a" => "secret-a", "issuer-b" => "secret-b")
+    # A registry of issuers: every key verifies, and one has to be named the signer (#260).
+    secrets = Dict("issuer-a" => "secret-a", "issuer-b" => "secret-b")
+    keyset = Nitro.Auth.JWTKeyset("issuer-a" => "secret-a"; verify = ["issuer-b" => "secret-b"])
+    # Sign AS one issuer: a one-key keyset whose signing key is that issuer.
+    as_issuer(kid) = Nitro.Auth.JWTKeyset(kid => secrets[kid])
     # `Base.CoreLogging`, not `using Logging` -- Logging is not a test dependency.
     records(f; min_level = Base.CoreLogging.Debug) = begin
         logger = Test.TestLogger(min_level = min_level)
@@ -519,7 +542,7 @@ end
     at(logs, level) = filter(r -> r.level == level, logs)
     kv(record) = Dict(record.kwargs)
 
-    subless(kid) = Nitro.Auth.encode_jwt(Dict("iss" => "legacy-idp"), keyset; kid=kid, expires_in=3600)
+    subless(kid) = Nitro.Auth.encode_jwt(Dict("iss" => "legacy-idp"), as_issuer(kid); expires_in=3600)
 
     @testset "warns once per (claim, kid, iss), debugs every time" begin
         validator = Nitro.Auth.jwt_validator(keyset; warn_claims=["sub"])
@@ -540,7 +563,7 @@ end
     @testset "the record names the offender and nothing else" begin
         validator = Nitro.Auth.jwt_validator(keyset; warn_claims=["sub"])
         token = Nitro.Auth.encode_jwt(Dict("iss" => "legacy-idp", "email" => "a@b.test"),
-                                      keyset; kid="issuer-a", expires_in=3600)
+                                      as_issuer("issuer-a"); expires_in=3600)
         record = only(at(records(() -> validator(token)), Base.CoreLogging.Warn))
         fields = kv(record)
         @test (fields[:claim], fields[:kid], fields[:iss]) == ("sub", "issuer-a", "legacy-idp")
@@ -567,7 +590,7 @@ end
         @test validator(subless("issuer-a")) isa Nitro.Principal
         # And says nothing at all when the claim is there.
         present = Nitro.Auth.encode_jwt(Dict("sub" => "9", "iss" => "modern-idp"),
-                                        keyset; kid="issuer-a", expires_in=3600)
+                                        as_issuer("issuer-a"); expires_in=3600)
         @test isempty(records(() -> validator(present)))
         # A validator without the tier does no work and logs nothing.
         plain = Nitro.Auth.jwt_validator(keyset)
@@ -578,8 +601,10 @@ end
         # With a single string secret the header kid is attacker-writable, so it must not
         # reach the log as though it identified a signer.
         validator = Nitro.Auth.jwt_validator("secret-a"; warn_claims=["sub"])
-        spoofed = Nitro.Auth.encode_jwt(Dict("iss" => "legacy-idp"), "secret-a";
-                                        kid="i-am-whoever-i-say", expires_in=3600)
+        # Signed with the one secret, but stamped with an arbitrary header kid.
+        spoofed = Nitro.Auth.encode_jwt(Dict("iss" => "legacy-idp"),
+                                        Nitro.Auth.JWTKeyset("i-am-whoever-i-say" => "secret-a");
+                                        expires_in=3600)
         @test kv(only(at(records(() -> validator(spoofed)), Base.CoreLogging.Warn)))[:kid] === nothing
     end
 
@@ -850,7 +875,9 @@ end
 end
 
 @testset "jwt_validator identity and profiles" begin
-    keyset = Dict("service-a" => "secret-a", "service-b" => "secret-b")
+    # A registry of service identities; one of them has to be named the signer (#260).
+    keyset = Nitro.Auth.JWTKeyset("service-a" => "secret-a"; verify = ["service-b" => "secret-b"])
+    as_service_b = Nitro.Auth.JWTKeyset("service-b" => "secret-b")
 
     @testset "returns a normalized Principal" begin
         validator = Nitro.Auth.jwt_validator("secret-a")
@@ -874,13 +901,13 @@ end
     @testset "kid trust model" begin
         # Keyset-verified kid is exposed on the principal
         keyset_validator = Nitro.Auth.jwt_validator(keyset)
-        principal = keyset_validator(Nitro.Auth.encode_jwt(Dict("sub" => "9"), keyset; kid="service-b", expires_in=3600))
+        principal = keyset_validator(Nitro.Auth.encode_jwt(Dict("sub" => "9"), as_service_b; expires_in=3600))
         @test principal.kid == "service-b"
         @test principal.id == "9"
 
         # identity_from=:kid — the verified signer is the principal
         kid_validator = Nitro.Auth.jwt_validator(keyset; identity_from=:kid)
-        signer = kid_validator(Nitro.Auth.encode_jwt(Dict("action" => "sync"), keyset; kid="service-a", expires_in=3600))
+        signer = kid_validator(Nitro.Auth.encode_jwt(Dict("action" => "sync"), keyset; expires_in=3600))
         @test signer.id == "service-a"
         @test signer.kid == "service-a"
         @test signer.source === :kid
@@ -895,7 +922,7 @@ end
         seen = Ref{Any}(nothing)
         validator = Nitro.Auth.jwt_validator(keyset;
             user_validator = principal -> (seen[] = principal; Dict("uid" => principal.id)))
-        result = validator(Nitro.Auth.encode_jwt(Dict("sub" => "7"), keyset; kid="service-a", expires_in=3600))
+        result = validator(Nitro.Auth.encode_jwt(Dict("sub" => "7"), keyset; expires_in=3600))
         @test seen[] isa Nitro.Principal
         @test seen[]["sub"] == "7"           # dict-compatible with old claims-style validators
         @test result isa Tuple && length(result) == 2
@@ -905,8 +932,7 @@ end
 
         # A rejecting user_validator still yields nothing
         rejecting = Nitro.Auth.jwt_validator(keyset; user_validator = _ -> nothing)
-        # `kid=` is now required to sign with a multi-key keyset that has no "default".
-        @test rejecting(Nitro.Auth.encode_jwt(Dict("sub" => "7"), keyset; kid="service-a", expires_in=3600)) === nothing
+        @test rejecting(Nitro.Auth.encode_jwt(Dict("sub" => "7"), keyset; expires_in=3600)) === nothing
     end
 
     @testset "construction-time validation" begin

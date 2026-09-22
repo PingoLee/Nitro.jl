@@ -85,6 +85,7 @@ const TEST_FILES = [
     "staticfiles_security_tests.jl",
     "dx_tests.jl",
     "auth_module_tests.jl",
+    "auth_keyset_tests.jl",
     "auth_tests.jl",
     "revise_test.jl",
 

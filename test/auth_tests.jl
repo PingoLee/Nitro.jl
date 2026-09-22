@@ -223,7 +223,8 @@ end
 end
 
 @testset "Keyset auth: kid_required authorization" begin
-    keyset = Dict("service-a" => "ka-secret", "service-b" => "kb-secret")
+    # A registry of service identities. Every key verifies; one is named the signer (#260).
+    keyset = Nitro.Auth.JWTKeyset("service-a" => "ka-secret"; verify = ["service-b" => "kb-secret"])
     validator = Nitro.Auth.jwt_validator(keyset; identity_from=:kid)
 
     handler = BearerAuth(validator)(GuardMiddleware(
@@ -231,7 +232,7 @@ end
     )(req -> HTTP.Response(200, getuser(req).id)))
 
     # Token signed by an allowed key → pass, and the signer is the principal
-    token_a = Nitro.Auth.encode_jwt(Dict("action" => "sync"), keyset; kid="service-a", expires_in=60)
+    token_a = Nitro.Auth.encode_jwt(Dict("action" => "sync"), keyset; expires_in=60)
     req_a = HTTP.Request("GET", "/sync", ["Authorization" => "Bearer $token_a"])
     res_a = handler(req_a)
     @test res_a.status == 200
@@ -239,7 +240,9 @@ end
 
     # Verified token from a key OUTSIDE the route's allowlist → 403 (authorization,
     # not authentication: the signature checked out)
-    token_b = Nitro.Auth.encode_jwt(Dict("action" => "sync"), keyset; kid="service-b", expires_in=60)
+    # Signed AS service-b: a one-key keyset whose signing key is service-b.
+    token_b = Nitro.Auth.encode_jwt(Dict("action" => "sync"),
+                                    Nitro.Auth.JWTKeyset("service-b" => "kb-secret"); expires_in=60)
     req_b = HTTP.Request("GET", "/sync", ["Authorization" => "Bearer $token_b"])
     @test handler(req_b).status == 403
 end

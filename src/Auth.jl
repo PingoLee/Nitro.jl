@@ -13,7 +13,7 @@ using ..Core.Types: AbstractSessionStore, get_session
 
 export AuthError,
     set_auth_cookie!, clear_auth_cookie!, extract_auth_token,
-    encode_jwt, decode_jwt, validate_iat, validate_claims,
+    encode_jwt, decode_jwt, validate_iat, validate_claims, JWTKeyset,
     make_password, check_password, validate_password, password_needs_upgrade, is_password_usable,
     set_default_algorithm!, SUPPORTED_ALGORITHMS, DEFAULT_ALGORITHM,
     ValidationResult, PasswordValidator,
@@ -31,6 +31,7 @@ end
 Base.showerror(io::IO, error::AuthError) = print(io, error.msg)
 
 include("Auth/claims.jl")
+include("Auth/keyset.jl")
 include("Auth/jwt.jl")
 include("Auth/cookies.jl")
 include("Auth/passwords.jl")

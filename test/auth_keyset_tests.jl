@@ -1,0 +1,138 @@
+@testitem "JWTKeyset (#260)" tags=[:auth, :core] setup=[NitroCommon] begin
+
+using Test
+using JSON
+using Nitro
+using Nitro.Auth: JWTKeyset, encode_jwt, decode_jwt, jwt_validator
+
+caught(f) = try; f(); nothing; catch err; err; end
+message(f) = sprint(showerror, caught(f))
+kids(ks::JWTKeyset) = [kid for (kid, _) in Nitro.Auth._verify_candidates(ks, nothing)]
+header_kid(tok) = get(
+    JSON.parse(String(Nitro.Auth._base64url_decode(split(tok, '.')[1]))), "kid", nothing)
+
+@testset "exactly one signing key, by construction" begin
+    ks = JWTKeyset("current" => "s-cur"; verify = ["previous" => "s-prev", "partner" => "s-part"])
+    # The signing key first, then the rest by kid -- the kid-less trial order.
+    @test kids(ks) == ["current", "partner", "previous"]
+    @test header_kid(encode_jwt(Dict("sub" => "1"), ks)) == "current"
+    # A verify-only key verifies; it just never signs.
+    as_previous = encode_jwt(Dict("sub" => "1"), JWTKeyset("previous" => "s-prev"))
+    @test decode_jwt(as_previous, ks; with_kid = true)[2] == "previous"
+
+    # Symbol kids and SecretString values are accepted, and a keyset is idempotent.
+    mixed = JWTKeyset(:current => SecretString("s-cur"); verify = [:old => SecretString("s-old")])
+    @test kids(mixed) == ["current", "old"]
+    @test JWTKeyset(mixed) === mixed
+end
+
+@testset "the constructor owns the value contract" begin
+    for (label, build, needle) in (
+            ("duplicate kid", () -> JWTKeyset("a" => "s1"; verify = ["a" => "s2"]), "more than once"),
+            ("signer kid reused", () -> JWTKeyset("a" => "s1"; verify = [:a => "s2"]), "more than once"),
+            ("same HMAC key", () -> JWTKeyset("a" => "s"; verify = ["b" => "s"]), "same HMAC key"),
+            ("zero-padded twin", () -> JWTKeyset("a" => "k"; verify = ["b" => "k\0"]), "same HMAC key"),
+            ("empty secret", () -> JWTKeyset("a" => ""), "empty"),
+            ("empty kid", () -> JWTKeyset("" => "s"), "must not be empty"),
+            ("integer kid", () -> JWTKeyset(1 => "s"), "String or Symbol"),
+            ("integer secret", () -> JWTKeyset("a" => 42), "Int64"),
+            ("verify not pairs", () -> JWTKeyset("a" => "s"; verify = ["b"]), "kid => secret pairs"))
+        err = caught(build)
+        @test (label, err isa ArgumentError) == (label, true)
+        @test (label, occursin(needle, sprint(showerror, err))) == (label, true)
+    end
+
+    # The byte-vector trap: refused BEFORE it is read, so the caller's buffer survives.
+    # `String(::Vector{UInt8})` would have taken ownership and emptied it.
+    secret = Vector{UInt8}(codeunits("real-secret"))
+    @test caught(() -> JWTKeyset("a" => secret)) isa ArgumentError
+    @test secret == codeunits("real-secret")
+    # ... and the message never echoes the value.
+    @test !occursin("real-secret", message(() -> JWTKeyset("a" => secret)))
+end
+
+@testset "lifting a Dict" begin
+    @test kids(JWTKeyset(Dict("default" => "s1", "zed" => "s2", "alpha" => "s3"))) ==
+        ["default", "alpha", "zed"]
+    @test kids(JWTKeyset(Dict("only" => "s1"))) == ["only"]
+    @test kids(JWTKeyset(Dict(:default => "s1", :other => "s2"))) == ["default", "other"]
+    @test kids(JWTKeyset(Dict("default" => SecretString("s1")))) == ["default"]
+
+    msg = message(() -> JWTKeyset(Dict("primary" => "s1", "rotated" => "s2")))
+    @test occursin("no \"default\"", msg) && occursin("JWTKeyset(", msg)
+    @test occursin("empty", message(() -> JWTKeyset(Dict{String, String}())))
+    # "a" and :a would have been one name, the String silently shadowing the Symbol.
+    @test occursin("both", message(() -> JWTKeyset(Dict{Any, String}("a" => "s1", :a => "s2"))))
+    @test occursin("String or Symbol", message(() -> JWTKeyset(Dict(1 => "s1"))))
+end
+
+@testset "display never carries a secret" begin
+    RAW = "NITRO-RAW-KEYSET-SECRET-9f3c"
+    ks = JWTKeyset("current" => RAW; verify = ["previous" => SecretString(RAW * "-old")])
+    for rendered in (sprint(show, ks),
+                     sprint((io, x) -> show(io, MIME("text/plain"), x), ks),
+                     repr(ks),
+                     string(ks),
+                     "interpolated: $ks",
+                     JSON.json(ks),
+                     JSON.json(Dict("auth" => ks)),
+                     sprint(show, ks.keys[1]))
+        @test !occursin(RAW, rendered)
+    end
+    @test sprint(show, ks) == "JWTKeyset(sign=\"current\", verify=[\"previous\"])"
+    @test JSON.parse(JSON.json(ks)) == Dict("sign" => "current", "verify" => ["previous"])
+end
+
+@testset "a direct decode_jwt gets the same checks as jwt_validator" begin
+    token = encode_jwt(Dict("sub" => "1"), "s")
+    # Two names for one HMAC key used to slip past a direct `decode_jwt` caller, which
+    # has no construction time -- the lift gives it one.
+    @test caught(() -> decode_jwt(token, Dict("default" => "s", "twin" => "s"))) isa ArgumentError
+    bytes = Dict("default" => Vector{UInt8}(codeunits("real-prod-secret")))
+    @test caught(() -> decode_jwt(token, bytes)) isa ArgumentError
+    @test bytes["default"] == codeunits("real-prod-secret")
+end
+
+@testset "signing as a peer of a registry" begin
+    # The client-registry shape: permanent identities, none of them "retiring".
+    registry = JWTKeyset("self" => "s-self"; verify = ["reporting" => "s-rep", "batch" => "s-batch"])
+    validator = jwt_validator(registry; identity_from = :kid)
+    # A peer signs with a one-key keyset whose signing key is its own identity.
+    as_batch = encode_jwt(Dict("action" => "sync"), JWTKeyset("batch" => "s-batch"); expires_in = 60)
+    @test header_kid(as_batch) == "batch"
+    principal = validator(as_batch)
+    @test (principal.id, principal.kid, principal.source) == ("batch", "batch", :kid)
+    # And a kid-less token from the same peer resolves to the key that verified it.
+    kidless = encode_jwt(Dict("action" => "sync"), "s-batch"; expires_in = 60)
+    @test validator(kidless).kid == "batch"
+end
+
+@testset "jwt_validator lifts a Dict once, and keeps the snapshot" begin
+    keymap = Dict("default" => "s1", "old" => "s2")
+    validator = jwt_validator(keymap; identity_from = :kid)
+    token = encode_jwt(Dict("sub" => "1"), JWTKeyset("old" => "s2"); expires_in = 60)
+    @test validator(token).kid == "old"
+    # Mutating the caller's Dict no longer changes what a running validator accepts: the
+    # construction-time checks could never have seen the mutation.
+    delete!(keymap, "old")
+    keymap["intruder"] = "s2"
+    @test validator(token).kid == "old"
+    intruder = encode_jwt(Dict("sub" => "1"), JWTKeyset("intruder" => "s2"); expires_in = 60)
+    @test occursin("Unknown JWT key id", message(() -> validator(intruder)))
+
+    # Misconfiguration is a construction-time error, which is app startup.
+    @test caught(() -> jwt_validator(Dict("a" => "s1", "b" => "s2"))) isa ArgumentError
+    @test caught(() -> jwt_validator(42)) isa ArgumentError
+end
+
+@testset "the verify path is type-stable (nitro-core §7)" begin
+    ks = JWTKeyset("current" => "s1"; verify = ["previous" => "s2"])
+    T = Vector{Tuple{Nullable{String}, String}}
+    @test (@inferred Nitro.Auth._verify_candidates(ks, nothing)) isa T
+    @test (@inferred Nitro.Auth._verify_candidates(ks, "previous")) isa T
+    @test (@inferred Nitro.Auth._verify_candidates("s1", "label")) isa T
+    @test (@inferred Nitro.Auth._signing_secret(ks)) == ("s1", "current")
+    @test (@inferred Nitro.Auth._signing_secret("s1")) == ("s1", nothing)
+end
+
+end
