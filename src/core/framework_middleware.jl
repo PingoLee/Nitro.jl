@@ -102,3 +102,49 @@ function DefaultSerializer(catch_errors::Bool; show_errors::Bool)
         end
     end
 end
+
+# The pipeline's error boundary (#256): `handlerequest` around the WHOLE middleware chain, so an
+# exception escaping middleware gets the same treatment one escaping a handler does -- an `@error`
+# with a backtrace, the generic JSON 500 (or a 400 for a `ValidationError`), and an access-log line.
+#
+# `DefaultSerializer` cannot simply move out here, because it does two jobs and only one of them
+# belongs at the top. `format_response` must stay innermost: every middleware is written against an
+# `HTTP.Response` coming back from `handle(req)`, not a handler's raw `Dict` or `String`. The catch
+# stays there too, so a handler's 500 still passes back through `Cors`, the session layer and the
+# rest on its way out. This layer therefore only ever sees what escapes middleware; a handler's
+# exception has already become a response, which is also why nothing is logged twice.
+#
+# Before this, such an exception left `stream_handler` unhandled and HTTP.jl answered with a
+# bodyless 500 and no Nitro log line at all -- the path #254 made reachable from `BearerAuth` and
+# `CookieAuthMiddleware` by letting `StackOverflowError`/`OutOfMemoryError` through them. This is
+# Plug's `Plug.ErrorHandler` shape: the boundary sits at the top of the pipeline, not next to the
+# router.
+#
+# `setupmiddleware` places it INSIDE `AccessLogMiddleware`, which reads `response.status` and so
+# needs a response to exist, and outside everything that can throw. A 500 raised here carries no
+# CORS or session headers: those layers were inside the throw and never produced a response.
+#
+# `InterruptException` is rethrown BEFORE `handlerequest` sees it. `handlerequest` turns every
+# exception into a response, interrupts included (it only skips logging them), so without this the
+# boundary would absorb a Ctrl-C landing in middleware as a silent 500. That is the exact "no-op
+# Ctrl-C" #254 removed from `BearerAuth` and `CookieAuthMiddleware`. Before this layer existed an
+# interrupt out of middleware propagated, and it still does. `StackOverflowError` and
+# `OutOfMemoryError` are deliberately NOT rethrown: they are failures of the request, and
+# recording them is what this layer is for.
+#
+# `handlerequest(rethrow, ...)` reuses its policy (log level, 400 vs 500, body) instead of
+# restating it. The no-argument `rethrow()` re-raises the exception being handled here with its
+# ORIGINAL backtrace, so the `catch_backtrace()` that `handlerequest` logs still points into the
+# middleware that threw, not at this layer.
+function ErrorBoundary(catch_errors::Bool; show_errors::Bool)
+    return function(handle)
+        return function(req::HTTP.Request)
+            try
+                return handle(req)
+            catch e
+                e isa InterruptException && rethrow()
+                return handlerequest(rethrow, catch_errors; show_errors)
+            end
+        end
+    end
+end

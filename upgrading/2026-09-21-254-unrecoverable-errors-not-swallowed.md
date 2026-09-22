@@ -62,17 +62,19 @@ absorbing it.
 
 ### Where the 500 surfaces, and what it looks like
 
-The two paths differ, and it is worth knowing which you are looking at:
+A `StackOverflowError` or `OutOfMemoryError` is handled the same way whether it is raised in
+a **handler** (where `getjson` runs) or in **middleware** (where `BearerAuth` runs):
+`handlerequest` catches it, logs `@error` with a backtrace, writes the access-log line, and
+returns the standard `{"message": "500: Internal Server Error"}` body. The server keeps running
+and the next request is served normally.
 
-- From a **handler** (which is where `getjson` runs): `handlerequest` catches it, logs
-  `@error` with a backtrace, writes the access-log line, and returns the standard
-  `{"message": "500: Internal Server Error"}` body.
-- From **middleware** (which is where `BearerAuth` runs): middleware sits outside
-  `DefaultSerializer`, so the exception reaches HTTP.jl directly and the client gets a
-  **bodyless `500` with no Nitro log line**. That gap is pre-existing and is tracked
-  separately; it is not introduced here.
+An `InterruptException` raised in middleware is not converted: it propagates out of the pipeline.
+One raised in a handler still becomes an unlogged `500`, as it did before this change.
 
-In both cases the server keeps running and the next request is served normally.
+The middleware half depends on [#256](https://github.com/PingoLee/Nitro.jl/issues/256), which
+ships in the same release. Before it, an exception escaping middleware skipped Nitro's error
+handling entirely: HTTP.jl answered with a **bodyless `500` and no Nitro log line**. See that
+entry for what else it changes.
 
 ### How to find the calls to migrate
 

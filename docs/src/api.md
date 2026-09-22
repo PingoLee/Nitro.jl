@@ -116,6 +116,17 @@ the server is up. `serve()`, `path()` and `urlpatterns()` take either form; only
 a chain by hand needs the `.middleware` field. The type is not exported, so construct one as
 `Nitro.LifecycleMiddleware(...)`.
 
+**A middleware that throws** is handled the same way as a handler that throws, as long as
+`catch_errors=true` (the default for both `serve()` and `internalrequest()`). The exception is
+logged with its backtrace and the client receives `{"message": "500: Internal Server Error"}`.
+A `ValidationError` is answered with a `400` instead and recorded at `@debug` only. The access
+log records the status either way. An `InterruptException` is not converted; it propagates.
+
+There is one difference: a handler's `500` still passes back out through every middleware, but a
+middleware's `500` is produced *above* the chain. It therefore carries no headers from layers the exception skipped,
+such as `Cors` or the session cookie, so a cross-origin browser client sees a CORS failure
+rather than the `500` itself.
+
 ```@docs
 BearerAuth
 Cors

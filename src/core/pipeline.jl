@@ -83,6 +83,11 @@ function setupmiddleware(ctx::App; middleware::Vector=[], serialize::Bool=true, 
 
     global_prefix_middleware = !isnothing(ctx.service.prefix[]) ? [PrefixStripMiddleware(ctx.service.prefix[])] : []
     serializer = serialize ? [DefaultSerializer(catch_errors; show_errors)] : []
+    # The outer half of error handling (#256) -- see `ErrorBoundary`. Gated exactly like the
+    # serializer's catch: `serialize=false` still means Nitro installs no error or format layer at
+    # all, and `catch_errors=false` would make it a pass-through, so it is left out rather than
+    # paid for per request.
+    error_boundary = serialize && catch_errors ? [ErrorBoundary(catch_errors; show_errors)] : []
     # Accept `true` to enable; `nothing`/`false` (or the old logfmt value) disable it.
     access_log_middleware = access_log === true ? [AccessLogMiddleware(; log_query=access_log_query)] : []
 
@@ -142,6 +147,9 @@ function setupmiddleware(ctx::App; middleware::Vector=[], serialize::Bool=true, 
                 ctx.service.custommiddleware, ctx.service.middleware_cache;
                 catch_errors, show_errors, serialize),
         global_prefix_middleware...,
+        # Outside every layer that can throw, inside the access log so that log line records
+        # the 500 this produces (#256).
+        error_boundary...,
         access_log_middleware...,
         _app_context_seed(ctx),
     ])
