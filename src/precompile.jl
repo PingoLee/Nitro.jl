@@ -204,6 +204,21 @@ end
                 "{\"id\":\"nope\",\"name\":\"p\"}"),
     )
 
+    # ── A middleware exception, caught by the pipeline's error boundary (#256) ────────────
+    #
+    # The block above reaches the SERIALIZER's catch. A throw out of middleware lands one layer
+    # further out, in `ErrorBoundary`, whose catch branch calls `handlerequest(rethrow, …)` -- its
+    # own method instance, reached by nothing else. Without this the first middleware failure in a
+    # fresh process pays inference + codegen for it, on the request that is already failing.
+    #
+    # Built with `setupmiddleware` rather than `internalrequest` for `show_errors=false`:
+    # `internalrequest` has no such kwarg, and the `@error` + backtrace it would otherwise print
+    # would land in every precompile log. The branch compiled is identical either way.
+    let boom = handler -> (req::Request -> error("precompile: middleware error boundary"))
+        Core.setupmiddleware(ctx; middleware = [boom], show_errors = false)(
+            Request("GET", "/precompile/ping"))
+    end
+
     # ── The request-body parsers (#242) ────────────────────────────────────────────────
     #
     # `formdata` and `multipart` in `src/utilities/bodyparsers.jl`: an HTML form POST and a file

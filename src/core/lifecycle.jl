@@ -90,9 +90,12 @@ is explicit introspection, not accidental disclosure.)
 - `async=false`: when `true`, return the running `Server` instead of blocking.
 - `parallel=true`: handle requests on the thread pool via `Threads.@spawn`.
 - `serialize=true`: auto-format handler return values into responses (see `Res`).
-- `catch_errors=true`: convert a thrown handler error into a generic
-  `500 Internal Server Error`. **Stack traces are never sent to the client** —
-  the body is always `{"message": "500: Internal Server Error"}`.
+- `catch_errors=true`: convert an error thrown by a handler **or by middleware** into a
+  generic `500 Internal Server Error` and log it with its backtrace. A `ValidationError` becomes
+  a `400` instead and is recorded at `@debug` only; an `InterruptException` from middleware
+  propagates rather than becoming a response. **Stack traces are never sent to the
+  client** — the body is always `{"message": "500: Internal Server Error"}`. Applies only with
+  `serialize=true`.
 - `show_errors=true`: gate **server-side** error logging only (not the client
   response). Leave it `true` in production so failures are recorded in your logs;
   `false` merely silences those logs and does *not* harden the already-generic response.

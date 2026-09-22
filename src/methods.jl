@@ -398,6 +398,12 @@ end
 
 Sends an internal request to the server, allowing for communication between different parts of the application.
 
+Errors go through the same error handling `serve` uses. With `catch_errors=true` (the default), an
+exception thrown by a handler **or by middleware** is logged with its backtrace and comes back as
+the generic `500` response, instead of being raised. A `ValidationError` comes back as a `400`,
+recorded at `@debug` only. An `InterruptException` from middleware is still raised. Pass `catch_errors=false` to have the exception raised to the caller,
+which is usually what a test asserting on it wants.
+
 !!! warning "A streamed response body is yours to close"
     This runs the whole pipeline **minus the socket layer**, so it never reaches the write path
     that drains and closes a streaming body. A handler using `Res.file(req, path; stream = true)`,

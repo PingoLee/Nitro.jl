@@ -300,25 +300,33 @@ Nitro's request path and so the only source of a request-driven `StackOverflowEr
 no-op for `Json{T}`/`JsonFragment{T}`/`Body{T}` routes, because the rethrow would be caught one
 frame later and relabelled a `ValidationError` → 400.
 
-The sites that keep the narrower `e isa InterruptException && rethrow()` do so for **two
+The sites that keep the narrower `e isa InterruptException && rethrow()` do so for **three
 different reasons**, and conflating them is how this list rots:
 
 1. **Nothing recursive is reachable.** `src/types.jl:1024,1055` (`unescapeuri`, `queryparams`),
    `src/utilities/fileutil.jl:609`, `src/core/framework_middleware.jl:43` (`HTTP.URI`), and
-   `src/core/transport.jl:352` (`readbytes!`). All scan-based; no request input makes them
-   overflow, so widening them would be churn.
-2. **Not a request path — a supervisor loop, where continuing IS the contract.**
-   `src/middleware/janitor.jl:76` and `src/Workers/api.jl:915`. Both call application-supplied
-   store code, so by the argument below they would otherwise qualify. They stay narrow because
-   the #190 janitor discipline is that one bad tick must not kill the janitor: there is no
-   request to fail, and a dead sweeper is worse than a swallowed tick. Do not "fix" these to
-   match the table above.
+   `src/core/transport.jl` `_swallow_request_body!` (`readbytes!`). All scan-based; no request
+   input makes them overflow, so widening them would be churn.
+2. **Not a request path — a background task, where the caught failure has no request to fail.**
+   `src/middleware/janitor.jl:76` and `src/Workers/api.jl:915` are supervisor loops: both call
+   application-supplied store code, so by the argument below they would otherwise qualify. They
+   stay narrow because the #190 janitor discipline is that one bad tick must not kill the janitor,
+   and a dead sweeper is worse than a swallowed tick. `src/response.jl`'s `_run_sse_producer`
+   (#160) is the same discipline one level down: the producer task nothing waits on, where the
+   expected failure is the client disconnecting. Do not "fix" these to match the table above.
+3. **The error boundary itself — the place the other two are MEANT to arrive.**
+   `ErrorBoundary` in `src/core/framework_middleware.jl` (#256) wraps the whole middleware chain
+   so that what this predicate lets through gets logged and answered with a 500. Widening it would
+   send `StackOverflowError`/`OutOfMemoryError` straight back to HTTP.jl as the bodyless, unlogged
+   500 it exists to replace. Only the interrupt goes past it.
 
 `src/middleware/extract_ip.jl` uses the predicate despite belonging to group 1, for consistency
 within a file this change already touched.
 
-Those six plus the sites in the table are every `e isa InterruptException && rethrow()` in
-`src/`; `grep -rn 'isa InterruptException && rethrow()' src/` is the audit.
+Those three groups plus the sites in the table are every `e isa InterruptException && rethrow()`
+in `src/`; `grep -rn 'isa InterruptException && rethrow()' src/` is the audit, and a hit it
+returns that no group names is a site that owes this list a line. (Sites are named by function
+rather than line where the file churns; the grep is the source of truth for where they are.)
 
 Use it as a **predicate with a lexical `rethrow()`**, never wrapped in a helper that rethrows for
 you — the no-argument `rethrow()` preserves the original backtrace, which is what
