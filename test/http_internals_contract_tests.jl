@@ -384,4 +384,61 @@ end
     end
 end
 
+@testset "HTTP's SSE body contract, which Res.sse is built on (#160)" begin
+    # `Res.sse` hands the transport an `HTTP.SSEStream` and nothing else. Three properties of that
+    # type are load-bearing for Nitro, and `HTTP = "~2.7"` is a deliberately tight pin, so they are
+    # pinned here next to the rest of the HTTP contract.
+
+    # 1. It is an `AbstractBody`, so it dispatches to the STREAMING method of
+    #    `_write_response_body!` (src/core/transport.jl) rather than a buffered one.
+    @test HTTP.SSEStream <: HTTP.AbstractBody
+
+    events = HTTP.SSEStream()
+    try
+        @test applicable(HTTP.body_read!, events, UInt8[])
+        @test applicable(HTTP.body_closed, events)
+        @test applicable(HTTP.body_close!, events)
+
+        # 2. CLOSED and DRAINED are different states, and that is exactly why the write path
+        #    terminates on the short read instead of pre-checking `body_closed`. If this ever
+        #    became "closed implies empty", the comment in `_write_response_body!` would be
+        #    describing a hazard that no longer exists -- and the fast-producer testset in
+        #    test/sse_tests.jl is the behavioral half of this guard.
+        write(events, HTTP.SSEEvent("pending"))
+        close(events)
+        @test HTTP.body_closed(events)
+        buffer = Vector{UInt8}(undef, 1024)
+        n = HTTP.body_read!(events, buffer)
+        @test n > 0
+        @test String(@view buffer[1:n]) == "data: pending\n\n"
+        # ... and only now does it report EOF, which is the loop's terminator.
+        @test HTTP.body_read!(events, buffer) == 0
+    finally
+        HTTP.body_close!(events)
+    end
+
+    # 3. `sse_stream` declares an unknown length, which is what makes HTTP choose chunked framing.
+    resp = HTTP.sse_stream(200)
+    try
+        @test resp.body isa HTTP.SSEStream
+        @test resp.content_length == -1
+        @test !HTTP.hasheader(resp, "Content-Length")
+        @test HTTP.header(resp, "Content-Type") == "text/event-stream"
+    finally
+        HTTP.body_close!(resp.body)
+    end
+
+    # The injection rejections Nitro relies on instead of its own deleted framer. A bare CR is a
+    # valid SSE line terminator, so accepting one in a single-line field lets one event forge
+    # additional fields -- the hole `format_sse_message` had.
+    @test_throws ArgumentError HTTP.SSEEvent("d"; event = "a\rb")
+    @test_throws ArgumentError HTTP.SSEEvent("d"; event = "a\nb")
+    @test_throws ArgumentError HTTP.SSEEvent("d"; id = "a\rb")
+    @test_throws ArgumentError HTTP.SSEEvent("d"; id = "a\nb")
+    @test_throws ArgumentError HTTP.SSEEvent("d"; id = "a\0b")
+    # `data` may legitimately span lines; every break becomes its own `data:` line rather than a
+    # smuggled field.
+    @test HTTP.SSEEvent("a\rb").data == "a\rb"
+end
+
 end

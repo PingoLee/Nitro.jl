@@ -316,6 +316,148 @@ end
     end
 end
 
+@testset "Res.sse — the SSE response contract, in process (#160)" begin
+    # Socket-level behavior (chunked framing, per-event flush, the fast-producer regression, the
+    # middleware chain) lives in test/sse_tests.jl and HAS to: `internalrequest` never reaches
+    # `_write_response_body!` at all (src/core/pipeline.jl), so nothing here proves a byte was
+    # written. What this testset pins is the part that is decided in the BUILDER.
+
+    @testset "headers, framing signal, and body type" begin
+        resp = Res.sse()
+        try
+            @test resp.status == 200
+            @test resp.body isa HTTP.SSEStream
+            @test HTTP.header(resp, "Content-Type") == "text/event-stream"
+            @test HTTP.header(resp, "Cache-Control") == "no-cache"
+            # Nitro's one addition over HTTP's SSE header set: without it nginx buffers the
+            # stream and a working endpoint is indistinguishable from a hung one.
+            @test HTTP.header(resp, "X-Accel-Buffering") == "no"
+            # An unknown length is what makes HTTP choose chunked framing on the wire. Asserting
+            # the ABSENCE of Content-Length matters: a stale one would make the response a
+            # fixed-length write and truncate it.
+            @test resp.content_length == -1
+            @test !HTTP.hasheader(resp, "Content-Length")
+        finally
+            close(resp.body)
+        end
+    end
+
+    @testset "caller headers are applied last, like every other builder" begin
+        resp = Res.sse(; status = 201,
+                       headers = ["Cache-Control" => "no-store", "X-Trace" => "abc"])
+        try
+            @test resp.status == 201
+            @test HTTP.header(resp, "Cache-Control") == "no-store"
+            @test HTTP.header(resp, "X-Trace") == "abc"
+            @test HTTP.header(resp, "Content-Type") == "text/event-stream"
+        finally
+            close(resp.body)
+        end
+    end
+
+    @testset "the producer form runs the producer and closes the stream" begin
+        resp = Res.sse() do events
+            write(events, SSEEvent("a"; event = "x"))
+            write(events, SSEEvent("b"))
+        end
+        # The producer runs on its own task, so wait for it rather than assuming it has run.
+        @test timedwait(() -> !isopen(resp.body), 10.0; pollint = 0.02) === :ok
+        # Closing the stream is what ENDS the response -- the transport parks in `body_read!`
+        # until it happens -- so `Res.sse` closing on the producer's behalf is the contract.
+        @test HTTP.body_closed(resp.body)
+
+        # The bytes are still readable after the close: buffered-and-closed is a legitimate state
+        # and is exactly what the write path must not mistake for "empty".
+        buffer = Vector{UInt8}(undef, 4096)
+        n = HTTP.body_read!(resp.body, buffer)
+        @test String(@view buffer[1:n]) == "event: x\ndata: a\n\ndata: b\n\n"
+    end
+
+    @testset "a throwing producer still closes the stream" begin
+        # Otherwise the connection would be held open for the life of the process: the drain has
+        # no other way to learn the producer is gone.
+        resp = Res.sse() do events
+            write(events, SSEEvent("partial"))
+            error("boom -- this @error line is expected")
+        end
+        @test timedwait(() -> HTTP.body_closed(resp.body), 10.0; pollint = 0.02) === :ok
+    end
+
+    @testset "a producer fault is reported even when the producer closed its own stream (#160)" begin
+        # THE case `!isopen(events)` alone got wrong. The docstring teaches
+        # `try ... finally close(events) end`, so a genuine fault routinely arrives at the
+        # `catch` with the stream already closed by the producer's own `finally`. Keying on the
+        # state alone demoted that to `@debug` -- compiled out by default -- so the operator saw
+        # nothing and the client saw a clean short stream.
+        events = HTTP.SSEStream()
+        @test_logs (:error, r"event producer failed") match_mode=:any begin
+            Nitro.Res._run_sse_producer(events) do ev
+                try
+                    error("a genuine producer fault")
+                finally
+                    close(ev)
+                end
+            end
+        end
+        @test HTTP.body_closed(events)
+
+        # A framing fault is an `ArgumentError`, not an `IOError`, so it stays at error level too
+        # even though the `finally` has closed the stream by the time it is caught.
+        small = HTTP.SSEStream(; max_len = 16)
+        @test_logs (:error, r"event producer failed") match_mode=:any begin
+            Nitro.Res._run_sse_producer(small) do ev
+                try
+                    write(ev, SSEEvent("x"^512))
+                finally
+                    close(ev)
+                end
+            end
+        end
+    end
+
+    @testset "a fan-out producer's disconnect is still not an error (#160)" begin
+        # A producer that spawns its writes gets the `IOError` wrapped:
+        # `CompositeException` -> `TaskFailedException` -> `Base.IOError`. Classifying the wrapper
+        # as a fault would log an error per departing client -- the noise the predicate exists to
+        # suppress -- so the check unwraps a bounded number of levels.
+        gone = HTTP.SSEStream()
+        close(gone)
+        @test_logs min_level = Base.CoreLogging.Error begin
+            Nitro.Res._run_sse_producer(gone) do ev
+                @sync for _ in 1:2
+                    Threads.@spawn write(ev, SSEEvent("into the void"))
+                end
+            end
+        end
+
+        # ... while a wrapped ArgumentError is still a fault, not a disconnect.
+        @test !Nitro.Res._is_closed_stream_error(ArgumentError("nope"))
+        @test Nitro.Res._is_closed_stream_error(Base.IOError("closed", 0))
+    end
+
+    @testset "a disconnect is NOT reported as an error (#160)" begin
+        # The other direction of the same predicate: writing into a stream the transport already
+        # closed is how most SSE connections end, so it must not log at error level once per
+        # departing client. `Base.IOError` + closed is the signature.
+        gone = HTTP.SSEStream()
+        close(gone)
+        @test_logs min_level = Base.CoreLogging.Error begin
+            Nitro.Res._run_sse_producer(ev -> write(ev, SSEEvent("into the void")), gone)
+        end
+    end
+
+    @testset "max_len caps one serialized event" begin
+        resp = Res.sse(; max_len = 32)
+        try
+            @test_throws ArgumentError write(resp.body, SSEEvent("x"^256))
+        finally
+            close(resp.body)
+        end
+        @test Nitro.Res.SSE_MAX_EVENT_BYTES == 16 * 1024 * 1024
+    end
+end
+
+
 end
 
 @testitem "Response builders on the wire" tags=[:core, :network] setup=[NitroCommon] begin
