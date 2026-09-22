@@ -3580,18 +3580,55 @@ end
     rt = WorkerRuntime(store)
     sink = Test.TestLogger()
     try
-        # Started under the sink, so the spawned scheduler inherits it. Polled for the line
-        # itself rather than for the delete plus a sleep: the line lands after the delete, and a
-        # fixed sleep is a flake waiting for a slow runner.
+        # Started under the sink, so the spawned scheduler inherits it. `TestLogger` takes no lock,
+        # so its log vector is read only once the scheduler has STOPPED: reading it while the
+        # scheduler task may still push is a data race at two threads. The line is written in the
+        # same tick as the delete, and `stop_cleanup_scheduler!` joins the task, so both are done
+        # by the time it returns.
         Base.CoreLogging.with_logger(() -> start_cleanup_scheduler(; interval_hours=0.00005, retain_days=7, runtime=rt), sink)
+        @test wait_for(() -> get_task_info(store, "retire-me") === nothing) == :ok
+        stop_cleanup_scheduler!(rt)
         done(r) = r.message == "Nitro.Workers: task retention sweep complete" && r.level == Base.CoreLogging.Info
-        @test wait_for(() -> any(done, copy(sink.logs))) == :ok
-        line = first(filter(done, copy(sink.logs)))
+        line = only(filter(done, sink.logs))
         @test line.kwargs[:deleted] == 1
-        @test get_task_info(store, "retire-me") === nothing
+        @test line.kwargs[:retain_days] == 7
     finally
         reset_runtime!(rt)
     end
+end
+
+@testset "a write that throws mid-sweep is logged with the tally, then rethrown (#238)" begin
+    # Delegates everything to an in-memory store except the transition, which throws -- the shape
+    # of a connection dropped on the UPDATE.
+    struct ThrowingTransitionStore <: AbstractWorkerStore
+        inner::InMemoryWorkerStore
+    end
+    Nitro.Workers.lock_tasks(f::Function, s::ThrowingTransitionStore) = Nitro.Workers.lock_tasks(f, s.inner)
+    Nitro.Workers.list_running_task_refs(s::ThrowingTransitionStore; kw...) =
+        Nitro.Workers.list_running_task_refs(s.inner; kw...)
+    Nitro.Workers.try_transition!(::ThrowingTransitionStore, ::String, from, ::TaskStatus; run_id, kw...) =
+        error("simulated connection drop on the transition")
+
+    inner = InMemoryWorkerStore()
+    lock(inner.task_lock) do
+        t = TaskInfo("throws::1"); t.status = RUNNING
+        inner.task_registry[t.id] = t
+    end
+    rt = WorkerRuntime(ThrowingTransitionStore(inner))
+    logs, threw = Test.collect_test_logs() do
+        try
+            recover_zombie_tasks!(; runtime=rt)
+            false
+        catch e
+            occursin("simulated connection drop", sprint(showerror, e))
+        end
+    end
+    @test threw
+    failed = only(filter(r -> r.message == "Nitro.Workers: zombie recovery failed mid-sweep", logs))
+    @test failed.level == Base.CoreLogging.Error
+    @test failed.kwargs[:candidates] == 1
+    @test failed.kwargs[:recovered] == 0
+    @test isempty(filter(r -> r.message == "Nitro.Workers: zombie recovery complete", logs))
 end
 
 @testset "cancel_task is atomic: completed task result is never overwritten" begin

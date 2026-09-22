@@ -58,7 +58,9 @@ It logs twice at `@info` ([#238](https://github.com/PingoLee/Nitro.jl/issues/238
 `"Nitro.Workers: zombie recovery complete"` goes out when it finishes, **always**, including when
 it recovered nothing. The completion line carries `candidates`, `recovered`, `spared_live`,
 `too_recent` and `lost_race`. If a read fails, an `@error` with the same counts replaces the
-completion line. Every field is a count; no task's `result` or `error` is ever logged.
+completion line, and the sweep returns what it had recovered so far. A write that throws is
+logged the same way and then rethrown. Every field is a count; no task's `result` or `error` is
+ever logged.
 
 The sweep runs after the startup banner and before the first request is served, so when a boot
 seems to hang after announcing itself, these two lines are the first thing to look for.
@@ -107,7 +109,17 @@ function recover_zombie_tasks!(; runtime::WorkerRuntime=default_runtime(),
                 @error "Nitro.Workers: zombie recovery could not read the RUNNING tasks; stopping early" _tally_kwargs(tally)... exception=(e, catch_backtrace())
                 return tally.recovered
             end
-            _recover_zombie_page!(tally, runtime, page, cutoff)
+            try
+                _recover_zombie_page!(tally, runtime, page, cutoff)
+            catch e
+                # A WRITE that throws still escapes, exactly as before #238. Unlike a failed read,
+                # it leaves the sweep not knowing whether that transition landed, which is not a
+                # state to boot past quietly. What it no longer does is escape without the tally,
+                # so the log shows how far the sweep got.
+                e isa InterruptException && rethrow()
+                @error "Nitro.Workers: zombie recovery failed mid-sweep" _tally_kwargs(tally)... exception=(e, catch_backtrace())
+                rethrow()
+            end
             # Short means exhausted: an implementation returns fewer than `limit` only when
             # nothing is left. A LONGER page is the default method's whole remainder, and the
             # next read past it comes back empty.
