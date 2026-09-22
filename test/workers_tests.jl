@@ -3503,6 +3503,86 @@ end
     @test recover_zombie_tasks!(; runtime=rt_legacy, batch_size=1) == 3
 end
 
+@testset "the zombie sweep always says it ran, and what it did (#238)" begin
+    record(logs, msg) = filter(r -> r.message == msg, logs)
+    SCAN = "Nitro.Workers: scanning for zombie tasks"
+    DONE = "Nitro.Workers: zombie recovery complete"
+
+    # Nothing to recover is exactly the case that used to be silent, and so exactly the one a
+    # hung boot could not be told apart from.
+    logs, n = Test.collect_test_logs() do
+        recover_zombie_tasks!(; runtime=WorkerRuntime(InMemoryWorkerStore()))
+    end
+    @test n == 0
+    @test length(record(logs, SCAN)) == 1
+    done = only(record(logs, DONE))
+    @test done.level == Base.CoreLogging.Info
+    @test done.kwargs[:recovered] == 0
+    @test done.kwargs[:candidates] == 0
+    @test findfirst(r -> r.message == SCAN, logs) < findfirst(r -> r.message == DONE, logs)
+
+    # Every counter, and no task payload. The sentinel sits in exactly the two fields the issue
+    # names, `result` and `error`, on a record the sweep reads and transitions.
+    sentinel = "zombie-secret-7c1e"
+    store = InMemoryWorkerStore()
+    rt = WorkerRuntime(store)
+    live = @async sleep(0.05)
+    try
+        lock(store.task_lock) do
+            for (id, started) in (("log::zombie", nothing), ("log::zombie2", nothing),
+                                  ("log::live", nothing), ("log::young", Dates.now(Dates.UTC)))
+                t = TaskInfo(id)
+                t.status = RUNNING
+                t.started_at = started
+                t.result = Dict("token" => sentinel)
+                t.error = "partial: $sentinel"
+                store.task_registry[id] = t
+            end
+        end
+        Nitro.Workers.register_active_task!(rt, "log::live", live)
+
+        logs, n = Test.collect_test_logs() do
+            recover_zombie_tasks!(; runtime=rt, zombie_min_age=Dates.Hour(1), batch_size=3)
+        end
+        @test n == 2
+        done = only(record(logs, DONE))
+        @test done.kwargs[:candidates] == 4
+        @test done.kwargs[:recovered] == 2
+        @test done.kwargs[:spared_live] == 1
+        @test done.kwargs[:too_recent] == 1
+        @test done.kwargs[:lost_race] == 0
+        @test !any(r -> occursin(sentinel, string(r.message, " ", r.kwargs)), logs)
+    finally
+        wait(live)
+        reset_runtime!(rt)
+    end
+end
+
+@testset "a retention tick that retired rows says so (#238)" begin
+    store = InMemoryWorkerStore()
+    lock(store.task_lock) do
+        expired = TaskInfo("retire-me")
+        expired.status = COMPLETED
+        expired.completed_at = Dates.now(Dates.UTC) - Dates.Day(10)
+        store.task_registry[expired.id] = expired
+    end
+    rt = WorkerRuntime(store)
+    sink = Test.TestLogger()
+    try
+        # Started under the sink, so the spawned scheduler inherits it. Polled for the line
+        # itself rather than for the delete plus a sleep: the line lands after the delete, and a
+        # fixed sleep is a flake waiting for a slow runner.
+        Base.CoreLogging.with_logger(() -> start_cleanup_scheduler(; interval_hours=0.00005, retain_days=7, runtime=rt), sink)
+        done(r) = r.message == "Nitro.Workers: task retention sweep complete" && r.level == Base.CoreLogging.Info
+        @test wait_for(() -> any(done, copy(sink.logs))) == :ok
+        line = first(filter(done, copy(sink.logs)))
+        @test line.kwargs[:deleted] == 1
+        @test get_task_info(store, "retire-me") === nothing
+    finally
+        reset_runtime!(rt)
+    end
+end
+
 @testset "cancel_task is atomic: completed task result is never overwritten" begin
     store = InMemoryWorkerStore()
     rt_store = WorkerRuntime(store)

@@ -782,8 +782,10 @@ degrades to the exception type alone.
 `cleanup_interval_hours=24`), so finished rows — error text included — are pruned on the
 retention window rather than kept forever. A sweep that throws — a transient store error,
 say — is logged and retried on the next interval: it neither stops the scheduler nor makes
-`shutdown!` throw. If you set `cleanup_enabled=false`, you own retention, and stored error
-text lives as long as the row does.
+`shutdown!` throw. A tick that retires rows logs
+`"Nitro.Workers: task retention sweep complete"` at `@info` with `deleted` and `retain_days`. A
+tick with nothing to retire logs the same line at `@debug`. If you set `cleanup_enabled=false`, you
+own retention, and stored error text lives as long as the row does.
 
 !!! warning "Treat `TaskInfo.error` as attacker-influenceable"
     It is free text derived from an exception your own code raised. The safest posture is to
@@ -949,6 +951,27 @@ large crash backlog is worked through in bounded steps rather than loaded whole.
 and stops for this boot, keeping what it already recovered.
 Startup carries on either way. A custom store that does not implement `list_running_task_refs`
 still works: the default derives it from `get_all_tasks`, at the cost of a full read of each record.
+
+The sweep logs at `@info` before it starts and again when it finishes. The finishing line is
+emitted **every time**, including when it recovered nothing:
+
+```
+[ Info: Nitro.Workers: scanning for zombie tasks
+│   zombie_min_age = nothing
+└   batch_size = 500
+[ Info: Nitro.Workers: zombie recovery complete
+│   candidates = 3
+│   recovered = 2
+│   spared_live = 1
+│   too_recent = 0
+└   lost_race = 0
+```
+
+The sweep runs after the startup banner and before the first request is served. If a boot
+announces itself and then goes quiet, look for these two lines. A "scanning" line with no
+"complete" line means the sweep is still working, or is stuck. Only counts are logged, never a
+task's `result` or `error`. `lost_race` counts records that another writer finished, cancelled or
+re-ran between the sweep's read and its write. The sweep leaves those alone.
 
 !!! warning "Several processes sharing one store: set `zombie_min_age`"
     "No live handle" is a fact about *this* process only. A node that boots while another node's

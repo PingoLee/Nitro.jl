@@ -53,6 +53,16 @@ stays `RUNNING`, and nothing but this sweep ever retires it. Each batch is adjud
 next is read. The store's task lock is still held for the whole sweep, as it was before, because
 the lock is what orders the sweep against runs registering in this process.
 
+It logs twice at `@info` ([#238](https://github.com/PingoLee/Nitro.jl/issues/238)).
+`"Nitro.Workers: scanning for zombie tasks"` goes out before it takes the lock, and
+`"Nitro.Workers: zombie recovery complete"` goes out when it finishes, **always**, including when
+it recovered nothing. The completion line carries `candidates`, `recovered`, `spared_live`,
+`too_recent` and `lost_race`. If a read fails, an `@error` with the same counts replaces the
+completion line. Every field is a count; no task's `result` or `error` is ever logged.
+
+The sweep runs after the startup banner and before the first request is served, so when a boot
+seems to hang after announcing itself, these two lines are the first thing to look for.
+
 Reads the **durable** records, not the live-overlaid listing: this is a decision about durable
 state, and `get_active_task` is the whole liveness criterion either way. It reads them through
 [`list_running_task_refs`](@ref), which asks only for the id, run id and start time of each
@@ -76,8 +86,14 @@ function recover_zombie_tasks!(; runtime::WorkerRuntime=default_runtime(),
     # One cutoff for the whole sweep, taken before the first read: a claim is "old enough" against
     # the moment the sweep began, however long the backlog takes to walk.
     cutoff = zombie_min_age === nothing ? nothing : current_time_utc() - zombie_min_age
+
+    # Before the lock, not inside it (#238). This sweep runs at every `start!`, AFTER the banner
+    # has announced the server and before the first request can be served, so a hang here used to
+    # read as a server that said it was up and then went silent. Logging before `lock_tasks` also
+    # separates "waiting for the lock" from "working through the backlog".
+    @info "Nitro.Workers: scanning for zombie tasks" zombie_min_age batch_size
+    tally = _ZombieTally()
     return lock_tasks(runtime) do
-        count = 0
         cursor = nothing
         while true
             # A failed read costs this sweep, never the boot that runs it: before #236 the PormG
@@ -88,18 +104,38 @@ function recover_zombie_tasks!(; runtime::WorkerRuntime=default_runtime(),
                 list_running_task_refs(runtime.store; after=cursor, limit=batch_size)
             catch e
                 e isa InterruptException && rethrow()
-                @error "Nitro.Workers: zombie recovery could not read the RUNNING tasks; stopping early" recovered=count exception=(e, catch_backtrace())
-                return count
+                @error "Nitro.Workers: zombie recovery could not read the RUNNING tasks; stopping early" _tally_kwargs(tally)... exception=(e, catch_backtrace())
+                return tally.recovered
             end
-            count += _recover_zombie_page!(runtime, page, cutoff)
+            _recover_zombie_page!(tally, runtime, page, cutoff)
             # Short means exhausted: an implementation returns fewer than `limit` only when
             # nothing is left. A LONGER page is the default method's whole remainder, and the
             # next read past it comes back empty.
-            length(page) < batch_size && return count
+            if length(page) < batch_size
+                # UNCONDITIONAL, `recovered = 0` included: silence must stop being ambiguous
+                # between "ran and found nothing" and "never got there" (#238). Counts only --
+                # never a task's `result` or `error`, which are application data.
+                @info "Nitro.Workers: zombie recovery complete" _tally_kwargs(tally)...
+                return tally.recovered
+            end
             cursor = last(page).id
         end
     end
 end
+
+# What the sweep did, for its log line. Every field is a count.
+mutable struct _ZombieTally
+    candidates::Int     # RUNNING records read
+    recovered::Int      # transitioned to FAILED
+    spared_live::Int    # this process holds a live handle for the run
+    too_recent::Int     # claimed inside `zombie_min_age` (#239): left for a later sweep, not absent
+    lost_race::Int      # the fenced transition was refused: it finished, or was re-run, meanwhile
+end
+_ZombieTally() = _ZombieTally(0, 0, 0, 0, 0)
+
+_tally_kwargs(t::_ZombieTally) = (candidates=t.candidates, recovered=t.recovered,
+                                  spared_live=t.spared_live, too_recent=t.too_recent,
+                                  lost_race=t.lost_race)
 
 _check_zombie_min_age(age) =
     age === nothing || age >= zero(age) ||
@@ -107,14 +143,21 @@ _check_zombie_min_age(age) =
 
 # One batch. Its transitions move rows out of `RUNNING` at ids at or below the cursor, so they
 # cannot disturb the next page, which starts strictly past it.
-function _recover_zombie_page!(runtime::WorkerRuntime, page::AbstractVector, cutoff::Union{Nothing, DateTime})
-    count = 0
+function _recover_zombie_page!(tally::_ZombieTally, runtime::WorkerRuntime, page::AbstractVector,
+                               cutoff::Union{Nothing, DateTime})
     for task in page
+        tally.candidates += 1
         # Too recent to call dead: see `zombie_min_age`. Checked in Julia over the projected
         # `started_at` rather than in SQL, so a row it excludes is still SEEN, and the sweep can
         # say how many it left for later.
-        cutoff === nothing || task.started_at === nothing || task.started_at <= cutoff || continue
-        isnothing(get_active_task(runtime, task.id)) || continue
+        if !(cutoff === nothing || task.started_at === nothing || task.started_at <= cutoff)
+            tally.too_recent += 1
+            continue
+        end
+        if !isnothing(get_active_task(runtime, task.id))
+            tally.spared_live += 1
+            continue
+        end
         # `get_active_task` is process-local, so in a multi-process deployment this
         # sweep sees another node's genuinely-running task as a zombie. Claiming the
         # transition rather than saving a decision means that if the task finishes
@@ -128,10 +171,12 @@ function _recover_zombie_page!(runtime::WorkerRuntime, page::AbstractVector, cut
                            run_id=task.run_id,
                            error="Worker process terminated unexpectedly mid-execution.",
                            completed_at=current_time_utc())
-            count += 1
+            tally.recovered += 1
+        else
+            tally.lost_race += 1
         end
     end
-    return count
+    return tally
 end
 
 function recover_zombie_tasks!(ctx::App; key::Symbol=DEFAULT_EXTENSION_KEY, runtime::Union{Nothing, WorkerRuntime}=nothing,
@@ -1031,7 +1076,17 @@ function start_cleanup_scheduler(; interval_hours::Real=24, retain_days::Int=7, 
                 break
             end
             try
-                cleanup_old_tasks(retain_days; runtime=runtime)
+                deleted = cleanup_old_tasks(retain_days; runtime=runtime)
+                # A success line too (#238), so a quiet log means "nothing to retire" rather than
+                # "never ran". It is `@info` only when the tick did something: the default cadence
+                # is daily, but the interval is caller-supplied, and an unconditional line at a short
+                # interval is noise. The boot-time zombie sweep is the one that logs
+                # unconditionally -- it runs once, in the window where silence cost an incident.
+                if deleted isa Integer && deleted > 0
+                    @info "Nitro.Workers: task retention sweep complete" deleted retain_days
+                else
+                    @debug "Nitro.Workers: task retention sweep complete" deleted retain_days
+                end
             catch e
                 # Rethrow guard, per the idiom in src/utilities/misc.jl and
                 # src/middleware/janitor.jl: a catch-all that eats `InterruptException` makes

@@ -234,6 +234,13 @@ never retires those, since it needs a `completed_at`.
 The filter runs **in Julia over the projected `started_at`**, not in SQL, so a row it excludes is
 still seen and counted. Do not "optimize" it into the query without keeping that count.
 
+**The sweep's completion line is unconditional**
+([#238](https://github.com/PingoLee/Nitro.jl/issues/238)). `"Nitro.Workers: scanning for zombie
+tasks"` goes out before `lock_tasks`, and `"… zombie recovery complete"` goes out after, with
+`recovered = 0` included. On a read failure, an `@error` carrying the same counts replaces it. The
+sweep runs after the banner and before the first request, which is the window where silence cost an
+incident, so never make that line conditional. Counts only, never a `result` or `error` payload.
+
 ## 6. Developer Rules
 
 > **Strict core isolation**: Never import `PormG` or run DB queries in `src/Workers`. Database logic belongs in `ext/NitroPormGExt.jl`.
