@@ -246,8 +246,16 @@ function _parse_db_datetime(val)::DateTime
     # PormG returns ZonedDateTime from PostgreSQL TIMESTAMPTZ and
     # from SQLite when the stored value contains a timezone offset.
     if val isa Dates.AbstractDateTime
-        return DateTime(Dates.year(val), Dates.month(val), Dates.day(val),
-                        Dates.hour(val), Dates.minute(val), Dates.second(val))
+        # To UTC, not merely stripped of its zone. Every `DateTime` Nitro compares these against
+        # is UTC, and copying the wall-clock fields read a `ZonedDateTime` from a non-UTC session
+        # as off by the offset. LibPQ pins the session to UTC by default, so this was latent, but
+        # `PGTZ` or a session TimeZone option would shift every stored instant: session
+        # `expires_at`, and the `started_at` that `zombie_min_age` judges a claim's age by (#239).
+        # `utc_datetime` is TimeZones' field for exactly this, read here without importing
+        # TimeZones into the ext. Whole seconds, as before, so a UTC session reads unchanged.
+        u = hasproperty(val, :utc_datetime) ? getproperty(val, :utc_datetime) : val
+        return DateTime(Dates.year(u), Dates.month(u), Dates.day(u),
+                        Dates.hour(u), Dates.minute(u), Dates.second(u))
     end
     s = string(val)
     # Try common DB formats

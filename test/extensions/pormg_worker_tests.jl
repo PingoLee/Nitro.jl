@@ -4,6 +4,7 @@ using Test
 using Dates
 using JSON
 using UUIDs
+using TimeZones: ZonedDateTime, FixedTimeZone
 using Nitro
 using Nitro.Workers
 using Nitro.Errors: AuthorizationError
@@ -1325,6 +1326,27 @@ else
                     end
                 end
             end
+
+            # A claim's age is only as honest as the timestamp it is read from. PostgreSQL hands
+            # back a `ZonedDateTime` in the SESSION's zone, and the parser used to copy its
+            # wall-clock fields and drop the offset -- so under `PGTZ=America/Sao_Paulo` every
+            # `started_at` read three hours OLDER than it was, and a peer's minute-old claim cleared
+            # a two-hour bound. Exactly the false positive `zombie_min_age` exists to prevent.
+            brt = FixedTimeZone("BRT", -3 * 3600)
+            parse_db = getproperty(PormGExt, :_parse_db_datetime)
+            @test parse_db(ZonedDateTime(DateTime(2026, 1, 1, 13, 0, 0), brt; from_utc=true)) ==
+                  DateTime(2026, 1, 1, 13, 0, 0)
+
+            m = MockTaskModel()
+            store_tz = RealPormGWorkerStore(model=m)
+            t = TaskInfo("tz::young")
+            t.status = RUNNING
+            replace_task!(store_tz, t.id, t)
+            just_now = Dates.now(Dates.UTC) - Minute(1)
+            m._table[t.id]["started_at"] = ZonedDateTime(just_now, brt; from_utc=true)
+            rt_tz = WorkerRuntime(store_tz)
+            @test recover_zombie_tasks!(; runtime=rt_tz, zombie_min_age=Hour(2)) == 0
+            @test m._table[t.id]["status"] == "RUNNING"
 
             @test_throws ArgumentError recover_zombie_tasks!(; runtime=WorkerRuntime(InMemoryWorkerStore()),
                                                               zombie_min_age=Hour(-1))
