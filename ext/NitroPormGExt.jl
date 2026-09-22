@@ -269,7 +269,9 @@ function _parse_db_datetime(val)::DateTime
             continue
         end
     end
-    # Strip timezone suffix and retry
+    # Strip timezone suffix and retry. This branch ASSUMES the suffix is UTC: PormG writes
+    # `+00:00`, and it hands SQLite DateTimeField columns back as `ZonedDateTime` (the branch
+    # above), so only a hand-written TEXT value with another offset reaches here misread.
     clean = replace(s, r"[+-]\d{2}:?\d{2}$" => "")
     clean = replace(clean, r"\.\d+$" => "")
     return Dates.DateTime(clean, dateformat"yyyy-mm-dd\THH:MM:SS")

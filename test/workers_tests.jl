@@ -3503,8 +3503,9 @@ end
     @test recover_zombie_tasks!(; runtime=rt_legacy, batch_size=1) == 3
 
     # The default scan's FIRST page is id-ordered too, not the store's Dict order: the sweep's
-    # cursor is that page's last id, so an unsorted page would leave unadjudicated rows below it
-    # and read them again on the next page. Twenty ids, so a Dict order cannot pass by luck.
+    # cursor is that page's last id, so an unsorted page makes the cursor arbitrary, and the next
+    # page re-reads rows already adjudicated and still RUNNING, counting them twice. Twenty ids,
+    # so a Dict order cannot pass by luck.
     many = DataOnlyStore()
     ids = ["many::$(lpad(i, 2, '0'))" for i in 1:20]
     for id in ids

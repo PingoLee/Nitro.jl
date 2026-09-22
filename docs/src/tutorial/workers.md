@@ -948,7 +948,10 @@ through the store method `list_running_task_refs`. It never deserializes a task'
 zombie behind it. It reads them `ZOMBIE_SWEEP_BATCH` (500) at a time, keyset-paged on the id, so a
 large crash backlog is worked through in bounded steps rather than loaded whole. Pass
 `batch_size` to `recover_zombie_tasks!` to change that. If a read fails, the sweep logs the error
-and stops for this boot, keeping what it already recovered.
+and stops for this boot, keeping what it already recovered. If a *write* throws (a connection
+dropped mid-update, say), the sweep logs `"zombie recovery failed mid-sweep"` with its counts and
+rethrows, which fails `start!`: after a failed write, the sweep cannot know whether that
+transition landed.
 Startup carries on either way. A custom store that does not implement `list_running_task_refs`
 still works: the default derives it from `get_all_tasks`, at the cost of a full read of each record.
 

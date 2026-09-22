@@ -303,8 +303,9 @@ function list_running_task_refs(store::AbstractWorkerStore; after::Union{Nothing
     refs = RunningTaskRef[_running_ref(task) for task in get_all_tasks(store, System(); status=RUNNING)]
     # Sorted on EVERY paged call, the first one included. The listing comes back in whatever
     # order the store keeps (a `Dict`'s, for most), and a caller's cursor is the last id of this
-    # page: an unsorted first page would put rows below that cursor that it never adjudicated,
-    # and the next page would read them a second time.
+    # page. Unsorted, that cursor is arbitrary, so the next page `id > cursor` hands back rows the
+    # caller has ALREADY adjudicated and that are still `RUNNING` (spared as live, too recent, or
+    # lost the race), which the sweep would then count twice.
     return paged ? _keyset_page(refs, after, nothing) : refs
 end
 
