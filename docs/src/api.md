@@ -157,6 +157,7 @@ Files
 ```@docs
 SecretString
 reveal
+Nitro.Auth.JWTKeyset
 ```
 
 ## Environment

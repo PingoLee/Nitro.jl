@@ -400,17 +400,17 @@ identity is available as a typed field — `getuser(req).id` is the `sub` claim 
 (configurable via `identity_claim`, or derive it from the verified key id with
 `identity_from=:kid`). See [Authentication](authentication.md) for the full contract.
 
-You can also pass a keyset with `kid` values for rotation:
+You can also pass a keyset — one signing key, plus keys that only verify — for rotation:
 
 ```julia
 required_env(name::String) = get(ENV, name, nothing) === nothing ? error("$name must be set") : ENV[name]
 
-keys = Dict(
-    "default" => required_env("JWT_SECRET_PRIMARY"),
-    "rotated" => required_env("JWT_SECRET_ROTATED"),
+keyset = JWTKeyset(
+    "current" => required_env("JWT_SECRET_CURRENT");
+    verify = ["previous" => required_env("JWT_SECRET_PREVIOUS")],
 )
-token = encode_jwt(Dict("sub" => "42", "exp" => trunc(Int, time()) + 300), keys; kid="rotated")
-claims = decode_jwt(token, keys)
+token = encode_jwt(Dict("sub" => "42", "exp" => trunc(Int, time()) + 300), keyset)  # kid = "current"
+claims = decode_jwt(token, keyset)
 ```
 
 `validate_claims` checks `exp`, `iat`, `nbf`, `iss`, and `aud` when present.
@@ -488,13 +488,14 @@ validator = jwt_validator(jwt_secret; exp_timeout=300)
 
 When the signer sets a `kid` header, pass a keyset instead of a single secret; `decode_jwt`
 reads the header's `kid` to select the matching key. A token that carries **no** `kid` is tried
-against every key in the set — `"default"` first, then the rest by name — so a foreign issuer
-still signing with the old secret keeps working through the rotation window. See
+against every key in the set — the signing key first, then the rest by name — so a foreign
+issuer still signing with the old secret keeps working through the rotation window. See
 [Key rotation and the `kid` trust model](authentication.md#Key-rotation-and-the-kid-trust-model)
-for the full contract, including why a keyset may not hold one secret under two names.
+for the full contract, including how a plain `Dict` is lifted into a keyset and why a keyset may
+not hold one secret under two names.
 
 ```julia
-keys = Dict("primary" => primary_secret, "rotated" => rotated_secret)
+keys = JWTKeyset("current" => current_secret; verify = ["previous" => previous_secret])
 validator = jwt_validator(keys)
 ```
 
