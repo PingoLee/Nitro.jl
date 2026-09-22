@@ -507,6 +507,129 @@ end
     end
 end
 
+@testset "jwt_validator warn_claims observability tier (#134)" begin
+    caught(f) = try; f(); nothing; catch err; err; end
+    keyset = Dict("issuer-a" => "secret-a", "issuer-b" => "secret-b")
+    # `Base.CoreLogging`, not `using Logging` -- Logging is not a test dependency.
+    records(f; min_level = Base.CoreLogging.Debug) = begin
+        logger = Test.TestLogger(min_level = min_level)
+        Base.CoreLogging.with_logger(logger) do; f(); end
+        logger.logs
+    end
+    at(logs, level) = filter(r -> r.level == level, logs)
+    kv(record) = Dict(record.kwargs)
+
+    subless(kid) = Nitro.Auth.encode_jwt(Dict("iss" => "legacy-idp"), keyset; kid=kid, expires_in=3600)
+
+    @testset "warns once per (claim, kid, iss), debugs every time" begin
+        validator = Nitro.Auth.jwt_validator(keyset; warn_claims=["sub"])
+        token = subless("issuer-a")
+        logs = records(() -> for _ in 1:3; validator(token); end)
+        @test length(at(logs, Base.CoreLogging.Warn)) == 1
+        @test length(at(logs, Base.CoreLogging.Debug)) == 3
+
+        # A DIFFERENT issuer is a different offender, so it gets its own warning. This is
+        # what `maxlog=1` could not do: it keys on the call site, so the second issuer
+        # would have been silent forever.
+        more = records(() -> (validator(token); validator(subless("issuer-b"))))
+        warned = at(more, Base.CoreLogging.Warn)
+        @test length(warned) == 1
+        @test kv(warned[1])[:kid] == "issuer-b"
+    end
+
+    @testset "the record names the offender and nothing else" begin
+        validator = Nitro.Auth.jwt_validator(keyset; warn_claims=["sub"])
+        token = Nitro.Auth.encode_jwt(Dict("iss" => "legacy-idp", "email" => "a@b.test"),
+                                      keyset; kid="issuer-a", expires_in=3600)
+        record = only(at(records(() -> validator(token)), Base.CoreLogging.Warn))
+        fields = kv(record)
+        @test (fields[:claim], fields[:kid], fields[:iss]) == ("sub", "issuer-a", "legacy-idp")
+        # Never the token, never another claim value.
+        rendered = string(record.message, fields)
+        @test !occursin(token, rendered)
+        @test !occursin("a@b.test", rendered)
+
+        # A hostile-but-signed `iss` is bounded before it reaches the log or the set.
+        long_iss = Nitro.Auth.jwt_validator("secret-a"; warn_claims=["sub"])
+        huge = Nitro.Auth.encode_jwt(Dict("iss" => repeat("x", 5_000)), "secret-a"; expires_in=3600)
+        reported = kv(only(at(records(() -> long_iss(huge)), Base.CoreLogging.Warn)))[:iss]
+        # A LITERAL, not `_WARN_ISS_MAX + 1`: reading the constant the assertion exists to
+        # pin makes it a tautology that moves with any change to the cap. 128 chars plus
+        # the ellipsis.
+        @test length(reported) == 129
+        @test endswith(reported, "…")
+        @test Nitro.Auth._WARN_ISS_MAX == 128
+    end
+
+    @testset "observed is not required, and silent when satisfied" begin
+        validator = Nitro.Auth.jwt_validator(keyset; warn_claims=["sub"])
+        # A warn claim never rejects.
+        @test validator(subless("issuer-a")) isa Nitro.Principal
+        # And says nothing at all when the claim is there.
+        present = Nitro.Auth.encode_jwt(Dict("sub" => "9", "iss" => "modern-idp"),
+                                        keyset; kid="issuer-a", expires_in=3600)
+        @test isempty(records(() -> validator(present)))
+        # A validator without the tier does no work and logs nothing.
+        plain = Nitro.Auth.jwt_validator(keyset)
+        @test isempty(records(() -> plain(subless("issuer-a"))))
+    end
+
+    @testset "kid is the keyset-verified one, never the header label" begin
+        # With a single string secret the header kid is attacker-writable, so it must not
+        # reach the log as though it identified a signer.
+        validator = Nitro.Auth.jwt_validator("secret-a"; warn_claims=["sub"])
+        spoofed = Nitro.Auth.encode_jwt(Dict("iss" => "legacy-idp"), "secret-a";
+                                        kid="i-am-whoever-i-say", expires_in=3600)
+        @test kv(only(at(records(() -> validator(spoofed)), Base.CoreLogging.Warn)))[:kid] === nothing
+    end
+
+    @testset "de-duplication is capped" begin
+        validator = Nitro.Auth.jwt_validator("secret-a"; warn_claims=["sub"])
+        logs = records(min_level = Base.CoreLogging.Warn) do
+            for n in 1:80
+                validator(Nitro.Auth.encode_jwt(Dict("iss" => "idp-$n"), "secret-a"; expires_in=3600))
+            end
+        end
+        warned = at(logs, Base.CoreLogging.Warn)
+        # 64 distinct offenders, then exactly one saturation notice and silence.
+        @test length(warned) == 65
+        @test occursin("saturated", warned[end].message)
+    end
+
+    @testset "de-duplication holds under concurrent requests" begin
+        # The `seen` Set is the only new shared mutable state on the request path, and
+        # every other test here drives it sequentially.
+        #
+        # Read this for what it is: a check that concurrent use produces no DUPLICATE
+        # warning, no lost one, and no corrupted Set -- not a race detector. Deleting the
+        # lock was measured at 200 trials per thread count and reproduced the duplicate
+        # 0/200 times at `-t 1` and 2/200 at `-t 2`, which are the counts CI runs. At
+        # `-t 1` `Threads.@spawn` cannot preempt inside the critical region at all, so no
+        # arrangement of this test could catch it there. It is stable in the other
+        # direction -- 200/200 exactly-one when the lock is present -- so it holds the
+        # contract without pretending to prove the lock is load-bearing.
+        validator = Nitro.Auth.jwt_validator(keyset; warn_claims=["sub"])
+        token = subless("issuer-a")
+        logger = Test.TestLogger(min_level = Base.CoreLogging.Warn)
+        Base.CoreLogging.with_logger(logger) do
+            @sync for _ in 1:32
+                Threads.@spawn validator(token)
+            end
+        end
+        @test length(at(logger.logs, Base.CoreLogging.Warn)) == 1
+    end
+
+    @testset "construction-time validation" begin
+        err = caught(() -> Nitro.Auth.jwt_validator("secret-a";
+                                                    required_claims=["sub", "iss"], warn_claims=["sub"]))
+        @test err isa ArgumentError
+        @test occursin("sub", sprint(showerror, err))
+        # Disjoint sets are the normal case.
+        @test Nitro.Auth.jwt_validator("secret-a"; required_claims=["iss"], warn_claims=["sub"]) isa Function
+        @test Nitro.Auth.jwt_validator("secret-a"; warn_claims=String[]) isa Function
+    end
+end
+
 @testset "Password helpers" begin
     hash = Nitro.Auth.make_password("ValidPass1!")
     @test Nitro.Auth.check_password("ValidPass1!", hash)
