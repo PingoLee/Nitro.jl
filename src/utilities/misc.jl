@@ -6,7 +6,7 @@ using ..Errors: ValidationError, is_unrecoverable
 
 export recursive_merge, parseparam, parseparam_checked,
     handlerequest,
-    format_response, header_name_isequal, set_content_size!,
+    format_response, header_name_isequal,
     join_url_path,
     own_response_headers, add_response_headers
 
@@ -348,34 +348,6 @@ _rebuild_with_headers(resp::HTTP.Response, headers) = HTTP.Response(
     previous        = resp.previous,
     redirect_count  = resp.redirect_count,
 )
-
-
-"""
-    set_content_size!(body::Base.CodeUnits{UInt8, String}, headers::Vector; add::Bool, replace::Bool)
-
-Set the "Content-Length" header in the `headers` vector based on the length of the `body`.
-
-# Arguments
-- `body`: The body of the HTTP response. This should be a `Base.CodeUnits{UInt8, String}`.
-- `headers`: A vector of headers for the HTTP response.
-- `add`: A boolean flag indicating whether to add the "Content-Length" header if it doesn't exist. Default is `false`.
-- `replace`: A boolean flag indicating whether to replace the "Content-Length" header if it exists. Default is `false`.
-"""
-function set_content_size!(body::Union{Base.CodeUnits{UInt8, String}, Vector{UInt8}}, headers::Vector; add::Bool, replace::Bool)
-    content_length_found = false
-    for i in 1:length(headers)
-        if headers[i].first == "Content-Length"
-            if replace 
-                headers[i] = "Content-Length" => string(sizeof(body))
-            end
-            content_length_found = true
-            break
-        end
-    end
-    if add && !content_length_found
-        push!(headers, "Content-Length" => string(sizeof(body)))
-    end
-end
 
 
 """
