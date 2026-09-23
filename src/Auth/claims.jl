@@ -7,6 +7,10 @@ function _claim_value(claims::AbstractDict, key::AbstractString, default=nothing
     return default
 end
 
+# The container `decode_jwt` parses into (#274). A `Dict{String, Any}` cannot hold a
+# `Symbol` key, so the fallback above would only intern a Symbol and miss, per claim read.
+_claim_value(claims::Dict{String, Any}, key::AbstractString, default=nothing) = get(claims, key, default)
+
 function _claim_int(value, field::String)
     if value isa Integer
         return Int(value)

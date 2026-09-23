@@ -411,7 +411,12 @@ keyset = JWTKeyset(
 )
 token = encode_jwt(Dict("sub" => "42", "exp" => trunc(Int, time()) + 300), keyset)  # kid = "current"
 claims = decode_jwt(token, keyset)
+claims["sub"]    # "42"
 ```
+
+`decode_jwt` returns the claims as a `Dict{String, Any}`, nested objects included. Read them
+by **string** key: `claims["sub"]`, not `claims[:sub]` or `claims.sub`. The values are
+whatever JSON the token carried.
 
 `validate_claims` checks `exp`, `iat`, `nbf`, `iss`, and `aud` when present.
 
