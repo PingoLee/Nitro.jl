@@ -45,8 +45,9 @@ because this is the request path (nitro-core §7).
 """
 function _verify_candidates(secret::AbstractString, header_kid::Nullable{String})
     # A single secret verifies everything, and the header `kid` stays an unverified label
-    # passed straight back -- `jwt_validator` discards it via `kid_trusted`.
-    return Tuple{Nullable{String}, String}[(header_kid, String(secret))]
+    # passed straight back -- `jwt_validator` discards it via `kid_trusted`. An empty key is
+    # refused here as well as at `jwt_validator` construction, for direct callers (#264).
+    return Tuple{Nullable{String}, String}[(header_kid, String(_check_string_secret(secret)))]
 end
 
 function _verify_candidates(keyset::JWTKeyset, header_kid::Nullable{String})
@@ -76,8 +77,9 @@ _verify_candidates(other, ::Nullable{String}) =
     throw(ArgumentError("JWT secret must be $_JWT_SECRET_TYPES, got a $(typeof(other))"))
 
 # `(secret, kid to stamp into the header)`. A plain string secret signs a kid-less token;
-# a keyset signs with, and stamps, its signing key.
-_signing_secret(secret::AbstractString) = (String(secret), nothing)
+# a keyset signs with, and stamps, its signing key. A token signed with an empty key is
+# one anyone can forge, so it is refused rather than issued (#264).
+_signing_secret(secret::AbstractString) = (String(_check_string_secret(secret)), nothing)
 
 function _signing_secret(keyset::JWTKeyset)
     key = _signing_key(keyset)

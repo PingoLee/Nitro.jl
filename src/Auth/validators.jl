@@ -102,6 +102,12 @@ misconfiguration — a multi-key `Dict` with no `"default"`, two entries that ar
 HMAC key, a non-string secret — is an `ArgumentError` at construction, which is app
 startup. The validator keeps that snapshot: mutating the `Dict` afterwards has no effect.
 
+A string secret is held to the same rule as a keyset secret: one that is empty, or that
+HMAC treats as empty (a short run of `"\\0"` bytes), is an `ArgumentError` at construction.
+Read the secret with a `nothing` default — `get(ENV, "JWT_SECRET", nothing)` — and fail at
+startup when it is missing; a `""` default would otherwise authenticate every token signed
+with the empty string. `encode_jwt` and `decode_jwt` refuse such a secret too.
+
 # Profiles
 
 - `profile = :default` — signature + time-bound validation, plus any explicitly passed
@@ -182,6 +188,10 @@ function jwt_validator(secret_or_keyset;
     keyset = secret_or_keyset isa AbstractDict ? JWTKeyset(secret_or_keyset) : secret_or_keyset
     keyset isa Union{AbstractString, JWTKeyset} || throw(ArgumentError(
         "jwt_validator: the secret must be $_JWT_SECRET_TYPES, got a $(typeof(keyset))"))
+    # At construction, which is app startup: an empty string secret -- typically an unset
+    # env var read with a "" default -- makes every token forged with "" authenticate
+    # (#264). `JWTKeyset` already refused this for its own secrets; a plain string did not.
+    keyset isa AbstractString && _check_string_secret(keyset)
 
     # Only a keyset-resolved kid is verified; `decode_jwt` with a single string secret
     # passes the attacker-chosen header kid through as an unverified label.

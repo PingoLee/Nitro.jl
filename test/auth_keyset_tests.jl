@@ -104,6 +104,45 @@ end
     @test bytes["default"] == codeunits("real-prod-secret")
 end
 
+@testset "a plain string secret is held to the keyset's empty-key rule (#264)" begin
+    # The predicate is HMAC's own equivalence, checked against HMAC itself: NULs up to the
+    # 64-byte block are zero-padded into the empty key; a longer key is hashed first.
+    oracle(s) = Nitro.Auth._hmac_fingerprint(SecretString(s)) ==
+        Nitro.Auth.SHA.hmac_sha256(UInt8[], UInt8[])
+    for s in ("", "\0", "\0\0\0", "\0"^64, "\0"^65, "a", "a\0", "\0a", "\0"^63 * "a")
+        @test (repr(s), Nitro.Auth._empty_hmac_key(s)) == (repr(s), oracle(s))
+    end
+    @test Nitro.Auth._empty_hmac_key("\0"^64)
+    @test !Nitro.Auth._empty_hmac_key("\0"^65)
+
+    # The forged token an attacker builds when the server's secret is "" -- by hand,
+    # because `encode_jwt` now refuses to sign it.
+    function forge_with_empty_key(claims)
+        seg(x) = Nitro.Auth._base64url_encode(Vector{UInt8}(codeunits(JSON.json(x))))
+        input = string(seg(Dict("alg" => "HS256", "typ" => "JWT")), ".", seg(claims))
+        sig = Nitro.Auth._base64url_encode(Nitro.Auth._hmac_sha256("", input))
+        return string(input, ".", sig)
+    end
+    forged = forge_with_empty_key(Dict("sub" => "admin", "exp" => Nitro.Auth._current_timestamp() + 60))
+
+    # The reported shape: `jwt_validator(get(ENV, "JWT_SECRET", ""))` used to return a
+    # Principal for `forged`. Now there is no validator to ask.
+    for secret in ("", "\0", "\0\0", SubString("x\0\0", 2))
+        @test (repr(secret), caught(() -> jwt_validator(secret)) isa ArgumentError) == (repr(secret), true)
+        @test (repr(secret), caught(() -> decode_jwt(forged, secret)) isa ArgumentError) == (repr(secret), true)
+        @test (repr(secret), caught(() -> encode_jwt(Dict("sub" => "x"), secret)) isa ArgumentError) ==
+            (repr(secret), true)
+    end
+    @test occursin("empty HMAC key", message(() -> jwt_validator("")))
+    @test occursin("JWT_SECRET", message(() -> jwt_validator("")))
+    # A real secret is untouched, and a forged token still fails its signature against it.
+    @test jwt_validator("s1")(encode_jwt(Dict("sub" => "1"), "s1"; expires_in = 60)).id == "1"
+    @test occursin("Invalid JWT signature", message(() -> jwt_validator("s1")(forged)))
+    # The message never echoes the value -- checked on a NUL spelling, the only one the
+    # refusal ever sees, since any other byte makes the secret non-empty.
+    @test !occursin("\0", message(() -> jwt_validator("\0\0")))
+end
+
 @testset "signing as a peer of a registry" begin
     # The client-registry shape: permanent identities, none of them "retiring".
     registry = JWTKeyset("self" => "s-self"; verify = ["reporting" => "s-rep", "batch" => "s-batch"])
