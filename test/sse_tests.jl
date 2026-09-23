@@ -152,6 +152,8 @@ urlpatterns(ctx, "", Nitro.RouteDefinition[
     path("/events/boom", boom),
     path("/events/forever", forever),
     path("/events/head", head_probe, methods = ["GET", "HEAD"]),
+    # GET-only: its HEAD is the auto-HEAD (#277), which must not drain the body either.
+    path("/events/head-auto", head_probe),
     path("/health", health),
 ])
 
@@ -264,7 +266,9 @@ try
 
         @test HTTP.get("$localhost/health").status == 200
     end
-    @testset "HEAD does not drain an SSE body (#160)" begin
+    # Explicit HEAD route, then the auto-HEAD of a GET-only route (#277). One at a time: they
+    # share the probe's counters.
+    @testset "HEAD does not drain an SSE body (#160): $route" for route in ("/events/head", "/events/head-auto")
         HEAD_WROTE[] = 0
         HEAD_STOPPED[] = false
 
@@ -279,7 +283,7 @@ try
         # is steadily streaming -- which is the exact failure this test guards.
         task = Threads.@spawn begin
             try
-                resp[] = HTTP.head("$localhost/events/head"; request_timeout = 15, retry = false)
+                resp[] = HTTP.head("$localhost$route"; request_timeout = 15, retry = false)
             catch err
                 failure[] = err
             end
@@ -305,7 +309,7 @@ try
         @test HEAD_WROTE[] < HEAD_EVENTS
 
         # And the same route still streams normally over GET, so the guard is method-scoped.
-        got = collect_sse("$localhost/events/head"; want = 3)
+        got = collect_sse("$localhost$route"; want = 3)
         @test got.finished === :ok
         @test length(got.events) == 3
 

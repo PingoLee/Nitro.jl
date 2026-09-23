@@ -90,6 +90,9 @@ end
 Define a single route using Django-style path syntax.
 
 Path converters: `<int:name>`, `<str:name>`, `<float:name>`, `<bool:name>`, `<uuid:name>`.
+
+A `"GET"` route also answers `HEAD` through the same handler and middleware, unless a `HEAD` route
+is registered explicitly for the same path. That route wins whatever the registration order.
 """
 function path(pattern::String, handler::Function; 
     method::String = "GET",

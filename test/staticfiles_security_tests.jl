@@ -1381,6 +1381,28 @@ end
             resetstate()
         end
     end
+
+    @testset "under a ROOT spafiles, HEAD on a GET-only API route is the route's, not the shell (#277)" begin
+        # HTTP.jl lets a later `**` leaf override an exact node's method miss. With no HEAD leaf on
+        # `/api/users`, a HEAD there fell through to the root mount and got the app shell's 200 and
+        # headers, while its GET returned JSON. The auto-HEAD gives the exact node its own leaf.
+        spa = mktempdir()
+        write(joinpath(spa, "index.html"), "SHELL")
+        resetstate()
+        try
+            spafiles(spa, "")
+            urlpatterns("", [path("/api/users", req -> Res.json(Dict("users" => 1)))])
+            got  = internalrequest(HTTP.Request("GET",  "/api/users"))
+            head = internalrequest(HTTP.Request("HEAD", "/api/users"))
+            @test head.status == got.status == 200
+            @test startswith(HTTP.header(head, "Content-Type"), "application/json")
+            @test HTTP.header(head, "Content-Type") == HTTP.header(got, "Content-Type")
+            # Client routes still get the shell on HEAD, as on GET.
+            @test startswith(HTTP.header(internalrequest(HTTP.Request("HEAD", "/users/1")), "Content-Type"), "text/html")
+        finally
+            resetstate()
+        end
+    end
 end
 
 @testset "a streamed body is released even when it is never written (#41)" begin

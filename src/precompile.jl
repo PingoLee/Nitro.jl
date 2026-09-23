@@ -68,6 +68,8 @@ end
     ])
     Core.internalrequest(ctx, Request("GET", "/precompile/cached"); catch_errors=false)
     Core.internalrequest(ctx, Request("GET", "/precompile/cached"); catch_errors=false)
+    # The auto-HEAD every GET route gets (#277): an `AutoHeadHandler` leaf, keyed on `GET` here.
+    Core.internalrequest(ctx, Request("HEAD", "/precompile/cached"); catch_errors=false)
 
     # A third request WITH per-call global middleware: `use_cache` is false, so this is the
     # `compose` branch that skips the cache entirely and rebuilds through `buildmiddleware`
