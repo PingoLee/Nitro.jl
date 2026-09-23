@@ -227,10 +227,28 @@ function registerhandler(ctx::App, router::Router, httpmethod::String, route::St
     elseif owns_head && (httpmethod == STREAM || httpmethod == WEBSOCKET)
         # These replace the `GET` leaf. An auto-`HEAD` left behind by an earlier `GET` at the same
         # path (Revise, a re-run `urlpatterns`) would keep serving that old handler.
-        _register_head!(ctx, router, route, req::HTTP.Request -> router._405(req), :retired)
+        _register_head!(ctx, router, route, RetiredHeadHandler(router), :retired)
     end
     return nothing
 end
+
+"""
+    RetiredHeadHandler(router)
+
+The `HEAD` leaf left where an auto-`HEAD` used to be, after a `STREAM`/`WEBSOCKET` route replaced
+the `GET` leaf beside it (#277). HTTP.jl cannot remove a leaf, so this one answers `405` in its
+place, with `Allow` (#281).
+
+It is a distinct type so [`_allowed_methods`](@ref) can leave `HEAD` out of that `Allow`: the
+router does resolve `HEAD` to this leaf, but the leaf refuses it.
+
+Subtypes `Function` so the `RouteResolution` hand-off (`innerhandler isa Function`) still applies.
+"""
+struct RetiredHeadHandler{R<:HTTP.Router} <: Function
+    router :: R
+end
+
+(h::RetiredHeadHandler)(req::HTTP.Request) = _method_not_allowed(h.router, req)
 
 """
     _route_shape(route) -> String
@@ -256,7 +274,8 @@ Register `handler` as `route`'s `HEAD` leaf, resolving who owns it (#277). `clai
 - `:auto` — the [`AutoHeadHandler`](@ref) a `GET` route adds. Skipped while an explicit `HEAD`
   owns the shape.
 - `:retired` — a `STREAM`/`WEBSOCKET` route replaced the `GET` leaf. Only an auto `HEAD` is
-  replaced, by the router's own `405`, since HTTP.jl has no way to remove a leaf.
+  replaced, by a [`RetiredHeadHandler`](@ref) answering `405`, since HTTP.jl has no way to
+  remove a leaf.
 
 HTTP.jl warns whenever a leaf is replaced. Replacing a leaf this table added itself (`:auto` or
 `:retired`) is expected, so it is silenced; the `GET` replacement that triggers it has already

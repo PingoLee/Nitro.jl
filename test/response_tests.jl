@@ -523,6 +523,8 @@ Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
     path("/h/split2", (req::HTTP.Request) -> Res.send(BODY_TEXT)),
     # GET-only, and reports the method its handler saw.
     path("/h/method", (req::HTTP.Request) -> HTTP.Response(200, ["X-Seen-Method" => req.method], BODY_TEXT)),
+    # POST-only, so its HEAD is a 405 (#281).
+    path("/h/empty-post", (req::HTTP.Request) -> Res.status(201); method = "POST"),
 ])
 
 port = get_free_port()
@@ -618,6 +620,16 @@ try
 
         # Only HEAD is added: other methods on a GET-only route are still refused.
         @test HTTP.request("POST", "http://$HOST:$port/plain"; status_exception = false).status == 405
+    end
+
+    @testset "a 405 carries Allow over the socket (#281)" begin
+        r = HTTP.request("DELETE", "http://$HOST:$port/plain"; status_exception = false)
+        @test r.status == 405
+        @test HTTP.header(r, "Allow") == "GET, HEAD"
+        # A HEAD to a 405 gets the same header: the write path drops only the body.
+        r = HTTP.request("HEAD", "http://$HOST:$port/h/empty-post"; status_exception = false)
+        @test r.status == 405
+        @test HTTP.header(r, "Allow") == "POST"
     end
 
     @testset "a streamed body reaches the client whole (#41)" begin

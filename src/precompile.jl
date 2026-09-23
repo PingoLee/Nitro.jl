@@ -85,6 +85,9 @@ end
     # branch #71 added that nothing above reaches. Returns a plain 404 `Response`; with
     # `catch_errors=false` nothing is thrown.
     Core.internalrequest(ctx, Request("GET", "/precompile/missing"); catch_errors=false)
+    # A method mismatch: the `405` path, which walks the route tree for `Allow` (#281). The 404
+    # above walks it too, to tell a true miss from a mismatch HTTP.jl reported as one.
+    Core.internalrequest(ctx, Request("DELETE", "/precompile/cached"); catch_errors=false)
 
     # ── A static mount, end to end ──────────────────────────────────────────────
     #

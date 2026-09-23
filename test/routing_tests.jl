@@ -794,3 +794,146 @@ end
     @test !HTTP.hasheader(r, "X-Tag")
 end
 end
+
+@testitem "A 405 carries Allow (#281)" tags=[:core] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+using Nitro.Core: App, Service, internalrequest, RetiredHeadHandler
+using Nitro.Core.Routing: urlpatterns
+
+# In-process and a local `App` per case. The wire half is in "Response builders on the wire",
+# test/response_tests.jl.
+
+send(ctx, method, target) = internalrequest(ctx, HTTP.Request(method, target))
+allow(r) = HTTP.header(r, "Allow", nothing)
+leaf(ctx, method, target) = first(HTTP.Handlers.gethandler(ctx.service.router, HTTP.Request(method, target)))
+
+ok(req::HTTP.Request) = Res.status(200)
+ok_name(req::HTTP.Request, name::String) = Res.status(200)
+passthrough = handle -> (req -> handle(req))
+
+@testset "Allow lists the path's methods, with the auto-HEAD and without OPTIONS" begin
+    ctx = App()
+    urlpatterns(ctx, "", path("/items", ok; methods = ["GET", "POST"]))
+    r = send(ctx, "DELETE", "/items")
+    @test r.status == 405
+    @test allow(r) == "GET, HEAD, POST"
+    # The query string is not part of the path the tree is walked with.
+    @test allow(send(ctx, "PUT", "/items?x=1")) == "GET, HEAD, POST"
+    # The methods that are allowed still answer.
+    @test send(ctx, "GET", "/items").status == 200
+    @test send(ctx, "HEAD", "/items").status == 200
+end
+
+@testset "the same Allow when per-route middleware sends the request through compose" begin
+    # With a non-empty middleware table, `compose` runs `gethandler` first and the 405 reaches
+    # the router terminal through its unmatched branch.
+    ctx = App()
+    urlpatterns(ctx, "", path("/items", ok; methods = ["GET", "POST"], middleware = [passthrough]))
+    r = send(ctx, "DELETE", "/items")
+    @test r.status == 405
+    @test allow(r) == "GET, HEAD, POST"
+end
+
+@testset "OPTIONS, an explicit HEAD and a custom method are listed when registered" begin
+    ctx = App()
+    urlpatterns(ctx, "",
+        path("/o", ok; methods = ["POST", "OPTIONS"]),
+        path("/h", ok; method = "HEAD"),
+        path("/dav", ok; method = "PROPFIND"),
+    )
+    @test allow(send(ctx, "GET", "/o")) == "OPTIONS, POST"
+    @test allow(send(ctx, "GET", "/h")) == "HEAD"
+    @test allow(send(ctx, "GET", "/dav")) == "PROPFIND"
+end
+
+@testset "a STREAM route lists GET and POST, and no HEAD" begin
+    ctx = App()
+    urlpatterns(ctx, "", path("/stream", (stream::HTTP.Stream) -> nothing; method = "STREAM"))
+    r = send(ctx, "PUT", "/stream")
+    @test r.status == 405
+    @test allow(r) == "GET, POST"
+end
+
+@testset "a retired auto-HEAD answers 405 with Allow, and is not in it" begin
+    # A STREAM route replacing a GET leaves a HEAD leaf behind that refuses HEAD (#277). The router
+    # resolves HEAD to that leaf, so HEAD must be left out of the list by hand.
+    ctx = App()
+    urlpatterns(ctx, "", path("/swap", ok))
+    urlpatterns(ctx, "", path("/swap", (stream::HTTP.Stream) -> nothing; method = "STREAM"))
+    @test leaf(ctx, "HEAD", "/swap") isa RetiredHeadHandler
+    r = send(ctx, "HEAD", "/swap")
+    @test r.status == 405
+    @test allow(r) == "GET, POST"
+    @test allow(send(ctx, "PUT", "/swap")) == "GET, POST"
+end
+
+@testset "a path matched by an exact and a variable route lists both" begin
+    ctx = App()
+    urlpatterns(ctx, "",
+        path("/u/me", ok),
+        path("/u/<str:name>", ok_name; method = "DELETE"),
+    )
+    # Each method goes to the first route that has it, so both routes' methods are allowed.
+    @test send(ctx, "DELETE", "/u/me").status == 200
+    @test allow(send(ctx, "PUT", "/u/me")) == "DELETE, GET, HEAD"
+    @test allow(send(ctx, "PUT", "/u/other")) == "DELETE"
+end
+
+@testset "a method mismatch HTTP.jl reports as a miss is a 405, not a 404" begin
+    ctx = App()
+    urlpatterns(ctx, "",
+        path("/users/me", ok),
+        path("/users/<str:name>/posts", ok_name),
+    )
+    # HTTP.jl's `match` overwrites its `anymissing` flag per branch: the exact `/users/me` node
+    # has GET, and the variable node tried after it has no leaf at this depth, so upstream
+    # reports a miss. If this starts failing, upstream has fixed it and the re-check in
+    # `_route_unresolved` is no longer needed.
+    @test leaf(ctx, "POST", "/users/me") === nothing
+    r = send(ctx, "POST", "/users/me")
+    @test r.status == 405
+    @test allow(r) == "GET, HEAD"
+
+    # The same through `compose`: it sees upstream's `nothing` and takes its unmatched branch, which
+    # must still reach the router terminal rather than answer 404 itself.
+    ctx = App()
+    urlpatterns(ctx, "",
+        path("/users/me", ok; middleware = [passthrough]),
+        path("/users/<str:name>/posts", ok_name),
+    )
+    r = send(ctx, "POST", "/users/me")
+    @test r.status == 405
+    @test allow(r) == "GET, HEAD"
+end
+
+@testset "a true miss is still a 404 with no Allow" begin
+    ctx = App()
+    urlpatterns(ctx, "", path("/users/<str:name>/posts", ok_name))
+    for target in ("/nowhere", "/users", "/users/x", "/users/x/posts/extra")
+        r = send(ctx, "GET", target)
+        @test r.status == 404
+        @test !HTTP.hasheader(r, "Allow")
+    end
+end
+
+@testset "a custom _405 gets Allow unless it set its own, and is never mutated" begin
+    shared = HTTP.Response(405)
+    ctx = App(service = Service(router = HTTP.Router(HTTP.Handlers.default404, req -> shared)))
+    urlpatterns(ctx, "", path("/c", ok))
+    r = send(ctx, "POST", "/c")
+    @test r.status == 405
+    @test allow(r) == "GET, HEAD"
+    # A new response, not the router's own object with a header appended.
+    @test r !== shared
+    @test !HTTP.hasheader(shared, "Allow")
+
+    ctx = App(service = Service(router = HTTP.Router(HTTP.Handlers.default404,
+        req -> HTTP.Response(418, ["Allow" => "BREW"]))))
+    urlpatterns(ctx, "", path("/c", ok))
+    r = send(ctx, "POST", "/c")
+    @test r.status == 418
+    @test [v for (k, v) in r.headers if k == "Allow"] == ["BREW"]
+end
+end

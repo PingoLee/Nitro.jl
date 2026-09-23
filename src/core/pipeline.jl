@@ -54,9 +54,9 @@ that transition, because nothing reads it until here.
 
 The guard is `(router, method, target)` — every input `gethandler` reads — and
 `RouteResolution` documents why each one is there, including the cross-`App` misroute the
-`router` check exists to prevent. Falling through to `r(req)` is always correct: it is exactly
-the old behavior, so every path that declines the hand-off degrades to the previous cost, never
-to a wrong route.
+`router` check exists to prevent. Falling through to [`_route_unresolved`](@ref) is always
+correct: it is `(r::Router)(req)` plus the `Allow` header (#281), so every path that declines the
+hand-off degrades to the previous cost, never to a wrong route.
 
 `r` is deliberately untyped: `Service.router` is declared as the unparameterized `Router`, and
 the caller `let`-binds it to keep that dynamic dispatch out of the request path. It doubles as
@@ -71,7 +71,117 @@ function _dispatch_resolved(r, req::HTTP.Request)
         isempty(res.params) || (req.context[:params] = res.params)
         return res.handler(req)
     end
-    return r(req)
+    return _route_unresolved(r, req)
+end
+
+"""
+    _route_unresolved(r, req) -> response
+
+`(r::Router)(req)` (HTTP.jl `http_handlers.jl`), except for how it answers a method mismatch (#281):
+
+- **A `405` carries `Allow`**, which RFC 9110 §15.5.6 requires. HTTP.jl's `default405` sends a
+  bare `Response(405)`. See [`_method_not_allowed`](@ref).
+- **A method mismatch that HTTP.jl reports as a miss is a `405`, not a `404`.** Upstream `match`
+  overwrites its `anymissing` flag on every branch it tries, so a later branch that finds nothing
+  hides an earlier one that found the path under another method. With `/users/me` (GET) and
+  `/users/{name}/posts` registered, `POST /users/me` came back `404`. A `nothing` from `gethandler`
+  is therefore re-checked against the route tree, and it is a `405` when the path has any method
+  there. That costs one walk of the target's branches on each `404`, the same order of work as
+  the lookup that produced it.
+
+The matched branch keeps upstream's order (`:route`, `:params` only when non-empty, then the
+handler) for the reason `_dispatch_resolved`'s fast branch gives.
+
+`r` is typed here, unlike in `_dispatch_resolved`: this is the function barrier that gives the
+lookup a concrete `Router`.
+"""
+function _route_unresolved(r::HTTP.Router, req::HTTP.Request)
+    handler, route, params = HTTP.Handlers.gethandler(r, req)
+    if handler === nothing
+        allowed = _allowed_methods(r, req.target)
+        return isempty(allowed) ? r._404(req) : _method_not_allowed(r, req, allowed)
+    elseif handler === missing
+        return _method_not_allowed(r, req)
+    end
+    req.context[:route] = route
+    isempty(params) || (req.context[:params] = params)
+    return handler(req)
+end
+
+"""
+    _method_not_allowed(r, req[, allowed]) -> response
+
+The router's own `_405`, plus an `Allow` header listing what `req.target` does answer (#281).
+`allowed` is that list when the caller already walked the tree for it; otherwise it is computed
+here, and only if the header is actually added.
+
+A custom `_405` (`Service(router = Router(my404, my405))`) still decides the response. `Allow` is
+added to it only when it returned an `HTTP.Response` with no `Allow` of its own, and it is added
+by building a new response, since a handler's response may be a shared `const` (nitro-core §4).
+Anything else it returns (a `Dict` for the serializer, say) is passed through untouched.
+"""
+function _method_not_allowed(r::HTTP.Router, req::HTTP.Request,
+                             allowed::Nullable{Vector{String}} = nothing)
+    res = r._405(req)
+    res isa HTTP.Response || return res
+    HTTP.hasheader(res, "Allow") && return res
+    list = allowed === nothing ? _allowed_methods(r, req.target) : allowed
+    return add_response_headers(res, "Allow" => join(list, ", "))
+end
+
+"""
+    _allowed_methods(r, target) -> Vector{String}
+
+The methods `r` would serve at `target`, sorted. Built from HTTP.jl's route tree in two steps:
+
+1. Collect the leaf methods at **every** node `target` reaches: exact, pattern-constrained
+   variable, bare variable and `**`, in the order upstream `match` tries them. The router serves
+   a method if *any* of those nodes has it, because `match` falls through to the next branch when
+   one lacks it.
+2. Keep a candidate only if upstream's own `match` resolves it to a leaf, and that leaf is not a
+   [`RetiredHeadHandler`](@ref). The list is then exactly what the router would serve, precedence
+   included, rather than a second implementation of it.
+
+`"*"` leaves are skipped. They take every method, so a node that has one can never answer `405`.
+
+Reads HTTP.jl internals (`Router.routes`, the `Node`/`Leaf`/`Variable` fields, `match`,
+`_route_variable_matches`, `_router_request_path`). Each one is canaried in
+test/http_internals_contract_tests.jl.
+"""
+function _allowed_methods(r::HTTP.Router, target::String)::Vector{String}
+    segments = split(HTTP.Handlers._router_request_path(target), '/'; keepempty = false)
+    candidates = String[]
+    _collect_leaf_methods!(candidates, r.routes, segments, 1)
+    allowed = String[]
+    for method in candidates
+        leaf = HTTP.Handlers.match(r.routes, method, segments, 1)
+        leaf isa HTTP.Handlers.Leaf && !(leaf.handler isa RetiredHeadHandler) && push!(allowed, method)
+    end
+    return sort!(allowed)
+end
+
+function _collect_leaf_methods!(acc::Vector{String}, node::HTTP.Handlers.Node,
+                                segments::Vector{SubString{String}}, i::Int)::Nothing
+    if i > length(segments)
+        for leaf in node.methods
+            leaf.method == "*" || leaf.method in acc || push!(acc, leaf.method)
+        end
+        return nothing
+    end
+    segment = segments[i]
+    for child in node.exact
+        child.segment == segment && _collect_leaf_methods!(acc, child, segments, i + 1)
+    end
+    for child in node.conditional
+        pattern = (child.segment::HTTP.Handlers.Variable).pattern::Regex
+        HTTP.Handlers._route_variable_matches(pattern, segment) &&
+            _collect_leaf_methods!(acc, child, segments, i + 1)
+    end
+    node.wildcard === nothing ||
+        _collect_leaf_methods!(acc, node.wildcard::HTTP.Handlers.Node, segments, i + 1)
+    node.doublestar === nothing ||
+        _collect_leaf_methods!(acc, node.doublestar::HTTP.Handlers.Node, segments, length(segments) + 1)
+    return nothing
 end
 
 function setupmiddleware(ctx::App; middleware::Vector=[], serialize::Bool=true, catch_errors::Bool=true, show_errors::Bool=true, access_log=false, access_log_query::Bool=false)::Function
