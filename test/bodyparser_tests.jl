@@ -379,24 +379,55 @@ end
 #
 # Which means the hazard the issue warns about is real: after a stack overflow Julia reports
 # "program state may be corrupted", and a ReTestItems worker is reused by every item scheduled
-# after this one. So it runs in a **disposable subprocess**. The corruption is confined to a
-# process that exits immediately, and the parent asserts on its output.
+# after this one. So every overflow runs in a **disposable subprocess**. The corruption is
+# confined to a process that exits immediately, and the parent asserts on its output.
 #
-# The child script carries NO backslash-escaped quote on purpose. Julia's `raw"""` is raw about
+# ONE child per overflow, not one child for all of them (#273). The single child this used to
+# be overflowed six times -- the first three back to back on its own root task -- and on
+# Windows it intermittently died early with exit code 0xC00000FD (`STATUS_STACK_OVERFLOW`): an
+# overflow the OS killed the process for, not a `StackOverflowError` Julia could hand to Nitro.
+# That is consistent with Windows not recovering from repeated overflows on one thread stack,
+# and it is not Nitro swallowing anything -- but it threw away every later step's verdict, and
+# `read(cmd, String)` threw away the output that would have said which step died. Now no
+# overflow runs on a stack an earlier one already used, and a crash that remains costs one step
+# and names it. The price is six Nitro loads instead of one, far inside `testitem_timeout`.
+#
+# The child scripts carry NO backslash-escaped quote on purpose. Julia's `raw"""` is raw about
 # every backslash EXCEPT one before a quote, so an escaped-quote JSON literal written here
 # arrives at the child with the backslashes gone and dies on a parse error that says nothing
 # about this test. `[1]` is valid JSON needing no inner quote, so the question does not arise.
 @testitem "Body parsers -- a deeply-nested body is not swallowed (#254)" tags=[:core, :network, :slow] setup=[NitroCommon] begin
 using Nitro
 
-script = raw"""
+prelude = raw"""
 using Nitro, HTTP, Sockets, Base64
 
 # ~20 KB -- well inside any default body limit, and deep enough that JSON.parse exhausts the
 # stack. This is the whole attack: no credentials, no unusual size, any route.
 deep = repeat("[", 10_000) * repeat("]", 10_000)
 
-# 1. The parser itself.
+# Pick a free port rather than a literal: :network items in this suite never pin one, because
+# a fixed port turns a parallel run into a flake.
+function start_app(routes...)
+    probe = Sockets.listen(Sockets.InetAddr(Sockets.ip"127.0.0.1", 0))
+    port = Sockets.getsockname(probe)[2]
+    close(probe)
+    app = App(mod = @__MODULE__)
+    urlpatterns(app, "", routes...)
+    serve(app; port=port, async=true, show_banner=false)
+    sleep(2)
+    return app, port
+end
+
+post_json(port, route, body) =
+    HTTP.post("http://127.0.0.1:$port$route", ["Content-Type" => "application/json"], body;
+              status_exception=false, request_timeout=20, retry=false)
+"""
+
+# (step, child body, lines its stdout must contain). Each body overflows at most once.
+steps = [
+    # 1. The parser itself.
+    ("PARSER", raw"""
 req = HTTP.Request("POST", "/j", ["Content-Type" => "application/json"], deep)
 try
     r = json(req)
@@ -404,68 +435,59 @@ try
 catch e
     println("PARSER=PROPAGATED:", typeof(e))
 end
+""", ["PARSER=PROPAGATED:StackOverflowError"]),
 
-# 2. The memoizing accessor handlers actually call.
-req2 = HTTP.Request("POST", "/j", ["Content-Type" => "application/json"], deep)
+    # 2. The memoizing accessor handlers actually call.
+    ("ACCESSOR", raw"""
+req = HTTP.Request("POST", "/j", ["Content-Type" => "application/json"], deep)
 try
-    r = getjson(req2)
+    r = getjson(req)
     println("ACCESSOR=SWALLOWED:", r === nothing)
 catch e
     println("ACCESSOR=PROPAGATED:", typeof(e))
 end
+""", ["ACCESSOR=PROPAGATED:StackOverflowError"]),
 
-# 2b. Scalar path/query parameters. `parseparam` tries `parse(T, str)` first and falls
-# through to `JSON.parse(str, T)`, so this fires for an ordinary `Int` parameter -- the
-# route shape `path("/p/<int:n>", …)` produces. Called directly rather than over a socket
-# because a 20 KB URI is a transport question, not the one under test.
+    # 2b. Scalar path/query parameters. `parseparam` tries `parse(T, str)` first and falls
+    # through to `JSON.parse(str, T)`, so this fires for an ordinary `Int` parameter -- the
+    # route shape `path("/p/<int:n>", …)` produces -- and used to answer 400. Called directly
+    # rather than over a socket because a 20 KB URI is a transport question, not the one under
+    # test.
+    ("SCALAR", raw"""
 try
     Nitro.parseparam_checked(Int, deep, "n", :query)
     println("SCALAR=SWALLOWED")
 catch e
     println("SCALAR=PROPAGATED:", typeof(e))
 end
+""", ["SCALAR=PROPAGATED:StackOverflowError"]),
 
-# 3. End to end over a real socket: the defect was that the handler went on to serve a normal
-# 200 off a worker Julia had just declared possibly corrupt.
-app = App(mod = @__MODULE__)
-urlpatterns(app, "",
-    path("/j", req -> Res.json(Dict("parsed" => getjson(req) !== nothing)); method="POST"),
-    # #254 finding: an extractor route resolves through the same parser, but `safe_extract`
-    # used to relabel the rethrow as a `ValidationError` -> 400. Same input must not produce
-    # two different verdicts depending on how the handler reads the body.
-    path("/x", (req, body::Json{Dict{String,Any}}) -> Res.json(Dict("ok" => true)); method="POST"),
-)
-
-# Pick a free port rather than a literal: :network items in this suite never pin one, because
-# a fixed port turns a parallel run into a flake.
-probe = Sockets.listen(Sockets.InetAddr(Sockets.ip"127.0.0.1", 0))
-port = Sockets.getsockname(probe)[2]
-close(probe)
-
-serve(app; port=port, async=true, show_banner=false)
-sleep(2)
-resp = HTTP.post("http://127.0.0.1:$port/j", ["Content-Type" => "application/json"], deep;
-                 status_exception=false, request_timeout=20, retry=false)
-println("SERVED=", resp.status)
-
-# The server must still be answering afterwards -- "louder" must not mean "dead".
-ok = HTTP.post("http://127.0.0.1:$port/j", ["Content-Type" => "application/json"], "[1]";
-               status_exception=false, request_timeout=20, retry=false)
-println("NEXT=", ok.status)
-xr = HTTP.post("http://127.0.0.1:$port/x", ["Content-Type" => "application/json"], deep;
-               status_exception=false, request_timeout=20, retry=false)
-println("EXTRACTOR=", xr.status)
+    # 3. End to end over a real socket: the defect was that the handler went on to serve a
+    # normal 200 off a worker Julia had just declared possibly corrupt -- so not a 200. And the
+    # server must still be answering afterwards: "louder" must not mean "dead", which is what
+    # makes rethrowing the safe choice rather than merely the loud one. NEXT does not overflow,
+    # and it has to share SERVED's process to mean anything.
+    ("SERVED", raw"""
+app, port = start_app(path("/j", req -> Res.json(Dict("parsed" => getjson(req) !== nothing)); method="POST"))
+println("SERVED=", post_json(port, "/j", deep).status)
+println("NEXT=", post_json(port, "/j", "[1]").status)
 terminate(app)
+""", ["SERVED=500", "NEXT=200"]),
 
-# 4. The AUTH half of #254, end to end -- the claim the issue, both docstrings, the tutorial
-# and the upgrade entry all rest on. The synthetic throws in the auth testitem prove the catch
-# block dispatches; only this proves a real bearer token gets there.
-#
-# LAST on purpose. Unlike the `SERVED=`/`EXTRACTOR=` overflows, which happen on server request
-# tasks, this one lands on the child's own ROOT task -- the task that would then be driving
-# every later assertion, in a process Julia has just called possibly corrupt. Running it after
-# everything else keeps that hazard from reaching the other checks, which is the same reason
-# this whole item is a subprocess in the first place.
+    # 3b. #254 finding: an extractor route resolves through the same parser, but `safe_extract`
+    # used to relabel the rethrow as a `ValidationError` -> 400. Same input must not produce two
+    # different verdicts depending on how the handler reads the body: not 400, because a
+    # corrupted worker is not a client mistake.
+    ("EXTRACTOR", raw"""
+app, port = start_app(path("/x", (req, body::Json{Dict{String,Any}}) -> Res.json(Dict("ok" => true)); method="POST"))
+println("EXTRACTOR=", post_json(port, "/x", deep).status)
+terminate(app)
+""", ["EXTRACTOR=500"]),
+
+    # 4. The AUTH half of #254, end to end -- the claim the issue, both docstrings, the tutorial
+    # and the upgrade entry all rest on. The synthetic throws in the auth testitem prove the
+    # catch block dispatches; only this proves a real bearer token gets there.
+    ("AUTH", raw"""
 hdr = replace(base64encode(deep), "+" => "-", "/" => "_", "=" => "")
 token = hdr * ".ey.AAAA"
 bearer = BearerAuth(t -> Nitro.Auth.decode_jwt(t, "secret"))(r -> Res.json(Dict("ok" => true)))
@@ -477,7 +499,8 @@ try
 catch e
     println("AUTH=PROPAGATED:", typeof(e))
 end
-"""
+""", ["AUTH=PROPAGATED:StackOverflowError"]),
+]
 
 # `--code-coverage=none` explicitly, matching test/extensions/pormg_env_tests.jl: CI runs the
 # suite under coverage in the job that uploads it (#244), and `Base.julia_cmd()` propagates
@@ -486,21 +509,41 @@ end
 # the one configuration where `testitem_timeout` does not apply, so a slow or wedged child
 # would have no ceiling at all (#84). Everything else must come FROM `julia_cmd()`, notably
 # `--check-bounds=yes`, or the child lands in a different cache and recompiles anyway.
-out = read(`$(Base.julia_cmd()) --code-coverage=none --project=$(Base.active_project()) --startup-file=no -e $script`, String)
+#
+# `ignorestatus` + captured streams rather than `read(cmd, String)` (#273): on a non-zero exit
+# `read` throws `ProcessFailedException` and discards the child's stdout, so a crash reported
+# neither which step it reached nor what the child printed on the way down.
+function run_child(script)
+    cmd = `$(Base.julia_cmd()) --code-coverage=none --project=$(Base.active_project()) --startup-file=no -e $script`
+    out, err = IOBuffer(), IOBuffer()
+    p = run(pipeline(ignorestatus(cmd); stdout=out, stderr=err))
+    return (; exitcode=p.exitcode, termsignal=p.termsignal,
+              out=String(take!(out)), err=String(take!(err)))
+end
 
-@test contains(out, "PARSER=PROPAGATED:StackOverflowError")
-@test contains(out, "ACCESSOR=PROPAGATED:StackOverflowError")
-# Scalar parameters take the same fall-through into JSON.parse, and used to answer 400.
-@test contains(out, "SCALAR=PROPAGATED:StackOverflowError")
-# Not a 200. The old behaviour served one, having quietly discarded the overflow.
-@test contains(out, "SERVED=500")
-# The auth half, against a real token rather than a synthetic throw.
-@test contains(out, "AUTH=PROPAGATED:StackOverflowError")
-# And the worker keeps serving -- this is what makes rethrowing the safe choice rather than
-# merely the loud one.
-@test contains(out, "NEXT=200")
-# Not 400: `safe_extract` must not relabel a corrupted worker as a client mistake.
-@test contains(out, "EXTRACTOR=500")
+# `nothing` for a clean exit; otherwise the whole diagnosis as one string. Asserted with `===`
+# because `Test` prints "Evaluated:" only for a comparison -- `@test isnothing(...)` fails with
+# the expression alone, and a bare `@test r.exitcode == 0` with just `3221225725 == 0`.
+function child_failure(step, r)
+    r.exitcode == 0 && r.termsignal == 0 && return nothing
+    code = "exit code $(r.exitcode) (0x$(string(r.exitcode % UInt32; base=16, pad=8)))"
+    r.exitcode == 0xC00000FD &&
+        (code *= " = Windows STATUS_STACK_OVERFLOW: the OS killed the child on an overflow Julia never turned into a StackOverflowError")
+    reached = filter(l -> occursin(r"^[A-Z]+=", l), split(r.out, '\n'))
+    last_line = isempty(reached) ? "none -- died before its first result line" : last(reached)
+    return "$step child: $code, termsignal $(r.termsignal); last result line: $last_line; " *
+           "stdout: $(repr(r.out)); stderr tail: $(repr(last(r.err, 2000)))"
+end
+
+for (step, body, expected) in steps
+    r = run_child(prelude * body)
+    @testset "$step" begin
+        @test child_failure(step, r) === nothing
+        for line in expected
+            @test contains(r.out, line)
+        end
+    end
+end
 end
 
 # `formdata` and `multipart` take the same narrowing, and deliberately ship WITHOUT a dedicated
