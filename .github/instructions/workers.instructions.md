@@ -146,6 +146,19 @@ never lists them:
   read failure: an empty result means "nothing to recover", so a swallowed error would pass for a
   clean sweep.
 
+**`get_all_tasks` rethrows a failed read too, paged or not; it skips an undecodable row alone**
+([#267](https://github.com/PingoLee/Nitro.jl/issues/267)). The unpaged PormG listing used to
+swallow every error into `TaskInfo[]`, so one bad `result` blob emptied the admin and user
+listings. A row that does not decode is now dropped by itself, before the authority gate. Schema
+drift (no `run_id` column) is not a bad row, and it still throws. JSON.jl quotes the stored text
+around a parse failure, so its message carries part of a `result` or a session payload. Two
+guarantees keep that text out of logs, and both stay:
+- **At the source**, `_parse_stored_json` replaces the parse error with a value-free one, thrown
+  *after* the `catch` so the original is not on the exception stack. That is what protects the
+  rethrow path, because a request handler's error logger prints a message in full.
+- **At each warning**, the listing, `get_task_info` and the session decode log the exception type
+  and task id, never the message.
+
 **`get_task_info(store, id)` is the DURABLE read.** A store must not cache live objects. Serving a
 running callback's own object to a reader is `get_task_info(runtime, id)`, and the split is
 load-bearing: run-start reads durably, because a live-preferring read there hands a re-run its
@@ -222,7 +235,16 @@ why the paged `Owner` listing is one `Qor` query and not the unpaged path's two 
 Julia.
 
 A paged method returns fewer than `limit` only when nothing is left. A row it skips, whether
-through the authority gate or an unparseable `run_id`, is made up from past the cursor.
+through the authority gate, an undecodable blob, or an unparseable `run_id`, is made up from past
+the cursor.
+
+**A `RUNNING` row whose `run_id` does not parse is skipped forever, by decision**
+([#267](https://github.com/PingoLee/Nitro.jl/issues/267)). It gets an ids-only warning on every
+boot, and retention never retires it. Only a hand edit or an app-side write produces one, since
+pre-#108 rows are backfilled with the nil UUID, which parses. Do not "fix" it with an unfenced
+(`run_id = nothing`) FAILED write. `lock_tasks` is process-local, so if another process has
+already failed the row and the key was re-run, the stale unfenced write fails the live successor,
+which is the #108 defect. The operator repairs the row.
 
 **`zombie_min_age` bounds OLD claims in, never recent ones**
 ([#239](https://github.com/PingoLee/Nitro.jl/issues/239)). It is a keyword on `start!` / `startup`

@@ -327,6 +327,11 @@ on the id. The cursor is keyset rather than an offset, so rows that change statu
 do not shift later pages. The same `after` / `limit` keywords work with an `Owner` and with a
 status filter.
 
+An empty result always means "no tasks": if the store cannot read the table, `get_all_tasks`
+throws, paged or not. With the PormG store, one record that no longer decodes (for example a
+`result` that was edited by hand into invalid JSON) is left out of the listing, and a warning
+naming its task id is logged. The rest of the listing is still returned.
+
 ### `get_queue_status`
 
 Queue-wide introspection for sequential queues, reporting:

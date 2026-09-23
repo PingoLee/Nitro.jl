@@ -956,6 +956,10 @@ while !isempty(page)
     page = get_all_tasks(System(); limit = 500, after = last(page)[:id])
 end
 ```
+
+An empty result always means "no tasks": a store that cannot be read **throws**, paged or not
+([#267](https://github.com/PingoLee/Nitro.jl/issues/267)). A persistent store may leave out a
+record it can no longer decode, and it logs that record's id when it does.
 """
 function get_all_tasks(authority::TaskAuthority, filter_status::Union{Nothing, TaskStatus}=nothing;
                        runtime::WorkerRuntime=default_runtime(),
@@ -1014,6 +1018,9 @@ Mount it behind the same authorization you would put in front of Sidekiq Web, Ob
 a Hangfire dashboard — all-or-nothing, and not on a user-facing route. If you want to show
 a user *their* place in a queue, build that from `get_all_tasks(Owner(uid), PENDING)`,
 which reports only what they may see.
+
+`:pending_tasks` is read from the store, so a store that cannot be read makes this **throw**
+rather than report an empty queue ([#267](https://github.com/PingoLee/Nitro.jl/issues/267)).
 """
 function get_queue_status(queue_name::AbstractString, ::System; runtime::WorkerRuntime=default_runtime())
     qlock = get_queue_lock(runtime)

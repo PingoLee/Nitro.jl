@@ -1123,10 +1123,12 @@ else
             m._table["alice::bad"]["result"] = "{not json"
             m._table["alice::bad"]["watchers"] = "also not json"
 
-            # The premise, pinned. The listing parses every row, and swallows the one that fails
-            # into an EMPTY result, so a sweep built on it saw no candidates at all -- the good
-            # zombie stranded alongside the bad one.
-            @test isempty(@test_logs (:warn, r"failed to list tasks") match_mode=:any get_all_tasks(store_b, System(); status=RUNNING))
+            # The listing parses every row. It used to swallow the one that failed into an EMPTY
+            # result, so a sweep built on it saw no candidates at all -- the good zombie stranded
+            # alongside the bad one. It now drops only that row (#267), and the sweep below still
+            # does not depend on it: a skipped row is a zombie the listing cannot see.
+            listed = @test_logs (:warn, r"does not decode") match_mode=:any get_all_tasks(store_b, System(); status=RUNNING)
+            @test [t.id for t in listed] == ["alice::good"]
 
             refs = list_running_task_refs(store_b)
             @test refs isa Vector{RunningTaskRef}
@@ -1264,6 +1266,115 @@ else
             @test [r.id for r in page] == ["k::1", "k::3"]
             rest = list_running_task_refs(store_k; after="k::3", limit=2)
             @test [r.id for r in rest] == ["k::4"]
+        end
+
+        # Everything `f` logged, rendered by a real logger. `SimpleLogger` prints an `exception=`
+        # kwarg with `show`, which includes the exception's message string. A leak assertion has
+        # to read the RENDERED text, because what reaches the operator's log is the defect, not
+        # what the record holds.
+        function _rendered_logs(f::Function)
+            io = IOBuffer()
+            value = Base.CoreLogging.with_logger(f, Base.CoreLogging.SimpleLogger(io, Base.CoreLogging.Debug))
+            return String(take!(io)), value
+        end
+
+        @testset "one undecodable row is skipped, not the whole listing (#267)" begin
+            m = MockTaskModel()
+            store_d = RealPormGWorkerStore(model=m)
+            for id in ("alice::1", "alice::2", "alice::3", "alice::4")
+                t = TaskInfo(id)
+                push!(t.watchers, "alice")
+                replace_task!(store_d, id, t)
+            end
+            # A JSON parse error quotes a window of text from just before the failure position, so
+            # the secret IS the unparseable token: the window then carries all of it. Placed a few
+            # bytes further on, only a fragment is quoted and the assertion below passes against
+            # the leaking code -- that is how this test was first written.
+            m._table["alice::2"]["result"] = "{\"token\": sk_SECRET_267}"
+            # A bad watcher blob on a row alice owns. Ownership alone would authorize her, so
+            # this pins the skip, not the gate.
+            m._table["alice::4"]["watchers"] = "not json"
+            # A row the gate genuinely cannot decide: bob owns it, and its truncated watcher blob
+            # still CONTAINS `"alice"`, so alice's SQL superset fetches it. With no parseable
+            # watcher list it must be dropped before the gate, never waved through it.
+            t_bob = TaskInfo("bob::grant")
+            push!(t_bob.watchers, "bob")
+            replace_task!(store_d, t_bob.id, t_bob)
+            m._table["bob::grant"]["watchers"] = "[\"bob\", \"alice\""
+
+            for authority in (System(), Owner("alice"))
+                logs, listed = _rendered_logs(() -> get_all_tasks(store_d, authority))
+                @test sort([t.id for t in listed]) == ["alice::1", "alice::3"]
+                @test occursin("does not decode", logs)
+                @test occursin("alice::2", logs)
+                @test !occursin("SECRET", logs)
+            end
+
+            # A paged walk crosses the bad rows rather than stopping at them: a skipped row is
+            # made up from past the cursor, so no page comes back short before the end.
+            for limit in (1, 2, 10)
+                logs, (ids, _) = _rendered_logs(() -> _walk_pages((after, n) -> get_all_tasks(store_d, System(); after, limit=n), limit))
+                @test ids == ["alice::1", "alice::3"]
+                @test !occursin("SECRET", logs)
+            end
+
+            # A single-row read has nothing to skip to, so it still throws, and its warning is
+            # held to the same rule. So is the exception itself: `get_task_info` rethrows, and a
+            # request handler's error logger (`src/utilities/misc.jl`) prints the message in full.
+            # The value-free error must also not carry JSON.jl's original as its cause on the
+            # exception stack, which an uncaught task failure prints.
+            thrown, stack_depth = nothing, 0
+            logs, _ = _rendered_logs() do
+                try
+                    get_task_info(store_d, "alice::2")
+                catch e
+                    thrown, stack_depth = e, length(Base.current_exceptions())
+                end
+            end
+            @test thrown isa ErrorException
+            @test occursin("alice::2", thrown.msg) && occursin("`result`", thrown.msg)
+            @test !occursin("SECRET", sprint(showerror, thrown))
+            @test stack_depth == 1
+            @test occursin("alice::2", logs)
+            @test !occursin("SECRET", logs)
+
+            # Same for the watcher blob, which is parsed and then shaped.
+            _, thrown_w = _rendered_logs(() -> try get_task_info(store_d, "alice::4") catch e; e end)
+            @test thrown_w isa ErrorException && occursin("`watchers`", thrown_w.msg)
+        end
+
+        @testset "an unpaged listing rethrows a failed read instead of reporting none (#267)" begin
+            flaky = FlakyReadModel()
+            store_f = RealPormGWorkerStore(model=flaky)
+            t = TaskInfo("alice::kept")
+            push!(t.watchers, "alice")
+            replace_task!(store_f, t.id, t)
+
+            # An empty listing means "no tasks". A read that failed must not say that.
+            for authority in (System(), Owner("alice"))
+                flaky.fail_next[] = 1
+                logs, _ = _rendered_logs() do
+                    @test_throws "simulated transient database read failure" get_all_tasks(store_f, authority)
+                end
+                @test occursin("failed to list tasks", logs)
+                # The failure was transient, so the next listing is whole.
+                @test [x.id for x in get_all_tasks(store_f, authority)] == ["alice::kept"]
+            end
+        end
+
+        @testset "schema drift still fails a listing loudly, not row by row (#267)" begin
+            m = MockTaskModel()
+            store_old = RealPormGWorkerStore(model=m)
+            t = TaskInfo("alice::old")
+            push!(t.watchers, "alice")
+            replace_task!(store_old, t.id, t)
+            # A table missing the column is table-wide. Skipping every row over it would
+            # rebuild the empty listing #267 removed, one warning per row.
+            delete!(m._table["alice::old"], "run_id")
+            _rendered_logs() do
+                @test_throws r"predates #108" get_all_tasks(store_old, System())
+                @test_throws r"predates #108" get_all_tasks(store_old, System(); limit=10)
+            end
         end
 
         @testset "recovery walks the backlog in batches and spares a live run (#237)" begin
