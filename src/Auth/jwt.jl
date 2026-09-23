@@ -150,9 +150,17 @@ function _decode_jwt(token::AbstractString, secret_or_keyset; issuer=nothing, au
     # only the parsed VALUE would leave the class half closed -- and length-dependently so,
     # which is what makes a partial fix read as complete: a 4-char garbage signature decodes
     # to bytes and lands on a clean AuthError, while a 1-char one does not.
+    #
+    # The claims segment parses into a CONCRETE container (#274). Untyped, `JSON.parse`
+    # infers `Any` and the object check below narrows it only to `AbstractDict`, so every
+    # per-request consumer -- `validate_claims`, `_claim_value`, `Principal` -- dispatched
+    # dynamically (nitro-core §7). `Dict{String, Any}` is also what `Principal` stores, so
+    # the validator no longer copies the claims once per request either. The VALUES stay
+    # `Any`: a claim is whatever the token's author typed. The header stays untyped -- it is
+    # read for `alg` and `kid` and never passed on.
     header, claims = try
         (JSON.parse(String(_base64url_decode(segments[1]))),
-         JSON.parse(String(_base64url_decode(segments[2]))))
+         JSON.parse(String(_base64url_decode(segments[2])); dicttype = Dict{String, Any}))
     catch e
         # Catch the ONE type this guard exists for, and let everything else through. An
         # allow-list is not stylistic here: `JSON.parse` on a deeply-nested segment raises
@@ -178,7 +186,9 @@ function _decode_jwt(token::AbstractString, secret_or_keyset; issuer=nothing, au
     # the three in `is_unrecoverable` propagate instead. Every type on this path is an
     # `AuthError` or a `MethodError`, so none of them is affected.)
     header isa AbstractDict || throw(AuthError("Invalid JWT header"))
-    claims isa AbstractDict || throw(AuthError("Invalid JWT claims"))
+    # Checking the concrete type is what narrows the slot: `_decode_jwt` then infers
+    # `Tuple{Dict{String, Any}, Nullable{String}}`.
+    claims isa Dict{String, Any} || throw(AuthError("Invalid JWT claims"))
 
     # Same class, one level down: a JSON `kid` is whatever the token's author typed --
     # `123`, `["a"]`, `null`. Anything but a string is a MethodError on

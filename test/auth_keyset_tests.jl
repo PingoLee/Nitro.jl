@@ -189,13 +189,39 @@ end
     @test (@inferred Nitro.Auth._signing_secret(ks)) == ("s1", "current")
     @test (@inferred Nitro.Auth._signing_secret("s1")) == ("s1", nothing)
 
-    # `_decode_jwt` is what the validator calls: one tuple shape, no `with_kid` Union (#265).
-    DT = Tuple{AbstractDict, Nullable{String}}
+    # `_decode_jwt` is what the validator calls: one tuple shape, no `with_kid` Union (#265),
+    # and a CONCRETE claims container (#274). This allowed type used to be
+    # `Tuple{AbstractDict, …}`, which admitted the abstract inference it was meant to catch.
+    DT = Tuple{Dict{String, Any}, Nullable{String}}
     token = encode_jwt(Dict("sub" => "1"), ks; expires_in = 60)
     @test (@inferred DT Nitro.Auth._decode_jwt(token, "s1")) isa DT
     @test (@inferred DT Nitro.Auth._decode_jwt(token, ks)) isa DT
     @test decode_jwt(token, ks; with_kid = true) == Nitro.Auth._decode_jwt(token, ks)
     @test decode_jwt(token, ks) == first(Nitro.Auth._decode_jwt(token, ks))
+end
+
+@testset "decode_jwt returns Dict{String, Any} claims, nested objects included (#274)" begin
+    ks = JWTKeyset("current" => "s1")
+    token = encode_jwt(Dict("sub" => "1", "ctx" => Dict("tenant" => "t1"),
+        "roles" => [Dict("name" => "admin")]), ks; expires_in = 60)
+    claims = decode_jwt(token, ks)
+    @test claims isa Dict{String, Any}
+    @test claims["ctx"] isa Dict{String, Any}
+    @test claims["ctx"]["tenant"] == "t1"
+    @test only(claims["roles"]) isa Dict{String, Any}
+    # String keys only: the Symbol lookups `JSON.Object` answered are gone. The upgrade
+    # entry names this as the migration.
+    @test !haskey(claims, :sub)
+    @test decode_jwt(token, ks; verify = false) isa Dict{String, Any}
+
+    # Through `jwt_validator`, nested claim objects change type too -- the one-level-down
+    # half of the upgrade entry. (`Principal.claims` was already a `Dict`.)
+    @test jwt_validator(ks)(token)["ctx"] isa Dict{String, Any}
+
+    # The Symbol-free `_claim_value` is a pure performance method: it infers `Any` exactly as
+    # the generic one does, so nothing else would notice it going missing.
+    @test which(Nitro.Auth._claim_value, (Dict{String, Any}, String, Nothing)).sig.parameters[2] ===
+        Dict{String, Any}
 end
 
 @testset "the jwt_validator closure is unboxed on every profile (#265)" begin
@@ -213,6 +239,9 @@ end
         # `warn_claims` `iss` all were.
         ci = only(code_typed(v, (String, Nothing); optimize = false)).first
         @test (label, filter(T -> T === Any, ci.slottypes)) == (label, [])
+        # And `claims` itself is concrete, so `validate_claims`, `_claim_value` and
+        # `Principal` specialize rather than dispatch per request (#274).
+        @test (label, ci.slottypes[findfirst(==(:claims), ci.slotnames)]) == (label, Dict{String, Any})
         @test (label, v(token).kid) == (label, label == "default" ? nothing : "current")
     end
 end
