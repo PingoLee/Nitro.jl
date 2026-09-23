@@ -9,7 +9,7 @@ Nitro has two shapes for that, and they are not equivalent.
 | | [`Res.sse`](@ref) | `method = "STREAM"` |
 |---|---|---|
 | What the handler returns | an ordinary `HTTP.Response` | nothing — it writes the socket itself |
-| Middleware | **applies normally** | **silently discarded** |
+| Middleware | **applies normally** | runs, and guards can refuse the request, but **what it adds to the response is silently discarded** |
 | Protocol | Server-Sent Events (`text/event-stream`) | anything you write |
 | Framing | chunked, one chunk per event | yours |
 
@@ -165,6 +165,21 @@ Writing on the stream marks the response as started, and Nitro's stream handler 
 serializing the response the middleware chain returned**. Everything that chain would have added is
 dropped: `Cors` headers, [`SecurityHeaders`](@ref), a session `Set-Cookie`, anything your own
 middleware appends. Nothing errors — the headers are simply not there.
+
+The chain still *runs* before the handler, though. Global, router and route middleware all apply to
+`STREAM` and `WEBSOCKET` routes, as they do to `method = "*"` ones. A guard that refuses the request
+returns its own response before the handler starts, and that response is written normally:
+
+```julia
+path("/raw", raw, method = "STREAM",
+     middleware = [GuardMiddleware(login_required(), role_required("admin"))])
+```
+
+What such a middleware gets back from the handler is **not** what the client received. The handler
+usually returns `nothing`, and the default serializer turns that into a placeholder `200` response
+with a `null` JSON body (under `serve(serialize = false)` the middleware gets the `nothing` itself).
+A middleware that logs the status, audits the body or computes an ETag from it is reading that
+placeholder, not the bytes the handler wrote to the socket.
 
 So a `STREAM` route owns its entire response head, including every security header it needs. Use it
 when that is what you want (a custom protocol, a non-SSE byte stream). For SSE, `Res.sse` returns a

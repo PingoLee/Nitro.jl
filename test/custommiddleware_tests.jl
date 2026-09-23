@@ -1095,3 +1095,130 @@ end
     @test order == [1, 2]
 end
 end
+
+@testitem "Route middleware — '*', STREAM and WEBSOCKET routes run their guards (#282)" tags=[:core, :middleware] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+using Nitro.Core: DeclaredMethodHandler, internalrequest, Service
+using Nitro.Core.RouterHOF: router
+using Nitro.Core.Routing: urlpatterns
+import Nitro: App, path, text
+
+# REGRESSION for #282, an authorization bypass. Route middleware is published under the
+# DECLARED method (`"*|/w"`, `"STREAM|/sse"`) and `compose` looked it up under `req.method`.
+# No request carries `*`, and `STREAM`/`WEBSOCKET` are registered as `GET`/`POST`, so the lookup
+# never matched and a guard on such a route was skipped without an error. The leaf now carries its
+# declared method (`DeclaredMethodHandler`) and `compose` keys on that.
+#
+# In-process throughout. `deny` never calls the handler, so the STREAM and WEBSOCKET handlers
+# are never reached and need no stream. The wire half, where a passing middleware wraps a live
+# STREAM handler, is in test/streaming_tests.jl.
+
+status(ctx, method, target) = internalrequest(ctx, HTTP.Request(method, target)).status
+leaf(ctx, method, target) = first(HTTP.Handlers.gethandler(ctx.service.router, HTTP.Request(method, target)))
+
+deny = handle -> (req -> HTTP.Response(403))
+# `value` is captured, so every `tag(...)` is a distinct closure.
+tag(value) = handle -> (req -> Nitro.Core.Util.add_response_headers(handle(req), "X-Tag" => value))
+ok(req::HTTP.Request) = Res.send("ran")
+
+@testset "a guard on a method=\"*\" route runs for every method" begin
+    ctx = App()
+    urlpatterns(ctx, "", path("/w", ok; method = "*", middleware = [deny]))
+    for m in ("GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS")
+        @test status(ctx, m, "/w") == 403
+    end
+    @test leaf(ctx, "POST", "/w") isa DeclaredMethodHandler
+    @test leaf(ctx, "POST", "/w").method == "*"
+end
+
+@testset "a guard on a STREAM route runs for GET and POST, on a WEBSOCKET route for GET" begin
+    ctx = App()
+    urlpatterns(ctx, "",
+        path("/sse", (s::HTTP.Stream) -> nothing; method = "STREAM", middleware = [deny]),
+        path("/ws", (ws::HTTP.WebSockets.WebSocket) -> nothing; method = "WEBSOCKET", middleware = [deny]),
+    )
+    @test status(ctx, "GET", "/sse") == 403
+    @test status(ctx, "POST", "/sse") == 403
+    @test status(ctx, "GET", "/ws") == 403
+    @test leaf(ctx, "GET", "/sse").method == "STREAM"
+    @test leaf(ctx, "POST", "/sse").method == "STREAM"
+    @test leaf(ctx, "GET", "/ws").method == "WEBSOCKET"
+end
+
+@testset "router-level middleware gates the same three methods" begin
+    ctx = App()
+    guarded = router(ctx, "/r"; middleware = [deny])
+    Nitro.Core.register(ctx, "*", guarded("/w"), ok)
+    Nitro.Core.register(ctx, "STREAM", guarded("/sse"), (s::HTTP.Stream) -> nothing)
+    Nitro.Core.register(ctx, "WEBSOCKET", guarded("/ws"), (ws::HTTP.WebSockets.WebSocket) -> nothing)
+    @test status(ctx, "GET", "/r/w") == 403
+    @test status(ctx, "PUT", "/r/w") == 403
+    @test status(ctx, "GET", "/r/sse") == 403
+    @test status(ctx, "POST", "/r/sse") == 403
+    @test status(ctx, "GET", "/r/ws") == 403
+end
+
+@testset "a \"*\" leaf and a GET leaf at one path keep their own middleware" begin
+    # GET first, so both leaves exist. Registered the other way round, the GET leaf would replace
+    # the "*" one (HTTP.jl's `insert!` matches an existing "*" leaf for any method).
+    guard_star = App()
+    urlpatterns(guard_star, "",
+        path("/p", ok),
+        path("/p", ok; method = "*", middleware = [deny]),
+    )
+    @test status(guard_star, "GET", "/p") == 200
+    @test status(guard_star, "POST", "/p") == 403
+
+    guard_get = App()
+    urlpatterns(guard_get, "",
+        path("/p", ok; middleware = [deny]),
+        path("/p", ok; method = "*"),
+    )
+    @test status(guard_get, "GET", "/p") == 403
+    @test status(guard_get, "POST", "/p") == 200
+end
+
+@testset "the cached chain is shared across methods and follows a re-publish" begin
+    ctx = App()
+    urlpatterns(ctx, "", path("/w", ok; method = "*", middleware = [tag("one")]))
+    # The first request warms the chain under `*|/w`; the second method hits the cache.
+    @test HTTP.header(internalrequest(ctx, HTTP.Request("GET", "/w")), "X-Tag") == "one"
+    @test HTTP.header(internalrequest(ctx, HTTP.Request("POST", "/w")), "X-Tag") == "one"
+
+    # Re-registering (what Revise does) re-publishes `*|/w` and must invalidate that cached chain
+    # for every method, not only the one that warmed it.
+    urlpatterns(ctx, "", path("/w", ok; method = "*", middleware = [tag("two")]))
+    @test HTTP.header(internalrequest(ctx, HTTP.Request("GET", "/w")), "X-Tag") == "two"
+    @test HTTP.header(internalrequest(ctx, HTTP.Request("POST", "/w")), "X-Tag") == "two"
+end
+
+@testset "a router with HTTP.jl-level middleware refuses a guarded route it cannot key" begin
+    # `register!` wraps the leaf in the router's own middleware, which hides the declared method.
+    # The guard would silently never run, so registration fails instead.
+    wrapped() = App(service = Service(router = HTTP.Router(HTTP.Handlers.default404,
+                                                           HTTP.Handlers.default405,
+                                                           h -> (req -> h(req)))))
+    for (method, handler) in (("*", ok),
+                              ("STREAM", (s::HTTP.Stream) -> nothing),
+                              ("WEBSOCKET", (ws::HTTP.WebSockets.WebSocket) -> nothing))
+        err = try
+            urlpatterns(wrapped(), "", path("/g", handler; method = method, middleware = [deny]))
+            nothing
+        catch e
+            e
+        end
+        @test err isa ArgumentError
+        @test occursin("would never run", sprint(showerror, err))
+    end
+
+    # With no middleware to key there is nothing to lose, so the route registers and is served.
+    ctx = wrapped()
+    urlpatterns(ctx, "", path("/g", ok; method = "*"))
+    @test status(ctx, "POST", "/g") == 200
+    # A concrete method keys on `req.method` and needs no tag, so it is not refused either.
+    urlpatterns(ctx, "", path("/c", ok; method = "POST", middleware = [deny]))
+    @test status(ctx, "POST", "/c") == 403
+end
+end

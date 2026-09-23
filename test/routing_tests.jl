@@ -655,7 +655,7 @@ end
 using Test
 using HTTP
 using Nitro
-using Nitro.Core: App, Service, internalrequest, AutoHeadHandler
+using Nitro.Core: App, Service, internalrequest, DeclaredMethodHandler
 using Nitro.Core.Routing: urlpatterns
 
 # In-process and a local `App` per case: routing and middleware keying are what change here, and
@@ -664,6 +664,9 @@ using Nitro.Core.Routing: urlpatterns
 
 head(ctx, target) = internalrequest(ctx, HTTP.Request("HEAD", target))
 leaf(ctx, method, target) = first(HTTP.Handlers.gethandler(ctx.service.router, HTTP.Request(method, target)))
+# The auto-HEAD leaf keys its middleware on the GET route's (#282 generalized it). An explicit HEAD
+# route's leaf is registered bare.
+is_auto_head(h) = h isa DeclaredMethodHandler && h.method == "GET"
 
 seen_method(req::HTTP.Request) = HTTP.Response(200, ["X-Seen-Method" => req.method], "get body")
 explicit_head(req::HTTP.Request) = Res.status(299)
@@ -677,7 +680,7 @@ tag(value) = handle -> (req -> Nitro.Core.Util.add_response_headers(handle(req),
     @test r.status == 200
     @test HTTP.header(r, "X-Seen-Method") == "HEAD"
     @test head(ctx, "/v/7").status == 200
-    @test leaf(ctx, "HEAD", "/g") isa AutoHeadHandler
+    @test is_auto_head(leaf(ctx, "HEAD", "/g"))
     # HEAD only. Every other method on a GET route is refused as before.
     @test internalrequest(ctx, HTTP.Request("POST", "/g")).status == 405
 end
@@ -696,7 +699,7 @@ end
     @test head(ctx, "/before").status == 299
     @test head(ctx, "/after").status == 299
     @test HTTP.header(head(ctx, "/both"), "X-Seen-Method") == "HEAD"
-    @test !(leaf(ctx, "HEAD", "/both") isa AutoHeadHandler)
+    @test !(leaf(ctx, "HEAD", "/both") isa DeclaredMethodHandler)
 end
 
 @testset "precedence is per route shape, as HTTP.jl's tree stores it" begin

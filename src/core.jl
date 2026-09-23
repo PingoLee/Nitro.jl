@@ -21,7 +21,7 @@ include("errors.jl");       @reexport using .Errors
 include("response.jl");     @reexport using .Res
 include("util.jl");         @reexport using .Util
 include("types.jl");        @reexport using .Types
-using .Types: snapshot, AutoHeadHandler
+using .Types: snapshot, DeclaredMethodHandler
 include("crypto.jl");       @reexport using .Crypto
 include("cookies.jl");      @reexport using .Cookies
 include("constants.jl");    @reexport using .Constants

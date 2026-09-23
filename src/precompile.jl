@@ -68,7 +68,8 @@ end
     ])
     Core.internalrequest(ctx, Request("GET", "/precompile/cached"); catch_errors=false)
     Core.internalrequest(ctx, Request("GET", "/precompile/cached"); catch_errors=false)
-    # The auto-HEAD every GET route gets (#277): an `AutoHeadHandler` leaf, keyed on `GET` here.
+    # The auto-HEAD every GET route gets (#277): a `DeclaredMethodHandler` leaf, keyed on `GET`
+    # here. `"*"`, STREAM and WEBSOCKET leaves (#282) take the same `compose` branch.
     Core.internalrequest(ctx, Request("HEAD", "/precompile/cached"); catch_errors=false)
 
     # A third request WITH per-call global middleware: `use_cache` is false, so this is the
