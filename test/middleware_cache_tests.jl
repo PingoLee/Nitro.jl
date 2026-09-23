@@ -61,7 +61,7 @@ end
 
 @testitem "Chain cache — generation-checked, copy-on-write" tags=[:core, :middleware] setup=[NitroCommon] begin
 using Test
-using Nitro.Core.Types: ChainCache, ChainCacheState, cached_chain, cache_chain!,
+using Nitro.Core.Types: ChainCache, ChainCacheState, ChainKey, cached_chain, cache_chain!,
                         CopyOnWriteDict, snapshot, publish!, RouteMiddleware
 
 # Unit coverage for `ChainCache` (src/types.jl, #255): one pipeline's composed chains, stamped
@@ -77,16 +77,16 @@ table() = (t = CopyOnWriteDict{RouteMiddleware}(); publish!(t, "GET|/a", (nothin
 
 @testset "a fresh cache misses for every snapshot" begin
     c, t = ChainCache(), table()
-    @test cached_chain(c, snapshot(t), "GET|/a") === nothing
-    @test cached_chain(c, Dict{String, RouteMiddleware}(), "GET|/a") === nothing
+    @test cached_chain(c, snapshot(t), ("GET", "/a")) === nothing
+    @test cached_chain(c, Dict{String, RouteMiddleware}(), ("GET", "/a")) === nothing
 end
 
 @testset "publish then hit, within one generation" begin
     c, t = ChainCache(), table()
     snap, f = snapshot(t), mkf("a")
-    @test cache_chain!(c, t, snap, "GET|/a", f)
-    @test cached_chain(c, snap, "GET|/a") === f
-    @test cached_chain(c, snap, "GET|/other") === nothing
+    @test cache_chain!(c, t, snap, ("GET", "/a"), f)
+    @test cached_chain(c, snap, ("GET", "/a")) === f
+    @test cached_chain(c, snap, ("GET", "/other")) === nothing
 end
 
 @testset "a registration makes every earlier chain unservable" begin
@@ -94,18 +94,18 @@ end
     # a new table, and the old chain is simply not returned to anyone holding it.
     c, t = ChainCache(), table()
     snap0 = snapshot(t)
-    cache_chain!(c, t, snap0, "GET|/a", mkf("old"))
+    cache_chain!(c, t, snap0, ("GET", "/a"), mkf("old"))
 
     publish!(t, "GET|/b", (nothing, Function[]))        # a DIFFERENT route is registered
     snap1 = snapshot(t)
-    @test cached_chain(c, snap1, "GET|/a") === nothing   # conservative: any write moves it
+    @test cached_chain(c, snap1, ("GET", "/a")) === nothing   # conservative: any write moves it
 
-    @test cache_chain!(c, t, snap1, "GET|/a", mkf("new"))
-    @test cached_chain(c, snap1, "GET|/a")(nothing) == "new"
+    @test cache_chain!(c, t, snap1, ("GET", "/a"), mkf("new"))
+    @test cached_chain(c, snap1, ("GET", "/a"))(nothing) == "new"
     # The new generation starts empty — nothing is carried over from the old one.
     @test length((@atomic c.state).chains) == 1
     # A request still holding the old table now misses too, and rebuilds from what it holds.
-    @test cached_chain(c, snap0, "GET|/a") === nothing
+    @test cached_chain(c, snap0, ("GET", "/a")) === nothing
 end
 
 @testset "the #81 straddle: built from the old table, published after the registration" begin
@@ -115,8 +115,8 @@ end
     c, t = ChainCache(), table()
     snap0 = snapshot(t)
     publish!(t, "GET|/a", (nothing, Function[mkf("mw")]))
-    @test cache_chain!(c, t, snap0, "GET|/a", mkf("stale")) == false
-    @test cached_chain(c, snapshot(t), "GET|/a") === nothing
+    @test cache_chain!(c, t, snap0, ("GET", "/a"), mkf("stale")) == false
+    @test cached_chain(c, snapshot(t), ("GET", "/a")) === nothing
 end
 
 @testset "a slow request cannot replace a newer generation" begin
@@ -124,23 +124,23 @@ end
     snap0 = snapshot(t)
     publish!(t, "GET|/b", (nothing, Function[]))
     snap1 = snapshot(t)
-    cache_chain!(c, t, snap1, "GET|/a", mkf("current"))
+    cache_chain!(c, t, snap1, ("GET", "/a"), mkf("current"))
     current = @atomic c.state
 
     # Composed against T0, publishing after T1's generation is in: refused, state untouched.
-    @test cache_chain!(c, t, snap0, "GET|/c", mkf("slow")) == false
+    @test cache_chain!(c, t, snap0, ("GET", "/c"), mkf("slow")) == false
     @test (@atomic c.state) === current
-    @test cached_chain(c, snap1, "GET|/a")(nothing) == "current"
+    @test cached_chain(c, snap1, ("GET", "/a"))(nothing) == "current"
 end
 
 @testset "first writer wins within a generation, and publishes nothing" begin
     c, t = ChainCache(), table()
     snap = snapshot(t)
     f, g = mkf("first"), mkf("second")
-    @test cache_chain!(c, t, snap, "GET|/a", f)
+    @test cache_chain!(c, t, snap, ("GET", "/a"), f)
     published = @atomic c.state
-    @test cache_chain!(c, t, snap, "GET|/a", g) == false
-    @test cached_chain(c, snap, "GET|/a") === f          # identity never changes under a reader
+    @test cache_chain!(c, t, snap, ("GET", "/a"), g) == false
+    @test cached_chain(c, snap, ("GET", "/a")) === f          # identity never changes under a reader
     @test (@atomic c.state) === published                # no pointless copy
 end
 
@@ -148,11 +148,11 @@ end
     # #35's invariant, carried over: a reader holding a generation sees it exactly as it was.
     c, t = ChainCache(), table()
     snap = snapshot(t)
-    cache_chain!(c, t, snap, "GET|/a", mkf("a"))
+    cache_chain!(c, t, snap, ("GET", "/a"), mkf("a"))
     held = @atomic c.state
-    cache_chain!(c, t, snap, "GET|/b", mkf("b"))
+    cache_chain!(c, t, snap, ("GET", "/b"), mkf("b"))
     @test length(held.chains) == 1
-    @test !haskey(held.chains, "GET|/b")
+    @test !haskey(held.chains, ("GET", "/b"))
     @test held !== (@atomic c.state)
     @test length((@atomic c.state).chains) == 2
 end
@@ -162,7 +162,23 @@ end
     # than a silent data race.
     c = ChainCache()
     @test_throws ConcurrencyViolationError c.state = ChainCacheState(Dict{String, RouteMiddleware}(),
-                                                                       Dict{String, Function}())
+                                                                       Dict{ChainKey, Function}())
+end
+
+@testset "a hit allocates nothing, key included (#250)" begin
+    # The hit path used to build `string(method, '|', path, tag)` per request — one `String`,
+    # the only allocation a cache hit paid. The key is now a tuple of strings that already exist,
+    # so building it AND looking it up must allocate nothing. Built inside the probe from two
+    # separate strings, exactly as `compose` does from `req.method` and `Leaf.path`, so a key
+    # type that joined them would show up here.
+    c, t = ChainCache(), table()
+    snap = snapshot(t)
+    method, route = "GET", "/a"
+    cache_chain!(c, t, snap, (method, route), mkf("a"))
+    probe(c, snap, m, p) = cached_chain(c, snap, (m, p))
+    @test probe(c, snap, method, route)(nothing) == "a"        # warm up, and it is a hit
+    @test (@allocated probe(c, snap, method, route)) == 0
+    @test @inferred(Union{Function, Nothing}, probe(c, snap, method, route)) isa Function
 end
 
 @testset "concurrent writers lose nothing" begin
@@ -170,7 +186,7 @@ end
     # write path is locked either way. The race is the next testset.
     c, t = ChainCache(), table()
     snap = snapshot(t)
-    fs = Dict("GET|/r$i" => mkf("r$i") for i in 1:64)
+    fs = Dict(("GET", "/r$i") => mkf("r$i") for i in 1:64)
     @sync for (k, f) in fs
         @async cache_chain!(c, t, snap, k, f)
     end
@@ -190,14 +206,14 @@ end
             c, t = ChainCache(), table()
             snap = snapshot(t)
             for i in 1:8
-                cache_chain!(c, t, snap, "GET|/seed$i", mkf("seed$i"))
+                cache_chain!(c, t, snap, ("GET", "/seed$i"), mkf("seed$i"))
             end
             stop = Threads.Atomic{Bool}(false)
             readers = [Threads.@spawn begin
                 try
                     while !stop[]
                         for i in 1:8
-                            f = cached_chain(c, snap, "GET|/seed$i")
+                            f = cached_chain(c, snap, ("GET", "/seed$i"))
                             if f === nothing || f(nothing) != "seed$i"
                                 Threads.atomic_add!(bad, 1)
                             end
@@ -213,7 +229,7 @@ end
                 # spin loops never exit and the item hangs to its timeout.
                 try
                     for i in 1:200
-                        cache_chain!(c, t, snap, "GET|/w$i", mkf("w$i"))
+                        cache_chain!(c, t, snap, ("GET", "/w$i"), mkf("w$i"))
                     end
                 finally
                     stop[] = true
@@ -230,14 +246,14 @@ end
         c, t = ChainCache(), table()
         snap = snapshot(t)
         for i in 1:8
-            cache_chain!(c, t, snap, "GET|/seed$i", mkf("seed$i"))
+            cache_chain!(c, t, snap, ("GET", "/seed$i"), mkf("seed$i"))
         end
         held = @atomic c.state
         for i in 1:200
-            cache_chain!(c, t, snap, "GET|/w$i", mkf("w$i"))
+            cache_chain!(c, t, snap, ("GET", "/w$i"), mkf("w$i"))
         end
         @test length(held.chains) == 8                      # the held generation never grew
-        @test all(held.chains["GET|/seed$i"](nothing) == "seed$i" for i in 1:8)
+        @test all(held.chains[("GET", "/seed$i")](nothing) == "seed$i" for i in 1:8)
         @test length((@atomic c.state).chains) == 208
     end
 end

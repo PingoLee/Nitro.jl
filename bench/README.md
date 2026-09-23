@@ -12,7 +12,7 @@ bench/
 ├── runbenchmarks.jl    # entry point: builds the SUITE, tunes, runs, prints a table, saves JSON
 ├── setup.jl            # a fresh App + bench routes (no global CONTEXT[] mutation)
 ├── suite/              # one file per benchmark group
-│   ├── routing.jl      # full-pipeline static route + genkey
+│   ├── routing.jl      # full-pipeline routes, served pipelines, chain-cache lookup
 │   ├── params.jl       # parseparam + <int:id> pipeline
 │   ├── query.jl        # queryvars URI re-parse
 │   ├── json.jl         # JSON echo (small + 10 KB)

@@ -90,3 +90,14 @@ const BENCH_MW_NOCACHE_PIPELINE =
     Nitro.Core.setupmiddleware(BENCH_MW_CTX; middleware = BENCH_GLOBAL_MW)
 
 run_bench_mw_served_nocache(req::HTTP.Request) = BENCH_MW_NOCACHE_PIPELINE(req)
+
+# A warm `ChainCache` holding one chain, for `routing/chain_cache_hit`. The method and path are
+# returned as SEPARATE strings, so the benchmark builds the tuple key itself, as `compose` does.
+function bench_chain_cache_hit()
+    T = Nitro.Core.Types
+    table = BENCH_MW_CTX.service.custommiddleware
+    snap = T.snapshot(table)
+    c = T.ChainCache()
+    T.cache_chain!(c, table, snap, ("GET", "/bench/mw/ping"), bench_passthrough(identity))
+    return c, snap, "GET", "/bench/mw/ping"
+end

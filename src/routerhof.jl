@@ -417,7 +417,12 @@ function compose(router::HTTP.Router, globalmiddleware::Vector{Function},
                 # is method-agnostic. An explicit `HEAD` route is a different handler type and
                 # keeps its own `HEAD|` key.
                 mw_method = innerhandler isa AutoHeadHandler ? "GET" : req.method
-                key = genkey(mw_method, path)
+
+                # A tuple of two strings that already exist — `req.method` or a literal, and
+                # HTTP.jl's stored `Leaf.path` — so a cache hit builds no key string (#250). The
+                # joined `genkey` is needed only below, on a miss, for the `custommiddleware`
+                # lookup. See `ChainKey` (src/types.jl).
+                key = (mw_method, path)
 
                 # One acquire-load, then a lookup on a table no writer will ever mutate. `nothing`
                 # both for "never built" and for "built from a table registration has since
@@ -427,7 +432,8 @@ function compose(router::HTTP.Router, globalmiddleware::Vector{Function},
 
                 # Combine all the middleware functions together, from THIS request's snapshot —
                 # the one the chain is about to be stamped with.
-                strategy = buildmiddleware(key, handler, globalmiddleware, custom_snap)
+                strategy = buildmiddleware(genkey(mw_method, path), handler, globalmiddleware,
+                                           custom_snap)
 
                 # Warmup only: once per route per registration generation. The publish decides
                 # how much later requests rebuild, never whether they are served a stale chain —

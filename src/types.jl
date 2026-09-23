@@ -450,7 +450,11 @@ end
 # route types), and the tests pin the container's semantics at a second `V` so they do not
 # silently depend on the one in use.
 #
-# The key type is fixed to `String`: the only table keys on `genkey`.
+# The key type is fixed to `String`, and #250 considered and declined parameterizing it: the only
+# table keys on `genkey`, and a request reads it by key only on a chain-cache MISS (the hit path
+# reads nothing but the snapshot's identity and `isempty`), so a tuple key here would buy
+# nothing per request and would cost a wider signature everywhere. The per-request key that did
+# cost a `String` is `ChainCache`'s, and that one is a tuple — see `ChainKey`.
 mutable struct CopyOnWriteDict{V}
     @atomic entries :: Dict{String, V}
     const lock      :: Base.ReentrantLock
@@ -1002,6 +1006,25 @@ while every test stayed green; this cannot, because it would stop constructing.
 const NO_ROUTE_MIDDLEWARE = RouteMiddleware((nothing, nothing))
 
 """
+    ChainKey
+
+A [`ChainCache`](@ref) key: `(method, route path)` — the same two strings `genkey` joins into
+`"METHOD|path"` for `custommiddleware`, kept apart (#250).
+
+Joining them was the one allocation a cache hit paid: a fresh `String` per request, on every
+app with per-route middleware. Both halves already exist as strings when `compose` needs the key
+— `req.method` (or the literal `"GET"` for an auto-`HEAD` leaf) and HTTP.jl's stored `Leaf.path`
+— so a tuple of them costs nothing to build, and hashing it hashes the same bytes the joined
+string would have.
+
+Not a collision fix, and not claimed as one: `("A|/b", "/c")` and `("A", "/b|/c")` are distinct
+here but join to the same `genkey`, and the chain cached under either is still *composed* from
+`custommiddleware[genkey(...)]`. That needs a method containing `|` — a legal HTTP token
+character that no real method uses — and it predates this key.
+"""
+const ChainKey = Tuple{String, String}
+
+"""
     ChainCacheState(source, chains)
 
 One generation of a [`ChainCache`](@ref): the `custommiddleware` snapshot `source`, and the
@@ -1010,7 +1033,7 @@ a chain paired with the wrong table.
 """
 struct ChainCacheState
     source :: Dict{String, RouteMiddleware}
-    chains :: Dict{String, Function}
+    chains :: Dict{ChainKey, Function}
 end
 
 """
@@ -1062,21 +1085,22 @@ end
 # into a state it did not just allocate. Sharing it rather than allocating per cache matters
 # because `internalrequest` builds a pipeline, and so a cache, on every call: 3 allocations
 # each, on apps with no per-route middleware that will never use the cache at all.
-const EMPTY_CHAIN_STATE = ChainCacheState(Dict{String, RouteMiddleware}(), Dict{String, Function}())
+const EMPTY_CHAIN_STATE = ChainCacheState(Dict{String, RouteMiddleware}(), Dict{ChainKey, Function}())
 
 ChainCache() = ChainCache(EMPTY_CHAIN_STATE, Base.ReentrantLock())
 
 """
-    cached_chain(c::ChainCache, source::Dict{String,RouteMiddleware}, key) -> Union{Function, Nothing}
+    cached_chain(c::ChainCache, source::Dict{String,RouteMiddleware}, key::ChainKey) -> Union{Function, Nothing}
 
 The chain cached for `key` **in the generation built from `source`**, or `nothing`. One
-acquire-load, then a lookup on a table no writer mutates.
+acquire-load, then a lookup on a table no writer mutates — allocation-free, which
+test/middleware_cache_tests.jl pins (#250).
 
 `source` must be the `custommiddleware` snapshot the caller takes for this request. A chain
 cached under any other generation is not returned, however recently it was cached — that check
 is the entire staleness guarantee, see [`ChainCache`](@ref).
 """
-@inline function cached_chain(c::ChainCache, source::Dict{String, RouteMiddleware}, key)
+@inline function cached_chain(c::ChainCache, source::Dict{String, RouteMiddleware}, key::ChainKey)
     state = @atomic :acquire c.state
     state.source === source || return nothing
     return get(state.chains, key, nothing)
@@ -1084,7 +1108,7 @@ end
 
 """
     cache_chain!(c::ChainCache, table::CopyOnWriteDict{RouteMiddleware},
-                 source::Dict{String,RouteMiddleware}, key, chain::Function) -> Bool
+                 source::Dict{String,RouteMiddleware}, key::ChainKey, chain::Function) -> Bool
 
 Record `chain`, built from the snapshot `source` of `table`, under `key`. Returns whether it
 published.
@@ -1103,7 +1127,7 @@ generation nobody will match, and the next request replaces it.
 Takes the lock and, on the same-generation path, copies that generation's chain table.
 """
 function cache_chain!(c::ChainCache, table::CopyOnWriteDict{RouteMiddleware},
-                      source::Dict{String, RouteMiddleware}, key, chain::Function)::Bool
+                      source::Dict{String, RouteMiddleware}, key::ChainKey, chain::Function)::Bool
     return lock(c.lock) do
         state = @atomic :monotonic c.state
         if state.source === source
@@ -1111,7 +1135,7 @@ function cache_chain!(c::ChainCache, table::CopyOnWriteDict{RouteMiddleware},
             chains = _grown_copy(state.chains)
         else
             snapshot(table) === source || return false
-            chains = Dict{String, Function}()
+            chains = Dict{ChainKey, Function}()
         end
         chains[key] = chain
         @atomic :release c.state = ChainCacheState(source, chains)
