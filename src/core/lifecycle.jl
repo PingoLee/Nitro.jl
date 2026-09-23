@@ -294,7 +294,7 @@ function serve(ctx::App;
     # misconfiguration, and the banner already reports the thread count. `preprocesskwargs` drops
     # `queuesize` whatever `parallel` is, so the warning that it is ignored is unconditional too.
     if haskey(kwargs, :queuesize)
-        @warn "Deprecated: serve() ignores `queuesize` -- each request runs on the thread pool via Threads.@spawn, so there is no queue to size. Remove the argument."
+        @warn "Deprecated: serve() ignores `queuesize`; remove the argument."
     end
 
     if parallel
