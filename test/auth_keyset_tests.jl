@@ -183,6 +183,33 @@ end
     @test (@inferred Nitro.Auth._verify_candidates("s1", "label")) isa T
     @test (@inferred Nitro.Auth._signing_secret(ks)) == ("s1", "current")
     @test (@inferred Nitro.Auth._signing_secret("s1")) == ("s1", nothing)
+
+    # `_decode_jwt` is what the validator calls: one tuple shape, no `with_kid` Union (#265).
+    DT = Tuple{AbstractDict, Nullable{String}}
+    token = encode_jwt(Dict("sub" => "1"), ks; expires_in = 60)
+    @test (@inferred DT Nitro.Auth._decode_jwt(token, "s1")) isa DT
+    @test (@inferred DT Nitro.Auth._decode_jwt(token, ks)) isa DT
+    @test decode_jwt(token, ks; with_kid = true) == Nitro.Auth._decode_jwt(token, ks)
+    @test decode_jwt(token, ks) == first(Nitro.Auth._decode_jwt(token, ks))
+end
+
+@testset "the jwt_validator closure is unboxed on every profile (#265)" begin
+    ks = JWTKeyset("current" => "s1")
+    token = encode_jwt(Dict("sub" => "1", "iss" => "i", "aud" => "a"), ks; expires_in = 60)
+    for (label, v) in (
+            ("default", jwt_validator("s1")),
+            ("keyset", jwt_validator(ks; identity_from = :kid)),
+            ("strict", jwt_validator(ks; profile = :strict, issuer = "i", audience = "a")),
+            ("warn_claims", jwt_validator(ks; warn_claims = ["iss"])))
+        # A captured variable reassigned anywhere in `jwt_validator` becomes a `Core.Box`,
+        # and every request then dispatched `decode_jwt` dynamically.
+        @test (label, any(T -> T === Core.Box, fieldtypes(typeof(v)))) == (label, false)
+        # And no local of the per-request body is `Any` -- `claims`, `kid` and the
+        # `warn_claims` `iss` all were.
+        ci = only(code_typed(v, (String, Nothing); optimize = false)).first
+        @test (label, filter(T -> T === Any, ci.slottypes)) == (label, [])
+        @test (label, v(token).kid) == (label, label == "default" ? nothing : "current")
+    end
 end
 
 end

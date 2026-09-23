@@ -130,6 +130,17 @@ function encode_jwt(payload::AbstractDict, secret_or_keyset; expires_in::Union{I
 end
 
 function decode_jwt(token::AbstractString, secret_or_keyset; issuer=nothing, audience=nothing, exp_timeout::Union{Int, Nothing}=DEFAULT_JWT_MAX_AGE_SECONDS, iat_skew::Int=30, verify::Bool=true, with_kid::Bool=false, require_exp::Bool=false, required_claims::Union{AbstractVector{<:AbstractString}, Nothing}=nothing)
+    claims, kid = _decode_jwt(token, secret_or_keyset; issuer=issuer, audience=audience,
+        exp_timeout=exp_timeout, iat_skew=iat_skew, verify=verify, require_exp=require_exp,
+        required_claims=required_claims)
+    return with_kid ? (claims, kid) : claims
+end
+
+# The body of `decode_jwt`, always returning `(claims, kid)`. `with_kid` is a runtime
+# Bool that is not constant-propagated, so `decode_jwt(...; with_kid=true)` infers a
+# `Union` of its two return shapes; `jwt_validator` calls this instead, and its per-request
+# path sees one concrete tuple shape (#265, nitro-core §7).
+function _decode_jwt(token::AbstractString, secret_or_keyset; issuer=nothing, audience=nothing, exp_timeout::Union{Int, Nothing}=DEFAULT_JWT_MAX_AGE_SECONDS, iat_skew::Int=30, verify::Bool=true, require_exp::Bool=false, required_claims::Union{AbstractVector{<:AbstractString}, Nothing}=nothing)
     segments = split(String(token), '.')
     length(segments) == 3 || throw(AuthError("Invalid JWT format"))
 
@@ -242,5 +253,5 @@ function decode_jwt(token::AbstractString, secret_or_keyset; issuer=nothing, aud
     end
 
     validate_claims(claims; exp_timeout=exp_timeout, iat_skew=iat_skew, issuer=issuer, audience=audience, require_exp=require_exp, required_claims=required_claims)
-    return with_kid ? (claims, kid) : claims
+    return (claims, kid)
 end

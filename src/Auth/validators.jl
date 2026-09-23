@@ -40,7 +40,9 @@ const _WARN_ISS_MAX = 128
 # And bound the set itself, so a high-cardinality `iss` cannot grow it without limit.
 const _WARN_SEEN_CAP = 64
 
-function _warn_iss(value)
+# A claim value is `Any` by nature, so this call is dynamic; the return annotation stops
+# that `Any` from reaching `_report_missing_claim!` on the per-request path (#265).
+function _warn_iss(value)::Nullable{String}
     value === nothing && return nothing
     text = string(value)
     return length(text) > _WARN_ISS_MAX ? string(first(text, _WARN_ISS_MAX), "…") : text
@@ -219,9 +221,6 @@ function jwt_validator(secret_or_keyset;
     seen_warned = Set{NTuple{3, Nullable{String}}}()
     seen_lock = ReentrantLock()
 
-    # Concrete NamedTuple capture — all profile resolution happens here, once, at
-    # construction; the per-request closure does no configuration branching.
-    decode_kwargs = values(kwargs)
     if profile === :strict
         get(kwargs, :issuer, nothing) === nothing &&
             throw(ArgumentError("profile=:strict requires issuer=..."))
@@ -229,11 +228,16 @@ function jwt_validator(secret_or_keyset;
             throw(ArgumentError("profile=:strict requires audience=..."))
         get(kwargs, :require_exp, true) === false &&
             throw(ArgumentError("profile=:strict forces require_exp=true; do not pass require_exp=false"))
-        decode_kwargs = merge(decode_kwargs, (require_exp = true,))
     end
+    # Concrete NamedTuple capture — all profile resolution happens here, once, at
+    # construction; the per-request closure does no configuration branching. Assigned
+    # exactly ONCE: a captured variable that is reassigned anywhere in the enclosing
+    # function is captured in a `Core.Box`, which made every request dispatch `decode_jwt`
+    # dynamically and infer `claims`/`kid` as `Any` (#265).
+    decode_kwargs = profile === :strict ? merge(values(kwargs), (require_exp = true,)) : values(kwargs)
 
     return function(token::AbstractString, req::Union{HTTP.Request, Nothing}=nothing)
-        claims, kid = decode_jwt(token, keyset; with_kid=true, decode_kwargs...)
+        claims, kid = _decode_jwt(token, keyset; decode_kwargs...)
         resolved_kid = kid_trusted && kid !== nothing ? String(kid) : nothing
         # `resolved_kid`, never the raw header kid: the header value is attacker-chosen,
         # and this one has been resolved against the keyset. An unverified kid must not
