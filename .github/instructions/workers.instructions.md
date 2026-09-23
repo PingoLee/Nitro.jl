@@ -256,12 +256,34 @@ never retires those, since it needs a `completed_at`.
 The filter runs **in Julia over the projected `started_at`**, not in SQL, so a row it excludes is
 still seen and counted. Do not "optimize" it into the query without keeping that count.
 
-**The sweep's completion line is unconditional**
+**With a bound, the retention tick re-runs the sweep; without one, it never does**
+([#266](https://github.com/PingoLee/Nitro.jl/issues/266)). `start!` passes `zombie_min_age` to
+`start_cleanup_scheduler` when `recover_zombies` is on, and every tick then runs the bounded
+sweep **before** retention, each in its own `try`, so a throw costs one sweep one tick. That is
+what picks up the claims the boot sweep counted `too_recent`, within `zombie_min_age +
+cleanup_interval_hours`. It needs `cleanup_enabled`, because there is no separate interval or
+second janitor.
+
+Do not make the tick's sweep unconditional. Liveness is process-local, so an unbounded sweep on a
+timer marks another process's live runs `FAILED` on every tick, and a single process gains nothing
+from it, since its boot sweep already took everything. It is safe in the running runtime because
+`_claim_run!` publishes a run's handle before its RUNNING claim, so this runtime's own runs are
+always `spared_live`.
+
+**The boot sweep's completion line is unconditional**
 ([#238](https://github.com/PingoLee/Nitro.jl/issues/238)). `"Nitro.Workers: scanning for zombie
 tasks"` goes out before `lock_tasks`, and `"… zombie recovery complete"` goes out after, with
 `recovered = 0` included. On a read failure, an `@error` carrying the same counts replaces it. The
 sweep runs after the banner and before the first request, which is the window where silence cost an
 incident, so never make that line conditional. Counts only, never a `result` or `error` payload.
+
+The **periodic** re-sweep (#266) is the one exception, and it follows the retention tick's rule
+instead: `@info` only when `recovered > 0`, `@debug` otherwise, and `@error` on failure. An
+unconditional pair on a caller-supplied interval is noise. `_recover_zombie_tasks!`'s `periodic`
+flag changes only the logging: the log levels, plus a write failure being logged once and then
+absorbed rather than rethrown. The tick carries on either way, so a rethrow would only log it
+twice. Keep the flag out of every adjudication, so the two sweeps cannot drift apart in what they
+decide.
 
 ## 6. Developer Rules
 
