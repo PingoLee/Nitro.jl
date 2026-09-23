@@ -521,9 +521,9 @@ catch e
 end
 """
 
-# `--code-coverage=none` explicitly, matching test/extensions/pormg_env_tests.jl: CI runs
-# `julia-actions/julia-runtest` with its default `coverage: true`, and `Base.julia_cmd()`
-# propagates that flag. Inheriting it costs the child its pkgimages, so it reloads all of
+# `--code-coverage=none` explicitly, matching test/extensions/pormg_env_tests.jl: CI runs the
+# suite under coverage in the job that uploads it (#244), and `Base.julia_cmd()` propagates
+# that flag. Inheriting it costs the child its pkgimages, so it reloads all of
 # Nitro from source -- and `test/runtests.jl` sets `nworkers = 0` under coverage, which is
 # the one configuration where `testitem_timeout` does not apply, so a slow or wedged child
 # would have no ceiling at all (#84). Everything else must come FROM `julia_cmd()`, notably

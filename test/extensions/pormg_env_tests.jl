@@ -97,11 +97,11 @@ end
     # runs once per process, so the only way to exercise it is a fresh process. This also
     # pins that the `jl_generating_output` guard does not suppress the RUNTIME path.
     script = "using Nitro, PormG; print(get(ENV, \"PORMG_ENV\", \"<unset>\"))"
-    # `--code-coverage=none` explicitly: CI runs `julia-actions/julia-runtest` with its default
-    # `coverage: true`, `Base.julia_cmd()` propagates that flag, and coverage disables pkgimages
-    # -- so without this each child re-JITs Nitro + PormG + the extension from source, on every
-    # matrix job. Everything else must come FROM `julia_cmd()` (notably `--check-bounds=yes`,
-    # which `Pkg.test` sets): dropping it would send the child to a different cache and cause
+    # `--code-coverage=none` explicitly: CI runs the suite under coverage in the job that
+    # uploads it (#244), `Base.julia_cmd()` propagates that flag, and coverage disables pkgimages
+    # -- so without this each child re-JITs Nitro + PormG + the extension from source there.
+    # Everything else must come FROM `julia_cmd()` (notably `--check-bounds=yes`, which
+    # `Pkg.test` sets): dropping it would send the child to a different cache and cause
     # the very recompile this avoids.
     cmd = `$(Base.julia_cmd()) --code-coverage=none --project=$(Base.active_project()) --startup-file=no -e $script`
 

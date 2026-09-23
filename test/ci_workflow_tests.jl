@@ -138,3 +138,51 @@ end
 end
 
 end
+
+@testitem "CI runs under coverage only in the job that uploads it" tags=[:core] setup=[NitroCommon] begin
+
+# Why this item exists (#244).
+#
+# `julia-actions/julia-runtest` defaults its `coverage` input to `true`. ci.yml called it
+# with no `with:` block and gated only the processing and upload steps, so all eight matrix
+# jobs ran under `--code-coverage` while one published the result. `test/runtests.jl` sets
+# `nworkers = 0` whenever it is covering, and ReTestItems applies `testitem_timeout` only on
+# the worker path -- so no CI job had a per-item hang ceiling, the condition #84 closed.
+#
+# Nothing about that is visible from a green run: the suite passes exactly as before, it
+# just cannot be stopped if an item hangs. So the three conditions are asserted equal here,
+# against the shipped file, the same way the item above guards least privilege.
+
+const CI_SRC = let raw = read(joinpath(pkgdir(Nitro), ".github", "workflows", "ci.yml"), String)
+    s = replace(raw, '﻿' => "", "\r\n" => "\n")
+    # Drop whole-line comments: ci.yml's own explanation names `coverage` and the action.
+    join(filter(l -> !occursin(r"^\s*#", l), split(s, '\n')), '\n')
+end
+
+@testset "julia-runtest's coverage is gated like the upload" begin
+    # One test step. A second would need its own gate, and nothing below would see it.
+    @test count(r"julia-actions/julia-runtest@", CI_SRC) == 1
+
+    # The input must be PRESENT -- absent means the action's `true` default. Other keys may
+    # precede it in the `with:` block; the next step (`- uses:`) ends the search.
+    run = match(
+        r"julia-actions/julia-runtest@\S+\n\s+with:\n(?:\s+[\w-]+:.*\n)*?\s+coverage:\s*\$\{\{\s*(.+?)\s*\}\}",
+        CI_SRC,
+    )
+    @test run !== nothing
+    cond = run === nothing ? "" : strip(run[1])
+    # A literal `true` would be the old bug spelled out; the gate has to name the matrix.
+    @test occursin("matrix.", cond)
+
+    # ...and it is the SAME job that processes and uploads coverage. If these drift, either
+    # the uploader finds no `.cov` files, or a second job is back under coverage with no
+    # timeout.
+    uploads = [strip(m[1]) for m in eachmatch(
+        r"(?:julia-actions/julia-processcoverage|coverallsapp/github-action)@\S+\n\s+if:\s*(.+)",
+        CI_SRC,
+    )]
+    @test length(uploads) == 2
+    @test all(==(cond), uploads)
+end
+
+end

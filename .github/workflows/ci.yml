@@ -128,7 +128,17 @@ jobs:
           delete-old-caches: 'false'
           cache-name: julia-cache;workflow=${{ github.workflow }};job=${{ github.job }};os=${{ matrix.os }};version=${{ matrix.version }};threads=${{ matrix.threads }}
       - uses: julia-actions/julia-buildpkg@v1
+      # `coverage` MUST be passed, and gated exactly like the two upload steps below. The
+      # action defaults it to `true`, so a bare step runs ALL eight jobs under
+      # `--code-coverage` -- and a covering run has `test/runtests.jl` pick `nworkers = 0`,
+      # which leaves the 600s `testitem_timeout` inert: no job had a per-item hang ceiling,
+      # the exact condition #84 closed (#244). Gating only the upload decides who PUBLISHES
+      # coverage, not who runs under it. `ci_workflow_tests.jl` asserts the three
+      # conditions stay identical; the coverage-vs-worker trade-off is explained in
+      # `test/runtests.jl`, above `covering`.
       - uses: julia-actions/julia-runtest@v1
+        with:
+          coverage: ${{ matrix.os == 'ubuntu-latest' && matrix.threads == '1' && matrix.version == '1.12' }}
       - uses: julia-actions/julia-processcoverage@v1
         if: matrix.os == 'ubuntu-latest' && matrix.threads == '1' && matrix.version == '1.12'
       - uses: coverallsapp/github-action@v2

@@ -5,6 +5,11 @@ test/Manifest.toml
 demo/Manifest.toml
 test_*.txt
 
+# Coverage artifacts: a `--code-coverage` run writes `<file>.jl.<pid>.cov` beside every
+# source file it touches, and julia-processcoverage writes lcov.info at the root (#245).
+*.cov
+lcov.info
+
 # Agent worktrees live under .claude/ but are never part of the tree.
 # (.claude/skills/ IS tracked — it is the Claude Code skill bridge.)
 .claude/worktrees/

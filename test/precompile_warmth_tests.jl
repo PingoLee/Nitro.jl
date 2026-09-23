@@ -24,8 +24,9 @@ using Test
 #
 # THIS LINE IS WHAT MAKES THE TEST MEAN ANYTHING IN CI, and it is not an optimization.
 # `Base.julia_cmd()` reproduces the PARENT's flags, `--code-coverage` among them, and
-# `.github/workflows/ci.yml` runs `julia-actions/julia-runtest`, whose `coverage` input
-# defaults to true. Coverage instrumentation makes Julia discard precompiled NATIVE code, so
+# `.github/workflows/ci.yml` runs the suite under coverage in the job that uploads it (and in
+# every job, if its `coverage:` gate is ever dropped -- the action defaults it to true,
+# #244). Coverage instrumentation makes Julia discard precompiled NATIVE code, so
 # an inherited flag leaves every probe cold — including the denominator. Measured, this
 # worktree, only the flag changed:
 #
