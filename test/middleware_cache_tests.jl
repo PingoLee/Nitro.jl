@@ -398,10 +398,15 @@ using HTTP
 using Nitro
 import Nitro: App, path, text
 
-# Found in review of #255. The chain key carries the request method, and a `method = "*"` route
-# matches ANY token, so caching every method a client sends would grow the pipeline's cache
-# without bound — each insert copying the whole generation. Only methods Nitro knows are cached;
-# anything else is composed for that one request.
+# Found in review of #255. The chain key carries a method, and some leaves match ANY method
+# token. Caching under every token a client sends would grow a pipeline's cache without bound,
+# each insert copying the whole generation. So the key's method must be one the client cannot
+# choose:
+#
+#   * a `"*"` route is a `DeclaredMethodHandler` leaf (#282) and keys on `"*"` — one chain,
+#     whatever the request says;
+#   * a bare leaf that matches any token keys on `req.method`, so only methods Nitro knows are
+#     cached, and anything else is composed for that one request.
 #
 # Observed through a counting GLOBAL factory: `compose` calls it once to prebuild the unmatched
 # chain, then once per chain composition.
@@ -415,20 +420,32 @@ Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
     # Some route must carry middleware, or every request takes the empty-table fast path.
     path("/mw", (req::HTTP.Request) -> Res.send("mw"), middleware = [h -> (r::HTTP.Request -> h(r))]),
 ])
+# A bare any-method leaf, registered on the router directly so no `DeclaredMethodHandler` wraps
+# it — the shape the method guard exists for.
+HTTP.register!(ctx.service.router, "*", "/raw", (req::HTTP.Request) -> HTTP.Response(200, "raw"))
 p = Nitro.Core.setupmiddleware(ctx; middleware = [counting_global], catch_errors = false)
 @test folds[] == 1
 
-@testset "unknown methods are served, and composed every time" begin
+@testset "a \"*\" route caches ONE chain for every method token" begin
     for _ in 1:2, i in 1:5
         @test text(p(HTTP.Request("X-JUNK-$i", "/any"))) == "any"
     end
-    @test folds[] == 1 + 10              # never cached, so never retained
+    @test text(p(HTTP.Request("POST", "/any"))) == "any"
+    @test folds[] == 1 + 1              # keyed on the declared "*", not on what was sent
 end
 
-@testset "known methods on the same route are cached as usual" begin
+@testset "a bare any-method leaf never caches an unknown method" begin
+    before = folds[]
+    for _ in 1:2, i in 1:5
+        @test text(p(HTTP.Request("X-JUNK-$i", "/raw"))) == "raw"
+    end
+    @test folds[] == before + 10        # composed per request, never retained
+end
+
+@testset "...but still caches a known one" begin
     before = folds[]
     for _ in 1:3
-        @test text(p(HTTP.Request("POST", "/any"))) == "any"
+        @test text(p(HTTP.Request("POST", "/raw"))) == "raw"
     end
     @test folds[] == before + 1
 end

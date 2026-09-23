@@ -1276,24 +1276,44 @@ struct RouteResolution
 end
 
 """
-    AutoHeadHandler(get_handler)
+    DeclaredMethodHandler(method, handler)
 
-The `HEAD` leaf registration adds next to every `GET` route that has no explicit `HEAD` route of
-its own (#277). It calls the `GET` route's handler unchanged; the request it passes on still says
-`req.method == "HEAD"`, and the write path drops the body (src/core/transport.jl).
+A router leaf that is reached by requests whose method is not the one its route was declared
+with. It calls `handler` unchanged and remembers the declared `method`, because the route's
+middleware is published under that method (`genkey(method, path)`) and HTTP.jl's `gethandler`
+returns the leaf's handler but not the leaf's own method. `compose` (src/routerhof.jl) reads
+`method` back from here after the lookup, and keys both the middleware table and the cached chain
+on it. Keyed on `req.method` instead, the lookup finds nothing and the route's guards never run.
 
-It is a distinct type, not the `GET` closure itself, so `compose` (src/routerhof.jl) can tell an
-auto-`HEAD` apart from an explicit one after the router lookup. It then keys the route's middleware
-and its cached chain on `GET`, so the `GET` route's guards also gate its `HEAD`. Both follow a
-later re-publish of the `GET` middleware. An explicit `HEAD` route replaces this leaf and keys on
-`HEAD` as it always did.
+Four leaves are registered this way:
+
+| Declared | Reached by | Keyed on |
+|---|---|---|
+| `GET` (the auto-`HEAD`, #277) | `HEAD` | `GET` |
+| `"*"` | any method | `*` |
+| `STREAM` | `GET`, `POST` | `STREAM` |
+| `WEBSOCKET` | `GET` | `WEBSOCKET` |
+
+`STREAM` and `WEBSOCKET` are not methods on the wire; `registerhandler` resolves them to the
+methods above (#282). Every other leaf is registered bare and keys on `req.method`, which then is
+its declared method.
+
+The auto-`HEAD` passes the request on as-is, still saying `req.method == "HEAD"`, and the write
+path drops the body (src/core/transport.jl). An explicit `HEAD` route replaces that leaf with a bare
+one and keys on `HEAD` as it always did.
+
+A router built with HTTP.jl-level `middleware` wraps every leaf in it, which hides this type.
+Registration handles that per case: no auto-`HEAD` at all, and an `ArgumentError` for a `"*"`,
+`STREAM` or `WEBSOCKET` route that has middleware to key (src/core/registration.jl).
 
 Subtypes `Function` so the `RouteResolution` hand-off (`innerhandler isa Function`) still applies.
+`method` is a `String` for every `F`, so `compose` reads it without widening.
 """
-struct AutoHeadHandler{F<:Function} <: Function
-    get_handler :: F
+struct DeclaredMethodHandler{F<:Function} <: Function
+    method  :: String
+    handler :: F
 end
 
-(h::AutoHeadHandler)(req::HTTP.Request) = h.get_handler(req)
+(h::DeclaredMethodHandler)(req::HTTP.Request) = h.handler(req)
 
 end # module Types

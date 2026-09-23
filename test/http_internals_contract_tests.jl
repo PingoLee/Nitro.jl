@@ -16,6 +16,9 @@ import Sockets
 #       `getproperty`, which calls it. Rename it upstream and the session, CSRF, auth and
 #       app-context paths all break at once.
 #   • src/utilities/bodyparsers.jl — the `EmptyBody` / `BytesBody` body hierarchy.
+#   • src/core/pipeline.jl — `_allowed_methods` walks the router's route tree to build a 405's
+#       `Allow` header (#281): `Router.routes`, the `Node`/`Leaf`/`Variable` fields, `match`,
+#       `_route_variable_matches` and `_router_request_path`.
 #   • src/context.jl — `_shutdown_server`'s bounded drain: it depends on `close(::Server)`
 #       releasing the listener BEFORE its unbounded quiesce loop, and escalates to
 #       `HTTP.forceclose`.
@@ -93,6 +96,32 @@ end
     @test :context        in flds
     # Read by `_http_stream_request` as the declared body length: -1 chunked, 0 none, >0 fixed.
     @test :content_length in flds
+end
+
+@testset "the route tree `_allowed_methods` walks is still shaped the same (#281)" begin
+    H = HTTP.Handlers
+    @test :routes in fieldnames(HTTP.Router)
+    @test fieldtype(HTTP.Router{Any,Any,Any}, :routes) === H.Node
+    for f in (:segment, :exact, :conditional, :wildcard, :doublestar, :methods)
+        @test f in fieldnames(H.Node)
+    end
+    @test :method  in fieldnames(H.Leaf)
+    @test :handler in fieldnames(H.Leaf)
+    @test :pattern in fieldnames(H.Variable)
+    @test hasmethod(H.match, Tuple{H.Node, String, Vector{SubString{String}}, Int})
+    @test hasmethod(H._route_variable_matches, Tuple{Regex, SubString{String}})
+    @test H._router_request_path("/a/b?x=1") == "/a/b"
+
+    # Behavior, not only shape: a plain variable, a pattern-constrained one, and a `**`.
+    r = HTTP.Router()
+    h = req -> HTTP.Response(200)
+    HTTP.register!(r, "GET",    "/a/{x}", h)
+    HTTP.register!(r, "DELETE", "/a/{n:[0-9]+}", h)
+    HTTP.register!(r, "PUT",    "/b/**", h)
+    @test Nitro.Core._allowed_methods(r, "/a/7") == ["DELETE", "GET"]
+    @test Nitro.Core._allowed_methods(r, "/a/z") == ["GET"]
+    @test Nitro.Core._allowed_methods(r, "/b/c/d?q") == ["PUT"]
+    @test isempty(Nitro.Core._allowed_methods(r, "/c"))
 end
 
 @testset "router hands over STILL-ENCODED path segments" begin

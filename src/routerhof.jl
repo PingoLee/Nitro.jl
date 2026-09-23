@@ -7,7 +7,7 @@ using ..AppContext: App
 using ..Constants: HTTP_METHODS
 using ..Types: Nullable, LifecycleMiddleware, CopyOnWriteDict, snapshot,
                 publish!, RouteResolution, ROUTE_RESOLUTION_KEY,
-                RouteMiddleware, NO_ROUTE_MIDDLEWARE, AutoHeadHandler,
+                RouteMiddleware, NO_ROUTE_MIDDLEWARE, DeclaredMethodHandler,
                 ChainCache, cached_chain, cache_chain!
 
 export router, compose, genkey, process_middleware, HOFRouter, OuterRouter, InnerRouter
@@ -412,15 +412,21 @@ function compose(router::HTTP.Router, globalmiddleware::Vector{Function},
                     _clear_resolution!(req)
                 end
 
-                # An auto-`HEAD` leaf (#277) takes its key from its `GET` route. That way the
-                # `GET` route's guards gate its `HEAD`, and a re-publish of the `GET` middleware
-                # reaches the chain `HEAD` uses, since the chain wraps the router terminal and
-                # is method-agnostic. An explicit `HEAD` route is a different handler type and
-                # keeps its own `HEAD|` key.
-                mw_method = innerhandler isa AutoHeadHandler ? "GET" : req.method
+                # Both keys use the method the route was DECLARED with, which is the one its
+                # middleware was published under. For most leaves that is `req.method`. A
+                # `DeclaredMethodHandler` leaf is reached by other methods and carries its own:
+                # `GET` for an auto-`HEAD` (#277), and `*`, `STREAM` or `WEBSOCKET` for routes
+                # declared that way (#282). No request carries those three, so keyed on
+                # `req.method` their guards were never found and never ran. One chain then
+                # serves every method that reaches the leaf, which is sound because the chain
+                # wraps the router terminal and is method-agnostic. A re-publish under the
+                # declared key moves `custommiddleware`, so no pipeline serves the old chain.
+                declared = innerhandler isa DeclaredMethodHandler
+                mw_method = declared ? innerhandler.method : req.method
 
-                # A tuple of two strings that already exist — `req.method` or a literal, and
-                # HTTP.jl's stored `Leaf.path` — so a cache hit builds no key string (#250). The
+                # A tuple of two strings that already exist — `req.method` or the leaf's stored
+                # declared method, and HTTP.jl's stored `Leaf.path` — so a cache hit builds no key
+                # string (#250). The
                 # joined `genkey` is needed only below, on a miss, for the `custommiddleware`
                 # lookup. See `ChainKey` (src/types.jl).
                 key = (mw_method, path)
@@ -442,15 +448,16 @@ function compose(router::HTTP.Router, globalmiddleware::Vector{Function},
                 # request needs no ordering argument here (it did, #81). A request whose
                 # snapshot is already superseded simply declines to publish.
                 #
-                # Only for a method Nitro knows. `req.method` is chosen by the client, and a
-                # `method = "*"` route matches any token, so caching every one would let a client
-                # grow this table without bound — and each insert copies the whole generation.
-                # An unknown method is composed per request and never cached — a cost confined to
-                # traffic nothing serves on purpose. (The `App`-wide cache before #255 did cache
-                # them, on apps without global middleware; making every app cache would have
-                # extended that growth to all of them, which review caught.) The check sits on
-                # the miss path only, so a hit never pays for it.
-                mw_method in HTTP_METHODS &&
+                # Only under a key the CLIENT cannot choose. A `DeclaredMethodHandler` leaf keys on
+                # the method it was registered with, so its entries are bounded by the route
+                # table. Every other leaf keys on `req.method`, which the router matched exactly —
+                # except a bare leaf that matches any token (a `"*"` route whose wrapper is hidden
+                # by HTTP.jl-level router middleware, or one registered on the router directly).
+                # Caching those under every token a client sends would grow this table without
+                # bound, each insert copying the whole generation, so a method Nitro does not know
+                # is composed for that one request and never cached. The check sits on the miss
+                # path only, so a hit never pays for it.
+                (declared || mw_method in HTTP_METHODS) &&
                     cache_chain!(chains, custommiddleware, custom_snap, key, strategy)
 
                 return strategy(req)

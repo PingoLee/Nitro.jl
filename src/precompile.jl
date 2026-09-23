@@ -69,7 +69,8 @@ end
     ])
     Core.internalrequest(ctx, Request("GET", "/precompile/cached"); catch_errors=false)
     Core.internalrequest(ctx, Request("GET", "/precompile/cached"); catch_errors=false)
-    # The auto-HEAD every GET route gets (#277): an `AutoHeadHandler` leaf, keyed on `GET` here.
+    # The auto-HEAD every GET route gets (#277): a `DeclaredMethodHandler` leaf, keyed on `GET`
+    # here. `"*"`, STREAM and WEBSOCKET leaves (#282) take the same `compose` branch.
     Core.internalrequest(ctx, Request("HEAD", "/precompile/cached"); catch_errors=false)
 
     # A request WITH per-call global middleware — the production shape: `serve(middleware=[...])`,
@@ -83,6 +84,9 @@ end
     # branch #71 added that nothing above reaches. Returns a plain 404 `Response`; with
     # `catch_errors=false` nothing is thrown.
     Core.internalrequest(ctx, Request("GET", "/precompile/missing"); catch_errors=false)
+    # A method mismatch: the `405` path, which walks the route tree for `Allow` (#281). The 404
+    # above walks it too, to tell a true miss from a mismatch HTTP.jl reported as one.
+    Core.internalrequest(ctx, Request("DELETE", "/precompile/cached"); catch_errors=false)
 
     # ── A static mount, end to end ──────────────────────────────────────────────
     #
