@@ -309,6 +309,24 @@ my_running = get_all_tasks(Owner("user-1"), RUNNING)
 every_task = get_all_tasks(System())
 ```
 
+The unpaged call materializes the whole listing, and the task table only grows between retention
+sweeps. A task that never finishes is never swept at all. On a large table, read it a page at a
+time instead. Pass `limit`, then pass the last entry's `:id` as `after` to get the next page:
+
+```julia
+page = get_all_tasks(System(); limit = 500)
+while !isempty(page)
+    foreach(show_row, page)
+    length(page) < 500 && break           # a short page is the last one
+    page = get_all_tasks(System(); limit = 500, after = last(page)[:id])
+end
+```
+
+A paged result is ordered by `:id`, not by `:created_at`, because the page boundary is a cursor
+on the id. The cursor is keyset rather than an offset, so rows that change status while you page
+do not shift later pages. The same `after` / `limit` keywords work with an `Owner` and with a
+status filter.
+
 ### `get_queue_status`
 
 Queue-wide introspection for sequential queues, reporting:
@@ -764,8 +782,10 @@ degrades to the exception type alone.
 `cleanup_interval_hours=24`), so finished rows — error text included — are pruned on the
 retention window rather than kept forever. A sweep that throws — a transient store error,
 say — is logged and retried on the next interval: it neither stops the scheduler nor makes
-`shutdown!` throw. If you set `cleanup_enabled=false`, you own retention, and stored error
-text lives as long as the row does.
+`shutdown!` throw. A tick that retires rows logs
+`"Nitro.Workers: task retention sweep complete"` at `@info` with `deleted` and `retain_days`. A
+tick with nothing to retire logs the same line at `@debug`. If you set `cleanup_enabled=false`, you
+own retention, and stored error text lives as long as the row does.
 
 !!! warning "Treat `TaskInfo.error` as attacker-influenceable"
     It is free text derived from an exception your own code raised. The safest posture is to
@@ -921,6 +941,56 @@ the teardown drain (see *Teardown drains, within a bound*, above) keeps
 the handle of a run it could not finish, restarting a **reused** runtime no longer marks such a run
 `FAILED`. A restart that builds a *new* runtime still sweeps it, because handles never cross
 runtimes — which is also why a genuine crash is still recovered.
+
+The sweep reads only three columns of each `RUNNING` record (its id, run id and start time),
+through the store method `list_running_task_refs`. It never deserializes a task's `result` or
+`watchers`, so a record with a malformed blob is still recovered rather than hiding every other
+zombie behind it. It reads them `ZOMBIE_SWEEP_BATCH` (500) at a time, keyset-paged on the id, so a
+large crash backlog is worked through in bounded steps rather than loaded whole. Pass
+`batch_size` to `recover_zombie_tasks!` to change that. If a read fails, the sweep logs the error
+and stops for this boot, keeping what it already recovered. If a *write* throws (a connection
+dropped mid-update, say), the sweep logs `"zombie recovery failed mid-sweep"` with its counts and
+rethrows, which fails `start!`: after a failed write, the sweep cannot know whether that
+transition landed.
+Startup carries on either way. A custom store that does not implement `list_running_task_refs`
+still works: the default derives it from `get_all_tasks`, at the cost of a full read of each record.
+
+The sweep logs at `@info` before it starts and again when it finishes. The finishing line is
+emitted **every time**, including when it recovered nothing:
+
+```
+[ Info: Nitro.Workers: scanning for zombie tasks
+│   zombie_min_age = nothing
+└   batch_size = 500
+[ Info: Nitro.Workers: zombie recovery complete
+│   candidates = 3
+│   recovered = 2
+│   spared_live = 1
+│   too_recent = 0
+└   lost_race = 0
+```
+
+The sweep runs after the startup banner and before the first request is served. If a boot
+announces itself and then goes quiet, look for these two lines. A "scanning" line with no
+"complete" line means the sweep is still working, or is stuck. Only counts are logged, never a
+task's `result` or `error`. `lost_race` counts records that another writer finished, cancelled or
+re-ran between the sweep's read and its write. The sweep leaves those alone.
+
+!!! warning "Several processes sharing one store: set `zombie_min_age`"
+    "No live handle" is a fact about *this* process only. A node that boots while another node's
+    task is genuinely mid-run sees that task as a zombie and marks it `FAILED`. Bound the sweep to
+    claims too old to belong to any live run:
+
+    ```julia
+    worker_startup(queues = ["reports"], store = persistent_store,
+                   zombie_min_age = Hour(2))   # longer than any task legitimately runs
+    ```
+
+    Records claimed more recently are left `RUNNING` for a later boot's sweep. A record with no
+    `started_at` is always adjudicated. The default, `nothing`, bounds nothing, which suits a
+    single process: its crashed tasks are recovered on the very next start. With a bound, a crash
+    followed by a quick restart leaves those tasks `RUNNING` until a boot that comes after the
+    window, because the sweep runs only at startup.
 
 ## When Not To Use Workers
 

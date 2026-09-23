@@ -210,9 +210,14 @@ function get_task_info(runtime::WorkerRuntime, task_id::String)
 end
 
 """
-    get_all_tasks(runtime::WorkerRuntime, authority::TaskAuthority; status, queue_name) -> Vector{TaskInfo}
+    get_all_tasks(runtime::WorkerRuntime, authority::TaskAuthority;
+                  status, queue_name, after=nothing, limit=nothing) -> Vector{TaskInfo}
 
 The store's listing with live progress overlaid onto whichever rows are running here.
+
+`after` / `limit` page it by keyset on the id; see *Paging* on [`AbstractWorkerStore`](@ref).
+They reach the store only when one of them is set, so an unpaged call still works against a
+backend written before they existed.
 
 Was `PormGWorkerStore`-only; every serializing backend now inherits it. The filtering and the
 authorization gate stay in the store — the overlay writes only volatile fields (`status`,
@@ -233,8 +238,14 @@ call just deserialized, owned by nobody else.
 """
 function get_all_tasks(runtime::WorkerRuntime, authority::TaskAuthority;
                        status::Union{Nothing, TaskStatus}=nothing,
-                       queue_name::Union{Nothing, String}=nothing)
-    tasks = get_all_tasks(runtime.store, authority; status, queue_name)
+                       queue_name::Union{Nothing, String}=nothing,
+                       after::Union{Nothing, String}=nothing,
+                       limit::Union{Nothing, Int}=nothing)
+    tasks = if _check_page(after, limit)
+        get_all_tasks(runtime.store, authority; status, queue_name, after, limit)
+    else
+        get_all_tasks(runtime.store, authority; status, queue_name)
+    end
 
     live = lock(runtime.active_lock) do
         isempty(runtime.active_task_infos) ? nothing : copy(runtime.active_task_infos)

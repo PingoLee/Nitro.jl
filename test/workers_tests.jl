@@ -3405,6 +3405,233 @@ end
     end
 end
 
+@testset "the recovery scan is an optional store method with a working default (#236)" begin
+    started = DateTime(2026, 1, 2, 3, 4, 5)
+    seed_rows!(store_rows) = begin
+        running = TaskInfo("scan-running"); running.status = RUNNING; running.started_at = started
+        pending = TaskInfo("scan-pending")
+        done = TaskInfo("scan-done"); done.status = COMPLETED
+        for t in (running, pending, done)
+            store_rows[t.id] = t
+        end
+        running
+    end
+
+    # The in-memory backend implements it, and reports only RUNNING records, with the run id
+    # the fenced transition is addressed to and the start time.
+    mem = InMemoryWorkerStore()
+    running = lock(() -> seed_rows!(mem.task_registry), mem.task_lock)
+    @test Nitro.Core.Errors.implements_contract_method(list_running_task_refs, InMemoryWorkerStore, AbstractWorkerStore, 1)
+    @test list_running_task_refs(mem) == [RunningTaskRef((running.id, running.run_id, started))]
+
+    # A backend that never heard of it still conforms, and still recovers: the default reads the
+    # listing. Adding it as a REQUIRED row would have broken every third-party store for a method
+    # whose whole purpose is an optimization.
+    legacy = DataOnlyStore()
+    legacy_running = seed_rows!(legacy.rows)
+    @test isempty(missing_store_methods(DataOnlyStore))
+    @test !(:list_running_task_refs in [nameof(f) for (f, _) in Nitro.Workers.WORKER_STORE_INTERFACE])
+    @test !Nitro.Core.Errors.implements_contract_method(list_running_task_refs, DataOnlyStore, AbstractWorkerStore, 1)
+    @test list_running_task_refs(legacy) == [RunningTaskRef((legacy_running.id, legacy_running.run_id, started))]
+    @test recover_zombie_tasks!(; runtime=WorkerRuntime(legacy)) == 1
+    @test legacy.rows["scan-running"].status == FAILED
+end
+
+@testset "listings and the recovery scan page by keyset on the id (#237)" begin
+    store = InMemoryWorkerStore()
+    rt = WorkerRuntime(store)
+    owner = Owner("alice")
+    try
+        lock(store.task_lock) do
+            # Inserted out of order, so a page that came back in Dict order would show it.
+            for (id, watchers, status) in (("alice::3", ["alice"], RUNNING), ("a-global", ["alice"], PENDING),
+                                           ("bob::1", ["bob"], RUNNING), ("alice::1", String[], RUNNING),
+                                           ("alice~w", ["carol", "alice"], RUNNING), ("alice::2", ["alice"], RUNNING))
+                t = TaskInfo(id)
+                append!(t.watchers, watchers)
+                t.status = status
+                store.task_registry[id] = t
+            end
+        end
+        expected = ["a-global", "alice::1", "alice::2", "alice::3", "alice~w"]
+
+        walk(fetch, limit) = begin
+            ids, after = String[], nothing
+            while true
+                page = fetch(after, limit)
+                @test length(page) <= limit
+                append!(ids, page)
+                length(page) < limit && return ids
+                after = last(page)
+            end
+        end
+
+        for limit in (1, 2, 5)
+            # The store, the runtime, and the public Dict API page identically. Paging is applied
+            # after the authority gate, so bob's task never takes a slot in a page.
+            @test walk((a, n) -> [t.id for t in get_all_tasks(store, owner; after=a, limit=n)], limit) == expected
+            @test walk((a, n) -> [t.id for t in get_all_tasks(rt, owner; after=a, limit=n)], limit) == expected
+            @test walk((a, n) -> [t[:id] for t in get_all_tasks(owner; runtime=rt, after=a, limit=n)], limit) == expected
+        end
+        # Unpaged keeps its contract: everything, sorted by created_at rather than by id.
+        @test sort([t[:id] for t in get_all_tasks(owner; runtime=rt)]) == expected
+        @test_throws ArgumentError get_all_tasks(owner; runtime=rt, limit=0)
+
+        # The scan pages the same way, over RUNNING only and with no authority.
+        @test walk((a, n) -> [r.id for r in list_running_task_refs(store; after=a, limit=n)], 2) ==
+              ["alice::1", "alice::2", "alice::3", "alice~w", "bob::1"]
+
+        # Recovery walks the backlog one record at a time and still reaches all of it.
+        @test recover_zombie_tasks!(; runtime=rt, batch_size=1) == 5
+        @test isempty(list_running_task_refs(store))
+        @test_throws ArgumentError recover_zombie_tasks!(; runtime=rt, batch_size=0)
+    finally
+        reset_runtime!(rt)
+    end
+
+    # A store written before paging existed keeps every UNPAGED call: the runtime only forwards
+    # the keywords when one is set. Recovery over it pages through the default scan, which hands
+    # back the whole remainder in one page, and still reaches every row.
+    legacy = DataOnlyStore()
+    for i in 1:3
+        t = TaskInfo("legacy::$i"); t.status = RUNNING
+        legacy.rows[t.id] = t
+    end
+    rt_legacy = WorkerRuntime(legacy)
+    @test length(get_all_tasks(rt_legacy, System())) == 3
+    @test_throws MethodError get_all_tasks(rt_legacy, System(); limit=1)
+    @test recover_zombie_tasks!(; runtime=rt_legacy, batch_size=1) == 3
+
+    # The default scan's FIRST page is id-ordered too, not the store's Dict order: the sweep's
+    # cursor is that page's last id, so an unsorted page makes the cursor arbitrary, and the next
+    # page re-reads rows already adjudicated and still RUNNING, counting them twice. Twenty ids,
+    # so a Dict order cannot pass by luck.
+    many = DataOnlyStore()
+    ids = ["many::$(lpad(i, 2, '0'))" for i in 1:20]
+    for id in ids
+        t = TaskInfo(id); t.status = RUNNING
+        many.rows[id] = t
+    end
+    @test [r.id for r in list_running_task_refs(many; limit=1)] == ids
+end
+
+@testset "the zombie sweep always says it ran, and what it did (#238)" begin
+    record(logs, msg) = filter(r -> r.message == msg, logs)
+    SCAN = "Nitro.Workers: scanning for zombie tasks"
+    DONE = "Nitro.Workers: zombie recovery complete"
+
+    # Nothing to recover is exactly the case that used to be silent, and so exactly the one a
+    # hung boot could not be told apart from.
+    logs, n = Test.collect_test_logs() do
+        recover_zombie_tasks!(; runtime=WorkerRuntime(InMemoryWorkerStore()))
+    end
+    @test n == 0
+    @test length(record(logs, SCAN)) == 1
+    done = only(record(logs, DONE))
+    @test done.level == Base.CoreLogging.Info
+    @test done.kwargs[:recovered] == 0
+    @test done.kwargs[:candidates] == 0
+    @test findfirst(r -> r.message == SCAN, logs) < findfirst(r -> r.message == DONE, logs)
+
+    # Every counter, and no task payload. The sentinel sits in exactly the two fields the issue
+    # names, `result` and `error`, on a record the sweep reads and transitions.
+    sentinel = "zombie-secret-7c1e"
+    store = InMemoryWorkerStore()
+    rt = WorkerRuntime(store)
+    live = @async sleep(0.05)
+    try
+        lock(store.task_lock) do
+            for (id, started) in (("log::zombie", nothing), ("log::zombie2", nothing),
+                                  ("log::live", nothing), ("log::young", Dates.now(Dates.UTC)))
+                t = TaskInfo(id)
+                t.status = RUNNING
+                t.started_at = started
+                t.result = Dict("token" => sentinel)
+                t.error = "partial: $sentinel"
+                store.task_registry[id] = t
+            end
+        end
+        Nitro.Workers.register_active_task!(rt, "log::live", live)
+
+        logs, n = Test.collect_test_logs() do
+            recover_zombie_tasks!(; runtime=rt, zombie_min_age=Dates.Hour(1), batch_size=3)
+        end
+        @test n == 2
+        done = only(record(logs, DONE))
+        @test done.kwargs[:candidates] == 4
+        @test done.kwargs[:recovered] == 2
+        @test done.kwargs[:spared_live] == 1
+        @test done.kwargs[:too_recent] == 1
+        @test done.kwargs[:lost_race] == 0
+        @test !any(r -> occursin(sentinel, string(r.message, " ", r.kwargs)), logs)
+    finally
+        wait(live)
+        reset_runtime!(rt)
+    end
+end
+
+@testset "a retention tick that retired rows says so (#238)" begin
+    store = InMemoryWorkerStore()
+    lock(store.task_lock) do
+        expired = TaskInfo("retire-me")
+        expired.status = COMPLETED
+        expired.completed_at = Dates.now(Dates.UTC) - Dates.Day(10)
+        store.task_registry[expired.id] = expired
+    end
+    rt = WorkerRuntime(store)
+    sink = Test.TestLogger()
+    try
+        # Started under the sink, so the spawned scheduler inherits it. `TestLogger` takes no lock,
+        # so its log vector is read only once the scheduler has STOPPED: reading it while the
+        # scheduler task may still push is a data race at two threads. The line is written in the
+        # same tick as the delete, and `stop_cleanup_scheduler!` joins the task, so both are done
+        # by the time it returns.
+        Base.CoreLogging.with_logger(() -> start_cleanup_scheduler(; interval_hours=0.00005, retain_days=7, runtime=rt), sink)
+        @test wait_for(() -> get_task_info(store, "retire-me") === nothing) == :ok
+        stop_cleanup_scheduler!(rt)
+        done(r) = r.message == "Nitro.Workers: task retention sweep complete" && r.level == Base.CoreLogging.Info
+        line = only(filter(done, sink.logs))
+        @test line.kwargs[:deleted] == 1
+        @test line.kwargs[:retain_days] == 7
+    finally
+        reset_runtime!(rt)
+    end
+end
+
+@testset "a write that throws mid-sweep is logged with the tally, then rethrown (#238)" begin
+    # Delegates everything to an in-memory store except the transition, which throws -- the shape
+    # of a connection dropped on the UPDATE.
+    struct ThrowingTransitionStore <: AbstractWorkerStore
+        inner::InMemoryWorkerStore
+    end
+    Nitro.Workers.lock_tasks(f::Function, s::ThrowingTransitionStore) = Nitro.Workers.lock_tasks(f, s.inner)
+    Nitro.Workers.list_running_task_refs(s::ThrowingTransitionStore; kw...) =
+        Nitro.Workers.list_running_task_refs(s.inner; kw...)
+    Nitro.Workers.try_transition!(::ThrowingTransitionStore, ::String, from, ::TaskStatus; run_id, kw...) =
+        error("simulated connection drop on the transition")
+
+    inner = InMemoryWorkerStore()
+    lock(inner.task_lock) do
+        t = TaskInfo("throws::1"); t.status = RUNNING
+        inner.task_registry[t.id] = t
+    end
+    rt = WorkerRuntime(ThrowingTransitionStore(inner))
+    logs, threw = Test.collect_test_logs() do
+        try
+            recover_zombie_tasks!(; runtime=rt)
+            false
+        catch e
+            occursin("simulated connection drop", sprint(showerror, e))
+        end
+    end
+    @test threw
+    failed = only(filter(r -> r.message == "Nitro.Workers: zombie recovery failed mid-sweep", logs))
+    @test failed.level == Base.CoreLogging.Error
+    @test failed.kwargs[:candidates] == 1
+    @test failed.kwargs[:recovered] == 0
+    @test isempty(filter(r -> r.message == "Nitro.Workers: zombie recovery complete", logs))
+end
+
 @testset "cancel_task is atomic: completed task result is never overwritten" begin
     store = InMemoryWorkerStore()
     rt_store = WorkerRuntime(store)

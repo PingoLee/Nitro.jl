@@ -4,6 +4,7 @@ using Test
 using Dates
 using JSON
 using UUIDs
+using TimeZones: ZonedDateTime, FixedTimeZone
 using Nitro
 using Nitro.Workers
 using Nitro.Errors: AuthorizationError
@@ -47,7 +48,7 @@ const PORMG_OPERATOR_NAMES = Set([
 # actually exercising, and must say so. These are exactly the keys `ext/NitroPormGExt.jl`
 # builds -- adding one here without the matching branch below is how the guard rots.
 const MODELLED_FILTER_KEYS = Set([
-    "id", "run_id", "status", "status__@in", "queue_name",
+    "id", "id__@gt", "run_id", "status", "status__@in", "queue_name",
     "completed_at__@lte", "completed_at__@isnull",
     "watchers", "id__@startswith", "watchers__@contains",
 ])
@@ -115,6 +116,40 @@ mutable struct MockTaskQuerySet
     # Per-queryset, and deliberately NOT under the lock: `model.objects` mints a fresh queryset
     # on every access, so an accumulating chain is confined to the task that built it.
     filters::Dict{String, Any}
+    # `.values(cols...)`, or `nothing` for every column. Like PormG's `_values!`, the last call
+    # wins. A projected read hands back ONLY these keys, which is what makes "the recovery scan
+    # never parses `result`" observable: a row whose blob is not JSON is harmless to it (#236).
+    projection::Union{Nothing, Vector{String}}
+    # `.order_by("id")` and `.limit(n)`: the keyset page shape (#237). Applied by the READ ops
+    # only. PormG refuses a `delete()` carrying either, and so does this mock.
+    order::Union{Nothing, String}
+    limit::Union{Nothing, Int}
+end
+
+MockTaskQuerySet(mdb::MockDB, db_key, filters::Dict{String, Any}) =
+    MockTaskQuerySet(mdb, db_key, filters, nothing, nothing, nothing)
+
+# The key a `Qor(...)` is recorded under in `filters`: a vector of reconstructed pairs, ANY of
+# which may match. One per query -- that is all the ext builds.
+const MOCK_OR_KEY = "__or__"
+
+# Read a `PormG.Qor` back into the `"col__@op" => value` pairs it was built from.
+#
+# This couples the mock to three fields of PormG's `OperObject` (`operator`, `values`,
+# `column.field`), the same three its own SQL builder reads. That is the price of a paged Owner
+# listing being ONE `Qor` query rather than two legs, and the ext says why that shape is required
+# (collation; see "Keyset paging" in `ext/NitroPormGExt.jl`). An unfamiliar member fails loudly
+# rather than matching nothing.
+function _mock_or_pairs(q)
+    pairs = Pair{String, Any}[]
+    for o in getfield(q, :or)
+        (hasproperty(o, :operator) && hasproperty(o, :values) && hasproperty(o, :column) &&
+         hasproperty(o.column, :field)) ||
+            error("MockTaskQuerySet: unmodelled Qor member $(typeof(o)) -- teach the mock about it.")
+        op = o.operator
+        push!(pairs, (op == "=" ? String(o.column.field) : "$(o.column.field)__@$(op)") => o.values)
+    end
+    return pairs
 end
 
 _mock_lock(qs::MockTaskQuerySet) = getfield(qs, :mdb).lock
@@ -148,8 +183,14 @@ function _filtered_rows_locked(qs::MockTaskQuerySet)
     # an empty table, and an empty table is precisely the state a retention sweep runs against
     # once it has worked. It also let an earlier non-matching key `break` out before an
     # unmodelled one was ever reached.
-    for k in keys(filters)
-        k in MODELLED_FILTER_KEYS || _reject_filter_key(k)
+    for (k, v) in filters
+        if k == MOCK_OR_KEY
+            for (inner, _) in v
+                inner in MODELLED_FILTER_KEYS || _reject_filter_key(inner)
+            end
+        else
+            k in MODELLED_FILTER_KEYS || _reject_filter_key(k)
+        end
     end
 
     # Recorded AFTER validation, so `_filters_seen` holds only filters a query could actually
@@ -166,44 +207,66 @@ function _filtered_rows_locked(qs::MockTaskQuerySet)
     for row in values(table)
         matches = true
         for (k, v) in filters
-            if k == "id"
-                matches = row["id"] == v
-            elseif k == "run_id"
-                # The run half of try_transition!'s compare — see #108. Without this branch
-                # the mock would `error` on every fenced transition.
-                matches = row["run_id"] == v
-            elseif k == "status"
-                matches = row["status"] == v
-            elseif k == "status__@in"
-                matches = row["status"] in v
-            elseif k == "queue_name"
-                matches = row["queue_name"] == v
-            elseif k == "completed_at__@lte"
-                matches = row["completed_at"] !== nothing && row["completed_at"] <= v
-            elseif k == "completed_at__@isnull"
-                matches = (row["completed_at"] === nothing) == v
-            elseif k == "watchers"
-                # Exact match on the serialized document — the compare half of
-                # add_watcher!'s CAS. Without this branch the filter fell through and
-                # matched on `id` alone, so the CAS always appeared to win.
-                matches = row["watchers"] == v
-            elseif k == "id__@startswith"
-                matches = startswith(row["id"], v)
-            elseif k == "watchers__@contains"
-                # Substring match on the serialized JSON, like the real backend.
-                matches = occursin(v, row["watchers"])
-            else
-                # Unreachable: the loop above rejected every key not in
-                # `MODELLED_FILTER_KEYS`. Kept as the belt to that braces, so adding a key to
-                # the constant without a branch here fails loudly instead of leaving `matches`
-                # at whatever the previous key set.
-                _reject_filter_key(k)
-            end
+            matches = k == MOCK_OR_KEY ? any(((ik, iv),) -> _mock_matches(row, ik, iv), v) :
+                                         _mock_matches(row, k, v)
             matches || break
         end
         matches && push!(rows, row)
     end
 
+    return rows
+end
+
+# One filter term against one row. Shared by the ANDed terms and by each `Qor` member, so the two
+# cannot evaluate the same key differently.
+function _mock_matches(row::Dict{String, Any}, k::String, v)
+    if k == "id"
+        return row["id"] == v
+    elseif k == "id__@gt"
+        # The keyset cursor (#237). Julia's codepoint order is SQLite's default BINARY collation;
+        # the ext never compares ids in Julia, so a collation that differs would not change what
+        # this models.
+        return row["id"] > v
+    elseif k == "run_id"
+        # The run half of try_transition!'s compare — see #108. Without this branch
+        # the mock would `error` on every fenced transition.
+        return row["run_id"] == v
+    elseif k == "status"
+        return row["status"] == v
+    elseif k == "status__@in"
+        return row["status"] in v
+    elseif k == "queue_name"
+        return row["queue_name"] == v
+    elseif k == "completed_at__@lte"
+        return row["completed_at"] !== nothing && row["completed_at"] <= v
+    elseif k == "completed_at__@isnull"
+        return (row["completed_at"] === nothing) == v
+    elseif k == "watchers"
+        # Exact match on the serialized document — the compare half of
+        # add_watcher!'s CAS. Without this branch the filter fell through and
+        # matched on `id` alone, so the CAS always appeared to win.
+        return row["watchers"] == v
+    elseif k == "id__@startswith"
+        return startswith(row["id"], v)
+    elseif k == "watchers__@contains"
+        # Substring match on the serialized JSON, like the real backend.
+        return occursin(v, row["watchers"])
+    end
+    # Unreachable: `_filtered_rows_locked` rejected every key not in `MODELLED_FILTER_KEYS`
+    # before reaching here. Kept as the belt to that braces, so adding a key to the constant
+    # without a branch here fails loudly.
+    _reject_filter_key(k)
+end
+
+# `ORDER BY` then `LIMIT`, for the read ops. Sorting a fresh vector of live rows, never the table.
+function _ordered_limited!(qs::MockTaskQuerySet, rows::Vector{Dict{String, Any}})
+    order = getfield(qs, :order)
+    if order !== nothing
+        order == "id" || error("MockTaskQuerySet: unmodelled order_by '$order' -- teach the mock about it.")
+        sort!(rows; by = r -> r["id"])
+    end
+    lim = getfield(qs, :limit)
+    lim === nothing || length(rows) <= lim || resize!(rows, lim)
     return rows
 end
 
@@ -216,9 +279,27 @@ end
 # string, not a vector. Put a mutable value in a column and this quietly becomes an alias again.
 _snapshot(row::Dict{String, Any}) = copy(row)
 
+function _snapshot(qs::MockTaskQuerySet, row::Dict{String, Any})
+    cols = getfield(qs, :projection)
+    cols === nothing && return _snapshot(row)
+    return Dict{String, Any}(c => row[c] for c in cols)
+end
+
 function Base.getproperty(qs::MockTaskQuerySet, name::Symbol)
     if name === :filter
-        return function(pairs::Pair{String,<:Any}...)
+        return function(args...)
+            pairs = Pair{String, Any}[]
+            for a in args
+                if a isa Pair{String}
+                    push!(pairs, a)
+                elseif a isa PormG.SQLTypeQor
+                    haskey(getfield(qs, :filters), MOCK_OR_KEY) &&
+                        error("MockTaskQuerySet: only one Qor per query is modelled.")
+                    push!(pairs, MOCK_OR_KEY => _mock_or_pairs(a))
+                else
+                    error("MockTaskQuerySet: unmodelled filter argument $(typeof(a)).")
+                end
+            end
             # ACCUMULATE onto this object and return it, exactly as PormG's `_filter!`
             # does (`push!(q.filter, …)`; see its "Calls ACCUMULATE (ANDed)" note).
             #
@@ -243,17 +324,33 @@ function Base.getproperty(qs::MockTaskQuerySet, name::Symbol)
             setfield!(qs, :db_key, db_key)
             return qs
         end
+    elseif name === :values
+        return function(cols::String...)
+            # Mutate-and-return-self, like `filter` and `db`.
+            setfield!(qs, :projection, collect(String, cols))
+            return qs
+        end
+    elseif name === :order_by
+        return function(col::String)
+            setfield!(qs, :order, col)          # last call wins, as in PormG
+            return qs
+        end
+    elseif name === :limit
+        return function(n::Int)
+            setfield!(qs, :limit, n)
+            return qs
+        end
     elseif name === :list
         return function()
             return lock(_mock_lock(qs)) do
-                Dict{String,Any}[_snapshot(r) for r in _filtered_rows_locked(qs)]
+                Dict{String,Any}[_snapshot(qs, r) for r in _ordered_limited!(qs, _filtered_rows_locked(qs))]
             end
         end
     elseif name === :first
         return function()
             return lock(_mock_lock(qs)) do
-                rows = _filtered_rows_locked(qs)
-                isempty(rows) ? nothing : _snapshot(first(rows))
+                rows = _ordered_limited!(qs, _filtered_rows_locked(qs))
+                isempty(rows) ? nothing : _snapshot(qs, first(rows))
             end
         end
     elseif name === :create
@@ -307,6 +404,9 @@ function Base.getproperty(qs::MockTaskQuerySet, name::Symbol)
             (!allow_delete_all && isempty(getfield(qs, :filters))) &&
                 error("MockTaskQuerySet: delete() must have a filter -- pass " *
                       "allow_delete_all = true to delete every row, as PormG requires.")
+            # PormG's `UnsafeMutationError`: a paged delete is refused, not silently widened.
+            (getfield(qs, :order) !== nothing || getfield(qs, :limit) !== nothing) &&
+                error("MockTaskQuerySet: delete() refuses order_by/limit, as PormG does.")
             return lock(_mock_lock(qs)) do
                 table = _selected_table(qs)
                 count = 0
@@ -415,8 +515,10 @@ function Base.getproperty(qs::FlakyReadQuerySet, name::Symbol)
 
     if name === :db
         return (key::String) -> FlakyReadQuerySet(inner.db(key), fail_next, fail_ids)
-    elseif name === :filter
-        return (pairs::Pair{String,<:Any}...) -> FlakyReadQuerySet(inner.filter(pairs...), fail_next, fail_ids)
+    elseif name in (:filter, :values, :order_by, :limit)
+        # Every chaining builder is re-wrapped. Falling through to `inner` would hand back the bare
+        # queryset, and the `.list()` after a projection or a page would bypass the guard.
+        return (args...) -> FlakyReadQuerySet(getproperty(inner, name)(args...), fail_next, fail_ids)
     elseif name === :first
         return function()
             _flaky_guard(qs)
@@ -490,8 +592,7 @@ function Base.getproperty(qs::RacingWatcherQuerySet, name::Symbol)
     if name === :db
         return (key::String) -> RacingWatcherQuerySet(inner.db(key), inject_next, intruder)
     elseif name === :filter
-        return (pairs::Pair{String,<:Any}...) ->
-            RacingWatcherQuerySet(inner.filter(pairs...), inject_next, intruder)
+        return (args...) -> RacingWatcherQuerySet(inner.filter(args...), inject_next, intruder)
     elseif name === :update
         return function(pairs::Pair{String,<:Any}...)
             # Only a watchers CAS is worth racing, and only once.
@@ -1002,6 +1103,255 @@ else
             persisted = get_task_info(store_z, "alice::job")
             @test persisted.status == COMPLETED
             @test persisted.result == "real-result"
+        end
+
+        @testset "zombie recovery reads a projection, so a malformed blob cannot blind it (#236)" begin
+            m = MockTaskModel()
+            store_b = RealPormGWorkerStore(model=m)
+            rt_b = WorkerRuntime(store_b)
+
+            for id in ("alice::good", "alice::bad")
+                t = TaskInfo(id)
+                push!(t.watchers, "alice")
+                t.status = RUNNING
+                replace_task!(store_b, id, t)
+            end
+            bad_run = get_task_info(store_b, "alice::bad").run_id
+            # Corrupt both blobs the full deserializer parses, behind the store's back -- the
+            # way an app-side write or a hand edit would leave them. Direct table access is safe
+            # here: nothing is in flight.
+            m._table["alice::bad"]["result"] = "{not json"
+            m._table["alice::bad"]["watchers"] = "also not json"
+
+            # The premise, pinned. The listing parses every row, and swallows the one that fails
+            # into an EMPTY result, so a sweep built on it saw no candidates at all -- the good
+            # zombie stranded alongside the bad one.
+            @test isempty(@test_logs (:warn, r"failed to list tasks") match_mode=:any get_all_tasks(store_b, System(); status=RUNNING))
+
+            refs = list_running_task_refs(store_b)
+            @test refs isa Vector{RunningTaskRef}
+            @test sort([r.id for r in refs]) == ["alice::bad", "alice::good"]
+            @test only(filter(r -> r.id == "alice::bad", refs)).run_id == bad_run
+
+            @test recover_zombie_tasks!(; runtime=rt_b) == 2
+            @test m._table["alice::good"]["status"] == "FAILED"
+            @test m._table["alice::bad"]["status"] == "FAILED"
+        end
+
+        @testset "a RUNNING row whose run_id does not parse is skipped, not guessed at (#236)" begin
+            m = MockTaskModel()
+            store_u = RealPormGWorkerStore(model=m)
+            t = TaskInfo("alice::unfenceable")
+            t.status = RUNNING
+            replace_task!(store_u, t.id, t)
+            m._table[t.id]["run_id"] = "not-a-uuid"
+
+            refs = @test_logs (:warn, r"run_id does not parse") list_running_task_refs(store_u)
+            @test isempty(refs)
+
+            # An unreadable start time is not a reason to skip -- the row can still be fenced --
+            # and certainly not a reason to fail the scan, which would stop the sweep there on
+            # every boot. It reads as unstamped.
+            t2 = TaskInfo("alice::garbled-start")
+            t2.status = RUNNING
+            replace_task!(store_u, t2.id, t2)
+            m._table[t2.id]["started_at"] = "not a timestamp"
+            refs = @test_logs (:warn, r"run_id does not parse") (:warn, r"started_at does not parse") match_mode=:any list_running_task_refs(store_u)
+            @test only(refs).id == t2.id
+            @test only(refs).started_at === nothing
+        end
+
+        @testset "a failed recovery read is logged and costs the sweep, not the boot (#236)" begin
+            flaky = FlakyReadModel()
+            store_f = RealPormGWorkerStore(model=flaky)
+            rt_f = WorkerRuntime(store_f)
+            t = TaskInfo("alice::stranded")
+            t.status = RUNNING
+            replace_task!(store_f, t.id, t)
+
+            flaky.fail_next[] = 1
+            # The listing used to swallow this into "no candidates", indistinguishable from a
+            # clean sweep. It now surfaces as an @error, and startup still carries on.
+            recovered = @test_logs (:warn, r"failed to list running tasks") (:error, r"zombie recovery could not read") match_mode=:any recover_zombie_tasks!(; runtime=rt_f)
+            @test recovered == 0
+            @test flaky._table[t.id]["status"] == "RUNNING"
+
+            # The failure was transient, so the next sweep recovers it.
+            @test recover_zombie_tasks!(; runtime=rt_f) == 1
+        end
+
+        # Walk a paged listing to the end, the way the public docstring tells an app to.
+        function _walk_pages(fetch::Function, limit::Int)
+            ids, pages, after = String[], Vector{String}[], nothing
+            while true
+                page = [t.id for t in fetch(after, limit)]
+                push!(pages, page)
+                append!(ids, page)
+                (isempty(page) || length(page) < limit) && return ids, pages
+                after = last(page)
+            end
+        end
+
+        @testset "a paged Owner listing is the complete union, in id order (#237)" begin
+            m = MockTaskModel()
+            store_o = RealPormGWorkerStore(model=m)
+            # Interleaved by id so that owned-only, watched-only and both-legs rows alternate:
+            # '-' < ':' < '~' in codepoint order. A per-leg LIMIT merged in Julia is the shape
+            # #237 warned about, and it drops rows exactly when the two legs interleave like this.
+            rows = [
+                ("a-global",  String["alice"]),          # watched only (a :global key)
+                ("alice::1",  String["alice"]),          # both legs
+                ("alice::2",  String[]),                 # owned only (grant list lost)
+                ("alice~w",   String["carol", "alice"]), # watched only
+                # FETCHED but not authorized: its one watcher serializes to `["x\",\"alice"]`,
+                # which contains `"alice"`, so the SQL superset matches and the gate drops it.
+                # A page it lands on must be topped up from past the cursor, not returned short --
+                # a short page reads as the end, and would hide everything after it.
+                ("b-decoy",   String["x\",\"alice"]),
+                ("bob::1",    String["bob"]),            # neither: must never appear
+                ("c-global",  String["alice"]),          # watched only
+            ]
+            for (id, watchers) in rows
+                t = TaskInfo(id)
+                append!(t.watchers, watchers)
+                replace_task!(store_o, id, t)
+            end
+            expected = ["a-global", "alice::1", "alice::2", "alice~w", "c-global"]
+
+            unpaged = [t.id for t in get_all_tasks(store_o, Owner("alice"))]
+            @test sort(unpaged) == expected
+
+            for limit in (1, 2, 3, 10)
+                ids, pages = _walk_pages((after, n) -> get_all_tasks(store_o, Owner("alice"); after, limit=n), limit)
+                @test ids == expected
+                @test all(p -> length(p) <= limit, pages)
+            end
+
+            # ONE query per page, carrying the union as a Qor and the cursor as `id > after`, not
+            # the unpaged path's two legs.
+            empty!(m._filters_seen)
+            get_all_tasks(store_o, Owner("alice"); after="alice::1", limit=2)
+            @test length(m._filters_seen) == 1
+            @test haskey(only(m._filters_seen), MOCK_OR_KEY)
+            @test only(m._filters_seen)["id__@gt"] == "alice::1"
+        end
+
+        @testset "a paged System listing round-trips with its filters (#237)" begin
+            store_s = RealPormGWorkerStore(model=MockTaskModel())
+            for i in 1:7
+                t = TaskInfo("sys::$i")
+                t.status = isodd(i) ? RUNNING : PENDING
+                replace_task!(store_s, t.id, t)
+            end
+            ids, _ = _walk_pages((after, n) -> get_all_tasks(store_s, System(); status=RUNNING, after, limit=n), 2)
+            @test ids == ["sys::1", "sys::3", "sys::5", "sys::7"]
+            @test_throws ArgumentError get_all_tasks(store_s, System(); limit=0)
+        end
+
+        @testset "a page the recovery scan skips a row from is topped up, not cut short (#237)" begin
+            m = MockTaskModel()
+            store_k = RealPormGWorkerStore(model=m)
+            for i in 1:4
+                t = TaskInfo("k::$i")
+                t.status = RUNNING
+                replace_task!(store_k, t.id, t)
+            end
+            m._table["k::2"]["run_id"] = "not-a-uuid"
+
+            # A short page means "nothing left", so the skipped row has to be made up from past
+            # the cursor. Otherwise the sweep would stop at k::3 and strand k::4.
+            page = @test_logs (:warn, r"run_id does not parse") list_running_task_refs(store_k; limit=2)
+            @test [r.id for r in page] == ["k::1", "k::3"]
+            rest = list_running_task_refs(store_k; after="k::3", limit=2)
+            @test [r.id for r in rest] == ["k::4"]
+        end
+
+        @testset "recovery walks the backlog in batches and spares a live run (#237)" begin
+            m = MockTaskModel()
+            store_r = RealPormGWorkerStore(model=m)
+            rt_r = WorkerRuntime(store_r)
+            for i in 1:5
+                t = TaskInfo("z::$i")
+                t.status = RUNNING
+                replace_task!(store_r, t.id, t)
+            end
+            live = @async sleep(0.05)
+            Nitro.Workers.register_active_task!(rt_r, "z::3", live)
+            try
+                empty!(m._filters_seen)
+                @test recover_zombie_tasks!(; runtime=rt_r, batch_size=2) == 4
+                @test m._table["z::3"]["status"] == "RUNNING"
+                @test all(m._table["z::$i"]["status"] == "FAILED" for i in (1, 2, 4, 5))
+                # Paged: the scan ran more than once, and every read after the first carried a cursor.
+                scans = filter(f -> Base.get(f, "status", nothing) == "RUNNING", m._filters_seen)
+                @test length(scans) == 3
+                @test !haskey(first(scans), "id__@gt")
+                @test all(haskey(f, "id__@gt") for f in scans[2:end])
+            finally
+                wait(live)
+                reset_runtime!(rt_r)
+            end
+        end
+
+        @testset "zombie_min_age adjudicates only claims old enough to be dead (#239)" begin
+            for (label, backend) in (("in-memory", InMemoryWorkerStore()),
+                                     ("pormg", RealPormGWorkerStore(model=MockTaskModel())))
+                @testset "$label" begin
+                    now_utc = Dates.now(Dates.UTC)
+                    for (id, started) in (("age::old", now_utc - Hour(3)),
+                                          ("age::young", now_utc - Minute(1)),
+                                          ("age::unstamped", nothing))
+                        t = TaskInfo(id)
+                        t.status = RUNNING
+                        t.started_at = started
+                        replace_task!(backend, id, t)
+                    end
+                    status_of(id) = get_task_info(backend, id).status
+
+                    # Through `start!`, so the keyword is plumbed and not merely accepted. Only
+                    # the old claim, and the one nothing shows is recent, are adjudicated: a node
+                    # booting beside a peer's hour-long run no longer declares it dead.
+                    app = Nitro.Core.App()
+                    rt = start!(app; store=backend, zombie_min_age=Hour(1), cleanup_enabled=false)
+                    try
+                        @test status_of("age::old") == FAILED
+                        @test status_of("age::unstamped") == FAILED
+                        @test status_of("age::young") == RUNNING
+
+                        # The default bounds nothing, exactly as before #239.
+                        @test recover_zombie_tasks!(; runtime=rt) == 1
+                        @test status_of("age::young") == FAILED
+                    finally
+                        reset_runtime!(rt)
+                    end
+                end
+            end
+
+            # A claim's age is only as honest as the timestamp it is read from. PostgreSQL hands
+            # back a `ZonedDateTime` in the SESSION's zone, and the parser used to copy its
+            # wall-clock fields and drop the offset -- so under `PGTZ=America/Sao_Paulo` every
+            # `started_at` read three hours OLDER than it was, and a peer's minute-old claim cleared
+            # a two-hour bound. Exactly the false positive `zombie_min_age` exists to prevent.
+            brt = FixedTimeZone("BRT", -3 * 3600)
+            parse_db = getproperty(PormGExt, :_parse_db_datetime)
+            @test parse_db(ZonedDateTime(DateTime(2026, 1, 1, 13, 0, 0), brt; from_utc=true)) ==
+                  DateTime(2026, 1, 1, 13, 0, 0)
+
+            m = MockTaskModel()
+            store_tz = RealPormGWorkerStore(model=m)
+            t = TaskInfo("tz::young")
+            t.status = RUNNING
+            replace_task!(store_tz, t.id, t)
+            just_now = Dates.now(Dates.UTC) - Minute(1)
+            m._table[t.id]["started_at"] = ZonedDateTime(just_now, brt; from_utc=true)
+            rt_tz = WorkerRuntime(store_tz)
+            @test recover_zombie_tasks!(; runtime=rt_tz, zombie_min_age=Hour(2)) == 0
+            @test m._table[t.id]["status"] == "RUNNING"
+
+            @test_throws ArgumentError recover_zombie_tasks!(; runtime=WorkerRuntime(InMemoryWorkerStore()),
+                                                              zombie_min_age=Hour(-1))
+            # Refused where the middleware is built, not later from the startup hook.
+            @test_throws ArgumentError Nitro.Workers.startup(Nitro.Core.App(); zombie_min_age=Minute(-5))
         end
 
         @testset "a cross-process grantee still sees live progress (#96)" begin

@@ -134,9 +134,17 @@ store cannot run anything.
 **A new backend implements no teardown method at all.** `shutdown!` is a concrete method on
 `WorkerRuntime`, so there is no fallback to forget — which is what closes
 [#29](https://github.com/PingoLee/Nitro.jl/issues/29) as a *class* rather than an instance. Two
-optional store methods exist, both no-op by default: `clear_records!` (volatile backends only;
-`reset_runtime!` calls it, and the default must stay a no-op so a reset can never delete durable
-rows) and nothing else.
+optional store methods exist, and neither is a `WORKER_STORE_INTERFACE` row, so `missing_store_methods`
+never lists them:
+
+- `clear_records!`: volatile backends only. `reset_runtime!` calls it, and the default must stay a
+  no-op so a reset can never delete durable rows.
+- `list_running_task_refs`: the zombie-recovery scan
+  ([#236](https://github.com/PingoLee/Nitro.jl/issues/236)). The default derives it from
+  `get_all_tasks`, which is correct but deserializes every `RUNNING` record in full. A serializing
+  backend implements it as a projection of `id`, `run_id` and `started_at`. It must **rethrow** a
+  read failure: an empty result means "nothing to recover", so a swallowed error would pass for a
+  clean sweep.
 
 **`get_task_info(store, id)` is the DURABLE read.** A store must not cache live objects. Serving a
 running callback's own object to a reader is `get_task_info(runtime, id)`, and the split is
@@ -198,6 +206,40 @@ conditionally correct: a teardown no longer manufactures zombies out of runs tha
 executing. The window is narrower, not gone — run handles are per-runtime, so a restart that builds
 a **new** `WorkerRuntime` over the same store still sweeps the previous one's abandoned runs. That
 is also what keeps a genuine process crash recoverable.
+
+**The sweep is bounded, and paged listings are keyset in SQL**
+([#236](https://github.com/PingoLee/Nitro.jl/issues/236),
+[#237](https://github.com/PingoLee/Nitro.jl/issues/237)). It reads `list_running_task_refs`, a
+three-column projection, never the listing, and walks it `ZOMBIE_SWEEP_BATCH` records at a time
+under one `lock_tasks`.
+
+Paging is keyset on the id (`id > after ORDER BY id LIMIT n`), never offset: the sweep moves every
+row it adjudicates out of `RUNNING`, so an offset page would skip rows.
+
+A database backend pages **in SQL and never re-sorts in Julia**. `ORDER BY` and `>` share the
+column's collation, which on a non-C PostgreSQL collation is not Julia's codepoint order. That is
+why the paged `Owner` listing is one `Qor` query and not the unpaged path's two legs merged in
+Julia.
+
+A paged method returns fewer than `limit` only when nothing is left. A row it skips, whether
+through the authority gate or an unparseable `run_id`, is made up from past the cursor.
+
+**`zombie_min_age` bounds OLD claims in, never recent ones**
+([#239](https://github.com/PingoLee/Nitro.jl/issues/239)). It is a keyword on `start!` / `startup`
+/ `recover_zombie_tasks!`, `nothing` by default. The sweep then adjudicates only records whose
+`started_at` is older than `now - zombie_min_age`; a NULL `started_at` is always eligible. The
+opposite bound ("only recent claims") would strand every old record `RUNNING` forever, and retention
+never retires those, since it needs a `completed_at`.
+
+The filter runs **in Julia over the projected `started_at`**, not in SQL, so a row it excludes is
+still seen and counted. Do not "optimize" it into the query without keeping that count.
+
+**The sweep's completion line is unconditional**
+([#238](https://github.com/PingoLee/Nitro.jl/issues/238)). `"Nitro.Workers: scanning for zombie
+tasks"` goes out before `lock_tasks`, and `"… zombie recovery complete"` goes out after, with
+`recovered = 0` included. On a read failure, an `@error` carrying the same counts replaces it. The
+sweep runs after the banner and before the first request, which is the window where silence cost an
+incident, so never make that line conditional. Counts only, never a `result` or `error` payload.
 
 ## 6. Developer Rules
 

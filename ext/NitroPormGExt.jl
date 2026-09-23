@@ -14,8 +14,10 @@ import Nitro: pormg_nitro_session, sync_pormg_env!
 import Nitro.Workers: AbstractWorkerStore, TaskInfo, TaskStatus, TaskOptions,
     PENDING, RUNNING, COMPLETED, FAILED, CANCELLED,
     TaskAuthority, Owner, System, UNSUPPLIED, owner_of, _is_authorized, TASK_KEY_DELIMITER,
+    _check_page,
     get_task_info, set_task!, replace_task!, add_watcher!, try_transition!,
     delete_task!, cleanup_tasks!, get_all_tasks,
+    list_running_task_refs, RunningTaskRef,
     get_queue_authorizer, set_queue_authorizer!,
     get_error_redactor, set_error_redactor!,
     get_watch_authorizer, set_watch_authorizer!,
@@ -244,8 +246,16 @@ function _parse_db_datetime(val)::DateTime
     # PormG returns ZonedDateTime from PostgreSQL TIMESTAMPTZ and
     # from SQLite when the stored value contains a timezone offset.
     if val isa Dates.AbstractDateTime
-        return DateTime(Dates.year(val), Dates.month(val), Dates.day(val),
-                        Dates.hour(val), Dates.minute(val), Dates.second(val))
+        # To UTC, not merely stripped of its zone. Every `DateTime` Nitro compares these against
+        # is UTC, and copying the wall-clock fields read a `ZonedDateTime` from a non-UTC session
+        # as off by the offset. LibPQ pins the session to UTC by default, so this was latent, but
+        # `PGTZ` or a session TimeZone option would shift every stored instant: session
+        # `expires_at`, and the `started_at` that `zombie_min_age` judges a claim's age by (#239).
+        # `utc_datetime` is TimeZones' field for exactly this, read here without importing
+        # TimeZones into the ext. Whole seconds, as before, so a UTC session reads unchanged.
+        u = hasproperty(val, :utc_datetime) ? getproperty(val, :utc_datetime) : val
+        return DateTime(Dates.year(u), Dates.month(u), Dates.day(u),
+                        Dates.hour(u), Dates.minute(u), Dates.second(u))
     end
     s = string(val)
     # Try common DB formats
@@ -259,7 +269,9 @@ function _parse_db_datetime(val)::DateTime
             continue
         end
     end
-    # Strip timezone suffix and retry
+    # Strip timezone suffix and retry. This branch ASSUMES the suffix is UTC: PormG writes
+    # `+00:00`, and it hands SQLite DateTimeField columns back as `ZonedDateTime` (the branch
+    # above), so only a hand-written TEXT value with another offset reaches here misread.
     clean = replace(s, r"[+-]\d{2}:?\d{2}$" => "")
     clean = replace(clean, r"\.\d+$" => "")
     return Dates.DateTime(clean, dateformat"yyyy-mm-dd\THH:MM:SS")
@@ -778,6 +790,11 @@ The win is rows fetched and `watchers` blobs JSON-parsed, not index usage: on
 PostgreSQL a `LIKE 'x%'` uses the primary-key index only under a C collation or a
 `text_pattern_ops` opclass, which `PormG.Dialect.create_index` cannot express. Do not
 add an index for this.
+
+**Unpaged listings only.** Two legs merged in Julia are a correct union only while nothing
+depends on their order, and a paged listing depends on nothing else. `get_all_tasks` with `after`
+or `limit` therefore asks for the same superset as ONE `Qor` query (`_authority_query`) and lets
+the database order it. See *Keyset paging* below ([#237](https://github.com/PingoLee/Nitro.jl/issues/237)).
 """
 _authority_rows(make_base::Function, ::System) = make_base().list()
 
@@ -805,20 +822,78 @@ function _authority_rows(make_base::Function, authority::Owner)
     return rows
 end
 
-function get_all_tasks(store::PormGWorkerStore, authority::TaskAuthority; status::Union{Nothing, TaskStatus}=nothing, queue_name::Union{Nothing, String}=nothing)
-    try
-        # A factory, not a queryset: see `_authority_rows` on why each leg needs its own.
-        make_base = function()
-            qs = _task_objects(store)
-            if status !== nothing
-                qs = qs.filter("status" => string(status))
-            end
-            if queue_name !== nothing
-                qs = qs.filter("queue_name" => queue_name)
-            end
-            return qs
-        end
+# -- Keyset paging (#237) --
+#
+# The shape `_authority_rows` above does not have: a page is `id > after ORDER BY id LIMIT n`,
+# and ALL of it runs in SQL. The database orders and compares under one collation, the column's.
+# On an `en_US` PostgreSQL database that is not Julia's codepoint order, so any Julia-side sort or
+# merge on a paged path would disagree with the next page's `id > after` and skip rows. That is
+# also why the paged Owner listing is ONE `Qor` query rather than `_authority_rows`' two legs.
+# Merging two separately-limited legs is a correct union only under an order Julia can reproduce.
 
+function _keyset!(qs, after, limit)
+    after === nothing || (qs = qs.filter("id__@gt" => after))
+    qs = qs.order_by("id")
+    limit === nothing || (qs = qs.limit(limit))
+    return qs
+end
+
+# Up to `limit` KEPT rows past `after`, in the database's id order. `keep!(out, row)` decides per
+# row. A row it drops is made up from past the cursor, so the result is short of `limit` only when
+# the query ran out of rows. That is the contract both paged methods publish, and a caller reads a
+# short page as the end. With `limit === nothing` this is one unbounded query past `after`.
+function _keyset_collect!(keep!::Function, out::AbstractVector, query::Function, after, limit)
+    cursor = after
+    while true
+        want = limit === nothing ? nothing : limit - length(out)
+        rows = _keyset!(query(), cursor, want).list()
+        for row in rows
+            keep!(out, row)
+        end
+        (want === nothing || length(rows) < want || length(out) >= limit) && return out
+        cursor = _row_task_id(last(rows))
+    end
+end
+
+# The same superset `_authority_rows` fetches, as one query.
+_authority_query(make_base::Function, ::System) = make_base()
+_authority_query(make_base::Function, authority::Owner) = make_base().filter(PormG.Qor(
+    "id__@startswith" => authority.user_id * TASK_KEY_DELIMITER,
+    "watchers__@contains" => JSON.json(authority.user_id),
+))
+
+function get_all_tasks(store::PormGWorkerStore, authority::TaskAuthority;
+                       status::Union{Nothing, TaskStatus}=nothing, queue_name::Union{Nothing, String}=nothing,
+                       after::Union{Nothing, String}=nothing, limit::Union{Nothing, Int}=nothing)
+    # A factory, not a queryset: see `_authority_rows` on why each leg needs its own.
+    make_base = function()
+        qs = _task_objects(store)
+        if status !== nothing
+            qs = qs.filter("status" => string(status))
+        end
+        if queue_name !== nothing
+            qs = qs.filter("queue_name" => queue_name)
+        end
+        return qs
+    end
+
+    if _check_page(after, limit)
+        # A paged read RETHROWS, unlike the unpaged one below. A caller reads an empty page as
+        # "no more rows", so a swallowed error would quietly end the iteration part-way.
+        try
+            return _keyset_collect!(TaskInfo[], () -> _authority_query(make_base, authority), after, limit) do out, row
+                task_info = _from_db_record(row)
+                # The gate, after the fetch as always. Rows it drops are made up by
+                # `_keyset_collect!`, so a page is short only when the listing is exhausted.
+                _is_authorized(authority, task_info) && push!(out, task_info)
+            end
+        catch e
+            @warn "PormGWorkerStore: failed to list a page of tasks" exception=(e, catch_backtrace())
+            rethrow()
+        end
+    end
+
+    try
         # Durable rows only. Overlaying live progress onto them is `WorkerRuntime`'s job
         # and is now done for every backend rather than this one (#167).
         tasks = TaskInfo[]
@@ -832,6 +907,57 @@ function get_all_tasks(store::PormGWorkerStore, authority::TaskAuthority; status
     catch e
         @warn "PormGWorkerStore: failed to list tasks" exception=(e, catch_backtrace())
         return TaskInfo[]
+    end
+end
+
+# One projected row -> a ref, or `nothing` for a row that cannot be fenced. Same symbol-or-string
+# key handling as `_from_db_record`, and deliberately none of its parsing.
+function _running_ref_from_row(row)
+    get_val = (key_sym, key_str) -> haskey(row, key_sym) ? row[key_sym] : row[key_str]
+    id = string(get_val(:id, "id"))
+    run_id = tryparse(UUIDs.UUID, string(get_val(:run_id, "run_id")))
+    if run_id === nothing
+        # Skipped, not guessed at. A fenced transition needs the row's real run id, and inventing
+        # one is the #108 defect `_from_db_record` refuses loudly. Ids only -- never row contents.
+        @warn "PormGWorkerStore: skipping a RUNNING task whose run_id does not parse; zombie recovery cannot fence it" task_id=id
+        return nothing
+    end
+    # An unreadable timestamp must not fail the whole scan: `list_running_task_refs` rethrows, so
+    # one hand-edited row would stop the sweep at its page on every boot, which is #236's poison
+    # pill again. Read as "no start time", the case the sweep already treats as always eligible.
+    started_at = try
+        _parse_optional_db_datetime(get_val(:started_at, "started_at"))
+    catch e
+        e isa InterruptException && rethrow()
+        @warn "PormGWorkerStore: a RUNNING task's started_at does not parse; treating it as unstamped" task_id=id
+        nothing
+    end
+    return RunningTaskRef((id, run_id, started_at))
+end
+
+# Zombie recovery's scan (#236): a projection of exactly the three columns it reads. No row's
+# `result` or `watchers` blob is fetched, let alone parsed, and `_from_db_record` is never called.
+# Its full parse, behind `get_all_tasks`'s swallow-into-empty, is what let one malformed row
+# blind the whole sweep.
+#
+# Logs and RETHROWS, like `get_task_info`, and unlike the listing above. An empty result here
+# reads as "nothing to recover", so a swallowed read error would be indistinguishable from a
+# clean sweep, which is the silence #238 is about.
+#
+# Paged by keyset like the listing (#237). A skipped row is made up from past the cursor by
+# `_keyset_collect!`, so recovery never mistakes a page an unfenceable row shortened for the end.
+function list_running_task_refs(store::PormGWorkerStore; after::Union{Nothing, String}=nothing,
+                                limit::Union{Nothing, Int}=nothing)
+    _check_page(after, limit)
+    query = () -> _task_objects(store).filter("status" => string(RUNNING)).values("id", "run_id", "started_at")
+    try
+        return _keyset_collect!(RunningTaskRef[], query, after, limit) do refs, row
+            ref = _running_ref_from_row(row)
+            ref === nothing || push!(refs, ref)
+        end
+    catch e
+        @warn "PormGWorkerStore: failed to list running tasks" exception=(e, catch_backtrace())
+        rethrow()
     end
 end
 
