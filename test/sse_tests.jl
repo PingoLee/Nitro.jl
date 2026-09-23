@@ -305,7 +305,13 @@ try
         # the stream, the producer's `isopen` check fails, and it unwinds almost immediately.
         # Against the unguarded handler the drain consumes every event, so this reads HEAD_EVENTS
         # -- a value the guarded path cannot reach, because the producer is paced.
-        @test HEAD_STOPPED[]
+        #
+        # "Almost immediately" is not "before `HTTP.head` returns" (#287): the client returns on the
+        # response head, while the producer only notices the closed stream on its next `isopen`
+        # check, up to one 10ms tick later. Read once, the flag lost that race on loaded CI runners.
+        # Wait for it with a bound, as the PRODUCER_STOPPED check above does. A drained body still
+        # fails, on the count below, which the wait also makes final.
+        @test timedwait(() -> HEAD_STOPPED[], 5.0; pollint = 0.01) === :ok
         @test HEAD_WROTE[] < HEAD_EVENTS
 
         # And the same route still streams normally over GET, so the guard is method-scoped.
