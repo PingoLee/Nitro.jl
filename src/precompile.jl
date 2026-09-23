@@ -54,13 +54,14 @@ end
     # ── Route with per-route middleware → the compose / middleware-cache path ───
     # `compose` is installed unconditionally (#71), so the blocks above already exercise its
     # empty-table fast path (`snapshot` + `isempty` + the prebuilt chain). THIS block is the
-    # only one that gets past that check and reaches `gethandler`, `cachetag`, `genkey`,
-    # `buildmiddleware`, `cache_if_current!`, the cache-hit read, and the `RouteResolution`
-    # hand-off (#80) — the blocks above compile only `_dispatch_resolved`'s fall-through
-    # branch, since nothing stashes a resolution for them. Two requests: the first
-    # takes the cache miss + publish path, the second the cache-hit read path. Honest scope: only this generic plumbing
-    # carries over — the composed chain itself specializes on the app's own handler/middleware
-    # closure types, per the NOTE below.
+    # only one that gets past that check and reaches `gethandler`, `genkey`,
+    # `buildmiddleware`, `cache_chain!`, `cached_chain`, and the `RouteResolution` hand-off
+    # (#80) — the blocks above compile only `_dispatch_resolved`'s fall-through branch, since
+    # nothing stashes a resolution for them. Each `internalrequest` builds a fresh pipeline and
+    # so a cold `ChainCache` (#255): every request here takes the miss + publish path, and the
+    # hit path is the same `cached_chain` call returning early. Honest scope: only this generic
+    # plumbing carries over — the composed chain itself specializes on the app's own
+    # handler/middleware closure types, per the NOTE below.
     precompile_mw = handle -> (req::Request -> handle(req))
     Core.Routing.urlpatterns(ctx, "", RouteDefinition[
         path("/precompile/cached", (req::Request) -> Res.json(Dict("cached" => true)),
@@ -72,13 +73,10 @@ end
     # here. `"*"`, STREAM and WEBSOCKET leaves (#282) take the same `compose` branch.
     Core.internalrequest(ctx, Request("HEAD", "/precompile/cached"); catch_errors=false)
 
-    # A third request WITH per-call global middleware: `use_cache` is false, so this is the
-    # `compose` branch that skips the cache entirely and rebuilds through `buildmiddleware`
-    # on every request. That is the production shape — `serve(middleware=[...])`, and every
-    # `revise=:lazy|:eager` session via `ReviseHandler` — and nothing above compiles it.
-    # Honest scope: `buildmiddleware` and `snapshot` are already reached by the first
-    # request's cache miss; what is new here is `compose`'s `use_cache == false` branch and
-    # `normalize_middleware` over a non-empty vector.
+    # A request WITH per-call global middleware — the production shape: `serve(middleware=[...])`,
+    # and every `revise=:lazy|:eager` session via `ReviseHandler`. Since #255 it takes the same
+    # `compose` path as the requests above, so what is new here is only `normalize_middleware`
+    # over a non-empty vector and a non-empty `globalmiddleware` fold.
     Core.internalrequest(ctx, Request("GET", "/precompile/cached");
                          middleware=[precompile_mw], catch_errors=false)
 

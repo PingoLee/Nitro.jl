@@ -11,10 +11,9 @@ import Nitro: App, path, text
 # (src/routerhof.jl) read it lock-free on the request path.
 #
 # It is now a `CopyOnWriteDict{RouteMiddleware}` written via `publish!` (the value type was
-# narrowed from an abstract `Tuple` in #76). The semantic that separates it
-# from `middleware_cache` is LAST-writer-wins: re-running `urlpatterns` for a path must
-# install the NEW middleware, whereas a cached chain must never change identity. A port that
-# reached for `cache!` here passes every other test in the suite and fails this one.
+# narrowed from an abstract `Tuple` in #76). Its semantic is LAST-writer-wins: re-running
+# `urlpatterns` for a path must install the NEW middleware. (The first-writer-wins
+# `middleware_cache` that used to sit beside it became the per-pipeline `ChainCache` in #255.)
 #
 # Local `App` throughout — no global `CONTEXT[]`, so these items are
 # order-independent within runtests.jl.
@@ -48,13 +47,6 @@ mkmw(tag) = handler -> (req::HTTP.Request -> Res.send(tag * "|" * text(handler(r
 
     # Behavioral confirmation, immune to closure-identity subtleties: the request must run
     # through B's middleware, not A's.
-    #
-    # The per-call `middleware=` is future-proofing, not load-bearing today: no request runs
-    # before the re-registration above, so the cache is cold either way. It keeps `use_cache`
-    # false so this stays correct if a request is ever added between the two registrations —
-    # with a warm cache the first-writer-wins chain from registration A would win and this
-    # would read "A|h". Verified by construction: with the kwarg dropped AND a request
-    # inserted between the registrations, this returns "A|h".
     body = text(Nitro.Core.internalrequest(ctx, HTTP.Request("GET", "/lww");
                                            middleware = [h -> (r::HTTP.Request -> h(r))],
                                            catch_errors = false))
@@ -80,20 +72,20 @@ end
 end
 
 
-@testitem "Custom middleware table — the uncached hot path (use_cache == false)" tags=[:core, :middleware] setup=[NitroCommon] begin
+@testitem "Custom middleware table — pipelines with global middleware" tags=[:core, :middleware] setup=[NitroCommon] begin
 using Test
 using HTTP
 using Nitro
-using Nitro.Core.Types: snapshot
 import Nitro: App, path, text
 
-# This is the configuration the #68 bug actually lives in, so it gets its own item.
+# The configuration the #68 bug lived in, so it gets its own item: global middleware plus
+# per-route middleware — any `serve(middleware=[...])` (CORS, sessions, auth, rate limiting, the
+# normal production shape) with route guards, and every `revise=:lazy|:eager` session, since
+# `serve` injects `ReviseHandler`.
 #
-# `compose` computes `use_cache = isempty(globalmiddleware)` once. When false, the cache is
-# neither read nor written, so `buildmiddleware` — and its read of `custommiddleware` — runs
-# on EVERY request, forever. `use_cache` is false for any `serve(middleware=[...])` (CORS,
-# sessions, auth, rate limiting — the normal production shape) and for every
-# `revise=:lazy|:eager` session, since `serve` injects `ReviseHandler`.
+# Until #255 this shape cached nothing (`use_cache = isempty(globalmiddleware)`), so
+# `buildmiddleware` and its read of `custommiddleware` ran on EVERY request, forever. Each
+# pipeline now owns a `ChainCache`, so it builds once per route like every other shape.
 
 const K = 8
 mktag(tag) = handler -> (req::HTTP.Request -> Res.send(tag * "|" * text(handler(req))))
@@ -108,45 +100,52 @@ Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
     for i in 1:K
 ])
 
-# NO caching happens here, so requests may be driven sequentially — the point of this item
-# is the per-request rebuild, not concurrency (that is the third item).
+# Sequential on purpose — the point of this item is key→chain mapping and build counts, not
+# concurrency (that is the third item). Both the per-call-pipeline (`internalrequest`) and the
+# built-once (`serve`) shapes.
 results = [text(Nitro.Core.internalrequest(ctx, HTTP.Request("GET", "/u/$i");
                                            middleware = [global_mw], catch_errors = false))
            for _ in 1:3 for i in 1:K]
+served = Nitro.Core.setupmiddleware(ctx; middleware = [global_mw], catch_errors = false)
+served_results = [text(served(HTTP.Request("GET", "/u/$i"))) for _ in 1:3 for i in 1:K]
 
 @testset "every request got its own route's chain" begin
     expected = [ "r$i|h$i" for _ in 1:3 for i in 1:K ]
     @test results == expected
+    @test served_results == expected
 end
 
-@testset "this configuration caches nothing at all" begin
-    # Executable documentation of why the lock-free read here is a per-request-forever read
-    # rather than a warmup-window one. If this ever starts failing, the cost model in
-    # `CopyOnWriteDict`'s comment block changed and that comment needs revisiting.
-    @test isempty(snapshot(ctx.service.middleware_cache))
-end
-
-@testset "buildmiddleware runs once per request, not once per route" begin
+@testset "buildmiddleware runs once per route per pipeline, not once per request" begin
     ctx2 = App()
     Nitro.Core.Routing.urlpatterns(ctx2, "", Nitro.RouteDefinition[
         path("/counted", (req::HTTP.Request) -> Res.send("ok"), middleware = [counting_mw])
     ])
+    # `serve`-shaped: one pipeline, five requests, one build. This assertion used to read
+    # `== 5` — "uncached, forever" — and was flipped deliberately by #255, which is the change
+    # it existed to make someone confront.
+    factory_calls[] = 0
+    pipeline = Nitro.Core.setupmiddleware(ctx2; middleware = [global_mw], catch_errors = false)
+    for _ in 1:5
+        pipeline(HTTP.Request("GET", "/counted"))
+    end
+    @test factory_calls[] == 1
+
+    # `internalrequest` builds a new pipeline — and so a cold cache — per call. That is the
+    # stated trade-off of a pipeline-owned cache: the ~12 µs pipeline rebuild dwarfs one fold.
     factory_calls[] = 0
     for _ in 1:5
         Nitro.Core.internalrequest(ctx2, HTTP.Request("GET", "/counted");
                                    middleware = [global_mw], catch_errors = false)
     end
-    # The positive form of "uncached, forever". A future "let's just cache it anyway" change
-    # has to confront this assertion deliberately rather than silently flipping it.
     @test factory_calls[] == 5
 end
 
 @testset "a composed pipeline sees routes registered after it was composed" begin
-    # Mutation guard, mirroring the one in test/middleware_cache_tests.jl. `buildmiddleware`
-    # must snapshot `custommiddleware` PER CALL. If a refactor hoists that snapshot to
-    # compose time the table freezes for the life of the server and routes registered later
-    # — Revise re-running `urlpatterns` — silently lose their middleware, with no error and
-    # no other failing test.
+    # Mutation guard, mirroring the one in test/middleware_cache_tests.jl. `compose` must
+    # snapshot `custommiddleware` PER REQUEST. If a refactor hoists that snapshot to compose
+    # time the table freezes for the life of the server and routes registered later — Revise
+    # re-running `urlpatterns` — silently lose their middleware, with no error and no other
+    # failing test.
     ctx3 = App()
     Nitro.Core.Routing.urlpatterns(ctx3, "", Nitro.RouteDefinition[
         path("/first", (req::HTTP.Request) -> Res.send("h1"), middleware = [mktag("r1")])
@@ -154,7 +153,7 @@ end
     # Route 1 exists BEFORE this call deliberately, and the reason changed with #71: the table
     # being non-empty is no longer what installs `compose` (it is always installed now), but it
     # is what gets requests PAST the per-request emptiness fast path and into `buildmiddleware`,
-    # which is where the per-call snapshot this item guards actually lives. The companion item
+    # which is where the snapshot this item guards is actually read. The companion item
     # "composed against an EMPTY table" covers the other side.
     pipeline = Nitro.Core.setupmiddleware(ctx3; middleware = [global_mw], catch_errors = false)
 
@@ -294,7 +293,7 @@ import Nitro: App, path, text
 mktag(tag) = handler -> (req::HTTP.Request -> Res.send(tag * "|" * text(handler(req))))
 plain_global = handler -> (req::HTTP.Request -> handler(req))
 
-@testset "middleware registered after composition runs (use_cache == true)" begin
+@testset "middleware registered after composition runs" begin
     ctx = App()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/plain", (req::HTTP.Request) -> Res.send("plain"))
@@ -304,10 +303,6 @@ plain_global = handler -> (req::HTTP.Request -> handler(req))
     pipeline = Nitro.Core.setupmiddleware(ctx; catch_errors = false)
 
     @test text(pipeline(HTTP.Request("GET", "/plain"))) == "plain"
-    # Nothing may be cached while the table is empty. This is what makes the flip below
-    # clean: `cache!` is first-writer-wins, so a bare chain cached now would beat the
-    # middleware registered later and #71 would reappear one level down.
-    @test isempty(snapshot(ctx.service.middleware_cache))
 
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/late", (req::HTTP.Request) -> Res.send("h"), middleware = [mktag("late")])
@@ -318,7 +313,7 @@ plain_global = handler -> (req::HTTP.Request -> handler(req))
     @test text(pipeline(HTTP.Request("GET", "/plain"))) == "plain"
 end
 
-@testset "same at use_cache == false" begin
+@testset "same with global middleware" begin
     ctx = App()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/plain", (req::HTTP.Request) -> Res.send("plain"))
@@ -330,7 +325,6 @@ end
         path("/late", (req::HTTP.Request) -> Res.send("h"), middleware = [mktag("late")])
     ])
     @test text(pipeline(HTTP.Request("GET", "/late"))) == "late|h"
-    @test isempty(snapshot(ctx.service.middleware_cache))   # use_cache == false caches nothing
 end
 
 @testset "an explicit middleware=[] does not publish an entry" begin
@@ -365,17 +359,22 @@ end
     @test !isempty(snapshot(r2.service.custommiddleware))
 end
 
-@testset "nothing is cached while the table is empty" begin
+@testset "nothing is composed while the table is empty" begin
+    # The fast path returns the prebuilt global-only chain before `gethandler`, so no
+    # per-request chain is ever composed. Observed through a counting GLOBAL factory: it is
+    # called once when `compose` prebuilds that chain, and once more by every `buildmiddleware`.
+    folds = Ref(0)
+    counting_global = handler -> (folds[] += 1; req::HTTP.Request -> handler(req))
     ctx = App()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/a", (req::HTTP.Request) -> Res.send("a")),
         path("/b", (req::HTTP.Request) -> Res.send("b")),
     ])
-    pipeline = Nitro.Core.setupmiddleware(ctx; catch_errors = false)
+    pipeline = Nitro.Core.setupmiddleware(ctx; middleware = [counting_global], catch_errors = false)
     for _ in 1:3, p in ("/a", "/b")
         pipeline(HTTP.Request("GET", p))
     end
-    @test isempty(snapshot(ctx.service.middleware_cache))
+    @test folds[] == 1
 end
 end
 
@@ -430,10 +429,10 @@ counting(ref) = handler -> (req::HTTP.Request -> (ref[] += 1; handler(req)))
     @test hits[] == 1
 end
 
-@testset "405 — same parity, and no degenerate cache key" begin
+@testset "405 — same parity, and no chain composed for it" begin
     # `gethandler` returns `missing` (not `nothing`) for a method mismatch, and
     # `missing !== nothing`, so a 405 used to take the *matched* branch: it keyed on the
-    # empty path and wrote a junk "POST|" entry into the middleware cache.
+    # empty path, composed a chain, and cached it under a junk "POST|" key.
     hits = Ref(0)
     ctx = App()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
@@ -446,17 +445,19 @@ end
     @test r.status == 405
     @test hits[] == 1
 
-    # The junk-key check needs its OWN context with NO per-call middleware: passing
-    # `middleware=` sets `use_cache = false`, so nothing is cached at all and the assertion
-    # could never fail. Measured on unpatched main, this context ends up holding "POST|".
+    # No chain composed: the per-route middleware factory is never called for a 405, and the
+    # global one only once, when `compose` prebuilds the unmatched-path chain.
+    route_folds, global_folds = Ref(0), Ref(0)
     keyctx = App()
     Nitro.Core.Routing.urlpatterns(keyctx, "", Nitro.RouteDefinition[
         path("/only-get", (req::HTTP.Request) -> Res.send("ok"), method = "GET",
-             middleware = [h -> (q::HTTP.Request -> h(q))])
+             middleware = [h -> (route_folds[] += 1; q::HTTP.Request -> h(q))])
     ])
-    r2 = Nitro.Core.internalrequest(keyctx, HTTP.Request("POST", "/only-get"); catch_errors = false)
-    @test r2.status == 405
-    @test !any(startswith(k, "POST|") for k in keys(snapshot(keyctx.service.middleware_cache)))
+    p = Nitro.Core.setupmiddleware(keyctx; catch_errors = false,
+                                   middleware = [h -> (global_folds[] += 1; q::HTTP.Request -> h(q))])
+    @test p(HTTP.Request("POST", "/only-get")).status == 405
+    @test route_folds[] == 0
+    @test global_folds[] == 1
 end
 
 @testset "a matched request still works and runs the global middleware once" begin
@@ -475,38 +476,48 @@ end
     @test hits[] == 1
 end
 
-@testset "an unmatched request caches nothing (use_cache == true)" begin
+@testset "an unmatched request composes nothing" begin
+    global_folds = Ref(0)
     ctx = App()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/has", (req::HTTP.Request) -> Res.send("ok"),
              middleware = [h -> (q::HTTP.Request -> h(q))])
     ])
-    Nitro.Core.internalrequest(ctx, HTTP.Request("GET", "/nope"); catch_errors = false)
-    @test isempty(snapshot(ctx.service.middleware_cache))
+    p = Nitro.Core.setupmiddleware(ctx; catch_errors = false,
+                                   middleware = [h -> (global_folds[] += 1; q::HTTP.Request -> h(q))])
+    for _ in 1:3
+        @test p(HTTP.Request("GET", "/nope")).status == 404
+    end
+    @test global_folds[] == 1          # the prebuilt unmatched chain, and nothing per request
 end
 end
 
 
-@testitem "Custom middleware — registering middleware invalidates the cached chain (#71)" tags=[:core, :middleware] setup=[NitroCommon] begin
+@testitem "Custom middleware — registering middleware reaches a cached chain (#71)" tags=[:core, :middleware] setup=[NitroCommon] begin
 using Test
 using HTTP
 using Nitro
-using Nitro.Core.Types: CopyOnWriteDict, snapshot, cache!, publish!
-using Nitro.Core.RouterHOF: cachetag
 import Nitro: App, path, text
 
-const TAG = cachetag(false, true, true)   # catch_errors=false, show_errors/serialize default
-
-# The sibling of #71, one level down. `middleware_cache` is first-writer-wins, so once a
-# route's composed chain is cached, registering middleware for that route afterwards could
-# never take effect — the same symptom as the install gate, reached through the cache.
+# The sibling of #71, one level down. A pipeline caches each route's composed chain, so once a
+# route is warm, middleware registered for it afterwards must still take effect — otherwise it is
+# the install-gate symptom again, reached through the cache.
 #
-# Route middleware is now published via `publish_route_middleware!`, which pairs the
-# `publish!` with a `delete!` of the same cache key.
+# Before #255 this was an explicit `delete!` of the route's key from an `App`-wide cache,
+# paired with the publish in `publish_route_middleware!`. Now nothing is deleted: the publish
+# moves `custommiddleware` to a new table, and each pipeline's `ChainCache` serves a chain only
+# to requests holding the table it was built from. Both shapes of pipeline are covered, since
+# the global-middleware one did not cache at all before #255.
 
 mktag(tag) = handler -> (req::HTTP.Request -> Res.send(tag * "|" * text(handler(req))))
 
 @testset "a warmed route picks up middleware registered afterwards" begin
+    # A counting GLOBAL factory makes "warm" checkable rather than assumed: `compose` calls it
+    # once to prebuild the unmatched-path chain, then once per chain composition. (Whether the
+    # pipeline has global middleware no longer selects a code path since #255; this one has a
+    # layer only so the cache can be observed.)
+    folds = Ref(0)
+    counting_global = handler -> (folds[] += 1; req::HTTP.Request -> handler(req))
     ctx = App()
     # Two routes so the table is non-empty from the start: this exercises the CACHE path, not
     # the empty-table fast path covered by the item above.
@@ -514,56 +525,45 @@ mktag(tag) = handler -> (req::HTTP.Request -> Res.send(tag * "|" * text(handler(
         path("/other", (req::HTTP.Request) -> Res.send("o"), middleware = [mktag("other")]),
         path("/warm",  (req::HTTP.Request) -> Res.send("h")),
     ])
-    pipeline = Nitro.Core.setupmiddleware(ctx; catch_errors = false)
-
-    @test text(pipeline(HTTP.Request("GET", "/warm"))) == "h"
-    # Cache keys carry the pipeline's serializer settings since #79; this pipeline is
-    # `catch_errors=false` with the other two defaulted, i.e. "|cES".
-    @test haskey(snapshot(ctx.service.middleware_cache), "GET|/warm" * TAG)   # warmed
+    pipeline = Nitro.Core.setupmiddleware(ctx; middleware = [counting_global], catch_errors = false)
+    for _ in 1:2
+        @test text(pipeline(HTTP.Request("GET", "/warm"))) == "h"
+    end
+    @test folds[] == 2               # prebuilt + ONE composition: the second request was a hit
 
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/warm", (req::HTTP.Request) -> Res.send("h"), middleware = [mktag("late")])
     ])
 
-    # Without the invalidation the cached bare chain wins and this is "h".
-    @test !haskey(snapshot(ctx.service.middleware_cache), "GET|/warm" * TAG)  # invalidated
+    # Were the warm bare chain still served, this would be "h".
     @test text(pipeline(HTTP.Request("GET", "/warm"))) == "late|h"
+    @test text(pipeline(HTTP.Request("GET", "/warm"))) == "late|h"
+    @test folds[] == 3               # recomposed once for the new table, then cached again
 end
 
-@testset "invalidation drops only the affected key" begin
+@testset "a registration rebuilds every route, and each still gets its own chain" begin
+    # Invalidation is by generation now, so a registration for ONE route rebuilds every route's
+    # chain on its next request. That is the accepted cost — registrations are rare — and this
+    # pins that the rebuild is correct, not just that it happens.
+    builds = Ref(0)
+    keep = handler -> (builds[] += 1; req::HTTP.Request -> Res.send("keep|" * text(handler(req))))
     ctx = App()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
-        path("/keep", (req::HTTP.Request) -> Res.send("k"), middleware = [mktag("keep")]),
+        path("/keep", (req::HTTP.Request) -> Res.send("k"), middleware = [keep]),
         path("/drop", (req::HTTP.Request) -> Res.send("d")),
     ])
     pipeline = Nitro.Core.setupmiddleware(ctx; catch_errors = false)
-    pipeline(HTTP.Request("GET", "/keep"))
-    pipeline(HTTP.Request("GET", "/drop"))
-    @test haskey(snapshot(ctx.service.middleware_cache), "GET|/keep" * TAG)
+    pipeline(HTTP.Request("GET", "/keep")); pipeline(HTTP.Request("GET", "/drop"))
+    @test builds[] == 1
 
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/drop", (req::HTTP.Request) -> Res.send("d"), middleware = [mktag("new")])
     ])
-    entries = snapshot(ctx.service.middleware_cache)
-    @test haskey(entries, "GET|/keep" * TAG)        # untouched
-    @test !haskey(entries, "GET|/drop" * TAG)       # invalidated
-end
-
-@testset "delete! is copy-on-write" begin
-    d = CopyOnWriteDict{Function}()
-    f = req -> "f"
-    cache!(d, "GET|/x", f)
-    held = snapshot(d)
-
-    delete!(d, "GET|/x")
-    @test isempty(snapshot(d))
-    @test held["GET|/x"] === f          # the held snapshot still has it
-    @test length(held) == 1
-
-    # Absent key: no publish at all, so the table object is unchanged.
-    before = snapshot(d)
-    delete!(d, "GET|/never")
-    @test snapshot(d) === before
+    @test text(pipeline(HTTP.Request("GET", "/keep"))) == "keep|k"
+    @test text(pipeline(HTTP.Request("GET", "/drop"))) == "new|d"
+    @test builds[] == 2                  # /keep rebuilt once for the new generation...
+    pipeline(HTTP.Request("GET", "/keep"))
+    @test builds[] == 2                  # ...and is cached again after that
 end
 end
 
@@ -854,11 +854,11 @@ end
 end
 
 @testset "a reused request object picks up a handler registered between passes" begin
-    # The hand-off carries a per-request LOOKUP, never a cached handler: the chain in
-    # `middleware_cache` still bottoms out in a live resolution. Re-registering `/x` WITHOUT a
-    # `middleware=` kwarg skips `publish_route_middleware!`, so the cached chain is NOT
-    # invalidated — and the second call must still reach the new handler. A design that baked
-    # the resolved handler into the cached chain returns "v1" here.
+    # The hand-off carries a per-request LOOKUP, never a cached handler: a pipeline's cached
+    # chain still bottoms out in a live resolution. Re-registering `/x` WITHOUT a
+    # `middleware=` kwarg skips `publish_route_middleware!`, so `custommiddleware` does not move
+    # and the cached chain stays valid — and the second call must still reach the new handler.
+    # A design that baked the resolved handler into the cached chain returns "v1" here.
     ctx = App()
     passthrough = handler -> (req::HTTP.Request -> handler(req))
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
@@ -993,9 +993,9 @@ using Nitro.Core.RouterHOF: publish_route_middleware!, genkey, router
 import Nitro: App, path, text
 
 # #76: the field was `CopyOnWriteDict{Tuple}`. Unparameterized `Tuple` is abstract, so
-# `buildmiddleware`'s destructure (src/routerhof.jl) inferred `Any` in both slots — and that
-# runs on EVERY request whenever `use_cache == false` (`serve(middleware=[...])`, every
-# `revise=:lazy|:eager` session), not once per route.
+# `buildmiddleware`'s destructure (src/routerhof.jl) inferred `Any` in both slots — and until
+# #255 that ran on EVERY request of any pipeline with global middleware
+# (`serve(middleware=[...])`, every `revise=:lazy|:eager` session), not once per route.
 
 @testset "the Service field and its snapshot carry the narrowed type" begin
     ctx = App()
@@ -1017,7 +1017,7 @@ end
           Tuple{OPTIONAL, OPTIONAL}
 
     # Pre-#76: abstract `Tuple` value type, so the destructure handed `buildmiddleware` two
-    # values of static type `Any` — and that runs per request whenever `use_cache` is false.
+    # values of static type `Any` — per request, before #255, whenever global middleware was set.
     @test Base.infer_return_type(probe, (CopyOnWriteDict{Tuple}, String)) === Tuple
     @test Base.infer_return_type(slots, (CopyOnWriteDict{Tuple}, String)) === Tuple{Any, Any}
 

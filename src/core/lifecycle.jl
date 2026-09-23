@@ -402,8 +402,9 @@ end
     terminate(context::App; timeout = nothing)
     terminate(; timeout = nothing)
 
-Stop the running server: run every `LifecycleMiddleware` shutdown hook, drop the composed
-middleware cache, and close the listener. A no-op when nothing is serving.
+Stop the running server: run every `LifecycleMiddleware` shutdown hook and close the listener.
+A no-op when nothing is serving. (There is no middleware cache to drop: each pipeline owns its
+own, so the next `serve()` starts cold.)
 
 Shutdown is a **bounded graceful drain**, modeled on Go's `http.Server.Shutdown(ctx)`. The
 listening socket is released immediately — the port is free as soon as `terminate` is entered
@@ -480,11 +481,9 @@ function terminate(context::App; timeout::Nullable{Real} = nothing)
         # Do NOT "symmetrize" this by also emptying `custommiddleware`: that table is route
         # *registration* state, not cache state. test/original_tests.jl re-serves after a
         # `terminate()` and expects the registered routes and their middleware to survive.
-        # `empty!(::CopyOnWriteDict)`, not `empty!(::Dict)`: publishes a fresh table under
-        # the cache's lock. Requests are still in `compose` here — the server is not closed
-        # until the `close` a couple of lines below — so an in-flight reader must be able to
-        # finish against a table nobody mutates.
-        empty!(context.service.middleware_cache)
+        # There is no chain cache to clear either: each pipeline owns its own (#255), so the
+        # next `serve()` builds a new pipeline and starts cold, while requests still in flight
+        # here finish against the old one untouched.
         context.service.external_url[] = nothing
         interrupt = _close_deferring_interrupt(context.service,
             something(timeout, context.service.shutdown_timeout[]), interrupt)

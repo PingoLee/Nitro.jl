@@ -4,11 +4,13 @@ using HTTP
 
 using ..Util: join_url_path
 using ..AppContext: App
+using ..Constants: HTTP_METHODS
 using ..Types: Nullable, LifecycleMiddleware, CopyOnWriteDict, snapshot,
-                cache_if_current!, publish!, RouteResolution, ROUTE_RESOLUTION_KEY,
-                RouteMiddleware, NO_ROUTE_MIDDLEWARE, DeclaredMethodHandler
+                publish!, RouteResolution, ROUTE_RESOLUTION_KEY,
+                RouteMiddleware, NO_ROUTE_MIDDLEWARE, DeclaredMethodHandler,
+                ChainCache, cached_chain, cache_chain!
 
-export router, compose, genkey, cachetag, process_middleware, HOFRouter, OuterRouter, InnerRouter
+export router, compose, genkey, process_middleware, HOFRouter, OuterRouter, InnerRouter
 
 # Shared read-only stand-in for "this route has no middleware of that kind". `foldlayers` only
 # ever appends *from* it, never to it, so one instance is safe to share.
@@ -181,8 +183,8 @@ end
 # `(Function[], Function[])` entry into `custommiddleware`. Secondarily, and sharper since #71:
 # those entries contribute zero layers but make the table permanently non-empty, which defeats
 # `compose`'s per-request fast path for the whole app — every request would then pay a
-# `gethandler`, a cache-key string and a cache lookup for nothing, plus the chain fold on the
-# first request for each route. (Before #80 it also paid a SECOND `gethandler`; the fast path
+# `gethandler` and a chain-cache lookup for nothing, plus the chain fold on the first request
+# for each route. (Before #80 it also paid a SECOND `gethandler`; the fast path
 # is still worth defending without it.)
 function process_middleware(::App, ::Nothing) end
 
@@ -215,9 +217,9 @@ is `nothing`.
 
 `compose`'s emptiness fast path deliberately does NOT call this: it returns before `gethandler`,
 and it can only be taken by a request whose every earlier pass also took it, because
-`custommiddleware` never shrinks — nothing in `src/` removes a key from it, and `empty!` is
-called only on `middleware_cache`. That one invariant is load-bearing and holds; the route-table
-one did not, which is why this function exists.
+`custommiddleware` never shrinks — nothing in `src/` removes a key from it, and
+`CopyOnWriteDict` has no `delete!` or `empty!` to do it with. That one invariant is load-bearing
+and holds; the route-table one did not, which is why this function exists.
 """
 function _clear_resolution!(req::HTTP.Request)
     haskey(req.context, ROUTE_RESOLUTION_KEY) && (req.context[ROUTE_RESOLUTION_KEY] = nothing)
@@ -232,104 +234,33 @@ function genkey(http_method::String, path::String)::String
 end
 
 """
-    cachetag(catch_errors::Bool, show_errors::Bool, serialize::Bool) -> String
-
-The `middleware_cache` key suffix for one pipeline's serializer settings (#79).
-
-`middleware_cache` lives on `ctx.service` and outlives any single pipeline, but the chain it
-stores closes over `handler` — the fold accumulator, which `setupmiddleware` builds as
-`serialize ? DefaultSerializer(catch_errors; show_errors) : identity` around the router. Those
-three booleans are therefore *baked into the cached value*, while the key named only the route.
-`serve` builds one pipeline for the server's lifetime so the baked settings are always the right
-ones there; `internalrequest` rebuilds per call, so the first call to warm a route won
-permanently and every later call's kwargs were silently ignored.
-
-Fixed by putting every input in the key. The completeness argument is short and worth keeping:
-`compose` receives `handler` already folded, and the only free variables in its construction are
-these three — `router_entry` is fixed per context, and the access-log and prefix middleware wrap
-*outside* `compose`, so they are not captured. Nothing else can vary.
-
-!!! warning "One input is excluded by a *different* invariant, not by this key"
-    The cached value is `buildmiddleware(...)`, which also closes over `globalmiddleware`. That
-    is absent from the key and safe **only** because `use_cache = isempty(globalmiddleware)` —
-    nothing is cached at all when there is any. So the obvious future optimization, "why not
-    cache when global middleware is present too?", silently makes this key incomplete again and
-    reintroduces exactly the bug #79 fixed. Caching with non-empty `globalmiddleware` requires
-    putting it in the key first, and it has no stable identity to key on.
-
-Deliberately NOT collapsed: with `serialize = false` there is no serializer at all, so the other
-two booleans are unobservable and four tags describe one pipeline. Canonicalizing them would
-save at most three unused cache slots and costs a subtle invariant to maintain.
-
-The key space is these 8 tags times the routes actually warmed. `custommiddleware` keeps the
-plain [`genkey`](@ref) — the two tables no longer share a key space.
-"""
-cachetag(catch_errors::Bool, show_errors::Bool, serialize::Bool)::String =
-    string('|', catch_errors ? 'C' : 'c', show_errors ? 'E' : 'e', serialize ? 'S' : 's')
-
-# Every tag `cachetag` can produce. Invalidation must drop a route's chain under ALL of them,
-# and it does so by exact key rather than by prefix matching. Prefix matching would be *correct*
-# — a route path may contain `|`, so a `"GET|/a|"` prefix would also sweep the cache key of a
-# route registered at `/a|b`, but over-invalidation only costs a rebuild. The reasons are cost
-# and simplicity: a prefix scan is O(#keys) with a `startswith` per key, under the lock, versus
-# eight exact lookups. (What fixed-width tags DO buy is the no-collision property — see the
-# `cachetag` docstring.)
-const CACHE_TAGS = ntuple(i -> cachetag(isodd((i - 1) >> 2), isodd((i - 1) >> 1), isodd(i - 1)), 8)
-
-"""
     publish_route_middleware!(ctx::App, key::String, value::RouteMiddleware) -> RouteMiddleware
 
 Register `value` — a `(router middleware, route middleware)` pair — as the middleware for route
-`key`, and invalidate any chain already cached for it.
+`key`.
 
 `value` is typed as [`RouteMiddleware`](@ref) rather than `Tuple` (#76), so a pair of the wrong
 arity is rejected *here*, at the one sanctioned write site, instead of surfacing as a
 `MethodError` inside `buildmiddleware`'s destructure on some later request.
 
-**Use this instead of writing `ctx.service.custommiddleware` directly.** Publishing alone is not
-enough: `middleware_cache` is first-writer-wins, so a chain composed before the registration
-would keep winning and the new middleware would never run — the same symptom as #71, reached
-through the cache instead of the install gate. Pairing the two here means a future write site
-cannot do one without the other.
+**Use this instead of writing `ctx.service.custommiddleware` directly**, so that check stays in
+one place.
+
+There is no separate invalidation step, and that is deliberate (#255). `publish!` allocates a new
+table, and every pipeline's [`ChainCache`](@ref) serves a chain only to a request whose
+`custommiddleware` snapshot is the exact table that chain was built from. So a chain composed
+before this call — including one a racing request is still composing — can never be served
+after it. This used to be publish-then-`delete!` against an `App`-wide cache (#71), and the
+`delete!` alone could not close the window where a request built its chain from the old table
+and published it after the `delete!` ran (#81); a read-time check has no such window.
 
 Scope: this covers *adding* or *changing* a route's middleware. It does not cover **removal** —
 re-running `urlpatterns` with no `middleware=` kwarg skips the registration branch entirely, so
-a previously-published entry and its cached chain both survive. Pre-existing, and unchanged by
-#71.
-
-**The order is load-bearing.** Publish first, invalidate second. Inverted, a concurrent request
-could miss the freshly-emptied cache, rebuild from the *old* table, and publish that stale
-chain — which first-writer-wins would then make permanent, on every interleaving where the
-request's cache read lands between the two calls.
-
-**The order alone was never sufficient**, and #81 was the residual window: a request whose chain
-construction straddled the whole publish-and-invalidate still cached a stale chain, because the
-`delete!` no-oped on a key the request had not written yet.
-
-    req: cache read                        -> miss
-    req: snapshot(custommiddleware)        -> OLD table
-    reg: publish!(custommiddleware, ...)
-    reg: delete!(middleware_cache, key)    -> key absent, no-op
-    req: cache!(middleware_cache, key, ..) -> stale chain, first-writer-wins, permanent
-
-That is closed now, on the *other* side: `compose` publishes through
-[`cache_if_current!`](@ref) (src/types.jl) rather than `cache!`, which re-checks
-`custommiddleware`'s table identity while holding the cache's lock. The `delete!` below and that
-re-check are therefore totally ordered on one lock, so a stale chain is either refused outright
-or removed by this `delete!` immediately afterwards. The full argument, and the one invariant it
-rests on — `delete!` must keep taking the lock even when the key is absent — is in
-`cache_if_current!`'s docstring.
-
-Both halves are still needed. `delete!` handles the chain cached *before* registration; the
-identity check handles the chain built before but published after it.
+a previously-published entry survives, and so do chains built from it. Pre-existing, and
+unchanged by #71 or #255.
 """
 function publish_route_middleware!(ctx::App, key::String, value::RouteMiddleware)
     publish!(ctx.service.custommiddleware, key, value)
-    # Every settings variant, not just one (#79): the cache is keyed on route + pipeline
-    # settings, so a route can hold up to `length(CACHE_TAGS)` chains and invalidation has to
-    # drop all of them. One lock acquisition, at most one copy — and it takes that lock
-    # unconditionally, which #81's proof depends on.
-    delete!(ctx.service.middleware_cache, (key * tag for tag in CACHE_TAGS))
     return value
 end
 
@@ -358,29 +289,30 @@ function foldlayers(handler::Function, layers::Vector...) :: Function
 end
 
 """
-This function is used to build up the middleware chain for all our endpoints
+    buildmiddleware(key, handler, globalmiddleware, custom) -> Function
+
+Compose the chain for route `key` from `custom` — the `custommiddleware` snapshot the calling
+request already took. Runs on a [`ChainCache`](@ref) miss only: once per route per registration
+generation, per pipeline.
 """
 function buildmiddleware(key::String, handler::Function, globalmiddleware::Vector{Function},
-                         custommiddleware::CopyOnWriteDict{RouteMiddleware}) :: Function
+                         custom::Dict{String, RouteMiddleware}) :: Function
 
     # lookup the middleware for this path.
     #
-    # `snapshot` is taken HERE — not by `compose`, not by the caller. This function runs on
-    # EVERY request whenever `use_cache` is false: `serve(middleware=[...])`,
-    # `internalrequest(...; middleware=[...])`, and every `revise=:lazy|:eager` session
-    # (serve injects `ReviseHandler`). A snapshot hoisted to compose time would freeze the
-    # route table for the life of the server, so routes registered later — Revise re-running
-    # `urlpatterns` — would silently lose their middleware, with no error.
+    # `custom` is the CALLER's per-request snapshot, and it must be that one rather than a fresh
+    # snapshot taken here (#255): `compose` stamps the resulting chain with the snapshot it
+    # passed in, and `cached_chain` serves it only to requests holding that same table. Building
+    # from a later snapshot than the stamp would cache a chain under a generation it was not
+    # built from. The hazard the old NOTE here guarded — a snapshot hoisted to compose time,
+    # freezing the route table for the server's life — now lives in `compose`'s per-request
+    # closure, where its own NOTE covers it.
     #
-    # Taking the wrapper rather than a pre-snapshotted `Dict` is the point: it leaves no
-    # `snapshot(...)` expression at any call site for a future refactor to lift out of the
-    # request path. See `CopyOnWriteDict` (src/types.jl) for why this read needs no lock.
-    # Both slots infer as `Union{Nothing, Vector{Function}}` here since #76; before it, the
-    # table's `Tuple` value type was abstract and this line inferred `Tuple{Any, Any}` —
-    # which is dispatch on every request whenever `use_cache` is false. `NO_ROUTE_MIDDLEWARE`
-    # is the miss-path default; a `(nothing, nothing)` literal infers the same today, and
-    # that constant's docstring says why it is still the one to use.
-    routermiddleware, routemiddleware = get(snapshot(custommiddleware), key, NO_ROUTE_MIDDLEWARE)
+    # Both slots infer as `Union{Nothing, Vector{Function}}` since #76; before it, the table's
+    # `Tuple` value type was abstract and this line inferred `Tuple{Any, Any}`.
+    # `NO_ROUTE_MIDDLEWARE` is the miss-path default; a `(nothing, nothing)` literal infers the
+    # same today, and that constant's docstring says why it is still the one to use.
+    routermiddleware, routemiddleware = get(custom, key, NO_ROUTE_MIDDLEWARE)
 
     # sanitize outputs (either value can be nothing)
     routermiddleware = isnothing(routermiddleware) ? EMPTY_LAYERS : routermiddleware
@@ -393,17 +325,17 @@ function buildmiddleware(key::String, handler::Function, globalmiddleware::Vecto
 end
 
 """
-This function dynamically determines which middleware functions to apply to a request at runtime. 
-If router or route specific middleware is defined, then it's used instead of the globally defined
-middleware. 
+    compose(router, globalmiddleware, custommiddleware) -> (handler -> request function)
+
+The pipeline layer that applies per-route and per-router middleware, chosen per request from
+the route the request resolves to. Global middleware is applied here too — outside the per-route
+layers — so every request, matched or not, runs it exactly once.
+
+Each pipeline gets its own [`ChainCache`](@ref) (#255), so a route's chain is composed once per
+registration generation rather than per request, with or without global middleware.
 """
 function compose(router::HTTP.Router, globalmiddleware::Vector{Function},
-                 custommiddleware::CopyOnWriteDict{RouteMiddleware},
-                 middleware_cache::CopyOnWriteDict{Function};
-                 catch_errors::Bool = true, show_errors::Bool = true, serialize::Bool = true)
-    use_cache = isempty(globalmiddleware)
-    # Fixed for this pipeline's lifetime, so build it once here rather than per request (#79).
-    cache_suffix = cachetag(catch_errors, show_errors, serialize)
+                 custommiddleware::CopyOnWriteDict{RouteMiddleware})
     return function (handler)
         # The chain for "no per-route middleware applies": global middleware only. Built once
         # here because it never varies. `handler` alone would be WRONG — it is the fold
@@ -414,11 +346,20 @@ function compose(router::HTTP.Router, globalmiddleware::Vector{Function},
         # itself, so this costs nothing in that case.
         nocustom = foldlayers(handler, globalmiddleware)
 
-        # NOTE: `middleware_cache` is captured as an *object*; `snapshot` is called per
-        # request below. Hoisting the `snapshot` call out to here would freeze the table at
-        # compose time and silently disable caching — every request would rebuild its chain.
-        # `custommiddleware` is captured the same way and for the same reason; it is
-        # snapshotted per call below and again inside `buildmiddleware` — see its own NOTE.
+        # This pipeline's chains — created HERE, once per `handler`, never shared (#255). Every
+        # chain closes over `handler` and `globalmiddleware`, so a cache that outlives or spans
+        # pipelines would need both in its key; `globalmiddleware` has no stable identity to key
+        # on, which is why the old `App`-wide cache could not cache at all when any was present.
+        # Owned by the pipeline, the key only has to name the route and the registration
+        # generation. See `ChainCache` (src/types.jl).
+        chains = ChainCache()
+
+        # NOTE: `custommiddleware` is captured as an *object*; `snapshot` is called per request
+        # below. Hoisting it to here would freeze the route table at compose time: routes
+        # registered later — Revise re-running `urlpatterns`, a runtime `include_routes` —
+        # would silently run without their middleware, and the emptiness verdict would freeze
+        # with it (#71). The "sees routes registered after it was composed" and "composed
+        # against an EMPTY table" items in test/custommiddleware_tests.jl catch each half.
         return function (req::HTTP.Request)
 
             # #71: `compose` is now installed unconditionally, and THIS is the emptiness test
@@ -429,19 +370,10 @@ function compose(router::HTTP.Router, globalmiddleware::Vector{Function},
             # test/custommiddleware_tests.jl is what catches that — verified by mutation: the
             # non-empty-table guard in the same file stays green under the hoist.
             #
-            # It is also load-bearing for correctness, not just cost: without it, requests
-            # arriving while the table is empty would build a bare chain and `cache!` it, and
-            # `cache!` is first-writer-wins — so middleware registered afterwards would lose
-            # to that cached bare chain and #71 would reappear one level down.
-            #
-            # On the non-empty path this snapshot is one extra 0-allocation acquire-load: two
-            # per request when `use_cache` is false, three on a `use_cache == true` cache miss
-            # (here, the cache read, then `buildmiddleware`). They can disagree only in the
-            # harmless direction — nothing in `src/` ever removes a key from `custommiddleware`,
-            # so a later read can never see an emptier table than this one did.
-            # Bound, not discarded: this snapshot doubles as the generation stamp handed to
-            # `cache_if_current!` below, which is what closes #81's stale-chain window. See
-            # the publish site for why reusing *this* (earlier) snapshot is sound.
+            # One 0-allocation acquire-load, and the only `custommiddleware` read this request
+            # makes: the same snapshot is the generation stamp `cached_chain` checks and, on a
+            # miss, the table `buildmiddleware` composes from — so the chain and its stamp can
+            # never disagree.
             custom_snap = snapshot(custommiddleware)
             isempty(custom_snap) && return nocustom(req)
 
@@ -480,21 +412,6 @@ function compose(router::HTTP.Router, globalmiddleware::Vector{Function},
                     _clear_resolution!(req)
                 end
 
-                # Check if we already have a cached middleware function for this specific
-                # route AND this pipeline's serializer settings. Skipped entirely when per-call
-                # global middleware is present, since then nothing is cached at all.
-                #
-                # The cache key carries `cache_suffix` and the `custommiddleware` key does not
-                # (#79). The chain closes over `handler`, which bakes in this pipeline's
-                # `catch_errors`/`show_errors`/`serialize`; keying on the route alone let the
-                # first pipeline to warm a route serve its settings to every later one, so a
-                # second `internalrequest` with different kwargs was silently ignored. See
-                # `cachetag` for why those three booleans are the complete set of inputs.
-                #
-                # Built BEFORE the plain `genkey` so a cache hit still allocates exactly one
-                # string, as it did before this change. `genkey` is only needed on the miss
-                # path, where `buildmiddleware` looks up `custommiddleware`.
-                #
                 # Both keys use the method the route was DECLARED with, which is the one its
                 # middleware was published under. For most leaves that is `req.method`. A
                 # `DeclaredMethodHandler` leaf is reached by other methods and carries its own:
@@ -503,46 +420,45 @@ function compose(router::HTTP.Router, globalmiddleware::Vector{Function},
                 # `req.method` their guards were never found and never ran. One chain then
                 # serves every method that reaches the leaf, which is sound because the chain
                 # wraps the router terminal and is method-agnostic. A re-publish under the
-                # declared key invalidates it for all of them.
-                mw_method = innerhandler isa DeclaredMethodHandler ? innerhandler.method : req.method
-                if use_cache
-                    cachekey = string(mw_method, '|', path, cache_suffix)
-                    # One acquire-load, then a lookup on a table no writer will ever mutate.
-                    # See `CopyOnWriteDict` (src/types.jl) for why this read needs no lock.
-                    func = get(snapshot(middleware_cache), cachekey, nothing)
-                    if !isnothing(func)
-                        return func(req)
-                    end
-                end
+                # declared key moves `custommiddleware`, so no pipeline serves the old chain.
+                declared = innerhandler isa DeclaredMethodHandler
+                mw_method = declared ? innerhandler.method : req.method
 
-                key = genkey(mw_method, path)
+                # A tuple of two strings that already exist — `req.method` or the leaf's stored
+                # declared method, and HTTP.jl's stored `Leaf.path` — so a cache hit builds no key
+                # string (#250). The
+                # joined `genkey` is needed only below, on a miss, for the `custommiddleware`
+                # lookup. See `ChainKey` (src/types.jl).
+                key = (mw_method, path)
 
-                # Combine all the middleware functions together
-                strategy = buildmiddleware(key, handler, globalmiddleware, custommiddleware)
+                # One acquire-load, then a lookup on a table no writer will ever mutate. `nothing`
+                # both for "never built" and for "built from a table registration has since
+                # replaced" — `cached_chain` never serves a chain across generations.
+                func = cached_chain(chains, custom_snap, key)
+                isnothing(func) || return func(req)
 
-                # Warmup only. Reaching here with `use_cache` means the key was absent from
-                # this request's snapshot, so the publish (first-writer-wins, under the lock)
-                # *is* the second half of the double check. The old unlocked `haskey` pre-check
-                # was a deliberate lock-avoidance optimization — it skipped the lock when
-                # another thread published between the read and here — traded away on purpose:
-                # it was a racy read, and the lock it avoided is warmup-bounded with a short
-                # critical section.
+                # Combine all the middleware functions together, from THIS request's snapshot —
+                # the one the chain is about to be stamped with.
+                strategy = buildmiddleware(genkey(mw_method, path), handler, globalmiddleware,
+                                           custom_snap)
+
+                # Warmup only: once per route per registration generation. The publish decides
+                # how much later requests rebuild, never whether they are served a stale chain —
+                # that is `cached_chain`'s identity check alone, so a registration racing this
+                # request needs no ordering argument here (it did, #81). A request whose
+                # snapshot is already superseded simply declines to publish.
                 #
-                # `cache_if_current!`, NOT `cache!` (#81). Publishing unconditionally could
-                # strand a chain built from a `custommiddleware` table that route registration
-                # has since replaced, and first-writer-wins would then make it permanent —
-                # registered middleware that silently never runs. The extra argument is the
-                # generation stamp: publish only if `custommiddleware` still holds the very
-                # table this chain was derived from.
-                #
-                # `custom_snap` is the snapshot taken above for the emptiness test, which is
-                # *earlier* than the one `buildmiddleware` took for itself. That is deliberate
-                # and safe: if a write landed between the two, the identity check fails and we
-                # decline to cache. Conservative in the safe direction — never the other way.
-                # `cachekey` from the lookup above is still in scope — `if` opens no new scope
-                # in Julia — so reuse it rather than rebuilding the identical string.
-                use_cache && cache_if_current!(middleware_cache, cachekey, strategy,
-                                               custommiddleware, custom_snap)
+                # Only under a key the CLIENT cannot choose. A `DeclaredMethodHandler` leaf keys on
+                # the method it was registered with, so its entries are bounded by the route
+                # table. Every other leaf keys on `req.method`, which the router matched exactly —
+                # except a bare leaf that matches any token (a `"*"` route whose wrapper is hidden
+                # by HTTP.jl-level router middleware, or one registered on the router directly).
+                # Caching those under every token a client sends would grow this table without
+                # bound, each insert copying the whole generation, so a method Nitro does not know
+                # is composed for that one request and never cached. The check sits on the miss
+                # path only, so a hit never pays for it.
+                (declared || mw_method in HTTP_METHODS) &&
+                    cache_chain!(chains, custommiddleware, custom_snap, key, strategy)
 
                 return strategy(req)
             end

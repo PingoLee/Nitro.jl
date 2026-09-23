@@ -384,24 +384,18 @@ function cleanup_expired_sessions!(store::MemoryStore{K, V}) where {K, V}
 end
 
 # ── Copy-on-write table (atomic publish, lock-free reads) ───────────────────────
-# A `String`-keyed table read on the request hot path and written rarely, off it. The two
-# instantiations no longer share a key space: `custommiddleware` keys on the route alone
-# ("METHOD|path", see `genkey`), while `middleware_cache` appends the pipeline's serializer
-# settings ("METHOD|path|CES", see `cachetag`) — because the chain it stores closes over those
-# settings, so the route alone is not a complete key for it (#79).
+# A `String`-keyed table read on the request hot path and written rarely, off it. One
+# instantiation: `custommiddleware :: CopyOnWriteDict{RouteMiddleware}`, route key
+# ("METHOD|path", see `genkey`) → `(router middleware, route middleware)`. Written at route
+# registration via `publish!` (LAST-writer-wins): re-running `urlpatterns` for a path must
+# install the new middleware. "Registration" is not necessarily startup-only: under
+# `revise=:lazy`, `Revise.revise()` runs on a request-handling task (src/core/lifecycle.jl), so
+# re-registration can land while OTHER request tasks are inside `compose` reading this table.
 #
-# Two instantiations, with deliberately different write semantics:
-#
-#   `middleware_cache :: CopyOnWriteDict{Function}` — route key → fully-composed middleware
-#       chain. Written during cache warmup only, once per route, via `cache!`
-#       (FIRST-writer-wins): a cached chain must never change identity underneath a reader.
-#
-#   `custommiddleware :: CopyOnWriteDict{RouteMiddleware}` — route key → `(router middleware,
-#       route middleware)`. Written at route registration via `publish!` (LAST-writer-wins):
-#       re-running `urlpatterns` for a path must install the new middleware. "Registration"
-#       is not necessarily startup-only: under `revise=:lazy`, `Revise.revise()` runs on a
-#       request-handling task (src/core/lifecycle.jl), so re-registration can land while OTHER request
-#       tasks are inside `buildmiddleware` reading this table.
+# (There used to be a second instantiation, `middleware_cache :: CopyOnWriteDict{Function}`,
+# shared by every pipeline on the `App`. #255 replaced it with a per-pipeline
+# [`ChainCache`](@ref) below, which is why `cache!`, `cache_if_current!`, `delete!` and
+# `empty!` are gone from this type: nothing invalidates or clears this table any more.)
 #
 # Shape: copy-on-write behind an atomic reference, NOT a lock around the read. A reader
 # takes one acquire-load of `entries` and works on that snapshot; a writer copies the
@@ -409,41 +403,39 @@ end
 # a reader is ever mutated by *this module* — that is the entire safety argument. Julia's
 # `Dict` tolerates concurrent *readers*, but never a reader concurrent with `setindex!`: a
 # `rehash!` swaps the backing `slots`/`keys`/`vals` arrays underneath the reader, yielding
-# a wrong lookup (one route's chain served for another), a `BoundsError`, or a segfault.
+# a wrong lookup (one route's middleware served for another), a `BoundsError`, or a segfault.
 #
 # Scope of the guarantee, stated honestly: `@atomic` makes the *publish* unwritable, but
 # nothing makes a returned *snapshot* unwritable. `App` is public, so app code can
-# reach `ctx.service.middleware_cache` / `ctx.service.custommiddleware` and `setindex!` a
-# snapshot, reintroducing this bug with no error. `snapshot`'s "immutable by convention" is
-# a convention, enforced by review rather than by the type.
+# reach `ctx.service.custommiddleware` and `setindex!` a snapshot, reintroducing this bug with
+# no error. `snapshot`'s "immutable by convention" is a convention, enforced by review rather
+# than by the type.
 #
-# Why not simply lock the read: every request on an already-cached route would then
-# serialize through one `ReentrantLock`. Every request runs on `Threads.@spawn`, so that is
-# a permanent hot-path cost paid to close a window that only exists during warmup. The
-# steady state here is pure lock-free reads instead.
+# Why not simply lock the read: `compose` snapshots this table on EVERY request that reaches it,
+# not just during a warmup window — it is the emptiness test, and the generation stamp the
+# `ChainCache` is checked against. Every request runs on `Threads.@spawn`, so a lock would
+# serialize the whole server through one `ReentrantLock` to protect writes that happen at
+# registration time.
 #
-# For `custommiddleware` that argument is *stronger*, not weaker. `compose` computes
-# `use_cache = isempty(globalmiddleware)` once; when it is false the cache is never read and
-# never written, so `buildmiddleware` — and its read of this table — runs on EVERY request,
-# forever, not just during a warmup window. `use_cache` is false for any
-# `serve(middleware=[...])` (CORS, sessions, auth, rate limiting — the normal production
-# shape) and for every `revise=:lazy|:eager` session, since `serve` injects `ReviseHandler`.
+# The snapshot's IDENTITY is load-bearing, not just its contents: every write release-stores a
+# freshly allocated `Dict`, so `===` between two snapshots answers "has anything been
+# registered since?" That is the generation stamp `ChainCache` uses. A write path that mutated
+# the published `Dict` in place would therefore break the chain cache as well as the readers.
 #
-# Cost of the trade: each write copies the whole table, so warming R routes is O(R^2)
+# Cost of the trade: each write copies the whole table, so registering R routes is O(R^2)
 # insertions in aggregate and discards R intermediate tables. One-time and off the
-# steady-state path, but it does mean a burst of garbage proportional to the route table.
-# The O(R^2) shape is the durable fact; a wall-clock number here would only rot. If a route
-# table ever gets big enough for this to matter, the answer is to build the table once at
-# route-registration time, not to abandon copy-on-write.
+# steady-state path. The O(R^2) shape is the durable fact; a wall-clock number here would only
+# rot. If a route table ever gets big enough for this to matter, the answer is to build the
+# table once at route-registration time, not to abandon copy-on-write.
 #
 # `entries` is `@atomic`, so a plain `d.entries = ...` raises ConcurrencyViolationError:
-# the type makes the unsynchronized publish that caused this bug unwritable. Bare *reads*
+# the type makes the unsynchronized publish that caused #68 unwritable. Bare *reads*
 # are still legal (and only `:monotonic`) — always go through `snapshot`.
 #
 # Deliberately NOT `<: AbstractDict`. Subtyping would inherit `AbstractDict`-generic
 # fallbacks that touch the live table with no synchronization and never go through
 # `snapshot` — `get!` and `filter!` mutate it, `merge` and `copy` read it. It would also
-# widen the method-ambiguity surface Aqua checks. Four operations, and no `getindex`, is
+# widen the method-ambiguity surface Aqua checks. Two operations, and no `getindex`, is
 # the point. For the same reason there is no `Base.isempty`: spelling `snapshot` at a call
 # site is the signal that the read is a point-in-time view.
 #
@@ -453,17 +445,16 @@ end
 # there is one reference and no gate, so atomicizing that reference directly is the whole
 # mechanism.
 #
-# Both value types are abstract on purpose. `Function`: each route's chain is a distinct
-# closure type produced by `reduce(|>, layers)` in `buildmiddleware`, so no concrete type
-# spans the table; narrowing needs FunctionWrappers, which pins the return type and breaks
-# `serialize=false` (where a handler's raw return value flows out through `compose`).
-# `Tuple`: the value is a positional `(router middleware, route middleware)` pair whose
-# slots are each `Union{Vector{Function}, Nothing}`, and `buildmiddleware`'s lookup default
-# is `(nothing, nothing)`.
+# The value type stays a parameter although one instantiation remains: `RouteMiddleware` is
+# defined further down this file (it names `Nullable`, and its docstring belongs with the other
+# route types), and the tests pin the container's semantics at a second `V` so they do not
+# silently depend on the one in use.
 #
-# The key type is fixed to `String` rather than parameterized: both instantiations key on
-# `genkey`, so a `K` parameter would be a knob no call site ever turns, at the cost of
-# widening every signature in src/routerhof.jl. Adding it later is mechanical.
+# The key type is fixed to `String`, and #250 considered and declined parameterizing it: the only
+# table keys on `genkey`, and a request reads it by key only on a chain-cache MISS (the hit path
+# reads nothing but the snapshot's identity and `isempty`), so a tuple key here would buy
+# nothing per request and would cost a wider signature everywhere. The per-request key that did
+# cost a `String` is `ChainCache`'s, and that one is a tuple — see `ChainKey`.
 mutable struct CopyOnWriteDict{V}
     @atomic entries :: Dict{String, V}
     const lock      :: Base.ReentrantLock
@@ -476,8 +467,7 @@ CopyOnWriteDict{V}() where {V} = CopyOnWriteDict{V}(Dict{String, V}(), Base.Reen
 
 Reader fast path: one acquire-load, allocation-free. The returned `Dict` is immutable by
 convention — never `setindex!`/`delete!` it. The `:acquire` pairs with the `:release` in
-[`cache!`](@ref) / [`publish!`](@ref) / `empty!`, so a value is fully constructed by the
-time a reader can observe it.
+[`publish!`](@ref), so a value is fully constructed by the time a reader can observe it.
 
 Deliberately non-parametric in the signature: one method covers every instantiation and
 still infers the concrete `Dict{String,V}` from a concrete argument.
@@ -485,104 +475,17 @@ still infers the concrete `Dict{String,V}` from a concrete argument.
 @inline snapshot(d::CopyOnWriteDict) = @atomic :acquire d.entries
 
 """
-    cache!(d::CopyOnWriteDict{V}, key::String, value::V) -> V
-
-**First writer wins.** Publish `key => value` unless `key` is already present; return the
-value now in force. Use where an entry, once observed, must never change identity under a
-reader — `middleware_cache`, whose writes are warmup-only. Where re-registration must
-overwrite, use [`publish!`](@ref).
-
-Takes the lock and copies the whole table.
-"""
-function cache!(d::CopyOnWriteDict{V}, key::String, value::V) where {V}
-    return lock(d.lock) do
-        # `:monotonic` suffices: the lock's own acquire/release edges already order this
-        # read against every other writer's publish and that publish's `Dict` contents.
-        current = @atomic :monotonic d.entries
-        # `haskey` + `getindex`, NOT `get(current, key, nothing)`: with `V` a parameter,
-        # `nothing` is not a safe universal absence sentinel — it is a legal value at
-        # `V === Any`, where the sentinel form silently breaks first-writer-wins. Two
-        # lookups of a short `String`, once per key, ever.
-        haskey(current, key) && return current[key]
-        updated = _grown_copy(current)
-        updated[key] = value
-        @atomic :release d.entries = updated
-        return value
-    end
-end
-
-"""
-    cache_if_current!(d::CopyOnWriteDict{V}, key::String, value::V,
-                      source::CopyOnWriteDict, expected::Dict) -> Bool
-
-**First writer wins, and only while `source` has not moved.** Publish `key => value` into `d`
-unless `key` is already present *or* `source`'s table is no longer the one `value` was derived
-from. Returns whether it published.
-
-This is [`cache!`](@ref) plus a generation check, and it exists to close the stale-chain race
-that publish-then-invalidate only narrowed (#81). Registration does
-`publish!(custommiddleware, …)` then `delete!(middleware_cache, …)`; a request whose chain
-construction straddled that whole pair used to `cache!` a chain built from the *old* table, and
-first-writer-wins then made it permanent. Symptom: route middleware registered at runtime that
-silently never runs.
-
-**The generation stamp is the table's own identity — there is no counter.** Every write to a
-`CopyOnWriteDict` release-stores a *freshly allocated* `Dict`, and the caller still holds a
-reference to the one it read, so that object cannot be collected and its address cannot be
-reused while the comparison is live. `===` on the snapshot is therefore a sound generation
-check that costs one acquire-load on the miss path and nothing at all on the hit path.
-
-**Why the window is actually closed, not merely narrower.** The check runs *inside* `d`'s lock,
-and [`delete!`](@ref) acquires that same lock **unconditionally** — it locks first and only then
-early-returns on an absent key. So the racing registration and this publish are totally ordered
-on one lock, leaving exactly two cases:
-
-1. This critical section precedes the registration's `delete!`. The `delete!` therefore runs
-   *after* the insert, sees it (unlock→lock happens-before), and removes it.
-2. The registration's `delete!` precedes this critical section. Then `publish!(source, …)`
-   happened-before that `delete!` (program order), which happened-before this section (lock
-   edge) — so this `snapshot(source)` **must** observe the new table, `!==` fires, and nothing
-   is published.
-
-There is no third case, so no interleaving can strand a stale entry.
-
-!!! warning
-    `delete!` must keep taking the lock even when the key is absent. A lock-free `haskey`
-    pre-check added there as an "optimization" would silently reopen case 2.
-
-`expected` is the snapshot the value was derived from. Passing an *earlier* snapshot than the
-one actually used is safe and is what `compose` does — it reuses the snapshot it already took
-for the emptiness test, and `buildmiddleware` takes its own, later one. If the two disagree,
-this refuses to publish: conservative in the safe direction, never the other way.
-"""
-function cache_if_current!(d::CopyOnWriteDict{V}, key::String, value::V,
-                           source::CopyOnWriteDict, expected::Dict)::Bool where {V}
-    return lock(d.lock) do
-        # Inside the lock, and that placement is the whole proof — see the docstring.
-        snapshot(source) === expected || return false
-        current = @atomic :monotonic d.entries
-        haskey(current, key) && return false
-        updated = _grown_copy(current)
-        updated[key] = value
-        @atomic :release d.entries = updated
-        return true
-    end
-end
-
-"""
     publish!(d::CopyOnWriteDict{V}, key::String, value::V) -> V
 
 **Last writer wins.** Publish `key => value`, replacing any existing entry; return `value`.
 Use where re-registration must take effect — `custommiddleware`, where re-running
-`urlpatterns` for a path installs the new per-route middleware. Where an entry must be
-stable once observed, use [`cache!`](@ref).
+`urlpatterns` for a path installs the new per-route middleware.
 
-When `use_cache` is true, publishing to `custommiddleware` alone is not enough to change what a
-route *serves*: a chain already cached in `middleware_cache` is first-writer-wins and would keep
-winning. (With any global or per-call middleware nothing is cached, and `publish!` alone is
-sufficient.) That is why route middleware goes through `publish_route_middleware!`
-(src/routerhof.jl), which pairs this call with a [`delete!`](@ref) of the same key from the
-cache. Reach for that helper rather than calling `publish!` on `custommiddleware` directly (#71).
+Every publish release-stores a **new** `Dict`, which is what moves every pipeline's
+[`ChainCache`](@ref) to a new generation: a chain composed before this call can no longer be
+served, with no separate invalidation step (#255). Route middleware still goes through
+`publish_route_middleware!` (src/routerhof.jl), the one sanctioned write site, so the
+`RouteMiddleware` arity check stays in one place.
 
 A reader holding an earlier snapshot keeps seeing the earlier value until it takes a new
 one; that is the copy-on-write contract, not a bug. A request already mid-chain finishes
@@ -604,108 +507,12 @@ end
 # either way. It forces a tighter growth curve (16→32→64→…) than `setindex!`'s own policy
 # (16→64→256…), so each generation's backing array stays right-sized: cheaper copies and
 # measurably less garbage across a warmup. It also right-sizes the odd generation where
-# `copy` preserved an over-large capacity.
-function _grown_copy(current::Dict{String, V}) where {V}
+# `copy` preserved an over-large capacity. Shared by `publish!` and `cache_chain!`, which key
+# on different types.
+function _grown_copy(current::Dict{K, V}) where {K, V}
     updated = copy(current)
     sizehint!(updated, length(current) + 1)
     return updated
-end
-
-"""
-    delete!(d::CopyOnWriteDict{V}, key::String) -> CopyOnWriteDict{V}
-
-Drop `key` by publishing a copy without it; a no-op if the key is absent. Readers holding an
-earlier snapshot keep seeing the entry until they take a new one — the copy-on-write contract.
-
-Exists so `middleware_cache` can be *invalidated* rather than only appended to: `cache!` is
-first-writer-wins, so without this a route's composed chain would be permanent and middleware
-registered for that route afterwards could never take effect (#71). See
-`publish_route_middleware!` (src/routerhof.jl) for the pairing and for why the order matters.
-
-Takes the lock; copies the whole table only when the key is actually present. Uses a plain
-`copy`, not `_grown_copy` — that one sizehints for an *added* entry, the wrong direction here.
-
-!!! warning "The lock is taken unconditionally, and that is load-bearing"
-    The absent-key fast path skips the *copy*, never the *lock*. [`cache_if_current!`](@ref)'s
-    proof that no interleaving can strand a stale chain (#81) rests on this call and that
-    publish being totally ordered on `d.lock` — a lock-free `haskey` pre-check added here as an
-    optimization would silently reopen the race, with no test failure and no symptom until a
-    registration happens to race a live request.
-"""
-function Base.delete!(d::CopyOnWriteDict{V}, key::String) where {V}
-    lock(d.lock) do
-        current = @atomic :monotonic d.entries
-        # Skip the copy entirely when there is nothing to drop. Registration re-publishes far
-        # more often than it invalidates a warmed key, so this is the common case. NOTE: this
-        # skips the copy, NOT the lock — see the warning above (#81).
-        haskey(current, key) || return d
-        updated = copy(current)
-        delete!(updated, key)
-        @atomic :release d.entries = updated
-    end
-    return d
-end
-
-"""
-    delete!(d::CopyOnWriteDict{V}, keys) -> CopyOnWriteDict{V}
-
-Drop several keys in **one** publish. Equivalent to calling the single-key method for each, but
-takes the lock once and copies the table at most once — absent keys cost nothing beyond a
-lookup, and if none are present nothing is published at all.
-
-Exists for `publish_route_middleware!` (src/routerhof.jl), which since #79 must invalidate a
-route's chain under every pipeline-settings tag rather than under one key. Doing that as N
-separate `delete!` calls would take the cache lock N times and publish up to N intermediate
-tables for one logical invalidation.
-
-`keys` is any iterable of `String` — a generator is the expected shape, so nothing is
-materialized. It is consumed exactly **once**: an earlier draft probed with `any(...)` and then
-iterated again to delete, which silently skipped the matching key when handed a single-pass
-iterator (`Iterators.Stateful`) — an invalidation that deletes nothing and returns normally,
-i.e. #71's symptom with no error.
-
-!!! warning "The lock is taken unconditionally, and that is load-bearing"
-    Same invariant as the single-key method: the all-absent fast path skips the *publish*, never
-    the *lock*. [`cache_if_current!`](@ref)'s proof (#81) requires this call and that publish to
-    be totally ordered on `d.lock`.
-"""
-function Base.delete!(d::CopyOnWriteDict{V}, keys) where {V}
-    lock(d.lock) do
-        current = @atomic :monotonic d.entries
-        # ONE pass. The copy is made lazily, on the first key that is actually present, so the
-        # common case — invalidating a route nobody has warmed yet — still does no copying. Keys
-        # seen before that point were by definition absent, so skipping them loses nothing.
-        # The lock is already held either way; see the warning above.
-        updated = nothing
-        for k in keys
-            if isnothing(updated)
-                haskey(current, k) || continue
-                updated = copy(current)
-            end
-            delete!(updated, k)
-        end
-        isnothing(updated) && return d
-        @atomic :release d.entries = updated
-    end
-    return d
-end
-
-"""
-    empty!(d::CopyOnWriteDict{V}) -> CopyOnWriteDict{V}
-
-Drop every entry by publishing a fresh table. Deliberately NOT an in-place `empty!` of the
-live `Dict`: `terminate` (src/core/lifecycle.jl) calls this on `middleware_cache` with requests still
-in `compose`, and an in-flight reader must be able to finish against a table nobody mutates.
-
-The fresh table takes its value type from the parameter. (Belt and braces rather than a
-correctness hinge: `entries` is a declared `Dict{String,V}` field, so `setfield!` would
-convert a wrongly-typed table anyway.)
-"""
-function Base.empty!(d::CopyOnWriteDict{V}) where {V}
-    lock(d.lock) do
-        @atomic :release d.entries = Dict{String, V}()
-    end
-    return d
 end
 
 # Represents the application context
@@ -896,7 +703,7 @@ value is discarded.
 
 `InterruptException` is **deferred** the same way [`startup`](@ref) defers it: `shutdown` logs it
 and returns it, and `terminate()` completes **both** shutdown broadcasts, clears the serve-owned
-lifecycle list and the middleware cache, closes the listener — escalating an interrupted drain to
+lifecycle list, closes the listener — escalating an interrupted drain to
 a force-close — and only then re-raises it. If more than one hook is interrupted, each is logged
 and the first is re-raised; the rest are dropped, since an `InterruptException` carries nothing to
 tell them apart (#185).
@@ -1145,13 +952,14 @@ route-level)`, each present or absent (#76).
 
 The field used to be declared `CopyOnWriteDict{Tuple}`. Unparameterized `Tuple` is **abstract**,
 so `buildmiddleware`'s destructure (src/routerhof.jl) inferred `Any` in both slots — followed by
-two `append!` calls on values of unknown type. That is not a once-per-route cost: whenever
-`use_cache == false` —
-`serve(middleware = [...])`, `internalrequest(...; middleware = [...])`, and every
-`revise=:lazy|:eager` session — `buildmiddleware` runs on **every request, forever** (#68). So
-this was steady-state dynamic dispatch on the hot path for the normal production configuration,
-which is what put it under the "no `Any` in the request hot path" rule rather than under
-cosmetics.
+two `append!` calls on values of unknown type. At the time that was not a once-per-route cost:
+any pipeline with global middleware — `serve(middleware = [...])`,
+`internalrequest(...; middleware = [...])`, and every `revise=:lazy|:eager` session — ran
+`buildmiddleware` on **every request, forever** (#68). So it was steady-state dynamic dispatch
+on the hot path for the normal production configuration, which is what put it under the "no
+`Any` in the request hot path" rule rather than under cosmetics. (Since #255 every pipeline
+caches its chains, so `buildmiddleware` is back to once per route per registration generation —
+the narrowing still stands, it is just off the steady-state path now.)
 
 Exactly two shapes are ever stored, from the only two write sites, and both go through
 `publish_route_middleware!`:
@@ -1196,6 +1004,159 @@ and a `(nothing, nothing)` literal would quietly widen the lookup's inferred typ
 while every test stayed green; this cannot, because it would stop constructing.
 """
 const NO_ROUTE_MIDDLEWARE = RouteMiddleware((nothing, nothing))
+
+"""
+    ChainKey
+
+A [`ChainCache`](@ref) key: `(method, route path)` — the same two strings `genkey` joins into
+`"METHOD|path"` for `custommiddleware`, kept apart (#250).
+
+Joining them was the one allocation a cache hit paid: a fresh `String` per request, on every
+app with per-route middleware. Both halves already exist as strings when `compose` needs the key
+— `req.method` (or the literal `"GET"` for an auto-`HEAD` leaf) and HTTP.jl's stored `Leaf.path`
+— so a tuple of them costs nothing to build, and hashing it hashes the same bytes the joined
+string would have.
+
+Not a collision fix, and not claimed as one: `("A|/b", "/c")` and `("A", "/b|/c")` are distinct
+here but join to the same `genkey`, and the chain cached under either is still *composed* from
+`custommiddleware[genkey(...)]`. That needs a method containing `|` — a legal HTTP token
+character that no real method uses — and it predates this key.
+"""
+const ChainKey = Tuple{String, String}
+
+"""
+    ChainCacheState(source, chains)
+
+One generation of a [`ChainCache`](@ref): the `custommiddleware` snapshot `source`, and the
+composed chains built **from that snapshot**. Immutable, so a reader that loaded it can never see
+a chain paired with the wrong table.
+"""
+struct ChainCacheState
+    source :: Dict{String, RouteMiddleware}
+    chains :: Dict{ChainKey, Function}
+end
+
+"""
+    ChainCache()
+
+One pipeline's composed middleware chains (#255). `compose` (src/routerhof.jl) creates one per
+pipeline, so it lives exactly as long as the pipeline does: the server's lifetime under `serve`,
+one call under `internalrequest`.
+
+# Why per pipeline, and why that makes the key complete
+
+A chain is `foldlayers(handler, route mw, router mw, global mw)`. Two of those inputs —
+`handler`, which bakes in `catch_errors`/`show_errors`/`serialize`, and the global middleware —
+are fixed for one pipeline's lifetime; the other two come from one `custommiddleware` snapshot.
+So *(this pipeline, that snapshot, method, path)* determines the chain, and a cache owned by the
+pipeline and stamped with the snapshot is complete **by construction**.
+
+The `App`-wide `middleware_cache` this replaced had to rebuild that completeness argument in its
+key, and could not: `cachetag` carried the three serializer booleans (#79), but global
+middleware has no stable identity to key on, so every pipeline *with* global middleware —
+`serve(middleware = [...])`, every `revise=:lazy|:eager` session — could not cache at all and
+rebuilt its chain on every request, forever. Per-call tokens in a shared key would have fixed that
+for `serve` and leaked an entry per `internalrequest` call; a pipeline-owned cache is thrown away
+with the pipeline instead.
+
+# Invalidation is a read-time check, not a write-time one
+
+[`cached_chain`](@ref) returns a chain only when the stored generation's `source` is the **very
+object** (`===`) the request just snapshotted. Every `publish!` to `custommiddleware` allocates a
+new table, so after any registration no earlier chain can be served — there is nothing to
+delete, and no ordering between the registration and a racing warmup to get right. That replaced
+two mechanisms and a proof: publish-then-`delete!` in `publish_route_middleware!` (#71) and
+`cache_if_current!`'s lock-ordering argument (#81).
+
+The identity compare is sound because both sides are live when it runs: the state holds its
+`source`, and the request holds its snapshot, so neither address can be reused by a new table.
+
+# Why the world age is NOT part of the stamp
+
+Composing a chain *calls* each middleware factory, so it is fair to ask whether a Revise edit to a
+factory — which redefines its method without re-running `urlpatterns` — needs to invalidate the
+cache. Under `serve` it cannot matter: a new task inherits its parent's world age, so every
+request task runs in the world the listener was started in, and `compose` dispatches factories in
+that fixed world whether it caches or not. Measured on the pre-#255 code, which recomposed on
+every request: an edited factory served the old middleware under `serve` all the same.
+(`ReviseHandler`'s `invokelatest` sits *inside* the chain, which is why edits to functions the
+middleware calls do take effect — and still do, since the chain calls them by name.)
+
+A world stamp was tried during #255's review and removed: it changed nothing under `serve`,
+recomposed on every world bump in REPL- and test-driven pipelines, and leaned on the internal
+`Base.tls_world_age`.
+
+`internalrequest` rebuilds its pipeline per call, so it no longer reuses a chain across calls. It
+already pays ~12 µs of pipeline construction per call; one fold on top is noise.
+"""
+mutable struct ChainCache
+    @atomic state :: ChainCacheState
+    const lock    :: Base.ReentrantLock
+end
+
+# Every new cache starts from this one shared state. Its `source` is a `Dict` no
+# `custommiddleware` snapshot can ever be `===` to — each `CopyOnWriteDict` allocates its own —
+# so an empty cache misses on every request until the first `cache_chain!`, which never writes
+# into a state it did not just allocate. Sharing it rather than allocating per cache matters
+# because `internalrequest` builds a pipeline, and so a cache, on every call: 3 allocations
+# each, on apps with no per-route middleware that will never use the cache at all.
+const EMPTY_CHAIN_STATE = ChainCacheState(Dict{String, RouteMiddleware}(), Dict{ChainKey, Function}())
+
+ChainCache() = ChainCache(EMPTY_CHAIN_STATE, Base.ReentrantLock())
+
+"""
+    cached_chain(c::ChainCache, source::Dict{String,RouteMiddleware}, key::ChainKey) -> Union{Function, Nothing}
+
+The chain cached for `key` **in the generation built from `source`**, or `nothing`. One
+acquire-load, then a lookup on a table no writer mutates — allocation-free, which
+test/middleware_cache_tests.jl pins (#250).
+
+`source` must be the `custommiddleware` snapshot the caller takes for this request. A chain
+cached under any other generation is not returned, however recently it was cached — that check
+is the entire staleness guarantee, see [`ChainCache`](@ref).
+"""
+@inline function cached_chain(c::ChainCache, source::Dict{String, RouteMiddleware}, key::ChainKey)
+    state = @atomic :acquire c.state
+    state.source === source || return nothing
+    return get(state.chains, key, nothing)
+end
+
+"""
+    cache_chain!(c::ChainCache, table::CopyOnWriteDict{RouteMiddleware},
+                 source::Dict{String,RouteMiddleware}, key::ChainKey, chain::Function) -> Bool
+
+Record `chain`, built from the snapshot `source` of `table`, under `key`. Returns whether it
+published.
+
+- **Same generation** (`source` is the one already stored): first writer wins. A chain that is
+  already cached keeps its identity and nothing is copied.
+- **Different generation**: start a fresh generation holding only this chain — but only if
+  `source` is still `table`'s *current* snapshot. A slow request that composed against an older
+  table must not throw away a newer generation other requests are already filling.
+
+Neither rule is what keeps a stale chain from being *served*; [`cached_chain`](@ref)'s identity
+check does that on its own. These two only decide how much gets rebuilt, which is why this can be
+checked without holding `table`'s lock: a registration landing just after the check leaves a
+generation nobody will match, and the next request replaces it.
+
+Takes the lock and, on the same-generation path, copies that generation's chain table.
+"""
+function cache_chain!(c::ChainCache, table::CopyOnWriteDict{RouteMiddleware},
+                      source::Dict{String, RouteMiddleware}, key::ChainKey, chain::Function)::Bool
+    return lock(c.lock) do
+        state = @atomic :monotonic c.state
+        if state.source === source
+            haskey(state.chains, key) && return false
+            chains = _grown_copy(state.chains)
+        else
+            snapshot(table) === source || return false
+            chains = Dict{ChainKey, Function}()
+        end
+        chains[key] = chain
+        @atomic :release c.state = ChainCacheState(source, chains)
+        return true
+    end
+end
 
 """
     ROUTE_RESOLUTION_KEY
@@ -1278,10 +1239,10 @@ contents. The `router` check is a true identity compare, which is what it should
 # Staleness within one `App`
 
 `compose` overwrites this entry on every request it matches — cache hit or miss alike, since
-the write sits above the `use_cache` branch — so a later pass that re-resolves the same
+the write sits above the chain-cache lookup — so a later pass that re-resolves the same
 `(router, method, target)` always installs the fresh handler. Re-registration is therefore
-handled by construction, not by invalidation, which is why the chain in `middleware_cache` can
-stay cached while the handler it reaches changes.
+handled by construction, not by invalidation, which is why a pipeline's cached chain
+([`ChainCache`](@ref)) can stay cached while the handler it reaches changes.
 
 That leaves passes that write **no** stash, and those do not rely on an argument at all:
 `compose` calls `_clear_resolution!` (src/routerhof.jl) on every path that reached `gethandler`
@@ -1297,9 +1258,8 @@ reaches it from ordinary Nitro code. `_clear_resolution!`'s docstring carries th
 
 One invariant of that shape survives, because `compose`'s **emptiness fast path** returns before
 `gethandler` and so cannot clear: a request can only take it if every earlier pass took it too,
-since `custommiddleware` never shrinks — nothing in `src/` removes a key from it, and `empty!`
-is called only on `middleware_cache` (src/core/lifecycle.jl, which carries an explicit comment
-*not* to symmetrize it). That one holds.
+since `custommiddleware` never shrinks — nothing in `src/` removes a key from it, and
+`CopyOnWriteDict` no longer has a `delete!` or `empty!` at all (#255). That one holds.
 
 **And all of it is scoped per router, which is the other half.** Reading the old version as
 unconditional is how the cross-`App` defect above got written; the `router` field is what

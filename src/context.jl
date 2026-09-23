@@ -28,7 +28,6 @@ end
     router              :: Router                   = Router()
     custommiddleware    :: CopyOnWriteDict{RouteMiddleware} = CopyOnWriteDict{RouteMiddleware}()
     named_routes        :: Dict{String, String}     = Dict{String, String}()
-    middleware_cache    :: CopyOnWriteDict{Function} = CopyOnWriteDict{Function}()
     external_url        :: Ref{Nullable{String}}    = Ref{Nullable{String}}(nothing)
     prefix              :: Ref{Nullable{String}}    = Ref{Nullable{String}}(nothing)
     eager_revise        :: Ref{Nullable{EagerReviseService}} = Ref{Nullable{EagerReviseService}}(nothing)

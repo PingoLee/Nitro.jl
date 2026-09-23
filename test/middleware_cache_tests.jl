@@ -1,62 +1,41 @@
-@testitem "Copy-on-write dict — parametric container at both instantiations" tags=[:core, :middleware] setup=[NitroCommon] begin
+@testitem "Copy-on-write dict — parametric container" tags=[:core, :middleware] setup=[NitroCommon] begin
 using Test
-using Nitro.Core.Types: CopyOnWriteDict, snapshot, cache!, publish!, RouteMiddleware
+using Nitro.Core.Types: CopyOnWriteDict, snapshot, publish!, RouteMiddleware
 
-# #68 generalized `MiddlewareCache` into `CopyOnWriteDict{V}`, serving two `Service` fields
-# with deliberately different write semantics:
-#   `middleware_cache :: CopyOnWriteDict{Function}`        — `cache!`, FIRST-writer-wins
-#   `custommiddleware :: CopyOnWriteDict{RouteMiddleware}` — `publish!`, LAST-writer-wins
-# These assertions pin the container itself. The per-field behavior lives in the item below
-# and in test/custommiddleware_tests.jl.
-#
-# The second V is spelled `RouteMiddleware` rather than the bare `Tuple` it was before #76
-# on purpose: "both instantiations" in the title means the two `Service` fields, so testing a
-# V that nothing instantiates any more would quietly stop backing that claim.
+# #68 generalized `MiddlewareCache` into `CopyOnWriteDict{V}`. Since #255 it backs one `Service`
+# field, `custommiddleware :: CopyOnWriteDict{RouteMiddleware}` (LAST-writer-wins `publish!`);
+# the chain cache that was its other instantiation became the per-pipeline `ChainCache` (items
+# below). These assertions pin the container at `RouteMiddleware` AND at a second `V`, so its
+# semantics are proven generic rather than accidentally correct for the one value type in use.
 
 probe(d) = snapshot(d)                     # a call boundary, so @inferred/@allocated mean something
 mkf(tag) = (req -> tag)
 
 @testset "snapshot is type-stable and allocation-free at both V" begin
-    cf = CopyOnWriteDict{Function}(); cache!(cf, "k", mkf("f"))
+    cf = CopyOnWriteDict{Function}(); publish!(cf, "k", mkf("f"))
     ct = CopyOnWriteDict{RouteMiddleware}(); publish!(ct, "k", (nothing, Function[]))
     @test @inferred(probe(cf)) isa Dict{String, Function}
     @test @inferred(probe(ct)) isa Dict{String, RouteMiddleware}
     probe(cf); probe(ct)                   # warm up before measuring
-    # The reader fast path is on every request; if this ever regresses we want to hear it.
+    # The reader fast path is on every request that gets past `compose`'s emptiness test; if
+    # this ever regresses we want to hear it.
     @test (@allocated probe(cf)) == 0
     @test (@allocated probe(ct)) == 0
 end
 
-@testset "empty! republishes at the right value type" begin
-    # Documents the field type after a clear; it does NOT guard a port hazard, and an
-    # earlier draft of this comment wrongly claimed it did. Because `entries` is declared
-    # `@atomic entries :: Dict{String, V}`, `setfield!` *converts* — so even a `Base.empty!`
-    # body that hard-coded `Dict{String,Function}()` would still yield a
-    # `Dict{String,RouteMiddleware}` on a `CopyOnWriteDict{RouteMiddleware}`. Verified by
-    # mutation: that revert leaves this green.
-    @test typeof(snapshot(empty!(CopyOnWriteDict{RouteMiddleware}()))) === Dict{String, RouteMiddleware}
-    @test typeof(snapshot(empty!(CopyOnWriteDict{Function}()))) === Dict{String, Function}
-end
-
-@testset "publish! is last-writer-wins; cache! is first-writer-wins" begin
-    # Asserted at BOTH V, so the verb pair is proven generic rather than accidentally
-    # correct only for `Function`.
+@testset "publish! is last-writer-wins" begin
     for (V, v1, v2) in ((Function, mkf("a"), mkf("b")),
                         (RouteMiddleware, (nothing, Function[]), (Function[], nothing)))
         p = CopyOnWriteDict{V}()
         publish!(p, "k", v1); publish!(p, "k", v2)
         @test snapshot(p)["k"] === v2                  # LWW: overwritten
-
-        c = CopyOnWriteDict{V}()
-        cache!(c, "k", v1)
-        @test cache!(c, "k", v2) === v1                # FWW: loser handed the winner
-        @test snapshot(c)["k"] === v1
     end
 end
 
-@testset "publish! never mutates a held snapshot" begin
-    # The LWW analogue of the cache's invariant, and the property that makes the race
-    # impossible for `custommiddleware`.
+@testset "publish! never mutates a held snapshot, and always moves the identity" begin
+    # The first half is what makes lock-free reads safe. The second is what the chain cache's
+    # generation check is built on (#255): a publish that reused the published `Dict` would
+    # leave every pipeline serving chains composed from the old middleware.
     d = CopyOnWriteDict{RouteMiddleware}()
     v1, v2 = (nothing, Function[]), (Function[], nothing)
     publish!(d, "k", v1)
@@ -65,142 +44,176 @@ end
     @test reader["k"] === v1
     @test reader !== snapshot(d)
     @test snapshot(d)["k"] === v2
+
+    # ...including a publish of the value already stored: "nothing changed" is not a reason to
+    # keep the identity, and the chain cache does not need it to be.
+    held = snapshot(d)
+    publish!(d, "k", v2)
+    @test snapshot(d) !== held
 end
 
 @testset "an unsynchronized publish is unwritable at V = RouteMiddleware" begin
     d = CopyOnWriteDict{RouteMiddleware}()
     @test_throws ConcurrencyViolationError d.entries = Dict{String, RouteMiddleware}()
 end
-
-@testset "cache! tolerates a nothing value" begin
-    # Guards the `haskey` presence check. The pre-#68 `get(current, key, nothing)` sentinel
-    # is unsound once V is a parameter: at V === Any, `nothing` is a legal stored value, so
-    # the sentinel form treats a present key as absent and republishes — breaking
-    # first-writer-wins. With `haskey` this returns `nothing`; with the sentinel it returns 1.
-    d = CopyOnWriteDict{Any}()
-    cache!(d, "k", nothing)
-    @test cache!(d, "k", 1) === nothing
-    @test snapshot(d)["k"] === nothing
-end
 end
 
 
-@testitem "Middleware cache — copy-on-write publish" tags=[:core, :middleware] setup=[NitroCommon] begin
+@testitem "Chain cache — generation-checked, copy-on-write" tags=[:core, :middleware] setup=[NitroCommon] begin
 using Test
-using Nitro.Core.Types: CopyOnWriteDict, snapshot, cache!
+using Nitro.Core.Types: ChainCache, ChainCacheState, ChainKey, cached_chain, cache_chain!,
+                        CopyOnWriteDict, snapshot, publish!, RouteMiddleware
 
-# Regression test for #35. `CopyOnWriteDict{Function}` backs `compose`'s per-route chain lookup
-# (src/routerhof.jl), which is read lock-free on every request while warmup writes are
-# still landing. It used to be a plain `Dict` read outside the lock that guarded its
-# writes — a `rehash!` under a concurrent reader yields a wrong lookup (one route's chain
-# served for another), a `BoundsError`, or a segfault.
+# Unit coverage for `ChainCache` (src/types.jl, #255): one pipeline's composed chains, stamped
+# with the `custommiddleware` snapshot they were built from. Two properties, tested separately:
 #
-# Most of these assertions are deliberately deterministic and single-threaded: they do not
-# test the race, they test the invariant that makes the race impossible — no `Dict` is
-# mutated after a reader can reach it. Measured against a faithful reconstruction of the
-# pre-fix shape, 6 assertions across testsets 2, 4 and 5 hard-fail. The last testset is the
-# genuine race, and needs real parallelism to mean anything (see its own comment).
+#   * STALENESS — a chain is returned only to a caller holding the very snapshot it was built
+#     from. That replaced #71's invalidating `delete!` and #81's lock-ordering proof, so it is
+#     the property a regression would silently reopen: registered middleware that never runs.
+#   * #35 — the published generation is never mutated under a lock-free reader.
 
-mk(tag) = (req -> tag)          # stand-in composed chain; only identity is ever checked
+mkf(tag) = (req -> tag)          # stand-in composed chain; only identity/result is checked
+table() = (t = CopyOnWriteDict{RouteMiddleware}(); publish!(t, "GET|/a", (nothing, Function[])); t)
 
-@testset "publish is visible and returns the winner" begin
-    c = CopyOnWriteDict{Function}()
-    @test isempty(snapshot(c))
-    f = mk("a")
-    @test cache!(c, "GET|/a", f) === f
-    @test snapshot(c)["GET|/a"] === f
+@testset "a fresh cache misses for every snapshot" begin
+    c, t = ChainCache(), table()
+    @test cached_chain(c, snapshot(t), ("GET", "/a")) === nothing
+    @test cached_chain(c, Dict{String, RouteMiddleware}(), ("GET", "/a")) === nothing
 end
 
-@testset "a published snapshot is never mutated" begin
-    c = CopyOnWriteDict{Function}()
-    f, g = mk("a"), mk("b")
-    cache!(c, "GET|/a", f)
-    reader = snapshot(c)          # what an in-flight request is holding
-    cache!(c, "GET|/b", g)        # a warmup write lands underneath it
-
-    # The whole safety argument. Against the pre-fix shared plain `Dict`, `reader` would
-    # have gained the key in place — the exact reader-vs-`rehash!` window of #35.
-    @test length(reader) == 1
-    @test !haskey(reader, "GET|/b")
-    @test reader["GET|/a"] === f
-    @test reader !== snapshot(c)
-    @test length(snapshot(c)) == 2
+@testset "publish then hit, within one generation" begin
+    c, t = ChainCache(), table()
+    snap, f = snapshot(t), mkf("a")
+    @test cache_chain!(c, t, snap, ("GET", "/a"), f)
+    @test cached_chain(c, snap, ("GET", "/a")) === f
+    @test cached_chain(c, snap, ("GET", "/other")) === nothing
 end
 
-@testset "first writer wins; an already-cached key publishes nothing" begin
-    c = CopyOnWriteDict{Function}()
-    f, g = mk("first"), mk("second")
-    cache!(c, "GET|/a", f)
-    published = snapshot(c)
-    @test cache!(c, "GET|/a", g) === f       # the loser is handed the winner
-    @test snapshot(c)["GET|/a"] === f
-    @test snapshot(c) === published          # no pointless copy on the already-cached path
+@testset "a registration makes every earlier chain unservable" begin
+    # THE staleness property. No `delete!` runs anywhere: the registration's `publish!` allocates
+    # a new table, and the old chain is simply not returned to anyone holding it.
+    c, t = ChainCache(), table()
+    snap0 = snapshot(t)
+    cache_chain!(c, t, snap0, ("GET", "/a"), mkf("old"))
+
+    publish!(t, "GET|/b", (nothing, Function[]))        # a DIFFERENT route is registered
+    snap1 = snapshot(t)
+    @test cached_chain(c, snap1, ("GET", "/a")) === nothing   # conservative: any write moves it
+
+    @test cache_chain!(c, t, snap1, ("GET", "/a"), mkf("new"))
+    @test cached_chain(c, snap1, ("GET", "/a"))(nothing) == "new"
+    # The new generation starts empty — nothing is carried over from the old one.
+    @test length((@atomic c.state).chains) == 1
+    # A request still holding the old table now misses too, and rebuilds from what it holds.
+    @test cached_chain(c, snap0, ("GET", "/a")) === nothing
 end
 
-@testset "empty! swaps a fresh table in — it does not clear the reader's" begin
-    c = CopyOnWriteDict{Function}()
-    cache!(c, "GET|/a", mk("a")); cache!(c, "GET|/b", mk("b"))
-    reader = snapshot(c)                     # an in-flight request during shutdown
-    @test empty!(c) === c
-    @test isempty(snapshot(c))
-    # `terminate` (src/core/lifecycle.jl) calls this while requests are still in `compose`. An
-    # in-place `empty!(::Dict)` would have pulled the table out from under `reader`.
-    @test length(reader) == 2
-    @test reader["GET|/a"] isa Function
+@testset "the #81 straddle: built from the old table, published after the registration" begin
+    # req: snapshot -> T0; reg: publish! -> T1; req: cache_chain!(…, T0, …)
+    # The table has moved and T0 is not the stored generation, so this declines. Even if it had
+    # published, the next request (holding T1) would not be served it — see the testset above.
+    c, t = ChainCache(), table()
+    snap0 = snapshot(t)
+    publish!(t, "GET|/a", (nothing, Function[mkf("mw")]))
+    @test cache_chain!(c, t, snap0, ("GET", "/a"), mkf("stale")) == false
+    @test cached_chain(c, snapshot(t), ("GET", "/a")) === nothing
+end
+
+@testset "a slow request cannot replace a newer generation" begin
+    c, t = ChainCache(), table()
+    snap0 = snapshot(t)
+    publish!(t, "GET|/b", (nothing, Function[]))
+    snap1 = snapshot(t)
+    cache_chain!(c, t, snap1, ("GET", "/a"), mkf("current"))
+    current = @atomic c.state
+
+    # Composed against T0, publishing after T1's generation is in: refused, state untouched.
+    @test cache_chain!(c, t, snap0, ("GET", "/c"), mkf("slow")) == false
+    @test (@atomic c.state) === current
+    @test cached_chain(c, snap1, ("GET", "/a"))(nothing) == "current"
+end
+
+@testset "first writer wins within a generation, and publishes nothing" begin
+    c, t = ChainCache(), table()
+    snap = snapshot(t)
+    f, g = mkf("first"), mkf("second")
+    @test cache_chain!(c, t, snap, ("GET", "/a"), f)
+    published = @atomic c.state
+    @test cache_chain!(c, t, snap, ("GET", "/a"), g) == false
+    @test cached_chain(c, snap, ("GET", "/a")) === f          # identity never changes under a reader
+    @test (@atomic c.state) === published                # no pointless copy
+end
+
+@testset "a published generation is never mutated" begin
+    # #35's invariant, carried over: a reader holding a generation sees it exactly as it was.
+    c, t = ChainCache(), table()
+    snap = snapshot(t)
+    cache_chain!(c, t, snap, ("GET", "/a"), mkf("a"))
+    held = @atomic c.state
+    cache_chain!(c, t, snap, ("GET", "/b"), mkf("b"))
+    @test length(held.chains) == 1
+    @test !haskey(held.chains, ("GET", "/b"))
+    @test held !== (@atomic c.state)
+    @test length((@atomic c.state).chains) == 2
 end
 
 @testset "an unsynchronized publish is unwritable" begin
-    c = CopyOnWriteDict{Function}()
-    # `entries` is declared `@atomic`, so the plain field write that caused #35 is a
-    # runtime error rather than a silent data race. This is the property that keeps the
-    # bug from being reintroduced by someone reaching past `cache!`.
-    @test_throws ConcurrencyViolationError c.entries = Dict{String, Function}()
+    # `state` is `@atomic`, so the plain field write that caused #35 is a runtime error rather
+    # than a silent data race.
+    c = ChainCache()
+    @test_throws ConcurrencyViolationError c.state = ChainCacheState(Dict{String, RouteMiddleware}(),
+                                                                       Dict{ChainKey, Function}())
+end
+
+@testset "a hit allocates nothing, key included (#250)" begin
+    # The hit path used to build `string(method, '|', path, tag)` per request — one `String`,
+    # the only allocation a cache hit paid. The key is now a tuple of strings that already exist,
+    # so building it AND looking it up must allocate nothing. Built inside the probe from two
+    # separate strings, exactly as `compose` does from `req.method` and `Leaf.path`, so a key
+    # type that joined them would show up here.
+    c, t = ChainCache(), table()
+    snap = snapshot(t)
+    method, route = "GET", "/a"
+    cache_chain!(c, t, snap, (method, route), mkf("a"))
+    probe(c, snap, m, p) = cached_chain(c, snap, (m, p))
+    @test probe(c, snap, method, route)(nothing) == "a"        # warm up, and it is a hit
+    @test (@allocated probe(c, snap, method, route)) == 0
+    @test @inferred(Union{Function, Nothing}, probe(c, snap, method, route)) isa Function
 end
 
 @testset "concurrent writers lose nothing" begin
-    c = CopyOnWriteDict{Function}()
-    fs = Dict("GET|/r$i" => mk("r$i") for i in 1:64)
-    # Scope note, honestly: this passes identically against the pre-fix shape, because the
-    # pre-fix WRITE path was already correctly locked — #35 was a read bug. Keep it as a
-    # `cache!` unit test (no lost updates, first-writer-wins holds under interleaving); do
-    # not read it as a #35 regression test. The regression coverage is testsets 2/4/5 and
-    # the race testset below.
+    # A `cache_chain!` unit test (no lost updates under interleaving), not a #35 test — the
+    # write path is locked either way. The race is the next testset.
+    c, t = ChainCache(), table()
+    snap = snapshot(t)
+    fs = Dict(("GET", "/r$i") => mkf("r$i") for i in 1:64)
     @sync for (k, f) in fs
-        @async cache!(c, k, f)
+        @async cache_chain!(c, t, snap, k, f)
     end
-    final = snapshot(c)
-    @test length(final) == 64
-    @test all(final[k] === f for (k, f) in fs)
+    @test all(cached_chain(c, snap, k) === f for (k, f) in fs)
 end
 
 @testset "lock-free readers are not corrupted by a concurrent writer" begin
-    # THE #35 race itself. This needs REAL parallelism: `@async` produces sticky tasks bound
-    # to the spawning thread, so an `@async` reader can never actually overlap a writer —
-    # cooperative scheduling has no yield point inside a `Dict` lookup. Hence
-    # `Threads.@spawn`, gated on thread count so the spin loop cannot starve the writer at
-    # `-t 1`. CI runs 1 and 2, so the gated branch does execute in CI.
-    c = CopyOnWriteDict{Function}()
-    for i in 1:8
-        cache!(c, "GET|/seed$i", mk("seed$i"))
-    end
-
+    # THE #35 race, against `ChainCache`. This needs REAL parallelism: `@async` produces sticky
+    # tasks bound to the spawning thread, so an `@async` reader can never actually overlap a
+    # writer. Hence `Threads.@spawn`, gated on thread count so the spin loop cannot starve the
+    # writer at `-t 1`. CI runs 1 and 2, so the gated branch does execute in CI. 25 rounds, as the
+    # `CopyOnWriteDict` version of this test measured: one round detects a reintroduced #35 only
+    # ~13% of the time at `-t 2`, 25 rounds ~97%.
     if Threads.nthreads() > 1
         bad = Threads.Atomic{Int}(0)
-        # ROUNDS, not one pass: a single round detects a reintroduced #35 only ~13% of the
-        # time at `-t 2` (measured, 200 trials). A round costs ~0.5 ms, so 25 of them buy
-        # ~97% detection for ~12 ms. Measured false-positive rate on correct code: 0/600.
         for _ in 1:25
-            c = CopyOnWriteDict{Function}()
+            c, t = ChainCache(), table()
+            snap = snapshot(t)
             for i in 1:8
-                cache!(c, "GET|/seed$i", mk("seed$i"))
+                cache_chain!(c, t, snap, ("GET", "/seed$i"), mkf("seed$i"))
             end
             stop = Threads.Atomic{Bool}(false)
             readers = [Threads.@spawn begin
                 try
                     while !stop[]
-                        t = snapshot(c)      # one acquire-load, then read it repeatedly
                         for i in 1:8
-                            f = get(t, "GET|/seed$i", nothing)
+                            f = cached_chain(c, snap, ("GET", "/seed$i"))
                             if f === nothing || f(nothing) != "seed$i"
                                 Threads.atomic_add!(bad, 1)
                             end
@@ -212,11 +225,11 @@ end
             end for _ in 1:max(1, Threads.nthreads() - 1)]
 
             writer = Threads.@spawn begin
-                # `finally`: if `cache!` ever throws, `stop` must still be set or the
-                # reader spin loops never exit and the item hangs to its 600 s timeout.
+                # `finally`: if the writer ever throws, `stop` must still be set or the reader
+                # spin loops never exit and the item hangs to its timeout.
                 try
                     for i in 1:200
-                        cache!(c, "GET|/w$i", mk("w$i"))
+                        cache_chain!(c, t, snap, ("GET", "/w$i"), mkf("w$i"))
                     end
                 finally
                     stop[] = true
@@ -225,70 +238,59 @@ end
 
             wait(writer)
             foreach(wait, readers)
-            @test length(snapshot(c)) == 208
+            @test length((@atomic c.state).chains) == 208
         end
-
-        # Against the pre-fix plain `Dict` this trips: a `rehash!` under a lock-free reader
-        # gives a missing or wrong lookup, or throws out of the reader.
         @test bad[] == 0
     else
-        # `-t 1`: no parallelism to be had. Assert the same invariant sequentially so the
-        # testset is never vacuously green (cf. test/parallel_tests.jl's both-branches shape).
-        held = snapshot(c)
-        for i in 1:200
-            cache!(c, "GET|/w$i", mk("w$i"))
+        # `-t 1`: assert the same invariant sequentially so the testset is never vacuously green.
+        c, t = ChainCache(), table()
+        snap = snapshot(t)
+        for i in 1:8
+            cache_chain!(c, t, snap, ("GET", "/seed$i"), mkf("seed$i"))
         end
-        @test length(held) == 8                      # the held snapshot never grew
-        @test all(held["GET|/seed$i"](nothing) == "seed$i" for i in 1:8)
-        @test length(snapshot(c)) == 208
+        held = @atomic c.state
+        for i in 1:200
+            cache_chain!(c, t, snap, ("GET", "/w$i"), mkf("w$i"))
+        end
+        @test length(held.chains) == 8                      # the held generation never grew
+        @test all(held.chains[("GET", "/seed$i")](nothing) == "seed$i" for i in 1:8)
+        @test length((@atomic c.state).chains) == 208
     end
 end
 end
 
 
-@testitem "Middleware cache — concurrent warmup through compose" tags=[:core, :middleware] setup=[NitroCommon] begin
+@testitem "Chain cache — concurrent warmup through compose" tags=[:core, :middleware] setup=[NitroCommon] begin
 using Test
 using HTTP
 using Random: randperm
 using Nitro
-using Nitro.Core.Types: snapshot
-using Nitro.Core.RouterHOF: cachetag
 import Nitro: App
 
-# Companion to the unit item above: drives the real `compose` fast path (src/routerhof.jl)
-# on a LOCAL App, so this item touches no global CONTEXT[] router state and is
-# order-independent within runtests.jl.
+# Drives the real `compose` (src/routerhof.jl) on a LOCAL App and ONE composed pipeline — the
+# `serve` shape, where the pipeline and so its `ChainCache` live for the server's lifetime. Each
+# `internalrequest` builds a new pipeline with a cold cache (#255), so it cannot show a warm one.
 #
-# One precondition to reach the cache: caching is on only when there is no per-call global
-# middleware (`use_cache = isempty(globalmiddleware)`, src/routerhof.jl) → `internalrequest` is
-# called with NO `middleware=` kwarg.
+# The cache is observed through behavior, not by reaching into it: a chain is composed only on a
+# cache miss, and composing calls each middleware FACTORY once — so factory calls count builds.
 #
-# Registering every route with `middleware=` is still what makes each key's chain distinct and
-# the route middleware observable — but since #71 it is no longer what installs `compose`,
-# which is now unconditional. It does still get these requests past the per-request emptiness
-# fast path.
-#
-# `terminate()` is deliberately not exercised end-to-end: it requires `isopen(service)`,
-# i.e. a live `serve(async=true)`, which buys a `:network` flake risk for no signal over
-# the direct `empty!` assertions in the last testset.
+# Scope, stated accurately: a FUNCTIONAL test of the key→chain mapping and of the cache being
+# reached — NOT a race test. `@async` tasks are sticky to the spawning thread, so no reader
+# overlaps a writer here. The real race is in the unit item above, under `Threads.@spawn`.
 
 const K = 24        # distinct routes — enough to exercise many keys, not a race parameter
 const M = 4         # requests per route
-const TAG = cachetag(false, true, true)   # catch_errors=false, show_errors/serialize default
 
-# Scope, stated accurately: this item is a FUNCTIONAL regression test for the key→chain
-# mapping and for the cache actually being reached — it is NOT a race test. `@async` tasks
-# are sticky to the spawning thread, and the factory `yield()` below fires inside
-# `buildmiddleware`, i.e. after the cache read-miss and before the publish. Reads and writes
-# therefore phase-separate cleanly and no reader ever overlaps a writer here. The real race
-# lives in the unit item above, under `Threads.@spawn`.
-function tagging_middleware(tag::String)
+builds = zeros(Int, K)
+function tagging_middleware(i::Int)
+    tag = "route-$i"
     return function (handler)
-        yield()
+        builds[i] += 1
+        yield()                                         # interleave misses during warmup
         return function (req::HTTP.Request)
             yield()
             inner = handler(req)                        # router + serializer for this route
-            return Res.send(tag * "|" * text(inner))        # NEW response; never mutate `inner`
+            return Res.send(tag * "|" * text(inner))    # NEW response; never mutate `inner`
         end
     end
 end
@@ -296,66 +298,45 @@ end
 ctx = App()
 Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
     path("/warm/$i", (req::HTTP.Request) -> Res.send("handler-$i"),
-         middleware = [tagging_middleware("route-$i")])
+         middleware = [tagging_middleware(i)])
     for i in 1:K
 ])
 
+# `catch_errors=false` is deliberate: any error in the chain propagates instead of being
+# laundered into a 500 that the body assertions would then (wrongly) explain.
+pipeline = Nitro.Core.setupmiddleware(ctx; catch_errors=false)
+
 targets  = [(i, "/warm/$i") for i in 1:K for _ in 1:M]
 shuffled = targets[randperm(length(targets))]           # interleave misses with hits
-
-# `catch_errors=false` is deliberate: any error in the chain propagates instead of being
-# laundered into a 500 that the body assertion below would then (wrongly) explain.
 results = Vector{String}(undef, length(shuffled))
 @sync for (n, (_, target)) in enumerate(shuffled)
     @async begin
-        r = Nitro.Core.internalrequest(ctx, HTTP.Request("GET", target); catch_errors=false)
+        r = pipeline(HTTP.Request("GET", target))
         results[n] = "$(r.status)|$(text(r))"
     end
 end
 
 @testset "every request got its own route's chain" begin
-    # A stale or mis-keyed cache read serves route A's chain for route B — visible here as
-    # a body mismatch. This is deterministic key→chain coverage, not race coverage: per the
-    # header, no reader overlaps a writer in this item.
+    # A mis-keyed read serves route A's chain for route B — visible here as a body mismatch.
     @test all(results[n] == "200|route-$(shuffled[n][1])|handler-$(shuffled[n][1])"
               for n in eachindex(shuffled))
 end
 
-@testset "warmup converged to exactly one entry per route" begin
-    # Cache keys carry this pipeline's serializer settings since #79 — `catch_errors=false`
-    # with default `show_errors`/`serialize` is "|cES". `custommiddleware` keeps the plain
-    # route key; only this table is suffixed.
-    entries = snapshot(ctx.service.middleware_cache)
-    @test length(entries) == K
-    @test all(haskey(entries, "GET|/warm/$i" * TAG) for i in 1:K)
-end
-
-@testset "cache-hit path returns the right chain" begin
-    for i in 1:K
-        r = Nitro.Core.internalrequest(ctx, HTTP.Request("GET", "/warm/$i"); catch_errors=false)
-        @test r.status == 200
-        @test text(r) == "route-$i|handler-$i"
+@testset "warmup converges: every route built, and no further builds once warm" begin
+    # Concurrent misses on one route may each build (the factory yields between the miss and the
+    # publish), so the warmup count is at least one per route, not exactly one.
+    @test all(>=(1), builds)
+    warm = copy(builds)
+    for _ in 1:M, i in 1:K
+        @test text(pipeline(HTTP.Request("GET", "/warm/$i"))) == "route-$i|handler-$i"
     end
+    @test builds == warm
 end
 
-@testset "empty! re-warms cleanly — the terminate path" begin
-    empty!(ctx.service.middleware_cache)
-    @test isempty(snapshot(ctx.service.middleware_cache))
-    r = Nitro.Core.internalrequest(ctx, HTTP.Request("GET", "/warm/1"); catch_errors=false)
-    @test text(r) == "route-1|handler-1"
-    @test haskey(snapshot(ctx.service.middleware_cache), "GET|/warm/1" * TAG)
-end
-
-@testset "one composed pipeline re-reads the cache on every request" begin
-    # Guards the `compose` NOTE: the cache object must be captured by the closure and
-    # `snapshot` called PER REQUEST. Hoisting `snapshot` to compose time freezes an empty
-    # table and silently disables the cache — no functional symptom at all, just a
-    # permanent rebuild on every request.
-    #
-    # Nothing above catches that, because `internalrequest` calls `setupmiddleware` (hence
-    # `compose`) per request, so a hoisted snapshot is refreshed every call. `serve()` calls
-    # it exactly ONCE for the server's lifetime. So compose once and reuse the pipeline,
-    # which is what production actually does.
+@testset "one composed pipeline re-reads its cache on every request" begin
+    # Guards `compose`'s NOTEs: the cache must be created per pipeline and consulted PER REQUEST.
+    # A cache that is never read, or never written, has no functional symptom — just a permanent
+    # rebuild on every request, which is #255's symptom.
     factory_calls = Ref(0)
     counting_mw = handler -> (factory_calls[] += 1; req -> handler(req))
 
@@ -363,155 +344,200 @@ end
     Nitro.Core.Routing.urlpatterns(ctx2, "", Nitro.RouteDefinition[
         path("/once", (req::HTTP.Request) -> Res.send("ok"), middleware = [counting_mw])
     ])
-
-    pipeline = Nitro.Core.setupmiddleware(ctx2; catch_errors=false)
+    p = Nitro.Core.setupmiddleware(ctx2; catch_errors=false)
     for _ in 1:5
-        @test text(pipeline(HTTP.Request("GET", "/once"))) == "ok"
+        @test text(p(HTTP.Request("GET", "/once"))) == "ok"
     end
-
-    # `buildmiddleware` — and so the factory — runs only on a cache MISS. One call means
-    # requests 2-5 took the cached chain. Under a hoisted `snapshot` this is 5.
     @test factory_calls[] == 1
 end
+
+@testset "...and so does one WITH global middleware (#255)" begin
+    # THE #255 assertion. Global middleware used to switch the cache off (`use_cache =
+    # isempty(globalmiddleware)`), because the `App`-wide cache had no way to key on it, so this
+    # pipeline composed its chain on every request, forever: 5 here, on unpatched main. That is
+    # every `serve(middleware = [...])` app with per-route middleware, and every
+    # `revise=:lazy|:eager` session (serve injects `ReviseHandler`).
+    factory_calls = Ref(0)
+    counting_mw = handler -> (factory_calls[] += 1; req -> handler(req))
+    global_mw   = handler -> (req::HTTP.Request -> handler(req))
+
+    ctx3 = App()
+    Nitro.Core.Routing.urlpatterns(ctx3, "", Nitro.RouteDefinition[
+        path("/g", (req::HTTP.Request) -> Res.send("ok"), middleware = [counting_mw])
+    ])
+    p = Nitro.Core.setupmiddleware(ctx3; middleware = [global_mw], catch_errors=false)
+    for _ in 1:5
+        @test text(p(HTTP.Request("GET", "/g"))) == "ok"
+    end
+    @test factory_calls[] == 1
+end
+
+@testset "two pipelines on one App do not share chains" begin
+    # Each pipeline's chains close over its own global middleware. Sharing a cache between these
+    # two would serve one pipeline's global layer to the other — the key-completeness failure
+    # #79 was, with global middleware in place of the serializer settings.
+    ctx4 = App()
+    Nitro.Core.Routing.urlpatterns(ctx4, "", Nitro.RouteDefinition[
+        path("/s", (req::HTTP.Request) -> Res.send("h"),
+             middleware = [h -> (req::HTTP.Request -> h(req))])
+    ])
+    wrap(tag) = h -> (req::HTTP.Request -> Res.send(tag * "|" * text(h(req))))
+    pa = Nitro.Core.setupmiddleware(ctx4; middleware = [wrap("A")], catch_errors=false)
+    pb = Nitro.Core.setupmiddleware(ctx4; middleware = [wrap("B")], catch_errors=false)
+    for _ in 1:2
+        @test text(pa(HTTP.Request("GET", "/s"))) == "A|h"
+        @test text(pb(HTTP.Request("GET", "/s"))) == "B|h"
+    end
+end
 end
 
 
-@testitem "Middleware cache — pipeline settings are part of the key" tags=[:core, :middleware] setup=[NitroCommon] begin
+@testitem "Chain cache — a client-chosen method cannot grow the cache" tags=[:core, :middleware] setup=[NitroCommon] begin
 using Test
 using HTTP
 using Nitro
-using Nitro.Core.Types: snapshot
-using Nitro.Core.RouterHOF: cachetag, CACHE_TAGS, genkey
 import Nitro: App, path, text
 
-# Regression test for #79. `middleware_cache` lives on `ctx.service` and outlives any single
-# pipeline, but the chain it stores closes over `handler` — the fold accumulator, which is
-# `DefaultSerializer(catch_errors; show_errors)` wrapping the router. Those settings were baked
-# into the cached value while the key named only the route, so the FIRST pipeline to warm a
-# route won permanently and every later pipeline's kwargs were silently ignored.
+# Found in review of #255. The chain key carries a method, and some leaves match ANY method
+# token. Caching under every token a client sends would grow a pipeline's cache without bound,
+# each insert copying the whole generation. So the key's method must be one the client cannot
+# choose:
 #
-# `compose`'s existing guard did not cover it: it keys on `globalmiddleware` being non-empty,
-# but the settings live in `handler`, which is captured regardless. Pass no per-call middleware
-# and the guard never fires.
+#   * a `"*"` route is a `DeclaredMethodHandler` leaf (#282) and keys on `"*"` — one chain,
+#     whatever the request says;
+#   * a bare leaf that matches any token keys on `req.method`, so only methods Nitro knows are
+#     cached, and anything else is composed for that one request.
 #
-# Not a `serve` bug — one pipeline lives for the server's lifetime there, so its baked settings
-# are the right ones. It bites tests and anything driving `internalrequest` with varying kwargs
-# against a shared context.
+# Observed through a counting GLOBAL factory: `compose` calls it once to prebuild the unmatched
+# chain, then once per chain composition.
+
+folds = Ref(0)
+counting_global = handler -> (folds[] += 1; req::HTTP.Request -> handler(req))
+
+ctx = App()
+Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+    path("/any", (req::HTTP.Request) -> Res.send("any"), method = "*"),
+    # Some route must carry middleware, or every request takes the empty-table fast path.
+    path("/mw", (req::HTTP.Request) -> Res.send("mw"), middleware = [h -> (r::HTTP.Request -> h(r))]),
+])
+# A bare any-method leaf, registered on the router directly so no `DeclaredMethodHandler` wraps
+# it — the shape the method guard exists for.
+HTTP.register!(ctx.service.router, "*", "/raw", (req::HTTP.Request) -> HTTP.Response(200, "raw"))
+p = Nitro.Core.setupmiddleware(ctx; middleware = [counting_global], catch_errors = false)
+@test folds[] == 1
+
+@testset "a \"*\" route caches ONE chain for every method token" begin
+    for _ in 1:2, i in 1:5
+        @test text(p(HTTP.Request("X-JUNK-$i", "/any"))) == "any"
+    end
+    @test text(p(HTTP.Request("POST", "/any"))) == "any"
+    @test folds[] == 1 + 1              # keyed on the declared "*", not on what was sent
+end
+
+@testset "a bare any-method leaf never caches an unknown method" begin
+    before = folds[]
+    for _ in 1:2, i in 1:5
+        @test text(p(HTTP.Request("X-JUNK-$i", "/raw"))) == "raw"
+    end
+    @test folds[] == before + 10        # composed per request, never retained
+end
+
+@testset "...but still caches a known one" begin
+    before = folds[]
+    for _ in 1:3
+        @test text(p(HTTP.Request("POST", "/raw"))) == "raw"
+    end
+    @test folds[] == before + 1
+end
+end
+
+
+@testitem "Chain cache — pipeline settings stay with their pipeline (#79)" tags=[:core, :middleware] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+import Nitro: App, path, text
+
+# Regression test for #79. A cached chain closes over `handler` — the fold accumulator, which is
+# `DefaultSerializer(catch_errors; show_errors)` wrapping the router — so those settings are baked
+# into it. When the cache lived on `ctx.service` and was keyed on the route alone, the FIRST
+# pipeline to warm a route won permanently and every later pipeline's kwargs were silently
+# ignored. #79 put the settings in the key (`cachetag`); #255 made the cache per pipeline, so a
+# chain can only ever be served to the pipeline whose settings it baked in. The assertions below
+# are about behavior and hold for either mechanism.
+
+mw() = handler -> (req::HTTP.Request -> handler(req))
 
 @testset "a later internalrequest's catch_errors is honoured" begin
     ctx = App()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
-        path("/boom", (req::HTTP.Request) -> error("kaboom"),
-             middleware = [handler -> (req::HTTP.Request -> handler(req))]),
+        path("/boom", (req::HTTP.Request) -> error("kaboom"), middleware = [mw()]),
     ])
-
     # Warm the route with catch_errors = true: the thrown error is laundered into a 500.
-    r = Nitro.Core.internalrequest(ctx, HTTP.Request("GET", "/boom");
-                                   catch_errors = true)
+    r = Nitro.Core.internalrequest(ctx, HTTP.Request("GET", "/boom"); catch_errors = true)
     @test r.status == 500
-
-    # THE assertion. Against the unpatched code this returns a 500 too, because the cached
-    # chain carries the first call's catch_errors = true.
+    # Against the pre-#79 code this returns a 500 too: the first call's chain was reused.
     @test_throws Exception Nitro.Core.internalrequest(ctx, HTTP.Request("GET", "/boom");
                                                       catch_errors = false)
 end
 
-@testset "the two settings variants coexist as distinct entries" begin
+@testset "two warm pipelines with different settings keep their own" begin
+    # The `serve`-shaped form: both pipelines are built once and warmed, then interleaved.
     ctx = App()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
-        path("/ok", (req::HTTP.Request) -> Res.send("h"),
-             middleware = [handler -> (req::HTTP.Request -> handler(req))]),
+        path("/boom", (req::HTTP.Request) -> error("kaboom"), middleware = [mw()]),
     ])
-    Nitro.Core.internalrequest(ctx, HTTP.Request("GET", "/ok"); catch_errors = true)
-    Nitro.Core.internalrequest(ctx, HTTP.Request("GET", "/ok"); catch_errors = false)
-
-    entries = snapshot(ctx.service.middleware_cache)
-    @test haskey(entries, "GET|/ok" * cachetag(true, true, true))
-    @test haskey(entries, "GET|/ok" * cachetag(false, true, true))
-    @test length(entries) == 2
-    # ...and `custommiddleware` is NOT suffixed — the two tables have separate key spaces now.
-    @test haskey(snapshot(ctx.service.custommiddleware), genkey("GET", "/ok"))
+    catching = Nitro.Core.setupmiddleware(ctx; catch_errors = true)
+    raising  = Nitro.Core.setupmiddleware(ctx; catch_errors = false)
+    for _ in 1:2
+        @test catching(HTTP.Request("GET", "/boom")).status == 500
+        @test_throws Exception raising(HTTP.Request("GET", "/boom"))
+    end
 end
 
-@testset "serialize=false is its own variant" begin
+@testset "registration reaches every pipeline's cached chain" begin
+    # #250's acceptance: invalidation must reach a route's chain in EVERY pipeline, with a test
+    # that fails if it silently reaches none. Two warm pipelines with different settings, one
+    # re-registration, and both must run the new middleware — against an invalidation that
+    # matched nothing, both keep answering "h".
+    builds = Ref(0)
+    counted = handler -> (builds[] += 1; req::HTTP.Request -> handler(req))
     ctx = App()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
-        path("/s", (req::HTTP.Request) -> Res.send("h"),
-             middleware = [handler -> (req::HTTP.Request -> handler(req))]),
+        path("/other", (req::HTTP.Request) -> Res.send("o"), middleware = [mw()]),
+        path("/v", (req::HTTP.Request) -> Res.send("h"), middleware = [counted]),
     ])
-    Nitro.Core.internalrequest(ctx, HTTP.Request("GET", "/s"); serialize = true)
-    Nitro.Core.internalrequest(ctx, HTTP.Request("GET", "/s"); serialize = false)
-    entries = snapshot(ctx.service.middleware_cache)
-    @test haskey(entries, "GET|/s" * cachetag(true, true, true))
-    @test haskey(entries, "GET|/s" * cachetag(true, true, false))
-end
-
-@testset "registration invalidates every settings variant" begin
-    # The batch `delete!`. Invalidating only the variant that happens to match the registering
-    # caller's settings would leave the others stranded — #71's symptom for every OTHER
-    # pipeline, which is exactly the failure a per-key invalidation would reintroduce.
-    ctx = App()
-    Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
-        path("/other", (req::HTTP.Request) -> Res.send("o"),
-             middleware = [handler -> (req::HTTP.Request -> handler(req))]),
-        path("/v", (req::HTTP.Request) -> Res.send("h")),
-    ])
-    Nitro.Core.internalrequest(ctx, HTTP.Request("GET", "/other"); catch_errors = true)
-    Nitro.Core.internalrequest(ctx, HTTP.Request("GET", "/v"); catch_errors = true)
-    Nitro.Core.internalrequest(ctx, HTTP.Request("GET", "/v"); catch_errors = false)
-    @test count(k -> startswith(k, "GET|/v|"), keys(snapshot(ctx.service.middleware_cache))) == 2
+    p1 = Nitro.Core.setupmiddleware(ctx; catch_errors = true)
+    p2 = Nitro.Core.setupmiddleware(ctx; catch_errors = false)
+    for _ in 1:2
+        @test text(p1(HTTP.Request("GET", "/v"))) == "h"
+        @test text(p2(HTTP.Request("GET", "/v"))) == "h"
+    end
+    @test builds[] == 2              # one per pipeline: both are warm before the registration
 
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/v", (req::HTTP.Request) -> Res.send("h"),
              middleware = [handler -> (req::HTTP.Request -> Res.send("late|" * text(handler(req))))]),
     ])
-    entries = snapshot(ctx.service.middleware_cache)
-    @test !any(startswith(k, "GET|/v|") for k in keys(entries))     # all variants dropped
-    @test haskey(entries, "GET|/other" * cachetag(true, true, true)) # untouched
-
-    # Both variants now see the newly registered middleware.
-    @test text(Nitro.Core.internalrequest(ctx, HTTP.Request("GET", "/v");
-                                          catch_errors = true)) == "late|h"
-    @test text(Nitro.Core.internalrequest(ctx, HTTP.Request("GET", "/v");
-                                          catch_errors = false)) == "late|h"
+    @test text(p1(HTTP.Request("GET", "/v"))) == "late|h"
+    @test text(p2(HTTP.Request("GET", "/v"))) == "late|h"
+    @test text(p1(HTTP.Request("GET", "/other"))) == "o"     # other routes still resolve
 end
 
-@testset "keys cannot collide across routes — the tag is fixed width" begin
-    # Security-relevant invariant. A route path may itself contain `|`, so route `/a` under one
-    # tag and route `/a|X` under another are competing for the same key space. A cache collision
-    # there means one route's composed chain is served for a DIFFERENT route: the wrong
-    # middleware runs, and if the middleware that goes missing is a `GuardMiddleware`, the route
-    # it was registered on is served without it.
-    #
-    # Fixed-width tags make the proof trivial — every tag is exactly 4 characters, so
-    # `key1 * tag1 == key2 * tag2` forces `|key1| == |key2|` hence `key1 == key2`. Variable
-    # widths would not automatically collide, but they would replace that one-line argument with
-    # a case analysis over the whole tag set, re-done on every change to it. This pins the cheap
-    # invariant instead: a future "shorten the common tag" optimization trips here.
-    @test all(length(t) == 4 for t in CACHE_TAGS)
-
+@testset "routes whose paths share a prefix never share a chain" begin
+    # Security-relevant: a route path may itself contain `|`, the separator in the route key. If
+    # `/a` and `/a|x` ever shared a cache entry, one route's chain — and so its guards — would be
+    # served for the other.
     ctx = App()
+    tagged(tag) = h -> (req::HTTP.Request -> Res.send(tag * "|" * text(h(req))))
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
-        path("/a", (req::HTTP.Request) -> Res.send("plain"),
-             middleware = [handler -> (req::HTTP.Request -> handler(req))]),
-        path("/a" * cachetag(true, true, true), (req::HTTP.Request) -> Res.send("pipe"),
-             middleware = [handler -> (req::HTTP.Request -> handler(req))]),
+        path("/a", (req::HTTP.Request) -> Res.send("plain"), middleware = [tagged("A")]),
+        path("/a|x", (req::HTTP.Request) -> Res.send("pipe"), middleware = [tagged("AX")]),
     ])
-    for (target, want) in (("/a", "plain"), ("/a" * cachetag(true, true, true), "pipe")),
-        ce in (true, false)
-        r = Nitro.Core.internalrequest(ctx, HTTP.Request("GET", target); catch_errors = ce)
-        @test text(r) == want          # never the other route's chain
+    p = Nitro.Core.setupmiddleware(ctx; catch_errors = false)
+    for _ in 1:2
+        @test text(p(HTTP.Request("GET", "/a"))) == "A|plain"
+        @test text(p(HTTP.Request("GET", "/a|x"))) == "AX|pipe"
     end
-    # Two routes times two settings variants, all distinct.
-    @test length(snapshot(ctx.service.middleware_cache)) == 4
-end
-
-@testset "the tag tuple covers every tag cachetag can produce" begin
-    # `CACHE_TAGS` drives invalidation, so a tag `cachetag` can emit that is missing from it is
-    # a stranded cache entry with no symptom until someone hits that exact pipeline.
-    produced = Set(cachetag(c, e, s) for c in (true, false), e in (true, false), s in (true, false))
-    @test Set(CACHE_TAGS) == produced
-    @test length(CACHE_TAGS) == 8
-    @test allunique(CACHE_TAGS)
 end
 end # @testitem
