@@ -474,6 +474,9 @@ import Nitro: App
 # path -- asserting it on the response object in-process proves nothing, so it has to go over a
 # socket. Bodies are deliberately multi-byte: a character count would be wrong here, a byte count right.
 #
+# A `HEAD` gets no such help from HTTP.jl -- its bodyless framing only ever removes headers -- so the
+# write path adds the header itself, from the same `content_length` the `GET` path reads (#146).
+#
 # Isolation: a fresh `App` rather than the global `CONTEXT[]`, so this cannot perturb the
 # shared router the rest of the suite depends on. (`instance()` used to be the other way to do
 # this; #31 deleted it -- a fresh `App` is the supported form and costs no recompile.)
@@ -490,6 +493,11 @@ const STREAM_BYTES = rand(UInt8, 300_000)
 const STREAM_PATH  = joinpath(mktempdir(), "big.bin")
 write(STREAM_PATH, STREAM_BYTES)
 
+# Returned by reference on every request, the way the auth middleware's `const` rejections are.
+# The HEAD fix must build a new response rather than add its header to this one (nitro-core §4).
+const SHARED_RESPONSE = HTTP.Response(200, ["Content-Type" => "text/plain; charset=utf-8"], BODY_TEXT)
+const SHARED_304      = HTTP.Response(304)
+
 ctx = App()
 Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
     path("/page",  (req::HTTP.Request) -> Res.html(BODY_HTML)),
@@ -498,6 +506,15 @@ Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
     path("/data",  (req::HTTP.Request) -> Res.json(BODY_JSON)),
     path("/stream", (req::HTTP.Request) -> Res.file(req, STREAM_PATH; stream = true)),
     path("/buffered", (req::HTTP.Request) -> Res.file(req, STREAM_PATH)),
+    # Registered for both methods, so each HEAD can be compared against its own GET.
+    path("/h/page",   (req::HTTP.Request) -> Res.html(BODY_HTML);  methods = ["GET", "HEAD"]),
+    path("/h/plain",  (req::HTTP.Request) -> Res.send(BODY_TEXT);  methods = ["GET", "HEAD"]),
+    path("/h/data",   (req::HTTP.Request) -> Res.json(BODY_JSON);  methods = ["GET", "HEAD"]),
+    path("/h/file",   (req::HTTP.Request) -> Res.file(req, STREAM_PATH); methods = ["GET", "HEAD"]),
+    path("/h/empty",  (req::HTTP.Request) -> Res.status(200);      methods = ["GET", "HEAD"]),
+    path("/h/shared", (req::HTTP.Request) -> SHARED_RESPONSE;      methods = ["GET", "HEAD"]),
+    path("/h/none",   (req::HTTP.Request) -> Res.status(204);      methods = ["HEAD"]),
+    path("/h/304",    (req::HTTP.Request) -> SHARED_304;           methods = ["HEAD"]),
 ])
 
 port = get_free_port()
@@ -519,6 +536,37 @@ try
             # Present on the wire, and a BYTE count of the body actually sent.
             @test HTTP.header(r, "Content-Length") == string(sizeof(expected))
             @test String(r.body) == expected
+        end
+    end
+
+    @testset "HEAD carries the Content-Length its GET would (#146)" begin
+        for (route, expected) in (
+            ("/h/page",   sizeof(BODY_HTML)),
+            ("/h/plain",  sizeof(BODY_TEXT)),
+            ("/h/data",   sizeof(JSON.json(BODY_JSON))),
+            ("/h/file",   length(STREAM_BYTES)),
+            ("/h/empty",  0),
+            ("/h/shared", sizeof(BODY_TEXT)),
+        )
+            got  = HTTP.get("http://$HOST:$port$route")
+            head = HTTP.request("HEAD", "http://$HOST:$port$route")
+            @test head.status == got.status == 200
+            @test isempty(head.body)
+            @test HTTP.header(got,  "Content-Length") == string(expected)
+            @test HTTP.header(head, "Content-Length") == string(expected)
+        end
+
+        # Built, not mutated: the shared response is exactly as it was declared, however many
+        # HEADs it has answered.
+        @test !HTTP.hasheader(SHARED_RESPONSE, "Content-Length")
+        @test !HTTP.hasheader(SHARED_304, "Content-Length")
+
+        # No representation, so no length: a 204 must not send the header at all, and a 304's
+        # empty body says nothing about the size of what it stands in for.
+        for route in ("/h/none", "/h/304")
+            r = HTTP.request("HEAD", "http://$HOST:$port$route"; status_exception = false)
+            @test r.status in (204, 304)
+            @test !HTTP.hasheader(r, "Content-Length")
         end
     end
 

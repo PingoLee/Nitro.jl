@@ -451,6 +451,29 @@ function _reject_oversized_body!(stream::HTTP.Stream, limit::Int64, drain::Bool)
     return nothing
 end
 
+# A `HEAD` response carries the `Content-Length` the same `GET` would (RFC 9110 §9.3.2) (#146).
+#
+# HTTP.jl frames the two differently. For a `GET` it picks `FIXED` mode and `setheader`s
+# `Content-Length` from `response.content_length` — which is why `Res.json`/`send`/`html`/`status`
+# can leave the header out. For a `HEAD` it picks `NONE` mode, which only ever *removes* a header
+# the status forbids and never synthesizes one, so every builder that leaves the header to HTTP.jl
+# lost it on `HEAD`. Adding it here, once, from the same `content_length` field the `GET` path
+# reads keeps the two equal by construction — for every builder, raw return and hand-built
+# `HTTP.Response` alike — where a per-builder header would only ever cover `Res`.
+#
+# Skipped when there is nothing honest to say: an unknown length (`-1` — a streamed or SSE body,
+# which a `GET` would send chunked), a header the response already set (`Res.file`, static files),
+# and statuses that carry no representation — 1xx and 204 must not send the header, and a 304's
+# empty body says nothing about the size of the representation it stands in for.
+#
+# A new response, never a mutated one: `resp` may be a shared `const` (nitro-core §4).
+function _with_head_content_length(resp::HTTP.Response)::HTTP.Response
+    status = resp.status
+    (resp.content_length < 0 || status < 200 || status == 204 || status == 304) && return resp
+    HTTP.hasheader(resp, "Content-Length") && return resp
+    return add_response_headers(resp, "Content-Length" => string(resp.content_length))
+end
+
 function stream_handler(middleware::Function; max_body_bytes::Int64 = DEFAULT_MAX_BODY_BYTES)
     return function(stream::HTTP.Stream)
         ip = _peer_ip(stream)
@@ -469,6 +492,7 @@ function stream_handler(middleware::Function; max_body_bytes::Int64 = DEFAULT_MA
         try
             if !_response_started(stream)
                 resp = produced === nothing ? HTTP.Response(200) : produced
+                stream.message.method == "HEAD" && (resp = _with_head_content_length(resp))
                 resp.request = req
                 stream.response = resp
                 # `HEAD` gets the head and no body, so there is nothing to drain — and draining it
@@ -488,8 +512,8 @@ function stream_handler(middleware::Function; max_body_bytes::Int64 = DEFAULT_MA
                 #
                 # Deliberately narrow: `HEAD` only, keyed on the request method. Status-based
                 # suppression (204/304) is the same class of hazard, but `Res.sse` cannot produce
-                # those statuses and the `Content-Length`-on-HEAD question is #146's, not this
-                # change's — widening here would collide with it.
+                # those statuses. The response head a `HEAD` gets is `_with_head_content_length`'s
+                # business, above (#146).
                 #
                 # `stream.message.method`, NOT `req.method`. They are equal at entry and are two
                 # different mutable objects: `_http_stream_request` builds a fresh `Request` from
