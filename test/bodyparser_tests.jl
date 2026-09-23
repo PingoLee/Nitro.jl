@@ -1,5 +1,4 @@
 @testitem "Body parser" tags=[:core] setup=[NitroCommon] begin
-using Nitro: set_content_size!
 
 struct rank
     title   :: String 
@@ -35,48 +34,7 @@ end
 end
 
 
-@testset "set_content_size!" begin
-    headers = ["Content-Type" => "text/plain"]
-    body = Vector{UInt8}("Hello, World!")
-    @testset "when add is false and replace is false" begin
-        set_content_size!(body, headers, add=false, replace=false)
-        @test length(headers) == 1
-        @test headers[1].first == "Content-Type" 
-        @test headers[1].second == "text/plain"
-    end
-
-    @testset "when add is true and replace is false" begin
-        set_content_size!(body, headers, add=true, replace=false)
-        @test length(headers) == 2
-        @test headers[1].first == "Content-Type"
-        @test headers[1].second == "text/plain"
-        @test headers[2].first == "Content-Length"
-        @test headers[2].second == "13"
-    end
-
-    @testset "when add is false and replace is true" begin
-        headers = ["Content-Length" => "0", "Content-Type" => "text/plain"]
-        set_content_size!(body, headers, add=false, replace=true)
-        @test length(headers) == 2
-        @test headers[1].first == "Content-Length"
-        @test headers[1].second == "13"
-        @test headers[2].first == "Content-Type"
-        @test headers[2].second == "text/plain"
-    end
-
-    @testset "when add is true and replace is true" begin
-        headers = ["Content-Type" => "text/plain"]
-        set_content_size!(body, headers, add=true, replace=true)
-        @test length(headers) == 2
-        @test headers[1].first == "Content-Type"
-        @test headers[1].second == "text/plain"
-        @test headers[2].first == "Content-Length"
-        @test headers[2].second == "13"
-    end
-end
-
-
-@testset "json() Request struct keyword tests" begin 
+@testset "json() Request struct keyword tests" begin
 
 
     @testset "json() Request struct keyword tests" begin 

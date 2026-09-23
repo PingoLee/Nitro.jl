@@ -290,15 +290,14 @@ function serve(ctx::App;
         stream_handler(configured_middelware; max_body_bytes = body_limit) :
         handler(configured_middelware)
 
+    # No warning for running on one thread (#149): single-threaded is a valid deployment, not a
+    # misconfiguration, and the banner already reports the thread count. `preprocesskwargs` drops
+    # `queuesize` whatever `parallel` is, so the warning that it is ignored is unconditional too.
+    if haskey(kwargs, :queuesize)
+        @warn "Deprecated: serve() ignores `queuesize`; remove the argument."
+    end
+
     if parallel
-        if Threads.nthreads() <= 1 && !is_test()
-            @warn "serveparallel() only has 1 thread available to use, try launching julia like this: \"julia -t auto\" to leverage multiple threads"
-        end
-
-        if haskey(kwargs, :queuesize) && !is_test()
-            @warn "Deprecated: The `queuesize` parameter is no longer used / supported in serveparallel()"
-        end
-
         handle_stream = parallel_stream_handler(handle_stream)
     end
 

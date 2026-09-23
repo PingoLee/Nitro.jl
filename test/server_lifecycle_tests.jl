@@ -308,4 +308,36 @@ end
     end
 end
 
+@testset "serve() warnings name serve(), never serveparallel() (#149)" begin
+    # Every record `serve()` logs, at every level. The old guards keyed on an `is_test()` that
+    # never returned true, so these warnings reached production -- asserting on the captured
+    # records is what shows what an operator reads.
+    function serve_logs(; kw...)
+        ctx = Nitro.Core.App()
+        logger = Test.TestLogger(min_level = Base.CoreLogging.Debug)
+        try
+            Base.CoreLogging.with_logger(() -> _serve(ctx, get_free_port(); kw...), logger)
+        finally
+            Nitro.Core.terminate(ctx)
+        end
+        return logger.logs
+    end
+    mentions(logs, pat) = any(r -> occursin(pat, string(r.message)), logs)
+
+    for kw in ((; queuesize = 100), (; queuesize = 100, parallel = false))
+        logs = serve_logs(; kw...)
+        # `queuesize` is dropped whatever `parallel` is, so the warning is unconditional.
+        @test any(r -> r.level == Base.CoreLogging.Warn &&
+                       occursin("queuesize", string(r.message)) &&
+                       occursin("serve()", string(r.message)), logs)
+        @test !mentions(logs, "serveparallel")
+    end
+
+    # One thread is a valid deployment: nothing warns about it, on any thread count.
+    logs = serve_logs()
+    @test !mentions(logs, "serveparallel")
+    @test !mentions(logs, "thread available")
+    @test !mentions(logs, "queuesize")
+end
+
 end
