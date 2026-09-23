@@ -134,18 +134,13 @@ function setupmiddleware(ctx::App; middleware::Vector=[], serialize::Bool=true, 
     return reduce(|>, [
         router_entry,
         serializer...,
-        # `catch_errors`/`show_errors`/`serialize` travel into `compose` because the chain it
-        # caches closes over them, via `serializer` above — so they belong in the cache key
-        # (#79). They are not otherwise used there.
-        #
-        # `show_errors` is declared `::Bool` above for this reason: `DefaultSerializer` converts
-        # whatever it gets, so an untyped truthy value (`1`) would bake `true` into the chain
-        # while `cachetag` recorded `e` — two pipelines with different behaviour sharing one
-        # cache key, which is the exact failure #79 removed. Typing it makes the projection
-        # lossless by construction rather than by luck.
-        compose(ctx.service.router, processed_middleware,
-                ctx.service.custommiddleware, ctx.service.middleware_cache;
-                catch_errors, show_errors, serialize),
+        # The chains `compose` caches close over the serializer above, and so over
+        # `catch_errors`/`show_errors`/`serialize`. They do not need to travel into `compose`
+        # any more (#255): its cache is owned by THIS pipeline, so every chain in it was built
+        # with this pipeline's settings. Before that, the cache lived on `ctx.service` and the
+        # three had to be in its key, or a second `internalrequest` with different kwargs was
+        # served the first one's chain (#79).
+        compose(ctx.service.router, processed_middleware, ctx.service.custommiddleware),
         global_prefix_middleware...,
         # Outside every layer that can throw, inside the access log so that log line records
         # the 500 this produces (#256).

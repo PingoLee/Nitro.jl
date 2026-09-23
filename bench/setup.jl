@@ -59,10 +59,10 @@ Nitro.Core.Routing.urlpatterns(BENCH_MW_CTX, "", Nitro.RouteDefinition[
 
 run_bench_mw_request(req::HTTP.Request) = Nitro.Core.internalrequest(BENCH_MW_CTX, req)
 
-# `use_cache = isempty(globalmiddleware)` (src/routerhof.jl), so passing ANY global
-# middleware disables the chain cache and puts `buildmiddleware` — and with it the
-# `custommiddleware` destructure #76 is about — on every request, forever. That is the
-# normal shape for `serve(middleware=[...])` and for every `revise=:lazy|:eager` session.
+# One pass-through global layer: the shape of `serve(middleware=[...])` and of every
+# `revise=:lazy|:eager` session. Until #255 any global middleware switched the chain cache off
+# and put `buildmiddleware` on every request, forever; the `*_nocache` names below date from then
+# and are kept so results stay comparable across commits.
 const BENCH_GLOBAL_MW = Any[bench_passthrough]
 
 run_bench_mw_nocache_request(req::HTTP.Request) =
@@ -82,10 +82,10 @@ const BENCH_PIPELINE = Nitro.Core.setupmiddleware(BENCH_CTX)
 run_bench_served(req::HTTP.Request) = BENCH_PIPELINE(req)
 run_bench_mw_served(req::HTTP.Request) = BENCH_MW_PIPELINE(req)
 
-# `use_cache == false`, `serve`-shaped: the pipeline is built once, but global middleware is
-# present, so nothing is cached and `buildmiddleware` — including the `custommiddleware`
-# destructure (#76) — runs on every request. This is `serve(middleware = [...])` and every
-# `revise=:lazy|:eager` session, which is to say the normal production configuration.
+# Global middleware, `serve`-shaped: the pipeline is built once. This is `serve(middleware =
+# [...])` and every `revise=:lazy|:eager` session — the normal production configuration. Before
+# #255 it cached nothing and rebuilt its chain per request; now it caches like `BENCH_MW_PIPELINE`,
+# so the gap between the two is the global layer's own call cost.
 const BENCH_MW_NOCACHE_PIPELINE =
     Nitro.Core.setupmiddleware(BENCH_MW_CTX; middleware = BENCH_GLOBAL_MW)
 

@@ -27,14 +27,17 @@ SUITE["routing"]["genkey"] = @benchmarkable Nitro.Core.RouterHOF.genkey("GET", "
 # from `compose`'s emptiness fast path before `gethandler` and has never measured any of
 # this. The three below run on `BENCH_MW_CTX`, where the table is non-empty:
 #
-#   mw_cache_hit   — the chain is cached, so the request pays `compose`'s `gethandler` plus
-#                    whatever the chain's terminal does. This is where #80's second trie walk
-#                    USED to live; these exist to show it no longer does, and to catch it
-#                    coming back.
+#   mw_cache_hit   — `compose`'s `gethandler` plus whatever the chain's terminal does. This is
+#                    where #80's second trie walk USED to live; these exist to show it no longer
+#                    does, and to catch it coming back.
 #   mw_cache_hit_param — same, on a route with a path variable, so `Params()` is populated
 #                    rather than just allocated.
-#   mw_nocache     — `use_cache == false`, so `buildmiddleware` runs per request and the
-#                    `custommiddleware` destructure (#76) is on the hot path.
+#   mw_nocache     — same with one global middleware layer.
+#
+# The names predate #255 and are kept so results compare across commits, but read them
+# literally no more: `internalrequest` builds a fresh pipeline per call, and since #255 each
+# pipeline owns its chain cache, so EVERY request here is a cache miss that composes its chain.
+# The `mw_served_*` family below is the one that measures a warm cache.
 SUITE["routing"]["mw_cache_hit"] = @benchmarkable run_bench_mw_request(req) setup=(
     req = bench_request("GET", "/bench/mw/ping")) evals=1
 
@@ -66,7 +69,15 @@ SUITE["routing"]["mw_served"] = @benchmarkable run_bench_mw_served(req) setup=(
 SUITE["routing"]["mw_served_param"] = @benchmarkable run_bench_mw_served(req) setup=(
     req = bench_request("GET", "/bench/mw/items/42")) evals=1
 
-# `use_cache == false`, pipeline built once: `buildmiddleware` and its `custommiddleware`
-# destructure run per request here, which is the only place #76 is observable.
+# Global middleware, pipeline built once. Until #255 this cached nothing, so `buildmiddleware`
+# and its `custommiddleware` destructure (#76) ran per request here; now the chain is cached
+# like `mw_served_param`'s, and the gap between the two is the global layer's own call cost.
 SUITE["routing"]["mw_served_nocache"] = @benchmarkable run_bench_mw_served_nocache(req) setup=(
     req = bench_request("GET", "/bench/mw/items/42")) evals=1
+
+# The static-route partner of `mw_served_nocache`, so each global-middleware benchmark has a
+# route-shape twin in the no-global family (`mw_served` ↔ this, `mw_served_param` ↔
+# `mw_served_nocache`). Read the pairs across families for the global layer's cost, and the
+# two routes within a family for the cost of a populated `Params()` (#255).
+SUITE["routing"]["mw_served_nocache_static"] = @benchmarkable run_bench_mw_served_nocache(req) setup=(
+    req = bench_request("GET", "/bench/mw/ping")) evals=1
