@@ -7,7 +7,7 @@ using ..Errors: ValidationError, is_unrecoverable
 export recursive_merge, parseparam, parseparam_checked,
     handlerequest,
     format_response, header_name_isequal, set_content_size!,
-    join_url_path, is_test,
+    join_url_path,
     own_response_headers, add_response_headers
 
 ### Request helper functions ###
@@ -416,10 +416,6 @@ end
 
 join_url_path(::Nothing, route::String) :: String = route
 join_url_path(prefix::String, ::Nothing) :: String = prefix
-
-function is_test()
-    return haskey(ENV, "JULIA_TESTING") || haskey(ENV, "PK_TESTING")
-end
 
 # """
 #     generate_parser(func::Function, pathparams::Vector{Tuple{String,Type}})
