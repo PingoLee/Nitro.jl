@@ -176,21 +176,6 @@ end
 _hmac_fingerprint(secret::SecretString) =
     SHA.hmac_sha256(Vector{UInt8}(codeunits(reveal(secret))), UInt8[])
 
-# Is `secret` the empty HMAC key? By HMAC key, not by `isempty`, for the same reason the
-# duplicate check is: HMAC-SHA256 zero-pads a key up to its 64-byte block, so "\0" -- or
-# any run of NULs up to the block size -- IS the empty key, and a token signed with ""
-# verifies against it. A longer key is hashed first, and no SHA-256 output is the zero
-# block, so past 64 bytes nothing is empty. This is `_hmac_fingerprint(s) ==
-# hmac_sha256(UInt8[], UInt8[])` exactly, without the allocation or the HMAC -- which
-# matters because the plain-string secret path runs it on every `decode_jwt` call (#264).
-function _empty_hmac_key(secret::AbstractString)
-    ncodeunits(secret) <= 64 || return false
-    for byte in codeunits(secret)
-        byte == 0x00 || return false
-    end
-    return true
-end
-
 const _EMPTY_SECRET_MESSAGE =
     "the JWT secret is empty, or equivalent to the empty HMAC key, so a token signed with " *
     "the empty string would verify against it. An unset environment variable read as " *

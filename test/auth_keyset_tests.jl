@@ -109,11 +109,14 @@ end
     # 64-byte block are zero-padded into the empty key; a longer key is hashed first.
     oracle(s) = Nitro.Auth._hmac_fingerprint(SecretString(s)) ==
         Nitro.Auth.SHA.hmac_sha256(UInt8[], UInt8[])
+    # The predicate lives in `Crypto` (#269) so the CSRF middleware, below `Auth`, shares it.
+    empty_key = Nitro.Core.Crypto._empty_hmac_key
+    @test Nitro.Auth._empty_hmac_key === empty_key
     for s in ("", "\0", "\0\0\0", "\0"^64, "\0"^65, "a", "a\0", "\0a", "\0"^63 * "a")
-        @test (repr(s), Nitro.Auth._empty_hmac_key(s)) == (repr(s), oracle(s))
+        @test (repr(s), empty_key(s)) == (repr(s), oracle(s))
     end
-    @test Nitro.Auth._empty_hmac_key("\0"^64)
-    @test !Nitro.Auth._empty_hmac_key("\0"^65)
+    @test empty_key("\0"^64)
+    @test !empty_key("\0"^65)
 
     # The forged token an attacker builds when the server's secret is "" -- by hand,
     # because `encode_jwt` now refuses to sign it.
