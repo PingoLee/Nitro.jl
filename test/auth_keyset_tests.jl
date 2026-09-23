@@ -138,9 +138,11 @@ end
     # A real secret is untouched, and a forged token still fails its signature against it.
     @test jwt_validator("s1")(encode_jwt(Dict("sub" => "1"), "s1"; expires_in = 60)).id == "1"
     @test occursin("Invalid JWT signature", message(() -> jwt_validator("s1")(forged)))
-    # The message never echoes the value -- checked on a NUL spelling, the only one the
-    # refusal ever sees, since any other byte makes the secret non-empty.
-    @test !occursin("\0", message(() -> jwt_validator("\0\0")))
+    # The message never echoes the value. Asserted as the exact fixed text, because a
+    # `repr(secret)` regression would escape the NULs to `\\0` and slip past a
+    # `!occursin("\0", ...)` check.
+    @test message(() -> jwt_validator("\0\0")) ==
+        "ArgumentError: " * Nitro.Auth._EMPTY_SECRET_MESSAGE
 end
 
 @testset "signing as a peer of a registry" begin

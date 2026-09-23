@@ -297,6 +297,11 @@ signed with the empty secret verifies. `JWTKeyset` refuses an empty secret for e
 reason, but the error then surfaces as a missing key rather than a missing variable; require
 every key from the environment. See [Managing Secrets](secrets.md).
 
+A single string secret is held to the same rule: `jwt_validator("")` — or a secret of only
+`"\0"` bytes, which HMAC treats as empty — is an `ArgumentError` at startup, and `encode_jwt`
+and a verifying `decode_jwt` refuse it too. That is why the quick start above reads
+`JWT_SECRET` with a `nothing` default rather than `""`.
+
 The roles describe what a key is **for**, not where it is in a rotation. A rotation window is
 "the new key signs, the old one verifies". A registry of service identities — each caller signs
 with its own key, and `identity_from=:kid` makes the signer the principal — is "this service's

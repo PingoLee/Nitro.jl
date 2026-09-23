@@ -108,7 +108,8 @@ A string secret is held to the same rule as a keyset secret: one that is empty, 
 HMAC treats as empty (a short run of `"\\0"` bytes), is an `ArgumentError` at construction.
 Read the secret with a `nothing` default — `get(ENV, "JWT_SECRET", nothing)` — and fail at
 startup when it is missing; a `""` default would otherwise authenticate every token signed
-with the empty string. `encode_jwt` and `decode_jwt` refuse such a secret too.
+with the empty string. `encode_jwt` refuses such a secret too, and so does `decode_jwt`
+whenever it verifies a signature.
 
 # Profiles
 

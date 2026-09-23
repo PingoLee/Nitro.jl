@@ -21,7 +21,7 @@ any run of NUL bytes up to 64 are the empty key too. Every one of those is now r
 |---|---|---|
 | `jwt_validator("")` | a validator that accepts forged tokens | `ArgumentError`, at construction (app startup) |
 | `encode_jwt(claims, "")` | a token anyone can forge | `ArgumentError` |
-| `decode_jwt(token, "")` | verifies a token signed with `""` | `ArgumentError` |
+| `decode_jwt(token, "")` | verifies a token signed with `""` | `ArgumentError` whenever it verifies a signature — `verify = false` still returns the claims, and a token rejected before key selection (malformed, or an `alg` other than HS256) still gets its `AuthError` |
 
 From inside a custom validator, a `decode_jwt` that throws this `ArgumentError` is answered
 with a `401` by the auth middleware, as any other validator failure is — it fails closed.
@@ -31,8 +31,9 @@ with a `401` by the auth middleware, as any other validator failure is — it fa
 ```bash
 # An env var read with an empty-string default is the realistic trigger.
 grep -rnE 'get\(ENV, *"[^"]*", *""\)' --include=*.jl .
-# A literal empty secret passed directly.
-grep -rnE '(jwt_validator|encode_jwt|decode_jwt)\([^)]*""' --include=*.jl .
+# A literal empty secret passed directly (over-matches on purpose -- `[^)]*` would stop at the
+# `)` of an inline `Dict(...)` payload and miss `encode_jwt(Dict("sub" => "x"), "")`).
+grep -rnE '(jwt_validator|encode_jwt|decode_jwt)\(.*""' --include=*.jl .
 ```
 
 At runtime, the startup error reads `the JWT secret is empty, or equivalent to the empty HMAC key`.
