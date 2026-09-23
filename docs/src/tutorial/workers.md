@@ -790,7 +790,9 @@ say — is logged and retried on the next interval: it neither stops the schedul
 `shutdown!` throw. A tick that retires rows logs
 `"Nitro.Workers: task retention sweep complete"` at `@info` with `deleted` and `retain_days`. A
 tick with nothing to retire logs the same line at `@debug`. If you set `cleanup_enabled=false`, you
-own retention, and stored error text lives as long as the row does.
+own retention, and stored error text lives as long as the row does. That also turns off the
+periodic zombie sweep, which runs on the same tick when `zombie_min_age` is set (see *Startup
+Zombie Task Recovery* below).
 
 !!! warning "Treat `TaskInfo.error` as attacker-influenceable"
     It is free text derived from an exception your own code raised. The safest posture is to
@@ -960,8 +962,9 @@ transition landed.
 Startup carries on either way. A custom store that does not implement `list_running_task_refs`
 still works: the default derives it from `get_all_tasks`, at the cost of a full read of each record.
 
-The sweep logs at `@info` before it starts and again when it finishes. The finishing line is
-emitted **every time**, including when it recovered nothing:
+The boot sweep logs at `@info` before it starts and again when it finishes. The finishing line
+is emitted **every time**, including when it recovered nothing. The periodic re-sweep, described
+in the warning below, is quieter. A boot sweep logs:
 
 ```
 [ Info: Nitro.Workers: scanning for zombie tasks
@@ -991,11 +994,20 @@ re-ran between the sweep's read and its write. The sweep leaves those alone.
                    zombie_min_age = Hour(2))   # longer than any task legitimately runs
     ```
 
-    Records claimed more recently are left `RUNNING` for a later boot's sweep. A record with no
+    Records claimed more recently are left `RUNNING` for a later sweep. A record with no
     `started_at` is always adjudicated. The default, `nothing`, bounds nothing, which suits a
-    single process: its crashed tasks are recovered on the very next start. With a bound, a crash
-    followed by a quick restart leaves those tasks `RUNNING` until a boot that comes after the
-    window, because the sweep runs only at startup.
+    single process: its crashed tasks are recovered on the very next start.
+
+    With a bound, the sweep also re-runs on every tick of the retention scheduler, so a claim
+    deferred at boot is recovered once it ages past the window. After a crash and a quick
+    restart, those tasks leave `RUNNING` within `zombie_min_age + cleanup_interval_hours`, rather
+    than at some later boot. The re-sweep rides the retention tick, so `cleanup_enabled = false`
+    turns it off, and so does `recover_zombies = false`. Without a bound there is no re-sweep:
+    run on a timer, an unbounded sweep would fail another process's live runs on every tick.
+
+    The periodic sweep logs the way the retention sweep does. It emits `"zombie recovery
+    complete"` at `@info` only when it recovered something, and at `@debug` otherwise. The
+    unconditional pair above belongs to the boot sweep.
 
 ## When Not To Use Workers
 

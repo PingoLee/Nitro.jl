@@ -37,10 +37,20 @@ recent ones). A lower bound would leave every genuinely stranded old record `RUN
 That is exactly the backlog [#237](https://github.com/PingoLee/Nitro.jl/issues/237) is about,
 and it is invisible to retention, which retires only records with a `completed_at`.
 
-The cost is on the single-process side. A task stranded by a crash is recovered only by a sweep
-that runs after its claim is `zombie_min_age` old, and the sweep runs only at [`start!`](@ref). A
-single process that restarts right after a crash therefore leaves that crash's tasks `RUNNING`
-until a later boot. That is why the default stays `nothing`.
+A task stranded by a crash is recovered only by a sweep that runs after its claim is
+`zombie_min_age` old, so a restart that comes right after the crash defers that crash's tasks.
+With a bound set, [`start!`](@ref) therefore also re-runs this sweep on every tick of the
+retention scheduler ([#266](https://github.com/PingoLee/Nitro.jl/issues/266)). A deferred claim
+is recovered at most `zombie_min_age + cleanup_interval_hours` after it was made, not at some
+later boot. That periodic sweep needs `cleanup_enabled = true`, since it rides the retention
+tick, and it never runs without a bound. An unbounded sweep on a timer would mark another
+node's live runs `FAILED` on every tick. It would also gain a single process nothing, because
+that process's boot sweep already took everything. Once a claim is older than the window, it is
+exactly as safe to adjudicate from a tick as from a boot, because the same process-local caveat
+applies to both.
+
+The default stays `nothing` because a single process loses nothing with it: its crashed tasks
+are recovered on the very next start.
 
 Nothing else needs to grow for this. Once the sweep marks a record `FAILED` it carries a
 `completed_at`, and the retention sweep retires it like any other finished task. `cleanup_tasks!`
@@ -63,7 +73,10 @@ logged the same way and then rethrown. Every field is a count; no task's `result
 ever logged.
 
 The sweep runs after the startup banner and before the first request is served, so when a boot
-seems to hang after announcing itself, these two lines are the first thing to look for.
+seems to hang after announcing itself, these two lines are the first thing to look for. That
+unconditional pair belongs to this call, the boot sweep. The periodic sweep on the retention tick
+logs the way the retention sweep does: `@info` only when it recovered something, `@debug`
+otherwise, and `@error` on a failure, which costs that tick and nothing else.
 
 Reads the **durable** records, not the live-overlaid listing: this is a decision about durable
 state, and `get_active_task` is the whole liveness criterion either way. It reads them through
@@ -83,17 +96,30 @@ why this stays process-local rather than trying to be authoritative.
 function recover_zombie_tasks!(; runtime::WorkerRuntime=default_runtime(),
                                zombie_min_age::Union{Nothing, Dates.Period}=nothing,
                                batch_size::Int=ZOMBIE_SWEEP_BATCH)
+    return _recover_zombie_tasks!(runtime, zombie_min_age, batch_size; periodic=false)
+end
+
+# `periodic` changes the LOGGING and nothing the sweep decides. The boot sweep's `@info` pair is
+# unconditional (#238); the retention tick's re-sweep (#266) logs like the retention sweep beside
+# it, because an unconditional pair on a caller-supplied interval is noise. A write failure ends
+# either sweep; only the boot one rethrows it after logging.
+function _recover_zombie_tasks!(runtime::WorkerRuntime, zombie_min_age::Union{Nothing, Dates.Period},
+                                batch_size::Int; periodic::Bool)
     batch_size >= 1 || throw(ArgumentError("`batch_size` must be at least 1, got $batch_size"))
     _check_zombie_min_age(zombie_min_age)
     # One cutoff for the whole sweep, taken before the first read: a claim is "old enough" against
     # the moment the sweep began, however long the backlog takes to walk.
     cutoff = zombie_min_age === nothing ? nothing : current_time_utc() - zombie_min_age
 
-    # Before the lock, not inside it (#238). This sweep runs at every `start!`, AFTER the banner
+    # Before the lock, not inside it (#238). The boot sweep runs at every `start!`, AFTER the banner
     # has announced the server and before the first request can be served, so a hang here used to
     # read as a server that said it was up and then went silent. Logging before `lock_tasks` also
     # separates "waiting for the lock" from "working through the backlog".
-    @info "Nitro.Workers: scanning for zombie tasks" zombie_min_age batch_size
+    if periodic
+        @debug "Nitro.Workers: scanning for zombie tasks" zombie_min_age batch_size
+    else
+        @info "Nitro.Workers: scanning for zombie tasks" zombie_min_age batch_size
+    end
     tally = _ZombieTally()
     return lock_tasks(runtime) do
         cursor = nothing
@@ -118,6 +144,10 @@ function recover_zombie_tasks!(; runtime::WorkerRuntime=default_runtime(),
                 # so the log shows how far the sweep got.
                 e isa InterruptException && rethrow()
                 @error "Nitro.Workers: zombie recovery failed mid-sweep" _tally_kwargs(tally)... exception=(e, catch_backtrace())
+                # The periodic sweep stops here instead (#266). The rethrow exists so a boot does
+                # not carry on quietly, and a tick carries on either way: its caller would only
+                # log this same exception a second time, on every tick of a persistent fault.
+                periodic && return tally.recovered
                 rethrow()
             end
             # Short means exhausted: an implementation returns fewer than `limit` only when
@@ -126,8 +156,13 @@ function recover_zombie_tasks!(; runtime::WorkerRuntime=default_runtime(),
             if length(page) < batch_size
                 # UNCONDITIONAL, `recovered = 0` included: silence must stop being ambiguous
                 # between "ran and found nothing" and "never got there" (#238). Counts only --
-                # never a task's `result` or `error`, which are application data.
-                @info "Nitro.Workers: zombie recovery complete" _tally_kwargs(tally)...
+                # never a task's `result` or `error`, which are application data. The periodic
+                # re-sweep (#266) is the exception, and says so only when it recovered something.
+                if !periodic || tally.recovered > 0
+                    @info "Nitro.Workers: zombie recovery complete" _tally_kwargs(tally)...
+                else
+                    @debug "Nitro.Workers: zombie recovery complete" _tally_kwargs(tally)...
+                end
                 return tally.recovered
             end
             cursor = last(page).id
@@ -237,7 +272,13 @@ is already installed tears the old one down first, and that teardown drains like
 
 `zombie_min_age` bounds the zombie sweep to claims older than that period. Leave it `nothing` for
 a single process; **set it when several processes share one store**. The reasoning, and the
-trade, are on [`recover_zombie_tasks!`](@ref) (#239).
+trade, are on [`recover_zombie_tasks!`](@ref) (#239). With a bound set and `recover_zombies`
+on, the cleanup scheduler also re-runs that bounded sweep on every tick, so a claim deferred at
+boot is recovered once it ages past the window. Without `cleanup_enabled` there is no tick, and
+so no re-sweep (#266). A later `start!` that reuses the runtime also reuses its running
+scheduler, so it cannot change that scheduler's `zombie_min_age`, `cleanup_interval_hours` or
+`cleanup_retain_days`, and a `recover_zombies = false` there does not stop an already-running
+re-sweep. Call `stop_cleanup_scheduler!` first.
 """
 function start!(ctx::App;
     queues::AbstractVector{<:AbstractString}=String[],
@@ -262,7 +303,10 @@ function start!(ctx::App;
     end
 
     if cleanup_enabled
-        start_cleanup_scheduler(; interval_hours=cleanup_interval_hours, retain_days=cleanup_retain_days, runtime=resolved)
+        # `recover_zombies = false` turns the sweep off, periodic half included (#266) -- for a
+        # scheduler started here. One already running is returned as is; see the docstring.
+        start_cleanup_scheduler(; interval_hours=cleanup_interval_hours, retain_days=cleanup_retain_days,
+                                zombie_min_age=recover_zombies ? zombie_min_age : nothing, runtime=resolved)
     else
         stop_cleanup_scheduler!(resolved)
     end
@@ -1050,7 +1094,43 @@ function get_queue_status(ctx::App, queue_name::AbstractString, authority::Syste
     return get_queue_status(queue_name, authority; runtime=_resolve_runtime(ctx; key, runtime))
 end
 
-function start_cleanup_scheduler(; interval_hours::Real=24, retain_days::Int=7, runtime::WorkerRuntime=default_runtime())
+"""
+    start_cleanup_scheduler(; interval_hours=24, retain_days=7, zombie_min_age=nothing,
+                            runtime=default_runtime()) -> CleanupScheduler
+
+Start the runtime's background housekeeping. Every `interval_hours` it retires finished tasks
+older than `retain_days` (`cleanup_old_tasks`).
+
+With `zombie_min_age` set, each tick first re-runs the bounded zombie sweep
+([`recover_zombie_tasks!`](@ref) with that bound), so a claim the boot sweep deferred as too
+recent is recovered once it ages past the window, instead of waiting for a later boot
+([#266](https://github.com/PingoLee/Nitro.jl/issues/266)). With `nothing`, the default, the tick
+does not sweep zombies at all: an unbounded sweep on a timer would mark another process's live
+runs `FAILED` on every tick. [`start!`](@ref) passes its own `zombie_min_age` here when
+`recover_zombies` is on.
+
+The two sweeps fail independently. A throw costs that sweep one tick, never the other sweep and
+never the scheduler. Each logs at `@info` only when it did something.
+
+The bound works by age alone, so choose it as you would for the boot sweep: longer than any task
+legitimately runs. `Second(0)` passes validation but bounds nothing, which on a timer is exactly
+the unbounded periodic sweep described above.
+
+The zombie sweep holds the store's task lock for the whole scan, as the boot sweep does, and
+here that happens while requests are being served. Submissions, run starts and run completions
+in this process wait for it. Each tick re-reads every `RUNNING` record, including other
+processes' live runs, which it counts `too_recent` and leaves alone. At the daily default that
+cost is negligible; a short `interval_hours` pays it on every tick.
+
+Idempotent while a scheduler is running: a second call returns the running one, and its
+arguments, `zombie_min_age` included, are ignored. Stop it with `stop_cleanup_scheduler!`
+first to change them.
+"""
+function start_cleanup_scheduler(; interval_hours::Real=24, retain_days::Int=7,
+                                 zombie_min_age::Union{Nothing, Dates.Period}=nothing,
+                                 runtime::WorkerRuntime=default_runtime())
+    # Refused at the call, not from inside the loop, where a throw would only be logged per tick.
+    _check_zombie_min_age(zombie_min_age)
     scheduler_ref = get_cleanup_scheduler(runtime)
     existing = scheduler_ref[]
     if !isnothing(existing) && !istaskdone(existing.task)
@@ -1063,7 +1143,8 @@ function start_cleanup_scheduler(; interval_hours::Real=24, retain_days::Int=7, 
     # discriminator -- "does anything `schedule(…, error=true)` this task?" -- stopped
     # discriminating when #127 removed every injection, so it is not the reason. The reason is
     # that this task runs no user code: it sleeps in `timedwait` and calls `cleanup_old_tasks`
-    # once a day, so there is nothing here that could starve a thread and nothing to gain from
+    # once a day (plus, with a bound, the zombie sweep, #266, which is store calls too), so there
+    # is nothing here that could starve a thread and nothing to gain from
     # migrating it. It is stopped by a `Channel` signal, never by an interrupt.
     #
     # This is Nitro's fourth background janitor, and it stays hand-rolled rather than going
@@ -1094,6 +1175,25 @@ function start_cleanup_scheduler(; interval_hours::Real=24, retain_days::Int=7, 
             if wait_result == :ok
                 break
             end
+            # Zombies FIRST, and in a `try` of their own (#266). A failed write is logged and
+            # absorbed inside the periodic sweep; this `try` is the backstop for anything else, so
+            # a failed sweep costs this tick's sweep and never the retention pass below, which is
+            # the scheduler's original job. First, because a
+            # record it fails carries a fresh `completed_at` and so is never retired on the same
+            # tick either way; the order is only about which failure the log reports first.
+            #
+            # Gated on a bound, never unconditional: see the docstring. It takes `lock_tasks` for
+            # the whole sweep, as the boot sweep does, and this runtime's own runs are spared by
+            # `get_active_task`, because `_claim_run!` publishes a run's handle before its RUNNING
+            # claim.
+            if zombie_min_age !== nothing
+                try
+                    _recover_zombie_tasks!(runtime, zombie_min_age, ZOMBIE_SWEEP_BATCH; periodic=true)
+                catch e
+                    e isa InterruptException && rethrow()
+                    @error "Nitro.Workers: periodic zombie sweep failed" exception=(e, catch_backtrace())
+                end
+            end
             try
                 deleted = cleanup_old_tasks(retain_days; runtime=runtime)
                 # A success line too (#238), so a quiet log means "nothing to retire" rather than
@@ -1101,6 +1201,7 @@ function start_cleanup_scheduler(; interval_hours::Real=24, retain_days::Int=7, 
                 # is daily, but the interval is caller-supplied, and an unconditional line at a short
                 # interval is noise. The boot-time zombie sweep is the one that logs
                 # unconditionally -- it runs once, in the window where silence cost an incident.
+                # Its periodic re-run above follows this rule, not that one.
                 if deleted isa Integer && deleted > 0
                     @info "Nitro.Workers: task retention sweep complete" deleted retain_days
                 else
@@ -1121,8 +1222,10 @@ function start_cleanup_scheduler(; interval_hours::Real=24, retain_days::Int=7, 
     return scheduler
 end
 
-function start_cleanup_scheduler(ctx::App; interval_hours::Real=24, retain_days::Int=7, key::Symbol=DEFAULT_EXTENSION_KEY, runtime::Union{Nothing, WorkerRuntime}=nothing)
-    return start_cleanup_scheduler(; interval_hours, retain_days, runtime=_resolve_runtime(ctx; key, runtime))
+function start_cleanup_scheduler(ctx::App; interval_hours::Real=24, retain_days::Int=7,
+                                 zombie_min_age::Union{Nothing, Dates.Period}=nothing,
+                                 key::Symbol=DEFAULT_EXTENSION_KEY, runtime::Union{Nothing, WorkerRuntime}=nothing)
+    return start_cleanup_scheduler(; interval_hours, retain_days, zombie_min_age, runtime=_resolve_runtime(ctx; key, runtime))
 end
 
 function stop_cleanup_scheduler!(scheduler::CleanupScheduler)

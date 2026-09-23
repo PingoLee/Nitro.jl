@@ -577,8 +577,9 @@ function shutdown!(runtime::WorkerRuntime; drain_timeout::Real = WORKER_DRAIN_TI
     scheduler = scheduler_ref[]
     if !isnothing(scheduler)
         # This wait carries no deadline, so it sits OUTSIDE `drain_timeout`'s budget. It is short
-        # in practice -- the scheduler task runs no user code, only `timedwait` and a retention
-        # sweep -- but `drain_timeout` is not a bound on this function's total time. A scheduler
+        # in practice -- the scheduler task runs no user code, only `timedwait`, a retention sweep
+        # and, with a `zombie_min_age`, a bounded zombie sweep (#266) -- but `drain_timeout` is not
+        # a bound on this function's total time. A scheduler
         # whose task already died is logged in there and does NOT throw out of here (#193), so
         # everything below still runs.
         stop_cleanup_scheduler!(scheduler)

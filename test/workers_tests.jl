@@ -3632,6 +3632,183 @@ end
     @test isempty(filter(r -> r.message == "Nitro.Workers: zombie recovery complete", logs))
 end
 
+# #266. With `zombie_min_age` set, the boot sweep defers claims younger than the window, and
+# before this nothing ever came back for them: the sweep ran only at `start!`. The retention tick
+# now re-runs the bounded sweep. Every scheduler below ticks every ~0.2s (`timedwait`'s poll floor
+# is 0.1s). A sink is read only AFTER `stop_cleanup_scheduler!` has joined the task, per the #238
+# retention test above: `TestLogger` takes no lock.
+const _ZOMBIE_TICK_HOURS = 0.00005
+const _ZOMBIE_DONE = "Nitro.Workers: zombie recovery complete"
+const _ZOMBIE_SCAN = "Nitro.Workers: scanning for zombie tasks"
+const _ZOMBIE_ERROR = "Worker process terminated unexpectedly mid-execution."
+
+function _seed!(store::InMemoryWorkerStore, id::String, status::TaskStatus;
+                started_at=nothing, completed_at=nothing, result=nothing)
+    lock(store.task_lock) do
+        t = TaskInfo(id)
+        t.status = status
+        t.started_at = started_at
+        t.completed_at = completed_at
+        t.result = result
+        store.task_registry[id] = t
+    end
+end
+
+# The expired COMPLETED row is the tick-proof: retention deletes it on the same tick, and AFTER
+# the zombie sweep, so once it is gone at least one whole tick -- sweep included -- has run.
+_seed_expired!(store, id) =
+    _seed!(store, id, COMPLETED; completed_at=Dates.now(Dates.UTC) - Dates.Day(10))
+
+@testset "the retention tick recovers a claim the boot sweep deferred as too recent (#266)" begin
+    sentinel = "periodic-zombie-secret-4b2d"
+    store = InMemoryWorkerStore()
+    rt = WorkerRuntime(store)
+    # Claimed just now, so no sweep may touch it yet -- exactly what a crash followed by a quick
+    # restart leaves behind.
+    _seed!(store, "tick::young", RUNNING; started_at=Dates.now(Dates.UTC), result=Dict("token" => sentinel))
+    # Old enough, but this runtime holds its handle: a live run, and it must stay RUNNING.
+    _seed!(store, "tick::live", RUNNING; started_at=Dates.now(Dates.UTC) - Dates.Hour(1))
+    Nitro.Workers.register_active_task!(rt, "tick::live", @async nothing)
+    sink = Test.TestLogger()
+    try
+        # The boot sweep defers it; nothing about this test depends on a boot having run.
+        @test recover_zombie_tasks!(; runtime=rt, zombie_min_age=Dates.Second(3)) == 0
+        @test get_task_info(store, "tick::young").status == RUNNING
+
+        Base.CoreLogging.with_logger(sink) do
+            start_cleanup_scheduler(; interval_hours=_ZOMBIE_TICK_HOURS, retain_days=7,
+                                    zombie_min_age=Dates.Second(3), runtime=rt)
+        end
+        @test wait_for(() -> get_task_info(store, "tick::young").status == FAILED; timeout=10.0) == :ok
+        stop_cleanup_scheduler!(rt)
+
+        young = get_task_info(store, "tick::young")
+        @test young.error == _ZOMBIE_ERROR
+        @test young.completed_at !== nothing
+        @test get_task_info(store, "tick::live").status == RUNNING
+
+        # Quiet like retention: no @info scan line on a tick, and the @info completion line only
+        # from the tick that recovered something. Counts, never the record's payload.
+        @test isempty(filter(r -> r.message == _ZOMBIE_SCAN, sink.logs))
+        done = filter(r -> r.message == _ZOMBIE_DONE, sink.logs)
+        @test length(done) == 1
+        @test only(done).level == Base.CoreLogging.Info
+        @test only(done).kwargs[:recovered] == 1
+        @test only(done).kwargs[:spared_live] == 1
+        @test !any(r -> occursin(sentinel, string(r.message, " ", r.kwargs)), sink.logs)
+    finally
+        reset_runtime!(rt)
+    end
+end
+
+@testset "a periodic tick that recovers nothing logs nothing at @info (#266)" begin
+    store = InMemoryWorkerStore()
+    rt = WorkerRuntime(store)
+    _seed!(store, "quiet::young", RUNNING; started_at=Dates.now(Dates.UTC))
+    _seed_expired!(store, "quiet::expired")
+    sink = Test.TestLogger()
+    try
+        Base.CoreLogging.with_logger(sink) do
+            start_cleanup_scheduler(; interval_hours=_ZOMBIE_TICK_HOURS, retain_days=7,
+                                    zombie_min_age=Dates.Hour(1), runtime=rt)
+        end
+        @test wait_for(() -> get_task_info(store, "quiet::expired") === nothing) == :ok
+        stop_cleanup_scheduler!(rt)
+        @test get_task_info(store, "quiet::young").status == RUNNING
+        @test !any(r -> r.message in (_ZOMBIE_SCAN, _ZOMBIE_DONE), sink.logs)
+    finally
+        reset_runtime!(rt)
+    end
+end
+
+@testset "without zombie_min_age the retention tick never sweeps zombies (#266)" begin
+    # An unbounded sweep on a timer would fail another process's live runs on every tick, so the
+    # tick sweeps only with a bound. This row is handle-less and a day old: any sweep would take it.
+    store = InMemoryWorkerStore()
+    rt = WorkerRuntime(store)
+    _seed!(store, "unbounded::old", RUNNING; started_at=Dates.now(Dates.UTC) - Dates.Day(1))
+    _seed_expired!(store, "unbounded::expired")
+    try
+        start_cleanup_scheduler(; interval_hours=_ZOMBIE_TICK_HOURS, retain_days=7, runtime=rt)
+        @test wait_for(() -> get_task_info(store, "unbounded::expired") === nothing) == :ok
+        stop_cleanup_scheduler!(rt)
+        @test get_task_info(store, "unbounded::old").status == RUNNING
+    finally
+        reset_runtime!(rt)
+    end
+end
+
+@testset "start! wires the periodic sweep only when recover_zombies is on (#266)" begin
+    quiet(f) = Base.CoreLogging.with_logger(f, Base.CoreLogging.NullLogger())
+
+    # On: the boot sweep defers the young claim, and the tick recovers it once it ages past the
+    # window. 3s, not 1s: the RUNNING precondition must survive a first compile of `start!`.
+    store = InMemoryWorkerStore()
+    ctx = Nitro.Core.App()
+    _seed!(store, "start::young", RUNNING; started_at=Dates.now(Dates.UTC))
+    try
+        quiet() do
+            start!(ctx; store, cleanup_interval_hours=_ZOMBIE_TICK_HOURS, zombie_min_age=Dates.Second(3))
+        end
+        @test get_task_info(store, "start::young").status == RUNNING
+        @test wait_for(() -> get_task_info(store, "start::young").status == FAILED; timeout=10.0) == :ok
+    finally
+        uninstall!(ctx)
+    end
+
+    # Off: `recover_zombies = false` means no sweep at all, the periodic half included.
+    store = InMemoryWorkerStore()
+    ctx = Nitro.Core.App()
+    _seed!(store, "start::old", RUNNING; started_at=Dates.now(Dates.UTC) - Dates.Day(1))
+    _seed_expired!(store, "start::expired")
+    try
+        quiet() do
+            start!(ctx; store, cleanup_interval_hours=_ZOMBIE_TICK_HOURS,
+                   recover_zombies=false, zombie_min_age=Dates.Second(1))
+        end
+        @test wait_for(() -> get_task_info(store, "start::expired") === nothing) == :ok
+        stop_cleanup_scheduler!(worker_runtime(ctx))
+        @test get_task_info(store, "start::old").status == RUNNING
+    finally
+        uninstall!(ctx)
+    end
+end
+
+@testset "a periodic sweep that throws costs that tick's sweep, not retention or the scheduler (#266)" begin
+    # `ThrowingTransitionStore` is the #238 testset's: every transition throws. Retention delegates.
+    Nitro.Workers.cleanup_tasks!(s::ThrowingTransitionStore, days::Int) = Nitro.Workers.cleanup_tasks!(s.inner, days)
+    inner = InMemoryWorkerStore()
+    _seed!(inner, "tick-throws::1", RUNNING)   # no `started_at`: always eligible
+    _seed_expired!(inner, "tick-throws::expired")
+    rt = WorkerRuntime(ThrowingTransitionStore(inner))
+    sink = Test.TestLogger()
+    try
+        scheduler = Base.CoreLogging.with_logger(sink) do
+            start_cleanup_scheduler(; interval_hours=_ZOMBIE_TICK_HOURS, retain_days=7,
+                                    zombie_min_age=Dates.Second(0), runtime=rt)
+        end
+        @test wait_for(() -> get_task_info(inner, "tick-throws::expired") === nothing) == :ok
+        @test !istaskdone(scheduler.task)
+        stop_cleanup_scheduler!(rt)
+        @test get_task_info(inner, "tick-throws::1").status == RUNNING
+        # Logged ONCE per tick, with the tally: the periodic sweep absorbs the write failure it
+        # has just logged, rather than rethrowing it for the tick to log a second time.
+        failed = filter(r -> r.message == "Nitro.Workers: zombie recovery failed mid-sweep", sink.logs)
+        @test !isempty(failed)
+        @test all(r -> r.level == Base.CoreLogging.Error && r.kwargs[:candidates] == 1, failed)
+        @test isempty(filter(r -> r.message == "Nitro.Workers: periodic zombie sweep failed", sink.logs))
+    finally
+        # Not `reset_runtime!`: this store implements only what the two sweeps reach.
+        stop_cleanup_scheduler!(rt)
+    end
+end
+
+@testset "start_cleanup_scheduler refuses a negative zombie_min_age at the call (#266)" begin
+    rt = WorkerRuntime(InMemoryWorkerStore())
+    @test_throws ArgumentError start_cleanup_scheduler(; zombie_min_age=Dates.Second(-1), runtime=rt)
+    @test get_cleanup_scheduler(rt)[] === nothing
+end
+
 @testset "cancel_task is atomic: completed task result is never overwritten" begin
     store = InMemoryWorkerStore()
     rt_store = WorkerRuntime(store)

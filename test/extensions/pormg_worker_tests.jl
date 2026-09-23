@@ -1465,6 +1465,32 @@ else
             @test_throws ArgumentError Nitro.Workers.startup(Nitro.Core.App(); zombie_min_age=Minute(-5))
         end
 
+        @testset "the retention tick recovers a claim the boot sweep deferred (#266)" begin
+            for (label, backend) in (("in-memory", InMemoryWorkerStore()),
+                                     ("pormg", RealPormGWorkerStore(model=MockTaskModel())))
+                @testset "$label" begin
+                    # Claimed just now: a crash followed by a quick restart.
+                    t = TaskInfo("tick::young")
+                    t.status = RUNNING
+                    t.started_at = Dates.now(Dates.UTC)
+                    replace_task!(backend, t.id, t)
+                    status_of(id) = get_task_info(backend, id).status
+
+                    app = Nitro.Core.App()
+                    # 3s, so the RUNNING precondition survives a first compile of `start!`.
+                    rt = start!(app; store=backend, zombie_min_age=Second(3),
+                                cleanup_interval_hours=0.00005)
+                    try
+                        # The boot sweep defers it; before #266 nothing came back for it.
+                        @test status_of("tick::young") == RUNNING
+                        @test timedwait(() -> status_of("tick::young") == FAILED, 10.0) == :ok
+                    finally
+                        reset_runtime!(rt)
+                    end
+                end
+            end
+        end
+
         @testset "a cross-process grantee still sees live progress (#96)" begin
             store_p = RealPormGWorkerStore(model=MockTaskModel())
             rt_store_p = WorkerRuntime(store_p)
