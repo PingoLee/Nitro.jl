@@ -338,9 +338,40 @@ The rules:
   `GuardMiddleware(login_required())` refuses an anonymous `HEAD` exactly as it refuses the `GET`.
   An explicit `HEAD` route uses only its own `middleware=`.
 - **Only `method="GET"` gets it.** `"STREAM"` and `"WEBSOCKET"` routes do not, and other
-  methods on a `GET` route are still refused with `405`.
+  methods on a `GET` route are still refused with `405`, whose `Allow` lists `GET, HEAD` (see
+  below).
 - **`internalrequest` does not drop the body.** The body is removed by the server's write path,
   so an in-process `HEAD` returns what the handler built.
+
+## Method Not Allowed (`405`)
+
+A request whose path matches a route, but whose method matches none of that path's routes, gets
+`405 Method Not Allowed`. The response carries an `Allow` header naming the methods the path does
+answer, which RFC 9110 §15.5.6 requires:
+
+```julia
+path("/api/products", ProductHandlers.list_products)                   # GET
+path("/api/products", ProductHandlers.create_product; method="POST")
+```
+
+```
+DELETE /api/products  →  405, Allow: GET, HEAD, POST
+```
+
+- **The list is what the router would actually serve**, sorted. It includes the automatic `HEAD`
+  of a `GET` route, every method of every route whose pattern matches the path (`/users/me` and
+  `/users/<str:name>` both match `/users/me`), and custom method names given to `path()`.
+- **`OPTIONS` is listed only when a route declares it.** `Cors()` answers `OPTIONS` itself, before
+  routing, so the router cannot see it and does not list it.
+- **A path that matches no route at all is still a `404`**, with no `Allow`.
+- **Under a `staticfiles`/`spafiles`/`dynamicfiles` mount this does not hold yet.** The mount's
+  catch-all turns a method mismatch on an app route under its prefix (every path, for a root
+  mount) into a `404`, and a mount's own `405` always says `Allow: GET, HEAD`. Tracked in
+  [#284](https://github.com/PingoLee/Nitro.jl/issues/284).
+- **A custom 405 handler still decides the response.** With
+  `Service(router = HTTP.Router(my404, my405))`, Nitro calls `my405` and adds `Allow` to the
+  `HTTP.Response` it returns, as a new response, so a shared `const` response is safe. If `my405`
+  sets its own `Allow`, Nitro leaves it alone. Any other return value passes through unchanged.
 
 ## Modular Route Inclusion with `include_routes`
 
