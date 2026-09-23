@@ -166,10 +166,7 @@ function _keyset_entry(pair::Pair, use::Symbol)
             "an AbstractString or a SecretString. A Vector{UInt8} in particular is refused " *
             "without being read -- converting one empties the caller's buffer"))
     end
-    # By HMAC key, not by `isempty`, for the same reason the duplicate check is: HMAC
-    # zero-pads a short key, so "\0" (or any run of NULs up to the block size) IS the empty
-    # key, and a token signed with "" would verify against it.
-    _hmac_fingerprint(wrapped) == _EMPTY_KEY_FINGERPRINT && throw(ArgumentError(
+    _empty_hmac_key(reveal(wrapped)) && throw(ArgumentError(
         "JWTKeyset: the secret for kid $(repr(kid)) is empty, or equivalent to the empty HMAC " *
         "key; a token signed with the empty string would verify against it"))
     return (kid, wrapped, use)
@@ -179,7 +176,33 @@ end
 _hmac_fingerprint(secret::SecretString) =
     SHA.hmac_sha256(Vector{UInt8}(codeunits(reveal(secret))), UInt8[])
 
-const _EMPTY_KEY_FINGERPRINT = SHA.hmac_sha256(UInt8[], UInt8[])
+# Is `secret` the empty HMAC key? By HMAC key, not by `isempty`, for the same reason the
+# duplicate check is: HMAC-SHA256 zero-pads a key up to its 64-byte block, so "\0" -- or
+# any run of NULs up to the block size -- IS the empty key, and a token signed with ""
+# verifies against it. A longer key is hashed first, and no SHA-256 output is the zero
+# block, so past 64 bytes nothing is empty. This is `_hmac_fingerprint(s) ==
+# hmac_sha256(UInt8[], UInt8[])` exactly, without the allocation or the HMAC -- which
+# matters because the plain-string secret path runs it on every `decode_jwt` call (#264).
+function _empty_hmac_key(secret::AbstractString)
+    ncodeunits(secret) <= 64 || return false
+    for byte in codeunits(secret)
+        byte == 0x00 || return false
+    end
+    return true
+end
+
+const _EMPTY_SECRET_MESSAGE =
+    "the JWT secret is empty, or equivalent to the empty HMAC key, so a token signed with " *
+    "the empty string would verify against it. An unset environment variable read as " *
+    "get(ENV, \"JWT_SECRET\", \"\") is the usual cause -- read it with a `nothing` default " *
+    "and fail at startup instead"
+
+# The plain-string counterpart of `_keyset_entry`'s check. Deliberately no `repr(secret)`
+# in the message.
+function _check_string_secret(secret::AbstractString)
+    _empty_hmac_key(secret) && throw(ArgumentError(_EMPTY_SECRET_MESSAGE))
+    return secret
+end
 
 _signing_key(keyset::JWTKeyset) = @inbounds keyset.keys[1]
 

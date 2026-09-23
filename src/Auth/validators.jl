@@ -40,7 +40,9 @@ const _WARN_ISS_MAX = 128
 # And bound the set itself, so a high-cardinality `iss` cannot grow it without limit.
 const _WARN_SEEN_CAP = 64
 
-function _warn_iss(value)
+# A claim value is `Any` by nature, so this call is dynamic; the return annotation stops
+# that `Any` from reaching `_report_missing_claim!` on the per-request path (#265).
+function _warn_iss(value)::Nullable{String}
     value === nothing && return nothing
     text = string(value)
     return length(text) > _WARN_ISS_MAX ? string(first(text, _WARN_ISS_MAX), "…") : text
@@ -101,6 +103,13 @@ Safe by default: every token is signature-verified and time-bounded (`exp`, or `
 misconfiguration — a multi-key `Dict` with no `"default"`, two entries that are the same
 HMAC key, a non-string secret — is an `ArgumentError` at construction, which is app
 startup. The validator keeps that snapshot: mutating the `Dict` afterwards has no effect.
+
+A string secret is held to the same rule as a keyset secret: one that is empty, or that
+HMAC treats as empty (a short run of `"\\0"` bytes), is an `ArgumentError` at construction.
+Read the secret with a `nothing` default — `get(ENV, "JWT_SECRET", nothing)` — and fail at
+startup when it is missing; a `""` default would otherwise authenticate every token signed
+with the empty string. `encode_jwt` refuses such a secret too, and so does `decode_jwt`
+whenever it verifies a signature.
 
 # Profiles
 
@@ -182,6 +191,10 @@ function jwt_validator(secret_or_keyset;
     keyset = secret_or_keyset isa AbstractDict ? JWTKeyset(secret_or_keyset) : secret_or_keyset
     keyset isa Union{AbstractString, JWTKeyset} || throw(ArgumentError(
         "jwt_validator: the secret must be $_JWT_SECRET_TYPES, got a $(typeof(keyset))"))
+    # At construction, which is app startup: an empty string secret -- typically an unset
+    # env var read with a "" default -- makes every token forged with "" authenticate
+    # (#264). `JWTKeyset` already refused this for its own secrets; a plain string did not.
+    keyset isa AbstractString && _check_string_secret(keyset)
 
     # Only a keyset-resolved kid is verified; `decode_jwt` with a single string secret
     # passes the attacker-chosen header kid through as an unverified label.
@@ -209,9 +222,6 @@ function jwt_validator(secret_or_keyset;
     seen_warned = Set{NTuple{3, Nullable{String}}}()
     seen_lock = ReentrantLock()
 
-    # Concrete NamedTuple capture — all profile resolution happens here, once, at
-    # construction; the per-request closure does no configuration branching.
-    decode_kwargs = values(kwargs)
     if profile === :strict
         get(kwargs, :issuer, nothing) === nothing &&
             throw(ArgumentError("profile=:strict requires issuer=..."))
@@ -219,11 +229,16 @@ function jwt_validator(secret_or_keyset;
             throw(ArgumentError("profile=:strict requires audience=..."))
         get(kwargs, :require_exp, true) === false &&
             throw(ArgumentError("profile=:strict forces require_exp=true; do not pass require_exp=false"))
-        decode_kwargs = merge(decode_kwargs, (require_exp = true,))
     end
+    # Concrete NamedTuple capture — all profile resolution happens here, once, at
+    # construction; the per-request closure does no configuration branching. Assigned
+    # exactly ONCE: a captured variable that is reassigned anywhere in the enclosing
+    # function is captured in a `Core.Box`, which made every request dispatch `decode_jwt`
+    # dynamically and infer `claims`/`kid` as `Any` (#265).
+    decode_kwargs = profile === :strict ? merge(values(kwargs), (require_exp = true,)) : values(kwargs)
 
     return function(token::AbstractString, req::Union{HTTP.Request, Nothing}=nothing)
-        claims, kid = decode_jwt(token, keyset; with_kid=true, decode_kwargs...)
+        claims, kid = _decode_jwt(token, keyset; decode_kwargs...)
         resolved_kid = kid_trusted && kid !== nothing ? String(kid) : nothing
         # `resolved_kid`, never the raw header kid: the header value is attacker-chosen,
         # and this one has been resolved against the keyset. An unverified kid must not

@@ -104,6 +104,47 @@ end
     @test bytes["default"] == codeunits("real-prod-secret")
 end
 
+@testset "a plain string secret is held to the keyset's empty-key rule (#264)" begin
+    # The predicate is HMAC's own equivalence, checked against HMAC itself: NULs up to the
+    # 64-byte block are zero-padded into the empty key; a longer key is hashed first.
+    oracle(s) = Nitro.Auth._hmac_fingerprint(SecretString(s)) ==
+        Nitro.Auth.SHA.hmac_sha256(UInt8[], UInt8[])
+    for s in ("", "\0", "\0\0\0", "\0"^64, "\0"^65, "a", "a\0", "\0a", "\0"^63 * "a")
+        @test (repr(s), Nitro.Auth._empty_hmac_key(s)) == (repr(s), oracle(s))
+    end
+    @test Nitro.Auth._empty_hmac_key("\0"^64)
+    @test !Nitro.Auth._empty_hmac_key("\0"^65)
+
+    # The forged token an attacker builds when the server's secret is "" -- by hand,
+    # because `encode_jwt` now refuses to sign it.
+    function forge_with_empty_key(claims)
+        seg(x) = Nitro.Auth._base64url_encode(Vector{UInt8}(codeunits(JSON.json(x))))
+        input = string(seg(Dict("alg" => "HS256", "typ" => "JWT")), ".", seg(claims))
+        sig = Nitro.Auth._base64url_encode(Nitro.Auth._hmac_sha256("", input))
+        return string(input, ".", sig)
+    end
+    forged = forge_with_empty_key(Dict("sub" => "admin", "exp" => Nitro.Auth._current_timestamp() + 60))
+
+    # The reported shape: `jwt_validator(get(ENV, "JWT_SECRET", ""))` used to return a
+    # Principal for `forged`. Now there is no validator to ask.
+    for secret in ("", "\0", "\0\0", SubString("x\0\0", 2))
+        @test (repr(secret), caught(() -> jwt_validator(secret)) isa ArgumentError) == (repr(secret), true)
+        @test (repr(secret), caught(() -> decode_jwt(forged, secret)) isa ArgumentError) == (repr(secret), true)
+        @test (repr(secret), caught(() -> encode_jwt(Dict("sub" => "x"), secret)) isa ArgumentError) ==
+            (repr(secret), true)
+    end
+    @test occursin("empty HMAC key", message(() -> jwt_validator("")))
+    @test occursin("JWT_SECRET", message(() -> jwt_validator("")))
+    # A real secret is untouched, and a forged token still fails its signature against it.
+    @test jwt_validator("s1")(encode_jwt(Dict("sub" => "1"), "s1"; expires_in = 60)).id == "1"
+    @test occursin("Invalid JWT signature", message(() -> jwt_validator("s1")(forged)))
+    # The message never echoes the value. Asserted as the exact fixed text, because a
+    # `repr(secret)` regression would escape the NULs to `\\0` and slip past a
+    # `!occursin("\0", ...)` check.
+    @test message(() -> jwt_validator("\0\0")) ==
+        "ArgumentError: " * Nitro.Auth._EMPTY_SECRET_MESSAGE
+end
+
 @testset "signing as a peer of a registry" begin
     # The client-registry shape: permanent identities, none of them "retiring".
     registry = JWTKeyset("self" => "s-self"; verify = ["reporting" => "s-rep", "batch" => "s-batch"])
@@ -144,6 +185,33 @@ end
     @test (@inferred Nitro.Auth._verify_candidates("s1", "label")) isa T
     @test (@inferred Nitro.Auth._signing_secret(ks)) == ("s1", "current")
     @test (@inferred Nitro.Auth._signing_secret("s1")) == ("s1", nothing)
+
+    # `_decode_jwt` is what the validator calls: one tuple shape, no `with_kid` Union (#265).
+    DT = Tuple{AbstractDict, Nullable{String}}
+    token = encode_jwt(Dict("sub" => "1"), ks; expires_in = 60)
+    @test (@inferred DT Nitro.Auth._decode_jwt(token, "s1")) isa DT
+    @test (@inferred DT Nitro.Auth._decode_jwt(token, ks)) isa DT
+    @test decode_jwt(token, ks; with_kid = true) == Nitro.Auth._decode_jwt(token, ks)
+    @test decode_jwt(token, ks) == first(Nitro.Auth._decode_jwt(token, ks))
+end
+
+@testset "the jwt_validator closure is unboxed on every profile (#265)" begin
+    ks = JWTKeyset("current" => "s1")
+    token = encode_jwt(Dict("sub" => "1", "iss" => "i", "aud" => "a"), ks; expires_in = 60)
+    for (label, v) in (
+            ("default", jwt_validator("s1")),
+            ("keyset", jwt_validator(ks; identity_from = :kid)),
+            ("strict", jwt_validator(ks; profile = :strict, issuer = "i", audience = "a")),
+            ("warn_claims", jwt_validator(ks; warn_claims = ["iss"])))
+        # A captured variable reassigned anywhere in `jwt_validator` becomes a `Core.Box`,
+        # and every request then dispatched `decode_jwt` dynamically.
+        @test (label, any(T -> T === Core.Box, fieldtypes(typeof(v)))) == (label, false)
+        # And no local of the per-request body is `Any` -- `claims`, `kid` and the
+        # `warn_claims` `iss` all were.
+        ci = only(code_typed(v, (String, Nothing); optimize = false)).first
+        @test (label, filter(T -> T === Any, ci.slottypes)) == (label, [])
+        @test (label, v(token).kid) == (label, label == "default" ? nothing : "current")
+    end
 end
 
 end
