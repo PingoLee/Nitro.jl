@@ -6,7 +6,7 @@ using ..Util: join_url_path
 using ..AppContext: App
 using ..Types: Nullable, LifecycleMiddleware, CopyOnWriteDict, snapshot,
                 cache_if_current!, publish!, RouteResolution, ROUTE_RESOLUTION_KEY,
-                RouteMiddleware, NO_ROUTE_MIDDLEWARE, AutoHeadHandler
+                RouteMiddleware, NO_ROUTE_MIDDLEWARE, DeclaredMethodHandler
 
 export router, compose, genkey, cachetag, process_middleware, HOFRouter, OuterRouter, InnerRouter
 
@@ -495,12 +495,16 @@ function compose(router::HTTP.Router, globalmiddleware::Vector{Function},
                 # string, as it did before this change. `genkey` is only needed on the miss
                 # path, where `buildmiddleware` looks up `custommiddleware`.
                 #
-                # An auto-`HEAD` leaf (#277) takes both keys from its `GET` route. That way the
-                # `GET` route's guards gate its `HEAD`, and a re-publish of the `GET` middleware
-                # invalidates the chain `HEAD` uses, since the chain wraps the router terminal and
-                # is method-agnostic. An explicit `HEAD` route is a different handler type and
-                # keeps its own `HEAD|` keys.
-                mw_method = innerhandler isa AutoHeadHandler ? "GET" : req.method
+                # Both keys use the method the route was DECLARED with, which is the one its
+                # middleware was published under. For most leaves that is `req.method`. A
+                # `DeclaredMethodHandler` leaf is reached by other methods and carries its own:
+                # `GET` for an auto-`HEAD` (#277), and `*`, `STREAM` or `WEBSOCKET` for routes
+                # declared that way (#282). No request carries those three, so keyed on
+                # `req.method` their guards were never found and never ran. One chain then
+                # serves every method that reaches the leaf, which is sound because the chain
+                # wraps the router terminal and is method-agnostic. A re-publish under the
+                # declared key invalidates it for all of them.
+                mw_method = innerhandler isa DeclaredMethodHandler ? innerhandler.method : req.method
                 if use_cache
                     cachekey = string(mw_method, '|', path, cache_suffix)
                     # One acquire-load, then a lookup on a table no writer will ever mutate.
