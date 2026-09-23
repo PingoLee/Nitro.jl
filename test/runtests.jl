@@ -434,6 +434,13 @@ let args = copy(ARGS)
     # else. That is the right way round: exactly one CI job runs with `--code-coverage`,
     # and the other seven keep a per-item ceiling, so a hang is still caught -- just not by
     # the coverage job.
+    #
+    # "Exactly one" is not the default, and for a while it was not true (#244):
+    # `julia-actions/julia-runtest` defaults `coverage` to `true`, so a bare step put all
+    # eight jobs down this branch while only the upload was gated -- and no job had a
+    # ceiling. It holds because ci.yml passes `coverage:` to that step behind the same
+    # matrix condition as the upload, and `test/ci_workflow_tests.jl` asserts they stay
+    # equal. A job that DOES cover runs with no per-item timeout; that is the price.
     covering = Base.JLOptions().code_coverage != 0
 
     # Tag EXCLUSION, which ReTestItems' own filters cannot express (#214).
