@@ -6,7 +6,7 @@ using ..Util: join_url_path
 using ..AppContext: App
 using ..Types: Nullable, LifecycleMiddleware, CopyOnWriteDict, snapshot,
                 cache_if_current!, publish!, RouteResolution, ROUTE_RESOLUTION_KEY,
-                RouteMiddleware, NO_ROUTE_MIDDLEWARE
+                RouteMiddleware, NO_ROUTE_MIDDLEWARE, AutoHeadHandler
 
 export router, compose, genkey, cachetag, process_middleware, HOFRouter, OuterRouter, InnerRouter
 
@@ -494,8 +494,15 @@ function compose(router::HTTP.Router, globalmiddleware::Vector{Function},
                 # Built BEFORE the plain `genkey` so a cache hit still allocates exactly one
                 # string, as it did before this change. `genkey` is only needed on the miss
                 # path, where `buildmiddleware` looks up `custommiddleware`.
+                #
+                # An auto-`HEAD` leaf (#277) takes both keys from its `GET` route. That way the
+                # `GET` route's guards gate its `HEAD`, and a re-publish of the `GET` middleware
+                # invalidates the chain `HEAD` uses, since the chain wraps the router terminal and
+                # is method-agnostic. An explicit `HEAD` route is a different handler type and
+                # keeps its own `HEAD|` keys.
+                mw_method = innerhandler isa AutoHeadHandler ? "GET" : req.method
                 if use_cache
-                    cachekey = string(req.method, '|', path, cache_suffix)
+                    cachekey = string(mw_method, '|', path, cache_suffix)
                     # One acquire-load, then a lookup on a table no writer will ever mutate.
                     # See `CopyOnWriteDict` (src/types.jl) for why this read needs no lock.
                     func = get(snapshot(middleware_cache), cachekey, nothing)
@@ -504,7 +511,7 @@ function compose(router::HTTP.Router, globalmiddleware::Vector{Function},
                     end
                 end
 
-                key = genkey(req.method, path)
+                key = genkey(mw_method, path)
 
                 # Combine all the middleware functions together
                 strategy = buildmiddleware(key, handler, globalmiddleware, custommiddleware)

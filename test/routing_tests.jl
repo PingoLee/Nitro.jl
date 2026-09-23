@@ -650,3 +650,147 @@ end
     @test roundtrip([reads_payload]) == expected
 end
 end
+
+@testitem "HEAD is auto-routed from GET (#277)" tags=[:core] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+using Nitro.Core: App, Service, internalrequest, AutoHeadHandler
+using Nitro.Core.Routing: urlpatterns
+
+# In-process and a local `App` per case: routing and middleware keying are what change here, and
+# `internalrequest` runs the same `compose` a server does. The wire half (empty body, the GET's
+# Content-Type and Content-Length) is in "Response builders on the wire", test/response_tests.jl.
+
+head(ctx, target) = internalrequest(ctx, HTTP.Request("HEAD", target))
+leaf(ctx, method, target) = first(HTTP.Handlers.gethandler(ctx.service.router, HTTP.Request(method, target)))
+
+seen_method(req::HTTP.Request) = HTTP.Response(200, ["X-Seen-Method" => req.method], "get body")
+explicit_head(req::HTTP.Request) = Res.status(299)
+deny = handle -> (req -> HTTP.Response(403))
+tag(value) = handle -> (req -> Nitro.Core.Util.add_response_headers(handle(req), "X-Tag" => value))
+
+@testset "a GET-only route answers HEAD through its GET handler" begin
+    ctx = App()
+    urlpatterns(ctx, "", path("/g", seen_method), path("/v/<int:id>", (req::HTTP.Request, id::Int) -> Res.json(Dict("id" => id))))
+    r = head(ctx, "/g")
+    @test r.status == 200
+    @test HTTP.header(r, "X-Seen-Method") == "HEAD"
+    @test head(ctx, "/v/7").status == 200
+    @test leaf(ctx, "HEAD", "/g") isa AutoHeadHandler
+    # HEAD only. Every other method on a GET route is refused as before.
+    @test internalrequest(ctx, HTTP.Request("POST", "/g")).status == 405
+end
+
+@testset "an explicit HEAD route wins, in either order, and neither order warns" begin
+    ctx = App()
+    # `@test_logs` with no patterns asserts that NOTHING at or above Warn was logged. HTTP.jl
+    # warns on every leaf replacement, and HEAD-after-GET replaces the auto leaf.
+    @test_logs min_level = Base.CoreLogging.Warn urlpatterns(ctx, "",
+        path("/before", explicit_head; method = "HEAD"),
+        path("/before", seen_method),
+        path("/after",  seen_method),
+        path("/after",  explicit_head; method = "HEAD"),
+        path("/both",   seen_method; methods = ["GET", "HEAD"]),
+    )
+    @test head(ctx, "/before").status == 299
+    @test head(ctx, "/after").status == 299
+    @test HTTP.header(head(ctx, "/both"), "X-Seen-Method") == "HEAD"
+    @test !(leaf(ctx, "HEAD", "/both") isa AutoHeadHandler)
+end
+
+@testset "precedence is per route shape, as HTTP.jl's tree stores it" begin
+    # `/s/{id}` and `/s/{x}` are one leaf in the tree, whatever the variable is called.
+    ctx = App()
+    explicit_x(req::HTTP.Request, x::Int) = Res.status(299)
+    @test_logs min_level = Base.CoreLogging.Warn urlpatterns(ctx, "",
+        path("/s1/<int:x>",  explicit_x; method = "HEAD"),
+        path("/s1/<int:id>", (req::HTTP.Request, id::Int) -> Res.json(Dict("id" => id))),
+        path("/s2/<int:id>", (req::HTTP.Request, id::Int) -> Res.json(Dict("id" => id))),
+        path("/s2/<int:x>",  explicit_x; method = "HEAD"),
+    )
+    @test head(ctx, "/s1/1").status == 299
+    @test head(ctx, "/s2/1").status == 299
+end
+
+@testset "two explicit HEAD routes on one shape still warn" begin
+    ctx = App()
+    @test_logs (:warn, r"replacing existing registered route") urlpatterns(ctx, "",
+        path("/dup", explicit_head; method = "HEAD"),
+        path("/dup", explicit_head; method = "HEAD"),
+    )
+end
+
+@testset "STREAM and WEBSOCKET routes get no HEAD" begin
+    ctx = App()
+    urlpatterns(ctx, "",
+        path("/stream", (stream::HTTP.Stream) -> nothing; method = "STREAM"),
+        path("/ws", (ws::HTTP.WebSockets.WebSocket) -> nothing; method = "WEBSOCKET"),
+    )
+    @test leaf(ctx, "GET", "/stream") isa Function
+    @test leaf(ctx, "HEAD", "/stream") === missing
+    @test leaf(ctx, "HEAD", "/ws") === missing
+
+    # Re-registering a GET path as STREAM or WEBSOCKET (Revise, a re-run `urlpatterns`) replaces
+    # the GET leaf. The auto-HEAD it left behind must not keep serving the old GET handler.
+    for (method, handler) in (("STREAM", (stream::HTTP.Stream) -> nothing),
+                              ("WEBSOCKET", (ws::HTTP.WebSockets.WebSocket) -> nothing))
+        ctx = App()
+        urlpatterns(ctx, "", path("/swap", seen_method))
+        @test head(ctx, "/swap").status == 200
+        urlpatterns(ctx, "", path("/swap", handler; method = method))
+        @test head(ctx, "/swap").status == 405
+        # ... and a GET registered there again gets its auto-HEAD back.
+        urlpatterns(ctx, "", path("/swap", seen_method))
+        @test head(ctx, "/swap").status == 200
+    end
+end
+
+@testset "a method=\"*\" route registered after the GET no longer receives its HEAD" begin
+    # HTTP.jl gives a HEAD to the first leaf that accepts it, and the auto-HEAD now sits before a
+    # later `"*"` leaf. The GET route answers the HEAD; every other method still reaches `"*"`.
+    ctx = App()
+    urlpatterns(ctx, "",
+        path("/any", seen_method),
+        path("/any", (req::HTTP.Request) -> Res.status(298); method = "*"),
+    )
+    @test HTTP.header(head(ctx, "/any"), "X-Seen-Method") == "HEAD"
+    @test internalrequest(ctx, HTTP.Request("PUT", "/any")).status == 298
+end
+
+@testset "a router with HTTP.jl-level middleware gets no auto-HEAD" begin
+    # `register!` wraps the handler in the router's own middleware, so the leaf could no longer
+    # be told apart from an explicit HEAD, and would lose the GET route's guards. A 405 is safe.
+    ctx = App(service = Service(router = HTTP.Router(HTTP.Handlers.default404, HTTP.Handlers.default405, h -> (req -> h(req)))))
+    urlpatterns(ctx, "", path("/g", seen_method; middleware = [deny]))
+    @test leaf(ctx, "HEAD", "/g") === missing
+    @test head(ctx, "/g").status == 405
+end
+
+@testset "route middleware on the GET route gates its HEAD" begin
+    # The auto-HEAD keys its middleware on `GET|path`. Keyed on `HEAD|path` it would find none,
+    # and a guarded GET route would answer an unguarded HEAD.
+    ctx = App()
+    urlpatterns(ctx, "", path("/guarded", seen_method; middleware = [deny]))
+    @test internalrequest(ctx, HTTP.Request("GET", "/guarded")).status == 403
+    @test head(ctx, "/guarded").status == 403
+end
+
+@testset "HEAD follows a re-published GET middleware, and an explicit HEAD drops it" begin
+    ctx = App()
+    urlpatterns(ctx, "", path("/r", seen_method; middleware = [tag("one")]))
+    @test HTTP.header(head(ctx, "/r"), "X-Tag") == "one"        # warms the cached chain
+
+    # Re-registering the GET (what Revise does) re-publishes `GET|/r` and invalidates its cached
+    # chain. The auto-HEAD shares that key, so it must see the new middleware too.
+    urlpatterns(ctx, "", path("/r", seen_method; middleware = [tag("two")]))
+    @test HTTP.header(head(ctx, "/r"), "X-Tag") == "two"
+
+    # An explicit HEAD with no middleware of its own replaces the auto leaf. It must not keep
+    # the GET route's middleware, from the table or from the chain the HEADs above cached.
+    urlpatterns(ctx, "", path("/r", explicit_head; method = "HEAD"))
+    r = head(ctx, "/r")
+    @test r.status == 299
+    @test !HTTP.hasheader(r, "X-Tag")
+end
+end

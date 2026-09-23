@@ -518,6 +518,11 @@ Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
     path("/h/split",  (req::HTTP.Request) -> Res.status(200);      methods = ["HEAD"]),
     path("/h/none",   (req::HTTP.Request) -> Res.status(204);      methods = ["HEAD"]),
     path("/h/304",    (req::HTTP.Request) -> SHARED_304;           methods = ["HEAD"]),
+    # `/h/split` in the other order: the explicit HEAD first, then the GET (#277).
+    path("/h/split2", (req::HTTP.Request) -> Res.status(200);      methods = ["HEAD"]),
+    path("/h/split2", (req::HTTP.Request) -> Res.send(BODY_TEXT)),
+    # GET-only, and reports the method its handler saw.
+    path("/h/method", (req::HTTP.Request) -> HTTP.Response(200, ["X-Seen-Method" => req.method], BODY_TEXT)),
 ])
 
 port = get_free_port()
@@ -584,6 +589,35 @@ try
             @test r.status in (204, 304)
             @test !HTTP.hasheader(r, "Content-Length")
         end
+    end
+
+    @testset "a GET-only route answers HEAD from its GET handler (#277)" begin
+        # Every route here is registered for GET alone. Before #277 each HEAD was a 405.
+        for route in ("/page", "/plain", "/sheet", "/data", "/buffered", "/stream")
+            got  = HTTP.get("http://$HOST:$port$route")
+            head = HTTP.request("HEAD", "http://$HOST:$port$route"; status_exception = false)
+            @test head.status == got.status == 200
+            @test isempty(head.body)
+            @test HTTP.header(head, "Content-Type") == HTTP.header(got, "Content-Type")
+            @test HTTP.header(head, "Content-Length") == HTTP.header(got, "Content-Length")
+            @test !isempty(HTTP.header(got, "Content-Length"))
+        end
+
+        # The GET handler runs on the HEAD request itself, so it can tell the two apart.
+        @test HTTP.header(HTTP.get("http://$HOST:$port/h/method"), "X-Seen-Method") == "GET"
+        @test HTTP.header(HTTP.request("HEAD", "http://$HOST:$port/h/method"), "X-Seen-Method") == "HEAD"
+
+        # An explicit HEAD route wins in either registration order: its empty body means no
+        # Content-Length, where the auto-HEAD would have sent the GET's.
+        for route in ("/h/split", "/h/split2")
+            head = HTTP.request("HEAD", "http://$HOST:$port$route")
+            @test head.status == 200
+            @test !HTTP.hasheader(head, "Content-Length")
+            @test HTTP.header(HTTP.get("http://$HOST:$port$route"), "Content-Length") == string(sizeof(BODY_TEXT))
+        end
+
+        # Only HEAD is added: other methods on a GET-only route are still refused.
+        @test HTTP.request("POST", "http://$HOST:$port/plain"; status_exception = false).status == 405
     end
 
     @testset "a streamed body reaches the client whole (#41)" begin

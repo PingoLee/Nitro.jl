@@ -294,6 +294,54 @@ end
 > HTML forms only support these two verbs natively, and action-oriented APIs
 > (import, sync, trigger) are naturally expressed as `POST`.
 
+## `HEAD` Requests
+
+Every `GET` route also answers `HEAD`, with no extra declaration. Nitro calls the `GET` handler,
+sends its status and headers (`Content-Type`, `Content-Length`, …) and drops the body. This is
+what RFC 9110 §9.3.2 asks for, and what Django, Express and Go's `net/http` do. `curl -I` works
+against any `GET` route.
+
+```julia
+# src/Routes.jl
+path("/api/products/<int:id>", ProductHandlers.get_product)   # answers GET and HEAD
+```
+
+The rules:
+
+- **An explicit `HEAD` route wins**, whichever order the two are registered in. Declare one when
+  `HEAD` has a cheaper answer than building the body:
+
+  ```julia
+  path("/api/reports/<int:id>", ReportHandlers.download)
+  path("/api/reports/<int:id>", ReportHandlers.report_exists; method="HEAD")
+  ```
+
+  An explicit `HEAD` handler that returns an empty body (`Res.status(200)`) gets no
+  `Content-Length`. Nitro cannot know the size of the `GET` body, and a wrong length is worse
+  than none. `methods=["GET", "HEAD"]` still works and means the same one handler serves both.
+- **The handler sees `req.method == "HEAD"`**, so a `GET` handler can skip a side effect that
+  should only happen on a real read:
+
+  ```julia
+  function get_product(req, id::Int)
+      req.method == "HEAD" || record_view!(id)       # a HEAD is not a view
+      return Res.json(Dict("id" => id, "name" => product_name(id)))
+  end
+  ```
+
+  Return the **same** body either way. Nitro sets the `HEAD`'s `Content-Length` from the body the
+  handler returned, so a smaller body on `HEAD` would announce the wrong length. To avoid building
+  the body at all, use an explicit `HEAD` route that returns an empty one (above). Without any
+  branch the handler runs in full and only the body is discarded. A streamed body (`Res.sse`,
+  `Res.file(...; stream=true)`) is closed, never read.
+- **The `GET` route's middleware and guards apply to its `HEAD`.** A route behind
+  `GuardMiddleware(login_required())` refuses an anonymous `HEAD` exactly as it refuses the `GET`.
+  An explicit `HEAD` route uses only its own `middleware=`.
+- **Only `method="GET"` gets it.** `"STREAM"` and `"WEBSOCKET"` routes do not, and other
+  methods on a `GET` route are still refused with `405`.
+- **`internalrequest` does not drop the body.** The body is removed by the server's write path,
+  so an in-process `HEAD` returns what the handler built.
+
 ## Modular Route Inclusion with `include_routes`
 
 For large applications split across multiple handler modules, use `include_routes` to

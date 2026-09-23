@@ -204,7 +204,78 @@ function registerhandler(ctx::App, router::Router, httpmethod::String, route::St
         [get(METHOD_ALIASES, httpmethod, httpmethod)]
     end
 
+    # `HEAD` on the app's own router goes through the precedence table below (#277). Other
+    # routers (the static mounts register `"*"` on theirs) keep the plain registration.
+    owns_head = router === ctx.service.router
+    if owns_head && httpmethod == HEAD
+        _register_head!(ctx, router, route, handle, :explicit)
+        return nothing
+    end
+
     for resolved_httpmethod in resolved_methods
         HTTP.register!(router, resolved_httpmethod, route, handle)
+    end
+
+    # Literal `GET` only. `STREAM` and `WEBSOCKET` also resolve to `GET` above, but a handler
+    # that writes to the raw stream or upgrades the connection has no meaningful `HEAD`.
+    #
+    # Not on a router built with HTTP.jl-level `middleware` either: `register!` wraps the handler
+    # in it, the leaf then no longer `isa AutoHeadHandler`, and `compose` would key the `HEAD` on
+    # `HEAD|…`, finding none of the `GET` route's guards. A `405` is the safe answer there.
+    if owns_head && httpmethod == GET && router.middleware === nothing
+        _register_head!(ctx, router, route, AutoHeadHandler(handle), :auto)
+    elseif owns_head && (httpmethod == STREAM || httpmethod == WEBSOCKET)
+        # These replace the `GET` leaf. An auto-`HEAD` left behind by an earlier `GET` at the same
+        # path (Revise, a re-run `urlpatterns`) would keep serving that old handler.
+        _register_head!(ctx, router, route, req::HTTP.Request -> router._405(req), :retired)
+    end
+    return nothing
+end
+
+"""
+    _route_shape(route) -> String
+
+The identity HTTP.jl's route tree gives `route`'s leaf. A variable with no pattern is a wildcard
+node there, the same as `*`, so `/a/{id}` and `/a/{x}` share one leaf. A variable with a pattern
+is keyed on its pattern alone. Mirrors `HTTP.Handlers.register!`'s split and `VARREGEX`.
+"""
+function _route_shape(route::String)::String
+    shape = map(split(route, '/'; keepempty = false)) do seg
+        m = Base.match(r"^{([^:{}]+)(?::(.*))?}$", seg)
+        m === nothing ? String(seg) : m.captures[2] === nothing ? "*" : string("{:", m.captures[2], "}")
+    end
+    return join(shape, '/')
+end
+
+"""
+    _register_head!(ctx, router, route, handler, claim)
+
+Register `handler` as `route`'s `HEAD` leaf, resolving who owns it (#277). `claim` is:
+
+- `:explicit` — a `HEAD` route. It always wins, in either registration order.
+- `:auto` — the [`AutoHeadHandler`](@ref) a `GET` route adds. Skipped while an explicit `HEAD`
+  owns the shape.
+- `:retired` — a `STREAM`/`WEBSOCKET` route replaced the `GET` leaf. Only an auto `HEAD` is
+  replaced, by the router's own `405`, since HTTP.jl has no way to remove a leaf.
+
+HTTP.jl warns whenever a leaf is replaced. Replacing a leaf this table added itself (`:auto` or
+`:retired`) is expected, so it is silenced; the `GET` replacement that triggers it has already
+warned. Two explicit `HEAD` routes on one shape still warn, as before.
+"""
+function _register_head!(ctx::App, router::Router, route::String, handler::Function, claim::Symbol)
+    shape = _route_shape(route)
+    Base.lock(ctx.service.head_routes_lock) do
+        owner = get(ctx.service.head_routes, shape, nothing)
+        claim === :auto && owner === :explicit && return nothing
+        claim === :retired && owner !== :auto && return nothing
+        ctx.service.head_routes[shape] = claim
+        if owner === :auto || owner === :retired
+            Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
+                HTTP.register!(router, HEAD, route, handler)
+            end
+        else
+            HTTP.register!(router, HEAD, route, handler)
+        end
+        return nothing
     end
 end

@@ -461,14 +461,15 @@ end
 # reads keeps the two equal by construction — for every builder, raw return and hand-built
 # `HTTP.Response` alike — where a per-builder header would only ever cover `Res`.
 #
-# This assumes the `HEAD` handler returned the body `GET` would send — true when one function is
-# registered for both methods. RFC 9110 §8.6 makes a wrong value a MUST NOT and an absent one a
-# MAY, so every case where that assumption cannot be trusted is skipped:
+# This assumes the `HEAD` handler returned the body `GET` would send. That holds when one function
+# is registered for both methods, and for the auto-`HEAD` every `GET` route gets (#277). RFC 9110
+# §8.6 makes a wrong value a MUST NOT and an absent one a MAY, so every case where the assumption
+# cannot be trusted is skipped:
 #
-# - An EMPTY body (`0`). `HEAD` is not auto-routed from `GET`, so a hand-written `HEAD`-only
-#   handler is the normal shape, and its natural return is `Res.status(200)` — whose empty body
-#   says nothing about the `GET` representation. Claiming `0` there would be a lie; a route whose
-#   `GET` really is empty loses a header it was only permitted to send.
+# - An EMPTY body (`0`). An explicit `HEAD`-only handler still wins over the auto-`HEAD`, and its
+#   natural return is `Res.status(200)`, whose empty body says nothing about the `GET`
+#   representation. Claiming `0` there would be a lie. The write path cannot tell which handler
+#   ran, so a route whose `GET` really is empty loses a header it was only permitted to send.
 # - An unknown length (`-1` — a streamed or SSE body, which a `GET` would send chunked).
 # - A header the response already set (`Res.file`, static files) — the handler said it explicitly.
 # - Statuses that carry no representation: 1xx and 204 must not send the header, and a 304's

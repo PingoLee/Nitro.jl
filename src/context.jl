@@ -33,6 +33,11 @@ end
     prefix              :: Ref{Nullable{String}}    = Ref{Nullable{String}}(nothing)
     eager_revise        :: Ref{Nullable{EagerReviseService}} = Ref{Nullable{EagerReviseService}}(nothing)
     named_routes_lock     :: ReentrantLock          = ReentrantLock()
+    # Route shape -> `:auto`, `:explicit` or `:retired`: who owns the `HEAD` leaf there (#277).
+    # Explicit `HEAD` wins whatever the registration order; see `_register_head!`
+    # (src/core/registration.jl).
+    head_routes         :: Dict{String, Symbol}     = Dict{String, Symbol}()
+    head_routes_lock    :: ReentrantLock            = ReentrantLock()
     # Lifecycle middleware, split by the SCOPE that declared it (#82). The two halves have
     # genuinely different lifetimes, and collapsing them into one collection is what made
     # `serve(); terminate(); serve()` silently drop every route-level startup hook:

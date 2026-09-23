@@ -1315,4 +1315,25 @@ struct RouteResolution
     params  :: Dict{String,String}
 end
 
+"""
+    AutoHeadHandler(get_handler)
+
+The `HEAD` leaf registration adds next to every `GET` route that has no explicit `HEAD` route of
+its own (#277). It calls the `GET` route's handler unchanged; the request it passes on still says
+`req.method == "HEAD"`, and the write path drops the body (src/core/transport.jl).
+
+It is a distinct type, not the `GET` closure itself, so `compose` (src/routerhof.jl) can tell an
+auto-`HEAD` apart from an explicit one after the router lookup. It then keys the route's middleware
+and its cached chain on `GET`, so the `GET` route's guards also gate its `HEAD`. Both follow a
+later re-publish of the `GET` middleware. An explicit `HEAD` route replaces this leaf and keys on
+`HEAD` as it always did.
+
+Subtypes `Function` so the `RouteResolution` hand-off (`innerhandler isa Function`) still applies.
+"""
+struct AutoHeadHandler{F<:Function} <: Function
+    get_handler :: F
+end
+
+(h::AutoHeadHandler)(req::HTTP.Request) = h.get_handler(req)
+
 end # module Types
