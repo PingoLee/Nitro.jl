@@ -461,15 +461,23 @@ end
 # reads keeps the two equal by construction — for every builder, raw return and hand-built
 # `HTTP.Response` alike — where a per-builder header would only ever cover `Res`.
 #
-# Skipped when there is nothing honest to say: an unknown length (`-1` — a streamed or SSE body,
-# which a `GET` would send chunked), a header the response already set (`Res.file`, static files),
-# and statuses that carry no representation — 1xx and 204 must not send the header, and a 304's
-# empty body says nothing about the size of the representation it stands in for.
+# This assumes the `HEAD` handler returned the body `GET` would send — true when one function is
+# registered for both methods. RFC 9110 §8.6 makes a wrong value a MUST NOT and an absent one a
+# MAY, so every case where that assumption cannot be trusted is skipped:
+#
+# - An EMPTY body (`0`). `HEAD` is not auto-routed from `GET`, so a hand-written `HEAD`-only
+#   handler is the normal shape, and its natural return is `Res.status(200)` — whose empty body
+#   says nothing about the `GET` representation. Claiming `0` there would be a lie; a route whose
+#   `GET` really is empty loses a header it was only permitted to send.
+# - An unknown length (`-1` — a streamed or SSE body, which a `GET` would send chunked).
+# - A header the response already set (`Res.file`, static files) — the handler said it explicitly.
+# - Statuses that carry no representation: 1xx and 204 must not send the header, and a 304's
+#   empty body says nothing about the size of the representation it stands in for.
 #
 # A new response, never a mutated one: `resp` may be a shared `const` (nitro-core §4).
 function _with_head_content_length(resp::HTTP.Response)::HTTP.Response
     status = resp.status
-    (resp.content_length < 0 || status < 200 || status == 204 || status == 304) && return resp
+    (resp.content_length <= 0 || status < 200 || status == 204 || status == 304) && return resp
     HTTP.hasheader(resp, "Content-Length") && return resp
     return add_response_headers(resp, "Content-Length" => string(resp.content_length))
 end

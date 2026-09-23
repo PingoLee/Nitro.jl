@@ -513,6 +513,9 @@ Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
     path("/h/file",   (req::HTTP.Request) -> Res.file(req, STREAM_PATH); methods = ["GET", "HEAD"]),
     path("/h/empty",  (req::HTTP.Request) -> Res.status(200);      methods = ["GET", "HEAD"]),
     path("/h/shared", (req::HTTP.Request) -> SHARED_RESPONSE;      methods = ["GET", "HEAD"]),
+    # The usual hand-written HEAD route: a GET with a body, and a HEAD-only handler with none.
+    path("/h/split",  (req::HTTP.Request) -> Res.send(BODY_TEXT);  methods = ["GET"]),
+    path("/h/split",  (req::HTTP.Request) -> Res.status(200);      methods = ["HEAD"]),
     path("/h/none",   (req::HTTP.Request) -> Res.status(204);      methods = ["HEAD"]),
     path("/h/304",    (req::HTTP.Request) -> SHARED_304;           methods = ["HEAD"]),
 ])
@@ -545,7 +548,6 @@ try
             ("/h/plain",  sizeof(BODY_TEXT)),
             ("/h/data",   sizeof(JSON.json(BODY_JSON))),
             ("/h/file",   length(STREAM_BYTES)),
-            ("/h/empty",  0),
             ("/h/shared", sizeof(BODY_TEXT)),
         )
             got  = HTTP.get("http://$HOST:$port$route")
@@ -559,10 +561,24 @@ try
         # Built, not mutated: the shared response is exactly as it was declared, however many
         # HEADs it has answered.
         @test !HTTP.hasheader(SHARED_RESPONSE, "Content-Length")
-        @test !HTTP.hasheader(SHARED_304, "Content-Length")
+
+        # An empty HEAD body cannot be trusted to describe the GET (RFC 9110 §8.6: a wrong
+        # Content-Length is a MUST NOT, a missing one a MAY). `/h/split` is the case that matters:
+        # its GET sends a body, and a `Content-Length: 0` on its HEAD would be a lie. `/h/empty`
+        # is the price -- its GET really is empty, and its HEAD loses a header it was only
+        # permitted to send.
+        split_get  = HTTP.get("http://$HOST:$port/h/split")
+        split_head = HTTP.request("HEAD", "http://$HOST:$port/h/split")
+        @test HTTP.header(split_get, "Content-Length") == string(sizeof(BODY_TEXT))
+        @test split_head.status == 200
+        @test !HTTP.hasheader(split_head, "Content-Length")
+        @test HTTP.header(HTTP.get("http://$HOST:$port/h/empty"), "Content-Length") == "0"
+        @test !HTTP.hasheader(HTTP.request("HEAD", "http://$HOST:$port/h/empty"), "Content-Length")
 
         # No representation, so no length: a 204 must not send the header at all, and a 304's
-        # empty body says nothing about the size of what it stands in for.
+        # empty body says nothing about the size of what it stands in for. (Regression guards
+        # only: both bodies are empty, so the empty-body skip already covers them, and HTTP.jl
+        # itself strips the header from a 204.)
         for route in ("/h/none", "/h/304")
             r = HTTP.request("HEAD", "http://$HOST:$port$route"; status_exception = false)
             @test r.status in (204, 304)
