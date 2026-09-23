@@ -590,6 +590,32 @@ end
             @test cleanup_expired_sessions!(failing) === nothing
         end
     end
+
+    @testset "an undecodable session is logged without its payload (#267)" begin
+        m = MockModel()
+        s = RealPormGSessionStore(model=m)
+        set_session!(s, "sess-bad-267", Dict{String,Any}("user_id" => 1); ttl=3600)
+        # A JSON parse error quotes a window of text from just before the failure position.
+        # Session payloads are named secrets, so the secret IS the unparseable token: the window
+        # carries all of it. A few bytes further on, only a fragment is quoted and the assertion
+        # below passes against the leaking code.
+        m._table["sess-bad-267"][:session_data] = "{\"csrf\": tok_SECRET_267}"
+
+        # Rendered through a real logger. `SimpleLogger` prints an `exception=` kwarg with `show`,
+        # which includes the exception's message: the leak is what reaches the operator's log,
+        # not what the record holds.
+        io = IOBuffer()
+        got = Base.CoreLogging.with_logger(Base.CoreLogging.SimpleLogger(io, Base.CoreLogging.Debug)) do
+            Base.get(s, "sess-bad-267", :fallback)
+        end
+        logs = String(take!(io))
+
+        @test got === :fallback
+        @test occursin("failed to read session", logs)
+        @test !occursin("SECRET", logs)
+        # The session key is the credential itself, so it stays out of the line too.
+        @test !occursin("sess-bad-267", logs)
+    end
 end
 
 @testset "_parse_db_datetime accepts what the drivers return" begin

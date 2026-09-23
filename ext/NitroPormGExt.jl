@@ -227,16 +227,25 @@ end
 # -- Store interface implementation --
 
 function Base.get(store::PormGSessionStore, session_id::String, default)
+    result = try
+        _session_objects(store).filter("session_key" => session_id).first()
+    catch e
+        @warn "PormGSessionStore: failed to read session" exception=(e, catch_backtrace())
+        return default
+    end
+    isnothing(result) && return default
+    # Decoding is a separate `try` so it can log differently from the query above (#267). A JSON
+    # parse error quotes the stored text around the failure, and that text is a session payload,
+    # so this warning carries the exception TYPE only. It never carries the session key either,
+    # because the key is the credential. The query failure above keeps its full exception, since a
+    # driver error quotes no payload and an outage needs its message to be diagnosed.
     try
-        result = _session_objects(store).filter("session_key" => session_id).first()
-        if isnothing(result)
-            return default
-        end
         expires_at = _parse_db_datetime(result[:expires_at])
         data = _deserialize_session(result[:session_data])
         return SessionPayload(data, expires_at)
     catch e
-        @warn "PormGSessionStore: failed to read session" exception=(e, catch_backtrace())
+        e isa InterruptException && rethrow()
+        @warn "PormGSessionStore: failed to read session: the stored session does not decode" exception_type=typeof(e)
         return default
     end
 end
@@ -533,6 +542,18 @@ function _row_task_id(row)
     return nothing
 end
 
+# Refuse a row from a table that predates the `run_id` column (#108). Its own function because
+# `_listed_task` must run it OUTSIDE its per-row catch: a missing column is table-wide, and
+# skipping every row over it would rebuild the empty listing #267 removed.
+function _check_run_id_column(row, id::String)
+    if !(haskey(row, :run_id) || haskey(row, "run_id"))
+        error("PormGWorkerStore: task row '$(id)' has no `run_id` column — this nitro_task " *
+              "table predates #108. Boot through `pormg_nitro_worker`, which adds it, or run " *
+              "the ALTER TABLE from the #108 entry — `Nitro.upgrade_guide(from = v\"<your pin>\")`.")
+    end
+    return nothing
+end
+
 function _from_db_record(row)::TaskInfo
     # Support both symbol lookup (PormG DB rows) and string dict (for mocks)
     get_val = (key_sym, key_str) -> haskey(row, key_sym) ? row[key_sym] : row[key_str]
@@ -545,11 +566,7 @@ function _from_db_record(row)::TaskInfo
     # read — and then no worker can ever finish its own task, because every `try_transition!`
     # fence compares against an id nothing holds. Assign explicitly, and refuse a row that
     # predates the column rather than silently keeping the invented one (#108).
-    if !(haskey(row, :run_id) || haskey(row, "run_id"))
-        error("PormGWorkerStore: task row '$(id)' has no `run_id` column — this nitro_task " *
-              "table predates #108. Boot through `pormg_nitro_worker`, which adds it, or run " *
-              "the ALTER TABLE from the #108 entry — `Nitro.upgrade_guide(from = v\"<your pin>\")`.")
-    end
+    _check_run_id_column(row, id)
     task.run_id = UUIDs.UUID(string(get_val(:run_id, "run_id")))
 
     status_str = string(get_val(:status, "status"))
@@ -570,7 +587,7 @@ function _from_db_record(row)::TaskInfo
     @atomic task.progress = Float64(get_val(:progress, "progress"))
 
     result_str = string(get_val(:result, "result"))
-    task.result = isempty(result_str) ? nothing : JSON.parse(result_str)
+    task.result = isempty(result_str) ? nothing : _parse_stored_json(identity, result_str, "result", id)
 
     err_str = string(get_val(:error, "error"))
     task.error = isempty(err_str) ? nothing : err_str
@@ -582,12 +599,36 @@ function _from_db_record(row)::TaskInfo
     task.completed_at = _parse_optional_db_datetime(get_val(:completed_at, "completed_at"))
 
     watchers_str = string(get_val(:watchers, "watchers"))
-    task.watchers = isempty(watchers_str) ? String[] : convert(Vector{String}, JSON.parse(watchers_str))
+    task.watchers = isempty(watchers_str) ? String[] :
+        _parse_stored_json(v -> convert(Vector{String}, v), watchers_str, "watchers", id)
 
     qn_str = string(get_val(:queue_name, "queue_name"))
     task.queue_name = isempty(qn_str) ? nothing : qn_str
 
     return task
+end
+
+# Parse a stored JSON column, and on failure throw an error that names the task and the column
+# but carries NONE of the stored text (#267). JSON.jl's own error quotes the text around the
+# failure position, which is a task's `result`. A warning that redacts it is not enough, because
+# `get_task_info` rethrows to its caller and a request handler's error logger prints the message
+# in full.
+#
+# The replacement is thrown AFTER the `catch` block closes, not inside it. Thrown inside, the
+# original error would stay on the exception stack as its cause, and anything that prints the
+# stack (`current_exceptions()`, an uncaught task failure) would quote the text anyway.
+function _parse_stored_json(shape::Function, raw::AbstractString, column::String, id::String)
+    parsed = try
+        Some(shape(JSON.parse(raw)))
+    catch e
+        e isa InterruptException && rethrow()
+        nothing
+    end
+    parsed === nothing &&
+        # "does not decode", not "is not valid JSON": `shape` failing on valid JSON of the wrong
+        # shape (a `null` or `[1]` watcher list) lands here too.
+        error("PormGWorkerStore: task '$(id)' has a stored `$(column)` that does not decode")
+    return something(parsed)
 end
 
 # -- AbstractWorkerStore Interface Methods --
@@ -604,6 +645,11 @@ function get_task_info(store::PormGWorkerStore, task_id::String)
     # skip the cross-user authorization gate and let a caller take over someone
     # else's task. It also swallowed `_from_db_record`'s deliberate schema-drift
     # error, defeating the check that raises it.
+    #
+    # The warning carries the exception's TYPE, never its message (#267). `_from_db_record` no
+    # longer raises a message that quotes a stored blob (see `_parse_stored_json`), so this is a
+    # second guarantee and not the only one. The caller gets the whole exception from the
+    # rethrow, and that exception is value-free for the same reason.
     try
         result = _task_objects(store).filter("id" => task_id).first()
         if isnothing(result)
@@ -611,7 +657,7 @@ function get_task_info(store::PormGWorkerStore, task_id::String)
         end
         return _from_db_record(result)
     catch e
-        @warn "PormGWorkerStore: failed to read task" exception=(e, catch_backtrace())
+        @warn "PormGWorkerStore: failed to read task" task_id exception_type=typeof(e)
         rethrow()
     end
 end
@@ -877,18 +923,24 @@ function get_all_tasks(store::PormGWorkerStore, authority::TaskAuthority;
         return qs
     end
 
+    # Both paths RETHROW a failed read. A caller reads an empty listing as "no tasks" and an empty
+    # page as "no more rows", so a swallowed error would pass for either. The unpaged path used to
+    # swallow into `TaskInfo[]`, so one undecodable row emptied the whole listing (#267). A row
+    # that does not decode is now skipped on its own by `_listed_task`, and a read failure
+    # propagates. Both warnings carry the exception TYPE only: see `_listed_task` on why the
+    # message is not safe to log.
     if _check_page(after, limit)
-        # A paged read RETHROWS, unlike the unpaged one below. A caller reads an empty page as
-        # "no more rows", so a swallowed error would quietly end the iteration part-way.
         try
             return _keyset_collect!(TaskInfo[], () -> _authority_query(make_base, authority), after, limit) do out, row
-                task_info = _from_db_record(row)
-                # The gate, after the fetch as always. Rows it drops are made up by
-                # `_keyset_collect!`, so a page is short only when the listing is exhausted.
+                task_info = _listed_task(row)
+                task_info === nothing && return
+                # The gate, after the fetch as always. Rows it drops, and rows that did not
+                # decode, are made up by `_keyset_collect!`, so a page is short only when the
+                # listing is exhausted.
                 _is_authorized(authority, task_info) && push!(out, task_info)
             end
         catch e
-            @warn "PormGWorkerStore: failed to list a page of tasks" exception=(e, catch_backtrace())
+            @warn "PormGWorkerStore: failed to list a page of tasks" exception_type=typeof(e)
             rethrow()
         end
     end
@@ -898,15 +950,44 @@ function get_all_tasks(store::PormGWorkerStore, authority::TaskAuthority;
         # and is now done for every backend rather than this one (#167).
         tasks = TaskInfo[]
         for row in _authority_rows(make_base, authority)
-            task_info = _from_db_record(row)
+            task_info = _listed_task(row)
+            task_info === nothing && continue
             # The gate. `_authority_rows` above only narrowed what was fetched.
             _is_authorized(authority, task_info) || continue
             push!(tasks, task_info)
         end
         return tasks
     catch e
-        @warn "PormGWorkerStore: failed to list tasks" exception=(e, catch_backtrace())
-        return TaskInfo[]
+        @warn "PormGWorkerStore: failed to list tasks" exception_type=typeof(e)
+        rethrow()
+    end
+end
+
+# One listed row -> its `TaskInfo`, or `nothing` for a row that does not decode (#267).
+#
+# Skipped, so one hand-edited or app-written row costs the listing that row and not every row.
+# That matches how `_running_ref_from_row` treats an unfenceable one. A skipped row is dropped
+# BEFORE the authority gate, which cannot be evaluated without a parsed watcher list, so it fails
+# closed. Schema drift is checked outside the catch: it is table-wide, never a single bad row.
+#
+# The warning carries the id and the exception TYPE, never the message. `_parse_stored_json`
+# already keeps the blob out of the JSON failures, so this is the second guarantee: it also covers
+# whatever else `_from_db_record` can throw.
+#
+# What a per-row skip cannot tell apart is one bad row and a SYSTEMIC decode failure. A driver
+# value type `_parse_db_datetime` rejects (the #239 class), or a PormG change that breaks every
+# row, skips them all, and the listing is empty again with one warning per row. Those warnings,
+# all naming the same exception type, are the signal. It also warns on every listing call until
+# the row is repaired, so a polling UI repeats the line.
+function _listed_task(row)::Union{Nothing, TaskInfo}
+    id = _row_task_id(row)
+    _check_run_id_column(row, something(id, "<no id>"))
+    try
+        return _from_db_record(row)
+    catch e
+        e isa InterruptException && rethrow()
+        @warn "PormGWorkerStore: skipping a task row that does not decode" task_id=id exception_type=typeof(e)
+        return nothing
     end
 end
 
@@ -919,6 +1000,13 @@ function _running_ref_from_row(row)
     if run_id === nothing
         # Skipped, not guessed at. A fenced transition needs the row's real run id, and inventing
         # one is the #108 defect `_from_db_record` refuses loudly. Ids only -- never row contents.
+        #
+        # Skipped FOREVER, by decision (#267): retention never retires it and the key stays taken
+        # until an operator repairs the row. Only a hand edit or an app-side write reaches here,
+        # since pre-#108 rows were backfilled with the nil UUID, which parses. An unfenced
+        # (`run_id = nothing`) FAILED write was considered and declined. `lock_tasks` is
+        # process-local, so if another process has already failed the row and the key was re-run,
+        # a stale unfenced write would fail the live successor, which is #108's own shape.
         @warn "PormGWorkerStore: skipping a RUNNING task whose run_id does not parse; zombie recovery cannot fence it" task_id=id
         return nothing
     end
@@ -937,10 +1025,11 @@ end
 
 # Zombie recovery's scan (#236): a projection of exactly the three columns it reads. No row's
 # `result` or `watchers` blob is fetched, let alone parsed, and `_from_db_record` is never called.
-# Its full parse, behind `get_all_tasks`'s swallow-into-empty, is what let one malformed row
-# blind the whole sweep.
+# Its full parse, behind what was then `get_all_tasks`'s swallow-into-empty, is what let one
+# malformed row blind the whole sweep. The listing now skips such a row (#267), but a skipped
+# row is still a zombie it cannot see, so the sweep keeps its own projection.
 #
-# Logs and RETHROWS, like `get_task_info`, and unlike the listing above. An empty result here
+# Logs and RETHROWS, like `get_task_info` and, since #267, the listing above. An empty result here
 # reads as "nothing to recover", so a swallowed read error would be indistinguishable from a
 # clean sweep, which is the silence #238 is about.
 #

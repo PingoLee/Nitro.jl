@@ -44,6 +44,14 @@ cursor and skip rows.
 The paging keywords are opt-in for a backend too. [`WorkerRuntime`](@ref) forwards them only when
 the caller set one, so a store written before them keeps serving every unpaged call.
 
+**A failed read must throw, paged or not** ([#267](https://github.com/PingoLee/Nitro.jl/issues/267)).
+A caller reads an empty listing as "no tasks" and a short page as the end, so a store that
+swallows a read error into an empty result reports a false fact. A serializing backend **may**
+skip one record it cannot decode, so a single bad row does not cost the whole listing. It then
+logs the task id and the exception *type* only: a parse error's message quotes the stored text,
+which is a task's `result`. A skipped record counts like one the authority gate dropped, so a
+page is still short only when nothing is left.
+
 # Application hooks
 
 Each is a plain slot the application writes and the framework reads through `Base.invokelatest`.
