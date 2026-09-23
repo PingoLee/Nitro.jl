@@ -703,7 +703,7 @@ value is discarded.
 
 `InterruptException` is **deferred** the same way [`startup`](@ref) defers it: `shutdown` logs it
 and returns it, and `terminate()` completes **both** shutdown broadcasts, clears the serve-owned
-lifecycle list and the middleware cache, closes the listener — escalating an interrupted drain to
+lifecycle list, closes the listener — escalating an interrupted drain to
 a force-close — and only then re-raises it. If more than one hook is interrupted, each is logged
 and the first is re-raised; the rest are dropped, since an `InterruptException` carries nothing to
 tell them apart (#185).
@@ -1070,6 +1070,21 @@ two mechanisms and a proof: publish-then-`delete!` in `publish_route_middleware!
 
 The identity compare is sound because both sides are live when it runs: the state holds its
 `source`, and the request holds its snapshot, so neither address can be reused by a new table.
+
+# Why the world age is NOT part of the stamp
+
+Composing a chain *calls* each middleware factory, so it is fair to ask whether a Revise edit to a
+factory — which redefines its method without re-running `urlpatterns` — needs to invalidate the
+cache. Under `serve` it cannot matter: a new task inherits its parent's world age, so every
+request task runs in the world the listener was started in, and `compose` dispatches factories in
+that fixed world whether it caches or not. Measured on the pre-#255 code, which recomposed on
+every request: an edited factory served the old middleware under `serve` all the same.
+(`ReviseHandler`'s `invokelatest` sits *inside* the chain, which is why edits to functions the
+middleware calls do take effect — and still do, since the chain calls them by name.)
+
+A world stamp was tried during #255's review and removed: it changed nothing under `serve`,
+recomposed on every world bump in REPL- and test-driven pipelines, and leaned on the internal
+`Base.tls_world_age`.
 
 `internalrequest` rebuilds its pipeline per call, so it no longer reuses a chain across calls. It
 already pays ~12 µs of pipeline construction per call; one fold on top is noise.

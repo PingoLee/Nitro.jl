@@ -4,6 +4,7 @@ using HTTP
 
 using ..Util: join_url_path
 using ..AppContext: App
+using ..Constants: HTTP_METHODS
 using ..Types: Nullable, LifecycleMiddleware, CopyOnWriteDict, snapshot,
                 publish!, RouteResolution, ROUTE_RESOLUTION_KEY,
                 RouteMiddleware, NO_ROUTE_MIDDLEWARE, AutoHeadHandler,
@@ -182,8 +183,8 @@ end
 # `(Function[], Function[])` entry into `custommiddleware`. Secondarily, and sharper since #71:
 # those entries contribute zero layers but make the table permanently non-empty, which defeats
 # `compose`'s per-request fast path for the whole app — every request would then pay a
-# `gethandler`, a cache-key string and a cache lookup for nothing, plus the chain fold on the
-# first request for each route. (Before #80 it also paid a SECOND `gethandler`; the fast path
+# `gethandler` and a chain-cache lookup for nothing, plus the chain fold on the first request
+# for each route. (Before #80 it also paid a SECOND `gethandler`; the fast path
 # is still worth defending without it.)
 function process_middleware(::App, ::Nothing) end
 
@@ -440,7 +441,17 @@ function compose(router::HTTP.Router, globalmiddleware::Vector{Function},
                 # that is `cached_chain`'s identity check alone, so a registration racing this
                 # request needs no ordering argument here (it did, #81). A request whose
                 # snapshot is already superseded simply declines to publish.
-                cache_chain!(chains, custommiddleware, custom_snap, key, strategy)
+                #
+                # Only for a method Nitro knows. `req.method` is chosen by the client, and a
+                # `method = "*"` route matches any token, so caching every one would let a client
+                # grow this table without bound — and each insert copies the whole generation.
+                # An unknown method is composed per request and never cached — a cost confined to
+                # traffic nothing serves on purpose. (The `App`-wide cache before #255 did cache
+                # them, on apps without global middleware; making every app cache would have
+                # extended that growth to all of them, which review caught.) The check sits on
+                # the miss path only, so a hit never pays for it.
+                mw_method in HTTP_METHODS &&
+                    cache_chain!(chains, custommiddleware, custom_snap, key, strategy)
 
                 return strategy(req)
             end

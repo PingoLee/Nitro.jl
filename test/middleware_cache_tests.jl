@@ -392,6 +392,49 @@ end
 end
 
 
+@testitem "Chain cache — a client-chosen method cannot grow the cache" tags=[:core, :middleware] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+import Nitro: App, path, text
+
+# Found in review of #255. The chain key carries the request method, and a `method = "*"` route
+# matches ANY token, so caching every method a client sends would grow the pipeline's cache
+# without bound — each insert copying the whole generation. Only methods Nitro knows are cached;
+# anything else is composed for that one request.
+#
+# Observed through a counting GLOBAL factory: `compose` calls it once to prebuild the unmatched
+# chain, then once per chain composition.
+
+folds = Ref(0)
+counting_global = handler -> (folds[] += 1; req::HTTP.Request -> handler(req))
+
+ctx = App()
+Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+    path("/any", (req::HTTP.Request) -> Res.send("any"), method = "*"),
+    # Some route must carry middleware, or every request takes the empty-table fast path.
+    path("/mw", (req::HTTP.Request) -> Res.send("mw"), middleware = [h -> (r::HTTP.Request -> h(r))]),
+])
+p = Nitro.Core.setupmiddleware(ctx; middleware = [counting_global], catch_errors = false)
+@test folds[] == 1
+
+@testset "unknown methods are served, and composed every time" begin
+    for _ in 1:2, i in 1:5
+        @test text(p(HTTP.Request("X-JUNK-$i", "/any"))) == "any"
+    end
+    @test folds[] == 1 + 10              # never cached, so never retained
+end
+
+@testset "known methods on the same route are cached as usual" begin
+    before = folds[]
+    for _ in 1:3
+        @test text(p(HTTP.Request("POST", "/any"))) == "any"
+    end
+    @test folds[] == before + 1
+end
+end
+
+
 @testitem "Chain cache — pipeline settings stay with their pipeline (#79)" tags=[:core, :middleware] setup=[NitroCommon] begin
 using Test
 using HTTP
@@ -440,15 +483,20 @@ end
     # that fails if it silently reaches none. Two warm pipelines with different settings, one
     # re-registration, and both must run the new middleware — against an invalidation that
     # matched nothing, both keep answering "h".
+    builds = Ref(0)
+    counted = handler -> (builds[] += 1; req::HTTP.Request -> handler(req))
     ctx = App()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/other", (req::HTTP.Request) -> Res.send("o"), middleware = [mw()]),
-        path("/v", (req::HTTP.Request) -> Res.send("h")),
+        path("/v", (req::HTTP.Request) -> Res.send("h"), middleware = [counted]),
     ])
     p1 = Nitro.Core.setupmiddleware(ctx; catch_errors = true)
     p2 = Nitro.Core.setupmiddleware(ctx; catch_errors = false)
-    @test text(p1(HTTP.Request("GET", "/v"))) == "h"
-    @test text(p2(HTTP.Request("GET", "/v"))) == "h"
+    for _ in 1:2
+        @test text(p1(HTTP.Request("GET", "/v"))) == "h"
+        @test text(p2(HTTP.Request("GET", "/v"))) == "h"
+    end
+    @test builds[] == 2              # one per pipeline: both are warm before the registration
 
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/v", (req::HTTP.Request) -> Res.send("h"),

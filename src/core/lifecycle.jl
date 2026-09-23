@@ -402,8 +402,9 @@ end
     terminate(context::App; timeout = nothing)
     terminate(; timeout = nothing)
 
-Stop the running server: run every `LifecycleMiddleware` shutdown hook, drop the composed
-middleware cache, and close the listener. A no-op when nothing is serving.
+Stop the running server: run every `LifecycleMiddleware` shutdown hook and close the listener.
+A no-op when nothing is serving. (There is no middleware cache to drop: each pipeline owns its
+own, so the next `serve()` starts cold.)
 
 Shutdown is a **bounded graceful drain**, modeled on Go's `http.Server.Shutdown(ctx)`. The
 listening socket is released immediately — the port is free as soon as `terminate` is entered

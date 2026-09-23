@@ -510,30 +510,35 @@ import Nitro: App, path, text
 # the global-middleware one did not cache at all before #255.
 
 mktag(tag) = handler -> (req::HTTP.Request -> Res.send(tag * "|" * text(handler(req))))
-global_mw  = handler -> (req::HTTP.Request -> handler(req))
 
-for (label, mw) in (("no global middleware", []), ("with global middleware", [global_mw]))
-    @testset "a warmed route picks up middleware registered afterwards — $label" begin
-        ctx = App()
-        # Two routes so the table is non-empty from the start: this exercises the CACHE path,
-        # not the empty-table fast path covered by the item above.
-        Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
-            path("/other", (req::HTTP.Request) -> Res.send("o"), middleware = [mktag("other")]),
-            path("/warm",  (req::HTTP.Request) -> Res.send("h")),
-        ])
-        pipeline = Nitro.Core.setupmiddleware(ctx; middleware = mw, catch_errors = false)
-        for _ in 1:2                                      # warm: the second is a cache hit
-            @test text(pipeline(HTTP.Request("GET", "/warm"))) == "h"
-        end
-
-        Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
-            path("/warm", (req::HTTP.Request) -> Res.send("h"), middleware = [mktag("late")])
-        ])
-
-        # Were the warm bare chain still served, this would be "h".
-        @test text(pipeline(HTTP.Request("GET", "/warm"))) == "late|h"
-        @test text(pipeline(HTTP.Request("GET", "/warm"))) == "late|h"
+@testset "a warmed route picks up middleware registered afterwards" begin
+    # A counting GLOBAL factory makes "warm" checkable rather than assumed: `compose` calls it
+    # once to prebuild the unmatched-path chain, then once per chain composition. (Whether the
+    # pipeline has global middleware no longer selects a code path since #255; this one has a
+    # layer only so the cache can be observed.)
+    folds = Ref(0)
+    counting_global = handler -> (folds[] += 1; req::HTTP.Request -> handler(req))
+    ctx = App()
+    # Two routes so the table is non-empty from the start: this exercises the CACHE path, not
+    # the empty-table fast path covered by the item above.
+    Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+        path("/other", (req::HTTP.Request) -> Res.send("o"), middleware = [mktag("other")]),
+        path("/warm",  (req::HTTP.Request) -> Res.send("h")),
+    ])
+    pipeline = Nitro.Core.setupmiddleware(ctx; middleware = [counting_global], catch_errors = false)
+    for _ in 1:2
+        @test text(pipeline(HTTP.Request("GET", "/warm"))) == "h"
     end
+    @test folds[] == 2               # prebuilt + ONE composition: the second request was a hit
+
+    Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+        path("/warm", (req::HTTP.Request) -> Res.send("h"), middleware = [mktag("late")])
+    ])
+
+    # Were the warm bare chain still served, this would be "h".
+    @test text(pipeline(HTTP.Request("GET", "/warm"))) == "late|h"
+    @test text(pipeline(HTTP.Request("GET", "/warm"))) == "late|h"
+    @test folds[] == 3               # recomposed once for the new table, then cached again
 end
 
 @testset "a registration rebuilds every route, and each still gets its own chain" begin

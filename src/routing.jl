@@ -228,9 +228,9 @@ function register_route(ctx::App, prefix::String, route_def::RouteDefinition)
     # `!isempty` matters as much as `!isnothing`: publishing a `(nothing, Function[])` entry for
     # `middleware=[]` contributes zero layers but makes `custommiddleware` permanently non-empty,
     # which disables `compose`'s per-request emptiness fast path for the WHOLE application —
-    # every request would then pay a `gethandler`, a cache-key string and a cache lookup for
-    # nothing — plus, on the first request for each route, the chain fold. (Before #80 it also
-    # paid a SECOND `gethandler`; the fast path is still worth defending without it.)
+    # every request would then pay a `gethandler` and a chain-cache lookup for nothing — plus,
+    # on the first request for each route, the chain fold. (Before #80 it also paid a SECOND
+    # `gethandler`; the fast path is still worth defending without it.)
     # `middleware=[]` means "this
     # route adds none of its own", which is indistinguishable from omitting the kwarg.
     if _has_layers(route_def.middleware)
