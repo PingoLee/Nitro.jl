@@ -217,6 +217,37 @@ end
     @test CSRFMiddleware(SECRET; cookie_name = "csrf_token", config = insecure) isa Function
 end
 
+# ── the secret ────────────────────────────────────────────────────────────────
+
+@testset "an empty or NUL-only secret is refused (#269)" begin
+    # HMAC-SHA256 zero-pads a key to its 64-byte block, so every one of these IS the empty key:
+    # a token signed with "" verifies under it. `get(ENV, "CSRF_SECRET", "")` with the variable
+    # unset is how an app ends up here, so construction -- app startup -- is where it must fail.
+    # Matched on type AND message: the cookie-prefix guard also throws `ArgumentError`, and would
+    # satisfy a bare type check if the default config ever changed. Anchoring on the printed
+    # `ArgumentError: ` keeps the type the docs promise, which a message-only regex would drop.
+    refused = r"^ArgumentError: the CSRF secret is empty"
+    for secret in ("", "\0", "\0"^64)
+        @test_throws refused CSRFMiddleware(secret)
+        # The two primitives are reachable from a handler, so each refuses on its own ...
+        @test_throws refused issue_csrf_token!(HTTP.Response(200, "ok"), secret; binding = SESSION_A)
+        @test_throws refused validate_csrf_token(request("POST"), secret; binding = SESSION_A)
+        # ... including on the early-`false` paths (no binding, no cookie), so a misconfiguration
+        # does not hide until the first request that happens to carry a cookie.
+        @test_throws refused validate_csrf_token(request("POST"), secret)
+    end
+
+    # The message names the cause and never quotes the secret.
+    message = sprint(showerror, try CSRFMiddleware("\0"^8); catch e; e; end)
+    @test occursin("CSRF secret is empty", message)
+    @test !occursin('\0', message) && !occursin("\\0", message)
+
+    # Past the 64-byte block HMAC hashes the key, so a NUL run that long is a real key, and a
+    # NUL anywhere beside another byte is too. These are accepted, as before.
+    @test CSRFMiddleware("\0"^65) isa Function
+    @test CSRFMiddleware("a\0") isa Function
+end
+
 # ── validate_csrf_token / CSRFMiddleware ──────────────────────────────────────
 
 @testset "safe methods issue a token and skip validation" begin

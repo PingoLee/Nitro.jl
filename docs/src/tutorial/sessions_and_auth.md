@@ -550,6 +550,11 @@ serve(middleware=[
 ])
 ```
 
+Read it with a `nothing` default, as above, not `get(ENV, "CSRF_SECRET", "")`: an empty secret —
+or any run of up to 64 NUL bytes, which HMAC treats as the same empty key — is refused with an
+`ArgumentError` at construction, because a token signed under it is one anyone can sign.
+`issue_csrf_token!` and `validate_csrf_token` refuse it on every call too.
+
 The middleware uses a signed double-submit cookie. Safe requests receive a CSRF cookie
 automatically; unsafe requests must echo the token in the `X-CSRF-Token` header, in a `_csrf`
 form field, or in a `_csrf` JSON body key.

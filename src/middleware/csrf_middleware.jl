@@ -6,7 +6,7 @@ using Base64
 
 using ...Types: CookieConfig, Nullable
 using ...Cookies: get_cookie, set_cookie!
-using ...Crypto: secure_random_bytes
+using ...Crypto: secure_random_bytes, _empty_hmac_key
 using ...Errors: is_unrecoverable
 using ...Res: json
 using ...Core: own_response_headers, getjson, getform
@@ -60,6 +60,21 @@ function _constant_time_equals(left::AbstractString, right::AbstractString)
         diff |= xor(left_bytes[index], right_bytes[index])
     end
     return diff == 0
+end
+
+const _EMPTY_SECRET_MESSAGE =
+    "the CSRF secret is empty, or equivalent to the empty HMAC key, so anyone could sign a " *
+    "valid CSRF token with the empty string. An unset environment variable read as " *
+    "get(ENV, \"CSRF_SECRET\", \"\") is the usual cause -- read it with a `nothing` default " *
+    "and fail at startup instead"
+
+# Refuse the key `_csrf_signature` would sign under before any token is minted or checked
+# (#269), by the same HMAC rule `Auth` applies to a JWT secret (#264). Every public entry
+# point calls it: the middleware once at construction, and the two primitives on each call,
+# since a handler may reach them directly. Deliberately no `repr(secret)` in the message.
+function _check_csrf_secret(secret::AbstractString)
+    _empty_hmac_key(secret) && throw(ArgumentError(_EMPTY_SECRET_MESSAGE))
+    return nothing
 end
 
 function _generate_raw_token()
@@ -146,8 +161,12 @@ what the client must echo in the `X-CSRF-Token` header.
 
 `binding` is required and has no default on purpose: an unbound token is the defect this
 function used to have, so there must be no way to ask for one by omission.
+
+Throws `ArgumentError` when `secret` is empty or equivalent to the empty HMAC key (a run of
+up to 64 NUL bytes) -- a token signed under it is one anyone can sign.
 """
 function issue_csrf_token!(res::HTTP.Response, secret::String; binding::AbstractString, cookie_name::String=DEFAULT_COOKIE_NAME, ttl::Int=3600, config::CookieConfig=CookieConfig(httponly=false, secure=true, samesite="Lax", path="/", maxage=ttl))
+    _check_csrf_secret(secret)
     _validate_cookie_prefix(cookie_name, config)
     raw_token = _generate_raw_token()
     set_cookie!(res, cookie_name, _signed_token(secret, raw_token, binding); config=config, encrypted=false, maxage=ttl)
@@ -242,8 +261,14 @@ end
 
 `false` unless the cookie's signature verifies **under this request's binding** and the presented
 token matches it. With no binding available the answer is `false`, never "unbound but valid".
+
+Throws `ArgumentError` when `secret` is empty or equivalent to the empty HMAC key, on every
+call -- not `false`, because that is a misconfiguration rather than a bad request.
 """
 function validate_csrf_token(req::HTTP.Request, secret::String; cookie_name::String=DEFAULT_COOKIE_NAME, header_name::String="X-CSRF-Token", form_field::String="_csrf", binding::Nullable{String}=_binding(req))
+    # Before any early `false`: an unusable secret is a configuration error on every call,
+    # not only on the ones that happen to carry a cookie.
+    _check_csrf_secret(secret)
     binding === nothing && return false
 
     cookie_value = get_cookie(req, cookie_name, nothing; encrypted=false)
@@ -258,6 +283,7 @@ function validate_csrf_token(req::HTTP.Request, secret::String; cookie_name::Str
 end
 
 function CSRFMiddleware(secret::String; cookie_name::String=DEFAULT_COOKIE_NAME, header_name::String="X-CSRF-Token", form_field::String="_csrf", ttl::Int=3600, config::CookieConfig=CookieConfig(httponly=false, secure=true, samesite="Lax", path="/", maxage=ttl))
+    _check_csrf_secret(secret)
     _validate_cookie_prefix(cookie_name, config)
     return function(handle::Function)
         return function(req::HTTP.Request)

@@ -162,6 +162,23 @@ end
 ct_compare(a::AbstractString, b::AbstractString)::Bool =
     ct_compare(codeunits(String(a)), codeunits(String(b)))
 
+# Is `secret` the empty HMAC key? By HMAC key, not by `isempty`: HMAC-SHA256 zero-pads a
+# key up to its 64-byte block, so "\0" -- or any run of NULs up to the block size -- IS the
+# empty key, and a MAC computed with "" verifies against it. A longer key is hashed first,
+# and no SHA-256 output is the zero block, so past 64 bytes nothing is empty. This is
+# `hmac_sha256(key, UInt8[]) == hmac_sha256(UInt8[], UInt8[])` exactly, without the
+# allocation or the HMAC -- which matters because the JWT plain-string secret path and
+# `validate_csrf_token` run it per request. It lives here rather than in `Auth` because
+# both `Auth` (#264) and the CSRF middleware (#269) must refuse the same keys, and `Auth`
+# is layered above `Core`.
+function _empty_hmac_key(secret::AbstractString)
+    ncodeunits(secret) <= 64 || return false
+    for byte in codeunits(secret)
+        byte == 0x00 || return false
+    end
+    return true
+end
+
 """
     SecretString(value::AbstractString)
 
