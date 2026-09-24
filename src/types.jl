@@ -1151,7 +1151,7 @@ one call under `internalrequest`.
 
 # Why per pipeline, and why that makes the key complete
 
-A chain is `foldlayers(handler, route mw, router mw)`. `handler`, which bakes in
+A chain is `foldlayers(handler, router mw, route mw)`. `handler`, which bakes in
 `catch_errors`/`show_errors`/`serialize`, is fixed for one pipeline's lifetime; the other two
 come from one `custommiddleware` snapshot. So *(this pipeline, that snapshot, method, path)*
 determines the chain, and a cache owned by the pipeline and stamped with the snapshot is

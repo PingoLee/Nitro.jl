@@ -256,11 +256,14 @@ function _collect_leaf_methods!(acc::Vector{String}, node::HTTP.Handlers.Node,
 end
 
 function setupmiddleware(ctx::App; middleware::Vector=[], serialize::Bool=true, catch_errors::Bool=true, show_errors::Bool=true, access_log=false, access_log_query::Bool=false)::Function
-    raw_middleware = reverse(middleware)
     # `normalize_middleware`, NOT `process_middleware`: this runs once per `serve` but ONCE
     # PER CALL from `internalrequest`, so it must have no registration side effect. `serve`
     # registers explicitly, just before it calls this. (#68)
-    processed_middleware = normalize_middleware(raw_middleware)
+    #
+    # In list order, NOT reversed: `foldlayers` owns the order now and runs every level
+    # top-down (#312). This `reverse` was the only thing that made the global list run
+    # top-down, and route/router lists had no such step, so they ran bottom-up.
+    processed_middleware = normalize_middleware(middleware)
 
     global_prefix_middleware = !isnothing(ctx.service.prefix[]) ? [PrefixStripMiddleware(ctx.service.prefix[])] : []
     serializer = serialize ? [DefaultSerializer(catch_errors; show_errors)] : []

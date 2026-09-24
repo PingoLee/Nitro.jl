@@ -470,8 +470,10 @@ urlpatterns("",
 ```
 
 A router-wide default allowlist is just the same guard at the router level, with tighter
-per-route subsets where needed. See the service-token section of
-[Sessions & Auth](sessions_and_auth.md) for `iat`-only tokens and `exp_timeout`.
+per-route subsets where needed. Router middleware wraps route middleware, so a router-level
+guard runs before any route-level auth layer: put the `BearerAuth` on the router, not only on
+its routes. See the service-token section of [Sessions & Auth](sessions_and_auth.md) for
+`iat`-only tokens and `exp_timeout`.
 
 ## 6. Guards & authorization
 

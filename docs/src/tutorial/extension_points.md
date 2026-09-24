@@ -164,12 +164,16 @@ serve(middleware = [RequireApiKey(key = ENV["API_KEY"])])
 
 ### Execution order
 
-Global middleware runs **top-down**: the first entry is outermost, sees the request first, and
-therefore sees the response last.
+Every middleware list runs **top-down**: the first entry is outermost, sees the request first, and
+therefore sees the response last. That holds for the global list, a `router(...; middleware)`
+list and a `path(...; middleware)` list alike.
 
 ```julia
 serve(middleware = [A, B])
 # A before  →  B before  →  handler  →  B after  →  A after
+
+path("/admin", handler; middleware = [BearerAuth(validator), GuardMiddleware(login_required())])
+# authenticate  →  authorize  →  handler
 ```
 
 The full nesting, outermost to innermost, is:
@@ -177,6 +181,14 @@ The full nesting, outermost to innermost, is:
 ```
 global middleware  →  router middleware  →  route middleware  →  handler
 ```
+
+So a guard placed on a *router* runs before an auth layer placed on one of its *routes*.
+Authenticate at the same level as the guard, or at an outer one.
+
+!!! note "Route and router lists ran bottom-up before #312"
+    Before that fix, only the global list ran top-down. A route or router list ran in reverse,
+    so `[BearerAuth(v), GuardMiddleware(...)]` checked its guards before authenticating. If you
+    reversed a list to work around that, put it back in the order you mean.
 
 Global middleware runs on **every** request, including ones that match no route (404) and ones
 whose path matches but whose method does not (405). A route cannot opt out of it: passing

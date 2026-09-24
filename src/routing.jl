@@ -93,6 +93,9 @@ Path converters: `<int:name>`, `<str:name>`, `<float:name>`, `<bool:name>`, `<uu
 
 A `"GET"` route also answers `HEAD` through the same handler and middleware, unless a `HEAD` route
 is registered explicitly for the same path. That route wins whatever the registration order.
+
+`middleware` runs top-down in list order, after global and router middleware, so authenticate
+before you authorize: `middleware = [BearerAuth(validator), GuardMiddleware(login_required())]`.
 """
 function path(pattern::String, handler::Function; 
     method::String = "GET",

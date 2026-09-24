@@ -13,7 +13,7 @@ using ..Types: Nullable, LifecycleMiddleware, CopyOnWriteDict, snapshot,
 export router, compose, genkey, process_middleware, HOFRouter, OuterRouter, InnerRouter
 
 # Shared read-only stand-in for "this route has no middleware of that kind". `foldlayers` only
-# ever appends *from* it, never to it, so one instance is safe to share.
+# ever iterates it, never writes to it, so one instance is safe to share.
 #
 # The win is allocation, not inference: a fresh `[]` per sanitized slot cost a `Vector{Any}` on
 # every `buildmiddleware` call. Measured: 224 -> 192 bytes with route middleware present,
@@ -267,22 +267,30 @@ end
 """
     foldlayers(handler::Function, layers::Vector...) -> Function
 
-Fold `handler` and zero or more middleware vectors into a single request function.
+Fold zero or more middleware vectors around `handler` into a single request function that runs
+them **in the order they are written**: the vectors outermost first, and each vector top-down.
+`foldlayers(h, [a, b], [c])` is `a(b(c(h)))`, so a request passes `a`, `b`, `c`, then `h`. A
+call with no layers returns `handler` itself.
 
-Handler first, each vector appended in argument order, then one `reduce(|>, …)` — so the LAST
-element appended ends up OUTERMOST (`reduce(|>, Function[h, a, b])` is `b(a(h))`), and a call
-with no layers returns `handler` itself, because `reduce` over a one-element collection never
-applies the operator.
+That order is the whole contract, and it lives here so no caller has to arrange it (#312).
+Before, this folded the LAST element outermost and left the order to its callers: the global
+list was `reverse`d first and ran top-down, while route and router lists were not and ran
+bottom-up, so the documented `[BearerAuth(v), GuardMiddleware(...)]` checked its guards before
+authenticating.
 
-Both fold sites go through here: [`buildmiddleware`](@ref) folds `route, router` around the
+Both fold sites go through here: [`buildmiddleware`](@ref) folds `router, route` around the
 pipeline's handler, and `compose` folds `global` once around its route-selection step (#291).
 """
 function foldlayers(handler::Function, layers::Vector...) :: Function
-    chain::Vector{Function} = [handler]
-    for layer in layers
-        append!(chain, layer)
+    # Wrap from the innermost element outward. `reverse` of the varargs tuple is free, and
+    # `Iterators.reverse` of each vector allocates nothing. `chain` is deliberately untyped: a
+    # layer may hand the next one any callable, and only the outermost result must be a
+    # `Function` (the return annotation). This runs once per chain build, never per request.
+    chain = handler
+    for layer in reverse(layers), middleware in Iterators.reverse(layer)
+        chain = middleware(chain)
     end
-    return reduce(|>, chain)
+    return chain
 end
 
 """
@@ -311,9 +319,8 @@ function buildmiddleware(entry::RouteMiddleware, handler::Function) :: Function
     routermiddleware = isnothing(routermiddleware) ? EMPTY_LAYERS : routermiddleware
     routemiddleware = isnothing(routemiddleware) ? EMPTY_LAYERS : routemiddleware
 
-    # Route middleware innermost, then router middleware — the last appended is the outermost
-    # after the fold.
-    return foldlayers(handler, routemiddleware, routermiddleware)
+    # Router middleware outermost, then route middleware, each list top-down (#312).
+    return foldlayers(handler, routermiddleware, routemiddleware)
 end
 
 """
@@ -477,8 +484,9 @@ function compose(router::HTTP.Router, globalmiddleware::Vector{Function},
             return handler(req)
         end
 
-        # Global middleware outermost, AROUND route selection (#291). Folded once per
-        # pipeline; with no global middleware `foldlayers` returns `select` itself.
+        # Global middleware outermost, AROUND route selection (#291), top-down in list order
+        # like every other level (#312). Folded once per pipeline; with no global middleware
+        # `foldlayers` returns `select` itself.
         return foldlayers(select, globalmiddleware)
     end
 end
