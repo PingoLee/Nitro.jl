@@ -56,8 +56,9 @@ Three things set the target, and the first one present wins:
 
 So a container or a systemd unit with a memory limit already gets a sensible GC target without a
 hint. `%` is also measured against that limit: inside a 4 GiB cgroup, `--heap-size-hint=75%` means
-3 GiB, whatever the host has (`julia --help` says "physical memory"; the implementation uses the
-cgroup limit when there is one).
+3 GiB, whatever the host has. `julia --help` and the Julia manual say "physical memory", but the
+implementation uses the cgroup limit when there is one; reported upstream as
+[JuliaLang/julia#63337](https://github.com/JuliaLang/julia/issues/63337).
 
 ### Sizing it
 
