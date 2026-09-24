@@ -77,8 +77,8 @@ end
         # Discriminates only at `nthreads() > 1` -- which CI runs on every push. The yield
         # noise gives the scheduler reasons to move the consumer, which is the trigger:
         # against the old walk at 2 threads, this loop failed ~2850-2900 runs of 3000 with
-        # the noise and ~10 without it. Against the current walk it cannot fail -- nothing
-        # is shared with a producer task -- so a red here is never a flake.
+        # the noise and ~10 without it. Against the current walk it cannot fail from this
+        # race -- nothing is shared with a producer task -- so a red here is not that flake.
         stop  = Threads.Atomic{Bool}(false)
         noise = [Threads.@spawn(while !stop[]; sum(rand(64)); yield(); end)
                  for _ in 1:Threads.nthreads()]
