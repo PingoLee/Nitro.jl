@@ -494,10 +494,11 @@ Sends an internal request to the server, allowing for communication between diff
     `internalrequest` runs only the `middleware` you pass **to this call**. It does not run the
     global list given to `serve(middleware = …)`, so authentication, sessions, CSRF and rate
     limiting installed there do **not** apply. Route and router middleware, and the guards
-    attached through them, still run. The `serve(prefix = …)` prefix still applies, so include it
-    in the target.
+    attached through them, still run. Once `serve(prefix = …)` has run, its prefix applies too,
+    so include it in the target.
 
-    The request's client IP is `127.0.0.1` unless it already carries one (`setip!`). So a route
+    The request's client IP is `127.0.0.1` unless it already carries one (`setip!`), and a
+    request object reused across calls keeps whatever address the previous call left. So a route
     that trusts loopback, or is protected only by global middleware, is reachable through it.
     **Never build the target from client input**: a handler that does lets its caller reach those
     routes too.

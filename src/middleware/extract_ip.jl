@@ -4,7 +4,7 @@ using HTTP
 using Sockets
 # This middleware writes `:peer_ip` and reads it back through `getpeerip` (#330), which also lets
 # the `@ref` cross-references in the docstrings below resolve.
-using ...Core: setip!, getpeerip, header_name_isequal
+using ...Core: getip, setip!, getpeerip, header_name_isequal
 using ...Types: Nullable
 using ...Errors: is_unrecoverable
 
@@ -136,11 +136,14 @@ end
 Resolve the client IP address for `req`. Returns `nothing` only when the request carries no peer
 address at all (a hand-constructed request that never went through the server).
 
-With no trust configured this returns the socket peer address and **ignores every forwarding
-header**, because those headers can be set to any value by the client.
+With no trust configured this **ignores every forwarding header**, because those headers can be
+set to any value by the client, and returns `getip(req)` as the chain left it: the socket peer
+address, or the client an `ExtractIP` earlier in the chain resolved.
 
 When `trusted_proxies` is configured *and* the socket peer matches one of them, the single header
-named by `forwarded_header` is read — and nothing else.
+named by `forwarded_header` is read — and nothing else. The socket peer here is always
+[`getpeerip`](@ref), even after an `ExtractIP` has rewritten `getip`, so an address resolved out
+of a header can never vouch for itself (#330).
 
 # Resolution rules
 `X-Real-IP`, `CF-Connecting-IP`, `True-Client-IP` carry one address, written by the trusted
@@ -179,8 +182,12 @@ function extract_ip(req::HTTP.Request;
     trust_forwarded                              = nothing) :: Nullable{IPAddr}
 
     policy = _trust_policy(forwarded_header, trusted_proxies, trust_forwarded)
-    # `getpeerip`, as in `ExtractIP`: after an extractor has run, `getip` is a resolved client,
-    # and judging trust against it would let a forwarded address vouch for itself (#330).
+    # The same two rules as `ExtractIP` (#330). With no trust configured there is nothing to
+    # resolve, so the answer is `getip` as the chain left it: the socket peer, or a client an
+    # earlier `ExtractIP` resolved. With trust configured it is judged against the socket peer,
+    # because after an extractor has run `getip` is a forwarded address, and trusting it would
+    # let that address vouch for itself.
+    isempty(policy.proxies) && return _resolve(req, policy, getip(req))
     return _resolve(req, policy, getpeerip(req))
 end
 

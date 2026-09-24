@@ -366,10 +366,14 @@ end
 # then the file handle stays open, which on Windows also blocks deleting the file. Over a real
 # socket none of this applies — the write path always closes.
 function internalrequest(ctx::App, req::HTTP.Request; middleware::Vector=[], serialize::Bool=true, catch_errors=true, context=missing)::HTTP.Response
-    # Loopback only when the caller supplied no address (#330). Overwriting one handed every
+    # Loopback only when the request carries no address (#330). Overwriting one handed every
     # internal call the one address loopback-trusting checks accept, including a call made on
     # behalf of an outside client whose own address was already on the request.
-    haskey(req.context, :ip) || setip!(req, IPv4("127.0.0.1"))
+    #
+    # Unlike the app context below, this is deliberately conditional, and so a reused request
+    # object keeps the address a previous call left on it. That cannot raise privilege: loopback
+    # is the most trusted value it could otherwise have had.
+    getip(req) === nothing && setip!(req, IPv4("127.0.0.1"))
 
     # Stamp the per-call override onto THIS REQUEST, never onto `ctx.app_context[]` (#31).
     #

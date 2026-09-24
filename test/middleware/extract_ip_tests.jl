@@ -322,12 +322,20 @@ end
     @test getip(seen[]) == CLIENT
     @test getpeerip(seen[]) == CLIENT
 
-    # The bare resolver takes the same view: with no trust configured it answers the socket
-    # peer, even on a request an extractor already resolved.
+    # The bare resolver follows the same two rules. With no trust configured it answers `getip`
+    # as the chain left it -- the resolved client, as it always did.
     @test extract_ip(seen[]) == CLIENT
     trusted()(handler)(proxied())
-    @test extract_ip(seen[]) == PROXY
+    @test extract_ip(seen[]) == FORWARDED
     @test xff(seen[]) == FORWARDED
+
+    # With trust configured it judges the SOCKET peer. Judging the resolved `getip` let a
+    # forwarded address vouch for itself: trusting 6.6.6.0/24 here made the walk step over the
+    # resolved 6.6.6.6 and hand back the value the client prepended.
+    trusted()(handler)(create_request(["X-Forwarded-For" => "$SPOOF, $FORWARDED"], PROXY))
+    @test getip(seen[]) == FORWARDED
+    @test extract_ip(seen[]; forwarded_header = :x_forwarded_for,
+                     trusted_proxies = ["6.6.6.0/24"]) == PROXY
 end
 
 @testset "Misconfiguration is rejected at construction" begin
@@ -397,6 +405,11 @@ urlpatterns(app, "",
 req = HTTP.Request("GET", "/ip")
 setip!(req, IPv4("203.0.113.7"))
 @test text(internalrequest(app, req)) == "203.0.113.7"
+
+# An explicit `nothing` is no address: it still becomes loopback.
+blank = HTTP.Request("GET", "/ip")
+blank.context[:ip] = nothing
+@test text(internalrequest(app, blank)) == "127.0.0.1"
 
 # What the docstring promises: route middleware still runs on an internal request.
 res = internalrequest(app, HTTP.Request("GET", "/guarded"))
