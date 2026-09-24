@@ -297,8 +297,8 @@ end
     @test getip(seen[]) == FORWARDED
     @test getpeerip(seen[]) == PROXY
 
-    # Two trusted extractors: the second judges trust against the real peer, not against the
-    # address the first one resolved, and resolves the same client.
+    # Two identical trusted extractors: the second judges the client the first resolved, does
+    # not trust it, and leaves it alone.
     trusted()(trusted()(handler))(proxied())
     @test getip(seen[]) == FORWARDED
     @test getpeerip(seen[]) == PROXY
@@ -322,20 +322,39 @@ end
     @test getip(seen[]) == CLIENT
     @test getpeerip(seen[]) == CLIENT
 
-    # The bare resolver follows the same two rules. With no trust configured it answers `getip`
-    # as the chain left it -- the resolved client, as it always did.
-    @test extract_ip(seen[]) == CLIENT
+    # Mismatched trust lists: a global extractor trusting a k8s ingress CIDR, and a limiter
+    # whose own `trusted_proxies` names only loopback. The limiter does not trust the client
+    # the global one resolved, so it keeps it -- judging the socket peer instead would reset
+    # `getip` to the ingress and put every client in one bucket.
+    INGRESS = IPv4("10.244.1.1")
+    k8s = ExtractIP(forwarded_header = :x_forwarded_for, trusted_proxies = ["10.244.0.0/16"])
+    local_limiter = RateLimiter(rate_limit = 100, window = Minute(1),
+                                forwarded_header = :x_forwarded_for,
+                                trusted_proxies = [ip"127.0.0.1"]).middleware
+    k8s(local_limiter(handler))(create_request(["X-Forwarded-For" => "$CLIENT"], INGRESS))
+    @test getip(seen[]) == CLIENT
+    @test getpeerip(seen[]) == INGRESS
+
+    # Two tiers with different headers chain: nginx on loopback writes X-Real-IP with the CDN
+    # edge it saw, and the CDN writes CF-Connecting-IP. The second extractor believes its header
+    # only because the first established a CDN address as the hop.
+    EDGE = IPv4("173.245.48.5")
+    nginx_tier = ExtractIP(forwarded_header = :x_real_ip, trusted_proxies = [PROXY])
+    cdn_tier   = ExtractIP(forwarded_header = :cf_connecting_ip, trusted_proxies = ["173.245.48.0/20"])
+    tiers(req) = nginx_tier(cdn_tier(handler))(req)
+    tiers(create_request(["X-Real-IP" => "$EDGE", "CF-Connecting-IP" => "$CLIENT"], PROXY))
+    @test getip(seen[]) == CLIENT
+    @test getpeerip(seen[]) == PROXY
+    # The same headers from a client that connected directly are believed by neither tier.
+    tiers(create_request(["X-Real-IP" => "$EDGE", "CF-Connecting-IP" => "$SPOOF"], CLIENT))
+    @test getip(seen[]) == CLIENT
+    @test getpeerip(seen[]) == CLIENT
+
+    # The bare resolver chains the same way: with no trust configured it answers `getip` as the
+    # chain left it.
     trusted()(handler)(proxied())
     @test extract_ip(seen[]) == FORWARDED
     @test xff(seen[]) == FORWARDED
-
-    # With trust configured it judges the SOCKET peer. Judging the resolved `getip` let a
-    # forwarded address vouch for itself: trusting 6.6.6.0/24 here made the walk step over the
-    # resolved 6.6.6.6 and hand back the value the client prepended.
-    trusted()(handler)(create_request(["X-Forwarded-For" => "$SPOOF, $FORWARDED"], PROXY))
-    @test getip(seen[]) == FORWARDED
-    @test extract_ip(seen[]; forwarded_header = :x_forwarded_for,
-                     trusted_proxies = ["6.6.6.0/24"]) == PROXY
 end
 
 @testset "Misconfiguration is rejected at construction" begin
