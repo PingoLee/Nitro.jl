@@ -236,8 +236,19 @@ end)
 HTTP.jl also exports a `Cookie`, so in a module that has `using HTTP` too, write `Nitro.Cookie`
 or import it explicitly (`using Nitro: Cookie`).
 
-The cookie is looked up by the **parameter name** (`theme` above). For a cookie whose name is
-not a legal Julia identifier, read it with `get_cookie` in the handler.
+The cookie is looked up by the **parameter name** (`theme` above). To read a cookie under
+another name, including one that is not a legal Julia identifier, give the parameter a
+`Cookie(name, T)` default:
+
+```julia
+path("/prefs", function(req, theme::Cookie{String} = Cookie("ui-theme", String))
+    Res.json(Dict("theme" => something(theme.value, "light")))
+end)
+```
+
+The default also carries an extractor-local validator, as it does for every other extractor:
+`Cookie("ui-theme", String, t -> t in ("light", "dark"))`. A present cookie that fails it is a
+`ValidationError` (400); the validator does not run when the cookie is absent.
 
 `value` is `nothing` when the request carries no such cookie; a present cookie that does not
 parse as `T` is a `ValidationError` (400). When the app has a cookie `secret_key` configured
@@ -247,17 +258,19 @@ parse as `T` is a `ValidationError` (400). When the app has a cookie `secret_key
 struct Cookie{T} <: Extractor{T}
     name::String
     value::Nullable{T}
-    
-    function Cookie(name::String, val_or_type::Any)
+    validate::Union{Function, Nothing}
+
+    function Cookie(name::String, val_or_type::Any, validate::Union{Function, Nothing}=nothing)
         if val_or_type isa Type
-            return new{val_or_type}(name, nothing)
+            return new{val_or_type}(name, nothing, validate)
         else
-            return new{typeof(val_or_type)}(name, val_or_type)
+            return new{typeof(val_or_type)}(name, val_or_type, validate)
         end
     end
 
     # Also allow explicit type specification
-    Cookie{T}(name::String, value::Nullable{T}=nothing) where T = new{T}(name, value)
+    Cookie{T}(name::String, value::Nullable{T}=nothing, validate::Union{Function, Nothing}=nothing) where T =
+        new{T}(name, value, validate)
 end
 
 """

@@ -242,8 +242,13 @@ function try_validate(param::Param{U}, instance::T) :: T where {T, U <: Extracto
         throw(ValidationError("Validation failed for parameter '$(param.name)': $T rejected by $impl"))
     end
 
-    # Case 2: Use custom validate function from an Extractor (if defined)
-    if param.hasdefault && param.default isa U && !isnothing(param.default.validate)
+    # Case 2: Use custom validate function from an Extractor (if defined).
+    #
+    # `hasfield` because not every extractor carries one: `Cookie{T}` did not until #293,
+    # and `ProtoBuffer{T}` (src/exts.jl) still does not. Reading `.validate` off such a
+    # default was a `FieldError`, which is not a `ValidationError`, so the route answered
+    # 500 whenever the value was present. It folds to a constant for a concrete `U`.
+    if param.hasdefault && param.default isa U && hasfield(U, :validate) && !isnothing(param.default.validate)
         if !param.default.validate(instance)
             impl = Base.which(param.default.validate, (T,))
             throw(ValidationError("Validation failed for parameter '$(param.name)': $T rejected by $impl"))

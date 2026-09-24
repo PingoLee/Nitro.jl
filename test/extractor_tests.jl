@@ -827,6 +827,75 @@ end
 end
 
 
+# -- #293 -----------------------------------------------------------------------------------
+#
+# A `Cookie(name, T)` default is how a `Cookie{T}` parameter reads a cookie under a name other
+# than its own. `try_validate` read `.validate` off every extractor default, and `Cookie` had
+# no such field, so the route answered 500 whenever the cookie was *present*. The absent case
+# returns before `try_validate`, which is why the direct-call test in cookies_tests.jl never
+# saw it -- these go through a real route.
+@testitem "Cookie{T} with a Cookie(name, T) default (#293)" tags=[:core] setup=[NitroCommon] begin
+
+using Test
+using HTTP
+using Nitro
+using Nitro: path, Cookie
+
+ctx = Nitro.Core.App()
+Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+    path("/renamed", (req, theme::Cookie{String} = Cookie("ui-theme", String)) ->
+        Res.send(something(theme.value, "absent"))),
+    path("/validated", (req, theme::Cookie{String} = Cookie("ui-theme", String, t -> t in ("light", "dark"))) ->
+        Res.send(something(theme.value, "absent"))),
+    path("/typed", (req, n::Cookie{Int} = Cookie("count", Int)) ->
+        Res.send(string(something(n.value, -1)))),
+])
+get_(t, cookie=nothing) = Nitro.Core.internalrequest(ctx,
+    HTTP.Request("GET", t, isnothing(cookie) ? Pair{String,String}[] : ["Cookie" => cookie]))
+
+@testset "reads the named cookie, present or absent" begin
+    r = get_("/renamed", "ui-theme=blue")
+    @test r.status == 200
+    @test Nitro.text(r) == "blue"
+    @test Nitro.text(get_("/renamed")) == "absent"
+    # The default's name replaces the parameter's -- a cookie called `theme` is not read.
+    @test Nitro.text(get_("/renamed", "theme=blue")) == "absent"
+end
+
+@testset "the default's validator runs on a present cookie" begin
+    @test Nitro.text(get_("/validated", "ui-theme=dark")) == "dark"
+    @test get_("/validated", "ui-theme=blue").status == 400
+    @test Nitro.text(get_("/validated")) == "absent"
+end
+
+@testset "the value parses as T" begin
+    @test Nitro.text(get_("/typed", "count=7")) == "7"
+    @test get_("/typed", "count=seven").status == 400
+end
+
+@testset "constructors carry the validator" begin
+    f = t -> true
+    @test Cookie("a", String).validate === nothing
+    @test Cookie("a", String, f).validate === f
+    @test Cookie("a", "v", f).value == "v"
+    @test Cookie{Int}("a", 3, f).validate === f
+    @test Cookie{Int}("a").value === nothing
+end
+
+# The class, not just `Cookie`: an extractor type with no `validate` field (`ProtoBuffer{T}`
+# is one) must not turn its own default into a 500.
+struct NoValidatorExtractor{T} <: Nitro.Types.Extractor{T}
+    payload::T
+end
+@testset "try_validate tolerates an extractor with no validate field" begin
+    param = Nitro.Types.Param(name=:x, type=NoValidatorExtractor{Int},
+                              default=NoValidatorExtractor(1), hasdefault=true)
+    @test Nitro.Core.Extractors.try_validate(param, 5) == 5
+end
+
+end
+
+
 # -- #254 -----------------------------------------------------------------------------------
 #
 # The `Session` extractor looks a session id up in an application-supplied store through a
