@@ -155,9 +155,6 @@ itself: do not log it, do not put it in a response, do not paste it into a bug r
 
 ## API Reference
 
-```@docs
-Json
-Form
-JsonFragment
-ValidationError
-```
+[`Json`](@ref), [`Form`](@ref), [`JsonFragment`](@ref), [`Body`](@ref), [`validate`](@ref) and
+[`ValidationError`](@ref) are documented with the other extractors in
+[Requests And Extractors](@ref).

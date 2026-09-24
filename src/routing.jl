@@ -108,11 +108,7 @@ end
 
 # ─── urlpatterns() — Group routes under a prefix ─────────────────────
 
-"""
-    urlpatterns(ctx, prefix, routes...)
-
-Register a group of `RouteDefinition`s under a common URL prefix.
-"""
+# Documented on the public `Nitro.urlpatterns` (src/methods.jl), which shadows this one (#186).
 function urlpatterns(ctx::App, prefix::String, routes::RouteDefinition...)
     for route_def in routes
         register_route(ctx, prefix, route_def)

@@ -13,6 +13,28 @@ export GuardMiddleware, login_required, role_required, permission_required,
 # but not authorized (guards), 302 = browser redirect (`login_required`).
 const FORBIDDEN = HTTP.Response(403, "Forbidden")
 
+"""
+    GuardMiddleware(guards::Function...)
+
+Turn authorization guards into a route or global middleware. Each guard is a
+`req -> Union{Nothing, HTTP.Response}`: `nothing` admits the request, and a response denies it
+and is returned as-is. Guards run in order and the first denial short-circuits the rest and the
+handler.
+
+```julia
+path("/admin/reports", reports;
+     middleware = [BearerAuth(Auth.jwt_validator(secret)), GuardMiddleware(login_required(), role_required("admin"))])
+```
+
+The shipped guards are [`login_required`](@ref), [`claim_required`](@ref) and its aliases
+[`role_required`](@ref) and [`permission_required`](@ref), and [`kid_required`](@ref). Any
+function of the same shape is a guard. Guards authorize, they do not authenticate: put the auth
+middleware that sets `getuser(req)` **before** this layer.
+
+The status contract: an auth middleware answers `401` for no or bad credentials, the claim guards
+answer `403` for an authenticated caller without the right, and `login_required` answers a `302`
+browser redirect.
+"""
 function GuardMiddleware(guards::Function...)
 	return function(handle::Function)
 		return function(req::HTTP.Request)
@@ -53,6 +75,25 @@ function _request_claims(req::HTTP.Request)::Nullable{AbstractDict}
 	return session isa AbstractDict ? session : nothing
 end
 
+"""
+    login_required(; redirect_url = "/login", session_key = "user_id")
+
+Guard that admits an authenticated request and otherwise answers `302` with
+`Location: redirect_url`. It is a factory, so call it: `GuardMiddleware(login_required())`.
+
+A request counts as authenticated in one of two ways, and they are trusted differently:
+
+1. **An auth middleware set `req.context[:user]`** (`BearerAuth`, `CookieAuthMiddleware`, or your
+   own). The identity is trusted as-is, whatever its shape, so a JWT principal without a
+   `user_id` passes. Only an empty dict is refused.
+2. **Otherwise, the raw [`getsession`](@ref) dict**, which must carry `session_key`. An anonymous
+   visitor accumulates session data too (a cart, a CSRF token), so a non-empty session alone is
+   not a login.
+
+`login_required` checks *that* someone is logged in, not *what* they may do. Stack
+[`claim_required`](@ref) or [`role_required`](@ref) after it for that. For a JSON API a redirect
+is usually the wrong answer; an auth middleware's own `401` already covers the anonymous case.
+"""
 function login_required(; redirect_url::String="/login", session_key::String="user_id")
 	return function(req::HTTP.Request)
 		# Two distinct sources of "user", which must be trusted differently:
@@ -134,9 +175,23 @@ function claim_required(claim::String, value; kind::Symbol=:equals)
 	throw(ArgumentError("claim_required kind must be :equals or :contains, got $(repr(kind))"))
 end
 
+"""
+    role_required(role; role_key = "role")
+
+Guard that answers `403` unless the principal's `role_key` claim equals `role`. Exactly
+`claim_required(role_key, role; kind = :equals)`; see [`claim_required`](@ref) for where the claims
+are read from and how fast a revocation takes effect.
+"""
 role_required(role::String; role_key::String="role") =
 	claim_required(role_key, role; kind=:equals)
 
+"""
+    permission_required(permission; permissions_key = "permissions")
+
+Guard that answers `403` unless the principal's `permissions_key` claim is a list containing
+`permission`. Exactly `claim_required(permissions_key, permission; kind = :contains)`; see
+[`claim_required`](@ref).
+"""
 permission_required(permission::String; permissions_key::String="permissions") =
 	claim_required(permissions_key, permission; kind=:contains)
 

@@ -160,8 +160,8 @@ end
 
 The exception a pluggable store backend raises when it is handed a call it never implemented.
 
-Nitro has two store contracts — [`AbstractWorkerStore`](@ref) for the worker queue and
-[`AbstractSessionStore`](@ref) for sessions — and both are open for third-party backends. Each
+Nitro has two store contracts — `AbstractWorkerStore` for the worker queue and
+`AbstractSessionStore` for sessions — and both are open for third-party backends. Each
 required method carries a fallback defined on the *abstract* type; reaching that fallback means the
 concrete store did not define the method, so this is thrown instead of letting the call fail far
 downstream with a bare `MethodError` that names neither the contract nor the missing piece.

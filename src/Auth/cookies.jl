@@ -31,7 +31,7 @@ failure is silent in the worst direction — the browser keeps sending a credent
 guaranteed to `401`, so the app looks broken rather than signed out (#232). Only the caller
 that just minted the token knows its lifetime, so only the caller may say.
 
-Pass the same value you passed to [`encode_jwt`](@ref):
+Pass the same value you passed to `encode_jwt`:
 
 ```julia
 token = encode_jwt(claims, secret; expires_in = 900)
@@ -39,7 +39,7 @@ set_auth_cookie!(res, token; ttl = 900)
 ```
 
 If you never passed `expires_in`, the token carries no `exp` and is bounded instead by the
-`iat + exp_timeout` fallback in [`decode_jwt`](@ref) — `ttl = 900` matches its default.
+`iat + exp_timeout` fallback in `decode_jwt` — `ttl = 900` matches its default.
 
 **Re-setting a token you minted earlier** — a refresh flow, or a re-login that reuses a
 live token — is the one case where `expires_in` is the wrong number: `Max-Age` counts from
@@ -53,7 +53,7 @@ set_auth_cookie!(res, token; ttl = ttl)
 ```
 
 The cookie is written unencrypted: it carries a signed token, which is already tamper-evident.
-Use [`clear_auth_cookie!`](@ref) to expire it.
+Use `clear_auth_cookie!` to expire it.
 """
 function set_auth_cookie!(res::HTTP.Response, token::AbstractString; ttl::Int, cookie_name::String=DEFAULT_AUTH_COOKIE_NAME, secure::Bool=true, httponly::Bool=true, samesite::String="Lax", path::String="/", domain=nothing)
     config = CookieConfig(secure=secure, httponly=httponly, samesite=samesite, path=path, domain=domain, maxage=ttl)

@@ -309,8 +309,5 @@ HTTP.post("http://localhost:8080/api/upload", [], body)
 
 ## API Reference
 
-```@docs
-FormFile
-multipart
-Files
-```
+[`FormFile`](@ref), [`multipart`](@ref), [`Files`](@ref) and [`MultipartForm`](@ref) are
+documented in [Requests And Extractors](@ref).

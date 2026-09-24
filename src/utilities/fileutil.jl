@@ -57,7 +57,7 @@ end
     _same_root(a, b) -> Bool
 
 Compare two filesystem-root components ignoring a trailing separator, which `splitpath` includes or
-omits depending on whether the root stands alone. See [`_is_within`](@ref).
+omits depending on whether the root stands alone. See `_is_within`.
 """
 _same_root(a::AbstractString, b::AbstractString) =
     rstrip(a, ('/', '\\')) == rstrip(b, ('/', '\\'))
@@ -100,12 +100,12 @@ routing layer. Two distinct failures, both refused:
   means a single brace-named file made `serve()` fail to boot.
 
 Applied to two things, by two callers with different consequences. [`mountable_files`](@ref) *skips*
-a filename that matches, because filenames arrive in bulk from the filesystem. [`mount_segments`](@ref)
+a filename that matches, because filenames arrive in bulk from the filesystem. `mount_segments`
 *throws* on a `mountdir` segment that matches, because that is one app-authored value with an obvious
 correction — and until #101 it was not checked at all, so a mount could claim URLs a file may not.
 
 This rule survived #121's route encoding, and has to. `*` and `**` are legal `pchar`, so
-[`_route_encode`](@ref) leaves them untouched: nothing but this refusal stops a file named `*` from
+`_route_encode` leaves them untouched: nothing but this refusal stops a file named `*` from
 shadowing every sibling URL under the mount. Braces *would* be encoded, but are caught here first,
 so `{id}.txt` stays skipped rather than becoming servable at `%7Bid%7D.txt`.
 """
@@ -127,7 +127,7 @@ Unicode-aware, so `isletter('Ａ')` — the fullwidth `A` — is `true`, and wit
 non-ASCII segment would be accepted as a literal route. A *conforming* client percent-encodes it and
 the router compares raw path segments, so the two never meet; a client that sends raw bytes does
 reach such a route, which is why refusing it is a deliberate trade rather than a free win — see
-[`mount_segments`](@ref). `isdigit` and `isxdigit` are already ASCII-only in Julia, so only the
+`mount_segments`. `isdigit` and `isxdigit` are already ASCII-only in Julia, so only the
 letter test needs the guard; applying it to the whole predicate keeps that from being a detail a
 reader has to know.
 """
@@ -176,9 +176,9 @@ becomes an uppercase `%XX` triplet. `name` is returned unchanged when every byte
 Triplets are **uppercase**, and because the router matches bytes rather than testing RFC 3986
 equivalence, a client that sends the lowercase spelling (`caf%c3%a9.txt`) gets a 404. Browsers emit
 uppercase, so this is a compatibility footnote rather than a defect — and it is the same fact that
-forbids case-normalizing a `mountdir`'s triplets in [`mount_segments`](@ref), so the two rules agree.
+forbids case-normalizing a `mountdir`'s triplets in `mount_segments`, so the two rules agree.
 
-This is the filename half of the rule [`mount_segments`](@ref) enforces on `mountdir`. The router
+This is the filename half of the rule `mount_segments` enforces on `mountdir`. The router
 compares path segments byte for byte and never percent-decodes, so a file whose name needs encoding
 used to register a route that no conforming client could ever match — enumerated, registered,
 counted and logged as served, and a 404 in every browser
@@ -199,7 +199,7 @@ pchar-clean filename keeps its route byte for byte, so no route a *conforming* c
 reach moves — the sole exception being the literal-`%` case below.
 
 **A literal `%` is always encoded, and that is the one place this deliberately disagrees with
-[`mount_segments`](@ref).** A `mountdir` is *authored*, so `"my%20static"` is someone spelling a
+`mount_segments`.** A `mountdir` is *authored*, so `"my%20static"` is someone spelling a
 space on purpose and the triplet is validated and passed through. A filename is *data*: a file named
 `my%20file.txt` contains the three characters `%`, `2`, `0`, and the URL that names it is
 `my%2520file.txt`. Passing the triplet through would make one URL mean two different files — the
@@ -207,7 +207,7 @@ literal `my%20file.txt` and the encoded form of `my file.txt` — so `%` is not 
 is encoded like any other non-`pchar` byte. This is the one case where a route that a *browser* could
 reach does move; it is recorded in the #121 upgrade-log entry.
 
-**It does not replace the [`_is_route_pattern`](@ref) refusal, which still runs first.** `*` and `**`
+**It does not replace the `_is_route_pattern` refusal, which still runs first.** `*` and `**`
 are perfectly legal `pchar`, so this function leaves them alone and a file named `*` would still
 shadow every sibling URL under the mount. `{` and `}` *would* be encoded here, but the refusal
 catches them earlier and keeps `{id}.txt` skipped — encoding them instead would change *what* a
@@ -222,7 +222,7 @@ Sweeping every **one-byte name** leaves exactly two whose output is not an inert
 and neither needs a rule here — worth writing down, since the dot-segment half is the class #101's
 review found late for `mountdir`:
 
-- A name that **is** `"*"` (or `"**"`) is refused by [`_is_route_pattern`](@ref) before enumeration
+- A name that **is** `"*"` (or `"**"`) is refused by `_is_route_pattern` before enumeration
   reaches encoding. Note that rule tests the *whole* segment, so an **embedded** `*` — `a*b.txt`,
   the common case — does reach this function and is deliberately passed through: HTTP.jl gives `*`
   meaning only as a complete segment, so `/x/a*b.txt` matches `/x/a*b.txt` and nothing else.
@@ -255,7 +255,7 @@ end
     _mount_root_parts(root::String) -> Vector{String}
 
 The `splitpath` of `root` resolved through `realpath`, for use as the left-hand side of
-[`_is_within`](@ref) and [`_resolves_hidden`](@ref).
+`_is_within` and `_resolves_hidden`.
 
 Throws `ArgumentError` when `root` is missing or not a directory. That has to be an error rather
 than an empty result: `mountable_files` logs-and-continues past unreadable *subdirectories*, so
@@ -288,7 +288,7 @@ This is the single enumerator behind [`mountfolder`](@ref) and therefore behind 
   Names with interior dots (`file.min.js`) are unaffected. Set `include_hidden=true` to serve them.
 
   The rule applies to a symlink's **resolved target** as well as to its own name
-  ([`_resolves_hidden`](@ref)) — otherwise `innocent.txt -> .env` walks straight through a name-only
+  (`_resolves_hidden`) — otherwise `innocent.txt -> .env` walks straight through a name-only
   test. It does **not** catch a *hard* link to a dotfile: `islink` is false, so nothing resolves, and
   `realpath` legitimately reports the in-mount path. That gap is inherent at this layer.
 - **Symlinks escaping the mount** — resolved with `realpath` and required to stay under the resolved
@@ -296,7 +296,7 @@ This is the single enumerator behind [`mountfolder`](@ref) and therefore behind 
   not. Set `allow_symlink_escape=true` to serve them anyway. Note this also disables the
   resolved-target hidden check for escaping links, since "hidden relative to the mount" stops meaning
   anything once the target is outside it.
-- **Filenames that are router patterns** — see [`_is_route_pattern`](@ref). Always refused; a file
+- **Filenames that are router patterns** — see `_is_route_pattern`. Always refused; a file
   cannot opt into claiming other URLs.
 - **Anything that is not a regular file** — symlinked *directories* (`walkdir` reports every link as
   a file, so without this a route would be registered whose target is a directory and the eager read
@@ -316,7 +316,7 @@ This is the single enumerator behind [`mountfolder`](@ref) and therefore behind 
 
 A name that is not a legal URL path segment is **not** in that list: `café.txt` and `my file.txt` are
 enumerated and served, at their percent-encoded routes. That is [`mountfolder`](@ref)'s job via
-[`_route_encode`](@ref), not a refusal here
+`_route_encode`, not a refusal here
 ([#121](https://github.com/PingoLee/Nitro.jl/issues/121)) — the alternative was dropping a file a
 mount serves today, and refusals at this layer skip rather than throw, so it would have been silent.
 
@@ -458,7 +458,7 @@ It normalizes **and** validates. A `mountdir` is judged by the same rule as a *f
 [`mountable_files`](@ref) — because a mount must not be able to claim URLs a file may not. Every
 surviving segment is refused, with an `ArgumentError` naming it, when it is either:
 
-- **a router pattern** ([`_is_route_pattern`](@ref)) — `staticfiles(dir, "*")` used to register
+- **a router pattern** (`_is_route_pattern`) — `staticfiles(dir, "*")` used to register
   `/*/<file>` *and* a bare `/*`, so `GET /anything` was answered by the mount. `**` and `{id}` failed
   loudly at registration; `*` was the one that did not, which is what made it worth refusing here
   (#101); or
@@ -480,7 +480,7 @@ it passes the encoding test, and clients still strip it before sending.
 
 Refusing is deliberate rather than warning: `mountdir` is a single app-authored value with an obvious
 correction, so failing at boot is cheaper than a dead mount nobody notices. **Filenames are handled
-the other way round — they are encoded, not refused** ([`_route_encode`](@ref),
+the other way round — they are encoded, not refused** (`_route_encode`,
 [#121](https://github.com/PingoLee/Nitro.jl/issues/121)), because they arrive in bulk from the
 filesystem and a refusal at that layer skips silently. The split is not inconsistency: a `mountdir`
 is *authored*, so `"my%20static"` is someone spelling a space deliberately and the triplet is passed
@@ -576,8 +576,8 @@ The mount-relative key a request names, decoded exactly once, or `nothing` when 
 cannot name a mounted file at all.
 
 `n_prefix` is the number of leading path segments the mount's own prefix occupies
-([`mount_segments`](@ref)); they are dropped without being decoded, because
-[`mount_segments`](@ref) validated them and they may legitimately carry their own `%XX`.
+(`mount_segments`); they are dropped without being decoded, because
+`mount_segments` validated them and they may legitimately carry their own `%XX`.
 A target that stops at the prefix yields `""`, which is the key of the mount's bare route.
 
 The returned key is in the same alphabet as [`mountfolder`](@ref)'s table: the raw, `/`-separated,
@@ -635,7 +635,7 @@ Discover the servable files under `folder` and hand each one to `addroute`, leav
 |---|---|---|
 | `route` | percent-**encoded** (#121) | the URL the mount *emits*, and the first half of the returned pair |
 | `filepath` | raw filesystem path | opening the file |
-| `key` | raw, `/`-separated, mount-relative | the mount **table**, looked up by [`mount_remainder`](@ref) |
+| `key` | raw, `/`-separated, mount-relative | the mount **table**, looked up by `mount_remainder` |
 
 **`route` and `key` are different alphabets on purpose.** Since
 [#221](https://github.com/PingoLee/Nitro.jl/issues/221) a mount registers one `/<prefix>/**` handler
@@ -658,11 +658,11 @@ tell those apart, which is how the fallback once came to be registered against a
 unrepresentable: a directory is never a `mountable_files` result
 ([#102](https://github.com/PingoLee/Nitro.jl/issues/102)).
 
-`mountdir` is canonicalized by [`mount_segments`](@ref), so `"static"`, `"/static"`, `"static/"` and
+`mountdir` is canonicalized by `mount_segments`, so `"static"`, `"/static"`, `"static/"` and
 `"/static/"` name the same mount, and `""`, `"/"` and whitespace all mount at the router root.
 
 **File-derived segments are percent-encoded; the `mountdir` prefix is not.** A name that could not
-stand unencoded in a URL path is routed at its encoded spelling by [`_route_encode`](@ref), so
+stand unencoded in a URL path is routed at its encoded spelling by `_route_encode`, so
 `café.txt` registers `/<prefix>/caf%C3%A9.txt` — the route a conforming client actually sends —
 while the pair's second half stays the raw filesystem path
 ([#121](https://github.com/PingoLee/Nitro.jl/issues/121)). That is the other half of why both halves

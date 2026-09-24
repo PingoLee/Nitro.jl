@@ -102,7 +102,7 @@ end
 Publish a run's live `TaskInfo` **and** its `Task` handle as one atomic step — **unless the slot
 already holds a different run**, in which case nothing is written and the return is `false`.
 
-The two must not be published separately, and the reason is [`_deregister_run!`](@ref): it decides
+The two must not be published separately, and the reason is `_deregister_run!`: it decides
 whose handles it may drop by comparing `run_id` on the *info*, so the info is the fence's only
 oracle. A run that had published its handle but not yet its oracle was invisible to the fence, and
 a predecessor finishing in that window deleted the **successor's** handle — which
@@ -279,7 +279,7 @@ a terminal one: a concurrent `cancel_task` then refuses to cancel a live success
 ("already finished"), a concurrent submit concludes the key is finished and replaces the record
 again, and `get_task_status` reports the predecessor's terminal status for a task that is pending.
 
-This is the mirror image of [`_deregister_run!`](@ref)'s fence, not a contradiction of it. There, a
+This is the mirror image of `_deregister_run!`'s fence, not a contradiction of it. There, a
 *predecessor* must not tear down a *successor*'s handles; here a successor displaces a predecessor,
 which is safe because the store has already been told the successor owns the key. Both rules say
 the same thing: the live entry belongs to whichever run currently owns the record.
@@ -424,7 +424,7 @@ end
 # can finish, and a re-run publish run B under the same key, entirely inside the drain window --
 # and an id-keyed `delete!` would then evict the LIVE SUCCESSOR's handle, which
 # `recover_zombie_tasks!` reads as death. That is exactly the #108/#167 defect
-# [`_deregister_run!`](@ref) exists to prevent, arriving through a window far wider than the one
+# `_deregister_run!` exists to prevent, arriving through a window far wider than the one
 # it was written for.
 #
 # **`active_tasks` only.** `active_task_infos` is what `cancel_task` resolves a live object
@@ -724,7 +724,7 @@ Discard every task record. **Optional, and the default is a no-op.**
 The default goes in the safe direction on purpose. For a durable backend the registry is rows that
 outlive the process, so wiping them on a reset would be a destructive delete of live data rather
 than a teardown — a backend that never implements this gets *"my reset did not wipe"*, never *"my
-reset deleted production"*. Persistent backends prune through [`cleanup_tasks!`](@ref) on their own
+reset deleted production"*. Persistent backends prune through `cleanup_tasks!` on their own
 retention policy instead.
 
 This replaces the `store isa InMemoryWorkerStore` branch `reset_store!` used to carry. The check
