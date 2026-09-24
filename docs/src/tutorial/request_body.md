@@ -48,7 +48,10 @@ end # module
 ## Recommended: The `Json{T}` Extractor
 
 For typed handlers, declare a `@kwdef` struct and use `Json{T}`. Nitro automatically
-constructs the struct with the JSON payload. This is ideal when combined with `PormG` filters.
+constructs the struct with the JSON payload. A field the body leaves out takes its declared
+default, so `{"name": "lamp"}` binds `category = ""` and `limit = 20`. A field with no default is
+required, and a body without it is a `400`, unless its type admits `nothing`
+(`Union{String, Nothing}`), in which case it binds `nothing`. This is ideal when combined with `PormG` filters.
 
 ```julia
 using Nitro

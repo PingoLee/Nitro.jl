@@ -195,9 +195,9 @@ end
     # A malformed body is the cheapest way in: `Json{PrecompileRecord}` cannot bind `"nope"` to
     # an `Int`, so the bind throws and the request lands on that branch as a 400.
     #
-    # `name` is supplied even though only `id` is malformed. It has a `@kwdef` default, but
-    # `JSON.parse(str, T)` does not honour those, so omitting it would 400 on the ABSENT field
-    # instead and the sentence above would be describing the wrong failure.
+    # `name` is supplied even though it has a `@kwdef` default (which `Json{T}` honours since
+    # #294), so the body's only fault is `id`'s type and the sentence above describes the
+    # failure actually taken.
     #
     # The kwarg is omitted rather than written out because `catch_errors=true` is the default;
     # spelling it would compile the identical branch, so this is about matching how `serve()`
