@@ -49,7 +49,14 @@ is explicit introspection, not accidental disclosure.)
   `code`/`state` carried in URLs never reach the logs.
 - `access_log_query=false`: set `true` to log the full target including the query
   string. Only enable when you are certain no secrets travel in query strings.
-- `prefix=nothing`: strip a global URL prefix (e.g. `"/api"`) before routing.
+- `prefix=nothing`: strip a global URL prefix (e.g. `"/api"`) before routing. It matches whole
+  path segments: `/api`, `/api/users` and `/api?x=1` are served (as `/`, `/users` and `/?x=1`),
+  while `/apiadmin/users` is a `404`, not `/admin/users`. Everything outside the prefix is a
+  `404` before any of your middleware runs, and the target global middleware sees keeps its
+  leading `/`.
+  A trailing slash is dropped (`"/api/"` is `"/api"`). The prefix is matched against the raw
+  request-target, so write it as clients send it: ASCII and percent-encoded, with no `?`, `#`,
+  empty or dot segments. Anything else, including `""` and `"/"`, is an `ArgumentError`.
 - `revise=:none`: `:lazy`/`:eager` enable Revise-based hot reload (dev only).
 - `secret_key`, `httponly`, `secure`, `samesite`: override cookie defaults for this run.
 - `shutdown_timeout=10.0`: seconds `terminate` waits for in-flight requests to drain
