@@ -119,6 +119,11 @@ jobs:
       - uses: julia-actions/setup-julia@v2
         with:
           version: ${{ matrix.version }}
+      # Logs the runner's CPU model and LLVM target on every job, passing or failing -- the
+      # baseline #301's Windows crash needs. The #254 test prints its own environment only
+      # when it fails, because ReTestItems shows an item's output only then.
+      - name: Runner CPU (#301)
+        run: julia --startup-file=no -e 'using InteractiveUtils; versioninfo()'
       - uses: julia-actions/cache@v3
         with:
           include-matrix: 'false'

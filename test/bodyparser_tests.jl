@@ -392,6 +392,17 @@ end
 # overflow runs on a stack an earlier one already used, and a crash that remains costs one step
 # and names it. The price is six Nitro loads instead of one, far inside `testitem_timeout`.
 #
+# That did not stop it (#301), and what #279's diagnostics showed rules the hypothesis out: a
+# failing job loses ALL six children, each overflowing once in a fresh process, and a passing
+# job loses none. Something that holds for the whole job decides it -- and every child died
+# with empty stdout, before its first result line, which is exactly what a crash while
+# LOADING Nitro would also look like. So every child now prints a `LOADED` line, with its
+# CPU, thread count, pkgimage state and load time, as the last act of the prelude and before
+# any overflow; `child_failure` says which side of it the child died on. The CONTROL child
+# runs the prelude and never overflows: if it dies too, the overflow is not the cause. The
+# passing-job baseline for the same fields is the "Runner CPU (#301)" step in ci.yml, since
+# ReTestItems shows an item's output only when it fails.
+#
 # The child scripts carry NO backslash-escaped quote on purpose. Julia's `raw"""` is raw about
 # every backslash EXCEPT one before a quote, so an escaped-quote JSON literal written here
 # arrives at the child with the backslashes gone and dies on a parse error that says nothing
@@ -400,6 +411,10 @@ end
 using Nitro
 
 prelude = raw"""
+# Measured before `using` on purpose (#301): a job-wide cold pkgimage cache is one of the
+# candidate causes, and after the load there is nothing left to ask.
+t0 = time_ns()
+nitro_cached = Base.isprecompiled(Base.identify_package("Nitro"))
 using Nitro, HTTP, Sockets, Base64
 
 # ~20 KB -- well inside any default body limit, and deep enough that JSON.parse exhausts the
@@ -422,10 +437,23 @@ end
 post_json(port, route, body) =
     HTTP.post("http://127.0.0.1:$port$route", ["Content-Type" => "application/json"], body;
               status_exception=false, request_timeout=20, retry=false)
+
+# The marker (#301): the last thing the prelude does, before any step can overflow. Flushed,
+# because a child the OS kills takes an unflushed pipe buffer with it. Not `NAME=` shaped, so
+# `child_failure` never mistakes it for a result line.
+println("LOADED cpu=", strip(Sys.cpu_info()[1].model), " target=", Sys.CPU_NAME,
+        " threads=", Threads.nthreads(), " nitro_cached=", nitro_cached,
+        " load_s=", round((time_ns() - t0) / 1e9; digits=1))
+flush(stdout)
 """
 
 # (step, child body, lines its stdout must contain). Each body overflows at most once.
 steps = [
+    # 0. The control (#301): the prelude and nothing else, no overflow.
+    ("CONTROL", raw"""
+println("CONTROL=OK")
+""", ["CONTROL=OK"]),
+
     # 1. The parser itself.
     ("PARSER", raw"""
 req = HTTP.Request("POST", "/j", ["Content-Type" => "application/json"], deep)
@@ -527,18 +555,35 @@ end
 function child_failure(step, r)
     r.exitcode == 0 && r.termsignal == 0 && return nothing
     code = "exit code $(r.exitcode) (0x$(string(r.exitcode % UInt32; base=16, pad=8)))"
-    r.exitcode == 0xC00000FD &&
-        (code *= " = Windows STATUS_STACK_OVERFLOW: the OS killed the child on an overflow Julia never turned into a StackOverflowError")
-    reached = filter(l -> occursin(r"^[A-Z]+=", l), split(r.out, '\n'))
+    # Named, not explained: WHERE the OS raised it is what the LOADED stage below answers.
+    r.exitcode == 0xC00000FD && (code *= " = Windows STATUS_STACK_OVERFLOW")
+    r.exitcode == 0xC0000005 && (code *= " = Windows STATUS_ACCESS_VIOLATION")
+    lines = split(r.out, '\n')
+    loaded = findfirst(startswith("LOADED "), lines)
+    stage = loaded === nothing ?
+        "died BEFORE LOADED -- while starting Julia or loading Nitro, not at this step's overflow" :
+        "reached $(lines[loaded]) -- died in this step's own code"
+    reached = filter(l -> occursin(r"^[A-Z]+=", l), lines)
     last_line = isempty(reached) ? "none -- died before its first result line" : last(reached)
-    return "$step child: $code, termsignal $(r.termsignal); last result line: $last_line; " *
+    return "$step child: $code, termsignal $(r.termsignal); $stage; last result line: $last_line; " *
            "stdout: $(repr(r.out)); stderr tail: $(repr(last(r.err, 2000)))"
+end
+
+# The diagnoser is the deliverable of #301, and it runs for real only on a crash no other
+# platform reproduces -- so pin its one distinction here rather than find it broken there.
+@testset "child_failure names which side of LOADED a child died on" begin
+    crashed(out) = (; exitcode=0xC00000FD, termsignal=0, out, err="")
+    @test contains(child_failure("X", crashed("")), "died BEFORE LOADED")
+    after = child_failure("X", crashed("LOADED cpu=Test target=generic threads=1 nitro_cached=true load_s=1.0\n"))
+    @test contains(after, "reached LOADED cpu=Test")
+    @test !contains(after, "BEFORE LOADED")
 end
 
 for (step, body, expected) in steps
     r = run_child(prelude * body)
     @testset "$step" begin
         @test child_failure(step, r) === nothing
+        @test contains(r.out, "LOADED ")
         for line in expected
             @test contains(r.out, line)
         end
