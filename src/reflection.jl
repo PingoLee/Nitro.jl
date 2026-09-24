@@ -444,7 +444,7 @@ as a `String`, so a key the client sent that is not a field is never touched. Bu
 and Julia never frees an interned `Symbol`: a login form flooded with unique junk keys grew the
 process by ~47 MB per million keys, for good.
 
-Each present value binds through [`bind_value`](@ref), the same rules scalar path and query
+Each present value binds through `bind_value`, the same rules scalar path and query
 parameters follow. A `@kwdef` struct is built by keyword, so an absent field takes its declared
 default; a plain struct is built positionally, and an absent field binds `nothing` or `missing`
 if its type admits one. Any other absent field is a `ValidationError` naming the field. A target

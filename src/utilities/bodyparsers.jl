@@ -392,8 +392,8 @@ end
 
 Read the body of a HTTP.Request as a Vector{UInt8}
 """
-# A fresh vector the caller owns: mutating it never touches the body other readers see.
 function binary(req::HTTP.Request) :: Vector{UInt8}
+    # A fresh vector the caller owns: mutating it never touches the body other readers see.
     return Vector{UInt8}(_body_view(req.body))
 end
 

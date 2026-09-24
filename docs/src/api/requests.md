@@ -60,7 +60,7 @@ FormFile
 
 An extractor is a handler parameter whose *type* says where its value comes from. Nitro binds it
 before the handler runs, and a value that does not bind or does not validate is answered with a
-`400` without calling the handler. The bound value is in the parameter's `.payload` (`.value` for
+`400` without calling the handler (a `415` when the body has the wrong media type). The bound value is in the parameter's `.payload` (`.value` for
 [`Cookie`](@ref)). [Request Body](../tutorial/request_body.md),
 [Query Parameters](../tutorial/query_parameters.md) and [File Uploads](../tutorial/file_uploads.md)
 walk through them.
@@ -80,6 +80,6 @@ Session
 Context
 validate
 ValidationError
-UnsupportedMediaTypeError
+Nitro.Errors.UnsupportedMediaTypeError
 extract
 ```
