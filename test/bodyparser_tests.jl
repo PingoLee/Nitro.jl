@@ -374,7 +374,7 @@ end
 # same children asserted the overflow PROPAGATED rather than being swallowed (#254); the input
 # is unchanged, only the verdict is.
 #
-# Why the deep input, and not the 513-level one the in-process item above uses: that one proves
+# Why the deep input, and not the 513-level one the in-process item below uses: that one proves
 # the bound's edge, this one proves the bound is what stands between a request and the
 # overflow. Drop the bound from any path and its child overflows -- which is also why they run
 # in **disposable subprocesses**. After a stack overflow Julia reports "program state may be
@@ -399,8 +399,10 @@ end
 #
 # What stays, and why. One child per step, and `LOADED` with `child_failure`'s verdict on which
 # side of it a child died: if the bound ever regresses on one path, its child dies (on such a
-# host) or prints `=PROPAGATED:StackOverflowError` (elsewhere), and the failure names the step
-# and the CPU. The AT_LIMIT step parses the deepest document the bound admits on a request-sized
+# host) or prints `=PROPAGATED:StackOverflowError` (elsewhere -- which relies on #254's rethrow
+# still standing behind the bound; the in-process item below pins that rethrow synthetically),
+# and the failure names the step and the CPU. The AT_LIMIT step parses the deepest document the
+# bound admits on a request-sized
 # stack, so every CI host checks that the limit itself is safe there.
 #
 # The child scripts carry NO backslash-escaped quote on purpose. Julia's `raw"""` is raw about
@@ -785,6 +787,27 @@ end
     @test err.cause isa ArgumentError
     @test Nitro.parseparam_checked(Vector{Any}, nest(512), "n", :query) isa Vector{Any}
 end
+
+# The bound means request input no longer raises one of `is_unrecoverable`'s three, so the
+# deep-input children stopped exercising #254's rethrows -- and deleting one would leave the
+# suite green. Pin them from INSIDE each guarded block with a synthetic trigger instead: a
+# `dicttype` whose constructor throws runs within the parse the `try` wraps, and so does a
+# `Base.parse` method for a type of our own.
+struct DepthBoomDict <: AbstractDict{String, Any} end
+DepthBoomDict() = throw(OutOfMemoryError())
+struct DepthBoom end
+Base.parse(::Type{DepthBoom}, ::String) = throw(OutOfMemoryError())
+
+@testset "#254's rethrow still stands behind the bound" begin
+    @test_throws OutOfMemoryError json(jreq("{\"a\":1}"); dicttype = DepthBoomDict)
+    @test_throws OutOfMemoryError json(HTTP.Response(200; body = "{\"a\":1}"); dicttype = DepthBoomDict)
+    # `parseparam`'s own rethrow (before its JSON fall-through), then `parseparam_checked`'s
+    # (before it wraps everything else in a `ValidationError`) -- both must hold for this.
+    @test_throws OutOfMemoryError Nitro.parseparam_checked(DepthBoom, "x", "n", :query)
+    # Ordinary failures on the same paths are still absorbed.
+    @test json(jreq("not json")) === nothing
+    @test_throws Nitro.ValidationError Nitro.parseparam_checked(Int, "x", "n", :query)
+end
 end
 
 # Every JSON parse of request data has to go through the bound, and the easiest way to lose
@@ -795,18 +818,20 @@ using Nitro
 
 const PARSERS = (:parse, :parse!, :parsefile, :parsefile!, :lazy, :lazyfile)
 
-# `JSON.<parser>` anywhere (a call, a bare reference, or an `import JSON.<parser>` path), and
-# `import`/`using JSON: <parser>`.
+# `JSON.<parser>` anywhere -- a call, a bare reference, qualified (`Util.JSON.parse`), or an
+# `import JSON.<parser>` path -- and `import`/`using JSON: <parser>`, renamed (`as`) or not.
+is_json(x) = x === :JSON || (x isa Expr && x.head === :. && x.args[end] == QuoteNode(:JSON))
+imported(a) = a isa Expr && (a.head === :as ? imported(a.args[1]) : a.args[end] in PARSERS)
 function json_parse_sites(path)
     n = Ref(0)
     function walk(e)
         e isa Expr || return
-        if e.head === :. && length(e.args) == 2 && e.args[1] === :JSON &&
+        if e.head === :. && length(e.args) == 2 && is_json(e.args[1]) &&
            (e.args[2] isa QuoteNode ? e.args[2].value : e.args[2]) in PARSERS
             n[] += 1
         elseif e.head in (:import, :using) && length(e.args) == 1 && e.args[1] isa Expr &&
                e.args[1].head === :(:) && e.args[1].args[1] == Expr(:., :JSON)
-            n[] += count(a -> a isa Expr && a.args[end] in PARSERS, e.args[1].args[2:end])
+            n[] += count(imported, e.args[1].args[2:end])
         end
         foreach(walk, e.args)
     end
@@ -847,8 +872,9 @@ end
 mktempdir() do d
     f = joinpath(d, "probe.jl")
     write(f, "\"docstring naming JSON.parse\"\nf(x) = JSON.parse(x)\ng = JSON.lazy\n" *
-             "import JSON: parse, json\nimport JSON.parsefile\n# JSON.parse in a comment\n")
-    @test json_parse_sites(f) == 4
+             "import JSON: parse, json\nimport JSON.parsefile\n# JSON.parse in a comment\n" *
+             "h(x) = Util.JSON.parse(x)\nusing JSON: lazy as l, json as j\n")
+    @test json_parse_sites(f) == 6
 end
 end
 

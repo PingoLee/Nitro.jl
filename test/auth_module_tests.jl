@@ -408,9 +408,11 @@ end
             (v, "Invalid JWT header: longer than 1024 bytes")
     end
 
-    # -- Claims nested past the bound. 601 levels parse fine unbounded, so each of these
-    # discriminates: a signed token's claims are decoded (and rejected), an offline decode
-    # rejects them, and a forged token never gets as far as decoding them at all.
+    # -- Claims nested past the bound. 601 levels parse fine unbounded, so the first two
+    # discriminate: a signed token's claims are decoded and rejected, and so are an offline
+    # decode's. The forged case would read "Invalid JWT signature" unbounded too; it is here
+    # to pin the ORDER -- once the bound exists, only claims-after-signature keeps it a
+    # signature failure rather than "Invalid JWT encoding".
     deep_claims = raw64("{\"a\":" * repeat("[", 600) * repeat("]", 600) * "}")
     header = b64json(Dict("alg" => "HS256", "typ" => "JWT"))
     @test msg(() -> Nitro.Auth.decode_jwt(sign(string(header, ".", deep_claims)), secret)) ==

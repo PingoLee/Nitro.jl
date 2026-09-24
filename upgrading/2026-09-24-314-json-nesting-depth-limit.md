@@ -38,13 +38,15 @@ Each path gives a too-deep document the answer it already gave malformed JSON:
 | … as the `CSRFMiddleware` JSON-body token | presented | not presented, so `403` unless sent in the header or a form field |
 | JSON deep enough to overflow (~3,100+ levels), any path | `StackOverflowError` | the rows above, with no overflow |
 | JWT with an encoded header segment over 1024 bytes | decoded | `AuthError("Invalid JWT header: longer than 1024 bytes")`; `401` through `BearerAuth`/`CookieAuthMiddleware` |
-| `decode_jwt(t, key)` (`verify=true`), forged token with a malformed claims segment | `AuthError("Invalid JWT claims")` or `("Invalid JWT encoding")` | `AuthError("Invalid JWT signature")` |
+| `decode_jwt(t, key)` (`verify=true`), forged token with a malformed claims segment | `AuthError("Invalid JWT claims")` or `("Invalid JWT encoding")` | the header or signature check that fails first — `AuthError("Invalid JWT signature")` for a single key, `("No key in the JWT keyset verified this token")` for a kid-less token against several |
+| `json(res::HTTP.Response)` / `json(res, T)` on a body nested past 512 levels | parsed | `nothing` / throws `ArgumentError`, like the request parsers |
 | `encode_jwt` with a keyset `kid` of ~730+ characters | minted | `ArgumentError` |
 
-Through the auth middlewares every JWT row was already a `401`, so only a direct
-`decode_jwt`/`encode_jwt` caller sees them. The
-[#254](https://github.com/PingoLee/Nitro.jl/issues/254) entry describes deep JSON reaching a
-`500`; with this change it never does.
+Through `BearerAuth`/`CookieAuthMiddleware`, the header cap is the one JWT row that changes an
+answer: a validly signed token whose encoded header is over 1 KB used to authenticate and is now
+a `401`. The forged-claims row was a `401` there before and still is; only a direct `decode_jwt`
+caller sees its message change. The [#254](https://github.com/PingoLee/Nitro.jl/issues/254)
+entry describes deep JSON reaching a `500`; with this change it never does.
 
 ### How to find the calls to migrate
 
@@ -55,10 +57,14 @@ Through the auth middlewares every JWT row was already a `401`, so only a direct
 rg -n 'getjson|json\(req|Json\{|JsonFragment\{|Body\{' <app>/src
 
 # 2. Code or tests matching decode_jwt's messages. A forged-token fixture that expected
-#    "Invalid JWT claims" or "Invalid JWT encoding" now gets "Invalid JWT signature".
+#    "Invalid JWT claims" or "Invalid JWT encoding" now gets the signature (or key) failure.
 rg -n 'Invalid JWT (encoding|claims)' <app>/src <app>/test
 
-# 3. Keysets whose kid could push the header past 1 KB.
+# 3. Offline inspection of foreign tokens -- the likeliest way to meet the 1 KB header cap,
+#    since another issuer's header can carry a certificate chain (`x5c`) or a key (`jwk`).
+rg -n 'verify\s*=\s*false' <app>/src
+
+# 4. Keysets whose kid could push the header past 1 KB.
 rg -n 'JWTKeyset\(' <app>/src
 ```
 

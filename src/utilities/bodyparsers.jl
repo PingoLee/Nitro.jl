@@ -95,7 +95,8 @@ depth: JSON has no comments or single-quoted strings, a `\\uXXXX` escape contain
 nor `\\`, and no byte of a multi-byte UTF-8 sequence matches an ASCII delimiter. It does not
 validate anything else -- malformed input that stays shallow is left to `JSON.parse`, which
 rejects it at the first bad byte. The count never goes below zero, so leading stray closers
-cannot bank depth for a later run of openers.
+cannot bank depth for a later run of openers. (With `jsonlines = true` the parser adds one
+implicit root array, so it recurses one level deeper than the count -- immaterial at this margin.)
 
 `ArgumentError` is what `JSON.parse` itself throws on malformed input, so a too-deep document
 lands on every caller's existing "not JSON" path. The message names the limit, never the input.

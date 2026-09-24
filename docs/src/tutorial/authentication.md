@@ -219,8 +219,9 @@ foreign tokens offline, this is the one part of the path that got stricter.
 
 **On the verifying path the claims are decoded only after the signature verifies**, in the order
 RFC 7519 §7.2 gives: an unsigned or forged token reaches exactly one JSON parse, of its header.
-So a forged token with a malformed claims segment is `AuthError("Invalid JWT signature")`, not
-an encoding or claims error; with `verify=false` the claims are decoded straight away. On both
+So a forged token with a malformed claims segment fails a header or signature check — with a
+single key, `AuthError("Invalid JWT signature")` — never an encoding or claims error; with
+`verify=false` the claims are decoded straight away. On both
 paths the encoded header segment is capped at **1 KB** (`AuthError("Invalid JWT header: …")`)
 and every segment's JSON is capped at 512 levels of nesting — Nitro's own header is under 100
 bytes, and `encode_jwt` refuses a `kid` long enough to mint past the cap.

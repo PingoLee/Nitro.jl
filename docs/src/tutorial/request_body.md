@@ -167,7 +167,7 @@ Every path gives a too-deep document the same answer it gives any other malforme
 |---|---|
 | `getjson(req)`, `json(req)` | `nothing` |
 | `json(req, T)` | throws `ArgumentError` |
-| `Json{T}`, `JsonFragment{T}`, `Body{T}` | `400 Bad Request` |
+| `Json{T}`, `JsonFragment{T}`, and `Body{T}` for a `T` bound from JSON (not `Body{String}`) | `400 Bad Request` |
 | a path or query parameter parsed as JSON | `400 Bad Request` |
 | a JWT segment in `BearerAuth` / `CookieAuthMiddleware` | `401` |
 
