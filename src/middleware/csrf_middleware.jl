@@ -6,7 +6,7 @@ using Base64
 
 using ...Types: CookieConfig, Nullable
 using ...Cookies: get_cookie, set_cookie!
-using ...Crypto: secure_random_bytes, _empty_hmac_key
+using ...Crypto: secure_random_bytes, _empty_hmac_key, SecretString, reveal
 using ...Errors: is_unrecoverable
 using ...Res: json
 using ...Core: own_response_headers, getjson, getform
@@ -282,11 +282,16 @@ function validate_csrf_token(req::HTTP.Request, secret::String; cookie_name::Str
     return _constant_time_equals(presented, raw_token) || _constant_time_equals(presented, cookie_value)
 end
 
-function CSRFMiddleware(secret::String; cookie_name::String=DEFAULT_COOKIE_NAME, header_name::String="X-CSRF-Token", form_field::String="_csrf", ttl::Int=3600, config::CookieConfig=CookieConfig(httponly=false, secure=true, samesite="Lax", path="/", maxage=ttl))
-    _check_csrf_secret(secret)
+function CSRFMiddleware(key::Union{AbstractString, SecretString}; cookie_name::String=DEFAULT_COOKIE_NAME, header_name::String="X-CSRF-Token", form_field::String="_csrf", ttl::Int=3600, config::CookieConfig=CookieConfig(httponly=false, secure=true, samesite="Lax", path="/", maxage=ttl))
+    # The closures below capture `sealed`, never the raw key: `repr` of a closure prints its
+    # captures, so a plain `String` here was published by any `@info … middleware = mw` (#307).
+    # The unwrap happens per request, into a local the closure does not hold.
+    sealed = key isa SecretString ? key : SecretString(key)
+    _check_csrf_secret(reveal(sealed))
     _validate_cookie_prefix(cookie_name, config)
     return function(handle::Function)
         return function(req::HTTP.Request)
+            secret = reveal(sealed)
             method = uppercase(String(req.method))
             binding = _binding(req)
 

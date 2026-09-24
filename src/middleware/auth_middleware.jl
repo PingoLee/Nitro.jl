@@ -4,6 +4,7 @@ using HTTP
 using ...Types
 using ...Cookies: get_cookie
 using ...Errors: CookieError, is_unrecoverable
+using ...Crypto: SecretString, _cookie_secret
 
 export BearerAuth, CookieAuthMiddleware
 
@@ -77,14 +78,16 @@ function _handle_validated(handle::Function, req::HTTP.Request, user_info)
 end
 
 """
-    CookieAuthMiddleware(validate_token::Function; cookie_name::String = "auth_token", secret_key::Union{String, Nothing} = nothing)
+    CookieAuthMiddleware(validate_token::Function; cookie_name::String = "auth_token", secret_key = nothing)
 
 Creates a middleware function for authentication using a pluggable token validation function based on cookies.
 
 # Arguments
 - `validate_token::Function`: A function that takes a token string from the cookie (and optionally the request) and returns user info, a `(user, claims)` tuple, or `nothing` if invalid. A tuple whose *user* half is `nothing` counts as invalid too — a nil user is no user.
 - `cookie_name::String = "auth_token"`: The name of the cookie to extract the token from.
-- `secret_key::Union{String, Nothing} = nothing`: If provided, the cookie will be decrypted before validation.
+- `secret_key = nothing`: an `AbstractString` or a [`SecretString`](@ref). If provided, the cookie
+  will be decrypted before validation. It is held as a `SecretString`, so the middleware never
+  prints it.
 
 Responses follow the auth error contract: missing/invalid cookie or a failed (or
 throwing) validator yields a `401`; authorization denials are the guards' `403`.
@@ -99,12 +102,15 @@ On success the validator's claims replace anything already at `req.context[:auth
 and a validator returning a plain user object clears that slot — the two slots always
 describe the same principal, so a second auth layer cannot authorize against the first's.
 """
-function CookieAuthMiddleware(validate_token::Function; cookie_name::String = "auth_token", secret_key::Union{String, Nothing} = nothing)
+function CookieAuthMiddleware(validate_token::Function; cookie_name::String = "auth_token", secret_key::Union{AbstractString, SecretString, Nothing} = nothing)
+    # Normalized once, here, so the closures capture a `SecretString` and not the raw key --
+    # `repr` of a closure prints its captures (#307).
+    sealed = _cookie_secret(secret_key)
     return function (handle::Function)
         return function(req::HTTP.Request)
             # Try to extract the authentication cookie
             token = try
-                get_cookie(req, cookie_name, nothing; encrypted=secret_key !== nothing, secret_key=secret_key)
+                get_cookie(req, cookie_name, nothing; encrypted=sealed !== nothing, secret_key=sealed)
             catch e
                 if e isa CookieError
                     return MISSING_COOKIE

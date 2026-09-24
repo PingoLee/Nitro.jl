@@ -8,7 +8,7 @@ using ...Types: AbstractSessionStore, MemoryStore, SessionPayload, Nullable, is_
 using ...Types: CookieConfig, LifecycleMiddleware
 using ..JanitorMiddleware: _janitor
 using ...Cookies: get_cookie, set_cookie!, storesession!, prunesessions!, regenerate_session!
-using ...Crypto: secure_uuid4
+using ...Crypto: secure_uuid4, SecretString
 using ...Core: own_response_headers
 
 export SessionMiddleware, SessionPruner
@@ -150,7 +150,7 @@ the chain by hand, the request function is its `.middleware` field.
 """
 function SessionMiddleware(;
     cookie_name::String = "nitro_session",
-    secret_key::Nullable{String} = nothing,
+    secret_key::Union{AbstractString, SecretString, Nothing} = nothing,
     max_age::Int = 86400,
     store::AbstractSessionStore{String, Dict{String,Any}},
     prune_interval::Period = Minute(10),

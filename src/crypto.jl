@@ -62,8 +62,10 @@ function base64url_decode(s::String)
     return base64decode(s)
 end
 
-function encrypt_payload(secret::String, payload::String)
-    key = SHA.sha256(secret)
+# `secret` is an `AbstractString` or a `SecretString`; `_secret_value` (below `SecretString`)
+# unwraps either, and is a `MethodError` for anything else.
+function encrypt_payload(secret, payload::String)
+    key = SHA.sha256(_secret_value(secret))
 
     # Cryptographically secure IV; `secure_random_bytes` checks RAND_bytes and
     # throws on failure, so we never encrypt under a low-entropy / zero IV (which
@@ -93,7 +95,7 @@ function encrypt_payload(secret::String, payload::String)
     end
 end
 
-function decrypt_payload(secret::String, payload::String)
+function decrypt_payload(secret, payload::String)
     data = try
         base64url_decode(payload)
     catch
@@ -107,7 +109,7 @@ function decrypt_payload(secret::String, payload::String)
     iv = data[1:12]
     tag = data[end-15:end]
     ciphertext = data[13:end-16]
-    key = SHA.sha256(secret)
+    key = SHA.sha256(_secret_value(secret))
 
     cipher_ptr = ccall((:EVP_get_cipherbyname, OpenSSL.libcrypto), Ptr{Cvoid}, (Cstring,), "AES-256-GCM")
     cipher = OpenSSL.EvpCipher(cipher_ptr)
@@ -234,6 +236,9 @@ secret auditable with a single grep.
 """
 reveal(s::SecretString)::String = s.value
 
+_secret_value(secret::SecretString) = reveal(secret)
+_secret_value(secret::AbstractString) = String(secret)
+
 Base.show(io::IO, ::SecretString) = print(io, "SecretString(\"****\")")
 Base.show(io::IO, ::MIME"text/plain", s::SecretString) = show(io, s)
 
@@ -253,5 +258,37 @@ Base.:(==)(a::AbstractString, b::SecretString) = b == a
 # Hash by value so `==`-equal secrets (and equal plain strings) hash equally,
 # keeping the Dict/Set contract intact.
 Base.hash(s::SecretString, h::UInt) = hash(s.value, h)
+
+# ── Cookie encryption keys ──────────────────────────────────────────────────────
+#
+# The ONE place a cookie key enters Nitro (#307). `configcookies`, `serve(secret_key = …)`,
+# `CookieConfig(secret_key = …)`, the per-call `secret_key` of `get_cookie`/`set_cookie!` and
+# `CookieAuthMiddleware` all normalize through here, so a key is held as a `SecretString` from
+# the moment it arrives -- masked in every `show`, `repr` and captured closure -- and unwrapped
+# with `reveal` only at the cipher.
+#
+# It used to be `string(v)`, which is exactly wrong for the container the docs recommend:
+# `SecretString` is deliberately not an `AbstractString`, so `string` goes through its masking
+# `show` and every app passing one got the public key `SecretString("****")`. A
+# `Base.SecretBuffer` failed the same way. Anything that is not a string is now refused WITHOUT
+# being read, as `JWTKeyset` does (src/Auth/keyset.jl) -- `String(::Vector{UInt8})` would empty
+# the caller's buffer. Deliberately no `repr(value)` in any message.
+_cookie_secret(::Nothing) = nothing
+function _cookie_secret(value)::SecretString
+    wrapped = if value isa SecretString
+        value
+    elseif value isa AbstractString
+        SecretString(value)
+    else
+        throw(ArgumentError(
+            "a cookie secret_key is a $(typeof(value)); it must be an AbstractString or a " *
+            "SecretString. Bytes and Base.SecretBuffer are refused without being read."))
+    end
+    isempty(reveal(wrapped)) && throw(ArgumentError(
+        "the cookie secret_key is empty. An unset environment variable read as " *
+        "get(ENV, \"COOKIE_SECRET\", \"\") is the usual cause -- read it with a `nothing` " *
+        "default and fail at startup instead"))
+    return wrapped
+end
 
 end

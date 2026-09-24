@@ -36,6 +36,7 @@ functions take the cookie configuration and secret explicitly instead of reading
 which is what a middleware or a test that owns no `App` needs.
 
 ```@docs
+Nitro.Core.Types.CookieConfig
 Nitro.Cookies.get_cookie
 Nitro.Cookies.set_cookie!
 Nitro.Cookies.parse_cookies

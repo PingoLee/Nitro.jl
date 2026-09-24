@@ -185,9 +185,11 @@ serve(host=config.server_host, port=config.server_port, context=config)
 `SecretString` is deliberately **not** an `AbstractString`, so it cannot flow into a string
 operation or a log line unnoticed. A `JWTKeyset` takes `SecretString`s directly, so
 `encode_jwt(claims, config.auth.api_keys)` and `jwt_validator(config.auth.api_keys)` need no
-unwrapping. Framework components that need a single raw key — `CSRFMiddleware`, `encode_jwt` or
-`jwt_validator` with one plain secret, `set_cookie!(..., encrypted=true)` — take a plain `String`,
-so unwrap with `reveal` at the call itself rather than storing a revealed copy in the config:
+unwrapping. The cookie and CSRF keys take one directly too — `configcookies(secret_key = …)`,
+`serve(secret_key = …)`, the `secret_key` of `set_cookie!`/`get_cookie`, `CookieAuthMiddleware` and
+`CSRFMiddleware` — and hold it as a `SecretString` from then on. `encode_jwt` and `jwt_validator`
+with one plain secret take a `String`, so unwrap with `reveal` at the call itself rather than
+storing a revealed copy in the config:
 
 ```julia
 serve(
@@ -196,7 +198,7 @@ serve(
     context=config,
     middleware=[
         SessionMiddleware(store=MemoryStore()),
-        CSRFMiddleware(reveal(config.auth.secret_key)),
+        CSRFMiddleware(config.auth.secret_key),
     ],
 )
 ```

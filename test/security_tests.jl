@@ -19,11 +19,14 @@ using HTTP
     # Should fail if bad key
     @test_throws Nitro.Core.Errors.CookieError get_cookie(req, "session", encrypted=true, secret_key="wrong-key")
 
-    # Encrypted operations should fail closed when the key is missing or empty
+    # Encrypted operations fail closed when the key is missing...
     @test_throws Nitro.Core.Errors.CookieError set_cookie!(HTTP.Response(200), "session", "secret-data", encrypted=true)
-    @test_throws Nitro.Core.Errors.CookieError set_cookie!(HTTP.Response(200), "session", "secret-data", encrypted=true, secret_key="")
     @test_throws Nitro.Core.Errors.CookieError get_cookie(HTTP.Request("GET", "/", ["Cookie" => "session=plaintext"]), "session", encrypted=true)
-    @test_throws Nitro.Core.Errors.CookieError get_cookie(HTTP.Request("GET", "/", ["Cookie" => "session=plaintext"]), "session", encrypted=true, secret_key="")
+    # ...and an EMPTY key is refused as an argument before it is used (#307): every key now
+    # passes one normalizer, and an empty secret is an `ArgumentError` there, as it is for JWT
+    # (#264) and CSRF (#269) secrets. It used to be a `CookieError` raised at the cipher.
+    @test_throws ArgumentError set_cookie!(HTTP.Response(200), "session", "secret-data", encrypted=true, secret_key="")
+    @test_throws ArgumentError get_cookie(HTTP.Request("GET", "/", ["Cookie" => "session=plaintext"]), "session", encrypted=true, secret_key="")
 end
 
 @testset "Security: Cookie Header Validation" begin

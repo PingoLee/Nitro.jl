@@ -6,7 +6,7 @@ using UUIDs
 using ..Types
 using ..Errors
 
-using ..Crypto: encrypt_payload, decrypt_payload, secure_uuid4
+using ..Crypto: encrypt_payload, decrypt_payload, secure_uuid4, SecretString, _cookie_secret
 
 export parse_cookies, format_cookie, get_cookie, set_cookie!, load_cookie_settings!,
     storesession!, prunesessions!, regenerate_session!
@@ -462,9 +462,9 @@ function get_cookie(
     source::Any, 
     name::Union{String, Symbol},
     default::Any = nothing; 
-    encrypted::Bool = false, 
+    encrypted::Bool = false,
     config::CookieConfig = CookieConfig(),
-    secret_key::Union{String, Nothing} = nothing,
+    secret_key::Union{AbstractString, SecretString, Nothing} = nothing,
     max_cookie_size::Union{Int, Nothing} = nothing,
     kwargs...
 )
@@ -490,17 +490,17 @@ function get_cookie(
     
     raw_value = String(found_value)
 
-    final_secret = isnothing(secret_key) ? config.secret_key : secret_key
+    final_secret = isnothing(secret_key) ? config.secret_key : _cookie_secret(secret_key)
     final_max_cookie_size = isnothing(max_cookie_size) ? config.max_cookie_size : max_cookie_size
 
     # Check size limit
     if !isnothing(final_max_cookie_size) && length(raw_value) > final_max_cookie_size
         return final_default
     end
-    
+
     # Decrypt if requested
     final_value = if encrypted
-        if isnothing(final_secret) || final_secret == ""
+        if isnothing(final_secret)
             throw(CookieError("Encrypted cookie access requires a non-empty secret_key"))
         end
         decrypt_payload(final_secret, raw_value)
@@ -552,8 +552,16 @@ function set_cookie!(
     secure::Nullable{Bool} = nothing, 
     samesite::Nullable{String} = nothing,
     encrypted::Nullable{Bool} = nothing,
-    secret_key::Nullable{String} = nothing
+    secret_key::Union{AbstractString, SecretString, Nothing} = nothing
 )
+    # `string(value)` below would write a masked secret's DISPLAY form -- `SecretString("****")`
+    # -- as the cookie value, the same failure #307 fixed for the key. Refuse rather than guess:
+    # a secret in a cookie is a decision the caller should spell with `reveal`.
+    value isa Union{SecretString, Base.SecretBuffer} && throw(ArgumentError(
+        "set_cookie!: the value for cookie $(repr(string(name))) is a $(typeof(value)), which " *
+        "would be written as its masked display form. Pass `reveal(value)` if the secret " *
+        "really belongs in a cookie."))
+
     # 1. Resolve values (Explicit param > Dict > Config Default)
     merged_attrs = Dict{Symbol, Any}()
     
@@ -618,12 +626,12 @@ function set_cookie!(
     end
     
     # 3. Handle Encryption
-    final_secret = isnothing(secret_key) ? config.secret_key : secret_key
+    final_secret = isnothing(secret_key) ? config.secret_key : _cookie_secret(secret_key)
     is_encrypted = isnothing(encrypted) ? !isnothing(final_secret) : encrypted
     str_value = string(value)
-    
+
     final_value = if is_encrypted
-        if isnothing(final_secret) || final_secret == ""
+        if isnothing(final_secret)
             throw(CookieError("Encrypted cookie writes require a non-empty secret_key"))
         end
         encrypt_payload(final_secret, str_value)
@@ -694,7 +702,8 @@ function load_cookie_settings!(defaults::Nullable{Dict} = nothing)
             elseif attr_key == :expires
                 optimized_defaults[attr_key] = _normalize_expires(v)
             elseif attr_key == :secret_key
-                optimized_defaults[attr_key] = isnothing(v) ? nothing : string(v)
+                # Never `string(v)`: on a `SecretString` that is its masked `show` (#307).
+                optimized_defaults[attr_key] = _cookie_secret(v)
             elseif attr_key == :max_cookie_size
                 optimized_defaults[attr_key] = v isa String ? parse(Int, v) : Int(v)
             else

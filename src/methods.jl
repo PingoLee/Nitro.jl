@@ -540,10 +540,15 @@ urlpatterns(prefix::String, routes::Vector{Nitro.Core.Routing.RouteDefinition}) 
     configcookies(defaults::Dict)
     configcookies(; kwargs...)
 
-Configure global cookie defaults for the application.
+Configure global cookie defaults for the application. Returns `nothing`.
+
+`secret_key` may be an `AbstractString` or a [`SecretString`](@ref); either way it is stored as a
+`SecretString`. Anything else -- bytes, a `Base.SecretBuffer` -- is an `ArgumentError`.
 """
 function configcookies(defaults::Dict)
     CONTEXT[].service.cookies[] = Nitro.Core.load_cookie_settings!(defaults)
+    # Not the config: returning it put the key in front of every REPL auto-display (#307).
+    return nothing
 end
 
 function configcookies(; kwargs...)
@@ -743,10 +748,12 @@ dynamicfiles(app::App, folder::String, mountdir::String="static"; kwargs...) =
     configcookies(app::App, defaults::Dict)
     configcookies(app::App; kwargs...)
 
-Set `app`'s cookie defaults. The only one of these forms that MUTATES the app.
+Set `app`'s cookie defaults. The only one of these forms that MUTATES the app. Returns `nothing`.
 """
-configcookies(app::App, defaults::Dict) =
-    (app.service.cookies[] = Nitro.Core.load_cookie_settings!(defaults))
+function configcookies(app::App, defaults::Dict)
+    app.service.cookies[] = Nitro.Core.load_cookie_settings!(defaults)
+    return nothing
+end
 
 configcookies(app::App; kwargs...) =
     configcookies(app, Dict(string(k) => v for (k, v) in kwargs))

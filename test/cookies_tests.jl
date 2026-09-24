@@ -1155,12 +1155,14 @@ using Nitro: Cookie
         # Invalid or missing secret keys should fail closed for encrypted reads and writes.
         res = HTTP.Response(200)
         
-        # 1. Empty explicit key during write must fail closed.
-        @test_throws Nitro.Core.Errors.CookieError set_cookie!(res, "test_empty_key", "value", secret_key="", encrypted=true)
-        
+        # 1. Empty explicit key during write must fail closed. An `ArgumentError` since #307:
+        #    every key passes one normalizer, which refuses an empty secret before it is used,
+        #    as JWT (#264) and CSRF (#269) secrets are refused.
+        @test_throws ArgumentError set_cookie!(res, "test_empty_key", "value", secret_key="", encrypted=true)
+
         # 2. Empty explicit key during read must fail closed.
         req = HTTP.Request("GET", "/", ["Cookie" => "test_empty_key=value"])
-        @test_throws Nitro.Core.Errors.CookieError Cookies.get_cookie(req, "test_empty_key", secret_key="", encrypted=true)
+        @test_throws ArgumentError Cookies.get_cookie(req, "test_empty_key", secret_key="", encrypted=true)
 
         # 3. Missing key during encrypted read must also fail closed.
         @test_throws Nitro.Core.Errors.CookieError Cookies.get_cookie(req, "test_empty_key", encrypted=true)
@@ -1364,5 +1366,86 @@ using Nitro: Cookie
         @test_throws Nitro.Core.Errors.CookieError Nitro.Extractors.extract(param, lazy_req, secret)
     end
 
+end
+end
+
+# #307: a cookie key used to be stored with `string(v)`. `SecretString` is deliberately not an
+# `AbstractString`, so that went through its masking `show` and every app passing one -- the
+# container the docs recommend -- encrypted under the PUBLIC key `SecretString("****")`.
+@testitem "Cookie keys are held as SecretStrings (#307)" tags=[:core, :security] setup=[NitroCommon] begin
+using Nitro
+using Nitro.Types: CookieConfig
+using HTTP
+using Test
+const Cookies = Nitro.Cookies
+
+real_key = "a-real-32-byte-secret-from-env!!"
+masked_literal = "SecretString(\"****\")"
+
+cookie_value(res) = split(split(HTTP.header(res, "Set-Cookie"), ';')[1], '='; limit = 2)[2]
+
+@testset "a SecretString key is the key, not its display form" begin
+    app = App(mod = @__MODULE__)
+    @test configcookies(app; secret_key = SecretString(real_key)) === nothing
+    @test app.service.cookies[].secret_key isa SecretString
+    @test app.service.cookies[].secret_key == real_key
+
+    token = cookie_value(set_cookie!(app, HTTP.Response(200), "role", "user"))
+    req = HTTP.Request("GET", "/", ["Cookie" => "role=$token"])
+    @test Cookies.get_cookie(req, "role"; encrypted = true, secret_key = real_key) == "user"
+    # The pre-fix key must NOT open it: that is the public key every such app shared.
+    @test_throws Nitro.CookieError Cookies.get_cookie(req, "role"; encrypted = true,
+                                                      secret_key = masked_literal)
+end
+
+@testset "every entry point normalizes the same way" begin
+    @test configcookies(secret_key = SecretString(real_key)) === nothing
+    try
+        @test Nitro.CONTEXT[].service.cookies[].secret_key == real_key
+    finally
+        resetstate()
+    end
+    @test CookieConfig(secret_key = SecretString(real_key)).secret_key == real_key
+    @test CookieConfig(secret_key = real_key).secret_key isa SecretString
+    @test Cookies.load_cookie_settings!(Dict("secret_key" => SecretString(real_key))).secret_key == real_key
+
+    # The per-call keyword takes a SecretString too, and it is the same key.
+    res = Cookies.set_cookie!(HTTP.Response(200), "k", "v"; secret_key = SecretString(real_key))
+    req = HTTP.Request("GET", "/", ["Cookie" => "k=$(cookie_value(res))"])
+    @test Cookies.get_cookie(req, "k"; encrypted = true, secret_key = real_key) == "v"
+end
+
+@testset "non-string keys are refused without being read" begin
+    bytes = Vector{UInt8}(codeunits(real_key))
+    for bad in (bytes, Base.SecretBuffer(real_key), :a_symbol_key)
+        @test_throws ArgumentError CookieConfig(secret_key = bad)
+        @test_throws ArgumentError configcookies(App(); secret_key = bad)
+    end
+    # `String(::Vector{UInt8})` empties the buffer; refusing must not have touched it.
+    @test bytes == Vector{UInt8}(codeunits(real_key))
+    @test_throws ArgumentError CookieConfig(secret_key = "")
+end
+
+@testset "a secret VALUE is refused, not written as its display form" begin
+    @test_throws ArgumentError Cookies.set_cookie!(HTTP.Response(200), "t", SecretString("tok");
+                                                   encrypted = false)
+end
+
+@testset "nothing that holds a key prints it" begin
+    cfg = CookieConfig(secret_key = real_key)
+    @test !occursin(real_key, repr(cfg))
+    @test !occursin(real_key, sprint(show, MIME"text/plain"(), cfg))
+
+    session = SessionMiddleware(store = MemoryStore{String, Dict{String, Any}}(),
+                                secret_key = real_key)
+    @test !occursin(real_key, repr(session))
+    @test !occursin(real_key, repr(session.middleware))
+
+    csrf_key = "csrf-" * real_key
+    @test !occursin(csrf_key, repr(CSRFMiddleware(csrf_key)))
+    @test !occursin(csrf_key, repr(CSRFMiddleware(SecretString(csrf_key))))
+
+    auth = CookieAuthMiddleware(token -> token; secret_key = real_key)
+    @test !occursin(real_key, repr(auth))
 end
 end
