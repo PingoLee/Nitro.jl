@@ -381,26 +381,27 @@ end
 # corrupted", and on some Windows hosts the process dies outright (#301); a regression must cost
 # one step of one test item, not the ReTestItems worker every later item runs on.
 #
-# ONE child per overflow, not one child for all of them (#273). The single child this used to
-# be overflowed six times -- the first three back to back on its own root task -- and on
-# Windows it intermittently died early with exit code 0xC00000FD (`STATUS_STACK_OVERFLOW`): an
-# overflow the OS killed the process for, not a `StackOverflowError` Julia could hand to Nitro.
-# That is consistent with Windows not recovering from repeated overflows on one thread stack,
-# and it is not Nitro swallowing anything -- but it threw away every later step's verdict, and
-# `read(cmd, String)` threw away the output that would have said which step died. Now no
-# overflow runs on a stack an earlier one already used, and a crash that remains costs one step
-# and names it. The price is six Nitro loads instead of one, far inside `testitem_timeout`.
+# Why Windows CI kept losing these children (#273, #301) -- the record, because the answer is
+# what made #314 the fix rather than a better catch.
 #
-# That did not stop it (#301), and what #279's diagnostics showed rules the hypothesis out: a
-# failing job loses ALL six children, each overflowing once in a fresh process, and a passing
-# job loses none. Something that holds for the whole job decides it -- and every child died
-# with empty stdout, before its first result line, which is exactly what a crash while
-# LOADING Nitro would also look like. So every child now prints a `LOADED` line, with its
-# CPU, thread count, pkgimage state and load time, as the last act of the prelude and before
-# any overflow; `child_failure` says which side of it the child died on. The CONTROL child
-# runs the prelude and never overflows: if it dies too, the overflow is not the cause. The
-# passing-job baseline for the same fields is the "Runner CPU (#301)" step in ci.yml, since
-# ReTestItems shows an item's output only when it fails.
+# While these children still overflowed, Windows runners intermittently killed them with
+# 0xC00000FD (`STATUS_STACK_OVERFLOW`) or 0xC0000005 (`STATUS_ACCESS_VIOLATION`) instead of
+# letting Julia raise a `StackOverflowError`. #273 split one six-overflow child into one child
+# per overflow; it kept happening, all-or-nothing per job (#301). #302 then had every child
+# print a `LOADED` line -- CPU, LLVM target, threads, pkgimage state -- before its step, plus a
+# CONTROL child that never overflowed. The failing jobs settled it: main run 36027018987 (job
+# 107726024787, Windows, 2 threads) and 35999186292 (18f320b) both ran on an `INTEL(R) XEON(R)
+# PLATINUM 8573C` (`sapphirerapids`), CONTROL passed, and every overflowing child reached
+# `LOADED` and died in its own step. Every passing job on record was AMD or Apple. So it was
+# never a load crash or a flake: on those hosts the overflow itself kills the process. A server
+# on one would die on a single deep-JSON request, and no `catch` can be made reliable there --
+# hence bounding the input (#314), after which no child overflows at all.
+#
+# What stays, and why. One child per step, and `LOADED` with `child_failure`'s verdict on which
+# side of it a child died: if the bound ever regresses on one path, its child dies (on such a
+# host) or prints `=PROPAGATED:StackOverflowError` (elsewhere), and the failure names the step
+# and the CPU. The AT_LIMIT step parses the deepest document the bound admits on a request-sized
+# stack, so every CI host checks that the limit itself is safe there.
 #
 # The child scripts carry NO backslash-escaped quote on purpose. Julia's `raw"""` is raw about
 # every backslash EXCEPT one before a quote, so an escaped-quote JSON literal written here
@@ -410,8 +411,8 @@ end
 using Nitro
 
 prelude = raw"""
-# Measured before `using` on purpose (#301): a job-wide cold pkgimage cache is one of the
-# candidate causes, and after the load there is nothing left to ask.
+# Measured before `using` on purpose (#301): a failure should say whether the child hit a cold
+# pkgimage cache, and after the load there is nothing left to ask.
 t0 = time_ns()
 nitro_cached = Base.isprecompiled(Base.identify_package("Nitro"))
 using Nitro, HTTP, Sockets, Base64
@@ -438,8 +439,8 @@ post_json(port, route, body) =
     HTTP.post("http://127.0.0.1:$port$route", ["Content-Type" => "application/json"], body;
               status_exception=false, request_timeout=20, retry=false)
 
-# The marker (#301): the last thing the prelude does, before any step can overflow. Flushed,
-# because a child the OS kills takes an unflushed pipe buffer with it. Not `NAME=` shaped, so
+# The marker (#301): the last thing the prelude does, before any step runs. Flushed, because a
+# child the OS kills takes an unflushed pipe buffer with it. Not `NAME=` shaped, so
 # `child_failure` never mistakes it for a result line.
 println("LOADED cpu=", strip(Sys.cpu_info()[1].model), " target=", Sys.CPU_NAME,
         " threads=", Threads.nthreads(), " nitro_cached=", nitro_cached,
@@ -451,10 +452,25 @@ flush(stdout)
 # to overflow an unbounded parser; each keeps its `catch` so a regression still names itself on
 # a platform that survives the overflow (`=PROPAGATED:StackOverflowError`).
 steps = [
-    # 0. The control (#301): the prelude and nothing else, no overflow.
-    ("CONTROL", raw"""
-println("CONTROL=OK")
-""", ["CONTROL=OK"]),
+    # 0. The limit itself, on a request-sized stack (#301). 512 levels -- the deepest document
+    # the bound admits -- through the untyped parse (the shallowest to overflow, at ~3,100), a
+    # typed one and an object one, on a `Threads.@spawn` task like a real request. The bound is
+    # only a fix if what it lets through is safe on every host, and this runs on every CI host.
+    ("AT_LIMIT", raw"""
+arrays = repeat("[", 512) * repeat("]", 512)
+q = string(Char(34))   # a double quote, spelled without one -- see the raw-string note above
+objects = repeat("{" * q * "a" * q * ":", 512) * "1" * repeat("}", 512)
+jreq(s) = HTTP.Request("POST", "/j", ["Content-Type" => "application/json"], s)
+try
+    ok = fetch(Threads.@spawn (json(jreq(arrays)) !== nothing &&
+                               json(jreq(arrays), Vector{Any}) isa Vector{Any} &&
+                               json(jreq(objects)) !== nothing &&
+                               json(jreq(objects), Dict{String, Any}) isa Dict{String, Any}))
+    println("AT_LIMIT=", ok ? "PARSED" : "REJECTED")
+catch e
+    println("AT_LIMIT=PROPAGATED:", typeof(e))
+end
+""", ["AT_LIMIT=PARSED"]),
 
     # 1. The parser itself: too deep is malformed, and malformed is `nothing`.
     ("PARSER", raw"""
@@ -617,7 +633,7 @@ function child_failure(step, r)
     lines = split(r.out, '\n')
     loaded = findfirst(startswith("LOADED "), lines)
     stage = loaded === nothing ?
-        "died BEFORE LOADED -- while starting Julia or loading Nitro, not at this step's overflow" :
+        "died BEFORE LOADED -- while starting Julia or loading Nitro, not in this step's code" :
         "reached $(lines[loaded]) -- died in this step's own code"
     reached = filter(l -> occursin(r"^[A-Z_]+=", l), lines)
     last_line = isempty(reached) ? "none -- died before its first result line" : last(reached)
@@ -625,8 +641,9 @@ function child_failure(step, r)
            "stdout: $(repr(r.out)); stderr tail: $(repr(last(r.err, 2000)))"
 end
 
-# The diagnoser is the deliverable of #301, and it runs for real only on a crash no other
-# platform reproduces -- so pin its one distinction here rather than find it broken there.
+# The diagnoser answered #301, and from now on it runs for real only if the bound regresses on
+# a host where the overflow kills the process -- so pin its one distinction here rather than
+# find it broken there.
 @testset "child_failure names which side of LOADED a child died on" begin
     crashed(out) = (; exitcode=0xC00000FD, termsignal=0, out, err="")
     @test contains(child_failure("X", crashed("")), "died BEFORE LOADED")
