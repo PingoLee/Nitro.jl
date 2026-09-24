@@ -951,3 +951,54 @@ end
 @test send("""{"user":"u"}""").status == 400                       # wrong shape
 @test send("""{"user":"u","password":"p"}""").status == 200
 end
+
+@testitem "Body parsers -- the body is read in place and never emptied (#327)" tags=[:core] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+
+# Every reader used to start from its own copy of the body, and `text` made a second:
+# `payload(req)` -- or CSRF reading the form and then the JSON -- made ~4 transient copies of a
+# 64 MiB body. They now read a view in place. The danger that creates is `String(::Vector)`,
+# which takes over the vector and leaves it EMPTY: one such call and every later reader of the
+# request would see no body. Both storage shapes are covered -- a `String` body (tests, clients)
+# and a `Vector{UInt8}` body (what the server's stream reader builds).
+body = """{"a":1,"b":"x=y"}"""
+for (shape, make) in (("String", () -> HTTP.Request("POST", "/", ["Content-Type" => "application/json"], body)),
+                      ("Vector", () -> HTTP.Request("POST", "/", ["Content-Type" => "application/json"], Vector{UInt8}(body))))
+    @testset "$shape body" begin
+        req = make()
+        n = length(req.body.data)
+        @test text(req) == body
+        @test text(req) == body
+        @test json(req)["a"] == 1
+        @test getjson(req)["b"] == "x=y"
+        @test formdata(req) isa Dict
+        bytes = binary(req)
+        bytes[1] = UInt8('X')                     # the caller owns what `binary` returns
+        @test length(req.body.data) == n
+        @test text(req) == body
+        @test payload(req)["a"] == 1
+    end
+end
+
+@testset "a Response body is not emptied either" begin
+    res = HTTP.Response(200, Vector{UInt8}("hello=world"))
+    @test text(res) == "hello=world"
+    @test text(res) == "hello=world"
+    @test formdata(res) == Dict("hello" => "world")
+    @test binary(res) == Vector{UInt8}("hello=world")
+    @test text(res) == "hello=world"
+end
+
+@testset "text() makes one copy of a byte body, not two" begin
+    big = Vector{UInt8}(repeat("a", 1 << 20))
+    req = HTTP.Request("POST", "/", [], big)
+    text(req)                                    # compile
+    @test (@allocated text(req)) < 1.5 * (1 << 20)
+    # A String body needs no copy at all.
+    sreq = HTTP.Request("POST", "/", [], repeat("a", 1 << 20))
+    text(sreq)
+    @test (@allocated text(sreq)) < 1024
+end
+end

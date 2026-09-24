@@ -6,12 +6,12 @@ using HTTP
 using Dates
 
 using ..Util: text, json, formdata, multipart, parseparam, FormFile
-using ..Util.BodyParsers: NITRO_READ_STYLE, _parse_json_bounded, is_json_media_type,
+using ..Util.BodyParsers: NITRO_READ_STYLE, _parse_json_bounded, _body_view, is_json_media_type,
     is_multipart_form_media_type
 using ..Reflection: struct_builder, extract_struct_info, kw_construct
 using ..Errors: ValidationError, UnsupportedMediaTypeError, is_unrecoverable
-# The Core stub `getjson` binds to (its body is in core/request.jl, included later).
-using ...Core: getjson
+# The Core stubs `getjson`/`getform` bind to (their bodies are in core/request.jl, included later).
+using ...Core: getjson, getform
 using ..Types
 using ..Cookies
 using ..Crypto: SecretString
@@ -350,7 +350,9 @@ Extracts a JSON object from a request and converts it into a custom struct
 function extract(param::Param{Json{T}}, request::LazyRequest) :: Json{T} where {T}
     require_json_media_type(param, request)
     instance = safe_extract(param) do
-        json_bind(T, textbody(request))
+        # Straight from the body's bytes: `textbody` would copy the whole body into a `String`
+        # first, only for JSON.jl to read it back as bytes (#327).
+        json_bind(T, _body_view(request.request.body))
     end
     valid_instance = try_validate(param, instance)
     return Json{T}(valid_instance, nothing)
@@ -380,7 +382,7 @@ Both parses go through `_parse_json_bounded`, so a body nested deeper than 512 i
 both use Nitro's read style, which never interns a client string as a `Symbol` (#306): JSON.jl's
 default style did so for every enum field, valid name or not.
 """
-function json_bind(::Type{T}, text::AbstractString) :: T where {T}
+function json_bind(::Type{T}, text::Union{AbstractString, AbstractVector{UInt8}}) :: T where {T}
     binds_by_keyword(T) || return _parse_json_bounded(text, T; style = NITRO_READ_STYLE)
     fields = _parse_json_bounded(text, Dict{String, JSON.JSONText}; style = NITRO_READ_STYLE)
     kwargs = Pair{Symbol, Any}[]
@@ -438,7 +440,9 @@ end
 Extracts a Form from a request and converts it into a custom struct
 """
 function extract(param::Param{Form{T}}, request::LazyRequest) :: Form{T} where {T}
-    form = Types.formbody(request)
+    # The cached `getform`, so a handler that also reads `getform`/`payload` -- or CSRFMiddleware,
+    # which reads the form for its token -- does not parse the body again (#327).
+    form = getform(request.request)
     instance = safe_extract(param) do 
         struct_builder(T, form) 
     end

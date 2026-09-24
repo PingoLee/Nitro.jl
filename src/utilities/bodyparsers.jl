@@ -129,23 +129,39 @@ function _interns(@nospecialize(T), seen::Base.IdSet{Any}) :: Bool
 end
 
 # HTTP.jl v2 replaced the raw `Vector{UInt8}` request body (and `HTTP.payload`) with the
-# `AbstractBody` hierarchy. Extract the bytes without consuming the body cursor so the
+# `AbstractBody` hierarchy. Read the bytes without consuming the body cursor so the
 # same request body can be read more than once (e.g. `.json` and `.form`). Responses may
 # additionally retain their body as a raw `Vector{UInt8}` or `String` (v2 keeps byte/string
 # bodies as-is so fixtures can inspect `response.body` directly), so handle those too.
-_body_bytes(::HTTP.EmptyBody) = UInt8[]
-_body_bytes(body::HTTP.BytesBody) = Vector{UInt8}(body.data)
-_body_bytes(::Nothing) = UInt8[]
-_body_bytes(body::AbstractVector{UInt8}) = Vector{UInt8}(body)
-_body_bytes(body::AbstractString) = Vector{UInt8}(codeunits(String(body)))
+#
+# A VIEW of the body's bytes, never a copy (#327). Every reader used to start from its own
+# `Vector{UInt8}` copy, and `text` made a second, so `payload(req)` -- or CSRF reading the form
+# and then the JSON -- made about four transient copies: ~256 MB for one 64 MiB body. The
+# parsers now read this view in place and copy only what they hand out.
+#
+# It must never reach `String(::Vector{UInt8})`: that constructor takes over the vector's memory
+# and leaves the vector EMPTY, which here would erase the request body for every later reader.
+# `_view_string` is the one sanctioned way to a `String`.
+_body_view(::HTTP.EmptyBody) = UInt8[]
+_body_view(body::HTTP.BytesBody) = body.data
+_body_view(::Nothing) = UInt8[]
+_body_view(body::AbstractVector{UInt8}) = body
+_body_view(body::AbstractString) = codeunits(body)
+
+# The body as a `String`: no copy when it already is one (a `String` body is stored as its code
+# units), otherwise exactly one. Not `String(Vector{UInt8}(bytes))`: on Julia 1.12 that copies
+# twice, because `String(::Vector)` still copies memory not allocated for a string.
+_view_string(bytes::Base.CodeUnits{UInt8, String}) = bytes.s
+_view_string(bytes::DenseVector{UInt8}) = GC.@preserve bytes unsafe_string(pointer(bytes), length(bytes))
+_view_string(bytes::AbstractVector{UInt8}) = String(collect(bytes))
 
 function _request_payload(req::HTTP.Request)
-    payload = _body_bytes(req.body)
+    payload = _body_view(req.body)
     return isempty(payload) ? nothing : payload
 end
 
 function _request_payload(res::HTTP.Response)
-    payload = _body_bytes(res.body)
+    payload = _body_view(res.body)
     return isempty(payload) ? nothing : payload
 end
 
@@ -281,13 +297,11 @@ end
 Read the body of a HTTP.Request as a String
 """
 function text(req::HTTP.Request) :: String
-    body = IOBuffer(_body_bytes(req.body))
-    return eof(body) ? "" : read(seekstart(body), String)
+    return _view_string(_body_view(req.body))
 end
 
 function text(res::HTTP.Response) :: String
-    payload = _request_payload(res)
-    return isnothing(payload) ? "" : String(payload)
+    return _view_string(_body_view(res.body))
 end
 
 
@@ -336,19 +350,13 @@ end
 
 Read the body of a HTTP.Request as a Vector{UInt8}
 """
+# A fresh vector the caller owns: mutating it never touches the body other readers see.
 function binary(req::HTTP.Request) :: Vector{UInt8}
-    body = IOBuffer(_body_bytes(req.body))
-    return eof(body) ? UInt8[] : readavailable(body)
+    return Vector{UInt8}(_body_view(req.body))
 end
 
 function binary(res::HTTP.Response) :: Vector{UInt8}
-    payload = _request_payload(res)
-    if isnothing(payload)
-        return UInt8[]
-    elseif payload isa AbstractVector{UInt8}
-        return Vector{UInt8}(payload)
-    end
-    return Vector{UInt8}(codeunits(String(payload)))
+    return Vector{UInt8}(_body_view(res.body))
 end
 
 
