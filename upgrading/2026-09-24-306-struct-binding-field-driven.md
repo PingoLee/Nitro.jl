@@ -28,6 +28,12 @@ key that is not a field is never touched.
 A struct that uses StructUtils' own field tags or defaults (`@tags`, `@defaults`, `StructUtils.@kwarg`)
 is unaffected: typed JSON still hands it to JSON.jl whole.
 
+**If you used `StructTypes.excludes` as a deny-list, it no longer protects anything.** A mutable
+struct bound through `Form{T}`/`Query{T}`/`JsonFragment{T}` with
+`StructTypes.excludes(::Type{User}) = (:is_admin,)` used to skip that field; every field is now
+bound by name, so a client that sends `is_admin=true` sets it. Bind requests to a separate input
+struct that has no privileged fields, and assign those server-side.
+
 Typed request JSON is now parsed with a Nitro style rather than JSON.jl's `DefaultStyle`. A
 StructUtils method your app defines for the **abstract** `StructStyle`, or the style-less
 `StructUtils.lift(::Type{MyType}, x)` form, still applies. One written specifically for
@@ -36,8 +42,10 @@ StructUtils method your app defines for the **abstract** `StructStyle`, or the s
 ### How to find the calls to migrate
 
 ```bash
-# Binding customized through StructTypes -- no longer read.
+# Binding customized through StructTypes -- no longer read. `excludes` above all: a field it
+# kept out of binding is now bound from the request.
 rg -n 'StructTypes\.' <app>/src
+rg -n 'StructTypes\.excludes' <app>/src
 
 # StructUtils customizations pinned to JSON.jl's default style.
 rg -n 'StructUtils\.(lift|liftkey|make)\(\s*::\s*(StructUtils\.DefaultStyle|JSON\.JSONStyle)' <app>/src
