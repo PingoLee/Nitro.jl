@@ -116,9 +116,13 @@ Extractor that parses the whole request body as JSON into `T`. This is the recom
 take a JSON body: typed, validated, and a malformed body is a 400.
 
 ```julia
-struct Search; q::String; limit::Int; end
+@kwdef struct Search; q::String; limit::Int = 20; end
 path("/search", (req, s::Json{Search}) -> Res.json(s.payload); method = "POST")
 ```
+
+With a `@kwdef` struct, a field the body omits takes its declared default: `{"q":"lamp"}` binds
+`limit = 20`, while a body without `q` is a 400. An omitted field with no default binds `nothing`
+(or `missing`) if its type admits one. A plain struct needs every field.
 
 Attach a validator by giving the parameter a default: `s = Json(Search, s -> s.limit <= 100)`.
 The *Request Body* guide has the walkthrough; use [`JsonFragment`](@ref) to bind one top-level
@@ -242,8 +246,13 @@ function try_validate(param::Param{U}, instance::T) :: T where {T, U <: Extracto
         throw(ValidationError("Validation failed for parameter '$(param.name)': $T rejected by $impl"))
     end
 
-    # Case 2: Use custom validate function from an Extractor (if defined)
-    if param.hasdefault && param.default isa U && !isnothing(param.default.validate)
+    # Case 2: Use custom validate function from an Extractor (if defined).
+    #
+    # `hasfield` because not every extractor carries one: `Cookie{T}` did not until #293,
+    # and `ProtoBuffer{T}` (src/exts.jl) still does not. Reading `.validate` off such a
+    # default was a `FieldError`, which is not a `ValidationError`, so the route answered
+    # 500 whenever the value was present. It folds to a constant for a concrete `U`.
+    if param.hasdefault && param.default isa U && hasfield(U, :validate) && !isnothing(param.default.validate)
         if !param.default.validate(instance)
             impl = Base.which(param.default.validate, (T,))
             throw(ValidationError("Validation failed for parameter '$(param.name)': $T rejected by $impl"))
@@ -298,10 +307,80 @@ Extracts a JSON object from a request and converts it into a custom struct
 """
 function extract(param::Param{Json{T}}, request::LazyRequest) :: Json{T} where {T}
     instance = safe_extract(param) do
-        JSON.parse(textbody(request), T) 
+        json_bind(T, textbody(request))
     end
     valid_instance = try_validate(param, instance)
     return Json(valid_instance)
+end
+
+"""
+    json_bind(T, text) :: T
+
+`JSON.parse(text, T)`, except that a `@kwdef` struct is built through its keyword constructor, so
+a field the body omits takes its declared default (#294). JSON.jl 1.x knows only StructUtils-style
+defaults, not `Base.@kwdef`'s, and answers a partial body with "field has no default and is absent
+from the source" -- while `Query{T}`, `Form{T}` and `JsonFragment{T}` already honored the defaults
+through `struct_builder`.
+
+Each present field is still parsed by `JSON.parse` against its own declared type, so field values
+bind exactly as they do for a plain struct. The body is parsed strictly first, as an object of raw
+field texts, so a malformed or trailing-garbage body is rejected as before. A `@kwdef` struct
+nested directly as a field is bound the same way; one inside a container or a `Union` follows
+JSON.jl's own rules.
+
+A struct that already speaks StructUtils -- field tags or defaults, as `StructUtils.@kwarg`,
+`@tags` and `@defaults` declare -- is left to `JSON.parse` whole: JSON.jl honors those itself, and
+the per-field path would drop the tags, so a renamed key would silently bind the field's default.
+"""
+function json_bind(::Type{T}, text::AbstractString) :: T where {T}
+    binds_by_keyword(T) || return JSON.parse(text, T)
+    fields = JSON.parse(text, Dict{String, JSON.JSONText})
+    kwargs = Pair{Symbol, Any}[]
+    for name in fieldnames(T)
+        raw = get(fields, String(name), nothing)
+        isnothing(raw) && continue
+        push!(kwargs, name => json_bind(fieldtype(T, name), raw.value))
+    end
+    return kw_construct(T, kwargs)
+end
+
+# Runs once per `Json{T}` request, so it is ordered cheapest first. The StructUtils queries are
+# plain dispatch and fold for a concrete `T`; `hasmethod` with keyword names is the same
+# `@kwdef` test `multipart_struct_builder` uses, several times cheaper than
+# `Reflection.has_kwdef_constructor`'s scan of `methods(T)`. StructUtils is reached through
+# JSON, whose typed-parse API is built on it, so it is not a dependency of Nitro's own.
+const _SU = JSON.StructUtils
+function binds_by_keyword(::Type{T}) :: Bool where {T}
+    T isa DataType && isstructtype(T) || return false
+    style = _SU.DefaultStyle()
+    isempty(_SU.fieldtags(style, T)) && isempty(_SU.fielddefaults(style, T)) || return false
+    return hasmethod(T, Tuple{}, fieldnames(T))
+end
+
+# Absent fields follow JSON.jl's own rule: the declared default, else the null the field's type
+# admits, else an error. The keyword constructor applies every default itself, so a field it
+# reports as undefined has none -- fill in the null if its type takes one and try again. Each
+# pass adds a field that was not there before, so this runs at most `fieldcount(T)` times.
+function kw_construct(::Type{T}, kwargs::Vector{Pair{Symbol, Any}}) :: T where {T}
+    while true
+        try
+            return T(; kwargs...)
+        catch e
+            e isa UndefKeywordError || rethrow()
+            name = e.var
+            # Only a keyword of `T`'s own constructor that we did not pass -- anything else was
+            # thrown from deeper inside a default expression and is not ours to answer.
+            (name in fieldnames(T) && !any(p -> p.first === name, kwargs)) || rethrow()
+            ftype = fieldtype(T, name)
+            if Nothing <: ftype
+                push!(kwargs, name => nothing)
+            elseif Missing <: ftype
+                push!(kwargs, name => missing)
+            else
+                throw(ValidationError("Missing required field '$name'"))
+            end
+        end
+    end
 end
 
 """

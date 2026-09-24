@@ -827,6 +827,203 @@ end
 end
 
 
+# -- #293 -----------------------------------------------------------------------------------
+#
+# A `Cookie(name, T)` default is how a `Cookie{T}` parameter reads a cookie under a name other
+# than its own. `try_validate` read `.validate` off every extractor default, and `Cookie` had
+# no such field, so the route answered 500 whenever the cookie was *present*. The absent case
+# returns before `try_validate`, which is why the direct-call test in cookies_tests.jl never
+# saw it -- these go through a real route.
+@testitem "Cookie{T} with a Cookie(name, T) default (#293)" tags=[:core] setup=[NitroCommon] begin
+
+using Test
+using HTTP
+using Nitro
+using Nitro: path, Cookie
+
+ctx = Nitro.Core.App()
+Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+    path("/renamed", (req, theme::Cookie{String} = Cookie("ui-theme", String)) ->
+        Res.send(something(theme.value, "absent"))),
+    path("/validated", (req, theme::Cookie{String} = Cookie("ui-theme", String, t -> t in ("light", "dark"))) ->
+        Res.send(something(theme.value, "absent"))),
+    path("/typed", (req, n::Cookie{Int} = Cookie("count", Int)) ->
+        Res.send(string(something(n.value, -1)))),
+])
+get_(t, cookie=nothing) = Nitro.Core.internalrequest(ctx,
+    HTTP.Request("GET", t, isnothing(cookie) ? Pair{String,String}[] : ["Cookie" => cookie]))
+
+@testset "reads the named cookie, present or absent" begin
+    r = get_("/renamed", "ui-theme=blue")
+    @test r.status == 200
+    @test Nitro.text(r) == "blue"
+    @test Nitro.text(get_("/renamed")) == "absent"
+    # The default's name replaces the parameter's -- a cookie called `theme` is not read.
+    @test Nitro.text(get_("/renamed", "theme=blue")) == "absent"
+end
+
+@testset "the default's validator runs on a present cookie" begin
+    @test Nitro.text(get_("/validated", "ui-theme=dark")) == "dark"
+    @test get_("/validated", "ui-theme=blue").status == 400
+    @test Nitro.text(get_("/validated")) == "absent"
+end
+
+@testset "the value parses as T" begin
+    @test Nitro.text(get_("/typed", "count=7")) == "7"
+    @test get_("/typed", "count=seven").status == 400
+end
+
+@testset "constructors carry the validator" begin
+    f = t -> true
+    @test Cookie("a", String).validate === nothing
+    @test Cookie("a", String, f).validate === f
+    @test Cookie("a", "v", f).value == "v"
+    @test Cookie{Int}("a", 3, f).validate === f
+    @test Cookie{Int}("a").value === nothing
+end
+
+# The class, not just `Cookie`: an extractor type with no `validate` field (`ProtoBuffer{T}`
+# is one) must not turn its own default into a 500.
+struct NoValidatorExtractor{T} <: Nitro.Types.Extractor{T}
+    payload::T
+end
+@testset "try_validate tolerates an extractor with no validate field" begin
+    param = Nitro.Types.Param(name=:x, type=NoValidatorExtractor{Int},
+                              default=NoValidatorExtractor(1), hasdefault=true)
+    @test Nitro.Core.Extractors.try_validate(param, 5) == 5
+end
+
+end
+
+
+# -- #294 -----------------------------------------------------------------------------------
+#
+# JSON.jl 1.x knows StructUtils-style defaults, not `Base.@kwdef`'s, so `Json{T}` answered a body
+# that omitted a defaulted field with a 400 -- including the Request Body tutorial's own
+# `ProductSearch` example. `Query{T}`/`Form{T}`/`JsonFragment{T}` go through `struct_builder` and
+# always honored the defaults.
+@testitem "Json{T} honors @kwdef field defaults (#294)" tags=[:core] setup=[NitroCommon] begin
+
+using Test
+using HTTP
+using JSON
+using Nitro
+using Nitro: path
+
+# The tutorial's struct, verbatim.
+@kwdef struct ProductSearch
+    name     :: String = ""
+    category :: String = ""
+    limit    :: Int    = 20
+end
+@kwdef struct Paging
+    page :: Int = 1
+    size :: Int = 10
+end
+@kwdef struct Mixed
+    id     :: Int                              # required
+    note   :: Union{String, Nothing}           # no default, but admits `nothing`
+    label  :: Union{String, Nothing} = "none"  # a default beats the null
+    paging :: Paging = Paging()
+    tags   :: Vector{String} = String[]
+    scale  :: Float64 = id * 2.0               # a default computed from another field
+end
+struct Plain; q::String; limit::Int; end
+
+ctx = Nitro.Core.App()
+Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+    path("/search", (req, s::Json{ProductSearch}) -> Res.json(s.payload); method = "POST"),
+    path("/validated", (req, s = Json(ProductSearch, q -> !isempty(q.name) || !isempty(q.category))) ->
+        Res.json(s.payload); method = "POST"),
+    path("/mixed", (req, m::Json{Mixed}) -> Res.json(m.payload); method = "POST"),
+    path("/plain", (req, p::Json{Plain}) -> Res.json(p.payload); method = "POST"),
+])
+post(t, body) = Nitro.Core.internalrequest(ctx, HTTP.Request("POST", t, [], body))
+bound(r) = JSON.parse(Nitro.text(r))
+
+@testset "a partial body binds, absent fields take their defaults" begin
+    r = post("/search", """{"name":"lamp"}""")
+    @test r.status == 200
+    @test bound(r) == Dict("name" => "lamp", "category" => "", "limit" => 20)
+    @test bound(post("/search", "{}")) == Dict("name" => "", "category" => "", "limit" => 20)
+    # A full body is unchanged, and an unknown key is still ignored.
+    @test bound(post("/search", """{"name":"a","category":"b","limit":5,"extra":1}""")) ==
+          Dict("name" => "a", "category" => "b", "limit" => 5)
+end
+
+@testset "the tutorial's inline validator sees the partial body" begin
+    @test post("/validated", """{"category":"tools"}""").status == 200
+    @test post("/validated", """{"limit":3}""").status == 400
+end
+
+@testset "a missing required field is still a 400" begin
+    @test post("/mixed", """{"note":"x"}""").status == 400
+end
+
+@testset "absent fields follow JSON.jl's rule: default, else null" begin
+    m = bound(post("/mixed", """{"id":2}"""))
+    @test m["id"] == 2
+    @test m["note"] === nothing
+    @test m["label"] == "none"
+    @test m["paging"] == Dict("page" => 1, "size" => 10)
+    @test m["tags"] == String[]
+    @test m["scale"] == 4.0
+end
+
+@testset "a directly nested @kwdef struct binds partially too" begin
+    m = bound(post("/mixed", """{"id":1,"paging":{"size":50},"tags":["a"],"label":null}"""))
+    @test m["paging"] == Dict("page" => 1, "size" => 50)
+    @test m["tags"] == ["a"]
+    @test m["label"] === nothing   # a present `null` is a value, not an absence
+end
+
+@testset "malformed and mistyped bodies are still 400s" begin
+    @test post("/search", """{"name":"a"} trailing""").status == 400
+    @test post("/search", """{"name":""").status == 400
+    @test post("/search", "[1,2]").status == 400
+    @test post("/search", "").status == 400
+    @test post("/search", """{"limit":"many"}""").status == 400
+    @test post("/mixed", """{"id":1,"paging":{"size":"big"}}""").status == 400
+end
+
+@testset "a plain struct is unchanged -- every field is required" begin
+    @test bound(post("/plain", """{"q":"x","limit":1}""")) == Dict("q" => "x", "limit" => 1)
+    @test post("/plain", """{"q":"x"}""").status == 400
+end
+
+@kwdef struct WithMissing; id::Int; m::Union{Int, Missing}; end
+@testset "absent-field fill reaches `missing` too" begin
+    w = Nitro.Core.Extractors.json_bind(WithMissing, """{"id":1}""")
+    @test w.id == 1
+    @test w.m === missing
+end
+
+# A struct that already speaks StructUtils is JSON.jl's to bind: its field tags must survive.
+# Taking the per-field path dropped them, so `{"bee":"y"}` bound the default "x" with a 200.
+JSON.StructUtils.@kwarg struct Tagged
+    a :: Int    = 3
+    b :: String = "x" &(json=(name="bee",),)
+end
+@testset "StructUtils field tags are honored, not dropped" begin
+    @test Nitro.Core.Extractors.json_bind(Tagged, """{"bee":"y"}""") == JSON.parse("""{"bee":"y"}""", Tagged)
+    @test Nitro.Core.Extractors.json_bind(Tagged, """{"bee":"y"}""").b == "y"
+    @test Nitro.Core.Extractors.json_bind(Tagged, "{}") == Tagged(3, "x")
+end
+
+@testset "the missing-field error names the field, never a value" begin
+    err = try
+        Nitro.Core.Extractors.json_bind(Mixed, """{"note":"secret-value"}""")
+    catch e
+        e
+    end
+    @test err isa Nitro.Core.Errors.ValidationError
+    @test occursin("'id'", sprint(showerror, err))
+    @test !occursin("secret-value", sprint(showerror, err))
+end
+
+end
+
+
 # -- #254 -----------------------------------------------------------------------------------
 #
 # The `Session` extractor looks a session id up in an application-supplied store through a
