@@ -446,7 +446,7 @@ using Nitro: App, Query, Body, MultipartForm, Nullable
 # parse method -- whose `parse` on a union recurses in Base's `tryparse` until the stack
 # overflows: a 500 flagged "program state may be corrupted", on every request.
 @test Nitro.parseparam(Union{Float32, Float64}, "1.5") === 1.5f0
-@test_throws Exception Nitro.parseparam(Union{Float32, Float64}, "nan")
+@test_throws ValidationError Nitro.parseparam(Union{Float32, Float64}, "nan")
 
 @kwdef struct UnionAmount
     amount::Union{Float32, Float64} = 0.0
@@ -519,4 +519,11 @@ end
 @test haskey(_INTERNS_CACHE, Walked)
 @test interns_client_strings_cached(Walked) === false
 @test (@allocated interns_client_strings_cached(Walked)) < 256
+# ...and `json(req, T)` is what consults it.
+struct ViaJson
+    a::Int
+end
+@test !haskey(_INTERNS_CACHE, ViaJson)
+@test json(HTTP.Request("POST", "/", ["Content-Type" => "application/json"], """{"a":1}"""), ViaJson).a == 1
+@test haskey(_INTERNS_CACHE, ViaJson)
 end
