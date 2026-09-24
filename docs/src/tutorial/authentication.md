@@ -74,7 +74,10 @@ The contract:
 - **The claim guards resolve claims in three steps.** `claim_required` (and its
   `role_required`/`permission_required` aliases) reads `req.context[:user]` when it is
   dict-like; otherwise `req.context[:auth_claims]`; otherwise the raw `getsession(req)` dict,
-  which serves session-based apps.
+  which serves session-based apps — but only while it is logged in: it must carry the login
+  marker (`session_key`, default `"user_id"`) with an identity as its value, the same test
+  `login_required` applies. A logout that clears `user_id` but leaves `role` behind authorizes
+  nothing. Pass the same `session_key` to both guards if your login writes a different key.
 - **A dict-like `:user` is authoritative, and an absent claim means denial.** It is *not*
   topped up from `:auth_claims`: the token's claims are verified but **stale**, while your
   user object is the result of a fresh lookup, so a demoted user's unexpired `role=admin`

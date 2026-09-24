@@ -233,9 +233,10 @@ using Nitro: GuardMiddleware, login_required, role_required, permission_required
             req_ok.context[:user] = Dict{String,Any}("action" => "reports:generate")
             @test isnothing(guard(req_ok))
 
-            # Session fallback (session-based apps store claims in the session dict)
+            # Session fallback (session-based apps store claims in the session dict) — only
+            # for a logged-in session, one carrying the login marker (#337)
             req_session = HTTP.Request("GET", "/test")
-            req_session.context[:session] = Dict{String,Any}("action" => "reports:generate")
+            req_session.context[:session] = Dict{String,Any}("user_id" => 1, "action" => "reports:generate")
             @test isnothing(guard(req_session))
         end
 
@@ -327,10 +328,11 @@ using Nitro: GuardMiddleware, login_required, role_required, permission_required
 
         # `:user` is the VOUCHING slot, and only it gates the session fallback. A non-dict
         # `:auth_claims` is not a claims source and vouches for nothing, so with no `:user`
-        # the session is still consulted...
+        # the session is still consulted... (it carries the login marker: since #337 a
+        # session without one is no claims source at all, which is not what this checks)
         req_bad_claims_session = HTTP.Request("GET", "/test")
         req_bad_claims_session.context[:auth_claims] = "not-a-claims-object"
-        req_bad_claims_session.context[:session] = Dict{String,Any}("role" => "admin")
+        req_bad_claims_session.context[:session] = Dict{String,Any}("user_id" => 7, "role" => "admin")
         @test isnothing(role_required("admin")(req_bad_claims_session))
 
         # ...whereas a non-dict `:user` does gate it, whatever `:auth_claims` holds.
@@ -358,6 +360,55 @@ using Nitro: GuardMiddleware, login_required, role_required, permission_required
         # struct identity still authenticates regardless of `:auth_claims`.
         @test isnothing(login_required()(req))
         @test isnothing(login_required()(req_session))
+    end
+
+    # #337: the raw session is a claims source only while it carries the login marker —
+    # the same `_is_identity` test `login_required` applies. Before, any session dict was,
+    # so a logout that dropped `user_id` but kept `role` stayed authorized as that role.
+    @testset "claim guards gate the session fallback on the login marker (#337)" begin
+        session_req(data) = (r = HTTP.Request("GET", "/test"); r.context[:session] = data; r)
+
+        # Never logged in: claim-like keys alone authorize nothing.
+        @test role_required("admin")(session_req(Dict{String,Any}("role" => "admin"))).status == 403
+
+        # The issue's scenario: a logout that deleted or nulled the marker, keeping `role`.
+        for bogus in (nothing, false, "")
+            req = session_req(Dict{String,Any}("user_id" => bogus, "role" => "admin",
+                                               "permissions" => ["reports:read"]))
+            @test role_required("admin")(req).status == 403
+            @test permission_required("reports:read")(req).status == 403
+            @test claim_required("role", "admin")(req).status == 403
+        end
+
+        # Logged in: the session still serves session-based apps, whatever the id's shape.
+        for uid in (7, 0, "alice")
+            req = session_req(Dict{String,Any}("user_id" => uid, "role" => "admin",
+                                               "permissions" => ["reports:read"]))
+            @test isnothing(role_required("admin")(req))
+            @test isnothing(permission_required("reports:read")(req))
+            @test isnothing(claim_required("role", "admin")(req))
+            # ...and the marker gates the source, it does not grant the claim.
+            @test role_required("superuser")(req).status == 403
+        end
+        # The marker lookup falls back to a Symbol key, as `login_required`'s does; the claim
+        # itself is still read by its String name.
+        @test isnothing(role_required("admin")(session_req(Dict{Any,Any}(:user_id => 5, "role" => "admin"))))
+        @test role_required("admin")(session_req(Dict{Any,Any}(:user_id => nothing, "role" => "admin"))).status == 403
+
+        # A custom `session_key` is honored on every claim guard, and the default key is then
+        # not a login for it.
+        uid_session = Dict{String,Any}("uid" => 9, "role" => "admin", "permissions" => ["reports:read"])
+        @test isnothing(role_required("admin"; session_key = "uid")(session_req(uid_session)))
+        @test isnothing(permission_required("reports:read"; session_key = "uid")(session_req(uid_session)))
+        @test isnothing(claim_required("role", "admin"; session_key = "uid")(session_req(uid_session)))
+        @test role_required("admin")(session_req(uid_session)).status == 403
+        user_id_session = Dict{String,Any}("user_id" => 9, "role" => "admin")
+        @test role_required("admin"; session_key = "uid")(session_req(user_id_session)).status == 403
+
+        # Unchanged: an auth layer's `:user` is not subject to the session marker.
+        req_ctx = HTTP.Request("GET", "/test")
+        req_ctx.context[:user] = Dict{String,Any}("role" => "admin")
+        @test isnothing(role_required("admin")(req_ctx))
     end
 
     @testset "kid_required guard" begin
