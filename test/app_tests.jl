@@ -142,10 +142,11 @@ try
 
         req = Nitro.Request("GET", "/", ["Cookie" => split(raw, ';')[1]])
         @test get_cookie(app1, req, "sid") == "payload-app1"
-        # app2 has a different key, so it must not be able to read app1's cookie. Decryption
-        # under the wrong key raises rather than returning the default -- which is the correct
-        # loud failure, and the reason this asserts a throw instead of a value.
-        @test_throws Nitro.CookieError get_cookie(app2, req, "sid")
+        # app2 has a different key, so it must not be able to read app1's cookie. Since #309 a
+        # token that does not open under the key reads as ABSENT -- the default, `nothing` --
+        # rather than raising, so this asserts the value. It still discriminates a swap to
+        # `CONTEXT[]`: the global has no key, so it would hand back the raw token, not `nothing`.
+        @test get_cookie(app2, req, "sid") === nothing
 
         # `router` — the HOF route builder; protocol is `router(app, prefix)(path)(method)`.
         #

@@ -457,6 +457,12 @@ end
 """
 Get a cookie value by name from a Request or Response.
 Supports default values, type parsing, and decryption.
+
+With `encrypted = true` the value must be a token `set_cookie!` sealed under this key **for this
+cookie name**. One that does not open — tampered, sealed under another key, copied from another
+cookie, expired, or written before the current token format — reads as **absent**: the default
+is returned and the rejection is logged at `@debug`, never with the value (#309). Encrypting
+with no key at all is still a `CookieError`, since that is configuration rather than a bad cookie.
 """
 function get_cookie(
     source::Any, 
@@ -475,22 +481,25 @@ function get_cookie(
         return final_default
     end
 
+    # Validated BEFORE the lookup: a bad per-call key is configuration, and must fail on every
+    # call rather than only on the ones that happen to carry the cookie.
+    final_secret = isnothing(secret_key) ? config.secret_key : _cookie_secret(secret_key)
+
     target_name = string(name)
     headers = if source isa HTTP.Request || source isa HTTP.Response
         source.headers
     else
         source
     end
-    
+
     found_value = _get_cookie_lazy(headers, target_name)
-    
+
     if isnothing(found_value)
         return final_default
     end
-    
+
     raw_value = String(found_value)
 
-    final_secret = isnothing(secret_key) ? config.secret_key : _cookie_secret(secret_key)
     final_max_cookie_size = isnothing(max_cookie_size) ? config.max_cookie_size : max_cookie_size
 
     # Check size limit
@@ -503,7 +512,18 @@ function get_cookie(
         if isnothing(final_secret)
             throw(CookieError("Encrypted cookie access requires a non-empty secret_key"))
         end
-        decrypt_payload(final_secret, raw_value)
+        # A token that does not open is a cookie the client should not have -- the same as no
+        # cookie, which is what Rails and Plug answer too. It used to throw, so every client
+        # carrying a stale or junk cookie turned each request into a 500, and a format change
+        # would have done that to every client at once. `purpose` is the NAME: a token sealed
+        # for `language` does not open as `session_user`.
+        try
+            decrypt_payload(final_secret, raw_value; purpose = target_name)
+        catch e
+            e isa CookieError || rethrow()
+            @debug "Nitro: an encrypted cookie did not open; reading it as absent" cookie = target_name reason = e.msg
+            return final_default
+        end
     else
         raw_value
     end
@@ -634,7 +654,20 @@ function set_cookie!(
         if isnothing(final_secret)
             throw(CookieError("Encrypted cookie writes require a non-empty secret_key"))
         end
-        encrypt_payload(final_secret, str_value)
+        # The token carries the lifetime the browser is told, so the server enforces it too
+        # (#309): `Max-Age` alone is a hint, and a captured cookie used to decrypt forever.
+        # Max-Age wins over Expires, as it does in the browser. A cookie with neither has no
+        # server-side expiry -- set `maxage` (per cookie, or in `configcookies`) to bound it.
+        issued = Dates.now(Dates.UTC)
+        sealed_until = if !isnothing(final_maxage)
+            issued + Dates.Second(final_maxage)
+        elseif final_expires isa DateTime
+            final_expires
+        else
+            nothing
+        end
+        encrypt_payload(final_secret, str_value; purpose = string(name), expires = sealed_until,
+                        now = issued)
     else
         str_value
     end

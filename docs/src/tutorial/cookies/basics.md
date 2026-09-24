@@ -1,4 +1,4 @@
-﻿# Working with Cookies
+# Working with Cookies
 
 Cookies are fundamental for maintaining state in web applications. Nitro provides a secure and flexible interface for handling them, including automatic encryption, configuration defaults, and protection against common attacks (XSS/CSRF).
 
@@ -6,31 +6,40 @@ Cookies are fundamental for maintaining state in web applications. Nitro provide
 
 ```julia
 using Nitro
-using Base64
-using HTTP
 
-# 1. Set a cookie
-function login(req)
-    res = Response("Logged in")
-    # Sets an encrypted cookie by default if secret_key is configured
-    set_cookie!(res, "session_user", "alice", maxage=3600)
+# The key comes from the environment, never from source, and must be at least 32 random
+# bytes. Generate one once: julia -e 'using Nitro; println(bytes2hex(Nitro.Crypto.secure_random_bytes(32)))'
+configcookies(secret_key = SecretString(ENV["COOKIE_SECRET"]))
+
+# 1. Set a cookie — encrypted, because a key is configured
+function save_theme(req)
+    res = Res.send("Theme saved")
+    set_cookie!(res, "theme", get(getquery(req), "theme", "light"), maxage=30 * 24 * 3600)
     return res
 end
 
-# 2. Read a cookie
-function dashboard(req)
-    # Reads and automatically decrypts the cookie
-    user = get_cookie(req, "session_user")
-    return "Hello, $user"
+# 2. Read it back — decrypted. A cookie that does not open reads as the default.
+function preferences(req)
+    theme = get_cookie(req, "theme", "light")
+    return Res.json(Dict("theme" => theme))
 end
 
 urlpatterns("",
-    path("/login", login, method="GET"),
-    path("/dashboard", dashboard, method="GET"),
+    path("/theme", save_theme, method="POST"),
+    path("/preferences", preferences, method="GET"),
 )
 
 serve()
 ```
+
+!!! warning "Do not keep who the user is in a cookie"
+    A cookie — encrypted or not — is the wrong place for a login. Nitro cannot revoke it, so a
+    copy keeps working after logout until it expires, and a cookie with no key is plain text
+    the client can simply rewrite. For identity use
+    [`SessionMiddleware`](sessions.md), where the cookie is only a random id and the data
+    stays on the server, or a JWT with an `exp` claim — see
+    [Sessions and Auth](../sessions_and_auth.md). Use cookies for preferences and other state
+    that is harmless in the client's hands.
 
 ## Basic Usage
 
@@ -47,19 +56,19 @@ set_cookie!(response, name, value; kwargs...)
 | `response` | The `HTTP.Response` object to modify | Required |
 | `name` | Name of the cookie (String) | Required |
 | `value` | Value to store (String, Int, Bool) | Required |
-| `maxage` | Lifetime in seconds | `nothing` (Session) |
+| `maxage` | Lifetime in seconds — also enforced on the server for an encrypted cookie | `nothing` (Session) |
 | `httponly` | Prevent JavaScript access | `true` |
-| `encrypted` | Encrypt the value | `false` (unless configured) |
+| `encrypted` | Encrypt the value | `true` when a `secret_key` is configured, else `false` |
 
 **Example:**
 ```julia
-res = Response("Cookie set")
+res = Res.send("Cookie set")
 
-# Simple value
-set_cookie!(res, "theme", "dark", httponly=false)
+# Simple value, readable by JavaScript
+set_cookie!(res, "theme", "dark", httponly=false, encrypted=false)
 
-# Encrypted sensitive data
-set_cookie!(res, "auth", "secret-token", encrypted=true)
+# Encrypted value
+set_cookie!(res, "cart", "item-17,item-42", encrypted=true, maxage=86400)
 ```
 
 ### Reading Cookies
@@ -67,19 +76,24 @@ set_cookie!(res, "auth", "secret-token", encrypted=true)
 To read a cookie, use `get_cookie` with the `HTTP.Request`.
 
 ```julia
-value = get_cookie(request, name; default=nothing, encrypted=false)
+value = get_cookie(request, name, default=nothing; encrypted)
 ```
+
+`encrypted` defaults to whether a `secret_key` is configured. An encrypted value is bound to the
+cookie's name and to the lifetime it was set with; one that does not open (tampered, expired,
+sealed under another key or for another cookie) reads as `default`. See
+[Cookie Security](security.md) for the details.
 
 **Examples:**
 ```julia
 # Get raw string
-theme = get_cookie(req, "theme", default="light")
+theme = get_cookie(req, "theme", "light"; encrypted=false)
 
 # Get encrypted value (automatically decrypts)
-token = get_cookie(req, "auth", encrypted=true)
+cart = get_cookie(req, "cart"; encrypted=true)
 
 # Get with type conversion
-count = get_cookie(req, "counter", default=0) # returns Int
+count = get_cookie(req, "counter", 0) # returns Int
 ```
 
 ### Removing Cookies (Logout)
@@ -87,16 +101,16 @@ count = get_cookie(req, "counter", default=0) # returns Int
 To "delete" a cookie, you set its `maxage` to `0`. This tells the browser to expire it immediately.
 
 ```julia
-function logout(req)
-    res = Response("Logged out")
-    
+function clear_cart(req)
+    res = Res.send("Cart cleared")
+
     # Overwrite the cookie with empty data and immediate expiration
-    set_cookie!(res, "auth", "", maxage=0)
-    
+    set_cookie!(res, "cart", "", maxage=0)
+
     return res
 end
 
 urlpatterns("",
-    path("/logout", logout, method="POST"),
+    path("/cart/clear", clear_cart, method="POST"),
 )
 ```

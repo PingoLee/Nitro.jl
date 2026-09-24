@@ -23,7 +23,7 @@ using Nitro: Cookie
 
     @testset "REQUEST: Cookie Retrieval with Quotes in Encrypted Value" begin
         data = "user-123"
-        encrypted_value = Cookies.encrypt_payload(secret, data)
+        encrypted_value = Cookies.encrypt_payload(secret, data; purpose = "my_session")
         value_with_quotes = "\"$encrypted_value\""
 
         req = HTTP.Request("GET", "/", ["Cookie" => "my_session=$value_with_quotes"])
@@ -34,7 +34,7 @@ using Nitro: Cookie
 
     @testset "REQUEST: Without Quotes in Encrypted Value" begin
         data = "user-456"
-        encrypted_value = Cookies.encrypt_payload(secret, data)
+        encrypted_value = Cookies.encrypt_payload(secret, data; purpose = "my_session")
 
         req = HTTP.Request("GET", "/", ["Cookie" => "my_session=$encrypted_value"])
         result = Cookies.get_cookie(req, "my_session", encrypted=true, secret_key=secret)
@@ -85,7 +85,7 @@ using Nitro: Cookie
     @testset "REQUEST: Multiple Cookies" begin
         data1 = "value1"
         data2 = "value2"
-        encrypted_value2 = Cookies.encrypt_payload(secret, data2)
+        encrypted_value2 = Cookies.encrypt_payload(secret, data2; purpose = "cookie2")
 
         req = HTTP.Request("GET", "/", ["Cookie" => "cookie1=$data1; cookie2=$encrypted_value2"])
         result1 = Cookies.get_cookie(req, "cookie1", encrypted=false)
@@ -97,7 +97,8 @@ using Nitro: Cookie
 
     @testset "REQUEST: Cookie Name Case Insensitivity" begin
         data = "case-test"
-        encrypted_value = Cookies.encrypt_payload(secret, data)
+        # The purpose is the name AS REQUESTED below -- that is what get_cookie decrypts under.
+        encrypted_value = Cookies.encrypt_payload(secret, data; purpose = "my_session")
 
         req = HTTP.Request("GET", "/", ["Cookie" => "MY_SESSION=$encrypted_value"])
         result = Cookies.get_cookie(req, "my_session", encrypted=true, secret_key=secret)
@@ -107,7 +108,7 @@ using Nitro: Cookie
 
     @testset "REQUEST: Cookie Value with Special Characters" begin
         data = "value_with_special_chars_!@#\$%^&*()"
-        encrypted_value = Cookies.encrypt_payload(secret, data)
+        encrypted_value = Cookies.encrypt_payload(secret, data; purpose = "special_cookie")
 
         req = HTTP.Request("GET", "/", ["Cookie" => "special_cookie=$encrypted_value"])
         result = Cookies.get_cookie(req, "special_cookie", encrypted=true, secret_key=secret)
@@ -117,7 +118,7 @@ using Nitro: Cookie
 
     @testset "REQUEST: Whitespace Handling in Cookie Value" begin
         data = "whitespace-test"
-        encrypted_value = Cookies.encrypt_payload(secret, data)
+        encrypted_value = Cookies.encrypt_payload(secret, data; purpose = "spaced_cookie")
 
         req = HTTP.Request("GET", "/", ["Cookie" => "spaced_cookie = $encrypted_value "])
         result = Cookies.get_cookie(req, "spaced_cookie", encrypted=true, secret_key=secret)
@@ -134,7 +135,7 @@ using Nitro: Cookie
 
     @testset "REQUEST: Very Large Cookie Value" begin
         data = "a"^5000  # 5000 characters
-        encrypted_value = Cookies.encrypt_payload(secret, data)
+        encrypted_value = Cookies.encrypt_payload(secret, data; purpose = "large_cookie")
 
         req = HTTP.Request("GET", "/", ["Cookie" => "large_cookie=$encrypted_value"])
         result = Cookies.get_cookie(req, "large_cookie", encrypted=true, secret_key=secret)
@@ -144,7 +145,7 @@ using Nitro: Cookie
 
     @testset "REQUEST: Very Large Cookie Value with Size Limit" begin
         data = "a"^5000
-        encrypted_value = Cookies.encrypt_payload(secret, data)
+        encrypted_value = Cookies.encrypt_payload(secret, data; purpose = "large_cookie")
 
         req = HTTP.Request("GET", "/", ["Cookie" => "large_cookie=$encrypted_value"])
         result = Cookies.get_cookie(req, "large_cookie", encrypted=true, secret_key=secret, max_cookie_size=4096)
@@ -154,7 +155,7 @@ using Nitro: Cookie
 
     @testset "REQUEST: Cookie with Symbol Key" begin
         data = "symbol-key-test"
-        encrypted_value = Cookies.encrypt_payload(secret, data)
+        encrypted_value = Cookies.encrypt_payload(secret, data; purpose = "sym_key")
 
         req = HTTP.Request("GET", "/", ["Cookie" => "sym_key=$encrypted_value"])
         result = Cookies.get_cookie(req, :sym_key, encrypted=true, secret_key=secret)
@@ -168,7 +169,7 @@ using Nitro: Cookie
 
     @testset "RESPONSE: Basic Cookie Retrieval" begin
         data = "response-value"
-        encrypted_value = Cookies.encrypt_payload(secret, data)
+        encrypted_value = Cookies.encrypt_payload(secret, data; purpose = "resp_cookie")
 
         res = HTTP.Response(200, [("Set-Cookie", "resp_cookie=$encrypted_value; Path=/; HttpOnly")])
         result = Cookies.get_cookie(res, "resp_cookie", encrypted=true, secret_key=secret)
@@ -177,8 +178,8 @@ using Nitro: Cookie
     end
 
     @testset "RESPONSE: Multiple Set-Cookie Headers" begin
-        encrypted_val1 = Cookies.encrypt_payload(secret, "resp1")
-        encrypted_val2 = Cookies.encrypt_payload(secret, "resp2")
+        encrypted_val1 = Cookies.encrypt_payload(secret, "resp1"; purpose = "cookie1")
+        encrypted_val2 = Cookies.encrypt_payload(secret, "resp2"; purpose = "cookie2")
 
         res = HTTP.Response(200, [
             ("Set-Cookie", "cookie1=$encrypted_val1; Path=/"),
@@ -196,7 +197,7 @@ using Nitro: Cookie
         encrypted_data = "secret-session-token"
         plaintext_data = "tracking-id-12345"
         
-        encrypted_val = Cookies.encrypt_payload(secret, encrypted_data)
+        encrypted_val = Cookies.encrypt_payload(secret, encrypted_data; purpose = "session")
         
         res = HTTP.Response(200, [
             ("Set-Cookie", "session=$encrypted_val; Path=/; HttpOnly; Secure"),
@@ -261,7 +262,7 @@ using Nitro: Cookie
     @testset "RESPONSE: Cookie with Complex Value" begin
         # Test response cookies with complex values (special chars, equals signs, etc.)
         complex_value = "key1=val1; key2=val2; special_chars=!@#\$%"
-        encrypted_complex = Cookies.encrypt_payload(secret, complex_value)
+        encrypted_complex = Cookies.encrypt_payload(secret, complex_value; purpose = "complex")
         
         res = HTTP.Response(200, [("Set-Cookie", "complex=$encrypted_complex; Path=/")])
         result = Cookies.get_cookie(res, "complex", encrypted=true, secret_key=secret)
@@ -569,7 +570,7 @@ using Nitro: Cookie
             "samesite" => "Strict",
             "maxage" => 3600,
             "domain" => "nitrojl.com",
-            "secret_key" => "my-secret-key",
+            "secret_key" => "my-secret-key-01234567890123456789",
             "max_cookie_size" => "8192"
         )
         conf = Cookies.load_cookie_settings!(defaults)
@@ -578,7 +579,7 @@ using Nitro: Cookie
         @test conf.samesite == "Strict"
         @test conf.maxage == 3600
         @test conf.domain == "nitrojl.com"
-        @test conf.secret_key == "my-secret-key"
+        @test conf.secret_key == "my-secret-key-01234567890123456789"
         @test conf.max_cookie_size == 8192
     end
 
@@ -684,7 +685,7 @@ using Nitro: Cookie
         
         # Simulate client sending them back
         headers = [
-            "Cookie" => "session_id=$(Cookies.encrypt_payload(secret, "abc123xyz789")); csrf_token=csrf_123456; tracking=track_987"
+            "Cookie" => "session_id=$(Cookies.encrypt_payload(secret, "abc123xyz789"; purpose = "session_id")); csrf_token=csrf_123456; tracking=track_987"
         ]
         req = HTTP.Request("GET", "/", headers)
         
@@ -722,7 +723,7 @@ using Nitro: Cookie
         # ========== PHASE 2: ACTIVE SESSION ==========
         # Client sends both cookies back to server in subsequent request
         active_request = HTTP.Request("GET", "/api/profile", [
-            "Cookie" => "session=$(Cookies.encrypt_payload(secret, session_data)); csrf_token=$csrf_token"
+            "Cookie" => "session=$(Cookies.encrypt_payload(secret, session_data; purpose = "session")); csrf_token=$csrf_token"
         ])
         
         # Server validates incoming cookies
@@ -743,8 +744,8 @@ using Nitro: Cookie
         @test Cookies.get_cookie(refresh_response, "session", encrypted=true, secret_key=secret) == updated_session_data
         
         # Verify different data produces different ciphertext (integrity check)
-        old_enc = Cookies.encrypt_payload(secret, session_data)
-        new_enc = Cookies.encrypt_payload(secret, updated_session_data)
+        old_enc = Cookies.encrypt_payload(secret, session_data; purpose = "session")
+        new_enc = Cookies.encrypt_payload(secret, updated_session_data; purpose = "session")
         @test old_enc != new_enc
         
         # ========== PHASE 4: LOGOUT ==========
@@ -875,8 +876,8 @@ using Nitro: Cookie
         @test Cookies.get_cookie(large_req, "large", max_cookie_size=8192) == large_val
         
         # ========== Size limit with encryption ==========
-        secret_small = "small-secret-1234567890"
-        encrypted_small = Cookies.encrypt_payload(secret_small, "secret_data")
+        secret_small = "small-secret-1234567890-0123456789"
+        encrypted_small = Cookies.encrypt_payload(secret_small, "secret_data"; purpose = "encrypted")
         enc_req = HTTP.Request("GET", "/", ["Cookie" => "encrypted=$encrypted_small"])
         result = Cookies.get_cookie(enc_req, "encrypted", encrypted=true, secret_key=secret_small, max_cookie_size=4096)
         @test result == "secret_data"
@@ -892,22 +893,23 @@ using Nitro: Cookie
     @testset "SCENARIO: Secret Key Rotation and Migration" begin
         # Test handling of rotating secret keys (old key -> new key migration)
         
-        old_secret = "old-secret-key-1234567890123456"
-        new_secret = "new-secret-key-1234567890123456"
-        
+        old_secret = "old-secret-key-12345678901234567890"
+        new_secret = "new-secret-key-12345678901234567890"
+
         # ========== Phase 1: Data encrypted with old key ==========
         data = "sensitive-user-data"
-        old_encrypted = Cookies.encrypt_payload(old_secret, data)
+        old_encrypted = Cookies.encrypt_payload(old_secret, data; purpose = "session")
         
         req_old = HTTP.Request("GET", "/", ["Cookie" => "session=$old_encrypted"])
         result_old = Cookies.get_cookie(req_old, "session", encrypted=true, secret_key=old_secret)
         @test result_old == data
         
         # ========== Phase 2: Cannot decrypt old data with new key ==========
-        @test_throws Nitro.Core.Errors.CookieError Cookies.get_cookie(req_old, "session", encrypted=true, secret_key=new_secret)
-        
+        # #309: a token that does not open under the key reads as absent instead of throwing.
+        @test Cookies.get_cookie(req_old, "session", encrypted=true, secret_key=new_secret) === nothing
+
         # ========== Phase 3: Re-encrypt with new key ==========
-        new_encrypted = Cookies.encrypt_payload(new_secret, data)
+        new_encrypted = Cookies.encrypt_payload(new_secret, data; purpose = "session")
         
         req_new = HTTP.Request("GET", "/", ["Cookie" => "session=$new_encrypted"])
         result_new = Cookies.get_cookie(req_new, "session", encrypted=true, secret_key=new_secret)
@@ -919,7 +921,7 @@ using Nitro: Cookie
         # ========== Phase 5: Migration scenario - accept both until cutoff ==========
         # (Simulating dual-key support during rotation)
         dual_encrypt_test = function(value, secret)
-            Cookies.encrypt_payload(secret, value)
+            Cookies.encrypt_payload(secret, value; purpose = "session")
         end
         
         old_ct = dual_encrypt_test(data, old_secret)
@@ -934,7 +936,8 @@ using Nitro: Cookie
         @test Cookies.get_cookie(req_migration2, "session", encrypted=true, secret_key=new_secret) == data
         
         # ========== Phase 6: Verify old key can't decrypt new data ==========
-        @test_throws Nitro.Core.Errors.CookieError Cookies.get_cookie(req_migration2, "session", encrypted=true, secret_key=old_secret)
+        # #309: a token that does not open under the key reads as absent instead of throwing.
+        @test Cookies.get_cookie(req_migration2, "session", encrypted=true, secret_key=old_secret) === nothing
     end
 
 
@@ -978,7 +981,7 @@ using Nitro: Cookie
 
     @testset "EXTRACTOR: Encrypted Cookie Extraction" begin
         data = "secure-user-456"
-        enc = Cookies.encrypt_payload(secret, data)
+        enc = Cookies.encrypt_payload(secret, data; purpose = "auth_token")
         req = HTTP.Request("GET", "/", ["Cookie" => "auth_token=$enc"])
         lazy_req = Nitro.Types.LazyRequest(request=req)
         
@@ -1027,7 +1030,7 @@ using Nitro: Cookie
 
         # 3. Test get_cookie using global config
         payload = "my-session"
-        enc_val = Cookies.encrypt_payload(conf.secret_key, payload)
+        enc_val = Cookies.encrypt_payload(conf.secret_key, payload; purpose = "session")
         req = Request("GET", "/", ["Cookie" => "session=$enc_val"])
         # Should auto-decrypt
         val = get_cookie(req, "session")
@@ -1046,16 +1049,16 @@ using Nitro: Cookie
         resetstate()
         
         # First call
-        configcookies(samesite="Lax", secret_key="first-secret-1234567890123456")
+        configcookies(samesite="Lax", secret_key="first-secret-12345678901234567890")
         conf1 = Nitro.CONTEXT[].service.cookies[]
         @test conf1.samesite == "Lax"
-        @test conf1.secret_key == "first-secret-1234567890123456"
+        @test conf1.secret_key == "first-secret-12345678901234567890"
 
         # Second call should overwrite
-        configcookies(samesite="Strict", secret_key="second-secret-1234567890123456")
+        configcookies(samesite="Strict", secret_key="second-secret-12345678901234567890")
         conf2 = Nitro.CONTEXT[].service.cookies[]
         @test conf2.samesite == "Strict"
-        @test conf2.secret_key == "second-secret-1234567890123456"
+        @test conf2.secret_key == "second-secret-12345678901234567890"
         
         resetstate()
     end
@@ -1070,7 +1073,7 @@ using Nitro: Cookie
         ctx = Nitro.Core.App()
         
         # Simulate what serve() does
-        secret_key = "serve-test-key-1234567890123456"
+        secret_key = "serve-test-key-12345678901234567890"
         current = ctx.service.cookies[]
         ctx.service.cookies[] = CookieConfig(
             secret_key = secret_key,
@@ -1094,16 +1097,9 @@ using Nitro: Cookie
         # Secret key too short should be caught during encryption
         short_key = "tooshort"
         res = HTTP.Response(200)
-        
-        # Should either throw or handle gracefully
-        try
-            set_cookie!(res, "test", "value", secret_key=short_key, encrypted=true)
-            # If it doesn't throw, verify the key is stored (may throw on use)
-            @test true
-        catch e
-            # Expected - short key should fail
-            @test true
-        end
+
+        # #309: a key under 32 bytes is refused outright (it used to pass either way here).
+        @test_throws ArgumentError set_cookie!(res, "test", "value", secret_key=short_key, encrypted=true)
     end
 
     @testset "API: Path normalization" begin
@@ -1132,12 +1128,12 @@ using Nitro: Cookie
         resetstate()
         
         # Set up global secret key
-        configcookies(secret_key="global-secret-1234567890123456")
+        configcookies(secret_key="global-secret-12345678901234567890")
         conf = Nitro.CONTEXT[].service.cookies[]
-        
+
         # Create request with encrypted cookie
         data = "encrypted-user-data"
-        enc_val = Cookies.encrypt_payload(conf.secret_key, data)
+        enc_val = Cookies.encrypt_payload(conf.secret_key, data; purpose = "user_data")
         req = Request("GET", "/", ["Cookie" => "user_data=$enc_val"])
         lazy_req = Nitro.Types.LazyRequest(request=req)
         
@@ -1169,7 +1165,7 @@ using Nitro: Cookie
 
         # 4. Core API should accept an explicit config as the key source.
         conf = CookieConfig(secret_key=secret)
-        encrypted_value = Cookies.encrypt_payload(secret, "config-backed")
+        encrypted_value = Cookies.encrypt_payload(secret, "config-backed"; purpose = "test_config_key")
         req_with_config = HTTP.Request("GET", "/", ["Cookie" => "test_config_key=$encrypted_value"])
         @test Cookies.get_cookie(req_with_config, "test_config_key", encrypted=true, config=conf) == "config-backed"
     end
@@ -1177,24 +1173,27 @@ using Nitro: Cookie
     @testset "SECURITY: AES-GCM Integrity (Tampering)" begin
         # 1. Encrypt a value
         data = "highly-sensitive-info"
-        enc_val = Cookies.encrypt_payload(secret, data)
-        
+        enc_val = Cookies.encrypt_payload(secret, data; purpose = "secure")
+
         # 2. Destructive tampering (force invalid base64/corrupt tag)
-        tampered_val = enc_val * "!!!" 
-        
-        # 3. Decryption must throw CookieError
+        tampered_val = enc_val * "!!!"
+
+        # 3. Decryption must not yield the value
         req = HTTP.Request("GET", "/", ["Cookie" => "secure=$tampered_val"])
-        @test_throws Nitro.Core.Errors.CookieError Cookies.get_cookie(req, "secure", encrypted=true, secret_key=secret)
+        # #309: a token that does not open reads as absent instead of throwing.
+        @test Cookies.get_cookie(req, "secure", encrypted=true, secret_key=secret) === nothing
     end
 
     @testset "SECURITY: AES-GCM Auth Tag Verification (In-Alphabet Tampering)" begin
         # Test that tampering within valid Base64 alphabet is caught by the auth tag
         data = "secret-message"
-        enc_val = Cookies.encrypt_payload(secret, data)
+        enc_val = Cookies.encrypt_payload(secret, data; purpose = "secure")
         
-        # Flip a character that is still valid Base64 (e.g., A->B)
+        # Flip a character that is still valid Base64 (e.g., A->B). Start at char 3: chars 1-2
+        # carry the leading version byte (#309), so a flip there would hit the version check,
+        # not the auth tag this test is about.
         chars = collect(enc_val)
-        for i in 1:length(chars)
+        for i in 3:length(chars)
             if chars[i] in ('A':'Z')
                 chars[i] = (chars[i] == 'A') ? 'B' : 'A'
                 break
@@ -1208,46 +1207,49 @@ using Nitro: Cookie
         end
         tampered_val = String(chars)
         
-        # Decryption should throw CookieError due to auth tag failure
+        # Decryption fails the auth tag check
         req = HTTP.Request("GET", "/", ["Cookie" => "secure=$tampered_val"])
-        @test_throws Nitro.Core.Errors.CookieError Cookies.get_cookie(req, "secure", encrypted=true, secret_key=secret)
+        # #309: a token that does not open reads as absent instead of throwing.
+        @test Cookies.get_cookie(req, "secure", encrypted=true, secret_key=secret) === nothing
     end
 
     @testset "SECURITY: Wrong Secret Key Rejection" begin
         # Encrypt with one key, try to decrypt with a different key
         data = "confidential-data"
-        enc_val = Cookies.encrypt_payload(secret, data)
-        
+        enc_val = Cookies.encrypt_payload(secret, data; purpose = "data")
+
         wrong_key = "wrong-secret-key-1234567890123456"
         req = HTTP.Request("GET", "/", ["Cookie" => "data=$enc_val"])
-        
-        # Should throw CookieError (decryption fails with wrong key)
-        @test_throws Nitro.Core.Errors.CookieError Cookies.get_cookie(req, "data", encrypted=true, secret_key=wrong_key)
+
+        # Decryption fails with the wrong key
+        # #309: a token that does not open under the key reads as absent instead of throwing.
+        @test Cookies.get_cookie(req, "data", encrypted=true, secret_key=wrong_key) === nothing
     end
 
     @testset "SECURITY: IV Tampering Detection" begin
-        # The IV is the first 12 bytes (24 Base64 chars excluding padding)
+        # The IV is the 12 bytes after the leading version byte -- decoded bytes 2:13 (#309)
         # Modify a character in the IV portion to test if GSM tag validation catches it
         data = "test-payload"
-        enc_val = Cookies.encrypt_payload(secret, data)
-        
-        # Tamper with the IV portion (first ~16 characters of base64)
+        enc_val = Cookies.encrypt_payload(secret, data; purpose = "iv_test")
+
+        # Tamper with the IV portion: base64 char 5 carries decoded byte 4, inside the IV
         chars = collect(enc_val)
         if length(chars) > 16
             chars[5] = (chars[5] == 'A') ? 'C' : 'A'  # Flip a char in IV region
         end
         tampered_val = String(chars)
-        
+
         # GCM should fail to verify due to IV mismatch in the auth calculation
         req = HTTP.Request("GET", "/", ["Cookie" => "iv_test=$tampered_val"])
-        @test_throws Nitro.Core.Errors.CookieError Cookies.get_cookie(req, "iv_test", encrypted=true, secret_key=secret)
+        # #309: a token that does not open reads as absent instead of throwing.
+        @test Cookies.get_cookie(req, "iv_test", encrypted=true, secret_key=secret) === nothing
     end
 
     @testset "SECURITY: Tag Corruption Detection" begin
         # The tag is the last 16 bytes (last ~21 Base64 chars)
         # Modifying the tag directly should definitely fail
         data = "another-secret"
-        enc_val = Cookies.encrypt_payload(secret, data)
+        enc_val = Cookies.encrypt_payload(secret, data; purpose = "tag_test")
         
         # Tamper with the last portion (tag area)
         chars = collect(enc_val)
@@ -1258,17 +1260,19 @@ using Nitro: Cookie
         
         # GCM tag verification should fail
         req = HTTP.Request("GET", "/", ["Cookie" => "tag_test=$tampered_val"])
-        @test_throws Nitro.Core.Errors.CookieError Cookies.get_cookie(req, "tag_test", encrypted=true, secret_key=secret)
+        # #309: a token that does not open reads as absent instead of throwing.
+        @test Cookies.get_cookie(req, "tag_test", encrypted=true, secret_key=secret) === nothing
     end
 
     @testset "ROBUSTNESS: Malformed Encryption Payloads" begin
         # 1. Invalid Base64
+        # #309: a token that does not open reads as absent instead of throwing.
         req1 = HTTP.Request("GET", "/", ["Cookie" => "bad_enc=!!!not-base64!!!"])
-        @test_throws Nitro.Core.Errors.CookieError Cookies.get_cookie(req1, "bad_enc", encrypted=true, secret_key=secret)
-        
-        # 2. Valid Base64 but too short for IV + Tag
+        @test Cookies.get_cookie(req1, "bad_enc", encrypted=true, secret_key=secret) === nothing
+
+        # 2. Valid Base64 but too short for version + IV + header + Tag
         req2 = HTTP.Request("GET", "/", ["Cookie" => "short_enc=YWFhYQ=="]) # "aaaa"
-        @test_throws Nitro.Core.Errors.CookieError Cookies.get_cookie(req2, "short_enc", encrypted=true, secret_key=secret)
+        @test Cookies.get_cookie(req2, "short_enc", encrypted=true, secret_key=secret) === nothing
     end
 
     @testset "CONCURRENCY: Multi-threaded Cookie Operations" begin
@@ -1302,25 +1306,27 @@ using Nitro: Cookie
     @testset "EXTRACTOR: Tempered Cookie Error" begin
         # 1. Create a tempered encrypted cookie (invalid base64)
         data = "secret"
-        enc = Cookies.encrypt_payload(secret, data)
+        enc = Cookies.encrypt_payload(secret, data; purpose = "auth")
         tampered = enc[1:end-1] * "!"
-        
+
         req = HTTP.Request("GET", "/", ["Cookie" => "auth=$tampered"])
         lazy_req = Nitro.Types.LazyRequest(request=req)
         param = Nitro.Types.Param(name=:auth, type=Cookie{String})
-        
-        # Extraction should throw CookieError (propagating from decrypt_payload)
-        @test_throws Nitro.Core.Errors.CookieError Nitro.Extractors.extract(param, lazy_req, secret)
+
+        # #309: a token that does not open reads as absent, so the extractor yields no value
+        # instead of propagating decrypt_payload's CookieError.
+        @test Nitro.Extractors.extract(param, lazy_req, secret).value === nothing
     end
 
     @testset "EXTRACTOR: In-Alphabet Tampered Cookie (Auth Tag Failure)" begin
         # Test that in-alphabet tampering is caught by auth tag during extraction
         data = "user-session-data"
-        enc = Cookies.encrypt_payload(secret, data)
-        
-        # Flip a Base64-valid character
+        enc = Cookies.encrypt_payload(secret, data; purpose = "session")
+
+        # Flip a Base64-valid character. Start at char 3: chars 1-2 carry the leading version
+        # byte (#309), so a flip there would hit the version check, not the auth tag.
         chars = collect(enc)
-        for i in 1:length(chars)
+        for i in 3:length(chars)
             if chars[i] in ('A':'Z')
                 chars[i] = chars[i] == 'A' ? 'M' : 'A'
                 break
@@ -1333,37 +1339,40 @@ using Nitro: Cookie
         param = Nitro.Types.Param(name=:session, type=Cookie{String})
         
         # Auth tag verification should fail during extraction
-        @test_throws Nitro.Core.Errors.CookieError Nitro.Extractors.extract(param, lazy_req, secret)
+        # #309: a token that does not open reads as absent, so the extractor yields no value.
+        @test Nitro.Extractors.extract(param, lazy_req, secret).value === nothing
     end
 
     @testset "EXTRACTOR: Wrong Key Rejection During Extraction" begin
         # Encrypt with correct key, try to extract with wrong key
         data = "protected-content"
-        enc = Cookies.encrypt_payload(secret, data)
-        
-        wrong_key = "incorrect-key-1234567890123456"
+        enc = Cookies.encrypt_payload(secret, data; purpose = "secure")
+
+        wrong_key = "incorrect-key-12345678901234567890"
         req = HTTP.Request("GET", "/", ["Cookie" => "secure=$enc"])
         lazy_req = Nitro.Types.LazyRequest(request=req)
         param = Nitro.Types.Param(name=:secure, type=Cookie{String})
-        
+
         # Decryption with wrong key should fail
-        @test_throws Nitro.Core.Errors.CookieError Nitro.Extractors.extract(param, lazy_req, wrong_key)
+        # #309: a token that does not open under the key reads as absent, so no value.
+        @test Nitro.Extractors.extract(param, lazy_req, wrong_key).value === nothing
     end
 
     @testset "EXTRACTOR: Truncated Encrypted Cookie" begin
         # Test that truncated payloads fail validation
         data = "important-secret"
-        enc = Cookies.encrypt_payload(secret, data)
-        
+        enc = Cookies.encrypt_payload(secret, data; purpose = "incomplete")
+
         # Truncate the payload (remove last few chars)
         truncated = enc[1:max(1, length(enc)-5)]
-        
+
         req = HTTP.Request("GET", "/", ["Cookie" => "incomplete=$truncated"])
         lazy_req = Nitro.Types.LazyRequest(request=req)
         param = Nitro.Types.Param(name=:incomplete, type=Cookie{String})
-        
-        # Should fail due to insufficient length for IV + Tag
-        @test_throws Nitro.Core.Errors.CookieError Nitro.Extractors.extract(param, lazy_req, secret)
+
+        # Should fail: the truncated token no longer decodes to a whole, authentic one
+        # #309: a token that does not open reads as absent, so the extractor yields no value.
+        @test Nitro.Extractors.extract(param, lazy_req, secret).value === nothing
     end
 
 end
@@ -1394,8 +1403,10 @@ cookie_value(res) = split(split(HTTP.header(res, "Set-Cookie"), ';')[1], '='; li
     req = HTTP.Request("GET", "/", ["Cookie" => "role=$token"])
     @test Cookies.get_cookie(req, "role"; encrypted = true, secret_key = real_key) == "user"
     # The pre-fix key must NOT open it: that is the public key every such app shared.
-    @test_throws Nitro.CookieError Cookies.get_cookie(req, "role"; encrypted = true,
-                                                      secret_key = masked_literal)
+    # #309: that display form is 20 bytes, under the 32-byte minimum, so it is now refused as a
+    # key outright -- stronger than the CookieError it used to fail to decrypt with.
+    @test_throws ArgumentError Cookies.get_cookie(req, "role"; encrypted = true,
+                                                  secret_key = masked_literal)
 end
 
 @testset "every entry point normalizes the same way" begin
@@ -1447,5 +1458,174 @@ end
 
     auth = CookieAuthMiddleware(token -> token; secret_key = real_key)
     @test !occursin(real_key, repr(auth))
+end
+end
+
+# #309: the token was AES-GCM under `sha256(secret)` with no associated data and no timestamp,
+# any key length accepted. So a ciphertext moved freely between cookies, a captured cookie
+# decrypted forever, and a weak key fell to an offline guess from one captured cookie.
+@testitem "Encrypted cookies are name-bound and expiring (#309)" tags=[:core, :security] setup=[NitroCommon] begin
+using Nitro
+using Nitro.Types: CookieConfig, LazyRequest, Param
+using HTTP
+using Test
+using Dates
+using OpenSSL
+using SHA
+using Base64
+const Cookies = Nitro.Cookies
+const Crypto = Nitro.Crypto
+using Nitro: Cookie
+
+key = "k" * "0123456789abcdef0123456789abcdef"          # 33 bytes
+other_key = "o" * "0123456789abcdef0123456789abcdef"    # 33 bytes, different
+
+token_of(res, name) = begin
+    for (k, v) in res.headers
+        lowercase(k) == "set-cookie" && startswith(v, name * "=") &&
+            return split(split(v, ';')[1], '='; limit = 2)[2]
+    end
+    error("no Set-Cookie for $name")
+end
+request_with(pairs...) = HTTP.Request("GET", "/", ["Cookie" => join(["$n=$v" for (n, v) in pairs], "; ")])
+
+@testset "HKDF-SHA256 matches RFC 5869" begin
+    ikm = fill(0x0b, 22)
+    # A.1 -- salt and info present
+    @test bytes2hex(Crypto._hkdf_sha256(ikm, hex2bytes("000102030405060708090a0b0c"),
+                                        hex2bytes("f0f1f2f3f4f5f6f7f8f9"), 42)) ==
+          "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"
+    # A.3 -- empty salt and info, the salt shape the cookie key uses
+    @test bytes2hex(Crypto._hkdf_sha256(ikm, UInt8[], UInt8[], 42)) ==
+          "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8"
+end
+
+@testset "a ciphertext opens only as the cookie it was set as" begin
+    # The issue's transplant: a value the attacker influences, set in one cookie...
+    lang = token_of(Cookies.set_cookie!(HTTP.Response(200), "language", "admin"; secret_key = key), "language")
+    req = request_with("language" => lang, "session_user" => lang)
+    @test Cookies.get_cookie(req, "language"; encrypted = true, secret_key = key) == "admin"
+    # ...pasted into another. It used to read "admin".
+    @test Cookies.get_cookie(req, "session_user"; encrypted = true, secret_key = key) === nothing
+    # The primitive refuses loudly; the cookie layer reads it as absent.
+    @test_throws Nitro.CookieError Crypto.decrypt_payload(key, lang; purpose = "session_user")
+    @test Crypto.decrypt_payload(key, lang; purpose = "language") == "admin"
+end
+
+@testset "the lifetime the browser is told is enforced by the server" begin
+    t0 = DateTime(2030, 1, 1)
+    sealed = Crypto.encrypt_payload(key, "v"; purpose = "p", expires = t0 + Second(60), now = t0)
+    @test Crypto.decrypt_payload(key, sealed; purpose = "p", now = t0 + Second(59)) == "v"
+    err = try
+        Crypto.decrypt_payload(key, sealed; purpose = "p", now = t0 + Second(60)); nothing
+    catch e
+        e
+    end
+    @test err isa Nitro.CookieError && occursin("expired", err.msg)
+
+    # No expiry sealed: opens however late it is read.
+    forever = Crypto.encrypt_payload(key, "v"; purpose = "p", now = t0)
+    @test Crypto.decrypt_payload(key, forever; purpose = "p", now = DateTime(2100, 1, 1)) == "v"
+
+    # Through set_cookie!: Max-Age is sealed...
+    tok = token_of(Cookies.set_cookie!(HTTP.Response(200), "s", "v"; secret_key = key, maxage = 60), "s")
+    @test Crypto.decrypt_payload(key, tok; purpose = "s") == "v"
+    @test_throws Nitro.CookieError Crypto.decrypt_payload(key, tok; purpose = "s",
+                                                          now = Dates.now(Dates.UTC) + Minute(2))
+    # ...and wins over Expires, as it does in the browser.
+    tok = token_of(Cookies.set_cookie!(HTTP.Response(200), "s", "v"; secret_key = key, maxage = 60,
+                                       expires = DateTime(2000, 1, 1)), "s")
+    @test Crypto.decrypt_payload(key, tok; purpose = "s") == "v"
+    # Expires alone, in the past: already expired.
+    tok = token_of(Cookies.set_cookie!(HTTP.Response(200), "s", "v"; secret_key = key,
+                                       expires = DateTime(2000, 1, 1)), "s")
+    @test Cookies.get_cookie(request_with("s" => tok), "s"; encrypted = true, secret_key = key) === nothing
+    # A config-wide maxage bounds a cookie that sets none.
+    cfg = CookieConfig(secret_key = key, maxage = 60)
+    tok = token_of(Cookies.set_cookie!(HTTP.Response(200), "s", "v"; config = cfg), "s")
+    @test_throws Nitro.CookieError Crypto.decrypt_payload(key, tok; purpose = "s",
+                                                          now = Dates.now(Dates.UTC) + Minute(2))
+    # A logout cookie (Max-Age=0) is expired the moment it is sealed.
+    tok = token_of(Cookies.set_cookie!(HTTP.Response(200), "s", ""; secret_key = key, maxage = 0), "s")
+    @test Cookies.get_cookie(request_with("s" => tok), "s"; encrypted = true, secret_key = key) === nothing
+end
+
+@testset "a cookie that does not open reads as absent" begin
+    good = token_of(Cookies.set_cookie!(HTTP.Response(200), "c", "value"; secret_key = key), "c")
+    bytes = Crypto.base64url_decode(String(good))
+    wrong_version = copy(bytes); wrong_version[1] = 0x02
+    flipped = copy(bytes); flipped[end - 20] ⊻= 0x01
+
+    # The pre-#309 format, built the way the old `encrypt_payload` built it: iv ‖ ct ‖ tag
+    # under sha256(secret), no version byte, no associated data.
+    legacy = let iv = Crypto.secure_random_bytes(12),
+                 cipher = OpenSSL.EvpCipher(ccall((:EVP_get_cipherbyname, OpenSSL.libcrypto),
+                                                  Ptr{Cvoid}, (Cstring,), "AES-256-GCM")),
+                 ctx = OpenSSL.EvpCipherContext()
+        OpenSSL.encrypt_init(ctx, cipher, SHA.sha256(key), iv)
+        ct = OpenSSL.cipher_update(ctx, Vector{UInt8}("value"))
+        fin = OpenSSL.cipher_final(ctx)
+        tag = Vector{UInt8}(undef, 16)
+        ccall((:EVP_CIPHER_CTX_ctrl, OpenSSL.libcrypto), Cint,
+              (OpenSSL.EvpCipherContext, Cint, Cint, Ptr{UInt8}), ctx, 0x10, 16, tag)
+        Crypto.base64url_encode(vcat(iv, ct, fin, tag))
+    end
+
+    for (label, token) in ("other key" => token_of(Cookies.set_cookie!(HTTP.Response(200), "c", "value"; secret_key = other_key), "c"),
+                           "version byte" => Crypto.base64url_encode(wrong_version),
+                           "tampered" => Crypto.base64url_encode(flipped),
+                           "truncated" => good[1:end-10],
+                           "not base64" => "!!!not-base64!!!",
+                           "pre-#309 format" => legacy)
+        req = request_with("c" => token)
+        @test Cookies.get_cookie(req, "c"; encrypted = true, secret_key = key) === nothing
+        @test Cookies.get_cookie(req, "c", "fallback"; encrypted = true, secret_key = key) == "fallback"
+        @test_throws Nitro.CookieError Crypto.decrypt_payload(key, token; purpose = "c")
+    end
+
+    # The Cookie{T} extractor used to propagate the CookieError -- a 500 per request.
+    param = Param(name = :c, type = Cookie{String})
+    @test Nitro.Extractors.extract(param, LazyRequest(request = request_with("c" => legacy)), key).value === nothing
+
+    # End to end: a junk cookie on a typed route is a 200 with the default, not a 500.
+    app = App(mod = @__MODULE__)
+    configcookies(app; secret_key = key)
+    urlpatterns(app, "", path("/pref", (req, c::Cookie{String}) -> Res.json(Dict("c" => something(c.value, "none")))))
+    r = internalrequest(app, HTTP.Request("GET", "/pref", ["Cookie" => "c=$legacy"]); catch_errors = false)
+    @test r.status == 200
+    @test occursin("none", String(r.body))
+
+    # Logged at @debug with the NAME and a reason, never the value or the token.
+    logger = Test.TestLogger(min_level = Base.CoreLogging.Debug)
+    Base.CoreLogging.with_logger(logger) do
+        Cookies.get_cookie(request_with("c" => legacy), "c"; encrypted = true, secret_key = key)
+    end
+    rejected = filter(r -> occursin("did not open", r.message), logger.logs)
+    @test length(rejected) == 1
+    @test rejected[1].kwargs[:cookie] == "c"
+    @test !occursin(legacy, sprint(show, rejected[1].kwargs))
+
+    # No key at all is configuration, not a bad cookie: still loud.
+    @test_throws Nitro.CookieError Cookies.get_cookie(request_with("c" => good), "c"; encrypted = true)
+end
+
+@testset "a cookie key is at least 32 bytes" begin
+    short = "s" ^ 31
+    @test_throws ArgumentError configcookies(App(); secret_key = short)
+    @test_throws ArgumentError CookieConfig(secret_key = short)
+    @test_throws ArgumentError Cookies.set_cookie!(HTTP.Response(200), "c", "v"; secret_key = short)
+    @test_throws ArgumentError Cookies.get_cookie(request_with("c" => "x"), "c"; encrypted = true, secret_key = short)
+    # ...on EVERY call, not only the ones that carry the cookie: a bad key is configuration.
+    @test_throws ArgumentError Cookies.get_cookie(HTTP.Request("GET", "/"), "c"; encrypted = true, secret_key = short)
+    @test_throws ArgumentError Crypto.encrypt_payload(short, "v"; purpose = "c")
+    @test_throws ArgumentError Crypto.decrypt_payload(short, "x"; purpose = "c")
+    @test_throws ArgumentError CookieAuthMiddleware(t -> t; secret_key = short)
+    @test_throws ArgumentError SessionMiddleware(store = MemoryStore{String, Dict{String, Any}}(), secret_key = short)
+    # Bytes, not characters: 16 two-byte characters are 32 bytes.
+    @test CookieConfig(secret_key = "é" ^ 16).secret_key isa SecretString
+    @test CookieConfig(secret_key = "s" ^ 32).secret_key isa SecretString
+    # The message says what to do and never echoes the key.
+    msg = try CookieConfig(secret_key = short); "" catch e; e.msg end
+    @test occursin("at least 32", msg) && occursin("ENV", msg) && !occursin(short, msg)
 end
 end
