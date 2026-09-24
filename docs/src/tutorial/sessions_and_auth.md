@@ -27,7 +27,9 @@ function login_handler(req::HTTP.Request)
     password = get(payload, "password", "")
 
     user = M.User.objects.filter("username" => username).first()
-    if isnothing(user) || !check_password(password, user[:password])
+    # Pass `nothing` for an unknown user instead of returning early: `check_password` then
+    # hashes anyway, so the response time does not reveal which usernames exist.
+    if !check_password(password, isnothing(user) ? nothing : user[:password])
         return Res.json(Dict("error" => "Invalid credentials"); status=401)
     end
 
