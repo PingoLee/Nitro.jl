@@ -247,3 +247,95 @@ end
     @test Nitro.text(send("POST", "/bare"; headers = JSON_CT, body = """{"shade":"dark"}""")) == "bound"
 end
 end
+
+@testitem "Symbol is refused at registration (#306)" tags=[:core] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+using Nitro: App, Nullable, Query, Form, Json, Body, Cookie, Session, Context
+using Nitro.Core.Types: Extractor
+using Nitro.Core.Util.BodyParsers: interns_client_strings
+using Random
+
+@enum Shade light = 1 dark = 2
+struct WithSymbol
+    tag::Symbol
+end
+struct WithSymbolDict
+    counts::Dict{Symbol,Int}
+end
+struct WithEnumDict
+    counts::Dict{Shade,Int}
+end
+struct Safe
+    name::String
+    shade::Shade
+    tags::Vector{String}
+    counts::Dict{String,Shade}
+end
+mutable struct Node
+    value::Int
+    next::Union{Nothing,Node}
+end
+# A third-party-style extractor: Nitro does not bind it, so its payload type is not checked.
+struct Opaque{T} <: Extractor{T}
+    payload::Union{T,Nothing}
+end
+
+interned(s::String) = ccall(:jl_symbol_lookup, Ptr{Cvoid}, (Cstring,), s) != C_NULL
+
+@testset "interns_client_strings" begin
+    for T in (Symbol, Nullable{Symbol}, Vector{Symbol}, Set{Symbol}, Dict{Symbol,Int},
+              Dict{String,Symbol}, Tuple{Int,Symbol}, Tuple{Vararg{Symbol}},
+              NamedTuple{(:a,),Tuple{Symbol}}, WithSymbol, WithSymbolDict, WithEnumDict,
+              Vector{WithSymbol})
+        @test interns_client_strings(T)
+    end
+    for T in (Any, Int, Float64, String, Shade, Nullable{Shade}, Vector{Shade}, Dict{String,Shade},
+              Dict{String,Any}, Tuple{Vararg{Int}}, Safe, Node, Vector)
+        @test !interns_client_strings(T)
+    end
+end
+
+@testset "a Symbol-binding parameter is refused when the route is declared" begin
+    refused(route) = (app = App(mod = @__MODULE__);
+                      @test_throws ArgumentError urlpatterns(app, "", route))
+    refused(path("/p/{x}", (req, x::Symbol) -> "x"))
+    refused(path("/q", (req, x::Nullable{Symbol} = nothing) -> "x"))
+    refused(path("/b", (req, b::Body{Symbol}) -> "x"; method = "POST"))
+    refused(path("/c", (req, c::Cookie{Symbol}) -> "x"))
+    refused(path("/qs", (req, q::Query{WithSymbol}) -> "x"))
+    refused(path("/j", (req, j::Json{Vector{Symbol}}) -> "x"; method = "POST"))
+    refused(path("/f", (req, f::Form{WithSymbolDict}) -> "x"; method = "POST"))
+    refused(path("/je", (req, j::Json{WithEnumDict}) -> "x"; method = "POST"))
+
+    app = App(mod = @__MODULE__)
+    err = try
+        urlpatterns(app, "", path("/p/{x}", (req, x::Symbol) -> "x"))
+        nothing
+    catch e
+        e
+    end
+    @test occursin("'x'", err.msg)
+    @test occursin("@enum", err.msg)
+end
+
+@testset "everything that does not bind a Symbol from input still registers" begin
+    app = App(mod = @__MODULE__)
+    urlpatterns(app, "",
+        path("/ok/{shade}", (req, shade::Shade) -> string(shade)),
+        path("/safe", (req, s::Json{Safe}) -> "x"; method = "POST"),
+        path("/session", (req, s::Session{WithSymbol}) -> "x"),
+        path("/opaque", (req, o::Opaque{WithSymbol}) -> "x"; method = "POST"),
+    )
+    @test internalrequest(app, HTTP.Request("GET", "/ok/dark")).status == 200
+end
+
+@testset "json(req, T) refuses a Symbol-binding T without interning" begin
+    k = "nitro306_" * bytes2hex(rand(Random.RandomDevice(), UInt8, 12))
+    req = HTTP.Request("POST", "/", ["Content-Type" => "application/json"], """{"tag":"$k"}""")
+    @test_throws ArgumentError json(req, WithSymbol)
+    @test_throws ArgumentError json(req, Dict{Symbol,String})
+    @test !interned(k)
+end
+end

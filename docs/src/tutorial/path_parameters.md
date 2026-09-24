@@ -186,6 +186,12 @@ An `@enum` binds by its integer value or by its name: `/fruit/2` and `/fruit/ora
 turned into a `Symbol` — Julia never frees an interned `Symbol`, so building one from each request
 would let any client grow the process's memory for good.
 
+For the same reason a parameter declared `::Symbol` is refused when the route is declared:
+`urlpatterns` throws an `ArgumentError` naming it. The rule covers every place a request value is
+read into, so `Nullable{Symbol}`, `Body{Symbol}`, and a `Symbol` field (or `Vector{Symbol}`,
+`Dict{Symbol,…}`) of a `Query`/`Form`/`Json` struct are refused too. Use an `@enum` for a closed
+set of names, or a `String` checked against an allow-list.
+
 A `Union{...}` annotation binds to the **first member type that parses**; if no member accepts the
 value, the request is a `400`.
 

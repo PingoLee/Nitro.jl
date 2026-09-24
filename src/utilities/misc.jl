@@ -143,10 +143,10 @@ function parseparam(::Type{Regex}, str::String)
 end
 
 
-function parseparam(::Type{Symbol}, str::String)
-    return Symbol(str)
-end
-
+# There is deliberately no `parseparam(::Type{Symbol}, …)`. It was `Symbol(str)`, which interned
+# every value a client sent, and Julia never frees an interned `Symbol` (#306). A `Symbol`
+# parameter is refused at route registration; one reached any other way falls through to the
+# JSON fallback below, whose read style refuses it too.
 
 # An enum binds by its integer value or by its name. The name is matched against the members'
 # own names (`BodyParsers.enum_from_string`), never looked up as `Symbol(str)`: that would intern

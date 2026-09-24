@@ -1,7 +1,9 @@
 module BodyParsers
 
-using HTTP 
+using HTTP
 using JSON
+using Dates: Dates
+using UUIDs: UUID
 using ..Util
 using ...Errors: is_unrecoverable
 
@@ -75,6 +77,46 @@ _SU.lift(st::NitroReadStyle, ::Type{E}, x::Integer) where {E<:Enum} =
 const _SYMBOL_REFUSED = "Nitro never builds a Symbol from request input (#306); declare an @enum, or a String checked against an allow-list"
 _SU.lift(::NitroReadStyle, ::Type{Symbol}, x) = throw(ArgumentError(_SYMBOL_REFUSED))
 _SU.liftkey(::NitroReadStyle, ::Type{Symbol}, x) = throw(ArgumentError(_SYMBOL_REFUSED))
+
+"""
+    interns_client_strings(T) :: Bool
+
+Whether binding request input to `T` could build a `Symbol` from a client string (#306): `T` is
+`Symbol`, or contains one anywhere a value is read into -- a `Union` member, an element, key or
+value type, a tuple slot, a struct field. A dictionary keyed by an enum counts too: JSON.jl lifts
+dictionary keys with its own conversion, which interns an enum name before looking it up.
+
+Route registration refuses such a parameter, and `json(req, T)` refuses such a `T`. An enum
+*value* is fine: every Nitro path matches it by name without interning.
+"""
+interns_client_strings(@nospecialize(T)) :: Bool = _interns(T, Base.IdSet{Any}())
+
+function _interns(@nospecialize(T), seen::Base.IdSet{Any}) :: Bool
+    T === Symbol && return true
+    T === Any && return false
+    T isa TypeVar && return _interns(T.ub, seen)
+    T isa UnionAll && return _interns(Base.unwrap_unionall(T), seen)
+    T isa Union && return _interns(T.a, seen) || _interns(T.b, seen)
+    T isa DataType || return false
+    T in seen && return false
+    push!(seen, T)
+    # An unwrapped `UnionAll` (`Vector` -> `Array{T,1}`) still has free type variables, which
+    # `eltype`/`fieldtypes` cannot resolve; its parameters (each a `TypeVar` bound) can be.
+    Base.has_free_typevars(T) &&
+        return any(p -> (p isa Type || p isa TypeVar) && _interns(p, seen), T.parameters)
+    # Values of these types are parsed or matched without ever building a Symbol.
+    T <: Union{Number, AbstractString, AbstractChar, Enum, Dates.TimeType, UUID, Regex, Nothing, Missing} &&
+        return false
+    if T <: AbstractDict
+        K, V = keytype(T), valtype(T)
+        (K isa Type && K <: Enum) && return true
+        return _interns(K, seen) || _interns(V, seen)
+    end
+    T <: Union{AbstractArray, AbstractSet} && return _interns(eltype(T), seen)
+    T <: Tuple && return any(t -> _interns(Base.unwrapva(t), seen), T.parameters)
+    isstructtype(T) || return false
+    return any(t -> _interns(t, seen), fieldtypes(T))
+end
 
 # HTTP.jl v2 replaced the raw `Vector{UInt8}` request body (and `HTTP.payload`) with the
 # `AbstractBody` hierarchy. Extract the bytes without consuming the body cursor so the
@@ -223,12 +265,14 @@ end
 Read the body of a HTTP.Request as JSON with additional arguments for the read/serializer into a custom struct.
 
 The body is client input, so it is always parsed with Nitro's read style, which never interns a
-client string as a `Symbol` (#306): an enum field binds by name or by integer, and a `Symbol`
-field is refused. Passing `style` is an `ArgumentError`.
+client string as a `Symbol` (#306): an enum field binds by name or by integer. A `T` that would
+bind a `Symbol` anywhere (see `interns_client_strings`) is refused, and so is passing `style`;
+both are an `ArgumentError`.
 """
 function json(req::HTTP.Request, class_type::Type{T}; kwargs...) where {T}
     haskey(kwargs, :style) && throw(ArgumentError(
         "json(req, T) parses client input with Nitro's read style (#306); `style` cannot be overridden"))
+    interns_client_strings(T) && throw(ArgumentError("json(req, $T): " * _SYMBOL_REFUSED))
     payload = _request_payload(req)
     if isnothing(payload)
         return nothing

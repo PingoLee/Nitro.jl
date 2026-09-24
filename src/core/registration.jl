@@ -82,6 +82,34 @@ function merge_pathparam_type_hints(route::String, info::NamedTuple, route_param
     )
 end
 
+# The extractors that bind client input with Nitro's own parsers. `Session` reads a server-side
+# store, `Files` binds `FormFile`s, `Context` is the app's own value, and a third-party extractor
+# (`ProtoBuffer{T}`, whose generated `OneOf` carries a `name::Symbol`) binds with its own decoder --
+# none of them turns a client string into a `Symbol` through Nitro, so none is checked.
+const CLIENT_BOUND_EXTRACTOR = Union{Path, Query, Header, Json, JsonFragment, Form, Body, Cookie, MultipartForm}
+
+"""
+    refuse_client_symbols(route, param)
+
+Throw an `ArgumentError` at registration when binding `param` from the request could build a
+`Symbol` from a client string (#306). Julia never frees an interned `Symbol`, so such a parameter
+would let any client grow the process's memory for good, one request at a time.
+"""
+function refuse_client_symbols(route::String, param::Param)
+    # `Context{T}` is not an `Extractor`; its `T` is the app's own config, never bound from input.
+    param.type <: Context && return nothing
+    T = if param.type <: Extractor
+        param.type <: CLIENT_BOUND_EXTRACTOR || return nothing
+        extracttype(param.type)
+    else
+        param.type
+    end
+    Util.BodyParsers.interns_client_strings(T) || return nothing
+    throw(ArgumentError(
+        "Parameter '$(param.name)' of route $route would build a Symbol from request input, " *
+        "which Julia never frees (#306). Declare an @enum, or a String checked against an allow-list."))
+end
+
 function parse_func_params(route::String, func::Function; type_hints::Dict{Symbol, Type}=Dict{Symbol, Type}())
     info = splitdef(func, start=2)
 
@@ -109,6 +137,7 @@ function parse_func_params(route::String, func::Function; type_hints::Dict{Symbo
     body_params = []
 
     for param in info.args
+        refuse_client_symbols(route, param)
         if param.type <: Context
             continue
         elseif param.type <: Extractor

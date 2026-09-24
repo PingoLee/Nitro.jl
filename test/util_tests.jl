@@ -1,6 +1,7 @@
 ﻿@testitem "Util" tags=[:core] setup=[NitroCommon] begin
 using Test
 using UUIDs
+using Random
 using Nitro.Core.Util
 using Nitro.Core.Util: mount_segments, mount_route, _route_encode, mount_remainder
 using Nitro.Core: serverwelcome
@@ -132,13 +133,25 @@ end
     # fails here rather than silently mangling one parameter source.
     @test parseparam(String, "a%2Bb")   == "a%2Bb"
     @test parseparam(Any,    "100%25")  == "100%25"
-    @test parseparam(Symbol, "a%20b")   === Symbol("a%20b")
     @test parseparam(Char,   "%41")     === '%'          # NOT 'A'
     @test parseparam(Regex,  "a%2Bb")   == r"a%2Bb"
 
     # The keyword itself must be gone, not merely defaulted to false -- otherwise a call site
     # could opt back into the double decode.
     @test_throws MethodError parseparam(String, "a%20b"; escape=true)
+end
+
+@testset "parseparam never builds a Symbol (#306)" begin
+    # `parseparam(::Type{Symbol}, str) = Symbol(str)` used to sit in the list above. It interned
+    # every value a client sent, and Julia never frees an interned Symbol, so the method is gone:
+    # a `Symbol` reaching `parseparam` now falls through to the JSON fallback, whose read style
+    # refuses it. Route registration refuses a `Symbol` parameter before it gets this far.
+    interned(s) = ccall(:jl_symbol_lookup, Ptr{Cvoid}, (Cstring,), s) != C_NULL
+    k = "nitro306_" * bytes2hex(rand(Random.RandomDevice(), UInt8, 12))
+    @test_throws Exception parseparam(Symbol, k)
+    @test_throws Exception parseparam(Symbol, "\"$k\"")
+    @test_throws ValidationError parseparam(Union{Nothing, Symbol}, "\"$k\"")
+    @test !interned(k)
 end
 
 @testset "parseparam_checked" begin
