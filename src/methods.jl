@@ -74,6 +74,12 @@ is explicit introspection, not accidental disclosure.)
   oversized uploads before they reach Julia at all. Asking for a ceiling alongside a custom
   `handler` throws, because the handler reads the body itself and Nitro cannot enforce one there;
   pass `max_body_bytes = nothing` if you want to state that explicitly.
+- `max_fields=1000`: ceiling on the number of fields in one request, per source: query
+  parameters, urlencoded form fields, multipart parts, and the object keys of a JSON body (the
+  whole document). A request over it is answered **400** before those fields are hashed into a
+  `Dict` (#327). `0` means unlimited. Django's `DATA_UPLOAD_MAX_NUMBER_FIELDS`, same default.
+  It also applies to `internalrequest` against the app, and to a parser called outside any
+  request (`DEFAULT_MAX_FIELDS`).
 - `reuseaddr`: forwarded to `HTTP.listen!`. Defaults to `true` on Linux/macOS, where it
   allows rebinding a port still in `TIME_WAIT`, and to **`false` on Windows**, where
   `SO_REUSEADDR` instead lets a second process bind a port another is actively listening

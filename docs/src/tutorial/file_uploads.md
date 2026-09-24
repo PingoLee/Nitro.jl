@@ -226,6 +226,9 @@ This blocks the thread and causes client timeouts.
     upstream. Note the whole body is still buffered in memory before staging, so the ceiling you
     choose is also the memory a single upload can claim.
 
+    The number of *parts* is capped separately: more than `serve(max_fields = …)` parts
+    (default 1000) is a `400`. Raise it for a form that uploads more files than that at once.
+
 Instead, follow this **Stage & Work** pattern:
 
 1. **Stage** — write the file bytes to a temporary directory and get a path.

@@ -6,6 +6,7 @@ using Dates: Dates
 using UUIDs: UUID
 using ..Util
 using ...Errors: is_unrecoverable, ValidationError
+using ...Constants: REQUEST_MAX_FIELDS
 
 export text, binary, json, formdata, multipart, FormFile
 
@@ -248,9 +249,15 @@ implicit root array, so it recurses one level deeper than the count -- immateria
 
 `ArgumentError` is what `JSON.parse` itself throws on malformed input, so a too-deep document
 lands on every caller's existing "not JSON" path. The message names the limit, never the input.
+
+With `max_keys > 0` the same pass also counts object keys -- every `:` outside a string, which in
+JSON separates a key from its value and appears nowhere else -- and throws a `ValidationError`
+past `max_keys` (#327). A key cap is not "malformed JSON" but a refused request, so it is a 400
+everywhere rather than the "not JSON" answer the depth bound gives.
 """
-function _check_json_depth(bytes::AbstractVector{UInt8})
+function _check_json_depth(bytes::AbstractVector{UInt8}, max_keys::Int = 0)
     depth = 0
+    keys = 0
     instring = false
     escaped = false
     for b in bytes
@@ -269,23 +276,56 @@ function _check_json_depth(bytes::AbstractVector{UInt8})
             depth > MAX_JSON_DEPTH && _throw_json_too_deep()
         elseif (b == UInt8(']') || b == UInt8('}')) && depth > 0
             depth -= 1
+        elseif b == UInt8(':') && max_keys > 0
+            keys += 1
+            keys > max_keys && _throw_too_many_fields("The JSON body", max_keys)
         end
     end
     return nothing
 end
 
-_check_json_depth(s::AbstractString) = _check_json_depth(codeunits(s))
+_check_json_depth(s::AbstractString, max_keys::Int = 0) = _check_json_depth(codeunits(s), max_keys)
+
+# The field cap (#327): one message for every source, naming the source and the cap -- never a
+# key, which is client input.
+@noinline _throw_too_many_fields(source::String, cap::Int) =
+    throw(ValidationError("$source has more than $cap fields"))
 
 """
-    _parse_json_bounded(buf, T = Any; kwargs...)
+    _check_field_count(s, source) -> nothing
+
+Throw a `ValidationError` if the `&`-separated string `s` (a query string or an urlencoded form
+body) holds more non-empty fields than the cap in force, `REQUEST_MAX_FIELDS` (#327). Counted
+before the fields are parsed into a `Dict`, whose string hashing a client choosing its own keys
+can collide. Stops counting at the first field past the cap.
+"""
+function _check_field_count(s::AbstractString, source::String)
+    cap = Int(REQUEST_MAX_FIELDS[])
+    cap > 0 || return nothing
+    n = 0
+    for field in eachsplit(s, '&')
+        isempty(field) && continue
+        n += 1
+        n > cap && _throw_too_many_fields(source, cap)
+    end
+    return nothing
+end
+
+"""
+    _parse_json_bounded(buf, T = Any; max_fields = REQUEST_MAX_FIELDS[], kwargs...)
 
 `JSON.parse(buf, T; kwargs...)` after `_check_json_depth`. The one way Nitro parses JSON
 that came from a request -- body, query string, path segment, cookie, or JWT segment -- so the
 parser's recursion is bounded by `MAX_JSON_DEPTH` and never by the input (#314).
 Throws `ArgumentError` for a too-deep document, like any other malformed one.
+
+The same pass caps the document's object keys at `max_fields` -- the request's
+`serve(max_fields = …)` by default, `0` for none -- throwing a `ValidationError` past it (#327).
+The `HTTP.Response` parsers pass `0`: a response is not client input.
 """
-function _parse_json_bounded(buf::Union{AbstractVector{UInt8}, AbstractString}, ::Type{T} = Any; kwargs...) where {T}
-    _check_json_depth(buf)
+function _parse_json_bounded(buf::Union{AbstractVector{UInt8}, AbstractString}, ::Type{T} = Any;
+                             max_fields::Integer = REQUEST_MAX_FIELDS[], kwargs...) where {T}
+    _check_json_depth(buf, Int(max_fields))
     return JSON.parse(buf, T; kwargs...)
 end
 
@@ -320,6 +360,8 @@ function formdata(req::HTTP.Request) :: Dict{String,String}
     if isnothing(body) || !occursin('=', body)
         return copy(EMPTY_FORM_DATA)
     end
+    # Outside the `try`: too many fields is a refused request (a 400), not "no form" (#327).
+    _check_field_count(body, "The form body")
     try
         return HTTP.queryparams(body)
     catch e
@@ -366,7 +408,9 @@ end
 Read the body of a HTTP.Request as JSON with additional arguments for the read/serializer.
 
 Returns `nothing` when the body is empty or is not JSON -- including a document nested deeper
-than 512 arrays/objects, which is rejected before parsing (#314).
+than 512 arrays/objects, which is rejected before parsing (#314). A document with more object keys
+than `serve(max_fields = …)` allows is not "not JSON" but a refused request: a `ValidationError`,
+answered `400` (#327).
 """
 function json(req::HTTP.Request; kwargs...)
     payload = _request_payload(req)
@@ -385,6 +429,8 @@ function json(req::HTTP.Request; kwargs...)
         # rethrow stays for what the bound does not cover -- `OutOfMemoryError`, an
         # `InterruptException`, or a regression in the bound itself.
         is_unrecoverable(e) && rethrow()
+        # Too many keys (#327) is a refusal, not malformed input: let it answer 400.
+        e isa ValidationError && rethrow()
         return nothing
     end
 end
@@ -395,7 +441,8 @@ function json(res::HTTP.Response; kwargs...)
         return nothing
     end
     try
-        return _parse_json_bounded(payload; kwargs...)
+        # No field cap: a response is not client input.
+        return _parse_json_bounded(payload; max_fields = 0, kwargs...)
     catch e
         # Same contract and bound as the `Request` method above (#254, #314). This one reads
         # a RESPONSE body, so it is not the attacker-reachable path -- it is here because the
@@ -453,7 +500,7 @@ function json(res::HTTP.Response, class_type::Type{T}; kwargs...) where {T}
     if isnothing(payload)
         return nothing
     end
-    return _parse_json_bounded(payload, class_type; kwargs...)
+    return _parse_json_bounded(payload, class_type; max_fields = 0, kwargs...)
 end
 
 
@@ -502,6 +549,10 @@ function multipart(req::HTTP.Request) :: Dict{String, Union{FormFile, Vector{For
     if isnothing(parts)
         return result
     end
+
+    # The part list is a plain vector; the hash tables below are what the cap protects (#327).
+    cap = Int(REQUEST_MAX_FIELDS[])
+    cap > 0 && length(parts) > cap && _throw_too_many_fields("The multipart body", cap)
 
     # Collect files and text into separate, homogeneously-typed buckets. This
     # keeps the per-field vectors correctly typed (`Vector{FormFile}` /

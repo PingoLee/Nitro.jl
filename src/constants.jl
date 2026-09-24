@@ -1,5 +1,6 @@
 module Constants
 using HTTP
+using Base.ScopedValues: ScopedValue
 
 
 export PACKAGE_DIR,
@@ -8,7 +9,7 @@ export PACKAGE_DIR,
     WEBSOCKET, STREAM,
     SPECIAL_METHODS, METHOD_ALIASES, TYPE_ALIASES,
     SHUTDOWN_TIMEOUT_SECONDS,
-    DEFAULT_MAX_BODY_BYTES
+    DEFAULT_MAX_BODY_BYTES, DEFAULT_MAX_FIELDS
 
 # Generate a reliable path to our package directory
 const PACKAGE_DIR = @__DIR__
@@ -80,5 +81,34 @@ convention — so the per-request check stays a plain integer comparison on the 
 branching on a `Union{Nothing, Int64}` (nitro-core §7). `serve` does that normalization once.
 """
 const DEFAULT_MAX_BODY_BYTES :: Int64 = 64 * 1024 * 1024
+
+"""
+Default ceiling on the number of fields one request may carry, per source, before Nitro answers
+**400**: query parameters, urlencoded form fields, multipart parts, and the keys of a JSON body
+(counted across the whole document, every object included).
+
+Byte caps bound how much a request can send, not how many keys it packs into it, and every one
+of those sources becomes a hash table keyed by strings the client chose. Julia's `hash(::String)`
+uses a fixed seed, so a client that can pick its keys can pick colliding ones. 1000 is Django's
+`DATA_UPLOAD_MAX_NUMBER_FIELDS`, and Express's `urlencoded` `parameterLimit`; a form or JSON body
+with more fields than that is almost always a bug or an attack.
+
+Override per server with `serve(max_fields = …)`; `0` means unlimited (#327).
+"""
+const DEFAULT_MAX_FIELDS :: Int64 = 1000
+
+"""
+    REQUEST_MAX_FIELDS :: ScopedValue{Int64}
+
+The field cap in force for the request being handled: `serve(max_fields = …)`, bound by the
+pipeline's outermost layer for the request's whole dynamic extent (and by `internalrequest`, which
+runs the same pipeline). Outside a request it is [`DEFAULT_MAX_FIELDS`](@ref), so a parser called
+directly -- in a test, a script -- is still capped. `0` means unlimited.
+
+A `ScopedValue` rather than a field on the request: the parsers that enforce it (`Util`'s body
+parsers, `Types`' query accessor) load before `App` exists, and reading a typed scoped value keeps
+`Any` out of the hot path. It is the same carrier as `SERVING_APP` (#308).
+"""
+const REQUEST_MAX_FIELDS = ScopedValue{Int64}(DEFAULT_MAX_FIELDS)
 
 end

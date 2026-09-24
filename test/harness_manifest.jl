@@ -68,6 +68,7 @@ const TEST_FILES = [
     "response_tests.jl",
     "bodyparser_tests.jl",
     "max_body_bytes_tests.jl",
+    "max_fields_tests.jl",
     "ergonomics_tests.jl",
     "app_tests.jl",
     "server_show_tests.jl",

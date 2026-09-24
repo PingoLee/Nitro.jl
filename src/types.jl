@@ -1027,6 +1027,8 @@ function _queryvars_uncached(req::HTTP.Request)
     # No URI parse, so nothing here can fail on the shape of the target itself (#326); the
     # guard below covers what can -- the percent-decoding of the query.
     query = _target_query(req.target)
+    # Before the parse, and outside the guard: too many fields is a refused request (#327).
+    Util.BodyParsers._check_field_count(query, "The query string")
     vars = try
         HTTP.queryparams(query)
     catch e
