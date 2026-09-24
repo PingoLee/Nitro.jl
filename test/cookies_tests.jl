@@ -1747,6 +1747,32 @@ end
     end
 end
 
+@testset "serving an App past a GLOBAL cookie key warns" begin
+    # The one setup #308 makes worse: the key sits on the global app, an explicit App is served,
+    # and the helpers -- which used to find the global key by accident -- now write plaintext.
+    resetstate()
+    try
+        configcookies(secret_key = key_g)
+        bare = App(mod = @__MODULE__)
+        @test_logs (:warn, r"GLOBAL app.*NOT encrypted") Nitro._warn_shadowed_cookie_key(bare, (;))
+        # ...and the message never carries the key.
+        logger = Test.TestLogger()
+        Base.CoreLogging.with_logger(() -> Nitro._warn_shadowed_cookie_key(bare, (;)), logger)
+        @test !any(r -> occursin(key_g, r.message), logger.logs)
+
+        # Silent whenever the served app does have a key, or is the global app itself.
+        keyed = App(mod = @__MODULE__)
+        configcookies(keyed; secret_key = key_a)
+        @test_logs min_level = Base.CoreLogging.Warn Nitro._warn_shadowed_cookie_key(keyed, (;))
+        @test_logs min_level = Base.CoreLogging.Warn Nitro._warn_shadowed_cookie_key(bare, (; secret_key = key_a))
+        @test_logs min_level = Base.CoreLogging.Warn Nitro._warn_shadowed_cookie_key(Nitro.CONTEXT[], (;))
+    finally
+        resetstate()
+    end
+    # No global key: nothing to shadow.
+    @test_logs min_level = Base.CoreLogging.Warn Nitro._warn_shadowed_cookie_key(App(mod = @__MODULE__), (;))
+end
+
 @testset "outside a request, and on the singleton, they mean the global app" begin
     resetstate()
     try

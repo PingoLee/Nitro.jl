@@ -555,6 +555,23 @@ function configcookies(; kwargs...)
     configcookies(Dict(string(k) => v for (k, v) in kwargs))
 end
 
+# #308 moved the argument-less helpers from the GLOBAL app's cookie config to the SERVING app's.
+# One setup is worse off for it: a key configured on the global app (`configcookies(secret_key =
+# …)`, no `app`) while an explicit `App` is served. Those helpers used to encrypt under the global
+# key by accident; now they would write plaintext without a word. Say so, once, where the mix is
+# visible. Never names the key.
+function _warn_shadowed_cookie_key(app::App, kwargs)
+    app === CONTEXT[] && return nothing
+    isnothing(CONTEXT[].service.cookies[].secret_key) && return nothing
+    isnothing(app.service.cookies[].secret_key) || return nothing
+    isnothing(Base.get(kwargs, :secret_key, nothing)) || return nothing
+    @warn "Nitro: a cookie secret_key is configured on the GLOBAL app (`configcookies(secret_key = …)`), " *
+          "but the App being served has none, so its cookies are NOT encrypted. `get_cookie`/" *
+          "`set_cookie!` use the configuration of the app serving the request (#308) -- configure " *
+          "this one with `configcookies(app; secret_key = …)` or `serve(app; secret_key = …)`." maxlog = 1
+    return nothing
+end
+
 # The app whose cookie config the argument-less helpers use: the one SERVING this request, and
 # the global app only outside any request (#308). They used to read `CONTEXT[]` always, so an app
 # built with an explicit `App` silently wrote plaintext and trusted raw client values -- its key
@@ -676,6 +693,7 @@ context, which has nothing to do with `app`. A blocking call still terminates th
 it started.
 """
 function serve(app::App; kwargs...)
+    _warn_shadowed_cookie_key(app, kwargs)
     async = Base.get(kwargs, :async, false)
     # Same reasoning as the singleton form above: decide ownership BEFORE the call, so a
     # rejected `serve` never tears down the healthy server that caused the rejection.
