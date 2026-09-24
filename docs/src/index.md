@@ -178,10 +178,11 @@ end
 
 function profile(req::HTTP.Request)
     session = getsession(req)
-    if isnothing(session) || !haskey(session, "user_id")
+    user_id = isnothing(session) ? nothing : get(session, "user_id", nothing)
+    if isnothing(user_id)
         return Res.send("Unauthorized", status=401)
     end
-    return Res.json(Dict("user_id" => session["user_id"]))
+    return Res.json(Dict("user_id" => user_id))
 end
 
 urlpatterns("",

@@ -2,6 +2,7 @@ module AuthMiddleware
 
 using HTTP
 using ...Types
+using ...Types: _is_identity
 using ...Cookies: get_cookie
 using ...Errors: CookieError, is_unrecoverable
 
@@ -12,11 +13,17 @@ const EXPIRED_TOKEN = HTTP.Response(401, "Unauthorized: Invalid or expired token
 const MISSING_COOKIE = HTTP.Response(401, "Unauthorized: Missing or invalid authentication cookie")
 
 # Shared post-validation dispatch for both auth middlewares — the single place the
-# validated identity is attached to the request. `nothing`/`missing` (including a
-# validator that threw, mapped by the callers) → 401; a `(user, claims)` 2-tuple →
+# validated identity is attached to the request. A value that is not an identity →
+# 401: `nothing`/`missing` (including a validator that threw, mapped by the callers), any
+# `Bool`, `""`, an empty dict — see `_is_identity` (src/types.jl). A `(user, claims)` 2-tuple →
 # `req.context[:user]` + `req.context[:auth_claims]`; anything else → `req.context[:user]`.
-# A 2-tuple whose user half is `nothing` is ALSO a 401: a nil user is no user, which is
+# A 2-tuple whose user half is not an identity is ALSO a 401: a nil user is no user, which is
 # what `jwt_validator` already means when its `user_validator` returns nothing (#24).
+#
+# `Bool` is the case that bit (#313). A predicate validator — `t -> t == API_KEY`, which is
+# what `false` means in Passport — returned `false` for a WRONG key, this layer stored it as
+# the user, and the handler ran. `true` is rejected too: it answers "is this key valid?", it
+# does not say who is calling.
 # Auth error contract: 401 = unauthenticated (this layer), 403 = authenticated but not
 # authorized (guards), 302 = browser redirect (`login_required`). A validator that throws is a
 # 401 — because a failed credential lookup is exactly what this layer exists to turn into a
@@ -61,11 +68,11 @@ function _set_auth_claims!(req::HTTP.Request, claims)
 end
 
 function _handle_validated(handle::Function, req::HTTP.Request, user_info)
-    if user_info === nothing || user_info === missing
+    if !_is_identity(user_info)
         return EXPIRED_TOKEN
     elseif user_info isa Tuple && length(user_info) == 2
         user, claims = user_info
-        (user === nothing || user === missing) && return EXPIRED_TOKEN
+        _is_identity(user) || return EXPIRED_TOKEN
         req.context[:user] = user
         _set_auth_claims!(req, claims)
         return handle(req)
@@ -82,7 +89,7 @@ end
 Creates a middleware function for authentication using a pluggable token validation function based on cookies.
 
 # Arguments
-- `validate_token::Function`: A function that takes a token string from the cookie (and optionally the request) and returns user info, a `(user, claims)` tuple, or `nothing` if invalid. A tuple whose *user* half is `nothing` counts as invalid too — a nil user is no user.
+- `validate_token::Function`: A function that takes a token string from the cookie (and optionally the request) and returns user info, a `(user, claims)` tuple, or `nothing` if invalid. `nothing`, `missing`, a `Bool`, `""` and an empty dict are not identities, so each is a `401`, and so is a tuple whose *user* half is one of them — a predicate like `t -> t == KEY` authenticates nobody; return an identity (`t -> t == KEY ? "api-client" : nothing`).
 - `cookie_name::String = "auth_token"`: The name of the cookie to extract the token from.
 - `secret_key::Union{String, Nothing} = nothing`: If provided, the cookie will be decrypted before validation.
 
@@ -138,7 +145,7 @@ end
 Creates a middleware function for authentication using a pluggable token validation function.
 
 # Arguments
-- `validate_token::Function`: A function that takes a token string (and optionally the request) and returns user info, a `(user, claims)` tuple, or `nothing` if invalid. A tuple whose *user* half is `nothing` counts as invalid too — a nil user is no user.
+- `validate_token::Function`: A function that takes a token string (and optionally the request) and returns user info, a `(user, claims)` tuple, or `nothing` if invalid. `nothing`, `missing`, a `Bool`, `""` and an empty dict are not identities, so each is a `401`, and so is a tuple whose *user* half is one of them — a predicate like `t -> t == KEY` authenticates nobody; return an identity (`t -> t == KEY ? "api-client" : nothing`).
 - `header::String = "Authorization"`: The name of the header to check for the token.
 - `scheme::String = "Bearer"`: The authentication scheme prefix in the header (e.g., "Bearer" for "Bearer <token>").
 

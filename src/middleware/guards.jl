@@ -2,7 +2,7 @@ module GuardsMiddleware
 
 using HTTP
 using ...Core: getsession
-using ...Types: Nullable, Principal
+using ...Types: Nullable, Principal, _is_identity
 
 export GuardMiddleware, login_required, role_required, permission_required,
 	claim_required, kid_required
@@ -85,10 +85,12 @@ A request counts as authenticated in one of two ways, and they are trusted diffe
 
 1. **An auth middleware set `req.context[:user]`** (`BearerAuth`, `CookieAuthMiddleware`, or your
    own). The identity is trusted as-is, whatever its shape, so a JWT principal without a
-   `user_id` passes. Only an empty dict is refused.
-2. **Otherwise, the raw [`getsession`](@ref) dict**, which must carry `session_key`. An anonymous
-   visitor accumulates session data too (a cart, a CSRF token), so a non-empty session alone is
-   not a login.
+   `user_id` passes. What is refused is a value that is no identity at all: a `Bool`, `""`,
+   `missing`, or an empty dict — the same set the auth middleware answers with a `401`.
+2. **Otherwise, the raw [`getsession`](@ref) dict**, which must carry `session_key` with an
+   identity as its value. An anonymous visitor accumulates session data too (a cart, a CSRF
+   token), so a non-empty session alone is not a login — and neither is a logout that set
+   `session["user_id"] = nothing` rather than deleting the key.
 
 `login_required` checks *that* someone is logged in, not *what* they may do. Stack
 [`claim_required`](@ref) or [`role_required`](@ref) after it for that. For a JSON API a redirect
@@ -112,18 +114,22 @@ function login_required(; redirect_url::String="/login", session_key::String="us
 		# Conflating the two (admitting any non-empty dict) is the auth bypass fixed
 		# here; requiring `session_key` on source 1 would instead lock out legitimate
 		# token-authenticated users.
+		#
+		# Both sources go through `_is_identity` (src/types.jl), the predicate the auth
+		# middleware rejects with (#313). A `:user` that is set but is no identity — `false`
+		# from a predicate validator, `""`, an empty dict — is a denial, NOT a fall-through to
+		# the session: something vouched, and what it vouched for is nobody.
 		ctx_user = Base.get(req.context, :user, nothing)
 		if ctx_user !== nothing
-			# An empty Dict carries no identity; stay defensive and treat it as unauthenticated.
-			if ctx_user isa AbstractDict && isempty(ctx_user)
-				return HTTP.Response(302, ["Location" => redirect_url])
-			end
-			return nothing
+			_is_identity(ctx_user) && return nothing
+			return HTTP.Response(302, ["Location" => redirect_url])
 		end
 
 		session = getsession(req)
-		if session isa AbstractDict && (haskey(session, session_key) || haskey(session, Symbol(session_key)))
-			return nothing
+		if session isa AbstractDict
+			marker = haskey(session, session_key) ? session[session_key] :
+				Base.get(session, Symbol(session_key), nothing)
+			_is_identity(marker) && return nothing
 		end
 		return HTTP.Response(302, ["Location" => redirect_url])
 	end

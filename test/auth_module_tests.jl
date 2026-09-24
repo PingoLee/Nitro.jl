@@ -867,11 +867,47 @@ end
 
     store = Nitro.Types.MemoryStore{String, Dict{String,Any}}()
     Nitro.Types.set_session!(store, "sess-1", Dict{String,Any}("user" => Dict("id" => 5)); ttl=60)
-    session_validator = Nitro.Auth.session_user_validator(store)
+    # `user_key = "user"` is explicit since #310 moved the default to "user_id".
+    session_validator = Nitro.Auth.session_user_validator(store; user_key = "user")
     @test session_validator("sess-1")["id"] == 5
     # The optional second argument is the middleware arity-dispatch slot; an HTTP.Request
     # there must not be mistaken for session data.
     @test session_validator("sess-1", HTTP.Request("GET", "/"))["id"] == 5
+end
+
+@testset "session_user_validator: only the login marker is an identity (#310)" begin
+    store = Nitro.Types.MemoryStore{String, Dict{String,Any}}()
+    Nitro.Types.set_session!(store, "logged-in", Dict{String,Any}("user_id" => 42, "cart" => [101]); ttl=60)
+    Nitro.Types.set_session!(store, "anon-cart", Dict{String,Any}("cart" => [101]); ttl=60)
+    Nitro.Types.set_session!(store, "anon-empty", Dict{String,Any}(); ttl=60)
+    Nitro.Types.set_session!(store, "logged-out", Dict{String,Any}("user_id" => nothing); ttl=60)
+    validator = Nitro.Auth.session_user_validator(store)
+
+    # The default key is the one `login_required` and `SessionMiddleware` read.
+    @test validator("logged-in") == 42
+    @test validator("logged-in", HTTP.Request("GET", "/")) == 42
+
+    # An anonymous session is not a login, however much it holds. Before #310 each of these
+    # returned the whole session dict, which auth middleware then accepted as the user.
+    @test validator("anon-cart") === nothing
+    @test validator("anon-empty") === nothing
+    @test validator("anon-cart", HTTP.Request("GET", "/")) === nothing
+    # A marker explicitly set to `nothing` is no login either.
+    @test validator("logged-out") === nothing
+    # And no session at all.
+    @test validator("no-such-session") === nothing
+
+    # Session data handed in directly (the `SessionMiddleware(validator = ...)` call shape).
+    @test validator("any-id", Dict{String,Any}("user_id" => 7)) == 7
+    @test validator("any-id", Dict{String,Any}("cart" => [1])) === nothing
+    @test validator("any-id", Dict{Symbol,Any}(:user_id => 8)) == 8
+    @test validator("any-id", Dict{Symbol,Any}(:cart => [1])) === nothing
+    # Session data that is not a dict carries no marker to find.
+    @test validator("any-id", "not a session") === nothing
+
+    # A custom key still works, and the default key is not consulted in its place.
+    by_user = Nitro.Auth.session_user_validator(store; user_key = "user")
+    @test by_user("logged-in") === nothing
 end
 
 @testset "jwt_validator identity and profiles" begin
@@ -938,6 +974,16 @@ end
         # A rejecting user_validator still yields nothing
         rejecting = Nitro.Auth.jwt_validator(keyset; user_validator = _ -> nothing)
         @test rejecting(Nitro.Auth.encode_jwt(Dict("sub" => "7"), keyset; expires_in=3600)) === nothing
+
+        # So does any other non-identity (#313): a predicate `user_validator` is a rejection,
+        # not a `(false, principal)` tuple handed on for the middleware to catch.
+        for bogus in (false, true, "", missing, Dict{String,Any}())
+            predicate = Nitro.Auth.jwt_validator(keyset; user_validator = _ -> bogus)
+            @test predicate(Nitro.Auth.encode_jwt(Dict("sub" => "7"), keyset; expires_in=3600)) === nothing
+        end
+        # A user id of 0 is a user.
+        zero = Nitro.Auth.jwt_validator(keyset; user_validator = _ -> 0)
+        @test zero(Nitro.Auth.encode_jwt(Dict("sub" => "7"), keyset; expires_in=3600))[1] == 0
     end
 
     @testset "construction-time validation" begin

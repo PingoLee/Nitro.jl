@@ -125,6 +125,50 @@ using Nitro: GuardMiddleware, login_required, role_required, permission_required
         @test guard_custom(req_custom_no).status == 302
     end
 
+    # #313: `login_required` refuses exactly what the auth middleware refuses (`_is_identity`,
+    # src/types.jl). Before, any non-`nothing` `:user` except an empty dict passed, so a
+    # predicate validator's `false` counted as logged in.
+    @testset "login_required refuses a non-identity (#313)" begin
+        guard = login_required(redirect_url="/login")
+        for bogus in (false, true, "", missing, Dict{String,Any}(), Principal(Dict{String,Any}()))
+            req = HTTP.Request("GET", "/test")
+            req.context[:user] = bogus
+            result = guard(req)
+            @test result isa HTTP.Response && result.status == 302
+        end
+
+        # A set-but-empty `:user` is a denial, not a fall-through to a logged-in session:
+        # the layer that set it vouched for nobody.
+        req_vouched_nobody = HTTP.Request("GET", "/test")
+        req_vouched_nobody.context[:user] = false
+        req_vouched_nobody.context[:session] = Dict{String,Any}("user_id" => 7)
+        @test guard(req_vouched_nobody).status == 302
+
+        # The session marker must hold an identity too. A logout that nulls the key instead
+        # of deleting it is not a login.
+        for bogus in (nothing, false, "")
+            req = HTTP.Request("GET", "/test")
+            req.context[:session] = Dict{String,Any}("user_id" => bogus, "cart" => [1])
+            @test guard(req).status == 302
+        end
+
+        # Still identities: a user id of 0, a string id, a non-empty Principal without an
+        # `id` (a service token — the documented case), and a claim-less Principal that does
+        # carry one (a keyset-verified signer).
+        for real in (0, "alice", Principal(Dict{String,Any}("action" => "sync")),
+                     Principal(Dict{String,Any}(); id = "service-a", kid = "service-a", source = :kid))
+            req = HTTP.Request("GET", "/test")
+            req.context[:user] = real
+            @test isnothing(guard(req))
+        end
+        req_zero = HTTP.Request("GET", "/test")
+        req_zero.context[:session] = Dict{String,Any}("user_id" => 0)
+        @test isnothing(guard(req_zero))
+        req_sym = HTTP.Request("GET", "/test")
+        req_sym.context[:session] = Dict{Symbol,Any}(:user_id => 5)
+        @test isnothing(guard(req_sym))
+    end
+
     @testset "role_required guard" begin
         guard = role_required("admin")
 

@@ -208,7 +208,9 @@ Returns the authenticated user attached to the request context by an auth middle
 **The type is deliberately open.** `BearerAuth`/`CookieAuthMiddleware` store whatever their
 validator returned: `jwt_validator` without a `user_validator` stores the [`Principal`](@ref),
 but with one it stores the *application's* user object and the `Principal` moves to
-`req.context[:auth_claims]`. A custom validator may return anything at all. Guards
+`req.context[:auth_claims]`. A custom validator may return any identity at all, with one
+restriction: `nothing`, `missing`, a `Bool`, `""` and an empty dict are *not* identities. The
+auth middleware answers those with a `401` and never stores them here. Guards
 (`login_required`, `role_required`, …) do their own normalization; this accessor does not —
 in particular the claim guards fall through to `req.context[:auth_claims]` when what is
 stored here is not dict-like, so a struct user still authorizes on its verified claims.

@@ -659,7 +659,8 @@ end
     r = Nitro.Core.internalrequest(ctx, HTTP.Request("GET", "/x");
                                    middleware = globals(), catch_errors = false)
     @test r.status == 200
-    # Route middleware runs INSIDE the globals — it is appended first, so it ends up innermost.
+    # Route middleware runs INSIDE the globals — `compose` folds the globals around route
+    # selection, so the chosen route's chain runs after all of them (#291).
     @test invocation == [1, 2, 3, 99]
 end
 end
@@ -1109,8 +1110,8 @@ end
 
     r = Nitro.Core.internalrequest(ctx, HTTP.Request("GET", "/h/x"); catch_errors = false)
     @test text(r) == "ok"
-    # Router-level outside route-level — `buildmiddleware` appends route first, so it lands
-    # innermost after the fold.
+    # Router-level outside route-level — `buildmiddleware` passes router first, and
+    # `foldlayers` runs its arguments outermost first (#312).
     @test order == [1, 2]
 end
 end
@@ -1475,5 +1476,84 @@ end
     end
     @test r.status == 500
     @test !guarded[]
+end
+end
+
+@testitem "Route middleware — every list runs top-down, in the order written (#312)" tags=[:core, :middleware, :auth] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+using Nitro.Core: internalrequest
+using Nitro.Core.RouterHOF: router
+import Nitro: App, path, text
+
+# REGRESSION for #312. The global list was `reverse`d before folding and ran top-down; route
+# and router lists were folded as written, and the fold made the LAST element outermost, so
+# `path(...; middleware = [A, B])` ran B, then A. The documented
+# `[BearerAuth(v), GuardMiddleware(...)]` therefore guarded before it authenticated. None of
+# the existing tests used a list with two entries, so none of them saw it.
+
+tag(order, name) = handle -> (req::HTTP.Request -> (push!(order, name); handle(req)))
+
+@testset "a route list runs in list order — the issue's reproduction" begin
+    app = App(mod = @__MODULE__)
+    order = String[]
+    urlpatterns(app, "", path("/x", req -> "ok"; middleware = [tag(order, "route1"), tag(order, "route2")]))
+    r = internalrequest(app, HTTP.Request("GET", "/x");
+                        middleware = [tag(order, "global1"), tag(order, "global2")])
+    @test r.status == 200
+    @test order == ["global1", "global2", "route1", "route2"]
+end
+
+@testset "global → router → route, each list top-down" begin
+    ctx = App()
+    order = String[]
+    outer = router(ctx, "/h"; middleware = [tag(order, "router1"), tag(order, "router2")])
+    inner = outer("/x"; middleware = [tag(order, "route1"), tag(order, "route2")])
+    Nitro.Core.register(ctx, "GET", inner("GET"), (req::HTTP.Request) -> Res.send("ok"))
+    r = internalrequest(ctx, HTTP.Request("GET", "/h/x");
+                        middleware = [tag(order, "global1"), tag(order, "global2")], catch_errors = false)
+    @test text(r) == "ok"
+    @test order == ["global1", "global2", "router1", "router2", "route1", "route2"]
+
+    # A cache hit replays the same chain, so the order is not a property of the first build.
+    empty!(order)
+    internalrequest(ctx, HTTP.Request("GET", "/h/x");
+                    middleware = [tag(order, "global1"), tag(order, "global2")], catch_errors = false)
+    @test order == ["global1", "global2", "router1", "router2", "route1", "route2"]
+end
+
+# The shape the `GuardMiddleware` docstring and the auth tutorial teach, end to end.
+@testset "[BearerAuth, GuardMiddleware] authenticates first, then authorizes" begin
+    app = App(mod = @__MODULE__)
+    validator(t) = t == "admin-token" ? Dict("sub" => "1", "role" => "admin") :
+                   t == "user-token"  ? Dict("sub" => "2", "role" => "user")  : nothing
+    urlpatterns(app, "",
+        path("/admin", req -> "welcome"; middleware = [
+            BearerAuth(validator), GuardMiddleware(login_required(), role_required("admin"))]),
+        path("/role-only", req -> "welcome"; middleware = [
+            BearerAuth(validator), GuardMiddleware(role_required("admin"))]))
+    bearer(t) = ["Authorization" => "Bearer $t"]
+
+    # Before #312 the guard ran first, on no principal: 302 here, 403 on /role-only.
+    @test internalrequest(app, HTTP.Request("GET", "/admin", bearer("admin-token"))).status == 200
+    @test internalrequest(app, HTTP.Request("GET", "/role-only", bearer("admin-token"))).status == 200
+    # Authenticated but not authorized is the guard's 403.
+    @test internalrequest(app, HTTP.Request("GET", "/admin", bearer("user-token"))).status == 403
+    # Unauthenticated is the auth layer's 401 — it runs first now, so it answers.
+    @test internalrequest(app, HTTP.Request("GET", "/admin")).status == 401
+    @test internalrequest(app, HTTP.Request("GET", "/admin", bearer("bogus"))).status == 401
+end
+
+# Why #312 had to land with #313: once the auth layer runs first, `login_required` is the only
+# thing between a predicate validator's `false` and the handler. It must be the 401.
+@testset "a predicate validator's wrong key is a 401 even with login_required behind it" begin
+    app = App(mod = @__MODULE__)
+    reached = Ref(false)
+    urlpatterns(app, "", path("/c", req -> (reached[] = true; "in");
+        middleware = [BearerAuth(t -> t == "s3cr3t"), GuardMiddleware(login_required())]))
+    r = internalrequest(app, HTTP.Request("GET", "/c", ["Authorization" => "Bearer WRONG"]))
+    @test r.status == 401
+    @test !reached[]
 end
 end

@@ -268,3 +268,107 @@ end
 end
 
 end
+
+# ── #310 ────────────────────────────────────────────────────────────────────────────────────
+#
+# `session_user_validator` through the real request path: `SessionMiddleware` gives EVERY
+# visitor a session, so the validator's answer for an anonymous one is what decides whether
+# `CookieAuthMiddleware` authenticates everybody. In-process (`internalrequest`), no socket.
+@testitem "Auth middleware — an anonymous session does not authenticate (#310)" tags=[:middleware, :auth, :security] setup=[NitroCommon] begin
+using HTTP
+using Nitro
+
+session_cookie(r) = match(r"nitro_session=([^;]+)", HTTP.header(r, "Set-Cookie"))[1]
+
+app = App(mod = @__MODULE__)
+store = MemoryStore()
+session_auth = CookieAuthMiddleware(Nitro.Auth.session_user_validator(store); cookie_name = "nitro_session")
+urlpatterns(app, "",
+    path("/cart/add", req -> (push!(get!(getsession(req), "cart", Int[]), 101); "added")),
+    path("/login", req -> (getsession(req)["user_id"] = 42; "in")),
+    path("/touch", req -> "touched"),
+    path("/api/me", req -> repr(getuser(req)); middleware = [session_auth]))
+mw = [SessionMiddleware(store = store, secure = false)]
+get_with(target, sid) = internalrequest(app, HTTP.Request("GET", target, ["Cookie" => "nitro_session=$sid"]); middleware = mw)
+
+@testset "an anonymous cart session is a 401, not the cart as a user" begin
+    sid = session_cookie(internalrequest(app, HTTP.Request("GET", "/cart/add"); middleware = mw))
+    r = get_with("/api/me", sid)
+    @test r.status == 401
+    @test contains(text(r), "Invalid or expired token")
+end
+
+@testset "an empty anonymous session is a 401" begin
+    sid = session_cookie(internalrequest(app, HTTP.Request("GET", "/touch"); middleware = mw))
+    @test get_with("/api/me", sid).status == 401
+end
+
+@testset "a logged-in session authenticates as the stored id" begin
+    sid = session_cookie(internalrequest(app, HTTP.Request("GET", "/login"); middleware = mw))
+    r = get_with("/api/me", sid)
+    @test r.status == 200
+    @test text(r) == "42"
+end
+
+end
+
+# ── #313 ────────────────────────────────────────────────────────────────────────────────────
+#
+# A validator's return value is an identity or a rejection, never a yes/no. Before #313 only
+# `nothing`/`missing` were rejections, so a predicate validator that answered `false` for a
+# WRONG key authenticated the request with `getuser(req) == false`. Direct closure calls plus
+# one in-process request; no socket.
+@testitem "Auth middleware — a non-identity never authenticates (#313)" tags=[:middleware, :auth, :security] setup=[NitroCommon] begin
+using HTTP
+using Nitro
+
+const NON_IDENTITIES = (false, true, "", missing, Dict{String,Any}(), Principal(Dict{String,Any}()))
+
+bearer_req() = HTTP.Request("GET", "/", ["Authorization" => "Bearer whatever"])
+cookie_req() = HTTP.Request("GET", "/", ["Cookie" => "auth_token=whatever"])
+
+@testset "$(repr(bogus)) is a 401, alone or as the user half of a tuple" for bogus in NON_IDENTITIES
+    for (mw, mkreq) in ((BearerAuth, bearer_req), (CookieAuthMiddleware, cookie_req))
+        for returned in (bogus, (bogus, Dict("sub" => "1")))
+            ran = Ref(false)
+            handler = mw(_ -> returned)(req -> (ran[] = true; HTTP.Response(200, "ok")))
+            req = mkreq()
+            res = handler(req)
+            @test res.status == 401
+            @test contains(text(res), "Invalid or expired token")
+            @test !ran[]
+            @test !haskey(req.context, :user)
+            @test !haskey(req.context, :auth_claims)
+        end
+    end
+end
+
+@testset "0, a string id, an id-less Principal and a claim-less signer are still identities" begin
+    for real in (0, "alice", Principal(Dict{String,Any}("action" => "sync")),
+                 Principal(Dict{String,Any}(); id = "service-a", kid = "service-a", source = :kid))
+        handler = BearerAuth(_ -> real)(req -> HTTP.Response(200, "ok"))
+        req = bearer_req()
+        @test handler(req).status == 200
+        @test req.context[:user] == real
+    end
+end
+
+# The issue's reproduction, through `path(...; middleware=...)`.
+@testset "a predicate validator with the wrong key is a 401" begin
+    app = App(mod = @__MODULE__)
+    urlpatterns(app, "",
+        path("/pred", req -> "user = $(repr(getuser(req)))"; middleware = [BearerAuth(t -> t == "s3cr3t")]),
+        path("/named", req -> "user = $(repr(getuser(req)))";
+             middleware = [BearerAuth(t -> t == "s3cr3t" ? "api-client" : nothing)]))
+    wrong = internalrequest(app, HTTP.Request("GET", "/pred", ["Authorization" => "Bearer WRONG"]))
+    @test wrong.status == 401
+    # The predicate authenticates nobody, the right key included — that is the contract.
+    @test internalrequest(app, HTTP.Request("GET", "/pred", ["Authorization" => "Bearer s3cr3t"])).status == 401
+    # Naming the caller is the fix the docs give.
+    named = internalrequest(app, HTTP.Request("GET", "/named", ["Authorization" => "Bearer s3cr3t"]))
+    @test named.status == 200
+    @test text(named) == "user = \"api-client\""
+    @test internalrequest(app, HTTP.Request("GET", "/named", ["Authorization" => "Bearer WRONG"])).status == 401
+end
+
+end

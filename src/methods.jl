@@ -507,6 +507,7 @@ Create a new router instance.
 - `prefix::String`: A string to be prefixed to all routes in this router.
 - `tags::Vector{String}`: A vector of strings to tag the router for documentation and management purposes.
 - `middleware::Nullable{Vector}`: Optional middleware to be applied to all routes in the router.
+  It runs top-down in list order, after global middleware and before each route's own.
 
 # Returns
 A router instance that can be used to define and manage a set of related routes.

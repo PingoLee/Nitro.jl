@@ -66,6 +66,11 @@ The contract:
 - **Custom validators** can opt into the same contract by returning a `Principal` (or a
   `(user, principal)` tuple). A `(nothing, principal)` tuple is *not* authenticated — a nil
   user is a 401, the same as returning `nothing`.
+- **A validator returns an identity, never a yes/no.** `nothing`, `missing`, a `Bool`, `""`
+  and an empty dict are not identities: each is a 401, alone or as the user half of a tuple.
+  A predicate such as `BearerAuth(t -> t == API_KEY)` therefore authenticates nobody, the
+  right key included. Name the caller instead:
+  `BearerAuth(t -> t == API_KEY ? "api-client" : nothing)`. A user id of `0` is an identity.
 - **The claim guards resolve claims in three steps.** `claim_required` (and its
   `role_required`/`permission_required` aliases) reads `req.context[:user]` when it is
   dict-like; otherwise `req.context[:auth_claims]`; otherwise the raw `getsession(req)` dict,
@@ -79,8 +84,10 @@ The contract:
   request with a struct identity, so an unauthenticated session dict is never promoted into
   a claims source for it — the guard denies instead.
 - **`login_required` is authentication, not authorization**, so it does not use that
-  resolution: it trusts any non-empty `req.context[:user]` as-is, and falls back to the
-  session only when it carries the login marker (`session_key`, default `"user_id"`).
+  resolution: it trusts any identity at `req.context[:user]` as-is, and falls back to the
+  session only when it carries the login marker (`session_key`, default `"user_id"`) with an
+  identity as its value. It refuses the same non-identities the auth middleware does, so a
+  `false`, a `""` or a `session["user_id"] = nothing` left behind by a logout is not a login.
 
 !!! warning "Revocation and the struct-user path"
 
@@ -463,8 +470,10 @@ urlpatterns("",
 ```
 
 A router-wide default allowlist is just the same guard at the router level, with tighter
-per-route subsets where needed. See the service-token section of
-[Sessions & Auth](sessions_and_auth.md) for `iat`-only tokens and `exp_timeout`.
+per-route subsets where needed. Router middleware wraps route middleware, so a router-level
+guard runs before any route-level auth layer: put the `BearerAuth` on the router, not only on
+its routes. See the service-token section of [Sessions & Auth](sessions_and_auth.md) for
+`iat`-only tokens and `exp_timeout`.
 
 ## 6. Guards & authorization
 
@@ -473,7 +482,7 @@ returns `nothing` (pass) or a response (deny). They run after auth middleware, i
 
 | Guard | Passes when | Denies with |
 |---|---|---|
-| `login_required(; redirect_url, session_key)` | An auth middleware attached a non-empty principal, **or** the session carries `session_key` | 302 → `redirect_url` |
+| `login_required(; redirect_url, session_key)` | An auth middleware attached an identity, **or** the session carries one under `session_key` | 302 → `redirect_url` |
 | `claim_required(claim, value; kind=:equals)` | `principal[claim] == value` | 403 |
 | `claim_required(claim, value; kind=:contains)` | `value in principal[claim]` (a list) | 403 |
 | `role_required(role; role_key="role")` | alias: `claim_required(role_key, role)` | 403 |
