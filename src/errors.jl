@@ -322,7 +322,7 @@ of these sites call (a user's `validate_token`, a user's session store):
 | site | guarded expression |
 |---|---|
 | `src/middleware/auth_middleware.jl` ×2 | the user's `validate_token` (reaches `decode_jwt` → `JSON.parse`) |
-| `src/utilities/bodyparsers.jl` ×5 | `_parse_json_bounded` — plus `HTTP.queryparams`/`HTTP.parse_multipart_form`, which do NOT recurse and ride along so the five parsers in one file cannot drift apart |
+| `src/utilities/bodyparsers.jl` ×6 | `_parse_json_bounded` — plus `HTTP.queryparams`/`HTTP.parse_multipart_form`, which do NOT recurse and ride along so the parsers in one file cannot drift apart; the sixth is `json(req, T)`'s wrap into a `ValidationError` (#326) |
 | `src/utilities/misc.jl` ×3 | `parseparam`'s `_parse_json_bounded(str, T)` fall-through — reached by **any** scalar path/query parameter, since `parse(Int, str)` fails first and lands there |
 | `src/extractors.jl` ×2 | `safe_extract`'s `f()` (the extractor body, i.e. the parsers above) and the app's session store |
 | `src/middleware/csrf_middleware.jl` ×2 | `getform`/`getjson` |

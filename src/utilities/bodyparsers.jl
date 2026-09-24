@@ -5,7 +5,7 @@ using JSON
 using Dates: Dates
 using UUIDs: UUID
 using ..Util
-using ...Errors: is_unrecoverable
+using ...Errors: is_unrecoverable, ValidationError
 
 export text, binary, json, formdata, multipart, FormFile
 
@@ -402,8 +402,10 @@ end
 
 Read the body of a HTTP.Request as JSON with additional arguments for the read/serializer into a custom struct.
 
-Throws `ArgumentError` when the body is not JSON, including a document nested deeper than 512
-arrays/objects (#314).
+Throws a `ValidationError` -- a `400` when raised in a handler -- when the body does not bind as
+a `T`: not JSON, nested deeper than 512 arrays/objects (#314), or the wrong shape (#326). Its
+message never quotes the body; the parse error is kept on `.cause`. Calling this on an
+`HTTP.Response` is unchanged and rethrows the parse error itself: a response is not client input.
 
 The body is client input, so it is always parsed with Nitro's read style, which never interns a
 client string as a `Symbol` (#306): an enum field binds by name or by integer. A float field
@@ -424,7 +426,18 @@ function json(req::HTTP.Request, class_type::Type{T}; kwargs...) where {T}
     if isnothing(payload)
         return nothing
     end
-    return _parse_json_bounded(payload, class_type; style = NITRO_READ_STYLE, kwargs...)
+    try
+        return _parse_json_bounded(payload, class_type; style = NITRO_READ_STYLE, kwargs...)
+    catch e
+        # A body that does not bind is client input: a `ValidationError` (a 400), like the
+        # `Json{T}` extractor answers the same body (#326). Rethrown raw it was a 500, and the
+        # log line quoted the payload -- a parse `ArgumentError` echoes the offending bytes, so a
+        # submitted password landed in the error log. The message here is value-free; the
+        # original is kept on `.cause`, which no Nitro output path renders (#130).
+        is_unrecoverable(e) && rethrow()
+        e isa ValidationError && rethrow()
+        throw(ValidationError("Could not bind the request body as $T", e))
+    end
 end
 
 function json(res::HTTP.Response, class_type::Type{T}; kwargs...) where {T}

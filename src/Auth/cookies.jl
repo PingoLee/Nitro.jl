@@ -4,7 +4,9 @@ function extract_auth_token(req::HTTP.Request; header::String="Authorization", s
     auth_header = HTTP.header(req, header, "")
     full_scheme = string(scheme, " ")
     if startswith(auth_header, full_scheme)
-        token = strip(SubString(auth_header, length(full_scheme) + 1:lastindex(auth_header)))
+        # A byte offset, as in `BearerAuth` (#326): `length` counts characters, and a non-ASCII
+        # scheme would start the slice mid-character.
+        token = strip(SubString(auth_header, ncodeunits(full_scheme) + 1))
         isempty(token) || return String(token)
     end
 

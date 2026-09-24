@@ -403,3 +403,32 @@ end
 end
 
 end
+
+@testitem "Auth middleware — a non-ASCII Authorization header is a 401, not a 500 (#326)" tags=[:middleware, :auth, :security] setup=[NitroCommon] begin
+using HTTP
+using Nitro
+
+# `_extract_token` measured the header with `length` (characters) and sliced it by that count
+# (bytes): `Bearer éé` ended the slice mid-character -> StringIndexError -> a 500 with a logged
+# backtrace, once per request, for anyone.
+seen = String[]
+validator(token) = (push!(seen, token); token == "ключ" ? Dict("sub" => "u") : nothing)
+handler = BearerAuth(validator)(req -> HTTP.Response(200, "ok"))
+call(value) = handler(HTTP.Request("GET", "/", ["Authorization" => value]))
+
+@test call("Bearer éé").status == 401
+@test call("Bearer abcé").status == 401            # ends in a multibyte character
+@test call("Bearer é").status == 401
+@test seen == ["éé", "abcé", "é"]                  # the token reached the validator whole
+@test call("Bearer ключ").status == 200
+
+# A non-ASCII scheme, configured by the app.
+handler2 = BearerAuth(t -> t == "tok" ? Dict("sub" => "u") : nothing; scheme = "Tökén")(
+    req -> HTTP.Response(200, "ok"))
+@test handler2(HTTP.Request("GET", "/", ["Authorization" => "Tökén tok"])).status == 200
+@test handler2(HTTP.Request("GET", "/", ["Authorization" => "Tökén ü"])).status == 401
+
+# `extract_auth_token` had the same character/byte mix-up (latent for an ASCII scheme).
+req = HTTP.Request("GET", "/", ["Authorization" => "Tökén ключ"])
+@test Nitro.Auth.extract_auth_token(req; scheme = "Tökén", cookie_name = nothing) == "ключ"
+end

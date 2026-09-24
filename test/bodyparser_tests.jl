@@ -88,13 +88,14 @@ end
 
     @testset "json() Request with class_type" begin
 
-        # #327: refused, as above; and without the keyword NaN is not JSON at all.
+        # #327: refused, as above (a usage error, so still an ArgumentError); and without the
+        # keyword NaN is not JSON at all -- client input, so a ValidationError (#326).
         req = Request("GET","/", [],"""{"title": "viscount", "power": NaN}""")
         @test_throws ArgumentError json(req, rank, allownan = true)
-        @test_throws ArgumentError json(req, rank)
+        @test_throws ValidationError json(req, rank)
         # A number too large for a Float64 is not smuggled in as Inf.
         req = Request("GET","/", [],"""{"title": "viscount", "power": 1e999}""")
-        @test_throws ArgumentError json(req, rank)
+        @test_throws ValidationError json(req, rank)
 
         req = Request("GET","/", [],"""{"title": "viscount", "power": 9000.1}""")
         myjson = json(req, rank)
@@ -121,8 +122,24 @@ end
         # pins missing-required-field -> `ValidationError` -> 400, because `safe_extract`
         # wraps ANY non-`InterruptException` throw. That is why this dependency change
         # altered no HTTP behaviour, only this line's expectation.
+        #
+        # #326 then gave `json(req, T)` the same wrap `safe_extract` has: whatever StructUtils
+        # throws, the REQUEST form now raises a value-free `ValidationError` carrying it as
+        # `.cause` -- a 400 in a handler, where the raw error was a 500 whose log line quoted
+        # the body. The Response form below keeps the raw union: a response is not client input.
         req = Request("GET","/", [],"""{}""")
-        @test_throws Union{TypeError, ArgumentError} json(req, rank)
+        err = try json(req, rank); nothing catch e; e end
+        @test err isa ValidationError
+        @test err.cause isa Union{TypeError, ArgumentError}
+
+        # The message never quotes the body, even when the parse error does -- and it does for
+        # bytes just before the error, which is where the issue's repro put its password.
+        req = Request("GET","/", [],"""{"title": "viscount", "password":"S3CR3T" oops}""")
+        err = try json(req, rank); nothing catch e; e end
+        @test err isa ValidationError
+        @test !occursin("S3CR3T", err.msg)
+        @test !occursin("S3CR3T", sprint(showerror, err))
+        @test occursin("S3CR3T", sprint(showerror, err.cause))   # the cause really carries it
 
         # test extra key
         req = Request("GET","/", [],"""{"title": "viscount", "power": 9000.1, "extra": "hi"}""")
@@ -500,17 +517,17 @@ catch e
 end
 """, ["PARSER_UNCLOSED=REJECTED"]),
 
-    # 1c. The typed parser has no catch of its own, so malformed -- too deep included -- is the
-    # parser's `ArgumentError`, not an overflow.
+    # 1c. The typed parser: malformed -- too deep included -- is a `ValidationError` wrapping the
+    # parser's `ArgumentError` (#326; it was the raw `ArgumentError`), not an overflow.
     ("TYPED", raw"""
 req = HTTP.Request("POST", "/j", ["Content-Type" => "application/json"], deep)
 try
     json(req, Vector{Any})
     println("TYPED=PARSED")
 catch e
-    println("TYPED=THREW:", typeof(e))
+    println("TYPED=THREW:", typeof(e), " CAUSE:", typeof(e.cause))
 end
-""", ["TYPED=THREW:ArgumentError"]),
+""", ["TYPED=THREW:ValidationError CAUSE:ArgumentError"]),
 
     # 2. The memoizing accessor handlers actually call.
     ("ACCESSOR", raw"""
@@ -754,7 +771,9 @@ jreq(s) = HTTP.Request("POST", "/j", ["Content-Type" => "application/json"], s)
     @test json(jreq(body(511))) isa AbstractDict
     @test getjson(jreq(body(512))) === nothing
     @test getjson(jreq(body(511))) isa AbstractDict
-    @test_throws ArgumentError json(jreq(body(512)), Dict{String, Any})
+    # A ValidationError since #326, carrying the bound's ArgumentError as its cause.
+    @test_throws ValidationError json(jreq(body(512)), Dict{String, Any})
+    @test (try json(jreq(body(512)), Dict{String, Any}); catch e; e.cause; end) isa ArgumentError
     @test json(jreq(body(511)), Dict{String, Any}) isa Dict{String, Any}
     @test json(HTTP.Response(200; body = body(512))) === nothing
     @test json(HTTP.Response(200; body = body(511))) isa AbstractDict
@@ -905,4 +924,30 @@ using Nitro
 
 @test isempty(multipart(HTTP.Request("POST", "/m",
     ["Content-Type" => "multipart/form-data; boundary=xyz"], "garbage")))
+end
+
+@testitem "json(req, T) in a handler: a bad body is a 400, not a logged 500 (#326)" tags=[:core, :security] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+using Nitro: App
+
+struct Login326
+    user::String
+    password::String
+end
+app = App(mod = @__MODULE__)
+urlpatterns(app, "", path("/login", req -> (json(req, Login326); "ok"); method = "POST"))
+send(body) = internalrequest(app,
+    HTTP.Request("POST", "/login", ["Content-Type" => "application/json"], body))
+
+logger = Test.TestLogger(min_level = Base.CoreLogging.Debug)
+r = Base.CoreLogging.with_logger(logger) do
+    send("""{"user":"u","password":"S3CR3T" oops}""")
+end
+@test r.status == 400
+@test !any(l -> l.level >= Base.CoreLogging.Error, logger.logs)
+@test !any(l -> occursin("S3CR3T", string(l.message, l.kwargs)), logger.logs)
+@test send("""{"user":"u"}""").status == 400                       # wrong shape
+@test send("""{"user":"u","password":"p"}""").status == 200
 end

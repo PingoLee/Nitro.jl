@@ -541,17 +541,25 @@ mount_route(segments::AbstractVector{<:AbstractString})::String =
 
 # The request path, without the query or fragment, and still percent-encoded.
 #
-# Origin-form (`/static/app.js`) is the overwhelmingly common case and is handled by a scan
-# rather than by building an `HTTP.URI`, because this runs on every request to a mount.
-# Absolute-form targets (`http://host/static/app.js`) are legal in a request line and fall back
-# to the URI parser, which also does not unescape.
+# Origin-form (`/static/app.js`) is the overwhelmingly common case. Absolute-form targets
+# (`http://host/static/app.js`) are legal in a request line too; their path starts at the first
+# `/` after the authority -- the split HTTP.jl's router makes, so a mount sees the path the
+# router matched. The authority is never parsed: `HTTP.URI` throws on a malformed one
+# (`http://h:abc/static/x`), which the router still routes, so the mount answered a 500 with a
+# logged backtrace (#326).
 function _target_path(target::AbstractString)::SubString{String}
     s = String(target)
-    if !isempty(s) && first(s) == '/'
-        cut = findfirst(c -> c === '?' || c === '#', s)
-        return cut === nothing ? SubString(s, 1) : SubString(s, 1, prevind(s, cut))
+    path = SubString(s, 1)
+    if isempty(s) || first(s) != '/'
+        scheme_end = findfirst("://", s)
+        if scheme_end !== nothing
+            start = findnext('/', s, last(scheme_end) + 1)
+            start === nothing && return SubString("/", 1)
+            path = SubString(s, start)
+        end
     end
-    return SubString(String(HTTP.URI(s).path), 1)
+    cut = findfirst(c -> c === '?' || c === '#', path)
+    return cut === nothing ? path : SubString(path, 1, prevind(path, cut))
 end
 
 # Whether a DECODED segment can name a single mounted path component.
