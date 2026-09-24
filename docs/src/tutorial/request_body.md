@@ -145,7 +145,10 @@ for a `Json{T}` parameter sent without a JSON `Content-Type`, or a non-multipart
 `UnsupportedMediaTypeError` and treated the same way.
 
 The `ValidationError` behind it names the parameter and its type and **never the submitted value**,
-so it is safe to log. The exception that actually failed — a JSON parse error, say — is kept on
+so it is safe to log. When a validator rejected the value, the message names that validator by
+function and module (`MyApp.validate`, `MyApp.check_limit`), or as "the extractor-local validator
+of parameter `x`" for an anonymous one — never by the file it is defined in, so returning `.msg` to
+a client does not publish the server's directory layout. The exception that actually failed — a JSON parse error, say — is kept on
 `.cause`, and that one *does* quote the payload. Every path Nitro renders it through masks it down
 to the cause's *type*:
 

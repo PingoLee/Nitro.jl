@@ -40,6 +40,8 @@ struct Login
     password::String
 end
 validate(l::Login) = length(l.password) >= 12
+# A named extractor-local validator, for the message-identity check (#327).
+reject_all_logins(::Login) = false
 
 @testset "Extactor builder sytnax" begin 
 
@@ -588,14 +590,26 @@ end
         @test occursin("Login", err.msg)
     end
 
-    # ...and the validator that rejected it, however it identifies itself: a named
-    # global `validate` method by name, an anonymous extractor-local one by source
-    # location. Neither identification carries a submitted value. The source-location
-    # assertion deliberately pins "the message identifies which validator rejected" —
-    # an anonymous function has no other identity, so hardening `impl` later must
-    # supply a replacement rather than simply dropping it.
+    # ...and the validator that rejected it, however it identifies itself: the global
+    # `validate` method by its module, a named extractor-local one by `Module.name`, an
+    # anonymous one by the parameter it guards. Neither identification carries a
+    # submitted value.
+    #
+    # This used to pin the SOURCE LOCATION (`occursin("extractor_tests.jl", err2.msg)`),
+    # with a note that hardening it "must supply a replacement rather than simply dropping
+    # it". #327 is that hardening -- `.msg` reaches clients, and `Base.which` rendered the
+    # validator's absolute path -- and the parameter-based identity below is the replacement.
     @test occursin("validate", err1.msg)
-    @test occursin("extractor_tests.jl", err2.msg)
+    @test occursin("extractor-local validator of parameter 'credentials'", err2.msg)
+    for err in (err1, err2)
+        @test !occursin(".jl", err.msg)
+        @test !occursin('/', err.msg) && !occursin('\\', err.msg)
+    end
+    # A NAMED extractor-local validator is reported by its module-qualified name.
+    err3 = extract_err(Param(:credentials, Json{Login}, Json{Login}(reject_all_logins), true),
+                       """{"username":"u-c4-sentinel","password":"pw-c4-long-enough"}""")
+    @test occursin("reject_all_logins", err3.msg)
+    @test !occursin(".jl", err3.msg)
 
     # The other branch: `safe_extract` wraps a deserialization failure and attaches the
     # underlying exception as `.cause`. Its `.msg` is value-free too, which is what makes

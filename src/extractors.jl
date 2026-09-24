@@ -261,8 +261,8 @@ function try_validate(param::Param{U}, instance) :: T where {T, U <: Extractor{T
 
     # Case 1: Use global validate function - returns true if one isn't defined for this type
     if !validate(instance)
-        impl = Base.which(validate, (T,))
-        throw(ValidationError("Validation failed for parameter '$(param.name)': $T rejected by $impl"))
+        impl = Base.which(validate, (typeof(instance),))
+        throw(ValidationError("Validation failed for parameter '$(param.name)': $T rejected by $(impl.module).validate"))
     end
 
     # Case 2: Use custom validate function from an Extractor (if defined).
@@ -273,12 +273,23 @@ function try_validate(param::Param{U}, instance) :: T where {T, U <: Extractor{T
     # 500 whenever the value was present. It folds to a constant for a concrete `U`.
     if param.hasdefault && param.default isa U && hasfield(U, :validate) && !isnothing(param.default.validate)
         if !param.default.validate(instance)
-            impl = Base.which(param.default.validate, (T,))
-            throw(ValidationError("Validation failed for parameter '$(param.name)': $T rejected by $impl"))
+            throw(ValidationError("Validation failed for parameter '$(param.name)': $T rejected by $(validator_identity(param.default.validate, param))"))
         end
     end
 
     return instance
+end
+
+# Which validator rejected a value, for `ValidationError.msg`: a function and its module, never a
+# source location (#327). This used to interpolate `Base.which(...)`, which renders as
+# `validate(s::Login) @ Main ~/app/src/handlers.jl:12` -- and `.msg` is what an app returns to a
+# client (`JSON.json(err)` is documented as safe), so every rejection published the deployment's
+# directory layout. An anonymous validator has no name of its own; the parameter it guards is
+# its identity.
+function validator_identity(f::Function, param::Param) :: String
+    name = String(nameof(f))
+    startswith(name, '#') && return "the extractor-local validator of parameter '$(param.name)'"
+    return "$(parentmodule(f)).$name"
 end
 
 """
