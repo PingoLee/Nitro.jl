@@ -62,7 +62,8 @@ end
     @testset "request accessors" begin
         req = HTTP.Request("GET", "/x?a=1&b=2", ["X-Trace" => "abc"])
         @test getquery(req) == Dict("a" => "1", "b" => "2")
-        req2 = HTTP.Request("POST", "/x", [], "{\"n\":7}")
+        # `getjson` reads only a body that declares itself JSON (#327).
+        req2 = HTTP.Request("POST", "/x", ["Content-Type" => "application/json"], "{\"n\":7}")
         @test getjson(req2)["n"] == 7
         # #151: the property shorthands are gone, and HTTP owns `getproperty` again.
         @test_throws FieldError getproperty(req2, :json)

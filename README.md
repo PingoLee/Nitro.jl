@@ -95,7 +95,7 @@ request and cached, so calling it twice is free:
 
 - `getparams(req)` for path parameters
 - `getquery(req)` for query parameters
-- `getjson(req)` for JSON request bodies (`nothing` on empty or malformed JSON)
+- `getjson(req)` for JSON request bodies (`nothing` on empty or malformed JSON, or when the request's `Content-Type` is not JSON)
 - `getform(req)` for form-encoded request bodies (`Dict()` on empty or non-form bodies)
 - `getfiles(req)` for the file parts of a multipart body (Django `request.FILES`)
 - `getpost(req)` for the text fields of a multipart body (Django `request.POST`)
