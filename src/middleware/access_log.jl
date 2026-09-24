@@ -273,8 +273,9 @@ serve(app; middleware = [
                      slept on.
 
 `prune` and `retention` go together: passing one without the other is an `ArgumentError`, never
-a silently disabled pruner, and so is a `prune_interval` with no pruner to apply it to. The pruner starts and stops with the server alongside the writer,
-and a `serve(); terminate(); serve()` cycle does not leak its task.
+a silently disabled pruner, and so is a `prune_interval` with no pruner to apply it to. The
+pruner starts and stops with the server alongside the writer, and a
+`serve(); terminate(); serve()` cycle does not leak its task.
 
 The first prune runs one `prune_interval` **after** `serve()`, not at startup. Keep the interval
 well under your restart cadence: a server restarted more often than `prune_interval` never
