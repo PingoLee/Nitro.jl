@@ -72,10 +72,13 @@ end
         # `walkdir`'s own producer task iterated that same vector. Harmless on one thread;
         # once the consumer MIGRATES (ReTestItems runs items in spawned tasks) the two ran
         # in parallel, and the walk either descended into `.helpers/` or died with
-        # `UndefRefError`. Reproduced at 2 threads: 4 bad runs in 3000; at 4 threads: 11.
+        # `UndefRefError`.
         #
         # Discriminates only at `nthreads() > 1` -- which CI runs on every push. The yield
-        # noise gives the scheduler reasons to move the consumer, which is the trigger.
+        # noise gives the scheduler reasons to move the consumer, which is the trigger:
+        # against the old walk at 2 threads, this loop failed ~2850-2900 runs of 3000 with
+        # the noise and ~10 without it. Against the current walk it cannot fail -- nothing
+        # is shared with a producer task -- so a red here is never a flake.
         stop  = Threads.Atomic{Bool}(false)
         noise = [Threads.@spawn(while !stop[]; sum(rand(64)); yield(); end)
                  for _ in 1:Threads.nthreads()]
@@ -85,7 +88,8 @@ end
                 for _ in 1:3000
                     n += try
                         discover_test_files(root) == expected ? 0 : 1
-                    catch
+                    catch e
+                        e isa InterruptException && rethrow()
                         1
                     end
                 end
