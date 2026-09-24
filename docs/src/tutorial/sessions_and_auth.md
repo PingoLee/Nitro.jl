@@ -199,6 +199,11 @@ grows for the life of the process:
 serve(middleware = [SessionPruner(store; interval = Minute(5))], context = store)
 ```
 
+The context must be the store itself, an `AbstractSessionStore{String}`. Any other context is not
+read: every `Session{T}` parameter then binds no session, and Nitro logs one warning. A plain `Dict`
+used to be indexed directly by the cookie's value, which let a client pick any entry of a context
+that was really the app's configuration.
+
 Your implementation runs on a background task, so keep it safe to call concurrently with
 reads and writes, and keep the work it does under any lock bounded.
 

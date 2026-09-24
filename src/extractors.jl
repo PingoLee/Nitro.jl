@@ -44,7 +44,12 @@ macro extractor(class_name)
 
             # Pass object directly & validator
             $(Symbol(class_name))(payload::T, f::Function) where T = new{T}(payload, f, T)
-            
+
+            # The declared type, whatever the value's runtime type. `extract` builds its result
+            # with this: `X(payload)` is an `X{typeof(payload)}`, which a handler declaring
+            # `X{Any}` (or any abstract `T`) could not accept -- a 500 (#327, the #293 family).
+            $(Symbol(class_name)){T}(payload, validate::Union{Function, Nothing}) where T = new{T}(payload, validate, T)
+
         end
     end |> esc
 end
@@ -233,7 +238,11 @@ validate(type::T) where {T} = true
 This function will try to validate an instance of a type using both global and local validators.
 If both validators pass, the instance is returned. If either fails, a `ValidationError` is thrown.
 """
-function try_validate(param::Param{U}, instance::T) :: T where {T, U <: Extractor{T}}
+function try_validate(param::Param{U}, instance) :: T where {T, U <: Extractor{T}}
+    # `T` comes from the extractor, never from the instance: dispatching on `instance::T` bound
+    # `T` to the value's RUNTIME type, so `Session{Any}` (or `Body{Any}`, `Json{Any}`) holding a
+    # `User` matched no method at all -- a `MethodError`, answered as a 500 (#327, the #293
+    # family). Every caller hands over a value it bound as a `T`; the return type asserts it.
 
     # The message names the parameter, its type, and the validator that rejected it —
     # never the instance. For a body-bound extractor the instance *is* the client's
@@ -312,7 +321,7 @@ function extract(param::Param{Json{T}}, request::LazyRequest) :: Json{T} where {
         json_bind(T, textbody(request))
     end
     valid_instance = try_validate(param, instance)
-    return Json(valid_instance)
+    return Json{T}(valid_instance, nothing)
 end
 
 """
@@ -374,7 +383,7 @@ function extract(param::Param{JsonFragment{T}}, request::LazyRequest) :: JsonFra
         struct_builder(T, Types.jsonbody(request)[string(param.name)])
     end
     valid_instance = try_validate(param, instance)
-    return JsonFragment(valid_instance)
+    return JsonFragment{T}(valid_instance, nothing)
 end
 
 """
@@ -385,7 +394,7 @@ function extract(param::Param{Body{T}}, request::LazyRequest) :: Body{T} where {
         parseparam(T, textbody(request))
     end
     valid_instance = try_validate(param, instance)
-    return Body(valid_instance)
+    return Body{T}(valid_instance, nothing)
 end
 
 """
@@ -397,7 +406,7 @@ function extract(param::Param{Form{T}}, request::LazyRequest) :: Form{T} where {
         struct_builder(T, form) 
     end
     valid_instance = try_validate(param, instance)
-    return Form(valid_instance) 
+    return Form{T}(valid_instance, nothing)
 end
 
 """
@@ -409,7 +418,7 @@ function extract(param::Param{Path{T}}, request::LazyRequest) :: Path{T} where {
         struct_builder(T, params) 
     end
     valid_instance = try_validate(param, instance)
-    return Path(valid_instance)
+    return Path{T}(valid_instance, nothing)
 end
 
 """
@@ -421,7 +430,7 @@ function extract(param::Param{Query{T}}, request::LazyRequest) :: Query{T} where
         struct_builder(T, params) 
     end
     valid_instance = try_validate(param, instance)
-    return Query(valid_instance)
+    return Query{T}(valid_instance, nothing)
 end
 
 """
@@ -433,7 +442,7 @@ function extract(param::Param{Header{T}}, request::LazyRequest) :: Header{T}  wh
         struct_builder(T, headers) 
     end
     valid_instance = try_validate(param, instance)
-    return Header(valid_instance)
+    return Header{T}(valid_instance, nothing)
 end
 
 """
@@ -470,7 +479,7 @@ function extract(param::Param{Cookie{T}}, request::LazyRequest, secret_key::Unio
     end
     
     valid_instance = try_validate(param, instance)
-    return Cookie(cookie_name, valid_instance)
+    return Cookie{T}(cookie_name, valid_instance)
 end
 
 """
@@ -499,25 +508,17 @@ function extract(param::Param{Session{T}}, request::LazyRequest, secret_key::Uni
     # app_context is expected to be a Context object
     store = app_context.payload
 
-    if store isa AbstractSessionStore
-        instance = get_session(store, val)
-        if isnothing(instance)
-            return Session(session_cookie_name, T)
-        end
-
-        valid_instance = try_validate(param, instance)
-        return Session(session_cookie_name, valid_instance)
+    # Only a session store is read (#327). Any other context used to be indexed directly by the
+    # cookie's value -- meant for a `Dict` of sessions, but a context that was the app's
+    # CONFIGURATION let `Cookie: session=admin_defaults` bind that config entry as the session,
+    # and without a `secret_key` the client picks the cookie value freely.
+    if !(store isa AbstractSessionStore{String})
+        @warn "Session{T} reads only an AbstractSessionStore{String} app context; this one is not a store, so no Session{T} parameter will ever bind a session" context_type = typeof(store) maxlog = 1
+        return Session(session_cookie_name, T)
     end
-    
-    # We assume the store is a Dict-like object or support get(). Looked up by the cookie value
-    # as a `String` only: a `Symbol(val)` branch here interned every session id a client sent,
-    # and Julia never frees an interned `Symbol` (#306).
+
     instance = try
-        if hasmethod(Base.get, (typeof(store), String, Any))
-            Base.get(store, val, nothing)
-        else
-            nothing
-        end
+        get_session(store, val)
     catch e
         # The store is application code, so "it threw" means "no session for this id" and the
         # extractor falls back. The three in `is_unrecoverable` are not that (#254).
@@ -525,20 +526,14 @@ function extract(param::Param{Session{T}}, request::LazyRequest, secret_key::Uni
         nothing
     end
 
-    if isnothing(instance)
+    # A stored value of another type is not this parameter's session. It used to reach
+    # `try_validate` with the wrong type and fail there as a 500 (the #293 family).
+    if isnothing(instance) || !(instance isa T)
         return Session(session_cookie_name, T)
     end
 
-    # Handle built-in SessionPayload with expiry checking
-    if instance isa SessionPayload
-        if is_expired(instance)
-            return Session(session_cookie_name, T)
-        end
-        instance = instance.data
-    end
-    
     valid_instance = try_validate(param, instance)
-    return Session(session_cookie_name, valid_instance)
+    return Session{T}(session_cookie_name, valid_instance)
 end
 
 """
@@ -652,7 +647,7 @@ function extract(param::Param{MultipartForm{T}}, request::LazyRequest) :: Multip
         multipart_struct_builder(T, parsed)
     end
     valid_instance = try_validate(param, instance)
-    return MultipartForm(valid_instance)
+    return MultipartForm{T}(valid_instance, nothing)
 end
 
 """

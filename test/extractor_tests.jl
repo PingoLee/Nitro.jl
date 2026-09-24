@@ -1039,7 +1039,9 @@ using HTTP
 using Nitro
 using Nitro: LazyRequest, Param, Session, extract
 
-struct ThrowingStore
+# A real `AbstractSessionStore` since #327: the extractor reads no other kind of context, so a
+# store that is not one would never be called and these assertions would pass vacuously.
+struct ThrowingStore <: Nitro.Types.AbstractSessionStore{String, Dict{String,Any}}
     ex::Exception
 end
 Base.get(s::ThrowingStore, ::String, ::Any) = throw(s.ex)
@@ -1073,4 +1075,47 @@ end
         @test result.name == "session"
     end
 end
+end
+
+@testitem "Extractors declared with an abstract T bind (#327)" tags=[:core] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+using Nitro: App, Json, Body, Cookie, Session
+
+# `try_validate` dispatched `instance::T` on the value's RUNTIME type, and `extract` returned
+# `X(value)` -- an `X{typeof(value)}` -- so a parameter declared with an abstract `T` matched no
+# method, or could not be converted to its declared type. Either way a 500 with a backtrace for
+# a perfectly good request (#327, the #293 family).
+struct Person
+    name::String
+end
+
+store = MemoryStore{String, Person}()
+Nitro.Types.set_session!(store, "sid", Person("Ann"); ttl = 60)
+
+app = App(mod = @__MODULE__)
+urlpatterns(app, "",
+    path("/body", (req, b::Body{Any}) -> string(typeof(b.payload)); method = "POST"),
+    path("/json", (req, j::Json{Any}) -> string(j.payload["a"]); method = "POST"),
+    path("/cookie", (req, c::Cookie{Any}) -> string(c.value)),
+    path("/session", (req, s::Session{Any}) -> s.payload.name),
+)
+send(r) = internalrequest(app, r; context = store)
+
+r = send(HTTP.Request("POST", "/body", ["Content-Type" => "text/plain"], "hello"))
+@test r.status == 200
+@test Nitro.text(r) == "String"
+
+r = send(HTTP.Request("POST", "/json", ["Content-Type" => "application/json"], """{"a":1}"""))
+@test r.status == 200
+@test Nitro.text(r) == "1"
+
+r = send(HTTP.Request("GET", "/cookie", ["Cookie" => "c=v"]))
+@test r.status == 200
+@test Nitro.text(r) == "v"
+
+r = send(HTTP.Request("GET", "/session", ["Cookie" => "session=sid"]))
+@test r.status == 200
+@test Nitro.text(r) == "Ann"
 end

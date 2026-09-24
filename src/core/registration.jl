@@ -110,6 +110,10 @@ function refuse_client_symbols(route::String, param::Param)
         "which Julia never frees (#306). Declare an @enum, or a String checked against an allow-list."))
 end
 
+# The field names an extractor's `T` binds, or none for a type that has no definite fields.
+# `fieldnames(Any)` throws, so `Body{Any}`/`Json{Any}` could not even be registered (#327).
+bound_fieldnames(T) = isconcretetype(T) ? fieldnames(T) : ()
+
 function parse_func_params(route::String, func::Function; type_hints::Dict{Symbol, Type}=Dict{Symbol, Type}())
     info = splitdef(func, start=2)
 
@@ -143,13 +147,13 @@ function parse_func_params(route::String, func::Function; type_hints::Dict{Symbo
         elseif param.type <: Extractor
             innner_type = extracttype(param.type)
             if param.type <: Path
-                append!(pathnames, fieldnames(innner_type))
+                append!(pathnames, bound_fieldnames(innner_type))
                 push!(path_params, param)
             elseif param.type <: Query
-                append!(querynames, fieldnames(innner_type))
+                append!(querynames, bound_fieldnames(innner_type))
                 push!(query_params, param)
             elseif param.type <: Header
-                append!(headernames, fieldnames(innner_type))
+                append!(headernames, bound_fieldnames(innner_type))
                 push!(header_params, param)
             elseif param.type <: Session
                 push!(cookienames, param.name)
@@ -158,7 +162,7 @@ function parse_func_params(route::String, func::Function; type_hints::Dict{Symbo
                 push!(cookienames, param.name)
                 push!(cookie_params, param)
             else
-                append!(bodynames, fieldnames(innner_type))
+                append!(bodynames, bound_fieldnames(innner_type))
                 push!(body_params, param)
             end
         elseif param.name in route_params
