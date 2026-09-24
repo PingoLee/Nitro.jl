@@ -196,9 +196,9 @@ BearerAuth(validate_token::Function;
 
 CookieAuthMiddleware(validate_token::Function;
                      cookie_name = "auth_token",
-                     secret_key  = nothing)
+                     secret_key  = nothing)          # String or SecretString, >= 32 bytes
 
-CSRFMiddleware(secret::String;                      # needs SessionMiddleware OUTSIDE it
+CSRFMiddleware(secret::Union{AbstractString, SecretString};  # needs SessionMiddleware OUTSIDE it
                cookie_name = "__Host-csrf_token",   # prefix => Secure + Path=/ + no Domain
                header_name = "X-CSRF-Token",
                form_field  = "_csrf",
@@ -210,8 +210,8 @@ CSRFMiddleware(secret::String;                      # needs SessionMiddleware OU
 # paired with a config browsers would reject.
 
 SessionMiddleware(; store,                           # REQUIRED -- no default (#171)
-                    cookie_name      = "nitro_session",
-                    secret_key       = nothing,
+                    cookie_name      = nothing,      # => __Host-nitro_session (#329); see below
+                    secret_key       = nothing,      # accepted, never used (#339)
                     max_age::Int     = 86400,
                     prune_interval   = Minute(10),   # background janitor period (#36)
                     secure           = true,
@@ -227,6 +227,9 @@ SessionMiddleware(; store,                           # REQUIRED -- no default (#
 #     SessionMiddleware(store=store).middleware(handler)
 # `prune_probability` was REMOVED -- pruning no longer runs on the request path.
 # `prune_interval` must be a fixed-length Period; Month/Quarter/Year are an ArgumentError.
+# Default cookie_name follows the attributes: secure + path "/" + no domain => __Host-nitro_session;
+# secure with a domain or another path => __Secure-nitro_session; secure=false => nitro_session.
+# An explicit __Host-/__Secure- name the attributes cannot carry is an ArgumentError.
 
 SessionPruner(store; interval = Minute(10))
 # Janitor only, pass-through middleware. For apps that reach sessions through the Session{T}
@@ -298,7 +301,7 @@ Keyword-only. Register routes with `urlpatterns(...)` first.
 | `reuseaddr` | platform | `true` on Linux/macOS, `false` on Windows (where `SO_REUSEADDR` lets another process hijack a live port) |
 | `external_url` | `nothing` | Advertised base URL |
 | `revise` | `:none` | `:lazy` / `:eager` with the Revise extension |
-| `secret_key`, `httponly`, `secure`, `samesite` | `nothing` | Cookie defaults |
+| `secret_key`, `httponly`, `secure`, `samesite` | `nothing` | Cookie defaults. `secret_key` is a `String` or `SecretString` of ≥ 32 bytes, validated before `serve` changes anything |
 
 Lifecycle: `terminate(; timeout=…)`, `resetstate()`, `internalrequest(req; …)` (in-process request,
 no socket), `App(mod = @__MODULE__)` for a self-contained router isolated from the global one.
@@ -411,9 +414,31 @@ watcher is then refused unless `set_watch_authorizer!` allows it. The queue auth
 `configcookies`, `get_cookie`, `set_cookie!`, `regenerate_session!(req, store; ttl=3600)`,
 `SecretString`, `reveal`.
 
-Wrap anything sensitive in `SecretString` so it does not print in logs or reprs — but note it
-currently still leaks through JSON response serialization
-([#25](https://github.com/PingoLee/Nitro.jl/issues/25)); never place one in a response body.
+```julia
+configcookies(app; secret_key = SecretString(ENV["COOKIE_SECRET"]))   # returns nothing
+set_cookie!(app, res, "cart", "item-17"; maxage = 86400)   # encrypted: a key is configured
+get_cookie(app, req, "cart", "")                           # "" when absent OR when it does not open
+```
+
+- **Key:** a `String` or `SecretString` of **≥ 32 random bytes**, read from the environment; stored
+  as a `SecretString`. Shorter, empty, bytes or a `Base.SecretBuffer` → `ArgumentError`.
+  Generate once: `bytes2hex(Nitro.Crypto.secure_random_bytes(32))`.
+- **Encrypted value:** AES-256-GCM under an HKDF-derived key, **bound to the cookie name** (a value
+  set as `language` does not open as `session_user`) and to its `Max-Age` (wins) or `Expires`,
+  which the server enforces. Neither set → no server-side expiry; `configcookies(maxage = …)`
+  bounds every cookie. Changing the key invalidates every cookie.
+- **A cookie that does not open reads as the default** (`nothing` for `Cookie{T}`), logged at
+  `@debug` with the name only. Encrypting with no key at all is still a `CookieError`.
+- **Which app:** `get_cookie(req, …)` / `set_cookie!(res, …)` without `app` use the `App` serving
+  the request (#308), and the global app only outside a request. A key set on the global app does
+  not reach an explicit `App`; `serve(app)` warns once when that is the setup.
+- **Parsing:** cookie names match **exactly**; the first occurrence wins; a request's `Set-Cookie`
+  is ignored (only a `Response` is read from `Set-Cookie`). `Domain` must be `[A-Za-z0-9.-]`.
+- **Values:** `set_cookie!` refuses a `SecretString` value — pass `reveal(x)` if a secret really
+  belongs in a cookie. Keep identity in the session or a JWT with `exp`, never in a cookie.
+
+Wrap anything sensitive in `SecretString`: it is masked in `show`/`repr`/logs **and** serializes to
+`"****"` through `Res.json` and struct returns (#25). `reveal` is the only unwrap.
 
 ---
 
