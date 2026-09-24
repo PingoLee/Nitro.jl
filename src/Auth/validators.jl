@@ -268,21 +268,49 @@ function jwt_validator(secret_or_keyset;
     end
 end
 
-function session_user_validator(store::AbstractSessionStore; user_key::String="user")
+"""
+    session_user_validator(store::AbstractSessionStore; user_key::String = "user_id")
+
+Build a validator for [`CookieAuthMiddleware`](@ref) that authenticates a request by its
+session: the cookie value is the session id, and the identity is whatever that session stores
+under `user_key`.
+
+```julia
+store = MemoryStore()
+session_auth = CookieAuthMiddleware(Auth.session_user_validator(store); cookie_name = "nitro_session")
+```
+
+It returns `nothing` — which the auth middleware answers with a `401` — when the session does not
+exist, when it has no `user_key` entry, or when that entry is `nothing`. The session existing is
+never enough on its own: `SessionMiddleware` gives every visitor one, and an anonymous visitor's
+collects a cart or a CSRF token. Only the login marker counts, so set it at login under the key
+`login_required` and `SessionMiddleware(auth_key = ...)` also read by default:
+
+```julia
+getsession(req)["user_id"] = user.id
+```
+
+`getuser(req)` is then the stored value itself. A plain id is an identity but not a claims
+source, so [`claim_required`](@ref) and [`role_required`](@ref) deny it. Store a dict under
+`user_key` — `Dict("id" => 42, "role" => "admin")` — when the claim guards should authorize off
+the session.
+
+The returned function also fits `SessionMiddleware(validator = ...)`, which calls it as
+`validator(session_id, session_data)` to find the identity marker it rotates the session id on.
+"""
+function session_user_validator(store::AbstractSessionStore; user_key::String="user_id")
     return function(session_id::String, session_data=nothing)
         # The second argument doubles as the middleware arity-dispatch slot: auth
         # middleware passes the `HTTP.Request` there, which is not session data.
         resolved = (session_data === nothing || session_data isa HTTP.Request) ?
             get_session(store, session_id) : session_data
-        resolved === nothing && return nothing
-        if resolved isa AbstractDict
-            if haskey(resolved, user_key)
-                return resolved[user_key]
-            elseif haskey(resolved, Symbol(user_key))
-                return resolved[Symbol(user_key)]
-            end
-        end
-        return resolved
+        # Only the login marker is an identity (#310). This used to fall through to
+        # `return resolved` — the whole session — whenever `user_key` was absent, and
+        # `SessionMiddleware` gives every visitor a session, so every anonymous visitor
+        # authenticated as their own cart.
+        resolved isa AbstractDict || return nothing
+        haskey(resolved, user_key) && return resolved[user_key]
+        return get(resolved, Symbol(user_key), nothing)
     end
 end
 

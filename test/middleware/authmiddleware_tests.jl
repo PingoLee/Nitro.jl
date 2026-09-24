@@ -268,3 +268,46 @@ end
 end
 
 end
+
+# ── #310 ────────────────────────────────────────────────────────────────────────────────────
+#
+# `session_user_validator` through the real request path: `SessionMiddleware` gives EVERY
+# visitor a session, so the validator's answer for an anonymous one is what decides whether
+# `CookieAuthMiddleware` authenticates everybody. In-process (`internalrequest`), no socket.
+@testitem "Auth middleware — an anonymous session does not authenticate (#310)" tags=[:middleware, :auth, :security] setup=[NitroCommon] begin
+using HTTP
+using Nitro
+
+session_cookie(r) = match(r"nitro_session=([^;]+)", HTTP.header(r, "Set-Cookie"))[1]
+
+app = App(mod = @__MODULE__)
+store = MemoryStore()
+session_auth = CookieAuthMiddleware(Nitro.Auth.session_user_validator(store); cookie_name = "nitro_session")
+urlpatterns(app, "",
+    path("/cart/add", req -> (push!(get!(getsession(req), "cart", Int[]), 101); "added")),
+    path("/login", req -> (getsession(req)["user_id"] = 42; "in")),
+    path("/touch", req -> "touched"),
+    path("/api/me", req -> repr(getuser(req)); middleware = [session_auth]))
+mw = [SessionMiddleware(store = store, secure = false)]
+get_with(target, sid) = internalrequest(app, HTTP.Request("GET", target, ["Cookie" => "nitro_session=$sid"]); middleware = mw)
+
+@testset "an anonymous cart session is a 401, not the cart as a user" begin
+    sid = session_cookie(internalrequest(app, HTTP.Request("GET", "/cart/add"); middleware = mw))
+    r = get_with("/api/me", sid)
+    @test r.status == 401
+    @test contains(text(r), "Invalid or expired token")
+end
+
+@testset "an empty anonymous session is a 401" begin
+    sid = session_cookie(internalrequest(app, HTTP.Request("GET", "/touch"); middleware = mw))
+    @test get_with("/api/me", sid).status == 401
+end
+
+@testset "a logged-in session authenticates as the stored id" begin
+    sid = session_cookie(internalrequest(app, HTTP.Request("GET", "/login"); middleware = mw))
+    r = get_with("/api/me", sid)
+    @test r.status == 200
+    @test text(r) == "42"
+end
+
+end
