@@ -222,7 +222,28 @@ end
     max_cookie_size::Nullable{Int} = nothing
 end
 
-# Represents a cookie extractor
+"""
+    Cookie{T}
+
+Handler-parameter extractor that reads one request cookie and parses it as `T`.
+
+```julia
+path("/prefs", function(req, theme::Cookie{String})
+    Res.json(Dict("theme" => something(theme.value, "light")))
+end)
+```
+
+HTTP.jl also exports a `Cookie`, so in a module that has `using HTTP` too, write `Nitro.Cookie`
+or import it explicitly (`using Nitro: Cookie`).
+
+The cookie is looked up by the **parameter name** (`theme` above). For a cookie whose name is
+not a legal Julia identifier, read it with `get_cookie` in the handler.
+
+`value` is `nothing` when the request carries no such cookie; a present cookie that does not
+parse as `T` is a `ValidationError` (400). When the app has a cookie `secret_key` configured
+(see `configcookies`), the value is decrypted before parsing, so a cookie written by
+`set_cookie!` round-trips. The raw value is not percent-decoded.
+"""
 struct Cookie{T} <: Extractor{T}
     name::String
     value::Nullable{T}
@@ -239,7 +260,32 @@ struct Cookie{T} <: Extractor{T}
     Cookie{T}(name::String, value::Nullable{T}=nothing) where T = new{T}(name, value)
 end
 
-# Represents a session extractor
+"""
+    Session{T}
+
+Handler-parameter extractor that resolves the request's session id to a stored value of type `T`.
+
+```julia
+path("/profile", function(req, session::Session{User})
+    isnothing(session.payload) && return Res.status(401)
+    Res.json(Dict("name" => session.payload.name))
+end)
+
+serve(context = store)   # the store the extractor reads from
+```
+
+The session id comes from the cookie named `"session"` (decrypted when a cookie `secret_key` is
+configured); give the parameter a `Session("sid", T)` default to read another cookie name. The
+id is looked up in the **app context**: an [`AbstractSessionStore`](@ref) is read through its
+interface, and any other `get`-able value (a `Dict`) is indexed directly. An expired
+`SessionPayload` counts as absent.
+
+`payload` is `nothing` when there is no cookie, no context, no entry, or the entry has expired.
+
+This is the store-on-the-context shape. Behind `SessionMiddleware`, read the session with
+`getsession` instead. Without `SessionMiddleware` nothing prunes the store: for an
+`AbstractSessionStore`, add a `SessionPruner`; a plain `Dict` context is yours to prune.
+"""
 struct Session{T} <: Extractor{T}
     name::String
     payload::Nullable{T}
@@ -515,7 +561,24 @@ function _grown_copy(current::Dict{K, V}) where {K, V}
     return updated
 end
 
-# Represents the application context
+"""
+    Context{T}
+
+Handler-parameter extractor for the application context: the value passed as
+`serve(context = …)` (or `internalrequest(…; context = …)`), wrapped with its type written down.
+
+```julia
+function health(req::HTTP.Request, ctx::Context{AppConfig})
+    Res.json(Dict("env" => ctx.payload.env))
+end
+
+serve(context = config)
+```
+
+Declaring the type is what keeps the handler body type-stable, so prefer this over the untyped
+`getcontext(req)`. Where only the request is at hand (inside middleware, or in
+a helper), use the typed `getcontext(req, T)`.
+"""
 struct Context{T}
     payload::T
 end
@@ -929,6 +992,17 @@ multipartbody(request::LazyRequest) = multipartbody(request.req)
 
 # ─── Routing ──────────────────────────────────────────────────────────
 
+"""
+    RouteDefinition
+
+One route, as returned by `path`: the `pattern` (already converted from the Django-style
+`<int:id>` to the router's `{id}` form), the `handler`, the HTTP `methods` it answers, an
+optional reverse-lookup `name` (see `url`), optional route `middleware`, and the `type_hints`
+parsed from the pattern's converters (`<int:id>` → `id => Int`).
+
+A `RouteDefinition` registers nothing on its own. Pass it to `urlpatterns`, or collect several
+in a `Vector` and prefix them with `include_routes`.
+"""
 @kwdef struct RouteDefinition
     pattern::String
     handler::Function

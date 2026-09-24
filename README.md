@@ -364,4 +364,4 @@ The bare names `text`, `json` and `binary` are *request body parsers*, not respo
 
 ## Documentation
 
-The docs site is built from the files in `docs/src`. The API reference in `docs/src/api.md` and the docs homepage in `docs/src/index.md` follow the same public contract as this README.
+The docs site is built from the files in `docs/src`. The API reference in `docs/src/api/` and the docs homepage in `docs/src/index.md` follow the same public contract as this README.

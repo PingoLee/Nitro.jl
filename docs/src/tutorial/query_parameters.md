@@ -119,7 +119,5 @@ end
 
 ## API Reference
 
-```@docs
-queryparams
-Query
-```
+[`Query`](@ref) and [`getquery`](@ref) are documented in [Requests And Extractors](@ref).
+`queryparams` is `HTTP.queryparams` re-exported unchanged; see the HTTP.jl documentation.

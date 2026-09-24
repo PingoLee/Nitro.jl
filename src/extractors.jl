@@ -62,6 +62,136 @@ end
 @extractor Files
 @extractor MultipartForm
 
+# Every extractor is a thin wrapper: declare a handler parameter of the wrapped type, and the
+# bound value arrives in `.payload`. They share one construction surface (from `@extractor`):
+# `X(T)`, `X(T, validator)` and `X{T}(validator)` build the parameter's *default*, which is how
+# an extractor-local validator is attached — `payload = Json(Search, s -> !isempty(s.q))`.
+# A value that fails to bind, or fails `validate`, is a `ValidationError` → 400.
+
+"""
+    Path{T}
+
+Extractor that binds the route's path parameters into a struct `T`, matching each field to the
+converter name in the pattern.
+
+```julia
+struct ItemRef; id::Int; slug::String; end
+path("/items/<int:id>/<str:slug>", (req, ref::Path{ItemRef}) -> Res.json(ref.payload))
+```
+
+For one or two parameters, plain typed arguments (`id::Int`) are simpler; `Path{T}` earns its
+place when the struct also carries a [`validate`](@ref) method.
+"""
+Path
+
+"""
+    Query{T}
+
+Extractor that binds the query string into a struct `T`. Fields are matched by name and parsed
+to their declared type; with a `@kwdef` struct an absent parameter takes the field's default.
+
+```julia
+@kwdef struct Page; page::Int = 1; per_page::Int = 20; end
+path("/items", (req, p::Query{Page}) -> Res.json(Dict("page" => p.payload.page)))
+```
+
+See `getquery` for the untyped accessor.
+"""
+Query
+
+"""
+    Header{T}
+
+Extractor that binds request headers into a struct `T`. Header names are lowercased before
+matching, and are matched to field names exactly: `Accept` binds a field `accept`. A hyphenated
+header binds only a field spelled the same way, `var"x-api-key"`; `HTTP.header(req, "X-Api-Key")`
+is usually simpler.
+"""
+Header
+
+"""
+    Json{T}
+
+Extractor that parses the whole request body as JSON into `T`. This is the recommended way to
+take a JSON body: typed, validated, and a malformed body is a 400.
+
+```julia
+struct Search; q::String; limit::Int; end
+path("/search", (req, s::Json{Search}) -> Res.json(s.payload); method = "POST")
+```
+
+Attach a validator by giving the parameter a default: `s = Json(Search, s -> s.limit <= 100)`.
+The *Request Body* guide has the walkthrough; use [`JsonFragment`](@ref) to bind one top-level
+key instead of the whole body.
+"""
+Json
+
+"""
+    JsonFragment{T}
+
+Extractor that binds **one top-level key** of a JSON object body, named after the parameter,
+into a struct `T`. Several `JsonFragment` parameters can split one body between them:
+
+```julia
+path("/orders", function(req, customer::JsonFragment{Customer}, shipping::JsonFragment{Address})
+    # body: {"customer": {...}, "shipping": {...}}
+end; method = "POST")
+```
+
+The key's value must itself be a JSON object. A body that is not a JSON object, or that lacks
+the key, is a 400.
+"""
+JsonFragment
+
+"""
+    Form{T}
+
+Extractor that binds an `application/x-www-form-urlencoded` body into a struct `T`, matching
+fields by name and parsing them to their declared types. For `multipart/form-data`, use
+[`MultipartForm`](@ref) (text fields and files) or [`Files`](@ref) (files only).
+"""
+Form
+
+"""
+    Body{T}
+
+Extractor that parses the raw request body as a single value of type `T`, such as a `String`,
+a number or a `Bool`, with no JSON or form decoding. `Body{String}` is the body text verbatim.
+"""
+Body
+
+"""
+    Files{FormFile}
+    Files{Vector{FormFile}}
+
+Extractor for the file parts of a `multipart/form-data` body, as [`FormFile`](@ref)s.
+
+- `Files{FormFile}` binds the **single** file uploaded under the parameter's name. A missing
+  field, or a field that is text rather than a file, is a 400.
+- `Files{Vector{FormFile}}` binds **every** file in the body, whatever its field name. The vector
+  is empty when there are none.
+
+```julia
+path("/upload", (req, document::Files{FormFile}) -> Res.json(Dict("size" => length(document.payload.data)));
+     method = "POST")
+```
+
+To take text fields and files together into one typed struct, use [`MultipartForm`](@ref).
+"""
+Files
+
+"""
+    MultipartForm{T}
+
+Extractor that binds a `multipart/form-data` body, text fields **and** files, into one struct
+`T`. Each field binds by its declared type: `String` and numbers from text parts, `FormFile` and
+`Vector{FormFile}` from file parts, `Union{X, Nothing}` as optional.
+
+The field-type table and the missing-field rules are on the `MultipartForm` method of
+[`extract`](@ref); the *File Uploads* guide has the walkthrough.
+"""
+MultipartForm
+
 function extracttype(::Type{U}) where {T, U <: Extractor{T}}
     return T
 end
@@ -78,7 +208,19 @@ function isbodyparam(::Param{U}) where {T, U <: Extractor{T}}
     return U <: Union{Json{T}, JsonFragment{T}, Form{T}, Body{T}, Files{T}, MultipartForm{T}}
 end
 
-# Generic validation function - if no validate function is defined for a type, return true
+"""
+    validate(value::T) -> Bool
+
+The global validation hook every extractor runs after binding. The fallback accepts everything;
+add a method for your own type and every extractor that binds a `T` enforces it:
+
+```julia
+Nitro.validate(s::Search) = 1 <= s.limit <= 100
+```
+
+Returning `false` is a `ValidationError` (400). An extractor-local validator, attached through the
+parameter's default (`Json(Search, f)`), runs *after* this one; both must pass.
+"""
 validate(type::T) where {T} = true
 
 """

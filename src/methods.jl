@@ -13,6 +13,79 @@ function resetstate()
     end
 end
 
+"""
+    serve(; middleware=[], host="127.0.0.1", port=8080, kwargs...) -> Union{Server, Nothing}
+
+Start the Nitro HTTP server with the registered routes. Runs until `terminate()`
+(or `Ctrl-C`); pass `async=true` to return immediately and serve in the background.
+
+Returns the running `Server` in `async=true` mode; in blocking mode it returns
+`nothing`, since the server has already shut down by the time control returns and a
+shut-down handle is not useful. The returned handle is safe to display: Nitro gives
+its servers a custom `show` that prints only the address (see `NitroStreamHandler`),
+so secrets captured in the handler closures — cookie/JWT `secret_key`, API keys, DB
+credentials — are never printed by an accidental REPL auto-display, `@show`, string
+interpolation, or logging. (`dump` bypasses `show` and still walks raw fields; that
+is explicit introspection, not accidental disclosure.)
+
+# Keyword arguments
+- `middleware=[]`: global middleware applied to every request, outermost first.
+- `host="127.0.0.1"`, `port=8080`: listen address. Keep `host` on loopback when a
+  reverse proxy terminates TLS in front of Nitro.
+- `async=false`: when `true`, return the running `Server` instead of blocking.
+- `parallel=true`: handle requests on the thread pool via `Threads.@spawn`.
+- `serialize=true`: auto-format handler return values into responses (see `Res`).
+- `catch_errors=true`: convert an error thrown by a handler **or by middleware** into a
+  generic `500 Internal Server Error` and log it with its backtrace. A `ValidationError` becomes
+  a `400` instead and is recorded at `@debug` only; an `InterruptException` from middleware
+  propagates rather than becoming a response. **Stack traces are never sent to the
+  client** — the body is always `{"message": "500: Internal Server Error"}`. Applies only with
+  `serialize=true`.
+- `show_errors=true`: gate **server-side** error logging only (not the client
+  response). Leave it `true` in production so failures are recorded in your logs;
+  `false` merely silences those logs and does *not* harden the already-generic response.
+- `access_log=true`: emit one log line per request. By default only the request
+  **path** is logged — query strings are redacted so tokens, API keys, and OAuth
+  `code`/`state` carried in URLs never reach the logs.
+- `access_log_query=false`: set `true` to log the full target including the query
+  string. Only enable when you are certain no secrets travel in query strings.
+- `prefix=nothing`: strip a global URL prefix (e.g. `"/api"`) before routing.
+- `revise=:none`: `:lazy`/`:eager` enable Revise-based hot reload (dev only).
+- `secret_key`, `httponly`, `secure`, `samesite`: override cookie defaults for this run.
+- `shutdown_timeout=10.0`: seconds `terminate` waits for in-flight requests to drain
+  before force-closing what remains. `0` skips the graceful phase entirely.
+- `max_body_bytes=64*1024*1024`: ceiling on a buffered request body. A request declaring or
+  sending more is answered **413** before any middleware runs, and its connection is closed.
+  Pass `nothing` to buffer without a ceiling. The default matches the cap the bundled HTTP fork
+  already enforces on its non-streaming path, which Nitro's stream handler bypasses (#17).
+  Two limits of the check are worth knowing: it does **not** cover WebSocket frames, which leave
+  the HTTP stream entirely at upgrade and are bounded by HTTP's own `maxframesize`; and it is a
+  floor, not a replacement for `client_max_body_size` at your reverse proxy, which rejects
+  oversized uploads before they reach Julia at all. Asking for a ceiling alongside a custom
+  `handler` throws, because the handler reads the body itself and Nitro cannot enforce one there;
+  pass `max_body_bytes = nothing` if you want to state that explicitly.
+- `reuseaddr`: forwarded to `HTTP.listen!`. Defaults to `true` on Linux/macOS, where it
+  allows rebinding a port still in `TIME_WAIT`, and to **`false` on Windows**, where
+  `SO_REUSEADDR` instead lets a second process bind a port another is actively listening
+  on — turning a port conflict into two servers silently splitting the traffic.
+
+Calling `serve` on an app that is **already serving** throws an `ArgumentError`: the second
+call would overwrite the running server's handle and strand its port. Terminate that app
+first, or give the second listener its own `App`.
+
+**Ctrl-C is honored at both points it can land (#185).** An interrupt inside a startup hook lets
+the remaining hooks finish, then unwinds through `terminate` and rethrows — so the app is left
+not-serving and `serve` can simply be retried. An interrupt out of the blocking wait
+(`async = false`) is the documented way to stop the server, and now tears it down before
+returning rather than leaving the listener up.
+
+IP-based controls (rate limiting, audit logging) key on the socket peer address,
+resolved for both plain-HTTP and direct-TLS listeners. Behind a reverse proxy,
+configure `ExtractIP`/`RateLimiter` with both `trusted_proxies` and the
+`forwarded_header` your proxy writes so per-client limits work.
+
+See also `terminate`, `RateLimiter`, and `ExtractIP`.
+"""
 function serve(; kwargs...)
     async = Base.get(kwargs, :async, false)
     # Whether the server this `finally` would tear down is OURS to tear down. Decided from
@@ -439,9 +512,10 @@ end
 
 """
     urlpatterns(prefix, routes...)
+    urlpatterns(prefix, routes::Vector{RouteDefinition})
 
-Register routes under a common prefix. Automatically uses the global context.
-See `Nitro.Core.Routing.urlpatterns` for details.
+Register routes on the global app, each under `prefix`. The same as
+`urlpatterns(app, prefix, routes...)` with the argument-less singleton as `app`.
 """
 urlpatterns(prefix::String, routes::Nitro.Core.Routing.RouteDefinition...) = 
     Nitro.Core.Routing.urlpatterns(CONTEXT[], prefix, routes...)
@@ -493,9 +567,45 @@ end
 
 ### Terminate Function ###
 
-# No docstring here on purpose: the loop below reassigns `@doc(Nitro.Core.terminate)` onto this
-# binding, so anything written here is silently discarded (it is why `terminate` rendered with an
-# empty body in `docs/src/api.md`). The canonical docstring lives on `Nitro.Core.terminate`.
+"""
+    terminate(context::App; timeout = nothing)
+    terminate(; timeout = nothing)
+
+Stop the running server: run every `LifecycleMiddleware` shutdown hook and close the listener.
+A no-op when nothing is serving. (There is no middleware cache to drop: each pipeline owns its
+own, so the next `serve()` starts cold.)
+
+Shutdown is a **bounded graceful drain**, modeled on Go's `http.Server.Shutdown(ctx)`. The
+listening socket is released immediately — the port is free as soon as `terminate` is entered
+— then Nitro waits up to `timeout` seconds for in-flight requests to finish and force-closes
+whatever remains.
+
+`timeout` defaults to the server's own `serve(shutdown_timeout = …)`, itself defaulting to
+`Nitro.Core.SHUTDOWN_TIMEOUT_SECONDS` (10 seconds). `timeout = 0` skips the graceful phase.
+
+**This budget is not the whole exit time.** Every `LifecycleMiddleware` shutdown hook runs *before*
+the drain begins, and a hook may block: `worker_startup`'s drains in-flight background tasks for up
+to `WORKER_DRAIN_TIMEOUT_SECONDS` (5 seconds) of its own. The two are consecutive, so size them
+together against a container's stop grace period.
+
+**Long-lived connections are always cut at the timeout.** A WebSocket, SSE, or STREAM handler
+holds its connection for its whole lifetime, so the drain can never wait it out. If such a
+handler has to finish cleanly, give it a shutdown signal of its own — an `Event` or `Channel`
+notified from a `LifecycleMiddleware`'s `on_shutdown`, which runs *before* the drain begins.
+
+!!! warning
+    Do not call `terminate()` from inside a request handler. The handler's own connection is
+    what the drain is waiting on, so the graceful phase is guaranteed to reach its timeout.
+
+!!! note "Ctrl-C during shutdown"
+    An interrupt raised inside a shutdown hook or during the drain does not abandon the teardown:
+    every remaining hook still runs, the lifecycle state is still cleared, and the listener is
+    still closed — an interrupted drain escalates straight to a force-close, cutting in-flight
+    requests rather than waiting out the remaining budget. `terminate` then rethrows the
+    `InterruptException`, so it is the one documented way this function throws (#185).
+
+See also `serve`.
+"""
 terminate(context::App; timeout::Nullable{Real} = nothing) =
     Nitro.Core.terminate(context; timeout)
 terminate(; timeout::Nullable{Real} = nothing) = terminate(CONTEXT[]; timeout)
@@ -504,9 +614,11 @@ terminate(; timeout::Nullable{Real} = nothing) = terminate(CONTEXT[]; timeout)
 ### Setup Docs Strings ###
 
 
-# `staticfiles`/`dynamicfiles`/`spafiles` are deliberately absent: they carry their own docstrings
-# above, and `Nitro.Core` has none for them, so propagating would replace real docs with a stub.
-for method in [:serve, :terminate, :internalrequest]
+# `serve` and `terminate` used to be propagated here too. They now carry their docstrings directly
+# (above), because a copy leaves the original on `Nitro.Core` where Documenter counts it as a
+# docstring missing from the manual (#186). `staticfiles`/`dynamicfiles`/`spafiles` carry their own
+# docstrings above, and `Nitro.Core` has none for them, so propagating would replace real docs.
+for method in [:internalrequest]
     eval(quote
         @doc (@doc(Nitro.Core.$method)) $method
     end)
@@ -589,6 +701,21 @@ router(app::App, prefix::String = "";
        middleware::Nullable{Vector} = nothing) =
     Nitro.Core.router(app, prefix; tags, middleware)
 
+"""
+    urlpatterns(app::App, prefix, routes...)
+    urlpatterns(app::App, prefix, routes::Vector{RouteDefinition})
+
+Register a group of [`RouteDefinition`](@ref)s on `app`, each under the URL `prefix` (`""` for
+none). This is the Django `urlpatterns` list: build the routes with [`path`](@ref), and compose
+modules' route lists with [`include_routes`](@ref).
+
+```julia
+urlpatterns(app, "/api/v1",
+    path("/users", list_users),
+    path("/users/<int:id>", get_user; name = "user-detail"),
+)
+```
+"""
 urlpatterns(app::App, prefix::String, routes::Nitro.Core.Routing.RouteDefinition...) =
     Nitro.Core.Routing.urlpatterns(app, prefix, routes...)
 
