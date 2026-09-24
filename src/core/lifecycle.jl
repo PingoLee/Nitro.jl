@@ -162,12 +162,11 @@ function serve(ctx::App;
     # output.
     current_env()
 
-    if !ismissing(context)
-        ctx.app_context[] = Context(context)
-    end
-
+    # Built BEFORE any mutation: `CookieConfig` validates the key (#307, #309 -- a non-string or
+    # sub-32-byte `secret_key` is an `ArgumentError`), and a rejected `serve` must leave the app
+    # untouched, as the guards above do.
     current = ctx.service.cookies[]
-    ctx.service.cookies[] = CookieConfig(
+    cookies = CookieConfig(
         secret_key=isnothing(secret_key) ? current.secret_key : secret_key,
         httponly=isnothing(httponly) ? current.httponly : httponly,
         secure=isnothing(secure) ? current.secure : secure,
@@ -178,6 +177,11 @@ function serve(ctx::App;
         expires=current.expires,
         max_cookie_size=current.max_cookie_size,
     )
+
+    if !ismissing(context)
+        ctx.app_context[] = Context(context)
+    end
+    ctx.service.cookies[] = cookies
 
     ctx.service.external_url[] = external_url isa String ? external_url : "http://$host:$port"
     ctx.service.prefix[] = prefix isa String ? prefix : nothing

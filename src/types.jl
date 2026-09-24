@@ -300,7 +300,9 @@ The default also carries an extractor-local validator, as it does for every othe
 `value` is `nothing` when the request carries no such cookie; a present cookie that does not
 parse as `T` is a `ValidationError` (400). When the app has a cookie `secret_key` configured
 (see `configcookies`), the value is decrypted before parsing, so a cookie written by
-`set_cookie!` round-trips. The raw value is not percent-decoded.
+`set_cookie!` round-trips; one that does not open — tampered, expired, sealed under another key
+or for another cookie name — is `nothing` as well, never a 500. The raw value is not
+percent-decoded.
 """
 struct Cookie{T} <: Extractor{T}
     name::String

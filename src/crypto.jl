@@ -7,6 +7,7 @@ using UUIDs
 using Dates
 using Dates: DateTime
 using ..Errors
+using ..Errors: is_unrecoverable
 
 import JSON
 
@@ -301,12 +302,12 @@ _gcm_cipher() = OpenSSL.EvpCipher(ccall((:EVP_get_cipherbyname, OpenSSL.libcrypt
                                         (Cstring,), "AES-256-GCM"))
 
 """
-    encrypt_payload(secret, payload; purpose, expires = nothing) -> String
+    encrypt_payload(secret, payload; purpose, expires = nothing, now = Dates.now(UTC)) -> String
 
 Seal `payload` into an authenticated, URL-safe token that opens only under `secret` **and** only
 for `purpose` — the cookie name, when `set_cookie!` calls it. `expires` (a UTC `DateTime`) is
 sealed inside the token and enforced by [`decrypt_payload`](@ref); `nothing` means the token
-does not expire on the server side.
+does not expire on the server side. `now` is the issued-at time sealed alongside it.
 
 `secret` is an `AbstractString` or a `SecretString` of at least 32 bytes; anything else is an
 `ArgumentError`. The key is derived from it with HKDF-SHA256 under a Nitro-specific label.
@@ -345,13 +346,13 @@ function encrypt_payload(secret, payload::AbstractString; purpose::AbstractStrin
 end
 
 """
-    decrypt_payload(secret, token; purpose) -> String
+    decrypt_payload(secret, token; purpose, now = Dates.now(UTC)) -> String
 
 Open a token made by [`encrypt_payload`](@ref) under the same `secret` and `purpose`, and return
 the payload. Throws a `CookieError` when the token is malformed, from another format version,
 fails authentication — tampered, sealed under another key, or sealed for another `purpose`, which
-is what stops a ciphertext moving from one cookie to another — or has expired. The messages are
-deliberately generic.
+is what stops a ciphertext moving from one cookie to another — or has expired as of `now` (a UTC
+`DateTime`; pass one to check against another instant). The messages are deliberately generic.
 
 A `secret` shorter than 32 bytes, or not a string, is an `ArgumentError`: that is
 configuration, not a bad token.
@@ -359,9 +360,13 @@ configuration, not a bad token.
 function decrypt_payload(secret, token::AbstractString; purpose::AbstractString,
                          now::DateTime = Dates.now(Dates.UTC))
     key = _cookie_key(_cookie_secret(secret))
+    # Both rescues below turn a failure into a `CookieError`, which `get_cookie` now reads as an
+    # absent cookie (#309) -- so a corrupted process must not pass through them: an interrupt or
+    # an OOM is not a missing cookie (#254, `is_unrecoverable`).
     data = try
         base64url_decode(String(token))
-    catch
+    catch e
+        is_unrecoverable(e) && rethrow()
         throw(CookieError("Invalid Base64 payload"))
     end
 
@@ -394,7 +399,7 @@ function decrypt_payload(secret, token::AbstractString; purpose::AbstractString,
         ret == 1 || throw(CookieError("Decryption failed: integrity check failed"))
         vcat(opened, final_res[1:outlen[]])
     catch e
-        e isa CookieError && rethrow()
+        (e isa CookieError || is_unrecoverable(e)) && rethrow()
         # Don't surface the underlying exception detail to callers (it can reach
         # clients); keep the failure reason generic.
         throw(CookieError("Decryption failed"))

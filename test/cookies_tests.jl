@@ -1627,6 +1627,31 @@ end
     @test_throws Nitro.CookieError Cookies.get_cookie(request_with("c" => good), "c"; encrypted = true)
 end
 
+@testset "a corrupted process is not an absent cookie" begin
+    # `get_cookie` reads a CookieError as "absent", so decrypt_payload's rescues must not turn a
+    # fatal error into one (#254). A token whose conversion throws stands in for an interrupt
+    # or an OOM landing inside the decode.
+    struct ExplodingToken <: AbstractString end
+    Base.String(::ExplodingToken) = throw(OutOfMemoryError())
+    @test_throws OutOfMemoryError Crypto.decrypt_payload(key, ExplodingToken(); purpose = "c")
+    struct InterruptedToken <: AbstractString end
+    Base.String(::InterruptedToken) = throw(InterruptException())
+    @test_throws InterruptException Crypto.decrypt_payload(key, InterruptedToken(); purpose = "c")
+end
+
+@testset "a rejected cookie key leaves serve's app untouched" begin
+    app = App(mod = @__MODULE__)
+    try
+        @test_throws ArgumentError serve(app; context = :marker, secret_key = "s" ^ 31,
+                                         port = get_free_port(), async = true, show_banner = false)
+        @test ismissing(app.app_context[])            # the context was set before the key check
+        @test app.service.cookies[].secret_key === nothing
+        @test !isopen(app.service)
+    finally
+        terminate(app)
+    end
+end
+
 @testset "a cookie key is at least 32 bytes" begin
     short = "s" ^ 31
     @test_throws ArgumentError configcookies(App(); secret_key = short)
