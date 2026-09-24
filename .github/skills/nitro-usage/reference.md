@@ -52,7 +52,7 @@ param and body accessors (`getparams`, `getquery`, `getjson`, `getform`, `getpos
 |----------|------|-------|
 | `getparams(req)` | `Dict` or `nothing` | Path parameters, percent-decoded once; `nothing` before the router runs |
 | `getquery(req)` | `Dict` | Query-string parameters |
-| `getjson(req)` | parsed JSON or `nothing` | **Cached** per request |
+| `getjson(req)` | parsed JSON or `nothing` | **Cached** per request; `nothing` unless the `Content-Type` is JSON (#327) |
 | `getform(req)` | `Dict` | urlencoded body — **cached** |
 | `getpost(req)` | `Dict{String, Union{String, Vector{String}}}` | Multipart *text* fields (Django `request.POST`) — **cached** |
 | `getfiles(req)` | `Dict{String, Union{FormFile, Vector{FormFile}}}` | Multipart *file* parts (Django `request.FILES`) — **cached** |
@@ -137,7 +137,7 @@ Declared as a handler parameter. Unwrap with `.payload`.
 | `Form{T}` | urlencoded form body |
 | `Body` | Raw body |
 | `Cookie` | A cookie (name = parameter name unless set) |
-| `Session` | Session data |
+| `Session` | The app context, which must be an `AbstractSessionStore{String}` (e.g. `MemoryStore`); any other context binds no session |
 | `Files{FormFile}` / `Files{Vector{FormFile}}` | Multipart file parts |
 | `MultipartForm{T}` | Mixed multipart — text fields *and* files into one struct |
 
@@ -155,7 +155,28 @@ end, method="POST")
 
 `T` must be constructible from its fields in declaration order (a plain `struct`) or by keyword (a
 `@kwdef struct`, which also honors field defaults for absent keys). A failing predicate raises
-`ValidationError` → HTTP 422.
+`ValidationError` → HTTP 400.
+
+### Binding rules that hold for every extractor
+
+- **Fields are looked up by name**, from `T`'s field list (never the client's keys). Each binds
+  like a scalar parameter of its type: `Nullable{T}`, `UUID`, `Date`, an `@enum` by integer
+  **or** name. StructTypes customizations (`StructTypes.names`) are not consulted (#306).
+- **No `Symbol` from request input.** A `::Symbol` parameter, `Body{Symbol}`, or a `Symbol`
+  (or `Vector{Symbol}`, `Dict{Symbol,…}`, enum-keyed `Dict`) field of a bound struct is refused
+  when the route is declared (`ArgumentError`): Julia never frees an interned `Symbol`. Use an
+  `@enum` or a `String` checked against an allow-list (#306).
+- **Content types are enforced.** `Json{T}`/`JsonFragment{T}` need `Content-Type:
+  application/json` or `application/*+json` — anything else, including none, is **415**.
+  `MultipartForm{T}` needs `multipart/form-data`, also 415. `getjson(req)` and `payload(req)`
+  ignore a body that does not declare JSON (#327).
+- **Floats must be finite.** `NaN`, `inf`, `1e999` are a 400 on every path (#327).
+- **Field count is capped**: `serve(max_fields = 1000)` per source (query, form, multipart
+  parts, JSON keys) → 400 over it; `0` lifts it (#327).
+- `json(req, T)` raises a `ValidationError` for a body that does not bind — a 400 in a handler
+  (#326).
+- A validation message names the parameter, its type and the validator (`Module.name`), never a
+  value or a source path, so returning `err.msg` is safe.
 
 ---
 
