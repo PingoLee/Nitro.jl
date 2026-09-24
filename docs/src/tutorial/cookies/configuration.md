@@ -11,19 +11,30 @@ using Nitro
 
 # Configure defaults for ALL cookies
 configcookies(
-    secret_key = "my-super-secret-key-1234567890", # Required for encryption
+    secret_key = SecretString(ENV["COOKIE_SECRET"]), # Required for encryption; ≥ 32 bytes
     httponly   = true,      # Default: true (Safety first)
     samesite   = "Lax",     # Default: "Lax"
     secure     = true,      # Default: true (HTTPS only)
-    maxage     = 3600       # Default: 1 hour
+    maxage     = 3600       # Default: none. Here every cookie lasts 1 hour, browser AND server
 )
 ```
+
+`configcookies` returns `nothing`. Read the key from the environment rather than writing it in
+source, and pass it as a plain `String` or a [`SecretString`](@ref) — either way Nitro stores it as a
+`SecretString`, so the configuration never prints it. It must be at least 32 random bytes; a
+shorter key, or anything that is not a string (bytes, a `Base.SecretBuffer`), is refused with an
+`ArgumentError`. Generate one once with
+`julia -e 'using Nitro; println(bytes2hex(Nitro.Crypto.secure_random_bytes(32)))'`.
+
+An encrypted cookie's `maxage`/`expires` is enforced by the server as well as the browser, so a
+default `maxage` here bounds every encrypted cookie that does not set its own — see
+[Cookie Security](security.md#What-an-encrypted-cookie-guarantees).
 
 ### Configuration Options
 
 | Option | Description | Recommended |
 |---|---|---|
-| `secret_key` | Key used for AES-256 encryption. Must be kept secret. | **Required** for encryption |
+| `secret_key` | Key used for AES-256 encryption. Must be kept secret. A `String` or a `SecretString`. | **Required** for encryption |
 | `httponly` | If `true`, JavaScript cannot access the cookie. | `true` |
 | `secure` | If `true`, cookie is sent only over HTTPS. | `true` (in Prod) |
 | `samesite` | Controls cross-site behavior (`"Lax"`, `"Strict"`, `"None"`). | `"Lax"` or `"Strict"` |

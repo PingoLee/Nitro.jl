@@ -10,6 +10,7 @@ using ..Reflection: struct_builder, extract_struct_info
 using ..Errors: ValidationError, is_unrecoverable
 using ..Types
 using ..Cookies
+using ..Crypto: SecretString
 # HTTP.jl v2 newly exports `Cookie` at the top level, which collides with Nitro's
 # `Cookie` extractor (defined in `Types`). Import it explicitly so the unqualified
 # `Cookie` references below resolve unambiguously to ours, not `HTTP.Cookie`.
@@ -461,7 +462,7 @@ end
 Extracts a cookie from a request and converts it into a custom type.
 This is a helper used by the cookie strategy in Core.
 """
-function extract(param::Param{Cookie{T}}, request::LazyRequest, secret_key::Nullable{String}) :: Cookie{T} where {T}
+function extract(param::Param{Cookie{T}}, request::LazyRequest, secret_key::Union{AbstractString, SecretString, Nothing}) :: Cookie{T} where {T}
     # The cookie name is either explicitly set in the Cookie struct or defaults to the parameter name
     cookie_name = if param.hasdefault && !isnothing(param.default.name) && !isempty(param.default.name)
         param.default.name
@@ -477,7 +478,10 @@ function extract(param::Param{Cookie{T}}, request::LazyRequest, secret_key::Null
     # on write — `_validate_cookie_value` rejects out-of-range octets instead, and `%` is a legal
     # cookie octet. Decoding here (which `parseparam` used to do by default) therefore mangled any
     # cookie carrying a literal `%` on the way back in — a write/read asymmetry removed with #70.
-    val = Cookies.get_cookie(headers(request), cookie_name; encrypted=!isnothing(secret_key), secret_key=secret_key)
+    # From the REQUEST, not `headers(request)`: that is a lowercased Dict keeping only the last
+    # `cookie` header, so repeated headers would resolve differently here than in
+    # `get_cookie(req)` / `parse_cookies(req)` (#329).
+    val = Cookies.get_cookie(request.req, cookie_name; encrypted=!isnothing(secret_key), secret_key=secret_key)
     
     if isnothing(val)
         return Cookie(cookie_name, T)
@@ -494,7 +498,7 @@ end
 """
 Extracts a session from a request using the application context as a store.
 """
-function extract(param::Param{Session{T}}, request::LazyRequest, secret_key::Nullable{String}, app_context::Any) :: Session{T} where {T}
+function extract(param::Param{Session{T}}, request::LazyRequest, secret_key::Union{AbstractString, SecretString, Nothing}, app_context::Any) :: Session{T} where {T}
     # 1. Get the session cookie name
     session_cookie_name = if param.hasdefault && !isnothing(param.default.name) && !isempty(param.default.name)
         param.default.name
@@ -503,7 +507,7 @@ function extract(param::Param{Session{T}}, request::LazyRequest, secret_key::Nul
     end
 
     # 2. Extract the session ID from cookies
-    val = Cookies.get_cookie(headers(request), session_cookie_name; encrypted=!isnothing(secret_key), secret_key=secret_key)
+    val = Cookies.get_cookie(request.req, session_cookie_name; encrypted=!isnothing(secret_key), secret_key=secret_key)
     
     if isnothing(val) || isempty(val)
         return Session(session_cookie_name, T)

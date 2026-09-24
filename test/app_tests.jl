@@ -91,17 +91,29 @@ try
         # The assertion has to name the literal secret. `!occursin("secret_key", …)` does NOT
         # discriminate — Julia's default `show` prints field VALUES, not names, so that form
         # passes with the override deleted. Verified before rewriting it.
+        cookie_key = "SUPERSECRET_COOKIE_KEY_9f2a_012345"
         secret = "SUPERSECRET_CANARY_9f2a"
         leaky = App(mod = @__MODULE__)
-        configcookies(leaky; secret_key = secret)
+        configcookies(leaky; secret_key = cookie_key)
+        # A route middleware closing over a raw secret -- the shape an app's own auth layer has.
+        canary_mw = let s = secret
+            handle -> (req -> (length(s); handle(req)))
+        end
+        urlpatterns(leaky, "", path("/canary", req -> "ok"; middleware = [canary_mw]))
 
         shown = sprint(show, leaky)
         @test occursin("App(", shown)
         @test !occursin(secret, shown)
+        @test !occursin(cookie_key, shown)
         @test !occursin("Service", shown)
 
-        # And the default path really would have leaked it, so the override is load-bearing.
-        @test occursin(secret, sprint(io -> invoke(Base.show, Tuple{IO,Any}, io, leaky)))
+        default_shown = sprint(io -> invoke(Base.show, Tuple{IO,Any}, io, leaky))
+        # The default path really would have leaked the middleware's capture, so the override is
+        # load-bearing. This used to be proven with the COOKIE key, which no longer leaks even
+        # there: since #307 the key is held as a `SecretString`, so the default field-walking
+        # `show` prints it masked. Hence two canaries, asserted both ways.
+        @test occursin(secret, default_shown)
+        @test !occursin(cookie_key, default_shown)
     end
     @testset "every (app, …) forward reaches the app, not the global" begin
         # The forwards are one-liners, which is exactly why they need this: a typo swapping
@@ -130,10 +142,11 @@ try
 
         req = Nitro.Request("GET", "/", ["Cookie" => split(raw, ';')[1]])
         @test get_cookie(app1, req, "sid") == "payload-app1"
-        # app2 has a different key, so it must not be able to read app1's cookie. Decryption
-        # under the wrong key raises rather than returning the default -- which is the correct
-        # loud failure, and the reason this asserts a throw instead of a value.
-        @test_throws Nitro.CookieError get_cookie(app2, req, "sid")
+        # app2 has a different key, so it must not be able to read app1's cookie. Since #309 a
+        # token that does not open under the key reads as ABSENT -- the default, `nothing` --
+        # rather than raising, so this asserts the value. It still discriminates a swap to
+        # `CONTEXT[]`: the global has no key, so it would hand back the raw token, not `nothing`.
+        @test get_cookie(app2, req, "sid") === nothing
 
         # `router` — the HOF route builder; protocol is `router(app, prefix)(path)(method)`.
         #

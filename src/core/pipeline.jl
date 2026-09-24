@@ -21,15 +21,38 @@
 # `haskey` + assignment rather than `get!`: `HTTP.RequestContext` is reached through
 # `haskey`/`getindex`/`setindex!`/`get` throughout `src/` (see `request_input`), and `get!`
 # is not part of that surface.
+#
+# It also binds `SERVING_APP` for the request's dynamic extent (#308) -- see below.
 function _app_context_seed(ctx::App)
     return function(handler::Function)
         return function(req::HTTP.Request)
             haskey(req.context, REQUEST_CONTEXT_KEY) ||
                 (req.context[REQUEST_CONTEXT_KEY] = ctx.app_context[])
-            return handler(req)
+            return @with SERVING_APP => ctx handler(req)
         end
     end
 end
+
+"""
+    SERVING_APP :: ScopedValue{Union{App, Nothing}}
+
+The [`App`](@ref) whose pipeline is running the current request, bound by `_app_context_seed` —
+the outermost layer — for the request's whole dynamic extent: every middleware, the handler, and
+any task the handler spawns. `nothing` outside a request.
+
+It exists for the argument-less `get_cookie(req, …)`/`set_cookie!(res, …)` (#308). They used to
+read the process-wide `CONTEXT[]`, so an app built with an explicit `App` — the recommended
+handle since #31 — silently wrote plaintext cookies and trusted raw client values, because the
+key lived on the serving app and the helpers looked somewhere else. A `Response` carries no
+request, so `set_cookie!(res, …)` cannot find the serving app from its arguments; a task-scoped
+binding is the one carrier both helpers can read. This is Spring's `RequestContextHolder`, with
+Julia's `ScopedValue` in place of a thread-local, which is what keeps it correct across
+`Threads.@spawn`.
+
+A background worker run deliberately does not inherit it: `_spawn_detached` clears the dynamic
+scope (#209).
+"""
+const SERVING_APP = ScopedValue{Union{App, Nothing}}(nothing)
 
 """
     _dispatch_resolved(r, req) -> response

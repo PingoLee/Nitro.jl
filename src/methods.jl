@@ -541,35 +541,66 @@ urlpatterns(prefix::String, routes::Vector{Nitro.Core.Routing.RouteDefinition}) 
     configcookies(defaults::Dict)
     configcookies(; kwargs...)
 
-Configure global cookie defaults for the application.
+Configure global cookie defaults for the application. Returns `nothing`.
+
+`secret_key` may be an `AbstractString` or a [`SecretString`](@ref); either way it is stored as a
+`SecretString`. Anything else -- bytes, a `Base.SecretBuffer` -- is an `ArgumentError`.
 """
 function configcookies(defaults::Dict)
     CONTEXT[].service.cookies[] = Nitro.Core.load_cookie_settings!(defaults)
+    # Not the config: returning it put the key in front of every REPL auto-display (#307).
+    return nothing
 end
 
 function configcookies(; kwargs...)
     configcookies(Dict(string(k) => v for (k, v) in kwargs))
 end
 
+# #308 moved the argument-less helpers from the GLOBAL app's cookie config to the SERVING app's.
+# One setup is worse off for it: a key configured on the global app (`configcookies(secret_key =
+# …)`, no `app`) while an explicit `App` is served. Those helpers used to encrypt under the global
+# key by accident; now they would write plaintext without a word. Say so, once, where the mix is
+# visible. Never names the key.
+function _warn_shadowed_cookie_key(app::App, kwargs)
+    app === CONTEXT[] && return nothing
+    isnothing(CONTEXT[].service.cookies[].secret_key) && return nothing
+    isnothing(app.service.cookies[].secret_key) || return nothing
+    isnothing(Base.get(kwargs, :secret_key, nothing)) || return nothing
+    @warn "Nitro: a cookie secret_key is configured on the GLOBAL app (`configcookies(secret_key = …)`), " *
+          "but the App being served has none, so any cookie it sets is NOT encrypted. `get_cookie`/" *
+          "`set_cookie!` use the configuration of the app serving the request (#308) -- configure " *
+          "this one with `configcookies(app; secret_key = …)` or `serve(app; secret_key = …)`. " *
+          "(An app that sets no cookies can ignore this.)" maxlog = 1
+    return nothing
+end
+
+# The app whose cookie config the argument-less helpers use: the one SERVING this request, and
+# the global app only outside any request (#308). They used to read `CONTEXT[]` always, so an app
+# built with an explicit `App` silently wrote plaintext and trusted raw client values -- its key
+# lived on the serving app. See `Nitro.Core.SERVING_APP` (src/core/pipeline.jl).
+_cookie_app() = something(Nitro.Core.SERVING_APP[], CONTEXT[])
+
 """
     get_cookie(req::Nitro.Request, name::String, default::Any=nothing; kwargs...)
 
-Get a cookie value from an Nitro request. Automatically handles decryption if a secret key is configured.
+Get a cookie value from an Nitro request, using the cookie configuration of the [`App`](@ref)
+**serving this request** — or the global app when called outside any request. Decrypts
+automatically when that app has a `secret_key`; an encrypted cookie that does not open reads as
+`default`. The same as `get_cookie(app, req, name, default; kwargs...)` with that app.
 """
 function get_cookie(req::Nitro.Request, name::String, default::Any=nothing; kwargs...)
-    secret_key = CONTEXT[].service.cookies[].secret_key
-    # If encrypted is not explicitly passed, we default to whatever the global config says (based on secret_key presence)
-    encrypted = Base.get(kwargs, :encrypted, !isnothing(secret_key))
-    return Nitro.Core.get_cookie(req, name, default; secret_key=secret_key, encrypted=encrypted, kwargs...)
+    return get_cookie(_cookie_app(), req, name, default; kwargs...)
 end
 
 """
     set_cookie!(res::Nitro.Response, name::String, value::Any; kwargs...)
 
-Set a cookie on an Nitro response using the global cookie configuration.
+Set a cookie on an Nitro response, using the cookie configuration of the [`App`](@ref)
+**serving this request** — or the global app when called outside any request. Encrypts when that
+app has a `secret_key`. The same as `set_cookie!(app, res, name, value; kwargs...)` with that app.
 """
 function set_cookie!(res::Nitro.Response, name::String, value::Any; kwargs...)
-    return Nitro.Core.set_cookie!(res, name, value; config=CONTEXT[].service.cookies[], kwargs...)
+    return set_cookie!(_cookie_app(), res, name, value; kwargs...)
 end
 
 
@@ -664,6 +695,7 @@ context, which has nothing to do with `app`. A blocking call still terminates th
 it started.
 """
 function serve(app::App; kwargs...)
+    _warn_shadowed_cookie_key(app, kwargs)
     async = Base.get(kwargs, :async, false)
     # Same reasoning as the singleton form above: decide ownership BEFORE the call, so a
     # rejected `serve` never tears down the healthy server that caused the rejection.
@@ -744,20 +776,36 @@ dynamicfiles(app::App, folder::String, mountdir::String="static"; kwargs...) =
     configcookies(app::App, defaults::Dict)
     configcookies(app::App; kwargs...)
 
-Set `app`'s cookie defaults. The only one of these forms that MUTATES the app.
+Set `app`'s cookie defaults. The only one of these forms that MUTATES the app. Returns `nothing`.
 """
-configcookies(app::App, defaults::Dict) =
-    (app.service.cookies[] = Nitro.Core.load_cookie_settings!(defaults))
+function configcookies(app::App, defaults::Dict)
+    app.service.cookies[] = Nitro.Core.load_cookie_settings!(defaults)
+    return nothing
+end
 
 configcookies(app::App; kwargs...) =
     configcookies(app, Dict(string(k) => v for (k, v) in kwargs))
 
+"""
+    get_cookie(app::App, req::Nitro.Request, name::String, default::Any=nothing; kwargs...)
+
+Read cookie `name` from `req` with `app`'s cookie configuration. `encrypted` defaults to whether
+`app` has a `secret_key`; an encrypted cookie that does not open — tampered, expired, sealed under
+another key or for another cookie name — reads as `default`. Keyword arguments are those of
+[`Nitro.Cookies.get_cookie`](@ref).
+"""
 function get_cookie(app::App, req::Nitro.Request, name::String, default::Any=nothing; kwargs...)
     secret_key = app.service.cookies[].secret_key
-    # Mirrors the singleton form: `encrypted` defaults to whatever the app's config implies.
+    # `encrypted` defaults to whatever the app's config implies.
     encrypted = Base.get(kwargs, :encrypted, !isnothing(secret_key))
     return Nitro.Core.get_cookie(req, name, default; secret_key=secret_key, encrypted=encrypted, kwargs...)
 end
 
+"""
+    set_cookie!(app::App, res::Nitro.Response, name::String, value::Any; kwargs...)
+
+Append a `Set-Cookie` for `name` to `res` with `app`'s cookie defaults, encrypting when `app` has
+a `secret_key`. Keyword arguments are those of [`Nitro.Cookies.set_cookie!`](@ref).
+"""
 set_cookie!(app::App, res::Nitro.Response, name::String, value::Any; kwargs...) =
     Nitro.Core.set_cookie!(res, name, value; config=app.service.cookies[], kwargs...)

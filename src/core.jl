@@ -13,6 +13,7 @@ using Reexport
 using DataStructures: CircularDeque
 using LRUCache: LRU
 import Base.Threads: lock, nthreads
+using Base.ScopedValues: ScopedValue, @with
 import ..has_revise_hooks, ..revise_hooks
 
 include("errors.jl");       @reexport using .Errors
@@ -20,9 +21,11 @@ include("errors.jl");       @reexport using .Errors
 # and `Res` itself depends on nothing in Nitro (HTTP, MIMEs, JSON only).
 include("response.jl");     @reexport using .Res
 include("util.jl");         @reexport using .Util
+# `Crypto` loads BEFORE `types.jl`: `CookieConfig` holds its key as a `SecretString` (#307), and
+# `Crypto` itself depends on nothing in Nitro but `Errors`.
+include("crypto.jl");       @reexport using .Crypto
 include("types.jl");        @reexport using .Types
 using .Types: snapshot, DeclaredMethodHandler
-include("crypto.jl");       @reexport using .Crypto
 include("cookies.jl");      @reexport using .Cookies
 include("constants.jl");    @reexport using .Constants
 include("environment.jl");  @reexport using .Environment

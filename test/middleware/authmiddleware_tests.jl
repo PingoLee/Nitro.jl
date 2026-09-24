@@ -106,7 +106,7 @@ end
     # Build middleware
     mw = CookieAuthMiddleware(validate_token, cookie_name="my_auth_cookie")
     handler = mw(req->HTTP.Response(200, "ok"))
-    secret = "auth-secret"
+    secret = "auth-secret-0123456789abcdefghijklmnop"
     encrypted_mw = CookieAuthMiddleware(validate_token, cookie_name="my_auth_cookie", secret_key=secret)
     encrypted_handler = encrypted_mw(req->HTTP.Response(200, "ok"))
 
@@ -143,7 +143,7 @@ end
 
     # Case E: Invalid encrypted cookie should be rejected as unauthorized, not raise
     wrong_res = HTTP.Response(200)
-    set_cookie!(wrong_res, "my_auth_cookie", good_token, encrypted=true, secret_key="wrong-secret")
+    set_cookie!(wrong_res, "my_auth_cookie", good_token, encrypted=true, secret_key="wrong-secret-0123456789abcdefghijklmnop")
     reqE = HTTP.Request("GET", "/")
     HTTP.setheader(reqE, "Cookie" => HTTP.header(wrong_res, "Set-Cookie"))
     resE = encrypted_handler(reqE)

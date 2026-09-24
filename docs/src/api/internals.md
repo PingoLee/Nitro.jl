@@ -54,4 +54,6 @@ Nitro.Core.Util.mountfolder
 Nitro.Core.Types.require_fixed_period
 Nitro.Core.Crypto.secure_random_bytes
 Nitro.Core.Crypto.secure_uuid4
+Nitro.Core.Crypto.encrypt_payload
+Nitro.Core.Crypto.decrypt_payload
 ```

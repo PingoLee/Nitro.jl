@@ -4,7 +4,10 @@ using OpenSSL
 using SHA
 using Base64
 using UUIDs
+using Dates
+using Dates: DateTime
 using ..Errors
+using ..Errors: is_unrecoverable
 
 import JSON
 
@@ -60,89 +63,6 @@ function base64url_decode(s::String)
         s *= "=" ^ (4 - padding)
     end
     return base64decode(s)
-end
-
-function encrypt_payload(secret::String, payload::String)
-    key = SHA.sha256(secret)
-
-    # Cryptographically secure IV; `secure_random_bytes` checks RAND_bytes and
-    # throws on failure, so we never encrypt under a low-entropy / zero IV (which
-    # would be catastrophic for GCM nonce uniqueness).
-    iv = secure_random_bytes(12)
-
-    cipher_ptr = ccall((:EVP_get_cipherbyname, OpenSSL.libcrypto), Ptr{Cvoid}, (Cstring,), "AES-256-GCM")
-    cipher = OpenSSL.EvpCipher(cipher_ptr)
-    ctx = OpenSSL.EvpCipherContext()
-
-    try
-        OpenSSL.encrypt_init(ctx, cipher, key, iv)
-        ciphertext = OpenSSL.cipher_update(ctx, Vector{UInt8}(payload))
-        final_part = OpenSSL.cipher_final(ctx)
-
-        tag = Vector{UInt8}(undef, 16)
-        # EVP_CTRL_GCM_GET_TAG (0x10) returns 1 on success. A silent failure here
-        # would emit an all-undefined tag and produce undecryptable ciphertext.
-        ret = ccall((:EVP_CIPHER_CTX_ctrl, OpenSSL.libcrypto), Cint,
-              (OpenSSL.EvpCipherContext, Cint, Cint, Ptr{UInt8}),
-              ctx, 0x10, 16, tag)
-        ret == 1 || throw(CookieError("Encryption failed: could not read authentication tag"))
-
-        return base64url_encode(vcat(iv, ciphertext, final_part, tag))
-    finally
-        # context cleaned by finalizer
-    end
-end
-
-function decrypt_payload(secret::String, payload::String)
-    data = try
-        base64url_decode(payload)
-    catch
-        throw(CookieError("Invalid Base64 payload"))
-    end
-
-    if length(data) < 28
-        throw(CookieError("Payload too short"))
-    end
-
-    iv = data[1:12]
-    tag = data[end-15:end]
-    ciphertext = data[13:end-16]
-    key = SHA.sha256(secret)
-
-    cipher_ptr = ccall((:EVP_get_cipherbyname, OpenSSL.libcrypto), Ptr{Cvoid}, (Cstring,), "AES-256-GCM")
-    cipher = OpenSSL.EvpCipher(cipher_ptr)
-    ctx = OpenSSL.EvpCipherContext()
-
-    try
-        OpenSSL.decrypt_init(ctx, cipher, key, iv)
-        plaintext = OpenSSL.cipher_update(ctx, Vector{UInt8}(ciphertext))
-
-        # EVP_CTRL_GCM_SET_TAG (0x11) returns 1 on success; a failure means the
-        # tag was rejected outright, so abort rather than continue to final.
-        set_tag = ccall((:EVP_CIPHER_CTX_ctrl, OpenSSL.libcrypto), Cint,
-              (OpenSSL.EvpCipherContext, Cint, Cint, Ptr{UInt8}),
-              ctx, 0x11, 16, Vector{UInt8}(tag))
-        set_tag == 1 || throw(CookieError("Decryption failed: integrity check failed"))
-
-        final_res = Vector{UInt8}(undef, 16)
-        outlen = Ref{Cint}(0)
-        
-        # EVP_DecryptFinal_ex returns 1 on success
-        ret = ccall((:EVP_DecryptFinal_ex, OpenSSL.libcrypto), Cint,
-                    (OpenSSL.EvpCipherContext, Ptr{UInt8}, Ptr{Cint}),
-                    ctx, final_res, outlen)
-        
-        if ret != 1
-            throw(CookieError("Decryption failed: integrity check failed"))
-        end
-
-        return String(vcat(plaintext, final_res[1:outlen[]]))
-    catch e
-        if e isa CookieError; rethrow(e); end
-        # Don't surface the underlying exception detail to callers (it can reach
-        # clients); keep the failure reason generic.
-        throw(CookieError("Decryption failed"))
-    end
 end
 
 # ── Secret handling ─────────────────────────────────────────────────────────────
@@ -287,5 +207,242 @@ Base.:(==)(a::AbstractString, b::SecretString) = b == a
 # Hash by value so `==`-equal secrets (and equal plain strings) hash equally,
 # keeping the Dict/Set contract intact.
 Base.hash(s::SecretString, h::UInt) = hash(s.value, h)
+
+# ── Cookie encryption keys ──────────────────────────────────────────────────────
+#
+# The ONE place a cookie key enters Nitro (#307). `configcookies`, `serve(secret_key = …)`,
+# `CookieConfig(secret_key = …)`, the per-call `secret_key` of `get_cookie`/`set_cookie!` and
+# `CookieAuthMiddleware` all normalize through here, so a key is held as a `SecretString` from
+# the moment it arrives -- masked in every `show`, `repr` and captured closure -- and unwrapped
+# with `reveal` only at the cipher.
+#
+# It used to be `string(v)`, which is exactly wrong for the container the docs recommend:
+# `SecretString` is deliberately not an `AbstractString`, so `string` goes through its masking
+# `show` and every app passing one got the public key `SecretString("****")`. A
+# `Base.SecretBuffer` failed the same way. Anything that is not a string is now refused WITHOUT
+# being read, as `JWTKeyset` does (src/Auth/keyset.jl) -- `String(::Vector{UInt8})` would empty
+# the caller's buffer. Deliberately no `repr(value)` in any message.
+_cookie_secret(::Nothing) = nothing
+function _cookie_secret(value)::SecretString
+    wrapped = if value isa SecretString
+        value
+    elseif value isa AbstractString
+        SecretString(value)
+    else
+        throw(ArgumentError(
+            "a cookie secret_key is a $(typeof(value)); it must be an AbstractString or a " *
+            "SecretString. Bytes and Base.SecretBuffer are refused without being read."))
+    end
+    isempty(reveal(wrapped)) && throw(ArgumentError(
+        "the cookie secret_key is empty. An unset environment variable read as " *
+        "get(ENV, \"COOKIE_SECRET\", \"\") is the usual cause -- read it with a `nothing` " *
+        "default and fail at startup instead"))
+    # #309: HKDF assumes a high-entropy key, and one captured cookie is enough to test guesses
+    # against a short one offline. 32 bytes is the AES-256 key size and what the docs always said.
+    ncodeunits(reveal(wrapped)) >= MIN_COOKIE_SECRET_BYTES || throw(ArgumentError(
+        "the cookie secret_key is $(ncodeunits(reveal(wrapped))) bytes; it must be at least " *
+        "$MIN_COOKIE_SECRET_BYTES random bytes. Generate one once -- e.g. " *
+        "`bytes2hex(Nitro.Crypto.secure_random_bytes(32))` -- and read it from the " *
+        "environment (ENV[\"COOKIE_SECRET\"]) rather than writing it in source"))
+    return wrapped
+end
+
+# ── Sealed tokens (#309) ────────────────────────────────────────────────────────
+#
+# What `set_cookie!` writes and `get_cookie` opens. The old format was AES-256-GCM under
+# `sha256(secret)` with nothing else: no associated data, so a ciphertext from ONE cookie opened
+# as ANY other (an attacker-influenced `language` cookie pasted into `session_user`); no
+# timestamp, so a captured cookie decrypted forever; and an unsalted fast hash of whatever key
+# the app passed, so one captured cookie let an attacker test guesses offline.
+#
+# Version 1, every piece of which is authenticated:
+#
+#     token     = base64url( 0x01 ‖ iv[12] ‖ ciphertext ‖ tag[16] )
+#     aad       = 0x01 ‖ purpose                 -- the cookie NAME, so a token opens for one name only
+#     plaintext = iat::Int64 ‖ exp::Int64 ‖ value   (big-endian unix seconds; exp == 0 is "none")
+#     key       = HKDF-SHA256(secret, info = COOKIE_KEY_INFO)[1:32]
+#
+# The version byte leads the token and is also in the AAD, so it cannot be swapped without
+# failing the tag. HKDF rather than a password hash on purpose: HKDF is the right derivation for
+# a HIGH-entropy key, which is why `_cookie_secret` requires 32 bytes; it gives nothing against a
+# guessable one, and neither would a salt, since there is one key per app. Rails and Plug derive
+# with PBKDF2 over a 64-byte `secret_key_base`; the label separation is the part copied here.
+
+const TOKEN_VERSION = 0x01
+const COOKIE_KEY_INFO = Vector{UInt8}(codeunits("nitro/cookie/aes-256-gcm/v1"))
+const MIN_COOKIE_SECRET_BYTES = 32
+# version + iv + tag + the iat/exp header inside the ciphertext
+const MIN_TOKEN_BYTES = 1 + 12 + 16 + 16
+
+"""
+    _hkdf_sha256(ikm, salt, info, len) -> Vector{UInt8}
+
+HKDF (RFC 5869) with HMAC-SHA256: extract a pseudorandom key from `ikm` under `salt`, then
+expand it to `len` bytes bound to `info`. An empty `salt` is the RFC's all-zero salt (HMAC pads
+the key to its block size either way).
+"""
+function _hkdf_sha256(ikm::AbstractVector{UInt8}, salt::AbstractVector{UInt8},
+                      info::AbstractVector{UInt8}, len::Integer)
+    0 < len <= 255 * 32 || throw(ArgumentError("HKDF-SHA256 output length must be 1:$(255 * 32), got $len"))
+    prk = SHA.hmac_sha256(Vector{UInt8}(salt), Vector{UInt8}(ikm))
+    okm = UInt8[]
+    block = UInt8[]
+    counter = 0x01
+    while length(okm) < len
+        block = SHA.hmac_sha256(prk, vcat(block, info, counter))
+        append!(okm, block)
+        counter += 0x01
+    end
+    return okm[1:len]
+end
+
+_cookie_key(secret::SecretString) =
+    _hkdf_sha256(codeunits(reveal(secret)), UInt8[], COOKIE_KEY_INFO, 32)
+
+_token_aad(purpose::AbstractString) = vcat(TOKEN_VERSION, Vector{UInt8}(codeunits(purpose)))
+
+_unix_seconds(t::DateTime) = floor(Int64, Dates.datetime2unix(t))
+
+function _int64_be(x::Int64)
+    bytes = Vector{UInt8}(undef, 8)
+    for i in 8:-1:1
+        bytes[i] = UInt8(x & 0xff)
+        x >>= 8
+    end
+    return bytes
+end
+
+function _read_int64_be(bytes::AbstractVector{UInt8}, offset::Int)
+    x = Int64(0)
+    for i in 0:7
+        x = (x << 8) | Int64(bytes[offset + i])
+    end
+    return x
+end
+
+# GCM associated data goes through `EVP_CipherUpdate` with a NULL output buffer, after the key
+# and iv are set and before any plaintext. `OpenSSL.cipher_update` always passes an output
+# buffer, so it cannot express this; the argument types mirror its own `ccall`.
+function _gcm_aad!(ctx::OpenSSL.EvpCipherContext, aad::Vector{UInt8})
+    outlen = Ref{Int32}(0)
+    ret = GC.@preserve aad outlen ccall((:EVP_CipherUpdate, OpenSSL.libcrypto), Cint,
+        (OpenSSL.EvpCipherContext, Ptr{UInt8}, Ptr{Int32}, Ptr{UInt8}, Cint),
+        ctx, C_NULL, outlen, aad, length(aad))
+    ret == 1 || throw(CookieError("Cipher failed: could not bind the token's purpose"))
+    return nothing
+end
+
+_gcm_cipher() = OpenSSL.EvpCipher(ccall((:EVP_get_cipherbyname, OpenSSL.libcrypto), Ptr{Cvoid},
+                                        (Cstring,), "AES-256-GCM"))
+
+"""
+    encrypt_payload(secret, payload; purpose, expires = nothing, now = Dates.now(UTC)) -> String
+
+Seal `payload` into an authenticated, URL-safe token that opens only under `secret` **and** only
+for `purpose` — the cookie name, when `set_cookie!` calls it. `expires` (a UTC `DateTime`) is
+sealed inside the token and enforced by [`decrypt_payload`](@ref); `nothing` means the token
+does not expire on the server side. `now` is the issued-at time sealed alongside it.
+
+`secret` is an `AbstractString` or a `SecretString` of at least 32 bytes; anything else is an
+`ArgumentError`. The key is derived from it with HKDF-SHA256 under a Nitro-specific label.
+"""
+function encrypt_payload(secret, payload::AbstractString; purpose::AbstractString,
+                         expires::Union{Nothing, DateTime} = nothing,
+                         now::DateTime = Dates.now(Dates.UTC))
+    key = _cookie_key(_cookie_secret(secret))
+
+    # Cryptographically secure IV; `secure_random_bytes` checks RAND_bytes and
+    # throws on failure, so we never encrypt under a low-entropy / zero IV (which
+    # would be catastrophic for GCM nonce uniqueness).
+    iv = secure_random_bytes(12)
+
+    # `exp == 0` is the "no expiry" sentinel, so an expiry at or before the epoch -- a logout
+    # cookie's `Expires` -- is stored as 1: already past, never "none".
+    exp = isnothing(expires) ? Int64(0) : max(Int64(1), _unix_seconds(expires))
+    plaintext = vcat(_int64_be(_unix_seconds(now)), _int64_be(exp),
+                     Vector{UInt8}(codeunits(String(payload))))
+
+    ctx = OpenSSL.EvpCipherContext()
+    OpenSSL.encrypt_init(ctx, _gcm_cipher(), key, iv)
+    _gcm_aad!(ctx, _token_aad(purpose))
+    ciphertext = OpenSSL.cipher_update(ctx, plaintext)
+    final_part = OpenSSL.cipher_final(ctx)
+
+    tag = Vector{UInt8}(undef, 16)
+    # EVP_CTRL_GCM_GET_TAG (0x10) returns 1 on success. A silent failure here
+    # would emit an all-undefined tag and produce undecryptable ciphertext.
+    ret = ccall((:EVP_CIPHER_CTX_ctrl, OpenSSL.libcrypto), Cint,
+          (OpenSSL.EvpCipherContext, Cint, Cint, Ptr{UInt8}),
+          ctx, 0x10, 16, tag)
+    ret == 1 || throw(CookieError("Encryption failed: could not read authentication tag"))
+
+    return base64url_encode(vcat(TOKEN_VERSION, iv, ciphertext, final_part, tag))
+end
+
+"""
+    decrypt_payload(secret, token; purpose, now = Dates.now(UTC)) -> String
+
+Open a token made by [`encrypt_payload`](@ref) under the same `secret` and `purpose`, and return
+the payload. Throws a `CookieError` when the token is malformed, from another format version,
+fails authentication — tampered, sealed under another key, or sealed for another `purpose`, which
+is what stops a ciphertext moving from one cookie to another — or has expired as of `now` (a UTC
+`DateTime`; pass one to check against another instant). The messages are deliberately generic.
+
+A `secret` shorter than 32 bytes, or not a string, is an `ArgumentError`: that is
+configuration, not a bad token.
+"""
+function decrypt_payload(secret, token::AbstractString; purpose::AbstractString,
+                         now::DateTime = Dates.now(Dates.UTC))
+    key = _cookie_key(_cookie_secret(secret))
+    # Both rescues below turn a failure into a `CookieError`, which `get_cookie` now reads as an
+    # absent cookie (#309) -- so a corrupted process must not pass through them: an interrupt or
+    # an OOM is not a missing cookie (#254, `is_unrecoverable`).
+    data = try
+        base64url_decode(String(token))
+    catch e
+        is_unrecoverable(e) && rethrow()
+        throw(CookieError("Invalid Base64 payload"))
+    end
+
+    length(data) < MIN_TOKEN_BYTES && throw(CookieError("Payload too short"))
+    data[1] == TOKEN_VERSION || throw(CookieError("Unsupported token version"))
+
+    iv = data[2:13]
+    tag = data[end-15:end]
+    ciphertext = data[14:end-16]
+
+    plaintext = try
+        ctx = OpenSSL.EvpCipherContext()
+        OpenSSL.decrypt_init(ctx, _gcm_cipher(), key, iv)
+        _gcm_aad!(ctx, _token_aad(purpose))
+        opened = OpenSSL.cipher_update(ctx, ciphertext)
+
+        # EVP_CTRL_GCM_SET_TAG (0x11) returns 1 on success; a failure means the
+        # tag was rejected outright, so abort rather than continue to final.
+        set_tag = ccall((:EVP_CIPHER_CTX_ctrl, OpenSSL.libcrypto), Cint,
+              (OpenSSL.EvpCipherContext, Cint, Cint, Ptr{UInt8}),
+              ctx, 0x11, 16, tag)
+        set_tag == 1 || throw(CookieError("Decryption failed: integrity check failed"))
+
+        final_res = Vector{UInt8}(undef, 16)
+        outlen = Ref{Cint}(0)
+        # EVP_DecryptFinal_ex returns 1 on success -- the tag check, which covers the purpose.
+        ret = ccall((:EVP_DecryptFinal_ex, OpenSSL.libcrypto), Cint,
+                    (OpenSSL.EvpCipherContext, Ptr{UInt8}, Ptr{Cint}),
+                    ctx, final_res, outlen)
+        ret == 1 || throw(CookieError("Decryption failed: integrity check failed"))
+        vcat(opened, final_res[1:outlen[]])
+    catch e
+        (e isa CookieError || is_unrecoverable(e)) && rethrow()
+        # Don't surface the underlying exception detail to callers (it can reach
+        # clients); keep the failure reason generic.
+        throw(CookieError("Decryption failed"))
+    end
+
+    # Authenticated from here on, so these reads cannot be steered by the client.
+    exp = _read_int64_be(plaintext, 9)
+    exp != 0 && _unix_seconds(now) >= exp && throw(CookieError("Token expired"))
+    return String(plaintext[17:end])
+end
 
 end

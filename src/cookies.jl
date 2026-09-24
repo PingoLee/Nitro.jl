@@ -4,9 +4,10 @@ using HTTP
 using Dates
 using UUIDs
 using ..Types
+using ..Types: _normalize_domain
 using ..Errors
 
-using ..Crypto: encrypt_payload, decrypt_payload, secure_uuid4
+using ..Crypto: encrypt_payload, decrypt_payload, secure_uuid4, SecretString, _cookie_secret
 
 export parse_cookies, format_cookie, get_cookie, set_cookie!, load_cookie_settings!,
     storesession!, prunesessions!, regenerate_session!
@@ -77,26 +78,6 @@ function _normalize_expires(val::Any) :: Union{Dates.DateTime, Nothing}
     end
   
     throw(ArgumentError("expires: cannot parse '$val' as DateTime"))
-end
-
-"""
-Helper to normalize domain strings
-"""
-function _normalize_domain(val::Any) :: String
-    if !isa(val, AbstractString)
-        throw(ArgumentError("domain: expected String, got $(typeof(val))"))
-    end
-
-    d = strip(String(val))
-    if isempty(d)
-        throw(ArgumentError("domain: cannot be empty"))
-    end
-
-    if !occursin(r"^[A-Za-z0-9\.-]+$", d) || occursin(':', d)
-        throw(ArgumentError("domain: contains invalid characters: \"$val\""))
-    end
-
-    return lowercase(d)
 end
 
 function _normalize_bool(val::Any, name::String) :: Bool
@@ -203,16 +184,22 @@ end
 """
 Internal helper to extract a single cookie value from a header string lazily.
 Works with SubString views to minimize allocations.
+
+Cookie names match **exactly** and the **first** occurrence wins (#329). Names are
+case-sensitive (RFC 6265 §4.1.1), and matching them case-insensitively let
+`__HOST-csrf_token=attacker` -- a name no prefix-checking browser protects -- shadow the real
+`__Host-csrf_token` sent after it (the "Cookie Crumbles" prefix bypass). First-wins follows
+RFC 6265 §5.4, which sends the most specific path first, and matches Go's `Request.Cookie` and
+npm `cookie`; `parse_cookies` agrees.
 """
 function _extract_value_from_header(header_value::AbstractString, target_key::String) :: Union{SubString{String}, Nothing}
-    target_lower = lowercase(target_key)
     for pair in eachsplit(header_value, ';')
         trimmed = strip(pair)
         idx = findfirst('=', trimmed)
-        
+
         name_view = isnothing(idx) ? trimmed : strip(@view trimmed[begin:prevind(trimmed, idx)])
-        
-        if lowercase(name_view) == target_lower
+
+        if name_view == target_key
             if isnothing(idx)
                 return SubString("")
             end
@@ -230,52 +217,51 @@ end
 """
 Optimized cookie parser that uses SubStrings to minimize allocations.
 Strips surrounding quotes from values according to RFC 6265.
+
+Reads the request `Cookie` header(s) only -- every one of them, since HTTP/2 may split the
+cookie list across several. A name sent twice keeps its **first** value, as `get_cookie` does
+(#329): this used to keep the last, so the two helpers disagreed on the same request.
 """
 function parse_cookies(headers::Union{Dict, Vector{Pair{String, String}}, HTTP.Headers})
     cookies = Dict{SubString{String}, SubString{String}}()
-    
-    # Extract cookie header - account for both Request (Cookie) and Response (Set-Cookie)
-    cookie_header = ""
+
     if headers isa Dict
         cookie_header = Base.get(headers, "cookie", Base.get(headers, "Cookie", ""))
+        _parse_cookie_header!(cookies, cookie_header)
     else
         for (k, v) in headers
-            if lowercase(k) == "cookie"
-                cookie_header = v
-                break
-            end
+            lowercase(k) == "cookie" && _parse_cookie_header!(cookies, v)
         end
     end
 
-    if isempty(cookie_header)
-        return cookies
-    end
+    return cookies
+end
 
-    for pair in eachsplit(cookie_header, ';')
+function _parse_cookie_header!(cookies::Dict{SubString{String}, SubString{String}}, cookie_header::AbstractString)
+    for pair in eachsplit(String(cookie_header), ';')
         trimmed = strip(pair)
         if isempty(trimmed)
             continue
         end
-        
+
         # find the first '=' to split name and value
         idx = findfirst('=', trimmed)
         if isnothing(idx)
             # RFC 6265: Cookie without '=' is treated as name with empty value
-            cookies[trimmed] = ""
+            haskey(cookies, trimmed) || (cookies[trimmed] = "")
             continue
         end
-        
+
         name = strip(@view trimmed[begin:prevind(trimmed, idx)])
         value = strip(@view trimmed[nextind(trimmed, idx):end])
-        
+
         # Strip surrounding quotes if balanced (RFC 6265)
         if length(value) >= 2 && value[begin] == '"' && value[end] == '"'
             value = @view value[nextind(value, begin):prevind(value, end)]
         end
-        
-        cookies[name] = value
+
+        haskey(cookies, name) || (cookies[name] = value)
     end
-    
     return cookies
 end
 
@@ -330,11 +316,9 @@ function format_cookie(
     parts = ["$name=$value", "Path=$path"]
     
     if !isnothing(domain)
-        # Basic domain validation (no spaces, no ports)
-        if occursin(' ', domain) || occursin(':', domain)
-            throw(ArgumentError("Invalid domain: $domain"))
-        end
-        push!(parts, "Domain=$(lowercase(strip(domain)))")
+        # The strict validator every other path uses (#329). This one used to reject only a
+        # space and `:`, so `domain = "evil.com; Secure"` injected attributes into the header.
+        push!(parts, "Domain=$(_normalize_domain(domain))")
     end
     
     # Handle Max-Age=0 and convert to past Expires for better reliability
@@ -374,6 +358,42 @@ function format_cookie(
     return join(parts, "; ")
 end
 
+const HOST_COOKIE_PREFIX = "__Host-"
+const SECURE_COOKIE_PREFIX = "__Secure-"
+
+"""
+Reject a cookie-name prefix the surrounding config would make undeliverable.
+
+Browsers match `__Host-`/`__Secure-` case-insensitively and *silently discard* a cookie that
+violates the prefix rules, so a misconfigured pipeline looks healthy and then never sets its
+cookie. Failing at construction turns that into an error the developer sees once. Shared by
+`CSRFMiddleware` and `SessionMiddleware` (#329); `label` and `plain_name` only shape the message.
+"""
+function _validate_cookie_prefix(cookie_name::AbstractString, config::CookieConfig;
+                                 label::AbstractString = "Cookie",
+                                 plain_name::Union{AbstractString, Nothing} = nothing)
+    lowered = lowercase(String(cookie_name))
+    is_host = startswith(lowered, lowercase(HOST_COOKIE_PREFIX))
+    (is_host || startswith(lowered, lowercase(SECURE_COOKIE_PREFIX))) || return nothing
+    prefix = is_host ? HOST_COOKIE_PREFIX : SECURE_COOKIE_PREFIX
+    unprefixed = isnothing(plain_name) ? "a cookie_name without the prefix" :
+                 "a cookie_name without the prefix (e.g. `cookie_name=\"$plain_name\"`)"
+
+    config.secure || throw(ArgumentError(
+        "$label \"$cookie_name\" carries the $prefix prefix, which browsers accept only on a " *
+        "Secure cookie. Pass `secure=true`, or use $unprefixed when serving over plain HTTP."))
+
+    if is_host
+        config.domain === nothing || throw(ArgumentError(
+            "$label \"$cookie_name\" carries the $prefix prefix, which browsers accept only " *
+            "when no Domain attribute is set (got domain=\"$(config.domain)\")."))
+        config.path == "/" || throw(ArgumentError(
+            "$label \"$cookie_name\" carries the $prefix prefix, which browsers accept only " *
+            "with Path=/ (got path=\"$(config.path)\")."))
+    end
+    return nothing
+end
+
 function format_cookie(name::String, value::String, config::CookieConfig)
     return format_cookie(
         name,
@@ -394,77 +414,67 @@ end
 
 """
 Internal lazy lookup for a cookie value across all headers.
-Handles both Request (Cookie) and Response (Set-Cookie).
+
+`set_cookie = false` -- a Request, or a bare header collection -- reads the `Cookie` header(s)
+only; `set_cookie = true` -- a Response -- reads `Set-Cookie` only (#329). A `Set-Cookie` on a
+REQUEST is not a cookie the client holds, but it used to be read as one, so any client could
+supply a "cookie" by sending the wrong header. Names match exactly, as in
+`_extract_value_from_header`.
 """
-function _get_cookie_lazy(headers::Any, target_name::String) :: Union{SubString{String}, Nothing}
-    tn_lower = lowercase(target_name)
-    
+function _get_cookie_lazy(headers::Any, target_name::String; set_cookie::Bool = false) :: Union{SubString{String}, Nothing}
+    # A Dict is never a Response's headers, so it is only ever read as a request's.
     if headers isa Dict
-        # Check Cookie header (Request)
         cookie_val = Base.get(headers, "cookie", Base.get(headers, "Cookie", nothing))
-        if !isnothing(cookie_val)
-            res = _extract_value_from_header(cookie_val, target_name)
-            !isnothing(res) && return res
+        return isnothing(cookie_val) ? nothing : _extract_value_from_header(cookie_val, target_name)
+    end
+
+    # Iterate through headers (Vector{Pair} or HTTP.Headers)
+    for (k, v) in headers
+        kl = lowercase(k)
+        res = if !set_cookie && kl == "cookie"
+            _extract_value_from_header(v, target_name)
+        elseif set_cookie && kl == "set-cookie"
+            _set_cookie_value(v, target_name)
+        else
+            nothing
         end
-        
-        # Check Set-Cookie (Response) - unlikely in a Dict but possible
-        set_cookie_val = Base.get(headers, "set-cookie", Base.get(headers, "Set-Cookie", nothing))
-        if !isnothing(set_cookie_val)
-            # If it's a single string, parse it
-            if set_cookie_val isa AbstractString
-                semi_idx = findfirst(';', set_cookie_val)
-                pair_view = isnothing(semi_idx) ? SubString(set_cookie_val) : @view set_cookie_val[begin:prevind(set_cookie_val, semi_idx)]
-                eq_idx = findfirst('=', pair_view)
-                if !isnothing(eq_idx)
-                    name = strip(@view pair_view[begin:prevind(pair_view, eq_idx)])
-                    if lowercase(name) == tn_lower
-                        val_view = strip(@view(pair_view[nextind(pair_view, eq_idx):end]))
-                        if length(val_view) >= 2 && val_view[begin] == '"' && val_view[end] == '"'
-                            return @view val_view[nextind(val_view, begin):prevind(val_view, end)]
-                        end
-                        return val_view
-                    end
-                end
-            end
-        end
-    else
-        # Iterate through headers (Vector{Pair} or HTTP.Headers)
-        for (k, v) in headers
-            kl = lowercase(k)
-            if kl == "cookie"
-                res = _extract_value_from_header(v, target_name)
-                !isnothing(res) && return res
-            elseif kl == "set-cookie"
-                semi_idx = findfirst(';', v)
-                pair_view = isnothing(semi_idx) ? SubString(v) : @view v[begin:prevind(v, semi_idx)]
-                eq_idx = findfirst('=', pair_view)
-                if !isnothing(eq_idx)
-                    name = strip(@view pair_view[begin:prevind(pair_view, eq_idx)])
-                    if lowercase(name) == tn_lower
-                        val_view = strip(@view(pair_view[nextind(pair_view, eq_idx):end]))
-                        if length(val_view) >= 2 && val_view[begin] == '"' && val_view[end] == '"'
-                            return @view val_view[nextind(val_view, begin):prevind(val_view, end)]
-                        end
-                        return val_view
-                    end
-                end
-            end
-        end
+        !isnothing(res) && return res
     end
     return nothing
+end
+
+# The value of one `Set-Cookie` line if it sets `target_name`, else `nothing`.
+function _set_cookie_value(line::AbstractString, target_name::String) :: Union{SubString{String}, Nothing}
+    semi_idx = findfirst(';', line)
+    pair_view = isnothing(semi_idx) ? SubString(line) : @view line[begin:prevind(line, semi_idx)]
+    eq_idx = findfirst('=', pair_view)
+    isnothing(eq_idx) && return nothing
+    name = strip(@view pair_view[begin:prevind(pair_view, eq_idx)])
+    name == target_name || return nothing
+    val_view = strip(@view(pair_view[nextind(pair_view, eq_idx):end]))
+    if length(val_view) >= 2 && val_view[begin] == '"' && val_view[end] == '"'
+        return @view val_view[nextind(val_view, begin):prevind(val_view, end)]
+    end
+    return val_view
 end
 
 """
 Get a cookie value by name from a Request or Response.
 Supports default values, type parsing, and decryption.
+
+With `encrypted = true` the value must be a token `set_cookie!` sealed under this key **for this
+cookie name**. One that does not open — tampered, sealed under another key, copied from another
+cookie, expired, or written before the current token format — reads as **absent**: the default
+is returned and the rejection is logged at `@debug`, never with the value (#309). Encrypting
+with no key at all is still a `CookieError`, since that is configuration rather than a bad cookie.
 """
 function get_cookie(
     source::Any, 
     name::Union{String, Symbol},
     default::Any = nothing; 
-    encrypted::Bool = false, 
+    encrypted::Bool = false,
     config::CookieConfig = CookieConfig(),
-    secret_key::Union{String, Nothing} = nothing,
+    secret_key::Union{AbstractString, SecretString, Nothing} = nothing,
     max_cookie_size::Union{Int, Nothing} = nothing,
     kwargs...
 )
@@ -475,35 +485,49 @@ function get_cookie(
         return final_default
     end
 
+    # Validated BEFORE the lookup: a bad per-call key is configuration, and must fail on every
+    # call rather than only on the ones that happen to carry the cookie.
+    final_secret = isnothing(secret_key) ? config.secret_key : _cookie_secret(secret_key)
+
     target_name = string(name)
     headers = if source isa HTTP.Request || source isa HTTP.Response
         source.headers
     else
         source
     end
-    
-    found_value = _get_cookie_lazy(headers, target_name)
-    
+
+    found_value = _get_cookie_lazy(headers, target_name; set_cookie = source isa HTTP.Response)
+
     if isnothing(found_value)
         return final_default
     end
-    
+
     raw_value = String(found_value)
 
-    final_secret = isnothing(secret_key) ? config.secret_key : secret_key
     final_max_cookie_size = isnothing(max_cookie_size) ? config.max_cookie_size : max_cookie_size
 
     # Check size limit
     if !isnothing(final_max_cookie_size) && length(raw_value) > final_max_cookie_size
         return final_default
     end
-    
+
     # Decrypt if requested
     final_value = if encrypted
-        if isnothing(final_secret) || final_secret == ""
+        if isnothing(final_secret)
             throw(CookieError("Encrypted cookie access requires a non-empty secret_key"))
         end
-        decrypt_payload(final_secret, raw_value)
+        # A token that does not open is a cookie the client should not have -- the same as no
+        # cookie, which is what Rails and Plug answer too. It used to throw, so every client
+        # carrying a stale or junk cookie turned each request into a 500, and a format change
+        # would have done that to every client at once. `purpose` is the NAME: a token sealed
+        # for `language` does not open as `session_user`.
+        try
+            decrypt_payload(final_secret, raw_value; purpose = target_name)
+        catch e
+            e isa CookieError || rethrow()
+            @debug "Nitro: an encrypted cookie did not open; reading it as absent" cookie = target_name reason = e.msg
+            return final_default
+        end
     else
         raw_value
     end
@@ -552,8 +576,16 @@ function set_cookie!(
     secure::Nullable{Bool} = nothing, 
     samesite::Nullable{String} = nothing,
     encrypted::Nullable{Bool} = nothing,
-    secret_key::Nullable{String} = nothing
+    secret_key::Union{AbstractString, SecretString, Nothing} = nothing
 )
+    # `string(value)` below would write a masked secret's DISPLAY form -- `SecretString("****")`
+    # -- as the cookie value, the same failure #307 fixed for the key. Refuse rather than guess:
+    # a secret in a cookie is a decision the caller should spell with `reveal`.
+    value isa Union{SecretString, Base.SecretBuffer} && throw(ArgumentError(
+        "set_cookie!: the value for cookie $(repr(string(name))) is a $(typeof(value)), which " *
+        "would be written as its masked display form. Pass `reveal(value)` if the secret " *
+        "really belongs in a cookie."))
+
     # 1. Resolve values (Explicit param > Dict > Config Default)
     merged_attrs = Dict{Symbol, Any}()
     
@@ -618,15 +650,28 @@ function set_cookie!(
     end
     
     # 3. Handle Encryption
-    final_secret = isnothing(secret_key) ? config.secret_key : secret_key
+    final_secret = isnothing(secret_key) ? config.secret_key : _cookie_secret(secret_key)
     is_encrypted = isnothing(encrypted) ? !isnothing(final_secret) : encrypted
     str_value = string(value)
-    
+
     final_value = if is_encrypted
-        if isnothing(final_secret) || final_secret == ""
+        if isnothing(final_secret)
             throw(CookieError("Encrypted cookie writes require a non-empty secret_key"))
         end
-        encrypt_payload(final_secret, str_value)
+        # The token carries the lifetime the browser is told, so the server enforces it too
+        # (#309): `Max-Age` alone is a hint, and a captured cookie used to decrypt forever.
+        # Max-Age wins over Expires, as it does in the browser. A cookie with neither has no
+        # server-side expiry -- set `maxage` (per cookie, or in `configcookies`) to bound it.
+        issued = Dates.now(Dates.UTC)
+        sealed_until = if !isnothing(final_maxage)
+            issued + Dates.Second(final_maxage)
+        elseif final_expires isa DateTime
+            final_expires
+        else
+            nothing
+        end
+        encrypt_payload(final_secret, str_value; purpose = string(name), expires = sealed_until,
+                        now = issued)
     else
         str_value
     end
@@ -694,7 +739,8 @@ function load_cookie_settings!(defaults::Nullable{Dict} = nothing)
             elseif attr_key == :expires
                 optimized_defaults[attr_key] = _normalize_expires(v)
             elseif attr_key == :secret_key
-                optimized_defaults[attr_key] = isnothing(v) ? nothing : string(v)
+                # Never `string(v)`: on a `SecretString` that is its masked `show` (#307).
+                optimized_defaults[attr_key] = _cookie_secret(v)
             elseif attr_key == :max_cookie_size
                 optimized_defaults[attr_key] = v isa String ? parse(Int, v) : Int(v)
             else

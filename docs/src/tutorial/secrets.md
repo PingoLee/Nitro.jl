@@ -134,7 +134,7 @@ The short answer is **No, session cookies do not need to be encrypted in Nitro.*
 ### Why?
 Nitro uses **Server-Side Sessions** by default (backed by `MemoryStore`). When you use `SessionMiddleware`, the data you put into `getsession(req)` never leaves your server. 
 
-Instead, Nitro generates a random, cryptographically secure `UUIDv4` identifier (e.g., `550e8400-e29b-41d4-a716-446655440000`) and sends **only** that UUID to the browser in the `nitro_session` cookie.
+Instead, Nitro generates a random, cryptographically secure `UUIDv4` identifier (e.g., `550e8400-e29b-41d4-a716-446655440000`) and sends **only** that UUID to the browser in the session cookie (`__Host-nitro_session` by default, whose prefix stops another site or subdomain planting its own).
 
 Because the UUID is completely random and has 122 bits of entropy, it is impossible for an attacker to guess or mathematically reverse it. There is no user data inside the cookie to encrypt.
 
@@ -164,5 +164,5 @@ SessionMiddleware(
 While standard sessions don't need a secret, other parts of Nitro do rely heavily on `SECRET_KEY`:
 
 1. **CSRF Protection**: `CSRFMiddleware(secret)` uses your secret to HMAC-SHA256 the CSRF token *together with the current session id*, so a token is valid only for the visitor it was minted for — a signature alone would prove the server issued the token, not that it issued it to this client. See [Sessions & Auth](sessions_and_auth.md#Auth-Cookies-and-CSRF).
-2. **Encrypted Cookies**: If you manually call `set_cookie!(..., encrypted=true)`, the `Cookies` module uses AES-256-GCM to fully encrypt the payload using the `secret_key` you provide to the framework.
+2. **Encrypted Cookies**: With a `secret_key` configured (at least 32 random bytes, via `configcookies`), `set_cookie!` seals the value with AES-256-GCM under a key derived from it with HKDF-SHA256. The seal binds the value to the cookie's name and to its `Max-Age`/`Expires`, so it cannot be moved to another cookie and stops opening once it expires — see [Cookie Security](cookies/security.md#What-an-encrypted-cookie-guarantees).
 3. **JWT and Auth**: If you use the `Nitro.Auth` module helpers like `encode_jwt(payload, keyset)` or `jwt_validator`, you use your secrets to sign the tokens. A `JWTKeyset` accepts `SecretString` values directly and refuses an empty one — see [Authentication](authentication.md#Key-rotation-and-the-kid-trust-model).

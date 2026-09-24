@@ -11,6 +11,7 @@ using Base: @kwdef
 using DataStructures: CircularDeque
 using ..Util
 using ..Errors: ValidationError, StoreInterfaceError, implements_contract_method, store_contract_error
+using ..Crypto: SecretString, _cookie_secret
 
 export Server, Nullable, Context,
     LifecycleMiddleware, startup, shutdown, require_fixed_period,
@@ -228,9 +229,46 @@ function missing_session_methods(S::Type{<:AbstractSessionStore})
     return names
 end
 
-# Generic cookie configuration
+"""
+Normalize a cookie `Domain`: trimmed, lowercased, and only `[A-Za-z0-9.-]`. The ONE domain
+validator (#329): `CookieConfig`, `format_cookie`, `set_cookie!(domain = …)` and
+`load_cookie_settings!` all use it. It lives here rather than in `Cookies` because
+`CookieConfig`'s constructor needs it and `types.jl` loads first. Two of those paths used to
+reject only a space and `:`, so a `;` injected attributes into the `Set-Cookie` header.
+"""
+function _normalize_domain(val::Any) :: String
+    if !isa(val, AbstractString)
+        throw(ArgumentError("domain: expected String, got $(typeof(val))"))
+    end
+
+    d = strip(String(val))
+    if isempty(d)
+        throw(ArgumentError("domain: cannot be empty"))
+    end
+
+    if !occursin(r"^[A-Za-z0-9\.-]+$", d) || occursin(':', d)
+        throw(ArgumentError("domain: contains invalid characters: \"$val\""))
+    end
+
+    return lowercase(d)
+end
+
+"""
+    CookieConfig(; secret_key, httponly, secure, samesite, path, domain, maxage, expires, max_cookie_size)
+
+Cookie defaults: what `configcookies` stores on an `App`, and what `set_cookie!`/`get_cookie`
+take as `config`.
+
+`secret_key` is held as a [`SecretString`](@ref) whatever it was passed as (#307): an
+`AbstractString` is wrapped, a `SecretString` is kept, and anything else -- bytes, a
+`Base.SecretBuffer` -- is an `ArgumentError`. So neither a `CookieConfig` nor anything that
+captures one (a middleware closure, a `LifecycleMiddleware`) prints the key.
+
+`domain` is validated and normalized (trimmed, lowercased, `[A-Za-z0-9.-]` only) when the config
+is built, so an invalid one fails at startup rather than on the first response.
+"""
 @kwdef struct CookieConfig
-    secret_key::Nullable{String} = nothing
+    secret_key::Nullable{SecretString} = nothing
     httponly::Bool = true
     secure::Bool = true
     samesite::String = "Lax"
@@ -239,6 +277,15 @@ end
     maxage::Nullable{Int} = nothing
     expires::Nullable{DateTime} = nothing
     max_cookie_size::Nullable{Int} = nothing
+
+    # Every construction path -- the keyword form above, `configcookies`, `serve(secret_key = …)`
+    # -- lands here, so this is where a key becomes a `SecretString`. See `_cookie_secret`.
+    function CookieConfig(secret_key, httponly, secure, samesite, path, domain, maxage, expires,
+                          max_cookie_size)
+        return new(_cookie_secret(secret_key), httponly, secure, samesite, path,
+                   domain === nothing ? nothing : _normalize_domain(domain), maxage,
+                   expires, max_cookie_size)
+    end
 end
 
 """
@@ -272,7 +319,9 @@ The default also carries an extractor-local validator, as it does for every othe
 `value` is `nothing` when the request carries no such cookie; a present cookie that does not
 parse as `T` is a `ValidationError` (400). When the app has a cookie `secret_key` configured
 (see `configcookies`), the value is decrypted before parsing, so a cookie written by
-`set_cookie!` round-trips. The raw value is not percent-decoded.
+`set_cookie!` round-trips; one that does not open — tampered, expired, sealed under another key
+or for another cookie name — is `nothing` as well, never a 500. The raw value is not
+percent-decoded.
 """
 struct Cookie{T} <: Extractor{T}
     name::String
@@ -731,6 +780,16 @@ once (#185).
     # A hook that's called when the server is shutdown (optional)
     on_shutdown :: Union{Function,Nothing} = nothing
 end
+
+# SECURITY (#307): the default `show` prints each closure WITH its captures -- `repr` of a closure
+# is `var"#3#4"{String}("the-key")` -- and every `LifecycleMiddleware` Nitro builds closes over a
+# config, a store or a secret. `@info … middleware = mw` would publish them. Print the shape only.
+# (`dump` still walks raw fields; that is explicit introspection, not accidental disclosure.)
+function Base.show(io::IO, lm::LifecycleMiddleware)
+    print(io, "LifecycleMiddleware(on_startup = ", lm.on_startup === nothing ? "nothing" : "<hook>",
+          ", on_shutdown = ", lm.on_shutdown === nothing ? "nothing" : "<hook>", ")")
+end
+Base.show(io::IO, ::MIME"text/plain", lm::LifecycleMiddleware) = show(io, lm)
 
 # Report an interrupt caught by `startup`/`shutdown`, and hand it back to the broadcast site.
 #

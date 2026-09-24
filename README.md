@@ -301,9 +301,8 @@ store = MemoryStore()          # in-process sessions; `store` is required
 serve(middleware=[
     SessionMiddleware(
         store=store,
-        cookie_name="nitro_session",
         max_age=3600,
-        secure=false,
+        secure=false,          # local HTTP only; with secure=true the cookie is __Host-nitro_session
         httponly=true,
         samesite="Lax",
     ),
