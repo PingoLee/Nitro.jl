@@ -25,12 +25,14 @@ both by default since #39. The structured log now does the same.
 
 `record.query` is now `nothing` unless you pass the new `AccessLog(sink; log_query = true)`. This
 mirrors `serve(...; access_log_query = true)`. With it, `query` is the raw query up to any `#`,
-and `path` is still reduced, so credentials never reach the sink in either mode. A target with
-no usable path (authority-form `CONNECT h:443`) records `"-"`, as the console log does.
+and `path` is still reduced, so credentials in a well-formed authority never reach the sink in
+either mode. A target with no usable path (authority-form `CONNECT h:443`) records `"-"`, and
+`OPTIONS *` records `"*"`, as the console log does.
 
-The console line changed too, with nothing to migrate. Its request target is now escaped, so C1
-controls, invalid UTF-8, Unicode line/bidi characters and `"` appear as `\u…`/`\x…` escapes and
-cannot forge a log line. A log parser that matched those bytes raw will see the escaped form.
+The console line changed too, with nothing to migrate. Its request target is now escaped: C1
+controls, invalid UTF-8 and Unicode line/bidi characters appear as `\u…`/`\x…` escapes, and `"`
+and `\` are backslash-escaped (`\"`, `\\`), so a request cannot forge a log line. A log parser
+that matched any of those characters raw, a backslash included, will see the escaped form.
 
 ### How to find the calls to migrate
 
@@ -42,7 +44,8 @@ grep -rnE '\.query\b' --include=*.jl .
 ```
 
 A sink that stores `r.query` keeps working, but from now on writes `NULL`/`missing` there. A
-sink or report that parsed the scheme or host out of `r.path` now always receives a path.
+sink or report that parsed the scheme or host out of `r.path` now receives only a path, or the
+placeholders `"-"` and `"*"`.
 
 ### Migrate your app
 

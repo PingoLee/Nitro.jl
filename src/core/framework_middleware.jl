@@ -27,8 +27,9 @@ authority are logged too. The default path is reduced by `_log_target_path`, whi
 both. Only opt in for a service whose clients you control.
 
 Either way the target is escaped before it reaches the line (#320): control characters,
-invalid UTF-8, Unicode line/bidi characters and `"` appear as `\\u…`/`\\x…` escapes, so a
-request cannot forge a log line or drive the terminal that displays it.
+invalid UTF-8 and Unicode line/bidi characters appear as `\\u…`/`\\x…` escapes, and `"` and
+`\\` are backslash-escaped, so a request cannot forge a log line or drive the terminal that
+displays it.
 """
 function AccessLogMiddleware(; log_query::Bool=false)
     return function(handle)

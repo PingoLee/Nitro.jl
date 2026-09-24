@@ -284,8 +284,8 @@ prunes. A throwing `prune` is logged and costs that one tick; the next tick runs
 
 By default a record carries the request **path only**, reduced the same way the console
 access log (`serve(access_log=true)`) reduces it: `record.query` is `nothing`, and an
-absolute-form target (`GET http://user:pa55w0rd@host/x`) is cut to `/x`, so the authority and
-any credentials in it never reach the sink. Query strings routinely carry secrets
+absolute-form target (`GET http://user:pa55w0rd@host/x`) is cut to `/x`, so a well-formed
+authority and any credentials in it never reach the sink. Query strings routinely carry secrets
 (password-reset and magic-link tokens, OAuth `code`/`state`, signed-URL signatures), and an
 access-log table or aggregator is rarely guarded like the secrets themselves.
 
