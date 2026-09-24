@@ -54,9 +54,12 @@ is explicit introspection, not accidental disclosure.)
   while `/apiadmin/users` is a `404`, not `/admin/users`. Everything outside the prefix is a
   `404` before any of your middleware runs, and the target global middleware sees keeps its
   leading `/`.
-  A trailing slash is dropped (`"/api/"` is `"/api"`). The prefix is matched against the raw
-  request-target, so write it as clients send it: ASCII and percent-encoded, with no `?`, `#`,
-  empty or dot segments. Anything else, including `""` and `"/"`, is an `ArgumentError`.
+  Trailing slashes are dropped (`"/api/"` is `"/api"`). The prefix is matched byte for byte
+  against the raw request-target, so write it as clients send it: ASCII, percent-encoded with
+  uppercase escapes, and with no `?`, `#`, whitespace, empty or dot segments. Anything else,
+  including `""` and `"/"`, is an `ArgumentError`. Even so, do not authorize in global middleware
+  by testing `req.target`: some targets, such as `//admin/…`, reach a route whose path they do
+  not start with (#341). Put authorization on the route or router.
 - `revise=:none`: `:lazy`/`:eager` enable Revise-based hot reload (dev only).
 - `secret_key`, `httponly`, `secure`, `samesite`: override cookie defaults for this run.
 - `shutdown_timeout=10.0`: seconds `terminate` waits for in-flight requests to drain

@@ -17,7 +17,8 @@ Four more defects came with it:
 
 - A trailing-slash prefix (`"/api/"`) cut the leading `/` off every target it rewrote, so global
   middleware saw `users/42` instead of `/users/42`.
-- A non-ASCII prefix was sliced mid-character and answered `500` to every request.
+- A non-ASCII prefix was sliced by characters where bytes were meant. It never matched a client
+  that percent-encodes (a `404`), and a raw UTF-8 target under it was cut mid-character (a `500`).
 - Any prefix that was not a `String`, a `SubString` for instance, was dropped silently, so every
   route was served unprefixed.
 - `""` and `"/"` were accepted and stripped nothing.
@@ -31,17 +32,23 @@ The prefix now covers whole path segments:
 | `/api?x=1` | `?x=1` | `/?x=1` |
 | `/apiadmin/users` | `admin/users`, served by `/admin/users` | `404` |
 
-Everything outside the prefix is still a `404` before any of your middleware runs, and the target global
-middleware sees always keeps its leading `/`. A trailing slash on the prefix is dropped, so
-`"/api/"` behaves as `"/api"`. Any `AbstractString` is accepted.
+Everything outside the prefix is still a `404` before any of your middleware runs, and the target
+global middleware sees always keeps its leading `/`. Trailing slashes on the prefix are dropped,
+so `"/api/"` behaves as `"/api"`. Any `AbstractString` is accepted.
+
+This closes the prefix's own route past a URL check. It does not make `req.target` a safe thing to
+authorize on in global middleware: `//admin/users` still reaches `/admin/users`, with or without a
+prefix (#341). Put authorization on the route or router.
 
 `serve` now validates the prefix before it changes anything, and raises `ArgumentError` for a
 shape that could never match a well-formed request-target:
 
 - `""` and `"/"`: pass `nothing` for no prefix;
 - no leading `/`;
-- non-ASCII: write it percent-encoded, as clients send it (`"/caf%C3%A9"`);
-- `?`, `#`, whitespace, a bad `%` escape, an empty segment (`//`), or a `.` or `..` segment;
+- non-ASCII: write it percent-encoded, as clients send it (`"/caf%C3%A9"`). Escapes are matched
+  byte for byte, so use uppercase hex, as clients do;
+- `?`, `#`, whitespace (a trailing newline included), a bad `%` escape, an empty segment inside
+  the path (`/a//b`), or a `.` or `..` segment;
 - a value that is not a string or `nothing`.
 
 ### How to find the calls to migrate

@@ -69,8 +69,8 @@ end
 end
 
 @testset "prefixes are matched and sliced by bytes" begin
-    # `length` counted characters and was used as a byte index, so a multi-byte prefix sliced
-    # mid-character on every request. On the wire it is percent-encoded, and that works.
+    # `length` counted characters and was used as a byte index, so a raw UTF-8 target under a
+    # multi-byte prefix was cut mid-character. On the wire it is percent-encoded, and that works.
     @test strip_through("/caf%C3%A9/menu"; prefix = "/caf%C3%A9") == (200, "/menu")
     @test strip_through("/caf%C3%A9x/menu"; prefix = "/caf%C3%A9") == (404, nothing)
     @test_throws ArgumentError PrefixStripMiddleware("/café")
@@ -88,10 +88,12 @@ end
 end
 
 # `serve` owns the check, before it mutates anything: a rejected call must leave the app exactly
-# as it was, not half-configured and not listening.
+# as it was, not half-configured and not listening. Port 1 on purpose: the call must refuse
+# before it binds, and if it ever gets that far it fails loudly instead of quietly taking a port
+# in an item that is meant to be socket-free.
 function rejects(app, prefix)
     try
-        serve(app; prefix, port = get_free_port(), host = HOST, async = true,
+        serve(app; prefix, port = 1, host = HOST, async = true,
               show_errors = false, show_banner = false)
     catch e
         return e isa ArgumentError
@@ -103,10 +105,15 @@ end
 
 @testset "serve rejects a malformed prefix before touching the app" begin
     app = App(mod = @__MODULE__)
+    cookies_before = app.service.cookies[]
+    # "/api\n" is the one PCRE's `$` let through: it also matches before a final newline.
     for bad in ("", "/", "//", "api", "api/v1", "/api?x=1", "/api#top", "/a//b", "/a/./b",
-                "/a/../b", "/..", "/café", "/a b", "/a%zz", 42, :api)
+                "/a/../b", "/..", "/café", "/a b", "/a%zz", "/api\n", "/api\n/", " /api",
+                42, :api)
         @test rejects(app, bad)
         @test app.service.prefix[] === nothing
+        @test app.service.external_url[] === nothing
+        @test app.service.cookies[] === cookies_before
         @test !isopen(app.service)
     end
 end

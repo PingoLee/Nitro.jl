@@ -79,7 +79,9 @@ end
 
 # One or more `/segment`s, each a run of RFC 3986 `pchar`s: unreserved, sub-delims, ':' and '@',
 # or a `%XX` escape. That rules out '?', '#', whitespace, non-ASCII and empty segments in one test.
-const _PREFIX_SHAPE = r"^(?:/(?:[A-Za-z0-9\-._~!$&'()*+,;=:@]|%[0-9A-Fa-f]{2})+)+$"
+# Anchored with `\z`, not `$`: PCRE's `$` also matches before a final "\n", so a prefix read from
+# a file or an env var with its newline still attached would pass and then match nothing.
+const _PREFIX_SHAPE = r"^(?:/(?:[A-Za-z0-9\-._~!$&'()*+,;=:@]|%[0-9A-Fa-f]{2})+)+\z"
 
 """
     _normalize_prefix(prefix) -> Union{String, Nothing}
@@ -88,7 +90,9 @@ Validate `serve(prefix = …)` and return it in the one form `PrefixStripMiddlew
 a `String` with a leading `/` and no trailing one (#315). `nothing` means no prefix.
 
 The prefix is compared against the raw request-target, which is what arrives on the wire, so it
-has to be written the way a client sends it: ASCII, percent-encoded, no query or fragment. A
+has to be written the way a client sends it: ASCII, percent-encoded, no query or fragment.
+Escapes are compared byte for byte, so write them in the uppercase RFC 3986 recommends and clients
+send (`%C3%A9`, not `%c3%a9`); a mismatch fails closed, as a 404. A
 shape that could never match a well-formed target is an `ArgumentError` here rather than a
 server that answers 404 to everything. Trailing slashes are dropped, the same tolerance
 `urlpatterns` gives its prefixes. Any `AbstractString` is accepted; `serve` used to drop a
@@ -105,7 +109,7 @@ function _normalize_prefix(prefix)::Nullable{String}
         "`prefix = $(repr(prefix))` is not ASCII. It is matched against the raw request-target, so " *
         "write it percent-encoded, the way clients send it: e.g. \"/caf%C3%A9\" for \"/café\"."))
     startswith(p, '/') || throw(ArgumentError(
-        "`prefix = $(repr(prefix))` must start with '/', e.g. \"/$(p)\"."))
+        "`prefix = $(repr(prefix))` must start with '/', like \"/api\"."))
     occursin(_PREFIX_SHAPE, p) || throw(ArgumentError(
         "`prefix = $(repr(prefix))` is not a URL path. Each segment may hold only letters, digits, " *
         "`-._~!\$&'()*+,;=:@` and `%XX` escapes: no '?', '#', whitespace, or empty segments (`//`)."))
@@ -128,7 +132,7 @@ HTTP.jl's router resolves to `/admin/…`, so any control keyed on the URL (a gl
 result always keeps its leading `/`. `n` is a byte count and the byte after the prefix is ASCII
 whenever it is accepted, so slicing at `n + 1` is always on a character boundary.
 """
-function _strip_prefix(target::AbstractString, prefix::String, n::Int)::Nullable{String}
+function _strip_prefix(target::String, prefix::String, n::Int)::Nullable{String}
     startswith(target, prefix) || return nothing
     ncodeunits(target) == n && return "/"
     next = codeunit(target, n + 1)
