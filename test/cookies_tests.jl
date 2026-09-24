@@ -1442,8 +1442,22 @@ end
 end
 
 @testset "a secret VALUE is refused, not written as its display form" begin
-    @test_throws ArgumentError Cookies.set_cookie!(HTTP.Response(200), "t", SecretString("tok");
-                                                   encrypted = false)
+    # The ENCRYPTED path is the one that mattered: it sealed `SecretString("****")` without
+    # complaint. (Plaintext was already refused, by accident -- the `"` in the display form is
+    # not a legal cookie octet -- so a plaintext-only assertion would pass on the unpatched code.)
+    # Matched on the message, so that accident cannot satisfy it either.
+    for secret_value in (SecretString("tok"), Base.SecretBuffer("tok"))
+        for encrypted in (true, false)
+            err = try
+                Cookies.set_cookie!(HTTP.Response(200), "t", secret_value; secret_key = real_key,
+                                    encrypted)
+                nothing
+            catch e
+                e
+            end
+            @test err isa ArgumentError && occursin("reveal", err.msg)
+        end
+    end
 end
 
 @testset "nothing that holds a key prints it" begin
