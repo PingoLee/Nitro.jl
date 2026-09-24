@@ -45,6 +45,10 @@ using ...Types: require_fixed_period
 # is "sleep for `interval`, then do `work`"; generalising it to also cover a blocking-wait loop
 # with a bounded shutdown would put two shapes back into the helper, which is the opposite of what
 # extracting it bought. That divergence is legitimate, unlike the three copies this replaced.
+#
+# `AccessLog`'s optional RETENTION pruner (#159) is a different task and does use this: it is
+# plain "sleep, then call the app's `prune(cutoff)`", a caller-supplied and possibly blocking
+# DELETE -- the session prune's shape exactly. Only the writer stays out.
 
 # The loop, named rather than written inline into the `Threads.@spawn` in `_janitor`.
 #
@@ -84,8 +88,8 @@ end
     _janitor(work, interval, label, what, kwname) -> (on_startup, on_shutdown)
 
 Build the `LifecycleMiddleware` hook pair for a periodic background janitor that calls `work()`
-every `interval`. Internal; the constructors that wrap it are `SessionMiddleware`, `SessionPruner`
-and `FixedRateLimiter`. Note `FixedRateLimiter`, not `RateLimiter`: the `:sliding_window` strategy
+every `interval`. Internal; the constructors that wrap it are `SessionMiddleware`, `SessionPruner`,
+`FixedRateLimiter`, and `AccessLog` when given a retention `prune` (#159). Note `FixedRateLimiter`, not `RateLimiter`: the `:sliding_window` strategy
 owns no background task and returns a `LifecycleMiddleware` with both hooks `nothing` (#172).
 
 - `work`     — a zero-argument function run once per tick. A throw costs one tick, not the janitor.

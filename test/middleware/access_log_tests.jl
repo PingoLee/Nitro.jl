@@ -232,3 +232,129 @@ end
 end
 
 end # @testitem
+
+# #159: the retention pruner. `AccessLog(sink; prune, retention, prune_interval)` schedules the
+# app's `prune(cutoff)` through the shared `_janitor`, starting and stopping with the writer.
+@testitem "AccessLog retention pruner" tags=[:middleware] setup=[NitroCommon] begin
+using Nitro.Core
+using Nitro
+using Dates
+
+# Records every cutoff it is handed, under a lock -- `prune` runs on the janitor task, and a
+# stale tick can still push after `shutdown`, so reads go through the lock too.
+function recording_prune()
+    buf = DateTime[]
+    lk = ReentrantLock()
+    prune = cutoff -> lock(() -> push!(buf, cutoff), lk)
+    count() = lock(() -> length(buf), lk)
+    cutoffs() = lock(() -> copy(buf), lk)
+    return cutoffs, prune, count
+end
+
+# Poll instead of sleeping a fixed time: a loaded CI box can be slow to schedule the janitor.
+function wait_for(cond; timeout = 10.0)
+    t = time()
+    while !cond()
+        time() - t > timeout && return false
+        sleep(0.01)
+    end
+    return true
+end
+
+@testset "prune runs every interval with cutoff = now() - retention" begin
+    cutoffs, prune, count = recording_prune()
+    lf = AccessLog(recs -> nothing; prune, retention = Day(90),
+                   prune_interval = Millisecond(20))
+    startup(lf)
+    before = now()
+    @test wait_for(() -> count() >= 3)                # it keeps firing, not just once
+    after = now()
+    shutdown(lf)
+
+    # Each cutoff is 90 days behind the clock that stamps `AccessRecord.ts` (`now()`). Only the
+    # first three are bounded by `after`: on >1 thread a later tick can land between `after` and
+    # `shutdown` -- pushes are in order, so these three were computed before `wait_for` returned.
+    @test all(c -> before - Day(90) - Second(5) <= c <= after - Day(90), cutoffs()[1:3])
+end
+
+@testset "a calendar retention is allowed" begin
+    cutoffs, prune, count = recording_prune()
+    lf = AccessLog(recs -> nothing; prune, retention = Month(3),
+                   prune_interval = Millisecond(20))
+    startup(lf)
+    before = now()
+    @test wait_for(() -> count() >= 1)
+    after = now()
+    shutdown(lf)
+    @test before - Month(3) - Second(5) <= cutoffs()[1] <= after - Month(3)   # first only, as above
+end
+
+@testset "no startup sweep: the first prune waits one interval" begin
+    cutoffs, prune, count = recording_prune()
+    lf = AccessLog(recs -> nothing; prune, retention = Day(1), prune_interval = Hour(1))
+    startup(lf)
+    sleep(0.2)
+    @test count() == 0
+    shutdown(lf)
+end
+
+@testset "a throwing prune costs one tick, not the pruner or the writer" begin
+    calls = Threads.Atomic{Int}(0)
+    prune = function (cutoff)
+        Threads.atomic_add!(calls, 1)
+        error("prune boom")
+    end
+    records = AccessRecord[]
+    lk = ReentrantLock()
+    lf = AccessLog(recs -> lock(() -> append!(records, recs), lk); prune,
+                   retention = Day(1), prune_interval = Millisecond(20))
+    handler = lf.middleware(req -> Response(200, "ok"))
+
+    startup(lf)
+    @test wait_for(() -> calls[] >= 3)                # still ticking after throwing
+    resp = handler(Request("GET", "/api/data"))
+    @test resp.status == 200
+    shutdown(lf)
+    @test length(records) == 1                        # the writer was unaffected
+end
+
+@testset "shutdown stops the pruner, and a restart does not leak a second one" begin
+    cutoffs, prune, count = recording_prune()
+    lf = AccessLog(recs -> nothing; prune, retention = Day(1),
+                   prune_interval = Millisecond(50))
+
+    startup(lf)
+    @test wait_for(() -> count() >= 1)
+    shutdown(lf)
+    sleep(0.2)                                        # let a stale tick, if any, land
+    n = count()
+    sleep(0.3)                                        # 6 intervals: a live pruner would tick
+    @test count() == n                                # stopped
+
+    startup(lf)
+    startup(lf)                                       # idempotent: no second task
+    t0 = count()
+    sleep(1.0)                                        # ~20 intervals
+    ticks = count() - t0
+    shutdown(lf)
+    # One pruner ticks at most once per 50 ms interval; two would roughly double that. The bound
+    # sits between the two so a slow machine (fewer ticks) cannot fail it.
+    @test 1 <= ticks <= 24
+end
+
+@testset "prune and retention go together; bad values fail at construction" begin
+    sink = recs -> nothing
+    @test_throws ArgumentError AccessLog(sink; prune = c -> nothing)
+    @test_throws ArgumentError AccessLog(sink; retention = Day(90))
+    @test_throws ArgumentError AccessLog(sink; prune = c -> nothing, retention = Day(0))
+    @test_throws ArgumentError AccessLog(sink; prune = c -> nothing, retention = Day(-1))
+    # Calendar intervals cannot be slept on -- rejected here, not on the first tick.
+    @test_throws ArgumentError AccessLog(sink; prune = c -> nothing, retention = Day(90),
+                                         prune_interval = Month(1))
+    @test_throws ArgumentError AccessLog(sink; prune = c -> nothing, retention = Day(90),
+                                         prune_interval = Millisecond(0))
+    # An interval with no pruner is simply unused -- the default is always passed.
+    @test AccessLog(sink; prune_interval = Hour(2)) isa Nitro.Core.Types.LifecycleMiddleware
+end
+
+end # @testitem

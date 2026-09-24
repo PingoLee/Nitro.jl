@@ -28,6 +28,7 @@ using HTTP
 using Dates
 using ...Core: getip, LifecycleMiddleware
 using ...Util: _log_target_path
+using ..JanitorMiddleware: _janitor
 
 export AccessLog, AccessRecord
 
@@ -185,6 +186,10 @@ end
 # signal and let the task finish its nap. Widening `_janitor` to cover a blocking-wait loop with
 # a bounded shutdown would put a second shape back into the helper, which is exactly what
 # extracting it removed. This divergence is by design; the three that collapsed were not.
+#
+# The optional RETENTION pruner (#159) is the opposite case, and does use `_janitor`: it is
+# exactly "sleep `prune_interval`, then call the app's `prune`", over app code that may block on a
+# SQL DELETE -- the session prune's shape, not this writer's. See `AccessLog`.
 function _run(sink, r::_Run, max_batch::Int)
     while true
         local rec
@@ -223,7 +228,7 @@ end
 
 """
     AccessLog(sink; capacity=10_000, batch=500, skip=nothing, annotate=nothing,
-              log_query=false)
+              log_query=false, prune=nothing, retention=nothing, prune_interval=Hour(1))
 
 Build a `LifecycleMiddleware` that asynchronously records every handled request and
 delivers batches to `sink(::Vector{AccessRecord})`. Add it to `serve(middleware=[…])`;
@@ -237,9 +242,43 @@ its background writer starts and stops with the server.
 - `annotate`  — optional `req -> Dict{Symbol,Any}`; its result becomes `record.context`
                 (e.g. `req -> Dict(:user => current_user_id(req))`)
 - `log_query` — record the query string in `record.query`. Off by default; see below
+- `prune`, `retention`, `prune_interval` — optional retention pruner; see below
 
 Best-effort by contract: never blocks or throws into the request; a full buffer or a
 failing sink costs records (counted and warned), never latency or correctness.
+
+# Retention
+
+A sink that persists records grows by one row per request, forever, unless something deletes
+old ones, and retention rules (LGPD, GDPR, HIPAA) usually require that something does. Nitro
+does not know where your sink writes, so you supply the delete and Nitro schedules it:
+
+```julia
+serve(app; middleware = [
+    AccessLog(sink;
+        prune = cutoff -> delete_access_log_older_than!(cutoff),   # your storage code
+        retention = Day(90),
+        prune_interval = Hour(1)),
+])
+```
+
+- `prune`          — `cutoff::DateTime -> Any`: delete every record whose `ts` is older than
+                     `cutoff`. Runs on a background task, never on a request, so it may block on
+                     a database.
+- `retention`      — how long a record is kept: any positive `Period`, `Month(3)` included.
+                     The cutoff is `Dates.now() - retention`, the same clock that stamps
+                     `AccessRecord.ts`, so the comparison is like for like.
+- `prune_interval` — how often `prune` runs; a positive fixed-length `Period` (default
+                     `Hour(1)`). `Month`/`Quarter`/`Year` are rejected, since they cannot be
+                     slept on.
+
+`prune` and `retention` go together: passing one without the other is an `ArgumentError`, never
+a silently disabled pruner. The pruner starts and stops with the server alongside the writer,
+and a `serve(); terminate(); serve()` cycle does not leak its task.
+
+The first prune runs one `prune_interval` **after** `serve()`, not at startup. Keep the interval
+well under your restart cadence: a server restarted more often than `prune_interval` never
+prunes. A throwing `prune` is logged and costs that one tick; the next tick runs as usual.
 
 # Security: what a record carries
 
@@ -257,9 +296,26 @@ escaped: a record is data, and the sink decides how to store or render it.
 function AccessLog(sink::Function; capacity::Integer=10_000, batch::Integer=500,
                    skip::Union{Nothing, Function}=nothing,
                    annotate::Union{Nothing, Function}=nothing,
-                   log_query::Bool=false)
+                   log_query::Bool=false,
+                   prune::Union{Nothing, Function}=nothing,
+                   retention::Union{Nothing, Period}=nothing,
+                   prune_interval::Period=Hour(1))
     capacity > 0 || throw(ArgumentError("AccessLog capacity must be positive"))
     batch > 0 || throw(ArgumentError("AccessLog batch must be positive"))
+
+    # Retention (#159). All validation happens HERE, at the caller's constructor call; a bad
+    # `prune_interval` is rejected inside `_janitor` for the same reason. A pruner that only
+    # discovered its misconfiguration on its first tick would fail an hour after deploy, silently.
+    (prune === nothing) == (retention === nothing) || throw(ArgumentError(
+        "AccessLog: `prune` and `retention` go together -- pass both to enable the retention " *
+        "pruner, or neither. Got only `$(prune === nothing ? "retention" : "prune")`."))
+    retention === nothing || Dates.value(retention) > 0 || throw(ArgumentError(
+        "AccessLog: `retention` must be positive, got $retention."))
+    pruner = prune === nothing ? nothing :
+        # `now()`, not `now(UTC)`: the cutoff must come from the clock that stamps
+        # `AccessRecord.ts` (`_capture!`), or every record is misjudged by the UTC offset.
+        _janitor(() -> prune(now() - retention), prune_interval, "AccessLog",
+                 "retention prune", "prune_interval")
 
     w = _Writer(sink, Int(batch), Threads.Atomic{Bool}(false), _Run(Int(capacity)), nothing)
 
@@ -280,7 +336,7 @@ function AccessLog(sink::Function; capacity::Integer=10_000, batch::Integer=500,
         end
     end
 
-    on_startup = function ()
+    start_writer = function ()
         w.active[] && return nothing
         r = _Run(Int(capacity))          # fresh activation; a prior drain task keeps its own
         w.run = r                        # plain write, published by the atomic store below
@@ -292,11 +348,26 @@ function AccessLog(sink::Function; capacity::Integer=10_000, batch::Integer=500,
         return nothing
     end
 
-    on_shutdown = function ()
+    stop_writer = function ()
         w.active[] || return nothing
         w.active[] = false
         close(w.run.channel)                                # drains buffered records, then _run exits
         w.task === nothing || timedwait(() -> istaskdone(w.task), 5.0)
+        return nothing
+    end
+
+    # Two independent resources, each idempotent on its own, so neither guard may short-circuit
+    # the other: an early `return` in the writer half must not skip the pruner. The pruner stops
+    # FIRST so the drain wait below is not spent with a prune still being scheduled.
+    on_startup = function ()
+        start_writer()
+        pruner === nothing || pruner[1]()
+        return nothing
+    end
+
+    on_shutdown = function ()
+        pruner === nothing || pruner[2]()
+        stop_writer()
         return nothing
     end
 
