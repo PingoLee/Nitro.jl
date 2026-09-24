@@ -214,6 +214,11 @@ Execution order is always:
 global middleware → route middleware → handler
 ```
 
+The route is chosen between the first two. A middleware that rewrites the method or the path
+(`X-HTTP-Method-Override`, a legacy alias) therefore belongs in the global list, where the
+rewritten request still gets its new route's guards. See
+[Rewriting the method or the target](extension_points.md#Rewriting-the-method-or-the-target).
+
 ### Global middleware
 
 ```julia

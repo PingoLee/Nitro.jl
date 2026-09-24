@@ -1119,11 +1119,12 @@ one call under `internalrequest`.
 
 # Why per pipeline, and why that makes the key complete
 
-A chain is `foldlayers(handler, route mw, router mw, global mw)`. Two of those inputs —
-`handler`, which bakes in `catch_errors`/`show_errors`/`serialize`, and the global middleware —
-are fixed for one pipeline's lifetime; the other two come from one `custommiddleware` snapshot.
-So *(this pipeline, that snapshot, method, path)* determines the chain, and a cache owned by the
-pipeline and stamped with the snapshot is complete **by construction**.
+A chain is `foldlayers(handler, route mw, router mw)`. `handler`, which bakes in
+`catch_errors`/`show_errors`/`serialize`, is fixed for one pipeline's lifetime; the other two
+come from one `custommiddleware` snapshot. So *(this pipeline, that snapshot, method, path)*
+determines the chain, and a cache owned by the pipeline and stamped with the snapshot is
+complete **by construction**. (Global middleware is no longer part of a cached chain: since #291
+it wraps route selection itself, folded once per pipeline.)
 
 The `App`-wide `middleware_cache` this replaced had to rebuild that completeness argument in its
 key, and could not: `cachetag` carried the three serializer booleans (#79), but global
@@ -1242,7 +1243,7 @@ end
 const ROUTE_RESOLUTION_KEY = :__nitro_route_resolution
 
 """
-    RouteResolution(router, method, target, handler, route, params)
+    RouteResolution(router, method, target, handler, route, params, mw_method, table, source)
 
 One request's route lookup, handed from `compose` (src/routerhof.jl) to the innermost layer of
 the pipeline (`_dispatch_resolved`, src/core/pipeline.jl) so the route is resolved **once**
@@ -1260,8 +1261,8 @@ to where the second one used to happen.
 `_dispatch_resolved` honours this hand-off only when all three still match. That set is not a
 judgement call: `HTTP.Handlers.gethandler` resolves from exactly `r.routes`, `req.method` and
 `req.target`, so re-checking those three is what makes "reuse the lookup" indistinguishable
-from "do the lookup again". Any mismatch falls through to `r(req)`, which is the old behavior
-and always correct.
+from "do the lookup again". A `router` mismatch falls through to `r(req)`, which is always
+correct; a `method` or `target` mismatch is the rewrite case below, and is not.
 
 **`router`** — because the stash lives on the *request*, while the invariant that makes it safe
 lives on the *`App`*. A single `HTTP.Request` object can be passed to `internalrequest` more
@@ -1292,16 +1293,28 @@ test; the note at that testset says why.)
     matters anyway. Left unparameterized on purpose — do not re-derive the microbenchmark and
     "fix" it.
 
-**`method`** — `gethandler` matches on the method too, and `Request.method` is a mutable field.
-A middleware doing the classic `X-HTTP-Method-Override` rewrite (`req.method = "PUT"`) used to
-change which handler ran, because the router resolved after every middleware layer. Guarding on
-it keeps that true. Nothing in `src/` rewrites the method today; this is for user middleware.
+**`method`** and **`target`** — `gethandler` matches on both, and both are mutable fields. Since
+#291 `compose` resolves the route *after* global middleware, so a global
+`X-HTTP-Method-Override` or path-alias layer has already run by the time this is written and
+never trips the guard. Only **router-level and route-level** middleware sit between `compose`'s
+lookup and the terminal, so a mismatch here means one of those rewrote the request after its
+chain was chosen. (`PrefixStripMiddleware` folds outside `compose` too, src/core/pipeline.jl.)
 
-**`target`** — the one every layer actually touches. Global, router-level and route-level
-middleware all fold *outside* the accumulator `compose` receives, so any of them may retarget
-the request before the terminal runs; the rewrite then decides the route, as it always did.
-(`PrefixStripMiddleware` is not in that set either way: it folds *outside* `compose`
-(src/core/pipeline.jl), so it has already run by the time any of this happens.)
+A mismatch is **not** simply re-resolved, and that is the #291 fix. The chain that already ran
+was chosen for the stashed route; the rewritten request may reach a different leaf whose own
+guards never ran. So the terminal re-resolves and serves the new leaf only when the entry the
+running chain was built from — `genkey(mw_method, route)` in `table` — is exactly what that leaf
+requires, or the leaf has no router or route middleware. Otherwise it refuses with a `500`. See
+`_route_rerouted` (src/core/pipeline.jl). The entry itself is not stashed: that would cost a
+`genkey` string on every matched request, which #250 removed from the cache-hit path, to serve
+a case that is rare by construction.
+
+What the new leaf requires is read from a **fresh** snapshot of `source`, not from `table`. The
+router is live, so a route registered while this request sat in route middleware (Revise, a
+runtime `include_routes`) can be the leaf the rewrite reaches, and `table` predates its entry —
+reading "no entry" there would serve it unguarded. Across generations the check stays
+fail-closed: an entry no registration touched is the same tuple in both tables, and one that was
+replaced compares unequal.
 
 **`===` on `String` compares contents, not addresses** — Julia's strings are egal by value, so
 the method and target checks ask "is this still what I resolved against?" rather than "is it
@@ -1320,7 +1333,8 @@ handled by construction, not by invalidation, which is why a pipeline's cached c
 
 That leaves passes that write **no** stash, and those do not rely on an argument at all:
 `compose` calls `_clear_resolution!` (src/routerhof.jl) on every path that reached `gethandler`
-and did not stash — a 404, a 405, and a non-`Function` leaf. Ran the lookup ⟹ wrote or cleared,
+and did not stash — a 404 or a 405. (A non-`Function` leaf used to clear too; since #291 it
+stashes like any other match, see `compose`.) Ran the lookup ⟹ wrote or cleared,
 no third outcome, so a stale hand-off is structurally impossible rather than argued away.
 
 It was argued away, once, and the argument was wrong. The claim was that a pass writing no
@@ -1341,12 +1355,15 @@ confines a stash to the router this reasoning is about.
 
 """
 struct RouteResolution
-    router  :: HTTP.Router
-    method  :: String
-    target  :: String
-    handler :: Function
-    route   :: String
-    params  :: Dict{String,String}
+    router     :: HTTP.Router
+    method     :: String
+    target     :: String
+    handler    :: Function
+    route      :: String
+    params     :: Dict{String,String}
+    mw_method  :: String                           # the method the running chain is keyed on
+    table      :: Dict{String,RouteMiddleware}     # the snapshot that chain was built from
+    source     :: CopyOnWriteDict{RouteMiddleware} # the live table, for the rerouted leaf's entry
 end
 
 """
@@ -1380,8 +1397,9 @@ A router built with HTTP.jl-level `middleware` wraps every leaf in it, which hid
 Registration handles that per case: no auto-`HEAD` at all, and an `ArgumentError` for a `"*"`,
 `STREAM` or `WEBSOCKET` route that has middleware to key (src/core/registration.jl).
 
-Subtypes `Function` so the `RouteResolution` hand-off (`innerhandler isa Function`) still applies.
-`method` is a `String` for every `F`, so `compose` reads it without widening.
+Subtypes `Function` so the `RouteResolution` hand-off stores it as-is, without the wrapper
+closure `compose` gives a non-`Function` leaf. `method` is a `String` for every `F`, so `compose`
+reads it without widening.
 """
 struct DeclaredMethodHandler{F<:Function} <: Function
     method  :: String

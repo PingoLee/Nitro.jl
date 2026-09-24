@@ -276,7 +276,8 @@ place, with `Allow` (#281).
 It is a distinct type so [`_allowed_methods`](@ref) can leave `HEAD` out of that `Allow`: the
 router does resolve `HEAD` to this leaf, but the leaf refuses it.
 
-Subtypes `Function` so the `RouteResolution` hand-off (`innerhandler isa Function`) still applies.
+Subtypes `Function` so the `RouteResolution` hand-off stores it as-is, without the wrapper
+closure `compose` gives a non-`Function` leaf.
 """
 struct RetiredHeadHandler{R<:HTTP.Router} <: Function
     router :: R

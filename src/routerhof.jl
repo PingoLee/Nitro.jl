@@ -274,11 +274,8 @@ element appended ends up OUTERMOST (`reduce(|>, Function[h, a, b])` is `b(a(h))`
 with no layers returns `handler` itself, because `reduce` over a one-element collection never
 applies the operator.
 
-Both fold sites go through here on purpose. [`buildmiddleware`](@ref) folds
-`route, router, global`; `compose`'s empty-table fast path folds `global` alone. Whenever no
-per-route middleware applies, those two must produce the same chain — appending an empty
-vector contributes nothing — and sharing the fold makes that a fact about the code rather than
-a coincidence between two copies of it that can drift.
+Both fold sites go through here: [`buildmiddleware`](@ref) folds `route, router` around the
+pipeline's handler, and `compose` folds `global` once around its route-selection step (#291).
 """
 function foldlayers(handler::Function, layers::Vector...) :: Function
     chain::Vector{Function} = [handler]
@@ -289,69 +286,62 @@ function foldlayers(handler::Function, layers::Vector...) :: Function
 end
 
 """
-    buildmiddleware(key, handler, globalmiddleware, custom) -> Function
+    buildmiddleware(entry, handler) -> Function
 
-Compose the chain for route `key` from `custom` — the `custommiddleware` snapshot the calling
-request already took. Runs on a [`ChainCache`](@ref) miss only: once per route per registration
-generation, per pipeline.
+Compose one route's chain from `entry`, its `(router middleware, route middleware)` pair as the
+calling request's `custommiddleware` snapshot holds it. Runs on a [`ChainCache`](@ref) miss
+only: once per route per registration generation, per pipeline.
+
+Global middleware is not in here (#291): `compose` folds it *around* route selection instead, so
+it has already run by the time this chain is chosen.
 """
-function buildmiddleware(key::String, handler::Function, globalmiddleware::Vector{Function},
-                         custom::Dict{String, RouteMiddleware}) :: Function
+function buildmiddleware(entry::RouteMiddleware, handler::Function) :: Function
 
-    # lookup the middleware for this path.
-    #
-    # `custom` is the CALLER's per-request snapshot, and it must be that one rather than a fresh
-    # snapshot taken here (#255): `compose` stamps the resulting chain with the snapshot it
-    # passed in, and `cached_chain` serves it only to requests holding that same table. Building
-    # from a later snapshot than the stamp would cache a chain under a generation it was not
-    # built from. The hazard the old NOTE here guarded — a snapshot hoisted to compose time,
-    # freezing the route table for the server's life — now lives in `compose`'s per-request
-    # closure, where its own NOTE covers it.
+    # `entry` comes from the CALLER's per-request snapshot, and it must be that one rather than
+    # a fresh snapshot taken here (#255): `compose` stamps the resulting chain with the snapshot
+    # it looked `entry` up in, and `cached_chain` serves it only to requests holding that same
+    # table. Building from a later snapshot than the stamp would cache a chain under a generation
+    # it was not built from.
     #
     # Both slots infer as `Union{Nothing, Vector{Function}}` since #76; before it, the table's
-    # `Tuple` value type was abstract and this line inferred `Tuple{Any, Any}`.
-    # `NO_ROUTE_MIDDLEWARE` is the miss-path default; a `(nothing, nothing)` literal infers the
-    # same today, and that constant's docstring says why it is still the one to use.
-    routermiddleware, routemiddleware = get(custom, key, NO_ROUTE_MIDDLEWARE)
+    # `Tuple` value type was abstract and the destructure inferred `Tuple{Any, Any}`.
+    routermiddleware, routemiddleware = entry
 
     # sanitize outputs (either value can be nothing)
     routermiddleware = isnothing(routermiddleware) ? EMPTY_LAYERS : routermiddleware
     routemiddleware = isnothing(routemiddleware) ? EMPTY_LAYERS : routemiddleware
 
-    # Route middleware innermost, then router middleware, then global — the last appended is
-    # the outermost after the fold. See `foldlayers`, which `compose`'s empty-table fast path
-    # also uses, so the two agree by construction.
-    return foldlayers(handler, routemiddleware, routermiddleware, globalmiddleware)
+    # Route middleware innermost, then router middleware — the last appended is the outermost
+    # after the fold.
+    return foldlayers(handler, routemiddleware, routermiddleware)
 end
 
 """
     compose(router, globalmiddleware, custommiddleware) -> (handler -> request function)
 
 The pipeline layer that applies per-route and per-router middleware, chosen per request from
-the route the request resolves to. Global middleware is applied here too — outside the per-route
-layers — so every request, matched or not, runs it exactly once.
+the route the request resolves to. Global middleware is applied here too, and **it wraps route
+selection** (#291): global layers run first, once per request whether or not it matches, and
+the route is looked up only when they hand the request on.
+
+That order is the one Express and Django use, and it is load-bearing for authorization. A
+global `X-HTTP-Method-Override` or path-alias layer rewrites `req.method`/`req.target` before
+the lookup, so the rewritten request gets *its* route's guards. Before #291 the lookup ran
+first and global middleware was folded into the chosen route's chain; the rewrite then reached
+the terminal, which re-resolved it to a leaf whose guards had never been selected — a guarded
+`DELETE` answered a `GET` or `POST` carrying an override header, and a global path alias turned
+a `404` into a guarded route's `200`.
 
 Each pipeline gets its own [`ChainCache`](@ref) (#255), so a route's chain is composed once per
-registration generation rather than per request, with or without global middleware.
+registration generation rather than per request.
 """
 function compose(router::HTTP.Router, globalmiddleware::Vector{Function},
                  custommiddleware::CopyOnWriteDict{RouteMiddleware})
     return function (handler)
-        # The chain for "no per-route middleware applies": global middleware only. Built once
-        # here because it never varies. `handler` alone would be WRONG — it is the fold
-        # accumulator (the serializer wrapping the router), and global middleware arrives
-        # sideways as `globalmiddleware`, applied only inside `buildmiddleware`. Returning
-        # `handler` directly is exactly how the unmatched path used to skip every global
-        # middleware in the app. With no global middleware `foldlayers` returns `handler`
-        # itself, so this costs nothing in that case.
-        nocustom = foldlayers(handler, globalmiddleware)
-
         # This pipeline's chains — created HERE, once per `handler`, never shared (#255). Every
-        # chain closes over `handler` and `globalmiddleware`, so a cache that outlives or spans
-        # pipelines would need both in its key; `globalmiddleware` has no stable identity to key
-        # on, which is why the old `App`-wide cache could not cache at all when any was present.
-        # Owned by the pipeline, the key only has to name the route and the registration
-        # generation. See `ChainCache` (src/types.jl).
+        # chain closes over `handler`, so a cache that outlives or spans pipelines would need it
+        # in its key. Owned by the pipeline, the key only has to name the route and the
+        # registration generation. See `ChainCache` (src/types.jl).
         chains = ChainCache()
 
         # NOTE: `custommiddleware` is captured as an *object*; `snapshot` is called per request
@@ -360,22 +350,24 @@ function compose(router::HTTP.Router, globalmiddleware::Vector{Function},
         # would silently run without their middleware, and the emptiness verdict would freeze
         # with it (#71). The "sees routes registered after it was composed" and "composed
         # against an EMPTY table" items in test/custommiddleware_tests.jl catch each half.
-        return function (req::HTTP.Request)
+        select = function (req::HTTP.Request)
 
             # #71: `compose` is now installed unconditionally, and THIS is the emptiness test
             # that used to live in `setupmiddleware` — evaluated once there, per request here.
             # It must stay inside this closure: hoisted out, the verdict freezes at compose
             # time and an app whose first per-route middleware is registered later never sees
             # it, which is #71 verbatim. The "composed against an EMPTY table" testitem in
-            # test/custommiddleware_tests.jl is what catches that — verified by mutation: the
-            # non-empty-table guard in the same file stays green under the hoist.
+            # test/custommiddleware_tests.jl is what catches that.
             #
             # One 0-allocation acquire-load, and the only `custommiddleware` read this request
             # makes: the same snapshot is the generation stamp `cached_chain` checks and, on a
-            # miss, the table `buildmiddleware` composes from — so the chain and its stamp can
-            # never disagree.
+            # miss, the table the chain is built from — so the chain and its stamp can never
+            # disagree.
+            #
+            # With no route middleware anywhere there is no chain to choose, so nothing a
+            # rewrite could skip: the terminal resolves whatever the request says by then.
             custom_snap = snapshot(custommiddleware)
-            isempty(custom_snap) && return nocustom(req)
+            isempty(custom_snap) && return handler(req)
 
             # `params` is BOUND now, not discarded (#80). `gethandler` allocates it either
             # way — a fresh `Params()` per call, populated for a parametrized route — and the
@@ -391,27 +383,6 @@ function compose(router::HTTP.Router, globalmiddleware::Vector{Function},
             # unmatched path below.
             if !isnothing(innerhandler) && !ismissing(innerhandler)
 
-                # Hand this lookup to the pipeline's terminal instead of letting it redo the
-                # work (#80). `_dispatch_resolved` (src/core/pipeline.jl) consumes it, and
-                # honours it only if `(router, method, target)` all still match — every input
-                # `gethandler` just read. `router` is in there because this stash rides on the
-                # REQUEST while the invariant that makes it safe belongs to the App; see
-                # `RouteResolution` (src/types.jl). Written HERE — before the chain runs —
-                # because the chain is what eventually reaches the terminal.
-                #
-                # Stashed unconditionally on this branch, cache hit or miss, since the chain
-                # is cached but the resolution is per request. `isa Function` keeps
-                # `RouteResolution.handler` concrete: HTTP.jl types `leaf.handler` as `Any`,
-                # and everything Nitro registers is a closure, but a callable struct arriving
-                # some other way simply declines the hand-off and takes the old double-lookup
-                # rather than widening the field — so that case CLEARS instead of stashing.
-                if innerhandler isa Function
-                    req.context[ROUTE_RESOLUTION_KEY] =
-                        RouteResolution(router, req.method, req.target, innerhandler, path, params)
-                else
-                    _clear_resolution!(req)
-                end
-
                 # Both keys use the method the route was DECLARED with, which is the one its
                 # middleware was published under. For most leaves that is `req.method`. A
                 # `DeclaredMethodHandler` leaf is reached by other methods and carries its own:
@@ -426,10 +397,40 @@ function compose(router::HTTP.Router, globalmiddleware::Vector{Function},
 
                 # A tuple of two strings that already exist — `req.method` or the leaf's stored
                 # declared method, and HTTP.jl's stored `Leaf.path` — so a cache hit builds no key
-                # string (#250). The
-                # joined `genkey` is needed only below, on a miss, for the `custommiddleware`
-                # lookup. See `ChainKey` (src/types.jl).
+                # string (#250). The joined `genkey` is needed only below, on a miss, for the
+                # `custommiddleware` lookup. See `ChainKey` (src/types.jl).
                 key = (mw_method, path)
+
+                # Hand this lookup to the pipeline's terminal instead of letting it redo the
+                # work (#80). `_dispatch_resolved` (src/core/pipeline.jl) consumes it, and
+                # honours it only if `(router, method, target)` all still match — every input
+                # `gethandler` just read. `router` is in there because this stash rides on the
+                # REQUEST while the invariant that makes it safe belongs to the App; see
+                # `RouteResolution` (src/types.jl). Written HERE — before the chain runs —
+                # because the chain is what eventually reaches the terminal.
+                #
+                # Stashed unconditionally on this branch, cache hit or miss, since the chain
+                # is cached but the resolution is per request.
+                #
+                # `mw_method` and `custom_snap` name the chain about to run, for the case where
+                # router- or route-level middleware reroutes the request after this (#291): the
+                # terminal then compares the new leaf's entry, read from a fresh snapshot of
+                # `custommiddleware`, against this one. All three already exist, so the stash
+                # costs no lookup on the requests that never reroute.
+                #
+                # EVERY matched leaf stashes, including one that is not a `Function`. HTTP.jl
+                # types `leaf.handler` as `Any`; everything Nitro registers is a closure, but a
+                # callable struct can arrive through `HTTP.register!` on the app's router. That
+                # case used to CLEAR the stash instead, to keep `RouteResolution.handler`
+                # concrete — and a cleared stash tells the terminal "no chain was chosen", so a
+                # route middleware on that leaf that rerouted the request reached a guarded leaf
+                # unchecked (found in review of #291). Wrapping it costs one closure on a path
+                # nothing in Nitro produces.
+                leafhandler = innerhandler isa Function ? innerhandler :
+                              (r::HTTP.Request) -> innerhandler(r)
+                req.context[ROUTE_RESOLUTION_KEY] =
+                    RouteResolution(router, req.method, req.target, leafhandler, path,
+                                    params, mw_method, custom_snap, custommiddleware)
 
                 # One acquire-load, then a lookup on a table no writer will ever mutate. `nothing`
                 # both for "never built" and for "built from a table registration has since
@@ -437,10 +438,10 @@ function compose(router::HTTP.Router, globalmiddleware::Vector{Function},
                 func = cached_chain(chains, custom_snap, key)
                 isnothing(func) || return func(req)
 
-                # Combine all the middleware functions together, from THIS request's snapshot —
-                # the one the chain is about to be stamped with.
-                strategy = buildmiddleware(genkey(mw_method, path), handler, globalmiddleware,
-                                           custom_snap)
+                # Combine the route's middleware, from THIS request's snapshot — the one the
+                # chain is about to be stamped with.
+                strategy = buildmiddleware(
+                    get(custom_snap, genkey(mw_method, path), NO_ROUTE_MIDDLEWARE), handler)
 
                 # Warmup only: once per route per registration generation. The publish decides
                 # how much later requests rebuild, never whether they are served a stale chain —
@@ -463,20 +464,22 @@ function compose(router::HTTP.Router, globalmiddleware::Vector{Function},
                 return strategy(req)
             end
 
-            # Unmatched (404) or method-mismatched (405). `nocustom`, NOT `handler`: the router
-            # still produces the 404/405 status downstream, but global middleware must run — a
-            # global `Cors()` has to emit its headers and a global `RateLimiter()` has to count
-            # the request, or unmatched paths become a rate-limit bypass. Returning `handler`
-            # here is what used to exempt them, and only for apps that had per-route middleware
-            # somewhere — an app without it ran global middleware on 404s all along. This
-            # restores parity between the two.
+            # Unmatched (404) or method-mismatched (405): no route middleware applies, and the
+            # router produces the status downstream. Global middleware has already run — it
+            # wraps this function — so a global `Cors()` still emits its headers here and a
+            # global `RateLimiter()` still counts the probe (#71).
             #
             # Clear first (#80): this pass ran `gethandler` and got no route, so any stash on
             # the request belongs to an EARLIER pass over the same object and must not be
-            # honoured by the terminal.
+            # honoured by the terminal. No middleware sits between here and the terminal, so
+            # nothing can reroute the request after this verdict.
             _clear_resolution!(req)
-            return nocustom(req)
+            return handler(req)
         end
+
+        # Global middleware outermost, AROUND route selection (#291). Folded once per
+        # pipeline; with no global middleware `foldlayers` returns `select` itself.
+        return foldlayers(select, globalmiddleware)
     end
 end
 

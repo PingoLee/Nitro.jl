@@ -408,30 +408,34 @@ import Nitro: App, path, text
 #   * a bare leaf that matches any token keys on `req.method`, so only methods Nitro knows are
 #     cached, and anything else is composed for that one request.
 #
-# Observed through a counting GLOBAL factory: `compose` calls it once to prebuild the unmatched
-# chain, then once per chain composition.
+# Observed through a counting ROUTE factory, called once per chain composition. (This used to
+# count a GLOBAL factory, which every composition re-folded; since #291 global middleware wraps
+# route selection and is folded once per pipeline, so it no longer sees compositions.) A leaf
+# with no entry composes to the bare handler and calls no factory, so every leaf here gets one.
 
 folds = Ref(0)
-counting_global = handler -> (folds[] += 1; req::HTTP.Request -> handler(req))
+counting = handler -> (folds[] += 1; req::HTTP.Request -> handler(req))
 
 ctx = App()
 Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
-    path("/any", (req::HTTP.Request) -> Res.send("any"), method = "*"),
-    # Some route must carry middleware, or every request takes the empty-table fast path.
-    path("/mw", (req::HTTP.Request) -> Res.send("mw"), middleware = [h -> (r::HTTP.Request -> h(r))]),
+    path("/any", (req::HTTP.Request) -> Res.send("any"), method = "*", middleware = [counting]),
 ])
 # A bare any-method leaf, registered on the router directly so no `DeclaredMethodHandler` wraps
-# it — the shape the method guard exists for.
+# it -- the shape the method guard exists for. It keys on `req.method`, so it has an entry for
+# each method this item sends it.
 HTTP.register!(ctx.service.router, "*", "/raw", (req::HTTP.Request) -> HTTP.Response(200, "raw"))
-p = Nitro.Core.setupmiddleware(ctx; middleware = [counting_global], catch_errors = false)
-@test folds[] == 1
+for m in ["POST"; ["X-JUNK-$i" for i in 1:5]]
+    Nitro.Core.RouterHOF.publish_route_middleware!(ctx, "$m|/raw", (nothing, Function[counting]))
+end
+p = Nitro.Core.setupmiddleware(ctx; catch_errors = false)
+@test folds[] == 0
 
 @testset "a \"*\" route caches ONE chain for every method token" begin
     for _ in 1:2, i in 1:5
         @test text(p(HTTP.Request("X-JUNK-$i", "/any"))) == "any"
     end
     @test text(p(HTTP.Request("POST", "/any"))) == "any"
-    @test folds[] == 1 + 1              # keyed on the declared "*", not on what was sent
+    @test folds[] == 1                  # keyed on the declared "*", not on what was sent
 end
 
 @testset "a bare any-method leaf never caches an unknown method" begin
