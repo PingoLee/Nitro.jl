@@ -203,11 +203,16 @@ The methods `r` would serve at `target`, sorted. Built from HTTP.jl's route tree
    variable, bare variable and `**`, in the order upstream `match` tries them. The router serves
    a method if *any* of those nodes has it, because `match` falls through to the next branch when
    one lacks it.
-2. Keep a candidate only if upstream's own `match` resolves it to a leaf, and that leaf is not a
-   [`RetiredHeadHandler`](@ref). The list is then exactly what the router would serve, precedence
-   included, rather than a second implementation of it.
+2. Keep a candidate only if upstream's own `match` resolves it to a leaf, and that leaf is neither
+   a [`RetiredHeadHandler`](@ref) nor a `"*"` leaf. The list is then exactly what the router
+   would serve, precedence included, rather than a second implementation of it.
 
-`"*"` leaves are skipped. They take every method, so a node that has one can never answer `405`.
+`"*"` leaves are skipped in both steps. They take every method, so the router cannot vouch for
+any one of them: the handler decides, and a static mount's catch-all is a `"*"` leaf that answers
+`404` or `405` for what it cannot serve (#284). With a mount at `static` and a `POST` route at
+`/{x}/a.txt`, a `POST /static/a.txt` resolves to the mount, so `POST` is not in the list. Step 2
+drops nothing when `match` itself reported the mismatch: it returns a `"*"` leaf for any method
+that reaches one, so such a target reaches none.
 
 Reads HTTP.jl internals (`Router.routes`, the `Node`/`Leaf`/`Variable` fields, `match`,
 `_route_variable_matches`, `_router_request_path`). Each one is canaried in
@@ -220,7 +225,8 @@ function _allowed_methods(r::HTTP.Router, target::String)::Vector{String}
     allowed = String[]
     for method in candidates
         leaf = HTTP.Handlers.match(r.routes, method, segments, 1)
-        leaf isa HTTP.Handlers.Leaf && !(leaf.handler isa RetiredHeadHandler) && push!(allowed, method)
+        leaf isa HTTP.Handlers.Leaf && leaf.method != "*" &&
+            !(leaf.handler isa RetiredHeadHandler) && push!(allowed, method)
     end
     return sort!(allowed)
 end

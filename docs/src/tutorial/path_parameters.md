@@ -364,14 +364,16 @@ DELETE /api/products  →  405, Allow: GET, HEAD, POST
 - **`OPTIONS` is listed only when a route declares it.** `Cors()` answers `OPTIONS` itself, before
   routing, so the router cannot see it and does not list it.
 - **A path that matches no route at all is still a `404`**, with no `Allow`.
-- **Under a `staticfiles`/`spafiles`/`dynamicfiles` mount this does not hold yet.** The mount's
-  catch-all turns a method mismatch on an app route under its prefix (every path, for a root
-  mount) into a `404`, and a mount's own `405` always says `Allow: GET, HEAD`. Tracked in
-  [#284](https://github.com/PingoLee/Nitro.jl/issues/284).
+- **Static mounts follow the same rule.** Under a `staticfiles`/`spafiles`/`dynamicfiles` mount,
+  including a root one, a method mismatch on an app route is still a `405` with the route's
+  `Allow`. A mounted file answers `GET` and `HEAD`, so its `405` lists those plus any app route
+  at the same path. The one exception is `spafiles` history mode, which answers a `GET` or `HEAD`
+  miss with the app shell.
 - **A custom 405 handler still decides the response.** With
   `Service(router = HTTP.Router(my404, my405))`, Nitro calls `my405` and adds `Allow` to the
   `HTTP.Response` it returns, as a new response, so a shared `const` response is safe. If `my405`
   sets its own `Allow`, Nitro leaves it alone. Any other return value passes through unchanged.
+  A static mount's `405` goes through `my405` the same way.
 
 ## Modular Route Inclusion with `include_routes`
 

@@ -52,9 +52,9 @@
 # off; Phoenix's `Plug.Static` returns the `conn` *unchanged* so a later plug answers; Go's
 # `FileServer` does not look at the method at all. Nitro cannot literally fall through — the router
 # has already matched — so it reproduces the observable outcome instead: a path that names no
-# mounted file defers to the application's own not-found handler whatever the method, and only a
-# path that *does* name one answers 405, with `Allow`. That is strictly more informative than
-# Express's default, which 404s even for a file that exists.
+# mounted file gets whatever the rest of the router answers there (`_mount_miss`), and only a path
+# that *does* name one answers 405, with `Allow`. That is strictly more informative than Express's
+# default, which 404s even for a file that exists.
 function _register_mount(ctx::App, router::HTTP.Router, segments::Vector{String}, handler::F;
                          bare::Bool) where {F}
     register_internal(ctx, router, "*", Util.mount_route(vcat(segments, "**")), handler)
@@ -65,10 +65,31 @@ end
 # GET and HEAD, the set `Plug.Static` calls `@allowed_methods` and `serve-static` spells inline.
 _is_mount_method(method::AbstractString) = method == GET || method == HEAD
 
-# Built per call rather than shared: this is a rare path, and a module-level `const` response is the
-# one shape nitro-core §4 asks you to think twice about.
-_mount_method_not_allowed() =
-    HTTP.Response(405, ["Allow" => "GET, HEAD", "Content-Length" => "0"])
+# A request the mount will not serve gets the answer the rest of the router gives at that path,
+# through the router's own `_404` and `_405`, so a custom handler and `Allow` behave as they do for
+# an app route (#281, #284).
+#
+# A miss is not always a 404. The catch-all is a `"*"` leaf, and HTTP.jl falls through to it
+# whenever the exact node lacks the request's method: under a ROOT mount, `PUT /api/items` on a
+# GET-only route lands here. When the router serves the path under another method, that is a 405.
+# `_allowed_methods` skips `"*"` leaves, so the mount itself never counts as serving the path.
+#
+# "The rest of the router" is not "the router without the mount": a route the mount SHADOWS is
+# left out. With a mount at `static` and a `PUT` route at `/{x}/foo`, `PUT /static/foo` resolves
+# to the mount, so `GET /static/foo` is a 404, not a 405 advertising a `PUT` that would 404 too.
+#
+# `notfound` is the router's `_404` captured at mount time; see `staticfiles`.
+function _mount_miss(router::HTTP.Router, notfound::F, req::HTTP.Request) where {F}
+    allowed = _allowed_methods(router, req.target)
+    return isempty(allowed) ? notfound(req) : _method_not_allowed(router, req, allowed)
+end
+
+# A path naming a mounted file, under a method the mount does not serve. `Allow` is the mount's
+# GET and HEAD plus every app route at that path: a `POST` route at `/static/a.txt` serves `POST`
+# there while the mount serves `GET`, so neither list alone is what the path answers.
+_mount_method_not_allowed(router::HTTP.Router, req::HTTP.Request) =
+    _method_not_allowed(router, req,
+                        sort!(union(String[GET, HEAD], _allowed_methods(router, req.target))))
 
 # Fill the mount table, warning when two enumerated files claim one key.
 #
@@ -338,10 +359,10 @@ function staticfiles(
 
     handler = function (req::HTTP.Request)
         mf = _lookup_mount(table, req.target, nprefix)
-        # A miss defers to the application's own not-found handler for EVERY method -- the mount
-        # does not claim a path it cannot serve (see `_register_mount`).
-        mf === nothing && return notfound(req)
-        _is_mount_method(req.method) || return _mount_method_not_allowed()
+        # A miss gets the router's own answer for EVERY method -- the mount does not claim a path
+        # it cannot serve (see `_register_mount` and `_mount_miss`).
+        mf === nothing && return _mount_miss(router, notfound, req)
+        _is_mount_method(req.method) || return _mount_method_not_allowed(router, req)
         return _serve_mounted(req, mf, policy, lru, headers, loadfile, cache_control)
     end
     _register_mount(ctx, router, segments, handler; bare = haskey(files, ""))
@@ -405,8 +426,8 @@ function spafiles(
         # router's own not-found rather than inventing a response.
         function (req::HTTP.Request)
             mf = _lookup_mount(table, req.target, nprefix)
-            mf === nothing && return notfound(req)
-            _is_mount_method(req.method) || return _mount_method_not_allowed()
+            mf === nothing && return _mount_miss(router, notfound, req)
+            _is_mount_method(req.method) || return _mount_method_not_allowed(router, req)
             return _serve_mounted(req, mf, policy, lru, headers, loadfile, cache_control)
         end
     else
@@ -427,8 +448,14 @@ function spafiles(
             # History mode answers a *navigation*, which is a GET (or HEAD). A POST to a client
             # route is not a request for the app shell, so it defers like any other mount rather
             # than being handed HTML with a 200.
+            #
+            # A GET miss still gets the shell even where an app route answers the path under
+            # another method (#284): `POST /login` beside a `/login` client route is an ordinary
+            # SPA, and a 405 there would break its navigation. Only the non-GET miss, which was
+            # a 404, becomes the router's 405.
             _is_mount_method(req.method) ||
-                return mf === nothing ? notfound(req) : _mount_method_not_allowed()
+                return mf === nothing ? _mount_miss(router, notfound, req) :
+                                        _mount_method_not_allowed(router, req)
             target = mf === nothing ? index_mf : mf
             return _serve_mounted(req, target, policy, lru, headers, loadfile, cache_control)
         end
@@ -484,10 +511,10 @@ function dynamicfiles(
 
     handler = function (req::HTTP.Request)
         mf = _lookup_mount(table, req.target, nprefix)
-        # A miss defers to the application's own not-found handler for EVERY method -- the mount
-        # does not claim a path it cannot serve (see `_register_mount`).
-        mf === nothing && return notfound(req)
-        _is_mount_method(req.method) || return _mount_method_not_allowed()
+        # A miss gets the router's own answer for EVERY method -- the mount does not claim a path
+        # it cannot serve (see `_register_mount` and `_mount_miss`).
+        mf === nothing && return _mount_miss(router, notfound, req)
+        _is_mount_method(req.method) || return _mount_method_not_allowed(router, req)
         return _serve_mounted(req, mf, policy, lru, headers, loadfile, cache_control)
     end
     _register_mount(ctx, router, segments, handler; bare = haskey(files, ""))

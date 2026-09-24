@@ -1403,6 +1403,111 @@ end
             resetstate()
         end
     end
+
+    @testset "a mount answers what the rest of the router does, not a 404 or a fixed Allow (#284)" begin
+        # A local `App` per case, so nothing here touches the global router.
+        send(app, m, t) = internalrequest(app, HTTP.Request(m, t))
+        allow(r) = HTTP.header(r, "Allow", nothing)
+        ok      = req -> Res.status(200)
+        created = req -> Res.status(201)
+        spa = mktempdir()
+        write(joinpath(spa, "index.html"), "SHELL")
+
+        # Under a ROOT mount the catch-all is `/**`, and HTTP.jl falls through to it whenever the
+        # exact node lacks the request's method. The mount found no file there and answered 404.
+        for mount! in (app -> staticfiles(app, root, ""),
+                       app -> dynamicfiles(app, root, ""),
+                       app -> spafiles(app, spa, ""))
+            app = App()
+            mount!(app)
+            urlpatterns(app, "",
+                path("/api/items", ok),
+                path("/api/items/<int:id>", (req, id::Int) -> Res.status(201); method = "DELETE"),
+            )
+            r = send(app, "PUT", "/api/items")
+            @test r.status == 405
+            @test allow(r) == "GET, HEAD"
+            # The same below a pattern-constrained variable, where `match` backs out of the
+            # `api/items` subtree before reaching the root's `**`.
+            r = send(app, "PUT", "/api/items/5")
+            @test r.status == 405
+            @test allow(r) == "DELETE"
+            # A path no route serves is still the app's 404, with no `Allow`.
+            r = send(app, "PUT", "/api/unrouted")
+            @test r.status == 404
+            @test allow(r) === nothing
+            @test send(app, "GET", "/api/items").status == 200
+            @test send(app, "DELETE", "/api/items/5").status == 201
+        end
+
+        # History mode keeps its GET: a client route may share its path with a POST endpoint, and
+        # a 405 there would break navigation to it. Only the non-GET miss changes.
+        app = App()
+        spafiles(app, spa, "")
+        urlpatterns(app, "", path("/login", created; method = "POST"))
+        @test bodystr(send(app, "GET", "/login")) == "SHELL"
+        @test send(app, "POST", "/login").status == 201
+        r = send(app, "PUT", "/login")
+        @test r.status == 405
+        @test allow(r) == "POST"
+        # Without history mode there is no shell to give, so the GET miss is the router's 405 too.
+        app = App()
+        staticfiles(app, root, "")
+        urlpatterns(app, "", path("/login", created; method = "POST"))
+        r = send(app, "GET", "/login")
+        @test r.status == 405
+        @test allow(r) == "POST"
+
+        # A non-root mount falls through the same way, for an app route under its prefix.
+        app = App()
+        staticfiles(app, root, "static")
+        urlpatterns(app, "", path("/static/api/ping", created; method = "POST"))
+        r = send(app, "PUT", "/static/api/ping")
+        @test r.status == 405
+        @test allow(r) == "POST"
+
+        # A mounted file's 405 lists the app routes at its path as well as GET and HEAD. This is
+        # the issue's repro: `Allow: GET, HEAD` left out the POST that answers 201.
+        app = App()
+        staticfiles(app, root, "static")
+        urlpatterns(app, "", path("/static/visible.txt", created; method = "POST"))
+        @test send(app, "GET",  "/static/visible.txt").status == 200
+        @test send(app, "POST", "/static/visible.txt").status == 201
+        r = send(app, "DELETE", "/static/visible.txt")
+        @test r.status == 405
+        @test allow(r) == "GET, HEAD, POST"
+
+        # ... but only the routes that actually answer there. `POST /static/visible.txt` resolves
+        # to the mount's catch-all before the variable route, so the mount refuses it and `Allow`
+        # must not claim otherwise. This is what skipping `"*"` leaves in `_allowed_methods` buys.
+        app = App()
+        staticfiles(app, root, "static")
+        urlpatterns(app, "", path("/<str:dir>/visible.txt", (req, dir::String) -> Res.status(201); method = "POST"))
+        r = send(app, "POST", "/static/visible.txt")
+        @test r.status == 405
+        @test allow(r) == "GET, HEAD"
+        @test send(app, "POST", "/other/visible.txt").status == 201
+        # And a miss under the mount does not advertise a shadowed route either: `POST
+        # /static/nope.txt` reaches the mount and 404s, so `GET` there is a 404, not a 405.
+        urlpatterns(app, "", path("/<str:dir>/nope.txt", (req, dir::String) -> Res.status(201); method = "POST"))
+        @test send(app, "POST", "/other/nope.txt").status == 201
+        @test send(app, "POST", "/static/nope.txt").status == 404
+        r = send(app, "GET", "/static/nope.txt")
+        @test r.status == 404
+        @test allow(r) === nothing
+
+        # Both answers go through the router's own `_405`, as the misses already went through its
+        # `_404`, so a custom one decides the response and still gets `Allow`.
+        app = App(service = Nitro.Core.Service(router = HTTP.Router(HTTP.Handlers.default404,
+            req -> HTTP.Response(418))))
+        staticfiles(app, root, "")
+        urlpatterns(app, "", path("/api/items", ok))
+        for target in ("/visible.txt", "/api/items")
+            r = send(app, "PUT", target)
+            @test r.status == 418
+            @test allow(r) == "GET, HEAD"
+        end
+    end
 end
 
 @testset "a streamed body is released even when it is never written (#41)" begin
