@@ -549,7 +549,12 @@ function get_cookie(
                 return final_default
             end
         elseif T <: Number
-            return parse(T, final_value)
+            parsed = parse(T, final_value)
+            # `parse(Float64, "nan")` succeeds, and `NaN > limit` and `NaN <= limit` are both
+            # false; a client-set cookie must not bring one in (#327). Same rule as the default
+            # for a value that does not parse.
+            parsed isa AbstractFloat && !isfinite(parsed) && return final_default
+            return parsed
         else
             return final_value
         end

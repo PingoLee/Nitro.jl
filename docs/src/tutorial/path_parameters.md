@@ -36,7 +36,9 @@ That means `/user/42` reaches `get_user` with `id == 42` and `typeof(id) == Int`
 
 The available converters are:
 - `<int:name>` (e.g., `123`)
-- `<float:name>` (e.g., `3.14`)
+- `<float:name>` (e.g., `3.14`) — finite only: `NaN`, `inf` and an overflowing `1e999` are a `400`,
+  here and for every other float a request binds, because `NaN > limit` and `NaN <= limit` are
+  both `false`
 - `<str:name>` (e.g., `"hello"`)
 - `<bool:name>` (e.g., `true`)
 - `<uuid:name>` (e.g., `550e8400-e29b-41d4-a716-446655440000`)

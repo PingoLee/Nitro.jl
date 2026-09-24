@@ -52,11 +52,13 @@ end
     end
 
 
-    @testset "json() Request stuct keyword with class_type" begin 
+    @testset "json() Request stuct keyword with class_type" begin
 
+        # #327: `json(req, T)` never binds NaN or Infinity from a REQUEST, so `allownan` is
+        # refused outright. It used to bind `power = NaN`. (The untyped form above and the
+        # Response forms below keep the keyword: they build no typed value from client input.)
         req = Request("GET","/", [],"""{"title": "viscount", "power": NaN}""")
-        myjson = json(req, rank, allownan = true)
-        @test isnan(myjson.power)
+        @test_throws ArgumentError json(req, rank, allownan = true)
 
         req = Request("GET","/", [],"""{"title": "viscount", "power": 9000.1}""")
         myjson = json(req, rank, allownan = false)
@@ -84,11 +86,15 @@ end
     end
 
 
-    @testset "json() Request with class_type" begin 
+    @testset "json() Request with class_type" begin
 
+        # #327: refused, as above; and without the keyword NaN is not JSON at all.
         req = Request("GET","/", [],"""{"title": "viscount", "power": NaN}""")
-        myjson = json(req, rank, allownan = true)
-        @test isnan(myjson.power)
+        @test_throws ArgumentError json(req, rank, allownan = true)
+        @test_throws ArgumentError json(req, rank)
+        # A number too large for a Float64 is not smuggled in as Inf.
+        req = Request("GET","/", [],"""{"title": "viscount", "power": 1e999}""")
+        @test_throws ArgumentError json(req, rank)
 
         req = Request("GET","/", [],"""{"title": "viscount", "power": 9000.1}""")
         myjson = json(req, rank)

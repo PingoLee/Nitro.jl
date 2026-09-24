@@ -175,7 +175,7 @@ Field binding rules:
 | Field type in `T`           | Bound from                                        |
 |-----------------------------|---------------------------------------------------|
 | `String`                    | single text field (matched by field name)         |
-| `Int`, `Float64`, `Bool`, … | single text field, parsed                          |
+| `Int`, `Float64`, `Bool`, … | single text field, parsed (a float must be finite) |
 | `Vector{String}`            | all text fields sent under that name              |
 | `FormFile`                  | single uploaded file                              |
 | `Vector{FormFile}`          | all uploaded files under that name                |

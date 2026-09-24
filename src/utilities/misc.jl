@@ -213,13 +213,28 @@ function parseparam(::Type{T}, str::String) where {T}
         # fails first and lands here. Unbounded, `JSON.parse` overflowed the stack on ~3 KB of
         # `[[[[…` in a query string (#254). `_parse_json_bounded` rejects anything nested past
         # `MAX_JSON_DEPTH` as malformed before the parser recurses (#314), so that is now an
-        # `ArgumentError` -> `ValidationError` -> 400 like any other bad value.
-        is_unrecoverable(e) && rethrow()
-        #
+        # `ArgumentError` -> `ValidationError` -> 400 like any other bad value. It parses with
         # Nitro's read style too: `str` is client input, and JSON.jl's default style interns the
         # strings it lifts into a `Symbol` or an enum field (#306).
+        is_unrecoverable(e) && rethrow()
         return _parse_json_bounded(str, T; style = BodyParsers.NITRO_READ_STYLE)
     end
+end
+
+"""
+Floats are the fallback above plus one rule: the value must be finite (#327).
+
+`parse(Float64, s)` accepts `"NaN"`, `"nan"`, `"inf"` and `"-Infinity"`, and turns `"1e999"`
+into `Inf`. None is a number a client can mean, and `NaN` defeats comparisons silently:
+`NaN > balance` and `NaN <= balance` are both `false`, so a check like "reject if amount >
+balance" lets it through. This one method covers every scalar path: `<float:x>`, typed query
+parameters, `Body{Float64}`, `Cookie{Float64}`, struct fields bound by `Query{T}`/`Form{T}`, and
+each member of a `Union`. The message is value-free, like every other parse failure here.
+"""
+function parseparam(::Type{T}, str::String) where {T <: AbstractFloat}
+    value = invoke(parseparam, Tuple{Type{T}, String} where {T}, T, str)
+    isfinite(value) || throw(ArgumentError("not a finite number"))
+    return value
 end
 
 """

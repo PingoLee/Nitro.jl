@@ -630,7 +630,7 @@ its file parts into a single typed struct `T`.
 | Field type                  | Source                                            |
 |-----------------------------|---------------------------------------------------|
 | `String`                    | single text field (by field name)                 |
-| `T <: Number`, `Bool`       | single text field, parsed                         |
+| `T <: Number`, `Bool`       | single text field, parsed; a float must be finite |
 | `Vector{String}`            | all text fields under that name                   |
 | `FormFile`                  | single uploaded file (by field name)              |
 | `Vector{FormFile}`          | all uploaded files under that name                |
@@ -727,6 +727,9 @@ function multipart_bind(field::String, ::Type{N}, parsed::AbstractDict) where {N
     raw = strip(multipart_text_value(field, parsed))
     result = tryparse(N, raw)
     isnothing(result) && throw(ValidationError("Field '$field' could not be parsed as $N"))
+    # `tryparse(Float64, "nan")` and `"1e999"` (→ Inf) succeed (#327).
+    result isa AbstractFloat && !isfinite(result) &&
+        throw(ValidationError("Field '$field' must be a finite number"))
     return result
 end
 

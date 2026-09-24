@@ -78,6 +78,16 @@ const _SYMBOL_REFUSED = "Nitro never builds a Symbol from request input (#306); 
 _SU.lift(::NitroReadStyle, ::Type{Symbol}, x) = throw(ArgumentError(_SYMBOL_REFUSED))
 _SU.liftkey(::NitroReadStyle, ::Type{Symbol}, x) = throw(ArgumentError(_SYMBOL_REFUSED))
 
+# A float field must receive a finite value (#327). JSON itself has no NaN or Infinity, but it has
+# no size limit either: JSON.jl reads `1e999`, or a 400-digit integer, as a `BigFloat`/`BigInt`,
+# and converting that to a `Float64` field is `Inf`. The `Union` bound also covers a
+# `Nullable{Float64}` field, which is lifted with its union type, not the float alone.
+function _SU.lift(st::NitroReadStyle, ::Type{T}, x::Real) where {T <: Union{AbstractFloat, Nothing, Missing}}
+    value, state = @invoke _SU.lift(st::_SU.StructStyle, T::Type, x::Any)
+    value isa AbstractFloat && !isfinite(value) && throw(ArgumentError("not a finite number"))
+    return value, state
+end
+
 """
     interns_client_strings(T) :: Bool
 
@@ -396,13 +406,19 @@ Throws `ArgumentError` when the body is not JSON, including a document nested de
 arrays/objects (#314).
 
 The body is client input, so it is always parsed with Nitro's read style, which never interns a
-client string as a `Symbol` (#306): an enum field binds by name or by integer. A `T` that would
-bind a `Symbol` anywhere (see `interns_client_strings`) is refused, and so is passing `style`;
-both are an `ArgumentError`.
+client string as a `Symbol` (#306): an enum field binds by name or by integer. A float field
+must receive a finite value (#327): `1e999`, which JSON.jl reads as a `BigFloat` and would
+convert to `Inf`, is rejected. A `T` that would bind a `Symbol` anywhere (see
+`interns_client_strings`) is refused, and so is passing `style` or `allownan = true`; all three
+are an `ArgumentError`.
 """
 function json(req::HTTP.Request, class_type::Type{T}; kwargs...) where {T}
     haskey(kwargs, :style) && throw(ArgumentError(
         "json(req, T) parses client input with Nitro's read style (#306); `style` cannot be overridden"))
+    # JSON.jl returns a `Float64` field straight from its number reader, without `lift`, so the
+    # style's finite check cannot see a NaN that `allownan` let through (#327).
+    get(kwargs, :allownan, false) === true && throw(ArgumentError(
+        "json(req, T) never binds NaN or Infinity from client input (#327); `allownan` is refused"))
     interns_client_strings(T) && throw(ArgumentError("json(req, $T): " * _SYMBOL_REFUSED))
     payload = _request_payload(req)
     if isnothing(payload)

@@ -339,3 +339,99 @@ end
     @test !interned(k)
 end
 end
+
+@testitem "non-finite floats are rejected (#327)" tags=[:core, :security] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+using Nitro: App, Query, Form, Json, JsonFragment, Body, Cookie, MultipartForm, Nullable
+
+# `parse(Float64, s)` accepts "NaN", "nan", "inf" and "-Infinity" and reads "1e999" as Inf; JSON
+# has no NaN but reads an oversized number as a BigFloat/BigInt, which converts to Inf. `NaN >
+# balance` and `NaN <= balance` are both false, so a "reject if amount > balance" check lets it
+# through. Every path a client float takes is covered here.
+@kwdef struct Amount
+    amount::Float64 = 0.0
+end
+struct JAmount
+    amount::Float64
+end
+struct J32
+    amount::Float32
+end
+struct JOpt
+    amount::Nullable{Float64}
+end
+struct MAmount
+    amount::Float64
+end
+
+app = App(mod = @__MODULE__)
+urlpatterns(app, "",
+    path("/conv/<float:amount>", (req, amount::Float64) -> string(amount)),
+    path("/scalar", (req, amount::Float64) -> string(amount)),
+    path("/query", (req, q::Query{Amount}) -> string(q.payload.amount)),
+    path("/form", (req, f::Form{Amount}) -> string(f.payload.amount); method = "POST"),
+    path("/json", (req, j::Json{JAmount}) -> string(j.payload.amount); method = "POST"),
+    path("/json32", (req, j::Json{J32}) -> string(j.payload.amount); method = "POST"),
+    path("/jsonopt", (req, j::Json{JOpt}) -> string(j.payload.amount); method = "POST"),
+    path("/jsonkw", (req, j::Json{Amount}) -> string(j.payload.amount); method = "POST"),
+    path("/fragment", (req, amount::JsonFragment{Amount}) -> string(amount.payload.amount); method = "POST"),
+    path("/body", (req, b::Body{Float64}) -> string(b.payload); method = "POST"),
+    path("/cookie", (req, amount::Cookie{Float64}) -> string(amount.value)),
+    path("/multipart", (req, m::MultipartForm{MAmount}) -> string(m.payload.amount); method = "POST"),
+)
+send(r) = internalrequest(app, r)
+get_(t; headers = Pair{String,String}[]) = send(HTTP.Request("GET", t, headers))
+post(t, ct, body) = send(HTTP.Request("POST", t, ["Content-Type" => ct], body))
+const JSON_T = "application/json"
+const FORM = "application/x-www-form-urlencoded"
+
+@testset "scalar, converter, query and form: $bad" for bad in ("NaN", "nan", "inf", "-Infinity", "1e999")
+    @test get_("/conv/$bad").status in (400, 404)   # the converter's regex may not even match
+    @test get_("/scalar?amount=$bad").status == 400
+    @test get_("/query?amount=$bad").status == 400
+    @test post("/form", FORM, "amount=$bad").status == 400
+    @test post("/body", "text/plain", bad).status == 400
+    @test post("/fragment", JSON_T, """{"amount":{"amount":"$bad"}}""").status == 400
+    # `Cookie{Float64}` answers a non-finite value like any other it cannot parse: a 400.
+    @test get_("/cookie"; headers = ["Cookie" => "amount=$bad"]).status == 400
+    # `get_cookie` with a numeric default reads it as absent, as it does an unparsable one.
+    req = HTTP.Request("GET", "/", ["Cookie" => "amount=$bad"])
+    @test Nitro.get_cookie(req, "amount", 1.0) === 1.0
+end
+
+@testset "typed JSON: an oversized number is not Inf" begin
+    for path in ("/json", "/jsonopt", "/jsonkw")
+        @test post(path, JSON_T, """{"amount":1e999}""").status == 400
+        @test post(path, JSON_T, """{"amount":-1e999}""").status == 400
+        @test post(path, JSON_T, """{"amount":$("9"^400)}""").status == 400
+    end
+    @test post("/json32", JSON_T, """{"amount":1e39}""").status == 400
+    # JsonFragment: the untyped parse keeps 1e999 a BigFloat; the field binder must not lower it to Inf.
+    @test post("/fragment", JSON_T, """{"amount":{"amount":1e999}}""").status == 400
+end
+
+@testset "multipart" begin
+    boundary = "----nitro327"
+    body(v) = "--$boundary\r\nContent-Disposition: form-data; name=\"amount\"\r\n\r\n$v\r\n--$boundary--\r\n"
+    ct = "multipart/form-data; boundary=$boundary"
+    @test post("/multipart", ct, body("inf")).status == 400
+    @test post("/multipart", ct, body("nan")).status == 400
+    @test post("/multipart", ct, body("2.5")).status == 200
+end
+
+@testset "finite values still bind everywhere" begin
+    @test Nitro.text(get_("/conv/3.14")) == "3.14"
+    @test Nitro.text(get_("/scalar?amount=-2.5")) == "-2.5"
+    @test Nitro.text(get_("/query?amount=1e10")) == "1.0e10"
+    @test Nitro.text(post("/form", FORM, "amount=0.5")) == "0.5"
+    @test Nitro.text(post("/json", JSON_T, """{"amount":1.5}""")) == "1.5"
+    @test Nitro.text(post("/json32", JSON_T, """{"amount":1.5}""")) == "1.5"
+    @test Nitro.text(post("/jsonopt", JSON_T, """{"amount":null}""")) == "nothing"
+    @test Nitro.text(post("/jsonkw", JSON_T, "{}")) == "0.0"
+    @test Nitro.text(post("/fragment", JSON_T, """{"amount":{"amount":7}}""")) == "7.0"
+    @test Nitro.text(post("/body", "text/plain", "4.25")) == "4.25"
+    @test Nitro.text(get_("/cookie"; headers = ["Cookie" => "amount=1.25"])) == "1.25"
+end
+end
