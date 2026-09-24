@@ -106,6 +106,14 @@ Route registration refuses such a parameter, and `json(req, T)` refuses such a `
 """
 interns_client_strings(@nospecialize(T)) :: Bool = _interns(T, Base.IdSet{Any}())
 
+# `json(req, T)` asks once per request, and the walk allocates and costs tens of microseconds --
+# more than parsing a small body. The answer depends only on `T`, so it is cached per type. Under
+# a lock: requests run on many threads, and an `IdDict` is not safe to read while another writes.
+const _INTERNS_CACHE = IdDict{Any, Bool}()
+const _INTERNS_LOCK = ReentrantLock()
+interns_client_strings_cached(@nospecialize(T)) :: Bool =
+    lock(() -> get!(() -> interns_client_strings(T), _INTERNS_CACHE, T), _INTERNS_LOCK)
+
 function _interns(@nospecialize(T), seen::Base.IdSet{Any}) :: Bool
     T === Symbol && return true
     T === Any && return false
@@ -498,7 +506,7 @@ function json(req::HTTP.Request, class_type::Type{T}; kwargs...) where {T}
     # style's finite check cannot see a NaN that `allownan` let through (#327).
     get(kwargs, :allownan, false) != false && throw(ArgumentError(
         "json(req, T) never binds NaN or Infinity from client input (#327); `allownan` is refused"))
-    interns_client_strings(T) && throw(ArgumentError("json(req, $T): " * _SYMBOL_REFUSED))
+    interns_client_strings_cached(T) && throw(ArgumentError("json(req, $T): " * _SYMBOL_REFUSED))
     payload = _request_payload(req)
     if isnothing(payload)
         return nothing

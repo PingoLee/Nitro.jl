@@ -475,6 +475,9 @@ function struct_builder(::Type{T}, source::AbstractDict) :: T where {T}
             throw(ValidationError("Missing required field '$name'"))
         end
     end
+    # A `NamedTuple` is built from a tuple of its values, not positionally (`T(args...)` has no
+    # method for it); `Query{@NamedTuple{a::Int, b::String}}` bound this way before #306.
+    T <: NamedTuple && return T(Tuple(args))
     return T(args...)
 end
 

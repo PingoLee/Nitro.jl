@@ -488,3 +488,35 @@ claims = "{" * join(("\"c$i\":$i" for i in 1:1500), ",") * "}"
 segment = Nitro.Auth._base64url_encode(Vector{UInt8}(claims))
 @test length(Nitro.Auth._jwt_segment_json(segment)) == 1500
 end
+
+@testitem "review follow-ups: NamedTuple targets and the cached type walk (#306)" tags=[:core] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+using Nitro: App, Query, Form
+using Nitro.Core.Util.BodyParsers: interns_client_strings_cached, _INTERNS_CACHE
+
+# StructTypes built a NamedTuple target; the field-driven binder's positional `T(args...)` has
+# no method for one, so `Query{@NamedTuple{...}}` answered 400 until this.
+const NT = @NamedTuple{a::Int, b::String}
+app = App(mod = @__MODULE__)
+urlpatterns(app, "",
+    path("/q", (req, q::Query{NT}) -> string(q.payload)),
+    path("/f", (req, f::Form{NT}) -> string(f.payload); method = "POST"),
+)
+r = internalrequest(app, HTTP.Request("GET", "/q?a=1&b=x"))
+@test r.status == 200
+@test Nitro.text(r) == string((a = 1, b = "x"))
+r = internalrequest(app, HTTP.Request("POST", "/f", ["Content-Type" => "application/x-www-form-urlencoded"], "a=2&b=y"))
+@test r.status == 200
+@test Nitro.text(r) == string((a = 2, b = "y"))
+
+# `json(req, T)` walks `T` once, not on every call.
+struct Walked
+    a::Vector{Dict{String, Int}}
+end
+@test interns_client_strings_cached(Walked) === false
+@test haskey(_INTERNS_CACHE, Walked)
+@test interns_client_strings_cached(Walked) === false
+@test (@allocated interns_client_strings_cached(Walked)) < 256
+end
