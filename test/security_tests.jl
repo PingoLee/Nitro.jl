@@ -142,6 +142,41 @@ end
         end
     end
 end
+
+# #320 (the #132 class): HTTP.jl rejects C0 bytes in the request line, but a C1 control (`\u9b`
+# is a terminal CSI), a raw non-UTF-8 byte, and the Unicode line/bidi characters all reached the
+# console line unescaped -- a terminal may act on the first, log UIs render the last as a forged
+# line break or reversed text. A raw `"` could close the quoted request field. Every one must
+# arrive as a visible escape, on the default path AND on the verbatim `log_query=true` path.
+@testset "console line escapes control, bidi and non-UTF-8 bytes in the target" begin
+    hostile = Dict(
+        "C1 CSI"          => "/a" * Char(0x9b) * "31mRED",
+        "raw 0x9b byte"   => String(UInt8[0x2f, 0x61, 0x9b, 0x62]),
+        "LINE SEPARATOR"  => "/a" * Char(0x2028) * "FORGED 200",
+        "RLO bidi"        => "/a" * Char(0x202e) * "gnp.exe",
+        "double quote"    => "/a\" 200 FORGED",
+    )
+    raw_char(c) = Char(c)
+    for (label, path) in hostile, mw in (Nitro.Core.AccessLogMiddleware(),
+                                          Nitro.Core.AccessLogMiddleware(log_query=true))
+        for target in (path, path * "?q=" * path)
+            logs = run_once(mw, HTTP.Request("GET", target))
+            @test length(logs) == 1
+            msg = logs[1].message
+            @test isvalid(msg)
+            @test !occursin(raw_char(0x9b), msg)
+            @test !occursin(raw_char(0x2028), msg)
+            @test !occursin(raw_char(0x202e), msg)
+            # Exactly the two quotes the line format puts around the request field; any quote
+            # the client sent arrives escaped as `\"`.
+            @test count(r"(?<!\\)\"", msg) == 2
+        end
+    end
+
+    # Printable non-ASCII and percent-escapes are not hostile, and stay readable.
+    logs = run_once(Nitro.Core.AccessLogMiddleware(), HTTP.Request("GET", "/café/a%20b"))
+    @test occursin("/café/a%20b", logs[1].message)
+end
 end
 
 @testitem "Security: SecretString redaction" tags=[:security, :core] setup=[NitroCommon] begin

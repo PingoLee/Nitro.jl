@@ -24,10 +24,54 @@ end
     rec = records[1]
     @test rec.method == "POST"
     @test rec.path == "/api/things"
-    @test rec.query == "limit=5"
+    @test rec.query === nothing              # redacted by default (#320)
     @test rec.status == 201
     @test rec.duration_ms >= 0
     @test rec.context[:user] == "u1"
+end
+
+# #320: the record used to carry the raw query and a prefix-sliced path, so a sink persisting
+# it stored reset tokens and absolute-form credentials. The console log had redacted both since
+# #39; the record now gets the same reduction, and the query only on opt-in.
+@testset "records redact the query and URL credentials by default" begin
+    records, sink = collecting_sink()
+    lf = AccessLog(sink; batch = 10)
+    handler = lf.middleware(req -> Response(200, "ok"))
+
+    startup(lf)
+    handler(Request("GET", "/reset?token=S3CRET-RESET-TOKEN"))
+    handler(Request("GET", "http://alice:pa55w0rd@h.example/x?code=S3CRET-CODE"))
+    handler(Request("GET", "//bob:pa55w0rd@evil.example/y?k=S3CRET"))
+    handler(Request("GET", "/frag#part?k=S3CRET"))
+    shutdown(lf)
+
+    @test [r.path for r in records] == ["/reset", "/x", "/y", "/frag"]
+    for r in records
+        @test r.query === nothing
+        fields = string(r.path, r.query, r.user_agent, r.ip)
+        @test !occursin("S3CRET", fields)
+        @test !occursin("pa55w0rd", fields)
+        @test !occursin("example", fields)
+    end
+end
+
+@testset "log_query=true opts back into the raw query, never the credentials" begin
+    records, sink = collecting_sink()
+    lf = AccessLog(sink; batch = 10, log_query = true)
+    handler = lf.middleware(req -> Response(200, "ok"))
+
+    startup(lf)
+    handler(Request("POST", "/api/things?limit=5"))
+    handler(Request("GET", "http://alice:pa55w0rd@h.example/x?code=abc"))
+    handler(Request("GET", "/q?a=1#frag"))          # the fragment is not part of the query
+    handler(Request("GET", "/f#frag?a=1"))          # a '?' inside a fragment is no query
+    handler(Request("GET", "/empty?"))              # an empty query is `nothing`, not ""
+    handler(Request("GET", "/none"))
+    shutdown(lf)
+
+    @test [r.query for r in records] == ["limit=5", "code=abc", "a=1", nothing, nothing, nothing]
+    @test records[2].path == "/x"                   # opting into the query keeps the path reduced
+    @test !occursin("pa55w0rd", string(records[2].path, records[2].query))
 end
 
 @testset "no query string → query is nothing" begin
