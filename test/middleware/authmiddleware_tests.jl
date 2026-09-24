@@ -210,8 +210,10 @@ end
 # catch block, so `throw(StackOverflowError())` exercises the identical branch, while a real
 # stack overflow would leave the ReTestItems worker in the state Julia itself describes as
 # "possibly corrupted" — poisoning every item scheduled after it in that process. The
-# end-to-end path (a real `[[[[…` bearer token through `jwt_validator`) is verified outside
-# the suite, in a disposable process; see the PR.
+# end-to-end path — a real `[[[[…` bearer token or cookie through `jwt_validator` — runs in
+# disposable child processes: the AUTH* steps of the deeply-nested-request testitem in
+# test/bodyparser_tests.jl. Since #314 that token is an ordinary 401: `decode_jwt` caps the
+# header segment, bounds JSON depth, and decodes the claims only after the signature.
 @testitem "Auth middleware — unrecoverable errors are not swallowed (#254)" tags=[:middleware, :auth] setup=[NitroCommon] begin
 using HTTP
 using Nitro
@@ -267,6 +269,35 @@ end
     @test req.context[:user] == Dict(:id => 1)
 end
 
+end
+
+# ── #314 ────────────────────────────────────────────────────────────────────────────────────
+#
+# The header cap through both auth middlewares and the stock `jwt_validator`. The oversized
+# token is GENUINELY signed and only ~1 KB, far too shallow to overflow anything: what rejects
+# it is the cap alone, and the pre-#314 decoder accepted it. Direct closure calls, no socket.
+@testitem "Auth middleware — an oversized JWT header is a 401 (#314)" tags=[:middleware, :auth, :security] setup=[NitroCommon] begin
+using HTTP, JSON
+using Nitro
+
+key = "k"^32
+raw64(str) = Nitro.Auth._base64url_encode(Vector{UInt8}(codeunits(str)))
+sign(input) = string(input, ".", Nitro.Auth._base64url_encode(Nitro.Auth._hmac_sha256(key, input)))
+claims = raw64(JSON.json(Dict("sub" => "1", "iat" => trunc(Int, time()), "exp" => trunc(Int, time()) + 60)))
+oversized = sign(string(raw64(JSON.json(Dict("alg" => "HS256", "typ" => "JWT", "x" => "a"^800))), ".", claims))
+control = Nitro.Auth.encode_jwt(Dict("sub" => "1"), key; expires_in = 60)
+@test ncodeunits(first(split(oversized, '.'))) > 1024
+
+ok(req) = HTTP.Response(200, "ok")
+bearer = BearerAuth(Nitro.Auth.jwt_validator(key))(ok)
+cookie = CookieAuthMiddleware(Nitro.Auth.jwt_validator(key))(ok)
+via_bearer(tok) = bearer(HTTP.Request("GET", "/", ["Authorization" => "Bearer " * tok])).status
+via_cookie(tok) = cookie(HTTP.Request("GET", "/", ["Cookie" => "auth_token=" * tok])).status
+
+@test via_bearer(control) == 200
+@test via_cookie(control) == 200
+@test via_bearer(oversized) == 401
+@test via_cookie(oversized) == 401
 end
 
 # ── #310 ────────────────────────────────────────────────────────────────────────────────────

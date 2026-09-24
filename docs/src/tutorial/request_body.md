@@ -165,6 +165,23 @@ itself: do not log it, do not put it in a response, do not paste it into a bug r
     The masking covers display and JSON, not reflection. `err.cause`, `dump`, and serializers other
     than JSON still reach the wrapped exception.
 
+### Nesting depth
+
+JSON nested deeper than **512** arrays or objects is treated as malformed JSON, and rejected
+before it is parsed. The parser recurses once per level, so without that bound a few kilobytes of
+`[[[[…` would exhaust the stack of the task serving the request. The limit is fixed, and real
+payloads sit far below it.
+
+Every path gives a too-deep document the same answer it gives any other malformed one:
+
+| Path | Too-deep JSON |
+|---|---|
+| `getjson(req)`, `json(req)` | `nothing` |
+| `json(req, T)` | throws `ArgumentError` |
+| `Json{T}`, `JsonFragment{T}`, and `Body{T}` for a `T` bound from JSON (not `Body{String}`) | `400 Bad Request` |
+| a path or query parameter parsed as JSON | `400 Bad Request` |
+| a JWT segment in `BearerAuth` / `CookieAuthMiddleware` | `401` |
+
 ---
 
 ## API Reference

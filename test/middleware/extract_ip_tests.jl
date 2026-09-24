@@ -1,7 +1,8 @@
 @testitem "Extract IP" tags=[:middleware] setup=[NitroCommon] begin
 using HTTP
 using Sockets
-using Nitro: setip!, getip, getpeerip, ExtractIP
+using Dates
+using Nitro: setip!, getip, getpeerip, ExtractIP, RateLimiter
 using Nitro.Middleware: extract_ip
 
 # Helper function to create a request with specific headers and context IP
@@ -283,6 +284,87 @@ end
     @test !haskey(bare.context, :ip)
 end
 
+@testset "Regression #330: a second extractor cannot rewrite the socket peer" begin
+    seen = Ref{Union{HTTP.Request, Nothing}}(nothing)
+    handler = req -> (seen[] = req; HTTP.Response(200))
+    FORWARDED = IPv4("6.6.6.6")
+    trusted() = ExtractIP(forwarded_header = :x_forwarded_for, trusted_proxies = ["127.0.0.0/8"])
+    proxied() = create_request(["X-Forwarded-For" => "$FORWARDED"], PROXY)
+
+    # THE BUG: the second extractor read `getip` -- by then the forwarded address -- and
+    # recorded it as the socket peer, so a client-chosen value reached `getpeerip`.
+    trusted()(ExtractIP()(handler))(proxied())
+    @test getip(seen[]) == FORWARDED
+    @test getpeerip(seen[]) == PROXY
+
+    # Two identical trusted extractors: the second judges the client the first resolved, does
+    # not trust it, and leaves it alone.
+    trusted()(trusted()(handler))(proxied())
+    @test getip(seen[]) == FORWARDED
+    @test getpeerip(seen[]) == PROXY
+
+    # Reversed: a no-trust extractor first changes nothing the trusted one relies on.
+    ExtractIP()(trusted()(handler))(proxied())
+    @test getip(seen[]) == FORWARDED
+    @test getpeerip(seen[]) == PROXY
+
+    # The shape the issue reports: a global ExtractIP plus a RateLimiter at its default
+    # `auto_extract_ip = true`, which builds an extractor of its own with no trust configured.
+    # The limiter must key on the resolved client, and the peer must stay the proxy.
+    limiter = RateLimiter(rate_limit = 100, window = Minute(1)).middleware
+    trusted()(limiter(handler))(proxied())
+    @test getip(seen[]) == FORWARDED
+    @test getpeerip(seen[]) == PROXY
+
+    # A client talking to the server directly is unaffected by the stacking: both addresses
+    # stay the socket peer, whatever it sends.
+    trusted()(ExtractIP()(handler))(create_request(["X-Forwarded-For" => "$SPOOF"], CLIENT))
+    @test getip(seen[]) == CLIENT
+    @test getpeerip(seen[]) == CLIENT
+
+    # Mismatched trust lists: a global extractor trusting a k8s ingress CIDR, and a limiter
+    # whose own `trusted_proxies` names only loopback. The limiter does not trust the client
+    # the global one resolved, so it keeps it -- judging the socket peer instead would reset
+    # `getip` to the ingress and put every client in one bucket.
+    INGRESS = IPv4("10.244.1.1")
+    k8s = ExtractIP(forwarded_header = :x_forwarded_for, trusted_proxies = ["10.244.0.0/16"])
+    local_limiter = RateLimiter(rate_limit = 100, window = Minute(1),
+                                forwarded_header = :x_forwarded_for,
+                                trusted_proxies = [ip"127.0.0.1"]).middleware
+    k8s(local_limiter(handler))(create_request(["X-Forwarded-For" => "$CLIENT"], INGRESS))
+    @test getip(seen[]) == CLIENT
+    @test getpeerip(seen[]) == INGRESS
+
+    # Two tiers with different headers chain: nginx on loopback writes X-Real-IP with the CDN
+    # edge it saw, and the CDN writes CF-Connecting-IP. The second extractor believes its header
+    # only because the first established a CDN address as the hop.
+    EDGE = IPv4("173.245.48.5")
+    nginx_tier = ExtractIP(forwarded_header = :x_real_ip, trusted_proxies = [PROXY])
+    cdn_tier   = ExtractIP(forwarded_header = :cf_connecting_ip, trusted_proxies = ["173.245.48.0/20"])
+    tiers(req) = nginx_tier(cdn_tier(handler))(req)
+    tiers(create_request(["X-Real-IP" => "$EDGE", "CF-Connecting-IP" => "$CLIENT"], PROXY))
+    @test getip(seen[]) == CLIENT
+    @test getpeerip(seen[]) == PROXY
+    # The same headers from a client outside both tiers' ranges, connecting directly, are
+    # believed by neither tier.
+    tiers(create_request(["X-Real-IP" => "$EDGE", "CF-Connecting-IP" => "$SPOOF"], CLIENT))
+    @test getip(seen[]) == CLIENT
+    @test getpeerip(seen[]) == CLIENT
+    # What the docstring warns about: a direct connection FROM the CDN's own ranges is believed
+    # by the CDN tier, because the chain has nothing better than the socket peer to judge. Only
+    # network placement (nginx the sole way in) keeps this out. Pinned so the docs and the code
+    # cannot drift apart.
+    tiers(create_request(["CF-Connecting-IP" => "$SPOOF"], EDGE))
+    @test getip(seen[]) == SPOOF
+    @test getpeerip(seen[]) == EDGE
+
+    # The bare resolver chains the same way: with no trust configured it answers `getip` as the
+    # chain left it.
+    trusted()(handler)(proxied())
+    @test extract_ip(seen[]) == FORWARDED
+    @test xff(seen[]) == FORWARDED
+end
+
 @testset "Misconfiguration is rejected at construction" begin
     # trust_forwarded trusted headers from any peer and guessed the header — removed outright.
     @test_throws ArgumentError ExtractIP(trust_forwarded = true)
@@ -328,4 +410,35 @@ end
                     trusted_proxies = [PROXY, "10.244.0.0/16"]) isa Function
 end
 
+end
+
+@testitem "internalrequest keeps a caller's client IP (#330)" tags=[:core, :middleware] setup=[NitroCommon] begin
+using HTTP
+using Sockets
+using Nitro: setip!, getip
+
+app = App(mod = @__MODULE__)
+stamp = handle -> req -> Nitro.Core.Util.add_response_headers(handle(req), "X-Route-Middleware" => "ran")
+urlpatterns(app, "",
+    path("/ip", req -> string(getip(req))),
+    path("/guarded", req -> "ok"; middleware = [stamp]),
+)
+
+# A request with no address is an in-process call, so it is loopback, as before.
+@test text(internalrequest(app, HTTP.Request("GET", "/ip"))) == "127.0.0.1"
+
+# THE BUG: an address the caller already set was replaced with loopback, which every
+# loopback-trusting check accepts.
+req = HTTP.Request("GET", "/ip")
+setip!(req, IPv4("203.0.113.7"))
+@test text(internalrequest(app, req)) == "203.0.113.7"
+
+# An explicit `nothing` is no address: it still becomes loopback.
+blank = HTTP.Request("GET", "/ip")
+blank.context[:ip] = nothing
+@test text(internalrequest(app, blank)) == "127.0.0.1"
+
+# What the docstring promises: route middleware still runs on an internal request.
+res = internalrequest(app, HTTP.Request("GET", "/guarded"))
+@test HTTP.header(res, "X-Route-Middleware") == "ran"
 end

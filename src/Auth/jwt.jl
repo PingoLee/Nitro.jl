@@ -37,6 +37,12 @@ end
 
 const _JWT_SECRET_TYPES = "a string, a JWTKeyset, or a Dict of kid => secret"
 
+# The encoded JOSE header segment `_decode_jwt` accepts, in bytes. Nitro's own header --
+# `{"alg":"HS256","typ":"JWT","kid":…}` -- is well under 100 bytes; 1 KB leaves room for a
+# long `kid` and for another issuer's extra members while bounding what an unsigned token
+# can make the server decode and parse (#314). `encode_jwt` refuses to mint past it.
+const _JWT_MAX_HEADER_SEGMENT_BYTES = 1024
+
 """
     _verify_candidates(secret_or_keyset, header_kid) -> Vector{Tuple{Nullable{String}, String}}
 
@@ -121,8 +127,13 @@ function encode_jwt(payload::AbstractDict, secret_or_keyset; expires_in::Union{I
         header["kid"] = signing_kid
     end
 
+    encoded_header = _base64url_encode(Vector{UInt8}(codeunits(JSON.json(header))))
+    # Only a keyset's `kid` can grow the header, and a token `_decode_jwt` would refuse is
+    # not one to issue (#314). The kid is not echoed: it names a key.
+    ncodeunits(encoded_header) <= _JWT_MAX_HEADER_SEGMENT_BYTES || throw(ArgumentError(
+        "JWT header would exceed $_JWT_MAX_HEADER_SEGMENT_BYTES bytes encoded; use a shorter kid"))
     signing_input = string(
-        _base64url_encode(Vector{UInt8}(codeunits(JSON.json(header)))), ".",
+        encoded_header, ".",
         _base64url_encode(Vector{UInt8}(codeunits(JSON.json(claims))))
     )
     signature = _base64url_encode(_hmac_sha256(secret, signing_input))
@@ -144,51 +155,24 @@ function _decode_jwt(token::AbstractString, secret_or_keyset; issuer=nothing, au
     segments = split(String(token), '.')
     length(segments) == 3 || throw(AuthError("Invalid JWT format"))
 
-    # Every byte past the segment count is attacker-supplied, and BOTH decoders are sinks:
-    # `base64decode` throws ArgumentError on a bad alphabet or a length that cannot be
-    # padded, and `JSON.parse` throws ArgumentError on anything that is not JSON. Guarding
-    # only the parsed VALUE would leave the class half closed -- and length-dependently so,
-    # which is what makes a partial fix read as complete: a 4-char garbage signature decodes
-    # to bytes and lands on a clean AuthError, while a 1-char one does not.
+    # The order below is RFC 7519 §7.2's: the JOSE header is decoded and checked (steps
+    # 3-5), the JWS is validated (step 7), and only THEN is the claims set decoded (steps
+    # 9-10). It used to parse both segments up front, which put the claims parser -- a
+    # recursive-descent `JSON.parse` -- in front of anyone who could send a header, signed
+    # or not (#314). Now an unsigned token reaches exactly one JSON parse, of a header
+    # capped at `_JWT_MAX_HEADER_SEGMENT_BYTES`, and even that one is depth-bounded.
     #
-    # The claims segment parses into a CONCRETE container (#274). Untyped, `JSON.parse`
-    # infers `Any` and the object check below narrows it only to `AbstractDict`, so every
-    # per-request consumer -- `validate_claims`, `_claim_value`, `Principal` -- dispatched
-    # dynamically (nitro-core §7). `Dict{String, Any}` is also what `Principal` stores, so
-    # the validator no longer copies the claims once per request either. The VALUES stay
-    # `Any`: a claim is whatever the token's author typed. The header stays untyped -- it is
-    # read for `alg` and `kid` and never passed on.
-    header, claims = try
-        (JSON.parse(String(_base64url_decode(segments[1]))),
-         JSON.parse(String(_base64url_decode(segments[2])); dicttype = Dict{String, Any}))
-    catch e
-        # Catch the ONE type this guard exists for, and let everything else through. An
-        # allow-list is not stylistic here: `JSON.parse` on a deeply-nested segment raises
-        # `StackOverflowError`, which Julia itself reports as "program state may be
-        # corrupted, so further execution might be unreliable" -- and a base64url header of
-        # `[[[[...` reaches it from a bearer token at a depth well inside any header limit.
-        # A broad catch turned that into a routine 401 and carried on. `OutOfMemoryError`
-        # and `InterruptException` are the same class; so is a `MethodError` introduced by
-        # a later edit inside this block. Naming the exceptions to rethrow means keeping
-        # that list correct forever; naming the one to catch cannot rot.
-        #
-        # This also makes an `AuthError` rethrow unnecessary by construction rather than by
-        # inspection: `AuthError <: Exception`, not `<: ArgumentError`, so it is not caught.
-        e isa ArgumentError || rethrow()
-        throw(AuthError("Invalid JWT encoding"))
-    end
+    # The cap holds on the `verify=false` path too. That path promises to parse whatever
+    # `alg` says, not whatever size the header is; an HS256 header is under 100 bytes.
+    ncodeunits(segments[1]) <= _JWT_MAX_HEADER_SEGMENT_BYTES ||
+        throw(AuthError("Invalid JWT header: longer than $_JWT_MAX_HEADER_SEGMENT_BYTES bytes"))
+    header = _jwt_segment_json(segments[1])
 
-    # Decoding succeeding does not make either segment an object. A header of `[]` (`W10`)
-    # makes `get(::Vector{Any}, "alg", nothing)` a MethodError; a non-object claims segment
-    # makes `validate_claims(::AbstractDict)` one. None of this is an authz hole -- auth
-    # middleware renders these as 401 -- but a direct `decode_jwt` caller was getting
-    # exceptions the API does not document. (It used to render ANY throw as 401; since #254
-    # the three in `is_unrecoverable` propagate instead. Every type on this path is an
-    # `AuthError` or a `MethodError`, so none of them is affected.)
+    # Decoding succeeding does not make the segment an object. A header of `[]` (`W10`)
+    # makes `get(::Vector{Any}, "alg", nothing)` a MethodError. None of this is an authz
+    # hole -- auth middleware renders it as 401 -- but a direct `decode_jwt` caller was
+    # getting exceptions the API does not document.
     header isa AbstractDict || throw(AuthError("Invalid JWT header"))
-    # Checking the concrete type is what narrows the slot: `_decode_jwt` then infers
-    # `Tuple{Dict{String, Any}, Nullable{String}}`.
-    claims isa Dict{String, Any} || throw(AuthError("Invalid JWT claims"))
 
     # Same class, one level down: a JSON `kid` is whatever the token's author typed --
     # `123`, `["a"]`, `null`. Anything but a string is a MethodError on
@@ -262,6 +246,47 @@ function _decode_jwt(token::AbstractString, secret_or_keyset; issuer=nothing, au
         kid = matched_kid
     end
 
+    # The claims set, decoded only now that the signature has verified (or the caller asked
+    # for `verify=false`). It parses into a CONCRETE container (#274): untyped, `JSON.parse`
+    # infers `Any` and an `AbstractDict` check narrows it no further, so every per-request
+    # consumer -- `validate_claims`, `_claim_value`, `Principal` -- dispatched dynamically
+    # (nitro-core §7). `Dict{String, Any}` is also what `Principal` stores, so the validator
+    # does not copy the claims per request either. The VALUES stay `Any`: a claim is
+    # whatever the token's author typed.
+    claims = _jwt_segment_json(segments[2]; dicttype = Dict{String, Any})
+    # Checking the concrete type is what narrows the slot -- assigned exactly once, so
+    # `_decode_jwt` infers `Tuple{Dict{String, Any}, Nullable{String}}`.
+    claims isa Dict{String, Any} || throw(AuthError("Invalid JWT claims"))
+
     validate_claims(claims; exp_timeout=exp_timeout, iat_skew=iat_skew, issuer=issuer, audience=audience, require_exp=require_exp, required_claims=required_claims)
     return (claims, kid)
+end
+
+"""
+    _jwt_segment_json(segment; kwargs...)
+
+Base64url-decode one JWT segment and parse it as JSON through `_parse_json_bounded`, so its
+nesting is bounded before the parser recurses (#314). Either decoder failing is
+`AuthError("Invalid JWT encoding")`.
+"""
+function _jwt_segment_json(segment::AbstractString; kwargs...)
+    try
+        return _parse_json_bounded(String(_base64url_decode(segment)); kwargs...)
+    catch e
+        # Every byte of the segment is attacker-supplied, and BOTH decoders are sinks:
+        # `base64decode` throws ArgumentError on a bad alphabet or a length that cannot be
+        # padded, and `JSON.parse` -- or the depth bound in front of it -- throws
+        # ArgumentError on anything that is not acceptable JSON. Guarding only the parsed
+        # VALUE would leave the class half closed.
+        #
+        # Catch the ONE type this guard exists for, and let everything else through. An
+        # allow-list is not stylistic: `StackOverflowError`, `OutOfMemoryError` and
+        # `InterruptException` are not "a bad token" (#254), and neither is a `MethodError`
+        # introduced by a later edit inside this block. Naming the exceptions to rethrow
+        # means keeping that list correct forever; naming the one to catch cannot rot. It
+        # also makes an `AuthError` rethrow unnecessary by construction: `AuthError <:
+        # Exception`, not `<: ArgumentError`, so it is not caught.
+        e isa ArgumentError || rethrow()
+        throw(AuthError("Invalid JWT encoding"))
+    end
 end

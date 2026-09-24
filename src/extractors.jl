@@ -6,7 +6,8 @@ using HTTP
 using Dates
 
 using ..Util: text, json, formdata, multipart, parseparam, FormFile
-using ..Util.BodyParsers: NITRO_READ_STYLE, is_json_media_type, is_multipart_form_media_type
+using ..Util.BodyParsers: NITRO_READ_STYLE, _parse_json_bounded, is_json_media_type,
+    is_multipart_form_media_type
 using ..Reflection: struct_builder, extract_struct_info, kw_construct
 using ..Errors: ValidationError, UnsupportedMediaTypeError, is_unrecoverable
 # The Core stub `getjson` binds to (its body is in core/request.jl, included later).
@@ -122,7 +123,8 @@ Header
     Json{T}
 
 Extractor that parses the whole request body as JSON into `T`. This is the recommended way to
-take a JSON body: typed, validated, and a malformed body is a 400.
+take a JSON body: typed, validated, and a malformed body is a 400 -- including one nested deeper
+than 512 arrays/objects, which is rejected before parsing (#314).
 
 ```julia
 @kwdef struct Search; q::String; limit::Int = 20; end
@@ -293,14 +295,16 @@ function safe_extract(f::Function, param::Param{U}) :: T where {T, U <: Extracto
         # ever sees it.
         #
         # Widened from `InterruptException` alone in #254, and this site is the reason that
-        # issue's fix is not confined to the parsers. `Json{T}`/`JsonFragment{T}`/`Body{T}`
-        # resolve through `Types.jsonbody` -> `BodyParsers.json`, which now rethrows a
-        # `StackOverflowError` from a deeply-nested body instead of answering `nothing`. If
-        # this guard still named only `InterruptException`, that rethrow would be caught one
-        # frame later and laundered into a `ValidationError` -- so every extractor-based
-        # route, the most idiomatic shape in the framework, would still answer 400 for a
-        # corrupted worker while a bare `getjson` handler answered 500. Same input, two
-        # verdicts, and the narrowing a no-op exactly where routes actually are.
+        # issue's fix is not confined to the parsers. If this guard named only
+        # `InterruptException`, a `StackOverflowError` or `OutOfMemoryError` raised while
+        # binding would be caught here and laundered into a `ValidationError` -- so every
+        # extractor-based route, the most idiomatic shape in the framework, would answer 400
+        # for a corrupted worker while a bare `getjson` handler answered 500.
+        #
+        # A deeply-nested body no longer overflows on the way here: every JSON parse behind
+        # `Json{T}`/`JsonFragment{T}`/`Body{T}` is depth-bounded (#314) and answers an
+        # ordinary `ArgumentError`, which becomes the 400 below. This line is the backstop
+        # for what the bound does not cover.
         #
         # A further wrap site must copy this line too.
         is_unrecoverable(e) && rethrow()
@@ -360,12 +364,14 @@ A struct that already speaks StructUtils -- field tags or defaults, as `StructUt
 `@tags` and `@defaults` declare -- is left to `JSON.parse` whole: JSON.jl honors those itself, and
 the per-field path would drop the tags, so a renamed key would silently bind the field's default.
 
-Every parse uses Nitro's read style, which never interns a client string as a `Symbol` (#306):
-JSON.jl's default style did so for every enum field, valid name or not.
+Both parses go through `_parse_json_bounded`, so a body nested deeper than 512 is an
+`ArgumentError` -- a 400 via `safe_extract` -- before `JSON.parse` recurses into it (#314). And
+both use Nitro's read style, which never interns a client string as a `Symbol` (#306): JSON.jl's
+default style did so for every enum field, valid name or not.
 """
 function json_bind(::Type{T}, text::AbstractString) :: T where {T}
-    binds_by_keyword(T) || return JSON.parse(text, T; style = NITRO_READ_STYLE)
-    fields = JSON.parse(text, Dict{String, JSON.JSONText}; style = NITRO_READ_STYLE)
+    binds_by_keyword(T) || return _parse_json_bounded(text, T; style = NITRO_READ_STYLE)
+    fields = _parse_json_bounded(text, Dict{String, JSON.JSONText}; style = NITRO_READ_STYLE)
     kwargs = Pair{Symbol, Any}[]
     for name in fieldnames(T)
         raw = get(fields, String(name), nothing)

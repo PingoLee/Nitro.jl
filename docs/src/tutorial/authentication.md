@@ -140,19 +140,18 @@ same 401 as any other invalid credential. This matches RFC 6750: `invalid_token`
     as *"program state may be corrupted, so further execution might be unreliable"*. A worker in
     that state must not quietly go on authenticating people.
 
-    Be aware of what that `500` looks like from the client: auth middleware runs *outside*
-    Nitro's serializer, so the response is a **bodyless `500` with no log line and no
-    access-log entry** — unlike a `500` raised inside a handler, which is logged with a
-    backtrace and carries the usual JSON body. The server itself keeps serving normally.
+    That `500` is handled like one raised in a handler: Nitro's error boundary wraps the whole
+    middleware chain (#256), so it is logged with a backtrace, recorded in the access log, and
+    carries the usual JSON body. The server itself keeps serving normally.
 
-    This is request-reachable, not theoretical: `JSON.parse` raises `StackOverflowError` on a
-    deeply-nested value, so a bearer token whose header segment is base64url of `[[[[…` gets
-    there. Reaching it through *this* path takes an `Authorization` header of about 8.3 KB
-    (nesting depth ~3100 on a request task) — above nginx's default 8k header buffer and
-    Apache's `LimitRequestFieldSize` of 8190, so a default-configured proxy refuses it, and a
-    cookie cannot carry it at all at the 4 KB browser cap. Nitro served directly accepts it.
-    The same overflow reached through a request **body** or a query parameter needs only
-    ~6.2 KB and nothing gates that, which is why the body parsers take the same narrowing.
+    A crafted token does not get there. `JSON.parse` raises `StackOverflowError` on a
+    deeply-nested value, and a bearer token of base64url `[[[[…` used to reach it in about
+    4.1 KB — inside nginx's and Apache's default header limits, and not stopped by the 4 KB
+    browser cookie cap either, since an attacker's request is not a browser's. `decode_jwt` now
+    caps the header segment at 1 KB, rejects JSON nested deeper than 512 levels as malformed,
+    and decodes the claims only after the signature verifies, so that token is an ordinary
+    `AuthError` and a 401 (#314). What still propagates is the runtime reporting on itself —
+    most likely from your own validator code.
 
     If your own validator wraps work in a `try`, narrow it the same way — catch the failures you
     expect, not everything:
@@ -217,6 +216,15 @@ rejected as malformed on both paths — `AuthError("Invalid JWT header")`,
 kind of check as "a JWT has three segments", not a policy decision about algorithms, and
 `with_kid=true` promises a `String` it cannot deliver from a numeric `kid`. If you inspect
 foreign tokens offline, this is the one part of the path that got stricter.
+
+**On the verifying path the claims are decoded only after the signature verifies**, in the order
+RFC 7519 §7.2 gives: an unsigned or forged token reaches exactly one JSON parse, of its header.
+So a forged token with a malformed claims segment fails a header or signature check — with a
+single key, `AuthError("Invalid JWT signature")` — never an encoding or claims error; with
+`verify=false` the claims are decoded straight away. On both
+paths the encoded header segment is capped at **1 KB** (`AuthError("Invalid JWT header: …")`)
+and every segment's JSON is capped at 512 levels of nesting — Nitro's own header is under 100
+bytes, and `encode_jwt` refuses a `kid` long enough to mint past the cap.
 
 ### Configuring identity
 

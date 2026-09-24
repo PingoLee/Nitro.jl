@@ -297,11 +297,14 @@ response; these three are not failures, so swallowing one reports a broken proce
 outcome and keeps serving:
 
 - `StackOverflowError` — Julia's own report is *"program state may be corrupted, so further
-  execution might be unreliable"*. Reachable from request input: `JSON.parse` raises it on a
-  deeply-nested value. Measured on a `Threads.@spawn` task, which is the stack every Nitro
-  request runs on, the threshold is nesting depth ~3100 — about **6.2 KB** of `[[[[…` as a
-  body or query string. (Through a JWT header segment it is ~8.3 KB once base64url-encoded,
-  which most reverse proxies refuse by default; the body is the ungated path.)
+  execution might be unreliable"*, and on some Windows hosts the process does not survive it
+  at all (#301). `JSON.parse` raises it on a deeply-nested value: measured on a
+  `Threads.@spawn` task, which is the stack every Nitro request runs on, at nesting depth
+  ~3100 — ~3.1 KB of unclosed `[[[…`, which is a **4.1 KB** bearer token once base64url
+  encoded, inside nginx's and Apache's default header limits. Request input no longer gets
+  there: every request-data parse goes through `BodyParsers._parse_json_bounded`, which
+  rejects nesting past `MAX_JSON_DEPTH` (512) as malformed JSON before the parser recurses
+  (#314). Catching the overflow is not the defence; bounding the input is.
 - `OutOfMemoryError` — same class, one resource over.
 - `InterruptException` — a catch that eats it makes Ctrl-C a no-op. Rethrowing *it* was already
   the house rule (`src/middleware/janitor.jl` #190, `src/core/transport.jl`); #254 is where the
@@ -311,13 +314,16 @@ outcome and keeps serving:
 
 The criterion is **"a request can make this block raise one of the three"**. In practice that
 means the guarded expression reaches `JSON.parse`, which is the only recursive parser on
-Nitro's request path and so the only source of a request-driven `StackOverflowError`:
+Nitro's request path. Since #314 its depth is bounded, so request input alone should no longer
+overflow it — the rethrows below stay as the backstop for what the bound does not cover: a
+regression in the bound, an `OutOfMemoryError`, an interrupt, and the application code several
+of these sites call (a user's `validate_token`, a user's session store):
 
 | site | guarded expression |
 |---|---|
 | `src/middleware/auth_middleware.jl` ×2 | the user's `validate_token` (reaches `decode_jwt` → `JSON.parse`) |
-| `src/utilities/bodyparsers.jl` ×5 | `JSON.parse` — plus `HTTP.queryparams`/`HTTP.parse_multipart_form`, which do NOT recurse and ride along so the five parsers in one file cannot drift apart |
-| `src/utilities/misc.jl` ×3 | `parseparam`'s `JSON.parse(str, T)` fall-through — reached by **any** scalar path/query parameter, since `parse(Int, str)` fails first and lands there |
+| `src/utilities/bodyparsers.jl` ×5 | `_parse_json_bounded` — plus `HTTP.queryparams`/`HTTP.parse_multipart_form`, which do NOT recurse and ride along so the five parsers in one file cannot drift apart |
+| `src/utilities/misc.jl` ×3 | `parseparam`'s `_parse_json_bounded(str, T)` fall-through — reached by **any** scalar path/query parameter, since `parse(Int, str)` fails first and lands there |
 | `src/extractors.jl` ×2 | `safe_extract`'s `f()` (the extractor body, i.e. the parsers above) and the app's session store |
 | `src/middleware/csrf_middleware.jl` ×2 | `getform`/`getjson` |
 
