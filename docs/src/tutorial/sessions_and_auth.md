@@ -353,7 +353,7 @@ the rotation to happen before the handler finishes.
 populate `getuser(req)`. Write a small middleware to bridge them:
 
 ```julia
-# The values `login_required` and the claim guards refuse as a login marker.
+# The scalar values `login_required` and the claim guards refuse as a login marker.
 is_login_marker(uid) = !(uid === nothing || uid === missing || uid isa Bool || uid == "")
 
 function SessionAuthMiddleware(handle)
