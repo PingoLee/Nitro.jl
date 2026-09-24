@@ -253,8 +253,10 @@ mount time.
 `:lazy` budget — it is a full hash **on every request**. `dynamicfiles(dir; etag = :strong)` over a
 100 MB file hashes 100 MB per request. `:weak_stat` is the default for this reason.
 
-**A non-GET request under the mount prefix is a `405`, not a `404`**, because the mount's
-catch-all matches the path and carries `GET` only.
+**The mount serves `GET` and `HEAD`.** Another method on a mounted file is a `405` whose `Allow`
+lists `GET, HEAD` plus any application route at that path. A path naming no mounted file gets
+what the router answers there, apart from the mount itself: a `405` with that path's `Allow` when
+an application route serves it under another method, otherwise a `404` (#284).
 
 """
 staticfiles(
@@ -341,8 +343,12 @@ mount time.
 `:lazy` budget — it is a full hash **on every request**. `dynamicfiles(dir; etag = :strong)` over a
 100 MB file hashes 100 MB per request. `:weak_stat` is the default for this reason.
 
-**A non-GET request under the mount prefix is a `405`, not a `404`**, because the mount's
-catch-all matches the path and carries `GET` only.
+**The mount serves `GET` and `HEAD`.** Another method on a mounted file is a `405` whose `Allow`
+lists `GET, HEAD` plus any application route at that path. A path naming no mounted file gets
+what the router answers there, apart from the mount itself: a `405` with that path's `Allow` when
+an application route serves it under another method, otherwise a `404` (#284). History mode is the
+exception for `GET` and `HEAD`: a miss gets the app shell, even at a path an application route
+answers under another method.
 
 """
 spafiles(
@@ -425,8 +431,10 @@ mount time.
 `:lazy` budget — it is a full hash **on every request**. `dynamicfiles(dir; etag = :strong)` over a
 100 MB file hashes 100 MB per request. `:weak_stat` is the default for this reason.
 
-**A non-GET request under the mount prefix is a `405`, not a `404`**, because the mount's
-catch-all matches the path and carries `GET` only.
+**The mount serves `GET` and `HEAD`.** Another method on a mounted file is a `405` whose `Allow`
+lists `GET, HEAD` plus any application route at that path. A path naming no mounted file gets
+what the router answers there, apart from the mount itself: a `405` with that path's `Allow` when
+an application route serves it under another method, otherwise a `404` (#284).
 
 """
 dynamicfiles(
