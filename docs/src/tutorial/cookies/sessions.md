@@ -82,6 +82,26 @@ By default, `SessionMiddleware` writes the session cookie with:
 - `HttpOnly=true`
 - `Secure=true`
 - `SameSite="Lax"`
+- the name `__Host-nitro_session`
+
+The `__Host-` prefix is a browser-enforced promise: such a cookie can only be set by this exact
+origin, over HTTPS, with `Path=/` and no `Domain`. Without it, a sibling subdomain or anyone on a
+plain-HTTP hop can plant their own `nitro_session` for your site — say, the id of a session they
+are logged into, scoped to `Path=/account` so the browser sends it first — and the victim then
+works inside the attacker's account (login CSRF, or "session swapping").
+
+The name follows the cookie's attributes, so it is always the strongest one the browser will
+accept:
+
+| Attributes | Default `cookie_name` |
+|---|---|
+| `secure=true`, `path="/"`, no `domain` | `__Host-nitro_session` |
+| `secure=true` with a `domain` or another `path` | `__Secure-nitro_session` |
+| `secure=false` (local HTTP development) | `nitro_session` |
+
+Passing `cookie_name` explicitly overrides it. A `__Host-`/`__Secure-` name the attributes cannot
+carry is an `ArgumentError` when the middleware is built, because browsers would silently drop the
+cookie. Changing the name logs every user out once, since their browser still holds the old one.
 
 For HTTPS deployments, also configure `Strict-Transport-Security`. See [Cookie Security](security.md).
 

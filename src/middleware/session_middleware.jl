@@ -7,7 +7,8 @@ using UUIDs
 using ...Types: AbstractSessionStore, MemoryStore, SessionPayload, Nullable, is_expired
 using ...Types: CookieConfig, LifecycleMiddleware
 using ..JanitorMiddleware: _janitor
-using ...Cookies: get_cookie, set_cookie!, storesession!, prunesessions!, regenerate_session!
+using ...Cookies: get_cookie, set_cookie!, storesession!, prunesessions!, regenerate_session!,
+    _validate_cookie_prefix
 using ...Crypto: secure_uuid4, SecretString
 using ...Core: own_response_headers
 
@@ -136,7 +137,15 @@ contract.
 
 # Other keyword arguments
 
-- `cookie_name::String = "nitro_session"`, `max_age::Int`.
+- `cookie_name` — defaults to the most protected name the cookie's attributes allow (#329):
+  `"__Host-nitro_session"` when `secure` with `path = "/"` and no `domain`,
+  `"__Secure-nitro_session"` when `secure` with a `domain` or another `path`, and
+  `"nitro_session"` only when `secure = false`. The `__Host-` prefix is what stops a sibling
+  subdomain or a plain-HTTP attacker planting their own session cookie on the victim (login CSRF /
+  session swapping): browsers refuse to let anyone but this origin, over HTTPS, set one. An
+  explicit `__Host-`/`__Secure-` name the attributes cannot carry is an `ArgumentError` at
+  construction, since browsers would silently drop it.
+- `max_age::Int`.
 - `prune_interval::Period = Minute(10)` — how often the background janitor removes expired
   sessions from `store`. Must be a positive fixed-length `Period`; calendar periods (`Month`,
   `Quarter`, `Year`) are rejected, since they cannot be slept on. This replaced a `prune_probability` that ran the prune inline on a
@@ -149,7 +158,7 @@ A `LifecycleMiddleware`. `serve()` and `urlpatterns()` accept it directly; if yo
 the chain by hand, the request function is its `.middleware` field.
 """
 function SessionMiddleware(;
-    cookie_name::String = "nitro_session",
+    cookie_name::Nullable{String} = nothing,
     secret_key::Union{AbstractString, SecretString, Nothing} = nothing,
     max_age::Int = 86400,
     store::AbstractSessionStore{String, Dict{String,Any}},
@@ -172,13 +181,19 @@ function SessionMiddleware(;
     ),
     validator::Union{Function, Nothing} = nothing)
 
+    # Resolved from the FINAL config -- `config` may be passed whole -- and checked before any
+    # janitor exists, so a name browsers would drop fails at construction.
+    session_cookie = something(cookie_name, _default_session_cookie_name(config))
+    _validate_cookie_prefix(session_cookie, config; label = "Session cookie",
+                            plain_name = "nitro_session")
+
     on_startup, on_shutdown = _prune_janitor(store, prune_interval, "SessionMiddleware",
                                              "prune_interval")
 
     middleware = function(handle::Function)
         return function(req::HTTP.Request)
             # Load the current payload and remember the auth marker before the handler runs.
-            session_id = _get_session_id(req, cookie_name)
+            session_id = _get_session_id(req, session_cookie)
             session_data, is_new = _load_session(store, session_id)
             original_session = deepcopy(session_data)
             original_auth_marker = _auth_marker(session_data, session_id, auth_key, validator)
@@ -217,7 +232,7 @@ function SessionMiddleware(;
                 # object — a cross-request session leak — and races other threads.
                 response = own_response_headers(response)
                 # Append the session cookie without clobbering any sibling Set-Cookie headers.
-                set_cookie!(response, cookie_name, final_session_id; config=config, encrypted=false, maxage=max_age)
+                set_cookie!(response, session_cookie, final_session_id; config=config, encrypted=false, maxage=max_age)
             end
 
             return response
@@ -229,6 +244,17 @@ end
 
 function _get_session_id(req::HTTP.Request, cookie_name::String)
     return get_cookie(req, cookie_name)
+end
+
+# The most protected name the attributes allow (#329). `nitro_session` used to be the default
+# whatever the attributes, so a sibling subdomain or a plain-HTTP attacker could plant
+# `nitro_session=<their own logged-in id>; Path=/account` -- sent first, so it won -- and the
+# victim acted inside the attacker's account. Fixation and CSRF bypass were not possible
+# (unknown ids are refused, CSRF tokens are session-bound); session swapping was.
+function _default_session_cookie_name(config::CookieConfig)
+    config.secure || return "nitro_session"
+    return (config.domain === nothing && config.path == "/") ?
+        "__Host-nitro_session" : "__Secure-nitro_session"
 end
 
 function _generate_session_id()

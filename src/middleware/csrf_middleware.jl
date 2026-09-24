@@ -6,6 +6,7 @@ using Base64
 
 using ...Types: CookieConfig, Nullable
 using ...Cookies: get_cookie, set_cookie!
+import ...Cookies
 using ...Crypto: secure_random_bytes, _empty_hmac_key, SecretString, reveal
 using ...Errors: is_unrecoverable
 using ...Res: json
@@ -20,9 +21,6 @@ const SAFE_METHODS = Set(("GET", "HEAD", "OPTIONS", "TRACE"))
 # different origin's CSRF cookie. Signing alone cannot -- a signature proves the server minted
 # the token, not that it minted it for *this* client, which is what the binding below adds.
 const DEFAULT_COOKIE_NAME = "__Host-csrf_token"
-
-const HOST_COOKIE_PREFIX = "__Host-"
-const SECURE_COOKIE_PREFIX = "__Secure-"
 
 function _base64url_encode(data::Vector{UInt8})
     encoded = Base64.base64encode(data)
@@ -123,35 +121,9 @@ function _warn_unbound()
     return nothing
 end
 
-"""
-Reject a cookie-name prefix the surrounding config would make undeliverable.
-
-Browsers match `__Host-`/`__Secure-` case-insensitively and *silently discard* a cookie that
-violates the prefix rules, so a misconfigured pipeline looks healthy and then rejects every
-mutation with no cookie ever reaching the client. Failing at construction turns that into an
-error the developer sees once.
-"""
-function _validate_cookie_prefix(cookie_name::AbstractString, config::CookieConfig)
-    lowered = lowercase(String(cookie_name))
-    is_host = startswith(lowered, lowercase(HOST_COOKIE_PREFIX))
-    (is_host || startswith(lowered, lowercase(SECURE_COOKIE_PREFIX))) || return nothing
-    prefix = is_host ? HOST_COOKIE_PREFIX : SECURE_COOKIE_PREFIX
-
-    config.secure || throw(ArgumentError(
-        "CSRF cookie \"$cookie_name\" carries the $prefix prefix, which browsers accept only on a " *
-        "Secure cookie. Pass `secure=true` in `config`, or use a cookie_name without the prefix " *
-        "(e.g. `cookie_name=\"csrf_token\"`) when serving over plain HTTP."))
-
-    if is_host
-        config.domain === nothing || throw(ArgumentError(
-            "CSRF cookie \"$cookie_name\" carries the $prefix prefix, which browsers accept only " *
-            "when no Domain attribute is set (got domain=\"$(config.domain)\")."))
-        config.path == "/" || throw(ArgumentError(
-            "CSRF cookie \"$cookie_name\" carries the $prefix prefix, which browsers accept only " *
-            "with Path=/ (got path=\"$(config.path)\")."))
-    end
-    return nothing
-end
+_validate_cookie_prefix(cookie_name::AbstractString, config::CookieConfig) =
+    Cookies._validate_cookie_prefix(cookie_name, config; label = "CSRF cookie",
+                                    plain_name = "csrf_token")
 
 """
     issue_csrf_token!(res, secret; binding, cookie_name, ttl, config) -> String

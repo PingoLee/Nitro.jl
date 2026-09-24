@@ -134,7 +134,7 @@ The short answer is **No, session cookies do not need to be encrypted in Nitro.*
 ### Why?
 Nitro uses **Server-Side Sessions** by default (backed by `MemoryStore`). When you use `SessionMiddleware`, the data you put into `getsession(req)` never leaves your server. 
 
-Instead, Nitro generates a random, cryptographically secure `UUIDv4` identifier (e.g., `550e8400-e29b-41d4-a716-446655440000`) and sends **only** that UUID to the browser in the `nitro_session` cookie.
+Instead, Nitro generates a random, cryptographically secure `UUIDv4` identifier (e.g., `550e8400-e29b-41d4-a716-446655440000`) and sends **only** that UUID to the browser in the session cookie (`__Host-nitro_session` by default, whose prefix stops another site or subdomain planting its own).
 
 Because the UUID is completely random and has 122 bits of entropy, it is impossible for an attacker to guess or mathematically reverse it. There is no user data inside the cookie to encrypt.
 

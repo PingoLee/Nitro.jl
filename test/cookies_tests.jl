@@ -95,15 +95,16 @@ using Nitro: Cookie
         @test result2 == data2
     end
 
-    @testset "REQUEST: Cookie Name Case Insensitivity" begin
+    @testset "REQUEST: Cookie Names Are Case-Sensitive (#329)" begin
+        # This used to assert the opposite -- `MY_SESSION` read as `my_session` -- and that is
+        # the defect: cookie names are case-sensitive (RFC 6265 §4.1.1), and folding case let
+        # `__HOST-x` shadow the prefix-protected `__Host-x` ("Cookie Crumbles").
         data = "case-test"
-        # The purpose is the name AS REQUESTED below -- that is what get_cookie decrypts under.
-        encrypted_value = Cookies.encrypt_payload(secret, data; purpose = "my_session")
+        encrypted_value = Cookies.encrypt_payload(secret, data; purpose = "MY_SESSION")
 
         req = HTTP.Request("GET", "/", ["Cookie" => "MY_SESSION=$encrypted_value"])
-        result = Cookies.get_cookie(req, "my_session", encrypted=true, secret_key=secret)
-
-        @test result == data
+        @test Cookies.get_cookie(req, "my_session", encrypted=true, secret_key=secret) === nothing
+        @test Cookies.get_cookie(req, "MY_SESSION", encrypted=true, secret_key=secret) == data
     end
 
     @testset "REQUEST: Cookie Value with Special Characters" begin
@@ -336,15 +337,18 @@ using Nitro: Cookie
         @test_throws ArgumentError set_cookie!(res, "test", "val", attrs=Dict("httponly" => "not_a_bool"), encrypted=false)
     end
 
-    @testset "TYPE: Case-Insensitive Header and Key Variations" begin
-        # Request Header Variations
+    @testset "TYPE: Case-Insensitive Header Names, Case-Sensitive Cookie Names" begin
+        # Request Header Variations -- HTTP header NAMES are case-insensitive...
         req1 = HTTP.Request("GET", "/", ["cookie" => "my_key=val1"])
         @test Cookies.get_cookie(req1, "my_key") == "val1"
 
+        # ...cookie NAMES are not (#329, RFC 6265 §4.1.1). These used to read `MY_KEY` as
+        # `my_key`, which is the prefix-shadowing defect.
         req2 = HTTP.Request("GET", "/", ["COOKIE" => "MY_KEY=val2"])
-        @test Cookies.get_cookie(req2, "my_key") == "val2"
-        @test Cookies.get_cookie(req2, :my_key) == "val2"
+        @test Cookies.get_cookie(req2, "my_key") === nothing
+        @test Cookies.get_cookie(req2, :my_key) === nothing
         @test Cookies.get_cookie(req2, :MY_KEY) == "val2"
+        @test Cookies.get_cookie(req2, "MY_KEY") == "val2"
 
         # Response Header Variations
         res1 = HTTP.Response(200, [("set-cookie", "resp_opt=val3; Path=/")])
@@ -1726,5 +1730,92 @@ end
     finally
         resetstate()
     end
+end
+end
+
+# #329: four parsing and attribute defects on the same surface.
+@testitem "Cookie parsing: exact names, request-only Cookie, __Host- sessions, strict Domain (#329)" tags=[:core, :security] setup=[NitroCommon] begin
+using Nitro
+using Nitro.Types: CookieConfig
+using HTTP
+using Test
+const Cookies = Nitro.Cookies
+
+@testset "a case-folded name cannot shadow a prefixed cookie" begin
+    # The "Cookie Crumbles" bypass: browsers that check prefixes case-sensitively let anyone plant
+    # `__HOST-csrf_token`, and a case-insensitive first match returned it for `__Host-csrf_token`.
+    req = HTTP.Request("GET", "/", ["Cookie" => "__HOST-csrf_token=attacker; __Host-csrf_token=legit"])
+    @test Cookies.get_cookie(req, "__Host-csrf_token") == "legit"
+    @test Cookies.parse_cookies(req)["__Host-csrf_token"] == "legit"
+    @test Cookies.parse_cookies(req)["__HOST-csrf_token"] == "attacker"   # a different cookie
+end
+
+@testset "get_cookie and parse_cookies agree: the first occurrence wins" begin
+    req = HTTP.Request("GET", "/", ["Cookie" => "a=1; b=x; a=2"])
+    @test Cookies.get_cookie(req, "a") == "1"
+    @test Cookies.parse_cookies(req)["a"] == "1"        # used to be "2"
+    # Every Cookie header in a header list is read (HTTP/2 may split the list), in order. A raw
+    # list, because `HTTP.Request` itself folds repeated headers into one value.
+    split_headers = ["Cookie" => "a=1", "Cookie" => "c=3; a=2"]
+    @test Cookies.parse_cookies(split_headers)["c"] == "3"  # used to stop at the first header
+    @test Cookies.parse_cookies(split_headers)["a"] == "1"
+    @test Cookies.get_cookie(split_headers, "c") == "3"
+end
+
+@testset "a request's Set-Cookie is not a cookie" begin
+    req = HTTP.Request("GET", "/", ["Set-Cookie" => "role=admin"])
+    @test Cookies.get_cookie(req, "role") === nothing
+    @test Cookies.get_cookie(req.headers, "role") === nothing
+    @test Cookies.get_cookie(["Set-Cookie" => "role=admin"], "role") === nothing
+    @test isempty(Cookies.parse_cookies(req))
+    # A response is read from Set-Cookie, and only Set-Cookie.
+    res = HTTP.Response(200, ["Set-Cookie" => "role=user; Path=/", "Cookie" => "role=admin"])
+    @test Cookies.get_cookie(res, "role") == "user"
+    @test Cookies.get_cookie(HTTP.Response(200, ["Cookie" => "role=admin"]), "role") === nothing
+end
+
+@testset "Domain is validated strictly on every path" begin
+    for bad in ("evil.com; Secure", "evil.com;HttpOnly", "a b.com", "a.com:8080")
+        @test_throws ArgumentError Cookies.format_cookie("a", "b"; domain = bad)
+        @test_throws ArgumentError CookieConfig(domain = bad)
+        @test_throws ArgumentError Cookies.set_cookie!(HTTP.Response(200), "a", "b"; domain = bad, encrypted = false)
+        @test_throws ArgumentError Cookies.load_cookie_settings!(Dict("domain" => bad))
+    end
+    # Valid domains are normalized the same way everywhere.
+    @test CookieConfig(domain = " Example.COM ").domain == "example.com"
+    @test occursin("Domain=example.com", Cookies.format_cookie("a", "b"; domain = "Example.com"))
+    cfg = CookieConfig(domain = ".sub.example.com")
+    @test occursin("Domain=.sub.example.com",
+                   HTTP.header(Cookies.set_cookie!(HTTP.Response(200), "a", "b"; config = cfg, encrypted = false), "Set-Cookie"))
+end
+
+@testset "the session cookie takes the most protected name its attributes allow" begin
+    store() = MemoryStore{String, Dict{String, Any}}()
+    touch_session(req) = (getsession(req)["n"] = get(getsession(req), "n", 0) + 1; HTTP.Response(200))
+    set_cookie_line(mw, req = HTTP.Request("GET", "/")) = HTTP.header(mw.middleware(touch_session)(req), "Set-Cookie")
+    name_in(line) = split(line, '='; limit = 2)[1]
+
+    @test name_in(set_cookie_line(SessionMiddleware(store = store()))) == "__Host-nitro_session"
+    @test name_in(set_cookie_line(SessionMiddleware(store = store(), domain = "example.com"))) == "__Secure-nitro_session"
+    @test name_in(set_cookie_line(SessionMiddleware(store = store(), path = "/app"))) == "__Secure-nitro_session"
+    @test name_in(set_cookie_line(SessionMiddleware(store = store(), secure = false))) == "nitro_session"
+    # A whole `config` decides it too.
+    @test name_in(set_cookie_line(SessionMiddleware(store = store(),
+        config = CookieConfig(secure = false)))) == "nitro_session"
+
+    # The default name round-trips: the session is found again on the next request.
+    mw = SessionMiddleware(store = store())
+    first = set_cookie_line(mw)
+    @test occursin("Secure", first) && occursin("Path=/", first) && !occursin("Domain=", first)
+    pair = split(first, ';')[1]
+    second = mw.middleware(req -> Res.json(Dict("n" => getsession(req)["n"])))(HTTP.Request("GET", "/", ["Cookie" => pair]))
+    @test json(second)["n"] == 1
+
+    # An explicit prefixed name the attributes cannot carry would be dropped by browsers.
+    @test_throws ArgumentError SessionMiddleware(store = store(), cookie_name = "__Host-s", domain = "example.com")
+    @test_throws ArgumentError SessionMiddleware(store = store(), cookie_name = "__Host-s", path = "/app")
+    @test_throws ArgumentError SessionMiddleware(store = store(), cookie_name = "__Secure-s", secure = false)
+    # The documented opt-out keeps the old name.
+    @test name_in(set_cookie_line(SessionMiddleware(store = store(), cookie_name = "nitro_session"))) == "nitro_session"
 end
 end

@@ -211,6 +211,30 @@ function missing_session_methods(S::Type{<:AbstractSessionStore})
 end
 
 """
+Normalize a cookie `Domain`: trimmed, lowercased, and only `[A-Za-z0-9.-]`. The ONE domain
+validator (#329): `CookieConfig`, `format_cookie`, `set_cookie!(domain = …)` and
+`load_cookie_settings!` all use it. It lives here rather than in `Cookies` because
+`CookieConfig`'s constructor needs it and `types.jl` loads first. Two of those paths used to
+reject only a space and `:`, so a `;` injected attributes into the `Set-Cookie` header.
+"""
+function _normalize_domain(val::Any) :: String
+    if !isa(val, AbstractString)
+        throw(ArgumentError("domain: expected String, got $(typeof(val))"))
+    end
+
+    d = strip(String(val))
+    if isempty(d)
+        throw(ArgumentError("domain: cannot be empty"))
+    end
+
+    if !occursin(r"^[A-Za-z0-9\.-]+$", d) || occursin(':', d)
+        throw(ArgumentError("domain: contains invalid characters: \"$val\""))
+    end
+
+    return lowercase(d)
+end
+
+"""
     CookieConfig(; secret_key, httponly, secure, samesite, path, domain, maxage, expires, max_cookie_size)
 
 Cookie defaults: what `configcookies` stores on an `App`, and what `set_cookie!`/`get_cookie`
@@ -220,6 +244,9 @@ take as `config`.
 `AbstractString` is wrapped, a `SecretString` is kept, and anything else -- bytes, a
 `Base.SecretBuffer` -- is an `ArgumentError`. So neither a `CookieConfig` nor anything that
 captures one (a middleware closure, a `LifecycleMiddleware`) prints the key.
+
+`domain` is validated and normalized (trimmed, lowercased, `[A-Za-z0-9.-]` only) when the config
+is built, so an invalid one fails at startup rather than on the first response.
 """
 @kwdef struct CookieConfig
     secret_key::Nullable{SecretString} = nothing
@@ -236,7 +263,8 @@ captures one (a middleware closure, a `LifecycleMiddleware`) prints the key.
     # -- lands here, so this is where a key becomes a `SecretString`. See `_cookie_secret`.
     function CookieConfig(secret_key, httponly, secure, samesite, path, domain, maxage, expires,
                           max_cookie_size)
-        return new(_cookie_secret(secret_key), httponly, secure, samesite, path, domain, maxage,
+        return new(_cookie_secret(secret_key), httponly, secure, samesite, path,
+                   domain === nothing ? nothing : _normalize_domain(domain), maxage,
                    expires, max_cookie_size)
     end
 end
