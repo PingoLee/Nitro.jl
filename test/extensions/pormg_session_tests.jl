@@ -772,4 +772,26 @@ end
     @test !haskey(PormG.config, key)
 end
 
+# The `PasswordField` hook is latent (PormG 0.6 has no `register_field_hook`), so it is tested as
+# the function it is. It used to pass any hash-shaped string through verbatim, which let a user
+# pick a stored hash -- cost parameters included -- as their "password" (#311).
+@testset "hash_password_field always hashes user input (#311)" begin
+    hook = PormGExt.hash_password_field
+    hostile = "pbkdf2_sha256\$9223372036854775807\$s\$h"
+    stored = hook(hostile)
+    @test stored != hostile
+    @test startswith(stored, "pbkdf2_sha256\$$(Nitro.Auth.DEFAULT_PBKDF2_ITERATIONS)\$")
+    @test Nitro.Auth.check_password(hostile, stored)
+
+    # A genuine hash is hashed too: pre-hashed values take `auto_hash=false`, not this hook.
+    genuine = Nitro.Auth.make_password("secret"; iterations = 1000)
+    @test hook(genuine) != genuine
+
+    # Blank and non-string values are PormG's to validate.
+    @test hook("") == ""
+    @test hook("   ") == "   "
+    @test hook(nothing) === nothing
+    @test hook(42) == 42
+end
+
 end

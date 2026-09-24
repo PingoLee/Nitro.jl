@@ -26,6 +26,8 @@ Nitro.Auth.set_auth_cookie!
 ## Passwords
 
 ```@docs
+Nitro.Auth.make_password
+Nitro.Auth.check_password
 Nitro.Auth.parse_argon2_phc
 ```
 

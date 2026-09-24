@@ -78,7 +78,7 @@ is_password_usable("sha256:310000:32:salt:hash")          # true
 is_password_usable("plain_text")                          # false
 ```
 
-This is used internally by the NitroPormG extension to decide whether a value needs hashing before database storage.
+It looks only at the prefix and does not validate the rest, so never use it to decide whether *user input* is already hashed: a user who registers the "password" `pbkdf2_sha256$9223372036854775807$s$h` would otherwise choose their own stored hash, cost parameters included. Hash user input unconditionally.
 
 ## Using Encoders Directly
 
@@ -163,8 +163,10 @@ isnothing(jwt_secret) && error("JWT_SECRET must be set")
 
 function login(req::HTTP.Request)
     body = json(req)
-    stored_hash = lookup_user_hash(body["username"])  # your DB lookup
+    stored_hash = lookup_user_hash(body["username"])  # your DB lookup; `nothing` for an unknown user
 
+    # Do not return early for an unknown user: `check_password(pw, nothing)` hashes once anyway,
+    # so the response time does not reveal which usernames exist.
     if !check_password(body["password"], stored_hash)
         return Res.json(Dict("error" => "invalid credentials"); status=401)
     end
@@ -192,7 +194,7 @@ pbkdf2_sha256$<iterations>$<salt>$<hash_b64>
 ```
 
 - **Algorithm**: PBKDF2-HMAC-SHA256
-- **Iterations**: 720 000 (Django 4.2+ default)
+- **Iterations**: 720 000 (Django 4.2+ default); a stored hash is verified only with 1–10 000 000
 - **Salt**: 22-character random alphanumeric string
 - **Hash**: 32-byte derived key, base64-encoded
 - **Interop**: A hash produced by `make_password` is accepted by Django's `check_password`, and vice versa.
@@ -204,7 +206,7 @@ $2a$<cost>$<22-char-salt><31-char-hash>
 ```
 
 - **Variants**: `$2a$`, `$2b$`, `$2y$` are all accepted
-- **Cost**: 12 (default); range 4–31
+- **Cost**: 12 (default); range 4–15, for both hashing and verifying. The format allows up to 31, but each step doubles the work, and 31 is about 50 hours per check here
 - **Max input**: 72 bytes (longer passwords are truncated with a warning)
 - **Interop**: Bitwise compatible with Spring Security and all standard BCrypt libraries.
 
@@ -215,8 +217,8 @@ sha256:<iterations>:<key_length>:<salt_b64>:<hash_b64>
 ```
 
 - **Algorithm**: PBKDF2-HMAC-SHA256 (`SecretKeyFactoryAlgorithm.PBKDF2WithHmacSHA256`)
-- **Iterations**: 310 000 (Spring Security 6.x default)
-- **Key length**: 32 bytes
+- **Iterations**: 310 000 (Spring Security 6.x default); iterations × 32-byte key blocks up to 10 000 000 accepted
+- **Key length**: 32 bytes; 16–64 accepted, and it must equal the stored hash's decoded length
 - **Salt**: 24-byte random, base64-encoded
 - **Interop**: Matches Spring Security 6.x `Pbkdf2PasswordEncoder` output.
 
@@ -231,16 +233,32 @@ Will use the standard PHC string format for interoperability. Not yet available 
 ## Security Notes
 
 - All password comparisons use **constant-time equality** to prevent timing side-channel attacks.
-- Empty passwords are rejected by all encoders (`ArgumentError`).
-- BCrypt silently truncates passwords longer than 72 bytes (with a logged warning). If this is a concern, use PBKDF2 or Spring PBKDF2 which have no length limit.
-- The `DelegatingPasswordEncoder` falls back to constant-time plain-text comparison for unknown formats, with a warning. This is intentional for migration scenarios but should not be relied upon in production.
+- **Every password operation is bounded work.** A login endpoint hashes whatever an unauthenticated client submits, so:
+  - Passwords are capped at **4096 bytes** (`Nitro.Auth.MAX_PASSWORD_BYTES`). `make_password` and every `encode` throw `ArgumentError` above it, and `check_password` and every `matches` return `false` before hashing anything. Validate or cap the field in your signup handler, or the `ArgumentError` becomes a `500`.
+  - The cost read from a *stored* hash is bounded too. PBKDF2 iterations × 32-byte key blocks may be at most 10 000 000 (so 10 000 000 iterations at the usual 32-byte key), a Spring key length must be 16–64 bytes, and a bcrypt cost at most 15. A hash outside those bounds is refused with a logged warning; the hash itself is never logged. The encoder constructors enforce the same ceilings, so no encoder can produce a hash that its own `matches` refuses.
+  - PBKDF2 runs in OpenSSL's libcrypto, which keys the HMAC once per derivation. The cost therefore does not grow with password length, and the default 720 000 iterations take about 0.2 s rather than several seconds.
+- Empty passwords are rejected by all encoders (`ArgumentError`) and never match.
+- BCrypt silently truncates passwords longer than 72 bytes (with a logged warning). If this is a concern, use PBKDF2 or Spring PBKDF2, which hash the whole password up to the 4096-byte cap.
+- The `DelegatingPasswordEncoder` **never** falls back to comparing plain text. An unknown or unsupported format fails to match, with a warning.
+- **Username enumeration.** Look the user up, and pass `nothing` to `check_password` when there is no such user, rather than returning early. `check_password(password, nothing)` hashes once at the default cost before answering `false`, and so does a stored value no encoder can verify. An unknown user and a wrong password then take the same time. The equalizer costs what the *current default* algorithm costs, so while stored hashes still use an older algorithm or cost, the two paths differ by that much.
 
 ## PormG Integration
 
-When `Nitro` and `PormG` are both loaded, the `NitroPormGExt` extension activates automatically. It hooks into PormG's `PasswordField` to:
+When `Nitro` and `PormG` are both loaded, the `NitroPormGExt` extension activates automatically.
 
-1. **Auto-hash on write**: If `auto_hash=true` on a `PasswordField`, raw passwords are hashed via `make_password` before database storage. Already-encoded hashes pass through unchanged.
-2. **Verify helper**: Use `check_password` from `Nitro.Auth` to verify passwords against stored hashes.
-3. **Upgrade detection**: Use `password_needs_upgrade` to detect hashes that should be re-hashed with stronger parameters.
+**Hash in your application today, and declare the field `auto_hash=false`.** PormG's `PasswordField` is a storage type: it stores the string it is given, and its `auto_hash` option (default `true`) currently does nothing. Call `make_password` before saving, and `check_password` to verify:
 
-This keeps the core `Nitro.Auth` engine database-agnostic while providing seamless ORM integration when PormG is available.
+```julia
+# In the model: you hash, PormG stores the string as given.
+password = Models.PasswordField(auto_hash = false)
+```
+
+```julia
+# In the login handler.
+user = M.User.objects.filter("username" => username).first()
+check_password(password, isnothing(user) ? nothing : user[:password])
+```
+
+The `auto_hash=false` matters now even though the option does nothing yet. The extension carries a `PasswordField` hook, `hash_password_field`, for when PormG adds the field-normalization seam it registers against. That hook **always** hashes a non-blank string, even one that looks like an encoded hash, because it comes from user input. On a field left at `auto_hash=true`, a hash your application computed would then be hashed a second time, and that user could no longer log in. Use `password_needs_upgrade` to detect hashes that should be re-hashed with stronger parameters.
+
+This keeps the core `Nitro.Auth` engine database-agnostic.
