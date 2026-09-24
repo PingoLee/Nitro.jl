@@ -170,15 +170,30 @@ const KNOWN_TAGS = Set([
 is_test_file(p) = any(s -> endswith(p, s),
                       ("_test.jl", "_tests.jl", "-test.jl", "-tests.jl"))
 
+# A plain recursive `readdir`, NOT `walkdir` with `filter!` on the yielded `dirs` (#297).
+# `walkdir` never promised in-place pruning: its producer task puts `(path, dirs, files)`
+# on an unbuffered channel and then iterates that same `dirs` itself. The producer is
+# sticky, so on one thread it waits for the consumer to yield and the prune looked like it
+# worked. Under ReTestItems the consumer is migratable, so at 2 threads the two run in
+# parallel. The producer then either descends before the prune (a `.helpers/` "orphan") or
+# reads the vector mid-`filter!` (`UndefRefError` → `TaskFailedException`).
+#
+# Classification is `walkdir(follow_symlinks = false)`'s: a symlink is a file, never
+# descended, whatever it points at.
 function discover_test_files(root)
     out = String[]
-    for (dir, dirs, files) in walkdir(root; topdown = true)
-        filter!(d -> !startswith(d, '.'), dirs)   # in-place: prunes the descent
-        for f in files
-            (startswith(f, '.') || !is_test_file(f)) && continue
-            push!(out, replace(relpath(joinpath(dir, f), root), '\\' => '/'))
+    function walk(dir)
+        for name in readdir(dir)
+            startswith(name, '.') && continue
+            path = joinpath(dir, name)
+            if !islink(path) && isdir(path)
+                walk(path)
+            elseif is_test_file(name)
+                push!(out, replace(relpath(path, root), '\\' => '/'))
+            end
         end
     end
+    walk(root)
     return sort!(out)
 end
 

@@ -50,6 +50,61 @@ const TEST_ROOT = joinpath(pkgdir(Nitro), "test")
     @test length(found) > 50
 end
 
+@testset "discovery prunes hidden paths, and does it deterministically across threads" begin
+    # The assertion above trusts `discover_test_files`, so its rules are pinned here on a
+    # synthetic tree rather than inferred from whatever `test/` happens to contain.
+    root = mktempdir()
+    try
+        touch_at(parts...) = (p = joinpath(root, parts...); mkpath(dirname(p)); touch(p))
+        touch_at("a_tests.jl"); touch_at("b_test.jl"); touch_at("c-tests.jl"); touch_at("d-test.jl")
+        touch_at("helper.jl")                          # no test suffix
+        touch_at(".hidden_tests.jl")                   # dotfile
+        touch_at(".helpers", "run_auth_tests.jl")      # under a dot-directory: the #297 orphan
+        touch_at(".deep", "sub", "x_tests.jl")         # pruned at the top, not just one level
+        for i in 1:8
+            touch_at("sub$i", "nested", "n$(i)_tests.jl")
+        end
+        expected = sort!(vcat(["a_tests.jl", "b_test.jl", "c-tests.jl", "d-test.jl"],
+                              ["sub$i/nested/n$(i)_tests.jl" for i in 1:8]))
+        @test discover_test_files(root) == expected
+
+        # #297: the old walk pruned `walkdir`'s yielded `dirs` with `filter!`, while
+        # `walkdir`'s own producer task iterated that same vector. Harmless on one thread;
+        # once the consumer MIGRATES (ReTestItems runs items in spawned tasks) the two ran
+        # in parallel, and the walk either descended into `.helpers/` or died with
+        # `UndefRefError`.
+        #
+        # Discriminates only at `nthreads() > 1` -- which CI runs on every push. The yield
+        # noise gives the scheduler reasons to move the consumer, which is the trigger:
+        # against the old walk at 2 threads, this loop failed ~2850-2900 runs of 3000 with
+        # the noise and ~10 without it. Against the current walk it cannot fail from this
+        # race -- nothing is shared with a producer task -- so a red here is not that flake.
+        stop  = Threads.Atomic{Bool}(false)
+        noise = [Threads.@spawn(while !stop[]; sum(rand(64)); yield(); end)
+                 for _ in 1:Threads.nthreads()]
+        bad = try
+            fetch(Threads.@spawn begin
+                n = 0
+                for _ in 1:3000
+                    n += try
+                        discover_test_files(root) == expected ? 0 : 1
+                    catch e
+                        e isa InterruptException && rethrow()
+                        1
+                    end
+                end
+                n
+            end)
+        finally
+            stop[] = true
+            foreach(wait, noise)
+        end
+        @test bad == 0
+    finally
+        rm(root; recursive = true, force = true)
+    end
+end
+
 @testset "the tag vocabulary is closed, in both directions" begin
     used     = Set{Symbol}()
     untagged = String[]
