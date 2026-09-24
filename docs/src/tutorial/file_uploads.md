@@ -186,7 +186,7 @@ or a `@kwdef struct` both work. With a `@kwdef struct`, a field's default is use
 field is absent from the body (a `Union{…, Nothing}` field still binds to `nothing` when
 absent, which takes precedence over a default). A missing required field, an unparseable
 value, or a failing `validate(::T)` all raise a `ValidationError`, which Nitro turns into a
-`400` response.
+`400` response. A request that is not `multipart/form-data` at all is a `415` instead.
 
 ## Routes (the "urls")
 

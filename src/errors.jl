@@ -3,7 +3,7 @@ module Errors
 
 import JSON
 
-export ValidationError, CookieError, AuthorizationError, StoreInterfaceError
+export ValidationError, CookieError, AuthorizationError, StoreInterfaceError, UnsupportedMediaTypeError
 
 """
     ValidationError(msg::String)
@@ -152,6 +152,31 @@ end
 
 function Base.showerror(io::IO, e::AuthorizationError)
     print(io, "Authorization Error: $(e.msg)")
+end
+
+"""
+    UnsupportedMediaTypeError(msg::String)
+
+The exception Nitro raises when a request's body has the wrong `Content-Type` for the extractor
+that binds it (#327): a `Json{T}`/`JsonFragment{T}` parameter needs `application/json` or an
+`application/*+json` type, and a `MultipartForm{T}` needs `multipart/form-data`. A missing
+`Content-Type` is the wrong type too. `handle_error` answers it with a fixed
+`415 Unsupported Media Type`, and it is logged at `@debug` only, like a `ValidationError`.
+
+Why a JSON body sent as `text/plain` is refused rather than parsed: `text/plain`,
+`application/x-www-form-urlencoded` and `multipart/form-data` are the CORS "simple" types, so a
+cross-site page can send any of them — or no type at all — without a preflight. An API that
+reads JSON regardless of the type accepts a forged cross-site request exactly as it accepts its
+own client's. Express's `json()` and Spring's `@RequestBody` refuse it the same way.
+
+`msg` names the parameter and the type it needs, never the `Content-Type` the client sent.
+"""
+struct UnsupportedMediaTypeError <: Exception
+    msg::String
+end
+
+function Base.showerror(io::IO, e::UnsupportedMediaTypeError)
+    print(io, "Unsupported Media Type: $(e.msg)")
 end
 
 

@@ -222,7 +222,7 @@ end
         @test data["b"] == "2"
 
         # Test JSON only
-        req = Request("POST", "/", [], """{"a": 1, "b": 2}""")
+        req = Request("POST", "/", ["Content-Type" => "application/json"], """{"a": 1, "b": 2}""")
         data = payload(req)
         @test data["a"] == 1
         @test data["b"] == 2
@@ -230,9 +230,9 @@ end
         # Test Precedence (JSON > Form > Query)
         # Using HTTP Request directly to combine query and body
         req = Request("POST", "/?a=query_a&b=query_b&c=query_c", ["Content-Type" => "application/json"], """{"a": "json_a"}""")
-        # We need to force `formdata` to parse something for the test by simulating a multipart or x-www-form-urlencoded,
-        # but JSON parser won't parse it if Content-Type isn't json. 
-        # So we'll test Query + JSON first.
+        # One body cannot be both JSON and a form: `payload` reads JSON only under a JSON
+        # Content-Type (#327) and a form only when the body parses as one, so Query + JSON here,
+        # and Query + Form below.
         data = payload(req)
         @test data["a"] == "json_a" # JSON wins
         @test data["b"] == "query_b" # Fallback to Query

@@ -139,6 +139,37 @@ function _request_payload(res::HTTP.Response)
     return isempty(payload) ? nothing : payload
 end
 
+### Media types
+
+# The media type of a `Content-Type` value: everything before the first `;`, trimmed and
+# lowercased (RFC 9110 §8.3.1: type and subtype are case-insensitive; parameters follow `;`).
+function _media_type(content_type::AbstractString) :: String
+    i = findfirst(==(';'), content_type)
+    mt = i === nothing ? content_type : SubString(content_type, 1, prevind(content_type, i))
+    return lowercase(strip(mt))
+end
+
+"""
+    is_json_media_type(content_type) :: Bool
+
+Whether a `Content-Type` value names JSON: `application/json`, or any `application/*+json`
+(`application/problem+json`, `application/vnd.api+json`), compared case-insensitively with
+parameters such as `charset` ignored. An empty value -- no `Content-Type` -- is not JSON (#327).
+"""
+function is_json_media_type(content_type::AbstractString) :: Bool
+    mt = _media_type(content_type)
+    return mt == "application/json" || (startswith(mt, "application/") && endswith(mt, "+json"))
+end
+
+"""
+    is_multipart_form_media_type(content_type) :: Bool
+
+Whether a `Content-Type` value is `multipart/form-data`, compared case-insensitively with the
+`boundary` and other parameters ignored.
+"""
+is_multipart_form_media_type(content_type::AbstractString) :: Bool =
+    _media_type(content_type) == "multipart/form-data"
+
 ### Helper functions used to parse the body of a HTTP.Request object
 
 """
@@ -165,7 +196,7 @@ Read the html form data from the body of a HTTP.Request
 function formdata(req::HTTP.Request) :: Dict{String,String}
     # multipart/form-data is not urlencoded — parsing it here yields a garbage
     # key. Use `getfiles(req)` / `getpost(req)` (or `multipart(req)`) for multipart bodies.
-    if occursin("multipart/form-data", HTTP.header(req, "Content-Type", ""))
+    if is_multipart_form_media_type(HTTP.header(req, "Content-Type", ""))
         return copy(EMPTY_FORM_DATA)
     end
     body = text(req)

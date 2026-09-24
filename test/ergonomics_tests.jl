@@ -5,9 +5,12 @@ using HTTP
 using Nitro
 using Base.Threads
 
+# `getjson` reads only a body that declares itself JSON (#327).
+const JSON_CT = ["Content-Type" => "application/json"]
+
 @testset "Request ergonomics" begin
     @testset "request accessor caching" begin
-        req = HTTP.Request("POST", "/items?source=query", [], "{\"source\":\"json\",\"count\":1}")
+        req = HTTP.Request("POST", "/items?source=query", JSON_CT, "{\"source\":\"json\",\"count\":1}")
 
         first_json = getjson(req)
         second_json = getjson(req)
@@ -69,7 +72,7 @@ using Base.Threads
     end
 
     @testset "query and merged input" begin
-        req = HTTP.Request("POST", "/users/42?shared=query&only_query=1", [], "{\"shared\":\"json\",\"only_json\":2}")
+        req = HTTP.Request("POST", "/users/42?shared=query&only_query=1", JSON_CT, "{\"shared\":\"json\",\"only_json\":2}")
         req.context[:params] = Dict("shared" => "path", "id" => "42")
 
         @test getquery(req) == Dict("shared" => "query", "only_query" => "1")
@@ -91,7 +94,7 @@ using Base.Threads
 
     @testset "empty and malformed bodies degrade gracefully" begin
         empty_req = HTTP.Request("POST", "/empty", [], "")
-        bad_json_req = HTTP.Request("POST", "/bad-json", [], "{not-json")
+        bad_json_req = HTTP.Request("POST", "/bad-json", JSON_CT, "{not-json")
         plain_text_req = HTTP.Request("POST", "/plain", [], "hello world")
 
         @test isnothing(getjson(empty_req))
@@ -105,9 +108,31 @@ using Base.Threads
         @test getform(plain_text_req) == Dict{String,String}()
     end
 
+    @testset "a body that does not declare itself JSON is not read as JSON (#327)" begin
+        # `text/plain`, a form type, and no Content-Type at all are what a cross-site page can
+        # send without a CORS preflight; the body is valid JSON in every case.
+        body = "{\"role\":\"admin\"}"
+        for headers in ([], ["Content-Type" => "text/plain"],
+                        ["Content-Type" => "application/x-www-form-urlencoded"])
+            req = HTTP.Request("POST", "/items", headers, body)
+            @test isnothing(getjson(req))
+            @test !haskey(payload(req), "role")
+        end
+        for ct in ("application/json", "application/json; charset=utf-8", "APPLICATION/JSON",
+                   "application/vnd.api+json", "application/problem+json")
+            req = HTTP.Request("POST", "/items", ["Content-Type" => ct], body)
+            @test getjson(req)["role"] == "admin"
+            @test payload(req)["role"] == "admin"
+        end
+        # `application/jsonp` and `text/json` are not JSON media types.
+        for ct in ("application/jsonp", "text/json", "application/json-seq")
+            @test isnothing(getjson(HTTP.Request("POST", "/items", ["Content-Type" => ct], body)))
+        end
+    end
+
     @testset "concurrent requests keep isolated caches" begin
         tasks = [Threads.@spawn begin
-            req = HTTP.Request("POST", "/items?request=$(index)", [], "{\"request\":$(index),\"payload\":\"$(repeat('x', 128))\"}")
+            req = HTTP.Request("POST", "/items?request=$(index)", JSON_CT, "{\"request\":$(index),\"payload\":\"$(repeat('x', 128))\"}")
             req.context[:params] = Dict("request" => string(index))
             return payload(req)["request"] => getjson(req)["payload"]
         end for index in 1:8]
@@ -120,7 +145,7 @@ using Base.Threads
 
     @testset "large payloads are cached" begin
         blob = repeat("a", 100_000)
-        req = HTTP.Request("POST", "/large", [], "{\"blob\":\"$(blob)\"}")
+        req = HTTP.Request("POST", "/large", JSON_CT, "{\"blob\":\"$(blob)\"}")
 
         first_json = getjson(req)
         second_json = getjson(req)

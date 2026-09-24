@@ -6,9 +6,11 @@ using HTTP
 using Dates
 
 using ..Util: text, json, formdata, multipart, parseparam, FormFile
-using ..Util.BodyParsers: NITRO_READ_STYLE
+using ..Util.BodyParsers: NITRO_READ_STYLE, is_json_media_type, is_multipart_form_media_type
 using ..Reflection: struct_builder, extract_struct_info, kw_construct
-using ..Errors: ValidationError, is_unrecoverable
+using ..Errors: ValidationError, UnsupportedMediaTypeError, is_unrecoverable
+# The Core stub `getjson` binds to (its body is in core/request.jl, included later).
+using ...Core: getjson
 using ..Types
 using ..Cookies
 using ..Crypto: SecretString
@@ -134,6 +136,10 @@ With a `@kwdef` struct, a field the body omits takes its declared default: `{"q"
 Attach a validator by giving the parameter a default: `s = Json(Search, s -> s.limit <= 100)`.
 The *Request Body* guide has the walkthrough; use [`JsonFragment`](@ref) to bind one top-level
 key instead of the whole body.
+
+The request must declare a JSON body: `Content-Type: application/json` or an
+`application/*+json` type. Anything else, including no `Content-Type`, is a `415` (#327) — those
+are the types a cross-site page can send without a CORS preflight.
 """
 Json
 
@@ -150,7 +156,7 @@ end; method = "POST")
 ```
 
 The key's value must itself be a JSON object. A body that is not a JSON object, or that lacks
-the key, is a 400.
+the key, is a 400. Like [`Json`](@ref), it needs a JSON `Content-Type`, or it is a 415.
 """
 JsonFragment
 
@@ -298,7 +304,7 @@ function safe_extract(f::Function, param::Param{U}) :: T where {T, U <: Extracto
         #
         # A further wrap site must copy this line too.
         is_unrecoverable(e) && rethrow()
-        if e isa ValidationError
+        if e isa ValidationError || e isa UnsupportedMediaTypeError
             throw(e)
         end
         # If the function fails, we throw a ValidationError with the parameter name and type.
@@ -313,10 +319,21 @@ function safe_extract(f::Function, param::Param{U}) :: T where {T, U <: Extracto
     end
 end
 
+# A body bound as JSON must say it is JSON (#327). `text/plain`, a urlencoded form, multipart, or
+# no Content-Type at all are what a cross-site page can send without a CORS preflight, so reading
+# JSON from them regardless accepts a forged request as readily as the app's own client. The
+# message names the parameter, never the client's Content-Type.
+function require_json_media_type(param::Param, request::LazyRequest)
+    is_json_media_type(HTTP.header(request.request, "Content-Type", "")) && return nothing
+    throw(UnsupportedMediaTypeError(
+        "parameter '$(param.name)' needs a JSON body: Content-Type application/json or application/*+json"))
+end
+
 """
 Extracts a JSON object from a request and converts it into a custom struct
 """
 function extract(param::Param{Json{T}}, request::LazyRequest) :: Json{T} where {T}
+    require_json_media_type(param, request)
     instance = safe_extract(param) do
         json_bind(T, textbody(request))
     end
@@ -375,12 +392,15 @@ end
 Extracts a part of a json object from the body of a request and converts it into a custom struct
 """
 function extract(param::Param{JsonFragment{T}}, request::LazyRequest) :: JsonFragment{T} where {T}
+    require_json_media_type(param, request)
     instance = safe_extract(param) do
         # The fragment lookup belongs INSIDE the guard: a body that is not a JSON object
         # (`MethodError` on `getindex(::Nothing, ::String)`) or one missing this fragment's
         # key (`KeyError`) is client input, and used to escape as a 500 with a backtrace
         # while every sibling extractor returned a 400.
-        struct_builder(T, Types.jsonbody(request)[string(param.name)])
+        #
+        # Through the cached `getjson`, so several fragments of one body parse it once.
+        struct_builder(T, getjson(request.request)[string(param.name)])
     end
     valid_instance = try_validate(param, instance)
     return JsonFragment{T}(valid_instance, nothing)
@@ -614,8 +634,9 @@ For a `@kwdef struct`, a field absent from the body falls back to its declared d
 an absent `Union{X, Nothing}` field always binds to `nothing` (taking precedence over a
 default). A required field (no default, no `Nothing` in its type) that is absent is an error.
 
-Throws a `ValidationError` (→ 400) when the body is not multipart, a required field is
-missing, a value cannot be parsed, or `validate(::T)` / an extractor-local validator fails.
+A request whose `Content-Type` is not `multipart/form-data` is an `UnsupportedMediaTypeError`
+(→ 415). Throws a `ValidationError` (→ 400) when a required field is missing, a value cannot be
+parsed, or `validate(::T)` / an extractor-local validator fails.
 
 ```julia
 struct ImportUpload
@@ -638,8 +659,9 @@ function extract(param::Param{MultipartForm{T}}, request::LazyRequest) :: Multip
     # and gets a specific "Missing field 'X'" error instead of a misleading
     # "Content-Type must be multipart/form-data".
     content_type = HTTP.header(request.request, "Content-Type", "")
-    if !occursin("multipart/form-data", content_type)
-        throw(ValidationError("Content-Type must be multipart/form-data for parameter: $(param.name)"))
+    if !is_multipart_form_media_type(content_type)
+        # 415, like a JSON extractor given the wrong type (#327). It was a 400.
+        throw(UnsupportedMediaTypeError("parameter '$(param.name)' needs a multipart/form-data body"))
     end
 
     parsed = multipartbody(request)

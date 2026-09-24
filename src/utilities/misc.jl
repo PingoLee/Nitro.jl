@@ -2,7 +2,7 @@ using HTTP
 using JSON
 using Dates
 
-using ..Errors: ValidationError, is_unrecoverable
+using ..Errors: ValidationError, UnsupportedMediaTypeError, is_unrecoverable
 
 export recursive_merge, parseparam, parseparam_checked,
     handlerequest,
@@ -14,7 +14,11 @@ export recursive_merge, parseparam, parseparam_checked,
 
 
 function handle_error(::ValidationError)
-    return Res.json(("message" => "400: Bad Request"), status = 400)    
+    return Res.json(("message" => "400: Bad Request"), status = 400)
+end
+
+function handle_error(::UnsupportedMediaTypeError)
+    return Res.json(("message" => "415: Unsupported Media Type"), status = 415)
 end
 
 function handle_error(::Any)
@@ -61,6 +65,10 @@ function handlerequest(getresponse::Function, catch_errors::Bool; show_errors::B
                 # by tests directly, where the renderer's safety is only transitive; two
                 # independent guarantees cost nothing to keep separate.
                 show_errors && @debug "Request rejected (400 Bad Request)" message=error.msg
+            elseif error isa UnsupportedMediaTypeError
+                # Client input too, so the same treatment: no backtrace. `.msg` names the
+                # parameter and the type it needs, never the Content-Type the client sent (#327).
+                show_errors && @debug "Request rejected (415 Unsupported Media Type)" message=error.msg
             elseif show_errors && !isa(error, InterruptException)
                 @error "ERROR: " exception=(error, catch_backtrace())
             end

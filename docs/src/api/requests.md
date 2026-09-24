@@ -80,5 +80,6 @@ Session
 Context
 validate
 ValidationError
+UnsupportedMediaTypeError
 extract
 ```
