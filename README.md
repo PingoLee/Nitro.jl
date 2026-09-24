@@ -2,7 +2,7 @@
 
 Nitro is a Julia web framework built on top of HTTP.jl.
 
-The current public routing contract is centered on `path()`, `urlpatterns()`, and `include_routes()`. `serve()` is the primary server entry point and runs in parallel by default.
+The current public routing contract is centered on `path()`, `urlpatterns()`, and `include_routes()`. `serve()` is the primary server entry point and runs in parallel by default — each request on its own thread-pool task, so start Julia with `--threads=auto` and a `--heap-size-hint` in production (see [Running in Production](docs/src/tutorial/deployment.md)).
 
 ## Installation
 

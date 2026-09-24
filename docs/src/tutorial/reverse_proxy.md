@@ -64,6 +64,10 @@ sit in your thread pool. Treat request timeouts and body caps at the proxy as ca
 not just hygiene — Nitro's own `max_body_bytes` bounds the memory a single request can claim, but
 it cannot bound how long a slow client occupies the thread sending it.
 
+The other half of capacity is the process itself: how many threads it starts with, and how much
+memory its garbage collector aims for. Both are covered in
+[Running in Production](deployment.md).
+
 ## nginx
 
 ```nginx
