@@ -33,20 +33,18 @@ const MISSING_COOKIE = HTTP.Response(401, "Unauthorized: Missing or invalid auth
 # THE ONE CARVE-OUT, and it is the same at both catch sites below (#254): the three types
 # `is_unrecoverable` (`src/errors.jl`) names are rethrown instead. A bare `catch` also ate
 # `StackOverflowError`, which Julia reports as "program state may be corrupted, so further
-# execution might be unreliable" — and which arrives from request input, because `JSON.parse`
-# raises it on a deeply-nested value and a credential whose JWT header segment is base64url of
-# `[[[[…` reaches that inside `decode_jwt`. The request came back 401 and the worker carried
-# on authenticating people. #252 stopped `decode_jwt` mislabelling it an encoding error; this
-# stops this layer absorbing it anyway.
+# execution might be unreliable". The request came back 401 and the worker carried on
+# authenticating people.
 #
-# Measure the reach before citing it. On a `Threads.@spawn` task — the stack a real request
-# runs on — `JSON.parse` overflows at nesting depth ~3100, which is an `Authorization` header
-# of ~8.3 KB. That is ABOVE nginx's default `large_client_header_buffers` 8k and Apache's
-# `LimitRequestFieldSize` 8190, and far above the 4 KB per-cookie browser cap, so a
-# default-configured proxy in front of Nitro stops this particular vector and a cookie cannot
-# carry it at all. It reaches a directly-served Nitro. The same overflow needs only a ~6.2 KB
-# request BODY or query string, which nothing gates — which is why the sibling narrowing in
-# `src/utilities/bodyparsers.jl` and `src/utilities/misc.jl` matters more than this one.
+# Measure the reach before citing it — an earlier version of this comment got it wrong. On a
+# `Threads.@spawn` task `JSON.parse` overflows at nesting depth ~3100, and an UNCLOSED `[[[…`
+# gets there in ~3.1 KB: a 4,149-byte `Authorization` header once base64url-encoded into a JWT
+# header segment. That is inside nginx's 8k and Apache's 8190-byte header defaults, and a
+# hand-built request is not bound by a browser's 4 KB cookie cap, so neither a proxy nor
+# `CookieAuthMiddleware` stopped it. The fix is not here: `decode_jwt` caps the header segment
+# at 1 KB, depth-bounds every JSON parse, and decodes the claims only after the signature
+# verifies (#314), so such a token is an ordinary `AuthError` and a 401. The rethrow stays for
+# what that does not cover — above all the application's own `validate_token`.
 #
 # It is a deny-list, where `decode_jwt` one layer down uses an allow-list, and the difference
 # is the guarded expression rather than taste: that one guards Nitro's own code, a closed set;
@@ -161,10 +159,9 @@ throwing) validator yields a `401`; authorization denials are the guards' `403`.
 `InterruptException`, `StackOverflowError` and `OutOfMemoryError` are the exception, and
 **propagate** rather than becoming a `401` (#254): Julia reports a stack overflow as *"program
 state may be corrupted"*, which is not an authentication outcome and must not be served as one.
-A bearer token whose header segment is base64url of `[[[[…` reaches one through `JSON.parse`,
-so this is request-reachable, not theoretical — though for *this* path it takes an ~8.3 KB
-`Authorization` header, which nginx's and Apache's default per-header caps refuse. Nitro served
-directly accepts it. They arrive at the server's error path as a `500`.
+They arrive at the server's error path as a `500`. A crafted token no longer produces one:
+`decode_jwt` and `jwt_validator` bound the JSON they parse and decode the claims only after
+the signature verifies, so a bearer token of base64url `[[[[…` is an ordinary `401` (#314).
 
 On success the validator's claims replace anything already at `req.context[:auth_claims]`,
 and a validator returning a plain user object clears that slot — the two slots always

@@ -48,6 +48,99 @@ function _request_payload(res::HTTP.Response)
     return isempty(payload) ? nothing : payload
 end
 
+### Bounded JSON parsing (#314)
+
+"""
+    MAX_JSON_DEPTH
+
+The deepest nesting of arrays and objects Nitro will hand to `JSON.parse`: **512**. A document
+nested any deeper is rejected as malformed JSON before the parser sees it.
+
+JSON.jl parses by recursive descent and has no depth option, so without this bound the depth
+of a request's JSON is the depth of the parser's recursion, and a small request exhausts the
+stack. Measured on a `Threads.@spawn` task -- the stack every request runs on -- with JSON 1.8.0
+and Julia 1.12.7, the first depth that raises `StackOverflowError`:
+
+| input | overflows at depth |
+|---|---|
+| untyped `[[[…]]]`, or unclosed `[[[…` | ~3,100 |
+| untyped objects (`dicttype = Dict{String, Any}`), typed `Dict{String, Any}` | ~3,800 |
+| typed `Vector{Any}` | ~3,900 |
+| typed `Dict{String, JSON.JSONText}` | ~5,900 |
+
+An unclosed `[[[…` reaches that in ~3.1 KB, which is a ~4.1 KB bearer token once base64url
+encoded. Catching the overflow is not a defence: Julia reports program state as possibly
+corrupted afterwards, and on some Windows hosts the process dies outright (#301). 512 leaves a
+6× margin for larger stack frames (Win64, coverage builds, user types) and for the stack the
+middleware chain has already used, and is far deeper than any real payload.
+
+Internal and fixed on purpose. Every request-data `JSON.parse` in Nitro goes through
+`_parse_json_bounded`, and `test/bodyparser_tests.jl` fails if one does not.
+"""
+const MAX_JSON_DEPTH = 512
+
+@noinline _throw_json_too_deep() =
+    throw(ArgumentError("JSON nesting exceeds the maximum depth of $MAX_JSON_DEPTH"))
+
+"""
+    _check_json_depth(bytes) -> nothing
+
+Throw `ArgumentError` if the JSON text `bytes` nests arrays and objects deeper than
+`MAX_JSON_DEPTH`. One pass, no allocation, no recursion -- it must not be able to fail
+the way the parser it guards does.
+
+It counts `[`/`{` against `]`/`}` outside string literals; inside one, `\\` skips the next byte
+and `"` closes it. On any valid prefix of a JSON document that count IS the parser's recursion
+depth: JSON has no comments or single-quoted strings, a `\\uXXXX` escape contains neither `"`
+nor `\\`, and no byte of a multi-byte UTF-8 sequence matches an ASCII delimiter. It does not
+validate anything else -- malformed input that stays shallow is left to `JSON.parse`, which
+rejects it at the first bad byte. The count never goes below zero, so leading stray closers
+cannot bank depth for a later run of openers. (With `jsonlines = true` the parser adds one
+implicit root array, so it recurses one level deeper than the count -- immaterial at this margin.)
+
+`ArgumentError` is what `JSON.parse` itself throws on malformed input, so a too-deep document
+lands on every caller's existing "not JSON" path. The message names the limit, never the input.
+"""
+function _check_json_depth(bytes::AbstractVector{UInt8})
+    depth = 0
+    instring = false
+    escaped = false
+    for b in bytes
+        if instring
+            if escaped
+                escaped = false
+            elseif b == UInt8('\\')
+                escaped = true
+            elseif b == UInt8('"')
+                instring = false
+            end
+        elseif b == UInt8('"')
+            instring = true
+        elseif b == UInt8('[') || b == UInt8('{')
+            depth += 1
+            depth > MAX_JSON_DEPTH && _throw_json_too_deep()
+        elseif (b == UInt8(']') || b == UInt8('}')) && depth > 0
+            depth -= 1
+        end
+    end
+    return nothing
+end
+
+_check_json_depth(s::AbstractString) = _check_json_depth(codeunits(s))
+
+"""
+    _parse_json_bounded(buf, T = Any; kwargs...)
+
+`JSON.parse(buf, T; kwargs...)` after `_check_json_depth`. The one way Nitro parses JSON
+that came from a request -- body, query string, path segment, cookie, or JWT segment -- so the
+parser's recursion is bounded by `MAX_JSON_DEPTH` and never by the input (#314).
+Throws `ArgumentError` for a too-deep document, like any other malformed one.
+"""
+function _parse_json_bounded(buf::Union{AbstractVector{UInt8}, AbstractString}, ::Type{T} = Any; kwargs...) where {T}
+    _check_json_depth(buf)
+    return JSON.parse(buf, T; kwargs...)
+end
+
 ### Helper functions used to parse the body of a HTTP.Request object
 
 """
@@ -131,6 +224,9 @@ end
     json(request::HTTP.Request; keyword_arguments...)
 
 Read the body of a HTTP.Request as JSON with additional arguments for the read/serializer.
+
+Returns `nothing` when the body is empty or is not JSON -- including a document nested deeper
+than 512 arrays/objects, which is rejected before parsing (#314).
 """
 function json(req::HTTP.Request; kwargs...)
     payload = _request_payload(req)
@@ -138,15 +234,16 @@ function json(req::HTTP.Request; kwargs...)
         return nothing
     end
     try
-        return JSON.parse(IOBuffer(payload); kwargs...)
+        return _parse_json_bounded(payload; kwargs...)
     catch e
-        # `nothing` means "the body was not JSON", and that is the whole contract here.
+        # `nothing` means "the body was not JSON", and that is the whole contract here. A
+        # document nested past `MAX_JSON_DEPTH` is one of those: `_parse_json_bounded`
+        # rejects it with an `ArgumentError` before `JSON.parse` can recurse into it (#314).
         #
-        # It used to also mean "the body was 20 KB of `[[[[…`, `JSON.parse` blew the stack,
-        # and Julia says program state may be corrupted" -- swallowed, unlogged, on a route
-        # needing no credentials at all, after which the handler served a normal 200 off
-        # that worker (#254). This is the same defect as the auth middleware's, one layer
-        # out and reachable by anyone.
+        # Before that bound, 3 KB of `[[[[…` blew the stack here, and a bare catch served
+        # the handler a normal 200 off a worker Julia called possibly corrupt (#254). The
+        # rethrow stays for what the bound does not cover -- `OutOfMemoryError`, an
+        # `InterruptException`, or a regression in the bound itself.
         is_unrecoverable(e) && rethrow()
         return nothing
     end
@@ -158,11 +255,11 @@ function json(res::HTTP.Response; kwargs...)
         return nothing
     end
     try
-        return JSON.parse(IOBuffer(payload); kwargs...)
+        return _parse_json_bounded(payload; kwargs...)
     catch e
-        # Same narrowing as the `Request` method above (#254). This one reads a RESPONSE
-        # body, so it is not the attacker-reachable path -- it is here because the contract
-        # ("not JSON" -> `nothing`) is the same and the two must not drift.
+        # Same contract and bound as the `Request` method above (#254, #314). This one reads
+        # a RESPONSE body, so it is not the attacker-reachable path -- it is here because the
+        # contract ("not JSON" -> `nothing`) is the same and the two must not drift.
         is_unrecoverable(e) && rethrow()
         return nothing
     end
@@ -172,13 +269,16 @@ end
     json(request::HTTP.Request, class_type::Type{T}; keyword_arguments...)
 
 Read the body of a HTTP.Request as JSON with additional arguments for the read/serializer into a custom struct.
+
+Throws `ArgumentError` when the body is not JSON, including a document nested deeper than 512
+arrays/objects (#314).
 """
 function json(req::HTTP.Request, class_type::Type{T}; kwargs...) where {T}
     payload = _request_payload(req)
     if isnothing(payload)
         return nothing
     end
-    return JSON.parse(IOBuffer(payload), class_type; kwargs...)
+    return _parse_json_bounded(payload, class_type; kwargs...)
 end
 
 function json(res::HTTP.Response, class_type::Type{T}; kwargs...) where {T}
@@ -186,7 +286,7 @@ function json(res::HTTP.Response, class_type::Type{T}; kwargs...) where {T}
     if isnothing(payload)
         return nothing
     end
-    return JSON.parse(IOBuffer(payload), class_type; kwargs...)
+    return _parse_json_bounded(payload, class_type; kwargs...)
 end
 
 

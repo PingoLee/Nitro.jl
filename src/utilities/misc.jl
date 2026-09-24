@@ -3,6 +3,7 @@ using JSON
 using Dates
 
 using ..Errors: ValidationError, is_unrecoverable
+using .BodyParsers: _parse_json_bounded
 
 export recursive_merge, parseparam, parseparam_checked,
     handlerequest,
@@ -192,17 +193,17 @@ function parseparam(::Type{T}, str::String) where {T}
         return parse(T, str)
     catch e
         # This is the method every scalar type below the specialized ones lands in, so it is
-        # where the swallow would actually happen — falling through to `JSON.parse` and, one
+        # where the swallow would actually happen — falling through to the JSON parse and, one
         # layer up, being reported as a client error. The matching guard in
         # `parseparam_checked` never sees it without this rethrow.
         #
-        # Widened past `InterruptException` in #254, and the fall-through below is precisely
-        # why: `JSON.parse` raises `StackOverflowError` on a deeply-nested value, so a ~20 KB
-        # query string of `[[[[…` reaches it through ANY scalar parameter -- `parse(Int, str)`
-        # fails first, lands here, and overflows. That was reported as `400 Bad Request` off a
-        # worker Julia had just called possibly corrupt.
+        # The fall-through below is reachable from ANY scalar parameter: `parse(Int, str)`
+        # fails first and lands here. Unbounded, `JSON.parse` overflowed the stack on ~3 KB of
+        # `[[[[…` in a query string (#254). `_parse_json_bounded` rejects anything nested past
+        # `MAX_JSON_DEPTH` as malformed before the parser recurses (#314), so that is now an
+        # `ArgumentError` -> `ValidationError` -> 400 like any other bad value.
         is_unrecoverable(e) && rethrow()
-        return JSON.parse(str, T)
+        return _parse_json_bounded(str, T)
     end
 end
 
@@ -234,9 +235,10 @@ function parseparam_checked(::Type{T}, str::String, name::String, source::Symbol
     try
         return parseparam(T, str)
     catch e
-        # #254: not just an interrupt. A deeply-nested query value overflows the stack inside
-        # `parseparam`'s `JSON.parse` fall-through; wrapping that in a `ValidationError` calls
-        # a corrupted worker a client mistake.
+        # #254: not just an interrupt. Wrapping a `StackOverflowError` or `OutOfMemoryError`
+        # in a `ValidationError` would call a corrupted worker a client mistake. A deeply
+        # nested value no longer gets that far -- the JSON fall-through is depth-bounded
+        # (#314) -- so this is the backstop, not the defence.
         is_unrecoverable(e) && rethrow()
         # Already well-formed (e.g. the `Regex` length cap above) — do not double-wrap.
         e isa ValidationError && rethrow()

@@ -6,7 +6,9 @@
 - **Severity**: **behavior change** — a request that returned `401` (auth), `403` (CSRF),
   `400` (typed extractors and scalar path/query parameters) or `200` with an empty parse
   result (body parsers) can now produce a `500`. Only for the three exception types named
-  below; every other failure is unchanged.
+  below; every other failure is unchanged. Request input no longer raises one: the
+  deeply-nested JSON that did is rejected as malformed before it is parsed since
+  [#314](https://github.com/PingoLee/Nitro.jl/issues/314), which has its own entry.
 
 ### What changed
 
@@ -26,10 +28,11 @@ Julia reports a stack overflow as *"program state may be corrupted, so further e
 be unreliable"*. Reporting that as a routine authentication failure, and then continuing to
 serve from the same worker, is the defect.
 
-**It is request-reachable, and one path needs no credentials at all.** `JSON.parse` raises
+**It was request-reachable, and one path needed no credentials at all.** `JSON.parse` raises
 `StackOverflowError` on a deeply-nested value. Measured on a `Threads.@spawn` task — the stack
-a real request runs on — the threshold is nesting depth ~3100, i.e. **~6.2 KB** of `[[[[…` as a
-body or query string, and **~8.3 KB** once base64url-encoded into a JWT header segment:
+a real request runs on — the threshold is nesting depth ~3100, i.e. **~3.1 KB** of unclosed
+`[[[[…` as a body or query string (~6.2 KB closed), and a **4,149-byte** `Authorization` header
+once base64url-encoded into a JWT header segment:
 
 - Through **auth**: a bearer token whose header segment is base64url of that nesting reaches it
   inside `decode_jwt`. `BearerAuth`/`CookieAuthMiddleware` answered `401`.
@@ -46,15 +49,18 @@ body or query string, and **~8.3 KB** once base64url-encoded into a JWT header s
 - Through **CSRF**: `CSRFMiddleware` looks for a token in the parsed body, so a protected POST
   with such a body answered `403`.
 
-All five now propagate.
+This change made all five propagate. [#314](https://github.com/PingoLee/Nitro.jl/issues/314)
+then removed the input class itself: JSON nested deeper than 512 levels is rejected as malformed
+before `JSON.parse` sees it, and `decode_jwt` caps the header segment at 1 KB and decodes the
+claims only after the signature verifies. Each path above now gives such a request its ordinary
+malformed-input answer, with no overflow; see that entry.
 
-**The auth path is the narrowest of them, and worth sizing before you panic about it.** At
-~8.3 KB the `Authorization` header is above nginx's default `large_client_header_buffers` (8k)
-and Apache's `LimitRequestFieldSize` (8190), so a default-configured reverse proxy refuses it;
-the `CookieAuthMiddleware` variant cannot be reached at all, since browsers cap a cookie at
-4 KB. Nitro served directly does accept it. The **body**, **scalar parameter** and **extractor**
-paths need only ~6.2 KB and nothing gates those anywhere — they are the ones that matter in a
-proxied deployment.
+**An earlier version of this entry sized the auth path wrongly.** It said the token needed
+~8.3 KB, so nginx's default `large_client_header_buffers` (8k) and Apache's
+`LimitRequestFieldSize` (8190) refused it, and that browsers' 4 KB cookie cap put the
+`CookieAuthMiddleware` variant out of reach. An *unclosed* `[[[[…` overflows in half the bytes
+— 4,149 bytes of header, inside both proxies' defaults — and a hand-built request is not bound
+by what a browser will store. Neither a proxy nor the cookie path stopped it.
 
 [#45](https://github.com/PingoLee/Nitro.jl/issues/45) narrowed `decode_jwt`'s own catch so the
 overflow stopped being *reported* as an encoding error; this change stops the layers above from
@@ -86,7 +92,7 @@ Nothing in your app has to change for Nitro's own behavior to be correct. Look f
 rg -n 'catch\s*$' <app>/src
 
 # 2. Code that treats "getjson returned nothing" as "the body was not JSON". That is still
-#    true for malformed input, but a hostile body now raises instead of landing here.
+#    true for malformed input -- and since #314 a too-deeply-nested body is malformed input.
 rg -n 'getjson|json\(req' <app>/src
 
 # 3. Custom validators handed to BearerAuth / CookieAuthMiddleware, if they wrap work in a
@@ -115,13 +121,12 @@ end
 ```
 
 If a route takes a typed extractor (`Json{T}`, `Body{T}`, a scalar `<int:…>` converter), there
-is nothing to change: it simply stops answering `400` for this one input class and answers
-`500` instead, consistently with the untyped path.
+is nothing to change. A body engineered to break the parser is, since #314, simply malformed
+input there: a `400`, the same answer the route gives any other bad body.
 
 If a handler relies on `getjson(req) === nothing` to mean "no usable body", it keeps working
-for every malformed body. It no longer covers a body engineered to break the parser, which now
-returns a `500` instead of running the handler — which is the point.
+for every malformed body, and since #314 that includes one nested deep enough to break an
+unbounded parser.
 
-Rejecting such a body earlier is a size question, not a parse question: cap it with
-`serve(...; max_body_bytes = N)`. A 20 KB body is well inside most caps, so a cap alone does
-not close this.
+A body-size cap (`serve(...; max_body_bytes = N)`) never closed this — 3 KB of `[[[[…` was
+enough — which is why #314 bounds nesting depth instead of size.

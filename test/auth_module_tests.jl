@@ -280,18 +280,30 @@ end
     @test err isa Nitro.Auth.AuthError
     @test occursin("Invalid JWT header", sprint(showerror, err))
 
-    err = caught(() -> Nitro.Auth.decode_jwt(string(b64json(Dict("alg" => "HS256")), ".", arr, ".x"), secret))
+    # The claims case, on the three paths that can reach it. Since #314 the claims segment is
+    # decoded only AFTER the signature verifies (RFC 7519 §7.2), so on `verify=true` only a
+    # secret-holder's token gets as far as the object check; a forged one is rejected by the
+    # signature first. This used to be a single forged-token case expecting
+    # "Invalid JWT claims" -- that was the pre-#314 order, where the claims were parsed and
+    # checked before the MAC.
+    err = caught(() -> Nitro.Auth.decode_jwt(signed(Dict("alg" => "HS256"), Any[]), secret))
+    @test err isa Nitro.Auth.AuthError
+    @test occursin("Invalid JWT claims", sprint(showerror, err))
+    forged_arr = string(b64json(Dict("alg" => "HS256")), ".", arr, ".AAAA")
+    @test sprint(showerror, caught(() -> Nitro.Auth.decode_jwt(forged_arr, secret))) ==
+        "Invalid JWT signature"
+    err = caught(() -> Nitro.Auth.decode_jwt(forged_arr, secret; verify=false))
     @test err isa Nitro.Auth.AuthError
     @test occursin("Invalid JWT claims", sprint(showerror, err))
 
     # The header case is reachable from an attacker-controlled bearer token; the CLAIMS case
-    # is not, on `verify=true` -- you cannot reach `validate_claims` without first passing
-    # the signature check, so an attacker gets "Invalid JWT signature". It is reachable
+    # is not, on `verify=true` -- you cannot reach the claims without first passing the
+    # signature check, so an attacker gets "Invalid JWT signature" (above). It is reachable
     # offline, and by a secret-holder. Both must stay AuthError on both paths.
     @test_throws Nitro.Auth.AuthError Nitro.Auth.decode_jwt("W10.W10.x", secret)
     @test_throws Nitro.Auth.AuthError Nitro.Auth.decode_jwt("W10.W10.x", secret; verify=false)
 
-    # -- The rest of the same class: the DECODERS are sinks too, and both run before the
+    # -- The rest of the same class: the DECODERS are sinks too, and run before the
     # `isa AbstractDict` guards above. `base64decode` throws ArgumentError on a bad alphabet
     # or an unpaddable length, `JSON.parse` on anything that is not JSON. Guarding only the
     # parsed value left the class half closed, and length-dependently so -- which is exactly
@@ -309,7 +321,6 @@ end
         ("header not JSON",       string(raw64("foo"), ".", good_claims, ".x")),
         ("header truncated JSON", string(raw64("{\"alg\":"), ".", good_claims, ".x")),
         ("header empty",          string("", ".", good_claims, ".x")),
-        ("claims not JSON",       string(good_header, ".", raw64("foo"), ".x")),
     ]
     for (label, tok) in malformed, v in (true, false)
         err = caught(() -> Nitro.Auth.decode_jwt(tok, secret; verify=v))
@@ -317,6 +328,21 @@ end
         # Pin the message, like every other assertion in this testset: `err isa AuthError`
         # alone is satisfied by any rejection, including one for the wrong reason.
         @test (label, v, occursin("Invalid JWT encoding", sprint(showerror, err))) == (label, v, true)
+    end
+
+    # A claims segment that is not JSON is the same sink, reached later: after the signature
+    # on `verify=true` (#314, RFC 7519 §7.2). It used to sit in the loop above, expecting
+    # "Invalid JWT encoding" on both paths from a forged token -- the pre-#314 order.
+    garbage_claims = string(good_header, ".", raw64("foo"))
+    signed_garbage = string(garbage_claims, ".",
+        Nitro.Auth._base64url_encode(Nitro.Auth._hmac_sha256(secret, garbage_claims)))
+    for (label, tok, v, want) in (
+            ("offline",   string(garbage_claims, ".x"), false, "Invalid JWT encoding"),
+            ("signed",    signed_garbage,               true,  "Invalid JWT encoding"),
+            ("forged",    string(garbage_claims, ".AAAA"), true, "Invalid JWT signature"))
+        err = caught(() -> Nitro.Auth.decode_jwt(tok, secret; verify=v))
+        @test (label, err isa Nitro.Auth.AuthError) == (label, true)
+        @test (label, sprint(showerror, err)) == (label, want)
     end
 
     # The sharpest instance, and the one that is NOT length-independent: a well-formed
@@ -352,6 +378,78 @@ end
     @test (claims["sub"], kid) == ("42", "rotated")
     mislabeled = signed(Dict("alg" => "HS256", "typ" => "JWT", "kid" => "default"), payload; key = "secret-b")
     @test_throws Nitro.Auth.AuthError Nitro.Auth.decode_jwt(mislabeled, keyset)
+end
+
+# A `dicttype` whose constructor throws: it runs inside `_jwt_segment_json`'s `try`, which is
+# the only way left to reach that block with something other than an `ArgumentError` now that
+# the header cap and the depth bound answer a deep token first.
+struct JWTBoomDict <: AbstractDict{String, Any} end
+JWTBoomDict() = throw(OutOfMemoryError())
+
+@testset "JWT header cap; claims decoded only after the signature (#314)" begin
+    # An unsigned token used to reach TWO recursive-descent JSON parses before the MAC, and a
+    # 4.1 KB `[[[…` header overflowed the stack. Now: the header segment is capped, every
+    # segment's JSON is depth-bounded, and the claims wait for the signature. Each assertion
+    # below fails against the pre-#314 decoder -- the deep-input overflow itself is exercised
+    # in a subprocess, in test/bodyparser_tests.jl.
+    secret = "secret-a"
+    raw64(str) = Nitro.Auth._base64url_encode(Vector{UInt8}(codeunits(str)))
+    b64json(data) = raw64(JSON.json(data))
+    sign(input; key = secret) = string(input, ".", Nitro.Auth._base64url_encode(Nitro.Auth._hmac_sha256(key, input)))
+    payload = Dict("sub" => "42", "exp" => NOW_TS + 3600)
+    caught(f) = try; f(); nothing; catch err; err; end
+    msg(f) = (err = caught(f); err isa Nitro.Auth.AuthError ? sprint(showerror, err) : err)
+
+    # -- The cap, on a GENUINELY signed token, so what rejects it is the size and nothing
+    # else. 768 bytes of header JSON encode to exactly 1024 base64url characters; 769, to 1026.
+    padded(n) = Dict("alg" => "HS256", "typ" => "JWT", "x" => "a"^n)
+    base = ncodeunits(JSON.json(padded(0)))
+    at_cap = sign(string(b64json(padded(768 - base)), ".", b64json(payload)))
+    over_cap = sign(string(b64json(padded(769 - base)), ".", b64json(payload)))
+    @test ncodeunits(first(split(at_cap, '.'))) == 1024
+    @test ncodeunits(first(split(over_cap, '.'))) == 1026
+    for v in (true, false)
+        @test Nitro.Auth.decode_jwt(at_cap, secret; verify=v)["sub"] == "42"
+        @test (v, msg(() -> Nitro.Auth.decode_jwt(over_cap, secret; verify=v))) ==
+            (v, "Invalid JWT header: longer than 1024 bytes")
+    end
+
+    # -- Claims nested past the bound. 601 levels parse fine unbounded, so the first two
+    # discriminate: a signed token's claims are decoded and rejected, and so are an offline
+    # decode's. The forged case would read "Invalid JWT signature" unbounded too; it is here
+    # to pin the ORDER -- once the bound exists, only claims-after-signature keeps it a
+    # signature failure rather than "Invalid JWT encoding".
+    deep_claims = raw64("{\"a\":" * repeat("[", 600) * repeat("]", 600) * "}")
+    header = b64json(Dict("alg" => "HS256", "typ" => "JWT"))
+    @test msg(() -> Nitro.Auth.decode_jwt(sign(string(header, ".", deep_claims)), secret)) ==
+        "Invalid JWT encoding"
+    @test msg(() -> Nitro.Auth.decode_jwt(string(header, ".", deep_claims, ".x"), secret; verify=false)) ==
+        "Invalid JWT encoding"
+    @test msg(() -> Nitro.Auth.decode_jwt(string(header, ".", deep_claims, ".AAAA"), secret)) ==
+        "Invalid JWT signature"
+
+    # -- A header nested past the bound cannot fit under the cap (513 levels need 1,026 bytes
+    # of JSON; 1024 encoded bytes decode to 768), so the cap is what answers an oversized one.
+    # #314's own 4,149-byte token is deliberately NOT replayed here: if the cap and the bound
+    # both regressed it would overflow this worker. It runs in a disposable child instead --
+    # the AUTH_REPRO and AUTH_COOKIE steps in test/bodyparser_tests.jl.
+
+    # -- `encode_jwt` does not mint what `decode_jwt` refuses. Only a keyset's kid can grow
+    # the header; 800 characters is past the cap, 100 is nowhere near it.
+    err = caught(() -> Nitro.Auth.encode_jwt(payload, Nitro.Auth.JWTKeyset("k"^800 => "secret-z")))
+    @test err isa ArgumentError
+    @test occursin("1024", sprint(showerror, err))
+    @test !occursin("k"^800, sprint(showerror, err))
+    fits = Nitro.Auth.JWTKeyset("k"^100 => "secret-z")
+    @test Nitro.Auth.decode_jwt(Nitro.Auth.encode_jwt(payload, fits), fits)["sub"] == "42"
+
+    # -- The segment decoder's allow-list: an `ArgumentError` (bad base64, bad or too-deep
+    # JSON) is "Invalid JWT encoding"; anything else is not a bad token and goes through
+    # (#254). A real overflow used to pin this from the bearer path; the cap now answers that
+    # token first, so pin it from inside the guarded block instead.
+    @test_throws OutOfMemoryError Nitro.Auth._jwt_segment_json(raw64("{}"); dicttype = JWTBoomDict)
+    @test msg(() -> Nitro.Auth._jwt_segment_json("!")) == "Invalid JWT encoding"
+    @test msg(() -> Nitro.Auth._jwt_segment_json(raw64(repeat("[", 513)))) == "Invalid JWT encoding"
 end
 
 @testset "kid-less tokens try every key in the keyset (#253)" begin
