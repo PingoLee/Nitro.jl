@@ -58,6 +58,13 @@ Report missing env vars by name; do not invent secret values.
       `serve(...; access_log_query=true)` only when you are certain no secrets travel in
       query strings.
 - [ ] Worker `worker_startup(..., store=..., recover_zombies=...)` configured if background queues are used (`workers.instructions.md`).
+- [ ] **Process sizing is set on the unit, not left to defaults.** The start command passes
+      `--threads` (a bare `julia` serves on **one** thread), and the GC has a target: a
+      `--heap-size-hint` / `JULIA_HEAP_SIZE_HINT`, or a cgroup limit (`MemoryMax=`, container
+      memory limit), which Julia reads automatically. With neither, the GC has no memory-derived
+      ceiling at all. The hint must sit above peak live data **plus 250 MiB** (an undersized hint
+      thrashes rather than crashing) and below any `MemoryMax=`. Neither turns an OOM kill into a
+      Julia backtrace. See `docs/src/tutorial/deployment.md`.
 
 ## 4. Reverse proxy (when requested)
 
