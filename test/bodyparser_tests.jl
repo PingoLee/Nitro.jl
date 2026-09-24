@@ -402,8 +402,8 @@ end
 # host) or prints `=PROPAGATED:StackOverflowError` (elsewhere -- which relies on #254's rethrow
 # still standing behind the bound; the in-process item below pins that rethrow synthetically),
 # and the failure names the step and the CPU. The AT_LIMIT step parses the deepest document the
-# bound admits on a request-sized
-# stack, so every CI host checks that the limit itself is safe there.
+# bound admits on a request-sized stack, so every CI host checks that the limit itself is safe
+# there.
 #
 # The child scripts carry NO backslash-escaped quote on purpose. Julia's `raw"""` is raw about
 # every backslash EXCEPT one before a quote, so an escaped-quote JSON literal written here
@@ -804,6 +804,8 @@ Base.parse(::Type{DepthBoom}, ::String) = throw(OutOfMemoryError())
     # `parseparam`'s own rethrow (before its JSON fall-through), then `parseparam_checked`'s
     # (before it wraps everything else in a `ValidationError`) -- both must hold for this.
     @test_throws OutOfMemoryError Nitro.parseparam_checked(DepthBoom, "x", "n", :query)
+    # ... and the `Union` method's own rethrow, which tries each member type in turn.
+    @test_throws OutOfMemoryError Nitro.parseparam_checked(Union{Nothing, DepthBoom}, "x", "n", :query)
     # Ordinary failures on the same paths are still absorbed.
     @test json(jreq("not json")) === nothing
     @test_throws Nitro.ValidationError Nitro.parseparam_checked(Int, "x", "n", :query)

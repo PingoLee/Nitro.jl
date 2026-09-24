@@ -42,10 +42,11 @@ Each path gives a too-deep document the answer it already gave malformed JSON:
 | `json(res::HTTP.Response)` / `json(res, T)` on a body nested past 512 levels | parsed | `nothing` / throws `ArgumentError`, like the request parsers |
 | `encode_jwt` with a keyset `kid` of ~730+ characters | minted | `ArgumentError` |
 
-Through `BearerAuth`/`CookieAuthMiddleware`, the header cap is the one JWT row that changes an
+Through `BearerAuth`/`CookieAuthMiddleware`, the header cap is the JWT row that changes an
 answer: a validly signed token whose encoded header is over 1 KB used to authenticate and is now
-a `401`. The forged-claims row was a `401` there before and still is; only a direct `decode_jwt`
-caller sees its message change. The [#254](https://github.com/PingoLee/Nitro.jl/issues/254)
+a `401` (so is one whose claims nest past 512 levels, which no real issuer produces). The
+forged-claims row was a `401` there before and still is; only a direct `decode_jwt` caller sees
+its message change. The [#254](https://github.com/PingoLee/Nitro.jl/issues/254)
 entry describes deep JSON reaching a `500`; with this change it never does.
 
 ### How to find the calls to migrate

@@ -380,6 +380,12 @@ end
     @test_throws Nitro.Auth.AuthError Nitro.Auth.decode_jwt(mislabeled, keyset)
 end
 
+# A `dicttype` whose constructor throws: it runs inside `_jwt_segment_json`'s `try`, which is
+# the only way left to reach that block with something other than an `ArgumentError` now that
+# the header cap and the depth bound answer a deep token first.
+struct JWTBoomDict <: AbstractDict{String, Any} end
+JWTBoomDict() = throw(OutOfMemoryError())
+
 @testset "JWT header cap; claims decoded only after the signature (#314)" begin
     # An unsigned token used to reach TWO recursive-descent JSON parses before the MAC, and a
     # 4.1 KB `[[[…` header overflowed the stack. Now: the header segment is capped, every
@@ -436,6 +442,14 @@ end
     @test !occursin("k"^800, sprint(showerror, err))
     fits = Nitro.Auth.JWTKeyset("k"^100 => "secret-z")
     @test Nitro.Auth.decode_jwt(Nitro.Auth.encode_jwt(payload, fits), fits)["sub"] == "42"
+
+    # -- The segment decoder's allow-list: an `ArgumentError` (bad base64, bad or too-deep
+    # JSON) is "Invalid JWT encoding"; anything else is not a bad token and goes through
+    # (#254). A real overflow used to pin this from the bearer path; the cap now answers that
+    # token first, so pin it from inside the guarded block instead.
+    @test_throws OutOfMemoryError Nitro.Auth._jwt_segment_json(raw64("{}"); dicttype = JWTBoomDict)
+    @test msg(() -> Nitro.Auth._jwt_segment_json("!")) == "Invalid JWT encoding"
+    @test msg(() -> Nitro.Auth._jwt_segment_json(raw64(repeat("[", 513)))) == "Invalid JWT encoding"
 end
 
 @testset "kid-less tokens try every key in the keyset (#253)" begin
