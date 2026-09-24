@@ -88,12 +88,14 @@ end
 end
 
 # `serve` owns the check, before it mutates anything: a rejected call must leave the app exactly
-# as it was, not half-configured and not listening. Port 1 on purpose: the call must refuse
-# before it binds, and if it ever gets that far it fails loudly instead of quietly taking a port
-# in an item that is meant to be socket-free.
+# as it was, not half-configured and not listening. The `secret_key` is there so that a
+# regression which stored the cookie config first would store a DIFFERENT value, one the
+# `cookies[]` assertion below can see. Port 1 because the call must refuse before it binds: on
+# Linux a regression then fails loudly at bind, and on every OS the `finally` below tears down
+# anything it did start, and `rejects` reports false.
 function rejects(app, prefix)
     try
-        serve(app; prefix, port = 1, host = HOST, async = true,
+        serve(app; prefix, port = 1, host = HOST, async = true, secret_key = "k"^32,
               show_errors = false, show_banner = false)
     catch e
         return e isa ArgumentError
