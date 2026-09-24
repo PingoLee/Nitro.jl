@@ -98,7 +98,9 @@ function rejects(app, prefix)
         serve(app; prefix, port = 1, host = HOST, async = true, secret_key = "k"^32,
               show_errors = false, show_banner = false)
     catch e
-        return e isa ArgumentError
+        # The PREFIX check, specifically: the call validates `secret_key` too, and a tightened
+        # key rule must not make every case pass without testing the prefix at all.
+        return e isa ArgumentError && occursin("prefix", e.msg)
     finally
         isopen(app.service) && terminate(app)
     end
