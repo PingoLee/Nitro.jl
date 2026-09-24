@@ -494,10 +494,10 @@ returns `nothing` (pass) or a response (deny). They run after auth middleware, i
 | Guard | Passes when | Denies with |
 |---|---|---|
 | `login_required(; redirect_url, session_key)` | An auth middleware attached an identity, **or** the session carries one under `session_key` | 302 → `redirect_url` |
-| `claim_required(claim, value; kind=:equals)` | `principal[claim] == value` | 403 |
-| `claim_required(claim, value; kind=:contains)` | `value in principal[claim]` (a list) | 403 |
-| `role_required(role; role_key="role")` | alias: `claim_required(role_key, role)` | 403 |
-| `permission_required(perm; permissions_key="permissions")` | alias: `claim_required(permissions_key, perm; kind=:contains)` | 403 |
+| `claim_required(claim, value; kind=:equals, session_key="user_id")` | `principal[claim] == value` | 403 |
+| `claim_required(claim, value; kind=:contains, session_key="user_id")` | `value in principal[claim]` (a list) | 403 |
+| `role_required(role; role_key="role", session_key="user_id")` | alias: `claim_required(role_key, role)` | 403 |
+| `permission_required(perm; permissions_key="permissions", session_key="user_id")` | alias: `claim_required(permissions_key, perm; kind=:contains)` | 403 |
 | `kid_required(allowed)` | The principal's **verified** `kid` is in `allowed` | 403 |
 
 Notes:
@@ -505,7 +505,8 @@ Notes:
 - The claim guards read any dict-like principal — a `Principal`, a plain claims dict from
   a custom validator, the `Principal` at `req.context[:auth_claims]` when your
   `user_validator` returned a non-dict user object, or (last) the raw session dict of a
-  session-authenticated app. Full precedence and its rationale: §2.
+  session-authenticated app, while it carries the login marker (`session_key`). Full
+  precedence and its rationale: §2.
 - `kid_required` has **no** session fallback and never trusts a claim named `"kid"` —
   only the keyset-verified key id carried by a `Principal`. No trusted kid ⇒ 403.
 - Guards deny with a shared constant `403 Forbidden` response; bodies are stable and safe

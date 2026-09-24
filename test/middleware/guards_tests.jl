@@ -320,10 +320,11 @@ using Nitro: GuardMiddleware, login_required, role_required, permission_required
 
         # A non-claims `:user` suppresses the raw-session fallback: a middleware vouched
         # for this request with a struct identity, so an unauthenticated session dict is
-        # not promoted into a claims source for it.
+        # not promoted into a claims source for it. These sessions carry the login marker
+        # (#337) so each denial below is owed to the rule it names, not to the marker gate.
         req_session = HTTP.Request("GET", "/test")
         req_session.context[:user] = app_user
-        req_session.context[:session] = Dict{String,Any}("role" => "admin")
+        req_session.context[:session] = Dict{String,Any}("user_id" => 7, "role" => "admin")
         @test role_required("admin")(req_session).status == 403
 
         # `:user` is the VOUCHING slot, and only it gates the session fallback. A non-dict
@@ -339,7 +340,7 @@ using Nitro: GuardMiddleware, login_required, role_required, permission_required
         req_bad_claims = HTTP.Request("GET", "/test")
         req_bad_claims.context[:user] = app_user
         req_bad_claims.context[:auth_claims] = "not-a-claims-object"
-        req_bad_claims.context[:session] = Dict{String,Any}("role" => "admin")
+        req_bad_claims.context[:session] = Dict{String,Any}("user_id" => 7, "role" => "admin")
         @test role_required("admin")(req_bad_claims).status == 403
 
         # `:auth_claims` alone (no `:user`) resolves — same trust tier as an app-set
@@ -353,7 +354,7 @@ using Nitro: GuardMiddleware, login_required, role_required, permission_required
         # session. Reachable only if app code sets `:auth_claims` without a `:user`.
         req_claims_over_session = HTTP.Request("GET", "/test")
         req_claims_over_session.context[:auth_claims] = Dict{String,Any}("role" => "viewer")
-        req_claims_over_session.context[:session] = Dict{String,Any}("role" => "admin")
+        req_claims_over_session.context[:session] = Dict{String,Any}("user_id" => 7, "role" => "admin")
         @test role_required("admin")(req_claims_over_session).status == 403
 
         # Unchanged: `login_required` does not route through the claims resolver, so a

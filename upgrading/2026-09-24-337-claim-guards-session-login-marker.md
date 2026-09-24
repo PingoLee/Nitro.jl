@@ -39,11 +39,17 @@ Only routes where no auth middleware runs before the guard read the session. For
 find the key your login handler writes:
 
 ```bash
-grep -rnE 'session\[("|:)[a-z_]+("|)\] *=' --include=*.jl .
+grep -rnE 'session(\([^)]*\))?\[("[A-Za-z0-9_]+"|:[A-Za-z0-9_]+)\] *=' --include=*.jl .
+grep -rn 'auth_key' --include=*.jl .     # a custom SessionMiddleware(auth_key = …) names it too
 ```
 
 If it is not `"user_id"`, pass it as `session_key`. If `login_required(session_key = ...)` already
 names a custom key on the same route, the claim guards need the same one.
+
+A route that granted a claim to a session that **never logs in** — a guest checkout guarded by
+`permission_required("cart:checkout")` over a session with no marker — is now a `403` too. The
+session fallback is for logged-in sessions only; give such a route a real auth layer or drop the
+claim guard from it.
 
 ### Migrate your app
 
