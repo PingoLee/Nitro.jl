@@ -222,7 +222,7 @@ own response unless you need a custom body.
 ```julia
 serve(middleware=[
     ExtractIP(forwarded_header=:x_forwarded_for, trusted_proxies=[ip"127.0.0.1"]),
-    SessionMiddleware(store=MemoryStore(), secret_key=ENV["SECRET_KEY"]),
+    SessionMiddleware(store=MemoryStore()),
     BearerAuth(jwt_validator(secret; issuer="myapp", audience="api", profile=:strict)),
     CSRFMiddleware(ENV["CSRF_SECRET"]),
 ])
@@ -258,7 +258,6 @@ with typed `id` and `kid` fields. Read it with `getuser(req)`.
 ```julia
 SessionMiddleware(
     store      = MemoryStore(),   # REQUIRED -- there is no default store (#171)
-    secret_key = ENV["SECRET_KEY"],
     max_age    = 86400,
     secure     = true,      # keep true in production
     httponly   = true,      # never lower this
@@ -266,6 +265,14 @@ SessionMiddleware(
     rotate_on_auth = true,  # regenerates the session id on login — leave on
 )
 ```
+
+The session cookie is named `__Host-nitro_session` by default (#329): the strongest name its
+attributes allow, so a sibling subdomain or a plain-HTTP hop cannot plant its own session id on
+the victim. With a `domain` or a non-`/` `path` it becomes `__Secure-nitro_session`, and plain
+`nitro_session` only with `secure=false`. Do not pass `cookie_name` unless you must; an explicit
+`__Host-`/`__Secure-` name the attributes cannot carry is an `ArgumentError` at construction. The
+cookie holds only a random id, so `SessionMiddleware` needs no `secret_key` — it accepts one and
+ignores it ([#339](https://github.com/PingoLee/Nitro.jl/issues/339)).
 
 Read and write through `getsession(req)`. Call `regenerate_session!(req, store)` on any privilege
 change you perform manually. `CSRFMiddleware(secret)` is required for cookie-authenticated
@@ -285,7 +292,21 @@ every request it sees. Scope guards per route; scope CSRF per app.
 The cookie is `__Host-csrf_token` by default, so a sibling subdomain cannot overwrite it. Browsers
 accept that prefix only on a `Secure`, `Path=/`, `Domain`-less cookie, and `CSRFMiddleware` throws
 an `ArgumentError` at construction rather than let the browser discard the cookie silently. For
-plain-HTTP development pass `cookie_name="csrf_token"` with `secure=false`.
+plain-HTTP development pass `cookie_name="csrf_token"` with `secure=false`. The CSRF secret may be
+a `String` or a `SecretString`.
+
+**Cookies.** Configure the key on the app you serve, from the environment:
+`configcookies(app; secret_key = SecretString(ENV["COOKIE_SECRET"]))`. The key must be **at least
+32 random bytes** — anything shorter, or anything that is not a string, is an `ArgumentError` — and
+is held as a `SecretString`, so no config or middleware prints it. With a key set, every
+`set_cookie!`/`get_cookie` encrypts and decrypts, and an encrypted value is **bound to its cookie
+name and to its `Max-Age`/`Expires`**, which the server enforces; a cookie with neither never
+expires server-side. A cookie that does not open — tampered, expired, another key, copied from
+another cookie — reads as the **default**, never a 500. The argument-less `get_cookie(req, …)` /
+`set_cookie!(res, …)` use the cookie config of the `App` **serving the request** (#308), so a key
+set only on the global app (`configcookies(secret_key = …)` without `app`) does not reach an explicit
+`App`. Cookie names match **exactly**. Never keep *who the user is* in a cookie — use the session
+or a JWT with `exp`.
 
 ---
 
