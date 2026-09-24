@@ -62,7 +62,9 @@ to bypass your `X-Forwarded-For` configuration.
   header is read), `:x_forwarded_for`, `:x_real_ip`, `:cf_connecting_ip`, `:true_client_ip`.
 - `trusted_proxies`: the proxies whose forwarding header may be believed. Entries are either an
   `IPAddr` (`ip"127.0.0.1"`) or a CIDR string (`"10.244.0.0/16"`, `"2400:cb00::/32"`). The
-  header is read **only** when the socket peer matches one of them.
+  header is read **only** when the nearest hop the chain has established matches one of them:
+  the socket peer, unless an earlier extractor already resolved a client (see *More than one
+  extractor in a chain* below).
 
 # Your proxy must *set*, not forward, the header
 `X-Real-IP`, `CF-Connecting-IP` and `True-Client-IP` are single-valued: Nitro believes whatever
@@ -75,6 +77,31 @@ fooled either.
 it right-to-left, discarding hops that match `trusted_proxies`, and takes the first address that
 is not one of your proxies. Entries a client prepends are therefore never reached. See
 [`extract_ip`](@ref) for the exact rules.
+
+# More than one extractor in a chain
+A chain can hold several, and the usual way is a global `ExtractIP` plus a `RateLimiter` at its
+default `auto_extract_ip = true`, which builds its own. Extractors **chain**:
+
+- the socket peer is recorded once, by the first extractor, and never overwritten, so
+  [`getpeerip`](@ref) is always the address that actually connected (#330);
+- each extractor judges `trusted_proxies` against `getip` as the chain left it: the socket peer
+  for the first, the client an earlier extractor resolved for a later one;
+- so a later extractor with no trust configured, or one that does not trust the resolved client,
+  leaves `getip` as it found it — a `RateLimiter` with its own `trusted_proxies` behind a global
+  `ExtractIP` keys on the same client;
+- and a later extractor that *does* trust the resolved address peels one more hop, reading its
+  own header. That is how two tiers with different headers compose: an `ExtractIP` trusting your
+  nginx on `:x_real_ip` resolves the CDN edge nginx saw, and a second one trusting the CDN's
+  ranges on `:cf_connecting_ip` resolves the client the CDN saw.
+
+A later tier believes its header from **any** address in its ranges, including one that
+connected to Nitro directly and that the tier before it therefore never resolved. Make sure only
+the first tier can reach Nitro: bind it to loopback behind nginx, or firewall it.
+
+Chaining is for tiers that write *different* headers. For one `X-Forwarded-For` chain through
+several proxies, use a single extractor whose `trusted_proxies` lists every one of them: a second
+`:x_forwarded_for` extractor walks the whole header again with only its own list, and stops at
+the first inner proxy that list does not name.
 
 # Examples
 ```julia
@@ -99,10 +126,16 @@ function ExtractIP(;
     policy = _trust_policy(forwarded_header, trusted_proxies, trust_forwarded)
     function(handle::Function)
         function(req::HTTP.Request)
+            # The nearest hop the chain has established: the socket peer for the first
+            # extractor, the client an earlier one resolved for a later one. Trust is judged
+            # against it, so extractors chain -- see "More than one extractor" above.
             peer = getip(req)
-            # Preserve the address that actually connected before `:ip` is overwritten, so an
-            # audit trail can still tell a proxied request from a direct one.
-            peer === nothing || (req.context[:peer_ip] = peer)
+            # Recorded once, by the first extractor, while `:ip` still is the socket peer. A
+            # later one used to re-record whatever `:ip` held by then (#330), which made a
+            # forwarded address the "socket peer" an audit trail relies on to spot a forged
+            # header. A global `ExtractIP` plus a `RateLimiter` at its default
+            # `auto_extract_ip = true` is exactly that chain.
+            peer === nothing || haskey(req.context, :peer_ip) || (req.context[:peer_ip] = peer)
             resolved = _resolve(req, policy, peer)
             resolved === nothing || setip!(req, resolved)
             return handle(req)
@@ -117,10 +150,12 @@ end
 Resolve the client IP address for `req`. Returns `nothing` only when the request carries no peer
 address at all (a hand-constructed request that never went through the server).
 
-With no trust configured this returns the socket peer address and **ignores every forwarding
-header**, because those headers can be set to any value by the client.
+It resolves from `getip(req)` as the chain left it, which is the socket peer unless an `ExtractIP`
+earlier in the chain already resolved a client — the same chaining [`ExtractIP`](@ref) documents.
+With no trust configured this returns that address and **ignores every forwarding header**,
+because those headers can be set to any value by the client.
 
-When `trusted_proxies` is configured *and* the socket peer matches one of them, the single header
+When `trusted_proxies` is configured *and* that address matches one of them, the single header
 named by `forwarded_header` is read — and nothing else.
 
 # Resolution rules

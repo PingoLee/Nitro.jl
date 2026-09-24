@@ -77,18 +77,82 @@ function AccessLogMiddleware(; log_query::Bool=false)
     end
 end
 
-function PrefixStripMiddleware(prefix::String)
-    plen = length(prefix)
+# One or more `/segment`s, each a run of RFC 3986 `pchar`s: unreserved, sub-delims, ':' and '@',
+# or a `%XX` escape. That rules out '?', '#', whitespace, non-ASCII and empty segments in one test.
+# Anchored with `\z`, not `$`: PCRE's `$` also matches before a final "\n", so a prefix read from
+# a file or an env var with its newline still attached would pass and then match nothing.
+const _PREFIX_SHAPE = r"^(?:/(?:[A-Za-z0-9\-._~!$&'()*+,;=:@]|%[0-9A-Fa-f]{2})+)+\z"
+
+"""
+    _normalize_prefix(prefix) -> Union{String, Nothing}
+
+Validate `serve(prefix = …)` and return it in the one form `PrefixStripMiddleware` matches on:
+a `String` with a leading `/` and no trailing one (#315). `nothing` means no prefix.
+
+The prefix is compared against the raw request-target, which is what arrives on the wire, so it
+has to be written the way a client sends it: ASCII, percent-encoded, no query or fragment.
+Escapes are compared byte for byte, so write them in the uppercase RFC 3986 recommends and clients
+send (`%C3%A9`, not `%c3%a9`); a mismatch fails closed, as a 404. A
+shape that could never match a well-formed target is an `ArgumentError` here rather than a
+server that answers 404 to everything. Trailing slashes are dropped, the same tolerance
+`urlpatterns` gives its prefixes. Any `AbstractString` is accepted; `serve` used to drop a
+`SubString` silently, which left every route unprefixed.
+"""
+function _normalize_prefix(prefix)::Nullable{String}
+    prefix === nothing && return nothing
+    prefix isa AbstractString || throw(ArgumentError(
+        "`prefix` must be a string such as \"/api\", or `nothing` for no prefix; got a $(typeof(prefix))."))
+    p = String(rstrip(prefix, '/'))
+    isempty(p) && throw(ArgumentError(
+        "`prefix = $(repr(prefix))` strips nothing. Pass `prefix = nothing` to serve without a prefix."))
+    isascii(p) || throw(ArgumentError(
+        "`prefix = $(repr(prefix))` is not ASCII. It is matched against the raw request-target, so " *
+        "write it percent-encoded, the way clients send it: e.g. \"/caf%C3%A9\" for \"/café\"."))
+    startswith(p, '/') || throw(ArgumentError(
+        "`prefix = $(repr(prefix))` must start with '/', like \"/api\"."))
+    occursin(_PREFIX_SHAPE, p) || throw(ArgumentError(
+        "`prefix = $(repr(prefix))` is not a URL path. Each segment may hold only letters, digits, " *
+        "`-._~!\$&'()*+,;=:@` and `%XX` escapes: no '?', '#', whitespace, or empty segments (`//`)."))
+    any(s -> s == "." || s == "..", eachsplit(p, '/')) && throw(ArgumentError(
+        "`prefix = $(repr(prefix))` contains a '.' or '..' segment. Clients resolve those before " *
+        "sending a request, so the prefix would never match."))
+    return p
+end
+
+"""
+    _strip_prefix(target, prefix, n) -> Union{String, Nothing}
+
+`target` with `prefix` removed, or `nothing` when the request is not under it. `n` is
+`ncodeunits(prefix)` and `prefix` comes from `_normalize_prefix`.
+
+The prefix is a whole number of path segments (#315). `/api` covers `/api`, `/api/…` and
+`/api?…`. It does not cover `/apiadmin/…`: a bare `startswith` turned that into `admin/…`, which
+HTTP.jl's router resolves to `/admin/…`, so any control keyed on the URL (a global
+`startswith(req.target, "/admin")` gate, a proxy `location /api/admin/` rule) was bypassed. The
+result always keeps its leading `/`. `n` is a byte count and the byte after the prefix is ASCII
+whenever it is accepted, so slicing at `n + 1` is always on a character boundary.
+"""
+function _strip_prefix(target::String, prefix::String, n::Int)::Nullable{String}
+    startswith(target, prefix) || return nothing
+    ncodeunits(target) == n && return "/"
+    next = codeunit(target, n + 1)
+    next == UInt8('/') && return String(SubString(target, n + 1))
+    next == UInt8('?') && return string('/', SubString(target, n + 1))
+    return nothing
+end
+
+function PrefixStripMiddleware(prefix::AbstractString)
+    # Normalized here as well as in `serve`: `internalrequest` builds this layer straight from
+    # `service.prefix[]`, so this is the one point every path to it shares.
+    p = _normalize_prefix(prefix)::String
+    n = ncodeunits(p)
     NOT_FOUND = HTTP.Response(404, "Not Found")
     return function(handler)
         return function(req::HTTP.Request)
-            if startswith(req.target, prefix)
-                newtarget = req.target[plen+1:end]
-                req.target = isempty(newtarget) ? "/" : newtarget
-                return handler(req)
-            else
-                return NOT_FOUND
-            end
+            stripped = _strip_prefix(req.target, p, n)
+            stripped === nothing && return NOT_FOUND
+            req.target = stripped
+            return handler(req)
         end
     end
 end

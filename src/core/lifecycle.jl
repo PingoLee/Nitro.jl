@@ -153,6 +153,10 @@ function serve(ctx::App;
     body_limit = ismissing(max_body_bytes) ? DEFAULT_MAX_BODY_BYTES :
                  max_body_bytes === nothing ? zero(Int64) : Int64(max_body_bytes)
 
+    # Before any mutation, like the checks above (#315). A malformed prefix is refused here
+    # rather than served as a listener that answers 404 to every request.
+    global_prefix = _normalize_prefix(prefix)
+
     # Resolve (and therefore VALIDATE) the environment exactly once per `serve`, here rather
     # than only in `serverwelcome`. The banner is the sole other caller and `startserver` runs
     # it only `if show_banner` -- so any caller passing `show_banner=false` (embedded servers,
@@ -184,7 +188,7 @@ function serve(ctx::App;
     ctx.service.cookies[] = cookies
 
     ctx.service.external_url[] = external_url isa String ? external_url : "http://$host:$port"
-    ctx.service.prefix[] = prefix isa String ? prefix : nothing
+    ctx.service.prefix[] = global_prefix
     # Stored rather than passed through, because the *blocking* `serve()` calls `terminate()`
     # from its own `finally` (the Ctrl-C path) with no way to hand it a keyword.
     ctx.service.shutdown_timeout[] = Float64(shutdown_timeout)

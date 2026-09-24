@@ -282,3 +282,13 @@ function process_and_fetch(req::HTTP.Request, id::Int)
     return Res.json(data)
 end
 ```
+
+!!! warning "An internal request skips your global middleware"
+    `internalrequest` runs only the middleware you pass to that call, not the global list given
+    to `serve(middleware = …)`. Authentication, sessions, CSRF and rate limiting installed
+    globally do not apply to it. Route and router middleware still run. Unless the request
+    already carries a client IP, it is `127.0.0.1`.
+
+    Build the target yourself, as above, from values you have already validated (`id` is an
+    `Int` here). A handler that passes a client-supplied path to `internalrequest` lets that
+    client reach every route guarded only by global middleware, as loopback.

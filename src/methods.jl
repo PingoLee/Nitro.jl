@@ -49,7 +49,17 @@ is explicit introspection, not accidental disclosure.)
   `code`/`state` carried in URLs never reach the logs.
 - `access_log_query=false`: set `true` to log the full target including the query
   string. Only enable when you are certain no secrets travel in query strings.
-- `prefix=nothing`: strip a global URL prefix (e.g. `"/api"`) before routing.
+- `prefix=nothing`: strip a global URL prefix (e.g. `"/api"`) before routing. It matches whole
+  path segments: `/api`, `/api/users` and `/api?x=1` are served (as `/`, `/users` and `/?x=1`),
+  while `/apiadmin/users` is a `404`, not `/admin/users`. Everything outside the prefix is a
+  `404` before any of your middleware runs, and the target global middleware sees keeps its
+  leading `/`.
+  Trailing slashes are dropped (`"/api/"` is `"/api"`). The prefix is matched byte for byte
+  against the raw request-target, so write it as clients send it: ASCII, percent-encoded with
+  uppercase escapes, and with no `?`, `#`, whitespace, empty or dot segments. Anything else,
+  including `""` and `"/"`, is an `ArgumentError`. Even so, do not authorize in global middleware
+  by testing `req.target`: some targets, such as `//admin/…`, reach a route whose path they do
+  not start with (#341). Put authorization on the route or router.
 - `revise=:none`: `:lazy`/`:eager` enable Revise-based hot reload (dev only).
 - `secret_key`, `httponly`, `secure`, `samesite`: override cookie defaults for this run.
 - `shutdown_timeout=10.0`: seconds `terminate` waits for in-flight requests to drain
@@ -476,8 +486,22 @@ end
 
 """
     internalrequest(req::Nitro.Request; middleware::Vector=[], serialize::Bool=true, catch_errors=true, context=missing)
+    internalrequest(app::App, req::Nitro.Request; kwargs...)
 
 Sends an internal request to the server, allowing for communication between different parts of the application.
+
+!!! warning "A privileged call that skips your global middleware"
+    `internalrequest` runs only the `middleware` you pass **to this call**. It does not run the
+    global list given to `serve(middleware = …)`, so authentication, sessions, CSRF and rate
+    limiting installed there do **not** apply. Route and router middleware, and the guards
+    attached through them, still run. Once `serve(prefix = …)` has run, its prefix applies too,
+    so include it in the target.
+
+    The request's client IP is `127.0.0.1` unless it already carries one (`setip!`), and a
+    request object reused across calls keeps whatever address the previous call left. So a route
+    that trusts loopback, or is protected only by global middleware, is reachable through it.
+    **Never build the target from client input**: a handler that does lets its caller reach those
+    routes too.
 
 Errors go through the same error handling `serve` uses. With `catch_errors=true` (the default), an
 exception thrown by a handler **or by middleware** is logged with its backtrace and comes back as
