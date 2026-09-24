@@ -120,6 +120,25 @@ Base.haskey(principal::Principal, key) = haskey(getfield(principal, :claims), ke
 Base.keys(principal::Principal) = keys(getfield(principal, :claims))
 Base.values(principal::Principal) = values(getfield(principal, :claims))
 
+# What an auth validator may hand back as the request's user, and what `login_required` counts
+# as logged in (#313). ONE predicate for the auth middleware, `jwt_validator` and the guard, so
+# they cannot disagree about who is authenticated.
+#
+# Not an identity: `nothing`/`missing` (the documented "reject"); any `Bool`, because a
+# predicate's answer is not a user — `BearerAuth(t -> t == API_KEY)` authenticated a WRONG key
+# as `false` before #313, and `true` names nobody either; an empty string; and an empty dict,
+# including a `Principal` with no claims AND no `id`. Everything else is, deliberately including
+# `0` (a real user id in some schemas), a non-empty `Principal` whose `id` is `nothing` (how a
+# service token authenticates), and a claim-less `Principal` that does carry an `id` (a
+# keyset-verified signer under `identity_from = :kid` is a principal whatever its payload).
+function _is_identity(x)::Bool
+    (x === nothing || x === missing || x isa Bool) && return false
+    x isa AbstractString && return !isempty(x)
+    x isa Principal && return x.id !== nothing || !isempty(x)
+    x isa AbstractDict && return !isempty(x)
+    return true
+end
+
 @kwdef struct Param{T}
     name::Symbol
     type::Type{T} = T

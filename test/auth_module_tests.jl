@@ -974,6 +974,16 @@ end
         # A rejecting user_validator still yields nothing
         rejecting = Nitro.Auth.jwt_validator(keyset; user_validator = _ -> nothing)
         @test rejecting(Nitro.Auth.encode_jwt(Dict("sub" => "7"), keyset; expires_in=3600)) === nothing
+
+        # So does any other non-identity (#313): a predicate `user_validator` is a rejection,
+        # not a `(false, principal)` tuple handed on for the middleware to catch.
+        for bogus in (false, true, "", missing, Dict{String,Any}())
+            predicate = Nitro.Auth.jwt_validator(keyset; user_validator = _ -> bogus)
+            @test predicate(Nitro.Auth.encode_jwt(Dict("sub" => "7"), keyset; expires_in=3600)) === nothing
+        end
+        # A user id of 0 is a user.
+        zero = Nitro.Auth.jwt_validator(keyset; user_validator = _ -> 0)
+        @test zero(Nitro.Auth.encode_jwt(Dict("sub" => "7"), keyset; expires_in=3600))[1] == 0
     end
 
     @testset "construction-time validation" begin

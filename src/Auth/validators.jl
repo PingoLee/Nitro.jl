@@ -155,9 +155,11 @@ validator returns `(user, principal)`, so auth middleware attaches the app user 
 `req.context[:user]` and the normalized principal at `req.context[:auth_claims]`.
 
 A `user_validator` returning `nothing` — "the token verified, but there is no such user" —
-makes the whole validator return `nothing`, which auth middleware renders as a `401`. That
-is the precedent custom validators follow: never hand back a `(nothing, claims)` tuple,
-because a nil user is no user and is rejected the same way.
+makes the whole validator return `nothing`, which auth middleware renders as a `401`. So does
+any other value that is not an identity: `missing`, a `Bool`, `""`, or an empty dict. A
+`user_validator` written as a predicate (`p -> is_active(p.id)`) therefore rejects everyone;
+return the user, or `nothing`. That is the precedent custom validators follow: never hand back
+a `(nothing, claims)` tuple, because a nil user is no user and is rejected the same way.
 
 The validator is a pure function of the token: it never mutates the request.
 """
@@ -264,7 +266,10 @@ function jwt_validator(secret_or_keyset;
                 user_validator(principal)
             end
         end
-        return user === nothing ? nothing : (user, principal)
+        # The auth middleware's own predicate, so a `user_validator` answering `false` is the
+        # same `nothing` a missing user is, not a `(false, principal)` tuple for the middleware
+        # to catch (#313).
+        return _is_identity(user) ? (user, principal) : nothing
     end
 end
 

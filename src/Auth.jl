@@ -9,7 +9,7 @@ using Base64
 
 using ..Core
 using ..Core: CookieConfig, get_cookie, set_cookie!
-using ..Core.Types: AbstractSessionStore, get_session
+using ..Core.Types: AbstractSessionStore, get_session, _is_identity
 using ..Core.Crypto: _empty_hmac_key
 
 export AuthError,

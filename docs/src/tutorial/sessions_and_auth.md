@@ -354,9 +354,12 @@ populate `getuser(req)`. Write a small middleware to bridge them:
 function SessionAuthMiddleware(handle)
     return function(req::HTTP.Request)
         session = getsession(req)
-        if !isnothing(session) && haskey(session, "user_id")
+        # Check the VALUE, not just the key: a logout that set `user_id = nothing` must not
+        # leave a `Dict("id" => nothing, ...)` behind, which is a non-empty dict and so an identity.
+        uid = isnothing(session) ? nothing : get(session, "user_id", nothing)
+        if !isnothing(uid)
             req.context[:user] = Dict(
-                "id"   => session["user_id"],
+                "id"   => uid,
                 "role" => get(session, "role", "user"),
             )
         end
@@ -444,7 +447,8 @@ claims as `getuser(req)`. Because the claims *are* the identity here, `getuser(r
 `sub`/`user_id` — and that is fine:
 
 - **`login_required` only checks that a validly-signed token is present.** It trusts any
-  principal an auth middleware attached, so an `action`-keyed token (no `user_id`) passes.
+  non-empty principal an auth middleware attached, so an `action`-keyed token (no `user_id`)
+  passes.
   The `user_id` marker is required only on the raw-`getsession(req)` fallback, never on a
   principal that `BearerAuth` already authenticated.
 
