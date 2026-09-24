@@ -283,7 +283,7 @@ import Nitro: App, path, text
 # middleware silently never ran. No error, no warning.
 #
 # `compose` is now installed unconditionally and the emptiness check moved inside it, per
-# request, in front of a prebuilt global-middleware-only chain.
+# request, in front of the route lookup (and, since #291, inside the global middleware).
 #
 # ANTI-HOIST DUTY. Hoisting the emptiness check out of the per-request closure would freeze the
 # verdict at compose time and reinstate #71 exactly. Verified by mutation: under that change
@@ -359,10 +359,14 @@ end
     @test !isempty(snapshot(r2.service.custommiddleware))
 end
 
-@testset "nothing is composed while the table is empty" begin
-    # The fast path returns the prebuilt global-only chain before `gethandler`, so no
-    # per-request chain is ever composed. Observed through a counting GLOBAL factory: it is
-    # called once when `compose` prebuilds that chain, and once more by every `buildmiddleware`.
+@testset "nothing is resolved while the table is empty" begin
+    # The fast path returns before `gethandler`, so no route is looked up and no chain composed.
+    #
+    # This used to count folds of a GLOBAL factory, which `buildmiddleware` re-folded into every
+    # route's chain. Since #291 global middleware wraps route selection and is folded exactly
+    # once per pipeline whatever the table holds, so that count is 1 with or without the fast
+    # path and asserted nothing. What still tells the two apart is the `RouteResolution` stash:
+    # `compose` writes one on every lookup that matches, and the fast path performs none.
     folds = Ref(0)
     counting_global = handler -> (folds[] += 1; req::HTTP.Request -> handler(req))
     ctx = App()
@@ -372,7 +376,9 @@ end
     ])
     pipeline = Nitro.Core.setupmiddleware(ctx; middleware = [counting_global], catch_errors = false)
     for _ in 1:3, p in ("/a", "/b")
-        pipeline(HTTP.Request("GET", p))
+        req = HTTP.Request("GET", p)
+        @test text(pipeline(req)) == p[2:end]
+        @test !haskey(req.context, Nitro.Core.Types.ROUTE_RESOLUTION_KEY)
     end
     @test folds[] == 1
 end
@@ -445,8 +451,9 @@ end
     @test r.status == 405
     @test hits[] == 1
 
-    # No chain composed: the per-route middleware factory is never called for a 405, and the
-    # global one only once, when `compose` prebuilds the unmatched-path chain.
+    # No chain composed: the per-route middleware factory is never called for a 405. The global
+    # factory is folded once per pipeline whatever happens (#291), so its count is only a check
+    # that nothing folds it twice; `route_folds` is the assertion that matters.
     route_folds, global_folds = Ref(0), Ref(0)
     keyctx = App()
     Nitro.Core.Routing.urlpatterns(keyctx, "", Nitro.RouteDefinition[
@@ -476,19 +483,25 @@ end
     @test hits[] == 1
 end
 
-@testset "an unmatched request composes nothing" begin
-    global_folds = Ref(0)
+@testset "an unmatched request composes nothing and leaves no stash" begin
+    # This used to count GLOBAL folds against a prebuilt unmatched-path chain. Since #291 there is
+    # no such chain — global middleware wraps route selection, folded once per pipeline — so that
+    # count was 1 whatever the 404 path did. A 404 that composed a route chain would call the
+    # route factory; one that stashed a resolution would leave the key on the request.
+    route_folds = Ref(0)
     ctx = App()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/has", (req::HTTP.Request) -> Res.send("ok"),
-             middleware = [h -> (q::HTTP.Request -> h(q))])
+             middleware = [h -> (route_folds[] += 1; q::HTTP.Request -> h(q))])
     ])
     p = Nitro.Core.setupmiddleware(ctx; catch_errors = false,
-                                   middleware = [h -> (global_folds[] += 1; q::HTTP.Request -> h(q))])
+                                   middleware = [h -> (q::HTTP.Request -> h(q))])
     for _ in 1:3
-        @test p(HTTP.Request("GET", "/nope")).status == 404
+        req = HTTP.Request("GET", "/nope")
+        @test p(req).status == 404
+        @test get(req.context, Nitro.Core.Types.ROUTE_RESOLUTION_KEY, nothing) === nothing
     end
-    @test global_folds[] == 1          # the prebuilt unmatched chain, and nothing per request
+    @test route_folds[] == 0
 end
 end
 
@@ -512,12 +525,13 @@ import Nitro: App, path, text
 mktag(tag) = handler -> (req::HTTP.Request -> Res.send(tag * "|" * text(handler(req))))
 
 @testset "a warmed route picks up middleware registered afterwards" begin
-    # A counting GLOBAL factory makes "warm" checkable rather than assumed: `compose` calls it
-    # once to prebuild the unmatched-path chain, then once per chain composition. (Whether the
-    # pipeline has global middleware no longer selects a code path since #255; this one has a
-    # layer only so the cache can be observed.)
-    folds = Ref(0)
-    counting_global = handler -> (folds[] += 1; req::HTTP.Request -> handler(req))
+    # This used to observe "warm" through a counting GLOBAL factory, which every chain
+    # composition re-folded. Since #291 global middleware wraps route selection and is folded
+    # once per pipeline, so it no longer sees compositions; the late ROUTE factory below does.
+    # The pipeline keeps a global layer so the global-middleware shape stays covered.
+    late_folds = Ref(0)
+    late = handler -> (late_folds[] += 1; mktag("late")(handler))
+    plain_global = handler -> (req::HTTP.Request -> handler(req))
     ctx = App()
     # Two routes so the table is non-empty from the start: this exercises the CACHE path, not
     # the empty-table fast path covered by the item above.
@@ -525,20 +539,19 @@ mktag(tag) = handler -> (req::HTTP.Request -> Res.send(tag * "|" * text(handler(
         path("/other", (req::HTTP.Request) -> Res.send("o"), middleware = [mktag("other")]),
         path("/warm",  (req::HTTP.Request) -> Res.send("h")),
     ])
-    pipeline = Nitro.Core.setupmiddleware(ctx; middleware = [counting_global], catch_errors = false)
+    pipeline = Nitro.Core.setupmiddleware(ctx; middleware = [plain_global], catch_errors = false)
     for _ in 1:2
         @test text(pipeline(HTTP.Request("GET", "/warm"))) == "h"
     end
-    @test folds[] == 2               # prebuilt + ONE composition: the second request was a hit
 
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
-        path("/warm", (req::HTTP.Request) -> Res.send("h"), middleware = [mktag("late")])
+        path("/warm", (req::HTTP.Request) -> Res.send("h"), middleware = [late])
     ])
 
     # Were the warm bare chain still served, this would be "h".
     @test text(pipeline(HTTP.Request("GET", "/warm"))) == "late|h"
     @test text(pipeline(HTTP.Request("GET", "/warm"))) == "late|h"
-    @test folds[] == 3               # recomposed once for the new table, then cached again
+    @test late_folds[] == 1          # composed once for the new table, then cached
 end
 
 @testset "a registration rebuilds every route, and each still gets its own chain" begin
@@ -656,7 +669,7 @@ end
 using Test
 using HTTP
 using Nitro
-using Nitro.Core.Types: RouteResolution, ROUTE_RESOLUTION_KEY
+using Nitro.Core.Types: RouteResolution, ROUTE_RESOLUTION_KEY, RouteMiddleware, CopyOnWriteDict
 import Nitro: App, path, text, getparams
 
 # #80: `compose` (src/routerhof.jl) has to call `gethandler` before it can key the middleware
@@ -684,9 +697,14 @@ stash_handler(body::String) = (::HTTP.Request) -> HTTP.Response(200, body)
 # Builds a stash that legitimately matches: THIS router, and this request's own method and
 # target objects. Each testset below then perturbs exactly one of the three guarded inputs, so
 # a failure names which part of the guard moved.
+#
+# The middleware table is EMPTY, so no route here has middleware of its own and a rerouted
+# request may run any leaf (#291). The guard-bearing reroute cases are in the #291 item below.
 stash!(req, router; handler, route = "/stashroute", params = Dict{String,String}()) =
     req.context[ROUTE_RESOLUTION_KEY] =
-        RouteResolution(router, req.method, req.target, handler, route, params)
+        RouteResolution(router, req.method, req.target, handler, route, params,
+                        req.method, Dict{String,RouteMiddleware}(),
+                        CopyOnWriteDict{RouteMiddleware}())
 
 @testset "a matching stash is used, and the router is not consulted" begin
     router = router_with("ROUTER")
@@ -793,7 +811,8 @@ end
 @testset "a middleware that rewrites req.target still reaches the rewritten route" begin
     # Route middleware folds OUTSIDE the terminal, so it runs between compose's lookup and the
     # dispatch. Before #80 the router resolved after it and the rewrite won; the target guard
-    # is what keeps that true.
+    # is what keeps that true. Since #291 that holds only because `/b` has no middleware of its
+    # own; a reroute onto a guarded route is refused, see the #291 item.
     ctx = App()
     rewrite = handler -> (req::HTTP.Request -> begin
         suffix = "b"
@@ -1220,5 +1239,241 @@ end
     # A concrete method keys on `req.method` and needs no tag, so it is not refused either.
     urlpatterns(ctx, "", path("/c", ok; method = "POST", middleware = [deny]))
     @test status(ctx, "POST", "/c") == 403
+end
+end
+
+
+@testitem "Route middleware — a rerouting middleware cannot skip the new route's guards (#291)" tags=[:core, :middleware] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+using Nitro.Core: internalrequest
+using Nitro.Core.RouterHOF: router
+using Nitro.Core.Routing: urlpatterns
+import Nitro: App, path, text
+
+# REGRESSION for #291, an authorization bypass. `compose` chose the middleware chain from the
+# request as it arrived, and global middleware ran inside that chain. A layer that rewrote
+# `req.method` or `req.target` then reached the terminal, which re-resolved the rewritten
+# request to a leaf whose guards were never chosen. A guarded `DELETE` answered a `GET` or a
+# `POST` carrying `X-HTTP-Method-Override`, and a global path alias turned a 404 into a guarded
+# route's 200. The 404/405 cases are the ones the issue itself thought were safe.
+#
+# Global middleware now wraps route selection, so its rewrites pick up the new route's guards.
+# A router- or route-level layer runs after selection; rerouting from there onto a route with
+# different middleware is refused with a 500.
+
+deleted = Ref(false)
+deny = handle -> (req -> HTTP.Response(403))
+override = handle -> function (req::HTTP.Request)
+    m = HTTP.header(req, "X-HTTP-Method-Override", "")
+    isempty(m) || (req.method = uppercase(m))
+    return handle(req)
+end
+alias(from, to) = handle -> function (req::HTTP.Request)
+    startswith(req.target, from) && (req.target = replace(req.target, from => to; count = 1))
+    return handle(req)
+end
+read_item(req::HTTP.Request, id::Int) = Res.send("read $id")
+delete_item(req::HTTP.Request, id::Int) = (deleted[] = true; Res.send("DELETED $id"))
+
+# The issue's app: a public GET and a guarded DELETE at one path.
+function items_app(; get_mw = Function[])
+    app = App()
+    urlpatterns(app, "",
+        path("/items/<int:id>", read_item; middleware = get_mw),
+        path("/items/<int:id>", delete_item; method = "DELETE", middleware = [deny]),
+    )
+    return app
+end
+hit(app, method, target, headers = Pair{String,String}[]; middleware = Function[]) =
+    internalrequest(app, HTTP.Request(method, target, headers); middleware)
+
+OVERRIDE_DELETE = ["X-HTTP-Method-Override" => "DELETE"]
+
+# A router leaf that is callable but not a `Function`.
+struct CallableLeaf end
+(::CallableLeaf)(req::HTTP.Request) = HTTP.Response(200, "raw")
+
+@testset "global method override gets the overridden route's guard" begin
+    app = items_app()
+    deleted[] = false
+    # A GET that matched the public route, then was rewritten. 200 "DELETED 1" before #291.
+    @test hit(app, "GET", "/items/1", OVERRIDE_DELETE; middleware = [override]).status == 403
+    # A POST, which no route declares, so `compose` took its 405 path and chose no chain at all.
+    # The HTML-form shape, and the one the issue called safe. 200 "DELETED 1" before #291.
+    @test hit(app, "POST", "/items/1", OVERRIDE_DELETE; middleware = [override]).status == 403
+    @test !deleted[]
+
+    # Without the header the same layer changes nothing.
+    r = hit(app, "GET", "/items/1"; middleware = [override])
+    @test r.status == 200 && text(r) == "read 1"
+    r = hit(app, "POST", "/items/1"; middleware = [override])
+    @test r.status == 405
+    @test HTTP.header(r, "Allow") == "DELETE, GET, HEAD"
+end
+
+@testset "global path alias gets the aliased route's guard" begin
+    app = items_app()
+    deleted[] = false
+    legacy = alias("/legacy/", "/items/")
+    # `/legacy/1` matches nothing, so this came through the 404 path. 200 before #291.
+    @test hit(app, "DELETE", "/legacy/1"; middleware = [legacy]).status == 403
+    @test !deleted[]
+    # An alias onto a public route still works.
+    r = hit(app, "GET", "/legacy/1"; middleware = [legacy])
+    @test r.status == 200 && text(r) == "read 1"
+end
+
+@testset "route-level method override onto a guarded route is refused" begin
+    app = items_app(get_mw = [override])
+    deleted[] = false
+    logger = Test.TestLogger(min_level = Base.CoreLogging.Error)
+    r = Base.CoreLogging.with_logger(logger) do
+        hit(app, "GET", "/items/1?token=s3cret", OVERRIDE_DELETE)
+    end
+    @test r.status == 500
+    @test !deleted[]
+
+    # One error, naming both routes by pattern, and nothing from the request's query string.
+    @test length(logger.logs) == 1
+    entry = only(logger.logs)
+    @test occursin("rerouted", entry.message)
+    @test entry.kwargs[:from] == "GET /items/{id}"
+    @test entry.kwargs[:to] == "DELETE /items/{id}"
+    @test !occursin("s3cret", sprint(show, entry.kwargs))
+
+    # The layer is harmless when it does not reroute.
+    r = hit(app, "GET", "/items/1")
+    @test r.status == 200 && text(r) == "read 1"
+end
+
+@testset "route-level target rewrite: refused onto a guarded route, allowed onto an open one" begin
+    app = App()
+    urlpatterns(app, "",
+        path("/old-admin", (req::HTTP.Request) -> Res.send("old"); middleware = [alias("/old-admin", "/admin")]),
+        path("/admin", (req::HTTP.Request) -> Res.send("ADMIN"); middleware = [deny]),
+        path("/old-page", (req::HTTP.Request) -> Res.send("old"); middleware = [alias("/old-page", "/page")]),
+        path("/page", (req::HTTP.Request) -> Res.send("page")),
+    )
+    r = Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
+        hit(app, "GET", "/old-admin")
+    end
+    @test r.status == 500
+    @test text(r) != "ADMIN"
+
+    # `/page` has no middleware of its own, so the chain that already ran covers it.
+    r = hit(app, "GET", "/old-page")
+    @test r.status == 200 && text(r) == "page"
+end
+
+@testset "a rewrite that stays on the same chain is served" begin
+    strip_slash = handle -> function (req::HTTP.Request)
+        endswith(req.target, "/") && (req.target = chop(req.target))
+        return handle(req)
+    end
+    head_as_get = handle -> function (req::HTTP.Request)
+        req.method == "HEAD" && (req.method = "GET")
+        return handle(req)
+    end
+    app = App()
+    urlpatterns(app, "",
+        path("/s", (req::HTTP.Request) -> Res.send("s"); middleware = [strip_slash]),
+        path("/h", (req::HTTP.Request) -> Res.send(req.method); middleware = [head_as_get]),
+    )
+    # Same leaf, different target string.
+    r = hit(app, "GET", "/s/")
+    @test r.status == 200 && text(r) == "s"
+    # The auto-HEAD leaf keys on GET (#277), so HEAD rewritten to GET stays on that chain.
+    r = hit(app, "HEAD", "/h")
+    @test r.status == 200 && text(r) == "GET"
+
+    # Two routes under one `router(...; middleware)` share their entry, so a reroute between them
+    # has already run everything the target requires.
+    shared = App()
+    admin = router(shared, "/r"; middleware = [override])
+    Nitro.Core.register(shared, "GET", admin("/x"), (req::HTTP.Request) -> Res.send("get"))
+    Nitro.Core.register(shared, "DELETE", admin("/x"), (req::HTTP.Request) -> Res.send("delete"))
+    r = hit(shared, "GET", "/r/x", OVERRIDE_DELETE)
+    @test r.status == 200 && text(r) == "delete"
+end
+
+@testset "a router-level override onto a differently guarded route is refused" begin
+    app = App()
+    open_r = router(app, "/r"; middleware = [override])
+    Nitro.Core.register(app, "GET", open_r("/x"), (req::HTTP.Request) -> Res.send("get"))
+    Nitro.Core.register(app, "DELETE", open_r("/x"; middleware = [deny]),
+                        (req::HTTP.Request) -> Res.send("delete"))
+    r = Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
+        hit(app, "GET", "/r/x", OVERRIDE_DELETE)
+    end
+    @test r.status == 500
+end
+
+@testset "a reroute onto a declared-method leaf keys on its declared method" begin
+    # The new leaf's entry must be looked up under the method it was DECLARED with, exactly as
+    # `compose` does. Keyed on `req.method` instead, both lookups below miss, read as "no
+    # middleware", and serve the guarded handler. Found in review.
+    guarded = Ref(false)
+    to_star = handle -> (req::HTTP.Request -> (req.target = "/star"; handle(req)))
+    to_head = handle -> (req::HTTP.Request -> (req.method = "HEAD"; req.target = "/g"; handle(req)))
+    app = App()
+    urlpatterns(app, "",
+        path("/star", (req::HTTP.Request) -> (guarded[] = true; Res.send("STAR"));
+             method = "*", middleware = [deny]),
+        path("/g", (req::HTTP.Request) -> (guarded[] = true; Res.send("G")); middleware = [deny]),
+        path("/to-star", (req::HTTP.Request) -> Res.send("open"); middleware = [to_star]),
+        path("/to-head", (req::HTTP.Request) -> Res.send("open"); middleware = [to_head]),
+    )
+    Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
+        @test hit(app, "GET", "/to-star").status == 500        # "*|/star", not "GET|/star"
+        @test hit(app, "GET", "/to-head").status == 500        # auto-HEAD keys on "GET|/g"
+    end
+    @test !guarded[]
+end
+
+@testset "a reroute from a non-Function leaf is judged like any other" begin
+    # A callable struct registered on the router directly is not a `Function`. Its match used to
+    # CLEAR the stash, which the terminal read as "no chain was chosen", so its route middleware
+    # could reroute onto a guarded leaf unchecked. Found in review.
+    guarded = Ref(false)
+    app = App()
+    urlpatterns(app, "",
+        path("/g", (req::HTTP.Request) -> (guarded[] = true; Res.send("GUARDED")); middleware = [deny]))
+    HTTP.register!(app.service.router, "GET", "/raw", CallableLeaf())
+    Nitro.Core.RouterHOF.publish_route_middleware!(app, "GET|/raw",
+        (nothing, Function[handle -> (req::HTTP.Request -> (req.target = "/g"; handle(req)))]))
+    r = Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
+        hit(app, "GET", "/raw")
+    end
+    @test r.status == 500
+    @test !guarded[]
+    # Without the reroute it is served through the stash, wrapper and all.
+    Nitro.Core.RouterHOF.publish_route_middleware!(app, "GET|/raw",
+        (nothing, Function[handle -> (req::HTTP.Request -> handle(req))]))
+    req = HTTP.Request("GET", "/raw")
+    r = internalrequest(app, req)
+    @test r.status == 200 && text(r) == "raw"
+    @test req.context[Nitro.Core.Types.ROUTE_RESOLUTION_KEY] isa Nitro.Core.Types.RouteResolution
+end
+
+@testset "a route registered after selection is judged against the live table" begin
+    # The stash's snapshot predates a route registered while the request sat in route middleware
+    # (Revise, a runtime `include_routes`). Read from that snapshot the new route has no entry and
+    # would be served unguarded. Made deterministic by registering from inside the middleware.
+    guarded = Ref(false)
+    app = App()
+    register_then_go = handle -> function (req::HTTP.Request)
+        urlpatterns(app, "",
+            path("/late", (r::HTTP.Request) -> (guarded[] = true; Res.send("LATE")); middleware = [deny]))
+        req.target = "/late"
+        return handle(req)
+    end
+    urlpatterns(app, "", path("/early", (req::HTTP.Request) -> Res.send("early"); middleware = [register_then_go]))
+    r = Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
+        hit(app, "GET", "/early")
+    end
+    @test r.status == 500
+    @test !guarded[]
 end
 end

@@ -53,7 +53,7 @@ end
 
     # ── Route with per-route middleware → the compose / middleware-cache path ───
     # `compose` is installed unconditionally (#71), so the blocks above already exercise its
-    # empty-table fast path (`snapshot` + `isempty` + the prebuilt chain). THIS block is the
+    # empty-table fast path (`snapshot` + `isempty` + the handler). THIS block is the
     # only one that gets past that check and reaches `gethandler`, `genkey`,
     # `buildmiddleware`, `cache_chain!`, `cached_chain`, and the `RouteResolution` hand-off
     # (#80) — the blocks above compile only `_dispatch_resolved`'s fall-through branch, since

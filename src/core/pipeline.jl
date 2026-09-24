@@ -54,9 +54,17 @@ that transition, because nothing reads it until here.
 
 The guard is `(router, method, target)` — every input `gethandler` reads — and
 `RouteResolution` documents why each one is there, including the cross-`App` misroute the
-`router` check exists to prevent. Falling through to [`_route_unresolved`](@ref) is always
-correct: it is `(r::Router)(req)` plus the `Allow` header (#281), so every path that declines the
-hand-off degrades to the previous cost, never to a wrong route.
+`router` check exists to prevent. Three outcomes:
+
+- **All three match** — the fast branch.
+- **The router differs, or there is no stash** — [`_route_unresolved`](@ref), which is
+  `(r::Router)(req)` plus the `Allow` header (#281). Correct because no route middleware of
+  *this* router was chosen for the request: the table was empty, the lookup missed, or the stash
+  belongs to another `App`.
+- **Same router, but `method` or `target` changed** — router- or route-level middleware rerouted
+  the request after `compose` chose its chain. [`_route_rerouted`](@ref) decides whether the new
+  leaf may run under the chain that already ran (#291). This used to take the fallback above,
+  which ran the new leaf's handler without its guards.
 
 `r` is deliberately untyped: `Service.router` is declared as the unparameterized `Router`, and
 the caller `let`-binds it to keep that dynamic dispatch out of the request path. It doubles as
@@ -65,13 +73,60 @@ application it belongs to.
 """
 function _dispatch_resolved(r, req::HTTP.Request)
     res = get(req.context, Types.ROUTE_RESOLUTION_KEY, nothing)
-    if res isa Types.RouteResolution && res.router === r &&
-       res.method === req.method && res.target === req.target
-        req.context[:route] = res.route
-        isempty(res.params) || (req.context[:params] = res.params)
-        return res.handler(req)
+    if res isa Types.RouteResolution && res.router === r
+        if res.method === req.method && res.target === req.target
+            req.context[:route] = res.route
+            isempty(res.params) || (req.context[:params] = res.params)
+            return res.handler(req)
+        end
+        return _route_rerouted(r, req, res)
     end
     return _route_unresolved(r, req)
+end
+
+"""
+    _route_rerouted(r, req, res) -> response
+
+The terminal for a request that router- or route-level middleware rewrote (`req.method` or
+`req.target`) after `compose` chose its chain from `res` (#291).
+
+The chain that already ran is the stashed route's. The rewritten request is resolved again, and
+its leaf is served only if that chain covers the leaf's router and route middleware:
+
+- the leaf's `custommiddleware` entry is the very entry the running chain was built from — the
+  same route, a `HEAD` rewritten onto its own `GET`, or two routes under one
+  `router(...; middleware)` when neither adds route middleware of its own; or
+- the leaf has no entry at all: no router or route middleware to skip.
+
+A miss or a method mismatch is answered exactly as [`_route_unresolved`](@ref) answers it; no
+handler runs. Anything else is refused with a `500` and an `@error`. Serving it would run a
+handler whose guards were never selected. Re-selecting its chain from here is not an option
+either, since the terminal sits inside the serializer and the new route's middleware would run
+in a different position from the one it was written for.
+
+**What this does not cover: global middleware saw the request *before* the rewrite.** A
+method-sensitive global layer — `CSRFMiddleware` skips its check for safe methods — made its
+decision on the original method, and a route-level layer that then turns a `GET` into a
+`DELETE` has escaped it, onto either kind of leaf above. That is not a regression (the same
+held before #291); it is why a rewriting layer belongs in the global list, *before* anything
+that reads the method.
+
+The new leaf's entry is read from a fresh snapshot, not `res.table`; see `RouteResolution` for
+why. The log names both routes by their **patterns** and their **declared** methods — not
+`req.target`, which can carry a query string (access logging redacts those by default), and not
+a client-chosen method token, which a `"*"` leaf accepts verbatim.
+"""
+function _route_rerouted(r::HTTP.Router, req::HTTP.Request, res::Types.RouteResolution)
+    handler, route, params = HTTP.Handlers.gethandler(r, req)
+    (handler === nothing || handler === missing) && return _route_miss(r, req, handler)
+
+    ran = get(res.table, RouterHOF.genkey(res.mw_method, res.route), Types.NO_ROUTE_MIDDLEWARE)
+    mw_method = handler isa Types.DeclaredMethodHandler ? handler.method : req.method
+    needs = get(Types.snapshot(res.source), RouterHOF.genkey(mw_method, route), nothing)
+    (needs === nothing || needs === ran) && return _route_call(req, handler, route, params)
+
+    @error "A router- or route-level middleware rerouted the request to a route with different middleware; refusing it. Rewrite req.method/req.target in global middleware (serve(middleware = [...])) instead, so the route is chosen after the rewrite." from = "$(res.mw_method) $(res.route)" to = "$(mw_method) $(route)"
+    return Res.json(("message" => "500: Internal Server Error"), status = 500)
 end
 
 """
@@ -97,12 +152,22 @@ lookup a concrete `Router`.
 """
 function _route_unresolved(r::HTTP.Router, req::HTTP.Request)
     handler, route, params = HTTP.Handlers.gethandler(r, req)
+    (handler === nothing || handler === missing) && return _route_miss(r, req, handler)
+    return _route_call(req, handler, route, params)
+end
+
+# `gethandler` found no leaf: `nothing` is a miss, `missing` a method mismatch. See
+# `_route_unresolved` for why a `nothing` can still be a 405.
+function _route_miss(r::HTTP.Router, req::HTTP.Request, handler::Union{Nothing,Missing})
     if handler === nothing
         allowed = _allowed_methods(r, req.target)
         return isempty(allowed) ? r._404(req) : _method_not_allowed(r, req, allowed)
-    elseif handler === missing
-        return _method_not_allowed(r, req)
     end
+    return _method_not_allowed(r, req)
+end
+
+# `(r::Router)(req)`'s matched branch: `:route`, `:params` only when non-empty, then the handler.
+function _route_call(req::HTTP.Request, handler, route, params)
     req.context[:route] = route
     isempty(params) || (req.context[:params] = params)
     return handler(req)
@@ -206,8 +271,8 @@ function setupmiddleware(ctx::App; middleware::Vector=[], serialize::Bool=true, 
     # once, so an app whose first per-route middleware was registered AFTER the server started
     # (Revise re-running `urlpatterns`, a runtime `include_routes`) never got `compose` at all
     # and that middleware silently never ran. The emptiness test now lives inside `compose`,
-    # per request, where it also short-circuits to a prebuilt global-middleware-only chain
-    # BEFORE `gethandler` — so an app with no per-route middleware does strictly less routing
+    # per request, where it also short-circuits straight to the handler — global middleware has
+    # already run around it (#291) — BEFORE `gethandler`, so an app with no per-route middleware does strictly less routing
     # work here than the old compose branch did (one `gethandler`, not two). Since #80 the
     # matched path resolves once as well, so that contrast is with the PRE-#80 compose branch,
     # not with the other path through this pipeline today. Against the old
@@ -216,9 +281,10 @@ function setupmiddleware(ctx::App; middleware::Vector=[], serialize::Bool=true, 
     # carried one that went stale the moment `router_entry` was added below.)
     #
     # `processed_middleware` travels SIDEWAYS into `compose` rather than being spliced into the
-    # list below: `compose` applies it inside `buildmiddleware` and inside that fast path,
-    # which lands it outside route middleware and inside the serializer — the same effective
-    # position it held in this list. Do NOT do both, or every global middleware runs twice.
+    # list below: `compose` folds it around its route-selection step (#291), which lands it
+    # outside route middleware and outside the serializer — the same effective position it
+    # would hold at `compose`'s slot in this list, with the route chosen only after it has run.
+    # Do NOT do both, or every global middleware runs twice.
     # `HTTP.Router` is a *callable struct*, not a `Function` — `HTTP.Handlers.Router <: Function`
     # is false. Three of the layers that can end up wrapping it are typed on `Function` and so
     # reject it outright: `_app_context_seed` below, and `foldlayers`/`buildmiddleware` in

@@ -182,6 +182,43 @@ Global middleware runs on **every** request, including ones that match no route 
 whose path matches but whose method does not (405). A route cannot opt out of it: passing
 `middleware = []` on a `path()` call means "no *extra* middleware", not "skip the global chain".
 
+### Rewriting the method or the target
+
+The route, and with it the router and route middleware, is chosen **after** global middleware
+runs and **before** router middleware runs. A layer that rewrites `req.method` or `req.target`
+therefore belongs in the global list. An `X-HTTP-Method-Override` layer, a legacy path alias
+and a locale prefix are the usual cases. From there the rewritten request gets the new route's
+own middleware and guards:
+
+```julia
+# Only a POST may be overridden, as with Express's `methodOverride`: letting a GET become a
+# DELETE would turn a link or an <img> into a state-changing request.
+method_override = handler -> function (req::HTTP.Request)
+    m = HTTP.header(req, "X-HTTP-Method-Override", "")
+    (req.method == "POST" && !isempty(m)) && (req.method = uppercase(m))
+    return handler(req)
+end
+
+# FIRST in the list, so every layer after it — CSRFMiddleware included — sees the final method.
+serve(app; middleware = [
+    method_override,
+    SessionMiddleware(store = store),
+    CSRFMiddleware(csrf_secret),
+])
+```
+
+Order inside the global list still matters. A global layer listed *before* the rewrite made its
+decision on the original request: `CSRFMiddleware` skips its check for `GET`, so a `GET`
+rewritten into a `DELETE` after it has already passed.
+
+A router- or route-level layer runs after the route was chosen, and after every global layer. If
+it rewrites the request onto a route with **different** middleware, Nitro refuses the request
+with a `500` and logs an error naming both routes, because serving it would skip the new route's
+guards. A rewrite that stays on the same route is served, and so is one onto a route that has no
+router or route middleware. Stripping a trailing slash and mapping `HEAD` onto its `GET` are both
+fine. The global layers still ran on the original request, which is one more reason to put the
+rewrite in the global list.
+
 ### Rules a middleware must follow
 
 - **Never mutate a `Response` an inner layer returned — build a new one.** The inner layer may be
