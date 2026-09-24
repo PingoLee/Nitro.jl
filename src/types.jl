@@ -1005,16 +1005,12 @@ end
 # guard it serves, so the reason travels with it.
 const MAX_QUERY_KEY_REPORT = 64
 
-# Same guard, same reason: `HTTP.queryparams` decodes internally and throws on a malformed
-# escape, so `?q=%ZZ` was a 500 here too (pre-existing -- this accessor's decode was never
-# inside `parseparam_checked` either). Both accessors now owe their caller a well-formed map
-# or a `ValidationError`; neither leaks a raw decode failure into the server-error path.
-# Same `.cause` rule as `pathparams` above (#130): attached, never rendered by default.
 # The raw (still percent-encoded) query of a request-target: everything after the first `?`, up
-# to a `#`. Read straight off the target, the way HTTP.jl's router splits it, rather than through
-# `HTTP.URI`: an absolute-form target with a malformed authority (`GET http://h:abc/items?a=1`)
-# is ROUTED -- the router never parses the authority -- but `HTTP.URI` throws on it, so every
-# route that read its query answered a 500 with a logged backtrace (#326).
+# to a `#` -- RFC 3986's delimiting, which is what `HTTP.URI(target).query` returned, but without
+# parsing the authority. An absolute-form target with a malformed authority
+# (`GET http://h:abc/items?a=1`) is ROUTED -- HTTP.jl's router never parses the authority -- yet
+# `HTTP.URI` throws on it, so every route that read its query answered a 500 with a logged
+# backtrace (#326).
 function _target_query(target::AbstractString) :: String
     i = findfirst(c -> c === '?' || c === '#', target)
     (i === nothing || target[i] === '#') && return ""
@@ -1023,6 +1019,11 @@ function _target_query(target::AbstractString) :: String
     return j === nothing ? String(rest) : String(SubString(rest, 1, prevind(rest, j)))
 end
 
+# Same guard, same reason: `HTTP.queryparams` decodes internally and throws on a malformed
+# escape, so `?q=%ZZ` was a 500 here too (pre-existing -- this accessor's decode was never
+# inside `parseparam_checked` either). Both accessors now owe their caller a well-formed map
+# or a `ValidationError`; neither leaks a raw decode failure into the server-error path.
+# Same `.cause` rule as `pathparams` above (#130): attached, never rendered by default.
 function _queryvars_uncached(req::HTTP.Request)
     # No URI parse, so nothing here can fail on the shape of the target itself (#326); the
     # guard below covers what can -- the percent-decoding of the query.
