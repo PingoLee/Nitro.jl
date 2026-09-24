@@ -45,8 +45,8 @@ The sink maps these onto whatever storage it uses.
 - `method`      — HTTP verb
 - `path`        — request path, reduced exactly as the console access log reduces it: query
                   and fragment stripped, and an absolute-form target (`http://user:pw@h/x`)
-                  cut to its path, so no authority or credentials survive. `"-"` when the
-                  target has no usable path
+                  cut to its path, so a well-formed authority and its credentials never
+                  survive. `"-"` when the target has no usable path, `"*"` for `OPTIONS *`
 - `query`       — `nothing` unless `AccessLog(sink; log_query = true)`; then the raw query
                   string (`nothing` if the request had none)
 - `status`      — response status (`500` if the handler threw)
