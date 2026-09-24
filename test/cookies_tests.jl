@@ -1629,3 +1629,102 @@ end
     @test occursin("at least 32", msg) && occursin("ENV", msg) && !occursin(short, msg)
 end
 end
+
+# #308: the argument-less `get_cookie(req, …)`/`set_cookie!(res, …)` read the process-wide
+# `CONTEXT[]`, not the app serving the request. With an explicit `App` -- the recommended handle
+# since #31 -- they could not see its key: writes went out in plaintext and reads returned the
+# raw client value, and nothing errored.
+@testitem "Argument-less cookie helpers use the serving App (#308)" tags=[:core, :security] setup=[NitroCommon] begin
+using Nitro
+using HTTP
+using Test
+const Cookies = Nitro.Cookies
+
+key_a = "a" * "0123456789abcdef0123456789abcdef"
+key_b = "b" * "0123456789abcdef0123456789abcdef"
+key_g = "g" * "0123456789abcdef0123456789abcdef"
+
+token_of(res, name) = begin
+    for (k, v) in res.headers
+        lowercase(k) == "set-cookie" && startswith(v, name * "=") &&
+            return split(split(v, ';')[1], '='; limit = 2)[2]
+    end
+    error("no Set-Cookie for $name")
+end
+opens_under(token, name, key) = Cookies.get_cookie(
+    HTTP.Request("GET", "/", ["Cookie" => "$name=$token"]), name; encrypted = true, secret_key = key)
+
+@testset "the issue's reproduction" begin
+    app = App(mod = @__MODULE__)
+    configcookies(app; secret_key = key_a)
+    urlpatterns(app, "",
+        path("/whoami", req -> Res.json(Dict("role" => get_cookie(req, "role")))),
+        path("/issue",  req -> (r = Res.send("ok"); set_cookie!(r, "role", "user"); r)))
+
+    # A forged plaintext cookie is not trusted. It used to read back as "admin".
+    forged = internalrequest(app, HTTP.Request("GET", "/whoami", ["Cookie" => "role=admin"]))
+    @test forged.status == 200
+    @test json(forged)["role"] === nothing
+
+    # The written cookie is sealed under THIS app's key. It used to be `role=user` in the clear.
+    issued = internalrequest(app, HTTP.Request("GET", "/issue"))
+    @test !occursin("role=user", HTTP.header(issued, "Set-Cookie"))
+    token = token_of(issued, "role")
+    @test opens_under(token, "role", key_a) == "user"
+
+    # And the app reads its own cookie back.
+    back = internalrequest(app, HTTP.Request("GET", "/whoami", ["Cookie" => "role=$token"]))
+    @test json(back)["role"] == "user"
+end
+
+@testset "a task the handler spawns still sees the serving app" begin
+    app = App(mod = @__MODULE__)
+    configcookies(app; secret_key = key_a)
+    urlpatterns(app, "",
+        path("/spawned", req -> (r = Res.send("ok"); fetch(Threads.@spawn set_cookie!(r, "s", "v")); r)))
+    @test opens_under(token_of(internalrequest(app, HTTP.Request("GET", "/spawned")), "s"), "s", key_a) == "v"
+end
+
+@testset "two apps serving concurrently each use their own key" begin
+    apps = (App(mod = @__MODULE__), App(mod = @__MODULE__))
+    keys = (key_a, key_b)
+    for (app, key) in zip(apps, keys)
+        configcookies(app; secret_key = key)
+        urlpatterns(app, "", path("/w", req -> (r = Res.send("ok"); set_cookie!(r, "w", "v"); r)))
+    end
+    n = 64
+    tokens = Vector{String}(undef, n)
+    @sync for i in 1:n
+        Threads.@spawn tokens[i] = token_of(internalrequest(apps[isodd(i) ? 1 : 2], HTTP.Request("GET", "/w")), "w")
+    end
+    for i in 1:n
+        own, other = isodd(i) ? (keys[1], keys[2]) : (keys[2], keys[1])
+        @test opens_under(tokens[i], "w", own) == "v"
+        @test opens_under(tokens[i], "w", other) === nothing
+    end
+end
+
+@testset "outside a request, and on the singleton, they mean the global app" begin
+    resetstate()
+    try
+        configcookies(secret_key = key_g)
+        @test Nitro.Core.SERVING_APP[] === nothing
+
+        # Outside any request.
+        token = token_of(set_cookie!(HTTP.Response(200), "g", "v"), "g")
+        @test opens_under(token, "g", key_g) == "v"
+        @test get_cookie(HTTP.Request("GET", "/", ["Cookie" => "g=$token"]), "g") == "v"
+
+        # Inside a request served by the singleton app.
+        urlpatterns("", path("/s308", req -> (r = Res.send(something(get_cookie(req, "g"), "none"));
+                                              set_cookie!(r, "g", "w"); r)))
+        first = internalrequest(HTTP.Request("GET", "/s308"))
+        @test String(first.body) == "none"
+        token = token_of(first, "g")
+        @test opens_under(token, "g", key_g) == "w"
+        @test String(internalrequest(HTTP.Request("GET", "/s308", ["Cookie" => "g=$token"])).body) == "w"
+    finally
+        resetstate()
+    end
+end
+end

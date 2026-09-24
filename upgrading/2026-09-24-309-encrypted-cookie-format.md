@@ -38,6 +38,12 @@ key configured at all, an encrypted read or write still throws `CookieError`.
 for tokens `set_cookie!`/`get_cookie` must read). `decrypt_payload` itself still throws
 `CookieError` for every failure above.
 
+Apps built with an explicit `App` that called the argument-less `get_cookie(req, …)` /
+`set_cookie!(res, …)` were writing **plaintext** cookies, because those helpers read the global
+app instead of the serving one ([#308](https://github.com/PingoLee/Nitro.jl/issues/308), fixed
+in this release). They now use the serving app's key, so those plaintext cookies read as absent
+too — the same single round.
+
 ### How to find the calls to migrate
 
 ```bash
