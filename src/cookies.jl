@@ -422,11 +422,8 @@ supply a "cookie" by sending the wrong header. Names match exactly, as in
 `_extract_value_from_header`.
 """
 function _get_cookie_lazy(headers::Any, target_name::String; set_cookie::Bool = false) :: Union{SubString{String}, Nothing}
+    # A Dict is never a Response's headers, so it is only ever read as a request's.
     if headers isa Dict
-        if set_cookie
-            line = Base.get(headers, "set-cookie", Base.get(headers, "Set-Cookie", nothing))
-            return line isa AbstractString ? _set_cookie_value(line, target_name) : nothing
-        end
         cookie_val = Base.get(headers, "cookie", Base.get(headers, "Cookie", nothing))
         return isnothing(cookie_val) ? nothing : _extract_value_from_header(cookie_val, target_name)
     end

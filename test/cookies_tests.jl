@@ -1825,6 +1825,14 @@ end
     @test Cookies.parse_cookies(split_headers)["c"] == "3"  # used to stop at the first header
     @test Cookies.parse_cookies(split_headers)["a"] == "1"
     @test Cookies.get_cookie(split_headers, "c") == "3"
+
+    # The Cookie{T} extractor agrees with get_cookie on the same request. It used to read a
+    # lowercased header Dict, which keeps only the LAST `cookie` header.
+    spaced = HTTP.Request("GET", "/", ["Cookie" => "a=1", "X-Other" => "y", "Cookie" => "a=2"])
+    param = Nitro.Types.Param(name = :a, type = Nitro.Cookie{String})
+    extracted = Nitro.Extractors.extract(param, Nitro.Types.LazyRequest(request = spaced), nothing).value
+    @test extracted == Cookies.get_cookie(spaced, "a")
+    @test extracted == "1"
 end
 
 @testset "a request's Set-Cookie is not a cookie" begin

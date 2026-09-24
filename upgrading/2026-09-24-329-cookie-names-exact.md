@@ -12,7 +12,7 @@
 | | Before | After |
 |---|---|---|
 | Cookie-name matching in `get_cookie` (and so in the `Cookie{T}`/`Session{T}` extractors, `SessionMiddleware`, `CSRFMiddleware`) | case-insensitive | **exact** — cookie names are case-sensitive (RFC 6265 §4.1.1) |
-| A name sent twice | `get_cookie` took the first, `parse_cookies` the last | both take the **first** (RFC 6265 §5.4 sends the most specific path first; Go and npm `cookie` agree) |
+| A name sent twice in a **request** | `get_cookie` took the first, `parse_cookies` the last | both take the **first** (RFC 6265 §5.4 sends the most specific path first; Go and npm `cookie` agree). Responses are unchanged |
 | Several `Cookie` headers in a header list | `parse_cookies` read only the first | every one is read, in order |
 | A `Set-Cookie` header on a **request** | read as a cookie | ignored; only a **response** is read from `Set-Cookie`, and only from it |
 | `domain` in `format_cookie` and `CookieConfig(domain = …)` | rejected only a space and `:` | the strict validator every other path used: trimmed, lowercased, `[A-Za-z0-9.-]` only, else `ArgumentError` — `CookieConfig` now checks at construction |

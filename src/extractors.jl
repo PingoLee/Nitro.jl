@@ -478,7 +478,10 @@ function extract(param::Param{Cookie{T}}, request::LazyRequest, secret_key::Unio
     # on write — `_validate_cookie_value` rejects out-of-range octets instead, and `%` is a legal
     # cookie octet. Decoding here (which `parseparam` used to do by default) therefore mangled any
     # cookie carrying a literal `%` on the way back in — a write/read asymmetry removed with #70.
-    val = Cookies.get_cookie(headers(request), cookie_name; encrypted=!isnothing(secret_key), secret_key=secret_key)
+    # From the REQUEST, not `headers(request)`: that is a lowercased Dict keeping only the last
+    # `cookie` header, so repeated headers would resolve differently here than in
+    # `get_cookie(req)` / `parse_cookies(req)` (#329).
+    val = Cookies.get_cookie(request.req, cookie_name; encrypted=!isnothing(secret_key), secret_key=secret_key)
     
     if isnothing(val)
         return Cookie(cookie_name, T)
@@ -504,7 +507,7 @@ function extract(param::Param{Session{T}}, request::LazyRequest, secret_key::Uni
     end
 
     # 2. Extract the session ID from cookies
-    val = Cookies.get_cookie(headers(request), session_cookie_name; encrypted=!isnothing(secret_key), secret_key=secret_key)
+    val = Cookies.get_cookie(request.req, session_cookie_name; encrypted=!isnothing(secret_key), secret_key=secret_key)
     
     if isnothing(val) || isempty(val)
         return Session(session_cookie_name, T)
