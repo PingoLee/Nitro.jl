@@ -6,7 +6,7 @@ using Dates
 using JSON
 using UUIDs
 
-import Nitro.Auth: make_password, check_password, password_needs_upgrade, is_password_usable
+import Nitro.Auth: make_password, check_password, password_needs_upgrade
 import Nitro.Core.Types: AbstractSessionStore, SessionPayload, get_session, set_session!, delete_session!, cleanup_expired_sessions!, is_expired
 import Nitro.Core.Cookies: storesession!, prunesessions!
 import Nitro: pormg_nitro_session, sync_pormg_env!
@@ -35,15 +35,26 @@ export PormGWorkerStore, pormg_nitro_worker
 
 Hook for PormG's `normalize_field_value` on `PasswordField` with `auto_hash=true`.
 
-- If `value` is a `String` that does not look like an already-encoded hash
-  (checked via `is_password_usable`), hashes it with `make_password`.
-- If `value` is already an encoded hash, passes it through unchanged.
-- If `value` is not a `String` (e.g. `nothing`, numeric, etc.), passes it through
-  untouched — type validation is PormG's responsibility, not Nitro's.
+- A non-blank string is **always** hashed with `make_password`, including one that already
+  looks like an encoded hash (#311). The value comes from user input, and a pass-through keyed
+  on the hash *prefix* let a user register the password `pbkdf2_sha256\$9223372036854775807\$s\$h`
+  and have it stored verbatim, as a hash whose cost the next login would pay.
+- To store a hash you computed yourself, declare the field `auto_hash=false`; PormG then stores
+  the string as given. That is the explicit route for pre-hashed values — and an app that
+  hashes with `make_password` before saving must declare it now, or once the seam lands its
+  hashes get hashed again (PormG's default is `auto_hash=true`).
+- A blank string, or a value that is not a string (e.g. `nothing`), passes through untouched:
+  type validation is PormG's responsibility, not Nitro's.
+- A password longer than `Nitro.Auth.MAX_PASSWORD_BYTES` (4096) bytes throws `ArgumentError`
+  out of the save, as `make_password` does. Validate the length before assigning it.
+
+Contract for PormG's side of the seam, which does not exist yet (PormG 0.6 has no
+`register_field_hook`, so this hook is registered only when it appears): the hook must run on
+values the **application assigns**, never on a value read back from the database, or saving
+a loaded row would hash its hash.
 """
 function hash_password_field(value)
     value isa AbstractString || return value
-    is_password_usable(value) && return value
     isempty(strip(value)) && return value
     return make_password(value)
 end

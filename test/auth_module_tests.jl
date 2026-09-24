@@ -1102,3 +1102,195 @@ end
 end
 
 end
+
+# Password hashing is bounded work (#311). Before it, the PBKDF2 loop was pure Julia and cost
+# password length x iterations, nothing capped the password, and `matches` trusted the stored
+# hash's cost parameters. The first testset is characterization (libcrypto must compute exactly
+# what the old loop did). Most refusals after it failed or hung against the old code; the ones
+# that were already `false` before assert the refusal warning, which only the bound can emit.
+@testitem "Password hashing bounds (#311)" tags=[:auth, :security, :core] setup=[NitroCommon] begin
+
+using Test
+using Nitro
+using Base64
+using Bcrypt
+import Nitro.Auth: encode, matches, PBKDF2PasswordEncoder, BCryptPasswordEncoder,
+    SpringSecurityPBKDF2PasswordEncoder, DelegatingPasswordEncoder, check_password, make_password,
+    MAX_PASSWORD_BYTES, MAX_PBKDF2_ITERATIONS, MAX_PBKDF2_KEY_LENGTH, MAX_BCRYPT_COST, _pbkdf2_sha256
+
+# The warnings for refused hashes are expected here; keep them out of the test log.
+# `Base.CoreLogging`, not `using Logging` -- Logging is not a test dependency.
+quiet(f) = Base.CoreLogging.with_logger(f, Base.CoreLogging.NullLogger())
+
+@testset "PBKDF2 through libcrypto is the same function" begin
+    # RFC 7914 §11, the two PBKDF2-HMAC-SHA256 vectors.
+    @test bytes2hex(_pbkdf2_sha256("passwd", "salt", 1; key_length = 64)) ==
+        "55ac046e56e3089fec1691c22544b605f94185216dde0465e68b9d57c20dacbc" *
+        "49ca9cccf179b645991664b39d77ef317c71b845b1e30bd509112041d3a19783"
+    @test bytes2hex(_pbkdf2_sha256("Password", "NaCl", 80000; key_length = 64)) ==
+        "4ddcd8f60b98be21830cee5ef22701f9641a4418d04c0414aeff08876b34ab56" *
+        "a1d425a1225833549adb841b51c9b3176a272bdebba1d078478f62b397f33c8d"
+
+    # Hashes stored before the switch still verify. Both expected values come from Python's
+    # `hashlib.pbkdf2_hmac` -- the function Django itself calls -- not from this package.
+    django = "pbkdf2_sha256\$1000\$seasalt\$JgZryXe2Ga8ysg6XbzkLpTdyPQrHqsinbL9BnnhgX4A="
+    @test check_password("lètmein", django)
+    @test !check_password("letmein", django)
+    spring = "sha256:1000:32:MDEyMzQ1Njc4OWFiY2RlZmdoaWprbG1u:N5p8hFeP4JoVYtGtyOFRkadQp2R3Vn4dtT7AmBNdz3c="
+    @test check_password("correct horse", spring)
+    @test !check_password("correct horsf", spring)
+    # An empty salt was accepted before; a libcrypto error here would be a 500 at login.
+    @test check_password("pw", "pbkdf2_sha256\$1000\$\$oDUwIi0TG0fZgsmBDvjjtrbGdmtrGhutVhusvMeWb+A=")
+end
+
+@testset "PBKDF2 work does not grow with password length" begin
+    # HMAC re-hashes a key longer than its 64-byte block on every call, and the pure-Julia loop
+    # allocated a fresh HMAC per iteration -- megabytes here, and time proportional to the
+    # password's length. libcrypto keys the HMAC once and allocates only the output.
+    long = "a"^MAX_PASSWORD_BYTES
+    _pbkdf2_sha256(long, "salt", 20_000)
+    @test (@allocated _pbkdf2_sha256(long, "salt", 20_000)) < 16_384
+end
+
+@testset "password length is capped before any hashing" begin
+    @test MAX_PASSWORD_BYTES == 4096
+    at_cap = "a"^MAX_PASSWORD_BYTES
+    over = "a"^(MAX_PASSWORD_BYTES + 1)
+
+    # At the cap still round-trips; one byte over is refused by every hashing entry point.
+    @test check_password(at_cap, make_password(at_cap; iterations = 1000))
+    @test_throws ArgumentError make_password(over)
+    @test_throws ArgumentError make_password(over; algorithm = "bcrypt", bcrypt_cost = 4)
+    @test_throws ArgumentError make_password(over; algorithm = "spring_sha256", iterations = 1000)
+    @test_throws ArgumentError encode(PBKDF2PasswordEncoder(iterations = 1000), over)
+    @test_throws ArgumentError encode(BCryptPasswordEncoder(cost = 4), over)
+    @test_throws ArgumentError encode(SpringSecurityPBKDF2PasswordEncoder(iterations = 1000), over)
+    # The cap is in bytes, not characters.
+    @test_throws ArgumentError make_password("é"^(MAX_PASSWORD_BYTES ÷ 2 + 1))
+
+    # Verification refuses an over-cap password even when it IS the right one. Each hash is
+    # built with the primitive, which the encoders now refuse to do.
+    pbkdf2 = "pbkdf2_sha256\$1000\$salt\$" * base64encode(_pbkdf2_sha256(over, "salt", 1000))
+    salt_b64 = base64encode(b"0123456789abcdefghijklmn")
+    spring = "sha256:1000:32:$salt_b64:" * base64encode(_pbkdf2_sha256(over, salt_b64, 1000))
+    bcrypt = String(Bcrypt.GenerateFromPassword(over, 4))   # bcrypt truncates at 72 bytes
+    for stored in (pbkdf2, spring, bcrypt, "bcrypt\$" * bcrypt, "{bcrypt}" * bcrypt)
+        @test !check_password(over, stored)
+    end
+    @test !matches(PBKDF2PasswordEncoder(), over, pbkdf2)
+    @test !matches(SpringSecurityPBKDF2PasswordEncoder(), over, spring)
+    @test !matches(BCryptPasswordEncoder(), over, bcrypt)
+    @test !matches(DelegatingPasswordEncoder(), over, pbkdf2)
+    @test !check_password(over, nothing)
+end
+
+@testset "stored cost parameters are bounded" begin
+    # A bare `false` proves nothing here: most of these hashes can never match anyway, and a
+    # later check (a Spring hash of the wrong length, say) would answer `false` with the bound
+    # deleted. The refusal warning is what shows the bound fired -- before any hashing.
+    refused = (:warn, r"out-of-range cost parameters")
+    salt_b64 = base64encode(b"0123456789abcdefghijklmn")
+    zeros_b64(n) = base64encode(zeros(UInt8, n))   # a stored hash of the declared length
+
+    # A zero-length Spring key derived the empty string and matched ANY password.
+    @test !(@test_logs refused check_password("anything", "sha256:1:0:AAAA:"))
+    # A one-byte key matches 1 in 256 random passwords; this one is built to match.
+    one_byte = "sha256:1:1:$salt_b64:" * base64encode(_pbkdf2_sha256("pw", salt_b64, 1; key_length = 1))
+    @test !(@test_logs refused check_password("pw", one_byte))
+    # A declared key length that disagrees with the stored hash's: `false` before too (the
+    # lengths differ), now answered without deriving anything, and not a cost refusal.
+    full = base64encode(_pbkdf2_sha256("pw", salt_b64, 1000; key_length = 32))
+    @test check_password("pw", "sha256:1000:32:$salt_b64:$full")
+    @test !(@test_logs check_password("pw", "sha256:1000:16:$salt_b64:$full"))
+
+    # Unbounded work: each of these ran for hours, or forever, before.
+    for stored in (
+        "pbkdf2_sha256\$9223372036854775807\$s\$h",
+        "pbkdf2_sha256\$$(MAX_PBKDF2_ITERATIONS + 1)\$s\$h",
+        "sha256:9223372036854775807:32:$salt_b64:$(zeros_b64(32))",
+        "sha256:$(MAX_PBKDF2_ITERATIONS + 1):32:$salt_b64:$(zeros_b64(32))",
+        # Work is iterations x 32-byte blocks: a 64-byte key at half the ceiling is over it.
+        "sha256:$(MAX_PBKDF2_ITERATIONS ÷ 2 + 1):64:$salt_b64:$(zeros_b64(64))",
+        "sha256:1000:$(MAX_PBKDF2_KEY_LENGTH + 1):$salt_b64:$(zeros_b64(MAX_PBKDF2_KEY_LENGTH + 1))",
+        "sha256:1000:100000000:$salt_b64:$(zeros_b64(32))",
+        # Degenerate counts are refused, not handed to libcrypto (which would throw).
+        "pbkdf2_sha256\$0\$s\$h",
+        "pbkdf2_sha256\$-1\$s\$h",
+        "sha256:0:32:$salt_b64:$(zeros_b64(32))",
+    )
+        @test !(@test_logs refused check_password("x", stored))
+    end
+
+    bcrypt4 = String(Bcrypt.GenerateFromPassword("pw", 4))
+    @test check_password("pw", bcrypt4)
+    @test check_password("pw", "bcrypt\$" * bcrypt4)
+    @test check_password("pw", "{bcrypt}" * bcrypt4)
+    # Relabelled just over the ceiling. Bcrypt.jl accepts up to 31 (~50 h); one step over is the
+    # boundary that proves the bound, and a hash that would hang a run with the bound removed
+    # would prove nothing more.
+    relabelled = replace(bcrypt4, "\$04\$" => "\$$(lpad(MAX_BCRYPT_COST + 1, 2, '0'))\$")
+    for stored in (relabelled, "bcrypt\$" * relabelled, "{bcrypt}" * relabelled)
+        @test !(@test_logs refused check_password("pw", stored))
+    end
+    @test !(@test_logs refused matches(BCryptPasswordEncoder(), "pw", relabelled))
+end
+
+@testset "encoders cannot mint a hash their own matches refuses" begin
+    @test_throws ArgumentError PBKDF2PasswordEncoder(iterations = MAX_PBKDF2_ITERATIONS + 1)
+    @test_throws ArgumentError PBKDF2PasswordEncoder(key_length = MAX_PBKDF2_KEY_LENGTH + 1)
+    @test_throws ArgumentError SpringSecurityPBKDF2PasswordEncoder(iterations = MAX_PBKDF2_ITERATIONS + 1)
+    @test_throws ArgumentError SpringSecurityPBKDF2PasswordEncoder(key_length = MAX_PBKDF2_KEY_LENGTH + 1)
+    @test_throws ArgumentError SpringSecurityPBKDF2PasswordEncoder(
+        iterations = MAX_PBKDF2_ITERATIONS ÷ 2 + 1, key_length = 64)   # 2 blocks: over the work bound
+    @test_throws ArgumentError BCryptPasswordEncoder(cost = MAX_BCRYPT_COST + 1)
+    @test_throws ArgumentError DelegatingPasswordEncoder(pbkdf2_iterations = MAX_PBKDF2_ITERATIONS + 1)
+    @test_throws ArgumentError DelegatingPasswordEncoder(bcrypt_cost = MAX_BCRYPT_COST + 1)
+    @test_throws ArgumentError Nitro.Auth.password_needs_upgrade("x"; min_iterations = MAX_PBKDF2_ITERATIONS + 1)
+    @test_throws ArgumentError make_password("x"; iterations = MAX_PBKDF2_ITERATIONS + 1)
+    @test_throws ArgumentError make_password("x"; algorithm = "bcrypt", bcrypt_cost = MAX_BCRYPT_COST + 1)
+    # The ceilings themselves are accepted.
+    @test PBKDF2PasswordEncoder(iterations = MAX_PBKDF2_ITERATIONS).iterations == MAX_PBKDF2_ITERATIONS
+    @test SpringSecurityPBKDF2PasswordEncoder(iterations = MAX_PBKDF2_ITERATIONS ÷ 2, key_length = 64).key_length == 64
+    @test BCryptPasswordEncoder(cost = MAX_BCRYPT_COST).cost == MAX_BCRYPT_COST
+end
+
+@testset "an unknown user is an answer, not an error" begin
+    # Used to be a MethodError -- a 500 from the documented login flow.
+    @test check_password("x", nothing) == false
+    @test check_password("", nothing) == false
+    quiet() do
+        @test !check_password("x", "!unusable")
+        @test !check_password("x", "\$argon2id\$v=19\$m=65536,t=3,p=4\$c2FsdA\$aGFzaA")
+        @test !check_password("x", "bcrypt\$not-a-bcrypt-hash")
+    end
+end
+
+end
+
+# Timing is the only observable of the property below, so it gets its own item, tagged `:slow`
+# for `--skip-tags slow`. It compares measurements taken back to back under the same load, as a
+# minimum over several runs, with a wide margin -- never against an absolute time.
+@testitem "Password hashing cost (#311)" tags=[:auth, :security, :slow] setup=[NitroCommon] begin
+
+using Test
+using Nitro
+import Nitro.Auth: check_password, make_password
+
+mintime(f, n) = minimum(@elapsed(f()) for _ in 1:n)
+
+@testset "no stored hash costs what a real check costs" begin
+    # The username-enumeration oracle: returning at once for an unknown user answers the question
+    # "does this account exist?". Each of these must hash at the default cost first.
+    stored = make_password("right")
+    Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
+        check_password("warm-up", stored)
+        check_password("warm-up", nothing)
+        real = mintime(() -> check_password("wrong", stored), 3)
+        for unverifiable in (nothing, "!unusable", "plaintext", "bcrypt\$garbage",
+                             "\$argon2id\$v=19\$m=65536,t=3,p=4\$c2FsdA\$aGFzaA")
+            @test mintime(() -> check_password("wrong", unverifiable), 3) > 0.2 * real
+        end
+    end
+end
+
+end

@@ -179,6 +179,40 @@ function _empty_hmac_key(secret::AbstractString)
     return true
 end
 
+# PBKDF2-HMAC-SHA256 (RFC 8018) through libcrypto's `PKCS5_PBKDF2_HMAC`, for the password
+# hashers in `Auth` (#311). It replaced a pure-Julia loop that called `SHA.hmac_sha256` per
+# iteration: HMAC re-hashes a key longer than its 64-byte block on every call, so that loop
+# cost password length x iterations, and it ran several times slower than this at any length.
+# libcrypto keys the HMAC once per derivation, and the output is byte-identical, so every
+# stored hash still verifies.
+#
+# `gc_safe = true` is load-bearing: at the default cost this call runs for ~0.2 s, and a
+# ccall that is not GC-safe makes every other request thread wait for it at the next
+# stop-the-world collection. It is sound here because libcrypto touches only the buffers
+# passed in, which the ccall keeps rooted and Julia's non-moving GC never relocates.
+#
+# The caller owns the policy bounds (`Auth`'s `MAX_*` constants); this only refuses what
+# the C signature cannot represent.
+function _pbkdf2_hmac_sha256(password::AbstractString, salt::AbstractString, iterations::Integer, key_length::Integer)
+    pass = String(password)
+    saltstr = String(salt)
+    1 <= iterations <= typemax(Cint) || throw(ArgumentError("PBKDF2 iterations out of range: $iterations"))
+    1 <= key_length <= typemax(Cint) || throw(ArgumentError("PBKDF2 key length out of range: $key_length"))
+    (sizeof(pass) <= typemax(Cint) && sizeof(saltstr) <= typemax(Cint)) ||
+        throw(ArgumentError("PBKDF2 password or salt too long"))
+    out = Vector{UInt8}(undef, key_length)
+    md = @ccall OpenSSL.libcrypto.EVP_sha256()::Ptr{Cvoid}
+    ret = @ccall gc_safe = true OpenSSL.libcrypto.PKCS5_PBKDF2_HMAC(
+        pass::Ptr{UInt8}, sizeof(pass)::Cint, saltstr::Ptr{UInt8}, sizeof(saltstr)::Cint,
+        iterations::Cint, md::Ptr{Cvoid}, key_length::Cint, out::Ptr{UInt8})::Cint
+    if ret != 1
+        # The error queue is per OS thread; leave nothing behind for an unrelated TLS call.
+        @ccall OpenSSL.libcrypto.ERR_clear_error()::Cvoid
+        throw(ErrorException("PKCS5_PBKDF2_HMAC failed (code $ret)"))
+    end
+    return out
+end
+
 """
     SecretString(value::AbstractString)
 
