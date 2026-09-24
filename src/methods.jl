@@ -566,9 +566,10 @@ function _warn_shadowed_cookie_key(app::App, kwargs)
     isnothing(app.service.cookies[].secret_key) || return nothing
     isnothing(Base.get(kwargs, :secret_key, nothing)) || return nothing
     @warn "Nitro: a cookie secret_key is configured on the GLOBAL app (`configcookies(secret_key = …)`), " *
-          "but the App being served has none, so its cookies are NOT encrypted. `get_cookie`/" *
+          "but the App being served has none, so any cookie it sets is NOT encrypted. `get_cookie`/" *
           "`set_cookie!` use the configuration of the app serving the request (#308) -- configure " *
-          "this one with `configcookies(app; secret_key = …)` or `serve(app; secret_key = …)`." maxlog = 1
+          "this one with `configcookies(app; secret_key = …)` or `serve(app; secret_key = …)`. " *
+          "(An app that sets no cookies can ignore this.)" maxlog = 1
     return nothing
 end
 

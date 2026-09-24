@@ -1432,9 +1432,16 @@ end
 
 @testset "non-string keys are refused without being read" begin
     bytes = Vector{UInt8}(codeunits(real_key))
-    for bad in (bytes, Base.SecretBuffer(real_key), :a_symbol_key)
-        @test_throws ArgumentError CookieConfig(secret_key = bad)
-        @test_throws ArgumentError configcookies(App(); secret_key = bad)
+    buffer = Base.SecretBuffer(real_key)
+    try
+        for bad in (bytes, buffer, :a_symbol_key)
+            @test_throws ArgumentError CookieConfig(secret_key = bad)
+            @test_throws ArgumentError configcookies(App(); secret_key = bad)
+        end
+    finally
+        # An un-shredded SecretBuffer makes its GC finalizer `@warn` at a random later point,
+        # which can land inside another test's strict `@test_logs`.
+        Base.shred!(buffer)
     end
     # `String(::Vector{UInt8})` empties the buffer; refusing must not have touched it.
     @test bytes == Vector{UInt8}(codeunits(real_key))
@@ -1446,17 +1453,22 @@ end
     # complaint. (Plaintext was already refused, by accident -- the `"` in the display form is
     # not a legal cookie octet -- so a plaintext-only assertion would pass on the unpatched code.)
     # Matched on the message, so that accident cannot satisfy it either.
-    for secret_value in (SecretString("tok"), Base.SecretBuffer("tok"))
-        for encrypted in (true, false)
-            err = try
-                Cookies.set_cookie!(HTTP.Response(200), "t", secret_value; secret_key = real_key,
-                                    encrypted)
-                nothing
-            catch e
-                e
+    buffer = Base.SecretBuffer("tok")
+    try
+        for secret_value in (SecretString("tok"), buffer)
+            for encrypted in (true, false)
+                err = try
+                    Cookies.set_cookie!(HTTP.Response(200), "t", secret_value; secret_key = real_key,
+                                        encrypted)
+                    nothing
+                catch e
+                    e
+                end
+                @test err isa ArgumentError && occursin("reveal", err.msg)
             end
-            @test err isa ArgumentError && occursin("reveal", err.msg)
         end
+    finally
+        Base.shred!(buffer)   # see above: no finalizer warning at a random later point
     end
 end
 
@@ -1755,6 +1767,11 @@ end
         configcookies(secret_key = key_g)
         bare = App(mod = @__MODULE__)
         @test_logs (:warn, r"GLOBAL app.*NOT encrypted") Nitro._warn_shadowed_cookie_key(bare, (;))
+        # ...and `serve(app)` really calls it. An invalid `revise` makes serve refuse right after,
+        # before anything binds a port.
+        @test_logs (:warn, r"GLOBAL app") match_mode = :any begin
+            @test_throws ArgumentError serve(bare; revise = :bogus, show_banner = false)
+        end
         # ...and the message never carries the key.
         logger = Test.TestLogger()
         Base.CoreLogging.with_logger(() -> Nitro._warn_shadowed_cookie_key(bare, (;)), logger)

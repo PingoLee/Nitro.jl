@@ -33,13 +33,14 @@ applies to them — the same one round of absent cookies as the
 
 ```bash
 # Global cookie configuration...
-grep -rnE 'configcookies\((secret_key|[a-z_]+\s*=)' --include=*.jl .
+grep -rnE 'configcookies\(\s*(;|Dict|[a-z_]+\s*=)' --include=*.jl .
 # ...in an app that serves an explicit App.
 grep -rnE 'serve\([a-z_]+[;,)]|App\(' --include=*.jl .
 ```
 
 At runtime, `serve(app)` warns: `a cookie secret_key is configured on the GLOBAL app … but the App
-being served has none, so its cookies are NOT encrypted`.
+being served has none, so any cookie it sets is NOT encrypted`. An app that sets no cookies — a
+separate health or metrics server — can ignore it.
 
 ### Migrate your app
 
