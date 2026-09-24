@@ -108,7 +108,9 @@ getquery(req::HTTP.Request) = Types.queryvars(req)
 """
     getjson(req::HTTP.Request) -> Any
 
-Returns the parsed JSON request body, or `nothing` when the body is empty or malformed.
+Returns the parsed JSON request body, or `nothing` when the body is empty or malformed —
+including a body nested deeper than 512 arrays/objects, which is rejected before it is parsed
+(#314).
 
 Parsed **once per request and cached**, so reading it twice is free and both reads return the
 same object — a live handle, not a snapshot. This is the accessor handler code wants.

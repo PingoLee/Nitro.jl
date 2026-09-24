@@ -286,6 +286,24 @@ end
     @test layer(json).status == 200
 end
 
+@testset "a JSON-body token nested past the depth bound is not presented (#314)" begin
+    # The JSON-body fallback reads the token through `getjson`, whose parse is depth-bounded:
+    # past 512 levels the body is malformed JSON, so no token is presented and the request is
+    # the ordinary 403. One level shallower, the same token is accepted -- so the 403 is the
+    # bound's, not a broken round trip. The pre-#314 parser accepted both.
+    layer = bound_layer(SESSION_A)
+    issued = cookie_value(layer(request("GET")), "__Host-csrf_token")
+    raw = String(split(issued, '.', limit = 2)[1])
+    padded(d) = "{\"_csrf\":\"" * raw * "\",\"pad\":" * repeat("[", d) * repeat("]", d) * "}"
+    post(body) = layer(request("POST", Dict("__Host-csrf_token" => issued);
+                               headers = ["Content-Type" => "application/json"], body = body))
+
+    @test CSRF._presented_token(request("POST"; headers = ["Content-Type" => "application/json"],
+                                        body = padded(512)), "X-CSRF-Token", "_csrf") === nothing
+    @test post(padded(512)).status == 403
+    @test post(padded(511)).status == 200
+end
+
 @testset "unsafe requests are rejected without a valid pair" begin
     layer = bound_layer(SESSION_A)
     issued = cookie_value(layer(request("GET")), "__Host-csrf_token")
