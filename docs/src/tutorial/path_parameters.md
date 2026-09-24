@@ -181,6 +181,11 @@ function get_list(req, list::Vector{Int})
 end
 ```
 
+An `@enum` binds by its integer value or by its name: `/fruit/2` and `/fruit/orange` both bind
+`orange`, and anything else is a `400`. The name is compared against the enum's own members, never
+turned into a `Symbol` — Julia never frees an interned `Symbol`, so building one from each request
+would let any client grow the process's memory for good.
+
 A `Union{...}` annotation binds to the **first member type that parses**; if no member accepts the
 value, the request is a `400`.
 

@@ -27,6 +27,55 @@ end
 
 const EMPTY_FORM_DATA = Dict{String,String}()
 
+# ── Nitro's read style for typed client JSON (#306) ─────────────────────────────
+#
+# Julia never frees an interned `Symbol`, so building one from a client string is unbounded,
+# unauthenticated memory growth. JSON.jl's default style does exactly that for two field types:
+# `StructUtils.lift(::Type{Symbol}, x) = Symbol(x)`, and `lift(::Type{<:Enum}, x)` interns the
+# string *before* looking it up, so even an invalid enum name stays in memory for good. Every
+# typed parse of client input -- `Json{T}`, `json(req, T)`, `parseparam`'s JSON fallback, the
+# struct binder behind `Query{T}`/`Form{T}`/`Header{T}`/`Path{T}`/`JsonFragment{T}` -- passes
+# this style instead. JSON.jl (>= 1.5.2; the compat floor is 1.9) wraps a caller's style and
+# forwards `lift` to it after turning its internal `PtrString` into a `String`, so these methods
+# see a plain string and can match an enum by name without interning it.
+#
+# `Symbol` itself is refused at route registration (`interns_client_strings`); the `lift` method
+# below is the backstop for a `Symbol` reached some other way.
+const _SU = JSON.StructUtils
+
+"""
+    NitroReadStyle
+
+The `StructUtils` style every typed parse of client JSON goes through. It differs from JSON.jl's
+default in what it refuses to do with a client string: it never interns one as a `Symbol` (#306).
+Not part of the public API.
+"""
+struct NitroReadStyle <: _SU.StructStyle end
+const NITRO_READ_STYLE = NitroReadStyle()
+
+"""
+    enum_from_string(E, s) :: E
+
+The member of enum `E` whose name is `s`, found by comparing names rather than by building
+`Symbol(s)`, so an unknown name is not interned. `Symbol(inst)` returns the member's own name,
+which is interned already. Throws an `ArgumentError` that does not repeat `s`.
+"""
+function enum_from_string(::Type{E}, s::AbstractString) :: E where {E<:Enum}
+    for inst in instances(E)
+        String(Symbol(inst)) == s && return inst
+    end
+    throw(ArgumentError("not a valid $E name"))
+end
+
+_SU.lift(st::NitroReadStyle, ::Type{E}, x::AbstractString) where {E<:Enum} =
+    (enum_from_string(E, x), _SU.defaultstate(st))
+_SU.lift(st::NitroReadStyle, ::Type{E}, x::Integer) where {E<:Enum} =
+    (E(x), _SU.defaultstate(st))
+
+const _SYMBOL_REFUSED = "Nitro never builds a Symbol from request input (#306); declare an @enum, or a String checked against an allow-list"
+_SU.lift(::NitroReadStyle, ::Type{Symbol}, x) = throw(ArgumentError(_SYMBOL_REFUSED))
+_SU.liftkey(::NitroReadStyle, ::Type{Symbol}, x) = throw(ArgumentError(_SYMBOL_REFUSED))
+
 # HTTP.jl v2 replaced the raw `Vector{UInt8}` request body (and `HTTP.payload`) with the
 # `AbstractBody` hierarchy. Extract the bytes without consuming the body cursor so the
 # same request body can be read more than once (e.g. `.json` and `.form`). Responses may
@@ -172,13 +221,19 @@ end
     json(request::HTTP.Request, class_type::Type{T}; keyword_arguments...)
 
 Read the body of a HTTP.Request as JSON with additional arguments for the read/serializer into a custom struct.
+
+The body is client input, so it is always parsed with Nitro's read style, which never interns a
+client string as a `Symbol` (#306): an enum field binds by name or by integer, and a `Symbol`
+field is refused. Passing `style` is an `ArgumentError`.
 """
 function json(req::HTTP.Request, class_type::Type{T}; kwargs...) where {T}
+    haskey(kwargs, :style) && throw(ArgumentError(
+        "json(req, T) parses client input with Nitro's read style (#306); `style` cannot be overridden"))
     payload = _request_payload(req)
     if isnothing(payload)
         return nothing
     end
-    return JSON.parse(IOBuffer(payload), class_type; kwargs...)
+    return JSON.parse(IOBuffer(payload), class_type; style = NITRO_READ_STYLE, kwargs...)
 end
 
 function json(res::HTTP.Response, class_type::Type{T}; kwargs...) where {T}

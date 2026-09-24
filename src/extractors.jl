@@ -6,7 +6,8 @@ using HTTP
 using Dates
 
 using ..Util: text, json, formdata, multipart, parseparam, FormFile
-using ..Reflection: struct_builder, extract_struct_info
+using ..Util.BodyParsers: NITRO_READ_STYLE
+using ..Reflection: struct_builder, extract_struct_info, kw_construct
 using ..Errors: ValidationError, is_unrecoverable
 using ..Types
 using ..Cookies
@@ -332,10 +333,13 @@ JSON.jl's own rules.
 A struct that already speaks StructUtils -- field tags or defaults, as `StructUtils.@kwarg`,
 `@tags` and `@defaults` declare -- is left to `JSON.parse` whole: JSON.jl honors those itself, and
 the per-field path would drop the tags, so a renamed key would silently bind the field's default.
+
+Every parse uses Nitro's read style, which never interns a client string as a `Symbol` (#306):
+JSON.jl's default style did so for every enum field, valid name or not.
 """
 function json_bind(::Type{T}, text::AbstractString) :: T where {T}
-    binds_by_keyword(T) || return JSON.parse(text, T)
-    fields = JSON.parse(text, Dict{String, JSON.JSONText})
+    binds_by_keyword(T) || return JSON.parse(text, T; style = NITRO_READ_STYLE)
+    fields = JSON.parse(text, Dict{String, JSON.JSONText}; style = NITRO_READ_STYLE)
     kwargs = Pair{Symbol, Any}[]
     for name in fieldnames(T)
         raw = get(fields, String(name), nothing)
@@ -347,41 +351,15 @@ end
 
 # Runs once per `Json{T}` request, so it is ordered cheapest first. The StructUtils queries are
 # plain dispatch and fold for a concrete `T`; `hasmethod` with keyword names is the same
-# `@kwdef` test `multipart_struct_builder` uses, several times cheaper than
-# `Reflection.has_kwdef_constructor`'s scan of `methods(T)`. StructUtils is reached through
-# JSON, whose typed-parse API is built on it, so it is not a dependency of Nitro's own.
+# `@kwdef` test `multipart_struct_builder` and `struct_builder` use, several times cheaper than
+# scanning `methods(T)`. StructUtils is reached through JSON, whose typed-parse API is built on
+# it, so it is not a dependency of Nitro's own.
 const _SU = JSON.StructUtils
 function binds_by_keyword(::Type{T}) :: Bool where {T}
     T isa DataType && isstructtype(T) || return false
     style = _SU.DefaultStyle()
     isempty(_SU.fieldtags(style, T)) && isempty(_SU.fielddefaults(style, T)) || return false
     return hasmethod(T, Tuple{}, fieldnames(T))
-end
-
-# Absent fields follow JSON.jl's own rule: the declared default, else the null the field's type
-# admits, else an error. The keyword constructor applies every default itself, so a field it
-# reports as undefined has none -- fill in the null if its type takes one and try again. Each
-# pass adds a field that was not there before, so this runs at most `fieldcount(T)` times.
-function kw_construct(::Type{T}, kwargs::Vector{Pair{Symbol, Any}}) :: T where {T}
-    while true
-        try
-            return T(; kwargs...)
-        catch e
-            e isa UndefKeywordError || rethrow()
-            name = e.var
-            # Only a keyword of `T`'s own constructor that we did not pass -- anything else was
-            # thrown from deeper inside a default expression and is not ours to answer.
-            (name in fieldnames(T) && !any(p -> p.first === name, kwargs)) || rethrow()
-            ftype = fieldtype(T, name)
-            if Nothing <: ftype
-                push!(kwargs, name => nothing)
-            elseif Missing <: ftype
-                push!(kwargs, name => missing)
-            else
-                throw(ValidationError("Missing required field '$name'"))
-            end
-        end
-    end
 end
 
 """
@@ -531,12 +509,12 @@ function extract(param::Param{Session{T}}, request::LazyRequest, secret_key::Uni
         return Session(session_cookie_name, valid_instance)
     end
     
-    # We assume the store is a Dict-like object or support get()
+    # We assume the store is a Dict-like object or support get(). Looked up by the cookie value
+    # as a `String` only: a `Symbol(val)` branch here interned every session id a client sent,
+    # and Julia never frees an interned `Symbol` (#306).
     instance = try
         if hasmethod(Base.get, (typeof(store), String, Any))
             Base.get(store, val, nothing)
-        elseif hasmethod(Base.get, (typeof(store), Symbol, Any))
-            Base.get(store, Symbol(val), nothing)
         else
             nothing
         end

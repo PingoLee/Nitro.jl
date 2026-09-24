@@ -64,6 +64,7 @@ const TEST_FILES = [
     "precompile_warmth_tests.jl",
     "extractor_tests.jl",
     "reflection_tests.jl",
+    "binding_tests.jl",
     "response_tests.jl",
     "bodyparser_tests.jl",
     "max_body_bytes_tests.jl",

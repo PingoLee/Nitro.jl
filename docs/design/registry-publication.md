@@ -43,7 +43,7 @@ Nitro fails it on exactly one name. Every other entry in `Project.toml` was chec
 
 | Section | Names | In General |
 |---|---|---|
-| `[deps]`, non-stdlib | Bcrypt, DataStructures, HTTP, JSON, LRUCache, MIMEs, OpenSSL, PrecompileTools, Reexport, StructTypes | **all** — including HTTP at 2.7.1, which satisfies the `~2.7` pin |
+| `[deps]`, non-stdlib | Bcrypt, DataStructures, HTTP, JSON, LRUCache, MIMEs, OpenSSL, PrecompileTools, Reexport | **all** — including HTTP at 2.7.1, which satisfies the `~2.7` pin |
 | `[deps]`, stdlib | Base64, Dates, Printf, Random, SHA, Sockets, UUIDs | exempt (stdlib table) |
 | `[weakdeps]` | Mustache, OteraEngine, ProtoBuf, Revise, TimeZones | **all** |
 | `[weakdeps]` | **PormG** (`7d8d7541-4d3d-4580-80a2-17064efb0993`) | **no** |

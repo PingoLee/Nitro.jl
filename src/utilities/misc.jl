@@ -148,8 +148,12 @@ function parseparam(::Type{Symbol}, str::String)
 end
 
 
+# An enum binds by its integer value or by its name. The name is matched against the members'
+# own names (`BodyParsers.enum_from_string`), never looked up as `Symbol(str)`: that would intern
+# every string a client sends, and Julia never frees an interned `Symbol` (#306).
 function parseparam(::Type{T}, str::String) where {T <: Enum}
-    return T(parse(Int, str))
+    n = tryparse(Int, str)
+    return isnothing(n) ? BodyParsers.enum_from_string(T, str) : T(n)
 end
 
 """
@@ -202,7 +206,9 @@ function parseparam(::Type{T}, str::String) where {T}
         # fails first, lands here, and overflows. That was reported as `400 Bad Request` off a
         # worker Julia had just called possibly corrupt.
         is_unrecoverable(e) && rethrow()
-        return JSON.parse(str, T)
+        # Nitro's read style: `str` is client input, and JSON.jl's default style interns the
+        # strings it lifts into a `Symbol` or an enum field (#306).
+        return JSON.parse(str, T; style = BodyParsers.NITRO_READ_STYLE)
     end
 end
 

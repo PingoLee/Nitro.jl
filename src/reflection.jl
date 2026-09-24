@@ -1,7 +1,10 @@
 module Reflection
-using StructTypes
 using Base: @kwdef
+using JSON
 using ..Types
+using ..Errors: ValidationError
+using ..Util: parseparam
+using ..Util.BodyParsers: NITRO_READ_STYLE
 
 export splitdef, struct_builder, extract_struct_info
 
@@ -421,25 +424,6 @@ function splitdef(info::Vector{Core.CodeInfo}, method_defs::Base.MethodList, fun
 end
 
 
-"""
-    has_kwdef_constructor(T::Type) :: Bool
-
-Returns true if type `T` has a constructor that takes only keyword arguments and matches the order and field names of `T`.
-Otherwise, it returns `false`.
-
-Practically, this check is used to check if `@kwdef` was used to define the struct.
-"""
-function has_kwdef_constructor(T::Type) :: Bool
-    fieldnames = Base.fieldnames(T)
-    for constructor in methods(T)
-        if length(Base.method_argnames(constructor)) == 1 && 
-            Tuple(Base.kwarg_decl(constructor)) == fieldnames
-            return true
-        end
-    end
-    return false
-end
-
 # Function to extract field names, types, and default values
 function extract_struct_info(T::Type)
     field_names = fieldnames(T)
@@ -447,62 +431,119 @@ function extract_struct_info(T::Type)
     return (names=field_names, map=type_map)
 end
 
-function parsetype(target_type::Type{T}, value::Any) :: T where {T}
-    if value isa T
-        return value
-    elseif value isa AbstractString
-        return parse(target_type, value)
-    else
-        return convert(target_type, value)
+"""
+    struct_builder(::Type{T}, source::AbstractDict) :: T
+
+Build a `T` from a map the client supplied: the query string (`Query{T}`), a form body
+(`Form{T}`), the headers (`Header{T}`), the path parameters (`Path{T}`), or one object of a JSON
+body (`JsonFragment{T}`).
+
+The walk is over **`T`'s fields, never the map's keys** (#306). Each field is looked up by its name
+as a `String`, so a key the client sent that is not a field is never touched. Building
+`Dict(Symbol(k) => v ...)` over the client's map, as this used to, interned every key it held,
+and Julia never frees an interned `Symbol`: a login form flooded with unique junk keys grew the
+process by ~47 MB per million keys, for good.
+
+Each present value binds through [`bind_value`](@ref), the same rules scalar path and query
+parameters follow. A `@kwdef` struct is built by keyword, so an absent field takes its declared
+default; a plain struct is built positionally, and an absent field binds `nothing` or `missing`
+if its type admits one. Any other absent field is a `ValidationError` naming the field. A target
+that is itself a dictionary type keeps every key and binds each value the same way.
+"""
+function struct_builder(::Type{T}, source::AbstractDict) :: T where {T}
+    T <: AbstractDict && return dict_builder(T, source)
+    if hasmethod(T, Tuple{}, fieldnames(T))
+        kwargs = Pair{Symbol, Any}[]
+        for name in fieldnames(T)
+            key = String(name)
+            haskey(source, key) || continue
+            push!(kwargs, name => bind_value(fieldtype(T, name), source[key]))
+        end
+        return kw_construct(T, kwargs)
     end
-end
-
-"""
-    struct_builder(::Type{T}, parameters::Dict{String,String}) where {T}
-
-Constructs an object of type `T` using the parameters in the dictionary `parameters`.
-"""
-function struct_builder(::Type{T}, params::AbstractDict) :: T where {T}
-    has_kwdef = has_kwdef_constructor(T)
-    params_with_symbols = Dict(Symbol(k) => v for (k, v) in params)   
-    if has_kwdef
-        # case 1: Use slower converter to handle structs with default values
-        return kwarg_struct_builder(T, params_with_symbols)
-    else
-        # case 2: Use faster converter to handle structs with no defaults
-        return StructTypes.constructfrom(T, params_with_symbols)
-    end
-end
-
-"""
-    kwarg_struct_builder(TargetType::Type{T}, params::AbstractDict) where {T}
-"""
-function kwarg_struct_builder(TargetType::Type{T}, params::AbstractDict) where {T}
-    
-    info = extract_struct_info(TargetType)
-    param_dict = Dict{Symbol, Any}()
-
-    for param_name in info.names
-
-        # ignore unkown parameters
-        if haskey(params, param_name)
-            param_value = params[param_name]
-            target_type = info.map[param_name]
-
-            # Figure out how to parse the current param
-            if target_type == Any || target_type == String
-                parsed_value = param_value
-            elseif isstructtype(target_type)
-                parsed_value = struct_builder(target_type, param_value)
-            else
-                parsed_value = parsetype(target_type, param_value)
-            end
-
-            param_dict[param_name] = parsed_value
+    args = Any[]
+    for name in fieldnames(T)
+        key = String(name)
+        ftype = fieldtype(T, name)
+        if haskey(source, key)
+            push!(args, bind_value(ftype, source[key]))
+        elseif Nothing <: ftype
+            push!(args, nothing)
+        elseif Missing <: ftype
+            push!(args, missing)
+        else
+            throw(ValidationError("Missing required field '$name'"))
         end
     end
-    
-    return TargetType(;param_dict...)
+    return T(args...)
+end
+
+# A dictionary target keeps the client's keys, so they are only ever converted to the key type,
+# never interned: `convert(Symbol, ::String)` has no method, and a `Symbol`-keyed target is
+# refused at registration anyway (#306).
+function dict_builder(::Type{T}, source::AbstractDict) :: T where {T <: AbstractDict}
+    out = T()
+    for (k, v) in source
+        out[k] = bind_value(valtype(T), v)
+    end
+    return out
+end
+
+"""
+    bind_value(::Type{FT}, value) :: FT
+
+Bind one client-supplied value to a field of type `FT`:
+
+- a string goes through `parseparam`, so a field binds exactly as a scalar path or query
+  parameter of the same type would: `Nullable{T}`, enums (by integer or by name), `UUID`,
+  `Date`, and JSON for anything `parse` does not cover. A JSON string `"24"` still binds an
+  `Int` field;
+- a value that already is an `FT` (a JSON number for a number field, `nothing` for a
+  `Nullable` field, anything for an `Any` field) is taken as is;
+- a JSON object for a struct field recurses into [`struct_builder`](@ref), so `@kwdef`
+  defaults apply at every level;
+- anything else is converted by `StructUtils.make` under Nitro's read style.
+"""
+function bind_value(::Type{FT}, value) where {FT}
+    value isa FT && return value
+    value isa AbstractString && return parseparam(FT, String(value))
+    if value isa AbstractDict
+        RT = Base.nonnothingtype(FT)
+        RT isa DataType && isstructtype(RT) && return struct_builder(RT, value)
+    end
+    return JSON.StructUtils.make(FT, value, NITRO_READ_STYLE)
+end
+
+"""
+    kw_construct(T, kwargs) :: T
+
+Build a `@kwdef` struct from the keyword arguments of the fields that were present, the way
+JSON.jl treats an absent field: the declared default, else the null the field's type admits,
+else a `ValidationError`.
+"""
+function kw_construct(::Type{T}, kwargs::Vector{Pair{Symbol, Any}}) :: T where {T}
+    # The keyword constructor applies every default itself, so a field it reports as undefined
+    # has none -- fill in the null if its type takes one and try again. Each pass adds a field
+    # that was not there before, so this runs at most `fieldcount(T)` times.
+    while true
+        try
+            return T(; kwargs...)
+        catch e
+            e isa UndefKeywordError || rethrow()
+            name = e.var
+            # Only a keyword of `T`'s own constructor that we did not pass -- anything else was
+            # thrown from deeper inside a default expression and is not ours to answer.
+            (name in fieldnames(T) && !any(p -> p.first === name, kwargs)) || rethrow()
+            ftype = fieldtype(T, name)
+            if Nothing <: ftype
+                push!(kwargs, name => nothing)
+            elseif Missing <: ftype
+                push!(kwargs, name => missing)
+            else
+                throw(ValidationError("Missing required field '$name'"))
+            end
+        end
+    end
 end
 
 end
