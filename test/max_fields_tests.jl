@@ -61,6 +61,18 @@ end
     @test send(HTTP.Request("POST", "/json", JSON_T, """{"a":[1,2,3,4,5,6,7,8]}""")).status == 200
 end
 
+@testset "a JSON body is never counted as a form (#327 review)" begin
+    # `payload` reads the form of every request, and `formdata` form-parsed any body holding an
+    # `=`: a JSON body with ONE key whose string is ordinary HTML full of `&amp;` answered 400.
+    html = "a=b" * repeat("&amp;", 10)
+    body = JSON.json(Dict("html" => html))
+    urlpatterns(app, "", path("/payload", req -> string(sort(collect(keys(payload(req))))); method = "POST"))
+    r = send(HTTP.Request("POST", "/payload", JSON_T, body))
+    @test r.status == 200
+    @test Nitro.text(r) == string(["html"])          # and no junk "form" keys merged in
+    @test isempty(getform(HTTP.Request("POST", "/", JSON_T, body)))
+end
+
 @testset "empty fields are not fields" begin
     @test send(HTTP.Request("GET", "/query?a=1&&b=2&&&c=3&")).status == 200
 end
@@ -99,7 +111,7 @@ end
 
 @testset "serve validates max_fields before starting" begin
     bad_app = App(mod = @__MODULE__)
-    for bad in (-1, true, 1.5, "10")
+    for bad in (-1, true, 1.5, "10", typemax(UInt64), big(2)^70)
         @test_throws ArgumentError serve(bad_app; max_fields = bad, host = HOST, port = get_free_port(),
                                          async = true, show_banner = false, access_log = nothing)
         @test !isopen(bad_app.service)

@@ -80,6 +80,6 @@ Session
 Context
 validate
 ValidationError
-Nitro.Errors.UnsupportedMediaTypeError
+UnsupportedMediaTypeError
 extract
 ```

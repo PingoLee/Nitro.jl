@@ -232,6 +232,11 @@ parameters, `Body{Float64}`, `Cookie{Float64}`, struct fields bound by `Query{T}
 each member of a `Union`. The message is value-free, like every other parse failure here.
 """
 function parseparam(::Type{T}, str::String) where {T <: AbstractFloat}
+    # A union of float types (`Union{Float32, Float64}`) also lands here, because it is
+    # `<: AbstractFloat` and this method is more specific than `parseparam(::Union, …)`. Hand it
+    # back to that method, which tries each member in turn: the fallback's `parse(T, str)` on a
+    # union recurses in Base's `tryparse` until the stack overflows (#327 review).
+    T isa Union && return invoke(parseparam, Tuple{Union, String}, T, str)
     value = invoke(parseparam, Tuple{Type{T}, String} where {T}, T, str)
     isfinite(value) || throw(ArgumentError("not a finite number"))
     return value

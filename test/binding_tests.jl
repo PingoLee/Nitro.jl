@@ -388,7 +388,7 @@ const JSON_T = "application/json"
 const FORM = "application/x-www-form-urlencoded"
 
 @testset "scalar, converter, query and form: $bad" for bad in ("NaN", "nan", "inf", "-Infinity", "1e999")
-    @test get_("/conv/$bad").status in (400, 404)   # the converter's regex may not even match
+    @test get_("/conv/$bad").status == 400
     @test get_("/scalar?amount=$bad").status == 400
     @test get_("/query?amount=$bad").status == 400
     @test post("/form", FORM, "amount=$bad").status == 400
@@ -434,4 +434,57 @@ end
     @test Nitro.text(post("/body", "text/plain", "4.25")) == "4.25"
     @test Nitro.text(get_("/cookie"; headers = ["Cookie" => "amount=1.25"])) == "1.25"
 end
+end
+
+@testitem "review follow-ups: float unions, NaN keywords, and the JWT claim segment (#327)" tags=[:core, :security] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+using Nitro: App, Query, Body, MultipartForm, Nullable
+
+# A union of float types is `<: AbstractFloat` (and `<: Number`), so it landed on the float-only
+# parse method -- whose `parse` on a union recurses in Base's `tryparse` until the stack
+# overflows: a 500 flagged "program state may be corrupted", on every request.
+@test Nitro.parseparam(Union{Float32, Float64}, "1.5") === 1.5f0
+@test_throws Exception Nitro.parseparam(Union{Float32, Float64}, "nan")
+
+@kwdef struct UnionAmount
+    amount::Union{Float32, Float64} = 0.0
+end
+struct MUnion
+    amount::Union{Float32, Float64}
+end
+app = App(mod = @__MODULE__)
+urlpatterns(app, "",
+    path("/scalar", (req, amount::Union{Float32, Float64}) -> string(amount)),
+    path("/query", (req, q::Query{UnionAmount}) -> string(q.payload.amount)),
+    path("/body", (req, b::Body{Union{Float32, Float64}}) -> string(b.payload); method = "POST"),
+    path("/multipart", (req, m::MultipartForm{MUnion}) -> string(m.payload.amount); method = "POST"),
+    path("/conv/<float:amount>", (req, amount::Float64) -> string(amount)),
+)
+send(r) = internalrequest(app, r)
+@test send(HTTP.Request("GET", "/scalar?amount=2.5")).status == 200
+@test send(HTTP.Request("GET", "/scalar?amount=inf")).status == 400
+@test send(HTTP.Request("GET", "/query?amount=2.5")).status == 200
+@test send(HTTP.Request("POST", "/body", ["Content-Type" => "text/plain"], "2.5")).status == 200
+boundary = "----nitro327union"
+mp = "--$boundary\r\nContent-Disposition: form-data; name=\"amount\"\r\n\r\n2.5\r\n--$boundary--\r\n"
+@test send(HTTP.Request("POST", "/multipart", ["Content-Type" => "multipart/form-data; boundary=$boundary"], mp)).status == 200
+# The `<float:>` route always matches, so a non-finite value is exactly a 400.
+@test send(HTTP.Request("GET", "/conv/nan")).status == 400
+
+# `json(req, T)` refuses every truthy `allownan`, and a caller `style`.
+struct Reading
+    value::Float64
+end
+req = HTTP.Request("POST", "/", ["Content-Type" => "application/json"], """{"value":NaN}""")
+@test_throws ArgumentError json(req, Reading; allownan = true)
+@test_throws ArgumentError json(req, Reading; allownan = 1)
+@test_throws ArgumentError json(req, Reading; style = Nitro.Core.Util.BodyParsers.NITRO_READ_STYLE)
+
+# A JWT claim segment is size-bounded already; the field cap would turn a valid token with many
+# claims into a `ValidationError` where `decode_jwt` promises an `AuthError`. Not capped.
+claims = "{" * join(("\"c$i\":$i" for i in 1:1500), ",") * "}"
+segment = Nitro.Auth._base64url_encode(Vector{UInt8}(claims))
+@test length(Nitro.Auth._jwt_segment_json(segment)) == 1500
 end

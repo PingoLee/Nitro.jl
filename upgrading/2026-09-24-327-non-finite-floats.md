@@ -24,7 +24,7 @@ Every path a client float takes now requires a finite value:
 | a float field of `Json{T}`, including `Nullable{Float64}` and `Float32` | `400` |
 | a number field of `MultipartForm{T}` | `400` |
 | `get_cookie(req, name, default::AbstractFloat)` | the default, as for a value that does not parse |
-| `json(req, T)` | an `ArgumentError`; and `json(req, T; allownan = true)` is itself refused |
+| `json(req, T)` | a `ValidationError` (a `400` from a handler); and `json(req, T; allownan = true)` is itself refused with an `ArgumentError` |
 
 There is no opt-out. The untyped parsers (`json(req; allownan = true)`, `getjson`) and the
 `Response` forms of `json` are unchanged: they build no typed value from client input.

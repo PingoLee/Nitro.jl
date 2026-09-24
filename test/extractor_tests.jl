@@ -1193,6 +1193,30 @@ end
     @test send("/upload", [], "note=x").status == 415
 end
 
+@testset "a Content-Type that is not valid UTF-8 is a 415 or ignored, never a 500" begin
+    # RFC 9110 allows obs-text bytes in a field value. `lowercase` throws on such a string, and
+    # the media-type check ran outside every guard: a logged 500 from Json{T}, JsonFragment{T},
+    # MultipartForm{T}, getjson, getform and payload alike (#327 review).
+    bad = String(UInt8[0x61, 0x70, 0x70, 0x6c, 0x69, 0x63, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x2f, 0xff, 0x6a, 0x73, 0x6f, 0x6e])   # "application/\xffjson"
+    @test !isvalid(bad)
+    probe = App(mod = @__MODULE__)
+    urlpatterns(probe, "",
+        path("/json", (req, t::Json{Transfer}) -> "ok"; method = "POST"),
+        path("/fragment", (req, transfer::JsonFragment{Transfer}) -> "ok"; method = "POST"),
+        path("/upload", (req, u::MultipartForm{Upload}) -> "ok"; method = "POST"),
+        path("/payload", req -> string(length(payload(req)), ":", isnothing(getjson(req))); method = "POST"),
+    )
+    logger = Test.TestLogger(min_level = Base.CoreLogging.Debug)
+    results = Base.CoreLogging.with_logger(logger) do
+        [internalrequest(probe, HTTP.Request("POST", t, ["Content-Type" => bad], body))
+         for t in ("/json", "/fragment", "/upload", "/payload")]
+    end
+    @test [r.status for r in results[1:3]] == [415, 415, 415]
+    @test results[4].status == 200
+    @test Nitro.text(results[4]) == "0:true"
+    @test !any(l -> l.level >= Base.CoreLogging.Error, logger.logs)
+end
+
 @testset "a 415 is client input: no error log, no backtrace" begin
     # `Base.CoreLogging`, not `Logging`: Logging is not a test dependency.
     logger = Test.TestLogger(min_level = Base.CoreLogging.Debug)

@@ -83,7 +83,11 @@ _SU.liftkey(::NitroReadStyle, ::Type{Symbol}, x) = throw(ArgumentError(_SYMBOL_R
 # no size limit either: JSON.jl reads `1e999`, or a 400-digit integer, as a `BigFloat`/`BigInt`,
 # and converting that to a `Float64` field is `Inf`. The `Union` bound also covers a
 # `Nullable{Float64}` field, which is lifted with its union type, not the float alone.
-function _SU.lift(st::NitroReadStyle, ::Type{T}, x::Real) where {T <: Union{AbstractFloat, Nothing, Missing}}
+#
+# Base's own float types only, not every `AbstractFloat`: an app's `StructUtils.lift(::StructStyle,
+# ::Type{MyFloat}, x)` for its own float type would otherwise be ambiguous with this method, and
+# every request binding that field would fail.
+function _SU.lift(st::NitroReadStyle, ::Type{T}, x::Real) where {T <: Union{Base.IEEEFloat, BigFloat, Nothing, Missing}}
     value, state = @invoke _SU.lift(st::_SU.StructStyle, T::Type, x::Any)
     value isa AbstractFloat && !isfinite(value) && throw(ArgumentError("not a finite number"))
     return value, state
@@ -170,10 +174,22 @@ end
 
 # The media type of a `Content-Type` value: everything before the first `;`, trimmed and
 # lowercased (RFC 9110 §8.3.1: type and subtype are case-insensitive; parameters follow `;`).
+#
+# Byte by byte, lowercasing ASCII only. A header value may carry obs-text (bytes >= 0x80) that is
+# not valid UTF-8, and `lowercase(::String)` throws `InvalidCharError` on such a string -- a 500
+# with a logged backtrace from every JSON accessor, for one malformed header. No valid media type
+# has a byte outside ASCII, so any such byte simply fails to match.
 function _media_type(content_type::AbstractString) :: String
-    i = findfirst(==(';'), content_type)
-    mt = i === nothing ? content_type : SubString(content_type, 1, prevind(content_type, i))
-    return lowercase(strip(mt))
+    bytes = codeunits(content_type)
+    stop = something(findfirst(==(UInt8(';')), bytes), length(bytes) + 1) - 1
+    first_ = findfirst(b -> b != UInt8(' ') && b != UInt8('\t'), view(bytes, 1:stop))
+    first_ === nothing && return ""
+    last_ = findlast(b -> b != UInt8(' ') && b != UInt8('\t'), view(bytes, 1:stop))
+    out = Vector{UInt8}(undef, last_ - first_ + 1)
+    for (k, b) in enumerate(view(bytes, first_:last_))
+        out[k] = UInt8('A') <= b <= UInt8('Z') ? b + 0x20 : b
+    end
+    return String(out)
 end
 
 """
@@ -278,7 +294,7 @@ function _check_json_depth(bytes::AbstractVector{UInt8}, max_keys::Int = 0)
             depth -= 1
         elseif b == UInt8(':') && max_keys > 0
             keys += 1
-            keys > max_keys && _throw_too_many_fields("The JSON body", max_keys)
+            keys > max_keys && _throw_too_many_fields("The JSON document", max_keys)
         end
     end
     return nothing
@@ -353,7 +369,13 @@ Read the html form data from the body of a HTTP.Request
 function formdata(req::HTTP.Request) :: Dict{String,String}
     # multipart/form-data is not urlencoded — parsing it here yields a garbage
     # key. Use `getfiles(req)` / `getpost(req)` (or `multipart(req)`) for multipart bodies.
-    if is_multipart_form_media_type(HTTP.header(req, "Content-Type", ""))
+    #
+    # Nor is a body that declares itself JSON (#327). `payload(req)` reads the form of every
+    # request, so a JSON body whose string values held `=` and `&` -- ordinary HTML -- used to
+    # merge junk "form" keys into it, and with the field cap would answer 400 for a JSON body
+    # with one key.
+    content_type = HTTP.header(req, "Content-Type", "")
+    if is_multipart_form_media_type(content_type) || is_json_media_type(content_type)
         return copy(EMPTY_FORM_DATA)
     end
     body = text(req)
@@ -474,7 +496,7 @@ function json(req::HTTP.Request, class_type::Type{T}; kwargs...) where {T}
         "json(req, T) parses client input with Nitro's read style (#306); `style` cannot be overridden"))
     # JSON.jl returns a `Float64` field straight from its number reader, without `lift`, so the
     # style's finite check cannot see a NaN that `allownan` let through (#327).
-    get(kwargs, :allownan, false) === true && throw(ArgumentError(
+    get(kwargs, :allownan, false) != false && throw(ArgumentError(
         "json(req, T) never binds NaN or Infinity from client input (#327); `allownan` is refused"))
     interns_client_strings(T) && throw(ArgumentError("json(req, $T): " * _SYMBOL_REFUSED))
     payload = _request_payload(req)

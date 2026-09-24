@@ -156,7 +156,9 @@ function serve(ctx::App;
 
     # Same reasoning again (#327): read on every request, so refused here. An integer count, not
     # a `Bool` (`true` would silently mean 1) and not negative; `0` means unlimited.
-    (max_fields isa Integer && !(max_fields isa Bool) && max_fields >= 0) ||
+    # The upper bound is checked here too, so the `Int64(max_fields)` below cannot throw after
+    # the App has already been mutated.
+    (max_fields isa Integer && !(max_fields isa Bool) && 0 <= max_fields <= typemax(Int64)) ||
         throw(ArgumentError("`max_fields` must be an integer >= 0 (0 means unlimited), got $(repr(max_fields))"))
 
     # Before any mutation, like the checks above (#315). A malformed prefix is refused here

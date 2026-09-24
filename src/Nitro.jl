@@ -68,7 +68,7 @@ export  # The application handle
         # Extractors
         Path, Query, Header, Json, JsonFragment, Form, Body, Cookie, Session, Files, MultipartForm, FormFile, extract, validate,
         # Extractor extension surface (for app-layer custom extractors)
-        Param, LazyRequest, ValidationError, Nullable,
+        Param, LazyRequest, ValidationError, UnsupportedMediaTypeError, Nullable,
         # Cookies & Security
         configcookies, get_cookie, set_cookie!, Cookies, Errors,
         regenerate_session!, SecretString, reveal,

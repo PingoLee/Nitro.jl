@@ -24,6 +24,10 @@ For `CSRFMiddleware`, a token sent inside a JSON body now counts only when the r
 
 The bare parser `json(req)` is unchanged and still parses whatever it is given.
 
+The converse holds for forms: `getform` and `formdata(req)` no longer form-parse a body that
+declares a JSON `Content-Type`. A JSON body whose string values contained `=` and `&` used to
+contribute junk "form" keys to `payload(req)`; it now contributes none.
+
 ### How to find the calls to migrate
 
 ```bash

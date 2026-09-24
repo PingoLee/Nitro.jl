@@ -442,7 +442,7 @@ Extracts a Form from a request and converts it into a custom struct
 function extract(param::Param{Form{T}}, request::LazyRequest) :: Form{T} where {T}
     # The cached `getform`, so a handler that also reads `getform`/`payload` -- or CSRFMiddleware,
     # which reads the form for its token -- does not parse the body again (#327).
-    form = getform(request.request)
+    form = getform(request.request)::Dict{String,String}   # the cache is untyped; keep `Any` off the hot path
     instance = safe_extract(param) do 
         struct_builder(T, form) 
     end
@@ -739,6 +739,9 @@ multipart_bind(field::String, ::Type{String}, parsed::AbstractDict) =
     multipart_text_value(field, parsed)
 
 function multipart_bind(field::String, ::Type{N}, parsed::AbstractDict) where {N <: Number}
+    # A union of number types is `<: Number` too, and wins dispatch over the `Union` method below;
+    # `tryparse` on a union recurses until the stack overflows. Try the members one by one instead.
+    N isa Union && return invoke(multipart_bind, Tuple{String, Union, AbstractDict}, field, N, parsed)
     raw = strip(multipart_text_value(field, parsed))
     result = tryparse(N, raw)
     isnothing(result) && throw(ValidationError("Field '$field' could not be parsed as $N"))
