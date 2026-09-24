@@ -235,20 +235,26 @@ end # @testitem
 
 # #159: the retention pruner. `AccessLog(sink; prune, retention, prune_interval)` schedules the
 # app's `prune(cutoff)` through the shared `_janitor`, starting and stopping with the writer.
-@testitem "AccessLog retention pruner" tags=[:middleware] setup=[NitroCommon] begin
+@testitem "AccessLog retention pruner" tags=[:middleware, :slow] setup=[NitroCommon] begin
 using Nitro.Core
 using Nitro
 using Dates
 
-# Records every cutoff it is handed, under a lock -- `prune` runs on the janitor task, and a
-# stale tick can still push after `shutdown`, so reads go through the lock too.
+# Records every cutoff it is handed, and the task that handed it, under a lock -- `prune` runs
+# on the janitor task, and a stale tick can still push after `shutdown`, so reads go through
+# the lock too.
 function recording_prune()
     buf = DateTime[]
+    tasks = Task[]
     lk = ReentrantLock()
-    prune = cutoff -> lock(() -> push!(buf, cutoff), lk)
+    prune = cutoff -> lock(lk) do
+        push!(buf, cutoff)
+        push!(tasks, current_task())
+    end
     count() = lock(() -> length(buf), lk)
     cutoffs() = lock(() -> copy(buf), lk)
-    return cutoffs, prune, count
+    tasks_since(n) = lock(() -> tasks[n+1:end], lk)
+    return cutoffs, prune, count, tasks_since
 end
 
 # Poll instead of sleeping a fixed time: a loaded CI box can be slow to schedule the janitor.
@@ -262,7 +268,7 @@ function wait_for(cond; timeout = 10.0)
 end
 
 @testset "prune runs every interval with cutoff = now() - retention" begin
-    cutoffs, prune, count = recording_prune()
+    cutoffs, prune, count, tasks_since = recording_prune()
     lf = AccessLog(recs -> nothing; prune, retention = Day(90),
                    prune_interval = Millisecond(20))
     startup(lf)
@@ -278,7 +284,7 @@ end
 end
 
 @testset "a calendar retention is allowed" begin
-    cutoffs, prune, count = recording_prune()
+    cutoffs, prune, count, tasks_since = recording_prune()
     lf = AccessLog(recs -> nothing; prune, retention = Month(3),
                    prune_interval = Millisecond(20))
     startup(lf)
@@ -290,7 +296,7 @@ end
 end
 
 @testset "no startup sweep: the first prune waits one interval" begin
-    cutoffs, prune, count = recording_prune()
+    cutoffs, prune, count, tasks_since = recording_prune()
     lf = AccessLog(recs -> nothing; prune, retention = Day(1), prune_interval = Hour(1))
     startup(lf)
     sleep(0.2)
@@ -319,7 +325,7 @@ end
 end
 
 @testset "shutdown stops the pruner, and a restart does not leak a second one" begin
-    cutoffs, prune, count = recording_prune()
+    cutoffs, prune, count, tasks_since = recording_prune()
     lf = AccessLog(recs -> nothing; prune, retention = Day(1),
                    prune_interval = Millisecond(50))
 
@@ -334,27 +340,36 @@ end
     startup(lf)
     startup(lf)                                       # idempotent: no second task
     t0 = count()
-    sleep(1.0)                                        # ~20 intervals
-    ticks = count() - t0
+    @test wait_for(() -> count() >= t0 + 6)
     shutdown(lf)
-    # One pruner ticks at most once per 50 ms interval; two would roughly double that. The bound
-    # sits between the two so a slow machine (fewer ticks) cannot fail it.
-    @test 1 <= ticks <= 24
+    # Identity, not a tick-rate bound: a leaked second pruner would interleave its own ticks
+    # with the first's, and a rate bound goes red whenever a loaded runner oversleeps.
+    @test length(unique(objectid.(tasks_since(t0)))) == 1
 end
 
 @testset "prune and retention go together; bad values fail at construction" begin
     sink = recs -> nothing
-    @test_throws ArgumentError AccessLog(sink; prune = c -> nothing)
-    @test_throws ArgumentError AccessLog(sink; retention = Day(90))
-    @test_throws ArgumentError AccessLog(sink; prune = c -> nothing, retention = Day(0))
-    @test_throws ArgumentError AccessLog(sink; prune = c -> nothing, retention = Day(-1))
+    # Match the message, so each case pins the guard that fired rather than any ArgumentError.
+    function rejects(needle; kw...)
+        try
+            AccessLog(sink; kw...)
+            return false
+        catch e
+            return e isa ArgumentError && occursin(needle, e.msg)
+        end
+    end
+    @test rejects("go together"; prune = c -> nothing)
+    @test rejects("go together"; retention = Day(90))
+    @test rejects("must be positive"; prune = c -> nothing, retention = Day(0))
+    @test rejects("must be positive"; prune = c -> nothing, retention = Day(-1))
     # Calendar intervals cannot be slept on -- rejected here, not on the first tick.
-    @test_throws ArgumentError AccessLog(sink; prune = c -> nothing, retention = Day(90),
-                                         prune_interval = Month(1))
-    @test_throws ArgumentError AccessLog(sink; prune = c -> nothing, retention = Day(90),
-                                         prune_interval = Millisecond(0))
-    # An interval with no pruner is simply unused -- the default is always passed.
-    @test AccessLog(sink; prune_interval = Hour(2)) isa Nitro.Core.Types.LifecycleMiddleware
+    @test rejects("fixed-length"; prune = c -> nothing, retention = Day(90),
+                  prune_interval = Month(1))
+    @test rejects("at least 1 millisecond"; prune = c -> nothing, retention = Day(90),
+                  prune_interval = Millisecond(0))
+    # An interval with no pruner to apply it to is refused, not validated by nobody and ignored.
+    @test rejects("only applies to the retention pruner"; prune_interval = Hour(2))
+    @test rejects("only applies to the retention pruner"; prune_interval = Month(1))
 end
 
 end # @testitem

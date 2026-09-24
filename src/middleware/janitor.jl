@@ -36,7 +36,7 @@ using ...Types: require_fixed_period
 # and never surfaces -- the janitor dies mute and the thing it bounds stops being reaped for the
 # life of the process.
 #
-# ── Why `AccessLog` does NOT use this (#190 asked for an explicit decision) ──
+# ── Why `AccessLog`'s WRITER does NOT use this (#190 asked for an explicit decision) ──
 #
 # `AccessLog`'s writer (src/middleware/access_log.jl) is EVENT-driven, not interval-driven: it
 # parks on `take!` of a `Channel`, is stopped by `close`ing that channel rather than by a stop
@@ -89,8 +89,9 @@ end
 
 Build the `LifecycleMiddleware` hook pair for a periodic background janitor that calls `work()`
 every `interval`. Internal; the constructors that wrap it are `SessionMiddleware`, `SessionPruner`,
-`FixedRateLimiter`, and `AccessLog` when given a retention `prune` (#159). Note `FixedRateLimiter`, not `RateLimiter`: the `:sliding_window` strategy
-owns no background task and returns a `LifecycleMiddleware` with both hooks `nothing` (#172).
+`FixedRateLimiter`, and `AccessLog` when given a retention `prune` (#159). Note
+`FixedRateLimiter`, not `RateLimiter`: the `:sliding_window` strategy owns no background task and
+returns a `LifecycleMiddleware` with both hooks `nothing` (#172).
 
 - `work`     — a zero-argument function run once per tick. A throw costs one tick, not the janitor.
 - `interval` — validated by `require_fixed_period` **here, at construction**, so a calendar period

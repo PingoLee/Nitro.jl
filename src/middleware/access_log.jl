@@ -228,7 +228,7 @@ end
 
 """
     AccessLog(sink; capacity=10_000, batch=500, skip=nothing, annotate=nothing,
-              log_query=false, prune=nothing, retention=nothing, prune_interval=Hour(1))
+              log_query=false, prune=nothing, retention=nothing, prune_interval=nothing)
 
 Build a `LifecycleMiddleware` that asynchronously records every handled request and
 delivers batches to `sink(::Vector{AccessRecord})`. Add it to `serve(middleware=[…])`;
@@ -268,12 +268,12 @@ serve(app; middleware = [
 - `retention`      — how long a record is kept: any positive `Period`, `Month(3)` included.
                      The cutoff is `Dates.now() - retention`, the same clock that stamps
                      `AccessRecord.ts`, so the comparison is like for like.
-- `prune_interval` — how often `prune` runs; a positive fixed-length `Period` (default
-                     `Hour(1)`). `Month`/`Quarter`/`Year` are rejected, since they cannot be
+- `prune_interval` — how often `prune` runs; a positive fixed-length `Period` (`Hour(1)` when
+                     omitted). `Month`/`Quarter`/`Year` are rejected, since they cannot be
                      slept on.
 
 `prune` and `retention` go together: passing one without the other is an `ArgumentError`, never
-a silently disabled pruner. The pruner starts and stops with the server alongside the writer,
+a silently disabled pruner, and so is a `prune_interval` with no pruner to apply it to. The pruner starts and stops with the server alongside the writer,
 and a `serve(); terminate(); serve()` cycle does not leak its task.
 
 The first prune runs one `prune_interval` **after** `serve()`, not at startup. Keep the interval
@@ -299,7 +299,7 @@ function AccessLog(sink::Function; capacity::Integer=10_000, batch::Integer=500,
                    log_query::Bool=false,
                    prune::Union{Nothing, Function}=nothing,
                    retention::Union{Nothing, Period}=nothing,
-                   prune_interval::Period=Hour(1))
+                   prune_interval::Union{Nothing, Period}=nothing)
     capacity > 0 || throw(ArgumentError("AccessLog capacity must be positive"))
     batch > 0 || throw(ArgumentError("AccessLog batch must be positive"))
 
@@ -309,13 +309,19 @@ function AccessLog(sink::Function; capacity::Integer=10_000, batch::Integer=500,
     (prune === nothing) == (retention === nothing) || throw(ArgumentError(
         "AccessLog: `prune` and `retention` go together -- pass both to enable the retention " *
         "pruner, or neither. Got only `$(prune === nothing ? "retention" : "prune")`."))
+    # `nothing` rather than a `Hour(1)` default, so an interval passed WITHOUT a pruner is an
+    # error instead of being validated by nobody and ignored -- the same "never a silently
+    # disabled pruner" rule as the check above.
+    prune === nothing && prune_interval !== nothing && throw(ArgumentError(
+        "AccessLog: `prune_interval` only applies to the retention pruner -- pass `prune` and " *
+        "`retention` too, or drop it."))
     retention === nothing || Dates.value(retention) > 0 || throw(ArgumentError(
         "AccessLog: `retention` must be positive, got $retention."))
     pruner = prune === nothing ? nothing :
         # `now()`, not `now(UTC)`: the cutoff must come from the clock that stamps
         # `AccessRecord.ts` (`_capture!`), or every record is misjudged by the UTC offset.
-        _janitor(() -> prune(now() - retention), prune_interval, "AccessLog",
-                 "retention prune", "prune_interval")
+        _janitor(() -> prune(now() - retention), something(prune_interval, Hour(1)),
+                 "AccessLog", "retention prune", "prune_interval")
 
     w = _Writer(sink, Int(batch), Threads.Atomic{Bool}(false), _Run(Int(capacity)), nothing)
 
