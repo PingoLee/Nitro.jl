@@ -62,7 +62,9 @@ to bypass your `X-Forwarded-For` configuration.
   header is read), `:x_forwarded_for`, `:x_real_ip`, `:cf_connecting_ip`, `:true_client_ip`.
 - `trusted_proxies`: the proxies whose forwarding header may be believed. Entries are either an
   `IPAddr` (`ip"127.0.0.1"`) or a CIDR string (`"10.244.0.0/16"`, `"2400:cb00::/32"`). The
-  header is read **only** when the socket peer matches one of them.
+  header is read **only** when the nearest hop the chain has established matches one of them:
+  the socket peer, unless an earlier extractor already resolved a client (see *More than one
+  extractor in a chain* below).
 
 # Your proxy must *set*, not forward, the header
 `X-Real-IP`, `CF-Connecting-IP` and `True-Client-IP` are single-valued: Nitro believes whatever
@@ -90,8 +92,16 @@ default `auto_extract_ip = true`, which builds its own. Extractors **chain**:
 - and a later extractor that *does* trust the resolved address peels one more hop, reading its
   own header. That is how two tiers with different headers compose: an `ExtractIP` trusting your
   nginx on `:x_real_ip` resolves the CDN edge nginx saw, and a second one trusting the CDN's
-  ranges on `:cf_connecting_ip` resolves the client the CDN saw. Each tier's header is believed
-  only from the hop the tier before it established.
+  ranges on `:cf_connecting_ip` resolves the client the CDN saw.
+
+A later tier believes its header from **any** address in its ranges, including one that
+connected to Nitro directly and that the tier before it therefore never resolved. Make sure only
+the first tier can reach Nitro: bind it to loopback behind nginx, or firewall it.
+
+Chaining is for tiers that write *different* headers. For one `X-Forwarded-For` chain through
+several proxies, use a single extractor whose `trusted_proxies` lists every one of them: a second
+`:x_forwarded_for` extractor walks the whole header again with only its own list, and stops at
+the first inner proxy that list does not name.
 
 # Examples
 ```julia

@@ -345,10 +345,18 @@ end
     tiers(create_request(["X-Real-IP" => "$EDGE", "CF-Connecting-IP" => "$CLIENT"], PROXY))
     @test getip(seen[]) == CLIENT
     @test getpeerip(seen[]) == PROXY
-    # The same headers from a client that connected directly are believed by neither tier.
+    # The same headers from a client outside both tiers' ranges, connecting directly, are
+    # believed by neither tier.
     tiers(create_request(["X-Real-IP" => "$EDGE", "CF-Connecting-IP" => "$SPOOF"], CLIENT))
     @test getip(seen[]) == CLIENT
     @test getpeerip(seen[]) == CLIENT
+    # What the docstring warns about: a direct connection FROM the CDN's own ranges is believed
+    # by the CDN tier, because the chain has nothing better than the socket peer to judge. Only
+    # network placement (nginx the sole way in) keeps this out. Pinned so the docs and the code
+    # cannot drift apart.
+    tiers(create_request(["CF-Connecting-IP" => "$SPOOF"], EDGE))
+    @test getip(seen[]) == SPOOF
+    @test getpeerip(seen[]) == EDGE
 
     # The bare resolver chains the same way: with no trust configured it answers `getip` as the
     # chain left it.
