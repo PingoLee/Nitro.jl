@@ -2,9 +2,9 @@
 module ExtractIPMiddleware
 using HTTP
 using Sockets
-# `getpeerip` is not called here — this middleware writes `:peer_ip` and `getpeerip` reads it —
-# but importing it lets the `@ref` cross-references in the docstrings below resolve.
-using ...Core: getip, setip!, getpeerip, header_name_isequal
+# This middleware writes `:peer_ip` and reads it back through `getpeerip` (#330), which also lets
+# the `@ref` cross-references in the docstrings below resolve.
+using ...Core: setip!, getpeerip, header_name_isequal
 using ...Types: Nullable
 using ...Errors: is_unrecoverable
 
@@ -76,6 +76,18 @@ it right-to-left, discarding hops that match `trusted_proxies`, and takes the fi
 is not one of your proxies. Entries a client prepends are therefore never reached. See
 [`extract_ip`](@ref) for the exact rules.
 
+# More than one extractor in a chain
+A chain can hold several, and the usual way is a global `ExtractIP` plus a `RateLimiter` at its
+default `auto_extract_ip = true`, which builds its own. They cannot launder a forwarded address
+into the socket peer:
+
+- every extractor judges `trusted_proxies` against [`getpeerip`](@ref), the address that actually
+  connected, never against a `getip` an earlier extractor already rewrote;
+- the socket peer is recorded once, by the first extractor, and never overwritten;
+- an extractor with no trust configured leaves `getip` as it found it, so an earlier extractor's
+  resolution stands;
+- when two extractors both have trust configured, the later one decides `getip`.
+
 # Examples
 ```julia
 # Not behind a proxy — the socket peer is the client. This is the default.
@@ -99,10 +111,17 @@ function ExtractIP(;
     policy = _trust_policy(forwarded_header, trusted_proxies, trust_forwarded)
     function(handle::Function)
         function(req::HTTP.Request)
-            peer = getip(req)
-            # Preserve the address that actually connected before `:ip` is overwritten, so an
-            # audit trail can still tell a proxied request from a direct one.
-            peer === nothing || (req.context[:peer_ip] = peer)
+            # The socket peer, not `getip`: an earlier extractor may already have replaced
+            # `:ip` with an address read out of a header (#330). A `RateLimiter` at its default
+            # `auto_extract_ip = true` behind a global `ExtractIP` is exactly that chain.
+            peer = getpeerip(req)
+            # Recorded once, by the first extractor, before `:ip` is first overwritten. A later
+            # one used to re-record whatever `:ip` held by then, which made a forwarded address
+            # the "socket peer" that an audit trail relies on to spot a forged header.
+            peer === nothing || haskey(req.context, :peer_ip) || (req.context[:peer_ip] = peer)
+            # With no trust configured there is nothing to resolve: `:ip` is already the peer,
+            # unless an earlier extractor resolved it, and then that resolution stands.
+            isempty(policy.proxies) && return handle(req)
             resolved = _resolve(req, policy, peer)
             resolved === nothing || setip!(req, resolved)
             return handle(req)
@@ -160,7 +179,9 @@ function extract_ip(req::HTTP.Request;
     trust_forwarded                              = nothing) :: Nullable{IPAddr}
 
     policy = _trust_policy(forwarded_header, trusted_proxies, trust_forwarded)
-    return _resolve(req, policy, getip(req))
+    # `getpeerip`, as in `ExtractIP`: after an extractor has run, `getip` is a resolved client,
+    # and judging trust against it would let a forwarded address vouch for itself (#330).
+    return _resolve(req, policy, getpeerip(req))
 end
 
 # ── Resolution (request hot path) ──────────────────────────────────────────────────────────

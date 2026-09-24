@@ -246,10 +246,11 @@ setip!(req::HTTP.Request, val) = (req.context[:ip] = val)
 Returns the address of the socket that actually connected, as opposed to the client address
 `getip` reports.
 
-The two differ only when `ExtractIP` resolved the client from a forwarding header: it records the
-socket peer here before overwriting `getip(req)`. Without `ExtractIP` in the pipeline the two are
-the same value, because `serve` seeds the request context from the real TCP connection — in the
-same canonical form `getip` documents, since the seed is where that form is decided.
+The two differ only when `ExtractIP` resolved the client from a forwarding header: the first
+`ExtractIP` in the chain records the socket peer here before overwriting `getip(req)`, and a later
+one never overwrites it (#330). Without `ExtractIP` in the pipeline the two are the same value,
+because `serve` seeds the request context from the real TCP connection — in the same canonical
+form `getip` documents, since the seed is where that form is decided.
 
 Use it to tell a proxied request from a direct one when auditing — that distinction is what makes
 an access log usable after an incident, since a forged forwarding header changes `getip` but can

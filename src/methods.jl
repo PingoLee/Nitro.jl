@@ -483,8 +483,21 @@ end
 
 """
     internalrequest(req::Nitro.Request; middleware::Vector=[], serialize::Bool=true, catch_errors=true, context=missing)
+    internalrequest(app::App, req::Nitro.Request; kwargs...)
 
 Sends an internal request to the server, allowing for communication between different parts of the application.
+
+!!! warning "A privileged call that skips your global middleware"
+    `internalrequest` runs only the `middleware` you pass **to this call**. It does not run the
+    global list given to `serve(middleware = …)`, so authentication, sessions, CSRF and rate
+    limiting installed there do **not** apply. Route and router middleware, and the guards
+    attached through them, still run. The `serve(prefix = …)` prefix still applies, so include it
+    in the target.
+
+    The request's client IP is `127.0.0.1` unless it already carries one (`setip!`). So a route
+    that trusts loopback, or is protected only by global middleware, is reachable through it.
+    **Never build the target from client input**: a handler that does lets its caller reach those
+    routes too.
 
 Errors go through the same error handling `serve` uses. With `catch_errors=true` (the default), an
 exception thrown by a handler **or by middleware** is logged with its backtrace and comes back as

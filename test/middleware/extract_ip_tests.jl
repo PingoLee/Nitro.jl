@@ -1,7 +1,8 @@
 @testitem "Extract IP" tags=[:middleware] setup=[NitroCommon] begin
 using HTTP
 using Sockets
-using Nitro: setip!, getip, getpeerip, ExtractIP
+using Dates
+using Nitro: setip!, getip, getpeerip, ExtractIP, RateLimiter
 using Nitro.Middleware: extract_ip
 
 # Helper function to create a request with specific headers and context IP
@@ -283,6 +284,52 @@ end
     @test !haskey(bare.context, :ip)
 end
 
+@testset "Regression #330: a second extractor cannot rewrite the socket peer" begin
+    seen = Ref{Union{HTTP.Request, Nothing}}(nothing)
+    handler = req -> (seen[] = req; HTTP.Response(200))
+    FORWARDED = IPv4("6.6.6.6")
+    trusted() = ExtractIP(forwarded_header = :x_forwarded_for, trusted_proxies = ["127.0.0.0/8"])
+    proxied() = create_request(["X-Forwarded-For" => "$FORWARDED"], PROXY)
+
+    # THE BUG: the second extractor read `getip` -- by then the forwarded address -- and
+    # recorded it as the socket peer, so a client-chosen value reached `getpeerip`.
+    trusted()(ExtractIP()(handler))(proxied())
+    @test getip(seen[]) == FORWARDED
+    @test getpeerip(seen[]) == PROXY
+
+    # Two trusted extractors: the second judges trust against the real peer, not against the
+    # address the first one resolved, and resolves the same client.
+    trusted()(trusted()(handler))(proxied())
+    @test getip(seen[]) == FORWARDED
+    @test getpeerip(seen[]) == PROXY
+
+    # Reversed: a no-trust extractor first changes nothing the trusted one relies on.
+    ExtractIP()(trusted()(handler))(proxied())
+    @test getip(seen[]) == FORWARDED
+    @test getpeerip(seen[]) == PROXY
+
+    # The shape the issue reports: a global ExtractIP plus a RateLimiter at its default
+    # `auto_extract_ip = true`, which builds an extractor of its own with no trust configured.
+    # The limiter must key on the resolved client, and the peer must stay the proxy.
+    limiter = RateLimiter(rate_limit = 100, window = Minute(1)).middleware
+    trusted()(limiter(handler))(proxied())
+    @test getip(seen[]) == FORWARDED
+    @test getpeerip(seen[]) == PROXY
+
+    # A client talking to the server directly is unaffected by the stacking: both addresses
+    # stay the socket peer, whatever it sends.
+    trusted()(ExtractIP()(handler))(create_request(["X-Forwarded-For" => "$SPOOF"], CLIENT))
+    @test getip(seen[]) == CLIENT
+    @test getpeerip(seen[]) == CLIENT
+
+    # The bare resolver takes the same view: with no trust configured it answers the socket
+    # peer, even on a request an extractor already resolved.
+    @test extract_ip(seen[]) == CLIENT
+    trusted()(handler)(proxied())
+    @test extract_ip(seen[]) == PROXY
+    @test xff(seen[]) == FORWARDED
+end
+
 @testset "Misconfiguration is rejected at construction" begin
     # trust_forwarded trusted headers from any peer and guessed the header — removed outright.
     @test_throws ArgumentError ExtractIP(trust_forwarded = true)
@@ -328,4 +375,30 @@ end
                     trusted_proxies = [PROXY, "10.244.0.0/16"]) isa Function
 end
 
+end
+
+@testitem "internalrequest keeps a caller's client IP (#330)" tags=[:core, :middleware] setup=[NitroCommon] begin
+using HTTP
+using Sockets
+using Nitro: setip!, getip
+
+app = App(mod = @__MODULE__)
+stamp = handle -> req -> Nitro.Core.Util.add_response_headers(handle(req), "X-Route-Middleware" => "ran")
+urlpatterns(app, "",
+    path("/ip", req -> string(getip(req))),
+    path("/guarded", req -> "ok"; middleware = [stamp]),
+)
+
+# A request with no address is an in-process call, so it is loopback, as before.
+@test text(internalrequest(app, HTTP.Request("GET", "/ip"))) == "127.0.0.1"
+
+# THE BUG: an address the caller already set was replaced with loopback, which every
+# loopback-trusting check accepts.
+req = HTTP.Request("GET", "/ip")
+setip!(req, IPv4("203.0.113.7"))
+@test text(internalrequest(app, req)) == "203.0.113.7"
+
+# What the docstring promises: route middleware still runs on an internal request.
+res = internalrequest(app, HTTP.Request("GET", "/guarded"))
+@test HTTP.header(res, "X-Route-Middleware") == "ran"
 end
