@@ -386,9 +386,11 @@ A token verified by the partner's key is **rejected** — `decode_jwt` throws an
 
 Nothing is silently dropped, so the partner finds out that its tokens are out of policy. The
 check runs in `decode_jwt`, which means `jwt_validator` and any direct `decode_jwt` call holding
-the same keyset both enforce it. `iat`, `exp`, `nbf` and `jti` are always allowed. `sub`, `iss`
-and `aud` must be listed, which covers a key whose tokens have to pass an `issuer` or `audience`
-check too.
+the same keyset both enforce it. `iat`, `exp`, `nbf` and `jti` are always allowed, so key a
+replay cache on `(kid, jti)`, not on `jti` alone. `sub`, `iss` and `aud` must be listed. A
+validator whose `issuer`, `audience` or `required_claims` asks for a claim that a scoped key may
+not assert is an `ArgumentError` at startup, because that key could never authenticate. A scoped
+signing key is held to its own scope too: `encode_jwt` refuses to mint a token outside it.
 
 A key with no scope, such as `"self"` above or the old key in a rotation window, stays trusted
 for every claim. A scope that names a kid the keyset does not hold is an `ArgumentError` at

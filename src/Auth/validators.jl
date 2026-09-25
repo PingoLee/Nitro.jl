@@ -229,6 +229,23 @@ function jwt_validator(secret_or_keyset;
                 "and warn_claims; a claim is either enforced or observed, not both"))
         end
     end
+    # A scoped key (#349) that may not assert a claim this validator REQUIRES can never
+    # authenticate: without the claim `validate_claims` rejects the token, with it the scope
+    # does. Fails closed either way, but only as a stream of 401s -- so say so at startup.
+    if keyset isa JWTKeyset
+        must_assert = String[]
+        get(kwargs, :issuer, nothing) === nothing || push!(must_assert, "iss")
+        get(kwargs, :audience, nothing) === nothing || push!(must_assert, "aud")
+        required_names = get(kwargs, :required_claims, nothing)
+        required_names === nothing || append!(must_assert, String(claim) for claim in required_names)
+        unassertable = _unassertable_required(keyset, must_assert)
+        isempty(unassertable) || throw(ArgumentError(
+            "jwt_validator: " * join(("the claims scope of kid $(repr(scoped_kid)) omits " * join(omitted, ", ")
+                                      for (scoped_kid, omitted) in unassertable), "; ") *
+            ", which this validator requires (issuer= checks iss, audience= checks aud), so no token " *
+            "that key signs could pass. List them in its scope, or give that key its own validator"))
+    end
+
     seen_warned = Set{NTuple{3, Nullable{String}}}()
     seen_lock = ReentrantLock()
 

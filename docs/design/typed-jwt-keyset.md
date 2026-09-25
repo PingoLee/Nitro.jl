@@ -84,7 +84,9 @@ The decisions, and why:
 | What a pin accepts | Strings, and lists of strings whose every element is pinned. Nothing else | `in` compares with `==`, under which `true == 1`; a non-string pin would admit more than it names |
 | A disallowed claim | **Reject** the token (`AuthError` → `401`) | Dropping is silent: a dropped `sub` becomes a `Principal` with `id = nothing`, and the issuer never learns its tokens are out of policy |
 | Where it is checked | `_decode_jwt`, after the signature verifies and the claims parse, before `validate_claims` | The scope lives on the keyset, so `decode_jwt` and `jwt_validator` both enforce it. That is #260's lesson again: a guard in one of two entry points is the wrong shape |
-| Always allowed | `iat`, `exp`, `nbf`, `jti` | Every token carries them and none grants authority. `sub`, `iss` and `aud` say who and for whom, so they must be listed |
+| Always allowed | `iat`, `exp`, `nbf`, `jti` | Every token carries them and none grants authority. `sub`, `iss` and `aud` say who and for whom, so they must be listed. A key still chooses its own `jti`, so a replay cache keys on `(kid, jti)` |
+| A validator requiring an unlisted claim | `ArgumentError` at `jwt_validator` construction | `issuer`, `audience` or `required_claims` naming a claim a scoped key may not assert means that key can never authenticate. It fails closed, but only as 401s, so it is reported at startup instead |
+| A scoped signing key | `encode_jwt` refuses an out-of-scope payload | A token `_decode_jwt` would refuse is not one to issue, the rule #314 set for the header |
 | Unscoped keys | Trusted for every claim, as before | A rotation window is one issuer and needs no scope. The change is additive |
 | `identity_from = :claim` | Nothing special | `sub` is a claim like any other, so a key not scoped for it cannot name an identity |
 

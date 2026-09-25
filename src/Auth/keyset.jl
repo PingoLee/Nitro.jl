@@ -91,15 +91,21 @@ keyset = JWTKeyset("self" => own_secret;
 Each entry of a scope is a claim name, which allows any value, or `name => values`, which allows
 only those values. A pinned value is a `String` (or `Symbol`), and one value can stand alone:
 `"role" => "reader"`. A claim holding a list, such as a `permissions` array, passes a pin only
-when every element is allowed. Any other value under a pin is refused, whether it is a number,
-`null` or an object.
+when every element is allowed — so an empty list always passes, which is right for
+`permission_required` but not for an app that reads `[]` as "unrestricted". Any other value
+under a pin is refused, whether it is a number, `null` or an object.
 
 A token verified by a scoped key is **rejected** — `decode_jwt` throws an `AuthError`, and the
 auth middleware answers `401` — when it asserts a claim the scope does not list, or a pinned
 claim with a value the pin does not allow. The claims are never dropped. `decode_jwt` and
 `jwt_validator` both enforce it; `decode_jwt(...; verify = false)` has no verified key and does
-not. `iat`, `exp`, `nbf` and `jti` are always allowed. `sub`, `iss` and `aud` are not: list them
-for a key whose tokens carry them, including when the validator checks `issuer` or `audience`.
+not. `iat`, `exp`, `nbf` and `jti` are always allowed — so a scoped key still picks its own
+`jti`, and a replay cache should key on `(kid, jti)`, not `jti` alone. `sub`, `iss` and `aud` are
+not: list them for a key whose tokens carry them. A `jwt_validator` that requires a claim — via
+`issuer` (`iss`), `audience` (`aud`) or `required_claims` — that some scoped key may not assert
+is an `ArgumentError` at construction, since that key could never authenticate. A scoped
+*signing* key is held to its own scope by `encode_jwt`, which refuses to mint a token its
+keyset would reject.
 
 A kid with no scope stays trusted for every claim. The constructor refuses, with an
 `ArgumentError`, a scope for a kid the keyset does not hold, an empty name, a name listed twice,
@@ -269,20 +275,37 @@ end
 # dropping is deliberate: a dropped `sub` is a Principal with `id = nothing`, and the issuer
 # never learns its tokens are out of policy.
 function _check_claim_scope(scope::ClaimScope, claims::Dict{String, Any}, kid::Nullable{String})
+    # Neither the claim name nor its value is echoed: both are the token's, and a key holder
+    # can make them as long as the header allows.
+    _claims_in_scope(scope, claims) ||
+        throw(AuthError("JWT key $(repr(kid)) is not permitted to assert every claim in this token"))
+    return nothing
+end
+
+# The predicate both directions share: `_check_claim_scope` on decode, and `encode_jwt`, which
+# refuses to mint a token its own keyset would reject.
+function _claims_in_scope(scope::ClaimScope, claims::Dict{String, Any})::Bool
     for (name, value) in claims
         name in _JWT_ALWAYS_ALLOWED_CLAIMS && continue
-        allowed = true
-        if !haskey(scope, name)
-            allowed = false
-        else
-            pinned = scope[name]
-            pinned === nothing || (allowed = _pin_admits(pinned, value))
-        end
-        # Neither the claim name nor its value is echoed: both are the token's, and a key
-        # holder can make them as long as the header allows.
-        allowed || throw(AuthError("JWT key $(repr(kid)) is not permitted to assert every claim in this token"))
+        haskey(scope, name) || return false
+        pinned = scope[name]
+        pinned === nothing || _pin_admits(pinned, value) || return false
     end
-    return nothing
+    return true
+end
+
+# Claims that a validator REQUIRES but a scoped key may not assert (#349 review): such a key
+# can never produce a token that passes both checks. Construction-time, like the
+# `required_claims`/`warn_claims` overlap, because at request time it is only a stream of 401s.
+function _unassertable_required(keyset::JWTKeyset, required::Vector{String})
+    missing_by_kid = Pair{String, Vector{String}}[]
+    for key in keyset.keys
+        key.scope === nothing && continue
+        missing_names = String[name for name in required
+                               if !(name in _JWT_ALWAYS_ALLOWED_CLAIMS) && !haskey(key.scope, name)]
+        isempty(missing_names) || push!(missing_by_kid, key.kid => missing_names)
+    end
+    return missing_by_kid
 end
 
 # A claim value is `Any` by nature. A String must be pinned; a list passes only when every

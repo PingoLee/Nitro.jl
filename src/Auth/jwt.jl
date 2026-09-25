@@ -120,6 +120,17 @@ function encode_jwt(payload::AbstractDict, secret_or_keyset; expires_in::Union{I
         header["kid"] = signing_kid
     end
 
+    encoded_claims = JSON.json(claims)
+    # A scoped signing key mints only what its own keyset would accept (#349), for the #314
+    # reason below. Checked against the claims as `_decode_jwt` will parse them -- a Symbol
+    # value is a JSON string by then -- and paid only when the signing key is scoped.
+    scope = signing_kid === nothing ? nothing : _key_scope(secret_or_keyset, signing_kid)
+    if scope !== nothing
+        _claims_in_scope(scope, _parse_json_bounded(encoded_claims; max_fields = 0, dicttype = Dict{String, Any})) ||
+            throw(ArgumentError("JWT signing key $(repr(signing_kid)) is not permitted to assert every " *
+                                "claim in this payload; see its claims scope on the JWTKeyset"))
+    end
+
     encoded_header = base64url_encode(Vector{UInt8}(codeunits(JSON.json(header))))
     # Only a keyset's `kid` can grow the header, and a token `_decode_jwt` would refuse is
     # not one to issue (#314). The kid is not echoed: it names a key.
@@ -127,7 +138,7 @@ function encode_jwt(payload::AbstractDict, secret_or_keyset; expires_in::Union{I
         "JWT header would exceed $_JWT_MAX_HEADER_SEGMENT_BYTES bytes encoded; use a shorter kid"))
     signing_input = string(
         encoded_header, ".",
-        base64url_encode(Vector{UInt8}(codeunits(JSON.json(claims))))
+        base64url_encode(Vector{UInt8}(codeunits(encoded_claims)))
     )
     signature = base64url_encode(_hmac_sha256(secret, signing_input))
     return string(signing_input, ".", signature)

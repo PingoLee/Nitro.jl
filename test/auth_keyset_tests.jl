@@ -342,9 +342,18 @@ end
     @test decode_jwt(encode_jwt(Dict("role" => "admin"), jwtkey("s-part")), jwtkey("s-part"))["role"] == "admin"
     # verify=false is offline inspection: no key vouched, so nothing is scoped.
     @test decode_jwt(as_partner(Dict("role" => "admin")), registry; verify = false)["role"] == "admin"
-    # A scope can also sit on the signing key, and on a lifted Dict.
-    self_scoped = JWTKeyset("self" => jwtkey("s-self"); claims = ["self" => ["sub"]])
-    @test rejected(() -> decode_jwt(encode_jwt(Dict("role" => "admin"), self_scoped), self_scoped))
+    # A scope can also sit on the signing key, and on a lifted Dict. Decoding holds the
+    # signing key to it -- here against a token its HMAC key signed through another keyset.
+    self_scoped = JWTKeyset("self" => jwtkey("s-self"); claims = ["self" => ["sub", "role" => "reader"]])
+    minted_elsewhere = encode_jwt(Dict("role" => "admin"), JWTKeyset("self" => jwtkey("s-self")))
+    @test rejected(() -> decode_jwt(minted_elsewhere, self_scoped))
+    # And encoding refuses to mint what its own keyset would reject (#349 review) -- the
+    # #314 rule, a token `_decode_jwt` refuses is not one to issue.
+    err = caught(() -> encode_jwt(Dict("role" => "admin"), self_scoped))
+    @test err isa ArgumentError && occursin("\"self\"", sprint(showerror, err))
+    @test !occursin("admin", sprint(showerror, err))
+    # The check sees the claims as they will decode: a Symbol is a JSON string by then.
+    @test decode_jwt(encode_jwt(Dict("sub" => "u", "role" => :reader), self_scoped), self_scoped)["role"] == "reader"
     lifted = JWTKeyset(Dict("default" => jwtkey("s-self"), "partner" => jwtkey("s-part"));
                        claims = Dict(:partner => ["sub"]))
     @test rejected(() -> decode_jwt(as_partner(Dict("role" => "admin")), lifted))
@@ -397,6 +406,24 @@ end
     only_implicit = build(Dict("partner" => []))()
     token = encode_jwt(Dict{String, Any}(), JWTKeyset("partner" => jwtkey("s-part")); expires_in = 60)
     @test decode_jwt(token, only_implicit) isa Dict{String, Any}
+
+    # A validator that REQUIRES a claim some scoped key may not assert could never admit that
+    # key -- fail closed, but only as 401s. It is a startup error instead (#349 review).
+    scoped = build(Dict("partner" => ["sub"]))()
+    for (label, kwargs, needle) in (
+            ("issuer", (issuer = "https://idp.example",), "iss"),
+            ("audience", (audience = "api",), "aud"),
+            ("required_claims", (required_claims = ["tenant", "sub", "exp"],), "tenant"),
+            ("strict profile", (profile = :strict, issuer = "i", audience = "a"), "iss, aud"))
+        err = caught(() -> jwt_validator(scoped; kwargs...))
+        @test (label, err isa ArgumentError) == (label, true)
+        text = sprint(showerror, err)
+        @test (label, occursin(needle, text) && occursin("\"partner\"", text)) == (label, true)
+    end
+    # Listed claims, the always-allowed ones, and unscoped keys are all fine.
+    @test jwt_validator(scoped; required_claims = ["sub", "exp", "jti"]) isa Function
+    @test jwt_validator(build(Dict("partner" => ["sub", "iss", "aud"]))(); issuer = "i", audience = "a") isa Function
+    @test jwt_validator(build(())(); issuer = "i", required_claims = ["tenant"]) isa Function
 end
 
 @testset "display names scoped claims, never a secret or a pinned value (#349)" begin
