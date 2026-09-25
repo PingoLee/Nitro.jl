@@ -2,7 +2,7 @@
 
 using HTTP
 
-using ..Util: join_url_path
+using ..Util: join_url_path, _canonical_route
 using ..AppContext: App
 using ..Constants: HTTP_METHODS
 using ..Types: Nullable, LifecycleMiddleware, CopyOnWriteDict, snapshot,
@@ -583,6 +583,8 @@ function (inner::InnerRouter)(http_method::String)
     outer = inner.outer
 
     final_path = !isnothing(inner.path) ? join_url_path(outer.prefix, inner.path) : join_url_path(outer.prefix, "")
+    # Canonical before the middleware key is built, for the reason `register_route` gives (#351).
+    final_path = _canonical_route(final_path)
 
     # Non-EMPTY, not merely non-`nothing` — the same guard `register_route` (src/routing.jl)
     # applies. An explicit `middleware=[]` reaches `process_middleware`'s `::Vector` method and

@@ -33,7 +33,7 @@ using UUIDs: UUID
 
 using ..AppContext: App
 using ..Types: Nullable, RouteDefinition, NamedRoute
-using ..Util: join_url_path, parseparam
+using ..Util: join_url_path, parseparam, _canonical_route
 using ..Errors: is_unrecoverable
 using ..RouterHOF: genkey, process_middleware, publish_route_middleware!, _has_layers
 
@@ -263,7 +263,9 @@ We use `parentmodule` to late-bind to the `register` function, avoiding
 circular dependency issues at include-time.
 """
 function register_route(ctx::App, prefix::String, route_def::RouteDefinition)
-    full_path = join_url_path(prefix, route_def.pattern)
+    # Canonical BEFORE any key is built from it (#351): the router registers the canonical
+    # spelling, and `compose` reads the route middleware back by the route it matched.
+    full_path = _canonical_route(join_url_path(prefix, route_def.pattern))
 
     if !isnothing(route_def.name)
         register_named_route!(ctx, route_def.name, full_path, route_def.type_hints)

@@ -857,13 +857,20 @@ end
             # filesystem and must defend the join.
             for target in ("/static/%2e%2e%2fetc%2fpasswd",
                            "/static/..%2fetc",
-                           "/static/../../etc/passwd",
-                           "/static/%2e%2e/%2e%2e/etc",
                            "/static/sub%2Fnested.txt",   # encoded separator must not cross a level
                            "/static/sub%5Cnested.txt",   # ... nor a Windows one
                            "/static/%00visible.txt")
                 r = internalrequest(HTTP.Request("GET", target))
                 @test r.status == 404
+                @test !occursin("TOP SECRET", bodystr(r))
+                @test !occursin("hunter2", bodystr(r))
+            end
+            # A WHOLE dot segment, raw or encoded, never reaches the mount since #351: the
+            # request target is refused with a 400 before routing, as `//` is (#341). They were
+            # 404s here before; either way nothing is served.
+            for target in ("/static/../../etc/passwd", "/static/%2e%2e/%2e%2e/etc")
+                r = internalrequest(HTTP.Request("GET", target))
+                @test r.status == 400
                 @test !occursin("TOP SECRET", bodystr(r))
                 @test !occursin("hunter2", bodystr(r))
             end

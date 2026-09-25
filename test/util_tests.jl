@@ -408,11 +408,12 @@ end
     # app pre-encoded itself, which IS reachable, so refusing it would be wrong.
     @test mount_segments("my%20static") == ["my%20static"]
     @test mount_segments("caf%C3%A9") == ["caf%C3%A9"]
-    # Validated, never re-encoded. HTTP.jl compares path segments byte for byte rather than by RFC
-    # 3986 equivalence, so case-normalizing `%2f` to `%2F` here would stop matching a client that
-    # sends the lowercase form.
-    @test mount_segments("%2f") == ["%2f"]
-    @test mount_segments("%41") == ["%41"]
+    # Validated, then canonicalized (#351). This used to pin "never re-encoded", because HTTP.jl
+    # compares segments byte for byte and a rewritten prefix would miss a client sending the
+    # other spelling. `OriginFormMiddleware` now canonicalizes every request path the same way,
+    # so it is the UN-canonicalized prefix that could never match.
+    @test mount_segments("%2f") == ["%2F"]
+    @test mount_segments("%41") == ["A"]
     @test mount_segments("v1.2~beta_x-y") == ["v1.2~beta_x-y"]
     for md in ("a:b", "a@b", "a+b", "a,b", "a;b", "a=b", "a\$b", "a&b", "a'b", "a!b", "(a)")
         @test mount_segments(md) == [md]
