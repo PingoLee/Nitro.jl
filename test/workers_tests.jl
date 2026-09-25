@@ -3079,7 +3079,7 @@ end
             sequential in (false, true),
             timeout in (0, 30)
             label = "$(nameof(typeof(exc))) sequential=$sequential timeout=$timeout"
-            rt_store = WorkerRuntime(InMemoryWorkerStore())
+            rt_store = WorkerRuntime(InMemoryWorkerStore(); queues = ["unrecoverable-q"])
             attempts = Threads.Atomic{Int}(0)
             callback = () -> (Threads.atomic_add!(attempts, 1); throw(exc))
             options = TaskOptions(retry_on_failure=true, max_retries=3, timeout=timeout)
