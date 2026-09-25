@@ -358,13 +358,17 @@ the rotation to happen before the handler finishes.
 populate `getuser(req)`. Write a small middleware to bridge them:
 
 ```julia
+# The scalar values `login_required` and the claim guards refuse as a login marker.
+is_login_marker(uid) = !(uid === nothing || uid === missing || uid isa Bool || uid == "")
+
 function SessionAuthMiddleware(handle)
     return function(req::HTTP.Request)
         session = getsession(req)
-        # Check the VALUE, not just the key: a logout that set `user_id = nothing` must not
-        # leave a `Dict("id" => nothing, ...)` behind, which is a non-empty dict and so an identity.
+        # Check the VALUE, not just the key: a logout that set `user_id` to `nothing`, `false`
+        # or `""` must not leave a `Dict("id" => "", "role" => "admin")` behind — a non-empty
+        # dict is an identity, and `role_required` would authorize off it.
         uid = isnothing(session) ? nothing : get(session, "user_id", nothing)
-        if !isnothing(uid)
+        if is_login_marker(uid)
             req.context[:user] = Dict(
                 "id"   => uid,
                 "role" => get(session, "role", "user"),

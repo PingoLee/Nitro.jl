@@ -59,7 +59,7 @@ end
 # Only when the app user is not a claims source at all do we fall back to the token's
 # verified claims. An app that wants token claims honored merges them into the object its
 # `user_validator` returns.
-function _request_claims(req::HTTP.Request)::Nullable{AbstractDict}
+function _request_claims(req::HTTP.Request, session_key::String)::Nullable{AbstractDict}
 	user = Base.get(req.context, :user, nothing)
 	user isa AbstractDict && return user          # incl. `Principal`
 
@@ -71,9 +71,20 @@ function _request_claims(req::HTTP.Request)::Nullable{AbstractDict}
 	# back. A non-dict `:auth_claims` alone does NOT gate the fallback — nothing vouched.
 	user === nothing || return nothing
 
+	# The raw session is app data, not an authentication: it is a claims source only while
+	# it carries the login marker `login_required` checks (#337). A logout that deletes or
+	# nulls `session_key` but leaves `role` behind must not stay authorized as that role.
 	session = getsession(req)
-	return session isa AbstractDict ? session : nothing
+	session isa AbstractDict || return nothing
+	return _is_identity(_session_marker(session, session_key)) ? session : nothing
 end
+
+# The login marker of a raw session: `session_key` as a String key, else as a Symbol key.
+# Shared by `login_required` and the claim guards so they cannot disagree about who is
+# logged in.
+_session_marker(session::AbstractDict, session_key::String) =
+	haskey(session, session_key) ? session[session_key] :
+		Base.get(session, Symbol(session_key), nothing)
 
 """
     login_required(; redirect_url = "/login", session_key = "user_id")
@@ -127,16 +138,14 @@ function login_required(; redirect_url::String="/login", session_key::String="us
 
 		session = getsession(req)
 		if session isa AbstractDict
-			marker = haskey(session, session_key) ? session[session_key] :
-				Base.get(session, Symbol(session_key), nothing)
-			_is_identity(marker) && return nothing
+			_is_identity(_session_marker(session, session_key)) && return nothing
 		end
 		return HTTP.Response(302, ["Location" => redirect_url])
 	end
 end
 
 """
-    claim_required(claim, value; kind=:equals)
+    claim_required(claim, value; kind=:equals, session_key="user_id")
 
 Declarative authorization guard on a claim of the request principal: 403 unless the
 principal's `claim` matches `value`.
@@ -147,9 +156,12 @@ principal's `claim` matches `value`.
 The claims are resolved in three steps: `req.context[:user]` when an auth middleware set
 something dict-like there (a `Principal`, or your own claims dict); otherwise the verified
 `Principal` at `req.context[:auth_claims]`, which is where a `user_validator`'s token claims
-ride; otherwise the raw `getsession(req)` dict, for session-based apps. A non-dict `:user`
-(a plain user struct with no accompanying claims) denies rather than falling through to the
-session. `role_required` and `permission_required` are thin aliases over this guard.
+ride; otherwise the raw `getsession(req)` dict, for session-based apps — but only while it
+carries the login marker `session_key` with an identity as its value, the same test
+[`login_required`](@ref) applies. A logged-out session that kept its `role` authorizes
+nothing. A non-dict `:user` (a plain user struct with no accompanying claims) denies rather
+than falling through to the session. `role_required` and `permission_required` are thin
+aliases over this guard.
 
 !!! warning "A struct user authorizes off the token, not off your lookup"
     Those first two steps decide how fast a revocation takes effect. A dict-like `:user` is
@@ -159,10 +171,10 @@ session. `role_required` and `permission_required` are thin aliases over this gu
     result. A demoted user keeps what the token says until it expires. Return a dict merging
     your fresh state if revocation must take effect within the token TTL.
 """
-function claim_required(claim::String, value; kind::Symbol=:equals)
+function claim_required(claim::String, value; kind::Symbol=:equals, session_key::String="user_id")
 	if kind === :equals
 		return function(req::HTTP.Request)
-			claims = _request_claims(req)
+			claims = _request_claims(req, session_key)
 			if claims === nothing || get(claims, claim, nothing) != value
 				return FORBIDDEN
 			end
@@ -170,7 +182,7 @@ function claim_required(claim::String, value; kind::Symbol=:equals)
 		end
 	elseif kind === :contains
 		return function(req::HTTP.Request)
-			claims = _request_claims(req)
+			claims = _request_claims(req, session_key)
 			container = claims === nothing ? nothing : get(claims, claim, nothing)
 			if !(container isa AbstractVector) || !(value in container)
 				return FORBIDDEN
@@ -182,24 +194,24 @@ function claim_required(claim::String, value; kind::Symbol=:equals)
 end
 
 """
-    role_required(role; role_key = "role")
+    role_required(role; role_key = "role", session_key = "user_id")
 
 Guard that answers `403` unless the principal's `role_key` claim equals `role`. Exactly
-`claim_required(role_key, role; kind = :equals)`; see [`claim_required`](@ref) for where the claims
-are read from and how fast a revocation takes effect.
+`claim_required(role_key, role; kind = :equals, session_key)`; see [`claim_required`](@ref) for
+where the claims are read from, when the session counts, and how fast a revocation takes effect.
 """
-role_required(role::String; role_key::String="role") =
-	claim_required(role_key, role; kind=:equals)
+role_required(role::String; role_key::String="role", session_key::String="user_id") =
+	claim_required(role_key, role; kind=:equals, session_key)
 
 """
-    permission_required(permission; permissions_key = "permissions")
+    permission_required(permission; permissions_key = "permissions", session_key = "user_id")
 
 Guard that answers `403` unless the principal's `permissions_key` claim is a list containing
-`permission`. Exactly `claim_required(permissions_key, permission; kind = :contains)`; see
-[`claim_required`](@ref).
+`permission`. Exactly `claim_required(permissions_key, permission; kind = :contains, session_key)`;
+see [`claim_required`](@ref).
 """
-permission_required(permission::String; permissions_key::String="permissions") =
-	claim_required(permissions_key, permission; kind=:contains)
+permission_required(permission::String; permissions_key::String="permissions", session_key::String="user_id") =
+	claim_required(permissions_key, permission; kind=:contains, session_key)
 
 # The verified key id of the request principal. Only a `Principal` carries a trusted kid
 # (populated exclusively from keyset-verified decodes); there is deliberately no session

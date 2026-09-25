@@ -28,6 +28,28 @@ using Nitro: BearerAuth, GuardMiddleware, SessionMiddleware, login_required, rol
     @test Nitro.text(res) == "session-ok"
 end
 
+# #337: through the real SessionMiddleware, a claim guard with no auth layer in front of it
+# must not authorize off a logged-out session that kept its `role`.
+@testset "Claim guards refuse a logged-out session" begin
+    store = Nitro.Types.MemoryStore{String, Dict{String,Any}}()
+    Nitro.Types.set_session!(store, "logged-out", Dict{String,Any}(
+        "user_id" => nothing, "role" => "admin", "permissions" => ["reports:read"]); ttl=60)
+    Nitro.Types.set_session!(store, "anonymous", Dict{String,Any}("role" => "admin"); ttl=60)
+    Nitro.Types.set_session!(store, "logged-in", Dict{String,Any}(
+        "user_id" => 11, "role" => "admin", "permissions" => ["reports:read"]); ttl=60)
+
+    middleware = SessionMiddleware(cookie_name="auth_session", store=store).middleware
+    app = middleware(GuardMiddleware(
+        role_required("admin"),
+        permission_required("reports:read"),
+    )(req -> HTTP.Response(200, "admin-ok")))
+
+    status(sid) = app(HTTP.Request("GET", "/admin", ["Cookie" => "auth_session=$sid"])).status
+    @test status("logged-out") == 403
+    @test status("anonymous") == 403
+    @test status("logged-in") == 200
+end
+
 @testset "Bearer auth populates getuser(req)" begin
     validator = Nitro.Auth.jwt_validator("jwt-secret")
     token = Nitro.Auth.encode_jwt(Dict(
