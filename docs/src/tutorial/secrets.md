@@ -138,6 +138,12 @@ Instead, Nitro generates a random, cryptographically secure `UUIDv4` identifier 
 
 Because the UUID is completely random and has 122 bits of entropy, it is impossible for an attacker to guess or mathematically reverse it. There is no user data inside the cookie to encrypt.
 
+That is why `SessionMiddleware` takes **no** `secret_key`. It used to accept one and silently
+ignore it, which read as a promise that the cookie was protected. It is now a `MethodError`, and a
+`config::CookieConfig` carrying a `secret_key` is an `ArgumentError` (#339). Signing the id would
+not buy anything either. Unknown ids are already refused, `rotate_on_auth` rotates the id on login
+(fixation), and the `__Host-` cookie name stops a sibling site planting its own id (swapping).
+
 ### How to Secure Sessions
 Instead of encrypting the UUID, you secure the session by configuring the cookie transport attributes. You should ensure that `SessionMiddleware` uses:
 - `HttpOnly=true` (Prevents JavaScript XSS from stealing the UUID)

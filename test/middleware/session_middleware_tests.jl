@@ -1,7 +1,7 @@
 @testitem "Session middleware" tags=[:middleware] setup=[NitroCommon] begin
 using HTTP
 using Dates
-using Nitro: SessionMiddleware, GET, set_cookie!
+using Nitro: SessionMiddleware, GET, set_cookie!, CookieConfig
 using Nitro.Core.Types: MemoryStore, SessionPayload
 using Nitro.Core.Cookies: storesession!, prunesessions!
 
@@ -417,6 +417,34 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
         @test length(store.data) == 1
         payload = first(values(store.data))
         @test payload.data["custom_backend"] == true
+    end
+
+    # ── #339: no `secret_key` ────────────────────────────────────────────────
+    #
+    # The keyword was accepted and never used: the id cookie was always written and read raw, so a
+    # caller passing one believed the session cookie was protected by it when nothing was.
+    @testset "SessionMiddleware takes no secret_key (#339)" begin
+        key = "k" ^ 32
+        @test_throws MethodError SessionMiddleware(store = MemoryStore(), secret_key = key)
+
+        # The same no-op smuggled in through a whole `config` is refused, not ignored -- and the
+        # message explains why without echoing the key.
+        err = try
+            SessionMiddleware(store = MemoryStore(), config = CookieConfig(secret_key = key, secure = false))
+            nothing
+        catch e
+            e
+        end
+        @test err isa ArgumentError
+        @test occursin("#339", err.msg) && !occursin(key, err.msg)
+
+        # A config without a key is fine, and the cookie is what it always was: the raw id.
+        store = MemoryStore()
+        mw = SessionMiddleware(store = store, cookie_name = "plain",
+                               config = CookieConfig(secure = false)).middleware
+        res = mw(req -> (getsession(req)["x"] = 1; HTTP.Response(200, "ok")))(HTTP.Request("GET", "/"))
+        sid = String(match(r"plain=([^;]+)", HTTP.header(res, "Set-Cookie")).captures[1])
+        @test Base.get(store, sid, nothing) !== nothing
     end
 
     # ── #318: concurrent requests on one session ─────────────────────────────

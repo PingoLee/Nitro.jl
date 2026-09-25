@@ -10,7 +10,7 @@ using ...Types: CookieConfig, LifecycleMiddleware
 using ..JanitorMiddleware: _janitor
 using ...Cookies: get_cookie, set_cookie!, storesession!, prunesessions!, regenerate_session!,
     _validate_cookie_prefix
-using ...Crypto: secure_uuid4, SecretString
+using ...Crypto: secure_uuid4
 using ...Core: own_response_headers
 
 export SessionMiddleware, SessionPruner
@@ -92,7 +92,7 @@ function SessionPruner(store::AbstractSessionStore; interval::Period = Minute(10
 end
 
 """
-    SessionMiddleware(; store, cookie_name, secret_key, max_age, prune_interval,
+    SessionMiddleware(; store, cookie_name, max_age, prune_interval,
                         rotate_on_auth, auth_key, validator, ...)
 
 Creates a `LifecycleMiddleware` that manages server-side sessions with cookie-based session
@@ -169,8 +169,13 @@ contract.
   sessions from `store`. Must be a positive fixed-length `Period`; calendar periods (`Month`,
   `Quarter`, `Year`) are rejected, since they cannot be slept on. This replaced a `prune_probability` that ran the prune inline on a
   fraction of requests; see the comment above `_prune_janitor` for why that had to go.
-- Cookie attributes (`secure`, `httponly`, `samesite`, `path`, `domain`, `secret_key`) or a
-  fully-formed `config::CookieConfig`.
+- Cookie attributes (`secure`, `httponly`, `samesite`, `path`, `domain`) or a fully-formed
+  `config::CookieConfig`.
+
+There is no `secret_key` (#339). The cookie carries only a random UUIDv4 session id and the data
+stays on the server, so there is nothing to encrypt. Signing the id would not stop fixation or
+session swapping either; the `__Host-` default above is what stops swapping. A `config` whose
+`secret_key` is set is an `ArgumentError`, because it would be silently ignored.
 
 # Returns
 A `LifecycleMiddleware`. `serve()` and `urlpatterns()` accept it directly; if you are composing
@@ -178,7 +183,6 @@ the chain by hand, the request function is its `.middleware` field.
 """
 function SessionMiddleware(;
     cookie_name::Nullable{String} = nothing,
-    secret_key::Union{AbstractString, SecretString, Nothing} = nothing,
     max_age::Int = 86400,
     store::AbstractSessionStore{String, Dict{String,Any}},
     prune_interval::Period = Minute(10),
@@ -190,7 +194,6 @@ function SessionMiddleware(;
     rotate_on_auth::Bool = true,
     auth_key::String = "user_id",
     config::CookieConfig = CookieConfig(
-        secret_key = secret_key,
         httponly = httponly,
         secure = secure,
         samesite = samesite,
@@ -199,6 +202,15 @@ function SessionMiddleware(;
         maxage = max_age,
     ),
     validator::Union{Function, Nothing} = nothing)
+
+    # There is no `secret_key` keyword any more (#339): it was accepted and never used, since the
+    # id cookie was always written and read raw. A caller passing one reasonably believed the
+    # session cookie was encrypted or signed. A `config` carrying one would be the same silent
+    # no-op, so it is refused rather than ignored.
+    config.secret_key === nothing || throw(ArgumentError(
+        "SessionMiddleware does not encrypt or sign its cookie, so `config.secret_key` would be " *
+        "ignored. The cookie holds only a random 122-bit session id; the session data stays on " *
+        "the server. Build the `CookieConfig` without `secret_key` (#339)."))
 
     # Resolved from the FINAL config -- `config` may be passed whole -- and checked before any
     # janitor exists, so a name browsers would drop fails at construction.
