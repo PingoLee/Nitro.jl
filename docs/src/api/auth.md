@@ -22,6 +22,7 @@ Nitro.Auth.jwt_validator
 Nitro.Auth.session_user_validator
 Nitro.Auth.JWTKeyset
 Nitro.Auth.set_auth_cookie!
+Nitro.Auth.extract_auth_token
 ```
 
 ## Passwords

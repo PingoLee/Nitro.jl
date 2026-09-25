@@ -322,8 +322,12 @@ using HTTP
 using Nitro
 using Nitro.Auth
 
-token = encode_jwt(Dict("sub" => "42", "role" => "admin", "exp" => trunc(Int, time()) + 3600), "secret")
-validator = jwt_validator("secret")
+# At least 32 random bytes (RFC 7518 §3.2) — generate once with
+# `bytes2hex(Nitro.Crypto.secure_random_bytes(32))`, then read it from the environment.
+secret = ENV["JWT_SECRET"]
+
+token = encode_jwt(Dict("sub" => "42", "role" => "admin", "exp" => trunc(Int, time()) + 3600), secret)
+validator = jwt_validator(secret)
 
 function profile(req::HTTP.Request)
     return Res.json(Dict("user" => getuser(req)))
