@@ -7,8 +7,9 @@ body caps, the real client IP — is covered in [Behind a Reverse Proxy](reverse
 ## Threads
 
 `serve()` runs every request on its own `Threads.@spawn` task in Julia's default thread pool. There
-is no event loop and no cluster of worker processes; the thread count **is** the concurrency.
-Start the server with it set:
+is no event loop and no cluster of worker processes; the thread count is how many requests can
+**compute** at once. (How many can be *in flight* at once is a different number, and nothing
+bounds it; see [Sizing it](@ref) below.) Start the server with it set:
 
 ```bash
 julia --threads=auto --project -e 'using MyApp; MyApp.start_server()'
@@ -22,7 +23,8 @@ machine, not on your laptop:
  Nitro <version>  (parallel mode: 8 threads)
 ```
 
-`--threads=auto` means one thread per logical CPU. Julia 1.12 also sizes its parallel
+`--threads=auto` means one thread per CPU (on Linux and Windows, per CPU the process's affinity
+mask allows). Julia also sizes its parallel
 GC to the same number unless you pass `--gcthreads`, so the thread count reaches the collector as
 well as the handlers. Pin an explicit number (`--threads=8`) when the process shares its host.
 
@@ -37,7 +39,8 @@ julia --threads=auto --heap-size-hint=3G --project -e 'using MyApp; MyApp.start_
 ### What Julia does without one
 
 The garbage collector steers by a target heap size. Unless something sets that target, **there
-isn't one**: on Julia 1.12 with no hint and no container limit, the GC's ceiling is 2 PiB. How soon
+isn't one**: on Julia 1.12 and 1.13, with no hint and no container limit, the GC's ceiling is
+2 PiB. How soon
 it collects is then governed only by its own growth heuristics, and nothing about the machine
 tells it to try harder as memory runs out. A server whose live data is a few GB can keep growing
 until the kernel's OOM killer ends it, and on a host shared with other services that killer may
@@ -53,8 +56,9 @@ Three things set the target, and the first one present wins:
 
 So a container or a systemd unit with a memory limit already gets a sensible GC target without a
 hint. `%` is also measured against that limit: inside a 4 GiB cgroup, `--heap-size-hint=75%` means
-3 GiB, whatever the host has (`julia --help` says "physical memory"; the implementation uses the
-cgroup limit when there is one).
+3 GiB, whatever the host has. `julia --help` and the Julia manual say "physical memory", but the
+implementation uses the cgroup limit when there is one; reported upstream as
+[JuliaLang/julia#63337](https://github.com/JuliaLang/julia/issues/63337).
 
 ### Sizing it
 
@@ -67,10 +71,15 @@ heap at the remainder, and starts collecting hard at about 80% of that. Two cons
   `--heap-size-hint=400M` (a working target of ~120 MiB) ran 1,246 full collections and did not
   finish, where the same job with no hint took 14 seconds.
 - **Size it from peak concurrent load, not idle memory.** Every in-flight request holds its own
-  live data, and `--threads` sets how many are in flight. A service that accepts 64 MiB uploads
-  (`serve(max_body_bytes = …)`'s default) with 8 threads can hold half a gigabyte of request
-  bodies before any handler allocates anything. Raising the thread count raises the peak live set;
-  revisit the hint when you change either one.
+  live data, and `--threads` does **not** limit how many are in flight. HTTP.jl starts a task per
+  connection and Nitro one per request, and a task waiting on a slow body yields its thread to the
+  next request. So the bound is open connections, not threads, and today nothing caps it
+  ([#298](https://github.com/PingoLee/Nitro.jl/issues/298)). With the 64 MiB
+  `serve(max_body_bytes = …)` default, 200 concurrent uploads can hold ~12.8 GB of request bodies
+  before any handler allocates anything. That memory is **live**, so no hint reclaims it. Until a
+  cap exists, keep `max_body_bytes` as small as your largest real upload, and consider nginx's
+  `max_conns` on the `upstream` block's `server` line. Open-source nginx has no queue behind it,
+  so requests over the limit get a `502` rather than waiting.
 
 A workable starting point: the hint at the steady-state RSS you observe under realistic load plus
 headroom, and at least 250 MiB below whatever limit the host or cgroup enforces.
