@@ -1,7 +1,7 @@
 @testitem "Environment resolution" tags=[:core] setup=[NitroCommon] begin
 using Test
 using Nitro
-using Nitro.Core.Environment: _resolve_env, _present, NITRO_ENVS
+using Nitro.Core.Environment: _resolve_env, _resolve_explicit, _explicit_env, _present, NITRO_ENVS
 
 # Every `withenv` here sets BOTH variables. `GENIE_ENV` is a real fallback now, so a block that
 # only pins `NITRO_ENV` passes in CI and fails on any machine that exports `GENIE_ENV` -- a
@@ -42,6 +42,27 @@ using Nitro.Core.Environment: _resolve_env, _present, NITRO_ENVS
         @test _present("") === nothing
         @test _present("  ") === nothing
         @test _present(" prod ") == "prod"
+    end
+
+    @testset "the explicit resolver tells a SET environment from the fallback (#331)" begin
+        # The PormG bridge publishes only what someone set; `_resolve_env`'s "dev" is the
+        # fallback, and `_resolve_explicit` is the same resolver without it.
+        @test _resolve_explicit(nothing, nothing) === nothing
+        @test _resolve_explicit("", "  ") === nothing
+        @test _resolve_explicit("dev", nothing) == "dev"          # "dev", SET, is a choice
+        @test _resolve_explicit(nothing, "prod") == "prod"
+        @test _resolve_explicit("test", "prod") == "test"
+        # The same validation, not a laxer copy of it.
+        @test_throws ArgumentError _resolve_explicit("prodution", nothing)
+        @test_throws ArgumentError _resolve_explicit(nothing, "staging")
+
+        withenv("NITRO_ENV" => nothing, "GENIE_ENV" => nothing) do
+            @test _explicit_env() === nothing
+            @test current_env() == "dev"
+        end
+        withenv("NITRO_ENV" => nothing, "GENIE_ENV" => "prod") do
+            @test _explicit_env() == "prod"
+        end
     end
 
     @testset "an unknown value throws rather than defaulting silently" begin
@@ -111,6 +132,8 @@ end
     # `NITRO_ENVS` and the private resolver part of Nitro's API by accident.
     @test :NITRO_ENVS ∉ names(Nitro)
     @test :_resolve_env ∉ names(Nitro)
+    @test :_resolve_explicit ∉ names(Nitro)
+    @test :_explicit_env ∉ names(Nitro)
     @test :Environment ∉ names(Nitro)
 end
 

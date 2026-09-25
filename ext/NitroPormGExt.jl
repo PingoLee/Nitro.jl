@@ -1206,15 +1206,32 @@ end
 # SECTION 9: Environment bridge
 # ============================================================================
 
-function sync_pormg_env!(; force::Bool = false)
+function sync_pormg_env!(; force::Bool = false)::Union{String, Nothing}
     # Blank counts as UNSET, matching how `current_env` treats `NITRO_ENV` -- and here it
     # matters more, because PormG's `_effective_env` returns `""` on a bare `haskey` and then
     # looks up a `""` section in connection.yml. Honouring an empty `PORMG_ENV` as if it were
     # a deliberate choice would make the bridge worse than not existing.
-    if force || isempty(strip(get(ENV, "PORMG_ENV", "")))
-        ENV["PORMG_ENV"] = Nitro.current_env()
+    current = get(ENV, "PORMG_ENV", nothing)
+    blank = current !== nothing && isempty(strip(current))
+    if force || current === nothing || blank
+        # Only an environment someone SET is published (#331). Nitro's `"dev"` fallback is not
+        # a choice, and published as one it outranked a choice someone did make: `default_env:`
+        # in connection.yml sits below `PORMG_ENV` in PormG's precedence, so a prod box relying
+        # on it silently connected to dev. With neither `NITRO_ENV` nor `GENIE_ENV` set, PormG
+        # resolves its own environment -- which is also why `force` then has nothing to write.
+        #
+        # Resolved only here, as before: a typo in `NITRO_ENV` does not throw while a set
+        # `PORMG_ENV` means there is nothing to publish.
+        env = Nitro.Core.Environment._explicit_env()
+        if env !== nothing
+            ENV["PORMG_ENV"] = env
+        elseif blank
+            # Nothing to publish over the blank, and left in place PormG would read it as a
+            # `""` environment. Removing it is what "blank counts as unset" means to PormG.
+            delete!(ENV, "PORMG_ENV")
+        end
     end
-    return ENV["PORMG_ENV"]
+    return get(ENV, "PORMG_ENV", nothing)
 end
 
 # ============================================================================
@@ -1243,10 +1260,11 @@ function __init__()
     # keys. `session_model(db_key)` / `task_model(db_key)` build a bound model per store
     # instead, which is a handful of allocations about twice per application.
 
-    # Bridge Nitro's resolved environment to PormG's, so an app can call
+    # Bridge the environment set in `NITRO_ENV`/`GENIE_ENV` to PormG's, so an app can call
     # `PormG.Configuration.load_many([...])` with no `env=` and get the environment Nitro
     # resolved (#55). A DEFAULT, never a force: a pre-set `PORMG_ENV` and an explicit `env=`
-    # both still win.
+    # both still win -- and with neither variable set nothing is published, so PormG's own
+    # `default_env:` still decides (#331).
     #
     # Guarded, unlike the registration above, because this is the only side effect here that
     # ESCAPES THE MODULE: it mutates the OS process environment, which is inherited by any
@@ -1265,7 +1283,7 @@ function __init__()
             # lives in `serve()`, which is where the process commits to being a server.
             @warn "Nitro could not bridge its environment to PormG: " *
                   sprint(showerror, err) *
-                  "\n`PORMG_ENV` is left unset, so PormG falls back to its own " *
+                  "\n`PORMG_ENV` is left as it was, so PormG falls back to its own " *
                   "resolution (`env=` kwarg, then `PORMG_ENV`, then `default_env:` in " *
                   "connection.yml, then \"dev\").\nFix the variable and call " *
                   "`sync_pormg_env!()`, or pass `env=` explicitly."

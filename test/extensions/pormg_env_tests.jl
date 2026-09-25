@@ -38,16 +38,35 @@ end
         @test ENV["PORMG_ENV"] == "prod"
     end
 
-    # Unset resolves through to Nitro's default rather than leaving PORMG_ENV absent.
-    withenv("NITRO_ENV" => nothing, "GENIE_ENV" => nothing, "PORMG_ENV" => nothing) do
-        @test Nitro.sync_pormg_env!() == "dev"
-        @test ENV["PORMG_ENV"] == "dev"
-    end
-
     # The GENIE_ENV fallback reaches PormG too.
     withenv("NITRO_ENV" => nothing, "GENIE_ENV" => "test", "PORMG_ENV" => nothing) do
         @test Nitro.sync_pormg_env!() == "test"
         @test ENV["PORMG_ENV"] == "test"
+    end
+end
+
+@testset "Nitro's \"dev\" fallback is never published (#331)" begin
+    # This used to seed "dev" -- and PORMG_ENV outranks `default_env:` in connection.yml, so a
+    # prod box relying on `default_env: prod` with no NITRO_ENV silently connected to dev. The
+    # fallback is not a choice anyone made; `default_env:` is. So nothing is written, and PormG
+    # resolves its own environment.
+    withenv("NITRO_ENV" => nothing, "GENIE_ENV" => nothing, "PORMG_ENV" => nothing) do
+        @test Nitro.current_env() == "dev"            # Nitro still REPORTS its fallback...
+        @test Nitro.sync_pormg_env!() === nothing     # ...but does not publish it
+        @test !haskey(ENV, "PORMG_ENV")
+        # `force` overrides an existing value; with no environment set it has nothing to write.
+        @test Nitro.sync_pormg_env!(force=true) === nothing
+        @test !haskey(ENV, "PORMG_ENV")
+    end
+    withenv("NITRO_ENV" => nothing, "GENIE_ENV" => nothing, "PORMG_ENV" => "test") do
+        @test Nitro.sync_pormg_env!(force=true) == "test"
+        @test ENV["PORMG_ENV"] == "test"
+    end
+    # A blank PORMG_ENV counts as unset, as below -- and with nothing to publish over it, it is
+    # removed rather than left for PormG to read as a `""` environment.
+    withenv("NITRO_ENV" => "  ", "GENIE_ENV" => nothing, "PORMG_ENV" => "") do
+        @test Nitro.sync_pormg_env!() === nothing
+        @test !haskey(ENV, "PORMG_ENV")
     end
 end
 
@@ -88,6 +107,11 @@ end
         @test_throws ArgumentError Nitro.sync_pormg_env!()
         @test !haskey(ENV, "PORMG_ENV")   # nothing half-written
     end
+    # ...but only when there is something to publish: a set PORMG_ENV means the variables are
+    # never resolved, so the typo is `serve()`'s to report, not this function's.
+    withenv("NITRO_ENV" => "prodution", "GENIE_ENV" => nothing, "PORMG_ENV" => "test") do
+        @test Nitro.sync_pormg_env!() == "test"
+    end
 end
 
 @testset "__init__ actually calls the bridge (subprocess)" begin
@@ -115,6 +139,12 @@ end
         read(cmd, String)
     end
     @test out == "test"
+
+    # ...and with no environment set, loading PormG leaves PORMG_ENV alone (#331).
+    out = withenv("NITRO_ENV" => nothing, "GENIE_ENV" => nothing, "PORMG_ENV" => nothing) do
+        read(cmd, String)
+    end
+    @test out == "<unset>"
 end
 
 @testset "the value Nitro publishes is the one PormG's own resolver would pick" begin
@@ -127,6 +157,13 @@ end
         @test PormG.Configuration._effective_env(nothing, "dev") == "prod"
         # ...but an explicit `env=` at the call site still wins over everything.
         @test PormG.Configuration._effective_env("test", nothing) == "test"
+    end
+    # With no environment set, a file-level `default_env:` decides again (#331) -- the case
+    # the bridge used to override with Nitro's "dev" fallback.
+    withenv("NITRO_ENV" => nothing, "GENIE_ENV" => nothing, "PORMG_ENV" => nothing) do
+        Nitro.sync_pormg_env!()
+        @test PormG.Configuration._effective_env(nothing, "prod") == "prod"
+        @test PormG.Configuration._effective_env(nothing, nothing) == "dev"
     end
 end
 

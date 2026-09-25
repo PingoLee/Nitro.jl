@@ -54,11 +54,19 @@ serve(middleware=[SessionMiddleware(store=store)])
 function pormg_nitro_session end
 
 """
-    sync_pormg_env!(; force::Bool = false) -> String
+    sync_pormg_env!(; force::Bool = false) -> Union{String, Nothing}
 
-Publish Nitro's resolved environment ([`current_env`](@ref)) to `ENV["PORMG_ENV"]`, the
-variable PormG's own configuration loader consults. Returns whatever `PORMG_ENV` holds
-afterwards.
+Publish the environment set in `NITRO_ENV` (or its fallback `GENIE_ENV`, validated exactly as
+[`current_env`](@ref) validates them) to `ENV["PORMG_ENV"]`, the variable PormG's own
+configuration loader consults. Returns whatever `PORMG_ENV` holds afterwards, or `nothing` if it
+is unset.
+
+**Only a set environment is published.** With neither variable set, `current_env()` reports its
+`"dev"` fallback, but nothing is written: that fallback is not a choice anyone made, and as
+`PORMG_ENV` it would outrank one someone did make, `default_env:` in `connection.yml`. PormG
+then resolves its own environment. A blank or whitespace-only `PORMG_ENV` counts as unset. It is
+overwritten when there is an environment to publish, and removed when there is not, so PormG
+never looks up a `""` section.
 
 **A default, never a force.** With `force = false` (the default) an existing `PORMG_ENV` is
 left exactly as it is. PormG's documented precedence stays intact either way:
@@ -68,10 +76,11 @@ env= kwarg  >  ENV["PORMG_ENV"]  >  `default_env:` in connection.yml  >  "dev"
 ```
 
 so an explicit `env=` at a `load` call site always wins regardless of this function. Pass
-`force = true` only to deliberately overwrite a value already there.
+`force = true` only to deliberately overwrite a value already there. It still writes nothing
+when neither `NITRO_ENV` nor `GENIE_ENV` is set.
 
 `NitroPormGExt.__init__` calls this for you at `using PormG`, which is what lets an app write
-`PormG.Configuration.load_many(["db"])` with no `env=` and still get the right environment.
+`PormG.Configuration.load_many(["db"])` with no `env=` and still get the environment it set.
 Call it by hand only if you set `NITRO_ENV` *after* loading PormG — see the load-order note in
 the environment docs.
 

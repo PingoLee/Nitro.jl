@@ -71,9 +71,9 @@ Starting server at http://127.0.0.1:8080
 
 ## Bridging to PormG
 
-With `PormG` loaded, Nitro publishes the resolved environment to `ENV["PORMG_ENV"]`, which is
-the variable PormG's own configuration loader consults. That means a PormG app needs **no**
-`env=`:
+With `PormG` loaded, Nitro publishes the environment you set in `NITRO_ENV` (or `GENIE_ENV`) to
+`ENV["PORMG_ENV"]`, which is the variable PormG's own configuration loader consults. That means
+a PormG app needs **no** `env=`:
 
 ```julia
 using Nitro, PormG
@@ -95,10 +95,27 @@ ENV["PORMG_ENV"] = "test"                      # set before `using PormG` -- sur
 PormG.Configuration.load("db"; env = "test")   # explicit kwarg -- always wins
 ```
 
+**Only an environment you set is published.** With neither `NITRO_ENV` nor `GENIE_ENV` set,
+`current_env()` reports `"dev"`, but that is Nitro's fallback, not a choice, so the bridge
+writes nothing. PormG then resolves its own environment, and a `default_env:` in
+`connection.yml` decides. Publishing the fallback would put `"dev"` at the `PORMG_ENV` level,
+above `default_env:`, and a server relying on `default_env: prod` would silently connect to its
+dev database.
+
+| `NITRO_ENV` / `GENIE_ENV` | `PORMG_ENV` before `using PormG` | PormG connects with |
+|---|---|---|
+| set, e.g. `prod` | unset or blank | `prod`, published by the bridge |
+| set | set, e.g. `test` | `test`: yours survives |
+| neither set | unset or blank | `default_env:` from `connection.yml`, else `"dev"` |
+
+In that last row the banner still says `Environment: dev` while PormG may be on `prod`.
+`current_env()` never gates anything, so nothing behaves differently because of it. Set
+`NITRO_ENV` wherever the process is launched, and both will agree.
+
 !!! warning "Set `NITRO_ENV` before `using`"
     Nitro seeds `ENV["PORMG_ENV"]` once, when the PormG extension loads — that is, at
     `using PormG`. Setting `NITRO_ENV` *after* that point still changes what `current_env()`
-    returns, but `PORMG_ENV` keeps the value it was seeded with.
+    returns, but `PORMG_ENV` keeps the value it was seeded with, or stays unset.
 
     The seed is also skipped during **precompilation**, deliberately: a compile worker must
     not mutate the process environment. So a package that calls `PormG.Configuration.load*`
