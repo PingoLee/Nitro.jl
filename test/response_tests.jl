@@ -165,6 +165,10 @@ end
     # `disposition` is written unquoted, so it must be a token.
     @test_throws ArgumentError Res.file("content/index.html";
         disposition = "attachment; filename*=UTF-8''evil.html")
+    # A trailing LF: PCRE's `$` would have let this through.
+    @test_throws ArgumentError Res.file("content/index.html"; disposition = "attachment\n")
+    @test Dict(Res.file("content/index.html"; disposition = "form-data").headers)["Content-Disposition"] ==
+        "form-data; filename=\"index.html\""
 end
 
 @testset "Repeated calls do not duplicate headers for Res.file" begin

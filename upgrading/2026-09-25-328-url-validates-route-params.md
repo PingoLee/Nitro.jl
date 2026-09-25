@@ -45,7 +45,7 @@ Give both routes the same converter, or give them different names.
 rg -n '\burl\(' <app>/src <app>/test
 
 # Route names used more than once -- check each pair uses the same converters.
-rg -o --no-filename 'name\s*=\s*"[^"]+"' <app>/src | sort | uniq -d
+rg -o --no-filename -r '$1' 'name\s*=\s*"([^"]+)"' <app>/src | sort | uniq -d
 ```
 
 ### Migrate your app

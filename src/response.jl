@@ -77,7 +77,9 @@ function content_disposition(filename::AbstractString, disposition::String)
     return string(header, "; filename*=UTF-8''", rfc5987_encode(clean))
 end
 
-const DISPOSITION_TYPE = r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+# `\A…\z`, not `^…$`: PCRE's `$` also matches before a final `\n`, which would let a raw LF
+# into the unquoted header value.
+const DISPOSITION_TYPE = r"\A[!#$%&'*+.^_`|~0-9A-Za-z-]+\z"
 const HEX_ESCAPE = r"%[0-9A-Fa-f]{2}"
 
 # RFC 5987 `attr-char`: the bytes an `ext-value` carries literally. Everything else, including
