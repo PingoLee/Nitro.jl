@@ -889,12 +889,11 @@ for dir in ("src", "ext"), p in julia_files(joinpath(root, dir))
     k > 0 && (found[replace(relpath(p, root), '\\' => '/')] = k)
 end
 
-# The wrapper's own call, and the PormG extension's two. Those read JSON the application wrote
-# to its own database (session payloads, worker results), not request data -- bounding them is
-# a separate question. Any NEW site must go through `_parse_json_bounded` instead.
+# The wrapper's own call, and nothing else. The PormG extension's two -- JSON the application
+# stored itself, session payloads and worker results -- used to be allowlisted here and now go
+# through the bound too (#344). Any NEW site must go through `_parse_json_bounded` instead.
 @test found == Dict(
     "src/utilities/bodyparsers.jl" => 1,
-    "ext/NitroPormGExt.jl" => 2,
 )
 
 # The detector itself, so a silent miss cannot pass for a clean tree.
