@@ -89,9 +89,9 @@ before it is closed (#316).
 Kept equal to [`DEFAULT_READ_HEADER_TIMEOUT_SECONDS`](@ref Nitro.Core.Constants.DEFAULT_READ_HEADER_TIMEOUT_SECONDS)
 on purpose. On HTTP/1.1 HTTP.jl 2.7 overwrites this deadline with the header deadline before it
 can fire, so on the connections a browser or a reverse proxy actually opens, the header timeout
-*is* the idle limit. This value applies to cleartext HTTP/2, and to HTTP/1.1 when
-`read_header_timeout` is `0`: then nothing overwrites it, and it bounds the wait for the next
-request's head instead. Either way Nitro clears it once a head has arrived, so it never reaches
+*is* the idle limit. This value applies to cleartext HTTP/2, and to HTTP/1.1 when both
+`read_header_timeout` and `read_timeout` are `0`: then nothing overwrites it, and it bounds the
+wait for the next request's head instead. Either way Nitro clears it once a head has arrived, so it never reaches
 into a request body. Equal values mean none of these cases changes behavior.
 """
 const DEFAULT_IDLE_TIMEOUT_SECONDS :: Float64 = 120.0

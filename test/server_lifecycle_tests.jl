@@ -396,6 +396,8 @@ end
                (; read_timeout_ns = 1.5), (; write_timeout_ns = true),
                # `typemax(Int64)` ns, as seconds, rounds up to 2^63 ns: one past what fits.
                (; idle_timeout = typemax(Int64) / 1.0e9),
+               # Past Int128 once scaled, and past Float64: still an ArgumentError, not InexactError.
+               (; read_header_timeout = 1e30), (; write_timeout = big"1e400"),
                (; read_header_timeout_ns = typemax(UInt64)),
                # Two spellings of one timeout, each carrying a value.
                (; read_header_timeout = 5, read_header_timeout_ns = 10^9),

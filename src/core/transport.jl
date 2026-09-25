@@ -783,7 +783,7 @@ function _clear_header_deadline!(stream::HTTP.Stream)::Nothing
         # anyway — so it must not become an error of its own; HTTP's `_clear_deadlines!` ignores
         # the same failure. Structural breakage (a renamed method, a changed signature) cannot
         # hide here: the canary above fails first.
-        err isa InterruptException && rethrow()
+        Errors.is_unrecoverable(err) && rethrow()
     end
     return nothing
 end

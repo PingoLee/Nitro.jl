@@ -642,9 +642,12 @@ const _SERVER_TIMEOUT_NS_KWARGS = (:read_header_timeout_ns, :read_timeout_ns, :i
 function _validate_server_timeouts(kwargs)
     for (name, value) in pairs(kwargs)
         if name in _SERVER_TIMEOUT_KWARGS
+            # Compared in Float64, as HTTP.jl converts it: `Float64(value) * 1e9` must stay below
+            # 2^63 to round into `Int64` nanoseconds. Rounding first would throw `InexactError`
+            # rather than this `ArgumentError` for a value near 1e30, or a `BigFloat` past Float64.
             value === nothing ||
-                (value isa Real && !(value isa Bool) && isfinite(value) && value >= 0 &&
-                 round(Int128, Float64(value) * 1.0e9) <= typemax(Int64)) ||
+                (value isa Real && !(value isa Bool) && isfinite(Float64(value)) && value >= 0 &&
+                 Float64(value) * 1.0e9 < 2.0^63) ||
                 throw(ArgumentError("`$name` must be a finite number of seconds >= 0, or " *
                     "`nothing` (`0` and `nothing` both disable it), got $(repr(value))"))
         elseif name in _SERVER_TIMEOUT_NS_KWARGS
