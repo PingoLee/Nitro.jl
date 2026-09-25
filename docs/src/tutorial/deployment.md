@@ -110,12 +110,29 @@ serve(app; max_body_bytes = 16 * 1024^2, max_concurrent_requests = 64)
 ```
 
 A request that arrives with the limit already in flight is answered `503` with `Retry-After: 1`
-before its body is read, and its connection is closed. Each HTTP/2 stream counts as one request.
-A request holds its slot while its body is read, its handler runs and a buffered response is
-written. A streaming response (`Res.sse`, a streamed `Res.file`) gives the slot back once it starts
-streaming, because it holds little memory and can stay open for hours. A **WebSocket** holds its
-slot for its whole lifetime, and so does a `STREAM` handler, so leave room for those in the
+before its body is read; on HTTP/1.1 its connection is then closed. Each HTTP/2 stream counts as
+one request. A request holds its slot while its body is read, its handler runs and its response is
+written to the socket. That includes a streamed `Res.file`: it has a length, and HTTP.jl buffers a
+response with a length whole on HTTP/1.1, so a large download counts against memory like any other
+response. Only a response with no length — `Res.sse` — gives its slot back once it starts
+streaming, because it holds one chunk at a time and can stay open for hours. A **WebSocket** holds
+its slot for its whole lifetime, and so does a `STREAM` handler, so leave room for those in the
 number.
+
+The cap bounds how many requests are held, not for how long. With `read_timeout` off (the default),
+a client that sends a head and then trickles its body holds a slot as long as it likes, and without
+`write_timeout` so does one that stops reading its response; a handful of such clients can hold
+every slot, and everyone else gets `503`s. Behind nginx with its default request and response
+buffering, Nitro never sees a slow client. **Exposed directly, set both timeouts with the cap:**
+
+```julia
+serve(app; max_concurrent_requests = 64, read_timeout = 60, write_timeout = 30)
+```
+
+`write_timeout` bounds each write to the socket, which is not the same unit for every response. A
+response with a length goes out on HTTP/1.1 as **one** write at the end, so for it the timeout
+bounds the whole transfer: size it for your largest download to your slowest client. An `Res.sse`
+stream writes once per event, so only an event that stalls is cut.
 
 In front of Nitro, nginx's `max_conns` on the `upstream` block's `server` line is the proxy-side
 equivalent. Open-source nginx has no queue behind it, so requests over its limit get a `502`

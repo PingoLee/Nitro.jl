@@ -372,6 +372,32 @@ _release_response_body!(_) = nothing
 # has already declared its intent, and eating an RST is the correct outcome for it.
 const _MAX_SWALLOW_BYTES = 2 * 1024 * 1024
 
+# ...and how long to spend on it (#298). The byte budget bounds how much a refusal reads, not how
+# long it waits: a client that declares a body and then sends it slowly, or never, held the refusal
+# open for as long as it liked, since no deadline is armed once the head has been parsed (#316).
+# For a 413 that also held a `max_concurrent_requests` slot. Five seconds is nginx's
+# `lingering_timeout` default, its name for this same wait. Past it the close goes ahead, and a
+# client with unread data in flight eats an RST, as it does past the byte budget.
+const _SWALLOW_TIMEOUT_NS = Int64(5_000_000_000)
+
+# Arm that bound before swallowing. HTTP/1.1 only, for the reason `_clear_header_deadline!` gives:
+# an HTTP/2 connection's read deadline belongs to its frame loop, not to one stream. It can
+# lengthen a caller's shorter `read_timeout` by at most those five seconds, on a request that is
+# already being refused.
+function _bound_swallow!(stream::HTTP.Stream)::Nothing
+    getfield(stream, :h2_conn) === nothing || return nothing
+    tracked = getfield(stream, :tracked)
+    tracked === nothing && return nothing
+    try
+        # An absolute `time_ns()` deadline — Reseau's contract for `set_read_deadline!`.
+        HTTP._set_read_deadline!(getfield(tracked, :conn), Int64(time_ns()) + _SWALLOW_TIMEOUT_NS)
+    catch err
+        # Same tolerance as `_clear_header_deadline!`: a connection closing underneath us.
+        err isa InterruptException && rethrow()
+    end
+    return nothing
+end
+
 function _swallow_request_body!(stream::HTTP.Stream, budget::Int)
     scratch = Vector{UInt8}(undef, min(budget, _STREAM_CHUNK_BYTES))
     spent = 0
@@ -449,7 +475,10 @@ function _send_rejection!(stream::HTTP.Stream, resp::HTTP.Response, drain::Bool)
     # keeps the two in legal order, and in every reachable combination the continue is either a
     # no-op (no `Expect` header, or already sent during the read) or skipped entirely (`drain`
     # is false precisely when the client is still waiting for it).
-    drain && _swallow_request_body!(stream, _MAX_SWALLOW_BYTES)
+    if drain
+        _bound_swallow!(stream)
+        _swallow_request_body!(stream, _MAX_SWALLOW_BYTES)
+    end
 
     resp.close = true
     stream.response = resp
@@ -493,6 +522,30 @@ _is_streaming_body(::HTTP.BytesBody) = false
 _is_streaming_body(::HTTP.EmptyBody) = false
 _is_streaming_body(::HTTP.AbstractBody) = true
 _is_streaming_body(_) = false
+
+# Whether a response may hand its `max_concurrent_requests` slot back before it is written (#298):
+# a streaming body with NO declared length, and nothing else. HTTP.jl 2.7 writes such a body to the
+# socket live, one chunk at a time, so it holds one chunk however long it runs — an SSE stream.
+# A response with a length is framed FIXED, and on HTTP/1.1 HTTP.jl buffers a FIXED body WHOLE in
+# the stream (`_server_stream_buffered_fixed_h1`) and only puts it on the wire at `closewrite`. That
+# includes a streamed `Res.file`, which `servecontent` gives a `Content-Length`: its cursor is read
+# into that buffer in full. Releasing early there would free the slot while the whole file is live.
+_releases_slot_early(resp::HTTP.Response)::Bool =
+    _is_streaming_body(resp.body) && resp.content_length < 0 && !HTTP.hasheader(resp, "Content-Length")
+
+# Take one of `limit` slots, or report that none is free (#298). A compare-and-swap loop, not
+# add-then-undo: `atomic_add!` followed by a compensating `atomic_sub!` briefly counts a request
+# that is being refused, so a concurrent request arriving in that window could see the cap reached
+# with a slot actually free, and be refused as well.
+function _try_acquire_slot!(in_flight::Threads.Atomic{Int64}, limit::Int64)::Bool
+    current = in_flight[]
+    while current < limit
+        seen = Threads.atomic_cas!(in_flight, current, current + one(Int64))
+        seen == current && return true
+        current = seen
+    end
+    return false
+end
 
 # A `HEAD` response carries the `Content-Length` the same `GET` would (RFC 9110 §9.3.2) (#146).
 #
@@ -544,11 +597,18 @@ end
 # The permit is taken BEFORE `_http_stream_request` reads the body — that ordering is what makes it
 # bound body memory — with a lock-free try-acquire, and a request over the cap is answered 503 at
 # once rather than queued (a queue would hold the descriptors the cap exists to bound). It covers
-# the body read, the handler, and the write of a buffered response. A STREAMING response gives it
-# back as soon as the head is ready: an SSE stream or a streamed file holds little memory by design
-# and can last as long as the client likes, and counting it would let a few hundred idle event
-# streams starve every other request. A WebSocket, and a raw `STREAM` handler, run *inside* the
-# handler and therefore hold their permit for their whole lifetime.
+# the body read, the handler, and the response's write TO THE SOCKET: on HTTP/1.1 HTTP.jl buffers a
+# fixed-length response whole and sends it only at `closewrite`, so the handler calls `closewrite`
+# itself while the slot is held rather than leaving it to HTTP's loop after the slot is gone. A
+# streaming response with no declared length gives the slot back as soon as its head is ready (see
+# `_releases_slot_early`): an SSE stream holds one chunk however long it runs, and counting it would
+# let a few hundred idle event streams starve every other request. A WebSocket, and a raw `STREAM`
+# handler, run *inside* the handler and therefore hold their permit for their whole lifetime.
+#
+# What the permit does NOT bound is time. With `read_timeout` unset (the default, #316), a client
+# that sends a head and then trickles its body holds a slot as long as it likes, and without
+# `write_timeout` so does one that stops reading its response. Behind a buffering proxy neither
+# happens; exposed directly, set both alongside the cap — the `serve` docstring says so.
 function stream_handler(middleware::Function; max_body_bytes::Int64 = DEFAULT_MAX_BODY_BYTES,
                         max_concurrent_requests::Int64 = zero(Int64))
     in_flight = Threads.Atomic{Int64}(0)
@@ -556,10 +616,8 @@ function stream_handler(middleware::Function; max_body_bytes::Int64 = DEFAULT_MA
         # Released exactly once: early for a streaming body, otherwise by the outer `finally`.
         held = false
         if max_concurrent_requests > 0
-            if Threads.atomic_add!(in_flight, one(Int64)) >= max_concurrent_requests
-                Threads.atomic_sub!(in_flight, one(Int64))
+            _try_acquire_slot!(in_flight, max_concurrent_requests) ||
                 return _reject_over_capacity!(stream, max_concurrent_requests)
-            end
             held = true
         end
         try
@@ -612,15 +670,25 @@ function stream_handler(middleware::Function; max_body_bytes::Int64 = DEFAULT_MA
                     # branches on makes that unrepresentable. `_reject_oversized_body!` above already
                     # reads it the same way.
                     if stream.message.method != "HEAD"
-                        # A streaming body hands its permit back here, before a write that can last
-                        # as long as the client stays connected (#298; see above `stream_handler`).
-                        if held && _is_streaming_body(resp.body)
+                        # A streaming body with no declared length hands its permit back here,
+                        # before a write that can last as long as the client stays connected
+                        # (#298; see `_releases_slot_early` and above `stream_handler`).
+                        if held && _releases_slot_early(resp)
                             Threads.atomic_sub!(in_flight, one(Int64))
                             held = false
                         end
                         _write_response_body!(stream, resp.body)
                     end
                 end
+                # Put the response on the wire while the slot is still held (#298). On HTTP/1.1 a
+                # fixed-length response is buffered whole and only reaches the socket here; left to
+                # HTTP's loop, this ran after the slot was released, with the buffered response — and
+                # the request body `resp.request` pins — still live. `closewrite` is idempotent (HTTP
+                # returns at once when writes are already closed), so the loop's own call is then a
+                # no-op, and its errors are classified exactly as before: this runs inside the same
+                # `try` in HTTP's loop that the handler does. Only when a slot is held — without a cap,
+                # HTTP's loop keeps doing this exactly as it always has.
+                held && HTTP.closewrite(stream)
             finally
                 # Idempotent, and a no-op for the buffered bodies that are the overwhelming majority.
                 # `_write_response_body!` has usually already done this — releasing as soon as the body

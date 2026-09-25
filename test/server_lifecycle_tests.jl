@@ -595,6 +595,38 @@ end
     end
 end
 
+@testset "only a streaming body with no length releases its slot early" begin
+    sse = Nitro.Res.sse()
+    try
+        @test Nitro.Core._releases_slot_early(sse)
+    finally
+        close(sse.body)
+    end
+    @test !Nitro.Core._releases_slot_early(HTTP.Response(200, "buffered"))
+    # A streamed file is a cursor, but it has a Content-Length, and HTTP.jl buffers a response
+    # with a length WHOLE on HTTP/1.1 — so it must keep its slot until it is on the wire.
+    path_ = tempname()
+    write(path_, rand(UInt8, 1024))
+    streamed = Nitro.Res.file(HTTP.Request("GET", "/f"), path_; stream = true)
+    try
+        @test Nitro.Core._is_streaming_body(streamed.body)
+        @test !Nitro.Core._releases_slot_early(streamed)
+    finally
+        Nitro.Core._release_response_body!(streamed.body)
+        rm(path_; force = true)
+    end
+end
+
+@testset "_try_acquire_slot! never exceeds the limit and never over-counts" begin
+    counter = Threads.Atomic{Int64}(0)
+    @test Nitro.Core._try_acquire_slot!(counter, Int64(2))
+    @test Nitro.Core._try_acquire_slot!(counter, Int64(2))
+    @test !Nitro.Core._try_acquire_slot!(counter, Int64(2))
+    @test counter[] == 2          # a refusal leaves no trace, not even a transient one
+    Threads.atomic_sub!(counter, Int64(1))
+    @test Nitro.Core._try_acquire_slot!(counter, Int64(2))
+end
+
 """
 A context whose `/park` handler signals `entered` and then blocks until `release` is notified,
 so one request can be held in flight on purpose. `/ok` and `/events` answer at once, and
@@ -602,7 +634,11 @@ so one request can be held in flight on purpose. `/ok` and `/events` answer at o
 """
 function _capacity_context(entered::Threads.Atomic{Bool}, release::Base.Event)
     ctx = Nitro.Core.App()
+    # Far more than a loopback socket buffers, so a client that does not read it leaves the
+    # server's write blocked. Allocated once; a `Vector{UInt8}` body is written non-destructively.
+    big = fill(UInt8('x'), 48 * 1024 * 1024)
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+        path("/big", req -> HTTP.Response(200, big); method = "GET"),
         path("/park", function(req)
             entered[] = true
             wait(release)
@@ -677,6 +713,67 @@ end
         @test startswith(_get(port, "/ok"), "HTTP/1.1 200")
     finally
         notify(release)
+        Nitro.Core.terminate(ctx)
+    end
+end
+
+@testset "a buffered response holds its slot until it is on the wire" begin
+    # Review finding on #298. On HTTP/1.1 HTTP.jl buffers a fixed-length response whole and sends
+    # it at `closewrite`, which its loop ran AFTER `stream_handler` returned and the slot was
+    # released — so a client that stopped reading held the whole response, and the request body
+    # it pins, with its slot already free. Unpatched, the `/ok` below is a 200.
+    entered, release = Threads.Atomic{Bool}(false), Base.Event()
+    ctx = _capacity_context(entered, release)
+    port = get_free_port()
+    _serve(ctx, port; max_concurrent_requests = 1)
+    sock = nothing
+    try
+        sock = Sockets.connect(Sockets.localhost, port)
+        write(sock, "GET /big HTTP/1.1\r\nHost: $HOST\r\nConnection: close\r\n\r\n")
+        flush(sock)
+        # Read nothing. The handler returns at once; the 48 MiB write then stalls on a full socket.
+        sleep(1.5)
+        @test startswith(_get(port, "/ok"), "HTTP/1.1 503")
+        close(sock)                 # the write fails, and the slot comes back
+        sock = nothing
+        @test timedwait(() -> startswith(_get(port, "/ok"), "HTTP/1.1 200"), 20.0;
+                        pollint = 0.25) === :ok
+    finally
+        isnothing(sock) || close(sock)
+        notify(release)
+        Nitro.Core.terminate(ctx)
+    end
+end
+
+@testset "a refusal does not wait forever for a body that never comes" begin
+    # Review finding on #298. The swallow before a 413 or 503 was bounded in bytes but not in
+    # time, and no deadline is armed after the head (#316). A client declaring a body and never
+    # sending it held the refusal open — for the 413, inside a slot. Unpatched, neither refusal
+    # below is ever written, and each read gives up at 15 seconds.
+    entered, release = Threads.Atomic{Bool}(false), Base.Event()
+    ctx = _capacity_context(entered, release)
+    port = get_free_port()
+    _serve(ctx, port; max_concurrent_requests = 1)
+    parked = nothing
+    try
+        # The 413: a declared length over `max_body_bytes`, no `Expect`, and no body.
+        big = "POST /echo HTTP/1.1\r\nHost: $HOST\r\nContent-Length: 999999999999\r\n" *
+              "Connection: close\r\n\r\n"
+        t0 = time()
+        @test startswith(_raw_exchange(port, [big]), "HTTP/1.1 413")
+        @test time() - t0 < 12.0
+        @test startswith(_get(port, "/ok"), "HTTP/1.1 200")   # and its slot came back
+
+        # The 503: the slot is held, and the refused request declares a body it never sends.
+        parked = @async _get(port, "/park")
+        @test timedwait(() -> entered[], 20.0; pollint = 0.02) === :ok
+        head = "POST /echo HTTP/1.1\r\nHost: $HOST\r\nContent-Length: 100\r\nConnection: close\r\n\r\n"
+        t0 = time()
+        @test startswith(_raw_exchange(port, [head]), "HTTP/1.1 503")
+        @test time() - t0 < 12.0
+    finally
+        notify(release)
+        isnothing(parked) || timedwait(() -> istaskdone(parked), 20.0)
         Nitro.Core.terminate(ctx)
     end
 end

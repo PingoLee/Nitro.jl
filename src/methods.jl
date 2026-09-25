@@ -90,17 +90,24 @@ is explicit introspection, not accidental disclosure.)
   request (`DEFAULT_MAX_FIELDS`).
 - `max_concurrent_requests=nothing`: ceiling on how many requests this server holds at once
   (#298). `nothing` means no limit. When it is set, a request arriving with that many already in
-  flight is answered **503** with `Retry-After: 1` **before its body is read**, and its
-  connection is closed. Nothing else bounds this: `--threads` limits how many requests *compute*
-  at once, not how many are open, because a request waiting on a slow body yields its thread. So
-  this is the only setting that bounds the request-body memory held at once — at most
-  `max_concurrent_requests × max_body_bytes`, which no GC target can reclaim because it is live.
-  Each HTTP/2 stream counts as one request. A request holds its slot while its body is read,
-  its handler runs, and a buffered response is written. A streaming response (`Res.sse`, a
-  streamed `Res.file`) gives the slot back once it starts streaming, but a WebSocket or a
-  `STREAM` handler holds it for its whole lifetime. Throws with a custom `handler`, like
-  `max_body_bytes`. The refusal happens before any middleware runs, so it produces no access-log
-  line (one warning is logged the first time).
+  flight is answered **503** with `Retry-After: 1` **before its body is read**; on HTTP/1.1 its
+  connection is then closed, on HTTP/2 only its stream ends. Nothing else bounds this:
+  `--threads` limits how many requests *compute* at once, not how many are open, because a
+  request waiting on a slow body yields its thread. So this is the only setting that bounds the
+  request-body memory held at once — at most `max_concurrent_requests × max_body_bytes`, which no
+  GC target can reclaim because it is live. Each HTTP/2 stream counts as one request. A request
+  holds its slot while its body is read, its handler runs, and its response is written to the
+  socket — including a streamed `Res.file`, which HTTP.jl buffers whole on HTTP/1.1 because it
+  has a length. A response with no length (`Res.sse`) gives the slot back once it starts
+  streaming. A WebSocket or a `STREAM` handler holds its slot for its whole lifetime.
+
+  The slot bounds how many, not for how long. With `read_timeout` unset, a client that sends a
+  head and then trickles its body holds a slot as long as it likes, and without `write_timeout`
+  so does one that stops reading its response — so a handful of slow clients can hold every
+  slot. Behind a proxy that buffers requests and responses (nginx's default), neither happens;
+  **exposed directly, set both timeouts alongside the cap.** Throws with a custom `handler`,
+  like `max_body_bytes`. The refusal happens before any middleware runs, so it produces no
+  access-log line (one warning is logged the first time).
 - `reuseaddr`: forwarded to `HTTP.listen!`. Defaults to `true` on Linux/macOS, where it
   allows rebinding a port still in `TIME_WAIT`, and to **`false` on Windows**, where
   `SO_REUSEADDR` instead lets a second process bind a port another is actively listening
@@ -120,8 +127,10 @@ is explicit introspection, not accidental disclosure.)
   `read_timeout` is one deadline for the body *and* every read the handler makes, counted from
   the end of the head, and answers **408** when it fires; on HTTP/2 it is instead the longest
   gap between frames from the client, which a quiet SSE stream can exceed. `write_timeout`
-  limits each single write, not the whole response, so a long stream only fails on a write that
-  stalls.
+  limits each write to the socket. For a response with a length, HTTP.jl sends the whole body
+  as one write on HTTP/1.1, so there it bounds the entire transfer — size it for the largest
+  download to the slowest client. For `Res.sse` it bounds each event, so a long stream fails
+  only on an event that stalls.
 
   Every timeout is in seconds (any real `>= 0`); `0` or `nothing` disables it. Each also takes a
   `_ns` spelling in integer nanoseconds (`read_header_timeout_ns = …`), and passing one suppresses
