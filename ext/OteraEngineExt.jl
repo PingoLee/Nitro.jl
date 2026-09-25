@@ -18,6 +18,11 @@ Returns a function that takes a dictionary `data` (default is an empty dictionar
 optional `status`, `headers`, and `template_kwargs`, and returns an HTTP Response object
 with the rendered content.
 
+The response's `Content-Type` is a `Content-Type` in the per-call `headers` if there is one, else
+`mime_type`, else a type sniffed from the rendered output (see `Nitro.Util.response`). Sniffing
+never overrides a type you set. Rendered output is markup: escape user-influenced data, or serve
+it with a non-markup type.
+
 To get more info read the docs here: https://github.com/MommaWatasu/OteraEngine.jl
 """
 function otera(template::String; mime_type=nothing, from_file=false, kwargs...)
@@ -42,8 +47,7 @@ function otera(template::String; mime_type=nothing, from_file=false, kwargs...)
             combined_kwargs[:init] = data
         end
         content = tmp(; combined_kwargs...)
-        resp_headers = mime_is_known ? [["Content-Type" => mime_type]; headers] : headers
-        response(content, status, resp_headers; detect=!mime_is_known)
+        response(content, status, headers; content_type=mime_type)
     end
 end
 
@@ -59,7 +63,6 @@ To get more info read the docs here: https://github.com/MommaWatasu/OteraEngine.
 """
 function otera(file::IO; mime_type=nothing, kwargs...)
     template = read(file, String)
-    mime_is_known = !isnothing(mime_type)
     tmp = Template(template, path=false; kwargs...)
     
     return function(data = nothing; status=200, headers=[], template_kwargs...)
@@ -68,8 +71,7 @@ function otera(file::IO; mime_type=nothing, kwargs...)
             combined_kwargs[:init] = data
         end
         content = tmp(; combined_kwargs...)
-        resp_headers = mime_is_known ? [["Content-Type" => mime_type]; headers] : headers
-        response(content, status, resp_headers; detect=!mime_is_known)
+        response(content, status, headers; content_type=mime_type)
     end
 end
 

@@ -85,7 +85,16 @@ user_path = url("user-detail"; id=42)
 # "/users/42"
 ```
 
-Nitro substitutes the `{param}` placeholders from the registered route pattern. It raises an `ArgumentError` if the route name does not exist, if a required parameter is missing, or if extra keyword arguments are provided.
+Nitro substitutes the `{param}` placeholders from the registered route pattern, percent-escaping each value. It raises an `ArgumentError` if the route name does not exist, if a required parameter is missing, or if extra keyword arguments are provided.
+
+It also raises one for a value the route itself would not accept, the way Django's `reverse()` does:
+
+- `""`, `"."` or `".."` for any parameter. None of these is a path segment. An empty value at the start of `/{org}/{page}` would build `//evil.example`, which browsers read as a link to another host, so an open redirect once it reaches `Res.redirect`.
+- For a converter parameter, a value that does not parse as the converter's type: `url("user-detail"; id="abc")` throws, and `id=42` and `id="42"` both build `/users/42`.
+
+```julia
+url("user-detail"; id="abc")   # ArgumentError: ... does not match its Int converter
+```
 
 ## Using brackets `{name}`
 

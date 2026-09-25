@@ -6,7 +6,7 @@ using HTTP: Server, Router
 using ..Types
 # Unexported from `Types` on purpose: `CopyOnWriteDict` is internal plumbing for `compose`,
 # so it is named explicitly here rather than widened onto `Core`'s reexport surface.
-using ..Types: CopyOnWriteDict, RouteMiddleware
+using ..Types: CopyOnWriteDict, RouteMiddleware, NamedRoute
 using ..Constants: SHUTDOWN_TIMEOUT_SECONDS, DEFAULT_MAX_FIELDS
 
 export App, EagerReviseService, Service, wait, close, isopen
@@ -27,7 +27,7 @@ end
     server              :: Ref{Nullable{Server}}    = Ref{Nullable{Server}}(nothing)
     router              :: Router                   = Router()
     custommiddleware    :: CopyOnWriteDict{RouteMiddleware} = CopyOnWriteDict{RouteMiddleware}()
-    named_routes        :: Dict{String, String}     = Dict{String, String}()
+    named_routes        :: Dict{String, NamedRoute} = Dict{String, NamedRoute}()
     external_url        :: Ref{Nullable{String}}    = Ref{Nullable{String}}(nothing)
     prefix              :: Ref{Nullable{String}}    = Ref{Nullable{String}}(nothing)
     eager_revise        :: Ref{Nullable{EagerReviseService}} = Ref{Nullable{EagerReviseService}}(nothing)
