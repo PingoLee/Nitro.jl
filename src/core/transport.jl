@@ -393,7 +393,7 @@ function _bound_swallow!(stream::HTTP.Stream)::Nothing
         HTTP._set_read_deadline!(getfield(tracked, :conn), Int64(time_ns()) + _SWALLOW_TIMEOUT_NS)
     catch err
         # Same tolerance as `_clear_header_deadline!`: a connection closing underneath us.
-        err isa InterruptException && rethrow()
+        Errors.is_unrecoverable(err) && rethrow()
     end
     return nothing
 end
@@ -409,10 +409,12 @@ function _swallow_request_body!(stream::HTTP.Stream, budget::Int)
         end
     catch err
         # A client that disconnects while being swallowed is the expected case on this path, not an
-        # exceptional one — it is already being refused. Never let it mask the 413. An interrupt is
-        # not that: the janitor discipline in src/middleware/janitor.jl (#190) makes rethrowing it
-        # a house rule, and this runs on a request task where a Ctrl-C must still land.
-        err isa InterruptException && rethrow()
+        # exceptional one — it is already being refused, and since #298 so is one whose 5-second
+        # swallow deadline fires. Never let either mask the 413 or 503. An interrupt, a stack
+        # overflow or an out-of-memory is not that (#254, `is_unrecoverable`): the janitor
+        # discipline in src/middleware/janitor.jl (#190) makes rethrowing them a house rule, and this
+        # runs on a request task where a Ctrl-C must still land.
+        Errors.is_unrecoverable(err) && rethrow()
     end
     return nothing
 end

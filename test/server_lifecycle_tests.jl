@@ -624,23 +624,22 @@ end
     @test Nitro.Core._try_acquire_slot!(counter, Int64(2))
     @test Nitro.Core._try_acquire_slot!(counter, Int64(2))
     @test !Nitro.Core._try_acquire_slot!(counter, Int64(2))
-    @test counter[] == 2          # a refusal leaves no trace, not even a transient one
+    @test counter[] == 2          # a refusal leaves the count where it was
     Threads.atomic_sub!(counter, Int64(1))
     @test Nitro.Core._try_acquire_slot!(counter, Int64(2))
 end
 
 """
 A context whose `/park` handler signals `entered` and then blocks until `release` is notified,
-so one request can be held in flight on purpose. `/ok` and `/events` answer at once, and
-`/boom` throws inside the handler.
+so one request can be held in flight on purpose. `/ok`, `/echo` and `/events` answer at once,
+`/boom` throws inside the handler, and `/big` returns a 48 MiB buffered body.
 """
 function _capacity_context(entered::Threads.Atomic{Bool}, release::Base.Event)
     ctx = Nitro.Core.App()
-    # Far more than a loopback socket buffers, so a client that does not read it leaves the
-    # server's write blocked. Allocated once; a `Vector{UInt8}` body is written non-destructively.
-    big = fill(UInt8('x'), 48 * 1024 * 1024)
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
-        path("/big", req -> HTTP.Response(200, big); method = "GET"),
+        # Far more than a loopback socket buffers, so a client that does not read it leaves the
+        # server's write blocked. Built per request, so only the one testset that asks for it pays.
+        path("/big", req -> HTTP.Response(200, fill(UInt8('x'), 48 * 1024 * 1024)); method = "GET"),
         path("/park", function(req)
             entered[] = true
             wait(release)
@@ -791,10 +790,13 @@ end
         write(sock, "GET /events HTTP/1.1\r\nHost: $HOST\r\nConnection: close\r\n\r\n")
         flush(sock)
         seen = IOBuffer()
-        reader = @async while !occursin("data: tick-2", String(copy(seen.data[1:seen.size])))
-            write(seen, readavailable(sock))
+        reader = @async while !occursin("data: tick-2", String(seen.data[1:seen.size]))
+            chunk = readavailable(sock)
+            isempty(chunk) && break      # the server closed early: stop, don't spin on EOF
+            write(seen, chunk)
         end
         @test timedwait(() -> istaskdone(reader), 20.0; pollint = 0.02) === :ok
+        @test occursin("data: tick-2", String(seen.data[1:seen.size]))   # live, not closed early
         # The stream is live (it runs ~4s) and the cap is 1, yet a second request is served.
         @test startswith(_get(port, "/ok"), "HTTP/1.1 200")
     finally
