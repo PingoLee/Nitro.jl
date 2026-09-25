@@ -634,12 +634,17 @@ A context whose `/park` handler signals `entered` and then blocks until `release
 so one request can be held in flight on purpose. `/ok`, `/echo` and `/events` answer at once,
 `/boom` throws inside the handler, and `/big` returns a 48 MiB buffered body.
 """
-function _capacity_context(entered::Threads.Atomic{Bool}, release::Base.Event)
+function _capacity_context(entered::Threads.Atomic{Bool}, release::Base.Event;
+                           big_entered::Threads.Atomic{Bool} = Threads.Atomic{Bool}(false))
     ctx = Nitro.Core.App()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
-        # Far more than a loopback socket buffers, so a client that does not read it leaves the
-        # server's write blocked. Built per request, so only the one testset that asks for it pays.
-        path("/big", req -> HTTP.Response(200, fill(UInt8('x'), 48 * 1024 * 1024)); method = "GET"),
+        # More than a Linux or macOS loopback socket buffers, so a client that does not read it
+        # leaves the server's write blocked. Built per request, so only the testset that asks
+        # for it pays. `big_entered` says the handler — and so the slot — has been reached.
+        path("/big", function(req)
+            big_entered[] = true
+            return HTTP.Response(200, fill(UInt8('x'), 48 * 1024 * 1024))
+        end; method = "GET"),
         path("/park", function(req)
             entered[] = true
             wait(release)
@@ -724,18 +729,32 @@ end
     # released — so a client that stopped reading held the whole response, and the request body
     # it pins, with its slot already free. Unpatched, the `/ok` below is a 200.
     entered, release = Threads.Atomic{Bool}(false), Base.Event()
-    ctx = _capacity_context(entered, release)
+    big_entered = Threads.Atomic{Bool}(false)
+    ctx = _capacity_context(entered, release; big_entered)
     port = get_free_port()
-    _serve(ctx, port; max_concurrent_requests = 1)
+    srv = _serve(ctx, port; max_concurrent_requests = 1)
     sock = nothing
     try
         sock = Sockets.connect(Sockets.localhost, port)
         write(sock, "GET /big HTTP/1.1\r\nHost: $HOST\r\nConnection: close\r\n\r\n")
         flush(sock)
-        # Read nothing. The handler returns at once; the 48 MiB write then stalls on a full socket.
-        sleep(1.5)
-        @test startswith(_get(port, "/ok"), "HTTP/1.1 503")
-        close(sock)                 # the write fails, and the slot comes back
+        # Read nothing. Wait for the handler rather than a fixed sleep: a slow runner otherwise
+        # reaches `/ok` before `/big` has even taken the slot.
+        @test timedwait(() -> big_entered[], 20.0; pollint = 0.02) === :ok
+
+        # Whether the 48 MiB write actually stalled, observed on the server's own connection
+        # table: a `Connection: close` exchange whose write completed is untracked within
+        # moments, while a stalled one stays tracked for as long as the client does not read.
+        # Checked rather than assumed, because it is the platform's call, not Nitro's: Linux and
+        # macOS loopback sockets buffer a few MiB, but the first Windows CI run of this test
+        # served `/ok` while the write should have been blocked.
+        stalled = timedwait(() -> isempty(HTTP._server_conns(srv)), 2.0; pollint = 0.05) !== :ok
+        # Where the premise is known to hold, require it — this path must not go untested there.
+        Sys.iswindows() || @test stalled
+        # The assertion that discriminates, wherever the write is really in flight: unpatched,
+        # the slot was already released and this `/ok` is a 200.
+        stalled && @test startswith(_get(port, "/ok"), "HTTP/1.1 503")
+        close(sock)                 # the write fails (or already finished), and the slot comes back
         sock = nothing
         @test timedwait(() -> startswith(_get(port, "/ok"), "HTTP/1.1 200"), 20.0;
                         pollint = 0.25) === :ok
