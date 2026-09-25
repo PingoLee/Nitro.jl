@@ -4,7 +4,8 @@ using HTTP
 using Dates
 using JSON
 using UUIDs
-using ...Types: AbstractSessionStore, MemoryStore, SessionPayload, Nullable, is_expired
+using ...Types: AbstractSessionStore, MemoryStore, SessionPayload, Nullable, is_expired,
+    update_session!
 using ...Types: CookieConfig, LifecycleMiddleware
 using ..JanitorMiddleware: _janitor
 using ...Cookies: get_cookie, set_cookie!, storesession!, prunesessions!, regenerate_session!,
@@ -222,10 +223,24 @@ function SessionMiddleware(;
                 end
             end
 
-            session_changed = is_new || final_session_id != session_id || current_session != original_session
-            if session_changed
+            # An id minted during THIS request -- a new visitor's, or one `regenerate_session!`
+            # rotated to -- is inserted. An id the request LOADED is written back update-only
+            # (#318): if a concurrent logout or rotation deleted it meanwhile, the write is
+            # dropped and the cookie is not re-set. Upserting it re-created the deleted session,
+            # so a stolen id outlived the logout meant to kill it and the browser was logged
+            # back in.
+            minted = is_new || final_session_id != session_id
+            if minted
                 _save_session(store, final_session_id, current_session, max_age)
+                session_written = true
+            elseif current_session != original_session
+                session_written = update_session!(store, final_session_id, current_session;
+                                                  ttl = max_age)
+            else
+                session_written = false
+            end
 
+            if session_written
                 # Own the headers before adding Set-Cookie: `response` may be a shared/`const`
                 # object (e.g. an auth-rejection response). Mutating it in place would attach
                 # this visitor's session cookie to every later request that returns the same
@@ -271,14 +286,18 @@ function _load_session(store::AbstractSessionStore{String, Dict{String,Any}}, se
         return Dict{String,Any}(), true
     end
 
+    # DEEP copies (#318). A shallow `copy` shared every nested value -- the docs' `cart` vector,
+    # a nested `Dict` -- between the store and every concurrent request of the session, which
+    # all mutated it at once: lost writes, and a corrupted `Dict` that threw on every later
+    # request. `PormGSessionStore` decodes fresh JSON per read and never had the bug.
     if payload isa SessionPayload
         if is_expired(payload)
             return Dict{String,Any}(), true
         end
-        return copy(payload.data), false
+        return deepcopy(payload.data), false
     end
 
-    data = payload isa AbstractDict ? copy(payload) : payload
+    data = payload isa AbstractDict ? deepcopy(payload) : payload
     return data, false
 end
 

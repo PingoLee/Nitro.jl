@@ -312,6 +312,103 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
         @test payload.data["custom_backend"] == true
     end
 
+    # ── #318: concurrent requests on one session ─────────────────────────────
+    #
+    # Both interleavings are replayed DETERMINISTICALLY by running the second request to
+    # completion from inside the first one's handler -- that is exactly the order the race
+    # produces, without depending on a scheduler to produce it.
+    @testset "a write to a session a concurrent logout deleted is dropped (#318)" begin
+        store = MemoryStore()
+        stolen = "stolen-session-id"
+        storesession!(store, stolen, Dict{String,Any}("user_id" => 42); ttl=3600)
+
+        mw = SessionMiddleware(cookie_name="sid", max_age=3600, store=store, secure=false).middleware
+
+        # B: the documented logout -- clear the payload, then rotate the id.
+        logout = mw(function (req::HTTP.Request)
+            empty!(getsession(req))
+            Nitro.regenerate_session!(req, store; ttl=3600)
+            return HTTP.Response(200, "bye")
+        end)
+
+        logout_response = Ref{HTTP.Response}()
+        # A: a slow request on the same session, still running when B logs out, that then writes
+        # to the session (a flash message after an upload, in the issue's words).
+        slow = mw(function (req::HTTP.Request)
+            logout_response[] = logout(HTTP.Request("POST", "/logout", ["Cookie" => "sid=$stolen"]))
+            getsession(req)["flash"] = "upload done"
+            return HTTP.Response(200, "uploaded")
+        end)
+
+        response = slow(HTTP.Request("POST", "/upload", ["Cookie" => "sid=$stolen"]))
+        @test response.status == 200
+
+        # The logged-out session stays dead: not re-created in the store, and not handed back to
+        # the browser. Before #318 both happened -- the upsert re-created `stolen` with
+        # `user_id = 42` and the response re-set `sid=stolen`, logging the browser back in.
+        @test Base.get(store, stolen, nothing) === nothing
+        @test isempty(filter(h -> lowercase(h.first) == "set-cookie", response.headers))
+
+        # B's own outcome is untouched: a fresh, empty session under a new id.
+        fresh = String(match(r"sid=([^;]+)", HTTP.header(logout_response[], "Set-Cookie")).captures[1])
+        @test fresh != stolen
+        @test Base.get(store, fresh, nothing).data == Dict{String,Any}()
+    end
+
+    @testset "same-session requests do not share nested values (#318)" begin
+        store = MemoryStore()
+        sid = "shared-cart-session"
+        storesession!(store, sid, Dict{String,Any}("cart" => [1]); ttl=3600)
+
+        mw = SessionMiddleware(cookie_name="sid", max_age=3600, store=store, secure=false).middleware
+        add_to_cart(item) = mw(function (req::HTTP.Request)
+            push!(getsession(req)["cart"], item)       # the docs' cart pattern, mutating in place
+            return HTTP.Response(200, "added")
+        end)
+
+        seen_by_first = Ref{Vector{Int}}()
+        first_request = mw(function (req::HTTP.Request)
+            cart = getsession(req)["cart"]
+            add_to_cart(2)(HTTP.Request("GET", "/add", ["Cookie" => "sid=$sid"]))
+            # A shallow copy on load made this the SAME vector the other request just pushed to.
+            seen_by_first[] = copy(cart)
+            return HTTP.Response(200, "read")
+        end)
+
+        first_request(HTTP.Request("GET", "/cart", ["Cookie" => "sid=$sid"]))
+        @test seen_by_first[] == [1]
+        @test Base.get(store, sid, nothing).data["cart"] == [1, 2]
+    end
+
+    # A smoke test, not the pin: the two testsets above are what fail against the unpatched code.
+    # On one thread this cannot race at all; under `-t 2` (CI runs both) the shallow copy it
+    # replaced threw `ConcurrencyViolationError`/`UndefRefError` in the audit's reproduction.
+    # Lost appends remain possible and correct -- a session is last-writer-wins -- so only
+    # integrity is asserted.
+    @testset "concurrent cart appends on one session stay well-formed (#318)" begin
+        store = MemoryStore()
+        sid = "hammered-session"
+        storesession!(store, sid, Dict{String,Any}("cart" => Int[]); ttl=3600)
+
+        mw = SessionMiddleware(cookie_name="sid", max_age=3600, store=store, secure=false).middleware
+        handler = mw(function (req::HTTP.Request)
+            cart = get(getsession(req), "cart", Int[])
+            push!(cart, parse(Int, HTTP.header(req, "X-Item")))
+            getsession(req)["cart"] = cart
+            return HTTP.Response(200, "ok")
+        end)
+
+        tasks = [Threads.@spawn handler(HTTP.Request("GET", "/add",
+                     ["Cookie" => "sid=$sid", "X-Item" => string(i)])) for i in 1:500]
+        statuses = [fetch(t).status for t in tasks]
+        @test all(==(200), statuses)
+
+        cart = Base.get(store, sid, nothing).data["cart"]
+        @test cart isa Vector{Int}
+        @test allunique(cart)
+        @test all(in(1:500), cart)
+    end
+
     # ── #171: no implicit process-global store ────────────────────────────────
     #
     # `const DEFAULT_STORE = MemoryStore{String, Dict{String,Any}}()` used to be the `store`

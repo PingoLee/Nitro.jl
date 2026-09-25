@@ -17,8 +17,8 @@ export Server, Nullable, Context,
     LifecycleMiddleware, startup, shutdown, require_fixed_period,
     Param, isrequired, LazyRequest, headers, pathparams, queryvars, jsonbody, formbody, textbody, multipartbody,
     CookieConfig, Cookie, Session, SessionPayload,
-    AbstractSessionStore, get_session, set_session!, delete_session!, cleanup_expired_sessions!,
-    is_expired,
+    AbstractSessionStore, get_session, set_session!, update_session!, delete_session!,
+    cleanup_expired_sessions!, is_expired,
     MemoryStore, Extractor, missing_session_methods,
     RouteDefinition, Principal
 
@@ -39,15 +39,22 @@ and `V` the payload type — the middleware pins both to `AbstractSessionStore{S
 |---|---|
 | `Base.get(store, session_id, default)` | The stored `SessionPayload`, or `default` when absent |
 | `set_session!(store, session_id, data; ttl::Int)` | Persist `data` under a fixed-point expiry, returns `data` |
+| `update_session!(store, session_id, data; ttl::Int)` | Overwrite an **existing, unexpired** session; `false` and no write otherwise |
 | `delete_session!(store, session_id)` | Remove one session |
 
 `Base.get` is easy to miss and is genuinely mandatory: both the generic `get_session` and the
-middleware's own load path call it directly. Each of the three has a fallback on this abstract type
+middleware's own load path call it directly. Each of the four has a fallback on this abstract type
 raising `StoreInterfaceError`, and [`missing_session_methods`](@ref) lists what a type still owes:
 
 ```julia
 @test isempty(missing_session_methods(MySessionStore))
 ```
+
+`update_session!` is separate from `set_session!` because the two must disagree about a row that
+has gone. `SessionMiddleware` writes an existing session back with `update_session!`, so a request
+that is still running when a concurrent logout deletes its session cannot re-create it (#318).
+Make the existence check and the write **one** atomic step — an `UPDATE … WHERE` in SQL, one lock
+hold in memory. A check followed by a separate write re-opens the race.
 
 # Optional
 
@@ -180,6 +187,26 @@ end
     store_contract_error(set_session!, AbstractSessionStore, 1, store, session_id, data)
 end
 
+"""
+    update_session!(store::AbstractSessionStore, session_id, data; ttl::Int) -> Bool
+
+Overwrite the session `session_id` with `data` and a fresh expiry `ttl` seconds from now, **only
+if** that session still exists and has not expired. Returns `true` when it wrote, and `false` when
+there was nothing to update. On `false` the store is left unchanged; it never creates a row.
+
+This is the write `SessionMiddleware` uses for a session the request **loaded**. `set_session!`
+upserts, so a request that was still running when a concurrent logout deleted its session used to
+bring the session back: the stolen id survived the logout meant to kill it, and the browser was
+logged back in (#318). With update-only semantics that write is dropped, and the middleware does
+not re-set the cookie. This is Django's `UpdateError` → `SessionInterrupted`.
+
+Required. Implement the check and the write as one atomic step — see
+[`AbstractSessionStore`](@ref).
+"""
+@noinline function update_session!(store::AbstractSessionStore, session_id, data; ttl::Int = 3600)
+    store_contract_error(update_session!, AbstractSessionStore, 1, store, session_id, data)
+end
+
 @noinline function delete_session!(store::AbstractSessionStore, session_id)
     store_contract_error(delete_session!, AbstractSessionStore, 1, store, session_id)
 end
@@ -191,7 +218,7 @@ The *required* half of the [`AbstractSessionStore`](@ref) contract as data, read
 [`missing_session_methods`](@ref) and by the fallbacks above. `cleanup_expired_sessions!` is absent
 on purpose — it is optional, and its default is the no-op below.
 """
-const SESSION_STORE_INTERFACE = (Base.get, set_session!, delete_session!)
+const SESSION_STORE_INTERFACE = (Base.get, set_session!, update_session!, delete_session!)
 
 """
     cleanup_expired_sessions!(store::AbstractSessionStore)
@@ -454,9 +481,14 @@ function Base.get(store::MemoryStore, key, default)
     end
 end
 
+# DEEP, not `copy` (#318). A shallow copy of a session dict still shares its nested values, so the
+# docs' own cart pattern -- `getsession(req)["cart"] = Int[]`, then `push!` -- had every concurrent
+# request of one session mutating ONE vector: lost appends, `ConcurrencyViolationError`, and a
+# nested `Dict` corrupted badly enough that every later request on the session threw. A stored
+# value must never be reachable from a request, in either direction.
 function _copy_session_value(value)
     if value isa AbstractDict || value isa AbstractArray
-        return copy(value)
+        return deepcopy(value)
     end
     return value
 end
@@ -476,11 +508,27 @@ function get_session(store::MemoryStore{K, V}, key::K) where {K, V}
     end
 end
 
+# Stores a deep copy (#318). `regenerate_session!` hands over the request's LIVE session dict and
+# the handler goes on mutating it, so storing it by reference let one request edit a stored
+# payload while another request was deep-copying it on load.
 function set_session!(store::MemoryStore{K, V}, key::K, value::V; ttl::Int = 3600) where {K, V}
+    stored = _copy_session_value(value)
     lock(store.lock) do
-        store.data[key] = SessionPayload(value, Dates.now(Dates.UTC) + Dates.Second(ttl))
+        store.data[key] = SessionPayload(stored, Dates.now(Dates.UTC) + Dates.Second(ttl))
     end
     return value
+end
+
+# The existence check and the write in ONE lock hold: a separate `get` then `set_session!`
+# re-opens the window a concurrent `delete_session!` resurrects through (#318).
+function update_session!(store::MemoryStore{K, V}, key::K, value::V; ttl::Int = 3600) where {K, V}
+    stored = _copy_session_value(value)
+    return lock(store.lock) do
+        payload = Base.get(store.data, key, nothing)
+        (payload === nothing || is_expired(payload)) && return false
+        store.data[key] = SessionPayload(stored, Dates.now(Dates.UTC) + Dates.Second(ttl))
+        return true
+    end
 end
 
 function delete_session!(store::MemoryStore{K, V}, key) where {K, V}

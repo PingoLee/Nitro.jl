@@ -23,6 +23,7 @@ regenerate_session!
 AbstractSessionStore
 MemoryStore
 is_expired
+Nitro.Core.Types.update_session!
 Nitro.Core.Types.cleanup_expired_sessions!
 Nitro.Core.Types.missing_session_methods
 Nitro.Errors.StoreInterfaceError

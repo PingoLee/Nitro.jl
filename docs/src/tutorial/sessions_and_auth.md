@@ -133,16 +133,24 @@ created on *and* the one every session query runs against, so the two can never 
 
 ### Custom Stores
 
-Three methods are **required** for your store type `S <: AbstractSessionStore{String, Dict{String,Any}}`:
+Four methods are **required** for your store type `S <: AbstractSessionStore{String, Dict{String,Any}}`:
 
 ```julia
-Base.get(store::S, session_id::String, default)        # → SessionPayload or default
-set_session!(store::S, session_id::String, data; ttl)  # → persist data with TTL
-delete_session!(store::S, session_id::String)          # → remove a session
+Base.get(store::S, session_id::String, default)           # → SessionPayload or default
+set_session!(store::S, session_id::String, data; ttl)     # → persist data with TTL (insert or overwrite)
+update_session!(store::S, session_id::String, data; ttl)  # → overwrite a LIVE session only; Bool
+delete_session!(store::S, session_id::String)             # → remove a session
 ```
 
 `Base.get` is easy to overlook and is not optional — both `get_session` and the session
 middleware's own load path call it directly.
+
+`update_session!` is how `SessionMiddleware` writes back a session the request loaded. It must
+write **only if** the session still exists and has not expired, and return `false` (writing
+nothing) otherwise. That is what stops a slow request from re-creating a session that a
+concurrent logout just deleted. Make the check and the write one atomic step (an
+`UPDATE … WHERE`, or one lock hold). A store *failure* must throw, not return `false`: `false`
+means "logged out" and the middleware drops the write.
 
 A fourth is **optional**:
 

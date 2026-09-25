@@ -16,7 +16,7 @@ using Nitro
 # thing it is a replica of -- it can only agree with itself.
 
 using Nitro.Types: AbstractSessionStore, SessionPayload, get_session, set_session!,
-                   delete_session!, cleanup_expired_sessions!, is_expired,
+                   update_session!, delete_session!, cleanup_expired_sessions!, is_expired,
                    missing_session_methods
 
 # ── Mock PormG row ───────────────────────────────────────────────────────
@@ -50,7 +50,7 @@ const PORMG_OPERATOR_NAMES = Set([
 
 # Every filter key the mock knows how to evaluate. Anything else is a query the mock is not
 # actually exercising, and must say so.
-const MODELLED_FILTER_KEYS = Set(["session_key", "expires_at__@lte"])
+const MODELLED_FILTER_KEYS = Set(["session_key", "expires_at__@lte", "expires_at__@gt"])
 
 function _reject_filter_key(k::String)
     parts = split(k, "__")
@@ -156,6 +156,10 @@ function _matching_keys_locked(qs::MockQuerySet)
         for (k, v) in filters
             if k == "session_key"
                 ok = row[:session_key] == v
+            elseif k == "expires_at__@gt"
+                # `update_session!`'s liveness condition (#318): the strict complement of the
+                # `__@lte` below, so the boundary instant is expired on both sides.
+                ok = row[:expires_at] > v
             else  # "expires_at__@lte"
                 # PormG's `lte` is `<=`, matching `is_expired`'s inclusive boundary
                 # (`src/types.jl`). Comparing instants here rather than PormG's canonical
@@ -436,6 +440,41 @@ end
         @test get_session(store, "sess-1") === nothing
     end
 
+    # #318: `set_session!` re-creates a missing row, so the middleware's write-back of a session a
+    # concurrent logout deleted brought it back. `update_session!` must be ONE conditional UPDATE.
+    @testset "update_session! updates a live row and never creates one (#318)" begin
+        m = MockModel()
+        s = RealPormGSessionStore(model=m)
+
+        # Absent -- the logout already deleted it. No row appears.
+        @test update_session!(s, "gone", Dict{String,Any}("user_id" => 42); ttl=3600) === false
+        @test !haskey(m._table, "gone")
+
+        # Expired -- matched by nothing, and left exactly as it was for the prune.
+        stale_expiry = Dates.now(Dates.UTC) - Dates.Second(5)
+        _seed_row!(m, "stale", Dict{String,Any}("user_id" => 1), stale_expiry)
+        @test update_session!(s, "stale", Dict{String,Any}("user_id" => 2); ttl=3600) === false
+        @test m._table["stale"][:expires_at] == stale_expiry
+        @test JSON.parse(m._table["stale"][:session_data])["user_id"] == 1
+
+        # Live -- overwritten in place, expiry moved to `ttl` from now.
+        set_session!(s, "live", Dict{String,Any}("v" => 1); ttl=10)
+        before = Dates.now(Dates.UTC)
+        queries_before = length(m._filters_seen)
+        @test update_session!(s, "live", Dict{String,Any}("v" => 2); ttl=90) === true
+        after = Dates.now(Dates.UTC)
+
+        # The liveness condition is in the SAME query as the write -- exactly one query, carrying
+        # both keys -- not a read first and a write after, which would re-open the race.
+        @test length(m._filters_seen) == queries_before + 1
+        update_filters = m._filters_seen[end]
+        @test update_filters["session_key"] == "live"
+        @test haskey(update_filters, "expires_at__@gt")
+
+        @test get_session(s, "live") == Dict{String,Any}("v" => 2)
+        @test before + Dates.Second(90) <= m._table["live"][:expires_at] <= after + Dates.Second(90)
+    end
+
     @testset "every query runs on the store's db_key, not the model's default (#199)" begin
         # The regression test for #199 proper. `pormg_nitro_session(db_key="sessions")` created
         # `nitro_session` on `sessions` and then read, wrote, deleted and pruned on whatever
@@ -462,6 +501,11 @@ end
         @test JSON.parse(m._tables["sessions"]["routed"][:session_data])["user_id"] == 8
         @test JSON.parse(m._tables["db"]["routed"][:session_data])["user_id"] == 999
         @test length(m._tables["sessions"]) == 1   # updated in place, on the right connection
+
+        # UPDATE-ONLY -- `update_session!` (#318) is a third write site.
+        @test update_session!(store, "routed", Dict{String,Any}("user_id" => 9); ttl=3600)
+        @test JSON.parse(m._tables["sessions"]["routed"][:session_data])["user_id"] == 9
+        @test JSON.parse(m._tables["db"]["routed"][:session_data])["user_id"] == 999
 
         # DELETE.
         delete_session!(store, "routed")
@@ -578,6 +622,9 @@ end
         Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
             # Writes rethrow: a caller that thinks it stored a session must not be told it did.
             @test_throws "mock persistence failure" set_session!(failing, "sess-err", Dict{String,Any}("user_id" => 1); ttl=3600)
+            # Not `false`: `false` means "the session is gone", and the middleware acts on it by
+            # dropping the write. A database outage is not a logout.
+            @test_throws "mock persistence failure" update_session!(failing, "sess-err", Dict{String,Any}("user_id" => 1); ttl=3600)
             @test_throws "mock persistence failure" delete_session!(failing, "sess-err")
 
             # Reads degrade to "no session" rather than throwing out of the request path.
