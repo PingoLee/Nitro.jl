@@ -132,9 +132,14 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
 
         # Directive names are case-insensitive, and several `Cache-Control` lines are one list:
         # they collapse into a single private line, with `public` gone from wherever it was.
+        # The `X-Other` between them is load-bearing: HTTP.jl merges ADJACENT same-name headers
+        # into one entry when it builds a response, so without it the middleware would only
+        # ever see one line.
         res = writing(["Cache-Control" => "PUBLIC, max-age=60"])(HTTP.Request("GET", "/"))
         @test headers_of(res, "Cache-Control") == ["private, max-age=60"]
-        res = writing(["Cache-Control" => "max-age=60", "Cache-Control" => "public, immutable"])(HTTP.Request("GET", "/"))
+        two_lines = ["Cache-Control" => "max-age=60", "X-Other" => "1", "Cache-Control" => "public, immutable"]
+        @test count(h -> lowercase(h.first) == "cache-control", HTTP.Response(200, two_lines, "").headers) == 2
+        res = writing(two_lines)(HTTP.Request("GET", "/"))
         @test headers_of(res, "Cache-Control") == ["private, max-age=60, immutable"]
 
         # The rotation path too: a handler-driven `regenerate_session!` on an existing session.
@@ -145,7 +150,8 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
             return HTTP.Response(200, ["Cache-Control" => "public, max-age=60"], "rotated")
         end)
         res = rotating(HTTP.Request("GET", "/", ["Cookie" => "cache_session=$sid0"]))
-        @test !occursin("cache_session=$sid0", HTTP.header(res, "Set-Cookie"))
+        @test occursin("cache_session=", HTTP.header(res, "Set-Cookie"))     # a cookie IS set...
+        @test !occursin("cache_session=$sid0", HTTP.header(res, "Set-Cookie"))   # ...for the new id
         @test headers_of(res, "Cache-Control") == ["private, max-age=60"]
         @test headers_of(res, "Vary") == ["Cookie"]
 
