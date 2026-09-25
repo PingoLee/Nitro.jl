@@ -1789,13 +1789,29 @@ else
             update_progress!(info, 0.0)
             set_task!(store5, info.id, info)  # DB row stuck at 0.0
 
+            # The live object of THE SAME RUN, as a real run registers it: the object it read
+            # from the store, so its `run_id` is the row's (`_claim_run!` checks exactly that).
+            # This fixture used to mint an independent `TaskInfo`, i.e. a different run, which the
+            # overlay then happily applied -- the #323 defect of serving one run's live state as
+            # another's. Since the overlay is run-fenced, the fixture has to say which run it is.
             live = TaskInfo("task-live"; queue_name="reports")
+            live.run_id = info.run_id
             live.status = RUNNING
             update_progress!(live, 73.0)
             Nitro.Workers.register_active_task_info!(rt_store5, live.id, live)
 
             listed = only(get_all_tasks(rt_store5, System(); status=RUNNING))
             @test listed.progress == 73.0
+
+            # ...and a live object of ANOTHER run under the same id overlays nothing (#323).
+            other = TaskInfo("task-live"; queue_name="reports")
+            other.status = CANCELLED
+            update_progress!(other, 99.0)
+            Nitro.Workers.register_active_task_info!(rt_store5, other.id, other)
+            stale = only(get_all_tasks(rt_store5, System(); status=RUNNING))
+            @test stale.progress == 0.0
+            @test stale.status == RUNNING
+            Nitro.Workers.register_active_task_info!(rt_store5, live.id, live)
 
             # The overlay is the RUNTIME's, so the raw store listing still reports the row --
             # which is what makes run-start and zombie recovery able to read durable state.

@@ -413,6 +413,13 @@ function get_all_tasks(runtime::WorkerRuntime, authority::TaskAuthority;
     for task_info in tasks
         running = Base.get(live, task_info.id, nothing)
         (running === nothing || running === task_info) && continue
+        # Only the SAME run's live object may overlay a record (#323). The live cache can hold a
+        # predecessor still executing after a re-run replaced the record -- in another process,
+        # or in another runtime over the same store -- and overlaying it copied that run's
+        # status, progress and result onto its successor. On `InMemoryWorkerStore` the listed
+        # objects ARE the stored records, so the overlay did not just misreport the successor: it
+        # overwrote it, permanently. `_visible_record` applies the same rule to single reads.
+        running.run_id == task_info.run_id || continue
         task_info.status = running.status
         @atomic task_info.progress = running.progress
         task_info.result = running.result

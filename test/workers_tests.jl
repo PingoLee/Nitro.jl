@@ -4227,6 +4227,16 @@ end
         seen = get_task_status(gid, Owner("bob"); runtime = rt1)
         @test seen[:status] == "COMPLETED"
         @test seen[:result] == "bob's"
+
+        # Alice is authorized on the live predecessor, and is still served HER run.
+        @test get_task_status(gid, Owner("alice"); runtime = rt1)[:status] == "CANCELLED"
+
+        # The listing path, under the same rule: listing through rt1 must not overlay alice's live
+        # run onto bob's record -- on this store that overlay OVERWROTE the stored record.
+        listed = only(get_all_tasks(Owner("bob"); runtime = rt1))
+        @test listed[:status] == "COMPLETED"
+        @test get_task_info(store, gid).status == COMPLETED
+        @test get_task_info(store, gid).result == "bob's"
     finally
         put!(gate, nothing)
         reset_runtime!(rt1)

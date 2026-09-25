@@ -480,8 +480,12 @@ _not_found() = Dict{Symbol, Any}(:error => "Task not found", :status => "NOT_FOU
 # is the same run, which keeps a cross-process grantee's progress bar live, as #96 requires.
 #
 # **One durable read on every refusal path.** A missing id and a foreign id both reach the durable
-# read exactly once and stop there, so the two do not differ in round-trips either -- a second read
-# only on the "exists but not yours" path would put the oracle back as a timing difference.
+# read exactly once and stop there, so they do not differ in ROUND-TRIPS -- a second read only on
+# the "exists but not yours" path would have put the oracle back as a gross timing difference.
+# They are not byte-for-byte equal in cost, though: a hit decodes the row (`result` included) and a
+# miss does not, so a large result is measurable over many probes, and a foreign row whose stored
+# JSON no longer decodes throws where a missing id answers NOT_FOUND. Closing that needs an
+# authorization read from a projection (`id`, `run_id`, `watchers`) before the full record.
 function _visible_record(runtime::WorkerRuntime, authority::TaskAuthority, task_id::String)
     live = get_active_task_info(runtime, task_id)
     live !== nothing && _is_authorized(authority, live) && return live
