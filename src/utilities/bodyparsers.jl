@@ -412,7 +412,7 @@ _check_json_depth(s::AbstractString, max_keys::Int = 0) = _check_json_depth(code
 # dispatch on the type parameter rather than an `isa` against a `UnionAll`: that runtime subtype
 # query on every node was the walk's hottest line.
 const _JSONLeafType = Union{Bool, Base.BitInteger, Base.IEEEFloat, BigInt, BigFloat,
-                            String, Nothing, Missing, Symbol}
+                            String, SubString{String}, Nothing, Missing, Symbol}
 _flat_json_container(x) = false
 _flat_json_container(::AbstractArray{T}) where {T} = T <: _JSONLeafType
 _flat_json_container(::AbstractSet{T}) where {T} = T <: _JSONLeafType
@@ -447,9 +447,10 @@ dispatch fails there rather than here.
 
 The post-serialization `_check_json_depth` stays as the store's final word: a `JSONText` is
 written verbatim and only a scan of the text sees its depth. It also covers the one way the
-two can disagree: every value is lowered twice per write, once here and once by the serializer,
-so an app `JSON.lower` that is not deterministic can hand the walk a different structure than the
-one written.
+walk can UNDER-measure: every value is lowered twice per write, once here and once by the
+serializer, so an app `JSON.lower` that is not deterministic can hand the walk a different
+structure than the one written. (The walk can also over-measure, under a style that omits empty
+or null members, which only ever errs toward refusing.)
 """
 function _check_value_depth(value)
     style = JSON.JSONWriteStyle()

@@ -1010,6 +1010,8 @@ mixed(d)         = foldl((x, i) -> isodd(i) ? Any[x] : Dict{String,Any}("k" => x
         self_dict, self_struct, Any[shared, Any[shared]],
         # Numbers JSON.jl lowers to objects, inside TYPED containers (#367 review).
         [1 + 2im], [1 // 3], Dict("a" => 1.0im), Set([2 // 3]), Any[[1.5 + 0im]],
+        # `split` output: `SubString{String}` elements, on the flat shortcut.
+        split("a,b,c", ","), Any[split("a b", " ")],
     ]
     for v in corpus
         @test BP._check_value_depth(v) == written_depth(v)
@@ -1025,9 +1027,11 @@ end
     # those views that sit on the flat shortcut. The edge still holds.
     @test BP._check_value_depth(vecs(510, zeros(2, 2))) == 512
     @test refused(vecs(511, zeros(2, 2)))
-    # A `Number` that lowers to a container, inside a TYPED array, at the edge. The flat shortcut
-    # used to take `AbstractArray{<:Number}` on trust, so this measured 512 and passed.
+    # A `Number` that lowers to a container, at the edge. The first line is the CONTROL: in a
+    # `Vector{Any}` it was always walked.
     @test BP._check_value_depth(vecs(511, 1 + 2im)) == 512
+    # Inside a TYPED array it is the case that discriminates: the flat shortcut used to take
+    # `AbstractArray{<:Number}` on trust, so this measured 512 and passed.
     @test refused(vecs(511, [1 + 2im]))
 end
 
