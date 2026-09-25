@@ -24,10 +24,54 @@ end
     rec = records[1]
     @test rec.method == "POST"
     @test rec.path == "/api/things"
-    @test rec.query == "limit=5"
+    @test rec.query === nothing              # redacted by default (#320)
     @test rec.status == 201
     @test rec.duration_ms >= 0
     @test rec.context[:user] == "u1"
+end
+
+# #320: the record used to carry the raw query and a prefix-sliced path, so a sink persisting
+# it stored reset tokens and absolute-form credentials. The console log had redacted both since
+# #39; the record now gets the same reduction, and the query only on opt-in.
+@testset "records redact the query and URL credentials by default" begin
+    records, sink = collecting_sink()
+    lf = AccessLog(sink; batch = 10)
+    handler = lf.middleware(req -> Response(200, "ok"))
+
+    startup(lf)
+    handler(Request("GET", "/reset?token=S3CRET-RESET-TOKEN"))
+    handler(Request("GET", "http://alice:pa55w0rd@h.example/x?code=S3CRET-CODE"))
+    handler(Request("GET", "//bob:pa55w0rd@evil.example/y?k=S3CRET"))
+    handler(Request("GET", "/frag#part?k=S3CRET"))
+    shutdown(lf)
+
+    @test [r.path for r in records] == ["/reset", "/x", "/y", "/frag"]
+    for r in records
+        @test r.query === nothing
+        fields = string(r.path, r.query, r.user_agent, r.ip)
+        @test !occursin("S3CRET", fields)
+        @test !occursin("pa55w0rd", fields)
+        @test !occursin("example", fields)
+    end
+end
+
+@testset "log_query=true opts back into the raw query, never the credentials" begin
+    records, sink = collecting_sink()
+    lf = AccessLog(sink; batch = 10, log_query = true)
+    handler = lf.middleware(req -> Response(200, "ok"))
+
+    startup(lf)
+    handler(Request("POST", "/api/things?limit=5"))
+    handler(Request("GET", "http://alice:pa55w0rd@h.example/x?code=abc"))
+    handler(Request("GET", "/q?a=1#frag"))          # the fragment is not part of the query
+    handler(Request("GET", "/f#frag?a=1"))          # a '?' inside a fragment is no query
+    handler(Request("GET", "/empty?"))              # an empty query is `nothing`, not ""
+    handler(Request("GET", "/none"))
+    shutdown(lf)
+
+    @test [r.query for r in records] == ["limit=5", "code=abc", "a=1", nothing, nothing, nothing]
+    @test records[2].path == "/x"                   # opting into the query keeps the path reduced
+    @test !occursin("pa55w0rd", string(records[2].path, records[2].query))
 end
 
 @testset "no query string → query is nothing" begin
@@ -185,6 +229,147 @@ end
     @test length(records) == 2
     @test records[1].path == "/api/first"
     @test records[2].path == "/api/second"
+end
+
+end # @testitem
+
+# #159: the retention pruner. `AccessLog(sink; prune, retention, prune_interval)` schedules the
+# app's `prune(cutoff)` through the shared `_janitor`, starting and stopping with the writer.
+@testitem "AccessLog retention pruner" tags=[:middleware, :slow] setup=[NitroCommon] begin
+using Nitro.Core
+using Nitro
+using Dates
+
+# Records every cutoff it is handed, and the task that handed it, under a lock -- `prune` runs
+# on the janitor task, and a stale tick can still push after `shutdown`, so reads go through
+# the lock too.
+function recording_prune()
+    buf = DateTime[]
+    tasks = Task[]
+    lk = ReentrantLock()
+    prune = cutoff -> lock(lk) do
+        push!(buf, cutoff)
+        push!(tasks, current_task())
+    end
+    count() = lock(() -> length(buf), lk)
+    cutoffs() = lock(() -> copy(buf), lk)
+    tasks_since(n) = lock(() -> tasks[n+1:end], lk)
+    return cutoffs, prune, count, tasks_since
+end
+
+# Poll instead of sleeping a fixed time: a loaded CI box can be slow to schedule the janitor.
+function wait_for(cond; timeout = 10.0)
+    t = time()
+    while !cond()
+        time() - t > timeout && return false
+        sleep(0.01)
+    end
+    return true
+end
+
+@testset "prune runs every interval with cutoff = now() - retention" begin
+    cutoffs, prune, count, tasks_since = recording_prune()
+    lf = AccessLog(recs -> nothing; prune, retention = Day(90),
+                   prune_interval = Millisecond(20))
+    startup(lf)
+    before = now()
+    @test wait_for(() -> count() >= 3)                # it keeps firing, not just once
+    after = now()
+    shutdown(lf)
+
+    # Each cutoff is 90 days behind the clock that stamps `AccessRecord.ts` (`now()`). Only the
+    # first three are bounded by `after`: on >1 thread a later tick can land between `after` and
+    # `shutdown` -- pushes are in order, so these three were computed before `wait_for` returned.
+    @test all(c -> before - Day(90) - Second(5) <= c <= after - Day(90), cutoffs()[1:3])
+end
+
+@testset "a calendar retention is allowed" begin
+    cutoffs, prune, count, tasks_since = recording_prune()
+    lf = AccessLog(recs -> nothing; prune, retention = Month(3),
+                   prune_interval = Millisecond(20))
+    startup(lf)
+    before = now()
+    @test wait_for(() -> count() >= 1)
+    after = now()
+    shutdown(lf)
+    @test before - Month(3) - Second(5) <= cutoffs()[1] <= after - Month(3)   # first only, as above
+end
+
+@testset "no startup sweep: the first prune waits one interval" begin
+    cutoffs, prune, count, tasks_since = recording_prune()
+    lf = AccessLog(recs -> nothing; prune, retention = Day(1), prune_interval = Hour(1))
+    startup(lf)
+    sleep(0.2)
+    @test count() == 0
+    shutdown(lf)
+end
+
+@testset "a throwing prune costs one tick, not the pruner or the writer" begin
+    calls = Threads.Atomic{Int}(0)
+    prune = function (cutoff)
+        Threads.atomic_add!(calls, 1)
+        error("prune boom")
+    end
+    records = AccessRecord[]
+    lk = ReentrantLock()
+    lf = AccessLog(recs -> lock(() -> append!(records, recs), lk); prune,
+                   retention = Day(1), prune_interval = Millisecond(20))
+    handler = lf.middleware(req -> Response(200, "ok"))
+
+    startup(lf)
+    @test wait_for(() -> calls[] >= 3)                # still ticking after throwing
+    resp = handler(Request("GET", "/api/data"))
+    @test resp.status == 200
+    shutdown(lf)
+    @test length(records) == 1                        # the writer was unaffected
+end
+
+@testset "shutdown stops the pruner, and a restart does not leak a second one" begin
+    cutoffs, prune, count, tasks_since = recording_prune()
+    lf = AccessLog(recs -> nothing; prune, retention = Day(1),
+                   prune_interval = Millisecond(50))
+
+    startup(lf)
+    @test wait_for(() -> count() >= 1)
+    shutdown(lf)
+    sleep(0.2)                                        # let a stale tick, if any, land
+    n = count()
+    sleep(0.3)                                        # 6 intervals: a live pruner would tick
+    @test count() == n                                # stopped
+
+    startup(lf)
+    startup(lf)                                       # idempotent: no second task
+    t0 = count()
+    @test wait_for(() -> count() >= t0 + 6)
+    shutdown(lf)
+    # Identity, not a tick-rate bound: a leaked second pruner would interleave its own ticks
+    # with the first's, and a rate bound goes red whenever a loaded runner oversleeps.
+    @test length(unique(objectid.(tasks_since(t0)))) == 1
+end
+
+@testset "prune and retention go together; bad values fail at construction" begin
+    sink = recs -> nothing
+    # Match the message, so each case pins the guard that fired rather than any ArgumentError.
+    function rejects(needle; kw...)
+        try
+            AccessLog(sink; kw...)
+            return false
+        catch e
+            return e isa ArgumentError && occursin(needle, e.msg)
+        end
+    end
+    @test rejects("go together"; prune = c -> nothing)
+    @test rejects("go together"; retention = Day(90))
+    @test rejects("must be positive"; prune = c -> nothing, retention = Day(0))
+    @test rejects("must be positive"; prune = c -> nothing, retention = Day(-1))
+    # Calendar intervals cannot be slept on -- rejected here, not on the first tick.
+    @test rejects("fixed-length"; prune = c -> nothing, retention = Day(90),
+                  prune_interval = Month(1))
+    @test rejects("at least 1 millisecond"; prune = c -> nothing, retention = Day(90),
+                  prune_interval = Millisecond(0))
+    # An interval with no pruner to apply it to is refused, not validated by nobody and ignored.
+    @test rejects("only applies to the retention pruner"; prune_interval = Hour(2))
+    @test rejects("only applies to the retention pruner"; prune_interval = Month(1))
 end
 
 end # @testitem
