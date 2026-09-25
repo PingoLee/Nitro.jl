@@ -7,18 +7,31 @@
 # registry of client identities as it is a rotation window. See
 # docs/design/typed-jwt-keyset.md.
 
+# What one key may assert (#349): claim name => `nothing` (any value) or the allowed values.
+# Values are Strings only -- `in` compares with `==`, under which `true == 1`, so a numeric or
+# Bool pin would admit more than it names.
+const ClaimScope = Dict{String, Union{Nothing, Set{String}}}
+
+# Registered claims every token carries and none of which grants authority: the time bounds
+# `validate_claims` enforces and the token id. Always allowed, so a scope never has to repeat
+# them. `sub`, `iss` and `aud` are NOT here -- they say who the caller is and whom the token is
+# from and for, so a scoped key asserts them only when its scope lists them.
+const _JWT_ALWAYS_ALLOWED_CLAIMS = ("iat", "exp", "nbf", "jti")
+
 struct JWTKey
     kid::String
     secret::SecretString
     use::Symbol          # :sign | :verify
+    scope::Nullable{ClaimScope}   # `nothing`: trusted for every claim
 end
 
-Base.show(io::IO, key::JWTKey) = print(io, "JWTKey(", repr(key.kid), ", :", key.use, ")")
+Base.show(io::IO, key::JWTKey) = print(io, "JWTKey(", repr(key.kid), ", :", key.use,
+                                       key.scope === nothing ? "" : ", scoped", ")")
 Base.show(io::IO, ::MIME"text/plain", key::JWTKey) = show(io, key)
 
 """
-    JWTKeyset(signer::Pair; verify = ())
-    JWTKeyset(keyset::AbstractDict)
+    JWTKeyset(signer::Pair; verify = (), claims = ())
+    JWTKeyset(keyset::AbstractDict; claims = ())
 
 A set of HS256 keys for `encode_jwt`, `decode_jwt` and `jwt_validator`:
 exactly **one signing key**, plus any number of **verify-only** keys. The signing key also
@@ -59,14 +72,39 @@ Every pair is `kid => secret`. A `kid` is a `String` or `Symbol`; a secret is an
 
 A `Dict` holding both `"a"` and `:a` is refused rather than silently shadowed.
 
-# Every key is trusted for every claim
+# Scoping what a key may claim
 
-A keyset is **one trust domain**. Whoever holds any of its keys — verify-only ones included —
-can sign any claims: a partner's key can sign `{"role": "admin"}`, and under the default
-`identity_from = :claim` it can sign any `sub`. `identity_from = :kid` pins *who* the
-principal is, not *what it may claim*. Keep keys you would not trust with every claim in a
-separate keyset and validator, or gate every claim-guarded route with
-[`kid_required`](@ref) as well.
+By default a key is trusted for **every** claim. Whoever holds any key in the keyset — verify-only
+ones included — can sign `{"role": "admin"}`, and under the default `identity_from = :claim` any
+`sub`. `identity_from = :kid` pins *who* the principal is, not *what it may claim*. That is right
+for a rotation window, where every key belongs to one issuer, and wrong for a registry of
+partner keys.
+
+`claims` scopes a key to the claims it may assert:
+
+```julia
+keyset = JWTKeyset("self" => own_secret;
+    verify = ["partner" => partner_secret],
+    claims = Dict("partner" => ["sub", "action", "role" => ["reader"]]))
+```
+
+Each entry of a scope is a claim name, which allows any value, or `name => values`, which allows
+only those values. A pinned value is a `String` (or `Symbol`), and one value can stand alone:
+`"role" => "reader"`. A claim holding a list, such as a `permissions` array, passes a pin only
+when every element is allowed. Any other value under a pin is refused, whether it is a number,
+`null` or an object.
+
+A token verified by a scoped key is **rejected** — `decode_jwt` throws an `AuthError`, and the
+auth middleware answers `401` — when it asserts a claim the scope does not list, or a pinned
+claim with a value the pin does not allow. The claims are never dropped. `decode_jwt` and
+`jwt_validator` both enforce it; `decode_jwt(...; verify = false)` has no verified key and does
+not. `iat`, `exp`, `nbf` and `jti` are always allowed. `sub`, `iss` and `aud` are not: list them
+for a key whose tokens carry them, including when the validator checks `issuer` or `audience`.
+
+A kid with no scope stays trusted for every claim. The constructor refuses, with an
+`ArgumentError`, a scope for a kid the keyset does not hold, an empty name, a name listed twice,
+an empty value list, a non-string value, and any of the always-allowed claims (a pin on one of
+them would silently do nothing). [`kid_required`](@ref) remains the per-route alternative.
 
 Build the keyset **once**, at configuration time. `jwt_validator` lifts a `Dict` once and
 keeps that snapshot; a direct `decode_jwt` or `encode_jwt` call with a `Dict` lifts — and
@@ -84,7 +122,8 @@ encode_jwt(claims, outbound; expires_in = 60)
 
 # Display
 
-`show` and `JSON.lower` report key ids and roles only, never a secret.
+`show` and `JSON.lower` report key ids, roles, and which claim names each scoped key may
+assert — never a secret, and never a pinned value.
 """
 struct JWTKeyset
     # Internal. The constructor's invariants hold only for what it built; code that mutates
@@ -92,7 +131,7 @@ struct JWTKeyset
     keys::Vector{JWTKey}         # keys[1] signs; the rest are sorted by kid
     index::Dict{String, Int}
 
-    function JWTKeyset(signer::Pair; verify = ())
+    function JWTKeyset(signer::Pair; verify = (), claims = ())
         entries = Tuple{String, SecretString, Symbol}[_keyset_entry(signer, :sign)]
         for pair in verify
             pair isa Pair || throw(ArgumentError(
@@ -104,7 +143,15 @@ struct JWTKeyset
         # correctness -- no two keys are the same HMAC key, so at most one can match -- but
         # it is for reproducibility, of tests and of the kid that reaches an operator's log.
         sort!(@view(entries[2:end]); by = first)
-        keys = JWTKey[JWTKey(kid, secret, use) for (kid, secret, use) in entries]
+        scopes = _claim_scopes(claims)
+        keys = JWTKey[JWTKey(kid, secret, use, get(scopes, kid, nothing)) for (kid, secret, use) in entries]
+        # A scope naming a kid that is not here is a typo, and silently accepting it would leave
+        # the key it meant to restrict trusted for every claim.
+        for kid in Base.keys(scopes)
+            any(key -> key.kid == kid, keys) || throw(ArgumentError(
+                "JWTKeyset: claims names kid $(repr(kid)), which is not in the keyset, so the key " *
+                "it was meant to scope would stay trusted for every claim"))
+        end
         index = Dict{String, Int}()
         by_hmac = Dict{Vector{UInt8}, String}()
         for (position, key) in enumerate(keys)
@@ -129,7 +176,7 @@ end
 
 JWTKeyset(keyset::JWTKeyset) = keyset
 
-function JWTKeyset(keyset::AbstractDict)
+function JWTKeyset(keyset::AbstractDict; claims = ())
     isempty(keyset) && throw(ArgumentError(
         "JWTKeyset: the keyset is empty, so there is no key to sign or verify with"))
     names = Dict{String, Any}()
@@ -154,8 +201,105 @@ function JWTKeyset(keyset::AbstractDict)
             "JWTKeyset(\"<signing kid>\" => secret; verify = [...]) to say which one signs"))
     end
     verify = Pair{String, Any}[kid => secret for (kid, secret) in names if kid != signer]
-    return JWTKeyset(signer => names[signer]; verify = verify)
+    return JWTKeyset(signer => names[signer]; verify = verify, claims = claims)
 end
+
+# `claims = ...` normalized to kid => ClaimScope. Every check runs here, at construction.
+function _claim_scopes(claims)
+    scopes = Dict{String, ClaimScope}()
+    claims isa Union{AbstractDict, AbstractVector, Tuple} || throw(ArgumentError(
+        "JWTKeyset: claims must be a Dict (or list) of kid => claim scope, got a $(typeof(claims))"))
+    for pair in claims
+        pair isa Pair || throw(ArgumentError(
+            "JWTKeyset: claims must hold kid => claim scope pairs, got a $(typeof(pair))"))
+        pair.first isa Union{AbstractString, Symbol} || throw(ArgumentError(
+            "JWTKeyset: claims kid $(repr(pair.first)) is a $(typeof(pair.first)); a kid must be a String or Symbol"))
+        kid = string(pair.first)
+        haskey(scopes, kid) && throw(ArgumentError(
+            "JWTKeyset: claims scopes kid $(repr(kid)) more than once"))
+        scopes[kid] = _claim_scope(kid, pair.second)
+    end
+    return scopes
+end
+
+function _claim_scope(kid::String, spec)
+    spec isa Union{AbstractVector, Tuple} || throw(ArgumentError(
+        "JWTKeyset: the claim scope for kid $(repr(kid)) must be a list of claim names and " *
+        "name => values pairs, got a $(typeof(spec))"))
+    scope = ClaimScope()
+    for entry in spec
+        raw_name, raw_values = entry isa Pair ? (entry.first, entry.second) : (entry, nothing)
+        raw_name isa Union{AbstractString, Symbol} || throw(ArgumentError(
+            "JWTKeyset: the claim scope for kid $(repr(kid)) holds $(repr(entry)); an entry is a " *
+            "claim name, or name => values"))
+        name = string(raw_name)
+        isempty(name) && throw(ArgumentError(
+            "JWTKeyset: the claim scope for kid $(repr(kid)) names an empty claim"))
+        name in _JWT_ALWAYS_ALLOWED_CLAIMS && throw(ArgumentError(
+            "JWTKeyset: the claim scope for kid $(repr(kid)) lists $(repr(name)), which every key " *
+            "may always assert ($(join(_JWT_ALWAYS_ALLOWED_CLAIMS, ", "))); drop it"))
+        haskey(scope, name) && throw(ArgumentError(
+            "JWTKeyset: the claim scope for kid $(repr(kid)) lists $(repr(name)) more than once"))
+        scope[name] = entry isa Pair ? _pinned_values(kid, name, raw_values) : nothing
+    end
+    return scope
+end
+
+function _pinned_values(kid::String, name::String, values)
+    listed = values isa Union{AbstractString, Symbol} ? (values,) : values
+    listed isa Union{AbstractVector, Tuple, AbstractSet} || throw(ArgumentError(
+        "JWTKeyset: the values pinned for $(repr(name)) on kid $(repr(kid)) must be a String or " *
+        "a list of Strings, got a $(typeof(values))"))
+    isempty(listed) && throw(ArgumentError(
+        "JWTKeyset: no values are pinned for $(repr(name)) on kid $(repr(kid)), so no token " *
+        "could carry it; list the allowed values, or drop the claim to refuse it outright"))
+    allowed = Set{String}()
+    for value in listed
+        value isa Union{AbstractString, Symbol} || throw(ArgumentError(
+            "JWTKeyset: the values pinned for $(repr(name)) on kid $(repr(kid)) include a " *
+            "$(typeof(value)); a pinned value must be a String, because `==` would let `true` " *
+            "pass a pin of `1`"))
+        push!(allowed, string(value))
+    end
+    return allowed
+end
+
+# Checked in `_decode_jwt` once the signature has verified against the key that owns `scope`
+# and the claims set has parsed, before anything reads a claim (#349). Rejecting rather than
+# dropping is deliberate: a dropped `sub` is a Principal with `id = nothing`, and the issuer
+# never learns its tokens are out of policy.
+function _check_claim_scope(scope::ClaimScope, claims::Dict{String, Any}, kid::Nullable{String})
+    for (name, value) in claims
+        name in _JWT_ALWAYS_ALLOWED_CLAIMS && continue
+        allowed = true
+        if !haskey(scope, name)
+            allowed = false
+        else
+            pinned = scope[name]
+            pinned === nothing || (allowed = _pin_admits(pinned, value))
+        end
+        # Neither the claim name nor its value is echoed: both are the token's, and a key
+        # holder can make them as long as the header allows.
+        allowed || throw(AuthError("JWT key $(repr(kid)) is not permitted to assert every claim in this token"))
+    end
+    return nothing
+end
+
+# A claim value is `Any` by nature. A String must be pinned; a list passes only when every
+# element is a pinned String; anything else -- a number, `null`, an object -- never does.
+function _pin_admits(pinned::Set{String}, value)::Bool
+    value isa AbstractString && return value in pinned
+    value isa AbstractVector || return false
+    for element in value
+        (element isa AbstractString && element in pinned) || return false
+    end
+    return true
+end
+
+# The scope of the key that verified a token: only a `JWTKeyset` key carries one. A `Dict`
+# lifted per call has no `claims`, and a string secret has no keys.
+_key_scope(keyset::JWTKeyset, kid::String)::Nullable{ClaimScope} = keyset.keys[keyset.index[kid]].scope
+_key_scope(_, _)::Nullable{ClaimScope} = nothing
 
 function _keyset_entry(pair::Pair, use::Symbol)
     name, secret = pair.first, pair.second
@@ -222,19 +366,32 @@ end
 
 _signing_key(keyset::JWTKeyset) = @inbounds keyset.keys[1]
 
+# kid => the claim names it may assert, sorted, for each scoped key. Names only: a pinned
+# value is policy, not a secret, but a summary that lists names says what it needs to.
+_scoped_names(keyset::JWTKeyset) = Dict{String, Vector{String}}(
+    key.kid => sort!(collect(Base.keys(key.scope))) for key in keyset.keys if key.scope !== nothing)
+
 function _keyset_summary(io::IO, keyset::JWTKeyset)
     print(io, "JWTKeyset(sign=", repr(_signing_key(keyset).kid))
     if length(keyset.keys) > 1
         print(io, ", verify=", repr(String[key.kid for key in @view(keyset.keys[2:end])]))
     end
+    scoped = String[key.kid for key in keyset.keys if key.scope !== nothing]
+    isempty(scoped) || print(io, ", scoped=", repr(scoped))
     print(io, ")")
 end
 
-# SECURITY: kids and roles only. The default `show` would print each `JWTKey`, which is
-# already masked through `SecretString` -- but a keyset lands in REPL auto-display, `@show`
-# and interpolated config dumps, so it states its own contract rather than inheriting one.
+# SECURITY: kids, roles and scoped claim names only. The default `show` would print each
+# `JWTKey`, which is already masked through `SecretString` -- but a keyset lands in REPL
+# auto-display, `@show` and interpolated config dumps, so it states its own contract rather
+# than inheriting one.
 Base.show(io::IO, keyset::JWTKeyset) = _keyset_summary(io, keyset)
 Base.show(io::IO, ::MIME"text/plain", keyset::JWTKeyset) = show(io, keyset)
-JSON.lower(keyset::JWTKeyset) = Dict{String, Any}(
-    "sign" => _signing_key(keyset).kid,
-    "verify" => String[key.kid for key in @view(keyset.keys[2:end])])
+function JSON.lower(keyset::JWTKeyset)
+    lowered = Dict{String, Any}(
+        "sign" => _signing_key(keyset).kid,
+        "verify" => String[key.kid for key in @view(keyset.keys[2:end])])
+    scoped = _scoped_names(keyset)
+    isempty(scoped) || (lowered["claims"] = scoped)
+    return lowered
+end

@@ -57,17 +57,46 @@ Two roles say exactly what the code needs and nothing it cannot check:
 
 A rotation window is expressed with the same two roles: the new key signs, the old one verifies.
 
-### A keyset is one trust domain
+### What a key may claim: per-key scopes
 
 The roles say which key may **sign**, and nothing about what a verifying key may **claim**
-([#321](https://github.com/PingoLee/Nitro.jl/issues/321)). Every key in a keyset is fully trusted
-for every claim. A client-registry key can sign `{"role": "admin"}`, or under
+([#321](https://github.com/PingoLee/Nitro.jl/issues/321)). Unscoped, every key in a keyset is
+fully trusted for every claim. A client-registry key can sign `{"role": "admin"}`, or under
 `identity_from = :claim` any `sub`, and the validator believes it. `identity_from = :kid` pins who
 the principal is, not what it may assert. That is fine for a rotation window, where every key
-belongs to one issuer. It is a hazard for the client registry above, where it is safe only with
-`kid_required` on every claim-guarded route, or with each trust domain in its own keyset and
-validator. The tutorial and both docstrings now say so. Scoping claims per key is tracked in
-[#349](https://github.com/PingoLee/Nitro.jl/issues/349).
+belongs to one issuer. It is a hazard for the client registry above. #321 documented it, and the
+only mitigations were `kid_required` on every claim-guarded route or one keyset and validator per
+trust domain. Both are opt-in discipline, and a new route that forgets `kid_required` is silently
+exposed.
+
+[#349](https://github.com/PingoLee/Nitro.jl/issues/349) makes the policy a property of the key:
+
+```julia
+JWTKeyset("self" => s; verify = ["partner" => p],
+          claims = Dict("partner" => ["sub", "action", "role" => ["reader"]]))
+```
+
+The decisions, and why:
+
+| Question | Decision | Why |
+|---|---|---|
+| Names or values? | Both: a name allows any value, `name => values` pins it | Names alone cannot say "a partner may be a reader, never an admin", which is the registry's actual policy |
+| What a pin accepts | Strings, and lists of strings whose every element is pinned. Nothing else | `in` compares with `==`, under which `true == 1`; a non-string pin would admit more than it names |
+| A disallowed claim | **Reject** the token (`AuthError` → `401`) | Dropping is silent: a dropped `sub` becomes a `Principal` with `id = nothing`, and the issuer never learns its tokens are out of policy |
+| Where it is checked | `_decode_jwt`, after the signature verifies and the claims parse, before `validate_claims` | The scope lives on the keyset, so `decode_jwt` and `jwt_validator` both enforce it. That is #260's lesson again: a guard in one of two entry points is the wrong shape |
+| Always allowed | `iat`, `exp`, `nbf`, `jti` | Every token carries them and none grants authority. `sub`, `iss` and `aud` say who and for whom, so they must be listed |
+| Unscoped keys | Trusted for every claim, as before | A rotation window is one issuer and needs no scope. The change is additive |
+| `identity_from = :claim` | Nothing special | `sub` is a claim like any other, so a key not scoped for it cannot name an identity |
+
+The scope follows the key that **verified** the token, not the header `kid`. A kid-less token is
+scoped by whichever key's HMAC matched, and a string secret has no keys and so no scope.
+`verify = false` has no verifying key and applies none. A scope naming a kid the keyset does not
+hold is an `ArgumentError`, because accepting that typo would leave the key it meant to restrict
+unscoped.
+
+Prior art: Spring Security grants authorities per client registration, not per issuer, and OAuth
+scopes bound what one client's token may assert. FastAPI's `Security` scopes are the per-route
+analogue, and that is the shape `kid_required` already has.
 
 ### What the type answers, so no call site has to
 
@@ -131,7 +160,8 @@ Where the lift happens matters:
 
 `JWTKeyset` prints key ids and roles only — `JWTKeyset(sign="default", verify=["legacy", "partner"])`
 — in `show`, `MIME"text/plain"` `show`, and `JSON.lower`, the same discipline as `SecretString` and
-`App`. Secrets are stored as `SecretString` and revealed only at the HMAC. As with `SecretString`,
+`App`. A scoped keyset adds `scoped=[...]` to `show`, and a `claims` map of kid to claim names to
+`JSON.lower`. Pinned values are never printed. Secrets are stored as `SecretString` and revealed only at the HMAC. As with `SecretString`,
 `dump` and field reflection are not covered.
 
 ## Nitro.jl Constraints

@@ -178,6 +178,9 @@ function _decode_jwt(token::AbstractString, secret_or_keyset; issuer=nothing, au
     # every assignment to it, so narrowing in place would leave the slot `Any` and keep
     # `with_kid`'s return `Tuple{Any, Any}` on the per-request path through `jwt_validator`.
     kid::Nullable{String} = raw_kid === nothing ? nothing : String(raw_kid)
+    # What the verifying key may assert (#349), or `nothing` when it may assert anything --
+    # which is also the `verify=false` answer, since no key vouched for the token there.
+    scope::Nullable{ClaimScope} = nothing
 
     if verify
         # Nitro signs and verifies with HMAC-SHA256 and nothing else, so the header's `alg`
@@ -245,6 +248,7 @@ function _decode_jwt(token::AbstractString, secret_or_keyset; issuer=nothing, au
                 "No key in the JWT keyset verified this token"))
         end
         kid = matched_kid
+        scope = _key_scope(secret_or_keyset, matched_kid)
     end
 
     # The claims set, decoded only now that the signature has verified (or the caller asked
@@ -258,6 +262,12 @@ function _decode_jwt(token::AbstractString, secret_or_keyset; issuer=nothing, au
     # Checking the concrete type is what narrows the slot -- assigned exactly once, so
     # `_decode_jwt` infers `Tuple{Dict{String, Any}, Nullable{String}}`.
     claims isa Dict{String, Any} || throw(AuthError("Invalid JWT claims"))
+
+    # A scoped key asserts only what its scope allows (#349), checked here rather than in
+    # `jwt_validator` so a direct `decode_jwt` caller holding the same keyset gets it too --
+    # the #260 lesson that a guard in one of two entry points is the wrong shape. Before
+    # `validate_claims`: an out-of-policy token is refused whatever its time bounds say.
+    scope === nothing || _check_claim_scope(scope, claims, kid)
 
     validate_claims(claims; exp_timeout=exp_timeout, iat_skew=iat_skew, issuer=issuer, audience=audience, require_exp=require_exp, required_claims=required_claims)
     return (claims, kid)

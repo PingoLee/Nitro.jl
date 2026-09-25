@@ -96,10 +96,12 @@ Safe by default: every token is signature-verified and time-bounded (`exp`, or `
   the header `kid` is an unverified label, so this mode throws an `ArgumentError` at
   construction.
 
-Neither mode limits what a key may *claim*: every key in the keyset is trusted for every
-claim, so a verify-only partner key can sign `{"role": "admin"}` and pass `role_required`.
-Use one validator per trust domain, or add [`kid_required`](@ref) to every claim-guarded
-route — see "Every key is trusted for every claim" on [`JWTKeyset`](@ref).
+Neither mode limits what a key may *claim*. An unscoped key is trusted for every claim, so a
+verify-only partner key can sign `{"role": "admin"}` and pass `role_required`. Scope the key
+with `JWTKeyset(...; claims = ...)`, and a token asserting anything outside its scope is
+rejected before the `Principal` is built — see "Scoping what a key may claim" on
+[`JWTKeyset`](@ref). One validator per trust domain, or [`kid_required`](@ref) on every
+claim-guarded route, remain the alternatives.
 
 # Keysets
 
