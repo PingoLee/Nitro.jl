@@ -51,13 +51,13 @@ end
 end
 
 @testset "Bearer auth populates getuser(req)" begin
-    validator = Nitro.Auth.jwt_validator("jwt-secret")
+    validator = Nitro.Auth.jwt_validator(jwtkey("jwt-secret"))
     token = Nitro.Auth.encode_jwt(Dict(
         "sub" => "17",
         "role" => "admin",
         "permissions" => ["reports:read"],
         "exp" => trunc(Int, time()) + 60,
-    ), "jwt-secret")
+    ), jwtkey("jwt-secret"))
 
     handler = BearerAuth(validator)(GuardMiddleware(
         login_required(),
@@ -87,7 +87,7 @@ end
     # at `req.context[:auth_claims]`. Before the fix every claim guard returned 403 here
     # while `kid_required` on the same request worked.
     validator = Nitro.Auth.jwt_validator(
-        "struct-secret";
+        jwtkey("struct-secret");
         user_validator = principal -> AppUser(parse(Int, principal.id), "alice"),
     )
     token = Nitro.Auth.encode_jwt(Dict(
@@ -95,7 +95,7 @@ end
         "role" => "admin",
         "permissions" => ["reports:read"],
         "exp" => trunc(Int, time()) + 60,
-    ), "struct-secret")
+    ), jwtkey("struct-secret"))
 
     handler = BearerAuth(validator)(GuardMiddleware(
         login_required(),
@@ -176,8 +176,8 @@ end
 end
 
 @testset "Service tokens: claim-based authorization" begin
-    validator = Nitro.Auth.jwt_validator("svc-secret")
-    token = Nitro.Auth.encode_jwt(Dict("action" => "reports:generate"), "svc-secret"; expires_in=60)
+    validator = Nitro.Auth.jwt_validator(jwtkey("svc-secret"))
+    token = Nitro.Auth.encode_jwt(Dict("action" => "reports:generate"), jwtkey("svc-secret"); expires_in=60)
 
     handler = BearerAuth(validator)(GuardMiddleware(
         login_required(),
@@ -200,7 +200,7 @@ end
     # is a 401. Everything else in #45 asserts on `decode_jwt` directly, so without this
     # the promise is untested -- and `_handle_validated`'s catch-all is what turns the
     # AuthError into a 401 rather than letting it escape as a 500.
-    validator = Nitro.Auth.jwt_validator("jwt-secret")
+    validator = Nitro.Auth.jwt_validator(jwtkey("jwt-secret"))
     handler = BearerAuth(validator)(req -> HTTP.Response(200, "reached"))
 
     # Hand-built so the header can lie while the HMAC stays genuinely valid -- the shape
@@ -209,7 +209,7 @@ end
     claims = Dict("sub" => "17", "exp" => trunc(Int, time()) + 60)
     function mint(alg)
         input = string(b64(Dict("alg" => alg, "typ" => "JWT")), ".", b64(claims))
-        return string(input, ".", Nitro.Auth._base64url_encode(Nitro.Auth._hmac_sha256("jwt-secret", input)))
+        return string(input, ".", Nitro.Auth._base64url_encode(Nitro.Auth._hmac_sha256(jwtkey("jwt-secret"), input)))
     end
 
     # Control: identical machinery, honest label -> the request goes through, so a 401
@@ -246,7 +246,7 @@ end
 
 @testset "Keyset auth: kid_required authorization" begin
     # A registry of service identities. Every key verifies; one is named the signer (#260).
-    keyset = Nitro.Auth.JWTKeyset("service-a" => "ka-secret"; verify = ["service-b" => "kb-secret"])
+    keyset = Nitro.Auth.JWTKeyset("service-a" => jwtkey("ka-secret"); verify = ["service-b" => jwtkey("kb-secret")])
     validator = Nitro.Auth.jwt_validator(keyset; identity_from=:kid)
 
     handler = BearerAuth(validator)(GuardMiddleware(
@@ -264,14 +264,14 @@ end
     # not authentication: the signature checked out)
     # Signed AS service-b: a one-key keyset whose signing key is service-b.
     token_b = Nitro.Auth.encode_jwt(Dict("action" => "sync"),
-                                    Nitro.Auth.JWTKeyset("service-b" => "kb-secret"); expires_in=60)
+                                    Nitro.Auth.JWTKeyset("service-b" => jwtkey("kb-secret")); expires_in=60)
     req_b = HTTP.Request("GET", "/sync", ["Authorization" => "Bearer $token_b"])
     @test handler(req_b).status == 403
 end
 
 @testset "Handler returning getuser(req) serializes as the claims object" begin
-    validator = Nitro.Auth.jwt_validator("jwt-secret")
-    token = Nitro.Auth.encode_jwt(Dict("sub" => "17", "role" => "admin"), "jwt-secret"; expires_in=60)
+    validator = Nitro.Auth.jwt_validator(jwtkey("jwt-secret"))
+    token = Nitro.Auth.encode_jwt(Dict("sub" => "17", "role" => "admin"), jwtkey("jwt-secret"); expires_in=60)
 
     handler = BearerAuth(validator)(req -> Nitro.Res.json(getuser(req)))
     req = HTTP.Request("GET", "/me", ["Authorization" => "Bearer $token"])

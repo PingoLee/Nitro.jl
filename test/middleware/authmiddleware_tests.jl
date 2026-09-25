@@ -432,3 +432,29 @@ handler2 = BearerAuth(t -> t == "tok" ? Dict("sub" => "u") : nothing; scheme = "
 req = HTTP.Request("GET", "/", ["Authorization" => "Tökén ключ"])
 @test Nitro.Auth.extract_auth_token(req; scheme = "Tökén", cookie_name = nothing) == "ключ"
 end
+
+@testitem "extract_auth_token reads a cookie only when told to (#321)" tags=[:middleware, :auth, :security] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+
+# The auth cookie is an AMBIENT credential: a browser attaches it to a cross-site request
+# too. The helper used to fall back to `auth_token` by default, so a "bearer-only" API
+# built on it quietly accepted the cookie -- and with it, CSRF. It now matches `BearerAuth`.
+cookie_only = HTTP.Request("GET", "/", ["Cookie" => "auth_token=from-cookie"])
+@test Nitro.Auth.extract_auth_token(cookie_only) === nothing
+@test Nitro.Auth.extract_auth_token(cookie_only; cookie_name = "auth_token") == "from-cookie"
+@test Nitro.Auth.extract_auth_token(cookie_only; cookie_name = "other") === nothing
+
+# The header still wins when both are present, with or without the opt-in.
+both = HTTP.Request("GET", "/", ["Authorization" => "Bearer from-header", "Cookie" => "auth_token=from-cookie"])
+@test Nitro.Auth.extract_auth_token(both) == "from-header"
+@test Nitro.Auth.extract_auth_token(both; cookie_name = "auth_token") == "from-header"
+
+# A statement of agreement, not a guard: BearerAuth did not change, so these two pass on the
+# old code too. The `=== nothing` line above is what fails without the fix. They pin that the
+# helper and the middleware agree -- neither reads a cookie unless given its name.
+accept_any = BearerAuth(t -> Dict("sub" => t))(req -> HTTP.Response(200, "ok"))
+@test accept_any(cookie_only).status == 401
+@test accept_any(both).status == 200
+end

@@ -4,10 +4,51 @@ function _base64url_encode(data::Vector{UInt8})
     return replace(encoded, '=' => "")
 end
 
+# Strict: canonical base64url and nothing else (#321). This used to translate `-_` to `+/`
+# and pad, so the standard alphabet, `=` padding, and -- in the last character -- any of the
+# 4 (or 16) letters differing only in bits the decoder discards all decoded to the same bytes.
+# Every such spelling of a signature verified, so one token had many strings, and anything
+# keyed on the raw token (a denylist, a replay cache) could be walked around. RFC 7515 §2
+# defines the encoding with no padding.
+#
+# Canonical means: the URL-safe alphabet only, no padding, a length that is not 1 mod 4, and
+# zero in the bits of the last character that fall past the final byte -- the low 4 bits when
+# 2 characters are left over, the low 2 when 3 are. That last rule is checked on the value
+# directly rather than by re-encoding and comparing, which did the same job at three times
+# the cost on every segment of every request. The test suite holds it to the re-encoding
+# definition exhaustively over every 2- and 3-character input, so the two cannot drift.
+#
+# Throws ArgumentError, the one type both callers in `_decode_jwt` catch.
 function _base64url_decode(data::AbstractString)
-    normalized = replace(String(data), '-' => '+', '_' => '/')
-    padding = mod(4 - mod(length(normalized), 4), 4)
-    return Base64.base64decode(normalized * repeat("=", padding))
+    units = codeunits(data)
+    count = length(units)
+    remainder = mod(count, 4)
+    remainder == 1 && throw(ArgumentError("not base64url: impossible length"))
+    # Translated to the standard alphabet and padded in one buffer, for `base64decode`.
+    standard = Vector{UInt8}(undef, remainder == 0 ? count : count + 4 - remainder)
+    last_value = 0x00
+    for (index, byte) in enumerate(units)
+        last_value, translated = if UInt8('A') <= byte <= UInt8('Z')
+            byte - UInt8('A'), byte
+        elseif UInt8('a') <= byte <= UInt8('z')
+            byte - UInt8('a') + 0x1a, byte
+        elseif UInt8('0') <= byte <= UInt8('9')
+            byte - UInt8('0') + 0x34, byte
+        elseif byte == UInt8('-')
+            0x3e, UInt8('+')
+        elseif byte == UInt8('_')
+            0x3f, UInt8('/')
+        else
+            throw(ArgumentError("not base64url"))
+        end
+        standard[index] = translated
+    end
+    discarded = remainder == 2 ? 0x0f : remainder == 3 ? 0x03 : 0x00
+    last_value & discarded == 0x00 || throw(ArgumentError("not canonical base64url"))
+    for index in (count + 1):length(standard)
+        standard[index] = UInt8('=')
+    end
+    return Base64.base64decode(standard)
 end
 
 function _json_dict(data)
@@ -197,6 +238,14 @@ function _decode_jwt(token::AbstractString, secret_or_keyset; issuer=nothing, au
         # inspection path and must keep parsing a token whatever its header says.
         get(header, "alg", nothing) == "HS256" ||
             throw(AuthError("Unsupported JWT algorithm"))
+
+        # RFC 7515 §4.1.11: a recipient that does not understand an extension listed in
+        # `crit` MUST reject the token -- the issuer is saying "do not accept this unless
+        # you enforce X". Nitro understands no extensions, so any `crit` at all, malformed
+        # ones included, is one it cannot honour (#321). Ignoring it used to accept tokens
+        # whose issuer had made acceptance conditional.
+        haskey(header, "crit") &&
+            throw(AuthError("Unsupported critical JWT header extension"))
 
         # Resolved BEFORE the signature is decoded, so a token naming an unknown `kid`
         # still reports "Unknown JWT key id" and is not pre-empted by a signature that

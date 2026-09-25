@@ -57,6 +57,18 @@ Two roles say exactly what the code needs and nothing it cannot check:
 
 A rotation window is expressed with the same two roles: the new key signs, the old one verifies.
 
+### A keyset is one trust domain
+
+The roles say which key may **sign**, and nothing about what a verifying key may **claim**
+([#321](https://github.com/PingoLee/Nitro.jl/issues/321)). Every key in a keyset is fully trusted
+for every claim. A client-registry key can sign `{"role": "admin"}`, or under
+`identity_from = :claim` any `sub`, and the validator believes it. `identity_from = :kid` pins who
+the principal is, not what it may assert. That is fine for a rotation window, where every key
+belongs to one issuer. It is a hazard for the client registry above, where it is safe only with
+`kid_required` on every claim-guarded route, or with each trust domain in its own keyset and
+validator. The tutorial and both docstrings now say so. Scoping claims per key is tracked in
+[#349](https://github.com/PingoLee/Nitro.jl/issues/349).
+
 ### What the type answers, so no call site has to
 
 - **"Which key signs?"** The signing key. `_signing_kid`, and the `ArgumentError` it threw for a

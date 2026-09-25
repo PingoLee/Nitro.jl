@@ -205,6 +205,21 @@ silently. The `alg` gate sits inside the `verify` branch, so
 `decode_jwt(...; verify=false)` — offline inspection, not authentication — still parses a
 token whatever algorithm its header claims.
 
+**A `crit` header is rejected.** RFC 7515 §4.1.11 lets an issuer list extensions in `crit`
+that a recipient *must* understand, or else reject the token. Nitro implements none, so a token
+carrying `crit` in any form fails with `AuthError("Unsupported critical JWT header extension")`.
+Like the `alg` gate, this sits inside `verify`.
+
+**Each segment has exactly one spelling.** Segments are decoded as canonical base64url
+(RFC 7515 §2): the URL-safe alphabet only, no `=` padding, and no stray bits in the final
+character. The standard `+/` alphabet, a padded segment, or a last character that differs only in
+bits the decoder would discard is an encoding error (`AuthError("Invalid JWT signature encoding")`
+for the signature, `AuthError("Invalid JWT encoding")` for the header or claims), not a second
+way to write the same token. So a denylist or replay cache keyed on the token string cannot be
+bypassed by re-spelling it. `encode_jwt` has always produced canonical tokens; the only tokens
+this refuses come from an issuer that pads or uses the standard alphabet, which the JWS spec does
+not allow.
+
 A `kid` that is **present** in the header but absent from the keyset is
 `AuthError("Unknown JWT key id")` — no falling back to another key, which is what would let a
 revoked signer keep working.
@@ -320,10 +335,48 @@ A single string secret is held to the same rule: `jwt_validator("")` — or a se
 and a verifying `decode_jwt` refuse it too. That is why the quick start above reads
 `JWT_SECRET` with a `nothing` default rather than `""`.
 
+**Every key must be at least 32 bytes**, keyset key or string secret alike. RFC 7518 §3.2 sets
+that floor for HS256, and it matters in practice: anyone holding one issued token can test
+guesses against the key offline, as fast as they can compute HMACs, so `"secret"` falls in
+seconds. A shorter key is an `ArgumentError` at startup, and `encode_jwt` and a verifying
+`decode_jwt` refuse it too. Generate the key once and keep it in the environment:
+
+```sh
+julia -e 'using Nitro; println(bytes2hex(Nitro.Crypto.secure_random_bytes(32)))'
+```
+
+The length is counted in bytes, which is what HMAC sees. The 64 hex characters this prints are
+64 bytes that carry 32 bytes of randomness.
+
 The roles describe what a key is **for**, not where it is in a rotation. A rotation window is
 "the new key signs, the old one verifies". A registry of service identities — each caller signs
 with its own key, and `identity_from=:kid` makes the signer the principal — is "this service's
-key signs, every client's key verifies".
+key signs, every client's key verifies". That registry is safe only if you trust every client
+with every claim, which is what the next section is about.
+
+#### Every key is trusted for every claim
+
+**A keyset is one trust domain.** Any key in it, verify-only keys included, can sign a token
+that verifies, and the validator does not ask which key signed before it believes the claims.
+A partner holding a registry key can sign `{"role": "admin"}` with that key, and
+`role_required("admin")` lets it through. Under the default `identity_from = :claim`, it can
+also sign any `sub` and log in as any user. `identity_from = :kid` pins **who** the principal
+is, not **what it may claim**.
+
+So do one of the following:
+
+  * **One keyset and one validator per trust domain.** Your own identity provider's keys go in
+    one keyset, and each partner registry gets a separate validator on its own routes. This is
+    the default to reach for.
+  * **`kid_required` on every claim-guarded route** that a shared keyset can reach, so a claim
+    counts only when it was signed by a key you meant to trust with it:
+
+    ```julia
+    GuardMiddleware(kid_required(["current", "previous"]), role_required("admin"))
+    ```
+
+A rotation window, where every key belongs to the same issuer, is one trust domain by
+construction, so none of this applies to it.
 
 A plain `Dict` of `kid => secret` still works, and is lifted into a `JWTKeyset`:
 
@@ -360,6 +413,7 @@ The constructor owns every check, so they apply on every path — `jwt_validator
   * **A secret that is not a string.** A value must be an `AbstractString` or a `SecretString`
     (which is accepted as is — no need to `reveal` it). A `Vector{UInt8}` is refused **without
     being read**: converting one to a `String` empties the caller's buffer.
+  * **A secret shorter than 32 bytes**, verify-only keys included (RFC 7518 §3.2).
   * **An empty secret, a duplicate `kid`, and a `kid` that is not a `String` or `Symbol`.**
 
 #### Tokens that carry no `kid`

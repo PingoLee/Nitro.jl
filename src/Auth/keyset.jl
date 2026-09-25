@@ -38,6 +38,8 @@ Every pair is `kid => secret`. A `kid` is a `String` or `Symbol`; a secret is an
 - a secret of any other type — a `Vector{UInt8}` in particular is refused **without being
   read**, so the caller's buffer is left intact;
 - an empty secret, or one HMAC treats as empty (a short run of `"\\0"` bytes);
+- a secret shorter than 32 bytes — RFC 7518 §3.2's floor for an HS256 key. Generate one with
+  `bytes2hex(Nitro.Crypto.secure_random_bytes(32))`;
 - two keys with the same `kid`;
 - two keys that are the same HMAC key. The comparison is by HMAC key, not by string:
   HMAC-SHA256 pre-hashes a key longer than its block and zero-pads a shorter one, so `K` and
@@ -56,6 +58,15 @@ Every pair is `kid => secret`. A `kid` is a `String` or `Symbol`; a secret is an
 | empty | `ArgumentError` |
 
 A `Dict` holding both `"a"` and `:a` is refused rather than silently shadowed.
+
+# Every key is trusted for every claim
+
+A keyset is **one trust domain**. Whoever holds any of its keys — verify-only ones included —
+can sign any claims: a partner's key can sign `{"role": "admin"}`, and under the default
+`identity_from = :claim` it can sign any `sub`. `identity_from = :kid` pins *who* the
+principal is, not *what it may claim*. Keep keys you would not trust with every claim in a
+separate keyset and validator, or gate every claim-guarded route with
+[`kid_required`](@ref) as well.
 
 Build the keyset **once**, at configuration time. `jwt_validator` lifts a `Dict` once and
 keeps that snapshot; a direct `decode_jwt` or `encode_jwt` call with a `Dict` lifts — and
@@ -169,6 +180,9 @@ function _keyset_entry(pair::Pair, use::Symbol)
     _empty_hmac_key(reveal(wrapped)) && throw(ArgumentError(
         "JWTKeyset: the secret for kid $(repr(kid)) is empty, or equivalent to the empty HMAC " *
         "key; a token signed with the empty string would verify against it"))
+    _short_hmac_key(reveal(wrapped)) && throw(ArgumentError(
+        "JWTKeyset: the secret for kid $(repr(kid)) is $(ncodeunits(reveal(wrapped))) bytes; " *
+        _SHORT_SECRET_ADVICE))
     return (kid, wrapped, use)
 end
 
@@ -182,10 +196,27 @@ const _EMPTY_SECRET_MESSAGE =
     "get(ENV, \"JWT_SECRET\", \"\") is the usual cause -- read it with a `nothing` default " *
     "and fail at startup instead"
 
-# The plain-string counterpart of `_keyset_entry`'s check. Deliberately no `repr(secret)`
-# in the message.
+# RFC 7518 §3.2: an HS256 key is at least as long as the hash output, 256 bits. One issued
+# token is enough to test guesses against a short key offline, so `"secret"` is as good as
+# no key to anyone holding a token (#321). The same floor `MIN_COOKIE_SECRET_BYTES` sets for
+# cookie secrets (#309). Checked AFTER `_empty_hmac_key`, so an unset env var still gets
+# the message that names it -- and 32+ NUL bytes, which is long enough, is still empty.
+const MIN_JWT_SECRET_BYTES = 32
+
+_short_hmac_key(secret::AbstractString) = ncodeunits(secret) < MIN_JWT_SECRET_BYTES
+
+const _SHORT_SECRET_ADVICE =
+    "an HS256 key must be at least $MIN_JWT_SECRET_BYTES random bytes (RFC 7518 §3.2), or one " *
+    "issued token is enough to brute-force it offline. Generate one once -- e.g. " *
+    "`bytes2hex(Nitro.Crypto.secure_random_bytes(32))` -- and read it from the environment " *
+    "rather than writing it in source"
+
+# The plain-string counterpart of `_keyset_entry`'s checks. Deliberately no `repr(secret)`
+# in either message.
 function _check_string_secret(secret::AbstractString)
     _empty_hmac_key(secret) && throw(ArgumentError(_EMPTY_SECRET_MESSAGE))
+    _short_hmac_key(secret) && throw(ArgumentError(
+        "the JWT secret is $(ncodeunits(secret)) bytes; " * _SHORT_SECRET_ADVICE))
     return secret
 end
 

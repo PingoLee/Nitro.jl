@@ -23,7 +23,7 @@ const NOW_TS = trunc(Int, time())
   end
 
   @testset "JWT encode/decode and validation" begin
-    keyset = Dict("default" => "secret-a", "rotated" => "secret-b")
+    keyset = Dict("default" => ("secret-a" * "-0123456789abcdefghijklmnopq"), "rotated" => ("secret-b" * "-0123456789abcdefghijklmnopq"))
     token = Nitro.Auth.encode_jwt(
         Dict(
             "sub" => "42",
@@ -32,15 +32,15 @@ const NOW_TS = trunc(Int, time())
             "exp" => NOW_TS + 60,
             "nbf" => NOW_TS - 1,
         ),
-        Nitro.Auth.JWTKeyset("rotated" => "secret-b")
+        Nitro.Auth.JWTKeyset("rotated" => ("secret-b" * "-0123456789abcdefghijklmnopq"))
     )
 
     claims, kid = Nitro.Auth.decode_jwt(token, keyset; issuer="nitro-tests", audience="nitro", with_kid=true)
     @test claims["sub"] == "42"
     @test kid == "rotated"
 
-    expired = Nitro.Auth.encode_jwt(Dict("sub" => "42", "exp" => NOW_TS - 120), "secret-a")
-    @test_throws Nitro.Auth.AuthError Nitro.Auth.decode_jwt(expired, "secret-a")
+    expired = Nitro.Auth.encode_jwt(Dict("sub" => "42", "exp" => NOW_TS - 120), ("secret-a" * "-0123456789abcdefghijklmnopq"))
+    @test_throws Nitro.Auth.AuthError Nitro.Auth.decode_jwt(expired, ("secret-a" * "-0123456789abcdefghijklmnopq"))
   end
 
   @testset "Password helpers" begin
