@@ -194,6 +194,19 @@ Global middleware runs on **every** request, including ones that match no route 
 whose path matches but whose method does not (405). A route cannot opt out of it: passing
 `middleware = []` on a `path()` call means "no *extra* middleware", not "skip the global chain".
 
+The `req.target` global middleware reads is the path the router will match. An absolute-form
+request line (`GET http://host/admin/users`) arrives reduced to `/admin/users`, and a path with
+an empty segment (`//admin/users`, `/admin//users`) is answered `400` before any middleware
+runs. HTTP.jl's router drops empty segments, so without that refusal `//admin/users` would reach
+`/admin/users` past a `startswith(req.target, "/admin/")` test.
+
+That makes a gate on the literal segments of a route sound, and nothing more. The target is still
+percent-encoded, and some things decode it only after global middleware has run. A static or SPA
+mount decodes the path below its root before looking the file up, so `/files/%70rivate/x` serves
+`private/x` past a `startswith(req.target, "/files/private/")` test. Guards on the route or
+router are the better place to authorize: they run on the route that was actually matched, not on
+a URL pattern that has to be kept in step with `urlpatterns`.
+
 ### Rewriting the method or the target
 
 The route, and with it the router and route middleware, is chosen **after** global middleware

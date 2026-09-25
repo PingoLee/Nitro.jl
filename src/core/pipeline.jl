@@ -322,8 +322,9 @@ function setupmiddleware(ctx::App; middleware::Vector=[], serialize::Bool=true, 
     # `HTTP.Router` is a *callable struct*, not a `Function` — `HTTP.Handlers.Router <: Function`
     # is false. Three of the layers that can end up wrapping it are typed on `Function` and so
     # reject it outright: `_app_context_seed` below, and `foldlayers`/`buildmiddleware` in
-    # src/routerhof.jl. (`DefaultSerializer`, `PrefixStripMiddleware` and user middleware are
-    # untyped and accept it fine.) So start the fold from an adapter rather than the bare router.
+    # src/routerhof.jl. (`DefaultSerializer`, `PrefixStripMiddleware`, `OriginFormMiddleware` and
+    # user middleware are untyped and accept it fine.) So start the fold from an adapter rather
+    # than the bare router.
     #
     # `serialize=false` is what exposes this, because the serializer is otherwise the thing that
     # wraps the router into a closure on the first fold step. On `serve` it used to survive by
@@ -352,6 +353,11 @@ function setupmiddleware(ctx::App; middleware::Vector=[], serialize::Bool=true, 
         # served the first one's chain (#79).
         compose(ctx.service.router, processed_middleware, ctx.service.custommiddleware),
         global_prefix_middleware...,
+        # Installed on every pipeline, prefix or not (#341): it makes `req.target` the path the
+        # router will match, so a global gate keyed on the URL is not bypassed by `//admin/…`
+        # or absolute-form. OUTSIDE the prefix strip, which only understands origin-form, so
+        # `http://h/api/x` is reduced and then stripped rather than refused as a 404.
+        OriginFormMiddleware(),
         # Outside every layer that can throw, inside the access log so that log line records
         # the 500 this produces (#256).
         error_boundary...,

@@ -1409,7 +1409,8 @@ test; the note at that testset says why.)
 `X-HTTP-Method-Override` or path-alias layer has already run by the time this is written and
 never trips the guard. Only **router-level and route-level** middleware sit between `compose`'s
 lookup and the terminal, so a mismatch here means one of those rewrote the request after its
-chain was chosen. (`PrefixStripMiddleware` folds outside `compose` too, src/core/pipeline.jl.)
+chain was chosen. (`PrefixStripMiddleware` and `OriginFormMiddleware` fold outside `compose` too,
+src/core/pipeline.jl.)
 
 A mismatch is **not** simply re-resolved, and that is the #291 fix. The chain that already ran
 was chosen for the stashed route; the rewritten request may reach a different leaf whose own

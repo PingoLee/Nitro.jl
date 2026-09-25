@@ -29,7 +29,14 @@ interpolation, or logging. (`dump` bypasses `show` and still walks raw fields; t
 is explicit introspection, not accidental disclosure.)
 
 # Keyword arguments
-- `middleware=[]`: global middleware applied to every request, outermost first.
+- `middleware=[]`: global middleware applied to every request, outermost first. It sees
+  `req.target` in the form the router matches (#341): an absolute-form target
+  (`http://host/users`) arrives reduced to its path and query (`/users`), and a path with an
+  empty segment (`//admin/…`) is answered `400` before any middleware runs. So a
+  `startswith(req.target, "/admin/")` test sees every request routed to a literal `/admin/…`
+  path. It does not cover a file below a static mount, whose path is percent-decoded after
+  middleware runs (`/files/%70rivate/x` is `private/x`). Guards on the route or router remain
+  the place to authorize.
 - `host="127.0.0.1"`, `port=8080`: listen address. Keep `host` on loopback when a
   reverse proxy terminates TLS in front of Nitro.
 - `async=false`: when `true`, return the running `Server` instead of blocking.
@@ -57,9 +64,7 @@ is explicit introspection, not accidental disclosure.)
   Trailing slashes are dropped (`"/api/"` is `"/api"`). The prefix is matched byte for byte
   against the raw request-target, so write it as clients send it: ASCII, percent-encoded with
   uppercase escapes, and with no `?`, `#`, whitespace, empty or dot segments. Anything else,
-  including `""` and `"/"`, is an `ArgumentError`. Even so, do not authorize in global middleware
-  by testing `req.target`: some targets, such as `//admin/…`, reach a route whose path they do
-  not start with (#341). Put authorization on the route or router.
+  including `""` and `"/"`, is an `ArgumentError`.
 - `revise=:none`: `:lazy`/`:eager` enable Revise-based hot reload (dev only).
 - `secret_key`, `httponly`, `secure`, `samesite`: override cookie defaults for this run.
 - `shutdown_timeout=10.0`: seconds `terminate` waits for in-flight requests to drain
