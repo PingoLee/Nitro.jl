@@ -1,3 +1,65 @@
+# #369 with a REAL SIGINT. In-process, an interrupt can only be thrown from inside a sweep (the
+# `InterruptingCleanupStore` testset in the "Workers" item below). Where Julia actually DELIVERS
+# one is the whole bug, and only a separate process can take a signal without taking the test
+# runner down with it.
+#
+# The child is the issue's own reproduction. `--code-coverage=none` for the reason
+# test/bodyparser_tests.jl gives: an inherited coverage flag costs the child its pkgimages. The
+# "unhandled task" match is case-insensitive because `errormonitor` upper-cases it when stderr is
+# not a terminal.
+#
+# Not on Windows: there is no `kill -INT` to send, and Julia's console Ctrl-C there is a
+# different mechanism.
+@testitem "Workers -- Ctrl-C reaches the main task, not the retention scheduler (#369)" tags=[:workers, :slow] setup=[NitroCommon] begin
+using Test
+
+const CTRL_C_CHILD = raw"""
+Base.exit_on_sigint(false)          # what every REPL does
+using Nitro, Nitro.Workers
+rt = WorkerRuntime(InMemoryWorkerStore())
+s = start_cleanup_scheduler(; interval_hours=24, runtime=rt)
+# A plain OS process sends the signal, so no extra Julia task competes for thread 1. Four
+# seconds, not two: under `1,0` the scheduler's first run starts only once the main task parks,
+# and it JIT-compiles `_cleanup_scheduler_loop` then -- a signal landing mid-compile, before
+# the loop's `try`, would fail the task and look like the bug.
+run(`sh -c "sleep 4; kill -INT $(getpid())"`; wait=false)
+got = try
+    sleep(8)                        # parked the way a blocking `serve` parks
+    :main_never_saw_it
+catch e
+    e isa InterruptException ? :main_interrupted : rethrow()
+end
+println("RESULT main=", got, " scheduler_failed=", istaskfailed(s.task))
+"""
+
+function ctrl_c_child(threads::String)
+    cmd = `$(Base.julia_cmd()) --code-coverage=none --threads=$threads --project=$(Base.active_project()) --startup-file=no -e $CTRL_C_CHILD`
+    out, err = IOBuffer(), IOBuffer()
+    p = run(pipeline(ignorestatus(cmd); stdout=out, stderr=err))
+    return (; exitcode=p.exitcode, out=String(take!(out)), err=String(take!(err)))
+end
+
+if !Sys.iswindows()
+    @testset "with an interactive thread -- Julia 1.12's default for `julia` and `-t auto`" begin
+        r = ctrl_c_child("1,1")
+        @test r.exitcode == 0
+        # Against the unpatched scheduler: `main=main_never_saw_it scheduler_failed=true`.
+        @test contains(r.out, "RESULT main=main_interrupted scheduler_failed=false")
+        @test !occursin(r"unhandled task"i, r.err)
+    end
+
+    @testset "on one shared thread -- `-t 1`" begin
+        # Whichever task parked last takes the press here, which in practice is the scheduler. It
+        # must stop with its warning rather than die (unpatched: `scheduler_failed=true`).
+        r = ctrl_c_child("1,0")
+        @test r.exitcode == 0
+        @test contains(r.out, "scheduler_failed=false")
+        @test !occursin(r"unhandled task"i, r.err)
+    end
+end
+
+end
+
 @testitem "Workers" tags=[:core, :workers] setup=[NitroCommon] begin
 
 using Test
@@ -28,12 +90,12 @@ struct ScopeProbeStore <: AbstractWorkerStore
     ScopeProbeStore() = new(Channel{Symbol}(8))
 end
 
-# `isready ||`, so the sweep NEVER blocks. `timedwait`'s poll interval has a 0.1s floor, so a
-# scheduler asked for a 0.01s tick fires ~10x a second while the test takes exactly one entry.
-# An unguarded `put!` on a bounded channel would fill it within a second and then block the
-# scheduler INSIDE `cleanup_tasks!` -- no longer parked in `timedwait`, so it never observes the
-# stop signal, and `stop_cleanup_scheduler!` joins it with no deadline (workers §6). That hangs
-# the CI leg instead of failing it, which is the worse outcome by a distance.
+# `isready ||`, so the sweep NEVER blocks. The scheduler ticks on a plain `Timer` (#369), which
+# has no poll floor, so one asked for a 0.01s tick fires ~100x a second while the test takes
+# exactly one entry. An unguarded `put!` on a bounded channel would fill it at once and then block
+# the scheduler INSIDE `cleanup_tasks!` -- no longer parked in its `wait`, so it never observes
+# the stop signal, and `stop_cleanup_scheduler!` joins it with no deadline (workers §6). That
+# hangs the CI leg instead of failing it, which is the worse outcome by a distance.
 Nitro.Workers.cleanup_tasks!(s::ScopeProbeStore, ::Int) =
     (isready(s.seen) || put!(s.seen, _SCOPE_PROBE[]); 0)
 
@@ -1904,7 +1966,7 @@ end
         dead = @async error("simulated: the sweep died hours ago")
         @test wait_for(() -> istaskdone(dead)) == :ok
         @test istaskfailed(dead)
-        get_cleanup_scheduler(rt)[] = CleanupScheduler(dead, Channel{Nothing}(1))
+        get_cleanup_scheduler(rt)[] = CleanupScheduler(dead, Channel{Nothing}(1), Base.Event(true))
 
         # Against the unpatched code this line throws `TaskFailedException` and nothing below it
         # happens: the queue stays open, the registry stays populated, the handle stays.
@@ -1925,9 +1987,105 @@ end
 
         # The runtime-argument form -- what `startup(cleanup_enabled=false)` calls -- clears the
         # slot for a dead task too, instead of throwing before it gets there.
-        get_cleanup_scheduler(rt)[] = CleanupScheduler(dead, Channel{Nothing}(1))
+        get_cleanup_scheduler(rt)[] = CleanupScheduler(dead, Channel{Nothing}(1), Base.Event(true))
         @test (@test_logs (:error, r"retention scheduler had already died") match_mode=:any stop_cleanup_scheduler!(rt)) === nothing
         @test get_cleanup_scheduler(rt)[] === nothing
+    finally
+        reset_runtime!(rt)
+    end
+end
+
+# `stop_cleanup_scheduler!` joins the task with no deadline, so a lost wake-up would HANG the CI
+# leg instead of failing it. Every #369 stop below goes through this, which turns a hang into a
+# red assertion.
+function stop_within(stop::Function, seconds::Real=5.0)
+    t = @async stop()
+    return timedwait(() -> istaskdone(t), seconds) === :ok && !istaskfailed(t)
+end
+
+@testset "the retention scheduler is off thread 1, parks without polling, and stops at once (#369)" begin
+    # #369. With `exit_on_sigint(false)` -- every REPL -- Julia throws SIGINT into whichever task
+    # PARKED LAST on thread 1. The scheduler was `@async`-sticky and polled in `timedwait` 10x a
+    # second, so it re-parked there constantly and took the user's Ctrl-C: the task died and
+    # `serve` kept running. Under Julia 1.12's default layout thread 1 is the interactive thread,
+    # which a `:default`-pool task never runs on -- so the placement IS the fix.
+    rt = WorkerRuntime(InMemoryWorkerStore())
+    try
+        scheduler = start_cleanup_scheduler(; interval_hours=24, retain_days=7, runtime=rt)
+        @test scheduler.task.sticky === false
+        @test Threads.threadpool(scheduler.task) === :default
+
+        # A day-long interval, and the stop must still be immediate: it no longer relies on a
+        # poll noticing a closed channel, so it must wake the one `wait` the loop is parked in.
+        sleep(0.2)
+        @test !istaskdone(scheduler.task)
+        @test stop_within(() -> stop_cleanup_scheduler!(rt), 2.0)
+        @test istaskdone(scheduler.task)
+        @test !istaskfailed(scheduler.task)
+    finally
+        reset_runtime!(rt)
+    end
+
+    # A stop that lands BEFORE the loop first parks -- the spawned task may not have run at all
+    # yet. The autoreset `Event` holds the notify, and the `isopen` check skips the wait; lose
+    # either and the join hangs. Repeated because the interleaving is the scheduler's to choose.
+    for i in 1:25
+        rt_race = WorkerRuntime(InMemoryWorkerStore())
+        try
+            racing = start_cleanup_scheduler(; interval_hours=24, retain_days=7, runtime=rt_race)
+            @test stop_within(() -> stop_cleanup_scheduler!(rt_race))
+            @test istaskdone(racing.task)
+        finally
+            reset_runtime!(rt_race)
+        end
+    end
+end
+
+@testset "an interrupt stops the retention scheduler with a warning, not a failure (#369)" begin
+    # Where an interrupt that DOES land in the scheduler goes -- reachable under `julia -t 1`,
+    # where every task shares thread 1. The loop now stops NORMALLY with a `@warn`: rethrowing
+    # only killed it with an `Unhandled Task ERROR` while the server kept running, and looping on
+    # would re-park it as the last task on thread 1 and eat every later press too. The reasoning
+    # is next to `_cleanup_scheduler_loop`.
+    #
+    # A real SIGINT cannot be aimed at one task in-process, so the interrupt arrives the way the
+    # per-tick rethrow routes one that lands inside a sweep: out of `cleanup_tasks!`. The one that
+    # lands in the WAIT is exercised with a real signal by the child-process item at the top of
+    # this file.
+    mutable struct InterruptingCleanupStore <: AbstractWorkerStore
+        inner  :: InMemoryWorkerStore
+        sweeps :: Int
+    end
+    function Nitro.Workers.cleanup_tasks!(s::InterruptingCleanupStore, ::Int)
+        s.sweeps += 1
+        throw(InterruptException())
+    end
+    Nitro.Workers.lock_tasks(f::Function, s::InterruptingCleanupStore) = Nitro.Workers.lock_tasks(f, s.inner)
+    Nitro.Workers.get_task_info(s::InterruptingCleanupStore, id::String) = Nitro.Workers.get_task_info(s.inner, id)
+
+    store = InterruptingCleanupStore(InMemoryWorkerStore(), 0)
+    rt = WorkerRuntime(store)
+    try
+        # Started INSIDE `@test_logs`, so the spawned task inherits the capturing logger.
+        scheduler = @test_logs (:warn, r"interrupt \(Ctrl-C\) reached the task retention scheduler") match_mode=:any begin
+            s = start_cleanup_scheduler(; interval_hours=0.00005, retain_days=7, runtime=rt)
+            @test wait_for(() -> istaskdone(s.task)) == :ok
+            s
+        end
+        # Against the unpatched loop the interrupt escaped and the task FAILED.
+        @test !istaskfailed(scheduler.task)
+        @test store.sweeps == 1          # stopped -- not looping on to take the next press too
+
+        # ...so teardown has nothing to report: no "had already died" `@error`, no warning.
+        @test_logs min_level=Base.CoreLogging.Warn @test(stop_within(() -> stop_cleanup_scheduler!(rt)))
+        @test get_cleanup_scheduler(rt)[] === nothing
+
+        # And retention can be started again.
+        fresh = start_cleanup_scheduler(; interval_hours=24, retain_days=7, runtime=rt)
+        @test fresh.task !== scheduler.task
+        @test !istaskdone(fresh.task)
+        @test stop_within(() -> stop_cleanup_scheduler!(rt))
+        @test !istaskfailed(fresh.task)
     finally
         reset_runtime!(rt)
     end
@@ -2873,6 +3031,45 @@ end
         end
     end
 
+    @testset "an unrecoverable exception is terminal: FAILED at once, never retried (#367)" begin
+        # `StackOverflowError`, `OutOfMemoryError` and `InterruptException` report on the
+        # PROCESS, not the job. The per-attempt catch used to retry them like any failure --
+        # re-running a callback that had just overflowed the stack. They now take the timeout's
+        # arm: recorded FAILED on the first attempt, and not rethrown, since nothing waits on
+        # the run to receive one (the reasoning is in `is_unrecoverable`'s site table).
+        #
+        # The discriminating assertion is the DEADLINE on FAILED, not `attempts == 1`: against
+        # the unpatched loop the first attempt is followed by a 2s backoff (then 4s, 8s), so
+        # `attempts` is still 1 when a quick check runs and only the time to FAILED tells the
+        # two apart. Unpatched, FAILED lands after 2+4+8 = 14s, so the deadline must stay well
+        # under that; 10s leaves a slow runner's first-call compilation all the room it needs.
+        # Thrown synthetically -- a real overflow is not safe in-process (#254, #301).
+        for exc in (StackOverflowError(), OutOfMemoryError(), InterruptException()),
+            sequential in (false, true),
+            timeout in (0, 30)
+            label = "$(nameof(typeof(exc))) sequential=$sequential timeout=$timeout"
+            rt_store = WorkerRuntime(InMemoryWorkerStore())
+            attempts = Threads.Atomic{Int}(0)
+            callback = () -> (Threads.atomic_add!(attempts, 1); throw(exc))
+            options = TaskOptions(retry_on_failure=true, max_retries=3, timeout=timeout)
+            try
+                id = sequential ?
+                    submit_sequential_task("unrecoverable-q", "boom", callback, Owner("u");
+                                           options=options, runtime=rt_store) :
+                    submit_task("boom", callback, Owner("u"); options=options, runtime=rt_store)
+                failed = wait_for(() -> get_task_status(id, Owner("u"); runtime=rt_store)[:status] ==
+                                        "FAILED"; timeout=10.0)
+                @test (label, failed) == (label, :ok)
+                status = get_task_status(id, Owner("u"); runtime=rt_store)
+                @test (label, occursin(string(nameof(typeof(exc))), something(status[:error], ""))) ==
+                      (label, true)
+                @test (label, attempts[]) == (label, 1)
+            finally
+                reset_runtime!(rt_store)
+            end
+        end
+    end
+
     @testset "a fast task leaves no handle behind" begin
         # `_execute_task_async` used to also `register_active_task!` from the PARENT, after the
         # spawn. Under `@async` that was a duplicate write of the same Task object and merely
@@ -3634,8 +3831,8 @@ end
 
 # #266. With `zombie_min_age` set, the boot sweep defers claims younger than the window, and
 # before this nothing ever came back for them: the sweep ran only at `start!`. The retention tick
-# now re-runs the bounded sweep. Every scheduler below ticks every ~0.2s (`timedwait`'s poll floor
-# is 0.1s). A sink is read only AFTER `stop_cleanup_scheduler!` has joined the task, per the #238
+# now re-runs the bounded sweep. Every scheduler below ticks every 0.18s (`0.00005` hours, on a
+# plain `Timer` since #369). A sink is read only AFTER `stop_cleanup_scheduler!` has joined the task, per the #238
 # retention test above: `TestLogger` takes no lock.
 const _ZOMBIE_TICK_HOURS = 0.00005
 const _ZOMBIE_DONE = "Nitro.Workers: zombie recovery complete"
@@ -3961,18 +4158,6 @@ end
         @test got === :outer
         # ...but the log reached the submitter's logger.
         @test any(r -> occursin("from a detached run", string(r.message)), sink.logs)
-    end
-
-    @testset "_schedule_detached drops the scope and keeps @async's stickiness" begin
-        detached = with(_SCOPE_PROBE => :inner) do
-            fetch(Nitro.Workers._schedule_detached(() -> _SCOPE_PROBE[]))
-        end
-        @test detached === :outer
-
-        probe = Nitro.Workers._schedule_detached(() -> nothing)
-        reference = @async nothing
-        wait(probe); wait(reference)
-        @test probe.sticky === reference.sticky === true
     end
 
     @testset "submit_task" begin

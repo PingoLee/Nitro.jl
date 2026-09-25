@@ -60,26 +60,45 @@ using ...Types: require_fixed_period
 # the spawn.
 #
 # `token` is per ACTIVATION, never a shared `running` flag -- see `_janitor`.
+#
+# ── An interrupt (#369) ──
+#
+# The outer `try` ends the loop NORMALLY on an `InterruptException`, with one `@warn`, wherever it
+# lands -- in the `sleep` or, through the per-tick rethrow, in `work`. It is the same decision the
+# Workers retention scheduler records next to `_cleanup_scheduler_loop` (src/Workers/api.jl), and
+# the reasoning there is canonical. In short: with `exit_on_sigint(false)` Julia throws SIGINT into
+# whichever task parked last on thread 1. This task is `Threads.@spawn`, so under Julia 1.12's
+# default layout (thread 1 is the interactive thread) it never gets one. Under `-t 1` it can.
+# Rethrowing then only killed the janitor with an `Unhandled Task ERROR` while the server kept
+# running. Swallowing and looping would re-park it as the last task on thread 1 and eat every
+# later press too. Stopping frees the next press for the server, and `_janitor`'s `finally`
+# still retires the activation, so a later `on_startup()` respawns it.
 function _janitor_loop(work::Function, token::Ref{Bool}, interval::Period,
                        label::String, what::String)
-    while token[]
-        sleep(interval)
-        # Re-check AFTER the sleep: `on_shutdown` may have fired while we were parked, and this is
-        # the point a stale task from a previous activation leaves for good.
-        token[] || break
-        # The `try` is INSIDE the `while` on purpose. Hoisting it out turns one transient failure
-        # into a permanently dead janitor -- silently, since nothing waits on this task -- in
-        # components whose entire job is bounding memory. That is #169.
-        try
-            work()
-        catch e
-            # Rethrow guard, per the idiom in src/utilities/misc.jl and src/types.jl: a catch-all
-            # that eats `InterruptException` makes Ctrl-C during a tick a no-op. The window is
-            # narrow (the `sleep` is outside the `try`), but the guard is free -- and before #190
-            # only one of the three copies had it, on the wrong one of the two.
-            e isa InterruptException && rethrow()
-            @error "Nitro.$label: $what failed" exception=(e, catch_backtrace())
+    try
+        while token[]
+            sleep(interval)
+            # Re-check AFTER the sleep: `on_shutdown` may have fired while we were parked, and this
+            # is the point a stale task from a previous activation leaves for good.
+            token[] || break
+            # The `try` is INSIDE the `while` on purpose. Hoisting it out turns one transient
+            # failure into a permanently dead janitor -- silently, since nothing waits on this
+            # task -- in components whose entire job is bounding memory. That is #169.
+            try
+                work()
+            catch e
+                # Rethrow guard, per the idiom in src/utilities/misc.jl and src/types.jl: a
+                # catch-all that eats `InterruptException` makes Ctrl-C during a tick a no-op.
+                # It now lands in the outer handler below (#369), which stops the loop rather than
+                # looping on -- before #190 only one of the three copies had this guard at all.
+                e isa InterruptException && rethrow()
+                @error "Nitro.$label: $what failed" exception=(e, catch_backtrace())
+            end
         end
+    catch e
+        e isa InterruptException || rethrow()
+        @warn "Nitro.$label: an interrupt (Ctrl-C) reached the $what task instead of the server. " *
+              "It has stopped until the server is started again. Press Ctrl-C again to stop the server."
     end
     return nothing
 end

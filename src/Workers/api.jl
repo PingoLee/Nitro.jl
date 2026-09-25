@@ -580,8 +580,8 @@ end
 # against a task executing on another thread and aborted the process. #127 removed both
 # injections, and that -- not any property of this function -- is what makes migration safe. Note
 # the criterion is "does anything inject into this task?", not "is this the request path": with
-# nothing injecting anywhere, `start_cleanup_scheduler` could migrate too, and stays `@async` only
-# because it runs no user code.
+# nothing injecting anywhere, `start_cleanup_scheduler` could migrate too -- and since #369 it has,
+# because a sticky task parked on thread 1 is where a REPL's Ctrl-C lands.
 #
 # Nothing in `src/Workers/` depends on thread affinity: no `Threads.threadid()`, no task-local
 # storage, no `SpinLock`. Every lock here is a `ReentrantLock`, which keys on `current_task()`, so
@@ -688,7 +688,11 @@ function _execute_task_async(runtime::WorkerRuntime, task_key::String, callback:
                     # put four copies of the callback on the thread pool at once, sharing one
                     # `task_info` and one set of external side effects (#127). The token is not
                     # reset between attempts either, so a retry would start pre-cancelled.
-                    if unwrapped isa TaskTimeoutError
+                    #
+                    # So are the three `is_unrecoverable` exceptions (#367), recorded FAILED and
+                    # never rethrown. Why neither a retry nor a rethrow is canonical in that
+                    # function's site table (src/errors.jl); `_execute_queued_task` does the same.
+                    if unwrapped isa TaskTimeoutError || is_unrecoverable(unwrapped)
                         return _fail_task!(runtime, task_info, _store_error_text(runtime.store, unwrapped))
                     end
 
@@ -1112,6 +1116,14 @@ runs `FAILED` on every tick. [`start!`](@ref) passes its own `zombie_min_age` he
 The two sweeps fail independently. A throw costs that sweep one tick, never the other sweep and
 never the scheduler. Each logs at `@info` only when it did something.
 
+The scheduler runs on the `:default` thread pool and, between ticks, waits once rather than
+polling ([#369](https://github.com/PingoLee/Nitro.jl/issues/369)). While Julia has an
+interactive thread, which is the 1.12 default for `julia` and `julia -t auto`, a Ctrl-C at the
+REPL therefore reaches `serve` and not this task. Under `julia -t 1` every task shares one thread
+and it can land here. The scheduler then logs a warning and stops normally, rather than dying
+with an unhandled error or swallowing that press and every later one. Retention is off until
+the scheduler is started again.
+
 The bound works by age alone, so choose it as you would for the boot sweep: longer than any task
 legitimately runs. `Second(0)` passes validation but bounds nothing, which on a timer is exactly
 the unbounded periodic sweep described above.
@@ -1138,14 +1150,26 @@ function start_cleanup_scheduler(; interval_hours::Real=24, retain_days::Int=7,
     end
 
     stop_signal = Channel{Nothing}(1)
+    wake = Base.Event(true)
     interval_seconds = max(interval_hours * 3600, 0.01)
-    # Deliberately `@async` while worker bodies are `Threads.@spawn` (#30). The old
-    # discriminator -- "does anything `schedule(…, error=true)` this task?" -- stopped
-    # discriminating when #127 removed every injection, so it is not the reason. The reason is
-    # that this task runs no user code: it sleeps in `timedwait` and calls `cleanup_old_tasks`
-    # once a day (plus, with a bound, the zombie sweep, #266, which is store calls too), so there
-    # is nothing here that could starve a thread and nothing to gain from
-    # migrating it. It is stopped by a `Channel` signal, never by an interrupt.
+    # `_spawn_detached` -- the `:default` pool, NOT sticky -- and that placement is the #369 fix,
+    # more than the wait below is. With `exit_on_sigint(false)` (every REPL) Julia throws SIGINT
+    # into whichever task PARKED LAST on thread 1, and under Julia 1.12's default layout thread 1
+    # is the interactive thread, which a `:default`-pool task never runs on. Probed on 1.12.7:
+    # a sticky task parked there takes the interrupt even when it does not poll, the moment it is
+    # the last to park; a `:default`-pool one never does. This used to be `_schedule_detached`
+    # (sticky, `@async`-shaped) on the argument that it "runs no user code" -- but its sweep is
+    # `cleanup_tasks!` on a caller-supplied store, a database DELETE for `PormGWorkerStore`, which
+    # is exactly the shape src/middleware/janitor.jl already refuses to pin to a request thread.
+    # Nothing injects into this task (#127), so migrating it is free.
+    #
+    # Idle, it is parked in ONE `wait(wake)` per tick, woken once by the tick's `Timer` or by
+    # `stop_cleanup_scheduler!`. It used to sit in `timedwait`, which POLLS at its 0.1s default --
+    # 864,000 wake-ups a day for a daily job, and each one re-parked it on thread 1, which is what
+    # kept making it the last task to park there. The `Timer` callback inherits this task's
+    # non-stickiness and pool (`Timer(cb, t)` copies the creator's `sticky`), so it is off
+    # thread 1 as well. It is stopped by closing `stop_signal` and notifying `wake`, never by an
+    # interrupt.
     #
     # This is Nitro's fourth background janitor, and it stays hand-rolled rather than going
     # through `_janitor` (src/middleware/janitor.jl) on purpose: it is channel-signalled and
@@ -1163,18 +1187,57 @@ function start_cleanup_scheduler(; interval_hours::Real=24, retain_days::Int=7,
     #     cost one tick, never the scheduler: this is the component whose entire job is bounding
     #     the task table, and with the `try` hoisted out (or absent, as it was) one transient
     #     error left rows accumulating for the life of the process (#169, #190, #195).
-    #   * `_schedule_detached`, not a bare `@async` (#209). The scheduler is started from
-    #     `start!`, which an app may well call inside its own bootstrap transaction, and it then
-    #     issues a store DELETE on every tick for the life of the process. `@async`'s stickiness
-    #     is kept; only the inherited dynamic scope is dropped.
-    task = errormonitor(_schedule_detached() do
+    #   * detached, not a bare `Threads.@spawn` (#209). The scheduler is started from `start!`,
+    #     which an app may well call inside its own bootstrap transaction, and it then issues a
+    #     store DELETE on every tick for the life of the process. The inherited dynamic scope is
+    #     dropped.
+    task = errormonitor(_spawn_detached() do
+        _cleanup_scheduler_loop(runtime, stop_signal, wake, interval_seconds, retain_days, zombie_min_age)
+    end)
+
+    scheduler = CleanupScheduler(task, stop_signal, wake)
+    scheduler_ref[] = scheduler
+    return scheduler
+end
+
+# The scheduler's loop, named for the reason `_janitor_loop` is (src/middleware/janitor.jl): the
+# placement of its `try`s and of its interrupt handler is the whole point, and a named function
+# keeps them readable and lets a test drive the loop without going through the spawn.
+#
+# ── An interrupt that lands here anyway (#369) ──
+#
+# Only reachable when there IS no interactive thread (`julia -t 1`, `JULIA_NUM_THREADS=1`): then
+# every task shares thread 1, and whichever parked last takes the Ctrl-C. The answer is to STOP,
+# say so, and return normally. Each alternative was ruled out:
+#
+#   * Rethrow (the old behavior): the task dies with an `Unhandled Task ERROR`, `serve` keeps
+#     running, and teardown logs "already died". The interrupt reaches nobody who can act on it.
+#   * Swallow and keep looping: the loop re-parks, is the last task to park again, and takes the
+#     NEXT Ctrl-C too -- probed, three presses in a row were all eaten and the main task never saw
+#     one. Ctrl-C could then never stop the server.
+#   * Forward it to the task blocked in `serve`: that is `schedule(t, exc; error=true)`, the
+#     injection #127 removed because it aborts the process when `t` is running on another thread,
+#     and a runtime does not know which `App`'s serve task, if any, it belongs to.
+#
+# Ending the task means it is no longer parked anywhere, so the next press goes elsewhere.
+# Retention stops until the scheduler is started again, and the `@warn` says so -- the one thing
+# the old rethrow did right was not being silent about it. The per-tick `rethrow` guards below
+# stay: they route an interrupt that lands INSIDE a sweep to this same handler.
+function _cleanup_scheduler_loop(runtime::WorkerRuntime, stop_signal::Channel{Nothing},
+                                 wake::Base.Event, interval_seconds::Real, retain_days::Int,
+                                 zombie_min_age::Union{Nothing, Dates.Period})
+    try
         while true
-            # Closed counts as stopped: `stop_cleanup_scheduler!` signals by closing, and an
-            # empty closed channel is never `isready`.
-            wait_result = timedwait(() -> isready(stop_signal) || !isopen(stop_signal), interval_seconds)
-            if wait_result == :ok
-                break
+            timer = Timer(_ -> notify(wake), interval_seconds)
+            try
+                # Closed counts as stopped. Checked before parking: a stop that landed during the
+                # previous sweep has already set `wake`, so this `wait` would return at once
+                # anyway -- checking first just skips the round trip.
+                isopen(stop_signal) && wait(wake)
+            finally
+                close(timer)
             end
+            isopen(stop_signal) || break
             # Zombies FIRST, and in a `try` of their own (#266). A failed write is logged and
             # absorbed inside the periodic sweep; this `try` is the backstop for anything else, so
             # a failed sweep costs this tick's sweep and never the retention pass below, which is
@@ -1215,11 +1278,13 @@ function start_cleanup_scheduler(; interval_hours::Real=24, retain_days::Int=7,
                 @error "Nitro.Workers: task retention sweep failed" exception=(e, catch_backtrace())
             end
         end
-    end)
-
-    scheduler = CleanupScheduler(task, stop_signal)
-    scheduler_ref[] = scheduler
-    return scheduler
+    catch e
+        e isa InterruptException || rethrow()
+        @warn "Nitro.Workers: an interrupt (Ctrl-C) reached the task retention scheduler " *
+              "instead of the server. The scheduler has stopped, so finished tasks are not " *
+              "retired until it is started again. Press Ctrl-C again to stop the server."
+    end
+    return nothing
 end
 
 function start_cleanup_scheduler(ctx::App; interval_hours::Real=24, retain_days::Int=7,
@@ -1229,12 +1294,18 @@ function start_cleanup_scheduler(ctx::App; interval_hours::Real=24, retain_days:
 end
 
 function stop_cleanup_scheduler!(scheduler::CleanupScheduler)
-    # `close`, not `put!`. Nothing ever `take!`s this signal -- the scheduler only polls it -- so a
-    # `Channel(1)` that already holds the token blocks the next `put!` forever, and the
-    # `isopen && !isready` guard is a check-then-act that two concurrent teardowns can both pass.
-    # That race was previously hard to reach; `shutdown!` is now called for every backend, from
-    # both `uninstall!` and `reset_runtime!`, so it is not. Closing is idempotent and needs no guard.
+    # `close`, not `put!`. Nothing ever `take!`s this signal -- the scheduler only checks `isopen`
+    # on it -- so a `Channel(1)` that already holds the token blocks the next `put!` forever, and
+    # the `isopen && !isready` guard is a check-then-act that two concurrent teardowns can both
+    # pass. That race was previously hard to reach; `shutdown!` is now called for every backend,
+    # from both `uninstall!` and `reset_runtime!`, so it is not. Closing is idempotent and needs no
+    # guard, and so is the `notify`.
+    #
+    # Close THEN notify, in that order: the loop re-checks `isopen` after every wake, so the
+    # notify only has to get it out of `wait` once the close is already visible (#369). A notify
+    # that arrives before the loop parks is held by the autoreset `Event`, not lost.
     close(scheduler.stop_signal)
+    notify(scheduler.wake)
     # `wait` on a task that has already FAILED rethrows its exception as a `TaskFailedException`,
     # and before #193 that escaped here -- straight out of `shutdown!`, whose first step this is,
     # ahead of the queue close, the #182 backlog abandon and the #176 drain. A scheduler that had

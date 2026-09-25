@@ -12,7 +12,7 @@ import Nitro.Core.Cookies: storesession!, prunesessions!
 import Nitro: pormg_nitro_session, sync_pormg_env!
 # Stored JSON is read through the same depth bound as request JSON, and written only when it can
 # be read back (#344). `is_unrecoverable` is the #254 catch policy every request-path site uses.
-import Nitro.Core.Util.BodyParsers: _parse_json_bounded, _check_json_depth
+import Nitro.Core.Util.BodyParsers: _parse_json_bounded, _check_json_depth, _check_value_depth
 import Nitro.Core.Errors: is_unrecoverable
 
 import Nitro.Workers: AbstractWorkerStore, TaskInfo, TaskStatus, TaskOptions,
@@ -238,14 +238,18 @@ _session_objects(store::PormGSessionStore) = store.model.objects.db(store.db_key
 #
 # Bounding only the read would make a value stored deeper than the bound permanently
 # unreadable: the session would silently reset on every request, the task info would error on
-# every read. So the WRITE refuses it instead, while the caller can still see why: the same
-# non-recursive byte scan, over the serialized text, before any row is touched. `max_fields = 0`
-# on the read: the per-request key cap guards request bodies, and this is the app's own data.
+# every read. So the WRITE refuses it instead, while the caller can still see why, before any row
+# is touched. `max_fields = 0` on the read: the per-request key cap guards request bodies, and
+# this is the app's own data.
 #
-# What this does NOT bound is `JSON.json` itself, which recurses too. A value deep enough to
-# overflow the serializer -- thousands of levels, which only the app can build, since request JSON
-# stops at 512 -- overflows before the scan runs, exactly as it did before this check existed.
+# Twice, and the order is the point. `JSON.json` recurses once per level, so a value deep enough
+# to overflow it -- thousands of levels, which only the app can build, since request JSON stops
+# at 512 -- used to raise `StackOverflowError` from inside the serializer before any check of its
+# output could run (#367). `_check_value_depth` walks the VALUE first, non-recursively and
+# mirroring the writer, and refuses it with the same `ArgumentError`. The scan of the text stays
+# as the final word: a `JSONText` is written verbatim, and only the text shows its depth.
 function _json_for_storage(value)::String
+    _check_value_depth(value)
     serialized = JSON.json(value)
     _check_json_depth(serialized)
     return serialized

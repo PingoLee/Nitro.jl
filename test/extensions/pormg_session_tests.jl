@@ -717,6 +717,28 @@ end
         @test occursin("does not decode", String(take!(io)))
     end
 
+    @testset "the depth is decided before the payload is serialized (#367)" begin
+        # `JSON.json` recurses once per level, so a payload deep enough to overflow it raised
+        # `StackOverflowError` from INSIDE the serializer, before the #344 scan of its output ever
+        # ran. A real overflow is not safe in-process (#254, #301), so a tripwire stands in for
+        # it: the serializer raises the overflow on reaching it, 600 levels down, and the walk has
+        # refused the payload at 513 without ever lowering it.
+        struct SessionTripwire end
+        JSON.lower(::SessionTripwire) = throw(StackOverflowError())
+        deep = foldl((v, _) -> Any[v], 2:600; init=Any[SessionTripwire()])
+        @test_throws StackOverflowError JSON.json(deep)     # what the write used to raise
+
+        m = MockModel()
+        s = RealPormGSessionStore(model=m)
+        @test_throws ArgumentError set_session!(s, "sess-tripwire", Dict{String,Any}("deep" => deep); ttl=3600)
+        @test !haskey(m._table, "sess-tripwire")
+
+        set_session!(s, "sess-live", Dict{String,Any}("user_id" => 1); ttl=3600)
+        before = m._table["sess-live"][:session_data]
+        @test_throws ArgumentError update_session!(s, "sess-live", Dict{String,Any}("deep" => deep); ttl=3600)
+        @test m._table["sess-live"][:session_data] == before
+    end
+
     @testset "an unrecoverable error reading a session propagates (#254, #344)" begin
         # Read as "no session", an overflow would log the visitor out and keep serving from a
         # process that may be corrupted. Ordinary failures still read as no session -- the
