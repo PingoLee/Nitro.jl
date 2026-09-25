@@ -1123,6 +1123,19 @@ in a `Vector` and prefix them with `include_routes`.
     type_hints::Dict{Symbol, Type} = Dict{Symbol, Type}()
 end
 
+"""
+    NamedRoute
+
+What `url` needs to reverse a named route: the full registered `path` (`{param}` placeholders)
+and the converter `type_hints` a value must satisfy to fill each one (#328). Internal.
+"""
+struct NamedRoute
+    path::String
+    type_hints::Dict{Symbol, Type}
+end
+
+Base.:(==)(a::NamedRoute, b::NamedRoute) = a.path == b.path && a.type_hints == b.type_hints
+
 RouteDefinition(pattern::String, handler::Function, methods::Vector{String}, name, middleware, type_hints) =
     RouteDefinition(; pattern, handler, methods, name, middleware, type_hints)
 

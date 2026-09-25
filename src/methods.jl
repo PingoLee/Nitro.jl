@@ -489,7 +489,12 @@ end
     url(name; kwargs...)
 
 Build a URL path for a named route registered through `path(..., name="...")`.
-Keyword arguments fill the route parameters.
+Keyword arguments fill the route parameters, percent-escaped.
+
+A value the route itself would not accept throws an `ArgumentError`, never a URL: `""`, `"."`
+and `".."` for any parameter, and for a converter parameter anything that does not parse as
+its type (`url("user-detail"; id = "abc")` for `<int:id>`). An empty leading segment would
+otherwise build a scheme-relative `//host` URL, an open redirect once passed to `Res.redirect`.
 """
 function url(name::String; kwargs...)
     return Nitro.Core.Routing.url(CONTEXT[], name; kwargs...)
