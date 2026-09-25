@@ -4309,6 +4309,10 @@ end
     @test worker_runtime(app) === nothing
     @test_throws ArgumentError startup(app; zombie_min_age = Dates.Minute(-1))
     @test worker_runtime(app) === nothing
+    # Refused before the install too: installed, it could never be torn down (`uninstall!` would
+    # throw on it from `on_shutdown`).
+    @test_throws ArgumentError startup(app; drain_timeout = -1)
+    @test worker_runtime(app) === nothing
 end
 
 @testset "#322: bare worker_startup shares default_runtime() with the bare task API" begin

@@ -340,8 +340,12 @@ function startup(ctx::App;
     drain_timeout::Real=WORKER_DRAIN_TIMEOUT_SECONDS,
 )
     # Refused here, where the middleware is built, not from the startup hook once serving began.
-    # Every check runs BEFORE the install below, so a refused call leaves nothing installed.
+    # Every check runs BEFORE the install below, so a refused call leaves nothing installed. A
+    # negative `drain_timeout` would otherwise install fine and then throw from `uninstall!` in
+    # `on_shutdown`, leaving a runtime nothing ever tears down.
     _check_zombie_min_age(zombie_min_age)
+    drain_timeout >= 0 || throw(ArgumentError(
+        "drain_timeout must be >= 0 (got $(drain_timeout)); 0 releases without waiting"))
     queue_names = String.(collect(queues))
 
     # Installed NOW, when the middleware is built, not in `on_startup` (#322). `serve()` opens its

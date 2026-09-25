@@ -806,6 +806,11 @@ serve(app; middleware = [workers])
 The startup hook still does the running part: the zombie sweep, one processor per queue in
 `queues`, and the retention scheduler. The shutdown hook drains and uninstalls, and a later
 `serve` reinstalls the same runtime. Passing both `store` and `runtime` throws here.
+
+Because building it installs, **build it once**. Calling `worker_startup(app; store = s2)` again
+while `app` is serving with another store replaces the running runtime at that moment: the old one
+is shut down and drained, even if the `serve` you meant to pass it to never happens. Rebuilding
+with the same store object is a no-op.
 """
 worker_startup(app::App; kwargs...) = Nitro.Workers.startup(app; kwargs...)
 
