@@ -95,6 +95,11 @@ end, Owner("user-1"))
 
 Different queues can still run independently.
 
+A queue name must be **declared** before anything is submitted to it: list it in
+`worker_startup(app; queues=[...])` (or `start!(app; queues=[...])`). A submit to any other name is
+refused with `AuthorizationError`, a `403`, because every queue name gets a processor task that
+lives as long as the runtime. See [Worker Limits](@ref).
+
 ## Start Workers With The Server
 
 The recommended app-level entrypoint is the exported `worker_startup(app; ...)` middleware.
@@ -566,6 +571,41 @@ with its three limits, in [Streaming And Server-Sent Events](@ref). The most imp
 limits belongs here too: **`update_progress!` writes the in-process `TaskInfo` and not the store**,
 so intermediate progress is only visible to code running in the same process as the task. The
 durable row receives progress at a terminal transition.
+
+## Worker Limits
+
+Worker runs execute on the same thread pool that serves HTTP, so an unbounded runtime lets one
+caller starve the server simply by submitting fresh keys. Every runtime therefore enforces limits,
+and a submit that would exceed one is refused **before anything is written** (no record, no queued
+item) with a `WorkerCapacityError` ([#324](https://github.com/PingoLee/Nitro.jl/issues/324)):
+
+| Limit | Default | Refused as |
+|---|---|---|
+| Async runs (`submit_task`) in flight at once, runtime-wide | `max_concurrent_runs = 64` | `:runtime`, a `503` |
+| A sequential queue's buffer | 100 items per queue | `:queue`, a `503` |
+| One owner's live runs, queued or executing, on both paths | `max_runs_per_owner = nothing` (off) | `:owner`, a `429` |
+| Queue names | only those declared through `queues` | `AuthorizationError`, a `403` |
+
+A full queue used to **block** the submitting request in `put!` with no timeout, so one owner who
+filled it hung every other user's request. It now refuses at once, and the client can retry.
+
+A run counts against the cap until its callback **actually returns**. That includes a callback
+abandoned by `TaskOptions(timeout=…)`, because the deadline ends the wait, not the work, and the
+callback still holds a thread.
+
+The limits are set when a runtime is built, so choose them by building one:
+
+```julia
+runtime = WorkerRuntime(persistent_store;
+                        max_concurrent_runs = 16,       # size to your threads and your workload
+                        max_runs_per_owner = 5,         # opt-in fairness between users
+                        queues = ["reports"],           # declared up front
+                        allow_undeclared_queues = false)
+serve(app; middleware = [worker_startup(app; runtime = runtime, queues = ["reports"])])
+```
+
+`max_runs_per_owner` counts this runtime's runs only; several processes sharing a store each count
+their own. `nothing` turns either cap off. `default_runtime()` uses the defaults above.
 
 ## Task Keys And Deduplication Scope
 
@@ -1081,7 +1121,8 @@ Use `Nitro.Workers` when you need lightweight or persistent background execution
 - use `PormGWorkerStore` to persist task state to your database
 - pass an `Owner(...)` on submission and on every read; `System()` is the named, unscoped bypass
 - use `submit_task(...)` for parallel jobs
-- use `submit_sequential_task(...)` for ordered queue processing
+- use `submit_sequential_task(...)` for ordered queue processing, on a queue name declared in `queues`
+- expect `WorkerCapacityError` (a 503, or a 429 for a per-owner quota) when a limit is reached, and size `max_concurrent_runs` to your workload
 - read and cancel with the id the submit call **returned**, not the `task_key` you passed
 - poll `cancel_requested(task_info)` in any long-running callback — `cancel_task` and `timeout` do nothing without it
 - use `scope=:global` only when a job is genuinely shared, and pair it with `set_watch_authorizer!`

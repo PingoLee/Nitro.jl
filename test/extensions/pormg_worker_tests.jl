@@ -1972,7 +1972,7 @@ else
 
         @testset "the runtime tears a persistent backend down (#29, #167)" begin
             store_td = RealPormGWorkerStore(model=MockTaskModel())
-            rt_store_td = WorkerRuntime(store_td)
+            rt_store_td = WorkerRuntime(store_td; queues = ["td-queue"])
             owner = Owner("user-td")
 
             try
@@ -2113,7 +2113,7 @@ else
             # loop, leaving the queue undrained and every item behind it stranded.
             flaky = FlakyReadModel()
             store_q = RealPormGWorkerStore(model=flaky)
-            rt_store_q = WorkerRuntime(store_q)
+            rt_store_q = WorkerRuntime(store_q; queues = ["qfail"])
             gate = Base.Event()
 
             # One callback shared by all three submits, defined before the processor

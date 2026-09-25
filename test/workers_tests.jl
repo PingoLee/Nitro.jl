@@ -12,7 +12,7 @@ using Nitro.Workers: get_task_info, set_task!, replace_task!, add_watcher!, try_
     delete_task!, try_delete_task!, cleanup_tasks!, clear_records!, list_running_task_refs,
     RunningTaskRef, lock_tasks, get_active_task, get_active_task_info, register_run!,
     SequentialQueue, QueueItem, get_sequential_queues, get_queue_lock
-using Nitro.Errors: AuthorizationError, StoreInterfaceError, WorkerUnavailableError
+using Nitro.Errors: AuthorizationError, StoreInterfaceError, WorkerUnavailableError, WorkerCapacityError
 using Base.ScopedValues: ScopedValue, with
 
 function wait_for(predicate::Function; timeout::Real=5.0)
@@ -265,7 +265,7 @@ end
 
 @testset "shutdown! releases the scheduler, the queues and every settled handle (#167, #176)" begin
     store = InMemoryWorkerStore()
-    rt_store = WorkerRuntime(store)
+    rt_store = WorkerRuntime(store; queues = ["teardown-q"])
 
     try
         # A real sequential queue with a live processor, and a real cleanup scheduler.
@@ -450,7 +450,7 @@ end
         # `_run_settled` probed only `istaskdone`, this drain could not finish until the
         # processor had also worked through `b`, which is parked on an Event the test holds.
         store = InMemoryWorkerStore()
-        rt = WorkerRuntime(store)
+        rt = WorkerRuntime(store; queues = ["q"])
         owner = Owner("u")
         hold = Base.Event()
         try
@@ -700,7 +700,7 @@ end
         # already buffered, so a teardown started runs that were never in the drain's snapshot --
         # no token, no wait, a RUNNING record published into a runtime being torn down.
         store = InMemoryWorkerStore()
-        rt = WorkerRuntime(store)
+        rt = WorkerRuntime(store; queues = ["reports"])
         owner = Owner("u")
         entered = Base.Event()
         backlog_ran = Threads.Atomic{Int}(0)
@@ -751,7 +751,7 @@ end
         # the one respect in which 0 is no longer byte-for-byte the pre-#176 behaviour, and the
         # UPGRADING entry says so.
         store = InMemoryWorkerStore()
-        rt = WorkerRuntime(store)
+        rt = WorkerRuntime(store; queues = ["q0"])
         owner = Owner("u")
         entered = Base.Event()
         release = Base.Event()
@@ -831,15 +831,20 @@ end
         end
     end
 
-    @testset "a full queue with a blocked submitter still tears down (#182)" begin
-        # The regression the first version of this patch shipped. The collect loop was
+    @testset "a full queue refuses the next submit, and a parked put! still tears down (#182, #324)" begin
+        # The regression the first version of the #182 patch shipped. The collect loop was
         # `while isready(channel)`, and `isready` is `n_avail > 0` -- which counts tasks blocked
         # in `put!` as well as buffered items. On a full `Channel(100)` with one submitter waiting
         # it reports 101 with 100 to take, so the last `take!` threw on the empty closed channel:
         # every collected item was discarded back to PENDING, the registry was never emptied, and
-        # the whole #176 drain never ran. A busy queue torn down mid-deploy is exactly that state.
+        # the whole #176 drain never ran. A busy queue torn down mid-deploy was exactly that state.
+        #
+        # Since #324 a SUBMIT can no longer park in `put!`: past the buffer it is refused at once.
+        # (This test used to park one through the public API and assert its record ended
+        # CANCELLED; that submitter is now unreachable, which is the fix.) The collect loop must
+        # still survive a `put!` parked on a full channel, so one is parked here white-box.
         store = InMemoryWorkerStore()
-        rt = WorkerRuntime(store)
+        rt = WorkerRuntime(store; queues = ["full"])
         owner = Owner("u")
         entered = Base.Event()
         ran = Threads.Atomic{Int}(0)
@@ -860,16 +865,22 @@ end
                           return "ran"
                       end, owner; runtime=rt) for i in 1:100]
 
-            # ...and one more submitter parked in `put!`, which is what inflates `n_avail`.
-            blocked_key = scoped_task_key("blocked", owner)
+            # One more PUBLIC submit is refused at once, with nothing written (#324)...
+            refused_key = scoped_task_key("refused", owner)
+            @test_throws WorkerCapacityError submit_sequential_task("full", "refused",
+                                                                    task_info -> "ran", owner; runtime=rt)
+            @test get_task_info(store, refused_key) === nothing
+
+            # ...so the parked `put!` that inflates `n_avail` is made by hand.
+            queue = Nitro.Workers._get_or_create_queue(rt, "full")
+            stray = QueueItem(scoped_task_key("stray", owner), Nitro.Workers.uuid4(),
+                              task_info -> "ran", TaskOptions())
             blocked = Threads.@spawn try
-                submit_sequential_task("full", "blocked", task_info -> "ran", owner; runtime=rt)
+                put!(queue.channel, stray)
             catch error
                 error                     # InvalidStateException once the channel closes
             end
-            @test timedwait(() -> Base.n_avail(
-                                Nitro.Workers._get_or_create_queue(rt, "full").channel) > 100,
-                            10.0; pollint=0.02) === :ok
+            @test timedwait(() -> Base.n_avail(queue.channel) > 100, 10.0; pollint=0.02) === :ok
 
             # Before the fix this THREW instead of returning.
             @test shutdown!(rt; drain_timeout=8.0) == true
@@ -884,12 +895,8 @@ end
                 @test status[:error] == "Cancelled by worker shutdown"
             end
 
-            # The submitter `close` woke with an exception owns a record too, and it must not be
-            # left PENDING either -- the one orphan closing the channel leaves behind.
+            # `close` woke the parked `put!` with an exception rather than letting it in.
             @test fetch(blocked) isa InvalidStateException
-            @test get_task_status(blocked_key, System(); runtime=rt)[:status] == "CANCELLED"
-            @test get_task_status(blocked_key, System(); runtime=rt)[:error] ==
-                  "Cancelled by worker shutdown"
         finally
             reset_runtime!(rt)
         end
@@ -953,7 +960,7 @@ end
         # runtime-level flag would need resetting here, and the reset races a concurrent submit.
         # `shutdown!` empties the registry, so the fresh queue is not draining by construction.
         store = InMemoryWorkerStore()
-        rt = WorkerRuntime(store)
+        rt = WorkerRuntime(store; queues = ["after"])
         owner = Owner("u")
         try
             @test shutdown!(rt) == true      # no queues at all yet
@@ -1017,7 +1024,7 @@ end
         # no longer takes a message at all -- it renders from the run's own reason -- so there is no
         # longer a parameter the two paths could pass differently.
         store_q = InMemoryWorkerStore()
-        rt_q = WorkerRuntime(store_q)
+        rt_q = WorkerRuntime(store_q; queues = ["retry-q"])
         owner_q = Owner("u")
         entered_q = Base.Event()
         attempts_q = Threads.Atomic{Int}(0)
@@ -1186,7 +1193,7 @@ end
         # nothing: the marker for the *current* run is written before the callback is invoked, so
         # it reads the same with or without the restore.
         store = InMemoryWorkerStore()
-        rt = WorkerRuntime(store)
+        rt = WorkerRuntime(store; queues = ["marker-q"])
         owner = Owner("u")
         marker_during = Ref{Any}(:unset)
         try
@@ -1250,7 +1257,7 @@ end
     # abstract no-op, i.e. this store contributed none of its own.
     @test !Nitro.Core.Errors.implements_contract_method(clear_records!, DataOnlyStore, AbstractWorkerStore, 1)
 
-    rt = WorkerRuntime(DataOnlyStore())
+    rt = WorkerRuntime(DataOnlyStore(); queues = ["dataonly-q"])
     owner = Owner("user-dataonly")
 
     try
@@ -1453,8 +1460,8 @@ end
     # the other's down. This is the sharpest single proof that ownership moved -- and it is the
     # shape Sidekiq and River have, where several `Launcher`s/`Client`s can sit over one datastore.
     store = InMemoryWorkerStore()
-    rt_a = WorkerRuntime(store)
-    rt_b = WorkerRuntime(store)
+    rt_a = WorkerRuntime(store; queues = ["shared-q"])
+    rt_b = WorkerRuntime(store; queues = ["shared-q"])
     owner = Owner("user-shared")
 
     try
@@ -1677,7 +1684,7 @@ end
 
 @testset "Sequential callbacks defined after the processor spawned still run (#86)" begin
     store = InMemoryWorkerStore()
-    rt_store = WorkerRuntime(store)
+    rt_store = WorkerRuntime(store; queues = ["wq86"])
     auth = Owner("user-a")
 
     try
@@ -1720,7 +1727,7 @@ end
 
 @testset "Sequential queues preserve order" begin
     store = InMemoryWorkerStore()
-    rt_store = WorkerRuntime(store)
+    rt_store = WorkerRuntime(store; queues = ["reports"])
     observed = String[]
 
     try
@@ -1904,7 +1911,7 @@ end
     # rather than provoked: a `CleanupScheduler` over a task that has already failed is exactly
     # the state the unpatched code met, whatever produced it.
     store = InMemoryWorkerStore()
-    rt = WorkerRuntime(store)
+    rt = WorkerRuntime(store; queues = ["dead-sweep-q"])
 
     try
         owner = Owner("user-dead-sweep")
@@ -1994,7 +2001,7 @@ end
 
 @testset "User access control and queue authorization" begin
     store = InMemoryWorkerStore()
-    rt_store = WorkerRuntime(store)
+    rt_store = WorkerRuntime(store; queues = ["admin-queue"])
     # Declared out here so the `finally` below can release the callback -- see the note at
     # the `task-access` submit.
     access_started = Base.Event()
@@ -2548,7 +2555,7 @@ end
         # Both callbacks are defined before the processor spawns -- `_invoke_task_callback`
         # gates on `applicable`, which is world-age sensitive.
         store = InMemoryWorkerStore()
-        rt_store = WorkerRuntime(store)
+        rt_store = WorkerRuntime(store; queues = ["q"])
         owner = Owner("u")
         gate = Base.Event()
         entered = Base.Event()
@@ -3027,7 +3034,7 @@ end
 
 @testset "queue introspection is an admin surface (#87)" begin
     store = InMemoryWorkerStore()
-    rt_store = WorkerRuntime(store)
+    rt_store = WorkerRuntime(store; queues = ["reports"])
     try
         submit_sequential_task("reports", "job", () -> "ok", Owner("user-a"); runtime=rt_store)
 
@@ -3184,7 +3191,7 @@ end
 
 @testset "Sequential submits share the cross-user gate (#19)" begin
     store = InMemoryWorkerStore()
-    rt_store = WorkerRuntime(store)
+    rt_store = WorkerRuntime(store; queues = ["reports"])
     release = Base.Event()
 
     try
@@ -4019,7 +4026,7 @@ end
         # This submit is the one that spawns the queue's processor (`_start_queue_processor`),
         # so before #209 it pinned a PROCESS-LIFETIME task in one caller's scope -- and every
         # item that queue ever ran afterwards inherited it, whoever submitted them.
-        rt = WorkerRuntime(InMemoryWorkerStore())
+        rt = WorkerRuntime(InMemoryWorkerStore(); queues = ["reports"])
         try
             @test isempty(get_sequential_queues(rt))       # nothing spawned yet
             seen = Channel{Symbol}(2)
@@ -4320,6 +4327,250 @@ end
         @test worker_runtime(ctx) === other
     finally
         uninstall!(ctx; drain_timeout = 0)
+    end
+end
+
+
+# Reservations are what #324's limits read; every test below ends by checking they are all back.
+capacity_idle(rt) = isempty(rt.reservations) && isempty(rt.owner_runs) && rt.async_runs[] == 0
+
+@testset "#324: the runtime-wide cap refuses a submit before anything is written" begin
+    store = InMemoryWorkerStore()
+    rt = WorkerRuntime(store; max_concurrent_runs = 2)
+    gate = Channel{Nothing}(10)
+    try
+        a = submit_task("a", () -> take!(gate), Owner("u1"); runtime = rt)
+        b = submit_task("b", () -> take!(gate), Owner("u2"); runtime = rt)
+        @test rt.async_runs[] == 2
+
+        err = try
+            submit_task("c", () -> "never", Owner("u3"); runtime = rt); nothing
+        catch e
+            e
+        end
+        @test err isa WorkerCapacityError && err.kind === :runtime
+        @test get_task_info(store, "u3::c") === nothing          # nothing written
+        @test rt.async_runs[] == 2
+
+        # Joining a live run is not a new run, and costs nothing.
+        @test submit_task("a", () -> "dup", Owner("u1"); runtime = rt) == a
+
+        put!(gate, nothing); put!(gate, nothing)
+        @test wait_for(() -> get_task_status(a, System(); runtime = rt)[:status] == "COMPLETED" &&
+                             get_task_status(b, System(); runtime = rt)[:status] == "COMPLETED") == :ok
+        @test wait_for(() -> capacity_idle(rt)) == :ok
+        c = submit_task("c", () -> "ran", Owner("u3"); runtime = rt)
+        @test wait_for(() -> get_task_status(c, System(); runtime = rt)[:status] == "COMPLETED") == :ok
+        @test wait_for(() -> capacity_idle(rt)) == :ok
+    finally
+        foreach(_ -> isready(gate) || put!(gate, nothing), 1:4)
+        reset_runtime!(rt)
+    end
+    @test_throws ArgumentError WorkerRuntime(InMemoryWorkerStore(); max_concurrent_runs = 0)
+    @test_throws ArgumentError WorkerCapacityError(:elsewhere, "x")
+end
+
+@testset "#324: a refused submit does not supersede the run it would have replaced" begin
+    store = InMemoryWorkerStore()
+    rt = WorkerRuntime(store; max_concurrent_runs = 1)
+    gate = Channel{Nothing}(1)
+    try
+        id = submit_task("job", () -> take!(gate), Owner("u"); runtime = rt)
+        @test wait_for(() -> get_active_task_info(rt, id) !== nothing) == :ok
+        live = get_active_task_info(rt, id)
+        # Cancelled, but the callback ignores the token, so it still holds the only slot.
+        @test cancel_task(id, Owner("u"); runtime = rt)[:status] == "Task cancelled"
+        @test_throws WorkerCapacityError submit_task("job", () -> "again", Owner("u"); runtime = rt)
+        @test cancel_reason(live) === :user                     # not :superseded
+        @test get_task_info(store, id).run_id == live.run_id    # the record was not replaced
+    finally
+        put!(gate, nothing)
+        @test wait_for(() -> capacity_idle(rt)) == :ok
+        reset_runtime!(rt)
+    end
+end
+
+@testset "#324: the per-owner quota counts both paths and is a 429" begin
+    store = InMemoryWorkerStore()
+    rt = WorkerRuntime(store; max_runs_per_owner = 2, queues = ["q"])
+    gate = Channel{Nothing}(10)
+    try
+        submit_task("a1", () -> take!(gate), Owner("alice"); runtime = rt)
+        submit_sequential_task("q", "a2", () -> take!(gate), Owner("alice"); runtime = rt)
+        err = try
+            submit_task("a3", () -> "never", Owner("alice"); runtime = rt); nothing
+        catch e
+            e
+        end
+        @test err isa WorkerCapacityError && err.kind === :owner
+        @test_throws WorkerCapacityError submit_sequential_task("q", "a4", () -> "never", Owner("alice"); runtime = rt)
+        # Another owner is unaffected.
+        bob = submit_task("b1", () -> "bob", Owner("bob"); runtime = rt)
+        @test wait_for(() -> get_task_status(bob, Owner("bob"); runtime = rt)[:status] == "COMPLETED") == :ok
+    finally
+        foreach(_ -> put!(gate, nothing), 1:2)
+        @test wait_for(() -> capacity_idle(rt)) == :ok
+        reset_runtime!(rt)
+    end
+end
+
+@testset "#324: a full queue refuses at once instead of blocking the submitter" begin
+    store = InMemoryWorkerStore()
+    rt = WorkerRuntime(store; queues = ["small"])
+    # White-box: a two-slot queue, put in place before its first use.
+    get_sequential_queues(rt)["small"] = SequentialQueue(2)
+    gate = Channel{Nothing}(10)
+    try
+        first = submit_sequential_task("small", "k1", () -> take!(gate), Owner("u"); runtime = rt)
+        # The processor TOOK the first item, so its slot is free again: two more fit.
+        @test wait_for(() -> get_task_status(first, System(); runtime = rt)[:status] == "RUNNING") == :ok
+        submit_sequential_task("small", "k2", () -> take!(gate), Owner("u"); runtime = rt)
+        submit_sequential_task("small", "k3", () -> take!(gate), Owner("u"); runtime = rt)
+
+        started = time()
+        err = try
+            submit_sequential_task("small", "k4", () -> "never", Owner("u"); runtime = rt); nothing
+        catch e
+            e
+        end
+        @test time() - started < 2.0                              # refused, not parked in put!
+        @test err isa WorkerCapacityError && err.kind === :queue
+        @test get_task_info(store, "u::k4") === nothing
+
+        foreach(_ -> put!(gate, nothing), 1:3)
+        @test wait_for(() -> all(k -> get_task_status("u::$k", System(); runtime = rt)[:status] == "COMPLETED",
+                                 ("k1", "k2", "k3")); timeout = 10.0) == :ok
+        @test wait_for(() -> capacity_idle(rt) && (@atomic get_sequential_queues(rt)["small"].reserved) == 0) == :ok
+    finally
+        foreach(_ -> isready(gate) || put!(gate, nothing), 1:4)
+        reset_runtime!(rt)
+    end
+end
+
+@testset "#324: only declared queue names get a queue" begin
+    store = InMemoryWorkerStore()
+    rt = WorkerRuntime(store; queues = ["reports"])
+    try
+        @test_throws AuthorizationError submit_sequential_task("made-up-name", "k", () -> 1, Owner("u"); runtime = rt)
+        @test !haskey(get_sequential_queues(rt), "made-up-name")    # no queue, no processor
+        ok = submit_sequential_task("reports", "k", () -> "ok", Owner("u"); runtime = rt)
+        @test wait_for(() -> get_task_status(ok, System(); runtime = rt)[:status] == "COMPLETED") == :ok
+
+        # `start!` declares what it starts; `reset_runtime!` goes back to the constructor's set.
+        app = App(mod = @__MODULE__)
+        start!(app; runtime = rt, queues = ["imports"], cleanup_enabled = false, recover_zombies = false)
+        imp = submit_sequential_task(app, "imports", "k", () -> "ok", Owner("u"))
+        @test wait_for(() -> get_task_status(app, imp, System())[:status] == "COMPLETED") == :ok
+        uninstall!(app; drain_timeout = 0)
+        reset_runtime!(rt)
+        @test_throws AuthorizationError submit_sequential_task("imports", "k2", () -> 1, Owner("u"); runtime = rt)
+    finally
+        reset_runtime!(rt)
+    end
+
+    # The opt-out.
+    open_rt = WorkerRuntime(InMemoryWorkerStore(); allow_undeclared_queues = true)
+    try
+        id = submit_sequential_task("anything", "k", () -> "ok", Owner("u"); runtime = open_rt)
+        @test wait_for(() -> get_task_status(id, System(); runtime = open_rt)[:status] == "COMPLETED") == :ok
+    finally
+        reset_runtime!(open_rt)
+    end
+end
+
+@testset "#324: a timed-out callback keeps its slot until it actually returns" begin
+    store = InMemoryWorkerStore()
+    rt = WorkerRuntime(store; max_concurrent_runs = 1, queues = ["q"])
+    gate = Channel{Nothing}(2)
+    try
+        # Ignores the token: the deadline ends the wait, not the work.
+        id = submit_task("slow", () -> take!(gate), Owner("u"); runtime = rt,
+                         options = TaskOptions(timeout = 1))
+        @test wait_for(() -> get_task_status(id, System(); runtime = rt)[:status] == "FAILED"; timeout = 10.0) == :ok
+        # The record is terminal, but the callback still holds a thread -- and so the slot.
+        @test rt.async_runs[] == 1
+        @test_throws WorkerCapacityError submit_task("next", () -> "x", Owner("u"); runtime = rt)
+
+        put!(gate, nothing)
+        @test wait_for(() -> capacity_idle(rt)) == :ok
+        nxt = submit_task("next", () -> "x", Owner("u"); runtime = rt)
+        @test wait_for(() -> get_task_status(nxt, System(); runtime = rt)[:status] == "COMPLETED") == :ok
+
+        # The sequential path hands the OWNER's reservation over the same way.
+        qid = submit_sequential_task("q", "slowq", () -> take!(gate), Owner("v"); runtime = rt,
+                                     options = TaskOptions(timeout = 1))
+        @test wait_for(() -> get_task_status(qid, System(); runtime = rt)[:status] == "FAILED"; timeout = 10.0) == :ok
+        @test get(rt.owner_runs, "v", 0) == 1
+        put!(gate, nothing)
+        @test wait_for(() -> capacity_idle(rt)) == :ok
+    finally
+        foreach(_ -> isready(gate) || put!(gate, nothing), 1:2)
+        reset_runtime!(rt)
+    end
+end
+
+@testset "#324: every other exit gives the reservation back" begin
+    store = InMemoryWorkerStore()
+    rt = WorkerRuntime(store; queues = ["q"])
+    gate = Channel{Nothing}(10)
+    try
+        # Failure.
+        f = submit_task("fails", () -> error("boom"), Owner("u"); runtime = rt)
+        @test wait_for(() -> get_task_status(f, System(); runtime = rt)[:status] == "FAILED") == :ok
+        @test wait_for(() -> capacity_idle(rt)) == :ok
+
+        # Cancelled while queued, so the run is declined at its claim.
+        head = submit_sequential_task("q", "head", () -> take!(gate), Owner("u"); runtime = rt)
+        @test wait_for(() -> get_task_status(head, System(); runtime = rt)[:status] == "RUNNING") == :ok
+        queued = submit_sequential_task("q", "queued", () -> "never", Owner("u"); runtime = rt)
+        @test cancel_task(queued, Owner("u"); runtime = rt)[:status] == "Task cancelled"
+        put!(gate, nothing)
+        @test wait_for(() -> capacity_idle(rt)) == :ok
+
+        # Abandoned by a teardown while still buffered.
+        head2 = submit_sequential_task("q", "head2", () -> take!(gate), Owner("u"); runtime = rt)
+        @test wait_for(() -> get_task_status(head2, System(); runtime = rt)[:status] == "RUNNING") == :ok
+        submit_sequential_task("q", "buffered", () -> "never", Owner("u"); runtime = rt)
+        shutdown!(rt; drain_timeout = 0)
+        @test get_task_status("u::buffered", System(); runtime = rt)[:status] == "CANCELLED"
+        @test get(rt.owner_runs, "u", 0) == 1          # only head2, still running
+        put!(gate, nothing)
+        @test wait_for(() -> capacity_idle(rt)) == :ok
+    finally
+        foreach(_ -> isready(gate) || put!(gate, nothing), 1:4)
+        reset_runtime!(rt)
+    end
+end
+
+@testset "#324: capacity refusals over HTTP are a 503, a quota a 429, an undeclared queue a 403" begin
+    app = App(mod = @__MODULE__)
+    rt = WorkerRuntime(InMemoryWorkerStore(); max_concurrent_runs = 1, max_runs_per_owner = 1,
+                       queues = ["q"])
+    install!(app, rt)
+    gate = Channel{Nothing}(4)
+    urlpatterns(app, "",
+        path("/async", function (req)
+            q = getquery(req)
+            return Res.json(Dict("id" => submit_task(app, q["key"], () -> take!(gate), Owner(q["uid"]))))
+        end),
+        path("/queue", function (req)
+            q = getquery(req)
+            return Res.json(Dict("id" => submit_sequential_task(app, q["queue"], q["key"], () -> "ok", Owner(q["uid"]))))
+        end),
+    )
+    get_(target) = internalrequest(app, HTTP.Request("GET", target))
+    try
+        @test get_("/async?uid=alice&key=one").status == 200
+        busy = get_("/async?uid=bob&key=two")          # runtime cap of 1
+        @test busy.status == 503
+        @test JSON.parse(Nitro.text(busy)) == Dict("message" => "503: Service Unavailable")
+        quota = get_("/queue?uid=alice&queue=q&key=three")   # alice's one run is live
+        @test quota.status == 429
+        @test JSON.parse(Nitro.text(quota)) == Dict("message" => "429: Too Many Requests")
+        @test get_("/queue?uid=carol&queue=nope&key=four").status == 403
+    finally
+        put!(gate, nothing)
+        uninstall!(app; drain_timeout = 5)
     end
 end
 

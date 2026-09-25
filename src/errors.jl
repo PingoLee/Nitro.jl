@@ -4,7 +4,7 @@ module Errors
 import JSON
 
 export ValidationError, CookieError, AuthorizationError, StoreInterfaceError, UnsupportedMediaTypeError,
-    WorkerUnavailableError
+    WorkerUnavailableError, WorkerCapacityError
 
 """
     ValidationError(msg::String)
@@ -205,6 +205,39 @@ end
 
 function Base.showerror(io::IO, e::WorkerUnavailableError)
     print(io, "Worker Unavailable: $(e.msg)")
+end
+
+"""
+    WorkerCapacityError(kind::Symbol, msg::String)
+
+The exception a worker submission raises when accepting it would exceed a limit
+([#324](https://github.com/PingoLee/Nitro.jl/issues/324)). Nothing is written when it is thrown:
+no record, no queued item, and a previous run of the same key is not displaced.
+
+| `kind` | Limit | `handle_error` answers |
+|---|---|---|
+| `:runtime` | `WorkerRuntime(store; max_concurrent_runs)`, async runs in flight (64 by default) | `503 Service Unavailable` |
+| `:queue` | a sequential queue's capacity (100 items by default) | `503 Service Unavailable` |
+| `:owner` | `WorkerRuntime(store; max_runs_per_owner)`, one owner's live runs (off by default) | `429 Too Many Requests` |
+
+A full queue used to block the submitting request in `put!` with no timeout, so one owner could
+fill it and hang every other user's request. Submissions now fail fast instead. The first two are
+the server's capacity, hence `503`. The third is this caller's quota, hence `429`. Either way it
+is logged at `@debug` only, with no backtrace.
+"""
+struct WorkerCapacityError <: Exception
+    kind::Symbol
+    msg::String
+
+    function WorkerCapacityError(kind::Symbol, msg::String)
+        kind in (:runtime, :queue, :owner) ||
+            throw(ArgumentError("WorkerCapacityError kind must be :runtime, :queue or :owner, got :$kind"))
+        return new(kind, msg)
+    end
+end
+
+function Base.showerror(io::IO, e::WorkerCapacityError)
+    print(io, "Worker Capacity ($(e.kind)): $(e.msg)")
 end
 
 

@@ -241,8 +241,18 @@ function _execute_queued_task(runtime::WorkerRuntime, item::QueueItem)
     # handle publish, as one critical section under the store lock -- see `_claim_run!` for why
     # each of those is the way it is. `nothing` means this run must not start: the record is
     # gone, it belongs to a successor, or it was cancelled before it was dequeued.
-    task_info = _claim_run!(runtime, item.task_key, item.run_id)
-    task_info === nothing && return nothing
+    #
+    # Every way out of this function gives back the run's capacity reservation (#324), exactly
+    # once -- `_release_run!` is idempotent by `run_id` -- except a timed-out callback, which keeps
+    # it until it actually returns (`_RunHandoff`, `execution.jl`).
+    task_info = try
+        _claim_run!(runtime, item.task_key, item.run_id)
+    catch
+        _release_run!(runtime, item.run_id)
+        rethrow()
+    end
+    task_info === nothing && (_release_run!(runtime, item.run_id); return nothing)
+    handoff = _RunHandoff(() -> _release_run!(runtime, item.run_id))
 
     # From here `task_info` is a snapshot of THIS run's record -- on `InMemoryWorkerStore` the
     # very object the registry holds, on `PormGWorkerStore` a fresh deserialization of its row.
@@ -311,7 +321,7 @@ function _execute_queued_task(runtime::WorkerRuntime, item::QueueItem)
         max_attempts = item.options.retry_on_failure ? item.options.max_retries : 0
         for retry_count in 0:max_attempts
             try
-                result = timeout_call(item.callback, task_info; timeout=item.options.timeout)
+                result = timeout_call(item.callback, task_info; timeout=item.options.timeout, handoff)
                 return _complete_task!(runtime, task_info, result)
             catch error
                 unwrapped = _unwrap_exception(error)
@@ -369,6 +379,7 @@ function _execute_queued_task(runtime::WorkerRuntime, item::QueueItem)
         return task_info
     finally
         _deregister_run!(runtime, task_info)
+        _handed_off(handoff) || _release_run!(runtime, item.run_id)
     end
 end
 
@@ -398,6 +409,9 @@ function _start_queue_processor(runtime::WorkerRuntime, queue_name::String)
                         end
                         rethrow(error)
                     end
+                    # The item has left the buffer, so its slot is free for the next submit
+                    # (#324). Its OWNER's reservation lasts until the run ends.
+                    _release_queue_slot!(queue)
 
                     # BEFORE `_mark_queue_current_task!` and before `_execute_queued_task`'s
                     # `_claim_run!`, so once `draining` is visible no further run starts,
@@ -416,6 +430,7 @@ function _start_queue_processor(runtime::WorkerRuntime, queue_name::String)
                         catch error
                             @error "Worker queue item abandoned but not recorded during teardown" exception=(error, catch_backtrace()) queue_name=queue_name task_key=item.task_key
                         end
+                        _release_run!(runtime, item.run_id)    # after the `catch`: never skipped
                         continue
                     end
 

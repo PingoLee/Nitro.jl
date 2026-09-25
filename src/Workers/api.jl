@@ -309,6 +309,8 @@ function start!(ctx::App;
         recover_zombie_tasks!(; runtime=resolved, zombie_min_age)
     end
 
+    # Declared before its processor starts: these are the names a submit may use (#324).
+    _declare_queues!(resolved, queues)
     for queue_name in queues
         _start_queue_processor(resolved, String(queue_name))
     end
@@ -350,6 +352,9 @@ function startup(ctx::App;
     # logged. Only the INSTALL moves: the zombie sweep, the queue processors and the scheduler
     # still start in `on_startup`.
     installed = _start_runtime_for!(ctx, key, store, runtime, drain_timeout)
+    # Declared now too, not only by `start!` in the hook (#324): a submit in the startup window
+    # would otherwise be refused as an undeclared queue.
+    _declare_queues!(installed, queue_names)
 
     passthrough = function(handle::Function)
         return function(req)
@@ -520,9 +525,15 @@ end
 # (#191). Deriving any of them by re-reading the record does not work: by then the record may
 # belong to a successor, so the abandon would cancel a run about to start and the start claim
 # would agree with a run that is not the caller's.
+#
+# `queue` is the sequential queue the new run will be enqueued on, or `nothing` for an async run.
+# It decides which capacity the run reserves (#324) -- a slot in that queue's buffer, or one of the
+# runtime's concurrent async runs -- on top of its owner's quota. Only a run that is MINTED here
+# reserves; joining a live one costs nothing. The caller owns giving it back.
 function _register_or_watch!(runtime::WorkerRuntime, task_key::String, owner::Owner;
                              queue_name::Union{Nothing, String}=nothing,
-                             grants::AbstractVector{Owner}=Owner[])
+                             grants::AbstractVector{Owner}=Owner[],
+                             queue::Union{Nothing, SequentialQueue}=nothing)
     uid = owner.user_id
     return lock_tasks(runtime) do
         # The DURABLE read, not the live-preferring one, by the rule in `get_task_info`: this is
@@ -589,17 +600,28 @@ function _register_or_watch!(runtime::WorkerRuntime, task_key::String, owner::Ow
         # stops that run from writing (#108); this is the only thing that can reclaim the
         # thread it is sitting on. In-process only -- a run hosted on another node is
         # unreachable from here and will keep going until its callback returns.
-        previous = get_active_task_info(runtime, task_key)
-        previous === nothing || _request_cancel!(previous, :superseded)
-
+        #
+        # The new run reserves its capacity FIRST (#324), before the predecessor is asked to
+        # stop and before the record is replaced, so a refused submit changes nothing: no record,
+        # and no superseded run.
         task_info = TaskInfo(task_key; queue_name)
-        push!(task_info.watchers, uid)
-        for grant in grants
-            grant.user_id in task_info.watchers || push!(task_info.watchers, grant.user_id)
+        _reserve_capacity!(runtime, queue, task_info.run_id, uid)
+        try
+            previous = get_active_task_info(runtime, task_key)
+            previous === nothing || _request_cancel!(previous, :superseded)
+
+            push!(task_info.watchers, uid)
+            for grant in grants
+                grant.user_id in task_info.watchers || push!(task_info.watchers, grant.user_id)
+            end
+            # Through the RUNTIME: publishing a successor also evicts the run it displaced from
+            # the live caches, so nothing later reads a run that no longer owns this key.
+            replace_task!(runtime, task_key, task_info)
+        catch
+            # A store write that throws leaves no run to release it later.
+            _release_capacity!(runtime, queue, task_info.run_id)
+            rethrow()
         end
-        # Through the RUNTIME: publishing a successor also evicts the run it displaced from
-        # the live caches, so nothing later reads a run that no longer owns this key.
-        replace_task!(runtime, task_key, task_info)
         return task_info.run_id
     end
 end
@@ -651,8 +673,17 @@ function _execute_task_async(runtime::WorkerRuntime, task_key::String, callback:
         # nothing serializes them and the interleaving in which one stole the other's handles was
         # the ordinary case rather than an edge. A concurrent `cancel_task` plus re-submit needs
         # only `lock_tasks` -- which is exactly why the claim takes it (#191, #198).
-        task_info = _claim_run!(runtime, task_key, run_id)
-        task_info === nothing && return nothing
+        #
+        # Every way out gives back the run's capacity reservation (#324) exactly once, except a
+        # timed-out callback, which keeps it until it actually returns (`_RunHandoff`).
+        task_info = try
+            _claim_run!(runtime, task_key, run_id)
+        catch
+            _release_run!(runtime, run_id)
+            rethrow()
+        end
+        task_info === nothing && (_release_run!(runtime, run_id); return nothing)
+        handoff = _RunHandoff(() -> _release_run!(runtime, run_id))
 
         # Starting is a CLAIMED transition, not an unconditional write. `set_task!` has no
         # precondition, so a `cancel_task` that already claimed PENDING -> CANCELLED was simply
@@ -699,7 +730,7 @@ function _execute_task_async(runtime::WorkerRuntime, task_key::String, callback:
             max_attempts = options.retry_on_failure ? options.max_retries : 0
             for retry_count in 0:max_attempts
                 try
-                    result = timeout_call(callback, task_info; timeout=options.timeout)
+                    result = timeout_call(callback, task_info; timeout=options.timeout, handoff)
                     return _complete_task!(runtime, task_info, result)
                 catch error
                     unwrapped = _unwrap_exception(error)
@@ -757,6 +788,7 @@ function _execute_task_async(runtime::WorkerRuntime, task_key::String, callback:
             return task_info
         finally
             _deregister_run!(runtime, task_info)
+            _handed_off(handoff) || _release_run!(runtime, run_id)
         end
     end
 
@@ -825,7 +857,12 @@ function submit_task(task_key::AbstractString, callback::Function, owner::Owner;
     # scheduling hand-off, not a buffer wait, and it is unbounded under thread pressure.
     run_id = _register_or_watch!(runtime, key, owner; grants=watchers)
     if run_id !== nothing
-        _execute_task_async(runtime, key, callback, options, run_id)
+        try
+            _execute_task_async(runtime, key, callback, options, run_id)
+        catch
+            _release_run!(runtime, run_id)   # no run was spawned to give the reservation back
+            rethrow()
+        end
     end
     return key
 end
@@ -851,30 +888,51 @@ function submit_sequential_task(queue_name::AbstractString, task_key::AbstractSt
     _authorize_queue!(runtime.store, queue_id, owner)
 
     key = scoped_task_key(task_key, owner; scope)
-    run_id = _register_or_watch!(runtime, key, owner; queue_name=queue_id, grants=watchers)
+
+    # Only a DECLARED queue name gets a queue (#324). Every name used to mint a queue plus a
+    # processor task that lives as long as the runtime, so a handler taking the name from request
+    # data minted one per distinct name. Checked before `_start_queue_processor`, so a refused name
+    # never mints anything; after `scoped_task_key`, so a malformed key still reports as that.
+    if !_queue_declared(runtime, queue_id)
+        throw(AuthorizationError(
+            "Queue '$queue_id' is not declared on this worker runtime; declare it with " *
+            "`start!(app; queues = [...])` / `worker_startup(app; queues = [...])`"))
+    end
+
+    # One lookup, not two -- and it now comes BEFORE the record is written, because the new run
+    # reserves its slot in THIS queue's buffer while the record is claimed (#324). A second
+    # `_get_or_create_queue` could return a DIFFERENT object: `shutdown!` empties the registry, so
+    # a teardown landing between the two lookups would mint a fresh queue with an open channel and
+    # no processor. The `put!` would then succeed and the task would sit PENDING with nothing
+    # draining it -- a silent hang in place of the loud `InvalidStateException` a closed channel
+    # raises. Resolving it first widens the window a teardown can land in (it now spans the
+    # record write), but it stays loud: the `put!` below still hits the closed channel.
+    #
+    # Outside `lock_tasks`, deliberately: `get_queue_status` holds `queue_lock` while it lists
+    # under the store's lock, so taking `queue_lock` inside `lock_tasks` would be that pair inverted.
+    queue = _start_queue_processor(runtime, queue_id)
+    run_id = _register_or_watch!(runtime, key, owner; queue_name=queue_id, grants=watchers, queue)
     if run_id !== nothing
-        # One lookup, not two. `_start_queue_processor` already returns the queue it spawned a
-        # processor for, and a second `_get_or_create_queue` can return a DIFFERENT object: since
-        # `shutdown!` empties the registry, a teardown landing between the two calls makes the
-        # second lookup mint a fresh queue with an open channel and no processor. The `put!` would
-        # then succeed and the task would sit PENDING with nothing draining it -- a silent hang in
-        # place of the loud `InvalidStateException` a closed channel raises.
-        queue = _start_queue_processor(runtime, queue_id)
         item = QueueItem(key, run_id, callback, options)
 
         # A teardown landing between resolving the queue and handing it the item makes this
         # `put!` throw, and the record written a moment ago by `_register_or_watch!` is then
         # `PENDING` with nothing that will ever run it -- the same orphan #182 removes from the
-        # buffered backlog, arriving through the one door closing the channel leaves open. It is
-        # not rare: `close` raises in every submitter already blocked on a full `Channel(100)`,
-        # so a busy queue torn down mid-deploy produces one of these per waiter.
+        # buffered backlog, arriving through the one door closing the channel leaves open. Before
+        # #324 it was not rare -- `close` raised in every submitter blocked on a full queue --
+        # but no submitter blocks any more, so now it takes a teardown landing in that window.
         #
         # The exception still propagates -- the caller has to learn the submission failed, which
         # is the whole argument for the loud close over a silent hang -- but the record is now
         # terminal rather than abandoned.
+        #
+        # The `put!` itself can no longer BLOCK: the slot reserved above guarantees room in the
+        # buffer (#324). A full queue refuses the submit instead of parking the request here.
         try
             put!(queue.channel, item)
         catch error
+            # Unconditionally, whatever went wrong: the item never reached the buffer.
+            _release_capacity!(runtime, queue, run_id)
             error isa InvalidStateException || rethrow()
             try
                 _abandon_queued_item!(runtime, item)

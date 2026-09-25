@@ -700,23 +700,31 @@ function get_all_tasks(store::InMemoryWorkerStore, authority::TaskAuthority;
 end
 
 function _in_memory_listing(store::InMemoryWorkerStore, authority::TaskAuthority, status, queue_name)
-    lock(store.task_lock) do
-        tasks = TaskInfo[]
-        for task_info in values(store.task_registry)
-            if status !== nothing && task_info.status != status
-                continue
-            end
-            # Deliberately no owner -> ids index: the registry is already in RAM, so this
-            # is a Dict scan either way, and an index would be new mutable state to keep
-            # consistent across set_task!, delete_task!, cleanup_tasks! and clear_records!.
-            _is_authorized(authority, task_info) || continue
-            if queue_name !== nothing && task_info.queue_name != queue_name
-                continue
-            end
-            push!(tasks, task_info)
+    # Snapshot under the lock, filter OUTSIDE it (#324). The scan used to run while holding
+    # `task_lock` -- the lock every submit, claim, finish and cancel needs -- so one owner listing
+    # a 200k-record registry stalled the whole worker subsystem for its duration. Copying the
+    # values is a pointer copy; the per-record work below then contends with nothing.
+    #
+    # Reading a record outside the lock is the same thing `get_task_status` already does with a
+    # live object: `status` is a plain field written whole, and `watchers` is swapped
+    # copy-on-write by `add_watcher!`, never grown in place, so the vector `_is_authorized`
+    # iterates cannot be resized under it.
+    snapshot = lock(() -> collect(values(store.task_registry)), store.task_lock)
+    tasks = TaskInfo[]
+    for task_info in snapshot
+        if status !== nothing && task_info.status != status
+            continue
         end
-        return tasks
+        # Deliberately no owner -> ids index: the registry is already in RAM, so this
+        # is a Dict scan either way, and an index would be new mutable state to keep
+        # consistent across set_task!, delete_task!, cleanup_tasks! and clear_records!.
+        _is_authorized(authority, task_info) || continue
+        if queue_name !== nothing && task_info.queue_name != queue_name
+            continue
+        end
+        push!(tasks, task_info)
     end
+    return tasks
 end
 
 # Implemented rather than left to the default for parity with `PormGWorkerStore`, not for speed:

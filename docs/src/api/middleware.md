@@ -14,8 +14,9 @@ A `ValidationError` is answered with a `400` instead, an `UnsupportedMediaTypeEr
 `415`, and an `AuthorizationError` with a `403` (`{"message": "403: Forbidden"}`); all three are
 recorded at `@debug` only, and the `403`'s log line leaves out the error's message, which can
 name a caller-chosen queue or task key. A `WorkerUnavailableError` (an App-first worker call on
-an `App` with no worker runtime installed) is a `503`, logged at `@warn` without a backtrace. The
-access log records the status either way. An `InterruptException` is not converted; it propagates.
+an `App` with no worker runtime installed) is a `503`, logged at `@warn` without a backtrace. A
+`WorkerCapacityError` (a worker limit reached) is a `503`, or a `429` for a per-owner quota,
+logged at `@debug`. The access log records the status either way. An `InterruptException` is not converted; it propagates.
 
 There is one difference: a handler's `500` still passes back out through every middleware, but a
 middleware's `500` is produced *above* the chain. It therefore carries no headers from layers the exception skipped,

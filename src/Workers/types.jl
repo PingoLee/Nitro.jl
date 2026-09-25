@@ -476,9 +476,17 @@ mutable struct SequentialQueue
     #
     # `@atomic` because the writer is `shutdown!` and the reader is the processor task.
     @atomic draining::Bool
+    # Slots handed out to submissions that have not yet been TAKEN by the processor (#324).
+    # Reserved before the record is written and released at `take!`, so it bounds the buffer
+    # exactly and `put!` can never block: a full queue refuses the submit instead of parking the
+    # submitting request in `put!` with no timeout, which let one owner hang everyone else.
+    # `capacity` is stored rather than read back off the `Channel`'s internals.
+    capacity::Int
+    @atomic reserved::Int
 
     function SequentialQueue(size::Int=100)
-        return new(Channel{QueueItem}(size), false, nothing, ReentrantLock(), nothing, false)
+        size >= 1 || throw(ArgumentError("SequentialQueue size must be at least 1, got $size"))
+        return new(Channel{QueueItem}(size), false, nothing, ReentrantLock(), nothing, false, size, 0)
     end
 end
 

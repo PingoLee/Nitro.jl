@@ -3,7 +3,7 @@ using JSON
 using Dates
 
 using ..Errors: ValidationError, UnsupportedMediaTypeError, AuthorizationError, WorkerUnavailableError,
-    is_unrecoverable
+    WorkerCapacityError, is_unrecoverable
 using .BodyParsers: _parse_json_bounded
 
 export recursive_merge, parseparam, parsebody, parseparam_checked,
@@ -34,6 +34,14 @@ end
 # process-wide runtime, which carries none of the app's policy; now it is refused, and "the
 # service this route needs is not up" is a 503, not a 500.
 function handle_error(::WorkerUnavailableError)
+    return Res.json(("message" => "503: Service Unavailable"), status = 503)
+end
+
+# A worker limit (#324). The runtime's concurrency cap and a full queue are the SERVER's capacity,
+# so 503; a per-owner quota is THIS caller's, so 429. A full queue used to block the handler in
+# `put!` indefinitely instead.
+function handle_error(e::WorkerCapacityError)
+    e.kind === :owner && return Res.json(("message" => "429: Too Many Requests"), status = 429)
     return Res.json(("message" => "503: Service Unavailable"), status = 503)
 end
 
@@ -95,6 +103,10 @@ function handlerequest(getresponse::Function, catch_errors::Bool; show_errors::B
                 # `@warn`, but without a backtrace per request. `.msg` is fixed text naming the
                 # extension key and the fix; it carries no request data (#322).
                 show_errors && @warn "Request refused (503): no worker runtime installed" message=error.msg
+            elseif error isa WorkerCapacityError
+                # Back-pressure, not a fault: a burst would otherwise write one line per refused
+                # request at exactly the moment the server is busiest. `kind` only -- no message.
+                show_errors && @debug "Request refused: worker capacity" kind=error.kind
             elseif show_errors && !isa(error, InterruptException)
                 @error "ERROR: " exception=(error, catch_backtrace())
             end

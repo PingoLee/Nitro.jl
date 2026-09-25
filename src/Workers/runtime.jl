@@ -1,8 +1,35 @@
 """
-    WorkerRuntime(store::AbstractWorkerStore)
+    WorkerRuntime(store::AbstractWorkerStore; max_concurrent_runs=64, max_runs_per_owner=nothing,
+                  allow_undeclared_queues=false, queues=String[])
 
 The live half of the worker subsystem: the sequential queues and their processor `Task`s, the
 cleanup scheduler, and the process-local handles for runs executing **right now**.
+
+# Limits ([#324](https://github.com/PingoLee/Nitro.jl/issues/324))
+
+Worker runs execute on the `:default` thread pool, the same pool that serves HTTP, so an
+unbounded runtime lets one caller take the server down by submitting fresh keys. Each limit
+refuses a submission **before anything is written**, with a [`WorkerCapacityError`](@ref Nitro.Errors.WorkerCapacityError):
+
+- `max_concurrent_runs` (default `64`): async runs (`submit_task`) in flight at once, runtime-wide
+  (Sidekiq's concurrency, River's `MaxWorkers`). Past it, `:runtime`, a `503`. `nothing` removes
+  the cap. A run counts until its callback actually returns, including one abandoned by
+  `TaskOptions(timeout=…)`, because it still holds a thread.
+- `max_runs_per_owner` (default `nothing`, off): one owner's live runs across both submit paths,
+  queued or executing. Past it, `:owner`, a `429`. It counts this runtime's runs only; it is not
+  a deployment-wide quota.
+- Every sequential queue refuses a submit once its buffer is full (`:queue`, a `503`), rather
+  than blocking the submitting request in `put!`.
+- **Queue names must be declared**: here through `queues`, or through `start!(…; queues)` /
+  `worker_startup(app; queues)`. A submit to any other name is an `AuthorizationError` (a `403`)
+  unless `allow_undeclared_queues = true`. Each queue name mints a processor task for the life of
+  the runtime, so a handler that took the name from request data used to mint one per name.
+
+The declared set bounds which processors this runtime will run. It is a resource bound, not
+authorization: who may submit to a declared queue is still the store's queue authorizer.
+
+The limits are fixed at construction. `default_runtime()`'s are the defaults above, so an app that
+needs other values builds its own runtime and passes it as `worker_startup(app; runtime = …)`.
 
 `AbstractWorkerStore` used to own all of that as well as the durable records, and that double role
 is the whole of [#29](https://github.com/PingoLee/Nitro.jl/issues/29): a backend that forgot
@@ -35,6 +62,9 @@ data and the tenant, so two runtimes over one store correctly share one security
 | `sequential_queues` / `queue_lock` | `SequentialQueue` per queue name, each owning a `Channel` and a processor `Task` |
 | `cleanup_scheduler` | The retention sweep, or `nothing` |
 | `active_tasks` / `active_task_infos` / `active_lock` | Process-local run handles. Keyed by task id, but each entry describes one **run**. [`shutdown!`](@ref) drains against these and keeps whatever outlives the wait (#176) |
+| `max_concurrent_runs` / `max_runs_per_owner` / `allow_undeclared_queues` | The limits above, fixed at construction |
+| `declared_queues` / `initial_queues` | The queue names a submit may use (under `queue_lock`), and the constructor's set, which `reset_runtime!` restores |
+| `reservations` / `owner_runs` / `async_runs` / `reservation_lock` | One entry per live run, keyed by `run_id`, and the counts the limits read. `reservation_lock` is a leaf: nothing else is locked, and no store or app code runs, while it is held |
 
 `active_task_infos` is the live-`TaskInfo` cache, and it lives here for **both** backends. It was
 previously a `PormGWorkerStore` field with no in-memory counterpart — the in-memory store answered
@@ -58,7 +88,28 @@ struct WorkerRuntime{S <: AbstractWorkerStore}
     active_task_infos::Dict{String, TaskInfo}
     active_lock::ReentrantLock
 
-    function WorkerRuntime(store::S) where {S <: AbstractWorkerStore}
+    # #324. Plain fields, one type parameter: `DEFAULT_RUNTIME` stays concretely typed.
+    max_concurrent_runs::Union{Nothing, Int}
+    max_runs_per_owner::Union{Nothing, Int}
+    allow_undeclared_queues::Bool
+    initial_queues::Vector{String}
+    declared_queues::Set{String}
+
+    reservations::Dict{UUID, Tuple{String, Bool}}   # run_id => (owner, is_async)
+    owner_runs::Dict{String, Int}
+    async_runs::Base.RefValue{Int}
+    reservation_lock::ReentrantLock
+
+    function WorkerRuntime(store::S;
+                           max_concurrent_runs::Union{Nothing, Integer} = 64,
+                           max_runs_per_owner::Union{Nothing, Integer} = nothing,
+                           allow_undeclared_queues::Bool = false,
+                           queues::AbstractVector{<:AbstractString} = String[]) where {S <: AbstractWorkerStore}
+        for (name, value) in ((:max_concurrent_runs, max_concurrent_runs), (:max_runs_per_owner, max_runs_per_owner))
+            value === nothing || value >= 1 ||
+                throw(ArgumentError("`$name` must be at least 1 or `nothing`, got $value"))
+        end
+        initial = String.(collect(queues))
         return new{S}(
             store,
             Dict{String, SequentialQueue}(),
@@ -67,8 +118,115 @@ struct WorkerRuntime{S <: AbstractWorkerStore}
             Dict{String, Task}(),
             Dict{String, TaskInfo}(),
             ReentrantLock(),
+            max_concurrent_runs === nothing ? nothing : Int(max_concurrent_runs),
+            max_runs_per_owner === nothing ? nothing : Int(max_runs_per_owner),
+            allow_undeclared_queues,
+            initial,
+            Set{String}(initial),
+            Dict{UUID, Tuple{String, Bool}}(),
+            Dict{String, Int}(),
+            Ref(0),
+            ReentrantLock(),
         )
     end
+end
+
+# ============================================================================
+# Capacity (#324)
+# ============================================================================
+
+# Declare queue names a submit may use. `start!(…; queues)` and `startup` call it; the second one
+# does so when the middleware is BUILT, so the startup window cannot refuse a declared queue.
+function _declare_queues!(runtime::WorkerRuntime, names)
+    lock(runtime.queue_lock) do
+        foreach(name -> push!(runtime.declared_queues, String(name)), names)
+    end
+    return runtime
+end
+
+function _queue_declared(runtime::WorkerRuntime, name::String)
+    runtime.allow_undeclared_queues && return true
+    return lock(() -> name in runtime.declared_queues, runtime.queue_lock)
+end
+
+# A slot in `queue`'s buffer, as a compare-and-set loop on its counter -- no lock, because the
+# caller holds `lock_tasks`, and `queue_lock` may not be taken inside that (`get_queue_status`
+# holds `queue_lock` while it lists under the store's lock).
+function _reserve_queue_slot!(queue::SequentialQueue)
+    while true
+        n = @atomic queue.reserved
+        n >= queue.capacity && return false
+        (@atomicreplace queue.reserved n => n + 1).success && return true
+    end
+end
+
+# Floored at zero: a hand-made `put!` (tests do it, white-box) takes a slot nobody reserved, and a
+# counter driven negative would let the next submissions reserve more than the buffer holds.
+function _release_queue_slot!(queue::SequentialQueue)
+    while true
+        n = @atomic queue.reserved
+        n <= 0 && return nothing
+        (@atomicreplace queue.reserved n => n - 1).success && return nothing
+    end
+end
+
+# Count run `run_id` against the runtime's limits, or throw `WorkerCapacityError` having counted
+# nothing. `reservation_lock` is a LEAF: no store call, no app hook, no log inside it.
+function _reserve_run!(runtime::WorkerRuntime, run_id::UUID, owner::String, async::Bool)
+    lock(runtime.reservation_lock) do
+        cap = runtime.max_concurrent_runs
+        if async && cap !== nothing && runtime.async_runs[] >= cap
+            throw(WorkerCapacityError(:runtime,
+                "the worker runtime is already running its maximum of $cap concurrent tasks"))
+        end
+        held = Base.get(runtime.owner_runs, owner, 0)
+        quota = runtime.max_runs_per_owner
+        if quota !== nothing && held >= quota
+            throw(WorkerCapacityError(:owner, "this identity already has its maximum of $quota live tasks"))
+        end
+        runtime.reservations[run_id] = (owner, async)
+        runtime.owner_runs[owner] = held + 1
+        async && (runtime.async_runs[] += 1)
+    end
+    return nothing
+end
+
+# Give back what `_reserve_run!` counted for `run_id`. IDEMPOTENT by construction: every count moves
+# only by popping the run's own entry, so a second release -- or a release after `reset_runtime!`
+# cleared the table -- finds nothing and changes nothing.
+function _release_run!(runtime::WorkerRuntime, run_id::UUID)
+    lock(runtime.reservation_lock) do
+        entry = pop!(runtime.reservations, run_id, nothing)
+        entry === nothing && return false
+        owner, async = entry
+        left = runtime.owner_runs[owner] - 1
+        left <= 0 ? delete!(runtime.owner_runs, owner) : (runtime.owner_runs[owner] = left)
+        async && (runtime.async_runs[] -= 1)
+        return true
+    end
+end
+
+# The reservation for a run about to be minted, in the order that keeps a refusal side-effect free:
+# the queue slot (atomics only) first, then the owner and runtime counts, and the queue slot is
+# handed back if those refuse. `queue === nothing` is the async path.
+function _reserve_capacity!(runtime::WorkerRuntime, queue::Union{Nothing, SequentialQueue},
+                            run_id::UUID, owner::String)
+    if queue !== nothing && !_reserve_queue_slot!(queue)
+        throw(WorkerCapacityError(:queue, "the queue is full; retry once it drains"))
+    end
+    try
+        _reserve_run!(runtime, run_id, owner, queue === nothing)
+    catch
+        queue === nothing || _release_queue_slot!(queue)
+        rethrow()
+    end
+    return nothing
+end
+
+function _release_capacity!(runtime::WorkerRuntime, queue::Union{Nothing, SequentialQueue}, run_id::UUID)
+    queue === nothing || _release_queue_slot!(queue)
+    _release_run!(runtime, run_id)
+    return nothing
 end
 
 """
@@ -653,6 +811,9 @@ function shutdown!(runtime::WorkerRuntime; drain_timeout::Real = WORKER_DRAIN_TI
                 catch error
                     @error "Worker queued task abandoned but not recorded during teardown" exception=(error, catch_backtrace()) task_key=item.task_key
                 end
+                # After the `catch`, so a store failure above cannot skip it: the run will never
+                # start, so its owner's reservation (#324) ends here either way.
+                _release_run!(runtime, item.run_id)
             end
         end
     end
@@ -765,6 +926,20 @@ function reset_runtime!(runtime::WorkerRuntime=default_runtime(); drain_timeout:
         # KEEPS the handles of runs that outlived the wait (#176). A reset is total, so it drops
         # them regardless -- otherwise a reset runtime could still report a run as live.
         empty!(runtime.active_tasks)
+    end
+
+    # The reservation table describes runs a reset just forgot. Later releases from runs that
+    # outlived it find nothing and change nothing, so no count can go negative. The declared
+    # queues go back to the constructor's set: `start!`'s declarations belong to the run the reset
+    # ended.
+    lock(runtime.reservation_lock) do
+        empty!(runtime.reservations)
+        empty!(runtime.owner_runs)
+        runtime.async_runs[] = 0
+    end
+    lock(runtime.queue_lock) do
+        empty!(runtime.declared_queues)
+        union!(runtime.declared_queues, runtime.initial_queues)
     end
 
     clear_records!(runtime.store)

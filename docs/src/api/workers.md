@@ -21,6 +21,7 @@ Nitro.Workers.reset_runtime!
 Nitro.Workers.WORKER_DRAIN_TIMEOUT_SECONDS
 Nitro.Workers.DEFAULT_QUEUE_NAME
 Nitro.Errors.WorkerUnavailableError
+Nitro.Errors.WorkerCapacityError
 Nitro.pormg_nitro_worker
 ```
 
