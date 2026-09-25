@@ -362,7 +362,7 @@ different reasons**, and conflating them is how this list rots:
 `src/middleware/extract_ip.jl` uses the predicate despite belonging to group 1, for consistency
 within a file this change already touched.
 
-### One site uses the predicate and deliberately does NOT rethrow
+### The executors' per-attempt catch uses the predicate and deliberately does NOT rethrow
 
 The per-attempt `catch` in both worker executors — `_execute_task_async` (`src/Workers/api.jl`)
 and `_execute_queued_task` (`src/Workers/queue.jl`) — treats the three as **terminal**, in the

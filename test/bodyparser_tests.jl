@@ -969,6 +969,18 @@ JSON.lower(x::DepthLowered) = x.payload
 # Stands in for the overflow: the serializer raises it on reaching the value, the walk must not.
 struct DepthTripwire end
 JSON.lower(::DepthTripwire) = throw(StackOverflowError())
+# A `Number` whose lowering is a deep container, as an app's money or unit type could be.
+struct DeepMoney <: Number
+    cents::Int
+end
+JSON.lower(m::DeepMoney) = foldl((x, _) -> Any[x], 2:600; init=Any[m.cents])
+# A vector of leaf-typed elements that cannot be read: only a walk that skips enumerating it
+# gets past it.
+struct UnreadableFloats <: AbstractVector{Float64}
+    n::Int
+end
+Base.size(v::UnreadableFloats) = (v.n,)
+Base.getindex(::UnreadableFloats, ::Int) = error("the flat shortcut was not taken")
 
 # Every builder adds exactly ONE level per step and keeps the element type fixed, so a
 # 513-deep value never becomes a 513-deep TYPE (deeply nested Tuple/NamedTuple types are a
@@ -996,6 +1008,8 @@ mixed(d)         = foldl((x, i) -> isodd(i) ? Any[x] : Dict{String,Any}("k" => x
         Dict{String,Any}("a" => [1, 2], "b" => Dict("c" => Any[Any[]])),
         DepthLowered(vecs(9)), DepthLowered("flat"), Any[DepthLowered(dicts(3))],
         self_dict, self_struct, Any[shared, Any[shared]],
+        # Numbers JSON.jl lowers to objects, inside TYPED containers (#367 review).
+        [1 + 2im], [1 // 3], Dict("a" => 1.0im), Set([2 // 3]), Any[[1.5 + 0im]],
     ]
     for v in corpus
         @test BP._check_value_depth(v) == written_depth(v)
@@ -1007,26 +1021,41 @@ end
         @test BP._check_value_depth(build(512)) == 512
         @test refused(build(513))
     end
-    # A matrix is two levels at once, and it sits on the flat shortcut: the edge still holds.
+    # A matrix is two levels at once: it lowers to a generator of its column views, and it is
+    # those views that sit on the flat shortcut. The edge still holds.
     @test BP._check_value_depth(vecs(510, zeros(2, 2))) == 512
     @test refused(vecs(511, zeros(2, 2)))
+    # A `Number` that lowers to a container, inside a TYPED array, at the edge. The flat shortcut
+    # used to take `AbstractArray{<:Number}` on trust, so this measured 512 and passed.
+    @test BP._check_value_depth(vecs(511, 1 + 2im)) == 512
+    @test refused(vecs(511, [1 + 2im]))
+end
+
+@testset "a Number with a deep JSON.lower cannot slip past the bound in a typed container" begin
+    # The review's case against the `AbstractArray{<:Number}` shortcut: a typed `Vector{DeepMoney}`
+    # was never enumerated, so its elements' 600-level payload reached `JSON.json` unbounded.
+    @test refused([DeepMoney(1)])
+    @test refused(Any[[DeepMoney(1)]])
+    @test refused(Dict("m" => DeepMoney(1)))
 end
 
 @testset "it refuses BEFORE the serializer would reach anything past the bound" begin
     # 600 levels, then a value the serializer overflows on. `JSON.json` gets there; the walk
-    # stops at 513 and never lowers it. Against a walk that recursed or ran after the serializer
-    # this would be a `StackOverflowError`, not the `ArgumentError`.
+    # stops at 513 and never lowers it. That pins the ORDER -- a bound that ran after the
+    # serializer, as the #344 text scan does, would meet the `StackOverflowError` first.
     deep = vecs(600, DepthTripwire())
     @test_throws StackOverflowError JSON.json(deep)
     @test refused(deep)
 end
 
-@testset "a large flat value is not enumerated element by element" begin
-    # Not a timing assertion -- just that the flat shortcut returns the right depth for the
-    # shapes it covers, which are the ones a big task result usually is.
-    @test BP._check_value_depth(rand(1_000_000)) == 1
+@testset "a flat container of leaf types is not enumerated element by element" begin
+    # Its elements cannot be read at all, so only a walk that took the shortcut returns: without
+    # it, `applyeach` indexes the vector and the `error` escapes.
+    @test BP._check_value_depth(UnreadableFloats(1_000_000)) == 1
+    @test BP._check_value_depth(Any[UnreadableFloats(3), Dict("x" => UnreadableFloats(3))]) == 3
+    # The shortcut is taken only for leaf element types; everything else is still walked.
+    @test BP._check_value_depth(Any[rand(10), Dict("x" => rand(10))]) == 3
     @test BP._check_value_depth(Dict("k$i" => i for i in 1:1000)) == 1
-    @test BP._check_value_depth(Any[rand(10_000), Dict("x" => rand(10))]) == 3
 end
 end
 

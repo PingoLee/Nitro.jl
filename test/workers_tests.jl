@@ -2979,7 +2979,9 @@ end
         # The discriminating assertion is the DEADLINE on FAILED, not `attempts == 1`: against
         # the unpatched loop the first attempt is followed by a 2s backoff (then 4s, 8s), so
         # `attempts` is still 1 when a quick check runs and only the time to FAILED tells the
-        # two apart. Thrown synthetically -- a real overflow is not safe in-process (#254, #301).
+        # two apart. Unpatched, FAILED lands after 2+4+8 = 14s, so the deadline must stay well
+        # under that; 10s leaves a slow runner's first-call compilation all the room it needs.
+        # Thrown synthetically -- a real overflow is not safe in-process (#254, #301).
         for exc in (StackOverflowError(), OutOfMemoryError(), InterruptException()),
             sequential in (false, true),
             timeout in (0, 30)
@@ -2994,7 +2996,7 @@ end
                                            options=options, runtime=rt_store) :
                     submit_task("boom", callback, Owner("u"); options=options, runtime=rt_store)
                 failed = wait_for(() -> get_task_status(id, Owner("u"); runtime=rt_store)[:status] ==
-                                        "FAILED"; timeout=1.8)
+                                        "FAILED"; timeout=10.0)
                 @test (label, failed) == (label, :ok)
                 status = get_task_status(id, Owner("u"); runtime=rt_store)
                 @test (label, occursin(string(nameof(typeof(exc))), something(status[:error], ""))) ==

@@ -401,13 +401,22 @@ _check_json_depth(s::AbstractString, max_keys::Int = 0) = _check_json_depth(code
                                     JSON.StructUtils.arraylike(style, x) ||
                                     JSON.StructUtils.structlike(style, x)
 
-# Containers whose every element lowers to a leaf, so the walk can skip enumerating them. Only a
-# shortcut: without it a million-element `Vector{Float64}` result is a million closure calls
-# that can add no depth.
-const _JSONScalar = Union{Number, AbstractString, Nothing, Missing, Symbol}
-@inline _flat_json_container(x) =
-    x isa AbstractArray{<:_JSONScalar} || x isa AbstractSet{<:_JSONScalar} ||
-    x isa AbstractDict{<:Any, <:_JSONScalar}
+# Containers whose every element lowers to a leaf, so the walk can skip enumerating them: without
+# this a million-element `Vector{Float64}` result is a million closure calls that add no depth.
+#
+# A CLOSED list of concrete types, never an abstract one like `Number`, because the shortcut
+# judges the element TYPE without lowering an element. `Number` was wrong both ways (#367
+# review): JSON.jl lowers `Complex` to `(re=, im=)` and `Rational` to `(num=, den=)`, and an
+# app's own `Number` can lower to anything. `[1+2im]` measured 1 where the writer writes 2, and a
+# `Vector{<:Number}` whose `JSON.lower` returns a deep payload skipped the bound entirely. By
+# dispatch on the type parameter rather than an `isa` against a `UnionAll`: that runtime subtype
+# query on every node was the walk's hottest line.
+const _JSONLeafType = Union{Bool, Base.BitInteger, Base.IEEEFloat, BigInt, BigFloat,
+                            String, Nothing, Missing, Symbol}
+_flat_json_container(x) = false
+_flat_json_container(::AbstractArray{T}) where {T} = T <: _JSONLeafType
+_flat_json_container(::AbstractSet{T}) where {T} = T <: _JSONLeafType
+_flat_json_container(::AbstractDict{K, V}) where {K, V} = V <: _JSONLeafType
 
 """
     _check_value_depth(value) -> Int
@@ -437,7 +446,10 @@ shapes — that is what the returned depth is for — so a JSON.jl release that 
 dispatch fails there rather than here.
 
 The post-serialization `_check_json_depth` stays as the store's final word: a `JSONText` is
-written verbatim and only a scan of the text sees its depth.
+written verbatim and only a scan of the text sees its depth. It also covers the one way the
+two can disagree: every value is lowered twice per write, once here and once by the serializer,
+so an app `JSON.lower` that is not deterministic can hand the walk a different structure than the
+one written.
 """
 function _check_value_depth(value)
     style = JSON.JSONWriteStyle()
