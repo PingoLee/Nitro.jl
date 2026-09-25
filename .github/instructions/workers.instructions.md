@@ -123,7 +123,7 @@ you add anything:
 | `update_progress!` | The only safe write to `TaskInfo.progress` |
 | `cleanup_old_tasks`, `start_cleanup_scheduler`, `stop_cleanup_scheduler!` | Retention |
 | `shutdown!`, `reset_runtime!` | Teardown — takes a `WorkerRuntime`, never a store. Both take `drain_timeout`; `shutdown!` defaults to `WORKER_DRAIN_TIMEOUT_SECONDS`, `reset_runtime!` to `0` |
-| `WorkerRuntime`, `default_runtime`, `worker_runtime`, `install!`, `uninstall!`, `worker_store`, `default_store` | Lifecycle and resolution |
+| `WorkerRuntime`, `default_runtime`, `worker_runtime`, `install!`, `uninstall!`, `worker_store`, `default_store` | Lifecycle and resolution. An App-first call on an App with no runtime throws `WorkerUnavailableError` (a 503) and never falls back to `default_runtime()`, which carries none of the app's policy; `worker_startup(app; …)` installs when it is *built*, ahead of the listener; the bare `worker_startup()` runs `default_runtime()` and refuses `store=`/`runtime=` ([#322](https://github.com/PingoLee/Nitro.jl/issues/322)) |
 
 **`runtime=` is the public keyword; `store=` only selects a backend.** Every read and submit call
 takes `runtime::WorkerRuntime=default_runtime()`, or resolves one from an `App` first argument.
@@ -173,7 +173,8 @@ Configure PormG, then bootstrap the store:
 ```julia
 # db_key defaults to "db"; "workers" below is an explicit override, not the default.
 persistent_store = pormg_nitro_worker(db_key="workers")
-serve(middleware=[worker_startup(queues=["reports"], store=persistent_store, recover_zombies=true)])
+app = App(mod = @__MODULE__)
+serve(app; middleware=[worker_startup(app; queues=["reports"], store=persistent_store, recover_zombies=true)])
 ```
 
 ## 4. Queue And Watch Authorization

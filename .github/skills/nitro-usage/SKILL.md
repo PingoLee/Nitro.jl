@@ -354,14 +354,15 @@ Task submission **requires** a `user_id`; read and manage APIs take it optionall
 non-empty one enforces watcher-based access:
 
 ```julia
-serve(middleware=[
-    worker_startup(queues=["reports"], store=persistent_store, recover_zombies=true),
+app = App(mod = @__MODULE__)
+serve(app; middleware=[
+    worker_startup(app; queues=["reports"], store=persistent_store, recover_zombies=true),
 ])
 
 # Returns the STORED id ("<user_id>::report-42"), not the key you passed.
-task_id = submit_task("report-42", () -> build_report(id), Owner(user_id))
-status  = get_task_status(task_id, Owner(user_id))
-cancel_task(task_id, Owner(user_id))
+task_id = submit_task(app, "report-42", () -> build_report(id), Owner(user_id))
+status  = get_task_status(app, task_id, Owner(user_id))
+cancel_task(app, task_id, Owner(user_id))
 ```
 
 Every task API takes a required `TaskAuthority`: `Owner(user_id)` to act as that identity, or the

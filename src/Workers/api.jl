@@ -1,10 +1,21 @@
+# No fallback (#322). This used to answer `default_runtime()` whenever `ctx` had nothing
+# installed, and that runtime carries none of the app's policy: no queue authorizer, no error
+# redactor, no retention. It was reachable in three ordinary ways -- a request in the window
+# between `serve()` opening its listener and the startup hook installing the runtime, the
+# tutorial's bare `worker_startup` paired with App-first calls, and a `start!` that threw before
+# installing -- and in each one a submission silently skipped the app's authorization. An App
+# with no runtime is now refused; `worker_startup(app)` installs one when it is BUILT, so the
+# startup window no longer exists for it.
 function _resolve_runtime(ctx::App; key::Symbol=DEFAULT_EXTENSION_KEY, runtime::Union{Nothing, WorkerRuntime}=nothing)
     if !isnothing(runtime)
         return runtime
     end
 
     installed = worker_runtime(ctx; key)
-    return installed isa WorkerRuntime ? installed : default_runtime()
+    installed isa WorkerRuntime && return installed
+    throw(WorkerUnavailableError(
+        "no worker runtime is installed on this App under key :$key. Add `worker_startup(app)` " *
+        "to `serve(app; middleware = [...])`, or call `install!(app)` / `start!(app)` first."))
 end
 
 """
@@ -327,8 +338,18 @@ function startup(ctx::App;
     drain_timeout::Real=WORKER_DRAIN_TIMEOUT_SECONDS,
 )
     # Refused here, where the middleware is built, not from the startup hook once serving began.
+    # Every check runs BEFORE the install below, so a refused call leaves nothing installed.
     _check_zombie_min_age(zombie_min_age)
     queue_names = String.(collect(queues))
+
+    # Installed NOW, when the middleware is built, not in `on_startup` (#322). `serve()` opens its
+    # listener before it runs the startup hooks, so a runtime installed by the hook left a window
+    # in which App-first calls found nothing installed -- and they used to fall back to the
+    # process-wide runtime, skipping the app's queue authorizer. `_start_runtime_for!` also refuses
+    # `store` + `runtime` together here, at boot, instead of from a hook whose exception is only
+    # logged. Only the INSTALL moves: the zombie sweep, the queue processors and the scheduler
+    # still start in `on_startup`.
+    installed = _start_runtime_for!(ctx, key, store, runtime, drain_timeout)
 
     passthrough = function(handle::Function)
         return function(req)
@@ -337,6 +358,9 @@ function startup(ctx::App;
     end
 
     on_startup = () -> begin
+        # `runtime = installed`, never `store = store`: the store form mints a runtime whenever
+        # the slot holds a different one, and after `terminate`'s `uninstall!` the slot is empty.
+        # Re-serving must put back THIS runtime, the one policy may already hang off.
         start!(ctx;
             queues=queue_names,
             cleanup_enabled=cleanup_enabled,
@@ -345,8 +369,7 @@ function startup(ctx::App;
             recover_zombies=recover_zombies,
             zombie_min_age=zombie_min_age,
             key=key,
-            store=store,
-            runtime=runtime,
+            runtime=installed,
             drain_timeout=drain_timeout,
         )
         return nothing

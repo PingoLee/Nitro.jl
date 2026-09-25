@@ -12,7 +12,7 @@ using Nitro.Workers: get_task_info, set_task!, replace_task!, add_watcher!, try_
     delete_task!, try_delete_task!, cleanup_tasks!, clear_records!, list_running_task_refs,
     RunningTaskRef, lock_tasks, get_active_task, get_active_task_info, register_run!,
     SequentialQueue, QueueItem, get_sequential_queues, get_queue_lock
-using Nitro.Errors: AuthorizationError, StoreInterfaceError
+using Nitro.Errors: AuthorizationError, StoreInterfaceError, WorkerUnavailableError
 using Base.ScopedValues: ScopedValue, with
 
 function wait_for(predicate::Function; timeout::Real=5.0)
@@ -1964,11 +1964,17 @@ end
 
     processed = Nitro.Core.process_middleware(ctx, [lifecycle])
     @test length(processed) == 1
-    @test isnothing(worker_store(ctx))
+    # Installed when the middleware was BUILT (#322), so there is no window before `on_startup`
+    # in which an App-first call finds nothing -- this asserted `isnothing` before, which was
+    # exactly that window. Nothing is RUNNING yet, though: no processor, no scheduler.
+    built = worker_runtime(ctx)
+    @test built isa WorkerRuntime
+    @test get_cleanup_scheduler(built)[] === nothing
 
     lifecycle.on_startup()
 
     store = worker_store(ctx)
+    @test worker_runtime(ctx) === built
     @test store isa InMemoryWorkerStore
     @test get_queue_status(ctx, "reports", System())[:running] == true
     @test get_cleanup_scheduler(worker_runtime(ctx))[] isa CleanupScheduler
@@ -4218,6 +4224,102 @@ end
         put!(gate, nothing)
         reset_runtime!(rt1)
         reset_runtime!(rt2)
+    end
+end
+
+
+@testset "#322: an App with no runtime is refused, never served by the process-wide one" begin
+    app = App(mod = @__MODULE__)
+    @test worker_runtime(app) === nothing
+    # Every App-first form refuses; none of them reaches `default_runtime()`, which carries none
+    # of the app's policy -- no queue authorizer, no redactor, no retention.
+    @test_throws WorkerUnavailableError submit_task(app, "k", () -> 1, Owner("u"))
+    @test_throws WorkerUnavailableError submit_sequential_task(app, "q", "k", () -> 1, Owner("u"))
+    @test_throws WorkerUnavailableError get_task_status(app, "u::k", Owner("u"))
+    @test_throws WorkerUnavailableError cancel_task(app, "u::k", Owner("u"))
+    @test_throws WorkerUnavailableError release_task!(app, "k", System())
+    @test_throws WorkerUnavailableError get_all_tasks(app, Owner("u"))
+    @test_throws WorkerUnavailableError get_queue_status(app, "q", System())
+    @test_throws WorkerUnavailableError cleanup_old_tasks(app)
+    @test_throws WorkerUnavailableError recover_zombie_tasks!(app)
+    @test_throws WorkerUnavailableError start_cleanup_scheduler(app)
+    # ...and nothing landed in the default runtime's store on the way.
+    @test get_task_info(default_store(), "u::k") === nothing
+
+    # Over HTTP: a 503 with a fixed body, never the fallback.
+    urlpatterns(app, "", path("/submit", req -> Res.json(Dict("id" => submit_task(app, "k", () -> 1, Owner("u"))))))
+    r = internalrequest(app, HTTP.Request("GET", "/submit"))
+    @test r.status == 503
+    @test JSON.parse(Nitro.text(r)) == Dict("message" => "503: Service Unavailable")
+end
+
+@testset "#322: worker_startup installs the runtime when it is built, before serve opens the listener" begin
+    app = App(mod = @__MODULE__)
+    store = InMemoryWorkerStore()
+    set_queue_authorizer!(store, (queue, uid) -> uid != "mallory")
+    lifecycle = worker_startup(app; store = store, queues = ["reports"], cleanup_enabled = false,
+                               recover_zombies = false)
+    try
+        # Installed already -- the startup window a request could land in before `on_startup`
+        # runs is covered by the app's own runtime and so by its own policy.
+        rt = worker_runtime(app)
+        @test rt isa WorkerRuntime
+        @test worker_store(app) === store
+        @test_throws AuthorizationError submit_task(app, "purge", () -> "ran", Owner("mallory"))
+        @test get_task_info(default_store(), "mallory::purge") === nothing
+
+        # `on_startup` starts THAT runtime; it does not mint a second one.
+        lifecycle.on_startup()
+        @test worker_runtime(app) === rt
+        @test get_queue_status(app, "reports", System())[:running] == true
+
+        # A second serve after terminate re-installs the same runtime, policy included.
+        lifecycle.on_shutdown()
+        @test worker_runtime(app) === nothing
+        lifecycle.on_startup()
+        @test worker_runtime(app) === rt
+        @test_throws AuthorizationError submit_task(app, "purge", () -> "ran", Owner("mallory"))
+    finally
+        uninstall!(app; drain_timeout = 0)
+    end
+end
+
+@testset "#322: a startup misconfiguration fails at build time and installs nothing" begin
+    app = App(mod = @__MODULE__)
+    store = InMemoryWorkerStore()
+    rt = WorkerRuntime(InMemoryWorkerStore())
+    @test_throws ArgumentError startup(app; store = store, runtime = rt)
+    @test worker_runtime(app) === nothing
+    @test_throws ArgumentError startup(app; zombie_min_age = Dates.Minute(-1))
+    @test worker_runtime(app) === nothing
+end
+
+@testset "#322: bare worker_startup shares default_runtime() with the bare task API" begin
+    ctx = Nitro.CONTEXT[]
+    previous = worker_runtime(ctx)
+    @test previous === nothing || previous === default_runtime()
+    lifecycle = worker_startup(; queues = String[], cleanup_enabled = false, recover_zombies = false)
+    try
+        # The bare startup and a bare `submit_task` now resolve to ONE runtime, so policy set
+        # on `default_store()` is the policy both see.
+        @test worker_runtime(ctx) === default_runtime()
+
+        # A backend the bare task API could never see is refused, not silently split off.
+        @test_throws ArgumentError worker_startup(; store = InMemoryWorkerStore())
+        @test_throws ArgumentError worker_startup(; runtime = WorkerRuntime(InMemoryWorkerStore()))
+        @test worker_runtime(ctx) === default_runtime()
+    finally
+        lifecycle.on_shutdown()
+    end
+    @test worker_runtime(ctx) === nothing
+
+    # A different runtime already installed on CONTEXT[] is refused rather than shut down.
+    other = install!(ctx; store = InMemoryWorkerStore())
+    try
+        @test_throws ArgumentError worker_startup()
+        @test worker_runtime(ctx) === other
+    finally
+        uninstall!(ctx; drain_timeout = 0)
     end
 end
 

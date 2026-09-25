@@ -298,6 +298,17 @@ path("/api/import", ImportHandlers.submit_import, method="POST",
      middleware=[GuardMiddleware(login_required())]),
 ```
 
+**Server** — the submit above names `Nitro.CONTEXT[]`, so the worker runtime must be installed
+there, with `import_queue` in its `queues`. The argument-less `worker_startup` does both:
+
+```julia
+serve(middleware=[worker_startup(queues=["import_queue"])])
+```
+
+Without it the submit is refused with `WorkerUnavailableError`, a `503`: a task call never falls
+back to a runtime the app did not install. With an explicit `App`, pass it in both places instead
+(`worker_startup(app; …)` and `submit_sequential_task(app, …)`).
+
 ## Sending multipart requests (client side)
 
 Use `HTTP.jl` to build multipart requests from the client:

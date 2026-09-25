@@ -35,8 +35,10 @@ using HTTP
 using Nitro
 using Nitro.Workers
 
+app = App(mod = @__MODULE__)
+
 function start_report(req::HTTP.Request)
-    task_id = submit_task("report-42", task_info -> begin
+    task_id = submit_task(app, "report-42", task_info -> begin
         sleep(10)
         return Dict("report_id" => 42, "status" => "ready")
     end, Owner("user-1"))
@@ -46,6 +48,11 @@ end
 ```
 
 The client gets a task id right away and can poll for status later.
+
+Every call in this guide passes the [`App`](@ref) first. That is how a task call finds the worker
+runtime `worker_startup(app)` installed, with the store and the policy you gave it. An App with no
+runtime installed is refused with `WorkerUnavailableError` (a `503` over HTTP); it is never quietly
+served by some other runtime ([#322](https://github.com/PingoLee/Nitro.jl/issues/322)).
 
 !!! warning "The returned id is not the key you passed in"
     `submit_task` and `submit_sequential_task` namespace the key by its owner, so the
@@ -66,7 +73,7 @@ Use `submit_task(...)` when jobs can run independently.
 - useful for imports, exports, notifications, and one-off background processing
 
 ```julia
-task_id = submit_task("refresh-dashboard", () -> begin
+task_id = submit_task(app, "refresh-dashboard", () -> begin
     sleep(2)
     return "ok"
 end, Owner("user-1"))
@@ -80,7 +87,7 @@ Use `submit_sequential_task(...)` when only one job in a queue should run at a t
 - useful for per-customer jobs, report pipelines, or jobs that must not overlap
 
 ```julia
-task_id = submit_sequential_task("reports", "report-42", task_info -> begin
+task_id = submit_sequential_task(app, "reports", "report-42", task_info -> begin
     sleep(2)
     return Dict("queue" => "reports", "task" => task_info.id)
 end, Owner("user-1"))
@@ -90,18 +97,20 @@ Different queues can still run independently.
 
 ## Start Workers With The Server
 
-The recommended app-level entrypoint is the exported `worker_startup(...)` middleware.
+The recommended app-level entrypoint is the exported `worker_startup(app; ...)` middleware.
 
-Add it to the `serve(middleware=[...])` list so Nitro starts the worker runtime on server startup and shuts it down when the server stops.
+Add it to the `serve(app; middleware=[...])` list so Nitro starts the worker runtime on server startup and shuts it down when the server stops.
 
 ```julia
 using HTTP
 using Nitro
 using Nitro.Workers
 
+app = App(mod = @__MODULE__)
+
 function create_report(req::HTTP.Request)
     report_id = string(getparams(req)["id"])
-    task_id = submit_sequential_task("reports", "report-" * report_id, task_info -> begin
+    task_id = submit_sequential_task(app, "reports", "report-" * report_id, task_info -> begin
         sleep(3)
         return Dict("report_id" => report_id, "status" => "ready")
     end, Owner("user-1"))
@@ -111,21 +120,21 @@ end
 
 function report_status(req::HTTP.Request)
     task_id = string(getparams(req)["task_id"])
-    status = get_task_status(task_id, Owner("user-1"))
+    status = get_task_status(app, task_id, Owner("user-1"))
     # "NOT_FOUND" covers a task that does not exist AND one this caller may not see -- the
     # same answer on purpose, so a 404 either way never tells a client which ids exist.
     status[:status] == "NOT_FOUND" && return Res.json(Dict("error" => "unknown task"); status=404)
     return Res.json(status)
 end
 
-urlpatterns("",
+urlpatterns(app, "",
     path("/reports/<str:id>", create_report, method="POST"),
     path("/tasks/<str:task_id>", report_status, method="GET"),
 )
 
-serve(
+serve(app;
     middleware=[
-        worker_startup(
+        worker_startup(app;
             queues=["reports"],
             cleanup_interval_hours=24,
             cleanup_retain_days=7,
@@ -138,18 +147,38 @@ serve(
 
 This is the simplest setup for most Nitro applications.
 
+**`worker_startup(app; …)` installs the runtime when it is called, not when the server starts.**
+`serve` opens its listener before it runs startup hooks, so a runtime installed by the hook left a
+window in which a request found none. So `worker_store(app)` is available as soon as the
+middleware is built, which is where to install policy:
+
+```julia
+workers = worker_startup(app; queues=["reports"])
+set_queue_authorizer!(worker_store(app), my_queue_authorizer)
+serve(app; middleware=[workers])
+```
+
+The startup hook does the running part (the zombie sweep, the queue processors, the retention
+scheduler), and the shutdown hook drains and uninstalls. A later `serve` puts the same runtime
+back.
+
+!!! note "The argument-less forms share `default_runtime()`"
+    `worker_startup()` with no `App` runs `default_runtime()`, the same runtime the bare task calls
+    (`submit_task(key, …)`, `get_task_status(id, …)`) use, so the two agree. It therefore refuses
+    `store = …` and any other `runtime = …`: the bare task API could never see that runtime. To
+    choose a backend, use the `App` forms throughout.
+
 ## Manual Startup
 
 If your app needs explicit bootstrap control, call `Nitro.Workers.start!` yourself. Pass the
-same app you serve — with an explicit [`App`](@ref) that is `app`, and with the argument-less
-`serve()` it is `Nitro.CONTEXT[]`. Starting workers on an app you never serve gives you queues
-nothing submits to.
+same app you serve. Starting workers on an app you never serve gives you queues nothing submits
+to.
 
 ```julia
 using Nitro
 
 runtime = Nitro.Workers.start!(
-    Nitro.CONTEXT[];
+    app;
     queues=["reports", "imports"],
     cleanup_enabled=true,
     cleanup_interval_hours=24,
@@ -171,7 +200,7 @@ Workers are two objects, and which one you reach for follows from one question:
 | **Runtime** (`WorkerRuntime`) | *"what is this process doing right now?"* | The sequential queues and their processor tasks, the cleanup scheduler, and the handles of runs executing here |
 
 You choose a **store** when you choose a backend, and that is the only place `store=` appears:
-`worker_startup(...; store=...)`, `Workers.start!(app; store=...)`, `install!(app; store=...)`.
+`worker_startup(app; store=...)`, `Workers.start!(app; store=...)`, `install!(app; store=...)`.
 Everything else takes `runtime=`, or resolves one from the `App` you pass as the first argument.
 
 ```julia
@@ -201,7 +230,7 @@ asks every run still executing to stop, then waits up to `drain_timeout` seconds
 returns `true` if they all finished and `false` if the wait expired.
 
 ```julia
-serve(middleware=[worker_startup(queues=["reports"], drain_timeout=5)])
+serve(app; middleware=[worker_startup(app; queues=["reports"], drain_timeout=5)])
 ```
 
 Nothing can *stop* a Julia task, so the request half is the cancellation token — the same one
@@ -224,9 +253,10 @@ the wait.
 Two things worth knowing:
 
 - A run abandoned past the deadline **keeps its handle registered**, so `recover_zombie_tasks!`
-  will not declare it dead — but that only helps a runtime that is *reused*. A
-  `serve → terminate → serve` cycle with `store=` builds a fresh `WorkerRuntime` each time, whose
-  handles start empty; there, finishing the run inside the drain is the only thing that saves it.
+  will not declare it dead — but that only helps a runtime that is *reused*. `worker_startup(app)`
+  reuses its runtime across a `serve → terminate → serve` cycle in one process. A new process
+  starts with empty handles; there, finishing the run inside the drain is the only thing that
+  saves it.
 - **A sequential queue's unstarted backlog is abandoned, not executed.** Closing the channel stops
   new submissions; the teardown also stops the processor taking work, and records every task still
   queued as `CANCELLED` with `"Cancelled by worker shutdown"`. It used to let the processor work
@@ -258,7 +288,7 @@ do something other than stop can branch on `cancel_reason(task_info)`; one that 
 partial result recognisable downstream returns it:
 
 ```julia
-submit_task("import", task_info -> begin
+submit_task(app, "import", task_info -> begin
     for chunk in chunks
         # Returns COMPLETED carrying a result the caller can recognise as partial.
         cancel_requested(task_info) && return (done=done, total=total, truncated=true)
@@ -293,11 +323,11 @@ Every read takes an **authority** saying who is asking — see
 [User Access Control](#User-Access-Control) below.
 
 ```julia
-task_id = submit_task("report-42", () -> build_report(), Owner("user-1"))
-status = get_task_status(task_id, Owner("user-1"))
+task_id = submit_task(app, "report-42", () -> build_report(), Owner("user-1"))
+status = get_task_status(app, task_id, Owner("user-1"))
 
 # Equivalent, when the returned id was not kept:
-status = get_task_status(scoped_task_key("report-42", Owner("user-1")), Owner("user-1"))
+status = get_task_status(app, scoped_task_key("report-42", Owner("user-1")), Owner("user-1"))
 ```
 
 ### `get_all_tasks`
@@ -307,9 +337,9 @@ For an `Owner` that is the tasks they own plus any they have been granted; for
 `System()` it is every task.
 
 ```julia
-my_tasks = get_all_tasks(Owner("user-1"))
-my_running = get_all_tasks(Owner("user-1"), RUNNING)
-every_task = get_all_tasks(System())
+my_tasks = get_all_tasks(app, Owner("user-1"))
+my_running = get_all_tasks(app, Owner("user-1"), RUNNING)
+every_task = get_all_tasks(app, System())
 ```
 
 The unpaged call materializes the whole listing, and the task table only grows between retention
@@ -317,11 +347,11 @@ sweeps. A task that never finishes is never swept at all. On a large table, read
 time instead. Pass `limit`, then pass the last entry's `:id` as `after` to get the next page:
 
 ```julia
-page = get_all_tasks(System(); limit = 500)
+page = get_all_tasks(app, System(); limit = 500)
 while !isempty(page)
     foreach(show_row, page)
     length(page) < 500 && break           # a short page is the last one
-    page = get_all_tasks(System(); limit = 500, after = last(page)[:id])
+    page = get_all_tasks(app, System(); limit = 500, after = last(page)[:id])
 end
 ```
 
@@ -347,7 +377,7 @@ Queue-wide introspection for sequential queues, reporting:
 **It is an admin surface and takes `System()` only** — an `Owner` is a `MethodError`:
 
 ```julia
-queue = get_queue_status("reports", System())
+queue = get_queue_status(app, "reports", System())
 ```
 
 Queue depth and the current task are facts about a *queue*, not about any one user, and
@@ -359,12 +389,12 @@ in front of Sidekiq Web or a Hangfire dashboard, and keep it off user-facing rou
 To show a user their own pending work, build it from a scoped read instead:
 
 ```julia
-mine_pending = get_all_tasks(Owner("user-1"), PENDING)
+mine_pending = get_all_tasks(app, Owner("user-1"), PENDING)
 ```
 
 !!! note "`is_task_running` was removed"
     It took no user id at all, so any caller who could name an id learned whether it was
-    live. Use `get_task_status(task_id, Owner(user_id))[:status] in ("PENDING", "RUNNING")`,
+    live. Use `get_task_status(app, task_id, Owner(user_id))[:status] in ("PENDING", "RUNNING")`,
     which answers the same question with authorization applied. Note `:status` is a
     `String`, not the `TaskStatus` enum.
 
@@ -373,7 +403,7 @@ mine_pending = get_all_tasks(Owner("user-1"), PENDING)
 Tasks can be cancelled by id — again, the id the submit call returned:
 
 ```julia
-cancel_task(task_id, Owner("user-1"))
+cancel_task(app, task_id, Owner("user-1"))
 ```
 
 !!! warning "Cancellation is cooperative — the callback has to notice"
@@ -385,7 +415,7 @@ cancel_task(task_id, Owner("user-1"))
     Poll the token. It is the whole mechanism:
 
     ```julia
-    submit_task("import", task_info -> begin
+    submit_task(app, "import", task_info -> begin
         for chunk in chunks
             cancel_requested(task_info) && return "cancelled"
             process(chunk)
@@ -408,7 +438,7 @@ cancel_task(task_id, Owner("user-1"))
     sparingly — it is a database round-trip:
 
     ```julia
-    get_task_status(task_info.id, System())[:status] == "CANCELLED" && return "cancelled"
+    get_task_status(app, task_info.id, System())[:status] == "CANCELLED" && return "cancelled"
     ```
 
     **A callback owns every resource it acquired, unconditionally.** Nothing reaches the
@@ -417,7 +447,7 @@ cancel_task(task_id, Owner("user-1"))
     for child processes, which were never reachable even under the old model:
 
     ```julia
-    submit_task("convert", task_info -> begin
+    submit_task(app, "convert", task_info -> begin
         p = run(`ffmpeg -i input.mov output.mp4`; wait = false)
         try
             while process_running(p)
@@ -458,7 +488,7 @@ costs the same single atomic read. Use the reason when a callback should react *
 deploy than to a person:
 
 ```julia
-submit_task("import", task_info -> begin
+submit_task(app, "import", task_info -> begin
     for chunk in chunks
         if cancel_requested(task_info)
             # A shutdown means we are coming back: checkpoint so the next process resumes.
@@ -481,6 +511,7 @@ Tasks can also retry on failure by passing `TaskOptions`.
 
 ```julia
 submit_task(
+    app,
     "fragile-import",
     () -> begin
         error("temporary failure")
@@ -516,7 +547,7 @@ If your callback accepts `task_info`, you can update progress while the job runs
 Write it through `update_progress!`, which is the only supported path:
 
 ```julia
-task_id = submit_task("report-99", task_info -> begin
+task_id = submit_task(app, "report-99", task_info -> begin
     update_progress!(task_info, 10)
     sleep(1)
     update_progress!(task_info, 60)
@@ -526,7 +557,7 @@ task_id = submit_task("report-99", task_info -> begin
 end, Owner("user-1"))
 ```
 
-Clients can then poll `get_task_status(task_id, Owner("user-1"))` and read `:progress`.
+Clients can then poll `get_task_status(app, task_id, Owner("user-1"))` and read `:progress`.
 
 Polling from the browser is the simplest thing that works, but it scales badly: every client asks
 every second whether anything changed, and the answer is usually no. To push instead, keep the
@@ -547,8 +578,8 @@ which means a key that two users can both produce is a key that leaks between th
 The key is namespaced by its owner, so `submit_task` returns `"<user_id>::<task_key>"`:
 
 ```julia
-a = submit_task("export_report_42", cb, Owner("user-a"))   # "user-a::export_report_42"
-b = submit_task("export_report_42", cb, Owner("user-b"))   # "user-b::export_report_42"
+a = submit_task(app, "export_report_42", cb, Owner("user-a"))   # "user-a::export_report_42"
+b = submit_task(app, "export_report_42", cb, Owner("user-b"))   # "user-b::export_report_42"
 ```
 
 Two independent tasks. Deduplication still collapses one user's repeat submissions onto
@@ -572,7 +603,7 @@ Opt in when one expensive job really should be shared across users — a cache w
 nightly rollup, a tenant-wide index rebuild:
 
 ```julia
-task_id = submit_task("warm-price-cache", cb, Owner(user_id); scope=:global)
+task_id = submit_task(app, "warm-price-cache", cb, Owner(user_id); scope=:global)
 ```
 
 The key is stored verbatim, so any user can name it. A caller who is **not already a
@@ -588,7 +619,7 @@ the finished record, 7 days by default. An administrator can reclaim a squatted 
 its task has finished:
 
 ```julia
-release_task!("warm-price-cache", System())   # deletes the finished record; the next submit starts fresh
+release_task!(app, "warm-price-cache", System())   # deletes the finished record; the next submit starts fresh
 ```
 
 A `:global` key may not contain `::`. That keeps the two namespaces disjoint: without the
@@ -630,7 +661,7 @@ Create the task table and indexes, then keep the returned store for worker calls
 using Nitro
 using Nitro.Workers
 
-worker_store = pormg_nitro_worker(db_key="workers")
+persistent_store = pormg_nitro_worker(db_key="workers")
 ```
 
 Task metadata will now be persisted to that database, while live running threads are managed safely in memory to prevent serialization issues.
@@ -673,7 +704,7 @@ A task's return value is stored as JSON, and may nest at most **512** levels, th
     id = PormG.run_in_transaction("db") do
         write_audit_row()          # returns the id
     end
-    submit_task("report_42", () -> render(id), Owner(uid))
+    submit_task(app, "report_42", () -> render(id), Owner(uid))
     ```
 
     The same applies to `worker_startup` / `startup` / `start!` and to the first
@@ -723,11 +754,11 @@ A task's return value is stored as JSON, and may nest at most **512** levels, th
 Pass the store into the worker startup middleware:
 
 ```julia
-serve(
+serve(app;
     middleware=[
-        worker_startup(
+        worker_startup(app;
             queues=["reports"],
-            store=worker_store,
+            store=persistent_store,
             recover_zombies=true,
         ),
     ],
@@ -746,7 +777,7 @@ Outside a request — a test, a script, a bootstrap — hold the runtime `start!
 it as `runtime=`. Note that this is the *runtime*, not the store: a store cannot run anything.
 
 ```julia
-runtime = Nitro.Workers.start!(app; queues=["reports"], store=worker_store)
+runtime = Nitro.Workers.start!(app; queues=["reports"], store=persistent_store)
 task_id = submit_task("report-42", run_report, Owner("user-1"); runtime=runtime)
 status = get_task_status(task_id, Owner("user-1"); runtime=runtime)
 ```
@@ -761,10 +792,10 @@ When a task fails, Nitro renders the exception your callback threw and stores th
 `ArgumentError` echoes the offending bytes — and those bytes are what gets stored:
 
 ```julia
-submit_task("import", Owner(user_id)) do
+submit_task(app, "import", () -> begin
     # If `payload` is user-supplied, this exception carries it into the store.
     parse(Int, payload)
-end
+end, Owner(user_id))
 ```
 
 Nitro is not the one putting user data in that message, so it cannot know which parts are
@@ -783,10 +814,10 @@ what is *stored*.
 
 ```julia
 # Keep the exception type, drop everything it quoted.
-set_error_redactor!(store, (exc, rendered) -> string(nameof(typeof(exc))))
+set_error_redactor!(worker_store(app), (exc, rendered) -> string(nameof(typeof(exc))))
 
 # Or redact selectively, leaving ordinary failures diagnosable.
-set_error_redactor!(store, function(exc, rendered)
+set_error_redactor!(worker_store(app), function(exc, rendered)
     exc isa MyApp.UserDataError ? "UserDataError (details withheld)" : rendered
 end)
 ```
@@ -836,14 +867,14 @@ bypass is a value you name, greppable in review and in a security audit.
 ```julia
 using Nitro.Errors: AuthorizationError
 
-task_id = submit_task("my-task", heavy_job, Owner("user-123"))
+task_id = submit_task(app, "my-task", heavy_job, Owner("user-123"))
 
-status = get_task_status(task_id, Owner("user-123"))     # ok
-get_task_status(task_id, Owner("intruder-99"))           # :status => "NOT_FOUND", as for a missing id
-get_task_status(task_id, System())                       # ok — admin path, unscoped
+status = get_task_status(app, task_id, Owner("user-123"))     # ok
+get_task_status(app, task_id, Owner("intruder-99"))           # :status => "NOT_FOUND", as for a missing id
+get_task_status(app, task_id, System())                       # ok — admin path, unscoped
 
-get_task_status(task_id)                                 # MethodError, not a bypass
-get_task_status(task_id, "user-123")                     # MethodError — not an authority
+get_task_status(app, task_id)                                 # MethodError, not a bypass
+get_task_status(app, task_id, "user-123")                     # MethodError — not an authority
 ```
 
 A task the caller may not see is answered **exactly** like a task that does not exist, by
@@ -883,11 +914,11 @@ to cover the whole job is the thing that split exists to prevent.
 Pass `watchers` at submit time:
 
 ```julia
-task_id = submit_task("import-42", run_import, Owner("browser-client");
+task_id = submit_task(app, "import-42", run_import, Owner("browser-client");
                       watchers = [Owner("backend-service")])
 
 # The backend can now poll and cancel, under its own identity:
-get_task_status(task_id, Owner("backend-service"))
+get_task_status(app, task_id, Owner("backend-service"))
 ```
 
 The grant is made **at submit time, by the owner**. That is the moment the owner is already
@@ -918,7 +949,7 @@ function my_queue_authorizer(queue_name::String, user_id::String)::Bool
     return true
 end
 
-set_queue_authorizer!(worker_store, my_queue_authorizer)
+set_queue_authorizer!(worker_store(app), my_queue_authorizer)
 ```
 
 This runs on **both** submit paths. `submit_sequential_task` passes the queue it was given;
@@ -927,7 +958,7 @@ following the convention every comparable queue uses. An authorizer written as a
 must therefore permit `"default"`, or `submit_task` is closed to everyone:
 
 ```julia
-set_queue_authorizer!(worker_store, (queue_name, user_id) ->
+set_queue_authorizer!(worker_store(app), (queue_name, user_id) ->
     queue_name == DEFAULT_QUEUE_NAME || queue_name in queues_for(user_id))
 ```
 
@@ -936,7 +967,7 @@ Decide who may join or reuse a `:global` task key someone else already owns:
 
 ```julia
 # Decide from data already in memory — see the warning below.
-set_watch_authorizer!(worker_store, function(task_key, watchers, user_id)
+set_watch_authorizer!(worker_store(app), function(task_key, watchers, user_id)
     return ORG_OF[first(watchers)] == ORG_OF[user_id]
 end)
 ```
@@ -961,7 +992,7 @@ which the hook sees when a `watchers=` grant is checked, it is the submitter alo
 ## Startup Zombie Task Recovery (Option B)
 
 To protect databases from stuck `RUNNING` tasks when a server or worker process crashes unexpectedly, Nitro.jl implements **automatic startup recovery**.
-* When the server starts up (via the `worker_startup(...)` middleware), it sweeps the database store for all tasks marked as `RUNNING`.
+* When the server starts up (via the `worker_startup(app; ...)` middleware), it sweeps the database store for all tasks marked as `RUNNING`.
 * For each task, it checks if there is a live, in-memory execution thread running in the current process.
 * If there is no live execution (meaning the task is a "zombie" orphaned by a previous crash), it marks the task status as `FAILED` with the error: `"Worker process terminated unexpectedly mid-execution."`
 * By default, automatic recovery is enabled (`recover_zombies=true`).
@@ -1013,7 +1044,7 @@ re-ran between the sweep's read and its write. The sweep leaves those alone.
     claims too old to belong to any live run:
 
     ```julia
-    worker_startup(queues = ["reports"], store = persistent_store,
+    worker_startup(app; queues = ["reports"], store = persistent_store,
                    zombie_min_age = Hour(2))   # longer than any task legitimately runs
     ```
 
@@ -1046,7 +1077,7 @@ That last point is load-bearing rather than advisory. Worker callbacks run on th
 
 Use `Nitro.Workers` when you need lightweight or persistent background execution for Nitro requests.
 
-- use `worker_startup(...)` to bootstrap workers with the server
+- use `worker_startup(app; ...)` to bootstrap workers with the server, and pass the same `app` first to every task call
 - use `PormGWorkerStore` to persist task state to your database
 - pass an `Owner(...)` on submission and on every read; `System()` is the named, unscoped bypass
 - use `submit_task(...)` for parallel jobs

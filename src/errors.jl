@@ -3,7 +3,8 @@ module Errors
 
 import JSON
 
-export ValidationError, CookieError, AuthorizationError, StoreInterfaceError, UnsupportedMediaTypeError
+export ValidationError, CookieError, AuthorizationError, StoreInterfaceError, UnsupportedMediaTypeError,
+    WorkerUnavailableError
 
 """
     ValidationError(msg::String)
@@ -178,6 +179,32 @@ end
 
 function Base.showerror(io::IO, e::UnsupportedMediaTypeError)
     print(io, "Unsupported Media Type: $(e.msg)")
+end
+
+"""
+    WorkerUnavailableError(msg::String)
+
+The exception an App-first worker call raises when its `App` has **no worker runtime installed**
+([#322](https://github.com/PingoLee/Nitro.jl/issues/322)): `submit_task(app, …)`,
+`get_task_status(app, …)` and the rest of the `Nitro.Workers` task API that takes an `App` first.
+
+Those calls used to fall back to `default_runtime()`. That runtime has none of the app's policy
+(no queue authorizer, no error redactor, no retention), so a request that arrived before
+`worker_startup(app)` had installed the app's runtime silently skipped the app's authorization.
+A missing runtime is now refused instead.
+
+`handle_error` answers it with a fixed `503 Service Unavailable`. It is logged at `@warn`
+without a backtrace: the message is fixed text naming the extension key and the fix, and carries
+no request data. That keeps a misconfiguration visible without a stack trace per request. A
+`503` is also the honest answer for the one legitimate way to reach it: a request landing
+between `terminate()` uninstalling the runtime and a later `serve()` reinstalling it.
+"""
+struct WorkerUnavailableError <: Exception
+    msg::String
+end
+
+function Base.showerror(io::IO, e::WorkerUnavailableError)
+    print(io, "Worker Unavailable: $(e.msg)")
 end
 
 

@@ -2,7 +2,8 @@ using HTTP
 using JSON
 using Dates
 
-using ..Errors: ValidationError, UnsupportedMediaTypeError, AuthorizationError, is_unrecoverable
+using ..Errors: ValidationError, UnsupportedMediaTypeError, AuthorizationError, WorkerUnavailableError,
+    is_unrecoverable
 using .BodyParsers: _parse_json_bounded
 
 export recursive_merge, parseparam, parsebody, parseparam_checked,
@@ -27,6 +28,13 @@ end
 # log-flood class) while a missing task answered 404 -- the difference was the oracle.
 function handle_error(::AuthorizationError)
     return Res.json(("message" => "403: Forbidden"), status = 403)
+end
+
+# The App a worker call named has no runtime installed (#322). It used to fall back to the
+# process-wide runtime, which carries none of the app's policy; now it is refused, and "the
+# service this route needs is not up" is a 503, not a 500.
+function handle_error(::WorkerUnavailableError)
+    return Res.json(("message" => "503: Service Unavailable"), status = 503)
 end
 
 function handle_error(::Any)
@@ -82,6 +90,11 @@ function handlerequest(getresponse::Function, catch_errors::Bool; show_errors::B
                 # `.msg`: an `AuthorizationError`'s message names the caller-chosen queue or task key
                 # verbatim, and it is not pinned value-free the way `ValidationError.msg` is (#323).
                 show_errors && @debug "Request refused (403 Forbidden)"
+            elseif error isa WorkerUnavailableError
+                # A misconfiguration or a restart gap, not a client fault -- so visible, at
+                # `@warn`, but without a backtrace per request. `.msg` is fixed text naming the
+                # extension key and the fix; it carries no request data (#322).
+                show_errors && @warn "Request refused (503): no worker runtime installed" message=error.msg
             elseif show_errors && !isa(error, InterruptException)
                 @error "ERROR: " exception=(error, catch_backtrace())
             end
