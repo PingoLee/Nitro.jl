@@ -141,6 +141,33 @@ function _interns(@nospecialize(T), seen::Base.IdSet{Any}) :: Bool
     return any(t -> _interns(t, seen), fieldtypes(T))
 end
 
+"""
+    binds_from_text(T) :: Bool
+
+Whether `Body{T}` can bind `T` from the raw body text (#345): `String`, `Any` (the text itself),
+`Char`, `Regex`, an `@enum`, or any concrete type with a `Base.parse(::Type{T}, ::String)` method
+-- numbers, `Bool`, `Date`, `UUID`, and an app's own type once it defines one. An abstract type
+such as `Integer` or `Real` does not qualify: `parse` cannot build one. A `Union` qualifies
+when every member other than `Nothing`/`Missing` does.
+
+A struct or container does not: `parseparam` would bind it by parsing the body as JSON whatever
+its `Content-Type`, and `text/plain` is a type a cross-site page can send without a CORS
+preflight -- the path #327 closed for `Json{T}`. Route registration refuses such a `Body{T}` and
+points to `Json{T}`, which requires the request to declare JSON.
+"""
+function binds_from_text(@nospecialize(T)) :: Bool
+    T === Any && return true
+    if T isa Union
+        members = filter(t -> t !== Nothing && t !== Missing, Base.uniontypes(T))
+        return !isempty(members) && all(binds_from_text, members)
+    end
+    T isa Type || return false
+    (T === String || T <: Union{Char, Regex, Enum}) && return true
+    # Concrete only: Base declares `parse` for `Type{<:Integer}` and `Type{<:Real}`, so `hasmethod`
+    # answers true for `Integer` or `Real`, whose `parse` then throws on every request.
+    return isconcretetype(T) && hasmethod(parse, Tuple{Type{T}, String})
+end
+
 # HTTP.jl v2 replaced the raw `Vector{UInt8}` request body (and `HTTP.payload`) with the
 # `AbstractBody` hierarchy. Read the bytes without consuming the body cursor so the
 # same request body can be read more than once (e.g. `.json` and `.form`). Responses may
@@ -220,6 +247,53 @@ Whether a `Content-Type` value is `multipart/form-data`, compared case-insensiti
 """
 is_multipart_form_media_type(content_type::AbstractString) :: Bool =
     _media_type(content_type) == "multipart/form-data"
+
+"""
+    is_form_media_type(content_type) :: Bool
+
+Whether a request with this `Content-Type` may carry an urlencoded form: the type is
+`application/x-www-form-urlencoded` (case-insensitive, parameters ignored) or there is no type at
+all (#345). The absent case keeps hand-built `HTTP.Request`s and untyped clients working; any
+declared type other than a form -- `text/plain`, XML, HTML, JSON, multipart -- is not a form.
+"""
+function is_form_media_type(content_type::AbstractString) :: Bool
+    mt = _media_type(content_type)
+    return isempty(mt) || mt == "application/x-www-form-urlencoded"
+end
+
+"""
+    _multipart_boundary(content_type) :: Union{String, Nothing}
+
+The `boundary` parameter of a `multipart/form-data` `Content-Type`, or `nothing` when the type is
+not multipart or names no usable boundary (#345). Parameters may come in any order, their names
+are case-insensitive, and the value may be a quoted-string (RFC 9110 §5.6.6, RFC 2046 §5.1.1).
+
+HTTP.jl's `parse_multipart_form` matched only the exact spelling
+`multipart/form-data; boundary=…` and took everything after `=` as the boundary, so
+`multipart/form-data;boundary=x`, a `charset` before `boundary`, or `boundary="x"` all reached the
+binder as an empty body. A boundary longer than 70 characters (RFC 2046's limit) is refused.
+"""
+function _multipart_boundary(content_type::AbstractString) :: Union{String, Nothing}
+    is_multipart_form_media_type(content_type) || return nothing
+    for param in Iterators.drop(eachsplit(content_type, ';'), 1)
+        eq = findfirst('=', param)
+        eq === nothing && continue
+        name = SubString(param, firstindex(param), prevind(param, eq))
+        # `_media_type` trims and lowercases ASCII only, so a name that is not valid UTF-8 cannot
+        # throw here; `name` holds no `;`, so it is the whole name.
+        _media_type(name) == "boundary" || continue
+        value = strip(SubString(param, nextind(param, eq)))
+        if startswith(value, '"')
+            # An unterminated quote -- or one cut short by a `;`, which no boundary may contain
+            # (RFC 2046 §5.1.1 `bcharsnospace`) -- is not a boundary.
+            (ncodeunits(value) >= 2 && endswith(value, '"')) || return nothing
+            value = SubString(value, nextind(value, firstindex(value)), prevind(value, lastindex(value)))
+        end
+        (isempty(value) || ncodeunits(value) > 70) && return nothing
+        return String(value)
+    end
+    return nothing
+end
 
 ### Bounded JSON parsing (#314)
 
@@ -375,17 +449,13 @@ end
 Read the html form data from the body of a HTTP.Request
 """
 function formdata(req::HTTP.Request) :: Dict{String,String}
-    # multipart/form-data is not urlencoded — parsing it here yields a garbage
-    # key. Use `getfiles(req)` / `getpost(req)` (or `multipart(req)`) for multipart bodies.
-    #
-    # Nor is a body that declares itself JSON (#327). `payload(req)` reads the form of every
-    # request, so a JSON body whose string values held `=` and `&` -- ordinary HTML -- used to
-    # merge junk "form" keys into it, and with the field cap would answer 400 for a JSON body
-    # with one key.
-    content_type = HTTP.header(req, "Content-Type", "")
-    if is_multipart_form_media_type(content_type) || is_json_media_type(content_type)
-        return copy(EMPTY_FORM_DATA)
-    end
+    # Only a body that says it is a form, or says nothing, is parsed as one (#345). `payload(req)`
+    # reads the form of every request, so any other body that happened to hold `=` -- JSON whose
+    # strings carry HTML (#327), `application/xml`, `text/plain`, `text/html` -- used to merge its
+    # `&`-separated pieces into it as junk "form" keys, and with the field cap would answer 400
+    # for a body full of HTML entities. Multipart has its own parser: `getfiles(req)` /
+    # `getpost(req)` (or `multipart(req)`).
+    is_form_media_type(HTTP.header(req, "Content-Type", "")) || return copy(EMPTY_FORM_DATA)
     body = text(req)
     if isnothing(body) || !occursin('=', body)
         return copy(EMPTY_FORM_DATA)
@@ -568,15 +638,20 @@ end
 function multipart(req::HTTP.Request) :: Dict{String, Union{FormFile, Vector{FormFile}, String, Vector{String}}}
     result = Dict{String, Union{FormFile, Vector{FormFile}, String, Vector{String}}}()
 
+    # The boundary is read here rather than by `HTTP.parse_multipart_form`, whose pattern accepts
+    # only one spelling of the header (#345) -- see `_multipart_boundary`.
+    boundary = _multipart_boundary(HTTP.header(req, "Content-Type", ""))
+    isnothing(boundary) && return result
+    bytes = _body_view(req.body)
+    isempty(bytes) && return result
+    # The part parser reads each part's headers through `pointer`, which wants dense memory.
+    bytes isa DenseVector{UInt8} || (bytes = collect(bytes))
+
     parts = try
-        HTTP.parse_multipart_form(req)
+        HTTP.parse_multipart_body(bytes, boundary)
     catch e
         # A malformed multipart body is "no parts"; a corrupted process is not (#254).
         is_unrecoverable(e) && rethrow()
-        return result
-    end
-
-    if isnothing(parts)
         return result
     end
 

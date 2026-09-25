@@ -131,8 +131,9 @@ end
 """
     getform(req::HTTP.Request) -> Dict{String, String}
 
-Returns the parsed urlencoded form body, or an empty `Dict` when the body is empty or is not
-form-encoded. A `multipart/form-data` body is **not** parsed here — use [`getpost`](@ref) and
+Returns the parsed urlencoded form body, or an empty `Dict` when the body is empty, is not
+form-encoded, or declares a `Content-Type` other than `application/x-www-form-urlencoded` (#345).
+An untyped body is still read. A `multipart/form-data` body is **not** parsed here — use [`getpost`](@ref) and
 [`getfiles`](@ref) for those.
 
 Parsed **once per request and cached**, like [`getjson`](@ref). [`formdata(req)`](@ref) is the

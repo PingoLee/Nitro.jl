@@ -527,3 +527,101 @@ end
 @test json(HTTP.Request("POST", "/", ["Content-Type" => "application/json"], """{"a":1}"""), ViaJson).a == 1
 @test haskey(_INTERNS_CACHE, ViaJson)
 end
+
+@testitem "Body{T} binds only raw text; a struct T is refused at registration (#345)" tags=[:core, :security] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Dates
+using UUIDs
+using Nitro
+using Nitro: App, Nullable, Body, Json
+using Nitro.Core.Util.BodyParsers: binds_from_text
+
+# `Body{T}` for a struct went through `parseparam`'s JSON fallback, which reads the body as JSON
+# whatever its Content-Type -- a `text/plain` body a cross-site page can send without a CORS
+# preflight bound exactly like the app's own JSON client. #327 closed that path for `Json{T}`.
+struct Transfer345
+    to::String
+    amount::Int
+end
+@enum Tier345 bronze = 1 gold = 2
+# An app type opts in by defining `Base.parse`.
+struct Cents345
+    n::Int
+end
+Base.parse(::Type{Cents345}, s::String) = Cents345(parse(Int, s))
+
+@testset "binds_from_text" begin
+    for T in (Any, String, Char, Regex, Int, Float64, Bool, BigInt, Tier345, Date, DateTime, UUID,
+              Cents345, Nullable{Int}, Union{Float32, Float64}, Union{Missing, String})
+        @test binds_from_text(T)
+    end
+    for T in (Transfer345, Vector{Int}, Vector{Any}, Dict{String, Any}, Tuple{Int},
+              NamedTuple{(:a,), Tuple{Int}}, Nullable{Transfer345}, Union{Int, Vector{Int}},
+              Nothing, Union{Nothing, Missing},
+              # Base declares `parse` for these abstract types, but it throws on each of them.
+              Integer, Real, AbstractFloat, Signed)
+        @test !binds_from_text(T)
+    end
+end
+
+@testset "a struct or container Body{T} is refused when the route is declared" begin
+    refused(route) = (app = App(mod = @__MODULE__);
+                      @test_throws ArgumentError urlpatterns(app, "", route))
+    refused(path("/t", (req, t::Body{Transfer345}) -> "x"; method = "POST"))
+    refused(path("/v", (req, v::Body{Vector{Any}}) -> "x"; method = "POST"))
+    refused(path("/d", (req, d::Body{Dict{String, Any}}) -> "x"; method = "POST"))
+    refused(path("/n", (req, n::Body{Nullable{Transfer345}}) -> "x"; method = "POST"))
+
+    app = App(mod = @__MODULE__)
+    err = try
+        urlpatterns(app, "", path("/t", (req, transfer::Body{Transfer345}) -> "x"; method = "POST"))
+        nothing
+    catch e
+        e
+    end
+    @test err isa ArgumentError
+    @test occursin("'transfer'", err.msg)
+    @test occursin("Json{", err.msg)
+end
+
+@testset "raw scalars still register and bind from any Content-Type" begin
+    app = App(mod = @__MODULE__)
+    urlpatterns(app, "",
+        path("/s", (req, b::Body{String}) -> b.payload; method = "POST"),
+        path("/a", (req, b::Body{Any}) -> string(b.payload); method = "POST"),
+        path("/f", (req, b::Body{Float64}) -> string(b.payload); method = "POST"),
+        path("/u", (req, b::Body{Union{Float32, Float64}}) -> string(b.payload); method = "POST"),
+        path("/b", (req, b::Body{Bool}) -> string(b.payload); method = "POST"),
+        path("/e", (req, b::Body{Tier345}) -> string(b.payload); method = "POST"),
+        path("/date", (req, b::Body{Date}) -> string(b.payload); method = "POST"),
+        path("/c", (req, b::Body{Cents345}) -> string(b.payload.n); method = "POST"),
+        path("/nc", (req, b::Body{Nullable{Cents345}}) -> string(b.payload.n); method = "POST"),
+        # The replacement for a struct body: same value, and it demands a JSON Content-Type.
+        path("/j", (req, t::Json{Transfer345}) -> t.payload.to; method = "POST"),
+    )
+    send(route, body; ct = "text/plain") =
+        internalrequest(app, HTTP.Request("POST", route, ["Content-Type" => ct], body))
+    @test Nitro.text(send("/s", "hello")) == "hello"
+    @test Nitro.text(send("/a", "hello")) == "hello"
+    @test Nitro.text(send("/f", "2.5")) == "2.5"
+    @test Nitro.text(send("/u", "2.5")) == "2.5"
+    @test Nitro.text(send("/b", "true")) == "true"
+    @test Nitro.text(send("/e", "gold")) == "gold"
+    @test Nitro.text(send("/date", "2026-09-24")) == "2026-09-24"
+    @test Nitro.text(send("/c", "150")) == "150"
+
+    # No JSON fall-through behind an admitted type (#345 review): `parseparam` retried a failed
+    # `parse` as JSON, so a type admitted for its own `Base.parse` bound field by field from a JSON
+    # body sent as `text/plain` -- skipping whatever that `parse` checks.
+    @test send("/c", """{"n":150}""").status == 400
+    @test Nitro.text(send("/nc", "7")) == "7"
+    @test send("/nc", """{"n":150}""").status == 400
+    @test send("/f", "[2.5]").status == 400
+    @test send("/f", "Infinity").status == 400
+
+    body = """{"to":"mallory","amount":1000}"""
+    @test send("/j", body).status == 415
+    @test Nitro.text(send("/j", body; ct = "application/json")) == "mallory"
+end
+end
