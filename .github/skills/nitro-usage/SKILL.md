@@ -401,9 +401,11 @@ unrecognised value throws at `serve()`. Do not write your own `get(ENV, "APP_ENV
 config = load_config(current_env())      # Nitro resolves the NAME; the app decides what it means
 ```
 
-With PormG loaded, that value is published to `ENV["PORMG_ENV"]` as a default, so
-`PormG.Configuration.load_many(["db"])` needs no `env=`. A pre-set `PORMG_ENV` and an explicit
-`env=` both still win. Set `NITRO_ENV` **before** `using`, as with `RAILS_ENV`/`MIX_ENV`.
+With PormG loaded, an environment set in `NITRO_ENV`/`GENIE_ENV` is published to
+`ENV["PORMG_ENV"]` as a default, so `PormG.Configuration.load_many(["db"])` needs no `env=`. A
+pre-set `PORMG_ENV` and an explicit `env=` both still win. With neither variable set, the `"dev"`
+fallback is **not** published, so `default_env:` in `connection.yml` decides. Set `NITRO_ENV`
+**before** `using`, as with `RAILS_ENV`/`MIX_ENV`.
 
 `current_env()` **reports**; it must never **gate**. Selecting a config file, log verbosity, seed
 data: fine. Deciding whether a cookie gets `Secure`, whether CSRF is enforced, or whether error

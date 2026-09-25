@@ -27,8 +27,11 @@ When designing configuration, bootstrapping applications, or proposing developer
   Environment **resolution** is core Nitro as of [#55](https://github.com/PingoLee/Nitro.jl/issues/55):
   `current_env()` ([`src/environment.jl`](../../src/environment.jl)) resolves and validates
   `NITRO_ENV` (then `GENIE_ENV`, then `"dev"`) against a closed set, and `NitroPormGExt`
-  publishes it to `ENV["PORMG_ENV"]` as a default. Apps consume the name; they no longer
-  derive it. `current_env()` **reports** and must never **gate** — see `src/errors.jl`.
+  publishes it to `ENV["PORMG_ENV"]` as a default — **only when `NITRO_ENV`/`GENIE_ENV` is
+  actually set** ([#331](https://github.com/PingoLee/Nitro.jl/issues/331)). The `"dev"` fallback
+  is never published, because at the `PORMG_ENV` level it would outrank a `default_env:` someone
+  wrote in `connection.yml`. Apps consume the name; they no longer derive it. `current_env()`
+  **reports** and must never **gate** — see `src/errors.jl`.
 - **Secrets must not be committed**; use env vars or non-committed local config.
 - Allow env vars to override file-based app config for deployment.
 

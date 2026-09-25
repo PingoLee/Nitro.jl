@@ -121,6 +121,12 @@ serve(middleware=[
 Sessions are stored as JSON in the database with a fixed-point expiry timestamp
 (no sliding expiry). Works with any PormG-supported backend (SQLite, PostgreSQL).
 
+Session data may nest at most **512** levels, the same limit Nitro puts on request JSON.
+Storing anything deeper throws an `ArgumentError` when the session is saved, instead of writing
+a session that could never be read back. Real session data is a few levels deep; a recursive
+structure is the only way to get near the limit. The in-memory store serializes nothing and has
+no such limit, so a test suite on `MemoryStore` will not catch it.
+
 The default `db_key` is `"db"`. Use a different one when your session database uses another
 PormG connection, for example `db_key="sessions"` — the key selects the connection the table is
 created on *and* the one every session query runs against, so the two can never disagree.

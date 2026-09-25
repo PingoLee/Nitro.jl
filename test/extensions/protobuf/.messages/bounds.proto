@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+// Fixture for the bounded decoder (#325). Generated with a current ProtoBuf.jl, so unlike
+// test.proto / people.proto it exercises the NEW-style decode methods, and it carries the
+// field shapes those two lack: bytes, packed fixed-width numbers, a recursive message, and a
+// singular sub-message field (the merge path).
+
+message Node {
+    int64 x = 1;
+    Node child = 2;
+}
+
+message Blob {
+    bytes data = 1;
+    repeated fixed32 fx = 2;
+    repeated float fl = 3;
+    repeated bool flags = 4;
+}
+
+message Holder {
+    Blob blob = 1;
+}

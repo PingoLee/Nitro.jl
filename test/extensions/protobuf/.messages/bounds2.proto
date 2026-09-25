@@ -1,0 +1,49 @@
+syntax = "proto2";
+
+// Fixture for the bounded decoder (#325): proto2 `required` message fields. Current codegen
+// holds them in a plain `Ref{T}()` rather than `Ref{Union{Nothing,T}}`. When `T` is laid out
+// inline with no pointer, that ref reads as already assigned before the field is ever seen --
+// the case the merge counter must not mistake for a repeat.
+
+// An isbits `T`.
+message Point {
+    required int32 x = 1;
+    required int32 y = 2;
+}
+
+message Line {
+    required Point a = 1;
+    required Point b = 2;
+}
+
+message Drawing {
+    repeated Line lines = 1;
+}
+
+// Not isbits, but still inline and pointer-free: the optional sub-message is a
+// `Union{Nothing, Tag}` field.
+message Tag {
+    required int32 id = 1;
+}
+
+message Labeled {
+    optional Tag tag = 1;
+    required int32 k = 2;
+}
+
+message Row {
+    required Labeled item = 1;
+}
+
+message Table {
+    repeated Row rows = 1;
+}
+
+// A required field whose message CAN hold a vector: its repeats must still be counted.
+message Bag {
+    repeated fixed32 v = 1;
+}
+
+message Box {
+    required Bag bag = 1;
+}

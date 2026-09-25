@@ -328,6 +328,29 @@ function Base.getproperty(m::FailingMockModel, name::Symbol)
     end
 end
 
+# The same shape, throwing a chosen exception -- for the #254 rethrow of the query catch.
+struct ThrowingMockModel
+    exc::Exception
+end
+
+function Base.getproperty(m::ThrowingMockModel, name::Symbol)
+    name === :objects && return m
+    name === :db && return (_db_key::String) -> m
+    return (args...; kwargs...) -> throw(getfield(m, :exc))
+end
+
+# A stored `session_data` whose bytes cannot even be read: the synthetic stand-in for an overflow
+# or OOM raised while decoding, which cannot safely be produced for real in-process (#254, #301).
+# The depth scan reads code units first, so this throws where a real overflow would have.
+struct ExplodingText <: AbstractString
+    exc::Exception
+end
+Base.ncodeunits(::ExplodingText) = 2
+Base.codeunit(::ExplodingText) = UInt8
+Base.codeunit(t::ExplodingText, ::Int) = throw(t.exc)
+Base.isvalid(::ExplodingText, ::Int) = true
+Base.iterate(t::ExplodingText, ::Int = 1) = throw(t.exc)
+
 # ── Load the SHIPPED store from the extension ────────────────────────────
 
 function _load_pormg_session_store_type()
@@ -662,6 +685,52 @@ end
         @test !occursin("SECRET", logs)
         # The session key is the credential itself, so it stays out of the line too.
         @test !occursin("sess-bad-267", logs)
+    end
+
+    @testset "session data is depth-bounded both ways (#344)" begin
+        nested(k) = (v = Any[]; for _ in 2:k; v = Any[v]; end; v)   # `k` levels of arrays
+        m = MockModel()
+        s = RealPormGSessionStore(model=m)
+
+        # `{"deep": [[…]]}`: the object is one level, so 511 arrays inside it is the bound.
+        set_session!(s, "sess-deep", Dict{String,Any}("deep" => nested(511)); ttl=3600)
+        @test get_session(s, "sess-deep") !== nothing
+
+        # One level over is refused at the write, before a row exists -- not stored where every
+        # later read would silently reset the session.
+        @test_throws ArgumentError set_session!(s, "sess-deeper", Dict{String,Any}("deep" => nested(512)); ttl=3600)
+        @test !haskey(m._table, "sess-deeper")
+        # The update-only write a loaded session goes through (#318) is bounded the same way,
+        # and leaves the live row as it was.
+        before = m._table["sess-deep"][:session_data]
+        @test_throws ArgumentError update_session!(s, "sess-deep", Dict{String,Any}("deep" => nested(512)); ttl=3600)
+        @test m._table["sess-deep"][:session_data] == before
+
+        # A row stored over the bound before it existed reads as no session, through the same
+        # payload-free warning as any other undecodable row.
+        m._table["sess-deep"][:session_data] = JSON.json(Dict("deep" => nested(512)))
+        io = IOBuffer()
+        got = Base.CoreLogging.with_logger(Base.CoreLogging.SimpleLogger(io, Base.CoreLogging.Debug)) do
+            Base.get(s, "sess-deep", :fallback)
+        end
+        @test got === :fallback
+        @test occursin("does not decode", String(take!(io)))
+    end
+
+    @testset "an unrecoverable error reading a session propagates (#254, #344)" begin
+        # Read as "no session", an overflow would log the visitor out and keep serving from a
+        # process that may be corrupted. Ordinary failures still read as no session -- the
+        # FailingMockModel and #267 testsets above pin that half.
+        for exc in (InterruptException(), StackOverflowError(), OutOfMemoryError())
+            m = MockModel()
+            s = RealPormGSessionStore(model=m)
+            set_session!(s, "sess-boom", Dict{String,Any}("user_id" => 1); ttl=3600)
+            m._table["sess-boom"][:session_data] = ExplodingText(exc)
+            @test_throws typeof(exc) Base.get(s, "sess-boom", :fallback)
+
+            throwing = RealPormGSessionStore(model=ThrowingMockModel(exc))
+            @test_throws typeof(exc) Base.get(throwing, "sess-boom", :fallback)
+        end
     end
 end
 

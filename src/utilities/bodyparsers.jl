@@ -321,8 +321,14 @@ corrupted afterwards, and on some Windows hosts the process dies outright (#301)
 6× margin for larger stack frames (Win64, coverage builds, user types) and for the stack the
 middleware chain has already used, and is far deeper than any real payload.
 
-Internal and fixed on purpose. Every request-data `JSON.parse` in Nitro goes through
-`_parse_json_bounded`, and `test/bodyparser_tests.jl` fails if one does not.
+Internal and fixed on purpose. Every `JSON.parse` in Nitro goes through `_parse_json_bounded`,
+and `test/bodyparser_tests.jl` fails if one does not. That includes the JSON the PormG
+extension stores and reads back itself: session payloads, and a task's `result` and `watchers`
+(#344). What the application stored is not attacker input, but reading it back recurses on
+whatever task asked, often a request task. The extension also runs `_check_json_depth` over
+the serialized text before it writes, so a value too deep to read back is refused at
+`set_session!`/`update_session!` or at the task's completing write, instead of being stored
+unreadable.
 """
 const MAX_JSON_DEPTH = 512
 

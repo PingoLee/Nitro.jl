@@ -30,6 +30,11 @@ index if they do not already exist (`IF NOT EXISTS`), and returns a ready-to-use
 `PormGSessionStore`. Sessions are stored as JSON with a fixed-point expiry timestamp; there
 is no sliding expiry.
 
+Session data may nest at most **512** levels deep, the same bound as request JSON
+(`MAX_JSON_DEPTH`). Writing a deeper payload throws an `ArgumentError` before the row is
+touched, rather than storing a session that could never be read back. A row stored deeper
+before this bound existed reads as no session, and logs a warning that names no payload.
+
 `db_key` names the PormG connection, defaulting to `"db"`. It governs **both** halves: the
 table is created on that connection, and the returned store routes every session query — read,
 write, delete and prune — to the same one. Pass a different key when your session database uses
@@ -54,11 +59,19 @@ serve(middleware=[SessionMiddleware(store=store)])
 function pormg_nitro_session end
 
 """
-    sync_pormg_env!(; force::Bool = false) -> String
+    sync_pormg_env!(; force::Bool = false) -> Union{String, Nothing}
 
-Publish Nitro's resolved environment ([`current_env`](@ref)) to `ENV["PORMG_ENV"]`, the
-variable PormG's own configuration loader consults. Returns whatever `PORMG_ENV` holds
-afterwards.
+Publish the environment set in `NITRO_ENV` (or its fallback `GENIE_ENV`, validated exactly as
+[`current_env`](@ref) validates them) to `ENV["PORMG_ENV"]`, the variable PormG's own
+configuration loader consults. Returns whatever `PORMG_ENV` holds afterwards, or `nothing` if it
+is unset.
+
+**Only a set environment is published.** With neither variable set, `current_env()` reports its
+`"dev"` fallback, but nothing is written: that fallback is not a choice anyone made, and as
+`PORMG_ENV` it would outrank one someone did make, `default_env:` in `connection.yml`. PormG
+then resolves its own environment. A blank or whitespace-only `PORMG_ENV` counts as unset. It is
+overwritten when there is an environment to publish, and removed when there is not, so PormG
+never looks up a `""` section.
 
 **A default, never a force.** With `force = false` (the default) an existing `PORMG_ENV` is
 left exactly as it is. PormG's documented precedence stays intact either way:
@@ -68,10 +81,11 @@ env= kwarg  >  ENV["PORMG_ENV"]  >  `default_env:` in connection.yml  >  "dev"
 ```
 
 so an explicit `env=` at a `load` call site always wins regardless of this function. Pass
-`force = true` only to deliberately overwrite a value already there.
+`force = true` only to deliberately overwrite a value already there. It still writes nothing
+when neither `NITRO_ENV` nor `GENIE_ENV` is set.
 
 `NitroPormGExt.__init__` calls this for you at `using PormG`, which is what lets an app write
-`PormG.Configuration.load_many(["db"])` with no `env=` and still get the right environment.
+`PormG.Configuration.load_many(["db"])` with no `env=` and still get the environment it set.
 Call it by hand only if you set `NITRO_ENV` *after* loading PormG — see the load-order note in
 the environment docs.
 
@@ -96,6 +110,12 @@ they do not already exist (`IF NOT EXISTS`), and returns a ready-to-use `PormGWo
 Table setup is not purely additive. Bootstrapping also issues an unconditional
 `ALTER TABLE … ADD COLUMN run_id` against a pre-existing table that predates the run-id
 column, and tolerates the error when the column is already there.
+
+A task's return value is stored as JSON, and may nest at most **512** levels deep, the same
+bound as request JSON (`MAX_JSON_DEPTH`). A deeper result makes the completing write throw an
+`ArgumentError` before the row is touched. The run then retries or fails like any other
+attempt that throws, so the task ends `FAILED` rather than storing a result no read could
+decode. `InMemoryWorkerStore` serializes nothing and has no such limit.
 
 Requires `using PormG` and a configured PormG connection; without the extension loaded this
 is a `MethodError`.

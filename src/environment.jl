@@ -37,8 +37,13 @@ end
 
 # PURE — takes the two raw values rather than reading `ENV`, so the whole precedence table and
 # every error message are unit-testable without mutating the process environment. `current_env`
-# is the only caller that touches `ENV`.
-function _resolve_env(nitro::Nullable{String}, genie::Nullable{String})::String
+# and `_explicit_env` are the only callers that touch `ENV`.
+#
+# `nothing` when NEITHER variable is set: the environment someone actually chose, as opposed to
+# the `"dev"` Nitro falls back to. The PormG bridge needs that distinction (#331) -- publishing
+# the fallback as if it were a choice outranks a choice someone DID make, `default_env:` in
+# connection.yml.
+function _resolve_explicit(nitro::Nullable{String}, genie::Nullable{String})::Nullable{String}
     n = _present(nitro)
     if n !== nothing
         n in NITRO_ENVS || throw(_invalid("NITRO_ENV", n, ""))
@@ -57,8 +62,16 @@ function _resolve_env(nitro::Nullable{String}, genie::Nullable{String})::String
         return g
     end
 
-    return "dev"
+    return nothing
 end
+
+_resolve_env(nitro::Nullable{String}, genie::Nullable{String})::String =
+    something(_resolve_explicit(nitro, genie), "dev")
+
+# The environment set in `NITRO_ENV`/`GENIE_ENV`, or `nothing` when neither is. Validates exactly
+# as `current_env` does. Internal: the only consumer is the PormG bridge (`sync_pormg_env!`).
+_explicit_env()::Nullable{String} =
+    _resolve_explicit(get(ENV, "NITRO_ENV", nothing), get(ENV, "GENIE_ENV", nothing))
 
 """
     current_env() -> String
@@ -76,9 +89,11 @@ calls it once at startup, and `NitroPormGExt` once at load.
 
 # Bridging to PormG
 
-With `PormG` loaded, this value is published to `ENV["PORMG_ENV"]` as a **default** (see
-`sync_pormg_env!`), so `PormG.Configuration.load_many([...])` needs no `env=`. A
-pre-set `PORMG_ENV` and an explicit `env=` both still win.
+With `PormG` loaded, an environment set in `NITRO_ENV` or `GENIE_ENV` is published to
+`ENV["PORMG_ENV"]` as a **default** (see `sync_pormg_env!`), so
+`PormG.Configuration.load_many([...])` needs no `env=`. A pre-set `PORMG_ENV` and an explicit
+`env=` both still win. The `"dev"` fallback is **not** published: with neither variable set,
+PormG resolves its own environment, so `default_env:` in `connection.yml` still decides.
 
 # This function REPORTS; it must never GATE
 

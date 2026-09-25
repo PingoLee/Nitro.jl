@@ -30,9 +30,11 @@ Read `nitro-config.instructions.md` for config ownership rules before recommendi
       `staging` value that used to boot no longer does. Confirm it from the unit file /
       Dockerfile / compose, not from a shell you happen to be in.
 - [ ] If the app uses PormG: the environment it connects with is the one you expect.
-      Nitro seeds `ENV["PORMG_ENV"]` from `NITRO_ENV` at `using PormG`, which **outranks**
-      `default_env:` in `connection.yml` — so a `default_env:` that used to decide is now
-      inert. The startup banner prints the resolved environment; read it once on the box.
+      When `NITRO_ENV` (or `GENIE_ENV`) is set, Nitro seeds `ENV["PORMG_ENV"]` from it at
+      `using PormG`, which **outranks** `default_env:` in `connection.yml`. When neither is
+      set, nothing is seeded and `default_env:` decides — while the banner still says
+      `Environment: dev`. So on a PormG box, set `NITRO_ENV` explicitly and read the banner
+      once; don't infer the database environment from a banner showing the default.
 - [ ] No security control is keyed off `current_env()`. Cookie `Secure`, CSRF, and auth
       must fail closed on their own switch, not on the environment name (which is the
       value most likely to be missing). See `docs/src/tutorial/environment.md`.

@@ -10,6 +10,10 @@ import Nitro.Auth: make_password, check_password, password_needs_upgrade
 import Nitro.Core.Types: AbstractSessionStore, SessionPayload, get_session, set_session!, update_session!, delete_session!, cleanup_expired_sessions!, is_expired
 import Nitro.Core.Cookies: storesession!, prunesessions!
 import Nitro: pormg_nitro_session, sync_pormg_env!
+# Stored JSON is read through the same depth bound as request JSON, and written only when it can
+# be read back (#344). `is_unrecoverable` is the #254 catch policy every request-path site uses.
+import Nitro.Core.Util.BodyParsers: _parse_json_bounded, _check_json_depth
+import Nitro.Core.Errors: is_unrecoverable
 
 import Nitro.Workers: AbstractWorkerStore, TaskInfo, TaskStatus, TaskOptions,
     PENDING, RUNNING, COMPLETED, FAILED, CANCELLED,
@@ -226,21 +230,48 @@ _session_objects(store::PormGSessionStore) = store.model.objects.db(store.db_key
 
 # -- Serialization helpers --
 
+# Stored JSON -- a session payload here, a task's `result` in the worker store below -- is read
+# through the same 512-level bound as request JSON (#344). What the application stored is not
+# attacker input, but reading it back recurses once per level on whatever task asked, often a
+# request task (`get_task_info` from a handler, the session read in middleware), and #301 showed
+# an overflow there can take a Windows process down rather than raise.
+#
+# Bounding only the read would make a value stored deeper than the bound permanently
+# unreadable: the session would silently reset on every request, the task info would error on
+# every read. So the WRITE refuses it instead, while the caller can still see why: the same
+# non-recursive byte scan, over the serialized text, before any row is touched. `max_fields = 0`
+# on the read: the per-request key cap guards request bodies, and this is the app's own data.
+#
+# What this does NOT bound is `JSON.json` itself, which recurses too. A value deep enough to
+# overflow the serializer -- thousands of levels, which only the app can build, since request JSON
+# stops at 512 -- overflows before the scan runs, exactly as it did before this check existed.
+function _json_for_storage(value)::String
+    serialized = JSON.json(value)
+    _check_json_depth(serialized)
+    return serialized
+end
+
+_parse_stored(raw::AbstractString) = _parse_json_bounded(raw; max_fields = 0)
+
 function _serialize_session(data::Dict{String,Any})::String
-    return JSON.json(data)
+    return _json_for_storage(data)
 end
 
 function _deserialize_session(raw::AbstractString)::Dict{String,Any}
-    parsed = JSON.parse(raw)
+    parsed = _parse_stored(raw)
     return convert(Dict{String,Any}, parsed)
 end
 
 # -- Store interface implementation --
 
 function Base.get(store::PormGSessionStore, session_id::String, default)
+    # Both catches below follow #254: an interrupt, a stack overflow or an out-of-memory is not
+    # "no session" -- reported as one, it would log the visitor out and carry on in a process
+    # that may be corrupted. They propagate; everything else still reads as `default`.
     result = try
         _session_objects(store).filter("session_key" => session_id).first()
     catch e
+        is_unrecoverable(e) && rethrow()
         @warn "PormGSessionStore: failed to read session" exception=(e, catch_backtrace())
         return default
     end
@@ -255,7 +286,7 @@ function Base.get(store::PormGSessionStore, session_id::String, default)
         data = _deserialize_session(result[:session_data])
         return SessionPayload(data, expires_at)
     catch e
-        e isa InterruptException && rethrow()
+        is_unrecoverable(e) && rethrow()
         @warn "PormGSessionStore: failed to read session: the stored session does not decode" exception_type=typeof(e)
         return default
     end
@@ -313,6 +344,8 @@ end
 
 function set_session!(store::PormGSessionStore, session_id::String, data::Dict{String,Any}; ttl::Int=3600)
     expires_at = Dates.now(Dates.UTC) + Dates.Second(ttl)
+    # Outside the `try` on purpose: a payload nested past the JSON depth bound throws its
+    # `ArgumentError` here, before the row is touched, rather than being stored unreadable (#344).
     serialized = _serialize_session(data)
 
     try
@@ -535,7 +568,10 @@ _task_objects(store::PormGWorkerStore) = store.model.objects.db(store.db_key)
 # -- Serialization Helpers --
 
 function _to_db_record(task::TaskInfo)
-    result_str = isnothing(task.result) ? "" : JSON.json(task.result)
+    # A result nested past the JSON depth bound throws here, before the row is touched, instead
+    # of being stored where no read could decode it (#344; `_json_for_storage`). The watcher list
+    # is a flat `Vector{String}` and cannot nest.
+    result_str = isnothing(task.result) ? "" : _json_for_storage(task.result)
     watchers_str = JSON.json(task.watchers)
     return Dict{String, Any}(
         "id" => task.id,
@@ -650,11 +686,15 @@ end
 # The replacement is thrown AFTER the `catch` block closes, not inside it. Thrown inside, the
 # original error would stay on the exception stack as its cause, and anything that prints the
 # stack (`current_exceptions()`, an uncaught task failure) would quote the text anyway.
+#
+# The parse is depth-bounded (see `_json_for_storage`), so a value nested past the bound is one
+# more thing that "does not decode". An interrupt, overflow or OOM is not: relabelled as a decode
+# error it would hide a process that may be corrupted (#254, #344), so those propagate.
 function _parse_stored_json(shape::Function, raw::AbstractString, column::String, id::String)
     parsed = try
-        Some(shape(JSON.parse(raw)))
+        Some(shape(_parse_stored(raw)))
     catch e
-        e isa InterruptException && rethrow()
+        is_unrecoverable(e) && rethrow()
         nothing
     end
     parsed === nothing &&
@@ -799,8 +839,11 @@ function try_transition!(store::PormGWorkerStore, task_id::String, from, to::Tas
     error === nothing || push!(columns, "error" => error)
     completed_at === nothing || push!(columns, "completed_at" => completed_at)
     started_at === nothing || push!(columns, "started_at" => started_at)
+    # The completing write of a callback's return value. Too deep to read back, it throws before
+    # the UPDATE (#344): the run's retry/failure path records it, the same as any other result
+    # that cannot be stored.
     result === UNSUPPLIED ||
-        push!(columns, "result" => isnothing(result) ? "" : JSON.json(result))
+        push!(columns, "result" => isnothing(result) ? "" : _json_for_storage(result))
     progress === nothing || push!(columns, "progress" => Float64(progress))
 
     # The status precondition lives in the WHERE clause, so the compare and the write are
@@ -1018,7 +1061,9 @@ function _listed_task(row)::Union{Nothing, TaskInfo}
     try
         return _from_db_record(row)
     catch e
-        e isa InterruptException && rethrow()
+        # Same #254 line as `_parse_stored_json`, which now rethrows these: skipping the row here
+        # would swallow them again one frame up (#344).
+        is_unrecoverable(e) && rethrow()
         @warn "PormGWorkerStore: skipping a task row that does not decode" task_id=id exception_type=typeof(e)
         return nothing
     end
@@ -1206,15 +1251,32 @@ end
 # SECTION 9: Environment bridge
 # ============================================================================
 
-function sync_pormg_env!(; force::Bool = false)
+function sync_pormg_env!(; force::Bool = false)::Union{String, Nothing}
     # Blank counts as UNSET, matching how `current_env` treats `NITRO_ENV` -- and here it
     # matters more, because PormG's `_effective_env` returns `""` on a bare `haskey` and then
     # looks up a `""` section in connection.yml. Honouring an empty `PORMG_ENV` as if it were
     # a deliberate choice would make the bridge worse than not existing.
-    if force || isempty(strip(get(ENV, "PORMG_ENV", "")))
-        ENV["PORMG_ENV"] = Nitro.current_env()
+    current = get(ENV, "PORMG_ENV", nothing)
+    blank = current !== nothing && isempty(strip(current))
+    if force || current === nothing || blank
+        # Only an environment someone SET is published (#331). Nitro's `"dev"` fallback is not
+        # a choice, and published as one it outranked a choice someone did make: `default_env:`
+        # in connection.yml sits below `PORMG_ENV` in PormG's precedence, so a prod box relying
+        # on it silently connected to dev. With neither `NITRO_ENV` nor `GENIE_ENV` set, PormG
+        # resolves its own environment -- which is also why `force` then has nothing to write.
+        #
+        # Resolved only here, as before: a typo in `NITRO_ENV` does not throw while a set
+        # `PORMG_ENV` means there is nothing to publish.
+        env = Nitro.Core.Environment._explicit_env()
+        if env !== nothing
+            ENV["PORMG_ENV"] = env
+        elseif blank
+            # Nothing to publish over the blank, and left in place PormG would read it as a
+            # `""` environment. Removing it is what "blank counts as unset" means to PormG.
+            delete!(ENV, "PORMG_ENV")
+        end
     end
-    return ENV["PORMG_ENV"]
+    return get(ENV, "PORMG_ENV", nothing)
 end
 
 # ============================================================================
@@ -1243,10 +1305,11 @@ function __init__()
     # keys. `session_model(db_key)` / `task_model(db_key)` build a bound model per store
     # instead, which is a handful of allocations about twice per application.
 
-    # Bridge Nitro's resolved environment to PormG's, so an app can call
+    # Bridge the environment set in `NITRO_ENV`/`GENIE_ENV` to PormG's, so an app can call
     # `PormG.Configuration.load_many([...])` with no `env=` and get the environment Nitro
     # resolved (#55). A DEFAULT, never a force: a pre-set `PORMG_ENV` and an explicit `env=`
-    # both still win.
+    # both still win -- and with neither variable set nothing is published, so PormG's own
+    # `default_env:` still decides (#331).
     #
     # Guarded, unlike the registration above, because this is the only side effect here that
     # ESCAPES THE MODULE: it mutates the OS process environment, which is inherited by any
@@ -1265,7 +1328,7 @@ function __init__()
             # lives in `serve()`, which is where the process commits to being a server.
             @warn "Nitro could not bridge its environment to PormG: " *
                   sprint(showerror, err) *
-                  "\n`PORMG_ENV` is left unset, so PormG falls back to its own " *
+                  "\n`PORMG_ENV` is left as it was, so PormG falls back to its own " *
                   "resolution (`env=` kwarg, then `PORMG_ENV`, then `default_env:` in " *
                   "connection.yml, then \"dev\").\nFix the variable and call " *
                   "`sync_pormg_env!()`, or pass `env=` explicitly."

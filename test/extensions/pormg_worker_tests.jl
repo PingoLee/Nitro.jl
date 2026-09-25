@@ -666,6 +666,18 @@ function Base.getproperty(m::RacingWatcherModel, name::Symbol)
     return getfield(m, name)
 end
 
+# A stored column whose bytes cannot even be read: the synthetic stand-in for an overflow or OOM
+# raised while decoding, which cannot safely be produced for real in-process (#254, #301). The
+# depth scan reads code units first, so this throws where a real overflow would have come from.
+struct ExplodingText <: AbstractString
+    exc::Exception
+end
+Base.ncodeunits(::ExplodingText) = 2
+Base.codeunit(::ExplodingText) = UInt8
+Base.codeunit(t::ExplodingText, ::Int) = throw(t.exc)
+Base.isvalid(::ExplodingText, ::Int) = true
+Base.iterate(t::ExplodingText, ::Int = 1) = throw(t.exc)
+
 function _load_pormg_worker_store_type()
     try
         @eval using PormG
@@ -1341,6 +1353,67 @@ else
             # Same for the watcher blob, which is parsed and then shaped.
             _, thrown_w = _rendered_logs(() -> try get_task_info(store_d, "alice::4") catch e; e end)
             @test thrown_w isa ErrorException && occursin("`watchers`", thrown_w.msg)
+        end
+
+        @testset "a stored result is depth-bounded both ways (#344)" begin
+            nested(k) = (v = Any[]; for _ in 2:k; v = Any[v]; end; v)   # `k` levels of arrays
+            m = MockTaskModel()
+            store_j = RealPormGWorkerStore(model=m)
+
+            t = TaskInfo("alice::deep")
+            replace_task!(store_j, t.id, t)
+            # The completing write refuses a result too deep to read back, before the row moves.
+            @test_throws ArgumentError try_transition!(store_j, t.id, (PENDING, RUNNING), COMPLETED;
+                                                       run_id=t.run_id, result=nested(513))
+            @test get_task_info(store_j, t.id).status == PENDING
+            @test isempty(m._table[t.id]["result"])
+            # ...and so does a whole-record write carrying one.
+            t.result = nested(513)
+            @test_throws ArgumentError set_task!(store_j, t.id, t)
+            @test isempty(m._table[t.id]["result"])
+
+            # At the bound it is stored and read back intact.
+            @test try_transition!(store_j, t.id, (PENDING, RUNNING), COMPLETED;
+                                  run_id=t.run_id, result=nested(512)) == true
+            back = get_task_info(store_j, t.id).result
+            depth = 0
+            while back isa AbstractVector && !isempty(back)
+                depth += 1
+                back = only(back)
+            end
+            @test depth + 1 == 512
+
+            # A row stored deeper before the bound existed "does not decode", like any bad row:
+            # a single read throws the value-free error, a listing skips it.
+            m._table[t.id]["result"] = JSON.json(nested(513))
+            thrown = try get_task_info(store_j, t.id) catch e; e end
+            @test thrown isa ErrorException && occursin("does not decode", thrown.msg)
+            logs, listed = _rendered_logs(() -> get_all_tasks(store_j, System()))
+            @test isempty(listed)
+            @test occursin("does not decode", logs)
+        end
+
+        @testset "an unrecoverable error while decoding propagates (#254, #344)" begin
+            parse_stored = getproperty(PormGExt, :_parse_stored_json)
+            for exc in (InterruptException(), StackOverflowError(), OutOfMemoryError())
+                # From the shaping step and from the parse itself: not relabelled "does not decode".
+                @test_throws typeof(exc) parse_stored(_ -> throw(exc), "{}", "result", "alice::x")
+                @test_throws typeof(exc) parse_stored(identity, ExplodingText(exc), "result", "alice::x")
+
+                # And through a listing, which used to skip the row and so swallow it again.
+                m = MockTaskModel()
+                store_u = RealPormGWorkerStore(model=m)
+                t = TaskInfo("alice::boom")
+                replace_task!(store_u, t.id, t)
+                m._table[t.id]["result"] = ExplodingText(exc)
+                Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
+                    @test_throws typeof(exc) get_all_tasks(store_u, System())
+                    @test_throws typeof(exc) get_task_info(store_u, t.id)
+                end
+            end
+            # An ordinary failure is still the value-free decode error.
+            thrown = try parse_stored(_ -> error("shape"), "{}", "result", "alice::x") catch e; e end
+            @test thrown isa ErrorException && occursin("does not decode", thrown.msg)
         end
 
         @testset "an unpaged listing rethrows a failed read instead of reporting none (#267)" begin

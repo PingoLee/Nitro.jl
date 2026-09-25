@@ -622,6 +622,8 @@ worker_store = pormg_nitro_worker(db_key="workers")
 
 Task metadata will now be persisted to that database, while live running threads are managed safely in memory to prevent serialization issues.
 
+A task's return value is stored as JSON, and may nest at most **512** levels, the same limit Nitro puts on request JSON. A callback that returns something deeper does not complete. Its completing write throws an `ArgumentError` before the row changes, and the run then retries or fails like any other attempt that throws, so the task ends `FAILED` instead of holding a result nothing could read back. With `retry_on_failure`, the callback runs again first, so return a flatter value. `InMemoryWorkerStore` serializes nothing and has no such limit.
+
 !!! note "Worker runs are detached from the submitter's dynamic scope"
     Nitro spawns every worker task — the async run, each sequential queue's processor, and the
     cleanup scheduler — under a **fresh dynamic scope** rather than the caller's. PormG tracks
