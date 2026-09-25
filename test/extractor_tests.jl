@@ -333,6 +333,15 @@ end
     @test decoded_msg.a == -1
     @test decoded_msg.b == ["a", "b"]
 
+    # #325: a body that breaks the decode bounds is the client's error. 101 nested unknown
+    # groups decoded, and answered 200, on the unbounded decoder. The lying prefix was a 400
+    # there too, but only after allocating the 64 MiB it claimed. The bounds themselves are
+    # tested in test/extensions/protobuf/protobuf_tests.jl.
+    groups101 = vcat(fill(0x1b, 101), fill(0x04, 101))
+    for body in (groups101, UInt8[0x12, 0x80, 0x80, 0x80, 0x20])
+        @test internalrequest(HTTP.Request("POST", "/protobuf", [], body)).status == 400
+    end
+
 end
 
 # ─── Helper to build raw multipart/form-data bytes for testing ────────
