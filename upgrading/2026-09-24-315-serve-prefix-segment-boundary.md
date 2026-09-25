@@ -36,9 +36,8 @@ Everything outside the prefix is still a `404` before any of your middleware run
 global middleware sees always keeps its leading `/`. Trailing slashes on the prefix are dropped,
 so `"/api/"` behaves as `"/api"`. Any `AbstractString` is accepted.
 
-This closes the prefix's own route past a URL check. It does not make `req.target` a safe thing to
-authorize on in global middleware: `//admin/users` still reaches `/admin/users`, with or without a
-prefix (#341). Put authorization on the route or router.
+This closes the prefix's own route past a URL check. The other routes past one, `//admin/users`
+and absolute-form targets, are closed with or without a prefix by the #341 entry.
 
 `serve` now validates the prefix before it changes anything, and raises `ArgumentError` for a
 shape that could never match a well-formed request-target:

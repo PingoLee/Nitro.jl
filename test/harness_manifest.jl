@@ -81,6 +81,7 @@ const TEST_FILES = [
     "appcontext_tests.jl",
     "appcontext_race_tests.jl",
     "path_prefix_tests.jl",
+    "request_target_tests.jl",
     "routing_tests.jl",
     "original_tests.jl",
     "spa_tests.jl",

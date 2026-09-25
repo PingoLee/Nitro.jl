@@ -24,7 +24,9 @@ query when you are sure no sensitive data travels in URLs.
 `log_query=true` logs the request-target **verbatim**, which is not only the query: a
 client may send absolute-form (`GET http://user:pa55w0rd@host/x`), so credentials in the
 authority are logged too. The default path is reduced by `_log_target_path`, which strips
-both. Only opt in for a service whose clients you control.
+both. Only opt in for a service whose clients you control. Inside the pipeline `setupmiddleware`
+builds, `OriginFormMiddleware` has already dropped an absolute-form authority by the time this
+reads the target (#341); the caveat stands for this layer used on its own.
 
 Either way the target is escaped before it reaches the line (#320): control characters,
 invalid UTF-8 and Unicode line/bidi characters appear as `\\u…`/`\\x…` escapes, and `"` and
@@ -105,6 +107,76 @@ function _strip_prefix(target::String, prefix::String, n::Int)::Nullable{String}
     next == UInt8('/') && return String(SubString(target, n + 1))
     next == UInt8('?') && return string('/', SubString(target, n + 1))
     return nothing
+end
+
+"""
+    _origin_form(target) -> Union{String, Nothing}
+
+The request-target as the router will match it, in origin-form (`/path?query`), or `nothing`
+when the path holds an empty segment (`//`) and the request must be refused (#341).
+
+HTTP.jl's router does not match on `req.target` as written. It splits the path with
+`keepempty = false`, so `//admin/users` and `/admin//users` both reach `/admin/users`, and it
+routes an absolute-form target (`http://h/admin/users`) by the path after the authority. Global
+middleware runs before the route is chosen (#291), so a gate testing
+`startswith(req.target, "/admin")` saw none of those as `/admin`. This makes the two agree:
+
+- `*` (`OPTIONS *`) is returned as is.
+- Origin-form is returned as the **same object** when it is well-formed, the common case.
+- Absolute-form loses its scheme and authority, as RFC 9112 §3.2.2 has an origin server do. The
+  authority ends at the first `/`, `?` or `#` and is never parsed, so a malformed one
+  (`http://h:abc/x`) cannot throw (#326). An empty path becomes `/`. The router finds the path
+  by the first `/` after `://` instead, which put `http://h?x=/admin` and `http://h#/admin` on
+  `/admin`. Now the first routes to `/`, and the second keeps its fragment in the path
+  (`/#/admin`), which matches no route.
+- Anything else, including `""`, gets the leading `/` the router assumes. Over the wire that is
+  only `CONNECT`'s authority-form (`host:443`); `internalrequest` can deliver any string.
+
+An empty segment is refused rather than collapsed. Collapsing would rewrite
+`//user:pw@host/x`, which the access log reduces as an authority and redacts, into a path that
+logs the credentials. The check covers the path up to the first `?`, the same cut the router
+makes, so a `//` inside the query is fine and a single trailing `/` is kept.
+
+The result always starts with `/` and has no empty segment before its last `/`, so the path
+the router splits is the path global middleware reads, segment for segment.
+"""
+function _origin_form(target::String)::Nullable{String}
+    target == "*" && return target
+    t = target
+    if !startswith(target, '/')
+        scheme = findfirst("://", target)
+        if scheme === nothing
+            t = string('/', target)
+        else
+            i = findnext(c -> c === '/' || c === '?' || c === '#', target, last(scheme) + 1)
+            t = i === nothing ? "/" :
+                target[i] == '/' ? String(SubString(target, i)) :
+                string('/', SubString(target, i))
+        end
+    end
+    q = findfirst('?', t)
+    path = q === nothing ? t : SubString(t, 1, prevind(t, q))
+    occursin("//", path) && return nothing
+    return t
+end
+
+"""
+    OriginFormMiddleware()
+
+The framework layer that puts `req.target` in the form the router matches, before any prefix
+strip or user middleware sees it (#341). See `_origin_form`. A target with an empty path segment
+is answered `400`.
+"""
+function OriginFormMiddleware()
+    BAD_REQUEST = HTTP.Response(400, "Bad Request")
+    return function(handler)
+        return function(req::HTTP.Request)
+            target = _origin_form(req.target)
+            target === nothing && return BAD_REQUEST
+            target === req.target || (req.target = target)
+            return handler(req)
+        end
+    end
 end
 
 function PrefixStripMiddleware(prefix::AbstractString)
