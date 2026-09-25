@@ -1189,22 +1189,66 @@ to one `ALTER` keeps the upgrade automatic instead of silently fatal
 Idempotency is established by **proving the column is there**, not by matching the error text of
 a duplicate-column failure: SQLite says "duplicate column name", Postgres "column ... already
 exists" (SQLSTATE 42701) and MySQL error 1060, and a `catch`-all broad enough to cover the three
-would also swallow a genuine failure. So: attempt the `ALTER`; if it throws, `SELECT` the column.
-Success means it already existed and the error was benign; failure rethrows the original.
+would also swallow a genuine failure.
+
+**The probe runs first, because it is the statement that succeeds on the common path**
+([#366](https://github.com/PingoLee/Nitro.jl/issues/366)). `CREATE TABLE` has emitted the
+column since #108, so an `ALTER`-first order failed on every boot, the very first one included.
+Nitro caught that, but LibPQ logs a failed statement at `error` level *before* it throws, so
+every Postgres boot printed a `DuplicateColumn` error that no `catch` can take back. A probe that
+answers by success or failure alone has to fail in one of the two cases, so it fails in the rare
+one: a pre-#108 table logs one missing-column error, on the boot that migrates it. Reading the
+column list instead would fail in neither case, but the drivers return different result types
+and reading them generically needs `Tables`, which Nitro does not depend on.
+
+A failed `ALTER` is probed again before it is rethrown. Two processes booting on one pre-#108
+database both see the column missing, and the one that loses the race gets a duplicate-column
+error for a column that is now there.
+
+Called inside an open Postgres transaction on a pre-#108 table, the failed probe aborts that
+transaction, so the `ALTER` then fails with `InFailedSqlTransaction` and that is what surfaces.
+Boot outside a transaction; before #366 this path failed on every boot.
 """
 function _ensure_run_id_column!(conn)
+    _has_run_id_column(conn) && return nothing
     try
         PormG.ConnectionPool.fetch(conn,
             "ALTER TABLE \"nitro_task\" ADD COLUMN \"run_id\" VARCHAR(36) NOT NULL DEFAULT '$(_LEGACY_RUN_ID)'")
     catch e
-        try
-            PormG.ConnectionPool.fetch(conn, "SELECT \"run_id\" FROM \"nitro_task\" LIMIT 1")
-        catch
-            rethrow(e)
-        end
+        _interrupted(e) && rethrow()
+        _has_run_id_column(conn) || rethrow(e)
     end
     return nothing
 end
+
+# Whether `nitro_task` has a `run_id` column, answered by whether a statement naming it runs.
+#
+# The column is QUALIFIED on purpose, and the probe is wrong without it. By SQLite's default
+# double-quoted-string fallback, which the SQLite that SQLite.jl bundles keeps, a double-quoted
+# identifier that names no column is read as a string LITERAL: `SELECT "run_id" FROM
+# "nitro_task"` succeeds on a table without the column and returns the text 'run_id'. Probing
+# first with that form would skip the migration on exactly the table that needs it; as the old
+# after-the-ALTER check it swallowed every genuine ALTER failure on SQLite (#366).
+# `"nitro_task"."run_id"` cannot be read as a literal, so it throws on both dialects.
+#
+# `LIMIT 0` because the question is about the schema, not the rows: both dialects resolve the
+# column before they read anything.
+function _has_run_id_column(conn)::Bool
+    try
+        PormG.ConnectionPool.fetch(conn, "SELECT \"nitro_task\".\"run_id\" FROM \"nitro_task\" LIMIT 0")
+        return true
+    catch e
+        # A Ctrl-C during the probe is not an answer: read as "missing", it would run the ALTER.
+        _interrupted(e) && rethrow()
+        return false
+    end
+end
+
+# A Ctrl-C, as it comes out of PormG's `fetch`. `fetch` hands every driver failure back through
+# PormG's error taxonomy, an interrupt included, so it arrives as a `DatabaseError` whose `cause`
+# is the `InterruptException` -- a bare `e isa InterruptException` never matches it.
+_interrupted(e) = e isa InterruptException ||
+    (e isa PormG.DatabaseError && e.cause isa InterruptException)
 
 """
     _ensure_task_table!(conn, model)
