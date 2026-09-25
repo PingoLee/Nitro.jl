@@ -174,49 +174,10 @@ end
 
 terminate()
 
-rl = RateLimiter(rate_limit=1, window=Hour(1), cleanup_period=Second(1), cleanup_threshold=Second(1))
-
-# Start server for background cleanup test
-serve(middleware=[rl], port=port, host=HOST, async=true, show_errors=false, show_banner=false, access_log=nothing)
-
-@testset "Background Cleanup Test" begin
-
-    # First request should succeed
-    r = HTTP.get("$localhost/ok"; retry=false)
-    @test r.status == 200
-    @test text(r) == "ok"
-    @test HTTP.header(r, "X-RateLimit-Limit") == "1"
-    @test HTTP.header(r, "X-RateLimit-Remaining") == "0"
-    reset_time = parse(Int, HTTP.header(r, "X-RateLimit-Reset"))
-    @test reset_time > 0  # Should be close to 1 hour in seconds
-
-    # Second request should be rate limited (429)
-    try
-        HTTP.get("$localhost/ok"; retry=false)
-        @test false
-    catch e
-        @test e isa HTTP.StatusError
-        @test e.response.status == 429
-        @test HTTP.header(e.response, "X-RateLimit-Limit") == "1"
-        @test HTTP.header(e.response, "X-RateLimit-Remaining") == "0"
-        reset_time = parse(Int, HTTP.header(e.response, "X-RateLimit-Reset"))
-        @test reset_time > 0
-    end
-
-    # Wait for cleanup to run (cleanup_threshold=1s, cleanup_period=1s, wait 2.1s to ensure task runs)
-    sleep(2.1)
-
-    # Third request should succeed because the IP entry was cleaned up
-    r = HTTP.get("$localhost/ok"; retry=false)
-    @test r.status == 200
-    @test text(r) == "ok"
-    @test HTTP.header(r, "X-RateLimit-Limit") == "1"
-    @test HTTP.header(r, "X-RateLimit-Remaining") == "0"
-    reset_time = parse(Int, HTTP.header(r, "X-RateLimit-Reset"))
-    @test reset_time > 0
-end
-
-terminate()
+# The background sweep has no testset here any more. The one that sat here asserted the
+# defect #319 fixed: `window=Hour(1)` with a 1s `cleanup_threshold`, and a throttled client
+# admitted again 2s later. Over HTTP a reaped bucket and an expired one give the same answer,
+# so the sweep is covered in-process by "Rate limiter: fixed-window sweep" below.
 
 # Start server for exempt paths test
 urlpatterns("",
@@ -475,6 +436,61 @@ end
     end
 end
 
+@testset "Rate limiter: the removed cleanup_threshold is rejected by name" begin
+    # #319. The sweep reaped any bucket older than `cleanup_threshold`, window over or not, so a
+    # threshold under `window` cut every window short. The sweep now reaps at `window` and the
+    # keyword is gone. The error says to drop it: nothing it could still set changes an answer.
+    for strategy in (:fixed_window, :sliding_window)
+        err = try RateLimiter(; strategy, cleanup_threshold=Minute(10)); nothing catch e; e end
+        @test err isa ArgumentError
+        @test occursin("cleanup_threshold", err.msg)
+        @test occursin("window", err.msg)
+    end
+end
+
+# ── Exempt paths match whole segments (#319) ──────────────────────────────────
+# `startswith(req.target, ex)` made `"/health"` exempt `/healthz-admin` as well. In-process with
+# `rate_limit=1`, so a path the limiter counts is refused on its second request, and an exempt
+# one is never counted and carries no rate-limit headers.
+
+@testset "Rate limiter: exempt_paths match whole path segments" begin
+    ok_handler = _ -> HTTP.Response(200, "ok")
+    req_to(target) = (r = HTTP.Request("GET", target); setip!(r, ip"203.0.113.60"); r)
+    exempt(resp) = resp.status == 200 && !HTTP.hasheader(resp, "X-RateLimit-Limit")
+
+    for strategy in (:fixed_window, :sliding_window)
+        # A fresh limiter per assertion, so each one sees a full quota of 1.
+        limiter(paths) = RateLimiter(; strategy, rate_limit=1, window=Minute(1),
+                                     auto_extract_ip=false, exempt_paths=paths).middleware(ok_handler)
+
+        # The entry itself, anything below it, and it with a query string are exempt.
+        for target in ("/health", "/health/live", "/health?full=1", "/health/")
+            w = limiter(["/health"])
+            @test all(exempt(w(req_to(target))) for _ in 1:3)
+        end
+
+        # A sibling that merely shares the leading characters is counted. This is the
+        # assertion that fails against the bare prefix match.
+        for target in ("/healthz-admin", "/healthcheck", "/health-internal/x")
+            w = limiter(["/health"])
+            @test w(req_to(target)).status == 200
+            @test w(req_to(target)).status == 429
+        end
+
+        # An entry ending in `/` keeps its old meaning: everything below it, not the bare
+        # directory. The fix only narrows what is exempt.
+        w = limiter(["/static/"])
+        @test all(exempt(w(req_to("/static/app.js"))) for _ in 1:3)
+        w = limiter(["/static/"])
+        @test w(req_to("/static")).status == 200
+        @test w(req_to("/static")).status == 429
+
+        # `"/"` still exempts everything.
+        w = limiter(["/"])
+        @test all(exempt(w(req_to("/anything/at/all"))) for _ in 1:3)
+    end
+end
+
 @testset "Rate limiter: an unknown strategy names the valid ones" begin
     # `strategy` was the last unvalidated keyword on the constructor: with no fallback method,
     # a typo produced a raw `MethodError` naming the internal `dispatch_rate_limiter`, which
@@ -628,18 +644,18 @@ end
 @testset "Rate limiter: Period keywords reject calendar durations" begin
     # `Dates.value(p) > 0` was the old check and it does NOT catch these: `Dates.value(Month(1))`
     # is 1, so a calendar period passed validation. What it broke depends on the keyword:
-    #   cleanup_period    -> `sleep(Month(1))` throws in the un-monitored `@async` sweep, so
-    #                        the background cleanup dies on tick 1, silently, for the life of
-    #                        the process — in the component whose whole job is bounding memory.
-    #   cleanup_threshold -> the `current_time - last_reset > threshold` comparison throws
-    #                        (Millisecond vs Month), same silent dead sweep.
-    #   window            -> the same comparison, but ON THE REQUEST PATH. The limiter's own
-    #                        catch turns it into 503 for EVERY request (or fail-open, letting
-    #                        everything through). This is the most severe of the three.
+    #   cleanup_period -> `sleep(Month(1))` throws in the un-monitored `@async` sweep, so the
+    #                     background cleanup dies on tick 1, silently, for the life of the
+    #                     process — in the component whose whole job is bounding memory.
+    #   window         -> the `current_time - last_reset > window` comparison throws
+    #                     (Millisecond vs Month) ON THE REQUEST PATH. The limiter's own catch
+    #                     turns it into 503 for EVERY request (or fail-open, letting everything
+    #                     through). Since #319 the sweep makes the same comparison, so it would
+    #                     also die silently.
+    # A third keyword, `cleanup_threshold`, was checked here too until #319 removed it.
     # Same defect class as the session janitor (#36); fixed in both.
     for bad in (Month(1), Year(1), Quarter(1))
         @test_throws ArgumentError RateLimiter(cleanup_period=bad)
-        @test_throws ArgumentError RateLimiter(cleanup_threshold=bad)
         @test_throws ArgumentError RateLimiter(window=bad)
         @test_throws ArgumentError RateLimiter(strategy=:sliding_window, window=bad)
     end
@@ -647,8 +663,7 @@ end
     @test_throws ArgumentError RateLimiter(cleanup_period=Nanosecond(500))
     # Fixed periods, including the sub-second ones other tests rely on, still build.
     @test RateLimiter(window=Second(3)) isa Nitro.LifecycleMiddleware
-    @test RateLimiter(cleanup_period=Millisecond(50),
-                      cleanup_threshold=Millisecond(50)) isa Nitro.LifecycleMiddleware
+    @test RateLimiter(cleanup_period=Millisecond(50)) isa Nitro.LifecycleMiddleware
     # Both strategies return a LifecycleMiddleware (#172): `strategy` picks the algorithm, not
     # the return type. The sliding one owns no background task, so its hooks are `nothing`.
     sliding = RateLimiter(strategy=:sliding_window, window=Minute(1))
@@ -665,4 +680,113 @@ end
 end
 
 end # @testitem "Rate limiter construction and keying"
+
+
+# #319. The fixed-window sweep reaped any bucket older than `cleanup_threshold` (10 minutes by
+# default) whether or not its window had ended, so a throttled client got a fresh quota partway
+# through a longer window. It now reaps at `window` and the keyword is gone.
+#
+# In-process and socket-free, but the janitor is a real spawned task and these wait on its ticks,
+# hence `:slow` — the same tags as the janitor tests in lifecycle_middleware_tests.jl.
+@testitem "Rate limiter: fixed-window sweep" tags=[:middleware, :slow] setup=[NitroCommon] begin
+using HTTP
+using Dates
+using Sockets
+using Nitro
+using Nitro: setip!
+using Nitro.Core.Middleware.RateLimiterMiddleware: BucketKey, _Stripe, _sweep_expired!
+
+# White-box on purpose. Whether a bucket was reaped cannot be seen through the request path: an
+# expired bucket and a missing one give the same answer, which is exactly why reaping at `window`
+# is safe. So these read the store. It is a closure-local of `FixedRateLimiter`, captured by the
+# request-path closure that `.middleware` is under `auto_extract_ip=false`, and Julia names a
+# closure's fields after the variables it captures. Renaming that local turns this into a
+# `FieldError`, not a quiet pass — the fix is to follow the rename, not to drop the read.
+stripes_of(lf) = getfield(lf.middleware, :stripes)
+buckets(lf) = sum(s -> lock(() -> length(s.store), s.lock), stripes_of(lf))
+
+ok_handler = _ -> HTTP.Response(200, "ok")
+req_from(ip) = (r = HTTP.Request("GET", "/login"); setip!(r, ip); r)
+
+@testset "the sweep reaps a bucket once its window has ended, never before" begin
+    # This pins the boundary, not the wiring: the comparison must be the request path's own
+    # strict `>`, so the sweep deletes exactly the buckets a request would have reset. The
+    # wiring — that `FixedRateLimiter` hands the sweep `window` — is the next testset's job.
+    t = DateTime(2026, 9, 25, 12)
+    window = Hour(1)
+    store = Dict{BucketKey, Tuple{Int, DateTime}}(
+        (false, UInt128(1)) => (5, t - Minute(20)),                # throttled, older than the old 10-min default
+        (false, UInt128(2)) => (5, t - window),                    # window ends at `t`: still counted
+        (false, UInt128(3)) => (1, t - window - Millisecond(1)),   # expired
+        (true,  UInt128(4)) => (1, t - Day(1)))                    # long expired
+    _sweep_expired!([_Stripe(ReentrantLock(), store)], window, t)
+    @test Set(keys(store)) == Set([(false, UInt128(1)), (false, UInt128(2))])
+end
+
+@testset "a throttled client stays throttled while the sweep runs" begin
+    # The failure scenario from #319, at the default settings it was reported against: a
+    # one-hour window on a login route, with the client throttled 20 minutes ago. That is inside
+    # the window and past the old 10-minute threshold, so the old sweep deleted the bucket and the
+    # next request was admitted. `cleanup_period` is 20ms so the sweep runs many times during the
+    # wait, which also catches the sweep being handed `cleanup_period` as its age by mistake.
+    lf = RateLimiter(rate_limit=1, window=Hour(1), cleanup_period=Millisecond(20),
+                     auto_extract_ip=false)
+    w = lf.middleware(ok_handler)
+    client = ip"203.0.113.70"
+    @test w(req_from(client)).status == 200
+    @test w(req_from(client)).status == 429
+
+    # Backdate that one bucket's window start by 20 minutes. Rewriting it in place, in whichever
+    # stripe holds it, avoids re-deriving the key-to-stripe mapping here.
+    @test buckets(lf) == 1
+    for s in stripes_of(lf)
+        lock(s.lock) do
+            for (k, (count, last_reset)) in collect(s.store)
+                s.store[k] = (count, last_reset - Minute(20))
+            end
+        end
+    end
+    @test w(req_from(client)).status == 429         # still inside its window on the request path
+
+    # A bucket whose window ended an hour ago, planted beside the live one. Its disappearance
+    # proves the sweep really ran; without it, "still 429" would also pass with no sweep at all.
+    planted = (false, UInt128(0xC0000201))
+    s = first(stripes_of(lf))
+    lock(() -> (s.store[planted] = (1, now(UTC) - Hour(2))), s.lock)
+    @test buckets(lf) == 2
+
+    task = lf.on_startup()
+    try
+        @test timedwait(() -> buckets(lf) == 1, 10.0) === :ok
+        sleep(0.2)                                  # ten more sweeps over the live bucket
+        @test buckets(lf) == 1                      # 0 before the fix: both were reaped
+        @test w(req_from(client)).status == 429     # 200 before the fix
+    finally
+        lf.on_shutdown()
+    end
+    @test timedwait(() -> istaskdone(task), 10.0) === :ok
+end
+
+@testset "expired buckets are still reaped, so the store stays bounded" begin
+    # Removing the threshold must not stop the sweep reaping; it is what bounds this
+    # unbounded `Dict`. The janitor is started only after the count is taken, so a slow runner
+    # cannot race the 100ms window before the assertion that the buckets exist.
+    lf = RateLimiter(rate_limit=5, window=Millisecond(100), cleanup_period=Millisecond(20),
+                     auto_extract_ip=false)
+    w = lf.middleware(ok_handler)
+    for i in 1:3
+        @test w(req_from(IPv4("198.51.100.$i"))).status == 200
+    end
+    @test buckets(lf) == 3
+
+    task = lf.on_startup()
+    try
+        @test timedwait(() -> buckets(lf) == 0, 10.0) === :ok
+    finally
+        lf.on_shutdown()
+    end
+    @test timedwait(() -> istaskdone(task), 10.0) === :ok
+end
+
+end # @testitem "Rate limiter: fixed-window sweep"
 

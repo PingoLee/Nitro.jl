@@ -355,8 +355,7 @@ import Nitro: RateLimiter
 # `on_startup`/`on_shutdown` return the `Task` so this is observable at all — against the
 # unpatched code `t1` never finishes and the first `timedwait` below times out.
 
-lf = RateLimiter(rate_limit = 5, window = Second(1),
-                 cleanup_period = Millisecond(50), cleanup_threshold = Millisecond(50))
+lf = RateLimiter(rate_limit = 5, window = Second(1), cleanup_period = Millisecond(50))
 
 t1 = lf.on_startup()
 @test t1 isa Task
@@ -419,8 +418,8 @@ Base.length(s::FlakyBucketStore)         = length(s.inner)
 Base.delete!(s::FlakyBucketStore, k)     = (delete!(s.inner, k); s)
 
 @testset "the loop survives a throwing sweep and keeps reaping" begin
-    old = now(UTC) - Minute(30)          # older than the threshold -> must be reaped
-    fresh = now(UTC)                     # inside the threshold -> must be left alone
+    old = now(UTC) - Minute(30)          # window (10 min) has ended -> must be reaped
+    fresh = now(UTC)                     # inside its window -> must be left alone
     store = FlakyBucketStore(
         Dict{BucketKey, Tuple{Int, DateTime}}((false, UInt128(1)) => (1, old),
                                               (false, UInt128(2)) => (1, fresh)),
@@ -467,8 +466,7 @@ end
     # `errormonitor` itself is deliberately NOT asserted here. Its only observable effect is an
     # async log on a fatal death, which the per-tick `try` above now prevents from happening at
     # all; there is no seam to observe it through that would not be theater.
-    lf = RateLimiter(rate_limit = 5, window = Second(1),
-                     cleanup_period = Millisecond(50), cleanup_threshold = Millisecond(50))
+    lf = RateLimiter(rate_limit = 5, window = Second(1), cleanup_period = Millisecond(50))
     t = lf.on_startup()
     try
         @test t isa Task

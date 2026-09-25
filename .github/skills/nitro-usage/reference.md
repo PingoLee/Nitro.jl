@@ -196,10 +196,11 @@ RateLimiter(; strategy::Symbol = :fixed_window, # or :sliding_window
 # algorithm, never the return type. A middleware list accepts it as-is; only
 # hand-composition needs `.middleware`:
 #     RateLimiter(rate_limit=100).middleware(handler)
-# :fixed_window owns a background sweep that reaps idle buckets, started by serve() and
-# stopped by terminate(). :sliding_window has no task -- its LRU evicts by size -- so both
-# of its hooks are `nothing`, which startup()/shutdown() treat as a no-op.
-# Period keywords (window, cleanup_period, cleanup_threshold) must be fixed-length;
+# :fixed_window owns a background sweep that reaps buckets whose window has ended (never
+# earlier), started by serve() and stopped by terminate(). :sliding_window has no task -- its
+# LRU evicts by size -- so both of its hooks are `nothing`, which startup()/shutdown() treat
+# as a no-op.
+# Period keywords (window, cleanup_period) must be fixed-length;
 # Month/Quarter/Year are an ArgumentError.
 
 Cors(; allowed_origins   = ["*"],

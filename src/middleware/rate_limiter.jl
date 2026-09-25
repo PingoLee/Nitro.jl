@@ -68,6 +68,16 @@ function RateLimiter(;strategy::Symbol = :fixed_window, kwargs...)
         "forwarded_header=:x_forwarded_for, trusted_proxies=[ip\"127.0.0.1\"])`; " *
         "`trusted_proxies` accepts CIDR strings when your proxy addresses are dynamic.")
 
+    # `cleanup_threshold` was removed (#319). The sweep deleted any bucket older than it, whether
+    # or not the bucket's window had ended, so a threshold shorter than `window` handed a
+    # throttled client a fresh quota mid-window. Julia's own error would name the keyword but not
+    # say that dropping it loses nothing, which is the whole migration.
+    reject_key!(kwargs_dict, :cleanup_threshold,
+        "RateLimiter: `cleanup_threshold` was removed. The background sweep now deletes a " *
+        "bucket as soon as its window has ended, and never before, so there is nothing left to " *
+        "configure: an expired bucket answers exactly like a missing one. Drop the keyword; " *
+        "`cleanup_period` still sets how often the sweep runs.")
+
     # Return the rate limiter middleware
     dispatch_rate_limiter(Val(strategy); kwargs_dict...)
 end
@@ -200,6 +210,29 @@ end
     return (v6, host & (v6 ? v6mask : v4mask))
 end
 
+# ── Exempt paths (#319) ────────────────────────────────────────────────────────────────────
+#
+# An entry covers whole path segments, the rule `_strip_prefix` (src/core/framework_middleware.jl)
+# has applied to `serve(prefix = …)` since #315: `/health` covers `/health`, `/health/…` and
+# `/health?…`, and not `/healthz-admin`. The bare `startswith` this replaces exempted the last one
+# too, so exempting a health check could lift the limit off a neighbouring route.
+#
+# An entry that already ends in `/` is bounded by that slash, so `"/static/"` and `"/"` match
+# exactly what they matched before: the fix only narrows. The byte after a matched entry is
+# compared against two ASCII bytes, which a UTF-8 continuation byte can never equal, so the byte
+# offsets are safe on any target. `req.target` reaches middleware in canonical percent-encoding
+# (#351), so an entry has to be written that way to match at all.
+function _is_exempt(target::String, exempt_paths::Vector{String})::Bool
+    for ex in exempt_paths
+        startswith(target, ex) || continue
+        n = ncodeunits(ex)
+        (ncodeunits(target) == n || endswith(ex, '/')) && return true
+        next = codeunit(target, n + 1)
+        (next == UInt8('/') || next == UInt8('?')) && return true
+    end
+    return false
+end
+
 # ── Lock striping (#22) ────────────────────────────────────────────────────────────────────
 #
 # Buckets are independent — one per client prefix — but a single `store_lock` serialised every
@@ -239,15 +272,23 @@ function _bounded_stripe_count(max_entries::Int)
     return min(_DEFAULT_STRIPES, prevpow(2, fld(max_entries, _MIN_ENTRIES_PER_STRIPE)))
 end
 
-# Reaps every bucket whose window last reset more than `cleanup_threshold` ago.
+# Reaps every bucket whose window has ended, and no other.
+#
+# `window` is the only safe age (#319). A bucket past it answers exactly like a missing one: the
+# request path's "expired window" case and its "new client" case both store `(1, now)` and report
+# a full window, so deleting it changes no response. A bucket inside it is a client's count, and
+# deleting that hands a throttled client a fresh quota. The age used to be a separate
+# `cleanup_threshold` (10 minutes by default) that was never compared with `window`, so any longer
+# window was cut to about the threshold: `window = Hour(1)` on a login route let a brute-forcer
+# back in within 10-20 minutes. The comparison is the request path's own strict `>`, so the two
+# agree about which buckets have expired.
 #
 # A named function rather than an inline loop so the janitor's `try` wraps ONE call — the shape
 # `_janitor_loop` (src/middleware/janitor.jl) now enforces for every janitor in Nitro, and which
 # `_prune_janitor` feeds the same way with `prunesessions!`. An inline body invites a later edit
 # to hoist the `try` outside the `while`, which turns a single transient failure into a
 # permanently dead sweep with a still-green suite (#169).
-function _sweep_expired!(stripes::Vector{<:_Stripe}, cleanup_threshold::Period,
-                         current_time::DateTime)
+function _sweep_expired!(stripes::Vector{<:_Stripe}, window::Period, current_time::DateTime)
     # One stripe at a time: the sweep is O(N) in that stripe, and holding all of them
     # would reinstate exactly the global stall striping exists to remove.
     for stripe in stripes
@@ -258,7 +299,7 @@ function _sweep_expired!(stripes::Vector{<:_Stripe}, cleanup_threshold::Period,
             # tombstones and never rehashes, so the one-pass form happens to work;
             # this does not depend on that.)
             for (key, (_, last_reset)) in stripe.store
-                if current_time - last_reset > cleanup_threshold
+                if current_time - last_reset > window
                     push!(to_delete, key)
                 end
             end
@@ -275,8 +316,8 @@ end
 # collapsed did. `now(UTC)` is evaluated per tick, inside the closure, not captured here.
 const _SWEEP_LABEL = "RateLimiter"
 const _SWEEP_WHAT  = "bucket cleanup sweep"
-_sweep_work(stripes::Vector{<:_Stripe}, cleanup_threshold::Period) =
-    () -> _sweep_expired!(stripes, cleanup_threshold, now(UTC))
+_sweep_work(stripes::Vector{<:_Stripe}, window::Period) =
+    () -> _sweep_expired!(stripes, window, now(UTC))
 
 # The janitor loop, now this limiter's `work` bound to the shared loop in `_janitor_loop`
 # (src/middleware/janitor.jl), which owns the `try` placement (#169), the post-`sleep` token
@@ -288,26 +329,25 @@ _sweep_work(stripes::Vector{<:_Stripe}, cleanup_threshold::Period) =
 #
 # `token` is per activation, never a shared `running` flag — see `_janitor`.
 function _cleanup_loop(token::Ref{Bool}, stripes::Vector{<:_Stripe},
-                       cleanup_period::Period, cleanup_threshold::Period)
-    return _janitor_loop(_sweep_work(stripes, cleanup_threshold),
+                       cleanup_period::Period, window::Period)
+    return _janitor_loop(_sweep_work(stripes, window),
                          token, cleanup_period, _SWEEP_LABEL, _SWEEP_WHAT)
 end
 
 """
-    FixedRateLimiter(; rate_limit::Int = 100, window::Period = Minute(1), cleanup_period::Period = Minute(10), cleanup_threshold::Period = Minute(10), auto_extract_ip::Bool = true, forwarded_header::Symbol = :none, trusted_proxies = nothing, fail_open::Bool = false, exempt_paths::Vector{String} = String[], ipv4_prefix::Int = 32, ipv6_prefix::Int = 64)
+    FixedRateLimiter(; rate_limit::Int = 100, window::Period = Minute(1), cleanup_period::Period = Minute(10), auto_extract_ip::Bool = true, forwarded_header::Symbol = :none, trusted_proxies = nothing, fail_open::Bool = false, exempt_paths::Vector{String} = String[], ipv4_prefix::Int = 32, ipv6_prefix::Int = 64)
 
 Creates a middleware function that enforces rate limiting based on IP address, with automatic background cleanup to prevent memory leaks.
 
 # Arguments
 - `rate_limit::Int`: Maximum number of requests allowed per IP within the window period. Default is 100. Must be positive.
 - `window::Period`: Time window for rate limiting. Default is 1 minute. Must be a positive fixed-length `Period`; calendar periods (`Month`, `Quarter`, `Year`) are rejected.
-- `cleanup_period::Period`: Interval for running the background cleanup task. Default is 10 minutes. Must be a positive fixed-length `Period`.
-- `cleanup_threshold::Period`: Minimum age of inactive IP entries before deletion during cleanup. Default is 10 minutes. Must be a positive fixed-length `Period`.
+- `cleanup_period::Period`: How often the background sweep runs. Default is 10 minutes. Must be a positive fixed-length `Period`. The sweep deletes every client entry whose window has ended, and never one whose window is still running, so a throttled client stays throttled for the whole `window` and an idle client's entry is held for at most `window + cleanup_period`.
 - `auto_extract_ip::Bool`: If `true` (default), the middleware will automatically extract the client IP address from the request using the built-in extractor. Setting `false` is incompatible with `forwarded_header`/`trusted_proxies`, since nothing would then apply them.
 - `forwarded_header::Symbol`: Forwarded to [`ExtractIP`](@ref) — the single header your reverse proxy writes. One of `:none` (default), `:x_forwarded_for`, `:x_real_ip`, `:cf_connecting_ip`, `:true_client_ip`. Must be set together with `trusted_proxies`.
 - `trusted_proxies`: Forwarded to [`ExtractIP`](@ref) — the proxies whose forwarding header may be believed, as `IPAddr` values or CIDR strings (`"10.244.0.0/16"`). The header is read only when the socket peer matches one of them.
 - `fail_open::Bool`: If `true`, an internal error in the limiter lets the request through instead of returning 503. Default `false` (fail closed).
-- `exempt_paths::Vector{String}`: Request path prefixes to skip rate limiting. Default is empty.
+- `exempt_paths::Vector{String}`: Request paths to skip rate limiting. Default is empty. Each entry covers whole path segments: `"/health"` exempts `/health`, `/health/live` and `/health?full=1`, but not `/healthz`. An entry ending in `/` covers only what is below it. Entries are compared with `req.target`, whose path is in canonical percent-encoding by the time middleware runs, so write them that way (`"/caf%C3%A9"`, not `"/café"`).
 - `ipv4_prefix::Int`: Network prefix length the IPv4 bucket key is masked to. Default 32 — one bucket per host, i.e. unchanged. Must be 1-32.
 - `ipv6_prefix::Int`: Network prefix length the IPv6 bucket key is masked to. Default 64. Must be 1-128. A single IPv6 host normally controls a whole /64, so keying on the full /128 lets a client rotate source addresses inside its own allocation and never reach the limit; /64 collapses the allocation onto one bucket. Widen to /48 if your clients hold /48s (Let's Encrypt limits this way), narrow only if you know your addressing.
 
@@ -340,7 +380,6 @@ function FixedRateLimiter(;
     rate_limit          :: Int = 100,
     window              :: Period = Minute(1),
     cleanup_period      :: Period = Minute(10),
-    cleanup_threshold   :: Period = Minute(10),
     auto_extract_ip     :: Bool = true,
     forwarded_header    :: Symbol = :none,
     trusted_proxies     :: Union{Nothing, AbstractVector} = nothing,
@@ -358,7 +397,6 @@ function FixedRateLimiter(;
     # rejecting at construction still beats reporting from a background task.
     require_fixed_period("window", window)
     require_fixed_period("cleanup_period", cleanup_period)
-    require_fixed_period("cleanup_threshold", cleanup_threshold)
     v4mask, v6mask = _prefix_masks(ipv4_prefix, ipv6_prefix)
 
     # Validates the trust configuration here, not at `serve()` — see `build_ip_extractor`.
@@ -381,9 +419,12 @@ function FixedRateLimiter(;
     # activation's task actually exits. Keep these return values.
     #
     # `require_fixed_period("RateLimiter: cleanup_period", ...)` fires inside `_janitor` too; the
-    # explicit call above stays because it must also reject `window` and `cleanup_threshold`, and
-    # because it names the keyword the caller actually typed.
-    on_startup, on_shutdown = _janitor(_sweep_work(stripes, cleanup_threshold), cleanup_period,
+    # explicit call above stays because it names the keyword the caller actually typed.
+    #
+    # The sweep reaps at `window`, the age at which the request path would reset a bucket anyway.
+    # Reaping at any shorter age cuts the window short for a throttled client (#319); see
+    # `_sweep_expired!`.
+    on_startup, on_shutdown = _janitor(_sweep_work(stripes, window), cleanup_period,
                                        _SWEEP_LABEL, _SWEEP_WHAT, "cleanup_period")
 
     function rate_limit_only(handle::Function)
@@ -391,12 +432,8 @@ function FixedRateLimiter(;
             try
 
                 # allow passthrough for exempt paths
-                for ex in exempt_paths
-                    if startswith(req.target, ex)
-                        return handle(req)
-                    end
-                end
-                        
+                _is_exempt(req.target, exempt_paths) && return handle(req)
+
                 # No client address means there is no bucket to key on. Without this guard the
                 # `nothing` reaches `_bucket_key` and fails closed via the catch below, logging
                 # a backtrace per request. Honour `fail_open` the same way.
@@ -507,7 +544,7 @@ offering more precise rate limiting than fixed windows but with higher memory us
 - `rate_limit::Int`: Maximum requests per client per window. Default 100. Must be positive.
 - `window::Period`: Sliding time window duration. Default 1 minute. Must be a positive fixed-length `Period`; calendar periods (`Month`, `Quarter`, `Year`) are rejected.
 - `max_clients::Int`: Maximum distinct client buckets in LRU cache. Default 10000. Must be positive.
-- `exempt_paths::Vector{String}`: Request path prefixes to skip rate limiting. Default empty.
+- `exempt_paths::Vector{String}`: Request paths to skip rate limiting. Default empty. Matched on whole path segments against the canonical `req.target`, exactly as for [`FixedRateLimiter`](@ref): `"/health"` exempts `/health` and `/health/live`, not `/healthz`.
 - `auto_extract_ip::Bool`: If true, automatically extract IP address from request. Default true. Setting `false` is incompatible with `forwarded_header`/`trusted_proxies`, since nothing would then apply them.
 - `forwarded_header::Symbol`: Forwarded to [`ExtractIP`](@ref) — the single header your reverse proxy writes. One of `:none` (default), `:x_forwarded_for`, `:x_real_ip`, `:cf_connecting_ip`, `:true_client_ip`. Must be set together with `trusted_proxies`.
 - `trusted_proxies`: Forwarded to [`ExtractIP`](@ref) — the proxies whose forwarding header may be believed, as `IPAddr` values or CIDR strings (`"10.244.0.0/16"`). The header is read only when the socket peer matches one of them.
@@ -596,11 +633,7 @@ function SlidingRateLimiter(;
         return function(req::HTTP.Request)
             try
                 # Check exempt paths first (most efficient early return)
-                for exempt_path in exempt_paths
-                    if startswith(req.target, exempt_path)
-                        return handle(req)
-                    end
-                end
+                _is_exempt(req.target, exempt_paths) && return handle(req)
 
                 # No client address means there is no bucket to key on. Without this guard the
                 # `nothing` reaches `_bucket_key` and fails closed via the catch below, logging
