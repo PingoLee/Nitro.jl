@@ -4,10 +4,28 @@ function _base64url_encode(data::Vector{UInt8})
     return replace(encoded, '=' => "")
 end
 
+# Strict: canonical base64url and nothing else (#321). This used to translate `-_` to `+/`
+# and pad, so the standard alphabet, `=` padding, and -- in the last character -- any of the
+# 4 (or 16) letters differing only in bits the decoder discards all decoded to the same bytes.
+# Every such spelling of a signature verified, so one token had many strings, and anything
+# keyed on the raw token (a denylist, a replay cache) could be walked around. RFC 7515 §2
+# defines the encoding with no padding; re-encoding and comparing is what rules out the
+# discarded-bits variants, and it cannot drift from `_base64url_encode`.
+#
+# Throws ArgumentError, the one type both callers in `_decode_jwt` catch.
 function _base64url_decode(data::AbstractString)
-    normalized = replace(String(data), '-' => '+', '_' => '/')
-    padding = mod(4 - mod(length(normalized), 4), 4)
-    return Base64.base64decode(normalized * repeat("=", padding))
+    text = String(data)
+    for byte in codeunits(text)
+        (UInt8('A') <= byte <= UInt8('Z') || UInt8('a') <= byte <= UInt8('z') ||
+         UInt8('0') <= byte <= UInt8('9') || byte == UInt8('-') || byte == UInt8('_')) ||
+            throw(ArgumentError("not base64url"))
+    end
+    remainder = mod(ncodeunits(text), 4)
+    remainder == 1 && throw(ArgumentError("not base64url: impossible length"))
+    padding = remainder == 0 ? "" : repeat("=", 4 - remainder)
+    decoded = Base64.base64decode(replace(text, '-' => '+', '_' => '/') * padding)
+    _base64url_encode(decoded) == text || throw(ArgumentError("not canonical base64url"))
+    return decoded
 end
 
 function _json_dict(data)
@@ -197,6 +215,14 @@ function _decode_jwt(token::AbstractString, secret_or_keyset; issuer=nothing, au
         # inspection path and must keep parsing a token whatever its header says.
         get(header, "alg", nothing) == "HS256" ||
             throw(AuthError("Unsupported JWT algorithm"))
+
+        # RFC 7515 §4.1.11: a recipient that does not understand an extension listed in
+        # `crit` MUST reject the token -- the issuer is saying "do not accept this unless
+        # you enforce X". Nitro understands no extensions, so any `crit` at all, malformed
+        # ones included, is one it cannot honour (#321). Ignoring it used to accept tokens
+        # whose issuer had made acceptance conditional.
+        haskey(header, "crit") &&
+            throw(AuthError("Unsupported critical JWT header extension"))
 
         # Resolved BEFORE the signature is decoded, so a token naming an unknown `kid`
         # still reports "Unknown JWT key id" and is not pre-empted by a signature that

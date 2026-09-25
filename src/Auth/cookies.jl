@@ -1,6 +1,25 @@
 const DEFAULT_AUTH_COOKIE_NAME = "auth_token"
 
-function extract_auth_token(req::HTTP.Request; header::String="Authorization", scheme::String="Bearer", cookie_name::Union{String, Nothing}=DEFAULT_AUTH_COOKIE_NAME)
+"""
+    extract_auth_token(req; header="Authorization", scheme="Bearer", cookie_name=nothing)
+
+The token from `req`'s `header` (`"<scheme> <token>"`), or `nothing` when there is none.
+
+**Reading a cookie is opt-in.** With `cookie_name` set, a request with no usable header falls
+back to that cookie. A cookie is an *ambient* credential — the browser attaches it to
+cross-site requests too — so an endpoint that accepts one is CSRF-relevant in a way a
+bearer-only API is not. The default matches [`BearerAuth`](@ref), which also reads no cookie
+unless told to (#321):
+
+```julia
+extract_auth_token(req)                              # header only
+extract_auth_token(req; cookie_name = "auth_token")  # header, then the auth cookie
+```
+
+`"auth_token"` is the name [`set_auth_cookie!`](@ref) writes by default. Pair a cookie
+credential with `CSRFMiddleware` on state-changing routes.
+"""
+function extract_auth_token(req::HTTP.Request; header::String="Authorization", scheme::String="Bearer", cookie_name::Union{String, Nothing}=nothing)
     auth_header = HTTP.header(req, header, "")
     full_scheme = string(scheme, " ")
     if startswith(auth_header, full_scheme)

@@ -576,7 +576,7 @@ terminate(app)
     # refused before either decoder runs.
     ("AUTH", raw"""
 token = b64url(deep) * ".ey.AAAA"
-bearer = BearerAuth(t -> Nitro.Auth.decode_jwt(t, "secret"))(r -> Res.json(Dict("ok" => true)))
+bearer = BearerAuth(t -> Nitro.Auth.decode_jwt(t, "k"^32))(r -> Res.json(Dict("ok" => true)))
 authreq = HTTP.Request("GET", "/")
 HTTP.setheader(authreq, "Authorization" => "Bearer " * token)
 try
@@ -619,7 +619,7 @@ end
     ("CLAIMS", raw"""
 token = b64url("{}") * "." * b64url(deep) * ".AAAA"
 try
-    Nitro.Auth.decode_jwt(token, "secret"; verify=false)
+    Nitro.Auth.decode_jwt(token, "k"^32; verify=false)
     println("CLAIMS=PARSED")
 catch e
     println("CLAIMS=THREW:", nameof(typeof(e)), ":", e isa Nitro.Auth.AuthError ? e.msg : "")

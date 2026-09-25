@@ -96,6 +96,11 @@ Safe by default: every token is signature-verified and time-bounded (`exp`, or `
   the header `kid` is an unverified label, so this mode throws an `ArgumentError` at
   construction.
 
+Neither mode limits what a key may *claim*: every key in the keyset is trusted for every
+claim, so a verify-only partner key can sign `{"role": "admin"}` and pass `role_required`.
+Use one validator per trust domain, or add [`kid_required`](@ref) to every claim-guarded
+route — see "Every key is trusted for every claim" on [`JWTKeyset`](@ref).
+
 # Keysets
 
 `secret_or_keyset` is a string secret, a [`JWTKeyset`](@ref), or a `Dict` of
@@ -104,8 +109,9 @@ misconfiguration — a multi-key `Dict` with no `"default"`, two entries that ar
 HMAC key, a non-string secret — is an `ArgumentError` at construction, which is app
 startup. The validator keeps that snapshot: mutating the `Dict` afterwards has no effect.
 
-A string secret is held to the same rule as a keyset secret: one that is empty, or that
-HMAC treats as empty (a short run of `"\\0"` bytes), is an `ArgumentError` at construction.
+A string secret is held to the same rules as a keyset secret: one that is empty, that HMAC
+treats as empty (a short run of `"\\0"` bytes), or that is shorter than 32 bytes (RFC 7518
+§3.2), is an `ArgumentError` at construction.
 Read the secret with a `nothing` default — `get(ENV, "JWT_SECRET", nothing)` — and fail at
 startup when it is missing; a `""` default would otherwise authenticate every token signed
 with the empty string. `encode_jwt` refuses such a secret too, and so does `decode_jwt`

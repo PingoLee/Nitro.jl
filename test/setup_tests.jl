@@ -16,10 +16,20 @@ import Nitro: GET, POST, PUT, DELETE, PATCH, STREAM, WEBSOCKET
 export HOST
 export values_present, value_absent, value_count, has_property
 export get_free_port
+export jwtkey
 
 # ── Constants ────────────────────────────────────────────────────────
 
 const HOST = "127.0.0.1"
+
+"""
+    jwtkey(label)
+
+`label` padded with `'.'` to the 32 bytes an HS256 key must have (#321), so a test can still
+name its keys `"s1"`, `"s2"` and read them apart. Distinct labels stay distinct keys; a label
+of 32 bytes or more is returned unchanged.
+"""
+jwtkey(label::AbstractString) = rpad(label, Nitro.Auth.MIN_JWT_SECRET_BYTES, '.')
 
 # There is deliberately NO shared `PORT`/`localhost` here. A fixed port shared by every
 # `:network` item is what made an orphaned server from a *previous* run answer the next
