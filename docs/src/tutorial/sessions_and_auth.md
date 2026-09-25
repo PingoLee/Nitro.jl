@@ -155,7 +155,7 @@ concurrent logout just deleted. Make the check and the write one atomic step (an
 `UPDATE … WHERE`, or one lock hold). A store *failure* must throw, not return `false`: `false`
 means "logged out" and the middleware drops the write.
 
-A fourth is **optional**:
+A fifth is **optional**:
 
 ```julia
 cleanup_expired_sessions!(store::S)                    # → prune expired entries

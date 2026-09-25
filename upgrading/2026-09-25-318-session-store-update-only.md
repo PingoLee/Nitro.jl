@@ -27,6 +27,10 @@ When it returns `false` the write is dropped and the cookie is not re-set. That 
 `UpdateError` → `SessionInterrupted`. An id minted during the request, for a new visitor or by
 `regenerate_session!`, is still written with `set_session!`.
 
+This closes the write-back path only. A request that **rotates** its session after a concurrent
+logout (`regenerate_session!`, or `rotate_on_auth` on a user switch) still copies its stale data
+into the new id. That needs an atomic rotate on the store and is tracked separately.
+
 `update_session!` is a **required** part of the `AbstractSessionStore` contract, next to
 `Base.get`, `set_session!` and `delete_session!`. `MemoryStore` and `PormGSessionStore` implement
 it. A custom store that does not now fails with `StoreInterfaceError` on the first write-back of

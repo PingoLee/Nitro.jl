@@ -207,11 +207,16 @@ SessionPruner(store; interval = Minute(5))                     # janitor only
 
 With `SessionMiddleware`, `empty!(getsession(req))` only clears the current payload. To retire the old authenticated session ID, pair it with `regenerate_session!`.
 
-A logout holds even against requests that are still in flight on the old session. Once the old
-ID has been deleted, another request that loaded it earlier and then writes to it has that write
-dropped: the session is not re-created, and that response does not set the old cookie again.
-Each request also works on its own deep copy of the session, so concurrent requests never share a
-nested value such as a `cart` vector.
+A logout holds against requests that are still in flight on the old session and write to it.
+Once the old ID has been deleted, another request that loaded it earlier and then writes to it has
+that write dropped: the session is not re-created, and that response does not set the old cookie
+again. Each request also works on its own deep copy of the session, so concurrent requests never
+share a nested value such as a `cart` vector.
+
+One case is not covered yet: an in-flight request that **rotates** the session after the logout,
+by calling `regenerate_session!` or through `rotate_on_auth` on a user switch. It still copies its
+stale data into a fresh ID. Re-check credentials before rotating on a privilege change rather than
+trusting the loaded session alone.
 
 If you manage sessions manually without `SessionMiddleware`, delete the old server-side record and invalidate the client cookie yourself.
 

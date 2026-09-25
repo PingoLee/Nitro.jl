@@ -275,8 +275,10 @@ function SessionMiddleware(;
                 _save_session(store, final_session_id, current_session, max_age)
                 session_written = true
             elseif !is_new && (forced || current_session != original_session)
+                # `::Bool`: the contract's return type, asserted so inference does not carry `Any`
+                # (`current_session` comes out of `req.context`) into the branch below.
                 session_written = update_session!(store, final_session_id, current_session;
-                                                  ttl = max_age)
+                                                  ttl = max_age)::Bool
             else
                 session_written = false
             end
