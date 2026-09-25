@@ -402,6 +402,32 @@ end
         @test (bad, caught(() -> decode(bad)) isa ArgumentError) == (bad, true)
     end
 
+    # The decoder checks the discarded bits arithmetically. Hold it to the DEFINITION of
+    # canonical -- decode leniently, re-encode, compare -- over every input of up to three
+    # characters drawn from the alphabet plus the three characters the old decoder also
+    # took. Past three, a segment is whole 4-character groups plus one of these tails, so
+    # this covers every case the last-character rule can meet.
+    url = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    function canonical(s)
+        all(in(url), s) || return false
+        r = mod(ncodeunits(s), 4)
+        r == 1 && return false
+        lenient = Base64.base64decode(replace(s, '-' => '+', '_' => '/') * "="^(r == 0 ? 0 : 4 - r))
+        return Nitro.Auth._base64url_encode(lenient) == s
+    end
+    disagreements = String[]
+    accepted = 0
+    for n in 0:3, t in Iterators.product(ntuple(_ -> collect(url * "+/="), n)...)
+        s = String(collect(Char, t))
+        ok = caught(() -> decode(s)) === nothing
+        accepted += ok
+        ok == canonical(s) || push!(disagreements, s)
+    end
+    @test disagreements == String[]
+    # And the canonical set itself, counted independently of both: "", 64 * 4 two-character
+    # strings (4 free bits in the last character), 64^2 * 16 three-character ones (2 free bits).
+    @test accepted == 1 + 64 * 4 + 64^2 * 16
+
     # End to end. The old decoder mapped `+/` to `-_`, padded, and ignored the discarded
     # bits, so all of these verified as the SAME token -- defeating any denylist or replay
     # cache keyed on the token string. Search for a signature holding a `-` or `_`, so the

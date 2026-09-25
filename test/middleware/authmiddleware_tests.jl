@@ -451,8 +451,9 @@ both = HTTP.Request("GET", "/", ["Authorization" => "Bearer from-header", "Cooki
 @test Nitro.Auth.extract_auth_token(both) == "from-header"
 @test Nitro.Auth.extract_auth_token(both; cookie_name = "auth_token") == "from-header"
 
-# And the default agrees with BearerAuth's, which is the point of the change: neither
-# authenticates a cookie-only request unless given a cookie name.
+# A statement of agreement, not a guard: BearerAuth did not change, so these two pass on the
+# old code too. The `=== nothing` line above is what fails without the fix. They pin that the
+# helper and the middleware agree -- neither reads a cookie unless given its name.
 accept_any = BearerAuth(t -> Dict("sub" => t))(req -> HTTP.Response(200, "ok"))
 @test accept_any(cookie_only).status == 401
 @test accept_any(both).status == 200

@@ -9,23 +9,46 @@ end
 # 4 (or 16) letters differing only in bits the decoder discards all decoded to the same bytes.
 # Every such spelling of a signature verified, so one token had many strings, and anything
 # keyed on the raw token (a denylist, a replay cache) could be walked around. RFC 7515 §2
-# defines the encoding with no padding; re-encoding and comparing is what rules out the
-# discarded-bits variants, and it cannot drift from `_base64url_encode`.
+# defines the encoding with no padding.
+#
+# Canonical means: the URL-safe alphabet only, no padding, a length that is not 1 mod 4, and
+# zero in the bits of the last character that fall past the final byte -- the low 4 bits when
+# 2 characters are left over, the low 2 when 3 are. That last rule is checked on the value
+# directly rather than by re-encoding and comparing, which did the same job at three times
+# the cost on every segment of every request. The test suite holds it to the re-encoding
+# definition exhaustively over every 2- and 3-character input, so the two cannot drift.
 #
 # Throws ArgumentError, the one type both callers in `_decode_jwt` catch.
 function _base64url_decode(data::AbstractString)
-    text = String(data)
-    for byte in codeunits(text)
-        (UInt8('A') <= byte <= UInt8('Z') || UInt8('a') <= byte <= UInt8('z') ||
-         UInt8('0') <= byte <= UInt8('9') || byte == UInt8('-') || byte == UInt8('_')) ||
-            throw(ArgumentError("not base64url"))
-    end
-    remainder = mod(ncodeunits(text), 4)
+    units = codeunits(data)
+    count = length(units)
+    remainder = mod(count, 4)
     remainder == 1 && throw(ArgumentError("not base64url: impossible length"))
-    padding = remainder == 0 ? "" : repeat("=", 4 - remainder)
-    decoded = Base64.base64decode(replace(text, '-' => '+', '_' => '/') * padding)
-    _base64url_encode(decoded) == text || throw(ArgumentError("not canonical base64url"))
-    return decoded
+    # Translated to the standard alphabet and padded in one buffer, for `base64decode`.
+    standard = Vector{UInt8}(undef, remainder == 0 ? count : count + 4 - remainder)
+    last_value = 0x00
+    for (index, byte) in enumerate(units)
+        last_value, translated = if UInt8('A') <= byte <= UInt8('Z')
+            byte - UInt8('A'), byte
+        elseif UInt8('a') <= byte <= UInt8('z')
+            byte - UInt8('a') + 0x1a, byte
+        elseif UInt8('0') <= byte <= UInt8('9')
+            byte - UInt8('0') + 0x34, byte
+        elseif byte == UInt8('-')
+            0x3e, UInt8('+')
+        elseif byte == UInt8('_')
+            0x3f, UInt8('/')
+        else
+            throw(ArgumentError("not base64url"))
+        end
+        standard[index] = translated
+    end
+    discarded = remainder == 2 ? 0x0f : remainder == 3 ? 0x03 : 0x00
+    last_value & discarded == 0x00 || throw(ArgumentError("not canonical base64url"))
+    for index in (count + 1):length(standard)
+        standard[index] = UInt8('=')
+    end
+    return Base64.base64decode(standard)
 end
 
 function _json_dict(data)
