@@ -249,7 +249,7 @@ the task was absent, had left `from`, or belongs to another run.
 
 It is the delete counterpart of [`try_transition!`](@ref), and it exists for the same reason:
 `lock_tasks` is process-local, so reading a record, checking it, and then calling
-[`delete_task!`](@ref) is a read-modify-write that another process can interleave. Between the
+`delete_task!` is a read-modify-write that another process can interleave. Between the
 check and the delete, another node can re-run the key, and an unfenced delete then removes the
 successor's fresh `PENDING` record, whose run never starts. Its one caller is
 [`release_task!`](@ref) ([#323](https://github.com/PingoLee/Nitro.jl/issues/323)).
