@@ -423,14 +423,20 @@ function _start_queue_processor(runtime::WorkerRuntime, queue_name::String)
                     # (#324). Its OWNER's reservation lasts until the run ends.
                     _release_queue_slot!(queue)
 
-                    # While the runtime is at its cap, hold this item rather than start it
-                    # (#324). Abandoned sequential callbacks count toward the cap, so this is what
-                    # stops a queue of timing-out callbacks from piling up threads one per
-                    # deadline. It pauses the QUEUE, never a submitter: new submits still fail fast
-                    # once the buffer fills. A teardown ends the pause, and the item is then
-                    # abandoned below like any other.
-                    while _runtime_saturated(runtime) && !(@atomic queue.draining)
-                        sleep(0.05)
+                    # While abandoned sequential callbacks fill the runtime cap, hold this item
+                    # rather than start another beside them (#324). That is what stops a queue of
+                    # timing-out callbacks from piling up threads one per deadline. It is keyed on
+                    # those callbacks ALONE -- `_abandoned_saturated` says why not on async load --
+                    # and it pauses the QUEUE, never a submitter: new submits still fail fast once
+                    # the buffer fills. The held item is parked on `queue.held`, where `shutdown!`
+                    # collects it; a teardown also ends the pause, and the item is then abandoned
+                    # below like any other.
+                    if _abandoned_saturated(runtime)
+                        lock(() -> (queue.held = item), qlock)
+                        while _abandoned_saturated(runtime) && !(@atomic queue.draining)
+                            sleep(0.05)
+                        end
+                        lock(() -> (queue.held = nothing), qlock)
                     end
 
                     # BEFORE `_mark_queue_current_task!` and before `_execute_queued_task`'s

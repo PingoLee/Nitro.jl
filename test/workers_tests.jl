@@ -4575,7 +4575,9 @@ end
     gate = Channel{Nothing}(1)
     try
         id = submit_task("job", () -> take!(gate), Owner("u"); runtime = rt)
-        @test wait_for(() -> get_active_task_info(rt, id) !== nothing) == :ok
+        # RUNNING, not merely published: `_claim_run!` publishes the handle while the record is
+        # still PENDING, so waiting on the handle alone raced the fenced transition below.
+        @test wait_for(() -> get_task_info(store, id).status == RUNNING) == :ok
         live = get_active_task_info(rt, id)
         # The record goes terminal WITHOUT touching the run's token, so a supersede would be the
         # first thing to set it. The callback still runs, holding the only slot.
@@ -4731,6 +4733,47 @@ end
         @test wait_for(() -> capacity_idle(rt)) == :ok
     finally
         foreach(_ -> isready(gate) || put!(gate, nothing), 1:2)
+        reset_runtime!(rt)
+    end
+end
+
+@testset "#324: async load never holds a sequential queue" begin
+    # The fan-in pattern: an async run that submits a sequential item and waits for it. At the
+    # async cap, a queue that paused on total async load would never start the items those runs
+    # wait on -- a deadlock. Queues are held only by ABANDONED sequential callbacks.
+    store = InMemoryWorkerStore()
+    rt = WorkerRuntime(store; max_concurrent_runs = 2, queues = ["writes"])
+    try
+        ids = [submit_task("fan-$i", function ()
+                    child = submit_sequential_task("writes", "w-$i", () -> "wrote-$i", Owner("u"); runtime = rt)
+                    @assert wait_for(() -> get_task_status(child, System(); runtime = rt)[:status] == "COMPLETED") == :ok
+                    return "joined-$i"
+                end, Owner("u"); runtime = rt) for i in 1:2]
+        @test wait_for(() -> all(id -> get_task_status(id, System(); runtime = rt)[:status] == "COMPLETED", ids);
+                       timeout = 10.0) == :ok
+        @test wait_for(() -> capacity_idle(rt)) == :ok
+    finally
+        reset_runtime!(rt)
+    end
+end
+
+@testset "#324: shutdown! abandons the item a queue is holding, before it returns" begin
+    store = InMemoryWorkerStore()
+    rt = WorkerRuntime(store; max_concurrent_runs = 1, queues = ["q"])
+    gate = Channel{Nothing}(2)
+    try
+        slow = submit_sequential_task("q", "slow", () -> take!(gate), Owner("u"); runtime = rt,
+                                      options = TaskOptions(timeout = 1))
+        @test wait_for(() -> get_task_status(slow, System(); runtime = rt)[:status] == "FAILED"; timeout = 10.0) == :ok
+        held = submit_sequential_task("q", "held", () -> "never", Owner("u"); runtime = rt)
+        # Taken out of the buffer and parked, so the channel no longer has it.
+        @test wait_for(() -> get_sequential_queues(rt)["q"].held !== nothing) == :ok
+        shutdown!(rt; drain_timeout = 0)
+        # Terminal when `shutdown!` returns, not whenever the processor wakes up.
+        @test get_task_status(held, System(); runtime = rt)[:status] == "CANCELLED"
+    finally
+        foreach(_ -> isready(gate) || put!(gate, nothing), 1:2)
+        @test wait_for(() -> capacity_idle(rt)) == :ok
         reset_runtime!(rt)
     end
 end

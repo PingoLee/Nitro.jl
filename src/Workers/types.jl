@@ -485,10 +485,17 @@ mutable struct SequentialQueue
     # `capacity` is stored rather than read back off the `Channel`'s internals.
     capacity::Int
     @atomic reserved::Int
+    # The item the processor has TAKEN but is holding back while abandoned sequential callbacks
+    # fill the runtime cap (#324), under `queue_lock`. It is out of the channel, so `shutdown!`'s
+    # collect step would miss it, and it would be abandoned only after the teardown had returned --
+    # PENDING forever on a persistent store if the process exits first (the #182 orphan). So
+    # `shutdown!` collects it from here too; both abandons are the same idempotent CAS.
+    held::Union{Nothing, QueueItem}
 
     function SequentialQueue(size::Int=100)
         size >= 1 || throw(ArgumentError("SequentialQueue size must be at least 1, got $size"))
-        return new(Channel{QueueItem}(size), false, nothing, ReentrantLock(), nothing, false, size, 0)
+        return new(Channel{QueueItem}(size), false, nothing, ReentrantLock(), nothing, false, size, 0,
+                   nothing)
     end
 end
 

@@ -35,8 +35,9 @@ behavior. The first refusal of each undeclared name is logged at `@warn`. The in
 listing also no longer holds the task lock while it scans.
 
 A callback abandoned by `TaskOptions(timeout = …)` keeps counting against `max_concurrent_runs`
-until it actually returns, on either path. While the runtime is at that cap, sequential queues
-**hold** their next item instead of starting it; their submitters are not held.
+until it actually returns, on either path. When abandoned sequential callbacks alone fill that cap,
+sequential queues **hold** their next item instead of starting another beside them. Async load
+never holds a queue, and submitters are never held.
 
 ### How to find the calls to migrate
 

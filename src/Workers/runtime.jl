@@ -15,8 +15,9 @@ refuses a submission **before anything is written**, with a [`WorkerCapacityErro
   (Sidekiq's concurrency, River's `MaxWorkers`). Past it, `:runtime`, a `503`. `nothing` removes
   the cap. A run counts until its callback actually returns, including one abandoned by
   `TaskOptions(timeout=…)`, because it still holds a thread. A **sequential** callback abandoned by
-  its deadline counts too, and while the runtime is at its cap the sequential queues hold their
-  next item rather than start it.
+  its deadline counts too. When abandoned sequential callbacks alone fill the cap, the sequential
+  queues hold their next item rather than start another beside them; ordinary async load never
+  holds a queue.
 - `max_runs_per_owner` (default `nothing`, off): one owner's live runs across both submit paths,
   queued or executing. Past it, `:owner`, a `429`. It counts this runtime's runs only; it is not
   a deployment-wide quota.
@@ -66,7 +67,7 @@ data and the tenant, so two runtimes over one store correctly share one security
 | `active_tasks` / `active_task_infos` / `active_lock` | Process-local run handles. Keyed by task id, but each entry describes one **run**. [`shutdown!`](@ref) drains against these and keeps whatever outlives the wait (#176) |
 | `max_concurrent_runs` / `max_runs_per_owner` / `allow_undeclared_queues` | The limits above, fixed at construction |
 | `declared_queues` / `initial_queues` / `warned_queues` | The queue names a submit may use (under `queue_lock`), the constructor's set, which `reset_runtime!` restores, and the undeclared names already logged (bounded) |
-| `reservations` / `owner_runs` / `async_runs` / `reservation_lock` | One entry per live run, keyed by `run_id`, and the counts the limits read. `reservation_lock` is a leaf: nothing else is locked, and no store or app code runs, while it is held |
+| `reservations` / `owner_runs` / `async_runs` / `abandoned_runs` / `reservation_lock` | One entry per live run, keyed by `run_id` and tagged `:async`, `:queued` or `:abandoned`, and the counts the limits read. `reservation_lock` is a leaf: nothing else is locked, and no store or app code runs, while it is held |
 
 `active_task_infos` is the live-`TaskInfo` cache, and it lives here for **both** backends. It was
 previously a `PormGWorkerStore` field with no in-memory counterpart — the in-memory store answered
@@ -98,9 +99,13 @@ struct WorkerRuntime{S <: AbstractWorkerStore}
     declared_queues::Set{String}
     warned_queues::Set{String}                       # undeclared names already warned about
 
-    reservations::Dict{UUID, Tuple{String, Bool}}   # run_id => (owner, is_async)
+    # run_id => (owner, kind). `kind` is `:async` (a `submit_task` run), `:queued` (a sequential
+    # item, queued or executing), or `:abandoned` (a sequential callback its deadline gave up on,
+    # still holding a thread).
+    reservations::Dict{UUID, Tuple{String, Symbol}}
     owner_runs::Dict{String, Int}
-    async_runs::Base.RefValue{Int}
+    async_runs::Base.RefValue{Int}       # :async + :abandoned -- what `max_concurrent_runs` admits against
+    abandoned_runs::Base.RefValue{Int}   # :abandoned alone -- what holds the sequential queues
     reservation_lock::ReentrantLock
 
     function WorkerRuntime(store::S;
@@ -127,8 +132,9 @@ struct WorkerRuntime{S <: AbstractWorkerStore}
             initial,
             Set{String}(initial),
             Set{String}(),
-            Dict{UUID, Tuple{String, Bool}}(),
+            Dict{UUID, Tuple{String, Symbol}}(),
             Dict{String, Int}(),
+            Ref(0),
             Ref(0),
             ReentrantLock(),
         )
@@ -209,7 +215,7 @@ function _reserve_run!(runtime::WorkerRuntime, run_id::UUID, owner::String, asyn
         if quota !== nothing && held >= quota
             throw(WorkerCapacityError(:owner, "this identity already has its maximum of $quota live tasks"))
         end
-        runtime.reservations[run_id] = (owner, async)
+        runtime.reservations[run_id] = (owner, async ? :async : :queued)
         runtime.owner_runs[owner] = held + 1
         async && (runtime.async_runs[] += 1)
     end
@@ -223,10 +229,11 @@ function _release_run!(runtime::WorkerRuntime, run_id::UUID)
     lock(runtime.reservation_lock) do
         entry = pop!(runtime.reservations, run_id, nothing)
         entry === nothing && return false
-        owner, async = entry
+        owner, kind = entry
         left = runtime.owner_runs[owner] - 1
         left <= 0 ? delete!(runtime.owner_runs, owner) : (runtime.owner_runs[owner] = left)
-        async && (runtime.async_runs[] -= 1)
+        kind === :queued || (runtime.async_runs[] -= 1)
+        kind === :abandoned && (runtime.abandoned_runs[] -= 1)
         return true
     end
 end
@@ -249,26 +256,31 @@ function _reserve_capacity!(runtime::WorkerRuntime, queue::Union{Nothing, Sequen
 end
 
 # A sequential run abandoned by its deadline keeps a thread until its callback returns, so from
-# then on it counts against `max_concurrent_runs` like an async run: its reservation is
-# reclassified, and `_release_run!` gives the runtime slot back with the owner's when the callback
-# returns. A no-op if the reservation is already gone (the callback returned first) or already
-# counted.
+# then on it counts against `max_concurrent_runs` like an async run (`:queued -> :abandoned`), and
+# `_release_run!` gives both counts back with the owner's when the callback returns. A no-op if the
+# reservation is already gone (the callback returned first) or is not a queued one.
 function _count_abandoned!(runtime::WorkerRuntime, run_id::UUID)
     lock(runtime.reservation_lock) do
         entry = Base.get(runtime.reservations, run_id, nothing)
-        (entry === nothing || entry[2]) && return nothing
-        runtime.reservations[run_id] = (entry[1], true)
+        (entry === nothing || entry[2] !== :queued) && return nothing
+        runtime.reservations[run_id] = (entry[1], :abandoned)
         runtime.async_runs[] += 1
+        runtime.abandoned_runs[] += 1
         return nothing
     end
     return nothing
 end
 
-# At or past the runtime-wide cap. The sequential processors read it to hold their next item.
-function _runtime_saturated(runtime::WorkerRuntime)
+# Whether the sequential processors must hold their next item: when abandoned SEQUENTIAL callbacks
+# alone fill the runtime cap. Deliberately not the total async load. Keyed on that, one owner filling
+# the async slots stalled every tenant's queues, and async callbacks that wait on a sequential item
+# they submitted deadlocked outright at the cap -- queues used to run independently of async load,
+# and they still do. This bounds only what a queue itself piles up: one abandoned callback per
+# deadline, which nothing else would stop.
+function _abandoned_saturated(runtime::WorkerRuntime)
     cap = runtime.max_concurrent_runs
     cap === nothing && return false
-    return lock(() -> runtime.async_runs[] >= cap, runtime.reservation_lock)
+    return lock(() -> runtime.abandoned_runs[] >= cap, runtime.reservation_lock)
 end
 
 function _release_capacity!(runtime::WorkerRuntime, queue::Union{Nothing, SequentialQueue}, run_id::UUID)
@@ -433,14 +445,16 @@ authorization gate stay in the store — the overlay writes only volatile fields
 When the live object *is* the stored record — `InMemoryWorkerStore`, where the registry holds the
 same objects — the overlay is skipped rather than assigning each field to itself.
 
-That identity guard is also what keeps this loop, which runs outside the store's task lock, from
-mutating a record another reader holds. On the in-memory backend the two can never *disagree* for
-one id: a run registers the very object `get_task_info(store, ·)` returned, and the one operation
-that swaps the stored object for a different one — [`replace_task!`](@ref) on a re-run — evicts the
-live entry in the same breath, so there is no interval in which the cache names one object and the
-registry another. (`set_task!` also swaps, but only when there was no entry to disagree with.) On a
-serializing backend the two always differ, and there the objects being written are fresh ones this
-call just deserialized, owned by nobody else.
+The overlay also applies only when the live object is the **same run** as the listed record
+(matching `run_id`, [#323](https://github.com/PingoLee/Nitro.jl/issues/323)). That, not the identity
+guard, is what keeps one run's state off another's record. Within ONE runtime the in-memory cache
+and registry cannot disagree for an id: a run registers the very object `get_task_info(store, ·)`
+returned, and [`replace_task!`](@ref) on a re-run evicts the live entry in the same breath. But two
+runtimes over one store each hold their own cache, and `replace_task!` through one does not evict
+the other's. Before the `run_id` check, listing through the runtime still running the predecessor
+overwrote the successor's stored record with the predecessor's state. On a serializing backend the
+two objects always differ, and the ones being written are fresh ones this call just deserialized,
+owned by nobody else.
 """
 function get_all_tasks(runtime::WorkerRuntime, authority::TaskAuthority;
                        status::Union{Nothing, TaskStatus}=nothing,
@@ -841,6 +855,10 @@ function shutdown!(runtime::WorkerRuntime; drain_timeout::Real = WORKER_DRAIN_TI
                 end
                 push!(pending, item)
             end
+            # ...and the one item a processor has already taken but is holding back while
+            # abandoned sequential callbacks fill the cap (#324). Left in place: the processor
+            # clears it, and its own abandon on waking finds the record already terminal.
+            queue.held === nothing || push!(pending, queue.held)
 
             queue.running = false
             queue.current_task = nothing
@@ -992,6 +1010,7 @@ function reset_runtime!(runtime::WorkerRuntime=default_runtime(); drain_timeout:
         empty!(runtime.reservations)
         empty!(runtime.owner_runs)
         runtime.async_runs[] = 0
+        runtime.abandoned_runs[] = 0
     end
     lock(runtime.queue_lock) do
         empty!(runtime.declared_queues)
