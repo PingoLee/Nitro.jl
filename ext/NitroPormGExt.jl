@@ -20,7 +20,7 @@ import Nitro.Workers: AbstractWorkerStore, TaskInfo, TaskStatus, TaskOptions,
     TaskAuthority, Owner, System, UNSUPPLIED, owner_of, _is_authorized, TASK_KEY_DELIMITER,
     _check_page,
     get_task_info, set_task!, replace_task!, add_watcher!, try_transition!,
-    delete_task!, cleanup_tasks!, get_all_tasks,
+    delete_task!, try_delete_task!, cleanup_tasks!, get_all_tasks,
     list_running_task_refs, RunningTaskRef,
     get_queue_authorizer, set_queue_authorizer!,
     get_error_redactor, set_error_redactor!,
@@ -872,6 +872,26 @@ function delete_task!(store::PormGWorkerStore, task_id::String)
         rethrow()
     end
     return nothing
+end
+
+# The delete counterpart of `try_transition!` (#323): the status and run preconditions sit in the
+# statement's filter, so a record another process re-ran since the caller read it is not matched
+# and survives. PormG's `delete()` returns `(0, …)` without touching the table when nothing
+# matches, which is the ordinary lost-race answer here.
+#
+# Its guarantee is `cleanup_tasks!`'s, not `try_transition!`'s: PormG issues the DELETE through a
+# subquery on the filters, and PostgreSQL under READ COMMITTED re-checks only the outer `id` join
+# for a row a concurrent UPDATE changed while the DELETE waited. A re-run landing in that instant
+# can therefore still be deleted on PostgreSQL. Tracked as a follow-up; SQLite serializes writers.
+function try_delete_task!(store::PormGWorkerStore, task_id::String, from;
+                          run_id::Union{Nothing, UUIDs.UUID})
+    statuses = [string(s) for s in from]
+    matched = run_id === nothing ?
+        _task_objects(store).filter("id" => task_id, "status__@in" => statuses) :
+        _task_objects(store).filter("id" => task_id, "run_id" => string(run_id),
+                                    "status__@in" => statuses)
+    deleted, _ = matched.delete()
+    return deleted isa Integer && deleted >= 1
 end
 
 function cleanup_tasks!(store::PormGWorkerStore, retain_days::Int)

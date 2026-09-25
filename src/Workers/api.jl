@@ -430,34 +430,38 @@ function _watch_allowed(store::AbstractWorkerStore, task_key::String, watchers::
     return Base.invokelatest(authorizer, task_key, watchers, user_id)::Bool
 end
 
-# Authorize against the cached record, and only if that denies, re-check the durable one.
-#
-# The `task_info` handed in reached its caller through `get_task_info(runtime, ·)`, so for a
-# running task it may be the live in-memory object, which pollers read to see fresh progress
-# without a round-trip. That cache is per process, so a grant issued *elsewhere*
-# is not in it — and #96's whole motivating case is a task submitted on one node and polled
-# from another. Denying on the cache alone would refuse a user who is authorized in the
-# durable record, making the grant work or not depending on which node answered.
-#
-# Ordering matters for cost: the cached check succeeds for the owner and for any watcher
-# this process already knows, so the extra read is paid only on the path that was about to
-# raise anyway. It can only ever turn a denial into an approval, never the reverse.
-function _authorize_or_reload!(store::AbstractWorkerStore, authority::TaskAuthority,
-                               task_info::TaskInfo, action::AbstractString)
-    _is_authorized(authority, task_info) && return nothing
+# What a caller who may not see a task is told, and what a caller asking for a task that does not
+# exist is told -- ONE value for both (#323). They used to differ: a missing id answered this, a
+# foreign one raised `AuthorizationError`, and the difference let any authenticated user probe
+# `"<victim>::<key>"` ids (usually derived from resource ids, so guessable) and learn who ran what.
+_not_found() = Dict{Symbol, Any}(:error => "Task not found", :status => "NOT_FOUND")
 
-    # `get_task_info(store, ·)` is the DURABLE read -- it is what `reload_task` used to be, and
-    # no store caches live objects any more (#167).
-    # Authorize against the durable record, but keep serving the cached one: the durable
-    # row for a *running* task holds only what was flushed at RUNNING-start, so returning
-    # it would admit the cross-process grantee and then hand them a frozen progress bar —
-    # the exact field #96 exists to expose. The decision needs the durable record; the
-    # payload does not.
-    durable = get_task_info(store, task_info.id)
-    durable !== nothing && _is_authorized(authority, durable) && return nothing
+# The record `authority` may be served for `task_id`, or `nothing` -- which the callers answer with
+# `_not_found()`, so "not yours" and "not there" are indistinguishable (#323).
+#
+# **Live first, and only if it authorizes.** Pollers read the live object for fresh progress
+# without a round-trip. But that cache is per process, so a grant issued *elsewhere* is not in it --
+# #96's whole motivating case is a task submitted on one node and polled from another. So a live
+# object that denies is not the answer; the durable record decides.
+#
+# **The durable record authorizes only ITS OWN run.** The live object can be a predecessor still
+# executing after a re-run replaced the record (cancellation is cooperative), and re-running a key
+# resets its watcher list. Authorizing the predecessor's object against the successor's watchers
+# served one identity's run on another identity's grant, which is the Info item of #323. So when
+# the runs differ, the durable record is what gets served; the live object is served only when it
+# is the same run, which keeps a cross-process grantee's progress bar live, as #96 requires.
+#
+# **One durable read on every refusal path.** A missing id and a foreign id both reach the durable
+# read exactly once and stop there, so the two do not differ in round-trips either -- a second read
+# only on the "exists but not yours" path would put the oracle back as a timing difference.
+function _visible_record(runtime::WorkerRuntime, authority::TaskAuthority, task_id::String)
+    live = get_active_task_info(runtime, task_id)
+    live !== nothing && _is_authorized(authority, live) && return live
 
-    _authorize_task!(authority, task_info, action)   # raises
-    return nothing
+    # `get_task_info(store, ·)` is the DURABLE read -- no store caches live objects (#167).
+    durable = get_task_info(runtime.store, task_id)
+    (durable === nothing || !_is_authorized(authority, durable)) && return nothing
+    return live !== nothing && live.run_id == durable.run_id ? live : durable
 end
 
 # A `watchers=` grant is authorized by the *owner* — but a `:global` task has no owner
@@ -526,7 +530,16 @@ function _register_or_watch!(runtime::WorkerRuntime, task_key::String, owner::Ow
         # the single `add_watcher!(runtime, ·)` store-then-mirror path, so that particular
         # divergence is gone -- but the snapshot stays, because a hook written as
         # `all(w -> same_org(w, uid), watchers)` must see one value per call regardless.
-        seen = task_info === nothing ? String[] : copy(task_info.watchers)
+        #
+        # And the value is the list the record WILL have once the submitter is in it, never an
+        # empty one (#323). A new `:global` key used to be authorized against `String[]`, so an
+        # `all(...)` hook was vacuously true and the documented `ORG_OF[first(watchers)]` threw
+        # `BoundsError` -- a 500. Which list that is follows the same status test as the branch
+        # below: joining a live run keeps its watchers and adds the submitter; a new or replaced
+        # record starts from the submitter alone, because `replace_task!` resets the list.
+        joining = task_info !== nothing && task_info.status in (RUNNING, PENDING)
+        seen = joining ? copy(task_info.watchers) : String[]
+        uid in seen || push!(seen, uid)
 
         # Authorize every grant before applying any. Otherwise a refusal partway through
         # throws with the earlier grants already durably written — and a submit that
@@ -535,7 +548,7 @@ function _register_or_watch!(runtime::WorkerRuntime, task_key::String, owner::Ow
             _authorize_grant!(runtime.store, task_key, seen, grant)
         end
 
-        if task_info !== nothing && task_info.status in (RUNNING, PENDING)
+        if joining
             # Atomic and idempotent in the store. Composing this out of
             # get + push! + set_task! under `lock_tasks` is what #88 was: that lock is
             # process-local for a database-backed store, so the read-modify-write was
@@ -857,13 +870,19 @@ function submit_sequential_task(ctx::App, queue_name::AbstractString, task_key::
     return submit_sequential_task(queue_name, task_key, callback, owner; scope, watchers, options, runtime=_resolve_runtime(ctx; key, runtime))
 end
 
-function get_task_status(task_id::AbstractString, authority::TaskAuthority; runtime::WorkerRuntime=default_runtime())
-    task_info = get_task_info(runtime, String(task_id))
-    if task_info === nothing
-        return Dict{Symbol, Any}(:error => "Task not found", :status => "NOT_FOUND")
-    end
+"""
+    get_task_status(task_id, authority::TaskAuthority; runtime=default_runtime()) -> Dict{Symbol, Any}
 
-    _authorize_or_reload!(runtime.store, authority, task_info, "view")
+The task `task_id` as `authority` may see it.
+
+A task that does not exist and a task `authority` may not see get the **same** answer,
+`Dict(:error => "Task not found", :status => "NOT_FOUND")`, so a route should turn that into a
+`404` either way ([#323](https://github.com/PingoLee/Nitro.jl/issues/323)). It never raises
+`AuthorizationError`: that difference let any authenticated user probe another user's task ids.
+"""
+function get_task_status(task_id::AbstractString, authority::TaskAuthority; runtime::WorkerRuntime=default_runtime())
+    task_info = _visible_record(runtime, authority, String(task_id))
+    task_info === nothing && return _not_found()
 
     return Dict{Symbol, Any}(
         :id => task_info.id,
@@ -884,14 +903,21 @@ function get_task_status(ctx::App, task_id::AbstractString, authority::TaskAutho
     return get_task_status(task_id, authority; runtime=_resolve_runtime(ctx; key, runtime))
 end
 
+"""
+    cancel_task(task_id, authority::TaskAuthority; runtime=default_runtime()) -> Dict{Symbol, Any}
+
+Ask `task_id` to stop, as `authority`.
+
+Like [`get_task_status`](@ref), a task `authority` may not see is answered exactly as a missing
+one, with `:status => "NOT_FOUND"` ([#323](https://github.com/PingoLee/Nitro.jl/issues/323)).
+"""
 function cancel_task(task_id::AbstractString, authority::TaskAuthority; runtime::WorkerRuntime=default_runtime())
     return lock_tasks(runtime) do
-        task_info = get_task_info(runtime, String(task_id))
-        if task_info === nothing
-            return Dict{Symbol, Any}(:error => "Task not found")
-        end
-
-        _authorize_or_reload!(runtime.store, authority, task_info, "cancel")
+        # The record served here is the one the fenced claim below addresses: when a live
+        # predecessor and a durable successor disagree, `_visible_record` hands back the run the
+        # caller is authorized on, so the claim can never cancel a run on another run's grant.
+        task_info = _visible_record(runtime, authority, String(task_id))
+        task_info === nothing && return _not_found()
 
         if task_info.status in (COMPLETED, FAILED, CANCELLED)
             return Dict{Symbol, Any}(:error => "Task already finished with status $(task_info.status)")
@@ -904,7 +930,7 @@ function cancel_task(task_id::AbstractString, authority::TaskAuthority; runtime:
         # Doing this with a read, a decision, and a full-record save under `lock_tasks`
         # was #88: that lock does not span processes.
         # Fencing this on `run_id` is an AUTHORIZATION fix, not merely bookkeeping.
-        # `_authorize_or_reload!` above decided against the watcher list of the run we read,
+        # `_visible_record` above decided against the watcher list of the run we read,
         # and re-running a finished key RESETS that list (`replace_task!`). Cancelling the
         # successor on the predecessor's grant would be an authorization the app never issued
         # — reachable across processes, since `lock_tasks` is process-local for a
@@ -919,7 +945,7 @@ function cancel_task(task_id::AbstractString, authority::TaskAuthority; runtime:
             # failed the run fence. A live object still reporting RUNNING would render as
             # "already finished with status RUNNING" -- a sentence the CAS above just disproved.
             latest = get_task_info(runtime.store, task_info.id)
-            latest === nothing && return Dict{Symbol, Any}(:error => "Task not found")
+            latest === nothing && return _not_found()
             if latest.run_id != task_info.run_id
                 # Distinguished on purpose: reporting the successor's status here would say
                 # "Task already finished with status PENDING", which is nonsense.
@@ -979,6 +1005,61 @@ end
 
 function cancel_task(ctx::App, task_id::AbstractString, authority::TaskAuthority; key::Symbol=DEFAULT_EXTENSION_KEY, runtime::Union{Nothing, WorkerRuntime}=nothing)
     return cancel_task(task_id, authority; runtime=_resolve_runtime(ctx; key, runtime))
+end
+
+const _TERMINAL_STATUSES = (COMPLETED, FAILED, CANCELLED)
+
+"""
+    release_task!(task_id, ::System; runtime=default_runtime()) -> Dict{Symbol, Any}
+
+Delete a **finished** task's record now, so the next submitter of its key starts fresh instead
+of being refused. Returns `Dict(:status => "Task released")`, or a dict with `:error`.
+
+This is how an administrator reclaims a squatted `:global` key
+([#323](https://github.com/PingoLee/Nitro.jl/issues/323)). A `:global` id has no owner half, so
+the first submitter of a predictable key (`"warm-price-cache"`, `"report-2026-09-25"`) becomes
+its only watcher, and until retention deletes the record, 7 days after it finished by default,
+every other user is refused unless a watch authorizer lets them in. **Derive `:global` keys from
+system data, never from request input**, and use this when one is squatted anyway.
+
+**Admin only: it takes `System()`, and an `Owner` is a `MethodError`**, like
+[`get_queue_status`](@ref). Deleting a finished record discards its result, which is the owner's.
+
+A task that has not finished is refused. Cancel it first. The delete is fenced on the run it
+inspected ([`try_delete_task!`](@ref Nitro.Workers.try_delete_task!)), so if another process
+re-runs the key in between, its fresh record survives and this reports what it found instead.
+
+A run of the released key that is still executing in this process (a cancelled callback that
+has not returned yet) keeps its live handle until it returns, and a reader in this process may
+still be served that run meanwhile. Its terminal write finds no record and stores nothing.
+"""
+function release_task!(task_id::AbstractString, ::System; runtime::WorkerRuntime=default_runtime())
+    id = String(task_id)
+    return lock_tasks(runtime) do
+        # The DURABLE read: this decides whether to destroy a record, which is a claiming call
+        # (workers §2), and the live object may be a predecessor of what the row now holds.
+        task_info = get_task_info(runtime.store, id)
+        task_info === nothing && return _not_found()
+
+        if !(task_info.status in _TERMINAL_STATUSES)
+            return Dict{Symbol, Any}(
+                :error => "Task is still $(task_info.status); cancel it before releasing it")
+        end
+
+        # Fenced on the run this call inspected, so a successor published by another process in
+        # the meantime (`lock_tasks` does not span processes) is not deleted -- it would never run.
+        if !try_delete_task!(runtime.store, id, _TERMINAL_STATUSES; run_id=task_info.run_id)
+            latest = get_task_info(runtime.store, id)
+            latest === nothing && return _not_found()
+            return Dict{Symbol, Any}(
+                :error => "Task changed while it was being released; it is now $(latest.status)")
+        end
+        return Dict{Symbol, Any}(:status => "Task released")
+    end
+end
+
+function release_task!(ctx::App, task_id::AbstractString, authority::System; key::Symbol=DEFAULT_EXTENSION_KEY, runtime::Union{Nothing, WorkerRuntime}=nothing)
+    return release_task!(task_id, authority; runtime=_resolve_runtime(ctx; key, runtime))
 end
 
 """

@@ -25,6 +25,7 @@ using Nitro.Workers    # the contract names are not re-exported from `Nitro`
 | `add_watcher!(store, task_id::String, user_id::String)` | Atomic compare-and-set append, returns `Bool` |
 | `try_transition!(store, task_id::String, from, to::TaskStatus; run_id, …)` | Atomic conditional status change, returns `Bool` |
 | `delete_task!(store, task_id::String)` | Remove one record |
+| `try_delete_task!(store, task_id::String, from; run_id)` | Atomic conditional removal, returns `Bool` |
 | `cleanup_tasks!(store, retain_days::Int)` | Prune finished records, returns how many went |
 | `get_all_tasks(store, authority::TaskAuthority; status, queue_name, after, limit)` | `Vector{TaskInfo}`; see *Paging* |
 
@@ -238,6 +239,26 @@ diagnosing one of these, check for a missing `run_id` parameter before believing
 function try_transition! end
 
 function delete_task! end
+
+"""
+    try_delete_task!(store, task_id::String, from; run_id) -> Bool
+
+Remove `task_id` only while its status is in `from` and its record belongs to `run_id`, as one
+atomic step. Returns `true` if this call removed it, and `false`, having removed **nothing**, if
+the task was absent, had left `from`, or belongs to another run.
+
+It is the delete counterpart of [`try_transition!`](@ref), and it exists for the same reason:
+`lock_tasks` is process-local, so reading a record, checking it, and then calling
+[`delete_task!`](@ref) is a read-modify-write that another process can interleave. Between the
+check and the delete, another node can re-run the key, and an unfenced delete then removes the
+successor's fresh `PENDING` record, whose run never starts. Its one caller is
+[`release_task!`](@ref) ([#323](https://github.com/PingoLee/Nitro.jl/issues/323)).
+
+`run_id` is **required, with no default**, on the terms `try_transition!` sets out: `nothing` is
+the named opt-out, never the shorter call.
+"""
+function try_delete_task! end
+
 function cleanup_tasks! end
 function get_all_tasks end
 
@@ -440,6 +461,7 @@ const WORKER_STORE_INTERFACE = (
     (add_watcher!,                  (AbstractWorkerStore, String, String)),
     (try_transition!,               (AbstractWorkerStore, String, Any, TaskStatus)),
     (delete_task!,                  (AbstractWorkerStore, String)),
+    (try_delete_task!,              (AbstractWorkerStore, String, Any)),
     (cleanup_tasks!,                (AbstractWorkerStore, Int)),
     (get_all_tasks,                 (AbstractWorkerStore, TaskAuthority)),
     # -- Authorization hooks --
@@ -595,7 +617,12 @@ function add_watcher!(store::InMemoryWorkerStore, task_id::String, user_id::Stri
         task_info === nothing && return false
         # Mutating the registered object *is* the store write — no round-trip, and so
         # no window between the mutation and its publication.
-        user_id in task_info.watchers || push!(task_info.watchers, user_id)
+        #
+        # Copy-on-write, never `push!` (#323, #324). Readers check `watchers` WITHOUT this lock --
+        # `get_task_status` on the live object, and the listing, which scans a snapshot outside
+        # it -- and a `push!` can reallocate the very vector one of them is iterating. Swapping in
+        # a new vector leaves any reader holding the old one with a complete, if stale, list.
+        user_id in task_info.watchers || (task_info.watchers = vcat(task_info.watchers, user_id))
         return true
     end
 end
@@ -629,6 +656,18 @@ function delete_task!(store::InMemoryWorkerStore, task_id::String)
         delete!(store.task_registry, task_id)
     end
     return nothing
+end
+
+function try_delete_task!(store::InMemoryWorkerStore, task_id::String, from;
+                          run_id::Union{Nothing, UUID})
+    lock(store.task_lock) do
+        task_info = Base.get(store.task_registry, task_id, nothing)
+        task_info === nothing && return false
+        task_info.status in from || return false
+        run_id === nothing || task_info.run_id == run_id || return false
+        delete!(store.task_registry, task_id)
+        return true
+    end
 end
 
 function cleanup_tasks!(store::InMemoryWorkerStore, retain_days::Int)

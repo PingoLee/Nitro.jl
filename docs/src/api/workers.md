@@ -39,7 +39,9 @@ Nitro.Workers.scoped_task_key
 
 ```@docs
 Nitro.Workers.TaskInfo
-Nitro.Workers.get_task_info
+Nitro.Workers.get_task_status
+Nitro.Workers.cancel_task
+Nitro.Workers.release_task!
 Nitro.Workers.get_all_tasks
 Nitro.Workers.get_queue_status
 Nitro.Workers.update_progress!
@@ -49,7 +51,6 @@ Nitro.Workers.CANCEL_REASONS
 Nitro.Workers.TaskTimeoutError
 Nitro.Workers.format_error
 Nitro.Workers.MAX_STORED_ERROR_CHARS
-Nitro.Workers.add_watcher!
 Nitro.Workers.set_watch_authorizer!
 Nitro.Workers.set_error_redactor!
 ```
@@ -62,4 +63,7 @@ Nitro.Workers.recover_zombie_tasks!
 Nitro.Workers.ZOMBIE_SWEEP_BATCH
 ```
 
-A custom storage backend implements the contract on [Worker Store Interface](@ref).
+A custom storage backend implements the contract on [Worker Store Interface](@ref). Those
+methods — `get_task_info`, `add_watcher!` and the rest — are not exported: they read and write
+records with no authority check, so an application calls the task API above instead
+([#323](https://github.com/PingoLee/Nitro.jl/issues/323)).

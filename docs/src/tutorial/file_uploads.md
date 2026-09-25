@@ -251,10 +251,15 @@ function submit_import(req, upload::Files{FormFile})
     file = upload.payload
 
     # Scope the task to its owner. `getuser(req)` is `nothing` unless auth middleware
-    # ran, so check before reaching into it — the route below carries
-    # `login_required()`, which is what makes the Principal branch the real one.
+    # ran — the route below carries `login_required()` — and a token with no subject
+    # claim still authenticates, with `principal.id === nothing`. REFUSE both rather than
+    # falling back to a shared name like "anonymous": every such caller would become ONE
+    # worker identity, able to read and cancel each other's imports. An
+    # `AuthorizationError` is answered with a 403.
     principal = getuser(req)
-    user_id = principal === nothing ? "anonymous" : something(principal.id, "anonymous")
+    (principal === nothing || principal.id === nothing) &&
+        throw(Nitro.AuthorizationError("no user subject on this request"))
+    owner = Nitro.Workers.Owner(principal.id)
 
     # 1. Stage to disk — the UUID task_key is the real identity; the original
     #    filename is sanitized to a bare basename so it can't traverse paths.
@@ -272,7 +277,7 @@ function submit_import(req, upload::Files{FormFile})
         "import_queue",
         task_key,
         (task) -> MyImportModule.process(staged_path),
-        user_id,
+        owner,
     )
 
     # 3. Return immediately

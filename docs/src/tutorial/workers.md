@@ -111,8 +111,11 @@ end
 
 function report_status(req::HTTP.Request)
     task_id = string(getparams(req)["task_id"])
-    # Pass user_id to securely query task status
-    return Res.json(get_task_status(task_id, Owner("user-1")))
+    status = get_task_status(task_id, Owner("user-1"))
+    # "NOT_FOUND" covers a task that does not exist AND one this caller may not see -- the
+    # same answer on purpose, so a 404 either way never tells a client which ids exist.
+    status[:status] == "NOT_FOUND" && return Res.json(Dict("error" => "unknown task"); status=404)
+    return Res.json(status)
 end
 
 urlpatterns("",
@@ -575,8 +578,18 @@ task_id = submit_task("warm-price-cache", cb, Owner(user_id); scope=:global)
 The key is stored verbatim, so any user can name it. A caller who is **not already a
 watcher** is refused with `AuthorizationError`, whether the task is still running (joining
 it would hand over read and cancel rights) or already finished (re-running it would discard
-the owner's stored result). To allow sharing, install a watch authorizer — see
-[Queue And Watch Authorization](@ref).
+the owner's stored result). An HTTP route answers that refusal with a `403`. To allow
+sharing, install a watch authorizer — see [Queue And Watch Authorization](@ref).
+
+**Derive `:global` keys from system data, never from request input.** The first submitter of a
+key becomes its only watcher, so a user who can guess a key (`"warm-price-cache"`,
+`"report-2026-09-25"`) can submit it first and lock everyone else out until retention deletes
+the finished record, 7 days by default. An administrator can reclaim a squatted key as soon as
+its task has finished:
+
+```julia
+release_task!("warm-price-cache", System())   # deletes the finished record; the next submit starts fresh
+```
 
 A `:global` key may not contain `::`. That keeps the two namespaces disjoint: without the
 restriction, submitting `"victim::export_42"` globally would produce exactly the id
@@ -826,12 +839,19 @@ using Nitro.Errors: AuthorizationError
 task_id = submit_task("my-task", heavy_job, Owner("user-123"))
 
 status = get_task_status(task_id, Owner("user-123"))     # ok
-get_task_status(task_id, Owner("intruder-99"))           # AuthorizationError
+get_task_status(task_id, Owner("intruder-99"))           # :status => "NOT_FOUND", as for a missing id
 get_task_status(task_id, System())                       # ok — admin path, unscoped
 
 get_task_status(task_id)                                 # MethodError, not a bypass
 get_task_status(task_id, "user-123")                     # MethodError — not an authority
 ```
+
+A task the caller may not see is answered **exactly** like a task that does not exist, by
+`get_task_status` and `cancel_task` alike: `Dict(:error => "Task not found", :status =>
+"NOT_FOUND")`. Map it to a `404`. Raising `AuthorizationError` there instead, as Nitro once
+did, told any authenticated user which ids exist, and ids are usually derived from resource
+ids, so they are guessable. `AuthorizationError` remains for the **submit** paths, where a
+refusal reveals nothing the caller did not already name, and Nitro answers it with a `403`.
 
 ### Where authority comes from
 
@@ -922,7 +942,8 @@ end)
 ```
 
 Without this hook, cross-user submission of an existing `:global` key is refused. `watchers`
-is a copy, so mutating it has no effect.
+is a copy, so mutating it has no effect. It is never empty: for a key that does not exist yet,
+which the hook sees when a `watchers=` grant is checked, it is the submitter alone.
 
 !!! warning "The hook runs under the store's task lock"
     That lock also serializes `set_task!`, `cancel_task`, and zombie recovery, so blocking
@@ -933,7 +954,7 @@ is a copy, so mutating it has no effect.
 
 !!! note "Re-running a finished shared key resets its watchers"
     A terminal task is replaced, not resumed, so the new submitter becomes the only watcher.
-    Everyone else holding that id starts getting `AuthorizationError` until the hook
+    Everyone else holding that id starts getting `"NOT_FOUND"` until the hook
     re-approves them — and a pure status-polling route never re-submits, so it cannot
     re-approve itself. Give shared ids a short life, or re-submit rather than only poll.
 

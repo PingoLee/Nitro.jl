@@ -2,7 +2,7 @@ using HTTP
 using JSON
 using Dates
 
-using ..Errors: ValidationError, UnsupportedMediaTypeError, is_unrecoverable
+using ..Errors: ValidationError, UnsupportedMediaTypeError, AuthorizationError, is_unrecoverable
 using .BodyParsers: _parse_json_bounded
 
 export recursive_merge, parseparam, parsebody, parseparam_checked,
@@ -20,6 +20,13 @@ end
 
 function handle_error(::UnsupportedMediaTypeError)
     return Res.json(("message" => "415: Unsupported Media Type"), status = 415)
+end
+
+# A refusal, not a fault (#323). It used to fall to `handle_error(::Any)`: a 500 plus an `@error`
+# with a full backtrace, so every probe of someone else's task wrote a stack trace (the #18
+# log-flood class) while a missing task answered 404 -- the difference was the oracle.
+function handle_error(::AuthorizationError)
+    return Res.json(("message" => "403: Forbidden"), status = 403)
 end
 
 function handle_error(::Any)
@@ -70,6 +77,11 @@ function handlerequest(getresponse::Function, catch_errors::Bool; show_errors::B
                 # Client input too, so the same treatment: no backtrace. `.msg` names the
                 # parameter and the type it needs, never the Content-Type the client sent (#327).
                 show_errors && @debug "Request rejected (415 Unsupported Media Type)" message=error.msg
+            elseif error isa AuthorizationError
+                # A refusal, so no backtrace -- and, unlike the two branches above, not even
+                # `.msg`: an `AuthorizationError`'s message names the caller-chosen queue or task key
+                # verbatim, and it is not pinned value-free the way `ValidationError.msg` is (#323).
+                show_errors && @debug "Request refused (403 Forbidden)"
             elseif show_errors && !isa(error, InterruptException)
                 @error "ERROR: " exception=(error, catch_backtrace())
             end

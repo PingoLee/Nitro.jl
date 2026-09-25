@@ -321,7 +321,9 @@ function add_watcher!(runtime::WorkerRuntime, task_id::String, user_id::String)
     lock(runtime.active_lock) do
         live = Base.get(runtime.active_task_infos, task_id, nothing)
         if live !== nothing && !(user_id in live.watchers)
-            push!(live.watchers, user_id)
+            # Copy-on-write for the same reason as the in-memory store's `add_watcher!`: readers
+            # of the live object hold no lock.
+            live.watchers = vcat(live.watchers, user_id)
         end
     end
 

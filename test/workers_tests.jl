@@ -2,14 +2,26 @@
 
 using Test
 using Dates
+using HTTP
+using JSON
 using Nitro
 using Nitro.Workers
+# The store contract and the run/queue internals stopped being exported in #323; this suite
+# exercises them directly, so it names them.
+using Nitro.Workers: get_task_info, set_task!, replace_task!, add_watcher!, try_transition!,
+    delete_task!, try_delete_task!, cleanup_tasks!, clear_records!, list_running_task_refs,
+    RunningTaskRef, lock_tasks, get_active_task, get_active_task_info, register_run!,
+    SequentialQueue, QueueItem, get_sequential_queues, get_queue_lock
 using Nitro.Errors: AuthorizationError, StoreInterfaceError
 using Base.ScopedValues: ScopedValue, with
 
 function wait_for(predicate::Function; timeout::Real=5.0)
     return timedwait(predicate, timeout)
 end
+
+# The ONE answer a read or cancel gives both for a task that does not exist and for a task the
+# caller may not see (#323). Compared whole, so a denial that leaks even an extra key fails.
+is_not_found(d) = d == Dict{Symbol, Any}(:error => "Task not found", :status => "NOT_FOUND")
 
 # A stand-in for any `ScopedValue` an app might have open at submit time -- PormG's
 # `_tx_context` is the one #209 is about, but nothing here needs PormG to say what a spawn
@@ -21,7 +33,7 @@ const _SCOPE_PROBE = ScopedValue(:outer)
 # Implements ONLY `cleanup_tasks!` on purpose: the cleanup scheduler reaches nothing else on
 # the store, and the contract's missing-method errors are raised lazily at the call rather than
 # at construction — so a one-method store is the smallest thing that can observe `api.jl`'s
-# scheduler spawn without dragging in a 15-method backend.
+# scheduler spawn without dragging in a 16-method backend.
 struct ScopeProbeStore <: AbstractWorkerStore
     seen::Channel{Symbol}
 
@@ -57,7 +69,7 @@ Nitro.Workers.try_transition!(::StaleKwStore, ::String, from, ::TaskStatus;
 struct StaleNoKwStore <: AbstractWorkerStore end
 Nitro.Workers.try_transition!(::StaleNoKwStore, ::String, from, ::TaskStatus) = false
 
-# A conforming backend that implements the 15 data-and-policy rows and NOTHING else: no
+# A conforming backend that implements the 16 data-and-policy rows and NOTHING else: no
 # `shutdown!`, no queue or scheduler accessor, no run-handle cache, no `clear_records!`. It is
 # the proof that #167 closed the CLASS of the #29 leak rather than one instance of it — under
 # the pre-#167 contract this type could not be written at all, because teardown was the store's
@@ -81,6 +93,12 @@ Nitro.Workers.get_task_info(s::DataOnlyStore, id::String) = lock(() -> get(s.row
 Nitro.Workers.set_task!(s::DataOnlyStore, id::String, t::TaskInfo) = lock(() -> (s.rows[id] = t), s.lk)
 Nitro.Workers.replace_task!(s::DataOnlyStore, id::String, t::TaskInfo) = lock(() -> (s.rows[id] = t), s.lk)
 Nitro.Workers.delete_task!(s::DataOnlyStore, id::String) = (lock(() -> delete!(s.rows, id), s.lk); nothing)
+Nitro.Workers.try_delete_task!(s::DataOnlyStore, id::String, from; run_id) = lock(s.lk) do
+    t = get(s.rows, id, nothing)
+    (t === nothing || !(t.status in from) || !(run_id === nothing || t.run_id == run_id)) && return false
+    delete!(s.rows, id)
+    return true
+end
 
 function Nitro.Workers.add_watcher!(s::DataOnlyStore, id::String, user_id::String)
     lock(s.lk) do
@@ -1224,7 +1242,7 @@ end
     # The inversion of #29/#166. That pair made `shutdown!` a REQUIRED store method, so a
     # backend owning nothing had to write `shutdown!(::MyStore) = nothing` out loud -- which
     # closed the instance and left the class open: every future backend still had to get
-    # teardown right. `DataOnlyStore` below implements the 15 data-and-policy rows and NOTHING
+    # teardown right. `DataOnlyStore` below implements the 16 data-and-policy rows and NOTHING
     # else, and it cannot exist on the pre-#167 contract.
     @test isempty(missing_store_methods(DataOnlyStore))
     @test !hasmethod(shutdown!, Tuple{DataOnlyStore})
@@ -2016,8 +2034,8 @@ end
         status_a = get_task_status(task_id, Owner("user-a"); runtime=rt_store)
         @test status_a[:id] == task_id
 
-        # user-b cannot check status (throws AuthorizationError)
-        @test_throws AuthorizationError get_task_status(task_id, Owner("user-b"); runtime=rt_store)
+        # user-b cannot check status, and is told exactly what a missing id gets (#323)
+        @test is_not_found(get_task_status(task_id, Owner("user-b"); runtime=rt_store))
 
         # The bypass still exists, but it is now a value you have to name.
         @test get_task_status(task_id, System(); runtime=rt_store)[:id] == task_id
@@ -2053,7 +2071,7 @@ end
 
         # 4. Cancellation access control
         # user-b cannot cancel user-a's task
-        @test_throws AuthorizationError cancel_task(task_id, Owner("user-b"); runtime=rt_store)
+        @test is_not_found(cancel_task(task_id, Owner("user-b"); runtime=rt_store))
 
         # user-a can cancel their own task
         cancel_res = cancel_task(task_id, Owner("user-a"); runtime=rt_store)
@@ -2083,7 +2101,7 @@ end
         @test get_task_status(task_id, Owner("backend-service"); runtime=rt_store)[:owner] == "browser-client"
 
         # Nobody else is admitted by the grant.
-        @test_throws AuthorizationError get_task_status(task_id, Owner("stranger"); runtime=rt_store)
+        @test is_not_found(get_task_status(task_id, Owner("stranger"); runtime=rt_store))
 
         # Granting an identity that is already a watcher is a no-op, owner included.
         again = submit_task("solo", () -> "x", Owner("alice");
@@ -2116,7 +2134,7 @@ end
         @test_throws AuthorizationError submit_task("shared-index", () -> "x", Owner("bob");
                                                    scope=:global, watchers=[Owner("mallory")],
                                                    runtime=rt_store)
-        @test_throws AuthorizationError get_task_status(gid, Owner("mallory"); runtime=rt_store)
+        @test is_not_found(get_task_status(gid, Owner("mallory"); runtime=rt_store))
 
         # The refused submit must not have persisted the grants that preceded the
         # refusal: a submit that raised should not have handed out any access.
@@ -2124,7 +2142,7 @@ end
                                                    scope=:global,
                                                    watchers=[Owner("bob"), Owner("mallory")],
                                                    runtime=rt_store)
-        @test_throws AuthorizationError get_task_status(gid, Owner("bob"); runtime=rt_store)
+        @test is_not_found(get_task_status(gid, Owner("bob"); runtime=rt_store))
 
         # An in-org grantee the authorizer accepts still goes through.
         @test submit_task("shared-index", () -> "x", Owner("victim");
@@ -2174,7 +2192,7 @@ end
         again = submit_task("long-job", () -> "second", Owner("owner-a"); runtime=rt_store)
         @test again == task_id
         @test wait_for(() -> get_task_status(task_id, Owner("owner-a"); runtime=rt_store)[:result] == "second") == :ok
-        @test_throws AuthorizationError get_task_status(task_id, Owner("helper"); runtime=rt_store)
+        @test is_not_found(get_task_status(task_id, Owner("helper"); runtime=rt_store))
     finally
         notify(started)
         reset_runtime!(rt_store)
@@ -3076,7 +3094,7 @@ end
         @test isempty(get_task_info(store, uid).watchers)
         @test get_task_status(uid, Owner("alice"); runtime=rt_store)[:id] == uid
         @test get_task_status(uid, Owner("alice"); runtime=rt_store)[:owner] == "alice"
-        @test_throws AuthorizationError get_task_status(uid, Owner("mallory"); runtime=rt_store)
+        @test is_not_found(get_task_status(uid, Owner("mallory"); runtime=rt_store))
         # It still lists for its owner, with no watcher entry backing that up.
         @test length(get_all_tasks(Owner("alice"); runtime=rt_store)) == 1
 
@@ -3089,7 +3107,7 @@ end
         empty!(ginfo.watchers)
         set_task!(store, gid, ginfo)
 
-        @test_throws AuthorizationError get_task_status(gid, Owner("gus"); runtime=rt_store)
+        @test is_not_found(get_task_status(gid, Owner("gus"); runtime=rt_store))
         @test get_task_status(gid, System(); runtime=rt_store)[:id] == gid
         @test isempty(get_all_tasks(Owner("gus"); runtime=rt_store))
     finally
@@ -3176,7 +3194,7 @@ end
         notify(release)
         @test wait_for(() -> get_task_status(owner_id, Owner("owner"); runtime=rt_store)[:status] == "COMPLETED") == :ok
         @test get_task_status(owner_id, Owner("owner"); runtime=rt_store)[:result] == "owner-result"
-        @test_throws AuthorizationError get_task_status(owner_id, Owner("attacker"); runtime=rt_store)
+        @test is_not_found(get_task_status(owner_id, Owner("attacker"); runtime=rt_store))
 
         # Terminal state is gated on the sequential path too.
         @test_throws AuthorizationError submit_sequential_task(
@@ -3225,8 +3243,8 @@ end
 
         # The escalation the issue reports: reading and cancelling across users.
         @test get_task_status(a_id, Owner("user-a"); runtime=rt_store)[:result] == "victim-secret"
-        @test_throws AuthorizationError get_task_status(a_id, Owner("user-b"); runtime=rt_store)
-        @test_throws AuthorizationError cancel_task(a_id, Owner("user-b"); runtime=rt_store)
+        @test is_not_found(get_task_status(a_id, Owner("user-b"); runtime=rt_store))
+        @test is_not_found(cancel_task(a_id, Owner("user-b"); runtime=rt_store))
     finally
         notify(release)
         reset_runtime!(rt_store)
@@ -3254,8 +3272,8 @@ end
 
         # The refused submit left no trace on the victim's task.
         @test get_task_status(owner_id, Owner("victim"); runtime=rt_store)[:watcher_count] == 1
-        @test_throws AuthorizationError get_task_status(owner_id, Owner("attacker"); runtime=rt_store)
-        @test_throws AuthorizationError cancel_task(owner_id, Owner("attacker"); runtime=rt_store)
+        @test is_not_found(get_task_status(owner_id, Owner("attacker"); runtime=rt_store))
+        @test is_not_found(cancel_task(owner_id, Owner("attacker"); runtime=rt_store))
 
         notify(release)
         @test wait_for(() -> get_task_status(owner_id, Owner("victim"); runtime=rt_store)[:status] == "COMPLETED") == :ok
@@ -3315,7 +3333,7 @@ end
         status = get_task_status(owner_id, Owner("teammate"); runtime=rt_store)
         @test status[:result] == "shared-result"
         @test status[:watcher_count] == 2
-        @test_throws AuthorizationError get_task_status(owner_id, Owner("stranger"); runtime=rt_store)
+        @test is_not_found(get_task_status(owner_id, Owner("stranger"); runtime=rt_store))
 
         # The hook is not consulted for a user who already watches the task.
         seen[] = nothing
@@ -3327,7 +3345,7 @@ end
         # set_watch_authorizer! — asserted here so the behavior cannot drift silently.
         @test wait_for(() -> get_task_status(owner_id, Owner("owner"); runtime=rt_store)[:result] == "re-run") == :ok
         @test get_task_status(owner_id, Owner("owner"); runtime=rt_store)[:watcher_count] == 1
-        @test_throws AuthorizationError get_task_status(owner_id, Owner("teammate"); runtime=rt_store)
+        @test is_not_found(get_task_status(owner_id, Owner("teammate"); runtime=rt_store))
     finally
         notify(release)
         reset_runtime!(rt_store)
@@ -4052,6 +4070,154 @@ end
         finally
             stop_cleanup_scheduler!(rt)
         end
+    end
+end
+
+
+@testset "#323: a denial is a 403, and a foreign task reads exactly like a missing one" begin
+    app = App(mod = @__MODULE__)
+    store = InMemoryWorkerStore()
+    install!(app; store = store)
+    set_queue_authorizer!(store, (queue, uid) -> uid != "mallory")
+    gate = Channel{Nothing}(1)
+
+    urlpatterns(app, "",
+        path("/submit", function (req)
+            q = getquery(req)
+            id = submit_task(app, q["key"], () -> (take!(gate); "done"), Owner(q["uid"]))
+            return Res.json(Dict("id" => id))
+        end),
+        # The corrected tutorial recipe: NOT_FOUND is a 404, whoever's task it is.
+        path("/status", function (req)
+            q = getquery(req)
+            s = get_task_status(app, q["id"], Owner(q["uid"]))
+            s[:status] == "NOT_FOUND" && return Res.json(Dict("error" => "unknown task"); status = 404)
+            return Res.json(s)
+        end),
+    )
+    get_(target) = internalrequest(app, HTTP.Request("GET", target))
+
+    try
+        # Refused by the queue authorizer: a 403 with a fixed body, never a 500.
+        denied = get_("/submit?uid=mallory&key=probe")
+        @test denied.status == 403
+        @test JSON.parse(Nitro.text(denied)) == Dict("message" => "403: Forbidden")
+
+        ok = get_("/submit?uid=alice&key=payroll")
+        @test ok.status == 200
+        alice_id = JSON.parse(Nitro.text(ok))["id"]
+        @test alice_id == "alice::payroll"
+
+        # The oracle, closed: bob probing alice's real id and a made-up id cannot tell them apart.
+        foreign = get_("/status?uid=bob&id=$(HTTP.escapeuri(alice_id))")
+        missing_id = get_("/status?uid=bob&id=$(HTTP.escapeuri("alice::nothing-here"))")
+        @test foreign.status == missing_id.status == 404
+        @test Nitro.text(foreign) == Nitro.text(missing_id)
+        @test get_("/status?uid=alice&id=$(HTTP.escapeuri(alice_id))").status == 200
+
+        # Same for cancel, and a foreign cancel changes nothing.
+        rt = worker_runtime(app)
+        @test is_not_found(cancel_task(alice_id, Owner("bob"); runtime = rt))
+        @test is_not_found(cancel_task("alice::nothing-here", Owner("bob"); runtime = rt))
+        @test get_task_status(alice_id, Owner("alice"); runtime = rt)[:status] in ("PENDING", "RUNNING")
+    finally
+        put!(gate, nothing)
+        uninstall!(app; drain_timeout = 5)
+    end
+end
+
+@testset "#323: a grant on a NEW :global key is checked against the submitter, not an empty list" begin
+    store = InMemoryWorkerStore()
+    rt = WorkerRuntime(store)
+    org = Dict("alice" => "acme", "bob" => "acme", "eve" => "evil")
+    try
+        # The documented shape. On an empty list `first(watchers)` threw BoundsError -> a 500.
+        set_watch_authorizer!(store, (key, watchers, uid) -> org[first(watchers)] == org[uid])
+        gid = submit_task("team-report", () -> "ok", Owner("alice"); scope = :global,
+                          watchers = [Owner("bob")], runtime = rt)
+        @test wait_for(() -> get_task_status(gid, Owner("bob"); runtime = rt)[:status] == "COMPLETED") == :ok
+
+        # An `all(...)` hook was VACUOUSLY TRUE on the empty list, so a cross-org grant passed.
+        set_watch_authorizer!(store, (key, watchers, uid) -> all(w -> org[w] == org[uid], watchers))
+        @test_throws AuthorizationError submit_task("team-report-2", () -> "ok", Owner("alice");
+                                                    scope = :global, watchers = [Owner("eve")], runtime = rt)
+        # ...and a refused submit wrote nothing.
+        @test is_not_found(get_task_status("team-report-2", System(); runtime = rt))
+    finally
+        reset_runtime!(rt)
+    end
+end
+
+@testset "#323: release_task! reclaims a finished task, admin-only and run-fenced" begin
+    store = InMemoryWorkerStore()
+    rt = WorkerRuntime(store)
+    gate = Channel{Nothing}(1)
+    try
+        # A squatted :global key: alice ran it first, so bob is refused until retention runs.
+        gid = submit_task("warm-price-cache", () -> "alice's", Owner("alice"); scope = :global, runtime = rt)
+        @test wait_for(() -> get_task_status(gid, System(); runtime = rt)[:status] == "COMPLETED") == :ok
+        @test_throws AuthorizationError submit_task("warm-price-cache", () -> "bob's", Owner("bob");
+                                                    scope = :global, runtime = rt)
+
+        # Admin only, by dispatch.
+        @test_throws MethodError release_task!(gid, Owner("alice"); runtime = rt)
+
+        @test release_task!(gid, System(); runtime = rt) == Dict{Symbol, Any}(:status => "Task released")
+        @test is_not_found(get_task_status(gid, System(); runtime = rt))
+        @test is_not_found(release_task!(gid, System(); runtime = rt))
+
+        # The key is free again: bob's submit now creates it, and bob can read it.
+        @test submit_task("warm-price-cache", () -> "bob's", Owner("bob"); scope = :global, runtime = rt) == gid
+        @test wait_for(() -> get_task_status(gid, Owner("bob"); runtime = rt)[:status] == "COMPLETED") == :ok
+        @test get_task_status(gid, Owner("bob"); runtime = rt)[:result] == "bob's"
+
+        # An unfinished task is refused, and left alone.
+        running = submit_task("slow", () -> (take!(gate); "slow"), Owner("carol"); runtime = rt)
+        refused = release_task!(running, System(); runtime = rt)
+        @test occursin("cancel it", refused[:error])
+        @test get_task_status(running, Owner("carol"); runtime = rt)[:status] in ("PENDING", "RUNNING")
+
+        # The fence itself: a delete addressed to another run removes nothing.
+        record = get_task_info(store, gid)
+        @test !try_delete_task!(store, gid, (COMPLETED,); run_id = Nitro.Workers.uuid4())
+        @test !try_delete_task!(store, gid, (PENDING,); run_id = record.run_id)
+        @test get_task_info(store, gid) !== nothing
+        @test try_delete_task!(store, gid, (COMPLETED,); run_id = record.run_id)
+        @test get_task_info(store, gid) === nothing
+    finally
+        put!(gate, nothing)
+        reset_runtime!(rt)
+    end
+end
+
+@testset "#323: a successor's durable grant does not authorize a live predecessor" begin
+    # Two runtimes over one store: rt1 still hosts alice's cancelled-but-running run while rt2
+    # re-runs the key for bob. Bob is authorized on the SUCCESSOR's record only, so reading
+    # through rt1 must serve him the successor -- never alice's run on bob's grant.
+    store = InMemoryWorkerStore()
+    rt1 = WorkerRuntime(store)
+    rt2 = WorkerRuntime(store)
+    gate = Channel{Nothing}(1)
+    set_watch_authorizer!(store, (key, watchers, uid) -> uid == "bob")
+    try
+        gid = submit_task("shared-job", () -> (take!(gate); "alice's"), Owner("alice");
+                          scope = :global, runtime = rt1)
+        @test wait_for(() -> get_active_task_info(rt1, gid) !== nothing) == :ok
+        @test cancel_task(gid, Owner("alice"); runtime = rt1)[:status] == "Task cancelled"
+
+        @test submit_task("shared-job", () -> "bob's", Owner("bob"); scope = :global, runtime = rt2) == gid
+        @test wait_for(() -> get_task_status(gid, Owner("bob"); runtime = rt2)[:status] == "COMPLETED") == :ok
+        # rt1 still holds alice's live object, a different run.
+        @test get_active_task_info(rt1, gid) !== nothing
+        @test get_active_task_info(rt1, gid).run_id != get_task_info(store, gid).run_id
+
+        seen = get_task_status(gid, Owner("bob"); runtime = rt1)
+        @test seen[:status] == "COMPLETED"
+        @test seen[:result] == "bob's"
+    finally
+        put!(gate, nothing)
+        reset_runtime!(rt1)
+        reset_runtime!(rt2)
     end
 end
 

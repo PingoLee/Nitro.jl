@@ -250,8 +250,8 @@ function _execute_queued_task(runtime::WorkerRuntime, item::QueueItem)
     # Progress is harmless -- the run overwrites it itself. A concurrent grant lands on this
     # object through `add_watcher!`'s mirror, now that the handles are already published; before
     # the claim was atomic there was a window in which it wrote to nothing. Authorization
-    # survives either way, because `_authorize_or_reload!` re-reads the durable record whenever
-    # the cached one denies.
+    # survives either way, because `_visible_record` re-reads the durable record whenever the
+    # cached one denies.
 
     # Starting is a CLAIMED transition, not an unconditional write. `set_task!` has no
     # precondition, so a `cancel_task` that already claimed PENDING -> CANCELLED was simply
