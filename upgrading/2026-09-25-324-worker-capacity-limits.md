@@ -31,7 +31,12 @@ anything is written (no record, no queued item, no displaced predecessor):
 
 A queue name is declared by `worker_startup(app; queues = [...])`, `start!(app; queues = [...])`, or
 `WorkerRuntime(store; queues = [...])`. `allow_undeclared_queues = true` restores the old
-behavior. The in-memory store's listing also no longer holds the task lock while it scans.
+behavior. The first refusal of each undeclared name is logged at `@warn`. The in-memory store's
+listing also no longer holds the task lock while it scans.
+
+A callback abandoned by `TaskOptions(timeout = …)` keeps counting against `max_concurrent_runs`
+until it actually returns, on either path. While the runtime is at that cap, sequential queues
+**hold** their next item instead of starting it; their submitters are not held.
 
 ### How to find the calls to migrate
 

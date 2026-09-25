@@ -738,6 +738,7 @@ function _execute_task_async(runtime::WorkerRuntime, task_key::String, callback:
             max_attempts = options.retry_on_failure ? options.max_retries : 0
             for retry_count in 0:max_attempts
                 try
+                    handoff = _RunHandoff(handoff)       # a fresh one per attempt
                     result = timeout_call(callback, task_info; timeout=options.timeout, handoff)
                     return _complete_task!(runtime, task_info, result)
                 catch error
@@ -902,6 +903,7 @@ function submit_sequential_task(queue_name::AbstractString, task_key::AbstractSt
     # data minted one per distinct name. Checked before `_start_queue_processor`, so a refused name
     # never mints anything; after `scoped_task_key`, so a malformed key still reports as that.
     if !_queue_declared(runtime, queue_id)
+        _warn_undeclared_queue(runtime, queue_id)
         throw(AuthorizationError(
             "Queue '$queue_id' is not declared on this worker runtime; declare it with " *
             "`start!(app; queues = [...])` / `worker_startup(app; queues = [...])`"))

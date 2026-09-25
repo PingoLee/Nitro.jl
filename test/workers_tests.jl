@@ -4392,11 +4392,13 @@ end
         id = submit_task("job", () -> take!(gate), Owner("u"); runtime = rt)
         @test wait_for(() -> get_active_task_info(rt, id) !== nothing) == :ok
         live = get_active_task_info(rt, id)
-        # Cancelled, but the callback ignores the token, so it still holds the only slot.
-        @test cancel_task(id, Owner("u"); runtime = rt)[:status] == "Task cancelled"
+        # The record goes terminal WITHOUT touching the run's token, so a supersede would be the
+        # first thing to set it. The callback still runs, holding the only slot.
+        @test try_transition!(store, id, (RUNNING,), FAILED; run_id = live.run_id)
+        @test cancel_reason(live) === :none
         @test_throws WorkerCapacityError submit_task("job", () -> "again", Owner("u"); runtime = rt)
-        @test cancel_reason(live) === :user                     # not :superseded
-        @test get_task_info(store, id).run_id == live.run_id    # the record was not replaced
+        @test cancel_reason(live) === :none                     # the refusal superseded nothing
+        @test get_task_info(store, id).run_id == live.run_id    # and replaced no record
     finally
         put!(gate, nothing)
         @test wait_for(() -> capacity_idle(rt)) == :ok
@@ -4520,6 +4522,82 @@ end
     finally
         foreach(_ -> isready(gate) || put!(gate, nothing), 1:2)
         reset_runtime!(rt)
+    end
+end
+
+@testset "#324: a sequential callback abandoned by its deadline counts against the runtime cap" begin
+    store = InMemoryWorkerStore()
+    rt = WorkerRuntime(store; max_concurrent_runs = 1, queues = ["q"])
+    gate = Channel{Nothing}(4)
+    try
+        slow = submit_sequential_task("q", "slow", () -> take!(gate), Owner("u"); runtime = rt,
+                                      options = TaskOptions(timeout = 1))
+        @test wait_for(() -> get_task_status(slow, System(); runtime = rt)[:status] == "FAILED"; timeout = 10.0) == :ok
+        # Still running, so it holds the runtime's only slot...
+        @test wait_for(() -> rt.async_runs[] == 1) == :ok
+        @test_throws WorkerCapacityError submit_task("async", () -> "x", Owner("u"); runtime = rt)
+        # ...and the queue HOLDS its next item instead of starting another callback beside it.
+        next_id = submit_sequential_task("q", "next", () -> "ran", Owner("u"); runtime = rt)
+        sleep(0.5)
+        @test get_task_status(next_id, System(); runtime = rt)[:status] == "PENDING"
+
+        put!(gate, nothing)                   # the abandoned callback returns
+        @test wait_for(() -> get_task_status(next_id, System(); runtime = rt)[:status] == "COMPLETED") == :ok
+        @test wait_for(() -> capacity_idle(rt)) == :ok
+    finally
+        foreach(_ -> isready(gate) || put!(gate, nothing), 1:2)
+        reset_runtime!(rt)
+    end
+end
+
+@testset "#324: a retried run that then times out still keeps its slot (one handoff per attempt)" begin
+    store = InMemoryWorkerStore()
+    rt = WorkerRuntime(store; max_concurrent_runs = 1)
+    gate = Channel{Nothing}(2)
+    attempts = Threads.Atomic{Int}(0)
+    try
+        # Attempt 1 fails fast; attempt 2 (after the 2 s backoff) ignores its deadline.
+        id = submit_task("flaky", function ()
+                Threads.atomic_add!(attempts, 1) == 0 && error("first attempt fails")
+                take!(gate)
+            end, Owner("u"); runtime = rt,
+            options = TaskOptions(retry_on_failure = true, max_retries = 1, timeout = 1))
+        @test wait_for(() -> get_task_status(id, System(); runtime = rt)[:status] == "FAILED"; timeout = 15.0) == :ok
+        @test attempts[] == 2
+        @test rt.async_runs[] == 1
+        @test_throws WorkerCapacityError submit_task("other", () -> "x", Owner("u"); runtime = rt)
+        put!(gate, nothing)
+        @test wait_for(() -> capacity_idle(rt)) == :ok
+    finally
+        foreach(_ -> isready(gate) || put!(gate, nothing), 1:2)
+        reset_runtime!(rt)
+    end
+end
+
+@testset "#324: reset_runtime! zeroes the capacity counters; a refused undeclared queue warns once" begin
+    rt = WorkerRuntime(InMemoryWorkerStore())
+    gate = Channel{Nothing}(1)
+    try
+        submit_task("held", () -> take!(gate), Owner("u"); runtime = rt)
+        @test rt.async_runs[] == 1
+        reset_runtime!(rt)
+        @test capacity_idle(rt)
+    finally
+        put!(gate, nothing)
+        reset_runtime!(rt)
+    end
+
+    rt2 = WorkerRuntime(InMemoryWorkerStore())
+    try
+        @test_logs (:warn, r"undeclared queue") match_mode = :any begin
+            @test_throws AuthorizationError submit_sequential_task("typo-queue", "k", () -> 1, Owner("u"); runtime = rt2)
+        end
+        # Once per name: the second refusal is silent at the default level.
+        @test_logs min_level = Base.CoreLogging.Warn begin
+            @test_throws AuthorizationError submit_sequential_task("typo-queue", "k", () -> 1, Owner("u"); runtime = rt2)
+        end
+    finally
+        reset_runtime!(rt2)
     end
 end
 

@@ -591,7 +591,9 @@ filled it hung every other user's request. It now refuses at once, and the clien
 
 A run counts against the cap until its callback **actually returns**. That includes a callback
 abandoned by `TaskOptions(timeout=…)`, because the deadline ends the wait, not the work, and the
-callback still holds a thread.
+callback still holds a thread. A sequential callback abandoned that way counts too, and while the
+runtime is at its cap the sequential queues **hold** their next item rather than start it beside
+the one still running. Their submitters are never held: a full queue still refuses at once.
 
 The limits are set when a runtime is built, so choose them by building one:
 

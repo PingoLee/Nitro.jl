@@ -239,11 +239,23 @@ end
 # compare-and-set: the callback's task moves `:running -> :done` when it returns, the waiter moves
 # `:running -> :abandoned` when it gives up. If the waiter wins, the callback's task releases on its
 # way out; if the callback wins, it was done after all and the waiter takes its answer.
+#
+# ONE PER ATTEMPT, never re-armed. A retry after a failed attempt used to reset the same object to
+# `:running`, and if the previous attempt's callback task ran its `finally` only after that reset,
+# it flipped the new attempt's state to `:done`: the next deadline could then never claim
+# `:abandoned`, the waiter blocked until the callback returned, and the reservation was released
+# early. A fresh handoff per attempt has no such history; the caller checks the last one.
+#
+# `on_abandon` runs on the WAITER's side when it wins, before it throws. The sequential path uses it
+# to count the abandoned callback against the runtime-wide cap (#324), since it keeps a thread.
 mutable struct _RunHandoff
     @atomic state::Symbol
     const release::Function
+    const on_abandon::Function
 end
-_RunHandoff(release::Function) = _RunHandoff(:running, release)
+_RunHandoff(release::Function, on_abandon::Function = () -> nothing) =
+    _RunHandoff(:running, release, on_abandon)
+_RunHandoff(h::_RunHandoff) = _RunHandoff(h.release, h.on_abandon)   # the next attempt's
 
 _handed_off(h::_RunHandoff) = (@atomic h.state) === :abandoned
 
@@ -274,11 +286,6 @@ function timeout_call(callback::Function, task_info::TaskInfo; timeout::Int=3600
         return _invoke_task_callback(callback, task_info)
     end
 
-    # One handoff serves every attempt of a run, and each attempt starts from `:running`. A
-    # previous attempt's callback has always RETURNED by now (`:done`): a timeout is terminal and
-    # never retried, so `:abandoned` is never re-armed.
-    handoff === nothing || _handed_off(handoff) || (@atomic handoff.state = :running)
-
     result_channel = Channel{Any}(1)
     error_channel = Channel{Any}(1)
 
@@ -307,6 +314,7 @@ function timeout_call(callback::Function, task_info::TaskInfo; timeout::Int=3600
     timed_out = wait_result == :timed_out &&
                 (handoff === nothing || (@atomicreplace handoff.state :running => :abandoned).success)
     if timed_out
+        handoff === nothing || handoff.on_abandon()
         # Ask, because we cannot tell. The task above keeps running until the callback
         # returns; this is the only thing that can make it stop, and only if it polls.
         _request_cancel!(task_info, :timeout)

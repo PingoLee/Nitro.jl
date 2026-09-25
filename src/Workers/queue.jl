@@ -252,7 +252,11 @@ function _execute_queued_task(runtime::WorkerRuntime, item::QueueItem)
         rethrow()
     end
     task_info === nothing && (_release_run!(runtime, item.run_id); return nothing)
-    handoff = _RunHandoff(() -> _release_run!(runtime, item.run_id))
+    # A sequential callback abandoned by its deadline also counts against the RUNTIME cap until
+    # it returns: the processor moves on to the next item, so without this each queue could add
+    # one still-running callback per timeout, with nothing bounding them.
+    handoff = _RunHandoff(() -> _release_run!(runtime, item.run_id),
+                          () -> _count_abandoned!(runtime, item.run_id))
 
     # From here `task_info` is a snapshot of THIS run's record -- on `InMemoryWorkerStore` the
     # very object the registry holds, on `PormGWorkerStore` a fresh deserialization of its row.
@@ -321,6 +325,7 @@ function _execute_queued_task(runtime::WorkerRuntime, item::QueueItem)
         max_attempts = item.options.retry_on_failure ? item.options.max_retries : 0
         for retry_count in 0:max_attempts
             try
+                handoff = _RunHandoff(handoff)           # a fresh one per attempt
                 result = timeout_call(item.callback, task_info; timeout=item.options.timeout, handoff)
                 return _complete_task!(runtime, task_info, result)
             catch error
@@ -412,6 +417,16 @@ function _start_queue_processor(runtime::WorkerRuntime, queue_name::String)
                     # The item has left the buffer, so its slot is free for the next submit
                     # (#324). Its OWNER's reservation lasts until the run ends.
                     _release_queue_slot!(queue)
+
+                    # While the runtime is at its cap, hold this item rather than start it
+                    # (#324). Abandoned sequential callbacks count toward the cap, so this is what
+                    # stops a queue of timing-out callbacks from piling up threads one per
+                    # deadline. It pauses the QUEUE, never a submitter: new submits still fail fast
+                    # once the buffer fills. A teardown ends the pause, and the item is then
+                    # abandoned below like any other.
+                    while _runtime_saturated(runtime) && !(@atomic queue.draining)
+                        sleep(0.05)
+                    end
 
                     # BEFORE `_mark_queue_current_task!` and before `_execute_queued_task`'s
                     # `_claim_run!`, so once `draining` is visible no further run starts,

@@ -14,7 +14,9 @@ refuses a submission **before anything is written**, with a [`WorkerCapacityErro
 - `max_concurrent_runs` (default `64`): async runs (`submit_task`) in flight at once, runtime-wide
   (Sidekiq's concurrency, River's `MaxWorkers`). Past it, `:runtime`, a `503`. `nothing` removes
   the cap. A run counts until its callback actually returns, including one abandoned by
-  `TaskOptions(timeout=…)`, because it still holds a thread.
+  `TaskOptions(timeout=…)`, because it still holds a thread. A **sequential** callback abandoned by
+  its deadline counts too, and while the runtime is at its cap the sequential queues hold their
+  next item rather than start it.
 - `max_runs_per_owner` (default `nothing`, off): one owner's live runs across both submit paths,
   queued or executing. Past it, `:owner`, a `429`. It counts this runtime's runs only; it is not
   a deployment-wide quota.
@@ -63,7 +65,7 @@ data and the tenant, so two runtimes over one store correctly share one security
 | `cleanup_scheduler` | The retention sweep, or `nothing` |
 | `active_tasks` / `active_task_infos` / `active_lock` | Process-local run handles. Keyed by task id, but each entry describes one **run**. [`shutdown!`](@ref) drains against these and keeps whatever outlives the wait (#176) |
 | `max_concurrent_runs` / `max_runs_per_owner` / `allow_undeclared_queues` | The limits above, fixed at construction |
-| `declared_queues` / `initial_queues` | The queue names a submit may use (under `queue_lock`), and the constructor's set, which `reset_runtime!` restores |
+| `declared_queues` / `initial_queues` / `warned_queues` | The queue names a submit may use (under `queue_lock`), the constructor's set, which `reset_runtime!` restores, and the undeclared names already logged (bounded) |
 | `reservations` / `owner_runs` / `async_runs` / `reservation_lock` | One entry per live run, keyed by `run_id`, and the counts the limits read. `reservation_lock` is a leaf: nothing else is locked, and no store or app code runs, while it is held |
 
 `active_task_infos` is the live-`TaskInfo` cache, and it lives here for **both** backends. It was
@@ -94,6 +96,7 @@ struct WorkerRuntime{S <: AbstractWorkerStore}
     allow_undeclared_queues::Bool
     initial_queues::Vector{String}
     declared_queues::Set{String}
+    warned_queues::Set{String}                       # undeclared names already warned about
 
     reservations::Dict{UUID, Tuple{String, Bool}}   # run_id => (owner, is_async)
     owner_runs::Dict{String, Int}
@@ -123,6 +126,7 @@ struct WorkerRuntime{S <: AbstractWorkerStore}
             allow_undeclared_queues,
             initial,
             Set{String}(initial),
+            Set{String}(),
             Dict{UUID, Tuple{String, Bool}}(),
             Dict{String, Int}(),
             Ref(0),
@@ -147,6 +151,27 @@ end
 function _queue_declared(runtime::WorkerRuntime, name::String)
     runtime.allow_undeclared_queues && return true
     return lock(() -> name in runtime.declared_queues, runtime.queue_lock)
+end
+
+const _UNDECLARED_QUEUE_WARNINGS = 16
+
+# A refused undeclared queue is logged ONCE per name, at `@warn`, for at most
+# `_UNDECLARED_QUEUE_WARNINGS` names per runtime. The refusal itself is an `AuthorizationError`,
+# whose 403 is logged at `@debug` without its message, and an undeclared name is usually a
+# deployment mistake (an app that relied on queues being minted on first use) that would
+# otherwise surface as 403s nothing logs. Bounded because the name can come from request data;
+# truncated and `repr`-escaped for the same reason.
+function _warn_undeclared_queue(runtime::WorkerRuntime, name::String)
+    fresh = lock(runtime.queue_lock) do
+        name in runtime.warned_queues && return false
+        length(runtime.warned_queues) >= _UNDECLARED_QUEUE_WARNINGS && return false
+        push!(runtime.warned_queues, name)
+        return true
+    end
+    fresh && @warn "Nitro.Workers: refused a submit to an undeclared queue; declare it in " *
+                   "`worker_startup(app; queues = [...])`, or build the runtime with " *
+                   "`allow_undeclared_queues = true`" queue = repr(first(name, 64))
+    return nothing
 end
 
 # A slot in `queue`'s buffer, as a compare-and-set loop on its counter -- no lock, because the
@@ -221,6 +246,29 @@ function _reserve_capacity!(runtime::WorkerRuntime, queue::Union{Nothing, Sequen
         rethrow()
     end
     return nothing
+end
+
+# A sequential run abandoned by its deadline keeps a thread until its callback returns, so from
+# then on it counts against `max_concurrent_runs` like an async run: its reservation is
+# reclassified, and `_release_run!` gives the runtime slot back with the owner's when the callback
+# returns. A no-op if the reservation is already gone (the callback returned first) or already
+# counted.
+function _count_abandoned!(runtime::WorkerRuntime, run_id::UUID)
+    lock(runtime.reservation_lock) do
+        entry = Base.get(runtime.reservations, run_id, nothing)
+        (entry === nothing || entry[2]) && return nothing
+        runtime.reservations[run_id] = (entry[1], true)
+        runtime.async_runs[] += 1
+        return nothing
+    end
+    return nothing
+end
+
+# At or past the runtime-wide cap. The sequential processors read it to hold their next item.
+function _runtime_saturated(runtime::WorkerRuntime)
+    cap = runtime.max_concurrent_runs
+    cap === nothing && return false
+    return lock(() -> runtime.async_runs[] >= cap, runtime.reservation_lock)
 end
 
 function _release_capacity!(runtime::WorkerRuntime, queue::Union{Nothing, SequentialQueue}, run_id::UUID)
