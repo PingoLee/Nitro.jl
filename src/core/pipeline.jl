@@ -28,7 +28,9 @@ function _app_context_seed(ctx::App)
         return function(req::HTTP.Request)
             haskey(req.context, REQUEST_CONTEXT_KEY) ||
                 (req.context[REQUEST_CONTEXT_KEY] = ctx.app_context[])
-            return @with SERVING_APP => ctx handler(req)
+            # The field cap (#327) rides the same scope: the parsers that enforce it cannot see
+            # the `App`, and a typed `ScopedValue{Int64}` keeps `Any` off the hot path.
+            return @with SERVING_APP => ctx Constants.REQUEST_MAX_FIELDS => ctx.service.max_fields[] handler(req)
         end
     end
 end

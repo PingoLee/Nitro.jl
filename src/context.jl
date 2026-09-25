@@ -7,7 +7,7 @@ using ..Types
 # Unexported from `Types` on purpose: `CopyOnWriteDict` is internal plumbing for `compose`,
 # so it is named explicitly here rather than widened onto `Core`'s reexport surface.
 using ..Types: CopyOnWriteDict, RouteMiddleware
-using ..Constants: SHUTDOWN_TIMEOUT_SECONDS
+using ..Constants: SHUTDOWN_TIMEOUT_SECONDS, DEFAULT_MAX_FIELDS
 
 export App, EagerReviseService, Service, wait, close, isopen
 export set_extension!, get_extension, delete_extension!, has_extension
@@ -76,6 +76,9 @@ end
     extensions            :: Dict{Symbol, Any}      = Dict{Symbol, Any}()
     extensions_lock       :: ReentrantLock          = ReentrantLock()
     shutdown_timeout      :: Ref{Float64}           = Ref{Float64}(SHUTDOWN_TIMEOUT_SECONDS)
+    # `serve(max_fields = …)`, read once per request by the pipeline's outermost layer, which
+    # binds it as `REQUEST_MAX_FIELDS` for the request's extent (#327). `0` means unlimited.
+    max_fields            :: Ref{Int64}             = Ref{Int64}(DEFAULT_MAX_FIELDS)
 end
 
 """

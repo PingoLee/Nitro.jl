@@ -1,9 +1,12 @@
 module BodyParsers
 
-using HTTP 
+using HTTP
 using JSON
+using Dates: Dates
+using UUIDs: UUID
 using ..Util
-using ...Errors: is_unrecoverable
+using ...Errors: is_unrecoverable, ValidationError
+using ...Constants: REQUEST_MAX_FIELDS
 
 export text, binary, json, formdata, multipart, FormFile
 
@@ -27,26 +30,196 @@ end
 
 const EMPTY_FORM_DATA = Dict{String,String}()
 
+# ── Nitro's read style for typed client JSON (#306) ─────────────────────────────
+#
+# Julia never frees an interned `Symbol`, so building one from a client string is unbounded,
+# unauthenticated memory growth. JSON.jl's default style does exactly that for two field types:
+# `StructUtils.lift(::Type{Symbol}, x) = Symbol(x)`, and `lift(::Type{<:Enum}, x)` interns the
+# string *before* looking it up, so even an invalid enum name stays in memory for good. Every
+# typed parse of client input -- `Json{T}`, `json(req, T)`, `parseparam`'s JSON fallback, the
+# struct binder behind `Query{T}`/`Form{T}`/`Header{T}`/`Path{T}`/`JsonFragment{T}` -- passes
+# this style instead. JSON.jl (>= 1.5.2; the compat floor is 1.9) wraps a caller's style and
+# forwards `lift` to it after turning its internal `PtrString` into a `String`, so these methods
+# see a plain string and can match an enum by name without interning it.
+#
+# `Symbol` itself is refused at route registration (`interns_client_strings`); the `lift` method
+# below is the backstop for a `Symbol` reached some other way.
+const _SU = JSON.StructUtils
+
+"""
+    NitroReadStyle
+
+The `StructUtils` style every typed parse of client JSON goes through. It differs from JSON.jl's
+default in what it refuses to do with a client string: it never interns one as a `Symbol` (#306).
+Not part of the public API.
+"""
+struct NitroReadStyle <: _SU.StructStyle end
+const NITRO_READ_STYLE = NitroReadStyle()
+
+"""
+    enum_from_string(E, s) :: E
+
+The member of enum `E` whose name is `s`, found by comparing names rather than by building
+`Symbol(s)`, so an unknown name is not interned. `Symbol(inst)` returns the member's own name,
+which is interned already. Throws an `ArgumentError` that does not repeat `s`.
+"""
+function enum_from_string(::Type{E}, s::AbstractString) :: E where {E<:Enum}
+    for inst in instances(E)
+        String(Symbol(inst)) == s && return inst
+    end
+    throw(ArgumentError("not a valid $E name"))
+end
+
+_SU.lift(st::NitroReadStyle, ::Type{E}, x::AbstractString) where {E<:Enum} =
+    (enum_from_string(E, x), _SU.defaultstate(st))
+_SU.lift(st::NitroReadStyle, ::Type{E}, x::Integer) where {E<:Enum} =
+    (E(x), _SU.defaultstate(st))
+
+const _SYMBOL_REFUSED = "Nitro never builds a Symbol from request input (#306); declare an @enum, or a String checked against an allow-list"
+_SU.lift(::NitroReadStyle, ::Type{Symbol}, x) = throw(ArgumentError(_SYMBOL_REFUSED))
+_SU.liftkey(::NitroReadStyle, ::Type{Symbol}, x) = throw(ArgumentError(_SYMBOL_REFUSED))
+
+# A float field must receive a finite value (#327). JSON itself has no NaN or Infinity, but it has
+# no size limit either: JSON.jl reads `1e999`, or a 400-digit integer, as a `BigFloat`/`BigInt`,
+# and converting that to a `Float64` field is `Inf`. The `Union` bound also covers a
+# `Nullable{Float64}` field, which is lifted with its union type, not the float alone.
+#
+# Base's own float types only, not every `AbstractFloat`: an app's `StructUtils.lift(::StructStyle,
+# ::Type{MyFloat}, x)` for its own float type would otherwise be ambiguous with this method, and
+# every request binding that field would fail.
+function _SU.lift(st::NitroReadStyle, ::Type{T}, x::Real) where {T <: Union{Base.IEEEFloat, BigFloat, Nothing, Missing}}
+    value, state = @invoke _SU.lift(st::_SU.StructStyle, T::Type, x::Any)
+    value isa AbstractFloat && !isfinite(value) && throw(ArgumentError("not a finite number"))
+    return value, state
+end
+
+"""
+    interns_client_strings(T) :: Bool
+
+Whether binding request input to `T` could build a `Symbol` from a client string (#306): `T` is
+`Symbol`, or contains one anywhere a value is read into -- a `Union` member, an element, key or
+value type, a tuple slot, a struct field. A dictionary keyed by an enum counts too: JSON.jl lifts
+dictionary keys with its own conversion, which interns an enum name before looking it up.
+
+Route registration refuses such a parameter, and `json(req, T)` refuses such a `T`. An enum
+*value* is fine: every Nitro path matches it by name without interning.
+"""
+interns_client_strings(@nospecialize(T)) :: Bool = _interns(T, Base.IdSet{Any}())
+
+# `json(req, T)` asks once per request, and the walk allocates and costs tens of microseconds --
+# more than parsing a small body. The answer depends only on `T`, so it is cached per type. Under
+# a lock: requests run on many threads, and an `IdDict` is not safe to read while another writes.
+const _INTERNS_CACHE = IdDict{Any, Bool}()
+const _INTERNS_LOCK = ReentrantLock()
+interns_client_strings_cached(@nospecialize(T)) :: Bool =
+    lock(() -> get!(() -> interns_client_strings(T), _INTERNS_CACHE, T), _INTERNS_LOCK)
+
+function _interns(@nospecialize(T), seen::Base.IdSet{Any}) :: Bool
+    T === Symbol && return true
+    T === Any && return false
+    T isa TypeVar && return _interns(T.ub, seen)
+    T isa UnionAll && return _interns(Base.unwrap_unionall(T), seen)
+    T isa Union && return _interns(T.a, seen) || _interns(T.b, seen)
+    T isa DataType || return false
+    T in seen && return false
+    push!(seen, T)
+    # An unwrapped `UnionAll` (`Vector` -> `Array{T,1}`) still has free type variables, which
+    # `eltype`/`fieldtypes` cannot resolve; its parameters (each a `TypeVar` bound) can be.
+    Base.has_free_typevars(T) &&
+        return any(p -> (p isa Type || p isa TypeVar) && _interns(p, seen), T.parameters)
+    # Values of these types are parsed or matched without ever building a Symbol.
+    T <: Union{Number, AbstractString, AbstractChar, Enum, Dates.TimeType, UUID, Regex, Nothing, Missing} &&
+        return false
+    if T <: AbstractDict
+        K, V = keytype(T), valtype(T)
+        (K isa Type && K <: Enum) && return true
+        return _interns(K, seen) || _interns(V, seen)
+    end
+    T <: Union{AbstractArray, AbstractSet} && return _interns(eltype(T), seen)
+    T <: Tuple && return any(t -> _interns(Base.unwrapva(t), seen), T.parameters)
+    isstructtype(T) || return false
+    return any(t -> _interns(t, seen), fieldtypes(T))
+end
+
 # HTTP.jl v2 replaced the raw `Vector{UInt8}` request body (and `HTTP.payload`) with the
-# `AbstractBody` hierarchy. Extract the bytes without consuming the body cursor so the
+# `AbstractBody` hierarchy. Read the bytes without consuming the body cursor so the
 # same request body can be read more than once (e.g. `.json` and `.form`). Responses may
 # additionally retain their body as a raw `Vector{UInt8}` or `String` (v2 keeps byte/string
 # bodies as-is so fixtures can inspect `response.body` directly), so handle those too.
-_body_bytes(::HTTP.EmptyBody) = UInt8[]
-_body_bytes(body::HTTP.BytesBody) = Vector{UInt8}(body.data)
-_body_bytes(::Nothing) = UInt8[]
-_body_bytes(body::AbstractVector{UInt8}) = Vector{UInt8}(body)
-_body_bytes(body::AbstractString) = Vector{UInt8}(codeunits(String(body)))
+#
+# A VIEW of the body's bytes, never a copy (#327). Every reader used to start from its own
+# `Vector{UInt8}` copy, and `text` made a second, so `payload(req)` -- or CSRF reading the form
+# and then the JSON -- made about four transient copies: ~256 MB for one 64 MiB body. The
+# parsers now read this view in place and copy only what they hand out.
+#
+# It must never reach `String(::Vector{UInt8})`: that constructor takes over the vector's memory
+# and leaves the vector EMPTY, which here would erase the request body for every later reader.
+# `_view_string` is the one sanctioned way to a `String`.
+_body_view(::HTTP.EmptyBody) = UInt8[]
+_body_view(body::HTTP.BytesBody) = body.data
+_body_view(::Nothing) = UInt8[]
+_body_view(body::AbstractVector{UInt8}) = body
+_body_view(body::AbstractString) = codeunits(body)
+
+# The body as a `String`: no copy when it already is one (a `String` body is stored as its code
+# units), otherwise exactly one. Not `String(Vector{UInt8}(bytes))`: on Julia 1.12 that copies
+# twice, because `String(::Vector)` still copies memory not allocated for a string.
+_view_string(bytes::Base.CodeUnits{UInt8, String}) = bytes.s
+_view_string(bytes::DenseVector{UInt8}) = GC.@preserve bytes unsafe_string(pointer(bytes), length(bytes))
+_view_string(bytes::AbstractVector{UInt8}) = String(collect(bytes))
 
 function _request_payload(req::HTTP.Request)
-    payload = _body_bytes(req.body)
+    payload = _body_view(req.body)
     return isempty(payload) ? nothing : payload
 end
 
 function _request_payload(res::HTTP.Response)
-    payload = _body_bytes(res.body)
+    payload = _body_view(res.body)
     return isempty(payload) ? nothing : payload
 end
+
+### Media types
+
+# The media type of a `Content-Type` value: everything before the first `;`, trimmed and
+# lowercased (RFC 9110 §8.3.1: type and subtype are case-insensitive; parameters follow `;`).
+#
+# Byte by byte, lowercasing ASCII only. A header value may carry obs-text (bytes >= 0x80) that is
+# not valid UTF-8, and `lowercase(::String)` throws `InvalidCharError` on such a string -- a 500
+# with a logged backtrace from every JSON accessor, for one malformed header. No valid media type
+# has a byte outside ASCII, so any such byte simply fails to match.
+function _media_type(content_type::AbstractString) :: String
+    bytes = codeunits(content_type)
+    stop = something(findfirst(==(UInt8(';')), bytes), length(bytes) + 1) - 1
+    first_ = findfirst(b -> b != UInt8(' ') && b != UInt8('\t'), view(bytes, 1:stop))
+    first_ === nothing && return ""
+    last_ = findlast(b -> b != UInt8(' ') && b != UInt8('\t'), view(bytes, 1:stop))
+    out = Vector{UInt8}(undef, last_ - first_ + 1)
+    for (k, b) in enumerate(view(bytes, first_:last_))
+        out[k] = UInt8('A') <= b <= UInt8('Z') ? b + 0x20 : b
+    end
+    return String(out)
+end
+
+"""
+    is_json_media_type(content_type) :: Bool
+
+Whether a `Content-Type` value names JSON: `application/json`, or any `application/*+json`
+(`application/problem+json`, `application/vnd.api+json`), compared case-insensitively with
+parameters such as `charset` ignored. An empty value -- no `Content-Type` -- is not JSON (#327).
+"""
+function is_json_media_type(content_type::AbstractString) :: Bool
+    mt = _media_type(content_type)
+    return mt == "application/json" || (startswith(mt, "application/") && endswith(mt, "+json"))
+end
+
+"""
+    is_multipart_form_media_type(content_type) :: Bool
+
+Whether a `Content-Type` value is `multipart/form-data`, compared case-insensitively with the
+`boundary` and other parameters ignored.
+"""
+is_multipart_form_media_type(content_type::AbstractString) :: Bool =
+    _media_type(content_type) == "multipart/form-data"
 
 ### Bounded JSON parsing (#314)
 
@@ -100,9 +273,15 @@ implicit root array, so it recurses one level deeper than the count -- immateria
 
 `ArgumentError` is what `JSON.parse` itself throws on malformed input, so a too-deep document
 lands on every caller's existing "not JSON" path. The message names the limit, never the input.
+
+With `max_keys > 0` the same pass also counts object keys -- every `:` outside a string, which in
+JSON separates a key from its value and appears nowhere else -- and throws a `ValidationError`
+past `max_keys` (#327). A key cap is not "malformed JSON" but a refused request, so it is a 400
+everywhere rather than the "not JSON" answer the depth bound gives.
 """
-function _check_json_depth(bytes::AbstractVector{UInt8})
+function _check_json_depth(bytes::AbstractVector{UInt8}, max_keys::Int = 0)
     depth = 0
+    keys = 0
     instring = false
     escaped = false
     for b in bytes
@@ -121,23 +300,56 @@ function _check_json_depth(bytes::AbstractVector{UInt8})
             depth > MAX_JSON_DEPTH && _throw_json_too_deep()
         elseif (b == UInt8(']') || b == UInt8('}')) && depth > 0
             depth -= 1
+        elseif b == UInt8(':') && max_keys > 0
+            keys += 1
+            keys > max_keys && _throw_too_many_fields("The JSON document", max_keys)
         end
     end
     return nothing
 end
 
-_check_json_depth(s::AbstractString) = _check_json_depth(codeunits(s))
+_check_json_depth(s::AbstractString, max_keys::Int = 0) = _check_json_depth(codeunits(s), max_keys)
+
+# The field cap (#327): one message for every source, naming the source and the cap -- never a
+# key, which is client input.
+@noinline _throw_too_many_fields(source::String, cap::Int) =
+    throw(ValidationError("$source has more than $cap fields"))
 
 """
-    _parse_json_bounded(buf, T = Any; kwargs...)
+    _check_field_count(s, source) -> nothing
+
+Throw a `ValidationError` if the `&`-separated string `s` (a query string or an urlencoded form
+body) holds more non-empty fields than the cap in force, `REQUEST_MAX_FIELDS` (#327). Counted
+before the fields are parsed into a `Dict`, whose string hashing a client choosing its own keys
+can collide. Stops counting at the first field past the cap.
+"""
+function _check_field_count(s::AbstractString, source::String)
+    cap = Int(REQUEST_MAX_FIELDS[])
+    cap > 0 || return nothing
+    n = 0
+    for field in eachsplit(s, '&')
+        isempty(field) && continue
+        n += 1
+        n > cap && _throw_too_many_fields(source, cap)
+    end
+    return nothing
+end
+
+"""
+    _parse_json_bounded(buf, T = Any; max_fields = REQUEST_MAX_FIELDS[], kwargs...)
 
 `JSON.parse(buf, T; kwargs...)` after `_check_json_depth`. The one way Nitro parses JSON
 that came from a request -- body, query string, path segment, cookie, or JWT segment -- so the
 parser's recursion is bounded by `MAX_JSON_DEPTH` and never by the input (#314).
 Throws `ArgumentError` for a too-deep document, like any other malformed one.
+
+The same pass caps the document's object keys at `max_fields` -- the request's
+`serve(max_fields = …)` by default, `0` for none -- throwing a `ValidationError` past it (#327).
+The `HTTP.Response` parsers pass `0`: a response is not client input.
 """
-function _parse_json_bounded(buf::Union{AbstractVector{UInt8}, AbstractString}, ::Type{T} = Any; kwargs...) where {T}
-    _check_json_depth(buf)
+function _parse_json_bounded(buf::Union{AbstractVector{UInt8}, AbstractString}, ::Type{T} = Any;
+                             max_fields::Integer = REQUEST_MAX_FIELDS[], kwargs...) where {T}
+    _check_json_depth(buf, Int(max_fields))
     return JSON.parse(buf, T; kwargs...)
 end
 
@@ -149,13 +361,11 @@ end
 Read the body of a HTTP.Request as a String
 """
 function text(req::HTTP.Request) :: String
-    body = IOBuffer(_body_bytes(req.body))
-    return eof(body) ? "" : read(seekstart(body), String)
+    return _view_string(_body_view(req.body))
 end
 
 function text(res::HTTP.Response) :: String
-    payload = _request_payload(res)
-    return isnothing(payload) ? "" : String(payload)
+    return _view_string(_body_view(res.body))
 end
 
 
@@ -167,13 +377,21 @@ Read the html form data from the body of a HTTP.Request
 function formdata(req::HTTP.Request) :: Dict{String,String}
     # multipart/form-data is not urlencoded — parsing it here yields a garbage
     # key. Use `getfiles(req)` / `getpost(req)` (or `multipart(req)`) for multipart bodies.
-    if occursin("multipart/form-data", HTTP.header(req, "Content-Type", ""))
+    #
+    # Nor is a body that declares itself JSON (#327). `payload(req)` reads the form of every
+    # request, so a JSON body whose string values held `=` and `&` -- ordinary HTML -- used to
+    # merge junk "form" keys into it, and with the field cap would answer 400 for a JSON body
+    # with one key.
+    content_type = HTTP.header(req, "Content-Type", "")
+    if is_multipart_form_media_type(content_type) || is_json_media_type(content_type)
         return copy(EMPTY_FORM_DATA)
     end
     body = text(req)
     if isnothing(body) || !occursin('=', body)
         return copy(EMPTY_FORM_DATA)
     end
+    # Outside the `try`: too many fields is a refused request (a 400), not "no form" (#327).
+    _check_field_count(body, "The form body")
     try
         return HTTP.queryparams(body)
     catch e
@@ -205,18 +423,12 @@ end
 Read the body of a HTTP.Request as a Vector{UInt8}
 """
 function binary(req::HTTP.Request) :: Vector{UInt8}
-    body = IOBuffer(_body_bytes(req.body))
-    return eof(body) ? UInt8[] : readavailable(body)
+    # A fresh vector the caller owns: mutating it never touches the body other readers see.
+    return Vector{UInt8}(_body_view(req.body))
 end
 
 function binary(res::HTTP.Response) :: Vector{UInt8}
-    payload = _request_payload(res)
-    if isnothing(payload)
-        return UInt8[]
-    elseif payload isa AbstractVector{UInt8}
-        return Vector{UInt8}(payload)
-    end
-    return Vector{UInt8}(codeunits(String(payload)))
+    return Vector{UInt8}(_body_view(res.body))
 end
 
 
@@ -226,7 +438,9 @@ end
 Read the body of a HTTP.Request as JSON with additional arguments for the read/serializer.
 
 Returns `nothing` when the body is empty or is not JSON -- including a document nested deeper
-than 512 arrays/objects, which is rejected before parsing (#314).
+than 512 arrays/objects, which is rejected before parsing (#314). A document with more object keys
+than `serve(max_fields = …)` allows is not "not JSON" but a refused request: a `ValidationError`,
+answered `400` (#327).
 """
 function json(req::HTTP.Request; kwargs...)
     payload = _request_payload(req)
@@ -245,6 +459,8 @@ function json(req::HTTP.Request; kwargs...)
         # rethrow stays for what the bound does not cover -- `OutOfMemoryError`, an
         # `InterruptException`, or a regression in the bound itself.
         is_unrecoverable(e) && rethrow()
+        # Too many keys (#327) is a refusal, not malformed input: let it answer 400.
+        e isa ValidationError && rethrow()
         return nothing
     end
 end
@@ -255,7 +471,8 @@ function json(res::HTTP.Response; kwargs...)
         return nothing
     end
     try
-        return _parse_json_bounded(payload; kwargs...)
+        # No field cap: a response is not client input.
+        return _parse_json_bounded(payload; max_fields = 0, kwargs...)
     catch e
         # Same contract and bound as the `Request` method above (#254, #314). This one reads
         # a RESPONSE body, so it is not the attacker-reachable path -- it is here because the
@@ -270,15 +487,42 @@ end
 
 Read the body of a HTTP.Request as JSON with additional arguments for the read/serializer into a custom struct.
 
-Throws `ArgumentError` when the body is not JSON, including a document nested deeper than 512
-arrays/objects (#314).
+Throws a `ValidationError` -- a `400` when raised in a handler -- when the body does not bind as
+a `T`: not JSON, nested deeper than 512 arrays/objects (#314), or the wrong shape (#326). Its
+message never quotes the body; the parse error is kept on `.cause`. Calling this on an
+`HTTP.Response` is unchanged and rethrows the parse error itself: a response is not client input.
+
+The body is client input, so it is always parsed with Nitro's read style, which never interns a
+client string as a `Symbol` (#306): an enum field binds by name or by integer. A float field
+must receive a finite value (#327): `1e999`, which JSON.jl reads as a `BigFloat` and would
+convert to `Inf`, is rejected. A `T` that would bind a `Symbol` anywhere (see
+`interns_client_strings`) is refused, and so is passing `style` or `allownan = true`; all three
+are an `ArgumentError`.
 """
 function json(req::HTTP.Request, class_type::Type{T}; kwargs...) where {T}
+    haskey(kwargs, :style) && throw(ArgumentError(
+        "json(req, T) parses client input with Nitro's read style (#306); `style` cannot be overridden"))
+    # JSON.jl returns a `Float64` field straight from its number reader, without `lift`, so the
+    # style's finite check cannot see a NaN that `allownan` let through (#327).
+    get(kwargs, :allownan, false) != false && throw(ArgumentError(
+        "json(req, T) never binds NaN or Infinity from client input (#327); `allownan` is refused"))
+    interns_client_strings_cached(T) && throw(ArgumentError("json(req, $T): " * _SYMBOL_REFUSED))
     payload = _request_payload(req)
     if isnothing(payload)
         return nothing
     end
-    return _parse_json_bounded(payload, class_type; kwargs...)
+    try
+        return _parse_json_bounded(payload, class_type; style = NITRO_READ_STYLE, kwargs...)
+    catch e
+        # A body that does not bind is client input: a `ValidationError` (a 400), like the
+        # `Json{T}` extractor answers the same body (#326). Rethrown raw it was a 500, and the
+        # log line quoted the payload -- a parse `ArgumentError` echoes the offending bytes, so a
+        # submitted password landed in the error log. The message here is value-free; the
+        # original is kept on `.cause`, which no Nitro output path renders (#130).
+        is_unrecoverable(e) && rethrow()
+        e isa ValidationError && rethrow()
+        throw(ValidationError("Could not bind the request body as $T", e))
+    end
 end
 
 function json(res::HTTP.Response, class_type::Type{T}; kwargs...) where {T}
@@ -286,7 +530,7 @@ function json(res::HTTP.Response, class_type::Type{T}; kwargs...) where {T}
     if isnothing(payload)
         return nothing
     end
-    return _parse_json_bounded(payload, class_type; kwargs...)
+    return _parse_json_bounded(payload, class_type; max_fields = 0, kwargs...)
 end
 
 
@@ -335,6 +579,10 @@ function multipart(req::HTTP.Request) :: Dict{String, Union{FormFile, Vector{For
     if isnothing(parts)
         return result
     end
+
+    # The part list is a plain vector; the hash tables below are what the cap protects (#327).
+    cap = Int(REQUEST_MAX_FIELDS[])
+    cap > 0 && length(parts) > cap && _throw_too_many_fields("The multipart body", cap)
 
     # Collect files and text into separate, homogeneously-typed buckets. This
     # keeps the per-field vectors correctly typed (`Vector{FormFile}` /

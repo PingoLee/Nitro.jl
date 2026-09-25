@@ -110,7 +110,11 @@ getquery(req::HTTP.Request) = Types.queryvars(req)
 
 Returns the parsed JSON request body, or `nothing` when the body is empty or malformed —
 including a body nested deeper than 512 arrays/objects, which is rejected before it is parsed
-(#314).
+(#314) — or when the request's `Content-Type` is not JSON (`application/json` or
+`application/*+json`; a missing header counts as not JSON). A cross-site page can send
+`text/plain` or no type without a CORS preflight, so a body that does not declare itself JSON is
+not read as JSON (#327) -- and so [`payload`](@ref) and `CSRFMiddleware`'s JSON token lookup,
+which read through this accessor, do not see it either.
 
 Parsed **once per request and cached**, so reading it twice is free and both reads return the
 same object — a live handle, not a snapshot. This is the accessor handler code wants.
@@ -120,6 +124,7 @@ call, takes `kwargs`, has a typed `json(req, T)` form, and also works on an `HTT
 The relationship mirrors `getparams(req)` (cached, decoded) versus `HTTP.getparams(req)` (raw).
 """
 getjson(req::HTTP.Request) = request_cache!(req, REQUEST_JSON_CACHE_KEY) do
+    Util.BodyParsers.is_json_media_type(HTTP.header(req, "Content-Type", "")) || return nothing
     Types.jsonbody(req)
 end
 

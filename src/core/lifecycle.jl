@@ -93,6 +93,7 @@ function serve(ctx::App;
     samesite=nothing,
     shutdown_timeout=SHUTDOWN_TIMEOUT_SECONDS,
     max_body_bytes=missing,
+    max_fields=DEFAULT_MAX_FIELDS,
     kwargs...)::Union{Server, Nothing}
 
     # FIRST, before any validation or context mutation, so a rejected call leaves the context
@@ -153,6 +154,13 @@ function serve(ctx::App;
     body_limit = ismissing(max_body_bytes) ? DEFAULT_MAX_BODY_BYTES :
                  max_body_bytes === nothing ? zero(Int64) : Int64(max_body_bytes)
 
+    # Same reasoning again (#327): read on every request, so refused here. An integer count, not
+    # a `Bool` (`true` would silently mean 1) and not negative; `0` means unlimited.
+    # The upper bound is checked here too, so the `Int64(max_fields)` below cannot throw after
+    # the App has already been mutated.
+    (max_fields isa Integer && !(max_fields isa Bool) && 0 <= max_fields <= typemax(Int64)) ||
+        throw(ArgumentError("`max_fields` must be an integer >= 0 (0 means unlimited), got $(repr(max_fields))"))
+
     # Before any mutation, like the checks above (#315). A malformed prefix is refused here
     # rather than served as a listener that answers 404 to every request.
     global_prefix = _normalize_prefix(prefix)
@@ -192,6 +200,7 @@ function serve(ctx::App;
     # Stored rather than passed through, because the *blocking* `serve()` calls `terminate()`
     # from its own `finally` (the Ctrl-C path) with no way to hand it a keyword.
     ctx.service.shutdown_timeout[] = Float64(shutdown_timeout)
+    ctx.service.max_fields[] = Int64(max_fields)
 
     if revise == :lazy || revise == :eager
         if parallel && Threads.nthreads() > 1

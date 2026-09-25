@@ -89,6 +89,12 @@ function list_products(req, filters::Query{ProductFilters})
 end
 ```
 
+Each field binds by its name, under the same rules as a scalar parameter of its type:
+`Nullable{Int}`, an `@enum` (by integer value or by name), `UUID`, `Date`. A query key that is not
+a field of the struct is ignored. Nitro only ever looks up the struct's own field names, so what a
+client sends beyond them costs nothing. A plain struct (no `@kwdef`) works too: an absent field
+binds `nothing` if its type admits it, and is otherwise a `400`.
+
 ## Validation
 
 You can use the extractor's second argument to enforce business rules before the handler runs.

@@ -5,6 +5,7 @@ using Nitro.Types
 using Test
 using HTTP
 using Dates
+using JSON
 
 struct User
     id::Int
@@ -18,22 +19,13 @@ struct BoundaryStore <: Nitro.Types.AbstractSessionStore{String, Dict{String,Any
 Base.get(::BoundaryStore, ::String, default) =
     SessionPayload(Dict{String,Any}("user_id" => 7), Dates.now(Dates.UTC))
 
-# Stages the boundary case `expires == now` against the real clock, which is otherwise
-# unstageable: the payload is minted ON READ, so its `expires` clock read and the read path's
-# own `Dates.now(UTC)` are microseconds apart. `DateTime` has millisecond resolution, so the
-# two land in the SAME tick nearly every time -- exactly the payload `<` served and `<=`
-# refuses. Deliberately NOT an AbstractSessionStore: that is what routes the `Session{T}`
-# extractor down its `SessionPayload` fallback (#173).
-struct SameTickStore end
-Base.get(::SameTickStore, ::String, default) =
-    SessionPayload(Dict{String,Any}("user_id" => 7), Dates.now(Dates.UTC))
-
 @testset "Nitro Session via App Context Tests" begin
 
-    # 1. Setup a simple store in App Context
-    session_store = Dict{String, User}()
+    # 1. Setup a session store in App Context. It was a plain `Dict{String, User}` until #327:
+    #    the extractor now reads only an `AbstractSessionStore{String}` context.
+    session_store = MemoryStore{String, User}()
     user1 = User(1, "John Doe")
-    session_store["session-abc-123"] = user1
+    set_session!(session_store, "session-abc-123", user1; ttl = 3600)
 
     # 2. Define a route that uses the Session extractor
     # By default, it looks for a cookie named "session"
@@ -221,36 +213,62 @@ Base.get(::SameTickStore, ::String, default) =
         probe()                                                              # warm up
         @test count(_ -> !isempty(probe()), 1:N) == 0
 
-        # 4. The `Session{T}` extractor's SessionPayload fallback -- the site that said `<`.
-        #    Reachable ONLY through a store that is NOT an AbstractSessionStore but DOES hold
-        #    SessionPayloads; an AbstractSessionStore takes the `get_session` branch above and
-        #    never reaches it, which is why this line had no coverage at all before #173.
+        # 4. The `Session{T}` extractor. It had a `SessionPayload` fallback of its own for a
+        #    non-store context -- the site that said `<` -- until #327 made it read only an
+        #    `AbstractSessionStore`, through `get_session`. So its boundary IS path 2 above; this
+        #    pins that the extractor really goes through it, on the same minted-on-read store.
         urlpatterns("",
             path("/boundary", function(req, session::Session{Dict{String,Any}})
                 return isnothing(session.payload) ? "Expired" : "Active"
             end, method="GET"),
         )
-
-        # A payload comfortably in the past, and one comfortably in the future -- basic
-        # regression cover for a branch that had none. NOTE: these two pass under `<` too;
-        # they are coverage, not the boundary.
-        raw = Dict{String, SessionPayload{Dict{String,Any}}}()
-        raw["past-id"] = SessionPayload(d, Dates.now(Dates.UTC) - Second(10))
-        raw["live-id"] = SessionPayload(d, Dates.now(Dates.UTC) + Hour(1))
-        @test text(internalrequest(
-            Request("GET", "/boundary", ["Cookie" => "session=past-id"]); context=raw)) == "Expired"
-        @test text(internalrequest(
-            Request("GET", "/boundary", ["Cookie" => "session=live-id"]); context=raw)) == "Active"
-
-        # THE boundary, on the extractor. Assumes only that the wall clock does not step
-        # BACKWARDS between the store's clock read and the extractor's; an NTP step back
-        # between the two would serve one iteration and read as a mysterious flake.
-        same_tick = SameTickStore()
+        internalrequest(Request("GET", "/boundary", ["Cookie" => "session=any"]); context=BoundaryStore())
         served = count(1:N) do _
             text(internalrequest(
-                Request("GET", "/boundary", ["Cookie" => "session=any"]); context=same_tick)) == "Active"
+                Request("GET", "/boundary", ["Cookie" => "session=any"]); context=BoundaryStore())) == "Active"
         end
         @test served == 0
+    end
+
+    # ── #327: the extractor reads only a session store ──────────────────────────────────
+    @testset "a non-store context is never indexed by the cookie (#327)" begin
+        configcookies(secret_key=nothing)
+        urlpatterns("",
+            path("/whoami", function(req, session::Session{Dict{String,Any}})
+                return isnothing(session.payload) ? "anonymous" : JSON.json(session.payload)
+            end, method="GET"),
+        )
+        # The audit's repro: the app context is CONFIGURATION, and the cookie names an entry.
+        config = Dict{String,Any}("admin_defaults" => Dict{String,Any}("role" => "admin"))
+        req() = Request("GET", "/whoami", ["Cookie" => "session=admin_defaults"])
+        @test text(internalrequest(req(); context=config)) == "anonymous"
+        @test text(internalrequest(req(); context=(admin_defaults = Dict{String,Any}("role" => "admin"),))) == "anonymous"
+
+        # The same entry behind a real store still binds.
+        store = MemoryStore{String, Dict{String,Any}}()
+        set_session!(store, "admin_defaults", Dict{String,Any}("role" => "admin"); ttl = 60)
+        @test text(internalrequest(req(); context=store)) == """{"role":"admin"}"""
+    end
+
+    @testset "a stored value of another type is no session, and Session{Any} binds (#327)" begin
+        configcookies(secret_key=nothing)
+        store = MemoryStore{String, User}()
+        set_session!(store, "sid", User(3, "Ann"); ttl = 60)
+        urlpatterns("",
+            path("/typed", function(req, session::Session{Dict{String,Any}})
+                return isnothing(session.payload) ? "none" : "some"
+            end, method="GET"),
+            path("/any", function(req, session::Session{Any})
+                return isnothing(session.payload) ? "none" : session.payload.name
+            end, method="GET"),
+        )
+        r = internalrequest(Request("GET", "/typed", ["Cookie" => "session=sid"]); context=store)
+        @test r.status == 200
+        @test text(r) == "none"
+        # Was a MethodError in `try_validate`, answered 500.
+        r = internalrequest(Request("GET", "/any", ["Cookie" => "session=sid"]); context=store)
+        @test r.status == 200
+        @test text(r) == "Ann"
     end
 
     @testset "MemoryStore Thread Safety" begin

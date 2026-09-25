@@ -56,7 +56,8 @@ serve(host=HOST, port=port, async=true, show_banner=false, access_log=nothing)
 end
 
 @testset "Test ZonedDateTime within a json body" begin 
-    r = HTTP.post("$localhost/time", body=JSON.json(Dict("time" => "2025-02-02T22:25:31.035+07:00")))
+    r = HTTP.post("$localhost/time", ["Content-Type" => "application/json"],
+                  JSON.json(Dict("time" => "2025-02-02T22:25:31.035+07:00")))
     @test r.status == 200
     @test HTTP.header(r, "Content-Type") == "text/plain; charset=utf-8"
     @test text(r) == "The date is 2025-02-02T22:25:31.035+07:00"

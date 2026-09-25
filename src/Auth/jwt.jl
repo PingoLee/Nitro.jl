@@ -271,7 +271,9 @@ nesting is bounded before the parser recurses (#314). Either decoder failing is
 """
 function _jwt_segment_json(segment::AbstractString; kwargs...)
     try
-        return _parse_json_bounded(String(_base64url_decode(segment)); kwargs...)
+        # No field cap (#327): a segment is already size-bounded, and the cap's `ValidationError`
+        # is not the `AuthError` this function promises. The depth bound still applies.
+        return _parse_json_bounded(String(_base64url_decode(segment)); max_fields = 0, kwargs...)
     catch e
         # Every byte of the segment is attacker-supplied, and BOTH decoders are sinks:
         # `base64decode` throws ArgumentError on a bad alphabet or a length that cannot be

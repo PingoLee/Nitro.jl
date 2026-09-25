@@ -940,3 +940,52 @@ end
     @test [v for (k, v) in r.headers if k == "Allow"] == ["BREW"]
 end
 end
+
+@testitem "An absolute-form target with a malformed authority is not a 500 (#326)" tags=[:core, :security] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+using Nitro: App, Query
+using Nitro.Core.Types: _target_query
+using Nitro.Core.Util: _target_path
+
+# HTTP.jl routes `GET http://h:abc/items?a=1` as `/items` -- the router never parses the
+# authority -- but `HTTP.URI` rejects the port "abc". Nitro read the query and the mount path
+# through `HTTP.URI`, so every route with a query parameter, `Query{T}`, `getquery`, `payload`,
+# and every static mount answered a 500 with a logged backtrace (~1.7 KB of log per request).
+@testset "the target helpers never parse the authority" begin
+    @test _target_query("/items?a=1&b=2") == "a=1&b=2"
+    @test _target_query("http://h:abc/items?a=1#frag") == "a=1"
+    @test _target_query("/items") == ""
+    @test _target_query("/items#x?y") == ""
+    @test _target_path("http://h:abc/static/a.txt?v=1") == "/static/a.txt"
+    @test _target_path("http://h:abc") == "/"
+    @test _target_path("/static/a.txt#top") == "/static/a.txt"
+end
+
+struct Filter
+    a::Int
+end
+root = mktempdir()
+write(joinpath(root, "a.txt"), "static-a")
+
+app = App(mod = @__MODULE__)
+urlpatterns(app, "",
+    path("/items", (req, a::Int) -> string(a)),
+    path("/typed", (req, f::Query{Filter}) -> string(f.payload.a)),
+    path("/raw", req -> getquery(req)["a"]),
+)
+staticfiles(app, root, "static")
+send(t) = internalrequest(app, HTTP.Request("GET", t))
+
+for (target, expected) in (("http://h:abc/items?a=1", "1"),
+                           ("http://h:abc/typed?a=2", "2"),
+                           ("http://h:abc/raw?a=3", "3"))
+    r = send(target)
+    @test r.status == 200
+    @test Nitro.text(r) == expected
+end
+r = send("http://h:abc/static/a.txt")
+@test r.status == 200
+@test Nitro.text(r) == "static-a"
+end

@@ -16,6 +16,13 @@ Base.@kwdef struct PrecompileRecord
     name::String = ""
 end
 
+# A plain (non-`@kwdef`) struct: `Json{T}` hands it to JSON.jl whole rather than field by field,
+# which is a different typed-parse path from `PrecompileRecord`'s.
+struct PrecompilePlain
+    id::Int
+    score::Float64
+end
+
 @compile_workload begin
     ctx = App()
 
@@ -186,6 +193,37 @@ end
                 ["Content-Type" => "application/x-www-form-urlencoded"], "id=1&name=p");
         catch_errors=false,
     )
+
+    # ── Typed JSON under Nitro's read style (#306) ──────────────────────────────────────
+    #
+    # Every typed parse of client JSON passes `NITRO_READ_STYLE` (it never interns a client
+    # string as a `Symbol`), so JSON.jl's own precompiled default-style code no longer applies:
+    # the style's specializations of JSON.jl's parser are Nitro's to cache. Without this block
+    # the first `Json{Dict{String,Any}}` request in a fresh process took ~13 s, twice what it
+    # took under the default style. Warmed over the three shapes typed JSON takes -- a dictionary,
+    # a plain struct parsed whole, and one object of the body (`JsonFragment`) -- plus a body past
+    # the depth bound, whose rejection path is its own compile.
+    Core.Routing.urlpatterns(ctx, "", RouteDefinition[
+        path("/precompile/extract/jsondict", (req::Request, j::Json{Dict{String,Any}}) ->
+             Res.json(j.payload), method="POST"),
+        path("/precompile/extract/jsonplain", (req::Request, j::Json{PrecompilePlain}) ->
+             Res.json(j.payload), method="POST"),
+        path("/precompile/extract/fragment", (req::Request, record::JsonFragment{PrecompileRecord}) ->
+             Res.json(record.payload), method="POST"),
+    ])
+    # The bodies are `Vector{UInt8}`, not `String`: the server's stream reader hands every request
+    # over as a byte vector, and the body is parsed in place (#327), so a `String` body -- which
+    # reaches the parser as `CodeUnits` -- would warm a specialization production never calls.
+    # Measured on `json_bind(Dict{String,Any}, ::Vector{UInt8})` alone: 7 s on the first request.
+    for (target, body) in (
+            ("/precompile/extract/json", "{\"id\":1,\"name\":\"p\"}"),
+            ("/precompile/extract/jsondict", "{\"a\":1,\"b\":[1.5,\"x\"],\"c\":{\"d\":null}}"),
+            ("/precompile/extract/jsondict", repeat("[", 600) * repeat("]", 600)),
+            ("/precompile/extract/jsonplain", "{\"id\":1,\"score\":2.5}"),
+            ("/precompile/extract/fragment", "{\"record\":{\"id\":1,\"name\":\"p\"}}"))
+        Core.internalrequest(ctx, Request("POST", target, ["Content-Type" => "application/json"],
+                                          Vector{UInt8}(body)))
+    end
 
     # ── The error path, at the setting production actually runs (#242) ──────────────────
     #

@@ -6,9 +6,12 @@ using HTTP
 using Dates
 
 using ..Util: text, json, formdata, multipart, parseparam, FormFile
-using ..Util.BodyParsers: _parse_json_bounded
-using ..Reflection: struct_builder, extract_struct_info
-using ..Errors: ValidationError, is_unrecoverable
+using ..Util.BodyParsers: NITRO_READ_STYLE, _parse_json_bounded, _body_view, is_json_media_type,
+    is_multipart_form_media_type
+using ..Reflection: struct_builder, extract_struct_info, kw_construct
+using ..Errors: ValidationError, UnsupportedMediaTypeError, is_unrecoverable
+# The Core stubs `getjson`/`getform` bind to (their bodies are in core/request.jl, included later).
+using ...Core: getjson, getform
 using ..Types
 using ..Cookies
 using ..Crypto: SecretString
@@ -44,7 +47,12 @@ macro extractor(class_name)
 
             # Pass object directly & validator
             $(Symbol(class_name))(payload::T, f::Function) where T = new{T}(payload, f, T)
-            
+
+            # The declared type, whatever the value's runtime type. `extract` builds its result
+            # with this: `X(payload)` is an `X{typeof(payload)}`, which a handler declaring
+            # `X{Any}` (or any abstract `T`) could not accept -- a 500 (#327, the #293 family).
+            $(Symbol(class_name)){T}(payload, validate::Union{Function, Nothing}) where T = new{T}(payload, validate, T)
+
         end
     end |> esc
 end
@@ -130,6 +138,10 @@ With a `@kwdef` struct, a field the body omits takes its declared default: `{"q"
 Attach a validator by giving the parameter a default: `s = Json(Search, s -> s.limit <= 100)`.
 The *Request Body* guide has the walkthrough; use [`JsonFragment`](@ref) to bind one top-level
 key instead of the whole body.
+
+The request must declare a JSON body: `Content-Type: application/json` or an
+`application/*+json` type. Anything else, including no `Content-Type`, is a `415` (#327) — those
+are the types a cross-site page can send without a CORS preflight.
 """
 Json
 
@@ -146,7 +158,7 @@ end; method = "POST")
 ```
 
 The key's value must itself be a JSON object. A body that is not a JSON object, or that lacks
-the key, is a 400.
+the key, is a 400. Like [`Json`](@ref), it needs a JSON `Content-Type`, or it is a 415.
 """
 JsonFragment
 
@@ -234,7 +246,11 @@ validate(type::T) where {T} = true
 This function will try to validate an instance of a type using both global and local validators.
 If both validators pass, the instance is returned. If either fails, a `ValidationError` is thrown.
 """
-function try_validate(param::Param{U}, instance::T) :: T where {T, U <: Extractor{T}}
+function try_validate(param::Param{U}, instance) :: T where {T, U <: Extractor{T}}
+    # `T` comes from the extractor, never from the instance: dispatching on `instance::T` bound
+    # `T` to the value's RUNTIME type, so `Session{Any}` (or `Body{Any}`, `Json{Any}`) holding a
+    # `User` matched no method at all -- a `MethodError`, answered as a 500 (#327, the #293
+    # family). Every caller hands over a value it bound as a `T`; the return type asserts it.
 
     # The message names the parameter, its type, and the validator that rejected it —
     # never the instance. For a body-bound extractor the instance *is* the client's
@@ -245,8 +261,8 @@ function try_validate(param::Param{U}, instance::T) :: T where {T, U <: Extracto
 
     # Case 1: Use global validate function - returns true if one isn't defined for this type
     if !validate(instance)
-        impl = Base.which(validate, (T,))
-        throw(ValidationError("Validation failed for parameter '$(param.name)': $T rejected by $impl"))
+        impl = Base.which(validate, (typeof(instance),))
+        throw(ValidationError("Validation failed for parameter '$(param.name)': $T rejected by $(impl.module).validate"))
     end
 
     # Case 2: Use custom validate function from an Extractor (if defined).
@@ -257,12 +273,23 @@ function try_validate(param::Param{U}, instance::T) :: T where {T, U <: Extracto
     # 500 whenever the value was present. It folds to a constant for a concrete `U`.
     if param.hasdefault && param.default isa U && hasfield(U, :validate) && !isnothing(param.default.validate)
         if !param.default.validate(instance)
-            impl = Base.which(param.default.validate, (T,))
-            throw(ValidationError("Validation failed for parameter '$(param.name)': $T rejected by $impl"))
+            throw(ValidationError("Validation failed for parameter '$(param.name)': $T rejected by $(validator_identity(param.default.validate, param))"))
         end
     end
 
     return instance
+end
+
+# Which validator rejected a value, for `ValidationError.msg`: a function and its module, never a
+# source location (#327). This used to interpolate `Base.which(...)`, which renders as
+# `validate(s::Login) @ Main ~/app/src/handlers.jl:12` -- and `.msg` is what an app returns to a
+# client (`JSON.json(err)` is documented as safe), so every rejection published the deployment's
+# directory layout. An anonymous validator has no name of its own; the parameter it guards is
+# its identity.
+function validator_identity(f::Function, param::Param) :: String
+    name = String(nameof(f))
+    startswith(name, '#') && return "the extractor-local validator of parameter '$(param.name)'"
+    return "$(parentmodule(f)).$name"
 end
 
 """
@@ -292,7 +319,7 @@ function safe_extract(f::Function, param::Param{U}) :: T where {T, U <: Extracto
         #
         # A further wrap site must copy this line too.
         is_unrecoverable(e) && rethrow()
-        if e isa ValidationError
+        if e isa ValidationError || e isa UnsupportedMediaTypeError
             throw(e)
         end
         # If the function fails, we throw a ValidationError with the parameter name and type.
@@ -307,15 +334,28 @@ function safe_extract(f::Function, param::Param{U}) :: T where {T, U <: Extracto
     end
 end
 
+# A body bound as JSON must say it is JSON (#327). `text/plain`, a urlencoded form, multipart, or
+# no Content-Type at all are what a cross-site page can send without a CORS preflight, so reading
+# JSON from them regardless accepts a forged request as readily as the app's own client. The
+# message names the parameter, never the client's Content-Type.
+function require_json_media_type(param::Param, request::LazyRequest)
+    is_json_media_type(HTTP.header(request.request, "Content-Type", "")) && return nothing
+    throw(UnsupportedMediaTypeError(
+        "parameter '$(param.name)' needs a JSON body: Content-Type application/json or application/*+json"))
+end
+
 """
 Extracts a JSON object from a request and converts it into a custom struct
 """
 function extract(param::Param{Json{T}}, request::LazyRequest) :: Json{T} where {T}
+    require_json_media_type(param, request)
     instance = safe_extract(param) do
-        json_bind(T, textbody(request))
+        # Straight from the body's bytes: `textbody` would copy the whole body into a `String`
+        # first, only for JSON.jl to read it back as bytes (#327).
+        json_bind(T, _body_view(request.request.body))
     end
     valid_instance = try_validate(param, instance)
-    return Json(valid_instance)
+    return Json{T}(valid_instance, nothing)
 end
 
 """
@@ -338,11 +378,13 @@ A struct that already speaks StructUtils -- field tags or defaults, as `StructUt
 the per-field path would drop the tags, so a renamed key would silently bind the field's default.
 
 Both parses go through `_parse_json_bounded`, so a body nested deeper than 512 is an
-`ArgumentError` -- a 400 via `safe_extract` -- before `JSON.parse` recurses into it (#314).
+`ArgumentError` -- a 400 via `safe_extract` -- before `JSON.parse` recurses into it (#314). And
+both use Nitro's read style, which never interns a client string as a `Symbol` (#306): JSON.jl's
+default style did so for every enum field, valid name or not.
 """
-function json_bind(::Type{T}, text::AbstractString) :: T where {T}
-    binds_by_keyword(T) || return _parse_json_bounded(text, T)
-    fields = _parse_json_bounded(text, Dict{String, JSON.JSONText})
+function json_bind(::Type{T}, text::Union{AbstractString, AbstractVector{UInt8}}) :: T where {T}
+    binds_by_keyword(T) || return _parse_json_bounded(text, T; style = NITRO_READ_STYLE)
+    fields = _parse_json_bounded(text, Dict{String, JSON.JSONText}; style = NITRO_READ_STYLE)
     kwargs = Pair{Symbol, Any}[]
     for name in fieldnames(T)
         raw = get(fields, String(name), nothing)
@@ -354,9 +396,9 @@ end
 
 # Runs once per `Json{T}` request, so it is ordered cheapest first. The StructUtils queries are
 # plain dispatch and fold for a concrete `T`; `hasmethod` with keyword names is the same
-# `@kwdef` test `multipart_struct_builder` uses, several times cheaper than
-# `Reflection.has_kwdef_constructor`'s scan of `methods(T)`. StructUtils is reached through
-# JSON, whose typed-parse API is built on it, so it is not a dependency of Nitro's own.
+# `@kwdef` test `multipart_struct_builder` and `struct_builder` use, several times cheaper than
+# scanning `methods(T)`. StructUtils is reached through JSON, whose typed-parse API is built on
+# it, so it is not a dependency of Nitro's own.
 const _SU = JSON.StructUtils
 function binds_by_keyword(::Type{T}) :: Bool where {T}
     T isa DataType && isstructtype(T) || return false
@@ -365,45 +407,22 @@ function binds_by_keyword(::Type{T}) :: Bool where {T}
     return hasmethod(T, Tuple{}, fieldnames(T))
 end
 
-# Absent fields follow JSON.jl's own rule: the declared default, else the null the field's type
-# admits, else an error. The keyword constructor applies every default itself, so a field it
-# reports as undefined has none -- fill in the null if its type takes one and try again. Each
-# pass adds a field that was not there before, so this runs at most `fieldcount(T)` times.
-function kw_construct(::Type{T}, kwargs::Vector{Pair{Symbol, Any}}) :: T where {T}
-    while true
-        try
-            return T(; kwargs...)
-        catch e
-            e isa UndefKeywordError || rethrow()
-            name = e.var
-            # Only a keyword of `T`'s own constructor that we did not pass -- anything else was
-            # thrown from deeper inside a default expression and is not ours to answer.
-            (name in fieldnames(T) && !any(p -> p.first === name, kwargs)) || rethrow()
-            ftype = fieldtype(T, name)
-            if Nothing <: ftype
-                push!(kwargs, name => nothing)
-            elseif Missing <: ftype
-                push!(kwargs, name => missing)
-            else
-                throw(ValidationError("Missing required field '$name'"))
-            end
-        end
-    end
-end
-
 """
 Extracts a part of a json object from the body of a request and converts it into a custom struct
 """
 function extract(param::Param{JsonFragment{T}}, request::LazyRequest) :: JsonFragment{T} where {T}
+    require_json_media_type(param, request)
     instance = safe_extract(param) do
         # The fragment lookup belongs INSIDE the guard: a body that is not a JSON object
         # (`MethodError` on `getindex(::Nothing, ::String)`) or one missing this fragment's
         # key (`KeyError`) is client input, and used to escape as a 500 with a backtrace
         # while every sibling extractor returned a 400.
-        struct_builder(T, Types.jsonbody(request)[string(param.name)])
+        #
+        # Through the cached `getjson`, so several fragments of one body parse it once.
+        struct_builder(T, getjson(request.request)[string(param.name)])
     end
     valid_instance = try_validate(param, instance)
-    return JsonFragment(valid_instance)
+    return JsonFragment{T}(valid_instance, nothing)
 end
 
 """
@@ -414,19 +433,21 @@ function extract(param::Param{Body{T}}, request::LazyRequest) :: Body{T} where {
         parseparam(T, textbody(request))
     end
     valid_instance = try_validate(param, instance)
-    return Body(valid_instance)
+    return Body{T}(valid_instance, nothing)
 end
 
 """
 Extracts a Form from a request and converts it into a custom struct
 """
 function extract(param::Param{Form{T}}, request::LazyRequest) :: Form{T} where {T}
-    form = Types.formbody(request)
+    # The cached `getform`, so a handler that also reads `getform`/`payload` -- or CSRFMiddleware,
+    # which reads the form for its token -- does not parse the body again (#327).
+    form = getform(request.request)::Dict{String,String}   # the cache is untyped; keep `Any` off the hot path
     instance = safe_extract(param) do 
         struct_builder(T, form) 
     end
     valid_instance = try_validate(param, instance)
-    return Form(valid_instance) 
+    return Form{T}(valid_instance, nothing)
 end
 
 """
@@ -438,7 +459,7 @@ function extract(param::Param{Path{T}}, request::LazyRequest) :: Path{T} where {
         struct_builder(T, params) 
     end
     valid_instance = try_validate(param, instance)
-    return Path(valid_instance)
+    return Path{T}(valid_instance, nothing)
 end
 
 """
@@ -450,7 +471,7 @@ function extract(param::Param{Query{T}}, request::LazyRequest) :: Query{T} where
         struct_builder(T, params) 
     end
     valid_instance = try_validate(param, instance)
-    return Query(valid_instance)
+    return Query{T}(valid_instance, nothing)
 end
 
 """
@@ -462,7 +483,7 @@ function extract(param::Param{Header{T}}, request::LazyRequest) :: Header{T}  wh
         struct_builder(T, headers) 
     end
     valid_instance = try_validate(param, instance)
-    return Header(valid_instance)
+    return Header{T}(valid_instance, nothing)
 end
 
 """
@@ -499,7 +520,7 @@ function extract(param::Param{Cookie{T}}, request::LazyRequest, secret_key::Unio
     end
     
     valid_instance = try_validate(param, instance)
-    return Cookie(cookie_name, valid_instance)
+    return Cookie{T}(cookie_name, valid_instance)
 end
 
 """
@@ -528,25 +549,17 @@ function extract(param::Param{Session{T}}, request::LazyRequest, secret_key::Uni
     # app_context is expected to be a Context object
     store = app_context.payload
 
-    if store isa AbstractSessionStore
-        instance = get_session(store, val)
-        if isnothing(instance)
-            return Session(session_cookie_name, T)
-        end
-
-        valid_instance = try_validate(param, instance)
-        return Session(session_cookie_name, valid_instance)
+    # Only a session store is read (#327). Any other context used to be indexed directly by the
+    # cookie's value -- meant for a `Dict` of sessions, but a context that was the app's
+    # CONFIGURATION let `Cookie: session=admin_defaults` bind that config entry as the session,
+    # and without a `secret_key` the client picks the cookie value freely.
+    if !(store isa AbstractSessionStore{String})
+        @warn "Session{T} reads only an AbstractSessionStore{String} app context; this one is not a store, so no Session{T} parameter will ever bind a session" context_type = typeof(store) maxlog = 1
+        return Session(session_cookie_name, T)
     end
-    
-    # We assume the store is a Dict-like object or support get()
+
     instance = try
-        if hasmethod(Base.get, (typeof(store), String, Any))
-            Base.get(store, val, nothing)
-        elseif hasmethod(Base.get, (typeof(store), Symbol, Any))
-            Base.get(store, Symbol(val), nothing)
-        else
-            nothing
-        end
+        get_session(store, val)
     catch e
         # The store is application code, so "it threw" means "no session for this id" and the
         # extractor falls back. The three in `is_unrecoverable` are not that (#254).
@@ -554,20 +567,14 @@ function extract(param::Param{Session{T}}, request::LazyRequest, secret_key::Uni
         nothing
     end
 
-    if isnothing(instance)
+    # A stored value of another type is not this parameter's session. It used to reach
+    # `try_validate` with the wrong type and fail there as a 500 (the #293 family).
+    if isnothing(instance) || !(instance isa T)
         return Session(session_cookie_name, T)
     end
 
-    # Handle built-in SessionPayload with expiry checking
-    if instance isa SessionPayload
-        if is_expired(instance)
-            return Session(session_cookie_name, T)
-        end
-        instance = instance.data
-    end
-    
     valid_instance = try_validate(param, instance)
-    return Session(session_cookie_name, valid_instance)
+    return Session{T}(session_cookie_name, valid_instance)
 end
 
 """
@@ -638,7 +645,7 @@ its file parts into a single typed struct `T`.
 | Field type                  | Source                                            |
 |-----------------------------|---------------------------------------------------|
 | `String`                    | single text field (by field name)                 |
-| `T <: Number`, `Bool`       | single text field, parsed                         |
+| `T <: Number`, `Bool`       | single text field, parsed; a float must be finite |
 | `Vector{String}`            | all text fields under that name                   |
 | `FormFile`                  | single uploaded file (by field name)              |
 | `Vector{FormFile}`          | all uploaded files under that name                |
@@ -648,8 +655,9 @@ For a `@kwdef struct`, a field absent from the body falls back to its declared d
 an absent `Union{X, Nothing}` field always binds to `nothing` (taking precedence over a
 default). A required field (no default, no `Nothing` in its type) that is absent is an error.
 
-Throws a `ValidationError` (→ 400) when the body is not multipart, a required field is
-missing, a value cannot be parsed, or `validate(::T)` / an extractor-local validator fails.
+A request whose `Content-Type` is not `multipart/form-data` is an `UnsupportedMediaTypeError`
+(→ 415). Throws a `ValidationError` (→ 400) when a required field is missing, a value cannot be
+parsed, or `validate(::T)` / an extractor-local validator fails.
 
 ```julia
 struct ImportUpload
@@ -672,8 +680,9 @@ function extract(param::Param{MultipartForm{T}}, request::LazyRequest) :: Multip
     # and gets a specific "Missing field 'X'" error instead of a misleading
     # "Content-Type must be multipart/form-data".
     content_type = HTTP.header(request.request, "Content-Type", "")
-    if !occursin("multipart/form-data", content_type)
-        throw(ValidationError("Content-Type must be multipart/form-data for parameter: $(param.name)"))
+    if !is_multipart_form_media_type(content_type)
+        # 415, like a JSON extractor given the wrong type (#327). It was a 400.
+        throw(UnsupportedMediaTypeError("parameter '$(param.name)' needs a multipart/form-data body"))
     end
 
     parsed = multipartbody(request)
@@ -681,7 +690,7 @@ function extract(param::Param{MultipartForm{T}}, request::LazyRequest) :: Multip
         multipart_struct_builder(T, parsed)
     end
     valid_instance = try_validate(param, instance)
-    return MultipartForm(valid_instance)
+    return MultipartForm{T}(valid_instance, nothing)
 end
 
 """
@@ -730,9 +739,15 @@ multipart_bind(field::String, ::Type{String}, parsed::AbstractDict) =
     multipart_text_value(field, parsed)
 
 function multipart_bind(field::String, ::Type{N}, parsed::AbstractDict) where {N <: Number}
+    # A union of number types is `<: Number` too, and wins dispatch over the `Union` method below;
+    # `tryparse` on a union recurses until the stack overflows. Try the members one by one instead.
+    N isa Union && return invoke(multipart_bind, Tuple{String, Union, AbstractDict}, field, N, parsed)
     raw = strip(multipart_text_value(field, parsed))
     result = tryparse(N, raw)
     isnothing(result) && throw(ValidationError("Field '$field' could not be parsed as $N"))
+    # `tryparse(Float64, "nan")` and `"1e999"` (→ Inf) succeed (#327).
+    result isa AbstractFloat && !isfinite(result) &&
+        throw(ValidationError("Field '$field' must be a finite number"))
     return result
 end
 
