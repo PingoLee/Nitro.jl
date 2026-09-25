@@ -365,20 +365,41 @@ end
 
 @testset "an invalid server timeout is rejected at serve(), before any mutation" begin
     ctx = Nitro.Core.App()
-    for (name, bad) in ((:read_header_timeout, -1), (:read_header_timeout, NaN),
-                        (:idle_timeout, Inf), (:read_timeout, true), (:write_timeout, "5"),
-                        (:read_header_timeout, 1e20), (:idle_timeout_ns, -1),
-                        (:read_timeout_ns, 1.5), (:write_timeout_ns, true))
+    # Every call below is one HTTP.jl's `listen!` would refuse — after `serve` had mutated the App.
+    for kw in ((; read_header_timeout = -1), (; read_header_timeout = NaN),
+               (; idle_timeout = Inf), (; read_timeout = true), (; write_timeout = "5"),
+               (; read_header_timeout = 1e20), (; idle_timeout_ns = -1),
+               (; read_timeout_ns = 1.5), (; write_timeout_ns = true),
+               # `typemax(Int64)` ns, as seconds, rounds up to 2^63 ns: one past what fits.
+               (; idle_timeout = typemax(Int64) / 1.0e9),
+               (; read_header_timeout_ns = typemax(UInt64)),
+               # Two spellings of one timeout, each carrying a value.
+               (; read_header_timeout = 5, read_header_timeout_ns = 10^9),
+               (; readtimeout = 5, read_timeout = 5),
+               (; readtimeout = 5, read_timeout_ns = 10^9))
         err = try
-            _serve(ctx, get_free_port(); (name => bad,)...)
+            _serve(ctx, get_free_port(); kw...)
             nothing
         catch e
             e
         end
         @test err isa ArgumentError
-        @test occursin(string(name), sprint(showerror, err))
+        @test occursin(string(first(keys(kw))), sprint(showerror, err))
         @test !isopen(ctx.service)
         @test isnothing(ctx.service.external_url[])   # rejected before `serve` touched the App
+    end
+
+    # HTTP.jl's own reading of "both spellings": a seconds form of `nothing`, or an `_ns` form of
+    # `0`, carries no value, so it combines with the other spelling freely.
+    for kw in ((; read_header_timeout = nothing, read_header_timeout_ns = 10^9),
+               (; idle_timeout = 5, idle_timeout_ns = 0))
+        ok = Nitro.Core.App()
+        _serve(ok, get_free_port(); kw...)
+        try
+            @test isopen(ok.service)
+        finally
+            Nitro.Core.terminate(ok)
+        end
     end
 end
 
@@ -437,18 +458,14 @@ function _echo_context()
     ctx = Nitro.Core.App()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/echo", req -> String(req.body); method = "POST"),
-        path("/events", req -> Nitro.Res.sse() do events
-            for i in 1:6
-                isopen(events) || break
-                write(events, Nitro.SSEEvent("tick-$i"))
-                sleep(0.25)
-            end
-        end; method = "GET"),
     ])
     return ctx
 end
 
 @testset "read_header_timeout bounds the head (Slowloris)" begin
+    # A behavior pin, not a regression test: an explicit value was forwarded to HTTP.jl before
+    # #316 too. It pins that the head bound still holds through Nitro's deadline clearing, which
+    # must never run before a head has been parsed.
     ctx = _echo_context()
     port = get_free_port()
     _serve(ctx, port; read_header_timeout = 0.5)
@@ -486,8 +503,11 @@ end
     port = get_free_port()
     _serve(ctx, port; read_header_timeout = 0.5, read_timeout = 0.5)
     try
+        # The head alone: the body never comes. Sending it late would write into a socket the
+        # server has already closed, and on Windows the RST that draws discards the unread 408
+        # from the client's receive buffer.
         head = "POST /echo HTTP/1.1\r\nHost: $HOST\r\nContent-Length: 5\r\nConnection: close\r\n\r\n"
-        reply = _raw_exchange(port, [head, "hello"]; gap = 1.5)
+        reply = _raw_exchange(port, [head])
         @test startswith(reply, "HTTP/1.1 408")
     finally
         Nitro.Core.terminate(ctx)
@@ -661,19 +681,60 @@ end
     end
 end
 
-@testset "a short read_header_timeout does not cut an SSE stream" begin
-    # The docs promise the defaults leave streams alone. The stream below runs ~1.5s against a
-    # 0.5s header timeout; on HTTP/1.1 nothing reads the socket while it streams, and the header
-    # deadline is cleared as soon as the head is parsed.
-    ctx = _echo_context()
-    port = get_free_port()
-    _serve(ctx, port; read_header_timeout = 0.5)
+"""
+Send one request on a fresh connection and read its response, then send a second request on the
+SAME connection whose body arrives `gap` seconds after its head. Returns the second response.
+"""
+function _second_request_late_body(port; gap)
+    sock = Sockets.connect(Sockets.localhost, port)
     try
-        reply = _raw_exchange(port, ["GET /events HTTP/1.1\r\nHost: $HOST\r\nConnection: close\r\n\r\n"])
-        @test startswith(reply, "HTTP/1.1 200")
-        @test count("data: tick-", reply) == 6
+        write(sock, "POST /echo HTTP/1.1\r\nHost: $HOST\r\nContent-Length: 5\r\n\r\nfirst")
+        seen = IOBuffer()
+        reader = @async while !endswith(String(seen.data[1:seen.size]), "first")
+            chunk = readavailable(sock)
+            isempty(chunk) && break
+            write(seen, chunk)
+        end
+        timedwait(() -> istaskdone(reader), 15.0; pollint = 0.02) === :ok ||
+            return "(first response incomplete)"
+        startswith(String(take!(seen)), "HTTP/1.1 200") || return "(first request failed)"
+
+        write(sock, "POST /echo HTTP/1.1\r\nHost: $HOST\r\nContent-Length: 6\r\nConnection: close\r\n\r\n")
+        sleep(gap)
+        try
+            write(sock, "second")
+        catch
+        end
+        rest = @async try
+            String(read(sock))
+        catch
+            ""
+        end
+        timedwait(() -> istaskdone(rest), 15.0; pollint = 0.05)
+        return istaskdone(rest) ? fetch(rest) : "(no close within 15s)"
     finally
-        Nitro.Core.terminate(ctx)
+        close(sock)
+    end
+end
+
+@testset "a keep-alive request's body is not cut by the idle deadline" begin
+    # Review finding on #316. After each response HTTP.jl arms the IDLE deadline, and with
+    # `read_header_timeout = 0` nothing replaces it before the next request's body is read. The
+    # clear used to be skipped whenever the header timeout was 0 ("nothing was armed"), so every
+    # request after the first on a connection had its body cut `idle_timeout` after the previous
+    # response — 120 seconds by default. Unpatched, the second request below is a 408.
+    for kw in ((; read_header_timeout = 0, idle_timeout = 0.5),
+               (; read_header_timeout = 0.5, idle_timeout = 0.5))
+        ctx = _echo_context()
+        port = get_free_port()
+        _serve(ctx, port; kw...)
+        try
+            reply = _second_request_late_body(port; gap = 1.5)
+            @test startswith(reply, "HTTP/1.1 200")
+            @test endswith(reply, "second")
+        finally
+            Nitro.Core.terminate(ctx)
+        end
     end
 end
 

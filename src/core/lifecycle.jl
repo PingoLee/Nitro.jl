@@ -631,26 +631,38 @@ const _SERVER_TIMEOUT_KWARGS = (:read_header_timeout, :read_timeout, :idle_timeo
 const _SERVER_TIMEOUT_NS_KWARGS = (:read_header_timeout_ns, :read_timeout_ns, :idle_timeout_ns,
                                    :write_timeout_ns)
 
-# The largest seconds value HTTP.jl can hold: it stores every timeout as `Int64` nanoseconds.
-const _MAX_TIMEOUT_SECONDS = typemax(Int64) / 1.0e9
-
-# Refuse a timeout HTTP.jl would reject, at the `serve` call that contains it. HTTP.jl checks the
-# same things (`_timeout_ns_from_seconds`), but only inside `listen!` — after `serve` has already
-# mutated the App. Seconds may be any finite real in range, or `nothing`; `Inf` is refused rather
-# than read as "never", because `0`/`nothing` is how HTTP.jl spells never.
+# Refuse a timeout HTTP.jl would reject, at the `serve` call that contains it. HTTP.jl makes the
+# same checks (`_timeout_ns_from_seconds`, `_resolve_server_timeouts`), but only inside `listen!` —
+# after `serve` has already mutated the App. Each rule below mirrors one of HTTP.jl's, so the two
+# agree on exactly which calls are valid. Seconds may be any finite real `>= 0` that fits in
+# `Int64` nanoseconds, or `nothing`; `Inf` is refused rather than read as "never", because
+# `0`/`nothing` is how HTTP.jl spells never.
 function _validate_server_timeouts(kwargs)
     for (name, value) in pairs(kwargs)
         if name in _SERVER_TIMEOUT_KWARGS
             value === nothing ||
-                (value isa Real && !(value isa Bool) && isfinite(value) &&
-                 0 <= value <= _MAX_TIMEOUT_SECONDS) ||
+                (value isa Real && !(value isa Bool) && isfinite(value) && value >= 0 &&
+                 round(Int128, Float64(value) * 1.0e9) <= typemax(Int64)) ||
                 throw(ArgumentError("`$name` must be a finite number of seconds >= 0, or " *
                     "`nothing` (`0` and `nothing` both disable it), got $(repr(value))"))
         elseif name in _SERVER_TIMEOUT_NS_KWARGS
-            (value isa Integer && !(value isa Bool) && value >= 0) ||
+            (value isa Integer && !(value isa Bool) && 0 <= value <= typemax(Int64)) ||
                 throw(ArgumentError("`$name` must be an integer number of nanoseconds >= 0 " *
                     "(`0` disables it), got $(repr(value))"))
         end
+    end
+    # One timeout, two spellings: HTTP.jl throws when both carry a value. "Carries a value" is
+    # HTTP.jl's own test — a seconds form that is not `nothing`, an `_ns` form that is not `0`.
+    given(name) = get(kwargs, name, nothing) !== nothing
+    given_ns(name) = get(kwargs, name, 0) != 0
+    for name in (:read_header_timeout, :read_timeout, :idle_timeout, :write_timeout)
+        ns_name = Symbol(name, :_ns)
+        given(name) && given_ns(ns_name) &&
+            throw(ArgumentError("`$name` cannot be combined with `$ns_name`; pass one of them"))
+    end
+    if given(:readtimeout) && (given(:read_timeout) || given_ns(:read_timeout_ns))
+        throw(ArgumentError("`readtimeout` (deprecated) cannot be combined with `read_timeout` " *
+                            "or `read_timeout_ns`; pass `read_timeout`"))
     end
     return nothing
 end

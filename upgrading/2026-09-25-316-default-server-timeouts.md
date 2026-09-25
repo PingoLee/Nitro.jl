@@ -37,8 +37,11 @@ proxies use to reach Nitro:
 Separately, a request whose body read failed on an HTTP.jl error used to be answered `500`
 whatever the cause, because Nitro's per-request task wrapped the error before HTTP.jl could
 classify it. HTTP.jl's own status now reaches the client: `408` when an explicit `read_timeout`
-fires mid-body, `400` for a malformed body. Nothing to migrate for that part; it is listed here
-because a monitor that counted those `500`s will now see `408`s and `400`s instead.
+fires mid-body, `400` for a malformed body. The same applies to an HTTP.jl error that escapes a
+handler when `catch_errors = false` or `serialize = false` — a `ParseError` from an outbound call,
+say, is now a `400` rather than a `500`, which is what `parallel = false` always did. Nothing to
+migrate for that part; it is listed here because a monitor that counted those `500`s will now see
+`408`s and `400`s instead.
 
 ### How to find the calls to migrate
 
@@ -66,6 +69,7 @@ serve(app; host = "127.0.0.1", port = 8080)
 # ✓ after — to keep a proxy with a 300-second upstream idle timeout closing first
 serve(app; host = "127.0.0.1", port = 8080, read_header_timeout = 330, idle_timeout = 330)
 
-# ✓ after — to restore the old behavior exactly (not recommended for a directly exposed server)
+# ✓ after — to restore the old timeouts (not recommended for a directly exposed server).
+#   The 500 → 408/400 status change above has no switch; it is a fix.
 serve(app; host = "127.0.0.1", port = 8080, read_header_timeout = 0, idle_timeout = 0)
 ```

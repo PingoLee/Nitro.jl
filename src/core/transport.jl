@@ -689,8 +689,13 @@ end
 #     stream's handler would reach across every stream on the connection.
 #   * Only when `read_timeout` is unset. When it is set, HTTP has already re-armed the deadline for
 #     the body at the caller's chosen length, and that one must stand.
-#   * Only when `read_header_timeout` is set — otherwise nothing was armed and there is nothing to
-#     clear.
+#
+# NOT gated on `read_header_timeout` being set, although that looks like "nothing was armed".
+# After each response HTTP arms the IDLE deadline, and when the header timeout is 0 nothing
+# replaces it before the next request's head and body are read — so with
+# `read_header_timeout = 0` and the default `idle_timeout`, every request after the first on a
+# keep-alive connection had its body cut 120 seconds after the previous response. Clearing
+# unconditionally covers whichever deadline is armed; when none is, Reseau sees an unchanged value.
 #
 # `getfield`, not property access, to match `_peer_ip`'s walk of the same internal chain. Every
 # field and the `_set_read_deadline!` method are canaried in test/http_internals_contract_tests.jl.
@@ -698,12 +703,20 @@ function _clear_header_deadline!(stream::HTTP.Stream)::Nothing
     getfield(stream, :h2_conn) === nothing || return nothing
     server = getfield(stream, :server)
     server === nothing && return nothing
-    getfield(server, :read_header_timeout_ns) > 0 || return nothing
     getfield(server, :read_timeout_ns) > 0 && return nothing
     tracked = getfield(stream, :tracked)
     tracked === nothing && return nothing
-    # `0` disables the read deadline (Reseau's documented contract for `set_read_deadline!`).
-    HTTP._set_read_deadline!(getfield(tracked, :conn), zero(Int64))
+    try
+        # `0` disables the read deadline (Reseau's documented contract for `set_read_deadline!`).
+        HTTP._set_read_deadline!(getfield(tracked, :conn), zero(Int64))
+    catch err
+        # A `terminate` racing a freshly parsed head closes the connection underneath us, and
+        # Reseau then refuses the deadline change. That is harmless — the request is being cut
+        # anyway — so it must not become an error of its own; HTTP's `_clear_deadlines!` ignores
+        # the same failure. Structural breakage (a renamed method, a changed signature) cannot
+        # hide here: the canary above fails first.
+        err isa InterruptException && rethrow()
+    end
     return nothing
 end
 
