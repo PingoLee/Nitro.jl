@@ -60,6 +60,7 @@ authority and logs only what follows, so `GET //users/42` is logged as a `400` f
 A URL gate is now sound for the literal segments of a route, and no further. A file below a
 static or SPA mount is looked up by its percent-decoded path after middleware runs, so gate the
 mount's root rather than a directory inside it, or put the protected files in their own mount.
+Since #351 that is no longer needed: see the entry on the canonical request path.
 
 ### Migrate your app
 

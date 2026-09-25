@@ -216,13 +216,13 @@ function parse_func_params(route::String, func::Function; type_hints::Dict{Symbo
 end
 
 function register(ctx::App, httpmethod::String, route::Union{String,HOFRouter}, func::Function; type_hints::Dict{Symbol, Type}=Dict{Symbol, Type}())
-    route = parse_route(httpmethod, route)
+    route = Util._canonical_route(parse_route(httpmethod, route))
     func_details = parse_func_params(route, func; type_hints)
     registerhandler(ctx, ctx.service.router, httpmethod, route, func, func_details)
 end
 
 function register_internal(ctx::App, router::Router, httpmethod::String, route::Union{String,HOFRouter}, func::Function; type_hints::Dict{Symbol, Type}=Dict{Symbol, Type}())
-    route = parse_route(httpmethod, route)
+    route = Util._canonical_route(parse_route(httpmethod, route))
     func_details = parse_func_params(route, func; type_hints)
     registerhandler(ctx, router, httpmethod, route, func, func_details)
 end

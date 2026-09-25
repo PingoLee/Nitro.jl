@@ -200,12 +200,20 @@ an empty segment (`//admin/users`, `/admin//users`) is answered `400` before any
 runs. HTTP.jl's router drops empty segments, so without that refusal `//admin/users` would reach
 `/admin/users` past a `startswith(req.target, "/admin/")` test.
 
-That makes a gate on the literal segments of a route sound, and nothing more. The target is still
-percent-encoded, and some things decode it only after global middleware has run. A static or SPA
-mount decodes the path below its root before looking the file up, so `/files/%70rivate/x` serves
-`private/x` past a `startswith(req.target, "/files/private/")` test. Guards on the route or
-router are the better place to authorize: they run on the route that was actually matched, not on
-a URL pattern that has to be kept in step with `urlpatterns`.
+The path is also in **one canonical percent-encoding**. A static or SPA mount and a path
+parameter decode the path after global middleware has run, so any other spelling would reach them
+past your test. Every escape of a character that may stand unencoded in a path is decoded, and
+everything else is written as an uppercase escape. So `/%61dmin/users` arrives as `/admin/users`,
+`/files/%70rivate/x` as `/files/private/x`, and `caf%c3%a9` or a raw `café` as `caf%C3%A9`. A dot
+segment (`/a/../b`, `/a/%2E%2E/b`) is answered `400`, like an empty one, and a malformed escape
+(`%ZZ`) gets the same JSON `400` a mount or a path parameter gives it. The query string is left as
+the client sent it.
+
+That makes `startswith(req.target, "/files/private/")` hold for a directory inside a mount, not
+only for the literal segments of a route. Write the prefix you test in canonical form too:
+`"/caf%C3%A9/"`, not `"/caf%c3%a9/"` or `"/café/"`. Guards on the route or router are still the
+better place to authorize: they run on the route that was actually matched, not on a URL pattern
+that has to be kept in step with `urlpatterns`.
 
 ### Rewriting the method or the target
 

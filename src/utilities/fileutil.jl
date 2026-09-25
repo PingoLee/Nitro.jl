@@ -173,10 +173,10 @@ Percent-encode a *filename* into a URL path segment: every byte that could not s
 becomes an uppercase `%XX` triplet. `name` is returned unchanged when every byte is already
 [`_is_pchar`](@ref), which is the overwhelmingly common case.
 
-Triplets are **uppercase**, and because the router matches bytes rather than testing RFC 3986
-equivalence, a client that sends the lowercase spelling (`caf%c3%a9.txt`) gets a 404. Browsers emit
-uppercase, so this is a compatibility footnote rather than a defect — and it is the same fact that
-forbids case-normalizing a `mountdir`'s triplets in `mount_segments`, so the two rules agree.
+Triplets are **uppercase**. That is also the canonical form `OriginFormMiddleware` gives every
+request path ([#351](https://github.com/PingoLee/Nitro.jl/issues/351)) — `_canonical_segment` *is*
+this function applied to the decoded bytes — so a client sending `caf%c3%a9.txt` or raw `café.txt`
+reaches the same route.
 
 This is the filename half of the rule `mount_segments` enforces on `mountdir`. The router
 compares path segments byte for byte and never percent-decodes, so a file whose name needs encoding
@@ -249,6 +249,179 @@ function _route_encode(name::AbstractString)
         end
     end
     return String(take!(io))
+end
+
+const _HEX_UPPER = b"0123456789ABCDEF"
+
+# The value of one hex digit, or -1 when `b` is not one. Either case, as RFC 3986 §2.1 allows.
+function _hexval(b::UInt8)::Int
+    UInt8('0') <= b <= UInt8('9') && return Int(b - UInt8('0'))
+    UInt8('A') <= b <= UInt8('F') && return Int(b - UInt8('A')) + 10
+    UInt8('a') <= b <= UInt8('f') && return Int(b - UInt8('a')) + 10
+    return -1
+end
+
+"""
+    _canonical_segment(segment::AbstractString) -> Union{String,Nothing}
+
+The one spelling of a URL path segment that every percent-encoding of it shares, or `nothing` when
+`segment` holds a malformed escape (`%ZZ`, a trailing `%`).
+
+The canonical form is `_route_encode` of the decoded bytes
+([#351](https://github.com/PingoLee/Nitro.jl/issues/351)): an escape of a [`_is_pchar`](@ref) byte
+is decoded (`%70` → `p`, `%21` → `!`), and every other byte, escaped or raw, is written as an
+uppercase triplet (`%c3%a9` and a raw `é` → `%C3%A9`, `%2f` → `%2F`). Decoding the result gives the
+same bytes decoding `segment` did, so nothing that decodes a path — `mount_remainder`, `{var}`
+path params — can tell the two apart. What changes is that the spelling becomes unique, which is
+what lets global middleware test `req.target` against one string.
+
+This goes further than RFC 3986 §6.2.2.2, which only equates escapes of *unreserved* characters. It
+has to: Nitro's decoders also decode sub-delims, so `%21` and `!` already name the same file, and a
+gate that saw them as different was bypassable.
+
+It works on bytes rather than calling `HTTP.unescapeuri`, so a raw byte that is not valid UTF-8 is
+encoded like any other rather than making the decode throw. A `.` or `..` result is returned as is;
+refusing it is the caller's job.
+"""
+function _canonical_segment(segment::AbstractString)::Union{String,Nothing}
+    bytes = codeunits(segment)
+    all(b -> b < 0x80 && _is_pchar(Char(b)), bytes) && return String(segment)
+
+    io = IOBuffer(; sizehint = length(bytes) + 8)
+    n = length(bytes)
+    i = 1
+    while i <= n
+        b = bytes[i]
+        if b == UInt8('%')
+            i + 2 <= n || return nothing
+            hi = _hexval(bytes[i + 1])
+            lo = _hexval(bytes[i + 2])
+            (hi < 0 || lo < 0) && return nothing
+            b = UInt8(hi << 4 | lo)
+            i += 3
+        else
+            i += 1
+        end
+        if b < 0x80 && _is_pchar(Char(b))
+            write(io, b)
+        else
+            write(io, UInt8('%'), _HEX_UPPER[(b >> 4) + 1], _HEX_UPPER[(b & 0x0f) + 1])
+        end
+    end
+    return String(take!(io))
+end
+
+_is_dot_segment(s::AbstractString)::Bool = s == "." || s == ".."
+
+"""
+    _is_canonical_path(path::AbstractString) -> Bool
+
+Whether `path` is already in the form `_canonical_path` would return, without building anything:
+every byte is `/`, a [`_is_pchar`](@ref) byte, or an escape already in canonical form (uppercase
+hex, of a byte that is *not* pchar, such as `%C3%A9` or `%2F`), and no segment is `.` or `..`.
+This is the per-request fast path: a browser sends canonical paths, escapes included, so nearly
+every real request takes it and `_origin_form` hands back the target it was given.
+"""
+function _is_canonical_path(path::AbstractString)::Bool
+    bytes = codeunits(path)
+    n = length(bytes)
+    len = 0
+    dots = 0
+    i = 1
+    while i <= n
+        b = bytes[i]
+        if b == UInt8('/')
+            (0 < len <= 2 && dots == len) && return false
+            len = 0
+            dots = 0
+            i += 1
+        elseif b == UInt8('%')
+            i + 2 <= n || return false
+            hi, lo = bytes[i + 1], bytes[i + 2]
+            # Uppercase only: `_hexval` accepts both cases, so test the byte, not the value.
+            (_is_upper_hex(hi) && _is_upper_hex(lo)) || return false
+            d = UInt8(_hexval(hi) << 4 | _hexval(lo))
+            (d < 0x80 && _is_pchar(Char(d))) && return false    # would be decoded
+            len += 1
+            i += 3
+        else
+            (b < 0x80 && _is_pchar(Char(b))) || return false
+            len += 1
+            b == UInt8('.') && (dots += 1)
+            i += 1
+        end
+    end
+    return !(0 < len <= 2 && dots == len)
+end
+
+_is_upper_hex(b::UInt8)::Bool = UInt8('0') <= b <= UInt8('9') || UInt8('A') <= b <= UInt8('F')
+
+"""
+    _canonical_path(path::AbstractString) -> Union{String,Nothing}
+
+`path` (no query) with every non-empty segment replaced by its [`_canonical_segment`](@ref), or
+`nothing` when a segment is a dot segment, raw or encoded (`.`, `%2E%2E`). Empty segments are kept
+as they are; `_origin_form` refuses `//` before it gets here.
+
+A malformed escape throws `ValidationError`, a **400**, the same answer `mount_remainder` and the
+`{var}` path params give for one, so the response a client gets does not depend on which of them
+would have decoded it. The offending segment is not interpolated, for the reason given there.
+
+A dot segment is refused rather than kept because clients remove them before sending (RFC 3986
+§5.2.4), so one on the wire is a probe, and because decoding `%2E%2E` would otherwise put a literal
+`..` into `req.target` where the client sent none.
+"""
+function _canonical_path(path::AbstractString)::Union{String,Nothing}
+    parts = String[]
+    for raw in eachsplit(path, '/')
+        if isempty(raw)
+            push!(parts, "")
+            continue
+        end
+        segment = _canonical_segment(raw)
+        segment === nothing && throw(ValidationError("Malformed percent-encoding in request path"))
+        _is_dot_segment(segment) && return nothing
+        push!(parts, segment)
+    end
+    return join(parts, '/')
+end
+
+"""
+    _canonical_route(route::String) -> String
+
+`route` with each literal segment in the canonical percent-encoding `OriginFormMiddleware` gives
+every request path (#351), so an authored `/a%7eb` or `/café` is registered as `/a~b` or
+`/caf%C3%A9` and answers every spelling a client can send. Pattern segments (`{id}`, `*`, `**`)
+are left alone.
+
+Every place that builds a key from a route calls this **before** building it — `register_route`,
+`InnerRouter`, and `register`/`register_internal`, which also cover a direct caller. The route
+middleware table is keyed by `genkey(method, route)` and read back with the route the router
+matched, so a key built from the authored spelling would silently drop that route's middleware
+and guards. It is idempotent, so calling it twice costs one scan.
+
+A malformed escape, or a segment that is or decodes to a dot segment or a pattern (`%2E%2E`,
+`%2A`), is an `ArgumentError`: requests with those paths are refused or read differently before
+routing, so the route could never be reached as written.
+"""
+function _canonical_route(route::String)::String
+    _is_canonical_path(route) && return route
+    parts = String[]
+    for raw in eachsplit(route, '/')
+        if isempty(raw) || _is_route_pattern(raw)
+            push!(parts, String(raw))
+            continue
+        end
+        segment = _canonical_segment(raw)
+        (segment === nothing || _is_dot_segment(segment) || _is_route_pattern(segment)) &&
+            throw(ArgumentError(
+                "route $(repr(route)) has a segment $(repr(String(raw))) that no request can reach: " *
+                "it is a malformed percent-escape, a '.' or '..' segment, or an escape that decodes " *
+                "to one or to a route pattern. Request paths are decoded to one canonical form " *
+                "before routing, and those are refused or read as something else."))
+        push!(parts, segment)
+    end
+    return join(parts, '/')
 end
 
 """
@@ -487,11 +660,14 @@ is *authored*, so `"my%20static"` is someone spelling a space deliberately and t
 through, while a filename is *data*, so a file named `my%20file.txt` really does contain `%`, `2`,
 `0` and its route must be `my%2520file.txt`. One rule cannot do both without losing information.
 
-**Validated, never re-encoded.** A percent triplet is checked for well-formedness and then passed
-through byte for byte — `"%2f"` stays `"%2f"`. Do not add case-normalization or decoding of
-unreserved triplets here, however much "the one place `mountdir` is normalized" invites it: HTTP.jl
-matches path segments with a byte comparison, not an RFC 3986 equivalence test, so rewriting `"%2f"`
-to `"%2F"` would stop matching the client that sends the lowercase form.
+**Validated, then canonicalized** ([#351](https://github.com/PingoLee/Nitro.jl/issues/351)). A
+percent triplet is checked for well-formedness and then rewritten by [`_canonical_segment`](@ref):
+`"%2f"` becomes `"%2F"` and `"%7e"` becomes `"~"`. This used to be forbidden, because HTTP.jl
+matches path segments byte for byte and a rewritten prefix would stop matching a client that sent
+the other spelling. That reason is gone: `OriginFormMiddleware` puts every request path in the same
+canonical form before routing, so an un-canonicalized prefix is the one that would never match. A
+triplet that decodes to a pattern or a dot segment (`"%2A"`, `"%2E%2E"`) is refused like the raw
+character would be.
 
 Note this runs **before** enumeration: [`mountfolder`](@ref) calls this function first, so
 `staticfiles("does_not_exist", "*")` reports the bad `mountdir`, not the missing folder. Both are
@@ -524,7 +700,15 @@ function mount_segments(mountdir::AbstractString)::Vector{String}
             "this mount would register routes no request could reach. Write the prefix " *
             "pre-encoded (e.g. \"my%20static\") or choose a different one."))
 
-        push!(segments, segment)
+        # `_first_unroutable` validated every escape, so this cannot be `nothing`. Decoding can
+        # still produce a pattern or a dot segment the checks above could not see (#351).
+        canonical = _canonical_segment(segment)::String
+        (_is_route_pattern(canonical) || _is_dot_segment(canonical)) && throw(ArgumentError(
+            "mountdir segment $(repr(segment)) decodes to $(repr(canonical)), which a mount " *
+            "may not use as a literal prefix: request paths are decoded to that same form " *
+            "before routing. Choose a different prefix."))
+
+        push!(segments, canonical)
     end
     return segments
 end

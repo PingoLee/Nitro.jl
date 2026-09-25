@@ -6,6 +6,7 @@
 # `AccessLog`, which is included before this file, can share them (#320). Imported by name so
 # they stay reachable as `Nitro.Core._log_target_path`, which the security tests pin.
 using .Util: _log_target_path, _log_escape
+using .Util: _is_canonical_path, _canonical_path
 
 """
     AccessLogMiddleware(; log_query::Bool=false)
@@ -57,10 +58,10 @@ const _PREFIX_SHAPE = r"^(?:/(?:[A-Za-z0-9\-._~!$&'()*+,;=:@]|%[0-9A-Fa-f]{2})+)
 Validate `serve(prefix = …)` and return it in the one form `PrefixStripMiddleware` matches on:
 a `String` with a leading `/` and no trailing one (#315). `nothing` means no prefix.
 
-The prefix is compared against the raw request-target, which is what arrives on the wire, so it
-has to be written the way a client sends it: ASCII, percent-encoded, no query or fragment.
-Escapes are compared byte for byte, so write them in the uppercase RFC 3986 recommends and clients
-send (`%C3%A9`, not `%c3%a9`); a mismatch fails closed, as a 404. A
+The prefix is compared against the request-target after `OriginFormMiddleware` has put its path
+in canonical form, so it has to be written the way a client sends it: ASCII, percent-encoded, no
+query or fragment. Its escapes are canonicalized the same way (#351), so `/caf%c3%a9` and
+`/caf%C3%A9` name one prefix, and `/%61pi` is `/api`. A
 shape that could never match a well-formed target is an `ArgumentError` here rather than a
 server that answers 404 to everything. Trailing slashes are dropped, the same tolerance
 `urlpatterns` gives its prefixes. Any `AbstractString` is accepted; `serve` used to drop a
@@ -81,10 +82,11 @@ function _normalize_prefix(prefix)::Nullable{String}
     occursin(_PREFIX_SHAPE, p) || throw(ArgumentError(
         "`prefix = $(repr(prefix))` is not a URL path. Each segment may hold only letters, digits, " *
         "`-._~!\$&'()*+,;=:@` and `%XX` escapes: no '?', '#', whitespace, or empty segments (`//`)."))
-    any(s -> s == "." || s == "..", eachsplit(p, '/')) && throw(ArgumentError(
-        "`prefix = $(repr(prefix))` contains a '.' or '..' segment. Clients resolve those before " *
-        "sending a request, so the prefix would never match."))
-    return p
+    canonical = _canonical_path(p)
+    canonical === nothing && throw(ArgumentError(
+        "`prefix = $(repr(prefix))` contains a '.' or '..' segment, or an escape that decodes to " *
+        "one. Clients resolve those before sending a request, so the prefix would never match."))
+    return canonical
 end
 
 """
@@ -127,8 +129,8 @@ middleware runs before the route is chosen (#291), so a gate testing
   authority ends at the first `/`, `?` or `#` and is never parsed, so a malformed one
   (`http://h:abc/x`) cannot throw (#326). An empty path becomes `/`. The router finds the path
   by the first `/` after `://` instead, which put `http://h?x=/admin` and `http://h#/admin` on
-  `/admin`. Now the first routes to `/`, and the second keeps its fragment in the path
-  (`/#/admin`), which matches no route.
+  `/admin`. Now the first routes to `/`, and the second keeps its fragment in the path, where
+  the canonical form below escapes it (`/%23/admin`), and it matches no route.
 - Anything else, including `""`, gets the leading `/` the router assumes. Over the wire that is
   only `CONNECT`'s authority-form (`host:443`); `internalrequest` can deliver any string.
 
@@ -137,8 +139,23 @@ An empty segment is refused rather than collapsed. Collapsing would rewrite
 logs the credentials. The check covers the path up to the first `?`, the same cut the router
 makes, so a `//` inside the query is fine and a single trailing `/` is kept.
 
-The result always starts with `/` and has no empty segment before its last `/`, so the path
-the router splits is the path global middleware reads, segment for segment.
+**The path is then put in canonical form** (#351), by `_canonical_path`. Every segment is
+percent-decoded and re-encoded, so `/%66iles/%70rivate`, `/files/priv%61te` and `/files/private`
+all become `/files/private`, and `caf%c3%a9` and a raw `café` both become `caf%C3%A9`. The query
+is left as sent. Two more shapes are refused:
+
+- a malformed escape (`%ZZ`, a trailing `%`) throws `ValidationError`. Every decoder downstream
+  already answered those with that 400, so refusing them here changes nothing but where it
+  happens, and the body is the same JSON error;
+- a dot segment, raw or encoded (`/./x`, `/a/%2E%2E/b`). Clients resolve those before sending.
+
+Without this, a static mount or a `{var}` param decoded the path only after global middleware
+had run, so a gate testing `startswith(req.target, "/files/private/")` let
+`/files/%70rivate/secret.txt` through to `private/secret.txt`.
+
+The result always starts with `/`, has no empty segment before its last `/`, and has no dot
+segment. Its path is the one spelling of what the router, the mounts and the path params will
+decode, so a test on `req.target` sees the request they will act on.
 """
 function _origin_form(target::String)::Nullable{String}
     target == "*" && return target
@@ -157,15 +174,19 @@ function _origin_form(target::String)::Nullable{String}
     q = findfirst('?', t)
     path = q === nothing ? t : SubString(t, 1, prevind(t, q))
     occursin("//", path) && return nothing
-    return t
+    _is_canonical_path(path) && return t
+    canonical = _canonical_path(path)
+    canonical === nothing && return nothing
+    return q === nothing ? canonical : string(canonical, SubString(t, q))
 end
 
 """
     OriginFormMiddleware()
 
 The framework layer that puts `req.target` in the form the router matches, before any prefix
-strip or user middleware sees it (#341). See `_origin_form`. A target with an empty path segment
-is answered `400`.
+strip or user middleware sees it (#341), with its path in canonical percent-encoding (#351). See
+`_origin_form`. A target with an empty path segment or a dot segment is answered `400`; a
+malformed escape throws `ValidationError`, which the error boundary answers `400` too.
 """
 function OriginFormMiddleware()
     BAD_REQUEST = HTTP.Response(400, "Bad Request")

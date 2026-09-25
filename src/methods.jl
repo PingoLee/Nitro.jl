@@ -32,11 +32,13 @@ is explicit introspection, not accidental disclosure.)
 - `middleware=[]`: global middleware applied to every request, outermost first. It sees
   `req.target` in the form the router matches (#341): an absolute-form target
   (`http://host/users`) arrives reduced to its path and query (`/users`), and a path with an
-  empty segment (`//admin/…`) is answered `400` before any middleware runs. So a
-  `startswith(req.target, "/admin/")` test sees every request routed to a literal `/admin/…`
-  path. It does not cover a file below a static mount, whose path is percent-decoded after
-  middleware runs (`/files/%70rivate/x` is `private/x`). Guards on the route or router remain
-  the place to authorize.
+  empty or dot segment (`//admin/…`, `/a/../admin/…`) is answered `400` before any middleware
+  runs. Its path is also in one canonical percent-encoding (#351): `/%61dmin/users`,
+  `/files/%70rivate/x` and `/files/priv%61te/x` arrive as `/admin/users` and
+  `/files/private/x`, and `caf%c3%a9` or a raw `café` as `caf%C3%A9`. So a
+  `startswith(req.target, "/admin/")` test sees every request that a route, a static mount or
+  a path parameter will read as `/admin/…`. Guards on the route or router remain the place to
+  authorize.
 - `host="127.0.0.1"`, `port=8080`: listen address. Keep `host` on loopback when a
   reverse proxy terminates TLS in front of Nitro.
 - `async=false`: when `true`, return the running `Server` instead of blocking.
@@ -61,10 +63,11 @@ is explicit introspection, not accidental disclosure.)
   while `/apiadmin/users` is a `404`, not `/admin/users`. Everything outside the prefix is a
   `404` before any of your middleware runs, and the target global middleware sees keeps its
   leading `/`.
-  Trailing slashes are dropped (`"/api/"` is `"/api"`). The prefix is matched byte for byte
-  against the raw request-target, so write it as clients send it: ASCII, percent-encoded with
-  uppercase escapes, and with no `?`, `#`, whitespace, empty or dot segments. Anything else,
-  including `""` and `"/"`, is an `ArgumentError`.
+  Trailing slashes are dropped (`"/api/"` is `"/api"`). The prefix is matched against the
+  request-target in its canonical form, so write it as clients send it: ASCII, percent-encoded,
+  and with no `?`, `#`, whitespace, empty or dot segments. Its escapes are canonicalized like
+  the request's (`"/caf%c3%a9"` is `"/caf%C3%A9"`). Anything else, including `""` and `"/"`,
+  is an `ArgumentError`.
 - `revise=:none`: `:lazy`/`:eager` enable Revise-based hot reload (dev only).
 - `secret_key`, `httponly`, `secure`, `samesite`: override cookie defaults for this run.
 - `shutdown_timeout=10.0`: seconds `terminate` waits for in-flight requests to drain
@@ -192,10 +195,10 @@ root.
 It is also **validated**, and throws `ArgumentError` at mount time rather than registering a mount
 that cannot work. A segment is refused when it would register as a router pattern (`*`, `**`, or one
 containing `{`/`}`) — the rule that has always applied to filenames, so a mount cannot claim URLs a
-file may not — or when it is not a legal URL path segment (outside RFC 3986 `pchar`). The router
-compares path segments byte for byte and never percent-decodes, so `"my static"` and `"café"` are
-refused while `"my%20static"` and `"caf%C3%A9"` mount and serve: the encoded spelling is the one a
-conforming client sends. A relative dot-segment (`.`, `..`) is refused too, because clients strip it
+file may not — or when it is not a legal URL path segment (outside RFC 3986 `pchar`). A prefix is
+written the way it appears in a URL, so `"my static"` and `"café"` are refused while
+`"my%20static"` and `"caf%C3%A9"` mount and serve. Its escapes are canonicalized like every request
+path (#351), so `"caf%c3%a9"` is the same prefix and every client spelling of it reaches the mount. A relative dot-segment (`.`, `..`) is refused too, because clients strip it
 before sending.
 
 Note `"café"`, `"a#b"`, `"a|b"` and `"100%"` *were* reachable by a client that sends raw bytes instead
@@ -227,11 +230,10 @@ route from `first(pair)` rather than rebuilding it from the filename.
 
 Only characters that RFC 3986 forbids in a path segment are encoded, so a name that already works
 keeps its exact URL: `report(1).txt`, `a+b.txt`, `v1.2~beta.txt`, `a:b.txt` and `a@b.txt` are all
-unchanged. The two costs, both real: a **literal `%`** in a filename is itself encoded, so
+unchanged. The one cost: a **literal `%`** in a filename is itself encoded, so
 `my%20file.txt` moves to `/static/my%2520file.txt` (it has to — otherwise one URL would name both
-that file and the encoded form of `my file.txt`); and a non-browser client that was sending raw
-UTF-8 bytes to reach `café.txt` gets a 404, because `café` and `caf%C3%A9` are different byte
-strings under a byte-exact matcher.
+that file and the encoded form of `my file.txt`). A client sending raw UTF-8 bytes still reaches
+`café.txt`: the request path is canonicalized to `caf%C3%A9.txt` before routing (#351).
 
 `include_hidden=true` serves dotfiles and `allow_symlink_escape=true` serves escaping symlinks; both
 widen what is publicly reachable, so set them deliberately. Note they interact: with
@@ -310,10 +312,10 @@ root.
 It is also **validated**, and throws `ArgumentError` at mount time rather than registering a mount
 that cannot work. A segment is refused when it would register as a router pattern (`*`, `**`, or one
 containing `{`/`}`) — the rule that has always applied to filenames, so a mount cannot claim URLs a
-file may not — or when it is not a legal URL path segment (outside RFC 3986 `pchar`). The router
-compares path segments byte for byte and never percent-decodes, so `"my static"` and `"café"` are
-refused while `"my%20static"` and `"caf%C3%A9"` mount and serve: the encoded spelling is the one a
-conforming client sends. A relative dot-segment (`.`, `..`) is refused too, because clients strip it
+file may not — or when it is not a legal URL path segment (outside RFC 3986 `pchar`). A prefix is
+written the way it appears in a URL, so `"my static"` and `"café"` are refused while
+`"my%20static"` and `"caf%C3%A9"` mount and serve. Its escapes are canonicalized like every request
+path (#351), so `"caf%c3%a9"` is the same prefix and every client spelling of it reaches the mount. A relative dot-segment (`.`, `..`) is refused too, because clients strip it
 before sending.
 
 Note `"café"`, `"a#b"`, `"a|b"` and `"100%"` *were* reachable by a client that sends raw bytes instead
@@ -404,10 +406,10 @@ root.
 It is also **validated**, and throws `ArgumentError` at mount time rather than registering a mount
 that cannot work. A segment is refused when it would register as a router pattern (`*`, `**`, or one
 containing `{`/`}`) — the rule that has always applied to filenames, so a mount cannot claim URLs a
-file may not — or when it is not a legal URL path segment (outside RFC 3986 `pchar`). The router
-compares path segments byte for byte and never percent-decodes, so `"my static"` and `"café"` are
-refused while `"my%20static"` and `"caf%C3%A9"` mount and serve: the encoded spelling is the one a
-conforming client sends. A relative dot-segment (`.`, `..`) is refused too, because clients strip it
+file may not — or when it is not a legal URL path segment (outside RFC 3986 `pchar`). A prefix is
+written the way it appears in a URL, so `"my static"` and `"café"` are refused while
+`"my%20static"` and `"caf%C3%A9"` mount and serve. Its escapes are canonicalized like every request
+path (#351), so `"caf%c3%a9"` is the same prefix and every client spelling of it reaches the mount. A relative dot-segment (`.`, `..`) is refused too, because clients strip it
 before sending.
 
 Note `"café"`, `"a#b"`, `"a|b"` and `"100%"` *were* reachable by a client that sends raw bytes instead
