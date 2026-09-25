@@ -111,10 +111,14 @@ Base.get(::BoundaryStore, ::String, default) =
         store = MemoryStore{String, User}()
         user = User(5, "TTL User")
         
-        # 1. Store with short TTL (1 second)
+        # 1. One short-TTL session that must expire, one long-TTL session that must not.
+        # The "still active" half used to read the 1 s session, but the first request pays
+        # route compile time and a loaded machine overran the TTL before it arrived (#305).
+        # Only the expiry half depends on the clock, and that direction is stable.
         # We need to use Cookies.storesession! since it's in that module
         Nitro.Cookies.storesession!(store, "temp-id", user, ttl=1)
-        
+        Nitro.Cookies.storesession!(store, "live-id", user, ttl=3600)
+
         urlpatterns("",
             path("/ttl-profile", function(req, session::Session{User})
                 if isnothing(session.payload)
@@ -125,18 +129,21 @@ Base.get(::BoundaryStore, ::String, default) =
         )
 
         # Immediate check
-        res1 = internalrequest(Request("GET", "/ttl-profile", ["Cookie" => "session=temp-id"]); context=store)
+        res1 = internalrequest(Request("GET", "/ttl-profile", ["Cookie" => "session=live-id"]); context=store)
         @test text(res1) == "Active"
 
         # Wait for expiration
         sleep(1.1)
         res2 = internalrequest(Request("GET", "/ttl-profile", ["Cookie" => "session=temp-id"]); context=store)
         @test text(res2) == "Expired"
+        res3 = internalrequest(Request("GET", "/ttl-profile", ["Cookie" => "session=live-id"]); context=store)
+        @test text(res3) == "Active"
 
-        # 2. Verify Pruning
-        @test length(store.data) == 1
+        # 2. Verify Pruning -- only the expired row goes
+        @test length(store.data) == 2
         Nitro.Cookies.prunesessions!(store)
-        @test length(store.data) == 0
+        @test length(store.data) == 1
+        @test haskey(store.data, "live-id")
     end
 
     # ── #173: one expiry predicate, and the boundary belongs to the expired side ──
