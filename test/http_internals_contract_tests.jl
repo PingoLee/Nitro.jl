@@ -298,6 +298,24 @@ end
     @test fieldtype(HTTP.Server, :reuseaddr) === Bool
 end
 
+@testset "header-deadline release surface (src/core/transport.jl `_clear_header_deadline!`)" begin
+    # #316: Nitro defaults `read_header_timeout`, and clears the read deadline once the head is
+    # parsed because HTTP.jl 2.7 leaves it armed through the body. The clear reads these fields to
+    # decide whether it applies, and calls this internal setter. A rename would not fail loudly:
+    # `_clear_header_deadline!` would throw on every request, or — worse, if a field were merely
+    # repurposed — stop clearing, and every upload slower than 120s would be cut mid-body again.
+    @test :server in fieldnames(HTTP.Stream)
+    @test :h2_conn in fieldnames(HTTP.Stream)
+    @test :tracked in fieldnames(HTTP.Stream)
+    for f in (:read_header_timeout_ns, :read_timeout_ns, :idle_timeout_ns, :write_timeout_ns)
+        @test f in fieldnames(HTTP.Server)
+        @test fieldtype(HTTP.Server, f) === Int64
+    end
+    @test isdefined(HTTP, :_set_read_deadline!)
+    @test hasmethod(HTTP._set_read_deadline!, Tuple{HTTP.TCP.Conn, Int64})
+    @test hasmethod(HTTP._set_read_deadline!, Tuple{HTTP.TLS.Conn, Int64})
+end
+
 @testset "peer-IP field chain still present (src/core/transport.jl `_peer_ip`/`_conn_fd`)" begin
     # `_peer_ip` reaches `stream.tracked.conn.fd.raddr` for TCP and
     # `stream.tracked.conn.tcp.fd.raddr` for TLS. A silent rename anywhere on this

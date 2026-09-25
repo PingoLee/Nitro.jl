@@ -92,6 +92,29 @@ is explicit introspection, not accidental disclosure.)
   allows rebinding a port still in `TIME_WAIT`, and to **`false` on Windows**, where
   `SO_REUSEADDR` instead lets a second process bind a port another is actively listening
   on — turning a port conflict into two servers silently splitting the traffic.
+- `read_header_timeout=120`: seconds a connection has to deliver a complete request head. Past
+  it the server answers **408** and closes the connection, which bounds a client that trickles
+  header bytes (Slowloris) or goes silent. It bounds the **head only**: once the head is parsed
+  the deadline is cleared, so a slow upload is not cut by it (Go's `ReadHeaderTimeout`
+  semantics). On HTTP/1.1 it is also the **keep-alive idle limit** — HTTP.jl re-arms it before
+  every request on a connection, including the wait between two requests — which is why it
+  defaults to 120 rather than a few seconds: behind nginx or an AWS ALB, whose idle upstream
+  connections time out at 60 seconds, the proxy must be the side that closes first. See
+  `DEFAULT_READ_HEADER_TIMEOUT_SECONDS`.
+- `idle_timeout=120`: seconds an HTTP/2 connection with no open stream is kept. On HTTP/1.1 the
+  header timeout above takes its place.
+- `read_timeout`, `write_timeout`: **off** by default, forwarded to `HTTP.listen!`.
+  `read_timeout` is one deadline for the body *and* every read the handler makes, counted from
+  the end of the head, and answers **408** when it fires; on HTTP/2 it is instead the longest
+  gap between frames from the client, which a quiet SSE stream can exceed. `write_timeout`
+  limits each single write, not the whole response, so a long stream only fails on a write that
+  stalls.
+
+  Every timeout is in seconds (any real `>= 0`); `0` or `nothing` disables it. Each also takes a
+  `_ns` spelling in integer nanoseconds (`read_header_timeout_ns = …`), and passing one suppresses
+  the seconds default. An invalid value is an `ArgumentError` at this call, before anything
+  starts. These are a floor, not a replacement for your reverse proxy's own timeouts — see
+  *Behind a Reverse Proxy* in the docs.
 
 Calling `serve` on an app that is **already serving** throws an `ArgumentError`: the second
 call would overwrite the running server's handle and strand its port. Terminate that app

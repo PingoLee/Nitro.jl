@@ -563,9 +563,68 @@ end
 # task-local storage — and migratable is the correct model here. But an *app*
 # using the `threadid()`-as-index pattern (`buffers[Threads.threadid()]`) was
 # already unsound under `@async` and is now visibly so.
+#
+# The handler's own exception is what reaches HTTP, not the `TaskFailedException` `wait` wraps it
+# in (#316). HTTP's stream path answers a handler error with a status it derives from the
+# exception's TYPE (`_server_error_status`): a `DeadlineExceededError` is a 408, a `ParseError` from
+# a malformed chunked body a 400, anything it does not recognize a 500. The wrapper made all of them
+# a 500, so a `read_timeout` expiring mid-body told the client the server had crashed. Nothing is
+# lost by unwrapping: HTTP's stream path turns the error into a status and never logs it, and every
+# handler error Nitro reports is caught and logged inside the middleware chain long before here.
 function parallel_stream_handler(handle_stream::Function)
     function(stream::HTTP.Stream)
         task = Threads.@spawn handle_stream(stream)
-        wait(task)
+        try
+            wait(task)
+        catch err
+            err isa TaskFailedException && throw(err.task.result)
+            rethrow()
+        end
+    end
+end
+
+# ── The header deadline bounds the head, not the body (#316) ────────────────────────────────────
+#
+# Go's `ReadHeaderTimeout` contract: "the connection's read deadline is reset after reading the
+# headers and the Handler can decide what is considered too slow for the body." HTTP.jl 2.7 arms
+# the header deadline before `read_request` and, when `read_timeout` is 0, never replaces it —
+# `_set_read_deadline_for_body!` returns early instead of clearing it, and `_clear_deadlines!` runs
+# only after the handler returns. So `read_header_timeout = 120` silently became "the head AND the
+# whole body within 120 seconds": an upload that took longer got its connection cut mid-body.
+# That is the wrong default for a timeout Nitro now turns on for everyone, so we clear the read
+# deadline the moment HTTP hands us a parsed head.
+#
+# Narrow on purpose:
+#   * HTTP/1.1 only. An HTTP/2 stream's deadlines belong to the connection's frame loop, which
+#     re-arms them before every frame and multiplexes other streams; touching them from one
+#     stream's handler would reach across every stream on the connection.
+#   * Only when `read_timeout` is unset. When it is set, HTTP has already re-armed the deadline for
+#     the body at the caller's chosen length, and that one must stand.
+#   * Only when `read_header_timeout` is set — otherwise nothing was armed and there is nothing to
+#     clear.
+#
+# `getfield`, not property access, to match `_peer_ip`'s walk of the same internal chain. Every
+# field and the `_set_read_deadline!` method are canaried in test/http_internals_contract_tests.jl.
+function _clear_header_deadline!(stream::HTTP.Stream)::Nothing
+    getfield(stream, :h2_conn) === nothing || return nothing
+    server = getfield(stream, :server)
+    server === nothing && return nothing
+    getfield(server, :read_header_timeout_ns) > 0 || return nothing
+    getfield(server, :read_timeout_ns) > 0 && return nothing
+    tracked = getfield(stream, :tracked)
+    tracked === nothing && return nothing
+    # `0` disables the read deadline (Reseau's documented contract for `set_read_deadline!`).
+    HTTP._set_read_deadline!(getfield(tracked, :conn), zero(Int64))
+    return nothing
+end
+
+# Outermost of the handler wrappers `serve` installs, so the clear runs on the connection task the
+# instant the head is parsed — before `parallel_stream_handler` spends a spawn getting to the body.
+# Applied to a custom `handler` too: the deadline is HTTP's, not the handler's, and a custom
+# handler reading a slow body would hit exactly the same cut.
+function header_deadline_handler(handle_stream::Function)
+    function(stream::HTTP.Stream)
+        _clear_header_deadline!(stream)
+        handle_stream(stream)
     end
 end

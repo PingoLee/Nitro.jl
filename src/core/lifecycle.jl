@@ -161,6 +161,10 @@ function serve(ctx::App;
     (max_fields isa Integer && !(max_fields isa Bool) && 0 <= max_fields <= typemax(Int64)) ||
         throw(ArgumentError("`max_fields` must be an integer >= 0 (0 means unlimited), got $(repr(max_fields))"))
 
+    # Same reasoning as the checks above (#316): HTTP.jl only sees these at `listen!`, which runs
+    # after the App has been mutated, so a typo'd timeout would otherwise fail half-way through.
+    _validate_server_timeouts(kwargs)
+
     # Before any mutation, like the checks above (#315). A malformed prefix is refused here
     # rather than served as a listener that answers 404 to every request.
     global_prefix = _normalize_prefix(prefix)
@@ -246,6 +250,10 @@ function serve(ctx::App;
     if parallel
         handle_stream = parallel_stream_handler(handle_stream)
     end
+
+    # Outside the parallel spawn, so the header deadline is cleared on the connection task the
+    # moment the head is parsed (#316; see `header_deadline_handler`, src/core/transport.jl).
+    handle_stream = header_deadline_handler(handle_stream)
 
     # Wrap last, so the handler HTTP stores gets our secret-safe `show` (see NitroStreamHandler).
     handle_stream = NitroStreamHandler(handle_stream)
@@ -500,5 +508,50 @@ function preprocesskwargs(kwargs)
     # a silent split-brain where some requests are answered by the corpse, out of *its* router.
     # `get!` writes only when the key is absent, so an explicit `serve(reuseaddr = …)` wins.
     Base.get!(kwargs_dict, :reuseaddr, !Sys.iswindows())
+    # HTTP.jl disables every server timeout by default, which leaves a half-sent head or a silent
+    # connection holding its socket forever (#316). Nitro defaults the two that cannot cut a
+    # legitimate stream; `read_timeout` and `write_timeout` stay opt-in. The values, and why they
+    # are 120 seconds, are on the constants (src/constants.jl).
+    #
+    # Written only when NEITHER spelling is present: HTTP.jl takes each timeout in seconds (`X`)
+    # or nanoseconds (`X_ns`) and throws when it gets both, so defaulting `X` next to a caller's
+    # `X_ns` would turn a valid call into an error. An explicit `0` or `nothing` is a value, so it
+    # wins — both mean "disabled" to HTTP.jl.
+    for (name, default) in ((:read_header_timeout, DEFAULT_READ_HEADER_TIMEOUT_SECONDS),
+                            (:idle_timeout, DEFAULT_IDLE_TIMEOUT_SECONDS))
+        haskey(kwargs_dict, name) || haskey(kwargs_dict, Symbol(name, :_ns)) ||
+            (kwargs_dict[name] = default)
+    end
     return kwargs_dict
+end
+
+# The server timeouts HTTP.jl's `listen!` accepts, in their seconds spelling (#316). `readtimeout`
+# is HTTP.jl's deprecated alias for `read_timeout` and still accepted there.
+const _SERVER_TIMEOUT_KWARGS = (:read_header_timeout, :read_timeout, :idle_timeout, :write_timeout,
+                                :readtimeout)
+const _SERVER_TIMEOUT_NS_KWARGS = (:read_header_timeout_ns, :read_timeout_ns, :idle_timeout_ns,
+                                   :write_timeout_ns)
+
+# The largest seconds value HTTP.jl can hold: it stores every timeout as `Int64` nanoseconds.
+const _MAX_TIMEOUT_SECONDS = typemax(Int64) / 1.0e9
+
+# Refuse a timeout HTTP.jl would reject, at the `serve` call that contains it. HTTP.jl checks the
+# same things (`_timeout_ns_from_seconds`), but only inside `listen!` — after `serve` has already
+# mutated the App. Seconds may be any finite real in range, or `nothing`; `Inf` is refused rather
+# than read as "never", because `0`/`nothing` is how HTTP.jl spells never.
+function _validate_server_timeouts(kwargs)
+    for (name, value) in pairs(kwargs)
+        if name in _SERVER_TIMEOUT_KWARGS
+            value === nothing ||
+                (value isa Real && !(value isa Bool) && isfinite(value) &&
+                 0 <= value <= _MAX_TIMEOUT_SECONDS) ||
+                throw(ArgumentError("`$name` must be a finite number of seconds >= 0, or " *
+                    "`nothing` (`0` and `nothing` both disable it), got $(repr(value))"))
+        elseif name in _SERVER_TIMEOUT_NS_KWARGS
+            (value isa Integer && !(value isa Bool) && value >= 0) ||
+                throw(ArgumentError("`$name` must be an integer number of nanoseconds >= 0 " *
+                    "(`0` disables it), got $(repr(value))"))
+        end
+    end
+    return nothing
 end

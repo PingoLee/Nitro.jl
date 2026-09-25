@@ -340,4 +340,189 @@ end
     @test !mentions(logs, "queuesize")
 end
 
+# ── Default server timeouts (#316) ──────────────────────────────────────────────────────────────
+
+@testset "server timeout defaults (unit)" begin
+    pk = Nitro.Core.preprocesskwargs
+    d = pk(pairs((;)))
+    @test d[:read_header_timeout] === Nitro.Core.DEFAULT_READ_HEADER_TIMEOUT_SECONDS
+    @test d[:idle_timeout] === Nitro.Core.DEFAULT_IDLE_TIMEOUT_SECONDS
+    # The two that could cut a legitimate stream stay opt-in.
+    @test !haskey(d, :read_timeout)
+    @test !haskey(d, :write_timeout)
+
+    # An explicit value wins, including the two spellings of "disabled".
+    @test pk(pairs((; read_header_timeout = 5)))[:read_header_timeout] === 5
+    @test pk(pairs((; idle_timeout = 0)))[:idle_timeout] === 0
+    @test pk(pairs((; read_header_timeout = nothing)))[:read_header_timeout] === nothing
+
+    # HTTP.jl throws when it gets both `X` and `X_ns`, so a caller's `_ns` spelling must suppress
+    # the default rather than collide with it.
+    ns = pk(pairs((; read_header_timeout_ns = 10^9, idle_timeout_ns = 0)))
+    @test !haskey(ns, :read_header_timeout)
+    @test !haskey(ns, :idle_timeout)
+end
+
+@testset "an invalid server timeout is rejected at serve(), before any mutation" begin
+    ctx = Nitro.Core.App()
+    for (name, bad) in ((:read_header_timeout, -1), (:read_header_timeout, NaN),
+                        (:idle_timeout, Inf), (:read_timeout, true), (:write_timeout, "5"),
+                        (:read_header_timeout, 1e20), (:idle_timeout_ns, -1),
+                        (:read_timeout_ns, 1.5), (:write_timeout_ns, true))
+        err = try
+            _serve(ctx, get_free_port(); (name => bad,)...)
+            nothing
+        catch e
+            e
+        end
+        @test err isa ArgumentError
+        @test occursin(string(name), sprint(showerror, err))
+        @test !isopen(ctx.service)
+        @test isnothing(ctx.service.external_url[])   # rejected before `serve` touched the App
+    end
+end
+
+@testset "the timeout defaults reach the Server, and an explicit 0 disables them" begin
+    ctx = Nitro.Core.App()
+    srv = _serve(ctx, get_free_port())
+    try
+        @test srv.read_header_timeout_ns == round(Int64, 1e9 * Nitro.Core.DEFAULT_READ_HEADER_TIMEOUT_SECONDS)
+        @test srv.idle_timeout_ns == round(Int64, 1e9 * Nitro.Core.DEFAULT_IDLE_TIMEOUT_SECONDS)
+        @test srv.read_timeout_ns == 0
+        @test srv.write_timeout_ns == 0
+    finally
+        Nitro.Core.terminate(ctx)
+    end
+
+    ctx2 = Nitro.Core.App()
+    srv2 = _serve(ctx2, get_free_port(); read_header_timeout = 0, idle_timeout = nothing)
+    try
+        @test srv2.read_header_timeout_ns == 0
+        @test srv2.idle_timeout_ns == 0
+    finally
+        Nitro.Core.terminate(ctx2)
+    end
+end
+
+"""
+Write `parts` to a fresh raw connection, `gap` seconds apart, and return everything the server
+sends back until it closes the connection (or `limit` seconds pass). A raw socket rather than
+HTTP.jl's client: no pool, no retry, and no way for the client to paper over a slow send.
+"""
+function _raw_exchange(port, parts; gap = 0.0, limit = 15.0)
+    sock = Sockets.connect(Sockets.localhost, port)
+    try
+        for (i, part) in enumerate(parts)
+            i > 1 && sleep(gap)
+            try
+                write(sock, part)
+                flush(sock)
+            catch
+                break          # the server already hung up; read whatever it said first
+            end
+        end
+        reader = @async try
+            String(read(sock))
+        catch
+            ""
+        end
+        timedwait(() -> istaskdone(reader), limit; pollint = 0.05)
+        return istaskdone(reader) ? fetch(reader) : "(no close within $(limit)s)"
+    finally
+        close(sock)
+    end
+end
+
+function _echo_context()
+    ctx = Nitro.Core.App()
+    Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+        path("/echo", req -> String(req.body); method = "POST"),
+        path("/events", req -> Nitro.Res.sse() do events
+            for i in 1:6
+                isopen(events) || break
+                write(events, Nitro.SSEEvent("tick-$i"))
+                sleep(0.25)
+            end
+        end; method = "GET"),
+    ])
+    return ctx
+end
+
+@testset "read_header_timeout bounds the head (Slowloris)" begin
+    ctx = _echo_context()
+    port = get_free_port()
+    _serve(ctx, port; read_header_timeout = 0.5)
+    try
+        t0 = time()
+        reply = _raw_exchange(port, ["GET /echo HTTP/1.1\r\nHost: $HOST\r\n"])   # never finished
+        @test startswith(reply, "HTTP/1.1 408")
+        @test time() - t0 < 10.0
+    finally
+        Nitro.Core.terminate(ctx)
+    end
+end
+
+@testset "read_header_timeout does not bound the body (Go semantics)" begin
+    # The regression this cluster exists for. HTTP.jl leaves the header deadline armed through
+    # the body read when `read_timeout` is unset, so against unpatched Nitro a body that finishes
+    # after the header timeout is cut mid-read — and surfaced as a 500, see the next testset.
+    ctx = _echo_context()
+    port = get_free_port()
+    _serve(ctx, port; read_header_timeout = 0.5)
+    try
+        head = "POST /echo HTTP/1.1\r\nHost: $HOST\r\nContent-Length: 5\r\nConnection: close\r\n\r\n"
+        reply = _raw_exchange(port, [head, "hello"]; gap = 1.5)
+        @test startswith(reply, "HTTP/1.1 200")
+        @test endswith(reply, "hello")
+    finally
+        Nitro.Core.terminate(ctx)
+    end
+end
+
+@testset "an explicit read_timeout still bounds the body, and answers 408 rather than 500" begin
+    # `parallel_stream_handler` used to rethrow HTTP's `DeadlineExceededError` wrapped in a
+    # `TaskFailedException`, which HTTP's stream path cannot classify, so it answered 500.
+    ctx = _echo_context()
+    port = get_free_port()
+    _serve(ctx, port; read_header_timeout = 0.5, read_timeout = 0.5)
+    try
+        head = "POST /echo HTTP/1.1\r\nHost: $HOST\r\nContent-Length: 5\r\nConnection: close\r\n\r\n"
+        reply = _raw_exchange(port, [head, "hello"]; gap = 1.5)
+        @test startswith(reply, "HTTP/1.1 408")
+    finally
+        Nitro.Core.terminate(ctx)
+    end
+end
+
+@testset "a malformed chunked body is answered 400, not 500" begin
+    # The same unwrapping, for a different HTTP.jl error: its chunk parser raises an error HTTP.jl
+    # maps to 400, which the `TaskFailedException` wrapper used to turn into a 500.
+    ctx = _echo_context()
+    port = get_free_port()
+    _serve(ctx, port)
+    try
+        req = "POST /echo HTTP/1.1\r\nHost: $HOST\r\nTransfer-Encoding: chunked\r\n" *
+              "Connection: close\r\n\r\nzz\r\nhello\r\n0\r\n\r\n"
+        @test startswith(_raw_exchange(port, [req]), "HTTP/1.1 400")
+    finally
+        Nitro.Core.terminate(ctx)
+    end
+end
+
+@testset "a short read_header_timeout does not cut an SSE stream" begin
+    # The docs promise the defaults leave streams alone. The stream below runs ~1.5s against a
+    # 0.5s header timeout; on HTTP/1.1 nothing reads the socket while it streams, and the header
+    # deadline is cleared as soon as the head is parsed.
+    ctx = _echo_context()
+    port = get_free_port()
+    _serve(ctx, port; read_header_timeout = 0.5)
+    try
+        reply = _raw_exchange(port, ["GET /events HTTP/1.1\r\nHost: $HOST\r\nConnection: close\r\n\r\n"])
+        @test startswith(reply, "HTTP/1.1 200")
+        @test count("data: tick-", reply) == 6
+    finally
+        Nitro.Core.terminate(ctx)
+    end
+end
+
 end
