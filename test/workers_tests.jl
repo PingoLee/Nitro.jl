@@ -1,3 +1,65 @@
+# #369 with a REAL SIGINT. In-process, an interrupt can only be thrown from inside a sweep (the
+# `InterruptingCleanupStore` testset in the "Workers" item below). Where Julia actually DELIVERS
+# one is the whole bug, and only a separate process can take a signal without taking the test
+# runner down with it.
+#
+# The child is the issue's own reproduction. `--code-coverage=none` for the reason
+# test/bodyparser_tests.jl gives: an inherited coverage flag costs the child its pkgimages. The
+# "unhandled task" match is case-insensitive because `errormonitor` upper-cases it when stderr is
+# not a terminal.
+#
+# Not on Windows: there is no `kill -INT` to send, and Julia's console Ctrl-C there is a
+# different mechanism.
+@testitem "Workers -- Ctrl-C reaches the main task, not the retention scheduler (#369)" tags=[:workers, :slow] setup=[NitroCommon] begin
+using Test
+
+const CTRL_C_CHILD = raw"""
+Base.exit_on_sigint(false)          # what every REPL does
+using Nitro, Nitro.Workers
+rt = WorkerRuntime(InMemoryWorkerStore())
+s = start_cleanup_scheduler(; interval_hours=24, runtime=rt)
+# A plain OS process sends the signal, so no extra Julia task competes for thread 1. Four
+# seconds, not two: under `1,0` the scheduler's first run starts only once the main task parks,
+# and it JIT-compiles `_cleanup_scheduler_loop` then -- a signal landing mid-compile, before
+# the loop's `try`, would fail the task and look like the bug.
+run(`sh -c "sleep 4; kill -INT $(getpid())"`; wait=false)
+got = try
+    sleep(8)                        # parked the way a blocking `serve` parks
+    :main_never_saw_it
+catch e
+    e isa InterruptException ? :main_interrupted : rethrow()
+end
+println("RESULT main=", got, " scheduler_failed=", istaskfailed(s.task))
+"""
+
+function ctrl_c_child(threads::String)
+    cmd = `$(Base.julia_cmd()) --code-coverage=none --threads=$threads --project=$(Base.active_project()) --startup-file=no -e $CTRL_C_CHILD`
+    out, err = IOBuffer(), IOBuffer()
+    p = run(pipeline(ignorestatus(cmd); stdout=out, stderr=err))
+    return (; exitcode=p.exitcode, out=String(take!(out)), err=String(take!(err)))
+end
+
+if !Sys.iswindows()
+    @testset "with an interactive thread -- Julia 1.12's default for `julia` and `-t auto`" begin
+        r = ctrl_c_child("1,1")
+        @test r.exitcode == 0
+        # Against the unpatched scheduler: `main=main_never_saw_it scheduler_failed=true`.
+        @test contains(r.out, "RESULT main=main_interrupted scheduler_failed=false")
+        @test !occursin(r"unhandled task"i, r.err)
+    end
+
+    @testset "on one shared thread -- `-t 1`" begin
+        # Whichever task parked last takes the press here, which in practice is the scheduler. It
+        # must stop with its warning rather than die (unpatched: `scheduler_failed=true`).
+        r = ctrl_c_child("1,0")
+        @test r.exitcode == 0
+        @test contains(r.out, "scheduler_failed=false")
+        @test !occursin(r"unhandled task"i, r.err)
+    end
+end
+
+end
+
 @testitem "Workers" tags=[:core, :workers] setup=[NitroCommon] begin
 
 using Test
@@ -1988,7 +2050,7 @@ end
     #
     # A real SIGINT cannot be aimed at one task in-process, so the interrupt arrives the way the
     # per-tick rethrow routes one that lands inside a sweep: out of `cleanup_tasks!`. The one that
-    # lands in the WAIT is exercised with a real signal by the child-process item at the end of
+    # lands in the WAIT is exercised with a real signal by the child-process item at the top of
     # this file.
     mutable struct InterruptingCleanupStore <: AbstractWorkerStore
         inner  :: InMemoryWorkerStore
@@ -4175,67 +4237,6 @@ end
         finally
             stop_cleanup_scheduler!(rt)
         end
-    end
-end
-
-end
-
-# #369 with a REAL SIGINT. In-process, an interrupt can only be thrown from inside a sweep (the
-# `InterruptingCleanupStore` testset above). Where Julia actually DELIVERS one is the whole bug,
-# and only a separate process can take a signal without taking the test runner down with it.
-#
-# The child is the issue's own reproduction. `--code-coverage=none` for the reason
-# test/bodyparser_tests.jl gives: an inherited coverage flag costs the child its pkgimages. The
-# "unhandled task" match is case-insensitive because `errormonitor` upper-cases it when stderr is
-# not a terminal.
-#
-# Not on Windows: there is no `kill -INT` to send, and Julia's console Ctrl-C there is a
-# different mechanism.
-@testitem "Workers -- Ctrl-C reaches the main task, not the retention scheduler (#369)" tags=[:workers, :slow] setup=[NitroCommon] begin
-using Test
-
-const CTRL_C_CHILD = raw"""
-Base.exit_on_sigint(false)          # what every REPL does
-using Nitro, Nitro.Workers
-rt = WorkerRuntime(InMemoryWorkerStore())
-s = start_cleanup_scheduler(; interval_hours=24, runtime=rt)
-# A plain OS process sends the signal, so no extra Julia task competes for thread 1. Four
-# seconds, not two: under `1,0` the scheduler's first run starts only once the main task parks,
-# and it JIT-compiles `_cleanup_scheduler_loop` then -- a signal landing mid-compile, before
-# the loop's `try`, would fail the task and look like the bug.
-run(`sh -c "sleep 4; kill -INT $(getpid())"`; wait=false)
-got = try
-    sleep(8)                        # parked the way a blocking `serve` parks
-    :main_never_saw_it
-catch e
-    e isa InterruptException ? :main_interrupted : rethrow()
-end
-println("RESULT main=", got, " scheduler_failed=", istaskfailed(s.task))
-"""
-
-function ctrl_c_child(threads::String)
-    cmd = `$(Base.julia_cmd()) --code-coverage=none --threads=$threads --project=$(Base.active_project()) --startup-file=no -e $CTRL_C_CHILD`
-    out, err = IOBuffer(), IOBuffer()
-    p = run(pipeline(ignorestatus(cmd); stdout=out, stderr=err))
-    return (; exitcode=p.exitcode, out=String(take!(out)), err=String(take!(err)))
-end
-
-if !Sys.iswindows()
-    @testset "with an interactive thread -- Julia 1.12's default for `julia` and `-t auto`" begin
-        r = ctrl_c_child("1,1")
-        @test r.exitcode == 0
-        # Against the unpatched scheduler: `main=main_never_saw_it scheduler_failed=true`.
-        @test contains(r.out, "RESULT main=main_interrupted scheduler_failed=false")
-        @test !occursin(r"unhandled task"i, r.err)
-    end
-
-    @testset "on one shared thread -- `-t 1`" begin
-        # Whichever task parked last takes the press here, which in practice is the scheduler. It
-        # must stop with its warning rather than die (unpatched: `scheduler_failed=true`).
-        r = ctrl_c_child("1,0")
-        @test r.exitcode == 0
-        @test contains(r.out, "scheduler_failed=false")
-        @test !occursin(r"unhandled task"i, r.err)
     end
 end
 
