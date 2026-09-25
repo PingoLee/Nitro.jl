@@ -10,7 +10,7 @@ using Base64
 using ..Core
 using ..Core: CookieConfig, get_cookie, set_cookie!
 using ..Core.Types: AbstractSessionStore, get_session, _is_identity
-using ..Core.Crypto: _empty_hmac_key, _pbkdf2_hmac_sha256
+using ..Core.Crypto: _empty_hmac_key, _pbkdf2_hmac_sha256, base64url_encode, base64url_decode
 using ..Core.Util.BodyParsers: _parse_json_bounded
 
 export AuthError,

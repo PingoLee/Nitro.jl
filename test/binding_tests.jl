@@ -485,7 +485,7 @@ req = HTTP.Request("POST", "/", ["Content-Type" => "application/json"], """{"val
 # A JWT claim segment is size-bounded already; the field cap would turn a valid token with many
 # claims into a `ValidationError` where `decode_jwt` promises an `AuthError`. Not capped.
 claims = "{" * join(("\"c$i\":$i" for i in 1:1500), ",") * "}"
-segment = Nitro.Auth._base64url_encode(Vector{UInt8}(claims))
+segment = Nitro.Crypto.base64url_encode(Vector{UInt8}(claims))
 @test length(Nitro.Auth._jwt_segment_json(segment)) == 1500
 end
 

@@ -9,7 +9,7 @@ caught(f) = try; f(); nothing; catch err; err; end
 message(f) = sprint(showerror, caught(f))
 kids(ks::JWTKeyset) = [kid for (kid, _) in Nitro.Auth._verify_candidates(ks, nothing)]
 header_kid(tok) = get(
-    JSON.parse(String(Nitro.Auth._base64url_decode(split(tok, '.')[1]))), "kid", nothing)
+    JSON.parse(String(Nitro.Crypto.base64url_decode(split(tok, '.')[1]))), "kid", nothing)
 
 @testset "exactly one signing key, by construction" begin
     ks = JWTKeyset("current" => jwtkey("s-cur"); verify = ["previous" => jwtkey("s-prev"), "partner" => jwtkey("s-part")])
@@ -124,9 +124,9 @@ end
     # The forged token an attacker builds when the server's secret is "" -- by hand,
     # because `encode_jwt` now refuses to sign it.
     function forge_with_empty_key(claims)
-        seg(x) = Nitro.Auth._base64url_encode(Vector{UInt8}(codeunits(JSON.json(x))))
+        seg(x) = Nitro.Crypto.base64url_encode(Vector{UInt8}(codeunits(JSON.json(x))))
         input = string(seg(Dict("alg" => "HS256", "typ" => "JWT")), ".", seg(claims))
-        sig = Nitro.Auth._base64url_encode(Nitro.Auth._hmac_sha256("", input))
+        sig = Nitro.Crypto.base64url_encode(Nitro.Auth._hmac_sha256("", input))
         return string(input, ".", sig)
     end
     forged = forge_with_empty_key(Dict("sub" => "admin", "exp" => Nitro.Auth._current_timestamp() + 60))

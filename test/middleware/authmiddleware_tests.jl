@@ -281,8 +281,8 @@ using HTTP, JSON
 using Nitro
 
 key = "k"^32
-raw64(str) = Nitro.Auth._base64url_encode(Vector{UInt8}(codeunits(str)))
-sign(input) = string(input, ".", Nitro.Auth._base64url_encode(Nitro.Auth._hmac_sha256(key, input)))
+raw64(str) = Nitro.Crypto.base64url_encode(Vector{UInt8}(codeunits(str)))
+sign(input) = string(input, ".", Nitro.Crypto.base64url_encode(Nitro.Auth._hmac_sha256(key, input)))
 claims = raw64(JSON.json(Dict("sub" => "1", "iat" => trunc(Int, time()), "exp" => trunc(Int, time()) + 60)))
 oversized = sign(string(raw64(JSON.json(Dict("alg" => "HS256", "typ" => "JWT", "x" => "a"^800))), ".", claims))
 control = Nitro.Auth.encode_jwt(Dict("sub" => "1"), key; expires_in = 60)

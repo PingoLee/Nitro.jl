@@ -1639,6 +1639,36 @@ end
     @test_throws Nitro.CookieError Cookies.get_cookie(request_with("c" => good), "c"; encrypted = true)
 end
 
+@testset "one sealed cookie, one spelling (#350)" begin
+    # The lenient decoder this replaced read the standard `+/` alphabet, `=` padding, and a last
+    # character differing only in bits it discards as the SAME bytes, so each of these opened to
+    # the same value -- defeating a denylist or replay cache keyed on the raw cookie. Search for
+    # a token holding a `-` or `_`, so the standard-alphabet spelling actually differs.
+    url = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    good = ""
+    for _ in 1:1_000
+        good = Crypto.encrypt_payload(key, "value"; purpose = "c")
+        any(in("-_"), good) && break
+    end
+    @test any(in("-_"), good)
+    # 1 + 12 + 16 + 16 header + 5 value = 50 bytes: 67 characters, 3 left over, so the last
+    # character carries 2 discarded bits and one `=` would pad it.
+    @test mod(ncodeunits(good), 4) == 3
+    @test Crypto.decrypt_payload(key, good; purpose = "c") == "value"
+    @test Cookies.get_cookie(request_with("c" => good), "c"; encrypted = true, secret_key = key) == "value"
+
+    last_index = findfirst(==(last(good)), url)
+    discarded_bits = url[((last_index - 1) ⊻ 0x01) + 1]    # flip a bit the decoder drops
+    for (label, respelled) in ("padded" => good * "=",
+                               "standard alphabet" => replace(good, '-' => '+', '_' => '/'),
+                               "discarded bits" => good[1:end-1] * discarded_bits,
+                               "non-ASCII" => good[1:end-1] * "é")
+        @test (label, respelled != good) == (label, true)
+        @test_throws Nitro.CookieError Crypto.decrypt_payload(key, respelled; purpose = "c")
+        @test Cookies.get_cookie(request_with("c" => respelled), "c"; encrypted = true, secret_key = key) === nothing
+    end
+end
+
 @testset "a corrupted process is not an absent cookie" begin
     # `get_cookie` reads a CookieError as "absent", so decrypt_payload's rescues must not turn a
     # fatal error into one (#254). A token whose conversion throws stands in for an interrupt
