@@ -336,8 +336,9 @@ frame later and relabelled a `ValidationError` → 400.
 The sites that keep the narrower `e isa InterruptException && rethrow()` do so for **three
 different reasons**, and conflating them is how this list rots:
 
-1. **Nothing recursive is reachable.** `src/types.jl:1024,1055` (`unescapeuri`, `queryparams`),
-   `src/utilities/fileutil.jl:609`, `src/core/framework_middleware.jl:43` (`HTTP.URI`), and
+1. **Nothing recursive is reachable.** `src/types.jl` `_pathparams_uncached` and
+   `_queryvars_uncached` (`unescapeuri`, `queryparams`), `src/utilities/fileutil.jl`
+   `mount_remainder`, `src/utilities/misc.jl` `_log_target_path` (`HTTP.URI`), and
    `src/core/transport.jl` `_swallow_request_body!` (`readbytes!`). All scan-based; no request
    input makes them overflow, so widening them would be churn.
 2. **Not a request path — a background task, where the caught failure has no request to fail.**

@@ -4199,10 +4199,13 @@ Base.exit_on_sigint(false)          # what every REPL does
 using Nitro, Nitro.Workers
 rt = WorkerRuntime(InMemoryWorkerStore())
 s = start_cleanup_scheduler(; interval_hours=24, runtime=rt)
-# A plain OS process sends the signal, so no extra Julia task competes for thread 1.
-run(`sh -c "sleep 2; kill -INT $(getpid())"`; wait=false)
+# A plain OS process sends the signal, so no extra Julia task competes for thread 1. Four
+# seconds, not two: under `1,0` the scheduler's first run starts only once the main task parks,
+# and it JIT-compiles `_cleanup_scheduler_loop` then -- a signal landing mid-compile, before
+# the loop's `try`, would fail the task and look like the bug.
+run(`sh -c "sleep 4; kill -INT $(getpid())"`; wait=false)
 got = try
-    sleep(6)                        # parked the way a blocking `serve` parks
+    sleep(8)                        # parked the way a blocking `serve` parks
     :main_never_saw_it
 catch e
     e isa InterruptException ? :main_interrupted : rethrow()
