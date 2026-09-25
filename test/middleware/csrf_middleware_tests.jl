@@ -401,6 +401,68 @@ end
     @test !any(startswith("__Host-csrf_token="), set_cookie_headers(second))
 end
 
+# #317: `SessionMiddleware` now saves a NEW session only when something marks it modified. A token
+# is bound to the session id, so every path that hands one out must keep the session -- or the
+# anonymous visitor's next request gets a fresh id, the token no longer verifies, and every POST
+# is a 403. These three testsets are the three issuing paths.
+@testset "an anonymous visitor's first GET keeps the session its token is bound to (#317)" begin
+    layer, store = session_layer()
+
+    first = layer(HTTP.Request("GET", "/form"))
+    session_id = cookie_value(first, "unit_session")
+    token_cookie = cookie_value(first, "__Host-csrf_token")
+    @test Base.get(store, session_id, nothing) !== nothing        # saved, though still empty
+    @test CSRF._verify_signed_token(SECRET, token_cookie, session_id) !== nothing
+
+    raw = String(split(token_cookie, '.', limit = 2)[1])
+    post = layer(request("POST", Dict("unit_session" => session_id,
+                                      "__Host-csrf_token" => token_cookie);
+                         headers = ["X-CSRF-Token" => raw]))
+    @test post.status == 200
+end
+
+@testset "a handler-minted token keeps its session too (#317)" begin
+    minting(req) = begin
+        res = HTTP.Response(200, "ok")
+        issue_csrf_token!(res, SECRET; binding = req.context[:session_id])
+        res
+    end
+    layer, store = session_layer(handler = minting)
+
+    res = layer(HTTP.Request("GET", "/form"))
+    session_id = cookie_value(res, "unit_session")
+    @test Base.get(store, session_id, nothing) !== nothing
+    @test CSRF._verify_signed_token(SECRET, cookie_value(res, "__Host-csrf_token"), session_id) !== nothing
+end
+
+@testset "a refused POST on a lost session re-issues against a session that is kept (#317)" begin
+    # The client holds a genuine token pair, but its session is gone (pruned, or the store
+    # restarted): the presented id is unknown, so `SessionMiddleware` mints a fresh one. The
+    # rejection path re-issues a token bound to that fresh id -- which is only usable if the
+    # fresh session is saved and handed to the client in the same response.
+    layer, store = session_layer()
+    lost = "33333333-3333-4333-8333-333333333333"
+    stale = HTTP.Response(200, "ok")
+    issue_csrf_token!(stale, SECRET; binding = lost)
+    token_cookie = cookie_value(stale, "__Host-csrf_token")
+    raw = String(split(token_cookie, '.', limit = 2)[1])
+
+    refused = layer(request("POST", Dict("unit_session" => lost, "__Host-csrf_token" => token_cookie);
+                            headers = ["X-CSRF-Token" => raw]))
+    @test refused.status == 403
+    fresh_session = cookie_value(refused, "unit_session")
+    fresh_token = cookie_value(refused, "__Host-csrf_token")
+    @test fresh_session != lost
+    @test Base.get(store, fresh_session, nothing) !== nothing
+    @test CSRF._verify_signed_token(SECRET, fresh_token, fresh_session) !== nothing
+
+    fresh_raw = String(split(fresh_token, '.', limit = 2)[1])
+    retry = layer(request("POST", Dict("unit_session" => fresh_session,
+                                       "__Host-csrf_token" => fresh_token);
+                          headers = ["X-CSRF-Token" => fresh_raw]))
+    @test retry.status == 200
+end
+
 @testset "a handler-driven rotation re-issues the token in the same response" begin
     # `regenerate_session!` orphans a token bound to the old id. Issuing only when the cookie is
     # ABSENT would leave the client holding a permanently invalid token -- a login that locks out

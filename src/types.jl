@@ -9,6 +9,7 @@ using JSON
 using Dates
 using Base: @kwdef
 using DataStructures: CircularDeque
+using LRUCache: LRU
 using ..Util
 using ..Errors: ValidationError, StoreInterfaceError, implements_contract_method, store_contract_error
 using ..Crypto: SecretString, _cookie_secret
@@ -449,15 +450,38 @@ is_expired(payload, payload.expires)           # true -- the boundary is expired
 """
 is_expired(payload::SessionPayload, at::DateTime = Dates.now(Dates.UTC)) = payload.expires <= at
 
-# A thread-safe in-memory store for sessions
+"""
+The `max_sessions` a [`MemoryStore`](@ref) is built with when none is given (#317). Around
+200 B of payload per anonymous session plus the LRU's own bookkeeping puts a full store in the
+tens of megabytes: enough headroom for any single-process deployment that should be using a
+`MemoryStore` at all, and small enough that a flood cannot take the process down.
+"""
+const DEFAULT_MAX_SESSIONS = 100_000
+
+# A thread-safe, size-bounded in-memory store for sessions. `data` is an LRU (#317): it used to be
+# a plain `Dict` with no bound, which pruning shrank only by EXPIRED rows -- so a cookieless loop
+# grew it by one 24 h session per request until the process ran out of memory, and the janitor's
+# O(N) sweep then held `lock` for seconds per tick. `lock` still guards every compound operation
+# (`update_session!`'s check-and-write, the prune's two-pass sweep); the LRU's own lock covers only
+# its single calls.
 struct MemoryStore{K, V} <: AbstractSessionStore{K, V}
-    data::Dict{K, SessionPayload{V}}
+    data::LRU{K, SessionPayload{V}}
     lock::Base.ReentrantLock
-    MemoryStore{K, V}() where {K, V} = new{K, V}(Dict{K, SessionPayload{V}}(), Base.ReentrantLock())
+    max_sessions::Int
+    warned_full::Threads.Atomic{Bool}
+
+    function MemoryStore{K, V}(; max_sessions::Integer = DEFAULT_MAX_SESSIONS) where {K, V}
+        max_sessions > 0 ||
+            throw(ArgumentError("MemoryStore: max_sessions must be positive, got $max_sessions"))
+        n = Int(max_sessions)
+        return new{K, V}(LRU{K, SessionPayload{V}}(maxsize = n), Base.ReentrantLock(), n,
+                         Threads.Atomic{Bool}(false))
+    end
 end
 
 """
-    MemoryStore()
+    MemoryStore(; max_sessions = 100_000)
+    MemoryStore{K, V}(; max_sessions = 100_000)
 
 Build a `MemoryStore{String, Dict{String,Any}}` -- the exact type parameters
 `SessionMiddleware` pins its `store` keyword to, so this is the store to reach for
@@ -467,13 +491,30 @@ when you just want in-process sessions:
 serve(middleware = [SessionMiddleware(store = MemoryStore())])
 ```
 
-Sessions live in this process only: they are lost on restart and not shared between processes.
-Use a persistent store (`pormg_nitro_session()`) behind more than one worker.
+**For development or a single process.** Sessions live in this process only: they are lost on
+restart and not shared between processes. Use a persistent store (`pormg_nitro_session()`)
+behind more than one worker.
+
+**Bounded.** It holds at most `max_sessions` sessions. Once full, admitting a new session evicts
+the **least recently used** one (reading a session counts as using it), and the store logs one
+warning the first time it fills. Under a flood of new sessions that means idle users are logged
+out rather than the process running out of memory (#317). Raise `max_sessions` if you really hold
+more live sessions than that. A non-positive value is an `ArgumentError`.
 
 Each call builds a **separate** store. There is no shared default (#171) -- two `App`s that each
 want their own session table simply call this twice.
 """
-MemoryStore() = MemoryStore{String, Dict{String,Any}}()
+MemoryStore(; max_sessions::Integer = DEFAULT_MAX_SESSIONS) =
+    MemoryStore{String, Dict{String,Any}}(; max_sessions)
+
+# Once per store, not per insert: at capacity EVERY new session evicts one, and a warning per
+# eviction would be a second flood riding on the first.
+function _warn_memorystore_full(store::MemoryStore)
+    Threads.atomic_xchg!(store.warned_full, true) && return nothing
+    @warn "MemoryStore is full: each new session now evicts the least recently used one. " *
+          "Raise `max_sessions`, or use a persistent store such as `pormg_nitro_session()`." max_sessions = store.max_sessions
+    return nothing
+end
 
 function Base.get(store::MemoryStore, key, default)
     lock(store.lock) do
@@ -513,9 +554,11 @@ end
 # payload while another request was deep-copying it on load.
 function set_session!(store::MemoryStore{K, V}, key::K, value::V; ttl::Int = 3600) where {K, V}
     stored = _copy_session_value(value)
-    lock(store.lock) do
+    full = lock(store.lock) do
         store.data[key] = SessionPayload(stored, Dates.now(Dates.UTC) + Dates.Second(ttl))
+        return length(store.data) >= store.max_sessions
     end
+    full && _warn_memorystore_full(store)
     return value
 end
 
@@ -533,7 +576,10 @@ end
 
 function delete_session!(store::MemoryStore{K, V}, key) where {K, V}
     lock(store.lock) do
-        delete!(store.data, key)
+        # `LRU`'s `delete!` throws `KeyError` on a missing key where `Dict`'s is a no-op, and
+        # deleting an id that was never saved is routine: `regenerate_session!` on a new session
+        # that was never stored (#317), or on one a concurrent logout already removed.
+        haskey(store.data, key) && delete!(store.data, key)
     end
     return nothing
 end

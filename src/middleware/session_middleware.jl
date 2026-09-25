@@ -112,6 +112,24 @@ Expired sessions are reclaimed by a background janitor that starts on `serve()` 
 `terminate()` — see `prune_interval` below and [`SessionPruner`](@ref). Nothing prunes on the
 request path.
 
+# When a session is saved
+
+A request without a valid session cookie gets a fresh id in `req.context[:session_id]` and an
+empty `getsession(req)`. That new session is **saved, and its cookie set, only if** the handler
+leaves data in it, rotates it (`regenerate_session!`), or sets
+`req.context[:session_modified] = true` (#317). Otherwise nothing is stored and no cookie is sent,
+so health checks and static files do not create sessions. `CSRFMiddleware` sets the flag whenever
+it issues a token bound to the session. Set it yourself when you hand the client anything else
+bound to `req.context[:session_id]`.
+
+An existing session is written back when its data changed, or when the flag is set (which also
+refreshes its expiry). That write is update-only (`update_session!`, #318). If a concurrent logout
+deleted the session meanwhile, the write is dropped and the cookie is not re-set.
+
+A response that sets the session cookie also gets `Vary: Cookie`, and `Cache-Control: private` in
+place of any `public` (other directives are kept). A shared cache therefore never serves one
+visitor's session to another.
+
 # Session fixation defense (`rotate_on_auth`, `auth_key`, `validator`)
 
 When `rotate_on_auth=true` (the default), an existing session is assigned a **new** session
@@ -223,17 +241,28 @@ function SessionMiddleware(;
                 end
             end
 
+            # `:session_modified` is Django's `modified` flag: something OUTSIDE the session data
+            # depends on this session existing. `CSRFMiddleware` sets it whenever it hands out a
+            # token bound to the id -- without it an anonymous visitor's token would be bound to
+            # an id that was never saved, and every later POST would 403.
+            forced = get(req.context, :session_modified, false) === true
+            rotated = final_session_id != session_id
+
+            # A NEW session is saved lazily (#317): only once it holds data, was rotated, or was
+            # marked modified. It used to be saved for `max_age` -- and handed a cookie -- on
+            # every cookieless request, so a `/health` loop grew `MemoryStore` without bound and
+            # cost a PormG store a SELECT plus an INSERT per request.
+            #
             # An id minted during THIS request -- a new visitor's, or one `regenerate_session!`
             # rotated to -- is inserted. An id the request LOADED is written back update-only
             # (#318): if a concurrent logout or rotation deleted it meanwhile, the write is
             # dropped and the cookie is not re-set. Upserting it re-created the deleted session,
             # so a stolen id outlived the logout meant to kill it and the browser was logged
             # back in.
-            minted = is_new || final_session_id != session_id
-            if minted
+            if rotated || (is_new && (forced || !isempty(current_session)))
                 _save_session(store, final_session_id, current_session, max_age)
                 session_written = true
-            elseif current_session != original_session
+            elseif !is_new && (forced || current_session != original_session)
                 session_written = update_session!(store, final_session_id, current_session;
                                                   ttl = max_age)
             else
@@ -248,6 +277,7 @@ function SessionMiddleware(;
                 response = own_response_headers(response)
                 # Append the session cookie without clobbering any sibling Set-Cookie headers.
                 set_cookie!(response, session_cookie, final_session_id; config=config, encrypted=false, maxage=max_age)
+                _mark_private!(response)
             end
 
             return response
@@ -339,5 +369,47 @@ end
 function _save_session(store::AbstractSessionStore{String, Dict{String,Any}}, session_id::String, data::Dict{String,Any}, max_age::Int)
     storesession!(store, session_id, data; ttl=max_age)
 end
+
+# A response carrying one visitor's session cookie must never be stored by a SHARED cache (#317).
+# A static file served `public, max-age=31536000, immutable` under a global `SessionMiddleware`
+# used to carry `Set-Cookie: <session>=<fresh id>` with no `private` and no `Vary: Cookie`, so a
+# CDN that stored it handed one session -- and the CSRF token bound to it -- to every visitor.
+#
+# Only ever called on headers this middleware already owns (`own_response_headers`).
+function _mark_private!(response::HTTP.Response)
+    vary = String[]
+    cache_control = String[]
+    for (name, value) in response.headers
+        field = lowercase(name)
+        if field == "vary"
+            append!(vary, _header_list(value))
+        elseif field == "cache-control"
+            append!(cache_control, _header_list(value))
+        end
+    end
+
+    # `Vary` may already span several field lines -- `Cors` pushes its own `Vary: Origin` -- and
+    # another line is additive by definition, so nothing already there is rewritten.
+    if !any(t -> t == "*" || lowercase(t) == "cookie", vary)
+        push!(response.headers, "Vary" => "Cookie")
+    end
+
+    # `private` wins over `public`; every other directive (`max-age`, `immutable`, …) is kept, so
+    # the visitor's own browser still caches exactly as the handler asked. A response already
+    # `private` or `no-store` is left alone.
+    names = String[lowercase(strip(first(split(d, '='; limit = 2)))) for d in cache_control]
+    if !("private" in names || "no-store" in names)
+        kept = String[d for (d, n) in zip(cache_control, names) if n != "public"]
+        # `setheader` replaces EVERY existing `Cache-Control` line with this one.
+        HTTP.setheader(response, "Cache-Control" => join(pushfirst!(kept, "private"), ", "))
+    end
+    return response
+end
+
+# The comma-separated elements of a list-valued header, trimmed. A quoted element holding a comma
+# (`no-cache="a, b"`) splits in two, but the pieces are re-joined in order with ", ", so it is
+# written back as it came -- and no directive name this function tests can be inside quotes.
+_header_list(value::AbstractString) =
+    String[strip(element) for element in split(value, ',') if !isempty(strip(element))]
 
 end # module SessionMiddleware_

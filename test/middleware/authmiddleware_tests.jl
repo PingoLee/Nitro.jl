@@ -302,9 +302,10 @@ end
 
 # ── #310 ────────────────────────────────────────────────────────────────────────────────────
 #
-# `session_user_validator` through the real request path: `SessionMiddleware` gives EVERY
-# visitor a session, so the validator's answer for an anonymous one is what decides whether
-# `CookieAuthMiddleware` authenticates everybody. In-process (`internalrequest`), no socket.
+# `session_user_validator` through the real request path: any anonymous visitor can hold a stored
+# session -- one a cart write created, or an empty one `CSRFMiddleware` kept for its token (#317) --
+# so the validator's answer for an anonymous one is what decides whether `CookieAuthMiddleware`
+# authenticates everybody. In-process (`internalrequest`), no socket.
 @testitem "Auth middleware — an anonymous session does not authenticate (#310)" tags=[:middleware, :auth, :security] setup=[NitroCommon] begin
 using HTTP
 using Nitro
@@ -317,7 +318,10 @@ session_auth = CookieAuthMiddleware(Nitro.Auth.session_user_validator(store); co
 urlpatterns(app, "",
     path("/cart/add", req -> (push!(get!(getsession(req), "cart", Int[]), 101); "added")),
     path("/login", req -> (getsession(req)["user_id"] = 42; "in")),
-    path("/touch", req -> "touched"),
+    # Keeps an EMPTY session, the way `CSRFMiddleware` does for an anonymous visitor's token.
+    # Since #317 a new session nothing marks or writes is not saved at all -- there would be no
+    # empty session to test.
+    path("/touch", req -> (req.context[:session_modified] = true; "touched")),
     path("/api/me", req -> repr(getuser(req)); middleware = [session_auth]))
 mw = [SessionMiddleware(store = store, secure = false)]
 get_with(target, sid) = internalrequest(app, HTTP.Request("GET", target, ["Cookie" => "nitro_session=$sid"]); middleware = mw)

@@ -207,6 +207,12 @@ function _client_echoed_own_cookie(req::HTTP.Request, cookie_name::String, heade
     return _constant_time_equals(presented, raw_token) || _constant_time_equals(presented, cookie_value)
 end
 
+# A token going out in this response is bound to the session id, so that session must outlive the
+# response. `SessionMiddleware` saves a NEW session only when something marks it modified (#317).
+# Without this, an anonymous visitor's token was bound to an id nobody stored: the next request
+# got a fresh id, the token no longer verified, and every POST was a 403.
+_keep_session!(req::HTTP.Request) = (req.context[:session_modified] = true; nothing)
+
 """
 Is `res` already setting `cookie_name` itself? A handler is allowed to mint its own token (and to
 return the raw value in its body); the middleware must not then append a second, different cookie
@@ -279,6 +285,7 @@ function CSRFMiddleware(key::Union{AbstractString, SecretString}; cookie_name::S
                     if binding !== nothing && _client_echoed_own_cookie(req, cookie_name, header_name, form_field)
                         rejection = own_response_headers(rejection)
                         issue_csrf_token!(rejection, secret; binding, cookie_name, ttl, config)
+                        _keep_session!(req)
                     end
                     return rejection
                 end
@@ -305,14 +312,17 @@ function CSRFMiddleware(key::Union{AbstractString, SecretString}; cookie_name::S
             end
 
             cookie_value = get_cookie(req, cookie_name, nothing; encrypted=false)
-            if (cookie_value === nothing || _verify_signed_token(secret, cookie_value, binding) === nothing) &&
-               !_response_sets_cookie(response, cookie_name)
+            needs_token = cookie_value === nothing ||
+                          _verify_signed_token(secret, cookie_value, binding) === nothing
+            handler_minted = _response_sets_cookie(response, cookie_name)
+            if needs_token && !handler_minted
                 # Own the headers before issuing the cookie: `response` may be a shared/`const`
                 # object, and `issue_csrf_token!` mutates the headers in place.
                 response = own_response_headers(response)
                 raw_token = issue_csrf_token!(response, secret; binding, cookie_name, ttl, config)
                 req.context[:csrf_token] = raw_token
             end
+            (needs_token || handler_minted) && _keep_session!(req)
             return response
         end
     end

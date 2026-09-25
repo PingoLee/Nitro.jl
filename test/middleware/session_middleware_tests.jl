@@ -7,7 +7,7 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
 
 @testset "SessionMiddleware" begin
 
-    @testset "session creation on first request" begin
+    @testset "session creation on first write" begin
         # Create a dedicated store for testing
         store = MemoryStore{String, Dict{String,Any}}()
 
@@ -18,12 +18,14 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
             store=store,
         ).middleware
 
-        # Simulate a handler that reads the session
+        # A handler that finds an empty session and writes to it. Writing is what creates the
+        # session since #317; the read-only case is the next testset.
         handler = function(req::HTTP.Request)
             session = getsession(req)
             @test !isnothing(session)       # session should be injected
             @test session isa Dict{String,Any}
             @test isempty(session)           # new session should be empty
+            session["visited"] = true
             return HTTP.Response(200, "OK")
         end
 
@@ -43,6 +45,107 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
         @test occursin("HttpOnly", set_cookie_headers[1].second)
         @test occursin("Secure", set_cookie_headers[1].second)
         @test occursin("SameSite=Lax", set_cookie_headers[1].second)
+        @test length(store.data) == 1
+    end
+
+    # #317. This used to be the first half of the testset above, asserting the OPPOSITE: a
+    # read-only first request got a `Set-Cookie` and a 24 h stored session. That expectation
+    # encoded the defect -- every cookieless request (a health check, a static file) stored a
+    # session, growing `MemoryStore` without bound and costing a PormG store an INSERT each.
+    # Django (`request.session.modified`) and express-session (`saveUninitialized: false`) both
+    # save a new session only once it is used; that is the behaviour asserted now.
+    @testset "a new session nobody writes is not saved (#317)" begin
+        store = MemoryStore()
+        mw = SessionMiddleware(cookie_name="lazy_session", max_age=3600, store=store).middleware
+
+        seen_id = Ref{Any}(nothing)
+        handler = mw(function (req::HTTP.Request)
+            seen_id[] = req.context[:session_id]      # an id exists for the whole request...
+            _ = get(getsession(req), "user_id", nothing)
+            return HTTP.Response(200, "OK")
+        end)
+
+        for _ in 1:50                                 # a cookieless health-check loop
+            response = handler(HTTP.Request("GET", "/health"))
+            @test response.status == 200
+            @test isempty(filter(h -> lowercase(h.first) == "set-cookie", response.headers))
+        end
+        @test seen_id[] isa String
+        @test length(store.data) == 0                 # ...but nothing was stored
+    end
+
+    @testset "`:session_modified` saves a new session and refreshes an existing one (#317)" begin
+        store = MemoryStore()
+        mw = SessionMiddleware(cookie_name="pinned", max_age=3600, store=store, secure=false).middleware
+        pin = mw(function (req::HTTP.Request)
+            req.context[:session_modified] = true
+            return HTTP.Response(200, "OK")
+        end)
+
+        # New and still empty, but marked: saved, and the cookie is set.
+        response = pin(HTTP.Request("GET", "/"))
+        sid = String(match(r"pinned=([^;]+)", HTTP.header(response, "Set-Cookie")).captures[1])
+        @test Base.get(store, sid, nothing).data == Dict{String,Any}()
+
+        # Existing and unchanged, but marked: written back, which moves its expiry forward.
+        lock(store.lock) do
+            store.data[sid] = SessionPayload(Dict{String,Any}(), Dates.now(Dates.UTC) + Dates.Second(5))
+        end
+        response = pin(HTTP.Request("GET", "/", ["Cookie" => "pinned=$sid"]))
+        @test occursin("pinned=$sid", HTTP.header(response, "Set-Cookie"))
+        @test Base.get(store, sid, nothing).expires > Dates.now(Dates.UTC) + Dates.Second(3000)
+    end
+
+    @testset "a response that sets the session cookie is never publicly cacheable (#317)" begin
+        store = MemoryStore()
+        mw = SessionMiddleware(cookie_name="cache_session", max_age=3600, store=store, secure=false).middleware
+
+        headers_of(res, name) = [h.second for h in res.headers if lowercase(h.first) == lowercase(name)]
+        writing(headers) = mw(function (req::HTTP.Request)
+            getsession(req)["seen"] = true
+            return HTTP.Response(200, headers, "asset")
+        end)
+
+        # The issue's case: an immutable static asset under a global SessionMiddleware.
+        immutable = ["Cache-Control" => "public, max-age=31536000, immutable"]
+        res = writing(immutable)(HTTP.Request("GET", "/app.js"))
+        @test headers_of(res, "Cache-Control") == ["private, max-age=31536000, immutable"]
+        @test headers_of(res, "Vary") == ["Cookie"]
+
+        # No Cache-Control at all: `private` is added, not left to a heuristic freshness guess.
+        res = writing(Pair{String,String}[])(HTTP.Request("GET", "/"))
+        @test headers_of(res, "Cache-Control") == ["private"]
+
+        # An existing `Vary` is kept and `Cookie` is added beside it; one naming it already, or
+        # `*`, is left alone. Same for a response already `private` or `no-store`.
+        res = writing(["Vary" => "Origin"])(HTTP.Request("GET", "/"))
+        @test sort(headers_of(res, "Vary")) == ["Cookie", "Origin"]
+        res = writing(["Vary" => "Accept-Encoding, cookie", "Cache-Control" => "no-store"])(HTTP.Request("GET", "/"))
+        @test headers_of(res, "Vary") == ["Accept-Encoding, cookie"]
+        @test headers_of(res, "Cache-Control") == ["no-store"]
+        res = writing(["Vary" => "*", "Cache-Control" => "private, max-age=60"])(HTTP.Request("GET", "/"))
+        @test headers_of(res, "Vary") == ["*"]
+        @test headers_of(res, "Cache-Control") == ["private, max-age=60"]
+
+        # A response that sets NO session cookie is not touched: an existing visitor reading a
+        # public asset keeps it publicly cacheable.
+        sid = String(match(r"cache_session=([^;]+)",
+                           HTTP.header(writing(immutable)(HTTP.Request("GET", "/")), "Set-Cookie")).captures[1])
+        reader = mw(req -> HTTP.Response(200, immutable, "asset"))
+        res = reader(HTTP.Request("GET", "/app.js", ["Cookie" => "cache_session=$sid"]))
+        @test headers_of(res, "Cache-Control") == ["public, max-age=31536000, immutable"]
+        @test isempty(headers_of(res, "Vary"))
+
+        # And the rewrite happens on the middleware's OWN copy: a shared `const` response the
+        # handler returns is not mutated (nitro-core §4).
+        shared = HTTP.Response(200, ["Cache-Control" => "public, max-age=60"], "shared")
+        res = mw(function (req::HTTP.Request)
+            getsession(req)["x"] = 1
+            return shared
+        end)(HTTP.Request("GET", "/"))
+        @test headers_of(res, "Cache-Control") == ["private, max-age=60"]
+        @test headers_of(shared, "Cache-Control") == ["public, max-age=60"]
+        @test isempty(headers_of(shared, "Vary"))
     end
 
     @testset "session cookie attributes are configurable" begin
@@ -216,23 +319,27 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
             store=store,
         ).middleware
 
-        # Handler checks session is fresh (empty)
+        # Handler checks session is fresh (empty), then writes to it -- a new session is saved
+        # only once it is used (#317).
         handler = function(req::HTTP.Request)
             session = getsession(req)
             @test isempty(session)  # expired session should yield a new empty session
+            session["fresh"] = true
             return HTTP.Response(200, "fresh")
         end
 
         wrapped = mw(handler)
         req = HTTP.Request("GET", "/test", ["Cookie" => "exp_session=$expired_id"])
         response = wrapped(req)
-        
+
         @test response.status == 200
-        
+
         # Should have a new Set-Cookie (different session ID)
         set_cookie_headers = filter(h -> lowercase(h.first) == "set-cookie", response.headers)
         @test length(set_cookie_headers) >= 1
         @test !occursin(expired_id, set_cookie_headers[1].second)
+        # The expired row is not revived under its old id: the new data went to the new id.
+        @test store.data[expired_id].data == Dict{String,Any}("old" => true)
     end
 
     @testset "unmodified session not re-saved" begin

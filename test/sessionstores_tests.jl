@@ -223,6 +223,45 @@ end
     @test get_session(store, "live") === nothing
 end
 
+# #317: `MemoryStore` was an unbounded `Dict` that pruning shrank only by EXPIRED rows, so a flood
+# of new sessions grew it until the process ran out of memory.
+@testset "MemoryStore is bounded and evicts the least recently used session (#317)" begin
+    @test MemoryStore().max_sessions == 100_000
+    @test MemoryStore{String, Dict{String,Any}}().max_sessions == 100_000
+    @test_throws ArgumentError MemoryStore(max_sessions = 0)
+    @test_throws ArgumentError MemoryStore(max_sessions = -1)
+
+    store = MemoryStore(max_sessions = 3)
+    session(v) = Dict{String,Any}("v" => v)
+    set_session!(store, "a", session(1); ttl=3600)
+    set_session!(store, "b", session(2); ttl=3600)
+
+    # Filling the store warns -- once.
+    @test_logs (:warn, r"MemoryStore is full") set_session!(store, "c", session(3); ttl=3600)
+
+    # Reading `a` makes it the most recently used, so `b` is now the one to go.
+    @test get_session(store, "a") == session(1)
+    @test_logs min_level=Base.CoreLogging.Warn set_session!(store, "d", session(4); ttl=3600)
+    @test length(store.data) == 3
+    @test get_session(store, "b") === nothing
+    @test get_session(store, "a") == session(1)
+    @test get_session(store, "c") == session(3)
+    @test get_session(store, "d") == session(4)
+
+    # Overwriting a key that is present evicts nothing.
+    set_session!(store, "d", session(40); ttl=3600)
+    @test length(store.data) == 3
+    @test update_session!(store, "c", session(30); ttl=3600)
+    @test sort(collect(keys(store.data))) == ["a", "c", "d"]
+
+    # The prune still works on the LRU.
+    lock(store.lock) do
+        store.data["a"] = SessionPayload(session(1), Dates.now(Dates.UTC) - Dates.Second(1))
+    end
+    cleanup_expired_sessions!(store)
+    @test sort(collect(keys(store.data))) == ["c", "d"]
+end
+
 # #318: a stored value and a request's value must never be the same object. A shallow copy
 # shared nested vectors and dicts between the store and every concurrent request of a session.
 @testset "MemoryStore isolates nested values from callers (#318)" begin

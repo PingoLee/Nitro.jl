@@ -35,7 +35,11 @@ end
 @testset "SessionMiddleware does not leak a Set-Cookie onto a shared const" begin
     @test isempty(SHARED.headers)
     store = MemoryStore{String, Dict{String,Any}}()
-    wrapped = SessionMiddleware(cookie_name="sid", max_age=3600, store=store).middleware(req -> SHARED)
+    # The handler WRITES to the session before returning the const. Since #317 a new session
+    # that nothing writes is not saved and gets no cookie, so a read-only handler here would
+    # never reach the `Set-Cookie` path this guard exists for.
+    wrapped = SessionMiddleware(cookie_name="sid", max_age=3600, store=store).middleware(
+        req -> (getsession(req)["seen"] = true; SHARED))
 
     # Two distinct new visitors (no session cookie) both get the shared 401 const back.
     respA = wrapped(HTTP.Request("GET", "/protected"))
@@ -47,6 +51,11 @@ end
     @test ca !== nothing && cb !== nothing              # each visitor gets their own session cookie
     @test ca != cb                                      # …and B does NOT receive A's session id
     @test isempty(SHARED.headers)                       # the shared const carries no Set-Cookie of its own
+
+    # A visitor whose session is never written is handed the const itself, untouched.
+    untouched = SessionMiddleware(cookie_name="sid", max_age=3600, store=store).middleware(req -> SHARED)
+    @test untouched(HTTP.Request("GET", "/protected")) === SHARED
+    @test isempty(SHARED.headers)
 end
 
 @testset "CSRFMiddleware does not leak a Set-Cookie onto a shared const" begin
