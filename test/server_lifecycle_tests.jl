@@ -509,6 +509,158 @@ end
     end
 end
 
+# ── The in-flight request cap (#298) ────────────────────────────────────────────────────────────
+
+@testset "max_concurrent_requests is validated at serve(), before any mutation" begin
+    ctx = Nitro.Core.App()
+    for bad in (0, -1, true, 1.5, "2")
+        err = try
+            _serve(ctx, get_free_port(); max_concurrent_requests = bad)
+            nothing
+        catch e
+            e
+        end
+        @test err isa ArgumentError
+        @test occursin("max_concurrent_requests", sprint(showerror, err))
+        @test !isopen(ctx.service)
+        @test isnothing(ctx.service.external_url[])
+    end
+    # A custom handler reads its own body, so Nitro cannot hold a slot around it.
+    err = try
+        _serve(ctx, get_free_port(); max_concurrent_requests = 4,
+               handler = mw -> (stream -> nothing), max_body_bytes = nothing)
+        nothing
+    catch e
+        e
+    end
+    @test err isa ArgumentError
+    @test occursin("custom `handler`", sprint(showerror, err))
+    @test !isopen(ctx.service)
+end
+
+@testset "_is_streaming_body tells a cursor from a buffer" begin
+    @test !Nitro.Core._is_streaming_body(HTTP.BytesBody(UInt8[1, 2]))
+    @test !Nitro.Core._is_streaming_body(HTTP.EmptyBody())
+    @test !Nitro.Core._is_streaming_body(UInt8[1, 2])
+    @test !Nitro.Core._is_streaming_body("text")
+    events = Nitro.Res.sse().body
+    try
+        @test Nitro.Core._is_streaming_body(events)
+    finally
+        close(events)
+    end
+end
+
+"""
+A context whose `/park` handler signals `entered` and then blocks until `release` is notified,
+so one request can be held in flight on purpose. `/ok` and `/events` answer at once, and
+`/boom` throws inside the handler.
+"""
+function _capacity_context(entered::Threads.Atomic{Bool}, release::Base.Event)
+    ctx = Nitro.Core.App()
+    Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+        path("/park", function(req)
+            entered[] = true
+            wait(release)
+            return "parked"
+        end; method = "GET"),
+        path("/ok", req -> "ok"; method = "GET"),
+        path("/echo", req -> String(req.body); method = "POST"),
+        path("/boom", req -> error("boom"); method = "GET"),
+        path("/events", req -> Nitro.Res.sse() do events
+            for i in 1:40
+                isopen(events) || break
+                write(events, Nitro.SSEEvent("tick-$i"))
+                sleep(0.1)
+            end
+        end; method = "GET"),
+    ])
+    return ctx
+end
+
+_get(port, target) = _raw_exchange(port, ["GET $target HTTP/1.1\r\nHost: $HOST\r\nConnection: close\r\n\r\n"])
+
+@testset "over max_concurrent_requests: 503 + Retry-After, and the slot frees when the request ends" begin
+    entered, release = Threads.Atomic{Bool}(false), Base.Event()
+    ctx = _capacity_context(entered, release)
+    port = get_free_port()
+    _serve(ctx, port; max_concurrent_requests = 1)
+    parked = nothing
+    try
+        parked = @async _get(port, "/park")
+        @test timedwait(() -> entered[], 20.0; pollint = 0.02) === :ok
+
+        refused = _get(port, "/ok")
+        @test startswith(refused, "HTTP/1.1 503")
+        @test occursin(r"\r\nRetry-After: 1\r\n"i, refused)
+        @test occursin(r"\r\nConnection: close\r\n"i, refused)
+        # A body sent with the refused request is not read into memory, and the refusal still
+        # reaches the client rather than an RST (the swallow budget covers this small body).
+        refused_post = _raw_exchange(port, ["POST /echo HTTP/1.1\r\nHost: $HOST\r\n" *
+            "Content-Length: 5\r\nConnection: close\r\n\r\nhello"])
+        @test startswith(refused_post, "HTTP/1.1 503")
+
+        notify(release)
+        @test timedwait(() -> istaskdone(parked), 20.0; pollint = 0.02) === :ok
+        @test startswith(fetch(parked), "HTTP/1.1 200")
+        @test startswith(_get(port, "/ok"), "HTTP/1.1 200")   # the slot came back
+    finally
+        notify(release)
+        Nitro.Core.terminate(ctx)
+    end
+end
+
+@testset "a request that fails still gives its slot back" begin
+    entered, release = Threads.Atomic{Bool}(false), Base.Event()
+    ctx = _capacity_context(entered, release)
+    port = get_free_port()
+    _serve(ctx, port; max_concurrent_requests = 1)
+    try
+        # A handler error, caught and answered by the middleware chain.
+        @test startswith(_get(port, "/boom"), "HTTP/1.1 500")
+        @test startswith(_get(port, "/ok"), "HTTP/1.1 200")
+        # An error that escapes `stream_handler` itself — HTTP.jl's chunk parser — so only the
+        # outer `finally` can return the slot.
+        bad = "POST /echo HTTP/1.1\r\nHost: $HOST\r\nTransfer-Encoding: chunked\r\n" *
+              "Connection: close\r\n\r\nzz\r\nhello\r\n0\r\n\r\n"
+        @test startswith(_raw_exchange(port, [bad]), "HTTP/1.1 400")
+        @test startswith(_get(port, "/ok"), "HTTP/1.1 200")
+        # And the 413 path, which returns from inside the permit's `try`. `Expect: 100-continue`
+        # so the refusal does not wait to swallow a body this client never sends.
+        big = "POST /echo HTTP/1.1\r\nHost: $HOST\r\nContent-Length: 999999999999\r\n" *
+              "Expect: 100-continue\r\nConnection: close\r\n\r\n"
+        @test startswith(_raw_exchange(port, [big]), "HTTP/1.1 413")
+        @test startswith(_get(port, "/ok"), "HTTP/1.1 200")
+    finally
+        notify(release)
+        Nitro.Core.terminate(ctx)
+    end
+end
+
+@testset "a live SSE stream does not hold a max_concurrent_requests slot" begin
+    entered, release = Threads.Atomic{Bool}(false), Base.Event()
+    ctx = _capacity_context(entered, release)
+    port = get_free_port()
+    _serve(ctx, port; max_concurrent_requests = 1)
+    sock = nothing
+    try
+        sock = Sockets.connect(Sockets.localhost, port)
+        write(sock, "GET /events HTTP/1.1\r\nHost: $HOST\r\nConnection: close\r\n\r\n")
+        flush(sock)
+        seen = IOBuffer()
+        reader = @async while !occursin("data: tick-2", String(copy(seen.data[1:seen.size])))
+            write(seen, readavailable(sock))
+        end
+        @test timedwait(() -> istaskdone(reader), 20.0; pollint = 0.02) === :ok
+        # The stream is live (it runs ~4s) and the cap is 1, yet a second request is served.
+        @test startswith(_get(port, "/ok"), "HTTP/1.1 200")
+    finally
+        isnothing(sock) || close(sock)
+        notify(release)
+        Nitro.Core.terminate(ctx)
+    end
+end
+
 @testset "a short read_header_timeout does not cut an SSE stream" begin
     # The docs promise the defaults leave streams alone. The stream below runs ~1.5s against a
     # 0.5s header timeout; on HTTP/1.1 nothing reads the socket while it streams, and the header

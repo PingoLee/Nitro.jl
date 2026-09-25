@@ -64,8 +64,7 @@ function _http_stream_request(stream::HTTP.Stream, max_body_bytes::Int64)::Union
     if max_body_bytes > 0 && declared > max_body_bytes
         # `drain = false` only when the client is still waiting for permission to send: swallowing
         # would call `_maybe_write_continue!` and thereby *invite* the very body we just refused.
-        expects_continue = occursin("100-continue", lowercase(HTTP.header(head, "Expect", "")))
-        return _BodyRejected(!expects_continue)
+        return _BodyRejected(!_expects_continue(head))
     end
 
     body_bytes = UInt8[]
@@ -437,6 +436,14 @@ function _reject_oversized_body!(stream::HTTP.Stream, limit::Int64, drain::Bool)
            method = stream.message.method,
            declared_content_length = stream.message.content_length,
            limit = limit)
+    _send_rejection!(stream,
+        HTTP.Response(413, "Request body exceeds the configured limit of $(limit) bytes"), drain)
+end
+
+# The shared tail of the two refusals that answer before the middleware chain runs — the 413 above
+# and the capacity 503 below. `resp` must be freshly built by the caller, never a shared `const`:
+# see the note above `_reject_oversized_body!` for everything HTTP writes to it in place.
+function _send_rejection!(stream::HTTP.Stream, resp::HTTP.Response, drain::Bool)
     # BEFORE the write, not after: swallowing calls `_maybe_write_continue!`, which would try to
     # emit a `100 Continue` interim *after* the final response had already gone out. Draining first
     # keeps the two in legal order, and in every reachable combination the continue is either a
@@ -444,12 +451,48 @@ function _reject_oversized_body!(stream::HTTP.Stream, limit::Int64, drain::Bool)
     # is false precisely when the client is still waiting for it).
     drain && _swallow_request_body!(stream, _MAX_SWALLOW_BYTES)
 
-    resp = HTTP.Response(413, "Request body exceeds the configured limit of $(limit) bytes")
     resp.close = true
     stream.response = resp
     _write_response_body!(stream, resp.body)
     return nothing
 end
+
+_expects_continue(head)::Bool =
+    occursin("100-continue", lowercase(HTTP.header(head, "Expect", "")))
+
+# Answer 503 for a request that arrived with `max_concurrent_requests` already in flight, and close
+# the connection (#298). Refused BEFORE the body is read, which is the point of the cap: it bounds
+# the request bodies held in memory at once, and a body that is never read is never held.
+#
+# `Retry-After: 1`: the condition is transient by construction — a slot frees the moment any
+# in-flight request finishes — so a client that honors it retries almost at once, and one that
+# does not was going to retry anyway. The connection closes for the same reason the 413's does: a
+# body may still be arriving, and the swallow budget bounds how much of it is read before the
+# close, not whether the rest could be mistaken for the next request.
+#
+# Logged exactly like the 413, and for the same reason: reachable pre-auth, so one first-sighting
+# warning plus debug detail, never a per-request warning a client can use to flood the log.
+function _reject_over_capacity!(stream::HTTP.Stream, limit::Int64)
+    @warn("Refusing requests over max_concurrent_requests with 503 (detail at debug level)",
+          limit = limit, maxlog = 1)
+    @debug("Request refused: max_concurrent_requests already in flight; answered 503",
+           method = stream.message.method,
+           limit = limit)
+    resp = HTTP.Response(503, ["Retry-After" => "1"],
+        "Server is at its limit of $(limit) concurrent requests; retry shortly")
+    # The same `100-continue` rule as the 413's declared-length reject: a client still waiting for
+    # permission to send must not be sent a `100 Continue` by the swallow.
+    _send_rejection!(stream, resp, !_expects_continue(stream.message))
+end
+
+# Whether a response body is a streaming cursor (an SSE stream, a streamed file) rather than a
+# buffer. Mirrors the `_write_response_body!` dispatch: `BytesBody`, `EmptyBody`, bytes and strings
+# are written from memory already allocated; any other `HTTP.AbstractBody` is read from its source
+# as it is sent, and can take as long as the client or the producer likes.
+_is_streaming_body(::HTTP.BytesBody) = false
+_is_streaming_body(::HTTP.EmptyBody) = false
+_is_streaming_body(::HTTP.AbstractBody) = true
+_is_streaming_body(_) = false
 
 # A `HEAD` response carries the `Content-Length` the same `GET` would (RFC 9110 §9.3.2) (#146).
 #
@@ -483,65 +526,111 @@ function _with_head_content_length(resp::HTTP.Response)::HTTP.Response
     return add_response_headers(resp, "Content-Length" => string(resp.content_length))
 end
 
-function stream_handler(middleware::Function; max_body_bytes::Int64 = DEFAULT_MAX_BODY_BYTES)
+# ── The in-flight request cap (#298) ─────────────────────────────────────────────────────────────
+#
+# `max_concurrent_requests` (`0` = unlimited, the default) bounds how many requests this server
+# holds at once. Nothing else does: HTTP.jl spawns a task per connection with no limit, Nitro one
+# per request, and a task waiting on a slow body yields its thread, so `--threads` bounds compute,
+# not requests. With the 64 MiB body cap, 200 concurrent uploads could hold ~12.8 GB of LIVE
+# memory, which no GC target reclaims.
+#
+# A request cap, not a connection cap, because it is the only one that can be built here: HTTP.jl
+# has no accept hook, and `listen!` takes only its own concrete listener types, so there is nowhere
+# to count a connection before its head is parsed (Go's `netutil.LimitListener` wraps a listener
+# interface Julia's HTTP.jl does not have). It is also the right unit: an idle keep-alive connection
+# holds no body, and on HTTP/2 each stream reaches this handler separately, so one count covers
+# both protocols.
+#
+# The permit is taken BEFORE `_http_stream_request` reads the body — that ordering is what makes it
+# bound body memory — with a lock-free try-acquire, and a request over the cap is answered 503 at
+# once rather than queued (a queue would hold the descriptors the cap exists to bound). It covers
+# the body read, the handler, and the write of a buffered response. A STREAMING response gives it
+# back as soon as the head is ready: an SSE stream or a streamed file holds little memory by design
+# and can last as long as the client likes, and counting it would let a few hundred idle event
+# streams starve every other request. A WebSocket, and a raw `STREAM` handler, run *inside* the
+# handler and therefore hold their permit for their whole lifetime.
+function stream_handler(middleware::Function; max_body_bytes::Int64 = DEFAULT_MAX_BODY_BYTES,
+                        max_concurrent_requests::Int64 = zero(Int64))
+    in_flight = Threads.Atomic{Int64}(0)
     return function(stream::HTTP.Stream)
-        ip = _peer_ip(stream)
-        req = _http_stream_request(stream, max_body_bytes)
-        # Short-circuits BEFORE the middleware chain, so an oversized request produces no access-log
-        # line, no CORS headers and no custom error formatting. That is the correct trade: the
-        # alternative is handing middleware a truncated body, which is strictly worse than handing
-        # it nothing.
-        req isa _BodyRejected && return _reject_oversized_body!(stream, max_body_bytes, req.drain)
-        req.context[:ip] = ip
-        req.context[:stream] = stream
-
-        result = middleware(req)
-        produced = result isa HTTP.Response ? result : nothing
-
-        try
-            if !_response_started(stream)
-                resp = produced === nothing ? HTTP.Response(200) : produced
-                stream.message.method == "HEAD" && (resp = _with_head_content_length(resp))
-                resp.request = req
-                stream.response = resp
-                # `HEAD` gets the head and no body, so there is nothing to drain — and draining it
-                # anyway is not merely wasted work, it can pin the process (#160). HTTP's
-                # `startwrite` sets `ignore_writes` for a bodyless response and `_server_write`
-                # then returns without touching the socket, so for an open-ended body — an
-                # `HTTP.SSEStream` whose producer is still running — this loop consumes events
-                # forever. Because it never touches the socket, `terminate`'s force-close cannot
-                # unblock it either: the request task, the connection task (`parallel_stream_handler`
-                # waits on it) and the producer task are all pinned for the life of the process.
-                # One `curl -I` against a route registered for HEAD is enough.
-                #
-                # Skipping the drain is equivalent for every buffered body — those writes were
-                # already being discarded — and the `finally` below still releases a streaming one,
-                # which is what lets an SSE producer notice and unwind. The response head is
-                # unaffected: the server loop's `closewrite` calls `startwrite` regardless.
-                #
-                # Deliberately narrow: `HEAD` only, keyed on the request method. Status-based
-                # suppression (204/304) is the same class of hazard, but `Res.sse` cannot produce
-                # those statuses. The response head a `HEAD` gets is `_with_head_content_length`'s
-                # business, above (#146).
-                #
-                # `stream.message.method`, NOT `req.method`. They are equal at entry and are two
-                # different mutable objects: `_http_stream_request` builds a fresh `Request` from
-                # `head.method`, while HTTP's own suppression keys on `stream.message`. A
-                # middleware that rewrites the method — an app mapping `HEAD` onto its `GET`
-                # handlers, or an `X-HTTP-Method-Override` layer — would otherwise desynchronize
-                # the two: rewriting `HEAD → GET` reinstates the drain HTTP is still ignoring, and
-                # the pin this guard exists to remove comes back. Reading the value HTTP itself
-                # branches on makes that unrepresentable. `_reject_oversized_body!` above already
-                # reads it the same way.
-                stream.message.method == "HEAD" || _write_response_body!(stream, resp.body)
+        # Released exactly once: early for a streaming body, otherwise by the outer `finally`.
+        held = false
+        if max_concurrent_requests > 0
+            if Threads.atomic_add!(in_flight, one(Int64)) >= max_concurrent_requests
+                Threads.atomic_sub!(in_flight, one(Int64))
+                return _reject_over_capacity!(stream, max_concurrent_requests)
             end
-        finally
-            # Idempotent, and a no-op for the buffered bodies that are the overwhelming majority.
-            # `_write_response_body!` has usually already done this — releasing as soon as the body
-            # is drained keeps descriptor pressure down — so this is the net, not the owner.
-            produced === nothing || _release_response_body!(produced.body)
+            held = true
         end
-        return nothing
+        try
+            ip = _peer_ip(stream)
+            req = _http_stream_request(stream, max_body_bytes)
+            # Short-circuits BEFORE the middleware chain, so an oversized request produces no access-log
+            # line, no CORS headers and no custom error formatting. That is the correct trade: the
+            # alternative is handing middleware a truncated body, which is strictly worse than handing
+            # it nothing.
+            req isa _BodyRejected && return _reject_oversized_body!(stream, max_body_bytes, req.drain)
+            req.context[:ip] = ip
+            req.context[:stream] = stream
+
+            result = middleware(req)
+            produced = result isa HTTP.Response ? result : nothing
+
+            try
+                if !_response_started(stream)
+                    resp = produced === nothing ? HTTP.Response(200) : produced
+                    stream.message.method == "HEAD" && (resp = _with_head_content_length(resp))
+                    resp.request = req
+                    stream.response = resp
+                    # `HEAD` gets the head and no body, so there is nothing to drain — and draining it
+                    # anyway is not merely wasted work, it can pin the process (#160). HTTP's
+                    # `startwrite` sets `ignore_writes` for a bodyless response and `_server_write`
+                    # then returns without touching the socket, so for an open-ended body — an
+                    # `HTTP.SSEStream` whose producer is still running — this loop consumes events
+                    # forever. Because it never touches the socket, `terminate`'s force-close cannot
+                    # unblock it either: the request task, the connection task (`parallel_stream_handler`
+                    # waits on it) and the producer task are all pinned for the life of the process.
+                    # One `curl -I` against a route registered for HEAD is enough.
+                    #
+                    # Skipping the drain is equivalent for every buffered body — those writes were
+                    # already being discarded — and the `finally` below still releases a streaming one,
+                    # which is what lets an SSE producer notice and unwind. The response head is
+                    # unaffected: the server loop's `closewrite` calls `startwrite` regardless.
+                    #
+                    # Deliberately narrow: `HEAD` only, keyed on the request method. Status-based
+                    # suppression (204/304) is the same class of hazard, but `Res.sse` cannot produce
+                    # those statuses. The response head a `HEAD` gets is `_with_head_content_length`'s
+                    # business, above (#146).
+                    #
+                    # `stream.message.method`, NOT `req.method`. They are equal at entry and are two
+                    # different mutable objects: `_http_stream_request` builds a fresh `Request` from
+                    # `head.method`, while HTTP's own suppression keys on `stream.message`. A
+                    # middleware that rewrites the method — an app mapping `HEAD` onto its `GET`
+                    # handlers, or an `X-HTTP-Method-Override` layer — would otherwise desynchronize
+                    # the two: rewriting `HEAD → GET` reinstates the drain HTTP is still ignoring, and
+                    # the pin this guard exists to remove comes back. Reading the value HTTP itself
+                    # branches on makes that unrepresentable. `_reject_oversized_body!` above already
+                    # reads it the same way.
+                    if stream.message.method != "HEAD"
+                        # A streaming body hands its permit back here, before a write that can last
+                        # as long as the client stays connected (#298; see above `stream_handler`).
+                        if held && _is_streaming_body(resp.body)
+                            Threads.atomic_sub!(in_flight, one(Int64))
+                            held = false
+                        end
+                        _write_response_body!(stream, resp.body)
+                    end
+                end
+            finally
+                # Idempotent, and a no-op for the buffered bodies that are the overwhelming majority.
+                # `_write_response_body!` has usually already done this — releasing as soon as the body
+                # is drained keeps descriptor pressure down — so this is the net, not the owner.
+                produced === nothing || _release_response_body!(produced.body)
+            end
+            return nothing
+        finally
+            held && Threads.atomic_sub!(in_flight, one(Int64))
+        end
     end
 end
 

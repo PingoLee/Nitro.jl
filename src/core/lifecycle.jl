@@ -171,6 +171,7 @@ function serve(ctx::App;
     shutdown_timeout=SHUTDOWN_TIMEOUT_SECONDS,
     max_body_bytes=missing,
     max_fields=DEFAULT_MAX_FIELDS,
+    max_concurrent_requests=nothing,
     kwargs...)::Union{Server, Nothing}
 
     # FIRST, before any validation or context mutation, so a rejected call leaves the context
@@ -237,6 +238,23 @@ function serve(ctx::App;
     # the App has already been mutated.
     (max_fields isa Integer && !(max_fields isa Bool) && 0 <= max_fields <= typemax(Int64)) ||
         throw(ArgumentError("`max_fields` must be an integer >= 0 (0 means unlimited), got $(repr(max_fields))"))
+
+    # Same reasoning again (#298). Opt-in: `nothing` is unlimited, like Go's `net/http` and like
+    # every Nitro before it. A count must be a real integer >= 1 — `0` would refuse every request,
+    # which is never what a caller meant, and `true` would silently mean 1.
+    if max_concurrent_requests !== nothing
+        (max_concurrent_requests isa Integer && !(max_concurrent_requests isa Bool) &&
+         1 <= max_concurrent_requests <= typemax(Int64)) ||
+            throw(ArgumentError("`max_concurrent_requests` must be an integer >= 1, or `nothing` " *
+                                "for no limit, got $(repr(max_concurrent_requests))"))
+        # Mirrors `max_body_bytes`: the permit lives in Nitro's own `stream_handler`, around the
+        # body read and the response write, so a custom `handler` cannot be capped by it.
+        handler === stream_handler || throw(ArgumentError(
+            "`max_concurrent_requests` cannot be applied to a custom `handler`: the cap is " *
+            "enforced by Nitro's own `stream_handler`. Drop `handler`, or bound concurrency " *
+            "inside it."))
+    end
+    request_limit = max_concurrent_requests === nothing ? zero(Int64) : Int64(max_concurrent_requests)
 
     # Same reasoning as the checks above (#316): HTTP.jl only sees these at `listen!`, which runs
     # after the App has been mutated, so a typo'd timeout would otherwise fail half-way through.
@@ -314,7 +332,8 @@ function serve(ctx::App;
 
     configured_middelware = setupmiddleware(ctx; middleware, serialize, catch_errors, show_errors, access_log, access_log_query)
     handle_stream = handler === stream_handler ?
-        stream_handler(configured_middelware; max_body_bytes = body_limit) :
+        stream_handler(configured_middelware; max_body_bytes = body_limit,
+                       max_concurrent_requests = request_limit) :
         handler(configured_middelware)
 
     # No warning for running on one thread (#149): single-threaded is a valid deployment, not a

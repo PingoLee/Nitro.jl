@@ -88,6 +88,19 @@ is explicit introspection, not accidental disclosure.)
   `Dict` (#327). `0` means unlimited. Django's `DATA_UPLOAD_MAX_NUMBER_FIELDS`, same default.
   It also applies to `internalrequest` against the app, and to a parser called outside any
   request (`DEFAULT_MAX_FIELDS`).
+- `max_concurrent_requests=nothing`: ceiling on how many requests this server holds at once
+  (#298). `nothing` means no limit. When it is set, a request arriving with that many already in
+  flight is answered **503** with `Retry-After: 1` **before its body is read**, and its
+  connection is closed. Nothing else bounds this: `--threads` limits how many requests *compute*
+  at once, not how many are open, because a request waiting on a slow body yields its thread. So
+  this is the only setting that bounds the request-body memory held at once — at most
+  `max_concurrent_requests × max_body_bytes`, which no GC target can reclaim because it is live.
+  Each HTTP/2 stream counts as one request. A request holds its slot while its body is read,
+  its handler runs, and a buffered response is written. A streaming response (`Res.sse`, a
+  streamed `Res.file`) gives the slot back once it starts streaming, but a WebSocket or a
+  `STREAM` handler holds it for its whole lifetime. Throws with a custom `handler`, like
+  `max_body_bytes`. The refusal happens before any middleware runs, so it produces no access-log
+  line (one warning is logged the first time).
 - `reuseaddr`: forwarded to `HTTP.listen!`. Defaults to `true` on Linux/macOS, where it
   allows rebinding a port still in `TIME_WAIT`, and to **`false` on Windows**, where
   `SO_REUSEADDR` instead lets a second process bind a port another is actively listening

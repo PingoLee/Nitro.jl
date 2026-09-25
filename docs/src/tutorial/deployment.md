@@ -8,8 +8,9 @@ body caps, the real client IP — is covered in [Behind a Reverse Proxy](reverse
 
 `serve()` runs every request on its own `Threads.@spawn` task in Julia's default thread pool. There
 is no event loop and no cluster of worker processes; the thread count is how many requests can
-**compute** at once. (How many can be *in flight* at once is a different number, and nothing
-bounds it; see [Sizing it](@ref) below.) Start the server with it set:
+**compute** at once. (How many can be *in flight* at once is a different number, bounded only if
+you set `serve(max_concurrent_requests = …)`; see [Sizing it](@ref) below.) Start the server with
+it set:
 
 ```bash
 julia --threads=auto --project -e 'using MyApp; MyApp.start_server()'
@@ -81,16 +82,43 @@ heap at the remainder, and starts collecting hard at about 80% of that. Two cons
 - **Size it from peak concurrent load, not idle memory.** Every in-flight request holds its own
   live data, and `--threads` does **not** limit how many are in flight. HTTP.jl starts a task per
   connection and Nitro one per request, and a task waiting on a slow body yields its thread to the
-  next request. So the bound is open connections, not threads, and today nothing caps it
-  ([#298](https://github.com/PingoLee/Nitro.jl/issues/298)). With the 64 MiB
+  next request. So unless you cap it, the bound is open connections, not threads. With the 64 MiB
   `serve(max_body_bytes = …)` default, 200 concurrent uploads can hold ~12.8 GB of request bodies
-  before any handler allocates anything. That memory is **live**, so no hint reclaims it. Until a
-  cap exists, keep `max_body_bytes` as small as your largest real upload, and consider nginx's
-  `max_conns` on the `upstream` block's `server` line. Open-source nginx has no queue behind it,
-  so requests over the limit get a `502` rather than waiting.
+  before any handler allocates anything. That memory is **live**, so no hint reclaims it.
 
 A workable starting point: the hint at the steady-state RSS you observe under realistic load plus
 headroom, and at least 250 MiB below whatever limit the host or cgroup enforces.
+
+### Bounding requests in flight
+
+Three settings look related to request memory, and only one of them bounds how much of it is live
+at once:
+
+| Setting | Bounds | Does not bound |
+|---|---|---|
+| `--heap-size-hint` | When the GC works hard | Live data — the GC cannot free a body a request is still holding |
+| `serve(max_body_bytes = …)` | One request's body | How many of them are held at once |
+| `serve(max_concurrent_requests = …)` | How many requests are held at once | The size of each — that is `max_body_bytes`, and body memory is at most the product of the two |
+
+`max_concurrent_requests` is off by default, like Go's `net/http`. Set it to a number of requests
+your memory can hold at once, `max_body_bytes` each, with the hint's headroom left over:
+
+```julia
+# 3 GiB of hint, uploads up to 16 MiB: at most 64 × 16 MiB = 1 GiB of bodies in flight
+serve(app; max_body_bytes = 16 * 1024^2, max_concurrent_requests = 64)
+```
+
+A request that arrives with the limit already in flight is answered `503` with `Retry-After: 1`
+before its body is read, and its connection is closed. Each HTTP/2 stream counts as one request.
+A request holds its slot while its body is read, its handler runs and a buffered response is
+written. A streaming response (`Res.sse`, a streamed `Res.file`) gives the slot back once it starts
+streaming, because it holds little memory and can stay open for hours. A **WebSocket** holds its
+slot for its whole lifetime, and so does a `STREAM` handler, so leave room for those in the
+number.
+
+In front of Nitro, nginx's `max_conns` on the `upstream` block's `server` line is the proxy-side
+equivalent. Open-source nginx has no queue behind it, so requests over its limit get a `502`
+rather than waiting.
 
 ### systemd
 
