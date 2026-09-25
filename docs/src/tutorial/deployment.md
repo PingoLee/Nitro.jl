@@ -25,7 +25,8 @@ covered in [Memory and GC](@ref) below — check it on the target machine, not o
 ```
 
 The thread count is the default pool, where handlers run. Julia 1.12 also starts one
-*interactive* thread; HTTP.jl accepts connections there, and no handler ever runs on it.
+*interactive* thread; HTTP.jl accepts connections there, and with the default `parallel = true`
+no handler runs on it.
 
 A process with no GC target prints `GC target: none`. When the environment is `prod`
 (`NITRO_ENV=prod`), `serve` also logs a warning about it at startup, even with

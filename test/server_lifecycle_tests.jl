@@ -340,6 +340,30 @@ end
     @test !mentions(logs, "queuesize")
 end
 
+@testset "serve() logs the no-GC-target warning in prod only, even with the banner off (#299)" begin
+    # The helper is unit-tested in test/util_tests.jl; this pins the CALL SITE — that `serve`
+    # makes it, with `show_banner = false`, and passes it the real environment and target.
+    function gc_warnings(env)
+        ctx = Nitro.Core.App()
+        logger = Test.TestLogger(min_level = Base.CoreLogging.Warn)
+        try
+            withenv("NITRO_ENV" => env, "GENIE_ENV" => nothing) do
+                Base.CoreLogging.with_logger(() -> _serve(ctx, get_free_port()), logger)
+            end
+        finally
+            Nitro.Core.terminate(ctx)
+        end
+        return filter(r -> occursin("no GC target", string(r.message)), logger.logs)
+    end
+
+    target = Nitro.Core._gc_target_bytes()
+    unset = target !== nothing && !Nitro.Core._has_gc_target(target)
+    # Whichever this process is — CI runners usually have no hint and no cgroup limit, a
+    # container does — the prod result must agree with it, and dev never warns.
+    @test length(gc_warnings("prod")) == (unset ? 1 : 0)
+    @test isempty(gc_warnings("dev"))
+end
+
 # ── Default server timeouts (#316) ──────────────────────────────────────────────────────────────
 
 @testset "server timeout defaults (unit)" begin

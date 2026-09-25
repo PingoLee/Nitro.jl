@@ -358,7 +358,9 @@ function serve(ctx::App;
         ctx.service.eager_revise[] = start_revise_service()
     end
 
-    # After every check that can still refuse this call, so a rejected `serve` never warns (#299).
+    # After every check Nitro itself makes, so a call Nitro refuses never warns (#299). HTTP.jl's
+    # `listen!` can still refuse below (an address in use, say), after the warning has been
+    # logged; that costs one accurate line about the process, which is harmless.
     _warn_if_no_gc_target(current_env(), _gc_target_bytes())
 
     try

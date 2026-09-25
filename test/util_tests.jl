@@ -392,15 +392,9 @@ end
 end
 
 @testset "the GC target is read from the running process (#299)" begin
-    target = Nitro.Core._gc_target_bytes()
-    @test target isa UInt64
-    # The read reflects `--heap-size-hint`, not just a constant: a child started with a 1G hint
-    # reports a target below 1 GiB, where one without a hint or cgroup limit reports none.
-    code = "using Nitro; print(Nitro.Core._gc_target_bytes())"
-    hinted = parse(UInt64, read(`$(Base.julia_cmd()) --startup-file=no --heap-size-hint=1G
-                                 --project=$(Base.active_project()) -e $code`, String))
-    @test Nitro.Core._has_gc_target(hinted)
-    @test UInt64(512) * 2^20 < hinted <= UInt64(2)^30
+    # The live read works on this runtime. Whether it reflects `--heap-size-hint` needs a child
+    # process with one, which is the separate `:slow` item at the end of this file.
+    @test Nitro.Core._gc_target_bytes() isa UInt64
 end
 
 @testset "mount_segments canonicalization" begin
@@ -657,4 +651,33 @@ end
     end
 end
 
+end
+
+# #299: the banner's GC target must reflect `--heap-size-hint`, not a constant, and only a
+# process started with one can show that. Its own `:slow` item because it starts a Julia child
+# that loads Nitro, which `--skip-tags slow` exists to avoid.
+@testitem "Banner GC target reflects --heap-size-hint (#299)" tags=[:core, :slow] setup=[NitroCommon] begin
+    using Test
+    using Nitro
+
+    # `--code-coverage=none` and captured streams: the child-process pattern of
+    # test/bodyparser_tests.jl `run_child`, for the reasons written there (#84, #244, #273).
+    code = "using Nitro; print(Nitro.Core._gc_target_bytes())"
+    cmd = `$(Base.julia_cmd()) --code-coverage=none --heap-size-hint=1G --startup-file=no
+           --project=$(Base.active_project()) -e $code`
+    out, err = IOBuffer(), IOBuffer()
+    p = run(pipeline(ignorestatus(cmd); stdout = out, stderr = err))
+    stdout_text, stderr_text = String(take!(out)), String(take!(err))
+    # Asserted with `===` so a failure prints the child's own diagnosis ("Evaluated: …").
+    failure = (p.exitcode, p.termsignal) == (0, 0) ? nothing :
+        "child exit $(p.exitcode), signal $(p.termsignal); stderr: $(stderr_text)"
+    @test failure === nothing
+
+    hinted = tryparse(UInt64, strip(stdout_text))
+    @test hinted isa UInt64
+    if hinted isa UInt64
+        # A 1G hint, less Julia's 250 MiB reserve: a real target, below 1 GiB.
+        @test Nitro.Core._has_gc_target(hinted)
+        @test UInt64(512) * 2^20 < hinted <= UInt64(2)^30
+    end
 end
