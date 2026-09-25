@@ -362,6 +362,23 @@ different reasons**, and conflating them is how this list rots:
 `src/middleware/extract_ip.jl` uses the predicate despite belonging to group 1, for consistency
 within a file this change already touched.
 
+### One site uses the predicate and deliberately does NOT rethrow
+
+The per-attempt `catch` in both worker executors — `_execute_task_async` (`src/Workers/api.jl`)
+and `_execute_queued_task` (`src/Workers/queue.jl`) — treats the three as **terminal**, in the
+same arm as `TaskTimeoutError`: no retry, recorded `FAILED` through `_fail_task!`, never
+rethrown (#367).
+
+- **Not retried**: a retry re-runs a callback that has just overflowed the stack or exhausted
+  memory, and on some Windows hosts the overflow ends the process (#301). An interrupt is the
+  operator's Ctrl-C (under `julia -t 1` it can land on any task) or the callback's own. Neither is
+  a transient failure.
+- **Not rethrown**: nothing is waiting to receive it. The async run is a detached task, and the
+  sequential processor's catch-all logs and drops the item. Either way the record would stay
+  `RUNNING` until a zombie sweep marked it failed with no hint of why, where `FAILED` with the
+  exception's type is the honest record. It is group 2's argument one level down: a background
+  task, where the failure has no request to fail.
+
 Those three groups plus the sites in the table are every `e isa InterruptException && rethrow()`
 in `src/`; `grep -rn 'isa InterruptException && rethrow()' src/` is the audit, and a hit it
 returns that no group names is a site that owes this list a line. (Sites are named by function

@@ -906,6 +906,130 @@ mktempdir() do d
 end
 end
 
+# -- #367: the WRITE side, bounded before `JSON.json` runs --------------------------------------
+#
+# The PormG stores refuse a value nested past `MAX_JSON_DEPTH` (#344). They used to decide that by
+# scanning `JSON.json`'s output, but the serializer recurses once per level too, so a value deep
+# enough overflowed it before the scan ran. `_check_value_depth` walks the VALUE first. Nothing
+# here builds an overflow-deep value (not safe in-process, #254/#301): the "it runs first"
+# property is pinned with a tripwire the serializer would hit and the walk never reaches.
+@testitem "Body parsers -- a value's JSON depth is bounded before it is serialized (#367)" tags=[:core, :security] setup=[NitroCommon] begin
+using JSON
+using Nitro
+
+const BP = Nitro.Core.Util.BodyParsers
+
+# The depth `JSON.json` ACTUALLY writes: the scanner's count, maximised, over its real output.
+# An oracle independent of the walk under test -- which is what makes the equality below a
+# contract against JSON.jl rather than the walk agreeing with itself.
+function written_depth(v)
+    depth = deepest = 0
+    instring = escaped = false
+    for b in codeunits(JSON.json(v))
+        if instring
+            if escaped
+                escaped = false
+            elseif b == UInt8('\\')
+                escaped = true
+            elseif b == UInt8('"')
+                instring = false
+            end
+        elseif b == UInt8('"')
+            instring = true
+        elseif b == UInt8('[') || b == UInt8('{')
+            depth += 1
+            deepest = max(deepest, depth)
+        elseif b == UInt8(']') || b == UInt8('}')
+            depth -= 1
+        end
+    end
+    return deepest
+end
+
+refused(v) = try
+    BP._check_value_depth(v)
+    false
+catch e
+    e isa ArgumentError || rethrow()
+    @test e.msg == "JSON nesting exceeds the maximum depth of 512"
+    true
+end
+
+struct DepthWrap
+    inner::Any
+end
+mutable struct DepthMWrap
+    inner::Any
+end
+# An app's own lowering, honoured by the writer -- so it must be by the walk too.
+struct DepthLowered
+    payload::Any
+end
+JSON.lower(x::DepthLowered) = x.payload
+# Stands in for the overflow: the serializer raises it on reaching the value, the walk must not.
+struct DepthTripwire end
+JSON.lower(::DepthTripwire) = throw(StackOverflowError())
+
+# Every builder adds exactly ONE level per step and keeps the element type fixed, so a
+# 513-deep value never becomes a 513-deep TYPE (deeply nested Tuple/NamedTuple types are a
+# compile-time hazard of their own, and not what this is about).
+vecs(d, leaf=1)  = foldl((x, _) -> Any[x], 2:d; init=Any[leaf])
+dicts(d, leaf=1) = foldl((x, _) -> Dict{String,Any}("k" => x), 2:d; init=Dict{String,Any}("k" => leaf))
+structs(d)       = foldl((x, _) -> DepthWrap(x), 2:d; init=DepthWrap(1))
+mstructs(d)      = foldl((x, _) -> DepthMWrap(x), 2:d; init=DepthMWrap(1))
+pairvecs(d)      = foldl((x, _) -> Pair{String,Any}["k" => x], 2:d; init=Pair{String,Any}["k" => 1])
+mixed(d)         = foldl((x, i) -> isodd(i) ? Any[x] : Dict{String,Any}("k" => x), 2:d; init=Any[1])
+
+@testset "the walk measures exactly what JSON.json writes" begin
+    self_dict = Dict{String,Any}()
+    self_dict["self"] = self_dict                # written as {"self":null}
+    self_struct = DepthMWrap(nothing)
+    self_struct.inner = Any[self_struct]         # written as {"inner":[null]}
+    shared = Any[1]                              # shared, not circular: written twice, in full
+
+    corpus = Any[
+        1, "s", nothing, missing, :sym, 1.5, true,
+        Any[], Dict{String,Any}(), DepthWrap(nothing),
+        vecs(7), dicts(7), structs(7), mstructs(7), pairvecs(7), mixed(7),
+        [1 2; 3 4], zeros(2, 2, 2), Any[zeros(2, 2)],
+        (1, (2, (3,))), (a = 1, b = (c = Any[1],)), Set([Any[1]]),
+        Dict{String,Any}("a" => [1, 2], "b" => Dict("c" => Any[Any[]])),
+        DepthLowered(vecs(9)), DepthLowered("flat"), Any[DepthLowered(dicts(3))],
+        self_dict, self_struct, Any[shared, Any[shared]],
+    ]
+    for v in corpus
+        @test BP._check_value_depth(v) == written_depth(v)
+    end
+end
+
+@testset "512 levels pass and 513 are refused, on every shape" begin
+    for build in (vecs, dicts, structs, mstructs, pairvecs, mixed)
+        @test BP._check_value_depth(build(512)) == 512
+        @test refused(build(513))
+    end
+    # A matrix is two levels at once, and it sits on the flat shortcut: the edge still holds.
+    @test BP._check_value_depth(vecs(510, zeros(2, 2))) == 512
+    @test refused(vecs(511, zeros(2, 2)))
+end
+
+@testset "it refuses BEFORE the serializer would reach anything past the bound" begin
+    # 600 levels, then a value the serializer overflows on. `JSON.json` gets there; the walk
+    # stops at 513 and never lowers it. Against a walk that recursed or ran after the serializer
+    # this would be a `StackOverflowError`, not the `ArgumentError`.
+    deep = vecs(600, DepthTripwire())
+    @test_throws StackOverflowError JSON.json(deep)
+    @test refused(deep)
+end
+
+@testset "a large flat value is not enumerated element by element" begin
+    # Not a timing assertion -- just that the flat shortcut returns the right depth for the
+    # shapes it covers, which are the ones a big task result usually is.
+    @test BP._check_value_depth(rand(1_000_000)) == 1
+    @test BP._check_value_depth(Dict("k$i" => i for i in 1:1000)) == 1
+    @test BP._check_value_depth(Any[rand(10_000), Dict("x" => rand(10))]) == 3
+end
+end
+
 # `formdata` and `multipart` take the same narrowing, and deliberately ship WITHOUT a dedicated
 # test: neither `HTTP.queryparams` nor `HTTP.parse_multipart_body` parses recursively, so no
 # request input reaches their guarded block with any of the three types, and the only test that

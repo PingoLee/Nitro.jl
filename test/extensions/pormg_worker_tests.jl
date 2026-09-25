@@ -1393,6 +1393,30 @@ else
             @test occursin("does not decode", logs)
         end
 
+        @testset "the depth is decided before the result is serialized (#367)" begin
+            # As the session store's twin testset: the serializer recurses once per level and
+            # used to overflow before the #344 scan of its output ran. A tripwire 600 levels down
+            # stands in for the overflow (#254, #301); the walk refuses at 513 and never reaches it.
+            struct ResultTripwire end
+            JSON.lower(::ResultTripwire) = throw(StackOverflowError())
+            deep = foldl((v, _) -> Any[v], 2:600; init=Any[ResultTripwire()])
+            @test_throws StackOverflowError JSON.json(deep)     # what the write used to raise
+
+            m = MockTaskModel()
+            store_t = RealPormGWorkerStore(model=m)
+            t = TaskInfo("alice::tripwire")
+            replace_task!(store_t, t.id, t)
+            # The completing write, which `_finish_task!` makes...
+            @test_throws ArgumentError try_transition!(store_t, t.id, (PENDING, RUNNING), COMPLETED;
+                                                       run_id=t.run_id, result=deep)
+            @test get_task_info(store_t, t.id).status == PENDING
+            @test isempty(m._table[t.id]["result"])
+            # ...and a whole-record write carrying the same result.
+            t.result = deep
+            @test_throws ArgumentError set_task!(store_t, t.id, t)
+            @test isempty(m._table[t.id]["result"])
+        end
+
         @testset "an unrecoverable error while decoding propagates (#254, #344)" begin
             parse_stored = getproperty(PormGExt, :_parse_stored_json)
             for exc in (InterruptException(), StackOverflowError(), OutOfMemoryError())

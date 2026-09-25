@@ -325,10 +325,11 @@ Internal and fixed on purpose. Every `JSON.parse` in Nitro goes through `_parse_
 and `test/bodyparser_tests.jl` fails if one does not. That includes the JSON the PormG
 extension stores and reads back itself: session payloads, and a task's `result` and `watchers`
 (#344). What the application stored is not attacker input, but reading it back recurses on
-whatever task asked, often a request task. The extension also runs `_check_json_depth` over
-the serialized text before it writes, so a value too deep to read back is refused at
-`set_session!`/`update_session!` or at the task's completing write, instead of being stored
-unreadable.
+whatever task asked, often a request task. The extension also bounds what it writes, so a
+value too deep to read back is refused at `set_session!`/`update_session!` or at the task's
+completing write, instead of being stored unreadable. It does so twice: `_check_value_depth`
+walks the Julia value **before** `JSON.json` runs, because the serializer recurses too and a
+deep enough value overflows it first (#367), then `_check_json_depth` scans the text it wrote.
 """
 const MAX_JSON_DEPTH = 512
 
@@ -389,6 +390,94 @@ function _check_json_depth(bytes::AbstractVector{UInt8}, max_keys::Int = 0)
 end
 
 _check_json_depth(s::AbstractString, max_keys::Int = 0) = _check_json_depth(codeunits(s), max_keys)
+
+# The values `JSON.json` writes without recursing, tested in the order its writer (`JSON.json!`)
+# tests them, ahead of the container test. `Bool <: Number`. A `JSONText` is written verbatim, so
+# its depth is its text's, which only the post-serialization scan can see.
+@inline _json_leaf(x) = x isa AbstractString || x isa Number || x === nothing ||
+                        x isa JSON.JSONText || x isa JSON.Null || x isa JSON.Omit
+
+@inline _json_container(style, x) = JSON.StructUtils.dictlike(style, x) ||
+                                    JSON.StructUtils.arraylike(style, x) ||
+                                    JSON.StructUtils.structlike(style, x)
+
+# Containers whose every element lowers to a leaf, so the walk can skip enumerating them. Only a
+# shortcut: without it a million-element `Vector{Float64}` result is a million closure calls
+# that can add no depth.
+const _JSONScalar = Union{Number, AbstractString, Nothing, Missing, Symbol}
+@inline _flat_json_container(x) =
+    x isa AbstractArray{<:_JSONScalar} || x isa AbstractSet{<:_JSONScalar} ||
+    x isa AbstractDict{<:Any, <:_JSONScalar}
+
+"""
+    _check_value_depth(value) -> Int
+
+Throw the same `ArgumentError` as `_check_json_depth` if `JSON.json(value)` would nest arrays and
+objects deeper than `MAX_JSON_DEPTH`; otherwise return the depth it would write (`0` for a bare
+scalar). Decided **before** serializing, by walking the Julia
+value, because `JSON.json` recurses once per level and a value deep enough overflows it before
+any scan of its output can run (#367). Only the application can build such a value (request JSON
+stops at 512, #314), so this is a robustness bound on a store's write path, not an input check.
+
+Non-recursive: an explicit stack, so the walk cannot fail the way the serializer it guards
+does. It mirrors the writer rather than approximating it, so the depth it measures is the depth
+`JSON.json` writes:
+
+- every value is lowered with `StructUtils.lower(JSONWriteStyle(), ·)` first, exactly as the
+  writer does, so an app's own `JSON.lower` method is honoured and nothing is counted twice;
+- the leaves are the writer's leaves (`_json_leaf`), tested first, as it tests them;
+- a container is what the writer writes as one — `dictlike || arraylike || structlike` — and
+  its children are what `StructUtils.applyeach` hands the writer, already lowered;
+- a **mutable** child already on the path from the root is a circular reference, which the
+  writer writes as `null`, so it is a leaf here too. The root is on that path whether mutable or
+  not, as it is in the writer's ancestor stack.
+
+`test/bodyparser_tests.jl` pins the mirror against `JSON.json`'s actual output for a corpus of
+shapes — that is what the returned depth is for — so a JSON.jl release that changes the
+dispatch fails there rather than here.
+
+The post-serialization `_check_json_depth` stays as the store's final word: a `JSONText` is
+written verbatim and only a scan of the text sees its depth.
+"""
+function _check_value_depth(value)
+    style = JSON.JSONWriteStyle()
+    root = JSON.StructUtils.lower(style, value)
+    _json_leaf(root) && return 0
+    _json_container(style, root) || return 0
+
+    # A frame is `(value, depth)`. `depth == 0` is an EXIT marker: the mutable container entered
+    # above it has had its whole subtree walked, so it leaves the ancestor path.
+    ancestors = Any[root]
+    stack = Tuple{Any, Int}[(root, 1)]
+    children = Any[]
+    collect_child = function (_, v)
+        (_json_leaf(v) || !_json_container(style, v)) && return nothing
+        # The writer's circular-reference rule: `null`, so nothing below it is written.
+        ismutable(v) && any(a -> a === v, ancestors) && return nothing
+        push!(children, v)
+        return nothing
+    end
+
+    deepest = 0
+    while !isempty(stack)
+        x, depth = pop!(stack)
+        if depth == 0
+            pop!(ancestors)
+            continue
+        end
+        depth > MAX_JSON_DEPTH && _throw_json_too_deep()
+        deepest = max(deepest, depth)
+        _flat_json_container(x) && continue
+        x === root || !ismutable(x) || push!(ancestors, x)
+        x === root || !ismutable(x) || push!(stack, (nothing, 0))
+        empty!(children)
+        JSON.StructUtils.applyeach(style, collect_child, x)
+        for child in children
+            push!(stack, (child, depth + 1))
+        end
+    end
+    return deepest
+end
 
 # The field cap (#327): one message for every source, naming the source and the cap -- never a
 # key, which is client input.

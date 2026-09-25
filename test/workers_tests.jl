@@ -2969,6 +2969,43 @@ end
         end
     end
 
+    @testset "an unrecoverable exception is terminal: FAILED at once, never retried (#367)" begin
+        # `StackOverflowError`, `OutOfMemoryError` and `InterruptException` report on the
+        # PROCESS, not the job. The per-attempt catch used to retry them like any failure --
+        # re-running a callback that had just overflowed the stack. They now take the timeout's
+        # arm: recorded FAILED on the first attempt, and not rethrown, since nothing waits on
+        # the run to receive one (the reasoning is in `is_unrecoverable`'s site table).
+        #
+        # The discriminating assertion is the DEADLINE on FAILED, not `attempts == 1`: against
+        # the unpatched loop the first attempt is followed by a 2s backoff (then 4s, 8s), so
+        # `attempts` is still 1 when a quick check runs and only the time to FAILED tells the
+        # two apart. Thrown synthetically -- a real overflow is not safe in-process (#254, #301).
+        for exc in (StackOverflowError(), OutOfMemoryError(), InterruptException()),
+            sequential in (false, true),
+            timeout in (0, 30)
+            label = "$(nameof(typeof(exc))) sequential=$sequential timeout=$timeout"
+            rt_store = WorkerRuntime(InMemoryWorkerStore())
+            attempts = Threads.Atomic{Int}(0)
+            callback = () -> (Threads.atomic_add!(attempts, 1); throw(exc))
+            options = TaskOptions(retry_on_failure=true, max_retries=3, timeout=timeout)
+            try
+                id = sequential ?
+                    submit_sequential_task("unrecoverable-q", "boom", callback, Owner("u");
+                                           options=options, runtime=rt_store) :
+                    submit_task("boom", callback, Owner("u"); options=options, runtime=rt_store)
+                failed = wait_for(() -> get_task_status(id, Owner("u"); runtime=rt_store)[:status] ==
+                                        "FAILED"; timeout=1.8)
+                @test (label, failed) == (label, :ok)
+                status = get_task_status(id, Owner("u"); runtime=rt_store)
+                @test (label, occursin(string(nameof(typeof(exc))), something(status[:error], ""))) ==
+                      (label, true)
+                @test (label, attempts[]) == (label, 1)
+            finally
+                reset_runtime!(rt_store)
+            end
+        end
+    end
+
     @testset "a fast task leaves no handle behind" begin
         # `_execute_task_async` used to also `register_active_task!` from the PARENT, after the
         # spawn. Under `@async` that was a duplicate write of the same Task object and merely

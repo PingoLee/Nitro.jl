@@ -688,7 +688,11 @@ function _execute_task_async(runtime::WorkerRuntime, task_key::String, callback:
                     # put four copies of the callback on the thread pool at once, sharing one
                     # `task_info` and one set of external side effects (#127). The token is not
                     # reset between attempts either, so a retry would start pre-cancelled.
-                    if unwrapped isa TaskTimeoutError
+                    #
+                    # So are the three `is_unrecoverable` exceptions (#367), recorded FAILED and
+                    # never rethrown. Why neither a retry nor a rethrow is canonical in that
+                    # function's site table (src/errors.jl); `_execute_queued_task` does the same.
+                    if unwrapped isa TaskTimeoutError || is_unrecoverable(unwrapped)
                         return _fail_task!(runtime, task_info, _store_error_text(runtime.store, unwrapped))
                     end
 
