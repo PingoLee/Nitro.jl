@@ -338,6 +338,71 @@ end
     @test !occursin("1.10.0", output)
 end
 
+# #299: the banner reports the GC target and the thread pools, and never guesses. The target is
+# injected so each shape is deterministic; the live read has its own smoke test below.
+@testset "serverwelcome banner reports the GC target and thread pools" begin
+    banner(parallel; gc_target) = mktemp() do path, io
+        redirect_stdout(io) do
+            withenv("NITRO_ENV" => "dev", "GENIE_ENV" => nothing) do
+                serverwelcome("http://127.0.0.1:8080", nothing, parallel; gc_target)
+            end
+        end
+        flush(io)
+        read(path, String)
+    end
+
+    # A hint of 1G, as Julia 1.12 reports it (the hint minus its 250 MiB reserve).
+    with_target = banner(true; gc_target = UInt64(811597824))
+    @test occursin("GC target 774.0 MiB", with_target)
+    @test occursin("parallel mode: $(Threads.nthreads(:default)) thread", with_target)
+    if Threads.nthreads(:interactive) > 0
+        @test occursin("+ $(Threads.nthreads(:interactive)) interactive", with_target)
+    else
+        @test !occursin("interactive", with_target)
+    end
+    @test occursin("GC target 2.8 GiB", banner(true; gc_target = UInt64(3) * 2^30 - UInt64(250) * 2^20))
+
+    # Julia's "unset" value is reported as none, never as a 2 PiB limit.
+    none = banner(true; gc_target = UInt64(2)^51)
+    @test occursin("GC target: none", none)
+    @test !occursin("PiB", none)
+
+    # The runtime would not say: no field at all, rather than a guess.
+    unknown = banner(true; gc_target = nothing)
+    @test !occursin("GC target", unknown)
+    @test occursin("parallel mode:", unknown)
+
+    # Outside parallel mode the GC field still prints, on its own.
+    serial = banner(false; gc_target = UInt64(811597824))
+    @test occursin(" (GC target 774.0 MiB)", serial)
+    @test !occursin("parallel mode", serial)
+    @test !occursin("(", banner(false; gc_target = nothing))
+end
+
+@testset "a prod process with no GC target warns once at startup, and nothing else does (#299)" begin
+    warn_fn = Nitro.Core._warn_if_no_gc_target
+    unset = UInt64(2)^51
+    @test_logs (:warn, r"no GC target") warn_fn("prod", unset)
+    # Every other combination is silent: another environment, a target that is set, or a
+    # runtime that would not say.
+    @test_logs min_level = Base.CoreLogging.Debug warn_fn("dev", unset)
+    @test_logs min_level = Base.CoreLogging.Debug warn_fn("test", unset)
+    @test_logs min_level = Base.CoreLogging.Debug warn_fn("prod", UInt64(811597824))
+    @test_logs min_level = Base.CoreLogging.Debug warn_fn("prod", nothing)
+end
+
+@testset "the GC target is read from the running process (#299)" begin
+    target = Nitro.Core._gc_target_bytes()
+    @test target isa UInt64
+    # The read reflects `--heap-size-hint`, not just a constant: a child started with a 1G hint
+    # reports a target below 1 GiB, where one without a hint or cgroup limit reports none.
+    code = "using Nitro; print(Nitro.Core._gc_target_bytes())"
+    hinted = parse(UInt64, read(`$(Base.julia_cmd()) --startup-file=no --heap-size-hint=1G
+                                 --project=$(Base.active_project()) -e $code`, String))
+    @test Nitro.Core._has_gc_target(hinted)
+    @test UInt64(512) * 2^20 < hinted <= UInt64(2)^30
+end
+
 @testset "mount_segments canonicalization" begin
     # The SINGLE normalization point for `mountdir` (#93). staticfiles/spafiles/dynamicfiles no
     # longer strip anything themselves, so `mountfolder` and `spafiles`' history-mode fallback both

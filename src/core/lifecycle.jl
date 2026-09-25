@@ -2,7 +2,67 @@
 # `serve`/`terminate`/`startserver`, the startup banner, and the Revise wiring.
 # Included into `module Core` by src/core.jl — not a submodule; see the hub for why.
 
-function serverwelcome(external_url::String, prefix::Nullable{String}, parallel::Bool)
+# ── What the process was started with (#299) ──────────────────────────────────────────────────────
+#
+# REPORT, NEVER ENFORCE. The two most common ways to misconfigure a production process — one
+# thread, and no GC target — cannot be seen from inside it without these lines. Nothing in Nitro
+# may depend on either value: it never refuses to start, never sets a hint itself, never sizes
+# anything from what it reads. That is the same line `current_env()` holds (#55), and it is a
+# deliberate, narrow exception to #241's "nothing in `src/` should read the heap hint".
+
+# Julia's own "no target" is 2 PiB (2^51) on 1.12 and 1.13. Compared against a threshold rather
+# than that exact value, which is a runtime constant that could move; no real host has 1 PiB.
+const _NO_GC_TARGET_BYTES = UInt64(1) << 50
+
+# The GC's effective target, in bytes: `--heap-size-hint`, else `JULIA_HEAP_SIZE_HINT`, else the
+# cgroup memory limit — the runtime has already applied that precedence, and subtracted its own
+# 250 MiB reserve. `nothing` when the runtime does not expose it: `jl_gc_get_max_memory` is exported
+# (`julia/gc-interface.h`) but not documented API, so a GC build without it must cost only the
+# banner field, never the server start.
+function _gc_target_bytes()::Nullable{UInt64}
+    try
+        return ccall(:jl_gc_get_max_memory, UInt64, ())
+    catch err
+        err isa InterruptException && rethrow()
+        return nothing
+    end
+end
+
+_has_gc_target(bytes::UInt64) = bytes < _NO_GC_TARGET_BYTES
+
+function _format_gc_bytes(bytes::UInt64)::String
+    gib = bytes / 2.0^30
+    return gib >= 1 ? "$(round(gib; digits = 1)) GiB" : "$(round(bytes / 2.0^20; digits = 1)) MiB"
+end
+
+# `Threads.nthreads()` is the default pool only. Julia 1.12 also starts one interactive thread by
+# default, and HTTP.jl runs its accept loop and every connection task there, so it is worth
+# showing — but as a separate count, because handlers never run on it.
+function _thread_summary()::String
+    ndefault = Threads.nthreads(:default)
+    ninteractive = Threads.nthreads(:interactive)
+    summary = "$ndefault thread$(ndefault == 1 ? "" : "s")"
+    return ninteractive > 0 ? "$summary + $ninteractive interactive" : summary
+end
+
+# The one environment-dependent output at startup, and it only logs. A prod process with no GC
+# target is the documented cause of an OOM kill that leaves no Julia backtrace (Running in
+# Production), and the banner alone is easy to miss — it goes to stdout, and `show_banner=false`
+# suppresses it — so prod also gets a line at warning level, where log alerting sees it.
+# Deliberately NOT for a single thread: that is a valid deployment (#149). And not when the value
+# is unknown: guessing would warn about something that may well be set.
+function _warn_if_no_gc_target(env::AbstractString, gc_target::Nullable{UInt64})::Nothing
+    env == "prod" || return nothing
+    (gc_target === nothing || _has_gc_target(gc_target)) && return nothing
+    @warn "Nitro is running in prod with no GC target: no `--heap-size-hint`, no " *
+          "`JULIA_HEAP_SIZE_HINT` and no cgroup memory limit. The heap can then grow until the " *
+          "kernel OOM-kills the process, which leaves no Julia backtrace. Set one of the three; " *
+          "see \"Running in Production\" in the Nitro docs."
+    return nothing
+end
+
+function serverwelcome(external_url::String, prefix::Nullable{String}, parallel::Bool;
+                       gc_target::Nullable{UInt64} = _gc_target_bytes())
     server_url = Util.join_url_path(external_url, prefix)
     curr_time = Dates.format(now(), "yyyy-mm-dd HH:MM:SS")
     # Renamed: `current_env` is now a function in this module (#55).
@@ -17,9 +77,26 @@ function serverwelcome(external_url::String, prefix::Nullable{String}, parallel:
     # `1.10.0` literal this replaces, just with a longer fuse.
     version = something(Base.pkgversion(@__MODULE__), "unknown")
     printstyled(" Nitro $version ", color=:cyan, reverse=true, bold=true)
+    # `(parallel mode: 8 threads + 1 interactive, GC target 2.8 GiB)`. Each field is printed only
+    # when there is something true to say: no thread count outside parallel mode, and no GC field
+    # at all when the runtime would not say (`nothing`) rather than a guess.
+    opened = false
     if parallel
-        printstyled(" (parallel mode: $(Threads.nthreads()) threads)", color=:light_black)
+        printstyled(" (parallel mode: $(_thread_summary())", color=:light_black)
+        opened = true
     end
+    if gc_target !== nothing
+        printstyled(opened ? ", " : " (", color=:light_black)
+        if _has_gc_target(gc_target)
+            printstyled("GC target $(_format_gc_bytes(gc_target))", color=:light_black)
+        else
+            # Not "2.0 PiB": that number is Julia's placeholder for "unset", and printing it would
+            # read as a real, enormous limit.
+            printstyled("GC target: none", color=:yellow)
+        end
+        opened = true
+    end
+    opened && printstyled(")", color=:light_black)
     println("\n$curr_time")
     # ALWAYS printed, including the defaulted case. A prod box that forgot `NITRO_ENV` must
     # SEE that it is running as `dev` -- hiding the line when nobody set one reproduces exactly
@@ -261,6 +338,9 @@ function serve(ctx::App;
     if revise == :eager
         ctx.service.eager_revise[] = start_revise_service()
     end
+
+    # After every check that can still refuse this call, so a rejected `serve` never warns (#299).
+    _warn_if_no_gc_target(current_env(), _gc_target_bytes())
 
     try
         return startserver(ctx; host, port, show_banner, parallel, async, kwargs, start=(kwargs) ->

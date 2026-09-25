@@ -16,12 +16,20 @@ julia --threads=auto --project -e 'using MyApp; MyApp.start_server()'
 ```
 
 A bare `julia` starts with **one** default thread, so a CPU-bound handler holds up every other
-request until it returns. The startup banner prints what you got — check it on the target
-machine, not on your laptop:
+request until it returns. The startup banner prints what you got, along with the GC target
+covered in [Memory and GC](@ref) below — check it on the target machine, not on your laptop:
 
 ```
- Nitro <version>  (parallel mode: 8 threads)
+ Nitro <version>  (parallel mode: 8 threads + 1 interactive, GC target 2.8 GiB)
 ```
+
+The thread count is the default pool, where handlers run. Julia 1.12 also starts one
+*interactive* thread; HTTP.jl accepts connections there, and no handler ever runs on it.
+
+A process with no GC target prints `GC target: none`. When the environment is `prod`
+(`NITRO_ENV=prod`), `serve` also logs a warning about it at startup, even with
+`show_banner = false`, so it reaches your log alerting. Nothing refuses to start and nothing is
+set for you: the banner and the warning only report what the process was started with.
 
 `--threads=auto` means one thread per CPU (on Linux and Windows, per CPU the process's affinity
 mask allows). Julia also sizes its parallel
