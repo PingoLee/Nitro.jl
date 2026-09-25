@@ -69,9 +69,15 @@ The `secure=false` example is only for local HTTP development. Keep `secure=true
 ## What SessionMiddleware Does
 
 1. Reads the session ID cookie.
-2. Loads the server-side payload into `getsession(req)`.
-3. Persists any changes at the end of the request.
-4. Writes a new cookie when the session is created or the session ID rotates.
+2. Loads the server-side payload into `getsession(req)`, or gives a new visitor an empty one.
+3. Persists any changes at the end of the request. A **new** session is saved only once it is
+   used: the handler stored something in it, rotated it, or set
+   `req.context[:session_modified] = true` (as `CSRFMiddleware` does for its tokens). A request
+   that never touches the session stores nothing and gets no cookie.
+4. Writes the cookie when a session is saved or its ID rotates, and marks that response
+   `Cache-Control: private` with `Vary: Cookie`, so a shared cache or CDN never hands one
+   visitor's session to another. `private` replaces a `public` directive; `max-age` and the
+   other directives are kept.
 
 The cookie contains an opaque session identifier, not the session payload itself. With `SessionMiddleware`, you do not need to encrypt the session ID to keep user data off the client.
 
@@ -176,13 +182,16 @@ Implement these methods for your own backend:
 ```julia
 Base.get(store::S, session_id::String, default)
 set_session!(store::S, session_id::String, data; ttl=3600)
+update_session!(store::S, session_id::String, data; ttl=3600)   # -> Bool
 delete_session!(store::S, session_id::String)
 cleanup_expired_sessions!(store::S)
 ```
 
 `SessionMiddleware` uses Nitro's `storesession!` and `prunesessions!` helpers, and those
-delegate to `set_session!` and `cleanup_expired_sessions!` by default. Implementing the
-four methods above is enough for custom backends.
+delegate to `set_session!` and `cleanup_expired_sessions!` by default. It writes back a session
+the request *loaded* with `update_session!`. That method must write only if the session still
+exists and has not expired, returning `false` otherwise, as one atomic step. Implementing the
+five methods above is enough for custom backends; only `cleanup_expired_sessions!` is optional.
 
 `cleanup_expired_sessions!` is called from a background janitor owned by
 `SessionMiddleware`'s lifecycle hooks — it never runs on the request path. Use
@@ -197,6 +206,18 @@ SessionPruner(store; interval = Minute(5))                     # janitor only
 ## Logout Semantics
 
 With `SessionMiddleware`, `empty!(getsession(req))` only clears the current payload. To retire the old authenticated session ID, pair it with `regenerate_session!`.
+
+A logout holds against requests that are still in flight on the old session and write to it.
+Once the old ID has been deleted, another request that loaded it earlier and then writes to it has
+that write dropped: the session is not re-created, and that response does not set the old cookie
+again. Each request also works on its own deep copy of the session, so concurrent requests never
+share a nested value such as a `cart` vector.
+
+One case is not covered yet
+([#361](https://github.com/PingoLee/Nitro.jl/issues/361)): an in-flight request that
+**rotates** the session after the logout, by calling `regenerate_session!` or through
+`rotate_on_auth` on a user switch. It still copies its stale data into a fresh ID. Re-check
+credentials before rotating on a privilege change rather than trusting the loaded session alone.
 
 If you manage sessions manually without `SessionMiddleware`, delete the old server-side record and invalidate the client cookie yourself.
 

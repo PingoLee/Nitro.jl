@@ -87,11 +87,14 @@ uses a different session key.
 
 ### In-Memory (development)
 
-The built-in `MemoryStore` keeps sessions in a process-local dictionary.
-Sessions are lost on restart.
+The built-in `MemoryStore` keeps sessions in a process-local, size-bounded LRU. Sessions are lost
+on restart and are not shared between processes. It holds at most `max_sessions` (default
+`100_000`). Once full, each new session evicts the least recently used one, and the store warns
+once. A flood of new sessions therefore logs idle users out instead of exhausting memory.
 
 ```julia
-store = MemoryStore()
+store = MemoryStore()                          # up to 100_000 sessions
+store = MemoryStore(max_sessions = 500_000)    # raise the bound
 
 serve(middleware=[
     SessionMiddleware(store=store, secure=false),
@@ -133,18 +136,26 @@ created on *and* the one every session query runs against, so the two can never 
 
 ### Custom Stores
 
-Three methods are **required** for your store type `S <: AbstractSessionStore{String, Dict{String,Any}}`:
+Four methods are **required** for your store type `S <: AbstractSessionStore{String, Dict{String,Any}}`:
 
 ```julia
-Base.get(store::S, session_id::String, default)        # → SessionPayload or default
-set_session!(store::S, session_id::String, data; ttl)  # → persist data with TTL
-delete_session!(store::S, session_id::String)          # → remove a session
+Base.get(store::S, session_id::String, default)           # → SessionPayload or default
+set_session!(store::S, session_id::String, data; ttl)     # → persist data with TTL (insert or overwrite)
+update_session!(store::S, session_id::String, data; ttl)  # → overwrite a LIVE session only; Bool
+delete_session!(store::S, session_id::String)             # → remove a session
 ```
 
 `Base.get` is easy to overlook and is not optional — both `get_session` and the session
 middleware's own load path call it directly.
 
-A fourth is **optional**:
+`update_session!` is how `SessionMiddleware` writes back a session the request loaded. It must
+write **only if** the session still exists and has not expired, and return `false` (writing
+nothing) otherwise. That is what stops a slow request from re-creating a session that a
+concurrent logout just deleted. Make the check and the write one atomic step (an
+`UPDATE … WHERE`, or one lock hold). A store *failure* must throw, not return `false`: `false`
+means "logged out" and the middleware drops the write.
+
+A fifth is **optional**:
 
 ```julia
 cleanup_expired_sessions!(store::S)                    # → prune expired entries
@@ -237,6 +248,13 @@ It works exactly like Django's `request.session`:
 
 Changes are automatically detected and persisted at the end of the request.
 You do not need to call a save method.
+
+A **new** session is saved, and its cookie set, only once it is used: once the handler stores
+something in it, rotates it, or sets `req.context[:session_modified] = true`. That is the
+equivalent of Django's `request.session.modified = True`. A request that never touches the
+session, such as a health check or a static file, creates nothing. Set the flag yourself when you
+hand the client something bound to `req.context[:session_id]` without writing to the session.
+`CSRFMiddleware` already sets it for its tokens.
 
 `empty!(getsession(req))` only clears the current payload. For the default `user_id`-based flow,
 `SessionMiddleware` now rotates an existing session automatically when auth state changes.
@@ -578,6 +596,13 @@ or any run of up to 64 NUL bytes, which HMAC treats as the same empty key — is
 The middleware uses a signed double-submit cookie. Safe requests receive a CSRF cookie
 automatically; unsafe requests must echo the token in the `X-CSRF-Token` header, in a `_csrf`
 form field, or in a `_csrf` JSON body key.
+
+Issuing a token also **keeps the session it is bound to**. `SessionMiddleware` saves a new session
+only when something uses it, and `CSRFMiddleware` counts as a use: it sets
+`req.context[:session_modified]`, so an anonymous visitor's session is saved and their token still
+verifies on the next request. The flip side is that every cookieless request reaching
+`CSRFMiddleware` stores one session. Put it on the routes that serve forms or your SPA, not in
+front of health checks and static files, where a request only creates a session nobody will use.
 
 **`SessionMiddleware` must sit outside `CSRFMiddleware`.** The token's signature covers the
 session id as well as the random token value, so a token minted for one visitor does not

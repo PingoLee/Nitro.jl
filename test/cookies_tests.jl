@@ -1477,10 +1477,8 @@ end
     @test !occursin(real_key, repr(cfg))
     @test !occursin(real_key, sprint(show, MIME"text/plain"(), cfg))
 
-    session = SessionMiddleware(store = MemoryStore{String, Dict{String, Any}}(),
-                                secret_key = real_key)
-    @test !occursin(real_key, repr(session))
-    @test !occursin(real_key, repr(session.middleware))
+    # `SessionMiddleware` used to be checked here too. Since #339 it cannot hold a key at all:
+    # the keyword is gone, and a `config` carrying one is refused at construction.
 
     csrf_key = "csrf-" * real_key
     @test !occursin(csrf_key, repr(CSRFMiddleware(csrf_key)))
@@ -1707,7 +1705,8 @@ end
     @test_throws ArgumentError Crypto.encrypt_payload(short, "v"; purpose = "c")
     @test_throws ArgumentError Crypto.decrypt_payload(short, "x"; purpose = "c")
     @test_throws ArgumentError CookieAuthMiddleware(t -> t; secret_key = short)
-    @test_throws ArgumentError SessionMiddleware(store = MemoryStore{String, Dict{String, Any}}(), secret_key = short)
+    # `SessionMiddleware` used to be on this list; since #339 it takes no key at all (see
+    # "SessionMiddleware takes no secret_key (#339)" in test/middleware/session_middleware_tests.jl).
     # Bytes, not characters: 16 two-byte characters are 32 bytes.
     @test CookieConfig(secret_key = "é" ^ 16).secret_key isa SecretString
     @test CookieConfig(secret_key = "s" ^ 32).secret_key isa SecretString

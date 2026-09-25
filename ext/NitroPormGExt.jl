@@ -7,7 +7,7 @@ using JSON
 using UUIDs
 
 import Nitro.Auth: make_password, check_password, password_needs_upgrade
-import Nitro.Core.Types: AbstractSessionStore, SessionPayload, get_session, set_session!, delete_session!, cleanup_expired_sessions!, is_expired
+import Nitro.Core.Types: AbstractSessionStore, SessionPayload, get_session, set_session!, update_session!, delete_session!, cleanup_expired_sessions!, is_expired
 import Nitro.Core.Cookies: storesession!, prunesessions!
 import Nitro: pormg_nitro_session, sync_pormg_env!
 
@@ -334,6 +334,28 @@ function set_session!(store::PormGSessionStore, session_id::String, data::Dict{S
         rethrow()
     end
     return data
+end
+
+# One `UPDATE ... WHERE session_key = ? AND expires_at > now`, never a read followed by a write:
+# the WHERE is the existence check, so a row a concurrent logout deleted -- or one that expired --
+# matches nothing and is NOT re-created (#318). `update()` returns the matched-row count (Django
+# semantics). `__@gt` is the exact complement of the prune's inclusive `__@lte` and of
+# `is_expired`, so the boundary instant counts as expired here too.
+function update_session!(store::PormGSessionStore, session_id::String, data::Dict{String,Any}; ttl::Int=3600)
+    now_utc = Dates.now(Dates.UTC)
+    serialized = _serialize_session(data)
+
+    matched = try
+        _session_objects(store).filter("session_key" => session_id,
+                                       "expires_at__@gt" => now_utc).update(
+            "session_data" => serialized,
+            "expires_at"   => now_utc + Dates.Second(ttl),
+        )
+    catch e
+        @warn "PormGSessionStore: failed to write session" exception=(e, catch_backtrace())
+        rethrow()
+    end
+    return matched > 0
 end
 
 function delete_session!(store::PormGSessionStore, session_id::String)

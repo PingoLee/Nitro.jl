@@ -4,12 +4,13 @@ using HTTP
 using Dates
 using JSON
 using UUIDs
-using ...Types: AbstractSessionStore, MemoryStore, SessionPayload, Nullable, is_expired
+using ...Types: AbstractSessionStore, MemoryStore, SessionPayload, Nullable, is_expired,
+    update_session!
 using ...Types: CookieConfig, LifecycleMiddleware
 using ..JanitorMiddleware: _janitor
 using ...Cookies: get_cookie, set_cookie!, storesession!, prunesessions!, regenerate_session!,
     _validate_cookie_prefix
-using ...Crypto: secure_uuid4, SecretString
+using ...Crypto: secure_uuid4
 using ...Core: own_response_headers
 
 export SessionMiddleware, SessionPruner
@@ -91,7 +92,7 @@ function SessionPruner(store::AbstractSessionStore; interval::Period = Minute(10
 end
 
 """
-    SessionMiddleware(; store, cookie_name, secret_key, max_age, prune_interval,
+    SessionMiddleware(; store, cookie_name, max_age, prune_interval,
                         rotate_on_auth, auth_key, validator, ...)
 
 Creates a `LifecycleMiddleware` that manages server-side sessions with cookie-based session
@@ -110,6 +111,24 @@ IDs. The mutable session dictionary is read with `getsession(req)` (`req.context
 Expired sessions are reclaimed by a background janitor that starts on `serve()` and stops on
 `terminate()` — see `prune_interval` below and [`SessionPruner`](@ref). Nothing prunes on the
 request path.
+
+# When a session is saved
+
+A request without a valid session cookie gets a fresh id in `req.context[:session_id]` and an
+empty `getsession(req)`. That new session is **saved, and its cookie set, only if** the handler
+leaves data in it, rotates it (`regenerate_session!`), or sets
+`req.context[:session_modified] = true` (#317). Otherwise nothing is stored and no cookie is sent,
+so health checks and static files do not create sessions. `CSRFMiddleware` sets the flag whenever
+it issues a token bound to the session. Set it yourself when you hand the client anything else
+bound to `req.context[:session_id]`.
+
+An existing session is written back when its data changed, or when the flag is set (which also
+refreshes its expiry). That write is update-only (`update_session!`, #318). If a concurrent logout
+deleted the session meanwhile, the write is dropped and the cookie is not re-set.
+
+A response that sets the session cookie also gets `Vary: Cookie`, and `Cache-Control: private` in
+place of any `public` (other directives are kept). A shared cache therefore never serves one
+visitor's session to another.
 
 # Session fixation defense (`rotate_on_auth`, `auth_key`, `validator`)
 
@@ -150,8 +169,13 @@ contract.
   sessions from `store`. Must be a positive fixed-length `Period`; calendar periods (`Month`,
   `Quarter`, `Year`) are rejected, since they cannot be slept on. This replaced a `prune_probability` that ran the prune inline on a
   fraction of requests; see the comment above `_prune_janitor` for why that had to go.
-- Cookie attributes (`secure`, `httponly`, `samesite`, `path`, `domain`, `secret_key`) or a
-  fully-formed `config::CookieConfig`.
+- Cookie attributes (`secure`, `httponly`, `samesite`, `path`, `domain`) or a fully-formed
+  `config::CookieConfig`.
+
+There is no `secret_key` (#339). The cookie carries only a random UUIDv4 session id and the data
+stays on the server, so there is nothing to encrypt. Signing the id would not stop fixation or
+session swapping either; the `__Host-` default above is what stops swapping. A `config` whose
+`secret_key` is set is an `ArgumentError`, because it would be silently ignored.
 
 # Returns
 A `LifecycleMiddleware`. `serve()` and `urlpatterns()` accept it directly; if you are composing
@@ -159,7 +183,6 @@ the chain by hand, the request function is its `.middleware` field.
 """
 function SessionMiddleware(;
     cookie_name::Nullable{String} = nothing,
-    secret_key::Union{AbstractString, SecretString, Nothing} = nothing,
     max_age::Int = 86400,
     store::AbstractSessionStore{String, Dict{String,Any}},
     prune_interval::Period = Minute(10),
@@ -171,7 +194,6 @@ function SessionMiddleware(;
     rotate_on_auth::Bool = true,
     auth_key::String = "user_id",
     config::CookieConfig = CookieConfig(
-        secret_key = secret_key,
         httponly = httponly,
         secure = secure,
         samesite = samesite,
@@ -180,6 +202,15 @@ function SessionMiddleware(;
         maxage = max_age,
     ),
     validator::Union{Function, Nothing} = nothing)
+
+    # There is no `secret_key` keyword any more (#339): it was accepted and never used, since the
+    # id cookie was always written and read raw. A caller passing one reasonably believed the
+    # session cookie was encrypted or signed. A `config` carrying one would be the same silent
+    # no-op, so it is refused rather than ignored.
+    config.secret_key === nothing || throw(ArgumentError(
+        "SessionMiddleware does not encrypt or sign its cookie, so `config.secret_key` would be " *
+        "ignored. The cookie holds only a random 122-bit session id; the session data stays on " *
+        "the server. Build the `CookieConfig` without `secret_key` (#339)."))
 
     # Resolved from the FINAL config -- `config` may be passed whole -- and checked before any
     # janitor exists, so a name browsers would drop fails at construction.
@@ -222,10 +253,37 @@ function SessionMiddleware(;
                 end
             end
 
-            session_changed = is_new || final_session_id != session_id || current_session != original_session
-            if session_changed
-                _save_session(store, final_session_id, current_session, max_age)
+            # `:session_modified` is Django's `modified` flag: something OUTSIDE the session data
+            # depends on this session existing. `CSRFMiddleware` sets it whenever it hands out a
+            # token bound to the id -- without it an anonymous visitor's token would be bound to
+            # an id that was never saved, and every later POST would 403.
+            forced = get(req.context, :session_modified, false) === true
+            rotated = final_session_id != session_id
 
+            # A NEW session is saved lazily (#317): only once it holds data, was rotated, or was
+            # marked modified. It used to be saved for `max_age` -- and handed a cookie -- on
+            # every cookieless request, so a `/health` loop grew `MemoryStore` without bound and
+            # cost a PormG store a SELECT plus an INSERT per request.
+            #
+            # An id minted during THIS request -- a new visitor's, or one `regenerate_session!`
+            # rotated to -- is inserted. An id the request LOADED is written back update-only
+            # (#318): if a concurrent logout or rotation deleted it meanwhile, the write is
+            # dropped and the cookie is not re-set. Upserting it re-created the deleted session,
+            # so a stolen id outlived the logout meant to kill it and the browser was logged
+            # back in.
+            if rotated || (is_new && (forced || !isempty(current_session)))
+                _save_session(store, final_session_id, current_session, max_age)
+                session_written = true
+            elseif !is_new && (forced || current_session != original_session)
+                # `::Bool`: the contract's return type, asserted so inference does not carry `Any`
+                # (`current_session` comes out of `req.context`) into the branch below.
+                session_written = update_session!(store, final_session_id, current_session;
+                                                  ttl = max_age)::Bool
+            else
+                session_written = false
+            end
+
+            if session_written
                 # Own the headers before adding Set-Cookie: `response` may be a shared/`const`
                 # object (e.g. an auth-rejection response). Mutating it in place would attach
                 # this visitor's session cookie to every later request that returns the same
@@ -233,6 +291,7 @@ function SessionMiddleware(;
                 response = own_response_headers(response)
                 # Append the session cookie without clobbering any sibling Set-Cookie headers.
                 set_cookie!(response, session_cookie, final_session_id; config=config, encrypted=false, maxage=max_age)
+                _mark_private!(response)
             end
 
             return response
@@ -271,14 +330,18 @@ function _load_session(store::AbstractSessionStore{String, Dict{String,Any}}, se
         return Dict{String,Any}(), true
     end
 
+    # DEEP copies (#318). A shallow `copy` shared every nested value -- the docs' `cart` vector,
+    # a nested `Dict` -- between the store and every concurrent request of the session, which
+    # all mutated it at once: lost writes, and a corrupted `Dict` that threw on every later
+    # request. `PormGSessionStore` decodes fresh JSON per read and never had the bug.
     if payload isa SessionPayload
         if is_expired(payload)
             return Dict{String,Any}(), true
         end
-        return copy(payload.data), false
+        return deepcopy(payload.data), false
     end
 
-    data = payload isa AbstractDict ? copy(payload) : payload
+    data = payload isa AbstractDict ? deepcopy(payload) : payload
     return data, false
 end
 
@@ -320,5 +383,47 @@ end
 function _save_session(store::AbstractSessionStore{String, Dict{String,Any}}, session_id::String, data::Dict{String,Any}, max_age::Int)
     storesession!(store, session_id, data; ttl=max_age)
 end
+
+# A response carrying one visitor's session cookie must never be stored by a SHARED cache (#317).
+# A static file served `public, max-age=31536000, immutable` under a global `SessionMiddleware`
+# used to carry `Set-Cookie: <session>=<fresh id>` with no `private` and no `Vary: Cookie`, so a
+# CDN that stored it handed one session -- and the CSRF token bound to it -- to every visitor.
+#
+# Only ever called on headers this middleware already owns (`own_response_headers`).
+function _mark_private!(response::HTTP.Response)
+    vary = String[]
+    cache_control = String[]
+    for (name, value) in response.headers
+        field = lowercase(name)
+        if field == "vary"
+            append!(vary, _header_list(value))
+        elseif field == "cache-control"
+            append!(cache_control, _header_list(value))
+        end
+    end
+
+    # `Vary` may already span several field lines -- `Cors` pushes its own `Vary: Origin` -- and
+    # another line is additive by definition, so nothing already there is rewritten.
+    if !any(t -> t == "*" || lowercase(t) == "cookie", vary)
+        push!(response.headers, "Vary" => "Cookie")
+    end
+
+    # `private` wins over `public`; every other directive (`max-age`, `immutable`, …) is kept, so
+    # the visitor's own browser still caches exactly as the handler asked. A response already
+    # `private` or `no-store` is left alone.
+    names = String[lowercase(strip(first(split(d, '='; limit = 2)))) for d in cache_control]
+    if !("private" in names || "no-store" in names)
+        kept = String[d for (d, n) in zip(cache_control, names) if n != "public"]
+        # `setheader` replaces EVERY existing `Cache-Control` line with this one.
+        HTTP.setheader(response, "Cache-Control" => join(pushfirst!(kept, "private"), ", "))
+    end
+    return response
+end
+
+# The comma-separated elements of a list-valued header, trimmed. A quoted element holding a comma
+# (`no-cache="a, b"`) splits in two, but the pieces are re-joined in order with ", ", so it is
+# written back as it came -- and no directive name this function tests can be inside quotes.
+_header_list(value::AbstractString) =
+    String[strip(element) for element in split(value, ',') if !isempty(strip(element))]
 
 end # module SessionMiddleware_

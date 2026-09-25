@@ -5,7 +5,7 @@ using HTTP
 using Dates
 using Nitro
 using Nitro.Types: AbstractSessionStore, MemoryStore, SessionPayload
-using Nitro.Types: get_session, set_session!, delete_session!, cleanup_expired_sessions!
+using Nitro.Types: get_session, set_session!, update_session!, delete_session!, cleanup_expired_sessions!
 using Nitro.Types: missing_session_methods
 using Nitro.Errors: StoreInterfaceError
 
@@ -49,6 +49,13 @@ function Nitro.Types.set_session!(store::DelegatingSessionStore, session_id::Str
     return value
 end
 
+function Nitro.Types.update_session!(store::DelegatingSessionStore, session_id::String, value::Dict{String,Any}; ttl::Int=3600)
+    payload = get(store.data, session_id, nothing)
+    (payload === nothing || Nitro.Types.is_expired(payload)) && return false
+    store.data[session_id] = SessionPayload(copy(value), Dates.now(Dates.UTC) + Dates.Second(ttl))
+    return true
+end
+
 function Nitro.Types.delete_session!(store::DelegatingSessionStore, session_id::String)
     delete!(store.data, session_id)
     return nothing
@@ -81,7 +88,9 @@ end
     missing_names = missing_session_methods(BareSessionStore)
     @test :get in missing_names
     @test :set_session! in missing_names
+    @test :update_session! in missing_names
     @test :delete_session! in missing_names
+    @test isempty(missing_session_methods(DelegatingSessionStore))
 
     # `cleanup_expired_sessions!` is optional, so it is never reported and never throws.
     @test !(:cleanup_expired_sessions! in missing_names)
@@ -91,6 +100,7 @@ end
     # that forgets it used to fail with a bare `MethodError` raised from inside `get_session`.
     for thunk in (() -> Base.get(BareSessionStore(), "sid", nothing),
                   () -> set_session!(BareSessionStore(), "sid", Dict{String,Any}(); ttl=60),
+                  () -> update_session!(BareSessionStore(), "sid", Dict{String,Any}(); ttl=60),
                   () -> delete_session!(BareSessionStore(), "sid"))
         err = try
             thunk()
@@ -179,6 +189,104 @@ end
 
     set_session!(store, "overwrite", Dict{String,Any}("v" => 2); ttl=3600)
     @test get_session(store, "overwrite") == Dict{String,Any}("v" => 2)
+end
+
+# #318: `set_session!` upserts, so the middleware's write-back of a session a concurrent logout had
+# deleted re-created it. `update_session!` is the write that refuses a row that has gone.
+@testset "MemoryStore update_session! never creates a row (#318)" begin
+    store = MemoryStore{String, Dict{String,Any}}()
+
+    # Absent: nothing to update, and nothing is written.
+    @test update_session!(store, "gone", Dict{String,Any}("user_id" => 42); ttl=3600) === false
+    @test !haskey(store.data, "gone")
+
+    # Expired: refused on the same `is_expired` boundary every read uses, and left as it was --
+    # an expired row is the prune's to remove, not the write path's to revive.
+    stale_expiry = Dates.now(Dates.UTC) - Dates.Second(5)
+    lock(store.lock) do
+        store.data["stale"] = SessionPayload(Dict{String,Any}("user_id" => 1), stale_expiry)
+    end
+    @test update_session!(store, "stale", Dict{String,Any}("user_id" => 2); ttl=3600) === false
+    @test store.data["stale"].expires == stale_expiry
+    @test store.data["stale"].data == Dict{String,Any}("user_id" => 1)
+
+    # Present: overwritten, with the expiry moved to `ttl` from now.
+    set_session!(store, "live", Dict{String,Any}("v" => 1); ttl=10)
+    t0 = Dates.now(Dates.UTC)
+    @test update_session!(store, "live", Dict{String,Any}("v" => 2); ttl=3600) === true
+    @test get_session(store, "live") == Dict{String,Any}("v" => 2)
+    @test store.data["live"].expires >= t0 + Dates.Second(3600)
+
+    # The logout interleaving at the store level: deleted between load and write-back.
+    delete_session!(store, "live")
+    @test update_session!(store, "live", Dict{String,Any}("v" => 3); ttl=3600) === false
+    @test get_session(store, "live") === nothing
+end
+
+# #317: `MemoryStore` was an unbounded `Dict` that pruning shrank only by EXPIRED rows, so a flood
+# of new sessions grew it until the process ran out of memory.
+@testset "MemoryStore is bounded and evicts the least recently used session (#317)" begin
+    @test MemoryStore().max_sessions == 100_000
+    @test MemoryStore{String, Dict{String,Any}}().max_sessions == 100_000
+    @test_throws ArgumentError MemoryStore(max_sessions = 0)
+    @test_throws ArgumentError MemoryStore(max_sessions = -1)
+
+    store = MemoryStore(max_sessions = 3)
+    session(v) = Dict{String,Any}("v" => v)
+    set_session!(store, "a", session(1); ttl=3600)
+    set_session!(store, "b", session(2); ttl=3600)
+
+    # Filling the store warns -- once.
+    @test_logs (:warn, r"MemoryStore is full") set_session!(store, "c", session(3); ttl=3600)
+
+    # Reading `a` makes it the most recently used, so `b` is now the one to go.
+    @test get_session(store, "a") == session(1)
+    @test_logs min_level=Base.CoreLogging.Warn set_session!(store, "d", session(4); ttl=3600)
+    @test length(store.data) == 3
+    @test get_session(store, "b") === nothing
+    @test get_session(store, "a") == session(1)
+    @test get_session(store, "c") == session(3)
+    @test get_session(store, "d") == session(4)
+
+    # Overwriting a key that is present evicts nothing.
+    set_session!(store, "d", session(40); ttl=3600)
+    @test length(store.data) == 3
+    @test update_session!(store, "c", session(30); ttl=3600)
+    @test sort(collect(keys(store.data))) == ["a", "c", "d"]
+
+    # The prune still works on the LRU.
+    lock(store.lock) do
+        store.data["a"] = SessionPayload(session(1), Dates.now(Dates.UTC) - Dates.Second(1))
+    end
+    cleanup_expired_sessions!(store)
+    @test sort(collect(keys(store.data))) == ["c", "d"]
+end
+
+# #318: a stored value and a request's value must never be the same object. A shallow copy
+# shared nested vectors and dicts between the store and every concurrent request of a session.
+@testset "MemoryStore isolates nested values from callers (#318)" begin
+    store = MemoryStore{String, Dict{String,Any}}()
+
+    # Write side: the caller keeps mutating the dict it handed over -- `regenerate_session!`
+    # hands over the request's live session, and the handler carries on after it.
+    live = Dict{String,Any}("cart" => [1], "prefs" => Dict{String,Any}("theme" => "dark"))
+    set_session!(store, "sid", live; ttl=3600)
+    push!(live["cart"], 2)
+    live["prefs"]["theme"] = "light"
+    @test store.data["sid"].data["cart"] == [1]
+    @test store.data["sid"].data["prefs"]["theme"] == "dark"
+
+    update_session!(store, "sid", live; ttl=3600)
+    push!(live["cart"], 3)
+    @test store.data["sid"].data["cart"] == [1, 2]
+
+    # Read side: two readers of one session do not share a nested value, with each other or
+    # with the store.
+    a = get_session(store, "sid")
+    b = get_session(store, "sid")
+    push!(a["cart"], 99)
+    @test b["cart"] == [1, 2]
+    @test store.data["sid"].data["cart"] == [1, 2]
 end
 
 @testset "regenerate_session! against MemoryStore" begin
