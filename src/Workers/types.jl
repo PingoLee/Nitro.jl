@@ -490,4 +490,8 @@ end
 mutable struct CleanupScheduler
     task::Task
     stop_signal::Channel{Nothing}
+    # The one thing the loop parks on between ticks (#369): notified by the tick's `Timer` and by
+    # `stop_cleanup_scheduler!`. Autoreset, so a notify that lands before the loop reaches its
+    # `wait` is kept rather than lost -- that is what makes the stop race-free without polling.
+    wake::Base.Event
 end

@@ -341,12 +341,18 @@ different reasons**, and conflating them is how this list rots:
    `src/core/transport.jl` `_swallow_request_body!` (`readbytes!`). All scan-based; no request
    input makes them overflow, so widening them would be churn.
 2. **Not a request path — a background task, where the caught failure has no request to fail.**
-   `src/middleware/janitor.jl:76` and `src/Workers/api.jl:915` are supervisor loops: both call
-   application-supplied store code, so by the argument below they would otherwise qualify. They
-   stay narrow because the #190 janitor discipline is that one bad tick must not kill the janitor,
-   and a dead sweeper is worse than a swallowed tick. `src/response.jl`'s `_run_sse_producer`
-   (#160) is the same discipline one level down: the producer task nothing waits on, where the
-   expected failure is the client disconnecting. Do not "fix" these to match the table above.
+   `_janitor_loop` (`src/middleware/janitor.jl`) and the Workers retention scheduler's
+   `_cleanup_scheduler_loop` — with the two catches in `_recover_zombie_tasks!` that its tick
+   reaches (`src/Workers/api.jl`) — are supervisor loops: they call application-supplied store
+   code, so by the argument below they would otherwise qualify. They stay narrow because the
+   #190 janitor discipline is that one bad tick must not kill the janitor, and a dead sweeper is
+   worse than a swallowed tick. The interrupt their per-tick catches rethrow lands in an **outer
+   handler that ends the loop with a `@warn`** rather than killing the task (#369). In a
+   background task a rethrow reaches nobody who can act on it, and swallowing it and looping on
+   makes the loop the task every later Ctrl-C lands in. The reasoning is canonical next to
+   `_cleanup_scheduler_loop`. `src/response.jl`'s `_run_sse_producer` (#160) is the same
+   discipline one level down: the producer task nothing waits on, where the expected failure is
+   the client disconnecting. Do not "fix" these to match the table above.
 3. **The error boundary itself — the place the other two are MEANT to arrive.**
    `ErrorBoundary` in `src/core/framework_middleware.jl` (#256) wraps the whole middleware chain
    so that what this predicate lets through gets logged and answered with a 500. Widening it would

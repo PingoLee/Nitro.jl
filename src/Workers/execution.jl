@@ -63,21 +63,10 @@ function _spawn_detached(f::Function)
     return task
 end
 
-"""
-    _schedule_detached(f) -> Task
-
-`@async f()`, but detached from the caller's dynamic scope (#209) — except for the logger, as
-above.
-
-Sticky, like `@async`: the caller chose `@async` over `Threads.@spawn` deliberately, and this
-must not change which pool the task lands in — only what scope it inherits.
-"""
-function _schedule_detached(f::Function)
-    task = Task(_detached_thunk(f))
-    task.scope = nothing
-    schedule(task)
-    return task
-end
+# There used to be a sticky `_schedule_detached` twin for `@async`-shaped callers. Its only caller
+# was the retention scheduler, which moved to `_spawn_detached` in #369 because a sticky task
+# parked on thread 1 is where a REPL's Ctrl-C lands. Nothing in Nitro wants a sticky background
+# task any more, so the twin went with it.
 
 function _unwrap_exception(error)
     if error isa TaskFailedException

@@ -37,22 +37,25 @@ end
 # logger has to be installed around the whole hook lifetime, not around the call.
 quiet(f) = Base.CoreLogging.with_logger(f, Base.CoreLogging.NullLogger())
 
-@testset "the stranded case: an escaped exception does not make the janitor unrestartable" begin
-    # THE regression this issue exists for. `InterruptException` is the one thing `_janitor_loop`
-    # lets escape, so it is how the stranded state is reached on purpose. Before #190 the
-    # activation Refs stayed populated when the loop died, so the next `on_startup()` hit its own
-    # `isnothing(active[]) || return nothing` guard and returned `nothing` FOREVER -- the janitor
-    # was gone for the life of the process while the thing it bounds kept growing.
+@testset "the stranded case: a loop that ends does not make the janitor unrestartable" begin
+    # THE regression #190 exists for. `InterruptException` is the one thing that ends
+    # `_janitor_loop` while its token is still set, so it is how the stranded state is reached on
+    # purpose. Before #190 the activation Refs stayed populated when the loop ended, so the next
+    # `on_startup()` hit its own `isnothing(active[]) || return nothing` guard and returned
+    # `nothing` FOREVER -- the janitor was gone for the life of the process while the thing it
+    # bounds kept growing.
     #
-    # Against the unpatched code the `t2 isa Task` assertion below fails (it was `nothing`).
+    # Against the #190-unpatched code the `t2 isa Task` assertion below fails (it was `nothing`).
     interrupting = FlakyWork(1, InterruptException())
     on_startup, on_shutdown = _janitor(() -> interrupting(), Millisecond(20),
                                        "JanitorTest", "interrupting work", "interval")
 
     t1 = quiet(on_startup)
     @test t1 isa Task
-    # The interrupt escapes the per-tick `try`, so the loop -- and the task -- end.
+    # The interrupt escapes the per-tick `try` and ends the loop -- and the task. Since #369 it
+    # ends it NORMALLY, with a warning, rather than failing it (the next testset).
     @test timedwait(() -> istaskdone(t1), 10.0) === :ok
+    @test !istaskfailed(t1)
 
     # ...and the activation retired itself on the way out, so a later start really respawns.
     t2 = quiet(on_startup)
@@ -63,6 +66,23 @@ quiet(f) = Base.CoreLogging.with_logger(f, Base.CoreLogging.NullLogger())
 
     on_shutdown()
     @test timedwait(() -> istaskdone(t2), 10.0) === :ok
+end
+
+@testset "an interrupt ends the loop normally, with a warning -- not a failure (#369)" begin
+    # With `exit_on_sigint(false)` -- every REPL -- Julia throws SIGINT into whichever task parked
+    # last on thread 1. A janitor is `Threads.@spawn`, so under Julia 1.12's default layout (thread
+    # 1 is the interactive thread) it never gets one. Under `-t 1` it can, and then rethrowing
+    # killed it with an `Unhandled Task ERROR` while the server kept running, and looping on would
+    # re-park it to take every later press too. It stops and says so; the reasoning is next to the
+    # Workers `_cleanup_scheduler_loop`. Against the unpatched loop this call THROWS.
+    interrupting = FlakyWork(1, InterruptException())
+    token = Ref(true)
+    @test_logs (:warn, "Nitro.JanitorTest: an interrupt (Ctrl-C) reached the interrupting work task instead of the server. It has stopped until the server is started again. Press Ctrl-C again to stop the server.") begin
+        @test _janitor_loop(() -> interrupting(), token, Millisecond(1),
+                            "JanitorTest", "interrupting work") === nothing
+    end
+    @test interrupting.calls == 1     # stopped, not looping on
+    @test token[]                     # it was the interrupt that ended it, not a shutdown
 end
 
 @testset "an ordinary throw costs one tick, not the janitor" begin
