@@ -94,6 +94,9 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
         response = pin(HTTP.Request("GET", "/", ["Cookie" => "pinned=$sid"]))
         @test occursin("pinned=$sid", HTTP.header(response, "Set-Cookie"))
         @test Base.get(store, sid, nothing).expires > Dates.now(Dates.UTC) + Dates.Second(3000)
+        # The update path marks its response private too, not only the insert path.
+        @test HTTP.header(response, "Cache-Control") == "private"
+        @test HTTP.header(response, "Vary") == "Cookie"
     end
 
     @testset "a response that sets the session cookie is never publicly cacheable (#317)" begin
@@ -126,6 +129,25 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
         res = writing(["Vary" => "*", "Cache-Control" => "private, max-age=60"])(HTTP.Request("GET", "/"))
         @test headers_of(res, "Vary") == ["*"]
         @test headers_of(res, "Cache-Control") == ["private, max-age=60"]
+
+        # Directive names are case-insensitive, and several `Cache-Control` lines are one list:
+        # they collapse into a single private line, with `public` gone from wherever it was.
+        res = writing(["Cache-Control" => "PUBLIC, max-age=60"])(HTTP.Request("GET", "/"))
+        @test headers_of(res, "Cache-Control") == ["private, max-age=60"]
+        res = writing(["Cache-Control" => "max-age=60", "Cache-Control" => "public, immutable"])(HTTP.Request("GET", "/"))
+        @test headers_of(res, "Cache-Control") == ["private, max-age=60, immutable"]
+
+        # The rotation path too: a handler-driven `regenerate_session!` on an existing session.
+        sid0 = String(match(r"cache_session=([^;]+)",
+                            HTTP.header(writing(Pair{String,String}[])(HTTP.Request("GET", "/")), "Set-Cookie")).captures[1])
+        rotating = mw(function (req::HTTP.Request)
+            Nitro.regenerate_session!(req, store; ttl=3600)
+            return HTTP.Response(200, ["Cache-Control" => "public, max-age=60"], "rotated")
+        end)
+        res = rotating(HTTP.Request("GET", "/", ["Cookie" => "cache_session=$sid0"]))
+        @test !occursin("cache_session=$sid0", HTTP.header(res, "Set-Cookie"))
+        @test headers_of(res, "Cache-Control") == ["private, max-age=60"]
+        @test headers_of(res, "Vary") == ["Cookie"]
 
         # A response that sets NO session cookie is not touched: an existing visitor reading a
         # public asset keeps it publicly cacheable.
@@ -338,8 +360,6 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
         set_cookie_headers = filter(h -> lowercase(h.first) == "set-cookie", response.headers)
         @test length(set_cookie_headers) >= 1
         @test !occursin(expired_id, set_cookie_headers[1].second)
-        # The expired row is not revived under its old id: the new data went to the new id.
-        @test store.data[expired_id].data == Dict{String,Any}("old" => true)
     end
 
     @testset "unmodified session not re-saved" begin

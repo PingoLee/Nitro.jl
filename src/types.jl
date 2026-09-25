@@ -587,14 +587,13 @@ end
 function cleanup_expired_sessions!(store::MemoryStore{K, V}) where {K, V}
     current_time = Dates.now(Dates.UTC)
     lock(store.lock) do
-        # Collect first, delete after. Mutating a collection while iterating it is not a
-        # supported pattern in Julia and `Dict` promises nothing about it.
-        #
-        # Honest scope: on the current implementation `delete!` only tombstones a slot and
-        # never rehashes, so the one-pass form did NOT observably skip entries — measured, it
-        # is correct today. This is hygiene against a documented-unsafe pattern whose validity
-        # rests on an internal detail, not a fix for a reproduced bug. The rate limiter's
-        # sweep (src/middleware/rate_limiter.jl) is two-pass for the same reason.
+        # Collect first, delete after -- and keep it that way. `data` is an `LRU` (#317), and
+        # LRUCache promises nothing about `delete!` during iteration: its iterator walks an
+        # internal linked key list and stops by comparing against the list's `first` node, which
+        # `delete!` can move. Whether a one-pass sweep happens to survive that is an internal
+        # detail, not a contract. (When `data` was a `Dict`, measured, the one-pass form did
+        # work, because `delete!` only tombstoned a slot.) The rate limiter's sweep
+        # (src/middleware/rate_limiter.jl) is two-pass for the same reason.
         expired = K[]
         for (key, payload) in store.data
             if is_expired(payload, current_time)

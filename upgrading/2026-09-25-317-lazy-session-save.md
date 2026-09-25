@@ -53,19 +53,22 @@ is the backstop.
 Code that binds its own state to the session id, rather than to session data:
 
 ```bash
-grep -rnE 'context\[:session_id\]|issue_csrf_token!' --include=*.jl .
+# `:session_id` catches `req.context[:session_id]` and `get(req.context, :session_id, …)` alike
+grep -rnE ':session_id|issue_csrf_token!' --include=*.jl .
 ```
 
-Tests that expect a session cookie on a first response whose handler never writes to the session:
+Tests that expect a session cookie on a first response whose handler never writes to the session.
+Header names are matched case-insensitively, because tests spell them every way:
 
 ```bash
-grep -rnE 'Set-Cookie|set-cookie' --include=*.jl test/ | grep -iE 'session'
+grep -rniE 'set-cookie' --include=*.jl test/
 ```
 
 `MemoryStore`s that may hold more than 100 000 live sessions:
 
 ```bash
-grep -rnE 'MemoryStore(\{[^}]*\})?\(' --include=*.jl .
+# `.*` rather than `[^}]*`: `MemoryStore{String, Dict{String,Any}}()` nests braces
+grep -rnE 'MemoryStore(\{.*\})?\(' --include=*.jl .
 ```
 
 ### Migrate your app
