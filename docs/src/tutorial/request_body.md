@@ -5,7 +5,7 @@ Used when inputs are too complex or large for a URL.
 
 Nitro.jl offers two layers of body access:
 1. **Low-level** — `getjson(req)` / `getform(req)` on `HTTP.Request` (simple, flexible)
-2. **Extractors** — `Json{T}`, `Form{T}`, `JsonFragment{T}` (typed, validated, recommended)
+2. **Extractors** — `Json{T}`, `Form{T}`, `JsonFragment{T}`, `Body{T}` (typed, validated, recommended)
 
 ---
 
@@ -113,6 +113,25 @@ function login(req, form::Form{LoginForm})
 end
 ```
 
+The request must be `application/x-www-form-urlencoded`, or carry no `Content-Type` at all. A body
+that declares any other type — `text/plain`, XML, JSON, multipart — is a `415`, and `getform(req)`
+returns an empty `Dict` for it, so its `key=value` pieces never reach `getform` or `payload(req)`
+either. The untyped case stays readable for hand-built `HTTP.Request`s and clients that send no type.
+
+---
+
+## The `Body{T}` Extractor
+
+`Body{T}` binds the raw body text as one value, with no decoding: `Body{String}` is the text
+verbatim, and `Body{Int}`, `Body{Float64}`, `Body{Bool}`, an `@enum` or a `Date` are parsed from it.
+Any concrete type with a `Base.parse(::Type{T}, ::String)` method qualifies. The `Content-Type` is not
+checked, because nothing is decoded.
+
+A struct or container — `Body{Transfer}`, `Body{Vector{Int}}`, `Body{Dict{String,Any}}` — is refused
+when the route is declared. It could only be bound by parsing the body as JSON whatever its
+`Content-Type`, which would accept a cross-site `text/plain` request exactly as it accepts your own
+client. Declare it `Json{T}` instead.
+
 ---
 
 ## The `JsonFragment{T}` Extractor
@@ -140,8 +159,8 @@ end
 
 A body Nitro cannot bind is **client input**, not a server fault: it becomes a `400 Bad Request`
 with a fixed body, never a `500` and never a logged backtrace. A body of the wrong media type — JSON
-for a `Json{T}` parameter sent without a JSON `Content-Type`, or a non-multipart request to a
-`MultipartForm{T}` — is a `415 Unsupported Media Type` instead, raised as an
+for a `Json{T}` parameter sent without a JSON `Content-Type`, a non-form type sent to a `Form{T}`,
+or a non-multipart request to a `MultipartForm{T}` — is a `415 Unsupported Media Type` instead, raised as an
 `UnsupportedMediaTypeError` and treated the same way.
 
 The `ValidationError` behind it names the parameter and its type and **never the submitted value**,
@@ -181,7 +200,7 @@ Every path gives a too-deep document the same answer it gives any other malforme
 |---|---|
 | `getjson(req)`, `json(req)` | `nothing` |
 | `json(req, T)` | throws `ArgumentError` |
-| `Json{T}`, `JsonFragment{T}`, and `Body{T}` for a `T` bound from JSON (not `Body{String}`) | `400 Bad Request` |
+| `Json{T}`, `JsonFragment{T}` | `400 Bad Request` |
 | a path or query parameter parsed as JSON | `400 Bad Request` |
 | a JWT segment in `BearerAuth` / `CookieAuthMiddleware` | `401` |
 

@@ -5,7 +5,7 @@ using Dates
 using ..Errors: ValidationError, UnsupportedMediaTypeError, is_unrecoverable
 using .BodyParsers: _parse_json_bounded
 
-export recursive_merge, parseparam, parseparam_checked,
+export recursive_merge, parseparam, parsebody, parseparam_checked,
     handlerequest,
     format_response, header_name_isequal,
     join_url_path,
@@ -228,8 +228,8 @@ Floats are the fallback above plus one rule: the value must be finite (#327).
 into `Inf`. None is a number a client can mean, and `NaN` defeats comparisons silently:
 `NaN > balance` and `NaN <= balance` are both `false`, so a check like "reject if amount >
 balance" lets it through. This one method covers every scalar path: `<float:x>`, typed query
-parameters, `Body{Float64}`, `Cookie{Float64}`, struct fields bound by `Query{T}`/`Form{T}`, and
-each member of a `Union`. The message is value-free, like every other parse failure here.
+parameters, `Cookie{Float64}`, struct fields bound by `Query{T}`/`Form{T}`, and each member of a
+`Union`. `Body{Float64}` goes through `parsebody`, which applies the same rule. The message is value-free, like every other parse failure here.
 """
 function parseparam(::Type{T}, str::String) where {T <: AbstractFloat}
     # A union of float types (`Union{Float32, Float64}`) also lands here, because it is
@@ -240,6 +240,40 @@ function parseparam(::Type{T}, str::String) where {T <: AbstractFloat}
     value = invoke(parseparam, Tuple{Type{T}, String} where {T}, T, str)
     isfinite(value) || throw(ArgumentError("not a finite number"))
     return value
+end
+
+"""
+    parsebody(::Type{T}, str) :: T
+
+`Body{T}`'s conversion (#345): `parseparam` **without the JSON fall-through**. The types route
+registration admits (`BodyParsers.binds_from_text`) are converted from the text alone -- through
+their own `parseparam` method, or `Base.parse(T, str)` -- and a failure is a failure.
+
+The fall-through is why this is not simply `parseparam`. It catches a failed `parse(T, str)` and
+retries the text as JSON, so an app type admitted for its `Base.parse` method would still bind
+field by field from a JSON body sent as `text/plain`, bypassing whatever that `parse` checks.
+"""
+function parsebody(::Type{T}, str::String) where {T}
+    T isa Union && return parsebody_union(T, str)
+    (T === Any || T === String || T <: Union{Char, Regex, Enum}) && return parseparam(T, str)
+    value = parse(T, str)
+    value isa AbstractFloat && !isfinite(value) && throw(ArgumentError("not a finite number"))
+    return value
+end
+
+# `parseparam(::Union, …)`'s member loop, with `parsebody` per member: the first member the text
+# converts to wins, `Nothing`/`Missing` are never targets, and the message stays value-free.
+function parsebody_union(type::Union, str::String)
+    for current_type in Base.uniontypes(type)
+        (current_type === Nothing || current_type === Missing) && continue
+        try
+            return parsebody(current_type, str)
+        catch e
+            is_unrecoverable(e) && rethrow()
+            continue
+        end
+    end
+    throw(ValidationError("Could not parse value as $type"))
 end
 
 """

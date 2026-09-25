@@ -1228,3 +1228,131 @@ end
     @test !any(r -> occursin("text/plain", string(r.message, r.kwargs)), logger.logs)
 end
 end
+
+@testitem "form and multipart bodies are read only under their own media type (#345)" tags=[:core, :security] setup=[NitroCommon] begin
+using Test
+using HTTP
+using JSON
+using Nitro
+using Nitro: App, Form, MultipartForm, FormFile
+using Nitro.Core.Util.BodyParsers: is_form_media_type, _multipart_boundary
+
+req(ct, body) = HTTP.Request("POST", "/f", isnothing(ct) ? [] : ["Content-Type" => ct], body)
+
+@testset "is_form_media_type: urlencoded or absent" begin
+    for ct in ("", "application/x-www-form-urlencoded", "APPLICATION/X-WWW-FORM-URLENCODED",
+               "application/x-www-form-urlencoded; charset=UTF-8", "  ")
+        @test is_form_media_type(ct)
+    end
+    for ct in ("text/plain", "application/xml", "text/html", "application/json",
+               "multipart/form-data; boundary=x", "application/x-www-form-urlencodedx")
+        @test !is_form_media_type(ct)
+    end
+end
+
+@testset "formdata / getform / payload skip a body that declares another type" begin
+    body = "<a href=\"/x?a=1&amp;b=2\">link</a>"
+    for ct in ("text/plain", "application/xml", "text/html", "text/plain; charset=utf-8")
+        @test isempty(formdata(req(ct, body)))
+        @test isempty(getform(req(ct, body)))
+        @test isempty(payload(req(ct, "a=1&b=2")))
+    end
+    # Urlencoded, in any case or with parameters, and an untyped body still parse.
+    for ct in (nothing, "application/x-www-form-urlencoded", "Application/X-WWW-Form-Urlencoded",
+               "application/x-www-form-urlencoded;charset=UTF-8")
+        @test formdata(req(ct, "a=1&b=2")) == Dict("a" => "1", "b" => "2")
+        @test payload(req(ct, "a=1&b=2")) == Dict{String, Any}("a" => "1", "b" => "2")
+    end
+end
+
+@testset "a text/plain body full of `&` no longer trips the field cap in payload" begin
+    # One `&` per HTML entity: past `max_fields` this used to make `payload` answer 400.
+    app = App(mod = @__MODULE__)
+    urlpatterns(app, "", path("/p", r -> string(length(payload(r))); method = "POST"))
+    body = "x=" * repeat("a&amp;", 2_000)
+    r = internalrequest(app, HTTP.Request("POST", "/p", ["Content-Type" => "text/plain"], body))
+    @test r.status == 200
+    @test Nitro.text(r) == "0"
+end
+
+Base.@kwdef struct Prefs345
+    theme::String = "light"
+    size::Int = 10
+end
+struct Login345
+    user::String
+end
+
+@testset "Form{T} is a 415 under a declared non-form type" begin
+    app = App(mod = @__MODULE__)
+    urlpatterns(app, "",
+        path("/login", (req, f::Form{Login345}) -> f.payload.user; method = "POST"),
+        # Every field defaulted: an empty form used to bind silently as a 200.
+        path("/prefs", (req, f::Form{Prefs345}) -> f.payload.theme; method = "POST"),
+    )
+    send(route, ct, body) = internalrequest(app, HTTP.Request("POST", route,
+        isnothing(ct) ? [] : ["Content-Type" => ct], body))
+    for ct in ("text/plain", "application/json", "application/xml", "multipart/form-data; boundary=x")
+        r = send("/login", ct, "user=ann")
+        @test r.status == 415
+        @test JSON.parse(Nitro.text(r)) == Dict("message" => "415: Unsupported Media Type")
+        @test send("/prefs", ct, "theme=dark").status == 415
+    end
+    @test Nitro.text(send("/login", "application/x-www-form-urlencoded", "user=ann")) == "ann"
+    @test Nitro.text(send("/login", nothing, "user=ann")) == "ann"
+    @test Nitro.text(send("/prefs", "application/x-www-form-urlencoded; charset=UTF-8", "theme=dark")) == "dark"
+end
+
+@testset "_multipart_boundary reads any spelling of the parameter" begin
+    @test _multipart_boundary("multipart/form-data; boundary=x") == "x"
+    @test _multipart_boundary("multipart/form-data;boundary=x") == "x"
+    @test _multipart_boundary("Multipart/Form-Data; charset=utf-8; boundary=x") == "x"
+    @test _multipart_boundary("multipart/form-data; BOUNDARY=x") == "x"
+    # No boundary may contain `;`, so a quote it cuts short is unterminated, not a boundary.
+    @test _multipart_boundary("multipart/form-data; boundary=\"a b;c\"") === nothing
+    @test _multipart_boundary("multipart/form-data; boundary=\"x") === nothing
+    @test _multipart_boundary("multipart/form-data; boundary=\"x-1\"") == "x-1"
+    @test _multipart_boundary("multipart/form-data; boundary=x; charset=utf-8") == "x"
+    @test _multipart_boundary("multipart/form-data") === nothing
+    @test _multipart_boundary("multipart/form-data; boundary=") === nothing
+    @test _multipart_boundary("multipart/form-data; boundary=" * "b"^71) === nothing
+    @test _multipart_boundary("multipart/form-data; boundary=" * "b"^70) == "b"^70
+    @test _multipart_boundary("multipart/mixed; boundary=x") === nothing
+    @test _multipart_boundary("text/plain; boundary=x") === nothing
+end
+
+struct Upload345
+    note::String
+    file::FormFile
+end
+
+@testset "MultipartForm and getpost bind whatever the header's spelling" begin
+    mp(b) = "--$b\r\nContent-Disposition: form-data; name=\"note\"\r\n\r\nhello\r\n" *
+            "--$b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.txt\"\r\n" *
+            "Content-Type: text/plain\r\n\r\nfile contents\r\n--$b--\r\n"
+    app = App(mod = @__MODULE__)
+    urlpatterns(app, "",
+        path("/up", (req, u::MultipartForm{Upload345}) -> string(u.payload.note, ":", String(u.payload.file.data));
+             method = "POST"),
+        path("/post", req -> string(getpost(req)["note"], ":", length(getfiles(req))); method = "POST"),
+    )
+    for ct in ("multipart/form-data; boundary=XyZ", "multipart/form-data;boundary=XyZ",
+               "Multipart/Form-Data; charset=utf-8; boundary=XyZ",
+               "multipart/form-data; boundary=\"XyZ\"", "multipart/form-data; BOUNDARY=XyZ",
+               "multipart/form-data; boundary=XyZ; charset=utf-8")
+        r = internalrequest(app, HTTP.Request("POST", "/up", ["Content-Type" => ct], mp("XyZ")))
+        @test r.status == 200
+        @test Nitro.text(r) == "hello:file contents"
+        r = internalrequest(app, HTTP.Request("POST", "/post", ["Content-Type" => ct], mp("XyZ")))
+        @test Nitro.text(r) == "hello:1"
+    end
+    # No usable boundary, or a malformed body, is a client error -- never a 500.
+    for (ct, body) in (("multipart/form-data", mp("XyZ")),
+                       ("multipart/form-data; boundary=" * "b"^71, mp("b"^71)),
+                       ("multipart/form-data; boundary=XyZ", "not multipart at all"),
+                       ("multipart/form-data; boundary=XyZ", ""))
+        @test internalrequest(app, HTTP.Request("POST", "/up", ["Content-Type" => ct], body)).status == 400
+        @test isempty(multipart(HTTP.Request("POST", "/m", ["Content-Type" => ct], body)))
+    end
+end
+end

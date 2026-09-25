@@ -15,7 +15,8 @@ import Sockets
 #       every `req.context[…]` read and write in `src/` now goes through HTTP's own
 #       `getproperty`, which calls it. Rename it upstream and the session, CSRF, auth and
 #       app-context paths all break at once.
-#   • src/utilities/bodyparsers.jl — the `EmptyBody` / `BytesBody` body hierarchy.
+#   • src/utilities/bodyparsers.jl — the `EmptyBody` / `BytesBody` body hierarchy, and
+#       `parse_multipart_body`, which `multipart` calls with a boundary it parsed itself (#345).
 #   • src/core/pipeline.jl — `_allowed_methods` walks the router's route tree to build a 405's
 #       `Allow` header (#281): `Router.routes`, the `Node`/`Leaf`/`Variable` fields, `match`,
 #       `_route_variable_matches` and `_router_request_path`.
@@ -39,6 +40,10 @@ import Sockets
 
 @testset "private functions still exist" begin
     @test isdefined(HTTP, :_request_context_metadata!)
+    # `multipart` reads the boundary itself and hands the body to `parse_multipart_body` (#345):
+    # the public `parse_multipart_form` matches one exact spelling of the Content-Type. Pinned by
+    # signature, since Nitro calls it with a byte vector and a `String` boundary.
+    @test hasmethod(HTTP.parse_multipart_body, Tuple{Vector{UInt8}, String})
     # `_buffered_stream_request` deliberately is NOT asserted here any more. Until #17 Nitro
     # delegated its whole request build to it; the body cap replaced that call with a
     # reimplementation over supported API, so the reach is gone and canarying it would pin a

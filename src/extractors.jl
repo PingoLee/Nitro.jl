@@ -5,9 +5,9 @@ using Base: @kwdef
 using HTTP
 using Dates
 
-using ..Util: text, json, formdata, multipart, parseparam, FormFile
+using ..Util: text, json, formdata, multipart, parseparam, parsebody, FormFile
 using ..Util.BodyParsers: NITRO_READ_STYLE, _parse_json_bounded, _body_view, is_json_media_type,
-    is_multipart_form_media_type
+    is_multipart_form_media_type, is_form_media_type
 using ..Reflection: struct_builder, extract_struct_info, kw_construct
 using ..Errors: ValidationError, UnsupportedMediaTypeError, is_unrecoverable
 # The Core stubs `getjson`/`getform` bind to (their bodies are in core/request.jl, included later).
@@ -168,6 +168,9 @@ JsonFragment
 Extractor that binds an `application/x-www-form-urlencoded` body into a struct `T`, matching
 fields by name and parsing them to their declared types. For `multipart/form-data`, use
 [`MultipartForm`](@ref) (text fields and files) or [`Files`](@ref) (files only).
+
+A request that declares any other `Content-Type` -- `text/plain`, JSON, XML, multipart -- is a
+`415` (#345). A request with no `Content-Type` is still read as a form.
 """
 Form
 
@@ -176,6 +179,17 @@ Form
 
 Extractor that parses the raw request body as a single value of type `T`, such as a `String`,
 a number or a `Bool`, with no JSON or form decoding. `Body{String}` is the body text verbatim.
+
+`T` must be something a body's text parses to on its own: `String`, `Any` (the text), `Char`,
+`Regex`, an `@enum`, a concrete type with a `Base.parse(::Type{T}, ::String)` method -- numbers, `Bool`,
+`Date`, `UUID` -- or a `Union` of those with `Nothing`/`Missing`. The `Content-Type` is not
+checked, because the body is not decoded.
+
+A struct or container `T` is refused when the route is declared (#345): binding it would mean
+parsing the body as JSON whatever its type, including the `text/plain` a cross-site page can send
+without a CORS preflight. Use [`Json`](@ref) for those, which requires a JSON `Content-Type`.
+The check runs when the route is registered, so an app's own `Base.parse` method must be defined
+before its `urlpatterns` call.
 """
 Body
 
@@ -313,7 +327,7 @@ function safe_extract(f::Function, param::Param{U}) :: T where {T, U <: Extracto
         # for a corrupted worker while a bare `getjson` handler answered 500.
         #
         # A deeply-nested body no longer overflows on the way here: every JSON parse behind
-        # `Json{T}`/`JsonFragment{T}`/`Body{T}` is depth-bounded (#314) and answers an
+        # `Json{T}`/`JsonFragment{T}` is depth-bounded (#314) and answers an
         # ordinary `ArgumentError`, which becomes the 400 below. This line is the backstop
         # for what the bound does not cover.
         #
@@ -332,6 +346,16 @@ function safe_extract(f::Function, param::Param{U}) :: T where {T, U <: Extracto
         # explicit `showerror(io, err; cause=true)` or `Errors.cause_report`. Never log it.
         throw(ValidationError("Failed to serialize data for | parameter: $(param.name) | extractor: $U | type: $T", e))
     end
+end
+
+# A form body must say it is a form, or say nothing (#345). The untyped case is kept for
+# hand-built requests; a body declared as anything else is not read as a form by `getform` either,
+# so without this `Form{T}` would bind an empty form -- a 400, or a silent 200 when every field of a
+# `@kwdef` struct has a default. The message names the parameter, never the client's Content-Type.
+function require_form_media_type(param::Param, request::LazyRequest)
+    is_form_media_type(HTTP.header(request.request, "Content-Type", "")) && return nothing
+    throw(UnsupportedMediaTypeError(
+        "parameter '$(param.name)' needs a form body: Content-Type application/x-www-form-urlencoded"))
 end
 
 # A body bound as JSON must say it is JSON (#327). `text/plain`, a urlencoded form, multipart, or
@@ -429,8 +453,9 @@ end
 Extracts the body from a request and convert it into a custom type
 """
 function extract(param::Param{Body{T}}, request::LazyRequest) :: Body{T} where {T}
-    instance = safe_extract(param) do 
-        parseparam(T, textbody(request))
+    instance = safe_extract(param) do
+        # Never `parseparam`: its JSON fall-through would bind a struct from any body (#345).
+        parsebody(T, textbody(request))
     end
     valid_instance = try_validate(param, instance)
     return Body{T}(valid_instance, nothing)
@@ -440,6 +465,7 @@ end
 Extracts a Form from a request and converts it into a custom struct
 """
 function extract(param::Param{Form{T}}, request::LazyRequest) :: Form{T} where {T}
+    require_form_media_type(param, request)
     # The cached `getform`, so a handler that also reads `getform`/`payload` -- or CSRFMiddleware,
     # which reads the form for its token -- does not parse the body again (#327).
     form = getform(request.request)::Dict{String,String}   # the cache is untyped; keep `Any` off the hot path

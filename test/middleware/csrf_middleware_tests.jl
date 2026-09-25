@@ -138,6 +138,15 @@ end
         ["Content-Type" => "application/x-www-form-urlencoded"], "_csrf=tok-form&other=1")
     @test CSRF._presented_token(form_req, "X-CSRF-Token", "_csrf") == "tok-form"
 
+    # Only a body that is a form, or says nothing, is read as one (#345): the same `_csrf=` pair
+    # under another declared type is not a presented token.
+    untyped_req = HTTP.Request("POST", "/form", [], "_csrf=tok-form")
+    @test CSRF._presented_token(untyped_req, "X-CSRF-Token", "_csrf") == "tok-form"
+    for ct in ("text/plain", "application/xml", "text/html")
+        other_req = HTTP.Request("POST", "/form", ["Content-Type" => ct], "_csrf=tok-form&other=1")
+        @test CSRF._presented_token(other_req, "X-CSRF-Token", "_csrf") === nothing
+    end
+
     json_req = HTTP.Request("POST", "/form",
         ["Content-Type" => "application/json"], JSON.json(Dict("_csrf" => "tok-json")))
     @test CSRF._presented_token(json_req, "X-CSRF-Token", "_csrf") == "tok-json"

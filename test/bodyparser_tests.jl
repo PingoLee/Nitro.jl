@@ -789,7 +789,9 @@ end
     urlpatterns(app, "",
         path("/dict", (req, b::Json{Dict{String, Any}}) -> ok(req, b); method = "POST"),
         path("/kwdef", (req, b::Json{DeepWrap}) -> ok(req, b); method = "POST"),
-        path("/body", (req, b::Body{Vector{Any}}) -> ok(req, b); method = "POST"))
+        # A top-level array. This was `Body{Vector{Any}}` until #345 refused a container `Body{T}`
+        # at registration; `parseparam`'s own bounded fall-through is pinned by the next testset.
+        path("/array", (req, b::Json{Vector{Any}}) -> ok(req, b); method = "POST"))
     status(route, s) = internalrequest(app, HTTP.Request("POST", route,
         ["Content-Type" => "application/json"], s)).status
 
@@ -798,8 +800,8 @@ end
     # The `@kwdef` path parses the body into raw field texts first -- the JSONText branch.
     @test status("/kwdef", body(512)) == 400
     @test status("/kwdef", body(511)) == 200
-    @test status("/body", nest(513)) == 400
-    @test status("/body", nest(512)) == 200
+    @test status("/array", nest(513)) == 400
+    @test status("/array", nest(512)) == 200
 end
 
 @testset "scalar parameters -- the JSON fall-through is bounded" begin
@@ -906,7 +908,7 @@ end
 end
 
 # `formdata` and `multipart` take the same narrowing, and deliberately ship WITHOUT a dedicated
-# test: neither `HTTP.queryparams` nor `HTTP.parse_multipart_form` parses recursively, so no
+# test: neither `HTTP.queryparams` nor `HTTP.parse_multipart_body` parses recursively, so no
 # request input reaches their guarded block with any of the three types, and the only test that
 # could be written would pass against the unpatched code too. They are covered by
 # `is_unrecoverable`'s own contract and by the regression testitem below, which pins the half

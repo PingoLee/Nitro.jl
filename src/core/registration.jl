@@ -110,6 +110,25 @@ function refuse_client_symbols(route::String, param::Param)
         "which Julia never frees (#306). Declare an @enum, or a String checked against an allow-list."))
 end
 
+"""
+    refuse_json_body_type(route, param)
+
+Throw an `ArgumentError` at registration when `param` is a `Body{T}` whose `T` is not bound from
+the raw body text -- a struct or a container (#345). Such a `T` could only be bound by parsing the
+body as JSON whatever its `Content-Type`, which accepts a cross-site `text/plain` request as
+readily as the app's own JSON client. `Json{T}` binds the same value and requires the request to
+declare JSON.
+"""
+function refuse_json_body_type(route::String, param::Param)
+    param.type <: Body || return nothing
+    T = extracttype(param.type)
+    Util.BodyParsers.binds_from_text(T) && return nothing
+    throw(ArgumentError(
+        "Parameter '$(param.name)' of route $route is a Body{$T}, but Body{T} binds only the raw " *
+        "body text (a String, a number, a Bool, an @enum, or a type with Base.parse) (#345). " *
+        "Declare it Json{$T}, which requires a JSON Content-Type, or read raw bytes with binary(req)."))
+end
+
 # The field names an extractor's `T` binds, or none for a type that has no definite fields.
 # `fieldnames(Any)` throws, so `Body{Any}`/`Json{Any}` could not even be registered (#327).
 bound_fieldnames(T) = isconcretetype(T) ? fieldnames(T) : ()
@@ -142,6 +161,7 @@ function parse_func_params(route::String, func::Function; type_hints::Dict{Symbo
 
     for param in info.args
         refuse_client_symbols(route, param)
+        refuse_json_body_type(route, param)
         if param.type <: Context
             continue
         elseif param.type <: Extractor
