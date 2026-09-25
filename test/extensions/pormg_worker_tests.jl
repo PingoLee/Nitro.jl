@@ -720,6 +720,48 @@ end
 PormG.ConnectionPool.fetch(c::FakeTaskPool, sql::String; kwargs...) =
     (push!(c.sql, sql); nothing)
 
+# A connection whose `nitro_task` has the `run_id` column or does not, and that answers the way a
+# real driver does (#366): a statement naming a missing column throws, and so does an `ALTER` adding
+# one that is already there. `FakeTaskPool` answers every statement, so it cannot tell a probe from
+# a migration, or say which of them failed.
+#
+# The UNQUALIFIED `SELECT "run_id" FROM "nitro_task"` is modelled as SQLite really runs it: as the
+# string literal 'run_id', which succeeds whether the column exists or not (SQLite's default
+# double-quoted-string fallback; checked against the SQLite that SQLite.jl bundles, 3.53.4). It is
+# the natural spelling of the probe, and it falls through to the success arm below on purpose -- a
+# regression to it leaves a pre-#108 table unmigrated here.
+#
+# Only the exact qualified spelling the ext uses counts as a probe. Another correct spelling would
+# fall through to "succeeds" and fail these tests; that is accepted, because the spelling IS the fix.
+mutable struct FakeSchemaPool <: PormG.PormGSQLite
+    sql::Vector{String}
+    has_run_id::Bool
+    # The `ALTER` throws this whatever the schema says -- a lock timeout, a permission error.
+    alter_error::Union{Nothing, Exception}
+    # The probe throws this whatever the schema says -- a Ctrl-C.
+    probe_error::Union{Nothing, Exception}
+    # Another process adds the column between our probe and our `ALTER`.
+    concurrent_add::Bool
+end
+
+FakeSchemaPool(has_run_id::Bool; alter_error=nothing, probe_error=nothing,
+               concurrent_add::Bool=false) =
+    FakeSchemaPool(String[], has_run_id, alter_error, probe_error, concurrent_add)
+
+function PormG.ConnectionPool.fetch(c::FakeSchemaPool, sql::String; kwargs...)
+    push!(c.sql, sql)
+    if startswith(sql, "ALTER TABLE \"nitro_task\" ADD COLUMN \"run_id\"")
+        c.concurrent_add && (c.has_run_id = true)
+        c.alter_error === nothing || throw(c.alter_error)
+        c.has_run_id && error("duplicate column name: run_id")
+        c.has_run_id = true
+    elseif occursin("\"nitro_task\".\"run_id\"", sql)
+        c.probe_error === nothing || throw(c.probe_error)
+        c.has_run_id || error("no such column: nitro_task.run_id")
+    end
+    return nothing
+end
+
 # The extension module itself, for the private `task_model` accessor the #202 guard drives.
 const PormGExt = Base.get_extension(Nitro, :NitroPormGExt)
 
@@ -1434,6 +1476,30 @@ else
             logs, listed = _rendered_logs(() -> get_all_tasks(store_j, System()))
             @test isempty(listed)
             @test occursin("does not decode", logs)
+        end
+
+        @testset "the depth is decided before the result is serialized (#367)" begin
+            # As the session store's twin testset: the serializer recurses once per level and
+            # used to overflow before the #344 scan of its output ran. A tripwire 600 levels down
+            # stands in for the overflow (#254, #301); the walk refuses at 513 and never reaches it.
+            struct ResultTripwire end
+            JSON.lower(::ResultTripwire) = throw(StackOverflowError())
+            deep = foldl((v, _) -> Any[v], 2:600; init=Any[ResultTripwire()])
+            @test_throws StackOverflowError JSON.json(deep)     # what the write used to raise
+
+            m = MockTaskModel()
+            store_t = RealPormGWorkerStore(model=m)
+            t = TaskInfo("alice::tripwire")
+            replace_task!(store_t, t.id, t)
+            # The completing write, which `_finish_task!` makes...
+            @test_throws ArgumentError try_transition!(store_t, t.id, (PENDING, RUNNING), COMPLETED;
+                                                       run_id=t.run_id, result=deep)
+            @test get_task_info(store_t, t.id).status == PENDING
+            @test isempty(m._table[t.id]["result"])
+            # ...and a whole-record write carrying the same result.
+            t.result = deep
+            @test_throws ArgumentError set_task!(store_t, t.id, t)
+            @test isempty(m._table[t.id]["result"])
         end
 
         @testset "an unrecoverable error while decoding propagates (#254, #344)" begin
@@ -2814,6 +2880,69 @@ else
             # Neither constructor touches `PormG.config`, so no fixture is needed.
             @test RealPormGWorkerStore(db_key="tasks").model.connect_key == "tasks"
             @test RealPormGWorkerStore().model.connect_key == "db"
+        end
+
+        @testset "the run_id migration probes before it alters (#366)" begin
+            ensure! = getproperty(PormGExt, :_ensure_run_id_column!)
+            is_alter(s) = startswith(s, "ALTER TABLE")
+
+            # A table that already has the column, which is every boot since #108 -- the first
+            # one included, because CREATE TABLE emits it. The ALTER used to run first here and
+            # fail, and LibPQ logs a failed statement at `error` before it throws, so every
+            # Postgres boot printed a DuplicateColumn error that the `catch` could not take back.
+            current = FakeSchemaPool(true)
+            @test ensure!(current) === nothing
+            @test !any(is_alter, current.sql)
+            @test length(current.sql) == 1
+
+            # The same through the whole table bootstrap, whose CREATE TABLE is what gives a new
+            # database the column. That premise is asserted, not assumed: a model that stopped
+            # emitting `run_id` would put every boot back on the migration path, logging on each.
+            booted = FakeSchemaPool(true)
+            getproperty(PormGExt, :_ensure_task_table!)(booted, getproperty(PormGExt, :task_model)())
+            @test occursin("CREATE TABLE", first(booted.sql))
+            @test occursin("\"run_id\"", first(booted.sql))
+            @test !any(is_alter, booted.sql)
+
+            # A pre-#108 table is still migrated, probed first, and backfilled with the nil UUID.
+            legacy = FakeSchemaPool(false)
+            @test ensure!(legacy) === nothing
+            @test legacy.has_run_id
+            alters = filter(is_alter, legacy.sql)
+            @test length(alters) == 1
+            @test occursin("NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000'", only(alters))
+            @test findfirst(is_alter, legacy.sql) > 1
+
+            # Losing the race to another process migrating the same table is not a failure: the
+            # ALTER's duplicate-column error is followed by a probe that finds the column.
+            raced = FakeSchemaPool(false; concurrent_add=true)
+            @test ensure!(raced) === nothing
+            @test raced.has_run_id
+            @test length(raced.sql) == 3 && count(is_alter, raced.sql) == 1   # probe, ALTER, probe
+
+            # A genuine ALTER failure still surfaces, as the ALTER's own error, not the probe's.
+            # Before #366 the check after a failed ALTER was the unqualified form, which SQLite
+            # answers with a literal -- so on SQLite this failure was swallowed.
+            denied = FakeSchemaPool(false;
+                alter_error=ErrorException("permission denied for table nitro_task"))
+            @test_throws "permission denied" ensure!(denied)
+            @test !denied.has_run_id
+            @test length(denied.sql) == 3   # the re-probe ran before the rethrow
+
+            # A Ctrl-C during the probe propagates instead of reading as "missing" and running the
+            # ALTER. It arrives in PormG's shape, not bare: `fetch` wraps every driver failure,
+            # an interrupt included, as a `DatabaseError` whose `cause` is the interrupt.
+            interrupted = FakeSchemaPool(true;
+                probe_error=PormG.StatementError("SQLite", InterruptException()))
+            @test_throws PormG.StatementError ensure!(interrupted)
+            @test !any(is_alter, interrupted.sql)
+
+            # The same for a Ctrl-C during the ALTER: it propagates without the re-probe, which
+            # would otherwise run one more statement after the user asked to stop.
+            ialter = FakeSchemaPool(false;
+                alter_error=PormG.StatementError("SQLite", InterruptException()))
+            @test_throws PormG.StatementError ensure!(ialter)
+            @test length(ialter.sql) == 2   # probe, ALTER -- no re-probe
         end
 
         @testset "a run does not inherit the submitter's PormG transaction (#209)" begin

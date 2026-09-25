@@ -396,17 +396,24 @@ frame later and relabelled a `ValidationError` → 400.
 The sites that keep the narrower `e isa InterruptException && rethrow()` do so for **three
 different reasons**, and conflating them is how this list rots:
 
-1. **Nothing recursive is reachable.** `src/types.jl:1024,1055` (`unescapeuri`, `queryparams`),
-   `src/utilities/fileutil.jl:609`, `src/core/framework_middleware.jl:43` (`HTTP.URI`), and
+1. **Nothing recursive is reachable.** `src/types.jl` `_pathparams_uncached` and
+   `_queryvars_uncached` (`unescapeuri`, `queryparams`), `src/utilities/fileutil.jl`
+   `mount_remainder`, `src/utilities/misc.jl` `_log_target_path` (`HTTP.URI`), and
    `src/core/transport.jl` `_swallow_request_body!` (`readbytes!`). All scan-based; no request
    input makes them overflow, so widening them would be churn.
 2. **Not a request path — a background task, where the caught failure has no request to fail.**
-   `src/middleware/janitor.jl:76` and `src/Workers/api.jl:915` are supervisor loops: both call
-   application-supplied store code, so by the argument below they would otherwise qualify. They
-   stay narrow because the #190 janitor discipline is that one bad tick must not kill the janitor,
-   and a dead sweeper is worse than a swallowed tick. `src/response.jl`'s `_run_sse_producer`
-   (#160) is the same discipline one level down: the producer task nothing waits on, where the
-   expected failure is the client disconnecting. Do not "fix" these to match the table above.
+   `_janitor_loop` (`src/middleware/janitor.jl`) and the Workers retention scheduler's
+   `_cleanup_scheduler_loop` — with the two catches in `_recover_zombie_tasks!` that its tick
+   reaches (`src/Workers/api.jl`) — are supervisor loops: they call application-supplied store
+   code, so by the argument below they would otherwise qualify. They stay narrow because the
+   #190 janitor discipline is that one bad tick must not kill the janitor, and a dead sweeper is
+   worse than a swallowed tick. The interrupt their per-tick catches rethrow lands in an **outer
+   handler that ends the loop with a `@warn`** rather than killing the task (#369). In a
+   background task a rethrow reaches nobody who can act on it, and swallowing it and looping on
+   makes the loop the task every later Ctrl-C lands in. The reasoning is canonical next to
+   `_cleanup_scheduler_loop`. `src/response.jl`'s `_run_sse_producer` (#160) is the same
+   discipline one level down: the producer task nothing waits on, where the expected failure is
+   the client disconnecting. Do not "fix" these to match the table above.
 3. **The error boundary itself — the place the other two are MEANT to arrive.**
    `ErrorBoundary` in `src/core/framework_middleware.jl` (#256) wraps the whole middleware chain
    so that what this predicate lets through gets logged and answered with a 500. Widening it would
@@ -415,6 +422,23 @@ different reasons**, and conflating them is how this list rots:
 
 `src/middleware/extract_ip.jl` uses the predicate despite belonging to group 1, for consistency
 within a file this change already touched.
+
+### The executors' per-attempt catch uses the predicate and deliberately does NOT rethrow
+
+The per-attempt `catch` in both worker executors — `_execute_task_async` (`src/Workers/api.jl`)
+and `_execute_queued_task` (`src/Workers/queue.jl`) — treats the three as **terminal**, in the
+same arm as `TaskTimeoutError`: no retry, recorded `FAILED` through `_fail_task!`, never
+rethrown (#367).
+
+- **Not retried**: a retry re-runs a callback that has just overflowed the stack or exhausted
+  memory, and on some Windows hosts the overflow ends the process (#301). An interrupt is the
+  operator's Ctrl-C (under `julia -t 1` it can land on any task) or the callback's own. Neither is
+  a transient failure.
+- **Not rethrown**: nothing is waiting to receive it. The async run is a detached task, and the
+  sequential processor's catch-all logs and drops the item. Either way the record would stay
+  `RUNNING` until a zombie sweep marked it failed with no hint of why, where `FAILED` with the
+  exception's type is the honest record. It is group 2's argument one level down: a background
+  task, where the failure has no request to fail.
 
 Those three groups plus the sites in the table are every `e isa InterruptException && rethrow()`
 in `src/`; `grep -rn 'isa InterruptException && rethrow()' src/` is the audit, and a hit it

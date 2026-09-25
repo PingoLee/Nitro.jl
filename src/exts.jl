@@ -32,7 +32,9 @@ is no sliding expiry.
 
 Session data may nest at most **512** levels deep, the same bound as request JSON
 (`MAX_JSON_DEPTH`). Writing a deeper payload throws an `ArgumentError` before the row is
-touched, rather than storing a session that could never be read back. A row stored deeper
+touched, rather than storing a session that could never be read back. The check walks the value
+before serializing it, so even a payload deep enough to overflow `JSON.json` gets that
+`ArgumentError` rather than a `StackOverflowError`. A row stored deeper
 before this bound existed reads as no session, and logs a warning that names no payload.
 
 `db_key` names the PormG connection, defaulting to `"db"`. It governs **both** halves: the
@@ -113,9 +115,10 @@ column, and tolerates the error when the column is already there.
 
 A task's return value is stored as JSON, and may nest at most **512** levels deep, the same
 bound as request JSON (`MAX_JSON_DEPTH`). A deeper result makes the completing write throw an
-`ArgumentError` before the row is touched. The run then retries or fails like any other
-attempt that throws, so the task ends `FAILED` rather than storing a result no read could
-decode. `InMemoryWorkerStore` serializes nothing and has no such limit.
+`ArgumentError` before the row is touched. The value is walked before it is serialized, so this
+holds even for a result deep enough to overflow `JSON.json`. The run then retries or fails like
+any other attempt that throws, so the task ends `FAILED` rather than storing a result no read
+could decode. `InMemoryWorkerStore` serializes nothing and has no such limit.
 
 Requires `using PormG` and a configured PormG connection; without the extension loaded this
 is a `MethodError`.

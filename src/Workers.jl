@@ -9,6 +9,9 @@ using ..Core: App, LifecycleMiddleware
 using ..Core.AppContext: set_extension!, get_extension, delete_extension!
 using ..Core: AuthorizationError, StoreInterfaceError, WorkerUnavailableError, WorkerCapacityError
 using ..Core.Errors: implements_contract_method, store_contract_error
+# The per-attempt catch in the two executors treats these as terminal (#367); see the site
+# table in `is_unrecoverable`'s docstring.
+using ..Core.Errors: is_unrecoverable
 
 const DEFAULT_EXTENSION_KEY = :workers
 

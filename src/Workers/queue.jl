@@ -351,7 +351,12 @@ function _execute_queued_task(runtime::WorkerRuntime, item::QueueItem)
                 # put four copies of the callback on the thread pool at once, sharing one
                 # `task_info` and one set of external side effects (#127). The token is not
                 # reset between attempts either, so a retry would start pre-cancelled.
-                if unwrapped isa TaskTimeoutError
+                #
+                # So are the three `is_unrecoverable` exceptions (#367), recorded FAILED and
+                # never rethrown -- see that function's site table (src/errors.jl). A rethrow
+                # here would reach the processor's catch-all below, which logs and DROPS the item,
+                # leaving its record RUNNING until a zombie sweep.
+                if unwrapped isa TaskTimeoutError || is_unrecoverable(unwrapped)
                     return _fail_task!(runtime, task_info, _store_error_text(runtime.store, unwrapped))
                 end
 

@@ -407,9 +407,11 @@ cancel_reason(task_info::TaskInfo) = @atomic task_info.cancel_reason
 
 A task callback outran its `TaskOptions(timeout=…)`.
 
-Distinct from a plain `ErrorException` because it is the one failure that must **not** be
-retried: nothing can stop the attempt that timed out, so retrying would run a second copy of the
-callback beside the first, against the same `task_info` and the same external state. Its
+Distinct from a plain `ErrorException` because it is the one callback failure that must **not**
+be retried: nothing can stop the attempt that timed out, so retrying would run a second copy of
+the callback beside the first, against the same `task_info` and the same external state. (The
+executor does not retry `StackOverflowError`, `OutOfMemoryError` or `InterruptException` either,
+since #367, but those are reports on the process, not failures of the callback.) Its
 `showerror` text is unchanged from the message this used to throw, so anything matching on the
 rendered string still matches.
 """
@@ -493,4 +495,8 @@ end
 mutable struct CleanupScheduler
     task::Task
     stop_signal::Channel{Nothing}
+    # The one thing the loop parks on between ticks (#369): notified by the tick's `Timer` and by
+    # `stop_cleanup_scheduler!`. Autoreset, so a notify that lands before the loop reaches its
+    # `wait` is kept rather than lost -- that is what makes the stop race-free without polling.
+    wake::Base.Event
 end
