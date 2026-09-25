@@ -39,6 +39,8 @@ Nitro.Core.Reflection.struct_builder
 Nitro.Core.Reflection.splitdef
 Nitro.Core.Util.parseparam
 Nitro.Core.Util.parseparam_checked
+Nitro.Core.Util.parsebody
+Nitro.Core.Util.response
 Nitro.Core.Util.add_response_headers
 Nitro.Core.Util.own_response_headers
 Nitro.Core.Util.header_name_isequal
