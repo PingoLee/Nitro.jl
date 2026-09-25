@@ -23,8 +23,8 @@ The bare names `text`, `json` and `binary` are *request body parsers*
 (`Nitro.BodyParsers`), not response builders. One name, one direction.
 
 Two other places build responses, neither of them for handler code: `Nitro.Util.response`,
-which **content-sniffs** and is what the Mustache and OteraEngine template extensions render
-through, and `protobuf` in the ProtoBuf extension. Middleware and core also construct fixed
+which **content-sniffs** when neither the caller's `headers` nor the template's `mime_type` set a
+`Content-Type`, and is what the Mustache and OteraEngine template extensions render through, and `protobuf` in the ProtoBuf extension. Middleware and core also construct fixed
 error and redirect responses directly.
 
 Caller-supplied `headers` are applied **last** in every builder, so they override the

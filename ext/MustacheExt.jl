@@ -17,6 +17,11 @@ If `template` is a file path, it reads the file content as the template string.
 Returns a function that takes a dictionary `data`, optional `status`, and `headers`, and
 returns an HTTP Response object with the rendered content.
 
+The response's `Content-Type` is a `Content-Type` in the per-call `headers` if there is one, else
+`mime_type`, else a type sniffed from the rendered output (see `Nitro.Util.response`). Sniffing
+never overrides a type you set: `render(data; headers = ["Content-Type" => "text/plain"])` stays
+`text/plain` even when a `{{{triple-stashed}}}` value renders as `<script>`.
+
 To get more info read the docs here: https://github.com/jverzani/Mustache.jl
 """
 function mustache(template::String; mime_type=nothing, from_file=false, kwargs...)
@@ -36,8 +41,7 @@ function mustache(template::String; mime_type=nothing, from_file=false, kwargs..
     # Case 2: A string template was passed directly
     function(data::AbstractDict = Dict(); status=200, headers=[])
         content = Mustache.render(template, data; kwargs...)        
-        resp_headers = mime_is_known ? [["Content-Type" => mime_type]; headers] : headers
-        response(content, status, resp_headers; detect=!mime_is_known)
+        response(content, status, headers; content_type=mime_type)
     end
 end
 
@@ -51,11 +55,9 @@ returns an HTTP Response object with the rendered content.
 To get more info read the docs here: https://github.com/jverzani/Mustache.jl
 """
 function mustache(tokens::Mustache.MustacheTokens; mime_type=nothing, kwargs...)
-    mime_is_known = !isnothing(mime_type)
     return function(data::AbstractDict = Dict(); status=200, headers=[])
         content = Mustache.render(tokens, data; kwargs...)
-        resp_headers = mime_is_known ? [["Content-Type" => mime_type]; headers] : headers
-        response(content, status, resp_headers; detect=!mime_is_known)
+        response(content, status, headers; content_type=mime_type)
     end 
 end
 
@@ -70,11 +72,9 @@ To get more info read the docs here: https://github.com/jverzani/Mustache.jl
 """
 function mustache(file::IO; mime_type=nothing, kwargs...)
     template = read(file, String)
-    mime_is_known = !isnothing(mime_type)
     return function(data::AbstractDict = Dict(); status=200, headers=[])
         content = Mustache.render(template, data; kwargs...)
-        resp_headers = mime_is_known ? [["Content-Type" => mime_type]; headers] : headers
-        response(content, status, resp_headers; detect=!mime_is_known)
+        response(content, status, headers; content_type=mime_type)
     end
 end
 

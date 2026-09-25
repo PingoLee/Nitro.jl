@@ -333,7 +333,7 @@ function format_response(content::AbstractString)
     # XSS. Handlers that intentionally return HTML/JS/etc. must opt in explicitly
     # via `Res.html(...)` or `Res.send(...; content_type=...)`, which set the type
     # themselves. Those two, plus template rendering through `response` below (which
-    # DOES sniff), are the framework's markup sinks.
+    # sniffs when no type was given), are the framework's markup sinks.
     body = string(content)
     return HTTP.Response(200, [
         "Content-Type" => "text/plain; charset=utf-8",
@@ -422,19 +422,29 @@ _rebuild_with_headers(resp::HTTP.Response, headers) = HTTP.Response(
 
 
 """
-    response(content::String, status=200, headers=[]) :: HTTP.Response
+    response(content::String, status=200, headers=[]; content_type=nothing, detect=true) :: HTTP.Response
 
-Convert a template string `content` into a valid HTTP Response object.
-The content type header is automatically generated based on the content's mimetype
-- `content`: The string content to be included in the HTTP response body.
-- `status`: The HTTP status code (default is 200).
-- `headers`: Additional HTTP headers to include (default is an empty array).
+Convert a rendered template string `content` into an HTTP Response. This is what the Mustache and
+OteraEngine extensions render through, and it is a markup sink.
 
-Returns an `HTTP.Response` object with the specified content, status, and headers.
+The `Content-Type` is the first of these that applies, and there is only ever one:
+1. a `Content-Type` already in `headers` — the caller's per-call choice;
+2. `content_type` — the template's `mime_type`;
+3. `HTTP.sniff(content)`, only when `detect` is true.
+
+**An explicit type is never overridden by sniffing** (#328). It used to be: sniffing replaced the
+caller's header, so a template served as `text/plain` precisely so that unescaped output was safe
+went out as `text/html` whenever the rendered value looked like markup.
 """
-function response(content::String, status=200, headers=[]; detect=true) :: HTTP.Response
+function response(content::String, status=200, headers=[]; content_type=nothing, detect=true) :: HTTP.Response
     response = HTTP.Response(status, headers, content)
-    detect && HTTP.setheader(response, "Content-Type" => HTTP.sniff(content))
+    if !HTTP.hasheader(response, "Content-Type")
+        if !isnothing(content_type)
+            HTTP.setheader(response, "Content-Type" => content_type)
+        elseif detect
+            HTTP.setheader(response, "Content-Type" => HTTP.sniff(content))
+        end
+    end
     HTTP.setheader(response, "Content-Length" => string(sizeof(content)))
     return response
 end

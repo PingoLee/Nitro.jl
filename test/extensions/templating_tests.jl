@@ -313,6 +313,51 @@ Well, 6000.0 dollars, after taxes.
         @test result.body |> String |> clean_output == expected_output
     end
 
+    # #328: sniffing replaced an explicit `Content-Type`, so a template served as text/plain --
+    # chosen precisely so that unescaped output is safe -- went out as text/html once the output
+    # looked like markup. And `mime_type` plus a per-call header emitted two `Content-Type`s.
+    @testset "an explicit Content-Type is never overridden by sniffing (#328)" begin
+        content_types(resp) = [v for (k, v) in resp.headers if lowercase(k) == "content-type"]
+        plain = ["Content-Type" => "text/plain; charset=utf-8"]
+        payload = "<script>alert(1)</script>"
+
+        renderers = [
+            "mustache(string)" => (mustache("<html><body>{{{msg}}}</body></html>"),
+                                   Dict("msg" => payload)),
+            "mustache(tokens)" => (mustache(mt"<html><body>{{{msg}}}</body></html>"),
+                                   Dict("msg" => payload)),
+            "otera(string)"    => (otera("<html><body>{{ msg }}</body></html>"),
+                                   Dict(:msg => payload)),
+        ]
+        for (label, (render, vars)) in renderers
+            @testset "$label" begin
+                # The caller's type wins, and it is the only one.
+                @test content_types(render(vars; headers = plain)) == ["text/plain; charset=utf-8"]
+                # With no type anywhere, the output is still sniffed.
+                @test only(content_types(render(vars))) == "text/html; charset=utf-8"
+            end
+        end
+
+        @testset "mime_type plus a per-call header: one header, the per-call one" begin
+            render = mustache("<html>{{{msg}}}</html>"; mime_type = "text/html")
+            @test content_types(render(Dict("msg" => payload); headers = plain)) ==
+                ["text/plain; charset=utf-8"]
+            @test content_types(render(Dict("msg" => payload))) == ["text/html"]
+
+            render = otera("<html>{{ msg }}</html>"; mime_type = "text/html")
+            @test content_types(render(Dict(:msg => payload); headers = plain)) ==
+                ["text/plain; charset=utf-8"]
+        end
+
+        @testset "Util.response precedence" begin
+            @test content_types(Nitro.Util.response("<html></html>", 200, plain)) ==
+                ["text/plain; charset=utf-8"]
+            @test content_types(Nitro.Util.response("<html></html>"; content_type = "text/css")) ==
+                ["text/css"]
+            @test isempty(content_types(Nitro.Util.response("<html></html>"; detect = false)))
+        end
+    end
+
 end
 
 end
