@@ -9,7 +9,7 @@ cleanup scheduler, and the process-local handles for runs executing **right now*
 
 Worker runs execute on the `:default` thread pool, the same pool that serves HTTP, so an
 unbounded runtime lets one caller take the server down by submitting fresh keys. Each limit
-refuses a submission **before anything is written**, with a [`WorkerCapacityError`](@ref Nitro.Errors.WorkerCapacityError):
+refuses a submission **before anything is written**, with a [`WorkerCapacityError`](@ref):
 
 - `max_concurrent_runs` (default `64`): async runs (`submit_task`) in flight at once, runtime-wide
   (Sidekiq's concurrency, River's `MaxWorkers`). Past it, `:runtime`, a `503`. `nothing` removes
