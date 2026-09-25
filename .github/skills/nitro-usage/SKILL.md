@@ -281,8 +281,9 @@ attributes allow, so a sibling subdomain or a plain-HTTP hop cannot plant its ow
 the victim. With a `domain` or a non-`/` `path` it becomes `__Secure-nitro_session`, and plain
 `nitro_session` only with `secure=false`. Do not pass `cookie_name` unless you must; an explicit
 `__Host-`/`__Secure-` name the attributes cannot carry is an `ArgumentError` at construction. The
-cookie holds only a random id, so `SessionMiddleware` needs no `secret_key` — it accepts one and
-ignores it ([#339](https://github.com/PingoLee/Nitro.jl/issues/339)).
+cookie holds only a random id, so `SessionMiddleware` takes no `secret_key`. Passing one is a
+`MethodError`, and a `config::CookieConfig` carrying one is an `ArgumentError`
+([#339](https://github.com/PingoLee/Nitro.jl/issues/339)).
 
 Read and write through `getsession(req)`. Call `regenerate_session!(req, store)` on any privilege
 change you perform manually. `CSRFMiddleware(secret)` is required for cookie-authenticated
