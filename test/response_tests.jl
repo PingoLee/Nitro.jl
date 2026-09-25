@@ -138,6 +138,27 @@ end
     @test Dict(named.headers)["Content-Disposition"] == "attachment; filename=\"report.html\""
 end
 
+@testset "Res.file — an untrusted filename cannot inject parameters (#328)" begin
+    disposition(name) = Dict(Res.file("content/index.html"; filename = name).headers)["Content-Disposition"]
+
+    # The audit's payload: unescaped, the `"` closed the quote and the name appended a
+    # `filename*`, which browsers prefer. Escaped, it is all one quoted-string.
+    evil = "report.txt\"; filename*=UTF-8''evil.html; x=\""
+    @test disposition(evil) ==
+        "attachment; filename=\"report.txt\\\"; filename*=UTF-8''evil.html; x=\\\"\""
+    # Nothing outside the quoted-string: strip the one quoted value and no parameter is left.
+    @test replace(disposition(evil), r"\"(?:[^\"\\]|\\.)*\"" => "Q") == "attachment; filename=Q"
+
+    @test disposition("a\\b.txt") == "attachment; filename=\"a\\\\b.txt\""
+    # Control characters are dropped, not passed to the header writer to neutralize.
+    @test disposition("a\r\nb\tc\x7f.txt") == "attachment; filename=\"abc.txt\""
+
+    # Non-ASCII: an ASCII fallback, plus the real name as RFC 5987 `filename*`.
+    uni = disposition("relatório 2026.pdf")
+    @test uni == "attachment; filename=\"relat?rio 2026.pdf\"; filename*=UTF-8''relat%C3%B3rio%202026.pdf"
+    @test HTTP.unescapeuri(split(uni, "UTF-8''")[2]) == "relatório 2026.pdf"
+end
+
 @testset "Repeated calls do not duplicate headers for Res.file" begin
     response1 = Res.file("content/index.html")
     response2 = Res.file("content/index.html")
@@ -310,6 +331,10 @@ end
         @test HTTP.header(Res.file(get(), path), "Content-Disposition", "") == ""
         dl = Res.file(get(), path; disposition = "attachment")
         @test HTTP.header(dl, "Content-Disposition") == "attachment; filename=\"app.js\""
+        # The request-aware builder escapes an untrusted name the same way (#328).
+        evil = Res.file(get(), path; filename = "x\"; filename*=UTF-8''evil.html; y=\"")
+        @test HTTP.header(evil, "Content-Disposition") ==
+            "attachment; filename=\"x\\\"; filename*=UTF-8''evil.html; y=\\\"\""
         # Caller headers are applied LAST and override what the builder computed.
         over = Res.file(get(), path; headers = ["Content-Type" => "text/plain"])
         @test HTTP.header(over, "Content-Type") == "text/plain"

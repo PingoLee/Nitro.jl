@@ -45,8 +45,42 @@ function apply_headers!(response::HTTP.Response, headers)
     return response
 end
 
-function content_disposition(filename::String, disposition::String)
-    return string(disposition, "; filename=\"", filename, "\"")
+"""
+    content_disposition(filename, disposition) -> String
+
+The `Content-Disposition` value for `filename`, per RFC 6266 — the same shape Express's
+`content-disposition` package emits (#328).
+
+`filename` is often a value the app did not choose — an upload's original name kept as metadata —
+so it is treated as untrusted. Control characters are dropped, and `\\` and `"` are escaped inside
+the quoted-string. Unescaped, a `"` closed the quote and let the name append parameters of its own:
+`report.txt"; filename*=UTF-8''evil.html; x="` injected a `filename*`, which browsers prefer over
+`filename`.
+
+The quoted `filename=` is ASCII-only, with `?` standing in for anything else. A name that needed
+that substitution also gets an RFC 5987 `filename*=UTF-8''…` carrying the real name, so a plain
+ASCII name produces exactly the header it always did.
+"""
+function content_disposition(filename::AbstractString, disposition::String)
+    clean = filter(!iscntrl, filename)
+    fallback = map(c -> isascii(c) ? c : '?', clean)
+    quoted = replace(fallback, '\\' => "\\\\", '"' => "\\\"")
+    header = string(disposition, "; filename=\"", quoted, "\"")
+    fallback == clean && return header
+    return string(header, "; filename*=UTF-8''", rfc5987_encode(clean))
+end
+
+# RFC 5987 `attr-char`: the bytes an `ext-value` carries literally. Everything else, including
+# every byte of a multi-byte UTF-8 sequence, is percent-encoded.
+is_attr_char(b::UInt8) = UInt8('a') <= b <= UInt8('z') || UInt8('A') <= b <= UInt8('Z') ||
+    UInt8('0') <= b <= UInt8('9') || b in codeunits("!#\$&+-.^_`|~")
+
+function rfc5987_encode(s::AbstractString)
+    io = IOBuffer()
+    for b in codeunits(s)
+        is_attr_char(b) ? write(io, b) : print(io, '%', uppercase(string(b, base = 16, pad = 2)))
+    end
+    return String(take!(io))
 end
 
 """
@@ -226,6 +260,10 @@ Content-Length from the body actually sent.
 given, so a plain `file(path)` serves inline — which is what static mounts need. Pass
 `disposition="attachment"` to force a download. Supplying `filename` alone implies
 `"attachment"`.
+
+`filename` may be untrusted — an upload's original name, say. It is escaped for the header, not
+interpolated: control characters are dropped, `"` and `\\` are escaped, and a non-ASCII name is
+sent as an ASCII `filename=` fallback plus an RFC 5987 `filename*=UTF-8''…` with the real name.
 
 Custom headers are applied last and may override defaults.
 """
