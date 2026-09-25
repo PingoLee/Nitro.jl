@@ -213,10 +213,11 @@ that write dropped: the session is not re-created, and that response does not se
 again. Each request also works on its own deep copy of the session, so concurrent requests never
 share a nested value such as a `cart` vector.
 
-One case is not covered yet: an in-flight request that **rotates** the session after the logout,
-by calling `regenerate_session!` or through `rotate_on_auth` on a user switch. It still copies its
-stale data into a fresh ID. Re-check credentials before rotating on a privilege change rather than
-trusting the loaded session alone.
+One case is not covered yet
+([#361](https://github.com/PingoLee/Nitro.jl/issues/361)): an in-flight request that
+**rotates** the session after the logout, by calling `regenerate_session!` or through
+`rotate_on_auth` on a user switch. It still copies its stale data into a fresh ID. Re-check
+credentials before rotating on a privilege change rather than trusting the loaded session alone.
 
 If you manage sessions manually without `SessionMiddleware`, delete the old server-side record and invalidate the client cookie yourself.
 
