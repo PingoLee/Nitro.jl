@@ -142,11 +142,17 @@ end
 @testset "MemoryStore fixed-TTL expiry" begin
     store = MemoryStore{String, Dict{String,Any}}()
 
+    # The expiry is fixed at write time. Check it from the stored payload rather than an
+    # immediate read of a 1 s session, which a slow first call can overrun (#305).
+    t0 = Dates.now(Dates.UTC)
     set_session!(store, "ttl-test", Dict{String,Any}("role" => "admin"); ttl=1)
-    @test get_session(store, "ttl-test") == Dict{String,Any}("role" => "admin")
+    t1 = Dates.now(Dates.UTC)
+    @test t0 + Dates.Second(1) <= store.data["ttl-test"].expires <= t1 + Dates.Second(1)
+    set_session!(store, "live", Dict{String,Any}("role" => "user"); ttl=3600)
 
     sleep(1.1)
     @test get_session(store, "ttl-test") === nothing
+    @test get_session(store, "live") == Dict{String,Any}("role" => "user")
 end
 
 @testset "cleanup_expired_sessions! leaves non-expired rows" begin
