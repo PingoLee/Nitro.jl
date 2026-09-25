@@ -17,7 +17,7 @@ Split in [#167](https://github.com/PingoLee/Nitro.jl/issues/167). One question d
 change belongs to: **the store answers *"what does the record say?"*; the runtime answers *"what is
 this process doing right now?"***.
 
-- **`AbstractWorkerStore`** (`src/Workers/registry.jl`): data access plus policy hooks, 15 required
+- **`AbstractWorkerStore`** (`src/Workers/registry.jl`): data access plus policy hooks, 16 required
   methods. It owns **nothing that runs** — no queue, no scheduler, no `Task` handle — which is what
   makes the #29 leak unrepresentable rather than merely fixed.
 - **`WorkerRuntime`** (`src/Workers/runtime.jl`): the sequential queues and their processor tasks,
@@ -117,7 +117,10 @@ you add anything:
 
 | API | Purpose |
 |-----|---------|
-| `submit_sequential_task`, `SequentialQueue` | Ordered, one-at-a-time execution within a queue |
+| `submit_sequential_task` | Ordered, one-at-a-time execution within a queue |
+| `get_task_status`, `cancel_task` | Read and cancel. A task the authority may not see answers **exactly** like a missing one (`:status => "NOT_FOUND"`), never `AuthorizationError` — that difference was a task-existence oracle ([#323](https://github.com/PingoLee/Nitro.jl/issues/323)). `AuthorizationError` is left to the submit paths, and `handle_error` answers it with a 403 |
+| `release_task!` | **Admin only**, takes `System()`: deletes a *finished* record through the fenced `try_delete_task!`, so a squatted `:global` key can be reused |
+| *(not exported)* `get_task_info`, `add_watcher!`, `set_task!`, `replace_task!`, `try_transition!`, `try_delete_task!`, `delete_task!`, `cleanup_tasks!`, `clear_records!`, `list_running_task_refs`, `RunningTaskRef`, `lock_tasks`, `get_active_task[_info]`, `register_run!`, `SequentialQueue`, `QueueItem`, `get_sequential_queues`, `get_queue_lock` | The store contract and the run/queue internals. Backends extend them qualified; they perform no authorization, so they must not become application API again (#323) |
 | `scoped_task_key`, `DEFAULT_QUEUE_NAME` | Resolve a `(task_key, user_id, scope)` to its stored id; the queue name `submit_task` authorizes against |
 | `get_queue_status` | Queue-wide introspection — **admin only**, takes `System()`; an `Owner` is a `MethodError` |
 | `update_progress!` | The only safe write to `TaskInfo.progress` |
