@@ -157,6 +157,14 @@ end
     uni = disposition("relatório 2026.pdf")
     @test uni == "attachment; filename=\"relat?rio 2026.pdf\"; filename*=UTF-8''relat%C3%B3rio%202026.pdf"
     @test HTTP.unescapeuri(split(uni, "UTF-8''")[2]) == "relatório 2026.pdf"
+
+    # Some browsers percent-decode `filename=`, so a `%XX` in an ASCII name also gets the
+    # unambiguous `filename*` (as Express does).
+    @test disposition("a%22b.txt") == "attachment; filename=\"a%22b.txt\"; filename*=UTF-8''a%2522b.txt"
+
+    # `disposition` is written unquoted, so it must be a token.
+    @test_throws ArgumentError Res.file("content/index.html";
+        disposition = "attachment; filename*=UTF-8''evil.html")
 end
 
 @testset "Repeated calls do not duplicate headers for Res.file" begin

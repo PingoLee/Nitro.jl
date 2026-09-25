@@ -22,10 +22,11 @@ background task behind it. See the streaming tutorial for the shape.
 The bare names `text`, `json` and `binary` are *request body parsers*
 (`Nitro.BodyParsers`), not response builders. One name, one direction.
 
-Two other places build responses, neither of them for handler code: `Nitro.Util.response`,
-which **content-sniffs** when neither the caller's `headers` nor the template's `mime_type` set a
-`Content-Type`, and is what the Mustache and OteraEngine template extensions render through, and `protobuf` in the ProtoBuf extension. Middleware and core also construct fixed
-error and redirect responses directly.
+Two other places build responses, neither of them for handler code. One is
+`Nitro.Util.response`, which the Mustache and OteraEngine template extensions render through; it
+**content-sniffs** unless the caller's `headers` or the template's `mime_type` set a
+`Content-Type`. The other is `protobuf` in the ProtoBuf extension. Middleware and core also
+construct fixed error and redirect responses directly.
 
 Caller-supplied `headers` are applied **last** in every builder, so they override the
 defaults, `Content-Type` included.
@@ -58,17 +59,26 @@ the quoted-string. Unescaped, a `"` closed the quote and let the name append par
 `filename`.
 
 The quoted `filename=` is ASCII-only, with `?` standing in for anything else. A name that needed
-that substitution also gets an RFC 5987 `filename*=UTF-8''…` carrying the real name, so a plain
+that substitution also gets an RFC 5987 `filename*=UTF-8''…` carrying the real name, and so does
+one containing a `%XX` sequence, which some browsers percent-decode in `filename=`. Any other
 ASCII name produces exactly the header it always did.
+
+`disposition` must be an RFC 7230 token (`attachment`, `inline`); anything else throws an
+`ArgumentError`, since it is written into the header unquoted.
 """
 function content_disposition(filename::AbstractString, disposition::String)
+    occursin(DISPOSITION_TYPE, disposition) || throw(ArgumentError(
+        "Res.file: `disposition` must be a token such as \"attachment\" or \"inline\""))
     clean = filter(!iscntrl, filename)
     fallback = map(c -> isascii(c) ? c : '?', clean)
     quoted = replace(fallback, '\\' => "\\\\", '"' => "\\\"")
     header = string(disposition, "; filename=\"", quoted, "\"")
-    fallback == clean && return header
+    fallback == clean && !occursin(HEX_ESCAPE, clean) && return header
     return string(header, "; filename*=UTF-8''", rfc5987_encode(clean))
 end
+
+const DISPOSITION_TYPE = r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+const HEX_ESCAPE = r"%[0-9A-Fa-f]{2}"
 
 # RFC 5987 `attr-char`: the bytes an `ext-value` carries literally. Everything else, including
 # every byte of a multi-byte UTF-8 sequence, is percent-encoded.
