@@ -1135,6 +1135,7 @@ struct NamedRoute
 end
 
 Base.:(==)(a::NamedRoute, b::NamedRoute) = a.path == b.path && a.type_hints == b.type_hints
+Base.hash(r::NamedRoute, h::UInt) = hash(r.type_hints, hash(r.path, hash(:NamedRoute, h)))
 
 RouteDefinition(pattern::String, handler::Function, methods::Vector{String}, name, middleware, type_hints) =
     RouteDefinition(; pattern, handler, methods, name, middleware, type_hints)

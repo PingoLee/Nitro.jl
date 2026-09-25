@@ -236,32 +236,37 @@ end
         path("/flags/<bool:on>", (req::HTTP.Request, on) -> "ok", name="flag"),
     )
 
+    # The ArgumentError's message, so each case can say WHICH rule refused it.
+    refusal(f) = try f(); "no error" catch e; e isa ArgumentError ? e.msg : rethrow() end
+    EMPTY_OR_DOT = "cannot be empty, '.' or '..'"
+    NO_MATCH = "does not match its"
+
     # The audit's two cases: an empty leading value built a scheme-relative `//host`, and `..`
     # built a dot-segment.
-    @test_throws ArgumentError url(app, "org-page"; org = "", page = "evil.example")
-    @test_throws ArgumentError url(app, "user-delete"; name = "..")
-    @test_throws ArgumentError url(app, "user-delete"; name = ".")
-    @test_throws ArgumentError url(app, "org-page"; org = "acme", page = "")
+    @test occursin(EMPTY_OR_DOT, refusal(() -> url(app, "org-page"; org = "", page = "evil.example")))
+    @test occursin(EMPTY_OR_DOT, refusal(() -> url(app, "user-delete"; name = "..")))
+    @test occursin(EMPTY_OR_DOT, refusal(() -> url(app, "user-delete"; name = ".")))
+    @test occursin(EMPTY_OR_DOT, refusal(() -> url(app, "org-page"; org = "acme", page = "")))
     # A converter-less `{param}` takes any other value, escaped.
     @test url(app, "user-delete"; name = "a/b..c") == "/users/a%2Fb..c/delete"
     @test url(app, "org-page"; org = "acme", page = "...") == "/acme/..."
 
     # A converter value must parse as the converter's type -- what the route would bind.
     @test url(app, "item"; id = 42) == url(app, "item"; id = "42") == "/items/42"
-    @test_throws ArgumentError url(app, "item"; id = "abc")
-    @test_throws ArgumentError url(app, "key"; key = "not-a-uuid")
-    @test_throws ArgumentError url(app, "score"; x = NaN)
+    @test occursin("$NO_MATCH Int64 converter", refusal(() -> url(app, "item"; id = "abc")))
+    @test occursin("$NO_MATCH UUID converter", refusal(() -> url(app, "key"; key = "not-a-uuid")))
+    @test occursin("$NO_MATCH Float64 converter", refusal(() -> url(app, "score"; x = NaN)))
     @test url(app, "score"; x = 1.5) == "/scores/1.5"
-    @test_throws ArgumentError url(app, "flag"; on = "maybe")
+    @test occursin("$NO_MATCH Bool converter", refusal(() -> url(app, "flag"; on = "maybe")))
 
     # The refused value never reaches the message.
-    err = try url(app, "item"; id = "s3cr3t-value"); nothing catch e; e end
-    @test err isa ArgumentError
-    @test occursin("'id'", err.msg) && !occursin("s3cr3t-value", err.msg)
+    msg = refusal(() -> url(app, "item"; id = "s3cr3t-value"))
+    @test occursin("'id'", msg) && !occursin("s3cr3t-value", msg)
 
-    # Re-registering a name with the same path but a different converter is still a conflict.
-    @test_throws ArgumentError urlpatterns(app, "",
-        path("/items/<str:id>", (req::HTTP.Request, id) -> "ok", name="item"))
+    # A name on the same path with different converters used to register, and `url` reversed it
+    # by path alone. It could not know which rule a value must meet, so it is now a conflict.
+    @test occursin("with different path converters", refusal(() -> urlpatterns(app, "",
+        path("/items/{id}", (req::HTTP.Request, id) -> "ok", method="POST", name="item"))))
 end
 
 @testset "duplicate route names" begin

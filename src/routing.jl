@@ -149,14 +149,21 @@ end
 
 function register_named_route!(ctx::App, name::String, full_path::String,
                                type_hints::Dict{Symbol, Type} = Dict{Symbol, Type}())
-    route = NamedRoute(full_path, type_hints)
+    route = NamedRoute(full_path, copy(type_hints))
     return Base.lock(ctx.service.named_routes_lock) do
         existing = get(ctx.service.named_routes, name, nothing)
         if isnothing(existing)
             ctx.service.named_routes[name] = route
-        elseif existing != route
+        elseif existing.path != full_path
             throw(ArgumentError(
                 "Duplicate route name: '$name' is already registered for '$(existing.path)'"
+            ))
+        elseif existing != route
+            # Same path, different converters (`<int:id>` for GET, `{id}` for POST): `url` could
+            # not know which rule a value must satisfy, so one name cannot reverse both.
+            throw(ArgumentError(
+                "Duplicate route name: '$name' is already registered for '$full_path' " *
+                "with different path converters"
             ))
         end
 
@@ -175,8 +182,10 @@ applies: a value the route itself would not accept.
   `//evil.example`, a scheme-relative URL and so an open redirect once handed to `Res.redirect`,
   and `..` produced a dot-segment that a client or proxy resolves away.
 - Under a converter (`<int:id>`), the value must parse through `parseparam` as the converter's
-  type: the parser the router binds that segment with, so `url` refuses exactly what the route
-  would answer with a 400. A plain `{param}` has no converter, so only the first rule applies.
+  type — the parser the router binds that segment with. It is the *converter* that is checked,
+  not the handler's annotation: a handler that narrows `<int:id>` to `id::UInt8`, or types a
+  converter-less `{id}` as `Int`, can still answer a URL `url` built with a 400. A plain
+  `{param}` has no converter, so only the first rule applies.
 
 The value is left out of the message, as `parseparam`'s own errors leave it out.
 """
@@ -194,7 +203,7 @@ function check_route_value(pattern::String, param_name::AbstractString, raw::Str
     catch e
         is_unrecoverable(e) && rethrow()
         throw(ArgumentError(
-            "Route parameter '$param_name' for route '$pattern' does not match its $T converter"
+            "Route parameter '$param_name' for route '$pattern' does not match its $(nameof(T)) converter"
         ))
     end
     return nothing

@@ -6,7 +6,7 @@
 - **Recorded**: 2026-09-25
 - **Severity**: behavior change — a `url(...)` call that used to return a string now throws an
   `ArgumentError` when a parameter value is empty, `.`/`..`, or does not parse as its converter's
-  type.
+  type; one route name on the same path with different converters now fails at registration.
 
 ### What changed
 
@@ -24,9 +24,18 @@ accept. `""`, `"."` and `".."` are refused for every parameter. Under a converte
 `<float:>`, `<bool:>`, `<uuid:>`), the value must also parse as that type, using the same parser
 the router binds the segment with. So `id = 42` and `id = "42"` both still build `/items/42`, and
 `x = NaN` for a `<float:x>` is refused. A plain `{param}` or `<str:>` parameter gets only the first
-rule.
+rule. Only the *converter* is checked, not the handler's annotation: a handler that narrows
+`<int:id>` to `id::UInt8`, or types a converter-less `{id}` as `Int`, can still answer a URL that
+`url` built with a `400`.
 
 The error message names the parameter and the route, never the value.
+
+**One registration now fails at startup.** The same `name` on two routes with the same path but
+different converters — `path("/i/<int:id>", …; name = "i")` for `GET` and
+`path("/i/{id}", …; method = "POST", name = "i")` — used to register, and `url` silently used the
+path alone. It now throws `ArgumentError: Duplicate route name: 'i' is already registered for
+'/i/{id}' with different path converters`, since `url` could not know which rule a value must meet.
+Give both routes the same converter, or give them different names.
 
 ### How to find the calls to migrate
 
@@ -34,6 +43,9 @@ The error message names the parameter and the route, never the value.
 # Every reverse lookup. The ones to look at build a parameter from data that can be empty
 # (an optional field, a blank form value) or is not guaranteed to match the converter.
 rg -n '\burl\(' <app>/src <app>/test
+
+# Route names used more than once -- check each pair uses the same converters.
+rg -o --no-filename 'name\s*=\s*"[^"]+"' <app>/src | sort | uniq -d
 ```
 
 ### Migrate your app
