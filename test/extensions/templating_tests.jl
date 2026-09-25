@@ -315,7 +315,8 @@ Well, 6000.0 dollars, after taxes.
 
     # #328: sniffing replaced an explicit `Content-Type`, so a template served as text/plain --
     # chosen precisely so that unescaped output is safe -- went out as text/html once the output
-    # looked like markup. And `mime_type` plus a per-call header emitted two `Content-Type`s.
+    # looked like markup. And `mime_type` plus a per-call header sent both, which HTTP.jl folds
+    # into one malformed `text/html,text/plain; charset=utf-8`.
     @testset "an explicit Content-Type is never overridden by sniffing (#328)" begin
         content_types(resp) = [v for (k, v) in resp.headers if lowercase(k) == "content-type"]
         plain = ["Content-Type" => "text/plain; charset=utf-8"]
@@ -326,7 +327,11 @@ Well, 6000.0 dollars, after taxes.
                                    Dict("msg" => payload)),
             "mustache(tokens)" => (mustache(mt"<html><body>{{{msg}}}</body></html>"),
                                    Dict("msg" => payload)),
+            "mustache(io)"     => (mustache(IOBuffer("<html><body>{{{msg}}}</body></html>")),
+                                   Dict("msg" => payload)),
             "otera(string)"    => (otera("<html><body>{{ msg }}</body></html>"),
+                                   Dict(:msg => payload)),
+            "otera(io)"        => (otera(IOBuffer("<html><body>{{ msg }}</body></html>")),
                                    Dict(:msg => payload)),
         ]
         for (label, (render, vars)) in renderers

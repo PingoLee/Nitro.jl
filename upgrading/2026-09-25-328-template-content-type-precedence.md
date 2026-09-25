@@ -22,8 +22,9 @@ render(Dict("msg" => "<script>…</script>"); headers = ["Content-Type" => "text
 # after:  Content-Type: text/plain
 ```
 
-A renderer built **with** `mime_type` sent two `Content-Type` headers when the caller also passed
-one: the template's first, then the caller's.
+A renderer built **with** `mime_type` sent a malformed `Content-Type` when the caller also passed
+one: HTTP.jl folds repeated headers, so the value joined both, template first
+(`text/html,text/plain`).
 
 The `Content-Type` is now the first of these that applies, and only one is ever sent:
 
@@ -36,9 +37,11 @@ The `Content-Type` is now the first of these that applies, and only one is ever 
 ### How to find the calls to migrate
 
 ```bash
-# Renderers called with per-call headers. Only calls whose headers carry a Content-Type change.
-rg -n 'headers\s*=' <app>/src | rg -i 'content-type'
+# Every renderer. Only calls whose per-call headers carry a Content-Type change -- follow each
+# renderer to where it is called, since the headers are often built in a variable.
 rg -n '\b(mustache|otera)\(' <app>/src
+# Where a Content-Type is written inline next to the call.
+rg -n -i 'headers\s*=.*content-type' <app>/src
 ```
 
 ### Migrate your app
