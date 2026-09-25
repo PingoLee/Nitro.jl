@@ -353,6 +353,10 @@ different reasons**, and conflating them is how this list rots:
    send `StackOverflowError`/`OutOfMemoryError` straight back to HTTP.jl as the bodyless, unlogged
    500 it exists to replace. Only the interrupt goes past it.
 
+Group 1 also holds `_clear_header_deadline!` and `_bound_swallow!` in `src/core/transport.jl`
+(each wraps a Reseau read-deadline setter, #316/#298) and `_gc_target_bytes` in
+`src/core/lifecycle.jl` (a `ccall`, #299).
+
 `src/middleware/extract_ip.jl` uses the predicate despite belonging to group 1, for consistency
 within a file this change already touched.
 

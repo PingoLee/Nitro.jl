@@ -23,7 +23,8 @@ function _gc_target_bytes()::Nullable{UInt64}
     try
         return ccall(:jl_gc_get_max_memory, UInt64, ())
     catch err
-        Errors.is_unrecoverable(err) && rethrow()
+        # Narrow on purpose (group 1 in `src/errors.jl`): a `ccall` recurses into nothing.
+        err isa InterruptException && rethrow()
         return nothing
     end
 end

@@ -392,8 +392,8 @@ function _bound_swallow!(stream::HTTP.Stream)::Nothing
         # An absolute `time_ns()` deadline — Reseau's contract for `set_read_deadline!`.
         HTTP._set_read_deadline!(getfield(tracked, :conn), Int64(time_ns()) + _SWALLOW_TIMEOUT_NS)
     catch err
-        # Same tolerance as `_clear_header_deadline!`: a connection closing underneath us.
-        Errors.is_unrecoverable(err) && rethrow()
+        # Same tolerance, and the same narrow rethrow, as `_clear_header_deadline!`.
+        err isa InterruptException && rethrow()
     end
     return nothing
 end
@@ -410,11 +410,11 @@ function _swallow_request_body!(stream::HTTP.Stream, budget::Int)
     catch err
         # A client that disconnects while being swallowed is the expected case on this path, not an
         # exceptional one — it is already being refused, and since #298 so is one whose 5-second
-        # swallow deadline fires. Never let either mask the 413 or 503. An interrupt, a stack
-        # overflow or an out-of-memory is not that (#254, `is_unrecoverable`): the janitor
-        # discipline in src/middleware/janitor.jl (#190) makes rethrowing them a house rule, and this
-        # runs on a request task where a Ctrl-C must still land.
-        Errors.is_unrecoverable(err) && rethrow()
+        # swallow deadline fires. Never let either mask the 413 or 503. An interrupt is not that:
+        # the janitor discipline in src/middleware/janitor.jl (#190) makes rethrowing it a house
+        # rule, and this runs on a request task where a Ctrl-C must still land. Deliberately not
+        # `is_unrecoverable`: `readbytes!` is scan-based (group 1 in `src/errors.jl`).
+        err isa InterruptException && rethrow()
     end
     return nothing
 end
@@ -784,8 +784,9 @@ function _clear_header_deadline!(stream::HTTP.Stream)::Nothing
         # Reseau then refuses the deadline change. That is harmless — the request is being cut
         # anyway — so it must not become an error of its own; HTTP's `_clear_deadlines!` ignores
         # the same failure. Structural breakage (a renamed method, a changed signature) cannot
-        # hide here: the canary above fails first.
-        Errors.is_unrecoverable(err) && rethrow()
+        # hide here: the canary above fails first. Narrow, not `is_unrecoverable`: a deadline
+        # setter recurses into nothing (group 1 in `src/errors.jl`).
+        err isa InterruptException && rethrow()
     end
     return nothing
 end
