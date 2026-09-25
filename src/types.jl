@@ -357,15 +357,19 @@ serve(context = store)   # the store the extractor reads from
 
 The session id comes from the cookie named `"session"` (decrypted when a cookie `secret_key` is
 configured); give the parameter a `Session("sid", T)` default to read another cookie name. The
-id is looked up in the **app context**: an [`AbstractSessionStore`](@ref) is read through its
-interface, and any other `get`-able value (a `Dict`) is indexed directly. An expired
-`SessionPayload` counts as absent.
+id is looked up in the **app context**, which must be an
+[`AbstractSessionStore`](@ref)`{String}` such as `MemoryStore{String, User}`; it is read through
+`get_session`, so an expired entry counts as absent.
 
-`payload` is `nothing` when there is no cookie, no context, no entry, or the entry has expired.
+`payload` is `nothing` when there is no cookie, no context, no entry, the entry has expired, the
+stored value is not a `T`, or the store throws an ordinary exception.
+
+**Any other context is not read**, and Nitro logs one warning naming its type. A plain `Dict` used
+to be indexed directly by the cookie's value, which let a client select any entry of a context
+that was really the app's configuration (#327).
 
 This is the store-on-the-context shape. Behind `SessionMiddleware`, read the session with
-`getsession` instead. Without `SessionMiddleware` nothing prunes the store: for an
-`AbstractSessionStore`, add a `SessionPruner`; a plain `Dict` context is yours to prune.
+`getsession` instead. Without `SessionMiddleware` nothing prunes the store: add a `SessionPruner`.
 """
 struct Session{T} <: Extractor{T}
     name::String
@@ -1001,15 +1005,31 @@ end
 # guard it serves, so the reason travels with it.
 const MAX_QUERY_KEY_REPORT = 64
 
+# The raw (still percent-encoded) query of a request-target: everything after the first `?`, up
+# to a `#` -- RFC 3986's delimiting, which is what `HTTP.URI(target).query` returned, but without
+# parsing the authority. An absolute-form target with a malformed authority
+# (`GET http://h:abc/items?a=1`) is ROUTED -- HTTP.jl's router never parses the authority -- yet
+# `HTTP.URI` throws on it, so every route that read its query answered a 500 with a logged
+# backtrace (#326).
+function _target_query(target::AbstractString) :: String
+    i = findfirst(c -> c === '?' || c === '#', target)
+    (i === nothing || target[i] === '#') && return ""
+    rest = SubString(target, nextind(target, i))
+    j = findfirst(==('#'), rest)
+    return j === nothing ? String(rest) : String(SubString(rest, 1, prevind(rest, j)))
+end
+
 # Same guard, same reason: `HTTP.queryparams` decodes internally and throws on a malformed
 # escape, so `?q=%ZZ` was a 500 here too (pre-existing -- this accessor's decode was never
 # inside `parseparam_checked` either). Both accessors now owe their caller a well-formed map
 # or a `ValidationError`; neither leaks a raw decode failure into the server-error path.
 # Same `.cause` rule as `pathparams` above (#130): attached, never rendered by default.
 function _queryvars_uncached(req::HTTP.Request)
-    # Deliberately OUTSIDE the guard: a `req.target` this malformed is a framework/router
-    # problem, not client input, and must stay a logged 500 rather than be laundered into a 400.
-    query = HTTP.URI(req.target).query
+    # No URI parse, so nothing here can fail on the shape of the target itself (#326); the
+    # guard below covers what can -- the percent-decoding of the query.
+    query = _target_query(req.target)
+    # Before the parse, and outside the guard: too many fields is a refused request (#327).
+    Util.BodyParsers._check_field_count(query, "The query string")
     vars = try
         HTTP.queryparams(query)
     catch e

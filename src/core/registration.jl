@@ -82,6 +82,38 @@ function merge_pathparam_type_hints(route::String, info::NamedTuple, route_param
     )
 end
 
+# The extractors that bind client input with Nitro's own parsers. `Session` reads a server-side
+# store, `Files` binds `FormFile`s, `Context` is the app's own value, and a third-party extractor
+# (`ProtoBuffer{T}`, whose generated `OneOf` carries a `name::Symbol`) binds with its own decoder --
+# none of them turns a client string into a `Symbol` through Nitro, so none is checked.
+const CLIENT_BOUND_EXTRACTOR = Union{Path, Query, Header, Json, JsonFragment, Form, Body, Cookie, MultipartForm}
+
+"""
+    refuse_client_symbols(route, param)
+
+Throw an `ArgumentError` at registration when binding `param` from the request could build a
+`Symbol` from a client string (#306). Julia never frees an interned `Symbol`, so such a parameter
+would let any client grow the process's memory for good, one request at a time.
+"""
+function refuse_client_symbols(route::String, param::Param)
+    # `Context{T}` is not an `Extractor`; its `T` is the app's own config, never bound from input.
+    param.type <: Context && return nothing
+    T = if param.type <: Extractor
+        param.type <: CLIENT_BOUND_EXTRACTOR || return nothing
+        extracttype(param.type)
+    else
+        param.type
+    end
+    Util.BodyParsers.interns_client_strings(T) || return nothing
+    throw(ArgumentError(
+        "Parameter '$(param.name)' of route $route would build a Symbol from request input, " *
+        "which Julia never frees (#306). Declare an @enum, or a String checked against an allow-list."))
+end
+
+# The field names an extractor's `T` binds, or none for a type that has no definite fields.
+# `fieldnames(Any)` throws, so `Body{Any}`/`Json{Any}` could not even be registered (#327).
+bound_fieldnames(T) = isconcretetype(T) ? fieldnames(T) : ()
+
 function parse_func_params(route::String, func::Function; type_hints::Dict{Symbol, Type}=Dict{Symbol, Type}())
     info = splitdef(func, start=2)
 
@@ -109,18 +141,19 @@ function parse_func_params(route::String, func::Function; type_hints::Dict{Symbo
     body_params = []
 
     for param in info.args
+        refuse_client_symbols(route, param)
         if param.type <: Context
             continue
         elseif param.type <: Extractor
             innner_type = extracttype(param.type)
             if param.type <: Path
-                append!(pathnames, fieldnames(innner_type))
+                append!(pathnames, bound_fieldnames(innner_type))
                 push!(path_params, param)
             elseif param.type <: Query
-                append!(querynames, fieldnames(innner_type))
+                append!(querynames, bound_fieldnames(innner_type))
                 push!(query_params, param)
             elseif param.type <: Header
-                append!(headernames, fieldnames(innner_type))
+                append!(headernames, bound_fieldnames(innner_type))
                 push!(header_params, param)
             elseif param.type <: Session
                 push!(cookienames, param.name)
@@ -129,7 +162,7 @@ function parse_func_params(route::String, func::Function; type_hints::Dict{Symbo
                 push!(cookienames, param.name)
                 push!(cookie_params, param)
             else
-                append!(bodynames, fieldnames(innner_type))
+                append!(bodynames, bound_fieldnames(innner_type))
                 push!(body_params, param)
             end
         elseif param.name in route_params

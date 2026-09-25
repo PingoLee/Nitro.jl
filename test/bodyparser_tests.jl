@@ -52,11 +52,13 @@ end
     end
 
 
-    @testset "json() Request stuct keyword with class_type" begin 
+    @testset "json() Request stuct keyword with class_type" begin
 
+        # #327: `json(req, T)` never binds NaN or Infinity from a REQUEST, so `allownan` is
+        # refused outright. It used to bind `power = NaN`. (The untyped form above and the
+        # Response forms below keep the keyword: they build no typed value from client input.)
         req = Request("GET","/", [],"""{"title": "viscount", "power": NaN}""")
-        myjson = json(req, rank, allownan = true)
-        @test isnan(myjson.power)
+        @test_throws ArgumentError json(req, rank, allownan = true)
 
         req = Request("GET","/", [],"""{"title": "viscount", "power": 9000.1}""")
         myjson = json(req, rank, allownan = false)
@@ -84,11 +86,16 @@ end
     end
 
 
-    @testset "json() Request with class_type" begin 
+    @testset "json() Request with class_type" begin
 
+        # #327: refused, as above (a usage error, so still an ArgumentError); and without the
+        # keyword NaN is not JSON at all -- client input, so a ValidationError (#326).
         req = Request("GET","/", [],"""{"title": "viscount", "power": NaN}""")
-        myjson = json(req, rank, allownan = true)
-        @test isnan(myjson.power)
+        @test_throws ArgumentError json(req, rank, allownan = true)
+        @test_throws ValidationError json(req, rank)
+        # A number too large for a Float64 is not smuggled in as Inf.
+        req = Request("GET","/", [],"""{"title": "viscount", "power": 1e999}""")
+        @test_throws ValidationError json(req, rank)
 
         req = Request("GET","/", [],"""{"title": "viscount", "power": 9000.1}""")
         myjson = json(req, rank)
@@ -115,8 +122,24 @@ end
         # pins missing-required-field -> `ValidationError` -> 400, because `safe_extract`
         # wraps ANY non-`InterruptException` throw. That is why this dependency change
         # altered no HTTP behaviour, only this line's expectation.
+        #
+        # #326 then gave `json(req, T)` the same wrap `safe_extract` has: whatever StructUtils
+        # throws, the REQUEST form now raises a value-free `ValidationError` carrying it as
+        # `.cause` -- a 400 in a handler, where the raw error was a 500 whose log line quoted
+        # the body. The Response form below keeps the raw union: a response is not client input.
         req = Request("GET","/", [],"""{}""")
-        @test_throws Union{TypeError, ArgumentError} json(req, rank)
+        err = try json(req, rank); nothing catch e; e end
+        @test err isa ValidationError
+        @test err.cause isa Union{TypeError, ArgumentError}
+
+        # The message never quotes the body, even when the parse error does -- and it does for
+        # bytes just before the error, which is where the issue's repro put its password.
+        req = Request("GET","/", [],"""{"title": "viscount", "password":"S3CR3T" oops}""")
+        err = try json(req, rank); nothing catch e; e end
+        @test err isa ValidationError
+        @test !occursin("S3CR3T", err.msg)
+        @test !occursin("S3CR3T", sprint(showerror, err))
+        @test occursin("S3CR3T", sprint(showerror, err.cause))   # the cause really carries it
 
         # test extra key
         req = Request("GET","/", [],"""{"title": "viscount", "power": 9000.1, "extra": "hi"}""")
@@ -222,7 +245,7 @@ end
         @test data["b"] == "2"
 
         # Test JSON only
-        req = Request("POST", "/", [], """{"a": 1, "b": 2}""")
+        req = Request("POST", "/", ["Content-Type" => "application/json"], """{"a": 1, "b": 2}""")
         data = payload(req)
         @test data["a"] == 1
         @test data["b"] == 2
@@ -230,9 +253,9 @@ end
         # Test Precedence (JSON > Form > Query)
         # Using HTTP Request directly to combine query and body
         req = Request("POST", "/?a=query_a&b=query_b&c=query_c", ["Content-Type" => "application/json"], """{"a": "json_a"}""")
-        # We need to force `formdata` to parse something for the test by simulating a multipart or x-www-form-urlencoded,
-        # but JSON parser won't parse it if Content-Type isn't json. 
-        # So we'll test Query + JSON first.
+        # One body cannot be both JSON and a form: `payload` reads JSON only under a JSON
+        # Content-Type (#327) and a form only when the body parses as one, so Query + JSON here,
+        # and Query + Form below.
         data = payload(req)
         @test data["a"] == "json_a" # JSON wins
         @test data["b"] == "query_b" # Fallback to Query
@@ -494,17 +517,17 @@ catch e
 end
 """, ["PARSER_UNCLOSED=REJECTED"]),
 
-    # 1c. The typed parser has no catch of its own, so malformed -- too deep included -- is the
-    # parser's `ArgumentError`, not an overflow.
+    # 1c. The typed parser: malformed -- too deep included -- is a `ValidationError` wrapping the
+    # parser's `ArgumentError` (#326; it was the raw `ArgumentError`), not an overflow.
     ("TYPED", raw"""
 req = HTTP.Request("POST", "/j", ["Content-Type" => "application/json"], deep)
 try
     json(req, Vector{Any})
     println("TYPED=PARSED")
 catch e
-    println("TYPED=THREW:", typeof(e))
+    println("TYPED=THREW:", typeof(e), " CAUSE:", typeof(e.cause))
 end
-""", ["TYPED=THREW:ArgumentError"]),
+""", ["TYPED=THREW:ValidationError CAUSE:ArgumentError"]),
 
     # 2. The memoizing accessor handlers actually call.
     ("ACCESSOR", raw"""
@@ -748,7 +771,9 @@ jreq(s) = HTTP.Request("POST", "/j", ["Content-Type" => "application/json"], s)
     @test json(jreq(body(511))) isa AbstractDict
     @test getjson(jreq(body(512))) === nothing
     @test getjson(jreq(body(511))) isa AbstractDict
-    @test_throws ArgumentError json(jreq(body(512)), Dict{String, Any})
+    # A ValidationError since #326, carrying the bound's ArgumentError as its cause.
+    @test_throws ValidationError json(jreq(body(512)), Dict{String, Any})
+    @test (try json(jreq(body(512)), Dict{String, Any}); catch e; e.cause; end) isa ArgumentError
     @test json(jreq(body(511)), Dict{String, Any}) isa Dict{String, Any}
     @test json(HTTP.Response(200; body = body(512))) === nothing
     @test json(HTTP.Response(200; body = body(511))) isa AbstractDict
@@ -899,4 +924,81 @@ using Nitro
 
 @test isempty(multipart(HTTP.Request("POST", "/m",
     ["Content-Type" => "multipart/form-data; boundary=xyz"], "garbage")))
+end
+
+@testitem "json(req, T) in a handler: a bad body is a 400, not a logged 500 (#326)" tags=[:core, :security] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+using Nitro: App
+
+struct Login326
+    user::String
+    password::String
+end
+app = App(mod = @__MODULE__)
+urlpatterns(app, "", path("/login", req -> (json(req, Login326); "ok"); method = "POST"))
+send(body) = internalrequest(app,
+    HTTP.Request("POST", "/login", ["Content-Type" => "application/json"], body))
+
+logger = Test.TestLogger(min_level = Base.CoreLogging.Debug)
+r = Base.CoreLogging.with_logger(logger) do
+    send("""{"user":"u","password":"S3CR3T" oops}""")
+end
+@test r.status == 400
+@test !any(l -> l.level >= Base.CoreLogging.Error, logger.logs)
+@test !any(l -> occursin("S3CR3T", string(l.message, l.kwargs)), logger.logs)
+@test send("""{"user":"u"}""").status == 400                       # wrong shape
+@test send("""{"user":"u","password":"p"}""").status == 200
+end
+
+@testitem "Body parsers -- the body is read in place and never emptied (#327)" tags=[:core] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+
+# Every reader used to start from its own copy of the body, and `text` made a second:
+# `payload(req)` -- or CSRF reading the form and then the JSON -- made ~4 transient copies of a
+# 64 MiB body. They now read a view in place. The danger that creates is `String(::Vector)`,
+# which takes over the vector and leaves it EMPTY: one such call and every later reader of the
+# request would see no body. Both storage shapes are covered -- a `String` body (tests, clients)
+# and a `Vector{UInt8}` body (what the server's stream reader builds).
+body = """{"a":1,"b":"x=y"}"""
+for (shape, make) in (("String", () -> HTTP.Request("POST", "/", ["Content-Type" => "application/json"], body)),
+                      ("Vector", () -> HTTP.Request("POST", "/", ["Content-Type" => "application/json"], Vector{UInt8}(body))))
+    @testset "$shape body" begin
+        req = make()
+        n = length(req.body.data)
+        @test text(req) == body
+        @test text(req) == body
+        @test json(req)["a"] == 1
+        @test getjson(req)["b"] == "x=y"
+        @test formdata(req) isa Dict
+        bytes = binary(req)
+        bytes[1] = UInt8('X')                     # the caller owns what `binary` returns
+        @test length(req.body.data) == n
+        @test text(req) == body
+        @test payload(req)["a"] == 1
+    end
+end
+
+@testset "a Response body is not emptied either" begin
+    res = HTTP.Response(200, Vector{UInt8}("hello=world"))
+    @test text(res) == "hello=world"
+    @test text(res) == "hello=world"
+    @test formdata(res) == Dict("hello" => "world")
+    @test binary(res) == Vector{UInt8}("hello=world")
+    @test text(res) == "hello=world"
+end
+
+@testset "text() makes one copy of a byte body, not two" begin
+    big = Vector{UInt8}(repeat("a", 1 << 20))
+    req = HTTP.Request("POST", "/", [], big)
+    text(req)                                    # compile
+    @test (@allocated text(req)) < 1.5 * (1 << 20)
+    # A String body needs no copy at all.
+    sreq = HTTP.Request("POST", "/", [], repeat("a", 1 << 20))
+    text(sreq)
+    @test (@allocated text(sreq)) < 1024
+end
 end

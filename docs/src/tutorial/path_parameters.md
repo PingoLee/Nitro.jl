@@ -36,7 +36,9 @@ That means `/user/42` reaches `get_user` with `id == 42` and `typeof(id) == Int`
 
 The available converters are:
 - `<int:name>` (e.g., `123`)
-- `<float:name>` (e.g., `3.14`)
+- `<float:name>` (e.g., `3.14`) — finite only: `NaN`, `inf` and an overflowing `1e999` are a `400`,
+  here and for every other float a request binds, because `NaN > limit` and `NaN <= limit` are
+  both `false`
 - `<str:name>` (e.g., `"hello"`)
 - `<bool:name>` (e.g., `true`)
 - `<uuid:name>` (e.g., `550e8400-e29b-41d4-a716-446655440000`)
@@ -180,6 +182,17 @@ function get_list(req, list::Vector{Int})
     return length(list)
 end
 ```
+
+An `@enum` binds by its integer value or by its name: `/fruit/2` and `/fruit/orange` both bind
+`orange`, and anything else is a `400`. The name is compared against the enum's own members, never
+turned into a `Symbol` — Julia never frees an interned `Symbol`, so building one from each request
+would let any client grow the process's memory for good.
+
+For the same reason a parameter declared `::Symbol` is refused when the route is declared:
+`urlpatterns` throws an `ArgumentError` naming it. The rule covers every place a request value is
+read into, so `Nullable{Symbol}`, `Body{Symbol}`, and a `Symbol` field (or `Vector{Symbol}`,
+`Dict{Symbol,…}`) of a `Query`/`Form`/`Json` struct are refused too. Use an `@enum` for a closed
+set of names, or a `String` checked against an allow-list.
 
 A `Union{...}` annotation binds to the **first member type that parses**; if no member accepts the
 value, the request is a `400`.

@@ -10,7 +10,8 @@ a chain by hand needs the `.middleware` field. The type is not exported, so cons
 **A middleware that throws** is handled the same way as a handler that throws, as long as
 `catch_errors=true` (the default for both `serve()` and `internalrequest()`). The exception is
 logged with its backtrace and the client receives `{"message": "500: Internal Server Error"}`.
-A `ValidationError` is answered with a `400` instead and recorded at `@debug` only. The access
+A `ValidationError` is answered with a `400` instead, and an `UnsupportedMediaTypeError` with a
+`415`; both are recorded at `@debug` only. The access
 log records the status either way. An `InterruptException` is not converted; it propagates.
 
 There is one difference: a handler's `500` still passes back out through every middleware, but a

@@ -17,6 +17,9 @@ using Base.ScopedValues: ScopedValue, @with
 import ..has_revise_hooks, ..revise_hooks
 
 include("errors.jl");       @reexport using .Errors
+# `Constants` depends on nothing but HTTP, and loads this early so the body parsers (`Util`) and
+# the request accessors (`Types`) can read `REQUEST_MAX_FIELDS` (#327).
+include("constants.jl");    @reexport using .Constants
 # `Res` loads BEFORE `util.jl`: `Util`'s error formatter builds responses with `Res.json`,
 # and `Res` itself depends on nothing in Nitro (HTTP, MIMEs, JSON only).
 include("response.jl");     @reexport using .Res
@@ -27,7 +30,6 @@ include("crypto.jl");       @reexport using .Crypto
 include("types.jl");        @reexport using .Types
 using .Types: snapshot, DeclaredMethodHandler
 include("cookies.jl");      @reexport using .Cookies
-include("constants.jl");    @reexport using .Constants
 include("environment.jl");  @reexport using .Environment
 include("context.jl");      @reexport using .AppContext
 

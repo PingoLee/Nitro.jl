@@ -26,7 +26,7 @@ import ..appM  # your app's model module
 export get_product
 
 function get_product(req::HTTP.Request)
-    payload = getjson(req)  # Dict{String, Any} or nothing
+    payload = getjson(req)  # Dict{String, Any}, or nothing (no JSON Content-Type, empty, malformed)
     if !(payload isa AbstractDict)
         return Res.json(Dict("error" => "Invalid JSON payload"), status=400)
     end
@@ -52,6 +52,14 @@ constructs the struct with the JSON payload. A field the body leaves out takes i
 default, so `{"name": "lamp"}` binds `category = ""` and `limit = 20`. A field with no default is
 required, and a body without it is a `400`, unless its type admits `nothing`
 (`Union{String, Nothing}`), in which case it binds `nothing`. This is ideal when combined with `PormG` filters.
+
+The request must say it carries JSON: `Content-Type: application/json`, or an `application/*+json`
+type. Anything else — `text/plain`, a form type, or no `Content-Type` at all — is a
+`415 Unsupported Media Type`, and `getjson(req)` returns `nothing` for such a body. Those are the
+types a cross-site page can send without a CORS preflight, so reading JSON from them regardless
+would accept a forged request as readily as your own client's. `fetch` with a JSON body, axios and
+most HTTP clients send the header already; hand-built test requests are the usual place it is
+missing.
 
 ```julia
 using Nitro
@@ -131,10 +139,16 @@ end
 ## When Binding Fails
 
 A body Nitro cannot bind is **client input**, not a server fault: it becomes a `400 Bad Request`
-with a fixed body, never a `500` and never a logged backtrace.
+with a fixed body, never a `500` and never a logged backtrace. A body of the wrong media type — JSON
+for a `Json{T}` parameter sent without a JSON `Content-Type`, or a non-multipart request to a
+`MultipartForm{T}` — is a `415 Unsupported Media Type` instead, raised as an
+`UnsupportedMediaTypeError` and treated the same way.
 
 The `ValidationError` behind it names the parameter and its type and **never the submitted value**,
-so it is safe to log. The exception that actually failed — a JSON parse error, say — is kept on
+so it is safe to log. When a validator rejected the value, the message names that validator by
+function and module (`MyApp.validate`, `MyApp.check_limit`), or as "the extractor-local validator
+of parameter `x`" for an anonymous one — never by the file it is defined in, so returning `.msg` to
+a client does not publish the server's directory layout. The exception that actually failed — a JSON parse error, say — is kept on
 `.cause`, and that one *does* quote the payload. Every path Nitro renders it through masks it down
 to the cause's *type*:
 

@@ -175,7 +175,7 @@ Field binding rules:
 | Field type in `T`           | Bound from                                        |
 |-----------------------------|---------------------------------------------------|
 | `String`                    | single text field (matched by field name)         |
-| `Int`, `Float64`, `Bool`, … | single text field, parsed                          |
+| `Int`, `Float64`, `Bool`, … | single text field, parsed (a float must be finite) |
 | `Vector{String}`            | all text fields sent under that name              |
 | `FormFile`                  | single uploaded file                              |
 | `Vector{FormFile}`          | all uploaded files under that name                |
@@ -186,7 +186,7 @@ or a `@kwdef struct` both work. With a `@kwdef struct`, a field's default is use
 field is absent from the body (a `Union{…, Nothing}` field still binds to `nothing` when
 absent, which takes precedence over a default). A missing required field, an unparseable
 value, or a failing `validate(::T)` all raise a `ValidationError`, which Nitro turns into a
-`400` response.
+`400` response. A request that is not `multipart/form-data` at all is a `415` instead.
 
 ## Routes (the "urls")
 
@@ -225,6 +225,9 @@ This blocks the thread and causes client timeouts.
     1024 * 1024)` — or pass `max_body_bytes = nothing` when a reverse proxy already caps bodies
     upstream. Note the whole body is still buffered in memory before staging, so the ceiling you
     choose is also the memory a single upload can claim.
+
+    The number of *parts* is capped separately: more than `serve(max_fields = …)` parts
+    (default 1000) is a `400`. Raise it for a form that uploads more files than that at once.
 
 Instead, follow this **Stage & Work** pattern:
 

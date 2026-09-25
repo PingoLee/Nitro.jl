@@ -15,7 +15,10 @@ using Nitro: Form, Cookie
 import Nitro: validate
 
 include("extensions/protobuf/.messages/test_pb.jl")
-using .test_pb: MyMessage 
+using .test_pb: MyMessage
+
+# `Json{T}`/`JsonFragment{T}` require a JSON Content-Type since #327.
+const JSON_CT = ["Content-Type" => "application/json"]
 
 struct Person
     name::String
@@ -37,6 +40,8 @@ struct Login
     password::String
 end
 validate(l::Login) = length(l.password) >= 12
+# A named extractor-local validator, for the message-identity check (#327).
+reject_all_logins(::Login) = false
 
 @testset "Extactor builder sytnax" begin 
 
@@ -52,7 +57,7 @@ validate(l::Login) = length(l.password) >= 12
 end
 
 @testset "JSON extract" begin 
-    req = HTTP.Request("GET", "/", [], """{"name": "joe", "age": 25}""")
+    req = HTTP.Request("GET", "/", JSON_CT, """{"name": "joe", "age": 25}""")
     param = Param(:person, Json{Person}, missing, false)
     p = extract(param, LazyRequest(request=req)).payload
     @test p.name == "joe"
@@ -60,7 +65,7 @@ end
 end
 
 @testset "kwarg_struct_builder Nested test" begin 
-    req = HTTP.Request("GET", "/", [], """
+    req = HTTP.Request("GET", "/", JSON_CT, """
     {
         "address": "123 main street",
         "owner": {
@@ -84,7 +89,7 @@ end
 end
 
 @testset "Partial JSON extract" begin
-    req = HTTP.Request("GET", "/", [], """{ "person": {"name": "joe", "age": 25} }""")
+    req = HTTP.Request("GET", "/", JSON_CT, """{ "person": {"name": "joe", "age": 25} }""")
     param = Param(:person, JsonFragment{Person}, missing, false)
     p = extract(param, LazyRequest(request=req)).payload
     @test p.name == "joe"
@@ -93,10 +98,10 @@ end
     # The fragment lookup itself is client input: a body missing the key, and a body that
     # is not a JSON object at all, must be ValidationErrors (400) like every sibling
     # extractor -- they used to escape as a KeyError / MethodError and surface as 500s.
-    missing_key = HTTP.Request("GET", "/", [], """{ "other": {"name": "joe", "age": 25} }""")
+    missing_key = HTTP.Request("GET", "/", JSON_CT, """{ "other": {"name": "joe", "age": 25} }""")
     @test_throws Nitro.Core.Errors.ValidationError extract(param, LazyRequest(request=missing_key))
 
-    not_an_object = HTTP.Request("GET", "/", [], "not json at all")
+    not_an_object = HTTP.Request("GET", "/", JSON_CT, "not json at all")
     @test_throws Nitro.Core.Errors.ValidationError extract(param, LazyRequest(request=not_an_object))
 end
 
@@ -271,7 +276,7 @@ end
 
     @suppress_err begin 
         # value is higher than the limit set in the validator
-        r = internalrequest(HTTP.Request("POST", "/json", [], """
+        r = internalrequest(HTTP.Request("POST", "/json", JSON_CT, """
         {
             "name": "joe",
             "age": 24,
@@ -281,7 +286,7 @@ end
         @test r.status == 400
     end
 
-    r = internalrequest(HTTP.Request("POST", "/json", [], """
+    r = internalrequest(HTTP.Request("POST", "/json", JSON_CT, """
     {
         "name": "joe",
         "age": 24,
@@ -293,7 +298,7 @@ end
     @test data["age"] == 24
     @test data["value"] == 4.8
 
-    r = internalrequest(HTTP.Request("POST", "/json/partial", [], """
+    r = internalrequest(HTTP.Request("POST", "/json/partial", JSON_CT, """
     {
         "p1": {
             "name": "joe",
@@ -561,7 +566,7 @@ end
 # `try_validate` branches had the same interpolation, so both are covered here.
 @testset "validation errors never echo the submitted payload (#72)" begin
     extract_err(param, body) = try
-        extract(param, LazyRequest(request = HTTP.Request("POST", "/", [], body)))
+        extract(param, LazyRequest(request = HTTP.Request("POST", "/", JSON_CT, body)))
         nothing
     catch e
         e
@@ -585,14 +590,26 @@ end
         @test occursin("Login", err.msg)
     end
 
-    # ...and the validator that rejected it, however it identifies itself: a named
-    # global `validate` method by name, an anonymous extractor-local one by source
-    # location. Neither identification carries a submitted value. The source-location
-    # assertion deliberately pins "the message identifies which validator rejected" —
-    # an anonymous function has no other identity, so hardening `impl` later must
-    # supply a replacement rather than simply dropping it.
+    # ...and the validator that rejected it, however it identifies itself: the global
+    # `validate` method by its module, a named extractor-local one by `Module.name`, an
+    # anonymous one by the parameter it guards. Neither identification carries a
+    # submitted value.
+    #
+    # This used to pin the SOURCE LOCATION (`occursin("extractor_tests.jl", err2.msg)`),
+    # with a note that hardening it "must supply a replacement rather than simply dropping
+    # it". #327 is that hardening -- `.msg` reaches clients, and `Base.which` rendered the
+    # validator's absolute path -- and the parameter-based identity below is the replacement.
     @test occursin("validate", err1.msg)
-    @test occursin("extractor_tests.jl", err2.msg)
+    @test occursin("extractor-local validator of parameter 'credentials'", err2.msg)
+    for err in (err1, err2)
+        @test !occursin(".jl", err.msg)
+        @test !occursin('/', err.msg) && !occursin('\\', err.msg)
+    end
+    # A NAMED extractor-local validator is reported by its module-qualified name.
+    err3 = extract_err(Param(:credentials, Json{Login}, Json{Login}(reject_all_logins), true),
+                       """{"username":"u-c4-sentinel","password":"pw-c4-long-enough"}""")
+    @test occursin("reject_all_logins", err3.msg)
+    @test !occursin(".jl", err3.msg)
 
     # The other branch: `safe_extract` wraps a deserialization failure and attaches the
     # underlying exception as `.cause`. Its `.msg` is value-free too, which is what makes
@@ -671,9 +688,10 @@ end
 end
 
 @testset "MultipartForm - non-multipart body throws" begin
+    # A 415 since #327, like a JSON extractor given the wrong type; it was a 400.
     req = HTTP.Request("POST", "/", ["Content-Type" => "application/json"], """{}""")
     param = Param(:payload, MultipartForm{ImportUpload}, missing, false)
-    @test_throws Nitro.Core.Errors.ValidationError extract(param, LazyRequest(request=req))
+    @test_throws Nitro.Core.Errors.UnsupportedMediaTypeError extract(param, LazyRequest(request=req))
 end
 
 @testset "MultipartForm - empty multipart body reports the missing field, not Content-Type" begin
@@ -938,7 +956,8 @@ Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
     path("/mixed", (req, m::Json{Mixed}) -> Res.json(m.payload); method = "POST"),
     path("/plain", (req, p::Json{Plain}) -> Res.json(p.payload); method = "POST"),
 ])
-post(t, body) = Nitro.Core.internalrequest(ctx, HTTP.Request("POST", t, [], body))
+post(t, body) = Nitro.Core.internalrequest(ctx,
+    HTTP.Request("POST", t, ["Content-Type" => "application/json"], body))
 bound(r) = JSON.parse(Nitro.text(r))
 
 @testset "a partial body binds, absent fields take their defaults" begin
@@ -1039,7 +1058,9 @@ using HTTP
 using Nitro
 using Nitro: LazyRequest, Param, Session, extract
 
-struct ThrowingStore
+# A real `AbstractSessionStore` since #327: the extractor reads no other kind of context, so a
+# store that is not one would never be called and these assertions would pass vacuously.
+struct ThrowingStore <: Nitro.Types.AbstractSessionStore{String, Dict{String,Any}}
     ex::Exception
 end
 Base.get(s::ThrowingStore, ::String, ::Any) = throw(s.ex)
@@ -1072,5 +1093,138 @@ end
         @test result.payload === nothing
         @test result.name == "session"
     end
+end
+end
+
+@testitem "Extractors declared with an abstract T bind (#327)" tags=[:core] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+using Nitro: App, Json, Body, Cookie, Session
+
+# `try_validate` dispatched `instance::T` on the value's RUNTIME type, and `extract` returned
+# `X(value)` -- an `X{typeof(value)}` -- so a parameter declared with an abstract `T` matched no
+# method, or could not be converted to its declared type. Either way a 500 with a backtrace for
+# a perfectly good request (#327, the #293 family).
+struct Person
+    name::String
+end
+
+store = MemoryStore{String, Person}()
+Nitro.Types.set_session!(store, "sid", Person("Ann"); ttl = 60)
+
+app = App(mod = @__MODULE__)
+urlpatterns(app, "",
+    path("/body", (req, b::Body{Any}) -> string(typeof(b.payload)); method = "POST"),
+    path("/json", (req, j::Json{Any}) -> string(j.payload["a"]); method = "POST"),
+    path("/cookie", (req, c::Cookie{Any}) -> string(c.value)),
+    path("/session", (req, s::Session{Any}) -> s.payload.name),
+)
+send(r) = internalrequest(app, r; context = store)
+
+r = send(HTTP.Request("POST", "/body", ["Content-Type" => "text/plain"], "hello"))
+@test r.status == 200
+@test Nitro.text(r) == "String"
+
+r = send(HTTP.Request("POST", "/json", ["Content-Type" => "application/json"], """{"a":1}"""))
+@test r.status == 200
+@test Nitro.text(r) == "1"
+
+r = send(HTTP.Request("GET", "/cookie", ["Cookie" => "c=v"]))
+@test r.status == 200
+@test Nitro.text(r) == "v"
+
+r = send(HTTP.Request("GET", "/session", ["Cookie" => "session=sid"]))
+@test r.status == 200
+@test Nitro.text(r) == "Ann"
+end
+
+@testitem "JSON extractors require a JSON media type (#327)" tags=[:core, :security] setup=[NitroCommon] begin
+using Test
+using HTTP
+using JSON
+using Nitro
+using Nitro: App, Json, JsonFragment, MultipartForm, FormFile
+
+# A JSON body sent as `text/plain`, as a urlencoded form, or with no Content-Type is what a
+# cross-site page can send without a CORS preflight. Binding it regardless accepted a forged
+# request as readily as the app's own client; it is a 415 now, as in Express's `json()` and
+# Spring's `@RequestBody`.
+struct Transfer
+    to::String
+    amount::Int
+end
+struct Upload
+    note::String
+end
+
+app = App(mod = @__MODULE__)
+urlpatterns(app, "",
+    path("/json", (req, t::Json{Transfer}) -> "ok"; method = "POST"),
+    path("/fragment", (req, transfer::JsonFragment{Transfer}) -> "ok"; method = "POST"),
+    path("/upload", (req, u::MultipartForm{Upload}) -> "ok"; method = "POST"),
+)
+body = """{"to":"mallory","amount":1000}"""
+send(t, headers, b = body) = internalrequest(app, HTTP.Request("POST", t, headers, b))
+
+@testset "the wrong or no Content-Type is a 415 with a fixed body" begin
+    for headers in ([], ["Content-Type" => "text/plain"],
+                    ["Content-Type" => "text/plain;charset=UTF-8"],
+                    ["Content-Type" => "application/x-www-form-urlencoded"],
+                    ["Content-Type" => "multipart/form-data; boundary=x"])
+        r = send("/json", headers)
+        @test r.status == 415
+        @test JSON.parse(Nitro.text(r)) == Dict("message" => "415: Unsupported Media Type")
+        r = send("/fragment", headers, """{"transfer":$body}""")
+        @test r.status == 415
+    end
+end
+
+@testset "JSON media types bind, whatever the case or parameters" begin
+    for ct in ("application/json", "APPLICATION/JSON", "application/json; charset=utf-8",
+               "application/vnd.bank.transfer+json")
+        @test send("/json", ["Content-Type" => ct]).status == 200
+        @test send("/fragment", ["Content-Type" => ct], """{"transfer":$body}""").status == 200
+    end
+end
+
+@testset "MultipartForm needs multipart/form-data" begin
+    @test send("/upload", ["Content-Type" => "application/json"], "{}").status == 415
+    @test send("/upload", [], "note=x").status == 415
+end
+
+@testset "a Content-Type that is not valid UTF-8 is a 415 or ignored, never a 500" begin
+    # RFC 9110 allows obs-text bytes in a field value. `lowercase` throws on such a string, and
+    # the media-type check ran outside every guard: a logged 500 from Json{T}, JsonFragment{T},
+    # MultipartForm{T}, getjson, getform and payload alike (#327 review).
+    bad = String(UInt8[0x61, 0x70, 0x70, 0x6c, 0x69, 0x63, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x2f, 0xff, 0x6a, 0x73, 0x6f, 0x6e])   # "application/\xffjson"
+    @test !isvalid(bad)
+    probe = App(mod = @__MODULE__)
+    urlpatterns(probe, "",
+        path("/json", (req, t::Json{Transfer}) -> "ok"; method = "POST"),
+        path("/fragment", (req, transfer::JsonFragment{Transfer}) -> "ok"; method = "POST"),
+        path("/upload", (req, u::MultipartForm{Upload}) -> "ok"; method = "POST"),
+        path("/payload", req -> string(length(payload(req)), ":", isnothing(getjson(req))); method = "POST"),
+    )
+    logger = Test.TestLogger(min_level = Base.CoreLogging.Debug)
+    results = Base.CoreLogging.with_logger(logger) do
+        [internalrequest(probe, HTTP.Request("POST", t, ["Content-Type" => bad], body))
+         for t in ("/json", "/fragment", "/upload", "/payload")]
+    end
+    @test [r.status for r in results[1:3]] == [415, 415, 415]
+    @test results[4].status == 200
+    @test Nitro.text(results[4]) == "0:true"
+    @test !any(l -> l.level >= Base.CoreLogging.Error, logger.logs)
+end
+
+@testset "a 415 is client input: no error log, no backtrace" begin
+    # `Base.CoreLogging`, not `Logging`: Logging is not a test dependency.
+    logger = Test.TestLogger(min_level = Base.CoreLogging.Debug)
+    Base.CoreLogging.with_logger(logger) do
+        send("/json", ["Content-Type" => "text/plain"])
+    end
+    @test !any(r -> r.level >= Base.CoreLogging.Error, logger.logs)
+    # And the debug record never repeats the client's Content-Type.
+    @test !any(r -> occursin("text/plain", string(r.message, r.kwargs)), logger.logs)
 end
 end

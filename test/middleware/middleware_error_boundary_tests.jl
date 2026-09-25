@@ -112,6 +112,13 @@ end
     @test json(r)["message"] == "400: Bad Request"
 end
 
+@testset "an UnsupportedMediaTypeError from middleware is a 415, with no @error (#327)" begin
+    mw = handler -> (req::HTTP.Request -> throw(Nitro.Core.Errors.UnsupportedMediaTypeError("needs JSON")))
+    r = @test_logs min_level = ERROR_LEVEL internalrequest(app, get_("/ok"); middleware = [mw])
+    @test r.status == 415
+    @test json(r)["message"] == "415: Unsupported Media Type"
+end
+
 @testset "a handler exception is logged exactly once, not once per layer" begin
     # The inner serializer catches it and the outer boundary sees a normal response. Exact
     # sequence at Error level: one entry, not two.

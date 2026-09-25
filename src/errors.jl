@@ -3,7 +3,7 @@ module Errors
 
 import JSON
 
-export ValidationError, CookieError, AuthorizationError, StoreInterfaceError
+export ValidationError, CookieError, AuthorizationError, StoreInterfaceError, UnsupportedMediaTypeError
 
 """
     ValidationError(msg::String)
@@ -154,6 +154,31 @@ function Base.showerror(io::IO, e::AuthorizationError)
     print(io, "Authorization Error: $(e.msg)")
 end
 
+"""
+    UnsupportedMediaTypeError(msg::String)
+
+The exception Nitro raises when a request's body has the wrong `Content-Type` for the extractor
+that binds it (#327): a `Json{T}`/`JsonFragment{T}` parameter needs `application/json` or an
+`application/*+json` type, and a `MultipartForm{T}` needs `multipart/form-data`. A missing
+`Content-Type` is the wrong type too. `handle_error` answers it with a fixed
+`415 Unsupported Media Type`, and it is logged at `@debug` only, like a `ValidationError`.
+
+Why a JSON body sent as `text/plain` is refused rather than parsed: `text/plain`,
+`application/x-www-form-urlencoded` and `multipart/form-data` are the CORS "simple" types, so a
+cross-site page can send any of them — or no type at all — without a preflight. An API that
+reads JSON regardless of the type accepts a forged cross-site request exactly as it accepts its
+own client's. Express's `json()` and Spring's `@RequestBody` refuse it the same way.
+
+`msg` names the parameter and the type it needs, never the `Content-Type` the client sent.
+"""
+struct UnsupportedMediaTypeError <: Exception
+    msg::String
+end
+
+function Base.showerror(io::IO, e::UnsupportedMediaTypeError)
+    print(io, "Unsupported Media Type: $(e.msg)")
+end
+
 
 """
     StoreInterfaceError(f::Function, store_type::Type)
@@ -297,7 +322,7 @@ of these sites call (a user's `validate_token`, a user's session store):
 | site | guarded expression |
 |---|---|
 | `src/middleware/auth_middleware.jl` ×2 | the user's `validate_token` (reaches `decode_jwt` → `JSON.parse`) |
-| `src/utilities/bodyparsers.jl` ×5 | `_parse_json_bounded` — plus `HTTP.queryparams`/`HTTP.parse_multipart_form`, which do NOT recurse and ride along so the five parsers in one file cannot drift apart |
+| `src/utilities/bodyparsers.jl` ×6 | `_parse_json_bounded` — plus `HTTP.queryparams`/`HTTP.parse_multipart_form`, which do NOT recurse and ride along so the parsers in one file cannot drift apart; the sixth is `json(req, T)`'s wrap into a `ValidationError` (#326) |
 | `src/utilities/misc.jl` ×3 | `parseparam`'s `_parse_json_bounded(str, T)` fall-through — reached by **any** scalar path/query parameter, since `parse(Int, str)` fails first and lands there |
 | `src/extractors.jl` ×2 | `safe_extract`'s `f()` (the extractor body, i.e. the parsers above) and the app's session store |
 | `src/middleware/csrf_middleware.jl` ×2 | `getform`/`getjson` |

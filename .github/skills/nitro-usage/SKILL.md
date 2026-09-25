@@ -115,7 +115,7 @@ Read the request through these exported **functions** — prefer them over diggi
 |----------|-----------|
 | `getparams(req)` | Path parameters, percent-decoded once; `nothing` before the router runs |
 | `getquery(req)` | Query-string parameters |
-| `getjson(req)` | Parsed JSON body (cached per request) |
+| `getjson(req)` | Parsed JSON body (cached per request); `nothing` unless the request's `Content-Type` is JSON |
 | `getform(req)` | Parsed urlencoded form body (cached) |
 | `getpost(req)` | Text fields of a multipart body (Django `request.POST`, cached) |
 | `getfiles(req)` | File parts of a multipart body (Django `request.FILES`, cached) |
@@ -197,7 +197,17 @@ end
 
 Available extractors: `Path{T}`, `Query{T}`, `Header{T}`, `Json{T}`, `JsonFragment{T}`, `Form{T}`,
 `Body`, `Cookie`, `Session`, `Files{...}`, `MultipartForm{T}`. Full binding rules in
-[`reference.md`](reference.md).
+[`reference.md`](reference.md). Five that bite (#306, #327):
+
+- **JSON needs a JSON `Content-Type`.** `Json{T}`/`JsonFragment{T}` answer **415** to anything
+  else, including no header; `getjson`/`payload` ignore such a body. Send
+  `Content-Type: application/json` from clients *and* from tests.
+- **Never a `Symbol` from input.** `x::Symbol` or a `Symbol` field in a bound struct is refused when
+  the route is declared. Use an `@enum` (binds by integer or name) or a `String` + allow-list.
+- **Floats are finite.** `NaN`/`inf`/`1e999` are a 400 everywhere.
+- **At most `max_fields` (1000) fields per source**, set with `serve(max_fields = …)`.
+- **`Session{T}` reads only a session store** as the app context (`serve(context = MemoryStore{…}())`);
+  a `Dict` or config context binds no session.
 
 **Validation** attaches a predicate by writing the extractor as a *default argument* rather than a
 type annotation:
@@ -208,7 +218,7 @@ path("/api/products", function(req, body = Json{ProductCreate}(p -> p.price > 0)
 end, method="POST")
 ```
 
-A failing predicate raises `ValidationError` and Nitro answers 422 — do not catch it to build your
+A failing predicate raises `ValidationError` and Nitro answers 400 — do not catch it to build your
 own response unless you need a custom body.
 
 > **Mass assignment.** Binding a request body straight to a struct that carries privileged fields

@@ -175,7 +175,9 @@ not a `LifecycleMiddleware` — pass it to `serve(middleware = [...])` or `path(
 function BearerAuth(validate_token::Function; header::String = "Authorization", scheme::String = "Bearer", cookie_name::Nullable{String} = nothing)
 
     full_scheme = scheme * " "
-    scheme_prefix_len = length(full_scheme)
+    # In BYTES: `_extract_token` slices the header by it. A character count sliced mid-character
+    # on a non-ASCII header -- `Bearer éé` -> StringIndexError -> a 500 with a backtrace (#326).
+    scheme_prefix_len = ncodeunits(full_scheme)
 
     return function (handle::Function)
         return function(req::HTTP.Request)
@@ -203,9 +205,12 @@ end
 function _extract_token(req::HTTP.Request, header::String, full_scheme::String, scheme_prefix_len::Int, cookie_name::Nullable{String})
     auth_header = HTTP.header(req, header, missing)
     if !(ismissing(auth_header) || !startswith(auth_header, full_scheme))
-        header_len = length(auth_header)
-        if header_len > scheme_prefix_len
-            token = strip(SubString(auth_header, scheme_prefix_len + 1:header_len))
+        # Byte offsets throughout (#326). `startswith` has matched all of `full_scheme`, which
+        # ends in a space, so `scheme_prefix_len + 1` starts a character; the end is left to `SubString`, which
+        # stops at `lastindex` -- an explicit `ncodeunits` end is mid-character whenever the
+        # header ends in a multibyte one.
+        if ncodeunits(auth_header) > scheme_prefix_len
+            token = strip(SubString(auth_header, scheme_prefix_len + 1))
             if !isempty(token)
                 return String(token)
             end

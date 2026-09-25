@@ -2,7 +2,7 @@ using HTTP
 using JSON
 using Dates
 
-using ..Errors: ValidationError, is_unrecoverable
+using ..Errors: ValidationError, UnsupportedMediaTypeError, is_unrecoverable
 using .BodyParsers: _parse_json_bounded
 
 export recursive_merge, parseparam, parseparam_checked,
@@ -15,7 +15,11 @@ export recursive_merge, parseparam, parseparam_checked,
 
 
 function handle_error(::ValidationError)
-    return Res.json(("message" => "400: Bad Request"), status = 400)    
+    return Res.json(("message" => "400: Bad Request"), status = 400)
+end
+
+function handle_error(::UnsupportedMediaTypeError)
+    return Res.json(("message" => "415: Unsupported Media Type"), status = 415)
 end
 
 function handle_error(::Any)
@@ -62,6 +66,10 @@ function handlerequest(getresponse::Function, catch_errors::Bool; show_errors::B
                 # by tests directly, where the renderer's safety is only transitive; two
                 # independent guarantees cost nothing to keep separate.
                 show_errors && @debug "Request rejected (400 Bad Request)" message=error.msg
+            elseif error isa UnsupportedMediaTypeError
+                # Client input too, so the same treatment: no backtrace. `.msg` names the
+                # parameter and the type it needs, never the Content-Type the client sent (#327).
+                show_errors && @debug "Request rejected (415 Unsupported Media Type)" message=error.msg
             elseif show_errors && !isa(error, InterruptException)
                 @error "ERROR: " exception=(error, catch_backtrace())
             end
@@ -144,13 +152,17 @@ function parseparam(::Type{Regex}, str::String)
 end
 
 
-function parseparam(::Type{Symbol}, str::String)
-    return Symbol(str)
-end
+# There is deliberately no `parseparam(::Type{Symbol}, …)`. It was `Symbol(str)`, which interned
+# every value a client sent, and Julia never frees an interned `Symbol` (#306). A `Symbol`
+# parameter is refused at route registration; one reached any other way falls through to the
+# JSON fallback below, whose read style refuses it too.
 
-
+# An enum binds by its integer value or by its name. The name is matched against the members'
+# own names (`BodyParsers.enum_from_string`), never looked up as `Symbol(str)`: that would intern
+# every string a client sends, and Julia never frees an interned `Symbol` (#306).
 function parseparam(::Type{T}, str::String) where {T <: Enum}
-    return T(parse(Int, str))
+    n = tryparse(Int, str)
+    return isnothing(n) ? BodyParsers.enum_from_string(T, str) : T(n)
 end
 
 """
@@ -201,10 +213,33 @@ function parseparam(::Type{T}, str::String) where {T}
         # fails first and lands here. Unbounded, `JSON.parse` overflowed the stack on ~3 KB of
         # `[[[[…` in a query string (#254). `_parse_json_bounded` rejects anything nested past
         # `MAX_JSON_DEPTH` as malformed before the parser recurses (#314), so that is now an
-        # `ArgumentError` -> `ValidationError` -> 400 like any other bad value.
+        # `ArgumentError` -> `ValidationError` -> 400 like any other bad value. It parses with
+        # Nitro's read style too: `str` is client input, and JSON.jl's default style interns the
+        # strings it lifts into a `Symbol` or an enum field (#306).
         is_unrecoverable(e) && rethrow()
-        return _parse_json_bounded(str, T)
+        return _parse_json_bounded(str, T; style = BodyParsers.NITRO_READ_STYLE)
     end
+end
+
+"""
+Floats are the fallback above plus one rule: the value must be finite (#327).
+
+`parse(Float64, s)` accepts `"NaN"`, `"nan"`, `"inf"` and `"-Infinity"`, and turns `"1e999"`
+into `Inf`. None is a number a client can mean, and `NaN` defeats comparisons silently:
+`NaN > balance` and `NaN <= balance` are both `false`, so a check like "reject if amount >
+balance" lets it through. This one method covers every scalar path: `<float:x>`, typed query
+parameters, `Body{Float64}`, `Cookie{Float64}`, struct fields bound by `Query{T}`/`Form{T}`, and
+each member of a `Union`. The message is value-free, like every other parse failure here.
+"""
+function parseparam(::Type{T}, str::String) where {T <: AbstractFloat}
+    # A union of float types (`Union{Float32, Float64}`) also lands here, because it is
+    # `<: AbstractFloat` and this method is more specific than `parseparam(::Union, …)`. Hand it
+    # back to that method, which tries each member in turn: the fallback's `parse(T, str)` on a
+    # union recurses in Base's `tryparse` until the stack overflows (#327 review).
+    T isa Union && return invoke(parseparam, Tuple{Union, String}, T, str)
+    value = invoke(parseparam, Tuple{Type{T}, String} where {T}, T, str)
+    isfinite(value) || throw(ArgumentError("not a finite number"))
+    return value
 end
 
 """
