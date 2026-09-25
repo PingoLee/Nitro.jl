@@ -351,23 +351,55 @@ The length is counted in bytes, which is what HMAC sees. The 64 hex characters t
 The roles describe what a key is **for**, not where it is in a rotation. A rotation window is
 "the new key signs, the old one verifies". A registry of service identities — each caller signs
 with its own key, and `identity_from=:kid` makes the signer the principal — is "this service's
-key signs, every client's key verifies". That registry is safe only if you trust every client
-with every claim, which is what the next section is about.
+key signs, every client's key verifies". That registry is safe only once you say what each
+client may claim, which is what the next section is about.
 
-#### Every key is trusted for every claim
+#### Scoping what a key may claim
 
-**A keyset is one trust domain.** Any key in it, verify-only keys included, can sign a token
-that verifies, and the validator does not ask which key signed before it believes the claims.
-A partner holding a registry key can sign `{"role": "admin"}` with that key, and
-`role_required("admin")` lets it through. Under the default `identity_from = :claim`, it can
-also sign any `sub` and log in as any user. `identity_from = :kid` pins **who** the principal
-is, not **what it may claim**.
+**By default, every key is trusted for every claim.** Any key in a keyset, verify-only keys
+included, can sign a token that verifies. A partner holding a registry key can sign
+`{"role": "admin"}` with that key, and `role_required("admin")` lets it through. Under the
+default `identity_from = :claim`, it can also sign any `sub` and log in as any user.
+`identity_from = :kid` pins **who** the principal is, not **what it may claim**.
 
-So do one of the following:
+Scope the key with `claims`, once, where the keyset is built:
+
+```julia
+keyset = JWTKeyset(
+    "self" => required_env("JWT_SECRET");
+    verify = ["partner" => required_env("PARTNER_JWT_SECRET")],
+    claims = Dict("partner" => ["sub", "action", "role" => ["reader"]]),
+)
+validator = jwt_validator(keyset)
+```
+
+Each entry of a scope is either a claim name, which allows any value, or `name => values`, which
+allows only the listed values. A pinned value is a string. A claim holding a list, such as a
+`permissions` array, passes its pin only when every element is allowed.
+
+A token verified by the partner's key is **rejected** — `decode_jwt` throws an `AuthError`, and
+`BearerAuth` answers `401` — when it asserts:
+
+  * a claim its scope does not list, such as `"admin": true`;
+  * a pinned claim with a value outside the pin, such as `"role": "admin"`;
+  * a pinned claim holding anything other than a string or a list of strings.
+
+Nothing is silently dropped, so the partner finds out that its tokens are out of policy. The
+check runs in `decode_jwt`, which means `jwt_validator` and any direct `decode_jwt` call holding
+the same keyset both enforce it. `iat`, `exp`, `nbf` and `jti` are always allowed, so key a
+replay cache on `(kid, jti)`, not on `jti` alone. `sub`, `iss` and `aud` must be listed. A
+validator whose `issuer`, `audience` or `required_claims` asks for a claim that a scoped key may
+not assert is an `ArgumentError` at startup, because that key could never authenticate. A scoped
+signing key is held to its own scope too: `encode_jwt` refuses to mint a token outside it.
+
+A key with no scope, such as `"self"` above or the old key in a rotation window, stays trusted
+for every claim. A scope that names a kid the keyset does not hold is an `ArgumentError` at
+startup, so a typo cannot leave the key it meant to restrict wide open.
+
+Two alternatives remain, for when a scope does not fit:
 
   * **One keyset and one validator per trust domain.** Your own identity provider's keys go in
-    one keyset, and each partner registry gets a separate validator on its own routes. This is
-    the default to reach for.
+    one keyset, and each partner registry gets a separate validator on its own routes.
   * **`kid_required` on every claim-guarded route** that a shared keyset can reach, so a claim
     counts only when it was signed by a key you meant to trust with it:
 
@@ -375,8 +407,8 @@ So do one of the following:
     GuardMiddleware(kid_required(["current", "previous"]), role_required("admin"))
     ```
 
-A rotation window, where every key belongs to the same issuer, is one trust domain by
-construction, so none of this applies to it.
+    This is per-route discipline: a new route that forgets it is exposed. A scope is stated
+    once, on the key.
 
 A plain `Dict` of `kid => secret` still works, and is lifted into a `JWTKeyset`:
 

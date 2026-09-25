@@ -205,11 +205,11 @@ end
 
     # Hand-built so the header can lie while the HMAC stays genuinely valid -- the shape
     # `encode_jwt` cannot produce and the shape that used to be accepted.
-    b64(d) = Nitro.Auth._base64url_encode(Vector{UInt8}(codeunits(JSON.json(d))))
+    b64(d) = Nitro.Crypto.base64url_encode(Vector{UInt8}(codeunits(JSON.json(d))))
     claims = Dict("sub" => "17", "exp" => trunc(Int, time()) + 60)
     function mint(alg)
         input = string(b64(Dict("alg" => alg, "typ" => "JWT")), ".", b64(claims))
-        return string(input, ".", Nitro.Auth._base64url_encode(Nitro.Auth._hmac_sha256(jwtkey("jwt-secret"), input)))
+        return string(input, ".", Nitro.Crypto.base64url_encode(Nitro.Auth._hmac_sha256(jwtkey("jwt-secret"), input)))
     end
 
     # Control: identical machinery, honest label -> the request goes through, so a 401

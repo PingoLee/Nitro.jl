@@ -2,12 +2,11 @@ module CSRFMiddleware_
 
 using HTTP
 using SHA
-using Base64
 
 using ...Types: CookieConfig, Nullable
 using ...Cookies: get_cookie, set_cookie!
 import ...Cookies
-using ...Crypto: secure_random_bytes, _empty_hmac_key, SecretString, reveal
+using ...Crypto: secure_random_bytes, _empty_hmac_key, SecretString, reveal, base64url_encode
 using ...Errors: is_unrecoverable
 using ...Res: json
 using ...Core: own_response_headers, getjson, getform
@@ -21,12 +20,6 @@ const SAFE_METHODS = Set(("GET", "HEAD", "OPTIONS", "TRACE"))
 # different origin's CSRF cookie. Signing alone cannot -- a signature proves the server minted
 # the token, not that it minted it for *this* client, which is what the binding below adds.
 const DEFAULT_COOKIE_NAME = "__Host-csrf_token"
-
-function _base64url_encode(data::Vector{UInt8})
-    encoded = Base64.base64encode(data)
-    encoded = replace(encoded, '+' => '-', '/' => '_')
-    return replace(encoded, '=' => "")
-end
 
 # The HMAC covers the random token AND the caller's binding (the session id), so a token minted
 # for one client does not verify for another. `binding` never travels in the cookie -- only its
@@ -43,7 +36,7 @@ function _csrf_signature(secret::String, token::AbstractString, binding::Abstrac
     token_string = String(token)
     message = string(ncodeunits(token_string), ':', token_string, String(binding))
     signature = SHA.hmac_sha256(Vector{UInt8}(codeunits(secret)), Vector{UInt8}(codeunits(message)))
-    return _base64url_encode(signature)
+    return base64url_encode(signature)
 end
 
 # Compare two strings without an early-exit, so attackers can't recover the
@@ -76,7 +69,7 @@ function _check_csrf_secret(secret::AbstractString)
 end
 
 function _generate_raw_token()
-    return _base64url_encode(secure_random_bytes(32))
+    return base64url_encode(secure_random_bytes(32))
 end
 
 function _signed_token(secret::String, raw_token::String, binding::AbstractString)

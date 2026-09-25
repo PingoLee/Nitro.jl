@@ -1,55 +1,7 @@
-function _base64url_encode(data::Vector{UInt8})
-    encoded = Base64.base64encode(data)
-    encoded = replace(encoded, '+' => '-', '/' => '_')
-    return replace(encoded, '=' => "")
-end
-
-# Strict: canonical base64url and nothing else (#321). This used to translate `-_` to `+/`
-# and pad, so the standard alphabet, `=` padding, and -- in the last character -- any of the
-# 4 (or 16) letters differing only in bits the decoder discards all decoded to the same bytes.
-# Every such spelling of a signature verified, so one token had many strings, and anything
-# keyed on the raw token (a denylist, a replay cache) could be walked around. RFC 7515 §2
-# defines the encoding with no padding.
-#
-# Canonical means: the URL-safe alphabet only, no padding, a length that is not 1 mod 4, and
-# zero in the bits of the last character that fall past the final byte -- the low 4 bits when
-# 2 characters are left over, the low 2 when 3 are. That last rule is checked on the value
-# directly rather than by re-encoding and comparing, which did the same job at three times
-# the cost on every segment of every request. The test suite holds it to the re-encoding
-# definition exhaustively over every 2- and 3-character input, so the two cannot drift.
-#
-# Throws ArgumentError, the one type both callers in `_decode_jwt` catch.
-function _base64url_decode(data::AbstractString)
-    units = codeunits(data)
-    count = length(units)
-    remainder = mod(count, 4)
-    remainder == 1 && throw(ArgumentError("not base64url: impossible length"))
-    # Translated to the standard alphabet and padded in one buffer, for `base64decode`.
-    standard = Vector{UInt8}(undef, remainder == 0 ? count : count + 4 - remainder)
-    last_value = 0x00
-    for (index, byte) in enumerate(units)
-        last_value, translated = if UInt8('A') <= byte <= UInt8('Z')
-            byte - UInt8('A'), byte
-        elseif UInt8('a') <= byte <= UInt8('z')
-            byte - UInt8('a') + 0x1a, byte
-        elseif UInt8('0') <= byte <= UInt8('9')
-            byte - UInt8('0') + 0x34, byte
-        elseif byte == UInt8('-')
-            0x3e, UInt8('+')
-        elseif byte == UInt8('_')
-            0x3f, UInt8('/')
-        else
-            throw(ArgumentError("not base64url"))
-        end
-        standard[index] = translated
-    end
-    discarded = remainder == 2 ? 0x0f : remainder == 3 ? 0x03 : 0x00
-    last_value & discarded == 0x00 || throw(ArgumentError("not canonical base64url"))
-    for index in (count + 1):length(standard)
-        standard[index] = UInt8('=')
-    end
-    return Base64.base64decode(standard)
-end
+# JWT segments use `Crypto`'s base64url codec: `base64url_encode`, and the strict
+# `base64url_decode`, which accepts one spelling per byte string (#321). RFC 7515 §2 defines
+# the encoding with no padding. It lives in `Crypto` because sealed cookies need the same
+# decoder and sit below `Auth` in the include chain (#350).
 
 function _json_dict(data)
     if data isa AbstractDict
@@ -168,16 +120,29 @@ function encode_jwt(payload::AbstractDict, secret_or_keyset; expires_in::Union{I
         header["kid"] = signing_kid
     end
 
-    encoded_header = _base64url_encode(Vector{UInt8}(codeunits(JSON.json(header))))
+    encoded_claims = JSON.json(claims)
+    # A scoped signing key mints only what its own keyset would accept (#349), for the #314
+    # reason below. Checked against the claims as `_decode_jwt` will parse them -- a Symbol
+    # value is a JSON string by then -- and paid only when the signing key is scoped. That parse
+    # is depth-bounded like the decoder's, so a payload nested past the bound is an
+    # ArgumentError here, from the parser rather than the scope: decoding would refuse it too.
+    scope = signing_kid === nothing ? nothing : _key_scope(secret_or_keyset, signing_kid)
+    if scope !== nothing
+        _claims_in_scope(scope, _parse_json_bounded(encoded_claims; max_fields = 0, dicttype = Dict{String, Any})) ||
+            throw(ArgumentError("JWT signing key $(repr(signing_kid)) is not permitted to assert every " *
+                                "claim in this payload; see its claims scope on the JWTKeyset"))
+    end
+
+    encoded_header = base64url_encode(Vector{UInt8}(codeunits(JSON.json(header))))
     # Only a keyset's `kid` can grow the header, and a token `_decode_jwt` would refuse is
     # not one to issue (#314). The kid is not echoed: it names a key.
     ncodeunits(encoded_header) <= _JWT_MAX_HEADER_SEGMENT_BYTES || throw(ArgumentError(
         "JWT header would exceed $_JWT_MAX_HEADER_SEGMENT_BYTES bytes encoded; use a shorter kid"))
     signing_input = string(
         encoded_header, ".",
-        _base64url_encode(Vector{UInt8}(codeunits(JSON.json(claims))))
+        base64url_encode(Vector{UInt8}(codeunits(encoded_claims)))
     )
-    signature = _base64url_encode(_hmac_sha256(secret, signing_input))
+    signature = base64url_encode(_hmac_sha256(secret, signing_input))
     return string(signing_input, ".", signature)
 end
 
@@ -226,6 +191,9 @@ function _decode_jwt(token::AbstractString, secret_or_keyset; issuer=nothing, au
     # every assignment to it, so narrowing in place would leave the slot `Any` and keep
     # `with_kid`'s return `Tuple{Any, Any}` on the per-request path through `jwt_validator`.
     kid::Nullable{String} = raw_kid === nothing ? nothing : String(raw_kid)
+    # What the verifying key may assert (#349), or `nothing` when it may assert anything --
+    # which is also the `verify=false` answer, since no key vouched for the token there.
+    scope::Nullable{ClaimScope} = nothing
 
     if verify
         # Nitro signs and verifies with HMAC-SHA256 and nothing else, so the header's `alg`
@@ -257,7 +225,7 @@ function _decode_jwt(token::AbstractString, secret_or_keyset; issuer=nothing, au
         # signature segment that is not decodable base64 -- `Bearer <hdr>.<claims>.x` --
         # reached `base64decode` as an ArgumentError on the authenticated path.
         provided = try
-            _base64url_decode(segments[3])
+            base64url_decode(segments[3])
         catch e
             e isa ArgumentError || rethrow()
             # Deliberately NOT the same message as a signature that decodes but does not
@@ -293,6 +261,7 @@ function _decode_jwt(token::AbstractString, secret_or_keyset; issuer=nothing, au
                 "No key in the JWT keyset verified this token"))
         end
         kid = matched_kid
+        scope = _key_scope(secret_or_keyset, matched_kid)
     end
 
     # The claims set, decoded only now that the signature has verified (or the caller asked
@@ -306,6 +275,12 @@ function _decode_jwt(token::AbstractString, secret_or_keyset; issuer=nothing, au
     # Checking the concrete type is what narrows the slot -- assigned exactly once, so
     # `_decode_jwt` infers `Tuple{Dict{String, Any}, Nullable{String}}`.
     claims isa Dict{String, Any} || throw(AuthError("Invalid JWT claims"))
+
+    # A scoped key asserts only what its scope allows (#349), checked here rather than in
+    # `jwt_validator` so a direct `decode_jwt` caller holding the same keyset gets it too --
+    # the #260 lesson that a guard in one of two entry points is the wrong shape. Before
+    # `validate_claims`: an out-of-policy token is refused whatever its time bounds say.
+    scope === nothing || _check_claim_scope(scope, claims, kid)
 
     validate_claims(claims; exp_timeout=exp_timeout, iat_skew=iat_skew, issuer=issuer, audience=audience, require_exp=require_exp, required_claims=required_claims)
     return (claims, kid)
@@ -322,7 +297,7 @@ function _jwt_segment_json(segment::AbstractString; kwargs...)
     try
         # No field cap (#327): a segment is already size-bounded, and the cap's `ValidationError`
         # is not the `AuthError` this function promises. The depth bound still applies.
-        return _parse_json_bounded(String(_base64url_decode(segment)); max_fields = 0, kwargs...)
+        return _parse_json_bounded(String(base64url_decode(segment)); max_fields = 0, kwargs...)
     catch e
         # Every byte of the segment is attacker-supplied, and BOTH decoders are sinks:
         # `base64decode` throws ArgumentError on a bad alphabet or a length that cannot be

@@ -2,6 +2,7 @@
 
 using Test
 using JSON
+using HTTP
 using Nitro
 using Nitro.Auth: JWTKeyset, encode_jwt, decode_jwt, jwt_validator
 
@@ -9,7 +10,7 @@ caught(f) = try; f(); nothing; catch err; err; end
 message(f) = sprint(showerror, caught(f))
 kids(ks::JWTKeyset) = [kid for (kid, _) in Nitro.Auth._verify_candidates(ks, nothing)]
 header_kid(tok) = get(
-    JSON.parse(String(Nitro.Auth._base64url_decode(split(tok, '.')[1]))), "kid", nothing)
+    JSON.parse(String(Nitro.Crypto.base64url_decode(split(tok, '.')[1]))), "kid", nothing)
 
 @testset "exactly one signing key, by construction" begin
     ks = JWTKeyset("current" => jwtkey("s-cur"); verify = ["previous" => jwtkey("s-prev"), "partner" => jwtkey("s-part")])
@@ -124,9 +125,9 @@ end
     # The forged token an attacker builds when the server's secret is "" -- by hand,
     # because `encode_jwt` now refuses to sign it.
     function forge_with_empty_key(claims)
-        seg(x) = Nitro.Auth._base64url_encode(Vector{UInt8}(codeunits(JSON.json(x))))
+        seg(x) = Nitro.Crypto.base64url_encode(Vector{UInt8}(codeunits(JSON.json(x))))
         input = string(seg(Dict("alg" => "HS256", "typ" => "JWT")), ".", seg(claims))
-        sig = Nitro.Auth._base64url_encode(Nitro.Auth._hmac_sha256("", input))
+        sig = Nitro.Crypto.base64url_encode(Nitro.Auth._hmac_sha256("", input))
         return string(input, ".", sig)
     end
     forged = forge_with_empty_key(Dict("sub" => "admin", "exp" => Nitro.Auth._current_timestamp() + 60))
@@ -285,6 +286,170 @@ end
         @test (label, ci.slottypes[findfirst(==(:claims), ci.slotnames)]) == (label, Dict{String, Any})
         @test (label, v(token).kid) == (label, label == "default" ? nothing : "current")
     end
+end
+
+@testset "a scoped key asserts only what its scope allows (#349)" begin
+    # The issue's shape: a registry partner that may say who it is and what it does, and may
+    # be a reader -- never an admin, and never anyone it likes under identity_from=:claim.
+    registry = JWTKeyset("self" => jwtkey("s-self");
+        verify = ["partner" => jwtkey("s-part"), "rotated" => jwtkey("s-old")],
+        claims = Dict("partner" => ["sub", "action", "role" => ["reader"], :permissions => ("read", "list")]))
+    as_partner(claims) = encode_jwt(claims, JWTKeyset("partner" => jwtkey("s-part")); expires_in = 60)
+    as_self(claims) = encode_jwt(claims, registry; expires_in = 60)
+    # Kid-less: the scope follows the key that VERIFIED the token, not a header label.
+    kidless_partner(claims) = encode_jwt(claims, jwtkey("s-part"); expires_in = 60)
+    rejected(f) = (err = caught(f); err isa Nitro.Auth.AuthError && occursin("not permitted", err.msg))
+
+    validator = jwt_validator(registry)
+    for sign in (as_partner, kidless_partner)
+        # Inside the scope: listed names, a pinned value, a list of pinned values, the
+        # implicit time and id claims (`iat` and `exp` are stamped by encode_jwt).
+        ok = sign(Dict("sub" => "p-1", "action" => "sync", "role" => "reader",
+                       "permissions" => ["read", "list"], "nbf" => 0, "jti" => "t-1"))
+        principal = validator(ok)
+        @test (principal.id, principal.kid, principal["role"]) == ("p-1", "partner", "reader")
+        @test decode_jwt(ok, registry)["action"] == "sync"
+        @test validator(sign(Dict("permissions" => String[]))) isa Nitro.Principal
+
+        for (label, claims) in (
+                ("unlisted role claim", Dict("sub" => "p-1", "admin" => true)),
+                ("pinned role, other value", Dict("sub" => "p-1", "role" => "admin")),
+                ("one disallowed list element", Dict("permissions" => ["read", "delete"])),
+                ("non-string under a pin", Dict("role" => 1)),
+                ("null under a pin", Dict("role" => nothing)),
+                ("object under a pin", Dict("role" => Dict("name" => "reader"))),
+                ("nested list under a pin", Dict("permissions" => [["read"]])),
+                ("unlisted iss", Dict("iss" => "https://idp.example")))
+            token = sign(claims)
+            # BOTH entry points: the check is in `_decode_jwt`, so a direct caller holding the
+            # keyset gets it as well as the auth validator.
+            @test (label, rejected(() -> decode_jwt(token, registry))) == (label, true)
+            @test (label, rejected(() -> validator(token))) == (label, true)
+        end
+    end
+
+    # Under identity_from=:claim, `sub` IS the identity: a key not scoped for it cannot name one.
+    no_sub = JWTKeyset("self" => jwtkey("s-self"); verify = ["partner" => jwtkey("s-part")],
+                       claims = Dict("partner" => ["action"]))
+    @test rejected(() -> jwt_validator(no_sub)(as_partner(Dict("sub" => "admin-user"))))
+    @test jwt_validator(no_sub)(as_partner(Dict("action" => "sync"))).id === nothing
+
+    # Unscoped keys are untouched: the signing key and the rotation key assert anything.
+    @test validator(as_self(Dict("sub" => "u", "role" => "admin")))["role"] == "admin"
+    rotated = encode_jwt(Dict("role" => "admin"), JWTKeyset("rotated" => jwtkey("s-old")); expires_in = 60)
+    @test validator(rotated)["role"] == "admin"
+    # A string secret has no keys, so no scope.
+    @test decode_jwt(encode_jwt(Dict("role" => "admin"), jwtkey("s-part")), jwtkey("s-part"))["role"] == "admin"
+    # verify=false is offline inspection: no key vouched, so nothing is scoped.
+    @test decode_jwt(as_partner(Dict("role" => "admin")), registry; verify = false)["role"] == "admin"
+    # A scope can also sit on the signing key, and on a lifted Dict. Decoding holds the
+    # signing key to it -- here against a token its HMAC key signed through another keyset.
+    self_scoped = JWTKeyset("self" => jwtkey("s-self"); claims = ["self" => ["sub", "role" => "reader"]])
+    minted_elsewhere = encode_jwt(Dict("role" => "admin"), JWTKeyset("self" => jwtkey("s-self")))
+    @test rejected(() -> decode_jwt(minted_elsewhere, self_scoped))
+    # And encoding refuses to mint what its own keyset would reject (#349 review) -- the
+    # #314 rule, a token `_decode_jwt` refuses is not one to issue.
+    err = caught(() -> encode_jwt(Dict("role" => "admin"), self_scoped))
+    @test err isa ArgumentError && occursin("\"self\"", sprint(showerror, err))
+    @test !occursin("admin", sprint(showerror, err))
+    # The check sees the claims as they will decode: a Symbol is a JSON string by then.
+    @test decode_jwt(encode_jwt(Dict("sub" => "u", "role" => :reader), self_scoped), self_scoped)["role"] == "reader"
+    lifted = JWTKeyset(Dict("default" => jwtkey("s-self"), "partner" => jwtkey("s-part"));
+                       claims = Dict(:partner => ["sub"]))
+    @test rejected(() -> decode_jwt(as_partner(Dict("role" => "admin")), lifted))
+
+    # The request path: the partner's forged admin token is a 401 from the auth layer, and
+    # never reaches `role_required` -- nor the handler.
+    reached = Ref(false)
+    handler = BearerAuth(validator)(GuardMiddleware(role_required("admin"))(req -> (reached[] = true; HTTP.Response(200))))
+    bearer(token) = HTTP.Request("GET", "/", ["Authorization" => "Bearer $token"])
+    @test handler(bearer(as_partner(Dict("sub" => "p-1", "role" => "admin")))).status == 401
+    @test !reached[]
+    # A reader token authenticates and is then refused by the guard, as a reader should be.
+    @test handler(bearer(as_partner(Dict("sub" => "p-1", "role" => "reader")))).status == 403
+    @test handler(bearer(as_self(Dict("sub" => "u", "role" => "admin")))).status == 200
+
+    # The rejection does not echo the claim or its value, both of which the token chose.
+    loud = as_partner(Dict("NITRO-CLAIM-NAME-7c1d" => "NITRO-CLAIM-VALUE-2b9e"))
+    text = message(() -> decode_jwt(loud, registry))
+    @test !occursin("NITRO-CLAIM-NAME-7c1d", text) && !occursin("NITRO-CLAIM-VALUE-2b9e", text)
+    @test occursin("\"partner\"", text)
+
+    # Still one concrete tuple shape on the validator's path (nitro-core §7, #265).
+    DT = Tuple{Dict{String, Any}, Nullable{String}}
+    @test (@inferred DT Nitro.Auth._decode_jwt(as_partner(Dict("sub" => "p")), registry)) isa DT
+end
+
+@testset "a claim scope is checked at construction (#349)" begin
+    build(claims) = () -> JWTKeyset("self" => jwtkey("s-self"); verify = ["partner" => jwtkey("s-part")], claims = claims)
+    for (label, claims, needle) in (
+            ("unknown kid", Dict("partnr" => ["sub"]), "not in the keyset"),
+            ("kid twice", ["partner" => ["sub"], :partner => ["action"]], "more than once"),
+            ("integer kid", Dict(1 => ["sub"]), "String or Symbol"),
+            ("claims not a collection", "partner", "kid => claim scope"),
+            ("scope not a list", Dict("partner" => "sub"), "must be a list"),
+            ("entry not a name", Dict("partner" => [42]), "an entry is a claim name"),
+            ("empty name", Dict("partner" => [""]), "empty claim"),
+            ("name twice", Dict("partner" => ["sub", "sub" => ["a"]]), "more than once"),
+            ("always-allowed exp", Dict("partner" => ["exp"]), "always assert"),
+            ("pinned jti", Dict("partner" => ["jti" => ["x"]]), "always assert"),
+            ("empty pin", Dict("partner" => ["role" => String[]]), "no values are pinned"),
+            ("numeric pin", Dict("partner" => ["tier" => [1]]), "must be a String"),
+            ("Bool pin", Dict("partner" => ["admin" => true]), "String or a list"))
+        err = caught(build(claims))
+        @test (label, err isa ArgumentError) == (label, true)
+        @test (label, occursin(needle, sprint(showerror, err))) == (label, true)
+    end
+    # A single pinned value stands alone, and an empty scope allows only the implicit claims.
+    single = build(Dict("partner" => ["role" => "reader"]))()
+    @test Nitro.Auth._key_scope(single, "partner") == Dict("role" => Set(["reader"]))
+    only_implicit = build(Dict("partner" => []))()
+    token = encode_jwt(Dict{String, Any}(), JWTKeyset("partner" => jwtkey("s-part")); expires_in = 60)
+    @test decode_jwt(token, only_implicit) isa Dict{String, Any}
+
+    # A validator that REQUIRES a claim some scoped key may not assert could never admit that
+    # key -- fail closed, but only as 401s. It is a startup error instead (#349 review).
+    scoped = build(Dict("partner" => ["sub"]))()
+    for (label, kwargs, needle) in (
+            ("issuer", (issuer = "https://idp.example",), "iss"),
+            ("audience", (audience = "api",), "aud"),
+            ("required_claims", (required_claims = ["tenant", "sub", "exp"],), "tenant"),
+            ("strict profile", (profile = :strict, issuer = "i", audience = "a"), "iss, aud"))
+        err = caught(() -> jwt_validator(scoped; kwargs...))
+        @test (label, err isa ArgumentError) == (label, true)
+        text = sprint(showerror, err)
+        @test (label, occursin(needle, text) && occursin("\"partner\"", text)) == (label, true)
+    end
+    # A pin that excludes the configured value is the same dead key: `iss = idp` fails the
+    # scope and anything else fails the issuer check.
+    pinned = build(Dict("partner" => ["sub", "iss" => ["other-idp"], "aud" => ["api", "web"]]))()
+    for (label, kwargs, needle) in (("issuer pin", (issuer = "idp",), "iss"),
+                                    ("audience pin", (audience = "admin",), "aud"))
+        err = caught(() -> jwt_validator(pinned; kwargs...))
+        @test (label, err isa ArgumentError && occursin(needle, sprint(showerror, err))) == (label, true)
+    end
+    @test jwt_validator(pinned; issuer = "other-idp", audience = "web") isa Function
+    # A list audience is not one fixed value, so only the listing is checked.
+    @test jwt_validator(pinned; audience = ["admin", "api"]) isa Function
+
+    # Listed claims, the always-allowed ones, and unscoped keys are all fine.
+    @test jwt_validator(scoped; required_claims = ["sub", "exp", "jti"]) isa Function
+    @test jwt_validator(build(Dict("partner" => ["sub", "iss", "aud"]))(); issuer = "i", audience = "a") isa Function
+    @test jwt_validator(build(())(); issuer = "i", required_claims = ["tenant"]) isa Function
+end
+
+@testset "display names scoped claims, never a secret or a pinned value (#349)" begin
+    RAW = "NITRO-RAW-SCOPED-SECRET-5e0a-7f21-44c8"   # past the 32-byte floor
+    ks = JWTKeyset("self" => RAW; verify = ["partner" => RAW * "-partner"],
+                   claims = Dict("partner" => ["sub", "role" => ["NITRO-PINNED-VALUE"]]))
+    for rendered in (sprint(show, ks), repr(ks), JSON.json(ks), sprint(show, ks.keys[2]))
+        @test !occursin(RAW, rendered)
+        @test !occursin("NITRO-PINNED-VALUE", rendered)
+    end
+    @test sprint(show, ks) == "JWTKeyset(sign=\"self\", verify=[\"partner\"], scoped=[\"partner\"])"
+    @test JSON.parse(JSON.json(ks)) ==
+        Dict("sign" => "self", "verify" => ["partner"], "claims" => Dict("partner" => ["role", "sub"]))
+    @test sprint(show, ks.keys[2]) == "JWTKey(\"partner\", :verify, scoped)"
 end
 
 end

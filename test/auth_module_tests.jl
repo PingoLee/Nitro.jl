@@ -183,7 +183,7 @@ end
     # out, which no amount of signature verification can reject.
     function signed(header, claims; key = secret)
         input = string(b64json(header), ".", b64json(claims))
-        return string(input, ".", Nitro.Auth._base64url_encode(Nitro.Auth._hmac_sha256(key, input)))
+        return string(input, ".", Nitro.Crypto.base64url_encode(Nitro.Auth._hmac_sha256(key, input)))
     end
     payload = Dict("sub" => "42", "exp" => NOW_TS + 3600)
 
@@ -336,7 +336,7 @@ end
     # "Invalid JWT encoding" on both paths from a forged token -- the pre-#314 order.
     garbage_claims = string(good_header, ".", raw64("foo"))
     signed_garbage = string(garbage_claims, ".",
-        Nitro.Auth._base64url_encode(Nitro.Auth._hmac_sha256(secret, garbage_claims)))
+        Nitro.Crypto.base64url_encode(Nitro.Auth._hmac_sha256(secret, garbage_claims)))
     for (label, tok, v, want) in (
             ("offline",   string(garbage_claims, ".x"), false, "Invalid JWT encoding"),
             ("signed",    signed_garbage,               true,  "Invalid JWT encoding"),
@@ -347,7 +347,7 @@ end
     end
 
     # The sharpest instance, and the one that is NOT length-independent: a well-formed
-    # header and claims with a one-character signature segment. `_base64url_decode("x")`
+    # header and claims with a one-character signature segment. `base64url_decode("x")`
     # pads to "x===", which `base64decode` refuses -- on the authenticated path. The
     # four-character case is the contrast that makes the point: it decodes fine and reaches
     # the comparison, so it was ALREADY a clean AuthError before this change (a pin), while
@@ -388,12 +388,13 @@ end
 
 @testset "one token, one spelling: base64url is decoded strictly (#321)" begin
     caught(f) = try; f(); nothing; catch err; err; end
-    decode = Nitro.Auth._base64url_decode
+    # `Crypto`'s decoder, which JWT segments and sealed cookies share since #350.
+    decode = Nitro.Crypto.base64url_decode
 
     # The decoder, directly. Canonical input round-trips at every length remainder ...
     for n in 0:40
         bytes = rand(Random.RandomDevice(), UInt8, n)
-        @test decode(Nitro.Auth._base64url_encode(bytes)) == bytes
+        @test decode(Nitro.Crypto.base64url_encode(bytes)) == bytes
     end
     # ... and every other spelling of the same bytes is refused. "QQ" is 0x41; "QR" differs
     # only in the 4 bits the decoder discards, and "QQ==" is the padded form.
@@ -413,7 +414,7 @@ end
         r = mod(ncodeunits(s), 4)
         r == 1 && return false
         lenient = Base64.base64decode(replace(s, '-' => '+', '_' => '/') * "="^(r == 0 ? 0 : 4 - r))
-        return Nitro.Auth._base64url_encode(lenient) == s
+        return Nitro.Crypto.base64url_encode(lenient) == s
     end
     disagreements = String[]
     accepted = 0
@@ -475,10 +476,10 @@ end
 @testset "a critical header extension is refused (#321)" begin
     caught(f) = try; f(); nothing; catch err; err; end
     secret = jwtkey("secret-a")
-    seg(x) = Nitro.Auth._base64url_encode(Vector{UInt8}(codeunits(JSON.json(x))))
+    seg(x) = Nitro.Crypto.base64url_encode(Vector{UInt8}(codeunits(JSON.json(x))))
     function signed(header)
         input = string(seg(header), ".", seg(Dict("sub" => "42", "exp" => NOW_TS + 3600)))
-        return string(input, ".", Nitro.Auth._base64url_encode(Nitro.Auth._hmac_sha256(secret, input)))
+        return string(input, ".", Nitro.Crypto.base64url_encode(Nitro.Auth._hmac_sha256(secret, input)))
     end
 
     # Control: a correctly signed token with no `crit` verifies.
@@ -511,9 +512,9 @@ JWTBoomDict() = throw(OutOfMemoryError())
     # below fails against the pre-#314 decoder -- the deep-input overflow itself is exercised
     # in a subprocess, in test/bodyparser_tests.jl.
     secret = jwtkey("secret-a")
-    raw64(str) = Nitro.Auth._base64url_encode(Vector{UInt8}(codeunits(str)))
+    raw64(str) = Nitro.Crypto.base64url_encode(Vector{UInt8}(codeunits(str)))
     b64json(data) = raw64(JSON.json(data))
-    sign(input; key = secret) = string(input, ".", Nitro.Auth._base64url_encode(Nitro.Auth._hmac_sha256(key, input)))
+    sign(input; key = secret) = string(input, ".", Nitro.Crypto.base64url_encode(Nitro.Auth._hmac_sha256(key, input)))
     payload = Dict("sub" => "42", "exp" => NOW_TS + 3600)
     caught(f) = try; f(); nothing; catch err; err; end
     msg(f) = (err = caught(f); err isa Nitro.Auth.AuthError ? sprint(showerror, err) : err)
@@ -727,7 +728,7 @@ end
 
     # -- Every keyset that can exist signs, and stamps the key it used.
     header_kid(tok) = get(
-        JSON.parse(String(Nitro.Auth._base64url_decode(split(tok, '.')[1]))), "kid", nothing)
+        JSON.parse(String(Nitro.Crypto.base64url_decode(split(tok, '.')[1]))), "kid", nothing)
 
     @test header_kid(Nitro.Auth.encode_jwt(payload, Dict("only" => jwtkey("s1")))) == "only"
     @test header_kid(Nitro.Auth.encode_jwt(payload, Dict("default" => jwtkey("s1"), "other" => jwtkey("s2")))) == "default"

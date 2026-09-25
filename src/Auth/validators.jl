@@ -96,10 +96,12 @@ Safe by default: every token is signature-verified and time-bounded (`exp`, or `
   the header `kid` is an unverified label, so this mode throws an `ArgumentError` at
   construction.
 
-Neither mode limits what a key may *claim*: every key in the keyset is trusted for every
-claim, so a verify-only partner key can sign `{"role": "admin"}` and pass `role_required`.
-Use one validator per trust domain, or add [`kid_required`](@ref) to every claim-guarded
-route — see "Every key is trusted for every claim" on [`JWTKeyset`](@ref).
+Neither mode limits what a key may *claim*. An unscoped key is trusted for every claim, so a
+verify-only partner key can sign `{"role": "admin"}` and pass `role_required`. Scope the key
+with `JWTKeyset(...; claims = ...)`, and a token asserting anything outside its scope is
+rejected before the `Principal` is built — see "Scoping what a key may claim" on
+[`JWTKeyset`](@ref). One validator per trust domain, or [`kid_required`](@ref) on every
+claim-guarded route, remain the alternatives.
 
 # Keysets
 
@@ -227,6 +229,33 @@ function jwt_validator(secret_or_keyset;
                 "and warn_claims; a claim is either enforced or observed, not both"))
         end
     end
+    # A scoped key (#349) that may not assert a claim this validator REQUIRES can never
+    # authenticate: without the claim `validate_claims` rejects the token, with it the scope
+    # does. Fails closed either way, but only as a stream of 401s -- so say so at startup.
+    if keyset isa JWTKeyset
+        must_assert = String[]
+        must_equal = Dict{String, String}()
+        configured_issuer = get(kwargs, :issuer, nothing)
+        if configured_issuer !== nothing
+            push!(must_assert, "iss")
+            configured_issuer isa AbstractString && (must_equal["iss"] = String(configured_issuer))
+        end
+        configured_audience = get(kwargs, :audience, nothing)
+        if configured_audience !== nothing
+            push!(must_assert, "aud")
+            configured_audience isa AbstractString && (must_equal["aud"] = String(configured_audience))
+        end
+        required_names = get(kwargs, :required_claims, nothing)
+        required_names === nothing || append!(must_assert, String(claim) for claim in required_names)
+        unassertable = _unassertable_required(keyset, must_assert, must_equal)
+        isempty(unassertable) || throw(ArgumentError(
+            "jwt_validator: " * join(("the claims scope of kid $(repr(scoped_kid)) omits " * join(omitted, ", ")
+                                      for (scoped_kid, omitted) in unassertable), "; ") *
+            " (or pins it to values excluding the configured one), which this validator requires " *
+            "(issuer= checks iss, audience= checks aud), so no token that key signs could pass. " *
+            "List them in its scope, or give that key its own validator"))
+    end
+
     seen_warned = Set{NTuple{3, Nullable{String}}}()
     seen_lock = ReentrantLock()
 

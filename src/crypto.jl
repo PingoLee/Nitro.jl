@@ -49,20 +49,66 @@ function secure_uuid4()
     return UUIDs.UUID(value)
 end
 
-# Helper for URL-safe Base64
+# ── base64url ───────────────────────────────────────────────────────────────────
+#
+# The ONE codec for every base64url value Nitro mints or reads: JWT segments (`Auth`), sealed
+# cookies (below), CSRF tokens (#350). It lives here rather than in `Auth` because `Auth` is
+# layered above `Core`, and the cookie and CSRF code below it need the same one.
+
+# Unpadded, URL-safe alphabet (RFC 4648 §5; RFC 7515 §2 for JWTs).
 function base64url_encode(data::Vector{UInt8})
     s = base64encode(data)
     s = replace(s, '+' => '-', '/' => '_')
     return replace(s, '=' => "")
 end
 
-function base64url_decode(s::String)
-    s = replace(s, '-' => '+', '_' => '/')
-    padding = length(s) % 4
-    if padding > 0
-        s *= "=" ^ (4 - padding)
+# Strict: canonical base64url and nothing else (#321, #350). The lenient decoder this replaced
+# translated `-_` to `+/` and padded, so the standard alphabet, `=` padding, and -- in the last
+# character -- any of the 4 (or 16) letters differing only in bits the decoder discards all
+# decoded to the same bytes. One token then had many strings, and anything keyed on the raw
+# token (a denylist, a replay cache) could be walked around: a JWT signature in `Auth` until
+# #321, a sealed cookie here until #350. It also padded by `length` (characters) rather than
+# code units, so a non-ASCII input was padded wrongly before it was refused.
+#
+# Canonical means: the URL-safe alphabet only, no padding, a length that is not 1 mod 4, and
+# zero in the bits of the last character that fall past the final byte -- the low 4 bits when
+# 2 characters are left over, the low 2 when 3 are. That last rule is checked on the value
+# directly rather than by re-encoding and comparing, which did the same job at three times
+# the cost on every segment of every request. The test suite holds it to the re-encoding
+# definition exhaustively over every 2- and 3-character input, so the two cannot drift.
+#
+# Throws ArgumentError, the one type its callers catch: `_decode_jwt`'s two sites map it to an
+# `AuthError`, and `decrypt_payload` to a `CookieError`.
+function base64url_decode(data::AbstractString)
+    units = codeunits(data)
+    count = length(units)
+    remainder = mod(count, 4)
+    remainder == 1 && throw(ArgumentError("not base64url: impossible length"))
+    # Translated to the standard alphabet and padded in one buffer, for `base64decode`.
+    standard = Vector{UInt8}(undef, remainder == 0 ? count : count + 4 - remainder)
+    last_value = 0x00
+    for (index, byte) in enumerate(units)
+        last_value, translated = if UInt8('A') <= byte <= UInt8('Z')
+            byte - UInt8('A'), byte
+        elseif UInt8('a') <= byte <= UInt8('z')
+            byte - UInt8('a') + 0x1a, byte
+        elseif UInt8('0') <= byte <= UInt8('9')
+            byte - UInt8('0') + 0x34, byte
+        elseif byte == UInt8('-')
+            0x3e, UInt8('+')
+        elseif byte == UInt8('_')
+            0x3f, UInt8('/')
+        else
+            throw(ArgumentError("not base64url"))
+        end
+        standard[index] = translated
     end
-    return base64decode(s)
+    discarded = remainder == 2 ? 0x0f : remainder == 3 ? 0x03 : 0x00
+    last_value & discarded == 0x00 || throw(ArgumentError("not canonical base64url"))
+    for index in (count + 1):length(standard)
+        standard[index] = UInt8('=')
+    end
+    return base64decode(standard)
 end
 
 # ── Secret handling ─────────────────────────────────────────────────────────────
@@ -397,6 +443,7 @@ function decrypt_payload(secret, token::AbstractString; purpose::AbstractString,
     # Both rescues below turn a failure into a `CookieError`, which `get_cookie` now reads as an
     # absent cookie (#309) -- so a corrupted process must not pass through them: an interrupt or
     # an OOM is not a missing cookie (#254, `is_unrecoverable`).
+    # Canonical spellings only (#350): a sealed token has exactly one string.
     data = try
         base64url_decode(String(token))
     catch e
