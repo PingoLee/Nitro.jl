@@ -1662,6 +1662,8 @@ end
     for (label, respelled) in ("padded" => good * "=",
                                "standard alphabet" => replace(good, '-' => '+', '_' => '/'),
                                "discarded bits" => good[1:end-1] * discarded_bits,
+                               # A pin, not a regression check: the old decoder also failed
+                               # here, by truncating at the `é` and failing GCM.
                                "non-ASCII" => good[1:end-1] * "é")
         @test (label, respelled != good) == (label, true)
         @test_throws Nitro.CookieError Crypto.decrypt_payload(key, respelled; purpose = "c")
