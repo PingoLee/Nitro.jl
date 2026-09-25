@@ -420,6 +420,18 @@ end
         text = sprint(showerror, err)
         @test (label, occursin(needle, text) && occursin("\"partner\"", text)) == (label, true)
     end
+    # A pin that excludes the configured value is the same dead key: `iss = idp` fails the
+    # scope and anything else fails the issuer check.
+    pinned = build(Dict("partner" => ["sub", "iss" => ["other-idp"], "aud" => ["api", "web"]]))()
+    for (label, kwargs, needle) in (("issuer pin", (issuer = "idp",), "iss"),
+                                    ("audience pin", (audience = "admin",), "aud"))
+        err = caught(() -> jwt_validator(pinned; kwargs...))
+        @test (label, err isa ArgumentError && occursin(needle, sprint(showerror, err))) == (label, true)
+    end
+    @test jwt_validator(pinned; issuer = "other-idp", audience = "web") isa Function
+    # A list audience is not one fixed value, so only the listing is checked.
+    @test jwt_validator(pinned; audience = ["admin", "api"]) isa Function
+
     # Listed claims, the always-allowed ones, and unscoped keys are all fine.
     @test jwt_validator(scoped; required_claims = ["sub", "exp", "jti"]) isa Function
     @test jwt_validator(build(Dict("partner" => ["sub", "iss", "aud"]))(); issuer = "i", audience = "a") isa Function

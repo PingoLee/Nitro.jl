@@ -297,12 +297,17 @@ end
 # Claims that a validator REQUIRES but a scoped key may not assert (#349 review): such a key
 # can never produce a token that passes both checks. Construction-time, like the
 # `required_claims`/`warn_claims` overlap, because at request time it is only a stream of 401s.
-function _unassertable_required(keyset::JWTKeyset, required::Vector{String})
+# `expected` holds the one value a claim must have when the validator fixes it -- `issuer`, or
+# a single-string `audience` -- so a pin that excludes that value counts as unassertable too.
+function _unassertable_required(keyset::JWTKeyset, required::Vector{String},
+                                expected::Dict{String, String} = Dict{String, String}())
     missing_by_kid = Pair{String, Vector{String}}[]
+    unassertable(scope, name) = !haskey(scope, name) ||
+        (scope[name] !== nothing && haskey(expected, name) && !(expected[name] in scope[name]))
     for key in keyset.keys
         key.scope === nothing && continue
         missing_names = String[name for name in required
-                               if !(name in _JWT_ALWAYS_ALLOWED_CLAIMS) && !haskey(key.scope, name)]
+                               if !(name in _JWT_ALWAYS_ALLOWED_CLAIMS) && unassertable(key.scope, name)]
         isempty(missing_names) || push!(missing_by_kid, key.kid => missing_names)
     end
     return missing_by_kid

@@ -123,7 +123,9 @@ function encode_jwt(payload::AbstractDict, secret_or_keyset; expires_in::Union{I
     encoded_claims = JSON.json(claims)
     # A scoped signing key mints only what its own keyset would accept (#349), for the #314
     # reason below. Checked against the claims as `_decode_jwt` will parse them -- a Symbol
-    # value is a JSON string by then -- and paid only when the signing key is scoped.
+    # value is a JSON string by then -- and paid only when the signing key is scoped. That parse
+    # is depth-bounded like the decoder's, so a payload nested past the bound is an
+    # ArgumentError here, from the parser rather than the scope: decoding would refuse it too.
     scope = signing_kid === nothing ? nothing : _key_scope(secret_or_keyset, signing_kid)
     if scope !== nothing
         _claims_in_scope(scope, _parse_json_bounded(encoded_claims; max_fields = 0, dicttype = Dict{String, Any})) ||
