@@ -173,6 +173,7 @@ function serve(ctx::App;
     max_body_bytes=missing,
     max_fields=DEFAULT_MAX_FIELDS,
     max_concurrent_requests=nothing,
+    max_upgraded_connections=nothing,
     kwargs...)::Union{Server, Nothing}
 
     # FIRST, before any validation or context mutation, so a rejected call leaves the context
@@ -257,6 +258,22 @@ function serve(ctx::App;
     end
     request_limit = max_concurrent_requests === nothing ? zero(Int64) : Int64(max_concurrent_requests)
 
+    # The WebSocket budget (#376), validated by the same rules for the same reasons: a socket
+    # takes one of these at the upgrade and gives its `max_concurrent_requests` slot back, which
+    # happens in Nitro's own `stream_handler` and WebSocket branch, so a custom `handler` cannot
+    # have it either.
+    if max_upgraded_connections !== nothing
+        (max_upgraded_connections isa Integer && !(max_upgraded_connections isa Bool) &&
+         1 <= max_upgraded_connections <= typemax(Int64)) ||
+            throw(ArgumentError("`max_upgraded_connections` must be an integer >= 1, or `nothing` " *
+                                "for no limit, got $(repr(max_upgraded_connections))"))
+        handler === stream_handler || throw(ArgumentError(
+            "`max_upgraded_connections` cannot be applied to a custom `handler`: the budget is " *
+            "enforced by Nitro's own `stream_handler`. Drop `handler`, or bound WebSockets " *
+            "inside it."))
+    end
+    upgraded_limit = max_upgraded_connections === nothing ? zero(Int64) : Int64(max_upgraded_connections)
+
     # Same reasoning as the checks above (#316): HTTP.jl only sees these at `listen!`, which runs
     # after the App has been mutated, so a typo'd timeout would otherwise fail half-way through.
     _validate_server_timeouts(kwargs)
@@ -334,7 +351,8 @@ function serve(ctx::App;
     configured_middelware = setupmiddleware(ctx; middleware, serialize, catch_errors, show_errors, access_log, access_log_query)
     handle_stream = handler === stream_handler ?
         stream_handler(configured_middelware; max_body_bytes = body_limit,
-                       max_concurrent_requests = request_limit) :
+                       max_concurrent_requests = request_limit,
+                       max_upgraded_connections = upgraded_limit) :
         handler(configured_middelware)
 
     # No warning for running on one thread (#149): single-threaded is a valid deployment, not a

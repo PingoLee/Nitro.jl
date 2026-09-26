@@ -597,19 +597,46 @@ function _log_ws_refusal(stream::HTTP.Stream, attempt::_UpgradeAttempt, status::
     return nothing
 end
 
+# `max_upgraded_connections` is full (#376): answered 503 BEFORE the handshake, so no 101 is sent
+# and the client sees an ordinary refusal it can retry. It is a fresh response (it is written, and
+# HTTP sets fields on what it writes), `Retry-After: 1` for the capacity 503's reason — a slot frees
+# the moment any one socket closes — and `Connection: close`, because a server at its socket budget
+# is better off with the descriptor back than with an idle keep-alive connection.
+#
+# Unlike the capacity 503 it comes from inside the middleware chain — the WebSocket branch is the
+# route's handler — so it does get an access-log line, and a request that auth refuses never takes
+# a slot. Logged like every other refusal: one first-sighting warning, debug detail.
+function _refuse_upgrade_over_capacity(limit::Int64)::HTTP.Response
+    @warn("Refusing WebSocket upgrades over max_upgraded_connections with 503 (detail at debug level)",
+          limit = limit, maxlog = 1)
+    @debug("WebSocket upgrade refused: max_upgraded_connections already open; answered 503",
+           limit = limit)
+    resp = HTTP.Response(503, ["Retry-After" => "1"],
+        "Server is at its limit of $(limit) WebSocket connections; retry shortly")
+    resp.close = true
+    return resp
+end
+
 """
     _upgrade_websocket!(f, req) -> Union{Bool, Nothing, HTTP.Response}
 
-Upgrade `req` to a WebSocket and run `f(ws)` on it, with a proxy-aware Origin check (#374). A
-request that is not an upgrade returns `false`, as the handler always has. A refused handshake
-returns the `HTTP.Response` whose status HTTP already sent, so the access log records it. Errors
-raised by `f` rethrow as before.
+Upgrade `req` to a WebSocket and run `f(ws)` on it, with a proxy-aware Origin check (#374) and,
+under `serve(max_upgraded_connections = n)`, a budget of its own (#376). A request that is not an
+upgrade returns `false`, as the handler always has. A refused handshake returns the
+`HTTP.Response` whose status HTTP already sent, so the access log records it; a full budget
+returns a 503 that is written normally. Errors raised by `f` rethrow as before.
 """
 function _upgrade_websocket!(f::Function, req::HTTP.Request)
-    # FIRST, before the stream is looked up: a plain GET to a WebSocket route — and an in-process
-    # `internalrequest`, which has no stream — must answer exactly as it always has.
+    # FIRST, before the stream is looked up or a slot taken: a plain GET to a WebSocket route — and
+    # an in-process `internalrequest`, which has no stream — must answer exactly as it always has.
     HTTP.WebSockets.isupgrade(req) || return false
     stream = req.context[:stream]::HTTP.Stream
+    # Present only under `max_upgraded_connections`. Past this check, `adm !== nothing` means this
+    # socket holds a slot of that budget — assigned once, so the closures below capture it unboxed.
+    adm = get(req.context, _ADMISSION_KEY, nothing)::Nullable{_Admission}
+    if adm !== nothing && !_try_acquire_slot!(adm.upgraded, adm.upgraded_limit)
+        return _refuse_upgrade_over_capacity(adm.upgraded_limit)
+    end
     attempt = _UpgradeAttempt(false, false, false)
     check_origin = function (head::HTTP.Request)
         attempt.secure = _ws_secure(req, stream)
@@ -620,6 +647,11 @@ function _upgrade_websocket!(f::Function, req::HTTP.Request)
     try
         HTTP.WebSockets.upgrade(stream; check_origin = check_origin) do ws
             attempt.entered = true
+            # The 101 is out: switch budgets. From here the socket counts against
+            # `max_upgraded_connections` alone and gives its request slot back for the rest of its
+            # life (#376). Without that budget it keeps the slot, as it always has — a socket
+            # released from both caps would be bounded by neither.
+            adm === nothing || _release_request_slot!(adm)
             f(ws)
         end
     catch err
@@ -631,6 +663,9 @@ function _upgrade_websocket!(f::Function, req::HTTP.Request)
         # Never written — HTTP already sent it, and `stream_handler` writes nothing once the
         # response has started — but every middleware on the way out now sees the real status.
         return HTTP.Response(status)
+    finally
+        # Every way out of `upgrade` — refused, the handler returned or threw, the peer vanished.
+        adm === nothing || Threads.atomic_sub!(adm.upgraded, one(Int64))
     end
     return nothing
 end
@@ -667,6 +702,32 @@ function _try_acquire_slot!(in_flight::Threads.Atomic{Int64}, limit::Int64)::Boo
     end
     return false
 end
+
+# One request's standing against the two caps (#298, #376). Allocated only when a cap is
+# configured, so an uncapped server's request path is exactly what it was.
+#
+# `held` is whether this request still holds a `max_concurrent_requests` slot. It is released from
+# up to three places — the early SSE release, a WebSocket's switch to its own budget, and the
+# outer `finally` — and `_release_request_slot!` makes that exactly-once by construction rather
+# than by the order they happen to run in. Nitro's own path runs all three on one task; the CAS is
+# what keeps a middleware that runs the handler on another task and gives up on it (a timeout
+# pattern) from releasing twice and letting the cap drift upward.
+mutable struct _Admission
+    @atomic held         :: Bool
+    const in_flight      :: Threads.Atomic{Int64}
+    const upgraded       :: Threads.Atomic{Int64}
+    const upgraded_limit :: Int64   # `max_upgraded_connections`; 0 = WebSockets keep their slot
+end
+
+function _release_request_slot!(adm::_Admission)::Bool
+    (@atomicreplace adm.held true => false).success || return false
+    Threads.atomic_sub!(adm.in_flight, one(Int64))
+    return true
+end
+
+# `req.context` key carrying the `_Admission` to the WebSocket branch — set only when
+# `max_upgraded_connections` is, so its presence is what "this server has a WebSocket budget" means.
+const _ADMISSION_KEY = :__nitro_admission
 
 # A `HEAD` response carries the `Content-Length` the same `GET` would (RFC 9110 §9.3.2) (#146).
 #
@@ -723,23 +784,35 @@ end
 # itself while the slot is held rather than leaving it to HTTP's loop after the slot is gone. A
 # streaming response with no declared length gives the slot back as soon as its head is ready (see
 # `_releases_slot_early`): an SSE stream holds one chunk however long it runs, and counting it would
-# let a few hundred idle event streams starve every other request. A WebSocket, and a raw `STREAM`
-# handler, run *inside* the handler and therefore hold their permit for their whole lifetime.
+# let a few hundred idle event streams starve every other request. A raw `STREAM` handler runs
+# *inside* the handler and therefore holds its permit for its whole lifetime: it has no moment at
+# which it turns from a request into a long-lived connection, and many are short (#376).
+#
+# A WebSocket does have that moment — the 101. Under `max_upgraded_connections` (off by default)
+# it takes a slot of that second budget before the handshake, is refused 503 if none is free, and
+# hands its request slot back once the 101 is out, so idle sockets stop starving ordinary requests
+# (Kestrel's `MaxConcurrentUpgradedConnections` split). Without that budget it keeps its request
+# slot for its lifetime, as before: released from both, it would be bounded by neither.
 #
 # What the permit does NOT bound is time. With `read_timeout` unset (the default, #316), a client
 # that sends a head and then trickles its body holds a slot as long as it likes, and without
 # `write_timeout` so does one that stops reading its response. Behind a buffering proxy neither
 # happens; exposed directly, set both alongside the cap — the `serve` docstring says so.
 function stream_handler(middleware::Function; max_body_bytes::Int64 = DEFAULT_MAX_BODY_BYTES,
-                        max_concurrent_requests::Int64 = zero(Int64))
+                        max_concurrent_requests::Int64 = zero(Int64),
+                        max_upgraded_connections::Int64 = zero(Int64))
     in_flight = Threads.Atomic{Int64}(0)
+    upgraded  = Threads.Atomic{Int64}(0)
+    capped = max_concurrent_requests > 0 || max_upgraded_connections > 0
     return function(stream::HTTP.Stream)
-        # Released exactly once: early for a streaming body, otherwise by the outer `finally`.
-        held = false
+        # The request slot is released exactly once — early for a streaming body, at a WebSocket's
+        # switch to its own budget, or by the outer `finally` — through `_release_request_slot!`.
+        # Allocated BEFORE the slot is taken, so nothing stands between the acquire and the `try`.
+        adm = capped ? _Admission(false, in_flight, upgraded, max_upgraded_connections) : nothing
         if max_concurrent_requests > 0
             _try_acquire_slot!(in_flight, max_concurrent_requests) ||
                 return _reject_over_capacity!(stream, max_concurrent_requests)
-            held = true
+            @atomic adm.held = true
         end
         try
             ip = _peer_ip(stream)
@@ -751,6 +824,8 @@ function stream_handler(middleware::Function; max_body_bytes::Int64 = DEFAULT_MA
             req isa _BodyRejected && return _reject_oversized_body!(stream, max_body_bytes, req.drain)
             req.context[:ip] = ip
             req.context[:stream] = stream
+            # Only the WebSocket branch reads it, and only a WebSocket budget gives it work (#376).
+            max_upgraded_connections > 0 && (req.context[_ADMISSION_KEY] = adm)
 
             result = middleware(req)
             produced = result isa HTTP.Response ? result : nothing
@@ -794,10 +869,7 @@ function stream_handler(middleware::Function; max_body_bytes::Int64 = DEFAULT_MA
                         # A streaming body with no declared length hands its permit back here,
                         # before a write that can last as long as the client stays connected
                         # (#298; see `_releases_slot_early` and above `stream_handler`).
-                        if held && _releases_slot_early(resp)
-                            Threads.atomic_sub!(in_flight, one(Int64))
-                            held = false
-                        end
+                        adm !== nothing && _releases_slot_early(resp) && _release_request_slot!(adm)
                         _write_response_body!(stream, resp.body)
                     end
                 end
@@ -809,7 +881,7 @@ function stream_handler(middleware::Function; max_body_bytes::Int64 = DEFAULT_MA
                 # no-op, and its errors are classified exactly as before: this runs inside the same
                 # `try` in HTTP's loop that the handler does. Only when a slot is held — without a cap,
                 # HTTP's loop keeps doing this exactly as it always has.
-                held && HTTP.closewrite(stream)
+                adm !== nothing && (@atomic adm.held) && HTTP.closewrite(stream)
             finally
                 # Idempotent, and a no-op for the buffered bodies that are the overwhelming majority.
                 # `_write_response_body!` has usually already done this — releasing as soon as the body
@@ -818,7 +890,7 @@ function stream_handler(middleware::Function; max_body_bytes::Int64 = DEFAULT_MA
             end
             return nothing
         finally
-            held && Threads.atomic_sub!(in_flight, one(Int64))
+            adm === nothing || _release_request_slot!(adm)
         end
     end
 end

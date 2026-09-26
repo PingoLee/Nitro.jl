@@ -825,6 +825,223 @@ end
     end
 end
 
+# ── The WebSocket budget (#376) ─────────────────────────────────────────────────────────────────
+
+@testset "max_upgraded_connections is validated at serve(), before any mutation" begin
+    ctx = Nitro.Core.App()
+    for bad in (0, -1, true, 1.5, "2")
+        err = try
+            _serve(ctx, get_free_port(); max_upgraded_connections = bad)
+            nothing
+        catch e
+            e
+        end
+        @test err isa ArgumentError
+        @test occursin("max_upgraded_connections", sprint(showerror, err))
+        @test !isopen(ctx.service)
+        @test isnothing(ctx.service.external_url[])
+    end
+    err = try
+        _serve(ctx, get_free_port(); max_upgraded_connections = 4,
+               handler = mw -> (stream -> nothing), max_body_bytes = nothing)
+        nothing
+    catch e
+        e
+    end
+    @test err isa ArgumentError
+    @test occursin("custom `handler`", sprint(showerror, err))
+    @test !isopen(ctx.service)
+end
+
+"""
+A context for the WebSocket budget. `/ws/hold` counts itself into `ws_entered` and reads until the
+client goes away; `/ws/quick` returns at once; `/ws/boom` throws after the 101. `/park` holds an
+ordinary request in flight until `release`, and `/ok` answers at once.
+"""
+function _ws_capacity_context(ws_entered::Threads.Atomic{Int}, entered::Threads.Atomic{Bool},
+                              release::Base.Event)
+    ctx = Nitro.Core.App()
+    Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+        path("/ws/hold", function(ws::HTTP.WebSockets.WebSocket)
+            Threads.atomic_add!(ws_entered, 1)
+            try
+                for _ in ws end
+            catch e
+                e isa HTTP.WebSockets.WebSocketError || rethrow()
+            end
+        end; method = "WEBSOCKET"),
+        path("/ws/quick", ws -> nothing; method = "WEBSOCKET"),
+        path("/ws/boom", ws -> error("boom"); method = "WEBSOCKET"),
+        path("/park", function(req)
+            entered[] = true
+            wait(release)
+            return "parked"
+        end; method = "GET"),
+        path("/ok", req -> "ok"; method = "GET"),
+    ])
+    return ctx
+end
+
+_ws_head(target; origin = nothing) =
+    "GET $target HTTP/1.1\r\nHost: $HOST\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" *
+    "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n" *
+    (origin === nothing ? "" : "Origin: $origin\r\n") * "\r\n"
+
+# A raw handshake whose socket stays open — after a 101 that is a live WebSocket the server holds —
+# returned with the status line. `_raw_exchange` would wait for a close that a 101 never sends.
+function _ws_open(port, target; kw...)
+    sock = Sockets.connect(Sockets.localhost, port)
+    write(sock, _ws_head(target; kw...))
+    flush(sock)
+    reader = @async try readline(sock) catch; "" end
+    timedwait(() -> istaskdone(reader), 15.0; pollint = 0.02)
+    return sock, (istaskdone(reader) ? fetch(reader) : "(no reply within 15s)")
+end
+
+function _ws_status(port, target; kw...)
+    sock, line = _ws_open(port, target; kw...)
+    close(sock)
+    return line
+end
+
+_upgraded(line) = startswith(line, "HTTP/1.1 101")
+
+# Slots are handed back in `finally` blocks that run after the client has its answer, so "the slot
+# came back" is always polled. Returns the held socket, or `nothing` if no upgrade was accepted.
+function _hold_ws(port; timeout = 20.0)
+    held = Ref{Any}(nothing)
+    timedwait(timeout; pollint = 0.05) do
+        sock, line = _ws_open(port, "/ws/hold")
+        _upgraded(line) && (held[] = sock; return true)
+        close(sock)
+        return false
+    end
+    return held[]
+end
+
+_eventually(f; timeout = 20.0) = timedwait(f, timeout; pollint = 0.05) === :ok
+
+@testset "under max_upgraded_connections an open WebSocket no longer holds a request slot" begin
+    ws_entered, entered, release = Threads.Atomic{Int}(0), Threads.Atomic{Bool}(false), Base.Event()
+    ctx = _ws_capacity_context(ws_entered, entered, release)
+    port = get_free_port()
+    _serve(ctx, port; max_concurrent_requests = 1, max_upgraded_connections = 2)
+    sock = nothing
+    try
+        sock, line = _ws_open(port, "/ws/hold")
+        @test _upgraded(line)
+        @test _eventually(() -> ws_entered[] >= 1)
+        # THE STARVATION #376 is about: with the cap at 1, this was a 503 for as long as the
+        # socket stayed open.
+        @test startswith(_get(port, "/ok"), "HTTP/1.1 200")
+    finally
+        isnothing(sock) || close(sock)
+        notify(release)
+        Nitro.Core.terminate(ctx)
+    end
+end
+
+@testset "without max_upgraded_connections a WebSocket keeps its request slot" begin
+    # The budget is opt-in. A socket released from the request cap with no budget of its own would
+    # be bounded by neither.
+    ws_entered, entered, release = Threads.Atomic{Int}(0), Threads.Atomic{Bool}(false), Base.Event()
+    ctx = _ws_capacity_context(ws_entered, entered, release)
+    port = get_free_port()
+    _serve(ctx, port; max_concurrent_requests = 1)
+    sock = nothing
+    try
+        sock, line = _ws_open(port, "/ws/hold")
+        @test _upgraded(line)
+        @test _eventually(() -> ws_entered[] >= 1)
+        @test startswith(_get(port, "/ok"), "HTTP/1.1 503")
+    finally
+        isnothing(sock) || close(sock)
+        notify(release)
+        Nitro.Core.terminate(ctx)
+    end
+end
+
+@testset "over max_upgraded_connections: 503 before the handshake, and the slot comes back once" begin
+    ws_entered, entered, release = Threads.Atomic{Int}(0), Threads.Atomic{Bool}(false), Base.Event()
+    ctx = _ws_capacity_context(ws_entered, entered, release)
+    port = get_free_port()
+    _serve(ctx, port; max_upgraded_connections = 1)
+    held = nothing
+    try
+        held, line = _ws_open(port, "/ws/hold")
+        @test _upgraded(line)
+        refused = _raw_exchange(port, [_ws_head("/ws/hold")]; limit = 5.0)
+        @test startswith(refused, "HTTP/1.1 503")
+        @test occursin(r"\r\nRetry-After: 1\r\n"i, refused)
+        @test !occursin("101", first(split(refused, "\r\n")))
+        # Ordinary requests are not part of that budget.
+        @test startswith(_get(port, "/ok"), "HTTP/1.1 200")
+
+        # Released when the socket closes...
+        close(held)
+        held = _hold_ws(port)
+        @test held !== nothing
+        # ...exactly once: with one held again, the next is refused. A double release would have
+        # pushed the count below zero and admitted it.
+        @test startswith(_raw_exchange(port, [_ws_head("/ws/quick")]; limit = 5.0), "HTTP/1.1 503")
+    finally
+        isnothing(held) || close(held)
+        notify(release)
+        Nitro.Core.terminate(ctx)
+    end
+end
+
+@testset "a refused handshake and a handler that throws both give the WebSocket slot back" begin
+    ws_entered, entered, release = Threads.Atomic{Int}(0), Threads.Atomic{Bool}(false), Base.Event()
+    ctx = _ws_capacity_context(ws_entered, entered, release)
+    port = get_free_port()
+    _serve(ctx, port; max_concurrent_requests = 1, max_upgraded_connections = 1)
+    held = nothing
+    try
+        # Refused by the Origin check after the slot was taken (#374's 403).
+        @test startswith(_ws_status(port, "/ws/quick"; origin = "https://evil.example"), "HTTP/1.1 403")
+        held = _hold_ws(port)
+        @test held !== nothing
+        @test startswith(_raw_exchange(port, [_ws_head("/ws/quick")]; limit = 5.0), "HTTP/1.1 503")
+        close(held)
+        held = nothing
+
+        # The handler throws after the 101.
+        @test _eventually(() -> _upgraded(_ws_status(port, "/ws/boom")))
+        held = _hold_ws(port)
+        @test held !== nothing
+        close(held)
+        held = nothing
+        @test _eventually(() -> startswith(_get(port, "/ok"), "HTTP/1.1 200"))
+    finally
+        isnothing(held) || close(held)
+        notify(release)
+        Nitro.Core.terminate(ctx)
+    end
+end
+
+@testset "a WebSocket hands its request slot back exactly once" begin
+    ws_entered, entered, release = Threads.Atomic{Int}(0), Threads.Atomic{Bool}(false), Base.Event()
+    ctx = _ws_capacity_context(ws_entered, entered, release)
+    port = get_free_port()
+    _serve(ctx, port; max_concurrent_requests = 1, max_upgraded_connections = 1)
+    parked = nothing
+    try
+        # The socket gives its request slot back at the 101, and `stream_handler`'s `finally` then
+        # runs for the same request: that must not give it back a second time.
+        @test _upgraded(_ws_status(port, "/ws/quick"))
+        @test _eventually(() -> startswith(_get(port, "/ok"), "HTTP/1.1 200"))
+        parked = @async _get(port, "/park")
+        @test _eventually(() -> entered[])
+        # With `/park` in the one slot, a double release would have left room for this.
+        @test startswith(_get(port, "/ok"), "HTTP/1.1 503")
+    finally
+        notify(release)
+        isnothing(parked) || timedwait(() -> istaskdone(parked), 20.0)
+        Nitro.Core.terminate(ctx)
+    end
+end
+
 """
 Send one request on a fresh connection and read its response, then send a second request on the
 SAME connection whose body arrives `gap` seconds after its head. Returns the second response.

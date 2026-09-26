@@ -71,7 +71,8 @@ Nitro's own limits are the floor underneath, for a process the proxy is not in f
 |---|---|---|
 | `read_header_timeout` | 120 s | How long a connection may take to send a complete request head, and on HTTP/1.1 how long a keep-alive connection may sit idle. A Slowloris client is answered `408` and dropped |
 | `max_body_bytes` | 64 MiB | How much one request body may hold |
-| `max_concurrent_requests` | off | How many requests are held at once, and so, with `max_body_bytes`, how much body memory. Over it, a request is answered `503` before its body is read. A WebSocket holds one of these slots for as long as it is open; see [Bounding requests in flight](@ref) |
+| `max_concurrent_requests` | off | How many requests are held at once, and so, with `max_body_bytes`, how much body memory. Over it, a request is answered `503` before its body is read. A WebSocket holds one of these slots for as long as it is open, unless `max_upgraded_connections` gives WebSockets their own budget; see [Bounding requests in flight](@ref) |
+| `max_upgraded_connections` | off | How many WebSockets are open at once. A socket counts here instead of against `max_concurrent_requests` once its `101` is sent; over it, an upgrade is answered `503` |
 | `read_timeout` | off | How long the body may take once the head has arrived. Off because a legitimate large upload over a slow link can take minutes; turn it on when the proxy is not buffering bodies for you |
 
 `read_header_timeout` deliberately does not cover the body, so a slow upload is only cut by
