@@ -961,6 +961,32 @@ end
     end
 end
 
+@testset "a handshake that carried a body keeps its request slot" begin
+    # The body was buffered into `req` (up to `max_body_bytes`) and stays reachable from the handler
+    # for the socket's life. Handing the slot back would let every socket in the budget pin one —
+    # body memory the request cap exists to bound. Review finding on #376.
+    ws_entered, entered, release = Threads.Atomic{Int}(0), Threads.Atomic{Bool}(false), Base.Event()
+    ctx = _ws_capacity_context(ws_entered, entered, release)
+    port = get_free_port()
+    _serve(ctx, port; max_concurrent_requests = 1, max_upgraded_connections = 2)
+    sock = nothing
+    try
+        sock = Sockets.connect(Sockets.localhost, port)
+        head = replace(_ws_head("/ws/hold"), r"\r\n\r\n$" => "\r\nContent-Length: 5\r\n\r\n")
+        write(sock, head * "hello")
+        flush(sock)
+        reader = @async try readline(sock) catch; "" end
+        timedwait(() -> istaskdone(reader), 15.0; pollint = 0.02)
+        @test istaskdone(reader) && _upgraded(fetch(reader))
+        @test _eventually(() -> ws_entered[] >= 1)
+        @test startswith(_get(port, "/ok"), "HTTP/1.1 503")
+    finally
+        isnothing(sock) || close(sock)
+        notify(release)
+        Nitro.Core.terminate(ctx)
+    end
+end
+
 @testset "over max_upgraded_connections: 503 before the handshake, and the slot comes back once" begin
     ws_entered, entered, release = Threads.Atomic{Int}(0), Threads.Atomic{Bool}(false), Base.Event()
     ctx = _ws_capacity_context(ws_entered, entered, release)
@@ -973,7 +999,8 @@ end
         refused = _raw_exchange(port, [_ws_head("/ws/hold")]; limit = 5.0)
         @test startswith(refused, "HTTP/1.1 503")
         @test occursin(r"\r\nRetry-After: 1\r\n"i, refused)
-        @test !occursin("101", first(split(refused, "\r\n")))
+        @test occursin(r"\r\nConnection: close\r\n"i, refused)
+        @test !occursin(r"Sec-WebSocket-Accept"i, refused)      # no handshake was completed
         # Ordinary requests are not part of that budget.
         @test startswith(_get(port, "/ok"), "HTTP/1.1 200")
 
@@ -1020,16 +1047,41 @@ end
     end
 end
 
+@testset "_release_request_slot! releases exactly once" begin
+    # The deterministic half of the next testset: whichever release site runs second is a no-op.
+    in_flight = Threads.Atomic{Int64}(1)
+    adm = Nitro.Core._Admission(true, in_flight, Threads.Atomic{Int64}(0), 1)
+    @test Nitro.Core._release_request_slot!(adm)
+    @test !Nitro.Core._release_request_slot!(adm)
+    @test in_flight[] == 0
+    # And a request that never held a slot releases nothing.
+    idle = Nitro.Core._Admission(false, in_flight, Threads.Atomic{Int64}(0), 1)
+    @test !Nitro.Core._release_request_slot!(idle)
+    @test in_flight[] == 0
+end
+
 @testset "a WebSocket hands its request slot back exactly once" begin
     ws_entered, entered, release = Threads.Atomic{Int}(0), Threads.Atomic{Bool}(false), Base.Event()
     ctx = _ws_capacity_context(ws_entered, entered, release)
     port = get_free_port()
-    _serve(ctx, port; max_concurrent_requests = 1, max_upgraded_connections = 1)
+    # Set once `/ws/quick`'s whole chain has returned, which leaves only `stream_handler`'s own
+    # `finally` — the second release site — between it and the assertions below. Without it, a
+    # slow runner could check before that `finally` ran, and pass whether it released twice or not.
+    quick_done = Threads.Atomic{Bool}(false)
+    mark = handle -> req -> begin
+        try
+            handle(req)
+        finally
+            req.target == "/ws/quick" && (quick_done[] = true)
+        end
+    end
+    _serve(ctx, port; max_concurrent_requests = 1, max_upgraded_connections = 1, middleware = [mark])
     parked = nothing
     try
         # The socket gives its request slot back at the 101, and `stream_handler`'s `finally` then
         # runs for the same request: that must not give it back a second time.
         @test _upgraded(_ws_status(port, "/ws/quick"))
+        @test timedwait(() -> quick_done[], 20.0; pollint = 0.02) === :ok
         @test _eventually(() -> startswith(_get(port, "/ok"), "HTTP/1.1 200"))
         parked = @async _get(port, "/park")
         @test _eventually(() -> entered[])

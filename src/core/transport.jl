@@ -658,7 +658,13 @@ function _upgrade_websocket!(f::Function, req::HTTP.Request)
             # `max_upgraded_connections` alone and gives its request slot back for the rest of its
             # life (#376). Without that budget it keeps the slot, as it always has — a socket
             # released from both caps would be bounded by neither.
-            adm === nothing || _release_request_slot!(adm)
+            #
+            # Unless the handshake carried a BODY. Nothing in a handshake reads one, but
+            # `_http_stream_request` has buffered it (up to `max_body_bytes`) into `req`, and `req`
+            # stays reachable from the handler for the socket's whole life. Handing the slot back
+            # then would let `max_upgraded_connections` idle sockets each pin a full body — body
+            # memory the request cap exists to bound. Such a socket keeps both slots.
+            adm === nothing || !(req.body isa HTTP.EmptyBody) || _release_request_slot!(adm)
             f(ws)
         end
     catch err

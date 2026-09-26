@@ -117,8 +117,10 @@ is explicit introspection, not accidental disclosure.)
   the budget full is answered **503** with `Retry-After: 1` and no `101`. Because the WebSocket is
   the route's handler, that refusal comes after the middleware chain: it gets an access-log line,
   and a request auth refuses never takes a slot. The budget also bounds the per-socket reader
-  tasks HTTP.jl starts. A `STREAM` handler is not a WebSocket and keeps its request slot. Throws
-  with a custom `handler`.
+  tasks HTTP.jl starts; it bounds how many sockets are open, not the memory each one holds. A
+  `STREAM` handler is not a WebSocket and keeps its request slot, and so does a handshake that
+  carried a request body, which stays reachable for the socket's life. Throws with a custom
+  `handler`.
 - `reuseaddr`: forwarded to `HTTP.listen!`. Defaults to `true` on Linux/macOS, where it
   allows rebinding a port still in `TIME_WAIT`, and to **`false` on Windows**, where
   `SO_REUSEADDR` instead lets a second process bind a port another is actively listening
