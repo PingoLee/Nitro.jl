@@ -20,8 +20,10 @@ with the rendered content.
 
 The response's `Content-Type` is a `Content-Type` in the per-call `headers` if there is one, else
 `mime_type`, else a type sniffed from the rendered output (see `Nitro.Util.response`). Sniffing
-never overrides a type you set. Rendered output is markup: escape user-influenced data, or serve
-it with a non-markup type.
+never overrides a type you set. Rendered output is markup. `{{ x }}` is HTML-escaped by default
+(OteraEngine's `autoescape = true`). Two things render a value raw: the `safe` filter
+(`{{ x |> safe }}`), and a template built with `config = Dict("autoescape" => false)`. Keep both
+away from user-influenced data, or serve the output with a non-markup type.
 
 To get more info read the docs here: https://github.com/MommaWatasu/OteraEngine.jl
 """

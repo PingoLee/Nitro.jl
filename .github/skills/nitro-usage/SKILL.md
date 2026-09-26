@@ -164,10 +164,12 @@ The bare names `text`, `json` and `binary` are **request-body parsers**, not bui
 
 > **The XSS rule — three sinks.** (1) `Res.html(...)`. (2) `Res.send(...; content_type=...)` naming
 > a markup or script type. (3) A template rendered by `mustache(...)` / `otera(...)`, which builds
-> through a **content-sniffing** helper and does not HTML-escape by default. Everything else — raw
-> `String` returns, a bare `Res.send`, `Res.json` — is served as `text/plain` or `application/json`
-> with no content-sniffing, so an attacker-influenced value can never be reclassified as HTML.
-> Escape before those three, always. Nowhere else needs escaping.
+> through a **content-sniffing** helper. Both engines HTML-escape `{{x}}` by default; the raw forms
+> are the danger: `{{{x}}}`, `{{&x}}`, Otera's `{{ x |> safe }}`, and `autoescape = false`. Everything
+> else — raw `String` returns, a bare `Res.send`, `Res.json` — is served as `text/plain` or
+> `application/json` with no content-sniffing, so an attacker-influenced value can never be
+> reclassified as HTML. Escape before sinks 1 and 2, and never feed user data to a template's raw
+> form. Nowhere else needs escaping.
 
 Returning a raw `Dict` or `String` from a handler works (auto-formatted to JSON / `text/plain`) and
 is **safe**, but prefer a builder so status and content type are explicit rather than inferred.

@@ -54,18 +54,41 @@ end
     @test occursin(r"(?m)^permissions:\n  contents: read$", CI_SRC)
 end
 
-@testset "secrets are job-scoped, never workflow-level" begin
+@testset "secrets are scoped to the one step that deploys" begin
     # A workflow-level `env:` entry reaches every step of every job, PormG's build and test
-    # steps included. Job-level (six-space indent, under `docs`) is the whole point, so
-    # these anchor on indent -- two spaces would mean workflow level.
+    # steps included; a job-level one reaches every step of `docs`, including the instantiate
+    # and doctest steps that resolve and run Documenter's floating dependency tree. Only
+    # `deploydocs`, in `docs/make.jl`, reads either secret -- so they sit on that step (#332).
+    # These anchor on indent: two spaces is workflow level, six is job level.
     @test !occursin(r"(?m)^  GITHUB_TOKEN:", CI_SRC)
     @test !occursin(r"(?m)^  DOCUMENTER_KEY:", CI_SRC)
-    # Present-and-job-scoped, not merely absent from the top. Asserting only the absence
-    # above would stay green if the line were deleted outright -- which would silently
-    # remove Documenter's fallback auth, and the first rotation of DOCUMENTER_KEY would
-    # then reproduce #105: a green docs job that published nothing.
-    @test count(r"(?m)^      DOCUMENTER_KEY:", CI_SRC) == 1
-    @test count(r"(?m)^      GITHUB_TOKEN:", CI_SRC) == 1
+    @test !occursin(r"(?m)^      GITHUB_TOKEN:", CI_SRC)
+    @test !occursin(r"(?m)^      DOCUMENTER_KEY:", CI_SRC)
+    # Present, once, on the deploy step -- not merely absent from the wider scopes. Asserting
+    # only the absences above would stay green if the lines were deleted outright, which
+    # would silently remove Documenter's fallback auth; the first rotation of DOCUMENTER_KEY
+    # would then reproduce #105: a green docs job that published nothing.
+    @test count(r"(?m)^\s+DOCUMENTER_KEY:", CI_SRC) == 1
+    @test count(r"(?m)^\s+GITHUB_TOKEN:", CI_SRC) == 1
+    # The step's own lines are indented eight or more; the next step (`      - `) or job ends it.
+    deploy = match(
+        r"(?m)^      - (?:name: .*\n        )?run: julia --project=docs docs/make\.jl\n((?:        .*(?:\n|$))*)",
+        CI_SRC,
+    )
+    @test deploy !== nothing
+    step = deploy === nothing ? "" : deploy[1]
+    @test occursin(r"(?m)^        env:$", step)
+    @test occursin(r"(?m)^          DOCUMENTER_KEY:\s*\$\{\{\s*secrets\.DOCUMENTER_KEY\s*\}\}", step)
+    @test occursin(r"(?m)^          GITHUB_TOKEN:\s*\$\{\{\s*secrets\.GITHUB_TOKEN\s*\}\}", step)
+end
+
+@testset "the docs job does not leave the job token on disk" begin
+    # Step-scoping the env is moot if checkout's default `persist-credentials: true` writes the
+    # job token (here `contents: write`) into `.git/config`, where the instantiate and doctest
+    # steps can read it. `deploydocs` pushes from its own tempdir clone, so nothing needs it.
+    docs = match(r"(?m)^  docs:\n((?:(?:    .*|)\n)*?)(?=^  [\w-]+:$)", CI_SRC)
+    @test docs !== nothing
+    @test docs !== nothing && occursin(r"persist-credentials:\s*false", docs[1])
 end
 
 # How many jobs materialise the pinned PormG tree. Every assertion below scales off this
@@ -164,9 +187,10 @@ end
     @test count(r"julia-actions/julia-runtest@", CI_SRC) == 1
 
     # The input must be PRESENT -- absent means the action's `true` default. Other keys may
-    # precede it in the `with:` block; the next step (`- uses:`) ends the search.
+    # precede it in the `with:` block; the next step (`- uses:`) ends the search. `[^\n]*`
+    # after the ref admits the trailing `# vX.Y.Z` a SHA pin carries (#332).
     run = match(
-        r"julia-actions/julia-runtest@\S+\n\s+with:\n(?:\s+[\w-]+:.*\n)*?\s+coverage:\s*\$\{\{\s*(.+?)\s*\}\}",
+        r"julia-actions/julia-runtest@\S+[^\n]*\n\s+with:\n(?:\s+[\w-]+:.*\n)*?\s+coverage:\s*\$\{\{\s*(.+?)\s*\}\}",
         CI_SRC,
     )
     @test run !== nothing
@@ -178,11 +202,58 @@ end
     # the uploader finds no `.cov` files, or a second job is back under coverage with no
     # timeout.
     uploads = [strip(m[1]) for m in eachmatch(
-        r"(?:julia-actions/julia-processcoverage|coverallsapp/github-action)@\S+\n\s+if:\s*(.+)",
+        r"(?:julia-actions/julia-processcoverage|coverallsapp/github-action)@\S+[^\n]*\n\s+if:\s*(.+)",
         CI_SRC,
     )]
     @test length(uploads) == 2
     @test all(==(cond), uploads)
+end
+
+end
+
+@testitem "every workflow action is pinned to a commit SHA" tags=[:security, :core] setup=[NitroCommon] begin
+
+# Why this item exists (#332).
+#
+# `uses: owner/repo@v2` names a TAG, and a tag is mutable: whoever controls the action's repo
+# can re-point it, and every workflow resolving it runs the new code on its next trigger --
+# the tj-actions/changed-files compromise (CVE-2025-30066) was exactly that. Nitro's jobs hand
+# those actions a write-scoped token, the Documenter deploy key, and a PAT. The repo already
+# refuses a tag for the PormG `[sources]` pin for this reason (see the first item above), so
+# the same rule applies to actions: a full 40-hex commit, with the release as a comment.
+#
+# Every workflow file is scanned, not just ci.yml. A new workflow that goes back to a tag is
+# the regression this catches, and it is invisible from a green run.
+
+const WORKFLOWS_DIR = joinpath(pkgdir(Nitro), ".github", "workflows")
+const WORKFLOWS = isdir(WORKFLOWS_DIR) ?
+    sort(filter(f -> endswith(f, ".yml") || endswith(f, ".yaml"), readdir(WORKFLOWS_DIR; join = true))) :
+    String[]
+
+# Same normalisation as the items above: BOM, CRLF, and whole-line comments, which in these
+# files name the very refs being asserted on.
+function workflow_src(path)
+    s = replace(read(path, String), '﻿' => "", "\r\n" => "\n")
+    join(filter(l -> !occursin(r"^\s*#", l), split(s, '\n')), '\n')
+end
+
+@testset "every `uses:` names a full commit SHA" begin
+    @test !isempty(WORKFLOWS)
+    refs = [(basename(f), String(m[1])) for f in WORKFLOWS
+            for m in eachmatch(r"(?m)^\s*(?:-\s+)?uses:\s*(\S+)", workflow_src(f))]
+    # A floor, so a parser that silently matches nothing cannot pass vacuously.
+    @test length(refs) >= 10
+    # A local action (`./path`) is pinned by this repository's own history.
+    unpinned = [(file, ref) for (file, ref) in refs
+                if !startswith(ref, "./") && !occursin(r"^[\w.-]+/[\w./-]+@[0-9a-f]{40}$", ref)]
+    @test isempty(unpinned)
+end
+
+@testset "Dependabot keeps the pins current" begin
+    # Without it a SHA never moves, so the pins only age -- security fixes included.
+    path = joinpath(pkgdir(Nitro), ".github", "dependabot.yml")
+    @test isfile(path)
+    @test isfile(path) && occursin(r"package-ecosystem:\s*\"?github-actions\"?", workflow_src(path))
 end
 
 end

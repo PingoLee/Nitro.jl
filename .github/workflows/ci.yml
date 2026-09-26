@@ -104,7 +104,7 @@ jobs:
             os: ubuntu-latest
             threads: 2
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # This job EXECUTES the pinned PormG source. checkout's default
           # `persist-credentials: true` writes an `AUTHORIZATION: basic <token>`
@@ -116,7 +116,7 @@ jobs:
       # No PormG checkout step. `[sources]` pins it by url + rev, so `julia-buildpkg` below
       # fetches that exact commit itself. This job still EXECUTES that code under `Pkg.test()`,
       # which is why it keeps `contents: read` and `persist-credentials: false` above (#21).
-      - uses: julia-actions/setup-julia@v2
+      - uses: julia-actions/setup-julia@4c0cb0fce8556fdb04a90347310e5db8b1f98fb9 # v2.7.0
         with:
           version: ${{ matrix.version }}
       # Logs the runner's CPU model and LLVM target on every job, passing or failing -- the
@@ -124,7 +124,7 @@ jobs:
       # when it fails, because ReTestItems shows an item's output only then.
       - name: Runner CPU (#301)
         run: julia --startup-file=no -e 'using InteractiveUtils; versioninfo()'
-      - uses: julia-actions/cache@v3
+      - uses: julia-actions/cache@a45e8fa8be21c18a06b7177052533149e61e9b38 # v3.1.0
         with:
           include-matrix: 'false'
           # Cache eviction is the ONLY thing julia-actions/cache needs `actions: write`
@@ -132,7 +132,7 @@ jobs:
           # with no write scope at all while it executes third-party code.
           delete-old-caches: 'false'
           cache-name: julia-cache;workflow=${{ github.workflow }};job=${{ github.job }};os=${{ matrix.os }};version=${{ matrix.version }};threads=${{ matrix.threads }}
-      - uses: julia-actions/julia-buildpkg@v1
+      - uses: julia-actions/julia-buildpkg@e3eb439fad4f9aba7da2667e7510e4a46ebc46e1 # v1.7.0
       # `coverage` MUST be passed, and gated exactly like the two upload steps below. The
       # action defaults it to `true`, so a bare step runs ALL eight jobs under
       # `--code-coverage` -- and a covering run has `test/runtests.jl` pick `nworkers = 0`,
@@ -141,12 +141,12 @@ jobs:
       # coverage, not who runs under it. `ci_workflow_tests.jl` asserts the three
       # conditions stay identical; the coverage-vs-worker trade-off is explained in
       # `test/runtests.jl`, above `covering`.
-      - uses: julia-actions/julia-runtest@v1
+      - uses: julia-actions/julia-runtest@6e050c8013b833b1195105ff2fce9cd802f53271 # v1.12.0
         with:
           coverage: ${{ matrix.os == 'ubuntu-latest' && matrix.threads == '1' && matrix.version == '1.12' }}
-      - uses: julia-actions/julia-processcoverage@v1
+      - uses: julia-actions/julia-processcoverage@03114f09f119417c3242a9fb6e0b722676aedf38 # v1.2.2
         if: matrix.os == 'ubuntu-latest' && matrix.threads == '1' && matrix.version == '1.12'
-      - uses: coverallsapp/github-action@v2
+      - uses: coverallsapp/github-action@8d6379e14d29928660c4ba802d8e85393440b329 # v2.3.8
         if: matrix.os == 'ubuntu-latest' && matrix.threads == '1' && matrix.version == '1.12'
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -184,30 +184,31 @@ jobs:
         version:
           - '~1.13.0-0'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false   # same reason as the `test` job
       # No PormG checkout step, same as the `test` job: `[sources]` pins it by url + rev and
       # `julia-buildpkg` fetches it. This job does not run PormG's code -- the smoke test
       # touches nothing test-only -- but the project still has to resolve.
-      - uses: julia-actions/setup-julia@v2
+      - uses: julia-actions/setup-julia@4c0cb0fce8556fdb04a90347310e5db8b1f98fb9 # v2.7.0
         with:
           version: ${{ matrix.version }}
-      - uses: julia-actions/cache@v3
+      - uses: julia-actions/cache@a45e8fa8be21c18a06b7177052533149e61e9b38 # v3.1.0
         with:
           include-matrix: 'false'
           delete-old-caches: 'false'   # same reason as the `test` job above
           cache-name: julia-cache;workflow=${{ github.workflow }};job=${{ github.job }};version=${{ matrix.version }}
-      - uses: julia-actions/julia-buildpkg@v1
+      - uses: julia-actions/julia-buildpkg@e3eb439fad4f9aba7da2667e7510e4a46ebc46e1 # v1.7.0
       - name: Load, route and serve without ReTestItems
         run: julia --project=. .github/scripts/smoke_test.jl
   docs:
     name: Documentation
     runs-on: ubuntu-latest
-    # The only job that WRITES anything, and the only one holding a job-wide secret. It
-    # fetches no PormG, so the third-party code #21 is about never runs here -- which is
-    # why the write scope and both secrets are parked in this job rather than at workflow
-    # level.
+    # The only job that WRITES anything, and the only one holding the deploy secrets (`test`
+    # hands a read-only GITHUB_TOKEN to one coveralls step -- see below). It fetches no PormG,
+    # so the third-party code #21 is about never runs here -- which is why the write scope and
+    # both secrets are parked in this job rather than at workflow level. Inside the job they
+    # are narrower still: both secrets live on the ONE step that deploys (#332).
     #
     # That property is now a FACT ABOUT PKG rather than a structural impossibility, and the
     # difference is worth knowing. Under the old path dep it was fail-closed: a job that
@@ -233,8 +234,10 @@ jobs:
     #     input, scoped to that one step, and now carrying only `contents: read`.
     #   * this job is not third-party-code-free -- `docs/Manifest.toml` is gitignored, so
     #     the `Pkg.instantiate()` below resolves Documenter and its whole transitive tree
-    #     from the General registry at floating versions and then runs it, while holding
-    #     DOCUMENTER_KEY. That is the residual supply-chain exposure after #21. It was
+    #     from the General registry at floating versions and then runs it. Since #332 the
+    #     instantiate and doctest steps run it WITHOUT either secret; the deploy step still
+    #     runs that same floating tree while holding DOCUMENTER_KEY, because `deploydocs`
+    #     is Documenter code. That is the residual supply-chain exposure after #21. It was
     #     never pinned before either, and closing it is a separate decision.
     #
     # `actions: write` is cache eviction, which `test` and `smoke` give up
@@ -249,16 +252,18 @@ jobs:
     # the permission table look tidier -- and note an SSH deploy key is not governed by
     # `permissions:` at all, so dropping them would not reduce the deploy surface anyway.
     #
-    # `GITHUB_TOKEN` is job-scoped for the same reason the deploy key is: Documenter reads
-    # it from the environment, and no job executing foreign code should have it.
+    # Both secrets are STEP-scoped, on the `docs/make.jl` step, not job `env` (#332): only
+    # `deploydocs` reads them, and a job-level `env` handed them to every step -- the
+    # instantiate and doctest steps included, which run the floating Documenter tree.
     permissions:
       contents: write
       actions: write
     # Serializes docs deploys so a release cut stops racing itself (#124). `deploydocs` pushes to
-    # the single `gh-pages` ref, does not force-push, and does not retry. A cut pushes `main` and
-    # then the `vX.Y.Z` tag at the SAME commit, and `on.push` above matches both -- so two runs
-    # fire, each with a full `docs` job, and whichever arrives second is rejected non-fast-forward,
-    # reddening the release CI for a reason that has nothing to do with the release.
+    # the single `gh-pages` ref, does not force-push, and does not retry. A cut merges its release
+    # PR into `main` and then pushes the `vX.Y.Z` tag at that SAME commit, and `on.push` above
+    # matches both -- so two runs fire, each with a full `docs` job, and whichever arrives second
+    # is rejected non-fast-forward, reddening the release CI for a reason that has nothing to do
+    # with the release.
     #
     # The two are NOT redundant, so gating to one trigger is the wrong fix: the `main` run
     # publishes `dev/`, the tag run publishes `vX.Y.Z/` and repoints `stable/`. The tag run is the
@@ -295,15 +300,18 @@ jobs:
       group: docs-deploy-${{ github.event_name != 'pull_request' && 'shared' || github.run_id }}
       cancel-in-progress: false
       queue: max
-    env:
-      DOCUMENTER_KEY: ${{ secrets.DOCUMENTER_KEY }}
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: julia-actions/setup-julia@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Nothing in this job pushes through the checkout. `deploydocs` clones into its own
+          # `mktempdir()` and authenticates with the key, or on the fallback path with a URL it
+          # builds from GITHUB_TOKEN in its environment. Persisting the job token into
+          # `.git/config` would only hand it to the instantiate and doctest steps below (#332).
+          persist-credentials: false
+      - uses: julia-actions/setup-julia@4c0cb0fce8556fdb04a90347310e5db8b1f98fb9 # v2.7.0
         with:
           version: '1.12'
-      - uses: julia-actions/cache@v3
+      - uses: julia-actions/cache@a45e8fa8be21c18a06b7177052533149e61e9b38 # v3.1.0
         with:
           cache-name: julia-cache;workflow=${{ github.workflow }};job=${{ github.job }};version=1.12
       - run: |
@@ -316,15 +324,21 @@ jobs:
             using Documenter: doctest
             using Nitro
             doctest(Nitro)'
-      - run: julia --project=docs docs/make.jl
+      - name: Build and deploy
+        run: julia --project=docs docs/make.jl
+        # The only step holding a secret: `deploydocs` in docs/make.jl is the only reader of
+        # either. Both must stay present -- see the #105 note above the job's `permissions`.
+        env:
+          DOCUMENTER_KEY: ${{ secrets.DOCUMENTER_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   docs-lint:
     name: Docs reference lint
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: julia-actions/setup-julia@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: julia-actions/setup-julia@4c0cb0fce8556fdb04a90347310e5db8b1f98fb9 # v2.7.0
         with:
           version: '1.12'
       # No package build needed — the script uses only stdlib and reads files.

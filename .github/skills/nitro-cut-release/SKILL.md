@@ -48,8 +48,9 @@ gh issue list --label pre-publish      # informational only -- a lead-time warni
 1. **Working tree clean, on `main`, synced with `origin`.** Stop otherwise.
 2. **At least one entry is uncut.** If no file under `upgrading/` carries
    `- **Version**: Unreleased`, **stop** — there is nothing to cut. An empty train is not a release.
-3. **The suite is green on CI** for the commit you are about to tag — not just locally. CI covers
-   Julia 1.12 on three OSes at 1 and 2 threads.
+3. **The suite is green on CI** for `main`'s current tip — not just locally. CI covers Julia 1.12
+   on three OSes at 1 and 2 threads. (The commit you finally tag is the release PR's merge commit,
+   which does not exist yet; step 6 checks its own run.)
 4. **Every entry carries its grep and its `before → after`.** Add missing ones now.
 5. **`docs_lint` passes:** `julia .github/scripts/docs_lint.jl`.
 
@@ -167,34 +168,52 @@ not the check — before the count was asserted, this step could pass while bein
 PormG repo cut an 11-entry wave of which `upgrade_guide` returned 3, with every step green. Fix any
 mismatch before committing.
 
-### 5. Commit, then get approval to push
+### 5. Commit on a release branch, open the PR, then get approval to tag
+
+`main` accepts changes **only through a pull request**: a repository ruleset blocks direct pushes,
+force-pushes and deletion, with no bypass actors, so it applies to the maintainer's credentials too
+([#332](https://github.com/PingoLee/Nitro.jl/issues/332);
+[`agent-security.md`](../../../docs/design/agent-security.md)). A `git push origin main` is
+rejected. The cut rides a release PR like every other change:
 
 ```bash
+git switch -c release/v<new>
 git add upgrading/ UPGRADING.md Project.toml
 git commit -m "chore(release): cut <new>"          # entry titles in the body
+git push -u origin release/v<new>
+gh pr create --title "chore(release): cut <new>" --body-file <file listing the entry titles>
 ```
 
-**Stop here and show the diff.** A release is the exception to the merge-gate rule in
+**Stop here and show the PR.** A release is the exception to the merge-gate rule in
 [`nitro-general.instructions.md`](../../instructions/nitro-general.instructions.md): an ordinary
 issue runs straight through to an open PR, but `git tag` and `gh release create` publish something
 that cannot be taken back, so they stay on their own explicit approval — separate from approval to
-prepare the cut.
+prepare the cut. The maintainer merges the release PR, as with any PR.
 
-### 6. Tag and push
+### 6. Tag the merge commit and push the tag
 
-Tag the commit on `main` that carries the new `Project.toml` version — the merge commit of the
-release PR, not the branch commit:
+After the release PR merges, tag the commit on `main` that carries the new `Project.toml` version.
+That is the **merge commit of the release PR**, not the branch commit. Ask GitHub for it rather
+than reading `main`'s tip, which may already have moved past it:
 
 ```bash
+gh pr view <release PR> --json mergeCommit --jq .mergeCommit.oid    # <sha>
+git fetch origin main                               # no branch switch -- works from a worktree too
+gh run list --branch main --commit <sha>            # must show a completed, green CI run for <sha>
 git tag -a v<new> <sha> -m "Nitro v<new>"          # entry titles in the body
-git push origin main
-git push origin v<new>                              # a plain `git push` does NOT carry tags
+git push origin v<new>                              # the tag only; `main` already has the commit
 ```
 
+Precondition 3 checked `main` *before* the cut. The merge commit is new, so its own `main` run is
+the one that counts, and a red or pending run is a stop.
+
 The **`v` prefix is required**: once Nitro is registered in General,
-[`JuliaRegistries/TagBot`](../../workflows/TagBot.yml) takes over tagging and emits `vX.Y.Z`.
-Matching it now keeps one continuous series. Pre-publish, TagBot never fires — nothing comments as
-`JuliaTagBot` — so tags are manual until then.
+[`JuliaRegistries/TagBot`](https://github.com/JuliaRegistries/TagBot) takes over tagging and emits
+`vX.Y.Z`. Matching it now keeps one continuous series. The TagBot workflow is **not installed**
+before registration. #332 removed it: it has nothing to do until then, and a `workflow_dispatch`
+ran a mutable tag with `contents: write` and the deploy key. It is restored at registration (see
+[`registry-publication.md`](../../../docs/design/registry-publication.md) §6). Tags are manual until
+then.
 
 ### 7. Roll it out
 
@@ -220,7 +239,8 @@ The pin **is** the app's rollout state — there are no per-entry rollout tables
   `gh release create` are the two commands the merge-gate rule does *not* hand you.
 - **Never** rewrite historical entries while cutting — fix errors in a separate commit with its own
   review.
-- **Never** cut from a branch other than `main`, or with a dirty tree, or when CI is red or unknown.
+- **Never** start a cut from a branch other than an up-to-date `main` (step 5 branches the release
+  from it), or with a dirty tree, or when CI is red or unknown.
 - **`Unreleased` is a literal token**, not a version — `_parse_upgrading` in
   [`src/upgrading.jl`](../../../src/upgrading.jl) maps it to a high sentinel so uncut entries sort
   newest and `upgrade_guide` surfaces them by default. Stamping replaces it with a real

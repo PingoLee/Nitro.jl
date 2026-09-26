@@ -185,6 +185,16 @@ Cheap to check by hand before opening any registration PR: list the six `[weakde
 each one up. Five are in General; `PormG = "7d8d7541-4d3d-4580-80a2-17064efb0993"` is not. That is
 the whole gate.
 
+**Not a gate, but owed the day registration lands: restore TagBot.** The
+[TagBot](https://github.com/JuliaRegistries/TagBot) workflow was removed in
+[#332](https://github.com/PingoLee/Nitro.jl/issues/332). Before registration it has nothing to do,
+because nothing comments as `JuliaTagBot`. Its job-level `if:` skipped every other comment, but a
+`workflow_dispatch` still ran a mutable `@v1` tag with `contents: write` and the deploy key, for no
+benefit. Re-add the standard `.github/workflows/TagBot.yml` from TagBot's README,
+pinned by commit SHA like every other action (`test/ci_workflow_tests.jl` enforces the pin).
+[`nitro-cut-release`](../../.github/skills/nitro-cut-release/SKILL.md) already emits the `vX.Y.Z`
+tags TagBot will continue.
+
 ## 7. Decision: not taken
 
 The finding is what ships. **No route is chosen, and no timetable is implied** — it is a maintainer

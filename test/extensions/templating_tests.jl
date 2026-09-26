@@ -363,6 +363,34 @@ Well, 6000.0 dollars, after taxes.
         end
     end
 
+    # #333: nitro-core §4 used to say "neither engine HTML-escapes by default". Both do, and the
+    # markup sink is the OPT-OUT. This pins both halves, so the rule stays true: if an upstream
+    # release flips a default, this goes red here instead of every Nitro app quietly turning a
+    # `{{ x }}` into an injection point.
+    @testset "both engines escape by default; the opt-outs render raw (#333)" begin
+        payload = "<script>alert(1)</script>"
+        body(resp) = String(resp.body)
+
+        @testset "Mustache: {{x}} escapes, {{{x}}} and {{&x}} do not" begin
+            escaped = body(mustache("<p>{{msg}}</p>")(Dict("msg" => payload)))
+            @test !occursin("<script>", escaped)
+            @test occursin("&lt;script&gt;", escaped)
+            @test occursin("<script>", body(mustache("<p>{{{msg}}}</p>")(Dict("msg" => payload))))
+            @test occursin("<script>", body(mustache("<p>{{&msg}}</p>")(Dict("msg" => payload))))
+        end
+
+        @testset "OteraEngine: autoescape is on unless |> safe or the config turns it off" begin
+            escaped = body(otera("<p>{{ msg }}</p>")(Dict(:msg => payload)))
+            @test !occursin("<script>", escaped)
+            @test occursin("&lt;script&gt;", escaped)
+            # Per value, under the DEFAULT config: `safe` wraps it in a SafeString that
+            # `htmlesc` passes through untouched.
+            @test occursin("<script>", body(otera("<p>{{ msg |> safe }}</p>")(Dict(:msg => payload))))
+            raw = otera("<p>{{ msg }}</p>"; config = Dict("autoescape" => false))
+            @test occursin("<script>", body(raw(Dict(:msg => payload))))
+        end
+    end
+
 end
 
 end
