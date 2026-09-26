@@ -93,8 +93,35 @@ function _is_self_reference(name::AbstractString, func_name::AbstractString)::Bo
            startswith(name, "#" * func_name * "#")
 end
 
+# Substitutes SSA values and assigned slots back into a lowered expression, recursively.
+#
+# A callable struct rather than a local `rebuild!` with five methods: the local function called
+# itself, so its closure captured its own binding before that binding existed, and Julia boxed it
+# (#364).
+struct _Rebuilder
+    statements  :: Dict{Core.SSAValue, Any}
+    assignments :: Dict{Core.SlotNumber, Any}
+    no_values   :: Symbol
+end
+
+(r::_Rebuilder)(values::AbstractVector) = r.(values)
+
+function (r::_Rebuilder)(expr::Expr)
+    expr.args = r.(expr.args)
+    return expr
+end
+
+(r::_Rebuilder)(ssa::Core.SSAValue) = r(r.statements[ssa])
+
+function (r::_Rebuilder)(slot::Core.SlotNumber)
+    value = get(r.assignments, slot, r.no_values)
+    return value == r.no_values ? slot : r(value)
+end
+
+(r::_Rebuilder)(@nospecialize(value)) = value
+
 function reconstruct(info::Core.CodeInfo, func_name::Symbol)
-    
+
     # Track which index the function signature can be found on
     sig_index = nothing
 
@@ -105,28 +132,8 @@ function reconstruct(info::Core.CodeInfo, func_name::Symbol)
     # create a unique flag for each call to mark missing values
     NO_VALUES = gensym()
 
-    function rebuild!(values::AbstractVector)
-        return rebuild!.(values)
-    end
+    rebuild! = _Rebuilder(statements, assignments, NO_VALUES)
 
-    function rebuild!(expr::Expr)
-        expr.args = rebuild!.(expr.args)
-        return expr
-    end
-
-    function rebuild!(ssa::Core.SSAValue)
-        return rebuild!(statements[ssa])
-    end
-
-    function rebuild!(slot::Core.SlotNumber)
-        value = get(assignments, slot, NO_VALUES)
-        return value == NO_VALUES ? slot : rebuild!(value)
-    end
-
-    function rebuild!(value::Any)
-        return value
-    end
-    
     for (index, expr) in enumerate(info.code)
 
         ssa_index = Core.SSAValue(index)

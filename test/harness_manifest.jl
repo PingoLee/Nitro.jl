@@ -112,6 +112,7 @@ const TEST_FILES = [
     "middleware/middleware_error_boundary_tests.jl",
 
     # ── Quality Gate ──────────────────────────────────────────────────────────
+    "closure_boxing_tests.jl",
     "aqua_tests.jl",
 ]
 
