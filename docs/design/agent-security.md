@@ -112,7 +112,15 @@ that only exists on one machine is not a policy, and the local file silently ove
     "deny": [
       "Bash(gh pr merge:*)",
       "Bash(git push --force:*)", "Bash(git push -f:*)",
-      "Bash(git push --force-with-lease:*)", "Bash(git push --delete:*)",
+      "Bash(git push --force-with-lease:*)", "Bash(git push --delete:*)", "Bash(git push -d:*)",
+      "Bash(git push *--force*)", "Bash(git push * -f)", "Bash(git push * -f *)",
+      "Bash(git push * +*)",
+      "Bash(git push *--delete*)", "Bash(git push * -d)", "Bash(git push * -d *)",
+      "Bash(git push *--mirror*)", "Bash(git push *--prune*)",
+      "Bash(git push * main)", "Bash(git push * main *)",
+      "Bash(git push *:main)", "Bash(git push *:main *)",
+      "Bash(git push * refs/heads/main)", "Bash(git push * refs/heads/main *)",
+      "Bash(git push *:refs/heads/main)", "Bash(git push *:refs/heads/main *)",
       "Read(./.env)",
       "Read(./.env.*)",
       "Read(./**/connection.yml)"
@@ -137,14 +145,40 @@ Notes on specific entries:
   is the only control on that, which makes it load-bearing prose rather than a nicety.
 - **`git commit`, `git push` and `gh pr create` are allowed, and that is the merge gate's design, not
   a hole in it.** The general instructions moved from three step approvals to one gate at the merge:
-  every branch is discardable and `main` is reachable only through a human `gh pr merge`, which stays
-  **denied**. The trade is that the PR is now the maintainer's *first* look, so the verify rungs in
-  `nitro-issue-workflow` §4 are what pays for the autonomy — a skipped rung spends the only remaining
-  check.
-- **Force-push is denied while plain push is allowed.** Deny beats allow, so the narrow
-  `--force`/`-f`/`--force-with-lease`/`--delete` entries carve the irreversible half out of
-  `Bash(git push:*)`. Discardable branch history is the property that makes the merge gate sufficient;
-  rewriting a pushed branch removes it.
+  every branch is discardable and `main` is reachable only through a merged pull request. `gh pr
+  merge` stays **denied** here, and the server enforces the rest (see the next bullet). The trade is
+  that the PR is now the maintainer's *first* look, so the verify rungs in `nitro-issue-workflow` §4
+  are what pays for the autonomy — a skipped rung spends the only remaining check.
+- **The structural control is the `main` ruleset, not this file.** Since
+  [#332](https://github.com/PingoLee/Nitro.jl/issues/332), a repository ruleset on the default
+  branch requires a pull request (zero approvals, since the maintainer is the only reviewer), blocks
+  force-push, and blocks deletion. It has **no bypass actors**, on purpose: an agent pushes with the
+  maintainer's own credentials, so an admin bypass would exempt the agent too. The side effect is that
+  a release cut goes through a release PR as well
+  ([`nitro-cut-release`](../../.github/skills/nitro-cut-release/SKILL.md)). Check it with
+  `gh api repos/PingoLee/Nitro.jl/rules/branches/main`. Until #332, `main` had no protection at all,
+  so the merge gate was prose.
+- **The push denies are a second layer, and a best-effort one.** Deny beats allow, so the entries
+  above remove the destructive `git push` shapes an agent usually writes from `Bash(git push:*)`:
+  `--force*`, and `-f` as a separate word, in any position; a `+refspec`; `--delete`, and `-d` as a
+  separate word; `--mirror`; `--prune`; and a push naming `main` or `refs/heads/main`, either as its
+  own word or as the destination of a `src:dst` refspec. The original entries were prefix-only
+  (`git push --force:*`), so `git push origin main --force` and `git push origin +main` matched the
+  allow rule and none of the denies. The correct claim is narrower than "carves out the irreversible
+  half". A Bash rule matches the command text, and Claude Code's own documentation says a deny rule
+  "isn't a security boundary around the program". Known gaps:
+  - `git -C . push …`, `git -c k=v push …` and a quoted `git 'push' …` match none of these rules.
+    They also miss the allow rule, though, so they prompt rather than run silently.
+  - The same holds for combined short flags such as `-uf`.
+  - A deleting `:refspec` (`git push origin :branch`) **is** auto-approved. The natural rule,
+    `Bash(git push * :*)`, does not work: a pattern ending in `:*` is the legacy prefix syntax, so
+    Claude Code matches it as the literal prefix `git push * `. The one working spelling, `:**`,
+    makes Claude Code print a warning at every startup, the noise the `Edit`-only rule below
+    avoids. The ruleset still blocks deleting `main`, and a deleted PR branch can be restored from
+    its PR.
+
+  Discardable branch history is what makes the merge gate sufficient, and the ruleset is what
+  guarantees it.
 - **`git tag` and `gh release create` stay on `ask`.** `nitro-cut-release` documents them as workflow
   steps, and a published tag cannot be taken back — the one place where prose asking nicely is not
   enough.
@@ -178,6 +212,8 @@ Re-read this document when any of the following becomes true:
   [`docs/design/registry-publication.md`](registry-publication.md) — no route is chosen yet.
 - CI gains a workflow that runs agent tooling against a fork PR.
 - Anyone besides the maintainer gains write access.
+- The `main` ruleset is changed, bypassed, or removed. The merge gate stops being structural at that
+  point.
 
 Related, and **closed**: [#21](https://github.com/PingoLee/Nitro.jl/issues/21) was the same trust
 question at the supply-chain layer — CI cloned an unpinned personal PormG fork at default-branch
@@ -185,6 +221,12 @@ HEAD in jobs carrying `contents: write` and the Documenter deploy key. It is fix
 write scope and both secrets now live only in the `docs` job, and the workflow no longer clones
 PormG at all — `Project.toml`'s `[sources]` pins it by url plus an immutable 40-hex `rev` that Pkg
 fetches itself. `test/ci_workflow_tests.jl` asserts both properties against the shipped `ci.yml`.
+[#332](https://github.com/PingoLee/Nitro.jl/issues/332) applied the same immutability argument to
+the actions themselves. Every `uses:` is pinned to a full commit SHA, and
+[`.github/dependabot.yml`](../../.github/dependabot.yml) keeps those pins current. The two docs
+secrets moved from the job's `env` to the single step that deploys. TagBot was removed: before
+registration it has nothing to do, and on a `workflow_dispatch` it ran a mutable tag with
+`contents: write` and the deploy key. The same test file asserts the pins and the step scoping.
 
 What that did **not** settle is publication: a `[weakdeps]` entry no registry knows still blocks
 registration outright. See [`docs/design/registry-publication.md`](registry-publication.md).

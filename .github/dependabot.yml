@@ -1,0 +1,24 @@
+# Keeps the SHA pins in .github/workflows/ current (#332).
+#
+# Every `uses:` is pinned to a full 40-hex commit with the release it came from as a trailing
+# comment (`@<sha> # vX.Y.Z`). A tag is mutable and can be re-pointed -- the same reason the
+# PormG `[sources]` pin is a SHA -- but a SHA never moves on its own, so without this file the
+# pins would only ever age. Dependabot reads the trailing comment and bumps both together.
+#
+# `test/ci_workflow_tests.jl` asserts every workflow action is SHA-pinned and that this file
+# still covers `github-actions`.
+#
+# Julia dependencies are NOT managed here: CompatHelper owns `[compat]`
+# (.github/workflows/CompatHelper.yml).
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "infrastructure"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
