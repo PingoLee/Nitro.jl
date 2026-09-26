@@ -75,7 +75,10 @@ connection, so it is also the keep-alive idle limit (`idle_timeout` never gets a
 there). A backend that drops idle connections before its proxy does races the proxy's reuse of
 them: nginx upstream pools and AWS ALB both idle out at 60 seconds, and a backend below that
 produces sporadic `502`s. 120 seconds keeps the proxy the side that closes first, and still bounds
-a stuck or hostile connection instead of keeping it forever.
+a stuck or hostile connection instead of keeping it forever. That coupling is an HTTP.jl behavior,
+reported upstream as
+[JuliaWeb/HTTP.jl#1381](https://github.com/JuliaWeb/HTTP.jl/issues/1381); once a release keeps
+the idle and header deadlines apart the way Go does, this default can drop to Go's usual range.
 
 It bounds the head only. Once the head is parsed Nitro clears the deadline, so a slow upload is
 not cut by it — the Go semantics. Set `read_timeout` to bound the body too.

@@ -753,6 +753,12 @@ end
 # That is the wrong default for a timeout Nitro now turns on for everyone, so we clear the read
 # deadline the moment HTTP hands us a parsed head.
 #
+# A WORKAROUND, reported upstream as JuliaWeb/HTTP.jl#1381 (reproduced on HTTP.jl 2.8.0). When a
+# release fixes it — `_set_read_deadline_for_body!` clearing the deadline itself, and the idle
+# deadline no longer outliving a keep-alive wait — this wrapper and its canaries in
+# test/http_internals_contract_tests.jl can go. Keep the keep-alive and late-body tests in
+# test/server_lifecycle_tests.jl: they are what proves the fix landed.
+#
 # Narrow on purpose:
 #   * HTTP/1.1 only. An HTTP/2 stream's deadlines belong to the connection's frame loop, which
 #     re-arms them before every frame and multiplexes other streams; touching them from one
