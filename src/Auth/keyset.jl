@@ -196,10 +196,12 @@ function JWTKeyset(keyset::AbstractDict; claims = ())
             "JWTKeyset: the keyset holds both \"$kid\" and :$kid; one kid, one entry"))
         names[kid] = secret      # the RAW value -- `_keyset_entry` checks it before reading
     end
-    if haskey(names, "default")
-        signer = "default"
+    # One assignment, not one per branch: the comprehension below captures `signer`, and a
+    # captured variable assigned in two places is boxed (#364).
+    signer = if haskey(names, "default")
+        "default"
     elseif length(names) == 1
-        signer = first(keys(names))
+        first(keys(names))
     else
         throw(ArgumentError(
             "JWTKeyset: the keyset has $(length(names)) keys and no \"default\" entry, so no key " *

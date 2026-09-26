@@ -262,6 +262,19 @@ function _read_mount(path::String, loadfile)
     return raw isa Vector{UInt8} ? raw : Vector{UInt8}(codeunits(raw))
 end
 
+# Reads a re-reading mount's file and derives its validators FROM THAT READ, so the tag always
+# describes the bytes it travels with. `:lazy` caches the result; `:none` uses it once.
+#
+# A named function rather than a `get!` do-block: the block assigned `body`, `t` and `m`, names
+# the enclosing `_serve_mounted` also bound for `:none`. That boxed all three for the whole
+# function, so the `:none` branch (`dynamicfiles`) read its body and validators as `Any` on every
+# request (#364).
+function _read_with_validators(path::String, policy::MountPolicy, loadfile)::CachedBody
+    body = _read_mount(path, loadfile)
+    tag, modtime = Res.file_validators(path; etag = policy.etag, bytes = body)
+    return CachedBody(body, tag, modtime)
+end
+
 # Build the response for one mounted file, for THIS request.
 #
 # A response can no longer be prebuilt and handed out unchanged: whether it is a 200, a 304 or a
@@ -301,20 +314,18 @@ function _serve_mounted(req::HTTP.Request, mf::MountedFile, policy::MountPolicy,
         (mf.bytes, mf.etag, mf.modtime)
     elseif cache !== nothing
         # `:lazy` — the tag is cached WITH the bytes, so it always identifies the body in hand
-        # even after an eviction re-reads a file that has since changed on disk.
-        cb = get!(cache, mf.path) do
-            body = _read_mount(mf.path, loadfile)
-            t, m = Res.file_validators(mf.path; etag = policy.etag, bytes = body)
-            CachedBody(body, t, m)
-        end
+        # even after an eviction re-reads a file that has since changed on disk. The assertion
+        # pins an implementation detail: LRUCache's function-form `get!` infers concretely only
+        # because it takes its lock without a do-block, while its value form already infers
+        # `Any`. A release that rewrote this one the same way would otherwise go unnoticed.
+        cb = get!(() -> _read_with_validators(mf.path, policy, loadfile), cache, mf.path)::CachedBody
         (cb.bytes, cb.etag, cb.modtime)
     else
         # `:none` — re-read per request, so the validators are derived from that read. This is the
         # whole point of `dynamicfiles`: a change on disk must be visible, and a validator that
         # did not move would hide it behind a 304.
-        body = _read_mount(mf.path, loadfile)
-        t, m = Res.file_validators(mf.path; etag = policy.etag, bytes = body)
-        (body, t, m)
+        fresh = _read_with_validators(mf.path, policy, loadfile)
+        (fresh.bytes, fresh.etag, fresh.modtime)
     end
     resp = HTTP.servecontent(req, source; name = basename(mf.path), modtime = modtime,
                              content_type = mf.content_type, etag = tag, headers = extra)

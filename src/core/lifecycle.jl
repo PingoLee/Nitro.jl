@@ -353,7 +353,9 @@ function serve(ctx::App;
     handle_stream = header_deadline_handler(handle_stream)
 
     # Wrap last, so the handler HTTP stores gets our secret-safe `show` (see NitroStreamHandler).
-    handle_stream = NitroStreamHandler(handle_stream)
+    # A new, once-assigned name because the `start` closure below captures it: capturing
+    # `handle_stream`, assigned up to three times above, boxed it (#364).
+    listener = NitroStreamHandler(handle_stream)
 
     if revise == :eager
         ctx.service.eager_revise[] = start_revise_service()
@@ -366,7 +368,7 @@ function serve(ctx::App;
 
     try
         return startserver(ctx; host, port, show_banner, parallel, async, kwargs, start=(kwargs) ->
-            HTTP.listen!(handle_stream, host, port; kwargs...))
+            HTTP.listen!(listener, host, port; kwargs...))
     finally
         if ctx.service.eager_revise[] !== nothing && async == false
             close(ctx.service.eager_revise[])
