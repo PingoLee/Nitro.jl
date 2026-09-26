@@ -247,8 +247,9 @@ function task_events(req, task_id::String)
     owner = owner_for(req)
 
     # Authorize BEFORE opening the stream. Once the SSE head is on the wire the status cannot
-    # change, so a 403 or a 404 has to be an ordinary response -- this call throws for a task the
-    # caller may not read, and returns "NOT_FOUND" for one that does not exist.
+    # change, so a 404 has to be an ordinary response. This call returns "NOT_FOUND" both for a
+    # task that does not exist and for one the caller may not read -- deliberately the same
+    # answer, so a client cannot probe which ids exist.
     initial = get_task_status(app, task_id, owner)
     initial[:status] == "NOT_FOUND" && return Res.json(Dict("error" => "unknown task"); status = 404)
 

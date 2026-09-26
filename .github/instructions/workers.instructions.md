@@ -17,7 +17,7 @@ Split in [#167](https://github.com/PingoLee/Nitro.jl/issues/167). One question d
 change belongs to: **the store answers *"what does the record say?"*; the runtime answers *"what is
 this process doing right now?"***.
 
-- **`AbstractWorkerStore`** (`src/Workers/registry.jl`): data access plus policy hooks, 15 required
+- **`AbstractWorkerStore`** (`src/Workers/registry.jl`): data access plus policy hooks, 16 required
   methods. It owns **nothing that runs** — no queue, no scheduler, no `Task` handle — which is what
   makes the #29 leak unrepresentable rather than merely fixed.
 - **`WorkerRuntime`** (`src/Workers/runtime.jl`): the sequential queues and their processor tasks,
@@ -117,13 +117,17 @@ you add anything:
 
 | API | Purpose |
 |-----|---------|
-| `submit_sequential_task`, `SequentialQueue` | Ordered, one-at-a-time execution within a queue |
+| `submit_sequential_task` | Ordered, one-at-a-time execution within a queue |
+| `get_task_status`, `cancel_task` | Read and cancel. A task the authority may not see answers **exactly** like a missing one (`:status => "NOT_FOUND"`), never `AuthorizationError` — that difference was a task-existence oracle ([#323](https://github.com/PingoLee/Nitro.jl/issues/323)). `AuthorizationError` is left to the submit paths, and `handle_error` answers it with a 403 |
+| `release_task!` | **Admin only**, takes `System()`: deletes a *finished* record through the fenced `try_delete_task!`, so a squatted `:global` key can be reused |
+| `WorkerRuntime(store; max_concurrent_runs = 64, max_runs_per_owner = nothing, allow_undeclared_queues = false, queues)`, `WorkerCapacityError` | Limits ([#324](https://github.com/PingoLee/Nitro.jl/issues/324)). A submit past a limit is refused **before anything is written** — `:runtime`/`:queue` a 503, `:owner` a 429 — and a full queue never blocks in `put!`. Only declared queue names get a queue (else `AuthorizationError`). A run holds its reservation until its callback *returns*, a timed-out one included (`_RunHandoff`, one per attempt); a timed-out *sequential* callback then counts against the runtime cap, and queues hold their next item only while such abandoned callbacks *alone* fill it (never on async load: an async run waiting on a queued item would deadlock). Every other exit releases the reservation exactly once, by `run_id`. `reservation_lock` is a leaf, and `queue_lock` is never taken inside `lock_tasks` |
+| *(not exported)* `get_task_info`, `add_watcher!`, `set_task!`, `replace_task!`, `try_transition!`, `try_delete_task!`, `delete_task!`, `cleanup_tasks!`, `clear_records!`, `list_running_task_refs`, `RunningTaskRef`, `lock_tasks`, `get_active_task[_info]`, `register_run!`, `SequentialQueue`, `QueueItem`, `get_sequential_queues`, `get_queue_lock` | The store contract and the run/queue internals. Backends extend them qualified; they perform no authorization, so they must not become application API again (#323) |
 | `scoped_task_key`, `DEFAULT_QUEUE_NAME` | Resolve a `(task_key, user_id, scope)` to its stored id; the queue name `submit_task` authorizes against |
 | `get_queue_status` | Queue-wide introspection — **admin only**, takes `System()`; an `Owner` is a `MethodError` |
 | `update_progress!` | The only safe write to `TaskInfo.progress` |
 | `cleanup_old_tasks`, `start_cleanup_scheduler`, `stop_cleanup_scheduler!` | Retention |
 | `shutdown!`, `reset_runtime!` | Teardown — takes a `WorkerRuntime`, never a store. Both take `drain_timeout`; `shutdown!` defaults to `WORKER_DRAIN_TIMEOUT_SECONDS`, `reset_runtime!` to `0` |
-| `WorkerRuntime`, `default_runtime`, `worker_runtime`, `install!`, `uninstall!`, `worker_store`, `default_store` | Lifecycle and resolution |
+| `WorkerRuntime`, `default_runtime`, `worker_runtime`, `install!`, `uninstall!`, `worker_store`, `default_store` | Lifecycle and resolution. An App-first call on an App with no runtime throws `WorkerUnavailableError` (a 503) and never falls back to `default_runtime()`, which carries none of the app's policy; `worker_startup(app; …)` installs when it is *built*, ahead of the listener; the bare `worker_startup()` runs `default_runtime()` and refuses `store=`/`runtime=` ([#322](https://github.com/PingoLee/Nitro.jl/issues/322)) |
 
 **`runtime=` is the public keyword; `store=` only selects a backend.** Every read and submit call
 takes `runtime::WorkerRuntime=default_runtime()`, or resolves one from an `App` first argument.
@@ -173,7 +177,8 @@ Configure PormG, then bootstrap the store:
 ```julia
 # db_key defaults to "db"; "workers" below is an explicit override, not the default.
 persistent_store = pormg_nitro_worker(db_key="workers")
-serve(middleware=[worker_startup(queues=["reports"], store=persistent_store, recover_zombies=true)])
+app = App(mod = @__MODULE__)
+serve(app; middleware=[worker_startup(app; queues=["reports"], store=persistent_store, recover_zombies=true)])
 ```
 
 ## 4. Queue And Watch Authorization

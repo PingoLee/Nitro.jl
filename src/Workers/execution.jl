@@ -220,8 +220,36 @@ function _invoke_task_callback(callback::Function, task_info::TaskInfo)
     end
 end
 
+# Who gives back a run's capacity reservation (#324) when a deadline expires: normally the run
+# itself, when it finishes. But an expired deadline only stops the WAIT -- the callback keeps its
+# thread until it returns -- so if the run released on the timeout, one caller with
+# `TaskOptions(timeout = 1)` could start `max_concurrent_runs` new callbacks every second, all of
+# them still running. So the slot is handed to whichever side finishes LAST, decided by one
+# compare-and-set: the callback's task moves `:running -> :done` when it returns, the waiter moves
+# `:running -> :abandoned` when it gives up. If the waiter wins, the callback's task releases on its
+# way out; if the callback wins, it was done after all and the waiter takes its answer.
+#
+# ONE PER ATTEMPT, never re-armed. A retry after a failed attempt used to reset the same object to
+# `:running`, and if the previous attempt's callback task ran its `finally` only after that reset,
+# it flipped the new attempt's state to `:done`: the next deadline could then never claim
+# `:abandoned`, the waiter blocked until the callback returned, and the reservation was released
+# early. A fresh handoff per attempt has no such history; the caller checks the last one.
+#
+# `on_abandon` runs on the WAITER's side when it wins, before it throws. The sequential path uses it
+# to count the abandoned callback against the runtime-wide cap (#324), since it keeps a thread.
+mutable struct _RunHandoff
+    @atomic state::Symbol
+    const release::Function
+    const on_abandon::Function
+end
+_RunHandoff(release::Function, on_abandon::Function = () -> nothing) =
+    _RunHandoff(:running, release, on_abandon)
+_RunHandoff(h::_RunHandoff) = _RunHandoff(h.release, h.on_abandon)   # the next attempt's
+
+_handed_off(h::_RunHandoff) = (@atomic h.state) === :abandoned
+
 """
-    timeout_call(callback, task_info; timeout=3600) -> Any
+    timeout_call(callback, task_info; timeout=3600, handoff=nothing) -> Any
 
 Run `callback` under a deadline and return its value, or throw [`TaskTimeoutError`](@ref).
 
@@ -237,8 +265,12 @@ accept a leaked goroutine rather than an unsafe kill. Nitro used to also throw a
 `InterruptException` into the task, which was unusable for the CPU-bound callbacks this exists to
 bound and fatal once worker bodies migrate between threads
 ([#127](https://github.com/PingoLee/Nitro.jl/issues/127)).
+
+With a `handoff`, an expired deadline hands the run's capacity reservation to the callback's task,
+which releases it when the callback finally returns (#324); see `_RunHandoff`.
 """
-function timeout_call(callback::Function, task_info::TaskInfo; timeout::Int=3600)
+function timeout_call(callback::Function, task_info::TaskInfo; timeout::Int=3600,
+                      handoff::Union{Nothing, _RunHandoff}=nothing)
     if timeout <= 0
         return _invoke_task_callback(callback, task_info)
     end
@@ -256,11 +288,22 @@ function timeout_call(callback::Function, task_info::TaskInfo; timeout::Int=3600
             put!(result_channel, _invoke_task_callback(callback, task_info))
         catch error
             put!(error_channel, error)
+        finally
+            # Losing this compare-and-set means the waiter already gave up on us, so the
+            # reservation is ours to hand back, now that the callback has actually returned.
+            if handoff !== nothing && !(@atomicreplace handoff.state :running => :done).success
+                handoff.release()
+            end
         end
     end
 
     wait_result = timedwait(() -> isready(result_channel) || isready(error_channel), timeout)
-    if wait_result == :timed_out
+    # Timed out, AND the callback had not finished in the meantime. If it finished in the instant
+    # after the deadline, it won the handoff, and its answer is already in a channel below.
+    timed_out = wait_result == :timed_out &&
+                (handoff === nothing || (@atomicreplace handoff.state :running => :abandoned).success)
+    if timed_out
+        handoff === nothing || handoff.on_abandon()
         # Ask, because we cannot tell. The task above keeps running until the callback
         # returns; this is the only thing that can make it stop, and only if it polls.
         _request_cancel!(task_info, :timeout)

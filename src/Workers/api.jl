@@ -1,10 +1,21 @@
+# No fallback (#322). This used to answer `default_runtime()` whenever `ctx` had nothing
+# installed, and that runtime carries none of the app's policy: no queue authorizer, no error
+# redactor, no retention. It was reachable in three ordinary ways -- a request in the window
+# between `serve()` opening its listener and the startup hook installing the runtime, the
+# tutorial's bare `worker_startup` paired with App-first calls, and a `start!` that threw before
+# installing -- and in each one a submission silently skipped the app's authorization. An App
+# with no runtime is now refused; `worker_startup(app)` installs one when it is BUILT, so the
+# startup window no longer exists for it.
 function _resolve_runtime(ctx::App; key::Symbol=DEFAULT_EXTENSION_KEY, runtime::Union{Nothing, WorkerRuntime}=nothing)
     if !isnothing(runtime)
         return runtime
     end
 
     installed = worker_runtime(ctx; key)
-    return installed isa WorkerRuntime ? installed : default_runtime()
+    installed isa WorkerRuntime && return installed
+    throw(WorkerUnavailableError(
+        "no worker runtime is installed on this App under key :$key. Add `worker_startup(app)` " *
+        "to `serve(app; middleware = [...])`, or call `install!(app)` / `start!(app)` first."))
 end
 
 """
@@ -298,6 +309,8 @@ function start!(ctx::App;
         recover_zombie_tasks!(; runtime=resolved, zombie_min_age)
     end
 
+    # Declared before its processor starts: these are the names a submit may use (#324).
+    _declare_queues!(resolved, queues)
     for queue_name in queues
         _start_queue_processor(resolved, String(queue_name))
     end
@@ -327,8 +340,25 @@ function startup(ctx::App;
     drain_timeout::Real=WORKER_DRAIN_TIMEOUT_SECONDS,
 )
     # Refused here, where the middleware is built, not from the startup hook once serving began.
+    # Every check runs BEFORE the install below, so a refused call leaves nothing installed. A
+    # negative `drain_timeout` would otherwise install fine and then throw from `uninstall!` in
+    # `on_shutdown`, leaving a runtime nothing ever tears down.
     _check_zombie_min_age(zombie_min_age)
+    drain_timeout >= 0 || throw(ArgumentError(
+        "drain_timeout must be >= 0 (got $(drain_timeout)); 0 releases without waiting"))
     queue_names = String.(collect(queues))
+
+    # Installed NOW, when the middleware is built, not in `on_startup` (#322). `serve()` opens its
+    # listener before it runs the startup hooks, so a runtime installed by the hook left a window
+    # in which App-first calls found nothing installed -- and they used to fall back to the
+    # process-wide runtime, skipping the app's queue authorizer. `_start_runtime_for!` also refuses
+    # `store` + `runtime` together here, at boot, instead of from a hook whose exception is only
+    # logged. Only the INSTALL moves: the zombie sweep, the queue processors and the scheduler
+    # still start in `on_startup`.
+    installed = _start_runtime_for!(ctx, key, store, runtime, drain_timeout)
+    # Declared now too, not only by `start!` in the hook (#324): a submit in the startup window
+    # would otherwise be refused as an undeclared queue.
+    _declare_queues!(installed, queue_names)
 
     passthrough = function(handle::Function)
         return function(req)
@@ -337,6 +367,9 @@ function startup(ctx::App;
     end
 
     on_startup = () -> begin
+        # `runtime = installed`, never `store = store`: the store form mints a runtime whenever
+        # the slot holds a different one, and after `terminate`'s `uninstall!` the slot is empty.
+        # Re-serving must put back THIS runtime, the one policy may already hang off.
         start!(ctx;
             queues=queue_names,
             cleanup_enabled=cleanup_enabled,
@@ -345,8 +378,7 @@ function startup(ctx::App;
             recover_zombies=recover_zombies,
             zombie_min_age=zombie_min_age,
             key=key,
-            store=store,
-            runtime=runtime,
+            runtime=installed,
             drain_timeout=drain_timeout,
         )
         return nothing
@@ -430,34 +462,42 @@ function _watch_allowed(store::AbstractWorkerStore, task_key::String, watchers::
     return Base.invokelatest(authorizer, task_key, watchers, user_id)::Bool
 end
 
-# Authorize against the cached record, and only if that denies, re-check the durable one.
-#
-# The `task_info` handed in reached its caller through `get_task_info(runtime, ·)`, so for a
-# running task it may be the live in-memory object, which pollers read to see fresh progress
-# without a round-trip. That cache is per process, so a grant issued *elsewhere*
-# is not in it — and #96's whole motivating case is a task submitted on one node and polled
-# from another. Denying on the cache alone would refuse a user who is authorized in the
-# durable record, making the grant work or not depending on which node answered.
-#
-# Ordering matters for cost: the cached check succeeds for the owner and for any watcher
-# this process already knows, so the extra read is paid only on the path that was about to
-# raise anyway. It can only ever turn a denial into an approval, never the reverse.
-function _authorize_or_reload!(store::AbstractWorkerStore, authority::TaskAuthority,
-                               task_info::TaskInfo, action::AbstractString)
-    _is_authorized(authority, task_info) && return nothing
+# What a caller who may not see a task is told, and what a caller asking for a task that does not
+# exist is told -- ONE value for both (#323). They used to differ: a missing id answered this, a
+# foreign one raised `AuthorizationError`, and the difference let any authenticated user probe
+# `"<victim>::<key>"` ids (usually derived from resource ids, so guessable) and learn who ran what.
+_not_found() = Dict{Symbol, Any}(:error => "Task not found", :status => "NOT_FOUND")
 
-    # `get_task_info(store, ·)` is the DURABLE read -- it is what `reload_task` used to be, and
-    # no store caches live objects any more (#167).
-    # Authorize against the durable record, but keep serving the cached one: the durable
-    # row for a *running* task holds only what was flushed at RUNNING-start, so returning
-    # it would admit the cross-process grantee and then hand them a frozen progress bar —
-    # the exact field #96 exists to expose. The decision needs the durable record; the
-    # payload does not.
-    durable = get_task_info(store, task_info.id)
-    durable !== nothing && _is_authorized(authority, durable) && return nothing
+# The record `authority` may be served for `task_id`, or `nothing` -- which the callers answer with
+# `_not_found()`, so "not yours" and "not there" are indistinguishable (#323).
+#
+# **Live first, and only if it authorizes.** Pollers read the live object for fresh progress
+# without a round-trip. But that cache is per process, so a grant issued *elsewhere* is not in it --
+# #96's whole motivating case is a task submitted on one node and polled from another. So a live
+# object that denies is not the answer; the durable record decides.
+#
+# **The durable record authorizes only ITS OWN run.** The live object can be a predecessor still
+# executing after a re-run replaced the record (cancellation is cooperative), and re-running a key
+# resets its watcher list. Authorizing the predecessor's object against the successor's watchers
+# served one identity's run on another identity's grant, which is the Info item of #323. So when
+# the runs differ, the durable record is what gets served; the live object is served only when it
+# is the same run, which keeps a cross-process grantee's progress bar live, as #96 requires.
+#
+# **One durable read on every refusal path.** A missing id and a foreign id both reach the durable
+# read exactly once and stop there, so they do not differ in ROUND-TRIPS -- a second read only on
+# the "exists but not yours" path would have put the oracle back as a gross timing difference.
+# They are not byte-for-byte equal in cost, though: a hit decodes the row (`result` included) and a
+# miss does not, so a large result is measurable over many probes, and a foreign row whose stored
+# JSON no longer decodes throws where a missing id answers NOT_FOUND. Closing that needs an
+# authorization read from a projection (`id`, `run_id`, `watchers`) before the full record.
+function _visible_record(runtime::WorkerRuntime, authority::TaskAuthority, task_id::String)
+    live = get_active_task_info(runtime, task_id)
+    live !== nothing && _is_authorized(authority, live) && return live
 
-    _authorize_task!(authority, task_info, action)   # raises
-    return nothing
+    # `get_task_info(store, ·)` is the DURABLE read -- no store caches live objects (#167).
+    durable = get_task_info(runtime.store, task_id)
+    (durable === nothing || !_is_authorized(authority, durable)) && return nothing
+    return live !== nothing && live.run_id == durable.run_id ? live : durable
 end
 
 # A `watchers=` grant is authorized by the *owner* — but a `:global` task has no owner
@@ -493,9 +533,15 @@ end
 # (#191). Deriving any of them by re-reading the record does not work: by then the record may
 # belong to a successor, so the abandon would cancel a run about to start and the start claim
 # would agree with a run that is not the caller's.
+#
+# `queue` is the sequential queue the new run will be enqueued on, or `nothing` for an async run.
+# It decides which capacity the run reserves (#324) -- a slot in that queue's buffer, or one of the
+# runtime's concurrent async runs -- on top of its owner's quota. Only a run that is MINTED here
+# reserves; joining a live one costs nothing. The caller owns giving it back.
 function _register_or_watch!(runtime::WorkerRuntime, task_key::String, owner::Owner;
                              queue_name::Union{Nothing, String}=nothing,
-                             grants::AbstractVector{Owner}=Owner[])
+                             grants::AbstractVector{Owner}=Owner[],
+                             queue::Union{Nothing, SequentialQueue}=nothing)
     uid = owner.user_id
     return lock_tasks(runtime) do
         # The DURABLE read, not the live-preferring one, by the rule in `get_task_info`: this is
@@ -526,7 +572,16 @@ function _register_or_watch!(runtime::WorkerRuntime, task_key::String, owner::Ow
         # the single `add_watcher!(runtime, ·)` store-then-mirror path, so that particular
         # divergence is gone -- but the snapshot stays, because a hook written as
         # `all(w -> same_org(w, uid), watchers)` must see one value per call regardless.
-        seen = task_info === nothing ? String[] : copy(task_info.watchers)
+        #
+        # And the value is the list the record WILL have once the submitter is in it, never an
+        # empty one (#323). A new `:global` key used to be authorized against `String[]`, so an
+        # `all(...)` hook was vacuously true and the documented `ORG_OF[first(watchers)]` threw
+        # `BoundsError` -- a 500. Which list that is follows the same status test as the branch
+        # below: joining a live run keeps its watchers and adds the submitter; a new or replaced
+        # record starts from the submitter alone, because `replace_task!` resets the list.
+        joining = task_info !== nothing && task_info.status in (RUNNING, PENDING)
+        seen = joining ? copy(task_info.watchers) : String[]
+        uid in seen || push!(seen, uid)
 
         # Authorize every grant before applying any. Otherwise a refusal partway through
         # throws with the earlier grants already durably written — and a submit that
@@ -535,7 +590,7 @@ function _register_or_watch!(runtime::WorkerRuntime, task_key::String, owner::Ow
             _authorize_grant!(runtime.store, task_key, seen, grant)
         end
 
-        if task_info !== nothing && task_info.status in (RUNNING, PENDING)
+        if joining
             # Atomic and idempotent in the store. Composing this out of
             # get + push! + set_task! under `lock_tasks` is what #88 was: that lock is
             # process-local for a database-backed store, so the read-modify-write was
@@ -553,17 +608,28 @@ function _register_or_watch!(runtime::WorkerRuntime, task_key::String, owner::Ow
         # stops that run from writing (#108); this is the only thing that can reclaim the
         # thread it is sitting on. In-process only -- a run hosted on another node is
         # unreachable from here and will keep going until its callback returns.
-        previous = get_active_task_info(runtime, task_key)
-        previous === nothing || _request_cancel!(previous, :superseded)
-
+        #
+        # The new run reserves its capacity FIRST (#324), before the predecessor is asked to
+        # stop and before the record is replaced, so a refused submit changes nothing: no record,
+        # and no superseded run.
         task_info = TaskInfo(task_key; queue_name)
-        push!(task_info.watchers, uid)
-        for grant in grants
-            grant.user_id in task_info.watchers || push!(task_info.watchers, grant.user_id)
+        _reserve_capacity!(runtime, queue, task_info.run_id, uid)
+        try
+            previous = get_active_task_info(runtime, task_key)
+            previous === nothing || _request_cancel!(previous, :superseded)
+
+            push!(task_info.watchers, uid)
+            for grant in grants
+                grant.user_id in task_info.watchers || push!(task_info.watchers, grant.user_id)
+            end
+            # Through the RUNTIME: publishing a successor also evicts the run it displaced from
+            # the live caches, so nothing later reads a run that no longer owns this key.
+            replace_task!(runtime, task_key, task_info)
+        catch
+            # A store write that throws leaves no run to release it later.
+            _release_capacity!(runtime, queue, task_info.run_id)
+            rethrow()
         end
-        # Through the RUNTIME: publishing a successor also evicts the run it displaced from
-        # the live caches, so nothing later reads a run that no longer owns this key.
-        replace_task!(runtime, task_key, task_info)
         return task_info.run_id
     end
 end
@@ -615,8 +681,17 @@ function _execute_task_async(runtime::WorkerRuntime, task_key::String, callback:
         # nothing serializes them and the interleaving in which one stole the other's handles was
         # the ordinary case rather than an edge. A concurrent `cancel_task` plus re-submit needs
         # only `lock_tasks` -- which is exactly why the claim takes it (#191, #198).
-        task_info = _claim_run!(runtime, task_key, run_id)
-        task_info === nothing && return nothing
+        #
+        # Every way out gives back the run's capacity reservation (#324) exactly once, except a
+        # timed-out callback, which keeps it until it actually returns (`_RunHandoff`).
+        task_info = try
+            _claim_run!(runtime, task_key, run_id)
+        catch
+            _release_run!(runtime, run_id)
+            rethrow()
+        end
+        task_info === nothing && (_release_run!(runtime, run_id); return nothing)
+        handoff = _RunHandoff(() -> _release_run!(runtime, run_id))
 
         # Starting is a CLAIMED transition, not an unconditional write. `set_task!` has no
         # precondition, so a `cancel_task` that already claimed PENDING -> CANCELLED was simply
@@ -663,7 +738,8 @@ function _execute_task_async(runtime::WorkerRuntime, task_key::String, callback:
             max_attempts = options.retry_on_failure ? options.max_retries : 0
             for retry_count in 0:max_attempts
                 try
-                    result = timeout_call(callback, task_info; timeout=options.timeout)
+                    handoff = _RunHandoff(handoff)       # a fresh one per attempt
+                    result = timeout_call(callback, task_info; timeout=options.timeout, handoff)
                     return _complete_task!(runtime, task_info, result)
                 catch error
                     unwrapped = _unwrap_exception(error)
@@ -725,6 +801,7 @@ function _execute_task_async(runtime::WorkerRuntime, task_key::String, callback:
             return task_info
         finally
             _deregister_run!(runtime, task_info)
+            _handed_off(handoff) || _release_run!(runtime, run_id)
         end
     end
 
@@ -793,7 +870,12 @@ function submit_task(task_key::AbstractString, callback::Function, owner::Owner;
     # scheduling hand-off, not a buffer wait, and it is unbounded under thread pressure.
     run_id = _register_or_watch!(runtime, key, owner; grants=watchers)
     if run_id !== nothing
-        _execute_task_async(runtime, key, callback, options, run_id)
+        try
+            _execute_task_async(runtime, key, callback, options, run_id)
+        catch
+            _release_run!(runtime, run_id)   # no run was spawned to give the reservation back
+            rethrow()
+        end
     end
     return key
 end
@@ -819,30 +901,52 @@ function submit_sequential_task(queue_name::AbstractString, task_key::AbstractSt
     _authorize_queue!(runtime.store, queue_id, owner)
 
     key = scoped_task_key(task_key, owner; scope)
-    run_id = _register_or_watch!(runtime, key, owner; queue_name=queue_id, grants=watchers)
+
+    # Only a DECLARED queue name gets a queue (#324). Every name used to mint a queue plus a
+    # processor task that lives as long as the runtime, so a handler taking the name from request
+    # data minted one per distinct name. Checked before `_start_queue_processor`, so a refused name
+    # never mints anything; after `scoped_task_key`, so a malformed key still reports as that.
+    if !_queue_declared(runtime, queue_id)
+        _warn_undeclared_queue(runtime, queue_id)
+        throw(AuthorizationError(
+            "Queue '$queue_id' is not declared on this worker runtime; declare it with " *
+            "`start!(app; queues = [...])` / `worker_startup(app; queues = [...])`"))
+    end
+
+    # One lookup, not two -- and it now comes BEFORE the record is written, because the new run
+    # reserves its slot in THIS queue's buffer while the record is claimed (#324). A second
+    # `_get_or_create_queue` could return a DIFFERENT object: `shutdown!` empties the registry, so
+    # a teardown landing between the two lookups would mint a fresh queue with an open channel and
+    # no processor. The `put!` would then succeed and the task would sit PENDING with nothing
+    # draining it -- a silent hang in place of the loud `InvalidStateException` a closed channel
+    # raises. Resolving it first widens the window a teardown can land in (it now spans the
+    # record write), but it stays loud: the `put!` below still hits the closed channel.
+    #
+    # Outside `lock_tasks`, deliberately: `get_queue_status` holds `queue_lock` while it lists
+    # under the store's lock, so taking `queue_lock` inside `lock_tasks` would be that pair inverted.
+    queue = _start_queue_processor(runtime, queue_id)
+    run_id = _register_or_watch!(runtime, key, owner; queue_name=queue_id, grants=watchers, queue)
     if run_id !== nothing
-        # One lookup, not two. `_start_queue_processor` already returns the queue it spawned a
-        # processor for, and a second `_get_or_create_queue` can return a DIFFERENT object: since
-        # `shutdown!` empties the registry, a teardown landing between the two calls makes the
-        # second lookup mint a fresh queue with an open channel and no processor. The `put!` would
-        # then succeed and the task would sit PENDING with nothing draining it -- a silent hang in
-        # place of the loud `InvalidStateException` a closed channel raises.
-        queue = _start_queue_processor(runtime, queue_id)
         item = QueueItem(key, run_id, callback, options)
 
         # A teardown landing between resolving the queue and handing it the item makes this
         # `put!` throw, and the record written a moment ago by `_register_or_watch!` is then
         # `PENDING` with nothing that will ever run it -- the same orphan #182 removes from the
-        # buffered backlog, arriving through the one door closing the channel leaves open. It is
-        # not rare: `close` raises in every submitter already blocked on a full `Channel(100)`,
-        # so a busy queue torn down mid-deploy produces one of these per waiter.
+        # buffered backlog, arriving through the one door closing the channel leaves open. Before
+        # #324 it was not rare -- `close` raised in every submitter blocked on a full queue --
+        # but no submitter blocks any more, so now it takes a teardown landing in that window.
         #
         # The exception still propagates -- the caller has to learn the submission failed, which
         # is the whole argument for the loud close over a silent hang -- but the record is now
         # terminal rather than abandoned.
+        #
+        # The `put!` itself can no longer BLOCK: the slot reserved above guarantees room in the
+        # buffer (#324). A full queue refuses the submit instead of parking the request here.
         try
             put!(queue.channel, item)
         catch error
+            # Unconditionally, whatever went wrong: the item never reached the buffer.
+            _release_capacity!(runtime, queue, run_id)
             error isa InvalidStateException || rethrow()
             try
                 _abandon_queued_item!(runtime, item)
@@ -861,13 +965,19 @@ function submit_sequential_task(ctx::App, queue_name::AbstractString, task_key::
     return submit_sequential_task(queue_name, task_key, callback, owner; scope, watchers, options, runtime=_resolve_runtime(ctx; key, runtime))
 end
 
-function get_task_status(task_id::AbstractString, authority::TaskAuthority; runtime::WorkerRuntime=default_runtime())
-    task_info = get_task_info(runtime, String(task_id))
-    if task_info === nothing
-        return Dict{Symbol, Any}(:error => "Task not found", :status => "NOT_FOUND")
-    end
+"""
+    get_task_status(task_id, authority::TaskAuthority; runtime=default_runtime()) -> Dict{Symbol, Any}
 
-    _authorize_or_reload!(runtime.store, authority, task_info, "view")
+The task `task_id` as `authority` may see it.
+
+A task that does not exist and a task `authority` may not see get the **same** answer,
+`Dict(:error => "Task not found", :status => "NOT_FOUND")`, so a route should turn that into a
+`404` either way ([#323](https://github.com/PingoLee/Nitro.jl/issues/323)). It never raises
+`AuthorizationError`: that difference let any authenticated user probe another user's task ids.
+"""
+function get_task_status(task_id::AbstractString, authority::TaskAuthority; runtime::WorkerRuntime=default_runtime())
+    task_info = _visible_record(runtime, authority, String(task_id))
+    task_info === nothing && return _not_found()
 
     return Dict{Symbol, Any}(
         :id => task_info.id,
@@ -888,14 +998,21 @@ function get_task_status(ctx::App, task_id::AbstractString, authority::TaskAutho
     return get_task_status(task_id, authority; runtime=_resolve_runtime(ctx; key, runtime))
 end
 
+"""
+    cancel_task(task_id, authority::TaskAuthority; runtime=default_runtime()) -> Dict{Symbol, Any}
+
+Ask `task_id` to stop, as `authority`.
+
+Like [`get_task_status`](@ref), a task `authority` may not see is answered exactly as a missing
+one, with `:status => "NOT_FOUND"` ([#323](https://github.com/PingoLee/Nitro.jl/issues/323)).
+"""
 function cancel_task(task_id::AbstractString, authority::TaskAuthority; runtime::WorkerRuntime=default_runtime())
     return lock_tasks(runtime) do
-        task_info = get_task_info(runtime, String(task_id))
-        if task_info === nothing
-            return Dict{Symbol, Any}(:error => "Task not found")
-        end
-
-        _authorize_or_reload!(runtime.store, authority, task_info, "cancel")
+        # The record served here is the one the fenced claim below addresses: when a live
+        # predecessor and a durable successor disagree, `_visible_record` hands back the run the
+        # caller is authorized on, so the claim can never cancel a run on another run's grant.
+        task_info = _visible_record(runtime, authority, String(task_id))
+        task_info === nothing && return _not_found()
 
         if task_info.status in (COMPLETED, FAILED, CANCELLED)
             return Dict{Symbol, Any}(:error => "Task already finished with status $(task_info.status)")
@@ -908,7 +1025,7 @@ function cancel_task(task_id::AbstractString, authority::TaskAuthority; runtime:
         # Doing this with a read, a decision, and a full-record save under `lock_tasks`
         # was #88: that lock does not span processes.
         # Fencing this on `run_id` is an AUTHORIZATION fix, not merely bookkeeping.
-        # `_authorize_or_reload!` above decided against the watcher list of the run we read,
+        # `_visible_record` above decided against the watcher list of the run we read,
         # and re-running a finished key RESETS that list (`replace_task!`). Cancelling the
         # successor on the predecessor's grant would be an authorization the app never issued
         # — reachable across processes, since `lock_tasks` is process-local for a
@@ -923,7 +1040,7 @@ function cancel_task(task_id::AbstractString, authority::TaskAuthority; runtime:
             # failed the run fence. A live object still reporting RUNNING would render as
             # "already finished with status RUNNING" -- a sentence the CAS above just disproved.
             latest = get_task_info(runtime.store, task_info.id)
-            latest === nothing && return Dict{Symbol, Any}(:error => "Task not found")
+            latest === nothing && return _not_found()
             if latest.run_id != task_info.run_id
                 # Distinguished on purpose: reporting the successor's status here would say
                 # "Task already finished with status PENDING", which is nonsense.
@@ -983,6 +1100,61 @@ end
 
 function cancel_task(ctx::App, task_id::AbstractString, authority::TaskAuthority; key::Symbol=DEFAULT_EXTENSION_KEY, runtime::Union{Nothing, WorkerRuntime}=nothing)
     return cancel_task(task_id, authority; runtime=_resolve_runtime(ctx; key, runtime))
+end
+
+const _TERMINAL_STATUSES = (COMPLETED, FAILED, CANCELLED)
+
+"""
+    release_task!(task_id, ::System; runtime=default_runtime()) -> Dict{Symbol, Any}
+
+Delete a **finished** task's record now, so the next submitter of its key starts fresh instead
+of being refused. Returns `Dict(:status => "Task released")`, or a dict with `:error`.
+
+This is how an administrator reclaims a squatted `:global` key
+([#323](https://github.com/PingoLee/Nitro.jl/issues/323)). A `:global` id has no owner half, so
+the first submitter of a predictable key (`"warm-price-cache"`, `"report-2026-09-25"`) becomes
+its only watcher, and until retention deletes the record, 7 days after it finished by default,
+every other user is refused unless a watch authorizer lets them in. **Derive `:global` keys from
+system data, never from request input**, and use this when one is squatted anyway.
+
+**Admin only: it takes `System()`, and an `Owner` is a `MethodError`**, like
+[`get_queue_status`](@ref). Deleting a finished record discards its result, which is the owner's.
+
+A task that has not finished is refused. Cancel it first. The delete is fenced on the run it
+inspected ([`try_delete_task!`](@ref Nitro.Workers.try_delete_task!)), so if another process
+re-runs the key in between, its fresh record survives and this reports what it found instead.
+
+A run of the released key that is still executing in this process (a cancelled callback that
+has not returned yet) keeps its live handle until it returns, and a reader in this process may
+still be served that run meanwhile. Its terminal write finds no record and stores nothing.
+"""
+function release_task!(task_id::AbstractString, ::System; runtime::WorkerRuntime=default_runtime())
+    id = String(task_id)
+    return lock_tasks(runtime) do
+        # The DURABLE read: this decides whether to destroy a record, which is a claiming call
+        # (workers §2), and the live object may be a predecessor of what the row now holds.
+        task_info = get_task_info(runtime.store, id)
+        task_info === nothing && return _not_found()
+
+        if !(task_info.status in _TERMINAL_STATUSES)
+            return Dict{Symbol, Any}(
+                :error => "Task is still $(task_info.status); cancel it before releasing it")
+        end
+
+        # Fenced on the run this call inspected, so a successor published by another process in
+        # the meantime (`lock_tasks` does not span processes) is not deleted -- it would never run.
+        if !try_delete_task!(runtime.store, id, _TERMINAL_STATUSES; run_id=task_info.run_id)
+            latest = get_task_info(runtime.store, id)
+            latest === nothing && return _not_found()
+            return Dict{Symbol, Any}(
+                :error => "Task changed while it was being released; it is now $(latest.status)")
+        end
+        return Dict{Symbol, Any}(:status => "Task released")
+    end
+end
+
+function release_task!(ctx::App, task_id::AbstractString, authority::System; key::Symbol=DEFAULT_EXTENSION_KEY, runtime::Union{Nothing, WorkerRuntime}=nothing)
+    return release_task!(task_id, authority; runtime=_resolve_runtime(ctx; key, runtime))
 end
 
 """

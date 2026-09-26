@@ -3,7 +3,8 @@ module Errors
 
 import JSON
 
-export ValidationError, CookieError, AuthorizationError, StoreInterfaceError, UnsupportedMediaTypeError
+export ValidationError, CookieError, AuthorizationError, StoreInterfaceError, UnsupportedMediaTypeError,
+    WorkerUnavailableError, WorkerCapacityError
 
 """
     ValidationError(msg::String)
@@ -178,6 +179,65 @@ end
 
 function Base.showerror(io::IO, e::UnsupportedMediaTypeError)
     print(io, "Unsupported Media Type: $(e.msg)")
+end
+
+"""
+    WorkerUnavailableError(msg::String)
+
+The exception an App-first worker call raises when its `App` has **no worker runtime installed**
+([#322](https://github.com/PingoLee/Nitro.jl/issues/322)): `submit_task(app, …)`,
+`get_task_status(app, …)` and the rest of the `Nitro.Workers` task API that takes an `App` first.
+
+Those calls used to fall back to `default_runtime()`. That runtime has none of the app's policy
+(no queue authorizer, no error redactor, no retention), so a request that arrived before
+`worker_startup(app)` had installed the app's runtime silently skipped the app's authorization.
+A missing runtime is now refused instead.
+
+`handle_error` answers it with a fixed `503 Service Unavailable`. It is logged at `@warn`
+without a backtrace: the message is fixed text naming the extension key and the fix, and carries
+no request data. That keeps a misconfiguration visible without a stack trace per request. A
+`503` is also the honest answer for the one legitimate way to reach it: a request landing
+between `terminate()` uninstalling the runtime and a later `serve()` reinstalling it.
+"""
+struct WorkerUnavailableError <: Exception
+    msg::String
+end
+
+function Base.showerror(io::IO, e::WorkerUnavailableError)
+    print(io, "Worker Unavailable: $(e.msg)")
+end
+
+"""
+    WorkerCapacityError(kind::Symbol, msg::String)
+
+The exception a worker submission raises when accepting it would exceed a limit
+([#324](https://github.com/PingoLee/Nitro.jl/issues/324)). Nothing is written when it is thrown:
+no record, no queued item, and a previous run of the same key is not displaced.
+
+| `kind` | Limit | `handle_error` answers |
+|---|---|---|
+| `:runtime` | `WorkerRuntime(store; max_concurrent_runs)`, async runs in flight (64 by default) | `503 Service Unavailable` |
+| `:queue` | a sequential queue's capacity (100 items by default) | `503 Service Unavailable` |
+| `:owner` | `WorkerRuntime(store; max_runs_per_owner)`, one owner's live runs (off by default) | `429 Too Many Requests` |
+
+A full queue used to block the submitting request in `put!` with no timeout, so one owner could
+fill it and hang every other user's request. Submissions now fail fast instead. The first two are
+the server's capacity, hence `503`. The third is this caller's quota, hence `429`. Either way it
+is logged at `@debug` only, with no backtrace.
+"""
+struct WorkerCapacityError <: Exception
+    kind::Symbol
+    msg::String
+
+    function WorkerCapacityError(kind::Symbol, msg::String)
+        kind in (:runtime, :queue, :owner) ||
+            throw(ArgumentError("WorkerCapacityError kind must be :runtime, :queue or :owner, got :$kind"))
+        return new(kind, msg)
+    end
+end
+
+function Base.showerror(io::IO, e::WorkerCapacityError)
+    print(io, "Worker Capacity ($(e.kind)): $(e.msg)")
 end
 
 

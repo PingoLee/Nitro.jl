@@ -7,7 +7,16 @@ using UUIDs
 using TimeZones: ZonedDateTime, FixedTimeZone
 using Nitro
 using Nitro.Workers
+# The store contract and the run/queue internals stopped being exported in #323; this suite
+# exercises them directly, so it names them.
+using Nitro.Workers: get_task_info, set_task!, replace_task!, add_watcher!, try_transition!,
+    delete_task!, try_delete_task!, cleanup_tasks!, list_running_task_refs, RunningTaskRef,
+    lock_tasks, get_active_task, get_active_task_info, register_run!, get_sequential_queues
 using Nitro.Errors: AuthorizationError
+
+# The ONE answer a read or cancel gives both for a missing task and for one the caller may not
+# see (#323), on this backend exactly as on the in-memory one.
+is_not_found(d) = d == Dict{Symbol, Any}(:error => "Task not found", :status => "NOT_FOUND")
 
 # Poll until a task settles, and let a timeout report as ONE failure.
 #
@@ -1036,6 +1045,40 @@ else
             @test get_task_info(store_r, b.id).result == "fresh"
         end
 
+        @testset "try_delete_task! removes only the run it names, in one statement (#323)" begin
+            store_d = RealPormGWorkerStore(model=MockTaskModel())
+            rt_store_d = WorkerRuntime(store_d)
+
+            a = TaskInfo("warm-cache")
+            a.status = COMPLETED
+            replace_task!(store_d, a.id, a)
+
+            # Another run's id, or a status outside `from`: nothing is deleted.
+            @test try_delete_task!(store_d, a.id, (COMPLETED, FAILED, CANCELLED);
+                                   run_id=Nitro.Workers.uuid4()) == false
+            @test try_delete_task!(store_d, a.id, (PENDING, RUNNING); run_id=a.run_id) == false
+            @test get_task_info(store_d, a.id) !== nothing
+            @test try_delete_task!(store_d, "absent", (COMPLETED,); run_id=nothing) == false
+
+            # The run that is there, in a status in `from`: deleted, exactly once.
+            @test try_delete_task!(store_d, a.id, (COMPLETED, FAILED, CANCELLED); run_id=a.run_id) == true
+            @test get_task_info(store_d, a.id) === nothing
+            @test try_delete_task!(store_d, a.id, (COMPLETED,); run_id=a.run_id) == false
+
+            # The fence rode the delete's own filter, as `try_transition!`'s does.
+            fenced = filter(f -> haskey(f, "run_id"), store_d.model._filters_seen)
+            @test !isempty(fenced)
+            @test all(f -> haskey(f, "status__@in") && haskey(f, "id"), fenced)
+
+            # And `release_task!` drives it end to end on this backend.
+            b = TaskInfo("warm-cache-2")
+            b.status = FAILED
+            replace_task!(store_d, b.id, b)
+            @test release_task!(b.id, System(); runtime=rt_store_d) ==
+                  Dict{Symbol, Any}(:status => "Task released")
+            @test get_task_info(store_d, b.id) === nothing
+        end
+
         @testset "replace_task! publishes a new run id; set_task! leaves it alone (#108)" begin
             store_s = RealPormGWorkerStore(model=MockTaskModel())
             rt_store_s = WorkerRuntime(store_s)
@@ -1694,7 +1737,7 @@ else
             # ...and so must the point reads, or the grant works or not by which node answered.
             @test get_task_status("alice::upload", Owner("backend-service"); runtime=rt_store_s)[:id] == "alice::upload"
             # A genuine stranger is still refused after the durable re-check.
-            @test_throws AuthorizationError get_task_status("alice::upload", Owner("stranger"); runtime=rt_store_s)
+            @test is_not_found(get_task_status("alice::upload", Owner("stranger"); runtime=rt_store_s))
         end
 
         @testset "watchers= grants persist through the store (#96)" begin
@@ -1711,7 +1754,7 @@ else
             # `set_task!` too. The non-vacuous #88 cases are above and in workers_tests.jl.)
             @test get_task_status(task_id, Owner("backend-service"); runtime=rt_store_grant)[:result] == "imported"
             @test only(get_all_tasks(store_grant, Owner("backend-service"))).id == task_id
-            @test_throws AuthorizationError get_task_status(task_id, Owner("stranger"); runtime=rt_store_grant)
+            @test is_not_found(get_task_status(task_id, Owner("stranger"); runtime=rt_store_grant))
         end
 
         @testset "add_watcher! reaches a running task's live info" begin
@@ -1812,13 +1855,29 @@ else
             update_progress!(info, 0.0)
             set_task!(store5, info.id, info)  # DB row stuck at 0.0
 
+            # The live object of THE SAME RUN, as a real run registers it: the object it read
+            # from the store, so its `run_id` is the row's (`_claim_run!` checks exactly that).
+            # This fixture used to mint an independent `TaskInfo`, i.e. a different run, which the
+            # overlay then happily applied -- the #323 defect of serving one run's live state as
+            # another's. Since the overlay is run-fenced, the fixture has to say which run it is.
             live = TaskInfo("task-live"; queue_name="reports")
+            live.run_id = info.run_id
             live.status = RUNNING
             update_progress!(live, 73.0)
             Nitro.Workers.register_active_task_info!(rt_store5, live.id, live)
 
             listed = only(get_all_tasks(rt_store5, System(); status=RUNNING))
             @test listed.progress == 73.0
+
+            # ...and a live object of ANOTHER run under the same id overlays nothing (#323).
+            other = TaskInfo("task-live"; queue_name="reports")
+            other.status = CANCELLED
+            update_progress!(other, 99.0)
+            Nitro.Workers.register_active_task_info!(rt_store5, other.id, other)
+            stale = only(get_all_tasks(rt_store5, System(); status=RUNNING))
+            @test stale.progress == 0.0
+            @test stale.status == RUNNING
+            Nitro.Workers.register_active_task_info!(rt_store5, live.id, live)
 
             # The overlay is the RUNTIME's, so the raw store listing still reports the row --
             # which is what makes run-start and zombie recovery able to read durable state.
@@ -1939,7 +1998,7 @@ else
                 b = submit_task("report", () -> "b", Owner("user-b"); runtime=rt_store_e2e)
                 @test a == "user-a::report"
                 @test b == "user-b::report"
-                @test_throws AuthorizationError get_task_status(a, Owner("user-b"); runtime=rt_store_e2e)
+                @test is_not_found(get_task_status(a, Owner("user-b"); runtime=rt_store_e2e))
             finally
                 notify(release)
                 reset_runtime!(rt_store_e2e)
@@ -1995,7 +2054,7 @@ else
 
         @testset "the runtime tears a persistent backend down (#29, #167)" begin
             store_td = RealPormGWorkerStore(model=MockTaskModel())
-            rt_store_td = WorkerRuntime(store_td)
+            rt_store_td = WorkerRuntime(store_td; queues = ["td-queue"])
             owner = Owner("user-td")
 
             try
@@ -2126,7 +2185,7 @@ else
             persisted = get_task_status("shared-export", Owner("victim"); runtime=rt_store_fail)
             @test persisted[:result] == "victim-secret"
             @test persisted[:watcher_count] == 1
-            @test_throws AuthorizationError get_task_status("shared-export", Owner("attacker"); runtime=rt_store_fail)
+            @test is_not_found(get_task_status("shared-export", Owner("attacker"); runtime=rt_store_fail))
         end
 
         @testset "a failed read of one queued item does not kill the processor (#19)" begin
@@ -2136,7 +2195,7 @@ else
             # loop, leaving the queue undrained and every item behind it stranded.
             flaky = FlakyReadModel()
             store_q = RealPormGWorkerStore(model=flaky)
-            rt_store_q = WorkerRuntime(store_q)
+            rt_store_q = WorkerRuntime(store_q; queues = ["qfail"])
             gate = Base.Event()
 
             # One callback shared by all three submits, defined before the processor

@@ -131,8 +131,10 @@ deliberately carries none.
 using Nitro, PormG
 PormG.Configuration.load("db")
 
+app = App(mod = @__MODULE__)
 store = pormg_nitro_worker(db_key="db")
-serve(middleware=[worker_startup(queues=["reports"], store=store)])
+serve(app; middleware=[worker_startup(app; queues=["reports"], store=store)])
+# ...and the task calls take the same `app` first: submit_task(app, key, cb, Owner(uid))
 ```
 """
 function pormg_nitro_worker end

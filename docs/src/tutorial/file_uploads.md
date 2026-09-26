@@ -251,10 +251,15 @@ function submit_import(req, upload::Files{FormFile})
     file = upload.payload
 
     # Scope the task to its owner. `getuser(req)` is `nothing` unless auth middleware
-    # ran, so check before reaching into it — the route below carries
-    # `login_required()`, which is what makes the Principal branch the real one.
+    # ran — the route below carries `login_required()` — and a token with no subject
+    # claim still authenticates, with `principal.id === nothing`. REFUSE both rather than
+    # falling back to a shared name like "anonymous": every such caller would become ONE
+    # worker identity, able to read and cancel each other's imports. An
+    # `AuthorizationError` is answered with a 403.
     principal = getuser(req)
-    user_id = principal === nothing ? "anonymous" : something(principal.id, "anonymous")
+    (principal === nothing || principal.id === nothing) &&
+        throw(Nitro.AuthorizationError("no user subject on this request"))
+    owner = Nitro.Workers.Owner(principal.id)
 
     # 1. Stage to disk — the UUID task_key is the real identity; the original
     #    filename is sanitized to a bare basename so it can't traverse paths.
@@ -272,7 +277,7 @@ function submit_import(req, upload::Files{FormFile})
         "import_queue",
         task_key,
         (task) -> MyImportModule.process(staged_path),
-        user_id,
+        owner,
     )
 
     # 3. Return immediately
@@ -292,6 +297,17 @@ end # module ImportHandlers
 path("/api/import", ImportHandlers.submit_import, method="POST",
      middleware=[GuardMiddleware(login_required())]),
 ```
+
+**Server** — the submit above names `Nitro.CONTEXT[]`, so the worker runtime must be installed
+there, with `import_queue` in its `queues`. The argument-less `worker_startup` does both:
+
+```julia
+serve(middleware=[worker_startup(queues=["import_queue"])])
+```
+
+Without it the submit is refused with `WorkerUnavailableError`, a `503`: a task call never falls
+back to a runtime the app did not install. With an explicit `App`, pass it in both places instead
+(`worker_startup(app; …)` and `submit_sequential_task(app, …)`).
 
 ## Sending multipart requests (client side)
 

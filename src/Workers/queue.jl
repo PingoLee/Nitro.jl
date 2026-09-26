@@ -241,8 +241,22 @@ function _execute_queued_task(runtime::WorkerRuntime, item::QueueItem)
     # handle publish, as one critical section under the store lock -- see `_claim_run!` for why
     # each of those is the way it is. `nothing` means this run must not start: the record is
     # gone, it belongs to a successor, or it was cancelled before it was dequeued.
-    task_info = _claim_run!(runtime, item.task_key, item.run_id)
-    task_info === nothing && return nothing
+    #
+    # Every way out of this function gives back the run's capacity reservation (#324), exactly
+    # once -- `_release_run!` is idempotent by `run_id` -- except a timed-out callback, which keeps
+    # it until it actually returns (`_RunHandoff`, `execution.jl`).
+    task_info = try
+        _claim_run!(runtime, item.task_key, item.run_id)
+    catch
+        _release_run!(runtime, item.run_id)
+        rethrow()
+    end
+    task_info === nothing && (_release_run!(runtime, item.run_id); return nothing)
+    # A sequential callback abandoned by its deadline also counts against the RUNTIME cap until
+    # it returns: the processor moves on to the next item, so without this each queue could add
+    # one still-running callback per timeout, with nothing bounding them.
+    handoff = _RunHandoff(() -> _release_run!(runtime, item.run_id),
+                          () -> _count_abandoned!(runtime, item.run_id))
 
     # From here `task_info` is a snapshot of THIS run's record -- on `InMemoryWorkerStore` the
     # very object the registry holds, on `PormGWorkerStore` a fresh deserialization of its row.
@@ -250,8 +264,8 @@ function _execute_queued_task(runtime::WorkerRuntime, item::QueueItem)
     # Progress is harmless -- the run overwrites it itself. A concurrent grant lands on this
     # object through `add_watcher!`'s mirror, now that the handles are already published; before
     # the claim was atomic there was a window in which it wrote to nothing. Authorization
-    # survives either way, because `_authorize_or_reload!` re-reads the durable record whenever
-    # the cached one denies.
+    # survives either way, because `_visible_record` re-reads the durable record whenever the
+    # cached one denies.
 
     # Starting is a CLAIMED transition, not an unconditional write. `set_task!` has no
     # precondition, so a `cancel_task` that already claimed PENDING -> CANCELLED was simply
@@ -311,7 +325,8 @@ function _execute_queued_task(runtime::WorkerRuntime, item::QueueItem)
         max_attempts = item.options.retry_on_failure ? item.options.max_retries : 0
         for retry_count in 0:max_attempts
             try
-                result = timeout_call(item.callback, task_info; timeout=item.options.timeout)
+                handoff = _RunHandoff(handoff)           # a fresh one per attempt
+                result = timeout_call(item.callback, task_info; timeout=item.options.timeout, handoff)
                 return _complete_task!(runtime, task_info, result)
             catch error
                 unwrapped = _unwrap_exception(error)
@@ -374,6 +389,7 @@ function _execute_queued_task(runtime::WorkerRuntime, item::QueueItem)
         return task_info
     finally
         _deregister_run!(runtime, task_info)
+        _handed_off(handoff) || _release_run!(runtime, item.run_id)
     end
 end
 
@@ -403,6 +419,25 @@ function _start_queue_processor(runtime::WorkerRuntime, queue_name::String)
                         end
                         rethrow(error)
                     end
+                    # The item has left the buffer, so its slot is free for the next submit
+                    # (#324). Its OWNER's reservation lasts until the run ends.
+                    _release_queue_slot!(queue)
+
+                    # While abandoned sequential callbacks fill the runtime cap, hold this item
+                    # rather than start another beside them (#324). That is what stops a queue of
+                    # timing-out callbacks from piling up threads one per deadline. It is keyed on
+                    # those callbacks ALONE -- `_abandoned_saturated` says why not on async load --
+                    # and it pauses the QUEUE, never a submitter: new submits still fail fast once
+                    # the buffer fills. The held item is parked on `queue.held`, where `shutdown!`
+                    # collects it; a teardown also ends the pause, and the item is then abandoned
+                    # below like any other.
+                    if _abandoned_saturated(runtime)
+                        lock(() -> (queue.held = item), qlock)
+                        while _abandoned_saturated(runtime) && !(@atomic queue.draining)
+                            sleep(0.05)
+                        end
+                        lock(() -> (queue.held = nothing), qlock)
+                    end
 
                     # BEFORE `_mark_queue_current_task!` and before `_execute_queued_task`'s
                     # `_claim_run!`, so once `draining` is visible no further run starts,
@@ -421,6 +456,7 @@ function _start_queue_processor(runtime::WorkerRuntime, queue_name::String)
                         catch error
                             @error "Worker queue item abandoned but not recorded during teardown" exception=(error, catch_backtrace()) queue_name=queue_name task_key=item.task_key
                         end
+                        _release_run!(runtime, item.run_id)    # after the `catch`: never skipped
                         continue
                     end
 

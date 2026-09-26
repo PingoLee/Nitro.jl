@@ -257,15 +257,10 @@ function _is_authorized(authority::Owner, task_info::TaskInfo)
     return authority.user_id in task_info.watchers
 end
 
-# Split on the authority rather than branched inside one method, so `System` never
-# reaches an `authority.user_id` field access.
-_authorize_task!(::System, ::TaskInfo, ::AbstractString) = nothing
-
-function _authorize_task!(authority::Owner, task_info::TaskInfo, action::AbstractString)
-    _is_authorized(authority, task_info) && return nothing
-    throw(AuthorizationError(
-        "User '$(authority.user_id)' is not authorized to $action task '$(task_info.id)'"))
-end
+# There is deliberately no raising `_authorize_task!` any more (#323). The read and cancel paths
+# answer a task the caller may not see exactly as a missing one, so a denial there is a
+# `nothing` from `_visible_record`, never an exception. `AuthorizationError` is left to the
+# SUBMIT paths -- queue, join, grant -- where the caller already named the task and learns nothing.
 
 """
     update_progress!(task_info::TaskInfo, value::Real)
@@ -483,9 +478,24 @@ mutable struct SequentialQueue
     #
     # `@atomic` because the writer is `shutdown!` and the reader is the processor task.
     @atomic draining::Bool
+    # Slots handed out to submissions that have not yet been TAKEN by the processor (#324).
+    # Reserved before the record is written and released at `take!`, so it bounds the buffer
+    # exactly and `put!` can never block: a full queue refuses the submit instead of parking the
+    # submitting request in `put!` with no timeout, which let one owner hang everyone else.
+    # `capacity` is stored rather than read back off the `Channel`'s internals.
+    capacity::Int
+    @atomic reserved::Int
+    # The item the processor has TAKEN but is holding back while abandoned sequential callbacks
+    # fill the runtime cap (#324), under `queue_lock`. It is out of the channel, so `shutdown!`'s
+    # collect step would miss it, and it would be abandoned only after the teardown had returned --
+    # PENDING forever on a persistent store if the process exits first (the #182 orphan). So
+    # `shutdown!` collects it from here too; both abandons are the same idempotent CAS.
+    held::Union{Nothing, QueueItem}
 
     function SequentialQueue(size::Int=100)
-        return new(Channel{QueueItem}(size), false, nothing, ReentrantLock(), nothing, false)
+        size >= 1 || throw(ArgumentError("SequentialQueue size must be at least 1, got $size"))
+        return new(Channel{QueueItem}(size), false, nothing, ReentrantLock(), nothing, false, size, 0,
+                   nothing)
     end
 end
 

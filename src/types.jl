@@ -60,7 +60,7 @@ hold in memory. A check followed by a separate write re-opens the race.
 # Optional
 
 `cleanup_expired_sessions!(store)` prunes expired rows and **defaults to a no-op**. That is the one
-asymmetry with `AbstractWorkerStore`, whose fifteen data-and-policy methods are all required, and it
+asymmetry with `AbstractWorkerStore`, whose sixteen data-and-policy methods are all required, and it
 is deliberate: expiry here is enforced on the *read* path — `get_session` refuses a payload whose
 `expires` has passed — so a store that never prunes wastes rows but never serves a stale session.
 Implement it for any store whose rows outlive the process.

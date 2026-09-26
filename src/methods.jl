@@ -206,9 +206,33 @@ end
     worker_startup(; kwargs...)
 
 Create a lifecycle middleware that starts `Nitro.Workers` when `serve()` starts and
-shuts the worker runtime down when the server terminates.
+shuts the worker runtime down when the server terminates. This is the argument-less form over the
+global app, and it runs **`default_runtime()`** — the runtime the bare task API
+(`submit_task(key, …)`, `get_task_status(id, …)`) uses — so the two agree
+([#322](https://github.com/PingoLee/Nitro.jl/issues/322)).
+
+It therefore refuses `store = …`, a `runtime = …` other than `default_runtime()`, and a different
+runtime already installed on the global app, each with an `ArgumentError`: the bare task API
+could never see that runtime, so a submission would silently skip its policy. To choose a
+backend, use the App-first form, `worker_startup(app; store = …)`, with App-first task calls.
 """
-worker_startup(; kwargs...) = Nitro.Workers.startup(CONTEXT[]; kwargs...)
+function worker_startup(; kwargs...)
+    app = CONTEXT[]
+    fix = "The bare task API always runs on `default_runtime()`, so it could never see that " *
+          "runtime. Use `worker_startup(app; …)` with App-first calls (`submit_task(app, …)`)."
+    haskey(kwargs, :store) && throw(ArgumentError(
+        "bare `worker_startup(store = …)` is not supported. $fix"))
+    default = Nitro.Workers.default_runtime()
+    requested = get(kwargs, :runtime, nothing)
+    (requested === nothing || requested === default) || throw(ArgumentError(
+        "bare `worker_startup(runtime = …)` accepts only `default_runtime()`. $fix"))
+    installed = Nitro.Workers.worker_runtime(app;
+                                             key = get(kwargs, :key, Nitro.Workers.DEFAULT_EXTENSION_KEY))
+    (installed === nothing || installed === default) || throw(ArgumentError(
+        "the global app already has a different worker runtime installed, and bare " *
+        "`worker_startup()` would shut it down to install `default_runtime()`. $fix"))
+    return Nitro.Workers.startup(app; merge(values(kwargs), (runtime = default,))...)
+end
 
 
 ### Core Routing Functions (Internal plumbing for path() and urlpatterns()) ###
@@ -805,6 +829,34 @@ function serve(app::App; kwargs...)
     end
 end
 
+"""
+    worker_startup(app::App; queues=String[], store=nothing, runtime=nothing, kwargs...)
+
+The App-first form: a lifecycle middleware for `serve(app; middleware = [...])` that runs `app`'s
+worker runtime. Pass `store = …` to choose a backend, or `runtime = …` to adopt one you built.
+
+**The runtime is installed when this is called, not when the server starts**
+([#322](https://github.com/PingoLee/Nitro.jl/issues/322)). `serve()` opens its listener before it
+runs startup hooks, so a runtime installed by the hook left a window in which App-first calls
+found nothing installed. So `worker_store(app)` is available straight after building the
+middleware, which is the moment to install policy on it:
+
+```julia
+app = App(mod = @__MODULE__)
+workers = worker_startup(app; queues = ["reports"], store = persistent_store)
+set_queue_authorizer!(worker_store(app), my_authorizer)
+serve(app; middleware = [workers])
+```
+
+The startup hook still does the running part: the zombie sweep, one processor per queue in
+`queues`, and the retention scheduler. The shutdown hook drains and uninstalls, and a later
+`serve` reinstalls the same runtime. Passing both `store` and `runtime` throws here.
+
+Because building it installs, **build it once**. Calling `worker_startup(app; store = s2)` again
+while `app` is serving with another store replaces the running runtime at that moment: the old one
+is shut down and drained, even if the `serve` you meant to pass it to never happens. Rebuilding
+with the same store object is a no-op.
+"""
 worker_startup(app::App; kwargs...) = Nitro.Workers.startup(app; kwargs...)
 
 """

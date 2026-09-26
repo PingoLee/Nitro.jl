@@ -178,20 +178,27 @@ try
         @test internalrequest(app2, HTTP.Request("GET", "/spa/index.html")).status == 200
 
         # `worker_startup` returns LIFECYCLE MIDDLEWARE for the `serve(middleware = [...])`
-        # list -- it does not install a store by itself; `Workers.start!` does that. Both are
-        # asserted, because the distinction is exactly what the UPGRADING caveat turns on:
-        # an app with no store installed falls back to the process-wide default.
+        # list, and since #322 it installs the app's runtime when it is BUILT: `serve` opens its
+        # listener before running startup hooks, and an App-first call that found nothing
+        # installed used to fall back to the process-wide runtime, skipping the app's policy.
+        # (This block used to assert the opposite -- nothing installed until `on_startup` -- which
+        # was that window, recorded as design.) It must land on THIS app and no other.
         @test Nitro.Workers.worker_store(app1) === nothing
         lm = worker_startup(app1; queues = String[], cleanup_enabled = false, recover_zombies = false)
         @test lm isa Nitro.Core.Types.LifecycleMiddleware
-
-        # Firing the hook is what `serve(middleware = [...])` does; the return type alone is
-        # `LifecycleMiddleware` whichever app the closure captured, so it proves nothing.
-        lm.on_startup()
         @test Nitro.Workers.worker_store(app1) !== nothing
         @test Nitro.Workers.worker_store(Nitro.CONTEXT[]) === nothing
         @test Nitro.Workers.worker_store(app2) === nothing
+
+        # Firing the hook is what `serve(middleware = [...])` does: it starts the runtime the
+        # build installed, and still touches no other app.
+        installed = Nitro.Workers.worker_runtime(app1)
+        lm.on_startup()
+        @test Nitro.Workers.worker_runtime(app1) === installed
+        @test Nitro.Workers.worker_store(Nitro.CONTEXT[]) === nothing
+        @test Nitro.Workers.worker_store(app2) === nothing
         lm.on_shutdown()
+        @test Nitro.Workers.worker_store(app1) === nothing
     end
 finally
     terminate(app1)

@@ -59,7 +59,7 @@ Report missing env vars by name; do not invent secret values.
       OAuth `code`/`state` carried in URLs never reach the logs. Enable
       `serve(...; access_log_query=true)` only when you are certain no secrets travel in
       query strings.
-- [ ] Worker `worker_startup(..., store=..., recover_zombies=...)` configured if background queues are used (`workers.instructions.md`).
+- [ ] Worker `worker_startup(app; store=..., recover_zombies=...)` configured if background queues are used, with every task call App-first (`submit_task(app, …)`) — an `App` with no runtime installed is a 503 (`workers.instructions.md`).
 - [ ] **Process sizing is set on the unit, not left to defaults.** The start command passes
       `--threads` (a bare `julia` serves on **one** thread), and the GC has a target: a
       `--heap-size-hint` / `JULIA_HEAP_SIZE_HINT`, or a cgroup limit (`MemoryMax=`, container

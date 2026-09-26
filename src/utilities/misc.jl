@@ -2,7 +2,8 @@ using HTTP
 using JSON
 using Dates
 
-using ..Errors: ValidationError, UnsupportedMediaTypeError, is_unrecoverable
+using ..Errors: ValidationError, UnsupportedMediaTypeError, AuthorizationError, WorkerUnavailableError,
+    WorkerCapacityError, is_unrecoverable
 using .BodyParsers: _parse_json_bounded
 
 export recursive_merge, parseparam, parsebody, parseparam_checked,
@@ -20,6 +21,28 @@ end
 
 function handle_error(::UnsupportedMediaTypeError)
     return Res.json(("message" => "415: Unsupported Media Type"), status = 415)
+end
+
+# A refusal, not a fault (#323). It used to fall to `handle_error(::Any)`: a 500 plus an `@error`
+# with a full backtrace, so every probe of someone else's task wrote a stack trace (the #18
+# log-flood class) while a missing task answered 404 -- the difference was the oracle.
+function handle_error(::AuthorizationError)
+    return Res.json(("message" => "403: Forbidden"), status = 403)
+end
+
+# The App a worker call named has no runtime installed (#322). It used to fall back to the
+# process-wide runtime, which carries none of the app's policy; now it is refused, and "the
+# service this route needs is not up" is a 503, not a 500.
+function handle_error(::WorkerUnavailableError)
+    return Res.json(("message" => "503: Service Unavailable"), status = 503)
+end
+
+# A worker limit (#324). The runtime's concurrency cap and a full queue are the SERVER's capacity,
+# so 503; a per-owner quota is THIS caller's, so 429. A full queue used to block the handler in
+# `put!` indefinitely instead.
+function handle_error(e::WorkerCapacityError)
+    e.kind === :owner && return Res.json(("message" => "429: Too Many Requests"), status = 429)
+    return Res.json(("message" => "503: Service Unavailable"), status = 503)
 end
 
 function handle_error(::Any)
@@ -70,6 +93,20 @@ function handlerequest(getresponse::Function, catch_errors::Bool; show_errors::B
                 # Client input too, so the same treatment: no backtrace. `.msg` names the
                 # parameter and the type it needs, never the Content-Type the client sent (#327).
                 show_errors && @debug "Request rejected (415 Unsupported Media Type)" message=error.msg
+            elseif error isa AuthorizationError
+                # A refusal, so no backtrace -- and, unlike the two branches above, not even
+                # `.msg`: an `AuthorizationError`'s message names the caller-chosen queue or task key
+                # verbatim, and it is not pinned value-free the way `ValidationError.msg` is (#323).
+                show_errors && @debug "Request refused (403 Forbidden)"
+            elseif error isa WorkerUnavailableError
+                # A misconfiguration or a restart gap, not a client fault -- so visible, at
+                # `@warn`, but without a backtrace per request. `.msg` is fixed text naming the
+                # extension key and the fix; it carries no request data (#322).
+                show_errors && @warn "Request refused (503): no worker runtime installed" message=error.msg
+            elseif error isa WorkerCapacityError
+                # Back-pressure, not a fault: a burst would otherwise write one line per refused
+                # request at exactly the moment the server is busiest. `kind` only -- no message.
+                show_errors && @debug "Request refused: worker capacity" kind=error.kind
             elseif show_errors && !isa(error, InterruptException)
                 @error "ERROR: " exception=(error, catch_backtrace())
             end

@@ -119,6 +119,25 @@ end
     @test json(r)["message"] == "415: Unsupported Media Type"
 end
 
+@testset "an AuthorizationError is a 403 with a fixed body, logged without its message (#323)" begin
+    # It used to be a 500 with an `@error` and a full backtrace per refusal: a log-flood vector
+    # (#18), and -- next to a missing task's 404 -- a task-existence oracle.
+    secret = "victim::export_payroll_2026"
+    mw = handler -> (req::HTTP.Request -> throw(Nitro.Core.Errors.AuthorizationError("not yours: $secret")))
+    buf = IOBuffer()
+    r = Base.CoreLogging.with_logger(Base.CoreLogging.SimpleLogger(buf, Base.CoreLogging.Debug)) do
+        internalrequest(app, get_("/ok"); middleware = [mw])
+    end
+    @test r.status == 403
+    @test json(r) == Dict("message" => "403: Forbidden")
+    logged = String(take!(buf))
+    # Refused at @debug, and the message -- which names caller-chosen keys -- never reaches the log.
+    @test occursin("Request refused (403 Forbidden)", logged)
+    @test !occursin(secret, logged)
+    @test !occursin("Stacktrace", logged)
+    @test !occursin("Error", logged)
+end
+
 @testset "a handler exception is logged exactly once, not once per layer" begin
     # The inner serializer catches it and the outer boundary sees a normal response. Exact
     # sequence at Error level: one entry, not two.

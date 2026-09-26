@@ -406,7 +406,7 @@ get_all_tasks(authority::TaskAuthority, filter_status = nothing; runtime = defau
 # The authority is REQUIRED on all three — omitting it is a MethodError, not a bypass.
 
 scoped_task_key(task_key, owner::Owner; scope = :user)        # "user-a::report_42"
-worker_startup(; queues, store, recover_zombies)              # a middleware
+worker_startup(app; queues, store, recover_zombies)           # a middleware; installs on `app` when built (#322)
 
 # `store=` selects a BACKEND and appears only on worker_startup / start! / startup / install!.
 # Every call above takes `runtime=`, or an `App` first argument that resolves one (#167):
