@@ -71,7 +71,8 @@ Nitro's own limits are the floor underneath, for a process the proxy is not in f
 |---|---|---|
 | `read_header_timeout` | 120 s | How long a connection may take to send a complete request head, and on HTTP/1.1 how long a keep-alive connection may sit idle. A Slowloris client is answered `408` and dropped |
 | `max_body_bytes` | 64 MiB | How much one request body may hold |
-| `max_concurrent_requests` | off | How many requests are held at once, and so, with `max_body_bytes`, how much body memory. Over it, a request is answered `503` before its body is read. A WebSocket holds one of these slots for as long as it is open; see [Bounding requests in flight](@ref) |
+| `max_concurrent_requests` | off | How many requests are held at once, and so, with `max_body_bytes`, how much body memory. Over it, a request is answered `503` before its body is read. A WebSocket holds one of these slots for as long as it is open, unless `max_upgraded_connections` gives WebSockets their own budget (and its handshake carried no body); see [Bounding requests in flight](@ref) |
+| `max_upgraded_connections` | off | How many WebSockets are open at once — how many, not how much memory each holds. A socket counts here from its handshake, and once its `101` is sent it no longer counts against `max_concurrent_requests` — unless the handshake carried a body; over it, an upgrade is answered `503` |
 | `read_timeout` | off | How long the body may take once the head has arrived. Off because a legitimate large upload over a slow link can take minutes; turn it on when the proxy is not buffering bodies for you |
 
 `read_header_timeout` deliberately does not cover the body, so a slow upload is only cut by
@@ -201,7 +202,9 @@ Four things in that config are easy to get wrong, and three of them fail *quietl
   upstream and the pool is never reused — the directive looks active and does nothing.
 - **SSE needs `proxy_buffering off`.** nginx buffers proxied responses by default, which is right for
   JSON and wrong for an event stream: without it the endpoint simply appears to hang. A WebSocket
-  route missing `Upgrade`/`Connection` fails the handshake with a confusing `400`.
+  route missing `Upgrade`/`Connection` fails the handshake with a confusing `400`. Behind TLS
+  termination a WebSocket route also needs `ExtractIP(forwarded_proto = …)`, or every browser
+  upgrade is a `403` — see [WebSocket upgrades and the Origin check](@ref).
 
 ## Caddy
 
@@ -253,7 +256,9 @@ Two asymmetries with the nginx config above, both in Caddy's favour:
 
 `reverse_proxy` sets `X-Forwarded-For`, `X-Forwarded-Proto` and `X-Forwarded-Host` for you and
 handles WebSocket upgrades with no extra configuration. It does **not** set `X-Real-IP` — so pair it
-with the `:x_forwarded_for` variant of `ExtractIP` below, not the `:x_real_ip` one.
+with the `:x_forwarded_for` variant of `ExtractIP` below, not the `:x_real_ip` one. Because it
+terminates TLS, WebSocket routes also need `forwarded_proto` — see
+[WebSocket upgrades and the Origin check](@ref).
 
 ## Keep Nitro unreachable directly
 
@@ -309,10 +314,12 @@ serve(middleware = [
 |---|---|
 | `trusted_proxies` | The peers whose forwarding header may be believed. `IPAddr` values or CIDR strings. |
 | `forwarded_header` | The **one** header your proxy writes: `:x_forwarded_for`, `:x_real_ip`, `:cf_connecting_ip`, or `:true_client_ip`. |
+| `forwarded_proto` | The header your proxy writes the client's scheme into: `:x_forwarded_proto`. Only needed for WebSocket routes behind TLS termination — see [WebSocket upgrades and the Origin check](@ref). |
 
-Setting either one alone is an `ArgumentError` at startup. A trust boundary with no header named
-reads nothing; a header with no trust boundary is honored from any client, which is the whole
-problem. Nitro refuses both rather than starting in a configuration that looks active and isn't.
+A trust boundary with no header named, and a header with no trust boundary, are each an
+`ArgumentError` at startup. The first reads nothing; the second is honored from any client, which
+is the whole problem. Nitro refuses both rather than starting in a configuration that looks active
+and isn't.
 
 **Only the header you name is ever read.** If you declare `:x_forwarded_for`, a request carrying
 `CF-Connecting-IP` is not consulted at all — so a proxy that forgets to strip a vendor header
@@ -483,6 +490,42 @@ as `203.0.113.7`, so the same host logs identically whether it connected directl
 your proxy. That demotion happens where `serve` reads the socket, so it applies even with no
 `ExtractIP` in the pipeline.
 
+## WebSocket upgrades and the Origin check
+
+Every WebSocket upgrade passes a same-origin check: a browser's `Origin` must name this server's own
+scheme, host and port. That check is what stops a page on another site from opening a socket that
+rides your users' cookies — cross-site WebSocket hijacking — and it is the only thing that does.
+
+Behind a proxy that terminates TLS, the *scheme* half is wrong unless Nitro is told. The page is
+`https://app.example.com`, so the browser sends `Origin: https://app.example.com`, but the proxy
+reaches Nitro over plain TCP — and a secure origin on an insecure connection is refused with `403`,
+for every browser. Tell `ExtractIP` which header the proxy writes the client's scheme into. Both
+configs above already send it (`X-Forwarded-Proto $scheme`; Caddy does it by default):
+
+```julia
+serve(middleware = [
+    ExtractIP(forwarded_header = :x_forwarded_for,
+              forwarded_proto  = :x_forwarded_proto,
+              trusted_proxies  = [ip"127.0.0.1"]),
+])
+```
+
+`forwarded_proto` can also be set without `forwarded_header` if the scheme is all you need. The
+value is read only from a peer in `trusted_proxies`, the leftmost entry of a list counts, and
+Traefik's `wss`/`ws` are read as `https`/`http`.
+
+- **Keep `Host` the public host.** The Origin is compared with the `Host` Nitro receives.
+  `proxy_set_header Host $host` does that; nginx's default, the upstream's own name, turns every
+  upgrade back into a `403`. Behind a non-default public port use `$http_host`, which keeps the port.
+- **Never strip or rewrite `Origin` to make the 403 go away.** A handshake with no `Origin` is let
+  through — that is how a non-browser client is recognized — so stripping it switches the check off
+  for everyone, including the cross-site page it exists to stop.
+- **The scheme cannot admit another site.** It only decides whether `https://<Host>` or
+  `http://<Host>` is same-origin: `Origin: https://evil.example` is refused whatever the proxy
+  reports, and a scheme sent by a peer outside `trusted_proxies` is ignored.
+- A refused upgrade logs **one** warning the first time it happens, with each refusal's `Origin` and
+  status at debug level. It is not an application error, and it records the `403` the client got.
+
 ## Checklist
 
 **The proxy layer**
@@ -494,6 +537,8 @@ your proxy. That demotion happens where `serve` reads the socket, so it applies 
       and it is **not larger** than Nitro's own `serve(max_body_bytes = …)` — otherwise the proxy
       forwards uploads that Nitro will only reject after buffering them.
 - [ ] SSE routes disable response buffering; WebSocket routes pass `Upgrade`/`Connection`.
+- [ ] Behind TLS termination, WebSocket routes have `ExtractIP(forwarded_proto = …)` configured,
+      the proxy forwards the public `Host`, and nothing strips `Origin`.
 - [ ] The Nitro port is not reachable except through the proxy — check the container's published
       ports and any network policy, not just `host`.
 - [ ] Authorization is enforced in handlers. No `location` block is the only thing guarding a route.

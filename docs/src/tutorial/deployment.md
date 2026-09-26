@@ -115,9 +115,32 @@ one request. A request holds its slot while its body is read, its handler runs a
 written to the socket. That includes a streamed `Res.file`: it has a length, and HTTP.jl buffers a
 response with a length whole on HTTP/1.1, so a large download counts against memory like any other
 response. Only a response with no length — `Res.sse` — gives its slot back once it starts
-streaming, because it holds one chunk at a time and can stay open for hours. A **WebSocket** holds
-its slot for its whole lifetime, and so does a `STREAM` handler, so leave room for those in the
-number.
+streaming, because it holds one chunk at a time and can stay open for hours. A `STREAM` handler
+holds its slot for its whole lifetime, so leave room for those in the number.
+
+A **WebSocket** holds its slot for its whole lifetime too, unless you give WebSockets a budget of
+their own. A few hundred idle chat or notification sockets would otherwise fill the cap while using
+almost no memory, and every ordinary request would get a `503`:
+
+```julia
+# Up to 64 ordinary requests in flight, and up to 1000 open WebSockets besides
+serve(app; max_concurrent_requests = 64, max_upgraded_connections = 1000)
+```
+
+With `max_upgraded_connections` set, an upgrade takes a slot of that budget before the handshake
+and gives its request slot back once the `101` is sent — the split ASP.NET Core's Kestrel makes
+between `MaxConcurrentConnections` and `MaxConcurrentUpgradedConnections`. When the budget is full
+the upgrade is answered `503` with `Retry-After: 1`, and no `101`. That refusal comes from the
+route's handler, after your middleware, so it appears in the access log and a request your auth
+refuses never takes a slot. A `STREAM` handler is not an upgrade and stays on the request cap: it
+has no moment at which it turns from a request into a long-lived connection. Nor does a handshake
+that carried a request body: the body stays reachable from the handler for the socket's life, so
+that socket keeps its request slot as well.
+
+The budget bounds how many sockets are open, not what each one holds. An idle socket costs little,
+but a message a client sends is buffered whole, up to HTTP.jl's frame and fragment limits, which
+Nitro does not currently lower — and messages your handler has not read yet queue without a limit,
+so a handler that falls behind a fast client lets that one socket grow.
 
 The cap bounds how many requests are held, not for how long. With `read_timeout` off (the default),
 a client that sends a head and then trickles its body holds a slot as long as it likes, and without

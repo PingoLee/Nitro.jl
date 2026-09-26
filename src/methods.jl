@@ -99,7 +99,8 @@ is explicit introspection, not accidental disclosure.)
   holds its slot while its body is read, its handler runs, and its response is written to the
   socket — including a streamed `Res.file`, which HTTP.jl buffers whole on HTTP/1.1 because it
   has a length. A response with no length (`Res.sse`) gives the slot back once it starts
-  streaming. A WebSocket or a `STREAM` handler holds its slot for its whole lifetime.
+  streaming. A `STREAM` handler holds its slot for its whole lifetime, and so does a WebSocket
+  unless `max_upgraded_connections` is set.
 
   The slot bounds how many, not for how long. With `read_timeout` unset, a client that sends a
   head and then trickles its body holds a slot as long as it likes, and without `write_timeout`
@@ -108,6 +109,18 @@ is explicit introspection, not accidental disclosure.)
   **exposed directly, set both timeouts alongside the cap.** Throws with a custom `handler`,
   like `max_body_bytes`. The refusal happens before any middleware runs, so it produces no
   access-log line (one warning is logged the first time).
+- `max_upgraded_connections=nothing`: a separate budget for open WebSockets (#376), like Kestrel's
+  `MaxConcurrentUpgradedConnections`. `nothing` means no limit, and then a WebSocket keeps its
+  `max_concurrent_requests` slot for its whole lifetime. When it is set, an upgrade takes one of
+  these slots before the handshake and, once the `101` is sent, gives its request slot back — so
+  a few hundred idle sockets no longer starve ordinary requests into `503`s. An upgrade that finds
+  the budget full is answered **503** with `Retry-After: 1` and no `101`. Because the WebSocket is
+  the route's handler, that refusal comes after the middleware chain: it gets an access-log line,
+  and a request auth refuses never takes a slot. The budget also bounds the per-socket reader
+  tasks HTTP.jl starts; it bounds how many sockets are open, not the memory each one holds. A
+  `STREAM` handler is not a WebSocket and keeps its request slot, and so does a handshake that
+  carried a request body, which stays reachable for the socket's life. Throws with a custom
+  `handler`.
 - `reuseaddr`: forwarded to `HTTP.listen!`. Defaults to `true` on Linux/macOS, where it
   allows rebinding a port still in `TIME_WAIT`, and to **`false` on Windows**, where
   `SO_REUSEADDR` instead lets a second process bind a port another is actively listening

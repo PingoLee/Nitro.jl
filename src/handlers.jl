@@ -2,9 +2,10 @@ module Handlers
 using HTTP
 using ..Types: Nullable
 using ..Constants: SPECIAL_METHODS, TYPE_ALIASES
-# `getcontext` is a forward declaration at src/core.jl:42, above this file's include --
-# the stub block exists precisely so submodules can bind Core names at include time.
-using ...Core: getcontext
+# `getcontext` and `_upgrade_websocket!` are forward declarations in src/core.jl, above this
+# file's include -- the stub block exists precisely so submodules can bind Core names at include
+# time.
+using ...Core: getcontext, _upgrade_websocket!
 
 export select_handler, first_arg_type
 
@@ -115,7 +116,9 @@ Returns a handler for `HTTP.WebSockets.WebSocket`types
 function select_handler(::Type{HTTP.WebSockets.WebSocket}, has_ctx_kwarg::Bool, has_req_kwarg::Bool, has_path_params::Bool; no_args=false)
     invoker = get_invoker_strategy(has_ctx_kwarg, has_req_kwarg, has_path_params, no_args)
     function (req::HTTP.Request, func::Function; parameters::Nullable{Tuple}=nothing)
-        HTTP.WebSockets.isupgrade(req) && HTTP.WebSockets.upgrade(ws -> invoker(func, ws, req, parameters), req.context[:stream])
+        # The handshake, the proxy-aware Origin check and a refusal's logging live in
+        # core/transport.jl (#374).
+        _upgrade_websocket!(ws -> invoker(func, ws, req, parameters), req)
     end
 end
 

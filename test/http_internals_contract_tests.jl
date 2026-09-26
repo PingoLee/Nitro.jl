@@ -20,6 +20,10 @@ import Sockets
 #   • src/core/pipeline.jl — `_allowed_methods` walks the router's route tree to build a 405's
 #       `Allow` header (#281): `Router.routes`, the `Node`/`Leaf`/`Variable` fields, `match`,
 #       `_route_variable_matches` and `_router_request_path`.
+#   • src/core/transport.jl — `_upgrade_websocket!` (#374) runs the private
+#       `WebSockets._origin_allowed_default` with a proxy-reported scheme, mirrors `upgrade`'s
+#       `stream.tracked.conn isa TLS.Conn`, and classifies a refused handshake by
+#       `WebSocketError.message.code`.
 #   • src/context.jl — `_shutdown_server`'s bounded drain: it depends on `close(::Server)`
 #       releasing the listener BEFORE its unbounded quiesce loop, and escalates to
 #       `HTTP.forceclose`.
@@ -314,6 +318,48 @@ end
     @test isdefined(HTTP, :_set_read_deadline!)
     @test hasmethod(HTTP._set_read_deadline!, Tuple{HTTP.TCP.Conn, Int64})
     @test hasmethod(HTTP._set_read_deadline!, Tuple{HTTP.TLS.Conn, Int64})
+end
+
+@testset "WebSocket Origin policy surface (src/core/transport.jl `_upgrade_websocket!`)" begin
+    # #374: Nitro passes `upgrade` a `check_origin` that runs HTTP's own same-origin rule with the
+    # scheme a trusted proxy reported, instead of the transport's. It calls the PRIVATE default
+    # rule (through `_http_origin_allowed_default`), reads `stream.tracked.conn isa TLS.Conn` as
+    # HTTP does, and recognizes a refused handshake by `WebSocketError`'s close code. A rename
+    # here would 500 every upgrade; a change in the rule's meaning would silently re-open or
+    # re-close the #374 case — which is what the truth table pins.
+    WS = HTTP.WebSockets
+    @test isdefined(WS, :_origin_allowed_default)
+    @test hasmethod(WS._origin_allowed_default, Tuple{HTTP.Request, Bool})
+    @test :check_origin in Base.kwarg_decl(only(methods(WS.upgrade, Tuple{Function, HTTP.Stream})))
+    @test fieldnames(WS.WebSocketError) == (:message,)
+    @test fieldtype(WS.WebSocketError, :message) === WS.CloseFrameBody
+    @test :code in fieldnames(WS.CloseFrameBody)
+    @test isdefined(HTTP.TLS, :Conn)
+
+    req(origin) = HTTP.Request("GET", "/ws",
+        origin === nothing ? ["Host" => "app.example.com"] :
+                             ["Host" => "app.example.com", "Origin" => origin])
+    allowed(origin, secure) = Nitro.Core._http_origin_allowed_default(req(origin), secure)
+    @test allowed("https://app.example.com", true)        # behind TLS, told the scheme: allowed
+    @test !allowed("https://app.example.com", false)      # the #374 refusal itself
+    @test allowed("http://app.example.com", false)
+    @test !allowed("http://app.example.com", true)        # scheme still matters once known
+    @test !allowed("https://evil.example", true)          # cross-site: never
+    @test !allowed("https://app.example.com:8443", true)  # port is part of the origin
+    @test allowed(nothing, false)                         # no Origin: not a browser, allowed
+    @test !allowed("null", true)
+end
+
+@testset "a refused handshake is told apart from a session error (#374)" begin
+    WS = HTTP.WebSockets
+    err(code) = WS.WebSocketError(WS.CloseFrameBody(code, ""))
+    status = Nitro.Core._ws_refusal_status
+    @test status(err(1002), false, true)  == 403    # our Origin check refused
+    @test status(err(1002), false, false) == 400    # HTTP refused a malformed handshake
+    @test status(err(1002), true, false)  === nothing  # a peer protocol error mid-session
+    @test status(err(1011), false, false) === nothing  # e.g. an upgrade attempted over HTTP/2
+    @test status(ErrorException("x"), false, true) === nothing
+    @test status(InterruptException(), false, true) === nothing
 end
 
 @testset "peer-IP field chain still present (src/core/transport.jl `_peer_ip`/`_conn_fd`)" begin
