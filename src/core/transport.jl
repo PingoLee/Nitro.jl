@@ -567,6 +567,12 @@ end
 # handshake, the only two statuses besides 101 that `_upgrade_response` produces — and then
 # throws `WebSocketError` with close code 1002. The code alone does not identify it: a protocol
 # error from the peer mid-session is also 1002. Whether the handler was entered is what does.
+#
+# In practice only the 403 is reachable. `isupgrade(req)` already demands everything the 400
+# branches check (GET, the Upgrade/Connection tokens, version 13, a key), so a malformed handshake
+# never gets this far — it is answered as a plain GET. The 400 is kept as the honest mapping for
+# the one way left: a middleware that rewrote `req`, which `isupgrade` sees, while HTTP checks the
+# unmodified head in `stream.message`.
 function _ws_refusal_status(err, entered::Bool, origin_refused::Bool)::Nullable{Int}
     entered && return nothing
     err isa HTTP.WebSockets.WebSocketError || return nothing
@@ -587,7 +593,8 @@ function _log_ws_refusal(stream::HTTP.Stream, attempt::_UpgradeAttempt, status::
               "`ExtractIP(forwarded_proto = :x_forwarded_proto, trusted_proxies = …)` so the " *
               "check compares against the scheme the client used.", maxlog = 1)
     else
-        @warn("Refusing malformed WebSocket handshakes with 400 (detail at debug level)", maxlog = 1)
+        @warn("Refusing malformed WebSocket handshakes with 400 (detail at debug level). Only " *
+              "reachable when a middleware rewrote the upgrade request.", maxlog = 1)
     end
     @debug("WebSocket upgrade refused",
            status = status,

@@ -463,9 +463,18 @@ end
     @test getip(r) == CLIENT
     @test scheme(r) == "https"
 
-    # A later extractor that does not trust its hop never clears an earlier one's answer.
-    proto_only(ExtractIP()(handler))(create_request(["X-Forwarded-Proto" => "https"], PROXY))
+    # A later extractor that reads the scheme but does not trust its hop never clears an earlier
+    # one's answer. (A plain `ExtractIP()` would prove nothing: it never looks at the scheme.)
+    distrusting = ExtractIP(forwarded_proto = :x_forwarded_proto, trusted_proxies = ["10.0.0.0/8"])
+    proto_only(distrusting(handler))(create_request(["X-Forwarded-Proto" => "https"], PROXY))
     @test scheme(seen[]) == "https"
+    # Nor does a trusted one whose proxy sent no scheme, or one that is not a scheme.
+    for headers in (Pair{String,String}[], ["X-Forwarded-Proto" => "gopher"])
+        req = create_request(headers, PROXY)
+        req.context[KEY] = "https"          # as an earlier extractor would have left it
+        proto_only(handler)(req)
+        @test scheme(seen[]) == "https"
+    end
 end
 
 end
