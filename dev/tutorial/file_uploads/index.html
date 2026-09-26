@@ -124,10 +124,15 @@ function submit_import(req, upload::Files{FormFile})
     file = upload.payload
 
     # Scope the task to its owner. `getuser(req)` is `nothing` unless auth middleware
-    # ran, so check before reaching into it — the route below carries
-    # `login_required()`, which is what makes the Principal branch the real one.
+    # ran — the route below carries `login_required()` — and a token with no subject
+    # claim still authenticates, with `principal.id === nothing`. REFUSE both rather than
+    # falling back to a shared name like &quot;anonymous&quot;: every such caller would become ONE
+    # worker identity, able to read and cancel each other&#39;s imports. An
+    # `AuthorizationError` is answered with a 403.
     principal = getuser(req)
-    user_id = principal === nothing ? &quot;anonymous&quot; : something(principal.id, &quot;anonymous&quot;)
+    (principal === nothing || principal.id === nothing) &amp;&amp;
+        throw(Nitro.AuthorizationError(&quot;no user subject on this request&quot;))
+    owner = Nitro.Workers.Owner(principal.id)
 
     # 1. Stage to disk — the UUID task_key is the real identity; the original
     #    filename is sanitized to a bare basename so it can&#39;t traverse paths.
@@ -145,7 +150,7 @@ function submit_import(req, upload::Files{FormFile})
         &quot;import_queue&quot;,
         task_key,
         (task) -&gt; MyImportModule.process(staged_path),
-        user_id,
+        owner,
     )
 
     # 3. Return immediately
@@ -157,7 +162,7 @@ function submit_import(req, upload::Files{FormFile})
 end
 
 end # module ImportHandlers</code></pre><p><strong>Routes</strong> (<code>src/Routes.jl</code>):</p><pre><code class="language-julia hljs">path(&quot;/api/import&quot;, ImportHandlers.submit_import, method=&quot;POST&quot;,
-     middleware=[GuardMiddleware(login_required())]),</code></pre><h2 id="Sending-multipart-requests-(client-side)"><a class="docs-heading-anchor" href="#Sending-multipart-requests-(client-side)">Sending multipart requests (client side)</a><a id="Sending-multipart-requests-(client-side)-1"></a><a class="docs-heading-anchor-permalink" href="#Sending-multipart-requests-(client-side)" title="Permalink"></a></h2><p>Use <code>HTTP.jl</code> to build multipart requests from the client:</p><pre><code class="language-julia hljs">using HTTP
+     middleware=[GuardMiddleware(login_required())]),</code></pre><p><strong>Server</strong> — the submit above names <code>Nitro.CONTEXT[]</code>, so the worker runtime must be installed there, with <code>import_queue</code> in its <code>queues</code>. The argument-less <code>worker_startup</code> does both:</p><pre><code class="language-julia hljs">serve(middleware=[worker_startup(queues=[&quot;import_queue&quot;])])</code></pre><p>Without it the submit is refused with <code>WorkerUnavailableError</code>, a <code>503</code>: a task call never falls back to a runtime the app did not install. With an explicit <code>App</code>, pass it in both places instead (<code>worker_startup(app; …)</code> and <code>submit_sequential_task(app, …)</code>).</p><h2 id="Sending-multipart-requests-(client-side)"><a class="docs-heading-anchor" href="#Sending-multipart-requests-(client-side)">Sending multipart requests (client side)</a><a id="Sending-multipart-requests-(client-side)-1"></a><a class="docs-heading-anchor-permalink" href="#Sending-multipart-requests-(client-side)" title="Permalink"></a></h2><p>Use <code>HTTP.jl</code> to build multipart requests from the client:</p><pre><code class="language-julia hljs">using HTTP
 
 body = HTTP.Form(Dict(
     &quot;file1&quot; =&gt; open(&quot;data.dbf&quot;),
@@ -166,4 +171,4 @@ body = HTTP.Form(Dict(
     &quot;description&quot; =&gt; &quot;My data files&quot;,
 ))
 
-HTTP.post(&quot;http://localhost:8080/api/upload&quot;, [], body)</code></pre><h2 id="API-Reference"><a class="docs-heading-anchor" href="#API-Reference">API Reference</a><a id="API-Reference-1"></a><a class="docs-heading-anchor-permalink" href="#API-Reference" title="Permalink"></a></h2><p><a href="../../api/requests/#Nitro.Core.Util.BodyParsers.FormFile"><code>FormFile</code></a>, <a href="../../api/requests/#Nitro.Core.Util.BodyParsers.multipart"><code>multipart</code></a>, <a href="../../api/requests/#Nitro.Core.Extractors.Files"><code>Files</code></a> and <a href="../../api/requests/#Nitro.Core.Extractors.MultipartForm"><code>MultipartForm</code></a> are documented in <a href="../../api/requests/#Requests-And-Extractors">Requests And Extractors</a>.</p></article><nav class="docs-footer"><a class="docs-footer-prevpage" href="../request_body/">« -</a><a class="docs-footer-nextpage" href="../streaming/">Streaming And Server-Sent Events »</a><div class="flexbox-break"></div><p class="footer-message">Powered by <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> and the <a href="https://julialang.org/">Julia Programming Language</a>.</p></nav></div><div class="modal" id="documenter-settings"><div class="modal-background"></div><div class="modal-card"><header class="modal-card-head"><p class="modal-card-title">Settings</p><button class="delete"></button></header><section class="modal-card-body"><p><label class="label">Theme</label><div class="select"><select id="documenter-themepicker"><option value="auto">Automatic (OS)</option><option value="documenter-light">documenter-light</option><option value="documenter-dark">documenter-dark</option><option value="catppuccin-latte">catppuccin-latte</option><option value="catppuccin-frappe">catppuccin-frappe</option><option value="catppuccin-macchiato">catppuccin-macchiato</option><option value="catppuccin-mocha">catppuccin-mocha</option></select></div></p><hr/><p>This document was generated with <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> version 1.19.0 on <span class="colophon-date" title="Saturday 26 September 2026 00:48">Saturday 26 September 2026</span>. Using Julia version 1.12.7.</p></section><footer class="modal-card-foot"></footer></div></div></div></body></html>
+HTTP.post(&quot;http://localhost:8080/api/upload&quot;, [], body)</code></pre><h2 id="API-Reference"><a class="docs-heading-anchor" href="#API-Reference">API Reference</a><a id="API-Reference-1"></a><a class="docs-heading-anchor-permalink" href="#API-Reference" title="Permalink"></a></h2><p><a href="../../api/requests/#Nitro.Core.Util.BodyParsers.FormFile"><code>FormFile</code></a>, <a href="../../api/requests/#Nitro.Core.Util.BodyParsers.multipart"><code>multipart</code></a>, <a href="../../api/requests/#Nitro.Core.Extractors.Files"><code>Files</code></a> and <a href="../../api/requests/#Nitro.Core.Extractors.MultipartForm"><code>MultipartForm</code></a> are documented in <a href="../../api/requests/#Requests-And-Extractors">Requests And Extractors</a>.</p></article><nav class="docs-footer"><a class="docs-footer-prevpage" href="../request_body/">« -</a><a class="docs-footer-nextpage" href="../streaming/">Streaming And Server-Sent Events »</a><div class="flexbox-break"></div><p class="footer-message">Powered by <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> and the <a href="https://julialang.org/">Julia Programming Language</a>.</p></nav></div><div class="modal" id="documenter-settings"><div class="modal-background"></div><div class="modal-card"><header class="modal-card-head"><p class="modal-card-title">Settings</p><button class="delete"></button></header><section class="modal-card-body"><p><label class="label">Theme</label><div class="select"><select id="documenter-themepicker"><option value="auto">Automatic (OS)</option><option value="documenter-light">documenter-light</option><option value="documenter-dark">documenter-dark</option><option value="catppuccin-latte">catppuccin-latte</option><option value="catppuccin-frappe">catppuccin-frappe</option><option value="catppuccin-macchiato">catppuccin-macchiato</option><option value="catppuccin-mocha">catppuccin-mocha</option></select></div></p><hr/><p>This document was generated with <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> version 1.19.0 on <span class="colophon-date" title="Saturday 26 September 2026 00:52">Saturday 26 September 2026</span>. Using Julia version 1.12.7.</p></section><footer class="modal-card-foot"></footer></div></div></div></body></html>
