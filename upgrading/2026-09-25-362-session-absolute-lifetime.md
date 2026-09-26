@@ -24,9 +24,12 @@ to **604800 (7 days)**:
   readers that bypass the middleware (`get_session`, the `Session{T}` extractor,
   `Auth.session_user_validator`) enforce the cap through the expiry check they already make.
 - Rotation does **not** restart the clock. `regenerate_session!` and `rotate_on_auth` move the
-  session to a new id and keep its creation instant.
+  session to a new id and keep its creation instant. The exception is an **empty** session, which
+  is the logout recipe (`empty!` + `regenerate_session!`). It carries no identity, so it starts a
+  fresh clock, and logging out and back in gets a full window.
 - `absolute_max_age = nothing` switches the cap off, which is the old behavior and Django's
-  default. A zero or negative value is an `ArgumentError` at construction.
+  default. A zero or negative value, or one over 100 years, is an `ArgumentError` at
+  construction. A huge number would overflow the date arithmetic, so use `nothing` for no cap.
 
 To measure a session's age, every store now records when the session was created:
 
@@ -95,6 +98,10 @@ function Base.get(s::RedisSessionStore, id::String, default)
                           DateTime(fields["created"]))
 end
 ```
+
+`set_session!` writes the `created` field (`HSET … created <now>`). The #318 and #361 entries'
+Redis examples already keep it: `update_session!` writes only the `data` field, and
+`rotate_session!` `RENAME`s the whole key.
 
 A `nitro_session` table is migrated by `pormg_nitro_session()` on its next boot. It adds
 `created_at` and stamps the rows already there with the upgrade instant, so live sessions get a

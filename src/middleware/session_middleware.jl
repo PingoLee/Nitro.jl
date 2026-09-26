@@ -11,6 +11,7 @@ using ..JanitorMiddleware: _janitor
 using ...Cookies: get_cookie, set_cookie!, storesession!, prunesessions!, regenerate_session!,
     _validate_cookie_prefix
 using ...Crypto: secure_uuid4
+using ...Errors: is_unrecoverable
 using ...Core: own_response_headers
 
 export SessionMiddleware, SessionPruner
@@ -96,6 +97,10 @@ end
 # enough that a stolen session id stops working within a week however much it is used.
 const DEFAULT_ABSOLUTE_MAX_AGE = 7 * 86400
 
+# The largest `absolute_max_age` accepted: 100 years. Far past any real session, and far short of
+# where `DateTime + Second(n)` overflows and wraps round to the past.
+const MAX_ABSOLUTE_MAX_AGE = 100 * 365 * 86400
+
 """
     SessionMiddleware(; store, cookie_name, max_age, absolute_max_age, prune_interval,
                         rotate_on_auth, auth_key, validator, ...)
@@ -154,13 +159,20 @@ A session has two lifetimes, and it ends at whichever comes first.
   an absolute timeout.
 
 Rotation does not restart the absolute clock: `regenerate_session!` and `rotate_on_auth` move a
-session to a new id and keep its creation time, so the cap bounds the whole chain of ids.
+session to a new id and keep its creation time, so the cap bounds the whole chain of ids. The one
+exception is an **empty** session, which is the logout recipe (`empty!` + `regenerate_session!`).
+It carries no identity, so it starts a fresh clock, and logging back in gets a full window.
 
 The cap binds every reader of the store, not only this middleware. Each write sets the expiry to
 `max_age` from now or the absolute deadline, whichever is sooner, and the cookie's `Max-Age`
 likewise. The `Session{T}` extractor and `Auth.session_user_validator` read the store directly,
-and the expiry check they already make then enforces the cap too. A session whose cap was
-*lowered* after it was last written is deleted the next time this middleware loads it.
+and the expiry check they already make then enforces the cap too. A session this middleware finds
+past its cap anyway is deleted. That happens after a cap was *lowered*, after a direct
+`set_session!`, or when another `SessionMiddleware` with a looser cap shares the store, so give
+middlewares that share a store the same cap. A session that reaches its deadline while a request
+runs ends with that request: nothing is written, not even a rotation, and no cookie is set.
+
+`absolute_max_age` must be at most 100 years; pass `nothing`, not a huge number, for no cap.
 
 # Session fixation defense (`rotate_on_auth`, `auth_key`, `validator`)
 
@@ -196,8 +208,8 @@ contract.
   session swapping): browsers refuse to let anyone but this origin, over HTTPS, set one. An
   explicit `__Host-`/`__Secure-` name the attributes cannot carry is an `ArgumentError` at
   construction, since browsers would silently drop it.
-- `max_age`, `absolute_max_age` — see *Session lifetime* above. A non-positive
-  `absolute_max_age` is an `ArgumentError` at construction.
+- `max_age`, `absolute_max_age` — see *Session lifetime* above. An `absolute_max_age` that is
+  not positive, or is over 100 years, is an `ArgumentError` at construction.
 - `prune_interval::Period = Minute(10)` — how often the background janitor removes expired
   sessions from `store`. Must be a positive fixed-length `Period`; calendar periods (`Month`,
   `Quarter`, `Year`) are rejected, since they cannot be slept on. This replaced a `prune_probability` that ran the prune inline on a
@@ -247,10 +259,14 @@ function SessionMiddleware(;
         "the server. Build the `CookieConfig` without `secret_key` (#339)."))
 
     # A zero or negative cap would refuse every session the moment it was stored; `nothing` is
-    # how the cap is switched off.
-    absolute_max_age === nothing || absolute_max_age > 0 || throw(ArgumentError(
-        "SessionMiddleware: `absolute_max_age` must be a positive number of seconds, or " *
-        "`nothing` for no absolute lifetime; got $absolute_max_age (#362)."))
+    # how the cap is switched off. The upper bound is arithmetic, not policy: `created +
+    # Second(typemax(Int))` wraps `DateTime` round to the past, so "effectively unbounded"
+    # written as a huge number refused EVERY session. `nothing` says unbounded.
+    absolute_max_age === nothing ||
+        0 < absolute_max_age <= MAX_ABSOLUTE_MAX_AGE || throw(ArgumentError(
+        "SessionMiddleware: `absolute_max_age` must be a positive number of seconds, at most " *
+        "$MAX_ABSOLUTE_MAX_AGE (100 years), or `nothing` for no absolute lifetime; got " *
+        "$absolute_max_age (#362)."))
 
     # Resolved from the FINAL config -- `config` may be passed whole -- and checked before any
     # janitor exists, so a name browsers would drop fails at construction.
@@ -290,6 +306,18 @@ function SessionMiddleware(;
             # Every write below -- insert, update, rotation -- and the cookie use this, so the
             # stored expiry never passes the absolute deadline (#362).
             ttl = _write_ttl(max_age, absolute_max_age, created, Dates.now(Dates.UTC))
+
+            # A loaded session that reached its absolute deadline while this request ran (it had
+            # under a second left, or the handler took longer than what was left) is ended the
+            # way the load path ends one: no rotation, no write, no cookie. Writing it with a TTL
+            # of 0 would store a row that is expired on arrival -- and a rotation would move the
+            # session into it, reporting success for a login the next request cannot see. It
+            # would also hand every store method a TTL some backends reject (Redis `EX 0`).
+            # Whatever id it now lives under, the handler's own rotation included, is deleted.
+            if !is_new && ttl == 0
+                _end_session!(store, final_session_id)
+                return response
+            end
 
             # Retire the previous ID when an existing session crosses an auth boundary. If a
             # concurrent logout deleted the session meanwhile, the rotation finds nothing to move
@@ -403,10 +431,13 @@ function _load_session(store::AbstractSessionStore{String, Dict{String,Any}}, se
             # Past its absolute lifetime (#362): absent, like an expired session, whatever its
             # sliding expiry says. Deleted rather than merely refused, because the readers that
             # bypass this middleware -- `get_session`, the `Session{T}` extractor,
-            # `session_user_validator` -- see only `expires`. Every write here clamps `expires`
-            # to the deadline, so this row can only exist if the cap was lowered after it was
-            # written; deleting it is what makes a lowered cap bind them too.
-            delete_session!(store, session_id)
+            # `session_user_validator` -- see only `expires`. This middleware's own writes never
+            # put `expires` past the deadline, so such a row was written some other way: under a
+            # cap since lowered, by a direct `set_session!`/`storesession!`, or by another
+            # `SessionMiddleware` on the same store with a looser cap. Deleting it makes this
+            # middleware's cap bind them all -- which is why two middlewares sharing a store
+            # should share a cap too.
+            _end_session!(store, session_id)
             return Dict{String,Any}(), true, now
         end
         return deepcopy(payload.data), false, payload.created
@@ -425,6 +456,22 @@ function _load_session(store::AbstractSessionStore{String, Dict{String,Any}}, se
     end
     data = payload isa AbstractDict ? deepcopy(payload) : payload
     return data, false, now
+end
+
+# Deletes a session that has outlived its absolute lifetime (#362). Nothing depends on the delete
+# succeeding: the session is treated as absent either way. So a failing store is logged and the
+# request carries on without the session, rather than failing with a 500 before the handler even
+# runs. The log names the exception's type only -- a store's own error could quote the key, and
+# the key is the credential. An interrupt, an overflow or an out-of-memory still propagates (#254).
+function _end_session!(store::AbstractSessionStore, session_id::String)
+    try
+        delete_session!(store, session_id)
+    catch e
+        is_unrecoverable(e) && rethrow()
+        @warn "SessionMiddleware: failed to delete a session past its absolute lifetime; it is " *
+              "refused anyway" exception_type = typeof(e)
+    end
+    return nothing
 end
 
 # Whether a session created at `created` has outlived `absolute_max_age` as of `now`. The

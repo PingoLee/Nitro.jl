@@ -746,6 +746,30 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
         @test Base.get(store, again, nothing).expires <= Dates.now(Dates.UTC) + Dates.Second(3600)
     end
 
+    @testset "logout starts a fresh clock; logging back in carries it (#362)" begin
+        # Rotation carries `created`, and logout is a rotation, so logging out and back in on day 6
+        # used to leave a day. An EMPTY session carries no identity, so it starts over instead.
+        store = MemoryStore()
+        born = Dates.now(Dates.UTC) - Dates.Day(6)
+        seed!(store, "S", Dict{String,Any}("user_id" => 7, "cart" => [1]); created = born)
+        mw = SessionMiddleware(cookie_name="sid", max_age=3600, store=store, secure=false).middleware
+
+        logout = mw(function (req::HTTP.Request)
+            empty!(getsession(req))
+            Nitro.regenerate_session!(req, store; ttl=3600)
+            return HTTP.Response(200, "bye")
+        end)
+        before = Dates.now(Dates.UTC)
+        anon = cookie_of(logout(HTTP.Request("POST", "/logout", ["Cookie" => "sid=S"])), "sid")
+        @test anon != "S" && Base.get(store, "S", nothing) === nothing
+        @test Base.get(store, anon, nothing).created >= before
+
+        login = mw(req -> (getsession(req)["user_id"] = 7; HTTP.Response(200, "in")))
+        back = cookie_of(login(HTTP.Request("POST", "/login", ["Cookie" => "sid=$anon"])), "sid")
+        @test back != anon
+        @test Base.get(store, back, nothing).created >= before   # the new clock, carried
+    end
+
     @testset "absolute_max_age = nothing switches the cap off (#362)" begin
         store = MemoryStore()
         seed!(store, "ancient", Dict{String,Any}("user_id" => 9);
@@ -759,9 +783,70 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
         @test max_age_of(res) == 3600
     end
 
-    @testset "absolute_max_age must be positive (#362)" begin
-        @test_throws ArgumentError SessionMiddleware(store=MemoryStore(), absolute_max_age=0)
-        @test_throws ArgumentError SessionMiddleware(store=MemoryStore(), absolute_max_age=-1)
+    @testset "absolute_max_age must be positive and bounded (#362)" begin
+        for bad in (0, -1)
+            err = try SessionMiddleware(store=MemoryStore(), absolute_max_age=bad); nothing catch e; e end
+            @test err isa ArgumentError && occursin("absolute_max_age", err.msg)
+        end
+        # A huge value was a plausible way to write "unbounded", and `created + Second(n)` wraps
+        # round to the past for it -- every session refused. `nothing` is the way to say it.
+        @test Dates.DateTime(2026, 9, 25) + Dates.Second(typemax(Int)) < Dates.DateTime(2026, 9, 25)
+        err = try SessionMiddleware(store=MemoryStore(), absolute_max_age=typemax(Int)); nothing catch e; e end
+        @test err isa ArgumentError && occursin("100 years", err.msg)
+        @test SessionMiddleware(store=MemoryStore(), absolute_max_age=100 * 365 * 86400) isa Nitro.Core.Types.LifecycleMiddleware
+    end
+
+    @testset "a session that reaches its deadline mid-request ends with it (#362)" begin
+        # Loaded with 1.5 s left; the handler outlives that. Writing it back with a TTL of 0 would
+        # store a row expired on arrival -- and the login rotation would report success for a
+        # session the next request cannot see. It ends instead: nothing written, no cookie.
+        for (label, handler) in (
+                "a plain write" => (req -> (getsession(req)["n"] = 1; sleep(1.7); HTTP.Response(200, "ok"))),
+                "a login (rotate_on_auth)" => (req -> (getsession(req)["user_id"] = 7; sleep(1.7); HTTP.Response(200, "in"))))
+            @testset "$label" begin
+                store = MemoryStore()
+                cap = 3600
+                seed!(store, "S", Dict{String,Any}("cart" => [1]);
+                      created = Dates.now(Dates.UTC) - Dates.Second(cap) + Dates.Millisecond(1500))
+                mw = SessionMiddleware(cookie_name="sid", max_age=600, absolute_max_age=cap,
+                                       store=store, secure=false).middleware
+                res = mw(handler)(HTTP.Request("POST", "/", ["Cookie" => "sid=S"]))
+                @test res.status == 200
+                @test isempty(filter(h -> lowercase(h.first) == "set-cookie", res.headers))
+                @test isempty(store.data)   # neither S nor a rotated id survives
+            end
+        end
+    end
+
+    @testset "a store that cannot delete an over-age session does not fail the request (#362)" begin
+        # The session is refused whether or not the delete lands, so a store error there is logged
+        # -- by type only; its message could quote the key -- and the request goes on without it.
+        struct DeleteFailingStore <: Nitro.Core.Types.AbstractSessionStore{String, Dict{String,Any}}
+            inner::MemoryStore{String, Dict{String,Any}}
+        end
+        Base.get(s::DeleteFailingStore, id::String, default) = Base.get(s.inner, id, default)
+        Nitro.Core.Types.set_session!(s::DeleteFailingStore, id::String, d::Dict{String,Any}; ttl::Int=3600) =
+            Nitro.Core.Types.set_session!(s.inner, id, d; ttl)
+        Nitro.Core.Types.delete_session!(::DeleteFailingStore, ::String) = error("store down: sid=S")
+
+        store = DeleteFailingStore(MemoryStore())
+        seed!(store.inner, "S", Dict{String,Any}("user_id" => 42); created = Dates.now(Dates.UTC) - Dates.Day(8))
+        mw = SessionMiddleware(cookie_name="sid", store=store, secure=false).middleware
+        reader = mw(req -> HTTP.Response(200, string(get(getsession(req), "user_id", "none"))))
+        logger = Test.TestLogger()
+        res = Base.CoreLogging.with_logger(logger) do
+            reader(HTTP.Request("GET", "/", ["Cookie" => "sid=S"]))
+        end
+        @test res.status == 200
+        @test String(res.body) == "none"
+        @test length(logger.logs) == 1
+        @test logger.logs[1].level == Base.CoreLogging.Warn
+        @test occursin("absolute lifetime", logger.logs[1].message)
+        @test !occursin("store down", sprint(show, logger.logs[1].kwargs))   # nor the key it quotes
+
+        # An unrecoverable error is not swallowed (#254).
+        Nitro.Core.Types.delete_session!(::DeleteFailingStore, ::String) = throw(InterruptException())
+        @test_throws InterruptException reader(HTTP.Request("GET", "/", ["Cookie" => "sid=S"]))
     end
 
     @testset "a store that cannot say when a session was created fails closed under a cap (#362)" begin

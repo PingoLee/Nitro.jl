@@ -534,6 +534,27 @@ end
     @test store.data["renamed"].created > born
 end
 
+@testset "regenerate_session! carries the clock, except for an empty session (#362)" begin
+    store = MemoryStore()
+    born = Dates.now(Dates.UTC) - Dates.Day(3)
+    for (id, data) in (("full", Dict{String,Any}("user_id" => 1)), ("empty", Dict{String,Any}()))
+        lock(store.lock) do
+            store.data[id] = SessionPayload(data, Dates.now(Dates.UTC) + Dates.Hour(1), born)
+        end
+    end
+    rotate(id, data) = (req = HTTP.Request("GET", "/"); req.context[:session_id] = id;
+                        req.context[:session] = data; Nitro.regenerate_session!(req, store; ttl=3600))
+
+    # An identity keeps its clock across the rotation...
+    kept = rotate("full", Dict{String,Any}("user_id" => 1))
+    @test store.data[kept].created == born
+    # ...an empty session -- the logout recipe -- starts a new one.
+    before = Dates.now(Dates.UTC)
+    fresh = rotate("empty", Dict{String,Any}())
+    @test store.data[fresh].created >= before
+    @test !haskey(store.data, "empty")
+end
+
 @testset "regenerate_session! on a session minted in this request (#361)" begin
     # `SessionMiddleware` marks a new visitor's id `:session_new`: it has never been stored, so
     # there is nothing for `rotate_session!` to move -- and it must not read that as a logout,

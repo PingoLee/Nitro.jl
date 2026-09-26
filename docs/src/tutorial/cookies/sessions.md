@@ -156,11 +156,20 @@ SessionMiddleware(store = store, absolute_max_age = nothing)                    
 - **Rotation keeps the clock.** `regenerate_session!` and `rotate_on_auth` move a session to a new
   ID, so its lifetime is still measured from when it was first created. A login therefore does not
   buy a fresh week, and neither can an endpoint that rotates without re-checking credentials.
+- **Logout starts a new one.** An *empty* session carries no identity, so rotating one starts a
+  fresh clock. The logout recipe, `empty!(getsession(req))` then `regenerate_session!`, leaves
+  an anonymous session with a full window, and logging back in carries that new clock.
 - **The cap binds every reader.** Each write sets the stored expiry to `max_age` from now or the
   absolute deadline, whichever is sooner, and the cookie's `Max-Age` too. Readers that skip the
   middleware — the `Session{T}` extractor, `Auth.session_user_validator` — refuse the session
-  at the deadline through the same expiry check. If you **lower** the cap, a session written under
-  the old one is deleted the next time `SessionMiddleware` loads it.
+  at the deadline through the same expiry check. A session `SessionMiddleware` finds past its cap
+  anyway is deleted. That happens after you **lower** the cap, or after a direct `set_session!`.
+  It also happens when two `SessionMiddleware`s with different caps share one store, so give them
+  the same cap.
+- **The deadline is exact.** A session that reaches it during a request ends with that request:
+  nothing is written, a login rotation included, and no cookie is set.
+- **`nothing` means no cap.** A huge number would overflow the date arithmetic, so the keyword
+  refuses anything over 100 years.
 - **Why seven days.** OWASP recommends an absolute timeout; Django ships none. A week keeps a
   regular user signed in across a working week and bounds how long a stolen ID works. Shorten it
   for sensitive apps.
