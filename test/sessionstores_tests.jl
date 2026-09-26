@@ -534,7 +534,7 @@ end
     @test store.data["renamed"].created > born
 end
 
-@testset "regenerate_session! carries the clock, except for an empty session (#362)" begin
+@testset "regenerate_session! carries the clock, even for an empty session (#362)" begin
     store = MemoryStore()
     born = Dates.now(Dates.UTC) - Dates.Day(3)
     for (id, data) in (("full", Dict{String,Any}("user_id" => 1)), ("empty", Dict{String,Any}()))
@@ -545,13 +545,13 @@ end
     rotate(id, data) = (req = HTTP.Request("GET", "/"); req.context[:session_id] = id;
                         req.context[:session] = data; Nitro.regenerate_session!(req, store; ttl=3600))
 
-    # An identity keeps its clock across the rotation...
     kept = rotate("full", Dict{String,Any}("user_id" => 1))
     @test store.data[kept].created == born
-    # ...an empty session -- the logout recipe -- starts a new one.
-    before = Dates.now(Dates.UTC)
-    fresh = rotate("empty", Dict{String,Any}())
-    @test store.data[fresh].created >= before
+    # An empty one too. The logout recipe's fresh clock is `SessionMiddleware`'s to give, on the
+    # session's FINAL contents: deciding here, mid-handler, let a handler that emptied, rotated and
+    # then restored the identity hand a stolen session a fresh week.
+    also = rotate("empty", Dict{String,Any}())
+    @test store.data[also].created == born
     @test !haskey(store.data, "empty")
 end
 

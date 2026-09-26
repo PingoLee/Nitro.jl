@@ -160,8 +160,10 @@ A session has two lifetimes, and it ends at whichever comes first.
 
 Rotation does not restart the absolute clock: `regenerate_session!` and `rotate_on_auth` move a
 session to a new id and keep its creation time, so the cap bounds the whole chain of ids. The one
-exception is an **empty** session, which is the logout recipe (`empty!` + `regenerate_session!`).
-It carries no identity, so it starts a fresh clock, and logging back in gets a full window.
+exception is a rotated session that **ends the request empty**, which is what the logout recipe
+(`empty!` + `regenerate_session!`) leaves. It carries no identity, so it is written with a fresh
+clock, and logging back in gets a full window. The check is made on the final contents, so emptying
+a session, rotating it and putting the identity back keeps the old clock.
 
 The cap binds every reader of the store, not only this middleware. Each write sets the expiry to
 `max_age` from now or the absolute deadline, whichever is sooner, and the cookie's `Max-Age`
@@ -304,8 +306,11 @@ function SessionMiddleware(;
             final_session_id = get(req.context, :session_id, session_id)
 
             # Every write below -- insert, update, rotation -- and the cookie use this, so the
-            # stored expiry never passes the absolute deadline (#362).
-            ttl = _write_ttl(max_age, absolute_max_age, created, Dates.now(Dates.UTC))
+            # stored expiry never passes the absolute deadline (#362). A new session's clock
+            # starts when it is written, not when the request began, so a slow first request can
+            # never leave it with no lifetime at all.
+            write_now = Dates.now(Dates.UTC)
+            ttl = _write_ttl(max_age, absolute_max_age, is_new ? write_now : created, write_now)
 
             # A loaded session that reached its absolute deadline while this request ran (it had
             # under a second left, or the handler took longer than what was left) is ended the
@@ -357,6 +362,17 @@ function SessionMiddleware(;
             # `regenerate_session!(…; ttl)` to the absolute deadline, and keeps `created` (#362),
             # which an upsert would reset.
             if is_new && (rotated || forced || !isempty(current_session))
+                _save_session(store, final_session_id, current_session, ttl)
+                session_written = true
+            elseif !is_new && rotated && isempty(current_session)
+                # A rotated session that ENDS the request empty -- what the logout recipe
+                # (`empty!` + `regenerate_session!`) leaves -- starts a fresh absolute clock
+                # (#362). It carries no identity for the cap to bound, and carrying the clock
+                # meant logging out and back in on day 6 left a day. `set_session!` stamps a new
+                # `created`. Decided HERE, on the final contents, not when `regenerate_session!`
+                # ran: a handler that emptied, rotated, then put the identity back would otherwise
+                # have handed a stolen session a fresh week. Only this request knows the id.
+                ttl = _write_ttl(max_age, absolute_max_age, write_now, write_now)
                 _save_session(store, final_session_id, current_session, ttl)
                 session_written = true
             elseif !is_new && (rotated || forced || current_session != original_session)

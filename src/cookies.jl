@@ -821,10 +821,9 @@ A session `SessionMiddleware` created during this request has never been stored 
 client, so it gets a new ID with no store operation; the middleware saves it on the way out.
 
 The new ID keeps the session's creation instant, which is what `SessionMiddleware`'s
-`absolute_max_age` measures from (#362). An **empty** session is the exception and starts a new
-clock. That is the logout recipe, `empty!(getsession(req))` then `regenerate_session!`: a
-session with no data carries no identity for the cap to bound, and logging out and back in
-should buy a fresh window.
+`absolute_max_age` measures from (#362). A rotated session that **ends the request empty**,
+which is what the logout recipe `empty!(getsession(req))` + `regenerate_session!` leaves, gets a
+fresh clock from `SessionMiddleware` when it is written back.
 """
 function regenerate_session!(req::HTTP.Request, store::AbstractSessionStore{String, Dict{String,Any}}; ttl::Int=3600)
     old_id = get(req.context, :session_id, nothing)
@@ -841,13 +840,6 @@ function regenerate_session!(req::HTTP.Request, store::AbstractSessionStore{Stri
         # here by name, and inference does not carry `Any` (the arguments come out of
         # `req.context`).
         rotate_session!(store, old_id, new_id, session_data; ttl=ttl)::Bool || return nothing
-        # The move carries the session's creation instant, so the absolute lifetime bounds the
-        # whole chain of ids (#362). An EMPTY session is the exception: it carries no identity,
-        # so there is nothing for the cap to protect, and it is what the logout recipe
-        # (`empty!` + `regenerate_session!`) rotates. Carrying the clock there meant logging out
-        # and back in never bought a fresh window. Re-storing it with `set_session!` stamps a new
-        # `created`; the atomic move above has already decided that the old session was live.
-        isempty(session_data) && set_session!(store, new_id, session_data; ttl=ttl)
     end
     # Otherwise the id was minted by `SessionMiddleware` in this request: never stored, never
     # sent, so no other request can hold it. Asking the store to move it would find nothing and

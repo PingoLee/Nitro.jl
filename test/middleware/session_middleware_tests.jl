@@ -768,6 +768,21 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
         back = cookie_of(login(HTTP.Request("POST", "/login", ["Cookie" => "sid=$anon"])), "sid")
         @test back != anon
         @test Base.get(store, back, nothing).created >= before   # the new clock, carried
+
+        # The fresh clock is decided on the session's FINAL contents. A handler that empties,
+        # rotates, then puts the identity back -- a "reset but stay signed in" -- keeps the old
+        # clock; deciding at rotation time handed such a session a fresh week.
+        seed!(store, "T", Dict{String,Any}("user_id" => 7, "theme" => "dark"); created = born)
+        reset = mw(function (req::HTTP.Request)
+            uid = getsession(req)["user_id"]
+            empty!(getsession(req))
+            Nitro.regenerate_session!(req, store; ttl=3600)
+            getsession(req)["user_id"] = uid
+            return HTTP.Response(200, "reset")
+        end)
+        kept = cookie_of(reset(HTTP.Request("POST", "/reset", ["Cookie" => "sid=T"])), "sid")
+        @test kept != "T"
+        @test Base.get(store, kept, nothing).created == born
     end
 
     @testset "absolute_max_age = nothing switches the cap off (#362)" begin
@@ -800,17 +815,30 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
         # Loaded with 1.5 s left; the handler outlives that. Writing it back with a TTL of 0 would
         # store a row expired on arrival -- and the login rotation would report success for a
         # session the next request cannot see. It ends instead: nothing written, no cookie.
-        for (label, handler) in (
-                "a plain write" => (req -> (getsession(req)["n"] = 1; sleep(1.7); HTTP.Response(200, "ok"))),
-                "a login (rotate_on_auth)" => (req -> (getsession(req)["user_id"] = 7; sleep(1.7); HTTP.Response(200, "in"))))
+        #
+        # The load must land inside that 1.5 s, so the exact wrapped handler is warmed first: its
+        # first call compiles the whole request path, and on a loaded CI runner that alone could
+        # outlast the budget -- the session would then be refused at LOAD, and the assertions
+        # would fail as if the fix had regressed.
+        slow = Ref(false)
+        for (label, write!) in (
+                "a plain write" => (s -> (s["n"] = 1)),
+                "a login (rotate_on_auth)" => (s -> (s["user_id"] = 7)))
             @testset "$label" begin
                 store = MemoryStore()
                 cap = 3600
-                seed!(store, "S", Dict{String,Any}("cart" => [1]);
-                      created = Dates.now(Dates.UTC) - Dates.Second(cap) + Dates.Millisecond(1500))
                 mw = SessionMiddleware(cookie_name="sid", max_age=600, absolute_max_age=cap,
                                        store=store, secure=false).middleware
-                res = mw(handler)(HTTP.Request("POST", "/", ["Cookie" => "sid=S"]))
+                wrapped = mw(req -> (write!(getsession(req)); slow[] && sleep(1.7); HTTP.Response(200, "ok")))
+                slow[] = false
+                wrapped(HTTP.Request("POST", "/", ["Cookie" => "sid=warm"]))   # warm-up, discarded
+                empty!(store.data)
+
+                seed!(store, "S", Dict{String,Any}("cart" => [1]);
+                      created = Dates.now(Dates.UTC) - Dates.Second(cap) + Dates.Millisecond(1500))
+                slow[] = true
+                res = wrapped(HTTP.Request("POST", "/", ["Cookie" => "sid=S"]))
+                slow[] = false
                 @test res.status == 200
                 @test isempty(filter(h -> lowercase(h.first) == "set-cookie", res.headers))
                 @test isempty(store.data)   # neither S nor a rotated id survives

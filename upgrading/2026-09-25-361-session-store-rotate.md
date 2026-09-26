@@ -47,8 +47,8 @@ still rotates to a new id as before, with no store call. The middleware marks on
   id in place: an id the store does not hold is indistinguishable from a logged-out one. Store the
   session first, or set `req.context[:session_new] = true` for an id minted in that request.
 - A handler that swaps `req.context[:session_id]` for a fresh id by hand, on a session the request
-  loaded, had that id upserted. It is now written update-only, so the write is dropped. Call
-  `regenerate_session!` instead.
+  loaded, had that id upserted. It is now written update-only, so the write is dropped; only a
+  session left empty is still written, as a fresh one (#362). Call `regenerate_session!` instead.
 
 ### How to find the calls to migrate
 

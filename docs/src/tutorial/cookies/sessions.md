@@ -156,9 +156,11 @@ SessionMiddleware(store = store, absolute_max_age = nothing)                    
 - **Rotation keeps the clock.** `regenerate_session!` and `rotate_on_auth` move a session to a new
   ID, so its lifetime is still measured from when it was first created. A login therefore does not
   buy a fresh week, and neither can an endpoint that rotates without re-checking credentials.
-- **Logout starts a new one.** An *empty* session carries no identity, so rotating one starts a
-  fresh clock. The logout recipe, `empty!(getsession(req))` then `regenerate_session!`, leaves
-  an anonymous session with a full window, and logging back in carries that new clock.
+- **Logout starts a new one.** A rotated session that *ends the request empty* carries no
+  identity, so `SessionMiddleware` writes it with a fresh clock. The logout recipe,
+  `empty!(getsession(req))` then `regenerate_session!`, leaves an anonymous session with a full
+  window, and logging back in carries that new clock. The check is made when the request ends:
+  emptying a session, rotating it and putting the identity back keeps the old clock.
 - **The cap binds every reader.** Each write sets the stored expiry to `max_age` from now or the
   absolute deadline, whichever is sooner, and the cookie's `Max-Age` too. Readers that skip the
   middleware — the `Session{T}` extractor, `Auth.session_user_validator` — refuse the session
