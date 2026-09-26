@@ -135,6 +135,8 @@ bound to `req.context[:session_id]`.
 An existing session is written back when its data changed, when it was rotated, or when the flag
 is set (which also refreshes its expiry). That write is update-only (`update_session!`, #318). If a
 concurrent logout deleted the session meanwhile, the write is dropped and the cookie is not re-set.
+The one exception is a rotated session that ends the request empty and with no identity, such as
+a logout. It is written with `set_session!` as a fresh session; see *Session lifetime* below.
 
 Rotation holds against the same race (#361). `regenerate_session!` and `rotate_on_auth` move the
 session with the store's atomic `rotate_session!`, which moves it only if it still exists. After a
@@ -360,18 +362,23 @@ function SessionMiddleware(;
             # update-only is the same write, except that it never re-creates a row something
             # deleted after the rotation. It also re-clamps the expiry of a handler's own
             # `regenerate_session!(…; ttl)` to the absolute deadline, and keeps `created` (#362),
-            # which an upsert would reset.
+            # which an upsert would reset. The single exception, a rotated session left empty
+            # and anonymous, is the branch just below the new-visitor one.
             if is_new && (rotated || forced || !isempty(current_session))
                 _save_session(store, final_session_id, current_session, ttl)
                 session_written = true
-            elseif !is_new && rotated && isempty(current_session)
-                # A rotated session that ENDS the request empty -- what the logout recipe
-                # (`empty!` + `regenerate_session!`) leaves -- starts a fresh absolute clock
-                # (#362). It carries no identity for the cap to bound, and carrying the clock
-                # meant logging out and back in on day 6 left a day. `set_session!` stamps a new
-                # `created`. Decided HERE, on the final contents, not when `regenerate_session!`
-                # ran: a handler that emptied, rotated, then put the identity back would otherwise
-                # have handed a stolen session a fresh week. Only this request knows the id.
+            elseif !is_new && rotated && isempty(current_session) &&
+                   _auth_marker(current_session, final_session_id, auth_key, validator) === nothing
+                # A rotated session that ENDS the request empty, with no identity -- what the
+                # logout recipe (`empty!` + `regenerate_session!`) leaves -- starts a fresh
+                # absolute clock (#362). There is nothing for the cap to bound, and carrying the
+                # clock meant logging out and back in on day 6 left a day. `set_session!` stamps a
+                # new `created`. Decided HERE, on the final contents, not when
+                # `regenerate_session!` ran: a handler that emptied, rotated, then put the identity
+                # back would otherwise have handed a stolen session a fresh week. "No identity"
+                # asks the same `auth_key`/`validator` question `rotate_on_auth` does, so an app
+                # that keys identity outside the session dict -- by id, through `validator` -- is
+                # not mistaken for logged out. Only this request knows the id.
                 ttl = _write_ttl(max_age, absolute_max_age, write_now, write_now)
                 _save_session(store, final_session_id, current_session, ttl)
                 session_written = true

@@ -783,6 +783,18 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
         kept = cookie_of(reset(HTTP.Request("POST", "/reset", ["Cookie" => "sid=T"])), "sid")
         @test kept != "T"
         @test Base.get(store, kept, nothing).created == born
+
+        # "Empty" is not "anonymous" when identity lives outside the dict: an app whose `validator`
+        # resolves it by session id keeps an empty dict while signed in, and a rotation there must
+        # not reset the clock either. Same question `rotate_on_auth` asks.
+        seed!(store, "V", Dict{String,Any}(); created = born)
+        by_id = SessionMiddleware(cookie_name="sid", max_age=3600, store=store, secure=false,
+                                  validator = (sid, data) -> "user-9").middleware
+        rotated = cookie_of(by_id(req -> (Nitro.regenerate_session!(req, store; ttl=3600);
+                                          HTTP.Response(200, "ok")))(
+            HTTP.Request("POST", "/sudo", ["Cookie" => "sid=V"])), "sid")
+        @test rotated != "V"
+        @test Base.get(store, rotated, nothing).created == born
     end
 
     @testset "absolute_max_age = nothing switches the cap off (#362)" begin

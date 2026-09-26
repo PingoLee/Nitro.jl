@@ -26,7 +26,9 @@ The browser was logged back in, and a stolen `S` survived the logout meant to ki
 When it returns `false` the write is dropped and the cookie is not re-set. That is Django's
 `UpdateError` → `SessionInterrupted`. A new visitor's session is still written with
 `set_session!`. A loaded session that the request rotates is moved by `rotate_session!` (#361)
-and then written with `update_session!`, like any other loaded session.
+and then written with `update_session!`, like any other loaded session. The one exception is a
+rotated session that ends the request empty and anonymous, such as a logout: it is re-stored with
+`set_session!` as a fresh session (#362).
 
 This closes the write-back path only. A request that **rotates** its session after a concurrent
 logout (`regenerate_session!`, or `rotate_on_auth` on a user switch) is closed by a second required

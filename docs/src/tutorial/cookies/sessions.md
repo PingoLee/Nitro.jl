@@ -237,7 +237,9 @@ cleanup_expired_sessions!(store::S)
 
 `SessionMiddleware` uses Nitro's `storesession!` and `prunesessions!` helpers, and those
 delegate to `set_session!` and `cleanup_expired_sessions!` by default. It writes back a session
-the request *loaded* with `update_session!`, and `regenerate_session!` moves one to a new ID with
+the request *loaded* with `update_session!`, except a logged-out session, which it re-stores with
+`set_session!` for a fresh clock. `set_session!` must therefore overwrite an existing ID.
+`regenerate_session!` moves a session to a new ID with
 `rotate_session!`. Each must act only if the session still exists and has not expired, returning
 `false` otherwise, as one atomic step. Implementing the six methods above is enough for custom
 backends; only `cleanup_expired_sessions!` is optional.
