@@ -122,9 +122,14 @@ so health checks and static files do not create sessions. `CSRFMiddleware` sets 
 it issues a token bound to the session. Set it yourself when you hand the client anything else
 bound to `req.context[:session_id]`.
 
-An existing session is written back when its data changed, or when the flag is set (which also
-refreshes its expiry). That write is update-only (`update_session!`, #318). If a concurrent logout
-deleted the session meanwhile, the write is dropped and the cookie is not re-set.
+An existing session is written back when its data changed, when it was rotated, or when the flag
+is set (which also refreshes its expiry). That write is update-only (`update_session!`, #318). If a
+concurrent logout deleted the session meanwhile, the write is dropped and the cookie is not re-set.
+
+Rotation holds against the same race (#361). `regenerate_session!` and `rotate_on_auth` move the
+session with the store's atomic `rotate_session!`, which moves it only if it still exists. After a
+concurrent logout there is nothing to move, so the logged-out data is not copied into a fresh id,
+this request's write is dropped, and no cookie is set.
 
 A response that sets the session cookie also gets `Vary: Cookie`, and `Cache-Control: private` in
 place of any `public` (other directives are kept). A shared cache therefore never serves one
@@ -237,6 +242,9 @@ function SessionMiddleware(;
             # Expose the mutable session dictionary through the request context.
             req.context[:session] = session_data
             req.context[:session_id] = session_id
+            # Tells `regenerate_session!` whether this id is in the store: a minted one is not,
+            # and moving it with `rotate_session!` would find nothing and read as a logout.
+            req.context[:session_new] = is_new
 
             # Let downstream middleware and the handler read or mutate the session.
             response = handle(req)
@@ -244,7 +252,10 @@ function SessionMiddleware(;
             current_session = req.context[:session]
             final_session_id = get(req.context, :session_id, session_id)
 
-            # Retire the previous ID when an existing session crosses an auth boundary.
+            # Retire the previous ID when an existing session crosses an auth boundary. If a
+            # concurrent logout deleted the session meanwhile, the rotation finds nothing to move
+            # and the id stays put, so the update-only write below drops this request's data
+            # (#361).
             if rotate_on_auth && !is_new && final_session_id == session_id
                 current_auth_marker = _auth_marker(current_session, final_session_id, auth_key, validator)
                 if _auth_marker_changed(original_auth_marker, current_auth_marker)
@@ -265,16 +276,21 @@ function SessionMiddleware(;
             # every cookieless request, so a `/health` loop grew `MemoryStore` without bound and
             # cost a PormG store a SELECT plus an INSERT per request.
             #
-            # An id minted during THIS request -- a new visitor's, or one `regenerate_session!`
-            # rotated to -- is inserted. An id the request LOADED is written back update-only
-            # (#318): if a concurrent logout or rotation deleted it meanwhile, the write is
-            # dropped and the cookie is not re-set. Upserting it re-created the deleted session,
-            # so a stolen id outlived the logout meant to kill it and the browser was logged
-            # back in.
-            if rotated || (is_new && (forced || !isempty(current_session)))
+            # A new visitor's session -- whatever id it ends the request under -- is inserted. A
+            # session the request LOADED is written back update-only (#318): if a concurrent
+            # logout or rotation deleted it meanwhile, the write is dropped and the cookie is not
+            # re-set. Upserting it re-created the deleted session, so a stolen id outlived the
+            # logout meant to kill it and the browser was logged back in.
+            #
+            # That covers a loaded session this request ROTATED too (#361). `rotate_session!` has
+            # already moved it to `final_session_id`, so the row exists, and the update carries
+            # whatever the handler changed after rotating. This branch used to upsert the new id;
+            # update-only is the same write, except that it never re-creates a row something
+            # deleted after the rotation.
+            if is_new && (rotated || forced || !isempty(current_session))
                 _save_session(store, final_session_id, current_session, max_age)
                 session_written = true
-            elseif !is_new && (forced || current_session != original_session)
+            elseif !is_new && (rotated || forced || current_session != original_session)
                 # `::Bool`: the contract's return type, asserted so inference does not carry `Any`
                 # (`current_session` comes out of `req.context`) into the branch below.
                 session_written = update_session!(store, final_session_id, current_session;

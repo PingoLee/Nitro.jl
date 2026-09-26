@@ -16,7 +16,7 @@ using Nitro
 # thing it is a replica of -- it can only agree with itself.
 
 using Nitro.Types: AbstractSessionStore, SessionPayload, get_session, set_session!,
-                   update_session!, delete_session!, cleanup_expired_sessions!, is_expired,
+                   update_session!, rotate_session!, delete_session!, cleanup_expired_sessions!, is_expired,
                    missing_session_methods
 
 # ── Mock PormG row ───────────────────────────────────────────────────────
@@ -498,6 +498,43 @@ end
         @test before + Dates.Second(90) <= m._table["live"][:expires_at] <= after + Dates.Second(90)
     end
 
+    # #361: `regenerate_session!` copied a session a concurrent logout had deleted into a fresh id.
+    # PormG refuses a primary key in `update()`'s SET, so the move is a guarded DELETE whose row
+    # count decides, then an INSERT -- and the INSERT happens only when that DELETE removed a row.
+    @testset "rotate_session! moves a live row and never creates one (#361)" begin
+        m = MockModel()
+        s = RealPormGSessionStore(model=m)
+
+        # Absent -- the logout already deleted it. Nothing moves, and no new row appears.
+        @test rotate_session!(s, "gone", "fresh", Dict{String,Any}("user_id" => 42); ttl=3600) === false
+        @test isempty(m._table)
+
+        # Expired -- matched by nothing, and left exactly as it was for the prune.
+        stale_expiry = Dates.now(Dates.UTC) - Dates.Second(5)
+        _seed_row!(m, "stale", Dict{String,Any}("user_id" => 1), stale_expiry)
+        @test rotate_session!(s, "stale", "fresh", Dict{String,Any}("user_id" => 1); ttl=3600) === false
+        @test !haskey(m._table, "fresh")
+        @test m._table["stale"][:expires_at] == stale_expiry
+
+        # Live -- moved: the old key is gone, the new one holds the data under a fresh expiry.
+        set_session!(s, "live", Dict{String,Any}("v" => 1); ttl=10)
+        queries_before = length(m._filters_seen)
+        before = Dates.now(Dates.UTC)
+        @test rotate_session!(s, "live", "moved", Dict{String,Any}("v" => 2); ttl=90) === true
+        after = Dates.now(Dates.UTC)
+
+        # The liveness condition is in the DELETE's own WHERE, the query whose count decides.
+        # (Checked before the reads below, which record filters of their own.)
+        @test length(m._filters_seen) == queries_before + 1
+        delete_filters = m._filters_seen[end]
+        @test delete_filters["session_key"] == "live"
+        @test haskey(delete_filters, "expires_at__@gt")
+
+        @test !haskey(m._table, "live")
+        @test get_session(s, "moved") == Dict{String,Any}("v" => 2)
+        @test before + Dates.Second(90) <= m._table["moved"][:expires_at] <= after + Dates.Second(90)
+    end
+
     @testset "every query runs on the store's db_key, not the model's default (#199)" begin
         # The regression test for #199 proper. `pormg_nitro_session(db_key="sessions")` created
         # `nitro_session` on `sessions` and then read, wrote, deleted and pruned on whatever
@@ -534,6 +571,15 @@ end
         delete_session!(store, "routed")
         @test !haskey(m._tables["sessions"], "routed")
         @test haskey(m._tables["db"], "routed")    # the decoy survives: a different database
+
+        # ROTATE -- `rotate_session!` (#361): its guarded DELETE and its INSERT, both routed. The
+        # decoy under the old key must survive, and the new key must not appear beside it.
+        set_session!(store, "rot-old", Dict{String,Any}("user_id" => 10); ttl=3600)
+        _seed_row!(m, "rot-old", Dict{String,Any}("user_id" => 999),
+                   Dates.now(Dates.UTC) + Dates.Hour(1); db_key="db")
+        @test rotate_session!(store, "rot-old", "rot-new", Dict{String,Any}("user_id" => 10); ttl=3600)
+        @test haskey(m._tables["sessions"], "rot-new") && !haskey(m._tables["sessions"], "rot-old")
+        @test haskey(m._tables["db"], "rot-old") && !haskey(m._tables["db"], "rot-new")
     end
 
     @testset "an expired payload is refused on the read path" begin
@@ -648,6 +694,8 @@ end
             # Not `false`: `false` means "the session is gone", and the middleware acts on it by
             # dropping the write. A database outage is not a logout.
             @test_throws "mock persistence failure" update_session!(failing, "sess-err", Dict{String,Any}("user_id" => 1); ttl=3600)
+            # Same for a rotation (#361): `false` would drop the rotation as if logged out.
+            @test_throws "mock persistence failure" rotate_session!(failing, "sess-err", "sess-new", Dict{String,Any}("user_id" => 1); ttl=3600)
             @test_throws "mock persistence failure" delete_session!(failing, "sess-err")
 
             # Reads degrade to "no session" rather than throwing out of the request path.
@@ -705,6 +753,11 @@ end
         before = m._table["sess-deep"][:session_data]
         @test_throws ArgumentError update_session!(s, "sess-deep", Dict{String,Any}("deep" => nested(512)); ttl=3600)
         @test m._table["sess-deep"][:session_data] == before
+        # So is a rotation (#361), and it is refused BEFORE the old row is deleted -- a payload
+        # too deep to store must not cost the visitor their session.
+        @test_throws ArgumentError rotate_session!(s, "sess-deep", "sess-rotated", Dict{String,Any}("deep" => nested(512)); ttl=3600)
+        @test m._table["sess-deep"][:session_data] == before
+        @test !haskey(m._table, "sess-rotated")
 
         # A row stored over the bound before it existed reads as no session, through the same
         # payload-free warning as any other undecodable row.

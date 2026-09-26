@@ -516,6 +516,71 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
         @test Base.get(store, fresh, nothing).data == Dict{String,Any}()
     end
 
+    # ── #361: the same race, through the ROTATION path ─────────────────────────
+    #
+    # #318 closed the plain write-back. A request that ROTATES after the logout -- an explicit
+    # `regenerate_session!` (the docs recommend it on any privilege change), or `rotate_on_auth`
+    # on a user switch -- used to copy the logged-out session into a fresh id, and the middleware
+    # handed the client that new cookie: the browser was logged back in as `user_id = 42`.
+    @testset "a rotation after a concurrent logout revives nothing (#361)" begin
+        for (label, rotate!) in (
+                "explicit regenerate_session!" =>
+                    (req, store) -> Nitro.regenerate_session!(req, store; ttl=3600),
+                "rotate_on_auth on a user switch" =>
+                    (req, store) -> (getsession(req)["user_id"] = 43; nothing))
+            @testset "$label" begin
+                store = MemoryStore()
+                stolen = "stolen-session-id"
+                storesession!(store, stolen, Dict{String,Any}("user_id" => 42); ttl=3600)
+
+                mw = SessionMiddleware(cookie_name="sid", max_age=3600, store=store, secure=false).middleware
+
+                logout = mw(function (req::HTTP.Request)
+                    empty!(getsession(req))
+                    Nitro.regenerate_session!(req, store; ttl=3600)
+                    return HTTP.Response(200, "bye")
+                end)
+
+                logout_response = Ref{HTTP.Response}()
+                # A loaded `stolen` (user_id = 42); B logs out before A rotates.
+                slow = mw(function (req::HTTP.Request)
+                    logout_response[] = logout(HTTP.Request("POST", "/logout", ["Cookie" => "sid=$stolen"]))
+                    rotate!(req, store)
+                    return HTTP.Response(200, "rotated")
+                end)
+
+                response = slow(HTTP.Request("POST", "/elevate", ["Cookie" => "sid=$stolen"]))
+                @test response.status == 200
+
+                # No cookie for any id: neither `stolen` nor a fresh one carrying its data.
+                @test isempty(filter(h -> lowercase(h.first) == "set-cookie", response.headers))
+
+                # The only session left is B's fresh, empty one. Nothing carries user 42 (or the
+                # user A switched to) -- before #361 a second row did, under the rotated id.
+                fresh = String(match(r"sid=([^;]+)", HTTP.header(logout_response[], "Set-Cookie")).captures[1])
+                @test collect(keys(store.data)) == [fresh]
+                @test Base.get(store, fresh, nothing).data == Dict{String,Any}()
+            end
+        end
+    end
+
+    @testset "a rotation that wins keeps the handler's later writes (#361)" begin
+        # The rotated id is written back update-only, so what the handler changed AFTER rotating
+        # still lands -- the row exists, because `rotate_session!` just made it.
+        store = MemoryStore()
+        storesession!(store, "S", Dict{String,Any}("user_id" => 42); ttl=3600)
+        mw = SessionMiddleware(cookie_name="sid", max_age=3600, store=store, secure=false).middleware
+        res = mw(function (req::HTTP.Request)
+            Nitro.regenerate_session!(req, store; ttl=3600)
+            getsession(req)["elevated"] = true
+            return HTTP.Response(200, "ok")
+        end)(HTTP.Request("POST", "/sudo", ["Cookie" => "sid=S"]))
+        rotated = String(match(r"sid=([^;]+)", HTTP.header(res, "Set-Cookie")).captures[1])
+        @test rotated != "S"
+        @test Base.get(store, "S", nothing) === nothing
+        @test Base.get(store, rotated, nothing).data == Dict{String,Any}("user_id" => 42, "elevated" => true)
+    end
+
     @testset "same-session requests do not share nested values (#318)" begin
         store = MemoryStore()
         sid = "shared-cart-session"

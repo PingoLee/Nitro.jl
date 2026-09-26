@@ -7,7 +7,7 @@ using JSON
 using UUIDs
 
 import Nitro.Auth: make_password, check_password, password_needs_upgrade
-import Nitro.Core.Types: AbstractSessionStore, SessionPayload, get_session, set_session!, update_session!, delete_session!, cleanup_expired_sessions!, is_expired
+import Nitro.Core.Types: AbstractSessionStore, SessionPayload, get_session, set_session!, update_session!, rotate_session!, delete_session!, cleanup_expired_sessions!, is_expired
 import Nitro.Core.Cookies: storesession!, prunesessions!
 import Nitro: pormg_nitro_session, sync_pormg_env!
 # Stored JSON is read through the same depth bound as request JSON, and written only when it can
@@ -393,6 +393,42 @@ function update_session!(store::PormGSessionStore, session_id::String, data::Dic
         rethrow()
     end
     return matched > 0
+end
+
+# Moves a session to a new key only while the old one is live (#361). This cannot be one
+# `UPDATE ... SET session_key = new WHERE session_key = old AND expires_at > now`, the shape
+# `update_session!` uses: PormG refuses a primary key in `update()`'s SET (`InvalidValueError`).
+#
+# So the guarded DELETE decides. Its WHERE is the liveness check, and its row count says whether
+# THIS call removed the row: of a rotation and a concurrent logout, exactly one deletes it, and the
+# loser sees 0. Only the winner inserts the new key, so a logged-out session is never copied into
+# one. A read followed by an unguarded delete would re-open exactly that window.
+#
+# There is deliberately no transaction around the DELETE and the INSERT. It would buy only crash
+# atomicity, and a failure between the two already fails closed: the INSERT throws, the old row is
+# gone, and the visitor is logged out rather than left holding a session nobody authorized.
+function rotate_session!(store::PormGSessionStore, old_id::String, new_id::String,
+                         data::Dict{String,Any}; ttl::Int=3600)
+    now_utc = Dates.now(Dates.UTC)
+    # Outside the `try`, as in `set_session!`: a payload too deep to store throws its
+    # `ArgumentError` before the old row is touched, so the session is not lost to it (#344).
+    serialized = _serialize_session(data)
+
+    try
+        # PormG's `delete()` returns `(total, per-table breakdown)`.
+        deleted = first(_session_objects(store).filter("session_key" => old_id,
+                                                       "expires_at__@gt" => now_utc).delete())
+        deleted > 0 || return false
+        _session_objects(store).create(
+            "session_key"  => new_id,
+            "session_data" => serialized,
+            "expires_at"   => now_utc + Dates.Second(ttl),
+        )
+    catch e
+        @warn "PormGSessionStore: failed to rotate session" exception=(e, catch_backtrace())
+        rethrow()
+    end
+    return true
 end
 
 function delete_session!(store::PormGSessionStore, session_id::String)

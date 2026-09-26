@@ -182,16 +182,18 @@ Implement these methods for your own backend:
 ```julia
 Base.get(store::S, session_id::String, default)
 set_session!(store::S, session_id::String, data; ttl=3600)
-update_session!(store::S, session_id::String, data; ttl=3600)   # -> Bool
+update_session!(store::S, session_id::String, data; ttl=3600)                 # -> Bool
+rotate_session!(store::S, old_id::String, new_id::String, data; ttl=3600)     # -> Bool
 delete_session!(store::S, session_id::String)
 cleanup_expired_sessions!(store::S)
 ```
 
 `SessionMiddleware` uses Nitro's `storesession!` and `prunesessions!` helpers, and those
 delegate to `set_session!` and `cleanup_expired_sessions!` by default. It writes back a session
-the request *loaded* with `update_session!`. That method must write only if the session still
-exists and has not expired, returning `false` otherwise, as one atomic step. Implementing the
-five methods above is enough for custom backends; only `cleanup_expired_sessions!` is optional.
+the request *loaded* with `update_session!`, and `regenerate_session!` moves one to a new ID with
+`rotate_session!`. Each must act only if the session still exists and has not expired, returning
+`false` otherwise, as one atomic step. Implementing the six methods above is enough for custom
+backends; only `cleanup_expired_sessions!` is optional.
 
 `cleanup_expired_sessions!` is called from a background janitor owned by
 `SessionMiddleware`'s lifecycle hooks — it never runs on the request path. Use
@@ -213,11 +215,17 @@ that write dropped: the session is not re-created, and that response does not se
 again. Each request also works on its own deep copy of the session, so concurrent requests never
 share a nested value such as a `cart` vector.
 
-One case is not covered yet
-([#361](https://github.com/PingoLee/Nitro.jl/issues/361)): an in-flight request that
-**rotates** the session after the logout, by calling `regenerate_session!` or through
-`rotate_on_auth` on a user switch. It still copies its stale data into a fresh ID. Re-check
-credentials before rotating on a privilege change rather than trusting the loaded session alone.
+The same holds for an in-flight request that **rotates** the session after the logout, by
+calling `regenerate_session!` or through `rotate_on_auth` on a user switch
+([#361](https://github.com/PingoLee/Nitro.jl/issues/361)). The store moves a session to a new ID
+only if it still exists, so the logged-out data is not copied into a fresh ID, the rotating
+request's write is dropped, and it sets no cookie. `regenerate_session!` returns `nothing` in that
+case.
+
+The race has a second order, and it is not a resurrection. If the rotation commits **before** the
+logout, the logout then targets an ID that no longer exists, and the rotated session lives on:
+the rotation genuinely happened first. Logging out every session of a user is what closes that
+order, and it is a separate mechanism.
 
 If you manage sessions manually without `SessionMiddleware`, delete the old server-side record and invalidate the client cookie yourself.
 

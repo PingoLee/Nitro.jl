@@ -28,9 +28,9 @@ When it returns `false` the write is dropped and the cookie is not re-set. That 
 `regenerate_session!`, is still written with `set_session!`.
 
 This closes the write-back path only. A request that **rotates** its session after a concurrent
-logout (`regenerate_session!`, or `rotate_on_auth` on a user switch) still copies its stale data
-into the new id. That needs an atomic rotate on the store and is tracked in
-[#361](https://github.com/PingoLee/Nitro.jl/issues/361).
+logout (`regenerate_session!`, or `rotate_on_auth` on a user switch) is closed by a second required
+store method, `rotate_session!`
+([#361](https://github.com/PingoLee/Nitro.jl/issues/361)), which has its own entry.
 
 `update_session!` is a **required** part of the `AbstractSessionStore` contract, next to
 `Base.get`, `set_session!` and `delete_session!`. `MemoryStore` and `PormGSessionStore` implement
