@@ -97,7 +97,7 @@ Res.redirect(url::String;     status::Int=302, headers::Vector=[])
 | `Res.html(s)` | `text/html` | **markup sink, escape first** |
 | `Res.send(s)` | `text/plain` | |
 | `Res.send(s; content_type=c)` | `c` | **markup sink when `c` is a markup/script type** |
-| `mustache(...)` / `otera(...)` | sniffed, or `mime_type=` | **markup sink** — templating does not escape by default |
+| `mustache(...)` / `otera(...)` | sniffed, or `mime_type=` | **markup sink** — `{{x}}` escapes by default; `{{{x}}}`, `{{&x}}`, `\|> safe` and `autoescape = false` do not |
 | `Res.send(b)` | octet-stream | `Vector{UInt8}`; **also a markup sink with `content_type=`** |
 | `Res.json(x)` | `application/json` | any value; `Vector{UInt8}` is sent verbatim |
 | `Res.file(p)` | sniffed from path | **inline**; `loadfile=` hook |

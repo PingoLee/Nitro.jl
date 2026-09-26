@@ -143,12 +143,3 @@ You should be able to hit `http://127.0.0.1:8080/greet` inside your browser and 
 ```
 "hello world!"
 ```
-
-
-## Interactive API documenation
-
-Open your browser to http://127.0.0.1:8080/docs
-Here you'll see the auto-generated documentation for your api. 
-This is done internally by generating a JSON object that conforms to the openapi format. 
-Once generated, you can feed this same schema to libraries like swagger which translate this 
-into an interactive api for you to explore.
