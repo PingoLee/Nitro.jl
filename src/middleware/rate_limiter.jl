@@ -453,44 +453,43 @@ function FixedRateLimiter(;
                 stripe = _stripe_for(stripes, key)
                 rate_limit_store = stripe.store
 
-                reset_time = 0
-                should_limit = false
-                remaining_requests = rate_limit
-
-                lock(stripe.lock) do
+                # Each case RETURNS `(should_limit, remaining_requests, reset_time)` as a concrete
+                # `Tuple{Bool,Int,Int}`. These three used to be locals declared above the block
+                # and assigned inside it, which boxed them and handed `set_rate_headers!` three
+                # `Any`s on every request (#364) -- see the sliding limiter's note on the same
+                # shape. `test/closure_boxing_tests.jl` now fails on any boxed closure in Nitro.
+                should_limit, remaining_requests, reset_time = lock(stripe.lock) do
                     current_time = now(UTC)
 
                     if haskey(rate_limit_store, key)
                         count, last_reset = rate_limit_store[key]
 
-                        # Case 2: Expired Window 
+                        # Case 2: Expired Window
                         if current_time - last_reset > window
                             rate_limit_store[key] = (1, current_time)
-                            remaining_requests = rate_limit - 1
                             # Reset to current time, so reset time is full window period
-                            reset_time = calculate_reset_time(current_time, current_time, window)
+                            return (false, rate_limit - 1,
+                                    calculate_reset_time(current_time, current_time, window))
 
                         # Case 3: Limit Exceeded
                         elseif count >= rate_limit
-                            should_limit = true
-                            remaining_requests = 0
                             # Use original last_reset to calculate remaining time
-                            reset_time = calculate_reset_time(current_time, last_reset, window)
+                            return (true, 0, calculate_reset_time(current_time, last_reset, window))
 
                         # Case 4: Within Limit
                         else
                             rate_limit_store[key] = (count + 1, last_reset)
-                            remaining_requests = rate_limit - (count + 1)
                             # Calculate reset based on original last_reset
-                            reset_time = calculate_reset_time(current_time, last_reset, window)
+                            return (false, rate_limit - (count + 1),
+                                    calculate_reset_time(current_time, last_reset, window))
                         end
-                    else
-                        # Case 1: New IP
-                        rate_limit_store[key] = (1, current_time)
-                        remaining_requests = rate_limit - 1
-                        # Start from current time, full window period
-                        reset_time = calculate_reset_time(current_time, current_time, window)
                     end
+
+                    # Case 1: New IP
+                    rate_limit_store[key] = (1, current_time)
+                    # Start from current time, full window period
+                    return (false, rate_limit - 1,
+                            calculate_reset_time(current_time, current_time, window))
                 end
 
                 # Prepare the response
@@ -671,8 +670,10 @@ function SlidingRateLimiter(;
                 should_limit, remaining_requests, reset_time = lock(stripe.lock) do
                     current_time = now(UTC)
 
-                    # Get existing timestamps or create empty vector
-                    timestamps = get!(rate_limit_store, key, DateTime[])
+                    # Get existing timestamps or create empty vector. The assertion is
+                    # load-bearing: LRUCache's `get!` infers `Any`, so without it the tuple's
+                    # middle element, derived from `length(timestamps)`, was `Any` (#364).
+                    timestamps = get!(rate_limit_store, key, DateTime[])::Vector{DateTime}
 
                     # Prune expired timestamps (sliding window cleanup)
                     # Keep only timestamps within the current window

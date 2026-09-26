@@ -679,6 +679,28 @@ end
     @test bare_sliding.middleware(_ -> HTTP.Response(200, "reached"))(req).status == 200
 end
 
+@testset "the request closure boxes nothing (#364)" begin
+    # The fixed limiter declared its three decision values before `lock(stripe.lock) do … end`
+    # and assigned them inside it. Assigning an enclosing-scope local from a closure boxes it, so
+    # `set_rate_headers!` got three `Any`s on every request (nitro-core §7). The sliding limiter
+    # had no box but still leaked one `Any`: LRUCache's `get!` infers `Any`, and
+    # `remaining_requests` was computed from what it returned.
+    #
+    # `test/closure_boxing_tests.jl` catches a box anywhere in Nitro; this is the narrower check
+    # that the values reaching the headers are concrete, which a box-free closure can still miss.
+    for strategy in (:fixed_window, :sliding_window)
+        f = RateLimiter(; strategy, auto_extract_ip=false).middleware(_ -> HTTP.Response(200))
+        ci = only(code_typed(f, (HTTP.Request,); optimize = false)).first
+        @test (strategy, filter(T -> T === Core.Box, ci.slottypes)) == (strategy, [])
+        for (name, T) in (:should_limit => Bool, :remaining_requests => Int, :reset_time => Int)
+            # A name can own several slots; one that is never assigned infers `Union{}`.
+            assigned = unique(S for (n, S) in zip(ci.slotnames, ci.slottypes)
+                              if n === name && S !== Union{})
+            @test (strategy, name, assigned) == (strategy, name, [T])
+        end
+    end
+end
+
 end # @testitem "Rate limiter construction and keying"
 
 
