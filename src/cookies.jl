@@ -803,15 +803,27 @@ function prunesessions!(store::AbstractSessionStore)
 end
 
 """
-    regenerate_session!(req::HTTP.Request, store::AbstractSessionStore{String, Dict{String,Any}}; ttl::Int=3600) -> String
+    regenerate_session!(req::HTTP.Request, store::AbstractSessionStore{String, Dict{String,Any}}; ttl::Int=3600) -> Union{String, Nothing}
 
 Regenerate the session ID to prevent session-fixation attacks.
 
-Copies the current session data to a new session ID, deletes the old session,
-and updates `req.context[:session_id]` so that `SessionMiddleware` writes the
-new cookie on the response. Works with any `AbstractSessionStore` backend.
+Moves the current session data to a new session ID with the store's atomic
+[`rotate_session!`](@ref), which also removes the old one, and updates
+`req.context[:session_id]` so that `SessionMiddleware` writes the new cookie on the response.
+Works with any `AbstractSessionStore` backend.
 
-Returns the new session ID.
+Returns the new session ID, or **`nothing` when the session was logged out while this request
+was running** (#361). A concurrent request deleted it, so there is nothing to rotate: the context
+keeps the old id, `SessionMiddleware` drops this request's write, and no cookie is set. Rotating
+anyway used to copy the logged-out session, identity included, into a fresh id.
+
+A session `SessionMiddleware` created during this request has never been stored or sent to the
+client, so it gets a new ID with no store operation; the middleware saves it on the way out.
+
+The new ID keeps the session's creation instant, which is what `SessionMiddleware`'s
+`absolute_max_age` measures from (#362). A rotated session that **ends the request empty**,
+which is what the logout recipe `empty!(getsession(req))` + `regenerate_session!` leaves, gets a
+fresh clock from `SessionMiddleware` when it is written back.
 """
 function regenerate_session!(req::HTTP.Request, store::AbstractSessionStore{String, Dict{String,Any}}; ttl::Int=3600)
     old_id = get(req.context, :session_id, nothing)
@@ -819,13 +831,19 @@ function regenerate_session!(req::HTTP.Request, store::AbstractSessionStore{Stri
 
     new_id = string(secure_uuid4())
 
-    # Write current data under new ID
-    set_session!(store, new_id, session_data; ttl=ttl)
-
-    # Remove old session
-    if !isnothing(old_id)
-        delete_session!(store, old_id)
+    if isnothing(old_id)
+        # No session at all, so none that a logout could have deleted: create one.
+        set_session!(store, new_id, session_data; ttl=ttl)
+    elseif get(req.context, :session_new, false) !== true
+        # A session this request LOADED. Move it only if it is still there (#361).
+        # `::Bool`: the contract's return type, asserted so a store returning anything else fails
+        # here by name, and inference does not carry `Any` (the arguments come out of
+        # `req.context`).
+        rotate_session!(store, old_id, new_id, session_data; ttl=ttl)::Bool || return nothing
     end
+    # Otherwise the id was minted by `SessionMiddleware` in this request: never stored, never
+    # sent, so no other request can hold it. Asking the store to move it would find nothing and
+    # read as a logout, so a first-time visitor's login would never rotate.
 
     # Update the request context so middleware writes the new cookie
     req.context[:session_id] = new_id

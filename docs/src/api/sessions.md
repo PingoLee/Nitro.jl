@@ -21,9 +21,11 @@ SessionMiddleware
 SessionPruner
 regenerate_session!
 AbstractSessionStore
+Nitro.Core.Types.SessionPayload
 MemoryStore
 is_expired
 Nitro.Core.Types.update_session!
+Nitro.Core.Types.rotate_session!
 Nitro.Core.Types.cleanup_expired_sessions!
 Nitro.Core.Types.missing_session_methods
 Nitro.Errors.StoreInterfaceError

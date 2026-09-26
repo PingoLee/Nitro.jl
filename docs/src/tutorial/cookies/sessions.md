@@ -134,6 +134,48 @@ function elevate_handler(req::HTTP.Request)
 end
 ```
 
+## Session Lifetime
+
+A session has two lifetimes, and it ends at whichever comes first:
+
+| Keyword | Default | Measured from | Ends a session that is… |
+|---|---|---|---|
+| `max_age` | `86400` (1 day) | the last write | idle |
+| `absolute_max_age` | `604800` (7 days) | when the session was first stored | old, however active |
+
+`max_age` is a **sliding** lifetime: every write moves the expiry forward, so on its own it never
+ends a session that keeps being used, and a stolen session ID stays valid for as long as someone
+keeps using it. `absolute_max_age` caps that. Once a session is older than the cap, it is treated
+as absent: the visitor gets a fresh session and signs in again.
+
+```julia
+SessionMiddleware(store = store, max_age = 3600, absolute_max_age = 12 * 3600)  # 1 h idle, 12 h total
+SessionMiddleware(store = store, absolute_max_age = nothing)                     # no absolute cap
+```
+
+- **Rotation keeps the clock.** `regenerate_session!` and `rotate_on_auth` move a session to a new
+  ID, so its lifetime is still measured from when it was first created. A login therefore does not
+  buy a fresh week, and neither can an endpoint that rotates without re-checking credentials.
+- **Logout starts a new one.** A rotated session that *ends the request empty* carries no
+  identity, so `SessionMiddleware` writes it with a fresh clock. The logout recipe,
+  `empty!(getsession(req))` then `regenerate_session!`, leaves an anonymous session with a full
+  window, and logging back in carries that new clock. The check is made when the request ends:
+  emptying a session, rotating it and putting the identity back keeps the old clock.
+- **The cap binds every reader.** Each write sets the stored expiry to `max_age` from now or the
+  absolute deadline, whichever is sooner, and the cookie's `Max-Age` too. Readers that skip the
+  middleware — the `Session{T}` extractor, `Auth.session_user_validator` — refuse the session
+  at the deadline through the same expiry check. A session `SessionMiddleware` finds past its cap
+  anyway is deleted. That happens after you **lower** the cap, or after a direct `set_session!`.
+  It also happens when two `SessionMiddleware`s with different caps share one store, so give them
+  the same cap.
+- **The deadline is exact.** A session that reaches it during a request ends with that request:
+  nothing is written, a login rotation included, and no cookie is set.
+- **`nothing` means no cap.** A huge number would overflow the date arithmetic, so the keyword
+  refuses anything over 100 years.
+- **Why seven days.** OWASP recommends an absolute timeout; Django ships none. A week keeps a
+  regular user signed in across a working week and bounds how long a stolen ID works. Shorten it
+  for sensitive apps.
+
 ## Store Options
 
 ### In-Memory Store
@@ -169,6 +211,11 @@ The default `db_key` is `"db"`. Use a different one when your session database u
 PormG connection, for example `db_key="sessions"` — the key selects the connection the table is
 created on *and* the one every session query runs against.
 
+`pormg_nitro_session()` also brings an existing table up to date on boot. A `nitro_session` table
+created before `absolute_max_age` existed gains its `created_at` column. Rows already in it are
+stamped with the upgrade instant, so live sessions get a full lifetime from the upgrade rather
+than ending at once.
+
 !!! note "Sessions inside a PormG transaction"
     The store's `nitro_session` model is bound to `db_key`, so session reads and writes work
     inside a `PormG.run_in_transaction(db_key)` block. A session call inside a transaction
@@ -182,16 +229,25 @@ Implement these methods for your own backend:
 ```julia
 Base.get(store::S, session_id::String, default)
 set_session!(store::S, session_id::String, data; ttl=3600)
-update_session!(store::S, session_id::String, data; ttl=3600)   # -> Bool
+update_session!(store::S, session_id::String, data; ttl=3600)                 # -> Bool
+rotate_session!(store::S, old_id::String, new_id::String, data; ttl=3600)     # -> Bool
 delete_session!(store::S, session_id::String)
 cleanup_expired_sessions!(store::S)
 ```
 
 `SessionMiddleware` uses Nitro's `storesession!` and `prunesessions!` helpers, and those
 delegate to `set_session!` and `cleanup_expired_sessions!` by default. It writes back a session
-the request *loaded* with `update_session!`. That method must write only if the session still
-exists and has not expired, returning `false` otherwise, as one atomic step. Implementing the
-five methods above is enough for custom backends; only `cleanup_expired_sessions!` is optional.
+the request *loaded* with `update_session!`, except a logged-out session, which it re-stores with
+`set_session!` for a fresh clock. `set_session!` must therefore overwrite an existing ID.
+`regenerate_session!` moves a session to a new ID with `rotate_session!`. `update_session!` and
+`rotate_session!` must each act only if the session still exists and has not expired, returning
+`false` otherwise, as one atomic step. Implementing the six methods above is enough for custom
+backends; only `cleanup_expired_sessions!` is optional.
+
+`Base.get` returns a `SessionPayload(data, expires, created)`. `created` is the instant the
+session was first stored: `set_session!` sets it, while `update_session!` keeps it and
+`rotate_session!` carries it to the new ID. That instant is what `absolute_max_age` measures from,
+so a store that reset it on every write would let sessions live forever.
 
 `cleanup_expired_sessions!` is called from a background janitor owned by
 `SessionMiddleware`'s lifecycle hooks — it never runs on the request path. Use
@@ -213,11 +269,17 @@ that write dropped: the session is not re-created, and that response does not se
 again. Each request also works on its own deep copy of the session, so concurrent requests never
 share a nested value such as a `cart` vector.
 
-One case is not covered yet
-([#361](https://github.com/PingoLee/Nitro.jl/issues/361)): an in-flight request that
-**rotates** the session after the logout, by calling `regenerate_session!` or through
-`rotate_on_auth` on a user switch. It still copies its stale data into a fresh ID. Re-check
-credentials before rotating on a privilege change rather than trusting the loaded session alone.
+The same holds for an in-flight request that **rotates** the session after the logout, by
+calling `regenerate_session!` or through `rotate_on_auth` on a user switch
+([#361](https://github.com/PingoLee/Nitro.jl/issues/361)). The store moves a session to a new ID
+only if it still exists, so the logged-out data is not copied into a fresh ID, the rotating
+request's write is dropped, and it sets no cookie. `regenerate_session!` returns `nothing` in that
+case.
+
+The race has a second order, and it is not a resurrection. If the rotation commits **before** the
+logout, the logout then targets an ID that no longer exists, and the rotated session lives on:
+the rotation genuinely happened first. Logging out every session of a user is what closes that
+order, and it is a separate mechanism.
 
 If you manage sessions manually without `SessionMiddleware`, delete the old server-side record and invalidate the client cookie yourself.
 
@@ -227,4 +289,5 @@ If you manage sessions manually without `SessionMiddleware`, delete the old serv
 - Keep `httponly=true` unless JavaScript must read the cookie.
 - Prefer `samesite="Lax"` or `"Strict"` for browser-authenticated apps.
 - Rotate the session ID on login, logout, and privilege changes.
+- Keep an absolute lifetime (`absolute_max_age`, 7 days by default); shorten it for sensitive apps.
 - Use a persistent store such as `pormg_nitro_session()` for production deployments.

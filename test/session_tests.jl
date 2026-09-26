@@ -17,7 +17,7 @@ end
 # read for the same reason `SameTickStore` does (#173).
 struct BoundaryStore <: Nitro.Types.AbstractSessionStore{String, Dict{String,Any}} end
 Base.get(::BoundaryStore, ::String, default) =
-    SessionPayload(Dict{String,Any}("user_id" => 7), Dates.now(Dates.UTC))
+    SessionPayload(Dict{String,Any}("user_id" => 7), Dates.now(Dates.UTC), Dates.now(Dates.UTC))
 
 @testset "Nitro Session via App Context Tests" begin
 
@@ -157,13 +157,13 @@ Base.get(::BoundaryStore, ::String, default) =
         at = DateTime(2030, 1, 1, 12, 0, 0)
         d  = Dict{String,Any}("user_id" => 7)
 
-        @test is_expired(SessionPayload(d, at), at) === true                      # the boundary
-        @test is_expired(SessionPayload(d, at + Millisecond(1)), at) === false    # not yet
-        @test is_expired(SessionPayload(d, at - Millisecond(1)), at) === true     # long gone
+        @test is_expired(SessionPayload(d, at, at), at) === true                      # the boundary
+        @test is_expired(SessionPayload(d, at + Millisecond(1), at), at) === false    # not yet
+        @test is_expired(SessionPayload(d, at - Millisecond(1), at), at) === true     # long gone
 
         # The one-arg form is the two-arg form against the clock.
-        @test is_expired(SessionPayload(d, Dates.now(Dates.UTC) - Second(10))) === true
-        @test is_expired(SessionPayload(d, Dates.now(Dates.UTC) + Hour(1))) === false
+        @test is_expired(SessionPayload(d, Dates.now(Dates.UTC) - Second(10), Dates.now(Dates.UTC))) === true
+        @test is_expired(SessionPayload(d, Dates.now(Dates.UTC) + Hour(1), Dates.now(Dates.UTC))) === false
 
         # Public, so a third-party `AbstractSessionStore` has something to call instead of
         # re-deriving the comparison -- which is how the six sites drifted apart.
@@ -173,7 +173,7 @@ Base.get(::BoundaryStore, ::String, default) =
     @testset "every read path refuses a payload on the boundary (#173)" begin
         configcookies(secret_key=nothing)
         d = Dict{String,Any}("user_id" => 7)
-        mint() = SessionPayload(d, Dates.now(Dates.UTC))
+        mint() = (now = Dates.now(Dates.UTC); SessionPayload(d, now, now))
         N = 200
 
         # Every path below is exercised in a WARM loop with the payload minted immediately

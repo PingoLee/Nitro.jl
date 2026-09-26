@@ -5,12 +5,13 @@ using Dates
 using JSON
 using UUIDs
 using ...Types: AbstractSessionStore, MemoryStore, SessionPayload, Nullable, is_expired,
-    update_session!
+    update_session!, delete_session!
 using ...Types: CookieConfig, LifecycleMiddleware
 using ..JanitorMiddleware: _janitor
 using ...Cookies: get_cookie, set_cookie!, storesession!, prunesessions!, regenerate_session!,
     _validate_cookie_prefix
 using ...Crypto: secure_uuid4
+using ...Errors: is_unrecoverable
 using ...Core: own_response_headers
 
 export SessionMiddleware, SessionPruner
@@ -91,8 +92,17 @@ function SessionPruner(store::AbstractSessionStore; interval::Period = Minute(10
         on_shutdown = on_shutdown)
 end
 
+# The `absolute_max_age` a `SessionMiddleware` gets when none is given: seven days, in seconds
+# (#362). Long enough that a user who keeps coming back signs in again about once a week; short
+# enough that a stolen session id stops working within a week however much it is used.
+const DEFAULT_ABSOLUTE_MAX_AGE = 7 * 86400
+
+# The largest `absolute_max_age` accepted: 100 years. Far past any real session, and far short of
+# where `DateTime + Second(n)` overflows and wraps round to the past.
+const MAX_ABSOLUTE_MAX_AGE = 100 * 365 * 86400
+
 """
-    SessionMiddleware(; store, cookie_name, max_age, prune_interval,
+    SessionMiddleware(; store, cookie_name, max_age, absolute_max_age, prune_interval,
                         rotate_on_auth, auth_key, validator, ...)
 
 Creates a `LifecycleMiddleware` that manages server-side sessions with cookie-based session
@@ -122,13 +132,51 @@ so health checks and static files do not create sessions. `CSRFMiddleware` sets 
 it issues a token bound to the session. Set it yourself when you hand the client anything else
 bound to `req.context[:session_id]`.
 
-An existing session is written back when its data changed, or when the flag is set (which also
-refreshes its expiry). That write is update-only (`update_session!`, #318). If a concurrent logout
-deleted the session meanwhile, the write is dropped and the cookie is not re-set.
+An existing session is written back when its data changed, when it was rotated, or when the flag
+is set (which also refreshes its expiry). That write is update-only (`update_session!`, #318). If a
+concurrent logout deleted the session meanwhile, the write is dropped and the cookie is not re-set.
+The one exception is a rotated session that ends the request empty and with no identity, such as
+a logout. It is written with `set_session!` as a fresh session; see *Session lifetime* below.
+
+Rotation holds against the same race (#361). `regenerate_session!` and `rotate_on_auth` move the
+session with the store's atomic `rotate_session!`, which moves it only if it still exists. After a
+concurrent logout there is nothing to move, so the logged-out data is not copied into a fresh id,
+this request's write is dropped, and no cookie is set.
 
 A response that sets the session cookie also gets `Vary: Cookie`, and `Cache-Control: private` in
 place of any `public` (other directives are kept). A shared cache therefore never serves one
 visitor's session to another.
+
+# Session lifetime (`max_age`, `absolute_max_age`)
+
+A session has two lifetimes, and it ends at whichever comes first.
+
+- `max_age::Int = 86400` — the **sliding** lifetime, in seconds. Every write moves the expiry to
+  `max_age` from now, so a session in use keeps going and an idle one lapses.
+- `absolute_max_age::Nullable{Int} = 604800` (7 days) — the **absolute** lifetime, in seconds,
+  measured from when the session was first stored (#362). A session older than that is treated as
+  absent, like an expired one: the visitor gets a fresh id and signs in again, however recently
+  the old session was used. Without it, a stolen session id stayed valid for as long as the
+  thief kept using it. `nothing` switches it off, which is Django's default; OWASP recommends
+  an absolute timeout.
+
+Rotation does not restart the absolute clock: `regenerate_session!` and `rotate_on_auth` move a
+session to a new id and keep its creation time, so the cap bounds the whole chain of ids. The one
+exception is a rotated session that **ends the request empty**, which is what the logout recipe
+(`empty!` + `regenerate_session!`) leaves. It carries no identity, so it is written with a fresh
+clock, and logging back in gets a full window. The check is made on the final contents, so emptying
+a session, rotating it and putting the identity back keeps the old clock.
+
+The cap binds every reader of the store, not only this middleware. Each write sets the expiry to
+`max_age` from now or the absolute deadline, whichever is sooner, and the cookie's `Max-Age`
+likewise. The `Session{T}` extractor and `Auth.session_user_validator` read the store directly,
+and the expiry check they already make then enforces the cap too. A session this middleware finds
+past its cap anyway is deleted. That happens after a cap was *lowered*, after a direct
+`set_session!`, or when another `SessionMiddleware` with a looser cap shares the store, so give
+middlewares that share a store the same cap. A session that reaches its deadline while a request
+runs ends with that request: nothing is written, not even a rotation, and no cookie is set.
+
+`absolute_max_age` must be at most 100 years; pass `nothing`, not a huge number, for no cap.
 
 # Session fixation defense (`rotate_on_auth`, `auth_key`, `validator`)
 
@@ -164,7 +212,8 @@ contract.
   session swapping): browsers refuse to let anyone but this origin, over HTTPS, set one. An
   explicit `__Host-`/`__Secure-` name the attributes cannot carry is an `ArgumentError` at
   construction, since browsers would silently drop it.
-- `max_age::Int`.
+- `max_age`, `absolute_max_age` — see *Session lifetime* above. An `absolute_max_age` that is
+  not positive, or is over 100 years, is an `ArgumentError` at construction.
 - `prune_interval::Period = Minute(10)` — how often the background janitor removes expired
   sessions from `store`. Must be a positive fixed-length `Period`; calendar periods (`Month`,
   `Quarter`, `Year`) are rejected, since they cannot be slept on. This replaced a `prune_probability` that ran the prune inline on a
@@ -184,6 +233,7 @@ the chain by hand, the request function is its `.middleware` field.
 function SessionMiddleware(;
     cookie_name::Nullable{String} = nothing,
     max_age::Int = 86400,
+    absolute_max_age::Nullable{Int} = DEFAULT_ABSOLUTE_MAX_AGE,
     store::AbstractSessionStore{String, Dict{String,Any}},
     prune_interval::Period = Minute(10),
     secure::Bool = true,
@@ -212,6 +262,16 @@ function SessionMiddleware(;
         "ignored. The cookie holds only a random 122-bit session id; the session data stays on " *
         "the server. Build the `CookieConfig` without `secret_key` (#339)."))
 
+    # A zero or negative cap would refuse every session the moment it was stored; `nothing` is
+    # how the cap is switched off. The upper bound is arithmetic, not policy: `created +
+    # Second(typemax(Int))` wraps `DateTime` round to the past, so "effectively unbounded"
+    # written as a huge number refused EVERY session. `nothing` says unbounded.
+    absolute_max_age === nothing ||
+        0 < absolute_max_age <= MAX_ABSOLUTE_MAX_AGE || throw(ArgumentError(
+        "SessionMiddleware: `absolute_max_age` must be a positive number of seconds, at most " *
+        "$MAX_ABSOLUTE_MAX_AGE (100 years), or `nothing` for no absolute lifetime; got " *
+        "$absolute_max_age (#362)."))
+
     # Resolved from the FINAL config -- `config` may be passed whole -- and checked before any
     # janitor exists, so a name browsers would drop fails at construction.
     session_cookie = something(cookie_name, _default_session_cookie_name(config))
@@ -225,7 +285,7 @@ function SessionMiddleware(;
         return function(req::HTTP.Request)
             # Load the current payload and remember the auth marker before the handler runs.
             session_id = _get_session_id(req, session_cookie)
-            session_data, is_new = _load_session(store, session_id)
+            session_data, is_new, created = _load_session(store, session_id, absolute_max_age)
             original_session = deepcopy(session_data)
             original_auth_marker = _auth_marker(session_data, session_id, auth_key, validator)
 
@@ -237,6 +297,9 @@ function SessionMiddleware(;
             # Expose the mutable session dictionary through the request context.
             req.context[:session] = session_data
             req.context[:session_id] = session_id
+            # Tells `regenerate_session!` whether this id is in the store: a minted one is not,
+            # and moving it with `rotate_session!` would find nothing and read as a logout.
+            req.context[:session_new] = is_new
 
             # Let downstream middleware and the handler read or mutate the session.
             response = handle(req)
@@ -244,11 +307,33 @@ function SessionMiddleware(;
             current_session = req.context[:session]
             final_session_id = get(req.context, :session_id, session_id)
 
-            # Retire the previous ID when an existing session crosses an auth boundary.
+            # Every write below -- insert, update, rotation -- and the cookie use this, so the
+            # stored expiry never passes the absolute deadline (#362). A new session's clock
+            # starts when it is written, not when the request began, so a slow first request can
+            # never leave it with no lifetime at all.
+            write_now = Dates.now(Dates.UTC)
+            ttl = _write_ttl(max_age, absolute_max_age, is_new ? write_now : created, write_now)
+
+            # A loaded session that reached its absolute deadline while this request ran (it had
+            # under a second left, or the handler took longer than what was left) is ended the
+            # way the load path ends one: no rotation, no write, no cookie. Writing it with a TTL
+            # of 0 would store a row that is expired on arrival -- and a rotation would move the
+            # session into it, reporting success for a login the next request cannot see. It
+            # would also hand every store method a TTL some backends reject (Redis `EX 0`).
+            # Whatever id it now lives under, the handler's own rotation included, is deleted.
+            if !is_new && ttl == 0
+                _end_session!(store, final_session_id)
+                return response
+            end
+
+            # Retire the previous ID when an existing session crosses an auth boundary. If a
+            # concurrent logout deleted the session meanwhile, the rotation finds nothing to move
+            # and the id stays put, so the update-only write below drops this request's data
+            # (#361).
             if rotate_on_auth && !is_new && final_session_id == session_id
                 current_auth_marker = _auth_marker(current_session, final_session_id, auth_key, validator)
                 if _auth_marker_changed(original_auth_marker, current_auth_marker)
-                    regenerate_session!(req, store; ttl=max_age)
+                    regenerate_session!(req, store; ttl=ttl)
                     final_session_id = req.context[:session_id]
                 end
             end
@@ -265,20 +350,43 @@ function SessionMiddleware(;
             # every cookieless request, so a `/health` loop grew `MemoryStore` without bound and
             # cost a PormG store a SELECT plus an INSERT per request.
             #
-            # An id minted during THIS request -- a new visitor's, or one `regenerate_session!`
-            # rotated to -- is inserted. An id the request LOADED is written back update-only
-            # (#318): if a concurrent logout or rotation deleted it meanwhile, the write is
-            # dropped and the cookie is not re-set. Upserting it re-created the deleted session,
-            # so a stolen id outlived the logout meant to kill it and the browser was logged
-            # back in.
-            if rotated || (is_new && (forced || !isempty(current_session)))
-                _save_session(store, final_session_id, current_session, max_age)
+            # A new visitor's session -- whatever id it ends the request under -- is inserted. A
+            # session the request LOADED is written back update-only (#318): if a concurrent
+            # logout or rotation deleted it meanwhile, the write is dropped and the cookie is not
+            # re-set. Upserting it re-created the deleted session, so a stolen id outlived the
+            # logout meant to kill it and the browser was logged back in.
+            #
+            # That covers a loaded session this request ROTATED too (#361). `rotate_session!` has
+            # already moved it to `final_session_id`, so the row exists, and the update carries
+            # whatever the handler changed after rotating. This branch used to upsert the new id;
+            # update-only is the same write, except that it never re-creates a row something
+            # deleted after the rotation. It also re-clamps the expiry of a handler's own
+            # `regenerate_session!(…; ttl)` to the absolute deadline, and keeps `created` (#362),
+            # which an upsert would reset. The single exception, a rotated session left empty
+            # and anonymous, is the branch just below the new-visitor one.
+            if is_new && (rotated || forced || !isempty(current_session))
+                _save_session(store, final_session_id, current_session, ttl)
                 session_written = true
-            elseif !is_new && (forced || current_session != original_session)
+            elseif !is_new && rotated && isempty(current_session) &&
+                   _auth_marker(current_session, final_session_id, auth_key, validator) === nothing
+                # A rotated session that ENDS the request empty, with no identity -- what the
+                # logout recipe (`empty!` + `regenerate_session!`) leaves -- starts a fresh
+                # absolute clock (#362). There is nothing for the cap to bound, and carrying the
+                # clock meant logging out and back in on day 6 left a day. `set_session!` stamps a
+                # new `created`. Decided HERE, on the final contents, not when
+                # `regenerate_session!` ran: a handler that emptied, rotated, then put the identity
+                # back would otherwise have handed a stolen session a fresh week. "No identity"
+                # asks the same `auth_key`/`validator` question `rotate_on_auth` does, so an app
+                # that keys identity outside the session dict -- by id, through `validator` -- is
+                # not mistaken for logged out. Only this request knows the id.
+                ttl = _write_ttl(max_age, absolute_max_age, write_now, write_now)
+                _save_session(store, final_session_id, current_session, ttl)
+                session_written = true
+            elseif !is_new && (rotated || forced || current_session != original_session)
                 # `::Bool`: the contract's return type, asserted so inference does not carry `Any`
                 # (`current_session` comes out of `req.context`) into the branch below.
                 session_written = update_session!(store, final_session_id, current_session;
-                                                  ttl = max_age)::Bool
+                                                  ttl = ttl)::Bool
             else
                 session_written = false
             end
@@ -290,7 +398,7 @@ function SessionMiddleware(;
                 # object — a cross-request session leak — and races other threads.
                 response = own_response_headers(response)
                 # Append the session cookie without clobbering any sibling Set-Cookie headers.
-                set_cookie!(response, session_cookie, final_session_id; config=config, encrypted=false, maxage=max_age)
+                set_cookie!(response, session_cookie, final_session_id; config=config, encrypted=false, maxage=ttl)
                 _mark_private!(response)
             end
 
@@ -320,14 +428,18 @@ function _generate_session_id()
     return string(secure_uuid4())
 end
 
-function _load_session(store::AbstractSessionStore{String, Dict{String,Any}}, session_id::Nullable{String})
+# Returns `(data, is_new, created)`. `created` is the loaded session's creation instant, or now
+# for a new one -- the instant its absolute lifetime will be measured from once it is saved.
+function _load_session(store::AbstractSessionStore{String, Dict{String,Any}}, session_id::Nullable{String},
+                       absolute_max_age::Nullable{Int})
+    now = Dates.now(Dates.UTC)
     if isnothing(session_id)
-        return Dict{String,Any}(), true
+        return Dict{String,Any}(), true, now
     end
 
     payload = Base.get(store, session_id, nothing)
     if isnothing(payload)
-        return Dict{String,Any}(), true
+        return Dict{String,Any}(), true, now
     end
 
     # DEEP copies (#318). A shallow `copy` shared every nested value -- the docs' `cart` vector,
@@ -335,14 +447,73 @@ function _load_session(store::AbstractSessionStore{String, Dict{String,Any}}, se
     # all mutated it at once: lost writes, and a corrupted `Dict` that threw on every later
     # request. `PormGSessionStore` decodes fresh JSON per read and never had the bug.
     if payload isa SessionPayload
-        if is_expired(payload)
-            return Dict{String,Any}(), true
+        if is_expired(payload, now)
+            return Dict{String,Any}(), true, now
         end
-        return deepcopy(payload.data), false
+        if _past_absolute_age(payload.created, absolute_max_age, now)
+            # Past its absolute lifetime (#362): absent, like an expired session, whatever its
+            # sliding expiry says. Deleted rather than merely refused, because the readers that
+            # bypass this middleware -- `get_session`, the `Session{T}` extractor,
+            # `session_user_validator` -- see only `expires`. This middleware's own writes never
+            # put `expires` past the deadline, so such a row was written some other way: under a
+            # cap since lowered, by a direct `set_session!`/`storesession!`, or by another
+            # `SessionMiddleware` on the same store with a looser cap. Deleting it makes this
+            # middleware's cap bind them all -- which is why two middlewares sharing a store
+            # should share a cap too.
+            _end_session!(store, session_id)
+            return Dict{String,Any}(), true, now
+        end
+        return deepcopy(payload.data), false, payload.created
     end
 
+    # A store whose `Base.get` hands back bare data breaks the contract (it must return a
+    # `SessionPayload`) and says nothing about when the session was created. Serving it under a
+    # cap would switch the cap off without a word, so it is refused instead -- loudly, once.
+    if absolute_max_age !== nothing
+        @warn "SessionMiddleware: the session store returned something other than a " *
+              "`SessionPayload`, so the session's age cannot be checked against " *
+              "`absolute_max_age` and the session is treated as absent. Return a " *
+              "`SessionPayload(data, expires, created)` from `Base.get` (#362), or pass " *
+              "`absolute_max_age = nothing`." store_type = typeof(store) maxlog = 1
+        return Dict{String,Any}(), true, now
+    end
     data = payload isa AbstractDict ? deepcopy(payload) : payload
-    return data, false
+    return data, false, now
+end
+
+# Deletes a session that has outlived its absolute lifetime (#362). Nothing depends on the delete
+# succeeding: the session is treated as absent either way. So a failing store is logged and the
+# request carries on without the session, rather than failing with a 500 before the handler even
+# runs. The log names the exception's type only -- a store's own error could quote the key, and
+# the key is the credential. An interrupt, an overflow or an out-of-memory still propagates (#254).
+function _end_session!(store::AbstractSessionStore, session_id::String)
+    try
+        delete_session!(store, session_id)
+    catch e
+        is_unrecoverable(e) && rethrow()
+        @warn "SessionMiddleware: failed to delete a session past its absolute lifetime; it is " *
+              "refused anyway" exception_type = typeof(e)
+    end
+    return nothing
+end
+
+# Whether a session created at `created` has outlived `absolute_max_age` as of `now`. The
+# boundary counts as past, the same convention `is_expired` uses for the sliding expiry.
+function _past_absolute_age(created::DateTime, absolute_max_age::Nullable{Int}, now::DateTime)
+    absolute_max_age === nothing && return false
+    return created + Dates.Second(absolute_max_age) <= now
+end
+
+# The seconds a write may keep a session alive: the sliding `max_age`, cut short at the
+# absolute deadline (#362). Every store write and the cookie's Max-Age go through this, so the
+# stored `expires` never passes the deadline -- which is what makes the cap bind the readers
+# that never pass through this middleware, through the `is_expired` check they already make.
+function _write_ttl(max_age::Int, absolute_max_age::Nullable{Int}, created::DateTime,
+                    now::DateTime)::Int
+    absolute_max_age === nothing && return max_age
+    # Whole seconds, rounded DOWN: rounding up would let the expiry overshoot the deadline.
+    left = fld(Dates.value(created + Dates.Second(absolute_max_age) - now), 1000)
+    return clamp(left, 0, max_age)
 end
 
 function _auth_marker(session_data::Dict{String,Any}, session_id::Nullable{String}, auth_key::String, validator::Union{Function, Nothing})

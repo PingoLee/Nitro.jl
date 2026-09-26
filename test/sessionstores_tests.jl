@@ -5,13 +5,13 @@ using HTTP
 using Dates
 using Nitro
 using Nitro.Types: AbstractSessionStore, MemoryStore, SessionPayload
-using Nitro.Types: get_session, set_session!, update_session!, delete_session!, cleanup_expired_sessions!
+using Nitro.Types: get_session, set_session!, update_session!, rotate_session!, delete_session!, cleanup_expired_sessions!
 using Nitro.Types: missing_session_methods
 using Nitro.Errors: StoreInterfaceError
 
 struct FailingSessionStore <: AbstractSessionStore{String, Dict{String,Any}} end
 
-struct DeleteFailingSessionStore <: AbstractSessionStore{String, Dict{String,Any}} end
+struct RotateFailingSessionStore <: AbstractSessionStore{String, Dict{String,Any}} end
 
 mutable struct DelegatingSessionStore <: AbstractSessionStore{String, Dict{String,Any}}
     data::Dict{String, SessionPayload{Dict{String,Any}}}
@@ -21,7 +21,7 @@ end
 DelegatingSessionStore() = DelegatingSessionStore(Dict{String, SessionPayload{Dict{String,Any}}}(), 0)
 
 Base.get(::FailingSessionStore, ::String, default) = default
-Base.get(::DeleteFailingSessionStore, ::String, default) = default
+Base.get(::RotateFailingSessionStore, ::String, default) = default
 Base.get(store::DelegatingSessionStore, key::String, default) = get(store.data, key, default)
 
 function Nitro.Types.set_session!(::FailingSessionStore, ::String, ::Dict{String,Any}; ttl::Int=3600)
@@ -34,25 +34,39 @@ end
 
 Nitro.Types.cleanup_expired_sessions!(::FailingSessionStore) = nothing
 
-function Nitro.Types.set_session!(::DeleteFailingSessionStore, ::String, value::Dict{String,Any}; ttl::Int=3600)
+# The rotation's removal of the old id now happens INSIDE `rotate_session!` (#361), so a store that
+# cannot remove it fails there; this used to be a `DeleteFailingSessionStore`.
+function Nitro.Types.set_session!(::RotateFailingSessionStore, ::String, value::Dict{String,Any}; ttl::Int=3600)
     return value
 end
 
-function Nitro.Types.delete_session!(::DeleteFailingSessionStore, ::String)
-    throw(ErrorException("session delete failed"))
+function Nitro.Types.rotate_session!(::RotateFailingSessionStore, ::String, ::String, ::Dict{String,Any}; ttl::Int=3600)
+    throw(ErrorException("session rotate failed"))
 end
 
-Nitro.Types.cleanup_expired_sessions!(::DeleteFailingSessionStore) = nothing
+Nitro.Types.cleanup_expired_sessions!(::RotateFailingSessionStore) = nothing
 
 function Nitro.Types.set_session!(store::DelegatingSessionStore, session_id::String, value::Dict{String,Any}; ttl::Int=3600)
-    store.data[session_id] = SessionPayload(copy(value), Dates.now(Dates.UTC) + Dates.Second(ttl))
+    now = Dates.now(Dates.UTC)
+    store.data[session_id] = SessionPayload(copy(value), now + Dates.Second(ttl), now)
     return value
 end
 
 function Nitro.Types.update_session!(store::DelegatingSessionStore, session_id::String, value::Dict{String,Any}; ttl::Int=3600)
     payload = get(store.data, session_id, nothing)
     (payload === nothing || Nitro.Types.is_expired(payload)) && return false
-    store.data[session_id] = SessionPayload(copy(value), Dates.now(Dates.UTC) + Dates.Second(ttl))
+    store.data[session_id] = SessionPayload(copy(value), Dates.now(Dates.UTC) + Dates.Second(ttl),
+                                            payload.created)
+    return true
+end
+
+function Nitro.Types.rotate_session!(store::DelegatingSessionStore, old_id::String, new_id::String,
+                                     value::Dict{String,Any}; ttl::Int=3600)
+    payload = get(store.data, old_id, nothing)
+    (payload === nothing || Nitro.Types.is_expired(payload)) && return false
+    delete!(store.data, old_id)
+    store.data[new_id] = SessionPayload(copy(value), Dates.now(Dates.UTC) + Dates.Second(ttl),
+                                        payload.created)
     return true
 end
 
@@ -89,6 +103,7 @@ end
     @test :get in missing_names
     @test :set_session! in missing_names
     @test :update_session! in missing_names
+    @test :rotate_session! in missing_names
     @test :delete_session! in missing_names
     @test isempty(missing_session_methods(DelegatingSessionStore))
 
@@ -101,6 +116,7 @@ end
     for thunk in (() -> Base.get(BareSessionStore(), "sid", nothing),
                   () -> set_session!(BareSessionStore(), "sid", Dict{String,Any}(); ttl=60),
                   () -> update_session!(BareSessionStore(), "sid", Dict{String,Any}(); ttl=60),
+                  () -> rotate_session!(BareSessionStore(), "sid", "new", Dict{String,Any}(); ttl=60),
                   () -> delete_session!(BareSessionStore(), "sid"))
         err = try
             thunk()
@@ -133,7 +149,7 @@ end
     @test get_session(store, "abc") === nothing
 
     lock(store.lock) do
-        store.data["expired"] = SessionPayload(Dict{String,Any}("user_id" => 2), Dates.now(Dates.UTC) - Dates.Second(5))
+        store.data["expired"] = SessionPayload(Dict{String,Any}("user_id" => 2), Dates.now(Dates.UTC) - Dates.Second(5), Dates.now(Dates.UTC))
     end
     cleanup_expired_sessions!(store)
     @test !haskey(store.data, "expired")
@@ -170,8 +186,8 @@ end
 
     set_session!(store, "active", Dict{String,Any}("a" => 1); ttl=3600)
     lock(store.lock) do
-        store.data["expired1"] = SessionPayload(Dict{String,Any}("b" => 2), Dates.now(Dates.UTC) - Dates.Second(10))
-        store.data["expired2"] = SessionPayload(Dict{String,Any}("c" => 3), Dates.now(Dates.UTC) - Dates.Second(5))
+        store.data["expired1"] = SessionPayload(Dict{String,Any}("b" => 2), Dates.now(Dates.UTC) - Dates.Second(10), Dates.now(Dates.UTC))
+        store.data["expired2"] = SessionPayload(Dict{String,Any}("c" => 3), Dates.now(Dates.UTC) - Dates.Second(5), Dates.now(Dates.UTC))
     end
 
     cleanup_expired_sessions!(store)
@@ -204,7 +220,7 @@ end
     # an expired row is the prune's to remove, not the write path's to revive.
     stale_expiry = Dates.now(Dates.UTC) - Dates.Second(5)
     lock(store.lock) do
-        store.data["stale"] = SessionPayload(Dict{String,Any}("user_id" => 1), stale_expiry)
+        store.data["stale"] = SessionPayload(Dict{String,Any}("user_id" => 1), stale_expiry, stale_expiry - Dates.Hour(1))
     end
     @test update_session!(store, "stale", Dict{String,Any}("user_id" => 2); ttl=3600) === false
     @test store.data["stale"].expires == stale_expiry
@@ -256,7 +272,7 @@ end
 
     # The prune still works on the LRU.
     lock(store.lock) do
-        store.data["a"] = SessionPayload(session(1), Dates.now(Dates.UTC) - Dates.Second(1))
+        store.data["a"] = SessionPayload(session(1), Dates.now(Dates.UTC) - Dates.Second(1), Dates.now(Dates.UTC))
     end
     cleanup_expired_sessions!(store)
     @test sort(collect(keys(store.data))) == ["c", "d"]
@@ -416,13 +432,143 @@ end
     @test_throws "session write failed" middleware(handler)(HTTP.Request("GET", "/login"))
 end
 
-@testset "regenerate_session! fails closed on store delete errors" begin
-    store = DeleteFailingSessionStore()
+@testset "regenerate_session! fails closed on store rotate errors" begin
+    store = RotateFailingSessionStore()
     req = HTTP.Request("GET", "/")
     req.context[:session_id] = "old-session-id"
     req.context[:session] = Dict{String,Any}("user_id" => 42)
 
-    @test_throws "session delete failed" Nitro.regenerate_session!(req, store; ttl=3600)
+    # A store FAILURE propagates; it is never read as "the session was logged out".
+    @test_throws "session rotate failed" Nitro.regenerate_session!(req, store; ttl=3600)
+    @test req.context[:session_id] == "old-session-id"
+end
+
+# ── #361: rotation after a concurrent logout ─────────────────────────────────
+#
+# `regenerate_session!` used to `set_session!(new_id, data)` and then delete the old id without
+# checking it still existed, so a request that rotated after a concurrent logout copied the
+# logged-out identity into a fresh id. `rotate_session!` is the atomic move that refuses a gone id.
+@testset "MemoryStore rotate_session! moves a live session and never creates one (#361)" begin
+    store = MemoryStore()
+    set_session!(store, "old", Dict{String,Any}("user_id" => 42); ttl=3600)
+    handed = Dict{String,Any}("user_id" => 42, "cart" => [1])
+    @test rotate_session!(store, "old", "new", handed; ttl=60) === true
+    @test get_session(store, "old") === nothing
+    @test get_session(store, "new") == Dict{String,Any}("user_id" => 42, "cart" => [1])
+    # The fresh expiry is `ttl` from now, not the old row's.
+    @test store.data["new"].expires <= Dates.now(Dates.UTC) + Dates.Second(60)
+    # A deep copy is stored: the caller keeps mutating the dict it handed over.
+    push!(handed["cart"], 2)
+    @test get_session(store, "new")["cart"] == [1]
+
+    # Gone -- a concurrent logout deleted it: nothing is moved, and `new` is never created.
+    @test rotate_session!(store, "gone", "fresh", Dict{String,Any}("user_id" => 42); ttl=3600) === false
+    @test !haskey(store.data, "fresh")
+
+    # Expired counts as gone, and the store is left unchanged.
+    lock(store.lock) do
+        store.data["stale"] = SessionPayload(Dict{String,Any}("user_id" => 7),
+                                             Dates.now(Dates.UTC) - Dates.Second(1), Dates.now(Dates.UTC))
+    end
+    @test rotate_session!(store, "stale", "fresh", Dict{String,Any}("user_id" => 7); ttl=3600) === false
+    @test !haskey(store.data, "fresh")
+    @test haskey(store.data, "stale")
+
+    # At capacity a rotation evicts nobody else: the old id goes before the new one arrives.
+    full = MemoryStore(max_sessions = 2)
+    set_session!(full, "a", Dict{String,Any}("v" => 1); ttl=3600)
+    set_session!(full, "b", Dict{String,Any}("v" => 2); ttl=3600)
+    @test rotate_session!(full, "a", "c", Dict{String,Any}("v" => 1); ttl=3600) === true
+    @test get_session(full, "b") == Dict{String,Any}("v" => 2)
+    @test get_session(full, "c") == Dict{String,Any}("v" => 1)
+    @test length(full.data) == 2
+end
+
+@testset "regenerate_session! does not revive a logged-out session (#361)" begin
+    store = MemoryStore()
+    set_session!(store, "S", Dict{String,Any}("user_id" => 42); ttl=3600)
+
+    req = HTTP.Request("GET", "/")
+    req.context[:session_id] = "S"
+    req.context[:session] = Dict{String,Any}("user_id" => 42)
+
+    delete_session!(store, "S")   # the concurrent logout, landing before the rotation
+
+    @test Nitro.regenerate_session!(req, store; ttl=3600) === nothing
+    @test req.context[:session_id] == "S"   # no new id for the middleware to hand out
+    @test isempty(store.data)               # and `user_id = 42` was copied nowhere
+end
+
+# ── #362: a session's creation instant ───────────────────────────────────────
+#
+# `SessionMiddleware(absolute_max_age = …)` measures from `SessionPayload.created`, so a store
+# that moved it on every write would let a session live forever.
+@testset "MemoryStore stamps, keeps and carries a session's creation instant (#362)" begin
+    store = MemoryStore()
+
+    # Stamped on insert, from the same clock read as the expiry.
+    before = Dates.now(Dates.UTC)
+    set_session!(store, "s", Dict{String,Any}("v" => 1); ttl=60)
+    after = Dates.now(Dates.UTC)
+    stamped = store.data["s"]
+    @test before <= stamped.created <= after
+    @test stamped.expires == stamped.created + Dates.Second(60)
+
+    # Kept by an update: the expiry slides, `created` does not.
+    born = Dates.now(Dates.UTC) - Dates.Day(3)
+    lock(store.lock) do
+        store.data["old"] = SessionPayload(Dict{String,Any}("v" => 1),
+                                           Dates.now(Dates.UTC) + Dates.Hour(1), born)
+    end
+    @test update_session!(store, "old", Dict{String,Any}("v" => 2); ttl=3600)
+    @test store.data["old"].created == born
+    @test store.data["old"].expires > Dates.now(Dates.UTC) + Dates.Minute(59)
+
+    # Carried by a rotation: renaming a session does not start a new one.
+    @test rotate_session!(store, "old", "renamed", Dict{String,Any}("v" => 3); ttl=3600)
+    @test store.data["renamed"].created == born
+
+    # `set_session!` stores a FRESH session, so overwriting an id restarts its clock. The
+    # middleware only ever calls it for an id minted in the same request.
+    set_session!(store, "renamed", Dict{String,Any}("v" => 4); ttl=3600)
+    @test store.data["renamed"].created > born
+end
+
+@testset "regenerate_session! carries the clock, even for an empty session (#362)" begin
+    store = MemoryStore()
+    born = Dates.now(Dates.UTC) - Dates.Day(3)
+    for (id, data) in (("full", Dict{String,Any}("user_id" => 1)), ("empty", Dict{String,Any}()))
+        lock(store.lock) do
+            store.data[id] = SessionPayload(data, Dates.now(Dates.UTC) + Dates.Hour(1), born)
+        end
+    end
+    rotate(id, data) = (req = HTTP.Request("GET", "/"); req.context[:session_id] = id;
+                        req.context[:session] = data; Nitro.regenerate_session!(req, store; ttl=3600))
+
+    kept = rotate("full", Dict{String,Any}("user_id" => 1))
+    @test store.data[kept].created == born
+    # An empty one too. The logout recipe's fresh clock is `SessionMiddleware`'s to give, on the
+    # session's FINAL contents: deciding here, mid-handler, let a handler that emptied, rotated and
+    # then restored the identity hand a stolen session a fresh week.
+    also = rotate("empty", Dict{String,Any}())
+    @test store.data[also].created == born
+    @test !haskey(store.data, "empty")
+end
+
+@testset "regenerate_session! on a session minted in this request (#361)" begin
+    # `SessionMiddleware` marks a new visitor's id `:session_new`: it has never been stored, so
+    # there is nothing for `rotate_session!` to move -- and it must not read that as a logout,
+    # or a first-time visitor's login would never rotate.
+    store = MemoryStore()
+    req = HTTP.Request("GET", "/")
+    req.context[:session_id] = "minted"
+    req.context[:session_new] = true
+    req.context[:session] = Dict{String,Any}("user_id" => 5)
+
+    new_id = Nitro.regenerate_session!(req, store; ttl=3600)
+    @test new_id isa String && new_id != "minted"
+    @test req.context[:session_id] == new_id
+    @test isempty(store.data)   # the middleware inserts it on the way out
 end
 
 @testset "getuser accessor" begin

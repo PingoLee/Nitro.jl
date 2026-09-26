@@ -142,13 +142,14 @@ created on *and* the one every session query runs against, so the two can never 
 
 ### Custom Stores
 
-Four methods are **required** for your store type `S <: AbstractSessionStore{String, Dict{String,Any}}`:
+Five methods are **required** for your store type `S <: AbstractSessionStore{String, Dict{String,Any}}`:
 
 ```julia
-Base.get(store::S, session_id::String, default)           # → SessionPayload or default
-set_session!(store::S, session_id::String, data; ttl)     # → persist data with TTL (insert or overwrite)
-update_session!(store::S, session_id::String, data; ttl)  # → overwrite a LIVE session only; Bool
-delete_session!(store::S, session_id::String)             # → remove a session
+Base.get(store::S, session_id::String, default)                     # → SessionPayload or default
+set_session!(store::S, session_id::String, data; ttl)               # → persist data with TTL (insert or overwrite)
+update_session!(store::S, session_id::String, data; ttl)            # → overwrite a LIVE session only; Bool
+rotate_session!(store::S, old_id::String, new_id::String, data; ttl) # → move a LIVE session to a new id; Bool
+delete_session!(store::S, session_id::String)                       # → remove a session
 ```
 
 `Base.get` is easy to overlook and is not optional — both `get_session` and the session
@@ -161,7 +162,20 @@ concurrent logout just deleted. Make the check and the write one atomic step (an
 `UPDATE … WHERE`, or one lock hold). A store *failure* must throw, not return `false`: `false`
 means "logged out" and the middleware drops the write.
 
-A fifth is **optional**:
+`rotate_session!` is how `regenerate_session!` moves a session to a new ID, and the same rule
+applies: move it **only if** the old ID still exists and has not expired, as one atomic step, and
+return `false` otherwise. Otherwise a request that rotates after a concurrent logout copies the
+logged-out session into a fresh ID. In SQL without a key update, a guarded
+`DELETE … WHERE key = old AND expires > now` whose row count decides, followed by the `INSERT`,
+is enough.
+
+The `SessionPayload` that `Base.get` returns carries three things: `data`, `expires`, and
+`created`, the instant the session was first stored. `set_session!` sets `created`,
+`update_session!` keeps it, and `rotate_session!` carries it to the new ID.
+`SessionMiddleware(absolute_max_age = …)` measures a session's absolute lifetime from it, so a
+store that reset it on every write would let sessions live forever.
+
+A sixth is **optional**:
 
 ```julia
 cleanup_expired_sessions!(store::S)                    # → prune expired entries
@@ -367,9 +381,13 @@ function login_handler(req::HTTP.Request)
 end
 ```
 
-`regenerate_session!` copies the current session data to a new ID, deletes the old
+`regenerate_session!` moves the current session data to a new ID, removes the old
 session, and updates the request context so `SessionMiddleware` writes the new
 cookie automatically. In practice, use the same `ttl` you want for the rotated session.
+
+The move is atomic: it happens only if the old session still exists. If a concurrent
+request logged the session out while this one was running, `regenerate_session!` returns
+`nothing`, nothing is copied into a new ID, and no cookie is set.
 
 If you keep the default `auth_key="user_id"`, `SessionMiddleware` also performs this
 rotation automatically for existing sessions whose auth state changes during the request.
