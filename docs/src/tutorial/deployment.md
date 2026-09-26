@@ -139,7 +139,8 @@ that socket keeps its request slot as well.
 
 The budget bounds how many sockets are open, not what each one holds. An idle socket costs little,
 but a message a client sends is buffered whole, up to HTTP.jl's frame and fragment limits, which
-Nitro does not currently lower.
+Nitro does not currently lower — and messages your handler has not read yet queue without a limit,
+so a handler that falls behind a fast client lets that one socket grow.
 
 The cap bounds how many requests are held, not for how long. With `read_timeout` off (the default),
 a client that sends a head and then trickles its body holds a slot as long as it likes, and without

@@ -660,11 +660,14 @@ function _upgrade_websocket!(f::Function, req::HTTP.Request)
             # released from both caps would be bounded by neither.
             #
             # Unless the handshake carried a BODY. Nothing in a handshake reads one, but
-            # `_http_stream_request` has buffered it (up to `max_body_bytes`) into `req`, and `req`
-            # stays reachable from the handler for the socket's whole life. Handing the slot back
-            # then would let `max_upgraded_connections` idle sockets each pin a full body — body
-            # memory the request cap exists to bound. Such a socket keeps both slots.
-            adm === nothing || !(req.body isa HTTP.EmptyBody) || _release_request_slot!(adm)
+            # `_http_stream_request` has buffered it (up to `max_body_bytes`), and the request
+            # holding it stays reachable for the socket's whole life — from `stream_handler`, and
+            # from the handler. Handing the slot back then would let `max_upgraded_connections`
+            # idle sockets each pin a full body — body memory the request cap exists to bound. Such
+            # a socket keeps both slots. Both bodies are checked: the one buffered, and the one on
+            # the `req` a middleware may have rebuilt for the handler.
+            adm === nothing || adm.body_buffered || !(req.body isa HTTP.EmptyBody) ||
+                _release_request_slot!(adm)
             f(ws)
         end
     catch err
@@ -730,6 +733,11 @@ mutable struct _Admission
     const in_flight      :: Threads.Atomic{Int64}
     const upgraded       :: Threads.Atomic{Int64}
     const upgraded_limit :: Int64   # `max_upgraded_connections`; 0 = WebSockets keep their slot
+    # Whether `_http_stream_request` buffered a body for this request. Recorded where the body is
+    # read, not inferred from the `req` the handler later sees, because that one may be a copy a
+    # middleware rebuilt: `stream_handler` still holds the original — and its body — to the end.
+    # Written and read on the request's own task.
+    body_buffered        :: Bool
 end
 
 function _release_request_slot!(adm::_Admission)::Bool
@@ -805,7 +813,8 @@ end
 # it takes a slot of that second budget before the handshake, is refused 503 if none is free, and
 # hands its request slot back once the 101 is out, so idle sockets stop starving ordinary requests
 # (Kestrel's `MaxConcurrentUpgradedConnections` split). Without that budget it keeps its request
-# slot for its lifetime, as before: released from both, it would be bounded by neither.
+# slot for its lifetime, as before: released from both, it would be bounded by neither. A
+# handshake that carried a body keeps its request slot too — the body stays live with the socket.
 #
 # What the permit does NOT bound is time. With `read_timeout` unset (the default, #316), a client
 # that sends a head and then trickles its body holds a slot as long as it likes, and without
@@ -821,7 +830,7 @@ function stream_handler(middleware::Function; max_body_bytes::Int64 = DEFAULT_MA
         # The request slot is released exactly once — early for a streaming body, at a WebSocket's
         # switch to its own budget, or by the outer `finally` — through `_release_request_slot!`.
         # Allocated BEFORE the slot is taken, so nothing stands between the acquire and the `try`.
-        adm = capped ? _Admission(false, in_flight, upgraded, max_upgraded_connections) : nothing
+        adm = capped ? _Admission(false, in_flight, upgraded, max_upgraded_connections, false) : nothing
         if max_concurrent_requests > 0
             _try_acquire_slot!(in_flight, max_concurrent_requests) ||
                 return _reject_over_capacity!(stream, max_concurrent_requests)
@@ -838,7 +847,10 @@ function stream_handler(middleware::Function; max_body_bytes::Int64 = DEFAULT_MA
             req.context[:ip] = ip
             req.context[:stream] = stream
             # Only the WebSocket branch reads it, and only a WebSocket budget gives it work (#376).
-            max_upgraded_connections > 0 && (req.context[_ADMISSION_KEY] = adm)
+            if max_upgraded_connections > 0
+                adm.body_buffered = !(req.body isa HTTP.EmptyBody)
+                req.context[_ADMISSION_KEY] = adm
+            end
 
             result = middleware(req)
             produced = result isa HTTP.Response ? result : nothing

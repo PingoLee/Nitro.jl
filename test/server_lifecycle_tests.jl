@@ -987,6 +987,34 @@ end
     end
 end
 
+@testset "...even when a middleware hands the handler a rebuilt, bodyless request" begin
+    # `stream_handler` still holds the request it buffered — and its body — for the socket's life,
+    # so the decision cannot rest on the `req` the handler receives. Delta-review finding on #376.
+    ws_entered, entered, release = Threads.Atomic{Int}(0), Threads.Atomic{Bool}(false), Base.Event()
+    ctx = _ws_capacity_context(ws_entered, entered, release)
+    port = get_free_port()
+    rebuild = handle -> req -> handle(HTTP.Request(req.method, req.target; headers = req.headers,
+        body = HTTP.EmptyBody(), context = HTTP.get_request_context(req)))
+    _serve(ctx, port; max_concurrent_requests = 1, max_upgraded_connections = 2,
+           middleware = [rebuild])
+    sock = nothing
+    try
+        sock = Sockets.connect(Sockets.localhost, port)
+        head = replace(_ws_head("/ws/hold"), r"\r\n\r\n$" => "\r\nContent-Length: 5\r\n\r\n")
+        write(sock, head * "hello")
+        flush(sock)
+        reader = @async try readline(sock) catch; "" end
+        timedwait(() -> istaskdone(reader), 15.0; pollint = 0.02)
+        @test istaskdone(reader) && _upgraded(fetch(reader))
+        @test _eventually(() -> ws_entered[] >= 1)
+        @test startswith(_get(port, "/ok"), "HTTP/1.1 503")
+    finally
+        isnothing(sock) || close(sock)
+        notify(release)
+        Nitro.Core.terminate(ctx)
+    end
+end
+
 @testset "over max_upgraded_connections: 503 before the handshake, and the slot comes back once" begin
     ws_entered, entered, release = Threads.Atomic{Int}(0), Threads.Atomic{Bool}(false), Base.Event()
     ctx = _ws_capacity_context(ws_entered, entered, release)
@@ -1050,12 +1078,12 @@ end
 @testset "_release_request_slot! releases exactly once" begin
     # The deterministic half of the next testset: whichever release site runs second is a no-op.
     in_flight = Threads.Atomic{Int64}(1)
-    adm = Nitro.Core._Admission(true, in_flight, Threads.Atomic{Int64}(0), 1)
+    adm = Nitro.Core._Admission(true, in_flight, Threads.Atomic{Int64}(0), 1, false)
     @test Nitro.Core._release_request_slot!(adm)
     @test !Nitro.Core._release_request_slot!(adm)
     @test in_flight[] == 0
     # And a request that never held a slot releases nothing.
-    idle = Nitro.Core._Admission(false, in_flight, Threads.Atomic{Int64}(0), 1)
+    idle = Nitro.Core._Admission(false, in_flight, Threads.Atomic{Int64}(0), 1, false)
     @test !Nitro.Core._release_request_slot!(idle)
     @test in_flight[] == 0
 end
