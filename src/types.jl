@@ -222,7 +222,7 @@ store `data` under `new_id` with a fresh expiry `ttl` seconds from now, and remo
 Returns `true` when it moved the session, and `false` when there was nothing to move. On `false`
 the store is left unchanged; it never creates `new_id`.
 
-This is what [`regenerate_session!`](@ref) uses. It used to be `set_session!(new_id, data)` then
+This is what [`regenerate_session!`](@ref Nitro.Core.Cookies.regenerate_session!) uses. It used to be `set_session!(new_id, data)` then
 `delete_session!(old_id)`, which never checked that `old_id` was still there. A request that had
 loaded a session, and rotated it after a concurrent logout deleted it, copied the logged-out
 identity into a fresh id, and `SessionMiddleware` handed the client that new cookie (#361). That is
