@@ -338,6 +338,65 @@ end
     @test !occursin("1.10.0", output)
 end
 
+# #299: the banner reports the GC target and the thread pools, and never guesses. The target is
+# injected so each shape is deterministic; the live read has its own smoke test below.
+@testset "serverwelcome banner reports the GC target and thread pools" begin
+    banner(parallel; gc_target) = mktemp() do path, io
+        redirect_stdout(io) do
+            withenv("NITRO_ENV" => "dev", "GENIE_ENV" => nothing) do
+                serverwelcome("http://127.0.0.1:8080", nothing, parallel; gc_target)
+            end
+        end
+        flush(io)
+        read(path, String)
+    end
+
+    # A hint of 1G, as Julia 1.12 reports it (the hint minus its 250 MiB reserve).
+    with_target = banner(true; gc_target = UInt64(811597824))
+    @test occursin("GC target 774.0 MiB", with_target)
+    @test occursin("parallel mode: $(Threads.nthreads(:default)) thread", with_target)
+    if Threads.nthreads(:interactive) > 0
+        @test occursin("+ $(Threads.nthreads(:interactive)) interactive", with_target)
+    else
+        @test !occursin("interactive", with_target)
+    end
+    @test occursin("GC target 2.8 GiB", banner(true; gc_target = UInt64(3) * 2^30 - UInt64(250) * 2^20))
+
+    # Julia's "unset" value is reported as none, never as a 2 PiB limit.
+    none = banner(true; gc_target = UInt64(2)^51)
+    @test occursin("GC target: none", none)
+    @test !occursin("PiB", none)
+
+    # The runtime would not say: no field at all, rather than a guess.
+    unknown = banner(true; gc_target = nothing)
+    @test !occursin("GC target", unknown)
+    @test occursin("parallel mode:", unknown)
+
+    # Outside parallel mode the GC field still prints, on its own.
+    serial = banner(false; gc_target = UInt64(811597824))
+    @test occursin(" (GC target 774.0 MiB)", serial)
+    @test !occursin("parallel mode", serial)
+    @test !occursin("(", banner(false; gc_target = nothing))
+end
+
+@testset "a prod process with no GC target warns once at startup, and nothing else does (#299)" begin
+    warn_fn = Nitro.Core._warn_if_no_gc_target
+    unset = UInt64(2)^51
+    @test_logs (:warn, r"no GC target") warn_fn("prod", unset)
+    # Every other combination is silent: another environment, a target that is set, or a
+    # runtime that would not say.
+    @test_logs min_level = Base.CoreLogging.Debug warn_fn("dev", unset)
+    @test_logs min_level = Base.CoreLogging.Debug warn_fn("test", unset)
+    @test_logs min_level = Base.CoreLogging.Debug warn_fn("prod", UInt64(811597824))
+    @test_logs min_level = Base.CoreLogging.Debug warn_fn("prod", nothing)
+end
+
+@testset "the GC target is read from the running process (#299)" begin
+    # The live read works on this runtime. Whether it reflects `--heap-size-hint` needs a child
+    # process with one, which is the separate `:slow` item at the end of this file.
+    @test Nitro.Core._gc_target_bytes() isa UInt64
+end
+
 @testset "mount_segments canonicalization" begin
     # The SINGLE normalization point for `mountdir` (#93). staticfiles/spafiles/dynamicfiles no
     # longer strip anything themselves, so `mountfolder` and `spafiles`' history-mode fallback both
@@ -592,4 +651,33 @@ end
     end
 end
 
+end
+
+# #299: the banner's GC target must reflect `--heap-size-hint`, not a constant, and only a
+# process started with one can show that. Its own `:slow` item because it starts a Julia child
+# that loads Nitro, which `--skip-tags slow` exists to avoid.
+@testitem "Banner GC target reflects --heap-size-hint (#299)" tags=[:core, :slow] setup=[NitroCommon] begin
+    using Test
+    using Nitro
+
+    # `--code-coverage=none` and captured streams: the child-process pattern of
+    # test/bodyparser_tests.jl `run_child`, for the reasons written there (#84, #244, #273).
+    code = "using Nitro; print(Nitro.Core._gc_target_bytes())"
+    cmd = `$(Base.julia_cmd()) --code-coverage=none --heap-size-hint=1G --startup-file=no
+           --project=$(Base.active_project()) -e $code`
+    out, err = IOBuffer(), IOBuffer()
+    p = run(pipeline(ignorestatus(cmd); stdout = out, stderr = err))
+    stdout_text, stderr_text = String(take!(out)), String(take!(err))
+    # Asserted with `===` so a failure prints the child's own diagnosis ("Evaluated: …").
+    failure = (p.exitcode, p.termsignal) == (0, 0) ? nothing :
+        "child exit $(p.exitcode), signal $(p.termsignal); stderr: $(stderr_text)"
+    @test failure === nothing
+
+    hinted = tryparse(UInt64, strip(stdout_text))
+    @test hinted isa UInt64
+    if hinted isa UInt64
+        # A 1G hint, less Julia's 250 MiB reserve: a real target, below 1 GiB.
+        @test Nitro.Core._has_gc_target(hinted)
+        @test UInt64(512) * 2^20 < hinted <= UInt64(2)^30
+    end
 end

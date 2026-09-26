@@ -88,10 +88,55 @@ is explicit introspection, not accidental disclosure.)
   `Dict` (#327). `0` means unlimited. Django's `DATA_UPLOAD_MAX_NUMBER_FIELDS`, same default.
   It also applies to `internalrequest` against the app, and to a parser called outside any
   request (`DEFAULT_MAX_FIELDS`).
+- `max_concurrent_requests=nothing`: ceiling on how many requests this server holds at once
+  (#298). `nothing` means no limit. When it is set, a request arriving with that many already in
+  flight is answered **503** with `Retry-After: 1` **before its body is read**; on HTTP/1.1 its
+  connection is then closed, on HTTP/2 only its stream ends. Nothing else bounds this:
+  `--threads` limits how many requests *compute* at once, not how many are open, because a
+  request waiting on a slow body yields its thread. So this is the only setting that bounds the
+  request-body memory held at once — at most `max_concurrent_requests × max_body_bytes`, which no
+  GC target can reclaim because it is live. Each HTTP/2 stream counts as one request. A request
+  holds its slot while its body is read, its handler runs, and its response is written to the
+  socket — including a streamed `Res.file`, which HTTP.jl buffers whole on HTTP/1.1 because it
+  has a length. A response with no length (`Res.sse`) gives the slot back once it starts
+  streaming. A WebSocket or a `STREAM` handler holds its slot for its whole lifetime.
+
+  The slot bounds how many, not for how long. With `read_timeout` unset, a client that sends a
+  head and then trickles its body holds a slot as long as it likes, and without `write_timeout`
+  so does one that stops reading its response — so a handful of slow clients can hold every
+  slot. Behind a proxy that buffers requests and responses (nginx's default), neither happens;
+  **exposed directly, set both timeouts alongside the cap.** Throws with a custom `handler`,
+  like `max_body_bytes`. The refusal happens before any middleware runs, so it produces no
+  access-log line (one warning is logged the first time).
 - `reuseaddr`: forwarded to `HTTP.listen!`. Defaults to `true` on Linux/macOS, where it
   allows rebinding a port still in `TIME_WAIT`, and to **`false` on Windows**, where
   `SO_REUSEADDR` instead lets a second process bind a port another is actively listening
   on — turning a port conflict into two servers silently splitting the traffic.
+- `read_header_timeout=120`: seconds a connection has to deliver a complete request head. Past
+  it the server answers **408** and closes the connection, which bounds a client that trickles
+  header bytes (Slowloris) or goes silent. It bounds the **head only**: once the head is parsed
+  the deadline is cleared, so a slow upload is not cut by it (Go's `ReadHeaderTimeout`
+  semantics). On HTTP/1.1 it is also the **keep-alive idle limit** — HTTP.jl re-arms it before
+  every request on a connection, including the wait between two requests — which is why it
+  defaults to 120 rather than a few seconds: behind nginx or an AWS ALB, whose idle upstream
+  connections time out at 60 seconds, the proxy must be the side that closes first. See
+  `DEFAULT_READ_HEADER_TIMEOUT_SECONDS`.
+- `idle_timeout=120`: seconds an HTTP/2 connection with no open stream is kept. On HTTP/1.1 the
+  header timeout above takes its place.
+- `read_timeout`, `write_timeout`: **off** by default, forwarded to `HTTP.listen!`.
+  `read_timeout` is one deadline for the body *and* every read the handler makes, counted from
+  the end of the head, and answers **408** when it fires; on HTTP/2 it is instead the longest
+  gap between frames from the client, which a quiet SSE stream can exceed. `write_timeout`
+  limits each write to the socket. For a response with a length, HTTP.jl sends the whole body
+  as one write on HTTP/1.1, so there it bounds the entire transfer — size it for the largest
+  download to the slowest client. For `Res.sse` it bounds each event, so a long stream fails
+  only on an event that stalls.
+
+  Every timeout is in seconds (any real `>= 0`); `0` or `nothing` disables it. Each also takes a
+  `_ns` spelling in integer nanoseconds (`read_header_timeout_ns = …`), and passing one suppresses
+  the seconds default. An invalid value is an `ArgumentError` at this call, before anything
+  starts. These are a floor, not a replacement for your reverse proxy's own timeouts — see
+  *Behind a Reverse Proxy* in the docs.
 
 Calling `serve` on an app that is **already serving** throws an `ArgumentError`: the second
 call would overwrite the running server's handle and strand its port. Terminate that app

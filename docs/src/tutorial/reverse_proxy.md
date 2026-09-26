@@ -11,7 +11,7 @@ box, and how to recover the real client IP afterwards without letting anyone for
 |---|---|
 | TLS termination and certificates | **Proxy** — Nitro speaks plain HTTP and has no TLS story |
 | Static assets, SPA history fallback | **Proxy** in production (see below) |
-| Request body caps, connection timeouts, compression | **Proxy first, app second** — Nitro caps request bodies at 64 MiB by default (`serve(max_body_bytes = …)`), but the proxy rejects an oversized upload before it reaches Julia at all |
+| Request body caps, connection timeouts, compression | **Proxy first, app second** — Nitro caps request bodies at 64 MiB by default (`serve(max_body_bytes = …)`) and closes a connection that has not sent a complete request head within 120 seconds (`serve(read_header_timeout = …)`), but the proxy rejects an oversized or slow upload before it reaches Julia at all |
 | Coarse per-IP rate limiting | **Proxy first, app second** — `RateLimiter` still matters in development and as a second layer |
 | Per-user rate limiting, quotas | **App** — needs identity |
 | **Authentication and authorization** | **App, always** |
@@ -57,12 +57,28 @@ that serves files.
 
 ## Why this matters more than usual for Nitro
 
-Nitro runs every request on its own thread — there is no event loop. A slow client therefore occupies
-a **thread**, not a cheap continuation. nginx buffers request and response bodies by default, so
-Nitro only ever sees complete requests; the proxy absorbs the slow-client cost that would otherwise
-sit in your thread pool. Treat request timeouts and body caps at the proxy as capacity protection,
-not just hygiene — Nitro's own `max_body_bytes` bounds the memory a single request can claim, but
-it cannot bound how long a slow client occupies the thread sending it.
+Nitro runs every request on its own task — there is no event loop, and no fixed pool of workers
+to exhaust. A slow client does not hold a *thread*: its task yields while it waits for bytes, and
+the thread moves on. What it does hold, for as long as it is slow, is a **file descriptor**, a
+task, and whatever part of its request body has arrived. nginx buffers request and response
+bodies by default, so Nitro only ever sees complete requests arriving at LAN speed; the proxy
+absorbs that cost. Treat request timeouts and body caps at the proxy as capacity protection, not
+just hygiene.
+
+Nitro's own limits are the floor underneath, for a process the proxy is not in front of:
+
+| Limit | Default | What it bounds |
+|---|---|---|
+| `read_header_timeout` | 120 s | How long a connection may take to send a complete request head, and on HTTP/1.1 how long a keep-alive connection may sit idle. A Slowloris client is answered `408` and dropped |
+| `max_body_bytes` | 64 MiB | How much one request body may hold |
+| `max_concurrent_requests` | off | How many requests are held at once, and so, with `max_body_bytes`, how much body memory. Over it, a request is answered `503` before its body is read. A WebSocket holds one of these slots for as long as it is open; see [Bounding requests in flight](@ref) |
+| `read_timeout` | off | How long the body may take once the head has arrived. Off because a legitimate large upload over a slow link can take minutes; turn it on when the proxy is not buffering bodies for you |
+
+`read_header_timeout` deliberately does not cover the body, so a slow upload is only cut by
+`read_timeout`. It is 120 seconds, not a few, because it doubles as the keep-alive idle limit: an
+nginx `upstream` pool and an AWS ALB both close idle connections at 60 seconds, and a backend that
+closes them first races the proxy reusing them, which surfaces as sporadic `502`s. Keep it above
+your proxy's idle timeout if you lower it.
 
 The other half of capacity is the process itself: how many threads it starts with, and how much
 memory its garbage collector aims for. Both are covered in

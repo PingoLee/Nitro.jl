@@ -2,7 +2,68 @@
 # `serve`/`terminate`/`startserver`, the startup banner, and the Revise wiring.
 # Included into `module Core` by src/core.jl — not a submodule; see the hub for why.
 
-function serverwelcome(external_url::String, prefix::Nullable{String}, parallel::Bool)
+# ── What the process was started with (#299) ──────────────────────────────────────────────────────
+#
+# REPORT, NEVER ENFORCE. The two most common ways to misconfigure a production process — one
+# thread, and no GC target — cannot be seen from inside it without these lines. Nothing in Nitro
+# may depend on either value: it never refuses to start, never sets a hint itself, never sizes
+# anything from what it reads. That is the same line `current_env()` holds (#55), and it is a
+# deliberate, narrow exception to #241's "nothing in `src/` should read the heap hint".
+
+# Julia's own "no target" is 2 PiB (2^51) on 1.12 and 1.13. Compared against a threshold rather
+# than that exact value, which is a runtime constant that could move; no real host has 1 PiB.
+const _NO_GC_TARGET_BYTES = UInt64(1) << 50
+
+# The GC's effective target, in bytes: `--heap-size-hint`, else `JULIA_HEAP_SIZE_HINT`, else the
+# cgroup memory limit — the runtime has already applied that precedence, and subtracted its own
+# 250 MiB reserve. `nothing` when the runtime does not expose it: `jl_gc_get_max_memory` is exported
+# (`julia/gc-interface.h`) but not documented API, so a GC build without it must cost only the
+# banner field, never the server start.
+function _gc_target_bytes()::Nullable{UInt64}
+    try
+        return ccall(:jl_gc_get_max_memory, UInt64, ())
+    catch err
+        # Narrow on purpose (group 1 in `src/errors.jl`): a `ccall` recurses into nothing.
+        err isa InterruptException && rethrow()
+        return nothing
+    end
+end
+
+_has_gc_target(bytes::UInt64) = bytes < _NO_GC_TARGET_BYTES
+
+function _format_gc_bytes(bytes::UInt64)::String
+    gib = bytes / 2.0^30
+    return gib >= 1 ? "$(round(gib; digits = 1)) GiB" : "$(round(bytes / 2.0^20; digits = 1)) MiB"
+end
+
+# `Threads.nthreads()` is the default pool only. Julia 1.12 also starts one interactive thread by
+# default, and HTTP.jl runs its accept loop and every connection task there, so it is worth
+# showing — but as a separate count, because handlers never run on it.
+function _thread_summary()::String
+    ndefault = Threads.nthreads(:default)
+    ninteractive = Threads.nthreads(:interactive)
+    summary = "$ndefault thread$(ndefault == 1 ? "" : "s")"
+    return ninteractive > 0 ? "$summary + $ninteractive interactive" : summary
+end
+
+# The one environment-dependent output at startup, and it only logs. A prod process with no GC
+# target is the documented cause of an OOM kill that leaves no Julia backtrace (Running in
+# Production), and the banner alone is easy to miss — it goes to stdout, and `show_banner=false`
+# suppresses it — so prod also gets a line at warning level, where log alerting sees it.
+# Deliberately NOT for a single thread: that is a valid deployment (#149). And not when the value
+# is unknown: guessing would warn about something that may well be set.
+function _warn_if_no_gc_target(env::AbstractString, gc_target::Nullable{UInt64})::Nothing
+    env == "prod" || return nothing
+    (gc_target === nothing || _has_gc_target(gc_target)) && return nothing
+    @warn "Nitro is running in prod with no GC target: no `--heap-size-hint`, no " *
+          "`JULIA_HEAP_SIZE_HINT` and no cgroup memory limit. The heap can then grow until the " *
+          "kernel OOM-kills the process, which leaves no Julia backtrace. Set one of the three; " *
+          "see \"Running in Production\" in the Nitro docs."
+    return nothing
+end
+
+function serverwelcome(external_url::String, prefix::Nullable{String}, parallel::Bool;
+                       gc_target::Nullable{UInt64} = _gc_target_bytes())
     server_url = Util.join_url_path(external_url, prefix)
     curr_time = Dates.format(now(), "yyyy-mm-dd HH:MM:SS")
     # Renamed: `current_env` is now a function in this module (#55).
@@ -17,9 +78,26 @@ function serverwelcome(external_url::String, prefix::Nullable{String}, parallel:
     # `1.10.0` literal this replaces, just with a longer fuse.
     version = something(Base.pkgversion(@__MODULE__), "unknown")
     printstyled(" Nitro $version ", color=:cyan, reverse=true, bold=true)
+    # `(parallel mode: 8 threads + 1 interactive, GC target 2.8 GiB)`. Each field is printed only
+    # when there is something true to say: no thread count outside parallel mode, and no GC field
+    # at all when the runtime would not say (`nothing`) rather than a guess.
+    opened = false
     if parallel
-        printstyled(" (parallel mode: $(Threads.nthreads()) threads)", color=:light_black)
+        printstyled(" (parallel mode: $(_thread_summary())", color=:light_black)
+        opened = true
     end
+    if gc_target !== nothing
+        printstyled(opened ? ", " : " (", color=:light_black)
+        if _has_gc_target(gc_target)
+            printstyled("GC target $(_format_gc_bytes(gc_target))", color=:light_black)
+        else
+            # Not "2.0 PiB": that number is Julia's placeholder for "unset", and printing it would
+            # read as a real, enormous limit.
+            printstyled("GC target: none", color=:yellow)
+        end
+        opened = true
+    end
+    opened && printstyled(")", color=:light_black)
     println("\n$curr_time")
     # ALWAYS printed, including the defaulted case. A prod box that forgot `NITRO_ENV` must
     # SEE that it is running as `dev` -- hiding the line when nobody set one reproduces exactly
@@ -94,6 +172,7 @@ function serve(ctx::App;
     shutdown_timeout=SHUTDOWN_TIMEOUT_SECONDS,
     max_body_bytes=missing,
     max_fields=DEFAULT_MAX_FIELDS,
+    max_concurrent_requests=nothing,
     kwargs...)::Union{Server, Nothing}
 
     # FIRST, before any validation or context mutation, so a rejected call leaves the context
@@ -160,6 +239,27 @@ function serve(ctx::App;
     # the App has already been mutated.
     (max_fields isa Integer && !(max_fields isa Bool) && 0 <= max_fields <= typemax(Int64)) ||
         throw(ArgumentError("`max_fields` must be an integer >= 0 (0 means unlimited), got $(repr(max_fields))"))
+
+    # Same reasoning again (#298). Opt-in: `nothing` is unlimited, like Go's `net/http` and like
+    # every Nitro before it. A count must be a real integer >= 1 — `0` would refuse every request,
+    # which is never what a caller meant, and `true` would silently mean 1.
+    if max_concurrent_requests !== nothing
+        (max_concurrent_requests isa Integer && !(max_concurrent_requests isa Bool) &&
+         1 <= max_concurrent_requests <= typemax(Int64)) ||
+            throw(ArgumentError("`max_concurrent_requests` must be an integer >= 1, or `nothing` " *
+                                "for no limit, got $(repr(max_concurrent_requests))"))
+        # Mirrors `max_body_bytes`: the permit lives in Nitro's own `stream_handler`, around the
+        # body read and the response write, so a custom `handler` cannot be capped by it.
+        handler === stream_handler || throw(ArgumentError(
+            "`max_concurrent_requests` cannot be applied to a custom `handler`: the cap is " *
+            "enforced by Nitro's own `stream_handler`. Drop `handler`, or bound concurrency " *
+            "inside it."))
+    end
+    request_limit = max_concurrent_requests === nothing ? zero(Int64) : Int64(max_concurrent_requests)
+
+    # Same reasoning as the checks above (#316): HTTP.jl only sees these at `listen!`, which runs
+    # after the App has been mutated, so a typo'd timeout would otherwise fail half-way through.
+    _validate_server_timeouts(kwargs)
 
     # Before any mutation, like the checks above (#315). A malformed prefix is refused here
     # rather than served as a listener that answers 404 to every request.
@@ -233,7 +333,8 @@ function serve(ctx::App;
 
     configured_middelware = setupmiddleware(ctx; middleware, serialize, catch_errors, show_errors, access_log, access_log_query)
     handle_stream = handler === stream_handler ?
-        stream_handler(configured_middelware; max_body_bytes = body_limit) :
+        stream_handler(configured_middelware; max_body_bytes = body_limit,
+                       max_concurrent_requests = request_limit) :
         handler(configured_middelware)
 
     # No warning for running on one thread (#149): single-threaded is a valid deployment, not a
@@ -247,12 +348,21 @@ function serve(ctx::App;
         handle_stream = parallel_stream_handler(handle_stream)
     end
 
+    # Outside the parallel spawn, so the header deadline is cleared on the connection task the
+    # moment the head is parsed (#316; see `header_deadline_handler`, src/core/transport.jl).
+    handle_stream = header_deadline_handler(handle_stream)
+
     # Wrap last, so the handler HTTP stores gets our secret-safe `show` (see NitroStreamHandler).
     handle_stream = NitroStreamHandler(handle_stream)
 
     if revise == :eager
         ctx.service.eager_revise[] = start_revise_service()
     end
+
+    # After every check Nitro itself makes, so a call Nitro refuses never warns (#299). HTTP.jl's
+    # `listen!` can still refuse below (an address in use, say), after the warning has been
+    # logged; that costs one accurate line about the process, which is harmless.
+    _warn_if_no_gc_target(current_env(), _gc_target_bytes())
 
     try
         return startserver(ctx; host, port, show_banner, parallel, async, kwargs, start=(kwargs) ->
@@ -500,5 +610,65 @@ function preprocesskwargs(kwargs)
     # a silent split-brain where some requests are answered by the corpse, out of *its* router.
     # `get!` writes only when the key is absent, so an explicit `serve(reuseaddr = …)` wins.
     Base.get!(kwargs_dict, :reuseaddr, !Sys.iswindows())
+    # HTTP.jl disables every server timeout by default, which leaves a half-sent head or a silent
+    # connection holding its socket forever (#316). Nitro defaults the two that cannot cut a
+    # legitimate stream; `read_timeout` and `write_timeout` stay opt-in. The values, and why they
+    # are 120 seconds, are on the constants (src/constants.jl).
+    #
+    # Written only when NEITHER spelling is present: HTTP.jl takes each timeout in seconds (`X`)
+    # or nanoseconds (`X_ns`) and throws when it gets both, so defaulting `X` next to a caller's
+    # `X_ns` would turn a valid call into an error. An explicit `0` or `nothing` is a value, so it
+    # wins — both mean "disabled" to HTTP.jl.
+    for (name, default) in ((:read_header_timeout, DEFAULT_READ_HEADER_TIMEOUT_SECONDS),
+                            (:idle_timeout, DEFAULT_IDLE_TIMEOUT_SECONDS))
+        haskey(kwargs_dict, name) || haskey(kwargs_dict, Symbol(name, :_ns)) ||
+            (kwargs_dict[name] = default)
+    end
     return kwargs_dict
+end
+
+# The server timeouts HTTP.jl's `listen!` accepts, in their seconds spelling (#316). `readtimeout`
+# is HTTP.jl's deprecated alias for `read_timeout` and still accepted there.
+const _SERVER_TIMEOUT_KWARGS = (:read_header_timeout, :read_timeout, :idle_timeout, :write_timeout,
+                                :readtimeout)
+const _SERVER_TIMEOUT_NS_KWARGS = (:read_header_timeout_ns, :read_timeout_ns, :idle_timeout_ns,
+                                   :write_timeout_ns)
+
+# Refuse a timeout HTTP.jl would reject, at the `serve` call that contains it. HTTP.jl makes the
+# same checks (`_timeout_ns_from_seconds`, `_resolve_server_timeouts`), but only inside `listen!` —
+# after `serve` has already mutated the App. Each rule below mirrors one of HTTP.jl's, so the two
+# agree on exactly which calls are valid. Seconds may be any finite real `>= 0` that fits in
+# `Int64` nanoseconds, or `nothing`; `Inf` is refused rather than read as "never", because
+# `0`/`nothing` is how HTTP.jl spells never.
+function _validate_server_timeouts(kwargs)
+    for (name, value) in pairs(kwargs)
+        if name in _SERVER_TIMEOUT_KWARGS
+            # Compared in Float64, as HTTP.jl converts it: `Float64(value) * 1e9` must stay below
+            # 2^63 to round into `Int64` nanoseconds. Rounding first would throw `InexactError`
+            # rather than this `ArgumentError` for a value near 1e30, or a `BigFloat` past Float64.
+            value === nothing ||
+                (value isa Real && !(value isa Bool) && isfinite(Float64(value)) && value >= 0 &&
+                 Float64(value) * 1.0e9 < 2.0^63) ||
+                throw(ArgumentError("`$name` must be a finite number of seconds >= 0, or " *
+                    "`nothing` (`0` and `nothing` both disable it), got $(repr(value))"))
+        elseif name in _SERVER_TIMEOUT_NS_KWARGS
+            (value isa Integer && !(value isa Bool) && 0 <= value <= typemax(Int64)) ||
+                throw(ArgumentError("`$name` must be an integer number of nanoseconds >= 0 " *
+                    "(`0` disables it), got $(repr(value))"))
+        end
+    end
+    # One timeout, two spellings: HTTP.jl throws when both carry a value. "Carries a value" is
+    # HTTP.jl's own test — a seconds form that is not `nothing`, an `_ns` form that is not `0`.
+    given(name) = get(kwargs, name, nothing) !== nothing
+    given_ns(name) = get(kwargs, name, 0) != 0
+    for name in (:read_header_timeout, :read_timeout, :idle_timeout, :write_timeout)
+        ns_name = Symbol(name, :_ns)
+        given(name) && given_ns(ns_name) &&
+            throw(ArgumentError("`$name` cannot be combined with `$ns_name`; pass one of them"))
+    end
+    if given(:readtimeout) && (given(:read_timeout) || given_ns(:read_timeout_ns))
+        throw(ArgumentError("`readtimeout` (deprecated) cannot be combined with `read_timeout` " *
+                            "or `read_timeout_ns`; pass `read_timeout`"))
+    end
+    return nothing
 end

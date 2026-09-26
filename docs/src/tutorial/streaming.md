@@ -125,9 +125,10 @@ your producer raises for its own reasons is still reported at error level.
 
 ### Keeping the connection alive
 
-Nitro sets none of HTTP.jl's read, write or idle timeouts, so nothing in the server closes a quiet
-stream. Proxies are less patient. If your stream can be silent for longer than the proxy's idle
-timeout, send a heartbeat:
+Nitro's default timeouts never close a quiet stream. `read_header_timeout` covers only the request
+head, and is cleared once the head has arrived; `read_timeout` and `write_timeout` are off unless
+you set them (see [`serve`](@ref)). Proxies are less patient. If your stream can be silent for
+longer than the proxy's idle timeout, send a heartbeat:
 
 ```julia
 write(events, SSEEvent(""; event = "ping"))

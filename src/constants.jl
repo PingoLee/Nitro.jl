@@ -9,6 +9,7 @@ export PACKAGE_DIR,
     WEBSOCKET, STREAM,
     SPECIAL_METHODS, METHOD_ALIASES, TYPE_ALIASES,
     SHUTDOWN_TIMEOUT_SECONDS,
+    DEFAULT_READ_HEADER_TIMEOUT_SECONDS, DEFAULT_IDLE_TIMEOUT_SECONDS,
     DEFAULT_MAX_BODY_BYTES, DEFAULT_MAX_FIELDS
 
 # Generate a reliable path to our package directory
@@ -59,6 +60,44 @@ the box is the worker drain (`Nitro.Workers.WORKER_DRAIN_TIMEOUT_SECONDS`, 5 sec
 sized at half this figure precisely because the two add up.
 """
 const SHUTDOWN_TIMEOUT_SECONDS :: Float64 = 10.0
+
+"""
+Default for `serve(read_header_timeout = …)`: seconds a connection has to deliver a complete
+request head before the server answers **408** and closes it (#316).
+
+HTTP.jl disables every server timeout by default, so without this a client that opens a connection
+and trickles header bytes (Slowloris), or simply goes silent, holds its socket and its task
+forever. Go's `net/http` guidance is the same: always set `ReadHeaderTimeout`.
+
+**Why 120 seconds rather than Go's usual 5–10.** On HTTP/1.1, HTTP.jl re-arms this deadline
+before *every* request head, including the wait between two requests on a keep-alive
+connection, so it is also the keep-alive idle limit (`idle_timeout` never gets a chance to apply
+there). A backend that drops idle connections before its proxy does races the proxy's reuse of
+them: nginx upstream pools and AWS ALB both idle out at 60 seconds, and a backend below that
+produces sporadic `502`s. 120 seconds keeps the proxy the side that closes first, and still bounds
+a stuck or hostile connection instead of keeping it forever. That coupling is an HTTP.jl behavior,
+reported upstream as
+[JuliaWeb/HTTP.jl#1381](https://github.com/JuliaWeb/HTTP.jl/issues/1381); once a release keeps
+the idle and header deadlines apart the way Go does, this default can drop to Go's usual range.
+
+It bounds the head only. Once the head is parsed Nitro clears the deadline, so a slow upload is
+not cut by it — the Go semantics. Set `read_timeout` to bound the body too.
+"""
+const DEFAULT_READ_HEADER_TIMEOUT_SECONDS :: Float64 = 120.0
+
+"""
+Default for `serve(idle_timeout = …)`: seconds an HTTP/2 connection with no open stream is kept
+before it is closed (#316).
+
+Kept equal to [`DEFAULT_READ_HEADER_TIMEOUT_SECONDS`](@ref Nitro.Core.Constants.DEFAULT_READ_HEADER_TIMEOUT_SECONDS)
+on purpose. On HTTP/1.1 HTTP.jl 2.7 overwrites this deadline with the header deadline before it
+can fire, so on the connections a browser or a reverse proxy actually opens, the header timeout
+*is* the idle limit. This value applies to cleartext HTTP/2, and to HTTP/1.1 when both
+`read_header_timeout` and `read_timeout` are `0`: then nothing overwrites it, and it bounds the
+wait for the next request's head instead. Either way Nitro clears it once a head has arrived, so it never reaches
+into a request body. Equal values mean none of these cases changes behavior.
+"""
+const DEFAULT_IDLE_TIMEOUT_SECONDS :: Float64 = 120.0
 
 """
 Default ceiling, in bytes, on a buffered request body before `serve()` answers **413** instead
