@@ -30,6 +30,13 @@ index if they do not already exist (`IF NOT EXISTS`), and returns a ready-to-use
 `PormGSessionStore`. Sessions are stored as JSON with a fixed-point expiry timestamp; there
 is no sliding expiry.
 
+Each row also records when the session was created (`created_at`), which
+`SessionMiddleware(absolute_max_age = …)` measures a session's absolute lifetime from (#362). On a
+table created before that column existed, this call adds it on boot and stamps the existing rows
+with the upgrade instant, so live sessions get a full lifetime from the upgrade. A store you
+construct directly skips this bootstrap, so add the column yourself there (see the #362 entry
+in `upgrade_guide()`).
+
 Session data may nest at most **512** levels deep, the same bound as request JSON
 (`MAX_JSON_DEPTH`). Writing a deeper payload throws an `ArgumentError` before the row is
 touched, rather than storing a session that could never be read back. The check walks the value

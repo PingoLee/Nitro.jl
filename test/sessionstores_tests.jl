@@ -47,14 +47,16 @@ end
 Nitro.Types.cleanup_expired_sessions!(::RotateFailingSessionStore) = nothing
 
 function Nitro.Types.set_session!(store::DelegatingSessionStore, session_id::String, value::Dict{String,Any}; ttl::Int=3600)
-    store.data[session_id] = SessionPayload(copy(value), Dates.now(Dates.UTC) + Dates.Second(ttl))
+    now = Dates.now(Dates.UTC)
+    store.data[session_id] = SessionPayload(copy(value), now + Dates.Second(ttl), now)
     return value
 end
 
 function Nitro.Types.update_session!(store::DelegatingSessionStore, session_id::String, value::Dict{String,Any}; ttl::Int=3600)
     payload = get(store.data, session_id, nothing)
     (payload === nothing || Nitro.Types.is_expired(payload)) && return false
-    store.data[session_id] = SessionPayload(copy(value), Dates.now(Dates.UTC) + Dates.Second(ttl))
+    store.data[session_id] = SessionPayload(copy(value), Dates.now(Dates.UTC) + Dates.Second(ttl),
+                                            payload.created)
     return true
 end
 
@@ -63,7 +65,8 @@ function Nitro.Types.rotate_session!(store::DelegatingSessionStore, old_id::Stri
     payload = get(store.data, old_id, nothing)
     (payload === nothing || Nitro.Types.is_expired(payload)) && return false
     delete!(store.data, old_id)
-    store.data[new_id] = SessionPayload(copy(value), Dates.now(Dates.UTC) + Dates.Second(ttl))
+    store.data[new_id] = SessionPayload(copy(value), Dates.now(Dates.UTC) + Dates.Second(ttl),
+                                        payload.created)
     return true
 end
 
@@ -146,7 +149,7 @@ end
     @test get_session(store, "abc") === nothing
 
     lock(store.lock) do
-        store.data["expired"] = SessionPayload(Dict{String,Any}("user_id" => 2), Dates.now(Dates.UTC) - Dates.Second(5))
+        store.data["expired"] = SessionPayload(Dict{String,Any}("user_id" => 2), Dates.now(Dates.UTC) - Dates.Second(5), Dates.now(Dates.UTC))
     end
     cleanup_expired_sessions!(store)
     @test !haskey(store.data, "expired")
@@ -183,8 +186,8 @@ end
 
     set_session!(store, "active", Dict{String,Any}("a" => 1); ttl=3600)
     lock(store.lock) do
-        store.data["expired1"] = SessionPayload(Dict{String,Any}("b" => 2), Dates.now(Dates.UTC) - Dates.Second(10))
-        store.data["expired2"] = SessionPayload(Dict{String,Any}("c" => 3), Dates.now(Dates.UTC) - Dates.Second(5))
+        store.data["expired1"] = SessionPayload(Dict{String,Any}("b" => 2), Dates.now(Dates.UTC) - Dates.Second(10), Dates.now(Dates.UTC))
+        store.data["expired2"] = SessionPayload(Dict{String,Any}("c" => 3), Dates.now(Dates.UTC) - Dates.Second(5), Dates.now(Dates.UTC))
     end
 
     cleanup_expired_sessions!(store)
@@ -217,7 +220,7 @@ end
     # an expired row is the prune's to remove, not the write path's to revive.
     stale_expiry = Dates.now(Dates.UTC) - Dates.Second(5)
     lock(store.lock) do
-        store.data["stale"] = SessionPayload(Dict{String,Any}("user_id" => 1), stale_expiry)
+        store.data["stale"] = SessionPayload(Dict{String,Any}("user_id" => 1), stale_expiry, stale_expiry - Dates.Hour(1))
     end
     @test update_session!(store, "stale", Dict{String,Any}("user_id" => 2); ttl=3600) === false
     @test store.data["stale"].expires == stale_expiry
@@ -269,7 +272,7 @@ end
 
     # The prune still works on the LRU.
     lock(store.lock) do
-        store.data["a"] = SessionPayload(session(1), Dates.now(Dates.UTC) - Dates.Second(1))
+        store.data["a"] = SessionPayload(session(1), Dates.now(Dates.UTC) - Dates.Second(1), Dates.now(Dates.UTC))
     end
     cleanup_expired_sessions!(store)
     @test sort(collect(keys(store.data))) == ["c", "d"]
@@ -465,7 +468,7 @@ end
     # Expired counts as gone, and the store is left unchanged.
     lock(store.lock) do
         store.data["stale"] = SessionPayload(Dict{String,Any}("user_id" => 7),
-                                             Dates.now(Dates.UTC) - Dates.Second(1))
+                                             Dates.now(Dates.UTC) - Dates.Second(1), Dates.now(Dates.UTC))
     end
     @test rotate_session!(store, "stale", "fresh", Dict{String,Any}("user_id" => 7); ttl=3600) === false
     @test !haskey(store.data, "fresh")
@@ -494,6 +497,41 @@ end
     @test Nitro.regenerate_session!(req, store; ttl=3600) === nothing
     @test req.context[:session_id] == "S"   # no new id for the middleware to hand out
     @test isempty(store.data)               # and `user_id = 42` was copied nowhere
+end
+
+# ── #362: a session's creation instant ───────────────────────────────────────
+#
+# `SessionMiddleware(absolute_max_age = …)` measures from `SessionPayload.created`, so a store
+# that moved it on every write would let a session live forever.
+@testset "MemoryStore stamps, keeps and carries a session's creation instant (#362)" begin
+    store = MemoryStore()
+
+    # Stamped on insert, from the same clock read as the expiry.
+    before = Dates.now(Dates.UTC)
+    set_session!(store, "s", Dict{String,Any}("v" => 1); ttl=60)
+    after = Dates.now(Dates.UTC)
+    stamped = store.data["s"]
+    @test before <= stamped.created <= after
+    @test stamped.expires == stamped.created + Dates.Second(60)
+
+    # Kept by an update: the expiry slides, `created` does not.
+    born = Dates.now(Dates.UTC) - Dates.Day(3)
+    lock(store.lock) do
+        store.data["old"] = SessionPayload(Dict{String,Any}("v" => 1),
+                                           Dates.now(Dates.UTC) + Dates.Hour(1), born)
+    end
+    @test update_session!(store, "old", Dict{String,Any}("v" => 2); ttl=3600)
+    @test store.data["old"].created == born
+    @test store.data["old"].expires > Dates.now(Dates.UTC) + Dates.Minute(59)
+
+    # Carried by a rotation: renaming a session does not start a new one.
+    @test rotate_session!(store, "old", "renamed", Dict{String,Any}("v" => 3); ttl=3600)
+    @test store.data["renamed"].created == born
+
+    # `set_session!` stores a FRESH session, so overwriting an id restarts its clock. The
+    # middleware only ever calls it for an id minted in the same request.
+    set_session!(store, "renamed", Dict{String,Any}("v" => 4); ttl=3600)
+    @test store.data["renamed"].created > born
 end
 
 @testset "regenerate_session! on a session minted in this request (#361)" begin

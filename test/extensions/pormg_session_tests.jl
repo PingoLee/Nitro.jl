@@ -84,13 +84,19 @@ struct SessionMockDB
     tables::Dict{String, Dict{String, Dict{Symbol,Any}}}   # db key -> session_key -> row
     seen::Vector{Dict{String,Any}}
     lock::ReentrantLock
+    # Test-only interleaving points, run OUTSIDE the lock the way another connection's
+    # statement would land between two of ours. `:after_first` runs after every `.first()` --
+    # which is how a concurrent logout is placed between `rotate_session!`'s read and its
+    # guarded DELETE (#361, #362).
+    hooks::Dict{Symbol,Any}
 end
 
 SessionMockDB(db_keys::String...) = SessionMockDB(
     Dict{String, Dict{String, Dict{Symbol,Any}}}(
         k => Dict{String, Dict{Symbol,Any}}() for k in (isempty(db_keys) ? ("db",) : db_keys)),
     Dict{String,Any}[],
-    ReentrantLock())
+    ReentrantLock(),
+    Dict{Symbol,Any}())
 
 mutable struct MockQuerySet
     mdb::SessionMockDB
@@ -188,6 +194,7 @@ end
 # untouched by every test that reads a session.
 _as_db_row(row::Dict{Symbol,Any}) = MockRow(merge(row, Dict{Symbol,Any}(
     :expires_at => ZonedDateTime(row[:expires_at], tz"UTC"),
+    :created_at => ZonedDateTime(row[:created_at], tz"UTC"),
 )))
 
 function Base.getproperty(qs::MockQuerySet, name::Symbol)
@@ -212,10 +219,13 @@ function Base.getproperty(qs::MockQuerySet, name::Symbol)
         end
     elseif name === :first
         return function()
-            return lock(_mock_lock(qs)) do
+            row = lock(_mock_lock(qs)) do
                 matched = _matching_keys_locked(qs)
                 isempty(matched) ? nothing : _as_db_row(_selected_table(qs)[first(matched)])
             end
+            hook = get(getfield(qs, :mdb).hooks, :after_first, nothing)
+            hook === nothing || hook()
+            return row
         end
     elseif name === :create
         return function(pairs::Pair{String,<:Any}...)
@@ -404,14 +414,15 @@ end
 PormG.ConnectionPool.fetch(c::FakeSessionPool, sql::String; kwargs...) =
     (push!(c.sql, sql); nothing)
 
-# Seed a row directly, the way a prior process would have left one behind. `expires_at` is a
-# naive UTC `DateTime`, which is what `set_session!` writes.
+# Seed a row directly, the way a prior process would have left one behind. `expires_at` and
+# `created_at` are naive UTC `DateTime`s, which is what `set_session!` writes.
 function _seed_row!(model::MockModel, key::String, data::Dict{String,Any}, expires_at::DateTime;
-                    db_key::String="db")
+                    db_key::String="db", created_at::DateTime=Dates.now(Dates.UTC))
     model._tables[db_key][key] = Dict{Symbol,Any}(
         :session_key  => key,
         :session_data => JSON.json(data),
         :expires_at   => expires_at,
+        :created_at   => created_at,
     )
     return nothing
 end
@@ -523,9 +534,10 @@ end
         @test rotate_session!(s, "live", "moved", Dict{String,Any}("v" => 2); ttl=90) === true
         after = Dates.now(Dates.UTC)
 
-        # The liveness condition is in the DELETE's own WHERE, the query whose count decides.
+        # Two queries: the read of the row's `created_at` (#362), then the guarded DELETE. The
+        # liveness condition is in the DELETE's own WHERE, the query whose count decides.
         # (Checked before the reads below, which record filters of their own.)
-        @test length(m._filters_seen) == queries_before + 1
+        @test length(m._filters_seen) == queries_before + 2
         delete_filters = m._filters_seen[end]
         @test delete_filters["session_key"] == "live"
         @test haskey(delete_filters, "expires_at__@gt")
@@ -533,6 +545,56 @@ end
         @test !haskey(m._table, "live")
         @test get_session(s, "moved") == Dict{String,Any}("v" => 2)
         @test before + Dates.Second(90) <= m._table["moved"][:expires_at] <= after + Dates.Second(90)
+    end
+
+    # The window the DELETE's row count exists for: the row is live when rotate reads its
+    # `created_at`, and a concurrent logout deletes it before rotate's DELETE runs.
+    @testset "a logout between rotate's read and its DELETE moves nothing (#361, #362)" begin
+        m = MockModel()
+        s = RealPormGSessionStore(model=m)
+        set_session!(s, "S", Dict{String,Any}("user_id" => 42); ttl=3600)
+        getfield(m, :mdb).hooks[:after_first] = () -> delete!(m._table, "S")
+        try
+            @test rotate_session!(s, "S", "fresh", Dict{String,Any}("user_id" => 42); ttl=3600) === false
+        finally
+            delete!(getfield(m, :mdb).hooks, :after_first)
+        end
+        @test isempty(m._table)     # `user_id = 42` was copied nowhere
+    end
+
+    # #362: `SessionMiddleware(absolute_max_age = …)` measures from `created_at`, so the store must
+    # stamp it once and never move it.
+    @testset "created_at is stamped on insert, kept by update, carried by rotate (#362)" begin
+        m = MockModel()
+        s = RealPormGSessionStore(model=m)
+
+        before = Dates.now(Dates.UTC)
+        set_session!(s, "new", Dict{String,Any}("v" => 1); ttl=60)
+        after = Dates.now(Dates.UTC)
+        @test before <= m._table["new"][:created_at] <= after
+        # Read back through `Base.get` as the payload's `created`: UTC-normalized and in whole
+        # seconds, exactly like `expires` (`_parse_db_datetime`).
+        @test Base.get(s, "new", nothing).created == floor(m._table["new"][:created_at], Dates.Second)
+
+        born = floor(Dates.now(Dates.UTC) - Dates.Day(3), Dates.Second)
+        _seed_row!(m, "old", Dict{String,Any}("v" => 1), Dates.now(Dates.UTC) + Dates.Hour(1);
+                   created_at = born)
+        @test update_session!(s, "old", Dict{String,Any}("v" => 2); ttl=3600)
+        @test m._table["old"][:created_at] == born
+
+        @test rotate_session!(s, "old", "renamed", Dict{String,Any}("v" => 3); ttl=3600)
+        @test m._table["renamed"][:created_at] == born
+        @test Base.get(s, "renamed", nothing).created == born
+
+        # A sub-second `created_at` is carried rounded DOWN: the lifetime can only shrink.
+        precise = Dates.now(Dates.UTC) - Dates.Day(1)
+        _seed_row!(m, "ms", Dict{String,Any}(), Dates.now(Dates.UTC) + Dates.Hour(1); created_at = precise)
+        @test rotate_session!(s, "ms", "ms2", Dict{String,Any}(); ttl=3600)
+        @test m._table["ms2"][:created_at] == floor(precise, Dates.Second) <= precise
+
+        # `set_session!` stores a FRESH session, so an overwrite restarts the clock.
+        set_session!(s, "renamed", Dict{String,Any}("v" => 4); ttl=3600)
+        @test m._table["renamed"][:created_at] > born
     end
 
     @testset "every query runs on the store's db_key, not the model's default (#199)" begin
@@ -949,9 +1011,12 @@ end
         # meaningful assertion is the binding, not the object.
         @test store.model.name == "nitro_session"
         @test store.model.connect_key == key
-        @test length(conn.sql) == 2
+        # CREATE TABLE, the `created_at` probe (#362), CREATE INDEX. This pool answers every
+        # statement, so the probe finds the column and no ALTER follows.
+        @test length(conn.sql) == 3
         @test any(q -> occursin("nitro_session", q), conn.sql)
         @test any(q -> occursin("nitro_session_expires_at_idx", q), conn.sql)
+        @test any(q -> occursin("\"nitro_session\".\"created_at\"", q), conn.sql)
     finally
         # `config` is process-global and PormG falls back to `first(keys(config))` when a model is
         # unbound and exactly one connection is loaded, so a leaked entry could silently be picked
@@ -961,6 +1026,84 @@ end
 
     # The default is still the default, and is not a function of what ran above.
     @test !haskey(PormG.config, key)
+end
+
+# A connection whose `nitro_session` has the `created_at` column (#362) or does not, answering the
+# way a real driver does: a statement naming a missing column throws, and so does an `ALTER`
+# adding one that is already there. The same model as `FakeSchemaPool` in
+# `pormg_worker_tests.jl` for `run_id` -- read the comment there. Only the exact qualified
+# spelling the ext uses counts as a probe; the unqualified one falls through to "succeeds", as
+# SQLite's double-quoted-string fallback really answers it.
+mutable struct FakeSessionSchemaPool <: PormG.PormGSQLite
+    sql::Vector{String}
+    has_created_at::Bool
+    alter_error::Union{Nothing, Exception}
+    concurrent_add::Bool
+end
+
+FakeSessionSchemaPool(has_created_at::Bool; alter_error=nothing, concurrent_add::Bool=false) =
+    FakeSessionSchemaPool(String[], has_created_at, alter_error, concurrent_add)
+
+function PormG.ConnectionPool.fetch(c::FakeSessionSchemaPool, sql::String; kwargs...)
+    push!(c.sql, sql)
+    if startswith(sql, "ALTER TABLE \"nitro_session\" ADD COLUMN \"created_at\"")
+        c.concurrent_add && (c.has_created_at = true)
+        c.alter_error === nothing || throw(c.alter_error)
+        c.has_created_at && error("duplicate column name: created_at")
+        c.has_created_at = true
+    elseif occursin("\"nitro_session\".\"created_at\"", sql)
+        c.has_created_at || error("no such column: nitro_session.created_at")
+    end
+    return nothing
+end
+
+struct FakePostgresPool <: PormG.PormGPostgres end
+
+@testset "the created_at migration probes, then adds the column once (#362)" begin
+    ensure! = getproperty(PormGExt, :_ensure_session_created_at_column!)
+    is_alter(s) = startswith(s, "ALTER TABLE")
+
+    # A table that already has the column -- every boot after the first, and the first one too
+    # for a new database, since CREATE TABLE emits it. Only the probe runs.
+    current = FakeSessionSchemaPool(true)
+    @test ensure!(current) === nothing
+    @test current.sql == ["SELECT \"nitro_session\".\"created_at\" FROM \"nitro_session\" LIMIT 0"]
+
+    # That premise is asserted, not assumed: through the whole bootstrap, CREATE TABLE carries
+    # the column, so a new database never takes the migration path.
+    booted = FakeSessionSchemaPool(true)
+    getproperty(PormGExt, :_ensure_session_table!)(booted, getproperty(PormGExt, :session_model)())
+    @test occursin("CREATE TABLE", first(booted.sql))
+    @test occursin("\"created_at\"", first(booted.sql))
+    @test !any(is_alter, booted.sql)
+
+    # A pre-#362 table is migrated: probed first, then ONE ALTER whose constant default stamps
+    # every existing row with the migration instant, in PormG's canonical UTC form.
+    legacy = FakeSessionSchemaPool(false)
+    before = floor(Dates.now(Dates.UTC), Dates.Millisecond)
+    @test ensure!(legacy) === nothing
+    after = Dates.now(Dates.UTC)
+    @test legacy.has_created_at
+    alters = filter(is_alter, legacy.sql)
+    @test length(alters) == 1
+    @test findfirst(is_alter, legacy.sql) > 1
+    m = match(r"^ALTER TABLE \"nitro_session\" ADD COLUMN \"created_at\" DATETIME NOT NULL DEFAULT '(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3})\+00:00'$",
+              only(alters))
+    @test m !== nothing
+    stamped = DateTime(m.captures[1], dateformat"yyyy-mm-ddTHH:MM:SS.sss")
+    @test before <= stamped <= after
+
+    # Losing the race to another process migrating the same table is not a failure.
+    raced = FakeSessionSchemaPool(false; concurrent_add = true)
+    @test ensure!(raced) === nothing
+    @test raced.has_created_at
+
+    # A genuine ALTER failure -- the column is still missing afterwards -- is rethrown.
+    broken = FakeSessionSchemaPool(false; alter_error = ErrorException("permission denied"))
+    @test_throws "permission denied" ensure!(broken)
+
+    # The column type follows the dialect, matching what CREATE TABLE emits for a DateTimeField.
+    @test getproperty(PormGExt, :_datetime_column_type)(FakePostgresPool()) == "TIMESTAMPTZ"
 end
 
 # The `PasswordField` hook is latent (PormG 0.6 has no `register_field_hook`), so it is tested as

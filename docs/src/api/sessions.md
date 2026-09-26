@@ -21,6 +21,7 @@ SessionMiddleware
 SessionPruner
 regenerate_session!
 AbstractSessionStore
+Nitro.Core.Types.SessionPayload
 MemoryStore
 is_expired
 Nitro.Core.Types.update_session!

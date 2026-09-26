@@ -136,6 +136,10 @@ Columns:
 - `session_key`  — VARCHAR(40), primary key (the session ID)
 - `session_data` — TEXT (JSON-serialized session payload)
 - `expires_at`   — TIMESTAMPTZ, indexed for efficient cleanup
+- `created_at`   — TIMESTAMPTZ, when the session was first stored; kept by every update and
+                   rotation, and what `SessionMiddleware(absolute_max_age = …)` measures from
+                   ([#362](https://github.com/PingoLee/Nitro.jl/issues/362)). Added after the
+                   table shipped, so `_ensure_session_created_at_column!` adds it on boot.
 """
 function _define_session_model(db_key::String)
     if isdefined(PormG, :Models)
@@ -143,6 +147,7 @@ function _define_session_model(db_key::String)
             session_key  = PormG.Models.CharField(max_length=40, primary_key=true),
             session_data = PormG.Models.TextField(default="{}"),
             expires_at   = PormG.Models.DateTimeField(db_index=true),
+            created_at   = PormG.Models.DateTimeField(),
         )
         _bind_model!(m, db_key)
         return m
@@ -287,8 +292,9 @@ function Base.get(store::PormGSessionStore, session_id::String, default)
     # driver error quotes no payload and an outage needs its message to be diagnosed.
     try
         expires_at = _parse_db_datetime(result[:expires_at])
+        created_at = _parse_db_datetime(result[:created_at])
         data = _deserialize_session(result[:session_data])
-        return SessionPayload(data, expires_at)
+        return SessionPayload(data, expires_at, created_at)
     catch e
         is_unrecoverable(e) && rethrow()
         @warn "PormGSessionStore: failed to read session: the stored session does not decode" exception_type=typeof(e)
@@ -346,8 +352,12 @@ function get_session(store::PormGSessionStore, session_id::String)
     return payload
 end
 
+# Stores a FRESH session: `created_at` is now on both branches, the overwrite included (#362).
+# `SessionMiddleware` only ever calls this for an id minted in the request; a loaded session is
+# written with `update_session!` and moved with `rotate_session!`, which both keep `created_at`.
 function set_session!(store::PormGSessionStore, session_id::String, data::Dict{String,Any}; ttl::Int=3600)
-    expires_at = Dates.now(Dates.UTC) + Dates.Second(ttl)
+    now_utc = Dates.now(Dates.UTC)
+    expires_at = now_utc + Dates.Second(ttl)
     # Outside the `try` on purpose: a payload nested past the JSON depth bound throws its
     # `ArgumentError` here, before the row is touched, rather than being stored unreadable (#344).
     serialized = _serialize_session(data)
@@ -359,11 +369,13 @@ function set_session!(store::PormGSessionStore, session_id::String, data::Dict{S
                 "session_key"  => session_id,
                 "session_data" => serialized,
                 "expires_at"   => expires_at,
+                "created_at"   => now_utc,
             )
         else
             _session_objects(store).filter("session_key" => session_id).update(
                 "session_data" => serialized,
                 "expires_at"   => expires_at,
+                "created_at"   => now_utc,
             )
         end
     catch e
@@ -377,7 +389,8 @@ end
 # the WHERE is the existence check, so a row a concurrent logout deleted -- or one that expired --
 # matches nothing and is NOT re-created (#318). `update()` returns the matched-row count (Django
 # semantics). `__@gt` is the exact complement of the prune's inclusive `__@lte` and of
-# `is_expired`, so the boundary instant counts as expired here too.
+# `is_expired`, so the boundary instant counts as expired here too. `created_at` is not in the SET:
+# an update slides the expiry, never the absolute lifetime (#362).
 function update_session!(store::PormGSessionStore, session_id::String, data::Dict{String,Any}; ttl::Int=3600)
     now_utc = Dates.now(Dates.UTC)
     serialized = _serialize_session(data)
@@ -404,6 +417,13 @@ end
 # loser sees 0. Only the winner inserts the new key, so a logged-out session is never copied into
 # one. A read followed by an unguarded delete would re-open exactly that window.
 #
+# The new row carries the old one's `created_at` (#362), read first. The read decides nothing: a
+# logout that lands between it and the DELETE makes the DELETE match 0 rows, and nothing is
+# inserted. `created_at` itself never changes after insert, so the value read is the value to carry.
+# It comes back through `_parse_db_datetime`, which keeps whole seconds as it does for
+# `expires_at`: each rotation can move `created_at` earlier by under a second, never later, so it
+# can only shorten a session's absolute lifetime, never extend it.
+#
 # There is deliberately no transaction around the DELETE and the INSERT. It would buy only crash
 # atomicity, and a failure between the two already fails closed: the INSERT throws, the old row is
 # gone, and the visitor is logged out rather than left holding a session nobody authorized.
@@ -415,6 +435,11 @@ function rotate_session!(store::PormGSessionStore, old_id::String, new_id::Strin
     serialized = _serialize_session(data)
 
     try
+        live = _session_objects(store).filter("session_key" => old_id,
+                                              "expires_at__@gt" => now_utc).first()
+        live === nothing && return false
+        created_at = _parse_db_datetime(live[:created_at])
+
         # PormG's `delete()` returns `(total, per-table breakdown)`.
         deleted = first(_session_objects(store).filter("session_key" => old_id,
                                                        "expires_at__@gt" => now_utc).delete())
@@ -423,6 +448,7 @@ function rotate_session!(store::PormGSessionStore, old_id::String, new_id::Strin
             "session_key"  => new_id,
             "session_data" => serialized,
             "expires_at"   => now_utc + Dates.Second(ttl),
+            "created_at"   => created_at,
         )
     catch e
         @warn "PormGSessionStore: failed to rotate session" exception=(e, catch_backtrace())
@@ -473,6 +499,9 @@ function _ensure_session_table!(conn, model)
     create_table_sql = PormG.Dialect.create_table(conn, model)
     PormG.ConnectionPool.fetch(conn, create_table_sql)
 
+    # A table created before #362 does not get `created_at` from the statement above.
+    _ensure_session_created_at_column!(conn)
+
     create_index_sql = PormG.Dialect.create_index(
         conn,
         "\"nitro_session_expires_at_idx\"",
@@ -482,6 +511,49 @@ function _ensure_session_table!(conn, model)
     PormG.ConnectionPool.fetch(conn, create_index_sql)
     return nothing
 end
+
+"""
+    _ensure_session_created_at_column!(conn)
+
+Add the `created_at` column ([#362](https://github.com/PingoLee/Nitro.jl/issues/362)) to an
+existing `nitro_session` table, idempotently. `Base.get` reads it on every session load, so a table
+without it cannot serve a session at all. It follows the same probe-first discipline as
+`_ensure_run_id_column!` (#366), whose docstring explains why: probe, `ALTER` only when the column
+is missing, and probe again before rethrowing a failed `ALTER` that another process may have beaten.
+
+Existing rows are backfilled through a **constant** `DEFAULT` holding the migration instant, for
+three reasons:
+
+- Each live session gets a full `absolute_max_age` from the upgrade, instead of being logged out
+  by it.
+- SQLite refuses a non-constant default such as `CURRENT_TIMESTAMP` in `ADD COLUMN`.
+- The default also stamps any row a process still on the old code inserts during a rolling deploy.
+  The column therefore never holds `NULL`, so no reader has a case for one.
+
+The literal is in PormG's canonical UTC form (`yyyy-mm-ddTHH:MM:SS.sss+00:00`), so it reads back
+exactly like a value PormG wrote. On SQLite that same text is what makes the prune's string
+comparison agree with an instant comparison.
+"""
+function _ensure_session_created_at_column!(conn)
+    _has_column(conn, "nitro_session", "created_at") && return nothing
+    try
+        PormG.ConnectionPool.fetch(conn,
+            "ALTER TABLE \"nitro_session\" ADD COLUMN \"created_at\" $(_datetime_column_type(conn)) " *
+            "NOT NULL DEFAULT '$(_canonical_utc(Dates.now(Dates.UTC)))'")
+    catch e
+        _interrupted(e) && rethrow()
+        _has_column(conn, "nitro_session", "created_at") || rethrow(e)
+    end
+    return nothing
+end
+
+# What `PormG.Dialect.create_table` emits for a `DateTimeField` on each backend (PormG
+# `constants.jl`), so a column added by `ALTER` matches one created with the table.
+_datetime_column_type(::PormG.PormGSQLite) = "DATETIME"
+_datetime_column_type(::PormG.PormGPostgres) = "TIMESTAMPTZ"
+
+# PormG's canonical `DateTimeField` text for a naive UTC `DateTime` (`format_timezone_sql`).
+_canonical_utc(t::DateTime) = Dates.format(t, dateformat"yyyy-mm-ddTHH:MM:SS.sss") * "+00:00"
 
 # Deliberately no docstring: the authoritative one is on the weakdep stub in `src/exts.jl`, which
 # is also what `?pormg_nitro_session` resolves to. Two docstrings on one function render as two
@@ -1270,18 +1342,19 @@ transaction, so the `ALTER` then fails with `InFailedSqlTransaction` and that is
 Boot outside a transaction; before #366 this path failed on every boot.
 """
 function _ensure_run_id_column!(conn)
-    _has_run_id_column(conn) && return nothing
+    _has_column(conn, "nitro_task", "run_id") && return nothing
     try
         PormG.ConnectionPool.fetch(conn,
             "ALTER TABLE \"nitro_task\" ADD COLUMN \"run_id\" VARCHAR(36) NOT NULL DEFAULT '$(_LEGACY_RUN_ID)'")
     catch e
         _interrupted(e) && rethrow()
-        _has_run_id_column(conn) || rethrow(e)
+        _has_column(conn, "nitro_task", "run_id") || rethrow(e)
     end
     return nothing
 end
 
-# Whether `nitro_task` has a `run_id` column, answered by whether a statement naming it runs.
+# Whether `table` has `column`, answered by whether a statement naming it runs. Shared by every
+# add-a-column-on-boot migration: `nitro_task.run_id` (#108) and `nitro_session.created_at` (#362).
 #
 # The column is QUALIFIED on purpose, and the probe is wrong without it. By SQLite's default
 # double-quoted-string fallback, which the SQLite that SQLite.jl bundles keeps, a double-quoted
@@ -1293,9 +1366,9 @@ end
 #
 # `LIMIT 0` because the question is about the schema, not the rows: both dialects resolve the
 # column before they read anything.
-function _has_run_id_column(conn)::Bool
+function _has_column(conn, table::String, column::String)::Bool
     try
-        PormG.ConnectionPool.fetch(conn, "SELECT \"nitro_task\".\"run_id\" FROM \"nitro_task\" LIMIT 0")
+        PormG.ConnectionPool.fetch(conn, "SELECT \"$table\".\"$column\" FROM \"$table\" LIMIT 0")
         return true
     catch e
         # A Ctrl-C during the probe is not an answer: read as "missing", it would run the ALTER.

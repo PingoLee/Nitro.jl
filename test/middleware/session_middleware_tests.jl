@@ -89,7 +89,7 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
 
         # Existing and unchanged, but marked: written back, which moves its expiry forward.
         lock(store.lock) do
-            store.data[sid] = SessionPayload(Dict{String,Any}(), Dates.now(Dates.UTC) + Dates.Second(5))
+            store.data[sid] = SessionPayload(Dict{String,Any}(), Dates.now(Dates.UTC) + Dates.Second(5), Dates.now(Dates.UTC))
         end
         response = pin(HTTP.Request("GET", "/", ["Cookie" => "pinned=$sid"]))
         @test occursin("pinned=$sid", HTTP.header(response, "Set-Cookie"))
@@ -338,7 +338,7 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
         expired_data = Dict{String,Any}("old" => true)
         # Store with a past expiry
         lock(store.lock) do
-            store.data[expired_id] = SessionPayload(expired_data, Dates.now(Dates.UTC) - Dates.Second(10))
+            store.data[expired_id] = SessionPayload(expired_data, Dates.now(Dates.UTC) - Dates.Second(10), Dates.now(Dates.UTC))
         end
 
         mw = SessionMiddleware(
@@ -410,7 +410,7 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
             return Base.get(store.data, key, default)
         end
         function Nitro.Core.Cookies.storesession!(store::MockStore{K,V}, key::K, val::V; ttl::Int=3600) where {K,V}
-            store.data[key] = SessionPayload(val, Dates.now(Dates.UTC) + Dates.Second(ttl))
+            store.data[key] = SessionPayload(val, Dates.now(Dates.UTC) + Dates.Second(ttl), Dates.now(Dates.UTC))
         end
         function Nitro.Core.Cookies.prunesessions!(store::MockStore)
             current_time = Dates.now(Dates.UTC)
@@ -645,6 +645,143 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
     # under the old design too -- it hands both middlewares an explicit store, so its outcome
     # never depended on whether a default existed. It is regression cover for explicit-store
     # isolation, not a demonstration of the defect.
+    # ── #362: absolute lifetime ──────────────────────────────────────────────
+    #
+    # Every write-back slid the expiry, so a session in use never ended and a stolen id stayed
+    # valid for as long as the thief kept using it. Sessions are staged with a chosen `created`
+    # directly in the store rather than waited out.
+    seed!(store, sid, data; created, expires = Dates.now(Dates.UTC) + Dates.Hour(1)) =
+        lock(store.lock) do
+            store.data[sid] = SessionPayload(data, expires, created)
+        end
+    cookie_of(res, name) = (m = match(Regex("$name=([^;]+)"), HTTP.header(res, "Set-Cookie"));
+                            m === nothing ? nothing : String(m.captures[1]))
+    max_age_of(res) = parse(Int, match(r"Max-Age=(\d+)", HTTP.header(res, "Set-Cookie")).captures[1])
+
+    @testset "the default cap is seven days (#362)" begin
+        @test Nitro.Core.Middleware.SessionMiddleware_.DEFAULT_ABSOLUTE_MAX_AGE == 7 * 86400
+        store = MemoryStore()
+        mw = SessionMiddleware(cookie_name="sid", store=store, secure=false).middleware
+        reader = mw(req -> HTTP.Response(200, string(get(getsession(req), "user_id", "none"))))
+
+        # Just inside: served, however long ago it was created.
+        seed!(store, "young", Dict{String,Any}("user_id" => 1);
+              created = Dates.now(Dates.UTC) - Dates.Day(7) + Dates.Minute(5))
+        @test String(reader(HTTP.Request("GET", "/", ["Cookie" => "sid=young"])).body) == "1"
+
+        # Just past: absent, although its sliding expiry is an hour away.
+        seed!(store, "old", Dict{String,Any}("user_id" => 2);
+              created = Dates.now(Dates.UTC) - Dates.Day(7) - Dates.Second(1))
+        @test String(reader(HTTP.Request("GET", "/", ["Cookie" => "sid=old"])).body) == "none"
+    end
+
+    @testset "a session past its absolute lifetime is refused and removed (#362)" begin
+        store = MemoryStore()
+        seed!(store, "stolen", Dict{String,Any}("user_id" => 42);
+              created = Dates.now(Dates.UTC) - Dates.Day(8))
+        mw = SessionMiddleware(cookie_name="sid", max_age=3600, store=store, secure=false).middleware
+
+        res = mw(function (req::HTTP.Request)
+            @test isempty(getsession(req))            # absent, like an expired session
+            getsession(req)["fresh"] = true
+            return HTTP.Response(200, "ok")
+        end)(HTTP.Request("GET", "/", ["Cookie" => "sid=stolen"]))
+
+        fresh = cookie_of(res, "sid")
+        @test fresh !== nothing && fresh != "stolen"
+        # Removed, not merely refused: the readers that bypass the middleware check only
+        # `expires`, and this row's expiry was still an hour away.
+        @test Base.get(store, "stolen", nothing) === nothing
+        @test Nitro.Core.Types.get_session(store, "stolen") === nothing
+        @test Base.get(store, fresh, nothing).data == Dict{String,Any}("fresh" => true)
+    end
+
+    @testset "writes never let the expiry pass the absolute deadline (#362)" begin
+        store = MemoryStore()
+        cap = 7 * 86400
+        born = Dates.now(Dates.UTC) - Dates.Second(cap - 100)   # 100 s of lifetime left
+        seed!(store, "S", Dict{String,Any}("user_id" => 1); created = born)
+        mw = SessionMiddleware(cookie_name="sid", max_age=3600, store=store, secure=false).middleware
+
+        res = mw(req -> (getsession(req)["n"] = 1; HTTP.Response(200, "ok")))(
+            HTTP.Request("GET", "/", ["Cookie" => "sid=S"]))
+
+        payload = Base.get(store, "S", nothing)
+        deadline = born + Dates.Second(cap)
+        # Clamped to the deadline -- not `max_age` (an hour) from now -- and `created` kept.
+        @test deadline - Dates.Second(5) <= payload.expires <= deadline
+        @test payload.created == born
+        @test 95 <= max_age_of(res) <= 100
+        # So a reader that never passes through the middleware -- `get_session`, the `Session{T}`
+        # extractor, `session_user_validator` -- refuses it at the deadline through `is_expired`.
+        @test Nitro.Types.is_expired(payload, deadline)
+
+        # A new session gets `min(max_age, absolute_max_age)`.
+        short = SessionMiddleware(cookie_name="sid", max_age=3600, absolute_max_age=60,
+                                  store=store, secure=false).middleware
+        res = short(req -> (getsession(req)["n"] = 1; HTTP.Response(200, "ok")))(HTTP.Request("GET", "/"))
+        @test max_age_of(res) == 60
+        @test Base.get(store, cookie_of(res, "sid"), nothing).expires <= Dates.now(Dates.UTC) + Dates.Second(60)
+    end
+
+    @testset "rotation carries the creation instant (#362)" begin
+        store = MemoryStore()
+        born = Dates.now(Dates.UTC) - Dates.Day(3)
+        seed!(store, "anon", Dict{String,Any}("cart" => [1]); created = born)
+        mw = SessionMiddleware(cookie_name="sid", max_age=3600, store=store, secure=false).middleware
+
+        # `rotate_on_auth` on login, and an explicit `regenerate_session!` on the new id.
+        login = mw(req -> (getsession(req)["user_id"] = 7; HTTP.Response(200, "in")))
+        rotated = cookie_of(login(HTTP.Request("POST", "/login", ["Cookie" => "sid=anon"])), "sid")
+        @test rotated != "anon"
+        @test Base.get(store, rotated, nothing).created == born
+
+        sudo = mw(req -> (Nitro.regenerate_session!(req, store; ttl=86400); HTTP.Response(200, "ok")))
+        res = sudo(HTTP.Request("POST", "/sudo", ["Cookie" => "sid=$rotated"]))
+        again = cookie_of(res, "sid")
+        @test again != rotated
+        @test Base.get(store, again, nothing).created == born
+        # The handler asked for a day; the middleware's write-back cut it to the deadline's
+        # remainder -- here the one-hour `max_age`, which is sooner.
+        @test Base.get(store, again, nothing).expires <= Dates.now(Dates.UTC) + Dates.Second(3600)
+    end
+
+    @testset "absolute_max_age = nothing switches the cap off (#362)" begin
+        store = MemoryStore()
+        seed!(store, "ancient", Dict{String,Any}("user_id" => 9);
+              created = Dates.now(Dates.UTC) - Dates.Day(365))
+        mw = SessionMiddleware(cookie_name="sid", max_age=3600, absolute_max_age=nothing,
+                               store=store, secure=false).middleware
+        res = mw(req -> (getsession(req)["seen"] = true;
+                         HTTP.Response(200, string(getsession(req)["user_id"]))))(
+            HTTP.Request("GET", "/", ["Cookie" => "sid=ancient"]))
+        @test String(res.body) == "9"
+        @test max_age_of(res) == 3600
+    end
+
+    @testset "absolute_max_age must be positive (#362)" begin
+        @test_throws ArgumentError SessionMiddleware(store=MemoryStore(), absolute_max_age=0)
+        @test_throws ArgumentError SessionMiddleware(store=MemoryStore(), absolute_max_age=-1)
+    end
+
+    @testset "a store that cannot say when a session was created fails closed under a cap (#362)" begin
+        # `Base.get` must return a `SessionPayload`. One that hands back bare data has no creation
+        # instant, and serving it would switch the cap off without a word.
+        struct BareDataStore <: Nitro.Core.Types.AbstractSessionStore{String, Dict{String,Any}} end
+        Base.get(::BareDataStore, ::String, default) = Dict{String,Any}("user_id" => 5)
+
+        reader(mw) = mw(req -> HTTP.Response(200, string(get(getsession(req), "user_id", "none"))))
+        req() = HTTP.Request("GET", "/", ["Cookie" => "sid=any"])
+
+        capped = SessionMiddleware(cookie_name="sid", store=BareDataStore(), secure=false).middleware
+        res = @test_logs (:warn, r"SessionPayload") reader(capped)(req())
+        @test String(res.body) == "none"
+
+        uncapped = SessionMiddleware(cookie_name="sid", store=BareDataStore(), secure=false,
+                                     absolute_max_age=nothing).middleware
+        @test String(reader(uncapped)(req()).body) == "5"
+    end
+
     @testset "store is required — no shared process-global (#171)" begin
         @test_throws UndefKeywordError SessionMiddleware()
         @test_throws UndefKeywordError SessionMiddleware(cookie_name="no_store", max_age=60)

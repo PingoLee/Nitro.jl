@@ -134,6 +134,37 @@ function elevate_handler(req::HTTP.Request)
 end
 ```
 
+## Session Lifetime
+
+A session has two lifetimes, and it ends at whichever comes first:
+
+| Keyword | Default | Measured from | Ends a session that is… |
+|---|---|---|---|
+| `max_age` | `86400` (1 day) | the last write | idle |
+| `absolute_max_age` | `604800` (7 days) | when the session was first stored | old, however active |
+
+`max_age` is a **sliding** lifetime: every write moves the expiry forward, so on its own it never
+ends a session that keeps being used, and a stolen session ID stays valid for as long as someone
+keeps using it. `absolute_max_age` caps that. Once a session is older than the cap, it is treated
+as absent: the visitor gets a fresh session and signs in again.
+
+```julia
+SessionMiddleware(store = store, max_age = 3600, absolute_max_age = 12 * 3600)  # 1 h idle, 12 h total
+SessionMiddleware(store = store, absolute_max_age = nothing)                     # no absolute cap
+```
+
+- **Rotation keeps the clock.** `regenerate_session!` and `rotate_on_auth` move a session to a new
+  ID, so its lifetime is still measured from when it was first created. A login therefore does not
+  buy a fresh week, and neither can an endpoint that rotates without re-checking credentials.
+- **The cap binds every reader.** Each write sets the stored expiry to `max_age` from now or the
+  absolute deadline, whichever is sooner, and the cookie's `Max-Age` too. Readers that skip the
+  middleware — the `Session{T}` extractor, `Auth.session_user_validator` — refuse the session
+  at the deadline through the same expiry check. If you **lower** the cap, a session written under
+  the old one is deleted the next time `SessionMiddleware` loads it.
+- **Why seven days.** OWASP recommends an absolute timeout; Django ships none. A week keeps a
+  regular user signed in across a working week and bounds how long a stolen ID works. Shorten it
+  for sensitive apps.
+
 ## Store Options
 
 ### In-Memory Store
@@ -169,6 +200,11 @@ The default `db_key` is `"db"`. Use a different one when your session database u
 PormG connection, for example `db_key="sessions"` — the key selects the connection the table is
 created on *and* the one every session query runs against.
 
+`pormg_nitro_session()` also brings an existing table up to date on boot. A `nitro_session` table
+created before `absolute_max_age` existed gains its `created_at` column. Rows already in it are
+stamped with the upgrade instant, so live sessions get a full lifetime from the upgrade rather
+than ending at once.
+
 !!! note "Sessions inside a PormG transaction"
     The store's `nitro_session` model is bound to `db_key`, so session reads and writes work
     inside a `PormG.run_in_transaction(db_key)` block. A session call inside a transaction
@@ -194,6 +230,11 @@ the request *loaded* with `update_session!`, and `regenerate_session!` moves one
 `rotate_session!`. Each must act only if the session still exists and has not expired, returning
 `false` otherwise, as one atomic step. Implementing the six methods above is enough for custom
 backends; only `cleanup_expired_sessions!` is optional.
+
+`Base.get` returns a `SessionPayload(data, expires, created)`. `created` is the instant the
+session was first stored: `set_session!` sets it, while `update_session!` keeps it and
+`rotate_session!` carries it to the new ID. That instant is what `absolute_max_age` measures from,
+so a store that reset it on every write would let sessions live forever.
 
 `cleanup_expired_sessions!` is called from a background janitor owned by
 `SessionMiddleware`'s lifecycle hooks — it never runs on the request path. Use
@@ -235,4 +276,5 @@ If you manage sessions manually without `SessionMiddleware`, delete the old serv
 - Keep `httponly=true` unless JavaScript must read the cookie.
 - Prefer `samesite="Lax"` or `"Strict"` for browser-authenticated apps.
 - Rotate the session ID on login, logout, and privilege changes.
+- Keep an absolute lifetime (`absolute_max_age`, 7 days by default); shorten it for sensitive apps.
 - Use a persistent store such as `pormg_nitro_session()` for production deployments.

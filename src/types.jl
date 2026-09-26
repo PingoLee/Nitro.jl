@@ -38,10 +38,10 @@ and `V` the payload type — the middleware pins both to `AbstractSessionStore{S
 
 | Method | Contract |
 |---|---|
-| `Base.get(store, session_id, default)` | The stored `SessionPayload`, or `default` when absent |
-| `set_session!(store, session_id, data; ttl::Int)` | Persist `data` under a fixed-point expiry, returns `data` |
-| `update_session!(store, session_id, data; ttl::Int)` | Overwrite an **existing, unexpired** session; `false` and no write otherwise |
-| `rotate_session!(store, old_id, new_id, data; ttl::Int)` | Move an **existing, unexpired** session to `new_id`; `false` and no write otherwise |
+| `Base.get(store, session_id, default)` | The stored [`SessionPayload`](@ref), or `default` when absent |
+| `set_session!(store, session_id, data; ttl::Int)` | Persist `data` under a fixed-point expiry, **created now**; returns `data` |
+| `update_session!(store, session_id, data; ttl::Int)` | Overwrite an **existing, unexpired** session, **keeping its `created`**; `false` and no write otherwise |
+| `rotate_session!(store, old_id, new_id, data; ttl::Int)` | Move an **existing, unexpired** session to `new_id`, **carrying its `created`**; `false` and no write otherwise |
 | `delete_session!(store, session_id)` | Remove one session |
 
 `Base.get` is easy to miss and is genuinely mandatory: both the generic `get_session` and the
@@ -204,6 +204,9 @@ bring the session back: the stolen id survived the logout meant to kill it, and 
 logged back in (#318). With update-only semantics that write is dropped, and the middleware does
 not re-set the cookie. This is Django's `UpdateError` → `SessionInterrupted`.
 
+The session keeps its `created` instant: an update slides the expiry, never the absolute lifetime
+(#362).
+
 Required. Implement the check and the write as one atomic step — see
 [`AbstractSessionStore`](@ref).
 """
@@ -228,7 +231,12 @@ rotation path instead.
 
 Required. The existence check, the write and the removal must be **one** atomic step, as for
 `update_session!`: one lock hold in memory; in SQL, one statement or a sequence whose single
-guarded `DELETE … WHERE key = old AND expires > now` decides by its row count. Return `false` only
+guarded `DELETE … WHERE key = old AND expires > now` decides by its row count.
+
+The new id keeps the old session's `created` instant (#362): rotation renames a session, it does
+not start a new one, so the absolute lifetime `SessionMiddleware` enforces bounds the whole chain of
+ids. Restarting the clock would let any endpoint that rotates keep a stolen session alive for good.
+Return `false` only
 when the old session is gone or expired. A store failure must **throw**; `false` tells the caller
 the session was logged out, and it drops the rotation and the write.
 """
@@ -445,10 +453,22 @@ struct Session{T} <: Extractor{T}
     Session{T}(name::String, payload::Nullable{T}=nothing, validate::Union{Function, Nothing}=nothing) where T = new{T}(name, payload, validate, T)
 end
 
-# Represents a session with metadata (like discovery/expiry time)
+"""
+    SessionPayload(data, expires::DateTime, created::DateTime)
+
+A stored session as a store's `Base.get` hands it back: its `data`, its sliding `expires` (moved
+forward by every write), and the fixed instant it was `created` (#362). All three are UTC.
+
+`created` is set once, when the session is first stored, and survives every later
+`update_session!` and `rotate_session!`. It is what `SessionMiddleware(absolute_max_age = …)`
+measures a session's absolute lifetime from, so a store that reset it on each write would let a
+session live forever. It is required, with no two-argument form: a store that could not report it
+would silently switch the cap off.
+"""
 struct SessionPayload{T}
     data::T
     expires::DateTime
+    created::DateTime
 end
 
 """
@@ -472,7 +492,8 @@ otherwise be staged.
 Implementing [`AbstractSessionStore`](@ref)? Call this rather than comparing `expires` yourself.
 
 ```julia
-payload = SessionPayload(Dict{String,Any}("user_id" => 7), Dates.now(Dates.UTC) + Dates.Hour(1))
+now = Dates.now(Dates.UTC)
+payload = SessionPayload(Dict{String,Any}("user_id" => 7), now + Dates.Hour(1), now)
 is_expired(payload)                            # false
 is_expired(payload, payload.expires)           # true -- the boundary is expired
 ```
@@ -584,7 +605,8 @@ end
 function set_session!(store::MemoryStore{K, V}, key::K, value::V; ttl::Int = 3600) where {K, V}
     stored = _copy_session_value(value)
     full = lock(store.lock) do
-        store.data[key] = SessionPayload(stored, Dates.now(Dates.UTC) + Dates.Second(ttl))
+        now = Dates.now(Dates.UTC)
+        store.data[key] = SessionPayload(stored, now + Dates.Second(ttl), now)
         return length(store.data) >= store.max_sessions
     end
     full && _warn_memorystore_full(store)
@@ -598,7 +620,9 @@ function update_session!(store::MemoryStore{K, V}, key::K, value::V; ttl::Int = 
     return lock(store.lock) do
         payload = Base.get(store.data, key, nothing)
         (payload === nothing || is_expired(payload)) && return false
-        store.data[key] = SessionPayload(stored, Dates.now(Dates.UTC) + Dates.Second(ttl))
+        # `created` is kept: the expiry slides, the absolute lifetime does not (#362).
+        store.data[key] = SessionPayload(stored, Dates.now(Dates.UTC) + Dates.Second(ttl),
+                                         payload.created)
         return true
     end
 end
@@ -617,7 +641,9 @@ function rotate_session!(store::MemoryStore{K, V}, old_key::K, new_key::K, value
         payload = Base.get(store.data, old_key, nothing)
         (payload === nothing || is_expired(payload)) && return false
         delete!(store.data, old_key)
-        store.data[new_key] = SessionPayload(stored, Dates.now(Dates.UTC) + Dates.Second(ttl))
+        # Carries `created`: a rotation renames the session, it does not start a new one (#362).
+        store.data[new_key] = SessionPayload(stored, Dates.now(Dates.UTC) + Dates.Second(ttl),
+                                             payload.created)
         return true
     end
 end

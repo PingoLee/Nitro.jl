@@ -169,6 +169,12 @@ logged-out session into a fresh ID. In SQL without a key update, a guarded
 `DELETE … WHERE key = old AND expires > now` whose row count decides, followed by the `INSERT`,
 is enough.
 
+The `SessionPayload` that `Base.get` returns carries three things: `data`, `expires`, and
+`created`, the instant the session was first stored. `set_session!` sets `created`,
+`update_session!` keeps it, and `rotate_session!` carries it to the new ID.
+`SessionMiddleware(absolute_max_age = …)` measures a session's absolute lifetime from it, so a
+store that reset it on every write would let sessions live forever.
+
 A sixth is **optional**:
 
 ```julia
