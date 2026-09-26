@@ -5,7 +5,7 @@ using Sockets
 # `getpeerip` is not called here — this middleware writes `:peer_ip` and `getpeerip` reads it —
 # but importing it lets the `@ref` cross-references in the docstrings below resolve.
 using ...Core: getip, setip!, getpeerip, header_name_isequal
-using ...Types: Nullable
+using ...Types: Nullable, REQUEST_FORWARDED_PROTO_KEY
 using ...Errors: is_unrecoverable
 
 export ExtractIP, extract_ip
@@ -18,6 +18,13 @@ const _HEADER_NAMES = (
     x_real_ip        = "X-Real-IP",
     cf_connecting_ip = "CF-Connecting-IP",
     true_client_ip   = "True-Client-IP",
+)
+
+# The protocol headers Nitro knows how to read (#374) — closed for the same reason. The RFC 7239
+# `Forwarded` header is deliberately absent: it is not parsed for the address either, and one
+# half of it without the other would be a second, inconsistent reading of the same header.
+const _PROTO_HEADERS = (
+    x_forwarded_proto = "X-Forwarded-Proto",
 )
 
 # A trusted-proxy entry, normalized to a family-tagged network/mask pair. IPv4 lives in the low
@@ -34,15 +41,18 @@ struct _TrustPolicy
     header  :: Nullable{String}    # canonical header name; `nothing` when `:none`
     is_list :: Bool                # true only for X-Forwarded-For, which carries a chain
     proxies :: Vector{_IPPrefix}   # empty exactly when no trust is configured
+    proto   :: Nullable{String}    # canonical protocol header name; `nothing` when `:none`
 end
 
-const _NO_TRUST = _TrustPolicy(nothing, false, _IPPrefix[])
+const _NO_TRUST = _TrustPolicy(nothing, false, _IPPrefix[], nothing)
 
 """
-    ExtractIP(; forwarded_header::Symbol = :none, trusted_proxies = nothing)
+    ExtractIP(; forwarded_header::Symbol = :none, forwarded_proto::Symbol = :none, trusted_proxies = nothing)
 
 Middleware that resolves the client IP address and assigns it to `getip(req)`, preserving the
-socket peer address under [`getpeerip`](@ref).
+socket peer address under [`getpeerip`](@ref). With `forwarded_proto` it also records the scheme a
+trusted proxy reports, which is what lets a WebSocket upgrade pass its Origin check behind a proxy
+that terminates TLS (see *Behind a TLS-terminating proxy* below).
 
 **Security:** client-supplied forwarding headers are trivially spoofable. Anything that keys on
 the client IP for a security decision — rate limiting, audit logging, allow/deny lists — is only
@@ -51,20 +61,37 @@ headers by default** and uses the socket peer address, which Nitro sets from the
 connection.
 
 To read a forwarding header you must declare **both** where the trust boundary is
-(`trusted_proxies`) and **which single header** your proxy writes (`forwarded_header`). Setting
-either alone is an `ArgumentError` — a trust boundary with no header reads nothing, and a header
-with no boundary honors it from any client. Exactly one header is ever read; every other
-forwarding header is ignored, so a proxy that forgets to strip `CF-Connecting-IP` cannot be used
-to bypass your `X-Forwarded-For` configuration.
+(`trusted_proxies`) and **which headers** your proxy writes (`forwarded_header` for the address,
+`forwarded_proto` for the scheme). A boundary with neither header named, and a header with no
+boundary, are each an `ArgumentError` — the first reads nothing, and the second honors the header
+from any client. Exactly one address header is ever read; every other forwarding header is
+ignored, so a proxy that forgets to strip `CF-Connecting-IP` cannot be used to bypass your
+`X-Forwarded-For` configuration.
 
 # Keyword Arguments
-- `forwarded_header::Symbol`: the one header your proxy writes. One of `:none` (default, no
-  header is read), `:x_forwarded_for`, `:x_real_ip`, `:cf_connecting_ip`, `:true_client_ip`.
-- `trusted_proxies`: the proxies whose forwarding header may be believed. Entries are either an
-  `IPAddr` (`ip"127.0.0.1"`) or a CIDR string (`"10.244.0.0/16"`, `"2400:cb00::/32"`). The
-  header is read **only** when the nearest hop the chain has established matches one of them:
-  the socket peer, unless an earlier extractor already resolved a client (see *More than one
+- `forwarded_header::Symbol`: the one address header your proxy writes. One of `:none` (default,
+  no header is read), `:x_forwarded_for`, `:x_real_ip`, `:cf_connecting_ip`, `:true_client_ip`.
+- `forwarded_proto::Symbol`: the header your proxy writes the client's scheme into. One of
+  `:none` (default) or `:x_forwarded_proto`. The RFC 7239 `Forwarded` header is not supported,
+  for the scheme or the address.
+- `trusted_proxies`: the proxies whose forwarding headers may be believed. Entries are either an
+  `IPAddr` (`ip"127.0.0.1"`) or a CIDR string (`"10.244.0.0/16"`, `"2400:cb00::/32"`). A header
+  is read **only** when the nearest hop the chain has established matches one of them: the
+  socket peer, unless an earlier extractor already resolved a client (see *More than one
   extractor in a chain* below).
+
+# Behind a TLS-terminating proxy
+A browser on `https://app.example.com` opens its WebSocket with `Origin: https://app.example.com`,
+but the proxy reaches Nitro over plain TCP, so the upgrade's same-origin check sees a secure origin
+on an insecure connection and refuses it with `403`. `forwarded_proto = :x_forwarded_proto` tells
+it which scheme the client really used: from a trusted proxy, `https` (or `wss`) makes the check
+compare against `https://<Host>`, `http` (or `ws`) against `http://<Host>`. The leftmost value
+counts when the header carries a list, and a value that is none of those four is ignored.
+
+The scheme is not a way around the check. It only chooses which scheme of *your own host* counts
+as same-origin, so it can never admit a page from another site — and a browser page cannot set the
+header on a WebSocket handshake in the first place. **Do not strip `Origin` at the proxy instead**:
+that turns the check off, and with it the only protection against cross-site WebSocket hijacking.
 
 # Your proxy must *set*, not forward, the header
 `X-Real-IP`, `CF-Connecting-IP` and `True-Client-IP` are single-valued: Nitro believes whatever
@@ -116,14 +143,19 @@ ExtractIP(forwarded_header = :x_forwarded_for, trusted_proxies = ["10.244.0.0/16
 
 # Cloudflare in front of a local nginx that sets X-Real-IP from its own peer
 ExtractIP(forwarded_header = :x_real_ip, trusted_proxies = [ip"127.0.0.1"])
+
+# A local nginx terminating TLS, with WebSocket routes behind it
+ExtractIP(forwarded_header = :x_forwarded_for, forwarded_proto = :x_forwarded_proto,
+          trusted_proxies  = [ip"127.0.0.1"])
 ```
 """
 function ExtractIP(;
     forwarded_header :: Symbol                   = :none,
+    forwarded_proto  :: Symbol                   = :none,
     trusted_proxies  :: Nullable{AbstractVector} = nothing,
     trust_forwarded                              = nothing)
 
-    policy = _trust_policy(forwarded_header, trusted_proxies, trust_forwarded)
+    policy = _trust_policy(forwarded_header, trusted_proxies, trust_forwarded, forwarded_proto)
     function(handle::Function)
         function(req::HTTP.Request)
             # The nearest hop the chain has established: the socket peer for the first
@@ -136,6 +168,9 @@ function ExtractIP(;
             # header. A global `ExtractIP` plus a `RateLimiter` at its default
             # `auto_extract_ip = true` is exactly that chain.
             peer === nothing || haskey(req.context, :peer_ip) || (req.context[:peer_ip] = peer)
+            # Judged against the same hop as the address header, and BEFORE `_resolve` moves
+            # `getip` on: the proxy that wrote the scheme is the one this extractor trusts.
+            policy.proto === nothing || _record_forwarded_proto!(req, policy, peer)
             resolved = _resolve(req, policy, peer)
             resolved === nothing || setip!(req, resolved)
             return handle(req)
@@ -203,6 +238,7 @@ end
 function _resolve(req::HTTP.Request, policy::_TrustPolicy, peer)::Nullable{IPAddr}
     peer isa IPAddr || return nothing
     isempty(policy.proxies) && return peer          # no trust configured — never read a header
+    policy.header === nothing && return peer        # trust for the scheme only (#374)
 
     pv6, ph = _norm(peer)
     _is_trusted(policy, pv6, ph) || return peer     # direct client — headers are ignored
@@ -235,6 +271,34 @@ function _walk_chain(raw::AbstractString, policy::_TrustPolicy, peer::IPAddr)::I
         _is_trusted(policy, v6, h) || return _canonical(ip)
     end
     return peer                                     # every hop was a trusted proxy
+end
+
+# Record the scheme a trusted proxy reports (#374), for the WebSocket upgrade's Origin check.
+# Only ever WRITES the key: an extractor that does not trust its hop leaves an earlier one's
+# answer alone, exactly as `_resolve` leaves `getip` alone.
+function _record_forwarded_proto!(req::HTTP.Request, policy::_TrustPolicy, peer)::Nothing
+    peer isa IPAddr || return nothing
+    pv6, ph = _norm(peer)
+    _is_trusted(policy, pv6, ph) || return nothing
+    raw = _header_value(req, policy.proto::String, true)
+    raw === nothing && return nothing
+    scheme = _forwarded_scheme(raw)
+    scheme === nothing || (req.context[REQUEST_FORWARDED_PROTO_KEY] = scheme)
+    return nothing
+end
+
+# The scheme the client used at the edge: the LEFTMOST value, which is how Django's
+# `SECURE_PROXY_SSL_HEADER` and Express's `trust proxy` read a list. Traefik writes `ws`/`wss` on
+# upgrade requests, so those fold onto their HTTP schemes; anything else is not a scheme this
+# server can be reached over and is ignored rather than guessed at. Spoofing the leftmost value
+# buys nothing a browser page could use: it only chooses which scheme of this server's own host
+# is same-origin, and a page cannot set the header on a WebSocket handshake at all.
+function _forwarded_scheme(raw::AbstractString)::Nullable{String}
+    comma = findfirst(==(','), raw)
+    token = lowercase(strip(comma === nothing ? raw : raw[firstindex(raw):prevind(raw, comma)]))
+    (token == "https" || token == "wss") && return "https"
+    (token == "http"  || token == "ws")  && return "http"
+    return nothing
 end
 
 # Resolve a header to a single value, in one pass.
@@ -340,7 +404,8 @@ _full_mask(v6::Bool) = v6 ? typemax(UInt128) : UInt128(typemax(UInt32))
 
 # ── Construction-time validation ───────────────────────────────────────────────────────────
 
-function _trust_policy(forwarded_header::Symbol, trusted_proxies, trust_forwarded)::_TrustPolicy
+function _trust_policy(forwarded_header::Symbol, trusted_proxies, trust_forwarded,
+                       forwarded_proto::Symbol = :none)::_TrustPolicy
     # Security: `trust_forwarded=true` honored forwarding headers from ANY peer, with the header
     # guessed from a fixed priority list — which let a direct client pick its own IP. It has no
     # replacement mode; naming the proxies is now the only way to enable header parsing.
@@ -366,18 +431,30 @@ function _trust_policy(forwarded_header::Symbol, trusted_proxies, trust_forwarde
         ))
     end
 
+    # V1b — the same closed-set rule for the protocol header (#374).
+    if forwarded_proto !== :none && !haskey(_PROTO_HEADERS, forwarded_proto)
+        throw(ArgumentError(
+            "ExtractIP misconfiguration: forwarded_proto=:$(forwarded_proto) is not a " *
+            "recognized protocol header. Valid values are :none and :x_forwarded_proto. The " *
+            "RFC 7239 `Forwarded` header is not supported yet, for the scheme or the address — " *
+            "configure your proxy to send X-Forwarded-Proto."
+        ))
+    end
+
     has_proxies = trusted_proxies !== nothing
     has_header  = forwarded_header !== :none
+    has_proto   = forwarded_proto !== :none
 
     # V2 — a trust boundary with no header named reads nothing at all.
-    if has_proxies && !has_header
+    if has_proxies && !has_header && !has_proto
         throw(ArgumentError(
             "ExtractIP misconfiguration: trusted_proxies cannot be combined with " *
             "forwarded_header=:none. Trusting a proxy without saying WHICH header it writes " *
             "means no header is ever read, so every client behind the proxy collapses onto the " *
             "proxy's own address and shares one rate-limit bucket while the setting looks " *
             "active. Set forwarded_header to the single header your proxy writes, e.g. " *
-            "forwarded_header=:x_forwarded_for."
+            "forwarded_header=:x_forwarded_for (or, on `ExtractIP`, set " *
+            "forwarded_proto=:x_forwarded_proto if the proxy's scheme is all you need)."
         ))
     end
 
@@ -389,6 +466,17 @@ function _trust_policy(forwarded_header::Symbol, trusted_proxies, trust_forwarde
             "without trusted_proxies. Forwarding headers are set by the client on a direct " *
             "connection, so honoring one from any peer hands the client control of the IP used " *
             "for rate limiting, audit logs and allow/deny lists. List the addresses or CIDR " *
+            "ranges of your proxies, e.g. trusted_proxies=[ip\"127.0.0.1\"]."
+        ))
+    end
+
+    # V3b — the same rule for the scheme: a direct client writes whatever it likes.
+    if has_proto && !has_proxies
+        throw(ArgumentError(
+            "ExtractIP misconfiguration: forwarded_proto=:$(forwarded_proto) cannot be used " *
+            "without trusted_proxies. A client connecting directly can send X-Forwarded-Proto " *
+            "with any value, so honoring it from any peer would let the client choose the " *
+            "scheme the WebSocket Origin check compares against. List the addresses or CIDR " *
             "ranges of your proxies, e.g. trusted_proxies=[ip\"127.0.0.1\"]."
         ))
     end
@@ -409,7 +497,10 @@ function _trust_policy(forwarded_header::Symbol, trusted_proxies, trust_forwarde
     for (i, entry) in enumerate(trusted_proxies)
         prefixes[i] = _parse_prefix(entry)
     end
-    return _TrustPolicy(_HEADER_NAMES[forwarded_header], forwarded_header === :x_forwarded_for, prefixes)
+    # A scheme-only policy has no address header: `_resolve` returns the peer for it.
+    header = has_header ? _HEADER_NAMES[forwarded_header] : nothing
+    proto  = has_proto  ? _PROTO_HEADERS[forwarded_proto] : nothing
+    return _TrustPolicy(header, forwarded_header === :x_forwarded_for, prefixes, proto)
 end
 
 function _parse_prefix(entry)::_IPPrefix

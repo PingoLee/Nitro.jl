@@ -1461,6 +1461,16 @@ end
 const ROUTE_RESOLUTION_KEY = :__nitro_route_resolution
 
 """
+    REQUEST_FORWARDED_PROTO_KEY
+
+`req.context` key carrying the request scheme (`"http"` or `"https"`) a **trusted** proxy reported
+in `X-Forwarded-Proto` (#374). Written only by `ExtractIP(forwarded_proto = …)` for a hop that
+matches its `trusted_proxies`, and read by the WebSocket upgrade's Origin check. Internal — absent
+means "no trusted proxy said", and the transport's own scheme applies.
+"""
+const REQUEST_FORWARDED_PROTO_KEY = :__nitro_forwarded_proto
+
+"""
     RouteResolution(router, method, target, handler, route, params, mw_method, table, source)
 
 One request's route lookup, handed from `compose` (src/routerhof.jl) to the innermost layer of

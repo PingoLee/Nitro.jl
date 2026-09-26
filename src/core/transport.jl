@@ -129,6 +129,13 @@ function _http_stream_request(stream::HTTP.Stream, max_body_bytes::Int64)::Union
     )
 end
 
+# HTTP.jl's own WebSocket Origin policy — the browser same-origin rule over (scheme, host, port) —
+# with the server's scheme supplied by the caller instead of read off the transport (#374). Private
+# upstream (not in `HTTP.WebSockets`' `public` list), and wrapped rather than reimplemented so Nitro
+# inherits HTTP's Host/Origin/IPv6 parsing instead of keeping a second copy of a security check.
+_http_origin_allowed_default(req::HTTP.Request, server_secure::Bool)::Bool =
+    HTTP.WebSockets._origin_allowed_default(req, server_secure)
+
 # True once a handler has begun writing the response on the raw stream (e.g. a STREAM
 # route that called `startwrite`, or a WebSocket upgrade). Used to decide whether the
 # framework still needs to emit a serialized `Response`.
@@ -514,6 +521,118 @@ function _reject_over_capacity!(stream::HTTP.Stream, limit::Int64)
     # The same `100-continue` rule as the 413's declared-length reject: a client still waiting for
     # permission to send must not be sent a `100 Continue` by the swallow.
     _send_rejection!(stream, resp, !_expects_continue(stream.message))
+end
+
+# ── The WebSocket upgrade (#374) ─────────────────────────────────────────────────────────────────
+#
+# A route whose handler takes a `WebSocket` reaches `_upgrade_websocket!` from `select_handler`
+# (src/handlers.jl), inside the middleware chain. HTTP.jl's `upgrade` answers the handshake and
+# runs the handler on the socket; Nitro supplies the one input HTTP.jl cannot know — which scheme
+# the CLIENT used.
+#
+# HTTP's Origin check is the browser same-origin rule, with the server's scheme read off its own
+# transport (`conn isa TLS.Conn`). Behind a proxy that terminates TLS that is the wrong half of the
+# connection: the browser on `https://app` sends `Origin: https://app`, the proxy reaches Nitro over
+# plain TCP, and every upgrade was refused 403 — with the obvious workaround, stripping `Origin` at
+# the proxy, switching off the only defense against cross-site WebSocket hijacking. So a scheme
+# reported by a TRUSTED proxy (`ExtractIP(forwarded_proto = …)`, which alone writes
+# `REQUEST_FORWARDED_PROTO_KEY`) replaces the transport's. With no such report the transport decides,
+# exactly as HTTP.jl would, and the comparison itself stays HTTP.jl's.
+#
+# A refused handshake used to reach `handlerequest` as an application error: an `@error` with a
+# full backtrace, before any authentication, per request — and a 500 in the access log for a
+# response the client received as 403. It is now logged like the 413 and the capacity 503.
+
+# What the `check_origin` and handler closures record. A struct, because a closure that reassigns
+# a captured local boxes it.
+mutable struct _UpgradeAttempt
+    entered        :: Bool   # the 101 went out and the handler started
+    origin_refused :: Bool   # the Origin check said no
+    secure         :: Bool   # the scheme the Origin was compared against was https
+end
+
+# The scheme the Origin is compared against, as HTTP.jl's `server_secure`. Called from inside
+# `check_origin`, never before `upgrade`: HTTP checks first that this is an HTTP/1.1 server stream,
+# and on an h2 stream `tracked` is `nothing`, so reading it early would pre-empt HTTP's own 1011
+# with an unrelated error.
+function _ws_secure(req::HTTP.Request, stream::HTTP.Stream)::Bool
+    forwarded = get(req.context, Types.REQUEST_FORWARDED_PROTO_KEY, nothing)
+    forwarded === nothing || return forwarded == "https"
+    return getfield(getfield(stream, :tracked), :conn) isa HTTP.TLS.Conn
+end
+
+# The status of a REFUSED handshake, or `nothing` for anything else, which the caller rethrows.
+#
+# HTTP writes a refusal straight to the connection — 403 for the Origin, 400 for a malformed
+# handshake, the only two statuses besides 101 that `_upgrade_response` produces — and then
+# throws `WebSocketError` with close code 1002. The code alone does not identify it: a protocol
+# error from the peer mid-session is also 1002. Whether the handler was entered is what does.
+function _ws_refusal_status(err, entered::Bool, origin_refused::Bool)::Nullable{Int}
+    entered && return nothing
+    err isa HTTP.WebSockets.WebSocketError || return nothing
+    err.message.code == 1002 || return nothing
+    return origin_refused ? 403 : 400
+end
+
+# Reachable before any authentication, so — like the 413 and the capacity 503 — one first-sighting
+# warning plus debug detail, never a per-request line a client can use to fill the log, and no
+# backtrace: nothing failed. One call site per status because `maxlog` counts per call site, and a
+# run of malformed handshakes must not spend the one warning that points at the proxy
+# configuration. That warning cannot claim a misconfiguration: a genuine cross-site page is
+# refused exactly the same way.
+function _log_ws_refusal(stream::HTTP.Stream, attempt::_UpgradeAttempt, status::Int)
+    if status == 403
+        @warn("Refusing WebSocket upgrades whose Origin is not this server's own origin with 403 " *
+              "(detail at debug level). Behind a proxy that terminates TLS, configure " *
+              "`ExtractIP(forwarded_proto = :x_forwarded_proto, trusted_proxies = …)` so the " *
+              "check compares against the scheme the client used.", maxlog = 1)
+    else
+        @warn("Refusing malformed WebSocket handshakes with 400 (detail at debug level)", maxlog = 1)
+    end
+    @debug("WebSocket upgrade refused",
+           status = status,
+           origin = Util._log_escape(HTTP.header(stream.message, "Origin", "")),
+           host   = Util._log_escape(HTTP.header(stream.message, "Host", "")),
+           scheme = status == 403 ? (attempt.secure ? "https" : "http") : nothing)
+    return nothing
+end
+
+"""
+    _upgrade_websocket!(f, req) -> Union{Bool, Nothing, HTTP.Response}
+
+Upgrade `req` to a WebSocket and run `f(ws)` on it, with a proxy-aware Origin check (#374). A
+request that is not an upgrade returns `false`, as the handler always has. A refused handshake
+returns the `HTTP.Response` whose status HTTP already sent, so the access log records it. Errors
+raised by `f` rethrow as before.
+"""
+function _upgrade_websocket!(f::Function, req::HTTP.Request)
+    # FIRST, before the stream is looked up: a plain GET to a WebSocket route — and an in-process
+    # `internalrequest`, which has no stream — must answer exactly as it always has.
+    HTTP.WebSockets.isupgrade(req) || return false
+    stream = req.context[:stream]::HTTP.Stream
+    attempt = _UpgradeAttempt(false, false, false)
+    check_origin = function (head::HTTP.Request)
+        attempt.secure = _ws_secure(req, stream)
+        allowed = _http_origin_allowed_default(head, attempt.secure)
+        allowed || (attempt.origin_refused = true)
+        return allowed
+    end
+    try
+        HTTP.WebSockets.upgrade(stream; check_origin = check_origin) do ws
+            attempt.entered = true
+            f(ws)
+        end
+    catch err
+        # Deliberately not the `is_unrecoverable` predicate (src/errors.jl): this does not swallow
+        # a class of errors, it recognizes one refusal and rethrows everything else untouched.
+        status = _ws_refusal_status(err, attempt.entered, attempt.origin_refused)
+        status === nothing && rethrow()
+        _log_ws_refusal(stream, attempt, status)
+        # Never written — HTTP already sent it, and `stream_handler` writes nothing once the
+        # response has started — but every middleware on the way out now sees the real status.
+        return HTTP.Response(status)
+    end
+    return nothing
 end
 
 # Whether a response body is a streaming cursor (an SSE stream, a streamed file) rather than a

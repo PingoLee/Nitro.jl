@@ -188,7 +188,9 @@ real response and the chain applies exactly as it does to JSON.
 
 WebSockets are the other raw shape — `path("/ws", handler, method = "WEBSOCKET")`, where the handler
 takes a `WebSocket`. SSE is one-directional and rides plain HTTP; prefer it when the client only
-needs to *listen*.
+needs to *listen*. Every upgrade passes a same-origin check on the browser's `Origin`; behind a
+proxy that terminates TLS that check needs to be told the client's scheme — see
+[WebSocket upgrades and the Origin check](@ref).
 
 ## Streaming a large file
 

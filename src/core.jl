@@ -46,6 +46,9 @@ function getip end
 function setip! end
 function getpeerip end
 function getcontext end
+# Not an accessor, and not exported: the WebSocket branch of `select_handler` (src/handlers.jl)
+# calls it, and its body lives in core/transport.jl with the rest of the stream handling (#374).
+function _upgrade_websocket! end
 
 include("handlers.jl");     @reexport using .Handlers
 include("routerhof.jl");    @reexport using .RouterHOF

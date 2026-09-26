@@ -408,6 +408,64 @@ end
     # Mixed IPAddr / CIDR-string literals are accepted.
     @test ExtractIP(forwarded_header = :x_real_ip,
                     trusted_proxies = [PROXY, "10.244.0.0/16"]) isa Function
+
+    # #374 — the scheme header follows the same rules as the address header.
+    # A scheme header with no boundary is honored from any client.
+    @test_throws ArgumentError ExtractIP(forwarded_proto = :x_forwarded_proto)
+    # A typo, and RFC 7239 `Forwarded`, which is not parsed for the address either.
+    @test_throws ArgumentError ExtractIP(forwarded_proto = :x_forwaded_proto, trusted_proxies = [PROXY])
+    @test_throws "Forwarded" ExtractIP(forwarded_proto = :forwarded, trusted_proxies = [PROXY])
+    # A boundary with only the scheme named is a complete configuration: V2 no longer applies.
+    @test ExtractIP(forwarded_proto = :x_forwarded_proto, trusted_proxies = [PROXY]) isa Function
+    @test ExtractIP(forwarded_header = :x_forwarded_for, forwarded_proto = :x_forwarded_proto,
+                    trusted_proxies = [PROXY]) isa Function
+end
+
+@testset "forwarded_proto records a trusted proxy's scheme (#374)" begin
+    KEY = Nitro.Core.Types.REQUEST_FORWARDED_PROTO_KEY
+    seen = Ref{HTTP.Request}()
+    handler = req -> (seen[] = req; HTTP.Response(200))
+    scheme(req) = get(req.context, KEY, nothing)
+    proto_only = ExtractIP(forwarded_proto = :x_forwarded_proto, trusted_proxies = [PROXY])
+    through(mw, headers, peer = PROXY) = (mw(handler)(create_request(headers, peer)); seen[])
+    via_proxy(value) = scheme(through(proto_only, ["X-Forwarded-Proto" => value]))
+
+    @test via_proxy("https") == "https"
+    @test via_proxy("HTTPS") == "https"
+    @test via_proxy("http") == "http"
+    # A list: the leftmost value is the scheme the client used at the edge.
+    @test via_proxy(" https , http") == "https"
+    @test scheme(through(proto_only, ["X-Forwarded-Proto" => "https", "X-Other" => "1",
+                                      "X-Forwarded-Proto" => "http"])) == "https"
+    # Traefik writes the WebSocket schemes on an upgrade.
+    @test via_proxy("wss") == "https"
+    @test via_proxy("ws") == "http"
+    # Not a scheme this server is reachable over: ignored, never guessed.
+    @test via_proxy("ftp") === nothing
+    @test via_proxy("") === nothing
+    @test scheme(through(proto_only, Pair{String,String}[])) === nothing
+
+    # A client connecting directly is not the trusted proxy: its header is ignored.
+    @test scheme(through(proto_only, ["X-Forwarded-Proto" => "https"], CLIENT)) === nothing
+    # Without `forwarded_proto` the header is never read, trusted peer or not.
+    addr_only = ExtractIP(forwarded_header = :x_forwarded_for, trusted_proxies = [PROXY])
+    @test scheme(through(addr_only, ["X-Forwarded-Proto" => "https"])) === nothing
+
+    # Scheme-only trust leaves the address alone. Before the fix to `_trust_policy`/`_resolve`
+    # this configuration could not be built, and a trusted request would have thrown.
+    r = through(proto_only, ["X-Forwarded-Proto" => "https", "X-Forwarded-For" => "$SPOOF"])
+    @test getip(r) == PROXY
+    @test getpeerip(r) == PROXY
+    # Both headers named: both apply.
+    both = ExtractIP(forwarded_header = :x_forwarded_for, forwarded_proto = :x_forwarded_proto,
+                     trusted_proxies = [PROXY])
+    r = through(both, ["X-Forwarded-For" => "$CLIENT", "X-Forwarded-Proto" => "https"])
+    @test getip(r) == CLIENT
+    @test scheme(r) == "https"
+
+    # A later extractor that does not trust its hop never clears an earlier one's answer.
+    proto_only(ExtractIP()(handler))(create_request(["X-Forwarded-Proto" => "https"], PROXY))
+    @test scheme(seen[]) == "https"
 end
 
 end
