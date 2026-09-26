@@ -24,8 +24,9 @@ The browser was logged back in, and a stolen `S` survived the logout meant to ki
 `SessionMiddleware` now writes a session the request **loaded** with the new
 `update_session!(store, id, data; ttl) -> Bool`. It writes only if an unexpired row still exists.
 When it returns `false` the write is dropped and the cookie is not re-set. That is Django's
-`UpdateError` → `SessionInterrupted`. An id minted during the request, for a new visitor or by
-`regenerate_session!`, is still written with `set_session!`.
+`UpdateError` → `SessionInterrupted`. A new visitor's session is still written with
+`set_session!`. A loaded session that the request rotates is moved by `rotate_session!` (#361)
+and then written with `update_session!`, like any other loaded session.
 
 This closes the write-back path only. A request that **rotates** its session after a concurrent
 logout (`regenerate_session!`, or `rotate_on_auth` on a user switch) is closed by a second required
@@ -73,10 +74,20 @@ end
 # ✓ after — also update_session!: write only if the key still exists
 import Nitro.Core.Types: update_session!
 
+# A Lua script runs atomically in Redis: nothing can run between the check and the write. The
+# session is a hash and only its `data` field is written, so every other field -- such as the
+# `created` instant #362 requires -- survives the update.
+const UPDATE_SESSION = """
+if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+redis.call('HSET', KEYS[1], 'data', ARGV[1])
+redis.call('EXPIRE', KEYS[1], ARGV[2])
+return 1
+"""
+
 function update_session!(s::RedisSessionStore, id::String, data::Dict{String,Any}; ttl::Int = 3600)
-    # SET … XX writes only when the key exists, atomically; the EX gives the fresh expiry
-    reply = execute(s.conn, ["SET", "session:" * id, JSON.json(data), "EX", string(ttl), "XX"])
-    return reply == "OK"
+    updated = execute(s.conn, ["EVAL", UPDATE_SESSION, "1", "session:" * id,
+                               JSON.json(data), string(ttl)])
+    return updated == 1
 end
 ```
 

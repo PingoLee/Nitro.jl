@@ -39,7 +39,16 @@ on its first rotation, and `missing_session_methods` lists `:rotate_session!`. I
 release train as #318's `update_session!`, so a custom store migrates once for both.
 
 A session `SessionMiddleware` created during the request itself, never stored and never sent,
-still rotates to a new id as before, with no store call.
+still rotates to a new id as before, with no store call. The middleware marks one with
+`req.context[:session_new] = true`. Two edge cases outside that path behave differently now:
+
+- `regenerate_session!` called **without** `SessionMiddleware`, on a `req.context[:session_id]`
+  the store does not hold, used to create the session. It now returns `nothing` and leaves the
+  id in place: an id the store does not hold is indistinguishable from a logged-out one. Store the
+  session first, or set `req.context[:session_new] = true` for an id minted in that request.
+- A handler that swaps `req.context[:session_id]` for a fresh id by hand, on a session the request
+  loaded, had that id upserted. It is now written update-only, so the write is dropped. Call
+  `regenerate_session!` instead.
 
 ### How to find the calls to migrate
 
@@ -75,11 +84,14 @@ end
 # ✓ after — also rotate_session!: move the session only if the old key still exists
 import Nitro.Core.Types: rotate_session!
 
-# A Lua script runs atomically in Redis: nothing can run between the check and the writes.
+# A Lua script runs atomically in Redis: nothing can run between the check and the writes. The
+# session is a hash (as in the #318 entry's `update_session!`), and RENAME moves the whole key,
+# so every field but `data` -- such as the `created` instant #362 requires -- is carried over.
 const ROTATE_SESSION = """
 if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
-redis.call('SET', KEYS[2], ARGV[1], 'EX', ARGV[2])
-redis.call('DEL', KEYS[1])
+redis.call('RENAME', KEYS[1], KEYS[2])
+redis.call('HSET', KEYS[2], 'data', ARGV[1])
+redis.call('EXPIRE', KEYS[2], ARGV[2])
 return 1
 """
 

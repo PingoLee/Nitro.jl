@@ -831,7 +831,10 @@ function regenerate_session!(req::HTTP.Request, store::AbstractSessionStore{Stri
         set_session!(store, new_id, session_data; ttl=ttl)
     elseif get(req.context, :session_new, false) !== true
         # A session this request LOADED. Move it only if it is still there (#361).
-        rotate_session!(store, old_id, new_id, session_data; ttl=ttl) || return nothing
+        # `::Bool`: the contract's return type, asserted so a store returning anything else fails
+        # here by name, and inference does not carry `Any` (the arguments come out of
+        # `req.context`).
+        rotate_session!(store, old_id, new_id, session_data; ttl=ttl)::Bool || return nothing
     end
     # Otherwise the id was minted by `SessionMiddleware` in this request: never stored, never
     # sent, so no other request can hold it. Asking the store to move it would find nothing and
