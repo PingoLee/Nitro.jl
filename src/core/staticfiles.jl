@@ -314,8 +314,11 @@ function _serve_mounted(req::HTTP.Request, mf::MountedFile, policy::MountPolicy,
         (mf.bytes, mf.etag, mf.modtime)
     elseif cache !== nothing
         # `:lazy` — the tag is cached WITH the bytes, so it always identifies the body in hand
-        # even after an eviction re-reads a file that has since changed on disk.
-        cb = get!(() -> _read_with_validators(mf.path, policy, loadfile), cache, mf.path)
+        # even after an eviction re-reads a file that has since changed on disk. The assertion
+        # pins an implementation detail: LRUCache's function-form `get!` infers concretely only
+        # because it takes its lock without a do-block, while its value form already infers
+        # `Any`. A release that rewrote this one the same way would otherwise go unnoticed.
+        cb = get!(() -> _read_with_validators(mf.path, policy, loadfile), cache, mf.path)::CachedBody
         (cb.bytes, cb.etag, cb.modtime)
     else
         # `:none` — re-read per request, so the validators are derived from that read. This is the

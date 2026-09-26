@@ -31,7 +31,9 @@ function boxed_closures(root::Module)
                 parentmodule(v) === m && v !== m && walk(v)
             elseif v isa Type && startswith(String(n), "#")
                 T = Base.unwrap_unionall(v)
-                (T isa DataType && T <: Function) || continue
+                # Captures only: every generic function also binds a field-less `#name` type,
+                # and those would keep the count below high even if closures vanished from it.
+                (T isa DataType && T <: Function && fieldcount(T) > 0) || continue
                 closures += 1
                 boxed = Symbol[f for (f, ft) in zip(fieldnames(T), fieldtypes(T)) if ft === Core.Box]
                 isempty(boxed) || push!(hits, (m, n, boxed))
@@ -45,7 +47,7 @@ end
 @testset "Nitro and its submodules" begin
     closures, hits = boxed_closures(Nitro)
     # Not vacuous: if Julia stopped binding closure types this way the walk would find none
-    # and the emptiness check below would pass for the wrong reason.
+    # and the emptiness check below would pass for the wrong reason. (About 250 today.)
     @test closures > 50
     @test hits == []
 end
