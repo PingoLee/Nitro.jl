@@ -239,8 +239,8 @@ cleanup_expired_sessions!(store::S)
 delegate to `set_session!` and `cleanup_expired_sessions!` by default. It writes back a session
 the request *loaded* with `update_session!`, except a logged-out session, which it re-stores with
 `set_session!` for a fresh clock. `set_session!` must therefore overwrite an existing ID.
-`regenerate_session!` moves a session to a new ID with
-`rotate_session!`. Each must act only if the session still exists and has not expired, returning
+`regenerate_session!` moves a session to a new ID with `rotate_session!`. `update_session!` and
+`rotate_session!` must each act only if the session still exists and has not expired, returning
 `false` otherwise, as one atomic step. Implementing the six methods above is enough for custom
 backends; only `cleanup_expired_sessions!` is optional.
 
