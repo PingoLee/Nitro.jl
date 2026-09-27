@@ -692,6 +692,72 @@ function Base.getproperty(m::RacingWatcherModel, name::Symbol)
     return getfield(m, name)
 end
 
+# A model that lands another process's write at one exact point of a store method (#379): right
+# after a `.first()` read returns a row (`:after_first`), just before `replace_task!`'s UPDATE
+# (`:before_replace_update`), or in place of the next `.create` (`:on_create`, which may throw
+# what the driver would). Each hook is one-shot and runs under the
+# database lock with the connection's table, for the reason `RacingWatcherQuerySet` gives:
+# deterministic, and it proves the window was actually hit.
+struct InterloperQuerySet
+    inner::MockTaskQuerySet
+    hooks::Dict{Symbol, Any}
+end
+
+function _run_hook!(qs::InterloperQuerySet, name::Symbol)
+    inner = getfield(qs, :inner)
+    lock(getfield(inner, :mdb).lock) do
+        hook = pop!(getfield(qs, :hooks), name, nothing)
+        hook === nothing || hook(_selected_table(inner))
+    end
+    return nothing
+end
+
+function Base.getproperty(qs::InterloperQuerySet, name::Symbol)
+    inner = getfield(qs, :inner)
+    hooks = getfield(qs, :hooks)
+    if name === :db
+        return (key::String) -> InterloperQuerySet(inner.db(key), hooks)
+    elseif name === :filter
+        return (args...) -> InterloperQuerySet(inner.filter(args...), hooks)
+    elseif name === :first
+        return function()
+            row = inner.first()
+            row === nothing || _run_hook!(qs, :after_first)
+            return row
+        end
+    elseif name === :create
+        return function(pairs::Pair{String,<:Any}...)
+            _run_hook!(qs, :on_create)
+            return inner.create(pairs...)
+        end
+    elseif name === :update
+        return function(pairs::Pair{String,<:Any}...)
+            # Only `replace_task!` writes `run_id`, so this lands between exactly ITS read and
+            # its UPDATE, whatever other reads the calling path made first.
+            any(p -> first(p) == "run_id", pairs) && _run_hook!(qs, :before_replace_update)
+            return inner.update(pairs...)
+        end
+    end
+    return getproperty(inner, name)
+end
+
+struct InterloperModel
+    mdb::MockDB
+    hooks::Dict{Symbol, Any}
+end
+
+InterloperModel() = InterloperModel(MockDB(), Dict{Symbol, Any}())
+
+function Base.getproperty(m::InterloperModel, name::Symbol)
+    if name === :objects
+        return InterloperQuerySet(MockTaskQuerySet(getfield(m, :mdb), nothing, Dict{String,Any}()),
+                                  getfield(m, :hooks))
+    elseif name === :_table
+        return getfield(m, :mdb).tables["db"]
+    end
+    return getfield(m, name)
+end
+
 # A stored column whose bytes cannot even be read: the synthetic stand-in for an overflow or OOM
 # raised while decoding, which cannot safely be produced for real in-process (#254, #301). The
 # depth scan reads code units first, so this throws where a real overflow would have come from.
@@ -912,7 +978,8 @@ const PormGExt = Base.get_extension(Nitro, :NitroPormGExt)
 # `_delete_target` is the ext's one seam between a store and the connection its fenced DELETE
 # runs on. The real method takes a `PormG.PormGModel`; the doubles are not one, so they supply the
 # pool above. A method for our own type, so it adds to the ext's function rather than replacing it.
-PormGExt._delete_target(m::Union{MockTaskModel, FlakyReadModel, RacingWatcherModel}, key::String) =
+PormGExt._delete_target(m::Union{MockTaskModel, FlakyReadModel, RacingWatcherModel, InterloperModel},
+                        key::String) =
     (mock_fence_pool(getfield(m, :mdb), key), "nitro_task")
 
 # The statements a mock database's fenced-delete pool ran, for `key`.
@@ -1374,6 +1441,91 @@ else
                 finally
                     delete!(PormG.config, key)
                 end
+            end
+        end
+
+        @testset "replace_task! writes a record deleted between its read and its write (#379)" begin
+            m = InterloperModel()
+            store_v = RealPormGWorkerStore(model=m)
+            finished = TaskInfo("alice::rerun"); finished.status = COMPLETED
+            replace_task!(store_v, finished.id, finished)
+
+            # Another process releases the finished record just after our read. The UPDATE then
+            # matched 0 rows and used to be ignored: no record, and a re-run that never ran.
+            m.hooks[:before_replace_update] = table -> delete!(table, "alice::rerun")
+            fresh = TaskInfo("alice::rerun"); push!(fresh.watchers, "alice")
+            replace_task!(store_v, fresh.id, fresh)
+
+            @test !haskey(m.hooks, :before_replace_update)   # the window was actually hit
+            stored = get_task_info(store_v, fresh.id)
+            @test stored !== nothing
+            @test stored.run_id == fresh.run_id
+            @test stored.status == PENDING
+            @test stored.watchers == ["alice"]
+        end
+
+        @testset "replace_task! updates the row a concurrent creator inserted first (#379)" begin
+            m = InterloperModel()
+            store_c = RealPormGWorkerStore(model=m)
+            rival = TaskInfo("alice::dup"); push!(rival.watchers, "rival")
+            integrity() = PormG.IntegrityError("sqlite",
+                                               ErrorException("UNIQUE constraint failed: nitro_task.id"))
+
+            # Absent at our read; another process's insert wins, and ours hits the primary key.
+            m.hooks[:on_create] = table -> begin
+                table[rival.id] = Dict{String, Any}(PormGExt._to_db_record(rival))
+                throw(integrity())
+            end
+            ours = TaskInfo("alice::dup"); push!(ours.watchers, "alice")
+            replace_task!(store_c, ours.id, ours)
+            @test !haskey(m.hooks, :on_create)
+            stored = get_task_info(store_c, ours.id)
+            @test stored.run_id == ours.run_id                # last writer wins, as for an UPDATE
+            @test stored.watchers == ["alice"]
+
+            # An integrity failure with no row behind it is a real constraint problem, not a
+            # lost race -- it propagates instead of being retried into a generic error.
+            m.hooks[:on_create] = _ -> throw(integrity())
+            other = TaskInfo("alice::broken")
+            @test_throws PormG.IntegrityError replace_task!(store_c, other.id, other)
+            @test get_task_info(store_c, other.id) === nothing
+        end
+
+        @testset "set_task! does not resurrect a record deleted under it (#379)" begin
+            # The deliberate asymmetry with `replace_task!` above: a STATE save that finds its row
+            # gone is a released or pruned run, and recreating the row would undo the release.
+            m = InterloperModel()
+            store_r = RealPormGWorkerStore(model=m)
+            run = TaskInfo("alice::released"); run.status = RUNNING
+            replace_task!(store_r, run.id, run)
+
+            m.hooks[:after_first] = table -> delete!(table, "alice::released")
+            run.status = COMPLETED
+            set_task!(store_r, run.id, run)
+            @test !haskey(m.hooks, :after_first)
+            @test get_task_info(store_r, run.id) === nothing
+        end
+
+        @testset "a re-run whose record vanishes mid-replace still runs (#379)" begin
+            # The request-path half of the fix: `submit_task` re-running a finished key used to
+            # return normally while `_claim_run!` found no record and dropped the run silently.
+            m = InterloperModel()
+            store_e = RealPormGWorkerStore(model=m)
+            rt_e = WorkerRuntime(store_e)
+            owner = Owner("alice")
+            try
+                id = submit_task("rerun-e2e", () -> "first", owner; runtime=rt_e)
+                @test _settled(() -> get_task_status(id, owner; runtime=rt_e)[:status] == "COMPLETED")
+
+                m.hooks[:before_replace_update] = table -> delete!(table, id)
+                @test submit_task("rerun-e2e", () -> "second", owner; runtime=rt_e) == id
+                @test !haskey(m.hooks, :before_replace_update)
+                @test _settled(() -> begin
+                    s = get_task_status(id, owner; runtime=rt_e)
+                    get(s, :status, nothing) == "COMPLETED" && get(s, :result, nothing) == "second"
+                end)
+            finally
+                reset_runtime!(rt_e)
             end
         end
 

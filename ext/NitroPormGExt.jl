@@ -847,55 +847,108 @@ function get_task_info(store::PormGWorkerStore, task_id::String)
     end
 end
 
+# A fresh row has no watchers to preserve, so a create always writes them, whichever entry point
+# it came through.
+function _create_task_row!(store::PormGWorkerStore, record)
+    _task_objects(store).create(
+        "id" => record["id"],
+        "run_id" => record["run_id"],
+        "status" => record["status"],
+        "progress" => record["progress"],
+        "result" => record["result"],
+        "error" => record["error"],
+        "created_at" => record["created_at"],
+        "started_at" => record["started_at"],
+        "completed_at" => record["completed_at"],
+        "watchers" => record["watchers"],
+        "queue_name" => record["queue_name"],
+    )
+    return nothing
+end
+
+# Rows written by an UPDATE of an existing record.
+function _update_task_row!(store::PormGWorkerStore, task_id::String, record, full_record::Bool)
+    columns = Pair{String, Any}[
+        "status" => record["status"],
+        "progress" => record["progress"],
+        "result" => record["result"],
+        "error" => record["error"],
+        "created_at" => record["created_at"],
+        "started_at" => record["started_at"],
+        "completed_at" => record["completed_at"],
+        "queue_name" => record["queue_name"],
+    ]
+    # `watchers` and `run_id` ride along ONLY for `replace_task!`. Including
+    # `watchers` on every save is what made ordinary state transitions clobber grants
+    # appended by another process since this one last read the row (#88) — and
+    # transitions are far more frequent than appends, so that was the dominant loss
+    # path. `run_id` is excluded for a sharper reason: it is the value
+    # `try_transition!` fences on, so a state save that carried it would let whichever
+    # run wrote last adopt the record's identity and defeat the fence (#108).
+    if full_record
+        push!(columns, "watchers" => record["watchers"])
+        push!(columns, "run_id" => record["run_id"])
+    end
+    changed = _task_objects(store).filter("id" => task_id).update(columns...)
+    return changed isa Integer ? Int(changed) : 0
+end
+
+# How many read -> write rounds `replace_task!` gets. A round is lost only when another process
+# deletes or creates this one row between our read and our write, so this is generous.
+const _REPLACE_ATTEMPTS = 8
+
 function _write_task!(store::PormGWorkerStore, task_id::String, task_info::TaskInfo, full_record::Bool)
     record = _to_db_record(task_info)
     try
+        full_record && return _replace_task_row!(store, task_id, record, task_info)
         existing = _task_objects(store).filter("id" => task_id).first()
         if isnothing(existing)
-            # A fresh row has no watchers to preserve, so the create branch always
-            # writes them whichever entry point we came through.
-            _task_objects(store).create(
-                "id" => record["id"],
-                "run_id" => record["run_id"],
-                "status" => record["status"],
-                "progress" => record["progress"],
-                "result" => record["result"],
-                "error" => record["error"],
-                "created_at" => record["created_at"],
-                "started_at" => record["started_at"],
-                "completed_at" => record["completed_at"],
-                "watchers" => record["watchers"],
-                "queue_name" => record["queue_name"],
-            )
+            _create_task_row!(store, record)
         else
-            columns = Pair{String, Any}[
-                "status" => record["status"],
-                "progress" => record["progress"],
-                "result" => record["result"],
-                "error" => record["error"],
-                "created_at" => record["created_at"],
-                "started_at" => record["started_at"],
-                "completed_at" => record["completed_at"],
-                "queue_name" => record["queue_name"],
-            ]
-            # `watchers` and `run_id` ride along ONLY for `replace_task!`. Including
-            # `watchers` on every save is what made ordinary state transitions clobber grants
-            # appended by another process since this one last read the row (#88) — and
-            # transitions are far more frequent than appends, so that was the dominant loss
-            # path. `run_id` is excluded for a sharper reason: it is the value
-            # `try_transition!` fences on, so a state save that carried it would let whichever
-            # run wrote last adopt the record's identity and defeat the fence (#108).
-            if full_record
-                push!(columns, "watchers" => record["watchers"])
-                push!(columns, "run_id" => record["run_id"])
-            end
-            _task_objects(store).filter("id" => task_id).update(columns...)
+            # A 0-row UPDATE is deliberately a no-op HERE, and only here. It means the record
+            # was deleted after our read -- released, pruned, or deleted in another process --
+            # and a state save must not resurrect it: a released run's own terminal write
+            # "finds no record and stores nothing" (`release_task!`). `replace_task!` is the
+            # opposite case, below.
+            _update_task_row!(store, task_id, record, false)
         end
     catch e
         @warn "PormGWorkerStore: failed to write task" exception=(e, catch_backtrace())
         rethrow()
     end
     return task_info
+end
+
+# `replace_task!` writes the record "replacing whatever is stored" -- including nothing. Its one
+# caller is a re-run publishing its new run, and a 0-row UPDATE there used to be ignored: a record
+# deleted between our read and our write (by `release_task!`, retention, or `delete_task!` in
+# another process) left the re-run with no record, `_claim_run!` declined it, and the submit
+# returned normally for a task that never ran (#379). So each lost round goes around again:
+# vanished -> create it; a concurrent creator won the insert -> update what it wrote. That is the
+# upsert `InMemoryWorkerStore.replace_task!` already is.
+function _replace_task_row!(store::PormGWorkerStore, task_id::String, record, task_info::TaskInfo)
+    for _ in 1:_REPLACE_ATTEMPTS
+        existing = _task_objects(store).filter("id" => task_id).first()
+        if isnothing(existing)
+            try
+                _create_task_row!(store, record)
+                return task_info
+            catch e
+                # Only a row that now exists explains an integrity failure here. Anything else
+                # is a real constraint problem, and it propagates. Inside an app's own open
+                # PostgreSQL transaction the failed INSERT has already aborted that transaction,
+                # so the re-read below throws instead and the submit fails loudly -- the app's
+                # transaction was lost either way.
+                e isa PormG.IntegrityError || rethrow()
+                isnothing(_task_objects(store).filter("id" => task_id).first()) && rethrow()
+            end
+        elseif _update_task_row!(store, task_id, record, true) >= 1
+            return task_info
+        end
+    end
+    error("PormGWorkerStore: could not write task '$task_id' after $(_REPLACE_ATTEMPTS) " *
+          "attempts -- another process kept deleting or creating the row between this " *
+          "store's read and its write")
 end
 
 set_task!(store::PormGWorkerStore, task_id::String, task_info::TaskInfo) =
