@@ -270,7 +270,8 @@ with typed `id` and `kid` fields. Read it with `getuser(req)`.
 ```julia
 SessionMiddleware(
     store      = MemoryStore(),   # REQUIRED -- there is no default store (#171)
-    max_age    = 86400,
+    max_age    = 86400,     # sliding: every write moves the expiry
+    absolute_max_age = 7 * 86400,  # hard cap from creation, however active; `nothing` = off (#362)
     secure     = true,      # keep true in production
     httponly   = true,      # never lower this
     samesite   = "Lax",
@@ -288,7 +289,10 @@ cookie holds only a random id, so `SessionMiddleware` takes no `secret_key`. Pas
 ([#339](https://github.com/PingoLee/Nitro.jl/issues/339)).
 
 Read and write through `getsession(req)`. Call `regenerate_session!(req, store)` on any privilege
-change you perform manually. `CSRFMiddleware(secret)` is required for cookie-authenticated
+change you perform manually. It returns `nothing`, and rotates nothing, when a concurrent request
+logged the session out first (#361). Rotation keeps the session's absolute clock, except for a
+logout: `empty!(getsession(req))` + `regenerate_session!` starts a fresh one (#362).
+`CSRFMiddleware(secret)` is required for cookie-authenticated
 mutations; its cookie is deliberately **not** `httponly` so the SPA can read and echo the token in
 the `X-CSRF-Token` header (or a `_csrf` form field / JSON key).
 
