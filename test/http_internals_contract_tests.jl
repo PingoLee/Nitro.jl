@@ -23,7 +23,9 @@ import Sockets
 #   • src/core/transport.jl — `_upgrade_websocket!` (#374) runs the private
 #       `WebSockets._origin_allowed_default` with a proxy-reported scheme, mirrors `upgrade`'s
 #       `stream.tracked.conn isa TLS.Conn`, and classifies a refused handshake by
-#       `WebSocketError.message.code`.
+#       `WebSocketError.message.code`. `_write_fixed_body_live!` (#377) writes a known-length
+#       streaming body past HTTP/1.1's FIXED buffer with the stream head/byte writers and the
+#       `Stream` write-state fields.
 #   • src/context.jl — `_shutdown_server`'s bounded drain: it depends on `close(::Server)`
 #       releasing the listener BEFORE its unbounded quiesce loop, and escalates to
 #       `HTTP.forceclose`.
@@ -318,6 +320,28 @@ end
     @test isdefined(HTTP, :_set_read_deadline!)
     @test hasmethod(HTTP._set_read_deadline!, Tuple{HTTP.TCP.Conn, Int64})
     @test hasmethod(HTTP._set_read_deadline!, Tuple{HTTP.TLS.Conn, Int64})
+end
+
+@testset "live FIXED writer (src/core/transport.jl `_write_fixed_body_live!`)" begin
+    # #377: on HTTP/1.1 HTTP.jl 2.7 buffers a FIXED stream response whole until `closewrite`, so
+    # Nitro writes a known-length streaming body itself — head, then each chunk to the socket —
+    # through these internals. A rename fails the wrappers loudly; the quieter breakage is a field
+    # changing meaning, so the fields are pinned by type too. What no signature can pin is the
+    # BEHAVIOR being worked around — `startwrite` deferring the HTTP/1.1 FIXED head. If HTTP.jl
+    # changes that, `_buffers_fixed_body`'s `head_committed` guard falls back to plain writes, and
+    # test/streaming_write_tests.jl is the canary that says whether they are live.
+    @test hasmethod(HTTP._server_stream_buffered_fixed_h1, Tuple{HTTP.Stream})
+    @test hasmethod(HTTP._write_server_stream_head!, Tuple{HTTP.Stream})
+    @test hasmethod(HTTP._write_server_stream_bytes!, Tuple{HTTP.Stream, Vector{UInt8}, Bool})
+    @test fieldtype(HTTP.Stream, :ignore_writes) === Bool
+    @test fieldtype(HTTP.Stream, :written_bytes) === Int64
+    # `write_closed` is what stops HTTP's loop and `stream_handler` from writing the head again;
+    # `head_committed` is what makes HTTP's error path close the connection after a failed body
+    # instead of appending a raw 500 to the bytes already sent — and `_buffers_fixed_body` reads it
+    # as its guard. `response_started` is read by `_response_started` in src/core/transport.jl.
+    for f in (:write_closed, :head_committed, :response_started)
+        @test fieldtype(HTTP.Stream, f) === Bool
+    end
 end
 
 @testset "WebSocket Origin policy surface (src/core/transport.jl `_upgrade_websocket!`)" begin

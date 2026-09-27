@@ -520,6 +520,25 @@ N× that resident on top of the mount's own copy. There is no cache policy under
 2 GB file per request is right, which is why the threshold overrides the policy rather than being
 one of its settings.
 
+**That claim did not hold on HTTP/1.1 until [#377](https://github.com/PingoLee/Nitro.jl/issues/377).**
+`servecontent` gives a streamed body a `Content-Length`, a response with a length is framed FIXED,
+and HTTP.jl 2.7 buffers every write to a FIXED stream response in `stream.request_buffer`, sending
+head and body only at `closewrite`. The 64 KiB drain therefore copied the whole file into that
+buffer before a byte was sent — one layer below the code #41 changed, which is why its tests (body
+correct, handle released) stayed green. HTTP.jl's *request*-handler path writes a FIXED body live;
+only the stream-handler path Nitro serves through buffers, and it has no switch. So Nitro now writes
+a known-length streaming body itself on HTTP/1.1 (`_write_fixed_body_live!` in
+`src/core/transport.jl`): the head, then each chunk to the connection, the length enforced. The
+cost is reaching HTTP internals, canaried in `test/http_internals_contract_tests.jl`, until HTTP.jl
+offers a public way to do it. The behavioral pin is `test/streaming_write_tests.jl`, which checks
+that the head and first chunk reach the client *while the body is still being read* — a check on
+when bytes hit the wire, which is the one thing #41's tests could not see. HTTP/2 was never
+affected: there a FIXED write is a live DATA frame.
+
+A failure after the head is on the wire can no longer become a `500` — the status is already sent —
+so it closes the connection instead, which is how the client learns the body is truncated. That is
+Go's `net/http` behavior, and the price of not buffering.
+
 **Below it, `cache` chooses where the bytes come from:** `:eager` (the default, and the historical
 behaviour) reads at mount time; `:lazy` reads on first request into an LRU bounded by a **byte
 budget**, so memory tracks the working set rather than the folder; `:none` reads per request, which
