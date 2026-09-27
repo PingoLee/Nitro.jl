@@ -1167,6 +1167,20 @@ end
     @test leaf(ctx, "GET", "/ws").method == "WEBSOCKET"
 end
 
+@testset "a WEBSOCKET route whose middleware passes answers a non-upgrade with 426 (#384)" begin
+    # The handler IS reached here, which the `deny` tests above never do. It used to return
+    # `false` for a request that is not an upgrade, served as `200 "false"`.
+    ctx = App()
+    urlpatterns(ctx, "",
+        path("/ws", (ws::HTTP.WebSockets.WebSocket) -> nothing; method = "WEBSOCKET",
+             middleware = [tag("route")]),
+    )
+    resp = internalrequest(ctx, HTTP.Request("GET", "/ws"))
+    @test resp.status == 426
+    @test HTTP.header(resp, "Upgrade") == "websocket"
+    @test HTTP.header(resp, "X-Tag") == "route"      # the route middleware ran around it
+end
+
 @testset "router-level middleware gates the same three methods" begin
     ctx = App()
     guarded = router(ctx, "/r"; middleware = [deny])

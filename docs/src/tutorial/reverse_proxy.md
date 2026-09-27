@@ -202,7 +202,9 @@ Four things in that config are easy to get wrong, and three of them fail *quietl
   upstream and the pool is never reused — the directive looks active and does nothing.
 - **SSE needs `proxy_buffering off`.** nginx buffers proxied responses by default, which is right for
   JSON and wrong for an event stream: without it the endpoint simply appears to hang. A WebSocket
-  route missing `Upgrade`/`Connection` fails the handshake with a confusing `400`. Behind TLS
+  location missing `proxy_set_header Upgrade $http_upgrade` or `Connection "upgrade"` reaches Nitro
+  as an ordinary request, and the route answers `426 Upgrade Required` — the same answer a browser
+  tab opening the URL gets. Behind TLS
   termination a WebSocket route also needs `ExtractIP(forwarded_proto = …)`, or every browser
   upgrade is a `403` — see [WebSocket upgrades and the Origin check](@ref).
 
