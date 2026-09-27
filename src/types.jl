@@ -1545,6 +1545,157 @@ means "no trusted proxy said", and the transport's own scheme applies.
 const REQUEST_FORWARDED_PROTO_KEY = :__nitro_forwarded_proto
 
 """
+    REQUEST_WS_ORIGINS_KEY
+
+`req.context` key carrying the `WebSocketOriginPolicy` a `WebSocketOrigins` middleware
+installed (#382). Every such layer REPLACES it as the request passes inward, so the one closest to
+the route wins. Read once by the WebSocket upgrade's Origin check, and consulted only after the
+same-origin rule has said no. Internal — absent means same-origin only.
+"""
+const REQUEST_WS_ORIGINS_KEY = :__nitro_ws_origins
+
+"""
+    WebSocketOriginPolicy(origins)
+
+The cross-origin pages a WebSocket upgrade admits besides its own origin (#382), stored as
+canonical serialized origins (RFC 6454): `scheme://host:port`, scheme and host lowercased, the
+port always explicit. Built only from a list that `_parse_origin` accepted, so membership is an
+exact comparison of two canonical strings — never a substring, suffix or pattern match. An empty
+list is valid and means same-origin only, which is how a route narrows a wider outer policy back.
+
+Internal; applications build one through `WebSocketOrigins`.
+"""
+struct WebSocketOriginPolicy
+    origins :: Set{String}
+    function WebSocketOriginPolicy(origins::AbstractVector{<:AbstractString})
+        canonical = Set{String}()
+        for origin in origins
+            parsed, problem = _parse_origin(origin)
+            parsed === nothing && throw(ArgumentError(
+                "WebSocketOrigins: $(repr(String(origin))) is not an origin: $problem. An origin " *
+                "is exactly what a browser sends in `Origin`: `https://app.example.com`, or " *
+                "`https://app.example.com:8443` on a non-default port."))
+            push!(canonical, parsed)
+        end
+        return new(canonical)
+    end
+end
+
+# The one parser for both sides of the comparison — an allow-list entry at construction, and the
+# `Origin` header of each handshake — so the two cannot disagree about what "the same origin" is.
+# Strict and fail-closed: `(canonical, "")` or `(nothing, reason)`. Hand-rolled over the serialized
+# origin grammar, `scheme "://" host [":" port]`, because HTTP.jl exports no URL parser and the
+# lenient one it pulls in (`URIs`) neither lowercases nor refuses a path.
+function _parse_origin(raw::AbstractString)::Tuple{Nullable{String}, String}
+    s = String(raw)
+    s == "*" && return (nothing, "`*` would admit every site, which is exactly what the check " *
+                                 "exists to stop; list the pages you trust")
+    lowercase(s) == "null" && return (nothing, "`null` is the Origin of sandboxed frames, " *
+                                                "`file:` pages and some redirects, so any site can produce it")
+    isascii(s) || return (nothing, "it is not ASCII; write the host in its punycode (`xn--`) " *
+                                    "form, which is what a browser sends")
+    any(c -> c <= ' ' || c == '\x7f', s) && return (nothing, "it contains whitespace or a control character")
+    sep = findfirst("://", s)
+    sep === nothing && return (nothing, "it has no `scheme://`")
+    scheme = lowercase(s[1:prevind(s, first(sep))])
+    if scheme == "ws" || scheme == "wss"
+        return (nothing, "a browser sends the PAGE's scheme, never `$scheme`; use " *
+                         "`$(scheme == "wss" ? "https" : "http")://`")
+    end
+    (scheme == "http" || scheme == "https") || return (nothing, "only `http` and `https` pages send an Origin")
+    rest = s[nextind(s, last(sep)):end]
+    isempty(rest) && return (nothing, "it has no host")
+    any(c -> c in ('/', '?', '#'), rest) &&
+        return (nothing, "an origin has no path, query or fragment (drop any trailing `/`)")
+    '@' in rest && return (nothing, "an origin has no user or password")
+    host, port = if startswith(rest, '[')
+        bracket = findfirst(==(']'), rest)
+        bracket === nothing && return (nothing, "its IPv6 address has no closing `]`")
+        ip = _try_ipv6(rest[2:prevind(rest, bracket)])
+        ip === nothing && return (nothing, "its IPv6 address does not parse")
+        tail = rest[nextind(rest, bracket):end]
+        (isempty(tail) || startswith(tail, ':')) || return (nothing, "unexpected text after `]`")
+        ("[" * string(ip) * "]", isempty(tail) ? nothing : tail[2:end])
+    else
+        count(==(':'), rest) <= 1 || return (nothing, "an IPv6 host must be written in brackets")
+        colon = findfirst(==(':'), rest)
+        colon === nothing ? (lowercase(rest), nothing) : (lowercase(rest[1:prevind(rest, colon)]), rest[nextind(rest, colon):end])
+    end
+    isempty(host) && return (nothing, "it has no host")
+    if !startswith(host, '[')
+        all(c -> isletter(c) || isdigit(c) || c in ('.', '-', '_'), host) ||
+            return (nothing, "its host contains a character no hostname has")
+        # A browser serializes the host it loaded the page from, after WHATWG URL normalization.
+        # Two spellings it never sends would otherwise be accepted here and silently never match:
+        # an empty label (`app..example.com`, and the trailing dot of `app.example.com.`, which is
+        # a DIFFERENT origin from `app.example.com`), and an IPv4 address in any form but four
+        # plain decimals (`0x7f.1`, `127.1`, `0177.0.0.1` reach the browser as `127.0.0.1`).
+        labels = split(host, '.')
+        any(isempty, labels) && return (nothing, "its host has an empty label (a leading, " *
+                                                 "doubled or trailing `.`)")
+        last_label = labels[end]
+        # WHATWG reads the last label as a number when it is all digits, or `0x` + hex digits.
+        if all(isdigit, last_label) || (startswith(last_label, "0x") && all(isxdigit, last_label[3:end]))
+            (length(labels) == 4 && all(l -> all(isdigit, l) && length(l) <= 3 &&
+                                             (l == "0" || l[1] != '0') && parse(Int, l) <= 255, labels)) ||
+                return (nothing, "an IPv4 host must be four plain decimals, as a browser sends it " *
+                                 "(`127.0.0.1`, not `127.1` or `0x7f.0.0.1`)")
+        end
+    end
+    # `nothing`: no port written, so the scheme's default. A `:` with nothing after it is not that.
+    port_number = if port === nothing
+        scheme == "https" ? 443 : 80
+    else
+        (!isempty(port) && all(isdigit, port)) || return (nothing, "its port is not a number")
+        n = tryparse(Int, port)
+        (n === nothing || !(1 <= n <= 65535)) && return (nothing, "its port is out of range")
+        n
+    end
+    return ("$scheme://$host:$port_number", "")
+end
+
+# `Sockets` has `parse` but no `tryparse` for an address; it throws `ArgumentError` on bad input.
+# It is also lenient — `""` parses as `::`, `1::2::3` as `1::2:0:0`, `:1` as `0:1::`, a bare
+# `1.2.3.4` as `::102:304`, and `00000::1` as `::1` — so the RFC 4291 text shape is checked first:
+# hex groups of 1–4 digits, one optional embedded dotted-quad IPv4 as the last group, at most one
+# `::`, a lone `:` at neither end, and eight groups exactly unless `::` stands in for some.
+# A `::` standing in for ONE group (`1:2:3:4:5:6:7::`) passes this and is then refused by
+# `Sockets.parse`; a browser never sends it, since WHATWG compresses only runs of two or more.
+function _try_ipv6(s::AbstractString)::Nullable{Sockets.IPv6}
+    (!isempty(s) && occursin(':', s) && all(c -> isxdigit(c) || c == ':' || c == '.', s) &&
+     count("::", s) <= 1 && !occursin(":::", s)) || return nothing
+    (startswith(s, ':') && !startswith(s, "::")) && return nothing
+    (endswith(s, ':') && !endswith(s, "::")) && return nothing
+    groups = filter(!isempty, split(s, ':'))
+    width = 0
+    for (i, g) in enumerate(groups)
+        if occursin('.', g)
+            (i == length(groups) && endswith(s, g)) || return nothing
+            octets = split(g, '.')
+            (length(octets) == 4 && all(o -> !isempty(o) && length(o) <= 3 && all(isdigit, o) &&
+                                            (o == "0" || o[1] != '0') && parse(Int, o) <= 255, octets)) ||
+                return nothing
+            width += 2
+        else
+            length(g) <= 4 || return nothing
+            width += 1
+        end
+    end
+    (occursin("::", s) ? width <= 7 : width == 8) || return nothing
+    try
+        return parse(Sockets.IPv6, s)
+    catch e
+        e isa ArgumentError || rethrow()
+        return nothing
+    end
+end
+
+# Whether a handshake's `Origin` is one the policy lists. An Origin that does not parse is never
+# listed. The caller has already let a missing `Origin` through and tried same-origin first.
+_origin_listed(policy::WebSocketOriginPolicy, origin::AbstractString)::Bool =
+    (canonical = first(_parse_origin(origin)); canonical !== nothing && canonical in policy.origins)
+
+"""
     RouteResolution(router, method, target, handler, route, params, mw_method, table, source)
 
 One request's route lookup, handed from `compose` (src/routerhof.jl) to the innermost layer of

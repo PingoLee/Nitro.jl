@@ -395,3 +395,138 @@ end
 end
 
 end
+
+@testitem "WebSocketOrigins admits a listed cross-origin page, and nothing else (#382)" tags=[:handler, :network, :security] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Sockets
+using Nitro
+using Nitro: path, ExtractIP, WebSocketOrigins
+
+const PUBLIC_HOST = "api.example.com"
+const WS_KEY = "dGhlIHNhbXBsZSBub25jZQ=="
+const SPA = "https://app.example.com"
+
+hold = function (ws::HTTP.WebSockets.WebSocket)
+    try
+        for _ in ws end
+    catch e
+        e isa HTTP.WebSockets.WebSocketError || rethrow()
+    end
+end
+
+# `/ws` inherits whatever the server-wide middleware lists; `/ws/own` lists its own page, and
+# `/ws/strict` narrows back to same-origin only.
+function _ws_context()
+    ctx = Nitro.Core.App()
+    Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+        path("/ws", hold, method = "WEBSOCKET"),
+        path("/ws/own", hold, method = "WEBSOCKET",
+             middleware = [WebSocketOrigins(["https://other.example.com"])]),
+        path("/ws/strict", hold, method = "WEBSOCKET", middleware = [WebSocketOrigins(String[])]),
+        # A middleware that rewrites the request's `Origin` to a listed one. The check reads the
+        # head HTTP parsed off the wire, so this must not widen anything.
+        path("/ws/rewritten", hold, method = "WEBSOCKET",
+             middleware = [handle -> req -> (HTTP.setheader(req, "Origin" => SPA); handle(req))]),
+    ])
+    # A router-level list, between the server-wide one and the route.
+    scoped = Nitro.Core.RouterHOF.router(ctx, "/r";
+                                         middleware = [WebSocketOrigins(["https://other.example.com"])])
+    Nitro.Core.register(ctx, "WEBSOCKET", scoped("/ws"), hold)
+    return ctx
+end
+
+_serve(ctx, port; kw...) = Nitro.Core.serve(ctx; port, host = HOST, async = true,
+                                            show_banner = false, show_errors = false,
+                                            access_log = nothing, kw...)
+
+# A raw handshake: the client sends a public `Host`, as a proxy would. Returns the status line.
+function _handshake(port; target = "/ws", origin = nothing, proto = nothing)
+    lines = ["GET $target HTTP/1.1", "Host: $PUBLIC_HOST", "Upgrade: websocket",
+             "Connection: Upgrade", "Sec-WebSocket-Key: $WS_KEY", "Sec-WebSocket-Version: 13"]
+    origin === nothing || push!(lines, "Origin: $origin")
+    proto  === nothing || push!(lines, "X-Forwarded-Proto: $proto")
+    sock = Sockets.connect(Sockets.localhost, port)
+    try
+        write(sock, join(lines, "\r\n") * "\r\n\r\n")
+        flush(sock)
+        reader = @async try readline(sock) catch; "" end
+        timedwait(() -> istaskdone(reader), 15.0; pollint = 0.05)
+        return istaskdone(reader) ? fetch(reader) : "(no reply within 15s)"
+    finally
+        close(sock)
+    end
+end
+
+upgraded(line) = startswith(line, "HTTP/1.1 101")
+forbidden(line) = startswith(line, "HTTP/1.1 403")
+
+@testset "without the middleware, a cross-origin page is refused as before" begin
+    ctx, port = _ws_context(), get_free_port()
+    _serve(ctx, port)
+    try
+        @test forbidden(_handshake(port; origin = SPA))
+        @test upgraded(_handshake(port; origin = "http://$PUBLIC_HOST"))
+        # A route-level list still applies on its own route.
+        @test upgraded(_handshake(port; target = "/ws/own", origin = "https://other.example.com"))
+        @test forbidden(_handshake(port; target = "/ws/own", origin = SPA))
+        # ... and so does a router-level one.
+        @test upgraded(_handshake(port; target = "/r/ws", origin = "https://other.example.com"))
+        @test forbidden(_handshake(port; target = "/r/ws", origin = SPA))
+    finally
+        Nitro.Core.terminate(ctx)
+    end
+end
+
+@testset "a server-wide list admits exactly its origins" begin
+    ctx, port = _ws_context(), get_free_port()
+    _serve(ctx, port; middleware = [WebSocketOrigins([SPA, "http://localhost:5173"])])
+    try
+        # THE FEATURE: an SPA on another origin can open its socket.
+        @test upgraded(_handshake(port; origin = SPA))
+        @test upgraded(_handshake(port; origin = "https://APP.example.com:443"))
+        @test upgraded(_handshake(port; origin = "http://localhost:5173"))
+        # Same-origin and a non-browser client are unaffected.
+        @test upgraded(_handshake(port; origin = "http://$PUBLIC_HOST"))
+        @test upgraded(_handshake(port))
+        # Exact on scheme, host and port — never a prefix, suffix or look-alike.
+        for other in ("http://app.example.com", "https://app.example.com:8443",
+                      "https://evil-app.example.com", "https://app.example.com.evil.example",
+                      "https://sub.app.example.com", "http://localhost:5174", "null",
+                      "https://evil.example")
+            @test forbidden(_handshake(port; origin = other))
+        end
+        # The layer closest to the route wins: `/ws/own` REPLACES the server-wide list ...
+        @test upgraded(_handshake(port; target = "/ws/own", origin = "https://other.example.com"))
+        @test forbidden(_handshake(port; target = "/ws/own", origin = SPA))
+        # ... and an empty one narrows a route back to same-origin only.
+        @test forbidden(_handshake(port; target = "/ws/strict", origin = SPA))
+        @test upgraded(_handshake(port; target = "/ws/strict", origin = "http://$PUBLIC_HOST"))
+        # A router-level list replaces the server-wide one for its routes.
+        @test upgraded(_handshake(port; target = "/r/ws", origin = "https://other.example.com"))
+        @test forbidden(_handshake(port; target = "/r/ws", origin = SPA))
+        # Rewriting `req`'s `Origin` to a listed page does not admit the page that really asked.
+        @test forbidden(_handshake(port; target = "/ws/rewritten", origin = "https://evil.example"))
+        @test upgraded(_handshake(port; target = "/ws/rewritten", origin = SPA))
+    finally
+        Nitro.Core.terminate(ctx)
+    end
+end
+
+@testset "it composes with a trusted proxy's scheme" begin
+    ctx, port = _ws_context(), get_free_port()
+    trusted = ExtractIP(forwarded_proto = :x_forwarded_proto, trusted_proxies = [ip"127.0.0.1"])
+    _serve(ctx, port; middleware = [trusted, WebSocketOrigins([SPA])])
+    try
+        @test upgraded(_handshake(port; origin = SPA, proto = "https"))
+        @test upgraded(_handshake(port; origin = "https://$PUBLIC_HOST", proto = "https"))
+        # The listed origin does not depend on the scheme the proxy reports: it is matched as
+        # written, against the list.
+        @test upgraded(_handshake(port; origin = SPA))
+        @test forbidden(_handshake(port; origin = "http://app.example.com", proto = "https"))
+    finally
+        Nitro.Core.terminate(ctx)
+    end
+end
+
+end

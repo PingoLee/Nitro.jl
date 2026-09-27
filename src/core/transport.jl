@@ -588,10 +588,11 @@ end
 # refused exactly the same way.
 function _log_ws_refusal(stream::HTTP.Stream, attempt::_UpgradeAttempt, status::Int)
     if status == 403
-        @warn("Refusing WebSocket upgrades whose Origin is not this server's own origin with 403 " *
+        @warn("Refusing WebSocket upgrades whose Origin is neither this server's own nor listed with 403 " *
               "(detail at debug level). Behind a proxy that terminates TLS, configure " *
               "`ExtractIP(forwarded_proto = :x_forwarded_proto, trusted_proxies = …)` so the " *
-              "check compares against the scheme the client used.", maxlog = 1)
+              "check compares against the scheme the client used. For a page served from " *
+              "another origin, list it with `WebSocketOrigins([...])`.", maxlog = 1)
     else
         @warn("Refusing malformed WebSocket handshakes with 400 (detail at debug level). Only " *
               "reachable when a middleware rewrote the upgrade request.", maxlog = 1)
@@ -699,9 +700,16 @@ function _upgrade_websocket!(f::Function, req::HTTP.Request)
         return _refuse_upgrade_over_capacity(adm.upgraded_limit)
     end
     attempt = _UpgradeAttempt(false, false, false)
+    # The cross-origin pages a `WebSocketOrigins` layer admits (#382) — the one closest to the route,
+    # since each layer replaces the key. Read once, into a local the closure captures unboxed. The
+    # Origin itself is read from `head`, the head HTTP checks, so a middleware that rewrote `req`'s
+    # `Origin` cannot widen what is admitted. Consulted only after same-origin said no, so an app
+    # without the middleware does exactly what it did.
+    listed = get(req.context, Types.REQUEST_WS_ORIGINS_KEY, nothing)::Nullable{Types.WebSocketOriginPolicy}
     check_origin = function (head::HTTP.Request)
         attempt.secure = _ws_secure(req, stream)
-        allowed = _http_origin_allowed_default(head, attempt.secure)
+        allowed = _http_origin_allowed_default(head, attempt.secure) ||
+                  (listed !== nothing && Types._origin_listed(listed, HTTP.header(head, "Origin", "")))
         allowed || (attempt.origin_refused = true)
         return allowed
     end

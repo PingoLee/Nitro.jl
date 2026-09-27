@@ -43,6 +43,10 @@ requests against `Access-Control-Allow-Origin: *`, and reflecting an arbitrary
 Origin alongside credentials would expose responses to any website. Specify the
 explicit origins you trust in `allowed_origins` instead.
 
+`Cors` does not govern WebSocket handshakes: an upgrade from another origin is refused by the
+same-origin check whatever `allowed_origins` says. List such a page with
+[`WebSocketOrigins`](@ref Nitro.Core.Middleware.WebSocketOriginsMiddleware.WebSocketOrigins).
+
 # Keyword Arguments
 
     - `allowed_origins`: Vector of allowed origins (default: ["*"]).

@@ -77,6 +77,7 @@ export  # The application handle
         AbstractSessionStore, MemoryStore, is_expired,
         # Middleware
         BearerAuth, CookieAuthMiddleware, Cors, SecurityHeaders, RateLimiter, ExtractIP, extract_ip,
+        WebSocketOrigins,
         SessionMiddleware, SessionPruner, GuardMiddleware, login_required, role_required, permission_required,
         claim_required, kid_required, Principal, CSRFMiddleware,
         AccessLog, AccessRecord,

@@ -6,6 +6,7 @@ using Reexport
 # reach as `using ..JanitorMiddleware` (#190).
 include("middleware/janitor.jl")
 include("middleware/extract_ip.jl"); @reexport using .ExtractIPMiddleware
+include("middleware/websocket_origins.jl"); @reexport using .WebSocketOriginsMiddleware
 include("middleware/rate_limiter.jl"); @reexport using .RateLimiterMiddleware
 include("middleware/auth_middleware.jl"); @reexport using .AuthMiddleware
 include("middleware/cors_middleware.jl"); @reexport using .CORSMiddleware

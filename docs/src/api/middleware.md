@@ -53,6 +53,12 @@ extract_ip
 getpeerip
 ```
 
+## WebSocket Origins
+
+```@docs
+WebSocketOrigins
+```
+
 ## Access Log
 
 ```@docs
