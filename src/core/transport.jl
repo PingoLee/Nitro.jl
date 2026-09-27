@@ -330,8 +330,8 @@ end
 # FIXED body live (`write_response!`); only the stream-handler path Nitro serves through buffers.
 #
 # `_write_fixed_body_live!` therefore does, for this one case, what that path does: head first,
-# then each chunk straight to the connection. A request for a public API is drafted upstream; until
-# it exists, the internals it reaches are wrapped below and canaried in
+# then each chunk straight to the connection. A public API for it is requested upstream
+# (JuliaWeb/HTTP.jl#1384); until it exists, the internals it reaches are wrapped below and canaried in
 # test/http_internals_contract_tests.jl — and behaviorally in test/streaming_write_tests.jl, which
 # is the only check that sees WHEN bytes reach the wire.
 #

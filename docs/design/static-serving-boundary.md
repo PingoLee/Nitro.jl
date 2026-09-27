@@ -530,7 +530,8 @@ only the stream-handler path Nitro serves through buffers, and it has no switch.
 a known-length streaming body itself on HTTP/1.1 (`_write_fixed_body_live!` in
 `src/core/transport.jl`): the head, then each chunk to the connection, the length enforced. The
 cost is reaching HTTP internals, canaried in `test/http_internals_contract_tests.jl`, until HTTP.jl
-offers a public way to do it. The behavioral pin is `test/streaming_write_tests.jl`, which checks
+offers a public way to do it — requested in
+[JuliaWeb/HTTP.jl#1384](https://github.com/JuliaWeb/HTTP.jl/issues/1384). The behavioral pin is `test/streaming_write_tests.jl`, which checks
 that the head and first chunk reach the client *while the body is still being read* — a check on
 when bytes hit the wire, which is the one thing #41's tests could not see. HTTP/2 was never
 affected: there a FIXED write is a live DATA frame.
