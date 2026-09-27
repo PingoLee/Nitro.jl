@@ -111,13 +111,24 @@ struct MockDB
     # scope prefix or the status set it was supposed to (#208).
     seen::Vector{Dict{String, Any}}
     lock::ReentrantLock
+    # The fenced DELETE is raw SQL, not a queryset call (#379), so it reaches this database
+    # through a stand-in connection pool per db key instead -- see `MockFencePool` below. Built
+    # lazily, in the dialect `dialect` names when the first delete runs.
+    fence_pools::Dict{String, Any}
+    dialect::Base.RefValue{Symbol}
 end
 
-MockDB(db_keys::String...) = MockDB(
+MockDB(db_keys::String...; dialect::Symbol=:sqlite) = MockDB(
     Dict{String, Dict{String, Dict{String, Any}}}(
         k => Dict{String, Dict{String, Any}}() for k in (isempty(db_keys) ? ("db",) : db_keys)),
     Dict{String, Any}[],
-    ReentrantLock())
+    ReentrantLock(),
+    Dict{String, Any}(),
+    Ref(dialect))
+
+# Around an existing table set (`RacingWatcherModel` wraps one it was handed).
+MockDB(tables::Dict{String, Dict{String, Dict{String, Any}}}, seen::Vector{Dict{String, Any}},
+       lock::ReentrantLock) = MockDB(tables, seen, lock, Dict{String, Any}(), Ref(:sqlite))
 
 mutable struct MockTaskQuerySet
     mdb::MockDB
@@ -200,6 +211,12 @@ function _filtered_rows_locked(qs::MockTaskQuerySet)
         else
             k in MODELLED_FILTER_KEYS || _reject_filter_key(k)
         end
+        # PormG has no `__@in` method for a Tuple -- it throws a `MethodError` from
+        # `_get_pair_to_oper`. This mock used to accept one, which is how `cleanup_tasks!`
+        # passed a Tuple for years, threw on every real sweep, and stayed green here (#379).
+        endswith(k, "__@in") && !(v isa AbstractVector) &&
+            error("MockTaskQuerySet: '$k' was given a $(typeof(v)); PormG accepts only a " *
+                  "Vector for `__@in` and throws a MethodError for anything else.")
     end
 
     # Recorded AFTER validation, so `_filters_seen` holds only filters a query could actually
@@ -720,6 +737,13 @@ end
 PormG.ConnectionPool.fetch(c::FakeTaskPool, sql::String; kwargs...) =
     (push!(c.sql, sql); nothing)
 
+# `FakeTaskSettings` plus the `change_data` switch a real `connection.yml` sets, which the fenced
+# DELETE reads because PormG's `delete()` would have (#379).
+struct FakeFenceSettings <: PormG.PormGSettings
+    connections::FakeTaskPool
+    change_data::Bool
+end
+
 # A connection whose `nitro_task` has the `run_id` column or does not, and that answers the way a
 # real driver does (#366): a statement naming a missing column throws, and so does an `ALTER` adding
 # one that is already there. `FakeTaskPool` answers every statement, so it cannot tell a probe from
@@ -762,8 +786,137 @@ function PormG.ConnectionPool.fetch(c::FakeSchemaPool, sql::String; kwargs...)
     return nothing
 end
 
+# -- A stand-in connection for the fenced DELETE (#379) -----------------------------
+#
+# `try_delete_task!` and `cleanup_tasks!` issue one raw, parameterized DELETE instead of going
+# through PormG's `delete()`, whose subquery PostgreSQL does not re-check. These pools answer that
+# statement against the owning `MockDB`'s table, so the #323 / #203 semantics stay asserted
+# against the ext's REAL SQL builder, placeholder choice and row-count path -- only the driver is
+# replaced.
+#
+# Like `FakeSchemaPool`, only the exact shape the ext emits is modelled, and anything else errors:
+# a DELETE that regressed to a subquery, or that spliced a value into its text, is a failure
+# here, not a statement the mock quietly approximates. The spelling IS the fix.
+mutable struct MockSQLiteFencePool <: PormG.PormGSQLite
+    mdb::Any                      # MockDB -- untyped only because it is defined above PormG
+    key::String
+    log::Vector{NamedTuple{(:sql, :params, :in_tx), Tuple{String, Vector{String}, Bool}}}
+    in_tx::Bool
+    # Run once, just before the next DELETE applies: another process's write landing in the
+    # window between a sweep's read and its delete.
+    before_delete::Any
+    changes::Int
+end
+
+mutable struct MockPostgresFencePool <: PormG.PormGPostgres
+    mdb::Any
+    key::String
+    log::Vector{NamedTuple{(:sql, :params, :in_tx), Tuple{String, Vector{String}, Bool}}}
+    in_tx::Bool
+    before_delete::Any
+end
+
+const MockFencePool = Union{MockSQLiteFencePool, MockPostgresFencePool}
+
+struct MockPostgresResult
+    affected::Int
+end
+
+const FENCED_DELETE_RE =
+    r"^DELETE FROM \"nitro_task\" WHERE \"status\" IN \(([^()]*)\) AND \((.*)\)$"
+const FENCED_LEG_RE = r"^\(\"id\" = (\?|\$\d+)(?: AND \"run_id\" = (\?|\$\d+))?\)$"
+
+# Parse the ext's DELETE and apply it to the table, under the database lock (one statement, one
+# lock hold -- the same granularity as every other terminal op here). Returns rows deleted.
+function _mock_fenced_delete!(c::MockFencePool, sql::String, params::Vector{String})
+    m = match(FENCED_DELETE_RE, sql)
+    m === nothing && error("MockFencePool: unmodelled statement -- $sql")
+
+    # Every value is a bound parameter, in textual order: `?` on SQLite, `$1..$n` on PostgreSQL.
+    slots = [x.match for x in eachmatch(r"\?|\$\d+", sql)]
+    expected = c isa MockSQLiteFencePool ? fill("?", length(params)) :
+                                           ["\$$i" for i in 1:length(params)]
+    slots == expected || error("MockFencePool: placeholders $slots do not bind $(length(params)) " *
+                               "parameters in order for this dialect -- $sql")
+    values = Iterators.Stateful(params)
+
+    statuses = [popfirst!(values) for _ in split(m.captures[1], ", ")]
+    runs = Tuple{String, Union{Nothing, String}}[]
+    for leg in split(m.captures[2], " OR ")
+        lm = match(FENCED_LEG_RE, leg)
+        lm === nothing && error("MockFencePool: unmodelled delete term '$leg' -- $sql")
+        id = popfirst!(values)
+        push!(runs, (id, lm.captures[2] === nothing ? nothing : popfirst!(values)))
+    end
+    isempty(values) || error("MockFencePool: parameters left unbound -- $sql")
+
+    return lock(c.mdb.lock) do
+        table = c.mdb.tables[c.key]
+        deleted = 0
+        for (id, run_id) in runs
+            row = get(table, id, nothing)
+            row === nothing && continue
+            row["status"] in statuses || continue
+            run_id === nothing || row["run_id"] == run_id || continue
+            delete!(table, id)
+            deleted += 1
+        end
+        deleted
+    end
+end
+
+function PormG.ConnectionPool.fetch(c::MockFencePool, sql::String, params::AbstractVector;
+                                    kwargs...)
+    push!(c.log, (sql = sql, params = Vector{String}(params), in_tx = c.in_tx))
+    hook, c.before_delete = c.before_delete, nothing
+    hook === nothing || hook()
+    n = _mock_fenced_delete!(c, sql, Vector{String}(params))
+    c isa MockSQLiteFencePool || return MockPostgresResult(n)
+    c.changes = n
+    return nothing
+end
+
+# SQLite's row count: `changes()`, which PormG requires on the connection that ran the DELETE.
+function PormG.ConnectionPool.fetch(c::MockSQLiteFencePool, sql::String; kwargs...)
+    push!(c.log, (sql = sql, params = String[], in_tx = c.in_tx))
+    sql == "SELECT changes() AS n" || error("MockFencePool: unmodelled statement -- $sql")
+    return [(n = c.changes,)]
+end
+
+function PormG.ConnectionPool.run_in_transaction(f::Function, c::MockFencePool)
+    c.in_tx && error("MockFencePool: nested transaction")
+    c.in_tx = true
+    try
+        return f()
+    finally
+        c.in_tx = false
+    end
+end
+
+PormG.backend_num_affected_rows(::MockPostgresFencePool, r::MockPostgresResult) = r.affected
+
+# The pool a mock database answers raw statements on for `key`, built on first use.
+function mock_fence_pool(mdb, key::String)
+    return lock(mdb.lock) do
+        get!(mdb.fence_pools, key) do
+            log = NamedTuple{(:sql, :params, :in_tx), Tuple{String, Vector{String}, Bool}}[]
+            mdb.dialect[] === :postgres ? MockPostgresFencePool(mdb, key, log, false, nothing) :
+                                          MockSQLiteFencePool(mdb, key, log, false, nothing, 0)
+        end
+    end
+end
+
 # The extension module itself, for the private `task_model` accessor the #202 guard drives.
 const PormGExt = Base.get_extension(Nitro, :NitroPormGExt)
+
+# `_delete_target` is the ext's one seam between a store and the connection its fenced DELETE
+# runs on. The real method takes a `PormG.PormGModel`; the doubles are not one, so they supply the
+# pool above. A method for our own type, so it adds to the ext's function rather than replacing it.
+PormGExt._delete_target(m::Union{MockTaskModel, FlakyReadModel, RacingWatcherModel}, key::String) =
+    (mock_fence_pool(getfield(m, :mdb), key), "nitro_task")
+
+# The statements a mock database's fenced-delete pool ran, for `key`.
+fence_log(m, key::String="db") = mock_fence_pool(getfield(m, :mdb), key).log
 
 # FAIL, do not skip (#128). This branch used to be
 # `@test_skip "PormG is not available, ..."`, which the Test stdlib reports as
@@ -1065,10 +1218,15 @@ else
             @test get_task_info(store_d, a.id) === nothing
             @test try_delete_task!(store_d, a.id, (COMPLETED,); run_id=a.run_id) == false
 
-            # The fence rode the delete's own filter, as `try_transition!`'s does.
-            fenced = filter(f -> haskey(f, "run_id"), store_d.model._filters_seen)
-            @test !isempty(fenced)
-            @test all(f -> haskey(f, "status__@in") && haskey(f, "id"), fenced)
+            # The fence rode the DELETE's own WHERE clause, as `try_transition!`'s rides its
+            # UPDATE's. This used to assert on the queryset filter instead -- but a filter handed
+            # to PormG's `delete()` lands in a subquery PostgreSQL does not re-check, which is
+            # the defect (#379), so the statement that ran is what has to carry it.
+            deletes = filter(s -> startswith(s.sql, "DELETE") && string(a.run_id) in s.params,
+                             fence_log(store_d.model))
+            @test length(deletes) == 3
+            @test all(s -> occursin("\"run_id\" = ", s.sql) && occursin("\"status\" IN (", s.sql) &&
+                           !occursin("SELECT", s.sql), deletes)
 
             # And `release_task!` drives it end to end on this backend.
             b = TaskInfo("warm-cache-2")
@@ -1077,6 +1235,146 @@ else
             @test release_task!(b.id, System(); runtime=rt_store_d) ==
                   Dict{Symbol, Any}(:status => "Task released")
             @test get_task_info(store_d, b.id) === nothing
+        end
+
+        @testset "a fenced delete keeps every predicate on the target row (#379)" begin
+            for dialect in (:sqlite, :postgres)
+                @testset "$dialect" begin
+                    m = MockTaskModel(MockDB("db"; dialect=dialect))
+                    store_f = RealPormGWorkerStore(model=m)
+                    a = TaskInfo("fence-a"); a.status = COMPLETED; replace_task!(store_f, a.id, a)
+                    b = TaskInfo("fence-b"); b.status = COMPLETED; replace_task!(store_f, b.id, b)
+
+                    # A value that would widen the statement if it were spliced rather than bound.
+                    @test try_delete_task!(store_f, "fence-a' OR '1'='1", (COMPLETED,);
+                                           run_id=nothing) == false
+                    @test try_delete_task!(store_f, a.id, (COMPLETED,); run_id=a.run_id) == true
+                    @test get_task_info(store_f, a.id) === nothing
+                    @test get_task_info(store_f, b.id) !== nothing
+
+                    deletes = filter(s -> startswith(s.sql, "DELETE"), fence_log(m))
+                    @test length(deletes) == 2
+                    # No subquery: PostgreSQL re-checks a waiting DELETE's own WHERE clause against
+                    # the row a concurrent UPDATE left, and only that clause.
+                    @test all(s -> !occursin("SELECT", s.sql), deletes)
+                    # Bound, never spliced: no parameter value appears in the statement text.
+                    @test all(s -> all(p -> !occursin(p, s.sql), s.params), deletes)
+
+                    slot(i) = dialect === :postgres ? "\$$i" : "?"
+                    @test last(deletes).sql ==
+                          "DELETE FROM \"nitro_task\" WHERE \"status\" IN ($(slot(1))) AND " *
+                          "((\"id\" = $(slot(2)) AND \"run_id\" = $(slot(3))))"
+                    @test last(deletes).params == ["COMPLETED", a.id, string(a.run_id)]
+
+                    if dialect === :sqlite
+                        # `changes()` is per-connection: it has to follow its DELETE inside the one
+                        # transaction that pins the connection, or it reads another statement's count.
+                        log = fence_log(m)
+                        i = findlast(s -> startswith(s.sql, "DELETE"), log)
+                        @test log[i].in_tx
+                        @test log[i + 1].sql == "SELECT changes() AS n" && log[i + 1].in_tx
+                    end
+                end
+            end
+        end
+
+        @testset "cleanup_tasks! fences each pruned row on its run, in bounded batches (#379)" begin
+            m = MockTaskModel()
+            store_p = RealPormGWorkerStore(model=m)
+            old = now(UTC) - Day(30)
+            stale_row(id, run_id) = Dict{String,Any}(
+                "id" => id, "run_id" => run_id, "status" => "COMPLETED",
+                "progress" => 100.0, "result" => "", "error" => "",
+                "created_at" => old, "started_at" => old, "completed_at" => old,
+                "watchers" => "[]", "queue_name" => "default")
+
+            # Another process re-runs `rerun` between the sweep's read and its delete. The re-run
+            # replaces the run id; the sweep read the old one, so its delete no longer matches.
+            m._table["rerun"] = stale_row("rerun", "run-old")
+            m._table["gone"] = stale_row("gone", "run-gone")
+            pool = mock_fence_pool(getfield(m, :mdb), "db")
+            pool.before_delete = () -> begin
+                row = m._table["rerun"]
+                row["run_id"] = "run-new"; row["status"] = "PENDING"; row["completed_at"] = nothing
+            end
+            @test cleanup_tasks!(store_p, 7) == 1
+            @test haskey(m._table, "rerun") && m._table["rerun"]["run_id"] == "run-new"
+            @test !haskey(m._table, "gone")
+
+            # A large sweep is chunked, not one statement per row nor one unbounded statement.
+            empty!(m._table)
+            n = 2 * PormGExt._FENCED_DELETE_CHUNK + 3
+            for i in 1:n
+                m._table["old-$i"] = stale_row("old-$i", "run-$i")
+            end
+            empty!(pool.log)
+            empty!(m._filters_seen)
+            @test cleanup_tasks!(store_p, 7) == n
+            @test isempty(m._table)
+            @test count(s -> startswith(s.sql, "DELETE"), pool.log) == 3
+            # ...and READ a page at a time, past a keyset cursor: the first sweep after this fix
+            # meets the whole backlog that the Tuple bug left behind.
+            @test count(f -> haskey(f, "id__@gt"), m._filters_seen) == 2
+
+            # A page that fails costs the rest of the sweep, not the count of what already went.
+            for i in 1:n
+                m._table["old-$i"] = stale_row("old-$i", "run-$i")
+            end
+            pool.before_delete = () -> (pool.before_delete = () -> error("connection reset"))
+            @test cleanup_tasks!(store_p, 7) == PormGExt._FENCED_DELETE_CHUNK
+
+            # A Ctrl-C leaves BARE, so the retention scheduler's `e isa InterruptException` sees
+            # it. PormG hands it back wrapped, and the sweep's catch-all used to swallow it.
+            pool.before_delete = () -> throw(PormG.OperationalError("sqlite", InterruptException()))
+            @test_throws InterruptException cleanup_tasks!(store_p, 7)
+        end
+
+        @testset "the mock refuses a Tuple for `__@in`, as PormG does (#379)" begin
+            # The meta-test for the guard in `_filtered_rows_locked`: without it, the cleanup
+            # assertions above could pass against the Tuple that made every real sweep throw.
+            m = MockTaskModel()
+            @test_throws "accepts only a Vector" m.objects.db("db").filter(
+                "status__@in" => ("COMPLETED",)).list()
+            @test m.objects.db("db").filter("status__@in" => ["COMPLETED"]).list() == []
+        end
+
+        @testset "a real model's fenced delete refuses what PormG's delete() refuses (#379)" begin
+            # The raw DELETE bypasses `delete()`, so it re-applies `delete()`'s refusals itself:
+            # a read-only connection, and a model outside the open transaction's connection.
+            key = "nitro-test-task-fence"
+            haskey(PormG.config, key) &&
+                error("test-only PormG connection key is already registered: $key")
+            for writable in (false, true)
+                PormG.config[key] = FakeFenceSettings(FakeTaskPool(String[]), writable)
+                try
+                    model = getproperty(PormGExt, :task_model)(key)
+                    if writable
+                        pool, table = PormGExt._delete_target(model, key)
+                        @test pool === PormG.config[key].connections
+                        @test table == "nitro_task"
+
+                        # The physical table comes from the model, `db_table` included, and is
+                        # quoted the way PormG quotes an identifier.
+                        model.db_table = "tasks \"v2\""
+                        @test last(PormGExt._delete_target(model, key)) == "tasks \"v2\""
+                        @test PormGExt._quote_identifier("tasks \"v2\"") == "\"tasks \"\"v2\"\"\""
+                        model.db_table = nothing
+
+                        # A transaction open on another connection cannot take this model's
+                        # delete -- `delete()`'s cross-connection refusal, kept.
+                        PormG.with_tx_context(FakeTaskPool(String[]), nothing) do
+                            @test_throws PormG.TransactionError PormGExt._delete_target(model, key)
+                        end
+                    else
+                        @test_throws PormG.WritesDisabledError PormGExt._delete_target(model, key)
+                        store_ro = RealPormGWorkerStore(model=model, db_key=key)
+                        @test_throws PormG.WritesDisabledError try_delete_task!(
+                            store_ro, "x", (COMPLETED,); run_id=nothing)
+                    end
+                finally
+                    delete!(PormG.config, key)
+                end
+            end
         end
 
         @testset "replace_task! publishes a new run id; set_task! leaves it alone (#108)" begin
