@@ -18,7 +18,7 @@ timeouts by default:
 | Keyword | Before | After |
 |---|---|---|
 | `read_header_timeout` | off | **120 s** — a request head must arrive within it, or the server answers `408` and closes the connection |
-| `idle_timeout` | off | **120 s** — an idle HTTP/2 connection is closed |
+| `idle_timeout` | off | **120 s** — bounds the wait for the next request when `read_header_timeout` and `read_timeout` are both `0` |
 | `read_timeout`, `write_timeout` | off | off (unchanged) |
 
 Two consequences of how HTTP.jl 2.7 applies these on HTTP/1.1, the protocol browsers and reverse

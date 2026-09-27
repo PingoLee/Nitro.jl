@@ -146,6 +146,25 @@ Base.show(io::IO, s::Server{<:NitroStreamHandler}) =
     print(io, "HTTP.Server(", something(s.bound_address, s.address), ")")
 Base.show(io::IO, ::MIME"text/plain", s::Server{<:NitroStreamHandler}) = show(io, s)
 
+# Nitro speaks HTTP/1.1 only (#375). HTTP.jl sniffs every plaintext connection for the cleartext
+# HTTP/2 (h2c) prior-knowledge preface and has no switch to turn that off, so without this any
+# client could opt into its h2 frame loop, and into Nitro's stream-level code on h2 streams, which
+# was written for HTTP/1.1: a 413 or 503 refusal cannot bound its swallow in time there (an
+# announced body that never arrives holds a `max_concurrent_requests` slot indefinitely), and
+# HTTP.jl's h2 server leaks flow-control credit and stream state when it discards a body. No
+# browser speaks h2c, and `serve` binds plaintext only, so HTTP/2 belongs at the TLS-terminating
+# proxy. Go (`Protocols.SetUnencryptedHTTP2`) and Node (a separate `http2.createServer`) also keep
+# h2c off a plain listener by default.
+#
+# Reporting "not h2" with nothing consumed hands the connection to the HTTP/1.1 parser untouched;
+# a preface then fails as a request line with no `Host` and is answered 400 with the connection
+# closed. `_serve_h1_conn!` arms its own header deadline, so the probe's is not missed. Constrained
+# to `NitroStreamHandler` like the `show` above: not piracy, and no other `HTTP.Server` changes.
+# `conn` is typed as in HTTP's method, or the two are ambiguous. Deleting this method re-enables
+# h2c; the internals it names are canaried in test/http_internals_contract_tests.jl.
+HTTP._probe_h2_preface!(::Server{<:NitroStreamHandler}, conn::HTTP.TCP.Conn) =
+    (false, HTTP._ServerPrefaceConn(UInt8[], conn))
+
 # Documented on the public `Nitro.serve` (src/methods.jl), which is the binding users call and
 # the one `docs/` renders. A docstring here is a second copy Documenter counts as missing (#186).
 function serve(ctx::App;

@@ -86,16 +86,16 @@ not cut by it — the Go semantics. Set `read_timeout` to bound the body too.
 const DEFAULT_READ_HEADER_TIMEOUT_SECONDS :: Float64 = 120.0
 
 """
-Default for `serve(idle_timeout = …)`: seconds an HTTP/2 connection with no open stream is kept
-before it is closed (#316).
+Default for `serve(idle_timeout = …)`: seconds an idle connection is kept before it is closed
+(#316).
 
 Kept equal to [`DEFAULT_READ_HEADER_TIMEOUT_SECONDS`](@ref Nitro.Core.Constants.DEFAULT_READ_HEADER_TIMEOUT_SECONDS)
-on purpose. On HTTP/1.1 HTTP.jl 2.7 overwrites this deadline with the header deadline before it
-can fire, so on the connections a browser or a reverse proxy actually opens, the header timeout
-*is* the idle limit. This value applies to cleartext HTTP/2, and to HTTP/1.1 when both
+on purpose. HTTP.jl 2.7 overwrites this deadline with the header deadline before it can fire, so
+the header timeout *is* the idle limit. This value applies only when both
 `read_header_timeout` and `read_timeout` are `0`: then nothing overwrites it, and it bounds the
-wait for the next request's head instead. Either way Nitro clears it once a head has arrived, so it never reaches
-into a request body. Equal values mean none of these cases changes behavior.
+wait for the next request's head instead. Either way Nitro clears it once a head has arrived, so
+it never reaches into a request body. (It was also HTTP/2's idle limit, until #375 took
+cleartext HTTP/2 off Nitro's listeners.)
 """
 const DEFAULT_IDLE_TIMEOUT_SECONDS :: Float64 = 120.0
 

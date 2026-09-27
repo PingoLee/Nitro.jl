@@ -4,6 +4,22 @@ This page is about the Julia process itself: how many threads to give it and how
 tell its garbage collector it has. What sits in *front* of that process — TLS, static assets,
 body caps, the real client IP — is covered in [Behind a Reverse Proxy](reverse_proxy.md).
 
+## HTTP/1.x only
+
+`serve` listens in plaintext and speaks **HTTP/1.x only**. A client that opens a connection with
+the cleartext HTTP/2 (h2c) preface is answered `400` and disconnected. No browser speaks h2c, so
+the only clients this turns away are ones configured for it on purpose. HTTP/2 and TLS belong at
+the reverse proxy, which should talk HTTP/1.1 to Nitro. nginx's `proxy_pass` never speaks HTTP/2
+upstream (keep the `proxy_http_version 1.1` from [Behind a Reverse Proxy](reverse_proxy.md): its
+default is 1.0, which loses keep-alive). Proxies and platforms that can be told to use HTTP/2
+upstream need that turned off: Caddy's `versions h2c` transport option, an Envoy cluster with
+HTTP/2 protocol options, Cloud Run's "end-to-end HTTP/2".
+
+h2c is refused rather than served because Nitro's request handling, and HTTP.jl's HTTP/2 server
+under it, were not safe on it. For example, a `413` or `503` refusal on an HTTP/2 stream could not
+bound its wait for a body that never arrives, and so could hold a `max_concurrent_requests` slot
+forever ([#375](https://github.com/PingoLee/Nitro.jl/issues/375)).
+
 ## Threads
 
 `serve()` runs every request on its own `Threads.@spawn` task in Julia's default thread pool. There
@@ -110,13 +126,13 @@ serve(app; max_body_bytes = 16 * 1024^2, max_concurrent_requests = 64)
 ```
 
 A request that arrives with the limit already in flight is answered `503` with `Retry-After: 1`
-before its body is read; on HTTP/1.1 its connection is then closed. Each HTTP/2 stream counts as
-one request. A request holds its slot while its body is read, its handler runs and its response is
-written to the socket. That includes a streamed `Res.file`: it has a length, and HTTP.jl buffers a
-response with a length whole on HTTP/1.1, so a large download counts against memory like any other
-response. Only a response with no length — `Res.sse` — gives its slot back once it starts
-streaming, because it holds one chunk at a time and can stay open for hours. A `STREAM` handler
-holds its slot for its whole lifetime, so leave room for those in the number.
+before its body is read, and its connection is then closed. A request holds its slot while its
+body is read, its handler runs and its response is written to the socket. That includes a streamed
+`Res.file`: it has a length, and HTTP.jl buffers a response with a length whole, so a large
+download counts against memory like any other response. Only a response with no length —
+`Res.sse` — gives its slot back once it starts streaming, because it holds one chunk at a time
+and can stay open for hours. A `STREAM` handler holds its slot for its whole lifetime, so leave
+room for those in the number.
 
 A **WebSocket** holds its slot for its whole lifetime too, unless you give WebSockets a budget of
 their own. A few hundred idle chat or notification sockets would otherwise fill the cap while using
