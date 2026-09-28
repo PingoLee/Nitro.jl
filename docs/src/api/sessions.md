@@ -20,6 +20,7 @@ set_cookie!
 SessionMiddleware
 SessionPruner
 regenerate_session!
+rehash_session!
 AbstractSessionStore
 Nitro.Core.Types.SessionPayload
 MemoryStore

@@ -365,6 +365,10 @@ end
 
 This invalidates the previous authenticated session on the server side and writes a fresh anonymous session cookie on the response.
 
+That ends only the session that sent the logout. To end every session of the user, on every device,
+configure `SessionMiddleware(session_auth_hash = …)`; see
+[Signing Out Everywhere](cookies/sessions.md#Signing-Out-Everywhere).
+
 ## Session Regeneration
 
 After login or any privilege change, regenerate the session ID to prevent session-fixation attacks:

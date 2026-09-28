@@ -5,7 +5,7 @@ using Dates
 using JSON
 using UUIDs
 using ...Types: AbstractSessionStore, MemoryStore, SessionPayload, Nullable, is_expired,
-    update_session!, delete_session!
+    update_session!, delete_session!, SESSION_AUTH_HASH_KEY, _session_auth_hash_current
 using ...Types: CookieConfig, LifecycleMiddleware
 using ..JanitorMiddleware: _janitor
 using ...Cookies: get_cookie, set_cookie!, storesession!, prunesessions!, regenerate_session!,
@@ -14,7 +14,7 @@ using ...Crypto: secure_uuid4
 using ...Errors: is_unrecoverable
 using ...Core: own_response_headers
 
-export SessionMiddleware, SessionPruner
+export SessionMiddleware, SessionPruner, rehash_session!
 
 # There is deliberately NO default store (#171). A `const DEFAULT_STORE` used to live here, and
 # every `SessionMiddleware()` built without `store=` shared that one process-wide instance --
@@ -103,7 +103,7 @@ const MAX_ABSOLUTE_MAX_AGE = 100 * 365 * 86400
 
 """
     SessionMiddleware(; store, cookie_name, max_age, absolute_max_age, prune_interval,
-                        rotate_on_auth, auth_key, validator, ...)
+                        rotate_on_auth, auth_key, validator, session_auth_hash, ...)
 
 Creates a `LifecycleMiddleware` that manages server-side sessions with cookie-based session
 IDs. The mutable session dictionary is read with `getsession(req)` (`req.context[:session]`).
@@ -202,6 +202,52 @@ The `validator` participates in fixation detection **only**; it never populates
 is deliberate: `SessionMiddleware` owns session *state and rotation*, not the auth identity
 contract.
 
+# Signing out everywhere (`session_auth_hash`)
+
+`session_auth_hash::Union{Function, Nothing} = nothing` ends **every** session of a user at once
+(#391), which a per-session logout cannot do: it only knows the id in the request that asked. The
+hook is called as `session_auth_hash(identity)`, with the identity `auth_key`/`validator` resolve
+above, and returns a string or `nothing`. The value is saved in the session when the identity is
+set (login, or a user switch) and checked every time an authenticated session is loaded. When it no
+longer matches, the session is deleted and the request continues as a new, anonymous visitor.
+
+```julia
+SessionMiddleware(; store,
+    session_auth_hash = uid -> string(find_user(uid).session_version))
+
+# "Sign out everywhere": every session the user has, on every device, ends on its next request.
+bump_session_version!(uid)
+```
+
+Nitro has no user model, so the value lives in your application. A per-user counter you bump is
+the simplest. Django's choice, derived from the stored password hash, also ends every session when
+the password changes, with no extra code. The value is stored in the session row, so derive it with
+an HMAC keyed by a server secret, never the password hash itself or a plain hash of it. Returning
+`nothing` says the user no longer exists, and the session is refused.
+
+This closes the ordering a per-session logout leaves open. If a request rotates the session just
+*before* the logout commits, the logout finds the old id gone and the rotated session lives on
+(see *Logout Semantics* in the sessions tutorial). A logout that changes the user's value ends that
+session too, whatever its id. Rotation keeps the value the session was stamped with at login, so a
+rotation cannot pick up the new one.
+
+- The value is kept under the reserved session key `"_nitro_auth_hash"`. It is removed when the
+  identity is cleared.
+- Anonymous sessions never call the hook. An authenticated one calls it once per request, so keep it
+  cheap, for example a cached column read.
+- Requests run concurrently, so the hook must be thread-safe. An exception it throws is not caught
+  and the request fails with a 500. That fails closed: a session is never accepted without a check.
+- A `validator` identity must come from the session data it is passed, not from reading the store
+  by id. The stamp is taken before the request's writes reach the store, so a store-reading
+  validator does not see a login and leaves it unstamped, and the next request then refuses it.
+  `Auth.session_user_validator` reads the data it is handed.
+- **Turning the hook on signs everyone out once.** Sessions authenticated before it have no value,
+  and nothing vouches for them.
+- To keep the current session through a password change, call [`rehash_session!`](@ref) in the
+  handler that changes it.
+- `Auth.session_user_validator` takes the same `session_auth_hash` keyword and applies the same
+  check. `get_session` and the `Session{T}` extractor do not.
+
 # Other keyword arguments
 
 - `cookie_name` — defaults to the most protected name the cookie's attributes allow (#329):
@@ -251,7 +297,8 @@ function SessionMiddleware(;
         domain = domain,
         maxage = max_age,
     ),
-    validator::Union{Function, Nothing} = nothing)
+    validator::Union{Function, Nothing} = nothing,
+    session_auth_hash::Union{Function, Nothing} = nothing)
 
     # There is no `secret_key` keyword any more (#339): it was accepted and never used, since the
     # id cookie was always written and read raw. A caller passing one reasonably believed the
@@ -286,6 +333,15 @@ function SessionMiddleware(;
             # Load the current payload and remember the auth marker before the handler runs.
             session_id = _get_session_id(req, session_cookie)
             session_data, is_new, created = _load_session(store, session_id, absolute_max_age)
+            # A signed-in session whose user has since been signed out everywhere (#391) is
+            # ended the way a session past its absolute lifetime is: deleted, and this request
+            # starts as a new visitor. Checked before the marker below is taken, so the handler
+            # sees -- and `rotate_on_auth` compares against -- the anonymous session it now has.
+            if !is_new && session_auth_hash !== nothing &&
+               _auth_hash_stale(session_data, session_id, auth_key, validator, session_auth_hash)
+                _end_session!(store, session_id, "whose sign-in was revoked")
+                session_data, is_new, created = Dict{String,Any}(), true, Dates.now(Dates.UTC)
+            end
             original_session = deepcopy(session_data)
             original_auth_marker = _auth_marker(session_data, session_id, auth_key, validator)
 
@@ -322,8 +378,16 @@ function SessionMiddleware(;
             # would also hand every store method a TTL some backends reject (Redis `EX 0`).
             # Whatever id it now lives under, the handler's own rotation included, is deleted.
             if !is_new && ttl == 0
-                _end_session!(store, final_session_id)
+                _end_session!(store, final_session_id, "past its absolute lifetime")
                 return response
+            end
+
+            # Stamp the sign-in with the user's current `session_auth_hash` (#391). Before the
+            # rotation below, so the data it moves already carries the stamp.
+            if session_auth_hash !== nothing
+                _stamp_auth_hash!(current_session, final_session_id, original_auth_marker, auth_key,
+                                  validator, session_auth_hash,
+                                  get(req.context, :session_auth_rehash, false) === true)
             end
 
             # Retire the previous ID when an existing session crosses an auth boundary. If a
@@ -460,7 +524,7 @@ function _load_session(store::AbstractSessionStore{String, Dict{String,Any}}, se
             # `SessionMiddleware` on the same store with a looser cap. Deleting it makes this
             # middleware's cap bind them all -- which is why two middlewares sharing a store
             # should share a cap too.
-            _end_session!(store, session_id)
+            _end_session!(store, session_id, "past its absolute lifetime")
             return Dict{String,Any}(), true, now
         end
         return deepcopy(payload.data), false, payload.created
@@ -481,19 +545,91 @@ function _load_session(store::AbstractSessionStore{String, Dict{String,Any}}, se
     return data, false, now
 end
 
-# Deletes a session that has outlived its absolute lifetime (#362). Nothing depends on the delete
-# succeeding: the session is treated as absent either way. So a failing store is logged and the
-# request carries on without the session, rather than failing with a 500 before the handler even
-# runs. The log names the exception's type only -- a store's own error could quote the key, and
-# the key is the credential. An interrupt, an overflow or an out-of-memory still propagates (#254).
-function _end_session!(store::AbstractSessionStore, session_id::String)
+# Deletes a session this middleware refuses: one that has outlived its absolute lifetime (#362),
+# or whose sign-in a `session_auth_hash` change revoked (#391). `why` completes "a session ..." in
+# the log. Nothing depends on the delete succeeding: the session is treated as absent either way.
+# So a failing store is logged and the request carries on without the session, rather than
+# failing with a 500 before the handler even runs. The log names the exception's type only -- a
+# store's own error could quote the key, and the key is the credential. An interrupt, an overflow
+# or an out-of-memory still propagates (#254).
+function _end_session!(store::AbstractSessionStore, session_id::String, why::String)
     try
         delete_session!(store, session_id)
     catch e
         is_unrecoverable(e) && rethrow()
-        @warn "SessionMiddleware: failed to delete a session past its absolute lifetime; it is " *
-              "refused anyway" exception_type = typeof(e)
+        @warn "SessionMiddleware: failed to delete a session $why; it is refused anyway" exception_type = typeof(e)
     end
+    return nothing
+end
+
+# Whether a loaded session's sign-in has been revoked (#391): it has an identity, and it does not
+# carry the hash `hook` gives that identity now. An anonymous session has nothing to revoke and
+# never costs a hook call.
+function _auth_hash_stale(session_data::Dict{String,Any}, session_id::String, auth_key::String,
+                          validator::Union{Function, Nothing}, hook::Function)::Bool
+    marker = _auth_marker(session_data, session_id, auth_key, validator)
+    marker === nothing && return false
+    return !_session_auth_hash_current(session_data, marker, hook)
+end
+
+# Keeps the `SESSION_AUTH_HASH_KEY` stamp in step with the session's identity at the end of a
+# request (#391). The stamp is written when the identity is SET -- a login or a user switch -- or
+# when the handler asked for it with `rehash_session!`, and removed when the identity is cleared.
+#
+# It is deliberately NOT refreshed on a rotation. That is the whole point: the #391 residual is a
+# request that rotates the session while a "sign out everywhere" lands. Re-stamping on rotation
+# would read the user's post-logout value into the rotated session and let it outlive the logout
+# it raced. A session keeps the value it was signed in with until something re-authenticates it.
+#
+# A hook answering `nothing` for a new identity leaves no stamp, so the next load refuses the
+# session; the stale stamp of a previous identity is removed rather than inherited.
+function _stamp_auth_hash!(session::Dict{String,Any}, session_id::String, original_marker,
+                           auth_key::String, validator::Union{Function, Nothing}, hook::Function,
+                           rehash::Bool)
+    marker = _auth_marker(session, session_id, auth_key, validator)
+    if marker === nothing
+        delete!(session, SESSION_AUTH_HASH_KEY)
+    elseif rehash || _auth_marker_changed(original_marker, marker)
+        stamp = hook(marker)::Nullable{AbstractString}
+        # Stored as a plain `String`, whatever string type the hook returned, so every store
+        # (PormG's JSON column included) holds the same thing.
+        stamp === nothing ? delete!(session, SESSION_AUTH_HASH_KEY) :
+                            (session[SESSION_AUTH_HASH_KEY] = String(stamp))
+    end
+    return nothing
+end
+
+"""
+    rehash_session!(req::HTTP.Request) -> Nothing
+
+Re-stamp the current session with the user's current `session_auth_hash` value at the end of this
+request, so a change that revokes the user's other sessions does not revoke this one (#391). This
+is Django's `update_session_auth_hash`.
+
+The typical case is a password change under a hook derived from the password hash, or a "sign out
+my other devices" button:
+
+```julia
+function change_password(req)
+    set_password!(current_user(req), getjson(req)["new_password"])   # the hook's value changes
+    rehash_session!(req)                           # ...and this session keeps up with it
+    regenerate_session!(req, store)                # a fresh id after a credential change
+    return Res.status(204)
+end
+```
+
+Without it, the session that made the change is refused on its next request, like every other
+session of the user.
+
+The stamp is taken when the request ends, so it is whatever the hook returns at that point. A
+"sign out everywhere" that commits while this request is still running is therefore overtaken by
+it, and this session survives. The re-stamp really did happen after the logout.
+
+This call only sets a flag. It has no effect without `SessionMiddleware(session_auth_hash = …)`,
+or when the session has no signed-in identity.
+"""
+function rehash_session!(req::HTTP.Request)
+    req.context[:session_auth_rehash] = true
     return nothing
 end
 

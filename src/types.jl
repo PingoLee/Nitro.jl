@@ -179,6 +179,29 @@ function get_session(store::AbstractSessionStore{K, V}, session_id::K) where {K,
     return payload
 end
 
+# The session key `SessionMiddleware(session_auth_hash = …)` stamps at login (#391): the hook's
+# value for the signed-in user, as it was when the session was authenticated. Django keeps the
+# same thing under `_auth_user_hash`. A plain `String`, so every store -- `PormGSessionStore`'s
+# JSON column included -- round-trips it unchanged.
+const SESSION_AUTH_HASH_KEY = "_nitro_auth_hash"
+
+# Whether `data`, a session whose identity is `marker`, still carries the hash the app's
+# `session_auth_hash` hook gives that user now (#391). One predicate for `SessionMiddleware` and
+# `Auth.session_user_validator`, so the two readers cannot disagree about which sessions a
+# "sign out everywhere" ended. `false` when the hook says the user is gone (`nothing`), and when
+# the session was never stamped -- it was authenticated before the hook was switched on, and
+# nothing vouches for it. Plain `==`: both sides are server-side values the client never sees
+# or supplies, so there is no timing oracle to close.
+function _session_auth_hash_current(data::AbstractDict, marker, hook::Function)::Bool
+    # Asserted: the hook is application code, so its result is checked here rather than carried
+    # as `Any` into the request path. Any string will do -- a `SubString` from `split` included --
+    # but a hook returning a number is a `TypeError`.
+    expected = hook(marker)::Nullable{AbstractString}
+    expected === nothing && return false
+    stored = get(data, SESSION_AUTH_HASH_KEY, nothing)
+    return stored isa AbstractString && stored == expected
+end
+
 # Required-method fallbacks. `Base.get` is not piracy: the store argument is our own type.
 #
 # Every non-store parameter is left untyped so a backend's own method is strictly more specific in
