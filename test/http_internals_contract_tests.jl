@@ -26,6 +26,9 @@ import Sockets
 #       `WebSocketError.message.code`. `_write_fixed_body_live!` (#377) writes a known-length
 #       streaming body past HTTP/1.1's FIXED buffer with the stream head/byte writers and the
 #       `Stream` write-state fields.
+#   • src/core/lifecycle.jl — refuses cleartext HTTP/2 (#375) by adding a method to the private
+#       `_probe_h2_preface!` for `Server{<:NitroStreamHandler}`, returning a
+#       `_ServerPrefaceConn` built with nothing consumed.
 #   • src/context.jl — `_shutdown_server`'s bounded drain: it depends on `close(::Server)`
 #       releasing the listener BEFORE its unbounded quiesce loop, and escalates to
 #       `HTTP.forceclose`.
@@ -320,6 +323,27 @@ end
     @test isdefined(HTTP, :_set_read_deadline!)
     @test hasmethod(HTTP._set_read_deadline!, Tuple{HTTP.TCP.Conn, Int64})
     @test hasmethod(HTTP._set_read_deadline!, Tuple{HTTP.TLS.Conn, Int64})
+end
+
+@testset "h2c refusal surface (src/core/lifecycle.jl `_probe_h2_preface!` override)" begin
+    # #375: Nitro keeps HTTP/2 off its plaintext listeners by overriding the preface probe
+    # `_serve_conn!` calls on every non-TLS connection. A rename of the function fails the
+    # method definition at load time, which is loud; the quiet failures are a changed signature or
+    # return type, which would leave Nitro's method never selected (h2c silently accepted again)
+    # or returning something `_serve_h1_conn!` cannot read. test/h2c_tests.jl is the behavioral
+    # net for `_serve_conn!` no longer calling the probe at all.
+    # Concrete server types, so each query selects exactly one method: HTTP's for any other
+    # handler, Nitro's for its own.
+    other_server = HTTP.Server{typeof(identity)}
+    nitro_server = HTTP.Server{Nitro.Core.NitroStreamHandler{typeof(identity)}}
+    @test hasmethod(HTTP._probe_h2_preface!, Tuple{HTTP.Server, HTTP.TCP.Conn})
+    @test which(HTTP._probe_h2_preface!, Tuple{other_server, HTTP.TCP.Conn}).module === HTTP
+    @test Base.return_types(HTTP._probe_h2_preface!, Tuple{other_server, HTTP.TCP.Conn}) ==
+          [Tuple{Bool, HTTP._ServerPrefaceConn{HTTP.TCP.Conn}}]
+    @test hasmethod(HTTP._ServerPrefaceConn, Tuple{Vector{UInt8}, HTTP.TCP.Conn})
+    @test which(HTTP._probe_h2_preface!, Tuple{nitro_server, HTTP.TCP.Conn}).module === Nitro.Core
+    @test Base.return_types(HTTP._probe_h2_preface!, Tuple{nitro_server, HTTP.TCP.Conn}) ==
+          [Tuple{Bool, HTTP._ServerPrefaceConn{HTTP.TCP.Conn}}]
 end
 
 @testset "live FIXED writer (src/core/transport.jl `_write_fixed_body_live!`)" begin

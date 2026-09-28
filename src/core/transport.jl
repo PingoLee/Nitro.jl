@@ -525,7 +525,9 @@ const _MAX_SWALLOW_BYTES = 2 * 1024 * 1024
 const _SWALLOW_TIMEOUT_NS = Int64(5_000_000_000)
 
 # Arm that bound before swallowing. HTTP/1.1 only, for the reason `_clear_header_deadline!` gives:
-# an HTTP/2 connection's read deadline belongs to its frame loop, not to one stream. It can
+# an HTTP/2 connection's read deadline belongs to its frame loop, not to one stream. (Unreachable
+# through `serve` since #375 refused HTTP/2, and kept so that re-enabling it would not reach across
+# streams; an h2 swallow would also be unbounded in time, which is part of why it was refused.) It can
 # lengthen a caller's shorter `read_timeout` by at most those five seconds, on a request that is
 # already being refused.
 function _bound_swallow!(stream::HTTP.Stream)::Nothing
@@ -690,8 +692,8 @@ end
 
 # The scheme the Origin is compared against, as HTTP.jl's `server_secure`. Called from inside
 # `check_origin`, never before `upgrade`: HTTP checks first that this is an HTTP/1.1 server stream,
-# and on an h2 stream `tracked` is `nothing`, so reading it early would pre-empt HTTP's own 1011
-# with an unrelated error.
+# and answers anything else with its own 1011, which this must not pre-empt. (Nitro's listeners
+# refuse HTTP/2 since #375, so that check does not fire through `serve`.)
 function _ws_secure(req::HTTP.Request, stream::HTTP.Stream)::Bool
     forwarded = get(req.context, Types.REQUEST_FORWARDED_PROTO_KEY, nothing)
     forwarded === nothing || return forwarded == "https"
@@ -996,8 +998,8 @@ end
 # has no accept hook, and `listen!` takes only its own concrete listener types, so there is nowhere
 # to count a connection before its head is parsed (Go's `netutil.LimitListener` wraps a listener
 # interface Julia's HTTP.jl does not have). It is also the right unit: an idle keep-alive connection
-# holds no body, and on HTTP/2 each stream reaches this handler separately, so one count covers
-# both protocols.
+# holds no body. (Nitro's listeners speak HTTP/1.1 only since #375, so there is no HTTP/2 stream
+# to count either.)
 #
 # The permit is taken BEFORE `_http_stream_request` reads the body — that ordering is what makes it
 # bound body memory — with a lock-free try-acquire, and a request over the cap is answered 503 at
@@ -1183,7 +1185,8 @@ end
 # Narrow on purpose:
 #   * HTTP/1.1 only. An HTTP/2 stream's deadlines belong to the connection's frame loop, which
 #     re-arms them before every frame and multiplexes other streams; touching them from one
-#     stream's handler would reach across every stream on the connection.
+#     stream's handler would reach across every stream on the connection. (Unreachable through
+#     `serve` since #375 refused HTTP/2; kept for the same reason as in `_bound_swallow!`.)
 #   * Only when `read_timeout` is unset. When it is set, HTTP has already re-armed the deadline for
 #     the body at the caller's chosen length, and that one must stand.
 #

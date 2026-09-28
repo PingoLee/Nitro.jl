@@ -40,7 +40,9 @@ is explicit introspection, not accidental disclosure.)
   a path parameter will read as `/admin/…`. Guards on the route or router remain the place to
   authorize.
 - `host="127.0.0.1"`, `port=8080`: listen address. Keep `host` on loopback when a
-  reverse proxy terminates TLS in front of Nitro.
+  reverse proxy terminates TLS in front of Nitro. The listener is plaintext **HTTP/1.x only**
+  (#375): a client that opens with the cleartext HTTP/2 (h2c) preface is answered `400` and
+  disconnected. Put HTTP/2 and TLS at the proxy, and have it speak HTTP/1.1 upstream.
 - `async=false`: when `true`, return the running `Server` instead of blocking.
 - `parallel=true`: handle requests on the thread pool via `Threads.@spawn`.
 - `serialize=true`: auto-format handler return values into responses (see `Res`).
@@ -90,17 +92,16 @@ is explicit introspection, not accidental disclosure.)
   request (`DEFAULT_MAX_FIELDS`).
 - `max_concurrent_requests=nothing`: ceiling on how many requests this server holds at once
   (#298). `nothing` means no limit. When it is set, a request arriving with that many already in
-  flight is answered **503** with `Retry-After: 1` **before its body is read**; on HTTP/1.1 its
-  connection is then closed, on HTTP/2 only its stream ends. Nothing else bounds this:
-  `--threads` limits how many requests *compute* at once, not how many are open, because a
-  request waiting on a slow body yields its thread. So this is the only setting that bounds the
-  request-body memory held at once — at most `max_concurrent_requests × max_body_bytes`, which no
-  GC target can reclaim because it is live. Each HTTP/2 stream counts as one request. A request
-  holds its slot while its body is read, its handler runs, and its response is written to the
-  socket — including a streamed `Res.file`, which is sent in chunks but holds its slot until the
-  last one is written. A response with no length (`Res.sse`) gives the slot back once it starts
-  streaming. A `STREAM` handler holds its slot for its whole lifetime, and so does a WebSocket
-  unless `max_upgraded_connections` is set.
+  flight is answered **503** with `Retry-After: 1` **before its body is read**, and its
+  connection is then closed. Nothing else bounds this: `--threads` limits how many requests
+  *compute* at once, not how many are open, because a request waiting on a slow body yields its
+  thread. So this is the only setting that bounds the request-body memory held at once — at
+  most `max_concurrent_requests × max_body_bytes`, which no GC target can reclaim because it is
+  live. A request holds its slot while its body is read, its handler runs, and its response is
+  written to the socket — including a streamed `Res.file`, which is sent in chunks but holds its
+  slot until the last one is written. A response with no length (`Res.sse`) gives the slot back
+  once it starts streaming. A `STREAM` handler holds its slot for its whole lifetime, and so does
+  a WebSocket unless `max_upgraded_connections` is set.
 
   The slot bounds how many, not for how long. With `read_timeout` unset, a client that sends a
   head and then trickles its body holds a slot as long as it likes, and without `write_timeout`
@@ -134,12 +135,12 @@ is explicit introspection, not accidental disclosure.)
   defaults to 120 rather than a few seconds: behind nginx or an AWS ALB, whose idle upstream
   connections time out at 60 seconds, the proxy must be the side that closes first. See
   `DEFAULT_READ_HEADER_TIMEOUT_SECONDS`.
-- `idle_timeout=120`: seconds an HTTP/2 connection with no open stream is kept. On HTTP/1.1 the
-  header timeout above takes its place.
+- `idle_timeout=120`: seconds a connection waits for its next request when both
+  `read_header_timeout` and `read_timeout` are `0`. Otherwise `read_header_timeout` takes its
+  place, or `read_timeout` when only that one is set.
 - `read_timeout`, `write_timeout`: **off** by default, forwarded to `HTTP.listen!`.
   `read_timeout` is one deadline for the body *and* every read the handler makes, counted from
-  the end of the head, and answers **408** when it fires; on HTTP/2 it is instead the longest
-  gap between frames from the client, which a quiet SSE stream can exceed. `write_timeout`
+  the end of the head, and answers **408** when it fires. `write_timeout`
   limits each write to the socket. A streamed body — `Res.file(...; stream = true)`, a mounted
   file over `stream_threshold` — is written in 64 KiB chunks, so it bounds each chunk: a long
   download is cut only when the client takes longer than `write_timeout` to accept one of them.
