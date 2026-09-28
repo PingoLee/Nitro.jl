@@ -54,6 +54,7 @@ jobs:
     # red required check trains you to stop reading CI. Keep them out of the required set.
     #
     #   nightly      — compiler and Base churn two releases out. Permanently advisory.
+    #                  Currently PARKED (commented out in the matrix below) -- see there.
     #
     # `~1.13.0-0` used to be listed here too, because no ReTestItems release could run on
     # 1.13 and the job died before the first assertion. v1.35.3 runs there — the job now
@@ -64,7 +65,7 @@ jobs:
       fail-fast: false
       matrix:
         # `1.12` is the floor `[compat]` declares (`julia = "^1.12"`), so it gets the full
-        # OS x thread-count grid. The two `include`s below cover the rest of that bound and
+        # OS x thread-count grid. The `include`s below cover the rest of that bound and
         # the future, one job each -- version-specific breakage is not OS-specific, so there
         # is nothing to learn from running them three times.
         version:
@@ -75,22 +76,22 @@ jobs:
           - windows-latest
         threads: [1, 2]
         include:
-          # The next release. `[compat]` promises `julia = "^1.12"`, i.e. 1.13+ as well, and
-          # this is the entry that actually tests that claim.
+          # The release above the floor. `[compat]` promises `julia = "^1.12"`, i.e. 1.13+ as
+          # well, and this is the entry that actually tests that claim.
           #
           # It replaces a `version: '1'` (latest stable) entry, which sounded like it covered
-          # this but did not: `'1'` resolves to whatever is *released*, and that is still
-          # 1.12.7 — so it ran an exact duplicate of the floor jobs above while 1.13, already
-          # at rc4, went untested. Latest-stable is only useful here once it stops being the
-          # floor, and by then this entry already covers it.
+          # this but did not: `'1'` resolves to whatever is *released*, which was still 1.12.x
+          # while 1.13 sat in rc -- so it ran an exact duplicate of the floor jobs above while
+          # 1.13 went untested.
           #
           # `~1.13.0-0` rather than `'1.13'` because plain semver ranges exclude
           # pre-releases; the `-0` lower bound opts them in. It resolves to >=1.13.0-0 and
-          # <1.14.0, so it picks up the newest 1.13 pre-release now and keeps covering 1.13.x
-          # after release — no bump needed when 1.13.0 ships.
+          # <1.14.0: it tracked the 1.13 rcs, and now that 1.13 has shipped it resolves to the
+          # newest 1.13.x patch (1.13.1 as of 2026-09) with no edit.
           #
-          # MAINTENANCE: when 1.14 enters pre-release, bump this to `~1.14.0-0`. There is no
-          # self-maintaining "next release" spec (julia-actions/setup-julia#84 proposes one).
+          # MAINTENANCE: when 1.14 enters pre-release, bump this to `~1.14.0-0` -- and at the
+          # same time restore the `nightly` entry below. There is no self-maintaining "next
+          # release" spec (julia-actions/setup-julia#84 proposes one).
           - version: '~1.13.0-0'
             os: ubuntu-latest
             threads: 2
@@ -100,9 +101,14 @@ jobs:
           # inference as an API property -- `test/handler_tests.jl` asserts an exact
           # `Base.infer_return_type`. Nightly is how that surfaces before a stable release,
           # not after.
-          - version: 'nightly'
-            os: ubuntu-latest
-            threads: 2
+          #
+          # PARKED: 1.13 has just shipped, so nightly is 1.14-DEV -- a full cycle before any
+          # 1.14 pre-release -- and ReTestItems cannot run there at all (#112), so the job
+          # died before the first assertion and only painted every PR red. Restore it
+          # together with the `~1.14.0-0` bump above. `continue-on-error` stays keyed on it.
+          # - version: 'nightly'
+          #   os: ubuntu-latest
+          #   threads: 2
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
