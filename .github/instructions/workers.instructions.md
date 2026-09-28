@@ -305,6 +305,22 @@ decide.
   write `watchers` **or `run_id`** — neither is volatile state, and carrying them on every
   transition is how grants got clobbered. `replace_task!` has exactly one caller: re-running a
   finished key, which by design resets the watcher list and publishes the new run's identity.
+  - **A write that finds its row gone splits the two** ([#379](https://github.com/PingoLee/Nitro.jl/issues/379)).
+    `replace_task!` must still leave the record written: a row deleted between its read and its
+    write is created, and a create that loses to a concurrent insert updates that row instead. A
+    0-row UPDATE there used to be ignored, so the re-run had no record and silently never ran.
+    `set_task!` must do the opposite and leave a vanished row gone, because a state save that
+    recreated it would undo a `release_task!` or a retention prune.
+- **A fenced delete never goes through PormG's `delete()`** ([#379](https://github.com/PingoLee/Nitro.jl/issues/379)).
+  `delete()` puts its filters in a subquery, `DELETE … WHERE "id" IN (SELECT "id" … WHERE
+  <filters>)`. After a lock wait, PostgreSQL's READ COMMITTED re-checks only the outer `"id" IN`,
+  so a `run_id`/`status` fence placed there is ignored exactly when it matters. A key re-run in
+  that window lost its fresh `PENDING` row. SQLite serializes writers and cannot show it, so no
+  mock-backed test can either. Any delete whose filter is a *guard* rather than a selection goes
+  through the ext's `_fenced_delete!`: one raw, parameterized DELETE with every predicate on the
+  target row, which is the shape `update()` already has and PostgreSQL does re-check. Plain
+  selection by id (`delete_task!`) may keep using `delete()`. The PormG side is tracked in
+  [PormG#765](https://github.com/PingoLee/PormG.jl/issues/765).
 - **A terminal write is addressed to a RUN, not to a task id.** A task id outlives the run writing
   under it: re-running a finished key builds a fresh record while the previous run may still be in
   flight, and a status-only precondition cannot tell the two apart

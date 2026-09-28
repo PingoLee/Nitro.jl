@@ -233,8 +233,9 @@ CSRFMiddleware(secret::Union{AbstractString, SecretString};  # needs SessionMidd
 
 SessionMiddleware(; store,                           # REQUIRED -- no default (#171)
                     cookie_name      = nothing,      # => __Host-nitro_session (#329); see below
-                    secret_key       = nothing,      # accepted, never used (#339)
-                    max_age::Int     = 86400,
+                    max_age::Int     = 86400,        # sliding: each write moves the expiry
+                    absolute_max_age = 7 * 86400,    # cap from creation (#362); nothing = off;
+                                                     # > 100 years is an ArgumentError
                     prune_interval   = Minute(10),   # background janitor period (#36)
                     secure           = true,
                     httponly         = true,
@@ -242,7 +243,14 @@ SessionMiddleware(; store,                           # REQUIRED -- no default (#
                     path             = "/",
                     domain           = nothing,
                     rotate_on_auth   = true,
-                    auth_key         = "user_id")
+                    auth_key         = "user_id",
+                    validator        = nothing,      # identity fallback when auth_key is absent
+                    config           = CookieConfig(…))   # or the attributes above, not both
+# No `secret_key`: the cookie is a random id, so there is nothing to encrypt. Passing one is a
+# MethodError; a `config` carrying one is an ArgumentError (#339).
+# A session older than `absolute_max_age` is absent, however active. Rotation keeps its clock;
+# a rotated session left empty and anonymous (a logout) starts a fresh one. Every write and the
+# cookie Max-Age stop at the deadline, so readers that skip the middleware enforce it too.
 # Returns a LifecycleMiddleware, not a bare function: expired sessions are pruned by a
 # background janitor that starts on serve() and stops on terminate(). A middleware list
 # accepts it as-is; only hand-composition needs `.middleware`:
@@ -433,8 +441,8 @@ watcher is then refused unless `set_watch_authorizer!` allows it. The queue auth
 
 ## Cookies, crypto, and secrets
 
-`configcookies`, `get_cookie`, `set_cookie!`, `regenerate_session!(req, store; ttl=3600)`,
-`SecretString`, `reveal`.
+`configcookies`, `get_cookie`, `set_cookie!`, `regenerate_session!(req, store; ttl=3600)` (returns
+the new id, or `nothing` if a concurrent logout got there first, #361), `SecretString`, `reveal`.
 
 ```julia
 configcookies(app; secret_key = SecretString(ENV["COOKIE_SECRET"]))   # returns nothing

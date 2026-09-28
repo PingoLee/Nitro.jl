@@ -847,55 +847,108 @@ function get_task_info(store::PormGWorkerStore, task_id::String)
     end
 end
 
+# A fresh row has no watchers to preserve, so a create always writes them, whichever entry point
+# it came through.
+function _create_task_row!(store::PormGWorkerStore, record)
+    _task_objects(store).create(
+        "id" => record["id"],
+        "run_id" => record["run_id"],
+        "status" => record["status"],
+        "progress" => record["progress"],
+        "result" => record["result"],
+        "error" => record["error"],
+        "created_at" => record["created_at"],
+        "started_at" => record["started_at"],
+        "completed_at" => record["completed_at"],
+        "watchers" => record["watchers"],
+        "queue_name" => record["queue_name"],
+    )
+    return nothing
+end
+
+# Rows written by an UPDATE of an existing record.
+function _update_task_row!(store::PormGWorkerStore, task_id::String, record, full_record::Bool)
+    columns = Pair{String, Any}[
+        "status" => record["status"],
+        "progress" => record["progress"],
+        "result" => record["result"],
+        "error" => record["error"],
+        "created_at" => record["created_at"],
+        "started_at" => record["started_at"],
+        "completed_at" => record["completed_at"],
+        "queue_name" => record["queue_name"],
+    ]
+    # `watchers` and `run_id` ride along ONLY for `replace_task!`. Including
+    # `watchers` on every save is what made ordinary state transitions clobber grants
+    # appended by another process since this one last read the row (#88) — and
+    # transitions are far more frequent than appends, so that was the dominant loss
+    # path. `run_id` is excluded for a sharper reason: it is the value
+    # `try_transition!` fences on, so a state save that carried it would let whichever
+    # run wrote last adopt the record's identity and defeat the fence (#108).
+    if full_record
+        push!(columns, "watchers" => record["watchers"])
+        push!(columns, "run_id" => record["run_id"])
+    end
+    changed = _task_objects(store).filter("id" => task_id).update(columns...)
+    return changed isa Integer ? Int(changed) : 0
+end
+
+# How many read -> write rounds `replace_task!` gets. A round is lost only when another process
+# deletes or creates this one row between our read and our write, so this is generous.
+const _REPLACE_ATTEMPTS = 8
+
 function _write_task!(store::PormGWorkerStore, task_id::String, task_info::TaskInfo, full_record::Bool)
     record = _to_db_record(task_info)
     try
+        full_record && return _replace_task_row!(store, task_id, record, task_info)
         existing = _task_objects(store).filter("id" => task_id).first()
         if isnothing(existing)
-            # A fresh row has no watchers to preserve, so the create branch always
-            # writes them whichever entry point we came through.
-            _task_objects(store).create(
-                "id" => record["id"],
-                "run_id" => record["run_id"],
-                "status" => record["status"],
-                "progress" => record["progress"],
-                "result" => record["result"],
-                "error" => record["error"],
-                "created_at" => record["created_at"],
-                "started_at" => record["started_at"],
-                "completed_at" => record["completed_at"],
-                "watchers" => record["watchers"],
-                "queue_name" => record["queue_name"],
-            )
+            _create_task_row!(store, record)
         else
-            columns = Pair{String, Any}[
-                "status" => record["status"],
-                "progress" => record["progress"],
-                "result" => record["result"],
-                "error" => record["error"],
-                "created_at" => record["created_at"],
-                "started_at" => record["started_at"],
-                "completed_at" => record["completed_at"],
-                "queue_name" => record["queue_name"],
-            ]
-            # `watchers` and `run_id` ride along ONLY for `replace_task!`. Including
-            # `watchers` on every save is what made ordinary state transitions clobber grants
-            # appended by another process since this one last read the row (#88) — and
-            # transitions are far more frequent than appends, so that was the dominant loss
-            # path. `run_id` is excluded for a sharper reason: it is the value
-            # `try_transition!` fences on, so a state save that carried it would let whichever
-            # run wrote last adopt the record's identity and defeat the fence (#108).
-            if full_record
-                push!(columns, "watchers" => record["watchers"])
-                push!(columns, "run_id" => record["run_id"])
-            end
-            _task_objects(store).filter("id" => task_id).update(columns...)
+            # A 0-row UPDATE is deliberately a no-op HERE, and only here. It means the record
+            # was deleted after our read -- released, pruned, or deleted in another process --
+            # and a state save must not resurrect it: a released run's own terminal write
+            # "finds no record and stores nothing" (`release_task!`). `replace_task!` is the
+            # opposite case, below.
+            _update_task_row!(store, task_id, record, false)
         end
     catch e
         @warn "PormGWorkerStore: failed to write task" exception=(e, catch_backtrace())
         rethrow()
     end
     return task_info
+end
+
+# `replace_task!` writes the record "replacing whatever is stored" -- including nothing. Its one
+# caller is a re-run publishing its new run, and a 0-row UPDATE there used to be ignored: a record
+# deleted between our read and our write (by `release_task!`, retention, or `delete_task!` in
+# another process) left the re-run with no record, `_claim_run!` declined it, and the submit
+# returned normally for a task that never ran (#379). So each lost round goes around again:
+# vanished -> create it; a concurrent creator won the insert -> update what it wrote. That is the
+# upsert `InMemoryWorkerStore.replace_task!` already is.
+function _replace_task_row!(store::PormGWorkerStore, task_id::String, record, task_info::TaskInfo)
+    for _ in 1:_REPLACE_ATTEMPTS
+        existing = _task_objects(store).filter("id" => task_id).first()
+        if isnothing(existing)
+            try
+                _create_task_row!(store, record)
+                return task_info
+            catch e
+                # Only a row that now exists explains an integrity failure here. Anything else
+                # is a real constraint problem, and it propagates. Inside an app's own open
+                # PostgreSQL transaction the failed INSERT has already aborted that transaction,
+                # so the re-read below throws instead and the submit fails loudly -- the app's
+                # transaction was lost either way.
+                e isa PormG.IntegrityError || rethrow()
+                isnothing(_task_objects(store).filter("id" => task_id).first()) && rethrow()
+            end
+        elseif _update_task_row!(store, task_id, record, true) >= 1
+            return task_info
+        end
+    end
+    error("PormGWorkerStore: could not write task '$task_id' after $(_REPLACE_ATTEMPTS) " *
+          "attempts -- another process kept deleting or creating the row between this " *
+          "store's read and its write")
 end
 
 set_task!(store::PormGWorkerStore, task_id::String, task_info::TaskInfo) =
@@ -986,38 +1039,144 @@ function delete_task!(store::PormGWorkerStore, task_id::String)
     return nothing
 end
 
-# The delete counterpart of `try_transition!` (#323): the status and run preconditions sit in the
-# statement's filter, so a record another process re-ran since the caller read it is not matched
-# and survives. PormG's `delete()` returns `(0, …)` without touching the table when nothing
-# matches, which is the ordinary lost-race answer here.
+# -- Fenced deletes (#379) --
 #
-# Its guarantee is `cleanup_tasks!`'s, not `try_transition!`'s: PormG issues the DELETE through a
-# subquery on the filters, and PostgreSQL under READ COMMITTED re-checks only the outer `id` join
-# for a row a concurrent UPDATE changed while the DELETE waited. A re-run landing in that instant
-# can therefore still be deleted on PostgreSQL. Tracked as a follow-up; SQLite serializes writers.
-function try_delete_task!(store::PormGWorkerStore, task_id::String, from;
-                          run_id::Union{Nothing, UUIDs.UUID})
-    statuses = [string(s) for s in from]
-    matched = run_id === nothing ?
-        _task_objects(store).filter("id" => task_id, "status__@in" => statuses) :
-        _task_objects(store).filter("id" => task_id, "run_id" => string(run_id),
-                                    "status__@in" => statuses)
-    deleted, _ = matched.delete()
-    return deleted isa Integer && deleted >= 1
+# A fenced delete is one raw statement, never PormG's `delete()`. `delete()` puts its filters in a
+# subquery -- `DELETE FROM t WHERE "id" IN (SELECT "id" FROM t WHERE <filters>)` -- and under
+# PostgreSQL's READ COMMITTED, a row that a concurrent UPDATE changed while the DELETE waited on
+# its lock is re-checked against the OUTER predicate only. The `run_id` and `status` fence sat
+# inside the subquery, so a re-run committing in that instant had its fresh PENDING row deleted and
+# the submitter held an id whose run never started. `update()` has no such gap -- its predicates
+# sit on the target row, which PostgreSQL re-checks -- and neither does this statement, for the
+# same reason. SQLite serializes writers, so the gap was PostgreSQL-only; one statement serves both.
+
+# Runs per statement, so a retention sweep over many rows is neither one statement per row nor one
+# statement past a driver's limits. The tighter limit is SQLite's expression depth (1000 by
+# default), not its bound-parameter cap: 500 ORed terms is about 502 deep, so do not double this.
+const _FENCED_DELETE_CHUNK = 500
+
+# The pool and physical table a fenced delete runs on, after the two refusals `delete()` makes
+# before touching anything: a model bound to another connection than the open transaction's, and a
+# connection configured read-only (`change_data: false`). A raw statement would otherwise skip
+# both. Its own function so the test doubles, which are not PormG models, can supply a pool.
+#
+# What it does NOT keep is `delete()`'s `on_delete` cascade handling. Nothing references
+# `nitro_task`, so there is nothing to cascade to; a model that pointed at it would need that back.
+function _delete_target(model::PormG.PormGModel, db_key::String)
+    PormG.Configuration.ensure_model_transaction_scope(model)
+    settings = PormG.Configuration.get_settings(db_key)
+    settings.change_data || throw(PormG.WritesDisabledError(
+        "PormGWorkerStore: connection '$db_key' is not allowed to write (change_data: false)"))
+    return settings.connections, PormG.model_table_name(model)
 end
 
+# PormG does no placeholder translation for raw SQL.
+_placeholder(::PormG.PormGPostgres, i::Int) = "\$$i"
+_placeholder(::PormG.PormGSQLite, ::Int) = "?"
+
+_quote_identifier(name::AbstractString) = "\"" * replace(name, "\"" => "\"\"") * "\""
+
+function _bind!(params::Vector{String}, pool, value::String)
+    push!(params, value)
+    return _placeholder(pool, length(params))
+end
+
+# The affected-row count, taken the way PormG's own `update()` takes it.
+_execute_counted(pool::PormG.PormGPostgres, sql::String, params::Vector{String})::Int =
+    PormG.backend_num_affected_rows(pool, PormG.ConnectionPool.fetch(pool, sql, params))
+
+# `changes()` is per-connection state, so it must run on the connection that ran the DELETE, and
+# the transaction is what pins one. Not `DELETE … RETURNING`: PormG avoids RETURNING on SQLite,
+# where it can hang (`insert`, PormG's `execution.jl`).
+function _execute_counted(pool::PormG.PormGSQLite, sql::String, params::Vector{String})::Int
+    return PormG.ConnectionPool.run_in_transaction(pool) do
+        PormG.ConnectionPool.fetch(pool, sql, params)
+        rows = PormG.ConnectionPool.fetch(pool, "SELECT changes() AS n")
+        return Int(first(rows)[1])
+    end
+end
+
+# Delete each `(id, run_id)` whose status is in `statuses`, and return how many rows went. A
+# `nothing` run omits that term, the named opt-out `try_transition!` also takes. Every predicate
+# sits on the target row and every value is bound, never spliced into the SQL.
+function _fenced_delete!(store::PormGWorkerStore,
+                         runs::Vector{Tuple{String, Union{Nothing, String}}}, statuses)::Int
+    status_values = String[string(s) for s in statuses]
+    (isempty(runs) || isempty(status_values)) && return 0
+    pool, table = _delete_target(store.model, store.db_key)
+
+    deleted = 0
+    for chunk in Iterators.partition(runs, _FENCED_DELETE_CHUNK)
+        params = String[]
+        status_slots = String[_bind!(params, pool, s) for s in status_values]
+        legs = String[]
+        for (id, run_id) in chunk
+            leg = "\"id\" = " * _bind!(params, pool, id)
+            run_id === nothing || (leg *= " AND \"run_id\" = " * _bind!(params, pool, run_id))
+            push!(legs, "(" * leg * ")")
+        end
+        sql = "DELETE FROM $(_quote_identifier(table)) WHERE \"status\" IN " *
+              "($(join(status_slots, ", "))) AND ($(join(legs, " OR ")))"
+        deleted += _execute_counted(pool, sql, params)
+    end
+    return deleted
+end
+
+# The delete counterpart of `try_transition!` (#323): the status and run preconditions sit in the
+# statement's own WHERE clause, so a record another process re-ran since the caller read it is
+# not matched and survives -- on PostgreSQL too, since #379 (see *Fenced deletes* above).
+function try_delete_task!(store::PormGWorkerStore, task_id::String, from;
+                          run_id::Union{Nothing, UUIDs.UUID})
+    run = run_id === nothing ? nothing : string(run_id)
+    return _fenced_delete!(store, Tuple{String, Union{Nothing, String}}[(task_id, run)], from) >= 1
+end
+
+# Which rows are old enough is a read; the delete is then fenced on the run each row held, so a
+# key re-run between the two is a run this sweep never saw, and it survives (#379). A row whose
+# `run_id` is NULL is fenced on its id and status alone, as every row was before.
+#
+# `status__@in` takes a Vector. PormG has no method for the Tuple this used to pass, so every
+# sweep threw -- and the `catch` below turned that into a warning and a 0, which is how retention
+# on a real database deleted nothing while the mocks, which accepted the Tuple, stayed green.
+#
+# Paged by keyset, one page per fenced DELETE. That same bug means the first sweep that works
+# meets every terminal row the table ever held, and reading all of them before deleting any would
+# hold the whole backlog in memory at once.
 function cleanup_tasks!(store::PormGWorkerStore, retain_days::Int)
     cutoff = Dates.now(Dates.UTC) - Dates.Day(retain_days)
+    terminal = (COMPLETED, FAILED, CANCELLED)
+    deleted = 0
+    after = nothing
     try
-        total_deleted, _ = _task_objects(store).filter(
-            "completed_at__@lte" => cutoff,
-            "completed_at__@isnull" => false,
-            "status__@in" => string.((COMPLETED, FAILED, CANCELLED)),
-        ).delete()
-        return total_deleted
+        while true
+            query = _task_objects(store).filter(
+                "completed_at__@lte" => cutoff,
+                "completed_at__@isnull" => false,
+                "status__@in" => String[string(s) for s in terminal],
+            ).values("id", "run_id")
+            rows = _keyset!(query, after, _FENCED_DELETE_CHUNK).list()
+            isempty(rows) && break
+            runs = Tuple{String, Union{Nothing, String}}[]
+            for row in rows
+                run_id = haskey(row, :run_id) ? row[:run_id] : row["run_id"]
+                push!(runs, (_row_task_id(row),
+                             run_id === nothing || run_id === missing ? nothing : string(run_id)))
+            end
+            deleted += _fenced_delete!(store, runs, terminal)
+            length(rows) < _FENCED_DELETE_CHUNK && break
+            # Past the last id READ, not the last deleted: a row the fence spared (a re-run) stays
+            # behind the cursor instead of being read again forever.
+            after = last(runs)[1]
+        end
+        return deleted
     catch e
-        @warn "PormGWorkerStore: failed to cleanup old tasks" exception=(e, catch_backtrace())
-        return 0
+        # A Ctrl-C leaves BARE: the retention scheduler recognises `e isa InterruptException` and
+        # nothing else, and PormG hands it back wrapped in a `DatabaseError` (`_interrupted`).
+        # Swallowed into the warning below, it made Ctrl-C during a sweep a no-op.
+        _interrupted(e) && throw(InterruptException())
+        # What earlier pages already deleted is gone either way, so it is what this reports.
+        @warn "PormGWorkerStore: failed to cleanup old tasks" deleted exception=(e, catch_backtrace())
+        return deleted
     end
 end
 

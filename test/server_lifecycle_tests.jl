@@ -605,8 +605,9 @@ end
         close(sse.body)
     end
     @test !Nitro.Core._releases_slot_early(HTTP.Response(200, "buffered"))
-    # A streamed file is a cursor, but it has a Content-Length, and HTTP.jl buffers a response
-    # with a length WHOLE on HTTP/1.1 — so it must keep its slot until it is on the wire.
+    # A streamed file is a cursor with a Content-Length. Since #377 it is written live, one chunk
+    # at a time, but it still keeps its slot until the last chunk is on the wire: a download is
+    # bounded work, and the slot is what bounds how many open descriptors downloads can hold.
     path_ = tempname()
     write(path_, rand(UInt8, 1024))
     streamed = Nitro.Res.file(HTTP.Request("GET", "/f"), path_; stream = true)

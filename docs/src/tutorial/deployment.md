@@ -128,11 +128,11 @@ serve(app; max_body_bytes = 16 * 1024^2, max_concurrent_requests = 64)
 A request that arrives with the limit already in flight is answered `503` with `Retry-After: 1`
 before its body is read, and its connection is then closed. A request holds its slot while its
 body is read, its handler runs and its response is written to the socket. That includes a streamed
-`Res.file`: it has a length, and HTTP.jl buffers a response with a length whole, so a large
-download counts against memory like any other response. Only a response with no length —
-`Res.sse` — gives its slot back once it starts streaming, because it holds one chunk at a time
-and can stay open for hours. A `STREAM` handler holds its slot for its whole lifetime, so leave
-room for those in the number.
+`Res.file`: it is sent in 64 KiB chunks, so it holds one chunk of memory rather than the file, but
+it keeps its slot until the last chunk is written — a slow client downloading a large file holds a
+slot for the whole transfer. Only a response with no length — `Res.sse` — gives its slot back once
+it starts streaming, because it has no end the server controls and can stay open for hours. A
+`STREAM` handler holds its slot for its whole lifetime, so leave room for those in the number.
 
 A **WebSocket** holds its slot for its whole lifetime too, unless you give WebSockets a budget of
 their own. A few hundred idle chat or notification sockets would otherwise fill the cap while using
@@ -169,9 +169,13 @@ serve(app; max_concurrent_requests = 64, read_timeout = 60, write_timeout = 30)
 ```
 
 `write_timeout` bounds each write to the socket, which is not the same unit for every response. A
-response with a length goes out on HTTP/1.1 as **one** write at the end, so for it the timeout
-bounds the whole transfer: size it for your largest download to your slowest client. An `Res.sse`
-stream writes once per event, so only an event that stalls is cut.
+streamed file — `Res.file(...; stream = true)`, or a mounted file over `stream_threshold` — writes
+once per 64 KiB chunk, so however large the file, only a client that takes longer than
+`write_timeout` to accept one chunk is cut — about 2 KiB/s at `write_timeout = 30`. An
+`Res.sse` stream writes once per event, so only an event that stalls is cut. An in-memory response
+with a length (`Res.json`, `Res.send`, a buffered `Res.file`) goes out on HTTP/1.1 as **one** write
+at the end, so for it the timeout bounds the whole transfer: size it for your largest such response
+to your slowest client.
 
 In front of Nitro, nginx's `max_conns` on the `upstream` block's `server` line is the proxy-side
 equivalent. Open-source nginx has no queue behind it, so requests over its limit get a `502`
