@@ -1,4 +1,4 @@
-﻿name: CI
+name: CI
 on:
   pull_request:
     branches:
@@ -104,7 +104,7 @@ jobs:
             os: ubuntu-latest
             threads: 2
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # This job EXECUTES the pinned PormG source. checkout's default
           # `persist-credentials: true` writes an `AUTHORIZATION: basic <token>`
@@ -116,7 +116,7 @@ jobs:
       # No PormG checkout step. `[sources]` pins it by url + rev, so `julia-buildpkg` below
       # fetches that exact commit itself. This job still EXECUTES that code under `Pkg.test()`,
       # which is why it keeps `contents: read` and `persist-credentials: false` above (#21).
-      - uses: julia-actions/setup-julia@4c0cb0fce8556fdb04a90347310e5db8b1f98fb9 # v2.7.0
+      - uses: julia-actions/setup-julia@fa02766e078afaaf09b14210362cee14137e6a32 # v3.0.2
         with:
           version: ${{ matrix.version }}
       # Logs the runner's CPU model and LLVM target on every job, passing or failing -- the
@@ -124,7 +124,7 @@ jobs:
       # when it fails, because ReTestItems shows an item's output only then.
       - name: Runner CPU (#301)
         run: julia --startup-file=no -e 'using InteractiveUtils; versioninfo()'
-      - uses: julia-actions/cache@a45e8fa8be21c18a06b7177052533149e61e9b38 # v3.1.0
+      - uses: julia-actions/cache@a7bed9df697e5d7309d68afe7542a87621a8b6c8 # v3.3.0
         with:
           include-matrix: 'false'
           # Cache eviction is the ONLY thing julia-actions/cache needs `actions: write`
@@ -184,16 +184,16 @@ jobs:
         version:
           - '~1.13.0-0'
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false   # same reason as the `test` job
       # No PormG checkout step, same as the `test` job: `[sources]` pins it by url + rev and
       # `julia-buildpkg` fetches it. This job does not run PormG's code -- the smoke test
       # touches nothing test-only -- but the project still has to resolve.
-      - uses: julia-actions/setup-julia@4c0cb0fce8556fdb04a90347310e5db8b1f98fb9 # v2.7.0
+      - uses: julia-actions/setup-julia@fa02766e078afaaf09b14210362cee14137e6a32 # v3.0.2
         with:
           version: ${{ matrix.version }}
-      - uses: julia-actions/cache@a45e8fa8be21c18a06b7177052533149e61e9b38 # v3.1.0
+      - uses: julia-actions/cache@a7bed9df697e5d7309d68afe7542a87621a8b6c8 # v3.3.0
         with:
           include-matrix: 'false'
           delete-old-caches: 'false'   # same reason as the `test` job above
@@ -301,17 +301,17 @@ jobs:
       cancel-in-progress: false
       queue: max
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Nothing in this job pushes through the checkout. `deploydocs` clones into its own
           # `mktempdir()` and authenticates with the key, or on the fallback path with a URL it
           # builds from GITHUB_TOKEN in its environment. Persisting the job token into
           # `.git/config` would only hand it to the instantiate and doctest steps below (#332).
           persist-credentials: false
-      - uses: julia-actions/setup-julia@4c0cb0fce8556fdb04a90347310e5db8b1f98fb9 # v2.7.0
+      - uses: julia-actions/setup-julia@fa02766e078afaaf09b14210362cee14137e6a32 # v3.0.2
         with:
           version: '1.12'
-      - uses: julia-actions/cache@a45e8fa8be21c18a06b7177052533149e61e9b38 # v3.1.0
+      - uses: julia-actions/cache@a7bed9df697e5d7309d68afe7542a87621a8b6c8 # v3.3.0
         with:
           cache-name: julia-cache;workflow=${{ github.workflow }};job=${{ github.job }};version=1.12
       - run: |
@@ -337,8 +337,8 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: julia-actions/setup-julia@4c0cb0fce8556fdb04a90347310e5db8b1f98fb9 # v2.7.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: julia-actions/setup-julia@fa02766e078afaaf09b14210362cee14137e6a32 # v3.0.2
         with:
           version: '1.12'
       # No package build needed — the script uses only stdlib and reads files.
