@@ -97,8 +97,8 @@ is explicit introspection, not accidental disclosure.)
   request-body memory held at once — at most `max_concurrent_requests × max_body_bytes`, which no
   GC target can reclaim because it is live. Each HTTP/2 stream counts as one request. A request
   holds its slot while its body is read, its handler runs, and its response is written to the
-  socket — including a streamed `Res.file`, which HTTP.jl buffers whole on HTTP/1.1 because it
-  has a length. A response with no length (`Res.sse`) gives the slot back once it starts
+  socket — including a streamed `Res.file`, which is sent in chunks but holds its slot until the
+  last one is written. A response with no length (`Res.sse`) gives the slot back once it starts
   streaming. A `STREAM` handler holds its slot for its whole lifetime, and so does a WebSocket
   unless `max_upgraded_connections` is set.
 
@@ -140,10 +140,12 @@ is explicit introspection, not accidental disclosure.)
   `read_timeout` is one deadline for the body *and* every read the handler makes, counted from
   the end of the head, and answers **408** when it fires; on HTTP/2 it is instead the longest
   gap between frames from the client, which a quiet SSE stream can exceed. `write_timeout`
-  limits each write to the socket. For a response with a length, HTTP.jl sends the whole body
-  as one write on HTTP/1.1, so there it bounds the entire transfer — size it for the largest
-  download to the slowest client. For `Res.sse` it bounds each event, so a long stream fails
-  only on an event that stalls.
+  limits each write to the socket. A streamed body — `Res.file(...; stream = true)`, a mounted
+  file over `stream_threshold` — is written in 64 KiB chunks, so it bounds each chunk: a long
+  download is cut only when the client takes longer than `write_timeout` to accept one of them.
+  For `Res.sse` it bounds each event. An in-memory body with a length (`Res.json`, `Res.send`, a
+  buffered `Res.file`) goes out as one write on HTTP/1.1, so there it bounds the whole body —
+  size it for the largest such response to the slowest client.
 
   Every timeout is in seconds (any real `>= 0`); `0` or `nothing` disables it. Each also takes a
   `_ns` spelling in integer nanoseconds (`read_header_timeout_ns = …`), and passing one suppresses

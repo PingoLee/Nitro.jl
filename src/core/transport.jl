@@ -4,7 +4,9 @@
 
 # Size of one transfer chunk, used in both directions: the streaming response writer below, and
 # the bounded request-body read in `_http_stream_request`. Peak memory for a streamed response is
-# this buffer rather than the file, which is the whole point of that writer. 64 KiB is `io.Copy`'s
+# this buffer rather than the file, which is the whole point of that writer — and on HTTP/1.1 that
+# holds only because it writes a known-length body live instead of through HTTP's FIXED buffer
+# (`_write_fixed_body_live!`, #377). 64 KiB is `io.Copy`'s
 # default in Go's `net/http` — the tradition Nitro took its concurrency model from — and
 # comfortably above a typical MTU or socket send buffer, so a chunk is not split into a
 # pathological number of writes.
@@ -226,7 +228,9 @@ end
 # handler's returned `Response`). Nitro's STREAM/WebSocket handlers take over the raw
 # stream and write the response themselves, so we only emit the serialized `Response` when
 # the handler hasn't already started one. The HTTP.jl v2 server loop closes the read/write
-# sides and turns any thrown exception into a 500 after this returns.
+# sides after this returns, and turns a thrown exception into a 500 only while no response head
+# is on the wire; once one is (an SSE stream, a live-written file — #377), it closes the
+# connection instead.
 # Write a response body to the stream WITHOUT consuming it. HTTP.jl v2's
 # `_write_response_body_to_stream!` advances the `BytesBody` read cursor, which corrupts
 # any Response object that is reused across requests — a common pattern in handler code
@@ -312,14 +316,48 @@ end
 # `ArgumentError("body is closed")` guard either: a closed-with-pending `SSEStream` is legitimate,
 # and that throw would reject exactly the case this comment exists to protect. Regression: the
 # fast-producer testset in test/sse_tests.jl, which writes and closes before `serve` ever drains.
+#
+# ── A body with a declared length is written LIVE on HTTP/1.1, not through `write` (#377) ──
+#
+# `write(stream, …)` is only live for a body with no length (CHUNKED — an SSE stream) and on
+# HTTP/2. A response with a `Content-Length` is framed FIXED, and on HTTP/1.1 HTTP.jl 2.7 appends
+# every `write` to such a response to `stream.request_buffer` and puts the head and the body on the
+# wire only at `closewrite`. So this loop used to read a streamed `Res.file` — `servecontent` always
+# gives it a length — into memory in full before a byte was sent: peak memory was file size ×
+# concurrent downloads, exactly what #41 set out to remove, and `write_timeout` bounded the whole
+# transfer because it was one socket write. HTTP.jl has no switch for it (2.8 unchanged; its #1376
+# only coalesces bodies ≤ 4 KiB with the head). Its own REQUEST-handler path already streams a
+# FIXED body live (`write_response!`); only the stream-handler path Nitro serves through buffers.
+#
+# `_write_fixed_body_live!` therefore does, for this one case, what that path does: head first,
+# then each chunk straight to the connection. A public API for it is requested upstream
+# (JuliaWeb/HTTP.jl#1384); until it exists, the internals it reaches are wrapped below and canaried in
+# test/http_internals_contract_tests.jl — and behaviorally in test/streaming_write_tests.jl, which
+# is the only check that sees WHEN bytes reach the wire.
+#
+# The first chunk is read BEFORE anything is started, as Go's `io.Copy` reads before its first
+# write. That keeps the head's timing exactly where the first `write` always put it — for every
+# framing, not only the one this fixes — and it keeps a body that fails on its very first read
+# (a file that cannot be read, a producer that throws at once) answerable with a clean 500, since
+# nothing is on the wire yet.
 function _write_response_body!(stream::HTTP.Stream, body::HTTP.AbstractBody)
     buffer = Vector{UInt8}(undef, _STREAM_CHUNK_BYTES)
     try
-        while true
-            n = HTTP.body_read!(body, buffer)
-            n == 0 && break
+        n = HTTP.body_read!(body, buffer)::Int
+        # Only a response that declares a length can be framed FIXED. `startwrite` is what the first
+        # `write` below would call anyway; calling it here fixes the framing so `_buffers_fixed_body`
+        # can ask which mode HTTP chose.
+        if _declares_length(stream.response)
+            HTTP.startwrite(stream)
+            if _buffers_fixed_body(stream)
+                _write_fixed_body_live!(stream, body, buffer, n)
+                return nothing
+            end
+        end
+        while n > 0
             # A view, not a copy: `body_read!` fills a prefix of the buffer and reports how much.
             write(stream, @view(buffer[1:n]))
+            n = HTTP.body_read!(body, buffer)::Int
         end
     finally
         # `finally`, not a trailing call: `write` throwing on a client disconnect is the EXPECTED
@@ -331,6 +369,105 @@ function _write_response_body!(stream::HTTP.Stream, body::HTTP.AbstractBody)
         # Releases the underlying handle when the body owns it. Idempotent, and a no-op for a body
         # that already closed itself on the final short read.
         HTTP.body_close!(body)
+    end
+    return nothing
+end
+
+_declares_length(resp::HTTP.Response)::Bool =
+    resp.content_length >= 0 || HTTP.hasheader(resp, "Content-Length")
+
+# The HTTP.jl internals the live FIXED writer reaches, one wrapper each so an HTTP upgrade that
+# renames one is a one-line fix. All are private in HTTP 2.7 and canaried in
+# test/http_internals_contract_tests.jl ("live FIXED writer").
+#
+# Whether HTTP would buffer this stream's body whole: HTTP/1.1, FIXED framing, head not yet sent.
+# False on HTTP/2 (FIXED writes are live DATA frames there) and for a bodyless response (HEAD,
+# 304), where `ignore_writes` already discards every write.
+#
+# `head_committed` is the guard against the day HTTP.jl fixes this itself. The natural upstream fix
+# is `startwrite` committing the FIXED head while the mode stays FIXED; without this check the
+# live writer would then send a SECOND head and corrupt every download. With it, Nitro falls back to
+# plain `write`s — correct bytes — and test/streaming_write_tests.jl reports whether they are live.
+_buffers_fixed_body(stream::HTTP.Stream)::Bool =
+    HTTP._server_stream_buffered_fixed_h1(stream) && !stream.ignore_writes &&
+    !(@atomic :acquire stream.head_committed)
+# Put the response head on the wire now, and mark it committed.
+_write_stream_head!(stream::HTTP.Stream) = HTTP._write_server_stream_head!(stream)
+# Write bytes straight to the connection (`buffer = false`), re-arming `write_timeout` per call.
+_write_stream_bytes_live!(stream::HTTP.Stream, bytes::Vector{UInt8}) =
+    HTTP._write_server_stream_bytes!(stream, bytes, false)
+
+"""
+    _write_fixed_body_live!(stream, body, buffer, n)
+
+Write a body with a declared length to an HTTP/1.1 stream as it is read, instead of letting
+HTTP.jl buffer it whole until `closewrite` (#377). `buffer[1:n]` is the first chunk, already read.
+What this does is exactly what `closewrite` would have done — head, then the body, the length
+enforced — only with the body in chunks:
+
+1. The head goes out with the first chunk. `startwrite` has already fixed FIXED framing and parsed
+   `content_length` from the header, so `_write_server_stream_head!` emits it as HTTP would.
+2. Each chunk is checked against the declared length BEFORE it is written — an overrun would
+   desynchronise the next response on a keep-alive connection — then written to the socket and
+   counted in `written_bytes`, which HTTP's own accounting and access logging read.
+3. At EOF a short body is refused, and `write_closed` is set so neither HTTP's connection loop
+   nor `stream_handler`'s own `closewrite` sends the head a second time.
+
+**A failure after the head cannot become an error response.** The status is on the wire, so a
+producer that throws, a length mismatch or a dropped client ends the response by closing the
+connection, which is how the client learns the body is truncated — Go's `net/http` does the same.
+`response.close` is set so the connection is never reused, and HTTP's loop — seeing
+`head_committed` — closes it without appending a second status line. A mismatch that is already
+certain from the first read — a first chunk past the length, or an empty body that declared one —
+is refused before the head, so it still gets a clean 500.
+
+A length mismatch is thrown as a plain `ErrorException`, not an `HTTP.ProtocolError`: HTTP maps a
+`ProtocolError` to **400**, which blames the client for the server's own wrong `Content-Length`.
+Anything else maps to 500.
+
+Because the client only ever sees a status or a cut connection, the server side is the one place a
+failure can be noticed: a producer error or a length mismatch — a server-side defect — is logged
+as a warning, and a failed socket write — almost always the client going away, the expected end of
+an abandoned download — at debug level. Neither logs body bytes or the request target.
+
+Peak memory is one `buffer` (`_STREAM_CHUNK_BYTES`) per response, whatever the file size.
+"""
+function _write_fixed_body_live!(stream::HTTP.Stream, body::HTTP.AbstractBody,
+                                 buffer::Vector{UInt8}, n::Int)
+    declared = Int64(stream.response.content_length)
+    writing = false
+    try
+        (n > declared || (n == 0 && declared > 0)) &&
+            error("streamed response body does not match its Content-Length")
+        writing = true
+        _write_stream_head!(stream)
+        writing = false
+        while n > 0
+            stream.written_bytes + n > declared &&
+                error("streamed response body exceeded its Content-Length")
+            # The internal takes a `Vector` and copies anything else, so a full chunk is passed as
+            # the buffer itself; only a short final chunk is copied.
+            writing = true
+            _write_stream_bytes_live!(stream, n == length(buffer) ? buffer : buffer[1:n])
+            writing = false
+            stream.written_bytes += n
+            n = HTTP.body_read!(body, buffer)::Int
+        end
+        stream.written_bytes == declared ||
+            error("streamed response body ended short of its Content-Length")
+    catch err
+        stream.response.close = true
+        if writing
+            @debug "Streamed response cut off: writing the response failed" exception=err
+        else
+            @warn("Streamed response body failed; connection closed",
+                  exception = (err, catch_backtrace()), written = stream.written_bytes, declared,
+                  head_sent = (@atomic :acquire stream.head_committed))
+        end
+        rethrow()
+    finally
+        # Set on both paths: on success so no second head is written, on failure so nothing tries.
+        @atomic :release stream.write_closed = true
     end
     return nothing
 end
@@ -697,11 +834,14 @@ _is_streaming_body(_) = false
 
 # Whether a response may hand its `max_concurrent_requests` slot back before it is written (#298):
 # a streaming body with NO declared length, and nothing else. HTTP.jl 2.7 writes such a body to the
-# socket live, one chunk at a time, so it holds one chunk however long it runs — an SSE stream.
-# A response with a length is framed FIXED, and on HTTP/1.1 HTTP.jl buffers a FIXED body WHOLE in
-# the stream (`_server_stream_buffered_fixed_h1`) and only puts it on the wire at `closewrite`. That
-# includes a streamed `Res.file`, which `servecontent` gives a `Content-Length`: its cursor is read
-# into that buffer in full. Releasing early there would free the slot while the whole file is live.
+# socket live, one chunk at a time, so it holds one chunk however long it runs — an SSE stream, with
+# no end the server controls. A streamed `Res.file` has a length (`servecontent` gives it one), and
+# since #377 it is ALSO written live, one chunk at a time (`_write_fixed_body_live!`) — until then
+# HTTP/1.1 buffered it whole, and releasing early would have freed the slot while the file sat in
+# memory. It keeps its slot anyway: a download is bounded work that ends when the file does, and the
+# slot is what bounds how many open descriptors a burst of downloads can hold. An in-memory body
+# with a length (`BytesBody`, bytes, a string) is not streaming and still reaches HTTP/1.1's socket
+# whole at `closewrite`.
 _releases_slot_early(resp::HTTP.Response)::Bool =
     _is_streaming_body(resp.body) && resp.content_length < 0 && !HTTP.hasheader(resp, "Content-Length")
 
@@ -800,9 +940,11 @@ end
 # The permit is taken BEFORE `_http_stream_request` reads the body — that ordering is what makes it
 # bound body memory — with a lock-free try-acquire, and a request over the cap is answered 503 at
 # once rather than queued (a queue would hold the descriptors the cap exists to bound). It covers
-# the body read, the handler, and the response's write TO THE SOCKET: on HTTP/1.1 HTTP.jl buffers a
-# fixed-length response whole and sends it only at `closewrite`, so the handler calls `closewrite`
-# itself while the slot is held rather than leaving it to HTTP's loop after the slot is gone. A
+# the body read, the handler, and the response's write TO THE SOCKET: on HTTP/1.1 HTTP.jl buffers an
+# in-memory fixed-length response whole and sends it only at `closewrite`, so the handler calls
+# `closewrite` itself while the slot is held rather than leaving it to HTTP's loop after the slot is
+# gone. (A streamed body with a length is already on the wire by then — `_write_fixed_body_live!`
+# writes it live and closes the stream's writes itself, #377 — so that call is a no-op for it.) A
 # streaming response with no declared length gives the slot back as soon as its head is ready (see
 # `_releases_slot_early`): an SSE stream holds one chunk however long it runs, and counting it would
 # let a few hundred idle event streams starve every other request. A raw `STREAM` handler runs
@@ -898,8 +1040,9 @@ function stream_handler(middleware::Function; max_body_bytes::Int64 = DEFAULT_MA
                         _write_response_body!(stream, resp.body)
                     end
                 end
-                # Put the response on the wire while the slot is still held (#298). On HTTP/1.1 a
-                # fixed-length response is buffered whole and only reaches the socket here; left to
+                # Put the response on the wire while the slot is still held (#298). On HTTP/1.1 an
+                # in-memory fixed-length response is buffered whole and only reaches the socket here
+                # (a streamed one was written live and already closed, #377); left to
                 # HTTP's loop, this ran after the slot was released, with the buffered response — and
                 # the request body `resp.request` pins — still live. `closewrite` is idempotent (HTTP
                 # returns at once when writes are already closed), so the loop's own call is then a

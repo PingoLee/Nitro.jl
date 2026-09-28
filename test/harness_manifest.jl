@@ -66,6 +66,7 @@ const TEST_FILES = [
     "reflection_tests.jl",
     "binding_tests.jl",
     "response_tests.jl",
+    "streaming_write_tests.jl",
     "bodyparser_tests.jl",
     "max_body_bytes_tests.jl",
     "max_fields_tests.jl",
