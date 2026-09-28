@@ -184,11 +184,13 @@ end
 
 # `===` on two `String`s compares content, so it cannot tell a copy from the original. What the
 # fast path promises is that nothing is BUILT, so measure that: a canonical target, escapes
-# included, allocates nothing.
+# included, allocates nothing. A red on the `?` targets alone is type instability, not noise:
+# on Julia 1.13.1 a `Union{String, SubString{String}}` path boxed there (#390). Only the 1.13 job
+# can catch it; on 1.12 the union happens not to allocate.
 @testset "a canonical target is handed back without building anything" begin
     alloc(t) = (O(t); @allocated O(t))
     for t in ("/", "/a/b", "/a/", "/a?q=%70", "/a!b~c", "/caf%C3%A9", "/a%2Fb/%25", "/a..b",
-              "/files/caf%C3%A9/s.txt?v=1")
+              "/files/caf%C3%A9/s.txt?v=1", "/?", "/a?")
         @test O(t) == t
         @test alloc(t) == 0
     end

@@ -172,7 +172,10 @@ function _origin_form(target::String)::Nullable{String}
         end
     end
     q = findfirst('?', t)
-    path = q === nothing ? t : SubString(t, 1, prevind(t, q))
+    # A `SubString` on both branches: a `Union{String, SubString{String}}` here is boxed when
+    # passed to `occursin` and `_is_canonical_path`, on every request with a query (Julia
+    # 1.13.1, #390).
+    path = SubString(t, 1, q === nothing ? lastindex(t) : prevind(t, q))
     occursin("//", path) && return nothing
     _is_canonical_path(path) && return t
     canonical = _canonical_path(path)
