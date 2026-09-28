@@ -707,9 +707,9 @@ end
 #
 # In practice only the 403 is reachable. `isupgrade(req)` already demands everything the 400
 # branches check (GET, the Upgrade/Connection tokens, version 13, a key), so a malformed handshake
-# never gets this far — it is answered as a plain GET. The 400 is kept as the honest mapping for
-# the one way left: a middleware that rewrote `req`, which `isupgrade` sees, while HTTP checks the
-# unmodified head in `stream.message`.
+# never gets this far — `_not_an_upgrade` answers it first (#384). The 400 is kept as the honest
+# mapping for the one way left: a middleware that rewrote `req`, which `isupgrade` sees, while HTTP
+# checks the unmodified head in `stream.message`.
 function _ws_refusal_status(err, entered::Bool, origin_refused::Bool)::Nullable{Int}
     entered && return nothing
     err isa HTTP.WebSockets.WebSocketError || return nothing
@@ -725,10 +725,11 @@ end
 # refused exactly the same way.
 function _log_ws_refusal(stream::HTTP.Stream, attempt::_UpgradeAttempt, status::Int)
     if status == 403
-        @warn("Refusing WebSocket upgrades whose Origin is not this server's own origin with 403 " *
+        @warn("Refusing WebSocket upgrades whose Origin is neither this server's own nor listed with 403 " *
               "(detail at debug level). Behind a proxy that terminates TLS, configure " *
               "`ExtractIP(forwarded_proto = :x_forwarded_proto, trusted_proxies = …)` so the " *
-              "check compares against the scheme the client used.", maxlog = 1)
+              "check compares against the scheme the client used. For a page served from " *
+              "another origin, list it with `WebSocketOrigins([...])`.", maxlog = 1)
     else
         @warn("Refusing malformed WebSocket handshakes with 400 (detail at debug level). Only " *
               "reachable when a middleware rewrote the upgrade request.", maxlog = 1)
@@ -761,19 +762,73 @@ function _refuse_upgrade_over_capacity(limit::Int64)::HTTP.Response
     return resp
 end
 
+# ── A request to a WebSocket route that is not an upgrade (#384) ────────────────────────────────
+#
+# It used to return `false`, which the serializer answered as `200 "false"`: a proxy that dropped
+# `Upgrade`/`Connection` — the most common WebSocket proxy misconfiguration — a malformed handshake
+# and a browser tab all looked like success to every layer, the access log included. HTTP.jl stays
+# the judge of what a VALID handshake is (`isupgrade`); this only classifies a request it rejected.
+#
+# The intent to upgrade needs BOTH tokens. An `Upgrade` without the `upgrade` connection option is
+# ignored by RFC 9110 §7.8, and it is exactly what nginx sends when `proxy_set_header Upgrade` is
+# there and `Connection "upgrade"` is not. Without that intent: 426 and `Upgrade: websocket`
+# (RFC 9110 §15.5.22). With it, a version other than 13: 426 and `Sec-WebSocket-Version: 13`
+# (RFC 6455 §4.4). Anything else wrong with a declared upgrade — a missing version or key, a
+# method other than GET on a `method = "*"` route: 400 (RFC 6455 §4.2.1).
+#
+# Fresh responses: `stream_handler` sets `resp.request` on what it writes. And no `resp.close`,
+# which would make HTTP.jl replace `Connection: Upgrade` with `close`; on h2 HTTP.jl strips both
+# headers and the bare 426 still stands.
+function _not_an_upgrade(req::HTTP.Request)::HTTP.Response
+    if !(HTTP.headercontains(req, "Upgrade", "websocket") &&
+         HTTP.headercontains(req, "Connection", "upgrade"))
+        @warn("Answering requests to WebSocket routes that do not ask to upgrade with 426 (detail " *
+              "at debug level). If every WebSocket client gets this, a proxy in front is not " *
+              "forwarding `Upgrade` and `Connection: upgrade`.", maxlog = 1)
+        _log_not_an_upgrade(req, 426)
+        return HTTP.Response(426, ["Upgrade" => "websocket", "Connection" => "Upgrade"],
+            "This route only accepts WebSocket upgrades")
+    end
+    version = strip(HTTP.header(req, "Sec-WebSocket-Version", ""))
+    if uppercase(req.method) == "GET" && !isempty(version) && version != "13"
+        @warn("Answering WebSocket handshakes for a version other than 13 with 426 (detail at " *
+              "debug level)", maxlog = 1)
+        _log_not_an_upgrade(req, 426)
+        return HTTP.Response(426, ["Upgrade" => "websocket", "Connection" => "Upgrade",
+                                   "Sec-WebSocket-Version" => "13"],
+            "Unsupported WebSocket version; this server speaks 13")
+    end
+    @warn("Answering malformed WebSocket handshakes with 400 (detail at debug level)", maxlog = 1)
+    _log_not_an_upgrade(req, 400)
+    return HTTP.Response(400, "Malformed WebSocket handshake")
+end
+
+# Reachable by any client that can reach the route, so — like every refusal above — one
+# first-sighting warning per case (one call site each, so a run of version probes cannot spend the
+# proxy hint), and the per-request detail at debug level only, escaped, with no backtrace.
+function _log_not_an_upgrade(req::HTTP.Request, status::Int)
+    @debug("WebSocket upgrade refused",
+           status     = status,
+           method     = Util._log_escape(req.method),
+           upgrade    = Util._log_escape(HTTP.header(req, "Upgrade", "")),
+           connection = Util._log_escape(HTTP.header(req, "Connection", "")),
+           version    = Util._log_escape(HTTP.header(req, "Sec-WebSocket-Version", "")))
+    return nothing
+end
+
 """
-    _upgrade_websocket!(f, req) -> Union{Bool, Nothing, HTTP.Response}
+    _upgrade_websocket!(f, req) -> Union{Nothing, HTTP.Response}
 
 Upgrade `req` to a WebSocket and run `f(ws)` on it, with a proxy-aware Origin check (#374) and,
-under `serve(max_upgraded_connections = n)`, a budget of its own (#376). A request that is not an
-upgrade returns `false`, as the handler always has. A refused handshake returns the
+under `serve(max_upgraded_connections = n)`, a budget of its own (#376). A request that is not a
+valid upgrade gets a 426 or a 400 from `_not_an_upgrade` (#384). A refused handshake returns the
 `HTTP.Response` whose status HTTP already sent, so the access log records it; a full budget
 returns a 503 that is written normally. Errors raised by `f` rethrow as before.
 """
 function _upgrade_websocket!(f::Function, req::HTTP.Request)
-    # FIRST, before the stream is looked up or a slot taken: a plain GET to a WebSocket route — and
-    # an in-process `internalrequest`, which has no stream — must answer exactly as it always has.
-    HTTP.WebSockets.isupgrade(req) || return false
+    # FIRST, before the stream is looked up or a slot taken: a request that is not an upgrade — and
+    # an in-process `internalrequest`, which has no stream — is answered without touching either.
+    HTTP.WebSockets.isupgrade(req) || return _not_an_upgrade(req)
     stream = req.context[:stream]::HTTP.Stream
     # Present only under `max_upgraded_connections`. Past this check, `adm !== nothing` means this
     # socket holds a slot of that budget — assigned once, so the closures below capture it unboxed.
@@ -782,9 +837,16 @@ function _upgrade_websocket!(f::Function, req::HTTP.Request)
         return _refuse_upgrade_over_capacity(adm.upgraded_limit)
     end
     attempt = _UpgradeAttempt(false, false, false)
+    # The cross-origin pages a `WebSocketOrigins` layer admits (#382) — the one closest to the route,
+    # since each layer replaces the key. Read once, into a local the closure captures unboxed. The
+    # Origin itself is read from `head`, the head HTTP checks, so a middleware that rewrote `req`'s
+    # `Origin` cannot widen what is admitted. Consulted only after same-origin said no, so an app
+    # without the middleware does exactly what it did.
+    listed = get(req.context, Types.REQUEST_WS_ORIGINS_KEY, nothing)::Nullable{Types.WebSocketOriginPolicy}
     check_origin = function (head::HTTP.Request)
         attempt.secure = _ws_secure(req, stream)
-        allowed = _http_origin_allowed_default(head, attempt.secure)
+        allowed = _http_origin_allowed_default(head, attempt.secure) ||
+                  (listed !== nothing && Types._origin_listed(listed, HTTP.header(head, "Origin", "")))
         allowed || (attempt.origin_refused = true)
         return allowed
     end

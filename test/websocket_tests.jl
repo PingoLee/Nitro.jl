@@ -244,3 +244,289 @@ end
 end
 
 end
+
+@testitem "A request to a WebSocket route that is not an upgrade is 426 or 400, never 200 (#384)" tags=[:handler, :network] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Sockets
+using Base.CoreLogging: with_logger
+const Logging = Base.CoreLogging   # `Logging` is not a test dependency; the levels live here
+using Nitro
+using Nitro: path
+
+const WS_KEY = "dGhlIHNhbXBsZSBub25jZQ=="
+
+function _ws_context()
+    ctx = Nitro.Core.App()
+    handler = function (ws::HTTP.WebSockets.WebSocket)
+        try
+            for _ in ws end
+        catch e
+            e isa HTTP.WebSockets.WebSocketError || rethrow()
+        end
+    end
+    Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+        path("/ws", handler, method = "WEBSOCKET"),
+        # Detected by the handler's first argument, not by the declared method.
+        path("/ws/get", handler, method = "GET"),
+        # A `"*"` route whose handler takes a `WebSocket` receives every method.
+        path("/ws/any", handler, method = "*"),
+    ])
+    return ctx
+end
+
+# A raw request, so each handshake header can be left out on purpose. Returns the status and the
+# response headers (lowercased names), read up to the blank line that ends the head.
+function _raw(port; target = "/ws", method = "GET", upgrade = "websocket", connection = "Upgrade",
+              key = WS_KEY, version = "13")
+    lines = ["$method $target HTTP/1.1", "Host: $HOST:$port"]
+    upgrade    === nothing || push!(lines, "Upgrade: $upgrade")
+    connection === nothing || push!(lines, "Connection: $connection")
+    key        === nothing || push!(lines, "Sec-WebSocket-Key: $key")
+    version    === nothing || push!(lines, "Sec-WebSocket-Version: $version")
+    sock = Sockets.connect(Sockets.localhost, port)
+    try
+        write(sock, join(lines, "\r\n") * "\r\n\r\n")
+        flush(sock)
+        reader = @async try
+            head = String[]
+            while true
+                line = readline(sock)
+                isempty(line) && break
+                push!(head, line)
+            end
+            head
+        catch
+            String[]
+        end
+        timedwait(() -> istaskdone(reader), 15.0; pollint = 0.05)
+        head = istaskdone(reader) ? fetch(reader) : String[]
+        isempty(head) && return (0, Dict{String,String}())
+        status = parse(Int, split(head[1])[2])
+        headers = Dict(lowercase(strip(k)) => strip(v)
+                       for (k, v) in (split(h, ':'; limit = 2) for h in head[2:end]))
+        return (status, headers)
+    finally
+        close(sock)
+    end
+end
+
+@testset "426, 400 and 101 on the wire" begin
+    statuses = Channel{Int}(32)
+    record = handle -> req -> begin
+        resp = handle(req)
+        resp isa HTTP.Response && put!(statuses, resp.status)
+        resp
+    end
+    logger = Test.TestLogger(min_level = Logging.Debug)
+    ctx, port = _ws_context(), get_free_port()
+    with_logger(logger) do
+        Nitro.Core.serve(ctx; port, host = HOST, async = true, show_banner = false,
+                         show_errors = true, access_log = nothing, middleware = [record])
+    end
+    records() = @lock logger.lock copy(logger.logs)
+    try
+        # THE BUG: a plain GET was `200 "false"`. Both route shapes, through the real client.
+        for target in ("/ws", "/ws/get")
+            r = HTTP.get("http://$HOST:$port$target"; status_exception = false, retry = false)
+            @test r.status == 426
+            @test HTTP.header(r, "Upgrade") == "websocket"
+            @test HTTP.headercontains(r, "Connection", "upgrade")
+            @test String(r.body) != "false"
+        end
+
+        # `Upgrade` without `Connection: upgrade` — nginx without `Connection "upgrade"` — is not
+        # an upgrade request at all (RFC 9110 §7.8), so it is the proxy case, not a malformed one.
+        status, headers = _raw(port; connection = nothing)
+        @test status == 426
+        @test get(headers, "upgrade", "") == "websocket"
+        @test first(_raw(port; upgrade = nothing)) == 426
+        @test first(_raw(port; connection = "keep-alive")) == 426
+
+        # A version this server does not speak: 426 naming the one it does (RFC 6455 §4.4).
+        status, headers = _raw(port; version = "8")
+        @test status == 426
+        @test get(headers, "sec-websocket-version", "") == "13"
+
+        # An upgrade that is declared but malformed: 400.
+        @test first(_raw(port; key = nothing)) == 400
+        @test first(_raw(port; key = "not-a-key")) == 400
+        @test first(_raw(port; version = nothing)) == 400
+        @test first(_raw(port; version = "")) == 400
+        # A declared upgrade on another method is malformed (only GET upgrades); a POST that does
+        # not ask to upgrade is the ordinary 426.
+        @test first(_raw(port; target = "/ws/any", method = "POST")) == 400
+        # ... even with a version that would earn a GET the 426: only GET upgrades.
+        @test first(_raw(port; target = "/ws/any", method = "POST", version = "8")) == 400
+        @test first(_raw(port; target = "/ws/any", method = "POST", upgrade = nothing)) == 426
+
+        # Header tokens are case-insensitive, and a valid handshake still upgrades.
+        @test first(_raw(port; upgrade = "WebSocket", connection = "keep-alive, Upgrade")) == 101
+        @test first(_raw(port)) == 101
+
+        # What a middleware on the way out sees is what the client got. (The two 101s are not
+        # counted: a finished session reaches it as the serializer's placeholder, see streaming.md.)
+        @test timedwait(() -> Base.n_avail(statuses) >= 13, 10.0; pollint = 0.05) === :ok
+        seen = [take!(statuses) for _ in 1:Base.n_avail(statuses)]
+        @test count(==(426), seen) == 7
+        @test count(==(400), seen) == 6
+
+        # One first-sighting warning per case, detail at debug level, never an error.
+        logs = records()
+        warns = filter(r -> r.level == Logging.Warn && occursin("WebSocket", string(r.message)), logs)
+        @test length(warns) == 3
+        @test any(r -> occursin("Connection: upgrade", string(r.message)), warns)
+        @test !any(r -> r.level >= Logging.Error, logs)
+        @test !any(r -> haskey(r.kwargs, :exception), logs)
+        details = filter(r -> r.level == Logging.Debug && r.message == "WebSocket upgrade refused", logs)
+        @test sort(unique([d.kwargs[:status] for d in details])) == [400, 426]
+    finally
+        Nitro.Core.terminate(ctx)
+    end
+end
+
+@testset "in-process, with no stream at all" begin
+    ctx = _ws_context()
+    for target in ("/ws", "/ws/get")
+        resp = Nitro.Core.internalrequest(ctx, HTTP.Request("GET", target))
+        @test resp.status == 426
+        @test HTTP.header(resp, "Upgrade") == "websocket"
+    end
+end
+
+end
+
+@testitem "WebSocketOrigins admits a listed cross-origin page, and nothing else (#382)" tags=[:handler, :network, :security] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Sockets
+using Nitro
+using Nitro: path, ExtractIP, WebSocketOrigins
+
+const PUBLIC_HOST = "api.example.com"
+const WS_KEY = "dGhlIHNhbXBsZSBub25jZQ=="
+const SPA = "https://app.example.com"
+
+hold = function (ws::HTTP.WebSockets.WebSocket)
+    try
+        for _ in ws end
+    catch e
+        e isa HTTP.WebSockets.WebSocketError || rethrow()
+    end
+end
+
+# `/ws` inherits whatever the server-wide middleware lists; `/ws/own` lists its own page, and
+# `/ws/strict` narrows back to same-origin only.
+function _ws_context()
+    ctx = Nitro.Core.App()
+    Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+        path("/ws", hold, method = "WEBSOCKET"),
+        path("/ws/own", hold, method = "WEBSOCKET",
+             middleware = [WebSocketOrigins(["https://other.example.com"])]),
+        path("/ws/strict", hold, method = "WEBSOCKET", middleware = [WebSocketOrigins(String[])]),
+        # A middleware that rewrites the request's `Origin` to a listed one. The check reads the
+        # head HTTP parsed off the wire, so this must not widen anything.
+        path("/ws/rewritten", hold, method = "WEBSOCKET",
+             middleware = [handle -> req -> (HTTP.setheader(req, "Origin" => SPA); handle(req))]),
+    ])
+    # A router-level list, between the server-wide one and the route.
+    scoped = Nitro.Core.RouterHOF.router(ctx, "/r";
+                                         middleware = [WebSocketOrigins(["https://other.example.com"])])
+    Nitro.Core.register(ctx, "WEBSOCKET", scoped("/ws"), hold)
+    return ctx
+end
+
+_serve(ctx, port; kw...) = Nitro.Core.serve(ctx; port, host = HOST, async = true,
+                                            show_banner = false, show_errors = false,
+                                            access_log = nothing, kw...)
+
+# A raw handshake: the client sends a public `Host`, as a proxy would. Returns the status line.
+function _handshake(port; target = "/ws", origin = nothing, proto = nothing)
+    lines = ["GET $target HTTP/1.1", "Host: $PUBLIC_HOST", "Upgrade: websocket",
+             "Connection: Upgrade", "Sec-WebSocket-Key: $WS_KEY", "Sec-WebSocket-Version: 13"]
+    origin === nothing || push!(lines, "Origin: $origin")
+    proto  === nothing || push!(lines, "X-Forwarded-Proto: $proto")
+    sock = Sockets.connect(Sockets.localhost, port)
+    try
+        write(sock, join(lines, "\r\n") * "\r\n\r\n")
+        flush(sock)
+        reader = @async try readline(sock) catch; "" end
+        timedwait(() -> istaskdone(reader), 15.0; pollint = 0.05)
+        return istaskdone(reader) ? fetch(reader) : "(no reply within 15s)"
+    finally
+        close(sock)
+    end
+end
+
+upgraded(line) = startswith(line, "HTTP/1.1 101")
+forbidden(line) = startswith(line, "HTTP/1.1 403")
+
+@testset "without the middleware, a cross-origin page is refused as before" begin
+    ctx, port = _ws_context(), get_free_port()
+    _serve(ctx, port)
+    try
+        @test forbidden(_handshake(port; origin = SPA))
+        @test upgraded(_handshake(port; origin = "http://$PUBLIC_HOST"))
+        # A route-level list still applies on its own route.
+        @test upgraded(_handshake(port; target = "/ws/own", origin = "https://other.example.com"))
+        @test forbidden(_handshake(port; target = "/ws/own", origin = SPA))
+        # ... and so does a router-level one.
+        @test upgraded(_handshake(port; target = "/r/ws", origin = "https://other.example.com"))
+        @test forbidden(_handshake(port; target = "/r/ws", origin = SPA))
+    finally
+        Nitro.Core.terminate(ctx)
+    end
+end
+
+@testset "a server-wide list admits exactly its origins" begin
+    ctx, port = _ws_context(), get_free_port()
+    _serve(ctx, port; middleware = [WebSocketOrigins([SPA, "http://localhost:5173"])])
+    try
+        # THE FEATURE: an SPA on another origin can open its socket.
+        @test upgraded(_handshake(port; origin = SPA))
+        @test upgraded(_handshake(port; origin = "https://APP.example.com:443"))
+        @test upgraded(_handshake(port; origin = "http://localhost:5173"))
+        # Same-origin and a non-browser client are unaffected.
+        @test upgraded(_handshake(port; origin = "http://$PUBLIC_HOST"))
+        @test upgraded(_handshake(port))
+        # Exact on scheme, host and port — never a prefix, suffix or look-alike.
+        for other in ("http://app.example.com", "https://app.example.com:8443",
+                      "https://evil-app.example.com", "https://app.example.com.evil.example",
+                      "https://sub.app.example.com", "http://localhost:5174", "null",
+                      "https://evil.example")
+            @test forbidden(_handshake(port; origin = other))
+        end
+        # The layer closest to the route wins: `/ws/own` REPLACES the server-wide list ...
+        @test upgraded(_handshake(port; target = "/ws/own", origin = "https://other.example.com"))
+        @test forbidden(_handshake(port; target = "/ws/own", origin = SPA))
+        # ... and an empty one narrows a route back to same-origin only.
+        @test forbidden(_handshake(port; target = "/ws/strict", origin = SPA))
+        @test upgraded(_handshake(port; target = "/ws/strict", origin = "http://$PUBLIC_HOST"))
+        # A router-level list replaces the server-wide one for its routes.
+        @test upgraded(_handshake(port; target = "/r/ws", origin = "https://other.example.com"))
+        @test forbidden(_handshake(port; target = "/r/ws", origin = SPA))
+        # Rewriting `req`'s `Origin` to a listed page does not admit the page that really asked.
+        @test forbidden(_handshake(port; target = "/ws/rewritten", origin = "https://evil.example"))
+        @test upgraded(_handshake(port; target = "/ws/rewritten", origin = SPA))
+    finally
+        Nitro.Core.terminate(ctx)
+    end
+end
+
+@testset "it composes with a trusted proxy's scheme" begin
+    ctx, port = _ws_context(), get_free_port()
+    trusted = ExtractIP(forwarded_proto = :x_forwarded_proto, trusted_proxies = [ip"127.0.0.1"])
+    _serve(ctx, port; middleware = [trusted, WebSocketOrigins([SPA])])
+    try
+        @test upgraded(_handshake(port; origin = SPA, proto = "https"))
+        @test upgraded(_handshake(port; origin = "https://$PUBLIC_HOST", proto = "https"))
+        # The listed origin does not depend on the scheme the proxy reports: it is matched as
+        # written, against the list.
+        @test upgraded(_handshake(port; origin = SPA))
+        @test forbidden(_handshake(port; origin = "http://app.example.com", proto = "https"))
+    finally
+        Nitro.Core.terminate(ctx)
+    end
+end
+
+end

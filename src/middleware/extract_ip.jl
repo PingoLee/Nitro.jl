@@ -92,6 +92,7 @@ The scheme is not a way around the check. It only chooses which scheme of *your 
 as same-origin, so it can never admit a page from another site — and a browser page cannot set the
 header on a WebSocket handshake in the first place. **Do not strip `Origin` at the proxy instead**:
 that turns the check off, and with it the only protection against cross-site WebSocket hijacking.
+A page served from a genuinely different origin is listed with [`WebSocketOrigins`](@ref Nitro.Core.Middleware.WebSocketOriginsMiddleware.WebSocketOrigins).
 
 # Your proxy must *set*, not forward, the header
 `X-Real-IP`, `CF-Connecting-IP` and `True-Client-IP` are single-valued: Nitro believes whatever

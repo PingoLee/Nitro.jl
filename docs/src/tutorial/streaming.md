@@ -188,8 +188,12 @@ real response and the chain applies exactly as it does to JSON.
 
 WebSockets are the other raw shape — `path("/ws", handler, method = "WEBSOCKET")`, where the handler
 takes a `WebSocket`. SSE is one-directional and rides plain HTTP; prefer it when the client only
-needs to *listen*. Every upgrade passes a same-origin check on the browser's `Origin`; behind a
-proxy that terminates TLS that check needs to be told the client's scheme — see
+needs to *listen*. A request to a WebSocket route that does not ask to upgrade — a browser tab, a
+proxy that dropped `Upgrade`/`Connection` — is answered `426 Upgrade Required` with
+`Upgrade: websocket`, and a handshake for another protocol version gets `426` with
+`Sec-WebSocket-Version: 13`; one that declares the upgrade but is otherwise malformed gets `400`.
+Every upgrade passes a same-origin check on the browser's `Origin`; behind a proxy that terminates
+TLS that check needs to be told the client's scheme — see
 [WebSocket upgrades and the Origin check](@ref).
 
 ## Streaming a large file

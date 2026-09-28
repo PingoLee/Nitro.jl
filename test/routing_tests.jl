@@ -777,6 +777,8 @@ end
     @test leaf(ctx, "GET", "/stream") isa Function
     @test leaf(ctx, "HEAD", "/stream") === missing
     @test leaf(ctx, "HEAD", "/ws") === missing
+    # And a GET that does not ask to upgrade is a 426, not the handler's old `200 "false"` (#384).
+    @test internalrequest(ctx, HTTP.Request("GET", "/ws")).status == 426
 
     # Re-registering a GET path as STREAM or WEBSOCKET (Revise, a re-run `urlpatterns`) replaces
     # the GET leaf. The auto-HEAD it left behind must not keep serving the old GET handler.

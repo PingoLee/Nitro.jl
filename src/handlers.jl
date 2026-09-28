@@ -116,8 +116,8 @@ Returns a handler for `HTTP.WebSockets.WebSocket`types
 function select_handler(::Type{HTTP.WebSockets.WebSocket}, has_ctx_kwarg::Bool, has_req_kwarg::Bool, has_path_params::Bool; no_args=false)
     invoker = get_invoker_strategy(has_ctx_kwarg, has_req_kwarg, has_path_params, no_args)
     function (req::HTTP.Request, func::Function; parameters::Nullable{Tuple}=nothing)
-        # The handshake, the proxy-aware Origin check and a refusal's logging live in
-        # core/transport.jl (#374).
+        # The handshake, the proxy-aware Origin check, the 426/400 for a request that is not a
+        # valid upgrade (#384) and a refusal's logging live in core/transport.jl (#374).
         _upgrade_websocket!(ws -> invoker(func, ws, req, parameters), req)
     end
 end

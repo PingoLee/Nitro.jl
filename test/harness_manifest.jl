@@ -99,6 +99,7 @@ const TEST_FILES = [
     # ── Prebuilt Middleware Tests ─────────────────────────────────────────────
     "middleware/janitor_tests.jl",
     "middleware/extract_ip_tests.jl",
+    "middleware/websocket_origins_tests.jl",
     "middleware/ratelimitter_tests.jl",
     "middleware/ratelimitter_lru_tests.jl",
     "middleware/authmiddleware_tests.jl",

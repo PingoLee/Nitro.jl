@@ -202,7 +202,9 @@ Four things in that config are easy to get wrong, and three of them fail *quietl
   upstream and the pool is never reused — the directive looks active and does nothing.
 - **SSE needs `proxy_buffering off`.** nginx buffers proxied responses by default, which is right for
   JSON and wrong for an event stream: without it the endpoint simply appears to hang. A WebSocket
-  route missing `Upgrade`/`Connection` fails the handshake with a confusing `400`. Behind TLS
+  location missing `proxy_set_header Upgrade $http_upgrade` or `Connection "upgrade"` reaches Nitro
+  as an ordinary request, and the route answers `426 Upgrade Required` — the same answer a browser
+  tab opening the URL gets. Behind TLS
   termination a WebSocket route also needs `ExtractIP(forwarded_proto = …)`, or every browser
   upgrade is a `403` — see [WebSocket upgrades and the Origin check](@ref).
 
@@ -493,8 +495,10 @@ your proxy. That demotion happens where `serve` reads the socket, so it applies 
 ## WebSocket upgrades and the Origin check
 
 Every WebSocket upgrade passes a same-origin check: a browser's `Origin` must name this server's own
-scheme, host and port. That check is what stops a page on another site from opening a socket that
-rides your users' cookies — cross-site WebSocket hijacking — and it is the only thing that does.
+scheme, host and port, or be listed with `WebSocketOrigins` (see
+[Allowing a page from another origin](@ref) below). That check is what stops a page on another
+site from opening a socket that rides your users' cookies — cross-site WebSocket hijacking — and it
+is the only thing that does.
 
 Behind a proxy that terminates TLS, the *scheme* half is wrong unless Nitro is told. The page is
 `https://app.example.com`, so the browser sends `Origin: https://app.example.com`, but the proxy
@@ -526,6 +530,35 @@ Traefik's `wss`/`ws` are read as `https`/`http`.
 - A refused upgrade logs **one** warning the first time it happens, with each refusal's `Origin` and
   status at debug level. It is not an application error, and it records the `403` the client got.
 
+### Allowing a page from another origin
+
+An SPA served from a different origin than its API — `https://app.example.com` opening a socket to
+`https://api.example.com`, or a page on a CDN host — is not same-origin, so its upgrade is refused
+whatever the proxy reports. List the page's origin with `WebSocketOrigins` instead of loosening the
+check:
+
+```julia
+serve(middleware = [WebSocketOrigins(["https://app.example.com"])])
+
+# or only on the routes that need it:
+urlpatterns("",
+    path("/ws/chat", chat; method = "WEBSOCKET",
+         middleware = [WebSocketOrigins(["https://app.example.com"])]),
+)
+```
+
+- **Matching is exact** on scheme, host and port — never a prefix, suffix or pattern.
+  `https://app.example.com` admits neither `http://app.example.com` nor
+  `https://evil-app.example.com`. `:443` on `https` (and `:80` on `http`) may be written or left
+  out.
+- **Same-origin stays allowed**, and so does a handshake with no `Origin`.
+- **The layer closest to the route wins.** A route-level list replaces a global one rather than
+  adding to it, and `WebSocketOrigins(String[])` narrows a route back to same-origin only.
+- **`Cors` does not govern handshakes.** Its `allowed_origins` controls which pages may *read*
+  ordinary responses; it admits no WebSocket. Give each its own list, even when the two match.
+- Entries are validated when the middleware is built: `*`, `null`, `wss://…`, a trailing `/` and a
+  non-ASCII host are each an `ArgumentError` naming the fix.
+
 ## Checklist
 
 **The proxy layer**
@@ -539,6 +572,8 @@ Traefik's `wss`/`ws` are read as `https`/`http`.
 - [ ] SSE routes disable response buffering; WebSocket routes pass `Upgrade`/`Connection`.
 - [ ] Behind TLS termination, WebSocket routes have `ExtractIP(forwarded_proto = …)` configured,
       the proxy forwards the public `Host`, and nothing strips `Origin`.
+- [ ] A page served from another origin is listed with `WebSocketOrigins([...])` — exact origins,
+      never `*` — rather than admitted by stripping `Origin` or by `Cors`.
 - [ ] The Nitro port is not reachable except through the proxy — check the container's published
       ports and any network policy, not just `host`.
 - [ ] Authorization is enforced in handlers. No `location` block is the only thing guarding a route.
