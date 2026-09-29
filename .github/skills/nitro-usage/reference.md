@@ -245,6 +245,8 @@ SessionMiddleware(; store,                           # REQUIRED -- no default (#
                     rotate_on_auth   = true,
                     auth_key         = "user_id",
                     validator        = nothing,      # identity fallback when auth_key is absent
+                    session_auth_hash = nothing,     # identity -> string|nothing; sign out
+                                                     # everywhere (#391), see below
                     config           = CookieConfig(…))   # or the attributes above, not both
 # No `secret_key`: the cookie is a random id, so there is nothing to encrypt. Passing one is a
 # MethodError; a `config` carrying one is an ArgumentError (#339).
@@ -260,6 +262,12 @@ SessionMiddleware(; store,                           # REQUIRED -- no default (#
 # Default cookie_name follows the attributes: secure + path "/" + no domain => __Host-nitro_session;
 # secure with a domain or another path => __Secure-nitro_session; secure=false => nitro_session.
 # An explicit __Host-/__Secure- name the attributes cannot carry is an ArgumentError.
+# session_auth_hash (#391): stamped into the session ("_nitro_auth_hash") at login, compared on
+# every load of a signed-in session; a mismatch, a missing stamp, or `nothing` deletes it and the
+# request continues anonymous. Bump a per-user counter the hook reads => every session of that
+# user ends. Rotation never re-stamps; `rehash_session!(req)` does (keep THIS session through a
+# password change). Turning it on signs everyone out once. A `validator` must read the session
+# data it is handed, not the store. Give `Auth.session_user_validator` the same hook.
 
 SessionPruner(store; interval = Minute(10))
 # Janitor only, pass-through middleware. For apps that reach sessions through the Session{T}
@@ -442,7 +450,8 @@ watcher is then refused unless `set_watch_authorizer!` allows it. The queue auth
 ## Cookies, crypto, and secrets
 
 `configcookies`, `get_cookie`, `set_cookie!`, `regenerate_session!(req, store; ttl=3600)` (returns
-the new id, or `nothing` if a concurrent logout got there first, #361), `SecretString`, `reveal`.
+the new id, or `nothing` if a concurrent logout got there first, #361), `rehash_session!(req)`
+(re-stamp under `session_auth_hash`, #391), `SecretString`, `reveal`.
 
 ```julia
 configcookies(app; secret_key = SecretString(ENV["COOKIE_SECRET"]))   # returns nothing
