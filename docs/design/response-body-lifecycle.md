@@ -8,8 +8,8 @@ which changes the rules (see §1.5).
 > **TL;DR for Nitro contributors:** Reusing or sharing a `Response` object across
 > requests — including a module-level `const` with a `String` body — is **safe in
 > Nitro**. Nitro's `_write_response_body!` writes the body non-destructively, so the
-> upstream "string bodies empty out on reuse" footgun does not apply inside Nitro's
-> serve path. The shared `const` error responses in `src/middleware/auth_middleware.jl`
+> upstream "a `BytesBody` is single-use" footgun (which also hit `String` bodies on HTTP
+> ≤ 2.6) does not apply inside Nitro's serve path. The shared `const` error responses in `src/middleware/auth_middleware.jl`
 > are correct and endorsed. The one rule: don't reintroduce HTTP's consuming writer
 > (see §3, Guardrails).
 
@@ -18,12 +18,22 @@ which changes the rules (see §1.5).
 This section is about HTTP.jl *by itself* — e.g. `HTTP.serve!` / `HTTP.listen!`.
 §1.5 covers what changes once a response goes through Nitro.
 
+> **Updated for HTTP 2.7+.** HTTP.jl #1364 (2.7.0) stopped wrapping a `String` body in a
+> `BytesBody`: a `String` is now stored as-is and is reusable, exactly like `Vector{UInt8}`. The
+> single-use cursor survives for an **explicit `BytesBody`** — which `HTTP.servecontent`, behind
+> every `staticfiles` / `spafiles` / `dynamicfiles` / `Res.file` response, returns — and since 2.7
+> the pre-send check `_check_response_body_unsent` answers its 2nd send with a **500** instead of
+> a truncated body. Verified against 2.8.0 under raw `HTTP.serve!`. The `String` walkthrough below
+> is the ≤ 2.6 history that motivated §1.5; the guardrail is unchanged, because `BytesBody` still
+> reaches Nitro.
+
 `HTTP.Response` stores its body differently depending on how you build it:
 
 | Constructed with | Stored body type | Reusable across requests (raw HTTP.jl)? |
 |---|---|---|
-| a `String` (`Response(503, "msg")`) | `BytesBody` (single-use **cursor**) | ❌ breaks after 1st send |
+| a `String` (`Response(503, "msg")`) | `String` since 2.7; a `BytesBody` cursor on ≤ 2.6 | ✅ since 2.7 (❌ on ≤ 2.6: breaks after 1st send) |
 | a `Vector{UInt8}` (`Response(503, bytes)`) | `Vector{UInt8}` (inert data) | ✅ written non-destructively |
+| an explicit `HTTP.BytesBody` (incl. `HTTP.servecontent`) | `BytesBody` (single-use **cursor**) | ❌ 2nd send is a 500 (2.7+) |
 | `EmptyBody` / an `AbstractBody` stream | as given | streams are 1-shot |
 
 The string path wraps the bytes in a `BytesBody` — a consuming read cursor that the
@@ -208,15 +218,16 @@ layer expecting a later layer to still see it; if you need the bytes, materializ
 
 ## 4. Reference facts
 
-- The `String`→`BytesBody` wrapping already aliases the string bytes zero-copy, so
-  switching string storage to `Vector` / `CodeUnits` would be **performance-neutral** —
-  it would buy *only* reuse-safety for a pattern no framework treats as the default.
-  Hence HTTP.jl leaves it single-use.
+- Up to 2.6, a `String` body was wrapped in a `BytesBody`, and HTTP.jl #1272 declared that
+  single-use behavior intentional. HTTP.jl #1364 (2.7.0) reversed it: `String` bodies are now
+  stored as-is and are reusable.
 - Byte-vector responses are reusable by design (HTTP.jl #1254).
-- `BytesBody`'s consume-and-close-on-write is intentional (HTTP.jl #1272).
+- An explicit `BytesBody` is still consumed and closed on write, by design; since 2.7
+  `_check_response_body_unsent` turns a resend into a 500.
 - Client response bodies (`HTTP.get(...).body`) are always materialized `Vector{UInt8}`
-  — unaffected. The footgun is only **server responses built from a `String` and
-  reused**, and Nitro neutralizes even that (§1.5).
+  — unaffected. The footgun is only **server responses whose body is a `BytesBody`
+  (e.g. from `HTTP.servecontent`) and that are reused**, and Nitro neutralizes even
+  that (§1.5).
 - Nitro specifics: `_write_response_body!` in `src/core/transport.jl`; the non-mutating header
   helpers `own_response_headers` / `add_response_headers` in `src/utilities/misc.jl`
   (used by the CORS / session / CSRF / rate-limiter middleware); shared consts in
