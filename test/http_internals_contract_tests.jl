@@ -35,7 +35,7 @@ import Sockets
 #
 # None of these are part of HTTP's public, SemVer-guaranteed API, so a 2.x bump
 # can rename or remove them WITHOUT a breaking-version signal. The compat pin
-# (`HTTP = "~2.7"`) caps that exposure to 2.7 patch releases; this testset is the
+# (`HTTP = "~2.8"`) caps that exposure to 2.8 patch releases; this testset is the
 # canary — if an upgrade moves the ground, it fails HERE, loud and naming the
 # missing symbol, instead of deep inside request handling.
 #
@@ -172,6 +172,29 @@ end
     @test :closed     in fieldnames(HTTP.BytesBody)
 end
 
+@testset "a header name is stored, and so sent, as spelled (HTTP 2.8)" begin
+    # 2.0 through 2.7 rewrote every name into `Content-Type` form on insertion, so the rate
+    # limiter's `setheader(resp, "X-RateLimit-Limit" => …)` (src/middleware/rate_limiter.jl) went
+    # out as `X-Ratelimit-Limit`. HTTP.jl #1377 (2.8.0) stores the name as given and HTTP/1
+    # serializes it that way, which is the wire change the ~2.8 upgrade entry documents. Nitro
+    # never depended on either spelling -- every header walk in src/ compares case-insensitively --
+    # so this pins the observable half: a release that re-canonicalized would fail here instead of
+    # silently changing what clients receive.
+    resp = HTTP.Response(200)
+    HTTP.setheader(resp, "X-RateLimit-Limit" => "10")
+    @test first(only(resp.headers)) == "X-RateLimit-Limit"
+    # Lookup stays case-insensitive in every spelling (as it was before 2.8 for any name that went
+    # through HTTP's insertion API, which canonicalized it).
+    @test HTTP.header(resp, "x-ratelimit-limit") == "10"
+    @test HTTP.header(resp, "X-RATELIMIT-LIMIT") == "10"
+    # A second set in another spelling replaces the entry rather than adding a twin -- and the
+    # LATEST writer's spelling wins. That is load-bearing: `Res` applies caller headers through
+    # `setheader`, so a caller's `"content-type"` rewrites Nitro's `Content-Type` on the wire.
+    HTTP.setheader(resp, "x-ratelimit-limit" => "20")
+    @test length(resp.headers) == 1 && HTTP.header(resp, "X-RateLimit-Limit") == "20"
+    @test first(only(resp.headers)) == "x-ratelimit-limit"
+end
+
 @testset "reading BytesBody.data does not spend the body (HTTP 2.7 pre-send check)" begin
     # HTTP 2.7.0 (#1364) added `_check_response_body_unsent`, called from `write_response!`
     # before the response head goes out. It answers **500** for a `BytesBody`/`CallbackBody`
@@ -274,6 +297,10 @@ end
     plain = HTTP.servecontent(HTTP.Request("GET", "/x"), src; name="x.txt", etag=etag)
     @test plain.status == 200
     @test HTTP.header(plain, "ETag") == etag
+    # `servecontent` writes the name as `ETag`, and since HTTP 2.8 that is what every static, SPA
+    # and `Res.file` response sends (2.7 canonicalized it to `Etag`). Pinned by raw name, since the
+    # lookup above cannot tell the two apart.
+    @test "ETag" in first.(collect(plain.headers))
 
     cond = HTTP.servecontent(HTTP.Request("GET", "/x", ["If-None-Match" => etag]), src;
                              name="x.txt", etag=etag)
@@ -532,7 +559,7 @@ end
 
 @testset "HTTP's SSE body contract, which Res.sse is built on (#160)" begin
     # `Res.sse` hands the transport an `HTTP.SSEStream` and nothing else. Three properties of that
-    # type are load-bearing for Nitro, and `HTTP = "~2.7"` is a deliberately tight pin, so they are
+    # type are load-bearing for Nitro, and `HTTP = "~2.8"` is a deliberately tight pin, so they are
     # pinned here next to the rest of the HTTP contract.
 
     # 1. It is an `AbstractBody`, so it dispatches to the STREAMING method of
