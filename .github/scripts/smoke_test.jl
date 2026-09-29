@@ -71,9 +71,10 @@ end
     end
 
     # ── 3. Routing + the response write path, over a real socket ──────────────
-    # The non-consuming response write path reaches into the `HTTP.BytesBody.data`
-    # internal, so "a request came back with the right body" is a real assertion
-    # about version compatibility, not a tautology.
+    # The non-consuming response write path reads `HTTP.BytesBody.data`, a field
+    # documented since HTTP 2.8 but on a type HTTP does not declare `public`, so "a request
+    # came back with the right body" is a real assertion about version compatibility, not a
+    # tautology.
     @testset "serves over a real socket" begin
         ctx = Nitro.Core.App()
         Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[

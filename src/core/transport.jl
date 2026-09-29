@@ -247,11 +247,13 @@ end
 # 2.7.0 also added `_check_response_body_unsent`, which runs in `write_response!` before the
 # head is written and answers 500 for a `BytesBody`/`CallbackBody` that is already sent or
 # closed. Reading `.data` never advances `next_index` nor sets `closed`, so a shared response
-# is never seen as spent — pinned behaviorally in test/http_internals_contract_tests.jl,
-# because #1364's note that reading `.data` directly "isn't explicitly restricted" is an
-# absence of prohibition rather than a guarantee.
+# is never seen as spent — pinned behaviorally in test/http_internals_contract_tests.jl.
 #
-# The `BytesBody.data` field this reaches into is an HTTP internal, canaried in
+# Since HTTP 2.8.0 that is documented behavior, not a loophole: the `BytesBody` docstring calls
+# `data` "the public `data` field" and says a read-only consumer "may borrow `data` … without
+# advancing the cursor". (Before 2.8 all we had was #1364's note that reading `.data` "isn't
+# explicitly restricted".) `BytesBody` itself is still not declared `public`
+# (`Base.ispublic(HTTP, :BytesBody) == false`), so the field stays canaried in
 # test/http_internals_contract_tests.jl; the reuse-safety it buys is covered behaviorally in
 # test/middleware/authmiddleware_tests.jl. Do not route response bodies back through HTTP's
 # consuming writer.
@@ -271,7 +273,8 @@ end
 #
 # Everything above exists so a `Response` can be written repeatedly: `staticfiles` and every
 # module-level `const` error response hand the same object to the writer again and again, and
-# reading `BytesBody.data` leaves the cursor alone so they can. This method is the deliberate
+# writing the stored bytes — `BytesBody.data`, or a `String`/`Vector{UInt8}` body as-is — leaves
+# any cursor alone so they can. This method is the deliberate
 # opposite. An `HTTP.AbstractBody` that is not a `BytesBody` — `_SeekableResponseBody` from
 # `HTTP.servecontent(req, ::IO)`, or a `CallbackBody` — is a *cursor over a source*, not a buffer.
 # Reading it is the only way to send it, and a second send would produce a truncated body.
@@ -282,8 +285,9 @@ end
 # 500 rather than silently truncating. Never cache a response built this way.
 #
 # `body_read!` / `body_closed` / `body_close!` are HTTP.jl **public** API (declared through
-# `Expr(:public, …)`), unlike the `BytesBody.data` field above — so this method depends on a
-# supported interface rather than on a layout canary.
+# `Expr(:public, …)`) — firmer footing than the `BytesBody.data` field above, which is documented
+# but lives on a type HTTP does not declare `public` — so this method depends on a supported
+# interface rather than on a layout canary.
 #
 # ── The loop terminates on the SHORT READ, never on `body_closed` (#160) ──
 #
