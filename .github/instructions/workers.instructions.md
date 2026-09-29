@@ -321,8 +321,9 @@ decide.
   worked around it with a hand-written DELETE until
   [PormG#765](https://github.com/PingoLee/PormG.jl/issues/765) put the filters on the row, and now
   `try_delete_task!` and `cleanup_tasks!` go through `.filter(...).delete()` again. **The
-  `[compat]` bound is what holds the fence** — an older PormG re-opens #379 with every test still
-  green, because SQLite serializes writers and no mock can show the race. A sweep that reads before
+  `[compat]` bound is what holds the fence** — an older PormG re-opens #379. SQLite serializes
+  writers and no mock can stage the race, so the suite pins the *shape* instead: the worker tests
+  render both deletes on both dialects and fail on a `WHERE "id" IN (SELECT …)`. A sweep that reads before
   it deletes re-applies its read's *eligibility* in the delete (`cleanup_tasks!`: the ids it read,
   plus the same cutoff and terminal statuses), which spares a re-run whether or not it has
   finished — not the `run_id` it read, which needs an OR-leg per row.

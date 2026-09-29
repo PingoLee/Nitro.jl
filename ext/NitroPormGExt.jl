@@ -1048,7 +1048,8 @@ end
 # clause. PormG 0.6 wrapped the filters in `WHERE "id" IN (SELECT "id" ... WHERE <filters>)`, which
 # is evaluated once, on the old snapshot: a key re-run committing while the DELETE waited on its
 # lock had its fresh PENDING row deleted (#379), so this was a hand-written DELETE until #398. The
-# `[compat]` bound is what keeps it closed -- an older PormG re-opens it, and no mock can show it.
+# `[compat]` bound is what keeps it closed -- an older PormG re-opens it. No mock can stage the
+# race; the rendered shape is pinned in `test/extensions/pormg_worker_tests.jl` instead.
 # SQLite serializes writers and never had the gap.
 
 # The delete counterpart of `try_transition!` (#323): the status and run preconditions sit in the
@@ -1069,14 +1070,15 @@ end
 # Retention reads the old-enough ids a keyset page at a time and deletes each page before reading
 # the next. Paged because a sweep can meet a large backlog -- the first working one after #379 met
 # every terminal row the table ever held -- and one unbounded DELETE over it would hold its row
-# locks, and the whole set in memory, for as long as it ran.
+# locks for as long as it ran.
 const _CLEANUP_PAGE = 500
 
 # Which rows are old enough is a read; each page's delete then re-applies that same eligibility to
 # the rows it writes, scoped to the ids read. The fence is "still eligible", not "still the same
 # run": a key re-run between the read and the delete is PENDING with no `completed_at`, or already
 # finished with a `completed_at` newer than `cutoff`, and fails the re-checked predicate either way.
-# That is the predicate `InMemoryWorkerStore` evaluates under its lock. (#379 fenced each row on
+# That is the eligibility `InMemoryWorkerStore` evaluates under its lock (it compares the cutoff
+# with `<` where this has `<=`, a boundary older than #398). (#379 fenced each row on
 # the `run_id` it read instead, which needed one OR-leg per row and a NULL `run_id` special case.)
 #
 # `status__@in` takes a Vector. PormG has no method for a Tuple, and the mocks refuse one too: the

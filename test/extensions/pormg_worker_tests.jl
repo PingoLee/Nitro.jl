@@ -814,6 +814,12 @@ struct FakeFenceSettings <: PormG.PormGSettings
     change_data::Bool
 end
 
+# Connections that only RENDER: `delete(; show_query = :dict, connection = …)` builds the statement
+# a dialect would run without touching a database, which is all the #398 shape pin needs.
+struct ShapeSQLite <: PormG.PormGSQLite end
+struct ShapePostgres <: PormG.PormGPostgres end
+PormG.backend_sqlite_version(::ShapeSQLite) = 3045000
+
 # A connection whose `nitro_task` has the `run_id` column or does not, and that answers the way a
 # real driver does (#366): a statement naming a missing column throws, and so does an `ALTER` adding
 # one that is already there. `FakeTaskPool` answers every statement, so it cannot tell a probe from
@@ -1176,16 +1182,12 @@ else
             @test get_task_info(store_d, b.id) === nothing
         end
 
-        @testset "a guarded delete compares the id as a value and spares its neighbours (#379)" begin
+        @testset "a guarded delete spares its neighbours, and an empty `from` sends nothing (#379)" begin
             m = MockTaskModel()
             store_f = RealPormGWorkerStore(model=m)
             a = TaskInfo("fence-a"); a.status = COMPLETED; replace_task!(store_f, a.id, a)
             b = TaskInfo("fence-b"); b.status = COMPLETED; replace_task!(store_f, b.id, b)
 
-            # A value that would widen the statement if it were spliced rather than bound. Binding
-            # is PormG's contract now (#398), so this pins only that the id reaches it as a value.
-            @test try_delete_task!(store_f, "fence-a' OR '1'='1", (COMPLETED,);
-                                   run_id=nothing) == false
             @test try_delete_task!(store_f, a.id, (COMPLETED,); run_id=a.run_id) == true
             @test get_task_info(store_f, a.id) === nothing
             @test get_task_info(store_f, b.id) !== nothing
@@ -1302,6 +1304,50 @@ else
                 finally
                     delete!(PormG.config, key)
                 end
+            end
+        end
+
+        @testset "the guarded deletes render every predicate on the target row (#379, #398)" begin
+            # What keeps #379 closed is PormG writing a delete's filters on the row it deletes
+            # (PormG#765), so PostgreSQL re-checks them after a lock wait. The race needs a real
+            # database; the SHAPE does not. This renders the filters `try_delete_task!` and a
+            # `cleanup_tasks!` page build, on both dialects: a PormG that went back to
+            # `WHERE "id" IN (SELECT …)` -- a regressed pin, or a widened `[compat]` -- fails here,
+            # where the mocks above would stay green. PormG 0.6 renders exactly that subquery.
+            key = "nitro-test-task-shape"
+            haskey(PormG.config, key) &&
+                error("test-only PormG connection key is already registered: $key")
+            PormG.config[key] = PormG.Configuration.Settings(
+                connections = ShapeSQLite(), change_data = true, db_def_folder = key)
+            try
+                model = getproperty(PormGExt, :task_model)(key)
+                cutoff = DateTime(2026, 1, 1)
+                shapes = (
+                    ("try_delete_task!", ["id", "run_id", "status"],
+                     () -> model.objects.filter("id" => "guard-id-value", "run_id" => "guard-run-value",
+                                                "status__@in" => ["COMPLETED"])),
+                    ("cleanup_tasks! page", ["id", "completed_at", "status"],
+                     () -> model.objects.filter("id__@in" => ["page-id-a", "page-id-b"],
+                                                "completed_at__@lte" => cutoff,
+                                                "completed_at__@isnull" => false,
+                                                "status__@in" => ["COMPLETED", "FAILED", "CANCELLED"])),
+                )
+                for conn in (ShapeSQLite(), ShapePostgres()), (name, cols, build) in shapes
+                    @testset "$(nameof(typeof(conn))): $name" begin
+                        d = build().delete(; show_query = :dict, connection = conn)
+                        sql = d[:sql_text]
+                        # The target row itself, not a self-subquery over it.
+                        @test startswith(sql, "DELETE FROM \"nitro_task\" AS \"Tb\" WHERE ")
+                        @test !occursin("SELECT", sql)
+                        @test all(c -> occursin("\"Tb\".\"$c\"", sql), cols)
+                        # Bound, never spliced.
+                        values = String[string(v) for p in d[:parameters]
+                                        for v in (p isa AbstractVector ? p : (p,))]
+                        @test !isempty(values) && !any(v -> occursin(v, sql), values)
+                    end
+                end
+            finally
+                delete!(PormG.config, key)
             end
         end
 
