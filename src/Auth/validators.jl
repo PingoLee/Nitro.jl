@@ -337,20 +337,44 @@ the session.
 
 The returned function also fits `SessionMiddleware(validator = ...)`, which calls it as
 `validator(session_id, session_data)` to find the identity marker it rotates the session id on.
+
+Pass the same `session_auth_hash` hook the `SessionMiddleware` has, and a session whose user was
+signed out everywhere is refused here too (#391). Without it, `CookieAuthMiddleware` reads the store
+directly and would keep authenticating a session that `SessionMiddleware` refuses.
+
+```julia
+hook = uid -> string(find_user(uid).session_version)
+SessionMiddleware(; store, session_auth_hash = hook)
+CookieAuthMiddleware(Auth.session_user_validator(store; session_auth_hash = hook);
+                     cookie_name = "nitro_session")
+```
+
+The check applies only when the validator reads the session from `store` itself. When
+`SessionMiddleware` calls it with the session data, the middleware has already checked it. The
+validator refuses a stale session but does not delete it; `SessionMiddleware` deletes it on its next
+load.
 """
-function session_user_validator(store::AbstractSessionStore; user_key::String="user_id")
+function session_user_validator(store::AbstractSessionStore; user_key::String="user_id",
+                                session_auth_hash::Union{Function, Nothing}=nothing)
     return function(session_id::String, session_data=nothing)
         # The second argument doubles as the middleware arity-dispatch slot: auth
         # middleware passes the `HTTP.Request` there, which is not session data.
-        resolved = (session_data === nothing || session_data isa HTTP.Request) ?
-            get_session(store, session_id) : session_data
+        from_store = session_data === nothing || session_data isa HTTP.Request
+        resolved = from_store ? get_session(store, session_id) : session_data
         # Only the login marker is an identity (#310). This used to fall through to
         # `return resolved` — the whole session — whenever `user_key` was absent, and
         # `SessionMiddleware` gives every visitor a session, so every anonymous visitor
         # authenticated as their own cart.
         resolved isa AbstractDict || return nothing
-        haskey(resolved, user_key) && return resolved[user_key]
-        return get(resolved, Symbol(user_key), nothing)
+        marker = haskey(resolved, user_key) ? resolved[user_key] :
+                 get(resolved, Symbol(user_key), nothing)
+        # A revoked sign-in is no identity (#391). The same predicate `SessionMiddleware`
+        # uses, so the two cannot disagree about which sessions a sign-out-everywhere ended.
+        if from_store && session_auth_hash !== nothing && marker !== nothing &&
+           !_session_auth_hash_current(resolved, marker, session_auth_hash)
+            return nothing
+        end
+        return marker
     end
 end
 

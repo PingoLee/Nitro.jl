@@ -278,10 +278,70 @@ case.
 
 The race has a second order, and it is not a resurrection. If the rotation commits **before** the
 logout, the logout then targets an ID that no longer exists, and the rotated session lives on:
-the rotation genuinely happened first. Logging out every session of a user is what closes that
-order, and it is a separate mechanism.
+the rotation genuinely happened first. A per-session logout cannot close that order, because it
+only knows the ID in its own request. [Signing Out Everywhere](#Signing-Out-Everywhere) below does
+close it ([#391](https://github.com/PingoLee/Nitro.jl/issues/391)).
 
 If you manage sessions manually without `SessionMiddleware`, delete the old server-side record and invalidate the client cookie yourself.
+
+## Signing Out Everywhere
+
+`SessionMiddleware(session_auth_hash = …)` ends every session of a user at once, on every device,
+whatever their IDs. Nitro has no user model, so you supply the hook. It takes the signed-in
+identity (the value under `auth_key`, `"user_id"` by default) and returns a string, or `nothing`
+if the user no longer exists. A per-user counter is the simplest source:
+
+```julia
+# A `session_version` integer column on your users table.
+session_hash(uid) = (user = find_user(uid); user === nothing ? nothing : string(user.session_version))
+
+app_sessions = SessionMiddleware(; store, session_auth_hash = session_hash)
+
+# Route it behind `GuardMiddleware(login_required())`, so there is a signed-in user to read.
+function logout_everywhere(req::HTTP.Request)
+    bump_session_version!(getsession(req)["user_id"])   # every other session ends
+    empty!(getsession(req))                             # ...and so does this one
+    regenerate_session!(req, store)
+    return Res.json(Dict("message" => "Signed out everywhere"))
+end
+```
+
+When a user signs in, the middleware saves the hook's value in the session, under the reserved key
+`"_nitro_auth_hash"`. Every later load of that session compares the saved value with the hook's
+current one. When they differ, the session is deleted and the request continues as a new anonymous
+visitor, the same way an expired session does.
+
+Rotation keeps the value the session was signed in with. That is what closes the race above: a
+rotated session still carries the old value, so the bump ends it, whichever request committed
+first.
+
+- **Password changes.** Return something derived from the stored password hash, and every session
+  ends when the password changes, with no extra code (Django does this). The value is stored in
+  each session row, so make it an HMAC keyed by a server secret, never the password hash itself or
+  a plain hash of it. A counter needs an explicit bump in the password-change handler.
+- **Keeping the current session.** Call [`rehash_session!`](@ref) in the handler that made the
+  change. The session is re-stamped with the new value at the end of the request, and only the
+  other sessions end.
+
+  ```julia
+  function sign_out_other_devices(req::HTTP.Request)
+      bump_session_version!(getsession(req)["user_id"])
+      rehash_session!(req)
+      return Res.status(204)
+  end
+  ```
+
+- **Turning the hook on signs everyone out once.** Sessions that signed in before it have no saved
+  value, and nothing vouches for them.
+- **Cost.** Anonymous sessions never call the hook. An authenticated request calls it once, so back
+  it with a cache or a cheap indexed read. Requests run concurrently, so it must be thread-safe.
+  An exception from it fails the request with a 500 rather than accepting an unchecked session.
+- **A custom `validator`** must find the identity in the session data it is handed, not by reading
+  the store by ID. A store read does not see the login the request is making, so the login is left
+  unstamped and refused on the next request.
+- **Other readers.** Pass the same hook to `Auth.session_user_validator(store; session_auth_hash)`
+  when `CookieAuthMiddleware` authenticates from the session store. `get_session` and the
+  `Session{T}` extractor read the store without the check.
 
 ## Summary Checklist
 
@@ -289,5 +349,7 @@ If you manage sessions manually without `SessionMiddleware`, delete the old serv
 - Keep `httponly=true` unless JavaScript must read the cookie.
 - Prefer `samesite="Lax"` or `"Strict"` for browser-authenticated apps.
 - Rotate the session ID on login, logout, and privilege changes.
+- Configure `session_auth_hash` if users must be able to sign out everywhere, or if a password
+  change must end their other sessions.
 - Keep an absolute lifetime (`absolute_max_age`, 7 days by default); shorten it for sensitive apps.
 - Use a persistent store such as `pormg_nitro_session()` for production deployments.

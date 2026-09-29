@@ -907,6 +907,238 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
         @test String(reader(uncapped)(req()).body) == "5"
     end
 
+    # ── #391: signing out everywhere ─────────────────────────────────────────
+    #
+    # A per-session logout knows only the id in its own request, so a rotation that commits just
+    # before it leaves the rotated session alive -- the second order of the #361 race. The
+    # `session_auth_hash` hook ends every session of a user whatever its id. `versions` is the
+    # app-side state the hook reads (a per-user counter), and `calls` counts hook calls.
+    function auth_hash_fixture(; hook = nothing)
+        store = MemoryStore()
+        versions = Dict{Int,Int}(42 => 1, 43 => 7)
+        calls = Ref(0)
+        hook = something(hook, uid -> (calls[] += 1; haskey(versions, uid) ? "v$(versions[uid])" : nothing))
+        mw = SessionMiddleware(cookie_name="sid", max_age=3600, store=store, secure=false,
+                               session_auth_hash=hook).middleware
+        return store, versions, calls, mw
+    end
+    send_as(mw, handler, sid) = mw(handler)(HTTP.Request("POST", "/",
+        sid === nothing ? Pair{String,String}[] : ["Cookie" => "sid=$sid"]))
+    sign_in(uid) = req -> (getsession(req)["user_id"] = uid; HTTP.Response(200, "in"))
+    whoami = req -> HTTP.Response(200, string(get(getsession(req), "user_id", "anon")))
+    who(mw, sid) = String(send_as(mw, whoami, sid).body)
+    stamp_of(store, sid) = get(Base.get(store, sid, nothing).data, "_nitro_auth_hash", nothing)
+
+    @testset "login stamps the session; clearing the identity removes the stamp (#391)" begin
+        store, versions, calls, mw = auth_hash_fixture()
+        sid = cookie_of(send_as(mw, sign_in(42), nothing), "sid")
+        @test stamp_of(store, sid) == "v1"
+        @test who(mw, sid) == "42"
+
+        # Signing out while keeping the cart: the identity goes, and so does its stamp.
+        res = send_as(mw, req -> (delete!(getsession(req), "user_id");
+                                  getsession(req)["cart"] = [1]; HTTP.Response(200, "out")), sid)
+        anon = cookie_of(res, "sid")
+        @test Base.get(store, anon, nothing).data == Dict{String,Any}("cart" => [1])
+    end
+
+    @testset "the logout recipe still starts a fresh clock under the hook (#362, #391)" begin
+        store, versions, calls, mw = auth_hash_fixture()
+        born = Dates.now(Dates.UTC) - Dates.Day(6)
+        seed!(store, "S", Dict{String,Any}("user_id" => 42, "_nitro_auth_hash" => "v1"); created = born)
+        before = Dates.now(Dates.UTC)
+        anon = cookie_of(send_as(mw, function (req::HTTP.Request)
+            empty!(getsession(req))
+            Nitro.regenerate_session!(req, store; ttl=3600)
+            return HTTP.Response(200, "bye")
+        end, "S"), "sid")
+        @test Base.get(store, anon, nothing).data == Dict{String,Any}()
+        @test Base.get(store, anon, nothing).created >= before
+    end
+
+    @testset "sign out everywhere ends every session of that user, and only theirs (#391)" begin
+        store, versions, calls, mw = auth_hash_fixture()
+        laptop = cookie_of(send_as(mw, sign_in(42), nothing), "sid")
+        phone = cookie_of(send_as(mw, sign_in(42), nothing), "sid")
+        other = cookie_of(send_as(mw, sign_in(43), nothing), "sid")
+
+        versions[42] += 1                     # what the app's "sign out everywhere" does
+
+        for sid in (laptop, phone)
+            res = send_as(mw, whoami, sid)
+            @test String(res.body) == "anon"
+            @test Base.get(store, sid, nothing) === nothing     # deleted, not merely refused
+            @test isempty(filter(h -> lowercase(h.first) == "set-cookie", res.headers))
+        end
+        @test who(mw, other) == "43"
+    end
+
+    @testset "the rotation-before-logout residual is closed (#391)" begin
+        # A rotates S → N and commits FIRST. B's logout then targets S, which is gone. The
+        # browser holds N. With a per-session logout N stays signed in; the control shows that.
+        logout_everywhere(store, versions) = function (req::HTTP.Request)
+            versions[42] += 1
+            empty!(getsession(req))
+            Nitro.regenerate_session!(req, store; ttl=3600)
+            return HTTP.Response(200, "bye")
+        end
+        # (label, who S is signed in as, S's stamp, A's handler). The `rotate_on_auth` case is A
+        # switching S from user 43 to 42, so N is also a fresh login that the logout must end.
+        for (label, uid, stamp, rotate_A!) in (
+                ("explicit regenerate_session!", 42, "v1",
+                    store -> (req -> (Nitro.regenerate_session!(req, store; ttl=3600); HTTP.Response(200, "A")))),
+                ("rotate_on_auth on a user switch", 43, "v7", store -> sign_in(42)))
+            @testset "$label" begin
+                # Control: no hook. The residual #391 describes.
+                store = MemoryStore()
+                storesession!(store, "S", Dict{String,Any}("user_id" => uid); ttl=3600)
+                plain = SessionMiddleware(cookie_name="sid", max_age=3600, store=store, secure=false).middleware
+                N = cookie_of(send_as(plain, rotate_A!(store), "S"), "sid")
+                send_as(plain, logout_everywhere(store, Dict(42 => 1)), "S")
+                @test who(plain, N) == "42"
+
+                # With the hook, the same sequence ends N.
+                store, versions, calls, mw = auth_hash_fixture()
+                storesession!(store, "S", Dict{String,Any}("user_id" => uid, "_nitro_auth_hash" => stamp); ttl=3600)
+                N = cookie_of(send_as(mw, rotate_A!(store), "S"), "sid")
+                @test N !== nothing && N != "S"
+                @test who(mw, N) == "42"                   # A's rotation really happened
+                send_as(mw, logout_everywhere(store, versions), "S")
+                @test who(mw, N) == "anon"
+                @test Base.get(store, N, nothing) === nothing
+            end
+        end
+    end
+
+    @testset "a rotation does not re-stamp, so it cannot outlive a logout it raced (#391)" begin
+        # The sign-out-everywhere lands while A is still running, before A rotates. Were the stamp
+        # refreshed on rotation, N would carry the post-logout value and survive it.
+        store, versions, calls, mw = auth_hash_fixture()
+        storesession!(store, "S", Dict{String,Any}("user_id" => 42, "_nitro_auth_hash" => "v1"); ttl=3600)
+        N = cookie_of(send_as(mw, function (req::HTTP.Request)
+            versions[42] += 1
+            Nitro.regenerate_session!(req, store; ttl=3600)
+            return HTTP.Response(200, "A")
+        end, "S"), "sid")
+        @test N !== nothing && N != "S"
+        @test stamp_of(store, N) == "v1"
+        @test who(mw, N) == "anon"
+    end
+
+    @testset "a session signed in before the hook was switched on is refused (#391)" begin
+        store, versions, calls, mw = auth_hash_fixture()
+        storesession!(store, "legacy", Dict{String,Any}("user_id" => 42); ttl=3600)
+        storesession!(store, "cart", Dict{String,Any}("cart" => [1]); ttl=3600)
+        @test who(mw, "legacy") == "anon"
+        @test Base.get(store, "legacy", nothing) === nothing
+        # Anonymous sessions are untouched, and cost no hook call.
+        before = calls[]
+        @test String(send_as(mw, req -> HTTP.Response(200, string(getsession(req)["cart"])), "cart").body) == "[1]"
+        @test calls[] == before
+    end
+
+    @testset "anonymous sessions never call the hook (#391)" begin
+        store, versions, calls, mw = auth_hash_fixture()
+        sid = cookie_of(send_as(mw, req -> (getsession(req)["cart"] = [1]; HTTP.Response(200, "ok")), nothing), "sid")
+        for _ in 1:3
+            send_as(mw, req -> (push!(getsession(req)["cart"], 2); HTTP.Response(200, "ok")), sid)
+        end
+        @test calls[] == 0
+        @test !haskey(Base.get(store, sid, nothing).data, "_nitro_auth_hash")
+    end
+
+    @testset "a user the hook no longer knows is refused (#391)" begin
+        store, versions, calls, mw = auth_hash_fixture()
+        sid = cookie_of(send_as(mw, sign_in(42), nothing), "sid")
+        delete!(versions, 42)                 # the user was deleted
+        @test who(mw, sid) == "anon"
+
+        # Signing in as someone the hook does not know leaves no stamp, so it never loads.
+        ghost = cookie_of(send_as(mw, sign_in(99), nothing), "sid")
+        @test stamp_of(store, ghost) === nothing
+        @test who(mw, ghost) == "anon"
+    end
+
+    @testset "a user switch stamps the new user's value (#391)" begin
+        store, versions, calls, mw = auth_hash_fixture()
+        sid = cookie_of(send_as(mw, sign_in(42), nothing), "sid")
+        switched = cookie_of(send_as(mw, sign_in(43), sid), "sid")
+        @test switched != sid
+        @test stamp_of(store, switched) == "v7"
+        versions[42] += 1                     # signing 42 out everywhere does not touch 43
+        @test who(mw, switched) == "43"
+    end
+
+    @testset "signing back in over a revoked session is a fresh login (#391)" begin
+        # The load check runs BEFORE the pre-handler identity is taken. Were it after, the
+        # handler's `user_id = 42` over the revoked `user_id = 42` would read as unchanged: no
+        # stamp, and the new login refused on its next request.
+        store, versions, calls, mw = auth_hash_fixture()
+        storesession!(store, "S", Dict{String,Any}("user_id" => 42, "_nitro_auth_hash" => "v1"); ttl=3600)
+        versions[42] = 2
+        fresh = cookie_of(send_as(mw, sign_in(42), "S"), "sid")
+        @test Base.get(store, "S", nothing) === nothing
+        @test fresh !== nothing && fresh != "S"
+        @test stamp_of(store, fresh) == "v2"
+        @test who(mw, fresh) == "42"
+    end
+
+    @testset "an identity found by `validator` is stamped and checked too (#391)" begin
+        # Identity under a key other than `auth_key`, resolved by a validator that reads the
+        # session data it is handed -- the shape the docstring requires under the hook.
+        store = MemoryStore()
+        versions = Dict(42 => 1)
+        hook = uid -> haskey(versions, uid) ? "v$(versions[uid])" : nothing
+        mw = SessionMiddleware(cookie_name="sid", max_age=3600, store=store, secure=false,
+                               validator=Nitro.Auth.session_user_validator(store; user_key="uid"),
+                               session_auth_hash=hook).middleware
+        sid = cookie_of(send_as(mw, req -> (getsession(req)["uid"] = 42; HTTP.Response(200, "in")), nothing), "sid")
+        @test stamp_of(store, sid) == "v1"
+        uid_of = req -> HTTP.Response(200, string(get(getsession(req), "uid", "anon")))
+        @test String(send_as(mw, uid_of, sid).body) == "42"
+        versions[42] += 1
+        @test String(send_as(mw, uid_of, sid).body) == "anon"
+        @test Base.get(store, sid, nothing) === nothing
+    end
+
+    @testset "a hook may return any string type (#391)" begin
+        # `split` hands back `SubString`s; the stamp is stored as a plain `String`.
+        store, versions, calls, mw = auth_hash_fixture(hook = uid -> first(split("v1 extra")))
+        sid = cookie_of(send_as(mw, sign_in(42), nothing), "sid")
+        @test stamp_of(store, sid) isa String
+        @test stamp_of(store, sid) == "v1"
+        @test who(mw, sid) == "42"
+    end
+
+    @testset "rehash_session! keeps the session that made the change (#391)" begin
+        @test :rehash_session! in names(Nitro)
+        store, versions, calls, mw = auth_hash_fixture()
+        here = cookie_of(send_as(mw, sign_in(42), nothing), "sid")
+        elsewhere = cookie_of(send_as(mw, sign_in(42), nothing), "sid")
+
+        # "Sign out my other devices": bump, and keep this one.
+        res = send_as(mw, req -> (versions[42] += 1; Nitro.rehash_session!(req); HTTP.Response(200, "ok")), here)
+        @test stamp_of(store, here) == "v2"
+        @test who(mw, here) == "42"
+        @test who(mw, elsewhere) == "anon"
+
+        # The same change without it signs this session out too.
+        res = send_as(mw, req -> (versions[42] += 1; HTTP.Response(200, "ok")), here)
+        @test who(mw, here) == "anon"
+
+        # A flag, nothing more: without the hook it changes nothing.
+        plain_store = MemoryStore()
+        plain = SessionMiddleware(cookie_name="sid", store=plain_store, secure=false).middleware
+        sid = cookie_of(send_as(plain, sign_in(42), nothing), "sid")
+        send_as(plain, req -> (Nitro.rehash_session!(req); HTTP.Response(200, "ok")), sid)
+        @test Base.get(plain_store, sid, nothing).data == Dict{String,Any}("user_id" => 42)
+    end
+
+    @testset "a hook returning a non-String is a TypeError (#391)" begin
+        store, versions, calls, mw = auth_hash_fixture(hook = uid -> 1)
+        @test_throws TypeError send_as(mw, sign_in(42), nothing)
+    end
+
     @testset "store is required — no shared process-global (#171)" begin
         @test_throws UndefKeywordError SessionMiddleware()
         @test_throws UndefKeywordError SessionMiddleware(cookie_name="no_store", max_age=60)

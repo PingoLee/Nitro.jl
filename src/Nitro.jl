@@ -71,7 +71,7 @@ export  # The application handle
         Param, LazyRequest, ValidationError, UnsupportedMediaTypeError, Nullable,
         # Cookies & Security
         configcookies, get_cookie, set_cookie!, Cookies, Errors,
-        regenerate_session!, SecretString, reveal,
+        regenerate_session!, rehash_session!, SecretString, reveal,
         # Session stores. `SessionMiddleware` has no default store (#171), so the type a caller
         # needs to satisfy it -- and the abstract type a custom store subtypes -- are public.
         AbstractSessionStore, MemoryStore, is_expired,

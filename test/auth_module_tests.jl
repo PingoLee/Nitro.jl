@@ -1127,6 +1127,43 @@ end
     @test by_user("logged-in") === nothing
 end
 
+@testset "session_user_validator: a signed-out-everywhere session is no identity (#391)" begin
+    store = Nitro.Types.MemoryStore{String, Dict{String,Any}}()
+    Nitro.Types.set_session!(store, "current", Dict{String,Any}("user_id" => 42, "_nitro_auth_hash" => "v2"); ttl=60)
+    Nitro.Types.set_session!(store, "stale", Dict{String,Any}("user_id" => 42, "_nitro_auth_hash" => "v1"); ttl=60)
+    Nitro.Types.set_session!(store, "unstamped", Dict{String,Any}("user_id" => 42); ttl=60)
+    Nitro.Types.set_session!(store, "anon", Dict{String,Any}("cart" => [1]); ttl=60)
+    versions = Dict(42 => 2)
+    calls = Ref(0)
+    hook = uid -> (calls[] += 1; haskey(versions, uid) ? "v$(versions[uid])" : nothing)
+    validator = Nitro.Auth.session_user_validator(store; session_auth_hash = hook)
+
+    # Read from the store -- `CookieAuthMiddleware`'s call shape, with or without the request.
+    @test validator("current") == 42
+    @test validator("current", HTTP.Request("GET", "/")) == 42
+    @test validator("stale") === nothing
+    @test validator("stale", HTTP.Request("GET", "/")) === nothing
+    @test validator("unstamped") === nothing
+    # Refused, not deleted: the validator only reads.
+    @test Nitro.Types.get_session(store, "stale") !== nothing
+    # A user the hook no longer knows is refused too.
+    delete!(versions, 42)
+    @test validator("current") === nothing
+    versions[42] = 2
+
+    # Anonymous sessions cost no hook call, and stay no identity.
+    before = calls[]
+    @test validator("anon") === nothing
+    @test calls[] == before
+
+    # Session data handed in directly is `SessionMiddleware`'s call shape: the middleware has
+    # already checked it, so the validator only finds the marker.
+    @test validator("any-id", Dict{String,Any}("user_id" => 7)) == 7
+
+    # Without the hook, nothing changes: the stale session still authenticates.
+    @test Nitro.Auth.session_user_validator(store)("stale") == 42
+end
+
 @testset "jwt_validator identity and profiles" begin
     # A registry of service identities; one of them has to be named the signer (#260).
     keyset = Nitro.Auth.JWTKeyset("service-a" => jwtkey("secret-a"); verify = ["service-b" => jwtkey("secret-b")])
