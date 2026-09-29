@@ -311,16 +311,21 @@ decide.
     0-row UPDATE there used to be ignored, so the re-run had no record and silently never ran.
     `set_task!` must do the opposite and leave a vanished row gone, because a state save that
     recreated it would undo a `release_task!` or a retention prune.
-- **A fenced delete never goes through PormG's `delete()`** ([#379](https://github.com/PingoLee/Nitro.jl/issues/379)).
-  `delete()` puts its filters in a subquery, `DELETE … WHERE "id" IN (SELECT "id" … WHERE
-  <filters>)`. After a lock wait, PostgreSQL's READ COMMITTED re-checks only the outer `"id" IN`,
-  so a `run_id`/`status` fence placed there is ignored exactly when it matters. A key re-run in
-  that window lost its fresh `PENDING` row. SQLite serializes writers and cannot show it, so no
-  mock-backed test can either. Any delete whose filter is a *guard* rather than a selection goes
-  through the ext's `_fenced_delete!`: one raw, parameterized DELETE with every predicate on the
-  target row, which is the shape `update()` already has and PostgreSQL does re-check. Plain
-  selection by id (`delete_task!`) may keep using `delete()`. The PormG side is tracked in
-  [PormG#765](https://github.com/PingoLee/PormG.jl/issues/765).
+- **A guarded delete is a fence only because PormG ≥ 0.7 writes its filters on the target row**
+  ([#379](https://github.com/PingoLee/Nitro.jl/issues/379),
+  [#398](https://github.com/PingoLee/Nitro.jl/issues/398)). After a lock wait, PostgreSQL's READ
+  COMMITTED re-checks a statement's own `WHERE` against the row a concurrent UPDATE left, and only
+  that clause. PormG 0.6's `delete()` wrapped its filters in `WHERE "id" IN (SELECT "id" … WHERE
+  <filters>)`, evaluated once on the old snapshot, so a `run_id`/`status` guard there was ignored
+  exactly when it mattered: a key re-run in that window lost its fresh `PENDING` row. The ext
+  worked around it with a hand-written DELETE until
+  [PormG#765](https://github.com/PingoLee/PormG.jl/issues/765) put the filters on the row, and now
+  `try_delete_task!` and `cleanup_tasks!` go through `.filter(...).delete()` again. **The
+  `[compat]` bound is what holds the fence** — an older PormG re-opens #379 with every test still
+  green, because SQLite serializes writers and no mock can show the race. A sweep that reads before
+  it deletes re-applies its read's *eligibility* in the delete (`cleanup_tasks!`: the ids it read,
+  plus the same cutoff and terminal statuses), which spares a re-run whether or not it has
+  finished — not the `run_id` it read, which needs an OR-leg per row.
 - **A terminal write is addressed to a RUN, not to a task id.** A task id outlives the run writing
   under it: re-running a finished key builds a fresh record while the previous run may still be in
   flight, and a status-only precondition cannot tell the two apart
