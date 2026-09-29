@@ -1106,9 +1106,9 @@ struct FakePostgresPool <: PormG.PormGPostgres end
     @test getproperty(PormGExt, :_datetime_column_type)(FakePostgresPool()) == "TIMESTAMPTZ"
 end
 
-# The `PasswordField` hook is latent (PormG 0.6 has no `register_field_hook`), so it is tested as
-# the function it is. It used to pass any hash-shaped string through verbatim, which let a user
-# pick a stored hash -- cost parameters included -- as their "password" (#311).
+# The `PasswordField` hook is latent (PormG, as of 0.7, has no `register_field_hook`), so it is
+# tested as the function it is. It used to pass any hash-shaped string through verbatim, which let
+# a user pick a stored hash -- cost parameters included -- as their "password" (#311).
 @testset "hash_password_field always hashes user input (#311)" begin
     hook = PormGExt.hash_password_field
     hostile = "pbkdf2_sha256\$9223372036854775807\$s\$h"
