@@ -52,7 +52,7 @@ Hook for PormG's `normalize_field_value` on `PasswordField` with `auto_hash=true
 - A password longer than `Nitro.Auth.MAX_PASSWORD_BYTES` (4096) bytes throws `ArgumentError`
   out of the save, as `make_password` does. Validate the length before assigning it.
 
-Contract for PormG's side of the seam, which does not exist yet (PormG 0.6 has no
+Contract for PormG's side of the seam, which does not exist yet (PormG, as of 0.7, has no
 `register_field_hook`, so this hook is registered only when it appears): the hook must run on
 values the **application assigns**, never on a value read back from the database, or saving
 a loaded row would hash its hash.

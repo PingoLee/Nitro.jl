@@ -31,7 +31,7 @@ Revise = "295af30f-e4ad-537b-8983-00126c2a3abe"
 TimeZones = "f269a46b-ccf7-5d73-abea-4c690281aa53"
 
 [sources]
-PormG = {url = "https://github.com/PingoLee/PormG.jl.git", rev = "054b90f6b4de6edacf9a40ebed09c2101e51ee8f"}
+PormG = {url = "https://github.com/PingoLee/PormG.jl.git", rev = "5a5798652508db4f700059bcf2964cfb87697151"}
 
 [extensions]
 MustacheExt = "Mustache"
@@ -55,7 +55,7 @@ Mustache = "^1"
 OpenSSL = "^1.4"
 OteraEngine = "^1"
 Pkg = "^1"
-PormG = "^0.6"
+PormG = "^0.7"
 PrecompileTools = "^1.3"
 Printf = "^1"
 ProtoBuf = "^1"
