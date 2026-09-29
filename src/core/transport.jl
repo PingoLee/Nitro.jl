@@ -377,7 +377,7 @@ _declares_length(resp::HTTP.Response)::Bool =
     resp.content_length >= 0 || HTTP.hasheader(resp, "Content-Length")
 
 # The HTTP.jl internals the live FIXED writer reaches, one wrapper each so an HTTP upgrade that
-# renames one is a one-line fix. All are private in HTTP 2.7 and canaried in
+# renames one is a one-line fix. All are private in HTTP 2.x and canaried in
 # test/http_internals_contract_tests.jl ("live FIXED writer").
 #
 # Whether HTTP would buffer this stream's body whole: HTTP/1.1, FIXED framing, head not yet sent.

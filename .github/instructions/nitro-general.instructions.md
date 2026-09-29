@@ -213,8 +213,10 @@ These are canonical here — no other file owns them.
   comment line; no flag disables it. Rationale parked there survives only until the next dependency
   bump. Keep the file comment-free *on purpose*, and never "fix" a stripped comment by restoring it.
   The standing case: **`julia = "^1.12"` is intentional — do not lower it to the 1.10 LTS**, and
-  `HTTP = "~2.6"` is pinned tight because core depends on `HTTP.BytesBody` internals
-  (see nitro-core §4).
+  `HTTP` is pinned with `~` (one minor series), never `^`, because core depends on
+  `HTTP.BytesBody` and other internals no SemVer covers (see nitro-core §4); moving it is a
+  deliberate bump that re-runs `test/http_internals_contract_tests.jl` and writes an `upgrading/`
+  entry, never a CompatHelper merge.
 
 - **Never log or serialize secrets.** No session payloads, CSRF tokens, JWTs, cookie values,
   connection strings, or `SecretString` contents in logs, error bodies, or issue text. Use

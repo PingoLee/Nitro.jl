@@ -315,8 +315,8 @@ end
 # whole path. For a single-valued header the LAST instance wins: proxies append or replace, so
 # the last one present is the one written closest to us.
 #
-# `HTTP.header` is not usable here — it canonicalizes only the key it is given and then compares
-# with `==`, so it misses a lowercase `cf-connecting-ip`.
+# `HTTP.header` is not usable here: it returns the FIRST instance only, and this needs every
+# instance joined, or the last one.
 function _header_value(req::HTTP.Request, name::String, join_all::Bool)::Nullable{String}
     val = nothing
     for (k, v) in req.headers
