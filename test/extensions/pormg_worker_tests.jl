@@ -1324,15 +1324,17 @@ else
                 cutoff = DateTime(2026, 1, 1)
                 shapes = (
                     ("try_delete_task!", ["id", "run_id", "status"],
+                     ["guard-id-value", "guard-run-value", "COMPLETED"],
                      () -> model.objects.filter("id" => "guard-id-value", "run_id" => "guard-run-value",
                                                 "status__@in" => ["COMPLETED"])),
                     ("cleanup_tasks! page", ["id", "completed_at", "status"],
+                     ["page-id-a", "page-id-b", "COMPLETED", "FAILED", "CANCELLED"],
                      () -> model.objects.filter("id__@in" => ["page-id-a", "page-id-b"],
                                                 "completed_at__@lte" => cutoff,
                                                 "completed_at__@isnull" => false,
                                                 "status__@in" => ["COMPLETED", "FAILED", "CANCELLED"])),
                 )
-                for conn in (ShapeSQLite(), ShapePostgres()), (name, cols, build) in shapes
+                for conn in (ShapeSQLite(), ShapePostgres()), (name, cols, inputs, build) in shapes
                     @testset "$(nameof(typeof(conn))): $name" begin
                         d = build().delete(; show_query = :dict, connection = conn)
                         sql = d[:sql_text]
@@ -1340,10 +1342,14 @@ else
                         @test startswith(sql, "DELETE FROM \"nitro_task\" AS \"Tb\" WHERE ")
                         @test !occursin("SELECT", sql)
                         @test all(c -> occursin("\"Tb\".\"$c\"", sql), cols)
-                        # Bound, never spliced.
+                        # Bound, never spliced -- checked against what went IN, not only against
+                        # what came out as a parameter: a value PormG spliced would be missing from
+                        # the parameter list, where a check over that list alone never looks.
                         values = String[string(v) for p in d[:parameters]
                                         for v in (p isa AbstractVector ? p : (p,))]
-                        @test !isempty(values) && !any(v -> occursin(v, sql), values)
+                        @test all(v -> v in values && !occursin(v, sql), inputs)
+                        # And the PostgreSQL leg really rendered PostgreSQL.
+                        conn isa ShapePostgres && @test occursin("\$1", sql)
                     end
                 end
             finally
