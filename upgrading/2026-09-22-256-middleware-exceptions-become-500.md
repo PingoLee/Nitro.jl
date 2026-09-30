@@ -1,6 +1,6 @@
 ## Middleware exceptions — a logged JSON `500`, and `internalrequest` no longer re-raises them
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#256](https://github.com/PingoLee/Nitro.jl/issues/256) ; `src/core/framework_middleware.jl`, `src/core/pipeline.jl`
 - **Recorded**: 2026-09-22
 - **Severity**: **behavior change**. An exception thrown by middleware now produces the same

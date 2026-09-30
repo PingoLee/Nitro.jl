@@ -1,6 +1,6 @@
 ## `set_auth_cookie!` — `ttl` is now a required keyword, and `DEFAULT_AUTH_COOKIE_TTL` is gone
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#232](https://github.com/PingoLee/Nitro.jl/issues/232) ; `src/Auth/cookies.jl`
 - **Recorded**: 2026-09-21
 - **Severity**: **breaking** — every existing `set_auth_cookie!` call that relied on the default

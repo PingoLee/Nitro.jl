@@ -1,6 +1,6 @@
 ## `Session{T}` — reads only an `AbstractSessionStore{String}` app context
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#327](https://github.com/PingoLee/Nitro.jl/issues/327) ; `src/extractors.jl`,
   `src/types.jl`
 - **Recorded**: 2026-09-24

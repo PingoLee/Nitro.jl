@@ -1,6 +1,6 @@
 ## Route- and router-level middleware lists now run top-down, in the order written (#312)
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#312](https://github.com/PingoLee/Nitro.jl/issues/312) ; `src/routerhof.jl`,
   `src/core/pipeline.jl`
 - **Recorded**: 2026-09-24

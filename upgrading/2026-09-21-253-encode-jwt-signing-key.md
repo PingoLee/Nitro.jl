@@ -1,6 +1,6 @@
 ## `encode_jwt` refuses a multi-key keyset with no `"default"` and no `kid=`
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#253](https://github.com/PingoLee/Nitro.jl/issues/253) ; `src/Auth/jwt.jl`
 - **Recorded**: 2026-09-21
 - **Severity**: **breaking** — a call that used to mint a token now throws an `ArgumentError`. It

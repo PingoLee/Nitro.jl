@@ -1,6 +1,6 @@
 ## Workers — no silent fallback to the process-wide runtime; `worker_startup` installs when it is built (#322)
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#322](https://github.com/PingoLee/Nitro.jl/issues/322) ;
   `src/Workers/api.jl`, `src/methods.jl`, `src/errors.jl`
 - **Recorded**: 2026-09-25

@@ -1,6 +1,6 @@
 ## `RateLimiter` — `cleanup_threshold` is removed, the sweep never ends a window early, and `exempt_paths` match whole segments (#319)
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#319](https://github.com/PingoLee/Nitro.jl/issues/319) ;
   `src/middleware/rate_limiter.jl`
 - **Recorded**: 2026-09-25

@@ -1,6 +1,6 @@
 ## Float binding — `NaN`, `Inf` and out-of-range numbers are a `400`
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#327](https://github.com/PingoLee/Nitro.jl/issues/327) ; `src/utilities/misc.jl`,
   `src/utilities/bodyparsers.jl`, `src/extractors.jl`, `src/cookies.jl`
 - **Recorded**: 2026-09-24

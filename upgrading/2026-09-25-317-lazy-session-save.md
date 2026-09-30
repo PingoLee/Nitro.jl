@@ -1,6 +1,6 @@
 ## `SessionMiddleware` — a new session is saved only when something uses it, and `MemoryStore` is bounded (#317)
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#317](https://github.com/PingoLee/Nitro.jl/issues/317) ;
   `src/middleware/session_middleware.jl`, `src/middleware/csrf_middleware.jl`, `src/types.jl`
 - **Recorded**: 2026-09-25

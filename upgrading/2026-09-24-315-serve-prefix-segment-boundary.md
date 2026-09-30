@@ -1,6 +1,6 @@
 ## `serve(prefix = …)` matches whole path segments, and a malformed prefix is refused (#315)
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#315](https://github.com/PingoLee/Nitro.jl/issues/315) ;
   `src/core/framework_middleware.jl`, `src/core/lifecycle.jl`
 - **Recorded**: 2026-09-24

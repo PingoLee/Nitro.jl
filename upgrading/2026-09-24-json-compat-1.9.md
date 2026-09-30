@@ -1,6 +1,6 @@
 ## JSON compat moves to `^1.9` — an app pinning an older JSON 1.x must move too
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#306](https://github.com/PingoLee/Nitro.jl/issues/306) ; `Project.toml` `[compat]`,
   `src/utilities/bodyparsers.jl`
 - **Recorded**: 2026-09-24

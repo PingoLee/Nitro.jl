@@ -1,6 +1,6 @@
 ## Cookie `secret_key` — at least 32 bytes, or an `ArgumentError`
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#309](https://github.com/PingoLee/Nitro.jl/issues/309) ; `src/crypto.jl`
 - **Recorded**: 2026-09-24
 - **Severity**: breaking — a cookie key shorter than 32 bytes used to be accepted and is now

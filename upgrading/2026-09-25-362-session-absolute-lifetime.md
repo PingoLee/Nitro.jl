@@ -1,6 +1,6 @@
 ## `SessionMiddleware` — sessions end 7 days after creation; `SessionPayload` gains `created` (#362)
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#362](https://github.com/PingoLee/Nitro.jl/issues/362) ; `src/types.jl`,
   `src/middleware/session_middleware.jl`, `ext/NitroPormGExt.jl`
 - **Recorded**: 2026-09-25

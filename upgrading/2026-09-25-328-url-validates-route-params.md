@@ -1,6 +1,6 @@
 ## `url()` — a value the route would not accept throws instead of building a URL
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#328](https://github.com/PingoLee/Nitro.jl/issues/328) ; `src/routing.jl`,
   `src/types.jl`, `src/context.jl`
 - **Recorded**: 2026-09-25

@@ -1,6 +1,6 @@
 ## Auth middleware and body parsers — `InterruptException`, `StackOverflowError` and `OutOfMemoryError` are no longer swallowed
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#254](https://github.com/PingoLee/Nitro.jl/issues/254) ; `src/errors.jl`, `src/middleware/auth_middleware.jl`, `src/utilities/bodyparsers.jl`, `src/utilities/misc.jl`, `src/middleware/csrf_middleware.jl`, `src/middleware/extract_ip.jl`, `src/extractors.jl`
 - **Recorded**: 2026-09-21
 - **Severity**: **behavior change** — a request that returned `401` (auth), `403` (CSRF),

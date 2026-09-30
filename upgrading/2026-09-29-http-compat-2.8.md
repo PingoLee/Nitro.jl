@@ -1,6 +1,6 @@
 ## HTTP compat moves to `~2.8` — an app pinning `~2.7` must move too, and header names now go out as spelled
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: `Project.toml` `[compat]`; `test/http_internals_contract_tests.jl`
 - **Recorded**: 2026-09-29
 - **Severity**: **breaking (dependency resolution)** — an app carrying its own `HTTP = "~2.7"`

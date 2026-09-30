@@ -1,6 +1,6 @@
 ## PormG session and worker stores — stored JSON nests at most 512 levels, and an overflow while reading it is no longer swallowed (#344)
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#344](https://github.com/PingoLee/Nitro.jl/issues/344) ; `ext/NitroPormGExt.jl`
 - **Recorded**: 2026-09-25
 - **Severity**: **behavior change.** It affects apps using `pormg_nitro_session` or

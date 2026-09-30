@@ -1,6 +1,6 @@
 ## Workers — runs are capped, a full queue refuses instead of blocking, and queue names must be declared (#324)
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#324](https://github.com/PingoLee/Nitro.jl/issues/324) ;
   `src/Workers/runtime.jl`, `src/Workers/api.jl`, `src/Workers/queue.jl`, `src/errors.jl`
 - **Recorded**: 2026-09-25

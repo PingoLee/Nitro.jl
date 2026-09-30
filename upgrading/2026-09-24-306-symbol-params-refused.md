@@ -1,6 +1,6 @@
 ## `path()` / `urlpatterns()` — a parameter that would build a `Symbol` from the request is refused when the route is declared
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#306](https://github.com/PingoLee/Nitro.jl/issues/306) ; `src/core/registration.jl`,
   `src/utilities/bodyparsers.jl`, `src/utilities/misc.jl`
 - **Recorded**: 2026-09-24

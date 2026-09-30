@@ -1,6 +1,6 @@
 ## Workers — a task you may not see reads as "not found", a denial is a `403`, and the store contract is no longer exported (#323)
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#323](https://github.com/PingoLee/Nitro.jl/issues/323) ;
   `src/Workers/api.jl`, `src/Workers.jl`, `src/utilities/misc.jl`
 - **Recorded**: 2026-09-25

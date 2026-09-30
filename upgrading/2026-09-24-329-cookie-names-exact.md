@@ -1,6 +1,6 @@
 ## `get_cookie` / `parse_cookies` — cookie names match exactly, the first one wins, and a request's `Set-Cookie` is ignored
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#329](https://github.com/PingoLee/Nitro.jl/issues/329) ; `src/cookies.jl`, `src/types.jl`
 - **Recorded**: 2026-09-24
 - **Severity**: behavior change — a cookie read under a name spelled with different case, or

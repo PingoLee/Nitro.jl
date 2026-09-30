@@ -1,6 +1,6 @@
 ## `session_user_validator` — an anonymous session no longer authenticates, and the default key is `"user_id"` (#310)
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#310](https://github.com/PingoLee/Nitro.jl/issues/310) ; `src/Auth/validators.jl`
 - **Recorded**: 2026-09-24
 - **Severity**: **breaking (auth).** The fix fails closed. An app that relied on the old default

@@ -1,6 +1,6 @@
 ## `AbstractSessionStore` — a new required `update_session!`, and a loaded session is written back update-only (#318)
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#318](https://github.com/PingoLee/Nitro.jl/issues/318) ; `src/types.jl`,
   `src/middleware/session_middleware.jl`, `ext/NitroPormGExt.jl`
 - **Recorded**: 2026-09-25
