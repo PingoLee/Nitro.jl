@@ -92,7 +92,9 @@ This safety is load-bearing and depends on two things, both guarded by tests:
 
 - `_write_response_body!` must keep writing `.data` directly — never route bodies back
   through HTTP's consuming `_write_response_body_to_stream!`.
-- It is coupled to the `HTTP.BytesBody.data` internal field, canaried in
+- It is coupled to the `HTTP.BytesBody.data` field — documented since HTTP 2.8 as public
+  and safe to borrow without advancing the cursor, but on a type HTTP does not declare
+  `public` — canaried in
   `test/http_internals_contract_tests.jl`; the reuse-safety is covered behaviorally in
   `test/middleware/authmiddleware_tests.jl`.
 
@@ -206,7 +208,8 @@ layer expecting a later layer to still see it; if you need the bytes, materializ
   `_write_response_body_to_stream!`. Nitro's non-consuming `_write_response_body!`
   (§1.5) is load-bearing; reintroducing the consuming path silently empties every
   reused response.
-- It depends on the `HTTP.BytesBody.data` internal, canaried in
+- It depends on `HTTP.BytesBody.data` (documented since HTTP 2.8; its type is not declared
+  `public`), canaried in
   `test/http_internals_contract_tests.jl`. Keep that canary and the behavioral coverage
   in `test/middleware/authmiddleware_tests.jl` green across HTTP.jl bumps.
 - **Header-adding middleware must not mutate the inner response in place.** Build a new

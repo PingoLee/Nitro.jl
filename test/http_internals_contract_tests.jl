@@ -200,11 +200,15 @@ end
     # before the response head goes out. It answers **500** for a `BytesBody`/`CallbackBody`
     # already sent or closed. Nitro's whole non-consuming write path
     # (`src/core/transport.jl::_write_response_body!`) depends on `BytesBody.data` being
-    # readable without tripping that check, because `staticfiles` and every module-level
-    # `const` error response hand the SAME `Response` object to the writer repeatedly.
+    # readable without tripping that check, because a shared `BytesBody` response — every
+    # `HTTP.servecontent` response behind `staticfiles` and `Res.file` is one — hands the SAME
+    # object to the writer repeatedly.
     #
-    # #1364 says only that reading `.data` directly "isn't explicitly restricted" — an absence
-    # of prohibition, not a guarantee. So pin the mechanism rather than trusting the note.
+    # Since HTTP 2.8.0 the `BytesBody` docstring documents this: `data` is "the public `data`
+    # field", which a read-only consumer "may borrow … without advancing the cursor". (Before
+    # 2.8, #1364 said only that it "isn't explicitly restricted".) But `BytesBody` is not
+    # declared `public`, so a docstring is all the guarantee there is — pin the mechanism rather
+    # than trusting the prose.
     @test isdefined(HTTP, :_check_response_body_unsent)
 
     # Since #1364 a String or Vector{UInt8} body is stored AS-IS — `HTTP.Response(200, "x")`
