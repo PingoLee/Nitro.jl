@@ -1,6 +1,6 @@
 ## `ProtoBuffer{T}` and `protobuf(req, T)` — protobuf bodies are decoded under length, depth and merge bounds (#325)
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#325](https://github.com/PingoLee/Nitro.jl/issues/325) ; `ext/ProtoBufExt.jl`
 - **Recorded**: 2026-09-25
 - **Severity**: **behavior change.** It affects apps that load ProtoBuf.jl and accept protobuf

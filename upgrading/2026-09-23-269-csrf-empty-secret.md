@@ -1,6 +1,6 @@
 ## `CSRFMiddleware` / `issue_csrf_token!` / `validate_csrf_token` — an empty secret is an `ArgumentError`
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#269](https://github.com/PingoLee/Nitro.jl/issues/269) ; `src/middleware/csrf_middleware.jl`, `src/crypto.jl`, `src/Auth/keyset.jl`
 - **Recorded**: 2026-09-23
 - **Severity**: behavior change — a CSRF secret that is empty, or that HMAC treats as empty,

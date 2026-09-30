@@ -1,6 +1,6 @@
 ## Request targets — the path global middleware reads is in one canonical percent-encoding (#351)
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#351](https://github.com/PingoLee/Nitro.jl/issues/351) ;
   `src/core/framework_middleware.jl`, `src/utilities/fileutil.jl`, `src/core/registration.jl`
 - **Recorded**: 2026-09-25

@@ -1,6 +1,6 @@
 ## `configcookies` / `CookieConfig` — the cookie key is held as a `SecretString`, and `configcookies` returns `nothing`
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#307](https://github.com/PingoLee/Nitro.jl/issues/307) ; `src/crypto.jl`, `src/types.jl`, `src/cookies.jl`, `src/methods.jl`
 - **Recorded**: 2026-09-24
 - **Severity**: breaking — code that read `CookieConfig.secret_key` as a `String`, used the value

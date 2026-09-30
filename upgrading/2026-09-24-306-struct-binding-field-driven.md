@@ -1,6 +1,6 @@
 ## `Query{T}` / `Form{T}` / `Header{T}` / `Path{T}` / `JsonFragment{T}` — binding follows the struct's fields, and StructTypes is no longer consulted
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#306](https://github.com/PingoLee/Nitro.jl/issues/306) ; `src/reflection.jl`,
   `src/utilities/bodyparsers.jl`, `src/utilities/misc.jl`, `src/extractors.jl`, `Project.toml`
 - **Recorded**: 2026-09-24

@@ -1,6 +1,6 @@
 ## `getform` / `payload` / `Form{T}` — only an urlencoded or untyped body is read as a form
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#345](https://github.com/PingoLee/Nitro.jl/issues/345) ; `src/utilities/bodyparsers.jl`,
   `src/extractors.jl`
 - **Recorded**: 2026-09-24

@@ -1,6 +1,6 @@
 ## An auth validator returning `false`, `true`, `""` or an empty dict is now a 401 (#313)
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#313](https://github.com/PingoLee/Nitro.jl/issues/313) ; `src/types.jl`,
   `src/middleware/auth_middleware.jl`, `src/middleware/guards.jl`, `src/Auth/validators.jl`
 - **Recorded**: 2026-09-24

@@ -1,6 +1,6 @@
 ## `sync_pormg_env!` — `PORMG_ENV` is seeded only from a `NITRO_ENV`/`GENIE_ENV` you set, so `default_env:` decides again without one (#331)
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#331](https://github.com/PingoLee/Nitro.jl/issues/331) ;
   `ext/NitroPormGExt.jl`, `src/environment.jl`, `src/exts.jl`, `docs/src/tutorial/environment.md`
 - **Recorded**: 2026-09-25

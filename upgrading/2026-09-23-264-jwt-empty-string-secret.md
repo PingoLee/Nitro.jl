@@ -1,6 +1,6 @@
 ## `jwt_validator` / `encode_jwt` / `decode_jwt` — an empty string secret is an `ArgumentError`
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#264](https://github.com/PingoLee/Nitro.jl/issues/264) ; `src/Auth/keyset.jl`, `src/Auth/jwt.jl`, `src/Auth/validators.jl`
 - **Recorded**: 2026-09-23
 - **Severity**: behavior change — a plain string secret that is empty, or that HMAC treats as

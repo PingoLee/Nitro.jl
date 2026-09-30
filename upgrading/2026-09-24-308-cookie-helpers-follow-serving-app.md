@@ -1,6 +1,6 @@
 ## `get_cookie(req, …)` / `set_cookie!(res, …)` — use the cookie configuration of the `App` serving the request
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#308](https://github.com/PingoLee/Nitro.jl/issues/308) ; `src/methods.jl`, `src/core/pipeline.jl`
 - **Recorded**: 2026-09-24
 - **Severity**: behavior change — an app that configures cookies on the **global** app but serves

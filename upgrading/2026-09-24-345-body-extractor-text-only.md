@@ -1,6 +1,6 @@
 ## `Body{T}` — a struct or container `T` is refused at registration; use `Json{T}`
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#345](https://github.com/PingoLee/Nitro.jl/issues/345) ; `src/core/registration.jl`,
   `src/utilities/bodyparsers.jl`
 - **Recorded**: 2026-09-24

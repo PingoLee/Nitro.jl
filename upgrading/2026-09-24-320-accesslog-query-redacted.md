@@ -1,6 +1,6 @@
 ## `AccessLog` — records carry no query string and no URL credentials by default (#320)
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#320](https://github.com/PingoLee/Nitro.jl/issues/320) ;
   `src/middleware/access_log.jl`, `src/utilities/misc.jl`, `src/core/framework_middleware.jl`
 - **Recorded**: 2026-09-24

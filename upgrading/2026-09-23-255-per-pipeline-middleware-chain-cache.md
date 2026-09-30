@@ -1,6 +1,6 @@
 ## `ctx.service.middleware_cache` and `cachetag` removed — middleware chains are cached per pipeline
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#255](https://github.com/PingoLee/Nitro.jl/issues/255), [#250](https://github.com/PingoLee/Nitro.jl/issues/250) ; `src/routerhof.jl`, `src/types.jl`, `src/context.jl`
 - **Recorded**: 2026-09-23
 - **Severity**: breaking for code that reached into the old cache — in practice, app **tests**

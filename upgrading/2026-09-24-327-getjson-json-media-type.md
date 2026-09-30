@@ -1,6 +1,6 @@
 ## `getjson` / `payload` — a body without a JSON `Content-Type` is not read as JSON
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#327](https://github.com/PingoLee/Nitro.jl/issues/327) ; `src/core/request.jl`,
   `src/utilities/bodyparsers.jl`
 - **Recorded**: 2026-09-24

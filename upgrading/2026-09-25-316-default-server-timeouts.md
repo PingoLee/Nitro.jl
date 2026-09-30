@@ -1,6 +1,6 @@
 ## `serve()` — a connection must finish its request head within 120 seconds, and idles out after 120 (#316)
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#316](https://github.com/PingoLee/Nitro.jl/issues/316) ; `src/core/lifecycle.jl`, `src/core/transport.jl`
 - **Recorded**: 2026-09-25
 - **Severity**: **behavior change.** It affects every app that calls `serve`, but only the

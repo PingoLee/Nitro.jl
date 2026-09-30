@@ -1,6 +1,6 @@
 ## `path(...; method="*" | "STREAM" | "WEBSOCKET", middleware=[...])` — route and router middleware now runs
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#282](https://github.com/PingoLee/Nitro.jl/issues/282) ; `src/routerhof.jl`, `src/core/registration.jl`, `src/types.jl`
 - **Recorded**: 2026-09-23
 - **Severity**: behavior change. Guards and other route middleware declared on a `method="*"`,

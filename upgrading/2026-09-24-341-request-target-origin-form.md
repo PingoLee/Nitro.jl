@@ -1,6 +1,6 @@
 ## Request targets — `//` in the path is a `400`, and absolute-form reaches middleware as a path (#341)
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#341](https://github.com/PingoLee/Nitro.jl/issues/341) ;
   `src/core/framework_middleware.jl`, `src/core/pipeline.jl`
 - **Recorded**: 2026-09-24

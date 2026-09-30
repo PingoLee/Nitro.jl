@@ -1,6 +1,6 @@
 ## `json(req, T)` — a body that does not bind raises a `ValidationError`
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#326](https://github.com/PingoLee/Nitro.jl/issues/326) ; `src/utilities/bodyparsers.jl`
 - **Recorded**: 2026-09-24
 - **Severity**: behavior change — code that caught the parser's own exception from

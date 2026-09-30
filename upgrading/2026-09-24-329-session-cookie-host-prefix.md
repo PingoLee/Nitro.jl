@@ -1,6 +1,6 @@
 ## `SessionMiddleware` — the session cookie defaults to `__Host-nitro_session`
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#329](https://github.com/PingoLee/Nitro.jl/issues/329) ; `src/middleware/session_middleware.jl`, `src/cookies.jl`
 - **Recorded**: 2026-09-24
 - **Severity**: behavior change — the default session cookie is renamed, so every user is logged

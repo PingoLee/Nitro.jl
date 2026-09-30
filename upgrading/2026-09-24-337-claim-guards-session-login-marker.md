@@ -1,6 +1,6 @@
 ## `claim_required` / `role_required` / `permission_required` — the session counts only while it is logged in (#337)
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#337](https://github.com/PingoLee/Nitro.jl/issues/337) ; `src/middleware/guards.jl`
 - **Recorded**: 2026-09-24
 - **Severity**: **behavior change (auth).** The fix fails closed: a route that was admitted is

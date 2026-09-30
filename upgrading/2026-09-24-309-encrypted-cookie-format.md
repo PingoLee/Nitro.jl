@@ -1,6 +1,6 @@
 ## Encrypted cookies — bound to their name and lifetime, and a cookie that does not open reads as absent
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#309](https://github.com/PingoLee/Nitro.jl/issues/309) ; `src/crypto.jl`, `src/cookies.jl`
 - **Recorded**: 2026-09-24
 - **Severity**: behavior change — every encrypted cookie issued before the upgrade reads as

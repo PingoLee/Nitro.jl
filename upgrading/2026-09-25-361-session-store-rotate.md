@@ -1,6 +1,6 @@
 ## `AbstractSessionStore` — a new required `rotate_session!`, and `regenerate_session!` may return `nothing` (#361)
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#361](https://github.com/PingoLee/Nitro.jl/issues/361) ; `src/types.jl`,
   `src/cookies.jl`, `src/middleware/session_middleware.jl`, `ext/NitroPormGExt.jl`
 - **Recorded**: 2026-09-25

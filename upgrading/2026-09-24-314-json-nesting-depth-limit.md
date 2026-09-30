@@ -1,6 +1,6 @@
 ## Request JSON and JWT decoding — nesting is capped at 512 levels, the JWT header at 1 KB, and JWT claims wait for the signature
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#314](https://github.com/PingoLee/Nitro.jl/issues/314) ; `src/utilities/bodyparsers.jl`, `src/utilities/misc.jl`, `src/extractors.jl`, `src/Auth/jwt.jl`
 - **Recorded**: 2026-09-24
 - **Severity**: **behavior change** — JSON nested 513 or more levels deep, which used to parse, is

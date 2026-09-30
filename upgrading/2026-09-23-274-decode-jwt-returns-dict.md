@@ -1,6 +1,6 @@
 ## `decode_jwt` — claims are a `Dict{String, Any}`, not a `JSON.Object`
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#274](https://github.com/PingoLee/Nitro.jl/issues/274) ; `src/Auth/jwt.jl`
 - **Recorded**: 2026-09-23
 - **Severity**: **breaking (and partly SILENT)**. `Symbol` and property access on decoded

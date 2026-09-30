@@ -1,6 +1,6 @@
 ## `mustache` / `otera` — an explicit `Content-Type` is no longer replaced by sniffing
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#328](https://github.com/PingoLee/Nitro.jl/issues/328) ; `src/utilities/misc.jl`,
   `ext/MustacheExt.jl`, `ext/OteraEngineExt.jl`
 - **Recorded**: 2026-09-25

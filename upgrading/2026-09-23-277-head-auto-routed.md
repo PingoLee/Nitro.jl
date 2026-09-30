@@ -1,6 +1,6 @@
 ## `path(...; method="GET")` — every `GET` route now also answers `HEAD`
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#277](https://github.com/PingoLee/Nitro.jl/issues/277) ; `src/core/registration.jl`, `src/routerhof.jl`, `src/types.jl`
 - **Recorded**: 2026-09-23
 - **Severity**: behavior change. A `HEAD` request to a `GET`-only route used to get a `405`, and now

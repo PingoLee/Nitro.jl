@@ -1,6 +1,6 @@
 ## `extract_auth_token` no longer falls back to the `auth_token` cookie by default (#321)
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#321](https://github.com/PingoLee/Nitro.jl/issues/321) ; `src/Auth/cookies.jl`
 - **Recorded**: 2026-09-24
 - **Severity**: **behaviour (auth).** Fails closed. An app that relied on the cookie fallback now

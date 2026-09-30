@@ -1,6 +1,6 @@
 ## Middleware that rewrites `req.method` or `req.target` — the rewritten route's own middleware now runs
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#291](https://github.com/PingoLee/Nitro.jl/issues/291) ; `src/routerhof.jl`, `src/core/pipeline.jl`, `src/types.jl`
 - **Recorded**: 2026-09-23
 - **Severity**: behavior change. A middleware that rewrote `req.method` or `req.target` could run a

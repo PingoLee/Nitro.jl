@@ -1,6 +1,6 @@
 ## `make_password` / `check_password` — password hashing is bounded work: a 4096-byte cap and bounded stored costs
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#311](https://github.com/PingoLee/Nitro.jl/issues/311) ; `src/Auth/passwords.jl`, `src/crypto.jl`, `ext/NitroPormGExt.jl`
 - **Recorded**: 2026-09-24
 - **Severity**: behavior change. Input that used to be hashed or verified at unbounded cost is now

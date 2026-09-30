@@ -1,6 +1,6 @@
 ## `SessionMiddleware(secret_key = …)` — removed; it was accepted and never used (#339)
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#339](https://github.com/PingoLee/Nitro.jl/issues/339) ;
   `src/middleware/session_middleware.jl`
 - **Recorded**: 2026-09-25

@@ -1,6 +1,6 @@
 ## WebSocket routes — a request that is not an upgrade now gets `426`, not `200 "false"`
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#384](https://github.com/PingoLee/Nitro.jl/issues/384) ; `src/core/transport.jl`
 - **Recorded**: 2026-09-27
 - **Severity**: behavior change. A request to a WebSocket route that is not a valid upgrade used to

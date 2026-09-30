@@ -1,6 +1,6 @@
 ## JWT keysets are a `JWTKeyset` with one signing key, and `encode_jwt` loses `kid=`
 
-- **Version**: Unreleased
+- **Version**: 0.5.0
 - **Nitro ref**: [#260](https://github.com/PingoLee/Nitro.jl/issues/260) ; `src/Auth/keyset.jl`, `src/Auth/jwt.jl`, `src/Auth/validators.jl`
 - **Recorded**: 2026-09-22
 - **Severity**: **breaking** — `encode_jwt(...; kid = ...)` no longer exists, and a `Dict` keyset
