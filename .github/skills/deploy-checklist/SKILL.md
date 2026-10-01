@@ -98,9 +98,10 @@ If the user uses nginx (or similar) in front of Nitro:
       from a direct one after an incident.
 - [ ] The socket peer IP is resolved for **both** plain HTTP and direct-TLS listeners;
       if a Nitro/HTTP upgrade ever breaks that resolution it logs a loud, rate-limited
-      error (and the request falls back to loopback) rather than silently degrading
-      IP-based limits and audit logs — watch for it, because a loopback fallback
-      combined with `trusted_proxies=[ip"127.0.0.1"]` would trust every client.
+      error and records the peer as `0.0.0.0`. That fails closed — the unspecified
+      address is never a trusted proxy, so no forwarded header is believed — but every
+      affected request then shares one rate-limit bucket and one audit-log address, so
+      watch for it.
 
 Provide a minimal config snippet only when asked; do not overwrite existing infra files without confirmation.
 

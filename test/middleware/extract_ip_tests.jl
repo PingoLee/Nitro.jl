@@ -248,6 +248,41 @@ end
                      trusted_proxies = [PROXY]) === nothing
 end
 
+@testset "Regression #404: an unreadable peer is never a trusted proxy" begin
+    # When `serve` cannot read the socket peer it seeds `0.0.0.0` (src/core/transport.jl). It
+    # used to seed loopback, so with the recommended `trusted_proxies = [ip"127.0.0.1"]` every
+    # such client had its forwarding header believed. The fallback itself is pinned in
+    # test/http_internals_contract_tests.jl; this pins that ExtractIP can never trust it, even
+    # under a `trusted_proxies` that names or covers the unspecified address.
+    UNSPEC = Nitro.Core._UNKNOWN_PEER
+    @test UNSPEC === IPv4("0.0.0.0")
+    @test xff(create_request(["X-Forwarded-For" => "$SPOOF"], UNSPEC)) == UNSPEC
+
+    covering = ([IPv4("0.0.0.0")], ["0.0.0.0/8"], [IPv6("::")], ["::ffff:0.0.0.0"])
+    for (peer, proxies) in ((IPv4("0.0.0.0"), covering[1]), (IPv4("0.0.0.0"), covering[2]),
+                            (IPv6("::"), covering[3]), (IPv6("::ffff:0.0.0.0"), covering[4]),
+                            (IPv6("::ffff:0.0.0.0"), covering[2]))
+        @test xff(create_request(["X-Forwarded-For" => "$SPOOF"], peer); proxies) == peer
+        @test extract_ip(create_request(["X-Real-IP" => "$SPOOF"], peer);
+                         forwarded_header = :x_real_ip, trusted_proxies = proxies) == peer
+    end
+
+    # Positive control: the same range still trusts the real addresses it covers, so the
+    # refusal is of the unspecified address, not of the entry.
+    @test xff(create_request(["X-Forwarded-For" => "$CLIENT"], IPv4("0.1.2.3"));
+              proxies = ["0.0.0.0/8"]) == CLIENT
+
+    # Nor is the scheme believed from it (#374's `_record_forwarded_proto!`).
+    KEY = Nitro.Core.Types.REQUEST_FORWARDED_PROTO_KEY
+    seen = Ref{HTTP.Request}()
+    mw = ExtractIP(forwarded_header = :x_forwarded_for, forwarded_proto = :x_forwarded_proto,
+                   trusted_proxies = ["0.0.0.0/8", PROXY])
+    mw(req -> (seen[] = req; HTTP.Response(200)))(
+        create_request(["X-Forwarded-For" => "$SPOOF", "X-Forwarded-Proto" => "https"], UNSPEC))
+    @test getip(seen[]) == UNSPEC
+    @test get(seen[].context, KEY, nothing) === nothing
+end
+
 @testset "The ExtractIP middleware closure" begin
     seen = Ref{Union{HTTP.Request, Nothing}}(nothing)
     handler = req -> (seen[] = req; HTTP.Response(200))

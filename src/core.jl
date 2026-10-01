@@ -68,7 +68,7 @@ export serve, terminate,
 # include/export hub it had only partly become. Each file below is included INTO
 # `module Core` and defines no module of its own, so every name in them is still a
 # `Nitro.Core.<name>` — which is how `src/methods.jl`, `src/precompile.jl` and the
-# suite reach `serve`, `internalrequest`, `setupmiddleware`, `_conn_fd` and the
+# suite reach `serve`, `internalrequest`, `setupmiddleware`, `_peer_ip` and the
 # `REQUEST_*_CACHE_KEY` consts. Wrapping any of them in a submodule breaks that.
 #
 # They must stay BELOW the submodule includes above, and the forward-declaration

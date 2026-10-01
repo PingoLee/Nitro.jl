@@ -19,8 +19,9 @@ const _STREAM_CHUNK_BYTES = 64 * 1024
 # test/http_internals_contract_tests.jl.
 #
 # Deliberately NOT centralized here: the `HTTP.EmptyBody`/`HTTP.BytesBody` body
-# *types* (dispatched on inline in bodyparsers.jl / core/transport.jl) and the `_peer_ip`
-# stream-layout reach (below) — both carry their own canary coverage.
+# *types* (dispatched on inline in bodyparsers.jl / core/transport.jl), which carry their
+# own canary coverage. The peer address is no longer a reach at all: `_peer_ip` (below)
+# reads it through HTTP's public `HTTP.peeraddr` (#410).
 #
 # Since #17 the request builder is no longer a one-line delegation to
 # `HTTP._buffered_stream_request`; what is wrapped here is that function's *shape*, rebuilt
@@ -143,22 +144,6 @@ _http_origin_allowed_default(req::HTTP.Request, server_secure::Bool)::Bool =
 # framework still needs to emit a serialized `Response`.
 _response_started(stream::HTTP.Stream)::Bool = (@atomic :acquire stream.response_started)
 
-# Resolve the underlying Reseau `TCP.FD` (which carries `raddr`) from the server connection.
-# The connection is transport-dependent: a plaintext `Reseau.TCP.Conn` exposes `:fd`
-# directly, while a `Reseau.TLS.Conn` wraps the TCP connection under `:tcp` and has no `:fd`
-# of its own. The earlier `conn.fd` shortcut therefore worked for HTTP but threw for *every*
-# HTTPS connection, silently sending every TLS client's IP to loopback. We branch on field
-# presence rather than importing Reseau (a transitive dep that must not leak into `src/`); an
-# unrecognized layout raises, which `_peer_ip` turns into the structural-break alarm below.
-function _conn_fd(conn)
-    if hasfield(typeof(conn), :fd)        # Reseau.TCP.Conn
-        return getfield(conn, :fd)
-    elseif hasfield(typeof(conn), :tcp)   # Reseau.TLS.Conn wraps a TCP.Conn under :tcp
-        return getfield(getfield(conn, :tcp), :fd)
-    end
-    error("Nitro: unrecognized Reseau connection type $(typeof(conn)) — no `:fd` or `:tcp` field")
-end
-
 # The peer address as a Julia value, in ONE canonical spelling per host. Two byte forms of
 # the same IPv4 host reach here: four bytes from an AF_INET socket, and sixteen bytes in the
 # `::ffff:0:0/96` block when a dual-stack AF_INET6 listener reports an IPv4 client. Without
@@ -189,38 +174,64 @@ function _ipaddr_from_bytes(bytes)::IPAddr
     return (acc >> 32) == 0x0000_0000_0000_ffff ? IPv4(UInt32(acc & 0xffff_ffff)) : IPv6(acc)
 end
 
-# HTTP.jl v1's `Sockets.getpeername(::HTTP.Stream)` no longer works in v2 — server streams
-# are not raw sockets. The peer address is reachable through the server connection that v2
-# tracks on the stream (`stream.tracked.conn`, a Reseau `TCP.Conn`/`TLS.Conn`, whose backing
-# `TCP.FD` carries `raddr`; see `_conn_fd`). Navigate that path defensively and fall back to
-# loopback when the address is unavailable so a request is never failed merely because the
-# client IP couldn't be determined — but make that fallback *loud*. Silently treating every
-# client as loopback degrades IP-based controls (rate limiting keys collapse to one bucket,
-# audit logs lose the source IP) and, combined with `ExtractIP(trusted_proxies=[loopback])`,
-# would cause `X-Forwarded-For` to be trusted from every client. We distinguish two cases:
-#   * `raddr === nothing` — a legitimate runtime condition for some connection types; warn.
-#   * a thrown `getfield` — the HTTP/Reseau internal layout this reaches into has likely
-#     changed; this is a structural break, so log it as an error with the exception.
+# The peer address bytes from what `HTTP.peeraddr` returns. That is declared as the abstract
+# `Reseau.TCP.SocketAddr`, so `getfield(addr, :ip)` infers `Any`; the two `isa` arms narrow it to
+# the concrete octet tuples of `SocketAddrV4`/`SocketAddrV6` without naming a Reseau type (a
+# transitive dep that must not leak into `src/`), which keeps `_ipaddr_from_bytes` statically
+# dispatched (nitro-core §7). Any other shape is a structural break, and raises.
+function _socketaddr_ip(addr)::IPAddr
+    ip = getfield(addr, :ip)
+    ip isa NTuple{4, UInt8}  && return _ipaddr_from_bytes(ip)
+    ip isa NTuple{16, UInt8} && return _ipaddr_from_bytes(ip)
+    error("Nitro: unrecognized peer address $(typeof(addr)) — expected a 4- or 16-octet `ip`")
+end
+
+# The socket peer of a served request, read through `HTTP.peeraddr` — HTTP's public API for
+# exactly this since 2.7.1, covering plain TCP and TLS over HTTP/1 and HTTP/2 (#410). Until
+# then this walked the private `stream.tracked.conn.{fd,tcp.fd}.raddr` chain, which is why that
+# chain was canaried and one reason HTTP is pinned with `~`.
+#
+# Two ways to come back without an address, and neither is allowed to fail the request:
+#   * `peeraddr` returns `nothing` — the stream has no live connection. Its docstring names a
+#     stream built from a buffered request; for a connection HTTP's server actually accepted it
+#     does not happen, because Reseau's `TCP.accept` either records the remote address or throws
+#     and drops the connection. Unexpected, so it warns.
+#   * `peeraddr` throws — HTTP no longer gives a server stream an address this function
+#     understands. A structural break, logged as an error with the exception.
 # Both use `maxlog=1` so a persistent failure can't flood the log one line per request.
-function _peer_ip(stream::HTTP.Stream)::IPAddr
+#
+# Both FAIL CLOSED to the unspecified address `0.0.0.0` (#404). The fallback used to be loopback
+# — the single most trusted value there is: `trusted_proxies = [ip"127.0.0.1"]` is the
+# configuration every `ExtractIP` example recommends, so an unreadable peer had `X-Forwarded-For`
+# trusted from every client, and an app allow-listing localhost let everyone in. No connection
+# has `0.0.0.0` as its peer, and `ExtractIP`'s `_is_trusted` refuses an unspecified address
+# whatever `trusted_proxies` says, so the fallback can never be anybody's proxy. What stays
+# degraded is the part no fallback can fix: every affected request shares one rate-limit bucket
+# and one audit-log address.
+#
+# `lookup` is the seam the tests drive both branches through without a live socket.
+const _UNKNOWN_PEER = IPv4(0)
+
+_peer_ip(stream::HTTP.Stream)::IPAddr = _peer_ip(HTTP.peeraddr, stream)
+
+function _peer_ip(lookup::F, stream)::IPAddr where {F}
     try
-        conn = getfield(getfield(stream, :tracked), :conn)
-        raddr = getfield(_conn_fd(conn), :raddr)
-        if raddr === nothing
-            @warn "Nitro: peer address unavailable on this connection; falling back to " *
-                  "loopback. IP-based rate limiting, audit logging and trusted-proxy " *
-                  "checks are degraded for affected requests." maxlog=1
-            return Sockets.localhost
+        addr = lookup(stream)
+        if addr === nothing
+            @warn "Nitro: peer address unavailable on this connection; recording it as " *
+                  "0.0.0.0. No forwarded header is trusted for affected requests, and they " *
+                  "share one rate-limit bucket and one audit-log address." maxlog=1
+            return _UNKNOWN_PEER
         end
-        return _ipaddr_from_bytes(getfield(raddr, :ip))
+        return _socketaddr_ip(addr)
     catch err
-        @error "Nitro: could not read the peer IP from HTTP stream internals — the " *
-               "HTTP.jl/Reseau stream layout `_peer_ip` reaches into may have changed. " *
-               "Falling back to loopback, which SILENTLY DEGRADES IP-based rate limiting " *
-               "and audit logging, and (with `trusted_proxies` set) can cause " *
-               "X-Forwarded-For to be trusted from every client. Pin HTTP.jl/Reseau and " *
-               "verify `_peer_ip`." exception=(err, catch_backtrace()) maxlog=1
-        return Sockets.localhost
+        err isa InterruptException && rethrow()
+        @error "Nitro: could not read the peer IP through `HTTP.peeraddr` — the HTTP.jl " *
+               "server-stream API `_peer_ip` relies on may have changed. Recording the peer " *
+               "as 0.0.0.0: no forwarded header is trusted, but EVERY request now shares one " *
+               "rate-limit bucket and one audit-log address. Pin HTTP.jl and verify " *
+               "`_peer_ip`." exception=(err, catch_backtrace()) maxlog=1
+        return _UNKNOWN_PEER
     end
 end
 
@@ -1201,8 +1212,9 @@ end
 # keep-alive connection had its body cut 120 seconds after the previous response. Clearing
 # unconditionally covers whichever deadline is armed; when none is, Reseau sees an unchanged value.
 #
-# `getfield`, not property access, to match `_peer_ip`'s walk of the same internal chain. Every
-# field and the `_set_read_deadline!` method are canaried in test/http_internals_contract_tests.jl.
+# `getfield`, not property access, to match the other readers of this internal chain
+# (`_bound_swallow!`, the WebSocket TLS check). Every field and the `_set_read_deadline!` method
+# are canaried in test/http_internals_contract_tests.jl ("header-deadline release surface").
 function _clear_header_deadline!(stream::HTTP.Stream)::Nothing
     getfield(stream, :h2_conn) === nothing || return nothing
     server = getfield(stream, :server)

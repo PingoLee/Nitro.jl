@@ -327,8 +327,15 @@ function _header_value(req::HTTP.Request, name::String, join_all::Bool)::Nullabl
     return val
 end
 
+# An unspecified address (`0.0.0.0`, `::`, and `::ffff:0.0.0.0`, which `_norm` folds onto the
+# first) is never a proxy, whatever `trusted_proxies` says. No connection has it as its peer: it
+# is what `_peer_ip` records when it could NOT read the peer (src/core/transport.jl, #404), so
+# trusting it would hand the forwarding header to every client whose address was lost. Refused
+# here, at the one check `_resolve`, `_walk_chain` and `_record_forwarded_proto!` all go
+# through, rather than by rejecting entries: a range like `"0.0.0.0/8"` stays a valid entry for
+# the addresses it really covers.
 _is_trusted(policy::_TrustPolicy, v6::Bool, host::UInt128) =
-    any(p -> p.v6 === v6 && (host & p.mask) == p.net, policy.proxies)
+    !iszero(host) && any(p -> p.v6 === v6 && (host & p.mask) == p.net, policy.proxies)
 
 # Strip a port and/or brackets so a proxy that writes `203.0.113.7:1234` or `[2001:db8::1]:443`
 # still parses. A bare IPv6 address has at least two colons, so the single-colon test is
