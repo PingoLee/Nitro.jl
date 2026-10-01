@@ -1,6 +1,6 @@
 name = "Nitro"
 uuid = "e5efdb2c-68ee-4494-894d-55bb80f0a340"
-version = "0.5.0"
+version = "0.5.1"
 authors = ["Nitro.jl Contributors"]
 repo = "https://github.com/PingoLee/Nitro.jl.git"
 
@@ -63,7 +63,7 @@ Random = "^1"
 ReTestItems = "^1"
 Reexport = "^1"
 Revise = "^3"
-SHA = "^0.7"
+SHA = "^0.7, 1"
 Sockets = "^1"
 Suppressor = "^0.2.6"
 Test = "^1"
