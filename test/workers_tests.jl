@@ -8,6 +8,12 @@
 # "unhandled task" match is case-insensitive because `errormonitor` upper-cases it when stderr is
 # not a terminal.
 #
+# The PARENT sends the signal, and only once the child says it is parked (#414). The child used
+# to send its own, from `sh -c "sleep 4; kill -INT …"`, at a main task asleep for a fixed 8 s,
+# and once printed `main_never_saw_it` beside a healthy scheduler on a macOS runner -- most
+# likely that window closing under load. A handshake has no window to miss, and with no sender
+# spawned inside the child, nothing but the tasks under test is there to park on its thread 1.
+#
 # Not on Windows: there is no `kill -INT` to send, and Julia's console Ctrl-C there is a
 # different mechanism.
 @testitem "Workers -- Ctrl-C reaches the main task, not the retention scheduler (#369)" tags=[:workers, :slow] setup=[NitroCommon] begin
@@ -18,30 +24,81 @@ Base.exit_on_sigint(false)          # what every REPL does
 using Nitro, Nitro.Workers
 rt = WorkerRuntime(InMemoryWorkerStore())
 s = start_cleanup_scheduler(; interval_hours=24, runtime=rt)
-# A plain OS process sends the signal, so no extra Julia task competes for thread 1. Four
-# seconds, not two: under `1,0` the scheduler's first run starts only once the main task parks,
-# and it JIT-compiles `_cleanup_scheduler_loop` then -- a signal landing mid-compile, before
-# the loop's `try`, would fail the task and look like the bug.
-run(`sh -c "sleep 4; kill -INT $(getpid())"`; wait=false)
+# Not READY until the scheduler is parked in its `wait(wake)`. Under `1,0` it first runs only
+# once the main task yields, and JIT-compiles `_cleanup_scheduler_loop` then -- a signal landing
+# mid-compile, before the loop's `try`, would fail the task and look like the bug. Reading the
+# Event's wait queue is internals, but it is the one exact answer to "is it parked yet"; this
+# poll ends before READY, so it never competes with the park below. A timeout is NOT an error:
+# a scheduler that no longer parks on `wake` -- say, one regressed to polling, the #369 shape --
+# has still had ten seconds to compile, and the assertions are what should judge it.
+timedwait(() -> !isempty(s.wake.notify.waitq), 10.0)
 got = try
-    sleep(8)                        # parked the way a blocking `serve` parks
+    println("READY"); flush(stdout)
+    # One tick on demand, so the scheduler re-parks AFTER main parks below. The probe above left
+    # main the last task to park, so under `1,0` the press would otherwise always reach main and
+    # never the scheduler's `wait(wake)` -- the one place its warn-and-stop handler covers that the
+    # in-process `InterruptingCleanupStore` testset cannot reach. Under `1,1` the patched tick runs
+    # on another thread and changes nothing -- but a scheduler made sticky again, even without
+    # polling, would now re-park on thread 1 after main and take the press, so `1,1` catches that
+    # too. The parent's `settle` covers the tick.
+    notify(s.wake)
+    # ONE park, no polling, the way a blocking `serve` parks. Not `sleep`: a fixed window is what
+    # #414 was. Not `timedwait`: it re-parks 10x a second, which keeps main the LAST task to park
+    # on thread 1 and would hide exactly the regression this item exists for. It returns only if
+    # the scheduler ends, which nothing but the press can make it do.
+    wait(s.task)
     :main_never_saw_it
 catch e
-    e isa InterruptException ? :main_interrupted : rethrow()
+    e isa InterruptException ? :main_interrupted :
+    e isa TaskFailedException ? :main_never_saw_it :   # the scheduler took it and died (#369)
+    rethrow()
 end
 println("RESULT main=", got, " scheduler_failed=", istaskfailed(s.task))
 """
 
-function ctrl_c_child(threads::String)
+# `settle` is how long after READY the press comes, and it is what makes this item sensitive at
+# all: the #369 scheduler polled every 0.1 s, so it took a press only once it had re-parked AFTER
+# the main task -- signalled within milliseconds of READY, main is still the last to park and
+# catches it even against the unpatched code (checked). A real Ctrl-C comes long after `serve`
+# parks. It is a lower bound only, never a window: main waits with no deadline, so a slow runner
+# makes the item slower, not red -- the window was the #414 flake.
+#
+# A child that never says READY, or never exits once signalled, is killed at the deadline and
+# reported as `timed_out` -- a red assertion, never a hung CI leg. The deadline includes the
+# child's startup; a cold pkgimage cache is warmed earlier in a full run by the other children
+# spawned with the same flags, so only a lone filtered run on a cold depot is near it.
+function ctrl_c_child(threads::String; settle::Real=2, deadline::Real=120)
     cmd = `$(Base.julia_cmd()) --code-coverage=none --threads=$threads --project=$(Base.active_project()) --startup-file=no -e $CTRL_C_CHILD`
-    out, err = IOBuffer(), IOBuffer()
-    p = run(pipeline(ignorestatus(cmd); stdout=out, stderr=err))
-    return (; exitcode=p.exitcode, out=String(take!(out)), err=String(take!(err)))
+    err = IOBuffer()
+    p = open(pipeline(ignorestatus(cmd); stderr=err), "r")
+    timed_out = Threads.Atomic{Bool}(false)
+    watchdog = Timer(deadline) do _
+        timed_out[] = true
+        kill(p, Base.SIGKILL)
+    end
+    try
+        # Lines until READY, not just the first: stray stdout ahead of it must not cost the press.
+        seen = String[]
+        for line in eachline(p)
+            push!(seen, line)
+            line == "READY" || continue
+            sleep(settle)
+            kill(p, Base.SIGINT)
+            break
+        end
+        out = join(seen, '\n') * '\n' * read(p, String)
+        wait(p)
+        return (; exitcode=p.exitcode, out=out, err=String(take!(err)), timed_out=timed_out[])
+    finally
+        close(watchdog)
+        process_running(p) && kill(p, Base.SIGKILL)   # never leave a child parked forever
+    end
 end
 
 if !Sys.iswindows()
     @testset "with an interactive thread -- Julia 1.12's default for `julia` and `-t auto`" begin
         r = ctrl_c_child("1,1")
+        @test !r.timed_out
         @test r.exitcode == 0
         # Against the unpatched scheduler: `main=main_never_saw_it scheduler_failed=true`.
         @test contains(r.out, "RESULT main=main_interrupted scheduler_failed=false")
@@ -49,11 +106,15 @@ if !Sys.iswindows()
     end
 
     @testset "on one shared thread -- `-t 1`" begin
-        # Whichever task parked last takes the press here, which in practice is the scheduler. It
-        # must stop with its warning rather than die (unpatched: `scheduler_failed=true`).
+        # Whichever task parked last takes the press here, and the child's on-demand tick makes
+        # that the scheduler, parked in its `wait(wake)`. It must stop with its warning rather
+        # than die (unpatched: `scheduler_failed=true`), and the warning is asserted so a green
+        # means the handler ran, not that main happened to take the press instead.
         r = ctrl_c_child("1,0")
+        @test !r.timed_out
         @test r.exitcode == 0
-        @test contains(r.out, "scheduler_failed=false")
+        @test contains(r.out, "RESULT main=main_never_saw_it scheduler_failed=false")
+        @test occursin("reached the task retention scheduler", r.err)
         @test !occursin(r"unhandled task"i, r.err)
     end
 end
@@ -2076,7 +2137,8 @@ end
     # A real SIGINT cannot be aimed at one task in-process, so the interrupt arrives the way the
     # per-tick rethrow routes one that lands inside a sweep: out of `cleanup_tasks!`. The one that
     # lands in the WAIT is exercised with a real signal by the child-process item at the top of
-    # this file.
+    # this file, in its `1,0` testset, which wakes the scheduler for one tick so that it is the
+    # last task to park (#414).
     mutable struct InterruptingCleanupStore <: AbstractWorkerStore
         inner  :: InMemoryWorkerStore
         sweeps :: Int
