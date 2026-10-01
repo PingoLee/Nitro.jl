@@ -347,6 +347,11 @@ end
     @test :server in fieldnames(HTTP.Stream)
     @test :h2_conn in fieldnames(HTTP.Stream)
     @test :tracked in fieldnames(HTTP.Stream)
+    # `tracked.conn` is read directly here, by `_bound_swallow!` and by the WebSocket TLS check.
+    # It used to be pinned by the peer-IP field-chain canary, which #410 retired along with the
+    # walk; all three of these readers still need it.
+    @test isdefined(HTTP, :_ServerConn)
+    @test :conn in fieldnames(HTTP._ServerConn)
     for f in (:read_header_timeout_ns, :read_timeout_ns, :idle_timeout_ns, :write_timeout_ns)
         @test f in fieldnames(HTTP.Server)
         @test fieldtype(HTTP.Server, f) === Int64
@@ -441,48 +446,42 @@ end
     @test status(InterruptException(), false, true) === nothing
 end
 
-@testset "peer-IP field chain still present (src/core/transport.jl `_peer_ip`/`_conn_fd`)" begin
-    # `_peer_ip` reaches `stream.tracked.conn.fd.raddr` for TCP and
-    # `stream.tracked.conn.tcp.fd.raddr` for TLS. A silent rename anywhere on this
-    # chain would send every client's IP to loopback (collapsing rate-limit buckets,
-    # blanking audit logs, and — with trusted_proxies — trusting X-Forwarded-For from
-    # everyone). Canary the whole chain so a layout change fails HERE, by name.
-    @test :tracked in fieldnames(HTTP.Stream)
-    @test isdefined(HTTP, :_ServerConn)
-    @test :conn in fieldnames(HTTP._ServerConn)
-
-    conn_t = fieldtype(HTTP._ServerConn, :conn)          # Union{TCP.Conn, TLS.Conn}
-    conn_variants = conn_t isa Union ? Base.uniontypes(conn_t) : [conn_t]
-    tcp = filter(T -> occursin("TCP", string(T)), conn_variants)
-    tls = filter(T -> occursin("TLS", string(T)), conn_variants)
-    @test !isempty(tcp)   # plaintext transport present
-    @test !isempty(tls)   # TLS transport present (the case `_conn_fd` must special-case)
-
-    # TCP.Conn exposes `:fd`; TLS.Conn wraps the TCP connection under `:tcp`.
-    tcp_conn = first(tcp)
-    @test :fd in fieldnames(tcp_conn)
-    @test :raddr in fieldnames(fieldtype(tcp_conn, :fd))
-    tls_conn = first(tls)
-    @test :tcp in fieldnames(tls_conn)
-    @test :fd in fieldnames(fieldtype(tls_conn, :tcp))
+@testset "the peer IP comes from HTTP's public `peeraddr` (#410)" begin
+    # `_peer_ip` used to walk the private `stream.tracked.conn.{fd,tcp.fd}.raddr` chain, and
+    # this testset canaried every link of it. Since #410 it calls `HTTP.peeraddr`, HTTP's
+    # supported API for the client address (TCP and TLS, HTTP/1 and HTTP/2). The canary is now
+    # that the API is still there AND still declared public — a future HTTP dropping either
+    # fails HERE, by name, instead of sending every client down `_peer_ip`'s fallback.
+    @test isdefined(HTTP, :peeraddr)
+    @test Base.ispublic(HTTP, :peeraddr)
+    @test hasmethod(HTTP.peeraddr, Tuple{HTTP.Stream})
 end
 
-# Stub connections for the behavioral `_conn_fd` test below. Defined at test-item top
-# level because `struct` is illegal inside a `@testset` local scope. They mirror the
-# Reseau layouts: TCP exposes `:fd`; TLS wraps the TCP conn under `:tcp`.
-struct _FakeTCP; fd; end
-struct _FakeTLS; tcp; end
-struct _FakeUnknown; whatever; end
+# Stand-ins for what `HTTP.peeraddr` returns — Reseau's `SocketAddrV4`/`SocketAddrV6`, whose
+# `ip` field is an octet tuple. Defined at test-item top level because `struct` is illegal
+# inside a `@testset` local scope.
+struct _FakeAddr4;   ip::NTuple{4, UInt8};  port::UInt16; end
+struct _FakeAddr6;   ip::NTuple{16, UInt8}; port::UInt16; end
+struct _FakeAddrOdd; ip::String;            port::UInt16; end
 
-@testset "_conn_fd resolves both transports and raises on the unknown layout" begin
-    # Behavioral coverage for the actual branching in `_conn_fd` (the canary above only
-    # asserts the field *names* exist). This is what the TLS bug fix turned on: a TCP
-    # conn exposes `:fd` directly, a TLS conn wraps the TCP conn under `:tcp`, and an
-    # unrecognized shape must RAISE — that raise is what `_peer_ip` converts into its
-    # loud structural-break alarm instead of silently resolving every client to loopback.
-    @test Nitro.Core._conn_fd(_FakeTCP(:tcp_fd)) === :tcp_fd            # TCP → conn.fd
-    @test Nitro.Core._conn_fd(_FakeTLS(_FakeTCP(:tls_fd))) === :tls_fd  # TLS → conn.tcp.fd
-    @test_throws ErrorException Nitro.Core._conn_fd(_FakeUnknown(1))    # structural break raises
+@testset "_peer_ip converts what peeraddr returns, and survives what it cannot" begin
+    peer(lookup) = Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
+        Nitro.Core._peer_ip(lookup, :stream)
+    end
+    mapped = (0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00, 0xff,0xff, 203,0,113,7)
+    real6  = (0x20,0x01, 0x0d,0xb8, 0,0,0,0, 0,0,0,0, 0,0,0,0x01)
+
+    @test peer(_ -> _FakeAddr4((203, 0, 113, 7), 0x1234)) === Sockets.IPv4("203.0.113.7")
+    # `peeraddr` keeps a dual-stack listener's `::ffff:` form; `_ipaddr_from_bytes` still
+    # demotes it, so #66's one-spelling-per-host holds through the new source.
+    @test peer(_ -> _FakeAddr6(mapped, 0x1234)) === Sockets.IPv4("203.0.113.7")
+    @test peer(_ -> _FakeAddr6(UInt8.(real6), 0x1234)) === Sockets.IPv6("2001:db8::1")
+
+    # The three ways to come back without an address must never fail the request.
+    fallback = Nitro.Core._UNKNOWN_PEER
+    @test peer(_ -> nothing) === fallback                         # no live connection
+    @test peer(_ -> throw(ArgumentError("client stream"))) === fallback  # API changed under us
+    @test peer(_ -> _FakeAddrOdd("x", 0x1234)) === fallback        # an address shape we don't know
 end
 
 @testset "_ipaddr_from_bytes gives one canonical spelling per host (#66)" begin
@@ -618,4 +617,32 @@ end
     @test HTTP.SSEEvent("a\rb").data == "a\rb"
 end
 
+end
+
+@testitem "A served request's peer is the real socket peer (#410)" tags=[:core, :network] setup=[NitroCommon] begin
+    using Test
+    using HTTP
+    using Nitro
+    import Sockets
+
+    # The unit tests above drive `_peer_ip` through a stand-in lookup. This one goes through a
+    # real socket, so it pins that `HTTP.peeraddr` actually yields an address on a stream
+    # `serve` hands Nitro — the case where its `nothing` would send every client down the
+    # fallback without any unit test noticing.
+    app = App(mod = @__MODULE__)
+    urlpatterns(app, "",
+        path("/peer", req -> begin
+            addr = HTTP.peeraddr(req.context[:stream])
+            string(addr === nothing ? "none" : "some", " ", getpeerip(req))
+        end),
+    )
+    port = get_free_port()
+    serve(app; host = HOST, port = port, async = true, show_errors = false, show_banner = false)
+    try
+        r = HTTP.get("http://$HOST:$port/peer")
+        @test r.status == 200
+        @test String(r.body) == "some 127.0.0.1"
+    finally
+        terminate(app)
+    end
 end
