@@ -477,8 +477,11 @@ struct _FakeAddrOdd; ip::String;            port::UInt16; end
     @test peer(_ -> _FakeAddr6(mapped, 0x1234)) === Sockets.IPv4("203.0.113.7")
     @test peer(_ -> _FakeAddr6(UInt8.(real6), 0x1234)) === Sockets.IPv6("2001:db8::1")
 
-    # The three ways to come back without an address must never fail the request.
+    # The three ways to come back without an address must never fail the request — and must
+    # FAIL CLOSED (#404). The fallback was loopback, which `trusted_proxies = [ip"127.0.0.1"]`
+    # trusts; the unspecified address is something no connection has and no policy trusts.
     fallback = Nitro.Core._UNKNOWN_PEER
+    @test fallback === Sockets.IPv4("0.0.0.0")
     @test peer(_ -> nothing) === fallback                         # no live connection
     @test peer(_ -> throw(ArgumentError("client stream"))) === fallback  # API changed under us
     @test peer(_ -> _FakeAddrOdd("x", 0x1234)) === fallback        # an address shape we don't know

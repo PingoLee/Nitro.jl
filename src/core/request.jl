@@ -238,6 +238,10 @@ directly or through a proxy (#66). Canonicalization happens where `serve` reads 
 middleware, so it applies with or without `ExtractIP` in the pipeline — and, for the same reason,
 it is a guarantee about what *Nitro* seeds. A custom middleware calling `setip!` can write
 any address it likes, including a non-canonical one.
+
+If `serve` cannot read the socket peer at all, it seeds the unspecified address `0.0.0.0`
+and logs once. That address is never a trusted proxy, so no forwarding header is believed for
+such a request (#404).
 """
 getip(req::HTTP.Request) = Base.get(req.context, :ip, nothing)
 

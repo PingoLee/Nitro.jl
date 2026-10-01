@@ -200,8 +200,17 @@ end
 #     understands. A structural break, logged as an error with the exception.
 # Both use `maxlog=1` so a persistent failure can't flood the log one line per request.
 #
+# Both FAIL CLOSED to the unspecified address `0.0.0.0` (#404). The fallback used to be loopback
+# — the single most trusted value there is: `trusted_proxies = [ip"127.0.0.1"]` is the
+# configuration every `ExtractIP` example recommends, so an unreadable peer had `X-Forwarded-For`
+# trusted from every client, and an app allow-listing localhost let everyone in. No connection
+# has `0.0.0.0` as its peer, and `ExtractIP`'s `_is_trusted` refuses an unspecified address
+# whatever `trusted_proxies` says, so the fallback can never be anybody's proxy. What stays
+# degraded is the part no fallback can fix: every affected request shares one rate-limit bucket
+# and one audit-log address.
+#
 # `lookup` is the seam the tests drive both branches through without a live socket.
-const _UNKNOWN_PEER = Sockets.localhost
+const _UNKNOWN_PEER = IPv4(0)
 
 _peer_ip(stream::HTTP.Stream)::IPAddr = _peer_ip(HTTP.peeraddr, stream)
 
@@ -209,19 +218,19 @@ function _peer_ip(lookup::F, stream)::IPAddr where {F}
     try
         addr = lookup(stream)
         if addr === nothing
-            @warn "Nitro: peer address unavailable on this connection; falling back to " *
-                  "loopback. IP-based rate limiting, audit logging and trusted-proxy " *
-                  "checks are degraded for affected requests." maxlog=1
+            @warn "Nitro: peer address unavailable on this connection; recording it as " *
+                  "0.0.0.0. No forwarded header is trusted for affected requests, and they " *
+                  "share one rate-limit bucket and one audit-log address." maxlog=1
             return _UNKNOWN_PEER
         end
         return _socketaddr_ip(addr)
     catch err
         err isa InterruptException && rethrow()
         @error "Nitro: could not read the peer IP through `HTTP.peeraddr` — the HTTP.jl " *
-               "server-stream API `_peer_ip` relies on may have changed. Falling back to " *
-               "loopback, which SILENTLY DEGRADES IP-based rate limiting and audit logging, " *
-               "and (with `trusted_proxies` set) can cause X-Forwarded-For to be trusted from " *
-               "every client. Pin HTTP.jl and verify `_peer_ip`." exception=(err, catch_backtrace()) maxlog=1
+               "server-stream API `_peer_ip` relies on may have changed. Recording the peer " *
+               "as 0.0.0.0: no forwarded header is trusted, but EVERY request now shares one " *
+               "rate-limit bucket and one audit-log address. Pin HTTP.jl and verify " *
+               "`_peer_ip`." exception=(err, catch_backtrace()) maxlog=1
         return _UNKNOWN_PEER
     end
 end
