@@ -571,6 +571,23 @@ end
 # is never escaped -- escaping is the renderer's job, as it is here for the console line.
 _log_escape(s::AbstractString) = escape_string(s)
 
+# Both access logs take a post-response `skip(req, resp) -> Bool` (#401). Until then the
+# structured `AccessLog`'s `skip` was `req -> Bool`, called before the handler. An old one-argument
+# hook would now throw a `MethodError` on every request -- caught, warned, and the request logged
+# anyway -- so the migration would surface as a warning flood instead of an error. Refuse that
+# shape at construction, where the call that contains it is on the stack. Only the clearly-old
+# shape is refused: a hook with no method we can see is left to fail per request as any other.
+function _check_access_log_skip(skip, owner::AbstractString)
+    skip === nothing && return nothing
+    if !hasmethod(skip, Tuple{HTTP.Request, Any}) && hasmethod(skip, Tuple{HTTP.Request})
+        throw(ArgumentError(
+            "$owner: `skip` is now called AFTER the handler as `skip(req, resp)` -- `resp` is the " *
+            "response, or `nothing` when the handler threw -- but this hook only takes `req`. " *
+            "Rewrite `req -> …` as `(req, resp) -> …` (#401; see `upgrade_guide`)."))
+    end
+    return nothing
+end
+
 # """
 #     generate_parser(func::Function, pathparams::Vector{Tuple{String,Type}})
 

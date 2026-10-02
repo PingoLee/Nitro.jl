@@ -60,6 +60,17 @@ is explicit introspection, not accidental disclosure.)
   `code`/`state` carried in URLs never reach the logs.
 - `access_log_query=false`: set `true` to log the full target including the query
   string. Only enable when you are certain no secrets travel in query strings.
+- `access_log_skip=nothing`: a `(req, resp) -> Bool` called once the response is known; return
+  `true` to write no line for that request. To quiet scanner probes no route answered:
+  `access_log_skip = (req, resp) -> route_missed(req)` (see [`route_missed`](@ref)). The same
+  hook shape as `AccessLog(sink; skip = …)`.
+- `security_headers=nothing`: a [`SecurityHeaders`](@ref) value to put on **every** response,
+  including the ones Nitro builds outside your middleware: the `400` for a malformed target, the
+  `404` outside `prefix`, the `500` for a middleware exception, and the `413`/`503` refusals of
+  `max_body_bytes`/`max_concurrent_requests`. `SecurityHeaders()` in `middleware` reaches only
+  what comes back through the router. Opt-in; a custom `handler` gets the pipeline layer but not
+  the `413`/`503`, which only Nitro's own `stream_handler` builds. Responses HTTP.jl writes itself
+  (a malformed request, the bare `500` under `catch_errors = false`) are out of reach.
 - `prefix=nothing`: strip a global URL prefix (e.g. `"/api"`) before routing. It matches whole
   path segments: `/api`, `/api/users` and `/api?x=1` are served (as `/`, `/users` and `/?x=1`),
   while `/apiadmin/users` is a `404`, not `/admin/users`. Everything outside the prefix is a
@@ -588,7 +599,7 @@ function url(name::String; kwargs...)
 end
 
 """
-    internalrequest(req::Nitro.Request; middleware::Vector=[], serialize::Bool=true, catch_errors=true, context=missing)
+    internalrequest(req::Nitro.Request; middleware::Vector=[], serialize::Bool=true, catch_errors=true, context=missing, security_headers=nothing)
     internalrequest(app::App, req::Nitro.Request; kwargs...)
 
 Sends an internal request to the server, allowing for communication between different parts of the application.
@@ -598,7 +609,8 @@ Sends an internal request to the server, allowing for communication between diff
     global list given to `serve(middleware = …)`, so authentication, sessions, CSRF and rate
     limiting installed there do **not** apply. Route and router middleware, and the guards
     attached through them, still run. Once `serve(prefix = …)` has run, its prefix applies too,
-    so include it in the target.
+    so include it in the target. `serve(security_headers = …)` does not carry over either: pass
+    `security_headers` to this call to get the same framework layer.
 
     The request's client IP is `127.0.0.1` unless it already carries one (`setip!`), and a
     request object reused across calls keeps whatever address the previous call left. So a route
@@ -620,8 +632,9 @@ which is usually what a test asserting on it wants.
     `HTTP.body_close!` — otherwise the file handle stays open, which on Windows also blocks
     deleting the file. Over a real socket this never applies: the write path always closes.
 """
-internalrequest(req::Nitro.Request; middleware::Vector=[], serialize::Bool=true, catch_errors=true, context=missing) = 
-    Nitro.Core.internalrequest(CONTEXT[], req; middleware, serialize, catch_errors, context)
+internalrequest(req::Nitro.Request; middleware::Vector=[], serialize::Bool=true, catch_errors=true, context=missing,
+                security_headers=nothing) =
+    Nitro.Core.internalrequest(CONTEXT[], req; middleware, serialize, catch_errors, context, security_headers)
 
 """
     router(prefix::String = ""; 
@@ -889,8 +902,8 @@ end
 url(app::App, name::String; kwargs...) = Nitro.Core.Routing.url(app, name; kwargs...)
 
 internalrequest(app::App, req::Nitro.Request; middleware::Vector=[], serialize::Bool=true,
-                catch_errors=true, context=missing) =
-    Nitro.Core.internalrequest(app, req; middleware, serialize, catch_errors, context)
+                catch_errors=true, context=missing, security_headers=nothing) =
+    Nitro.Core.internalrequest(app, req; middleware, serialize, catch_errors, context, security_headers)
 
 router(app::App, prefix::String = "";
        tags::Vector{String} = Vector{String}(),

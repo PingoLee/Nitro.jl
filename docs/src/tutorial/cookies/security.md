@@ -106,11 +106,18 @@ Use [`SecurityHeaders`](@ref), which carries HSTS alongside the rest of the base
 ```julia
 using Dates
 
-serve(middleware=[
-    SecurityHeaders(hsts = Day(365)),
-    SessionMiddleware(store=MemoryStore(), secure=true),
-])
+serve(security_headers = SecurityHeaders(hsts = Day(365)),
+      middleware = [SessionMiddleware(store=MemoryStore(), secure=true)])
 ```
+
+Pass it as `security_headers`, not inside `middleware`. In the middleware list it only reaches
+responses that come back through the router. Nitro builds several responses outside that chain:
+the `400` for a malformed request-target, the `404` for a path outside `serve(prefix = …)`, the
+`500` for an exception thrown by a middleware, and the `413`/`503` refusals of `max_body_bytes`
+and `max_concurrent_requests`. Those are exactly the responses a scanner provokes, and only the
+`security_headers` keyword reaches them. `SecurityHeaders()` in a router's own middleware list
+still works for per-router policy, and adds no second copy of a header the framework layer also
+sets.
 
 HSTS is **off** unless you ask for it, and deliberately so: a browser honours `max-age` even
 after you stop sending the header, so a value sent by mistake keeps a hostname HTTPS-only for

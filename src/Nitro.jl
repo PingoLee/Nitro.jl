@@ -60,6 +60,7 @@ export  # The application handle
         # Util
         getparams, getquery, getjson, getform, getfiles, getpost,
         getsession, setsession!, getuser, getip, setip!, getpeerip, getcontext, payload, getexternalurl,
+        route_missed,
         formdata, multipart,
         # Environment resolution (#55) -- reports the env, never gates on it
         current_env,

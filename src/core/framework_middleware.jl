@@ -5,7 +5,19 @@
 # The access-log target helpers live in `Util` (src/utilities/misc.jl) so the structured
 # `AccessLog`, which is included before this file, can share them (#320). Imported by name so
 # they stay reachable as `Nitro.Core._log_target_path`, which the security tests pin.
-using .Util: _log_target_path, _log_escape
+using .Util: _log_target_path, _log_escape, _check_access_log_skip
+
+# A buggy hook must never cost the request, nor silently the line: warn and log anyway, the
+# structured `AccessLog`'s `_skips` rule.
+function _console_skips(skip, req, resp)::Bool
+    skip === nothing && return false
+    try
+        return skip(req, resp) === true
+    catch err
+        @warn "access_log_skip hook errored (logging request anyway)" exception=err
+        return false
+    end
+end
 using .Util: _is_canonical_path, _canonical_path
 
 """
@@ -33,11 +45,19 @@ Either way the target is escaped before it reaches the line (#320): control char
 invalid UTF-8 and Unicode line/bidi characters appear as `\\u…`/`\\x…` escapes, and `"` and
 `\\` are backslash-escaped, so a request cannot forge a log line or drive the terminal that
 displays it.
+
+`skip` (`serve(...; access_log_skip = …)`) is a `(req, resp) -> Bool` called after the response
+is known; return `true` to write no line for that request (#401). It is the same hook
+`AccessLog(sink; skip = …)` takes, so one predicate can quiet both, e.g. scanner probes no route
+answered: `(req, resp) -> route_missed(req)`. A hook that throws is warned about and
+the line is written anyway.
 """
-function AccessLogMiddleware(; log_query::Bool=false)
+function AccessLogMiddleware(; log_query::Bool=false, skip::Union{Nothing,Function}=nothing)
+    _check_access_log_skip(skip, "serve(access_log_skip = …)")
     return function(handle)
         return function(req::HTTP.Request)
             response = handle(req)
+            _console_skips(skip, req, response) && return response
             ip = Base.get(req.context, :ip, nothing)
             target = _log_escape(log_query ? req.target : _log_target_path(req.target))
             @info "$(Dates.format(now(), "yyyy-mm-ddTHH:MM:SS")) - $ip - \"$(req.method) $target\" $(response.status)"
@@ -196,7 +216,9 @@ function OriginFormMiddleware()
     return function(handler)
         return function(req::HTTP.Request)
             target = _origin_form(req.target)
-            target === nothing && return BAD_REQUEST
+            # No route can match a target with no canonical path (`/../etc/passwd`, `//x`): a
+            # miss for `route_missed` (#401), so a probe filter can drop it.
+            target === nothing && (_mark_route_miss!(req); return BAD_REQUEST)
             target === req.target || (req.target = target)
             return handler(req)
         end
@@ -212,7 +234,8 @@ function PrefixStripMiddleware(prefix::AbstractString)
     return function(handler)
         return function(req::HTTP.Request)
             stripped = _strip_prefix(req.target, p, n)
-            stripped === nothing && return NOT_FOUND
+            # Outside the prefix is outside every route: a miss, for `route_missed` (#401).
+            stripped === nothing && (_mark_route_miss!(req); return NOT_FOUND)
             req.target = stripped
             return handler(req)
         end

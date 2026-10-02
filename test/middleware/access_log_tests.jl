@@ -101,7 +101,7 @@ end
 
 @testset "skip predicate excludes matching requests" begin
     records, sink = collecting_sink()
-    lf = AccessLog(sink; skip = req -> startswith(String(req.target), "/static/"))
+    lf = AccessLog(sink; skip = (req, resp) -> startswith(String(req.target), "/static/"))
     handler = lf.middleware(req -> Response(200, "ok"))
 
     startup(lf)
@@ -111,6 +111,48 @@ end
 
     @test length(records) == 1
     @test records[1].path == "/api/data"
+end
+
+# #401: `skip` used to be `req -> Bool`, called BEFORE the handler, so it could not see the status
+# -- the one thing a scanner-probe filter needs. It now runs after, with the response.
+@testset "skip runs after the handler and sees the response" begin
+    records, sink = collecting_sink()
+    seen = Any[]
+    lf = AccessLog(sink; batch = 10, skip = (req, resp) -> begin
+        push!(seen, resp === nothing ? nothing : resp.status)
+        resp !== nothing && resp.status == 404
+    end)
+    handler = lf.middleware(req -> req.target == "/boom" ? error("boom") :
+                                   Response(req.target == "/missing" ? 404 : 200, "x"))
+
+    startup(lf)
+    handler(Request("GET", "/missing"))          # 404 -> skipped
+    handler(Request("GET", "/found"))            # 200 -> logged
+    @test_throws ErrorException handler(Request("GET", "/boom"))   # resp === nothing -> logged
+    shutdown(lf)
+
+    @test seen == [404, 200, nothing]            # (unpatched: skip was never given a response)
+    @test [r.path for r in records] == ["/found", "/boom"]
+    @test records[2].status == 500
+end
+
+@testset "skip can drop the record of a handler that threw" begin
+    records, sink = collecting_sink()
+    lf = AccessLog(sink; skip = (req, resp) -> resp === nothing)
+    handler = lf.middleware(req -> error("boom"))
+    startup(lf)
+    @test_throws ErrorException handler(Request("GET", "/x"))
+    shutdown(lf)
+    @test isempty(records)
+end
+
+@testset "a pre-#401 one-argument skip is refused at construction" begin
+    @test_throws ArgumentError AccessLog(recs -> nothing; skip = req -> true)
+    err = try AccessLog(recs -> nothing; skip = req -> true); nothing catch e; e end
+    @test occursin("(req, resp)", sprint(showerror, err))
+    # A typed two-argument hook is accepted even though it has no `(Request, Any)` method.
+    @test AccessLog(recs -> nothing; skip = (req::Request, resp::Union{Nothing,Response}) -> false) isa
+          LifecycleMiddleware
 end
 
 @testset "handler exception is logged as 500 then re-raised" begin
@@ -130,7 +172,15 @@ end
 @testset "invalid capacity/batch are rejected" begin
     @test_throws ArgumentError AccessLog(recs -> nothing; capacity = 0)
     @test_throws ArgumentError AccessLog(recs -> nothing; batch = 0)
+    @test_throws ArgumentError AccessLog(recs -> nothing; capacity = 4, unmatched_capacity = 0)
+    @test_throws ArgumentError AccessLog(recs -> nothing; capacity = 4, unmatched_capacity = 5)
+    @test_throws ArgumentError AccessLog(recs -> nothing; max_field_bytes = 14)   # marker size
+    @test AccessLog(recs -> nothing; max_field_bytes = 15) isa LifecycleMiddleware
+    @test AccessLog(recs -> nothing; capacity = 1) isa LifecycleMiddleware      # default budget >= 1
 end
+
+# What the router does on a miss (#401): the only thing that makes a record unmatched.
+missed(status = 404) = req -> (Nitro.Core._mark_route_miss!(req); Response(status, "x"))
 
 # A sink that parks on its first delivery (signalling `entered`) until the test
 # releases it — lets us fill the buffer deterministically while the drain is stuck.
@@ -231,7 +281,224 @@ end
     @test records[2].path == "/api/second"
 end
 
+# #401: client-controlled fields are bounded. HTTP.jl's only limit is 64 KiB per line, so a probe
+# flood could buffer ~1.25 GiB of paths and User-Agents before a sink saw any of it.
+@testset "client-controlled fields are cut to max_field_bytes on a character boundary" begin
+    records, sink = collecting_sink()
+    lf = AccessLog(sink; batch = 10, log_query = true, max_field_bytes = 32)
+    handler = lf.middleware(req -> Response(200, "ok"))
+    marker = "…[truncated]"
+
+    startup(lf)
+    # '/' then 2-byte 'é's: the 18-byte budget beside the marker ends mid-character.
+    handler(Request("GET", "/" * "é"^50 * "?" * "q"^100, ["User-Agent" => "u"^5000]))
+    handler(Request("X"^100, "/short", ["User-Agent" => "curl/8"]))
+    shutdown(lf)
+
+    long, short = records
+    for v in (long.path, long.query, long.user_agent, short.method)
+        @test ncodeunits(v) <= 32                # (unpatched: the full 5000-byte UA survives)
+        @test endswith(v, marker)
+        @test isvalid(v)                         # never a split character
+    end
+    @test long.path == "/" * "é"^8 * marker      # the straddling 'é' is dropped whole
+    @test short.path == "/short"                 # short values are untouched
+    @test short.user_agent == "curl/8"
+    @test long.method == "GET"
+end
+
+# #401: when the buffer was full the NEWEST record was dropped, so a probe flood that filled it
+# dropped the authenticated requests arriving during the sweep. Unmatched records now draw on
+# their own smaller budget.
+@testset "a flood of unmatched records cannot evict matched ones" begin
+    s = blocking_sink()
+    lf = AccessLog(s.sink; capacity = 4, unmatched_capacity = 1, batch = 1)
+    probe = missed()
+    handler = lf.middleware(req -> startswith(req.target, "/api") ? Response(200, "x") : probe(req))
+    startup(lf)
+
+    handler(Request("GET", "/api/0"))       # taken by the drain -> parks in the sink
+    wait(s.entered)
+    for i in 1:5
+        handler(Request("GET", "/.env$i"))  # 1 buffered, 4 dropped against the unmatched budget
+    end
+    for i in 1:3
+        handler(Request("GET", "/api/$i"))  # still room: capacity 4 - 1 unmatched = 3
+    end
+
+    notify(s.release)
+    shutdown(lf)
+
+    matched = [r.path for r in s.records if r.matched]
+    unmatched = [r.path for r in s.records if !r.matched]
+    @test matched == ["/api/0", "/api/1", "/api/2", "/api/3"]   # (unpatched: only "/api/0")
+    @test unmatched == ["/.env1"]
+    @test all(r -> r.status == 404, filter(r -> !r.matched, s.records))
+end
+
+# The writer must hand back each unmatched reservation as it takes the record, or the budget leaks
+# and unmatched logging stops for good after `unmatched_capacity` records (review of #401).
+@testset "the unmatched budget is released as records drain" begin
+    records, sink = collecting_sink()
+    lf = AccessLog(sink; capacity = 4, unmatched_capacity = 1, batch = 1)
+    handler = lf.middleware(missed())
+    startup(lf)
+    for i in 1:5
+        handler(Request("GET", "/.env$i"))
+        # Let the writer drain before the next one, so each lands in an empty budget.
+        @test timedwait(() -> length(records) >= i, 10.0; pollint = 0.01) === :ok
+    end
+    shutdown(lf)
+    @test [r.path for r in records] == ["/.env$i" for i in 1:5]   # (leaky release: only "/.env1")
+    @test all(r -> !r.matched, records)
+end
+
 end # @testitem
+
+# #401, end to end: `matched` is the ROUTER's verdict (`route_missed`), so it has to survive the
+# real pipeline -- a handler's own 404 is matched, a router miss is not, a static mount's miss (a
+# catch-all leaf that defers to the router's 404) is not either, and a request a guard or
+# middleware REFUSED on a real route is matched: it never reached a lookup that came up empty.
+@testitem "AccessLog matched marker through the pipeline" tags=[:middleware] setup=[NitroCommon] begin
+using Nitro
+using HTTP
+# Not `using Nitro.Core`: its `urlpatterns` would collide with `Nitro`'s (src/methods.jl).
+using Nitro.Core: startup, shutdown
+
+records = AccessRecord[]
+lk = ReentrantLock()
+lf = AccessLog(recs -> lock(() -> append!(records, recs), lk); batch = 100)
+deny = handle -> req -> HTTP.Response(403, "denied")
+
+root = mktempdir()
+write(joinpath(root, "a.txt"), "a")
+app = App(mod = @__MODULE__)
+urlpatterns(app, "",
+    path("/real", () -> "ok"),
+    path("/gone", () -> HTTP.Response(404, "no such thing")),
+    path("/admin", () -> "secret"; middleware = [deny]),   # a route-level guard refusing
+)
+staticfiles(app, root, "static")
+
+startup(lf)
+for (method, target) in [("GET", "/real"), ("GET", "/gone"), ("GET", "/.env"),
+                         ("GET", "/static/a.txt"), ("GET", "/static/nope"),
+                         ("POST", "/static/a.txt"), ("GET", "/admin")]
+    internalrequest(app, HTTP.Request(method, target); middleware = [lf])
+end
+# A global middleware after AccessLog refusing before the router runs.
+internalrequest(app, HTTP.Request("PUT", "/real"); middleware = [lf, deny])
+shutdown(lf)
+
+got = Dict((r.method, r.path) => (r.status, r.matched) for r in records)
+@test got[("GET", "/real")] == (200, true)
+@test got[("GET", "/gone")] == (404, true)            # the handler's own 404 is a real request
+@test got[("GET", "/.env")] == (404, false)           # a router miss
+@test got[("GET", "/static/a.txt")] == (200, true)
+@test got[("GET", "/static/nope")] == (404, false)    # a mount miss is a miss too
+@test got[("POST", "/static/a.txt")] == (405, false)  # as is the mount's 405
+@test got[("GET", "/admin")] == (403, true)           # a guard's denial is NOT a probe
+@test got[("PUT", "/real")] == (403, true)            # nor is a global refusal before routing
+
+# The documented probe filter keeps everything but the misses -- the denials included.
+kept = AccessRecord[]
+lf2 = AccessLog(recs -> lock(() -> append!(kept, recs), lk); batch = 100,
+                skip = (req, resp) -> route_missed(req))
+startup(lf2)
+for target in ["/real", "/gone", "/.env", "/wp-login.php", "/static/nope", "/admin"]
+    internalrequest(app, HTTP.Request("GET", target); middleware = [lf2])
+end
+shutdown(lf2)
+@test sort([r.path for r in kept]) == ["/admin", "/gone", "/real"]
+end
+
+# The no-route answers outside the router proper. The prefix strip's 404 and OriginForm's 400 sit
+# outside `compose`, so only the console line (and any other framework-level reader) sees them --
+# assert the marker directly. The retired auto-HEAD is a router LEAF that answers a method miss,
+# so the router's own miss path never marks it.
+@testitem "route_missed marks every no-route answer" tags=[:middleware] setup=[NitroCommon] begin
+using HTTP
+using Nitro
+
+strip = Nitro.Core.PrefixStripMiddleware("/api")(req -> HTTP.Response(200, "in"))
+outside = HTTP.Request("GET", "/elsewhere")
+@test strip(outside).status == 404
+@test route_missed(outside)
+inside = HTTP.Request("GET", "/api/x")
+@test strip(inside).status == 200
+@test !route_missed(inside)
+
+origin = Nitro.Core.OriginFormMiddleware()(req -> HTTP.Response(200, "in"))
+traversal = HTTP.Request("GET", "/../etc/passwd")
+@test origin(traversal).status == 400
+@test route_missed(traversal)
+@test !route_missed(let r = HTTP.Request("GET", "/fine"); origin(r); r end)
+
+app = App(mod = @__MODULE__)
+urlpatterns(app, "", path("/swap", () -> "ok"))
+urlpatterns(app, "", path("/swap", (stream::HTTP.Stream) -> nothing; method = "STREAM"))
+head = HTTP.Request("HEAD", "/swap")
+@test internalrequest(app, head).status == 405
+@test route_missed(head)                     # (unpatched: false -- a leaf answered)
+end
+
+# A miss belongs to the request shape that missed. A global fallback that rewrites a 404 to a
+# served target must not leave the request reading as a miss, or the documented probe filter
+# drops a request a route served (delta review of #401).
+@testitem "route_missed follows a re-dispatched request" tags=[:middleware] setup=[NitroCommon] begin
+using HTTP
+using Nitro
+app = App(mod = @__MODULE__)
+urlpatterns(app, "", path("/real", () -> "ok"))
+fallback = handle -> req -> begin
+    resp = handle(req)
+    resp.status == 404 || return resp
+    req.target = "/real"
+    return handle(req)
+end
+r = HTTP.Request("GET", "/old-link")
+@test internalrequest(app, r; middleware = [fallback]).status == 200
+@test !route_missed(r)                       # (bare-`true` marker: still true)
+miss = HTTP.Request("GET", "/nowhere")
+@test internalrequest(app, miss).status == 404
+@test route_missed(miss)
+end
+
+# #401: the console line (`serve(access_log=true)`) had no hook at all; it now takes the same
+# post-response `skip`.
+@testitem "Console access log skip" tags=[:middleware] setup=[NitroCommon] begin
+using Nitro
+using HTTP
+
+lines(mw, req, resp = HTTP.Response(200)) = begin
+    logger = Test.TestLogger()
+    Base.CoreLogging.with_logger(logger) do
+        mw(_req -> resp)(req)
+    end
+    [string(l.message) for l in logger.logs]
+end
+
+quiet = Nitro.Core.AccessLogMiddleware(skip = (req, resp) -> resp.status == 404)
+@test isempty(lines(quiet, HTTP.Request("GET", "/.env"), HTTP.Response(404)))
+@test length(lines(quiet, HTTP.Request("GET", "/ok"))) == 1
+
+# A throwing hook warns and the line is still written.
+msgs = lines(Nitro.Core.AccessLogMiddleware(skip = (req, resp) -> error("hook boom")),
+             HTTP.Request("GET", "/ok"))
+@test any(m -> occursin("access_log_skip hook errored", m), msgs)
+@test any(m -> occursin("\"GET /ok\" 200", m), msgs)
+
+# The old one-argument shape and a non-function are refused before `serve` touches the App.
+@test_throws ArgumentError Nitro.Core.AccessLogMiddleware(skip = req -> true)
+app = App(mod = @__MODULE__)
+# `port`/`async`: should validation ever regress, this binds a free port and returns instead of
+# blocking on 8080.
+@test_throws ArgumentError serve(app; access_log_skip = req -> true, show_banner = false,
+                                 port = get_free_port(), host = HOST, async = true)
+@test_throws ArgumentError serve(app; access_log_skip = "nope", show_banner = false,
+                                 port = get_free_port(), host = HOST, async = true)
+@test !isopen(app.service)
+end
 
 # #159: the retention pruner. `AccessLog(sink; prune, retention, prune_interval)` schedules the
 # app's `prune(cutoff)` through the shared `_janitor`, starting and stopping with the writer.
