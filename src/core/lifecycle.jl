@@ -504,7 +504,8 @@ function _eager_revise_loop(done::Threads.Atomic{Bool}, hooks = revise_hooks())
         e isa InterruptException || rethrow()
         @warn "Nitro: an interrupt (Ctrl-C) reached the eager-Revise watcher instead of the " *
               "server. Eager revision has stopped until the server is started again. Press " *
-              "Ctrl-C again to stop the server."
+              "Ctrl-C again to stop the server. Outside a REPL, that press can end the process " *
+              "without running its shutdown hooks."
     end
     return nothing
 end

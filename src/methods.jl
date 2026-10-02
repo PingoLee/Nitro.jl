@@ -175,6 +175,23 @@ not-serving and `serve` can simply be retried. An interrupt out of the blocking 
 (`async = false`) is the documented way to stop the server, and now tears it down before
 returning rather than leaving the listener up.
 
+**That holds in a REPL; outside one, Julia decides what Ctrl-C does (#426).** In an interactive
+REPL, a press stops an idle blocking `serve` cleanly, `on_shutdown` hooks included, after any
+number of served requests, over closed or kept-alive connections. Under load the press can still
+abort, because Julia hands it to the REPL only when no other task is runnable.
+
+Outside a REPL:
+
+- A script run as `julia app.jl` is ended by the first press. Julia runs `atexit` hooks, but not
+  Nitro's `on_shutdown`.
+- Under `julia -e`, the press can reach no task at all.
+- Code that calls `Base.exit_on_sigint(false)` can see `fatal: error thrown and no exception
+  handler available` once a request has been served. A finished connection task is the last to
+  have parked on thread 1, and Julia hands the press on only to a REPL.
+
+When `on_shutdown` hooks must run, stop the server with `terminate` rather than Ctrl-C: serve with
+`async = true`, keep the main task alive yourself, and call `terminate(app)` from your own code.
+
 IP-based controls (rate limiting, audit logging) key on the socket peer address,
 resolved for both plain-HTTP and direct-TLS listeners. Behind a reverse proxy,
 configure `ExtractIP`/`RateLimiter` with both `trusted_proxies` and the

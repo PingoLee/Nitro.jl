@@ -1454,7 +1454,8 @@ function _cleanup_scheduler_loop(runtime::WorkerRuntime, stop_signal::Channel{No
         e isa InterruptException || rethrow()
         @warn "Nitro.Workers: an interrupt (Ctrl-C) reached the task retention scheduler " *
               "instead of the server. The scheduler has stopped, so finished tasks are not " *
-              "retired until it is started again. Press Ctrl-C again to stop the server."
+              "retired until it is started again. Press Ctrl-C again to stop the server. Outside " *
+              "a REPL, that press can end the process without running its shutdown hooks."
     end
     return nothing
 end

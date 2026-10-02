@@ -98,7 +98,8 @@ function _janitor_loop(work::Function, token::Ref{Bool}, interval::Period,
     catch e
         e isa InterruptException || rethrow()
         @warn "Nitro.$label: an interrupt (Ctrl-C) reached the $what task instead of the server. " *
-              "It has stopped until the server is started again. Press Ctrl-C again to stop the server."
+              "It has stopped until the server is started again. Press Ctrl-C again to stop the server. " *
+              "Outside a REPL, that press can end the process without running its shutdown hooks."
     end
     return nothing
 end
