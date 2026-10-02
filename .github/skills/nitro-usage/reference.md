@@ -186,9 +186,12 @@ Order in the pipeline is top-down: global middleware → framework defaults → 
 
 ```julia
 ExtractIP(; forwarded_header::Symbol = :none,   # :x_forwarded_for | :x_real_ip |
-            trusted_proxies = nothing)          #   :cf_connecting_ip | :true_client_ip
-                                                # trusted_proxies: IPAddr and/or CIDR strings.
-                                                # Both required together, or neither.
+                                                #   :cf_connecting_ip | :true_client_ip |
+                                                #   :forwarded (RFC 7239 for=)
+            forwarded_proto::Symbol = :none,    # :x_forwarded_proto | :forwarded (proto=)
+            trusted_proxies = nothing)          # trusted_proxies: IPAddr and/or CIDR strings.
+                                                # Either header needs trusted_proxies, and
+                                                # trusted_proxies needs at least one header.
 
 RateLimiter(; strategy::Symbol = :fixed_window, # or :sliding_window
               kwargs...)                        # forwarded to the strategy
@@ -282,8 +285,10 @@ AccessLog(sink::Function; capacity::Integer=10_000, batch::Integer=500, …)
 default — every client otherwise collapses onto the proxy's IP and shares one bucket. Declare
 **both** `trusted_proxies=[…]` (IPAddr and/or CIDR strings) and the single `forwarded_header` your
 proxy writes; setting either alone is an `ArgumentError` at construction. Only the named header is
-read, `X-Forwarded-For` is walked right-to-left with trusted hops peeled, and the socket peer stays
-available via `getpeerip(req)`.
+read, `X-Forwarded-For` and `Forwarded` (`:forwarded`, RFC 7239 `for=`) are walked right-to-left
+with trusted hops peeled, and the socket peer stays available via `getpeerip(req)`. For WebSocket
+routes behind TLS termination, `forwarded_proto` names the scheme header: `:x_forwarded_proto` takes
+the leftmost value, and `:forwarded` takes the `proto=` of the element that named the client.
 
 ---
 
