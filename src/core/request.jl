@@ -272,6 +272,37 @@ than through `ExtractIP`, overwrites `getip` without recording a peer here.
 getpeerip(req::HTTP.Request) = Base.get(req.context, :peer_ip, getip(req))
 
 """
+    route_missed(req::HTTP.Request) -> Bool
+
+`true` when Nitro answered the request with "no route here": the router's 404 or 405, a static
+mount's miss, the `404` for a path outside `serve(prefix = …)`, or the `400` for a request-target
+no route could ever match (`//x`, dot segments). Meaningful once the response is known, so read it
+in a post-response hook, such as `AccessLog`'s or `access_log_skip`'s `skip`:
+
+```julia
+AccessLog(sink; skip = (req, resp) -> route_missed(req))   # keep scanner probes out
+```
+
+It is `false` for everything else, **including** a request a guard or middleware refused on a
+real route, and one refused before the router ran. Only a request the router looked up and found
+nothing for is a miss, so an access log filtered on it never drops a denied login (#401). A route
+that returns 404 itself is not a miss either.
+
+The miss belongs to the method and target that missed. A middleware that gets a 404, rewrites
+`req.target` (a trailing-slash or locale fallback) and is then served by a route reads as
+**not** missed.
+"""
+route_missed(req::HTTP.Request)::Bool =
+    Base.get(req.context, Types.ROUTE_MISS_KEY, nothing) == (req.method, req.target)
+
+# Set at each place Nitro answers "no route" (see `Types.ROUTE_MISS_KEY`). It records WHICH request
+# shape missed rather than a bare `true`, so a re-dispatch to a target a route then serves is not
+# left reading as a miss -- without clearing anything on the matched path, which every request
+# takes. Only a miss allocates the tuple.
+_mark_route_miss!(req::HTTP.Request) =
+    (req.context[Types.ROUTE_MISS_KEY] = (req.method, req.target); nothing)
+
+"""
     getcontext(req::HTTP.Request) -> Union{Any, Nothing}
 
 Returns the application context payload for the request — the object passed to

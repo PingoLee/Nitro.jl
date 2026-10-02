@@ -336,7 +336,9 @@ struct RetiredHeadHandler{R<:HTTP.Router} <: Function
     router :: R
 end
 
-(h::RetiredHeadHandler)(req::HTTP.Request) = _method_not_allowed(h.router, req)
+# A method miss like the router's own 405, so `route_missed` must say so (#401) -- the router
+# resolved `HEAD` to this leaf, so it never took the miss path that would have marked it.
+(h::RetiredHeadHandler)(req::HTTP.Request) = (_mark_route_miss!(req); _method_not_allowed(h.router, req))
 
 """
     _route_shape(route) -> String

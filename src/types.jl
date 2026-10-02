@@ -1558,6 +1558,18 @@ end
 const ROUTE_RESOLUTION_KEY = :__nitro_route_resolution
 
 """
+    ROUTE_MISS_KEY
+
+`req.context` key set to the `(method, target)` that missed where Nitro answers "no route here":
+the router's 404/405, a static mount's miss, the `serve(prefix = …)` strip's 404, and
+OriginForm's 400 (#401). Internal; read it through
+`route_missed(req)`. It is a positive marker on purpose: `:route` is only written when the
+terminal handler runs, so its absence also covers a request a guard or middleware refused on a
+real route, and an access log must not mistake those for probes.
+"""
+const ROUTE_MISS_KEY = :__nitro_route_miss
+
+"""
     REQUEST_FORWARDED_PROTO_KEY
 
 `req.context` key carrying the request scheme (`"http"` or `"https"`) a **trusted** proxy reported

@@ -79,7 +79,11 @@ _is_mount_method(method::AbstractString) = method == GET || method == HEAD
 # to the mount, so `GET /static/foo` is a 404, not a 405 advertising a `PUT` that would 404 too.
 #
 # `notfound` is the router's `_404` captured at mount time; see `staticfiles`.
+#
+# The router matched the catch-all, so it never took its own miss path; mark the miss here, or
+# every probe under a root `staticfiles` mount reads as answered to `route_missed` (#401).
 function _mount_miss(router::HTTP.Router, notfound::F, req::HTTP.Request) where {F}
+    _mark_route_miss!(req)
     allowed = _allowed_methods(router, req.target)
     return isempty(allowed) ? notfound(req) : _method_not_allowed(router, req, allowed)
 end
@@ -87,9 +91,13 @@ end
 # A path naming a mounted file, under a method the mount does not serve. `Allow` is the mount's
 # GET and HEAD plus every app route at that path: a `POST` route at `/static/a.txt` serves `POST`
 # there while the mount serves `GET`, so neither list alone is what the path answers.
-_mount_method_not_allowed(router::HTTP.Router, req::HTTP.Request) =
-    _method_not_allowed(router, req,
-                        sort!(union(String[GET, HEAD], _allowed_methods(router, req.target))))
+#
+# A miss for `route_missed`, like the router's own 405 (#401); see `_mount_miss`.
+function _mount_method_not_allowed(router::HTTP.Router, req::HTTP.Request)
+    _mark_route_miss!(req)
+    return _method_not_allowed(router, req,
+                               sort!(union(String[GET, HEAD], _allowed_methods(router, req.target))))
+end
 
 # Fill the mount table, warning when two enumerated files claim one key.
 #

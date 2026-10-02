@@ -180,6 +180,7 @@ function serve(ctx::App;
     show_banner=true,
     access_log=true,
     access_log_query=false,
+    access_log_skip=nothing,
     external_url=nothing,
     prefix=nothing,
     context=missing,
@@ -209,6 +210,13 @@ function serve(ctx::App;
             "bound until the process exits. Terminate THIS app first, or give the second " *
             "listener its own: `app = App(mod = @__MODULE__); serve(app; …)`."))
     end
+
+    # Before any mutation (#401): the hook runs on every logged request, so a wrong shape -- a
+    # non-function, or the old pre-handler `req -> Bool` -- is refused at the call that has it.
+    access_log_skip === nothing || access_log_skip isa Function ||
+        throw(ArgumentError("`access_log_skip` must be a `(req, resp) -> Bool` function or " *
+                            "`nothing`, got $(repr(access_log_skip))"))
+    _check_access_log_skip(access_log_skip, "serve(access_log_skip = …)")
 
     if revise ∉ (:none, :lazy, :eager)
         throw(ArgumentError("Invalid `revise` value $(repr(revise)). Expected one of :none, :lazy, or :eager."))
@@ -367,7 +375,7 @@ function serve(ctx::App;
     # the resulting `Set` is the same either way — but the ordering is the correct default.)
     register_serve_lifecycle!(ctx, middleware)
 
-    configured_middelware = setupmiddleware(ctx; middleware, serialize, catch_errors, show_errors, access_log, access_log_query)
+    configured_middelware = setupmiddleware(ctx; middleware, serialize, catch_errors, show_errors, access_log, access_log_query, access_log_skip)
     handle_stream = handler === stream_handler ?
         stream_handler(configured_middelware; max_body_bytes = body_limit,
                        max_concurrent_requests = request_limit,

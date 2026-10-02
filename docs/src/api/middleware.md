@@ -64,6 +64,7 @@ WebSocketOrigins
 ```@docs
 AccessLog
 AccessRecord
+route_missed
 ```
 
 ## Lifecycle Middleware

@@ -184,6 +184,7 @@ end
 # `gethandler` found no leaf: `nothing` is a miss, `missing` a method mismatch. See
 # `_route_unresolved` for why a `nothing` can still be a 405.
 function _route_miss(r::HTTP.Router, req::HTTP.Request, handler::Union{Nothing,Missing})
+    _mark_route_miss!(req)   # what `route_missed` reads (#401)
     if handler === nothing
         allowed = _allowed_methods(r, req.target)
         return isempty(allowed) ? r._404(req) : _method_not_allowed(r, req, allowed)
@@ -280,7 +281,7 @@ function _collect_leaf_methods!(acc::Vector{String}, node::HTTP.Handlers.Node,
     return nothing
 end
 
-function setupmiddleware(ctx::App; middleware::Vector=[], serialize::Bool=true, catch_errors::Bool=true, show_errors::Bool=true, access_log=false, access_log_query::Bool=false)::Function
+function setupmiddleware(ctx::App; middleware::Vector=[], serialize::Bool=true, catch_errors::Bool=true, show_errors::Bool=true, access_log=false, access_log_query::Bool=false, access_log_skip::Union{Nothing,Function}=nothing)::Function
     # `normalize_middleware`, NOT `process_middleware`: this runs once per `serve` but ONCE
     # PER CALL from `internalrequest`, so it must have no registration side effect. `serve`
     # registers explicitly, just before it calls this. (#68)
@@ -298,7 +299,7 @@ function setupmiddleware(ctx::App; middleware::Vector=[], serialize::Bool=true, 
     # paid for per request.
     error_boundary = serialize && catch_errors ? [ErrorBoundary(catch_errors; show_errors)] : []
     # Accept `true` to enable; `nothing`/`false` (or the old logfmt value) disable it.
-    access_log_middleware = access_log === true ? [AccessLogMiddleware(; log_query=access_log_query)] : []
+    access_log_middleware = access_log === true ? [AccessLogMiddleware(; log_query=access_log_query, skip=access_log_skip)] : []
 
     # `compose` is installed UNCONDITIONALLY (#71). The old gate here — install it only if
     # `custommiddleware` was already non-empty — was evaluated once, and `serve` calls this

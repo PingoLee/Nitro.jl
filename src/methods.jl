@@ -60,6 +60,10 @@ is explicit introspection, not accidental disclosure.)
   `code`/`state` carried in URLs never reach the logs.
 - `access_log_query=false`: set `true` to log the full target including the query
   string. Only enable when you are certain no secrets travel in query strings.
+- `access_log_skip=nothing`: a `(req, resp) -> Bool` called once the response is known; return
+  `true` to write no line for that request. To quiet scanner probes no route answered:
+  `access_log_skip = (req, resp) -> route_missed(req)` (see [`route_missed`](@ref)). The same
+  hook shape as `AccessLog(sink; skip = …)`.
 - `prefix=nothing`: strip a global URL prefix (e.g. `"/api"`) before routing. It matches whole
   path segments: `/api`, `/api/users` and `/api?x=1` are served (as `/`, `/users` and `/?x=1`),
   while `/apiadmin/users` is a `404`, not `/admin/users`. Everything outside the prefix is a
