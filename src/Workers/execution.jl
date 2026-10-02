@@ -267,7 +267,9 @@ bound and fatal once worker bodies migrate between threads
 ([#127](https://github.com/PingoLee/Nitro.jl/issues/127)).
 
 With a `handoff`, an expired deadline hands the run's capacity reservation to the callback's task,
-which releases it when the callback finally returns (#324); see `_RunHandoff`.
+which releases it when the callback finally returns (#324); see `_RunHandoff`. An exception thrown
+into the wait itself (an interrupt under `julia -t 1`) hands it over the same way before it is
+rethrown, without setting the cancellation token (#371).
 """
 function timeout_call(callback::Function, task_info::TaskInfo; timeout::Int=3600,
                       handoff::Union{Nothing, _RunHandoff}=nothing)
@@ -277,10 +279,15 @@ function timeout_call(callback::Function, task_info::TaskInfo; timeout::Int=3600
 
     result_channel = Channel{Any}(1)
     error_channel = Channel{Any}(1)
+    # The ONE thing the waiter parks on (#371), notified once by whichever outcome comes first:
+    # the callback's task as it exits, or the deadline's `Timer`. This used to be `timedwait`,
+    # which POLLS at its 0.1s default -- 36,000 wake-ups for one run at the default hour-long
+    # timeout, per run. Not autoreset, so a notify that lands before the `wait` is kept.
+    done = Base.Event()
 
     # `Threads.@spawn`, not `@async` (#30). Under `@async` this child was pinned to the
     # monitoring task's own thread, so a CPU-bound callback -- precisely what a deadline exists
-    # to bound -- starved the `timedwait` below and the timeout mostly never fired at all. It
+    # to bound -- starved the wait below and the timeout mostly never fired at all. It
     # fires now. The flip side is that an abandoned callback occupies a `:default`-pool slot,
     # the same pool serving HTTP, until it returns; see the `@warn` on the timeout path.
     task = Threads.@spawn begin
@@ -294,13 +301,32 @@ function timeout_call(callback::Function, task_info::TaskInfo; timeout::Int=3600
             if handoff !== nothing && !(@atomicreplace handoff.state :running => :done).success
                 handoff.release()
             end
+            notify(done)
         end
     end
 
-    wait_result = timedwait(() -> isready(result_channel) || isready(error_channel), timeout)
+    timer = Timer(_ -> notify(done), timeout)
+    try
+        wait(done)
+    catch
+        # Something was thrown into the WAIT itself -- an `InterruptException` under `julia -t 1`,
+        # where this task can be the last to park on thread 1. The run is then recorded FAILED
+        # (#367) and its `finally` releases the reservation, while the callback keeps running:
+        # an undercount of `max_concurrent_runs`. So give up exactly as an expired deadline does,
+        # handing the release to the callback's task. If the callback already won, it was done
+        # and the run's own release is the right one.
+        if handoff !== nothing && (@atomicreplace handoff.state :running => :abandoned).success
+            handoff.on_abandon()
+        end
+        rethrow()
+    finally
+        close(timer)
+    end
+
     # Timed out, AND the callback had not finished in the meantime. If it finished in the instant
     # after the deadline, it won the handoff, and its answer is already in a channel below.
-    timed_out = wait_result == :timed_out &&
+    expired = !(isready(result_channel) || isready(error_channel))
+    timed_out = expired &&
                 (handoff === nothing || (@atomicreplace handoff.state :running => :abandoned).success)
     if timed_out
         handoff === nothing || handoff.on_abandon()

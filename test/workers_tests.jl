@@ -657,7 +657,7 @@ end
         #
         # `task === current_task()` alone does NOT catch it: with a deadline (the default)
         # `timeout_call` runs the callback on a child task while the registered handle is the
-        # parent parked in `timedwait`. The task-local `CURRENT_RUN_KEY` marker closes that.
+        # parent parked in its wait. The task-local `CURRENT_RUN_KEY` marker closes that.
         store = InMemoryWorkerStore()
         rt = WorkerRuntime(store)
         elapsed = Threads.Atomic{Float64}(-1.0)
@@ -4953,6 +4953,56 @@ end
     finally
         put!(gate, nothing)
         uninstall!(app; drain_timeout = 5)
+    end
+end
+
+@testset "#371: timeout_call notices completion at once, not at the next poll" begin
+    # The old wait was `timedwait`, which checks its predicate once up front -- before the
+    # spawned child can have finished -- and then only every 0.1s. So each call below cost at
+    # least 0.1s and the loop at least 2s. One `wait` on an `Event` wakes when the child notifies.
+    info = TaskInfo("u::371-latency")
+    quick = () -> (sleep(0.001); :ok)
+    @test Nitro.Workers.timeout_call(quick, info; timeout = 30) === :ok   # compile outside the clock
+    elapsed = @elapsed for _ in 1:20
+        Nitro.Workers.timeout_call(quick, info; timeout = 30)
+    end
+    @test elapsed < 1.5               # Windows can round each 1ms sleep up to a ~15.6ms tick
+end
+
+@testset "#371: an exception thrown into the wait hands the reservation to the callback" begin
+    # Under `julia -t 1` the waiter can be the task a Ctrl-C lands in. The run is then recorded
+    # FAILED (#367) and releases its reservation unless it was handed off -- and the callback is
+    # still running. Unpatched, the handoff stayed `:running`, the callback's compare-and-set won
+    # on its way out, and nothing released for it: `released` stays 0 below.
+    info = TaskInfo("u::371-interrupt")
+    released = Threads.Atomic{Int}(0)
+    abandoned = Threads.Atomic{Int}(0)
+    handoff = Nitro.Workers._RunHandoff(() -> Threads.atomic_add!(released, 1),
+                                        () -> Threads.atomic_add!(abandoned, 1))
+    entered = Threads.Atomic{Bool}(false)
+    gate = Channel{Nothing}(1)
+    callback = () -> (entered[] = true; take!(gate); :late)
+    # `@async`, so the waiter is sticky to THIS thread and is parked whenever this task runs.
+    # Throwing into a parked task is safe; what #127 forbids is throwing into a RUNNING one on
+    # another thread, which this is not.
+    waiter = @async Nitro.Workers.timeout_call(callback, info; timeout = 30, handoff)
+    try
+        @test wait_for(() -> entered[] && waiter.queue !== nothing) == :ok
+        schedule(waiter, InterruptException(); error = true)
+        # `wait` right away, with no yield in between: a task that dies of an interrupt with
+        # nobody waiting on it has Base forward that interrupt to the REPL backend.
+        @test_throws TaskFailedException wait(waiter)
+        @test istaskfailed(waiter)
+        @test waiter.result isa InterruptException
+        @test Nitro.Workers._handed_off(handoff)
+        @test abandoned[] == 1
+        @test released[] == 0             # the callback still holds the slot
+
+        put!(gate, nothing)
+        @test wait_for(() -> released[] == 1) == :ok
+        @test abandoned[] == 1
+    finally
+        isready(gate) || put!(gate, nothing)
     end
 end
 
