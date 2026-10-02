@@ -431,27 +431,65 @@ function serve(ctx::App;
     end
 end
 
+# The `revise=:eager` watcher (#372). It used to be a bare `@async` loop, and each part of the
+# spawn below answers one way that failed:
+#
+#   * `Threads.@spawn :default`, not `@async`. With `exit_on_sigint(false)` -- every REPL -- Julia
+#     throws SIGINT into whichever task parked LAST on thread 1, and an `@async` task started from
+#     `serve` is pinned there. This one re-parks after every revision, so the first Ctrl-C after a
+#     file save killed the watcher instead of stopping `serve`; the second landed in the dead task
+#     and aborted the process ("fatal: error thrown and no exception handler available"). Under
+#     Julia 1.12's default layout thread 1 is the interactive thread, which the `:default` pool
+#     never runs on, so the watcher cannot take a press at all. Running `revise()` off thread 1 is
+#     not new: `revise=:lazy` already calls it from `Threads.@spawn`ed request tasks, and Revise
+#     serializes it behind its own `ReentrantLock`. Nothing injects into this task, so it may
+#     migrate freely.
+#   * `errormonitor`, because nothing waits on this task -- `close` only sets the flag. A throw
+#     used to be stored in the `Task` and never seen, and eager revision stopped without a word.
 function start_revise_service()
     revise_task_done = Ref(false)
-    revise_task = @async begin
-        hooks = revise_hooks()
-        if hooks === nothing
-            return nothing
-        end
-        while true
-            if revise_task_done[]
-                break
-            end
-            Base.invokelatest(hooks.wait_for_revision_event)
-            if revise_task_done[]
-                break
-            end
-            @info "🗘  Starting eager revision"
-            Base.invokelatest(hooks.revise)
-            @info "👍 Eager revision finished"
-        end
-    end
+    revise_task = errormonitor(Threads.@spawn :default _eager_revise_loop(revise_task_done))
     EagerReviseService(revise_task, revise_task_done)
+end
+
+# The loop, named for the reason `_janitor_loop` is (src/middleware/janitor.jl): the placement of
+# its `try`s is the whole point, and a named function lets a test drive it over hooks that throw.
+#
+# ── An interrupt that lands here anyway ──
+#
+# Only reachable with no interactive thread (`julia -t 1`), where every task shares thread 1. The
+# answer is the one the Workers retention scheduler records next to `_cleanup_scheduler_loop`
+# (src/Workers/api.jl), and the reasoning there is canonical: STOP, say so, and return normally.
+# Rethrowing kills the task while `serve` keeps running; swallowing and looping re-parks it as the
+# last task on thread 1, so it eats every later press too.
+function _eager_revise_loop(done::Ref{Bool})
+    hooks = revise_hooks()
+    hooks === nothing && return nothing
+    try
+        while !done[]
+            Base.invokelatest(hooks.wait_for_revision_event)
+            done[] && break
+            # INSIDE the `while`, as in `_janitor_loop`: a revision that throws costs that revision,
+            # never the watcher. Revise reports a syntax error in a saved file itself and returns,
+            # so this is the backstop for anything else.
+            try
+                @info "🗘  Starting eager revision"
+                Base.invokelatest(hooks.revise)
+                @info "👍 Eager revision finished"
+            catch e
+                # Rethrow guard, per the idiom in src/utilities/misc.jl: it routes an interrupt
+                # that lands mid-revision to the handler below rather than looping on.
+                e isa InterruptException && rethrow()
+                @error "Nitro: eager revision failed" exception=(e, catch_backtrace())
+            end
+        end
+    catch e
+        e isa InterruptException || rethrow()
+        @warn "Nitro: an interrupt (Ctrl-C) reached the eager-Revise watcher instead of the " *
+              "server. Eager revision has stopped until the server is started again. Press " *
+              "Ctrl-C again to stop the server."
+    end
+    return nothing
 end
 
 # Broadcast `hook` (`startup` or `shutdown`) over `entries`, deferring any interrupt (#185).
