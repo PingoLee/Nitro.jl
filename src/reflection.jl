@@ -54,43 +54,47 @@ end
 function walkargs(predicate::Function, expr)
     if isdefined(expr, :args)
         for arg in expr.args
-            if predicate(arg)
+            if predicate(arg) || walkargs(predicate, arg)
                 return true
             end
-            walkargs(predicate, arg)
         end
     end
     return false
 end
 
-# The name a lowered-code node refers to, WITHOUT module qualification. Used by the
-# self-reference check below; returning "" means "not a named reference".
-_node_name(x::GlobalRef)     = String(x.name)
-_node_name(x::Symbol)        = String(x)
-_node_name(x::QuoteNode)     = x.value isa Symbol ? String(x.value) : ""
-_node_name(x::Function)      = String(nameof(x))
-_node_name(@nospecialize(_)) = ""
+"""
+    NoDefault
+
+Placeholder `reconstruct` leaves in a signature slot that has no default it can evaluate at
+registration time — a default that refers to another parameter (`b = a + 1`). It holds the slot
+so later defaults keep their positions; `extract_defaults` treats it like a bare argument.
+"""
+struct NoDefault end
 
 """
-    _is_self_reference(name, func_name) -> Bool
+    UnevaluableDefault(message, builds_extractor)
 
-Whether `name` refers to the function currently being reconstructed. Lowered
-self-references are the exact name (`myhandler`, `#36`) or a generated derivative —
-the base name extended through a `#` in a gensym pattern (`#36#37`, `#myhandler#12`,
-`##36#40`, `myhandler##kw`).
-
-Matching must be on these exact token shapes, never a substring test over the
-stringified node: stringification includes module qualification, so an unrelated
-module or closure whose printed name merely *contains* the function's name — e.g.
-module `##Extractors#360` against anonymous handler `#36` — would be mistaken for a
-self-reference, silently discarding a parameter's default value and misclassifying
-the parameter (a `Header(...)` extractor default degrades to a required query param).
+Placeholder for a default expression that threw when evaluated at registration time, or that
+refers to another parameter. `builds_extractor` is whether the expression constructs an
+`Extractor`: registration refuses such a parameter (#423), because without its default it would
+silently bind as a required query parameter named after the argument — a route that answers 400
+to every request, or one whose validator never runs.
 """
-function _is_self_reference(name::AbstractString, func_name::AbstractString)::Bool
-    isempty(name) && return false
-    return name == func_name ||
-           startswith(name, func_name * "#") ||
-           startswith(name, "#" * func_name * "#")
+struct UnevaluableDefault
+    message::String
+    builds_extractor::Bool
+end
+
+# Whether a rebuilt default expression is a call whose callee is an extractor type — `Query{T}(…)`
+# lowers to `(Core.apply_type(Query, T))(…)`, `Json(T, …)` to `(Json)(T, …)`.
+function builds_extractor(expr)::Bool
+    expr isa Expr && expr.head === :call || return false
+    callee = try
+        eval(expr.args[1])
+    catch
+        return false
+    end
+    return callee isa Type && callee <: Extractor
 end
 
 # Substitutes SSA values and assigned slots back into a lowered expression, recursively.
@@ -120,7 +124,36 @@ end
 
 (r::_Rebuilder)(@nospecialize(value)) = value
 
-function reconstruct(info::Core.CodeInfo, func_name::Symbol)
+# Replaces `#self#` (`SlotNumber(1)`) in a default expression with the function instance, so a
+# default that reaches a closure's captured variable -- `Core.getfield(#self#, :maxlim)` in a
+# handler built by a factory -- can be evaluated. Returns a copy; `self === nothing` is a no-op.
+_substitute_self(@nospecialize(x), ::Nothing) = x
+function _substitute_self(@nospecialize(x), self)
+    x isa Core.SlotNumber && x.id == 1 && return QuoteNode(self)
+    x isa Expr || return x
+    return Expr(x.head, (_substitute_self(arg, self) for arg in x.args)...)
+end
+
+"""
+    reconstruct(info::Core.CodeInfo; self = nothing) -> Vector{Any}
+
+The arguments of the lowered call `info` forwards to, with every default value evaluated — one
+entry per argument, in order. A slot that has no evaluable default stays a `Core.SlotNumber`,
+becomes a `NoDefault`, or an `UnevaluableDefault`; none is ever dropped, because
+`extract_defaults` maps the entries to parameter names **by position**.
+
+The callee is the function's self-reference and is left out — unless it is `#self#` itself
+(`SlotNumber(1)`), which `extract_defaults` uses as the divider between keyword and positional
+values. The self-reference is identified by *position*, never by name (#423): lowered names are
+gensyms whose shape changes between Julia versions — 1.12 names a closure written inside `f`'s
+default arguments `#f##0#f##1`, which a name-prefix test mistook for `f` itself, so the default
+was discarded.
+
+`self` is the function instance, when there is one: inside a default expression `#self#` is
+replaced by it, so a default that uses a closure's captured variable evaluates. The callee and
+the divider are left alone.
+"""
+function reconstruct(info::Core.CodeInfo; self = nothing)
 
     # Track which index the function signature can be found on
     sig_index = nothing
@@ -143,7 +176,7 @@ function reconstruct(info::Core.CodeInfo, func_name::Symbol)
             if expr.head == :(=)
                 (lhs, rhs) = expr.args
                 try
-                    assignments[lhs] = eval(rebuild!(rhs))
+                    assignments[lhs] = eval(_substitute_self(rebuild!(rhs), self))
                 catch
                 end
                 
@@ -161,28 +194,33 @@ function reconstruct(info::Core.CodeInfo, func_name::Symbol)
     # Recursively build an expression of the actual type of each argument in the function signature
     evaled_sig = rebuild!(statements[sig_index])
 
-    default_values = []
+    (callee, args...) = evaled_sig.args
+    default_values = Any[]
+    callee isa Core.SlotNumber && callee.id == 1 && push!(default_values, callee)
 
-    for arg in evaled_sig.args
-
-        # Skip self-references (the function's own name or its generated derivatives)
-        # by comparing unqualified node names on exact token shapes — see
-        # `_is_self_reference` for why a stringified substring test is wrong here.
-        fname = String(func_name)
-        contains_func_name = walkargs(x -> _is_self_reference(_node_name(x), fname), arg)
-
-        if contains_func_name || arg == NO_VALUES || arg isa GlobalRef && _is_self_reference(String(arg.name), fname)
-            continue
-        end
-
+    for arg in args
         if arg isa Expr
-            try
-                rebuilt = rebuild!(arg)
-                # Skip if SlotNumbers remain after rebuilding
-                walkargs(x -> isa(x, Core.SlotNumber), rebuilt) && continue
-                push!(default_values, eval(rebuilt))
+            rebuilt = try
+                _substitute_self(rebuild!(arg), self)
             catch
+                push!(default_values, NoDefault())
                 continue
+            end
+            if walkargs(x -> isa(x, Core.SlotNumber), rebuilt)
+                # Refers to another parameter, so there is nothing to evaluate it against yet.
+                push!(default_values, builds_extractor(rebuilt) ?
+                    UnevaluableDefault("it refers to another parameter, or to a local value that " *
+                                       "could not be computed, and a default is evaluated once, " *
+                                       "when the route is registered", true) :
+                    NoDefault())
+                continue
+            end
+            try
+                push!(default_values, eval(rebuilt))
+            catch e
+                # The first line only: a `MethodError` goes on to list every candidate method.
+                message = first(split(sprint(showerror, e), '\n'))
+                push!(default_values, UnevaluableDefault(message, builds_extractor(rebuilt)))
             end
         else
             push!(default_values, arg)
@@ -260,17 +298,35 @@ function has_sig_expr(c::Core.CodeInfo) :: Bool
 end
 
 """
-Given a list of CodeInfo objects, extract any default values assigned to parameters & keyword arguments
+    extract_defaults(info, param_names, kwarg_names; self = nothing) -> (param_defaults, kwarg_defaults, unevaluable)
+
+Given a list of CodeInfo objects, extract any default values assigned to parameters & keyword
+arguments. `unevaluable` maps each argument whose default exists but could not be evaluated at
+registration time to its `UnevaluableDefault`; such an argument has no entry in the
+defaults.
 """
-function extract_defaults(info::Vector{Core.CodeInfo}, func_name::Symbol, param_names::Vector{Symbol}, kwarg_names::Vector{Symbol})
+function extract_defaults(info::Vector{Core.CodeInfo}, param_names::Vector{Symbol}, kwarg_names::Vector{Symbol};
+                          self = nothing)
 
     # These store the mapping between parameter names and their default values
     param_defaults = Dict()
     kwarg_defaults = Dict()
+    unevaluable = Dict{Symbol, UnevaluableDefault}()
 
     # skip parsing if no parameters or keyword arguments are found
     if isempty(param_names) && isempty(kwarg_names)
-        return param_defaults, kwarg_defaults 
+        return param_defaults, kwarg_defaults, unevaluable
+    end
+
+    # Records one value against its argument name, by position.
+    function record!(defaults, names, values)
+        for (index, value) in enumerate(values)
+            if value isa UnevaluableDefault
+                unevaluable[names[index]] = value
+            elseif !(value isa Core.SlotNumber || value isa NoDefault)
+                defaults[names[index]] = getargvalue(value)
+            end
+        end
     end
 
     for c in info
@@ -281,7 +337,7 @@ function extract_defaults(info::Vector{Core.CodeInfo}, func_name::Symbol, param_
         end
 
         # rebuild the function signature with the default values included
-        sig_args = reconstruct(c, func_name)
+        sig_args = reconstruct(c; self)
 
         param_values = []
         kwarg_values = []
@@ -299,24 +355,14 @@ function extract_defaults(info::Vector{Core.CodeInfo}, func_name::Symbol, param_
             end
         end
 
-        # map parameters if defaults values are available
-        for (index, p_val) in enumerate(param_values)
-            if !isa(p_val, Core.SlotNumber)
-                p_name = param_names[index]
-                param_defaults[p_name] = getargvalue(p_val)
-            end
-        end
-
-        # map keyword args if defaults values are available
-        for (index, k_val) in enumerate(kwarg_values)
-            if !isa(k_val, Core.SlotNumber)
-                k_name = kwarg_names[index]
-                kwarg_defaults[k_name] = getargvalue(k_val)
-            end
-        end
+        record!(param_defaults, param_names, param_values)
+        record!(kwarg_defaults, kwarg_names, kwarg_values)
     end 
 
-    return param_defaults, kwarg_defaults 
+    # Another method of the same function may have evaluated the default after all.
+    filter!(((name, _),) -> !haskey(param_defaults, name) && !haskey(kwarg_defaults, name), unevaluable)
+
+    return param_defaults, kwarg_defaults, unevaluable
 end
 
 
@@ -360,7 +406,7 @@ Used to extract the function signature from regular Julia functions.
 function splitdef(f::Function; start=1)
     method_defs = methods(f)
     func_name = first(method_defs).name
-    return splitdef(Base.code_lowered(f), methods(f), func_name, start=start)
+    return splitdef(Base.code_lowered(f), methods(f), func_name, start=start, self=f)
 end
 
 
@@ -387,13 +433,13 @@ function splitdef(t::DataType; start=1)
 end
 
 
-function splitdef(info::Vector{Core.CodeInfo}, method_defs::Base.MethodList, func_name::Symbol; start=1)
+function splitdef(info::Vector{Core.CodeInfo}, method_defs::Base.MethodList, func_name::Symbol; start=1, self=nothing)
 
     # Extract parameter names and types
     param_names, param_types, kwarg_names = getsignames(method_defs)
 
     # Extract default values
-    param_defaults, kwarg_defaults = extract_defaults(info, func_name, param_names, kwarg_names)
+    param_defaults, kwarg_defaults, unevaluable = extract_defaults(info, param_names, kwarg_names; self)
 
     # Create a list of Param objects from parameters
     params = Vector{Param}()
@@ -426,7 +472,8 @@ function splitdef(info::Vector{Core.CodeInfo}, method_defs::Base.MethodList, fun
         args = params[start:end],
         kwargs = keyword_args[start:end],
         sig = sig_params,
-        sig_map = Dict{Symbol,Param}(param.name => param for param in sig_params)
+        sig_map = Dict{Symbol,Param}(param.name => param for param in sig_params),
+        unevaluable = unevaluable
     )
 end
 

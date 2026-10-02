@@ -33,6 +33,9 @@ macro extractor(class_name)
             validate::Union{Function, Nothing}
             type::Type{T}
         
+            # Neither -- a default that only declares the extractor (#423)
+            $(Symbol(class_name)){T}() where T = new{T}(nothing, nothing, T)
+
             # Only pass a validator
             $(Symbol(class_name)){T}(f::Function) where T = new{T}(nothing, f, T)
 
@@ -74,8 +77,10 @@ end
 
 # Every extractor is a thin wrapper: declare a handler parameter of the wrapped type, and the
 # bound value arrives in `.payload`. They share one construction surface (from `@extractor`):
-# `X(T)`, `X(T, validator)` and `X{T}(validator)` build the parameter's *default*, which is how
-# an extractor-local validator is attached — `payload = Json(Search, s -> !isempty(s.q))`.
+# `X(T)`, `X{T}()`, `X(T, validator)` and `X{T}(validator)` build the parameter's *default*, which
+# is how an extractor-local validator is attached — `payload = Json(Search, s -> !isempty(s.q))`.
+# A default is evaluated once, when the route is registered; one that cannot be (it throws, or
+# refers to another parameter) is refused there rather than silently dropped (#423).
 # A value that fails to bind, or fails `validate`, is a `ValidationError` → 400.
 
 """
