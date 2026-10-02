@@ -74,6 +74,14 @@ serve(revise=:eager)
 
 Use this if you prefer code changes to be revised as soon as they are detected.
 
+The watcher runs on Julia's `:default` thread pool. With the thread layout plain `julia` and
+`julia -t auto` give you on Julia 1.12, that keeps it off the interactive thread, where Ctrl-C is
+delivered, so a Ctrl-C never lands in the watcher. Under `julia -t 1` every task shares one
+thread, and the first Ctrl-C after a revision can land in the watcher. It then stops with a warning
+saying so, and eager revision stays off until the server restarts. Ctrl-C handling for a blocking
+`serve` has a broader open problem, independent of Revise, tracked in
+[#426](https://github.com/PingoLee/Nitro.jl/issues/426).
+
 ## Production Setup
 
 Production should not load `Revise`.

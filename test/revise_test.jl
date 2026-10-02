@@ -33,7 +33,15 @@ else
         using Nitro
 
         Nitro.has_revise_hooks() || error(\"Nitro did not register Revise hooks\")
-        Base.get_extension(Nitro, :NitroReviseExt) !== nothing || error(\"NitroReviseExt was not loaded\")
+        ext = Base.get_extension(Nitro, :NitroReviseExt)
+        ext !== nothing || error(\"NitroReviseExt was not loaded\")
+        # The hook must leave the event CLEARED (#372). It only bites on a Revise whose
+        # `revision_event` does not autoreset (<= 3.14.2): there, without the `reset`, the eager
+        # watcher re-woke at once forever. On later versions `wait` already cleared it, so this
+        # passes either way -- it is a regression check for the versions `[compat]` still admits.
+        notify(Revise.revision_event)
+        ext._wait_for_revision_event()
+        (@atomic Revise.revision_event.set) && error(\"the revision hook left Revise.revision_event set\")
         println(\"ok\")
     """
     integration_cmd = `$(Base.julia_cmd()) --project=$(pkgdir(Nitro)) -e $(integration_script)`
@@ -121,5 +129,227 @@ finally
 end
 
 println()
+
+end
+# The eager watcher's loop discipline (#372), in-process: the hooks are fakes, so nothing here needs
+# Revise, a file watcher or a socket. What a REAL Ctrl-C does is the next item's job.
+@testitem "Revise -- eager watcher stops on an interrupt and survives a failed revision (#372)" tags=[:extension] setup=[NitroCommon] begin
+
+using Test
+using Nitro
+using Suppressor
+
+original_revise_hooks = Nitro.revise_hooks()
+restore_hooks() = original_revise_hooks === nothing ? Nitro.clear_revise_hooks!() :
+    Nitro.register_revise_hooks!(;
+        revise=original_revise_hooks.revise,
+        has_pending_revisions=original_revise_hooks.has_pending_revisions,
+        wait_for_revision_event=original_revise_hooks.wait_for_revision_event,
+    )
+
+try
+    @testset "an interrupt ends the loop normally, with a warning -- not a failure" begin
+        Nitro.register_revise_hooks!(;
+            revise=() -> nothing,
+            has_pending_revisions=() -> false,
+            wait_for_revision_event=() -> throw(InterruptException()),
+        )
+        # Returning at all is the point: rethrowing is what killed the watcher, and swallowing
+        # would loop straight back into the throwing `wait` and never return.
+        @test (@test_logs (:warn, r"reached the eager-Revise watcher") Nitro.Core._eager_revise_loop(Ref(false))) === nothing
+    end
+
+    @testset "an interrupt DURING a revision reaches the same handler" begin
+        Nitro.register_revise_hooks!(;
+            revise=() -> throw(InterruptException()),
+            has_pending_revisions=() -> false,
+            wait_for_revision_event=() -> nothing,
+        )
+        @test (@test_logs (:info,) (:warn, r"reached the eager-Revise watcher") Nitro.Core._eager_revise_loop(Ref(false))) === nothing
+    end
+
+    @testset "a revision that throws costs that revision, never the watcher" begin
+        done = Ref(false)
+        events = Ref(0)
+        Nitro.register_revise_hooks!(;
+            revise=() -> events[] == 1 ? error("boom") : nothing,
+            has_pending_revisions=() -> false,
+            # Event 1 fails, event 2 must still be served, and event 3 asks the loop to stop.
+            wait_for_revision_event=() -> (events[] += 1; events[] == 3 && (done[] = true); nothing),
+        )
+        @test_logs (:error, "Nitro: eager revision failed") (:info, r"Eager revision finished") match_mode=:any Nitro.Core._eager_revise_loop(done)
+        @test events[] == 3
+    end
+
+    @testset "a watcher that dies is reported, not silent" begin
+        # A throw from the WAIT is outside the per-revision `try`, so it does end the task -- and
+        # `errormonitor` is the only thing that says so: nothing waits on this task until
+        # `terminate`, which merely sets the flag. Without it this prints nothing at all.
+        Nitro.register_revise_hooks!(;
+            revise=() -> nothing,
+            has_pending_revisions=() -> false,
+            wait_for_revision_event=() -> error("watcher boom (#372)"),
+        )
+        captured = @capture_err begin
+            svc = Nitro.Core.start_revise_service()
+            @test timedwait(() -> istaskdone(svc.task), 10) === :ok
+            @test istaskfailed(svc.task)
+            # `errormonitor` reports from a task of its own, scheduled as the watcher fails.
+            sleep(1)
+        end
+        @test occursin("watcher boom (#372)", captured)
+    end
+
+    @testset "the watcher is not sticky, and runs on the :default pool" begin
+        Nitro.register_revise_hooks!(;
+            revise=() -> nothing,
+            has_pending_revisions=() -> false,
+            wait_for_revision_event=() -> sleep(0.05),
+        )
+        svc = Nitro.Core.start_revise_service()
+        try
+            @test !svc.task.sticky
+            @test Threads.threadpool(svc.task) === :default
+        finally
+            close(svc)
+            @test timedwait(() -> istaskdone(svc.task), 10) === :ok
+            @test !istaskfailed(svc.task)
+        end
+    end
+finally
+    restore_hooks()
+end
+
+end
+
+# #372 with a REAL SIGINT, built exactly like the #369 item at the top of test/workers_tests.jl:
+# where Julia delivers a Ctrl-C is the whole bug, and only a child process can take one. Its
+# comments own the handshake, the `settle` lower bound and the watchdog; only what differs is
+# said here.
+#
+# The children register fake hooks, so no Revise is involved: `wait_for_revision_event` is a
+# `take!`, and `revise` prints REVISED, which is the parent's cue. Each child also holds
+# `Timer(3600)`, an active libuv handle that never fires. A REPL always has one -- its terminal --
+# and without one a headless child idles thread 1 where a SIGINT never wakes it: measured, the
+# press then reached NOBODY, patched watcher or not, and every child hung until the watchdog.
+# (The #369 child never needed this because its scheduler holds a 24 h `Timer` of its own.)
+#
+# Against the unpatched `@async` watcher (checked): the isolated child printed
+# `main=main_never_saw_it watcher_failed=true` at both layouts, and the `serve` child never
+# returned -- a second press then landed in the dead watcher and aborted the process with
+# "fatal: error thrown and no exception handler available".
+#
+# Not on Windows, for the reason the #369 item gives.
+@testitem "Revise -- Ctrl-C after an eager revision reaches serve, not the watcher (#372)" tags=[:extension, :slow, :network] setup=[NitroCommon] begin
+using Test
+
+# The watcher alone, with main parked in ONE `wait` on it -- the #369 child's shape.
+const WATCHER_CHILD = raw"""
+Base.exit_on_sigint(false)          # what every REPL does
+using Nitro
+const TERMINAL_STANDIN = Timer(3600)
+revisions = Channel{Nothing}(Inf)
+Nitro.register_revise_hooks!(;
+    revise = () -> (println("REVISED"); flush(stdout)),
+    has_pending_revisions = () -> false,
+    wait_for_revision_event = () -> take!(revisions),
+)
+svc = Nitro.Core.start_revise_service()
+# Parked in its first `take!` before the save below, for the reason the #369 child polls `wake`.
+timedwait(() -> !isempty(revisions.cond_take.waitq), 10.0)
+# One save, queued now and served once main parks: under `1,0` the watcher then re-parks AFTER
+# main, so it -- not main -- is the last task to park on thread 1 when the press comes.
+put!(revisions, nothing)
+got = try
+    wait(svc.task)
+    :main_never_saw_it
+catch e
+    e isa InterruptException ? :main_interrupted :
+    e isa TaskFailedException ? :main_never_saw_it :   # the watcher took it and died (#372)
+    rethrow()
+end
+println("RESULT main=", got, " watcher_failed=", istaskfailed(svc.task))
+"""
+
+# The issue's own acceptance: a BLOCKING `serve(revise = :eager)`, one save, one press. The save
+# comes from a `:default`-pool task, as Revise's file watchers do -- a sticky trigger would itself
+# be the last task to finish on thread 1 and take the press. It serves NO request, on purpose: a
+# connection task that finishes on thread 1 takes the press the same way, with or without Revise,
+# which is #426 and not this item's subject.
+const SERVE_CHILD = raw"""
+Base.exit_on_sigint(false)
+using Nitro, Sockets
+const TERMINAL_STANDIN = Timer(3600)
+revisions = Channel{Nothing}(Inf)
+Nitro.register_revise_hooks!(;
+    revise = () -> (println("REVISED"); flush(stdout)),
+    has_pending_revisions = () -> false,
+    wait_for_revision_event = () -> take!(revisions),
+)
+port, probe = listenany(ip"127.0.0.1", 20000); close(probe)
+app = App(mod = @__MODULE__)
+urlpatterns(app, "", path("/", () -> Res.send("ok"), method = "GET"))
+Threads.@spawn :default (sleep(3); put!(revisions, nothing))
+serve(app; host = "127.0.0.1", port = Int(port), show_banner = false, access_log = nothing,
+      revise = :eager)
+println("RESULT serve_returned")
+"""
+
+# The #369 parent, with REVISED as the cue instead of READY.
+function ctrl_c_child(child::String, threads::String; settle::Real=2, deadline::Real=120)
+    cmd = `$(Base.julia_cmd()) --code-coverage=none --threads=$threads --project=$(Base.active_project()) --startup-file=no -e $child`
+    err = IOBuffer()
+    p = open(pipeline(ignorestatus(cmd); stderr=err), "r")
+    timed_out = Threads.Atomic{Bool}(false)
+    watchdog = Timer(deadline) do _
+        timed_out[] = true
+        kill(p, Base.SIGKILL)
+    end
+    try
+        seen = String[]
+        for line in eachline(p)
+            push!(seen, line)
+            line == "REVISED" || continue
+            sleep(settle)
+            kill(p, Base.SIGINT)
+            break
+        end
+        out = join(seen, '\n') * '\n' * read(p, String)
+        wait(p)
+        return (; exitcode=p.exitcode, out=out, err=String(take!(err)), timed_out=timed_out[])
+    finally
+        close(watchdog)
+        process_running(p) && kill(p, Base.SIGKILL)
+    end
+end
+
+if !Sys.iswindows()
+    @testset "with an interactive thread -- Julia 1.12's default for `julia` and `-t auto`" begin
+        r = ctrl_c_child(WATCHER_CHILD, "1,1")
+        @test !r.timed_out
+        @test r.exitcode == 0
+        @test contains(r.out, "RESULT main=main_interrupted watcher_failed=false")
+        @test !occursin(r"unhandled task"i, r.err)
+    end
+
+    @testset "on one shared thread -- `-t 1`" begin
+        # The watcher re-parks after main here, so it takes the press. It must stop with its
+        # warning rather than die, and the warning is asserted so a green means the handler ran.
+        r = ctrl_c_child(WATCHER_CHILD, "1,0")
+        @test !r.timed_out
+        @test r.exitcode == 0
+        @test contains(r.out, "RESULT main=main_never_saw_it watcher_failed=false")
+        @test occursin("reached the eager-Revise watcher", r.err)
+        @test !occursin(r"unhandled task"i, r.err)
+    end
+
+    @testset "one press after a revision stops a blocking `serve(revise = :eager)`" begin
+        r = ctrl_c_child(SERVE_CHILD, "1,1")
+        @test !r.timed_out
+        @test r.exitcode == 0
+        @test contains(r.out, "RESULT serve_returned")
+        @test !occursin(r"fatal: error thrown"i, r.err)
+    end
+end
 
 end
