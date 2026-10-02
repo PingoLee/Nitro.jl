@@ -4,12 +4,27 @@ Base.@kwdef struct ReviseHooks
     revise::Function
     has_pending_revisions::Function
     wait_for_revision_event::Function
+    # `(task) -> Bool`: wake `task` out of `wait_for_revision_event` by throwing
+    # `ReviseWaitCancelled` into it, but only if it is parked there right now; return whether it
+    # was. This is what lets `terminate` stop the `revise=:eager` watcher it started, rather than
+    # leave it parked until the next save (#427).
+    cancel_revision_wait::Function
 end
+
+# Thrown into the `revise=:eager` watcher by `cancel_revision_wait` (#427). The watcher's loop
+# (`_eager_revise_loop`, src/core/lifecycle.jl) ends quietly on it: it means "the server that
+# started you is gone", not that anything failed.
+struct ReviseWaitCancelled <: Exception end
 
 const REVISE_HOOKS::Ref{Union{Nothing,ReviseHooks}} = Ref{Union{Nothing,ReviseHooks}}(nothing)
 
-function register_revise_hooks!(; revise::Function, has_pending_revisions::Function, wait_for_revision_event::Function)
-    REVISE_HOOKS[] = ReviseHooks(; revise, has_pending_revisions, wait_for_revision_event)
+# `cancel_revision_wait` defaults to "never parked", so a caller that cannot cancel its wait keeps
+# today's behavior: `terminate` sets the watcher's flag and the watcher exits at its next event.
+function register_revise_hooks!(; revise::Function, has_pending_revisions::Function,
+                                wait_for_revision_event::Function,
+                                cancel_revision_wait::Function = _ -> false)
+    REVISE_HOOKS[] = ReviseHooks(; revise, has_pending_revisions, wait_for_revision_event,
+                                 cancel_revision_wait)
     return REVISE_HOOKS[]
 end
 

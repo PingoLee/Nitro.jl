@@ -14,7 +14,7 @@ using DataStructures: CircularDeque
 using LRUCache: LRU
 import Base.Threads: lock, nthreads
 using Base.ScopedValues: ScopedValue, @with
-import ..has_revise_hooks, ..revise_hooks
+import ..has_revise_hooks, ..revise_hooks, ..ReviseWaitCancelled
 
 include("errors.jl");       @reexport using .Errors
 # `Constants` depends on nothing but HTTP, and loads this early so the body parsers (`Util`) and

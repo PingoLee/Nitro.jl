@@ -4,6 +4,7 @@ using Test
 using Pkg: TOML
 using Nitro
 using HTTP
+using Sockets
 
 port = get_free_port()
 localhost = "http://$HOST:$port"
@@ -42,6 +43,36 @@ else
         notify(Revise.revision_event)
         ext._wait_for_revision_event()
         (@atomic Revise.revision_event.set) && error(\"the revision hook left Revise.revision_event set\")
+
+        # #427, against the REAL event: `close` must take the watcher off `revision_event`, not
+        # leave it parked until the next save. The ext's own wait and cancel, a counting `revise`.
+        revised = Threads.Atomic{Int}(0)
+        Nitro.register_revise_hooks!(;
+            revise=() -> (Threads.atomic_add!(revised, 1); nothing),
+            has_pending_revisions=() -> false,
+            wait_for_revision_event=ext._wait_for_revision_event,
+            cancel_revision_wait=ext._cancel_revision_wait,
+        )
+        waitq = Revise.revision_event.notify.waitq
+        parked(svc) = svc.task.queue === waitq
+        svc1 = Nitro.Core.start_revise_service()
+        timedwait(() -> parked(svc1), 10.0) === :ok || error(\"watcher 1 never parked\")
+        close(svc1)
+        timedwait(() -> istaskdone(svc1.task), 10.0) === :ok ||
+            error(\"close left the watcher parked on Revise.revision_event (#427)\")
+        istaskfailed(svc1.task) && error(\"watcher 1 failed instead of stopping\")
+        isempty(waitq) || error(\"a task is still queued on Revise.revision_event after close\")
+
+        # The issue's acceptance: after a restart, the FIRST save reaches the new watcher. This
+        # only discriminates on an autoresetting event (Revise 3.14.5+), where a notify wakes one
+        # waiter -- before #427 that was the dead watcher 1. A non-autoreset event wakes both.
+        svc2 = Nitro.Core.start_revise_service()
+        timedwait(() -> parked(svc2), 10.0) === :ok || error(\"watcher 2 never parked\")
+        notify(Revise.revision_event)
+        timedwait(() -> revised[] == 1, 10.0) === :ok ||
+            error(\"the first save after a restart was not revised (#427)\")
+        close(svc2)
+        timedwait(() -> istaskdone(svc2.task), 10.0) === :ok || error(\"watcher 2 did not stop\")
         println(\"ok\")
     """
     integration_cmd = `$(Base.julia_cmd()) --project=$(pkgdir(Nitro)) -e $(integration_script)`
@@ -116,12 +147,43 @@ try
 
     run_revise_mode_test(:lazy)
     run_revise_mode_test(:eager)
+
+    # #427, the other way to strand a watcher: `serve(async = true)` starts it BEFORE `listen!`,
+    # so a listener that fails to bind returns no handle for `terminate` to reach it through.
+    let revisions = Channel{Nothing}(Inf)
+        Nitro.register_revise_hooks!(;
+            revise=() -> nothing,
+            has_pending_revisions=() -> false,
+            wait_for_revision_event=() -> take!(revisions),
+            cancel_revision_wait=t -> lock(revisions) do
+                t.queue === revisions.cond_take.waitq || return false
+                schedule(t, Nitro.ReviseWaitCancelled(); error = true)
+                return true
+            end,
+        )
+        busy_port = get_free_port()
+        blocker = Sockets.listen(Sockets.IPv4(HOST), busy_port)
+        app = App(mod = @__MODULE__)
+        try
+            @test_throws Exception serve(app; port=busy_port, host=HOST, show_errors=false,
+                                         show_banner=false, access_log=nothing, revise=:eager,
+                                         async=true, reuseaddr=false)
+            watcher = app.service.eager_revise[]
+            @test watcher !== nothing
+            @test timedwait(() -> istaskdone(watcher.task), 10) === :ok
+            @test !istaskfailed(watcher.task)
+        finally
+            close(blocker)
+            terminate(app)
+        end
+    end
 finally
     if original_revise_hooks !== nothing
         Nitro.register_revise_hooks!(;
             revise=original_revise_hooks.revise,
             has_pending_revisions=original_revise_hooks.has_pending_revisions,
             wait_for_revision_event=original_revise_hooks.wait_for_revision_event,
+            cancel_revision_wait=original_revise_hooks.cancel_revision_wait,
         )
     else
         Nitro.clear_revise_hooks!()
@@ -145,6 +207,7 @@ restore_hooks() = original_revise_hooks === nothing ? Nitro.clear_revise_hooks!(
         revise=original_revise_hooks.revise,
         has_pending_revisions=original_revise_hooks.has_pending_revisions,
         wait_for_revision_event=original_revise_hooks.wait_for_revision_event,
+        cancel_revision_wait=original_revise_hooks.cancel_revision_wait,
     )
 
 try
@@ -156,7 +219,7 @@ try
         )
         # Returning at all is the point: rethrowing is what killed the watcher, and swallowing
         # would loop straight back into the throwing `wait` and never return.
-        @test (@test_logs (:warn, r"reached the eager-Revise watcher") Nitro.Core._eager_revise_loop(Ref(false))) === nothing
+        @test (@test_logs (:warn, r"reached the eager-Revise watcher") Nitro.Core._eager_revise_loop(Threads.Atomic{Bool}(false))) === nothing
     end
 
     @testset "an interrupt DURING a revision reaches the same handler" begin
@@ -165,11 +228,11 @@ try
             has_pending_revisions=() -> false,
             wait_for_revision_event=() -> nothing,
         )
-        @test (@test_logs (:info,) (:warn, r"reached the eager-Revise watcher") Nitro.Core._eager_revise_loop(Ref(false))) === nothing
+        @test (@test_logs (:info,) (:warn, r"reached the eager-Revise watcher") Nitro.Core._eager_revise_loop(Threads.Atomic{Bool}(false))) === nothing
     end
 
     @testset "a revision that throws costs that revision, never the watcher" begin
-        done = Ref(false)
+        done = Threads.Atomic{Bool}(false)
         events = Ref(0)
         Nitro.register_revise_hooks!(;
             revise=() -> events[] == 1 ? error("boom") : nothing,
@@ -183,8 +246,8 @@ try
 
     @testset "a watcher that dies is reported, not silent" begin
         # A throw from the WAIT is outside the per-revision `try`, so it does end the task -- and
-        # `errormonitor` is the only thing that says so: nothing waits on this task until
-        # `terminate`, which merely sets the flag. Without it this prints nothing at all.
+        # `errormonitor` is the only thing that says so: nothing ever waits on this task, and
+        # `terminate` only stops it. Without it this prints nothing at all.
         Nitro.register_revise_hooks!(;
             revise=() -> nothing,
             has_pending_revisions=() -> false,
@@ -215,6 +278,98 @@ try
             @test timedwait(() -> istaskdone(svc.task), 10) === :ok
             @test !istaskfailed(svc.task)
         end
+    end
+
+    # #427. A fake cancellable wait built like the real one in ext/NitroReviseExt.jl: a `Channel`'s
+    # `take!` parks on `cond_take`, whose lock is the Channel's, just as `wait(::Event)` parks on
+    # `event.notify`. The real Revise event is exercised in the "Revise integration" child.
+    revisions = Channel{Nothing}(Inf)
+    cancel_take(t::Task) = lock(revisions) do
+        t.queue === revisions.cond_take.waitq || return false
+        schedule(t, Nitro.ReviseWaitCancelled(); error = true)
+        return true
+    end
+    parked() = !isempty(revisions.cond_take.waitq)
+
+    @testset "a cancelled wait ends the loop quietly (#427)" begin
+        Nitro.register_revise_hooks!(;
+            revise=() -> nothing,
+            has_pending_revisions=() -> false,
+            wait_for_revision_event=() -> throw(Nitro.ReviseWaitCancelled()),
+        )
+        # No warning, unlike an interrupt: being cancelled is how a watcher is meant to stop.
+        @test (@test_logs Nitro.Core._eager_revise_loop(Threads.Atomic{Bool}(false))) === nothing
+    end
+
+    @testset "close wakes a watcher parked in its wait (#427)" begin
+        Nitro.register_revise_hooks!(;
+            revise=() -> nothing,
+            has_pending_revisions=() -> false,
+            wait_for_revision_event=() -> take!(revisions),
+            cancel_revision_wait=cancel_take,
+        )
+        svc = Nitro.Core.start_revise_service()
+        @test timedwait(parked, 10) === :ok
+        # Before #427, `close` only set the flag and the watcher stayed parked until the next save.
+        close(svc)
+        @test timedwait(() -> istaskdone(svc.task), 10) === :ok
+        @test !istaskfailed(svc.task)
+        @test !parked()
+    end
+
+    @testset "close retries a cancel that finds the watcher not yet parked (#427)" begin
+        # The first attempt reports "not parked", as it does when the watcher read the flag a
+        # moment before `close` set it. Only the retry can wake it.
+        attempts = Threads.Atomic{Int}(0)
+        Nitro.register_revise_hooks!(;
+            revise=() -> nothing,
+            has_pending_revisions=() -> false,
+            wait_for_revision_event=() -> take!(revisions),
+            cancel_revision_wait=t -> Threads.atomic_add!(attempts, 1) == 0 ? false : cancel_take(t),
+        )
+        svc = Nitro.Core.start_revise_service()
+        @test timedwait(parked, 10) === :ok
+        close(svc)
+        @test timedwait(() -> istaskdone(svc.task), 10) === :ok
+        @test !istaskfailed(svc.task)
+        @test attempts[] >= 2
+    end
+
+    @testset "a cancel hook that throws is logged, never thrown out of close (#427)" begin
+        # `close` runs inside `terminate` after the listener is down, so a broken hook must not
+        # turn a clean shutdown into an exception.
+        Nitro.register_revise_hooks!(;
+            revise=() -> nothing,
+            has_pending_revisions=() -> false,
+            wait_for_revision_event=() -> take!(revisions),
+            cancel_revision_wait=_ -> error("cancel boom (#427)"),
+        )
+        svc = Nitro.Core.start_revise_service()
+        @test timedwait(parked, 10) === :ok
+        @test (@test_logs (:error, r"cancelling the eager-Revise watcher's wait failed") match_mode=:any close(svc)) === nothing
+        # Unblock it the old way, so the item leaves no parked task behind.
+        put!(revisions, nothing)
+        @test timedwait(() -> istaskdone(svc.task), 10) === :ok
+    end
+
+    @testset "close cancels with the hooks the watcher was started with (#427)" begin
+        Nitro.register_revise_hooks!(;
+            revise=() -> nothing,
+            has_pending_revisions=() -> false,
+            wait_for_revision_event=() -> take!(revisions),
+            cancel_revision_wait=cancel_take,
+        )
+        svc = Nitro.Core.start_revise_service()
+        @test timedwait(parked, 10) === :ok
+        # Re-registering, as a test or a reloaded extension does, must not strand the watcher.
+        Nitro.register_revise_hooks!(;
+            revise=() -> nothing,
+            has_pending_revisions=() -> false,
+            wait_for_revision_event=() -> nothing,
+        )
+        close(svc)
+        @test timedwait(() -> istaskdone(svc.task), 10) === :ok
+        @test !istaskfailed(svc.task)
     end
 finally
     restore_hooks()

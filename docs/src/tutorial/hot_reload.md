@@ -82,6 +82,9 @@ saying so, and eager revision stays off until the server restarts. Ctrl-C handli
 `serve` has a broader open problem, independent of Revise, tracked in
 [#426](https://github.com/PingoLee/Nitro.jl/issues/426).
 
+`terminate()` also stops the watcher, so after a `serve(revise = :eager)` is restarted in the same
+session, the next save reaches the new watcher instead of the stopped one.
+
 ## Production Setup
 
 Production should not load `Revise`.
