@@ -10,8 +10,9 @@ using ...Crypto: secure_random_bytes, _empty_hmac_key, SecretString, reveal, bas
 using ...Errors: is_unrecoverable
 using ...Res: json
 using ...Core: own_response_headers, getjson, getform
+using ...Util: _mark_private!
 
-export CSRFMiddleware, issue_csrf_token!, validate_csrf_token
+export CSRFMiddleware, csrf_token!, issue_csrf_token!, validate_csrf_token
 
 const SAFE_METHODS = Set(("GET", "HEAD", "OPTIONS", "TRACE"))
 
@@ -134,8 +135,112 @@ function issue_csrf_token!(res::HTTP.Response, secret::String; binding::Abstract
     _check_csrf_secret(secret)
     _validate_cookie_prefix(cookie_name, config)
     raw_token = _generate_raw_token()
-    set_cookie!(res, cookie_name, _signed_token(secret, raw_token, binding); config=config, encrypted=false, maxage=ttl)
+    _set_token_cookie!(res, secret, raw_token, binding, cookie_name, ttl, config)
     return raw_token
+end
+
+# Signs `raw_token` under `binding` and sets it on `res`. Split out of `issue_csrf_token!` so the
+# middleware can sign a token it did NOT just generate: the one `csrf_token!` already handed the
+# handler, which may have gone into the response body (#431).
+function _set_token_cookie!(res::HTTP.Response, secret::String, raw_token::String,
+                            binding::AbstractString, cookie_name::String, ttl::Int,
+                            config::CookieConfig)
+    set_cookie!(res, cookie_name, _signed_token(secret, raw_token, binding); config=config, encrypted=false, maxage=ttl)
+    return nothing
+end
+
+# `req.context` keys. `:csrf_token` is long-standing and read by handlers; the others are the
+# middleware's private handshake with `csrf_token!`.
+#   :csrf_active        -- set by the middleware before the handler: `csrf_token!` may be called.
+#   :csrf_binding       -- the session id the client's verified token is bound to (the binding at
+#                          entry). A rotation since then makes that token the PRE-rotation one.
+#   :csrf_requested     -- set by `csrf_token!`: the response must carry the token it returned.
+#   :csrf_minted_here   -- set by `csrf_token!` when it generated the token in this request, so no
+#                          one but this response has seen it.
+const _ACTIVE_KEY = :csrf_active
+const _BINDING_KEY = :csrf_binding
+const _REQUESTED_KEY = :csrf_requested
+const _MINTED_HERE_KEY = :csrf_minted_here
+
+"""
+    csrf_token!(req::HTTP.Request) -> String
+
+Return this client's CSRF token, minting one if it has none. Call it from a handler behind
+`CSRFMiddleware` wherever the client needs the token: a hidden `_csrf` form field, a JSON body
+for a single-page app, a `<meta>` tag.
+
+`CSRFMiddleware` creates a token on its own only when the visitor already has a session, or this
+request saves one anyway. A first visit that nothing else gives a session gets no token unless a
+handler calls this (#431). That is Django's `get_token`, and it is what keeps health checks,
+bearer clients and scanners from creating a session per request.
+
+The returned value is the raw token the client sends back in the `X-CSRF-Token` header, the
+`_csrf` form field, or the `_csrf` JSON key. The middleware sets the matching cookie on the
+response, and keeps the session the token is bound to. A client that already holds a valid
+token gets that one back, and its cookie is re-sent so its `Max-Age` starts again: a token just
+put in a page does not expire before the page is used.
+
+**Call it after any `regenerate_session!` in the same handler**, as a login does. A rotation
+retires the client's existing token, the way Django's `rotate_token` does on login, so a token
+taken *before* the rotation is replaced in the cookie and the one the handler embedded stops
+working. A token this call minted in the same request is kept across a rotation, since no one
+else can have seen it.
+
+```julia
+login_form(req) = Res.html(\"\"\"
+    <form method="post" action="/login">
+      <input type="hidden" name="_csrf" value="\$(csrf_token!(req))">
+      ...
+    </form>\"\"\")
+
+# A single-page app fetches it at startup, and again after a login, a logout or a 403, and
+# echoes it in `X-CSRF-Token`.
+path("/api/csrf", req -> Res.json(Dict("token" => csrf_token!(req))); method = "GET")
+```
+
+The token is URL-safe base64 (`A-Z a-z 0-9 - _`), so it needs no escaping in HTML.
+
+Throws `ArgumentError` if `CSRFMiddleware` did not run on this request, or if it has no session
+to bind the token to (put `SessionMiddleware` outside `CSRFMiddleware`). It never returns an
+unbound token.
+"""
+function csrf_token!(req::HTTP.Request)::String
+    Base.get(req.context, _ACTIVE_KEY, false) === true || throw(ArgumentError(
+        "csrf_token! was called on a request CSRFMiddleware did not handle. Add " *
+        "CSRFMiddleware(secret) to the pipeline, inside SessionMiddleware (#431)."))
+    _binding(req) === nothing && throw(ArgumentError(
+        "csrf_token! has no session to bind the token to: `:session_id` is missing from the " *
+        "request context. Put SessionMiddleware OUTSIDE CSRFMiddleware in the pipeline."))
+    token = Base.get(req.context, :csrf_token, nothing)
+    # The client's own token is reused only while the session it is bound to is still the
+    # session. After a rotation it is the pre-login token, and re-binding it to the new session
+    # would let whoever knew it before the login keep using it after (#431 review).
+    minted_here = Base.get(req.context, _MINTED_HERE_KEY, false) === true
+    stale = !minted_here && Base.get(req.context, _BINDING_KEY, nothing) != _binding(req)
+    if !(token isa String) || stale
+        token = _generate_raw_token()
+        req.context[:csrf_token] = token
+        req.context[_MINTED_HERE_KEY] = true
+    end
+    req.context[_REQUESTED_KEY] = true
+    return token
+end
+
+# Will the session outlive this response without CSRF's help? Then a token costs no extra store
+# row, and the middleware mints one unasked (#431). Otherwise only `csrf_token!` makes it mint:
+# keeping a session just to bind a token to it is what turned every cookieless GET into a store
+# write under a global `CSRFMiddleware`, undoing #317.
+#
+# An ABSENT `:session_new` counts as an existing session. Only `SessionMiddleware` sets it; a
+# pipeline that supplies `:session_id` some other way saves nothing on CSRF's behalf, so there is
+# no growth to avoid, and minting as before keeps it working.
+function _session_persists(req::HTTP.Request, binding_before::Nullable{String},
+                           binding_after::String)::Bool
+    Base.get(req.context, :session_new, false) === true || return true
+    Base.get(req.context, :session_modified, false) === true && return true
+    binding_before == binding_after || return true          # rotated: saved under the new id
+    session = Base.get(req.context, :session, nothing)
+    return session isa AbstractDict && !isempty(session)
 end
 
 function _presented_token(req::HTTP.Request, header_name::String, form_field::String)
@@ -210,7 +315,8 @@ end
 # A token going out in this response is bound to the session id, so that session must outlive the
 # response. `SessionMiddleware` saves a NEW session only when something marks it modified (#317).
 # Without this, an anonymous visitor's token was bound to an id nobody stored: the next request
-# got a fresh id, the token no longer verified, and every POST was a 403.
+# got a fresh id, the token no longer verified, and every POST was a 403. Called only when a token
+# actually goes out -- never just because a safe request passed through (#431).
 _keep_session!(req::HTTP.Request) = (req.context[:session_modified] = true; nothing)
 
 """
@@ -253,6 +359,58 @@ function validate_csrf_token(req::HTTP.Request, secret::String; cookie_name::Str
     return _constant_time_equals(presented, raw_token) || _constant_time_equals(presented, cookie_value)
 end
 
+"""
+    CSRFMiddleware(secret; cookie_name = "__Host-csrf_token", header_name = "X-CSRF-Token",
+                   form_field = "_csrf", ttl = 3600, config = CookieConfig(...))
+
+CSRF protection with a signed double-submit cookie, bound to the session. `secret` is a
+`String` or a `SecretString`; an empty one is an `ArgumentError`.
+
+Every unsafe request (anything but `GET`, `HEAD`, `OPTIONS`, `TRACE`) must send the token back
+in the `X-CSRF-Token` header, a `_csrf` form field, or a `_csrf` JSON key, or it gets `403`.
+
+# When a token is issued
+
+The token cookie is set on a response only when the client will need it and keeping it costs
+nothing extra (#431):
+
+- a handler called [`csrf_token!`](@ref Nitro.Core.Middleware.CSRFMiddleware_.csrf_token!)
+  for it, to put it in a form or hand it to a single-page app;
+- or the request's session is saved anyway: the visitor already had one, or this request wrote
+  to it or rotated it.
+
+A cookieless request nobody asked a token for, such as a health check, a bearer-token API call or
+a scanner, gets no token and no session. So the middleware can sit in the global pipeline
+without creating a session per request. That is Django's model. It used to mint on every safe
+response and keep a session for each one, which made every cookieless `GET` a store write.
+
+The cookie is re-issued whenever the client's token would not verify on the next request,
+including after the handler rotates the session with `regenerate_session!`. A rejected request
+from a client that echoed its own stale token gets a fresh one with the `403`, so a login that
+rotates the session cannot lock the client out.
+
+# Placement
+
+```julia
+serve(app, middleware = [
+    SessionMiddleware(store = MemoryStore()),   # OUTSIDE: the token is bound to its session id
+    CSRFMiddleware(ENV["CSRF_SECRET"]),
+])
+```
+
+With no session id on the request the middleware fails closed: it issues no token, and rejects
+every unsafe request.
+
+# Keywords
+
+- `cookie_name`: the `__Host-` prefix stops a sibling subdomain planting a token. Browsers
+  accept it only on a `Secure`, `Path=/`, `Domain`-less cookie, so a `config` that cannot carry
+  it is an `ArgumentError`. For plain-HTTP development pass `cookie_name = "csrf_token"` and a
+  `config` with `secure = false`.
+- `header_name`, `form_field`: where the token is read from on unsafe requests.
+- `ttl`: the cookie's `Max-Age`, in seconds.
+- `config`: the cookie's attributes. It is not `httponly`, so a browser script can read the token.
+"""
 function CSRFMiddleware(key::Union{AbstractString, SecretString}; cookie_name::String=DEFAULT_COOKIE_NAME, header_name::String="X-CSRF-Token", form_field::String="_csrf", ttl::Int=3600, config::CookieConfig=CookieConfig(httponly=false, secure=true, samesite="Lax", path="/", maxage=ttl))
     # The closures below capture `sealed`, never the raw key: `repr` of a closure prints its
     # captures, so a plain `String` here was published by any `@info … middleware = mw` (#307).
@@ -289,11 +447,16 @@ function CSRFMiddleware(key::Union{AbstractString, SecretString}; cookie_name::S
                     end
                     return rejection
                 end
-            else
-                cookie_value = get_cookie(req, cookie_name, nothing; encrypted=false)
-                req.context[:csrf_token] = (binding === nothing || cookie_value === nothing) ?
-                    nothing : _verify_signed_token(secret, cookie_value, binding)
             end
+            # The client's verified token, or `nothing`, for the handler to read -- on an unsafe
+            # request too, which has just proved it holds one, so a handler re-rendering a form
+            # after a POST hands back the same token.
+            cookie_value = get_cookie(req, cookie_name, nothing; encrypted=false)
+            req.context[:csrf_token] = (binding === nothing || cookie_value === nothing) ?
+                nothing : _verify_signed_token(secret, cookie_value, binding)
+            req.context[_ACTIVE_KEY] = true
+            req.context[_BINDING_KEY] = binding
+            binding_before = binding
 
             response = handle(req)
 
@@ -311,18 +474,45 @@ function CSRFMiddleware(key::Union{AbstractString, SecretString}; cookie_name::S
                 return response
             end
 
-            cookie_value = get_cookie(req, cookie_name, nothing; encrypted=false)
             needs_token = cookie_value === nothing ||
                           _verify_signed_token(secret, cookie_value, binding) === nothing
             handler_minted = _response_sets_cookie(response, cookie_name)
-            if needs_token && !handler_minted
-                # Own the headers before issuing the cookie: `response` may be a shared/`const`
-                # object, and `issue_csrf_token!` mutates the headers in place.
-                response = own_response_headers(response)
-                raw_token = issue_csrf_token!(response, secret; binding, cookie_name, ttl, config)
-                req.context[:csrf_token] = raw_token
+            if handler_minted
+                _keep_session!(req)
+                return response
             end
-            (needs_token || handler_minted) && _keep_session!(req)
+
+            requested = Base.get(req.context, _REQUESTED_KEY, false) === true
+            given = Base.get(req.context, :csrf_token, nothing)
+            if requested && given isa String &&
+               (!needs_token || Base.get(req.context, _MINTED_HERE_KEY, false) === true)
+                # The handler holds `given` and may have put it in the body, so the cookie
+                # carries THAT token. Either the client's own, still valid: re-sent so its
+                # Max-Age starts again, as Django does whenever `get_token` runs. Or one
+                # `csrf_token!` minted in this request: signed under the final binding, which
+                # follows a rotation safely because nobody else has seen it.
+                raw_token = given
+            elseif needs_token &&
+                   (requested || _session_persists(req, binding_before, binding))
+                # Lazy (#431): a fresh token only when the handler asked, or the session is
+                # saved anyway. A cookieless request nobody asked a token for creates nothing.
+                # `requested` lands here only with the client's pre-rotation token, which a
+                # rotation retires rather than re-binds.
+                raw_token = _generate_raw_token()
+            else
+                return response
+            end
+            # Own the headers before issuing the cookie: `response` may be a shared/`const`
+            # object, and setting a cookie mutates the headers in place.
+            response = own_response_headers(response)
+            _set_token_cookie!(response, secret, raw_token, binding, cookie_name, ttl, config)
+            # One visitor's credential in a Set-Cookie (and, when the handler asked, often in the
+            # body): never storable by a shared cache. A refresh sends it with no session write,
+            # so `SessionMiddleware` would not mark it (#431 review).
+            _mark_private!(response)
+            req.context[:csrf_token] = raw_token
+            # A refresh of a still-valid token needs nothing kept: its session already exists.
+            needs_token && _keep_session!(req)
             return response
         end
     end

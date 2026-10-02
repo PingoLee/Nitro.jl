@@ -5,7 +5,7 @@ using HTTP
 using JSON
 using Nitro
 using Nitro: BearerAuth, GuardMiddleware, SessionMiddleware, login_required, role_required, permission_required,
-    claim_required, kid_required, Principal, CSRFMiddleware
+    claim_required, kid_required, Principal, CSRFMiddleware, csrf_token!
 
 @testset "Unified auth context" begin
     store = Nitro.Types.MemoryStore{String, Dict{String,Any}}()
@@ -288,7 +288,7 @@ end
     # request context, so without it there is nothing to bind to and every mutation is refused.
     store = Nitro.Types.MemoryStore{String, Dict{String,Any}}()
     wrapped = SessionMiddleware(cookie_name="csrf_session", store=store).middleware(
-        CSRFMiddleware("csrf-secret")(req -> HTTP.Response(200, "ok")))
+        CSRFMiddleware("csrf-secret")(req -> (req.method == "GET" && csrf_token!(req); HTTP.Response(200, "ok"))))
 
     set_cookies(res) = join([h.second for h in res.headers if lowercase(h.first) == "set-cookie"], "\n")
     cookie_named(res, name) = String(match(Regex("$(name)=([^;]+)"), set_cookies(res)).captures[1])

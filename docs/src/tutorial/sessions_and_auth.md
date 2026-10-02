@@ -274,7 +274,9 @@ something in it, rotates it, or sets `req.context[:session_modified] = true`. Th
 equivalent of Django's `request.session.modified = True`. A request that never touches the
 session, such as a health check or a static file, creates nothing. Set the flag yourself when you
 hand the client something bound to `req.context[:session_id]` without writing to the session.
-`CSRFMiddleware` already sets it for its tokens.
+`CSRFMiddleware` sets it whenever it issues a token. It issues one to a new visitor only when a
+handler asks, so a global `CSRFMiddleware` does not create sessions either (see
+[When a token is issued](#When-a-token-is-issued)).
 
 `empty!(getsession(req))` only clears the current payload. For the default `user_id`-based flow,
 `SessionMiddleware` now rotates an existing session automatically when auth state changes.
@@ -604,7 +606,8 @@ One exception: when you re-set a token minted in an *earlier* request — a refr
 re-login that reuses a live token — `expires_in` is too long, because `Max-Age` counts from
 delivery while `exp` counts from `iat`. Pass what is left, `claims["exp"] - trunc(Int, time())`.
 
-For cookie-authenticated browsers, load the CSRF secret from the environment and add `CSRFMiddleware` to unsafe routes:
+For cookie-authenticated browsers, load the CSRF secret from the environment and add
+`CSRFMiddleware` to the global pipeline:
 
 ```julia
 csrf_secret = get(ENV, "CSRF_SECRET", nothing)
@@ -621,16 +624,103 @@ or any run of up to 64 NUL bytes, which HMAC treats as the same empty key — is
 `ArgumentError` at construction, because a token signed under it is one anyone can sign.
 `issue_csrf_token!` and `validate_csrf_token` refuse it on every call too.
 
-The middleware uses a signed double-submit cookie. Safe requests receive a CSRF cookie
-automatically; unsafe requests must echo the token in the `X-CSRF-Token` header, in a `_csrf`
-form field, or in a `_csrf` JSON body key.
+The middleware uses a signed double-submit cookie. Unsafe requests (anything but `GET`, `HEAD`,
+`OPTIONS` and `TRACE`) must echo the token in the `X-CSRF-Token` header, in a `_csrf` form field,
+or in a `_csrf` JSON body key, or they are refused with `403`.
 
-Issuing a token also **keeps the session it is bound to**. `SessionMiddleware` saves a new session
-only when something uses it, and `CSRFMiddleware` counts as a use: it sets
+### When a token is issued
+
+A token is bound to a session, so issuing one to a new visitor means storing a session for them.
+`CSRFMiddleware` therefore issues a token only when the client will use it:
+
+- **A handler asks for it** with [`csrf_token!(req)`](@ref csrf_token!), to put it in a form or hand it to a single-page
+  app. It returns the token, and the middleware sets the matching cookie on the
+  response.
+- **The session is saved anyway**: the visitor already has one, or this request wrote to it or
+  rotated it. The token then costs nothing extra, so the middleware issues it unasked.
+
+Anything else gets no token and no session. That covers health checks, bearer-token API clients,
+uptime probes and scanners, and every other cookieless request that never touches the session. So
+global placement is safe, even with a database-backed session store. It used to be otherwise:
+until [#431](https://github.com/PingoLee/Nitro.jl/issues/431) the middleware issued a token on
+every safe response and kept a session for each one, so every cookieless `GET` was a store write.
+
+This is the model Django (`get_token`), Spring Security 6 (deferred CSRF tokens), Rails and
+Phoenix all use. A token is created when something renders it, not on every request.
+
+Issuing a token also **keeps the session it is bound to**. It sets
 `req.context[:session_modified]`, so an anonymous visitor's session is saved and their token still
-verifies on the next request. The flip side is that every cookieless request reaching
-`CSRFMiddleware` stores one session. Put it on the routes that serve forms or your SPA, not in
-front of health checks and static files, where a request only creates a session nobody will use.
+verifies on the next request.
+
+### Server-rendered forms
+
+Call `csrf_token!` where the form is built, and put the value in a hidden `_csrf` field. It works
+on the very first visit: the token exists as soon as the handler asks for it.
+
+```julia
+function login_form(req::HTTP.Request)
+    return Res.html("""
+        <form method="post" action="/login">
+          <input type="hidden" name="_csrf" value="$(csrf_token!(req))">
+          <input name="username"> <input name="password" type="password">
+          <button>Sign in</button>
+        </form>""")
+end
+
+urlpatterns("",
+    path("/login", login_form, method="GET"),
+    path("/login", AuthHandlers.login, method="POST"),
+)
+```
+
+The token is URL-safe base64 (`A-Z a-z 0-9 - _`), so it is safe to interpolate into HTML as-is.
+A client that already holds a valid token gets the same one back, and its cookie is re-sent, so
+the cookie's lifetime (`ttl`, an hour by default) starts again from the page that embeds it.
+
+A handler that rotates the session (a login does) must call `csrf_token!` **after**
+`regenerate_session!`. Rotation retires the client's existing token, as Django's `rotate_token`
+does: a token taken before the rotation is replaced in the cookie, and the copy in the page stops
+working.
+
+### Single-page apps
+
+An SPA shell served by [`spafiles`](@ref) has no handler to call `csrf_token!`. Give the app an
+endpoint that does, and call it once at startup:
+
+```julia
+csrf(req::HTTP.Request) = Res.json(Dict("token" => csrf_token!(req)))
+
+urlpatterns("", path("/api/csrf", csrf, method="GET"))
+```
+
+```javascript
+// Once, when the app boots.
+const { token } = await (await fetch("/api/csrf", { credentials: "same-origin" })).json();
+
+// On every mutation.
+await fetch("/api/products", {
+  method: "POST",
+  credentials: "same-origin",
+  headers: { "Content-Type": "application/json", "X-CSRF-Token": token },
+  body: JSON.stringify({ name: "Lamp" }),
+});
+```
+
+Fetch the token again in two cases:
+
+- **after a login or a logout.** Both rotate the session, and a token belongs to the session it
+  was issued for.
+- **on a `403` from a mutation**, then retry the request once. The token in memory can outlive its
+  cookie: the cookie expires `ttl` seconds (an hour by default) after the app last fetched it, for
+  example while a tab sits idle.
+
+Raising `ttl` to your session's `max_age` makes the second case rarer. The retry on `403` is what
+makes the app correct, so keep it even then.
+
+The cookie is readable by JavaScript, so an app can instead read the token from `document.cookie`
+before each mutation. The raw token is the part before the first `.`.
+
+### Placement and binding
 
 **`SessionMiddleware` must sit outside `CSRFMiddleware`.** The token's signature covers the
 session id as well as the random token value, so a token minted for one visitor does not
@@ -657,12 +747,13 @@ travels in it — never the session id itself.
 
 A session rotation invalidates the token bound to the old session, so the middleware re-issues
 whenever the presented cookie would not verify under the current session. A handler that calls
-`regenerate_session!` gets a fresh, usable CSRF cookie in the same response.
+`regenerate_session!` gets a fresh, usable CSRF cookie in the same response. To put that token in
+the response body too, call `csrf_token!` after the rotation.
 
 `SessionMiddleware`'s own `rotate_on_auth` is the awkward case: it rotates *after* `CSRFMiddleware`
 has returned, so the login response cannot carry the replacement and the client's token is orphaned
-the moment it lands. The next mutation is therefore refused — but that `403` carries a fresh, valid
-token, so the client retries once and continues. Without that, an SPA that only ever issues unsafe
+the moment it lands. The next mutation is therefore refused, but that `403` carries a fresh, valid
+token in its cookie, so the client refetches the token (or reads the cookie) and retries once. Without that, an SPA that only ever issues unsafe
 requests after login would never see a safe response and would stay locked out.
 
 That re-issue gives nothing away: the token is bound to the *requester's own* session and travels

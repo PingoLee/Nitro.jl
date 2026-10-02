@@ -13,6 +13,7 @@ using ...Cookies: get_cookie, set_cookie!, storesession!, prunesessions!, regene
 using ...Crypto: secure_uuid4
 using ...Errors: is_unrecoverable
 using ...Core: own_response_headers
+using ...Util: _mark_private!
 
 export SessionMiddleware, SessionPruner, rehash_session!
 
@@ -129,8 +130,9 @@ empty `getsession(req)`. That new session is **saved, and its cookie set, only i
 leaves data in it, rotates it (`regenerate_session!`), or sets
 `req.context[:session_modified] = true` (#317). Otherwise nothing is stored and no cookie is sent,
 so health checks and static files do not create sessions. `CSRFMiddleware` sets the flag whenever
-it issues a token bound to the session. Set it yourself when you hand the client anything else
-bound to `req.context[:session_id]`.
+it issues a token bound to the session, and it issues one to a new visitor only when a handler
+asks for it with `csrf_token!` (#431), so a global `CSRFMiddleware` keeps this guarantee. Set the
+flag yourself when you hand the client anything else bound to `req.context[:session_id]`.
 
 An existing session is written back when its data changed, when it was rotated, or when the flag
 is set (which also refreshes its expiry). That write is update-only (`update_session!`, #318). If a
@@ -405,7 +407,8 @@ function SessionMiddleware(;
             # `:session_modified` is Django's `modified` flag: something OUTSIDE the session data
             # depends on this session existing. `CSRFMiddleware` sets it whenever it hands out a
             # token bound to the id -- without it an anonymous visitor's token would be bound to
-            # an id that was never saved, and every later POST would 403.
+            # an id that was never saved, and every later POST would 403. It hands one to a new
+            # visitor only when a handler asked (`csrf_token!`, #431), never on every safe request.
             forced = get(req.context, :session_modified, false) === true
             rotated = final_session_id != session_id
 
@@ -690,47 +693,5 @@ end
 function _save_session(store::AbstractSessionStore{String, Dict{String,Any}}, session_id::String, data::Dict{String,Any}, max_age::Int)
     storesession!(store, session_id, data; ttl=max_age)
 end
-
-# A response carrying one visitor's session cookie must never be stored by a SHARED cache (#317).
-# A static file served `public, max-age=31536000, immutable` under a global `SessionMiddleware`
-# used to carry `Set-Cookie: <session>=<fresh id>` with no `private` and no `Vary: Cookie`, so a
-# CDN that stored it handed one session -- and the CSRF token bound to it -- to every visitor.
-#
-# Only ever called on headers this middleware already owns (`own_response_headers`).
-function _mark_private!(response::HTTP.Response)
-    vary = String[]
-    cache_control = String[]
-    for (name, value) in response.headers
-        field = lowercase(name)
-        if field == "vary"
-            append!(vary, _header_list(value))
-        elseif field == "cache-control"
-            append!(cache_control, _header_list(value))
-        end
-    end
-
-    # `Vary` may already span several field lines -- `Cors` pushes its own `Vary: Origin` -- and
-    # another line is additive by definition, so nothing already there is rewritten.
-    if !any(t -> t == "*" || lowercase(t) == "cookie", vary)
-        push!(response.headers, "Vary" => "Cookie")
-    end
-
-    # `private` wins over `public`; every other directive (`max-age`, `immutable`, …) is kept, so
-    # the visitor's own browser still caches exactly as the handler asked. A response already
-    # `private` or `no-store` is left alone.
-    names = String[lowercase(strip(first(split(d, '='; limit = 2)))) for d in cache_control]
-    if !("private" in names || "no-store" in names)
-        kept = String[d for (d, n) in zip(cache_control, names) if n != "public"]
-        # `setheader` replaces EVERY existing `Cache-Control` line with this one.
-        HTTP.setheader(response, "Cache-Control" => join(pushfirst!(kept, "private"), ", "))
-    end
-    return response
-end
-
-# The comma-separated elements of a list-valued header, trimmed. A quoted element holding a comma
-# (`no-cache="a, b"`) splits in two, but the pieces are re-joined in order with ", ", so it is
-# written back as it came -- and no directive name this function tests can be inside quotes.
-_header_list(value::AbstractString) =
-    String[strip(element) for element in split(value, ',') if !isempty(strip(element))]
 
 end # module SessionMiddleware_

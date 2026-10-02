@@ -457,6 +457,54 @@ _rebuild_with_headers(resp::HTTP.Response, headers) = HTTP.Response(
     redirect_count  = resp.redirect_count,
 )
 
+# A response carrying one visitor's credential cookie must never be stored by a SHARED cache
+# (#317). A static file served `public, max-age=31536000, immutable` under a global
+# `SessionMiddleware` used to carry `Set-Cookie: <session>=<fresh id>` with no `private` and no
+# `Vary: Cookie`, so a CDN that stored it handed one session -- and the CSRF token bound to it --
+# to every visitor. `SessionMiddleware` calls this on every response that sets its cookie, and
+# `CSRFMiddleware` on every response that sets its token cookie (#431): the token alone, sent
+# without a session write, is still one visitor's credential.
+#
+# Internal, not exported: import it as `using ...Util: _mark_private!`. It lives in `Util`, next to
+# `own_response_headers`, because both middleware modules use it and `csrf_middleware.jl` is
+# included before `session_middleware.jl`. Only ever call it on headers the caller already owns
+# (`own_response_headers`).
+function _mark_private!(response::HTTP.Response)
+    vary = String[]
+    cache_control = String[]
+    for (name, value) in response.headers
+        field = lowercase(name)
+        if field == "vary"
+            append!(vary, _header_list(value))
+        elseif field == "cache-control"
+            append!(cache_control, _header_list(value))
+        end
+    end
+
+    # `Vary` may already span several field lines -- `Cors` pushes its own `Vary: Origin` -- and
+    # another line is additive by definition, so nothing already there is rewritten.
+    if !any(t -> t == "*" || lowercase(t) == "cookie", vary)
+        push!(response.headers, "Vary" => "Cookie")
+    end
+
+    # `private` wins over `public`; every other directive (`max-age`, `immutable`, …) is kept, so
+    # the visitor's own browser still caches exactly as the handler asked. A response already
+    # `private` or `no-store` is left alone.
+    names = String[lowercase(strip(first(split(d, '='; limit = 2)))) for d in cache_control]
+    if !("private" in names || "no-store" in names)
+        kept = String[d for (d, n) in zip(cache_control, names) if n != "public"]
+        # `setheader` replaces EVERY existing `Cache-Control` line with this one.
+        HTTP.setheader(response, "Cache-Control" => join(pushfirst!(kept, "private"), ", "))
+    end
+    return response
+end
+
+# The comma-separated elements of a list-valued header, trimmed. A quoted element holding a comma
+# (`no-cache="a, b"`) splits in two, but the pieces are re-joined in order with ", ", so it is
+# written back as it came -- and no directive name this function tests can be inside quotes.
+_header_list(value::AbstractString) =
+    String[strip(element) for element in split(value, ',') if !isempty(strip(element))]
+
 
 """
     response(content::String, status=200, headers=[]; content_type=nothing, detect=true) :: HTTP.Response
