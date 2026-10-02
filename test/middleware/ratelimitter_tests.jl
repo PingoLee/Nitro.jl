@@ -709,9 +709,10 @@ end
 # own. Both now refuse the new key once full.
 #
 # White-box where the store has to be read: with `auto_extract_ip=false`, `.middleware` is the
-# closure that captures `stripes`, and Julia names a closure's fields after its captures.
-# Renaming that local turns these into a `FieldError`, not a quiet pass -- follow the rename.
-cap_stripes(lf) = getfield(lf.middleware, :stripes)
+# closure that captures `decide`, which captures `stripes` (#421), and Julia names a closure's
+# fields after its captures. Renaming either turns these into a `FieldError`, not a quiet
+# pass -- follow the rename.
+cap_stripes(lf) = getfield(getfield(lf.middleware, :decide), :stripes)
 cap_buckets(lf) = sum(s -> lock(() -> length(s.store), s.lock), cap_stripes(lf))
 cap_req(ip) = (r = HTTP.Request("GET", "/"); setip!(r, ip); r)
 cap_ok = _ -> HTTP.Response(200, "ok")
@@ -862,6 +863,155 @@ end
     @test ra(typemax(DateTime), t, 60) == 60               # no survivors: no overflow
 end
 
+# ── #421: the limiter's `try` covers its own work, never the downstream chain ──────
+# Both strategies wrapped the whole request in one `try`, `handle(req)` included, so an exception
+# from below the limiter was taken for a limiter failure: answered `503` by default, or under
+# `fail_open` sent through the chain a SECOND time. Every assertion marked (unpatched) fails
+# against that code -- with a 503, or with `calls == 2`.
+
+f421_ip = ip"203.0.113.1"
+f421_req(target = "/") = (r = HTTP.Request("GET", target); setip!(r, f421_ip); r)
+# Runs `f`, returning what it returned OR threw, plus every message logged at Warn and above.
+function f421_run(f)
+    logger = Test.TestLogger(min_level = Base.CoreLogging.Warn)
+    out = Base.CoreLogging.with_logger(logger) do
+        try
+            f()
+        catch e
+            e
+        end
+    end
+    return out, [string(l.message) for l in logger.logs]
+end
+f421_limiter_logged(msgs) = any(m -> occursin("Rate limiter error", m), msgs)
+f421_counting(calls, f) = req -> (Threads.atomic_add!(calls, 1); f(req))
+
+@testset "Rate limiter: a throwing downstream chain runs once and propagates (unpatched)" begin
+    for strategy in (:fixed_window, :sliding_window), fail_open in (true, false)
+        calls = Threads.Atomic{Int}(0)
+        w = RateLimiter(; strategy, auto_extract_ip=false, fail_open).middleware(
+            f421_counting(calls, _ -> error("downstream boom")))
+        out, msgs = f421_run(() -> w(f421_req()))
+        @test (strategy, fail_open, out isa ErrorException && out.msg == "downstream boom",
+               calls[], f421_limiter_logged(msgs)) == (strategy, fail_open, true, 1, false)
+    end
+end
+
+@testset "Rate limiter: every handle(req) site is outside the try (unpatched)" begin
+    for strategy in (:fixed_window, :sliding_window), fail_open in (true, false)
+        # Exempt path.
+        calls = Threads.Atomic{Int}(0)
+        w = RateLimiter(; strategy, auto_extract_ip=false, fail_open,
+                        exempt_paths=["/health"]).middleware(
+            f421_counting(calls, _ -> error("exempt boom")))
+        out, _ = f421_run(() -> w(f421_req("/health")))
+        @test (:exempt, strategy, fail_open, out isa ErrorException, calls[]) ==
+              (:exempt, strategy, fail_open, true, 1)
+
+        # No client address: only `fail_open` reaches the chain.
+        calls = Threads.Atomic{Int}(0)
+        w = RateLimiter(; strategy, auto_extract_ip=false, fail_open).middleware(
+            f421_counting(calls, _ -> error("no-ip boom")))
+        out, _ = f421_run(() -> w(HTTP.Request("GET", "/")))
+        expected = fail_open ? (true, 1) : (false, 0)
+        @test (:noip, strategy, fail_open, out isa ErrorException, calls[]) ==
+              (:noip, strategy, fail_open, expected...)
+        fail_open || @test out.status == 503
+
+        # Post-handler bookkeeping: a non-`Response` makes `own_response_headers` throw AFTER
+        # the handler ran. That used to be caught and, under `fail_open`, run the chain again.
+        calls = Threads.Atomic{Int}(0)
+        w = RateLimiter(; strategy, auto_extract_ip=false, fail_open).middleware(
+            f421_counting(calls, _ -> "not a response"))
+        out, _ = f421_run(() -> w(f421_req()))
+        @test (:post, strategy, fail_open, out isa MethodError, calls[]) ==
+              (:post, strategy, fail_open, true, 1)
+    end
+end
+
+@testset "Rate limiter: a full store under fail_open runs a throwing chain once (unpatched)" begin
+    for strategy in (:fixed_window, :sliding_window)
+        newcomer = ip"198.51.100.9"
+        calls = Threads.Atomic{Int}(0)
+        h = req -> getip(req) == newcomer ?
+                   (Threads.atomic_add!(calls, 1); error("full-store boom")) :
+                   HTTP.Response(200, "ok")
+        w = RateLimiter(; strategy, max_clients=1, auto_extract_ip=false, fail_open=true).middleware(h)
+        first = HTTP.Request("GET", "/"); setip!(first, ip"198.51.100.1")
+        @test w(first).status == 200                          # fills the only slot
+        late = HTTP.Request("GET", "/"); setip!(late, newcomer)
+        out, _ = f421_run(() -> w(late))
+        @test (strategy, out isa ErrorException, calls[]) == (strategy, true, 1)
+    end
+end
+
+@testset "Rate limiter: through the pipeline, a failure below it is the app's 500 (unpatched)" begin
+    for strategy in (:fixed_window, :sliding_window), fail_open in (true, false)
+        calls = Threads.Atomic{Int}(0)
+        app = App(mod = @__MODULE__)
+        urlpatterns(app, "", path("/ok", () -> "ok"))
+        with_ip = handle -> (req -> (setip!(req, f421_ip); handle(req)))
+        below = handle -> f421_counting(calls, _ -> error("middleware below the limiter"))
+        rl = RateLimiter(; strategy, auto_extract_ip=false, fail_open)
+        r, msgs = f421_run(() -> internalrequest(app, HTTP.Request("GET", "/ok");
+                                                 middleware = [with_ip, rl, below]))
+        @test (strategy, fail_open, r.status, calls[], f421_limiter_logged(msgs)) ==
+              (strategy, fail_open, 500, 1, false)
+    end
+end
+
+@testset "Rate limiter: under catch_errors=false a route handler's exception runs once (unpatched)" begin
+    # With `catch_errors = false` the serializer does not catch, so a ROUTE HANDLER's exception
+    # reaches the limiter too -- under `fail_open` the handler itself used to run twice.
+    for strategy in (:fixed_window, :sliding_window), fail_open in (true, false)
+        calls = Threads.Atomic{Int}(0)
+        app = App(mod = @__MODULE__)
+        urlpatterns(app, "", path("/boom", () -> (Threads.atomic_add!(calls, 1); error("route boom"))))
+        with_ip = handle -> (req -> (setip!(req, f421_ip); handle(req)))
+        rl = RateLimiter(; strategy, auto_extract_ip=false, fail_open)
+        out, msgs = f421_run(() -> internalrequest(app, HTTP.Request("GET", "/boom");
+                                                   middleware = [with_ip, rl], catch_errors = false))
+        @test (strategy, fail_open, out isa ErrorException && out.msg == "route boom",
+               calls[], f421_limiter_logged(msgs)) == (strategy, fail_open, true, 1, false)
+    end
+end
+
+# A method on a test-owned `IPAddr` subtype makes `_bucket_key` throw an interrupt from INSIDE
+# `decide`, i.e. inside the limiter's own `try`. The type is test-owned, so this is not piracy.
+struct F421Interrupt <: Sockets.IPAddr end
+Nitro.Core.Middleware.RateLimiterMiddleware._bucket_key(::F421Interrupt, ::UInt128, ::UInt128) =
+    throw(InterruptException())
+
+@testset "Rate limiter: an interrupt inside the limiter propagates, never a 503 (unpatched)" begin
+    # #254's carve-out: `InterruptException`/`StackOverflowError`/`OutOfMemoryError` are not
+    # limiter outcomes. The old catch turned an interrupt into a 503, or under `fail_open`
+    # into a pass-through.
+    for strategy in (:fixed_window, :sliding_window), fail_open in (true, false)
+        calls = Threads.Atomic{Int}(0)
+        w = RateLimiter(; strategy, auto_extract_ip=false, fail_open).middleware(
+            f421_counting(calls, _ -> HTTP.Response(200, "ok")))
+        r = HTTP.Request("GET", "/"); setip!(r, F421Interrupt())
+        out, msgs = f421_run(() -> w(r))
+        @test (strategy, fail_open, out isa InterruptException, calls[], f421_limiter_logged(msgs)) ==
+              (strategy, fail_open, true, 0, false)
+    end
+end
+
+@testset "Rate limiter: its OWN failure still honours fail_open" begin
+    # A non-address in the `:ip` slot makes `_bucket_key` throw inside the limiter -- the
+    # failure `fail_open` is for. The fix narrows the `try`; it must not drop this path.
+    for strategy in (:fixed_window, :sliding_window), fail_open in (true, false)
+        calls = Threads.Atomic{Int}(0)
+        w = RateLimiter(; strategy, auto_extract_ip=false, fail_open).middleware(
+            f421_counting(calls, _ -> HTTP.Response(200, "ok")))
+        bad = HTTP.Request("GET", "/"); setip!(bad, "not-an-ip")
+        out, msgs = f421_run(() -> w(bad))
+        expected = fail_open ? (200, 1) : (503, 0)
+        @test (strategy, fail_open, out.status, calls[], f421_limiter_logged(msgs)) ==
+              (strategy, fail_open, expected..., true)
+    end
+end
+
 end # @testitem "Rate limiter construction and keying"
 
 
@@ -881,11 +1031,12 @@ using Nitro.Core.Middleware.RateLimiterMiddleware: BucketKey, _Stripe, _sweep_ex
 
 # White-box on purpose. Whether a bucket was reaped cannot be seen through the request path: an
 # expired bucket and a missing one give the same answer, which is exactly why reaping at `window`
-# is safe. So these read the store. It is a closure-local of `FixedRateLimiter`, captured by the
-# request-path closure that `.middleware` is under `auto_extract_ip=false`, and Julia names a
-# closure's fields after the variables it captures. Renaming that local turns this into a
-# `FieldError`, not a quiet pass — the fix is to follow the rename, not to drop the read.
-stripes_of(lf) = getfield(lf.middleware, :stripes)
+# is safe. So these read the store. It is a closure-local of `FixedRateLimiter`, captured by
+# `decide`, which the request-path closure that `.middleware` is under `auto_extract_ip=false`
+# captures in turn (#421); Julia names a closure's fields after the variables it captures.
+# Renaming either turns this into a `FieldError`, not a quiet pass — the fix is to follow the
+# rename, not to drop the read.
+stripes_of(lf) = getfield(getfield(lf.middleware, :decide), :stripes)
 buckets(lf) = sum(s -> lock(() -> length(s.store), s.lock), stripes_of(lf))
 
 ok_handler = _ -> HTTP.Response(200, "ok")

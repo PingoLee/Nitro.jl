@@ -3,6 +3,7 @@ using HTTP
 using Dates
 using Sockets
 using ...Core: getip, header_name_isequal, own_response_headers
+using ...Errors: is_unrecoverable
 
 # Import top level types module
 using ...Types 
@@ -57,6 +58,17 @@ RateLimiter(strategy = :sliding_window, rate_limit = 100,
 
 `serve()` and `path()`/`urlpatterns()` accept the result directly; only code composing a
 middleware chain by hand needs the `.middleware` field.
+
+# Errors
+
+`fail_open` is about the limiter's own failures: a request it cannot key (no client address),
+an error in its bookkeeping, a full store. An exception from anything *below* the limiter is
+never caught by it: a session store, a guard, a hand-composed handler, or under
+`catch_errors = false` (or `serialize = false`) the route handler itself. That exception
+propagates untouched and the downstream chain runs once (#421). It never becomes the limiter's
+`503`. Nitro's error handling answers it as it would any other: a `500`, or a `400` for a
+`ValidationError`. With `catch_errors = false` (or `serialize = false`), it reaches the server
+unhandled.
 """
 function RateLimiter(;strategy::Symbol = :fixed_window, kwargs...)
     # The element type is load-bearing: `Dict(kwargs)` narrows to the value type it happens to
@@ -407,11 +419,16 @@ end
 # `Retry-After` granularity is a second, and a sub-second window still has to say "1".
 _window_seconds(window::Period) = max(1, ceil(Int, Dates.toms(window) / 1000))
 
-# The lock-held decision both request paths return, as the first element of a concrete
-# `Tuple{Int,Int,Int}` (see the #364 note in `FixedRateLimiter`).
-const _ADMIT = 0
-const _LIMIT = 1
-const _FULL  = 2
+# The decision both strategies' `decide` returns, as the first element of a concrete
+# `Tuple{Int,Int,Int}` (see the #364 note in `FixedRateLimiter`). `_ADMIT`/`_LIMIT`/`_FULL` come
+# out of the lock; `_EXEMPT` and `_UNDECIDED` are reached before it. `_UNDECIDED` means the
+# limiter could not do its job -- no client address, or an error in its own bookkeeping -- so
+# `fail_open` picks the answer.
+const _ADMIT     = 0
+const _LIMIT     = 1
+const _FULL      = 2
+const _EXEMPT    = 3
+const _UNDECIDED = 4
 
 # A new client arrived at a full stripe. Outside the lock: it logs and may run the handler.
 #
@@ -429,6 +446,33 @@ function _refuse_new_client(handle::Function, req::HTTP.Request, fail_open::Bool
     resp = SERVICE_UNAVAILABLE()
     HTTP.setheader(resp, "Retry-After" => string(retry_after))
     return resp
+end
+
+# Acts on a decision -- the half of the request path that may run the downstream chain, shared
+# by both strategies. It is called OUTSIDE the limiter's `try` and reaches `handle(req)` at most
+# once, so whatever the chain throws propagates untouched to `ErrorBoundary` or the caller (#421).
+# Both strategies used to run this inside the `try` that guards their bookkeeping, so a
+# downstream exception was read as a limiter failure: logged under the limiter's label and
+# answered `503`, or under `fail_open` sent through the chain a second time.
+#
+# `limit_body` is the strategy's own 429 text; the two have always differed.
+function _respond(handle::Function, req::HTTP.Request, outcome::Int, remaining::Int,
+                  reset_time::Int, rate_limit::Int, fail_open::Bool, max_clients::Int,
+                  limit_body::String)
+    outcome == _EXEMPT && return handle(req)
+    # Fail closed by default: a bug or attacker-triggered error in the limiter must not become a
+    # way to bypass the limit. `fail_open = true` prefers availability instead.
+    outcome == _UNDECIDED && return fail_open ? handle(req) : SERVICE_UNAVAILABLE()
+    outcome == _FULL && return _refuse_new_client(handle, req, fail_open, reset_time, max_clients)
+    if outcome == _LIMIT
+        resp = HTTP.Response(429, limit_body)
+        set_rate_headers!(resp, rate_limit, 0, reset_time)
+        return resp
+    end
+    # Own the handler's (possibly shared/`const`) response before adding headers.
+    response = own_response_headers(handle(req))
+    set_rate_headers!(response, rate_limit, remaining, reset_time)
+    return response
 end
 
 # This limiter's janitor `work`, and the labels its failures are logged under — defined once so
@@ -467,7 +511,7 @@ Creates a middleware function that enforces rate limiting based on IP address, w
 - `auto_extract_ip::Bool`: If `true` (default), the middleware will automatically extract the client IP address from the request using the built-in extractor. Setting `false` is incompatible with `forwarded_header`/`trusted_proxies`, since nothing would then apply them.
 - `forwarded_header::Symbol`: Forwarded to [`ExtractIP`](@ref) — the single header your reverse proxy writes. Any value `ExtractIP` accepts, `:none` being the default. Must be set together with `trusted_proxies`.
 - `trusted_proxies`: Forwarded to [`ExtractIP`](@ref) — the proxies whose forwarding header may be believed, as `IPAddr` values or CIDR strings (`"10.244.0.0/16"`). The header is read only when the socket peer matches one of them.
-- `fail_open::Bool`: If `true`, an internal error in the limiter lets the request through instead of returning 503, and so does a *new* client arriving at a full store — admitted unrecorded, so a client rotating addresses while the store is full is not limited at all. Default `false` (fail closed).
+- `fail_open::Bool`: If `true`, an internal error in the limiter lets the request through instead of returning 503, and so does a *new* client arriving at a full store — admitted unrecorded, so a client rotating addresses while the store is full is not limited at all. Default `false` (fail closed). Only the limiter's own failures count: an exception from the downstream chain is never caught here, so it reaches Nitro's error handling unchanged and the chain runs once.
 - `exempt_paths::Vector{String}`: Request paths to skip rate limiting. Default is empty. Each entry covers whole path segments: `"/health"` exempts `/health`, `/health/live` and `/health?full=1`, but not `/healthz`. An entry ending in `/` covers only what is below it. Entries are compared with `req.target`, whose path is in canonical percent-encoding by the time middleware runs, so write them that way (`"/caf%C3%A9"`, not `"/café"`).
 - `ipv4_prefix::Int`: Network prefix length the IPv4 bucket key is masked to. Default 32 — one bucket per host, i.e. unchanged. Must be 1-32.
 - `ipv6_prefix::Int`: Network prefix length the IPv6 bucket key is masked to. Default 64. Must be 1-128. A single IPv6 host normally controls a whole /64, so keying on the full /128 lets a client rotate source addresses inside its own allocation and never reach the limit; /64 collapses the allocation onto one bucket. Widen to /48 if your clients hold /48s (Let's Encrypt limits this way), narrow only if you know your addressing.
@@ -554,105 +598,93 @@ function FixedRateLimiter(;
     on_startup, on_shutdown = _janitor(_sweep_work(stripes, window), cleanup_period,
                                        _SWEEP_LABEL, _SWEEP_WHAT, "cleanup_period")
 
-    function rate_limit_only(handle::Function)
-        return function(req::HTTP.Request)
-            try
+    # The limiter's own work for one request, and nothing else: it never calls `handle`, so the
+    # `try` around it in `rate_limit_only` catches only the limiter's failures (#421). Returns
+    # `(outcome, remaining_requests, reset_time)`; see `_ADMIT` and `_respond`.
+    function decide(req::HTTP.Request)::Tuple{Int,Int,Int}
+        _is_exempt(req.target, exempt_paths) && return (_EXEMPT, 0, 0)
 
-                # allow passthrough for exempt paths
-                _is_exempt(req.target, exempt_paths) && return handle(req)
+        # No client address means there is no bucket to key on. Without this guard the
+        # `nothing` reaches `_bucket_key` and fails closed via the catch, logging a backtrace
+        # per request. Honour `fail_open` the same way.
+        ip = getip(req)
+        if ip === nothing
+            @warn "Rate limiter: no client IP on this request; cannot apply a per-IP " *
+                  "limit. Put `ExtractIP` before the limiter, or leave " *
+                  "`auto_extract_ip=true`." maxlog=1
+            return (_UNDECIDED, 0, 0)
+        end
 
-                # No client address means there is no bucket to key on. Without this guard the
-                # `nothing` reaches `_bucket_key` and fails closed via the catch below, logging
-                # a backtrace per request. Honour `fail_open` the same way.
-                ip = getip(req)
-                if ip === nothing
-                    @warn "Rate limiter: no client IP on this request; cannot apply a per-IP " *
-                          "limit. Put `ExtractIP` before the limiter, or leave " *
-                          "`auto_extract_ip=true`." maxlog=1
-                    fail_open && return handle(req)
-                    return SERVICE_UNAVAILABLE()
-                end
+        # Derive the key and pick the stripe BEFORE taking the lock — neither needs it,
+        # and both used to run inside the critical section (`getip` was also called a
+        # second time in there).
+        key = _bucket_key(ip, v4mask, v6mask)
+        stripe = _stripe_for(stripes, key)
+        rate_limit_store = stripe.store
 
-                # Derive the key and pick the stripe BEFORE taking the lock — neither needs it,
-                # and both used to run inside the critical section (`getip` was also called a
-                # second time in there).
-                key = _bucket_key(ip, v4mask, v6mask)
-                stripe = _stripe_for(stripes, key)
-                rate_limit_store = stripe.store
+        # Each case RETURNS `(outcome, remaining_requests, reset_time)` as a concrete
+        # `Tuple{Int,Int,Int}` -- `outcome` is `_ADMIT`/`_LIMIT`/`_FULL`, and for `_FULL`
+        # the third slot is the `Retry-After`. These used to be locals declared above the
+        # block and assigned inside it, which boxed them and handed `set_rate_headers!`
+        # `Any`s on every request (#364) -- see the sliding limiter's note on the same
+        # shape. `test/closure_boxing_tests.jl` now fails on any boxed closure in Nitro.
+        return lock(stripe.lock) do
+            current_time = now(UTC)
 
-                # Each case RETURNS `(outcome, remaining_requests, reset_time)` as a concrete
-                # `Tuple{Int,Int,Int}` -- `outcome` is `_ADMIT`/`_LIMIT`/`_FULL`, and for `_FULL`
-                # the third slot is the `Retry-After`. These used to be locals declared above the
-                # block and assigned inside it, which boxed them and handed `set_rate_headers!`
-                # `Any`s on every request (#364) -- see the sliding limiter's note on the same
-                # shape. `test/closure_boxing_tests.jl` now fails on any boxed closure in Nitro.
-                outcome, remaining_requests, reset_time = lock(stripe.lock) do
-                    current_time = now(UTC)
+            if haskey(rate_limit_store, key)
+                count, last_reset = rate_limit_store[key]
 
-                    if haskey(rate_limit_store, key)
-                        count, last_reset = rate_limit_store[key]
-
-                        # Case 2: Expired Window
-                        if current_time - last_reset > window
-                            rate_limit_store[key] = (1, current_time)
-                            # Reset to current time, so reset time is full window period
-                            return (_ADMIT, rate_limit - 1,
-                                    calculate_reset_time(current_time, current_time, window))
-
-                        # Case 3: Limit Exceeded
-                        elseif count >= rate_limit
-                            # Use original last_reset to calculate remaining time
-                            return (_LIMIT, 0, calculate_reset_time(current_time, last_reset, window))
-
-                        # Case 4: Within Limit
-                        else
-                            rate_limit_store[key] = (count + 1, last_reset)
-                            # Calculate reset based on original last_reset
-                            return (_ADMIT, rate_limit - (count + 1),
-                                    calculate_reset_time(current_time, last_reset, window))
-                        end
-                    end
-
-                    # Case 1: New IP -- the only case that grows the store, so the only one that
-                    # can find it full (#403). A full stripe refuses; it never evicts.
-                    if !_has_room!(stripe, per_stripe, window, current_time)
-                        return (_FULL, 0,
-                                _retry_after(stripe.next_reap[], current_time, window_seconds))
-                    end
-                    bucket = (1, current_time)
-                    rate_limit_store[key] = bucket
-                    _note_expiry!(stripe, _expires_at(bucket, window))
-                    # Start from current time, full window period
+                # Case 2: Expired Window
+                if current_time - last_reset > window
+                    rate_limit_store[key] = (1, current_time)
+                    # Reset to current time, so reset time is full window period
                     return (_ADMIT, rate_limit - 1,
                             calculate_reset_time(current_time, current_time, window))
-                end
 
-                outcome == _FULL &&
-                    return _refuse_new_client(handle, req, fail_open, reset_time, max_clients)
+                # Case 3: Limit Exceeded
+                elseif count >= rate_limit
+                    # Use original last_reset to calculate remaining time
+                    return (_LIMIT, 0, calculate_reset_time(current_time, last_reset, window))
 
-                # Prepare the response
-                if outcome == _LIMIT
-                    # Create a new response for rate-limited requests
-                    response = HTTP.Response(429, "Rate limit exceeded")
-                    set_rate_headers!(response, rate_limit, 0, reset_time)
-                    return response
+                # Case 4: Within Limit
                 else
-                    # Get the response, then own its headers before adding ours — the
-                    # handler's response may be a shared/`const` object.
-                    response = own_response_headers(handle(req))
-                    # Add rate limit headers to successful responses
-                    set_rate_headers!(response, rate_limit, remaining_requests, reset_time)
-                    return response
+                    rate_limit_store[key] = (count + 1, last_reset)
+                    # Calculate reset based on original last_reset
+                    return (_ADMIT, rate_limit - (count + 1),
+                            calculate_reset_time(current_time, last_reset, window))
                 end
-
-            catch error
-                @error "Fixed Rate limiter error" exception=(error, catch_backtrace())
-                # Fail closed by default: a bug or attacker-triggered error in the
-                # limiter must not become a way to bypass the limit. Operators can
-                # opt into fail-open (prioritising availability) via `fail_open=true`.
-                fail_open && return handle(req)
-                return SERVICE_UNAVAILABLE()
             end
+
+            # Case 1: New IP -- the only case that grows the store, so the only one that
+            # can find it full (#403). A full stripe refuses; it never evicts.
+            if !_has_room!(stripe, per_stripe, window, current_time)
+                return (_FULL, 0,
+                        _retry_after(stripe.next_reap[], current_time, window_seconds))
+            end
+            bucket = (1, current_time)
+            rate_limit_store[key] = bucket
+            _note_expiry!(stripe, _expires_at(bucket, window))
+            # Start from current time, full window period
+            return (_ADMIT, rate_limit - 1,
+                    calculate_reset_time(current_time, current_time, window))
+        end
+    end
+
+    function rate_limit_only(handle::Function)
+        return function(req::HTTP.Request)
+            # The `try` covers `decide` ONLY. It used to wrap the whole request, `handle(req)`
+            # included, which is #421 -- see `_respond`.
+            outcome, remaining_requests, reset_time = try
+                decide(req)
+            catch error
+                # An interrupt, a stack overflow or an out-of-memory is not a limiter outcome
+                # (#254) -- the same carve-out every other middleware `catch` makes.
+                is_unrecoverable(error) && rethrow()
+                @error "Fixed Rate limiter error" exception=(error, catch_backtrace())
+                (_UNDECIDED, 0, 0)
+            end
+            return _respond(handle, req, outcome, remaining_requests, reset_time,
+                            rate_limit, fail_open, max_clients, "Rate limit exceeded")
         end
     end
 
@@ -685,7 +717,7 @@ offering more precise rate limiting than fixed windows but with higher memory us
 - `auto_extract_ip::Bool`: If true, automatically extract IP address from request. Default true. Setting `false` is incompatible with `forwarded_header`/`trusted_proxies`, since nothing would then apply them.
 - `forwarded_header::Symbol`: Forwarded to [`ExtractIP`](@ref) — the single header your reverse proxy writes. Any value `ExtractIP` accepts, `:none` being the default. Must be set together with `trusted_proxies`.
 - `trusted_proxies`: Forwarded to [`ExtractIP`](@ref) — the proxies whose forwarding header may be believed, as `IPAddr` values or CIDR strings (`"10.244.0.0/16"`). The header is read only when the socket peer matches one of them.
-- `fail_open::Bool`: If `true`, an internal error in the limiter lets the request through instead of returning 503, and so does a *new* client arriving at a full store — admitted unrecorded, so a client rotating addresses while the store is full is not limited at all. Default `false` (fail closed).
+- `fail_open::Bool`: If `true`, an internal error in the limiter lets the request through instead of returning 503, and so does a *new* client arriving at a full store — admitted unrecorded, so a client rotating addresses while the store is full is not limited at all. Default `false` (fail closed). Only the limiter's own failures count: an exception from the downstream chain is never caught here, so it reaches Nitro's error handling unchanged and the chain runs once.
 - `ipv4_prefix::Int`: Network prefix length the IPv4 bucket key is masked to. Default 32 — one bucket per host, i.e. unchanged. Must be 1-32.
 - `ipv6_prefix::Int`: Network prefix length the IPv6 bucket key is masked to. Default 64. Must be 1-128. A single IPv6 host normally controls a whole /64, so keying on the full /128 lets a client rotate source addresses inside its own allocation and never reach the limit; /64 collapses the allocation onto one bucket. Widen to /48 if your clients hold /48s (Let's Encrypt limits this way), narrow only if you know your addressing.
 
@@ -774,110 +806,100 @@ function SlidingRateLimiter(;
         end
     end
 
+    # The limiter's own work for one request; it never calls `handle` (#421). See the fixed
+    # limiter's `decide`.
+    function decide(req::HTTP.Request)::Tuple{Int,Int,Int}
+        # Check exempt paths first (most efficient early return)
+        _is_exempt(req.target, exempt_paths) && return (_EXEMPT, 0, 0)
+
+        # No client address means there is no bucket to key on. Without this guard the
+        # `nothing` reaches `_bucket_key` and fails closed via the catch, logging a backtrace
+        # per request. Honour `fail_open` the same way.
+        ip = getip(req)
+        if ip === nothing
+            @warn "Rate limiter: no client IP on this request; cannot apply a per-IP " *
+                  "limit. Put `ExtractIP` before the limiter, or leave " *
+                  "`auto_extract_ip=true`." maxlog=1
+            return (_UNDECIDED, 0, 0)
+        end
+
+        # Derive the key and pick the stripe BEFORE taking the lock — see the fixed
+        # limiter for why (`getip` used to be called a second time inside it).
+        key = _bucket_key(ip, v4mask, v6mask)
+        stripe = _stripe_for(stripes, key)
+        rate_limit_store = stripe.store
+
+        # CONCURRENCY (nitro-core §2) — DO NOT call `handle(req)` in here.
+        # Nitro serves every request via `Threads.@spawn`; this lock is shared
+        # by every client whose key lands on this stripe, so anything held
+        # under it is serialised. Running the downstream chain here made one
+        # slow handler block every other request from every IP (#15).
+        #
+        # The lock guards the stripe's `Dict` and the *shared mutable*
+        # `Vector{DateTime}` it hands back, so every read/write of `timestamps`
+        # must stay inside this block.
+        #
+        # The decision is returned as a concrete `Tuple{Int,Int,Int}` rather
+        # than assigned to hoisted locals: assigning an enclosing-scope local
+        # from inside a closure boxes it, which would hand `set_rate_headers!`
+        # three `Any`s on the request hot path (nitro-core §7). `outcome` is
+        # `_ADMIT`/`_LIMIT`/`_FULL`; for `_FULL` the third slot is the `Retry-After`.
+        return lock(stripe.lock) do
+            current_time = now(UTC)
+
+            # A new client is the only thing that grows the store, so it is the only
+            # thing that can find it full (#403). A full stripe refuses; it never evicts.
+            existing = get(rate_limit_store, key, nothing)
+            if existing === nothing
+                if !_has_room!(stripe, per_stripe, window, current_time)
+                    return (_FULL, 0,
+                            _retry_after(stripe.next_reap[], current_time, window_seconds))
+                end
+                timestamps = DateTime[]
+                rate_limit_store[key] = timestamps
+                # A new bucket is never throttled (`rate_limit > 0`), so the `push!`
+                # below always records `current_time`; note that expiry now.
+                _note_expiry!(stripe, current_time + window)
+            else
+                timestamps = existing
+            end
+
+            # Prune expired timestamps (sliding window cleanup)
+            # Keep only timestamps within the current window
+            cutoff_time = current_time - window
+            filter!(timestamp -> timestamp > cutoff_time, timestamps)
+
+            # Check if adding this request would exceed the limit
+            if length(timestamps) >= rate_limit
+                return (_LIMIT, 0, compute_reset_time_safe(current_time, timestamps))
+            end
+
+            # Within the limit: consume the slot and snapshot the header values
+            # now, while the vector is still guarded. These are the same values
+            # the old code produced — it computed them after `handle(req)`, but
+            # the vector could not change meanwhile because the lock was
+            # (wrongly) held across the handler.
+            push!(timestamps, current_time)
+            # Remaining quota, and time until the oldest request expires (when
+            # 1 slot becomes available).
+            return (_ADMIT, rate_limit - length(timestamps),
+                    compute_reset_time_safe(current_time, timestamps))
+        end
+    end
+
     function rate_limit_only(handle::Function)
         return function(req::HTTP.Request)
-            try
-                # Check exempt paths first (most efficient early return)
-                _is_exempt(req.target, exempt_paths) && return handle(req)
-
-                # No client address means there is no bucket to key on. Without this guard the
-                # `nothing` reaches `_bucket_key` and fails closed via the catch below, logging
-                # a backtrace per request. Honour `fail_open` the same way.
-                ip = getip(req)
-                if ip === nothing
-                    @warn "Rate limiter: no client IP on this request; cannot apply a per-IP " *
-                          "limit. Put `ExtractIP` before the limiter, or leave " *
-                          "`auto_extract_ip=true`." maxlog=1
-                    fail_open && return handle(req)
-                    return SERVICE_UNAVAILABLE()
-                end
-
-                # Derive the key and pick the stripe BEFORE taking the lock — see the fixed
-                # limiter for why (`getip` used to be called a second time inside it).
-                key = _bucket_key(ip, v4mask, v6mask)
-                stripe = _stripe_for(stripes, key)
-                rate_limit_store = stripe.store
-
-                # CONCURRENCY (nitro-core §2) — DO NOT call `handle(req)` in here.
-                # Nitro serves every request via `Threads.@spawn`; this lock is shared
-                # by every client whose key lands on this stripe, so anything held
-                # under it is serialised. Running the downstream chain here made one
-                # slow handler block every other request from every IP (#15).
-                #
-                # The lock guards the stripe's `Dict` and the *shared mutable*
-                # `Vector{DateTime}` it hands back, so every read/write of `timestamps`
-                # must stay inside this block.
-                #
-                # The decision is returned as a concrete `Tuple{Int,Int,Int}` rather
-                # than assigned to hoisted locals: assigning an enclosing-scope local
-                # from inside a closure boxes it, which would hand `set_rate_headers!`
-                # three `Any`s on the request hot path (nitro-core §7). `outcome` is
-                # `_ADMIT`/`_LIMIT`/`_FULL`; for `_FULL` the third slot is the `Retry-After`.
-                outcome, remaining_requests, reset_time = lock(stripe.lock) do
-                    current_time = now(UTC)
-
-                    # A new client is the only thing that grows the store, so it is the only
-                    # thing that can find it full (#403). A full stripe refuses; it never evicts.
-                    existing = get(rate_limit_store, key, nothing)
-                    if existing === nothing
-                        if !_has_room!(stripe, per_stripe, window, current_time)
-                            return (_FULL, 0,
-                                    _retry_after(stripe.next_reap[], current_time, window_seconds))
-                        end
-                        timestamps = DateTime[]
-                        rate_limit_store[key] = timestamps
-                        # A new bucket is never throttled (`rate_limit > 0`), so the `push!`
-                        # below always records `current_time`; note that expiry now.
-                        _note_expiry!(stripe, current_time + window)
-                    else
-                        timestamps = existing
-                    end
-
-                    # Prune expired timestamps (sliding window cleanup)
-                    # Keep only timestamps within the current window
-                    cutoff_time = current_time - window
-                    filter!(timestamp -> timestamp > cutoff_time, timestamps)
-
-                    # Check if adding this request would exceed the limit
-                    if length(timestamps) >= rate_limit
-                        return (_LIMIT, 0, compute_reset_time_safe(current_time, timestamps))
-                    end
-
-                    # Within the limit: consume the slot and snapshot the header values
-                    # now, while the vector is still guarded. These are the same values
-                    # the old code produced — it computed them after `handle(req)`, but
-                    # the vector could not change meanwhile because the lock was
-                    # (wrongly) held across the handler.
-                    push!(timestamps, current_time)
-                    # Remaining quota, and time until the oldest request expires (when
-                    # 1 slot becomes available).
-                    return (_ADMIT, rate_limit - length(timestamps),
-                            compute_reset_time_safe(current_time, timestamps))
-                end
-
-                outcome == _FULL &&
-                    return _refuse_new_client(handle, req, fail_open, reset_time, max_clients)
-
-                # Prepare the response — outside the lock, so a slow handler delays
-                # only its own request.
-                if outcome == _LIMIT
-                    resp = HTTP.Response(429, "429 Too Many Requests")
-                    set_rate_headers!(resp, rate_limit, 0, reset_time)
-                    return resp
-                else
-                    # Own the handler's (possibly shared/`const`) response before adding headers.
-                    response = own_response_headers(handle(req))
-                    set_rate_headers!(response, rate_limit, remaining_requests, reset_time)
-                    return response
-                end
-
+            # The `try` covers `decide` ONLY (#421) -- the response, and with it the
+            # downstream chain, is `_respond`'s, outside the lock and outside the `try`.
+            outcome, remaining_requests, reset_time = try
+                decide(req)
             catch error
+                is_unrecoverable(error) && rethrow()   # #254, as in the fixed limiter
                 @error "Sliding Window Rate limiter error" exception=(error, catch_backtrace())
-                # Fail closed by default so a limiter error can't be used to bypass
-                # the limit; set `fail_open=true` to prioritise availability instead.
-                fail_open && return handle(req)
-                return SERVICE_UNAVAILABLE()
+                (_UNDECIDED, 0, 0)
             end
+            return _respond(handle, req, outcome, remaining_requests, reset_time,
+                            rate_limit, fail_open, max_clients, "429 Too Many Requests")
         end
     end
 
