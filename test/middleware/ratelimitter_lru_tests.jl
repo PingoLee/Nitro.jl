@@ -1,4 +1,4 @@
-﻿@testitem "Rate limiter LRU" tags=[:middleware, :network, :slow] setup=[NitroCommon] begin
+﻿@testitem "Sliding rate limiter" tags=[:middleware, :network, :slow] setup=[NitroCommon] begin
 using HTTP
 using Dates
 using Nitro
@@ -406,12 +406,13 @@ end
     @test all(r -> r.status == 200, fetch.(inflight))
 end
 
-# ── Lock striping: the size-bounded store must not evict early (#22) ──────────
-# The sliding limiter's LRU is size-bounded, and striping divides `max_clients` across
-# the stripes. Naively splitting a small cache 16 ways would evict a client while the
-# store held a fraction of what the caller asked for -- silently, and looking like the
-# limit simply reset. `_bounded_stripe_count` collapses small caches to a single stripe
-# to keep the caller's bound meaningful.
+# ── Lock striping: the size-bounded store must not fill early (#22, #403) ─────
+# The sliding limiter's store is size-bounded, and striping divides `max_clients` across
+# the stripes. Naively splitting a small store 16 ways would turn a client away while the
+# store held a fraction of what the caller asked for. (Before #403 a full stripe EVICTED,
+# which looked like the limit simply reset; now it refuses the newcomer.)
+# `_bounded_stripe_count` collapses small stores to a single stripe to keep the caller's
+# bound meaningful.
 
 @testset "Sliding limiter: stripe count keeps max_clients honest" begin
     bsc = Nitro.Core.RateLimiterMiddleware._bounded_stripe_count
@@ -433,17 +434,24 @@ end
     end
 end
 
-@testset "Sliding limiter: stripes evict independently" begin
-    # The property striping actually introduces: each stripe has its OWN LRU budget, so
-    # flooding one stripe must not evict buckets held by another -- otherwise the victim
-    # silently gets a fresh quota, which is a rate-limit bypass.
+@testset "Sliding limiter: stripes fill independently, and a full one never evicts" begin
+    # The property striping introduces: each stripe has its OWN budget, so flooding one
+    # stripe must not touch buckets held by another, nor exhaust the other's capacity.
     #
-    # Which assertion catches which regression (simulated against both buggy shapes):
-    #   selection collapsed onto one stripe -> the MIDDLE assertion fires (victim evicted
-    #     by the other stripe's flood).
-    #   stripes sharing one store of 128    -> the middle assertion still passes (85 entries
-    #     in a 128 store evicts nothing); the FINAL assertion is what fires.
-    # So the non-vacuousness check at the end is load-bearing, not decoration.
+    # This test used to end by asserting that flooding the victim's OWN stripe EVICTED it
+    # (the victim's next request was admitted on a fresh quota). That was the LRU's
+    # behaviour, recorded as proof the middle assertion was not vacuous -- and it is the
+    # exploit #403 reports: a client rotating past the cap resets everyone's quota,
+    # including its own. A full stripe now refuses the newcomer, so the victim stays
+    # throttled and the flood's overflow gets 503.
+    #
+    # Which assertion catches which regression:
+    #   selection collapsed onto one stripe -> the stripe-2 flood lands beside the victim,
+    #     so it is refused one entry early (`flood2`).
+    #   stripes sharing one store           -> likewise: the victim's bucket counts against
+    #     stripe 2's budget, so `flood2` is refused one entry early.
+    #   eviction instead of refusal         -> `flood1` is all 200s and the victim's final
+    #     request is a 200.
     #
     # White-box on purpose: the stripe index is `hash(key) & (n-1)`, so the keys are sorted
     # into stripes here the same way the limiter does it. max_clients=128 gives exactly
@@ -474,20 +482,21 @@ end
     @test wrapped(req_from(victim)).status == 200
     @test wrapped(req_from(victim)).status == 429
 
-    # Flood stripe 2 with far more than its own budget. None of these touch stripe 1.
-    for ip in by_stripe[2][1:(per_stripe + 20)]
-        wrapped(req_from(ip))
-    end
+    # Flood stripe 2 with far more than its own budget. None of these touch stripe 1:
+    # stripe 2 admits exactly its budget and refuses the rest.
+    flood2 = [wrapped(req_from(ip)).status for ip in by_stripe[2][1:(per_stripe + 20)]]
+    @test flood2 == [fill(200, per_stripe); fill(503, 20)]
 
     # The victim's bucket must be untouched -- still out of quota.
     @test wrapped(req_from(victim)).status == 429
 
-    # And flooding the victim's OWN stripe past its budget does evict it, which is what
-    # proves the assertion above was not vacuous.
-    for ip in by_stripe[1][2:(per_stripe + 20)]
-        wrapped(req_from(ip))
-    end
-    @test wrapped(req_from(victim)).status == 200
+    # Stripe 1 still has its own full budget: the victim holds one slot, so exactly
+    # `per_stripe - 1` newcomers fit before it refuses.
+    flood1 = [wrapped(req_from(ip)).status for ip in by_stripe[1][2:(per_stripe + 20)]]
+    @test flood1 == [fill(200, per_stripe - 1); fill(503, 20)]
+
+    # And the full stripe did not make room by evicting the victim (#403).
+    @test wrapped(req_from(victim)).status == 429
 end
 
 end

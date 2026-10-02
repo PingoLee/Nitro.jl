@@ -3,8 +3,8 @@
 # numbers isolate the limiter from `ExtractIP` and from the socket layer:
 #
 #   single_key  — uncontended lock + keying cost per request
-#   many_keys   — the same, rotating over distinct clients (bucket lookup, and for
-#                 the sliding limiter, LRU behaviour)
+#   many_keys   — the same, rotating over distinct clients (bucket lookup; 1024 keys,
+#                 well under the default `max_clients`, so no request is refused)
 #   contended   — N concurrent tasks on DISTINCT keys. Before striping, every one of
 #                 them serialises on the single `store_lock` even though their buckets
 #                 are independent; this is the benchmark the striping has to move.
