@@ -281,7 +281,7 @@ function _collect_leaf_methods!(acc::Vector{String}, node::HTTP.Handlers.Node,
     return nothing
 end
 
-function setupmiddleware(ctx::App; middleware::Vector=[], serialize::Bool=true, catch_errors::Bool=true, show_errors::Bool=true, access_log=false, access_log_query::Bool=false, access_log_skip::Union{Nothing,Function}=nothing)::Function
+function setupmiddleware(ctx::App; middleware::Vector=[], serialize::Bool=true, catch_errors::Bool=true, show_errors::Bool=true, access_log=false, access_log_query::Bool=false, access_log_skip::Union{Nothing,Function}=nothing, security_headers::Union{Nothing,SecurityHeaders}=nothing)::Function
     # `normalize_middleware`, NOT `process_middleware`: this runs once per `serve` but ONCE
     # PER CALL from `internalrequest`, so it must have no registration side effect. `serve`
     # registers explicitly, just before it calls this. (#68)
@@ -300,6 +300,7 @@ function setupmiddleware(ctx::App; middleware::Vector=[], serialize::Bool=true, 
     error_boundary = serialize && catch_errors ? [ErrorBoundary(catch_errors; show_errors)] : []
     # Accept `true` to enable; `nothing`/`false` (or the old logfmt value) disable it.
     access_log_middleware = access_log === true ? [AccessLogMiddleware(; log_query=access_log_query, skip=access_log_skip)] : []
+    security_layer = security_headers === nothing ? [] : [security_headers]
 
     # `compose` is installed UNCONDITIONALLY (#71). The old gate here — install it only if
     # `custommiddleware` was already non-empty — was evaluated once, and `serve` calls this
@@ -362,6 +363,11 @@ function setupmiddleware(ctx::App; middleware::Vector=[], serialize::Bool=true, 
         # Outside every layer that can throw, inside the access log so that log line records
         # the 500 this produces (#256).
         error_boundary...,
+        # `serve(security_headers = …)` (#402). Outside every layer that builds its own response
+        # -- the error boundary's 500, OriginForm's 400, the prefix strip's 404 -- so an app that
+        # opts in gets the headers on all of them, not only on what comes back through `compose`.
+        # The 400 and 404 are shared `const`s; `SecurityHeaders` rebuilds, never mutates.
+        security_layer...,
         access_log_middleware...,
         _app_context_seed(ctx),
     ])
@@ -374,7 +380,8 @@ end
 # owns it: drain it with `HTTP.body_read!` until it reports 0, or call `HTTP.body_close!`. Until
 # then the file handle stays open, which on Windows also blocks deleting the file. Over a real
 # socket none of this applies — the write path always closes.
-function internalrequest(ctx::App, req::HTTP.Request; middleware::Vector=[], serialize::Bool=true, catch_errors=true, context=missing)::HTTP.Response
+function internalrequest(ctx::App, req::HTTP.Request; middleware::Vector=[], serialize::Bool=true, catch_errors=true, context=missing,
+                         security_headers::Union{Nothing,SecurityHeaders}=nothing)::HTTP.Response
     # Loopback only when the request carries no address (#330). Overwriting one handed every
     # internal call the one address loopback-trusting checks accept, including a call made on
     # behalf of an outside client whose own address was already on the request.
@@ -409,5 +416,5 @@ function internalrequest(ctx::App, req::HTTP.Request; middleware::Vector=[], ser
     # does not inherit a previous call's context" item in test/appcontext_race_tests.jl.
     req.context[REQUEST_CONTEXT_KEY] = ismissing(context) ? ctx.app_context[] : Context(context)
 
-    return req |> setupmiddleware(ctx; middleware, serialize, catch_errors)
+    return req |> setupmiddleware(ctx; middleware, serialize, catch_errors, security_headers)
 end

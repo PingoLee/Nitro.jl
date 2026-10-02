@@ -136,4 +136,85 @@ end
     @test :SecurityHeaders in names(Nitro)
 end
 
+@testset "A response that already carries every header is returned as-is" begin
+    # The nested case `serve(security_headers=…)` invites: a router's own `SecurityHeaders()`
+    # already set them all, so the outer layer has nothing to add and must not rebuild.
+    full = HTTP.Response(200, ["X-Content-Type-Options" => "nosniff", "X-Frame-Options" => "DENY",
+                               "Referrer-Policy" => "no-referrer"], "ok")
+    @test wrap(SecurityHeaders(), _ -> full)(HTTP.Request("GET", "/")) === full
+end
+
+@testset "It is a callable value that still drops into a middleware list" begin
+    # #402 made it a struct, so `serve(security_headers = …)` can read its frozen pairs for the
+    # transport refusals. `<: Function` keeps every `middleware = [SecurityHeaders()]` working.
+    sh = SecurityHeaders(csp = "default-src 'self'")
+    @test sh isa Function
+    @test ("Content-Security-Policy" => "default-src 'self'") in sh.headers
+    off = SecurityHeaders(content_type_options = nothing, frame_options = nothing,
+                          referrer_policy = nothing)
+    inner = _ -> HTTP.Response(200, "ok")
+    @test off(inner) === inner                     # still a pass-through when nothing is on
+end
+
+end
+
+# #402. As ordinary middleware `SecurityHeaders` sits inside `compose`, so every response built
+# OUTSIDE it went out bare: OriginForm's 400, the prefix strip's 404, ErrorBoundary's 500.
+# `serve(security_headers = …)` installs it as a framework layer outside all three. Driven through
+# `internalrequest`, which runs the same `setupmiddleware` as `serve`, prefix included.
+@testitem "SecurityHeaders as a framework layer" tags=[:middleware, :security] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+
+app = App(mod = @__MODULE__)
+urlpatterns(app, "", path("/ok", () -> "ok"))
+sh = SecurityHeaders(hsts = 600)
+boom = handle -> req -> error("middleware boom")
+nosniff(resp) = HTTP.header(resp, "X-Content-Type-Options", "")
+hsts(resp) = HTTP.header(resp, "Strict-Transport-Security", "")
+
+get_(target; kw...) = internalrequest(app, HTTP.Request("GET", target); kw...)
+
+@testset "every framework-built response carries the headers" begin
+    @test nosniff(get_("/ok"; security_headers = sh)) == "nosniff"
+    @test hsts(get_("/ok"; security_headers = sh)) == "max-age=600; includeSubDomains"
+    @test nosniff(get_("/nope"; security_headers = sh)) == "nosniff"          # router 404
+
+    bad = get_("//x"; security_headers = sh)                                   # OriginForm 400
+    @test bad.status == 400
+    @test nosniff(bad) == "nosniff"                                            # (unpatched: "")
+
+    err = @test_logs (:error,) match_mode=:any get_("/ok"; middleware = [boom], security_headers = sh)
+    @test err.status == 500                                                    # ErrorBoundary 500
+    @test nosniff(err) == "nosniff"                                            # (unpatched: "")
+end
+
+@testset "the prefix strip's 404 carries them too" begin
+    app.service.prefix[] = "/api"
+    try
+        miss = get_("/elsewhere"; security_headers = sh)
+        @test miss.status == 404
+        @test nosniff(miss) == "nosniff"                                       # (unpatched: "")
+        @test get_("/api/ok"; security_headers = sh).status == 200
+    finally
+        app.service.prefix[] = nothing
+    end
+end
+
+@testset "the shared const 400/404 are never mutated, and the default stays opt-in" begin
+    for _ in 1:3
+        @test length(HTTP.headers(get_("//x"; security_headers = sh), "X-Frame-Options")) == 1
+    end
+    # Same pipeline objects, no keyword: still bare, so nothing leaked into the shared responses.
+    @test nosniff(get_("//x")) == ""
+    @test nosniff(get_("/ok")) == ""
+end
+
+@testset "an app-level SecurityHeaders beside it adds no second copy" begin
+    resp = get_("/ok"; middleware = [SecurityHeaders(frame_options = "SAMEORIGIN")],
+                security_headers = sh)
+    # The inner (route-adjacent) choice wins, as for any header an inner layer already set.
+    @test HTTP.headers(resp, "X-Frame-Options") == ["SAMEORIGIN"]
+end
 end

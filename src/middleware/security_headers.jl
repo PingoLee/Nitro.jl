@@ -73,9 +73,34 @@ the directive as invalid (RFC 7034 §2.1), which drops the protection rather tha
 a route that deliberately answers `X-Frame-Options: SAMEORIGIN` keeps it, even under an app-wide
 `SecurityHeaders()` defaulting to `DENY`.
 
+# Which responses it reaches
+
+Installed as ordinary middleware (`serve(middleware = [SecurityHeaders()])`), it sits inside the
+router's middleware chain, so it **cannot** reach the responses the framework builds outside that
+chain: the `400` for a malformed request-target, the `404` for a path outside
+`serve(prefix = …)`, the `500` for an exception thrown by a middleware, and the transport's `413`
+(over `max_body_bytes`) and `503` (over `max_concurrent_requests`). Those are exactly the
+responses scanners elicit.
+
+To put the headers on **every** response Nitro sends, pass it to `serve` instead (#402):
+
+```julia
+serve(security_headers = SecurityHeaders(hsts = Day(365)))
+```
+
+That installs it as a framework layer outside all of those, and hands the same header pairs to the
+transport refusals. It is still opt-in: the keyword defaults to `nothing`. A per-router
+`SecurityHeaders()` beside it adds no second copy, because each header is a default, not an
+override (above). Outside either form: a malformed request HTTP.jl rejects before Nitro sees it,
+the bare `500` HTTP.jl writes when `serve(catch_errors = false)` lets an exception escape, and a
+WebSocket refusal written by HTTP.jl's own upgrade.
+
 # Returns
-A middleware closure compatible with the Nitro middleware pipeline. It owns no background
-resource, so it is a plain `handle -> req -> resp` closure rather than a `LifecycleMiddleware`.
+A `SecurityHeaders` value, callable as middleware (`handle -> req -> resp`) and a subtype of
+`Function`, so it drops into any middleware list. It owns no background resource, so it is not a
+`LifecycleMiddleware`. `sh.headers` is the `Vector{Pair{String,String}}` it adds; treat it as
+read-only, since every request (and the transport's refusals) shares it. Build values with the
+keyword constructor: it is the one that validates HSTS.
 
 # Examples
 
@@ -95,6 +120,16 @@ SecurityHeaders(content_type_options = nothing, frame_options = nothing,
                 extra_headers = ["Cross-Origin-Opener-Policy" => "same-origin"])
 ```
 """
+struct SecurityHeaders <: Function
+    # Every header is known at construction time -- none of them depends on the request -- so the
+    # vector is built once and only read per request. Nothing writes it after construction, which
+    # is what keeps it safe to share across threads and with the transport (#402).
+    headers :: Vector{Pair{String, String}}
+end
+
+Base.show(io::IO, sh::SecurityHeaders) =
+    print(io, "SecurityHeaders(", join((first(p) for p in sh.headers), ", "), ")")
+
 function SecurityHeaders(;
     content_type_options    :: Nullable{String} = "nosniff",
     frame_options           :: Nullable{String} = "DENY",
@@ -144,41 +179,43 @@ function SecurityHeaders(;
 
     csp === nothing || push!(headers, "Content-Security-Policy" => csp)
     append!(headers, extra_headers)
+    return SecurityHeaders(headers)
+end
 
-    # Every header is known at construction time -- none of them depends on the request -- so the
-    # vector is built once here and only read per request. Nothing is assigned inside the innermost
-    # closure, which is what keeps it safe to share across threads.
-    frozen = headers
+function (sh::SecurityHeaders)(handle::Function)
+    frozen = sh.headers
 
     # Everything was disabled. Hand back a pass-through rather than rebuilding each response to
     # add nothing: `add_response_headers` allocates a new `HTTP.Response` on every call, and doing
     # that for an empty header list is pure cost on the request hot path.
-    isempty(frozen) && return handle::Function -> handle
+    isempty(frozen) && return handle
 
-    return function(handle::Function)
-        return function(req::HTTP.Request)
-            resp = handle(req)
+    return function(req::HTTP.Request)
+        resp = handle(req)
 
-            # A NEW response, never a mutation of the one the inner layer returned. That response
-            # may be a shared module-level `const` (an auth rejection, a cached error), and Nitro
-            # serves every request on its own thread -- so `setheader` here would both leak these
-            # headers across requests and race. See nitro-core §4.
-            #
-            # Fast path: the inner layer set none of these, which is almost every response. The
-            # `any` scan itself allocates nothing and the shared `frozen` vector is appended as-is,
-            # so this path costs exactly what the middleware cost before the conflict check existed
-            # -- it is not allocation-free, because `add_response_headers` builds a new `Response`
-            # by design, and nothing here should be "optimized" on the belief that it was.
-            any(p -> HTTP.hasheader(resp, p.first), frozen) || return add_response_headers(resp, frozen)
+        # A NEW response, never a mutation of the one the inner layer returned. That response
+        # may be a shared module-level `const` (an auth rejection, a cached error), and Nitro
+        # serves every request on its own thread -- so `setheader` here would both leak these
+        # headers across requests and race. See nitro-core §4.
+        #
+        # Fast path: the inner layer set none of these, which is almost every response. The
+        # `any` scan itself allocates nothing and the shared `frozen` vector is appended as-is,
+        # so this path costs exactly what the middleware cost before the conflict check existed
+        # -- it is not allocation-free, because `add_response_headers` builds a new `Response`
+        # by design, and nothing here should be "optimized" on the belief that it was.
+        any(p -> HTTP.hasheader(resp, p.first), frozen) || return add_response_headers(resp, frozen)
 
-            # A handler or an inner middleware already chose a value for at least one of these, so
-            # DO NOT add a second copy. Two conflicting `X-Frame-Options` on the wire is not "more
-            # secure": RFC 7034 §2.1 says the browser must treat the directive as invalid, so the
-            # likely outcome is the protection being dropped entirely -- worse than either value
-            # alone. The explicit choice wins, which is also what Django's `SecurityMiddleware`
-            # (`setdefault`) and Phoenix's `put_secure_browser_headers` both do.
-            return add_response_headers(resp, [p for p in frozen if !HTTP.hasheader(resp, p.first)])
-        end
+        # A handler or an inner middleware already chose a value for at least one of these, so
+        # DO NOT add a second copy. Two conflicting `X-Frame-Options` on the wire is not "more
+        # secure": RFC 7034 §2.1 says the browser must treat the directive as invalid, so the
+        # likely outcome is the protection being dropped entirely -- worse than either value
+        # alone. The explicit choice wins, which is also what Django's `SecurityMiddleware`
+        # (`setdefault`) and Phoenix's `put_secure_browser_headers` both do.
+        missing_pairs = [p for p in frozen if !HTTP.hasheader(resp, p.first)]
+        # Every header already present -- e.g. a router's own `SecurityHeaders()` inside a
+        # `serve(security_headers = …)` layer (#402). Nothing to add, so nothing to rebuild.
+        isempty(missing_pairs) && return resp
+        return add_response_headers(resp, missing_pairs)
     end
 end
 

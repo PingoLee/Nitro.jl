@@ -724,6 +724,65 @@ end
     end
 end
 
+# #402. The 413 and 503 are built in `stream_handler`, before the middleware pipeline exists for
+# the request, so `SecurityHeaders` as ordinary middleware can never reach them. Under
+# `serve(security_headers = …)` they carry the same frozen pairs as every pipeline response.
+@testset "serve(security_headers=…) reaches the transport's 413 and 503" begin
+    entered, release = Threads.Atomic{Bool}(false), Base.Event()
+    ctx = _capacity_context(entered, release)
+    port = get_free_port()
+    _serve(ctx, port; max_concurrent_requests = 1, max_body_bytes = 1024,
+           security_headers = Nitro.SecurityHeaders(csp = "default-src 'none'"))
+    parked = nothing
+    try
+        @test occursin(r"\r\nX-Content-Type-Options: nosniff\r\n"i, _get(port, "/ok"))
+
+        parked = @async _get(port, "/park")
+        @test timedwait(() -> entered[], 20.0; pollint = 0.02) === :ok
+        refused = _get(port, "/ok")
+        @test startswith(refused, "HTTP/1.1 503")
+        @test occursin(r"\r\nRetry-After: 1\r\n"i, refused)                     # kept
+        @test occursin(r"\r\nX-Content-Type-Options: nosniff\r\n"i, refused)    # (unpatched: absent)
+        @test occursin(r"\r\nContent-Security-Policy: default-src 'none'\r\n"i, refused)
+        notify(release)
+        @test timedwait(() -> istaskdone(parked), 20.0; pollint = 0.02) === :ok
+
+        big = "POST /echo HTTP/1.1\r\nHost: $HOST\r\nContent-Length: 4096\r\n" *
+              "Expect: 100-continue\r\nConnection: close\r\n\r\n"
+        too_big = _raw_exchange(port, [big])
+        @test startswith(too_big, "HTTP/1.1 413")
+        @test occursin(r"\r\nX-Frame-Options: DENY\r\n"i, too_big)              # (unpatched: absent)
+        @test length(collect(eachmatch(r"\r\nX-Frame-Options:"i, too_big))) == 1
+    finally
+        notify(release)
+        Nitro.Core.terminate(ctx)
+    end
+end
+
+@testset "without security_headers the transport refusals stay bare" begin
+    entered, release = Threads.Atomic{Bool}(false), Base.Event()
+    ctx = _capacity_context(entered, release)
+    port = get_free_port()
+    _serve(ctx, port; max_body_bytes = 1024)
+    try
+        big = "POST /echo HTTP/1.1\r\nHost: $HOST\r\nContent-Length: 4096\r\n" *
+              "Expect: 100-continue\r\nConnection: close\r\n\r\n"
+        too_big = _raw_exchange(port, [big])
+        @test startswith(too_big, "HTTP/1.1 413")
+        @test !occursin(r"X-Content-Type-Options"i, too_big)   # still opt-in
+    finally
+        notify(release)
+        Nitro.Core.terminate(ctx)
+    end
+end
+
+@testset "security_headers must be a SecurityHeaders, refused before the App changes" begin
+    ctx = Nitro.Core.App()
+    @test_throws ArgumentError Nitro.Core.serve(ctx; security_headers = ["X-Frame-Options" => "DENY"],
+                                                show_banner = false)
+    @test !isopen(ctx.service)
+end
+
 @testset "a buffered response holds its slot until it is on the wire" begin
     # Review finding on #298. On HTTP/1.1 HTTP.jl buffers a fixed-length response whole and sends
     # it at `closewrite`, which its loop ran AFTER `stream_handler` returned and the slot was

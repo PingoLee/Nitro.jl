@@ -602,7 +602,8 @@ end
 # the same socket to retry on. `close = true` is set explicitly rather than left to HTTP's
 # `startwrite`, which would infer it from the unconsumed body: that inference is a private
 # implementation detail, while `_response_wants_close` honours the flag as public behavior.
-function _reject_oversized_body!(stream::HTTP.Stream, limit::Int64, drain::Bool)
+function _reject_oversized_body!(stream::HTTP.Stream, limit::Int64, drain::Bool,
+                                 extra::Vector{Pair{String,String}} = Pair{String,String}[])
     # The only server-side signal that a request was refused: the rejection returns before the
     # middleware chain, so there is no access-log line and no handler. Tomcat, nginx and Django all
     # record a rejected oversize body.
@@ -625,8 +626,11 @@ function _reject_oversized_body!(stream::HTTP.Stream, limit::Int64, drain::Bool)
            method = stream.message.method,
            declared_content_length = stream.message.content_length,
            limit = limit)
+    # `copy`: HTTP writes the framing headers into `resp.headers` in place, and `extra` is the
+    # `SecurityHeaders` vector every request shares (#402).
     _send_rejection!(stream,
-        HTTP.Response(413, "Request body exceeds the configured limit of $(limit) bytes"), drain)
+        HTTP.Response(413, copy(extra), "Request body exceeds the configured limit of $(limit) bytes"),
+        drain)
 end
 
 # The shared tail of the two refusals that answer before the middleware chain runs — the 413 above
@@ -664,13 +668,15 @@ _expects_continue(head)::Bool =
 #
 # Logged exactly like the 413, and for the same reason: reachable pre-auth, so one first-sighting
 # warning plus debug detail, never a per-request warning a client can use to flood the log.
-function _reject_over_capacity!(stream::HTTP.Stream, limit::Int64)
+function _reject_over_capacity!(stream::HTTP.Stream, limit::Int64,
+                                extra::Vector{Pair{String,String}} = Pair{String,String}[])
     @warn("Refusing requests over max_concurrent_requests with 503 (detail at debug level)",
           limit = limit, maxlog = 1)
     @debug("Request refused: max_concurrent_requests already in flight; answered 503",
            method = stream.message.method,
            limit = limit)
-    resp = HTTP.Response(503, ["Retry-After" => "1"],
+    # `vcat` builds a fresh vector, so the shared `extra` (#402) is never written through.
+    resp = HTTP.Response(503, vcat(Pair{String,String}["Retry-After" => "1"], extra),
         "Server is at its limit of $(limit) concurrent requests; retry shortly")
     # The same `100-continue` rule as the 413's declared-length reject: a client still waiting for
     # permission to send must not be sent a `100 Continue` by the swallow.
@@ -1043,7 +1049,8 @@ end
 # happens; exposed directly, set both alongside the cap — the `serve` docstring says so.
 function stream_handler(middleware::Function; max_body_bytes::Int64 = DEFAULT_MAX_BODY_BYTES,
                         max_concurrent_requests::Int64 = zero(Int64),
-                        max_upgraded_connections::Int64 = zero(Int64))
+                        max_upgraded_connections::Int64 = zero(Int64),
+                        rejection_headers::Vector{Pair{String,String}} = Pair{String,String}[])
     in_flight = Threads.Atomic{Int64}(0)
     upgraded  = Threads.Atomic{Int64}(0)
     capped = max_concurrent_requests > 0 || max_upgraded_connections > 0
@@ -1054,7 +1061,7 @@ function stream_handler(middleware::Function; max_body_bytes::Int64 = DEFAULT_MA
         adm = capped ? _Admission(false, in_flight, upgraded, max_upgraded_connections, false) : nothing
         if max_concurrent_requests > 0
             _try_acquire_slot!(in_flight, max_concurrent_requests) ||
-                return _reject_over_capacity!(stream, max_concurrent_requests)
+                return _reject_over_capacity!(stream, max_concurrent_requests, rejection_headers)
             @atomic adm.held = true
         end
         try
@@ -1063,8 +1070,10 @@ function stream_handler(middleware::Function; max_body_bytes::Int64 = DEFAULT_MA
             # Short-circuits BEFORE the middleware chain, so an oversized request produces no access-log
             # line, no CORS headers and no custom error formatting. That is the correct trade: the
             # alternative is handing middleware a truncated body, which is strictly worse than handing
-            # it nothing.
-            req isa _BodyRejected && return _reject_oversized_body!(stream, max_body_bytes, req.drain)
+            # it nothing. The one exception is `rejection_headers`, which `serve(security_headers=…)`
+            # supplies so the refusal carries the same security headers as every other response (#402).
+            req isa _BodyRejected &&
+                return _reject_oversized_body!(stream, max_body_bytes, req.drain, rejection_headers)
             req.context[:ip] = ip
             req.context[:stream] = stream
             # Only the WebSocket branch reads it, and only a WebSocket budget gives it work (#376).
