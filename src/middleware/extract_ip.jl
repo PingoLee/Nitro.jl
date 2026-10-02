@@ -18,14 +18,20 @@ const _HEADER_NAMES = (
     x_real_ip        = "X-Real-IP",
     cf_connecting_ip = "CF-Connecting-IP",
     true_client_ip   = "True-Client-IP",
+    forwarded        = "Forwarded",
 )
 
-# The protocol headers Nitro knows how to read (#374) — closed for the same reason. The RFC 7239
-# `Forwarded` header is deliberately absent: it is not parsed for the address either, and one
-# half of it without the other would be a second, inconsistent reading of the same header.
+# The protocol headers Nitro knows how to read (#374) — closed for the same reason. RFC 7239
+# `Forwarded` is in both sets (#383) and is read by ONE walk for both halves, so the address and
+# the scheme always come from the same element (see `_walk_forwarded`).
 const _PROTO_HEADERS = (
     x_forwarded_proto = "X-Forwarded-Proto",
+    forwarded         = "Forwarded",
 )
+
+# How the address header is read: one value the proxy wrote, the X-Forwarded-For chain, or the
+# RFC 7239 element list.
+@enum _AddrFormat::UInt8 _SINGLE _XFF_CHAIN _RFC7239
 
 # A trusted-proxy entry, normalized to a family-tagged network/mask pair. IPv4 lives in the low
 # 32 bits of `net`/`mask`; `v6` keeps the families apart so `0.0.0.0/0` can never match `::/0`.
@@ -38,13 +44,14 @@ end
 # The whole trust configuration, resolved and validated once at construction so the request
 # path is a few integer comparisons with no `Any` (nitro-core §7).
 struct _TrustPolicy
-    header  :: Nullable{String}    # canonical header name; `nothing` when `:none`
-    is_list :: Bool                # true only for X-Forwarded-For, which carries a chain
-    proxies :: Vector{_IPPrefix}   # empty exactly when no trust is configured
-    proto   :: Nullable{String}    # canonical protocol header name; `nothing` when `:none`
+    header        :: Nullable{String}    # canonical header name; `nothing` when `:none`
+    format        :: _AddrFormat         # how `header` is read
+    proxies       :: Vector{_IPPrefix}   # empty exactly when no trust is configured
+    proto         :: Nullable{String}    # canonical protocol header name; `nothing` when `:none`
+    proto_rfc7239 :: Bool                # the scheme comes from `Forwarded: proto=`
 end
 
-const _NO_TRUST = _TrustPolicy(nothing, false, _IPPrefix[], nothing)
+const _NO_TRUST = _TrustPolicy(nothing, _SINGLE, _IPPrefix[], nothing, false)
 
 """
     ExtractIP(; forwarded_header::Symbol = :none, forwarded_proto::Symbol = :none, trusted_proxies = nothing)
@@ -70,10 +77,10 @@ ignored, so a proxy that forgets to strip `CF-Connecting-IP` cannot be used to b
 
 # Keyword Arguments
 - `forwarded_header::Symbol`: the one address header your proxy writes. One of `:none` (default,
-  no header is read), `:x_forwarded_for`, `:x_real_ip`, `:cf_connecting_ip`, `:true_client_ip`.
+  no header is read), `:x_forwarded_for`, `:x_real_ip`, `:cf_connecting_ip`, `:true_client_ip`,
+  `:forwarded` (RFC 7239 `Forwarded: for=`).
 - `forwarded_proto::Symbol`: the header your proxy writes the client's scheme into. One of
-  `:none` (default) or `:x_forwarded_proto`. The RFC 7239 `Forwarded` header is not supported,
-  for the scheme or the address.
+  `:none` (default), `:x_forwarded_proto`, `:forwarded` (RFC 7239 `Forwarded: proto=`).
 - `trusted_proxies`: the proxies whose forwarding headers may be believed. Entries are either an
   `IPAddr` (`ip"127.0.0.1"`) or a CIDR string (`"10.244.0.0/16"`, `"2400:cb00::/32"`). A header
   is read **only** when the nearest hop the chain has established matches one of them: the
@@ -86,7 +93,9 @@ but the proxy reaches Nitro over plain TCP, so the upgrade's same-origin check s
 on an insecure connection and refuses it with `403`. `forwarded_proto = :x_forwarded_proto` tells
 it which scheme the client really used: from a trusted proxy, `https` (or `wss`) makes the check
 compare against `https://<Host>`, `http` (or `ws`) against `http://<Host>`. The leftmost value
-counts when the header carries a list, and a value that is none of those four is ignored.
+counts when `X-Forwarded-Proto` carries a list, and a value that is none of those four is ignored.
+With `forwarded_proto = :forwarded` the `proto=` that counts is the one in the same `Forwarded`
+element as the client's address — see [`extract_ip`](@ref).
 
 The scheme is not a way around the check. It only chooses which scheme of *your own host* counts
 as same-origin, so it can never admit a page from another site — and a browser page cannot set the
@@ -103,8 +112,9 @@ fooled either.
 
 `X-Forwarded-For` is a chain (`client, proxy1, proxy2`) and is handled differently: Nitro walks
 it right-to-left, discarding hops that match `trusted_proxies`, and takes the first address that
-is not one of your proxies. Entries a client prepends are therefore never reached. See
-[`extract_ip`](@ref) for the exact rules.
+is not one of your proxies. Entries a client prepends are therefore never reached. The RFC 7239
+`Forwarded` header is a chain too, walked the same way. See [`extract_ip`](@ref) for the exact
+rules.
 
 # More than one extractor in a chain
 A chain can hold several, and the usual way is a global `ExtractIP` plus a `RateLimiter` at its
@@ -147,6 +157,10 @@ ExtractIP(forwarded_header = :x_real_ip, trusted_proxies = [ip"127.0.0.1"])
 
 # A local nginx terminating TLS, with WebSocket routes behind it
 ExtractIP(forwarded_header = :x_forwarded_for, forwarded_proto = :x_forwarded_proto,
+          trusted_proxies  = [ip"127.0.0.1"])
+
+# A proxy that writes only the RFC 7239 header: `Forwarded: for=192.0.2.60;proto=https`
+ExtractIP(forwarded_header = :forwarded, forwarded_proto = :forwarded,
           trusted_proxies  = [ip"127.0.0.1"])
 ```
 """
@@ -216,6 +230,30 @@ Entries may carry a port (`203.0.113.7:1234`, `[2001:db8::1]:443`); it is stripp
 parsing. Falling back to the peer degrades gracefully — clients behind the proxy share one
 rate-limit bucket — rather than letting a client choose its own address.
 
+RFC 7239 `Forwarded` (`for=203.0.113.7;proto=https, for="[2001:db8::1]:4711"`) is a chain of
+*elements*, each written by one proxy about the connection it received. It is walked
+**right-to-left** under the same rules as `X-Forwarded-For`, using each element's `for=`:
+
+- an element whose `for=` names one of your proxies is peeled, and the walk continues left;
+- the first `for=` that is *not* one of your proxies is the client;
+- an element that cannot be read (bad syntax, a repeated parameter, an unterminated quote), and a
+  `for=` that is missing, `unknown`, obfuscated (`_hidden`) or not an address, stop the walk and
+  yield the peer;
+- parameter names are case-insensitive, values may be quoted, and a port is stripped as above.
+
+The line is split **from the right**, and only as far as the walk goes, so whatever a client
+writes before your proxy's element — an unterminated `"` or malformed bytes included — cannot
+change how that element is read. Never have the proxy interpolate a client-controlled value
+(`host=\$host`) into the header: that can inject an element to the *right* of yours.
+
+The scheme (`forwarded_proto = :forwarded`) is the `proto=` of the element the walk stopped at:
+the one that names the client. Your trusted proxy wrote that element about the connection the
+client opened, so its `proto=` is the scheme the client used. A client can prepend elements of its
+own but never reach that one, which is why this is not `X-Forwarded-Proto`'s leftmost rule. That
+header is a separate list with nothing binding it to an address. An element with no usable `for=`
+still supplies its `proto=`, so a proxy that writes only `Forwarded: proto=https` works. If every
+`for=` is one of your proxies, the leftmost element supplies it.
+
 An address resolved *out of a header* is canonicalized (an IPv4-mapped `::ffff:203.0.113.7`
 becomes `203.0.113.7`), so one host cannot occupy several buckets. The **peer is returned exactly
 as the server observed it** — this function never rewrites what `serve` seeded. Since #66 it does
@@ -244,10 +282,12 @@ function _resolve(req::HTTP.Request, policy::_TrustPolicy, peer)::Nullable{IPAdd
     pv6, ph = _norm(peer)
     _is_trusted(policy, pv6, ph) || return peer     # direct client — headers are ignored
 
-    raw = _header_value(req, policy.header::String, policy.is_list)
+    policy.format === _RFC7239 && return first(_walk_forwarded(req, policy, peer))
+
+    raw = _header_value(req, policy.header::String, policy.format === _XFF_CHAIN)
     raw === nothing && return peer
 
-    policy.is_list && return _walk_chain(raw, policy, peer)
+    policy.format === _XFF_CHAIN && return _walk_chain(raw, policy, peer)
 
     ip = _try_parse_ip(_normalize_entry(raw))
     return ip === nothing ? peer : _canonical(ip)
@@ -261,7 +301,7 @@ function _walk_chain(raw::AbstractString, policy::_TrustPolicy, peer::IPAddr)::I
         # quirks and carry no payload. A NON-blank token that normalizes to nothing (`"[]"`) is
         # opaque and must abort like any other unreadable hop — skipping it would let an
         # attacker step over the boundary entry and reach a value they prepended.
-        isempty(strip(parts[i])) && continue
+        isempty(_ows_strip(parts[i])) && continue
         entry = _normalize_entry(parts[i])
         isempty(entry) && return peer               # unreadable hop — stop trusting the chain
         ip = _try_parse_ip(entry)
@@ -281,26 +321,203 @@ function _record_forwarded_proto!(req::HTTP.Request, policy::_TrustPolicy, peer)
     peer isa IPAddr || return nothing
     pv6, ph = _norm(peer)
     _is_trusted(policy, pv6, ph) || return nothing
-    raw = _header_value(req, policy.proto::String, true)
-    raw === nothing && return nothing
-    scheme = _forwarded_scheme(raw)
+    scheme = if policy.proto_rfc7239
+        last(_walk_forwarded(req, policy, peer))
+    else
+        raw = _header_value(req, policy.proto::String, true)
+        raw === nothing ? nothing : _forwarded_scheme(raw)
+    end
     scheme === nothing || (req.context[REQUEST_FORWARDED_PROTO_KEY] = scheme)
     return nothing
 end
 
-# The scheme the client used at the edge: the LEFTMOST value, which is how Django's
-# `SECURE_PROXY_SSL_HEADER` and Express's `trust proxy` read a list. Traefik writes `ws`/`wss` on
-# upgrade requests, so those fold onto their HTTP schemes; anything else is not a scheme this
-# server can be reached over and is ignored rather than guessed at. Spoofing the leftmost value
-# buys nothing a browser page could use: it only chooses which scheme of this server's own host
-# is same-origin, and a page cannot set the header on a WebSocket handshake at all.
+# The scheme the client used at the edge, from X-Forwarded-Proto: the LEFTMOST value, which is
+# how Django's `SECURE_PROXY_SSL_HEADER` and Express's `trust proxy` read a list. Spoofing the
+# leftmost value buys nothing a browser page could use: it only chooses which scheme of this
+# server's own host is same-origin, and a page cannot set the header on a WebSocket handshake at
+# all. `Forwarded` does better than leftmost — see `_walk_forwarded`.
 function _forwarded_scheme(raw::AbstractString)::Nullable{String}
     comma = findfirst(==(','), raw)
-    token = lowercase(strip(comma === nothing ? raw : raw[firstindex(raw):prevind(raw, comma)]))
+    return _scheme_token(comma === nothing ? raw : raw[firstindex(raw):prevind(raw, comma)])
+end
+
+# Traefik writes `ws`/`wss` on upgrade requests, so those fold onto their HTTP schemes; anything
+# else is not a scheme this server can be reached over and is ignored rather than guessed at.
+function _scheme_token(value::Nullable{AbstractString})::Nullable{String}
+    value === nothing && return nothing
+    token = _ows_strip(value)
+    all(isascii, token) || return nothing
+    token = lowercase(token)
     (token == "https" || token == "wss") && return "https"
     (token == "http"  || token == "ws")  && return "http"
     return nothing
 end
+
+# ── RFC 7239 `Forwarded` (#383) ────────────────────────────────────────────────────────────
+
+# One element, reduced to the two parameters Nitro reads. `ok = false` is an element that could
+# not be read; the walk stops at it.
+struct _FwdElement
+    ok    :: Bool
+    for_  :: Nullable{SubString{String}}
+    proto :: Nullable{SubString{String}}
+end
+
+const _FWD_UNREADABLE = _FwdElement(false, nothing, nothing)
+
+# Walk `Forwarded` right-to-left and return `(client, scheme)` in one pass, so the address and the
+# scheme always come from the SAME element. Element i was written by a hop already known to be
+# trusted -- the peer for the rightmost one, then each peeled `for=` -- so the element the walk
+# stops at was written by your own proxy about the connection the client opened, and its
+# `proto=` is the scheme the client used. The leftmost `proto=` is client-writable; this one is
+# not, which is why `X-Forwarded-Proto`'s leftmost rule is not reused here.
+#
+# The stop rules are `_walk_chain`'s: anything unreadable yields the peer rather than letting the
+# walk step past it. An element with no usable `for=` still yields its `proto=` -- a trusted hop
+# wrote it -- so `Forwarded: proto=https` alone works for a scheme-only configuration.
+function _walk_forwarded(req::HTTP.Request, policy::_TrustPolicy,
+                         peer::IPAddr)::Tuple{IPAddr, Nullable{String}}
+    raw = _header_value(req, "Forwarded", true)
+    raw === nothing && return (peer, nothing)
+    s = String(raw)
+    i = ncodeunits(s)
+    seen = false
+    leftmost :: Nullable{SubString{String}} = nothing   # `proto=` of the last element peeled
+    while i >= 1
+        el, i = _prev_forwarded_element(s, i)
+        el === nothing && continue                  # a blank element (`,,`): no payload
+        el.ok || return (peer, nothing)             # unreadable -- stop trusting the chain
+        ip = _forwarded_node(el.for_)
+        ip === nothing && return (peer, _scheme_token(el.proto))
+        v6, h = _norm(ip)
+        _is_trusted(policy, v6, h) || return (_canonical(ip), _scheme_token(el.proto))
+        seen, leftmost = true, el.proto
+    end
+    # Every `for=` was one of ours (or there were no elements): the request originated inside
+    # your own infrastructure. The leftmost element still says how it reached the edge.
+    return (peer, seen ? _scheme_token(leftmost) : nothing)
+end
+
+# A `for=` node (RFC 7239 §6): an address, possibly bracketed and with a port, or `unknown`, or an
+# obfuscated `_identifier`. Only an address resolves.
+function _forwarded_node(value::Nullable{AbstractString})::Nullable{IPAddr}
+    value === nothing && return nothing
+    v = _ows_strip(value)
+    (isempty(v) || startswith(v, '_') || _ascii_lower_eq(v, "unknown")) && return nothing
+    return _try_parse_ip(_normalize_entry(v))
+end
+
+# Read the element that ENDS at byte `i` of a (possibly multi-line, comma-joined) `Forwarded`
+# value, scanning RIGHT-TO-LEFT, and return it with the byte where the next element to its left
+# ends (0 when there is none). `nothing` is a blank element.
+#
+# Why from the right: a quoted-string carries state, so a left-to-right split lets whatever comes
+# first decide how everything after it is read. A client that sends `Forwarded: for="` -- an
+# unterminated quote -- would swallow the element your proxy appends, and HTTP.jl folds ADJACENT
+# duplicate lines into one value (`appendheader`), so sending it as a separate line does not
+# isolate it. Scanning from the right, the proxy's well-formed suffix is split first and exactly:
+# inside a quoted-string a `"` is escaped iff an odd number of backslashes precede it, so the
+# backward split agrees with the forward grammar on any well-formed text.
+#
+# One element per call, so the walk parses nothing left of where it stops: text a client wrote
+# there is never even looked at, whatever bytes it holds. Delimiters are ASCII, so scanning code
+# units is safe for any UTF-8 -- or any invalid UTF-8 -- in a value.
+function _prev_forwarded_element(s::String, i::Int)::Tuple{Nullable{_FwdElement}, Int}
+    cu = codeunits(s)
+    for_  :: Nullable{SubString{String}} = nothing
+    proto :: Nullable{SubString{String}} = nothing
+    nonblank = false                                # the element held at least one pair
+    stop = i                                        # last byte of the pair being scanned
+    inq = false
+    while i >= 1
+        c = cu[i]
+        if inq
+            if c == UInt8('"')
+                j = i - 1
+                while j >= 1 && cu[j] == UInt8('\\')
+                    j -= 1
+                end
+                if isodd(i - 1 - j)                 # an escaped quote: content, keep going
+                    i = j
+                    continue
+                end
+                inq = false                         # the opening quote
+            end
+        elseif c == UInt8('"')
+            inq = true                              # a closing quote, seen from the right
+        elseif c == UInt8(',') || c == UInt8(';')
+            ok, for_, proto, nonblank = _forwarded_pair(s, i + 1, stop, for_, proto, nonblank)
+            ok || return (_FWD_UNREADABLE, 0)
+            c == UInt8(',') && return (nonblank ? _FwdElement(true, for_, proto) : nothing, i - 1)
+            stop = i - 1
+        end
+        i -= 1
+    end
+    # Still inside a quote at the left edge: an unterminated quoted-string. Nothing past it can
+    # be read.
+    inq && return (_FWD_UNREADABLE, 0)
+    ok, for_, proto, nonblank = _forwarded_pair(s, 1, stop, for_, proto, nonblank)
+    ok || return (_FWD_UNREADABLE, 0)
+    return (nonblank ? _FwdElement(true, for_, proto) : nothing, 0)
+end
+
+# Parse one `name=value` pair occupying bytes `a:b` of `s` and fold it into the element's state.
+# An empty pair (`for=x;` or a blank element) is allowed by RFC 7239's grammar and skipped.
+# Returns `ok = false` for anything the grammar does not allow, including a repeated `for`/`proto`
+# (§4: a parameter MUST NOT occur more than once per element).
+function _forwarded_pair(s::String, a::Int, b::Int, for_::Nullable{SubString{String}},
+                         proto::Nullable{SubString{String}}, nonblank::Bool)
+    pair = b < a ? SubString(s, 1, 0) : _ows_strip(SubString(s, a, thisind(s, b)))
+    isempty(pair) && return (true, for_, proto, nonblank)
+    eq = findfirst(==('='), pair)
+    eq === nothing && return (false, for_, proto, nonblank)
+    name  = _ows_strip(SubString(pair, firstindex(pair), prevind(pair, eq)))
+    value = _forwarded_value(_ows_strip(SubString(pair, nextind(pair, eq), lastindex(pair))))
+    (isempty(name) || !all(_is_tchar, name) || value === nothing) &&
+        return (false, for_, proto, nonblank)
+    key = lowercase(name)                           # ASCII: every char is a tchar
+    if key == "for"
+        for_ === nothing || return (false, for_, proto, nonblank)
+        for_ = value
+    elseif key == "proto"
+        proto === nothing || return (false, for_, proto, nonblank)
+        proto = value
+    end                                             # `by`, `host`, extensions: not read
+    return (true, for_, proto, true)
+end
+
+# A value is a token or a quoted-string. A quoted-string is checked FORWARD here, so a value the
+# backward split accepted but the grammar does not (`"abc\"`) is still refused. Unquoted values
+# are taken leniently -- some proxies write `for=[2001:db8::1]` without the quotes the RFC asks
+# for -- but never with a stray `"`, and never empty.
+function _forwarded_value(v::AbstractString)::Nullable{SubString{String}}
+    isempty(v) && return nothing
+    if startswith(v, '"')
+        buf = IOBuffer()
+        i = nextind(v, firstindex(v))
+        while i <= lastindex(v)
+            c = v[i]
+            if c == '\\'
+                i = nextind(v, i)
+                i > lastindex(v) && return nothing
+                print(buf, v[i])
+            elseif c == '"'
+                i == lastindex(v) || return nothing  # text after the closing quote
+                return SubString(String(take!(buf)))
+            else
+                print(buf, c)
+            end
+            i = nextind(v, i)
+        end
+        return nothing                              # no closing quote
+    end
+    occursin('"', v) && return nothing
+    return SubString(String(v))
+end
+
+# RFC 9110 §5.6.2 tchar.
+_is_tchar(c::AbstractChar) =
+    isascii(c) && (isletter(c) || isdigit(c) || c in "!#\$%&'*+-.^_`|~")
 
 # Resolve a header to a single value, in one pass.
 #
@@ -331,17 +548,26 @@ end
 # first) is never a proxy, whatever `trusted_proxies` says. No connection has it as its peer: it
 # is what `_peer_ip` records when it could NOT read the peer (src/core/transport.jl, #404), so
 # trusting it would hand the forwarding header to every client whose address was lost. Refused
-# here, at the one check `_resolve`, `_walk_chain` and `_record_forwarded_proto!` all go
-# through, rather than by rejecting entries: a range like `"0.0.0.0/8"` stays a valid entry for
-# the addresses it really covers.
+# here, at the one check `_resolve`, `_walk_chain`, `_walk_forwarded` and
+# `_record_forwarded_proto!` all go through, rather than by rejecting entries: a range like
+# `"0.0.0.0/8"` stays a valid entry for the addresses it really covers.
 _is_trusted(policy::_TrustPolicy, v6::Bool, host::UInt128) =
     !iszero(host) && any(p -> p.v6 === v6 && (host & p.mask) == p.net, policy.proxies)
+
+# Header values are BYTES: HTTP.jl passes anything >= 0x80 through unvalidated, so a value can
+# hold malformed UTF-8 a client chose. Base `strip` asks `isspace` and `lowercase` asks the
+# Unicode tables, and both THROW `InvalidCharError` on a malformed char -- which in middleware is
+# a 500 for any request carrying it. So the request path trims only what RFC 9110 §5.6.3 calls
+# whitespace (SP, HTAB) and folds case only on ASCII, neither of which ever inspects a char's
+# category.
+_ows_strip(s::AbstractString) = strip(c -> c == ' ' || c == '\t', s)
+_ascii_lower_eq(s::AbstractString, lower::String) = all(isascii, s) && lowercase(s) == lower
 
 # Strip a port and/or brackets so a proxy that writes `203.0.113.7:1234` or `[2001:db8::1]:443`
 # still parses. A bare IPv6 address has at least two colons, so the single-colon test is
 # unambiguous.
 function _normalize_entry(s::AbstractString)::String
-    t = strip(s)
+    t = _ows_strip(s)
     isempty(t) && return ""
     if startswith(t, '[')
         j = findfirst(==(']'), t)
@@ -434,7 +660,8 @@ function _trust_policy(forwarded_header::Symbol, trusted_proxies, trust_forwarde
             "ExtractIP misconfiguration: forwarded_header=:$(forwarded_header) is not a " *
             "recognized forwarding header. A typo would silently disable proxy support " *
             "instead of failing, so it is rejected at construction. Valid values are :none, " *
-            ":x_forwarded_for, :x_real_ip, :cf_connecting_ip and :true_client_ip — declare the " *
+            ":x_forwarded_for, :x_real_ip, :cf_connecting_ip, :true_client_ip and :forwarded " *
+            "(RFC 7239) — declare the " *
             "ONE header your reverse proxy writes."
         ))
     end
@@ -443,9 +670,9 @@ function _trust_policy(forwarded_header::Symbol, trusted_proxies, trust_forwarde
     if forwarded_proto !== :none && !haskey(_PROTO_HEADERS, forwarded_proto)
         throw(ArgumentError(
             "ExtractIP misconfiguration: forwarded_proto=:$(forwarded_proto) is not a " *
-            "recognized protocol header. Valid values are :none and :x_forwarded_proto. The " *
-            "RFC 7239 `Forwarded` header is not supported yet, for the scheme or the address — " *
-            "configure your proxy to send X-Forwarded-Proto."
+            "recognized protocol header. A typo would silently disable it instead of failing, " *
+            "so it is rejected at construction. Valid values are :none, :x_forwarded_proto " *
+            "and :forwarded (RFC 7239)."
         ))
     end
 
@@ -482,7 +709,7 @@ function _trust_policy(forwarded_header::Symbol, trusted_proxies, trust_forwarde
     if has_proto && !has_proxies
         throw(ArgumentError(
             "ExtractIP misconfiguration: forwarded_proto=:$(forwarded_proto) cannot be used " *
-            "without trusted_proxies. A client connecting directly can send X-Forwarded-Proto " *
+            "without trusted_proxies. A client connecting directly can send that header " *
             "with any value, so honoring it from any peer would let the client choose the " *
             "scheme the WebSocket Origin check compares against. List the addresses or CIDR " *
             "ranges of your proxies, e.g. trusted_proxies=[ip\"127.0.0.1\"]."
@@ -508,7 +735,9 @@ function _trust_policy(forwarded_header::Symbol, trusted_proxies, trust_forwarde
     # A scheme-only policy has no address header: `_resolve` returns the peer for it.
     header = has_header ? _HEADER_NAMES[forwarded_header] : nothing
     proto  = has_proto  ? _PROTO_HEADERS[forwarded_proto] : nothing
-    return _TrustPolicy(header, forwarded_header === :x_forwarded_for, prefixes, proto)
+    format = forwarded_header === :x_forwarded_for ? _XFF_CHAIN :
+             forwarded_header === :forwarded       ? _RFC7239   : _SINGLE
+    return _TrustPolicy(header, format, prefixes, proto, forwarded_proto === :forwarded)
 end
 
 function _parse_prefix(entry)::_IPPrefix

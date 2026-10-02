@@ -315,8 +315,8 @@ serve(middleware = [
 | Keyword | What it means |
 |---|---|
 | `trusted_proxies` | The peers whose forwarding header may be believed. `IPAddr` values or CIDR strings. |
-| `forwarded_header` | The **one** header your proxy writes: `:x_forwarded_for`, `:x_real_ip`, `:cf_connecting_ip`, or `:true_client_ip`. |
-| `forwarded_proto` | The header your proxy writes the client's scheme into: `:x_forwarded_proto`. Only needed for WebSocket routes behind TLS termination — see [WebSocket upgrades and the Origin check](@ref). |
+| `forwarded_header` | The **one** header your proxy writes: `:x_forwarded_for`, `:x_real_ip`, `:cf_connecting_ip`, `:true_client_ip`, or `:forwarded` (RFC 7239). |
+| `forwarded_proto` | The header your proxy writes the client's scheme into: `:x_forwarded_proto` or `:forwarded` (RFC 7239). Only needed for WebSocket routes behind TLS termination — see [WebSocket upgrades and the Origin check](@ref). |
 
 A trust boundary with no header named, and a header with no trust boundary, are each an
 `ArgumentError` at startup. The first reads nothing; the second is honored from any client, which
@@ -384,6 +384,48 @@ a shared bucket rather than letting a client choose its own:
     loopback is on an allow-list, as in "admin endpoints reachable only from localhost": the
     degradation becomes an escalation. Gate admin access on authentication, not on a client IP
     that a forwarding header can steer.
+
+### How `Forwarded` is resolved
+
+RFC 7239 standardizes the same information in one header,
+`Forwarded: for=203.0.113.7;proto=https`. It is a chain of *elements*, one per proxy, each
+describing the connection that proxy received. With `forwarded_header = :forwarded`, Nitro walks
+the elements **right to left** by their `for=` parameter, under exactly the rules in the table
+above. Parameter names are case-insensitive, values may be quoted, and IPv6 arrives quoted and
+bracketed (`for="[2001:db8::1]:4711"`). A `for=` of `unknown` or an obfuscated identifier
+(`_hidden`) names no address, so it stops the walk at the socket peer, like an entry that does not
+parse.
+
+```
+Forwarded: for=9.9.9.9;proto=https, for=203.0.113.7;proto=http
+           ~~~~~~~~~~~~~~~~~~~~~~~  ~~~~~~~~~~~~~~~~~~~~~~~~~~
+           client wrote this        your proxy appended this:
+                                    who connected, and over what
+```
+
+The resolved client is `203.0.113.7`. **The scheme is `http`, not `https`.** With
+`forwarded_proto = :forwarded`, the `proto=` that counts is the one in the element that names the
+client. Your own proxy wrote that element about the connection the client opened, so it is the only
+`proto=` in the header the client cannot choose. That is why it differs from `X-Forwarded-Proto`,
+where the leftmost value counts: that header carries no address to bind the scheme to. An element
+from your proxy with no usable `for=` still supplies its `proto=`, so a proxy that sends only
+`Forwarded: proto=https` works for a scheme-only configuration.
+
+Nitro reads the header from the right, and only as far as the walk goes, so whatever a client
+writes in front of your proxy's element cannot change how that element is parsed — not an
+unterminated `"`, not malformed bytes. Even so, have the **edge** proxy *set* the header rather
+than append to what the client sent (inner proxies append their own element after it), and write
+**only values the proxy derives itself**:
+
+```nginx
+proxy_set_header Forwarded "for=\"$remote_addr\";proto=$scheme";
+```
+
+Never interpolate a client-controlled variable into it — `host=$host`, `$http_*`. A `Host` of
+`x,for=9.9.9.9;proto=https` would then *inject an element to the right of yours*, which no parser
+can tell apart from one your proxy wrote. `$remote_addr` goes in quotes because an IPv6 address
+must be quoted, and that form is written without the brackets RFC 7239 asks for; Nitro reads it
+either way.
 
 ### Dynamic proxy addresses: use CIDR
 
@@ -515,8 +557,10 @@ serve(middleware = [
 ```
 
 `forwarded_proto` can also be set without `forwarded_header` if the scheme is all you need. The
-value is read only from a peer in `trusted_proxies`, the leftmost entry of a list counts, and
-Traefik's `wss`/`ws` are read as `https`/`http`.
+value is read only from a peer in `trusted_proxies`, the leftmost entry of an `X-Forwarded-Proto`
+list counts, and Traefik's `wss`/`ws` are read as `https`/`http`. A proxy that sends RFC 7239
+`Forwarded` instead is configured with `forwarded_proto = :forwarded`; see
+[How `Forwarded` is resolved](@ref) for which `proto=` counts.
 
 - **Keep `Host` the public host.** The Origin is compared with the `Host` Nitro receives.
   `proxy_set_header Host $host` does that; nginx's default, the upstream's own name, turns every
