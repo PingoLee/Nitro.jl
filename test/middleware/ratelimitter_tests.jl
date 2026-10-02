@@ -683,8 +683,9 @@ end
     # The fixed limiter declared its three decision values before `lock(stripe.lock) do … end`
     # and assigned them inside it. Assigning an enclosing-scope local from a closure boxes it, so
     # `set_rate_headers!` got three `Any`s on every request (nitro-core §7). The sliding limiter
-    # had no box but still leaked one `Any`: LRUCache's `get!` infers `Any`, and
-    # `remaining_requests` was computed from what it returned.
+    # had no box but still leaked one `Any`: its store was an LRU then, LRUCache's `get!` infers
+    # `Any`, and `remaining_requests` was computed from what it returned. The first value was a
+    # `should_limit::Bool` until #403 widened it to the three-way `outcome::Int`.
     #
     # `test/closure_boxing_tests.jl` catches a box anywhere in Nitro; this is the narrower check
     # that the values reaching the headers are concrete, which a box-free closure can still miss.
@@ -692,13 +693,173 @@ end
         f = RateLimiter(; strategy, auto_extract_ip=false).middleware(_ -> HTTP.Response(200))
         ci = only(code_typed(f, (HTTP.Request,); optimize = false)).first
         @test (strategy, filter(T -> T === Core.Box, ci.slottypes)) == (strategy, [])
-        for (name, T) in (:should_limit => Bool, :remaining_requests => Int, :reset_time => Int)
+        for (name, T) in (:outcome => Int, :remaining_requests => Int, :reset_time => Int)
             # A name can own several slots; one that is never assigned infers `Union{}`.
             assigned = unique(S for (n, S) in zip(ci.slotnames, ci.slottypes)
                               if n === name && S !== Union{})
             @test (strategy, name, assigned) == (strategy, name, [T])
         end
     end
+end
+
+# ── Capacity: a full store refuses a new client, never evicts one (#403) ──────
+# Per-/64 keying stops rotation inside one allocation; a client holding MANY /64s still gets a
+# bucket per /64. The fixed store used to be unbounded between sweeps, and the sliding store an
+# LRU that evicted live buckets -- resetting both its victims' quota and the rotating client's
+# own. Both now refuse the new key once full.
+#
+# White-box where the store has to be read: with `auto_extract_ip=false`, `.middleware` is the
+# closure that captures `stripes`, and Julia names a closure's fields after its captures.
+# Renaming that local turns these into a `FieldError`, not a quiet pass -- follow the rename.
+cap_stripes(lf) = getfield(lf.middleware, :stripes)
+cap_buckets(lf) = sum(s -> lock(() -> length(s.store), s.lock), cap_stripes(lf))
+cap_req(ip) = (r = HTTP.Request("GET", "/"); setip!(r, ip); r)
+cap_ok = _ -> HTTP.Response(200, "ok")
+
+@testset "Rate limiter: a full store refuses a new client and keeps every live bucket" begin
+    for strategy in (:fixed_window, :sliding_window)
+        lf = RateLimiter(; strategy, rate_limit=1, window=Minute(1), max_clients=4,
+                         auto_extract_ip=false)
+        w = lf.middleware(cap_ok)
+        clients = [IPv4("198.51.100.$i") for i in 1:4]
+        t0 = now(UTC)
+        @test [w(cap_req(c)).status for c in clients] == fill(200, 4)
+        t1 = now(UTC)
+
+        newcomer = w(cap_req(ip"198.51.100.200"))
+        @test (strategy, newcomer.status) == (strategy, 503)
+        # Every bucket here was opened just now with a one-minute window, so the soonest a slot
+        # frees is about a minute away.
+        @test (strategy, parse(Int, HTTP.header(newcomer, "Retry-After"))) in
+              ((strategy, 59), (strategy, 60))
+        @test cap_buckets(lf) == 4
+
+        # The property the old sliding LRU broke: the newcomer evicted the least-recently-used
+        # client, whose next request was then admitted on a fresh quota. And the fixed store
+        # simply admitted the newcomer, growing without bound.
+        @test (strategy, [w(cap_req(c)).status for c in clients]) == (strategy, fill(429, 4))
+
+        # The refusal recorded when a slot can next free up, so a flood of refused keys does not
+        # rescan the stripe on every request (`_has_room!`). It is a lower bound on the earliest
+        # expiry: never before the oldest bucket's window ends, never after the newest one's.
+        nr = only(cap_stripes(lf)).next_reap[]
+        @test (strategy, t0 + Minute(1) <= nr <= t1 + Minute(1) + Millisecond(1)) == (strategy, true)
+    end
+end
+
+@testset "Rate limiter: fail_open admits a new client unrecorded when the store is full" begin
+    for strategy in (:fixed_window, :sliding_window)
+        lf = RateLimiter(; strategy, rate_limit=1, window=Minute(1), max_clients=4,
+                         auto_extract_ip=false, fail_open=true)
+        w = lf.middleware(cap_ok)
+        for i in 1:4
+            w(cap_req(IPv4("198.51.100.$i")))
+        end
+        # Unrecorded: no bucket, so no quota headers and no count -- `rate_limit=1` would
+        # otherwise make the second request a 429.
+        for _ in 1:2
+            r = w(cap_req(ip"198.51.100.200"))
+            @test (strategy, r.status, HTTP.hasheader(r, "X-RateLimit-Limit")) ==
+                  (strategy, 200, false)
+        end
+        @test cap_buckets(lf) == 4
+    end
+end
+
+@testset "Rate limiter: a full store reaps its expired buckets before refusing anyone" begin
+    # No janitor runs here -- `on_startup` is never called -- so only the inline reap can free a
+    # slot. Expiry is simulated by backdating each bucket rather than sleeping.
+    backdate(b::Tuple{Int, DateTime}) = (b[1], b[2] - Hour(2))
+    backdate(b::Vector{DateTime}) = b .- Hour(2)
+    for strategy in (:fixed_window, :sliding_window)
+        lf = RateLimiter(; strategy, rate_limit=1, window=Minute(1), max_clients=4,
+                         auto_extract_ip=false)
+        w = lf.middleware(cap_ok)
+        for i in 1:4
+            w(cap_req(IPv4("198.51.100.$i")))
+        end
+        for s in cap_stripes(lf)
+            lock(s.lock) do
+                for (k, b) in collect(s.store)
+                    s.store[k] = backdate(b)
+                end
+            end
+        end
+        @test (strategy, w(cap_req(ip"198.51.100.200")).status) == (strategy, 200)
+        @test (strategy, cap_buckets(lf)) == (strategy, 1)   # four reaped, one admitted
+    end
+end
+
+@testset "Rate limiter: a stripe a reap emptied still reaps the buckets admitted after it" begin
+    # A reap that emptied the stripe recorded `typemax` as its next expiry, and the inserts that
+    # followed never lowered it, so the stripe's full-check never scanned again: once it refilled
+    # it refused every new client -- for good under the sliding strategy, which has no sweep. The
+    # first cycle passes regardless, because `next_reap` starts at `typemin`; the SECOND reap is
+    # the one the bug skipped. `max_clients=1` makes every newcomer go through the full stripe.
+    for strategy in (:fixed_window, :sliding_window)
+        lf = RateLimiter(; strategy, rate_limit=1, window=Minute(1), max_clients=1,
+                         auto_extract_ip=false)
+        w = lf.middleware(cap_ok)
+        # Simulates two hours passing: every bucket AND the stripe's recorded next expiry move
+        # back together, which is what the clock moving forward would look like to them.
+        # Backdating only the buckets would leave `next_reap` in the future and the gate would
+        # (correctly) refuse to scan. The sentinels are left alone: `typemax` is exactly the
+        # stale value this test is about, and must stay unreachable.
+        expire!() = for s in cap_stripes(lf)
+            lock(s.lock) do
+                for (k, b) in collect(s.store)
+                    s.store[k] = b isa Vector ? b .- Hour(2) : (b[1], b[2] - Hour(2))
+                end
+                nr = s.next_reap[]
+                typemin(DateTime) < nr < typemax(DateTime) && (s.next_reap[] = nr - Hour(2))
+            end
+        end
+        @test w(cap_req(ip"198.51.100.1")).status == 200
+        @test w(cap_req(ip"198.51.100.2")).status == 503        # full, nothing expired
+        expire!()
+        @test (strategy, w(cap_req(ip"198.51.100.3")).status) == (strategy, 200)   # 1st reap
+        expire!()
+        @test (strategy, w(cap_req(ip"198.51.100.4")).status) == (strategy, 200)   # 503 before
+        @test cap_buckets(lf) == 1
+    end
+end
+
+@testset "Rate limiter: rotating through many IPv6 /64s neither grows the store nor frees quota" begin
+    # The issue's scenario: one client holding a /48 walks 1 000 of its 65 536 /64s. A victim in
+    # another network spent its quota first and must stay throttled throughout.
+    # `max_clients=128` gives two stripes of 64, so per-stripe capacity is exercised too.
+    for strategy in (:fixed_window, :sliding_window)
+        lf = RateLimiter(; strategy, rate_limit=1, window=Minute(1), max_clients=128,
+                         auto_extract_ip=false)
+        w = lf.middleware(cap_ok)
+        victim = ip"2001:db8:aaaa:1::1"
+        @test w(cap_req(victim)).status == 200
+
+        base = UInt128(0x20010db8bbbb) << 80
+        statuses = [w(cap_req(IPv6(base | (UInt128(i) << 64) | 1))).status for i in 1:1000]
+        @test (strategy, Set(statuses)) == (strategy, Set([200, 503]))
+        # Exactly: both stripes fill (the hash is deterministic and 1 000 keys cover both), and
+        # the victim's bucket holds one of the 128 slots.
+        @test (strategy, count(==(200), statuses)) == (strategy, 127)
+        @test cap_buckets(lf) <= 128
+        @test all(s -> lock(() -> length(s.store), s.lock) <= 64, cap_stripes(lf))
+        @test (strategy, w(cap_req(victim)).status) == (strategy, 429)
+    end
+end
+
+@testset "Rate limiter: max_clients is validated on both strategies" begin
+    for strategy in (:fixed_window, :sliding_window), bad in (0, -1)
+        @test_throws ArgumentError RateLimiter(; strategy, max_clients=bad)
+    end
+end
+
+@testset "Rate limiter: Retry-After for a refused client" begin
+    ra = Nitro.Core.RateLimiterMiddleware._retry_after
+    t = DateTime(2026, 10, 2, 12)
+    @test ra(t + Millisecond(1500), t, 60) == 2            # rounds up to whole seconds
+    @test ra(t - Second(5), t, 60) == 1                    # overdue: never 0
+    @test ra(t + Hour(1), t, 60) == 60                     # never past the window
+    @test ra(typemax(DateTime), t, 60) == 60               # no survivors: no overflow
 end
 
 end # @testitem "Rate limiter construction and keying"

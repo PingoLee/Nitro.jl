@@ -197,9 +197,12 @@ RateLimiter(; strategy::Symbol = :fixed_window, # or :sliding_window
 # hand-composition needs `.middleware`:
 #     RateLimiter(rate_limit=100).middleware(handler)
 # :fixed_window owns a background sweep that reaps buckets whose window has ended (never
-# earlier), started by serve() and stopped by terminate(). :sliding_window has no task -- its
-# LRU evicts by size -- so both of its hooks are `nothing`, which startup()/shutdown() treat
-# as a no-op.
+# earlier), started by serve() and stopped by terminate(). :sliding_window has no task, so
+# both of its hooks are `nothing`, which startup()/shutdown() treat as a no-op.
+# Both cap their store at max_clients (default 10_000) and never evict a live bucket (#403):
+# when full, expired buckets are reaped inline, then a NEW client gets 503 + Retry-After
+# (admitted unrecorded under fail_open=true). Raise max_clients for more distinct clients
+# per window.
 # Period keywords (window, cleanup_period) must be fixed-length;
 # Month/Quarter/Year are an ArgumentError.
 

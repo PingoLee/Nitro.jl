@@ -2,7 +2,6 @@ module RateLimiterMiddleware
 using HTTP
 using Dates
 using Sockets
-using LRUCache
 using ...Core: getip, header_name_isequal, own_response_headers
 
 # Import top level types module
@@ -25,16 +24,28 @@ Every keyword other than `strategy` is forwarded to the chosen strategy.
 `strategy` picks the algorithm, and **only the algorithm** — both strategies return the same
 type (#172), so nothing about composing the result depends on which one you chose:
 
-- `:fixed_window` (default) — [`FixedRateLimiter`](@ref). One counter per client per window, in
-  an unbounded striped `Dict` reaped by a background sweep that `serve()` starts and
-  `terminate()` stops. Cheapest per request; a client can burst across a window boundary.
-- `:sliding_window` — [`SlidingRateLimiter`](@ref). One timestamp per request per client in a
-  size-bounded striped LRU, pruned inline. No background task, so both lifecycle hooks are
-  `nothing`. More precise, more memory, and `max_clients` bounds it rather than a sweep.
+- `:fixed_window` (default) — [`FixedRateLimiter`](@ref). One counter per client per window,
+  reaped by a background sweep that `serve()` starts and `terminate()` stops. Cheapest per
+  request; a client can burst across a window boundary.
+- `:sliding_window` — [`SlidingRateLimiter`](@ref). One timestamp per request per client,
+  pruned inline. No background task, so both lifecycle hooks are `nothing`. More precise, more
+  memory.
 
 Both key on a *prefix* of the client address — `/32` for IPv4 and `/64` for IPv6 by default —
 so an IPv6 client cannot buy quota by rotating source addresses inside its own allocation
 (#22). See the two strategy docstrings for the full keyword list.
+
+# Capacity
+
+Both hold about `max_clients` client buckets (default 10 000; split across lock stripes, see
+[`SlidingRateLimiter`](@ref)) and **never evict a live one** (#403). When the store is full, buckets whose window has ended are reaped on the spot;
+if it is still full, a *new* client gets `503 Service Unavailable` with `Retry-After` — or is
+let through unrecorded under `fail_open = true` — and a warning is logged, once per process
+across all limiters. Clients
+already being counted are unaffected. Evicting instead would hand a client rotating through
+many addresses (one IPv6 /48 is 65 536 /64s) a fresh quota on every rotation, and reset
+everyone else's. Raise `max_clients` if your app legitimately sees more distinct clients
+within one `window`.
 
 ```julia
 serve(app, middleware = [RateLimiter(rate_limit = 100, window = Minute(1))])
@@ -96,8 +107,8 @@ dispatch_rate_limiter(::Val{:sliding_window}; kwargs...) = SlidingRateLimiter(;k
 # numeric bounds, and now `strategy` (#187).
 #
 # Not every misconfiguration, and deliberately so: neither strategy takes a catch-all `kwargs...`,
-# so a keyword that does not exist on the chosen one -- `max_clients` under `:fixed_window`, say,
-# or a plain typo -- still surfaces as Julia's keyword `MethodError`. That one at least names the
+# so a keyword that does not exist on the chosen one -- `cleanup_period` under `:sliding_window`,
+# say, or a plain typo -- still surfaces as Julia's keyword `MethodError`. That one at least names the
 # offending keyword; this one named nothing the caller could act on.
 #
 # `::Val{S} where {S}`, not a bare `::Val`, so this is strictly less specific than the two methods
@@ -163,8 +174,8 @@ end
 # gets a brand-new bucket for every request simply by picking a different source address inside
 # their own allocation. The limit is then never reached, while the `X-RateLimit-*` headers keep
 # reporting that limiting is in effect. Masking to /64 collapses that whole allocation onto one
-# bucket, which is also what stops the sliding limiter's LRU from being thrashed (and legitimate
-# clients evicted) by a rotating attacker.
+# bucket. A client holding MANY /64s still gets one bucket per /64; what bounds that is the
+# store's capacity policy (#403), below.
 #
 # Defaults are /32 for IPv4 (i.e. unchanged — one bucket per host) and /64 for IPv6.
 # django-ratelimit (`RATELIMIT_IPV4_MASK`/`RATELIMIT_IPV6_MASK`) and HAProxy
@@ -243,10 +254,18 @@ end
 #
 # It also shortens the LONGEST hold, not just the average: the fixed limiter's background sweep
 # walks one stripe at a time, so it never blocks more than 1/N of the traffic at once.
+#
+# `next_reap` is the earliest instant any bucket in this stripe can have expired — a lower bound,
+# since a bucket only ever moves its expiry later. It is what lets a full stripe skip the reaping
+# scan until reaping could actually free a slot; see `_has_room!`.
 struct _Stripe{S}
-    lock  :: ReentrantLock
-    store :: S
+    lock      :: ReentrantLock
+    store     :: S
+    next_reap :: Base.RefValue{DateTime}
 end
+
+# `typemin`: nothing is known about the store yet, so the first full-stripe check scans.
+_Stripe(lock::ReentrantLock, store::S) where {S} = _Stripe{S}(lock, store, Ref(typemin(DateTime)))
 
 # Power of two, so stripe selection is a mask rather than a division.
 const _DEFAULT_STRIPES = 16
@@ -257,11 +276,11 @@ _make_stripes(build, n::Int) = [_Stripe(ReentrantLock(), build()) for _ in 1:n]
     return @inbounds stripes[(hash(key) & UInt(length(stripes) - 1)) + 1]
 end
 
-# Stripe count for a size-BOUNDED store (the sliding limiter's LRU). Each stripe gets its own
-# `maxsize`, so N stripes over a small `max_clients` would evict far earlier than the caller
-# asked for — with `max_clients=100`, 16 stripes of 7 entries each would drop a client while
-# the store held 30. Keep at least ~64 entries per stripe and fall back to a single stripe for
-# small caches, which reproduces the pre-striping behaviour exactly.
+# Stripe count for a size-BOUNDED store — both strategies' since #403. Each stripe gets its own
+# share of `max_clients`, so N stripes over a small `max_clients` would turn clients away far
+# earlier than the caller asked for — with `max_clients=100`, 16 stripes of 7 entries each would
+# refuse a client while the store held 30. Keep at least ~64 entries per stripe and fall back to
+# a single stripe for small stores, where the bound is exact.
 const _MIN_ENTRIES_PER_STRIPE = 64
 
 function _bounded_stripe_count(max_entries::Int)
@@ -293,22 +312,123 @@ function _sweep_expired!(stripes::Vector{<:_Stripe}, window::Period, current_tim
     # would reinstate exactly the global stall striping exists to remove.
     for stripe in stripes
         lock(stripe.lock) do
-            to_delete = BucketKey[]
-            # Collect first, delete after — mutating a collection while iterating it
-            # is not a supported pattern. (On the current `Dict` a `delete!` only
-            # tombstones and never rehashes, so the one-pass form happens to work;
-            # this does not depend on that.)
-            for (key, (_, last_reset)) in stripe.store
-                if current_time - last_reset > window
-                    push!(to_delete, key)
-                end
-            end
-            for key in to_delete
-                delete!(stripe.store, key)
-            end
+            stripe.next_reap[] = _reap_expired!(stripe.store, window, current_time)
         end
     end
     return nothing
+end
+
+# ── Capacity (#403) ────────────────────────────────────────────────────────────────────────
+#
+# Per-/64 keying (#22) stops rotation INSIDE one allocation, but a client holding many /64s — a
+# /56 is 256 of them, a /48 is 65,536, and hosting providers hand out both — still gets a fresh
+# bucket per /64. Both stores are therefore capped at `max_clients`, and a full one REFUSES the
+# new key rather than evicting a live bucket. Evicting is what the sliding limiter's LRU used to
+# do, and it inverted the limiter: a rotating client evicted legitimate clients' buckets (their
+# quota reset) and its own (every rotation started from a full quota), so capacity pressure
+# lowered enforcement. The fixed window had no cap at all, so its memory scaled with attack rate
+# x `cleanup_period`. Refusing is the fail-closed choice, matching the missing-IP 503 above; the
+# coarser-prefix alternative (fold new keys onto a /48) still needs a terminal refusal for a
+# client holding many /48s, so it would add machinery without removing this.
+#
+# An expired bucket answers exactly like a missing one (#319), so reaping it is never an
+# eviction — it is what a full stripe does before it refuses anyone.
+#
+# Expiry is dispatched on the bucket type rather than passed as a closure, so the reaper stays
+# concrete on the request path (nitro-core §7). `_expires_at` is the FIRST instant `_is_expired`
+# holds, which is what makes `next_reap` exact rather than off by one tick.
+
+# Fixed window: the request path's own strict `>` (see `_sweep_expired!`).
+@inline _is_expired(b::Tuple{Int, DateTime}, window::Period, t::DateTime) = t - b[2] > window
+@inline _expires_at(b::Tuple{Int, DateTime}, window::Period) = b[2] + window + Millisecond(1)
+
+# Sliding window: expired once its newest timestamp is at or before the `filter!` cutoff, i.e.
+# the request path would prune every timestamp. `maximum`, not `last`: a clock step backwards
+# can push out of order, and reaping a bucket that still holds a live timestamp is an eviction.
+@inline _is_expired(b::Vector{DateTime}, window::Period, t::DateTime) =
+    isempty(b) || maximum(b) <= t - window
+@inline _expires_at(b::Vector{DateTime}, window::Period) =
+    isempty(b) ? typemin(DateTime) : maximum(b) + window
+
+# Deletes every expired bucket and returns the earliest instant a survivor can expire (`typemax`
+# when none survive). The caller holds the stripe's lock.
+function _reap_expired!(store::AbstractDict{BucketKey}, window::Period, t::DateTime)::DateTime
+    to_delete = BucketKey[]
+    next = typemax(DateTime)
+    # Collect first, delete after — mutating a collection while iterating it is not a supported
+    # pattern. (On the current `Dict` a `delete!` only tombstones and never rehashes, so the
+    # one-pass form happens to work; this does not depend on that.)
+    for (key, bucket) in store
+        if _is_expired(bucket, window, t)
+            push!(to_delete, key)
+        else
+            next = min(next, _expires_at(bucket, window))
+        end
+    end
+    for key in to_delete
+        delete!(store, key)
+    end
+    return next
+end
+
+# Whether `stripe` can take one more bucket, reaping it first if it is full. The caller holds
+# the stripe's lock and has already checked that the key is new.
+#
+# The scan runs only once `t` reaches `next_reap`. Without that gate a flood of refused keys
+# would buy an O(stripe) walk under the lock on EVERY request, turning the refusal path into a
+# CPU amplifier. `next_reap` is a lower bound (buckets only ever move their expiry later), so the
+# gate can cost a fruitless scan but can never skip a reapable bucket.
+function _has_room!(stripe::_Stripe, cap::Int, window::Period, t::DateTime)::Bool
+    length(stripe.store) < cap && return true
+    t >= stripe.next_reap[] || return false
+    stripe.next_reap[] = _reap_expired!(stripe.store, window, t)
+    return length(stripe.store) < cap
+end
+
+# Records a bucket just inserted into `stripe`. The caller holds the stripe's lock.
+#
+# This is what keeps `next_reap` a lower bound. A reap sets it from the buckets that SURVIVED, so
+# without this a bucket inserted afterwards was invisible to it: a reap that emptied the stripe
+# left `typemax`, the gate in `_has_room!` never opened again, and once that stripe refilled it
+# refused every new client -- for the life of the process under the sliding strategy, which has
+# no sweep. It also covers a wall clock stepping backwards, which can give a new bucket an
+# earlier expiry than any survivor.
+@inline _note_expiry!(stripe::_Stripe, expires_at::DateTime) =
+    (stripe.next_reap[] = min(stripe.next_reap[], expires_at); nothing)
+
+# Seconds a refused client should wait: until the stripe's next bucket can expire, which is the
+# soonest a slot can free up. Clamped to [1, window], and the typemax case is caught before the
+# subtraction rather than after it.
+@inline function _retry_after(next_reap::DateTime, t::DateTime, window_seconds::Int)::Int
+    next_reap >= t + Second(window_seconds) && return window_seconds
+    return clamp(ceil(Int, Dates.value(next_reap - t) / 1000), 1, window_seconds)
+end
+
+# `Retry-After` granularity is a second, and a sub-second window still has to say "1".
+_window_seconds(window::Period) = max(1, ceil(Int, Dates.toms(window) / 1000))
+
+# The lock-held decision both request paths return, as the first element of a concrete
+# `Tuple{Int,Int,Int}` (see the #364 note in `FixedRateLimiter`).
+const _ADMIT = 0
+const _LIMIT = 1
+const _FULL  = 2
+
+# A new client arrived at a full stripe. Outside the lock: it logs and may run the handler.
+#
+# `maxlog=1` makes the warning one-shot per process — an operator learns that the store filled
+# (address rotation, or a `max_clients` too small for real traffic) before a user reports it,
+# without a log line per refused request. It names no address: the point is the capacity event.
+# `fail_open` lets the client through UNRECORDED; it already means "prefer availability when the
+# limiter cannot do its job", and a full store is that case.
+function _refuse_new_client(handle::Function, req::HTTP.Request, fail_open::Bool,
+                            retry_after::Int, max_clients::Int)
+    @warn "RateLimiter: the client store is full, so new clients are being refused until a " *
+          "bucket's window ends. One host rotating through many addresses (e.g. IPv6 /64s " *
+          "inside a /48) fills it; raise `max_clients` if this is legitimate traffic." max_clients maxlog=1
+    fail_open && return handle(req)
+    resp = SERVICE_UNAVAILABLE()
+    HTTP.setheader(resp, "Retry-After" => string(retry_after))
+    return resp
 end
 
 # This limiter's janitor `work`, and the labels its failures are logged under — defined once so
@@ -335,7 +455,7 @@ function _cleanup_loop(token::Ref{Bool}, stripes::Vector{<:_Stripe},
 end
 
 """
-    FixedRateLimiter(; rate_limit::Int = 100, window::Period = Minute(1), cleanup_period::Period = Minute(10), auto_extract_ip::Bool = true, forwarded_header::Symbol = :none, trusted_proxies = nothing, fail_open::Bool = false, exempt_paths::Vector{String} = String[], ipv4_prefix::Int = 32, ipv6_prefix::Int = 64)
+    FixedRateLimiter(; rate_limit::Int = 100, window::Period = Minute(1), cleanup_period::Period = Minute(10), max_clients::Int = 10000, auto_extract_ip::Bool = true, forwarded_header::Symbol = :none, trusted_proxies = nothing, fail_open::Bool = false, exempt_paths::Vector{String} = String[], ipv4_prefix::Int = 32, ipv6_prefix::Int = 64)
 
 Creates a middleware function that enforces rate limiting based on IP address, with automatic background cleanup to prevent memory leaks.
 
@@ -343,10 +463,11 @@ Creates a middleware function that enforces rate limiting based on IP address, w
 - `rate_limit::Int`: Maximum number of requests allowed per IP within the window period. Default is 100. Must be positive.
 - `window::Period`: Time window for rate limiting. Default is 1 minute. Must be a positive fixed-length `Period`; calendar periods (`Month`, `Quarter`, `Year`) are rejected.
 - `cleanup_period::Period`: How often the background sweep runs. Default is 10 minutes. Must be a positive fixed-length `Period`. The sweep deletes every client entry whose window has ended, and never one whose window is still running, so a throttled client stays throttled for the whole `window` and an idle client's entry is held for at most `window + cleanup_period`.
+- `max_clients::Int`: Maximum distinct client buckets held at once. Default 10000. Must be positive. A full store refuses a *new* client with 503 rather than evicting a live bucket; see *Capacity* in [`RateLimiter`](@ref).
 - `auto_extract_ip::Bool`: If `true` (default), the middleware will automatically extract the client IP address from the request using the built-in extractor. Setting `false` is incompatible with `forwarded_header`/`trusted_proxies`, since nothing would then apply them.
 - `forwarded_header::Symbol`: Forwarded to [`ExtractIP`](@ref) — the single header your reverse proxy writes. Any value `ExtractIP` accepts, `:none` being the default. Must be set together with `trusted_proxies`.
 - `trusted_proxies`: Forwarded to [`ExtractIP`](@ref) — the proxies whose forwarding header may be believed, as `IPAddr` values or CIDR strings (`"10.244.0.0/16"`). The header is read only when the socket peer matches one of them.
-- `fail_open::Bool`: If `true`, an internal error in the limiter lets the request through instead of returning 503. Default `false` (fail closed).
+- `fail_open::Bool`: If `true`, an internal error in the limiter lets the request through instead of returning 503, and so does a *new* client arriving at a full store — admitted unrecorded, so a client rotating addresses while the store is full is not limited at all. Default `false` (fail closed).
 - `exempt_paths::Vector{String}`: Request paths to skip rate limiting. Default is empty. Each entry covers whole path segments: `"/health"` exempts `/health`, `/health/live` and `/health?full=1`, but not `/healthz`. An entry ending in `/` covers only what is below it. Entries are compared with `req.target`, whose path is in canonical percent-encoding by the time middleware runs, so write them that way (`"/caf%C3%A9"`, not `"/café"`).
 - `ipv4_prefix::Int`: Network prefix length the IPv4 bucket key is masked to. Default 32 — one bucket per host, i.e. unchanged. Must be 1-32.
 - `ipv6_prefix::Int`: Network prefix length the IPv6 bucket key is masked to. Default 64. Must be 1-128. A single IPv6 host normally controls a whole /64, so keying on the full /128 lets a client rotate source addresses inside its own allocation and never reach the limit; /64 collapses the allocation onto one bucket. Widen to /48 if your clients hold /48s (Let's Encrypt limits this way), narrow only if you know your addressing.
@@ -380,6 +501,7 @@ function FixedRateLimiter(;
     rate_limit          :: Int = 100,
     window              :: Period = Minute(1),
     cleanup_period      :: Period = Minute(10),
+    max_clients         :: Int = 10000,
     auto_extract_ip     :: Bool = true,
     forwarded_header    :: Symbol = :none,
     trusted_proxies     :: Union{Nothing, AbstractVector} = nothing,
@@ -397,14 +519,19 @@ function FixedRateLimiter(;
     # rejecting at construction still beats reporting from a background task.
     require_fixed_period("window", window)
     require_fixed_period("cleanup_period", cleanup_period)
+    max_clients > 0 || throw(ArgumentError("max_clients must be positive, got $max_clients"))
     v4mask, v6mask = _prefix_masks(ipv4_prefix, ipv6_prefix)
 
     # Validates the trust configuration here, not at `serve()` — see `build_ip_extractor`.
     extract_client_ip = build_ip_extractor(auto_extract_ip, forwarded_header, trusted_proxies)
 
-    # Striped store — see `_Stripe`. Unbounded in size (only the sweep below reaps it), so it
-    # takes the full stripe count regardless of load.
-    stripes = _make_stripes(() -> Dict{BucketKey, Tuple{Int, DateTime}}(), _DEFAULT_STRIPES)
+    # Striped store — see `_Stripe`. Capped at `max_clients` split across the stripes (#403); it
+    # used to be unbounded, reaped only by the sweep below, so between sweeps it held one entry
+    # per distinct prefix seen — memory a client rotating through many /64s controlled.
+    nstripes = _bounded_stripe_count(max_clients)
+    per_stripe = cld(max_clients, nstripes)
+    stripes = _make_stripes(() -> Dict{BucketKey, Tuple{Int, DateTime}}(), nstripes)
+    window_seconds = _window_seconds(window)
     
     # The hooks, and every piece of discipline behind them, come from `_janitor`
     # (src/middleware/janitor.jl): the per-activation stop token that stops a restart leaking a
@@ -453,12 +580,13 @@ function FixedRateLimiter(;
                 stripe = _stripe_for(stripes, key)
                 rate_limit_store = stripe.store
 
-                # Each case RETURNS `(should_limit, remaining_requests, reset_time)` as a concrete
-                # `Tuple{Bool,Int,Int}`. These three used to be locals declared above the block
-                # and assigned inside it, which boxed them and handed `set_rate_headers!` three
+                # Each case RETURNS `(outcome, remaining_requests, reset_time)` as a concrete
+                # `Tuple{Int,Int,Int}` -- `outcome` is `_ADMIT`/`_LIMIT`/`_FULL`, and for `_FULL`
+                # the third slot is the `Retry-After`. These used to be locals declared above the
+                # block and assigned inside it, which boxed them and handed `set_rate_headers!`
                 # `Any`s on every request (#364) -- see the sliding limiter's note on the same
                 # shape. `test/closure_boxing_tests.jl` now fails on any boxed closure in Nitro.
-                should_limit, remaining_requests, reset_time = lock(stripe.lock) do
+                outcome, remaining_requests, reset_time = lock(stripe.lock) do
                     current_time = now(UTC)
 
                     if haskey(rate_limit_store, key)
@@ -468,32 +596,42 @@ function FixedRateLimiter(;
                         if current_time - last_reset > window
                             rate_limit_store[key] = (1, current_time)
                             # Reset to current time, so reset time is full window period
-                            return (false, rate_limit - 1,
+                            return (_ADMIT, rate_limit - 1,
                                     calculate_reset_time(current_time, current_time, window))
 
                         # Case 3: Limit Exceeded
                         elseif count >= rate_limit
                             # Use original last_reset to calculate remaining time
-                            return (true, 0, calculate_reset_time(current_time, last_reset, window))
+                            return (_LIMIT, 0, calculate_reset_time(current_time, last_reset, window))
 
                         # Case 4: Within Limit
                         else
                             rate_limit_store[key] = (count + 1, last_reset)
                             # Calculate reset based on original last_reset
-                            return (false, rate_limit - (count + 1),
+                            return (_ADMIT, rate_limit - (count + 1),
                                     calculate_reset_time(current_time, last_reset, window))
                         end
                     end
 
-                    # Case 1: New IP
-                    rate_limit_store[key] = (1, current_time)
+                    # Case 1: New IP -- the only case that grows the store, so the only one that
+                    # can find it full (#403). A full stripe refuses; it never evicts.
+                    if !_has_room!(stripe, per_stripe, window, current_time)
+                        return (_FULL, 0,
+                                _retry_after(stripe.next_reap[], current_time, window_seconds))
+                    end
+                    bucket = (1, current_time)
+                    rate_limit_store[key] = bucket
+                    _note_expiry!(stripe, _expires_at(bucket, window))
                     # Start from current time, full window period
-                    return (false, rate_limit - 1,
+                    return (_ADMIT, rate_limit - 1,
                             calculate_reset_time(current_time, current_time, window))
                 end
 
+                outcome == _FULL &&
+                    return _refuse_new_client(handle, req, fail_open, reset_time, max_clients)
+
                 # Prepare the response
-                if should_limit
+                if outcome == _LIMIT
                     # Create a new response for rate-limited requests
                     response = HTTP.Response(429, "Rate limit exceeded")
                     set_rate_headers!(response, rate_limit, 0, reset_time)
@@ -535,19 +673,19 @@ end
 """
     SlidingRateLimiter(; rate_limit::Int=100, window::Period=Minute(1), max_clients::Int=10000, exempt_paths::Vector{String}=String[], auto_extract_ip::Bool=true, forwarded_header::Symbol=:none, trusted_proxies=nothing, fail_open::Bool=false, ipv4_prefix::Int=32, ipv6_prefix::Int=64)
 
-Creates a middleware function that enforces rate limiting using an LRU cache for sliding window tracking.
+Creates a middleware function that enforces rate limiting with a per-client log of request timestamps.
 This implementation provides true sliding window behavior where each request creates its own expiration time,
 offering more precise rate limiting than fixed windows but with higher memory usage.
 
 # Arguments
 - `rate_limit::Int`: Maximum requests per client per window. Default 100. Must be positive.
 - `window::Period`: Sliding time window duration. Default 1 minute. Must be a positive fixed-length `Period`; calendar periods (`Month`, `Quarter`, `Year`) are rejected.
-- `max_clients::Int`: Maximum distinct client buckets in LRU cache. Default 10000. Must be positive.
+- `max_clients::Int`: Maximum distinct client buckets held at once. Default 10000. Must be positive. A full store refuses a *new* client with 503 rather than evicting a live bucket; see *Capacity* in [`RateLimiter`](@ref).
 - `exempt_paths::Vector{String}`: Request paths to skip rate limiting. Default empty. Matched on whole path segments against the canonical `req.target`, exactly as for [`FixedRateLimiter`](@ref): `"/health"` exempts `/health` and `/health/live`, not `/healthz`.
 - `auto_extract_ip::Bool`: If true, automatically extract IP address from request. Default true. Setting `false` is incompatible with `forwarded_header`/`trusted_proxies`, since nothing would then apply them.
 - `forwarded_header::Symbol`: Forwarded to [`ExtractIP`](@ref) — the single header your reverse proxy writes. Any value `ExtractIP` accepts, `:none` being the default. Must be set together with `trusted_proxies`.
 - `trusted_proxies`: Forwarded to [`ExtractIP`](@ref) — the proxies whose forwarding header may be believed, as `IPAddr` values or CIDR strings (`"10.244.0.0/16"`). The header is read only when the socket peer matches one of them.
-- `fail_open::Bool`: If `true`, an internal error in the limiter lets the request through instead of returning 503. Default `false` (fail closed).
+- `fail_open::Bool`: If `true`, an internal error in the limiter lets the request through instead of returning 503, and so does a *new* client arriving at a full store — admitted unrecorded, so a client rotating addresses while the store is full is not limited at all. Default `false` (fail closed).
 - `ipv4_prefix::Int`: Network prefix length the IPv4 bucket key is masked to. Default 32 — one bucket per host, i.e. unchanged. Must be 1-32.
 - `ipv6_prefix::Int`: Network prefix length the IPv6 bucket key is masked to. Default 64. Must be 1-128. A single IPv6 host normally controls a whole /64, so keying on the full /128 lets a client rotate source addresses inside its own allocation and never reach the limit; /64 collapses the allocation onto one bucket. Widen to /48 if your clients hold /48s (Let's Encrypt limits this way), narrow only if you know your addressing.
 
@@ -567,13 +705,14 @@ Uses a sliding window approach where:
 1. Each request timestamp is stored individually
 2. On each request, expired timestamps are pruned
 3. Current request count is checked against limit
-4. LRU eviction prevents unbounded memory growth
+4. A client with no live timestamps is reaped only when the store is full; it is never evicted
+   while it still has one
 
 The store is striped across independent locks (see `_Stripe`), and `max_clients` is divided
 among the stripes, so the total bound holds to within one entry per stripe (the per-stripe
-quota is rounded up). Eviction becomes per stripe: a stripe holding
-an unusually busy share of the key space evicts at its own quota rather than globally. Caches
-too small to divide (under 128 entries) use a single stripe and behave exactly as before.
+quota is rounded up). Capacity is per stripe too: a stripe holding an unusually busy share of
+the key space fills, and refuses new clients, at its own quota. Stores too small to divide
+(under 128 entries) use a single stripe, where the bound is exact.
 
 # Note
 - The `X-RateLimit-Reset` header indicates when the oldest request expires (when at least 1 request slot becomes available), not when the full quota resets.
@@ -606,22 +745,29 @@ function SlidingRateLimiter(;
     # Validates the trust configuration here, not at `serve()` — see `build_ip_extractor`.
     extract_client_ip = build_ip_extractor(auto_extract_ip, forwarded_header, trusted_proxies)
 
-    # Striped LRU: BucketKey -> Vector of request timestamps. `max_clients` is split across the
-    # stripes (rounded up, so the total may exceed `max_clients` by at most `nstripes - 1`)
-    # and eviction becomes per-stripe — a hot stripe
-    # evicts at its own share rather than globally. That is the standard sharded-cache trade;
-    # `_bounded_stripe_count` keeps it honest by collapsing to a single stripe for small caches.
+    # Striped store: BucketKey -> Vector of request timestamps. `max_clients` is split across the
+    # stripes (rounded up, so the total may exceed `max_clients` by at most `nstripes - 1`) and
+    # capacity becomes per-stripe — a hot stripe refuses at its own share rather than globally.
+    # That is the standard sharded-cache trade; `_bounded_stripe_count` keeps it honest by
+    # collapsing to a single stripe for small stores.
+    #
+    # A `Dict`, not the `LRU` it was until #403: a full stripe now refuses the new key (see
+    # `_has_room!`) instead of evicting the least-recently-used client, so the recency order an
+    # LRU maintains on every access had nothing left to pay for.
     nstripes = _bounded_stripe_count(max_clients)
     per_stripe = cld(max_clients, nstripes)
-    stripes = _make_stripes(() -> LRU{BucketKey, Vector{DateTime}}(maxsize = per_stripe), nstripes)
-    
-    # Precompute fallback reset seconds (window in milliseconds → seconds)
-    default_reset_seconds = Int(ceil(Dates.value(window) / 1000))
+    stripes = _make_stripes(() -> Dict{BucketKey, Vector{DateTime}}(), nstripes)
+
+    # The window in whole seconds: the empty-vector fallback below and the refusal's
+    # `Retry-After`. It used to be `Dates.value(window) / 1000`, which is milliseconds only when
+    # `window` is a `Millisecond` -- `Minute(1)` came out as 1 second. Unreachable then (a bucket
+    # is never empty when the fallback is asked), but `_window_seconds` converts properly.
+    window_seconds = _window_seconds(window)
 
     # Compute reset time from timestamps (safe for empty vectors)
     function compute_reset_time_safe(current_time::DateTime, timestamps::Vector{DateTime})
         if isempty(timestamps)
-            return default_reset_seconds
+            return window_seconds
         else
             oldest_timestamp = minimum(timestamps)
             return calculate_reset_time(current_time, oldest_timestamp, window)
@@ -658,22 +804,34 @@ function SlidingRateLimiter(;
                 # under it is serialised. Running the downstream chain here made one
                 # slow handler block every other request from every IP (#15).
                 #
-                # The lock is still required: `get!` hands back a *shared mutable*
-                # `Vector{DateTime}`, and LRUCache's internal SpinLock protects only
-                # the container, not that vector. Every read/write of `timestamps`
-                # must therefore stay inside this block.
+                # The lock guards the stripe's `Dict` and the *shared mutable*
+                # `Vector{DateTime}` it hands back, so every read/write of `timestamps`
+                # must stay inside this block.
                 #
-                # The decision is returned as a concrete `Tuple{Bool,Int,Int}` rather
+                # The decision is returned as a concrete `Tuple{Int,Int,Int}` rather
                 # than assigned to hoisted locals: assigning an enclosing-scope local
                 # from inside a closure boxes it, which would hand `set_rate_headers!`
-                # three `Any`s on the request hot path (nitro-core §7).
-                should_limit, remaining_requests, reset_time = lock(stripe.lock) do
+                # three `Any`s on the request hot path (nitro-core §7). `outcome` is
+                # `_ADMIT`/`_LIMIT`/`_FULL`; for `_FULL` the third slot is the `Retry-After`.
+                outcome, remaining_requests, reset_time = lock(stripe.lock) do
                     current_time = now(UTC)
 
-                    # Get existing timestamps or create empty vector. The assertion is
-                    # load-bearing: LRUCache's `get!` infers `Any`, so without it the tuple's
-                    # middle element, derived from `length(timestamps)`, was `Any` (#364).
-                    timestamps = get!(rate_limit_store, key, DateTime[])::Vector{DateTime}
+                    # A new client is the only thing that grows the store, so it is the only
+                    # thing that can find it full (#403). A full stripe refuses; it never evicts.
+                    existing = get(rate_limit_store, key, nothing)
+                    if existing === nothing
+                        if !_has_room!(stripe, per_stripe, window, current_time)
+                            return (_FULL, 0,
+                                    _retry_after(stripe.next_reap[], current_time, window_seconds))
+                        end
+                        timestamps = DateTime[]
+                        rate_limit_store[key] = timestamps
+                        # A new bucket is never throttled (`rate_limit > 0`), so the `push!`
+                        # below always records `current_time`; note that expiry now.
+                        _note_expiry!(stripe, current_time + window)
+                    else
+                        timestamps = existing
+                    end
 
                     # Prune expired timestamps (sliding window cleanup)
                     # Keep only timestamps within the current window
@@ -682,7 +840,7 @@ function SlidingRateLimiter(;
 
                     # Check if adding this request would exceed the limit
                     if length(timestamps) >= rate_limit
-                        return (true, 0, compute_reset_time_safe(current_time, timestamps))
+                        return (_LIMIT, 0, compute_reset_time_safe(current_time, timestamps))
                     end
 
                     # Within the limit: consume the slot and snapshot the header values
@@ -693,13 +851,16 @@ function SlidingRateLimiter(;
                     push!(timestamps, current_time)
                     # Remaining quota, and time until the oldest request expires (when
                     # 1 slot becomes available).
-                    return (false, rate_limit - length(timestamps),
+                    return (_ADMIT, rate_limit - length(timestamps),
                             compute_reset_time_safe(current_time, timestamps))
                 end
 
+                outcome == _FULL &&
+                    return _refuse_new_client(handle, req, fail_open, reset_time, max_clients)
+
                 # Prepare the response — outside the lock, so a slow handler delays
                 # only its own request.
-                if should_limit
+                if outcome == _LIMIT
                     resp = HTTP.Response(429, "429 Too Many Requests")
                     set_rate_headers!(resp, rate_limit, 0, reset_time)
                     return resp
@@ -726,7 +887,8 @@ function SlidingRateLimiter(;
     end
 
     # A `LifecycleMiddleware` with both hooks left `nothing` (#172). This strategy owns no
-    # background task — its LRU evicts by size, so there is nothing to start or stop — but
+    # background task — a full stripe reaps its expired buckets inline (#403), so there is
+    # nothing to start or stop — but
     # `RateLimiter(strategy = ...)` must not hand back a different TYPE depending on which
     # algorithm you picked. `startup`/`shutdown` already no-op on a `nothing` hook
     # (src/types.jl), so the wrapper costs one allocation at construction and nothing per
