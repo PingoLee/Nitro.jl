@@ -153,6 +153,19 @@ end
     @test xff(create_request(String[], PROXY)) == PROXY
 end
 
+@testset "Malformed UTF-8 in a header is unreadable, never a 500" begin
+    # HTTP.jl passes header bytes >= 0x80 through unvalidated. Base `strip` asks `isspace`, which
+    # throws `InvalidCharError` on a malformed char, so before #383 a client reaching any of these
+    # paths -- a pass-through proxy, or a trusted-range client -- turned its request into a 500.
+    for junk in ("\xf0\x80\x80\x80", "\xff", " \xc0\xaf ")
+        @test xff(create_request(["X-Forwarded-For" => "$junk, 10.0.0.8"], PROXY);
+                  proxies = [PROXY, "10.0.0.0/8"]) == PROXY
+        @test xff(create_request(["X-Forwarded-For" => "$junk, $CLIENT"], PROXY)) == CLIENT
+        @test extract_ip(create_request(["X-Real-IP" => junk], PROXY);
+                         forwarded_header = :x_real_ip, trusted_proxies = [PROXY]) == PROXY
+    end
+end
+
 @testset "Entries may carry a port" begin
     @test xff(create_request(["X-Forwarded-For" => "$CLIENT:1234"], PROXY)) == CLIENT
     @test xff(create_request(["X-Forwarded-For" => "[2001:db8::1]:443"], PROXY)) == IPv6("2001:db8::1")
@@ -177,6 +190,119 @@ end
     # Header names match case-insensitively.
     @test extract_ip(create_request(["cf-connecting-ip" => "$CLIENT"], PROXY);
                      forwarded_header = :cf_connecting_ip, trusted_proxies = [PROXY]) == CLIENT
+end
+
+@testset "RFC 7239 Forwarded: for= resolves the client (#383)" begin
+    fwd(value::AbstractString, peer = PROXY; proxies = [PROXY]) =
+        fwd(["Forwarded" => value], peer; proxies)
+    fwd(headers::Vector, peer = PROXY; proxies = [PROXY]) =
+        extract_ip(create_request(headers, peer); forwarded_header = :forwarded,
+                   trusted_proxies = proxies)
+
+    @test fwd("for=$CLIENT") == CLIENT
+    @test fwd("for=$CLIENT;proto=https;by=_edge") == CLIENT
+    # Parameter names are case-insensitive; values may be quoted; a port is stripped.
+    @test fwd("For=$CLIENT") == CLIENT
+    @test fwd("for=\"$CLIENT\"") == CLIENT
+    @test fwd("for=\"$CLIENT:47011\"") == CLIENT
+    @test fwd("for=\"[2001:db8:cafe::17]:4711\"") == IPv6("2001:db8:cafe::17")
+    @test fwd("for=\"[2001:db8:cafe::17]\"") == IPv6("2001:db8:cafe::17")
+    # nginx's `for=\"$remote_addr\"` writes IPv6 without the brackets; the docs promise it works.
+    @test fwd("for=\"2001:db8:cafe::17\"") == IPv6("2001:db8:cafe::17")
+    # An obfuscated port does not make the address unreadable.
+    @test fwd("for=\"[2001:db8:cafe::17]:_port\"") == IPv6("2001:db8:cafe::17")
+    # Returned canonical, so a mapped spelling cannot mint a second bucket.
+    @test fwd("for=\"[::ffff:203.0.113.7]\"") === CLIENT
+
+    # THE #16 PROPERTY. A client prepends its own element; the walk starts from the element our
+    # proxy appended and never reaches it, so rotating it buys nothing.
+    @test fwd("for=$SPOOF, for=$CLIENT") == CLIENT
+    @test fwd("for=8.8.8.8;proto=https, for=1.2.3.4, for=$CLIENT") == CLIENT
+    # A quoted `,` or `;` is data, not a delimiter: it cannot split a client value into an
+    # element that looks like ours...
+    @test fwd("for=\"$CLIENT, for=$SPOOF\"") == PROXY
+    @test fwd("for=\"$SPOOF;for=$CLIENT\"") == PROXY
+    # ...nor break up a readable element of our proxy's. These are the assertions a
+    # quote-unaware split fails: it would cut `"a,b;c"` apart and lose the element.
+    @test fwd("for=$CLIENT;host=\"a,b;c\"") == CLIENT
+    @test fwd("for=$SPOOF, for=$CLIENT;x=\"p, for=$SPOOF\"") == CLIENT
+    @test fwd("for=$SPOOF, for=$CLIENT;x=\"p; for=$SPOOF\"") == CLIENT
+
+    # Known hops are peeled right-to-left, by address or CIDR.
+    inner = IPv4("10.0.0.8")
+    @test fwd("for=$CLIENT, for=$inner"; proxies = [PROXY, inner]) == CLIENT
+    @test fwd("for=$SPOOF, for=$CLIENT, for=$inner"; proxies = [PROXY, "10.0.0.0/24"]) == CLIENT
+    # Every hop ours → the request came from inside the estate: the peer.
+    @test fwd("for=$inner"; proxies = [PROXY, inner]) == PROXY
+    # Blank elements and empty pairs are proxy quirks, not opaque hops.
+    @test fwd("for=$CLIENT,,") == CLIENT
+    @test fwd("for=$CLIENT, ") == CLIENT
+    @test fwd("for=$CLIENT;") == CLIENT
+    @test fwd("for=$CLIENT, ;") == CLIENT
+
+    # Anything that does not name an address stops the walk at the peer -- skipping it would
+    # hand back what lies to its left.
+    for stop in ("for=unknown", "for=UNKNOWN", "for=_hidden", "for=\"_hidden\"",
+                 "proto=https", "by=_edge", "for=junk", "for=\"\"", "for=",
+                 "for=$SPOOF;for=$CLIENT",           # a parameter MUST NOT repeat (§4)
+                 "for=$CLIENT;proto=https;proto=http",
+                 "garbage", "=$CLIENT", "f r=$CLIENT", "for=\"$CLIENT",
+                 "for=\"$CLIENT\"x", "for=$CLIENT\"", "for=\"$CLIENT\\\"")
+        @test fwd("for=$SPOOF, $stop") == PROXY
+    end
+    # ...and only once the walk reaches it: an unreadable element LEFT of the client is never
+    # parsed into the answer.
+    @test fwd("garbage, for=$CLIENT") == CLIENT
+    @test fwd("for=_hidden, for=$CLIENT") == CLIENT
+
+    # The client's unterminated quote cannot swallow our proxy's element. HTTP.jl folds ADJACENT
+    # duplicate lines into one comma-joined value, so a client that sends its broken line last
+    # lands on the same line as the proxy's -- which is why the split runs right-to-left.
+    @test fwd("for=\", for=$CLIENT") == CLIENT
+    @test fwd("for=\"$SPOOF\\\", for=$CLIENT") == CLIENT
+    @test fwd("for=\"[2001:db8::1, for=\"[2001:db8::2]\"") == IPv6("2001:db8::2")
+    # An escaped quote inside our proxy's element is still read correctly from the right.
+    @test fwd("for=$CLIENT;x=\"a\\\"b\"") == CLIENT
+    @test fwd("for=$CLIENT;x=\"a\\\\\"") == CLIENT
+    # Non-ASCII in a quoted value to the left is just bytes.
+    @test fwd("for=\"café\", for=$CLIENT") == CLIENT
+    # So is MALFORMED UTF-8, which HTTP.jl passes through: a client's junk left of our element
+    # is never parsed (the scan is lazy), and junk the walk does reach is unreadable, never a
+    # throw -- `strip`/`lowercase` throw `InvalidCharError` on these bytes, which was a 500.
+    for junk in ("\xf0\x80\x80\x80", "\xff", "for=\xff", "for=\"[\xff]\"", "for=$CLIENT;proto=\xff")
+        @test fwd("$junk, for=$CLIENT") == CLIENT
+        @test fwd("for=$CLIENT, $junk"; proxies = [PROXY, CLIENT]) == PROXY
+    end
+
+    # Separate lines, kept apart by another field, are one chain in order (RFC 9110 §5.3).
+    function raw_request(pairs, peer)
+        req = HTTP.Request("GET", "/", [], "")
+        empty!(req.headers)
+        for (k, v) in pairs
+            push!(req.headers, k => v)
+        end
+        setip!(req, peer)
+        return req
+    end
+    split_lines = raw_request(["Forwarded"  => "for=\"$SPOOF",     # client, unterminated
+                               "User-Agent" => "curl/8",
+                               "Forwarded"  => "for=$CLIENT"], PROXY)
+    @test count(p -> lowercase(first(p)) == "forwarded", split_lines.headers) == 2
+    @test extract_ip(split_lines; forwarded_header = :forwarded, trusted_proxies = [PROXY]) == CLIENT
+
+    # Trust is still gated on the peer, and `:forwarded` is the only header read.
+    @test fwd("for=$CLIENT", IPv4("203.0.113.99")) == IPv4("203.0.113.99")
+    @test fwd(["X-Forwarded-For" => "$SPOOF", "X-Real-IP" => "$SPOOF",
+               "Forwarded" => "for=$CLIENT"]) == CLIENT
+    @test fwd(["X-Forwarded-For" => "$CLIENT"]) == PROXY
+    @test xff(create_request(["Forwarded" => "for=$SPOOF", "X-Forwarded-For" => "$CLIENT"],
+                             PROXY)) == CLIENT
+    # Nothing usable at all → peer.
+    @test fwd("") == PROXY
+    @test fwd(Pair{String,String}[]) == PROXY
+    # #404: the unspecified address is never a proxy here either.
+    UNSPEC = Nitro.Core._UNKNOWN_PEER
+    @test fwd("for=$SPOOF", UNSPEC; proxies = ["0.0.0.0/8"]) == UNSPEC
 end
 
 @testset "CIDR ranges in trusted_proxies" begin
@@ -447,9 +573,15 @@ end
     # #374 — the scheme header follows the same rules as the address header.
     # A scheme header with no boundary is honored from any client.
     @test_throws ArgumentError ExtractIP(forwarded_proto = :x_forwarded_proto)
-    # A typo, and RFC 7239 `Forwarded`, which is not parsed for the address either.
+    # A typo.
     @test_throws ArgumentError ExtractIP(forwarded_proto = :x_forwaded_proto, trusted_proxies = [PROXY])
-    @test_throws "Forwarded" ExtractIP(forwarded_proto = :forwarded, trusted_proxies = [PROXY])
+    # #383: RFC 7239 `Forwarded` is in both closed sets, under the same trust rules.
+    @test ExtractIP(forwarded_proto = :forwarded, trusted_proxies = [PROXY]) isa Function
+    @test ExtractIP(forwarded_header = :forwarded, trusted_proxies = [PROXY]) isa Function
+    @test ExtractIP(forwarded_header = :forwarded, forwarded_proto = :forwarded,
+                    trusted_proxies = [PROXY]) isa Function
+    @test_throws ArgumentError ExtractIP(forwarded_header = :forwarded)
+    @test_throws ArgumentError ExtractIP(forwarded_proto = :forwarded)
     # A boundary with only the scheme named is a complete configuration: V2 no longer applies.
     @test ExtractIP(forwarded_proto = :x_forwarded_proto, trusted_proxies = [PROXY]) isa Function
     @test ExtractIP(forwarded_header = :x_forwarded_for, forwarded_proto = :x_forwarded_proto,
@@ -478,6 +610,9 @@ end
     # Not a scheme this server is reachable over: ignored, never guessed.
     @test via_proxy("ftp") === nothing
     @test via_proxy("") === nothing
+    # Malformed UTF-8 in the leftmost (client-writable) value: ignored, never a 500.
+    @test via_proxy("\xff") === nothing
+    @test via_proxy("\xf0\x80\x80\x80, https") === nothing
     @test scheme(through(proto_only, Pair{String,String}[])) === nothing
 
     # A client connecting directly is not the trusted proxy: its header is ignored.
@@ -510,6 +645,73 @@ end
         proto_only(handler)(req)
         @test scheme(seen[]) == "https"
     end
+end
+
+@testset "Forwarded: proto= comes from the element that names the client (#383)" begin
+    KEY = Nitro.Core.Types.REQUEST_FORWARDED_PROTO_KEY
+    seen = Ref{HTTP.Request}()
+    handler = req -> (seen[] = req; HTTP.Response(200))
+    scheme(req) = get(req.context, KEY, nothing)
+    through(mw, value, peer = PROXY) =
+        (mw(handler)(create_request(["Forwarded" => value], peer)); seen[])
+    proto_only = ExtractIP(forwarded_proto = :forwarded, trusted_proxies = [PROXY])
+    both = ExtractIP(forwarded_header = :forwarded, forwarded_proto = :forwarded,
+                     trusted_proxies = [PROXY, "10.0.0.0/24"])
+
+    @test scheme(through(proto_only, "for=$CLIENT;proto=https")) == "https"
+    @test scheme(through(proto_only, "for=$CLIENT;PROTO=\"HTTP\"")) == "http"
+    @test scheme(through(proto_only, "for=$CLIENT;proto=wss")) == "https"
+    @test scheme(through(proto_only, "for=$CLIENT;proto=ws")) == "http"
+    @test scheme(through(proto_only, "for=$CLIENT;proto=gopher")) === nothing
+    @test scheme(through(proto_only, "for=$CLIENT")) === nothing
+    @test scheme(through(proto_only, "for=$CLIENT;proto=\"\xff\"")) === nothing
+    # A quoted delimiter elsewhere in the element does not cost it its scheme.
+    @test scheme(through(both, "for=$CLIENT;proto=https;x=\"a,b\"")) == "https"
+    @test scheme(through(both, "for=$CLIENT;x=\"a;b\";proto=https")) == "https"
+
+    # THE CHOICE. A client prepends `proto=https`; our proxy, which accepted the client over
+    # plain HTTP, says `http`. Leftmost-wins -- X-Forwarded-Proto's rule -- would answer https.
+    r = through(both, "for=$SPOOF;proto=https, for=$CLIENT;proto=http")
+    @test getip(r) == CLIENT
+    @test scheme(r) == "http"
+    # Through two of our proxies: the edge one saw the client's scheme, the inner one only the
+    # internal hop's. The edge element is the one that names the client.
+    r = through(both, "for=$CLIENT;proto=https, for=10.0.0.8;proto=http")
+    @test getip(r) == CLIENT
+    @test scheme(r) == "https"
+    # Every hop ours: the leftmost element says how the request reached the edge.
+    r = through(both, "for=10.0.0.9;proto=https, for=10.0.0.8;proto=http")
+    @test getip(r) == PROXY
+    @test scheme(r) == "https"
+
+    # An element with no usable `for=` was still written by our proxy, so its `proto=` holds --
+    # a proxy that reports only the scheme works -- while the address stays the peer.
+    for value in ("proto=https", "for=_hidden;proto=https", "for=unknown;proto=https")
+        r = through(both, value)
+        @test getip(r) == PROXY
+        @test scheme(r) == "https"
+    end
+    # An unreadable element yields neither half.
+    r = through(both, "for=$CLIENT;proto=https;proto=http")
+    @test getip(r) == PROXY
+    @test scheme(r) === nothing
+
+    # Trust gates the scheme exactly as it gates the address.
+    @test scheme(through(proto_only, "for=$CLIENT;proto=https", CLIENT)) === nothing
+    @test scheme(through(proto_only, "proto=https", Nitro.Core._UNKNOWN_PEER)) === nothing
+    # Scheme-only trust leaves the address alone; the other protocol header is not read.
+    r = through(proto_only, "for=$CLIENT;proto=https")
+    @test getip(r) == PROXY
+    xfp = create_request(["X-Forwarded-Proto" => "https", "Forwarded" => "proto=http"], PROXY)
+    proto_only(handler)(xfp)
+    @test scheme(seen[]) == "http"
+    # Mixed configuration: the address from X-Forwarded-For, the scheme from Forwarded.
+    mixed = ExtractIP(forwarded_header = :x_forwarded_for, forwarded_proto = :forwarded,
+                      trusted_proxies = [PROXY])
+    mixed(handler)(create_request(["X-Forwarded-For" => "$CLIENT",
+                                   "Forwarded" => "for=$CLIENT;proto=https"], PROXY))
+    @test getip(seen[]) == CLIENT
+    @test scheme(seen[]) == "https"
 end
 
 end

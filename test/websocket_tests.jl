@@ -135,11 +135,12 @@ _serve(ctx, port; kw...) = Nitro.Core.serve(ctx; port, host = HOST, async = true
 
 # A raw handshake rather than `WebSockets.open`: the client has to send a `Host` that is not the
 # address it connects to, which is exactly what a proxy does. Returns the status line.
-function _handshake(port; origin = nothing, proto = nothing)
+function _handshake(port; origin = nothing, proto = nothing, forwarded = nothing)
     lines = ["GET /ws HTTP/1.1", "Host: $PUBLIC_HOST", "Upgrade: websocket",
              "Connection: Upgrade", "Sec-WebSocket-Key: $WS_KEY", "Sec-WebSocket-Version: 13"]
-    origin === nothing || push!(lines, "Origin: $origin")
-    proto  === nothing || push!(lines, "X-Forwarded-Proto: $proto")
+    origin    === nothing || push!(lines, "Origin: $origin")
+    proto     === nothing || push!(lines, "X-Forwarded-Proto: $proto")
+    forwarded === nothing || push!(lines, "Forwarded: $forwarded")
     sock = Sockets.connect(Sockets.localhost, port)
     try
         write(sock, join(lines, "\r\n") * "\r\n\r\n")
@@ -186,6 +187,34 @@ end
     try
         @test forbidden(_handshake(port; origin = "https://$PUBLIC_HOST", proto = "https"))
         @test upgraded(_handshake(port; origin = "http://$PUBLIC_HOST", proto = "https"))
+    finally
+        Nitro.Core.terminate(ctx)
+    end
+end
+
+# #383: the same check, with the scheme in RFC 7239 `Forwarded` -- over the wire, so the header
+# reaches `ExtractIP` the way HTTP.jl's parser hands it over.
+@testset "a trusted proxy's Forwarded proto= decides the same-origin check (#383)" begin
+    trusted   = ExtractIP(forwarded_proto = :forwarded, trusted_proxies = [ip"127.0.0.1"])
+    untrusted = ExtractIP(forwarded_proto = :forwarded, trusted_proxies = ["10.0.0.0/8"])
+    ctx, port = _ws_context(), get_free_port()
+    _serve(ctx, port; middleware = [trusted])
+    try
+        https_origin = "https://$PUBLIC_HOST"
+        @test upgraded(_handshake(port; origin = https_origin,
+                                  forwarded = "for=203.0.113.7;proto=https"))
+        # The client's own prepended element is not the one that counts.
+        @test forbidden(_handshake(port; origin = https_origin,
+                                   forwarded = "for=9.9.9.9;proto=https, for=203.0.113.7;proto=http"))
+        # Nor does X-Forwarded-Proto, which this configuration does not read.
+        @test forbidden(_handshake(port; origin = https_origin, proto = "https"))
+    finally
+        Nitro.Core.terminate(ctx)
+    end
+    ctx, port = _ws_context(), get_free_port()
+    _serve(ctx, port; middleware = [untrusted])
+    try
+        @test forbidden(_handshake(port; origin = "https://$PUBLIC_HOST", forwarded = "proto=https"))
     finally
         Nitro.Core.terminate(ctx)
     end
