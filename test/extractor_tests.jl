@@ -1365,3 +1365,83 @@ end
     end
 end
 end
+
+@testitem "Default-argument extractors bind on named handlers (#423)" tags=[:core] setup=[NitroCommon] begin
+using Base: @kwdef
+using Test
+using HTTP
+using Nitro
+using Nitro: App, Json, Query
+
+# A default-argument extractor bound on an anonymous handler but not on a named one: Julia
+# 1.12 names a closure written in `f`'s default arguments `#f##0#f##1`, and reflection took
+# that for `f` itself and dropped the default. `p` then bound as a required scalar query
+# parameter, so every request was a 400. `Query{T}()` failed on both kinds, for want of a
+# nullary constructor -- silently, because a default that threw was simply skipped.
+@kwdef struct SP
+    q::String = ""
+    limit::Int = 10
+end
+
+predicate(req, p = Query{SP}(x -> x.limit > 0)) = Res.json(Dict("q" => p.payload.q))
+bare(req, p = Query{SP}()) = Res.json(Dict("q" => p.payload.q))
+annotated(req, p::Query{SP}) = Res.json(Dict("q" => p.payload.q))
+body(req, b = Json(SP, x -> x.limit > 0)) = Res.json(Dict("q" => b.payload.q))
+
+app = App(mod = @__MODULE__)
+urlpatterns(app, "",
+    path("/anonymous", (req, p = Query{SP}(x -> x.limit > 0)) -> Res.json(Dict("q" => p.payload.q))),
+    path("/predicate", predicate),
+    path("/bare", bare),
+    path("/annotated", annotated),
+    path("/body", body; method = "POST"),
+)
+
+for route in ("/anonymous", "/predicate", "/bare", "/annotated")
+    r = internalrequest(app, HTTP.Request("GET", "$route?q=x&limit=5"))
+    @test r.status == 200
+    @test Nitro.json(r)["q"] == "x"
+end
+
+# The default's validator still runs -- the extractor binds AND validates.
+@test internalrequest(app, HTTP.Request("GET", "/predicate?q=x&limit=0")).status == 400
+
+json_ct = ["Content-Type" => "application/json"]
+r = internalrequest(app, HTTP.Request("POST", "/body", json_ct, """{"q":"y","limit":5}"""))
+@test r.status == 200
+@test Nitro.json(r)["q"] == "y"
+@test internalrequest(app, HTTP.Request("POST", "/body", json_ct, """{"q":"y","limit":0}""")).status == 400
+
+# A handler built by a factory: the validator reads a CAPTURED variable, which lowers to
+# `Core.getfield(#self#, :maxlim)` -- evaluable, because reflection holds the closure.
+factory(maxlim) = function (req, p = Query(SP, x -> x.limit <= maxlim))
+    return Res.json(Dict("q" => p.payload.q))
+end
+app3 = App(mod = @__MODULE__)
+urlpatterns(app3, "", path("/factory", factory(5)))
+@test internalrequest(app3, HTTP.Request("GET", "/factory?q=z&limit=5")).status == 200
+@test internalrequest(app3, HTTP.Request("GET", "/factory?q=z&limit=6")).status == 400
+
+# A default that cannot be evaluated at registration is refused there, not dropped.
+unevaluable(req, p = Query{SP}("x", "y")) = p
+captures(req, n::Int, p = Query{SP}(x -> x.limit < n)) = p
+typed(req, p::Query{SP} = Query{SP}("x", "y")) = p
+for handler in (unevaluable, captures, typed)
+    err = try
+        urlpatterns(App(mod = @__MODULE__), "", path("/x", handler))
+        nothing
+    catch e
+        e
+    end
+    @test err isa ArgumentError
+    @test occursin("parameter 'p'", err.msg)
+    @test occursin("#423", err.msg)
+end
+
+# A non-extractor default that throws keeps its old meaning: the parameter is required.
+plain(req, n::Int = error("not at registration")) = Res.json(Dict("n" => n))
+app2 = App(mod = @__MODULE__)
+urlpatterns(app2, "", path("/plain", plain))
+@test internalrequest(app2, HTTP.Request("GET", "/plain?n=4")).status == 200
+@test internalrequest(app2, HTTP.Request("GET", "/plain")).status == 400
+end

@@ -129,12 +129,34 @@ function refuse_json_body_type(route::String, param::Param)
         "Declare it Json{$T}, which requires a JSON Content-Type, or read raw bytes with binary(req)."))
 end
 
+"""
+    refuse_unevaluable_extractor_defaults(route, info)
+
+Throw an `ArgumentError` at registration when a handler parameter's default builds an extractor,
+or the parameter is declared as one, but the default could not be evaluated -- it threw, or it
+refers to another parameter (#423). Without it, the parameter would bind with no default: an
+untyped one as a required query parameter named after the argument, so the route answered 400
+to every request; a typed one without the validator its default attached.
+"""
+function refuse_unevaluable_extractor_defaults(route::String, info)
+    for param in info.args
+        failed = get(info.unevaluable, param.name, nothing)
+        isnothing(failed) && continue
+        (failed.builds_extractor || param.type <: Extractor) || continue
+        throw(ArgumentError(
+            "The default of parameter '$(param.name)' of route $route builds an extractor, but it " *
+            "could not be evaluated when the route was registered (#423): $(failed.message)"))
+    end
+    return nothing
+end
+
 # The field names an extractor's `T` binds, or none for a type that has no definite fields.
 # `fieldnames(Any)` throws, so `Body{Any}`/`Json{Any}` could not even be registered (#327).
 bound_fieldnames(T) = isconcretetype(T) ? fieldnames(T) : ()
 
 function parse_func_params(route::String, func::Function; type_hints::Dict{Symbol, Type}=Dict{Symbol, Type}())
     info = splitdef(func, start=2)
+    refuse_unevaluable_extractor_defaults(route, info)
 
     hasBraces = r"({)|(})"
     route_params = Vector{Symbol}()
