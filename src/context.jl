@@ -16,11 +16,54 @@ export set_extension!, get_extension, delete_extension!, has_extension
 
 @kwdef struct EagerReviseService
     task::Task
-    done::Ref{Bool}
+    # Atomic because `close` writes it from whichever task runs `terminate`, while the watcher
+    # reads it on a `:default`-pool thread.
+    done::Threads.Atomic{Bool}
+    # `cancel_revision_wait` from the hooks the watcher was STARTED with, not whatever is
+    # registered when `close` runs, so `close` always wakes the wait the task is parked in.
+    cancel::Function
 end
 
+# Set the flag, then wake the watcher out of its wait (#427). Setting the flag alone left the
+# watcher parked on Revise's event until the next save, and on an autoresetting event that save
+# went to the dead watcher instead of the one a restarted `serve` had just started.
+#
+# A cancel that returns `false` found the watcher somewhere other than its wait. It is either
+# mid-revision, and then it rechecks the flag and exits on its own, or a few instructions short
+# of parking, having read the flag just before it was set. Only the second case needs another
+# attempt, and it parks within microseconds. So the retry runs on a `:default` task, never in
+# `terminate`, which must not wait behind a revision, and gives up after a second. By then the
+# watcher has either been woken or will exit at its next flag check, so giving up leaks nothing.
+#
+# `close` runs inside `terminate`, after the listener is already down, so nothing here may throw.
+# A hook that fails, or returns something other than a `Bool`, is logged once and not retried.
+# The watcher then exits at its next event, as it did before #427. The retry task also ends
+# quietly on an interrupt. Under `julia -t 1` it shares thread 1, so a Ctrl-C can land in it, and
+# `errormonitor` would otherwise report the press as a crash.
 function Base.close(revise_service::EagerReviseService)
     revise_service.done[] = true
+    task, cancel = revise_service.task, revise_service.cancel
+    istaskdone(task) && return nothing
+    # `true`: woken. `nothing`: the hook is broken and has been logged. Only `false` retries.
+    _try_cancel(cancel, task) === false || return nothing
+    errormonitor(Threads.@spawn :default try
+        timedwait(1.0; pollint = 0.01) do
+            istaskdone(task) || _try_cancel(cancel, task) !== false
+        end
+    catch e
+        e isa InterruptException || rethrow()
+    end)
+    return nothing
+end
+
+function _try_cancel(cancel::Function, task::Task)::Union{Bool,Nothing}
+    try
+        return Base.invokelatest(cancel, task)::Bool
+    catch e
+        e isa InterruptException && rethrow()
+        @error "Nitro: cancelling the eager-Revise watcher's wait failed" exception=(e, catch_backtrace())
+        return nothing
+    end
 end
 
 @kwdef struct Service

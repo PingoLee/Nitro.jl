@@ -326,7 +326,12 @@ loads `MustacheExt` and the method appears. No branch in the core, and no option
     import Revise
 
     function __init__()
-        Nitro.register_revise_hooks!(; revise = () -> Revise.revise())
+        Nitro.register_revise_hooks!(;
+            revise = () -> Revise.revise(),
+            has_pending_revisions = () -> !isempty(Revise.revision_queue),
+            wait_for_revision_event = _wait_for_revision_event,
+            cancel_revision_wait = _cancel_revision_wait,   # optional
+        )
     end
 
     end

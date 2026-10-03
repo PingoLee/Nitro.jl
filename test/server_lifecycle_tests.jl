@@ -1240,3 +1240,145 @@ end
 end
 
 end
+
+# #426. Ctrl-C on a BLOCKING `serve` that has already served a request, in a real interactive REPL.
+#
+# The connection task HTTP.jl spawns for a request runs on the `:interactive` pool, which is thread
+# 1, so once it finishes, thread 1 idles inside that FINISHED task's `task_done_hook`. With
+# `exit_on_sigint(false)` the next Ctrl-C is thrown there. With no REPL around, that is
+# `fatal: error thrown and no exception handler available`: the process aborts and no shutdown
+# hook runs. In a REPL, Julia's `task_done_hook` (base/task.jl) hands the interrupt to the REPL
+# backend task, which is the one blocked in `serve`, so the press stops the server cleanly. This
+# item pins that down, so the "Press Ctrl-C again to stop the server" warnings stay true.
+#
+# Measured on Julia 1.12.7, one request served, then one press:
+#
+#   | how the server runs                              | result                                   |
+#   |--------------------------------------------------|------------------------------------------|
+#   | REPL, `--threads=1,1` or `1,0`                   | `serve` returns, shutdown hooks ran      |
+#   | `julia app.jl`                                   | ended at once; `atexit` runs, no hooks   |
+#   | `julia -e`                                       | the press reaches nobody, `serve` stays  |
+#   | `-e` + `exit_on_sigint(false)` + a live `Timer`  | `fatal: error thrown ...`, no hooks      |
+#
+# Only the first row is Nitro's to keep: Julia decides the others. Each layout runs twice:
+#
+# - `Connection: close`: the connection task FINISHES before the press, so the press is thrown
+#   into its `task_done_hook` and has to be handed on. That is the #426 path.
+# - Keep-alive: the connection task is still parked when the press comes. HTTP.jl must then fail
+#   that connection, not swallow the interrupt, for `serve` to see a second press.
+#
+# The press is one keystroke, and the server is idle by then. Julia hands an interrupt to the REPL
+# only when no other task is runnable, so a press under load can still abort; the `serve`
+# docstring says so.
+#
+# The REPL runs behind a pty from util-linux `script`, and the press is a raw `\x03` written into
+# it, so the terminal's line discipline raises SIGINT exactly as a keyboard would. Linux only:
+# BSD `script` on macOS takes different arguments, and Windows has neither. The parent's shape
+# (watchdog, settle) is the #369 item's at the top of test/workers_tests.jl.
+@testitem "Server lifecycle: Ctrl-C in a REPL stops a blocking serve after a request (#426)" tags=[:core, :slow, :network] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Sockets
+
+# One REPL input line, so the REPL evaluates it in one go. The markers are split ("RE", "ADY"),
+# because the pty echoes the typed line back and an unsplit marker would match the echo. The
+# child prints its pid so the parent can kill it directly; `script` alone only forwards a SIGHUP.
+function repl_line(port::Int)
+    "using Nitro; app = App(mod = Main); " *
+    "urlpatterns(app, \"\", path(\"/\", () -> Res.send(\"ok\"), method = \"GET\")); " *
+    "println(\"PI\", \"D=\", getpid(), \" RE\", \"ADY\"); " *
+    "serve(app; host = \"127.0.0.1\", port = $port, show_banner = false, access_log = nothing, " *
+    "middleware = [Nitro.LifecycleMiddleware(middleware = h -> h, " *
+    "on_shutdown = () -> println(\"SHUTDOWN\", \"_RAN\"))]); " *
+    "println(\"SERVE\", \"_RETURNED\")"
+end
+
+# Writing to a child that has just exited raises EPIPE; that is an outcome to assert on, not an
+# error in the harness.
+send(p, s) = try write(p, s); true catch e; e isa Base.IOError || rethrow(); false end
+
+function ctrl_c_in_repl(threads::String; keepalive::Bool, settle::Real=2, deadline::Real=120)
+    port = get_free_port()
+    julia = `$(Base.julia_cmd()) --code-coverage=none --threads=$threads --project=$(Base.active_project()) --startup-file=no --banner=no --color=no -i`
+    history = tempname()
+    cmd = addenv(`script -qefc $(Base.shell_escape(julia)) /dev/null`,
+                 "TERM" => "xterm", "JULIA_HISTORY" => history)
+    out = UInt8[]
+    out_lock = ReentrantLock()
+    text() = lock(() -> String(copy(out)), out_lock)
+    child_pid() = (m = match(r"PID=(\d+) READY", text()); m === nothing ? nothing : parse(Int32, m[1]))
+    p = open(cmd, "r+")
+    timed_out = Threads.Atomic{Bool}(false)
+    watchdog = Timer(deadline) do _
+        timed_out[] = true
+        kill(p, Base.SIGKILL)
+    end
+    reader = @async while !eof(p)
+        data = readavailable(p)
+        lock(() -> append!(out, data), out_lock)
+    end
+    # The keep-alive request goes over a raw socket the parent holds open until after the press,
+    # so the connection is provably still open then. HTTP.jl's client pool would only probably
+    # keep it.
+    held = Ref{Union{Nothing,Sockets.TCPSocket}}(nothing)
+    function request!()
+        if !keepalive
+            return HTTP.get("http://127.0.0.1:$port/", ["Connection" => "close"]; retry = false).status == 200
+        end
+        sock = Sockets.connect(Sockets.IPv4("127.0.0.1"), port)
+        write(sock, "GET / HTTP/1.1\r\nHost: 127.0.0.1:$port\r\n\r\n")
+        got = UInt8[]
+        # The body after the head, whether it is framed by Content-Length or chunked.
+        while !occursin(r"\r\n\r\n[\s\S]*ok", String(copy(got))) && !eof(sock)
+            append!(got, readavailable(sock))
+        end
+        reply = String(got)
+        ok = startswith(reply, "HTTP/1.1 200") && !occursin(r"(?i)\r\nconnection:\s*close", reply)
+        held[] = sock
+        return ok
+    end
+    try
+        send(p, repl_line(port) * "\r")
+        timedwait(() -> child_pid() !== nothing || !process_running(p), deadline)
+        served = false
+        for _ in 1:120
+            served = try request!() catch; false end
+            (served || !process_running(p)) && break
+            sleep(0.5)
+        end
+        sleep(settle)
+        send(p, "\x03")
+        timedwait(() -> occursin("SERVE_RETURNED", text()) || !process_running(p), 60.0)
+        process_running(p) && send(p, "exit()\r")
+        timedwait(() -> !process_running(p), 30.0)
+        return (; served, out = text(), timed_out = timed_out[])
+    finally
+        held[] === nothing || close(held[])
+        close(watchdog)
+        # Only while it may still be alive: a pid that already exited could have been reused.
+        pid = child_pid()
+        (timed_out[] || process_running(p)) && pid !== nothing &&
+            ccall(:kill, Cint, (Cint, Cint), pid, 9)
+        process_running(p) && kill(p, Base.SIGKILL)
+        close(p)
+        rm(history; force = true)
+    end
+end
+
+if Sys.islinux()
+    # Fail, do not skip, when `script` is missing: a Linux runner without util-linux is a broken
+    # environment, and a silent pass here would say nothing about #426.
+    Sys.which("script") === nothing && error("util-linux `script` is required for the #426 Ctrl-C item")
+    for threads in ("1,1", "1,0"), keepalive in (false, true)
+        @testset "REPL at --threads=$threads, keepalive=$keepalive" begin
+            r = ctrl_c_in_repl(threads; keepalive)
+            @test !r.timed_out
+            @test r.served
+            @test contains(r.out, "SHUTDOWN_RAN")
+            @test contains(r.out, "SERVE_RETURNED")
+            @test !contains(r.out, "fatal: error thrown")
+        end
+    end
+end
+
+end

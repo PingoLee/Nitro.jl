@@ -413,6 +413,10 @@ function serve(ctx::App;
     listener = NitroStreamHandler(handle_stream)
 
     if revise == :eager
+        # Never overwrite a live watcher: its handle is the only way to stop it (#427). `close`
+        # is idempotent, so closing one `terminate` already closed costs nothing.
+        previous = ctx.service.eager_revise[]
+        previous === nothing || close(previous)
         ctx.service.eager_revise[] = start_revise_service()
     end
 
@@ -424,6 +428,11 @@ function serve(ctx::App;
     try
         return startserver(ctx; host, port, show_banner, parallel, async, kwargs, start=(kwargs) ->
             HTTP.listen!(listener, host, port; kwargs...))
+    catch
+        # A `serve(async = true)` that never got its listener up (an address in use, say) returns
+        # no handle to `terminate`, so its watcher must stop here or nothing ever stops it (#427).
+        ctx.service.eager_revise[] === nothing || close(ctx.service.eager_revise[])
+        rethrow()
     finally
         if ctx.service.eager_revise[] !== nothing && async == false
             close(ctx.service.eager_revise[])
@@ -442,14 +451,20 @@ end
 #     Julia 1.12's default layout thread 1 is the interactive thread, which the `:default` pool
 #     never runs on, so the watcher cannot take a press at all. Running `revise()` off thread 1 is
 #     not new: `revise=:lazy` already calls it from `Threads.@spawn`ed request tasks, and Revise
-#     serializes it behind its own `ReentrantLock`. Nothing injects into this task, so it may
-#     migrate freely.
-#   * `errormonitor`, because nothing waits on this task -- `close` only sets the flag. A throw
-#     used to be stored in the `Task` and never seen, and eager revision stopped without a word.
+#     serializes it behind its own `ReentrantLock`. The only thing ever thrown into this task is
+#     `close`'s `ReviseWaitCancelled` (#427), and only while it is parked in the hooks' own wait
+#     (see `_cancel_revision_wait`, ext/NitroReviseExt.jl), so it may migrate freely.
+#   * `errormonitor`, because nothing waits on this task. A throw used to be stored in the `Task`
+#     and never seen, and eager revision stopped without a word.
+#
+# The hooks are read ONCE, here, and the loop and the service share them, so `close` cancels the
+# wait the task is actually parked in, even if the hooks are re-registered in the meantime.
 function start_revise_service()
-    revise_task_done = Ref(false)
-    revise_task = errormonitor(Threads.@spawn :default _eager_revise_loop(revise_task_done))
-    EagerReviseService(revise_task, revise_task_done)
+    hooks = revise_hooks()
+    done = Threads.Atomic{Bool}(false)
+    revise_task = errormonitor(Threads.@spawn :default _eager_revise_loop(done, hooks))
+    cancel = hooks === nothing ? (_ -> false) : hooks.cancel_revision_wait
+    EagerReviseService(revise_task, done, cancel)
 end
 
 # The loop, named for the reason `_janitor_loop` is (src/middleware/janitor.jl): the placement of
@@ -462,8 +477,7 @@ end
 # (src/Workers/api.jl), and the reasoning there is canonical: STOP, say so, and return normally.
 # Rethrowing kills the task while `serve` keeps running; swallowing and looping re-parks it as the
 # last task on thread 1, so it eats every later press too.
-function _eager_revise_loop(done::Ref{Bool})
-    hooks = revise_hooks()
+function _eager_revise_loop(done::Threads.Atomic{Bool}, hooks = revise_hooks())
     hooks === nothing && return nothing
     try
         while !done[]
@@ -484,10 +498,14 @@ function _eager_revise_loop(done::Ref{Bool})
             end
         end
     catch e
+        # `close` woke us out of the wait (#427): the server that started this watcher is gone.
+        # That is the normal way to stop, so there is nothing to report.
+        e isa ReviseWaitCancelled && return nothing
         e isa InterruptException || rethrow()
         @warn "Nitro: an interrupt (Ctrl-C) reached the eager-Revise watcher instead of the " *
               "server. Eager revision has stopped until the server is started again. Press " *
-              "Ctrl-C again to stop the server."
+              "Ctrl-C again to stop the server. Outside a REPL, that press can end the process " *
+              "without running its shutdown hooks."
     end
     return nothing
 end

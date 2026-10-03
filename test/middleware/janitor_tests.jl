@@ -77,7 +77,7 @@ end
     # Workers `_cleanup_scheduler_loop`. Against the unpatched loop this call THROWS.
     interrupting = FlakyWork(1, InterruptException())
     token = Ref(true)
-    @test_logs (:warn, "Nitro.JanitorTest: an interrupt (Ctrl-C) reached the interrupting work task instead of the server. It has stopped until the server is started again. Press Ctrl-C again to stop the server.") begin
+    @test_logs (:warn, "Nitro.JanitorTest: an interrupt (Ctrl-C) reached the interrupting work task instead of the server. It has stopped until the server is started again. Press Ctrl-C again to stop the server. Outside a REPL, that press can end the process without running its shutdown hooks.") begin
         @test _janitor_loop(() -> interrupting(), token, Millisecond(1),
                             "JanitorTest", "interrupting work") === nothing
     end
