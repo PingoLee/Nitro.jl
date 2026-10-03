@@ -75,7 +75,9 @@ The `secure=false` example is only for local HTTP development. Keep `secure=true
    `req.context[:session_modified] = true` (as `CSRFMiddleware` does when it issues a token). A
    request that never touches the session stores nothing and gets no cookie, even behind a global
    `CSRFMiddleware`: it issues a new visitor a token only when a handler asks with `csrf_token!`
-   (see [When a token is issued](../sessions_and_auth.md#When-a-token-is-issued)).
+   (see [When a token is issued](../sessions_and_auth.md#When-a-token-is-issued)). A new session
+   with no signed-in identity is saved *unconfirmed* until the browser sends its cookie back (see
+   [Anonymous Sessions and Floods](#Anonymous-Sessions-and-Floods)).
 4. Writes the cookie when a session is saved or its ID rotates, and marks that response
    `Cache-Control: private` with `Vary: Cookie`, so a shared cache or CDN never hands one
    visitor's session to another. `private` replaces a `public` directive; `max-age` and the
@@ -142,12 +144,24 @@ A session has two lifetimes, and it ends at whichever comes first:
 
 | Keyword | Default | Measured from | Ends a session that is… |
 |---|---|---|---|
-| `max_age` | `86400` (1 day) | the last write | idle |
+| `max_age` | `86400` (1 day) | the last write | not written to |
 | `absolute_max_age` | `604800` (7 days) | when the session was first stored | old, however active |
 
 `max_age` is a **sliding** lifetime: every write moves the expiry forward, so on its own it never
-ends a session that keeps being used, and a stolen session ID stays valid for as long as someone
-keeps using it. `absolute_max_age` caps that. Once a session is older than the cap, it is treated
+ends a session that keeps being written, and a stolen session ID stays valid for as long as someone
+keeps writing to it. `absolute_max_age` caps that.
+
+The expiry slides on **writes, not reads**. A request that only reads the session writes nothing
+to the store, which is what keeps a page view under a login from costing an `UPDATE`. So a
+signed-in user who only reads is signed out `max_age` after the last request that changed their
+session. That is Django's default as well. If your app has long read-only stretches, raise
+`max_age`, or set `req.context[:session_modified] = true` in a handler that should keep the
+session alive: that writes it back and moves the expiry.
+
+`SessionMiddleware` writes a session back only when the request changed its data, rotated it,
+confirmed it (see [Anonymous Sessions and Floods](#Anonymous-Sessions-and-Floods)), or set
+`:session_modified`. `CSRFMiddleware` sets that flag only when it issues a new token, not when a
+request presents a valid one. Once a session is older than the cap, it is treated
 as absent: the visitor gets a fresh session and signs in again.
 
 ```julia
@@ -177,6 +191,83 @@ SessionMiddleware(store = store, absolute_max_age = nothing)                    
 - **Why seven days.** OWASP recommends an absolute timeout; Django ships none. A week keeps a
   regular user signed in across a working week and bounds how long a stolen ID works. Shorten it
   for sensitive apps.
+
+## Anonymous Sessions and Floods
+
+Any route that writes to a visitor's session before they sign in — a cart, a "recently viewed"
+list, a locale choice, a flash message on a public page — creates a session for every visitor
+without a cookie. A script that calls such a route without cookies creates one per request. Two
+things keep that from filling your store.
+
+**New anonymous sessions start unconfirmed.** A new session that ends its first request with no
+identity is saved with a short lifetime, `unconfirmed_max_age` (one hour by default), in the store
+and in the cookie's `Max-Age`. When the browser sends the cookie back, `SessionMiddleware` writes
+the session once more with the full `max_age` and re-sets the cookie. A browser usually does this
+within seconds, on the next page or asset it fetches, so a real visitor keeps a full-length session.
+That needs the request to pass through `SessionMiddleware`: when assets are served outside it, the
+next page confirms the session instead. A script that never sends the cookie back leaves rows that expire in an hour rather than a day, and
+the pruning janitor deletes them.
+
+```julia
+SessionMiddleware(store = store)                               # unconfirmed for 1 h, then max_age
+SessionMiddleware(store = store, unconfirmed_max_age = 600)    # 10 minutes
+SessionMiddleware(store = store, unconfirmed_max_age = nothing) # off: every session gets max_age
+```
+
+- **Signed-in sessions are never unconfirmed.** A new session that ends the request with an
+  identity (`auth_key`, or `validator`), such as a login from a client with no cookie yet, gets
+  the full lifetime at once. So does the anonymous session a logout leaves, because that client
+  has already shown that it keeps cookies.
+- **The default follows your lifetimes.** It is one hour, the default `CSRFMiddleware` `ttl`, so
+  with both defaults a form whose session lapses unconfirmed has already lost its CSRF cookie.
+  With a shorter lifetime the two differ, and a form left open between them gets a `403`. When
+  `min(max_age, absolute_max_age)` is under two hours, the default is half of it. Under two
+  minutes, confirm-on-return is off. An explicit value must be positive and at most half that
+  lifetime.
+- **What it costs.** One extra write per visitor, on their second request. That response carries
+  the session cookie, so it is marked `private` like any other: if it is a public asset, that one
+  response is not stored by a shared cache. A client that makes one session-writing request and
+  returns after `unconfirmed_max_age` finds a fresh session.
+
+**A store can also cap itself.** A database store has no size limit of its own, and an hour of a
+fast enough flood is still a lot of rows. Give `pormg_nitro_session` a bound:
+
+```julia
+store = pormg_nitro_session(max_sessions = 1_000_000)
+```
+
+Once the table holds that many rows, `SessionMiddleware` stops saving **new anonymous** sessions.
+The request still succeeds, no cookie is set, and a warning is logged, at most once per
+`prune_interval`. Sessions that end signed
+in, existing sessions and rotations are never refused, so a full store logs nobody out. The count
+is read at boot, kept by the store's own writes, and read again on
+every prune tick, so it costs no query per request. Expired rows count until the janitor deletes
+them.
+
+**A full store does block some sign-ins.** While it is full, a visitor with no cookie holds no
+session. If your login form carries a session-bound CSRF token (the default with
+`CSRFMiddleware`), that visitor cannot get a token that verifies, so they cannot sign in until the
+store has room again: new users, and anyone who cleared their cookies. Only a sign-in that needs
+no session beforehand, such as a token or JSON login without session-bound CSRF, is unaffected.
+An attacker keeps the store full with about
+`max_sessions / (unconfirmed_max_age + prune_interval)` cookieless writes a second (about 240 a
+second for a bound of a million with the defaults). So treat the
+cap as a last resort against running out of disk, not as flood protection, and size it well above
+your normal number of live sessions.
+
+With several processes sharing one table, each keeps its own count between prune ticks, so the
+table can overshoot `max_sessions` by roughly the inserts each process makes in one
+`prune_interval`.
+
+**Sizing.** Without a sign-in, a flood leaves at most about
+`rate × (unconfirmed_max_age + prune_interval)` rows. At 100 cookieless writes a second, that is
+about 420 000 rows with the defaults, where it used to be about 8.7 million. A row costs a few
+hundred bytes with its two indexes, more if your anonymous sessions hold more data. Set
+`max_sessions` to a few times your normal number of live sessions.
+
+`MemoryStore` already has a bound (`max_sessions`, 100 000 by default) and evicts the least recently
+used session when it is full. A custom store opts in by implementing `session_store_full` (see
+below).
 
 ## Store Options
 
@@ -209,6 +300,9 @@ serve(middleware=[
 ])
 ```
 
+`max_sessions` is unbounded by default. See
+[Anonymous Sessions and Floods](#Anonymous-Sessions-and-Floods) for when to set it, and how.
+
 The default `db_key` is `"db"`. Use a different one when your session database uses another
 PormG connection, for example `db_key="sessions"` — the key selects the connection the table is
 created on *and* the one every session query runs against.
@@ -235,6 +329,7 @@ update_session!(store::S, session_id::String, data; ttl=3600)                 # 
 rotate_session!(store::S, old_id::String, new_id::String, data; ttl=3600)     # -> Bool
 delete_session!(store::S, session_id::String)
 cleanup_expired_sessions!(store::S)
+session_store_full(store::S)                                                  # -> Bool
 ```
 
 `SessionMiddleware` uses Nitro's `storesession!` and `prunesessions!` helpers, and those
@@ -243,13 +338,19 @@ the request *loaded* with `update_session!`, except a logged-out session, which 
 `set_session!` for a fresh clock. `set_session!` must therefore overwrite an existing ID.
 `regenerate_session!` moves a session to a new ID with `rotate_session!`. `update_session!` and
 `rotate_session!` must each act only if the session still exists and has not expired, returning
-`false` otherwise, as one atomic step. Implementing the six methods above is enough for custom
-backends; only `cleanup_expired_sessions!` is optional.
+`false` otherwise, as one atomic step. Implementing the methods above is enough for custom
+backends; `cleanup_expired_sessions!` and `session_store_full` are optional.
+
+`session_store_full` defaults to `false`. Implement it for a store that should stop accepting
+new anonymous sessions at some size. `SessionMiddleware` calls it before every new anonymous
+save, so answer from a cached count and never run a query per call.
 
 `Base.get` returns a `SessionPayload(data, expires, created)`. `created` is the instant the
 session was first stored: `set_session!` sets it, while `update_session!` keeps it and
 `rotate_session!` carries it to the new ID. That instant is what `absolute_max_age` measures from,
-so a store that reset it on every write would let sessions live forever.
+so a store that reset it on every write would let sessions live forever. Take `created` and
+`expires` from the same clock: `SessionMiddleware` tells an unconfirmed anonymous session apart by
+its stored lifetime, `expires - created`.
 
 `cleanup_expired_sessions!` is called from a background janitor owned by
 `SessionMiddleware`'s lifecycle hooks — it never runs on the request path. Use
@@ -354,4 +455,5 @@ first.
 - Configure `session_auth_hash` if users must be able to sign out everywhere, or if a password
   change must end their other sessions.
 - Keep an absolute lifetime (`absolute_max_age`, 7 days by default); shorten it for sensitive apps.
-- Use a persistent store such as `pormg_nitro_session()` for production deployments.
+- Use a persistent store such as `pormg_nitro_session()` for production deployments. Give it a
+  `max_sessions` if public routes write to anonymous sessions.

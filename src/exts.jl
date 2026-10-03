@@ -23,7 +23,7 @@ function svg end
 function pdf end
 
 """
-    pormg_nitro_session(; db_key="db") -> PormGSessionStore
+    pormg_nitro_session(; db_key="db", max_sessions=nothing) -> PormGSessionStore
 
 One-call setup for PormG-backed sessions: creates the `nitro_session` table and its expiry
 index if they do not already exist (`IF NOT EXISTS`), and returns a ready-to-use
@@ -48,6 +48,17 @@ before this bound existed reads as no session, and logs a warning that names no 
 table is created on that connection, and the returned store routes every session query — read,
 write, delete and prune — to the same one. Pass a different key when your session database uses
 another PormG connection, for example `db_key="sessions"`.
+
+`max_sessions` bounds the table against a flood of anonymous sessions (#440). **The default,
+`nothing`, is unbounded**: unlike `MemoryStore`, a database store has no size limit of its own.
+With a bound, once the table holds `max_sessions` rows `SessionMiddleware` stops saving new
+*anonymous* sessions — the request still succeeds, and a warning is logged at most once per
+`prune_interval` — while sessions that
+end signed in, existing sessions and rotations are never refused. A full store can still keep a
+visitor with no cookie from signing in through a form with a session-bound CSRF token. The count
+is read at boot, kept by the store's own writes, and re-read on every prune tick, so it costs no
+query per request. Size it from the sessions tutorial's *Anonymous Sessions and Floods* section. A non-positive value is an
+`ArgumentError`.
 
 Requires `using PormG` and a configured PormG connection; without the extension loaded this
 is a `MethodError`, exactly like `pormg_nitro_worker`.

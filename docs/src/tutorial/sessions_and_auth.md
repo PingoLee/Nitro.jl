@@ -131,6 +131,13 @@ The default `db_key` is `"db"`. Use a different one when your session database u
 PormG connection, for example `db_key="sessions"` — the key selects the connection the table is
 created on *and* the one every session query runs against, so the two can never disagree.
 
+Unlike `MemoryStore`, the table has no size limit unless you give it one. If public routes write
+to sessions before sign-in, pass `max_sessions`:
+`pormg_nitro_session(db_key="db", max_sessions=1_000_000)`. New anonymous sessions also start
+with a short, *unconfirmed* lifetime until the browser returns the cookie. For both, and for
+sizing, see
+[Anonymous Sessions and Floods](cookies/sessions.md#Anonymous-Sessions-and-Floods).
+
 !!! note "Sessions inside a PormG transaction"
     The store's `nitro_session` model is bound to `db_key`, so session reads and writes work
     normally inside a `PormG.run_in_transaction(db_key)` block — logging a user out in the same
@@ -185,6 +192,12 @@ It defaults to doing nothing. Expiry is enforced when a session is *read* — `g
 refuses a payload whose expiry has passed — so a store that never prunes accumulates dead
 rows but never serves a stale session. Implement it for any store whose rows outlive the
 process.
+
+So is a seventh, `session_store_full(store::S)` (→ `Bool`), which defaults to `false`. Answer
+`true` to make `SessionMiddleware` stop saving new anonymous sessions once the store reaches a bound
+of its own; signed-in and existing sessions are never refused. It runs on the request path, so
+answer from a cached count. See
+[Anonymous Sessions and Floods](cookies/sessions.md#Anonymous-Sessions-and-Floods).
 
 **Deciding whether a payload has expired: call `is_expired`, do not compare `expires`
 yourself.**

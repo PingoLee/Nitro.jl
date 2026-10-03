@@ -7,7 +7,7 @@ using JSON
 using UUIDs
 
 import Nitro.Auth: make_password, check_password, password_needs_upgrade
-import Nitro.Core.Types: AbstractSessionStore, SessionPayload, get_session, set_session!, update_session!, rotate_session!, delete_session!, cleanup_expired_sessions!, is_expired
+import Nitro.Core.Types: AbstractSessionStore, SessionPayload, get_session, set_session!, update_session!, rotate_session!, delete_session!, cleanup_expired_sessions!, session_store_full, is_expired, Nullable
 import Nitro.Core.Cookies: storesession!, prunesessions!
 import Nitro: pormg_nitro_session, sync_pormg_env!
 # Stored JSON is read through the same depth bound as request JSON, and written only when it can
@@ -169,12 +169,24 @@ session_model(db_key::String="db") = _define_session_model(db_key)
 # ============================================================================
 
 """
-    PormGSessionStore(; model=nothing, db_key="db")
+    PormGSessionStore(; model=nothing, db_key="db", max_sessions=nothing)
 
 A PormG-backed session store that implements Nitro's `AbstractSessionStore{String, Dict{String,Any}}`.
 
 Sessions are stored as JSON text in the database and expire at a fixed timestamp
 from the last write (no sliding expiry).
+
+`max_sessions` bounds the table against a flood of anonymous sessions (#440). Once the store holds
+that many rows, [`session_store_full`](@ref Nitro.Core.Types.session_store_full) answers `true` and
+`SessionMiddleware` stops saving **new anonymous** sessions; sessions that end signed in, existing
+sessions and rotations are never refused. A visitor with no cookie can still be kept from signing in
+through a form whose CSRF token is bound to the session, since that token needs an anonymous
+session first. `nothing`, the default, is unbounded and costs nothing. The count is not a query per
+request: it is read once at construction, kept up to date by this store's own inserts and deletes,
+and re-read exactly on every prune tick, which also corrects drift from other processes sharing the
+table. Between ticks each process sees only its own inserts, so several processes on one table can
+overshoot the bound by roughly what each inserts in one `prune_interval`. Expired rows count until
+the janitor deletes them, since they hold the disk until then.
 
 `db_key` is the PormG connection key **every** session query runs on — read, write, delete and
 prune alike — and it must name the connection whose `nitro_session` table you bootstrapped.
@@ -203,9 +215,24 @@ store = ext.PormGSessionStore(db_key="sessions")
 struct PormGSessionStore <: AbstractSessionStore{String, Dict{String,Any}}
     model::Any  # PormG Model reference
     db_key::String
+    max_sessions::Nullable{Int}
+    # Rows in the table as this process last knew it -- see `max_sessions` above. Kept only when
+    # `max_sessions` is set; an unbounded store never touches it.
+    count::Threads.Atomic{Int}
 end
 
-function PormGSessionStore(; model=nothing, db_key::String="db")
+# Refused before anything touches the database: `pormg_nitro_session` calls this ahead of its
+# table bootstrap, so a bad bound never half-configures a connection.
+function _check_max_sessions(max_sessions::Nullable{Integer})
+    max_sessions === nothing || max_sessions > 0 || throw(ArgumentError(
+        "PormGSessionStore: `max_sessions` must be positive, or `nothing` for no bound; got " *
+        "$max_sessions (#440)."))
+    return nothing
+end
+
+function PormGSessionStore(; model=nothing, db_key::String="db",
+                           max_sessions::Nullable{Integer}=nothing)
+    _check_max_sessions(max_sessions)
     # A SUPPLIED model is used exactly as given -- the caller owns its `connect_key`, and
     # the test doubles that pass one here are immutable structs that could not take the
     # assignment anyway. Only a model this constructor builds gets bound (#202).
@@ -213,8 +240,24 @@ function PormGSessionStore(; model=nothing, db_key::String="db")
     if isnothing(m)
         error("PormGSessionStore requires PormG.Models to be available. Ensure PormG is properly loaded.")
     end
-    return PormGSessionStore(m, db_key)
+    store = PormGSessionStore(m, db_key, max_sessions === nothing ? nothing : Int(max_sessions),
+                              Threads.Atomic{Int}(0))
+    _capped(store) && _recount_sessions!(store)
+    return store
 end
+
+_capped(store::PormGSessionStore) = store.max_sessions !== nothing
+
+# The exact row count, read into `store.count` (#440). Expired rows included: they hold the disk
+# until the janitor deletes them. Called at construction and on every prune tick, never per request.
+function _recount_sessions!(store::PormGSessionStore)
+    store.count[] = Int(_session_objects(store).count())
+    return nothing
+end
+
+# Called on the request path, before every anonymous insert: an atomic read, never a query.
+session_store_full(store::PormGSessionStore) =
+    _capped(store) && store.count[] >= something(store.max_sessions)
 
 # Route every session query to the store's configured connection, exactly as `_task_objects`
 # does for the worker store. Without this the query falls back to the model's own
@@ -371,6 +414,7 @@ function set_session!(store::PormGSessionStore, session_id::String, data::Dict{S
                 "expires_at"   => expires_at,
                 "created_at"   => now_utc,
             )
+            _capped(store) && Threads.atomic_add!(store.count, 1)
         else
             _session_objects(store).filter("session_key" => session_id).update(
                 "session_data" => serialized,
@@ -459,7 +503,9 @@ end
 
 function delete_session!(store::PormGSessionStore, session_id::String)
     try
-        _session_objects(store).filter("session_key" => session_id).delete()
+        # PormG's `delete()` returns `(total, per-table breakdown)`.
+        deleted = first(_session_objects(store).filter("session_key" => session_id).delete())
+        _capped(store) && Threads.atomic_sub!(store.count, Int(deleted))
     catch e
         @warn "PormGSessionStore: failed to delete session" exception=(e, catch_backtrace())
         rethrow()
@@ -471,6 +517,9 @@ function cleanup_expired_sessions!(store::PormGSessionStore)
     now_utc = Dates.now(Dates.UTC)
     try
         _session_objects(store).filter("expires_at__@lte" => now_utc).delete()
+        # Re-read rather than subtract: the exact count also absorbs inserts and deletes made by
+        # other processes on the same table since the last tick (#440).
+        _capped(store) && _recount_sessions!(store)
     catch e
         @warn "PormGSessionStore: failed to cleanup expired sessions" exception=(e, catch_backtrace())
     end
@@ -558,14 +607,15 @@ _canonical_utc(t::DateTime) = Dates.format(t, dateformat"yyyy-mm-ddTHH:MM:SS.sss
 # Deliberately no docstring: the authoritative one is on the weakdep stub in `src/exts.jl`, which
 # is also what `?pormg_nitro_session` resolves to. Two docstrings on one function render as two
 # conflicting help entries and drift apart independently (#33).
-function pormg_nitro_session(; db_key::String="db")
+function pormg_nitro_session(; db_key::String="db", max_sessions::Nullable{Integer}=nothing)
+    _check_max_sessions(max_sessions)
     model = session_model(db_key)
     if isnothing(model)
         error("pormg_nitro_session: PormG.Models is not available. Ensure PormG is properly loaded.")
     end
     conn = PormG.connection(key=db_key)
     _ensure_session_table!(conn, model)
-    return PormGSessionStore(model=model, db_key=db_key)
+    return PormGSessionStore(model=model, db_key=db_key, max_sessions=max_sessions)
 end
 
 # ============================================================================

@@ -19,7 +19,7 @@ export Server, Nullable, Context,
     Param, isrequired, LazyRequest, headers, pathparams, queryvars, jsonbody, formbody, textbody, multipartbody,
     CookieConfig, Cookie, Session, SessionPayload,
     AbstractSessionStore, get_session, set_session!, update_session!, rotate_session!,
-    delete_session!, cleanup_expired_sessions!, is_expired,
+    delete_session!, cleanup_expired_sessions!, session_store_full, is_expired,
     MemoryStore, Extractor, missing_session_methods,
     RouteDefinition, Principal
 
@@ -60,6 +60,12 @@ session can neither re-create it nor copy it into a fresh id. Make the existence
 write **one** atomic step — an `UPDATE … WHERE` in SQL, one lock hold in memory. A check followed
 by a separate write re-opens the race.
 
+Stamp a session's `created` and `expires` from **the same clock**, as `set_session!` writes them
+from one `now`. `SessionMiddleware` recognises a new anonymous session it has not seen again by its
+stored lifetime, `expires - created`, being exactly its `unconfirmed_max_age` (#440). A store that
+took `created` from a database clock and `expires` from the application's would never confirm
+one.
+
 # Optional
 
 `cleanup_expired_sessions!(store)` prunes expired rows and **defaults to a no-op**. That is the one
@@ -72,6 +78,13 @@ Implement it for any store whose rows outlive the process.
 and thereby leak live tasks. That has not been true since #167 moved every running resource onto
 `WorkerRuntime`: a worker store owns nothing that runs, so there is no teardown method on it to
 require or to forget.)
+
+[`session_store_full`](@ref)`(store)` says whether the store has reached a size bound of its own,
+and **defaults to `false`**. `SessionMiddleware` asks it before saving a new *anonymous* session and
+skips the save when it answers `true` (#440); a session with a signed-in identity, an existing
+session and a rotation are never refused. Implement it for a store whose rows a flood of anonymous
+traffic could otherwise grow without bound. It runs on the request path, so answer from a cached
+count, never a query per call.
 
 `storesession!` and `prunesessions!` are the framework's entry points and delegate here; a store may
 override those instead if it has a cheaper path.
@@ -296,6 +309,25 @@ See [`AbstractSessionStore`](@ref) for why this one is optional while every `Abs
 method is required.
 """
 cleanup_expired_sessions!(store::AbstractSessionStore) = nothing
+
+"""
+    session_store_full(store::AbstractSessionStore) -> Bool
+
+Whether `store` has reached a size bound of its own, so that `SessionMiddleware` should stop saving
+**new anonymous** sessions into it (#440). **Optional** — this default answers `false`: no bound.
+
+The middleware asks only when it is about to insert a session that ends its request with no
+identity. A `true` answer skips that save and its cookie, and the request still succeeds. Sessions
+that end signed in, existing sessions and rotations are never refused, so a full store logs nobody
+out. It **can** keep a visitor with no cookie from signing in through a form whose CSRF token is
+bound to the session: the anonymous session that token needs is not saved, so the token never
+verifies. Only a sign-in that needs no session beforehand (a token or JSON login without
+session-bound CSRF) is unaffected. `pormg_nitro_session(max_sessions = N)` implements it;
+`MemoryStore` does not need to, since it is an LRU bounded by `max_sessions` already.
+
+It is called on the request path: answer from a cached count, never a query per call.
+"""
+session_store_full(store::AbstractSessionStore) = false
 
 """
     missing_session_methods(S::Type{<:AbstractSessionStore}) -> Vector{Symbol}
@@ -584,8 +616,12 @@ MemoryStore(; max_sessions::Integer = DEFAULT_MAX_SESSIONS) =
 # eviction would be a second flood riding on the first.
 function _warn_memorystore_full(store::MemoryStore)
     Threads.atomic_xchg!(store.warned_full, true) && return nothing
+    # The advice names the PormG store's own bound (#440): a database store is unbounded unless
+    # given one, so a flood this store absorbs by evicting would otherwise move to disk.
     @warn "MemoryStore is full: each new session now evicts the least recently used one. " *
-          "Raise `max_sessions`, or use a persistent store such as `pormg_nitro_session()`." max_sessions = store.max_sessions
+          "Raise `max_sessions`, or use a persistent store such as " *
+          "`pormg_nitro_session(max_sessions = …)` -- a database store is unbounded unless you " *
+          "give it a `max_sessions`." max_sessions = store.max_sessions
     return nothing
 end
 

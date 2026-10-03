@@ -4,6 +4,7 @@ using Test
 using Dates
 using JSON
 using TimeZones
+using HTTP
 using Nitro
 
 # These tests exercise the real `NitroPormGExt.PormGSessionStore`. The mock below replaces
@@ -17,7 +18,7 @@ using Nitro
 
 using Nitro.Types: AbstractSessionStore, SessionPayload, get_session, set_session!,
                    update_session!, rotate_session!, delete_session!, cleanup_expired_sessions!, is_expired,
-                   missing_session_methods
+                   missing_session_methods, session_store_full
 
 # ── Mock PormG row ───────────────────────────────────────────────────────
 #
@@ -285,6 +286,14 @@ function Base.getproperty(qs::MockQuerySet, name::Symbol)
             end
         end
         return delete_fn
+    elseif name === :count
+        # PormG's `count()` is `COUNT(*)` over the filtered rows (`object_manager.jl`); the store's
+        # `max_sessions` bound reads it unfiltered, at construction and on every prune (#440).
+        return function()
+            return lock(_mock_lock(qs)) do
+                length(_matching_keys_locked(qs))
+            end
+        end
     else
         return getfield(qs, name)
     end
@@ -868,6 +877,125 @@ end
             throwing = RealPormGSessionStore(model=ThrowingMockModel(exc))
             @test_throws typeof(exc) Base.get(throwing, "sess-boom", :fallback)
         end
+    end
+end
+
+# #440: a database store had no size bound, so anonymous session writes grew the table without
+# limit. `max_sessions` is opt-in; the count it compares against is never a query per request.
+@testset "PormGSessionStore max_sessions bounds the table (#440)" begin
+    @testset "unbounded by default, and it costs nothing" begin
+        m = MockModel()
+        s = RealPormGSessionStore(model=m)
+        @test s.max_sessions === nothing
+        for i in 1:5
+            set_session!(s, "k$i", Dict{String,Any}(); ttl=3600)
+        end
+        @test session_store_full(s) === false
+        @test s.count[] == 0                                   # never maintained
+        @test !any(isempty, m._filters_seen)                  # no unfiltered COUNT ran
+    end
+
+    @testset "full once the table holds max_sessions rows" begin
+        m = MockModel()
+        _seed_row!(m, "old", Dict{String,Any}(), Dates.now(Dates.UTC) + Dates.Hour(1))
+        s = RealPormGSessionStore(model=m, max_sessions=3)
+        @test s.count[] == 1                                   # read once at construction
+        @test session_store_full(s) === false
+        set_session!(s, "a", Dict{String,Any}(); ttl=3600)
+        @test session_store_full(s) === false
+        set_session!(s, "a", Dict{String,Any}("x" => 1); ttl=3600)   # an overwrite adds no row
+        @test s.count[] == 2
+        set_session!(s, "b", Dict{String,Any}(); ttl=3600)
+        @test session_store_full(s) === true
+
+        # Reading it is an atomic load, not a query.
+        before = length(m._filters_seen)
+        session_store_full(s)
+        @test length(m._filters_seen) == before
+
+        # A delete frees a slot; deleting a key that is not there frees none.
+        delete_session!(s, "b")
+        @test s.count[] == 2
+        @test session_store_full(s) === false
+        delete_session!(s, "missing")
+        @test s.count[] == 2
+    end
+
+    @testset "rotation leaves the count unchanged" begin
+        s = RealPormGSessionStore(model=MockModel(), max_sessions=10)
+        set_session!(s, "r1", Dict{String,Any}(); ttl=3600)
+        @test rotate_session!(s, "r1", "r2", Dict{String,Any}(); ttl=3600)
+        @test s.count[] == 1
+    end
+
+    @testset "every prune re-reads the exact count" begin
+        m = MockModel()
+        s = RealPormGSessionStore(model=m, max_sessions=10)
+        set_session!(s, "live", Dict{String,Any}(); ttl=3600)
+        _seed_row!(m, "dead", Dict{String,Any}(), Dates.now(Dates.UTC) - Dates.Minute(1))
+        # Rows another process inserted, which this store's own bookkeeping never saw.
+        _seed_row!(m, "other-1", Dict{String,Any}(), Dates.now(Dates.UTC) + Dates.Hour(1))
+        _seed_row!(m, "other-2", Dict{String,Any}(), Dates.now(Dates.UTC) + Dates.Hour(1))
+        @test s.count[] == 1
+        cleanup_expired_sessions!(s)
+        @test s.count[] == 3                                   # dead pruned, others counted
+    end
+
+    @testset "a non-positive bound is refused before the database is touched" begin
+        @test_throws ArgumentError RealPormGSessionStore(model=MockModel(), max_sessions=0)
+        @test_throws ArgumentError RealPormGSessionStore(model=MockModel(), max_sessions=-1)
+        key = "nitro-test-session-cap"
+        haskey(PormG.config, key) && error("test-only PormG connection key is already registered: $key")
+        conn = FakeSessionPool(String[])
+        PormG.config[key] = FakeSessionSettings(conn)
+        try
+            @test_throws ArgumentError pormg_nitro_session(db_key=key, max_sessions=0)
+            @test isempty(conn.sql)
+        finally
+            delete!(PormG.config, key)
+        end
+    end
+
+    @testset "an unconfirmed session confirms through the store's whole-second read" begin
+        # `Base.get` truncates both instants to whole seconds (`_parse_db_datetime`). They were
+        # written from one `now`, an exact number of seconds apart, so the stored lifetime still
+        # reads as exactly `unconfirmed_max_age` -- this is the round trip that has to hold.
+        m = MockModel()
+        s = RealPormGSessionStore(model=m)
+        mw = SessionMiddleware(cookie_name="sid", store=s, secure=false).middleware
+        res = mw(req -> (getsession(req)["cart"] = [1]; HTTP.Response(200, "ok")))(HTTP.Request("GET", "/"))
+        sid = String(match(r"sid=([^;]+)", HTTP.header(res, "Set-Cookie")).captures[1])
+        @test occursin("Max-Age=3600", HTTP.header(res, "Set-Cookie"))
+        row = m._table[sid]
+        @test row[:expires_at] - row[:created_at] == Dates.Millisecond(3_600_000)
+
+        res = mw(req -> HTTP.Response(200, "page"))(HTTP.Request("GET", "/", ["Cookie" => "sid=$sid"]))
+        @test occursin("Max-Age=86400", HTTP.header(res, "Set-Cookie"))
+        @test m._table[sid][:expires_at] - m._table[sid][:created_at] >= Dates.Second(86400)
+        # Confirmed: the next read writes nothing.
+        res = mw(req -> HTTP.Response(200, "page"))(HTTP.Request("GET", "/", ["Cookie" => "sid=$sid"]))
+        @test isempty(HTTP.header(res, "Set-Cookie"))
+    end
+
+    @testset "end to end: a full store refuses anonymous sessions, never signed-in ones" begin
+        m = MockModel()
+        s = RealPormGSessionStore(model=m, max_sessions=2)
+        mw = SessionMiddleware(cookie_name="sid", store=s, secure=false).middleware
+        anon = mw(req -> (getsession(req)["cart"] = [1]; HTTP.Response(200, "ok")))
+        login = mw(req -> (getsession(req)["user_id"] = 7; HTTP.Response(200, "in")))
+
+        @test !isempty(HTTP.header(anon(HTTP.Request("GET", "/")), "Set-Cookie"))
+        @test !isempty(HTTP.header(anon(HTTP.Request("GET", "/")), "Set-Cookie"))
+        @test length(m._table) == 2
+        @test session_store_full(s)
+
+        res = @test_logs (:warn, r"session store is full") anon(HTTP.Request("GET", "/"))
+        @test res.status == 200
+        @test isempty(HTTP.header(res, "Set-Cookie"))
+        @test length(m._table) == 2
+
+        @test !isempty(HTTP.header(login(HTTP.Request("POST", "/login")), "Set-Cookie"))
+        @test length(m._table) == 3                            # a sign-in is never refused
     end
 end
 
