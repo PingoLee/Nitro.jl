@@ -90,10 +90,6 @@ _signing_secret(keyset::AbstractDict) = _signing_secret(JWTKeyset(keyset))
 _signing_secret(other) =
     throw(ArgumentError("JWT secret must be $_JWT_SECRET_TYPES, got a $(typeof(other))"))
 
-function _hmac_sha256(secret::String, message::String)
-    return SHA.hmac_sha256(Vector{UInt8}(codeunits(secret)), Vector{UInt8}(codeunits(message)))
-end
-
 function _constant_time_equals(left::Vector{UInt8}, right::Vector{UInt8})
     length(left) == length(right) || return false
     diff = UInt8(0)
@@ -133,14 +129,14 @@ function encode_jwt(payload::AbstractDict, secret_or_keyset; expires_in::Union{I
                                 "claim in this payload; see its claims scope on the JWTKeyset"))
     end
 
-    encoded_header = base64url_encode(Vector{UInt8}(codeunits(JSON.json(header))))
+    encoded_header = base64url_encode(codeunits(JSON.json(header)))
     # Only a keyset's `kid` can grow the header, and a token `_decode_jwt` would refuse is
     # not one to issue (#314). The kid is not echoed: it names a key.
     ncodeunits(encoded_header) <= _JWT_MAX_HEADER_SEGMENT_BYTES || throw(ArgumentError(
         "JWT header would exceed $_JWT_MAX_HEADER_SEGMENT_BYTES bytes encoded; use a shorter kid"))
     signing_input = string(
         encoded_header, ".",
-        base64url_encode(Vector{UInt8}(codeunits(encoded_claims)))
+        base64url_encode(codeunits(encoded_claims))
     )
     signature = base64url_encode(_hmac_sha256(secret, signing_input))
     return string(signing_input, ".", signature)
@@ -158,7 +154,8 @@ end
 # `Union` of its two return shapes; `jwt_validator` calls this instead, and its per-request
 # path sees one concrete tuple shape (#265, nitro-core §7).
 function _decode_jwt(token::AbstractString, secret_or_keyset; issuer=nothing, audience=nothing, exp_timeout::Union{Int, Nothing}=DEFAULT_JWT_MAX_AGE_SECONDS, iat_skew::Int=30, verify::Bool=true, require_exp::Bool=false, required_claims::Union{AbstractVector{<:AbstractString}, Nothing}=nothing)
-    segments = split(String(token), '.')
+    token_string = String(token)
+    segments = split(token_string, '.')
     length(segments) == 3 || throw(AuthError("Invalid JWT format"))
 
     # The order below is RFC 7519 §7.2's: the JOSE header is decoded and checked (steps
@@ -178,6 +175,12 @@ function _decode_jwt(token::AbstractString, secret_or_keyset; issuer=nothing, au
     # makes `get(::Vector{Any}, "alg", nothing)` a MethodError. None of this is an authz
     # hole -- auth middleware renders it as 401 -- but a direct `decode_jwt` caller was
     # getting exceptions the API does not document.
+    #
+    # A full parse into a Dict, although only three members are read below. Parsing into a
+    # struct of those three is ~8 allocations cheaper and was tried for #449, but a struct
+    # target skips the members it does not read without validating them -- a bad escape in
+    # `typ` parsed -- and RFC 7515 §5.2 requires the header to be a completely valid JSON
+    # object. A test pins that refusal.
     header isa AbstractDict || throw(AuthError("Invalid JWT header"))
 
     # Same class, one level down: a JSON `kid` is whatever the token's author typed --
@@ -238,10 +241,19 @@ function _decode_jwt(token::AbstractString, secret_or_keyset; issuer=nothing, au
             throw(AuthError("Invalid JWT signature encoding"))
         end
 
-        # Hoisted: one string for the whole trial, not one per candidate. Decoding
+        # Hoisted: one view for the whole trial, not one per candidate. Decoding
         # `provided` ahead of the loop also means a garbage signature costs zero HMACs
         # rather than one per key.
-        signing_input = string(segments[1], ".", segments[2])
+        #
+        # The signing input is `header.claims`, which is already the token's own prefix up
+        # to the second '.', so it is a view rather than a rebuilt string (#449). The '.'
+        # sits at byte `second_dot`; `prevind` steps back to the start of the character
+        # before it, so the view ends on a character boundary even when the claims segment
+        # ends in a non-ASCII byte. Such a token is refused as it always was -- by its
+        # signature, or, if validly signed, by the claims decode -- not by a
+        # StringIndexError here.
+        second_dot = ncodeunits(segments[1]) + ncodeunits(segments[2]) + 2
+        signing_input = SubString(token_string, 1, prevind(token_string, second_dot))
         matched_kid::Nullable{String} = nothing
         verified = false
         for (candidate_kid, secret) in candidates

@@ -580,6 +580,61 @@ end
     end
 end
 
+@testset "the JWT hot path: strict header, viewed signing input, bounded allocations (#449)" begin
+    caught(f) = try; f(); nothing; catch err; err; end
+    secret = jwtkey("secret-a")
+    raw64(str) = Nitro.Crypto.base64url_encode(codeunits(str))
+    sign(input) = string(input, ".", Nitro.Crypto.base64url_encode(Nitro.Auth._hmac_sha256(secret, input)))
+    claims64 = raw64(JSON.json(Dict("sub" => "42", "exp" => NOW_TS + 3600)))
+
+    # RFC 7515 §5.2: the header must be a COMPLETELY valid JSON object, including the members
+    # Nitro never reads. #449 tried parsing it into a struct of the three it does read, which
+    # skips the rest unvalidated -- every one of these then parsed. Each is validly signed,
+    # so the refusal is the parser's and nothing else's.
+    for header in ("""{"alg":"HS256","typ":"J\\WT"}""",
+                   """{"alg":"HS256","x":"\\u035"}""",
+                   """{"alg":"HS256","x":[1,}""",
+                   """{"alg":"HS256","x":"tab\there"}""")
+        tok = sign(string(raw64(header), ".", claims64))
+        @test (header, sprint(showerror, caught(() -> Nitro.Auth.decode_jwt(tok, secret)))) ==
+            (header, "Invalid JWT encoding")
+        @test (header, sprint(showerror, caught(() -> Nitro.Auth.decode_jwt(tok, secret; verify = false)))) ==
+            (header, "Invalid JWT encoding")
+    end
+
+    # The signature is checked over a VIEW of the token's own prefix rather than a rebuilt
+    # `header.claims` string. A claims segment ending in a multi-byte character puts the
+    # view's last byte mid-character; it must still end on a character boundary and reach
+    # the signature check, not throw a StringIndexError on the way.
+    good = Nitro.Auth.encode_jwt(Dict("sub" => "42"), secret; expires_in = 3600)
+    head, body, sig = split(good, '.')
+    for tail in ("é", "€", "𝄞")
+        forged = string(head, ".", body, tail, ".", sig)
+        err = caught(() -> Nitro.Auth.decode_jwt(forged, secret))
+        @test (tail, err isa Nitro.Auth.AuthError) == (tail, true)
+        @test (tail, sprint(showerror, err)) == (tail, "Invalid JWT signature")
+        # A forgery fails the MAC whatever bytes the view covers, so the case above only
+        # catches an exception. This one is SIGNED over the non-ASCII tail: a view that
+        # stopped short of the last character would MAC different bytes and say "Invalid
+        # JWT signature". Covering exactly the signed bytes, it passes the MAC and is refused
+        # by the claims decode instead.
+        signed_tail = sign(string(head, ".", body, tail))
+        @test (tail, sprint(showerror, caught(() -> Nitro.Auth.decode_jwt(signed_tail, secret)))) ==
+            (tail, "Invalid JWT encoding")
+    end
+    # An empty claims segment makes the view just `header.`. Its signature verifies -- so the
+    # refusal is the empty claims JSON, after the MAC, not "Invalid JWT signature".
+    empty_claims = caught(() -> Nitro.Auth.decode_jwt(sign(string(head, ".")), secret))
+    @test sprint(showerror, empty_claims) == "Invalid JWT encoding"
+
+    # The validator a bearer request runs, held to #449's byte target. It was ~11.7 KB and 176
+    # allocations per token before #432/#449, and ~2.5 KB / 58 after them.
+    validator = Nitro.Auth.jwt_validator(secret)
+    validator(good)
+    validator(good)
+    @test (@allocated validator(good)) < 4_096
+end
+
 # A `dicttype` whose constructor throws: it runs inside `_jwt_segment_json`'s `try`, which is
 # the only way left to reach that block with something other than an `ArgumentError` now that
 # the header cap and the depth bound answer a deep token first.

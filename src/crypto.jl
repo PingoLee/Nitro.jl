@@ -196,6 +196,39 @@ function _empty_hmac_key(secret::AbstractString)
     return true
 end
 
+# HMAC-SHA256 through libcrypto's one-shot `HMAC`, for the per-request MACs: every JWT signed or
+# verified in `Auth`, and every CSRF token minted or checked (#449). It replaced
+# `SHA.hmac_sha256`, which takes both arguments as `Vector{UInt8}` -- so each call copied the
+# secret and the message first -- and then builds its padded keys and contexts by allocation:
+# 26 allocations / 1.5 KB per JWT. This reads the strings' bytes in place and allocates only
+# the 32-byte result, and the output is byte-identical (the test suite holds it to SHA.jl).
+#
+# No `gc_safe`, unlike `_pbkdf2_hmac_sha256` below: one HMAC over a token takes a couple of
+# microseconds (mostly the digest lookup `HMAC` repeats per call), not the ~0.2 s that makes
+# PBKDF2 worth a GC-safe transition. It is thread-safe: `HMAC` keeps
+# no state between calls and `EVP_sha256()` returns a static table. An empty key is passed as a
+# real (non-NULL) pointer of length 0, which libcrypto treats as the empty key, exactly as
+# SHA.jl does; refusing empty keys is the callers' policy (`_empty_hmac_key`), not this
+# function's.
+function _hmac_sha256(key::Union{String, SubString{String}}, message::Union{String, SubString{String}})
+    ncodeunits(key) <= typemax(Cint) || throw(ArgumentError("HMAC key too long"))
+    out = Vector{UInt8}(undef, 32)
+    md = @ccall OpenSSL.libcrypto.EVP_sha256()::Ptr{Cvoid}
+    ret = GC.@preserve key message out @ccall OpenSSL.libcrypto.HMAC(
+        md::Ptr{Cvoid}, pointer(key)::Ptr{UInt8}, ncodeunits(key)::Cint,
+        pointer(message)::Ptr{UInt8}, ncodeunits(message)::Csize_t,
+        out::Ptr{UInt8}, C_NULL::Ptr{Cuint})::Ptr{UInt8}
+    if ret == C_NULL
+        # The error queue is per OS thread; leave nothing behind for an unrelated TLS call.
+        @ccall OpenSSL.libcrypto.ERR_clear_error()::Cvoid
+        throw(ErrorException("libcrypto HMAC-SHA256 failed"))
+    end
+    return out
+end
+
+# Any other string type is MACed over its UTF-8 bytes.
+_hmac_sha256(key::AbstractString, message::AbstractString) = _hmac_sha256(String(key), String(message))
+
 # PBKDF2-HMAC-SHA256 (RFC 8018) through libcrypto's `PKCS5_PBKDF2_HMAC`, for the password
 # hashers in `Auth` (#311). It replaced a pure-Julia loop that called `SHA.hmac_sha256` per
 # iteration: HMAC re-hashes a key longer than its 64-byte block on every call, so that loop
