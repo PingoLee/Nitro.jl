@@ -1161,6 +1161,14 @@ end
 # *request* off that connection task, which is the Go-style model Nitro wants
 # (nitro-core §2). Do not reintroduce the inner `@async`.
 #
+# The spawn is not overhead; it is the main reason the server scales (#448). HTTP.jl 2.x runs every
+# connection task on Julia's `:interactive` pool, and `julia -t 8` gives that pool ONE thread, so
+# a handler left on the connection task is serialized onto it whatever `-t` says. Measured on one
+# box (`-t 8`, server and `oha -c 50` on disjoint pinned cores, `/plaintext`, medians): bare
+# HTTP.jl `listen!` + `streamhandler` does ~33k rps with no spawn and ~72k with one per request;
+# `serve(parallel = false)` does ~26k. Keep it. The other half of the same lesson is in
+# `stream_handler`: the response write has to happen on this task too (#453).
+#
 # One genuine semantic difference, since "pure overhead" undersells it: `@async`
 # creates a **sticky** task, pinned to the thread that created it, while
 # `Threads.@spawn` creates a migratable one. A handler may therefore now move
