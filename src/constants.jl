@@ -137,17 +137,71 @@ Override per server with `serve(max_fields = …)`; `0` means unlimited (#327).
 const DEFAULT_MAX_FIELDS :: Int64 = 1000
 
 """
-    REQUEST_MAX_FIELDS :: ScopedValue{Int64}
+    AbstractApp
 
-The field cap in force for the request being handled: `serve(max_fields = …)`, bound by the
-pipeline's outermost layer for the request's whole dynamic extent (and by `internalrequest`, which
-runs the same pipeline). Outside a request it is [`DEFAULT_MAX_FIELDS`](@ref), so a parser called
-directly -- in a test, a script -- is still capped. `0` means unlimited.
-
-A `ScopedValue` rather than a field on the request: the parsers that enforce it (`Util`'s body
-parsers, `Types`' query accessor) load before `App` exists, and reading a typed scoped value keeps
-`Any` out of the hot path. It is the same carrier as `SERVING_APP` (#308).
+The supertype of [`App`](@ref), declared here so [`RequestScope`](@ref) can name the serving app
+without `Any`. `Constants` loads before `App` exists (src/core.jl).
 """
-const REQUEST_MAX_FIELDS = ScopedValue{Int64}(DEFAULT_MAX_FIELDS)
+abstract type AbstractApp end
+
+"""
+    RequestScope(app, max_fields)
+
+What the pipeline binds for one request's dynamic extent, as the single value of
+[`REQUEST_SCOPE`](@ref):
+
+- `app` -- the `App` whose pipeline is running the request, `nothing` outside one. Read it through
+  `Nitro.Core.serving_app()`, which narrows it back to `App`.
+- `max_fields` -- that app's own `service.max_fields` cell, shared rather than copied, so
+  `serve(max_fields = …)` is seen by every pipeline already built. Read it through
+  [`request_max_fields`](@ref).
+
+**Mutable only so that it is a heap object**, both fields `const`. A scope stores its values in a
+`PersistentDict{ScopedValue, Any}`, so an immutable value is boxed on every insert. One instance is
+built per pipeline (`_app_context_seed`) and every request binds that same object, which costs one
+insert and no box (#444). It used to be two `ScopedValue`s (`SERVING_APP`, `REQUEST_MAX_FIELDS`),
+an `App` and an `Int64`: two inserts and two boxes per request.
+"""
+mutable struct RequestScope
+    # `Union{…, Nothing}` spelled out: `Nullable` lives in `Types`, which loads after this.
+    const app        :: Union{AbstractApp, Nothing}
+    const max_fields :: Base.RefValue{Int64}
+end
+
+"""
+    REQUEST_SCOPE :: ScopedValue{RequestScope}
+
+The request being handled, bound by the pipeline's outermost layer (`_app_context_seed`) for the
+request's whole dynamic extent: every middleware, the handler, and any task the handler spawns.
+`internalrequest` runs the same pipeline, so it binds it too.
+
+Outside a request it holds no app and [`DEFAULT_MAX_FIELDS`](@ref), so a parser called directly --
+in a test, a script -- is still capped.
+
+It carries two things that cannot reach their readers through arguments:
+
+- **The serving app**, for the argument-less `get_cookie(req, …)`/`set_cookie!(res, …)` (#308). They
+  used to read the process-wide `CONTEXT[]`, so an app built with an explicit `App` -- the
+  recommended handle since #31 -- silently wrote plaintext cookies and trusted raw client values,
+  because the key lived on the serving app and the helpers looked somewhere else. A `Response`
+  carries no request, so `set_cookie!(res, …)` cannot find the serving app from its arguments; a
+  task-scoped binding is the one carrier both helpers can read. This is Spring's
+  `RequestContextHolder`, with Julia's `ScopedValue` in place of a thread-local, which is what keeps
+  it correct across `Threads.@spawn`.
+- **The field cap** (#327). The parsers that enforce it (`Util`'s body parsers) load before `App`
+  exists, so they read the cap from here rather than from the app.
+
+A background worker run deliberately does not inherit it: `_spawn_detached` clears the dynamic
+scope (#209).
+"""
+const REQUEST_SCOPE = ScopedValue{RequestScope}(RequestScope(nothing, Ref{Int64}(DEFAULT_MAX_FIELDS)))
+
+"""
+    request_max_fields() -> Int64
+
+The field cap in force for the request being handled: `serve(max_fields = …)` inside a request,
+[`DEFAULT_MAX_FIELDS`](@ref) outside one. `0` means unlimited (#327).
+"""
+request_max_fields()::Int64 = REQUEST_SCOPE[].max_fields[]
 
 end

@@ -23,6 +23,83 @@ export router, compose, genkey, process_middleware, HOFRouter, OuterRouter, Inne
 # constant did.)
 const EMPTY_LAYERS = Function[]
 
+"""
+    EMPTY_PARAMS :: HTTP.Handlers.Params
+
+The path parameters of every route [`_gethandler`](@ref) resolves on its exact fast path: one
+shared, empty `Dict`. **Never mutate it.** It is safe to share only because nothing does:
+`_route_call` and `_dispatch_resolved` (src/core/pipeline.jl) write `:params` onto the request
+only when it is non-empty, which is upstream's own rule, so this object never reaches
+`req.context` or a handler.
+"""
+const EMPTY_PARAMS = HTTP.Handlers.Params()
+
+# The segment list `match` takes, already exhausted: `match(node, m, NO_SEGMENTS, 1)` asks only
+# "which leaf of THIS node serves `m`", which is upstream's terminal step verbatim.
+const NO_SEGMENTS = SubString{String}[]
+
+"""
+    _gethandler(r::HTTP.Router, req) -> (handler, route, params)
+
+`HTTP.Handlers.gethandler`, without its two per-request allocations for a route with no
+variables (#445). Upstream `split`s the target into a `Vector{SubString}` and builds a fresh
+`Params()` on every call, whether the leaf it finds has variables or not.
+
+**The fast path** applies to an origin-form target with no query. It walks the trie through exact
+children only, segment by segment, without collecting the segments. At the node the path ends on
+it asks upstream's own `match` for the leaf, so the `"*"`-leaf and method-order rules are
+upstream's. A leaf found there is returned with [`EMPTY_PARAMS`](@ref).
+
+**Why that is the same leaf upstream picks.** `match` is depth-first and tries a node's exact
+children before its pattern, variable and `**` children, at every level. So when an all-exact
+chain ends in a leaf for this method, that leaf is the first one `match` would reach and return.
+A leaf reached that way has no variables, because its path has none.
+
+Anything else -- a segment with no exact child, a node with no leaf for this method (`match` would
+then try the other branches), a query string, an absolute-form or `*` target -- falls through to
+upstream `gethandler` unchanged. That keeps every miss, `405` and variable route on the code path
+it had before.
+
+`OriginFormMiddleware` (#341) has normally reduced the target to the canonical origin-form path the
+router will match, which is why the fast path sees nearly every request. It does not depend on
+that for correctness: a target it declines is one upstream resolves instead.
+
+Reads the `Node.exact`/`Node.segment` fields and `match`, all canaried in
+test/http_internals_contract_tests.jl.
+"""
+function _gethandler(r::HTTP.Router, req::HTTP.Request)
+    leaf = _exact_leaf(r.routes, req.method, req.target)
+    leaf === nothing || return leaf.handler, leaf.path, EMPTY_PARAMS
+    return HTTP.Handlers.gethandler(r, req)
+end
+
+# The leaf an all-exact walk of `target` reaches for `method`, or `nothing` when upstream must
+# decide. Empty segments are skipped, as upstream's `split(…; keepempty = false)` skips them.
+function _exact_leaf(root::HTTP.Handlers.Node, method::String, target::String)
+    (startswith(target, '/') && !occursin('?', target)) || return nothing
+    node = root
+    last = ncodeunits(target)
+    i = 2                                   # past the leading '/'
+    while i <= last
+        stop = something(findnext(==('/'), target, i), last + 1)
+        if stop > i
+            segment = SubString(target, i, prevind(target, stop))
+            child = nothing
+            for c in node.exact
+                if c.segment == segment
+                    child = c
+                    break
+                end
+            end
+            child === nothing && return nothing
+            node = child::HTTP.Handlers.Node
+        end
+        i = stop + 1
+    end
+    leaf = HTTP.Handlers.match(node, method, NO_SEGMENTS, 1)
+    return leaf isa HTTP.Handlers.Leaf ? leaf : nothing
+end
+
 # "This slot carries at least one middleware." Both registrars gate on this rather than on
 # `!isnothing`, so that an explicit `middleware=[]` — which normalizes to `Function[]`, not
 # `nothing` — does not publish a zero-layer entry and disable the fast path app-wide.
@@ -376,12 +453,12 @@ function compose(router::HTTP.Router, globalmiddleware::Vector{Function},
             custom_snap = snapshot(custommiddleware)
             isempty(custom_snap) && return handler(req)
 
-            # `params` is BOUND now, not discarded (#80). `gethandler` allocates it either
-            # way — a fresh `Params()` per call, populated for a parametrized route — and the
-            # router at the bottom of the chain used to allocate a second one because this
-            # one was thrown away. Handing it down is what makes the second lookup
+            # `params` is BOUND now, not discarded (#80). The lookup produces it either way —
+            # populated for a parametrized route, the shared `EMPTY_PARAMS` for an exact one
+            # (#445) — and the router at the bottom of the chain used to produce a second one
+            # because this one was thrown away. Handing it down is what makes the second lookup
             # unnecessary; see `RouteResolution` (src/types.jl) for the full argument.
-            innerhandler, path, params = HTTP.Handlers.gethandler(router, req)
+            innerhandler, path, params = _gethandler(router, req)
 
             # `missing` is HTTP.jl's method-mismatch sentinel — a path that matched but not for
             # this method (405). It is NOT a match: it carries an empty `path`, so treating it

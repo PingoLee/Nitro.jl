@@ -7,7 +7,7 @@ using ..Types
 # Unexported from `Types` on purpose: `CopyOnWriteDict` is internal plumbing for `compose`,
 # so it is named explicitly here rather than widened onto `Core`'s reexport surface.
 using ..Types: CopyOnWriteDict, RouteMiddleware, NamedRoute
-using ..Constants: SHUTDOWN_TIMEOUT_SECONDS, DEFAULT_MAX_FIELDS
+using ..Constants: SHUTDOWN_TIMEOUT_SECONDS, DEFAULT_MAX_FIELDS, AbstractApp
 
 export App, EagerReviseService, Service, wait, close, isopen
 export set_extension!, get_extension, delete_extension!, has_extension
@@ -119,9 +119,11 @@ end
     extensions            :: Dict{Symbol, Any}      = Dict{Symbol, Any}()
     extensions_lock       :: ReentrantLock          = ReentrantLock()
     shutdown_timeout      :: Ref{Float64}           = Ref{Float64}(SHUTDOWN_TIMEOUT_SECONDS)
-    # `serve(max_fields = …)`, read once per request by the pipeline's outermost layer, which
-    # binds it as `REQUEST_MAX_FIELDS` for the request's extent (#327). `0` means unlimited.
-    max_fields            :: Ref{Int64}             = Ref{Int64}(DEFAULT_MAX_FIELDS)
+    # `serve(max_fields = …)`. The pipeline's outermost layer binds THIS cell, not a copy, in
+    # `REQUEST_SCOPE` for each request's extent (#327, #444), so a pipeline built before `serve`
+    # sets it still sees it. Concrete `RefValue` so the scope can hold it without a conversion.
+    # `0` means unlimited.
+    max_fields            :: Base.RefValue{Int64}   = Ref{Int64}(DEFAULT_MAX_FIELDS)
 end
 
 """
@@ -157,7 +159,7 @@ The remaining fields are internal: `service` holds the router and per-server sta
 `getcontext` on the request, never off the `App`, or you reintroduce the race #31
 removed.
 """
-@kwdef struct App
+@kwdef struct App <: AbstractApp
     service :: Service          = Service()
     mod     :: Nullable{Module} = nothing
     app_context :: Ref{Any}     = Ref{Any}(missing) # This stores a reference to an Context{T} object

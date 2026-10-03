@@ -13,7 +13,10 @@ using JSON
 using Nitro
 using Nitro: App, Form, Json, JsonFragment, MultipartForm
 using Base.ScopedValues: @with
-using Nitro.Core.Constants: REQUEST_MAX_FIELDS, DEFAULT_MAX_FIELDS
+using Nitro.Core.Constants: REQUEST_SCOPE, RequestScope, request_max_fields, DEFAULT_MAX_FIELDS
+
+# A request's scope with only a field cap, as a parser sees one bound by the pipeline.
+capped(n) = REQUEST_SCOPE => RequestScope(nothing, Ref{Int64}(n))
 
 struct Small
     a::Int
@@ -85,7 +88,7 @@ end
     @test !any(l -> occursin("secretkey", string(l.message, l.kwargs)), logger.logs)
     @test !any(l -> l.level >= Base.CoreLogging.Error, logger.logs)
     err = try
-        @with REQUEST_MAX_FIELDS => 1 Nitro.Core.Util.BodyParsers._check_field_count("pw=1&tok=2", "The form body")
+        @with capped(1) Nitro.Core.Util.BodyParsers._check_field_count("pw=1&tok=2", "The form body")
         nothing
     catch e
         e
@@ -95,10 +98,10 @@ end
 end
 
 @testset "outside a request the default applies; 0 lifts it; responses are not capped" begin
-    @test REQUEST_MAX_FIELDS[] == DEFAULT_MAX_FIELDS == 1000
+    @test request_max_fields() == DEFAULT_MAX_FIELDS == 1000
     big = HTTP.Request("POST", "/", JSON_T, jobject(1001))
     @test_throws ValidationError json(big)
-    @test @with(REQUEST_MAX_FIELDS => 0, length(json(big))) == 1001
+    @test @with(capped(0), length(json(big))) == 1001
     @test length(json(HTTP.Response(200, jobject(1001)))) == 1001
     @test length(json(HTTP.Response(200, jobject(1001)), Dict{String,Int})) == 1001
 end

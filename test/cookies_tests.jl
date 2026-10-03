@@ -1825,7 +1825,7 @@ end
     resetstate()
     try
         configcookies(secret_key = key_g)
-        @test Nitro.Core.SERVING_APP[] === nothing
+        @test Nitro.Core.serving_app() === nothing
 
         # Outside any request.
         token = token_of(set_cookie!(HTTP.Response(200), "g", "v"), "g")
