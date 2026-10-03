@@ -4,6 +4,8 @@
 # connection loop -- is part of what is measured. `run.sh` drives it with `oha`.
 #
 #   MODE=nitro          Nitro `serve()` with no middleware (the default).
+#   MODE=nitro_log      The same with `access_log = true`, `serve()`'s own default (#443), so the
+#                       log's cost can be A/B'd against `nitro` in one interleaved run.
 #   MODE=bare_spawn     HTTP.jl `listen!` + `streamhandler`, one `Threads.@spawn` per request:
 #                       the shape Nitro's `parallel_stream_handler` takes, and the ceiling to
 #                       compare it against.
@@ -25,7 +27,7 @@ using Profile
 
 const MODE       = get(ENV, "MODE", "nitro")
 const PORT       = parse(Int, get(ENV, "PORT", "8080"))
-const ACCESS_LOG = get(ENV, "ACCESS_LOG", "0") == "1"
+const ACCESS_LOG = get(ENV, "ACCESS_LOG", "0") == "1" || MODE == "nitro_log"
 const PROFILE_S  = parse(Float64, get(ENV, "PROFILE", "0"))
 const WARMUP_S   = parse(Float64, get(ENV, "WARMUP", "8"))
 
@@ -78,10 +80,10 @@ function profile_window()
     @info "bench: profile written" stem
 end
 
-handle = MODE == "nitro"        ? start_nitro() :
+handle = MODE in ("nitro", "nitro_log") ? start_nitro() :
          MODE == "bare_spawn"   ? start_bare(true) :
          MODE == "bare_nospawn" ? start_bare(false) :
-         error("unknown MODE=$(MODE): expected nitro, bare_spawn or bare_nospawn")
+         error("unknown MODE=$(MODE): expected nitro, nitro_log, bare_spawn or bare_nospawn")
 
 @info "bench: serving" MODE PORT threads = Threads.nthreads() interactive = Threads.nthreads(:interactive)
 PROFILE_S > 0 && Threads.@spawn profile_window()

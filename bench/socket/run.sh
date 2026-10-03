@@ -133,7 +133,8 @@ for route in $ROUTES; do
     mp=$(printf '%s\n' "${p99[@]}" | median)
     printf '%-13s %-10s median=%-8s [%s..%s]  p99=%sms  runs: %s\n' \
       "$mode" "$route" "$med" "$mn" "$mx" "$mp" "${rps[*]}"
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$mode" "$THREADS" "${ACCESS_LOG:-0}" "$route" \
+    logged="${ACCESS_LOG:-0}"; [ "$mode" = nitro_log ] && logged=1
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$mode" "$THREADS" "$logged" "$route" \
       "$med" "$mn" "$mx" "$mp" >> "$RESULT"
   done
 done
