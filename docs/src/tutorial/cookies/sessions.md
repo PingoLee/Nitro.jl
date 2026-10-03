@@ -72,8 +72,10 @@ The `secure=false` example is only for local HTTP development. Keep `secure=true
 2. Loads the server-side payload into `getsession(req)`, or gives a new visitor an empty one.
 3. Persists any changes at the end of the request. A **new** session is saved only once it is
    used: the handler stored something in it, rotated it, or set
-   `req.context[:session_modified] = true` (as `CSRFMiddleware` does for its tokens). A request
-   that never touches the session stores nothing and gets no cookie.
+   `req.context[:session_modified] = true` (as `CSRFMiddleware` does when it issues a token). A
+   request that never touches the session stores nothing and gets no cookie, even behind a global
+   `CSRFMiddleware`: it issues a new visitor a token only when a handler asks with `csrf_token!`
+   (see [When a token is issued](../sessions_and_auth.md#When-a-token-is-issued)).
 4. Writes the cookie when a session is saved or its ID rotates, and marks that response
    `Cache-Control: private` with `Vary: Cookie`, so a shared cache or CDN never hands one
    visitor's session to another. `private` replaces a `public` directive; `max-age` and the

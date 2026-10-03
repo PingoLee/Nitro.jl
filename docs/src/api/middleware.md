@@ -38,6 +38,8 @@ CookieAuthMiddleware
 ```@docs
 Cors
 SecurityHeaders
+CSRFMiddleware
+csrf_token!
 Nitro.Core.Middleware.CSRFMiddleware_.issue_csrf_token!
 Nitro.Core.Middleware.CSRFMiddleware_.validate_csrf_token
 ```

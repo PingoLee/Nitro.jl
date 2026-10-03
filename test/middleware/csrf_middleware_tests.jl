@@ -3,7 +3,7 @@
 using HTTP
 using JSON
 using Nitro
-using Nitro: CSRFMiddleware, SessionMiddleware, CookieConfig, regenerate_session!
+using Nitro: CSRFMiddleware, SessionMiddleware, CookieConfig, regenerate_session!, csrf_token!
 using Nitro.Core.Types: MemoryStore
 
 # The private surface. Every one of these is security-relevant and none is reachable through the
@@ -27,6 +27,8 @@ const SESSION_B = "22222222-2222-4222-8222-222222222222"
 set_cookie_headers(res) = [h.second for h in res.headers if lowercase(h.first) == "set-cookie"]
 cookie_line(res, name) = only(filter(h -> startswith(h, "$name="), set_cookie_headers(res)))
 cookie_value(res, name) = String(match(Regex("$(name)=([^;]+)"), cookie_line(res, name)).captures[1])
+raw_half(cookie) = String(split(cookie, '.', limit = 2)[1])     # the token the client echoes
+session_count(store) = length(store.data)
 
 """Build a request already carrying `cookies` (a name => value dict) plus `headers`."""
 function request(method, cookies::Dict{String,String} = Dict{String,String}(); headers = Pair{String,String}[], body = nothing)
@@ -36,6 +38,11 @@ function request(method, cookies::Dict{String,String} = Dict{String,String}(); h
 end
 
 ok_handler(req) = HTTP.Response(200, "ok")
+
+# Asks for the token, the way a form page or an SPA bootstrap endpoint does. Since #431 a new
+# visitor gets a token only when something asks, so every testset that needs a first-visit token
+# goes through this handler.
+token_handler(req) = (csrf_token!(req); HTTP.Response(200, "ok"))
 
 """A CSRF layer whose binding is fixed to `session_id`, with no SessionMiddleware involved."""
 function bound_layer(session_id::String; kwargs...)
@@ -47,8 +54,8 @@ function bound_layer(session_id::String; kwargs...)
 end
 
 """A real SessionMiddleware wrapped around CSRFMiddleware, plus its store."""
-function session_layer(; csrf_kwargs = (;), handler = ok_handler)
-    store = MemoryStore{String, Dict{String,Any}}()
+function session_layer(; csrf_kwargs = (;), handler = ok_handler,
+                       store = MemoryStore{String, Dict{String,Any}}())
     layer = SessionMiddleware(cookie_name = "unit_session", store = store).middleware(
         CSRFMiddleware(SECRET; csrf_kwargs...)(handler))
     return layer, store
@@ -389,9 +396,10 @@ end
 # ── integration with SessionMiddleware ────────────────────────────────────────
 
 @testset "issued once, then reused while the session holds" begin
-    layer, _ = session_layer()
+    asking, store = session_layer(handler = token_handler)
+    layer, _ = session_layer(store = store)
 
-    first = layer(HTTP.Request("GET", "/form"))
+    first = asking(HTTP.Request("GET", "/form"))
     session_id = cookie_value(first, "unit_session")
     token_cookie = cookie_value(first, "__Host-csrf_token")
     jar = Dict("unit_session" => session_id, "__Host-csrf_token" => token_cookie)
@@ -399,14 +407,17 @@ end
     # A second safe request with a still-valid cookie must NOT mint a replacement.
     second = layer(request("GET", jar))
     @test !any(startswith("__Host-csrf_token="), set_cookie_headers(second))
+    # Asking again re-sends the cookie to refresh its Max-Age, but with the SAME token.
+    @test raw_half(cookie_value(asking(request("GET", jar)), "__Host-csrf_token")) == raw_half(token_cookie)
 end
 
 # #317: `SessionMiddleware` now saves a NEW session only when something marks it modified. A token
 # is bound to the session id, so every path that hands one out must keep the session -- or the
 # anonymous visitor's next request gets a fresh id, the token no longer verifies, and every POST
-# is a 403. These three testsets are the three issuing paths.
+# is a 403. These three testsets are the three issuing paths. The first used to be any safe
+# request; since #431 it is a request whose handler asked with `csrf_token!`.
 @testset "an anonymous visitor's first GET keeps the session its token is bound to (#317)" begin
-    layer, store = session_layer()
+    layer, store = session_layer(handler = token_handler)
 
     first = layer(HTTP.Request("GET", "/form"))
     session_id = cookie_value(first, "unit_session")
@@ -495,8 +506,13 @@ end
     # 403s forever: nothing in its traffic is a safe method, so nothing ever mints a replacement.
     store = MemoryStore{String, Dict{String,Any}}()
     # Only the POST logs in; a GET that also set `user_id` would leave the auth marker unchanged
-    # on the POST and nothing would rotate -- the fixture has to model a real login.
-    login(req) = (req.method == "POST" && (getsession(req)["user_id"] = "u1"); HTTP.Response(200, "ok"))
+    # on the POST and nothing would rotate -- the fixture has to model a real login. The GET is
+    # the login page, which asks for the token it would put in the form (#431).
+    login(req) = begin
+        req.method == "GET" && csrf_token!(req)
+        req.method == "POST" && (getsession(req)["user_id"] = "u1")
+        HTTP.Response(200, "ok")
+    end
     layer = SessionMiddleware(cookie_name = "unit_session", store = store).middleware(
         CSRFMiddleware(SECRET)(login))
 
@@ -585,8 +601,12 @@ end
 end
 
 @testset "a stale token is replaced on the next safe request" begin
-    layer, _ = session_layer()
-    first = layer(HTTP.Request("GET", "/form"))
+    # The replacement is unasked: the second request's handler never calls `csrf_token!`. It is
+    # minted because the session already exists, so the token costs no new store row (#431).
+    store = MemoryStore{String, Dict{String,Any}}()
+    asking, _ = session_layer(handler = token_handler, store = store)
+    layer, _ = session_layer(store = store)
+    first = asking(HTTP.Request("GET", "/form"))
     session_id = cookie_value(first, "unit_session")
 
     # Simulate a token minted under a different session (or an expired secret): still well-formed,
@@ -605,17 +625,227 @@ end
 @testset "req.context[:csrf_token] carries the raw token to the handler" begin
     seen = Ref{Any}(:unset)
     capture(req) = (seen[] = Base.get(req.context, :csrf_token, :missing); HTTP.Response(200, "ok"))
-    layer, _ = session_layer(handler = capture)
+    store = MemoryStore{String, Dict{String,Any}}()
+    layer, _ = session_layer(handler = capture, store = store)
+    asking, _ = session_layer(handler = token_handler, store = store)
 
-    # First visit: no cookie yet, so the handler sees `nothing` and the token is minted after.
-    first = layer(HTTP.Request("GET", "/form"))
+    # First visit: no cookie yet, so the handler sees `nothing` -- and since it did not ask,
+    # nothing is minted after it either (#431).
+    unasked = layer(HTTP.Request("GET", "/form"))
     @test seen[] === nothing
+    @test isempty(set_cookie_headers(unasked))
+
+    first = asking(HTTP.Request("GET", "/form"))
     session_id = cookie_value(first, "unit_session")
     token_cookie = cookie_value(first, "__Host-csrf_token")
 
     # Second visit: the handler sees the raw token, not the signed cookie value.
     layer(request("GET", Dict("unit_session" => session_id, "__Host-csrf_token" => token_cookie)))
     @test seen[] == String(split(token_cookie, '.', limit = 2)[1])
+end
+
+
+# ── lazy minting (#431) ───────────────────────────────────────────────────────
+# A global `CSRFMiddleware` used to mint on every safe response and mark the session modified to
+# keep the token's binding alive, so every cookieless GET -- health checks, bearer clients,
+# scanners -- became a stored session: #317's growth, back through CSRF. Now a token goes out
+# only when a handler asks (`csrf_token!`) or when the session is saved anyway.
+
+@testset "a cookieless GET that nobody asked a token for creates nothing (#431)" begin
+    reads_session(req) = (Base.get(getsession(req), "x", nothing); HTTP.Response(200, "ok"))
+    layer, store = session_layer(handler = reads_session)
+
+    res = layer(HTTP.Request("GET", "/form"))
+    @test res.status == 200
+    @test isempty(set_cookie_headers(res))           # neither a CSRF nor a session cookie
+    @test session_count(store) == 0
+
+    # The issue's reproduction, through an `App` and the request pipeline.
+    app = App()
+    urlpatterns(app, "", path("/x", req -> (Base.get(getsession(req), "x", nothing); Res.send("ok"));
+                              method = "GET"))
+    app_store = MemoryStore{String, Dict{String,Any}}()
+    insecure = CookieConfig(httponly = false, secure = false, samesite = "Lax", path = "/", maxage = 3600)
+    r = internalrequest(app, HTTP.Request("GET", "/x"); middleware = [
+        SessionMiddleware(store = app_store, secure = false),
+        CSRFMiddleware(SECRET; cookie_name = "csrf_token", config = insecure)])
+    @test r.status == 200
+    @test !any(h -> lowercase(h.first) == "set-cookie", r.headers)
+    @test session_count(app_store) == 0
+end
+
+@testset "csrf_token! on a first visit mints the token it returns (#431)" begin
+    returned = Ref{String}("")
+    asking(req) = (returned[] = csrf_token!(req); HTTP.Response(200, returned[]))
+    layer, store = session_layer(handler = asking)
+
+    res = layer(HTTP.Request("GET", "/form"))
+    session_id = cookie_value(res, "unit_session")
+    token_cookie = cookie_value(res, "__Host-csrf_token")
+    # The value the handler embedded is the cookie's raw half -- the token the client must echo.
+    @test raw_half(token_cookie) == returned[]
+    @test String(res.body) == returned[]
+    @test CSRF._verify_signed_token(SECRET, token_cookie, session_id) == returned[]
+    @test session_count(store) == 1
+
+    post = layer(request("POST", Dict("unit_session" => session_id, "__Host-csrf_token" => token_cookie);
+                         headers = ["X-CSRF-Token" => returned[]]))
+    @test post.status == 200
+end
+
+@testset "an existing session gets a token unasked, and no new row (#431)" begin
+    store = MemoryStore{String, Dict{String,Any}}()
+    Nitro.Types.set_session!(store, SESSION_A, Dict{String,Any}("cart" => [1]); ttl = 3600)
+    layer, _ = session_layer(store = store)
+
+    res = layer(request("GET", Dict("unit_session" => SESSION_A)))
+    @test CSRF._verify_signed_token(SECRET, cookie_value(res, "__Host-csrf_token"), SESSION_A) !== nothing
+    @test session_count(store) == 1
+end
+
+@testset "a new session the handler writes to gets a token unasked (#431)" begin
+    writes(req) = (getsession(req)["seen"] = true; HTTP.Response(200, "ok"))
+    layer, store = session_layer(handler = writes)
+
+    res = layer(HTTP.Request("GET", "/form"))
+    session_id = cookie_value(res, "unit_session")
+    @test CSRF._verify_signed_token(SECRET, cookie_value(res, "__Host-csrf_token"), session_id) !== nothing
+    @test session_count(store) == 1
+end
+
+@testset "csrf_token! returns a valid token the client already holds (#431)" begin
+    store = MemoryStore{String, Dict{String,Any}}()
+    first = session_layer(handler = token_handler, store = store)[1](HTTP.Request("GET", "/form"))
+    session_id = cookie_value(first, "unit_session")
+    token_cookie = cookie_value(first, "__Host-csrf_token")
+    jar = Dict("unit_session" => session_id, "__Host-csrf_token" => token_cookie)
+
+    returned = Ref{String}("")
+    asking(req) = (returned[] = csrf_token!(req); HTTP.Response(200, "ok"))
+    layer, _ = session_layer(handler = asking, store = store)
+
+    again = layer(request("GET", jar))
+    @test returned[] == raw_half(token_cookie)
+    # The cookie is re-sent with the SAME token, so its Max-Age starts again: a token just put in
+    # a page must not expire before the page is used (Django re-sends whenever `get_token` runs).
+    @test raw_half(cookie_value(again, "__Host-csrf_token")) == returned[]
+    @test occursin("Max-Age=3600", cookie_line(again, "__Host-csrf_token"))
+    @test session_count(store) == 1
+    # The refresh carries one visitor's token with no session write, so CSRF marks it private
+    # itself: a shared cache must never hand A's token to B.
+    @test occursin("private", HTTP.header(again, "Cache-Control"))
+    @test any(h -> lowercase(h.first) == "vary" && occursin("Cookie", h.second), again.headers)
+    # ... and it forces no session write: the stored expiry is untouched.
+    expires_before = Base.get(store, session_id, nothing).expires
+    sleep(0.01)
+    layer(request("GET", jar))
+    @test Base.get(store, session_id, nothing).expires == expires_before
+
+    # After a validated POST the handler gets the token the client just presented, so a form
+    # re-rendered with errors carries a token that still works.
+    returned[] = ""
+    post = layer(request("POST", jar; headers = ["X-CSRF-Token" => raw_half(token_cookie)]))
+    @test post.status == 200
+    @test returned[] == raw_half(token_cookie)
+    @test raw_half(cookie_value(post, "__Host-csrf_token")) == returned[]
+
+    # A request that does not ask re-sends nothing while the cookie is valid.
+    plain, _ = session_layer(store = store)
+    @test !any(startswith("__Host-csrf_token="), set_cookie_headers(plain(request("GET", jar))))
+end
+
+@testset "a login rotation retires the client's existing token (#431)" begin
+    # The client's token from BEFORE the rotation must not be re-bound to the post-login session:
+    # whoever knew it before -- another user of a shared browser -- would keep a working token for
+    # the victim's account. Django's `rotate_token` on login; the pre-#431 code minted fresh too.
+    store = MemoryStore{String, Dict{String,Any}}()
+    first = session_layer(handler = token_handler, store = store)[1](HTTP.Request("GET", "/form"))
+    old_session = cookie_value(first, "unit_session")
+    old_cookie = cookie_value(first, "__Host-csrf_token")
+    jar = Dict("unit_session" => old_session, "__Host-csrf_token" => old_cookie)
+
+    # Asked AFTER rotating, as a login should: a new token, returned and in the cookie.
+    returned = Ref{String}("")
+    login_then_ask(req) = (regenerate_session!(req, store); returned[] = csrf_token!(req);
+                           HTTP.Response(200, "ok"))
+    res = session_layer(handler = login_then_ask, store = store)[1](request("GET", jar))
+    new_session = cookie_value(res, "unit_session")
+    token_cookie = cookie_value(res, "__Host-csrf_token")
+    @test new_session != old_session
+    @test returned[] != raw_half(old_cookie)
+    @test raw_half(token_cookie) == returned[]
+    @test CSRF._verify_signed_token(SECRET, token_cookie, new_session) == returned[]
+
+    # Asked BEFORE rotating: the handler got the old token, and the rotation still retires it --
+    # the cookie carries a fresh one. (Documented: call `csrf_token!` after `regenerate_session!`.)
+    store2 = MemoryStore{String, Dict{String,Any}}()
+    first2 = session_layer(handler = token_handler, store = store2)[1](HTTP.Request("GET", "/form"))
+    jar2 = Dict("unit_session" => cookie_value(first2, "unit_session"),
+                "__Host-csrf_token" => cookie_value(first2, "__Host-csrf_token"))
+    ask_then_login(req) = (returned[] = csrf_token!(req); regenerate_session!(req, store2);
+                           HTTP.Response(200, "ok"))
+    res2 = session_layer(handler = ask_then_login, store = store2)[1](request("GET", jar2))
+    @test returned[] == raw_half(jar2["__Host-csrf_token"])
+    @test raw_half(cookie_value(res2, "__Host-csrf_token")) != returned[]
+    @test CSRF._verify_signed_token(SECRET, cookie_value(res2, "__Host-csrf_token"),
+                                    cookie_value(res2, "unit_session")) !== nothing
+end
+
+@testset "a new session marked modified, or rotated, gets a token unasked (#431)" begin
+    # The two remaining ways a new session is saved without CSRF's help.
+    flagging(req) = (req.context[:session_modified] = true; HTTP.Response(200, "ok"))
+    layer, store = session_layer(handler = flagging)
+    res = layer(HTTP.Request("GET", "/form"))
+    @test CSRF._verify_signed_token(SECRET, cookie_value(res, "__Host-csrf_token"),
+                                    cookie_value(res, "unit_session")) !== nothing
+    @test session_count(store) == 1
+
+    rstore = MemoryStore{String, Dict{String,Any}}()
+    rotating(req) = (regenerate_session!(req, rstore); HTTP.Response(200, "ok"))
+    rlayer, _ = session_layer(handler = rotating, store = rstore)
+    rres = rlayer(HTTP.Request("GET", "/form"))
+    @test CSRF._verify_signed_token(SECRET, cookie_value(rres, "__Host-csrf_token"),
+                                    cookie_value(rres, "unit_session")) !== nothing
+    @test session_count(rstore) == 1
+end
+
+@testset "csrf_token! then a rotation: the cookie carries the returned token (#431)" begin
+    # The handler may already have written the token into its body when it rotates the session,
+    # so the cookie must carry THAT token, signed for the new id -- not a fresh one.
+    store = MemoryStore{String, Dict{String,Any}}()
+    Nitro.Types.set_session!(store, SESSION_A, Dict{String,Any}(); ttl = 3600)
+    returned = Ref{String}("")
+    rotating(req) = begin
+        returned[] = csrf_token!(req)
+        regenerate_session!(req, store)
+        HTTP.Response(200, "ok")
+    end
+    layer, _ = session_layer(handler = rotating, store = store)
+
+    res = layer(request("GET", Dict("unit_session" => SESSION_A)))
+    new_session = cookie_value(res, "unit_session")
+    token_cookie = cookie_value(res, "__Host-csrf_token")
+    @test new_session != SESSION_A
+    @test raw_half(token_cookie) == returned[]
+    @test CSRF._verify_signed_token(SECRET, token_cookie, new_session) == returned[]
+    @test CSRF._verify_signed_token(SECRET, token_cookie, SESSION_A) === nothing
+end
+
+@testset "csrf_token! refuses to hand out an unbound token (#431)" begin
+    # No CSRFMiddleware at all: there is no cookie to back the token, so it would never verify.
+    # A session id IS present, so only the "middleware did not run" check can refuse it.
+    bare = HTTP.Request("GET", "/form")
+    bare.context[:session_id] = SESSION_A
+    err = try csrf_token!(bare); nothing catch e; e end
+    @test err isa ArgumentError
+    @test occursin("did not handle", sprint(showerror, err))
+
+    # CSRFMiddleware without a session: fail closed, never an unbound token.
+    thrown = Ref{Any}(nothing)
+    catching(req) = (try csrf_token!(req) catch e; thrown[] = e end; HTTP.Response(200, "ok"))
+    res = CSRFMiddleware(SECRET)(catching)(HTTP.Request("GET", "/form"))
+    @test thrown[] isa ArgumentError
+    @test isempty(set_cookie_headers(res))
 end
 
 end

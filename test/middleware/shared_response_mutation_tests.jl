@@ -65,7 +65,12 @@ end
     # `const` rejection, so each has to own the headers first.
     @test isempty(SHARED.headers)
     store = MemoryStore{String, Dict{String,Any}}()
+    # The handler asks for the token (`csrf_token!`): since #431 a first visit nobody asked a
+    # token for gets none, so the const would never be at risk on that path.
     wrapped = SessionMiddleware(cookie_name="sid", max_age=3600, store=store).middleware(
+        CSRFMiddleware("shared-const-secret")(req -> (csrf_token!(req); SHARED)))
+    # And one that does not ask: the re-issue below is unasked, minted because the session exists.
+    unasked = SessionMiddleware(cookie_name="sid", max_age=3600, store=store).middleware(
         CSRFMiddleware("shared-const-secret")(req -> SHARED))
 
     csrf_cookie(resp) = begin
@@ -91,7 +96,7 @@ end
                            respA.headers)).second
     sid = match(r"sid=([^;]+)", sid_line).captures[1]
     stale = HTTP.Request("GET", "/protected", ["Cookie" => "sid=$sid; __Host-csrf_token=bogus.sig"])
-    respC = wrapped(stale)
+    respC = unasked(stale)
     @test csrf_cookie(respC) !== nothing
     @test isempty(SHARED.headers)
 end

@@ -236,6 +236,14 @@ CSRFMiddleware(secret::Union{AbstractString, SecretString};  # needs SessionMidd
 # Tokens are HMAC'd over (raw_token | req.context[:session_id]). No session id => no token
 # issued and 403 on every unsafe method. Throws ArgumentError if a __Host-/__Secure- name is
 # paired with a config browsers would reject.
+# Lazy (#431): a token is issued only when a handler calls csrf_token!(req), or when the
+# session is saved anyway (it already existed, or the request wrote to / rotated it). A
+# cookieless request nobody asked a token for creates no token and no session.
+
+csrf_token!(req) -> String   # the raw token to embed (hidden `_csrf` field, JSON for an SPA);
+                             # the middleware sets (or refreshes) the matching cookie. Call it
+                             # AFTER regenerate_session!: rotation retires the earlier token.
+                             # ArgumentError outside CSRFMiddleware or with no session.
 
 SessionMiddleware(; store,                           # REQUIRED -- no default (#171)
                     cookie_name      = nothing,      # => __Host-nitro_session (#329); see below

@@ -302,9 +302,18 @@ cannot be replayed for another. With no session id present the gate **fails clos
 issued and every unsafe request gets `403`, with a warning naming the ordering rule — there is no
 unbound fallback.
 
-**Put `CSRFMiddleware` in the global pipeline, not on a route.** Tokens are minted on *safe*
-responses, so a `CSRFMiddleware` scoped to a `method="POST"` route never issues one and refuses
-every request it sees. Scope guards per route; scope CSRF per app.
+**Put `CSRFMiddleware` in the global pipeline, not on a route.** Tokens are issued to the page that
+renders the form, so a `CSRFMiddleware` scoped to a `method="POST"` route never issues one and
+refuses every request it sees. Scope guards per route; scope CSRF per app. Global placement costs no
+session per request (#431). A new visitor gets a token only when a handler calls
+**`csrf_token!(req)`**, which returns the raw token for a hidden `_csrf` field or a JSON body. A
+visitor whose session is saved anyway (it already exists, or the request wrote to or rotated it)
+gets one unasked. An SPA shell (`spafiles`, or the proxy) runs no handler, so give the app a
+`GET /api/csrf` endpoint returning `csrf_token!(req)`. The app fetches it at boot, after login
+or logout, and on a `403` (then retries once): the cookie expires `ttl` seconds after the last
+`csrf_token!`. A handler that rotates the session calls `csrf_token!` **after**
+`regenerate_session!`, because a rotation retires the client's earlier token. `csrf_token!` throws
+`ArgumentError` outside `CSRFMiddleware` or without a session.
 
 The cookie is `__Host-csrf_token` by default, so a sibling subdomain cannot overwrite it. Browsers
 accept that prefix only on a `Secure`, `Path=/`, `Domain`-less cookie, and `CSRFMiddleware` throws

@@ -39,6 +39,11 @@ spafiles("dist", "";        cache_control = "no-cache")   # the shell must reval
 There is deliberately no default — a `max-age` guessed on your behalf is wrong more often than
 right, and guessing high pins clients to a stale asset with no way to recover.
 
+Whoever serves the SPA shell, the proxy in production or `spafiles` in development, no handler of
+yours runs for it, so the shell cannot be relied on to carry a CSRF token. The app fetches one
+from an endpoint that calls `csrf_token!` instead; see
+[Single-page apps](sessions_and_auth.md#Single-page-apps).
+
 ### Large files hold a descriptor, and `proxy_buffering` is why that is fine
 
 A mounted file over `stream_threshold` (8 MiB by default), and any `Res.file(req, path;
