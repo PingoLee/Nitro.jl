@@ -909,8 +909,10 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
         res = @test_logs (:warn, r"SessionPayload") reader(capped)(req())
         @test String(res.body) == "none"
 
+        # `unconfirmed_max_age = nothing`: a bare-data store cannot be confirmed either, and the
+        # warning that says so (#440) is pinned in its own testset; this one is about #362.
         uncapped = SessionMiddleware(cookie_name="sid", store=BareDataStore(), secure=false,
-                                     absolute_max_age=nothing).middleware
+                                     absolute_max_age=nothing, unconfirmed_max_age=nothing).middleware
         @test String(reader(uncapped)(req()).body) == "5"
     end
 
@@ -1369,14 +1371,32 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
         @test Nitro.Core.Types.session_store_full(MemoryStore()) === false
     end
 
-    @testset "the full-store warning comes back after the store recovers (#440)" begin
+    @testset "the full-store warning repeats at most once per prune_interval (#440)" begin
+        # Not once for good: a store full again next week should say so. Not on every slot a
+        # flood refills either: under a sustained flood each logout frees a slot the flood takes
+        # at once, and re-arming on that accepted save made the warning rate the logout rate.
         store = CountingStore(full = true)
-        mw = SessionMiddleware(cookie_name="sid", store=store, secure=false).middleware
+        mw = SessionMiddleware(cookie_name="sid", store=store, secure=false).middleware   # 10 min
         @test_logs (:warn, r"session store is full") cart_writer(mw)(HTTP.Request("GET", "/"))
-        store.full[] = false
-        @test_logs min_level=Base.CoreLogging.Warn cart_writer(mw)(HTTP.Request("GET", "/"))   # saved
+        store.full[] = false                                   # a slot frees...
+        cart_writer(mw)(HTTP.Request("GET", "/"))              # ...and the flood takes it
         store.full[] = true
-        @test_logs (:warn, r"session store is full") cart_writer(mw)(HTTP.Request("GET", "/"))
+        @test_logs min_level=Base.CoreLogging.Warn cart_writer(mw)(HTTP.Request("GET", "/"))
+
+        # The interval itself, driven directly with an explicit clock window rather than slept
+        # out: a sleep-based check is a flake on a slow runner.
+        warn_full = Nitro.Core.Middleware.SessionMiddleware_._warn_store_full
+        # A minute, not an hour: `time_ns()` counts from boot, and a fresh CI runner may have been
+        # up for less than an hour, which would wrap the subtraction below.
+        last, minute = Threads.Atomic{UInt64}(0), UInt64(60) * UInt64(1_000_000_000)
+        @test_logs (:warn, r"session store is full") warn_full(last, minute, store)   # first: warns
+        @test_logs min_level=Base.CoreLogging.Warn warn_full(last, minute, store)     # too soon
+        last[] = time_ns() - minute - UInt64(1)                                        # a minute ago
+        @test_logs (:warn, r"session store is full") warn_full(last, minute, store)
+        # A `last` ahead of this call's clock read (a racer warned in between) is too soon, not a
+        # wrapped-around eternity.
+        last[] = time_ns() + minute
+        @test_logs min_level=Base.CoreLogging.Warn warn_full(last, minute, store)
     end
 
     @testset "a sign-in on an unconfirmed session confirms it through the rotation (#440)" begin
@@ -1423,6 +1443,8 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
                                                   absolute_max_age=nothing).middleware)
         res = @test_logs (:warn, r"never be confirmed") reader(HTTP.Request("GET", "/", ["Cookie" => "sid=x"]))
         @test String(res.body) == "1"
+        # Once per middleware, by its own flag: the next load does not reach the logger at all.
+        @test_logs min_level=Base.CoreLogging.Warn reader(HTTP.Request("GET", "/", ["Cookie" => "sid=x"]))
         # Off: no warning, nothing to confirm.
         quiet = session_reader(SessionMiddleware(cookie_name="sid", store=BareStore440(), secure=false,
                                                  absolute_max_age=nothing, unconfirmed_max_age=nothing).middleware)

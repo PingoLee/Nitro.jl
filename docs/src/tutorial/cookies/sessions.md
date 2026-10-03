@@ -237,7 +237,8 @@ store = pormg_nitro_session(max_sessions = 1_000_000)
 ```
 
 Once the table holds that many rows, `SessionMiddleware` stops saving **new anonymous** sessions.
-The request still succeeds, no cookie is set, and one warning is logged. Sessions that end signed
+The request still succeeds, no cookie is set, and a warning is logged, at most once per
+`prune_interval`. Sessions that end signed
 in, existing sessions and rotations are never refused, so a full store logs nobody out. The count
 is read at boot, kept by the store's own writes, and read again on
 every prune tick, so it costs no query per request. Expired rows count until the janitor deletes
@@ -248,8 +249,9 @@ session. If your login form carries a session-bound CSRF token (the default with
 `CSRFMiddleware`), that visitor cannot get a token that verifies, so they cannot sign in until the
 store has room again: new users, and anyone who cleared their cookies. Only a sign-in that needs
 no session beforehand, such as a token or JSON login without session-bound CSRF, is unaffected.
-An attacker keeps the store full with about `max_sessions / unconfirmed_max_age` cookieless
-writes a second (about 280 a second for a bound of a million with the default hour). So treat the
+An attacker keeps the store full with about
+`max_sessions / (unconfirmed_max_age + prune_interval)` cookieless writes a second (about 240 a
+second for a bound of a million with the defaults). So treat the
 cap as a last resort against running out of disk, not as flood protection, and size it well above
 your normal number of live sessions.
 

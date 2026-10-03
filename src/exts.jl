@@ -52,7 +52,8 @@ another PormG connection, for example `db_key="sessions"`.
 `max_sessions` bounds the table against a flood of anonymous sessions (#440). **The default,
 `nothing`, is unbounded**: unlike `MemoryStore`, a database store has no size limit of its own.
 With a bound, once the table holds `max_sessions` rows `SessionMiddleware` stops saving new
-*anonymous* sessions — the request still succeeds, and one warning is logged — while sessions that
+*anonymous* sessions — the request still succeeds, and a warning is logged at most once per
+`prune_interval` — while sessions that
 end signed in, existing sessions and rotations are never refused. A full store can still keep a
 visitor with no cookie from signing in through a form with a session-bound CSRF token. The count
 is read at boot, kept by the store's own writes, and re-read on every prune tick, so it costs no

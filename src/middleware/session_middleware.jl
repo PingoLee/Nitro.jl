@@ -199,8 +199,8 @@ is saved with the full lifetime at once.
   `unconfirmed_max_age = nothing` for such a store.
 - A store may also bound itself. Before saving a new anonymous session the middleware asks
   [`session_store_full`](@ref Nitro.Core.Types.session_store_full)`(store)`; when it answers
-  `true` the session is not saved and no cookie is set, the request still succeeds, and one
-  warning is logged. Sessions that end signed in, existing sessions and rotations are never
+  `true` the session is not saved and no cookie is set, the request still succeeds, and a warning
+  is logged, at most once per `prune_interval`. Sessions that end signed in, existing sessions and rotations are never
   refused. `pormg_nitro_session(max_sessions = N)` implements it. Under a full store a new visitor
   holds no session, so a session-bound CSRF token handed to them does not verify on their next
   request, and a cookieless visitor cannot sign in through such a form until the store has room.
@@ -406,16 +406,22 @@ function SessionMiddleware(;
 
     on_startup, on_shutdown = _prune_janitor(store, prune_interval, "SessionMiddleware",
                                              "prune_interval")
-    # Once per spell of fullness, not per refused session: at capacity EVERY anonymous insert is
-    # refused, and a warning each would be a second flood riding on the first.
-    warned_full = Threads.Atomic{Bool}(false)
+    # At most once per `prune_interval`, not per refused session: at capacity EVERY anonymous
+    # insert is refused, and a warning each would be a second flood riding on the first. Not once
+    # for good either -- a store that is full again next week deserves to say so. `prune_interval`
+    # because that is when the store's count can next change much. The janitor above has already
+    # refused a calendar period, so it converts to a fixed number of nanoseconds.
+    last_full_warning = Threads.Atomic{UInt64}(0)
+    full_warning_every = UInt64(Dates.toms(prune_interval)) * UInt64(1_000_000)
+    # Once per middleware: a store whose `Base.get` returns bare data can never confirm a session.
+    warned_bare = Threads.Atomic{Bool}(false)
 
     middleware = function(handle::Function)
         return function(req::HTTP.Request)
             # Load the current payload and remember the auth marker before the handler runs.
             session_id = _get_session_id(req, session_cookie)
             session_data, is_new, created, unconfirmed =
-                _load_session(store, session_id, absolute_max_age, unconfirmed_max_age)
+                _load_session(store, session_id, absolute_max_age, unconfirmed_max_age, warned_bare)
             # A signed-in session whose user has since been signed out everywhere (#391) is
             # ended the way a session past its absolute lifetime is: deleted, and this request
             # starts as a new visitor. Checked before the marker below is taken, so the handler
@@ -529,13 +535,11 @@ function SessionMiddleware(;
                 # `::Bool`: an optional contract method a custom store implements, asserted like
                 # `update_session!` below so a wrong return fails by name.
                 if anonymous && session_store_full(store)::Bool
-                    _warn_store_full(warned_full, store)
+                    _warn_store_full(last_full_warning, full_warning_every, store)
                     session_written = false
                 else
-                    if anonymous
-                        # The store has room again: the next time it fills is worth a warning too.
-                        warned_full[] && (warned_full[] = false)
-                        unconfirmed_max_age === nothing || (ttl = min(ttl, unconfirmed_max_age))
+                    if anonymous && unconfirmed_max_age !== nothing
+                        ttl = min(ttl, unconfirmed_max_age)
                     end
                     _save_session(store, final_session_id, current_session, ttl)
                     session_written = true
@@ -605,7 +609,8 @@ end
 # instant, or now for a new one -- the instant its absolute lifetime will be measured from once it
 # is saved. `unconfirmed` is whether a loaded session is still on its unconfirmed lifetime (#440).
 function _load_session(store::AbstractSessionStore{String, Dict{String,Any}}, session_id::Nullable{String},
-                       absolute_max_age::Nullable{Int}, unconfirmed_max_age::Nullable{Int})
+                       absolute_max_age::Nullable{Int}, unconfirmed_max_age::Nullable{Int},
+                       warned_bare::Threads.Atomic{Bool})
     now = Dates.now(Dates.UTC)
     if isnothing(session_id)
         return Dict{String,Any}(), true, now, false
@@ -655,12 +660,14 @@ function _load_session(store::AbstractSessionStore{String, Dict{String,Any}}, se
     # A bare payload carries no lifetime, so it cannot be recognised as unconfirmed: it reads as
     # confirmed and is never promoted. Every anonymous session in such a store therefore lapses at
     # `unconfirmed_max_age` however much it is used -- said once, since nothing else would (#440).
-    if unconfirmed_max_age !== nothing
+    # Gated on our own flag, not `maxlog`: `maxlog` is checked inside the logger, under its lock,
+    # so it would still cost every request that loads such a session a trip through the logger.
+    if unconfirmed_max_age !== nothing && !Threads.atomic_xchg!(warned_bare, true)
         @warn "SessionMiddleware: the session store returned something other than a " *
               "`SessionPayload`, so a new anonymous session can never be confirmed and lapses " *
               "after `unconfirmed_max_age` however often its visitor returns. Return a " *
               "`SessionPayload(data, expires, created)` from `Base.get`, or pass " *
-              "`unconfirmed_max_age = nothing` (#440)." store_type = typeof(store) maxlog = 1
+              "`unconfirmed_max_age = nothing` (#440)." store_type = typeof(store)
     end
     data = payload isa AbstractDict ? deepcopy(payload) : payload
     return data, false, now, false
@@ -681,11 +688,19 @@ function _unconfirmed_payload(payload::SessionPayload, unconfirmed_max_age::Null
     return abs(Dates.value(lifetime) - 1000 * unconfirmed_max_age) < 1000
 end
 
-# Once per spell of fullness: a full store refuses every anonymous insert, and a warning per refusal
-# would be a second flood. The flag is cleared by the next anonymous save the store accepts, so a
-# store that fills again later warns again. The store type is named; never a session id.
-function _warn_store_full(warned::Threads.Atomic{Bool}, store::AbstractSessionStore)
-    Threads.atomic_xchg!(warned, true) && return nothing
+# At most once per `every` nanoseconds (the middleware's `prune_interval`): a full store refuses
+# every anonymous insert, and a warning per refusal would be a second flood -- as would re-arming on
+# each accepted save, since under a sustained flood every freed slot is filled at once. Of two
+# requests racing past the interval, the compare-and-swap lets exactly one warn. The store type is
+# named; never a session id.
+function _warn_store_full(last::Threads.Atomic{UInt64}, every::UInt64, store::AbstractSessionStore)
+    # `prev` before the clock, and `now <= prev` counted as too soon: read the other way round, a
+    # racer that warned between the two reads leaves `prev > now`, the unsigned difference wraps to
+    # a huge number, and this call warns a second time and winds `last` back.
+    prev = last[]
+    now = time_ns()
+    prev != 0 && (now <= prev || now - prev < every) && return nothing
+    Threads.atomic_cas!(last, prev, now) === prev || return nothing
     @warn "SessionMiddleware: the session store is full, so new anonymous sessions are not being " *
           "saved. Signed-in and existing sessions are unaffected. Raise the store's bound, or " *
           "look for a flood of cookieless requests to a route that writes the session (#440)." store_type = typeof(store)
