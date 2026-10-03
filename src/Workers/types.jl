@@ -58,7 +58,7 @@ run can never settle while it is blocked in the wait, so without this the call s
 `drain_timeout` and then warns about itself (#176).
 
 A bare `task === current_task()` check does not find it. `timeout_call` runs the callback on a
-**child** task, so the handle in `active_tasks` is the parent wrapper parked in `timedwait`, not
+**child** task, so the handle in `active_tasks` is the parent wrapper parked in its wait, not
 the task the callback is running on — the identity comparison misses on every path that has a
 deadline, which is the default. Marking the run is what survives that indirection.
 

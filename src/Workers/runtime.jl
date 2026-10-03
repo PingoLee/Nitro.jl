@@ -593,7 +593,7 @@ end
 # TWO probes, because one does not cover it. `task === current_task()` catches a run whose callback
 # runs directly on its registered handle, which happens only when `TaskOptions(timeout = 0)`
 # disables the deadline. With a deadline -- the default -- `timeout_call` runs the callback on a
-# CHILD task and the registered handle is the parent parked in `timedwait`, so the identity check
+# CHILD task and the registered handle is the parent parked in its wait, so the identity check
 # misses. `CURRENT_RUN_KEY` (`types.jl`) is the task-local marker that survives that indirection.
 function _snapshot_runs(runtime::WorkerRuntime)
     me = current_task()
