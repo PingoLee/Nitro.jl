@@ -230,7 +230,7 @@ CSRFMiddleware(secret::Union{AbstractString, SecretString};  # needs SessionMidd
                cookie_name = "__Host-csrf_token",   # prefix => Secure + Path=/ + no Domain
                header_name = "X-CSRF-Token",
                form_field  = "_csrf",
-               ttl::Int    = 3600,
+               ttl::Int    = 604800,                # 7 days = SessionMiddleware absolute_max_age (#441)
                config      = CookieConfig(httponly=false, secure=true,
                                           samesite="Lax", path="/", maxage=ttl))
 # Tokens are HMAC'd over (raw_token | req.context[:session_id]). No session id => no token

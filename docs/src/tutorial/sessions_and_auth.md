@@ -688,7 +688,7 @@ urlpatterns("",
 
 The token is URL-safe base64 (`A-Z a-z 0-9 - _`), so it is safe to interpolate into HTML as-is.
 A client that already holds a valid token gets the same one back, and its cookie is re-sent, so
-the cookie's lifetime (`ttl`, an hour by default) starts again from the page that embeds it.
+the cookie's lifetime (`ttl`, seven days by default) starts again from the page that embeds it.
 
 A handler that rotates the session (a login does) must call `csrf_token!` **after**
 `regenerate_session!`. Rotation retires the client's existing token, as Django's `rotate_token`
@@ -723,12 +723,14 @@ Fetch the token again in two cases:
 
 - **after a login or a logout.** Both rotate the session, and a token belongs to the session it
   was issued for.
-- **on a `403` from a mutation**, then retry the request once. The token in memory can outlive its
-  cookie: the cookie expires `ttl` seconds (an hour by default) after the app last fetched it, for
-  example while a tab sits idle.
+- **on a `403` from a mutation**, then retry the request once. The token in memory can outlive the
+  session it is bound to: the session expires, or another tab logs out, while this tab sits idle.
 
-Raising `ttl` to your session's `max_age` makes the second case rarer. The retry on `403` is what
-makes the app correct, so keep it even then.
+The cookie itself lasts `ttl` seconds after the app last fetched the token: seven days by default,
+the same as `SessionMiddleware`'s default `absolute_max_age`, so with default settings it does not
+expire before its session. If you raise your session lifetimes, raise `ttl` with them. A longer
+`ttl` costs nothing: a token stops verifying when its session ends, whatever its cookie says. The
+retry on `403` is what makes the app correct, so keep it either way.
 
 The cookie is readable by JavaScript, so an app can instead read the token from `document.cookie`
 before each mutation. The raw token is the part before the first `.`.

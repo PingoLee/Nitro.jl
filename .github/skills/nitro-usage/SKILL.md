@@ -310,9 +310,10 @@ session per request (#431). A new visitor gets a token only when a handler calls
 visitor whose session is saved anyway (it already exists, or the request wrote to or rotated it)
 gets one unasked. An SPA shell (`spafiles`, or the proxy) runs no handler, so give the app a
 `GET /api/csrf` endpoint returning `csrf_token!(req)`. The app fetches it at boot, after login
-or logout, and on a `403` (then retries once): the cookie expires `ttl` seconds after the last
-`csrf_token!`. A handler that rotates the session calls `csrf_token!` **after**
-`regenerate_session!`, because a rotation retires the client's earlier token. `csrf_token!` throws
+or logout, and on a `403` (then retries once): the token dies with its session, and the cookie
+expires `ttl` seconds after the last `csrf_token!` (seven days by default, the session's default
+`absolute_max_age`; keep `ttl` at least as long as your session lifetimes, #441). A handler that
+rotates the session calls `csrf_token!` **after** `regenerate_session!`, because a rotation retires the client's earlier token. `csrf_token!` throws
 `ArgumentError` outside `CSRFMiddleware` or without a session.
 
 The cookie is `__Host-csrf_token` by default, so a sibling subdomain cannot overwrite it. Browsers

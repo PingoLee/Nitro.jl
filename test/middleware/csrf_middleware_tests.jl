@@ -187,7 +187,9 @@ end
     @test !occursin("Domain=", line)                  # required by the __Host- prefix
     @test !occursin("HttpOnly", line)                 # deliberate: the SPA has to read it
     @test occursin("SameSite=Lax", line)
-    @test occursin("Max-Age=3600", line)
+    # Seven days by default (#441): one hour sent idle SPAs and open forms into a 403 while their
+    # session was still alive.
+    @test occursin("Max-Age=604800", line)
 
     # The cookie carries `<raw>.<sig>` and verifies under the binding it was minted for.
     value = cookie_value(res, "__Host-csrf_token")
@@ -201,6 +203,17 @@ end
     short = HTTP.Response(200, "ok")
     issue_csrf_token!(short, SECRET; binding = SESSION_A, ttl = 60)
     @test occursin("Max-Age=60", cookie_line(short, "__Host-csrf_token"))
+end
+
+@testset "the default ttl matches the session's absolute lifetime (#441)" begin
+    # `CSRFMiddleware` cannot read `SessionMiddleware`'s settings, so the two defaults are kept
+    # equal by hand. A CSRF cookie that dies first is a 403 for a client whose session is alive.
+    @test CSRF.DEFAULT_TTL == Nitro.Core.Middleware.SessionMiddleware_.DEFAULT_ABSOLUTE_MAX_AGE
+
+    # The middleware's own default reaches the cookie it issues, not just `issue_csrf_token!`'s.
+    layer, _ = session_layer(handler = token_handler)
+    res = layer(HTTP.Request("GET", "/form"))
+    @test occursin("Max-Age=$(CSRF.DEFAULT_TTL)", cookie_line(res, "__Host-csrf_token"))
 end
 
 @testset "issue_csrf_token! requires a binding" begin
@@ -729,7 +742,7 @@ end
     # The cookie is re-sent with the SAME token, so its Max-Age starts again: a token just put in
     # a page must not expire before the page is used (Django re-sends whenever `get_token` runs).
     @test raw_half(cookie_value(again, "__Host-csrf_token")) == returned[]
-    @test occursin("Max-Age=3600", cookie_line(again, "__Host-csrf_token"))
+    @test occursin("Max-Age=604800", cookie_line(again, "__Host-csrf_token"))
     @test session_count(store) == 1
     # The refresh carries one visitor's token with no session write, so CSRF marks it private
     # itself: a shared cache must never hand A's token to B.

@@ -21,6 +21,14 @@ const SAFE_METHODS = Set(("GET", "HEAD", "OPTIONS", "TRACE"))
 # the token, not that it minted it for *this* client, which is what the binding below adds.
 const DEFAULT_COOKIE_NAME = "__Host-csrf_token"
 
+# The cookie's default `Max-Age`: seven days, `SessionMiddleware`'s default `absolute_max_age`, so
+# the cookie never expires before a default session can (#441). A longer lifetime protects nothing
+# less: the token verifies only under the session it was minted for (#23), so a cookie that
+# outlives its session is inert, and the next request on the new session gets a fresh one. It used
+# to be one hour, which sent an idle single-page app down the 403-and-retry path every hour.
+# This layer cannot read the session middleware's lifetimes; a test pins the two defaults equal.
+const DEFAULT_TTL = 7 * 86400
+
 # The HMAC covers the random token AND the caller's binding (the session id), so a token minted
 # for one client does not verify for another. `binding` never travels in the cookie -- only its
 # HMAC does -- because the cookie is not httponly and the session id must stay off the JS side.
@@ -129,7 +137,7 @@ function used to have, so there must be no way to ask for one by omission.
 Throws `ArgumentError` when `secret` is empty or equivalent to the empty HMAC key (a run of
 up to 64 NUL bytes) -- a token signed under it is one anyone can sign.
 """
-function issue_csrf_token!(res::HTTP.Response, secret::String; binding::AbstractString, cookie_name::String=DEFAULT_COOKIE_NAME, ttl::Int=3600, config::CookieConfig=CookieConfig(httponly=false, secure=true, samesite="Lax", path="/", maxage=ttl))
+function issue_csrf_token!(res::HTTP.Response, secret::String; binding::AbstractString, cookie_name::String=DEFAULT_COOKIE_NAME, ttl::Int=DEFAULT_TTL, config::CookieConfig=CookieConfig(httponly=false, secure=true, samesite="Lax", path="/", maxage=ttl))
     _check_csrf_secret(secret)
     _validate_cookie_prefix(cookie_name, config)
     raw_token = _generate_raw_token()
@@ -359,7 +367,7 @@ end
 
 """
     CSRFMiddleware(secret; cookie_name = "__Host-csrf_token", header_name = "X-CSRF-Token",
-                   form_field = "_csrf", ttl = 3600, config = CookieConfig(...))
+                   form_field = "_csrf", ttl = 604800, config = CookieConfig(...))
 
 CSRF protection with a signed double-submit cookie, bound to the session. `secret` is a
 `String` or a `SecretString`; an empty one is an `ArgumentError`.
@@ -406,10 +414,15 @@ every unsafe request.
   it is an `ArgumentError`. For plain-HTTP development pass `cookie_name = "csrf_token"` and a
   `config` with `secure = false`.
 - `header_name`, `form_field`: where the token is read from on unsafe requests.
-- `ttl`: the cookie's `Max-Age`, in seconds.
+- `ttl`: the cookie's `Max-Age`, in seconds. Seven days by default, the default `absolute_max_age`
+  of `SessionMiddleware`, so the cookie does not expire before its session does (#441). Keep it
+  at least as long as your session's `max_age` and `absolute_max_age`: a shorter cookie sends an
+  idle single-page app or an open form into a `403` while its session is still alive. A longer
+  one costs nothing, because the token stops verifying when its session ends. With no absolute
+  cap (`absolute_max_age = nothing`) no `ttl` covers every session; the `403` retry does.
 - `config`: the cookie's attributes. It is not `httponly`, so a browser script can read the token.
 """
-function CSRFMiddleware(key::Union{AbstractString, SecretString}; cookie_name::String=DEFAULT_COOKIE_NAME, header_name::String="X-CSRF-Token", form_field::String="_csrf", ttl::Int=3600, config::CookieConfig=CookieConfig(httponly=false, secure=true, samesite="Lax", path="/", maxage=ttl))
+function CSRFMiddleware(key::Union{AbstractString, SecretString}; cookie_name::String=DEFAULT_COOKIE_NAME, header_name::String="X-CSRF-Token", form_field::String="_csrf", ttl::Int=DEFAULT_TTL, config::CookieConfig=CookieConfig(httponly=false, secure=true, samesite="Lax", path="/", maxage=ttl))
     # The closures below capture `sealed`, never the raw key: `repr` of a closure prints its
     # captures, so a plain `String` here was published by any `@info … middleware = mw` (#307).
     # The unwrap happens per request, into a local the closure does not hold.

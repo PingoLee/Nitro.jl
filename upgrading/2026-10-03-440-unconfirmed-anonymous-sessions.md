@@ -24,7 +24,7 @@ session store faster than the pruning janitor could reclaim it.
 | Left by a logout (emptied and rotated) | `max_age` | `max_age` (unchanged) |
 | Existing, confirmed | unchanged | unchanged |
 
-`unconfirmed_max_age` defaults to one hour, the default `CSRFMiddleware` `ttl`. When
+`unconfirmed_max_age` defaults to one hour. When
 `min(max_age, absolute_max_age)` is under two hours, the default is half of it, and under two
 minutes the feature is off. An explicit value must be positive and at most half that lifetime, or
 `SessionMiddleware` throws an `ArgumentError` when it is built. `nothing` restores the old
