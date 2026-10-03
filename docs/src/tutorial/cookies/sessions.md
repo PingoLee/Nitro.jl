@@ -218,16 +218,17 @@ SessionMiddleware(store = store, unconfirmed_max_age = nothing) # off: every ses
   identity (`auth_key`, or `validator`), such as a login from a client with no cookie yet, gets
   the full lifetime at once. So does the anonymous session a logout leaves, because that client
   has already shown that it keeps cookies.
-- **The default follows your lifetimes.** It is one hour, the default `CSRFMiddleware` `ttl`, so
-  with both defaults a form whose session lapses unconfirmed has already lost its CSRF cookie.
-  With a shorter lifetime the two differ, and a form left open between them gets a `403`. When
+- **The default follows your lifetimes.** It is one hour. When
   `min(max_age, absolute_max_age)` is under two hours, the default is half of it. Under two
   minutes, confirm-on-return is off. An explicit value must be positive and at most half that
   lifetime.
 - **What it costs.** One extra write per visitor, on their second request. That response carries
   the session cookie, so it is marked `private` like any other: if it is a public asset, that one
   response is not stored by a shared cache. A client that makes one session-writing request and
-  returns after `unconfirmed_max_age` finds a fresh session.
+  returns after `unconfirmed_max_age` finds a fresh session. The same holds for a first-visit
+  form: its CSRF token is bound to the new session, so if the browser fetches nothing else
+  through this middleware and the form is submitted after `unconfirmed_max_age`, it gets a `403`.
+  The CSRF cookie itself lasts seven days ([#441](https://github.com/PingoLee/Nitro.jl/issues/441)).
 
 **A store can also cap itself.** A database store has no size limit of its own, and an hour of a
 fast enough flood is still a lot of rows. Give `pormg_nitro_session` a bound:

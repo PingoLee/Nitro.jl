@@ -103,11 +103,12 @@ const DEFAULT_ABSOLUTE_MAX_AGE = 7 * 86400
 # where `DateTime + Second(n)` overflows and wraps round to the past.
 const MAX_ABSOLUTE_MAX_AGE = 100 * 365 * 86400
 
-# The `unconfirmed_max_age` a `SessionMiddleware` gets when none is given (#440): one hour, the
-# default `CSRFMiddleware` `ttl`. With both defaults, a form left open long enough to lose its
-# unconfirmed session has already lost its CSRF cookie, so the default adds no 403 a stock app did
-# not already have. That holds only while the two are equal: a shorter `max_age` halves this one,
-# and a form idle between the two lifetimes then gets a 403 it did not get before.
+# The `unconfirmed_max_age` a `SessionMiddleware` gets when none is given (#440): one hour, long
+# enough for any real browser to send its cookie back. It is the one place an idle form can still
+# lose its CSRF token early: the `CSRFMiddleware` cookie lasts seven days (#441), but a token bound
+# to a session that lapsed unconfirmed no longer verifies. That needs a visitor whose browser
+# fetched nothing else through this middleware since the page loaded, and the form then 403s
+# after this hour, as every form did when the CSRF cookie itself lasted an hour.
 const DEFAULT_UNCONFIRMED_MAX_AGE = 3600
 
 # Below this full lifetime the default switches confirm-on-return off. An unconfirmed lifetime must
@@ -184,8 +185,8 @@ cookieless flood against a route that writes the session cannot grow the store f
 `max_age`. A new session that ends the request signed in, such as a login from a cookieless client,
 is saved with the full lifetime at once.
 
-- `unconfirmed_max_age::Nullable{Int}` — defaults to one hour, the default `CSRFMiddleware` `ttl`,
-  or half of `min(max_age, absolute_max_age)` when that is shorter. A full lifetime under two
+- `unconfirmed_max_age::Nullable{Int}` — defaults to one hour, or half of
+  `min(max_age, absolute_max_age)` when that is shorter. A full lifetime under two
   minutes switches the default off. An explicit value must be positive and at most half that
   lifetime, or it is an `ArgumentError`. `nothing` switches confirm-on-return off: every new
   session gets `max_age`, as before #440.

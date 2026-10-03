@@ -27,7 +27,10 @@ const SESSION_B = "22222222-2222-4222-8222-222222222222"
 set_cookie_headers(res) = [h.second for h in res.headers if lowercase(h.first) == "set-cookie"]
 cookie_line(res, name) = only(filter(h -> startswith(h, "$name="), set_cookie_headers(res)))
 cookie_value(res, name) = String(match(Regex("$(name)=([^;]+)"), cookie_line(res, name)).captures[1])
-raw_half(cookie) = String(split(cookie, '.', limit = 2)[1])     # the token the client echoes
+raw_half(cookie) = String(split(cookie, '.', limit = 2)[1])     # the raw token in the cookie
+# The raw token behind a masked one (#436). `csrf_token!` and `issue_csrf_token!` hand out a new
+# mask every call, so a test that means "the same token" compares through this, never with `==`.
+unmasked(token) = CSRF._unmask_token(token)
 session_count(store) = length(store.data)
 
 """Build a request already carrying `cookies` (a name => value dict) plus `headers`."""
@@ -179,15 +182,21 @@ end
 
 @testset "issue_csrf_token! cookie flags and TTL" begin
     res = HTTP.Response(200, "ok")
-    raw = issue_csrf_token!(res, SECRET; binding = SESSION_A)
+    masked = issue_csrf_token!(res, SECRET; binding = SESSION_A)
+    raw = unmasked(masked)
+    @test raw isa String                              # it returns the token masked (#436)
+    @test masked != raw
     line = cookie_line(res, "__Host-csrf_token")
+    @test !occursin(masked, line)                     # the cookie keeps the raw token
 
     @test occursin("Secure", line)                    # required by the __Host- prefix
     @test occursin("Path=/", line)                    # required by the __Host- prefix
     @test !occursin("Domain=", line)                  # required by the __Host- prefix
     @test !occursin("HttpOnly", line)                 # deliberate: the SPA has to read it
     @test occursin("SameSite=Lax", line)
-    @test occursin("Max-Age=3600", line)
+    # Seven days by default (#441): one hour sent idle SPAs and open forms into a 403 while their
+    # session was still alive.
+    @test occursin("Max-Age=604800", line)
 
     # The cookie carries `<raw>.<sig>` and verifies under the binding it was minted for.
     value = cookie_value(res, "__Host-csrf_token")
@@ -201,6 +210,17 @@ end
     short = HTTP.Response(200, "ok")
     issue_csrf_token!(short, SECRET; binding = SESSION_A, ttl = 60)
     @test occursin("Max-Age=60", cookie_line(short, "__Host-csrf_token"))
+end
+
+@testset "the default ttl matches the session's absolute lifetime (#441)" begin
+    # `CSRFMiddleware` cannot read `SessionMiddleware`'s settings, so the two defaults are kept
+    # equal by hand. A CSRF cookie that dies first is a 403 for a client whose session is alive.
+    @test CSRF.DEFAULT_TTL == Nitro.Core.Middleware.SessionMiddleware_.DEFAULT_ABSOLUTE_MAX_AGE
+
+    # The middleware's own default reaches the cookie it issues, not just `issue_csrf_token!`'s.
+    layer, _ = session_layer(handler = token_handler)
+    res = layer(HTTP.Request("GET", "/form"))
+    @test occursin("Max-Age=$(CSRF.DEFAULT_TTL)", cookie_line(res, "__Host-csrf_token"))
 end
 
 @testset "issue_csrf_token! requires a binding" begin
@@ -369,9 +389,9 @@ end
 
 @testset "validate_csrf_token honours an explicit binding" begin
     res = HTTP.Response(200, "ok")
-    raw = issue_csrf_token!(res, SECRET; binding = SESSION_A)
+    token = issue_csrf_token!(res, SECRET; binding = SESSION_A)
     value = cookie_value(res, "__Host-csrf_token")
-    req = request("POST", Dict("__Host-csrf_token" => value); headers = ["X-CSRF-Token" => raw])
+    req = request("POST", Dict("__Host-csrf_token" => value); headers = ["X-CSRF-Token" => token])
 
     @test validate_csrf_token(req, SECRET; binding = SESSION_A)
     @test !validate_csrf_token(req, SECRET; binding = SESSION_B)
@@ -622,7 +642,7 @@ end
     @test CSRF._verify_signed_token(SECRET, fresh, session_id) !== nothing
 end
 
-@testset "req.context[:csrf_token] carries the raw token to the handler" begin
+@testset "req.context[:csrf_token] carries the token to the handler, masked (#436)" begin
     seen = Ref{Any}(:unset)
     capture(req) = (seen[] = Base.get(req.context, :csrf_token, :missing); HTTP.Response(200, "ok"))
     store = MemoryStore{String, Dict{String,Any}}()
@@ -639,11 +659,158 @@ end
     session_id = cookie_value(first, "unit_session")
     token_cookie = cookie_value(first, "__Host-csrf_token")
 
-    # Second visit: the handler sees the raw token, not the signed cookie value.
-    layer(request("GET", Dict("unit_session" => session_id, "__Host-csrf_token" => token_cookie)))
-    @test seen[] == String(split(token_cookie, '.', limit = 2)[1])
+    # Second visit: the handler sees the client's token masked -- neither the signed cookie value
+    # nor the raw token, which is the fixed secret a compressed body must never carry.
+    jar = Dict("unit_session" => session_id, "__Host-csrf_token" => token_cookie)
+    layer(request("GET", jar))
+    first_seen = seen[]
+    @test first_seen isa String
+    @test first_seen != raw_half(token_cookie)
+    @test unmasked(first_seen) == raw_half(token_cookie)
+    # A new request, a new mask over the same token.
+    layer(request("GET", jar))
+    @test seen[] != first_seen
+    @test unmasked(seen[]) == raw_half(token_cookie)
 end
 
+# ── masking (#436) ────────────────────────────────────────────────────────────
+# Since #431 the token goes into response bodies. A compressed body holding a fixed secret next to
+# reflected input leaks the secret through its length (BREACH), so every value handed out is
+# `mask ‖ (mask ⊕ raw)` under a fresh mask, and validation unmasks before comparing.
+
+@testset "csrf_token! masks the token per call, and every mask verifies (#436)" begin
+    tokens = String[]
+    twice(req) = (push!(tokens, csrf_token!(req)); push!(tokens, csrf_token!(req));
+                  HTTP.Response(200, "ok"))
+    layer, _ = session_layer(handler = twice)
+    res = layer(HTTP.Request("GET", "/form"))
+    session_id = cookie_value(res, "unit_session")
+    token_cookie = cookie_value(res, "__Host-csrf_token")
+    jar = Dict("unit_session" => session_id, "__Host-csrf_token" => token_cookie)
+
+    # A copy: every request below runs `twice` again and appends to `tokens`.
+    handed = copy(tokens)
+    @test length(handed) == 2
+    @test handed[1] != handed[2]                                  # nothing stable to leak
+    @test all(t -> ncodeunits(t) == CSRF._MASKED_LENGTH, handed)
+    @test all(t -> occursin(r"^[A-Za-z0-9_-]+$", t), handed)      # still needs no HTML escaping
+    @test all(t -> unmasked(t) == raw_half(token_cookie), handed) # one token, two masks
+    for t in handed
+        @test layer(request("POST", jar; headers = ["X-CSRF-Token" => t])).status == 200
+    end
+
+    # The form field and the JSON key take the masked form too.
+    cookie_header = "unit_session=$session_id; __Host-csrf_token=$token_cookie"
+    form = HTTP.Request("POST", "/form",
+        ["Content-Type" => "application/x-www-form-urlencoded", "Cookie" => cookie_header],
+        "_csrf=$(handed[1])")
+    @test layer(form).status == 200
+    json = HTTP.Request("POST", "/form",
+        ["Content-Type" => "application/json", "Cookie" => cookie_header],
+        JSON.json(Dict("_csrf" => handed[2])))
+    @test layer(json).status == 200
+
+    # The raw token -- the cookie's part before the first `.`, which a single-page app can read
+    # from `document.cookie` -- is still accepted. Nitro never writes it into a body.
+    @test layer(request("POST", jar; headers = ["X-CSRF-Token" => raw_half(token_cookie)])).status == 200
+end
+
+@testset "after the handler, req.context[:csrf_token] is the value it was handed (#436)" begin
+    # An outer layer reading the context sees what the handler put in its body, not a re-mask:
+    # the middleware re-masks only a token it minted itself after the handler.
+    returned = Ref{String}("")
+    asking(req) = (returned[] = csrf_token!(req); HTTP.Response(200, "ok"))
+    store = MemoryStore{String, Dict{String,Any}}()
+    layer, _ = session_layer(handler = asking, store = store)
+
+    first_visit = HTTP.Request("GET", "/form")          # minted by `csrf_token!` here
+    res = layer(first_visit)
+    @test first_visit.context[:csrf_token] == returned[]
+    jar = Dict("unit_session" => cookie_value(res, "unit_session"),
+               "__Host-csrf_token" => cookie_value(res, "__Host-csrf_token"))
+
+    again = request("GET", jar)                          # the client's own token, refreshed
+    layer(again)
+    @test again.context[:csrf_token] == returned[]
+
+    # Minted by the middleware itself (a written session, nobody asked): masked, and it is the
+    # token in the cookie.
+    writes(req) = (getsession(req)["seen"] = true; HTTP.Response(200, "ok"))
+    wlayer, _ = session_layer(handler = writes)
+    unasked = HTTP.Request("GET", "/form")
+    wres = wlayer(unasked)
+    @test unasked.context[:csrf_token] != raw_half(cookie_value(wres, "__Host-csrf_token"))
+    @test unmasked(unasked.context[:csrf_token]) == raw_half(cookie_value(wres, "__Host-csrf_token"))
+end
+
+@testset "a verified cookie of a shape Nitro never mints is not a token (#436)" begin
+    # `_mask_token` decodes the verified raw half, so a validly-signed value of another shape
+    # must be refused at verification -- not reach the mask and throw a 500 on every request.
+    odd_raw = "short"
+    odd = odd_raw * "." * CSRF._csrf_signature(SECRET, odd_raw, SESSION_A)
+    @test CSRF._verify_signed_token(SECRET, odd, SESSION_A) === nothing
+    res = bound_layer(SESSION_A)(request("GET", Dict("__Host-csrf_token" => odd)))
+    @test res.status == 200
+end
+
+@testset "a masked token is bound to its session like a raw one (#436)" begin
+    res = HTTP.Response(200, "ok")
+    masked = issue_csrf_token!(res, SECRET; binding = SESSION_A)
+    cookie = Dict("__Host-csrf_token" => cookie_value(res, "__Host-csrf_token"))
+
+    @test bound_layer(SESSION_A)(request("POST", cookie; headers = ["X-CSRF-Token" => masked])).status == 200
+    @test bound_layer(SESSION_B)(request("POST", cookie; headers = ["X-CSRF-Token" => masked])).status == 403
+
+    # A masked copy of a DIFFERENT token never matches, however well-formed.
+    other = CSRF._mask_token(CSRF._generate_raw_token())
+    @test bound_layer(SESSION_A)(request("POST", cookie; headers = ["X-CSRF-Token" => other])).status == 403
+end
+
+@testset "a tampered or malformed masked token is refused, never an error (#436)" begin
+    res = HTTP.Response(200, "ok")
+    masked = issue_csrf_token!(res, SECRET; binding = SESSION_A)
+    cookie = Dict("__Host-csrf_token" => cookie_value(res, "__Host-csrf_token"))
+    layer = bound_layer(SESSION_A)
+
+    swap(c) = c == 'A' ? 'B' : 'A'
+    flip(s, i) = string(s[1:i-1], swap(s[i]), s[i+1:end])
+    half = CSRF._MASKED_LENGTH ÷ 2
+    candidates = [
+        "mask half"          => flip(masked, 1),
+        "cipher half"        => flip(masked, half + 2),
+        "one char short"     => masked[1:end-1],
+        "one char long"      => masked * "A",
+        "not base64url"      => "!"^CSRF._MASKED_LENGTH,
+        "non-ASCII"          => "é"^(CSRF._MASKED_LENGTH ÷ 2),  # 86 code units, not 86 chars
+        "padded base64"      => masked[1:end-2] * "==",
+        "empty"              => "",
+    ]
+    for (label, bad) in candidates
+        @test CSRF._unmask_token(bad) != unmasked(masked)
+        refused = layer(request("POST", cookie; headers = ["X-CSRF-Token" => bad]))
+        @test (label, refused.status) == (label, 403)
+    end
+    # The untouched value still verifies, so the refusals above are about the edits.
+    @test layer(request("POST", cookie; headers = ["X-CSRF-Token" => masked])).status == 200
+end
+
+@testset "a stale MASKED token on a refused request still gets a fresh cookie (#436)" begin
+    # The recovery path (`_client_echoed_own_cookie`) must recognise the client's own token in
+    # the form `csrf_token!` handed out, not only the raw one -- or every SPA would be stuck.
+    res = HTTP.Response(200, "ok")
+    masked = issue_csrf_token!(res, SECRET; binding = SESSION_A)
+    cookie = Dict("__Host-csrf_token" => cookie_value(res, "__Host-csrf_token"))
+
+    refused = bound_layer(SESSION_B)(request("POST", cookie; headers = ["X-CSRF-Token" => masked]))
+    @test refused.status == 403
+    @test CSRF._verify_signed_token(SECRET, cookie_value(refused, "__Host-csrf_token"), SESSION_B) !== nothing
+
+    # A masked value of some OTHER token is a blind replay: refused with nothing handed back.
+    other = CSRF._mask_token(CSRF._generate_raw_token())
+    blind = bound_layer(SESSION_B)(request("POST", cookie; headers = ["X-CSRF-Token" => other]))
+    @test blind.status == 403
+    @test !any(startswith("__Host-csrf_token="), set_cookie_headers(blind))
+end
 
 # ── lazy minting (#431) ───────────────────────────────────────────────────────
 # A global `CSRFMiddleware` used to mint on every safe response and mark the session modified to
@@ -682,10 +849,12 @@ end
     res = layer(HTTP.Request("GET", "/form"))
     session_id = cookie_value(res, "unit_session")
     token_cookie = cookie_value(res, "__Host-csrf_token")
-    # The value the handler embedded is the cookie's raw half -- the token the client must echo.
-    @test raw_half(token_cookie) == returned[]
+    # The value the handler embedded is the cookie's raw half under a mask (#436): the body never
+    # carries the raw token itself.
+    @test raw_half(token_cookie) == unmasked(returned[])
     @test String(res.body) == returned[]
-    @test CSRF._verify_signed_token(SECRET, token_cookie, session_id) == returned[]
+    @test !occursin(raw_half(token_cookie), String(res.body))
+    @test CSRF._verify_signed_token(SECRET, token_cookie, session_id) == unmasked(returned[])
     @test session_count(store) == 1
 
     post = layer(request("POST", Dict("unit_session" => session_id, "__Host-csrf_token" => token_cookie);
@@ -725,11 +894,11 @@ end
     layer, _ = session_layer(handler = asking, store = store)
 
     again = layer(request("GET", jar))
-    @test returned[] == raw_half(token_cookie)
+    @test unmasked(returned[]) == raw_half(token_cookie)
     # The cookie is re-sent with the SAME token, so its Max-Age starts again: a token just put in
     # a page must not expire before the page is used (Django re-sends whenever `get_token` runs).
-    @test raw_half(cookie_value(again, "__Host-csrf_token")) == returned[]
-    @test occursin("Max-Age=3600", cookie_line(again, "__Host-csrf_token"))
+    @test raw_half(cookie_value(again, "__Host-csrf_token")) == unmasked(returned[])
+    @test occursin("Max-Age=604800", cookie_line(again, "__Host-csrf_token"))
     @test session_count(store) == 1
     # The refresh carries one visitor's token with no session write, so CSRF marks it private
     # itself: a shared cache must never hand A's token to B.
@@ -746,8 +915,8 @@ end
     returned[] = ""
     post = layer(request("POST", jar; headers = ["X-CSRF-Token" => raw_half(token_cookie)]))
     @test post.status == 200
-    @test returned[] == raw_half(token_cookie)
-    @test raw_half(cookie_value(post, "__Host-csrf_token")) == returned[]
+    @test unmasked(returned[]) == raw_half(token_cookie)
+    @test raw_half(cookie_value(post, "__Host-csrf_token")) == unmasked(returned[])
 
     # A request that does not ask re-sends nothing while the cookie is valid.
     plain, _ = session_layer(store = store)
@@ -772,9 +941,9 @@ end
     new_session = cookie_value(res, "unit_session")
     token_cookie = cookie_value(res, "__Host-csrf_token")
     @test new_session != old_session
-    @test returned[] != raw_half(old_cookie)
-    @test raw_half(token_cookie) == returned[]
-    @test CSRF._verify_signed_token(SECRET, token_cookie, new_session) == returned[]
+    @test unmasked(returned[]) != raw_half(old_cookie)
+    @test raw_half(token_cookie) == unmasked(returned[])
+    @test CSRF._verify_signed_token(SECRET, token_cookie, new_session) == unmasked(returned[])
 
     # Asked BEFORE rotating: the handler got the old token, and the rotation still retires it --
     # the cookie carries a fresh one. (Documented: call `csrf_token!` after `regenerate_session!`.)
@@ -785,8 +954,8 @@ end
     ask_then_login(req) = (returned[] = csrf_token!(req); regenerate_session!(req, store2);
                            HTTP.Response(200, "ok"))
     res2 = session_layer(handler = ask_then_login, store = store2)[1](request("GET", jar2))
-    @test returned[] == raw_half(jar2["__Host-csrf_token"])
-    @test raw_half(cookie_value(res2, "__Host-csrf_token")) != returned[]
+    @test unmasked(returned[]) == raw_half(jar2["__Host-csrf_token"])
+    @test raw_half(cookie_value(res2, "__Host-csrf_token")) != unmasked(returned[])
     @test CSRF._verify_signed_token(SECRET, cookie_value(res2, "__Host-csrf_token"),
                                     cookie_value(res2, "unit_session")) !== nothing
 end
@@ -826,8 +995,8 @@ end
     new_session = cookie_value(res, "unit_session")
     token_cookie = cookie_value(res, "__Host-csrf_token")
     @test new_session != SESSION_A
-    @test raw_half(token_cookie) == returned[]
-    @test CSRF._verify_signed_token(SECRET, token_cookie, new_session) == returned[]
+    @test raw_half(token_cookie) == unmasked(returned[])
+    @test CSRF._verify_signed_token(SECRET, token_cookie, new_session) == unmasked(returned[])
     @test CSRF._verify_signed_token(SECRET, token_cookie, SESSION_A) === nothing
 end
 
