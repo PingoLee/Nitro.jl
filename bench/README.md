@@ -86,5 +86,13 @@ PROFILE=10 bench/socket/run.sh nitro 1 20s           # sample every thread for 1
   assume a 6-core part whose SMT siblings are `n` and `n+6`; set `SERVER_CPUS`/`CLIENT_CPUS` for
   another layout. Results go to `results/socket-<stamp>.tsv`, profiles to
   `results/profile-<mode>-<time>-{flat,threads}.txt`.
+- `first_request.sh [route] [repeats]` times the first request to a fresh server against a warm
+  one (#450). It waits for the listening socket with `ss` rather than a request, so nothing warms
+  the path first. Set `ACCESS_LOG=1` to measure `serve`'s default shape, which is the one the
+  precompile workload warms; set `BASE_ROOT` to measure another checkout.
+- `trace_first_request.sh [route]` runs the server under `--trace-compile` and prints exactly
+  what the first request compiled, which is the list of what the precompile workload missed.
+- `MODE=nitro_log` is `nitro` with the default console access log on (#443), for a one-run A/B
+  of what that line costs.
 - Compare modes **within one run**, not across days: the CPU governor and anything else on the box
   move absolute numbers by tens of percent. Requires `oha`, `jq`, `curl` and `taskset`.
