@@ -5,7 +5,8 @@ using Dates
 using JSON
 using UUIDs
 using ...Types: AbstractSessionStore, MemoryStore, SessionPayload, Nullable, is_expired,
-    update_session!, delete_session!, SESSION_AUTH_HASH_KEY, _session_auth_hash_current
+    update_session!, delete_session!, session_store_full, SESSION_AUTH_HASH_KEY,
+    _session_auth_hash_current
 using ...Types: CookieConfig, LifecycleMiddleware
 using ..JanitorMiddleware: _janitor
 using ...Cookies: get_cookie, set_cookie!, storesession!, prunesessions!, regenerate_session!,
@@ -102,9 +103,31 @@ const DEFAULT_ABSOLUTE_MAX_AGE = 7 * 86400
 # where `DateTime + Second(n)` overflows and wraps round to the past.
 const MAX_ABSOLUTE_MAX_AGE = 100 * 365 * 86400
 
+# The `unconfirmed_max_age` a `SessionMiddleware` gets when none is given (#440): one hour, the
+# default `CSRFMiddleware` `ttl`. A form left open long enough to lose its unconfirmed session has
+# already lost its CSRF cookie, so the default adds no 403 a stock app did not already have.
+const DEFAULT_UNCONFIRMED_MAX_AGE = 3600
+
+# Below this full lifetime the default switches confirm-on-return off. An unconfirmed lifetime must
+# sit well clear of the full one -- see `_unconfirmed_payload` -- and a session that lives two
+# minutes in total has no flood worth bounding.
+const MIN_LIFETIME_FOR_UNCONFIRMED = 120
+
+# The lifetime a confirmed session gets from a write made the moment it is created: `max_age`,
+# cut short by the absolute cap.
+_full_lifetime(max_age::Int, absolute_max_age::Nullable{Int}) =
+    absolute_max_age === nothing ? max_age : min(max_age, absolute_max_age)
+
+# `min(1 h, half the full lifetime)`, or off when the full lifetime is too short to split.
+function _default_unconfirmed_max_age(max_age::Int, absolute_max_age::Nullable{Int})::Nullable{Int}
+    full = _full_lifetime(max_age, absolute_max_age)
+    full >= MIN_LIFETIME_FOR_UNCONFIRMED || return nothing
+    return min(DEFAULT_UNCONFIRMED_MAX_AGE, full ÷ 2)
+end
+
 """
-    SessionMiddleware(; store, cookie_name, max_age, absolute_max_age, prune_interval,
-                        rotate_on_auth, auth_key, validator, session_auth_hash, ...)
+    SessionMiddleware(; store, cookie_name, max_age, absolute_max_age, unconfirmed_max_age,
+                        prune_interval, rotate_on_auth, auth_key, validator, session_auth_hash, ...)
 
 Creates a `LifecycleMiddleware` that manages server-side sessions with cookie-based session
 IDs. The mutable session dictionary is read with `getsession(req)` (`req.context[:session]`).
@@ -144,6 +167,32 @@ Rotation holds against the same race (#361). `regenerate_session!` and `rotate_o
 session with the store's atomic `rotate_session!`, which moves it only if it still exists. After a
 concurrent logout there is nothing to move, so the logged-out data is not copied into a fresh id,
 this request's write is dropped, and no cookie is set.
+
+# Unconfirmed anonymous sessions (`unconfirmed_max_age`, `session_store_full`)
+
+A new session that ends its first request with no identity is saved **unconfirmed** (#440): its
+stored expiry and its cookie's `Max-Age` are `unconfirmed_max_age`, not `max_age`. When the browser
+sends the cookie back, the session is confirmed: one write moves it to the full lifetime and re-sets
+the cookie. A real browser does that within seconds, on the next page or asset it fetches. A script
+that never returns its cookie leaves rows the janitor reclaims after `unconfirmed_max_age`, so a
+cookieless flood against a route that writes the session cannot grow the store for a whole
+`max_age`. A new session that ends the request signed in, such as a login from a cookieless client,
+is saved with the full lifetime at once.
+
+- `unconfirmed_max_age::Nullable{Int}` — defaults to one hour, the default `CSRFMiddleware` `ttl`,
+  or half of `min(max_age, absolute_max_age)` when that is shorter. A full lifetime under two
+  minutes switches the default off. An explicit value must be positive and at most half that
+  lifetime, or it is an `ArgumentError`. `nothing` switches confirm-on-return off: every new
+  session gets `max_age`, as before #440.
+- The one session it costs is a client that makes a single session-writing request and comes back
+  after `unconfirmed_max_age`: it finds a fresh session.
+- A store may also bound itself. Before saving a new anonymous session the middleware asks
+  [`session_store_full`](@ref Nitro.Core.Types.session_store_full)`(store)`; when it answers
+  `true` the session is not saved and no cookie is set, the request still succeeds, and one
+  warning is logged. Signed-in sessions, existing
+  sessions and rotations are never refused. `pormg_nitro_session(max_sessions = N)` implements it.
+  Under a full store a new visitor holds no session, so a session-bound CSRF token handed to them
+  does not verify on their next request.
 
 A response that sets the session cookie also gets `Vary: Cookie`, and `Cache-Control: private` in
 place of any `public` (other directives are kept). A shared cache therefore never serves one
@@ -260,7 +309,8 @@ rotation cannot pick up the new one.
   session swapping): browsers refuse to let anyone but this origin, over HTTPS, set one. An
   explicit `__Host-`/`__Secure-` name the attributes cannot carry is an `ArgumentError` at
   construction, since browsers would silently drop it.
-- `max_age`, `absolute_max_age` — see *Session lifetime* above. An `absolute_max_age` that is
+- `max_age`, `absolute_max_age` — see *Session lifetime* above; `unconfirmed_max_age` — see
+  *Unconfirmed anonymous sessions* above. An `absolute_max_age` that is
   not positive, or is over 100 years, is an `ArgumentError` at construction.
 - `prune_interval::Period = Minute(10)` — how often the background janitor removes expired
   sessions from `store`. Must be a positive fixed-length `Period`; calendar periods (`Month`,
@@ -282,6 +332,7 @@ function SessionMiddleware(;
     cookie_name::Nullable{String} = nothing,
     max_age::Int = 86400,
     absolute_max_age::Nullable{Int} = DEFAULT_ABSOLUTE_MAX_AGE,
+    unconfirmed_max_age::Nullable{Int} = _default_unconfirmed_max_age(max_age, absolute_max_age),
     store::AbstractSessionStore{String, Dict{String,Any}},
     prune_interval::Period = Minute(10),
     secure::Bool = true,
@@ -321,6 +372,17 @@ function SessionMiddleware(;
         "$MAX_ABSOLUTE_MAX_AGE (100 years), or `nothing` for no absolute lifetime; got " *
         "$absolute_max_age (#362)."))
 
+    # At most half the full lifetime (#440). A loaded session is recognised as unconfirmed by its
+    # stored lifetime being exactly `unconfirmed_max_age` (`_unconfirmed_payload`), and every
+    # confirmed write leaves at least the full lifetime -- so the two must sit well apart, or a
+    # confirmed session would read as unconfirmed and the other way round.
+    full_lifetime = _full_lifetime(max_age, absolute_max_age)
+    unconfirmed_max_age === nothing ||
+        0 < unconfirmed_max_age && 2 * unconfirmed_max_age <= full_lifetime || throw(ArgumentError(
+        "SessionMiddleware: `unconfirmed_max_age` must be a positive number of seconds, at most " *
+        "half of the full session lifetime (min(max_age, absolute_max_age) = $full_lifetime s), " *
+        "or `nothing` to switch confirm-on-return off; got $unconfirmed_max_age (#440)."))
+
     # Resolved from the FINAL config -- `config` may be passed whole -- and checked before any
     # janitor exists, so a name browsers would drop fails at construction.
     session_cookie = something(cookie_name, _default_session_cookie_name(config))
@@ -329,12 +391,16 @@ function SessionMiddleware(;
 
     on_startup, on_shutdown = _prune_janitor(store, prune_interval, "SessionMiddleware",
                                              "prune_interval")
+    # Once per middleware, not per refused session: at capacity EVERY anonymous insert is refused,
+    # and a warning each would be a second flood riding on the first.
+    warned_full = Threads.Atomic{Bool}(false)
 
     middleware = function(handle::Function)
         return function(req::HTTP.Request)
             # Load the current payload and remember the auth marker before the handler runs.
             session_id = _get_session_id(req, session_cookie)
-            session_data, is_new, created = _load_session(store, session_id, absolute_max_age)
+            session_data, is_new, created, unconfirmed =
+                _load_session(store, session_id, absolute_max_age, unconfirmed_max_age)
             # A signed-in session whose user has since been signed out everywhere (#391) is
             # ended the way a session past its absolute lifetime is: deleted, and this request
             # starts as a new visitor. Checked before the marker below is taken, so the handler
@@ -342,7 +408,8 @@ function SessionMiddleware(;
             if !is_new && session_auth_hash !== nothing &&
                _auth_hash_stale(session_data, session_id, auth_key, validator, session_auth_hash)
                 _end_session!(store, session_id, "whose sign-in was revoked")
-                session_data, is_new, created = Dict{String,Any}(), true, Dates.now(Dates.UTC)
+                session_data, is_new, created, unconfirmed =
+                    Dict{String,Any}(), true, Dates.now(Dates.UTC), false
             end
             original_session = deepcopy(session_data)
             original_auth_marker = _auth_marker(session_data, session_id, auth_key, validator)
@@ -409,7 +476,11 @@ function SessionMiddleware(;
             # token bound to the id -- without it an anonymous visitor's token would be bound to
             # an id that was never saved, and every later POST would 403. It hands one to a new
             # visitor only when a handler asked (`csrf_token!`, #431), never on every safe request.
-            forced = get(req.context, :session_modified, false) === true
+            #
+            # A loaded session that is still UNCONFIRMED is forced too (#440): its browser just
+            # sent the cookie back, which is the confirmation. One write moves it to the full
+            # lifetime and re-sets the cookie; a confirmed session never pays it.
+            forced = get(req.context, :session_modified, false) === true || unconfirmed
             rotated = final_session_id != session_id
 
             # A NEW session is saved lazily (#317): only once it holds data, was rotated, or was
@@ -431,9 +502,25 @@ function SessionMiddleware(;
             # `regenerate_session!(…; ttl)` to the absolute deadline, and keeps `created` (#362),
             # which an upsert would reset. The single exception, a rotated session left empty
             # and anonymous, is the branch just below the new-visitor one.
+            #
+            # A new session that ends the request ANONYMOUS is saved UNCONFIRMED (#440): with the
+            # short `unconfirmed_max_age` until its browser sends the cookie back. A script that
+            # never returns its cookie leaves rows the janitor reclaims within the hour, not the
+            # day. If the store reports itself full (`session_store_full`), it is not saved at all.
+            # A new session that ends the request signed in -- a cookieless login -- is neither.
             if is_new && (rotated || forced || !isempty(current_session))
-                _save_session(store, final_session_id, current_session, ttl)
-                session_written = true
+                anonymous = _auth_marker(current_session, final_session_id, auth_key,
+                                         validator) === nothing
+                if anonymous && session_store_full(store)
+                    _warn_store_full(warned_full, store)
+                    session_written = false
+                else
+                    if anonymous && unconfirmed_max_age !== nothing
+                        ttl = min(ttl, unconfirmed_max_age)
+                    end
+                    _save_session(store, final_session_id, current_session, ttl)
+                    session_written = true
+                end
             elseif !is_new && rotated && isempty(current_session) &&
                    _auth_marker(current_session, final_session_id, auth_key, validator) === nothing
                 # A rotated session that ENDS the request empty, with no identity -- what the
@@ -495,18 +582,19 @@ function _generate_session_id()
     return string(secure_uuid4())
 end
 
-# Returns `(data, is_new, created)`. `created` is the loaded session's creation instant, or now
-# for a new one -- the instant its absolute lifetime will be measured from once it is saved.
+# Returns `(data, is_new, created, unconfirmed)`. `created` is the loaded session's creation
+# instant, or now for a new one -- the instant its absolute lifetime will be measured from once it
+# is saved. `unconfirmed` is whether a loaded session is still on its unconfirmed lifetime (#440).
 function _load_session(store::AbstractSessionStore{String, Dict{String,Any}}, session_id::Nullable{String},
-                       absolute_max_age::Nullable{Int})
+                       absolute_max_age::Nullable{Int}, unconfirmed_max_age::Nullable{Int})
     now = Dates.now(Dates.UTC)
     if isnothing(session_id)
-        return Dict{String,Any}(), true, now
+        return Dict{String,Any}(), true, now, false
     end
 
     payload = Base.get(store, session_id, nothing)
     if isnothing(payload)
-        return Dict{String,Any}(), true, now
+        return Dict{String,Any}(), true, now, false
     end
 
     # DEEP copies (#318). A shallow `copy` shared every nested value -- the docs' `cart` vector,
@@ -515,7 +603,7 @@ function _load_session(store::AbstractSessionStore{String, Dict{String,Any}}, se
     # request. `PormGSessionStore` decodes fresh JSON per read and never had the bug.
     if payload isa SessionPayload
         if is_expired(payload, now)
-            return Dict{String,Any}(), true, now
+            return Dict{String,Any}(), true, now, false
         end
         if _past_absolute_age(payload.created, absolute_max_age, now)
             # Past its absolute lifetime (#362): absent, like an expired session, whatever its
@@ -528,9 +616,10 @@ function _load_session(store::AbstractSessionStore{String, Dict{String,Any}}, se
             # middleware's cap bind them all -- which is why two middlewares sharing a store
             # should share a cap too.
             _end_session!(store, session_id, "past its absolute lifetime")
-            return Dict{String,Any}(), true, now
+            return Dict{String,Any}(), true, now, false
         end
-        return deepcopy(payload.data), false, payload.created
+        return deepcopy(payload.data), false, payload.created,
+               _unconfirmed_payload(payload, unconfirmed_max_age)
     end
 
     # A store whose `Base.get` hands back bare data breaks the contract (it must return a
@@ -542,10 +631,37 @@ function _load_session(store::AbstractSessionStore{String, Dict{String,Any}}, se
               "`absolute_max_age` and the session is treated as absent. Return a " *
               "`SessionPayload(data, expires, created)` from `Base.get` (#362), or pass " *
               "`absolute_max_age = nothing`." store_type = typeof(store) maxlog = 1
-        return Dict{String,Any}(), true, now
+        return Dict{String,Any}(), true, now, false
     end
+    # A bare payload carries no lifetime, so it cannot be recognised as unconfirmed: it reads as
+    # confirmed and is never promoted.
     data = payload isa AbstractDict ? deepcopy(payload) : payload
-    return data, false, now
+    return data, false, now, false
+end
+
+# Whether a stored session is still UNCONFIRMED (#440): saved anonymous by the request that created
+# it, and not yet seen again. That save is the only write that gives a session a lifetime of exactly
+# `unconfirmed_max_age` (`expires - created`), so the payload says it with no extra column and no
+# reserved session key -- the store contract is unchanged. Every other write leaves at least the
+# full lifetime, which the constructor keeps at twice `unconfirmed_max_age` or more.
+#
+# "Within a second", not "equal": a store keeping whole seconds truncates both instants. They come
+# from one `now` and differ by a whole number of seconds, so it does not move their difference, but
+# a custom store is free to round each differently.
+function _unconfirmed_payload(payload::SessionPayload, unconfirmed_max_age::Nullable{Int})::Bool
+    unconfirmed_max_age === nothing && return false
+    lifetime = payload.expires - payload.created
+    return abs(Dates.value(lifetime) - 1000 * unconfirmed_max_age) < 1000
+end
+
+# Once per middleware: a full store refuses every anonymous insert from here on, and a warning per
+# refusal would be a second flood. The store type is named; never a session id.
+function _warn_store_full(warned::Threads.Atomic{Bool}, store::AbstractSessionStore)
+    Threads.atomic_xchg!(warned, true) && return nothing
+    @warn "SessionMiddleware: the session store is full, so new anonymous sessions are not being " *
+          "saved. Signed-in and existing sessions are unaffected. Raise the store's bound, or " *
+          "look for a flood of cookieless requests to a route that writes the session (#440)." store_type = typeof(store)
+    return nothing
 end
 
 # Deletes a session this middleware refuses: one that has outlived its absolute lifetime (#362),

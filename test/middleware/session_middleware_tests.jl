@@ -160,7 +160,14 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
         sid = String(match(r"cache_session=([^;]+)",
                            HTTP.header(writing(immutable)(HTTP.Request("GET", "/")), "Set-Cookie")).captures[1])
         reader = mw(req -> HTTP.Response(200, immutable, "asset"))
+        # The visitor's FIRST request back confirms the new anonymous session (#440): one write,
+        # whose response carries the session cookie and is therefore private like any other.
+        # Every request after that is the "existing visitor" this testset is about.
         res = reader(HTTP.Request("GET", "/app.js", ["Cookie" => "cache_session=$sid"]))
+        @test occursin("cache_session=$sid", HTTP.header(res, "Set-Cookie"))
+        @test headers_of(res, "Cache-Control") == ["private, max-age=31536000, immutable"]
+        res = reader(HTTP.Request("GET", "/app.js", ["Cookie" => "cache_session=$sid"]))
+        @test isempty(HTTP.header(res, "Set-Cookie"))
         @test headers_of(res, "Cache-Control") == ["public, max-age=31536000, immutable"]
         @test isempty(headers_of(res, "Vary"))
 
@@ -1174,6 +1181,192 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
         @test first(values(storeB.data)).data["marker"] == "B"
         # The session ids are distinct, so neither store can be holding the other's row.
         @test isempty(intersect(keys(storeA.data), keys(storeB.data)))
+    end
+
+    # ── #440: unconfirmed anonymous sessions, and a store that bounds itself ──────────
+    #
+    # A cookieless request to a route that writes the session used to store a row live for the
+    # whole `max_age` (24 h), so a flood grew a database store faster than the janitor could
+    # reclaim it. A new anonymous session now lives `unconfirmed_max_age` until its cookie comes
+    # back, and a store may refuse new anonymous sessions outright through `session_store_full`.
+
+    # Wraps a `MemoryStore` and counts every write the middleware makes, by kind. `full` is what
+    # `session_store_full` answers.
+    struct CountingStore <: Nitro.Core.Types.AbstractSessionStore{String, Dict{String,Any}}
+        inner::MemoryStore{String, Dict{String,Any}}
+        writes::Dict{Symbol,Int}
+        full::Base.RefValue{Bool}
+    end
+    CountingStore(; full = false) = CountingStore(MemoryStore(), Dict{Symbol,Int}(), Ref(full))
+    _count!(s::CountingStore, k::Symbol) = (s.writes[k] = get(s.writes, k, 0) + 1)
+    Base.get(s::CountingStore, id::String, default) = Base.get(s.inner, id, default)
+    Nitro.Core.Types.set_session!(s::CountingStore, id::String, d::Dict{String,Any}; ttl::Int = 3600) =
+        (_count!(s, :set); Nitro.Core.Types.set_session!(s.inner, id, d; ttl))
+    Nitro.Core.Types.update_session!(s::CountingStore, id::String, d::Dict{String,Any}; ttl::Int = 3600) =
+        (_count!(s, :update); Nitro.Core.Types.update_session!(s.inner, id, d; ttl))
+    Nitro.Core.Types.rotate_session!(s::CountingStore, old::String, new::String, d::Dict{String,Any}; ttl::Int = 3600) =
+        (_count!(s, :rotate); Nitro.Core.Types.rotate_session!(s.inner, old, new, d; ttl))
+    Nitro.Core.Types.delete_session!(s::CountingStore, id::String) =
+        (_count!(s, :delete); Nitro.Core.Types.delete_session!(s.inner, id))
+    Nitro.Core.Types.session_store_full(s::CountingStore) = s.full[]
+    total_writes(s::CountingStore) = sum(values(s.writes); init = 0)
+    lifetime_of(store, sid) = (p = Base.get(store, sid, nothing);
+                               Dates.value(p.expires - p.created) ÷ 1000)
+    cart_writer(mw) = mw(req -> (push!(get!(getsession(req), "cart", Any[]), 1); HTTP.Response(200, "ok")))
+    session_reader(mw) = mw(req -> HTTP.Response(200, string(length(getsession(req)))))
+
+    @testset "a new anonymous session is saved unconfirmed (#440)" begin
+        @test Nitro.Core.Middleware.SessionMiddleware_.DEFAULT_UNCONFIRMED_MAX_AGE == 3600
+        store = MemoryStore()
+        mw = SessionMiddleware(cookie_name="sid", store=store, secure=false).middleware   # max_age 1 day
+
+        res = cart_writer(mw)(HTTP.Request("GET", "/add"))
+        sid = cookie_of(res, "sid")
+        @test sid !== nothing
+        # An hour, not the day `max_age` gives: in the store and in the cookie alike.
+        @test max_age_of(res) == 3600
+        @test lifetime_of(store, sid) == 3600
+    end
+
+    @testset "its cookie coming back confirms it, with exactly one write (#440)" begin
+        store = CountingStore()
+        mw = SessionMiddleware(cookie_name="sid", store=store, secure=false).middleware
+        sid = cookie_of(cart_writer(mw)(HTTP.Request("GET", "/add")), "sid")
+        born = Base.get(store, sid, nothing).created
+        @test store.writes == Dict(:set => 1)
+
+        # The browser's next request -- a read, an asset -- is the confirmation: one update to the
+        # full lifetime, the cookie re-set to match, the creation instant kept.
+        res = session_reader(mw)(HTTP.Request("GET", "/page", ["Cookie" => "sid=$sid"]))
+        @test String(res.body) == "1"                      # the cart survived
+        @test store.writes == Dict(:set => 1, :update => 1)
+        @test cookie_of(res, "sid") == sid
+        @test max_age_of(res) == 86400
+        @test lifetime_of(store, sid) >= 86400
+        @test Base.get(store, sid, nothing).created == born
+
+        # Confirmed: a read writes nothing from here on.
+        res = session_reader(mw)(HTTP.Request("GET", "/page", ["Cookie" => "sid=$sid"]))
+        @test store.writes == Dict(:set => 1, :update => 1)
+        @test isempty(HTTP.header(res, "Set-Cookie"))
+    end
+
+    @testset "an unconfirmed session that is never returned lapses at its short lifetime (#440)" begin
+        # What bounds the flood: once `expires` passes, the row is dead to every reader and the
+        # janitor's prune deletes it. Staged with a past `expires` rather than waited out.
+        store = MemoryStore()
+        mw = SessionMiddleware(cookie_name="sid", store=store, secure=false).middleware
+        sid = cookie_of(cart_writer(mw)(HTTP.Request("GET", "/add")), "sid")
+        p = Base.get(store, sid, nothing)
+        @test p.expires <= Dates.now(Dates.UTC) + Dates.Second(3600)
+        seed!(store, sid, p.data; created = p.created - Dates.Hour(2), expires = p.expires - Dates.Hour(2))
+        prunesessions!(store)
+        @test Base.get(store, sid, nothing) === nothing
+    end
+
+    @testset "a new session that ends signed in gets the full lifetime (#440)" begin
+        store = MemoryStore()
+        mw = SessionMiddleware(cookie_name="sid", store=store, secure=false).middleware
+        # A login from a cookieless client: the session is new and ends the request with an identity.
+        res = mw(req -> (getsession(req)["user_id"] = 7; HTTP.Response(200, "in")))(
+            HTTP.Request("POST", "/login"))
+        @test max_age_of(res) == 86400
+        @test lifetime_of(store, cookie_of(res, "sid")) == 86400
+
+        # So does an identity found by `validator`, not `auth_key`.
+        vmw = SessionMiddleware(cookie_name="sid", store=store, secure=false,
+                                validator = (sid, data) -> get(data, "account", nothing)).middleware
+        res = vmw(req -> (getsession(req)["account"] = "a-1"; HTTP.Response(200, "in")))(
+            HTTP.Request("POST", "/login"))
+        @test max_age_of(res) == 86400
+    end
+
+    @testset "logout leaves a full-lifetime session, not an unconfirmed one (#440)" begin
+        store = MemoryStore()
+        seed!(store, "in", Dict{String,Any}("user_id" => 7); created = Dates.now(Dates.UTC) - Dates.Hour(1),
+              expires = Dates.now(Dates.UTC) + Dates.Hour(23))
+        mw = SessionMiddleware(cookie_name="sid", store=store, secure=false).middleware
+        res = mw(function (req::HTTP.Request)
+            empty!(getsession(req))
+            Nitro.regenerate_session!(req, store)
+            return HTTP.Response(200, "out")
+        end)(HTTP.Request("POST", "/logout", ["Cookie" => "sid=in"]))
+        @test max_age_of(res) == 86400
+        @test lifetime_of(store, cookie_of(res, "sid")) == 86400
+    end
+
+    @testset "`unconfirmed_max_age = nothing` switches it off (#440)" begin
+        store = CountingStore()
+        mw = SessionMiddleware(cookie_name="sid", store=store, secure=false,
+                               unconfirmed_max_age=nothing).middleware
+        res = cart_writer(mw)(HTTP.Request("GET", "/add"))
+        sid = cookie_of(res, "sid")
+        @test max_age_of(res) == 86400
+        res = session_reader(mw)(HTTP.Request("GET", "/page", ["Cookie" => "sid=$sid"]))
+        @test store.writes == Dict(:set => 1)                # no confirmation write
+        @test isempty(HTTP.header(res, "Set-Cookie"))
+    end
+
+    @testset "the default follows the full lifetime, and bad values are refused (#440)" begin
+        new_max_age(; kw...) = max_age_of(cart_writer(SessionMiddleware(;
+            cookie_name="sid", store=MemoryStore(), secure=false, kw...).middleware)(HTTP.Request("GET", "/")))
+        @test new_max_age() == 3600
+        @test new_max_age(max_age = 3600) == 1800                    # half the full lifetime
+        @test new_max_age(absolute_max_age = 1000) == 500            # the cap shortens it too
+        @test new_max_age(max_age = 100) == 100                      # under two minutes: off
+        @test new_max_age(unconfirmed_max_age = 60) == 60
+
+        build(; kw...) = SessionMiddleware(; cookie_name="sid", store=MemoryStore(), secure=false, kw...)
+        @test_throws ArgumentError build(unconfirmed_max_age = 0)
+        @test_throws ArgumentError build(unconfirmed_max_age = -5)
+        @test_throws ArgumentError build(max_age = 3600, unconfirmed_max_age = 1801)
+        @test_throws ArgumentError build(absolute_max_age = 1000, unconfirmed_max_age = 501)
+        @test build(max_age = 3600, unconfirmed_max_age = 1800) isa Nitro.Types.LifecycleMiddleware
+    end
+
+    @testset "a session stored with another short lifetime is not mistaken for unconfirmed (#440)" begin
+        # Only a lifetime of exactly `unconfirmed_max_age` reads as unconfirmed, so a session an
+        # app stored itself with a short ttl is not stretched to `max_age` by a read.
+        store = CountingStore()
+        Nitro.Core.Types.set_session!(store.inner, "short", Dict{String,Any}("k" => 1); ttl = 600)
+        mw = SessionMiddleware(cookie_name="sid", store=store, secure=false).middleware
+        res = session_reader(mw)(HTTP.Request("GET", "/", ["Cookie" => "sid=short"]))
+        @test String(res.body) == "1"
+        @test total_writes(store) == 0
+        @test lifetime_of(store, "short") == 600
+    end
+
+    @testset "a full store refuses new anonymous sessions, and nothing else (#440)" begin
+        store = CountingStore(full = true)
+        mw = SessionMiddleware(cookie_name="sid", store=store, secure=false).middleware
+
+        # Refused: no row, no cookie, one warning -- and the request still succeeds.
+        res = @test_logs (:warn, r"session store is full") cart_writer(mw)(HTTP.Request("GET", "/add"))
+        @test res.status == 200
+        @test isempty(HTTP.header(res, "Set-Cookie"))
+        @test total_writes(store) == 0
+        # Once per middleware, not per refusal: a flood does not become a log flood.
+        res = @test_logs min_level=Base.CoreLogging.Warn cart_writer(mw)(HTTP.Request("GET", "/add"))
+        @test isempty(HTTP.header(res, "Set-Cookie"))
+
+        # A cookieless login is never refused: a full store must not lock new users out of signing in.
+        res = mw(req -> (getsession(req)["user_id"] = 7; HTTP.Response(200, "in")))(
+            HTTP.Request("POST", "/login"))
+        @test cookie_of(res, "sid") !== nothing
+        @test store.writes[:set] == 1
+
+        # An existing session keeps being written, and its rotation on login goes through.
+        Nitro.Core.Types.set_session!(store.inner, "anon", Dict{String,Any}("cart" => [1]); ttl = 86400)
+        mw(req -> (push!(getsession(req)["cart"], 2); HTTP.Response(200, "ok")))(
+            HTTP.Request("GET", "/add", ["Cookie" => "sid=anon"]))
+        @test store.writes[:update] == 1
+        res = mw(req -> (getsession(req)["user_id"] = 8; HTTP.Response(200, "in")))(
+            HTTP.Request("POST", "/login", ["Cookie" => "sid=anon"]))
+        @test store.writes[:rotate] == 1
+        @test cookie_of(res, "sid") ∉ (nothing, "anon")
+
+        # A store that does not implement the hook is never full.
+        @test Nitro.Core.Types.session_store_full(MemoryStore()) === false
     end
 
 end

@@ -28,6 +28,7 @@ is_expired
 Nitro.Core.Types.update_session!
 Nitro.Core.Types.rotate_session!
 Nitro.Core.Types.cleanup_expired_sessions!
+Nitro.Core.Types.session_store_full
 Nitro.Core.Types.missing_session_methods
 Nitro.Errors.StoreInterfaceError
 Nitro.pormg_nitro_session
