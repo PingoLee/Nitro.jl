@@ -202,9 +202,10 @@ things keep that from filling your store.
 **New anonymous sessions start unconfirmed.** A new session that ends its first request with no
 identity is saved with a short lifetime, `unconfirmed_max_age` (one hour by default), in the store
 and in the cookie's `Max-Age`. When the browser sends the cookie back, `SessionMiddleware` writes
-the session once more with the full `max_age` and re-sets the cookie. A browser does this within
-seconds, on the next page or asset it fetches, so a real visitor keeps a full-length session. A
-script that never sends the cookie back leaves rows that expire in an hour rather than a day, and
+the session once more with the full `max_age` and re-sets the cookie. A browser usually does this
+within seconds, on the next page or asset it fetches, so a real visitor keeps a full-length session.
+That needs the request to pass through `SessionMiddleware`: when assets are served outside it, the
+next page confirms the session instead. A script that never sends the cookie back leaves rows that expire in an hour rather than a day, and
 the pruning janitor deletes them.
 
 ```julia
@@ -217,8 +218,9 @@ SessionMiddleware(store = store, unconfirmed_max_age = nothing) # off: every ses
   identity (`auth_key`, or `validator`), such as a login from a client with no cookie yet, gets
   the full lifetime at once. So does the anonymous session a logout leaves, because that client
   has already shown that it keeps cookies.
-- **The default follows your lifetimes.** It is one hour, the default `CSRFMiddleware` `ttl`, so a
-  form whose session lapses unconfirmed has already lost its CSRF cookie. When
+- **The default follows your lifetimes.** It is one hour, the default `CSRFMiddleware` `ttl`, so
+  with both defaults a form whose session lapses unconfirmed has already lost its CSRF cookie.
+  With a shorter lifetime the two differ, and a form left open between them gets a `403`. When
   `min(max_age, absolute_max_age)` is under two hours, the default is half of it. Under two
   minutes, confirm-on-return is off. An explicit value must be positive and at most half that
   lifetime.
@@ -235,15 +237,25 @@ store = pormg_nitro_session(max_sessions = 1_000_000)
 ```
 
 Once the table holds that many rows, `SessionMiddleware` stops saving **new anonymous** sessions.
-The request still succeeds, no cookie is set, and one warning is logged. Signed-in sessions,
-existing sessions and rotations are never refused, so a full store never logs anyone out or
-blocks a sign-in. The count is read at boot, kept by the store's own writes, and read again on
+The request still succeeds, no cookie is set, and one warning is logged. Sessions that end signed
+in, existing sessions and rotations are never refused, so a full store logs nobody out. The count
+is read at boot, kept by the store's own writes, and read again on
 every prune tick, so it costs no query per request. Expired rows count until the janitor deletes
 them.
 
-While the store is full, a new visitor holds no session. If your login form uses a session-bound
-CSRF token, a visitor with no cookie cannot get one that verifies until the flood ends, so treat
-the cap as a last resort and size it well above normal traffic.
+**A full store does block some sign-ins.** While it is full, a visitor with no cookie holds no
+session. If your login form carries a session-bound CSRF token (the default with
+`CSRFMiddleware`), that visitor cannot get a token that verifies, so they cannot sign in until the
+store has room again: new users, and anyone who cleared their cookies. Only a sign-in that needs
+no session beforehand, such as a token or JSON login without session-bound CSRF, is unaffected.
+An attacker keeps the store full with about `max_sessions / unconfirmed_max_age` cookieless
+writes a second (about 280 a second for a bound of a million with the default hour). So treat the
+cap as a last resort against running out of disk, not as flood protection, and size it well above
+your normal number of live sessions.
+
+With several processes sharing one table, each keeps its own count between prune ticks, so the
+table can overshoot `max_sessions` by roughly the inserts each process makes in one
+`prune_interval`.
 
 **Sizing.** Without a sign-in, a flood leaves at most about
 `rate × (unconfirmed_max_age + prune_interval)` rows. At 100 cookieless writes a second, that is
@@ -334,7 +346,9 @@ save, so answer from a cached count and never run a query per call.
 `Base.get` returns a `SessionPayload(data, expires, created)`. `created` is the instant the
 session was first stored: `set_session!` sets it, while `update_session!` keeps it and
 `rotate_session!` carries it to the new ID. That instant is what `absolute_max_age` measures from,
-so a store that reset it on every write would let sessions live forever.
+so a store that reset it on every write would let sessions live forever. Take `created` and
+`expires` from the same clock: `SessionMiddleware` tells an unconfirmed anonymous session apart by
+its stored lifetime, `expires - created`.
 
 `cleanup_expired_sessions!` is called from a background janitor owned by
 `SessionMiddleware`'s lifecycle hooks — it never runs on the request path. Use

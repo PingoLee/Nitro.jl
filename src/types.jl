@@ -60,6 +60,12 @@ session can neither re-create it nor copy it into a fresh id. Make the existence
 write **one** atomic step — an `UPDATE … WHERE` in SQL, one lock hold in memory. A check followed
 by a separate write re-opens the race.
 
+Stamp a session's `created` and `expires` from **the same clock**, as `set_session!` writes them
+from one `now`. `SessionMiddleware` recognises a new anonymous session it has not seen again by its
+stored lifetime, `expires - created`, being exactly its `unconfirmed_max_age` (#440). A store that
+took `created` from a database clock and `expires` from the application's would never confirm
+one.
+
 # Optional
 
 `cleanup_expired_sessions!(store)` prunes expired rows and **defaults to a no-op**. That is the one
@@ -311,10 +317,13 @@ Whether `store` has reached a size bound of its own, so that `SessionMiddleware`
 **new anonymous** sessions into it (#440). **Optional** — this default answers `false`: no bound.
 
 The middleware asks only when it is about to insert a session that ends its request with no
-identity. A `true` answer skips that save and its cookie, and the request still succeeds. Sign-ins,
-existing sessions and rotations are never refused, so a full store never logs anyone out and never
-blocks a login. `pormg_nitro_session(max_sessions = N)` implements it; `MemoryStore` does not need
-to, since it is an LRU bounded by `max_sessions` already.
+identity. A `true` answer skips that save and its cookie, and the request still succeeds. Sessions
+that end signed in, existing sessions and rotations are never refused, so a full store logs nobody
+out. It **can** keep a visitor with no cookie from signing in through a form whose CSRF token is
+bound to the session: the anonymous session that token needs is not saved, so the token never
+verifies. Only a sign-in that needs no session beforehand (a token or JSON login without
+session-bound CSRF) is unaffected. `pormg_nitro_session(max_sessions = N)` implements it;
+`MemoryStore` does not need to, since it is an LRU bounded by `max_sessions` already.
 
 It is called on the request path: answer from a cached count, never a query per call.
 """

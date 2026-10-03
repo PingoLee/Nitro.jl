@@ -178,12 +178,15 @@ from the last write (no sliding expiry).
 
 `max_sessions` bounds the table against a flood of anonymous sessions (#440). Once the store holds
 that many rows, [`session_store_full`](@ref Nitro.Core.Types.session_store_full) answers `true` and
-`SessionMiddleware` stops saving **new anonymous** sessions; sign-ins, existing sessions and
-rotations are never refused. `nothing`, the default, is unbounded and costs nothing. The count is
-not a query per request: it is read once at construction, kept up to date by this store's own
-inserts and deletes, and re-read exactly on every prune tick, which also corrects drift from other
-processes sharing the table. Expired rows count until the janitor deletes them, since they hold
-the disk until then.
+`SessionMiddleware` stops saving **new anonymous** sessions; sessions that end signed in, existing
+sessions and rotations are never refused. A visitor with no cookie can still be kept from signing in
+through a form whose CSRF token is bound to the session, since that token needs an anonymous
+session first. `nothing`, the default, is unbounded and costs nothing. The count is not a query per
+request: it is read once at construction, kept up to date by this store's own inserts and deletes,
+and re-read exactly on every prune tick, which also corrects drift from other processes sharing the
+table. Between ticks each process sees only its own inserts, so several processes on one table can
+overshoot the bound by roughly what each inserts in one `prune_interval`. Expired rows count until
+the janitor deletes them, since they hold the disk until then.
 
 `db_key` is the PormG connection key **every** session query runs on — read, write, delete and
 prune alike — and it must name the connection whose `nitro_session` table you bootstrapped.

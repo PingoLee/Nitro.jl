@@ -1369,6 +1369,66 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
         @test Nitro.Core.Types.session_store_full(MemoryStore()) === false
     end
 
+    @testset "the full-store warning comes back after the store recovers (#440)" begin
+        store = CountingStore(full = true)
+        mw = SessionMiddleware(cookie_name="sid", store=store, secure=false).middleware
+        @test_logs (:warn, r"session store is full") cart_writer(mw)(HTTP.Request("GET", "/"))
+        store.full[] = false
+        @test_logs min_level=Base.CoreLogging.Warn cart_writer(mw)(HTTP.Request("GET", "/"))   # saved
+        store.full[] = true
+        @test_logs (:warn, r"session store is full") cart_writer(mw)(HTTP.Request("GET", "/"))
+    end
+
+    @testset "a sign-in on an unconfirmed session confirms it through the rotation (#440)" begin
+        store = CountingStore()
+        mw = SessionMiddleware(cookie_name="sid", store=store, secure=false).middleware
+        sid = cookie_of(cart_writer(mw)(HTTP.Request("GET", "/add")), "sid")
+        born = Base.get(store, sid, nothing).created
+        res = mw(req -> (getsession(req)["user_id"] = 7; HTTP.Response(200, "in")))(
+            HTTP.Request("POST", "/login", ["Cookie" => "sid=$sid"]))
+        rotated = cookie_of(res, "sid")
+        @test rotated ∉ (nothing, sid)
+        @test max_age_of(res) == 86400
+        @test lifetime_of(store, rotated) >= 86400
+        @test Base.get(store, rotated, nothing).created == born
+        @test Base.get(store, rotated, nothing).data["cart"] == [1]
+    end
+
+    @testset "confirmation stops at the absolute deadline (#440, #362)" begin
+        # Confirming moves a session to `max_age` from now -- clamped, like every write, to the
+        # absolute deadline, so a session confirmed late in its life gets only what is left.
+        store = MemoryStore()
+        mw = SessionMiddleware(cookie_name="sid", store=store, secure=false,
+                               max_age=86400, absolute_max_age=4 * 3600).middleware   # unconfirmed: 1 h
+        sid = cookie_of(cart_writer(mw)(HTTP.Request("GET", "/")), "sid")
+        p = Base.get(store, sid, nothing)
+        # Re-dated 30 minutes back, still unconfirmed (a lifetime of exactly 1 h) and still live:
+        # 3 h 30 min of absolute lifetime left, far less than the day `max_age` would give.
+        born = Dates.now(Dates.UTC) - Dates.Minute(30)
+        seed!(store, sid, p.data; created = born, expires = born + Dates.Second(3600))
+        res = session_reader(mw)(HTTP.Request("GET", "/", ["Cookie" => "sid=$sid"]))
+        deadline = born + Dates.Hour(4)
+        q = Base.get(store, sid, nothing)
+        @test deadline - Dates.Second(5) <= q.expires <= deadline   # confirmed up to the deadline
+        @test q.created == born
+        @test 12_590 <= max_age_of(res) <= 12_600                   # 3 h 30 min, not a day
+    end
+
+    @testset "a store returning bare data is warned about, once (#440)" begin
+        # Such a store carries no lifetime, so a session in it can never be confirmed; with
+        # `unconfirmed_max_age` on, every anonymous session would silently lapse after an hour.
+        struct BareStore440 <: Nitro.Core.Types.AbstractSessionStore{String, Dict{String,Any}} end
+        Base.get(::BareStore440, ::String, default) = Dict{String,Any}("cart" => [1])
+        reader = session_reader(SessionMiddleware(cookie_name="sid", store=BareStore440(), secure=false,
+                                                  absolute_max_age=nothing).middleware)
+        res = @test_logs (:warn, r"never be confirmed") reader(HTTP.Request("GET", "/", ["Cookie" => "sid=x"]))
+        @test String(res.body) == "1"
+        # Off: no warning, nothing to confirm.
+        quiet = session_reader(SessionMiddleware(cookie_name="sid", store=BareStore440(), secure=false,
+                                                 absolute_max_age=nothing, unconfirmed_max_age=nothing).middleware)
+        @test_logs min_level=Base.CoreLogging.Warn quiet(HTTP.Request("GET", "/", ["Cookie" => "sid=x"]))
+    end
+
     # #452 asked whether every request that touches a session costs a store write -- an UPDATE
     # per page view on a database store. It does not: a loaded session is written back only when
     # it was rotated, marked modified, confirmed (#440), or its data changed. "unmodified session

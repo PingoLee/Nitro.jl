@@ -5,8 +5,9 @@
   `src/middleware/session_middleware.jl`, `src/types.jl`, `ext/NitroPormGExt.jl`
 - **Recorded**: 2026-10-03
 - **Severity**: **behavior change.** No call stops compiling. A new session that ends its first
-  request with no signed-in identity is now stored, and its cookie set, for one hour rather than
-  `max_age`. It gets the full `max_age` the first time the browser sends the cookie back.
+  request with no signed-in identity is now stored, and its cookie set, for `unconfirmed_max_age`
+  rather than `max_age`: one hour by default, less when the full lifetime is under two hours. It
+  gets the full `max_age` the first time the browser sends the cookie back.
 
 ### What changed
 
@@ -31,8 +32,9 @@ behavior.
 
 Two additions need no migration: `pormg_nitro_session(max_sessions = N)` bounds a database store
 (off by default), and `session_store_full(store)` is a new optional `AbstractSessionStore` method
-that defaults to `false`. See *Anonymous Sessions and Floods* in
-`docs/src/tutorial/cookies/sessions.md`.
+that defaults to `false`. Before turning the bound on, note what a full store costs: a visitor with
+no cookie cannot sign in through a form whose CSRF token is bound to the session until the store
+has room again. See *Anonymous Sessions and Floods* in `docs/src/tutorial/cookies/sessions.md`.
 
 ### How to find the calls to migrate
 
@@ -44,8 +46,9 @@ grep -rn 'Max-Age' --include=*.jl test/
 grep -rn '\.expires' --include=*.jl test/
 ```
 
-Most apps need no change: a browser sends the cookie back within seconds, on its next page or
-asset, and the session is confirmed. Check two cases:
+Most apps need no change: a browser usually sends the cookie back within seconds, on its next page
+or asset, and the session is confirmed (if the assets are served outside `SessionMiddleware`, the
+next page does it). Check three cases:
 
 - **A client that makes one session-writing request and comes back more than an hour later.** An
   API client that writes an anonymous session and polls rarely, or a page that writes the session
@@ -53,6 +56,11 @@ asset, and the session is confirmed. Check two cases:
   client make any request with its cookie in between.
 - **Tests that assert the first response's `Max-Age`, or a new session's stored expiry,** against
   `max_age`. Those now see `unconfirmed_max_age` unless the session ends signed in.
+- **A custom `AbstractSessionStore`.** An unconfirmed session is recognised by its stored lifetime,
+  `expires - created`, so `Base.get` must return a `SessionPayload` whose two instants come from the
+  same clock. A store returning bare data never confirms, so every anonymous session lapses at
+  `unconfirmed_max_age`; `SessionMiddleware` warns once. Pass `unconfirmed_max_age = nothing` to
+  such a store's middleware.
 
 ### Migrate your app
 

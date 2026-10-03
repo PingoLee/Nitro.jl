@@ -956,7 +956,28 @@ end
         end
     end
 
-    @testset "end to end: a full store refuses anonymous sessions, never sign-ins" begin
+    @testset "an unconfirmed session confirms through the store's whole-second read" begin
+        # `Base.get` truncates both instants to whole seconds (`_parse_db_datetime`). They were
+        # written from one `now`, an exact number of seconds apart, so the stored lifetime still
+        # reads as exactly `unconfirmed_max_age` -- this is the round trip that has to hold.
+        m = MockModel()
+        s = RealPormGSessionStore(model=m)
+        mw = SessionMiddleware(cookie_name="sid", store=s, secure=false).middleware
+        res = mw(req -> (getsession(req)["cart"] = [1]; HTTP.Response(200, "ok")))(HTTP.Request("GET", "/"))
+        sid = String(match(r"sid=([^;]+)", HTTP.header(res, "Set-Cookie")).captures[1])
+        @test occursin("Max-Age=3600", HTTP.header(res, "Set-Cookie"))
+        row = m._table[sid]
+        @test row[:expires_at] - row[:created_at] == Dates.Millisecond(3_600_000)
+
+        res = mw(req -> HTTP.Response(200, "page"))(HTTP.Request("GET", "/", ["Cookie" => "sid=$sid"]))
+        @test occursin("Max-Age=86400", HTTP.header(res, "Set-Cookie"))
+        @test m._table[sid][:expires_at] - m._table[sid][:created_at] >= Dates.Second(86400)
+        # Confirmed: the next read writes nothing.
+        res = mw(req -> HTTP.Response(200, "page"))(HTTP.Request("GET", "/", ["Cookie" => "sid=$sid"]))
+        @test isempty(HTTP.header(res, "Set-Cookie"))
+    end
+
+    @testset "end to end: a full store refuses anonymous sessions, never signed-in ones" begin
         m = MockModel()
         s = RealPormGSessionStore(model=m, max_sessions=2)
         mw = SessionMiddleware(cookie_name="sid", store=s, secure=false).middleware
