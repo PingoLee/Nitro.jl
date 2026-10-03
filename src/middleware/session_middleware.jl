@@ -157,8 +157,9 @@ it issues a token bound to the session, and it issues one to a new visitor only 
 asks for it with `csrf_token!` (#431), so a global `CSRFMiddleware` keeps this guarantee. Set the
 flag yourself when you hand the client anything else bound to `req.context[:session_id]`.
 
-An existing session is written back when its data changed, when it was rotated, or when the flag
-is set (which also refreshes its expiry). That write is update-only (`update_session!`, #318). If a
+An existing session is written back when its data changed, when it was rotated, when it is still
+unconfirmed (below), or when the flag is set (which also refreshes its expiry). A request that only
+reads it writes nothing, so its expiry does not move (#452). That write is update-only (`update_session!`, #318). If a
 concurrent logout deleted the session meanwhile, the write is dropped and the cookie is not re-set.
 The one exception is a rotated session that ends the request empty and with no identity, such as
 a logout. It is written with `set_session!` as a fresh session; see *Session lifetime* below.
@@ -203,7 +204,11 @@ visitor's session to another.
 A session has two lifetimes, and it ends at whichever comes first.
 
 - `max_age::Int = 86400` — the **sliding** lifetime, in seconds. Every write moves the expiry to
-  `max_age` from now, so a session in use keeps going and an idle one lapses.
+  `max_age` from now, so a session that keeps being written keeps going and an idle one lapses.
+  It slides on **writes, not reads** (#452), as Django's does by default: a request that only
+  reads the session costs no store write, so a session that is only read lapses `max_age` after
+  its last write. A handler that wants a read to keep the session alive sets
+  `req.context[:session_modified] = true`.
 - `absolute_max_age::Nullable{Int} = 604800` (7 days) — the **absolute** lifetime, in seconds,
   measured from when the session was first stored (#362). A session older than that is treated as
   absent, like an expired one: the visitor gets a fresh id and signs in again, however recently

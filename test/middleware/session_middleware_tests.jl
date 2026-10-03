@@ -1369,6 +1369,70 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
         @test Nitro.Core.Types.session_store_full(MemoryStore()) === false
     end
 
+    # #452 asked whether every request that touches a session costs a store write -- an UPDATE
+    # per page view on a database store. It does not: a loaded session is written back only when
+    # it was rotated, marked modified, confirmed (#440), or its data changed. "unmodified session
+    # not re-saved" above checks only the missing cookie; this counts the writes themselves,
+    # including under `CSRFMiddleware`, which marks the session modified only when it mints.
+    @testset "a request that does not change the session writes nothing (#452)" begin
+        store = CountingStore()
+        Nitro.Core.Types.set_session!(store.inner, "s1", Dict{String,Any}("user_id" => 7); ttl = 86400)
+        mw = SessionMiddleware(cookie_name="sid", store=store, secure=false).middleware
+
+        # Read-only, repeatedly: no write, no cookie, and so no expiry slide.
+        expires = Base.get(store, "s1", nothing).expires
+        for _ in 1:3
+            res = mw(req -> HTTP.Response(200, string(getsession(req)["user_id"])))(
+                HTTP.Request("GET", "/", ["Cookie" => "sid=s1"]))
+            @test String(res.body) == "7"
+            @test isempty(HTTP.header(res, "Set-Cookie"))
+        end
+        # Writing back the same value is no change either.
+        mw(req -> (getsession(req)["user_id"] = 7; HTTP.Response(200, "ok")))(
+            HTTP.Request("GET", "/", ["Cookie" => "sid=s1"]))
+        @test total_writes(store) == 0
+        @test Base.get(store, "s1", nothing).expires == expires
+
+        # A real change is one write.
+        mw(req -> (getsession(req)["theme"] = "dark"; HTTP.Response(200, "ok")))(
+            HTTP.Request("GET", "/", ["Cookie" => "sid=s1"]))
+        @test store.writes == Dict(:update => 1)
+    end
+
+    @testset "a valid CSRF token adds no session write (#452)" begin
+        store = CountingStore()
+        given = Ref{String}("")
+        stack(h) = SessionMiddleware(cookie_name="sid", store=store, secure=false).middleware(
+            Nitro.CSRFMiddleware(repeat("k", 64))(h))
+        # Every Set-Cookie of a response, as the next request's Cookie header.
+        jar = Dict{String,String}()
+        remember!(res) = for h in res.headers
+            lowercase(h.first) == "set-cookie" || continue
+            m = match(r"^([^=]+)=([^;]*)", h.second)
+            jar[m[1]] = m[2]
+        end
+        with_jar(method; headers = Pair{String,String}[]) =
+            HTTP.Request(method, "/", [headers; "Cookie" => join(("$k=$v" for (k, v) in jar), "; ")])
+
+        # A form page: a new session, kept for the token it is handed (one insert).
+        remember!(stack(req -> (given[] = Nitro.csrf_token!(req); HTTP.Response(200, "form")))(
+            HTTP.Request("GET", "/form")))
+        @test store.writes == Dict(:set => 1)
+        # The next request confirms it (#440): one update.
+        remember!(stack(req -> HTTP.Response(200, "page"))(with_jar("GET")))
+        @test store.writes == Dict(:set => 1, :update => 1)
+
+        # From here, safe and unsafe requests carrying a valid token write nothing.
+        reader = stack(req -> HTTP.Response(200, "ok"))
+        for _ in 1:2
+            @test reader(with_jar("GET")).status == 200
+            res = reader(with_jar("POST"; headers = ["X-CSRF-Token" => given[]]))
+            @test res.status == 200
+            @test isempty(HTTP.header(res, "Set-Cookie"))
+        end
+        @test store.writes == Dict(:set => 1, :update => 1)
+    end
+
 end
 
 end

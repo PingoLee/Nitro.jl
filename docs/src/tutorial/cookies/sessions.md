@@ -144,12 +144,24 @@ A session has two lifetimes, and it ends at whichever comes first:
 
 | Keyword | Default | Measured from | Ends a session that is… |
 |---|---|---|---|
-| `max_age` | `86400` (1 day) | the last write | idle |
+| `max_age` | `86400` (1 day) | the last write | not written to |
 | `absolute_max_age` | `604800` (7 days) | when the session was first stored | old, however active |
 
 `max_age` is a **sliding** lifetime: every write moves the expiry forward, so on its own it never
-ends a session that keeps being used, and a stolen session ID stays valid for as long as someone
-keeps using it. `absolute_max_age` caps that. Once a session is older than the cap, it is treated
+ends a session that keeps being written, and a stolen session ID stays valid for as long as someone
+keeps writing to it. `absolute_max_age` caps that.
+
+The expiry slides on **writes, not reads**. A request that only reads the session writes nothing
+to the store, which is what keeps a page view under a login from costing an `UPDATE`. So a
+signed-in user who only reads is signed out `max_age` after the last request that changed their
+session. That is Django's default as well. If your app has long read-only stretches, raise
+`max_age`, or set `req.context[:session_modified] = true` in a handler that should keep the
+session alive: that writes it back and moves the expiry.
+
+`SessionMiddleware` writes a session back only when the request changed its data, rotated it,
+confirmed it (see [Anonymous Sessions and Floods](#Anonymous-Sessions-and-Floods)), or set
+`:session_modified`. `CSRFMiddleware` sets that flag only when it issues a new token, not when a
+request presents a valid one. Once a session is older than the cap, it is treated
 as absent: the visitor gets a fresh session and signs in again.
 
 ```julia
