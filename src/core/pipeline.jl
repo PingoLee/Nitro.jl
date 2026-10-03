@@ -132,7 +132,7 @@ why. The log names both routes by their **patterns** and their **declared** meth
 a client-chosen method token, which a `"*"` leaf accepts verbatim.
 """
 function _route_rerouted(r::HTTP.Router, req::HTTP.Request, res::Types.RouteResolution)
-    handler, route, params = HTTP.Handlers.gethandler(r, req)
+    handler, route, params = RouterHOF._gethandler(r, req)
     (handler === nothing || handler === missing) && return _route_miss(r, req, handler)
 
     ran = get(res.table, RouterHOF.genkey(res.mw_method, res.route), Types.NO_ROUTE_MIDDLEWARE)
@@ -147,7 +147,9 @@ end
 """
     _route_unresolved(r, req) -> response
 
-`(r::Router)(req)` (HTTP.jl `http_handlers.jl`), except for how it answers a method mismatch (#281):
+`(r::Router)(req)` (HTTP.jl `http_handlers.jl`), except that the lookup is
+[`RouterHOF._gethandler`](@ref), which skips upstream's allocations on an exact route (#445), and
+for how it answers a method mismatch (#281):
 
 - **A `405` carries `Allow`**, which RFC 9110 §15.5.6 requires. HTTP.jl's `default405` sends a
   bare `Response(405)`. See [`_method_not_allowed`](@ref).
@@ -166,7 +168,7 @@ handler) for the reason `_dispatch_resolved`'s fast branch gives.
 lookup a concrete `Router`.
 """
 function _route_unresolved(r::HTTP.Router, req::HTTP.Request)
-    handler, route, params = HTTP.Handlers.gethandler(r, req)
+    handler, route, params = RouterHOF._gethandler(r, req)
     (handler === nothing || handler === missing) && return _route_miss(r, req, handler)
     return _route_call(req, handler, route, params)
 end

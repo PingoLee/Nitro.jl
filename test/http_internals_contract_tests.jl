@@ -20,6 +20,9 @@ import Sockets
 #   • src/core/pipeline.jl — `_allowed_methods` walks the router's route tree to build a 405's
 #       `Allow` header (#281): `Router.routes`, the `Node`/`Leaf`/`Variable` fields, `match`,
 #       `_route_variable_matches` and `_router_request_path`.
+#   • src/routerhof.jl — `_gethandler` resolves an exact route without upstream's `split` and
+#       `Params()` (#445): `Node.exact`, `Node.segment`, `Params`, and `match` on an exhausted
+#       segment list.
 #   • src/core/transport.jl — `_upgrade_websocket!` (#374) runs the private
 #       `WebSockets._origin_allowed_default` with a proxy-reported scheme, mirrors `upgrade`'s
 #       `stream.tracked.conn isa TLS.Conn`, and classifies a refused handshake by
@@ -136,6 +139,28 @@ end
     @test Nitro.Core._allowed_methods(r, "/a/z") == ["GET"]
     @test Nitro.Core._allowed_methods(r, "/b/c/d?q") == ["PUT"]
     @test isempty(Nitro.Core._allowed_methods(r, "/c"))
+end
+
+@testset "what `_gethandler`'s exact walk reads is still shaped the same (#445)" begin
+    H = HTTP.Handlers
+    # `src/routerhof.jl` `_exact_leaf`: walks `Node.exact` comparing `Node.segment`, then asks
+    # `match` with an exhausted segment list for the end node's leaf.
+    @test fieldtype(H.Node, :exact) === Vector{H.Node}
+    @test fieldtype(H.Node, :segment) === Union{String, H.Variable}
+    @test H.Params === Dict{String, String}
+    r = HTTP.Router()
+    h = req -> HTTP.Response(200)
+    HTTP.register!(r, "GET", "/a/b", h)
+    HTTP.register!(r, "*",   "/c", h)
+    child(node, s) = only(filter(n -> n.segment == s, node.exact))
+    a = child(r.routes, "a")
+    b = child(a, "b")
+    none = SubString{String}[]
+    leaf = H.match(b, "GET", none, 1)
+    @test leaf isa H.Leaf && leaf.handler === h && leaf.path == "/a/b" && isempty(leaf.variables)
+    @test H.match(b, "POST", none, 1) === missing            # a method mismatch, not a miss
+    @test H.match(a, "GET", none, 1) === nothing             # no leaf at all
+    @test H.match(child(r.routes, "c"), "PATCH", none, 1) isa H.Leaf   # a "*" leaf takes any method
 end
 
 @testset "router hands over STILL-ENCODED path segments" begin

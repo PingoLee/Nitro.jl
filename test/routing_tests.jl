@@ -1035,3 +1035,103 @@ r = send("http://h:abc/static/a.txt")
 @test r.status == 200
 @test Nitro.text(r) == "static-a"
 end
+
+@testitem "An exact route resolves without upstream's split and Params (#445)" tags=[:core] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+using Nitro.Core: App, internalrequest
+using Nitro.Core.Routing: urlpatterns
+using Nitro.Core.RouterHOF: _gethandler, EMPTY_PARAMS
+
+# A table that mixes every kind of node `match` tries, in the orders that make precedence matter:
+# an exact path beside a variable one, an exact path under a pattern-constrained variable, an
+# exact path beside `**` and `*`, a `"*"` leaf, a non-ASCII segment, and #281's shape (an exact
+# leaf with no POST, under a branch that only reaches `/posts`).
+const TABLE = [
+    ("GET", "/"), ("GET", "/a"), ("POST", "/a"), ("*", "/any"), ("GET", "/a/b"),
+    ("GET", "/a/{x}"), ("PUT", "/a/{x}"), ("GET", "/a/{n:[0-9]+}/c"), ("GET", "/a/7/c"),
+    ("DELETE", "/a/7/c"), ("GET", "/s/**"), ("GET", "/s/exact"), ("GET", "/u/me"),
+    ("GET", "/u/{name}/posts"), ("GET", "/é/ü"), ("GET", "/w/*/z"), ("GET", "/w/k/z"),
+    ("POST", "/w/k"),
+]
+const TARGETS = [
+    "/", "*", "/a", "/a/", "//a", "/a//b", "/a/b", "/a/zz", "/a/7/c", "/a/8/c", "/a/x/c", "/any",
+    "/any/", "/s/exact", "/s/x/y", "/s", "/u/me", "/u/bob/posts", "/u/me/posts", "/é/ü", "/é",
+    "/w/k/z", "/w/q/z", "/w/k", "/nope", "/a?x=1", "/a/b?", "http://h/a", "/a#f", "/a/b/c/d",
+    # Request segments that spell registration syntax: they must never match it as an exact child.
+    "/w/*/z", "/s/**", "/a/{x}", "/a/{x",
+    # Malformed UTF-8: the walk slices at '/' bytes, so it must not throw where upstream does not.
+    "/a/\xff", "/\xc3/b", "/a/\xe2\x82", "/\x80",
+]
+const METHODS = ["GET", "POST", "PUT", "DELETE", "HEAD", "PATCH", "FOO"]
+
+function table_router()
+    r = HTTP.Router()
+    for (m, p) in TABLE
+        HTTP.register!(r, m, p, req -> (m, p))
+    end
+    return r
+end
+
+@testset "the same (handler, route, params) as upstream, for every method and target" begin
+    r = table_router()
+    for t in TARGETS, m in METHODS
+        req = HTTP.Request(m, t)
+        want = HTTP.Handlers.gethandler(r, req)
+        got = _gethandler(r, req)
+        @test (m, t, got[1] === want[1], got[2], got[3]) == (m, t, true, want[2], want[3])
+    end
+end
+
+@testset "an exact leaf gets the shared empty Params; a variable leaf still gets its own" begin
+    r = table_router()
+    @test _gethandler(r, HTTP.Request("GET", "/a/b"))[3] === EMPTY_PARAMS
+    @test _gethandler(r, HTTP.Request("GET", "/a/7/c"))[3] === EMPTY_PARAMS   # exact beats {n}
+    p = _gethandler(r, HTTP.Request("GET", "/a/zz"))[3]
+    @test p == Dict("x" => "zz")
+    @test p !== EMPTY_PARAMS
+end
+
+@testset "through the pipeline: params, precedence, 405 + Allow, with and without compose" begin
+    passthrough = handle -> (req -> handle(req))
+    for mw in (nothing, [passthrough])   # `nothing`: compose's empty fast path; else compose resolves
+        ctx = App()
+        kw = mw === nothing ? (;) : (; middleware = mw)
+        urlpatterns(ctx, "",
+            path("/u/me", req -> "me"; method = "GET", kw...),
+            path("/u/<str:name>/posts", (req, name::String) -> "posts:$name"; method = "GET", kw...),
+            path("/u/<str:name>", (req, name::String) -> "user:$name"; method = "GET", kw...),
+            path("/static", req -> string(haskey(req.context, :params)); method = "GET", kw...),
+        )
+        send(method, target) = internalrequest(ctx, HTTP.Request(method, target))
+        @test Nitro.text(send("GET", "/u/me")) == "me"
+        @test Nitro.text(send("GET", "/u/bob")) == "user:bob"
+        @test Nitro.text(send("GET", "/u/bob/posts")) == "posts:bob"
+        # A static route never puts `:params` on the request, so the shared Dict never escapes.
+        @test Nitro.text(send("GET", "/static")) == "false"
+        @test Nitro.text(send("GET", "/static?q=1")) == "false"
+        r = send("POST", "/u/me")
+        @test r.status == 405
+        @test HTTP.header(r, "Allow") == "GET, HEAD"
+        @test send("HEAD", "/u/me").status == 200
+        @test send("GET", "/nope").status == 404
+    end
+    @test isempty(EMPTY_PARAMS)
+end
+
+# Measured against upstream on the same request rather than against a constant, so the bound
+# tracks the HTTP.jl and Julia versions in use. Upstream pays a `Vector{SubString}` and a `Dict`.
+function allocs_per_call(f, r, req, n)
+    f(r, req)
+    return @allocations(for _ in 1:n; f(r, req); end) / n
+end
+
+@testset "fewer allocations than upstream on an exact route, none extra on a variable one" begin
+    r = table_router()
+    exact, variable = HTTP.Request("GET", "/a/b"), HTTP.Request("GET", "/a/zz")
+    allocs_per_call(_gethandler, r, exact, 10); allocs_per_call(HTTP.Handlers.gethandler, r, exact, 10)
+    @test allocs_per_call(_gethandler, r, exact, 1000) + 2 <= allocs_per_call(HTTP.Handlers.gethandler, r, exact, 1000)
+    @test allocs_per_call(_gethandler, r, variable, 1000) <= allocs_per_call(HTTP.Handlers.gethandler, r, variable, 1000) + 0.5
+end
+end

@@ -1773,8 +1773,9 @@ One request's route lookup, handed from `compose` (src/routerhof.jl) to the inne
 the pipeline (`_dispatch_resolved`, src/core/pipeline.jl) so the route is resolved **once**
 (#80).
 
-`compose` has to call `HTTP.Handlers.gethandler` before it can build a middleware-cache key, and
-used to keep only `leaf.path` from it — discarding the handler and the `Params()` dict, which
+`compose` has to resolve the route (`RouterHOF._gethandler`, upstream `HTTP.Handlers.gethandler`
+with an exact-route fast path, #445) before it can build a middleware-cache key, and used to keep
+only `leaf.path` from it — discarding the handler and the `Params()` dict, which
 `(r::Router)(req)` then recomputed at the bottom of the chain. That is two
 `_router_request_path` + `split`, two trie walks and two `Dict{String,String}` per request, on
 every app that registers per-route middleware. This struct is what carries the first lookup down
@@ -1783,8 +1784,8 @@ to where the second one used to happen.
 # The guard is `(router, method, target)` — every input the lookup read
 
 `_dispatch_resolved` honours this hand-off only when all three still match. That set is not a
-judgement call: `HTTP.Handlers.gethandler` resolves from exactly `r.routes`, `req.method` and
-`req.target`, so re-checking those three is what makes "reuse the lookup" indistinguishable
+judgement call: the lookup (`_gethandler`, and upstream `gethandler` behind it) resolves from
+exactly `r.routes`, `req.method` and `req.target`, so re-checking those three is what makes "reuse the lookup" indistinguishable
 from "do the lookup again". A `router` mismatch falls through to `r(req)`, which is always
 correct; a `method` or `target` mismatch is the rewrite case below, and is not.
 
