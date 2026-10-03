@@ -2,7 +2,6 @@ module Crypto
 
 using OpenSSL
 using SHA
-using Base64
 using UUIDs
 using Dates
 using Dates: DateTime
@@ -55,11 +54,56 @@ end
 # cookies (below), CSRF tokens (#350). It lives here rather than in `Auth` because `Auth` is
 # layered above `Core`, and the cookie and CSRF code below it need the same one.
 
+# Both directions are a single pass over the input into one pre-sized output (#432). They used
+# to go through the stdlib: encode was `base64encode` plus two `replace` passes, and decode
+# translated into an intermediate standard-alphabet buffer and handed it to `base64decode`,
+# whose `IOBuffer` + `Base64DecodePipe` cost ~20 allocations for a JWT segment of under 200
+# bytes. This runs three times per bearer-authenticated request, once per encrypted cookie,
+# and once per CSRF token, so the per-call machinery was the cost, not the bytes.
+
 # Unpadded, URL-safe alphabet (RFC 4648 §5; RFC 7515 §2 for JWTs).
-function base64url_encode(data::Vector{UInt8})
-    s = base64encode(data)
-    s = replace(s, '+' => '-', '/' => '_')
-    return replace(s, '=' => "")
+const _BASE64URL_ALPHABET = Vector{UInt8}("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
+
+# Byte -> 6-bit value, indexed by `byte + 1`; 0xff marks a byte outside the alphabet, which
+# includes `=`, the standard alphabet's `+/`, whitespace, and every non-ASCII byte.
+const _BASE64URL_VALUES = let table = fill(0xff, 256)
+    for (value, byte) in enumerate(_BASE64URL_ALPHABET)
+        table[byte + 1] = UInt8(value - 1)
+    end
+    table
+end
+
+function base64url_encode(data::AbstractVector{UInt8})
+    count = length(data)
+    # `StringVector`, not `Vector{UInt8}`: `String` takes it over without copying, which it
+    # does not do for a plain vector on Julia 1.12.
+    out = Base.StringVector(cld(4 * count, 3))
+    alphabet = _BASE64URL_ALPHABET
+    input = firstindex(data)
+    stop = input + count - 1
+    written = 0
+    @inbounds while input + 2 <= stop
+        word = UInt32(data[input]) << 16 | UInt32(data[input + 1]) << 8 | UInt32(data[input + 2])
+        out[written + 1] = alphabet[(word >> 18) & 0x3f + 1]
+        out[written + 2] = alphabet[(word >> 12) & 0x3f + 1]
+        out[written + 3] = alphabet[(word >> 6) & 0x3f + 1]
+        out[written + 4] = alphabet[word & 0x3f + 1]
+        input += 3
+        written += 4
+    end
+    # The final group: 1 byte is 2 characters, 2 bytes are 3, and no `=` pads either.
+    left = stop - input + 1
+    @inbounds if left == 1
+        word = UInt32(data[input]) << 16
+        out[written + 1] = alphabet[(word >> 18) & 0x3f + 1]
+        out[written + 2] = alphabet[(word >> 12) & 0x3f + 1]
+    elseif left == 2
+        word = UInt32(data[input]) << 16 | UInt32(data[input + 1]) << 8
+        out[written + 1] = alphabet[(word >> 18) & 0x3f + 1]
+        out[written + 2] = alphabet[(word >> 12) & 0x3f + 1]
+        out[written + 3] = alphabet[(word >> 6) & 0x3f + 1]
+    end
+    return String(out)
 end
 
 # Strict: canonical base64url and nothing else (#321, #350). The lenient decoder this replaced
@@ -78,38 +122,45 @@ end
 # definition exhaustively over every 2- and 3-character input, so the two cannot drift.
 #
 # Throws ArgumentError, the one type its callers catch: `_decode_jwt`'s two sites map it to an
-# `AuthError`, and `decrypt_payload` to a `CookieError`.
-function base64url_decode(data::AbstractString)
+# `AuthError`, and `decrypt_payload` to a `CookieError`. The three refusals are checked in the
+# order the translate-and-pad decoder checked them, so each input fails with the same message.
+function base64url_decode(data::Union{String, SubString{String}})
     units = codeunits(data)
     count = length(units)
-    remainder = mod(count, 4)
+    remainder = count % 4
     remainder == 1 && throw(ArgumentError("not base64url: impossible length"))
-    # Translated to the standard alphabet and padded in one buffer, for `base64decode`.
-    standard = Vector{UInt8}(undef, remainder == 0 ? count : count + 4 - remainder)
-    last_value = 0x00
-    for (index, byte) in enumerate(units)
-        last_value, translated = if UInt8('A') <= byte <= UInt8('Z')
-            byte - UInt8('A'), byte
-        elseif UInt8('a') <= byte <= UInt8('z')
-            byte - UInt8('a') + 0x1a, byte
-        elseif UInt8('0') <= byte <= UInt8('9')
-            byte - UInt8('0') + 0x34, byte
-        elseif byte == UInt8('-')
-            0x3e, UInt8('+')
-        elseif byte == UInt8('_')
-            0x3f, UInt8('/')
-        else
-            throw(ArgumentError("not base64url"))
+    # 6 bits per character; a leftover 2 or 3 characters carry 1 or 2 whole bytes, so this is
+    # exactly the decoded length and every write below lands inside it. A plain vector, unlike
+    # the encoder's `StringVector`: that saves the copy when a JWT segment goes on to
+    # `String(...)`, but costs an allocation here, and allocations are what the JWT path
+    # still has too many of (#449).
+    out = Vector{UInt8}(undef, (count * 3) >> 2)
+    values = _BASE64URL_VALUES
+    accumulator = UInt32(0)
+    bits = 0
+    written = 0
+    value = 0x00
+    for byte in units
+        # `byte + 1` is an Int in 1:256, always inside the 256-entry table.
+        value = @inbounds values[byte + 1]
+        value == 0xff && throw(ArgumentError("not base64url"))
+        # At most the low 14 bits are ever read back, so shifting older bits out of the
+        # UInt32 is harmless.
+        accumulator = (accumulator << 6) | value
+        bits += 6
+        if bits >= 8
+            bits -= 8
+            written += 1
+            @inbounds out[written] = (accumulator >> bits) % UInt8
         end
-        standard[index] = translated
     end
     discarded = remainder == 2 ? 0x0f : remainder == 3 ? 0x03 : 0x00
-    last_value & discarded == 0x00 || throw(ArgumentError("not canonical base64url"))
-    for index in (count + 1):length(standard)
-        standard[index] = UInt8('=')
-    end
-    return base64decode(standard)
+    value & discarded == 0x00 || throw(ArgumentError("not canonical base64url"))
+    return out
 end
+
+# Any other string type: its code units need not be bytes, so it is decoded as UTF-8.
+base64url_decode(data::AbstractString) = base64url_decode(String(data))
 
 # ── Secret handling ─────────────────────────────────────────────────────────────
 

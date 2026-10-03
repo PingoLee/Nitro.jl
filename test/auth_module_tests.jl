@@ -305,20 +305,20 @@ end
     @test_throws Nitro.Auth.AuthError Nitro.Auth.decode_jwt("W10.W10.x", secret; verify=false)
 
     # -- The rest of the same class: the DECODERS are sinks too, and run before the
-    # `isa AbstractDict` guards above. `base64decode` throws ArgumentError on a bad alphabet
-    # or an unpaddable length, `JSON.parse` on anything that is not JSON. Guarding only the
-    # parsed value left the class half closed, and length-dependently so -- which is exactly
-    # what makes a partial fix read as complete.
+    # `isa AbstractDict` guards above. `base64url_decode` throws ArgumentError on a bad
+    # alphabet or an impossible length, `JSON.parse` on anything that is not JSON. Guarding
+    # only the parsed value left the class half closed, and length-dependently so -- which is
+    # exactly what makes a partial fix read as complete.
     raw64(str) = replace(replace(replace(Base64.base64encode(Vector{UInt8}(codeunits(str))), '+' => '-'), '/' => '_'), '=' => "")
     good_claims = b64json(payload)
     good_header = b64json(Dict("alg" => "HS256", "typ" => "JWT"))
-    # Note which sink each case actually reaches -- `base64decode("!!!!")` and
-    # `base64decode("")` do NOT throw, they return bytes that then fail to parse, so four
-    # of these five land on `JSON.parse`. Only an UNPADDABLE length reaches base64decode's
-    # own throw, which is why "header unpaddable" is here and not folded into the first row.
+    # Note which sink each case actually reaches. When these rows were written, the stdlib
+    # `base64decode` returned bytes for "!!!!" and "", so only an unpaddable length reached
+    # the decoder's own throw. Since #321 the strict `base64url_decode` refuses a bad
+    # alphabet too; "" still decodes, to nothing, and fails in `JSON.parse`.
     malformed = [
-        ("header unpaddable",     string("x", ".", good_claims, ".x")),      # -> base64decode
-        ("header bad alphabet",   string("!!!!", ".", good_claims, ".x")),   # -> JSON.parse
+        ("header unpaddable",     string("x", ".", good_claims, ".x")),      # -> base64url_decode
+        ("header bad alphabet",   string("!!!!", ".", good_claims, ".x")),   # -> base64url_decode
         ("header not JSON",       string(raw64("foo"), ".", good_claims, ".x")),
         ("header truncated JSON", string(raw64("{\"alg\":"), ".", good_claims, ".x")),
         ("header empty",          string("", ".", good_claims, ".x")),
@@ -471,6 +471,87 @@ end
         "Invalid JWT encoding"
     padded_head = string(head, "=.", claims, ".", sig)
     @test sprint(showerror, caught(() -> Nitro.Auth.decode_jwt(padded_head, secret))) == "Invalid JWT encoding"
+end
+
+@testset "the single-pass base64url codec agrees with the stdlib (#432)" begin
+    # Both directions used to be built on stdlib `Base64`; they are now one pass each. Hold
+    # them to a reference that still IS the stdlib: for decode, the translate-and-pad decoder
+    # this replaced, kept here verbatim; for encode, `base64encode` with the alphabet swapped
+    # and the padding dropped. Same bytes on success, same message on refusal.
+    function reference_decode(data::AbstractString)
+        units = codeunits(data)
+        count = length(units)
+        remainder = mod(count, 4)
+        remainder == 1 && throw(ArgumentError("not base64url: impossible length"))
+        standard = Vector{UInt8}(undef, remainder == 0 ? count : count + 4 - remainder)
+        last_value = 0x00
+        for (index, byte) in enumerate(units)
+            last_value, translated = if UInt8('A') <= byte <= UInt8('Z')
+                byte - UInt8('A'), byte
+            elseif UInt8('a') <= byte <= UInt8('z')
+                byte - UInt8('a') + 0x1a, byte
+            elseif UInt8('0') <= byte <= UInt8('9')
+                byte - UInt8('0') + 0x34, byte
+            elseif byte == UInt8('-')
+                0x3e, UInt8('+')
+            elseif byte == UInt8('_')
+                0x3f, UInt8('/')
+            else
+                throw(ArgumentError("not base64url"))
+            end
+            standard[index] = translated
+        end
+        discarded = remainder == 2 ? 0x0f : remainder == 3 ? 0x03 : 0x00
+        last_value & discarded == 0x00 || throw(ArgumentError("not canonical base64url"))
+        for index in (count + 1):length(standard)
+            standard[index] = UInt8('=')
+        end
+        return Base64.base64decode(standard)
+    end
+    reference_encode(bytes) = replace(Base64.base64encode(bytes), '+' => '-', '/' => '_', '=' => "")
+    outcome(f, s) = try; f(s); catch err; err isa ArgumentError ? err.msg : rethrow(); end
+
+    encode = Nitro.Crypto.base64url_encode
+    decode = Nitro.Crypto.base64url_decode
+    rng = Random.RandomDevice()
+    url = collect("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
+    junk = collect("=+/ \t\n.!\0é€")
+
+    encode_mismatches = Int[]
+    decode_mismatches = String[]
+    for _ in 1:2_000
+        # Round trips at every length class, past several whole groups.
+        bytes = rand(rng, UInt8, rand(rng, 0:300))
+        encoded = encode(bytes)
+        (encoded == reference_encode(bytes) && decode(encoded) == bytes) || push!(encode_mismatches, length(bytes))
+        # Random alphabet strings: most tails are non-canonical, and 1 in 4 lengths impossible.
+        s = String(rand(rng, url, rand(rng, 0:40)))
+        outcome(decode, s) == outcome(reference_decode, s) || push!(decode_mismatches, s)
+        # A SubString takes the same path as a String.
+        outcome(decode, SubString(s, 1)) == outcome(reference_decode, s) || push!(decode_mismatches, s)
+        # One byte outside the alphabet, anywhere: padding, the standard alphabet, whitespace,
+        # NUL, and multi-byte UTF-8.
+        chars = rand(rng, url, rand(rng, 1:40))
+        chars[rand(rng, eachindex(chars))] = rand(rng, junk)
+        t = String(chars)
+        outcome(decode, t) == outcome(reference_decode, t) || push!(decode_mismatches, t)
+    end
+    @test encode_mismatches == Int[]
+    @test decode_mismatches == String[]
+
+    # Every string type decodes as its UTF-8 bytes, not as its own code units.
+    @test decode(Test.GenericString("Zm8")) == decode("Zm8") == b"fo"
+    # The encoder takes any byte vector, a view included.
+    @test encode(view(b"foobar", 2:5)) == reference_encode(b"ooba")
+
+    # The point of #432: a JWT-claims-sized segment is the output buffer and little else.
+    # It was ~2.3 KB and 23 allocations through the stdlib pipe.
+    segment = encode(rand(rng, UInt8, 88))
+    decode(segment)
+    encode(rand(rng, UInt8, 88))
+    bytes = rand(rng, UInt8, 88)
+    @test (@allocated decode(segment)) < 512
+    @test (@allocated encode(bytes)) < 512
 end
 
 @testset "a critical header extension is refused (#321)" begin

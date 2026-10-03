@@ -300,10 +300,10 @@ function _jwt_segment_json(segment::AbstractString; kwargs...)
         return _parse_json_bounded(String(base64url_decode(segment)); max_fields = 0, kwargs...)
     catch e
         # Every byte of the segment is attacker-supplied, and BOTH decoders are sinks:
-        # `base64decode` throws ArgumentError on a bad alphabet or a length that cannot be
-        # padded, and `JSON.parse` -- or the depth bound in front of it -- throws
-        # ArgumentError on anything that is not acceptable JSON. Guarding only the parsed
-        # VALUE would leave the class half closed.
+        # `base64url_decode` throws ArgumentError on a bad alphabet, an impossible length, or
+        # a non-canonical last character, and `JSON.parse` -- or the depth bound in front of
+        # it -- throws ArgumentError on anything that is not acceptable JSON. Guarding only
+        # the parsed VALUE would leave the class half closed.
         #
         # Catch the ONE type this guard exists for, and let everything else through. An
         # allow-list is not stylistic: `StackOverflowError`, `OutOfMemoryError` and
