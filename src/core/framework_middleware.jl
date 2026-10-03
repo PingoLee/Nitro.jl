@@ -60,10 +60,34 @@ function AccessLogMiddleware(; log_query::Bool=false, skip::Union{Nothing,Functi
             _console_skips(skip, req, response) && return response
             ip = Base.get(req.context, :ip, nothing)
             target = _log_escape(log_query ? req.target : _log_target_path(req.target))
-            @info "$(Dates.format(now(), "yyyy-mm-ddTHH:MM:SS")) - $ip - \"$(req.method) $target\" $(response.status)"
+            @info "$(_iso_seconds(now())) - $ip - \"$(req.method) $target\" $(response.status)"
             return response
         end
     end
+end
+
+# `Dates.format(ts, "yyyy-mm-ddTHH:MM:SS")`, byte for byte, without the format-string machinery
+# (#443). That call cost ~6.7 µs per request on its own, against ~0.3 µs for this, out of a
+# console line that is otherwise almost entirely the logger. Years outside 0:9999 (never a wall
+# clock) take the `Dates.format` path, so the two cannot disagree.
+#
+# The line stays on the request task deliberately. A writer task looked like the fix and measured
+# worse (bench/socket/, `-t 8`, `/plaintext`): ~21k rps with one writer and ~24.5k with four,
+# against ~30.5k in place and ~43k with no log. Each line is ~20 µs of CPU inside `ConsoleLogger`
+# wherever it runs, so a queue only adds a handoff, and one writer serializes all of it. Do not
+# move it off-task without re-measuring; the cost is documented on `serve`'s `access_log`.
+function _iso_seconds(ts::DateTime)::String
+    y, mo, d = yearmonthday(ts)
+    0 <= y <= 9999 || return Dates.format(ts, "yyyy-mm-ddTHH:MM:SS")
+    buf = Base.StringVector(19)
+    @inline put2!(i, v) = (buf[i] = UInt8('0') + v ÷ 10; buf[i+1] = UInt8('0') + v % 10)
+    put2!(1, y ÷ 100); put2!(3, y % 100)
+    buf[5] = UInt8('-'); put2!(6, mo)
+    buf[8] = UInt8('-'); put2!(9, d)
+    buf[11] = UInt8('T'); put2!(12, hour(ts))
+    buf[14] = UInt8(':'); put2!(15, minute(ts))
+    buf[17] = UInt8(':'); put2!(18, second(ts))
+    return String(buf)
 end
 
 # One or more `/segment`s, each a run of RFC 3986 `pchar`s: unreserved, sub-delims, ':' and '@',

@@ -165,6 +165,43 @@ Base.show(io::IO, ::MIME"text/plain", s::Server{<:NitroStreamHandler}) = show(io
 HTTP._probe_h2_preface!(::Server{<:NitroStreamHandler}, conn::HTTP.TCP.Conn) =
     (false, HTTP._ServerPrefaceConn(UInt8[], conn))
 
+# The stream handler `serve` hands HTTP.jl, built around an assembled pipeline, outermost last:
+# Nitro's `stream_handler` (or a custom `handler`), the per-request spawn when `parallel`, the
+# header-deadline clear, and the `NitroStreamHandler` wrapper that gives it a secret-safe `show`.
+# Returns `(listener, request_handler)`: what HTTP.jl calls on the connection task, and the
+# handler the spawn runs on the request's own task.
+#
+# One function for `serve` AND the precompile workload (#450), so the types the workload compiles
+# are the types `serve` builds. HTTP.jl specializes its connection loop on the listener's type,
+# and every closure here is typed by what it captures, so a hand-copied chain that differs in one
+# layer caches code no server ever runs. test/precompilation_test.jl asserts the two agree.
+function _serve_listener(pipeline::Function, handler, body_limit::Int64, request_limit::Int64,
+                         upgraded_limit::Int64, security_headers, parallel::Bool)
+    request_handler = handler === stream_handler ?
+        stream_handler(pipeline; max_body_bytes = body_limit,
+                       max_concurrent_requests = request_limit,
+                       max_upgraded_connections = upgraded_limit,
+                       rejection_headers = security_headers === nothing ? Pair{String,String}[] :
+                                                                         security_headers.headers) :
+        handler(pipeline)
+    spawned = parallel ? parallel_stream_handler(request_handler) : request_handler
+    # Outside the parallel spawn, so the header deadline is cleared on the connection task the
+    # moment the head is parsed (#316; see `header_deadline_handler`, src/core/transport.jl).
+    return NitroStreamHandler(header_deadline_handler(spawned)), request_handler
+end
+
+# `_serve_listener` for an `App` served with every default `serve` has: no middleware, the access
+# log on, Nitro's own stream handler, the default body cap, no request or WebSocket cap, no
+# security headers, parallel. The shape the precompile workload warms (#450); a change to one of
+# `serve`'s defaults that alters a type here makes test/precompilation_test.jl fail rather than
+# leaving the workload silently caching the old shape.
+_default_serve_listener(ctx::App) =
+    _serve_listener(setupmiddleware(ctx; middleware = [], serialize = true, catch_errors = true,
+                                    show_errors = true, access_log = true,
+                                    access_log_query = false, access_log_skip = nothing,
+                                    security_headers = nothing),
+                    stream_handler, DEFAULT_MAX_BODY_BYTES, zero(Int64), zero(Int64), nothing, true)
+
 # Documented on the public `Nitro.serve` (src/methods.jl), which is the binding users call and
 # the one `docs/` renders. A docstring here is a second copy Documenter counts as missing (#186).
 function serve(ctx::App;
@@ -384,13 +421,6 @@ function serve(ctx::App;
 
     configured_middelware = setupmiddleware(ctx; middleware, serialize, catch_errors, show_errors, access_log, access_log_query, access_log_skip,
                                             security_headers)
-    handle_stream = handler === stream_handler ?
-        stream_handler(configured_middelware; max_body_bytes = body_limit,
-                       max_concurrent_requests = request_limit,
-                       max_upgraded_connections = upgraded_limit,
-                       rejection_headers = security_headers === nothing ? Pair{String,String}[] :
-                                                                         security_headers.headers) :
-        handler(configured_middelware)
 
     # No warning for running on one thread (#149): single-threaded is a valid deployment, not a
     # misconfiguration, and the banner already reports the thread count. `preprocesskwargs` drops
@@ -399,18 +429,10 @@ function serve(ctx::App;
         @warn "Deprecated: serve() ignores `queuesize`; remove the argument."
     end
 
-    if parallel
-        handle_stream = parallel_stream_handler(handle_stream)
-    end
-
-    # Outside the parallel spawn, so the header deadline is cleared on the connection task the
-    # moment the head is parsed (#316; see `header_deadline_handler`, src/core/transport.jl).
-    handle_stream = header_deadline_handler(handle_stream)
-
-    # Wrap last, so the handler HTTP stores gets our secret-safe `show` (see NitroStreamHandler).
-    # A new, once-assigned name because the `start` closure below captures it: capturing
-    # `handle_stream`, assigned up to three times above, boxed it (#364).
-    listener = NitroStreamHandler(handle_stream)
+    # Once-assigned, because the `start` closure below captures it: a name reassigned before
+    # capture is boxed (#364).
+    listener = first(_serve_listener(configured_middelware, handler, body_limit, request_limit,
+                                     upgraded_limit, security_headers, parallel))
 
     if revise == :eager
         # Never overwrite a live watcher: its handle is the only way to stop it (#427). `close`

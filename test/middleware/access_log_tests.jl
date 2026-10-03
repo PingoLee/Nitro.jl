@@ -640,3 +640,36 @@ end
 end
 
 end # @testitem
+
+# #443: the console line's timestamp no longer goes through `Dates.format` (~6.7 µs a request),
+# but it must still print exactly what that call printed -- the line is parsed by whatever reads
+# the logs.
+@testitem "Console access log timestamp matches Dates.format (#443)" tags=[:middleware] setup=[NitroCommon] begin
+using Dates
+using Random
+using Nitro
+using HTTP
+
+fmt(t) = Dates.format(t, "yyyy-mm-ddTHH:MM:SS")
+edges = [DateTime(0, 1, 1), DateTime(1, 1, 1), DateTime(999, 12, 31, 23, 59, 59),
+         DateTime(1000, 1, 1), DateTime(2026, 10, 3, 9, 5, 7), DateTime(2026, 12, 31, 23, 59, 59, 999),
+         DateTime(9999, 12, 31, 23, 59, 59), DateTime(10000, 1, 1), DateTime(-1, 6, 15, 12)]
+for t in edges
+    @test Nitro.Core._iso_seconds(t) == fmt(t)
+end
+# A spread of ordinary instants, from `RandomDevice` because `@testset` reseeds the default RNG.
+rng = Random.RandomDevice()
+lo, hi = Dates.value(DateTime(1970)), Dates.value(DateTime(2100))
+for _ in 1:2000
+    t = DateTime(Dates.UTM(rand(rng, lo:hi)))
+    @test Nitro.Core._iso_seconds(t) == fmt(t)
+end
+
+# And through the layer: the line still opens with that timestamp.
+logger = Test.TestLogger()
+Base.CoreLogging.with_logger(logger) do
+    Nitro.Core.AccessLogMiddleware()(req -> HTTP.Response(200))(HTTP.Request("GET", "/x"))
+end
+@test occursin(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d - nothing - \"GET /x\" 200$",
+               string(only(logger.logs).message))
+end
