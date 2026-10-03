@@ -2,6 +2,7 @@
 using OpenSSL
 using SHA
 using Base64
+using Random
 
 @testset "NitroCryptoExt Tests" begin
 
@@ -278,6 +279,32 @@ using Base64
 
         @test decrypted_null == payload_null
         @test contains(decrypted_null, "\0")
+    end
+
+    @testset "libcrypto HMAC-SHA256 matches SHA.jl byte for byte (#449)" begin
+        # `_hmac_sha256` signs and verifies every JWT and CSRF token. It moved from
+        # `SHA.hmac_sha256` to libcrypto's one-shot `HMAC`; hold it to SHA.jl over every key
+        # length that matters -- empty, inside the 64-byte block, exactly one block, and longer
+        # (hashed first) -- and messages from empty up, as raw bytes including NUL and non-UTF-8.
+        hmac = Nitro.Crypto._hmac_sha256
+        rng = Random.RandomDevice()
+        reference(key, message) = SHA.hmac_sha256(Vector{UInt8}(codeunits(key)), Vector{UInt8}(codeunits(message)))
+        mismatches = Tuple{Int, Int}[]
+        for key_length in vcat(0:3, 31:33, 63:65, 127:129, 200), message_length in (0, 1, 55, 64, 65, 300)
+            key = String(rand(rng, UInt8, key_length))
+            message = String(rand(rng, UInt8, message_length))
+            hmac(key, message) == reference(key, message) || push!(mismatches, (key_length, message_length))
+        end
+        @test mismatches == Tuple{Int, Int}[]
+        # RFC 4231 test case 2, independent of both implementations.
+        @test bytes2hex(hmac("Jefe", "what do ya want for nothing?")) ==
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        # A view MACs exactly its own bytes, and any other string type its UTF-8 bytes.
+        @test hmac("k", SubString("xxpayloadyy", 3, 9)) == reference("k", "payload")
+        @test hmac(Test.GenericString("k"), Test.GenericString("payload")) == reference("k", "payload")
+        # The result is the 32-byte MAC and nothing else on the heap.
+        hmac("k", "payload")
+        @test (@allocated hmac("k", "payload")) < 256
     end
 
 end

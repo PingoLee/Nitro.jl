@@ -1,12 +1,11 @@
 module CSRFMiddleware_
 
 using HTTP
-using SHA
 
 using ...Types: CookieConfig, Nullable
 using ...Cookies: get_cookie, set_cookie!
 import ...Cookies
-using ...Crypto: secure_random_bytes, _empty_hmac_key, SecretString, reveal, base64url_encode
+using ...Crypto: secure_random_bytes, _empty_hmac_key, _hmac_sha256, SecretString, reveal, base64url_encode
 using ...Errors: is_unrecoverable
 using ...Res: json
 using ...Core: own_response_headers, getjson, getform
@@ -36,8 +35,7 @@ const DEFAULT_COOKIE_NAME = "__Host-csrf_token"
 function _csrf_signature(secret::String, token::AbstractString, binding::AbstractString)
     token_string = String(token)
     message = string(ncodeunits(token_string), ':', token_string, String(binding))
-    signature = SHA.hmac_sha256(Vector{UInt8}(codeunits(secret)), Vector{UInt8}(codeunits(message)))
-    return base64url_encode(signature)
+    return base64url_encode(_hmac_sha256(secret, message))
 end
 
 # Compare two strings without an early-exit, so attackers can't recover the

@@ -305,20 +305,20 @@ end
     @test_throws Nitro.Auth.AuthError Nitro.Auth.decode_jwt("W10.W10.x", secret; verify=false)
 
     # -- The rest of the same class: the DECODERS are sinks too, and run before the
-    # `isa AbstractDict` guards above. `base64decode` throws ArgumentError on a bad alphabet
-    # or an unpaddable length, `JSON.parse` on anything that is not JSON. Guarding only the
-    # parsed value left the class half closed, and length-dependently so -- which is exactly
-    # what makes a partial fix read as complete.
+    # `isa AbstractDict` guards above. `base64url_decode` throws ArgumentError on a bad
+    # alphabet or an impossible length, `JSON.parse` on anything that is not JSON. Guarding
+    # only the parsed value left the class half closed, and length-dependently so -- which is
+    # exactly what makes a partial fix read as complete.
     raw64(str) = replace(replace(replace(Base64.base64encode(Vector{UInt8}(codeunits(str))), '+' => '-'), '/' => '_'), '=' => "")
     good_claims = b64json(payload)
     good_header = b64json(Dict("alg" => "HS256", "typ" => "JWT"))
-    # Note which sink each case actually reaches -- `base64decode("!!!!")` and
-    # `base64decode("")` do NOT throw, they return bytes that then fail to parse, so four
-    # of these five land on `JSON.parse`. Only an UNPADDABLE length reaches base64decode's
-    # own throw, which is why "header unpaddable" is here and not folded into the first row.
+    # Note which sink each case actually reaches. When these rows were written, the stdlib
+    # `base64decode` returned bytes for "!!!!" and "", so only an unpaddable length reached
+    # the decoder's own throw. Since #321 the strict `base64url_decode` refuses a bad
+    # alphabet too; "" still decodes, to nothing, and fails in `JSON.parse`.
     malformed = [
-        ("header unpaddable",     string("x", ".", good_claims, ".x")),      # -> base64decode
-        ("header bad alphabet",   string("!!!!", ".", good_claims, ".x")),   # -> JSON.parse
+        ("header unpaddable",     string("x", ".", good_claims, ".x")),      # -> base64url_decode
+        ("header bad alphabet",   string("!!!!", ".", good_claims, ".x")),   # -> base64url_decode
         ("header not JSON",       string(raw64("foo"), ".", good_claims, ".x")),
         ("header truncated JSON", string(raw64("{\"alg\":"), ".", good_claims, ".x")),
         ("header empty",          string("", ".", good_claims, ".x")),
@@ -473,6 +473,87 @@ end
     @test sprint(showerror, caught(() -> Nitro.Auth.decode_jwt(padded_head, secret))) == "Invalid JWT encoding"
 end
 
+@testset "the single-pass base64url codec agrees with the stdlib (#432)" begin
+    # Both directions used to be built on stdlib `Base64`; they are now one pass each. Hold
+    # them to a reference that still IS the stdlib: for decode, the translate-and-pad decoder
+    # this replaced, kept here verbatim; for encode, `base64encode` with the alphabet swapped
+    # and the padding dropped. Same bytes on success, same message on refusal.
+    function reference_decode(data::AbstractString)
+        units = codeunits(data)
+        count = length(units)
+        remainder = mod(count, 4)
+        remainder == 1 && throw(ArgumentError("not base64url: impossible length"))
+        standard = Vector{UInt8}(undef, remainder == 0 ? count : count + 4 - remainder)
+        last_value = 0x00
+        for (index, byte) in enumerate(units)
+            last_value, translated = if UInt8('A') <= byte <= UInt8('Z')
+                byte - UInt8('A'), byte
+            elseif UInt8('a') <= byte <= UInt8('z')
+                byte - UInt8('a') + 0x1a, byte
+            elseif UInt8('0') <= byte <= UInt8('9')
+                byte - UInt8('0') + 0x34, byte
+            elseif byte == UInt8('-')
+                0x3e, UInt8('+')
+            elseif byte == UInt8('_')
+                0x3f, UInt8('/')
+            else
+                throw(ArgumentError("not base64url"))
+            end
+            standard[index] = translated
+        end
+        discarded = remainder == 2 ? 0x0f : remainder == 3 ? 0x03 : 0x00
+        last_value & discarded == 0x00 || throw(ArgumentError("not canonical base64url"))
+        for index in (count + 1):length(standard)
+            standard[index] = UInt8('=')
+        end
+        return Base64.base64decode(standard)
+    end
+    reference_encode(bytes) = replace(Base64.base64encode(bytes), '+' => '-', '/' => '_', '=' => "")
+    outcome(f, s) = try; f(s); catch err; err isa ArgumentError ? err.msg : rethrow(); end
+
+    encode = Nitro.Crypto.base64url_encode
+    decode = Nitro.Crypto.base64url_decode
+    rng = Random.RandomDevice()
+    url = collect("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
+    junk = collect("=+/ \t\n.!\0é€")
+
+    encode_mismatches = Int[]
+    decode_mismatches = String[]
+    for _ in 1:2_000
+        # Round trips at every length class, past several whole groups.
+        bytes = rand(rng, UInt8, rand(rng, 0:300))
+        encoded = encode(bytes)
+        (encoded == reference_encode(bytes) && decode(encoded) == bytes) || push!(encode_mismatches, length(bytes))
+        # Random alphabet strings: most tails are non-canonical, and 1 in 4 lengths impossible.
+        s = String(rand(rng, url, rand(rng, 0:40)))
+        outcome(decode, s) == outcome(reference_decode, s) || push!(decode_mismatches, s)
+        # A SubString takes the same path as a String.
+        outcome(decode, SubString(s, 1)) == outcome(reference_decode, s) || push!(decode_mismatches, s)
+        # One byte outside the alphabet, anywhere: padding, the standard alphabet, whitespace,
+        # NUL, and multi-byte UTF-8.
+        chars = rand(rng, url, rand(rng, 1:40))
+        chars[rand(rng, eachindex(chars))] = rand(rng, junk)
+        t = String(chars)
+        outcome(decode, t) == outcome(reference_decode, t) || push!(decode_mismatches, t)
+    end
+    @test encode_mismatches == Int[]
+    @test decode_mismatches == String[]
+
+    # Every string type decodes as its UTF-8 bytes, not as its own code units.
+    @test decode(Test.GenericString("Zm8")) == decode("Zm8") == b"fo"
+    # The encoder takes any byte vector, a view included.
+    @test encode(view(b"foobar", 2:5)) == reference_encode(b"ooba")
+
+    # The point of #432: a JWT-claims-sized segment is the output buffer and little else.
+    # It was ~2.3 KB and 23 allocations through the stdlib pipe.
+    segment = encode(rand(rng, UInt8, 88))
+    decode(segment)
+    encode(rand(rng, UInt8, 88))
+    bytes = rand(rng, UInt8, 88)
+    @test (@allocated decode(segment)) < 512
+    @test (@allocated encode(bytes)) < 512
+end
+
 @testset "a critical header extension is refused (#321)" begin
     caught(f) = try; f(); nothing; catch err; err; end
     secret = jwtkey("secret-a")
@@ -497,6 +578,61 @@ end
         # Offline inspection still parses it, as it does an unsupported `alg`.
         @test (crit, Nitro.Auth.decode_jwt(tok, secret; verify = false)["sub"]) == (crit, "42")
     end
+end
+
+@testset "the JWT hot path: strict header, viewed signing input, bounded allocations (#449)" begin
+    caught(f) = try; f(); nothing; catch err; err; end
+    secret = jwtkey("secret-a")
+    raw64(str) = Nitro.Crypto.base64url_encode(codeunits(str))
+    sign(input) = string(input, ".", Nitro.Crypto.base64url_encode(Nitro.Auth._hmac_sha256(secret, input)))
+    claims64 = raw64(JSON.json(Dict("sub" => "42", "exp" => NOW_TS + 3600)))
+
+    # RFC 7515 §5.2: the header must be a COMPLETELY valid JSON object, including the members
+    # Nitro never reads. #449 tried parsing it into a struct of the three it does read, which
+    # skips the rest unvalidated -- every one of these then parsed. Each is validly signed,
+    # so the refusal is the parser's and nothing else's.
+    for header in ("""{"alg":"HS256","typ":"J\\WT"}""",
+                   """{"alg":"HS256","x":"\\u035"}""",
+                   """{"alg":"HS256","x":[1,}""",
+                   """{"alg":"HS256","x":"tab\there"}""")
+        tok = sign(string(raw64(header), ".", claims64))
+        @test (header, sprint(showerror, caught(() -> Nitro.Auth.decode_jwt(tok, secret)))) ==
+            (header, "Invalid JWT encoding")
+        @test (header, sprint(showerror, caught(() -> Nitro.Auth.decode_jwt(tok, secret; verify = false)))) ==
+            (header, "Invalid JWT encoding")
+    end
+
+    # The signature is checked over a VIEW of the token's own prefix rather than a rebuilt
+    # `header.claims` string. A claims segment ending in a multi-byte character puts the
+    # view's last byte mid-character; it must still end on a character boundary and reach
+    # the signature check, not throw a StringIndexError on the way.
+    good = Nitro.Auth.encode_jwt(Dict("sub" => "42"), secret; expires_in = 3600)
+    head, body, sig = split(good, '.')
+    for tail in ("é", "€", "𝄞")
+        forged = string(head, ".", body, tail, ".", sig)
+        err = caught(() -> Nitro.Auth.decode_jwt(forged, secret))
+        @test (tail, err isa Nitro.Auth.AuthError) == (tail, true)
+        @test (tail, sprint(showerror, err)) == (tail, "Invalid JWT signature")
+        # A forgery fails the MAC whatever bytes the view covers, so the case above only
+        # catches an exception. This one is SIGNED over the non-ASCII tail: a view that
+        # stopped short of the last character would MAC different bytes and say "Invalid
+        # JWT signature". Covering exactly the signed bytes, it passes the MAC and is refused
+        # by the claims decode instead.
+        signed_tail = sign(string(head, ".", body, tail))
+        @test (tail, sprint(showerror, caught(() -> Nitro.Auth.decode_jwt(signed_tail, secret)))) ==
+            (tail, "Invalid JWT encoding")
+    end
+    # An empty claims segment makes the view just `header.`. Its signature verifies -- so the
+    # refusal is the empty claims JSON, after the MAC, not "Invalid JWT signature".
+    empty_claims = caught(() -> Nitro.Auth.decode_jwt(sign(string(head, ".")), secret))
+    @test sprint(showerror, empty_claims) == "Invalid JWT encoding"
+
+    # The validator a bearer request runs, held to #449's byte target. It was ~11.7 KB and 176
+    # allocations per token before #432/#449, and ~2.5 KB / 58 after them.
+    validator = Nitro.Auth.jwt_validator(secret)
+    validator(good)
+    validator(good)
+    @test (@allocated validator(good)) < 4_096
 end
 
 # A `dicttype` whose constructor throws: it runs inside `_jwt_segment_json`'s `try`, which is
