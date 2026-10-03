@@ -6,7 +6,7 @@ using Dates: Dates
 using UUIDs: UUID
 using ..Util
 using ...Errors: is_unrecoverable, ValidationError
-using ...Constants: REQUEST_MAX_FIELDS
+using ...Constants: request_max_fields
 
 export text, binary, json, formdata, multipart, FormFile
 
@@ -501,12 +501,12 @@ end
     _check_field_count(s, source) -> nothing
 
 Throw a `ValidationError` if the `&`-separated string `s` (a query string or an urlencoded form
-body) holds more non-empty fields than the cap in force, `REQUEST_MAX_FIELDS` (#327). Counted
+body) holds more non-empty fields than the cap in force, `request_max_fields()` (#327). Counted
 before the fields are parsed into a `Dict`, whose string hashing a client choosing its own keys
 can collide. Stops counting at the first field past the cap.
 """
 function _check_field_count(s::AbstractString, source::String)
-    cap = Int(REQUEST_MAX_FIELDS[])
+    cap = request_max_fields()
     cap > 0 || return nothing
     n = 0
     for field in eachsplit(s, '&')
@@ -518,7 +518,7 @@ function _check_field_count(s::AbstractString, source::String)
 end
 
 """
-    _parse_json_bounded(buf, T = Any; max_fields = REQUEST_MAX_FIELDS[], kwargs...)
+    _parse_json_bounded(buf, T = Any; max_fields = request_max_fields(), kwargs...)
 
 `JSON.parse(buf, T; kwargs...)` after `_check_json_depth`. The one way Nitro parses JSON
 that came from a request -- body, query string, path segment, cookie, or JWT segment -- so the
@@ -530,7 +530,7 @@ The same pass caps the document's object keys at `max_fields` -- the request's
 The `HTTP.Response` parsers pass `0`: a response is not client input.
 """
 function _parse_json_bounded(buf::Union{AbstractVector{UInt8}, AbstractString}, ::Type{T} = Any;
-                             max_fields::Integer = REQUEST_MAX_FIELDS[], kwargs...) where {T}
+                             max_fields::Integer = request_max_fields(), kwargs...) where {T}
     _check_json_depth(buf, Int(max_fields))
     return JSON.parse(buf, T; kwargs...)
 end
@@ -764,7 +764,7 @@ function multipart(req::HTTP.Request) :: Dict{String, Union{FormFile, Vector{For
     end
 
     # The part list is a plain vector; the hash tables below are what the cap protects (#327).
-    cap = Int(REQUEST_MAX_FIELDS[])
+    cap = request_max_fields()
     cap > 0 && length(parts) > cap && _throw_too_many_fields("The multipart body", cap)
 
     # Collect files and text into separate, homogeneously-typed buckets. This

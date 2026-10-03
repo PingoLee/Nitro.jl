@@ -734,8 +734,8 @@ end
 # The app whose cookie config the argument-less helpers use: the one SERVING this request, and
 # the global app only outside any request (#308). They used to read `CONTEXT[]` always, so an app
 # built with an explicit `App` silently wrote plaintext and trusted raw client values -- its key
-# lived on the serving app. See `Nitro.Core.SERVING_APP` (src/core/pipeline.jl).
-_cookie_app() = something(Nitro.Core.SERVING_APP[], CONTEXT[])
+# lived on the serving app. See `Nitro.Core.serving_app` (src/core/pipeline.jl).
+_cookie_app() = something(Nitro.Core.serving_app(), CONTEXT[])
 
 """
     get_cookie(req::Nitro.Request, name::String, default::Any=nothing; kwargs...)

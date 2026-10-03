@@ -134,3 +134,62 @@ end
 terminate()
 
 end
+@testitem "request scope binds the serving app and its field cap, once (#444)" tags=[:core] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+using Base.ScopedValues: ScopedValue, @with
+using Nitro.Core: serving_app, _app_context_seed
+using Nitro.Core.Constants: REQUEST_SCOPE, RequestScope, request_max_fields, DEFAULT_MAX_FIELDS
+
+app = App(mod = @__MODULE__)
+app.service.max_fields[] = 7
+seen = Ref{Any}(nothing)
+urlpatterns(app, "",
+    path("/scope", function(req)
+        # A spawned task inherits the scope, which is what makes it `Threads.@spawn`-safe.
+        seen[] = fetch(Threads.@spawn (serving_app(), request_max_fields()))
+        return "ok"
+    end, method = "GET"),
+)
+
+@testset "inside a request: the serving app and ITS cap" begin
+    @test internalrequest(app, HTTP.Request("GET", "/scope")).status == 200
+    @test seen[][1] === app
+    @test seen[][2] == 7
+end
+
+@testset "outside a request: no app, the default cap" begin
+    @test serving_app() === nothing
+    @test request_max_fields() == DEFAULT_MAX_FIELDS
+end
+
+@testset "a cap set after the pipeline is built is still seen" begin
+    # `serve` writes `max_fields` once at startup; the scope shares the app's cell, not a copy.
+    pipeline = _app_context_seed(app)((req::HTTP.Request) -> request_max_fields())
+    app.service.max_fields[] = 11
+    @test pipeline(HTTP.Request("GET", "/")) == 11
+end
+
+# The seed layer binds ONE prebuilt heap object per request (#444). Measured against the cheapest
+# possible binding -- one `@with` of a prebuilt `RequestScope` -- rather than a constant, so the
+# bound tracks the Julia version's `PersistentDict` cost. A second `ScopedValue`, or a value that is
+# boxed on insert, makes the seed layer strictly more expensive than the reference.
+const REF_SCOPE = ScopedValue{RequestScope}(RequestScope(nothing, Ref{Int64}(0)))
+const REF_VALUE = RequestScope(nothing, Ref{Int64}(0))
+reference(req::HTTP.Request) = @with REF_SCOPE => REF_VALUE nothing
+
+function allocs_per_call(f, n)
+    # The app context is pre-seeded so the layer's one-off `req.context` insert is not measured.
+    reqs = [HTTP.Request("GET", "/") for _ in 1:n]
+    foreach(r -> r.context[Nitro.Core.REQUEST_CONTEXT_KEY] = nothing, reqs)
+    f(reqs[1])
+    return @allocations(foreach(f, reqs)) / n
+end
+
+@testset "one scope insert per request, nothing boxed" begin
+    seed = _app_context_seed(app)((req::HTTP.Request) -> nothing)
+    allocs_per_call(reference, 10); allocs_per_call(seed, 10)
+    @test allocs_per_call(seed, 1000) <= allocs_per_call(reference, 1000) + 0.5
+end
+end
