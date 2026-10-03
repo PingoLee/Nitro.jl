@@ -1104,7 +1104,7 @@ function stream_handler(middleware::Function; max_body_bytes::Int64 = DEFAULT_MA
                     # Skipping the drain is equivalent for every buffered body — those writes were
                     # already being discarded — and the `finally` below still releases a streaming one,
                     # which is what lets an SSE producer notice and unwind. The response head is
-                    # unaffected: the server loop's `closewrite` calls `startwrite` regardless.
+                    # unaffected: the `closewrite` below calls `startwrite` regardless.
                     #
                     # Deliberately narrow: `HEAD` only, keyed on the request method. Status-based
                     # suppression (204/304) is the same class of hazard, but `Res.sse` cannot produce
@@ -1128,16 +1128,33 @@ function stream_handler(middleware::Function; max_body_bytes::Int64 = DEFAULT_MA
                         _write_response_body!(stream, resp.body)
                     end
                 end
-                # Put the response on the wire while the slot is still held (#298). On HTTP/1.1 an
-                # in-memory fixed-length response is buffered whole and only reaches the socket here
-                # (a streamed one was written live and already closed, #377); left to
-                # HTTP's loop, this ran after the slot was released, with the buffered response — and
-                # the request body `resp.request` pins — still live. `closewrite` is idempotent (HTTP
-                # returns at once when writes are already closed), so the loop's own call is then a
-                # no-op, and its errors are classified exactly as before: this runs inside the same
-                # `try` in HTTP's loop that the handler does. Only when a slot is held — without a cap,
-                # HTTP's loop keeps doing this exactly as it always has.
-                adm !== nothing && (@atomic adm.held) && HTTP.closewrite(stream)
+                # Put the response on the wire HERE, on the request's own task, on every path that
+                # reached the middleware chain (#453). (The 413/503 refusals above return before it
+                # and are still written by HTTP's loop: rare, and cheap.)
+                # On HTTP/1.1 an in-memory fixed-length response is buffered whole and reaches the
+                # socket only at `closewrite`: that call serializes the head and makes the write
+                # syscall. Left to HTTP's loop, it runs on the CONNECTION task after this returns,
+                # and HTTP.jl 2.x runs every connection task on the `:interactive` pool, which
+                # `julia -t N` sizes at one thread. So every response the server sent was written by
+                # that one thread, whatever the request's own work had been spread across: in one
+                # interleaved run on a loaded box, ~30k rps `/plaintext` against ~58k for bare
+                # HTTP.jl (~72k on the quiet box #448 measured), whose `streamhandler` adapter calls
+                # `closewrite` inside the handler and so on the spawned task (bench/socket/,
+                # `-t 8`, pinned cores). Calling it here closed most of that gap.
+                #
+                # It also keeps the slot invariant (#298): under `max_concurrent_requests` the
+                # buffered response — and the request body `resp.request` pins — reaches the socket
+                # while the slot is still held, not after the `finally` below has released it. (A
+                # streamed body was written live and already closed, #377.)
+                #
+                # Nothing about the response changes, only which task writes it. `closewrite` is
+                # idempotent (HTTP returns at once when writes are already closed), so the loop's
+                # own call is then a no-op; and its errors are classified exactly as before, since an
+                # exception from here reaches the same `catch` in HTTP's loop the handler's does —
+                # through `parallel_stream_handler`'s unwrap when the request was spawned. `closeread`
+                # stays with HTTP's loop: it moved no measurable throughput, and an upgraded
+                # connection's read side is not this layer's to close.
+                HTTP.closewrite(stream)
             finally
                 # Idempotent, and a no-op for the buffered bodies that are the overwhelming majority.
                 # `_write_response_body!` has usually already done this — releasing as soon as the body
