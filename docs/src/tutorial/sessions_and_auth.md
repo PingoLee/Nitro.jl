@@ -690,6 +690,16 @@ The token is URL-safe base64 (`A-Z a-z 0-9 - _`), so it is safe to interpolate i
 A client that already holds a valid token gets the same one back, and its cookie is re-sent, so
 the cookie's lifetime (`ttl`, seven days by default) starts again from the page that embeds it.
 
+"The same one" means the same token under a **different mask**: `csrf_token!` returns a new
+string on every call, and every one of them verifies. That is what keeps the token safe in a page
+your proxy compresses. A compressed response that carries a fixed secret next to input the
+attacker controls, such as a search term echoed into the page, leaks the secret through its
+length, one byte at a time. This is the BREACH attack, and the proxy setups in
+[the reverse-proxy guide](reverse_proxy.md) do compress. A value that changes on every response
+leaves nothing to leak ([#436](https://github.com/PingoLee/Nitro.jl/issues/436)). It is the same
+one-time-pad mask Django, Rails and Spring Security 6 use. So never compare two tokens with `==`:
+they are equal only through the middleware.
+
 A handler that rotates the session (a login does) must call `csrf_token!` **after**
 `regenerate_session!`. Rotation retires the client's existing token, as Django's `rotate_token`
 does: a token taken before the rotation is replaced in the cookie, and the copy in the page stops
@@ -733,7 +743,9 @@ expire before its session. If you raise your session lifetimes, raise `ttl` with
 retry on `403` is what makes the app correct, so keep it either way.
 
 The cookie is readable by JavaScript, so an app can instead read the token from `document.cookie`
-before each mutation. The raw token is the part before the first `.`.
+before each mutation. The raw token is the part before the first `.`, and the middleware accepts
+it as well as the masked one. Masking is about response *bodies*: the cookie is never in one, so
+echoing its raw token in a request header reopens nothing.
 
 ### Placement and binding
 

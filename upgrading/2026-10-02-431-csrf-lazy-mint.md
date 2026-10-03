@@ -26,10 +26,10 @@ A token is now issued only when the client will use it:
 | New visitor whose session the request writes to or rotates | token issued | token issued (unchanged) |
 | Refused unsafe request from a client echoing its own stale token | fresh token with the `403` | unchanged |
 
-`csrf_token!(req)` is new and exported from `Nitro`. It returns the raw token (the value the
-client echoes in `X-CSRF-Token` or `_csrf`), and the middleware sets the matching cookie on the
-response. A client that already holds a valid token gets that one back, with its cookie re-sent
-so its `ttl` starts again. A handler that rotates the session must call it **after**
+`csrf_token!(req)` is new and exported from `Nitro`. It returns the token (the value the client
+echoes in `X-CSRF-Token` or `_csrf`; masked per call since #436), and the middleware sets the
+matching cookie on the response. A client that already holds a valid token gets that one back,
+with its cookie re-sent so its `ttl` starts again. A handler that rotates the session must call it **after**
 `regenerate_session!`: rotation retires the client's earlier token, as it always did. Because it runs inside
 the handler, a server-rendered form can now embed the token on the **first** visit. Before, the
 token was minted only after the handler had returned, so `req.context[:csrf_token]` was `nothing`

@@ -240,8 +240,11 @@ CSRFMiddleware(secret::Union{AbstractString, SecretString};  # needs SessionMidd
 # session is saved anyway (it already existed, or the request wrote to / rotated it). A
 # cookieless request nobody asked a token for creates no token and no session.
 
-csrf_token!(req) -> String   # the raw token to embed (hidden `_csrf` field, JSON for an SPA);
-                             # the middleware sets (or refreshes) the matching cookie. Call it
+csrf_token!(req) -> String   # the token to embed (hidden `_csrf` field, JSON for an SPA),
+                             # MASKED: a new string every call, all of them valid (#436, BREACH).
+                             # The cookie's raw half is accepted too. req.context[:csrf_token]
+                             # is masked as well; issue_csrf_token! returns a masked token.
+                             # The middleware sets (or refreshes) the matching cookie. Call it
                              # AFTER regenerate_session!: rotation retires the earlier token.
                              # ArgumentError outside CSRFMiddleware or with no session.
 

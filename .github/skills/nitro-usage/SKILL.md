@@ -306,7 +306,9 @@ unbound fallback.
 renders the form, so a `CSRFMiddleware` scoped to a `method="POST"` route never issues one and
 refuses every request it sees. Scope guards per route; scope CSRF per app. Global placement costs no
 session per request (#431). A new visitor gets a token only when a handler calls
-**`csrf_token!(req)`**, which returns the raw token for a hidden `_csrf` field or a JSON body. A
+**`csrf_token!(req)`**, which returns the token for a hidden `_csrf` field or a JSON body, masked
+afresh on every call (BREACH, #436): never compare two tokens with `==`. The raw token in the
+cookie (before the first `.`) is accepted too, for an SPA that reads `document.cookie`. A
 visitor whose session is saved anyway (it already exists, or the request wrote to or rotated it)
 gets one unasked. An SPA shell (`spafiles`, or the proxy) runs no handler, so give the app a
 `GET /api/csrf` endpoint returning `csrf_token!(req)`. The app fetches it at boot, after login
