@@ -14,7 +14,8 @@ Whenever you write code, write tests, or propose architecture for this repositor
 
 ## 2. Concurrency: Go-Inspired
 - **Always multithreaded**: `serve()` runs in parallel mode by default using `Threads.@spawn`.
-- **Handling I/O vs CPU**: All endpoints run via `Threads.@spawn`. Do not add heavy OS-level multi-processing (`Distributed` or multi-process clustering) unless explicitly requested. Julia's thread pool is sufficient.
+- **Handling I/O vs CPU**: All endpoints run via `Threads.@spawn`. Do not add heavy OS-level multi-processing (`Distributed` or multi-process clustering) unless explicitly requested. Threads scale I/O-bound handlers, but Julia tasks are cooperative: a CPU-bound handler holds its thread until it finishes.
+- **Task model**: where code runs, background tasks, interrupts and cancellation are in [`concurrency.instructions.md`](concurrency.instructions.md).
 - **No `serveparallel()`**: This function is deprecated. Do not use or suggest it.
 
 ## 3. Routing: Django-Style ONLY
