@@ -273,6 +273,7 @@ and editing `src/core.jl` without reading it risks a silent, suite-wide regressi
 | Config & bootstrap | [`nitro-config.instructions.md`](nitro-config.instructions.md) | App config or `serve()` design |
 | Documentation | [`nitro-docs.instructions.md`](nitro-docs.instructions.md) | `docs/**/*.md` edits |
 | Workers + PormG ext | [`workers.instructions.md`](workers.instructions.md) | `src/Workers/`, `ext/`, worker tests |
+| Concurrency & task model | [`concurrency.instructions.md`](concurrency.instructions.md) | Spawning, parking or stopping a task; background loops; interrupts; work on HTTP.jl's connection task |
 
 ## Skills
 
