@@ -318,6 +318,12 @@ expires `ttl` seconds after the last `csrf_token!` (seven days by default, the s
 rotates the session calls `csrf_token!` **after** `regenerate_session!`, because a rotation retires the client's earlier token. `csrf_token!` throws
 `ArgumentError` outside `CSRFMiddleware` or without a session.
 
+**Bearer-only requests skip the token check (#438)**: `Authorization: Bearer <token>` (any case)
+**and no `Cookie` header at all**. A browser never attaches that header cross-site, so with no
+cookie there is nothing to forge, and a bearer API can share the global pipeline with a cookie UI.
+Any cookie, even an unrelated one, keeps the check on. CSRF does not authenticate the token;
+`BearerAuth` still must. Opt out with `CSRFMiddleware(secret; exempt_bearer = false)`.
+
 The cookie is `__Host-csrf_token` by default, so a sibling subdomain cannot overwrite it. Browsers
 accept that prefix only on a `Secure`, `Path=/`, `Domain`-less cookie, and `CSRFMiddleware` throws
 an `ArgumentError` at construction rather than let the browser discard the cookie silently. For

@@ -232,13 +232,17 @@ CSRFMiddleware(secret::Union{AbstractString, SecretString};  # needs SessionMidd
                form_field  = "_csrf",
                ttl::Int    = 604800,                # 7 days = SessionMiddleware absolute_max_age (#441)
                config      = CookieConfig(httponly=false, secure=true,
-                                          samesite="Lax", path="/", maxage=ttl))
+                                          samesite="Lax", path="/", maxage=ttl),
+               exempt_bearer::Bool = true)          # #438: see below
 # Tokens are HMAC'd over (raw_token | req.context[:session_id]). No session id => no token
 # issued and 403 on every unsafe method. Throws ArgumentError if a __Host-/__Secure- name is
 # paired with a config browsers would reject.
 # Lazy (#431): a token is issued only when a handler calls csrf_token!(req), or when the
 # session is saved anyway (it already existed, or the request wrote to / rotated it). A
 # cookieless request nobody asked a token for creates no token and no session.
+# exempt_bearer (#438): an unsafe request with `Authorization: Bearer <token>` (scheme in any
+# case, one token68) and NO Cookie header at all skips the token check -- nothing ambient to
+# forge. Any cookie keeps the check on. It does not validate the token; BearerAuth does.
 
 csrf_token!(req) -> String   # the token to embed (hidden `_csrf` field, JSON for an SPA),
                              # MASKED: a new string every call, all of them valid (#436, BREACH).

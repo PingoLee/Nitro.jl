@@ -608,6 +608,11 @@ into `getuser(req)` are covered in [Sessions & Auth](sessions_and_auth.md).
 `set_auth_cookie!` / `clear_auth_cookie!` and `CSRFMiddleware` for cookie-authenticated
 browsers: see [Sessions & Auth](sessions_and_auth.md) and [Cookies](cookies/basics.md).
 
+CSRF is a cookie problem. A request that carries `Authorization: Bearer …` and no cookie at all
+skips `CSRFMiddleware`'s token check, so a bearer API can share a global pipeline with a
+cookie-authenticated UI. Any cookie on the request turns the check back on. See *Bearer-token API
+clients* in [Sessions & Auth](sessions_and_auth.md).
+
 ## 9. Passwords
 
 Password hashing (PBKDF2, BCrypt, Spring/Django-compatible encoders, validation and

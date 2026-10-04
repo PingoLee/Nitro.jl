@@ -747,6 +747,43 @@ before each mutation. The raw token is the part before the first `.`, and the mi
 it as well as the masked one. Masking is about response *bodies*: the cookie is never in one, so
 echoing its raw token in a request header reopens nothing.
 
+### Bearer-token API clients
+
+An app often serves a browser UI with a session cookie and an API with bearer tokens from the
+same pipeline. The API's clients have no CSRF token and no use for one, so `CSRFMiddleware`
+lets an unsafe request through without one when **both** of these hold
+([#438](https://github.com/PingoLee/Nitro.jl/issues/438)):
+
+- it carries `Authorization: Bearer <token>` (the scheme in any case), and
+- it carries **no `Cookie` header at all**.
+
+CSRF exists because a browser attaches cookies to a cross-site request on its own. It never adds
+an `Authorization` header that way: a page on another origin can set one only with `fetch`, after
+a CORS preflight your `Cors` middleware would have to allow. A request with a bearer header and
+no cookie therefore has nothing a forger could borrow. Django REST Framework draws the same line:
+its token and JWT authentication skip CSRF, and only `SessionAuthentication` enforces it.
+
+The middleware does not check the bearer token. It only decides whether a token check is needed;
+`BearerAuth` or your handler still has to authenticate the request.
+
+The reasoning assumes a request's authority comes from a credential. A route authorized by
+**network position** instead, such as an intranet-only endpoint or an IP allow-list, is the
+exception: if your `Cors` lets an untrusted origin send `Authorization` (it must be listed by name;
+`allowed_headers = ["*"]` does not cover it), a page in a victim's browser can reach that route
+from inside their network. Use `exempt_bearer = false` there.
+
+**Any cookie keeps the check on**, even one `CSRFMiddleware` knows nothing about, such as a load
+balancer's affinity cookie. The middleware cannot see your session or auth cookie names, and a
+request with both a bearer header and a session cookie is exactly what a page that won a
+permissive CORS policy could send. An API client that also carries cookies must send a token, or
+go through routes without the session and CSRF layers.
+
+To check bearer-only requests anyway, opt out:
+
+```julia
+CSRFMiddleware(csrf_secret; exempt_bearer = false)
+```
+
 ### Placement and binding
 
 **`SessionMiddleware` must sit outside `CSRFMiddleware`.** The token's signature covers the
