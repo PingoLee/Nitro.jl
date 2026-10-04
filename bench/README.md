@@ -51,6 +51,13 @@ header (git SHA, Julia version, thread count, CPU model — no hostname or paths
   measures the `Threads.@spawn` + inner `@async` pattern standalone rather than through a real request.
 - These are single-node micro-benchmarks, not a load test — they measure per-call cost and allocations,
   not sustained throughput under concurrency.
+- `httpparse/*` is the one group that does **not** go through Nitro at all: it is HTTP.jl's
+  `read_request` on a buffered request head — the work the server does on its connection task,
+  on the `:interactive` thread, before Nitro's per-request spawn (#462). `connreader_*` is the
+  server's `_ConnReader` path, `iobuffer_*` the generic `IO` path for contrast. It opens one
+  loopback TCP pair at include time (the reader type needs a real connection) and never reads
+  from it; the head sits in the reader's buffer. `HTTP._ConnReader`'s layout is internal and
+  pinned to HTTP 2.8.0, so a `[compat]` bump that breaks this file is doing its job.
 - `ratelimiter/*_contended` is the exception to that last point: it fans 64 tasks over **distinct**
   client keys and measures wall time for the batch, so it does reflect lock contention. Run it with
   `--threads=4` or more, or it measures nothing. Two sibling groups are deliberately different
@@ -75,6 +82,7 @@ bench/socket/run.sh                                  # nitro, bare_spawn, bare_n
 bench/socket/run.sh "nitro bare_spawn" 3 5s          # modes, runs, duration
 ACCESS_LOG=1 bench/socket/run.sh nitro               # the serve() default access log on
 PROFILE=10 bench/socket/run.sh nitro 1 20s           # sample every thread for 10 s under load
+bench/socket/run.sh "nitro@8,1 nitro@8,2 nitro@8,4"  # one mode per --threads, interleaved (#462)
 ```
 
 - `server.jl` serves `/plaintext`, `/json` and `/health` in one of three `MODE`s: `nitro`
@@ -85,7 +93,14 @@ PROFILE=10 bench/socket/run.sh nitro 1 20s           # sample every thread for 1
   route, and reports the median, min and max of N runs plus the median p99. The default CPU sets
   assume a 6-core part whose SMT siblings are `n` and `n+6`; set `SERVER_CPUS`/`CLIENT_CPUS` for
   another layout. Results go to `results/socket-<stamp>.tsv`, profiles to
-  `results/profile-<mode>-<time>-{flat,threads}.txt`.
+  `results/profile-<mode>-<time>-{flat,threads,interactive-tree}.txt` — the last is a call tree
+  of the `:interactive` threads only, which is where HTTP.jl accepts, parses every request head
+  and wakes the per-request task (#462).
+- `mode@threads` (`nitro@8,2`) starts that one server with its own `--threads` and records it in
+  the TSV's `threads` column, so a sweep of the interactive thread count is one interleaved run
+  rather than one run per count. `-t 8` is `8,1` on Julia 1.12; note that `8,2` and `8,4` put more
+  OS threads on the 8 pinned logical CPUs than `8,1` does — hold the total constant (`6,2`, `4,4`)
+  as a control if the sweep moves.
 - `first_request.sh [route] [repeats]` times the first request to a fresh server against a warm
   one (#450). It waits for the listening socket with `ss` rather than a request, so nothing warms
   the path first. Set `ACCESS_LOG=1` to measure `serve`'s default shape, which is the one the

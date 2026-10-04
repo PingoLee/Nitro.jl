@@ -13,8 +13,11 @@
 #
 #   PORT=8080           Loopback port.
 #   ACCESS_LOG=0|1      Nitro only: `serve(access_log = …)`. Default 0.
-#   PROFILE=<seconds>   After WARMUP seconds, sample every thread for this long and write flat and
-#                       per-thread reports under bench/results/. 0 (the default) disables it.
+#   PROFILE=<seconds>   After WARMUP seconds, sample every thread for this long and write three
+#                       reports under bench/results/: `-flat` (all threads), `-threads` (flat,
+#                       grouped by thread) and `-interactive-tree` (a call tree of the
+#                       `:interactive` threads only -- where HTTP.jl accepts, parses every request
+#                       head and wakes the per-request task, #462). 0 (the default) disables it.
 #   WARMUP=<seconds>    Delay before the profile window opens. Default 8.
 #   PRELOAD="Pkg ..."   Load these packages before serving, so `rss.sh` can measure what one adds
 #                       to the process (PRELOAD=PormG also loads NitroPormGExt). The project
@@ -90,6 +93,16 @@ PROFILE_S > 0 && @eval function profile_window()
     open("$stem-threads.txt", "w") do io
         Profile.print(IOContext(io, :displaysize => (10_000, 400)); format = :flat,
                       sortedby = :count, groupby = :thread, mincount = 20)
+    end
+    # The interactive thread(s) alone, as a tree: HTTP.jl's accept loop and every connection task
+    # run there, so this is where `read_request`, Nitro's `_clear_header_deadline!` and the
+    # `@spawn` wake-up show up against each other (#462). Selected by pool, not by id, so it stays
+    # right if the numbering ever changes.
+    interactive = filter(i -> Threads.threadpool(i) == :interactive, 1:Threads.maxthreadid())
+    open("$stem-interactive-tree.txt", "w") do io
+        println(io, "interactive thread ids: ", interactive)
+        Profile.print(IOContext(io, :displaysize => (10_000, 400)); format = :tree,
+                      threads = interactive, mincount = 20, maxdepth = 60)
     end
     @info "bench: profile written" stem
 end

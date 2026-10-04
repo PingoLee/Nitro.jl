@@ -19,7 +19,8 @@ BenchmarkTools.DEFAULT_PARAMETERS.seconds = SECONDS
 include(joinpath(BENCH_DIR, "setup.jl"))
 
 const SUITE = BenchmarkGroup()
-for f in ["routing.jl", "params.jl", "query.jl", "json.jl", "session.jl", "ratelimiter.jl", "taskpattern.jl"]
+for f in ["routing.jl", "params.jl", "query.jl", "json.jl", "session.jl", "ratelimiter.jl", "taskpattern.jl",
+          "httpparse.jl"]
     include(joinpath(BENCH_DIR, "suite", f))
 end
 
