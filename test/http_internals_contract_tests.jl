@@ -35,7 +35,9 @@ import Sockets
 #   • src/response.jl — `Res._new_response` (#446) builds every `Res` and `format_response`
 #       response through `HTTP.Response`'s positional FIELD constructor, skipping the keyword
 #       form's header normalize-and-copy. It depends on the field order and on storing what
-#       the keyword form stores for a `String`/`Vector{UInt8}` body.
+#       the keyword form stores for a `String`/`Vector{UInt8}` body. `_rebuild_with_headers`
+#       in src/utilities/misc.jl (#447) uses the same constructor for every header-adding
+#       middleware layer, carrying each field over by position.
 #   • src/context.jl — `_shutdown_server`'s bounded drain: it depends on `close(::Server)`
 #       releasing the listener BEFORE its unbounded quiesce loop, and escalates to
 #       `HTTP.forceclose`.

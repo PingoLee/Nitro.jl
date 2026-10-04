@@ -431,27 +431,45 @@ Return a new response carrying `resp`'s status and body plus the `extra` header 
 without mutating `resp`. See [`own_response_headers`](@ref) for why in-place header
 mutation of a returned response is unsafe, and for the full set of fields preserved.
 """
-add_response_headers(resp::HTTP.Response, extra) = _rebuild_with_headers(resp, vcat(resp.headers, extra))
+add_response_headers(resp::HTTP.Response, extra::Pair{<:AbstractString,<:AbstractString}) =
+    _rebuild_with_headers(resp, _appended(resp.headers, (extra,)))
+add_response_headers(resp::HTTP.Response, extra::AbstractVector{<:Pair{<:AbstractString,<:AbstractString}}) =
+    _rebuild_with_headers(resp, _appended(resp.headers, extra))
+# Anything else -- tuples, vector-valued pairs, an untyped vector -- keeps HTTP's general
+# normalization, which is what every call went through before #447.
+add_response_headers(resp::HTTP.Response, extra) =
+    _rebuild_with_headers(resp, HTTP.Headers(vcat(resp.headers, extra)))
 
-# Rebuild `resp` with a fresh `headers` vector while preserving every other field.
-# The two-argument `HTTP.Response(status, headers, body)` constructor resets `reason`,
-# `trailers`, HTTP version, `close`, and the client-side redirect fields to their
-# defaults; the server reads `close`/version to decide connection teardown, so they
-# must survive header-adding middleware. `body` (an `AbstractBody`) is shared by
-# reference. See `own_response_headers`.
-_rebuild_with_headers(resp::HTTP.Response, headers) = HTTP.Response(
-    resp.status, resp.body;
-    reason          = resp.reason,
-    headers         = headers,
-    trailers        = resp.trailers,
-    content_length  = resp.content_length,
-    proto_major     = resp.proto_major,
-    proto_minor     = resp.proto_minor,
-    close           = resp.close,
-    request         = resp.request,
-    request_url     = resp.request_url,
-    previous        = resp.previous,
-    redirect_count  = resp.redirect_count,
+# `resp.headers` then `extra`, through `appendheader`: adjacent duplicate names fold into `a,b`
+# and `Set-Cookie` never does. That is exactly what `HTTP.Headers(vcat(resp.headers, extra))`
+# produces, minus the intermediate vector and the keyword constructor's second copy (#447).
+function _appended(headers::HTTP.Headers, extra)
+    out = HTTP.Headers(length(headers) + length(extra))
+    for header in headers
+        HTTP.appendheader(out, header)
+    end
+    for header in extra
+        HTTP.appendheader(out, header)
+    end
+    return out
+end
+
+# Rebuild `resp` around a `headers` collection the caller owns, carrying every other field over
+# as-is. The keyword constructors reset `reason`, `trailers`, HTTP version, `close` and the
+# client-side redirect fields unless each is passed back in; the server reads `close`/version to
+# decide connection teardown, so they must survive header-adding middleware. `body` is shared by
+# reference (see `own_response_headers`); `trailers` is copied, so the new response owns every
+# mutable collection it holds. `content_length` is carried as stored too: the keyword form
+# re-derived a negative one from the body, which no constructor produces for a sized body, so
+# only a handler that wrote `-1` into a built response would see a difference.
+#
+# This is `Res._new_response`'s field constructor (#446), not the keyword form: that form ran
+# `copy(mkheaders(...))` on both header collections, so each middleware layer built four of them
+# per request (#447). The field order is pinned in `test/http_internals_contract_tests.jl`.
+_rebuild_with_headers(resp::HTTP.Response{B}, headers::HTTP.Headers) where {B} = HTTP.Response{B}(
+    resp.status, resp.reason, headers, copy(resp.trailers), resp.body, resp.content_length,
+    resp.proto_major, resp.proto_minor, resp.close, resp.request, resp.request_url,
+    resp.previous, resp.redirect_count,
 )
 
 # A response carrying one visitor's credential cookie must never be stored by a SHARED cache
