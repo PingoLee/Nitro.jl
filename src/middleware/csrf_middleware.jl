@@ -10,7 +10,7 @@ using ...Crypto: secure_random_bytes, _empty_hmac_key, _hmac_sha256, SecretStrin
 using ...Errors: is_unrecoverable
 using ...Res: json
 using ...Core: own_response_headers, getjson, getform, header_name_isequal
-using ...Util: _mark_private!, _ows_strip, _ascii_lower_eq
+using ...Util: _mark_private!, _auth_credential
 
 export CSRFMiddleware, csrf_token!, issue_csrf_token!, validate_csrf_token
 
@@ -217,7 +217,7 @@ policy can send. Failing closed on it costs an API client that also carries, say
 balancer's affinity cookie a token; failing open would cost the session.
 
 Header values are bytes, possibly malformed UTF-8, so this trims and case-folds without
-consulting the Unicode tables (`_ows_strip`, `_ascii_lower_eq`).
+consulting the Unicode tables (`_auth_credential`).
 """
 function _bearer_only(req::HTTP.Request)::Bool
     bearer = false
@@ -233,16 +233,14 @@ function _bearer_only(req::HTTP.Request)::Bool
     return bearer
 end
 
-# `Bearer <token68>` (RFC 6750 §2.1): one scheme, one token. A token68 holds no whitespace and no
-# comma, which also refuses two ADJACENT `Authorization` lines: HTTP.jl folds those into one value
-# joined with `,` (`HTTP.appendheader`). Non-adjacent lines stay separate; `_bearer_only` checks each.
+# `Bearer <token68>` (RFC 6750 §2.1): one scheme, one token. The scheme and separator are
+# `_auth_credential`'s, the parser `BearerAuth` uses too (#470). A token68 holds no whitespace
+# and no comma, which also refuses two ADJACENT `Authorization` lines: HTTP.jl folds those into
+# one value joined with `,` (`HTTP.appendheader`). Non-adjacent lines stay separate;
+# `_bearer_only` checks each.
 function _is_bearer_credential(value::AbstractString)::Bool
-    credential = _ows_strip(value)
-    gap = findfirst(c -> c == ' ' || c == '\t', credential)
-    gap === nothing && return false
-    _ascii_lower_eq(SubString(credential, 1, prevind(credential, gap)), "bearer") || return false
-    token = _ows_strip(SubString(credential, gap))
-    return !isempty(token) && !any(c -> c == ' ' || c == '\t' || c == ',', token)
+    token = _auth_credential(value, "bearer")
+    return token !== nothing && !any(c -> c == ' ' || c == '\t' || c == ',', token)
 end
 
 _validate_cookie_prefix(cookie_name::AbstractString, config::CookieConfig) =

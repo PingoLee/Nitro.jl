@@ -13,7 +13,7 @@ validate_token(token) = token == good_token ? Dict(:id => 1, :name => "TestUser"
     mw = BearerAuth(validate_token)
     handler = mw(req->HTTP.Response(200, "ok"))
 
-    # Case A: header == "Bearer " (exactly the scheme + single space) -> header_len == scheme_prefix_len -> invalid
+    # Case A: header == "Bearer " (exactly the scheme + single space) -> nothing follows the scheme -> invalid
     reqA = HTTP.Request("GET", "/")
     HTTP.setheader(reqA, "Authorization" => "Bearer ")
     resA = handler(reqA)
@@ -435,6 +435,76 @@ handler2 = BearerAuth(t -> t == "tok" ? Dict("sub" => "u") : nothing; scheme = "
 # `extract_auth_token` had the same character/byte mix-up (latent for an ASCII scheme).
 req = HTTP.Request("GET", "/", ["Authorization" => "Tökén ключ"])
 @test Nitro.Auth.extract_auth_token(req; scheme = "Tökén", cookie_name = nothing) == "ключ"
+end
+
+@testitem "Auth middleware — the auth scheme is case-insensitive (#470)" tags=[:middleware, :auth, :security] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+
+# RFC 9110 §11.1: the auth-scheme is a case-insensitive token. Both readers used
+# `startswith(header, "Bearer ")`, so `bearer x` was a 401 -- while `CSRFMiddleware` (#438)
+# already read it as a bearer credential. All three now share one parser.
+seen = String[]
+validator(token) = (push!(seen, token); token == "x" ? Dict("sub" => "u") : nothing)
+handler = BearerAuth(validator)(req -> HTTP.Response(200, "ok"))
+call(value) = handler(HTTP.Request("GET", "/", ["Authorization" => value]))
+extract(value) = Nitro.Auth.extract_auth_token(HTTP.Request("GET", "/", ["Authorization" => value]))
+
+@testset "any case, SP or HTAB" begin
+    for value in ("bearer x", "BEARER x", "bEaReR x", "Bearer\tx", "BEARER\tx", "bearer \t x",
+                  "Bearer   x", "  bearer x  ")
+        @test call(value).status == 200
+        @test extract(value) == "x"
+    end
+end
+
+@testset "still refused" begin
+    for value in ("Bearerx", "bearerx", "Basic x", "Bearer", "bearer", "Bearer   ", "Bear x",
+                  "Bearers x", "Bearer\0 x", "")
+        @test call(value).status == 401
+        @test extract(value) === nothing
+    end
+end
+
+@testset "only ASCII letters fold" begin
+    # `K` (U+212A KELVIN SIGN) lowercases to `k` under Unicode rules; it must not spell a scheme.
+    kh = BearerAuth(t -> t == "x" ? "u" : nothing; scheme = "Key")(req -> HTTP.Response(200, "ok"))
+    @test kh(HTTP.Request("GET", "/", ["Authorization" => "Key x"])).status == 401
+    @test kh(HTTP.Request("GET", "/", ["Authorization" => "KEY x"])).status == 200
+    # A configured non-ASCII scheme matches its own bytes exactly, case-folding only the ASCII.
+    th = BearerAuth(t -> t == "x" ? "u" : nothing; scheme = "Tökén")(req -> HTTP.Response(200, "ok"))
+    @test th(HTTP.Request("GET", "/", ["Authorization" => "TöKéN x"])).status == 200
+    @test th(HTTP.Request("GET", "/", ["Authorization" => "TÖkén x"])).status == 401
+end
+
+@testset "malformed UTF-8 is a 401 or the validator's call, never a 500" begin
+    empty!(seen)
+    @test call("\xffearer x").status == 401          # a malformed scheme byte
+    @test call("bearer\xff x").status == 401
+    @test extract("\xffearer x") === nothing
+    @test call("bearer \xff").status == 401          # a malformed token reaches the validator whole
+    @test call("BEARER x\xff").status == 401
+    @test seen == ["\xff", "x\xff"]
+    @test extract("bearer \xff") == "\xff"
+end
+
+# Both layers on one route, through the request path: a lowercase bearer POST skips the CSRF
+# check AND authenticates. Before #470 it skipped the check and was then refused.
+@testset "CSRFMiddleware and BearerAuth agree" begin
+    app = App(mod = @__MODULE__)
+    urlpatterns(app, "",
+        path("/api", req -> "user = $(getuser(req)["sub"])"; method = "POST",
+             middleware = [CSRFMiddleware(repeat("k", 64)), BearerAuth(validator)]))
+    post(value) = internalrequest(app, HTTP.Request("POST", "/api", ["Authorization" => value]))
+    for value in ("Bearer x", "bearer x", "BEARER\tx")
+        res = post(value)
+        @test res.status == 200
+        @test text(res) == "user = u"
+    end
+    @test post("Bearer wrong").status == 401         # CSRF skipped, the token still checked
+    @test post("Basic x").status == 403              # not bearer: the CSRF check stays on
+end
 end
 
 @testitem "extract_auth_token reads a cookie only when told to (#321)" tags=[:middleware, :auth, :security] setup=[NitroCommon] begin
