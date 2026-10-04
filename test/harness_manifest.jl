@@ -118,6 +118,7 @@ const TEST_FILES = [
 
     # ── Quality Gate ──────────────────────────────────────────────────────────
     "closure_boxing_tests.jl",
+    "zz_repro_473_loop_tests.jl",   # THROWAWAY -- repro/473-loop only
     "aqua_tests.jl",
 ]
 
