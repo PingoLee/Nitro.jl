@@ -152,6 +152,24 @@ end
     @test length(ctx.service.route_lifecycle) == 1
 end
 
+@testset "group middleware: one instance across a group, nested too, registers once (#439)" begin
+    # `include_routes(...; middleware)` copies the group's list into every route's list, so the
+    # dedup above is what keeps a group's `SessionMiddleware` to one janitor. Pin it for the
+    # group shape, a nested group, and the same instance at both levels.
+    lf, _, _, _ = counting_lifecycle()
+    inner_lf, _, _, _ = counting_lifecycle()
+    ctx = App()
+    ok = (req::HTTP.Request) -> Res.send("ok")
+    inner = Nitro.include_routes("/in", [path("/a", ok), path("/b", ok)]; middleware = [inner_lf, lf])
+    outer = Nitro.include_routes("/g", vcat([path("/c", ok), path("/d", ok; middleware = [lf])], inner);
+                                 middleware = [lf])
+    Nitro.Core.Routing.urlpatterns(ctx, "", outer)
+    @test length(ctx.service.route_lifecycle) == 2
+    @test lf in ctx.service.route_lifecycle
+    @test inner_lf in ctx.service.route_lifecycle
+    @test isempty(ctx.service.serve_lifecycle)
+end
+
 @testset "route ownership wins over serve ownership (#82)" begin
     # A single object handed both to a route and to `serve(middleware = ...)` must start
     # ONCE per cycle, not twice — and it must land on the half that survives `terminate`.

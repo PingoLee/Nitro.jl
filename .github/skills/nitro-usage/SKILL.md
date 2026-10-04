@@ -72,7 +72,13 @@ routes = [
 urlpatterns("", routes)                  # register at the root — the prefix argument is REQUIRED
 urlpatterns("/api", api_routes)          # or under a prefix
 include_routes("v2/", v2_routes)         # compose a sub-router into a route vector
+include_routes("/api", api_routes; middleware=[BearerAuth(validator)])   # group middleware (#439)
 ```
+
+**Middleware order: global (`serve`) → group (`include_routes(...; middleware)`, outer group
+first) → route (`path(...; middleware)`) → handler**, each list top-down. Group layers are shared
+instances (one `SessionMiddleware` = one store, one janitor). They never run on a 404/405, so
+rate limiting, `ExtractIP` and access logging stay global.
 
 There is **no single-argument `urlpatterns(routes)`** — the prefix comes first, `""` for root.
 Registration is a separate step from starting the server: declare routes, call `urlpatterns(...)`,
@@ -302,9 +308,12 @@ cannot be replayed for another. With no session id present the gate **fails clos
 issued and every unsafe request gets `403`, with a warning naming the ordering rule — there is no
 unbound fallback.
 
-**Put `CSRFMiddleware` in the global pipeline, not on a route.** Tokens are issued to the page that
-renders the form, so a `CSRFMiddleware` scoped to a `method="POST"` route never issues one and
-refuses every request it sees. Scope guards per route; scope CSRF per app. Global placement costs no
+**Put `CSRFMiddleware` in the global pipeline, or on a group — never on a single route.** Tokens
+are issued to the page that renders the form, so a `CSRFMiddleware` scoped to a `method="POST"`
+route never issues one and refuses every request it sees. Scope guards per route; scope CSRF per
+app, or per browser **group** (#439): `include_routes("", browser_routes; middleware =
+[SessionMiddleware(...), CSRFMiddleware(secret)])`, with every form page and the `/api/csrf`
+token endpoint inside the group, keeps a bearer API out of sessions and CSRF entirely. Global placement costs no
 session per request (#431). A new visitor gets a token only when a handler calls
 **`csrf_token!(req)`**, which returns the token for a hidden `_csrf` field or a JSON body, masked
 afresh on every call (BREACH, #436): never compare two tokens with `==`. The raw token in the

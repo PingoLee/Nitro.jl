@@ -784,6 +784,30 @@ To check bearer-only requests anyway, opt out:
 CSRFMiddleware(csrf_secret; exempt_bearer = false)
 ```
 
+#### Or keep the API out of the session altogether
+
+The exemption lets one global pipeline serve both clients. The structural alternative is to put
+`SessionMiddleware` and `CSRFMiddleware` on the browser routes only, as **group middleware**
+([#439](https://github.com/PingoLee/Nitro.jl/issues/439)):
+
+```julia
+browser = include_routes("", [
+    path("/login", login_form, method="GET"),
+    path("/login", AuthHandlers.login, method="POST"),
+    path("/api/csrf", csrf, method="GET"),          # the SPA's token endpoint is a browser route
+]; middleware=[SessionMiddleware(store=store), CSRFMiddleware(csrf_secret)])
+
+api = include_routes("/api/v1", api_routes; middleware=[BearerAuth(validator)])
+
+urlpatterns("", vcat(browser, api))
+```
+
+The API then never touches the session store, cookies or not. **Every route that renders a form
+or hands out a token has to be in the browser group**: a token comes from the same
+`CSRFMiddleware` that checks it. Group middleware also skips requests that match no route, which
+is harmless here, since a `404` has no form to protect. See
+[Group middleware](bigger_applications.md#Group-middleware).
+
 ### Placement and binding
 
 **`SessionMiddleware` must sit outside `CSRFMiddleware`.** The token's signature covers the

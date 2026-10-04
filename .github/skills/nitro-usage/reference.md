@@ -22,8 +22,10 @@ path(pattern::String, handler::Function;
 ```julia
 urlpatterns(prefix::String, routes...)                 # prefix is REQUIRED — "" for root
 urlpatterns(prefix::String, routes::Vector{RouteDefinition})
-include_routes(prefix::String, routes::Vector{RouteDefinition})
-include_routes(prefix::String, routes::RouteDefinition...)
+include_routes(prefix::String, routes::Vector{RouteDefinition}; middleware = nothing)
+include_routes(prefix::String, routes::RouteDefinition...;       middleware = nothing)
+# middleware (#439): the group's list, prepended to each route's own. global -> group (outer
+# first) -> route -> handler. Shared instances; never runs on a 404/405.
 url(name::String; kwargs...)                           # reverse lookup by route name
 ```
 

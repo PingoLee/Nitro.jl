@@ -95,7 +95,8 @@ Path converters: `<int:name>`, `<str:name>`, `<float:name>`, `<bool:name>`, `<uu
 A `"GET"` route also answers `HEAD` through the same handler and middleware, unless a `HEAD` route
 is registered explicitly for the same path. That route wins whatever the registration order.
 
-`middleware` runs top-down in list order, after global and router middleware, so authenticate
+`middleware` runs top-down in list order, after global middleware and the middleware of any
+[`include_routes`](@ref) group the route is in, so authenticate
 before you authorize: `middleware = [BearerAuth(validator), GuardMiddleware(login_required())]`.
 """
 function path(pattern::String, handler::Function; 
@@ -128,22 +129,58 @@ end
 # ─── include_routes() — Modular route inclusion ──────────────────────
 
 """
-    include_routes(prefix, routes) -> Vector{RouteDefinition}
+    include_routes(prefix, routes; middleware = nothing) -> Vector{RouteDefinition}
 
 Prepend a sub-prefix to each route for modular URL inclusion.
+
+`middleware` is the group's own list (#439). It runs on every route in the group, ahead of the
+route's own `middleware`, so a request meets `serve`'s global list, then the group's, then the
+route's, each top-down:
+
+```julia
+browser = include_routes("", [
+    path("/login", login_form, method = "GET"),
+    path("/login", login, method = "POST"),
+]; middleware = [SessionMiddleware(store = store), CSRFMiddleware(secret)])
+
+api = include_routes("/api", [
+    path("/products", list_products, method = "GET"),
+]; middleware = [BearerAuth(validator)])
+
+urlpatterns(app, "", vcat(browser, api))
+```
+
+Groups nest: an outer `include_routes` puts its list ahead of the inner one's. Every route shares
+the same middleware *instances*, so one `SessionMiddleware` keeps one store and one janitor, and
+is registered with `serve`'s lifecycle once.
+
+Group middleware runs only on a request that matched one of the group's routes. A `404` or `405`
+never reaches it, so keep layers that must see every request, such as rate limiting or access
+logging, in `serve(middleware = ...)`.
 """
-function include_routes(prefix::String, routes::Vector{RouteDefinition})
+function include_routes(prefix::String, routes::Vector{RouteDefinition};
+                        middleware::Nullable{Vector} = nothing)
     return [
         RouteDefinition(
             join_url_path(prefix, r.pattern),
-            r.handler, r.methods, r.name, r.middleware, r.type_hints
+            r.handler, r.methods, r.name, _group_middleware(middleware, r.middleware), r.type_hints
         )
         for r in routes
     ]
 end
 
-function include_routes(prefix::String, routes::RouteDefinition...)
-    return include_routes(prefix, collect(routes))
+function include_routes(prefix::String, routes::RouteDefinition...;
+                        middleware::Nullable{Vector} = nothing)
+    return include_routes(prefix, collect(routes); middleware)
+end
+
+# The group's layers ahead of the route's own. An empty group leaves the route's list exactly as it
+# was, `nothing` included: `register_route` publishes nothing for a route with no layers, which
+# keeps `compose`'s app-wide no-middleware fast path alive. A fresh vector per route, so no two
+# routes share a list one of them could mutate -- the middleware INSTANCES are shared on purpose.
+function _group_middleware(group::Nullable{Vector}, own::Nullable{Vector})::Nullable{Vector}
+    (group === nothing || isempty(group)) && return own
+    return own === nothing ? collect(Any, group) : vcat(collect(Any, group), own)
 end
 
 

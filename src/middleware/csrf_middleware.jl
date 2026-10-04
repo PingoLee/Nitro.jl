@@ -532,7 +532,9 @@ for it to borrow. One pipeline can therefore serve a browser UI and a bearer-tok
 
 Any cookie keeps the check on, including one this middleware does not recognise: a request with
 both a bearer header and a cookie still needs a token. Pass `exempt_bearer = false` to check
-bearer-only requests too.
+bearer-only requests too. Putting the session and CSRF layers on the browser routes alone, with
+`include_routes(...; middleware = [...])`, is the other way to keep an API out of the check
+(#439).
 
 # When a token is issued
 

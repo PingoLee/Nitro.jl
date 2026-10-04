@@ -205,16 +205,18 @@ middleware. Global middleware runs before every route, regardless of which handl
 
 ## Middleware layers
 
-Nitro supports middleware at two levels: **global** (via `serve()`) and
-**route-level** (via the `middleware=` keyword on `path()`).
+Nitro supports middleware at three levels: **global** (via `serve()`), **group** (via the
+`middleware=` keyword on `include_routes()`), and **route-level** (via the `middleware=` keyword
+on `path()`).
 
 Execution order is always:
 
 ```
-global middleware → route middleware → handler
+global middleware → group middleware (outer group first) → route middleware → handler
 ```
 
-The route is chosen between the first two. A middleware that rewrites the method or the path
+Each list runs top-down, in the order written. The route is chosen between the global list and
+the rest. A middleware that rewrites the method or the path
 (`X-HTTP-Method-Override`, a legacy alias) therefore belongs in the global list, where the
 rewritten request still gets its new route's guards. See
 [Rewriting the method or the target](extension_points.md#Rewriting-the-method-or-the-target).
@@ -244,6 +246,51 @@ const routes = [
          middleware=[GuardMiddleware(login_required(), role_required("admin"))]),
 ]
 ```
+
+### Group middleware
+
+`include_routes` can give a whole group of routes the same middleware
+([#439](https://github.com/PingoLee/Nitro.jl/issues/439)). It runs on every route in the group,
+ahead of each route's own list. The common use is an app that serves a browser UI and a
+bearer-token API: sessions and CSRF belong on the browser routes only.
+
+```julia
+browser = include_routes("", [
+    path("/login", AuthHandlers.login_form, method="GET"),
+    path("/login", AuthHandlers.login, method="POST"),
+    path("/account", AccountHandlers.show, method="GET",
+         middleware=[GuardMiddleware(login_required())]),
+]; middleware=[SessionMiddleware(store=store), CSRFMiddleware(csrf_secret)])
+
+api = include_routes("/api", [
+    path("/products", ProductHandlers.list_products, method="GET"),
+    path("/products", ProductHandlers.create_product, method="POST"),
+]; middleware=[BearerAuth(validator)])
+
+urlpatterns("", vcat(browser, api))
+```
+
+A `POST /login` meets `SessionMiddleware`, then `CSRFMiddleware`, then its handler. `GET /account`
+meets the same two, then its own `GuardMiddleware`. A `POST /api/products` never meets the
+session or the CSRF check.
+
+Groups nest. An `include_routes` around another puts its own list first:
+
+```julia
+admin = include_routes("/admin", admin_routes; middleware=[GuardMiddleware(role_required("admin"))])
+api   = include_routes("/api", vcat(public_routes, admin); middleware=[BearerAuth(validator)])
+# GET /api/admin/users: BearerAuth → the admin guard → the route's own list → handler
+```
+
+Every route in a group shares the same middleware **instances**. One `SessionMiddleware` keeps
+one store, and its prune janitor starts once when `serve()` starts. Do not list the same layer at
+two levels, such as globally and in a group: the lifecycle is registered once, but the layer
+itself runs once per list it appears in, on every request.
+
+Group middleware runs only on a request that matched one of the group's routes. A request that
+matches nothing (404), or matches a path but not its method (405), never reaches it. Keep layers
+that must see every request, such as rate limiting, access logging or `ExtractIP`, in the global
+list.
 
 ### Per-route middleware and global middleware
 
