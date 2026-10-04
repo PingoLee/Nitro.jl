@@ -747,6 +747,67 @@ before each mutation. The raw token is the part before the first `.`, and the mi
 it as well as the masked one. Masking is about response *bodies*: the cookie is never in one, so
 echoing its raw token in a request header reopens nothing.
 
+### Bearer-token API clients
+
+An app often serves a browser UI with a session cookie and an API with bearer tokens from the
+same pipeline. The API's clients have no CSRF token and no use for one, so `CSRFMiddleware`
+lets an unsafe request through without one when **both** of these hold
+([#438](https://github.com/PingoLee/Nitro.jl/issues/438)):
+
+- it carries `Authorization: Bearer <token>` (the scheme in any case), and
+- it carries **no `Cookie` header at all**.
+
+CSRF exists because a browser attaches cookies to a cross-site request on its own. It never adds
+an `Authorization` header that way: a page on another origin can set one only with `fetch`, after
+a CORS preflight your `Cors` middleware would have to allow. A request with a bearer header and
+no cookie therefore has nothing a forger could borrow. Django REST Framework draws the same line:
+its token and JWT authentication skip CSRF, and only `SessionAuthentication` enforces it.
+
+The middleware does not check the bearer token. It only decides whether a token check is needed;
+`BearerAuth` or your handler still has to authenticate the request.
+
+The reasoning assumes a request's authority comes from a credential. A route authorized by
+**network position** instead, such as an intranet-only endpoint or an IP allow-list, is the
+exception: if your `Cors` lets an untrusted origin send `Authorization` (it must be listed by name;
+`allowed_headers = ["*"]` does not cover it), a page in a victim's browser can reach that route
+from inside their network. Use `exempt_bearer = false` there.
+
+**Any cookie keeps the check on**, even one `CSRFMiddleware` knows nothing about, such as a load
+balancer's affinity cookie. The middleware cannot see your session or auth cookie names, and a
+request with both a bearer header and a session cookie is exactly what a page that won a
+permissive CORS policy could send. An API client that also carries cookies must send a token, or
+go through routes without the session and CSRF layers.
+
+To check bearer-only requests anyway, opt out:
+
+```julia
+CSRFMiddleware(csrf_secret; exempt_bearer = false)
+```
+
+#### Or keep the API out of the session altogether
+
+The exemption lets one global pipeline serve both clients. The structural alternative is to put
+`SessionMiddleware` and `CSRFMiddleware` on the browser routes only, as **group middleware**
+([#439](https://github.com/PingoLee/Nitro.jl/issues/439)):
+
+```julia
+browser = include_routes("", [
+    path("/login", login_form, method="GET"),
+    path("/login", AuthHandlers.login, method="POST"),
+    path("/api/csrf", csrf, method="GET"),          # the SPA's token endpoint is a browser route
+]; middleware=[SessionMiddleware(store=store), CSRFMiddleware(csrf_secret)])
+
+api = include_routes("/api/v1", api_routes; middleware=[BearerAuth(validator)])
+
+urlpatterns("", vcat(browser, api))
+```
+
+The API then never touches the session store, cookies or not. **Every route that renders a form
+or hands out a token has to be in the browser group**: a token comes from the same
+`CSRFMiddleware` that checks it. Group middleware also skips requests that match no route, which
+is harmless here, since a `404` has no form to protect. See
+[Group middleware](bigger_applications.md#Group-middleware).
+
 ### Placement and binding
 
 **`SessionMiddleware` must sit outside `CSRFMiddleware`.** The token's signature covers the
@@ -791,3 +852,43 @@ unsafe request does not carry the CSRF cookie at all, so the request is refused 
 attached. If you opt out of **both** (an unprefixed `cookie_name` *and* `samesite="None"`, which a
 cross-origin SPA needs), an attacker with a cookie-write position on a sibling origin can force a
 victim's CSRF token to rotate — a nuisance rather than a bypass, but weigh it before opting out.
+
+### Tokenless protection: `CrossOriginProtection`
+
+Every current browser sends `Sec-Fetch-Site` on every request to an HTTPS (or localhost) URL, and
+no page can set or remove it. A server that refuses unsafe requests marked `cross-site` therefore
+has CSRF protection without a token, a cookie or a session. [`CrossOriginProtection`](@ref) is that check
+([#437](https://github.com/PingoLee/Nitro.jl/issues/437)), modelled check for check on Go 1.25's
+`net/http.CrossOriginProtection`:
+
+```julia
+serve(middleware=[
+    CrossOriginProtection(trusted_origins=["https://app.example.com"]),
+    SessionMiddleware(store=store),
+])
+```
+
+For an unsafe request it passes:
+
+1. a `Sec-Fetch-Site` of `same-origin` or `none` (a typed URL or a bookmark). `cross-site` and
+   `same-site` are refused with `403`;
+2. with no `Sec-Fetch-Site` (an older browser, or any browser on a plain-HTTP site other than localhost), an `Origin`
+   whose host and port equal the `Host` header;
+3. a request with neither header, which no browser sends, so it carries no cookie a browser
+   attached on its own;
+4. an `Origin` in `trusted_origins`, or a path in `exempt_paths` (a third-party webhook), even when
+   steps 1 and 2 refused it.
+
+Nothing is minted, so there is no token endpoint for a single-page app to call, no hidden field in
+a form, and no `403`-and-retry when a session rotates. The trade is coverage: a browser too old to
+send either header is let through. Go makes the same call, and so does this middleware.
+
+It composes with `CSRFMiddleware`. Use both for defence in depth, or use `CrossOriginProtection`
+alone and drop the tokens. Unlike `CSRFMiddleware`, it does not need a session, so it can sit
+anywhere in the pipeline, including outside `SessionMiddleware`.
+
+`same-site` is refused on purpose: `https://evil.example.com` is same-site with
+`https://shop.example.com`, and a sibling subdomain you do not control is a common attacker
+foothold. List a sibling you trust in `trusted_origins`. Behind a reverse proxy, forward the public
+`Host`; see [Behind a Reverse Proxy](reverse_proxy.md). The design record is
+`docs/design/cross-origin-protection.md`.

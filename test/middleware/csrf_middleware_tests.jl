@@ -1017,4 +1017,90 @@ end
     @test isempty(set_cookie_headers(res))
 end
 
+# ── bearer-only requests (#438) ──────────────────────────────────────────────
+# A global CSRFMiddleware used to answer every bearer API client's POST with 403. A bearer header
+# is never attached cross-site by the browser, so with no cookie there is nothing to forge.
+
+bearer(token = "api-token") = "Authorization" => "Bearer $token"
+
+@testset "_bearer_only: a bearer header and no cookie, nothing else (#438)" begin
+    only_hdrs(hs...) = CSRF._bearer_only(HTTP.Request("POST", "/form", Pair{String,String}[hs...]))
+
+    @test only_hdrs(bearer())
+    @test only_hdrs("Authorization" => "bearer api-token")          # the scheme is case-insensitive
+    @test only_hdrs("authorization" => "BEARER\tapi-token")        # header name, HTAB separator
+    @test only_hdrs("Authorization" => "  Bearer   api-token  ")   # OWS around and inside
+
+    @test !only_hdrs()                                              # no credential at all
+    @test !only_hdrs("Authorization" => "Basic dXNlcjpwYXNz")       # not a bearer scheme
+    @test !only_hdrs("Authorization" => "Bearer")                   # no token
+    @test !only_hdrs("Authorization" => "Bearer    ")               # a blank token
+    @test !only_hdrs("Authorization" => "Bearerapi-token")          # no separator
+    @test !only_hdrs("Authorization" => "Bearer api-token extra")   # not a single token68
+    # Mixed schemes. HTTP.jl folds ADJACENT duplicate lines into one value joined with ","
+    # (no space), so these are also the folded-header cases.
+    @test !only_hdrs(bearer(), "Authorization" => "Basic dXNlcjpwYXNz")
+    @test !only_hdrs("Authorization" => "Bearer api-token, Basic dXNlcjpwYXNz")
+    # Folds to "Bearer a,b": no whitespace anywhere, so only the comma rule refuses it.
+    @test !only_hdrs("Authorization" => "Bearer a", "Authorization" => "b")
+    @test !only_hdrs("Authorization" => "Bearer a,b")
+    # Non-adjacent lines stay separate; each is checked on its own.
+    @test !only_hdrs(bearer(), "X-Other" => "1", "Authorization" => "Basic dXNlcjpwYXNz")
+    # Any cookie keeps the check on, including one CSRF has never heard of.
+    @test !only_hdrs(bearer(), "Cookie" => "lb_affinity=node-3")
+    @test !only_hdrs("Cookie" => "lb_affinity=node-3", bearer())
+    @test !only_hdrs(bearer(), "cookie" => "")
+
+    # Header values are bytes: malformed UTF-8 is an answer, never an InvalidCharError.
+    @test !only_hdrs("Authorization" => "B\xffarer api-token")
+    @test only_hdrs("Authorization" => "Bearer api-\xfftoken")      # an opaque token is not ours to judge
+end
+
+@testset "a bearer-only POST passes without a token, and starts nothing (#438)" begin
+    layer, store = session_layer()
+    res = layer(request("POST"; headers = [bearer()]))
+    @test res.status == 200
+    @test isempty(set_cookie_headers(res))     # no CSRF cookie, no session cookie
+    @test session_count(store) == 0            # and no store write for an API client
+
+    # The same request without the header is still refused.
+    @test layer(request("POST")).status == 403
+end
+
+@testset "a bearer header does not excuse an ambient cookie (#438)" begin
+    store = MemoryStore{String, Dict{String,Any}}()
+    Nitro.Types.set_session!(store, SESSION_A, Dict{String,Any}(); ttl = 3600)
+    layer, _ = session_layer(store = store)
+
+    # The live session cookie a cross-site forger would ride on: checked, and refused.
+    @test layer(request("POST", Dict("unit_session" => SESSION_A); headers = [bearer()])).status == 403
+    # A cookie this layer does not recognise fails closed too.
+    @test layer(request("POST", Dict("lb_affinity" => "node-3"); headers = [bearer()])).status == 403
+
+    # With a cookie, the check runs exactly as before: a valid token still passes.
+    minted = HTTP.Response(200, "ok")
+    masked = issue_csrf_token!(minted, SECRET; binding = SESSION_A)
+    cookies = Dict("unit_session" => SESSION_A,
+                   "__Host-csrf_token" => cookie_value(minted, "__Host-csrf_token"))
+    res = layer(request("POST", cookies; headers = [bearer(), "X-CSRF-Token" => masked]))
+    @test res.status == 200
+end
+
+@testset "exempt_bearer = false checks bearer-only requests (#438)" begin
+    layer, _ = session_layer(csrf_kwargs = (; exempt_bearer = false))
+    @test layer(request("POST"; headers = [bearer()])).status == 403
+    # A non-bearer scheme was never exempt.
+    default_layer, _ = session_layer()
+    @test default_layer(request("POST"; headers = ["Authorization" => "Basic dXNlcjpwYXNz"])).status == 403
+end
+
+@testset "a bearer-only request can still ask for a token (#438)" begin
+    # The exemption skips the check, not the layer: a handler that calls `csrf_token!` gets one.
+    layer, store = session_layer(handler = token_handler)
+    res = layer(request("POST"; headers = [bearer()]))
+    @test res.status == 200
+    @test !isempty(cookie_value(res, "__Host-csrf_token"))
+    @test session_count(store) == 1
+end
+
 end

@@ -7,6 +7,8 @@ using Sockets
 using ...Core: getip, setip!, getpeerip, header_name_isequal
 using ...Types: Nullable, REQUEST_FORWARDED_PROTO_KEY
 using ...Errors: is_unrecoverable
+# Byte-safe header-value helpers: malformed UTF-8 must not turn into a 500 (see their comment).
+using ...Util: _ows_strip, _ascii_lower_eq
 
 export ExtractIP, extract_ip
 
@@ -553,15 +555,6 @@ end
 # `"0.0.0.0/8"` stays a valid entry for the addresses it really covers.
 _is_trusted(policy::_TrustPolicy, v6::Bool, host::UInt128) =
     !iszero(host) && any(p -> p.v6 === v6 && (host & p.mask) == p.net, policy.proxies)
-
-# Header values are BYTES: HTTP.jl passes anything >= 0x80 through unvalidated, so a value can
-# hold malformed UTF-8 a client chose. Base `strip` asks `isspace` and `lowercase` asks the
-# Unicode tables, and both THROW `InvalidCharError` on a malformed char -- which in middleware is
-# a 500 for any request carrying it. So the request path trims only what RFC 9110 §5.6.3 calls
-# whitespace (SP, HTAB) and folds case only on ASCII, neither of which ever inspects a char's
-# category.
-_ows_strip(s::AbstractString) = strip(c -> c == ' ' || c == '\t', s)
-_ascii_lower_eq(s::AbstractString, lower::String) = all(isascii, s) && lowercase(s) == lower
 
 # Strip a port and/or brackets so a proxy that writes `203.0.113.7:1234` or `[2001:db8::1]:443`
 # still parses. A bare IPv6 address has at least two colons, so the single-colon test is

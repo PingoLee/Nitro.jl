@@ -22,8 +22,10 @@ path(pattern::String, handler::Function;
 ```julia
 urlpatterns(prefix::String, routes...)                 # prefix is REQUIRED — "" for root
 urlpatterns(prefix::String, routes::Vector{RouteDefinition})
-include_routes(prefix::String, routes::Vector{RouteDefinition})
-include_routes(prefix::String, routes::RouteDefinition...)
+include_routes(prefix::String, routes::Vector{RouteDefinition}; middleware = nothing)
+include_routes(prefix::String, routes::RouteDefinition...;       middleware = nothing)
+# middleware (#439): the group's list, prepended to each route's own. global -> group (outer
+# first) -> route -> handler. Shared instances; never runs on a 404/405.
 url(name::String; kwargs...)                           # reverse lookup by route name
 ```
 
@@ -232,13 +234,24 @@ CSRFMiddleware(secret::Union{AbstractString, SecretString};  # needs SessionMidd
                form_field  = "_csrf",
                ttl::Int    = 604800,                # 7 days = SessionMiddleware absolute_max_age (#441)
                config      = CookieConfig(httponly=false, secure=true,
-                                          samesite="Lax", path="/", maxage=ttl))
+                                          samesite="Lax", path="/", maxage=ttl),
+               exempt_bearer::Bool = true)          # #438: see below
 # Tokens are HMAC'd over (raw_token | req.context[:session_id]). No session id => no token
 # issued and 403 on every unsafe method. Throws ArgumentError if a __Host-/__Secure- name is
 # paired with a config browsers would reject.
 # Lazy (#431): a token is issued only when a handler calls csrf_token!(req), or when the
 # session is saved anyway (it already existed, or the request wrote to / rotated it). A
 # cookieless request nobody asked a token for creates no token and no session.
+# exempt_bearer (#438): an unsafe request with `Authorization: Bearer <token>` (scheme in any
+# case, one token68) and NO Cookie header at all skips the token check -- nothing ambient to
+# forge. Any cookie keeps the check on. It does not validate the token; BearerAuth does.
+
+CrossOriginProtection(; trusted_origins::Vector{String} = String[],   # exact origins; bad => ArgumentError
+                        exempt_paths::Vector{String}    = String[])   # whole segments, must start with `/`
+# #437, Go 1.25 net/http.CrossOriginProtection. Unsafe methods only: Sec-Fetch-Site same-origin|none
+# passes, any other value 403; no Sec-Fetch-Site => Origin host:port must equal Host (scheme
+# ignored); neither header => pass (not a browser); trusted Origin / exempt path => pass.
+# No session, no token. Host header only, never X-Forwarded-Host.
 
 csrf_token!(req) -> String   # the token to embed (hidden `_csrf` field, JSON for an SPA),
                              # MASKED: a new string every call, all of them valid (#436, BREACH).

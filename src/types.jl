@@ -1661,10 +1661,13 @@ function _parse_origin(raw::AbstractString)::Tuple{Nullable{String}, String}
     s = String(raw)
     s == "*" && return (nothing, "`*` would admit every site, which is exactly what the check " *
                                  "exists to stop; list the pages you trust")
-    lowercase(s) == "null" && return (nothing, "`null` is the Origin of sandboxed frames, " *
-                                                "`file:` pages and some redirects, so any site can produce it")
+    # `isascii` BEFORE anything that case-folds: this also parses a request's `Origin` header,
+    # whose bytes a client chose, and `lowercase` throws `InvalidCharError` on malformed UTF-8 --
+    # a 500 where the contract is a fail-closed "no" (#437; the #383 class).
     isascii(s) || return (nothing, "it is not ASCII; write the host in its punycode (`xn--`) " *
                                     "form, which is what a browser sends")
+    lowercase(s) == "null" && return (nothing, "`null` is the Origin of sandboxed frames, " *
+                                                "`file:` pages and some redirects, so any site can produce it")
     any(c -> c <= ' ' || c == '\x7f', s) && return (nothing, "it contains whitespace or a control character")
     sep = findfirst("://", s)
     sep === nothing && return (nothing, "it has no `scheme://`")

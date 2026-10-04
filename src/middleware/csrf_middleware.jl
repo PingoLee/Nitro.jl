@@ -9,8 +9,8 @@ using ...Crypto: secure_random_bytes, _empty_hmac_key, _hmac_sha256, SecretStrin
     base64url_decode
 using ...Errors: is_unrecoverable
 using ...Res: json
-using ...Core: own_response_headers, getjson, getform
-using ...Util: _mark_private!
+using ...Core: own_response_headers, getjson, getform, header_name_isequal
+using ...Util: _mark_private!, _ows_strip, _ascii_lower_eq
 
 export CSRFMiddleware, csrf_token!, issue_csrf_token!, validate_csrf_token
 
@@ -194,6 +194,55 @@ function _warn_unbound()
           "(`middleware=[SessionMiddleware(store = MemoryStore()), CSRFMiddleware(secret)]`). Until " *
           "then no token is issued and every unsafe request is rejected." maxlog=1
     return nothing
+end
+
+"""
+    _bearer_only(req) -> Bool
+
+True when a bearer token in the `Authorization` header is the request's ONLY credential: the
+scheme is `Bearer` (any case, RFC 9110 §11.1), the token is non-empty, and there is no `Cookie`
+header at all (#438).
+
+CSRF exists because a browser attaches cookies to a cross-site request on its own. It never
+attaches an `Authorization` header that way: a cross-site page can set one only through
+`fetch` with a CORS preflight this server's `Cors` would have to allow. So a request with no
+cookie and a bearer header carries nothing a forger could borrow, and the token check protects
+nothing on it.
+
+ANY `Cookie` header, even one this layer has never heard of, keeps the check on. This layer
+cannot see the session or auth cookie names (`SessionMiddleware`'s lives in its closure, and
+`BearerAuth(cookie_name=...)` can authenticate FROM a cookie), and a mixed request, with a
+bearer header and an ambient cookie, is exactly the one a page that won a permissive CORS
+policy can send. Failing closed on it costs an API client that also carries, say, a load
+balancer's affinity cookie a token; failing open would cost the session.
+
+Header values are bytes, possibly malformed UTF-8, so this trims and case-folds without
+consulting the Unicode tables (`_ows_strip`, `_ascii_lower_eq`).
+"""
+function _bearer_only(req::HTTP.Request)::Bool
+    bearer = false
+    for (name, value) in req.headers
+        header_name_isequal(name, "Cookie") && return false
+        if header_name_isequal(name, "Authorization")
+            # Every instance must be a bearer credential: two `Authorization` lines, one of
+            # them something else, is not a request to guess about.
+            _is_bearer_credential(value) || return false
+            bearer = true
+        end
+    end
+    return bearer
+end
+
+# `Bearer <token68>` (RFC 6750 §2.1): one scheme, one token. A token68 holds no whitespace and no
+# comma, which also refuses two ADJACENT `Authorization` lines: HTTP.jl folds those into one value
+# joined with `,` (`HTTP.appendheader`). Non-adjacent lines stay separate; `_bearer_only` checks each.
+function _is_bearer_credential(value::AbstractString)::Bool
+    credential = _ows_strip(value)
+    gap = findfirst(c -> c == ' ' || c == '\t', credential)
+    gap === nothing && return false
+    _ascii_lower_eq(SubString(credential, 1, prevind(credential, gap)), "bearer") || return false
+    token = _ows_strip(SubString(credential, gap))
+    return !isempty(token) && !any(c -> c == ' ' || c == '\t' || c == ',', token)
 end
 
 _validate_cookie_prefix(cookie_name::AbstractString, config::CookieConfig) =
@@ -465,13 +514,27 @@ end
 
 """
     CSRFMiddleware(secret; cookie_name = "__Host-csrf_token", header_name = "X-CSRF-Token",
-                   form_field = "_csrf", ttl = 604800, config = CookieConfig(...))
+                   form_field = "_csrf", ttl = 604800, config = CookieConfig(...),
+                   exempt_bearer = true)
 
 CSRF protection with a signed double-submit cookie, bound to the session. `secret` is a
 `String` or a `SecretString`; an empty one is an `ArgumentError`.
 
 Every unsafe request (anything but `GET`, `HEAD`, `OPTIONS`, `TRACE`) must send the token back
 in the `X-CSRF-Token` header, a `_csrf` form field, or a `_csrf` JSON key, or it gets `403`.
+
+# Bearer-token requests
+
+An unsafe request whose only credential is `Authorization: Bearer <token>`, with **no `Cookie`
+header at all**, skips the check (#438). A browser never attaches an `Authorization` header to
+a cross-site request on its own, so a forged request cannot carry one, and there is no cookie
+for it to borrow. One pipeline can therefore serve a browser UI and a bearer-token API.
+
+Any cookie keeps the check on, including one this middleware does not recognise: a request with
+both a bearer header and a cookie still needs a token. Pass `exempt_bearer = false` to check
+bearer-only requests too. Putting the session and CSRF layers on the browser routes alone, with
+`include_routes(...; middleware = [...])`, is the other way to keep an API out of the check
+(#439).
 
 # When a token is issued
 
@@ -527,8 +590,9 @@ every unsafe request.
   one costs nothing, because the token stops verifying when its session ends. With no absolute
   cap (`absolute_max_age = nothing`) no `ttl` covers every session; the `403` retry does.
 - `config`: the cookie's attributes. It is not `httponly`, so a browser script can read the token.
+- `exempt_bearer`: skip the check on bearer-only requests (see above). `true` by default.
 """
-function CSRFMiddleware(key::Union{AbstractString, SecretString}; cookie_name::String=DEFAULT_COOKIE_NAME, header_name::String="X-CSRF-Token", form_field::String="_csrf", ttl::Int=DEFAULT_TTL, config::CookieConfig=CookieConfig(httponly=false, secure=true, samesite="Lax", path="/", maxage=ttl))
+function CSRFMiddleware(key::Union{AbstractString, SecretString}; cookie_name::String=DEFAULT_COOKIE_NAME, header_name::String="X-CSRF-Token", form_field::String="_csrf", ttl::Int=DEFAULT_TTL, config::CookieConfig=CookieConfig(httponly=false, secure=true, samesite="Lax", path="/", maxage=ttl), exempt_bearer::Bool=true)
     # The closures below capture `sealed`, never the raw key: `repr` of a closure prints its
     # captures, so a plain `String` here was published by any `@info … middleware = mw` (#307).
     # The unwrap happens per request, into a local the closure does not hold.
@@ -541,7 +605,9 @@ function CSRFMiddleware(key::Union{AbstractString, SecretString}; cookie_name::S
             method = uppercase(String(req.method))
             binding = _binding(req)
 
-            if !(method in SAFE_METHODS)
+            # A bearer-only request has no ambient credential to forge (#438): it skips the
+            # check, but not the rest -- a handler can still ask it for a token.
+            if !(method in SAFE_METHODS) && !(exempt_bearer && _bearer_only(req))
                 binding === nothing && _warn_unbound()
                 if !validate_csrf_token(req, secret; cookie_name, header_name, form_field, binding)
                     rejection = json(Dict("error" => "Invalid CSRF token"); status=403)

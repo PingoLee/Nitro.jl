@@ -109,6 +109,7 @@ const TEST_FILES = [
     "middleware/lifecycle_middleware_tests.jl",
     "middleware/access_log_tests.jl",
     "middleware/csrf_middleware_tests.jl",
+    "middleware/cross_origin_protection_tests.jl",
     "middleware/session_middleware_tests.jl",
     "middleware/shared_response_mutation_tests.jl",
     "middleware/guards_tests.jl",

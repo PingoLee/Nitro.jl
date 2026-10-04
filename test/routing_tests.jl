@@ -113,6 +113,36 @@ end
     @test included2[1].pattern == "/v2/items"
 end
 
+@testset "include_routes: group middleware goes ahead of the route's own (#439)" begin
+    handler = (req) -> "hello"
+    g1 = (h) -> (req) -> h(req)
+    g2 = (h) -> (req) -> h(req)
+    own = (h) -> (req) -> h(req)
+
+    routes = [path("/a", handler), path("/b", handler, middleware = [own])]
+    grouped = include_routes("/g", routes; middleware = [g1, g2])
+    @test grouped[1].middleware == [g1, g2]                 # no list of its own: the group's
+    @test grouped[2].middleware == [g1, g2, own]            # the group's first, then its own
+    @test grouped[1].middleware !== grouped[2].middleware   # a fresh vector per route...
+    @test grouped[1].middleware[1] === g1                   # ...over the same instances
+    @test routes[2].middleware == [own]                     # the input is not modified
+
+    # Variadic form takes the keyword too.
+    @test include_routes("/v", path("/x", handler); middleware = [g1])[1].middleware == [g1]
+
+    # Nesting: the outer group wraps the inner one.
+    nested = include_routes("/outer", include_routes("/inner", routes; middleware = [g2]);
+                            middleware = [g1])
+    @test nested[2].pattern == "/outer/inner/b"
+    @test nested[2].middleware == [g1, g2, own]
+
+    # No group, or an empty one, leaves a route's list exactly as it was -- `nothing` included,
+    # so a route with no layers still publishes nothing (the app-wide fast path).
+    @test include_routes("/g", routes)[1].middleware === nothing
+    @test include_routes("/g", routes; middleware = [])[1].middleware === nothing
+    @test include_routes("/g", routes; middleware = [])[2].middleware == [own]
+end
+
 # ─── Test: urlpatterns() with server ──────────────────────────────────
 
 @testset "urlpatterns integration" begin

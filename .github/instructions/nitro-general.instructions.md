@@ -381,7 +381,7 @@ they **shadow** the same-named functions `using .Core` brings in. An `(app, …)
 | `src/extractors.jl` | Typed extractors: `Path`, `Query`, `Header`, `Json`, `JsonFragment`, `Form`, `Body`, `Cookie`, `Session`, `Files`, `MultipartForm` |
 | `src/reflection.jl` | `struct_builder`, `splitdef`, `extract_struct_info` — the machinery extractors bind through |
 | `src/handlers.jl` | Handler dispatch — `select_handler`, first-argument typing |
-| `src/middleware.jl`, `src/middleware/` | Middleware: `ExtractIP`, `RateLimiter`, auth (`BearerAuth`/`CookieAuthMiddleware`), `Cors`, `CSRFMiddleware`, `SessionMiddleware`, `GuardMiddleware` + guards, `AccessLog` |
+| `src/middleware.jl`, `src/middleware/` | Middleware: `ExtractIP`, `WebSocketOrigins`, `RateLimiter`, auth (`BearerAuth`/`CookieAuthMiddleware`), `Cors`, `SecurityHeaders`, `CSRFMiddleware`, `CrossOriginProtection` (tokenless Fetch-Metadata CSRF, #437), `SessionMiddleware`, `GuardMiddleware` + guards, `AccessLog` |
 | `src/middleware/janitor.jl` | `_janitor` — the **single** periodic-background-janitor discipline: spawn, per-activation stop token, per-tick `try`, `InterruptException` rethrow, and the activation reset that keeps a dead janitor restartable (#190). Internal, not re-exported. `SessionMiddleware`/`SessionPruner` and `FixedRateLimiter` are its only callers; `AccessLog`'s writer is event-driven and deliberately stays out |
 | `src/Auth.jl`, `src/Auth/` | JWT, claims, password hashing, cookie auth, guard re-exports |
 | `src/Workers.jl`, `src/Workers/` | Background task queue: API, execution, registry. **`AbstractWorkerStore` is data access only**; `src/Workers/runtime.jl`'s `WorkerRuntime` owns the queues, cleanup scheduler and run handles, and is what `shutdown!` takes (#167) |

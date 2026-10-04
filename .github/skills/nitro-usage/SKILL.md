@@ -72,7 +72,13 @@ routes = [
 urlpatterns("", routes)                  # register at the root — the prefix argument is REQUIRED
 urlpatterns("/api", api_routes)          # or under a prefix
 include_routes("v2/", v2_routes)         # compose a sub-router into a route vector
+include_routes("/api", api_routes; middleware=[BearerAuth(validator)])   # group middleware (#439)
 ```
+
+**Middleware order: global (`serve`) → group (`include_routes(...; middleware)`, outer group
+first) → route (`path(...; middleware)`) → handler**, each list top-down. Group layers are shared
+instances (one `SessionMiddleware` = one store, one janitor). They never run on a 404/405, so
+rate limiting, `ExtractIP` and access logging stay global.
 
 There is **no single-argument `urlpatterns(routes)`** — the prefix comes first, `""` for root.
 Registration is a separate step from starting the server: declare routes, call `urlpatterns(...)`,
@@ -302,9 +308,12 @@ cannot be replayed for another. With no session id present the gate **fails clos
 issued and every unsafe request gets `403`, with a warning naming the ordering rule — there is no
 unbound fallback.
 
-**Put `CSRFMiddleware` in the global pipeline, not on a route.** Tokens are issued to the page that
-renders the form, so a `CSRFMiddleware` scoped to a `method="POST"` route never issues one and
-refuses every request it sees. Scope guards per route; scope CSRF per app. Global placement costs no
+**Put `CSRFMiddleware` in the global pipeline, or on a group — never on a single route.** Tokens
+are issued to the page that renders the form, so a `CSRFMiddleware` scoped to a `method="POST"`
+route never issues one and refuses every request it sees. Scope guards per route; scope CSRF per
+app, or per browser **group** (#439): `include_routes("", browser_routes; middleware =
+[SessionMiddleware(...), CSRFMiddleware(secret)])`, with every form page and the `/api/csrf`
+token endpoint inside the group, keeps a bearer API out of sessions and CSRF entirely. Global placement costs no
 session per request (#431). A new visitor gets a token only when a handler calls
 **`csrf_token!(req)`**, which returns the token for a hidden `_csrf` field or a JSON body, masked
 afresh on every call (BREACH, #436): never compare two tokens with `==`. The raw token in the
@@ -317,6 +326,20 @@ expires `ttl` seconds after the last `csrf_token!` (seven days by default, the s
 `absolute_max_age`; keep `ttl` at least as long as your session lifetimes, #441). A handler that
 rotates the session calls `csrf_token!` **after** `regenerate_session!`, because a rotation retires the client's earlier token. `csrf_token!` throws
 `ArgumentError` outside `CSRFMiddleware` or without a session.
+
+**Bearer-only requests skip the token check (#438)**: `Authorization: Bearer <token>` (any case)
+**and no `Cookie` header at all**. A browser never attaches that header cross-site, so with no
+cookie there is nothing to forge, and a bearer API can share the global pipeline with a cookie UI.
+Any cookie, even an unrelated one, keeps the check on. CSRF does not authenticate the token;
+`BearerAuth` still must. Opt out with `CSRFMiddleware(secret; exempt_bearer = false)`.
+
+**Tokenless alternative: `CrossOriginProtection` (#437)** — Go 1.25's check. Unsafe requests pass
+on `Sec-Fetch-Site: same-origin|none`; with no `Sec-Fetch-Site`, only if `Origin` host:port equals
+`Host`; with neither header (non-browser) they pass; `trusted_origins` (exact origins, the
+`WebSocketOrigins` parser) and `exempt_paths` (whole segments) exempt the rest. Everything else,
+`same-site` included, is `403`. No token, no session, so no SPA bootstrap endpoint; it composes
+with `CSRFMiddleware` or replaces it. Reads `Host`, never `X-Forwarded-Host`: the proxy must keep
+the public `Host`.
 
 The cookie is `__Host-csrf_token` by default, so a sibling subdomain cannot overwrite it. Browsers
 accept that prefix only on a `Secure`, `Path=/`, `Domain`-less cookie, and `CSRFMiddleware` throws

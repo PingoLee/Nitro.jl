@@ -1571,3 +1571,91 @@ end
     @test !reached[]
 end
 end
+
+@testitem "Group middleware — include_routes(...; middleware) runs between global and route (#439)" tags=[:core, :middleware, :csrf] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+using Nitro.Core: internalrequest
+using Nitro.Core.Types: MemoryStore
+import Nitro: App, path, include_routes, text
+
+tag(order, name) = handle -> (req::HTTP.Request -> (push!(order, name); handle(req)))
+globals(order) = [tag(order, "global1"), tag(order, "global2")]
+
+@testset "global → group → route, each list top-down" begin
+    app = App(mod = @__MODULE__)
+    order = String[]
+    urlpatterns(app, "", include_routes("/g", [
+        path("/x", req -> "ok"; middleware = [tag(order, "route1"), tag(order, "route2")]),
+        path("/y", req -> "ok"),
+    ]; middleware = [tag(order, "group1"), tag(order, "group2")]))
+
+    r = internalrequest(app, HTTP.Request("GET", "/g/x"); middleware = globals(order))
+    @test text(r) == "ok"
+    @test order == ["global1", "global2", "group1", "group2", "route1", "route2"]
+
+    # A route with no list of its own still gets the group's.
+    empty!(order)
+    internalrequest(app, HTTP.Request("GET", "/g/y"); middleware = globals(order))
+    @test order == ["global1", "global2", "group1", "group2"]
+
+    # A cache hit replays the same chain.
+    empty!(order)
+    internalrequest(app, HTTP.Request("GET", "/g/x"); middleware = globals(order))
+    @test order == ["global1", "global2", "group1", "group2", "route1", "route2"]
+end
+
+@testset "nested groups: outer, then inner, then route" begin
+    app = App(mod = @__MODULE__)
+    order = String[]
+    inner = include_routes("/in", [path("/x", req -> "ok"; middleware = [tag(order, "route")])];
+                           middleware = [tag(order, "inner")])
+    urlpatterns(app, "", include_routes("/out", inner; middleware = [tag(order, "outer")]))
+    r = internalrequest(app, HTTP.Request("GET", "/out/in/x"); middleware = globals(order))
+    @test text(r) == "ok"
+    @test order == ["global1", "global2", "outer", "inner", "route"]
+end
+
+@testset "a 404 or a 405 never reaches group middleware" begin
+    app = App(mod = @__MODULE__)
+    order = String[]
+    urlpatterns(app, "", include_routes("/g", [path("/x", req -> "ok"; method = "GET")];
+                                        middleware = [tag(order, "group")]))
+    @test internalrequest(app, HTTP.Request("GET", "/g/nope"); middleware = globals(order)).status == 404
+    @test order == ["global1", "global2"]
+    empty!(order)
+    @test internalrequest(app, HTTP.Request("POST", "/g/x"); middleware = globals(order)).status == 405
+    @test order == ["global1", "global2"]
+end
+
+# The issue's motivating shape: sessions and CSRF on the browser routes, a bearer API beside them
+# that never meets either -- not even with a cookie, which the #438 exemption would not excuse.
+@testset "a browser group with sessions + CSRF, an API group without" begin
+    app = App(mod = @__MODULE__)
+    store = MemoryStore{String, Dict{String,Any}}()
+    browser = include_routes("", [
+        path("/login", req -> "form"; method = "GET"),
+        path("/login", req -> "in"; method = "POST"),
+    ]; middleware = [SessionMiddleware(store = store), CSRFMiddleware("group-csrf-secret")])
+    api = include_routes("/api", [path("/things", req -> "made"; method = "POST")];
+                         middleware = [BearerAuth(t -> t == "api-token" ? Dict("sub" => "svc") : nothing)])
+    urlpatterns(app, "", vcat(browser, api))
+
+    cookie = "Cookie" => "lb_affinity=node-3"
+    bearer = "Authorization" => "Bearer api-token"
+
+    # The API: no token, a cookie along for the ride, and still no CSRF check and no session.
+    r = internalrequest(app, HTTP.Request("POST", "/api/things", [bearer, cookie]))
+    @test r.status == 200
+    @test text(r) == "made"
+    @test isempty(store.data)
+    @test !any(h -> lowercase(h.first) == "set-cookie", r.headers)
+    # ...and the API's own authentication still applies.
+    @test internalrequest(app, HTTP.Request("POST", "/api/things", [cookie])).status == 401
+
+    # The browser routes are checked: a cookie-carrying POST with no token is refused.
+    @test internalrequest(app, HTTP.Request("POST", "/login", [cookie])).status == 403
+    @test internalrequest(app, HTTP.Request("GET", "/login")).status == 200
+end
+end
