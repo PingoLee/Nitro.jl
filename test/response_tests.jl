@@ -111,6 +111,29 @@ end
     @test length(response1.headers) == length(response2.headers) == 1
 end
 
+# What every builder did before #446: HTTP's keyword constructor, then `setheader`. Measured against
+# that on the same Julia and HTTP.jl rather than against a constant, so the bound survives a bump.
+function keyword_builder(body)
+    response = HTTP.Response(200, body = body)
+    HTTP.setheader(response, "Content-Type" => "text/plain; charset=utf-8")
+    return response
+end
+
+function allocs_per_call(f, x, n)
+    f(x)
+    return @allocations(for _ in 1:n; f(x); end) / n
+end
+
+@testset "builders allocate less than HTTP's keyword constructor (#446)" begin
+    bytes = Vector{UInt8}("{}")
+    # The keyword form normalizes then copies both header collections; the builders skip all four.
+    @test allocs_per_call(Res.send, "x", 1000) + 2 <= allocs_per_call(keyword_builder, "x", 1000)
+    @test allocs_per_call(Res.json, bytes, 1000) + 2 <= allocs_per_call(keyword_builder, bytes, 1000)
+    # Same response, cheaper: the headers a builder emits did not change shape.
+    @test Res.send("x").headers.entries == keyword_builder("x").headers.entries
+    @test Res.send("x").content_length == keyword_builder("x").content_length == 1
+end
+
 @testset "Res.file — Content-Disposition is opt-in" begin
     # A plain `Res.file(path)` serves INLINE. Static mounts (`staticfiles`, `spafiles`,
     # `dynamicfiles`) all route through here, so an `attachment` default would turn an SPA's

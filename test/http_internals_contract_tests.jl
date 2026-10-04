@@ -32,6 +32,12 @@ import Sockets
 #   • src/core/lifecycle.jl — refuses cleartext HTTP/2 (#375) by adding a method to the private
 #       `_probe_h2_preface!` for `Server{<:NitroStreamHandler}`, returning a
 #       `_ServerPrefaceConn` built with nothing consumed.
+#   • src/response.jl — `Res._new_response` (#446) builds every `Res` and `format_response`
+#       response through `HTTP.Response`'s positional FIELD constructor, skipping the keyword
+#       form's header normalize-and-copy. It depends on the field order and on storing what
+#       the keyword form stores for a `String`/`Vector{UInt8}` body. `_rebuild_with_headers`
+#       in src/utilities/misc.jl (#447) uses the same constructor for every header-adding
+#       middleware layer, carrying each field over by position.
 #   • src/context.jl — `_shutdown_server`'s bounded drain: it depends on `close(::Server)`
 #       releasing the listener BEFORE its unbounded quiesce loop, and escalates to
 #       `HTTP.forceclose`.
@@ -195,6 +201,37 @@ end
     # is spent (below). `_write_response_body!` must leave both alone.
     @test :next_index in fieldnames(HTTP.BytesBody)
     @test :closed     in fieldnames(HTTP.BytesBody)
+end
+
+@testset "Res._new_response matches HTTP's keyword constructor field for field (#446)" begin
+    # The field constructor is positional, so a reordered, added or retyped field would either
+    # fail to construct or -- worse -- land a value in the wrong slot. Pin the layout exactly.
+    @test fieldnames(HTTP.Response) == (:status, :reason, :headers, :trailers, :body,
+        :content_length, :proto_major, :proto_minor, :close, :request, :request_url,
+        :previous, :redirect_count)
+    @test fieldtypes(HTTP.Response{String})[[1, 2, 3, 4, 6, 7, 8, 9, 13]] ==
+        (Int, String, HTTP.Headers, HTTP.Headers, Int64, UInt8, UInt8, Bool, Int)
+
+    # The keyword form is the oracle: whatever HTTP stores for these bodies, the helper must too.
+    # A field HTTP starts defaulting differently (say, `content_length` for a String) fails here.
+    for body in ("héllo", Vector{UInt8}("bytes"), "")
+        h = HTTP.Headers(1)
+        push!(h, "Content-Type" => "text/plain")
+        ours = Nitro.Core.Res._new_response(201, h, body)
+        theirs = HTTP.Response(201; headers = copy(h), body = body)
+        @test typeof(ours) == typeof(theirs)
+        for f in fieldnames(HTTP.Response)
+            a, b = getfield(ours, f), getfield(theirs, f)
+            if a isa HTTP.Headers
+                @test a.entries == b.entries
+            else
+                @test isequal(a, b)
+            end
+        end
+        # The response owns its trailers: never a collection shared with anything else.
+        @test ours.trailers !== Nitro.Core.Res._new_response(201, HTTP.Headers(), body).trailers
+    end
+    @test_throws ArgumentError Nitro.Core.Res._new_response(-1, HTTP.Headers(), "")
 end
 
 @testset "a header name is stored, and so sent, as spelled (HTTP 2.8)" begin

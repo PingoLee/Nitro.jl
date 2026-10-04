@@ -219,6 +219,39 @@ layer expecting a later layer to still see it; if you need the bytes, materializ
   per-request headers (an echoed `Origin`, a session `Set-Cookie`) across requests and
   races. Regression: `test/middleware/shared_response_mutation_tests.jl`.
 
+### What P2 costs, and why it is a rule rather than an accumulator (#447)
+
+P2 means every header-adding layer rebuilds the response. Phoenix's `Plug.Conn` gets the same
+guarantee by *shape*: one connection value threads through the pipeline, and headers accumulate
+in it, so the response is built once. Nitro could do the same by rule, with a per-request
+"pending headers" list on `req.context` that the serializer applies once. #447 measured whether
+that is worth it. It is not.
+
+The rebuild was expensive because of how it called HTTP.jl, not because it happened. HTTP 2.8's
+keyword `Response` constructor runs `copy(mkheaders(...))` on both `headers` and `trailers`, and
+`add_response_headers` fed it a `vcat`'d vector, so one layer built four collections. Since
+#446/#447 the rebuild uses HTTP's field constructor around a single sized `Headers`, with the
+field order pinned in `test/http_internals_contract_tests.jl`.
+
+Measured in process: pipeline built once, Julia 1.12.7, HTTP 2.8.0, `GET /plaintext` returning
+`Res.send`, behind `Cors`, `SessionMiddleware`, `CSRFMiddleware`, `RateLimiter` and
+`SecurityHeaders`. Three of those rebuild on an anonymous GET: CORS, `SecurityHeaders` and the
+rate limiter. Session and CSRF write nothing until they have something to set.
+
+| | allocations / request | bytes / request |
+|---|---|---|
+| no middleware, before → after | 16 → 12 | 544 → 448 |
+| five layers, before → after | 195 → 169 | 10,768 → 8,544 |
+| one rebuild now, 12-header response | 6–8 | 416–544 |
+
+The three rebuilds left are about 20 of those 169 allocations. An accumulator still has to build
+the final response once, so the most it could save is roughly two rebuilds, ~14 allocations and
+~1 KB a request, about 8%. The rest of the layers' cost is their own work (origin checks, cookie
+parsing, rate-limit bookkeeping, header values). That saving does not buy a second mechanism every
+header-adding middleware must remember to use. P2 stays a rule, enforced by
+`shared_response_mutation_tests.jl`. Reopen this only if a layer's rebuild count grows, or a
+profile shows `_rebuild_with_headers` near the top again.
+
 ## 4. Reference facts
 
 - Up to 2.6, a `String` body was wrapped in a `BytesBody`, and HTTP.jl #1272 declared that

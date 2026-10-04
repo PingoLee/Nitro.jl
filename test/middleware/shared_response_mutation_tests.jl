@@ -166,4 +166,67 @@ end
     sess = SessionMiddleware(cookie_name="sid", max_age=3600, store=store).middleware(handler)
     @test sess(HTTP.Request("GET", "/")).close == true
 end
+
+@testset "a rebuild changes the headers and nothing else (#447)" begin
+    rich = rich_response()
+    for out in (own_response_headers(rich), add_response_headers(rich, "X-Added" => "y"))
+        for f in fieldnames(HTTP.Response)
+            f in (:headers, :trailers) && continue
+            @test getfield(out, f) === getfield(rich, f)
+        end
+        # The new response owns both header collections; the source's are untouched.
+        @test out.trailers !== rich.trailers && out.trailers.entries == rich.trailers.entries
+        @test out.headers !== rich.headers
+        @test rich.headers.entries == ["X-Orig" => "1"]
+    end
+end
+
+@testset "add_response_headers emits exactly what HTTP's normalization did (#447)" begin
+    # Before #447 every call built `HTTP.Headers(vcat(resp.headers, extra))`. That is the oracle:
+    # `appendheader` over everything, so adjacent duplicates fold into `a,b`, `Set-Cookie` never
+    # folds, and a name that differs only in case still counts as the same name.
+    oracle(resp, extra) = HTTP.Headers(vcat(resp.headers, extra)).entries
+    base = HTTP.Response(200; headers = ["Vary" => "Origin", "Set-Cookie" => "a=1"], body = "x")
+    cases = (
+        "X-One" => "1",                                              # a single Pair (pipeline.jl, transport.jl)
+        ["Set-Cookie" => "b=2", "Set-Cookie" => "c=3"],              # never folded
+        ["vary" => "Cookie"],                                        # not adjacent to `Vary`: kept apart
+        ["X-A" => "1", "x-a" => "2", "X-B" => "3"],                  # adjacent, case-variant: folded
+        Pair{String,String}[],                                       # nothing to add
+        ["X-Sub" => SubString("abc", 1, 2)],                         # non-String values
+    )
+    for extra in cases
+        @test add_response_headers(base, extra).headers.entries == oracle(base, extra)
+    end
+    # The fallback keeps HTTP's general form for anything that is not typed string pairs. Its
+    # oracle IS its implementation, so this proves only that an untyped vector reaches it.
+    untyped = Any["X-Any" => "1"]
+    @test add_response_headers(base, untyped).headers.entries == oracle(base, untyped)
+    # A response whose own headers hold adjacent duplicates is folded too, as before.
+    dup = HTTP.Response(200; body = "x")
+    push!(dup.headers, "X-D" => "1"); push!(dup.headers, "X-D" => "2")
+    @test add_response_headers(dup, "X-E" => "3").headers.entries == oracle(dup, "X-E" => "3")
+end
+
+# The pre-#447 rebuild: HTTP's keyword constructor, every field passed back in.
+keyword_rebuild(resp, headers) = HTTP.Response(resp.status, resp.body; reason = resp.reason,
+    headers = headers, trailers = resp.trailers, content_length = resp.content_length,
+    proto_major = resp.proto_major, proto_minor = resp.proto_minor, close = resp.close,
+    request = resp.request, request_url = resp.request_url, previous = resp.previous,
+    redirect_count = resp.redirect_count)
+
+function allocs_per_call(f, n)
+    f()
+    return @allocations(for _ in 1:n; f(); end) / n
+end
+
+@testset "a rebuild allocates less than the keyword constructor did (#447)" begin
+    resp, extra = HTTP.Response(200, "x"), ["X-A" => "1", "X-B" => "2"]
+    new_add() = add_response_headers(resp, extra)
+    old_add() = keyword_rebuild(resp, vcat(resp.headers, extra))
+    new_own() = own_response_headers(resp)
+    old_own() = keyword_rebuild(resp, copy(resp.headers))
+    @test allocs_per_call(new_add, 1000) + 3 <= allocs_per_call(old_add, 1000)
+    @test allocs_per_call(new_own, 1000) + 2 <= allocs_per_call(old_own, 1000)
+end
 end
