@@ -246,6 +246,13 @@ CSRFMiddleware(secret::Union{AbstractString, SecretString};  # needs SessionMidd
 # case, one token68) and NO Cookie header at all skips the token check -- nothing ambient to
 # forge. Any cookie keeps the check on. It does not validate the token; BearerAuth does.
 
+CrossOriginProtection(; trusted_origins::Vector{String} = String[],   # exact origins; bad => ArgumentError
+                        exempt_paths::Vector{String}    = String[])   # whole segments, must start with `/`
+# #437, Go 1.25 net/http.CrossOriginProtection. Unsafe methods only: Sec-Fetch-Site same-origin|none
+# passes, any other value 403; no Sec-Fetch-Site => Origin host:port must equal Host (scheme
+# ignored); neither header => pass (not a browser); trusted Origin / exempt path => pass.
+# No session, no token. Host header only, never X-Forwarded-Host.
+
 csrf_token!(req) -> String   # the token to embed (hidden `_csrf` field, JSON for an SPA),
                              # MASKED: a new string every call, all of them valid (#436, BREACH).
                              # The cookie's raw half is accepted too. req.context[:csrf_token]

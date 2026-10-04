@@ -608,6 +608,18 @@ urlpatterns("",
 - Entries are validated when the middleware is built: `*`, `null`, `wss://…`, a trailing `/` and a
   non-ASCII host are each an `ArgumentError` naming the fix.
 
+### `CrossOriginProtection` and `Host`
+
+[`CrossOriginProtection`](@ref) needs nothing from the proxy for a current browser on an HTTPS
+site: `Sec-Fetch-Site` travels end to end and decides on its own. Browsers send that header only to
+HTTPS and localhost, though, so on a plain-HTTP public side every browser takes the fallback. The
+fallback compares the
+`Origin` host with the **`Host` header** Nitro receives, never `X-Forwarded-Host`, so the same rule
+applies as for WebSocket upgrades above: forward the public `Host` (`proxy_set_header Host $host`,
+or `$http_host` behind a non-default port). The scheme is not compared, so TLS termination needs no
+`forwarded_proto` for it. Never strip `Sec-Fetch-Site` or `Origin` at the proxy: a request with
+neither is treated as a non-browser client and let through.
+
 ## Checklist
 
 **The proxy layer**
@@ -623,6 +635,8 @@ urlpatterns("",
       the proxy forwards the public `Host`, and nothing strips `Origin`.
 - [ ] A page served from another origin is listed with `WebSocketOrigins([...])` — exact origins,
       never `*` — rather than admitted by stripping `Origin` or by `Cors`.
+- [ ] With `CrossOriginProtection`, the proxy forwards the public `Host` and strips neither
+      `Sec-Fetch-Site` nor `Origin`.
 - [ ] The Nitro port is not reachable except through the proxy — check the container's published
       ports and any network policy, not just `host`.
 - [ ] Authorization is enforced in handlers. No `location` block is the only thing guarding a route.

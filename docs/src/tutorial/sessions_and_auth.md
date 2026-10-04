@@ -852,3 +852,43 @@ unsafe request does not carry the CSRF cookie at all, so the request is refused 
 attached. If you opt out of **both** (an unprefixed `cookie_name` *and* `samesite="None"`, which a
 cross-origin SPA needs), an attacker with a cookie-write position on a sibling origin can force a
 victim's CSRF token to rotate — a nuisance rather than a bypass, but weigh it before opting out.
+
+### Tokenless protection: `CrossOriginProtection`
+
+Every current browser sends `Sec-Fetch-Site` on every request to an HTTPS (or localhost) URL, and
+no page can set or remove it. A server that refuses unsafe requests marked `cross-site` therefore
+has CSRF protection without a token, a cookie or a session. [`CrossOriginProtection`](@ref) is that check
+([#437](https://github.com/PingoLee/Nitro.jl/issues/437)), modelled check for check on Go 1.25's
+`net/http.CrossOriginProtection`:
+
+```julia
+serve(middleware=[
+    CrossOriginProtection(trusted_origins=["https://app.example.com"]),
+    SessionMiddleware(store=store),
+])
+```
+
+For an unsafe request it passes:
+
+1. a `Sec-Fetch-Site` of `same-origin` or `none` (a typed URL or a bookmark). `cross-site` and
+   `same-site` are refused with `403`;
+2. with no `Sec-Fetch-Site` (an older browser, or any browser on a plain-HTTP site other than localhost), an `Origin`
+   whose host and port equal the `Host` header;
+3. a request with neither header, which no browser sends, so it carries no cookie a browser
+   attached on its own;
+4. an `Origin` in `trusted_origins`, or a path in `exempt_paths` (a third-party webhook), even when
+   steps 1 and 2 refused it.
+
+Nothing is minted, so there is no token endpoint for a single-page app to call, no hidden field in
+a form, and no `403`-and-retry when a session rotates. The trade is coverage: a browser too old to
+send either header is let through. Go makes the same call, and so does this middleware.
+
+It composes with `CSRFMiddleware`. Use both for defence in depth, or use `CrossOriginProtection`
+alone and drop the tokens. Unlike `CSRFMiddleware`, it does not need a session, so it can sit
+anywhere in the pipeline, including outside `SessionMiddleware`.
+
+`same-site` is refused on purpose: `https://evil.example.com` is same-site with
+`https://shop.example.com`, and a sibling subdomain you do not control is a common attacker
+foothold. List a sibling you trust in `trusted_origins`. Behind a reverse proxy, forward the public
+`Host`; see [Behind a Reverse Proxy](reverse_proxy.md). The design record is
+`docs/design/cross-origin-protection.md`.

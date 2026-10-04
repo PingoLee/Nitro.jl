@@ -333,6 +333,14 @@ cookie there is nothing to forge, and a bearer API can share the global pipeline
 Any cookie, even an unrelated one, keeps the check on. CSRF does not authenticate the token;
 `BearerAuth` still must. Opt out with `CSRFMiddleware(secret; exempt_bearer = false)`.
 
+**Tokenless alternative: `CrossOriginProtection` (#437)** — Go 1.25's check. Unsafe requests pass
+on `Sec-Fetch-Site: same-origin|none`; with no `Sec-Fetch-Site`, only if `Origin` host:port equals
+`Host`; with neither header (non-browser) they pass; `trusted_origins` (exact origins, the
+`WebSocketOrigins` parser) and `exempt_paths` (whole segments) exempt the rest. Everything else,
+`same-site` included, is `403`. No token, no session, so no SPA bootstrap endpoint; it composes
+with `CSRFMiddleware` or replaces it. Reads `Host`, never `X-Forwarded-Host`: the proxy must keep
+the public `Host`.
+
 The cookie is `__Host-csrf_token` by default, so a sibling subdomain cannot overwrite it. Browsers
 accept that prefix only on a `Secure`, `Path=/`, `Domain`-less cookie, and `CSRFMiddleware` throws
 an `ArgumentError` at construction rather than let the browser discard the cookie silently. For
