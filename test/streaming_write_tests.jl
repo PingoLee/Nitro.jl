@@ -305,3 +305,84 @@ for cap in (nothing, 4)
 end
 
 end
+
+@testitem "stream_handler puts the response on the wire itself, on every path (#453)" tags=[:core, :network] setup=[NitroCommon] begin
+
+using Test
+using HTTP
+using Nitro
+import Nitro: App
+
+# HTTP.jl's connection loop calls `closewrite` only after the stream handler returns, on the
+# connection task -- and HTTP.jl 2.x runs every connection task on the single `:interactive`
+# thread. On HTTP/1.1 a buffered fixed-length response reaches the socket only at `closewrite`, so
+# leaving that call to the loop put every response the server wrote on one thread: ~30k rps
+# against ~60k for bare HTTP.jl on the same box (bench/socket/). `stream_handler` now closes the
+# write side itself, on the request's own task, whether or not a `max_concurrent_requests` slot is
+# held. This pins it where it is observable: the moment `stream_handler`'s closure returns.
+#
+# Uncapped is the case that matters: the capped path already closed writes itself (#298), so an
+# assertion only under a cap would pass against the unpatched code.
+
+ctx = App()
+Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+    path("/text", (req::HTTP.Request) -> Res.send("hello"); methods = ["GET", "HEAD"]),
+    path("/json", (req::HTTP.Request) -> Res.json(Dict("a" => 1))),
+    path("/boom", (req::HTTP.Request) -> error("handler failed")),
+])
+
+closed_on_return = Bool[]
+connections = UInt[]            # objectid of the server-side connection each request arrived on
+seen_lock = ReentrantLock()
+# The wrapper is `stream_handler` itself plus one observation after it returns. A custom `handler`
+# is refused alongside a body cap, which only Nitro's own handler can enforce -- hence
+# `max_body_bytes = nothing`.
+recording = function (mw)
+    inner = Nitro.Core.stream_handler(mw)
+    return function (stream::HTTP.Stream)
+        inner(stream)
+        closed = @atomic :acquire stream.write_closed
+        conn = objectid(getfield(stream, :tracked))
+        lock(seen_lock) do
+            push!(closed_on_return, closed)
+            push!(connections, conn)
+        end
+        return nothing
+    end
+end
+
+port = get_free_port()
+Nitro.Core.serve(ctx; host = HOST, port = port, async = true, show_banner = false,
+                 show_errors = false, access_log = nothing, max_body_bytes = nothing,
+                 handler = recording)
+@test timedwait(() -> Base.isopen(ctx.service), 10.0) === :ok
+try
+    # Keep-alive reuse is part of the claim: closing writes early must not cost the connection.
+    responses = [
+        HTTP.get("http://$HOST:$port/text"; status_exception = false, retry = false),
+        HTTP.get("http://$HOST:$port/json"; status_exception = false, retry = false),
+        HTTP.head("http://$HOST:$port/text"; status_exception = false, retry = false),
+        HTTP.get("http://$HOST:$port/missing"; status_exception = false, retry = false),
+        HTTP.get("http://$HOST:$port/boom"; status_exception = false, retry = false),
+        HTTP.get("http://$HOST:$port/text"; status_exception = false, retry = false),
+    ]
+    @test [r.status for r in responses] == [200, 200, 200, 404, 500, 200]
+    @test String(responses[1].body) == "hello"
+    @test String(responses[2].body) == "{\"a\":1}"
+    @test isempty(responses[3].body)
+    @test HTTP.header(responses[3], "Content-Length") == "5"
+    @test String(responses[6].body) == "hello"
+
+    snapshot = lock(() -> copy(closed_on_return), seen_lock)
+    @test length(snapshot) == length(responses)
+    @test all(snapshot)
+    # All six on ONE connection. Closing writes early must not make HTTP's `startwrite` decide
+    # the connection is done; if it did, the client would quietly reconnect and every status
+    # above would still pass.
+    @test length(unique(lock(() -> copy(connections), seen_lock))) == 1
+    @test !any(r -> HTTP.hasheader(r, "Connection", "close"), responses)
+finally
+    terminate(ctx)
+end
+
+end

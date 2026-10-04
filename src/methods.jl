@@ -57,7 +57,13 @@ is explicit introspection, not accidental disclosure.)
   `false` merely silences those logs and does *not* harden the already-generic response.
 - `access_log=true`: emit one log line per request. By default only the request
   **path** is logged — query strings are redacted so tokens, API keys, and OAuth
-  `code`/`state` carried in URLs never reach the logs.
+  `code`/`state` carried in URLs never reach the logs. The line costs about 20 µs of CPU per
+  request, almost all of it inside the logger (`ConsoleLogger` formats each record), and it is
+  written on the request's own task. On a no-middleware `/plaintext` benchmark (`-t 8`) that is
+  a fifth to a third of the throughput, depending on load (#443); on a route that does real work
+  it is a far smaller share. When throughput matters more than a console line, pass `access_log = false` and use the
+  structured [`AccessLog`](@ref), which captures on the request and writes in batches off it.
+  Unlike this line, it sheds records when its buffer is full, and says so in a warning.
 - `access_log_query=false`: set `true` to log the full target including the query
   string. Only enable when you are certain no secrets travel in query strings.
 - `access_log_skip=nothing`: a `(req, resp) -> Bool` called once the response is known; return
@@ -191,6 +197,19 @@ Outside a REPL:
 
 When `on_shutdown` hooks must run, stop the server with `terminate` rather than Ctrl-C: serve with
 `async = true`, keep the main task alive yourself, and call `terminate(app)` from your own code.
+
+**What the socket path costs (#453).** HTTP.jl runs every connection on Julia's `:interactive`
+thread pool, which `julia -t N` sizes at one thread, so anything a request does on its connection
+task is serialized across the whole server. Nitro does only what it must there: parse the head
+(HTTP.jl), clear the header deadline, and spawn the request onto the default pool. Building the
+request, the middleware chain, the handler, and writing the response all run on the spawned
+task. On a loopback benchmark (`bench/socket/`, `-t 8`, no middleware, `access_log = false`,
+`/plaintext`) that puts `serve` within about 10–15% of bare HTTP.jl with the same per-request
+spawn; the default console access log costs more than that on its own (see `access_log`). Before #453 the
+response write ran on the connection task, and `serve` ran at about the speed of bare HTTP.jl
+*without* a spawn, roughly half. What remains on the interactive thread is mostly HTTP.jl's own
+head parsing and the cost of waking a thread for the spawn; `julia -t 8,2` gives the pool a
+second thread. To measure your own deployment, run `bench/socket/run.sh`.
 
 IP-based controls (rate limiting, audit logging) key on the socket peer address,
 resolved for both plain-HTTP and direct-TLS listeners. Behind a reverse proxy,

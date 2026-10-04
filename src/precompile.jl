@@ -296,22 +296,43 @@ end
         )
     end
 
-    # NOTE: a live-server round-trip (serve! + loopback HTTP.get) is intentionally NOT added
-    # here — but NOT for the reason this comment gave until #242, which measurement did not
-    # support. It claimed the live request path "is specialized on the user's specific
-    # handler/middleware closure types ... so the first real network request recompiles them
-    # regardless". Two structurally identical routes with different anonymous closures say
-    # otherwise: the first costs ~0.43s on its first request and the second ~0.014s. The
-    # per-closure component is 14ms; the rest is generic machinery that warms once and carries
-    # to every later route — exactly what a workload can cache, and what the blocks above now do.
+    # The transport layer (#450): `NitroStreamHandler` → the header-deadline clear → the spawn →
+    # `stream_handler` → this pipeline, for the listener a default `serve` builds. COMPILED, not
+    # run. Running it needs a live connection: `stream_handler` closes the write side itself
+    # (#453), and HTTP's socket-free `Stream(request)` has no connection to close. `precompile`
+    # needs only the types, and `_default_serve_listener` builds them through the same function
+    # `serve` does, so they are the types a default server really has (pinned by
+    # test/precompilation_test.jl).
     #
-    # What survives is narrower and still decisive: everything here runs through
-    # `internalrequest`, which is the same middleware chain and the same `Res`/serializer path a
-    # live request takes, minus the socket. A loopback round-trip would add only
-    # `NitroStreamHandler` and the transport read/write in `src/core/transport.jl` — and it would
-    # add them at the cost of binding a real port inside the precompile worker, which is the one
-    # thing in this file that could hang a build rather than merely slow it. The earlier
-    # Reseau loopback deadlock (fixed in HTTP 2.3.0 / Reseau 1.3.1) is why that is not a
-    # hypothetical. Warming the transport layer is worth doing; doing it with a socket is not.
-    # If someone finds a socket-free way to drive `NitroStreamHandler`, that is the gap to close.
+    # Measured over a socket (`ACCESS_LOG=1 bench/socket/first_request.sh`, `-t 8`): the first
+    # `/plaintext` request to a fresh default server drops from ~2.4 s to ~1.5 s. Only the
+    # DEFAULT shape benefits: a server with other middleware, or `access_log = false`, has another
+    # listener type and still compiles its chain on the first request. Most of the ~1.5 s left is
+    # HTTP.jl's own connection loop, specialized on the listener type; the app's own handler
+    # closures are the rest. The loop is compiled in HTTP's private
+    # `_serve_conn!`/`_serve_listener!`, which no public API reaches and no socket-free call
+    # drives, so it stays out. One stream type covers every HTTP/1.1 request, with a body or
+    # without: HTTP builds each `Stream` around `_stream_request_metadata(request)`, which is
+    # always a `Request{EmptyBody}`, and keeps the live body in an abstract `request_body` field.
+    # What stays cold is only the body READ for `FixedLengthBody`/`ChunkedBody`, which dispatches
+    # at runtime off that field; the workload's `internalrequest` POSTs warm the parsing above it.
+    let (listener, request_handler) = Core._default_serve_listener(ctx)
+        stream = Stream{false, Request{Core.HTTP.EmptyBody}}
+        precompile(listener, (stream,))
+        precompile(request_handler, (stream,))
+        precompile(Core._write_response_body!, (stream, String))
+        precompile(Core._write_response_body!, (stream, Vector{UInt8}))
+    end
+
+    # NOTE: a live-server round-trip (serve! + loopback HTTP.get) is still intentionally NOT
+    # added. Binding a real port inside the precompile worker is the one thing in this file that
+    # could hang a build rather than merely slow it; the earlier Reseau loopback deadlock (fixed in
+    # HTTP 2.3.0 / Reseau 1.3.1) is why that is not hypothetical. The block above warms what a
+    # socket would have, minus HTTP.jl's own loop.
+    #
+    # (Until #242 this NOTE also claimed the live path "is specialized on the user's specific
+    # handler/middleware closure types ... so the first real network request recompiles them
+    # regardless". Measurement did not support it: two structurally identical routes with
+    # different anonymous closures cost ~0.43 s and ~0.014 s on their first requests. The
+    # per-closure component is 14 ms; the rest is generic machinery a workload can cache.)
 end
