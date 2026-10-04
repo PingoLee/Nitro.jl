@@ -371,29 +371,26 @@ function format_response(content::AbstractString)
     # via `Res.html(...)` or `Res.send(...; content_type=...)`, which set the type
     # themselves. Those two, plus template rendering through `response` below (which
     # sniffs when no type was given), are the framework's markup sinks.
-    body = string(content)
-    return HTTP.Response(200, [
-        "Content-Type" => "text/plain; charset=utf-8",
-        "Content-Length" => string(sizeof(body)),
-    ], body)
+    return _formatted(string(content), "text/plain; charset=utf-8")
 end
 
 function format_response(content::Union{Number, Bool, Char, Symbol})
     # Convert all primitvies to a string and set the content type to text/plain
-    body = string(content)
-    return HTTP.Response(200, [
-        "Content-Type" => "text/plain; charset=utf-8",
-        "Content-Length" => string(sizeof(body)),
-    ], body)
+    return _formatted(string(content), "text/plain; charset=utf-8")
 end
 
 function format_response(content::Any)
     # Convert anthything else to a JSON string
-    body = JSON.json(content)
-    return HTTP.Response(200, [
-        "Content-Type" => "application/json; charset=utf-8",
-        "Content-Length" => string(sizeof(body)),
-    ], body)
+    return _formatted(JSON.json(content), "application/json; charset=utf-8")
+end
+
+# The response every `format_response` method builds: a 200 with exactly these two headers, made
+# through `Res._new_response` rather than HTTP's keyword constructor (#446).
+function _formatted(body::String, content_type::String)
+    h = HTTP.Headers(2)
+    push!(h, "Content-Type" => content_type)
+    push!(h, "Content-Length" => string(sizeof(body)))
+    return Res._new_response(200, h, body)
 end
 
 """

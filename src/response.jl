@@ -39,11 +39,34 @@ using MIMEs: MIME, mime_from_path, contenttype_from_mime
 using SHA: sha256
 import JSON
 
-function apply_headers!(response::HTTP.Response, headers)
+function apply_headers!(target::Union{HTTP.Response,HTTP.Headers}, headers)
     for header in headers
-        HTTP.setheader(response, header)
+        HTTP.setheader(target, header)
     end
-    return response
+    return target
+end
+
+# HTTP.jl 2.8's keyword `Response` constructor normalizes and then copies both `headers` and
+# `trailers` (`copy(mkheaders(...))`), so a builder that hands it nothing still pays for four header
+# collections before `setheader` grows a fifth (#446). This calls the struct's field constructor
+# with headers the caller already owns, and stores exactly what the keyword form stores for these
+# two body types: the body as given, its byte count as `content_length`, HTTP/1.1, no reason. That
+# couples it to `HTTP.Response`'s field order; `test/http_internals_contract_tests.jl` pins the
+# order and checks every field against the keyword form.
+function _new_response(status::Integer, headers::HTTP.Headers, body::Union{String,Vector{UInt8}})
+    status < 0 && throw(ArgumentError("status must be >= 0"))
+    return HTTP.Response{typeof(body)}(Int(status), "", headers, HTTP.Headers(), body,
+                                       Int64(sizeof(body)), 0x01, 0x01, false,
+                                       nothing, nothing, nothing, 0)
+end
+
+# One sized header collection: the builder's own header first, then the caller's, applied last
+# with `setheader` so they replace it on a name collision -- the rule `apply_headers!` has always
+# had on a built response.
+function _builder_headers(default::Pair{String,String}, headers)
+    h = HTTP.Headers(1 + length(headers))
+    push!(h, default)
+    return apply_headers!(h, headers)
 end
 
 """
@@ -188,10 +211,8 @@ end
 Return an HTTP.Response with the provided data serialized to JSON and the Content-Type header set to application/json.
 """
 function json(data; status::Int=200, headers::Vector=[])
-    response = HTTP.Response(status, body=JSON.json(data))
-    HTTP.setheader(response, "Content-Type" => "application/json; charset=utf-8")
-    apply_headers!(response, headers)
-    return response
+    return _new_response(status, _builder_headers("Content-Type" => "application/json; charset=utf-8", headers),
+                         JSON.json(data))
 end
 
 """
@@ -201,10 +222,8 @@ Return an HTTP.Response for a body that is *already* serialized JSON. The bytes 
 verbatim — passing them through `JSON.json` would re-encode them as an array of integers.
 """
 function json(data::Vector{UInt8}; status::Int=200, headers::Vector=[])
-    response = HTTP.Response(status, body=data)
-    HTTP.setheader(response, "Content-Type" => "application/json; charset=utf-8")
-    apply_headers!(response, headers)
-    return response
+    return _new_response(status, _builder_headers("Content-Type" => "application/json; charset=utf-8", headers),
+                         data)
 end
 
 """
@@ -217,10 +236,8 @@ content type, and a raw `String` returned from a handler is served as text/plain
 content-sniffing. Escape user-influenced data before it reaches here, always.
 """
 function html(content::String; status::Int=200, headers::Vector=[])
-    response = HTTP.Response(status, body=content)
-    HTTP.setheader(response, "Content-Type" => "text/html; charset=utf-8")
-    apply_headers!(response, headers)
-    return response
+    return _new_response(status, _builder_headers("Content-Type" => "text/html; charset=utf-8", headers),
+                         content)
 end
 
 """
@@ -229,9 +246,7 @@ end
 Return an empty HTTP.Response with the specified status code.
 """
 function status(code::Int; headers::Vector=[])
-    response = HTTP.Response(code, body="")
-    apply_headers!(response, headers)
-    return response
+    return _new_response(code, apply_headers!(HTTP.Headers(length(headers)), headers), "")
 end
 
 """
@@ -244,10 +259,7 @@ Security: `content_type` makes this an opt-in markup sink — `send(x; content_t
 is exactly as dangerous as `html(x)`. Escape user-influenced data first.
 """
 function send(body::String; status::Int=200, headers::Vector=[], content_type::String="text/plain; charset=utf-8")
-    response = HTTP.Response(status, body=body)
-    HTTP.setheader(response, "Content-Type" => content_type)
-    apply_headers!(response, headers)
-    return response
+    return _new_response(status, _builder_headers("Content-Type" => content_type, headers), body)
 end
 
 """
@@ -256,10 +268,7 @@ end
 Return an HTTP.Response for a raw byte body. Defaults to application/octet-stream.
 """
 function send(body::Vector{UInt8}; status::Int=200, headers::Vector=[], content_type::String="application/octet-stream")
-    response = HTTP.Response(status, body=body)
-    HTTP.setheader(response, "Content-Type" => content_type)
-    apply_headers!(response, headers)
-    return response
+    return _new_response(status, _builder_headers("Content-Type" => content_type, headers), body)
 end
 
 """
@@ -398,10 +407,7 @@ Return an HTTP redirect response with the Location header set. Pass `status=307`
 preserve the request method and body.
 """
 function redirect(url::String; status::Int=302, headers::Vector=[])
-    response = HTTP.Response(status, body="")
-    HTTP.setheader(response, "Location" => url)
-    apply_headers!(response, headers)
-    return response
+    return _new_response(status, _builder_headers("Location" => url, headers), "")
 end
 
 
