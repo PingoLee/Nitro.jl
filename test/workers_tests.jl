@@ -3,10 +3,8 @@
 # one is the whole bug, and only a separate process can take a signal without taking the test
 # runner down with it.
 #
-# The child is the issue's own reproduction. `--code-coverage=none` for the reason
-# test/bodyparser_tests.jl gives: an inherited coverage flag costs the child its pkgimages. The
-# "unhandled task" match is case-insensitive because `errormonitor` upper-cases it when stderr is
-# not a terminal.
+# The child is the issue's own reproduction. The "unhandled task" match is case-insensitive
+# because `errormonitor` upper-cases it when stderr is not a terminal.
 #
 # The PARENT sends the signal, and only once the child says it is parked (#414). The child used
 # to send its own, from `sh -c "sleep 4; kill -INT …"`, at a main task asleep for a fixed 8 s,
@@ -14,12 +12,16 @@
 # likely that window closing under load. A handshake has no window to miss, and with no sender
 # spawned inside the child, nothing but the tasks under test is there to park on its thread 1.
 #
+# The parent is `ctrl_c_child` in the `CtrlCChild` setup (test/setup_tests.jl), which owns the
+# handshake, the `settle` lower bound and the watchdog. `settle` matters here because the #369
+# scheduler polled every 0.1 s, so it took a press only once it had re-parked after main.
+#
 # Not on Windows: there is no `kill -INT` to send, and Julia's console Ctrl-C there is a
 # different mechanism.
-@testitem "Workers -- Ctrl-C reaches the main task, not the retention scheduler (#369)" tags=[:workers, :slow] setup=[NitroCommon] begin
+@testitem "Workers -- Ctrl-C reaches the main task, not the retention scheduler (#369)" tags=[:workers, :slow] setup=[NitroCommon, CtrlCChild] begin
 using Test
 
-const CTRL_C_CHILD = raw"""
+const CTRL_C_CHILD = SIGINT_PROBE * raw"""
 Base.exit_on_sigint(false)          # what every REPL does
 using Nitro, Nitro.Workers
 rt = WorkerRuntime(InMemoryWorkerStore())
@@ -56,50 +58,14 @@ end
 println("RESULT main=", got, " scheduler_failed=", istaskfailed(s.task))
 """
 
-# `settle` is how long after READY the press comes, and it is what makes this item sensitive at
-# all: the #369 scheduler polled every 0.1 s, so it took a press only once it had re-parked AFTER
-# the main task -- signalled within milliseconds of READY, main is still the last to park and
-# catches it even against the unpatched code (checked). A real Ctrl-C comes long after `serve`
-# parks. It is a lower bound only, never a window: main waits with no deadline, so a slow runner
-# makes the item slower, not red -- the window was the #414 flake.
-#
-# A child that never says READY, or never exits once signalled, is killed at the deadline and
-# reported as `timed_out` -- a red assertion, never a hung CI leg. The deadline includes the
-# child's startup; a cold pkgimage cache is warmed earlier in a full run by the other children
-# spawned with the same flags, so only a lone filtered run on a cold depot is near it.
-function ctrl_c_child(threads::String; settle::Real=2, deadline::Real=120)
-    cmd = `$(Base.julia_cmd()) --code-coverage=none --threads=$threads --project=$(Base.active_project()) --startup-file=no -e $CTRL_C_CHILD`
-    err = IOBuffer()
-    p = open(pipeline(ignorestatus(cmd); stderr=err), "r")
-    timed_out = Threads.Atomic{Bool}(false)
-    watchdog = Timer(deadline) do _
-        timed_out[] = true
-        kill(p, Base.SIGKILL)
-    end
-    try
-        # Lines until READY, not just the first: stray stdout ahead of it must not cost the press.
-        seen = String[]
-        for line in eachline(p)
-            push!(seen, line)
-            line == "READY" || continue
-            sleep(settle)
-            kill(p, Base.SIGINT)
-            break
-        end
-        out = join(seen, '\n') * '\n' * read(p, String)
-        wait(p)
-        return (; exitcode=p.exitcode, out=out, err=String(take!(err)), timed_out=timed_out[])
-    finally
-        close(watchdog)
-        process_running(p) && kill(p, Base.SIGKILL)   # never leave a child parked forever
-    end
-end
-
 if !Sys.iswindows()
     @testset "with an interactive thread -- Julia 1.12's default for `julia` and `-t auto`" begin
-        r = ctrl_c_child("1,1")
+        r = ctrl_c_child(CTRL_C_CHILD, "1,1"; cue="READY")
+        report(r)
+        @test !r.sigint_ignored
         @test !r.timed_out
         @test r.exitcode == 0
+        @test r.termsignal == 0
         # Against the unpatched scheduler: `main=main_never_saw_it scheduler_failed=true`.
         @test contains(r.out, "RESULT main=main_interrupted scheduler_failed=false")
         @test !occursin(r"unhandled task"i, r.err)
@@ -110,9 +76,12 @@ if !Sys.iswindows()
         # that the scheduler, parked in its `wait(wake)`. It must stop with its warning rather
         # than die (unpatched: `scheduler_failed=true`), and the warning is asserted so a green
         # means the handler ran, not that main happened to take the press instead.
-        r = ctrl_c_child("1,0")
+        r = ctrl_c_child(CTRL_C_CHILD, "1,0"; cue="READY")
+        report(r)
+        @test !r.sigint_ignored
         @test !r.timed_out
         @test r.exitcode == 0
+        @test r.termsignal == 0
         @test contains(r.out, "RESULT main=main_never_saw_it scheduler_failed=false")
         @test occursin("reached the task retention scheduler", r.err)
         @test !occursin(r"unhandled task"i, r.err)

@@ -378,9 +378,9 @@ end
 end
 
 # #372 with a REAL SIGINT, built exactly like the #369 item at the top of test/workers_tests.jl:
-# where Julia delivers a Ctrl-C is the whole bug, and only a child process can take one. Its
-# comments own the handshake, the `settle` lower bound and the watchdog; only what differs is
-# said here.
+# where Julia delivers a Ctrl-C is the whole bug, and only a child process can take one. The
+# parent is the shared `ctrl_c_child` (the `CtrlCChild` setup in test/setup_tests.jl), which
+# owns the handshake, the `settle` lower bound and the watchdog; only what differs is said here.
 #
 # The children register fake hooks, so no Revise is involved: `wait_for_revision_event` is a
 # `take!`, and `revise` prints REVISED, which is the parent's cue. Each child also holds
@@ -395,11 +395,11 @@ end
 # "fatal: error thrown and no exception handler available".
 #
 # Not on Windows, for the reason the #369 item gives.
-@testitem "Revise -- Ctrl-C after an eager revision reaches serve, not the watcher (#372)" tags=[:extension, :slow, :network] setup=[NitroCommon] begin
+@testitem "Revise -- Ctrl-C after an eager revision reaches serve, not the watcher (#372)" tags=[:extension, :slow, :network] setup=[NitroCommon, CtrlCChild] begin
 using Test
 
 # The watcher alone, with main parked in ONE `wait` on it -- the #369 child's shape.
-const WATCHER_CHILD = raw"""
+const WATCHER_CHILD = SIGINT_PROBE * raw"""
 Base.exit_on_sigint(false)          # what every REPL does
 using Nitro
 const TERMINAL_STANDIN = Timer(3600)
@@ -431,7 +431,7 @@ println("RESULT main=", got, " watcher_failed=", istaskfailed(svc.task))
 # be the last task to finish on thread 1 and take the press. It serves NO request, on purpose: a
 # connection task that finishes on thread 1 takes the press the same way, with or without Revise,
 # which is #426 and not this item's subject.
-const SERVE_CHILD = raw"""
+const SERVE_CHILD = SIGINT_PROBE * raw"""
 Base.exit_on_sigint(false)
 using Nitro, Sockets
 const TERMINAL_STANDIN = Timer(3600)
@@ -450,39 +450,14 @@ serve(app; host = "127.0.0.1", port = Int(port), show_banner = false, access_log
 println("RESULT serve_returned")
 """
 
-# The #369 parent, with REVISED as the cue instead of READY.
-function ctrl_c_child(child::String, threads::String; settle::Real=2, deadline::Real=120)
-    cmd = `$(Base.julia_cmd()) --code-coverage=none --threads=$threads --project=$(Base.active_project()) --startup-file=no -e $child`
-    err = IOBuffer()
-    p = open(pipeline(ignorestatus(cmd); stderr=err), "r")
-    timed_out = Threads.Atomic{Bool}(false)
-    watchdog = Timer(deadline) do _
-        timed_out[] = true
-        kill(p, Base.SIGKILL)
-    end
-    try
-        seen = String[]
-        for line in eachline(p)
-            push!(seen, line)
-            line == "REVISED" || continue
-            sleep(settle)
-            kill(p, Base.SIGINT)
-            break
-        end
-        out = join(seen, '\n') * '\n' * read(p, String)
-        wait(p)
-        return (; exitcode=p.exitcode, out=out, err=String(take!(err)), timed_out=timed_out[])
-    finally
-        close(watchdog)
-        process_running(p) && kill(p, Base.SIGKILL)
-    end
-end
-
 if !Sys.iswindows()
     @testset "with an interactive thread -- Julia 1.12's default for `julia` and `-t auto`" begin
-        r = ctrl_c_child(WATCHER_CHILD, "1,1")
+        r = ctrl_c_child(WATCHER_CHILD, "1,1"; cue="REVISED")
+        report(r)
+        @test !r.sigint_ignored
         @test !r.timed_out
         @test r.exitcode == 0
+        @test r.termsignal == 0
         @test contains(r.out, "RESULT main=main_interrupted watcher_failed=false")
         @test !occursin(r"unhandled task"i, r.err)
     end
@@ -490,18 +465,24 @@ if !Sys.iswindows()
     @testset "on one shared thread -- `-t 1`" begin
         # The watcher re-parks after main here, so it takes the press. It must stop with its
         # warning rather than die, and the warning is asserted so a green means the handler ran.
-        r = ctrl_c_child(WATCHER_CHILD, "1,0")
+        r = ctrl_c_child(WATCHER_CHILD, "1,0"; cue="REVISED")
+        report(r)
+        @test !r.sigint_ignored
         @test !r.timed_out
         @test r.exitcode == 0
+        @test r.termsignal == 0
         @test contains(r.out, "RESULT main=main_never_saw_it watcher_failed=false")
         @test occursin("reached the eager-Revise watcher", r.err)
         @test !occursin(r"unhandled task"i, r.err)
     end
 
     @testset "one press after a revision stops a blocking `serve(revise = :eager)`" begin
-        r = ctrl_c_child(SERVE_CHILD, "1,1")
+        r = ctrl_c_child(SERVE_CHILD, "1,1"; cue="REVISED")
+        report(r)
+        @test !r.sigint_ignored
         @test !r.timed_out
         @test r.exitcode == 0
+        @test r.termsignal == 0
         @test contains(r.out, "RESULT serve_returned")
         @test !occursin(r"fatal: error thrown"i, r.err)
     end
