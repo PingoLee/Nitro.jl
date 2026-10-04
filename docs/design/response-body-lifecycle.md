@@ -252,6 +252,58 @@ header-adding middleware must remember to use. P2 stays a rule, enforced by
 `shared_response_mutation_tests.jl`. Reopen this only if a layer's rebuild count grows, or a
 profile shows `_rebuild_with_headers` near the top again.
 
+### What `Res.json` costs, and where JSON.jl spends it (#474)
+
+#465 left `Res.json(Dict)` at 12 allocations / 976 B and attributed the rest to JSON.jl. #474
+asked which of three candidates in JSON.jl's writer was material: key-sorting of every `Dict`,
+`Dict{String,Any}` versus a `NamedTuple` or struct, and the writer's own fixed costs. Measured in
+process with `Profile.Allocs` at `sample_rate = 1`: Julia 1.12.7, one thread, JSON.jl 1.10.0,
+HTTP 2.8.0, per call after warm-up. Flat payloads alternate `Int` and `String` values.
+
+| | 2 keys | 10 keys | 50 keys |
+|---|---|---|---|
+| `JSON.json(Dict{String,Any})`, default sort | 8 | 8 | 10 |
+| `JSON.json(Dict{String,Any})`, `sort_keys = false` | 6 | 6 | 6 |
+| `JSON.json(NamedTuple)` | 9 | 17 | 57 |
+| `Res.json(Dict{String,Any})` | 12 | 12 | 14 |
+| `Res.json(NamedTuple)` | 13 | 21 | 61 |
+
+Allocations per call. A two-field struct costs what a two-field `NamedTuple` costs (9).
+
+**The `Dict` beats the `NamedTuple`, and the gap grows with the key count.** That inverts #474's
+item 2. A `Dict{String}` key passes through `StructUtils.lowerkey` unchanged; a `Symbol` key —
+every `NamedTuple` or struct field — goes through `lowerkey(::JSONStyle, sym::Symbol) =
+String(sym)`, one `String` per field per object. For a 250-row `Vector{NamedTuple}` with three
+fields that is 750 of the 762 allocations. It is the one upstream candidate the measurement
+supports: a `Symbol` is interned, so the writer could copy its bytes into the buffer without a
+`String`. Until that lands, **the docs' `Res.json(Dict(...))` examples are the cheaper form**, and
+the guidance stays as it is.
+
+**Key-sorting is 2 to 4 allocations per `Dict`** (`collect(keys(x))` plus `sort!`), flat in the key
+count. Nothing at the root; on a payload of 250 nested `Dict`s it is ~500 of ~5,000, about 10%.
+Not worth giving up deterministic key order for by itself; decide it with the next nested-payload
+case, not this one.
+
+**What is left in `Res.json(Dict)` at 2 keys is fixed cost**: the output buffer, its `Memory`, the
+final `String`, the ancestor stack `Any[root]` and its `Memory` (circular-reference tracking), one
+`Memory{Any}` behind the `WriteClosure`, and the two sort allocations — 8 — plus 4 for the response
+and its headers. `sizeguess(::Any) = 512` sets bytes, not count.
+
+**The bench's JSON echo is dominated by the parse, not the write.** `bench/suite/json.jl`'s
+`echo_10kb_served` (250 rows through `getjson` → `Res.json`, pipeline built once) is 5,047
+allocations / 236 KB; `JSON.parse` into `Dict{String,Any}` is 2,510 of them, about ten per row for
+the `Dict`, its two `Memory`s, the boxed values and the key strings. That is inherent to an untyped
+parse. The typed extractor `Json{T}` is the lever on that side, and is unmeasured.
+
+**JSON.jl below 1.9 is a different story.** The `[compat]` floor moved to `^1.9` in #306 for the
+read style, which happened to exclude two writer costs this measurement found in 1.8.0: every
+array element paid two allocations (`StructUtils.applyeach(::AbstractArray)` stringified the
+*index* through `lowerkey(::Real) = string(i)` though arrays never write a key — `JSON.json` of a
+250-element `Vector{Int}` was 507 allocations against 7 on 1.10), and every `Dict{String,Any}` key
+boxed the `WriteClosure` on the dynamic call (60 against 10 at 50 keys). A stale local
+`Manifest.toml` still resolving 1.8.0 reproduces both; `Manifest.toml` is gitignored, so
+`Pkg.update()` is the fix, not a commit.
+
 ## 4. Reference facts
 
 - Up to 2.6, a `String` body was wrapped in a `BytesBody`, and HTTP.jl #1272 declared that
