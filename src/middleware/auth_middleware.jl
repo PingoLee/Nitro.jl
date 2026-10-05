@@ -6,6 +6,7 @@ using ...Types: _is_identity
 using ...Cookies: get_cookie
 using ...Errors: CookieError, is_unrecoverable
 using ...Crypto: SecretString, _cookie_secret
+using ...Util: _auth_credential
 
 export BearerAuth, CookieAuthMiddleware
 
@@ -152,6 +153,9 @@ Creates a middleware function for authentication using a pluggable token validat
 - `validate_token::Function`: A function that takes a token string (and optionally the request) and returns user info, a `(user, claims)` tuple, or `nothing` if invalid. `nothing`, `missing`, a `Bool`, `""` and an empty dict are not identities, so each is a `401`, and so is a tuple whose *user* half is one of them — a predicate like `t -> t == KEY` authenticates nobody; return an identity (`t -> t == KEY ? "api-client" : nothing`).
 - `header::String = "Authorization"`: The name of the header to check for the token.
 - `scheme::String = "Bearer"`: The authentication scheme prefix in the header (e.g., "Bearer" for "Bearer <token>").
+  It is matched ASCII-case-insensitively, as RFC 9110 §11.1 requires, so `bearer <token>` and
+  `BEARER <token>` are accepted too; the separator may be one or more spaces or tabs. It must
+  be a single token: a scheme that is empty or contains a space or tab can never match.
 
 Responses follow the auth error contract: missing/malformed credentials or a failed (or
 throwing) validator yields a `401`; authorization denials are the guards' `403`.
@@ -174,15 +178,10 @@ not a `LifecycleMiddleware` — pass it to `serve(middleware = [...])` or `path(
 """
 function BearerAuth(validate_token::Function; header::String = "Authorization", scheme::String = "Bearer", cookie_name::Nullable{String} = nothing)
 
-    full_scheme = scheme * " "
-    # In BYTES: `_extract_token` slices the header by it. A character count sliced mid-character
-    # on a non-ASCII header -- `Bearer éé` -> StringIndexError -> a 500 with a backtrace (#326).
-    scheme_prefix_len = ncodeunits(full_scheme)
-
     return function (handle::Function)
         return function(req::HTTP.Request)
 
-            token = _extract_token(req, header, full_scheme, scheme_prefix_len, cookie_name)
+            token = _extract_token(req, header, scheme, cookie_name)
             if token === nothing
                 return INVALID_HEADER
             end
@@ -202,19 +201,14 @@ function BearerAuth(validate_token::Function; header::String = "Authorization", 
     end
 end
 
-function _extract_token(req::HTTP.Request, header::String, full_scheme::String, scheme_prefix_len::Int, cookie_name::Nullable{String})
+function _extract_token(req::HTTP.Request, header::String, scheme::String, cookie_name::Nullable{String})
     auth_header = HTTP.header(req, header, missing)
-    if !(ismissing(auth_header) || !startswith(auth_header, full_scheme))
-        # Byte offsets throughout (#326). `startswith` has matched all of `full_scheme`, which
-        # ends in a space, so `scheme_prefix_len + 1` starts a character; the end is left to `SubString`, which
-        # stops at `lastindex` -- an explicit `ncodeunits` end is mid-character whenever the
-        # header ends in a multibyte one.
-        if ncodeunits(auth_header) > scheme_prefix_len
-            token = strip(SubString(auth_header, scheme_prefix_len + 1))
-            if !isempty(token)
-                return String(token)
-            end
-        end
+    if !ismissing(auth_header)
+        # The scheme is case-insensitive (#470), and the header is bytes: `_auth_credential`
+        # slices at a found SP/HTAB rather than by a counted length, so a non-ASCII or malformed
+        # header can neither end the slice mid-character (#326) nor reach the Unicode tables.
+        token = _auth_credential(auth_header, scheme)
+        token === nothing || return String(token)
     end
 
     if !isnothing(cookie_name)

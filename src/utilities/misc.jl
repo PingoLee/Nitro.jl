@@ -408,10 +408,41 @@ header_name_isequal(a::AbstractString, b::AbstractString) = lowercase(a) == lowe
 # whitespace (SP, HTAB) and folds case only on ASCII, neither of which ever inspects a char's
 # category.
 #
-# Internal, not exported: import them as `using ...Util: _ows_strip, _ascii_lower_eq`. They live
-# here because `ExtractIP`, `CSRFMiddleware` and `CrossOriginProtection` all read header values.
+# Internal, not exported: import what you need, e.g. `using ...Util: _ows_strip, _auth_credential`.
+# They live here because `ExtractIP` (`_ows_strip`, `_ascii_lower_eq`), `CrossOriginProtection`
+# (`_ows_strip`), and `CSRFMiddleware`, `BearerAuth`, `extract_auth_token` (`_auth_credential`)
+# all read header values.
 _ows_strip(s::AbstractString) = strip(c -> c == ' ' || c == '\t', s)
 _ascii_lower_eq(s::AbstractString, lower::String) = all(isascii, s) && lowercase(s) == lower
+
+# Code unit by code unit, folding only A-Z: any other byte, including every byte of a multibyte
+# or malformed character, must match exactly. Unlike `_ascii_lower_eq` it compares two arbitrary
+# strings, so an app-configured scheme need not be lowercase, or even ASCII.
+function _ascii_casefold_eq(a::AbstractString, b::AbstractString)::Bool
+    ncodeunits(a) == ncodeunits(b) || return false
+    for i in 1:ncodeunits(a)
+        x, y = codeunit(a, i), codeunit(b, i)
+        x == y && continue
+        fx = x | 0x20
+        (fx == y | 0x20 && UInt8('a') <= fx <= UInt8('z')) || return false
+    end
+    return true
+end
+
+# `credentials = auth-scheme [ 1*SP ( token68 / #auth-param ) ]` (RFC 9110 §11.1): the text
+# after `scheme`, or `nothing` when the scheme differs or nothing follows it. The scheme is a
+# case-insensitive token, so `bearer x` is `Bearer x`; HTAB is tolerated beside SP. The one
+# definition of "scheme + separator" that `BearerAuth`, `extract_auth_token` and
+# `CSRFMiddleware` share (#470) -- they used to disagree, so a request one layer read as a
+# bearer credential the other refused.
+function _auth_credential(value::AbstractString, scheme::AbstractString)
+    credential = _ows_strip(value)
+    gap = findfirst(c -> c == ' ' || c == '\t', credential)
+    gap === nothing && return nothing
+    _ascii_casefold_eq(SubString(credential, 1, prevind(credential, gap)), scheme) || return nothing
+    rest = _ows_strip(SubString(credential, gap))
+    return isempty(rest) ? nothing : rest
+end
 
 """
     own_response_headers(resp::HTTP.Response) -> HTTP.Response

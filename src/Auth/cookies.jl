@@ -4,6 +4,8 @@ const DEFAULT_AUTH_COOKIE_NAME = "auth_token"
     extract_auth_token(req; header="Authorization", scheme="Bearer", cookie_name=nothing)
 
 The token from `req`'s `header` (`"<scheme> <token>"`), or `nothing` when there is none.
+The scheme is matched ASCII-case-insensitively (RFC 9110 §11.1), so `bearer <token>` counts,
+and spaces or tabs may separate it from the token, exactly as in [`BearerAuth`](@ref).
 
 **Reading a cookie is opt-in.** With `cookie_name` set, a request with no usable header falls
 back to that cookie. A cookie is an *ambient* credential — the browser attaches it to
@@ -20,14 +22,10 @@ extract_auth_token(req; cookie_name = "auth_token")  # header, then the auth coo
 credential with `CSRFMiddleware` on state-changing routes.
 """
 function extract_auth_token(req::HTTP.Request; header::String="Authorization", scheme::String="Bearer", cookie_name::Union{String, Nothing}=nothing)
-    auth_header = HTTP.header(req, header, "")
-    full_scheme = string(scheme, " ")
-    if startswith(auth_header, full_scheme)
-        # A byte offset, as in `BearerAuth` (#326): `length` counts characters, and a non-ASCII
-        # scheme would start the slice mid-character.
-        token = strip(SubString(auth_header, ncodeunits(full_scheme) + 1))
-        isempty(token) || return String(token)
-    end
+    # The parser `BearerAuth` uses (#470), so the helper and the middleware cannot disagree
+    # about which spellings of the scheme count.
+    token = _auth_credential(HTTP.header(req, header, ""), scheme)
+    token === nothing || return String(token)
 
     if cookie_name !== nothing
         token = get_cookie(req, cookie_name, nothing; encrypted=false)
