@@ -8,7 +8,7 @@ using Nitro.Auth: JWTKeyset, encode_jwt, decode_jwt, jwt_validator
 
 caught(f) = try; f(); nothing; catch err; err; end
 message(f) = sprint(showerror, caught(f))
-kids(ks::JWTKeyset) = [kid for (kid, _) in Nitro.Auth._verify_candidates(ks, nothing)]
+kids(ks::JWTKeyset) = [candidate.kid for candidate in Nitro.Auth._verify_candidates(ks, nothing)]
 header_kid(tok) = get(
     JSON.parse(String(Nitro.Crypto.base64url_decode(split(tok, '.')[1]))), "kid", nothing)
 
@@ -224,10 +224,20 @@ end
 
 @testset "the verify path is type-stable (nitro-core §7)" begin
     ks = JWTKeyset("current" => jwtkey("s1"); verify = ["previous" => jwtkey("s2")])
-    T = Vector{Tuple{Nullable{String}, String}}
-    @test (@inferred Nitro.Auth._verify_candidates(ks, nothing)) isa T
-    @test (@inferred Nitro.Auth._verify_candidates(ks, "previous")) isa T
-    @test (@inferred Nitro.Auth._verify_candidates(jwtkey("s1"), "label")) isa T
+    # A single secret's one candidate is a `Tuple`, not a `Vector` (#456): the container is the
+    # method's, the element type is the same concrete struct either way.
+    C = Nitro.Auth._VerifyCandidate
+    @test isconcretetype(C)
+    @test (@inferred Nitro.Auth._verify_candidates(ks, nothing)) isa Vector{C}
+    @test (@inferred Nitro.Auth._verify_candidates(ks, "previous")) isa Vector{C}
+    @test (@inferred Nitro.Auth._verify_candidates(jwtkey("s1"), "label")) isa Tuple{C}
+    @test only(Nitro.Auth._verify_candidates(jwtkey("s1"), "label")).kid == "label"
+    @test only(Nitro.Auth._verify_candidates(jwtkey("s1"), nothing)).kid === nothing
+    # It holds a revealed key, so it prints without one -- alone, and inside the containers.
+    shown = sprint(show, Nitro.Auth._verify_candidates(ks, nothing))
+    @test !occursin(jwtkey("s1"), shown) && !occursin(jwtkey("s2"), shown)
+    @test occursin("current", shown) && occursin("<redacted>", shown)
+    @test !occursin(jwtkey("s1"), sprint(show, MIME("text/plain"), Nitro.Auth._verify_candidates(jwtkey("s1"), nothing)))
     @test (@inferred Nitro.Auth._signing_secret(ks)) == (jwtkey("s1"), "current")
     @test (@inferred Nitro.Auth._signing_secret(jwtkey("s1"))) == (jwtkey("s1"), nothing)
 

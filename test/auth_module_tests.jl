@@ -580,7 +580,7 @@ end
     end
 end
 
-@testset "the JWT hot path: strict header, viewed signing input, bounded allocations (#449)" begin
+@testset "the JWT hot path: strict header, viewed signing input, bounded allocations (#449, #456)" begin
     caught(f) = try; f(); nothing; catch err; err; end
     secret = jwtkey("secret-a")
     raw64(str) = Nitro.Crypto.base64url_encode(codeunits(str))
@@ -627,12 +627,55 @@ end
     empty_claims = caught(() -> Nitro.Auth.decode_jwt(sign(string(head, ".")), secret))
     @test sprint(showerror, empty_claims) == "Invalid JWT encoding"
 
-    # The validator a bearer request runs, held to #449's byte target. It was ~11.7 KB and 176
-    # allocations per token before #432/#449, and ~2.5 KB / 58 after them.
+    # The token is split by locating its two dots rather than by `split` (#456). `split` is the
+    # reference: for every token with exactly two dots the segments must be byte-identical to
+    # its, and every other token must be "Invalid JWT format". The corpus puts multi-byte and
+    # invalid-UTF-8 characters on both sides of each dot, where a segment boundary computed one
+    # byte short of the dot would land mid-character and throw StringIndexError instead.
+    segments_of(t) = try; Nitro.Auth._jwt_segments(t); catch err; err; end
+    for t in ("", ".", "..", "...", "abc", "a.b", "a.b.c", "a.b.c.d", "a..c", "..c", "a..", ".b.",
+              "é.€.𝄞", "aé.b€.c𝄞", "é..", "..𝄞", "a\xff.\x80b.c\xc3", "\xe2\x82.b.c", "a.b.c.é.")
+        expected = count(==('.'), t) == 2 ? Tuple(split(t, '.')) : "Invalid JWT format"
+        got = segments_of(t)
+        got isa Exception && (got = sprint(showerror, got))
+        @test (t, got) == (t, expected)
+    end
+    # And through the decoder, a multi-byte character ending the HEADER or the SIGNATURE (the
+    # claims-segment case is above) is a typed refusal, never a StringIndexError.
+    for tail in ("é", "€", "𝄞")
+        err = caught(() -> Nitro.Auth.decode_jwt(string(head, tail, ".", body, ".", sig), secret))
+        @test (tail, sprint(showerror, err)) == (tail, "Invalid JWT encoding")
+        err = caught(() -> Nitro.Auth.decode_jwt(string(good, tail), secret))
+        @test (tail, sprint(showerror, err)) == (tail, "Invalid JWT signature encoding")
+    end
+
+    # `_claim_int` is compiled once for `Any` and tests a concrete `Int` before the abstract
+    # spellings (#456). Each spelling it accepted before still means the same number, and each
+    # it refused is still refused.
+    claim_int(v) = try; Nitro.Auth._claim_int(v, "exp"); catch err; sprint(showerror, err); end
+    for (value, expected) in ((NOW_TS, NOW_TS), (Int32(7), 7), (true, 1), (UInt8(9), 9),
+                              (5.9, 5), (-5.9, -5), ("123", 123), ("1.5", "Invalid exp claim"),
+                              ("", "Invalid exp claim"), (nothing, "Invalid exp claim"),
+                              (Any[1], "Invalid exp claim"), (Dict("a" => 1), "Invalid exp claim"))
+        @test (value, claim_int(value)) == (value, expected)
+    end
+    @test Base.return_types(Nitro.Auth._claim_int, (Any, String)) == [Int]
+
+    # The validator a bearer request runs, held to #449's targets: under 4 KB AND under 50
+    # allocations per token. Measured on a realistic token -- seven claims, the shape the
+    # numbers below come from -- because a three-claim one was already under 50 before #456.
+    # It was ~11.7 KB / 176 before #432/#449, ~2.4 KB / 54 after them, and ~1.8 KB / 41 after
+    # #456 (Julia 1.12). 50 rather than the measured value, so a Julia release that moves a few
+    # allocations does not fail it. The minimum of a few runs, because both counters are
+    # process-wide: another task allocating mid-measurement is charged to this call.
     validator = Nitro.Auth.jwt_validator(secret)
-    validator(good)
-    validator(good)
-    @test (@allocated validator(good)) < 4_096
+    typical = Nitro.Auth.encode_jwt(Dict("sub" => "42", "iss" => "https://issuer.example",
+                                         "aud" => "api", "role" => "admin", "name" => "Ada"),
+                                    secret; expires_in = 3600)
+    validator(typical)
+    validator(typical)
+    @test minimum(@allocated(validator(typical)) for _ in 1:5) < 4_096
+    @test minimum(@allocations(validator(typical)) for _ in 1:5) < 50
 end
 
 # A `dicttype` whose constructor throws: it runs inside `_jwt_segment_json`'s `try`, which is
@@ -727,7 +770,7 @@ end
     # decided -- the candidate list, fixed once at construction: the signing key first,
     # then the rest by kid. Reverse the sort, or stop putting the signing key first, and
     # these fail.
-    trial_order(ks) = [kid for (kid, _) in Nitro.Auth._verify_candidates(Nitro.Auth.JWTKeyset(ks), nothing)]
+    trial_order(ks) = [candidate.kid for candidate in Nitro.Auth._verify_candidates(Nitro.Auth.JWTKeyset(ks), nothing)]
     @test trial_order(Dict("zulu" => jwtkey("s1"), "default" => jwtkey("s2"), "alpha" => jwtkey("s3"))) == ["default", "alpha", "zulu"]
     @test trial_order(Nitro.Auth.JWTKeyset("zulu" => jwtkey("s1"); verify = ["bravo" => jwtkey("s2"), "alpha" => jwtkey("s3")])) ==
         ["zulu", "alpha", "bravo"]

@@ -131,9 +131,9 @@ function base64url_decode(data::Union{String, SubString{String}})
     remainder == 1 && throw(ArgumentError("not base64url: impossible length"))
     # 6 bits per character; a leftover 2 or 3 characters carry 1 or 2 whole bytes, so this is
     # exactly the decoded length and every write below lands inside it. A plain vector, unlike
-    # the encoder's `StringVector`: that saves the copy when a JWT segment goes on to
-    # `String(...)`, but costs an allocation here, and allocations are what the JWT path
-    # still has too many of (#449).
+    # the encoder's `StringVector`, which would cost an allocation here (#449). A JWT segment
+    # no longer goes on to `String(...)` at all -- the parser reads these bytes directly (#456)
+    # -- so there is no copy left for a `StringVector` to save.
     out = Vector{UInt8}(undef, (count * 3) >> 2)
     values = _BASE64URL_VALUES
     accumulator = UInt32(0)
