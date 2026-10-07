@@ -373,6 +373,13 @@ try
     @test HTTP.header(responses[3], "Content-Length") == "5"
     @test String(responses[6].body) == "hello"
 
+    # `recording` records only after `stream_handler` returns, and by then the client may already
+    # have the bytes -- that early write is the behavior under test. So the last record can still
+    # be on its way when the client gets here; wait for it rather than race it (#480). `closed` was
+    # still read the moment `stream_handler` returned, so the claim is not weakened.
+    @test timedwait(10.0) do
+        lock(() -> length(closed_on_return), seen_lock) == length(responses)
+    end === :ok
     snapshot = lock(() -> copy(closed_on_return), seen_lock)
     @test length(snapshot) == length(responses)
     @test all(snapshot)
