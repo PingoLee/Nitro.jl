@@ -44,7 +44,14 @@ is explicit introspection, not accidental disclosure.)
   (#375): a client that opens with the cleartext HTTP/2 (h2c) preface is answered `400` and
   disconnected. Put HTTP/2 and TLS at the proxy, and have it speak HTTP/1.1 upstream.
 - `async=false`: when `true`, return the running `Server` instead of blocking.
-- `parallel=true`: handle requests on the thread pool via `Threads.@spawn`.
+- `parallel=true`: run each request on its own `Threads.@spawn` task in Julia's default thread
+  pool. This is what lets `--threads` reach your handlers: HTTP.jl runs its accept loop and every
+  connection task on the separate *interactive* pool, which `--threads=N` (N > 1) gives one
+  thread. With `parallel=false` each handler runs on its connection task, so the whole server
+  handles requests on the interactive pool's thread(s) however many default threads the process
+  has, and `serve` logs a warning when it does. (With no interactive thread, `--threads=1` or
+  `--threads=N,0`, HTTP.jl runs connection tasks in the default pool instead.) See "Running in
+  Production" in the docs.
 - `serialize=true`: auto-format handler return values into responses (see `Res`).
 - `catch_errors=true`: convert an error thrown by a handler **or by middleware** into a
   generic `500 Internal Server Error` and log it with its backtrace. A `ValidationError` becomes

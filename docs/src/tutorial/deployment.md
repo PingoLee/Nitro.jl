@@ -41,8 +41,10 @@ covered in [Memory and GC](@ref) below — check it on the target machine, not o
 ```
 
 The thread count is the default pool, where handlers run. Julia 1.12 also starts one
-*interactive* thread; HTTP.jl accepts connections there, and with the default `parallel = true`
-no handler runs on it.
+*interactive* thread, in a pool of its own: `--threads=8` means 8 default threads **and** 1
+interactive one. HTTP.jl runs its accept loop and every connection's task there, reading each
+request's head before handing it on. With the default `parallel = true`, Nitro starts every
+request on its own task in the default pool, so no handler runs on the interactive thread.
 
 A process with no GC target prints `GC target: none`. When the environment is `prod`
 (`NITRO_ENV=prod`), `serve` also logs a warning about it at startup, even with
@@ -53,6 +55,36 @@ set for you: the banner and the warning only report what the process was started
 mask allows). Julia also sizes its parallel
 GC to the same number unless you pass `--gcthreads`, so the thread count reaches the collector as
 well as the handlers. Pin an explicit number (`--threads=8`) when the process shares its host.
+
+### Do not turn off `parallel`
+
+`serve(parallel = false)` skips the per-request task: each handler runs on its connection's task,
+on the interactive thread. The whole server then handles requests on the interactive pool alone
+(**one** thread unless `--threads=N,M` raised it), however many default threads `--threads` gave
+it.
+Go can serve a connection's requests on that connection's goroutine and still use every core,
+because goroutines run on all of them; HTTP.jl's connection tasks run only on the interactive
+pool, so in Julia the per-request task is what reaches the other threads. When the process has
+more than one default thread and an interactive one, `serve(parallel = false)` logs a warning
+saying so.
+
+### The interactive thread
+
+For N above 1, `--threads=N` is short for `--threads=N,1`: the second number is the interactive
+pool. (`--threads=1` gives it none, and so does `--threads=N,0`; HTTP.jl then runs its connection
+tasks in the default pool, and what follows does not apply.) Every
+request passes through that pool once, for HTTP.jl to read its head and for Nitro to start its
+task, so at a high enough request rate the one interactive thread is the bottleneck while the
+default threads wait for work. Handler cost decides where that happens. A route that does real
+work (a database query, a template) runs into the default pool's limit first, and a second
+interactive thread changes nothing. Small, fast responses at tens of thousands of requests per
+second hit the interactive thread first.
+
+On one machine, with the server pinned to 4 cores (8 logical CPUs) and serving a minimal route
+(Julia 1.12.7, `bench/socket/run.sh`), `--threads=8,2` served roughly a quarter to a half more
+requests per second than `--threads=8`, and HTTP.jl on its own moved the same way. If load
+tests show the default threads idle while throughput stops climbing, try `--threads=N,2` and
+measure; there is no reason to raise it otherwise.
 
 ## Memory and GC
 

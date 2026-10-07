@@ -62,6 +62,23 @@ function _warn_if_no_gc_target(env::AbstractString, gc_target::Nullable{UInt64})
     return nothing
 end
 
+# `parallel = false` on a process started with several default threads (#454). Not the case #149
+# declined to warn about: one thread is a valid deployment, but here the caller asked for N threads
+# and then turned off the one thing that reaches them. HTTP.jl 2.x runs every connection task on
+# the `:interactive` pool -- one thread for `-t N` with N > 1 -- so without the per-request spawn
+# every handler runs there, whatever `-t` says. With NO interactive thread (`-t N,0`, and `-t 1`
+# on Julia 1.12) HTTP.jl's interactive spawn falls back to the default pool, connection tasks run
+# on every thread, and nothing is stranded -- so that case is silent. Every environment: the
+# contradiction is the same in dev, and dev is where a throughput test would be misread.
+function _warn_if_serial_on_threads(parallel::Bool, ndefault::Int, ninteractive::Int)::Nothing
+    (parallel || ndefault <= 1 || ninteractive == 0) && return nothing
+    @warn "serve(parallel = false) runs every handler on HTTP.jl's connection tasks, which live " *
+          "on Julia's interactive thread pool ($ninteractive thread$(ninteractive == 1 ? "" : "s")" *
+          "), so none of this process's $ndefault default threads ever runs a handler. Drop " *
+          "`parallel = false` to use them; see \"Running in Production\" in the Nitro docs."
+    return nothing
+end
+
 function serverwelcome(external_url::String, prefix::Nullable{String}, parallel::Bool;
                        gc_target::Nullable{UInt64} = _gc_target_bytes())
     server_url = Util.join_url_path(external_url, prefix)
@@ -446,6 +463,7 @@ function serve(ctx::App;
     # `listen!` can still refuse below (an address in use, say), after the warning has been
     # logged; that costs one accurate line about the process, which is harmless.
     _warn_if_no_gc_target(current_env(), _gc_target_bytes())
+    _warn_if_serial_on_threads(parallel, Threads.nthreads(:default), Threads.nthreads(:interactive))
 
     try
         return startserver(ctx; host, port, show_banner, parallel, async, kwargs, start=(kwargs) ->

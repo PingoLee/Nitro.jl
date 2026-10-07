@@ -391,6 +391,21 @@ end
     @test_logs min_level = Base.CoreLogging.Debug warn_fn("prod", nothing)
 end
 
+@testset "parallel = false warns only when it strands default threads (#454)" begin
+    warn_fn = Nitro.Core._warn_if_serial_on_threads
+    @test_logs (:warn, r"parallel = false.*\(1 thread\).*8 default threads") warn_fn(false, 8, 1)
+    @test_logs (:warn, r"\(2 threads\)") warn_fn(false, 8, 2)
+    @test_logs (:warn, r"parallel = false") warn_fn(false, 2, 1)
+    # The default, and one thread either way, are silent: a single thread is a valid
+    # deployment (#149), and with one default thread `parallel = false` strands nothing.
+    @test_logs min_level = Base.CoreLogging.Debug warn_fn(true, 8, 1)
+    @test_logs min_level = Base.CoreLogging.Debug warn_fn(true, 1, 1)
+    @test_logs min_level = Base.CoreLogging.Debug warn_fn(false, 1, 1)
+    # No interactive thread (`-t 8,0`): HTTP.jl's interactive spawn falls back to the default
+    # pool, connection tasks already run on every thread, and a warning would be false.
+    @test_logs min_level = Base.CoreLogging.Debug warn_fn(false, 8, 0)
+end
+
 @testset "the GC target is read from the running process (#299)" begin
     # The live read works on this runtime. Whether it reflects `--heap-size-hint` needs a child
     # process with one, which is the separate `:slow` item at the end of this file.
