@@ -16,20 +16,30 @@
 #   PROFILE=<seconds>   After WARMUP seconds, sample every thread for this long and write flat and
 #                       per-thread reports under bench/results/. 0 (the default) disables it.
 #   WARMUP=<seconds>    Delay before the profile window opens. Default 8.
+#   PRELOAD="Pkg ..."   Load these packages before serving, so `rss.sh` can measure what one adds
+#                       to the process (PRELOAD=PormG also loads NitroPormGExt). The project
+#                       passed to `--project` must have them; the bench env does not.
 #
 # Run with `julia --project=bench -t 8 bench/socket/server.jl`. Every mode answers the same three
 # routes with the same bodies, so the stacks differ only in what serves them.
 
 using HTTP
 using JSON
-using Nitro
-using Profile
 
 const MODE       = get(ENV, "MODE", "nitro")
-const PORT       = parse(Int, get(ENV, "PORT", "8080"))
+
+# Only where it is used, so a `bare_*` process has no Nitro in it at all: `rss.sh` reports that
+# mode as the HTTP.jl-only floor (#451), and a loaded-but-idle Nitro would be counted in it.
+MODE in ("nitro", "nitro_log") && @eval using Nitro
+
+const PORT      = parse(Int, get(ENV, "PORT", "8080"))
 const ACCESS_LOG = get(ENV, "ACCESS_LOG", "0") == "1" || MODE == "nitro_log"
 const PROFILE_S  = parse(Float64, get(ENV, "PROFILE", "0"))
 const WARMUP_S   = parse(Float64, get(ENV, "WARMUP", "8"))
+
+for pkg in split(get(ENV, "PRELOAD", ""))
+    @eval using $(Symbol(pkg))
+end
 
 const PLAINTEXT = "Hello, World!"
 json_body() = JSON.json(Dict("message" => "Hello, World!"))
@@ -60,7 +70,11 @@ function start_nitro()
     return app
 end
 
-function profile_window()
+# Profile is not in Julia's system image (~13 MiB resident once loaded), so it loads only when
+# profiling: `rss.sh` must not count it. The function is evaluated after the `using`, not defined
+# at top level, because `Profile.@profile` needs the module when the macro expands.
+PROFILE_S > 0 && @eval using Profile
+PROFILE_S > 0 && @eval function profile_window()
     sleep(WARMUP_S)
     Profile.init(n = 10^7, delay = 0.001)
     Profile.clear()

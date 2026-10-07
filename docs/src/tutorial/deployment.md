@@ -1,8 +1,9 @@
 # Running in Production
 
-This page is about the Julia process itself: how many threads to give it and how much memory to
-tell its garbage collector it has. What sits in *front* of that process — TLS, static assets,
-body caps, the real client IP — is covered in [Behind a Reverse Proxy](reverse_proxy.md).
+This page is about the Julia process itself: how many threads to give it, how much memory to
+tell its garbage collector it has, and what its first requests cost. What sits in *front* of that
+process — TLS, static assets, body caps, the real client IP — is covered in
+[Behind a Reverse Proxy](reverse_proxy.md).
 
 ## HTTP/1.x only
 
@@ -55,6 +56,9 @@ set for you: the banner and the warning only report what the process was started
 mask allows). Julia also sizes its parallel
 GC to the same number unless you pass `--gcthreads`, so the thread count reaches the collector as
 well as the handlers. Pin an explicit number (`--threads=8`) when the process shares its host.
+Leave `--gcthreads` at that default on a host of its own: Julia's collector stops every handler
+while it marks the heap, so the more threads share the marking, the shorter that pause. Lower it
+only when the CPUs it would use belong to something else.
 
 ### Do not turn off `parallel`
 
@@ -118,6 +122,35 @@ hint. `%` is also measured against that limit: inside a 4 GiB cgroup, `--heap-si
 implementation uses the cgroup limit when there is one; reported upstream as
 [JuliaLang/julia#63337](https://github.com/JuliaLang/julia/issues/63337).
 
+### What the process costs at rest
+
+A Julia server holds a few hundred MiB before it holds any request data: the runtime, its
+system image, LLVM's compiler, and the compiled code of every package it loaded. Measured
+resident memory (RSS), on Julia 1.12.7, Linux x86-64, `--threads=8`, rounded to
+5 MiB:
+
+| Process | At rest | After one request per route | After 60 s of load |
+|---|---|---|---|
+| `julia`, no packages loaded | 245 MiB | — | — |
+| HTTP.jl serving three routes, Nitro not loaded | 380 MiB | 405 MiB | — |
+| Nitro `serve()`, no middleware | 450 MiB | 465 MiB | 490 MiB |
+| Nitro `serve()` with PormG loaded | 625 MiB | 645 MiB | 650 MiB |
+
+These are floors, not totals: your own code, your other dependencies (a database driver, a
+template engine), and the data your handlers hold come on top. The load was `oha` at 50
+connections against a small JSON route; `bench/socket/rss.sh` reproduces the table on your
+machine. PormG was loaded without a database connection, so a live driver adds to its row.
+
+Two things the table says about sizing:
+
+- **The floor does not grow with traffic.** The rise after load is the first requests' compiled
+  code and the GC's working room, and it stops there: the same load rose about 30 MiB above the
+  warm reading whether it ran for 60 seconds or for 180. Memory that keeps climbing under steady
+  load is your data, not the floor; see [After an unexplained kill](@ref).
+- **`--threads` does not multiply it.** The same server measured within 15 MiB at
+  `--threads=1` and `--threads=8`. Threads add request *capacity*; what they cost in memory is the
+  data the extra concurrent requests hold, which is the next section.
+
 ### Sizing it
 
 The GC reserves **250 MiB** of the hint for memory it does not manage (LLVM, C libraries), aims the
@@ -136,7 +169,9 @@ heap at the remainder, and starts collecting hard at about 80% of that. Two cons
   before any handler allocates anything. That memory is **live**, so no hint reclaims it.
 
 A workable starting point: the hint at the steady-state RSS you observe under realistic load plus
-headroom, and at least 250 MiB below whatever limit the host or cgroup enforces.
+headroom, and at least 250 MiB below whatever limit the host or cgroup enforces. That
+steady state starts from the floor above, so a container limit of 512 MiB is too small for any
+Nitro process, and one of 1 GiB leaves only about half of it for your code and data.
 
 ### Bounding requests in flight
 
@@ -263,3 +298,36 @@ Then work out which of the two causes it was:
    one is climbing: live bytes rising means something is holding references (a cache, a session
    store, a module-level collection); RSS rising while live bytes stay flat points outside the
    Julia heap.
+
+## Cold start
+
+Julia compiles a method the first time it runs with a given set of argument types, so the first
+request a fresh process serves pays for compiling the code it reaches. On a default
+`serve()` with one plain route (Julia 1.12.7, `bench/socket/first_request.sh`), the first request
+took about **1 second** and the second about half a millisecond. Most of that second is paid
+once per process; every route your app adds then pays its own, smaller share the first time it
+is hit, and so does a middleware stack other than the default one.
+
+Nitro already ships what it can: its `PrecompileTools` workload (`src/precompile.jl`) runs the
+router, the serializer, the typed extractors and static and SPA mounts while the package
+precompiles, and compiles (without running) the transport layer of a default `serve()` — no
+`middleware`, the access log on — so that code is cached with Nitro itself. What it cannot reach
+is HTTP.jl's own connection loop, which only a live socket drives, a transport with any other
+middleware stack, and your application's handlers.
+
+That matters wherever a fresh process takes traffic at once: a deploy, a restart after a crash,
+an autoscaled replica. Two remedies, in order of effort:
+
+- **Warm it before it takes traffic.** Start the new process, request your important routes
+  from the same host (a health check that touches them, or a short script), and only then let
+  the proxy or the orchestrator route to it — a Kubernetes readiness probe, or starting the new
+  unit before stopping the old one. Each route compiles once per process, so this costs seconds
+  at startup and nothing after.
+- **Build a system image** with [PackageCompiler.jl](https://github.com/JuliaLang/PackageCompiler.jl),
+  giving it a precompile script that exercises your routes over a real socket. The compiled code
+  is then in the image the process starts from, including the HTTP.jl paths the workload above
+  cannot reach. It costs a build step, an image to rebuild whenever a dependency changes, and a
+  larger file to ship.
+
+Either way, measure the first request on the target machine; a laptop with a warm package cache
+says little about a fresh container.
