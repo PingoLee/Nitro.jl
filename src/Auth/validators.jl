@@ -8,14 +8,19 @@ end
 
 # Build the normalized principal for a verified token. `kid` must already be trusted
 # (keyset-resolved) or `nothing`.
-function _principal(claims::AbstractDict, kid::Union{String, Nothing}, identity_from::Symbol, identity_claim::String)
-    id = if identity_from === :kid
+#
+# Through the field constructor, not `Principal(claims; id, kid, source)`: every input is
+# already in the normalized form that keyword constructor would produce -- the claims are the
+# `Dict{String, Any}` `_decode_jwt` parsed, `id` and `kid` are `Nullable{String}` -- and its
+# keyword call cost two allocations per token for nothing (#456).
+function _principal(claims::Dict{String, Any}, kid::Nullable{String}, identity_from::Symbol, identity_claim::String)
+    id::Nullable{String} = if identity_from === :kid
         kid
     else
         value = _claim_value(claims, identity_claim, nothing)
         value === nothing ? nothing : string(value)
     end
-    return Principal(claims; id=id, kid=kid, source=identity_from)
+    return Principal(id, claims, kid, identity_from)
 end
 
 # ── The `warn_claims` observability tier (#134) ───────────────────────────────────

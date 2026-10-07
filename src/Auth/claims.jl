@@ -11,8 +11,22 @@ end
 # `Symbol` key, so the fallback above would only intern a Symbol and miss, per claim read.
 _claim_value(claims::Dict{String, Any}, key::AbstractString, default=nothing) = get(claims, key, default)
 
-function _claim_int(value, field::String)
-    if value isa Integer
+# Every caller holds a claim read out of a `Dict{String, Any}`, so `value` is `Any` at the call
+# site, and three things together keep that from boxing an `Int` per claim -- three allocations
+# per token in `validate_claims` (#456). Each was measured; none is enough alone:
+#
+# - `@nospecialize`: compiled once for `Any`, the call is static. Specialized, it was a dynamic
+#   dispatch, and a dynamic call's `Int` comes back boxed whatever inference knows of it.
+# - `::Int`: inference could not prove the abstract branches below return an `Int`, so the
+#   caller's `+ iat_skew` was a dynamic call too, boxing ITS result.
+# - The concrete `Int` branch first: JSON.jl parses every integer claim to an `Int64`, and it is
+#   the only branch that returns without a call. The abstract ones narrow `value` no further
+#   than `Integer`, so their `Int(value)` dispatches dynamically -- fine for the float and string
+#   spellings another issuer might use, measurably worse for the common one.
+function _claim_int(@nospecialize(value), field::String)::Int
+    if value isa Int
+        return value
+    elseif value isa Integer
         return Int(value)
     elseif value isa AbstractFloat
         return trunc(Int, value)

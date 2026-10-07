@@ -37,16 +37,40 @@ const _JWT_SECRET_TYPES = "a string, a JWTKeyset, or a Dict of kid => secret"
 const _JWT_MAX_HEADER_SEGMENT_BYTES = 1024
 
 """
-    _verify_candidates(secret_or_keyset, header_kid) -> Vector{Tuple{Nullable{String}, String}}
+    _VerifyCandidate(kid, secret)
 
-The ordered `(kid, secret)` pairs a token may be verified against. Concretely typed
-because this is the request path (nitro-core §7).
+One key a token may be verified against: the `kid` it resolves to (or the header's
+unverified label, for a single secret) and the HMAC secret.
+
+A struct rather than a `Tuple{Nullable{String}, String}` because that tuple type is not
+concrete -- `Nullable` is a `Union` -- so a `Vector` of them boxed every element, and a
+single-secret token paid for a vector, its storage and that box (#456). This is concrete, so
+it is stored inline in a `Vector` and needs no heap at all in a `Tuple`.
+"""
+struct _VerifyCandidate
+    kid::Nullable{String}
+    secret::String
+end
+
+# It carries a revealed HMAC key, so it never prints one -- the same rule `SecretString` and
+# `JWTKeyset` follow. As with them, `dump` and field reflection are not covered.
+Base.show(io::IO, candidate::_VerifyCandidate) =
+    print(io, "_VerifyCandidate(", repr(candidate.kid), ", <redacted>)")
+
+"""
+    _verify_candidates(secret_or_keyset, header_kid)
+
+The ordered `_VerifyCandidate`s a token may be verified against. Concretely typed
+because this is the request path (nitro-core §7): a `Vector` for a keyset, and a one-element
+`Tuple` for a single secret. The container differs by method, which inference handles --
+dispatch is on the secret's own type, so each caller sees exactly one.
 """
 function _verify_candidates(secret::AbstractString, header_kid::Nullable{String})
     # A single secret verifies everything, and the header `kid` stays an unverified label
     # passed straight back -- `jwt_validator` discards it via `kid_trusted`. An empty key is
     # refused here as well as at `jwt_validator` construction, for direct callers (#264).
-    return Tuple{Nullable{String}, String}[(header_kid, String(_check_string_secret(secret)))]
+    # A tuple, since there is only ever one candidate (#456).
+    return (_VerifyCandidate(header_kid, String(_check_string_secret(secret))),)
 end
 
 function _verify_candidates(keyset::JWTKeyset, header_kid::Nullable{String})
@@ -56,15 +80,15 @@ function _verify_candidates(keyset::JWTKeyset, header_kid::Nullable{String})
         position = get(keyset.index, header_kid, 0)
         position == 0 && throw(AuthError("Unknown JWT key id"))
         key = keyset.keys[position]
-        return Tuple{Nullable{String}, String}[(key.kid, reveal(key.secret))]
+        return _VerifyCandidate[_VerifyCandidate(key.kid, reveal(key.secret))]
     end
     # Kid-less: every key, in the order `JWTKeyset` fixed at construction -- the signing
     # key first, then the rest by kid. No two keys are the same HMAC key, so at most one
     # candidate can match and the order is for reproducibility, not correctness.
-    candidates = Tuple{Nullable{String}, String}[]
+    candidates = _VerifyCandidate[]
     sizehint!(candidates, length(keyset.keys))
     for key in keyset.keys
-        push!(candidates, (key.kid, reveal(key.secret)))
+        push!(candidates, _VerifyCandidate(key.kid, reveal(key.secret)))
     end
     return candidates
 end
@@ -149,14 +173,37 @@ function decode_jwt(token::AbstractString, secret_or_keyset; issuer=nothing, aud
     return with_kid ? (claims, kid) : claims
 end
 
+"""
+    _jwt_segments(token) -> NTuple{3, SubString{String}}
+
+The token's three `.`-separated segments, exactly as `split(token, '.')` would give them when
+there are exactly two dots, and `AuthError("Invalid JWT format")` otherwise. Views, so no
+`Vector` is built per token (#456).
+
+Searched over code units: `.` is ASCII, and no byte of a multi-byte UTF-8 sequence -- valid or
+not -- equals it, so every hit is a real dot. A segment ends at the `prevind` of the next dot
+rather than one byte before it, which is a character boundary even when the segment's last
+character is multi-byte; the next segment starts one byte past the dot, which always is.
+"""
+function _jwt_segments(token::String)
+    units = codeunits(token)
+    first_dot = findfirst(==(UInt8('.')), units)
+    first_dot === nothing && throw(AuthError("Invalid JWT format"))
+    second_dot = findnext(==(UInt8('.')), units, first_dot + 1)
+    second_dot === nothing && throw(AuthError("Invalid JWT format"))
+    findnext(==(UInt8('.')), units, second_dot + 1) === nothing || throw(AuthError("Invalid JWT format"))
+    return (SubString(token, 1, prevind(token, first_dot)),
+            SubString(token, first_dot + 1, prevind(token, second_dot)),
+            SubString(token, second_dot + 1, lastindex(token)))
+end
+
 # The body of `decode_jwt`, always returning `(claims, kid)`. `with_kid` is a runtime
 # Bool that is not constant-propagated, so `decode_jwt(...; with_kid=true)` infers a
 # `Union` of its two return shapes; `jwt_validator` calls this instead, and its per-request
 # path sees one concrete tuple shape (#265, nitro-core §7).
 function _decode_jwt(token::AbstractString, secret_or_keyset; issuer=nothing, audience=nothing, exp_timeout::Union{Int, Nothing}=DEFAULT_JWT_MAX_AGE_SECONDS, iat_skew::Int=30, verify::Bool=true, require_exp::Bool=false, required_claims::Union{AbstractVector{<:AbstractString}, Nothing}=nothing)
     token_string = String(token)
-    segments = split(token_string, '.')
-    length(segments) == 3 || throw(AuthError("Invalid JWT format"))
+    segments = _jwt_segments(token_string)
 
     # The order below is RFC 7519 §7.2's: the JOSE header is decoded and checked (steps
     # 3-5), the JWS is validated (step 7), and only THEN is the claims set decoded (steps
@@ -256,9 +303,9 @@ function _decode_jwt(token::AbstractString, secret_or_keyset; issuer=nothing, au
         signing_input = SubString(token_string, 1, prevind(token_string, second_dot))
         matched_kid::Nullable{String} = nothing
         verified = false
-        for (candidate_kid, secret) in candidates
-            _constant_time_equals(_hmac_sha256(secret, signing_input), provided) || continue
-            matched_kid = candidate_kid
+        for candidate in candidates
+            _constant_time_equals(_hmac_sha256(candidate.secret, signing_input), provided) || continue
+            matched_kid = candidate.kid
             verified = true
             break
         end
@@ -309,7 +356,11 @@ function _jwt_segment_json(segment::AbstractString; kwargs...)
     try
         # No field cap (#327): a segment is already size-bounded, and the cap's `ValidationError`
         # is not the `AuthError` this function promises. The depth bound still applies.
-        return _parse_json_bounded(String(base64url_decode(segment)); max_fields = 0, kwargs...)
+        #
+        # The decoded bytes are parsed as they are: `String(...)` around them copied the
+        # segment once more per token (#456), and JSON.jl reads a byte vector with the same
+        # grammar and the same refusals as a String.
+        return _parse_json_bounded(base64url_decode(segment); max_fields = 0, kwargs...)
     catch e
         # Every byte of the segment is attacker-supplied, and BOTH decoders are sinks:
         # `base64url_decode` throws ArgumentError on a bad alphabet, an impossible length, or

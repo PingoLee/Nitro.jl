@@ -169,7 +169,9 @@ Where the lift happens matters:
 ## Nitro.jl Constraints
 
 - **Type stability (nitro-core §7).** `_verify_candidates` is dispatched per secret type and returns
-  a concrete `Vector{Tuple{Nullable{String}, String}}`; the `with_kid` tuple stays `Nullable{String}`.
+  concrete `_VerifyCandidate`s: a `Vector` of them for a keyset, a one-element `Tuple` for a single
+  secret (#456 — the struct replaced a `Tuple{Nullable{String}, String}`, which is not a concrete
+  type, so a `Vector` of them boxed every element). The `with_kid` tuple stays `Nullable{String}`.
 - **Auth semantics unchanged.** `identity_from = :kid`, `kid_required`, and `principal.kid` keep
   meaning *the key that verified the signature*. A string secret's header `kid` is still an unverified
   label that `jwt_validator` discards.
