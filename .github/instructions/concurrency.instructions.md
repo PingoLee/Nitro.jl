@@ -24,6 +24,10 @@ lives in the code comment it names, and that comment is canonical.
   `julia -t N` gives that pool one thread. `parallel_stream_handler`'s per-request
   `Threads.@spawn` moves handlers onto `:default`. That is a 2.2× win (#448), so keep it. The
   reasoning sits at its #39 comment in `src/core/transport.jl`.
+- **`serve(parallel = false)` strands the default threads**: every handler then runs on the
+  interactive thread. `_warn_if_serial_on_threads` (`src/core/lifecycle.jl`) warns when that
+  happens. Do not weaken or remove the warning; its comment says which thread layouts stay
+  silent and why (#454).
 - **The interactive thread is the scarcest resource in the process.** Add nothing to the
   connection task before the spawn. Today `header_deadline_handler` is Nitro's only work there
   (#316). The response is written on the request task: `stream_handler` calls `closewrite`
