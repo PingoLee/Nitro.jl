@@ -1175,12 +1175,15 @@ end
 # The inner task never ran concurrently with its parent, so it bought no
 # concurrency; exception propagation is identical either way because both `wait`s
 # rethrow. HTTP.jl already spawns per *connection*; this spawn is what moves each
-# *request* off that connection task, which is the Go-style model Nitro wants
-# (nitro-core §2). Do not reintroduce the inner `@async`.
+# *request* off that connection task. Do not reintroduce the inner `@async`.
 #
-# The spawn is not overhead; it is the main reason the server scales (#448). HTTP.jl 2.x runs every
-# connection task on Julia's `:interactive` pool, and `julia -t 8` gives that pool ONE thread, so
-# a handler left on the connection task is serialized onto it whatever `-t` says. Measured on one
+# The spawn is not overhead, and not a matter of style; it is the main reason the server scales
+# (#448, #454). The Go analogy (nitro-core §2) undersells it: Go serves a connection's requests on
+# that connection's one goroutine and still scales, because goroutines run on every thread. HTTP.jl
+# 2.x runs every connection task on Julia's `:interactive` pool, and `julia -t 8` gives that pool
+# ONE thread, so a handler left on the connection task is serialized onto it whatever `-t` says.
+# That is what `serve(parallel = false)` does, and why `serve` warns about it on a multi-threaded
+# process (`_warn_if_serial_on_threads`). Measured on one
 # box (`-t 8`, server and `oha -c 50` on disjoint pinned cores, `/plaintext`, medians): bare
 # HTTP.jl `listen!` + `streamhandler` does ~33k rps with no spawn and ~72k with one per request;
 # `serve(parallel = false)` does ~26k. Keep it. The other half of the same lesson is in

@@ -364,6 +364,25 @@ end
     @test isempty(gc_warnings("dev"))
 end
 
+@testset "serve(parallel = false) warns once when the process has threads it cannot reach (#454)" begin
+    # The helper is unit-tested in test/util_tests.jl; this pins the CALL SITE and that it reads
+    # the default pool. CI runs this file at 1 and 2 threads, so both sides are exercised.
+    function serial_warnings(; kw...)
+        ctx = Nitro.Core.App()
+        logger = Test.TestLogger(min_level = Base.CoreLogging.Warn)
+        try
+            Base.CoreLogging.with_logger(() -> _serve(ctx, get_free_port(); kw...), logger)
+        finally
+            Nitro.Core.terminate(ctx)
+        end
+        return filter(r -> occursin("parallel = false", string(r.message)), logger.logs)
+    end
+
+    stranded = Threads.nthreads(:default) > 1 && Threads.nthreads(:interactive) > 0
+    @test length(serial_warnings(; parallel = false)) == (stranded ? 1 : 0)
+    @test isempty(serial_warnings())
+end
+
 # ── Default server timeouts (#316) ──────────────────────────────────────────────────────────────
 
 @testset "server timeout defaults (unit)" begin

@@ -67,6 +67,18 @@ Report missing env vars by name; do not invent secret values.
       ceiling at all. The hint must sit above peak live data **plus 250 MiB** (an undersized hint
       thrashes rather than crashing) and below any `MemoryMax=`. Neither turns an OOM kill into a
       Julia backtrace. See `docs/src/tutorial/deployment.md`.
+- [ ] **The memory limit clears the process floor.** A Nitro `serve()` sits at 450–500 MiB RSS
+      before it holds any request data, and PormG adds roughly 175 MiB more (Julia 1.12; the
+      measured table, and `bench/socket/rss.sh` to reproduce it, are in
+      `docs/src/tutorial/deployment.md`). The floor is flat under load and does not scale with
+      `--threads`, so a 512 MiB container is too small for any Nitro app; size from the floor plus
+      the app's own data, not from a laptop's idle reading.
+- [ ] **`serve(parallel = false)` is not set** on a multi-threaded process. It runs every handler
+      on HTTP.jl's interactive-pool thread (one, for `--threads=N`) whatever `--threads` says;
+      `serve` logs a warning when it happens, so check the startup log.
+- [ ] **The cold start is planned.** The first request to each route compiles code the
+      precompile workload cannot reach. Either warm the new process (request its key routes
+      before the proxy or readiness probe sends it traffic) or ship a PackageCompiler sysimage.
 
 ## 4. Reverse proxy (when requested)
 
