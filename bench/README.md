@@ -55,9 +55,12 @@ header (git SHA, Julia version, thread count, CPU model — no hostname or paths
   `read_request` on a buffered request head — the work the server does on its connection task,
   on the `:interactive` thread, before Nitro's per-request spawn (#462). `connreader_*` is the
   server's `_ConnReader` path, `iobuffer_*` the generic `IO` path for contrast. It opens one
-  loopback TCP pair at include time (the reader type needs a real connection) and never reads
-  from it; the head sits in the reader's buffer. `HTTP._ConnReader`'s layout is internal and
-  pinned to HTTP 2.8.0, so a `[compat]` bump that breaks this file is doing its job.
+  loopback TCP pair at include time (the reader type needs a real connection). Most rows never
+  read from it: the head sits in the reader's buffer, so the request line takes the fast path.
+  `connreader_*_socket` is what a keep-alive server actually runs: the buffer starts empty, the
+  head arrives over the socket, and the request line takes `_readline_crlf`'s slow path, so the
+  fill syscall is part of the number. `HTTP._ConnReader`'s layout is internal and pinned to
+  HTTP 2.8.0, so a `[compat]` bump that breaks this file is doing its job.
 - `ratelimiter/*_contended` is the exception to that last point: it fans 64 tasks over **distinct**
   client keys and measures wall time for the batch, so it does reflect lock contention. Run it with
   `--threads=4` or more, or it measures nothing. Two sibling groups are deliberately different
@@ -95,7 +98,11 @@ bench/socket/run.sh "nitro@8,1 nitro@8,2 nitro@8,4"  # one mode per --threads, i
   another layout. Results go to `results/socket-<stamp>.tsv`, profiles to
   `results/profile-<mode>-<time>-{flat,threads,interactive-tree}.txt` — the last is a call tree
   of the `:interactive` threads only, which is where HTTP.jl accepts, parses every request head
-  and wakes the per-request task (#462).
+  and wakes the per-request task (#462). It keeps C frames and opens with the window's GC time.
+  Without C frames, a stop-the-world GC wait (`jl_safepoint_wait_gc`) is charged to whatever
+  Julia allocation the thread was parked at, and it reads as a parser cost. `Base.gc_time_ns`
+  counts the collection only, not the wait to reach a safepoint, so the tree can show more GC
+  wait than the header does.
 - `mode@threads` (`nitro@8,2`) starts that one server with its own `--threads` and records it in
   the TSV's `threads` column, so a sweep of the interactive thread count is one interleaved run
   rather than one run per count. `-t 8` is `8,1` on Julia 1.12; note that `8,2` and `8,4` put more

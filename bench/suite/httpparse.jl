@@ -134,6 +134,24 @@ for (name, lines) in HEADS
     SUITE["httpparse"]["iobuffer_$name"] = @benchmarkable parse_iobuffer_head($bytes)
 end
 
+# ── The keep-alive path: an empty buffer, filled from the socket ────────────
+#
+# The rows above preload the head, so the request line always takes `_readline_crlf`'s fast
+# path. A server on a keep-alive connection never does: the previous request drained the
+# buffer, so every request line takes the slow path instead -- a `UInt8[]`, a socket fill, an
+# `append!` that grows it, and a `String` copy. #462's socket profile found every request line
+# there. These rows reproduce it: `setup` writes the head to the client end, and the measured
+# body is the fill syscall plus the parse, on a reader built the way the server builds one.
+# `evals = 1` because each parse consumes its write.
+for (name, lines) in ("minimal" => HEAD_MINIMAL, "oha" => HEAD_OHA, "chrome" => HEAD_CHROME)
+    bytes = head_bytes(lines)
+    reader = HTTP._ConnReader(HTTPPARSE_SERVER_CONN)
+    write(HTTPPARSE_CLIENT_CONN, bytes)
+    HTTP.read_request(reader).target == "/plaintext" || error("httpparse: $name socket parse failed")
+    SUITE["httpparse"]["connreader_$(name)_socket"] =
+        @benchmarkable HTTP.read_request($reader) setup = (write(HTTPPARSE_CLIENT_CONN, $bytes)) evals = 1
+end
+
 # ── canonical_header_key alone ──────────────────────────────────────────────
 #
 # Four shapes: common + canonical (scan, table hit, returns the cached string), common + lower
