@@ -528,12 +528,16 @@ end
     # The regression this cluster exists for. HTTP.jl leaves the header deadline armed through
     # the body read when `read_timeout` is unset, so against unpatched Nitro a body that finishes
     # after the header timeout is cut mid-read — and surfaced as a 500, see the next testset.
+    #
+    # The window is generous for the reason given in the keep-alive testset below (#483): the
+    # connection task's first read, the head parse and the clear must all land inside it, and
+    # 0.5 s races a loaded runner.
     ctx = _echo_context()
     port = get_free_port()
-    _serve(ctx, port; read_header_timeout = 0.5)
+    _serve(ctx, port; read_header_timeout = 2)
     try
         head = "POST /echo HTTP/1.1\r\nHost: $HOST\r\nContent-Length: 5\r\nConnection: close\r\n\r\n"
-        reply = _raw_exchange(port, [head, "hello"]; gap = 1.5)
+        reply = _raw_exchange(port, [head, "hello"]; gap = 4)
         @test startswith(reply, "HTTP/1.1 200")
         @test endswith(reply, "hello")
     finally
@@ -1225,10 +1229,14 @@ function _second_request_late_body(port; gap)
             write(sock, "second")
         catch
         end
+        # A failed read is reported rather than turned into "". Writing the late body into a
+        # connection the server already closed draws an RST. The reset makes `read` throw, dropping
+        # any 408 it had not handed over yet, and on Windows the kernel discards that 408 as well.
+        # So a bare "" could not tell a reset from a server that never answered.
         rest = @async try
             String(read(sock))
-        catch
-            ""
+        catch e
+            "(read failed: $(sprint(showerror, e)))"
         end
         timedwait(() -> istaskdone(rest), 15.0; pollint = 0.05)
         return istaskdone(rest) ? fetch(rest) : "(no close within 15s)"
@@ -1243,13 +1251,18 @@ end
     # clear used to be skipped whenever the header timeout was 0 ("nothing was armed"), so every
     # request after the first on a connection had its body cut `idle_timeout` after the previous
     # response — 120 seconds by default. Unpatched, the second request below is a 408.
-    for kw in ((; read_header_timeout = 0, idle_timeout = 0.5),
-               (; read_header_timeout = 0.5, idle_timeout = 0.5))
+    #
+    # What this pins is `gap > window`, not a small window. The second head must still get there
+    # and be parsed within `window` of the first response, or the deadline answers 408 before the
+    # clear can run. At 0.5 s a loaded runner missed that (#483: Windows at 1 thread, macOS at 2).
+    window = 2.0
+    for kw in ((; read_header_timeout = 0, idle_timeout = window),
+               (; read_header_timeout = window, idle_timeout = window))
         ctx = _echo_context()
         port = get_free_port()
         _serve(ctx, port; kw...)
         try
-            reply = _second_request_late_body(port; gap = 1.5)
+            reply = _second_request_late_body(port; gap = 2window)
             @test startswith(reply, "HTTP/1.1 200")
             @test endswith(reply, "second")
         finally
