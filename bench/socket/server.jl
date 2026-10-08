@@ -13,8 +13,12 @@
 #
 #   PORT=8080           Loopback port.
 #   ACCESS_LOG=0|1      Nitro only: `serve(access_log = …)`. Default 0.
-#   PROFILE=<seconds>   After WARMUP seconds, sample every thread for this long and write flat and
-#                       per-thread reports under bench/results/. 0 (the default) disables it.
+#   PROFILE=<seconds>   After WARMUP seconds, sample every thread for this long and write three
+#                       reports under bench/results/: `-flat` (all threads), `-threads` (flat,
+#                       grouped by thread) and `-interactive-tree` (a call tree of the
+#                       `:interactive` threads only, C frames included, headed by the window's GC
+#                       time -- where HTTP.jl accepts, parses every request head and wakes the
+#                       per-request task, #462). 0 (the default) disables it.
 #   WARMUP=<seconds>    Delay before the profile window opens. Default 8.
 #   PRELOAD="Pkg ..."   Load these packages before serving, so `rss.sh` can measure what one adds
 #                       to the process (PRELOAD=PormG also loads NitroPormGExt). The project
@@ -79,7 +83,9 @@ PROFILE_S > 0 && @eval function profile_window()
     Profile.init(n = 10^7, delay = 0.001)
     Profile.clear()
     @info "bench: profiling every thread for $(PROFILE_S) s"
+    gc0, t0 = Base.gc_time_ns(), time_ns()
     Profile.@profile sleep(PROFILE_S)
+    gc_ns, window_ns = Base.gc_time_ns() - gc0, time_ns() - t0
     dir = joinpath(@__DIR__, "..", "results")
     mkpath(dir)
     stem = joinpath(dir, "profile-$(MODE)-$(round(Int, time()))")
@@ -90,6 +96,20 @@ PROFILE_S > 0 && @eval function profile_window()
     open("$stem-threads.txt", "w") do io
         Profile.print(IOContext(io, :displaysize => (10_000, 400)); format = :flat,
                       sortedby = :count, groupby = :thread, mincount = 20)
+    end
+    # The interactive thread(s) alone, as a tree: HTTP.jl's accept loop and every connection task
+    # run there, so this is where `read_request`, Nitro's `_clear_header_deadline!` and the
+    # `@spawn` wake-up show up against each other (#462). Selected by pool, not by id, so it stays
+    # right if the numbering ever changes. C frames are kept: without them a stop-the-world GC is
+    # charged to whatever Julia allocation site the thread was parked at, which reads as a parser
+    # cost. The GC line is the window's wall time spent collecting -- every thread pays it.
+    interactive = filter(i -> Threads.threadpool(i) == :interactive, 1:Threads.maxthreadid())
+    open("$stem-interactive-tree.txt", "w") do io
+        println(io, "interactive thread ids: ", interactive)
+        println(io, "GC: ", round(gc_ns / 1e6; digits = 1), " ms of a ", round(window_ns / 1e6; digits = 1),
+                " ms window (", round(100 * gc_ns / window_ns; digits = 1), "%)")
+        Profile.print(IOContext(io, :displaysize => (10_000, 400)); format = :tree, C = true,
+                      threads = interactive, mincount = 20, maxdepth = 80)
     end
     @info "bench: profile written" stem
 end

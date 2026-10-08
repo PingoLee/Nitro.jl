@@ -14,12 +14,18 @@
 # Usage: bench/socket/run.sh [modes] [runs] [duration]
 #   bench/socket/run.sh "nitro bare_spawn bare_nospawn" 5 6s
 #   ACCESS_LOG=1 bench/socket/run.sh nitro
-#   THREADS=8,2 bench/socket/run.sh            # two interactive threads
+#   THREADS=8,2 bench/socket/run.sh            # two interactive threads, every mode
+#   bench/socket/run.sh "nitro@8,1 nitro@8,2 nitro@8,4"   # per-mode --threads, one interleaved run
 #   PROFILE=10 bench/socket/run.sh nitro 1 20s # one mode only; see server.jl
 #   BASE_ROOT=/path/to/other/checkout bench/socket/run.sh "baseline nitro"
 #
 # `baseline` is `nitro` served from the checkout at BASE_ROOT (its own bench/ env, instantiated),
 # so a change can be A/B'd against the code it replaces in the same interleaved run.
+#
+# `mode@threads` starts that one server with its own `--threads` and records it in the TSV's
+# `threads` column; a bare mode takes THREADS. That is what lets a sweep of the interactive
+# thread count (#462: does HTTP.jl's single interactive thread set the ceiling?) obey the rule
+# the README states -- compare within ONE run -- instead of one run per thread count.
 #
 # Results: one TSV per invocation under bench/results/ (gitignored).
 set -uo pipefail
@@ -52,6 +58,10 @@ printf 'mode\tthreads\taccess_log\troute\tmedian_rps\tmin_rps\tmax_rps\tmedian_p
 
 median() { sort -n | awk '{a[NR]=$1} END{print (NR%2)?a[(NR+1)/2]:(a[NR/2]+a[NR/2+1])/2}'; }
 
+# `nitro@8,2` -> name `nitro`, threads `8,2`; `nitro` -> name `nitro`, threads $THREADS.
+mode_name()    { printf '%s' "${1%%@*}"; }
+mode_threads() { case "$1" in *@*) printf '%s' "${1#*@}" ;; *) printf '%s' "$THREADS" ;; esac; }
+
 PIDS=()
 cleanup() { for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null; done; wait 2>/dev/null; }
 trap cleanup EXIT
@@ -71,7 +81,7 @@ oha_json() {
     --output-format json "$2" 2>/dev/null
 }
 
-echo "socket bench: server CPUs $SERVER_CPUS (--threads=$THREADS), client CPUs $CLIENT_CPUS, $RUNS x $DUR interleaved, c=$CONNS"
+echo "socket bench: server CPUs $SERVER_CPUS (--threads=$THREADS unless mode@threads), client CPUs $CLIENT_CPUS, $RUNS x $DUR interleaved, c=$CONNS"
 echo "governor: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo unknown)"
 
 declare -A PORT_OF LOG_OF
@@ -87,13 +97,14 @@ for mode in "${MODE_LIST[@]}"; do
     exit 1
   fi
   log="$OUT/socket-$STAMP-$mode.log"
-  project="$ROOT/bench"; served="$mode"
-  if [ "$mode" = baseline ]; then
+  name="$(mode_name "$mode")"; threads="$(mode_threads "$mode")"
+  project="$ROOT/bench"; served="$name"
+  if [ "$name" = baseline ]; then
     [ -n "${BASE_ROOT:-}" ] || { echo "run.sh: baseline needs BASE_ROOT" >&2; exit 1; }
     project="$BASE_ROOT/bench"; served=nitro
   fi
   MODE="$served" PORT="$port" ACCESS_LOG="${ACCESS_LOG:-0}" PROFILE="${PROFILE:-0}" WARMUP="${WARMUP:-8}" \
-    taskset -c "$SERVER_CPUS" julia --project="$project" --threads="$THREADS" \
+    taskset -c "$SERVER_CPUS" julia --project="$project" --threads="$threads" \
     "$HERE/server.jl" >"$log" 2>&1 &
   pid=$!
   PIDS+=("$pid")
@@ -133,9 +144,9 @@ for route in $ROUTES; do
     mp=$(printf '%s\n' "${p99[@]}" | median)
     printf '%-13s %-10s median=%-8s [%s..%s]  p99=%sms  runs: %s\n' \
       "$mode" "$route" "$med" "$mn" "$mx" "$mp" "${rps[*]}"
-    logged="${ACCESS_LOG:-0}"; [ "$mode" = nitro_log ] && logged=1
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$mode" "$THREADS" "$logged" "$route" \
-      "$med" "$mn" "$mx" "$mp" >> "$RESULT"
+    logged="${ACCESS_LOG:-0}"; [ "$(mode_name "$mode")" = nitro_log ] && logged=1
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(mode_name "$mode")" "$(mode_threads "$mode")" \
+      "$logged" "$route" "$med" "$mn" "$mx" "$mp" >> "$RESULT"
   done
 done
 
