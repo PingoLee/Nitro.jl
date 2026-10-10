@@ -1,6 +1,5 @@
 ---
 description: Workers module — persistent stores, user_id/watchers, queue authorizers, zombie recovery
-applyTo: "src/Workers/**/*.jl,ext/NitroPormGExt.jl,test/**/*worker*.jl,test/extensions/**/*.jl"
 ---
 
 # Nitro.jl Workers Module

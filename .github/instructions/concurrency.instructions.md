@@ -1,6 +1,5 @@
 ---
 description: Nitro.jl task model — where code runs, background tasks, interrupts, cancellation, CPU-bound handlers
-applyTo: "src/core/transport.jl,src/core/lifecycle.jl,src/context.jl,src/errors.jl,src/middleware/janitor.jl,src/Workers/**/*.jl,ext/NitroReviseExt.jl"
 ---
 
 # Nitro.jl Concurrency & Task Model

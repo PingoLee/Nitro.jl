@@ -157,9 +157,8 @@ exceptions on purpose — read the canonical section before writing code in that
 
 ## Area rule files
 
-Each file carries an `applyTo:` glob. GitHub Copilot auto-attaches a file when you touch a matching
-path; every other reader opens it by hand, driven by this table. Treat *When to read* as a hard
-prerequisite: the non-consuming response-write path in nitro-core §4 is load-bearing, and editing
+Nothing attaches these files automatically: open the one for the area you are editing, driven by
+this table. Treat *When to read* as a hard prerequisite: the non-consuming response-write path in nitro-core §4 is load-bearing, and editing
 `src/core.jl` without reading it risks a silent, suite-wide regression.
 
 | Area | Rule file | When to read |
@@ -172,8 +171,7 @@ prerequisite: the non-consuming response-write path in nitro-core §4 is load-be
 
 `.github/scripts/docs_lint.jl` (run in CI) keeps this page, `AGENTS.md`, the area rule files and
 the public skills honest: every backtick path and local link must resolve, every `§` pointer must
-hit a real heading, every `applyTo` glob must match a tracked file, and the sets of rule files,
-skills and discovery stubs are pinned.
+hit a real heading, and the sets of rule files, skills and discovery stubs are pinned.
 
 ## Architecture
 

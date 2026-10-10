@@ -1,6 +1,5 @@
 ---
 description: Nitro.jl core architecture — philosophy, concurrency, routing, security, PormG isolation, quality standards
-applyTo: "**/*.jl"
 ---
 
 # Nitro.jl Core Architecture & Implementation Rules
