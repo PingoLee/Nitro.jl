@@ -1,0 +1,11 @@
+# .worktreeinclude — gitignored local state auto-copied into each new worktree at creation
+# (Claude Code feature; .gitignore syntax; only files that match a pattern AND are gitignored
+# are copied, so tracked files are never duplicated).
+#
+# Manifest.toml is deliberately absent: scripts/worktree_setup.sh copies it from the main
+# checkout and then RESOLVES it against the branch's Project.toml, which a plain copy would skip.
+#
+# Maintainer-local agent configuration (gitignored; absent in a contributor's clone, and that
+# is fine). scripts/worktree_setup.sh links the matching skills and the subagent when the
+# private checkout exists.
+CLAUDE.local.md

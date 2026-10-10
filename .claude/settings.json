@@ -1,7 +1,4 @@
 {
-  "enabledPlugins": {
-    "nitro-skills@nitro": true
-  },
   "permissions": {
     "allow": [
       "Bash(julia .github/scripts/docs_lint.jl)",

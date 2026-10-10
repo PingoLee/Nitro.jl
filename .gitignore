@@ -11,8 +11,21 @@ test_*.txt
 lcov.info
 
 # Agent worktrees live under .claude/ but are never part of the tree.
-# (.claude/skills/ IS tracked — it is the Claude Code skill bridge.)
 .claude/worktrees/
+
+# Personal Claude Code settings (machine-specific permission grants). Shared, repo-wide
+# permissions live in .claude/settings.json instead.
+.claude/settings.local.json
+
+# Maintainer-local agent material, linked in from a private checkout; never committed.
+# The three public skills ship with their .claude/skills/<name>/SKILL.md discovery stubs
+# (front-matter copy + pointer at .github/skills/<name>/SKILL.md), so those stay tracked.
+.claude/skills/*
+!.claude/skills/nitro-usage/
+!.claude/skills/add-route/
+!.claude/skills/deploy-checklist/
+.claude/agents/
+CLAUDE.local.md
 
 # Local scratch notes (copied from PormG.jl)
 notes.md

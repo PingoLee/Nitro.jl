@@ -52,7 +52,7 @@ That is the split Sidekiq draws between its `Launcher` and Redis, and Go's River
 Two `App`s sharing one `PormGWorkerStore` get their own queues and scheduler each, and
 `uninstall!` on one cannot stop the other's processors. That was not representable while the
 resources lived on the store, and it is the reason lifecycle belongs to an object rather than to a
-process-wide singleton — the application-context model `nitro-general` names as the tiebreaker.
+process-wide singleton — the application-context model `CONTRIBUTING.md` (*Design lineage*) names as the tiebreaker.
 
 Policy stays on the store: the queue and watch authorizers and the error redactor are about the
 data and the tenant, so two runtimes over one store correctly share one security posture.

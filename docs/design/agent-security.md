@@ -1,10 +1,11 @@
 # Design: Agent Security Posture
 
 > **Status:** design record. Describes how this repo defends against an AI agent being steered by
-> content it reads, and how tool permissions are tiered. The operative rules live in
-> [`nitro-general.instructions.md`](../../.github/instructions/nitro-general.instructions.md) — this
-> file explains *why* they are shaped that way, and holds the permission block to paste into
-> `.claude/settings.json`.
+> content it reads, and how tool permissions are tiered. The operative rules are maintainer-local:
+> the agent process ruleset, the workflow skills named below and the `issue-reader` subagent live
+> outside this repository and reach a checkout only through gitignored links, so a fresh clone sees
+> none of them. This file explains *why* they are shaped that way, and holds the permission block
+> that is committed in `.claude/settings.json`.
 
 ## The threat, stated plainly
 
@@ -14,7 +15,7 @@ someone else has a path by which that person can address the agent directly.
 
 This repo has two such workflows:
 
-- **`nitro-issue-management`** runs `gh issue view`. `PingoLee/Nitro.jl` is public with issues
+- **`nitro-issue-management`** (a maintainer-local workflow skill) runs `gh issue view`. `PingoLee/Nitro.jl` is public with issues
   enabled — anyone with a GitHub account can put text there.
 - **`changed-code-review`** runs `git diff`. On a fork PR, the diff and its description are written
   by the contributor.
@@ -58,7 +59,7 @@ Each covers a different failure, and none substitutes for another.
 | Layer | Mechanism | Covers |
 |-------|-----------|--------|
 | 1. Author check | `--json author` **before** the body | The common case — decide trust on metadata, not on content already in context |
-| 2. Quarantine | [`issue-reader`](../../.claude/agents/issue-reader.md) agent — `tools: Read, Grep, Glob` | Untrusted content that must be understood. It cannot act, and returns constrained JSON, so prose never crosses into the acting context |
+| 2. Quarantine | `issue-reader` agent (maintainer-local, linked in as `.claude/agents/issue-reader.md`) — `tools: Read, Grep, Glob` | Untrusted content that must be understood. It cannot act, and returns constrained JSON, so prose never crosses into the acting context |
 | 3. Permission tiers | `.claude/settings.json` | Blast radius when 1 and 2 fail |
 
 Layer 1 is the load-bearing one for a solo repo; layers 2 and 3 are what make the first outside
@@ -77,6 +78,10 @@ keep out.
 
 **Structured is narrower, not trusted.** A `"duplicate_of": 12` from an injected issue still closes
 #12 if acted on blindly. Confirm before any outward-facing action.
+
+The envelope used to be pinned by `.github/scripts/docs_lint.jl`; since the agent file left the
+repository the lint cannot read it, so the `tools:` line is checked by inspection whenever the file
+is touched.
 
 ## Permission tiers
 
@@ -155,7 +160,7 @@ Notes on specific entries:
   force-push, and blocks deletion. It has **no bypass actors**, on purpose: an agent pushes with the
   maintainer's own credentials, so an admin bypass would exempt the agent too. The side effect is that
   a release cut goes through a release PR as well
-  ([`nitro-cut-release`](../../.github/skills/nitro-cut-release/SKILL.md)). Check it with
+  (the `nitro-cut-release` workflow skill). Check it with
   `gh api repos/PingoLee/Nitro.jl/rules/branches/main`. Until #332, `main` had no protection at all,
   so the merge gate was prose.
 - **The push denies are a second layer, and a best-effort one.** Deny beats allow, so the entries
@@ -193,7 +198,9 @@ Notes on specific entries:
   can widen its own permissions has no gate at all. `.github/workflows/`, `.github/instructions/`,
   `.github/skills/` and `.claude/` change when the maintainer asks for it in conversation, never as a
   side effect of working an issue — the `ask` entries are what makes that structural rather than
-  aspirational.
+  aspirational. The maintainer-local process material is outside the repository and therefore
+  outside these path rules; the same "only when asked in conversation" rule is stated in that
+  ruleset itself.
 - **Avoid broad trailing wildcards.** `Bash(git diff*)` is wider than `Bash(git diff)` — prefer the
   narrow form when the surface is this asymmetric.
 - **`Read` denials cover secrets at rest.** `connection.yml` is PormG's connection config.

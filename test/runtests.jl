@@ -283,7 +283,7 @@ let args = copy(ARGS)
     # would leave a mode running that manufactures evidence. Refusing converts a rung-2
     # defect (silently wrong) into a rung-3 one (loud), which is the whole trade.
     #
-    # The diagnostic use documented in nitro-test-troubleshooting §7 is still available,
+    # The diagnostic use (multi-process runs to surface order dependence) is still available,
     # just not through this launcher: call `ReTestItems.runtests` directly with `nworkers`.
     #
     # Delete this guard when #31 lands and router state stops being process-global.

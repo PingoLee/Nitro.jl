@@ -2,7 +2,7 @@
 #
 # Nitro versions per *release train*, not per PR: a breaking/behavior PR adds ONE NEW FILE to
 # `upgrading/` carrying `- **Version**: Unreleased`, without touching Project.toml, and the
-# maintainer cuts a train (bump + stamp + tag) via the `nitro-cut-release` skill. This file is the
+# maintainer cuts a train (bump + stamp + tag) by hand -- see UPGRADING.md. This file is the
 # read side of that model — it turns the log into the slice a given consuming app still has to port.
 #
 # One file per entry is deliberate (#192). The log used to be a single UPGRADING.md whose

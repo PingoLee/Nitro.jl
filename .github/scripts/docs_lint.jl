@@ -1,12 +1,17 @@
 #!/usr/bin/env julia
 #
-# docs_lint.jl — guard the agent-context docs against drift.
+# docs_lint.jl — guard the contributor and agent docs against drift.
 #
-# The agent-doc system is built on one rule: *one fact, one home*. AGENTS.md is a
-# thin pointer, `.github/instructions/nitro-general.instructions.md` is the
-# canonical hub, area files own their area, and `.github/skills/` holds
-# workflows. That only stays true if every *cross-reference* between them is
-# checked — otherwise the hub silently rots into a second, wrong copy.
+# The doc system is built on one rule: *one fact, one home*. `AGENTS.md` is a thin
+# pointer, `CONTRIBUTING.md` is the canonical hub (design lineage, the rules that apply
+# everywhere, the hard-stop index, the area rule table, the architecture map, the
+# verification commands), the area files under `.github/instructions/` own their area,
+# and `.github/skills/` holds the three skills this repository ships. The maintainer's
+# process rules, process skills and subagent are NOT in this repository: they reach a
+# local checkout only as gitignored symlinks and a gitignored `CLAUDE.local.md`, so a
+# fresh clone — and CI — never sees them. The hub stays honest only if every
+# *cross-reference* between the public files is checked, and the public sets are pinned so
+# a process file re-committed by mistake fails loudly.
 #
 # This lint fails CI on the mechanically-checkable classes of that drift.
 #
@@ -20,23 +25,22 @@
 #   D. Front-matter — every skill declares `name` (matching its directory) and a
 #      non-empty `description`; every instruction file declares `applyTo` and
 #      `description`.
-#   E. Registry parity — every directory under `.github/skills/` is listed in the
-#      hub's skill table, and every instruction file is listed in its rule table.
-#      A skill nobody links to is invisible; a table row for a deleted skill is a
-#      lie.
-#   F. Plugin manifest — `.github/skills/` is the ONLY home for skill content.
-#      Copilot and Codex read it directly; Claude Code reaches it through the
-#      repo-local plugin in `.claude-plugin/`, whose `skills` path points there.
-#      This check pins that pointer, verifies the marketplace lists the plugin,
-#      and fails if a second `.claude/skills/` tree ever reappears.
+#   E. Registry parity — the set of tracked skill directories under `.github/skills/`
+#      and the set of `.github/instructions/*.instructions.md` files are BOTH pinned
+#      here (PUBLIC_SKILLS, PUBLIC_RULES), and every member is listed in the hub. A
+#      skill nobody links to is invisible; a table row for a deleted skill is a lie; and
+#      a process file reappearing as a tracked file is the regression this exists for.
+#   F. Discovery stubs — Claude Code registers a skill only from
+#      `.claude/skills/<name>/SKILL.md`, so each public skill has a tracked stub there
+#      whose front-matter is byte-identical to the canonical file's, whose body names
+#      the canonical path, and which stays under a size ceiling (a stub fails by slowly
+#      growing into a second, stale copy of the skill). Symlinked entries are the
+#      maintainer's private skills and are ignored. The front-matter of both trees is
+#      also checked for the YAML hazards that make discovery fail silently.
 #   G. Section-anchor references — a pointer like `[nitro-core §4](…)` or
 #      "`nitro-core.instructions.md` §4" must resolve to a real `## 4.` heading in
 #      that file. The hub's hard-stop index is built entirely out of these, so an
 #      unchecked § pointer is exactly how the index rots.
-#   I. Subagent envelopes — a quarantined agent (one whose purpose is that it
-#      CANNOT act) must declare an explicit tools list containing no acting tool.
-#      A quarantine that silently gains Bash is worse than none, because every
-#      doc still claims it holds. See docs/design/agent-security.md.
 #   H. `applyTo` coverage — every glob in an instruction file's front-matter
 #      matches at least one tracked file. Catches a rule scoped to a directory
 #      that has since been renamed.
@@ -48,6 +52,8 @@
 #     is namespace-blind. Add such pairs to REQUIRED_SYMBOLS only by their
 #     defining name.
 #   - Prose that is merely stale but references nothing concrete.
+#   - Anything in the private process material: it is not tracked here, so it is not
+#     read here. Its own cross-links are the maintainer's to keep.
 #
 # Run locally:  julia .github/scripts/docs_lint.jl
 # Exit code 1 on any finding.
@@ -58,30 +64,40 @@ const ROOT = normpath(joinpath(@__DIR__, "..", ".."))
 const DOC_GLOBS = String[
     "AGENTS.md",
     "CLAUDE.md",
+    "CONTRIBUTING.md",
 ]
 const DOC_DIRS = String[
-    joinpath(".claude", "agents"),
     joinpath(".github", "instructions"),
     joinpath(".github", "skills"),
+    joinpath(".claude", "skills"),
 ]
 
-# The canonical hub: the file that must list every skill and every rule file.
-const HUB = joinpath(".github", "instructions", "nitro-general.instructions.md")
+# The canonical hub: the file that must list every public skill and every rule file.
+const HUB = "CONTRIBUTING.md"
 
-const SKILLS_DIR       = joinpath(ROOT, ".github", "skills")
+const SKILLS_DIR        = joinpath(ROOT, ".github", "skills")
 const CLAUDE_SKILLS_DIR = joinpath(ROOT, ".claude", "skills")
-const PLUGIN_MANIFEST  = joinpath(ROOT, ".claude-plugin", "plugin.json")
-const PLUGIN_MARKET    = joinpath(ROOT, ".claude-plugin", "marketplace.json")
-const CLAUDE_AGENTS_DIR = joinpath(ROOT, ".claude", "agents")
-const INSTRUCTIONS_DIR = joinpath(ROOT, ".github", "instructions")
+const INSTRUCTIONS_DIR  = joinpath(ROOT, ".github", "instructions")
 
-# Subagents whose whole purpose is a reduced capability envelope. If one of these
-# ever gains a tool that can act (Bash, Write, Edit, WebFetch), the quarantine it
-# implements is silently gone while every doc still claims it holds — so the
-# allowed toolset is pinned here and checked. See docs/design/agent-security.md.
-const QUARANTINED_AGENTS = Dict{String,Set{String}}(
-    "issue-reader" => Set(["Read", "Grep", "Glob"]),
-)
+# The skills this repository ships, and the rule files it keeps. Adding to either list is
+# the deliberate edit; a directory or file that appears without it fails the lint. The
+# maintainer's process skills and ruleset left this repository on purpose and reach a
+# checkout only as gitignored symlinks — one of them reappearing as a tracked file is the
+# regression check E exists to catch.
+const PUBLIC_SKILLS = String["add-route", "deploy-checklist", "nitro-usage"]
+const PUBLIC_RULES  = String[
+    "concurrency.instructions.md",
+    "nitro-config.instructions.md",
+    "nitro-core.instructions.md",
+    "nitro-docs.instructions.md",
+    "workers.instructions.md",
+]
+
+# A stub is front-matter + a few lines of pointer prose. The canonical files run 3-25 KB,
+# so this ceiling sits an order of magnitude below the thing it protects against. Raising
+# it is a deliberate edit, and the answer is almost always "put that sentence in the
+# canonical file".
+const STUB_MAX_BYTES = 2_048
 
 # Some docs illustrate a *downstream app's* file layout (not this repo's). Those
 # example paths are intentionally absent here — allowlist them so the path check
@@ -129,11 +145,18 @@ const REQUIRED_SYMBOLS = String[
     "extract_ip", "getpeerip",
     "BearerAuth", "CookieAuthMiddleware", "GuardMiddleware", "AccessLog",
     "SecretString", "reveal",
-    # Release-train tooling — the versioning rule and cut-release skill name these.
+    # Release-train tooling — the versioning rule names these.
     "upgrade_guide", "_parse_upgrading",
 ]
 
 # ---- helpers ---------------------------------------------------------------
+
+# Tracked entries only: a symlinked directory under `.claude/skills/` (or a symlinked
+# file anywhere) is the maintainer's private material, linked in locally, and is not part
+# of what this repository ships — so it is not part of what this lint reads.
+tracked_subdirs(dir) = isdir(dir) ?
+    String[d for d in sort(readdir(dir)) if isdir(joinpath(dir, d)) && !islink(joinpath(dir, d))] :
+    String[]
 
 function collect_docs()
     docs = String[]
@@ -144,8 +167,11 @@ function collect_docs()
     for d in DOC_DIRS
         base = joinpath(ROOT, d)
         isdir(base) || continue
+        # walkdir does not follow symlinked directories, and a symlinked file is skipped
+        # explicitly, so the private material linked in locally is never read.
         for (dir, _, files) in walkdir(base), f in files
-            endswith(f, ".md") && push!(docs, joinpath(dir, f))
+            p = joinpath(dir, f)
+            endswith(f, ".md") && !islink(p) && push!(docs, p)
         end
     end
     return docs
@@ -178,6 +204,46 @@ function front_matter(text)
     return fm
 end
 
+"""
+The raw front-matter block of `text`, delimiters included, exactly as on disk — or
+`nothing` when the file does not open with a `---` line. Check F compares two of these
+byte for byte, because the stub's `name`/`description` are the only bytes that exist
+twice in the repo by design.
+"""
+function front_matter_block(text)
+    lines = split(text, '\n')
+    (isempty(lines) || strip(lines[1]) != "---") && return nothing
+    close_idx = findnext(l -> strip(l) == "---", lines, 2)
+    close_idx === nothing && return nothing
+    return join(lines[1:close_idx], "\n")
+end
+
+"""
+`nothing` if the `key: value` line is safe as plain YAML, else a reason string.
+
+Deliberately not a YAML parser — the script is stdlib-only. It pins the hazards that make
+skill discovery fail *silently*: an unquoted `": "` makes the block unparseable, so the
+skill is never registered; an unquoted `" #"` opens a comment and truncates the
+description mid-sentence, so the skill registers and advertises half a sentence. A value
+the author quoted is exempt.
+"""
+function yaml_scalar_problem(key, value)
+    v = strip(value)
+    isempty(v) && return "`$key` is empty"
+    (startswith(v, '"') && endswith(v, '"')) && return nothing
+    (startswith(v, '\'') && endswith(v, '\'')) && return nothing
+    occursin(": ", v) && return "`$key` contains \": \" but is not quoted"
+    occursin(" #", v) && return "`$key` contains ' #' but is not quoted"
+    occursin(first(v), "\"'{}[]&*!|>%@`#") && return "`$key` starts with the YAML indicator '$(first(v))'"
+    return nothing
+end
+
+# Is `key:` written as a YAML block scalar (`>`, `>-`, `|`, `|-`) in the front-matter?
+function block_scalar(text, key)
+    m = match(Regex("(?m)^" * key * ":[ \\t]*([>|][-+]?)[ \\t]*\$"), text)
+    return m !== nothing
+end
+
 normalize_ws(s) = replace(strip(s), r"\s+" => " ")
 
 # A: repo-relative paths inside backticks.
@@ -192,10 +258,9 @@ const LINK_RE = r"\]\(([^)]+)\)"
 # G: section pointers, all three spellings.
 #   linked:   [nitro-core §4](nitro-core.instructions.md)          -- § inside the brackets
 #   backtick: `nitro-core.instructions.md` §4
-#   trailing: [`nitro-board`](../nitro-board/SKILL.md) §1          -- § after the link
-# The trailing form is how every skill-to-skill pointer is written; without it the
-# check covered only the instruction-file pointers and skill cross-references rotted
-# silently.
+#   trailing: [`workers.instructions.md`](…/workers.instructions.md) §1   -- § after the link
+# The trailing form is how skill-to-skill pointers are written; without it the check
+# covered only the instruction-file pointers and cross-references rotted silently.
 const SECTION_LINK_RE  = r"\[[^\]]*?§(\d+)\]\(([^)#]+)(?:#[^)]*)?\)"
 const SECTION_TICK_RE  = r"`([A-Za-z0-9_\-]+\.instructions\.md)`[^\n]{0,12}?§(\d+)"
 const SECTION_TRAIL_RE = r"\]\(([^)#\s]+\.md)(?:#[^)]*)?\)[ ]{0,2}§(\d+)"
@@ -297,8 +362,7 @@ end
 # ---- structural checks -----------------------------------------------------
 
 function lint_skill_frontmatter(errors)
-    isdir(SKILLS_DIR) || return
-    for name in sort(readdir(SKILLS_DIR))
+    for name in tracked_subdirs(SKILLS_DIR)
         skill = joinpath(SKILLS_DIR, name, "SKILL.md")
         if !isfile(skill)
             push!(errors, ".github/skills/$(name)/: no SKILL.md")
@@ -334,6 +398,7 @@ function lint_instruction_frontmatter(errors, all_files)
     end
 end
 
+# E: the public sets are pinned, and the hub lists every member.
 function lint_registry(errors)
     hub = joinpath(ROOT, HUB)
     if !isfile(hub)
@@ -342,116 +407,84 @@ function lint_registry(errors)
     end
     text = read(hub, String)
 
+    actual_skills = tracked_subdirs(SKILLS_DIR)
+    actual_skills == PUBLIC_SKILLS ||
+        push!(errors, ".github/skills/: tracked skills are $(actual_skills), expected exactly " *
+                      "$(PUBLIC_SKILLS) — the process skills live outside this repository; " *
+                      "adding a public skill means editing PUBLIC_SKILLS and shipping its stub")
+
     listed_skills = Set{String}(m.captures[1] for m in
         eachmatch(r"\.github/skills/([A-Za-z0-9_\-]+)/SKILL\.md", text))
-    actual_skills = isdir(SKILLS_DIR) ?
-        Set{String}(d for d in readdir(SKILLS_DIR) if isdir(joinpath(SKILLS_DIR, d))) : Set{String}()
+    for s in actual_skills
+        s in listed_skills ||
+            push!(errors, "$(HUB): skill `$(s)` exists but is not listed in the hub")
+    end
+    for s in sort(collect(setdiff(listed_skills, Set(actual_skills))))
+        push!(errors, "$(HUB): lists `.github/skills/$(s)/SKILL.md` but that skill does not exist")
+    end
 
-    for s in sort(collect(setdiff(actual_skills, listed_skills)))
-        push!(errors, "$(HUB): skill `$(s)` exists but is not listed in the skill registry table")
-    end
-    for s in sort(collect(setdiff(listed_skills, actual_skills)))
-        push!(errors, "$(HUB): skill registry lists `$(s)` but `.github/skills/$(s)/` does not exist")
-    end
+    actual_rules = isdir(INSTRUCTIONS_DIR) ?
+        String[f for f in sort(readdir(INSTRUCTIONS_DIR)) if endswith(f, ".md") && !islink(joinpath(INSTRUCTIONS_DIR, f))] :
+        String[]
+    actual_rules == PUBLIC_RULES ||
+        push!(errors, ".github/instructions/: tracked rule files are $(actual_rules), expected exactly " *
+                      "$(PUBLIC_RULES) — the process ruleset lives outside this repository")
 
     listed_rules = Set{String}(m.captures[1] for m in
         eachmatch(r"([A-Za-z0-9_\-]+\.instructions\.md)", text))
-    actual_rules = isdir(INSTRUCTIONS_DIR) ?
-        Set{String}(f for f in readdir(INSTRUCTIONS_DIR) if endswith(f, ".instructions.md")) : Set{String}()
-    hub_basename = basename(HUB)
-
-    for r in sort(collect(setdiff(actual_rules, union(listed_rules, Set([hub_basename])))))
-        push!(errors, "$(HUB): rule file `$(r)` exists but is not listed in the deep-dive table")
+    for r in actual_rules
+        r in listed_rules ||
+            push!(errors, "$(HUB): rule file `$(r)` exists but is not listed in the area rule table")
+    end
+    for r in sort(collect(setdiff(listed_rules, Set(actual_rules))))
+        push!(errors, "$(HUB): names `$(r)` but `.github/instructions/$(r)` does not exist")
     end
 end
 
-function lint_agents(errors)
-    isdir(CLAUDE_AGENTS_DIR) || return
-    hub = joinpath(ROOT, HUB)
-    hubtext = isfile(hub) ? read(hub, String) : ""
+# F: the discovery stubs.
+function lint_skill_stubs(errors)
+    stubs = tracked_subdirs(CLAUDE_SKILLS_DIR)
+    stubs == PUBLIC_SKILLS ||
+        push!(errors, ".claude/skills/: tracked stubs are $(stubs), expected exactly $(PUBLIC_SKILLS) " *
+                      "— a public skill without a stub is invisible to Claude Code, and a stub with " *
+                      "no canonical file points at nothing (symlinked entries are ignored)")
 
-    for f in sort(readdir(CLAUDE_AGENTS_DIR))
-        endswith(f, ".md") || continue
-        name = f[1:end-3]
-        fm = front_matter(read(joinpath(CLAUDE_AGENTS_DIR, f), String))
+    for n in PUBLIC_SKILLS
+        canon_path = joinpath(SKILLS_DIR, n, "SKILL.md")
+        stub_path  = joinpath(CLAUDE_SKILLS_DIR, n, "SKILL.md")
+        (isfile(canon_path) && isfile(stub_path) && !islink(stub_path)) || continue   # reported above
 
-        get(fm, "name", "") == name ||
-            push!(errors, ".claude/agents/$(f): front-matter name `$(get(fm, "name", ""))` != filename `$(name)`")
-        isempty(get(fm, "description", "")) &&
-            push!(errors, ".claude/agents/$(f): empty or missing `description`")
+        canon = read(canon_path, String)
+        stub  = read(stub_path, String)
+        canon_fm = front_matter_block(canon)
+        stub_fm  = front_matter_block(stub)
+        canon_fm === nothing &&
+            push!(errors, ".github/skills/$(n)/SKILL.md: no parseable front-matter block")
+        stub_fm === nothing &&
+            push!(errors, ".claude/skills/$(n)/SKILL.md: no parseable front-matter block — discovery fails silently")
+        (canon_fm !== nothing && stub_fm !== nothing && canon_fm != stub_fm) &&
+            push!(errors, ".claude/skills/$(n)/SKILL.md: front-matter differs from .github/skills/$(n)/SKILL.md " *
+                          "— `name:` drift breaks invocation, `description:` drift breaks skill selection")
 
-        occursin(".claude/agents/$(f)", hubtext) ||
-            push!(errors, "$(HUB): subagent `$(name)` exists but is not listed in the Subagents table")
+        occursin(".github/skills/$(n)/SKILL.md", stub) ||
+            push!(errors, ".claude/skills/$(n)/SKILL.md: body does not name `.github/skills/$(n)/SKILL.md`")
+        filesize(stub_path) <= STUB_MAX_BYTES ||
+            push!(errors, ".claude/skills/$(n)/SKILL.md: $(filesize(stub_path)) bytes > $(STUB_MAX_BYTES) " *
+                          "— a stub is a pointer; put the content in the canonical file")
 
-        # Capability-envelope pin: a quarantined agent must never gain an acting tool.
-        if haskey(QUARANTINED_AGENTS, name)
-            declared = get(fm, "tools", "")
-            if isempty(declared)
-                push!(errors, ".claude/agents/$(f): quarantined agent must declare an explicit `tools:` list")
-            else
-                got = Set(strip(t) for t in split(declared, ',') if !isempty(strip(t)))
-                allowed = QUARANTINED_AGENTS[name]
-                extra = setdiff(got, allowed)
-                isempty(extra) ||
-                    push!(errors, ".claude/agents/$(f): quarantined agent grants disallowed tool(s) " *
-                                  "$(join(sort(collect(extra)), ", ")) — the quarantine only holds while it cannot act")
+        for (label, text) in ((".github/skills/$(n)/SKILL.md", canon), (".claude/skills/$(n)/SKILL.md", stub))
+            fm = front_matter(text)
+            for key in ("name", "description")
+                haskey(fm, key) || continue
+                # A folded/literal block (`description: >-` …) is not a plain scalar: `: ` and
+                # ` #` are ordinary characters inside it, so only the inline form is policed.
+                block_scalar(text, key) && continue
+                problem = yaml_scalar_problem(key, fm[key])
+                problem === nothing || push!(errors, "$(label): $(problem)")
             end
+            get(fm, "name", "") == n ||
+                push!(errors, "$(label): front-matter name `$(get(fm, "name", ""))` != `$(n)`")
         end
-    end
-
-    for name in sort(collect(keys(QUARANTINED_AGENTS)))
-        isfile(joinpath(CLAUDE_AGENTS_DIR, name * ".md")) ||
-            push!(errors, ".claude/agents/$(name).md: pinned quarantined agent is missing")
-    end
-end
-
-function lint_plugin_manifest(errors)
-    # `.github/skills/` is the single home for skill content. Copilot and Codex read it
-    # directly; Claude Code reaches it through the repo-local plugin declared in
-    # `.claude-plugin/`, whose manifest carries a custom `skills` path. If that path drifts
-    # from `.github/skills/`, every `/<name>` invocation silently stops resolving while the
-    # files still look fine — so the pointer is checked here rather than trusted.
-    #
-    # Deliberately regex, not a JSON parse: this script runs on stdlib only (see ci.yml).
-
-    if isdir(CLAUDE_SKILLS_DIR)
-        push!(errors, ".claude/skills/: exists again — skills live only in .github/skills/, " *
-                      "reached via .claude-plugin/plugin.json. Delete it.")
-    end
-
-    if !isfile(PLUGIN_MANIFEST)
-        push!(errors, ".claude-plugin/plugin.json: missing — Claude Code cannot invoke any skill as /<name>")
-        return
-    end
-    manifest = read(PLUGIN_MANIFEST, String)
-
-    skills_m = match(r"\"skills\"\s*:\s*\"([^\"]*)\"", manifest)
-    if skills_m === nothing
-        push!(errors, ".claude-plugin/plugin.json: no `skills` field — it is what points Claude Code at .github/skills/")
-    elseif !occursin(r"\.github/skills/?$", skills_m[1])
-        push!(errors, ".claude-plugin/plugin.json: `skills` is \"$(skills_m[1])\", expected \"./.github/skills/\"")
-    end
-
-    plugin_name_m = match(r"\"name\"\s*:\s*\"([^\"]*)\"", manifest)
-    plugin_name = plugin_name_m === nothing ? "" : plugin_name_m[1]
-    isempty(plugin_name) && push!(errors, ".claude-plugin/plugin.json: no `name` field")
-
-    if !isfile(PLUGIN_MARKET)
-        push!(errors, ".claude-plugin/marketplace.json: missing — the plugin has nothing to install it from")
-        return
-    end
-    market = read(PLUGIN_MARKET, String)
-    if !isempty(plugin_name) && !occursin("\"$(plugin_name)\"", market)
-        push!(errors, ".claude-plugin/marketplace.json: does not list plugin `$(plugin_name)`")
-    end
-
-    # Every skill directory must still carry a SKILL.md, or the plugin loads a partial set.
-    isdir(SKILLS_DIR) || return
-    for name in sort(readdir(SKILLS_DIR))
-        dir = joinpath(SKILLS_DIR, name)
-        isdir(dir) || continue
-        isfile(joinpath(dir, "SKILL.md")) ||
-            push!(errors, ".github/skills/$(name)/: no SKILL.md — the plugin will skip it")
     end
 end
 
@@ -478,12 +511,11 @@ function main()
     lint_skill_frontmatter(errors)
     lint_instruction_frontmatter(errors, all_files)
     lint_registry(errors)
-    lint_plugin_manifest(errors)
-    lint_agents(errors)
+    lint_skill_stubs(errors)
 
     if isempty(errors)
         println("docs_lint: OK — $(length(docs)) docs, $(length(REQUIRED_SYMBOLS)) symbols, " *
-                "registry + plugin manifest + § anchors + applyTo globs checked")
+                "public skill/rule sets + stubs + § anchors + applyTo globs checked")
         exit(0)
     else
         println(stderr, "docs_lint: $(length(errors)) finding(s):")

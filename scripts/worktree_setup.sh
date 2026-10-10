@@ -147,6 +147,15 @@ if ! julia --project="$WT" -e 'import Pkg; Pkg.resolve()'; then
 fi
 julia --project="$WT" -e 'import Pkg; Pkg.instantiate()'
 
+# Maintainer-local agent material — optional. The agent process rules, skills and subagent are not
+# in this repository; a private checkout provides `link.sh`, which links them into a checkout as
+# gitignored symlinks under .claude/ and writes CLAUDE.local.md. Absent in a contributor's clone,
+# and nothing here depends on it.
+linker="${NITRO_AGENT_CONFIG:-$HOME/app/agent-config}/nitro/link.sh"
+if [[ -x "$linker" ]]; then
+  "$linker" "$WT" || echo "  ! $linker failed — agent skills not linked (see its message above)"
+fi
+
 echo "done — worktree ready."
 echo "  julia --project=. test/runtests.jl                    # full suite"
 echo "  julia --project=. test/runtests.jl test/util_tests.jl  # single file"
