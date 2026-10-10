@@ -1,10 +1,10 @@
-# BI App Config Example
+# Application Config Example
 
 Nitro should not own your application configuration. Keep the config struct, file loading,
 and environment-variable resolution in the app layer, then pass the resulting object into
 Nitro with `serve(context=...)`.
 
-This is the right pattern for a BI-style app that uses Nitro for HTTP, `Nitro.Auth` for
+This is the right pattern for an application that uses Nitro for HTTP, `Nitro.Auth` for
 authentication helpers, `Nitro.Workers` for in-process jobs, and `PormG` as an external
 package dependency.
 
@@ -17,7 +17,7 @@ canonical page for *why*; this one shows the shape a full `AppConfig` takes.
 Split the config by responsibility instead of using one large untyped dictionary.
 
 ```julia
-module BIAppConfig
+module MyAppConfig
 
 using Nitro: SecretString
 using Nitro.Auth: JWTKeyset
@@ -57,7 +57,7 @@ struct AppConfig
     server_host::String
     server_port::Int
     db::DatabaseConfig
-    db_sch::DatabaseConfig
+    db_reports::DatabaseConfig
     auth::AuthConfig
     workers::WorkerConfig
     env::String
@@ -68,7 +68,7 @@ function load_config(env::String="dev")
         get(ENV, "DB_ADAPTER", "postgres"),
         get(ENV, "DB_HOST", "localhost"),
         parse(Int, get(ENV, "DB_PORT", "5432")),
-        get(ENV, "DB_NAME", "bi_db"),
+        get(ENV, "DB_NAME", "myapp"),
         get(ENV, "DB_USER", "postgres"),
         SecretString(required_env("DB_PASS"))
     )
@@ -140,19 +140,19 @@ a silent fallback.
 ## Why This Lives In The App
 
 - Nitro stays framework-focused and does not accumulate app-specific config types.
-- `PormG` remains external; Nitro does not need to know how your BI app names or groups databases.
+- `PormG` remains external; Nitro does not need to know how your app names or groups databases.
 - Each app can evolve its own config without forcing new public API into Nitro core.
 
-## Mapping From A Genie BI App
+## Mapping From A Genie App
 
 Typical migration mapping:
 
 - `db/connection.yml` -> `DatabaseConfig`
-- `config/all_sort.yml` JWT keys -> `AuthConfig`
+- `config/secrets.yml` JWT keys -> `AuthConfig`
 - worker tuning and retry limits -> `WorkerConfig`
 - host, port, and environment -> top-level `AppConfig`
 
-If your app has multiple databases such as `db`, `db_sch`, or `db_esus`, keep those as
+If your app has multiple databases such as `db`, `db_reports`, or `db_archive`, keep those as
 separate typed fields or store them in a typed dictionary owned by the app.
 
 ## Using The Config With Nitro
@@ -162,7 +162,7 @@ Pass the config into Nitro as the typed context payload.
 ```julia
 using HTTP
 using Nitro
-using .BIAppConfig
+using .MyAppConfig
 
 function health(req::HTTP.Request, ctx::Context{AppConfig})
     return Res.json(Dict(
@@ -253,7 +253,7 @@ serve(
     context=config,
     middleware=[
         worker_startup(
-            queues=["agendamento"],
+            queues=["reports"],
             cleanup_interval_hours=24,
             cleanup_retain_days=7,
         ),
@@ -261,5 +261,5 @@ serve(
 )
 ```
 
-For the BI server migration, this config object is the bridge between the old Genie layout
-and the new Nitro app bootstrap.
+For a migration from Genie, this config object is the bridge between the old Genie layout and
+the new Nitro app bootstrap.

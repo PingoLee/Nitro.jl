@@ -169,5 +169,5 @@ end
 
 Nitro resolves the environment **name**. Choosing what that name means — `config/env/dev.jl`,
 a YAML block, a `.env` file — stays in the application layer, along with the typed config
-struct it produces. See [BI App Config Example](bi_app_config.md) for the recommended shape and
+struct it produces. See [Application Config Example](app_config.md) for the recommended shape and
 [Managing Secrets](secrets.md) for keeping credentials out of it.

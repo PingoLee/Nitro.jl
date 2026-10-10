@@ -47,7 +47,7 @@ makedocs(
         "upgrading.md",
         "Manual" => [
             "tutorial/first_steps.md",
-            "tutorial/bi_app_config.md",
+            "tutorial/app_config.md",
             "tutorial/hot_reload.md",
             "tutorial/workers.md",
             "tutorial/request_types.md",

@@ -62,7 +62,7 @@ end
 serve(context=config)
 ```
 
-For a comprehensive guide on building `AppConfig`, refer to the [BI App Config Example](bi_app_config.md).
+For a comprehensive guide on building `AppConfig`, refer to the [Application Config Example](app_config.md).
 
 ## Keeping Secrets Out of Logs and REPL Output
 
