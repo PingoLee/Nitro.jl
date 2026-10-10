@@ -8,6 +8,33 @@ using HTTP
 
 const BENCH_CTX = Nitro.Core.App()
 
+# Typed shapes of suite/json.jl's two payloads, for the `Json{T}` routes below (#475). `BenchRows`
+# is the vector-of-structs case `json_bind` hands straight to `JSON.parse`; the `@kwdef` twins take
+# the `Dict{String, JSON.JSONText}` intermediate (#294) at the top level and re-parse each field.
+# `BenchRow` itself stays plain on purpose: a `@kwdef` struct inside a container follows JSON.jl's
+# own rules, so a `@kwdef` row would measure nothing the plain one does not.
+struct BenchRow
+    id::Int
+    label::String
+    value::Float64
+end
+struct BenchRows
+    rows::Vector{BenchRow}
+end
+Base.@kwdef struct BenchKwRows
+    rows::Vector{BenchRow} = BenchRow[]
+end
+struct BenchItem
+    name::String
+    qty::Int
+    tags::Vector{String}
+end
+Base.@kwdef struct BenchKwItem
+    name::String = ""
+    qty::Int = 0
+    tags::Vector{String} = String[]
+end
+
 Nitro.Core.Routing.urlpatterns(BENCH_CTX, "", Nitro.RouteDefinition[
     Nitro.path("/bench/ping", (req) -> "pong", method="GET"),
     Nitro.path("/bench/items/<int:id>", (req, id::Int) -> Res.json(Dict("id" => id)), method="GET"),
@@ -17,6 +44,15 @@ Nitro.Core.Routing.urlpatterns(BENCH_CTX, "", Nitro.RouteDefinition[
         return Res.json(Dict("n" => length(q2), "a" => get(q1, "a", "")))
     end, method="GET"),
     Nitro.path("/bench/json", (req) -> Res.json(getjson(req)), method="POST"),
+    # The same echo through the typed extractor (#475): parse into `T`, serialize `T` back.
+    Nitro.path("/bench/json/typed/item", (req, body::Json{BenchItem}) -> Res.json(body.payload),
+               method="POST"),
+    Nitro.path("/bench/json/kwdef/item", (req, body::Json{BenchKwItem}) -> Res.json(body.payload),
+               method="POST"),
+    Nitro.path("/bench/json/typed/rows", (req, body::Json{BenchRows}) -> Res.json(body.payload),
+               method="POST"),
+    Nitro.path("/bench/json/kwdef/rows", (req, body::Json{BenchKwRows}) -> Res.json(body.payload),
+               method="POST"),
     # Four bound params in one signature. The single-param route above barely moves
     # when the parser changes shape; the cost of the old `Vector{Any}` + per-param
     # dynamic dispatch scales with arity, so this is where #37 is visible.
