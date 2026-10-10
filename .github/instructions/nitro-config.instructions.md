@@ -1,6 +1,5 @@
 ---
 description: Nitro.jl app configuration — no framework singleton, typed app config, bootstrap order, secrets
-applyTo: "**/*.jl"
 ---
 
 # Nitro.jl Configuration & Bootstrap

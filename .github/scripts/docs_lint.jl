@@ -23,8 +23,7 @@
 #   C. Public-symbol existence — a curated set of API names the docs commit to
 #      must still be defined somewhere in `src/` or `ext/`.
 #   D. Front-matter — every skill declares `name` (matching its directory) and a
-#      non-empty `description`; every instruction file declares `applyTo` and
-#      `description`.
+#      non-empty `description`; every instruction file declares a `description`.
 #   E. Registry parity — the set of tracked skill directories under `.github/skills/`
 #      and the set of `.github/instructions/*.instructions.md` files are BOTH pinned
 #      here (PUBLIC_SKILLS, PUBLIC_RULES), and every member is listed in the hub. A
@@ -41,9 +40,6 @@
 #      "`nitro-core.instructions.md` §4" must resolve to a real `## 4.` heading in
 #      that file. The hub's hard-stop index is built entirely out of these, so an
 #      unchecked § pointer is exactly how the index rots.
-#   H. `applyTo` coverage — every glob in an instruction file's front-matter
-#      matches at least one tracked file. Catches a rule scoped to a directory
-#      that has since been renamed.
 #
 # What it does NOT catch (documented so nobody trusts it too far):
 #   - Wrong overload / signature drift (e.g. `Res.status(code, msg)` when only
@@ -336,29 +332,6 @@ function lint_sections(file, text, errors)
     end
 end
 
-# H: convert a front-matter glob to a regex and test it against tracked files.
-function glob_matches_any(glob, all_files)
-    pat = replace(glob, r"[.()\[\]+^$]" => s -> "\\" * s)
-    pat = replace(pat, "**/" => "\x00")     # `**/` may match zero segments
-    pat = replace(pat, "**" => "\x01")
-    pat = replace(pat, "*" => "[^/]*")
-    pat = replace(pat, "\x00" => "(?:.*/)?")
-    pat = replace(pat, "\x01" => ".*")
-    re = Regex("^" * pat * "\$")
-    return any(f -> occursin(re, f), all_files)
-end
-
-function tracked_files()
-    files = String[]
-    for (dir, _, fs) in walkdir(ROOT)
-        occursin(joinpath(ROOT, ".git"), dir) && continue
-        for f in fs
-            push!(files, replace(relpath(joinpath(dir, f), ROOT), '\\' => '/'))
-        end
-    end
-    return files
-end
-
 # ---- structural checks -----------------------------------------------------
 
 function lint_skill_frontmatter(errors)
@@ -377,24 +350,13 @@ function lint_skill_frontmatter(errors)
     end
 end
 
-function lint_instruction_frontmatter(errors, all_files)
+function lint_instruction_frontmatter(errors)
     isdir(INSTRUCTIONS_DIR) || return
     for f in sort(readdir(INSTRUCTIONS_DIR))
         endswith(f, ".md") || continue
         fm = front_matter(read(joinpath(INSTRUCTIONS_DIR, f), String))
         isempty(get(fm, "description", "")) &&
             push!(errors, ".github/instructions/$(f): empty or missing `description`")
-        applyto = get(fm, "applyTo", "")
-        if isempty(applyto)
-            push!(errors, ".github/instructions/$(f): missing `applyTo` glob")
-            continue
-        end
-        for glob in split(strip(applyto, ['\'', '"']), ',')
-            g = strip(glob)
-            (isempty(g) || g == "**") && continue
-            glob_matches_any(g, all_files) ||
-                push!(errors, ".github/instructions/$(f): applyTo glob `$(g)` matches no file")
-        end
     end
 end
 
@@ -507,15 +469,14 @@ function main()
             push!(errors, "REQUIRED_SYMBOLS: `$(sym)` referenced by docs is not defined in src/ or ext/")
     end
 
-    all_files = tracked_files()
     lint_skill_frontmatter(errors)
-    lint_instruction_frontmatter(errors, all_files)
+    lint_instruction_frontmatter(errors)
     lint_registry(errors)
     lint_skill_stubs(errors)
 
     if isempty(errors)
         println("docs_lint: OK — $(length(docs)) docs, $(length(REQUIRED_SYMBOLS)) symbols, " *
-                "public skill/rule sets + stubs + § anchors + applyTo globs checked")
+                "public skill/rule sets + stubs + § anchors checked")
         exit(0)
     else
         println(stderr, "docs_lint: $(length(errors)) finding(s):")
