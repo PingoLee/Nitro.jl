@@ -258,7 +258,7 @@ end
     # A release's DATE used to live in a `## <ver> — <date>` marker sitting in the same file as its
     # entries, so forgetting one was visible in the diff that stamped them. #192 moved it into a
     # table in `UPGRADING.md` — a file nothing parses and, without this, nothing tests. That would
-    # leave `nitro-cut-release`'s "skipping it loses the date for good" as the only guard, which is
+    # leave the release-cut step's "skipping it loses the date for good" as the only guard, which is
     # exactly the say-so-only shape this suite exists to replace.
     contract = read(joinpath(pkgdir(Nitro), "UPGRADING.md"), String)
     cut = sort(unique(e.version for e in _read_upgrading_entries() if e.version != _UNRELEASED_VERSION))
@@ -463,7 +463,7 @@ end
     # A warning that fires on the file's own header trains the maintainer to ignore the warning,
     # which is worse than not having one. SAMPLE carries both legitimate skips: the prose header
     # plus its `## Writing an entry` recipe, and a freshly-opened `## Unreleased` marker with
-    # nothing under it yet — the exact shape `nitro-cut-release` leaves behind.
+    # nothing under it yet — the exact shape a freshly cut release train leaves behind.
     @test _upgrading_problems(SAMPLE) == _UpgradeProblem[]
     @test_logs min_level = Base.CoreLogging.Warn _parse_upgrading(SAMPLE)
 

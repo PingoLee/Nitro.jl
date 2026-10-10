@@ -16,7 +16,7 @@ Nitro.jl — a Julia web framework with Django-style routing, Go-style threading
 response builders, and Spring-style typed binding.
 
 **Audience: you are a Nitro consumer.** Changing Nitro's own `src/`, `ext/`, in-repo `docs/`, or
-`test/`? Read [`nitro-general.instructions.md`](../../instructions/nitro-general.instructions.md)
+`test/`? Read [`CONTRIBUTING.md`](../../../CONTRIBUTING.md)
 and the area rule file instead — this skill teaches the public surface, not the internals.
 
 Default posture:

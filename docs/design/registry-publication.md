@@ -192,7 +192,7 @@ because nothing comments as `JuliaTagBot`. Its job-level `if:` skipped every oth
 `workflow_dispatch` still ran a mutable `@v1` tag with `contents: write` and the deploy key, for no
 benefit. Re-add the standard `.github/workflows/TagBot.yml` from TagBot's README,
 pinned by commit SHA like every other action (`test/ci_workflow_tests.jl` enforces the pin).
-[`nitro-cut-release`](../../.github/skills/nitro-cut-release/SKILL.md) already emits the `vX.Y.Z`
+The release-cut step already emits the `vX.Y.Z`
 tags TagBot will continue.
 
 ## 7. Decision: not taken

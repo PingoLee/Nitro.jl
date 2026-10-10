@@ -57,7 +57,7 @@ Two independent review passes were needed. The first found the UNC failure; the 
 density is the argument. nginx expresses most of this as `location ~ /\. { deny all; }` and
 `disable_symlinks on;`, backed by two decades of adversarial exposure.
 
-**This is on-lineage, not a departure.** [`nitro-general.instructions.md`](../../.github/instructions/nitro-general.instructions.md)
+**This is on-lineage, not a departure.** [`CONTRIBUTING.md`](../../CONTRIBUTING.md) (*Design lineage*)
 names Django as the tradition for routing, sessions and project layout — and Django settled this
 question years ago. `django.views.static.serve` is documented as not hardened for production, and the
 `static()` URL helper returns no patterns when `DEBUG=False`. Nitro borrowed the *name* `staticfiles`

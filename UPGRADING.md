@@ -41,7 +41,7 @@ Consequences worth knowing before you add one:
 
 - **One `##` entry per breaking change, in a new file.** It carries `- **Version**: Unreleased` and
   **no `Project.toml` bump**; the maintainer stamps it with a release number when cutting a train
-  (`nitro-cut-release`).
+  (see *Release trains* below).
 - **One entry per file, and no `---` line anywhere in it.** The parser still splits a file on a
   column-0 `---`, so a stray horizontal rule truncates your entry and a second `##` entry in the
   same file is absorbed into the first. Both are caught by `test/upgrade_guide_tests.jl`.
@@ -68,7 +68,7 @@ Consequences worth knowing before you add one:
 
 ## Release trains
 
-Cut by the maintainer via `nitro-cut-release`, which stamps every `Unreleased` entry with the new
+Cut by the maintainer, who stamps every `Unreleased` entry with the new
 number and adds its row here. Entries not listed under a number are uncut — a consumer dev'ing
 Nitro at HEAD is running them, and `upgrade_guide` surfaces them by default.
 
@@ -86,7 +86,7 @@ Nitro at HEAD is running them, and `upgrade_guide` surfaces them by default.
 
 Copy the block below into a **new file** `upgrading/<YYYY-MM-DD>-<slug>.md` for each new
 breaking/behavior change. Do NOT bump `Project.toml` — the version moves once, at cut time
-(the `nitro-cut-release` skill rewrites `Version: Unreleased` → the release number).
+(the cut rewrites `Version: Unreleased` → the release number).
 
 <!--
 ## `<api>` — <one-line summary of the change>
