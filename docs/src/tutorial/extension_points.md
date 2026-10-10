@@ -11,7 +11,7 @@ reading framework source.
 | **Middleware** | a function that wraps a handler | once per request, top-down |
 | **Package extensions** | an `ext/` module that fills in a stub | automatically, when a weak dependency loads |
 
-Configuration is a fourth seam with its own page — see [BI App Config Example](@ref).
+Configuration is a fourth seam with its own page — see [Application Config Example](@ref).
 
 ---
 
@@ -348,5 +348,5 @@ does not need it — a plain `using` in your own code is enough.
 - Prefix your route `name=` values so two packages can be mounted together.
 - Ship middleware as **keyword-only factories**, so options are explicit at the call site.
 - Keep handlers unexported; the host should need only your `routes` and your middleware.
-- Take configuration as **arguments**, not from a global — see [BI App Config Example](@ref).
+- Take configuration as **arguments**, not from a global — see [Application Config Example](@ref).
 - Reach for a package extension only when you are extending Nitro's own surface.
