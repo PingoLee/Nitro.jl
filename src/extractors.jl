@@ -8,7 +8,8 @@ using Dates
 using ..Util: text, json, formdata, multipart, parseparam, parsebody, FormFile
 using ..Util.BodyParsers: NITRO_READ_STYLE, _parse_json_bounded, _body_view, is_json_media_type,
     is_multipart_form_media_type, is_form_media_type
-using ..Reflection: struct_builder, extract_struct_info, kw_construct
+using ..Reflection: struct_builder, extract_struct_info, kw_construct, kw_constructible, TypeMemo,
+                    memoized, reset!
 using ..Errors: ValidationError, UnsupportedMediaTypeError, is_unrecoverable
 # The Core stubs `getjson`/`getform` bind to (their bodies are in core/request.jl, included later).
 using ...Core: getjson, getform
@@ -396,9 +397,12 @@ defaults, not `Base.@kwdef`'s, and answers a partial body with "field has no def
 from the source" -- while `Query{T}`, `Form{T}` and `JsonFragment{T}` already honored the defaults
 through `struct_builder`.
 
-Each present field is still parsed by `JSON.parse` against its own declared type, so field values
-bind exactly as they do for a plain struct. The body is parsed strictly first, as an object of raw
-field texts, so a malformed or trailing-garbage body is rejected as before. A `@kwdef` struct
+A `@kwdef` struct is bound in one `JSON.parse` over the body, through the `KwdefBind{T}` hook: each
+present field is parsed against its own declared type, with JSON.jl's own read style, so field
+values bind exactly as they do for a plain struct, and the parse rejects a malformed or
+trailing-garbage body as before. It used to parse the body twice -- once into
+`Dict{String, JSON.JSONText}` to learn which fields were present, then each field again -- which
+made a large `@kwdef` body slower to bind than an untyped `getjson` (#493). A `@kwdef` struct
 nested directly as a field is bound the same way; one inside a container or a `Union` follows
 JSON.jl's own rules.
 
@@ -406,34 +410,89 @@ A struct that already speaks StructUtils -- field tags or defaults, as `StructUt
 `@tags` and `@defaults` declare -- is left to `JSON.parse` whole: JSON.jl honors those itself, and
 the per-field path would drop the tags, so a renamed key would silently bind the field's default.
 
-Both parses go through `_parse_json_bounded`, so a body nested deeper than 512 is an
+The parse goes through `_parse_json_bounded`, so a body nested deeper than 512 is an
 `ArgumentError` -- a 400 via `safe_extract` -- before `JSON.parse` recurses into it (#314). And
-both use Nitro's read style, which never interns a client string as a `Symbol` (#306): JSON.jl's
+it uses Nitro's read style, which never interns a client string as a `Symbol` (#306): JSON.jl's
 default style did so for every enum field, valid name or not.
 """
 function json_bind(::Type{T}, text::Union{AbstractString, AbstractVector{UInt8}}) :: T where {T}
     binds_by_keyword(T) || return _parse_json_bounded(text, T; style = NITRO_READ_STYLE)
-    fields = _parse_json_bounded(text, Dict{String, JSON.JSONText}; style = NITRO_READ_STYLE)
-    kwargs = Pair{Symbol, Any}[]
-    for name in fieldnames(T)
-        raw = get(fields, String(name), nothing)
-        isnothing(raw) && continue
-        push!(kwargs, name => json_bind(fieldtype(T, name), raw.value))
-    end
-    return kw_construct(T, kwargs)
+    return _parse_json_bounded(text, KwdefBind{T}; style = NITRO_READ_STYLE)
 end
 
-# Runs once per `Json{T}` request, so it is ordered cheapest first. The StructUtils queries are
-# plain dispatch and fold for a concrete `T`; `hasmethod` with keyword names is the same
-# `@kwdef` test `multipart_struct_builder` and `struct_builder` use, several times cheaper than
-# scanning `methods(T)`. StructUtils is reached through JSON, whose typed-parse API is built on
-# it, so it is not a dependency of Nitro's own.
+# Asked once per `Json{T}` request and once per field of a keyword-bound struct, so the answer is
+# memoized per type (#493): uncached, the `hasmethod` behind `kw_constructible` cost ~1 µs, three
+# times the parse of a small body. StructUtils is reached through JSON, whose typed-parse API is
+# built on it, so it is not a dependency of Nitro's own.
 const _SU = JSON.StructUtils
-function binds_by_keyword(::Type{T}) :: Bool where {T}
+const BINDS_BY_KEYWORD = TypeMemo()
+__init__() = reset!(BINDS_BY_KEYWORD)
+binds_by_keyword(::Type{T}) where {T} = memoized(_binds_by_keyword, BINDS_BY_KEYWORD, T)
+function _binds_by_keyword(::Type{T}) :: Bool where {T}
     T isa DataType && isstructtype(T) || return false
     style = _SU.DefaultStyle()
     isempty(_SU.fieldtags(style, T)) && isempty(_SU.fielddefaults(style, T)) || return false
-    return hasmethod(T, Tuple{}, fieldnames(T))
+    return kw_constructible(T)
+end
+
+"""
+    KwdefBind{T}
+
+Parse target standing in for a keyword-bound `T` (see `json_bind`). Overloading `StructUtils.make`
+for a type Nitro owns is JSON.jl's hook for custom construction, and JSON.jl hands the method its
+**own** read style: every field parsed with that style binds exactly as `JSON.parse(·, FT; style)`
+would, and returns the position after it, so the body is walked once. No JSON.jl internals are
+named.
+"""
+struct KwdefBind{T} end
+
+# The fields a `KwdefBind{T}` walk has seen, as keyword arguments for `kw_construct`.
+struct KwdefFields{T, S}
+    style::S
+    kwargs::Vector{Pair{Symbol, Any}}
+end
+
+@noinline _throw_not_an_object() = throw(ArgumentError("expected a JSON object"))
+
+function _SU.make(st::_SU.StructStyle, ::Type{KwdefBind{T}}, source) where {T}
+    fields = KwdefFields{T, typeof(st)}(st, Pair{Symbol, Any}[])
+    pos = _SU.applyeach(st, fields, source)
+    return kw_construct(T, fields.kwargs), pos
+end
+
+# An array hands its elements over with integer keys, an object its field names. JSON.jl would bind
+# a struct from an array positionally; the keyword path never has. An empty array has no element
+# to refuse and binds every default -- as it did through the `Dict` this walk replaced.
+#
+# The key is materialized once. JSON.jl hands it over undecoded, and comparing an escaped key to a
+# `String` decodes it again on every comparison: one long escaped key, matched against every field
+# of a wide struct, allocated its length once per field.
+function (fields::KwdefFields)(key, value)
+    key isa Integer && _throw_not_an_object()
+    return bind_field!(fields, String(key), value)
+end
+
+# One literal comparison per field, unrolled so each branch knows its field's type statically. A
+# key matching no field returns `nothing`, and JSON.jl skips its value.
+@generated function bind_field!(fields::KwdefFields{T}, key, value) where {T}
+    body = Expr(:block)
+    for name in fieldnames(T)
+        push!(body.args, :(key == $(String(name)) &&
+            return bind_field!(fields, $(QuoteNode(name)), $(fieldtype(T, name)), value)))
+    end
+    push!(body.args, :(return nothing))
+    return body
+end
+
+function bind_field!(fields::KwdefFields, name::Symbol, ::Type{FT}, value) where {FT}
+    bound, pos = binds_by_keyword(FT) ? _SU.make(fields.style, KwdefBind{FT}, value) :
+                                        _SU.make(fields.style, FT, value)
+    # A repeated key replaces the earlier value, so the last one binds. Every occurrence is parsed,
+    # though, so an invalid one refuses the body even when a later one is valid -- as JSON.jl's
+    # plain-struct path does. The `Dict` this walk replaced kept only the last text and parsed that.
+    i = findfirst(p -> p.first === name, fields.kwargs)
+    i === nothing ? push!(fields.kwargs, name => bound) : (fields.kwargs[i] = name => bound)
+    return pos
 end
 
 """
@@ -738,7 +797,7 @@ function multipart_struct_builder(::Type{T}, parsed::AbstractDict) :: T where {T
     # A `@kwdef` struct exposes a keyword constructor accepting all its fields;
     # a plain struct does not. Building the former by keyword lets us omit absent
     # fields so their declared defaults apply.
-    if hasmethod(T, Tuple{}, fieldnames(T))
+    if kw_constructible(T)
         return multipart_kw_build(T, parsed)
     end
     args = Any[multipart_bind(String(name), fieldtype(T, name), parsed) for name in fieldnames(T)]

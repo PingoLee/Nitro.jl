@@ -355,6 +355,30 @@ for the plain struct. On a small body the extra cost is one `binds_by_keyword` p
 `@kwdef` echo still beats `getjson` end to end (159 against 181 µs) only because the struct write
 is cheap. Also #493.
 
+**Both are fixed (#493), and `Json{T}` is no longer slower than `getjson` at any size measured.** The
+keyword-constructor check is memoized per type (8–10 ns a hit, 9–15 ns with four threads reading
+it at once; keyed on the world counter so a later method definition is still seen), and a `@kwdef` body
+is one `JSON.parse` through a `make` hook on a Nitro-owned type, so it costs what a plain struct
+costs. Same method and versions as above:
+
+| allocations / time | before | after |
+|---|---|---|
+| parse, plain struct, 3 fields | 12 / 1.46 µs | 9 / 0.48 µs |
+| parse, `@kwdef`, 3 fields | 57 / 6.2 µs | 27 / 2.0 µs |
+| parse, `@kwdef`, 250 rows | 1,295 / 108 µs | 1,278 / 66 µs |
+| echo served, plain struct, 3 fields | 45 / 3.0 µs | 42 / 1.9 µs |
+| echo served, `@kwdef`, 3 fields | 92 / 8.4 µs | 60 / 3.5 µs |
+| echo served, `@kwdef`, 250 rows | 2,085 / 159 µs | 2,067 / 114 µs |
+
+The plain-struct echo now ties `getjson`'s 1.9 µs on the 3-field body, with fewer allocations. What
+`@kwdef` still pays over a plain struct on a small body is `kw_construct`'s dynamic keyword call,
+about 1.2 µs. A positional shortcut when every field is present would remove it, but would also
+bypass a hand-written keyword constructor that transforms its arguments, so it is not taken.
+
+One edge now behaves like JSON.jl's plain-struct path instead of like the `Dict` the walk replaced:
+a repeated key binds its last value as before, but every occurrence is parsed, so an invalid
+earlier occurrence (`{"a":"bad","a":5}`) refuses the body where the `Dict` kept only the last text.
+
 ## 4. Reference facts
 
 - Up to 2.6, a `String` body was wrapped in a `BytesBody`, and HTTP.jl #1272 declared that
