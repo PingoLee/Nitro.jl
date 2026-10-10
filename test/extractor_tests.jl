@@ -1052,6 +1052,182 @@ end
 end
 
 
+# -- #493 -----------------------------------------------------------------------------------
+#
+# `json_bind` used to parse a `@kwdef` body twice -- into `Dict{String, JSON.JSONText}`, then each
+# field again -- which made a large `@kwdef` body slower to bind than an untyped `getjson`. It is
+# now one parse through the `KwdefBind{T}` hook. The #294 testitem above is the behavior contract;
+# this one pins the edges the walk handles itself, against the old two-pass bind as the reference.
+@testitem "json_bind binds a @kwdef body in one pass (#493)" tags=[:core] setup=[NitroCommon] begin
+
+using Test
+using JSON
+using Nitro
+
+const E  = Nitro.Core.Extractors
+const BP = Nitro.Core.Util.BodyParsers
+
+@kwdef struct Page; page::Int = 1; size::Int = 10; end
+@kwdef struct Order
+    id     :: Int
+    note   :: Union{String, Nothing}
+    label  :: Union{String, Nothing} = "none"
+    page   :: Page = Page()
+    tags   :: Vector{String} = String[]
+end
+@kwdef struct Defaults; a::Int = 1; b::String = "x"; end
+struct Row; id::Int; label::String; end
+@kwdef struct Rows; rows::Vector{Row} = Row[]; end
+struct PlainRows; rows::Vector{Row}; end
+
+# The pre-#493 bind, verbatim: the third source the new walk is judged against.
+function two_pass(::Type{T}, text) where {T}
+    E.binds_by_keyword(T) || return BP._parse_json_bounded(text, T; style = BP.NITRO_READ_STYLE)
+    fields = BP._parse_json_bounded(text, Dict{String, JSON.JSONText}; style = BP.NITRO_READ_STYLE)
+    kwargs = Pair{Symbol, Any}[]
+    for name in fieldnames(T)
+        raw = get(fields, String(name), nothing)
+        isnothing(raw) && continue
+        push!(kwargs, name => two_pass(fieldtype(T, name), raw.value))
+    end
+    return Nitro.Core.Reflection.kw_construct(T, kwargs)
+end
+outcome(f) = try
+    (:bound, JSON.json(f()))
+catch e
+    e isa Nitro.Core.Errors.ValidationError || e isa ArgumentError || e isa MethodError ||
+        rethrow()
+    (:refused, nothing)      # what `safe_extract` turns into a 400
+end
+# Bytes one warmed call allocates.
+function bytes(f, x)
+    f(x)
+    return @allocated f(x)
+end
+
+@testset "agrees with the two-pass bind on every edge" begin
+    for (T, body) in [
+            (Order, """{"id":2}"""),
+            (Order, """{"id":1,"page":{"size":50},"tags":["a"],"label":null}"""),
+            (Order, """{"note":"x"}"""),
+            (Order, """{"id":1} trailing"""),
+            (Order, """{"id":1,"page":{"size":2}} x"""),
+            (Order, """{"id":"""),
+            (Order, ""),
+            (Order, """{"id":1,"page":{"size":"big"}}"""),
+            (Order, """{"id":1,"id":7}"""),
+            (Order, """{"id":1,"zzz":{"a":[1,{"b":[2]}]}}"""),
+            (Order, """{"id":1,"page":null}"""),
+            (Order, """{"id":1,"page":[]}"""),
+            (Order, """{"id":1,"page":{}}"""),
+            (Order, """{"id":1,"page":[1,2]}"""),
+            (Order, """{"id":1,"page":"p"}"""),
+            (Order, """  {"id":3}  """),
+            (Defaults, "[1,2]"), (Defaults, "[]"), (Defaults, "{}"), (Defaults, "\"s\""),
+            (Defaults, "3"), (Defaults, "null"), (Defaults, "{} x"),
+            (Defaults, """{"a":2,"b":"q","a":5}"""), (Defaults, """{"\\u0061":7}"""),
+        ]
+        @test outcome(() -> E.json_bind(T, body)) == outcome(() -> two_pass(T, body))
+    end
+end
+
+@testset "a repeated key binds its last value" begin
+    @test E.json_bind(Defaults, """{"a":2,"b":"q","a":5}""") == Defaults(5, "q")
+end
+
+# The one deliberate difference from the two-pass bind, which kept only a repeated key's last text
+# and parsed that: every occurrence is parsed now, as JSON.jl's plain-struct path does, so an
+# invalid one refuses the body.
+@testset "an invalid occurrence of a repeated key refuses the body" begin
+    @test outcome(() -> two_pass(Defaults, """{"a":"bad","a":5}""")) == (:bound, """{"a":5,"b":"x"}""")
+    @test outcome(() -> E.json_bind(Defaults, """{"a":"bad","a":5}""")) == (:refused, nothing)
+    @test outcome(() -> E.json_bind(Order, """{"id":1,"page":{"size":"x"},"page":{"size":2}}""")) ==
+          (:refused, nothing)
+end
+
+@kwdef struct Wide
+    f01::Int = 0; f02::Int = 0; f03::Int = 0; f04::Int = 0; f05::Int = 0
+    f06::Int = 0; f07::Int = 0; f08::Int = 0; f09::Int = 0; f10::Int = 0
+end
+@testset "an escaped key binds, and is decoded once rather than once per field" begin
+    @test E.json_bind(Defaults, """{"\\u0061":7}""") == Defaults(7, "x")
+    @test E.json_bind(Wide, """{"f\\u0030\\u0033":3}""").f03 == 3
+    # One long escaped key nothing matches. Decoded per field compared, this allocated ten decodes;
+    # the two-pass bind decoded it once, as a `Dict` key.
+    key = "\\u0062" ^ 20_000
+    body = Vector{UInt8}("{\"$key\":1}")
+    @test bytes(b -> E.json_bind(Wide, b), body) < 2 * bytes(b -> two_pass(Wide, b), body)
+end
+
+@testset "an array body is refused, as it was" begin
+    @test_throws ArgumentError E.json_bind(Defaults, "[1,2]")
+    @test_throws ArgumentError E.json_bind(Order, """{"id":1,"page":[1,2]}""")
+end
+
+# The structural claim, measured: the body is no longer copied into a second representation. The
+# two-pass bind allocated a `JSONText` copy of every field's text, about the size of the body;
+# the walk allocates what the plain struct's parse does.
+@testset "a @kwdef body allocates what the plain struct's parse does" begin
+    body = Vector{UInt8}(JSON.json(Dict("rows" => [Dict("id" => i, "label" => "row-$i")
+                                                   for i in 1:400])))   # 801 keys: under the field cap
+    kw    = bytes(b -> E.json_bind(Rows, b), body)
+    plain = bytes(b -> E.json_bind(PlainRows, b), body)
+    old   = bytes(b -> two_pass(Rows, b), body)
+    @test old - plain > length(body) ÷ 2      # the copy the old bind made, so the probe can see it
+    @test kw - plain < length(body) ÷ 8
+end
+
+end
+
+
+# -- #493 -----------------------------------------------------------------------------------
+#
+# `struct_builder`, `multipart_struct_builder` and `json_bind` asked `hasmethod` whether a type has
+# a keyword constructor on every request, ~1 µs each. The answer is now memoized per type -- keyed
+# on the world counter, so a method defined later (Revise, `@eval`) is still seen.
+@testitem "keyword-constructor checks are memoized per type and follow the world (#493)" tags=[:core] setup=[NitroCommon] begin
+
+using Test
+using Nitro
+
+const R = Nitro.Core.Reflection
+const E = Nitro.Core.Extractors
+
+struct LaterKw; a::Int; end
+
+@testset "a keyword constructor defined after the first answer is seen" begin
+    @test !R.kw_constructible(LaterKw)
+    @test !E.binds_by_keyword(LaterKw)
+    Core.eval(@__MODULE__, :(LaterKw(; a::Int = 0) = LaterKw(a)))
+    @test R.kw_constructible(LaterKw)
+    @test E.binds_by_keyword(LaterKw)
+end
+
+kw_allocs(T) = @allocated R.kw_constructible(T)
+@testset "a repeated answer is the memoized one" begin
+    kw_allocs(LaterKw)
+    @test kw_allocs(LaterKw) == 0       # `hasmethod` with keyword names allocates; a hit does not
+end
+
+# Many tasks missing on fresh types at once, each publishing its own copy. Whether a publication is
+# actually lost depends on the scheduler, and this does not try to force one; it pins that every
+# answer is right however the publications interleave.
+@testset "concurrent first answers agree with hasmethod" begin
+    types = [Core.eval(@__MODULE__, isodd(i) ?
+                 :(Base.@kwdef struct $(Symbol("Memo", i)); x::Int = $i; end; $(Symbol("Memo", i))) :
+                 :(struct $(Symbol("Memo", i)); x::Int; end; $(Symbol("Memo", i))))
+             for i in 1:32]
+    expected = [hasmethod(T, Tuple{}, fieldnames(T)) for T in types]
+    @test count(expected) == 16
+    for _ in 1:4
+        answers = fetch.([Threads.@spawn(R.kw_constructible(T)) for T in types for _ in 1:4])
+        @test answers == repeat(expected; inner = 4)
+    end
+end
+
+end
+
+
 # -- #254 -----------------------------------------------------------------------------------
 #
 # The `Session` extractor looks a session id up in an application-supplied store through a
