@@ -293,7 +293,8 @@ and its headers. `sizeguess(::Any) = 512` sets bytes, not count.
 `echo_10kb_served` (250 rows through `getjson` → `Res.json`, pipeline built once) is 5,047
 allocations / 236 KB; `JSON.parse` into `Dict{String,Any}` is 2,510 of them, about ten per row for
 the `Dict`, its two `Memory`s, the boxed values and the key strings. That is inherent to an untyped
-parse. The typed extractor `Json{T}` is the lever on that side, and is unmeasured.
+parse. The typed extractor `Json{T}` is the lever on that side; #475 below measures it, and corrects
+one premise of this paragraph: `getjson` returns a `JSON.Object{String,Any}`, not a `Dict`.
 
 **JSON.jl below 1.9 is a different story.** The `[compat]` floor moved to `^1.9` in #306 for the
 read style, which happened to exclude two writer costs this measurement found in 1.8.0: every
@@ -303,6 +304,56 @@ array element paid two allocations (`StructUtils.applyeach(::AbstractArray)` str
 boxed the `WriteClosure` on the dynamic call (60 against 10 at 50 keys). A stale local
 `Manifest.toml` still resolving 1.8.0 reproduces both; `Manifest.toml` is gitignored, so
 `Pkg.update()` is the fix, not a commit.
+
+### What `Json{T}` costs against `getjson` (#475)
+
+The same echo through the typed extractor: `bench/suite/json.jl`'s `typed_*` rows bind the body
+as a plain struct (`BenchItem` for the 3-field body, `BenchRows` holding a `Vector{BenchRow}` for
+the 250-row one) and `kwdef_*` as its `@kwdef` twin, then return `Res.json` of what they parsed.
+`parse_*` and `write_*` measure each half on its own, because a struct and a parsed object
+serialize differently. Measured with BenchmarkTools, minimum per call, Julia 1.12.7, one thread,
+JSON.jl 1.10.0, HTTP 2.8.0, reproduced across two runs. Attribution from `Profile.Allocs` at
+`sample_rate = 1`.
+
+| allocations / time | `getjson` | `Json{T}`, plain struct | `Json{T}`, `@kwdef` |
+|---|---|---|---|
+| parse, 3 fields | 14 / 0.36 µs | 12 / 1.46 µs | 57 / 6.2 µs |
+| write, 3 fields | 22 / 0.58 µs | 17 / 0.48 µs | (same as plain) |
+| echo served, 3 fields | 49 / 1.9 µs | 45 / 3.0 µs | 92 / 8.4 µs |
+| parse, 250 rows | 2,510 / 65–75 µs | 1,264 / 65 µs | 1,295 / 108 µs |
+| write, 250 rows | 2,524 / 104 µs | 773 / 44 µs | (same as plain) |
+| echo served, 250 rows | 5,047 / 181 µs | 2,053 / 114 µs | 2,085 / 159 µs |
+
+The `echo_*_served` rows are the parse plus the write, plus about 15 allocations of pipeline.
+
+**On a real payload `Json{T}` wins outright: 60% fewer allocations and 37% less time at 250 rows.**
+The parse halves its allocations, because one immutable `BenchRow` stored inline in the
+`Vector{BenchRow}` replaces a per-row object of boxed values. The write gains even more.
+
+**Half of `getjson`'s win comes from the write, because `getjson` returns a
+`JSON.Object{String,Any}`, not a `Dict`.** JSON.jl 1.x parses objects into its own ordered `Object`
+type, and the writer iterates it through a dynamic `applyeach` that heap-allocates every
+`Pair{String,Any}` and its iteration tuple: about seven allocations per object, 2,524 for the 250
+rows. Writing the same data as a Base `Dict{String,Any}` takes 773 allocations and 77 µs. A struct
+writes in 773 too, almost all of it the 750 field-name `String`s described in the `Res.json`
+section above. That section's "`Dict` beats `NamedTuple`" therefore holds for a `Dict` the handler
+builds itself, not for an echoed `getjson` value. Parsing into a Base `Dict` instead
+(`dicttype = Dict{String,Any}`) costs 3,495 allocations and 101 µs, so swapping the type inside
+`getjson` would roughly break even. The upstream candidate is the writer's `Object` iteration.
+
+**On a 3-field body `Json{T}` allocates less but takes 1 µs longer, and that microsecond is
+reflection, not parsing.** The typed parse itself is 0.33 µs. `json_bind`'s `binds_by_keyword(T)`
+adds 0.9 µs on every request, through `hasmethod` with keyword names, although its answer depends
+only on `T`. Filed as #493.
+
+**The `@kwdef` path makes a large body parse slower than `getjson` does, at half the
+allocations.** For a `@kwdef` type, `json_bind` first parses the whole body into
+`Dict{String, JSON.JSONText}` (#294): that pass validates the body and copies its text, 38.6 µs at
+10 KB for 6 allocations. Only then does it parse each field. At 250 rows that is 108 µs against 65
+for the plain struct. On a small body the extra cost is one `binds_by_keyword` per field plus
+`kw_construct`'s dynamic keyword call (1.2 µs, 12 allocations), so 6.2 µs against 1.5. The
+`@kwdef` echo still beats `getjson` end to end (159 against 181 µs) only because the struct write
+is cheap. Also #493.
 
 ## 4. Reference facts
 
