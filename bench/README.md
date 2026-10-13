@@ -28,8 +28,11 @@ bench/
 ## Setup (once)
 
 ```bash
-julia --project=bench -e 'using Pkg; Pkg.develop(path="."); Pkg.instantiate()'
+julia --project=bench -e 'using Pkg; Pkg.instantiate()'
 ```
+
+`bench/Project.toml` names this checkout as Nitro's source (`[sources] Nitro = {path = ".."}`), so
+no `Pkg.develop` step is needed and setup leaves no diff behind.
 
 ## Run
 
