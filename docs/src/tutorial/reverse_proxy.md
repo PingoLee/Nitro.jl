@@ -93,9 +93,30 @@ memory its garbage collector aims for. Both are covered in
 ## nginx
 
 ```nginx
+# A conf.d/ file is included inside nginx's `http {}` block, so the directives
+# down to `upstream` are http-level: they apply to every server below.
+server_tokens off;                 # proxy-built error pages stop naming the nginx version
+
+limit_req_zone $binary_remote_addr zone=perip:10m rate=10r/s;
+limit_req_status 429;              # the default, 503, reads as an outage
+
 upstream nitro {
     server 127.0.0.1:8080;
     keepalive 32;
+}
+
+# Catch-alls. Scanners address the bare IP; without these, the first server
+# block below would be the default and answer every unknown Host.
+server {
+    listen      80 default_server;
+    listen [::]:80 default_server;
+    return 444;                    # close the connection without a response
+}
+
+server {
+    listen      443 ssl default_server;
+    listen [::]:443 ssl default_server;
+    ssl_reject_handshake on;       # nginx >= 1.19.4; needs no certificate
 }
 
 server {
@@ -127,6 +148,14 @@ server {
 
     client_max_body_size 10m;      # reject oversize uploads before Julia sees them
 
+    # One limit for every location below. A location that declares its own
+    # `limit_req` drops this one rather than adding to it.
+    limit_req zone=perip burst=50 nodelay;
+
+    # HSTS, set here and not by Nitro as well. `always` reaches error responses.
+    # A location with its own `add_header` drops this one: repeat it there.
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+
     # Protect against links out of the asset tree without breaking the usual
     # atomic-deploy layout, where `dist` is itself a symlink into `releases/N`.
     # Bare `disable_symlinks on` checks every component and 403s that setup.
@@ -146,6 +175,7 @@ server {
     location /assets/ {
         try_files $uri =404;
         add_header Cache-Control "public, immutable, max-age=31536000";
+        add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
     }
 
     location /api/ {
@@ -187,9 +217,17 @@ server {
         proxy_read_timeout 1h;
     }
 
-    # SPA history mode — this is what `spafiles` does in development.
+    # SPA history mode — what `spafiles` does in development, minus one thing:
+    # a miss that looks like a file (`/wp-login.php`) is a 404, not the shell.
     location / {
-        try_files $uri /index.html;
+        try_files $uri @spa;
+    }
+
+    location @spa {
+        if ($uri ~ \.[^/]+$) {     # looks like a file, and no file matched
+            return 404;
+        }
+        rewrite ^ /index.html break;
     }
 }
 ```
@@ -212,6 +250,10 @@ Four things in that config are easy to get wrong, and three of them fail *quietl
   tab opening the URL gets. Behind TLS
   termination a WebSocket route also needs `ExtractIP(forwarded_proto = …)`, or every browser
   upgrade is a `403` — see [WebSocket upgrades and the Origin check](@ref).
+
+The rest of the config — the rate limit, the two catch-all servers, `server_tokens`, HSTS and the
+`@spa` fallback — is for the traffic no user sends, and is explained in
+[Hostile and scanner traffic](@ref).
 
 ## Caddy
 
@@ -266,6 +308,175 @@ handles WebSocket upgrades with no extra configuration. It does **not** set `X-R
 with the `:x_forwarded_for` variant of `ExtractIP` below, not the `:x_real_ip` one. Because it
 terminates TLS, WebSocket routes also need `forwarded_proto` — see
 [WebSocket upgrades and the Origin check](@ref).
+
+## Hostile and scanner traffic
+
+Everything above assumes the clients you meant to serve. From its first hour online, an
+internet-facing host also receives requests from nobody in particular: scanners probing `/.env`,
+`/.git/config`, `/wp-login.php`, `/cgi-bin/` and the bare IP address. On a small app they can be
+most of the traffic. None of it is dangerous to a correctly built Nitro app, but each gap below
+turns it into cost: requests reaching Julia that the proxy could have refused, log volume that
+buries the real records, and answers that tell a scanner to come back.
+
+### Rate-limit at the server level, not per location
+
+```nginx
+limit_req_zone $binary_remote_addr zone=perip:10m rate=10r/s;   # http level
+limit_req zone=perip burst=50 nodelay;                           # server level
+```
+
+The table at the top of this page makes coarse per-IP limiting the proxy's job; this is that job.
+Put `limit_req` at the **server** level, as the worked config does, so every location inherits it,
+including locations added later. `limit_req` follows the same rule as `proxy_set_header`: a
+location that declares its own — a stricter zone on a login route, say — inherits **none** from
+the server, so repeat the server-level line beside the stricter one. The opposite mistake is the
+common one: a limit placed only on a login or fallback location leaves `location /` and `/api/`
+unthrottled, and nothing reports it.
+
+Size `burst` from your own app. An SPA's first load fetches the shell and every asset at once, so
+count the requests in one cold page load and leave room above it. `limit_req_status 429` makes a
+refusal say what it is; nginx's default `503` reads as an outage in monitoring.
+
+The key has two blind spots:
+
+- `$binary_remote_addr` is one key per address, so an IPv6 client gets a fresh bucket from every
+  address in its /64 (see [Which addresses share a bucket](@ref)). `limit_req_zone` has no prefix
+  option. `RateLimiter`, which groups IPv6 by /64 by default, closes that gap, so keep it as the
+  second layer, configured with `forwarded_header` and `trusted_proxies` as in
+  [Rate limiting](@ref). Without them it sees only the proxy's address, and every client shares one
+  bucket.
+- Behind a CDN, `$remote_addr` is the CDN's edge, and every user behind that edge shares one bucket.
+  Restore the client address first with nginx's `realip` module (`set_real_ip_from` for the CDN's
+  ranges, `real_ip_header`). It rewrites `$remote_addr` and `$binary_remote_addr`, so the limit and
+  the `X-Real-IP` and `X-Forwarded-For` headers the worked config sends all carry the restored
+  client. That is the setup the Cloudflare `ExtractIP` example below assumes. Distribution and
+  nginx.org packages include the module; a build from source needs `--with-http_realip_module`.
+
+Caddy has no built-in rate limiter. It needs a plugin, such as `caddy-ratelimit` built in with
+`xcaddy`; without one, `RateLimiter` is the only limit you have.
+
+### Drop requests for hosts you do not serve
+
+Much scanner traffic addresses the machine by IP (`Host: 203.0.113.7`), or by some other name that
+happens to resolve to it. nginx hands a request that no `server_name` matches to the port's
+**default server**, and when none is declared that is the first `server` block listening on the
+port: your app. The two catch-all blocks in the worked config take that role instead.
+
+- On port 443, `ssl_reject_handshake on` (nginx 1.19.4 and later) refuses the TLS handshake for any
+  name without a server block of its own. It needs no certificate, and the client never gets as
+  far as an HTTP request.
+- On port 80, `return 444` closes the connection without writing a response. The app's own port-80
+  block keeps redirecting and serving the ACME challenge, because it names its `server_name`.
+
+A port has only one default server. Debian and Ubuntu packages ship `sites-enabled/default` with
+`listen 80 default_server`, so `nginx -t` refuses the config with *a duplicate default server for
+0.0.0.0:80* until you disable that site or remove its `default_server`. Health checks and uptime
+monitors that probe `http://<ip>/` or `https://<ip>/` fail after this change too; point them at
+the hostname.
+
+### Do not announce the version
+
+`server_tokens off` takes the version out of the `Server` header and out of the error pages nginx
+writes itself: the `404` for a missing asset, the `413` from `client_max_body_size`, the
+`502`–`504` while Nitro restarts. Left on, every response tells a scanner the exact build
+(`Server: nginx/1.24.0 (Ubuntu)`) to match against a CVE list. It sits at the http level so every
+server block gets it.
+
+### Never send one request to Nitro twice
+
+nginx's `error_page` can hand a failed response on to a named location. Do not point it back at
+Nitro:
+
+```nginx
+location /api/ {
+    proxy_pass             http://nitro;
+    proxy_intercept_errors on;
+    error_page 404 = @app;          # wrong: @app proxies the same request again
+}
+
+location @app {
+    proxy_pass http://nitro;
+}
+```
+
+Every `404` then reaches the app **twice**: two access-log records, two hits against `RateLimiter`,
+two runs of every middleware — for exactly the requests scanners send most. If `@app` looks on disk
+first instead, it is worse: a file that happens to exist there turns Nitro's `404` into a `200`,
+serving something the route refused.
+
+If you want a fallback to files on disk, decide it **before** the request is proxied, and leave
+`proxy_intercept_errors` off:
+
+```nginx
+location /api/ {
+    try_files $uri @nitro;          # a file on disk, else Nitro — once
+}
+
+location @nitro {
+    proxy_pass http://nitro;        # plus the proxy_set_header lines above
+}
+```
+
+Nitro's `404` is an answer, not an error to recover from.
+
+### Keep file-shaped misses out of the SPA fallback
+
+A bare `try_files $uri /index.html` answers every miss with the app shell and a `200`,
+`/wp-login.php` and `/phpmyadmin/index.php` included. A scanner records that as a hit and comes
+back with the follow-up probes. The worked config sends misses to `location @spa` instead, which
+answers `404` when the last path segment has an extension; only extension-free paths, which is what
+client routes look like, get the shell. The cost is a client route whose last segment contains a
+dot (`/users/jane.doe`): give it another shape, or a `location` of its own.
+
+Two shorter ways to write the same rule look equivalent and are not:
+
+- **A top-level `location ~ \.[^/]+$`** outranks the plain-prefix `/api/` and `/assets/`
+  locations, because a regex location beats a prefix one. `/api/report.csv` stops reaching Nitro
+  and is answered `404`, and `/assets/*` loses its `Cache-Control`.
+- **The same regex nested inside `location /`** is checked *before* the server-level regexes, so it
+  wins over `location ~ /\.` and serves `/.env`.
+
+A named location is reached only after `try_files` has missed, so it can do neither.
+
+`spafiles` still answers every miss with the shell, as a bare `try_files $uri /index.html` does. It
+is the development server; in production the SPA fallback is the proxy's, as recorded in
+`docs/design/static-serving-boundary.md`.
+
+### Ban at the proxy, from its access log
+
+An address that probes path after path is worth banning, and the tools for that read the proxy's
+log: fail2ban, or CrowdSec with its nginx collection. Do not build banning into the app.
+`RateLimiter` slows a client within a window and then forgets it, and `AccessLog` records requests;
+neither is a ban layer, and a ban decided in Julia still costs a request that reached Julia.
+
+Point the ban at the **access log**. In the worked config, scanner misses are answered by
+`try_files … =404` and `return 404`, which write nothing to nginx's error log. fail2ban's stock
+`nginx-botsearch` jail — the scanner jail — reads the error log by default, so on this config it
+sees nothing until you point its `logpath` at the access log. Rejections by `limit_req` *are*
+written to the error log, so the stock `nginx-limit-req` jail works as shipped.
+
+### Set HSTS in one place
+
+`Strict-Transport-Security` can come from the proxy (`add_header … always`, as in the worked
+config) or from Nitro (`serve(security_headers = SecurityHeaders(hsts = Day(365)))`). Choose
+**one**. Two copies do not add up: a browser that receives two obeys only the first (RFC 6797
+§8.1), so the other is silently ignored, and the two drift apart the first time one is edited. The
+proxy is usually the better home. It is where TLS terminates — Nitro speaks plain HTTP and cannot
+tell whether TLS terminated upstream — and only the proxy reaches the responses it writes itself.
+
+The worked config handles two nginx details:
+
+- **`always`.** Without it, nginx adds the header only to a fixed list of success and redirect
+  codes, so every `4xx` and `5xx` goes out without it.
+- **`add_header` does not merge across levels either.** `location /assets/` has an `add_header
+  Cache-Control` of its own, so it inherits none of the server's `add_header` lines and repeats the
+  HSTS one. Remove that repeat and every asset response loses HSTS while every page keeps it.
+  nginx 1.29.3 and later can change the rule with `add_header_inherit merge`; the repeated line
+  works on every version.
+
+If Nitro sets it instead, delete the proxy's lines, and pass `SecurityHeaders` as
+`security_headers =` rather than in `middleware`, so it reaches the responses Nitro builds outside
+the router as well (see [`SecurityHeaders`](@ref)).
 
 ## Keep Nitro unreachable directly
 
@@ -640,6 +851,19 @@ neither is treated as a non-browser client and let through.
 - [ ] The Nitro port is not reachable except through the proxy — check the container's published
       ports and any network policy, not just `host`.
 - [ ] Authorization is enforced in handlers. No `location` block is the only thing guarding a route.
+
+**Hostile traffic**
+
+- [ ] `limit_req` is set at the server level, and any location with a `limit_req` of its own repeats
+      the server-level one.
+- [ ] Catch-all `default_server` blocks on 80 and 443 drop requests for hosts you do not serve.
+- [ ] `server_tokens off`.
+- [ ] No `error_page` hands a Nitro response to a location that proxies it to Nitro again.
+- [ ] File-shaped misses get a `404`, not the SPA shell, and `/.env` is still refused after that
+      change.
+- [ ] Banning is done by fail2ban or CrowdSec reading the proxy's access log, not by the app.
+- [ ] HSTS is sent by the proxy **or** by `SecurityHeaders`, never both, and reaches every
+      location.
 
 **Client IP**
 

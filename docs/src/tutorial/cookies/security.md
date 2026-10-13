@@ -99,7 +99,7 @@ set_cookie!(res, "session", id, samesite="None", secure=true)
 `secure=true` protects the cookie transport once the browser is already speaking HTTPS,
 but it does not tell the browser to avoid plaintext HTTP on the first visit. For public
 HTTPS deployments, also set `Strict-Transport-Security` at your reverse proxy or in an
-application middleware.
+application middleware — in one of them, not both; see [Set HSTS in one place](@ref).
 
 Use [`SecurityHeaders`](@ref), which carries HSTS alongside the rest of the baseline set:
 
