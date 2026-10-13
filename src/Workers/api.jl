@@ -1291,10 +1291,10 @@ never the scheduler. Each logs at `@info` only when it did something.
 The scheduler runs on the `:default` thread pool and, between ticks, waits once rather than
 polling ([#369](https://github.com/PingoLee/Nitro.jl/issues/369)). While Julia has an
 interactive thread, which is the 1.12 default for `julia` and `julia -t auto`, a Ctrl-C at the
-REPL therefore reaches `serve` and not this task. Under `julia -t 1` every task shares one thread
-and it can land here. The scheduler then logs a warning and stops normally, rather than dying
-with an unhandled error or swallowing that press and every later one. Retention is off until
-the scheduler is started again.
+REPL therefore reaches `serve` and not this task. Under `julia -t 1` every task shares one thread,
+and under `julia -t N,0` thread 1 is a default thread, so it can land here. The scheduler then
+logs a warning and stops normally, rather than dying with an unhandled error or swallowing that
+press and every later one. Retention is off until the scheduler is started again.
 
 The bound works by age alone, so choose it as you would for the boot sweep: longer than any task
 legitimately runs. `Second(0)` passes validation but bounds nothing, which on a timer is exactly

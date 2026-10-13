@@ -191,7 +191,9 @@ returning rather than leaving the listener up.
 **That holds in a REPL; outside one, Julia decides what Ctrl-C does (#426).** In an interactive
 REPL, a press stops an idle blocking `serve` cleanly, `on_shutdown` hooks included, after any
 number of served requests, over closed or kept-alive connections. Under load the press can still
-abort, because Julia hands it to the REPL only when no other task is runnable.
+abort, because Julia hands it to the REPL only when no other task is runnable. With no interactive
+thread (`--threads=N,0`) handlers and background tasks share thread 1, and a press under load is
+less predictable still: in measured runs it sometimes ended the REPL session (#491).
 
 Outside a REPL:
 
@@ -215,8 +217,10 @@ task. On a loopback benchmark (`bench/socket/`, `-t 8`, no middleware, `access_l
 spawn; the default console access log costs more than that on its own (see `access_log`). Before #453 the
 response write ran on the connection task, and `serve` ran at about the speed of bare HTTP.jl
 *without* a spawn, roughly half. What remains on the interactive thread is mostly HTTP.jl's own
-head parsing and the cost of waking a thread for the spawn; `julia -t 8,2` gives the pool a
-second thread. To measure your own deployment, run `bench/socket/run.sh`.
+head parsing and the cost of waking a thread for the spawn; `julia -t 6,2` gives the pool a
+second thread within the same total, and `julia -t 8,0` removes it, so HTTP.jl's connection tasks
+share the default pool (see "Running in Production" for what each trades). To measure your own
+deployment, run `bench/socket/run.sh`.
 
 IP-based controls (rate limiting, audit logging) key on the socket peer address,
 resolved for both plain-HTTP and direct-TLS listeners. Behind a reverse proxy,

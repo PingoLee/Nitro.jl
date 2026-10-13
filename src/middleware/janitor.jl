@@ -68,7 +68,8 @@ using ...Types: require_fixed_period
 # Workers retention scheduler records next to `_cleanup_scheduler_loop` (src/Workers/api.jl), and
 # the reasoning there is canonical. In short: with `exit_on_sigint(false)` Julia throws SIGINT into
 # whichever task parked last on thread 1. This task is `Threads.@spawn`, so under Julia 1.12's
-# default layout (thread 1 is the interactive thread) it never gets one. Under `-t 1` it can.
+# default layout (thread 1 is the interactive thread) it never gets one. Under `-t 1` it can, and
+# under `-t N,0`, where thread 1 is a default thread (#491).
 # Rethrowing then only killed the janitor with an `Unhandled Task ERROR` while the server kept
 # running. Swallowing and looping would re-park it as the last task on thread 1 and eat every
 # later press too. Stopping frees the next press for the server, and `_janitor`'s `finally`

@@ -23,6 +23,15 @@ lives in the code comment it names, and that comment is canonical.
   `julia -t N` gives that pool one thread. `parallel_stream_handler`'s per-request
   `Threads.@spawn` moves handlers onto `:default`. That is a 2.2× win (#448), so keep it. The
   reasoning sits at its #39 comment in `src/core/transport.jl`.
+- **With no interactive thread (`-t N,0`) the connection tasks run on `:default`**, spread over
+  every thread. The spawn is still a win there: skipping it measured 4–9% slower (#492), so keep
+  it in every layout. Do not make `parallel` depend on the thread layout. Thread 1 is then a
+  default thread, so a REPL Ctrl-C can land in a handler or a background loop: everything that
+  "never gets a press under the default layout" (#369) can get one at `N,0`, as under `-t 1`.
+- **The interactive thread protects accepting and reading heads, not handlers.** A handler runs on
+  `:default` in every layout, so a CPU-bound handler or Workers job delays other requests just as
+  much at `N,1` as at `N,0` (#491). Do not cite the interactive pool as protection from
+  CPU-bound handlers or jobs.
 - **`serve(parallel = false)` strands the default threads**: every handler then runs on the
   interactive thread. `_warn_if_serial_on_threads` (`src/core/lifecycle.jl`) warns when that
   happens. Do not weaken or remove the warning; its comment says which thread layouts stay

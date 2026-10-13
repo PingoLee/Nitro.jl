@@ -72,23 +72,63 @@ pool, so in Julia the per-request task is what reaches the other threads. When t
 more than one default thread and an interactive one, `serve(parallel = false)` logs a warning
 saying so.
 
+With no interactive pool (`--threads=N,0`, below) nothing is stranded, because the connection
+tasks already run on every default thread, and `serve` does not warn. Keep `parallel` on there
+too: on the machine measured below, `parallel = false` at `--threads=8,0` served 4–9% fewer
+requests per second, with a higher p99.
+
 ### The interactive thread
 
 For N above 1, `--threads=N` is short for `--threads=N,1`: the second number is the interactive
-pool. (`--threads=1` gives it none, and so does `--threads=N,0`; HTTP.jl then runs its connection
-tasks in the default pool, and what follows does not apply.) Every
-request passes through that pool once, for HTTP.jl to read its head and for Nitro to start its
-task, so at a high enough request rate the one interactive thread is the bottleneck while the
-default threads wait for work. Handler cost decides where that happens. A route that does real
-work (a database query, a template) runs into the default pool's limit first, and a second
-interactive thread changes nothing. Small, fast responses at tens of thousands of requests per
-second hit the interactive thread first.
+pool. (`--threads=1` gives it none.) Every request passes through that pool once, for HTTP.jl to
+read its head and for Nitro to start its task, so at a high enough request rate the one
+interactive thread is the bottleneck while the default threads wait for work. Handler cost decides
+where that happens. A route that does real work (a database query, a template) runs into the
+default pool's limit first, and the interactive thread changes nothing. Small, fast responses at
+tens of thousands of requests per second hit the interactive thread first.
 
-On one machine, with the server pinned to 4 cores (8 logical CPUs) and serving a minimal route
-(Julia 1.12.7, `bench/socket/run.sh`), `--threads=8,2` served roughly a quarter to a half more
-requests per second than `--threads=8`, and HTTP.jl on its own moved the same way. If load
-tests show the default threads idle while throughput stops climbing, try `--threads=N,2` and
-measure; there is no reason to raise it otherwise.
+`--threads=N,0` removes the interactive pool. HTTP.jl then runs its connection tasks in the
+default pool, spread over every thread, the way Go places goroutines. On one machine, with the
+server pinned to 4 cores (8 logical CPUs) and serving a minimal route (`bench/socket/run.sh` and
+`bench/socket/contention.sh`, Julia 1.12.7 and 1.13.1 alike):
+
+| | `--threads=8` (`8,1`) | `--threads=6,2` | `--threads=8,0` |
+|---|---|---|---|
+| Requests per second at saturation | 1× | about 1.4× | about 1.7× |
+| p99 at a fixed rate well below saturation | about 1–2 ms | lowest, under 1.5 ms | about 2.5–4 ms |
+| A cheap route while CPU-bound handlers or jobs fill the default threads | delayed | delayed most | delayed |
+
+The last row is what the interactive thread does **not** do. Nitro starts every handler on the
+default pool whatever the layout, so the interactive thread can accept a connection and read its
+head while the default threads are busy, but the handler then waits for a default thread like any
+other. A cheap health check behind handlers that each compute for 50 ms took as long at `8,1` as
+at `8,0`, and longest at `6,2`, which has the fewest default threads to compute on. The same
+holds for background jobs: [Workers](workers.md) runs them on the default pool too.
+
+So:
+
+- **Throughput-bound** (load tests show the default threads idle while throughput stops climbing):
+  try `--threads=N,0`, with N the number of CPUs the process may use, and measure. Expect one to
+  three milliseconds more at p99.
+- **Latency-bound**: keep the interactive pool and give it a second thread within the same total,
+  `--threads=N-2,2`. That had the lowest p99 in nearly every fixed-rate run.
+- **CPU-bound handlers or jobs**: no layout protects the other requests from them, because Julia
+  does not preempt a task that computes without yielding. Bound them instead, so some default
+  threads stay free for requests: run CPU-heavy Workers jobs through one declared sequential
+  queue (`submit_sequential_task`), which runs one job at a time and buffers up to 100 behind it,
+  or put a `yield()` inside a long loop. `max_concurrent_runs` does not make jobs wait: past it,
+  `submit_task` refuses them.
+
+**Stopping it.** `--threads=N,0` is a production layout, for a process stopped by its supervisor.
+It is a worse one to press Ctrl-C at. In a REPL, Julia throws the interrupt into the task that last
+waited on thread 1. With an interactive thread, thread 1 runs no handlers and none of Nitro's
+background loops, and in the runs above the press behaved the same every time: ignored while the
+server was saturated, then the next press, once idle, stopped `serve` cleanly. At `--threads=8,0`
+thread 1 also runs handlers and background tasks (the session janitor, the Workers retention
+scheduler), and the same press under load stopped `serve` at once in some runs, needed a second
+press in most, and ended the whole Julia session in 2 of 10. Develop at the default layout, and
+stop a production server with `terminate` or its process supervisor rather than Ctrl-C (see
+`serve`'s docstring).
 
 ## Memory and GC
 
