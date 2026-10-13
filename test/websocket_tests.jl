@@ -145,7 +145,7 @@ function _handshake(port; origin = nothing, proto = nothing, forwarded = nothing
     try
         write(sock, join(lines, "\r\n") * "\r\n\r\n")
         flush(sock)
-        reader = @async try readline(sock) catch; "" end
+        reader = @async try readline(sock) catch e; read_failed(e) end
         timedwait(() -> istaskdone(reader), 15.0; pollint = 0.05)
         return istaskdone(reader) ? fetch(reader) : "(no reply within 15s)"
     finally
@@ -479,7 +479,7 @@ function _handshake(port; target = "/ws", origin = nothing, proto = nothing)
     try
         write(sock, join(lines, "\r\n") * "\r\n\r\n")
         flush(sock)
-        reader = @async try readline(sock) catch; "" end
+        reader = @async try readline(sock) catch e; read_failed(e) end
         timedwait(() -> istaskdone(reader), 15.0; pollint = 0.05)
         return istaskdone(reader) ? fetch(reader) : "(no reply within 15s)"
     finally
