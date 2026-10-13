@@ -18,6 +18,7 @@ through `req.context`.
 | `payload(req)` | Merged input — `params > post > form > json > query` |
 | `getsession(req)` | Session dict, with `SessionMiddleware` in the pipeline |
 | `getuser(req)` | The authenticated user, once an auth middleware has run |
+| `getprincipal(req)` | The verified token `Principal` — its `id`, `kid` and claims — whichever validator flow put it there |
 | `getip(req)` | Client IP — the socket peer, or the forwarded client with `ExtractIP` |
 
 `queryparams`, also exported, is `HTTP.queryparams` re-exported unchanged: it parses a URI's query
@@ -34,6 +35,7 @@ payload
 getsession
 setsession!
 getuser
+getprincipal
 getip
 setip!
 getcontext

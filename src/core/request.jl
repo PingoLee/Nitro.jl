@@ -228,6 +228,39 @@ stored here is not dict-like, so a struct user still authorizes on its verified 
 getuser(req::HTTP.Request) = Base.get(req.context, :user, nothing)
 
 """
+    getprincipal(req::HTTP.Request) -> Union{Principal, Nothing}
+
+Returns the verified token [`Principal`](@ref) that authenticated the request, or `nothing`.
+
+Where [`getuser`](@ref) returns whatever the validator returned, this returns the token's own
+`Principal`, in both flows. When a `user_validator` put the application's user object at
+`req.context[:user]`, the token's `Principal` rides at `req.context[:auth_claims]` — and that slot
+is read **first**, because the app's object may itself be a `Principal` (an enriched copy, say)
+that was never verified against anything. Otherwise it is `req.context[:user]`, where
+`jwt_validator` stores it when there is no `user_validator`. The auth middleware keeps the two
+slots describing one authentication, so neither can be left over from another layer.
+
+```julia
+function import_batch(req)
+    kid = getprincipal(req).kid   # the keyset-verified key id
+    ...
+end
+```
+
+`principal.kid` is set only when the token was verified against a [`JWTKeyset`](@ref Nitro.Auth.JWTKeyset)
+— a `kid` header on a single-secret token is an unverified label and is never exposed — and
+`principal.id` is the resolved identity. `nothing` means no token principal: an unauthenticated
+request, a session-only one, or a custom validator that returned some other identity. Behind
+[`kid_required`](@ref) the result is never `nothing`.
+"""
+function getprincipal(req::HTTP.Request)::Nullable{Principal}
+    claims = Base.get(req.context, :auth_claims, nothing)
+    claims isa Principal && return claims
+    user = Base.get(req.context, :user, nothing)
+    return user isa Principal ? user : nothing
+end
+
+"""
     getip(req::HTTP.Request) -> Union{Sockets.IPAddr, Nothing}
 
 Returns the caller's IP address from the request context, if present.

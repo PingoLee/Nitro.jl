@@ -532,3 +532,127 @@ accept_any = BearerAuth(t -> Dict("sub" => t))(req -> HTTP.Response(200, "ok"))
 @test accept_any(cookie_only).status == 401
 @test accept_any(both).status == 200
 end
+
+# ── #515 ────────────────────────────────────────────────────────────────────────────────────
+#
+# The denial is the app's to shape: `unauthorized = (req, reason) -> HTTP.Response`. What it may
+# NOT change is the decision -- a refused request stays refused, whatever the factory returns --
+# and it is told only the coarse reason. Direct closure calls; no socket.
+@testitem "Auth middleware — configurable denial responses (#515)" tags=[:middleware, :auth, :security] setup=[NitroCommon] begin
+using HTTP
+using Nitro
+
+const AM = Nitro.Core.Middleware.AuthMiddleware
+
+struct JsonDenial end
+(::JsonDenial)(req::HTTP.Request, reason::Symbol) = HTTP.Response(401, "{}")
+
+# Records every reason it is called with, and answers with it so a test can read it back.
+function recorder()
+    seen = Symbol[]
+    f = (req, reason) -> (push!(seen, reason); HTTP.Response(418, ["X-Reason" => String(reason)], "denied"))
+    return f, seen
+end
+bearer(value) = HTTP.Request("GET", "/", ["Authorization" => value])
+cookie(value) = HTTP.Request("GET", "/", ["Cookie" => "auth_token=$value"])
+
+@testset "BearerAuth: each refusal is reported with its coarse reason" begin
+    cases = (
+        ("no header",           HTTP.Request("GET", "/"),       _ -> "u",                  :missing_credentials),
+        ("another scheme",      bearer("Basic dXNlcg=="),       _ -> "u",                  :missing_credentials),
+        ("empty credential",    bearer("Bearer "),              _ -> "u",                  :missing_credentials),
+        ("validator: nothing",  bearer("Bearer t"),             _ -> nothing,              :invalid_credentials),
+        ("validator throws",    bearer("Bearer t"),             _ -> error("expired"),     :invalid_credentials),
+        ("validator: false",    bearer("Bearer t"),             _ -> false,                :invalid_credentials),
+        ("tuple, no user",      bearer("Bearer t"),             _ -> (nothing, Dict("sub" => "1")), :invalid_credentials),
+    )
+    for (label, req, validator, reason) in cases
+        f, seen = recorder()
+        ran = Ref(false)
+        res = BearerAuth(validator; unauthorized = f)(_ -> (ran[] = true; HTTP.Response(200)))(req)
+        @test (label, res.status, HTTP.header(res, "X-Reason"), seen) == (label, 418, String(reason), [reason])
+        @test (label, ran[]) == (label, false)
+        @test !haskey(req.context, :user)
+    end
+end
+
+@testset "CookieAuthMiddleware: missing / undecryptable cookie vs a refused one" begin
+    secret = "auth-secret-0123456789abcdefghijklmnop"
+    other = HTTP.Response(200)
+    set_cookie!(other, "auth_token", "t"; encrypted = true, secret_key = "wrong-secret-0123456789abcdefghijklmnop")
+    wrong_key = HTTP.Request("GET", "/", ["Cookie" => HTTP.header(other, "Set-Cookie")])
+
+    for (label, req, mw_kw, validator, reason) in (
+            ("no cookie",      HTTP.Request("GET", "/"), (;),                      _ -> "u",     :missing_credentials),
+            ("empty cookie",   cookie(""),               (;),                      _ -> "u",     :missing_credentials),
+            ("wrong key",      wrong_key,                (; secret_key = secret),  _ -> "u",     :missing_credentials),
+            ("validator: nothing", cookie("t"),          (;),                      _ -> nothing, :invalid_credentials))
+        f, seen = recorder()
+        ran = Ref(false)
+        res = CookieAuthMiddleware(validator; unauthorized = f, mw_kw...)(_ -> (ran[] = true; HTTP.Response(200)))(req)
+        @test (label, res.status, seen, ran[]) == (label, 418, [reason], false)
+    end
+end
+
+@testset "an admitted request never calls the factory" begin
+    for (mw, req) in ((BearerAuth, bearer("Bearer t")), (CookieAuthMiddleware, cookie("t")))
+        f, seen = recorder()
+        @test mw(_ -> "alice"; unauthorized = f)(_ -> HTTP.Response(200))(req).status == 200
+        @test isempty(seen)
+    end
+end
+
+@testset "without `unauthorized`, the responses are exactly today's consts" begin
+    ok = _ -> HTTP.Response(200)
+    @test BearerAuth(_ -> "u")(ok)(HTTP.Request("GET", "/")) === AM.INVALID_HEADER
+    @test BearerAuth(_ -> nothing)(ok)(bearer("Bearer t")) === AM.EXPIRED_TOKEN
+    @test CookieAuthMiddleware(_ -> "u")(ok)(HTTP.Request("GET", "/")) === AM.MISSING_COOKIE
+    @test CookieAuthMiddleware(_ -> nothing)(ok)(cookie("t")) === AM.EXPIRED_TOKEN
+end
+
+@testset "a factory that returns no response fails closed" begin
+    for bad in ((req, reason) -> nothing, (req, reason) -> Dict("error" => "Unauthorized"), (req, reason) -> 401)
+        for (mw, req) in ((BearerAuth, bearer("Bearer t")), (CookieAuthMiddleware, cookie("t")),
+                          (BearerAuth, HTTP.Request("GET", "/")))
+            ran = Ref(false)
+            handler = mw(_ -> nothing; unauthorized = bad)(_ -> (ran[] = true; HTTP.Response(200)))
+            @test_throws ArgumentError handler(req)
+            @test !ran[]
+        end
+    end
+end
+
+@testset "the factory must take (req, reason) -- checked when the middleware is built" begin
+    for mw in (BearerAuth, CookieAuthMiddleware)
+        @test_throws ArgumentError mw(_ -> "u"; unauthorized = req -> HTTP.Response(401))
+        @test_throws ArgumentError mw(_ -> "u"; unauthorized = HTTP.Response(401))
+        # A callable struct is fine; so is an untyped two-argument function.
+        @test mw(_ -> nothing; unauthorized = JsonDenial())(_ -> HTTP.Response(200))(cookie("t")).status == 401
+        @test mw(_ -> "u"; unauthorized = (req, _) -> HTTP.Response(401)) isa Function
+    end
+end
+
+@testset "an unrecoverable validator error still propagates, past the factory (#254)" begin
+    f, seen = recorder()
+    handler = BearerAuth(_ -> throw(InterruptException()); unauthorized = f)(_ -> HTTP.Response(200))
+    @test_throws InterruptException handler(bearer("Bearer t"))
+    @test isempty(seen)
+end
+
+# The issue's shape: one JSON error contract for every auth failure, through `path`.
+@testset "a JSON 401 contract end to end" begin
+    unauthorized = (req, _) -> Res.json(Dict("error" => "Unauthorized"); status = 401)
+    app = App(mod = @__MODULE__)
+    urlpatterns(app, "",
+        path("/api", req -> "hi $(getuser(req))";
+             middleware = [BearerAuth(t -> t == "k" ? "client" : nothing; unauthorized)]))
+    for req in (HTTP.Request("GET", "/api"), HTTP.Request("GET", "/api", ["Authorization" => "Bearer nope"]))
+        res = internalrequest(app, req)
+        @test res.status == 401
+        @test text(res) == "{\"error\":\"Unauthorized\"}"
+        @test startswith(HTTP.header(res, "Content-Type"), "application/json")
+    end
+    @test text(internalrequest(app, HTTP.Request("GET", "/api", ["Authorization" => "Bearer k"]))) == "hi client"
+end
+
+end

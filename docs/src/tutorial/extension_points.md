@@ -156,6 +156,11 @@ end
 serve(middleware = [RequireApiKey(key = ENV["API_KEY"])])
 ```
 
+Write one of these for a credential Nitro has no middleware for. If what you want is the
+built-in `BearerAuth` with a different refusal — a JSON body, a `WWW-Authenticate` challenge —
+pass it `unauthorized = (req, reason) -> …` instead; see
+[your own error contract](authentication.md#Your-own-error-contract).
+
 !!! warning "`RateLimiter` and `RateLimiter()` are not the same thing"
     Nitro's built-in middleware are keyword-only factories. Listing one **uncalled** passes the
     factory itself, and the chain then tries to apply it to a handler — a `MethodError` when the

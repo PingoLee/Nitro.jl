@@ -250,7 +250,7 @@ path("/api/admin/users", AdminHandlers.list_users, method="GET",
      middleware=[GuardMiddleware(login_required(), role_required("admin"))])
 ```
 
-**The error contract, and it is not negotiable:**
+**The error contract — the decisions are not negotiable, the response bodies are:**
 
 | Status | Meaning | Produced by |
 |--------|---------|-------------|
@@ -263,8 +263,16 @@ Guards: `login_required(; redirect_url, session_key)`, `role_required(role; role
 `kid_required(allowed)`. `role_required` and `permission_required` are thin aliases over
 `claim_required`.
 
+An app with its own error shape passes a factory `(req, reason) -> HTTP.Response`:
+`BearerAuth(v; unauthorized = f)` / `CookieAuthMiddleware(v; unauthorized = f)` and
+`denied = f` on every guard above. Reasons are `:missing_credentials`, `:invalid_credentials`,
+`:forbidden`, `:login_required` — never finer. The factory must return a response (anything else
+is a `500`, never an admission). Do not write an outer middleware that rewrites Nitro's `401`/`403`.
+
 The authenticated principal is a `Principal` — an immutable, dict-like wrapper over *verified* claims
-with typed `id` and `kid` fields. Read it with `getuser(req)`.
+with typed `id` and `kid` fields. Read it with `getprincipal(req)` (`nothing` when no token
+authenticated the request); `getuser(req)` is whatever the validator returned, which with a
+`user_validator` is your own user object.
 
 > **Authentication is not authorization.** A route that loads a record by a client-supplied id must
 > verify the caller *owns* it. `login_required()` alone is an IDOR waiting to happen.

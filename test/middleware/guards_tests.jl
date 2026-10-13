@@ -463,3 +463,118 @@ using Nitro: GuardMiddleware, login_required, role_required, permission_required
 end
 
 end
+
+# ── #515 ────────────────────────────────────────────────────────────────────────────────────
+# Every shipped guard takes `denied = (req, reason) -> HTTP.Response`. The factory shapes the
+# refusal; it cannot turn one into an admission, which matters MORE here than in the auth
+# middleware: `GuardMiddleware` admits any guard result that is not a response.
+@testitem "Guards — configurable denial responses (#515)" tags=[:middleware, :auth, :security] setup=[NitroCommon] begin
+using HTTP
+using Nitro
+
+function recorder()
+    seen = Symbol[]
+    f = (req, reason) -> (push!(seen, reason); Res.json(Dict("error" => "Unauthorized"); status = 401))
+    return f, seen
+end
+with_user(user) = (req = HTTP.Request("GET", "/"); req.context[:user] = user; req)
+reader = Dict{String,Any}("role" => "reader", "permissions" => ["read"])
+signer(kid) = Principal(Dict{String,Any}(); id = kid, kid = kid, source = :kid)
+
+@testset "the claim and kid guards report :forbidden, and only on a denial" begin
+    for (label, make, denied_req, admitted_req) in (
+            ("claim :equals",   d -> claim_required("role", "admin"; denied = d),              with_user(reader), with_user(Dict{String,Any}("role" => "admin"))),
+            ("claim :contains", d -> claim_required("permissions", "write"; kind = :contains, denied = d), with_user(reader), with_user(Dict{String,Any}("permissions" => ["write"]))),
+            ("role_required",   d -> role_required("admin"; denied = d),                       with_user(reader), with_user(Dict{String,Any}("role" => "admin"))),
+            ("permission_required", d -> permission_required("write"; denied = d),             with_user(reader), with_user(Dict{String,Any}("permissions" => ["write"]))),
+            ("kid_required",    d -> kid_required(["importer"]; denied = d),                    with_user(signer("other")), with_user(signer("importer"))))
+        f, seen = recorder()
+        guard = make(f)
+        res = guard(denied_req)
+        @test (label, res.status, text(res), seen) == (label, 401, "{\"error\":\"Unauthorized\"}", [:forbidden])
+        @test (label, guard(admitted_req)) == (label, nothing)
+        @test (label, length(seen)) == (label, 1)
+    end
+end
+
+@testset "login_required: `denied` replaces the redirect" begin
+    f, seen = recorder()
+    guard = login_required(denied = f)
+    res = guard(HTTP.Request("GET", "/"))
+    @test res.status == 401
+    @test seen == [:login_required]
+    @test guard(with_user("alice")) === nothing
+    # Both at once is a contradiction, not a precedence rule to remember.
+    @test_throws ArgumentError login_required(redirect_url = "/signin", denied = f)
+    # The redirect keeps working, with its default and with an explicit URL.
+    @test HTTP.header(login_required()(HTTP.Request("GET", "/")), "Location") == "/login"
+    @test HTTP.header(login_required(redirect_url = "/signin")(HTTP.Request("GET", "/")), "Location") == "/signin"
+end
+
+@testset "without `denied`, the defaults are unchanged" begin
+    FORBIDDEN = Nitro.Core.Middleware.GuardsMiddleware.FORBIDDEN
+    @test role_required("admin")(with_user(reader)) === FORBIDDEN
+    @test kid_required("importer")(with_user(signer("other"))) === FORBIDDEN
+    @test login_required()(HTTP.Request("GET", "/")).status == 302
+end
+
+# The bypass this rule exists for: a factory that "returns the error" as data, or nothing.
+@testset "a factory that returns no response fails closed -- the handler never runs" begin
+    for bad in ((r, _) -> nothing, (r, _) -> Dict("error" => "Unauthorized"), (r, _) -> 403)
+        for guard in (kid_required(["importer"]; denied = bad), role_required("admin"; denied = bad),
+                      permission_required("write"; denied = bad), login_required(denied = bad))
+            ran = Ref(false)
+            handler = GuardMiddleware(guard)(_ -> (ran[] = true; HTTP.Response(200)))
+            # Anonymous: every one of these guards denies it.
+            @test_throws ArgumentError handler(HTTP.Request("GET", "/"))
+            @test !ran[]
+        end
+    end
+end
+
+@testset "the factory must take (req, reason) -- checked when the guard is built" begin
+    one_arg = req -> HTTP.Response(401)
+    @test_throws ArgumentError kid_required(["k"]; denied = one_arg)
+    @test_throws ArgumentError claim_required("role", "admin"; denied = one_arg)
+    @test_throws ArgumentError role_required("admin"; denied = one_arg)
+    @test_throws ArgumentError permission_required("write"; denied = one_arg)
+    @test_throws ArgumentError login_required(denied = one_arg)
+end
+
+end
+
+@testitem "getprincipal (#515)" tags=[:middleware, :auth] setup=[NitroCommon] begin
+using HTTP
+using Nitro
+
+req(; user = nothing, claims = nothing, session = nothing) = begin
+    r = HTTP.Request("GET", "/")
+    user === nothing || (r.context[:user] = user)
+    claims === nothing || (r.context[:auth_claims] = claims)
+    session === nothing || (r.context[:session] = session)
+    r
+end
+token = Principal(Dict{String,Any}("sub" => "u1"); id = "u1", kid = "importer", source = :claim)
+
+# `jwt_validator` without a user_validator: the Principal is the user.
+@test getprincipal(req(user = token)) === token
+# With one: the app's object is the user, the token's Principal rides at :auth_claims.
+@test getprincipal(req(user = Dict{String,Any}("uid" => 7), claims = token)) === token
+# An app user_validator that returns its OWN Principal (never verified) does not shadow the
+# token's -- the verified kid is what a handler behind `kid_required` must read.
+enriched = Principal(Dict{String,Any}("sub" => "u1", "plan" => "pro"); id = "u1")
+@test getprincipal(req(user = enriched, claims = token)).kid == "importer"
+# ...not even one that writes a kid of its own: an app-built kid is a label, not a verification.
+relabelled = Principal(Dict{String,Any}("sub" => "u1"); id = "u1", kid = "admin-key")
+@test getprincipal(req(user = relabelled, claims = token)).kid == "importer"
+single_secret = Principal(Dict{String,Any}("sub" => "u1"); id = "u1")   # no verified kid
+@test getprincipal(req(user = relabelled, claims = single_secret)).kid === nothing
+# No token principal: nothing.
+@test getprincipal(req()) === nothing
+@test getprincipal(req(user = "alice")) === nothing
+@test getprincipal(req(user = Dict{String,Any}("kid" => "importer"))) === nothing
+@test getprincipal(req(session = Dict{String,Any}("user_id" => 1))) === nothing
+@test getprincipal(req(user = "alice", claims = Dict{String,Any}("sub" => "x"))) === nothing
+# Exported from both places a handler looks.
+@test Nitro.Auth.getprincipal === getprincipal
+end

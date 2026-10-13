@@ -580,7 +580,7 @@ keys = JWTKeyset("current" => current_secret; verify = ["previous" => previous_s
 validator = jwt_validator(keys)
 ```
 
-With a keyset, the *verified* key id is exposed as `getuser(req).kid`, which unlocks two more
+With a keyset, the *verified* key id is exposed as `getprincipal(req).kid`, which unlocks two more
 patterns (both covered in depth in [Authentication](authentication.md)):
 
 ```julia
@@ -589,11 +589,19 @@ GuardMiddleware(kid_required(["service-a", "service-b"]))
 
 # One key per caller? Make the signer the principal: getuser(req).id == verified kid.
 validator = jwt_validator(keys; identity_from=:kid)
+
+# In the handler, the token's verified key id -- with or without a user_validator:
+kid = getprincipal(req).kid
 ```
+
+A wrong-key token gets the guard's `403` by default; `kid_required(allowed; denied = f)` answers
+with whatever `f(req, reason)` builds instead — see
+[your own error contract](authentication.md#Your-own-error-contract).
 
 Note the trust boundary: a `kid` is only *verified* when resolved against a keyset. With a
 single string secret the header `kid` is an unchecked label, so `kid_required` denies and
-`identity_from=:kid` is a construction-time error.
+`identity_from=:kid` is a construction-time error — unless a `user_validator` returns a
+`Principal` it built with a `kid` of its own, which `kid_required` currently reads first (#517).
 
 ## Auth Cookies and CSRF
 

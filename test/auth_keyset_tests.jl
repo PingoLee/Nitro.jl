@@ -462,4 +462,35 @@ end
     @test sprint(show, ks.keys[2]) == "JWTKey(\"partner\", :verify, scoped)"
 end
 
+# A kid-authorized JSON API end to end (#515): one error contract for every auth failure --
+# no credentials, a forged token, a VALID token signed by the wrong key -- and the handler
+# reads the verified kid with `getprincipal`, in both validator flows.
+@testset "kid-authorized API: one JSON 401 contract, and getprincipal in the handler (#515)" begin
+    registry = JWTKeyset("self" => jwtkey("s-self"); verify = ["importer" => jwtkey("s-imp")])
+    as_importer = encode_jwt(Dict("sub" => "svc"), JWTKeyset("importer" => jwtkey("s-imp")); expires_in = 60)
+    as_self = encode_jwt(Dict("sub" => "svc"), registry; expires_in = 60)
+    forged = encode_jwt(Dict("sub" => "svc"), JWTKeyset("importer" => jwtkey("s-forger")); expires_in = 60)
+
+    unauthorized = (req, _) -> Res.json(Dict("error" => "Unauthorized"); status = 401)
+    handler(req) = "kid=$(getprincipal(req).kid) user=$(getuser(req) isa Nitro.Principal ? "principal" : getuser(req)["uid"])"
+    app = App(mod = @__MODULE__)
+    guarded(route, validator) = path(route, handler; middleware = [
+        BearerAuth(validator; unauthorized),
+        GuardMiddleware(kid_required("importer"; denied = unauthorized))])
+    urlpatterns(app, "",
+        guarded("/plain/import", jwt_validator(registry)),
+        guarded("/app-user/import", jwt_validator(registry; user_validator = p -> Dict("uid" => p.id))))
+    call(prefix, token) = internalrequest(app, HTTP.Request("GET", "$prefix/import",
+        token === nothing ? Pair{String,String}[] : ["Authorization" => "Bearer $token"]))
+
+    for prefix in ("/plain", "/app-user")
+        for (label, token) in (("no token", nothing), ("forged", forged), ("wrong kid", as_self))
+            res = call(prefix, token)
+            @test (prefix, label, res.status, text(res)) == (prefix, label, 401, "{\"error\":\"Unauthorized\"}")
+        end
+    end
+    @test text(call("/plain", as_importer)) == "kid=importer user=principal"
+    @test text(call("/app-user", as_importer)) == "kid=importer user=svc"
+end
+
 end
