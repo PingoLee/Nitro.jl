@@ -1167,13 +1167,25 @@ end
 # The structural claim, measured: the body is no longer copied into a second representation. The
 # two-pass bind allocated a `JSONText` copy of every field's text, about the size of the body;
 # the walk allocates what the plain struct's parse does.
+#
+# The probe's sensitivity is checked against copies measured directly, not inferred from
+# `two_pass`'s total (#505). That total also counts the reference's own parse of the rows, which
+# compiles into one of two states depending on what the process ran first: one boxed intermediate
+# per row (48 bytes) comes and goes, so `old - plain` read +12,752 in one run and -6,448 in another
+# for the same code. Neither number says anything about a copy.
 @testset "a @kwdef body allocates what the plain struct's parse does" begin
     body = Vector{UInt8}(JSON.json(Dict("rows" => [Dict("id" => i, "label" => "row-$i")
                                                    for i in 1:400])))   # 801 keys: under the field cap
     kw    = bytes(b -> E.json_bind(Rows, b), body)
     plain = bytes(b -> E.json_bind(PlainRows, b), body)
-    old   = bytes(b -> two_pass(Rows, b), body)
-    @test old - plain > length(body) ÷ 2      # the copy the old bind made, so the probe can see it
+    # What the old bind paid on top of the parse: its first pass, a `JSONText` map whose value is a
+    # copy of the body's text.
+    textmap = bytes(b -> BP._parse_json_bounded(b, Dict{String, JSON.JSONText};
+                                                style = BP.NITRO_READ_STYLE), body)
+    @test textmap > length(body) ÷ 2
+    # A bind that copies the body once must fail the bound below, or the bound cannot see a copy.
+    copying = bytes(b -> E.json_bind(Rows, copy(b)), body)
+    @test copying - plain >= length(body) ÷ 8
     @test kw - plain < length(body) ÷ 8
 end
 
