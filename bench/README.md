@@ -20,9 +20,9 @@ bench/
 │   ├── session.jl      # MemoryStore read/write (payload-size scaling)
 │   ├── ratelimiter.jl  # limiter hot path: keying, lock contention, exempt-path scan
 │   └── taskpattern.jl  # SYNTHETIC replica of parallel_stream_handler's task overhead
-├── socket/             # real-socket throughput: server.jl (Nitro vs bare HTTP.jl) + run.sh (oha)
+├── socket/             # real-socket load: server.jl (Nitro vs bare HTTP.jl), run.sh, contention.sh (oha)
 ├── results/            # JSON run outputs — gitignored (machine-specific)
-└── .gitignore          # ignores results/ and Manifest.toml
+└── .gitignore          # ignores results/, Manifest.toml and per-version Manifest-v*.toml
 ```
 
 ## Setup (once)
@@ -89,12 +89,18 @@ bench/socket/run.sh "nitro bare_spawn" 3 5s          # modes, runs, duration
 ACCESS_LOG=1 bench/socket/run.sh nitro               # the serve() default access log on
 PROFILE=10 bench/socket/run.sh nitro 1 20s           # sample every thread for 10 s under load
 bench/socket/run.sh "nitro@8,1 nitro@8,2 nitro@8,4"  # one mode per --threads, interleaved (#462)
+RATE=20000 bench/socket/run.sh "nitro@8,1 nitro@8,0" # fixed rate: latency without saturation (#491)
+JULIA="julia +1.12" bench/socket/run.sh              # another Julia, by juliaup channel
+bench/socket/contention.sh "8,1 6,2 8,0" 5 8s       # /health while the default pool is busy (#491)
 ```
 
-- `server.jl` serves `/plaintext`, `/json` and `/health` in one of three `MODE`s: `nitro`
-  (`serve()` with no middleware), `bare_spawn` (HTTP.jl `listen!` + `streamhandler` with a
-  `Threads.@spawn` per request, the shape Nitro takes and the ceiling to compare it with), and
-  `bare_nospawn` (the handler on HTTP.jl's connection task).
+- `server.jl` serves `/plaintext`, `/json`, `/health`, `/cpu` and `/lag` in one of these `MODE`s:
+  `nitro` (`serve()` with no middleware), `nitro_serial` (the same with `parallel = false`, #492),
+  `bare_spawn` (HTTP.jl `listen!` + `streamhandler` with a `Threads.@spawn` per request, the shape
+  Nitro takes and the ceiling to compare it with), and `bare_nospawn` (the handler on HTTP.jl's
+  connection task). `/cpu` burns `CPU_MS` (default 50) without yielding; `/lag` is live only with
+  `LAG=1`. `WORKERS=1` adds `/burst?n=K` to the Nitro modes, which submits K Workers jobs that each
+  burn `JOB_MS` (default 500).
 - `run.sh` pins the server (`-t 8`) and the load generator to disjoint physical cores, warms each
   route, and reports the median, min and max of N runs plus the median p99. The default CPU sets
   assume a 6-core part whose SMT siblings are `n` and `n+6`; set `SERVER_CPUS`/`CLIENT_CPUS` for
@@ -119,5 +125,19 @@ bench/socket/run.sh "nitro@8,1 nitro@8,2 nitro@8,4"  # one mode per --threads, i
   what the first request compiled, which is the list of what the precompile workload missed.
 - `MODE=nitro_log` is `nitro` with the default console access log on (#443), for a one-run A/B
   of what that line costs.
+- `RATE=<n>` makes `run.sh` send a fixed `n` requests per second (`oha -q`, with
+  `--latency-correction`) instead of as fast as the server answers, and the TSV gains the rate and
+  a p50 column. Compare latency at a rate every layout sustains: at saturation, the layout with
+  the higher throughput also has the longer queue, and its p99 says so.
+- `contention.sh [layouts] [rounds] [duration]` starts one server per `--threads` layout with
+  `WORKERS=1 LAG=1` and probes `/health` at `PROBE_RATE` (default 200/s) while `SCENARIOS` keep
+  the default pool busy: `idle`, `cpu` (`CPU_CONNS` connections on `/cpu`) and `burst<K>` (K
+  Workers jobs). Each row is `/health` p50/p99/max, its success rate, and `/lag`: how late a
+  10 ms `sleep` on the default pool woke, which is the delay a `Timer`-driven deadline (a Workers
+  timeout) sees. It answers whether the interactive thread protects a cheap request while
+  handlers or jobs hold the CPU (#491).
+- `JULIA="julia +1.12"` runs the servers on another juliaup channel. Each Julia minor wants its
+  own resolved manifest; `bench/Manifest-v1.12.toml` (gitignored) is the one 1.12 reads first, so
+  copy `Manifest.toml` to it and `Pkg.resolve()` under 1.12 once.
 - Compare modes **within one run**, not across days: the CPU governor and anything else on the box
   move absolute numbers by tens of percent. Requires `oha`, `jq`, `curl` and `taskset`.

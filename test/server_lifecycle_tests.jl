@@ -1366,12 +1366,14 @@ end
 #
 #   | how the server runs                              | result                                   |
 #   |--------------------------------------------------|------------------------------------------|
-#   | REPL, `--threads=1,1` or `1,0`                   | `serve` returns, shutdown hooks ran      |
+#   | REPL, `--threads=1,1`, `1,0` or `2,0`            | `serve` returns, shutdown hooks ran      |
 #   | `julia app.jl`                                   | ended at once; `atexit` runs, no hooks   |
 #   | `julia -e`                                       | the press reaches nobody, `serve` stays  |
 #   | `-e` + `exit_on_sigint(false)` + a live `Timer`  | `fatal: error thrown ...`, no hooks      |
 #
-# Only the first row is Nitro's to keep: Julia decides the others. Each layout runs twice:
+# Only the first row is Nitro's to keep: Julia decides the others. `2,0` is the layout "Running in
+# Production" suggests for throughput (#491): no interactive thread, so thread 1 is a default
+# thread that has run handlers, unlike `1,0` where it is the only one. Each layout runs twice:
 #
 # - `Connection: close`: the connection task FINISHES before the press, so the press is thrown
 #   into its `task_done_hook` and has to be handed on. That is the #426 path.
@@ -1480,7 +1482,7 @@ if Sys.islinux()
     # Fail, do not skip, when `script` is missing: a Linux runner without util-linux is a broken
     # environment, and a silent pass here would say nothing about #426.
     Sys.which("script") === nothing && error("util-linux `script` is required for the #426 Ctrl-C item")
-    for threads in ("1,1", "1,0"), keepalive in (false, true)
+    for threads in ("1,1", "1,0", "2,0"), keepalive in (false, true)
         @testset "REPL at --threads=$threads, keepalive=$keepalive" begin
             r = ctrl_c_in_repl(threads; keepalive)
             @test !r.timed_out
