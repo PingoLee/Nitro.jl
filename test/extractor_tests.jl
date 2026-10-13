@@ -1240,6 +1240,86 @@ end
 end
 
 
+# -- #508 -----------------------------------------------------------------------------------
+#
+# Whether a type binds by keyword is a run-time answer, so `json_bind` used to have the compiler
+# build BOTH parses for every `T`: a `@kwdef` type's first request also compiled JSON.jl's whole
+# plain-struct parse for it, which it never runs, and compiled each parse twice -- once for the
+# abstract text a `LazyRequest` yields, once for the body's concrete type. It made that request
+# ~37% slower (`test/precompile_warmth_tests.jl`'s `json_ext` ratio 5.0 -> 6.8), red on slow CI.
+#
+# That warmth test is a timing ratio, and only crossed its line now and then. This pins the cause
+# instead: which `StructUtils.make` specializations a first request leaves behind. `make` is the
+# public entry of JSON.jl's typed parse and the hook `KwdefBind` overloads, so it names both parses.
+@testitem "a @kwdef Json{T} request compiles only the parse it takes (#508)" tags=[:core] setup=[NitroCommon] begin
+
+using Test
+using HTTP
+using JSON
+using Nitro
+using Nitro: path
+
+const E = Nitro.Core.Extractors
+
+# Fresh types nothing else in the process binds, so every specialization found is this item's own.
+# `Kw508`'s last two fields are the field-level case: a field's type takes one of the same two
+# parses, and is just as unknown to the compiler.
+struct Inner508; x::Int; end
+Base.@kwdef struct Kw508
+    id::Int = 0
+    name::String = ""
+    inner::Inner508 = Inner508(0)
+    tags::Vector{String} = String[]
+end
+struct Plain508; id::Int; name::String; end
+
+ctx = Nitro.Core.App()
+Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+    path("/kw", (req, k::Json{Kw508}) -> Res.json(k.payload); method = "POST"),
+    path("/plain", (req, p::Json{Plain508}) -> Res.json(p.payload); method = "POST"),
+])
+post(t) = Nitro.Core.internalrequest(ctx, HTTP.Request("POST", t, ["Content-Type" => "application/json"],
+    """{"id":1,"name":"a","inner":{"x":2},"tags":["t"]}"""))
+@test post("/kw").status == 200
+@test post("/plain").status == 200
+
+# The `make(style, T, source)` specializations whose target is exactly `target`.
+function makes(target)
+    found = Any[]
+    for m in methods(JSON.StructUtils.make), mi in Base.specializations(m)
+        mi === nothing && continue
+        sig = Base.unwrap_unionall(mi.specTypes)
+        length(sig.parameters) == 4 && sig.parameters[3] === Type{target} &&
+            push!(found, sig.parameters[4])
+    end
+    return found
+end
+
+@testset "a @kwdef type compiles the keyword walk and not the plain-struct parse" begin
+    @test !isempty(makes(E.KwdefBind{Kw508}))
+    @test isempty(makes(Kw508))
+end
+
+@testset "a plain field type compiles its own parse and not the keyword walk" begin
+    @test !isempty(makes(Inner508))
+    @test isempty(makes(E.KwdefBind{Inner508}))
+    @test isempty(makes(E.KwdefBind{Vector{String}}))
+end
+
+@testset "each parse is compiled for the body's concrete text only" begin
+    @test all(isconcretetype, makes(E.KwdefBind{Kw508}))
+    @test all(isconcretetype, makes(Plain508))
+end
+
+# The control: the scan does see a plain-struct parse when one is compiled. Without it the
+# `isempty` above would pass just as well if `makes` could never find anything.
+@testset "a plain struct compiles the plain-struct parse" begin
+    @test !isempty(makes(Plain508))
+end
+
+end
+
+
 # -- #254 -----------------------------------------------------------------------------------
 #
 # The `Session` extractor looks a session id up in an application-supplied store through a

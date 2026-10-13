@@ -381,8 +381,10 @@ function extract(param::Param{Json{T}}, request::LazyRequest) :: Json{T} where {
     require_json_media_type(param, request)
     instance = safe_extract(param) do
         # Straight from the body's bytes: `textbody` would copy the whole body into a `String`
-        # first, only for JSON.jl to read it back as bytes (#327).
-        json_bind(T, _body_view(request.request.body))
+        # first, only for JSON.jl to read it back as bytes (#327). The body's type is abstract
+        # here, so this is a dynamic call whatever it calls; calling the binder directly keeps
+        # it the only one (see `json_binder`).
+        Base.inferencebarrier(json_binder(T))(_body_view(request.request.body)) :: T
     end
     valid_instance = try_validate(param, instance)
     return Json{T}(valid_instance, nothing)
@@ -416,9 +418,23 @@ it uses Nitro's read style, which never interns a client string as a `Symbol` (#
 default style did so for every enum field, valid name or not.
 """
 function json_bind(::Type{T}, text::Union{AbstractString, AbstractVector{UInt8}}) :: T where {T}
-    binds_by_keyword(T) || return _parse_json_bounded(text, T; style = NITRO_READ_STYLE)
-    return _parse_json_bounded(text, KwdefBind{T}; style = NITRO_READ_STYLE)
+    return Base.inferencebarrier(json_binder(T))(text) :: T
 end
+
+# `json_bind` reaches its parse through `inferencebarrier`, and that is what keeps a type's first
+# request cheap (#508). Which parse a type takes is answered at run time, so the compiler, unable
+# to know it, used to compile BOTH for every `T`: for a `@kwdef` type the branch it never takes is
+# JSON.jl's whole plain-struct parse specialized on `T`, which cost more to compile than the
+# branch it does take. And it compiled them twice: `Json{T}` hands over the body through a
+# `LazyRequest`, whose abstractly typed request makes the text abstract, so each branch was
+# inferred once for `AbstractVector{UInt8}` and again for the body's concrete type. Behind the
+# barrier only the parse a request takes is compiled, for the text it has. The price is one
+# dynamic call per bind, about 25 ns, plus a box for the result when `T` is isbits. The call is
+# on an instance rather than on the `Type`, which dispatches about four times faster.
+struct JsonBinder{P} end
+(::JsonBinder{P})(text) where {P} = _parse_json_bounded(text, P; style = NITRO_READ_STYLE)
+
+json_binder(::Type{T}) where {T} = binds_by_keyword(T) ? JsonBinder{KwdefBind{T}}() : JsonBinder{T}()
 
 # Asked once per `Json{T}` request and once per field of a keyword-bound struct, so the answer is
 # memoized per type (#493): uncached, the `hasmethod` behind `kw_constructible` cost ~1 µs, three
@@ -445,6 +461,7 @@ would, and returns the position after it, so the body is walked once. No JSON.jl
 named.
 """
 struct KwdefBind{T} end
+(::KwdefBind{T})(style, source) where {T} = _SU.make(style, KwdefBind{T}, source)
 
 # The fields a `KwdefBind{T}` walk has seen, as keyword arguments for `kw_construct`.
 struct KwdefFields{T, S}
@@ -484,9 +501,15 @@ end
     return body
 end
 
+# A field's type takes one of the same two parses as `json_bind`'s `T`, with the same problem. Both
+# were compiled for every field type: an `Int` field compiled a keyword walk it never takes, and a
+# `Vector` field's recursed into `Vector`'s own fields (#508). Only that branch is behind a
+# barrier. It is the one a field rarely takes -- a `@kwdef` struct nested directly as a field --
+# so a plain field keeps its static call and only a nested `@kwdef` field pays the dynamic one.
 function bind_field!(fields::KwdefFields, name::Symbol, ::Type{FT}, value) where {FT}
-    bound, pos = binds_by_keyword(FT) ? _SU.make(fields.style, KwdefBind{FT}, value) :
-                                        _SU.make(fields.style, FT, value)
+    bound, pos = binds_by_keyword(FT) ?
+        Base.inferencebarrier(KwdefBind{FT}())(fields.style, value) :: Tuple{FT, Int} :
+        _SU.make(fields.style, FT, value)
     # A repeated key replaces the earlier value, so the last one binds. Every occurrence is parsed,
     # though, so an invalid one refuses the body even when a later one is valid -- as JSON.jl's
     # plain-struct path does. The `Dict` this walk replaced kept only the last text and parsed that.
