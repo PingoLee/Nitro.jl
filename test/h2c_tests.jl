@@ -2,7 +2,6 @@
 
 using Test
 using HTTP
-using Sockets
 using Nitro
 using Nitro: path
 
@@ -25,25 +24,10 @@ _serve(ctx, port; kw...) = Nitro.Core.serve(ctx; port, host = HOST, async = true
                                             show_banner = false, show_errors = false,
                                             access_log = nothing, kw...)
 
-# Everything the server sends until it closes the connection, or a marker after `limit` seconds.
-# An unpatched server answers the preface with nothing at all: it waits for the client's SETTINGS
-# frame, so the marker — not a hang — is what the refusal assertions fail on.
-function _raw_exchange(port, payload; limit = 10.0)
-    sock = Sockets.connect(Sockets.localhost, port)
-    try
-        write(sock, payload)
-        flush(sock)
-        reader = @async try
-            String(read(sock))
-        catch
-            ""
-        end
-        timedwait(() -> istaskdone(reader), limit; pollint = 0.05)
-        return istaskdone(reader) ? fetch(reader) : "(no close within $(limit)s)"
-    finally
-        close(sock)
-    end
-end
+# The exchanges below go through `raw_exchange` (NitroCommon): everything the server sends until
+# it closes the connection, or a bare marker after `limit` seconds. An unpatched server answers
+# the preface with nothing at all: it waits for the client's SETTINGS frame, so the marker — not
+# a hang — is what the refusal assertions fail on.
 
 @testset "the prior-knowledge preface gets an HTTP/1.1 400 and a closed connection" begin
     ctx = _h2c_context()
@@ -51,12 +35,12 @@ end
     _serve(ctx, port)
     try
         # A server speaking h2 would answer with a binary SETTINGS frame, never an HTTP/1.1
-        # status line; `_raw_exchange` returning at all means the server closed the connection.
-        reply = _raw_exchange(port, H2_PREFACE)
+        # status line; `raw_exchange` returning at all means the server closed the connection.
+        reply = raw_exchange(port, [H2_PREFACE]; limit = 10.0)
         @test startswith(reply, "HTTP/1.1 400")
         # The same preface followed by the client's SETTINGS frame, as a real h2c client sends it.
         settings = UInt8[0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00]
-        reply = _raw_exchange(port, vcat(Vector{UInt8}(codeunits(H2_PREFACE)), settings))
+        reply = raw_exchange(port, [vcat(Vector{UInt8}(codeunits(H2_PREFACE)), settings)]; limit = 10.0)
         @test startswith(reply, "HTTP/1.1 400")
     finally
         Nitro.Core.terminate(ctx)
@@ -95,8 +79,8 @@ end
         @test HTTP.get("http://$HOST:$port/ok"; retry = false).status == 200
         # `POST` shares its first byte with `PRI`: HTTP.jl's probe used to read it and the next
         # byte before handing the connection to HTTP/1.1.
-        reply = _raw_exchange(port, "POST /echo HTTP/1.1\r\nHost: $HOST\r\n" *
-                                    "Content-Length: 5\r\nConnection: close\r\n\r\nhello")
+        reply = raw_exchange(port, ["POST /echo HTTP/1.1\r\nHost: $HOST\r\n" *
+                                    "Content-Length: 5\r\nConnection: close\r\n\r\nhello"]; limit = 10.0)
         @test startswith(reply, "HTTP/1.1 200")
         @test endswith(reply, "hello")
     finally
@@ -110,7 +94,7 @@ end
     # `serve` wraps every handler in `NitroStreamHandler`, which is what the override keys on.
     _serve(ctx, port; handler = mw -> Nitro.Core.stream_handler(mw), max_body_bytes = nothing)
     try
-        @test startswith(_raw_exchange(port, H2_PREFACE), "HTTP/1.1 400")
+        @test startswith(raw_exchange(port, [H2_PREFACE]; limit = 10.0), "HTTP/1.1 400")
         @test HTTP.get("http://$HOST:$port/ok"; retry = false).status == 200
     finally
         Nitro.Core.terminate(ctx)

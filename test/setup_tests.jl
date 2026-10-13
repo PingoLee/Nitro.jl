@@ -17,6 +17,7 @@ export HOST
 export values_present, value_absent, value_count, has_property
 export get_free_port
 export jwtkey
+export raw_exchange, read_failed
 
 # ── Constants ────────────────────────────────────────────────────────
 
@@ -111,6 +112,72 @@ function get_free_port()
             end
         end
         error("get_free_port: no unclaimed ephemeral port after 50 attempts")
+    end
+end
+
+# ── Raw-socket exchanges (#490) ──────────────────────────────────────
+
+"""
+    read_failed(e) -> String
+
+The marker a raw-socket reader returns for a failed read, in place of a bare `""`. A reset is
+the usual cause: a client that writes into a connection the server has already closed draws an
+RST, and the RST makes `read` throw. `""` could not tell that apart from a server that closed
+without a word, which is how #483 had to be reasoned out rather than read off the failure.
+"""
+read_failed(e) = "(read failed: $(sprint(showerror, e)))"
+
+"""
+    raw_exchange(port, parts; gap = 0.0, limit = 15.0) -> String
+
+Write `parts` (strings or byte vectors) to a fresh raw connection, `gap` seconds apart, and
+return everything the server sends back until it closes the connection. A raw socket rather
+than HTTP.jl's client: no pool, no retry, and no way for the client to paper over a slow send.
+
+The result is one of three things:
+
+- the server closed the connection: every byte it sent;
+- the read failed (typically a reset): every byte that arrived first, then `read_failed`'s
+  marker. A status line followed by a reset therefore still starts with that status. These
+  tests claim the server answered with a status, and a reset in that window is the client's own
+  late write, not the server's doing (the decision on #490);
+- no close within `limit` seconds: the bare marker `"(no close within …)"`, with no bytes in
+  front, so a server that answered but never closed cannot pass a `startswith` on its status.
+
+Reading starts before the first write, so the server's bytes are in this process as soon as
+they arrive. Left in the kernel, a later reset can discard them (Windows drops unread receive
+data when an RST arrives).
+"""
+function raw_exchange(port, parts; gap = 0.0, limit = 15.0)
+    sock = Sockets.connect(Sockets.localhost, port)
+    try
+        seen = IOBuffer()
+        reader = @async try
+            while true
+                chunk = readavailable(sock)
+                isempty(chunk) && break        # EOF: the server closed the connection
+                write(seen, chunk)
+            end
+            String(take!(seen))
+        catch e
+            String(take!(seen)) * read_failed(e)
+        end
+        yield()                                # let the reader park on the socket first
+        for (i, part) in enumerate(parts)
+            i > 1 && sleep(gap)
+            try
+                write(sock, part)
+                flush(sock)
+            catch
+                break          # the server already hung up; read whatever it said first
+            end
+        end
+        timedwait(() -> istaskdone(reader), limit; pollint = 0.05) === :ok && return fetch(reader)
+        close(sock)
+        timedwait(() -> istaskdone(reader), 5.0; pollint = 0.05)
+        return "(no close within $(limit)s)"
+    finally
+        close(sock)
     end
 end
 

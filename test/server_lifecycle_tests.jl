@@ -470,35 +470,6 @@ end
     end
 end
 
-"""
-Write `parts` to a fresh raw connection, `gap` seconds apart, and return everything the server
-sends back until it closes the connection (or `limit` seconds pass). A raw socket rather than
-HTTP.jl's client: no pool, no retry, and no way for the client to paper over a slow send.
-"""
-function _raw_exchange(port, parts; gap = 0.0, limit = 15.0)
-    sock = Sockets.connect(Sockets.localhost, port)
-    try
-        for (i, part) in enumerate(parts)
-            i > 1 && sleep(gap)
-            try
-                write(sock, part)
-                flush(sock)
-            catch
-                break          # the server already hung up; read whatever it said first
-            end
-        end
-        reader = @async try
-            String(read(sock))
-        catch
-            ""
-        end
-        timedwait(() -> istaskdone(reader), limit; pollint = 0.05)
-        return istaskdone(reader) ? fetch(reader) : "(no close within $(limit)s)"
-    finally
-        close(sock)
-    end
-end
-
 function _echo_context()
     ctx = Nitro.Core.App()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
@@ -516,7 +487,7 @@ end
     _serve(ctx, port; read_header_timeout = 0.5)
     try
         t0 = time()
-        reply = _raw_exchange(port, ["GET /echo HTTP/1.1\r\nHost: $HOST\r\n"])   # never finished
+        reply = raw_exchange(port, ["GET /echo HTTP/1.1\r\nHost: $HOST\r\n"])   # never finished
         @test startswith(reply, "HTTP/1.1 408")
         @test time() - t0 < 10.0
     finally
@@ -537,7 +508,7 @@ end
     _serve(ctx, port; read_header_timeout = 2)
     try
         head = "POST /echo HTTP/1.1\r\nHost: $HOST\r\nContent-Length: 5\r\nConnection: close\r\n\r\n"
-        reply = _raw_exchange(port, [head, "hello"]; gap = 4)
+        reply = raw_exchange(port, [head, "hello"]; gap = 4)
         @test startswith(reply, "HTTP/1.1 200")
         @test endswith(reply, "hello")
     finally
@@ -556,7 +527,7 @@ end
         # server has already closed, and on Windows the RST that draws discards the unread 408
         # from the client's receive buffer.
         head = "POST /echo HTTP/1.1\r\nHost: $HOST\r\nContent-Length: 5\r\nConnection: close\r\n\r\n"
-        reply = _raw_exchange(port, [head])
+        reply = raw_exchange(port, [head])
         @test startswith(reply, "HTTP/1.1 408")
     finally
         Nitro.Core.terminate(ctx)
@@ -572,7 +543,7 @@ end
     try
         req = "POST /echo HTTP/1.1\r\nHost: $HOST\r\nTransfer-Encoding: chunked\r\n" *
               "Connection: close\r\n\r\nzz\r\nhello\r\n0\r\n\r\n"
-        @test startswith(_raw_exchange(port, [req]), "HTTP/1.1 400")
+        @test startswith(raw_exchange(port, [req]), "HTTP/1.1 400")
     finally
         Nitro.Core.terminate(ctx)
     end
@@ -688,7 +659,7 @@ function _capacity_context(entered::Threads.Atomic{Bool}, release::Base.Event;
     return ctx
 end
 
-_get(port, target) = _raw_exchange(port, ["GET $target HTTP/1.1\r\nHost: $HOST\r\nConnection: close\r\n\r\n"])
+_get(port, target) = raw_exchange(port, ["GET $target HTTP/1.1\r\nHost: $HOST\r\nConnection: close\r\n\r\n"])
 
 @testset "over max_concurrent_requests: 503 + Retry-After, and the slot frees when the request ends" begin
     entered, release = Threads.Atomic{Bool}(false), Base.Event()
@@ -706,7 +677,7 @@ _get(port, target) = _raw_exchange(port, ["GET $target HTTP/1.1\r\nHost: $HOST\r
         @test occursin(r"\r\nConnection: close\r\n"i, refused)
         # A body sent with the refused request is not read into memory, and the refusal still
         # reaches the client rather than an RST (the swallow budget covers this small body).
-        refused_post = _raw_exchange(port, ["POST /echo HTTP/1.1\r\nHost: $HOST\r\n" *
+        refused_post = raw_exchange(port, ["POST /echo HTTP/1.1\r\nHost: $HOST\r\n" *
             "Content-Length: 5\r\nConnection: close\r\n\r\nhello"])
         @test startswith(refused_post, "HTTP/1.1 503")
 
@@ -733,13 +704,13 @@ end
         # outer `finally` can return the slot.
         bad = "POST /echo HTTP/1.1\r\nHost: $HOST\r\nTransfer-Encoding: chunked\r\n" *
               "Connection: close\r\n\r\nzz\r\nhello\r\n0\r\n\r\n"
-        @test startswith(_raw_exchange(port, [bad]), "HTTP/1.1 400")
+        @test startswith(raw_exchange(port, [bad]), "HTTP/1.1 400")
         @test startswith(_get(port, "/ok"), "HTTP/1.1 200")
         # And the 413 path, which returns from inside the permit's `try`. `Expect: 100-continue`
         # so the refusal does not wait to swallow a body this client never sends.
         big = "POST /echo HTTP/1.1\r\nHost: $HOST\r\nContent-Length: 999999999999\r\n" *
               "Expect: 100-continue\r\nConnection: close\r\n\r\n"
-        @test startswith(_raw_exchange(port, [big]), "HTTP/1.1 413")
+        @test startswith(raw_exchange(port, [big]), "HTTP/1.1 413")
         @test startswith(_get(port, "/ok"), "HTTP/1.1 200")
     finally
         notify(release)
@@ -772,7 +743,7 @@ end
 
         big = "POST /echo HTTP/1.1\r\nHost: $HOST\r\nContent-Length: 4096\r\n" *
               "Expect: 100-continue\r\nConnection: close\r\n\r\n"
-        too_big = _raw_exchange(port, [big])
+        too_big = raw_exchange(port, [big])
         @test startswith(too_big, "HTTP/1.1 413")
         @test occursin(r"\r\nX-Frame-Options: DENY\r\n"i, too_big)              # (unpatched: absent)
         @test length(collect(eachmatch(r"\r\nX-Frame-Options:"i, too_big))) == 1
@@ -790,7 +761,7 @@ end
     try
         big = "POST /echo HTTP/1.1\r\nHost: $HOST\r\nContent-Length: 4096\r\n" *
               "Expect: 100-continue\r\nConnection: close\r\n\r\n"
-        too_big = _raw_exchange(port, [big])
+        too_big = raw_exchange(port, [big])
         @test startswith(too_big, "HTTP/1.1 413")
         @test !occursin(r"X-Content-Type-Options"i, too_big)   # still opt-in
     finally
@@ -863,7 +834,7 @@ end
         big = "POST /echo HTTP/1.1\r\nHost: $HOST\r\nContent-Length: 999999999999\r\n" *
               "Connection: close\r\n\r\n"
         t0 = time()
-        @test startswith(_raw_exchange(port, [big]), "HTTP/1.1 413")
+        @test startswith(raw_exchange(port, [big]), "HTTP/1.1 413")
         @test time() - t0 < 12.0
         @test startswith(_get(port, "/ok"), "HTTP/1.1 200")   # and its slot came back
 
@@ -872,7 +843,7 @@ end
         @test timedwait(() -> entered[], 20.0; pollint = 0.02) === :ok
         head = "POST /echo HTTP/1.1\r\nHost: $HOST\r\nContent-Length: 100\r\nConnection: close\r\n\r\n"
         t0 = time()
-        @test startswith(_raw_exchange(port, [head]), "HTTP/1.1 503")
+        @test startswith(raw_exchange(port, [head]), "HTTP/1.1 503")
         @test time() - t0 < 12.0
     finally
         notify(release)
@@ -971,12 +942,12 @@ _ws_head(target; origin = nothing) =
     (origin === nothing ? "" : "Origin: $origin\r\n") * "\r\n"
 
 # A raw handshake whose socket stays open — after a 101 that is a live WebSocket the server holds —
-# returned with the status line. `_raw_exchange` would wait for a close that a 101 never sends.
+# returned with the status line. `raw_exchange` would wait for a close that a 101 never sends.
 function _ws_open(port, target; kw...)
     sock = Sockets.connect(Sockets.localhost, port)
     write(sock, _ws_head(target; kw...))
     flush(sock)
-    reader = @async try readline(sock) catch; "" end
+    reader = @async try readline(sock) catch e; read_failed(e) end
     timedwait(() -> istaskdone(reader), 15.0; pollint = 0.02)
     return sock, (istaskdone(reader) ? fetch(reader) : "(no reply within 15s)")
 end
@@ -1058,7 +1029,7 @@ end
         head = replace(_ws_head("/ws/hold"), r"\r\n\r\n$" => "\r\nContent-Length: 5\r\n\r\n")
         write(sock, head * "hello")
         flush(sock)
-        reader = @async try readline(sock) catch; "" end
+        reader = @async try readline(sock) catch e; read_failed(e) end
         timedwait(() -> istaskdone(reader), 15.0; pollint = 0.02)
         @test istaskdone(reader) && _upgraded(fetch(reader))
         @test _eventually(() -> ws_entered[] >= 1)
@@ -1086,7 +1057,7 @@ end
         head = replace(_ws_head("/ws/hold"), r"\r\n\r\n$" => "\r\nContent-Length: 5\r\n\r\n")
         write(sock, head * "hello")
         flush(sock)
-        reader = @async try readline(sock) catch; "" end
+        reader = @async try readline(sock) catch e; read_failed(e) end
         timedwait(() -> istaskdone(reader), 15.0; pollint = 0.02)
         @test istaskdone(reader) && _upgraded(fetch(reader))
         @test _eventually(() -> ws_entered[] >= 1)
@@ -1107,7 +1078,7 @@ end
     try
         held, line = _ws_open(port, "/ws/hold")
         @test _upgraded(line)
-        refused = _raw_exchange(port, [_ws_head("/ws/hold")]; limit = 5.0)
+        refused = raw_exchange(port, [_ws_head("/ws/hold")]; limit = 5.0)
         @test startswith(refused, "HTTP/1.1 503")
         @test occursin(r"\r\nRetry-After: 1\r\n"i, refused)
         @test occursin(r"\r\nConnection: close\r\n"i, refused)
@@ -1121,7 +1092,7 @@ end
         @test held !== nothing
         # ...exactly once: with one held again, the next is refused. A double release would have
         # pushed the count below zero and admitted it.
-        @test startswith(_raw_exchange(port, [_ws_head("/ws/quick")]; limit = 5.0), "HTTP/1.1 503")
+        @test startswith(raw_exchange(port, [_ws_head("/ws/quick")]; limit = 5.0), "HTTP/1.1 503")
     finally
         isnothing(held) || close(held)
         notify(release)
@@ -1140,7 +1111,7 @@ end
         @test startswith(_ws_status(port, "/ws/quick"; origin = "https://evil.example"), "HTTP/1.1 403")
         held = _hold_ws(port)
         @test held !== nothing
-        @test startswith(_raw_exchange(port, [_ws_head("/ws/quick")]; limit = 5.0), "HTTP/1.1 503")
+        @test startswith(raw_exchange(port, [_ws_head("/ws/quick")]; limit = 5.0), "HTTP/1.1 503")
         close(held)
         held = nothing
 
@@ -1236,7 +1207,7 @@ function _second_request_late_body(port; gap)
         rest = @async try
             String(read(sock))
         catch e
-            "(read failed: $(sprint(showerror, e)))"
+            read_failed(e)
         end
         timedwait(() -> istaskdone(rest), 15.0; pollint = 0.05)
         return istaskdone(rest) ? fetch(rest) : "(no close within 15s)"
@@ -1269,6 +1240,114 @@ end
             Nitro.Core.terminate(ctx)
         end
     end
+end
+
+end
+
+# #490. `raw_exchange` (NitroCommon) used to be `String(read(sock))` with `catch; ""`: a reset
+# after the server's status line threw the status away with the error, so a red said "" and not
+# which of "closed silently" and "answered, then reset" it was. This item forces that reset with
+# a bare listener (no Nitro) and pins what the helper now returns. Against the old shape, the
+# first case below returns "" on Linux.
+@testitem "Server lifecycle: raw_exchange keeps a reply a reset follows (#490)" tags=[:core, :network] setup=[NitroCommon] begin
+
+using Test
+using Sockets
+
+# `SO_LINGER {on, 0}` makes `close` abort the connection with an RST instead of a FIN.
+const SOL_SOCKET = Sys.islinux() ? Cint(1) : Cint(0xffff)
+const SO_LINGER  = Sys.islinux() ? Cint(13) : Cint(0x0080)
+
+function _abort!(conn)
+    fd = Base._fd(conn)
+    @static if Sys.iswindows()
+        # `fd` is a `WindowsRawSocket`, which converts to the `SOCKET` pointer itself.
+        linger = Ref((UInt16(1), UInt16(0)))    # Winsock's `struct linger` is two u_short
+        rc = ccall((:setsockopt, "Ws2_32"), stdcall, Cint,
+                   (Ptr{Cvoid}, Cint, Cint, Ptr{Cvoid}, Cint),
+                   fd, SOL_SOCKET, SO_LINGER, linger, sizeof(linger))
+        rc == 0 || error("setsockopt(SO_LINGER) failed: $(Libc.GetLastError())")
+    else
+        linger = Ref((Cint(1), Cint(0)))
+        rc = ccall(:setsockopt, Cint, (Cint, Cint, Cint, Ptr{Cvoid}, Cuint),
+                   reinterpret(Cint, fd), SOL_SOCKET, SO_LINGER, linger, sizeof(linger))
+        rc == 0 || error("setsockopt(SO_LINGER) failed: $(Libc.errno())")
+    end
+    close(conn)
+end
+
+# A one-connection server: write `reply`, give the client a moment to take it in, then end the
+# connection with an RST (`abort = true`) or an ordinary close. A clean close reads the request
+# first, because closing over unread input is itself a reset on Linux. An abort does not: on
+# Windows, libuv closes a socket with a read pending by sending a FIN first, and the client would
+# then see a clean EOF before the RST.
+function _one_shot(reply; abort)
+    server = Sockets.listen(Sockets.localhost, 0)
+    port = Int(getsockname(server)[2])
+    task = @async try
+        conn = accept(server)
+        abort || _drain_request(conn)
+        isempty(reply) || (write(conn, reply); flush(conn))
+        sleep(0.5)
+        abort ? _abort!(conn) : close(conn)
+    finally
+        close(server)
+    end
+    return port, task
+end
+
+const STATUS = "HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+const REQUEST = ["POST /echo HTTP/1.1\r\nHost: $HOST\r\nContent-Length: 5\r\n\r\nhello"]
+
+function _drain_request(conn)
+    seen = UInt8[]
+    while !endswith(String(copy(seen)), "hello")
+        chunk = readavailable(conn)
+        isempty(chunk) && break
+        append!(seen, chunk)
+    end
+end
+
+@testset "a status, then a reset: the status and the marker" begin
+    port, task = _one_shot(STATUS; abort = true)
+    reply = raw_exchange(port, REQUEST; limit = 10.0)
+    wait(task)
+    @test startswith(reply, "HTTP/1.1 413")
+    @test occursin("(read failed:", reply)
+end
+
+@testset "a reset with nothing before it: the bare marker, no status" begin
+    port, task = _one_shot(""; abort = true)
+    reply = raw_exchange(port, REQUEST; limit = 10.0)
+    wait(task)
+    @test startswith(reply, "(read failed:")
+end
+
+@testset "a status, then a clean close: the status alone" begin
+    port, task = _one_shot(STATUS; abort = false)
+    reply = raw_exchange(port, REQUEST; limit = 10.0)
+    wait(task)
+    @test reply == STATUS
+end
+
+@testset "a status and no close: the bare timeout marker, no status" begin
+    # Deliberate: `startswith(reply, "HTTP/1.1 400")` must not pass for a server that answered
+    # but kept the connection open (test/h2c_tests.jl reads "returned at all" as "closed").
+    server = Sockets.listen(Sockets.localhost, 0)
+    port = Int(getsockname(server)[2])
+    release = Base.Event()
+    task = @async try
+        conn = accept(server)
+        write(conn, STATUS); flush(conn)
+        wait(release)
+        close(conn)
+    finally
+        close(server)
+    end
+    reply = raw_exchange(port, REQUEST; limit = 1.0)
+    notify(release)
+    wait(task)
+    @test reply == "(no close within 1.0s)"
 end
 
 end
