@@ -1,6 +1,6 @@
 # Nitro.jl micro-benchmarks.
 #
-# Setup (once):  julia --project=bench -e 'using Pkg; Pkg.develop(path="."); Pkg.instantiate()'
+# Setup (once):  julia --project=bench -e 'using Pkg; Pkg.instantiate()'
 # Run:           julia --project=bench --threads=4 bench/runbenchmarks.jl
 #
 # Env knobs: NITRO_BENCH_SECONDS (per-benchmark budget, default 1.0),
