@@ -144,7 +144,7 @@ sizing, see
     transaction that writes an audit row, for instance.
 
     A session call inside a transaction opened on a **different** connection raises PormG's
-    `TransactionError`, which names the `run_in_transaction` call you need. Move the session
+    `TransactionError`, which names the connection the call needs a transaction on. Move the session
     operation outside that block, or open the transaction on the store's own connection.
 
 ### Custom Stores
