@@ -19,7 +19,7 @@ this process doing right now?"***.
 - **`AbstractWorkerStore`** (`src/Workers/registry.jl`): data access plus policy hooks, 16 required
   methods. It owns **nothing that runs** — no queue, no scheduler, no `Task` handle — which is what
   makes the #29 leak unrepresentable rather than merely fixed.
-- **`WorkerRuntime`** (`src/Workers/runtime.jl`): the sequential queues and their processor tasks,
+- **`WorkerRuntime`** (`src/Workers/runtime.jl`): the declared queues and their processor tasks,
   the cleanup scheduler, and `active_tasks` / `active_task_infos`. `shutdown!` takes one. It is
   parametric on the store type so `rt.store` stays concrete.
 - **One store may back several runtimes.** Two `App`s over one `PormGWorkerStore` get their own
@@ -32,7 +32,7 @@ this process doing right now?"***.
   **runtime**, in `active_tasks` / `active_task_infos`. Entries are keyed by task id but describe one
   **run** — only the run that registered one may tear it down (see §6).
 - **Queue authorization hooks**: Optional `queue_authorizer(queue_name, user_id)::Bool`, consulted on
-  **both** submit paths — `submit_task` has no sequential queue, so it passes `DEFAULT_QUEUE_NAME`.
+  **both** submit paths — `submit_task` has no declared queue, so it passes `DEFAULT_QUEUE_NAME`.
 - **Watch authorization hooks**: Optional `watch_authorizer(task_key, watchers, user_id)::Bool`,
   consulted only when a caller submits a key that already exists and that they do not already watch.
 - **Watchers**: Task submissions register the submitting `user_id` as a watcher. Read/manage APIs validate watcher access when `user_id` is supplied. Watcher membership is the *only* gate on reading a
@@ -116,11 +116,11 @@ you add anything:
 
 | API | Purpose |
 |-----|---------|
-| `submit_sequential_task` | Ordered, one-at-a-time execution within a queue |
+| `submit_queued_task` | Execution on a declared queue: items start in FIFO order, at most the queue's concurrency `k` at once (`queues = ["email", "compute" => 6]`; a bare name is `k = 1`). Was `submit_sequential_task` until [#513](https://github.com/PingoLee/Nitro.jl/issues/513). A queue's runs count toward `max_runs_per_owner`, never `max_concurrent_runs` |
 | `get_task_status`, `cancel_task` | Read and cancel. A task the authority may not see answers **exactly** like a missing one (`:status => "NOT_FOUND"`), never `AuthorizationError` — that difference was a task-existence oracle ([#323](https://github.com/PingoLee/Nitro.jl/issues/323)). `AuthorizationError` is left to the submit paths, and `handle_error` answers it with a 403 |
 | `release_task!` | **Admin only**, takes `System()`: deletes a *finished* record through the fenced `try_delete_task!`, so a squatted `:global` key can be reused |
-| `WorkerRuntime(store; max_concurrent_runs = 64, max_runs_per_owner = nothing, allow_undeclared_queues = false, queues)`, `WorkerCapacityError` | Limits ([#324](https://github.com/PingoLee/Nitro.jl/issues/324)). A submit past a limit is refused **before anything is written** — `:runtime`/`:queue` a 503, `:owner` a 429 — and a full queue never blocks in `put!`. Only declared queue names get a queue (else `AuthorizationError`). A run holds its reservation until its callback *returns*, a timed-out one included (`_RunHandoff`, one per attempt); a timed-out *sequential* callback then counts against the runtime cap, and queues hold their next item only while such abandoned callbacks *alone* fill it (never on async load: an async run waiting on a queued item would deadlock). Every other exit releases the reservation exactly once, by `run_id`. `reservation_lock` is a leaf, and `queue_lock` is never taken inside `lock_tasks` |
-| *(not exported)* `get_task_info`, `add_watcher!`, `set_task!`, `replace_task!`, `try_transition!`, `try_delete_task!`, `delete_task!`, `cleanup_tasks!`, `clear_records!`, `list_running_task_refs`, `RunningTaskRef`, `lock_tasks`, `get_active_task[_info]`, `register_run!`, `SequentialQueue`, `QueueItem`, `get_sequential_queues`, `get_queue_lock` | The store contract and the run/queue internals. Backends extend them qualified; they perform no authorization, so they must not become application API again (#323) |
+| `WorkerRuntime(store; max_concurrent_runs = 64, max_runs_per_owner = nothing, allow_undeclared_queues = false, queues)`, `WorkerCapacityError` | Limits ([#324](https://github.com/PingoLee/Nitro.jl/issues/324)). A submit past a limit is refused **before anything is written** — `:runtime`/`:queue` a 503, `:owner` a 429 — and a full queue never blocks in `put!`. Only declared queue names get a queue (else `AuthorizationError`). A run holds its reservation until its callback *returns*, a timed-out one included (`_RunHandoff`, one per attempt); a timed-out *queued* callback then counts against the runtime cap, and queues hold their next item only while such abandoned callbacks *alone* fill it (never on async load: an async run waiting on a queued item would deadlock). Every other exit releases the reservation exactly once, by `run_id`. `reservation_lock` is a leaf, and `queue_lock` is never taken inside `lock_tasks` |
+| *(not exported)* `get_task_info`, `add_watcher!`, `set_task!`, `replace_task!`, `try_transition!`, `try_delete_task!`, `delete_task!`, `cleanup_tasks!`, `clear_records!`, `list_running_task_refs`, `RunningTaskRef`, `lock_tasks`, `get_active_task[_info]`, `register_run!`, `WorkerQueue`, `QueueItem`, `get_worker_queues`, `get_queue_lock` | The store contract and the run/queue internals. Backends extend them qualified; they perform no authorization, so they must not become application API again (#323) |
 | `scoped_task_key`, `DEFAULT_QUEUE_NAME` | Resolve a `(task_key, user_id, scope)` to its stored id; the queue name `submit_task` authorizes against |
 | `get_queue_status` | Queue-wide introspection — **admin only**, takes `System()`; an `Owner` is a `MethodError` |
 | `update_progress!` | The only safe write to `TaskInfo.progress` |
@@ -355,7 +355,7 @@ decide.
     were never in the snapshot — no token, no wait, `RUNNING` rows nothing awaited. `shutdown!` now
     sets `queue.draining`, closes, **collects the buffer**, and records every collected item
     `CANCELLED` / `"Cancelled by worker shutdown"`. Three rules hold it together:
-    - **`draining` lives on the `SequentialQueue`, never on the `WorkerRuntime`.** A runtime-level
+    - **`draining` lives on the `WorkerQueue`, never on the `WorkerRuntime`.** A runtime-level
       flag would need resetting for the documented shutdown-then-reuse case, and the reset races a
       concurrent submit. `shutdown!` empties the registry, so a reused runtime mints queues that
       are not draining *by construction*.
@@ -372,10 +372,10 @@ decide.
   - **In `_run_settled`, the info clause is what terminates every production wait; `istaskdone` is
     a backstop.** A real run clears both caches through `_deregister_run!` *before* its task
     completes, so for anything `register_run!` published, clause 2 always fires first — on the
-    async path as much as the sequential one. On the sequential path it is also *necessary*, since
+    async path as much as the queued one. On the queued path it is also *necessary*, since
     the registered handle is the shared queue processor and `istaskdone` on that is false until the
     whole backlog has drained; narrowing the predicate to `istaskdone` alone stalls every
-    sequential teardown for the full window. `istaskdone` decides only for a handle whose info
+    queue teardown for the full window. `istaskdone` decides only for a handle whose info
     nothing will ever remove — the test-only `register_active_task!` + `register_active_task_info!`
     pair, where clause 2 is permanently false — and it is what gates the delete in
     `_release_settled_handles!`.

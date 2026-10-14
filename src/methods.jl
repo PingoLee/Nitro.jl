@@ -924,8 +924,8 @@ set_queue_authorizer!(worker_store(app), my_authorizer)
 serve(app; middleware = [workers])
 ```
 
-The startup hook still does the running part: the zombie sweep, one processor per queue in
-`queues`, and the retention scheduler. The shutdown hook drains and uninstalls, and a later
+The startup hook still does the running part: the zombie sweep, each queue's processors (as many
+as its declared concurrency), and the retention scheduler. The shutdown hook drains and uninstalls, and a later
 `serve` reinstalls the same runtime. Passing both `store` and `runtime` throws here.
 
 Because building it installs, **build it once**. Calling `worker_startup(app; store = s2)` again

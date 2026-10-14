@@ -11,7 +11,7 @@ using Nitro.Workers
 # exercises them directly, so it names them.
 using Nitro.Workers: get_task_info, set_task!, replace_task!, add_watcher!, try_transition!,
     delete_task!, try_delete_task!, cleanup_tasks!, list_running_task_refs, RunningTaskRef,
-    lock_tasks, get_active_task, get_active_task_info, register_run!, get_sequential_queues
+    lock_tasks, get_active_task, get_active_task_info, register_run!, get_worker_queues
 using Nitro.Errors: AuthorizationError
 
 # The ONE answer a read or cancel gives both for a missing task and for one the caller may not
@@ -2429,13 +2429,13 @@ else
                 # at all, so there is no longer anything for this backend to implement.
                 @test !hasmethod(shutdown!, Tuple{RealPormGWorkerStore})
 
-                task_id = submit_sequential_task("td-queue", "one", () -> "done", owner; runtime=rt_store_td)
+                task_id = submit_queued_task("td-queue", "one", () -> "done", owner; runtime=rt_store_td)
                 @test timedwait(() -> get_task_status(task_id, owner; runtime=rt_store_td)[:status] == "COMPLETED", 5.0) == :ok
 
                 scheduler = start_cleanup_scheduler(; interval_hours=1, retain_days=7, runtime=rt_store_td)
                 @test get_cleanup_scheduler(rt_store_td)[] === scheduler
 
-                channel = get_sequential_queues(rt_store_td)["td-queue"].channel
+                channel = get_worker_queues(rt_store_td)["td-queue"].channel
                 @test isopen(channel)
 
                 # Stand in for a run still in flight. A FINISHED run deregisters itself, so the
@@ -2472,7 +2472,7 @@ else
                 @test get_cleanup_scheduler(rt_store_td)[] === nothing
                 @test istaskdone(scheduler.task)
                 @test !isopen(channel)
-                @test isempty(get_sequential_queues(rt_store_td))
+                @test isempty(get_worker_queues(rt_store_td))
 
                 # The run outlived the wait, so its handle STAYS -- on this backend exactly as in
                 # memory. That is the whole of #176: `recover_zombie_tasks!` reads liveness from
@@ -2507,10 +2507,10 @@ else
                 # ...and `reset_runtime!` is no longer a complete no-op on a persistent store. It
                 # runs the teardown while still declining to delete the durable rows, which would
                 # be a destructive delete of live data rather than a reset.
-                second = submit_sequential_task("td-queue", "two", () -> "again", owner; runtime=rt_store_td)
+                second = submit_queued_task("td-queue", "two", () -> "again", owner; runtime=rt_store_td)
                 @test timedwait(() -> get_task_status(second, owner; runtime=rt_store_td)[:status] == "COMPLETED", 5.0) == :ok
                 reset_runtime!(rt_store_td)
-                @test isempty(get_sequential_queues(rt_store_td))
+                @test isempty(get_worker_queues(rt_store_td))
                 @test isempty(rt_store_td.active_tasks)
                 @test haskey(store_td.model._table, second)
             finally
@@ -2571,8 +2571,8 @@ else
             end
 
             try
-                first_id = submit_sequential_task("qfail", "k1", run_step, Owner("u"); runtime=rt_store_q)
-                second_id = submit_sequential_task("qfail", "k2", run_step, Owner("u"); runtime=rt_store_q)
+                first_id = submit_queued_task("qfail", "k1", run_step, Owner("u"); runtime=rt_store_q)
+                second_id = submit_queued_task("qfail", "k2", run_step, Owner("u"); runtime=rt_store_q)
                 @test first_id == "u::k1"
                 @test second_id == "u::k2"
 
@@ -2583,12 +2583,12 @@ else
                 @test timedwait(() -> get_task_status(first_id, Owner("u"); runtime=rt_store_q)[:status] == "COMPLETED", 5.0) == :ok
 
                 # k2 is dropped, but the processor must still be alive and draining.
-                queue = get_sequential_queues(rt_store_q)["qfail"]
-                @test queue.processor_task !== nothing
-                @test !istaskdone(queue.processor_task)
+                queue = get_worker_queues(rt_store_q)["qfail"]
+                @test length(queue.processors) == 1
+                @test !istaskdone(only(queue.processors))
 
                 unfail_id!(flaky, second_id)
-                third_id = submit_sequential_task("qfail", "k3", run_step, Owner("u"); runtime=rt_store_q)
+                third_id = submit_queued_task("qfail", "k3", run_step, Owner("u"); runtime=rt_store_q)
                 @test timedwait(() -> get_task_status(third_id, Owner("u"); runtime=rt_store_q)[:status] == "COMPLETED", 5.0) == :ok
                 @test get_task_status(third_id, Owner("u"); runtime=rt_store_q)[:result] == "ran-u::k3"
             finally

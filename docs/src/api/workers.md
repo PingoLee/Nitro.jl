@@ -29,7 +29,7 @@ Nitro.pormg_nitro_worker
 
 ```@docs
 Nitro.Workers.submit_task
-Nitro.Workers.submit_sequential_task
+Nitro.Workers.submit_queued_task
 Nitro.Workers.TaskAuthority
 Nitro.Workers.Owner
 Nitro.Workers.System

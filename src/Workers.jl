@@ -30,7 +30,7 @@ export TaskStatus, PENDING, RUNNING, COMPLETED, FAILED, CANCELLED,
     get_cleanup_scheduler,
     install!, uninstall!, worker_store, default_store,
     start!, startup, recover_zombie_tasks!,
-    submit_task, submit_sequential_task, get_task_status, cancel_task, release_task!,
+    submit_task, submit_queued_task, get_task_status, cancel_task, release_task!,
     update_progress!, cancel_requested, cancel_reason, CANCEL_REASONS, TaskTimeoutError,
     get_all_tasks, cleanup_old_tasks,
     start_cleanup_scheduler, stop_cleanup_scheduler!, get_queue_status,
@@ -53,8 +53,8 @@ export TaskStatus, PENDING, RUNNING, COMPLETED, FAILED, CANCELLED,
 #   `get_task_info(rt, id)` hands out a full record, `result` included, with no authority check, and
 #   `add_watcher!(rt, id, uid)` grants read + cancel with none -- exactly the post-hoc grant #96 said
 #   must not exist, and the unchecked-read shape #48 removed from the task API.
-# * The queue internals `SequentialQueue`, `QueueItem`, `get_sequential_queues`, `get_queue_lock`:
-#   anything that enqueues without going through `submit_sequential_task` bypasses its authorizer.
+# * The queue internals `WorkerQueue`, `QueueItem`, `get_worker_queues`, `get_queue_lock`:
+#   anything that enqueues without going through `submit_queued_task` bypasses its authorizer.
 # * `register_active_task!` / `register_active_task_info!` and their deregistrars. They have no
 #   production callers, and writing one dict without the other is exactly the state
 #   `register_run!` exists to make unbuildable (#167). Reach them qualified, from tests.

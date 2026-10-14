@@ -1,16 +1,30 @@
+# The queue's concurrency is read when the queue is MINTED and never again: it is fixed for the
+# queue's life, and `_declare_queues!` refuses to change a declared one, so there is nothing later to
+# read. A name nobody declared runs one at a time (`allow_undeclared_queues`).
+#
+# Read INSIDE `queue_lock`, in the same critical section as the mint: `_declare_queues!` checks for
+# a live queue under that lock, so a declaration racing an undeclared first submit either sees the
+# queue this mints, or is seen by it -- never neither, which would record one `k` and run another.
 function _get_or_create_queue(runtime::WorkerRuntime, queue_name::String)
     lock(get_queue_lock(runtime)) do
-        return get!(get_sequential_queues(runtime), queue_name) do
-            SequentialQueue()
+        return get!(get_worker_queues(runtime), queue_name) do
+            WorkerQueue(; concurrency=something(_declared_concurrency(runtime, queue_name), 1))
         end
     end
 end
 
-function _mark_queue_current_task!(runtime::WorkerRuntime, queue::SequentialQueue, task_id::Union{Nothing, String})
+# One entry per busy processor, so `get_queue_status` reports every id a queue is executing.
+_mark_queue_task_started!(runtime::WorkerRuntime, queue::WorkerQueue, task_id::String) =
+    lock(() -> push!(queue.current_tasks, task_id), get_queue_lock(runtime))
+
+# Removes ONE entry for `task_id`, the calling processor's: a stale item and its successor can
+# execute on two processors at once under the same key, and each must leave the other's entry.
+function _mark_queue_task_finished!(runtime::WorkerRuntime, queue::WorkerQueue, task_id::String)
     lock(get_queue_lock(runtime)) do
-        queue.current_task = task_id
+        i = findfirst(==(task_id), queue.current_tasks)
+        i === nothing || deleteat!(queue.current_tasks, i)
     end
-    return queue
+    return nothing
 end
 
 # `active_tasks` and `active_task_infos` are keyed by task id, but what they describe is a
@@ -150,7 +164,7 @@ end
 # **The `PENDING` pre-check.** The only status a record can hold under this run's `run_id` before
 # the run starts, other than `PENDING`, is `CANCELLED` -- a `cancel_task` or an abandoned queue
 # item (#182) that claimed it first. Declining here rather than at the start CAS means a cancelled
-# run never publishes handles at all. The sequential path always checked this; the async path used
+# run never publishes handles at all. The queued path always checked this; the async path used
 # to register, lose its CAS, and deregister, which was correct but published for nothing.
 #
 # `nothing` on every decline, never the record: handing the caller the SUCCESSOR's record under
@@ -252,7 +266,7 @@ function _execute_queued_task(runtime::WorkerRuntime, item::QueueItem)
         rethrow()
     end
     task_info === nothing && (_release_run!(runtime, item.run_id); return nothing)
-    # A sequential callback abandoned by its deadline also counts against the RUNTIME cap until
+    # A queued callback abandoned by its deadline also counts against the RUNTIME cap until
     # it returns: the processor moves on to the next item, so without this each queue could add
     # one still-running callback per timeout, with nothing bounding them.
     handoff = _RunHandoff(() -> _release_run!(runtime, item.run_id),
@@ -275,7 +289,7 @@ function _execute_queued_task(runtime::WorkerRuntime, item::QueueItem)
     # sequential (#142). The CAS *is* the write, so there is no `set_task!` after it.
     #
     # In the ASYNC path this was masked, not absent: `cancel_task` also interrupted the worker
-    # task, and a task that had not started yet never ran its body at all. The sequential path
+    # task, and a task that had not started yet never ran its body at all. The queued path
     # had no such cover -- its processor is already `Threads.@spawn`ed, and a cancel can land
     # between its `get_task_info` and its start write. Removing the interrupt (#127) uncovers
     # the async path too, which is why this lands FIRST.
@@ -393,101 +407,116 @@ function _execute_queued_task(runtime::WorkerRuntime, item::QueueItem)
     end
 end
 
+# Top `queue_name`'s processors back up to its concurrency, and return the queue.
+#
+# Called on every submit (and by `start!` for each declared name), which is also what restarts a
+# processor that died: a processor that exits removes itself, and the next submit spawns its
+# replacement. Under `queue_lock`, so two submitters cannot both spawn the last slot.
 function _start_queue_processor(runtime::WorkerRuntime, queue_name::String)
     queue = _get_or_create_queue(runtime, queue_name)
-    qlock = get_queue_lock(runtime)
 
-    lock(qlock) do
-        if queue.running && !isnothing(queue.processor_task) && !istaskdone(queue.processor_task)
-            return queue
-        end
-        queue.running = true
-        # `_spawn_detached`, not `Threads.@spawn` (#209). This one matters more than the async
-        # path, not less: the processor is spawned by whoever submits FIRST into an unstarted
-        # queue (`submit_sequential_task` -> `_start_queue_processor`), and it then runs for the
-        # life of the process. Inheriting that caller's scope would pin every item this queue
-        # ever executes -- including ones submitted hours later, by anyone -- to a transaction
-        # connection that was returned to the pool long ago.
-        queue.processor_task = _spawn_detached() do
-            try
-                while true
-                    item = try
-                        take!(queue.channel)
-                    catch error
-                        if error isa InvalidStateException
-                            break
-                        end
-                        rethrow(error)
-                    end
-                    # The item has left the buffer, so its slot is free for the next submit
-                    # (#324). Its OWNER's reservation lasts until the run ends.
-                    _release_queue_slot!(queue)
-
-                    # While abandoned sequential callbacks fill the runtime cap, hold this item
-                    # rather than start another beside them (#324). That is what stops a queue of
-                    # timing-out callbacks from piling up threads one per deadline. It is keyed on
-                    # those callbacks ALONE -- `_abandoned_saturated` says why not on async load --
-                    # and it pauses the QUEUE, never a submitter: new submits still fail fast once
-                    # the buffer fills. The held item is parked on `queue.held`, where `shutdown!`
-                    # collects it; a teardown also ends the pause, and the item is then abandoned
-                    # below like any other.
-                    if _abandoned_saturated(runtime)
-                        lock(() -> (queue.held = item), qlock)
-                        while _abandoned_saturated(runtime) && !(@atomic queue.draining)
-                            sleep(0.05)
-                        end
-                        lock(() -> (queue.held = nothing), qlock)
-                    end
-
-                    # BEFORE `_mark_queue_current_task!` and before `_execute_queued_task`'s
-                    # `_claim_run!`, so once `draining` is visible no further run starts,
-                    # publishes a handle into the runtime being torn down, and claims RUNNING with
-                    # nothing waiting on it (#182). A processor that read `false` a moment before
-                    # `shutdown!` set it can still register after `_snapshot_runs` -- the window is
-                    # narrowed, not closed, exactly as workers §5 says of the zombie sweep.
-                    #
-                    # `shutdown!` drains the buffer itself, so what this actually catches is the
-                    # narrow case that loop cannot reach: an item this processor had ALREADY taken
-                    # when the teardown began. `_abandon_queued_item!` is idempotent, so the two
-                    # abandoners cannot fight over one item.
-                    if (@atomic queue.draining)
-                        try
-                            _abandon_queued_item!(runtime, item)
-                        catch error
-                            @error "Worker queue item abandoned but not recorded during teardown" exception=(error, catch_backtrace()) queue_name=queue_name task_key=item.task_key
-                        end
-                        _release_run!(runtime, item.run_id)    # after the `catch`: never skipped
-                        continue
-                    end
-
-                    lock(queue.exec_lock) do
-                        _mark_queue_current_task!(runtime, queue, item.task_key)
-                        try
-                            _execute_queued_task(runtime, item)
-                        catch error
-                            # One bad item must never take the processor down. This
-                            # loop is the only thing draining the queue and nothing
-                            # restarts it until the next submission, so an escaping
-                            # exception strands every item behind it. Callback
-                            # failures are already converted to FAILED inside
-                            # _execute_queued_task; reaching here means the *store*
-                            # threw — a failed metadata read, say. Log it, drop the
-                            # item, keep draining.
-                            @error "Worker queue item aborted outside task execution" exception=(error, catch_backtrace()) queue_name=queue_name task_key=item.task_key
-                        finally
-                            _mark_queue_current_task!(runtime, queue, nothing)
-                        end
-                    end
-                end
-            finally
-                lock(qlock) do
-                    queue.running = false
-                    queue.current_task = nothing
-                    queue.processor_task = nothing
-                end
-            end
+    lock(get_queue_lock(runtime)) do
+        # A dead queue's processors are never topped up. `shutdown!` drops the queue from the
+        # registry, so a submit that raced the teardown and still holds it would otherwise spawn a
+        # processor that breaks at once on the closed channel.
+        (@atomic queue.draining) && return nothing
+        filter!(t -> !istaskdone(t), queue.processors)
+        while length(queue.processors) < queue.concurrency
+            push!(queue.processors, _spawn_queue_processor(runtime, queue, queue_name))
         end
     end
 
     return queue
+end
+
+# One processor: `take!` an item, run it, repeat until the channel is closed. A queue with
+# concurrency `k` runs `k` of these over one channel, so items START in FIFO order and at most `k`
+# execute at once (#513).
+#
+# `_spawn_detached`, not `Threads.@spawn` (#209). This matters more than on the async path, not
+# less: the processors are spawned by whoever submits FIRST into an unstarted queue
+# (`submit_queued_task` -> `_start_queue_processor`), and they then run for the life of the
+# process. Inheriting that caller's scope would pin every item this queue ever executes --
+# including ones submitted hours later, by anyone -- to a transaction connection that was returned
+# to the pool long ago.
+function _spawn_queue_processor(runtime::WorkerRuntime, queue::WorkerQueue, queue_name::String)
+    qlock = get_queue_lock(runtime)
+    return _spawn_detached() do
+        me = current_task()
+        try
+            while true
+                item = try
+                    take!(queue.channel)
+                catch error
+                    if error isa InvalidStateException
+                        break
+                    end
+                    rethrow(error)
+                end
+                # The item has left the buffer, so its slot is free for the next submit
+                # (#324). Its OWNER's reservation lasts until the run ends.
+                _release_queue_slot!(queue)
+
+                # While abandoned queued callbacks fill the runtime cap, hold this item rather
+                # than start another beside them (#324). That is what stops a queue of timing-out
+                # callbacks from piling up threads one per deadline. It is keyed on those
+                # callbacks ALONE -- `_abandoned_saturated` says why not on async load -- and it
+                # pauses the PROCESSOR, never a submitter: new submits still fail fast once the
+                # buffer fills. The held item is parked on `queue.held`, where `shutdown!` collects
+                # it; a teardown also ends the pause, and the item is then abandoned below like any
+                # other.
+                if _abandoned_saturated(runtime)
+                    lock(() -> push!(queue.held, item), qlock)
+                    while _abandoned_saturated(runtime) && !(@atomic queue.draining)
+                        sleep(0.05)
+                    end
+                    lock(qlock) do
+                        i = findfirst(x -> x === item, queue.held)
+                        i === nothing || deleteat!(queue.held, i)
+                    end
+                end
+
+                # BEFORE `_mark_queue_task_started!` and before `_execute_queued_task`'s
+                # `_claim_run!`, so once `draining` is visible no further run starts,
+                # publishes a handle into the runtime being torn down, and claims RUNNING with
+                # nothing waiting on it (#182). A processor that read `false` a moment before
+                # `shutdown!` set it can still register after `_snapshot_runs` -- the window is
+                # narrowed, not closed, exactly as workers §5 says of the zombie sweep.
+                #
+                # `shutdown!` drains the buffer itself, so what this actually catches is the
+                # narrow case that loop cannot reach: an item this processor had ALREADY taken
+                # when the teardown began. `_abandon_queued_item!` is idempotent, so the two
+                # abandoners cannot fight over one item.
+                if (@atomic queue.draining)
+                    try
+                        _abandon_queued_item!(runtime, item)
+                    catch error
+                        @error "Worker queue item abandoned but not recorded during teardown" exception=(error, catch_backtrace()) queue_name=queue_name task_key=item.task_key
+                    end
+                    _release_run!(runtime, item.run_id)    # after the `catch`: never skipped
+                    continue
+                end
+
+                _mark_queue_task_started!(runtime, queue, item.task_key)
+                try
+                    _execute_queued_task(runtime, item)
+                catch error
+                    # One bad item must never take the processor down. This loop is the only
+                    # thing draining its share of the queue and nothing restarts it until the next
+                    # submission, so an escaping exception strands every item behind it. Callback
+                    # failures are already converted to FAILED inside _execute_queued_task;
+                    # reaching here means the *store* threw — a failed metadata read, say. Log it,
+                    # drop the item, keep draining.
+                    @error "Worker queue item aborted outside task execution" exception=(error, catch_backtrace()) queue_name=queue_name task_key=item.task_key
+                finally
+                    _mark_queue_task_finished!(runtime, queue, item.task_key)
+                end
+            end
+        finally
+            lock(qlock) do
+                i = findfirst(t -> t === me, queue.processors)
+                i === nothing || deleteat!(queue.processors, i)
+            end
+        end
+    end
 end

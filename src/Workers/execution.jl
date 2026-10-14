@@ -195,8 +195,8 @@ function _invoke_task_callback(callback::Function, task_info::TaskInfo)
 
         # The arity probe must run in the SAME world age as the call (#86). `invokelatest` is
         # world-age-agnostic; bare `applicable` is not -- it answers in the world age of its
-        # caller. The sequential queue processor is a long-lived `Threads.@spawn`ed task created
-        # by the FIRST `submit_sequential_task` (`queue.jl`), so it carries that world age for its
+        # caller. A queue processor is a long-lived `Threads.@spawn`ed task created
+        # by the FIRST `submit_queued_task` (`queue.jl`), so it carries that world age for its
         # entire life. A callback whose method is first defined afterwards -- a REPL session, a
         # `@testitem` body, Revise redefining a handler -- was invisible to both bare checks. The
         # function then either threw `MethodError` for a method that exists, or silently picked
@@ -235,7 +235,7 @@ end
 # `:abandoned`, the waiter blocked until the callback returned, and the reservation was released
 # early. A fresh handoff per attempt has no such history; the caller checks the last one.
 #
-# `on_abandon` runs on the WAITER's side when it wins, before it throws. The sequential path uses it
+# `on_abandon` runs on the WAITER's side when it wins, before it throws. The queued path uses it
 # to count the abandoned callback against the runtime-wide cap (#324), since it keeps a thread.
 mutable struct _RunHandoff
     @atomic state::Symbol

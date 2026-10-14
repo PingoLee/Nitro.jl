@@ -103,7 +103,7 @@ using Nitro.Workers
 using Nitro.Workers: get_task_info, set_task!, replace_task!, add_watcher!, try_transition!,
     delete_task!, try_delete_task!, cleanup_tasks!, clear_records!, list_running_task_refs,
     RunningTaskRef, lock_tasks, get_active_task, get_active_task_info, register_run!,
-    SequentialQueue, QueueItem, get_sequential_queues, get_queue_lock
+    WorkerQueue, QueueItem, get_worker_queues, get_queue_lock
 using Nitro.Errors: AuthorizationError, StoreInterfaceError, WorkerUnavailableError, WorkerCapacityError
 using Base.ScopedValues: ScopedValue, with
 
@@ -260,7 +260,7 @@ Nitro.Workers.set_error_redactor!(s::DataOnlyStore, f) = (s.er[] = f)
     @test :try_transition! in missing_names
 
     # The lifecycle rows LEFT the contract in #167, so a store owes none of them.
-    for gone in (:shutdown!, :reload_task, :get_cleanup_scheduler, :get_sequential_queues,
+    for gone in (:shutdown!, :reload_task, :get_cleanup_scheduler, :get_worker_queues,
                  :get_queue_lock, :get_active_task, :register_active_task!,
                  :deregister_active_task!, :get_active_task_info,
                  :register_active_task_info!, :deregister_active_task_info!)
@@ -344,7 +344,7 @@ end
     # AbstractString)` and `(AbstractWorkerStore, String)` are mutually ambiguous -- neither is
     # more specific -- so an exact-typed fallback can win the call and the store's own method
     # never runs. `::AbstractString` is not a contrived choice either: Nitro's own
-    # `submit_task`/`submit_sequential_task` are written that way.
+    # `submit_task`/`submit_queued_task` are written that way.
     @test get_task_info(WideStore(), "id") == "wide"
     @test !(:get_task_info in missing_store_methods(WideStore))
 
@@ -362,13 +362,13 @@ end
     try
         # A real sequential queue with a live processor, and a real cleanup scheduler.
         owner = Owner("user-teardown")
-        task_id = submit_sequential_task("teardown-q", "one", () -> "done", owner; runtime=rt_store)
+        task_id = submit_queued_task("teardown-q", "one", () -> "done", owner; runtime=rt_store)
         @test wait_for(() -> get_task_status(task_id, owner; runtime=rt_store)[:status] == "COMPLETED") == :ok
 
         scheduler = start_cleanup_scheduler(; interval_hours=1, retain_days=7, runtime=rt_store)
         @test get_cleanup_scheduler(rt_store)[] === scheduler
 
-        queues = get_sequential_queues(rt_store)
+        queues = get_worker_queues(rt_store)
         @test haskey(queues, "teardown-q")
         channel = queues["teardown-q"].channel
         @test isopen(channel)
@@ -397,7 +397,7 @@ end
         # emptied, not merely drained. A closed-but-present queue is the reuse hazard: `get!` in
         # `_get_or_create_queue` would hand the dead one straight back.
         @test !isopen(channel)
-        @test isempty(get_sequential_queues(rt_store))
+        @test isempty(get_worker_queues(rt_store))
         @test isempty(rt_store.active_tasks)
 
         # ...but the live-`TaskInfo` cache SURVIVES, because `cancel_task` resolves a run's
@@ -409,9 +409,9 @@ end
         @test get_active_task_info(rt_store, "in-flight") === in_flight
 
         # So the runtime is genuinely reusable, rather than poisoned for sequential work.
-        again = submit_sequential_task("teardown-q", "two", () -> "again", owner; runtime=rt_store)
+        again = submit_queued_task("teardown-q", "two", () -> "again", owner; runtime=rt_store)
         @test wait_for(() -> get_task_status(again, owner; runtime=rt_store)[:status] == "COMPLETED") == :ok
-        @test get_sequential_queues(rt_store)["teardown-q"].channel !== channel
+        @test get_worker_queues(rt_store)["teardown-q"].channel !== channel
 
         # A RESET is total where a teardown is not: it also drops the live cache.
         reset_runtime!(rt_store)
@@ -546,11 +546,11 @@ end
         owner = Owner("u")
         hold = Base.Event()
         try
-            a = submit_sequential_task("q", "a", function (task_info)
+            a = submit_queued_task("q", "a", function (task_info)
                 timedwait(() -> cancel_requested(task_info), 10.0; pollint=0.02)
                 return "a"
             end, owner; runtime=rt)
-            submit_sequential_task("q", "b", (task_info) -> (wait(hold); "b"), owner; runtime=rt)
+            submit_queued_task("q", "b", (task_info) -> (wait(hold); "b"), owner; runtime=rt)
 
             @test wait_for(() -> get_task_status(a, owner; runtime=rt)[:status] == "RUNNING") == :ok
 
@@ -798,7 +798,7 @@ end
         backlog_ran = Threads.Atomic{Int}(0)
         try
             # One run in flight, holding the processor until the drain asks it to stop.
-            slow_id = submit_sequential_task("reports", "slow", function (task_info)
+            slow_id = submit_queued_task("reports", "slow", function (task_info)
                 notify(entered)
                 while !cancel_requested(task_info)
                     sleep(0.01)
@@ -809,7 +809,7 @@ end
             wait(entered)
 
             # ...and three behind it, which must never execute.
-            backlog = [submit_sequential_task("reports", "backlog-$i", function (task_info)
+            backlog = [submit_queued_task("reports", "backlog-$i", function (task_info)
                            Threads.atomic_add!(backlog_ran, 1)
                            return "ran"
                        end, owner; runtime=rt) for i in 1:3]
@@ -849,14 +849,14 @@ end
         release = Base.Event()
         ran = Threads.Atomic{Int}(0)
         try
-            submit_sequential_task("q0", "holder", function (task_info)
+            submit_queued_task("q0", "holder", function (task_info)
                 notify(entered)
                 wait(release)          # deliberately does NOT poll the token: 0 never sets one
                 return "held"
             end, owner; runtime=rt)
             wait(entered)
 
-            queued = submit_sequential_task("q0", "queued", function (task_info)
+            queued = submit_queued_task("q0", "queued", function (task_info)
                 Threads.atomic_add!(ran, 1)
                 return "ran"
             end, owner; runtime=rt)
@@ -943,7 +943,7 @@ end
         try
             # Fill the buffer to its 100-item ceiling, with one run in flight holding the
             # processor so nothing is consumed.
-            submit_sequential_task("full", "holder", function (task_info)
+            submit_queued_task("full", "holder", function (task_info)
                 notify(entered)
                 while !cancel_requested(task_info)
                     sleep(0.01)
@@ -952,15 +952,15 @@ end
             end, owner; runtime=rt)
             wait(entered)
 
-            queued = [submit_sequential_task("full", "buffered-$i", function (task_info)
+            queued = [submit_queued_task("full", "buffered-$i", function (task_info)
                           Threads.atomic_add!(ran, 1)
                           return "ran"
                       end, owner; runtime=rt) for i in 1:100]
 
             # One more PUBLIC submit is refused at once, with nothing written (#324)...
             refused_key = scoped_task_key("refused", owner)
-            @test_throws WorkerCapacityError submit_sequential_task("full", "refused",
-                                                                    task_info -> "ran", owner; runtime=rt)
+            @test_throws WorkerCapacityError submit_queued_task("full", "refused",
+                                                                task_info -> "ran", owner; runtime=rt)
             @test get_task_info(store, refused_key) === nothing
 
             # ...so the parked `put!` that inflates `n_avail` is made by hand.
@@ -979,7 +979,7 @@ end
 
             # ...and the teardown was total: registry emptied, nothing executed, every record
             # terminal rather than stranded PENDING.
-            @test isempty(Nitro.Workers.get_sequential_queues(rt))
+            @test isempty(Nitro.Workers.get_worker_queues(rt))
             @test ran[] == 0
             for id in queued
                 status = get_task_status(id, System(); runtime=rt)
@@ -1048,7 +1048,7 @@ end
     end
 
     @testset "a runtime reused after shutdown! gets a queue that is not draining (#182)" begin
-        # The reason `draining` lives on the SequentialQueue and not on the WorkerRuntime: a
+        # The reason `draining` lives on the WorkerQueue and not on the WorkerRuntime: a
         # runtime-level flag would need resetting here, and the reset races a concurrent submit.
         # `shutdown!` empties the registry, so the fresh queue is not draining by construction.
         store = InMemoryWorkerStore()
@@ -1058,7 +1058,7 @@ end
             @test shutdown!(rt) == true      # no queues at all yet
 
             done = Base.Event()
-            id = submit_sequential_task("after", "runs-normally", function (task_info)
+            id = submit_queued_task("after", "runs-normally", function (task_info)
                 notify(done)
                 return "ok"
             end, owner; runtime=rt)
@@ -1121,7 +1121,7 @@ end
         entered_q = Base.Event()
         attempts_q = Threads.Atomic{Int}(0)
         try
-            qid = submit_sequential_task("retry-q", "retrying", function (task_info)
+            qid = submit_queued_task("retry-q", "retrying", function (task_info)
                 Threads.atomic_add!(attempts_q, 1)
                 attempts_q[] == 1 && notify(entered_q)
                 error("transient failure")
@@ -1289,7 +1289,7 @@ end
         owner = Owner("u")
         marker_during = Ref{Any}(:unset)
         try
-            id = submit_sequential_task("marker-q", "one", function (task_info)
+            id = submit_queued_task("marker-q", "one", function (task_info)
                 marker_during[] = Base.get(task_local_storage(),
                                            Nitro.Workers.CURRENT_RUN_KEY, :absent)
                 return "one"
@@ -1300,10 +1300,11 @@ end
             # Set while the callback ran...
             @test marker_during[] isa Base.UUID
 
-            # ...and gone once it returned. `processor_task` is the task the callback ran on,
-            # since `timeout=0` bypasses `timeout_call`'s child.
-            processor = get_sequential_queues(rt)["marker-q"].processor_task
-            @test processor !== nothing
+            # ...and gone once it returned. The queue's one processor is the task the callback
+            # ran on, since `timeout=0` bypasses `timeout_call`'s child.
+            processors = get_worker_queues(rt)["marker-q"].processors
+            @test length(processors) == 1
+            processor = only(processors)
             storage = processor.storage
             @test storage === nothing || !haskey(storage, Nitro.Workers.CURRENT_RUN_KEY)
         finally
@@ -1355,18 +1356,18 @@ end
     try
         # A sequential queue (a `Channel` plus a spawned processor) and a cleanup scheduler --
         # the exact resources #29 leaked -- over a store that knows about none of them.
-        task_id = submit_sequential_task("dataonly-q", "one", () -> "done", owner; runtime=rt)
+        task_id = submit_queued_task("dataonly-q", "one", () -> "done", owner; runtime=rt)
         @test wait_for(() -> get_task_status(task_id, owner; runtime=rt)[:status] == "COMPLETED") == :ok
 
         scheduler = start_cleanup_scheduler(; interval_hours=1, retain_days=7, runtime=rt)
-        channel = get_sequential_queues(rt)["dataonly-q"].channel
+        channel = get_worker_queues(rt)["dataonly-q"].channel
 
         # Does not raise, and actually releases: teardown is the runtime's, not the backend's.
         shutdown!(rt)
 
         @test istaskdone(scheduler.task)
         @test !isopen(channel)
-        @test isempty(get_sequential_queues(rt))
+        @test isempty(get_worker_queues(rt))
         @test get_cleanup_scheduler(rt)[] === nothing
     finally
         reset_runtime!(rt)
@@ -1527,7 +1528,7 @@ end
     try
         first_runtime = start!(app; queues=["displaced-q"], store=store, recover_zombies=false)
         scheduler = get_cleanup_scheduler(first_runtime)[]
-        channel = get_sequential_queues(first_runtime)["displaced-q"].channel
+        channel = get_worker_queues(first_runtime)["displaced-q"].channel
 
         # Same backend: `start!` must be idempotent rather than mint a second runtime over it.
         @test start!(app; queues=["displaced-q"], store=store, recover_zombies=false) === first_runtime
@@ -1540,7 +1541,7 @@ end
         @test worker_runtime(app) === second_runtime
         @test istaskdone(scheduler.task)
         @test !isopen(channel)
-        @test isempty(get_sequential_queues(first_runtime))
+        @test isempty(get_worker_queues(first_runtime))
     finally
         uninstall!(app)
     end
@@ -1557,26 +1558,26 @@ end
     owner = Owner("user-shared")
 
     try
-        a_id = submit_sequential_task("shared-q", "from-a", () -> "a", owner; runtime=rt_a)
-        b_id = submit_sequential_task("shared-q", "from-b", () -> "b", owner; runtime=rt_b)
+        a_id = submit_queued_task("shared-q", "from-a", () -> "a", owner; runtime=rt_a)
+        b_id = submit_queued_task("shared-q", "from-b", () -> "b", owner; runtime=rt_b)
         @test wait_for(() -> get_task_status(a_id, owner; runtime=rt_a)[:status] == "COMPLETED") == :ok
         @test wait_for(() -> get_task_status(b_id, owner; runtime=rt_b)[:status] == "COMPLETED") == :ok
 
         # Same queue NAME, two independent queues -- the resources are per runtime.
-        @test get_sequential_queues(rt_a)["shared-q"] !== get_sequential_queues(rt_b)["shared-q"]
+        @test get_worker_queues(rt_a)["shared-q"] !== get_worker_queues(rt_b)["shared-q"]
 
         # ...but one set of records, because the store is shared.
         @test get_task_status(a_id, owner; runtime=rt_b)[:result] == "a"
 
-        b_channel = get_sequential_queues(rt_b)["shared-q"].channel
+        b_channel = get_worker_queues(rt_b)["shared-q"].channel
         shutdown!(rt_a)
 
         # Tearing one down leaves the other running, which is the whole point.
-        @test isempty(get_sequential_queues(rt_a))
+        @test isempty(get_worker_queues(rt_a))
         @test isopen(b_channel)
-        again = submit_sequential_task("shared-q", "still-b", () -> "b2", owner; runtime=rt_b)
+        again = submit_queued_task("shared-q", "still-b", () -> "b2", owner; runtime=rt_b)
         @test wait_for(() -> get_task_status(again, owner; runtime=rt_b)[:status] == "COMPLETED") == :ok
-        @test get_sequential_queues(rt_b)["shared-q"].channel === b_channel
+        @test get_worker_queues(rt_b)["shared-q"].channel === b_channel
     finally
         reset_runtime!(rt_a)
         reset_runtime!(rt_b)
@@ -1784,7 +1785,7 @@ end
         @eval mixed_cb() = "zero-arg (old)"
 
         # The FIRST sequential submit spawns the queue processor, freezing its world age.
-        first_id = submit_sequential_task("wq86", "first", () -> "first", auth; runtime=rt_store)
+        first_id = submit_queued_task("wq86", "first", () -> "first", auth; runtime=rt_store)
         @test wait_for(() -> get_task_status(first_id, auth; runtime=rt_store)[:status] == "COMPLETED") == :ok
 
         # `@eval` is the whole point of this test: it defines methods at a world age LATER than
@@ -1794,11 +1795,11 @@ end
         @eval late_one_arg(task_info) = "late one-arg"
         @eval late_zero_arg() = "late zero-arg"
 
-        second_id = submit_sequential_task("wq86", "second", late_one_arg, auth; runtime=rt_store)
+        second_id = submit_queued_task("wq86", "second", late_one_arg, auth; runtime=rt_store)
         @test wait_for(() -> get_task_status(second_id, auth; runtime=rt_store)[:status] == "COMPLETED") == :ok
         @test get_task_status(second_id, auth; runtime=rt_store)[:result] == "late one-arg"
 
-        third_id = submit_sequential_task("wq86", "third", late_zero_arg, auth; runtime=rt_store)
+        third_id = submit_queued_task("wq86", "third", late_zero_arg, auth; runtime=rt_store)
         @test wait_for(() -> get_task_status(third_id, auth; runtime=rt_store)[:status] == "COMPLETED") == :ok
         @test get_task_status(third_id, auth; runtime=rt_store)[:result] == "late zero-arg"
 
@@ -1809,7 +1810,7 @@ end
         # its task_info -- no error, wrong behaviour. This is what Revise adding a parameter to
         # a live callback looks like.
         @eval mixed_cb(task_info) = "one-arg (new)"
-        fourth_id = submit_sequential_task("wq86", "fourth", mixed_cb, auth; runtime=rt_store)
+        fourth_id = submit_queued_task("wq86", "fourth", mixed_cb, auth; runtime=rt_store)
         @test wait_for(() -> get_task_status(fourth_id, auth; runtime=rt_store)[:status] == "COMPLETED") == :ok
         @test get_task_status(fourth_id, auth; runtime=rt_store)[:result] == "one-arg (new)"
     finally
@@ -1825,7 +1826,7 @@ end
     try
         ids = String[]
         for index in 1:3
-            push!(ids, submit_sequential_task("reports", "queued-$(index)", task_info -> begin
+            push!(ids, submit_queued_task("reports", "queued-$(index)", task_info -> begin
                 push!(observed, task_info.id)
                 sleep(0.05)
                 return task_info.id
@@ -1838,7 +1839,8 @@ end
 
         queue_status = get_queue_status("reports", System(); runtime=rt_store)
         @test queue_status[:running] == true
-        @test queue_status[:current_task] === nothing
+        @test queue_status[:current_tasks] == String[]
+        @test queue_status[:concurrency] == 1
         @test queue_status[:total_load] == 0
     finally
         reset_runtime!(rt_store)
@@ -2007,9 +2009,9 @@ end
 
     try
         owner = Owner("user-dead-sweep")
-        task_id = submit_sequential_task("dead-sweep-q", "one", () -> "done", owner; runtime=rt)
+        task_id = submit_queued_task("dead-sweep-q", "one", () -> "done", owner; runtime=rt)
         @test wait_for(() -> get_task_status(task_id, owner; runtime=rt)[:status] == "COMPLETED") == :ok
-        channel = get_sequential_queues(rt)["dead-sweep-q"].channel
+        channel = get_worker_queues(rt)["dead-sweep-q"].channel
         @test isopen(channel)
 
         # A settled run handle, as in the #167 testset above: it must be released by the drain.
@@ -2029,7 +2031,7 @@ end
 
         @test get_cleanup_scheduler(rt)[] === nothing
         @test !isopen(channel)
-        @test isempty(get_sequential_queues(rt))
+        @test isempty(get_worker_queues(rt))
         @test !haskey(rt.active_tasks, "dead-sweep-handle")
 
         # The runtime is reusable afterwards: a fresh scheduler, alive, that stops cleanly.
@@ -2207,11 +2209,11 @@ end
     try
         # 1. Queue Authorization test
         # Authorized user succeeds
-        task1 = submit_sequential_task("admin-queue", "task-auth-ok", () -> "ok", Owner("admin-user"); runtime=rt_store)
+        task1 = submit_queued_task("admin-queue", "task-auth-ok", () -> "ok", Owner("admin-user"); runtime=rt_store)
         @test task1 == "admin-user::task-auth-ok"
 
         # Unauthorized user throws AuthorizationError
-        @test_throws AuthorizationError submit_sequential_task("admin-queue", "task-auth-fail", () -> "fail", Owner("other-user"); runtime=rt_store)
+        @test_throws AuthorizationError submit_queued_task("admin-queue", "task-auth-fail", () -> "fail", Owner("other-user"); runtime=rt_store)
 
         # 2. Task querying and watchers access control
         # submit a task by user-a (so user-a is the first watcher)
@@ -2759,12 +2761,12 @@ end
         try
             # Hold the processor so nothing is consumed while the scenario is set up. This is
             # the "busy queue" the issue notes is all the buffering the bug needs.
-            submit_sequential_task("q", "holder", holder_cb, owner; runtime=rt_store)
+            submit_queued_task("q", "holder", holder_cb, owner; runtime=rt_store)
             wait(entered)
 
-            id = submit_sequential_task("q", "K", first_cb, owner; runtime=rt_store)
+            id = submit_queued_task("q", "K", first_cb, owner; runtime=rt_store)
             @test cancel_task(id, owner; runtime=rt_store)[:status] == "Task cancelled"
-            id2 = submit_sequential_task("q", "K", second_cb, owner; runtime=rt_store)
+            id2 = submit_queued_task("q", "K", second_cb, owner; runtime=rt_store)
             # Same key, so the caller's surviving submission is the second callback.
             @test id2 == id
 
@@ -3116,8 +3118,8 @@ end
             options = TaskOptions(retry_on_failure=true, max_retries=3, timeout=timeout)
             try
                 id = sequential ?
-                    submit_sequential_task("unrecoverable-q", "boom", callback, Owner("u");
-                                           options=options, runtime=rt_store) :
+                    submit_queued_task("unrecoverable-q", "boom", callback, Owner("u");
+                                       options=options, runtime=rt_store) :
                     submit_task("boom", callback, Owner("u"); options=options, runtime=rt_store)
                 failed = wait_for(() -> get_task_status(id, Owner("u"); runtime=rt_store)[:status] ==
                                         "FAILED"; timeout=10.0)
@@ -3264,9 +3266,9 @@ end
     store = InMemoryWorkerStore()
     rt_store = WorkerRuntime(store; queues = ["reports"])
     try
-        submit_sequential_task("reports", "job", () -> "ok", Owner("user-a"); runtime=rt_store)
+        submit_queued_task("reports", "job", () -> "ok", Owner("user-a"); runtime=rt_store)
 
-        # `:pending_tasks` and `:current_task` enumerate ids that carry their owner in
+        # `:pending_tasks` and `:current_tasks` enumerate ids that carry their owner in
         # the "<owner>::<key>" prefix, and queue depth is a fact about the queue rather
         # than about any one user. So there is no scoped form: an Owner does not compile.
         @test get_queue_status("reports", System(); runtime=rt_store)[:running] == true
@@ -3407,11 +3409,11 @@ end
     try
         @test submit_task("k", () -> 1, Owner("u"); scope=:global, runtime=rt_store) == "k"
         @test_throws ArgumentError submit_task("k3", () -> 1, Owner("u"); scope=:tenant, runtime=rt_store)
-        @test_throws ArgumentError submit_sequential_task("q", "k4", () -> 1, Owner("u"); scope=:tenant, runtime=rt_store)
+        @test_throws ArgumentError submit_queued_task("q", "k4", () -> 1, Owner("u"); scope=:tenant, runtime=rt_store)
 
         # A global submit cannot squat a user-scoped id.
         @test_throws ArgumentError submit_task("victim::k5", () -> 1, Owner("attacker"); scope=:global, runtime=rt_store)
-        @test_throws ArgumentError submit_sequential_task("q", "victim::k6", () -> 1, Owner("attacker"); scope=:global, runtime=rt_store)
+        @test_throws ArgumentError submit_queued_task("q", "victim::k6", () -> 1, Owner("attacker"); scope=:global, runtime=rt_store)
     finally
         reset_runtime!(rt_store)
     end
@@ -3423,13 +3425,13 @@ end
     release = Base.Event()
 
     try
-        owner_id = submit_sequential_task("reports", "nightly-rollup", task_info -> begin
+        owner_id = submit_queued_task("reports", "nightly-rollup", task_info -> begin
             wait(release)
             return "owner-result"
         end, Owner("owner"); scope=:global, runtime=rt_store)
         @test owner_id == "nightly-rollup"
 
-        @test_throws AuthorizationError submit_sequential_task(
+        @test_throws AuthorizationError submit_queued_task(
             "reports", "nightly-rollup", () -> "noop", Owner("attacker"); scope=:global, runtime=rt_store)
 
         notify(release)
@@ -3438,7 +3440,7 @@ end
         @test is_not_found(get_task_status(owner_id, Owner("attacker"); runtime=rt_store))
 
         # Terminal state is gated on the sequential path too.
-        @test_throws AuthorizationError submit_sequential_task(
+        @test_throws AuthorizationError submit_queued_task(
             "reports", "nightly-rollup", () -> "noop", Owner("attacker"); scope=:global, runtime=rt_store)
     finally
         notify(release)
@@ -4238,26 +4240,26 @@ end
         end
     end
 
-    @testset "the FIRST submit_sequential_task into an unstarted queue" begin
+    @testset "the FIRST submit_queued_task into an unstarted queue" begin
         # This submit is the one that spawns the queue's processor (`_start_queue_processor`),
         # so before #209 it pinned a PROCESS-LIFETIME task in one caller's scope -- and every
         # item that queue ever ran afterwards inherited it, whoever submitted them.
         rt = WorkerRuntime(InMemoryWorkerStore(); queues = ["reports"])
         try
-            @test isempty(get_sequential_queues(rt))       # nothing spawned yet
+            @test isempty(get_worker_queues(rt))       # nothing spawned yet
             seen = Channel{Symbol}(2)
             with(_SCOPE_PROBE => :inner) do
-                submit_sequential_task("reports", "scope-seq-1",
-                                       () -> (put!(seen, _SCOPE_PROBE[]); nothing),
-                                       Owner("user-1"); runtime=rt)
+                submit_queued_task("reports", "scope-seq-1",
+                                   () -> (put!(seen, _SCOPE_PROBE[]); nothing),
+                                   Owner("user-1"); runtime=rt)
             end
             @test wait_for(() -> isready(seen)) == :ok
             @test take!(seen) === :outer
 
             # ...and a later item on that same processor is unaffected too.
-            submit_sequential_task("reports", "scope-seq-2",
-                                   () -> (put!(seen, _SCOPE_PROBE[]); nothing),
-                                   Owner("user-2"); runtime=rt)
+            submit_queued_task("reports", "scope-seq-2",
+                               () -> (put!(seen, _SCOPE_PROBE[]); nothing),
+                               Owner("user-2"); runtime=rt)
             @test wait_for(() -> isready(seen)) == :ok
             @test take!(seen) === :outer
         finally
@@ -4275,9 +4277,9 @@ end
             end
             seen = Channel{Symbol}(1)
             # Submitted from OUTSIDE the scope: only the processor could carry it in.
-            submit_sequential_task("reports", "scope-started",
-                                   () -> (put!(seen, _SCOPE_PROBE[]); nothing),
-                                   Owner("user-1"); runtime=rt)
+            submit_queued_task("reports", "scope-started",
+                               () -> (put!(seen, _SCOPE_PROBE[]); nothing),
+                               Owner("user-1"); runtime=rt)
             @test wait_for(() -> isready(seen)) == :ok
             @test take!(seen) === :outer
         finally
@@ -4467,7 +4469,7 @@ end
     # Every App-first form refuses; none of them reaches `default_runtime()`, which carries none
     # of the app's policy -- no queue authorizer, no redactor, no retention.
     @test_throws WorkerUnavailableError submit_task(app, "k", () -> 1, Owner("u"))
-    @test_throws WorkerUnavailableError submit_sequential_task(app, "q", "k", () -> 1, Owner("u"))
+    @test_throws WorkerUnavailableError submit_queued_task(app, "q", "k", () -> 1, Owner("u"))
     @test_throws WorkerUnavailableError get_task_status(app, "u::k", Owner("u"))
     @test_throws WorkerUnavailableError cancel_task(app, "u::k", Owner("u"))
     @test_throws WorkerUnavailableError release_task!(app, "k", System())
@@ -4630,14 +4632,14 @@ end
     gate = Channel{Nothing}(10)
     try
         submit_task("a1", () -> take!(gate), Owner("alice"); runtime = rt)
-        submit_sequential_task("q", "a2", () -> take!(gate), Owner("alice"); runtime = rt)
+        submit_queued_task("q", "a2", () -> take!(gate), Owner("alice"); runtime = rt)
         err = try
             submit_task("a3", () -> "never", Owner("alice"); runtime = rt); nothing
         catch e
             e
         end
         @test err isa WorkerCapacityError && err.kind === :owner
-        @test_throws WorkerCapacityError submit_sequential_task("q", "a4", () -> "never", Owner("alice"); runtime = rt)
+        @test_throws WorkerCapacityError submit_queued_task("q", "a4", () -> "never", Owner("alice"); runtime = rt)
         # Another owner is unaffected.
         bob = submit_task("b1", () -> "bob", Owner("bob"); runtime = rt)
         @test wait_for(() -> get_task_status(bob, Owner("bob"); runtime = rt)[:status] == "COMPLETED") == :ok
@@ -4652,18 +4654,18 @@ end
     store = InMemoryWorkerStore()
     rt = WorkerRuntime(store; queues = ["small"])
     # White-box: a two-slot queue, put in place before its first use.
-    get_sequential_queues(rt)["small"] = SequentialQueue(2)
+    get_worker_queues(rt)["small"] = WorkerQueue(2)
     gate = Channel{Nothing}(10)
     try
-        first = submit_sequential_task("small", "k1", () -> take!(gate), Owner("u"); runtime = rt)
+        first = submit_queued_task("small", "k1", () -> take!(gate), Owner("u"); runtime = rt)
         # The processor TOOK the first item, so its slot is free again: two more fit.
         @test wait_for(() -> get_task_status(first, System(); runtime = rt)[:status] == "RUNNING") == :ok
-        submit_sequential_task("small", "k2", () -> take!(gate), Owner("u"); runtime = rt)
-        submit_sequential_task("small", "k3", () -> take!(gate), Owner("u"); runtime = rt)
+        submit_queued_task("small", "k2", () -> take!(gate), Owner("u"); runtime = rt)
+        submit_queued_task("small", "k3", () -> take!(gate), Owner("u"); runtime = rt)
 
         started = time()
         err = try
-            submit_sequential_task("small", "k4", () -> "never", Owner("u"); runtime = rt); nothing
+            submit_queued_task("small", "k4", () -> "never", Owner("u"); runtime = rt); nothing
         catch e
             e
         end
@@ -4674,7 +4676,7 @@ end
         foreach(_ -> put!(gate, nothing), 1:3)
         @test wait_for(() -> all(k -> get_task_status("u::$k", System(); runtime = rt)[:status] == "COMPLETED",
                                  ("k1", "k2", "k3")); timeout = 10.0) == :ok
-        @test wait_for(() -> capacity_idle(rt) && (@atomic get_sequential_queues(rt)["small"].reserved) == 0) == :ok
+        @test wait_for(() -> capacity_idle(rt) && (@atomic get_worker_queues(rt)["small"].reserved) == 0) == :ok
     finally
         foreach(_ -> isready(gate) || put!(gate, nothing), 1:4)
         reset_runtime!(rt)
@@ -4685,19 +4687,19 @@ end
     store = InMemoryWorkerStore()
     rt = WorkerRuntime(store; queues = ["reports"])
     try
-        @test_throws AuthorizationError submit_sequential_task("made-up-name", "k", () -> 1, Owner("u"); runtime = rt)
-        @test !haskey(get_sequential_queues(rt), "made-up-name")    # no queue, no processor
-        ok = submit_sequential_task("reports", "k", () -> "ok", Owner("u"); runtime = rt)
+        @test_throws AuthorizationError submit_queued_task("made-up-name", "k", () -> 1, Owner("u"); runtime = rt)
+        @test !haskey(get_worker_queues(rt), "made-up-name")    # no queue, no processor
+        ok = submit_queued_task("reports", "k", () -> "ok", Owner("u"); runtime = rt)
         @test wait_for(() -> get_task_status(ok, System(); runtime = rt)[:status] == "COMPLETED") == :ok
 
         # `start!` declares what it starts; `reset_runtime!` goes back to the constructor's set.
         app = App(mod = @__MODULE__)
         start!(app; runtime = rt, queues = ["imports"], cleanup_enabled = false, recover_zombies = false)
-        imp = submit_sequential_task(app, "imports", "k", () -> "ok", Owner("u"))
+        imp = submit_queued_task(app, "imports", "k", () -> "ok", Owner("u"))
         @test wait_for(() -> get_task_status(app, imp, System())[:status] == "COMPLETED") == :ok
         uninstall!(app; drain_timeout = 0)
         reset_runtime!(rt)
-        @test_throws AuthorizationError submit_sequential_task("imports", "k2", () -> 1, Owner("u"); runtime = rt)
+        @test_throws AuthorizationError submit_queued_task("imports", "k2", () -> 1, Owner("u"); runtime = rt)
     finally
         reset_runtime!(rt)
     end
@@ -4705,7 +4707,7 @@ end
     # The opt-out.
     open_rt = WorkerRuntime(InMemoryWorkerStore(); allow_undeclared_queues = true)
     try
-        id = submit_sequential_task("anything", "k", () -> "ok", Owner("u"); runtime = open_rt)
+        id = submit_queued_task("anything", "k", () -> "ok", Owner("u"); runtime = open_rt)
         @test wait_for(() -> get_task_status(id, System(); runtime = open_rt)[:status] == "COMPLETED") == :ok
     finally
         reset_runtime!(open_rt)
@@ -4731,8 +4733,8 @@ end
         @test wait_for(() -> get_task_status(nxt, System(); runtime = rt)[:status] == "COMPLETED") == :ok
 
         # The sequential path hands the OWNER's reservation over the same way.
-        qid = submit_sequential_task("q", "slowq", () -> take!(gate), Owner("v"); runtime = rt,
-                                     options = TaskOptions(timeout = 1))
+        qid = submit_queued_task("q", "slowq", () -> take!(gate), Owner("v"); runtime = rt,
+                                 options = TaskOptions(timeout = 1))
         @test wait_for(() -> get_task_status(qid, System(); runtime = rt)[:status] == "FAILED"; timeout = 10.0) == :ok
         @test get(rt.owner_runs, "v", 0) == 1
         put!(gate, nothing)
@@ -4748,14 +4750,14 @@ end
     rt = WorkerRuntime(store; max_concurrent_runs = 1, queues = ["q"])
     gate = Channel{Nothing}(4)
     try
-        slow = submit_sequential_task("q", "slow", () -> take!(gate), Owner("u"); runtime = rt,
-                                      options = TaskOptions(timeout = 1))
+        slow = submit_queued_task("q", "slow", () -> take!(gate), Owner("u"); runtime = rt,
+                                  options = TaskOptions(timeout = 1))
         @test wait_for(() -> get_task_status(slow, System(); runtime = rt)[:status] == "FAILED"; timeout = 10.0) == :ok
         # Still running, so it holds the runtime's only slot...
         @test wait_for(() -> rt.async_runs[] == 1) == :ok
         @test_throws WorkerCapacityError submit_task("async", () -> "x", Owner("u"); runtime = rt)
         # ...and the queue HOLDS its next item instead of starting another callback beside it.
-        next_id = submit_sequential_task("q", "next", () -> "ran", Owner("u"); runtime = rt)
+        next_id = submit_queued_task("q", "next", () -> "ran", Owner("u"); runtime = rt)
         sleep(0.5)
         @test get_task_status(next_id, System(); runtime = rt)[:status] == "PENDING"
 
@@ -4776,7 +4778,7 @@ end
     rt = WorkerRuntime(store; max_concurrent_runs = 2, queues = ["writes"])
     try
         ids = [submit_task("fan-$i", function ()
-                    child = submit_sequential_task("writes", "w-$i", () -> "wrote-$i", Owner("u"); runtime = rt)
+                    child = submit_queued_task("writes", "w-$i", () -> "wrote-$i", Owner("u"); runtime = rt)
                     @assert wait_for(() -> get_task_status(child, System(); runtime = rt)[:status] == "COMPLETED") == :ok
                     return "joined-$i"
                 end, Owner("u"); runtime = rt) for i in 1:2]
@@ -4793,12 +4795,12 @@ end
     rt = WorkerRuntime(store; max_concurrent_runs = 1, queues = ["q"])
     gate = Channel{Nothing}(2)
     try
-        slow = submit_sequential_task("q", "slow", () -> take!(gate), Owner("u"); runtime = rt,
-                                      options = TaskOptions(timeout = 1))
+        slow = submit_queued_task("q", "slow", () -> take!(gate), Owner("u"); runtime = rt,
+                                  options = TaskOptions(timeout = 1))
         @test wait_for(() -> get_task_status(slow, System(); runtime = rt)[:status] == "FAILED"; timeout = 10.0) == :ok
-        held = submit_sequential_task("q", "held", () -> "never", Owner("u"); runtime = rt)
+        held = submit_queued_task("q", "held", () -> "never", Owner("u"); runtime = rt)
         # Taken out of the buffer and parked, so the channel no longer has it.
-        @test wait_for(() -> get_sequential_queues(rt)["q"].held !== nothing) == :ok
+        @test wait_for(() -> !isempty(get_worker_queues(rt)["q"].held)) == :ok
         shutdown!(rt; drain_timeout = 0)
         # Terminal when `shutdown!` returns, not whenever the processor wakes up.
         @test get_task_status(held, System(); runtime = rt)[:status] == "CANCELLED"
@@ -4849,11 +4851,11 @@ end
     rt2 = WorkerRuntime(InMemoryWorkerStore())
     try
         @test_logs (:warn, r"undeclared queue") match_mode = :any begin
-            @test_throws AuthorizationError submit_sequential_task("typo-queue", "k", () -> 1, Owner("u"); runtime = rt2)
+            @test_throws AuthorizationError submit_queued_task("typo-queue", "k", () -> 1, Owner("u"); runtime = rt2)
         end
         # Once per name: the second refusal is silent at the default level.
         @test_logs min_level = Base.CoreLogging.Warn begin
-            @test_throws AuthorizationError submit_sequential_task("typo-queue", "k", () -> 1, Owner("u"); runtime = rt2)
+            @test_throws AuthorizationError submit_queued_task("typo-queue", "k", () -> 1, Owner("u"); runtime = rt2)
         end
     finally
         reset_runtime!(rt2)
@@ -4871,17 +4873,17 @@ end
         @test wait_for(() -> capacity_idle(rt)) == :ok
 
         # Cancelled while queued, so the run is declined at its claim.
-        head = submit_sequential_task("q", "head", () -> take!(gate), Owner("u"); runtime = rt)
+        head = submit_queued_task("q", "head", () -> take!(gate), Owner("u"); runtime = rt)
         @test wait_for(() -> get_task_status(head, System(); runtime = rt)[:status] == "RUNNING") == :ok
-        queued = submit_sequential_task("q", "queued", () -> "never", Owner("u"); runtime = rt)
+        queued = submit_queued_task("q", "queued", () -> "never", Owner("u"); runtime = rt)
         @test cancel_task(queued, Owner("u"); runtime = rt)[:status] == "Task cancelled"
         put!(gate, nothing)
         @test wait_for(() -> capacity_idle(rt)) == :ok
 
         # Abandoned by a teardown while still buffered.
-        head2 = submit_sequential_task("q", "head2", () -> take!(gate), Owner("u"); runtime = rt)
+        head2 = submit_queued_task("q", "head2", () -> take!(gate), Owner("u"); runtime = rt)
         @test wait_for(() -> get_task_status(head2, System(); runtime = rt)[:status] == "RUNNING") == :ok
-        submit_sequential_task("q", "buffered", () -> "never", Owner("u"); runtime = rt)
+        submit_queued_task("q", "buffered", () -> "never", Owner("u"); runtime = rt)
         shutdown!(rt; drain_timeout = 0)
         @test get_task_status("u::buffered", System(); runtime = rt)[:status] == "CANCELLED"
         @test get(rt.owner_runs, "u", 0) == 1          # only head2, still running
@@ -4906,7 +4908,7 @@ end
         end),
         path("/queue", function (req)
             q = getquery(req)
-            return Res.json(Dict("id" => submit_sequential_task(app, q["queue"], q["key"], () -> "ok", Owner(q["uid"]))))
+            return Res.json(Dict("id" => submit_queued_task(app, q["queue"], q["key"], () -> "ok", Owner(q["uid"]))))
         end),
     )
     get_(target) = internalrequest(app, HTTP.Request("GET", target))
@@ -4972,6 +4974,207 @@ end
         @test abandoned[] == 1
     finally
         isready(gate) || put!(gate, nothing)
+    end
+end
+
+@testset "#513: a queue never runs more than its concurrency at once" begin
+    store = InMemoryWorkerStore()
+    rt = WorkerRuntime(store; queues = ["one", "cpu" => 3])
+    gate = Channel{Nothing}(16)
+    active = Threads.Atomic{Int}(0)
+    peak = Threads.Atomic{Int}(0)
+    body = () -> begin
+        Threads.atomic_max!(peak, Threads.atomic_add!(active, 1) + 1)
+        try
+            take!(gate)
+        finally
+            Threads.atomic_sub!(active, 1)
+        end
+        return "done"
+    end
+    try
+        ids = [submit_queued_task("cpu", "k$i", body, Owner("u"); runtime = rt) for i in 1:7]
+        @test wait_for(() -> active[] == 3) == :ok
+        # Held at three, not merely reached three on the way up: the other four wait in the buffer.
+        sleep(0.3)
+        @test active[] == 3
+        status = get_queue_status("cpu", System(); runtime = rt)
+        @test status[:concurrency] == 3
+        @test status[:running] == true
+        @test length(status[:current_tasks]) == 3
+        @test status[:current_tasks] ⊆ ids
+        @test count(id -> get_task_status(id, System(); runtime = rt)[:status] == "PENDING", ids) == 4
+
+        # Each release lets exactly one more start.
+        put!(gate, nothing)
+        @test wait_for(() -> count(id -> get_task_status(id, System(); runtime = rt)[:status] == "COMPLETED", ids) == 1) == :ok
+        @test wait_for(() -> active[] == 3) == :ok
+
+        foreach(_ -> put!(gate, nothing), 1:6)
+        @test wait_for(() -> all(id -> get_task_status(id, System(); runtime = rt)[:status] == "COMPLETED", ids);
+                       timeout = 10.0) == :ok
+        @test peak[] == 3
+        @test get_queue_status("cpu", System(); runtime = rt)[:current_tasks] == String[]
+        @test wait_for(() -> capacity_idle(rt)) == :ok
+
+        # A bare name is concurrency 1: one processor, one item at a time.
+        peak[] = 0
+        ones = [submit_queued_task("one", "o$i", body, Owner("u"); runtime = rt) for i in 1:3]
+        @test wait_for(() -> active[] == 1) == :ok
+        @test length(get_worker_queues(rt)["one"].processors) == 1
+        @test get_queue_status("one", System(); runtime = rt)[:concurrency] == 1
+        foreach(_ -> put!(gate, nothing), 1:3)
+        @test wait_for(() -> all(id -> get_task_status(id, System(); runtime = rt)[:status] == "COMPLETED", ones)) == :ok
+        @test peak[] == 1
+    finally
+        foreach(_ -> isready(gate) || put!(gate, nothing), 1:16)
+        reset_runtime!(rt)
+    end
+end
+
+@testset "#513: queue declarations carry a concurrency, fixed once declared" begin
+    store = InMemoryWorkerStore()
+    rt = WorkerRuntime(store; queues = ["a", "b" => 2, "b" => 2])     # a repeat with one `k` is fine
+    @test rt.declared_queues == Dict("a" => 1, "b" => 2)
+
+    for bad in (["a" => 1, "a" => 2], ["a" => 0], ["a" => -1], ["a" => 1.5], ["a" => true],
+                [:sym], [1 => 2], Any[nothing])
+        @test_throws ArgumentError WorkerRuntime(store; queues = bad)
+    end
+
+    app = App(mod = @__MODULE__)
+    try
+        # A conflicting re-declaration is refused WHOLE: "new" is not declared either.
+        @test_throws ArgumentError start!(app; runtime = rt, queues = ["new" => 2, "b" => 3],
+                                          cleanup_enabled = false, recover_zombies = false)
+        @test !haskey(rt.declared_queues, "new")
+        @test rt.declared_queues["b"] == 2
+
+        # Re-declaring with the SAME concurrency is how `worker_startup` works (build, then hook).
+        start!(app; runtime = rt, queues = ["b" => 2, "c" => 4], cleanup_enabled = false, recover_zombies = false)
+        @test rt.declared_queues["c"] == 4
+        @test length(get_worker_queues(rt)["c"].processors) == 4
+        @test get_worker_queues(rt)["c"].concurrency == 4
+
+        # `startup` refuses a malformed list when the middleware is BUILT, before installing anything.
+        other = App(mod = @__MODULE__)
+        @test_throws ArgumentError worker_startup(other; queues = ["x" => 0], store = InMemoryWorkerStore())
+        @test worker_runtime(other) === nothing
+        # ...and a CONFLICTING one too, against the runtime it was handed.
+        @test_throws ArgumentError worker_startup(other; runtime = rt, queues = ["b" => 5])
+        @test worker_runtime(other) === nothing
+
+        # A refused `start!` neither displaces the runtime already installed nor tears it down.
+        third = App(mod = @__MODULE__)
+        incumbent = WorkerRuntime(InMemoryWorkerStore(); queues = ["kept"])
+        install!(third, incumbent)
+        @test_throws ArgumentError start!(third; runtime = rt, queues = ["b" => 3],
+                                          cleanup_enabled = false, recover_zombies = false)
+        @test worker_runtime(third) === incumbent
+        kept = submit_queued_task(third, "kept", "k", () -> "still serving", Owner("u"))
+        @test wait_for(() -> get_task_status(third, kept, System())[:status] == "COMPLETED") == :ok
+        uninstall!(third; drain_timeout = 0)
+    finally
+        uninstall!(app; drain_timeout = 0)
+    end
+
+    # `reset_runtime!` goes back to the constructor's declarations, concurrency included.
+    reset_runtime!(rt)
+    @test rt.declared_queues == Dict("a" => 1, "b" => 2)
+
+    # An undeclared name, where allowed, runs one at a time.
+    loose = WorkerRuntime(store; allow_undeclared_queues = true)
+    try
+        id = submit_queued_task("anything", "k", () -> "ok", Owner("u"); runtime = loose)
+        @test wait_for(() -> get_task_status(id, System(); runtime = loose)[:status] == "COMPLETED") == :ok
+        @test get_worker_queues(loose)["anything"].concurrency == 1
+        # It is running at 1 now, so declaring it at 4 would be a declaration the queue ignores.
+        @test_throws ArgumentError Nitro.Workers._declare_queues!(loose, ["anything" => 4])
+        @test !haskey(loose.declared_queues, "anything")
+        Nitro.Workers._declare_queues!(loose, ["anything"])        # at its running `k`, it is fine
+        @test loose.declared_queues["anything"] == 1
+    finally
+        reset_runtime!(loose)
+    end
+end
+
+@testset "#513: cancellation, deadlines and the drain hold at concurrency > 1" begin
+    store = InMemoryWorkerStore()
+    rt = WorkerRuntime(store; queues = ["pair" => 2])
+    reasons = Dict{String, Symbol}()
+    reasons_lock = ReentrantLock()
+    # Runs until its token is set, then records why and returns.
+    until_cancelled(name) = function (task_info)
+        while !cancel_requested(task_info)
+            sleep(0.01)
+        end
+        lock(() -> (reasons[name] = cancel_reason(task_info)), reasons_lock)
+        return "stopped"
+    end
+    status(id) = get_task_status(id, System(); runtime = rt)[:status]
+    try
+        a = submit_queued_task("pair", "a", until_cancelled("a"), Owner("u"); runtime = rt)
+        b = submit_queued_task("pair", "b", until_cancelled("b"), Owner("u"); runtime = rt)
+        c = submit_queued_task("pair", "c", until_cancelled("c"), Owner("u"); runtime = rt)
+        @test wait_for(() -> status(a) == "RUNNING" && status(b) == "RUNNING") == :ok
+        @test status(c) == "PENDING"
+
+        # A cancel stops one run and frees its processor for the next item; the other run is untouched.
+        cancel_task(a, Owner("u"); runtime = rt)
+        @test status(a) == "CANCELLED"
+        @test wait_for(() -> status(c) == "RUNNING") == :ok
+        @test status(b) == "RUNNING"
+        @test lock(() -> reasons["a"], reasons_lock) === :user
+
+        # A deadline fires for one item while its neighbour keeps running.
+        cancel_task(c, Owner("u"); runtime = rt)
+        d = submit_queued_task("pair", "d", until_cancelled("d"), Owner("u"); runtime = rt,
+                               options = TaskOptions(timeout = 1))
+        @test wait_for(() -> status(d) == "FAILED"; timeout = 10.0) == :ok
+        @test occursin("Timeout", get_task_status(d, System(); runtime = rt)[:error])
+        @test wait_for(() -> lock(() -> Base.get(reasons, "d", :none), reasons_lock) === :timeout) == :ok
+        @test status(b) == "RUNNING"
+
+        # The drain: both processors' runs are asked to stop and settle, and the backlog behind
+        # them is recorded CANCELLED rather than started.
+        e = submit_queued_task("pair", "e", until_cancelled("e"), Owner("u"); runtime = rt)
+        @test wait_for(() -> status(e) == "RUNNING") == :ok
+        backlog = [submit_queued_task("pair", "z$i", until_cancelled("z$i"), Owner("u"); runtime = rt) for i in 1:3]
+        @test all(id -> status(id) == "PENDING", backlog)
+
+        @test shutdown!(rt; drain_timeout = 5) == true
+        @test lock(() -> (reasons["b"], reasons["e"]), reasons_lock) == (:shutdown, :shutdown)
+        @test all(id -> status(id) == "CANCELLED", backlog)
+        @test all(id -> get_task_status(id, System(); runtime = rt)[:error] == "Cancelled by worker shutdown", backlog)
+        @test lock(() -> !any(k -> startswith(k, "z"), keys(reasons)), reasons_lock)   # never started
+        @test isempty(rt.active_tasks)
+        @test wait_for(() -> capacity_idle(rt)) == :ok
+        @test isempty(get_worker_queues(rt))
+    finally
+        reset_runtime!(rt)
+    end
+end
+
+@testset "#513: shutdown! abandons every item a queue's processors are holding" begin
+    # Two abandoned callbacks fill a cap of two, so each of the queue's two processors takes an
+    # item and holds it (#324). Both have to be found by the teardown, not just the first.
+    store = InMemoryWorkerStore()
+    rt = WorkerRuntime(store; max_concurrent_runs = 2, queues = ["q" => 2])
+    gate = Channel{Nothing}(4)
+    try
+        slow = [submit_queued_task("q", "slow$i", () -> take!(gate), Owner("u"); runtime = rt,
+                                   options = TaskOptions(timeout = 1)) for i in 1:2]
+        @test wait_for(() -> all(id -> get_task_status(id, System(); runtime = rt)[:status] == "FAILED", slow);
+                       timeout = 10.0) == :ok
+        held = [submit_queued_task("q", "held$i", () -> "never", Owner("u"); runtime = rt) for i in 1:2]
+        @test wait_for(() -> length(get_worker_queues(rt)["q"].held) == 2) == :ok
+        shutdown!(rt; drain_timeout = 0)
+        @test all(id -> get_task_status(id, System(); runtime = rt)[:status] == "CANCELLED", held)
+    finally
+        # One release per abandoned callback: both are still parked in `take!`, holding their slots.
+        foreach(_ -> put!(gate, nothing), 1:2)
+        @test wait_for(() -> capacity_idle(rt)) == :ok
+        reset_runtime!(rt)
     end
 end
 

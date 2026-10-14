@@ -2,7 +2,7 @@
     WorkerRuntime(store::AbstractWorkerStore; max_concurrent_runs=64, max_runs_per_owner=nothing,
                   allow_undeclared_queues=false, queues=String[])
 
-The live half of the worker subsystem: the sequential queues and their processor `Task`s, the
+The live half of the worker subsystem: the declared queues and their processor `Task`s, the
 cleanup scheduler, and the process-local handles for runs executing **right now**.
 
 # Limits ([#324](https://github.com/PingoLee/Nitro.jl/issues/324))
@@ -11,22 +11,33 @@ Worker runs execute on the `:default` thread pool, the same pool that serves HTT
 unbounded runtime lets one caller take the server down by submitting fresh keys. Each limit
 refuses a submission **before anything is written**, with a [`WorkerCapacityError`](@ref):
 
-- `max_concurrent_runs` (default `64`): async runs (`submit_task`) in flight at once, runtime-wide
-  (Sidekiq's concurrency, River's `MaxWorkers`). Past it, `:runtime`, a `503`. `nothing` removes
-  the cap. A run counts until its callback actually returns, including one abandoned by
-  `TaskOptions(timeout=…)`, because it still holds a thread. A **sequential** callback abandoned by
-  its deadline counts too. When abandoned sequential callbacks alone fill the cap, the sequential
-  queues hold their next item rather than start another beside them; ordinary async load never
-  holds a queue.
+- `max_concurrent_runs` (default `64`): async runs (`submit_task`) in flight at once, runtime-wide.
+  Past it, `:runtime`, a `503`. `nothing` removes the cap. **It is an I/O-shaped number**: 64
+  callbacks that mostly wait on a database or an HTTP call cost little, but 64 that compute fill
+  every `:default` thread many times over, and request handlers run on those threads too. Put
+  CPU-bound work on a queue with a concurrency instead (below). A run counts until its callback
+  actually returns, including one abandoned by `TaskOptions(timeout=…)`, because it still holds a
+  thread. A **queued** callback abandoned by its deadline counts too. When abandoned queued
+  callbacks alone fill the cap, the queues hold their next item rather than start another beside
+  them; ordinary async load never holds a queue.
+- **A queue's concurrency** ([#513](https://github.com/PingoLee/Nitro.jl/issues/513)):
+  `queues = ["email", "compute" => 6]` runs at most six `"compute"` items at once, and a bare name
+  means one at a time. That is the bulkhead for CPU-bound jobs (Sidekiq's per-queue concurrency,
+  River's `MaxWorkers`): the class can never take more than `k` threads. A queue's running items
+  count toward `max_runs_per_owner` but **not** toward `max_concurrent_runs`. Counting them there
+  would let async load stall every queue, and an async callback that waits on an item it queued
+  would deadlock at the cap. A submit past `k` waits in the queue's buffer.
 - `max_runs_per_owner` (default `nothing`, off): one owner's live runs across both submit paths,
   queued or executing. Past it, `:owner`, a `429`. It counts this runtime's runs only; it is not
   a deployment-wide quota.
-- Every sequential queue refuses a submit once its buffer is full (`:queue`, a `503`), rather
-  than blocking the submitting request in `put!`.
+- Every queue refuses a submit once its buffer is full (`:queue`, a `503`), rather than blocking
+  the submitting request in `put!`.
 - **Queue names must be declared**: here through `queues`, or through `start!(…; queues)` /
   `worker_startup(app; queues)`. A submit to any other name is an `AuthorizationError` (a `403`)
-  unless `allow_undeclared_queues = true`. Each queue name mints a processor task for the life of
-  the runtime, so a handler that took the name from request data used to mint one per name.
+  unless `allow_undeclared_queues = true`, which runs an undeclared name at concurrency 1. Each
+  queue name mints its processor tasks for the life of the runtime, so a handler that took the name
+  from request data used to mint one per name. Declaring a name twice with two different
+  concurrencies is an `ArgumentError`; a queue's concurrency is fixed once declared.
 
 The declared set bounds which processors this runtime will run. It is a resource bound, not
 authorization: who may submit to a declared queue is still the store's queue authorizer.
@@ -62,11 +73,11 @@ data and the tenant, so two runtimes over one store correctly share one security
 | Field | What it holds |
 |---|---|
 | `store` | The backend. Concrete via the type parameter, so store calls stay statically dispatched |
-| `sequential_queues` / `queue_lock` | `SequentialQueue` per queue name, each owning a `Channel` and a processor `Task` |
+| `worker_queues` / `queue_lock` | `WorkerQueue` per queue name, each owning a `Channel` and up to its concurrency of processor `Task`s |
 | `cleanup_scheduler` | The retention sweep, or `nothing` |
 | `active_tasks` / `active_task_infos` / `active_lock` | Process-local run handles. Keyed by task id, but each entry describes one **run**. [`shutdown!`](@ref) drains against these and keeps whatever outlives the wait (#176) |
 | `max_concurrent_runs` / `max_runs_per_owner` / `allow_undeclared_queues` | The limits above, fixed at construction |
-| `declared_queues` / `initial_queues` / `warned_queues` | The queue names a submit may use (under `queue_lock`), the constructor's set, which `reset_runtime!` restores, and the undeclared names already logged (bounded) |
+| `declared_queues` / `initial_queues` / `warned_queues` | The queue names a submit may use and each one's concurrency (under `queue_lock`), the constructor's declarations, which `reset_runtime!` restores, and the undeclared names already logged (bounded) |
 | `reservations` / `owner_runs` / `async_runs` / `abandoned_runs` / `reservation_lock` | One entry per live run, keyed by `run_id` and tagged `:async`, `:queued` or `:abandoned`, and the counts the limits read. `reservation_lock` is a leaf: nothing else is locked, and no store or app code runs, while it is held |
 
 `active_task_infos` is the live-`TaskInfo` cache, and it lives here for **both** backends. It was
@@ -82,7 +93,7 @@ object it read from the store, and for `InMemoryWorkerStore` that object *is*
 struct WorkerRuntime{S <: AbstractWorkerStore}
     store::S
 
-    sequential_queues::Dict{String, SequentialQueue}
+    worker_queues::Dict{String, WorkerQueue}
     queue_lock::ReentrantLock
 
     cleanup_scheduler::Ref{Union{Nothing, CleanupScheduler}}
@@ -95,32 +106,32 @@ struct WorkerRuntime{S <: AbstractWorkerStore}
     max_concurrent_runs::Union{Nothing, Int}
     max_runs_per_owner::Union{Nothing, Int}
     allow_undeclared_queues::Bool
-    initial_queues::Vector{String}
-    declared_queues::Set{String}
+    initial_queues::Vector{Pair{String, Int}}
+    declared_queues::Dict{String, Int}               # name => concurrency (#513)
     warned_queues::Set{String}                       # undeclared names already warned about
 
-    # run_id => (owner, kind). `kind` is `:async` (a `submit_task` run), `:queued` (a sequential
-    # item, queued or executing), or `:abandoned` (a sequential callback its deadline gave up on,
+    # run_id => (owner, kind). `kind` is `:async` (a `submit_task` run), `:queued` (a queued
+    # item, queued or executing), or `:abandoned` (a queued callback its deadline gave up on,
     # still holding a thread).
     reservations::Dict{UUID, Tuple{String, Symbol}}
     owner_runs::Dict{String, Int}
     async_runs::Base.RefValue{Int}       # :async + :abandoned -- what `max_concurrent_runs` admits against
-    abandoned_runs::Base.RefValue{Int}   # :abandoned alone -- what holds the sequential queues
+    abandoned_runs::Base.RefValue{Int}   # :abandoned alone -- what holds the queues
     reservation_lock::ReentrantLock
 
     function WorkerRuntime(store::S;
                            max_concurrent_runs::Union{Nothing, Integer} = 64,
                            max_runs_per_owner::Union{Nothing, Integer} = nothing,
                            allow_undeclared_queues::Bool = false,
-                           queues::AbstractVector{<:AbstractString} = String[]) where {S <: AbstractWorkerStore}
+                           queues::AbstractVector = String[]) where {S <: AbstractWorkerStore}
         for (name, value) in ((:max_concurrent_runs, max_concurrent_runs), (:max_runs_per_owner, max_runs_per_owner))
             value === nothing || value >= 1 ||
                 throw(ArgumentError("`$name` must be at least 1 or `nothing`, got $value"))
         end
-        initial = String.(collect(queues))
+        initial = _queue_specs(queues)
         return new{S}(
             store,
-            Dict{String, SequentialQueue}(),
+            Dict{String, WorkerQueue}(),
             ReentrantLock(),
             Ref{Union{Nothing, CleanupScheduler}}(nothing),
             Dict{String, Task}(),
@@ -130,7 +141,7 @@ struct WorkerRuntime{S <: AbstractWorkerStore}
             max_runs_per_owner === nothing ? nothing : Int(max_runs_per_owner),
             allow_undeclared_queues,
             initial,
-            Set{String}(initial),
+            Dict{String, Int}(initial),
             Set{String}(),
             Dict{UUID, Tuple{String, Symbol}}(),
             Dict{String, Int}(),
@@ -145,19 +156,94 @@ end
 # Capacity (#324)
 # ============================================================================
 
-# Declare queue names a submit may use. `start!(…; queues)` and `startup` call it; the second one
-# does so when the middleware is BUILT, so the startup window cannot refuse a declared queue.
-function _declare_queues!(runtime::WorkerRuntime, names)
+# One `queues` entry, normalized: a bare name is concurrency 1, `name => k` is concurrency `k`
+# (#513). Configuration, not the request path, so the loose element type is fine here; it is
+# narrowed to `Pair{String, Int}` before anything stores it.
+_queue_spec(name::AbstractString) = _queue_spec(name => 1)
+function _queue_spec(spec::Pair)
+    name, k = spec
+    name isa AbstractString || throw(ArgumentError(
+        "a queue declaration is a name or `name => concurrency`; got a $(typeof(name)) name in $(repr(spec))"))
+    k isa Integer && !(k isa Bool) || throw(ArgumentError(
+        "queue \"$name\": the concurrency must be an integer, got $(repr(k))"))
+    k >= 1 || throw(ArgumentError("queue \"$name\": the concurrency must be at least 1, got $k"))
+    return String(name) => Int(k)
+end
+_queue_spec(other) = throw(ArgumentError(
+    "a queue declaration is a name or `name => concurrency`, like `[\"email\", \"compute\" => 4]`; " *
+    "got $(repr(other))"))
+
+# The whole `queues` list, normalized, with a name listed twice under two concurrencies refused.
+# The same name twice with one concurrency is harmless, and is kept once.
+function _queue_specs(queues::AbstractVector)
+    specs = Pair{String, Int}[]
+    seen = Dict{String, Int}()
+    for entry in queues
+        name, k = _queue_spec(entry)
+        previous = Base.get(seen, name, nothing)
+        if previous === nothing
+            seen[name] = k
+            push!(specs, name => k)
+        elseif previous != k
+            throw(ArgumentError("queue \"$name\" is declared twice, with concurrency $previous and $k"))
+        end
+    end
+    return specs
+end
+
+# Declare queue names a submit may use, with their concurrency. `start!(…; queues)` and `startup`
+# call it; the second one does so when the middleware is BUILT, so the startup window cannot refuse
+# a declared queue.
+#
+# Re-declaring a name with ANOTHER concurrency is refused rather than applied: a queue's processors
+# may already be running at the old `k`, and `startup` declares the same list twice (at build time
+# and again from `on_startup`), so the only consistent rule is that a declaration is fixed once made.
+# Every name is checked before any is written, so a refused call declares nothing.
+function _declare_queues!(runtime::WorkerRuntime, queues::AbstractVector)
+    specs = _queue_specs(queues)
     lock(runtime.queue_lock) do
-        foreach(name -> push!(runtime.declared_queues, String(name)), names)
+        _check_queue_declarations_locked(runtime, specs)
+        for (name, k) in specs
+            runtime.declared_queues[name] = k
+        end
     end
     return runtime
 end
 
-function _queue_declared(runtime::WorkerRuntime, name::String)
-    runtime.allow_undeclared_queues && return true
-    return lock(() -> name in runtime.declared_queues, runtime.queue_lock)
+# Refuse `specs` if any name already has another concurrency on `runtime`: in its declarations, or
+# in a live queue. The second case is a queue minted UNDECLARED (`allow_undeclared_queues`, which
+# runs at 1) that a later `start!` declares at another `k` -- recording the new `k` would leave a
+# declaration the running queue silently ignores. `start!` and `startup` also call this BEFORE they
+# install a runtime, so a refused declaration neither installs one nor displaces the old one.
+function _check_queue_declarations(runtime::WorkerRuntime, specs::Vector{Pair{String, Int}})
+    lock(() -> _check_queue_declarations_locked(runtime, specs), runtime.queue_lock)
+    return nothing
 end
+
+function _check_queue_declarations_locked(runtime::WorkerRuntime, specs::Vector{Pair{String, Int}})
+    for (name, k) in specs
+        declared = Base.get(runtime.declared_queues, name, k)
+        declared == k || throw(ArgumentError(
+            "queue \"$name\" is already declared on this runtime with concurrency $declared; " *
+            "it cannot be re-declared with $k"))
+        live = Base.get(runtime.worker_queues, name, nothing)
+        live === nothing || live.concurrency == k || throw(ArgumentError(
+            "queue \"$name\" is already running on this runtime with concurrency " *
+            "$(live.concurrency) (it was first used undeclared); it cannot be declared with $k"))
+    end
+    return nothing
+end
+
+# The concurrency a submit to `name` runs at, or `nothing` when the name may not be used.
+# `allow_undeclared_queues` runs an undeclared name one at a time, which is what every queue was
+# before #513.
+function _declared_concurrency(runtime::WorkerRuntime, name::String)
+    k = lock(() -> Base.get(runtime.declared_queues, name, nothing), runtime.queue_lock)
+    k === nothing && runtime.allow_undeclared_queues && return 1
+    return k
+end
+
+_queue_declared(runtime::WorkerRuntime, name::String) = _declared_concurrency(runtime, name) !== nothing
 
 const _UNDECLARED_QUEUE_WARNINGS = 16
 
@@ -183,7 +269,7 @@ end
 # A slot in `queue`'s buffer, as a compare-and-set loop on its counter -- no lock, because the
 # caller holds `lock_tasks`, and `queue_lock` may not be taken inside that (`get_queue_status`
 # holds `queue_lock` while it lists under the store's lock).
-function _reserve_queue_slot!(queue::SequentialQueue)
+function _reserve_queue_slot!(queue::WorkerQueue)
     while true
         n = @atomic queue.reserved
         n >= queue.capacity && return false
@@ -193,7 +279,7 @@ end
 
 # Floored at zero: a hand-made `put!` (tests do it, white-box) takes a slot nobody reserved, and a
 # counter driven negative would let the next submissions reserve more than the buffer holds.
-function _release_queue_slot!(queue::SequentialQueue)
+function _release_queue_slot!(queue::WorkerQueue)
     while true
         n = @atomic queue.reserved
         n <= 0 && return nothing
@@ -241,7 +327,7 @@ end
 # The reservation for a run about to be minted, in the order that keeps a refusal side-effect free:
 # the queue slot (atomics only) first, then the owner and runtime counts, and the queue slot is
 # handed back if those refuse. `queue === nothing` is the async path.
-function _reserve_capacity!(runtime::WorkerRuntime, queue::Union{Nothing, SequentialQueue},
+function _reserve_capacity!(runtime::WorkerRuntime, queue::Union{Nothing, WorkerQueue},
                             run_id::UUID, owner::String)
     if queue !== nothing && !_reserve_queue_slot!(queue)
         throw(WorkerCapacityError(:queue, "the queue is full; retry once it drains"))
@@ -255,7 +341,7 @@ function _reserve_capacity!(runtime::WorkerRuntime, queue::Union{Nothing, Sequen
     return nothing
 end
 
-# A sequential run abandoned by its deadline keeps a thread until its callback returns, so from
+# A queued run abandoned by its deadline keeps a thread until its callback returns, so from
 # then on it counts against `max_concurrent_runs` like an async run (`:queued -> :abandoned`), and
 # `_release_run!` gives both counts back with the owner's when the callback returns. A no-op if the
 # reservation is already gone (the callback returned first) or is not a queued one.
@@ -271,9 +357,9 @@ function _count_abandoned!(runtime::WorkerRuntime, run_id::UUID)
     return nothing
 end
 
-# Whether the sequential processors must hold their next item: when abandoned SEQUENTIAL callbacks
+# Whether the queue processors must hold their next item: when abandoned QUEUED callbacks
 # alone fill the runtime cap. Deliberately not the total async load. Keyed on that, one owner filling
-# the async slots stalled every tenant's queues, and async callbacks that wait on a sequential item
+# the async slots stalled every tenant's queues, and async callbacks that wait on a queued item
 # they submitted deadlocked outright at the cap -- queues used to run independently of async load,
 # and they still do. This bounds only what a queue itself piles up: one abandoned callback per
 # deadline, which nothing else would stop.
@@ -283,7 +369,7 @@ function _abandoned_saturated(runtime::WorkerRuntime)
     return lock(() -> runtime.abandoned_runs[] >= cap, runtime.reservation_lock)
 end
 
-function _release_capacity!(runtime::WorkerRuntime, queue::Union{Nothing, SequentialQueue}, run_id::UUID)
+function _release_capacity!(runtime::WorkerRuntime, queue::Union{Nothing, WorkerQueue}, run_id::UUID)
     queue === nothing || _release_queue_slot!(queue)
     _release_run!(runtime, run_id)
     return nothing
@@ -296,7 +382,7 @@ The backend this runtime reads and writes records through.
 """
 worker_store(runtime::WorkerRuntime) = runtime.store
 
-get_sequential_queues(runtime::WorkerRuntime) = runtime.sequential_queues
+get_worker_queues(runtime::WorkerRuntime) = runtime.worker_queues
 get_queue_lock(runtime::WorkerRuntime) = runtime.queue_lock
 get_cleanup_scheduler(runtime::WorkerRuntime) = runtime.cleanup_scheduler
 
@@ -620,11 +706,11 @@ end
 # for both shapes:
 #
 #   - The ASYNC path registers the run's OWN spawned task (`_execute_task_async`).
-#   - The SEQUENTIAL path registers `current_task()` -- the long-lived, SHARED queue processor
+#   - The QUEUED path registers `current_task()` -- one of the long-lived, SHARED queue processors
 #     (`_execute_queued_task`). `istaskdone` on that is true only once the processor has finished
 #     this item, drained every item still buffered behind it, and broken out of `take!`, so here
 #     the info clause is not merely first but *necessary*: narrowing this predicate to
-#     `istaskdone` alone would turn every sequential teardown into a full-timeout stall.
+#     `istaskdone` alone would turn every queue teardown into a full-timeout stall.
 #
 # **`istaskdone` is the backstop, not the probe.** It decides only for a handle whose info nothing
 # will ever remove -- the `register_active_task!` / `register_active_task_info!` pair, which has no
@@ -636,7 +722,7 @@ end
 # The info clause reads "this run no longer owns its key", not "the callback returned" -- a run
 # displaced mid-drain by a re-run (`replace_task!` evicts both caches) settles here while its
 # callback is still going. That is correct: the drain no longer owns that run, and in the
-# sequential case cannot even find its handle.
+# queued case cannot even find its handle.
 function _run_settled(runtime::WorkerRuntime, entry::DrainEntry)
     istaskdone(entry.task) && return true
     return lock(runtime.active_lock) do
@@ -684,7 +770,7 @@ end
     shutdown!(runtime::WorkerRuntime; drain_timeout = WORKER_DRAIN_TIMEOUT_SECONDS) -> Bool
 
 Release everything this process is running: stop the cleanup scheduler, close and discard the
-sequential queues — recording their unstarted backlog as `CANCELLED` rather than executing it —
+declared queues — recording their unstarted backlog as `CANCELLED` rather than executing it —
 then **drain** the runs still executing here, asking them to stop, waiting up to `drain_timeout`
 seconds, and releasing the handles of the ones that finished.
 
@@ -745,7 +831,7 @@ task with no deadline of its own, and that happens first. A scheduler task that 
 logged there, not rethrown, so the teardown below it always runs
 ([#193](https://github.com/PingoLee/Nitro.jl/issues/193)).
 
-# The sequential backlog is abandoned, not executed (#182)
+# A queue's backlog is abandoned, not executed (#182)
 
 Closing a queue's channel stops new *submissions*; it never stopped the **processor**, which kept
 `take!`-ing whatever was already buffered. So a teardown used to start runs that were never in the
@@ -827,7 +913,7 @@ function shutdown!(runtime::WorkerRuntime; drain_timeout::Real = WORKER_DRAIN_TI
     #      order leaves a window for a submit between the collect and the close.
     abandoned_items = lock(runtime.queue_lock) do
         pending = Vector{QueueItem}()
-        for queue in values(runtime.sequential_queues)
+        for queue in values(runtime.worker_queues)
             @atomic queue.draining = true
             if isopen(queue.channel)
                 close(queue.channel)
@@ -855,16 +941,20 @@ function shutdown!(runtime::WorkerRuntime; drain_timeout::Real = WORKER_DRAIN_TI
                 end
                 push!(pending, item)
             end
-            # ...and the one item a processor has already taken but is holding back while
-            # abandoned sequential callbacks fill the cap (#324). Left in place: the processor
-            # clears it, and its own abandon on waking finds the record already terminal.
-            queue.held === nothing || push!(pending, queue.held)
+            # ...and the items processors have already taken but are holding back while abandoned
+            # queued callbacks fill the cap (#324), one per processor at most. Left in place: each
+            # processor removes its own, and its own abandon on waking finds the record already
+            # terminal.
+            append!(pending, queue.held)
 
-            queue.running = false
-            queue.current_task = nothing
-            queue.processor_task = nothing
+            # The processors themselves are not waited for here: each one is either about to see
+            # `draining` or the closed channel, or is executing an item, which is a run the drain
+            # below snapshots like any other. Each removes itself on the way out, and a missing
+            # entry is fine.
+            empty!(queue.processors)
+            empty!(queue.current_tasks)
         end
-        empty!(runtime.sequential_queues)
+        empty!(runtime.worker_queues)
         return pending
     end
 
@@ -1014,7 +1104,7 @@ function reset_runtime!(runtime::WorkerRuntime=default_runtime(); drain_timeout:
     end
     lock(runtime.queue_lock) do
         empty!(runtime.declared_queues)
-        union!(runtime.declared_queues, runtime.initial_queues)
+        merge!(runtime.declared_queues, Dict(runtime.initial_queues))
     end
 
     clear_records!(runtime.store)

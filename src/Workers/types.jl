@@ -6,13 +6,13 @@ current_time_utc() = Dates.now(Dates.UTC)
     DEFAULT_QUEUE_NAME
 
 Queue name that [`submit_task`](@ref) authorizes against. Unqueued tasks do not
-run through a `SequentialQueue`, but they are still submissions, so they are
+run through a `WorkerQueue`, but they are still submissions, so they are
 still subject to the store's queue authorizer — under this name, following the
 default-queue convention every comparable queue uses (Sidekiq `default`, River
 `QueueDefault`).
 
 A `TaskInfo.queue_name` stays `nothing` for these tasks: that field records the
-*sequential* queue a task belongs to, and an unqueued task belongs to none.
+*declared* queue a task belongs to, and an unqueued task belongs to none.
 """
 const DEFAULT_QUEUE_NAME = "default"
 
@@ -68,7 +68,7 @@ deadline.
 
 Task-local storage is per-task and is **not** inherited by a spawned child, so two runs can never
 see each other's marker. It is **not** enough on its own to keep the marker current, though: a
-sequential queue processor with `TaskOptions(timeout=0)` runs many callbacks on one long-lived
+queue processor with `TaskOptions(timeout=0)` runs many callbacks on one long-lived
 task, so `_invoke_task_callback` saves and restores the previous value around each invocation.
 Staleness is prevented by that `finally`, not by the language — do not remove it on the theory that
 one task runs one callback.
@@ -459,21 +459,44 @@ struct QueueItem
     end
 end
 
-mutable struct SequentialQueue
+# A declared queue: one buffer drained by up to `concurrency` processor tasks (#513).
+#
+# **`concurrency` is a bulkhead, not a throughput knob.** Every processor runs on `:default`, the
+# pool that also runs every request handler, and Julia 1.12 has no preemption (#467), so a queue of
+# CPU-bound jobs with `k` processors can hold at most `k` of those threads -- the rest stay free for
+# handlers by construction. That is Sidekiq's per-queue concurrency and River's `MaxWorkers`.
+#
+# `k = 1` is the strict FIFO queue this type used to be (`SequentialQueue`). With `k > 1` items still
+# START in FIFO order, since every processor `take!`s from the one channel, but they finish in
+# whatever order they finish. Nothing else changes with `k`: each processor runs its item through
+# the same `_execute_queued_task`, so the claim, the `run_id` fences, cancellation, deadlines and the
+# teardown drain hold per item exactly as they do for one. A stale item and its successor can now
+# execute side by side on two processors of one queue, which is the async path's ordinary case and
+# is what `_claim_run!` takes `lock_tasks` for (#191, #198).
+#
+# There used to be an `exec_lock` held around each execution. With one processor it serialized
+# nothing that the processor loop did not already serialize, and with `k` it would serialize the
+# processors back into one, so it is gone.
+mutable struct WorkerQueue
     channel::Channel{QueueItem}
-    running::Bool
-    current_task::Union{Nothing, String}
-    exec_lock::ReentrantLock
-    processor_task::Union{Nothing, Task}
+    const concurrency::Int
+    # The live processor tasks, at most `concurrency` of them, under `queue_lock`. A processor
+    # removes itself in its `finally`, so `!isempty(processors)` is "this queue is running", and
+    # `_start_queue_processor` tops the set back up to `concurrency` on the next submit.
+    processors::Vector{Task}
+    # The task ids the processors are executing right now, one entry per busy processor, under
+    # `queue_lock`. A list, not a set: two processors can hold items for one key at once (a stale
+    # item and its successor), and each removes only its own entry.
+    current_tasks::Vector{String}
     # Set by `shutdown!` before it closes the channel: this queue is being torn down, so the
     # processor must record whatever it has already taken as abandoned rather than start it
     # ([#182](https://github.com/PingoLee/Nitro.jl/issues/182)).
     #
     # **On the QUEUE, not on the runtime**, and that placement is the whole design. A
     # runtime-level flag would have to be RESET for the documented shutdown-then-reuse case, and
-    # the reset races a concurrent `submit_sequential_task` -- clearing it mid-teardown re-opens
+    # the reset races a concurrent `submit_queued_task` -- clearing it mid-teardown re-opens
     # exactly the window this closes. `shutdown!` empties the queue registry, so a reused runtime
-    # mints fresh `SequentialQueue`s that are not draining *by construction*, and the only reader
+    # mints fresh `WorkerQueue`s that are not draining *by construction*, and the only reader
     # of a dead queue's flag is its own processor, which is precisely who should see it.
     #
     # `@atomic` because the writer is `shutdown!` and the reader is the processor task.
@@ -485,17 +508,20 @@ mutable struct SequentialQueue
     # `capacity` is stored rather than read back off the `Channel`'s internals.
     capacity::Int
     @atomic reserved::Int
-    # The item the processor has TAKEN but is holding back while abandoned sequential callbacks
-    # fill the runtime cap (#324), under `queue_lock`. It is out of the channel, so `shutdown!`'s
-    # collect step would miss it, and it would be abandoned only after the teardown had returned --
-    # PENDING forever on a persistent store if the process exits first (the #182 orphan). So
-    # `shutdown!` collects it from here too; both abandons are the same idempotent CAS.
-    held::Union{Nothing, QueueItem}
+    # The items the processors have TAKEN but are holding back while abandoned queued callbacks
+    # fill the runtime cap (#324), at most one per processor, under `queue_lock`. They are out of
+    # the channel, so `shutdown!`'s collect step would miss them, and they would be abandoned only
+    # after the teardown had returned -- PENDING forever on a persistent store if the process exits
+    # first (the #182 orphan). So `shutdown!` collects them from here too; both abandons are the
+    # same idempotent CAS.
+    held::Vector{QueueItem}
 
-    function SequentialQueue(size::Int=100)
-        size >= 1 || throw(ArgumentError("SequentialQueue size must be at least 1, got $size"))
-        return new(Channel{QueueItem}(size), false, nothing, ReentrantLock(), nothing, false, size, 0,
-                   nothing)
+    function WorkerQueue(size::Int=100; concurrency::Int=1)
+        size >= 1 || throw(ArgumentError("WorkerQueue size must be at least 1, got $size"))
+        concurrency >= 1 || throw(ArgumentError(
+            "WorkerQueue concurrency must be at least 1, got $concurrency"))
+        return new(Channel{QueueItem}(size), concurrency, Task[], String[], false, size, 0,
+                   QueueItem[])
     end
 end
 
