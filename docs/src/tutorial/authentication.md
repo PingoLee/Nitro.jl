@@ -214,8 +214,8 @@ The rules:
     exists to prevent.
   * **The factory shapes the refusal, it does not decide it.** It must return an
     `HTTP.Response`. Anything else — `nothing`, a `Dict` meant as the body — is an error and a
-    `500`, never an admission: a guard that returns something other than a response would
-    otherwise *admit* the request.
+    `500`, never an admission. A factory returning `nothing` would otherwise turn the denial into
+    an admission. The same rule covers a guard's own result (§6 below).
   * **It takes `(req, reason)`.** A one-argument function is an `ArgumentError` when the
     middleware or guard is built, at startup.
   * **Return a fresh response or a `const` one**, as the defaults do — never one you mutate later;
@@ -635,6 +635,25 @@ its routes. See the service-token section of [Sessions & Auth](sessions_and_auth
 
 Guards are per-route checks composed with `GuardMiddleware(guards...)`; each either
 returns `nothing` (pass) or a response (deny). They run after auth middleware, in order.
+
+**Anything else a guard returns is an error, never an admission** (#519). `GuardMiddleware`
+throws an `ArgumentError` naming the guard and the result's type, not its value. The server
+answers it with a `500`, and the handler does not run. That matters most for the guards you write
+yourself, where the natural mistakes all *look* like denials:
+
+```julia
+# ✗ each of these is a 500 -- before #519 each one ADMITTED the request
+only_admins = req -> getuser(req)["role"] == "admin"                                   # false
+only_admins = req -> getuser(req)["role"] == "admin" ? nothing : Dict("error" => "forbidden")
+only_admins = req -> getuser(req)["role"] == "admin" ? nothing : 403
+
+# ✓ nothing to admit, a response to deny
+only_admins = req -> getuser(req)["role"] == "admin" ? nothing :
+                     Res.json(Dict("error" => "forbidden"); status = 403)
+```
+
+For a claim check like this one, prefer the shipped `role_required("admin")`, which also handles
+the claim sources and session fallback below.
 
 | Guard | Passes when | Denies with |
 |---|---|---|

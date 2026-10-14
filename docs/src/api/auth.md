@@ -3,7 +3,8 @@
 ## Guards
 
 A guard is a `req -> Union{Nothing, HTTP.Response}` that admits a request (`nothing`) or denies it
-(a response). [`GuardMiddleware`](@ref) turns a list of guards into a middleware; put it after the
+(a response). Any other result is an error and a `500`, never an admission.
+[`GuardMiddleware`](@ref) turns a list of guards into a middleware; put it after the
 authentication middleware that sets `getuser(req)`. The walkthrough is in [Sessions and Auth](@ref).
 
 ```@docs

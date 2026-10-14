@@ -13,8 +13,8 @@ export GuardMiddleware, login_required, role_required, permission_required,
 # allocation-free. Contract: 401 = unauthenticated (auth middleware), 403 = authenticated
 # but not authorized (guards), 302 = browser redirect (`login_required`). That contract is the
 # default: every guard takes a `denied` factory (#515), and an app whose clients only handle a
-# `401` may answer a wrong-`kid` token with one. `_deny` checks what the factory returns,
-# because a guard returning anything but a response ADMITS the request.
+# `401` may answer a wrong-`kid` token with one. `_deny` checks what the factory returns, so a
+# factory that answers no response is an error at the factory, not a mystery at the guard.
 const FORBIDDEN = HTTP.Response(403, "Forbidden")
 
 # The default `denied` of the claim and kid guards.
@@ -27,6 +27,16 @@ Turn authorization guards into a route or global middleware. Each guard is a
 `req -> Union{Nothing, HTTP.Response}`: `nothing` admits the request, and a response denies it
 and is returned as-is. Guards run in order and the first denial short-circuits the rest and the
 handler.
+
+**Any other result is an error, never an admission.** A guard that returns `false`, a `Dict`, a
+status code or a message throws an `ArgumentError` naming the guard and the result's type. The server
+answers that with a `500`, and the handler does not run:
+
+```julia
+only_admins = req -> getuser(req)["role"] == "admin"                     # ✗ `false` is a 500
+only_admins = req -> getuser(req)["role"] == "admin" ? nothing :
+                     Res.json(Dict("error" => "forbidden"); status = 403) # ✓
+```
 
 ```julia
 path("/admin/reports", reports;
@@ -50,15 +60,31 @@ anything but an `HTTP.Response` is an error, not an admission.
 function GuardMiddleware(guards::Function...)
 	return function(handle::Function)
 		return function(req::HTTP.Request)
+			# A counter, not `enumerate`: over a tuple of five or more distinct closures,
+			# `enumerate` allocates per request where the plain loop did not.
+			position = 0
 			for guard in guards
+				position += 1
 				result = guard(req)
-				if result isa HTTP.Response
-					return result
-				end
+				result === nothing && continue
+				result isa HTTP.Response && return result
+				_refuse_guard_result(position, guard, result)
 			end
 			return handle(req)
 		end
 	end
+end
+
+# Fail closed (#519): the same rule `_deny` applies to a denial factory, applied to every guard.
+# A guard that "denies" with `false`, a `Dict` it meant to serialize, a status `Int` or a message
+# `String` used to ADMIT the request. Now it is an error, which the server answers with a 500; the
+# handler never runs. The message names the guard and the result's type NAME only -- the value is
+# whatever the application put in it, and a full type can carry a value as a parameter
+# (`Val{secret}`), so `nameof(typeof(result))` rather than `typeof(result)`.
+@noinline function _refuse_guard_result(position::Int, guard::Function, result)
+	throw(ArgumentError("GuardMiddleware: guard #$position ($(nameof(guard))) returned a " *
+	                    "$(nameof(typeof(result))); a guard must return `nothing` to admit the request " *
+	                    "or an `HTTP.Response` to deny it"))
 end
 
 # Claims resolution for the claim guards. Mirrors `_request_kid`'s two-slot lookup: a

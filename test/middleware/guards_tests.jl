@@ -543,6 +543,102 @@ end
 
 end
 
+@testitem "GuardMiddleware fails closed on a non-response guard result (#519)" tags=[:middleware, :auth, :security] setup=[NitroCommon] begin
+using HTTP
+using Nitro
+
+# A guard runs, and a handler that records whether it was reached.
+function guarded(guards...)
+    ran = Ref(false)
+    return GuardMiddleware(guards...)(_ -> (ran[] = true; HTTP.Response(200, "handler"))), ran
+end
+
+# Every one of these LOOKS like a denial, and every one of them used to admit the request.
+@testset "a guard that 'denies' with $(typeof(bad)) is an error -- the handler never runs" for bad in (
+        false, true, Dict("error" => "forbidden"), "forbidden", 403, :forbidden, missing)
+    handler, ran = guarded(_ -> bad)
+    @test_throws ArgumentError handler(HTTP.Request("GET", "/"))
+    @test !ran[]
+end
+
+@testset "the contract that stays: `nothing` admits, a response denies as-is" begin
+    handler, ran = guarded(_ -> nothing)
+    @test text(handler(HTTP.Request("GET", "/"))) == "handler"
+    @test ran[]
+
+    DENIED = HTTP.Response(403, "no")
+    handler, ran = guarded(_ -> nothing, _ -> DENIED)
+    @test handler(HTTP.Request("GET", "/")) === DENIED
+    @test !ran[]
+end
+
+@testset "a denial before a malformed guard short-circuits it; a malformed guard stops the rest" begin
+    reached = Ref(false)
+    later = _ -> (reached[] = true; nothing)
+
+    handler, ran = guarded(_ -> HTTP.Response(403), _ -> false)
+    @test handler(HTTP.Request("GET", "/")).status == 403
+    @test !ran[]
+
+    handler, ran = guarded(_ -> false, later)
+    @test_throws ArgumentError handler(HTTP.Request("GET", "/"))
+    @test !reached[] && !ran[]
+end
+
+@testset "the error names the guard and the type, never the value" begin
+    secret = "sk_live_DO_NOT_LOG"
+    function only_admins(req::HTTP.Request)
+        return Dict("error" => "forbidden", "token" => secret)
+    end
+    handler, _ = guarded(_ -> nothing, only_admins)
+    err = try
+        handler(HTTP.Request("GET", "/"))
+        nothing
+    catch e
+        e
+    end
+    @test err isa ArgumentError
+    @test occursin("guard #2", err.msg)
+    @test occursin("only_admins", err.msg)
+    @test occursin("returned a Dict;", err.msg)
+    @test !occursin(secret, err.msg)
+
+    # A value can ride in a type parameter; only the type's NAME is reported.
+    handler, _ = guarded(_ -> Val(Symbol(secret)))
+    err = try
+        handler(HTTP.Request("GET", "/"))
+        nothing
+    catch e
+        e
+    end
+    @test err isa ArgumentError
+    @test occursin("returned a Val;", err.msg)
+    @test !occursin(secret, err.msg)
+end
+
+# The request path: the throw reaches the server's error boundary, which answers 500.
+@testset "through a routed app the client gets a 500, and the handler does not run" begin
+    ran = Ref(false)
+    app = App()
+    urlpatterns(app, "",
+        path("/admin", _ -> (ran[] = true; Res.send("admin"));
+             middleware = [GuardMiddleware(req -> HTTP.header(req, "X-Role", "") == "admin")]))
+    logger = Test.TestLogger(min_level = Base.CoreLogging.Error)
+    r = Base.CoreLogging.with_logger(logger) do
+        internalrequest(app, HTTP.Request("GET", "/admin"))
+    end
+    @test r.status == 500
+    @test !ran[]
+    # A guard returning `true` is no admission either: the check is on the type, not the truth.
+    r = Base.CoreLogging.with_logger(logger) do
+        internalrequest(app, HTTP.Request("GET", "/admin", ["X-Role" => "admin"]))
+    end
+    @test r.status == 500
+    @test !ran[]
+end
+
+end
+
 @testitem "getprincipal (#515)" tags=[:middleware, :auth] setup=[NitroCommon] begin
 using HTTP
 using Nitro

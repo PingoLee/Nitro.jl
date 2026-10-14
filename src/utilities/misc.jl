@@ -453,10 +453,12 @@ function _check_denial_factory(f, keyword::Symbol)
                         "and return an `HTTP.Response`"))
 end
 
-# Fail closed. `GuardMiddleware` admits any guard result that is not an `HTTP.Response`, so a
-# factory returning `nothing` -- or a `Dict` it meant to serialize -- would turn a denial into an
-# admission. Anything else is an error, which the server answers with a 500; the handler never
-# runs. The message names the type only: the value may be whatever the app put in it.
+# Fail closed. A factory returning `nothing` would turn a denial into an admission, and one
+# returning a `Dict` it meant to serialize would reach `GuardMiddleware` as a malformed guard
+# result. Anything but a response is an error here, at the factory that produced it, which the
+# server answers with a 500; the handler never runs. `GuardMiddleware` applies the same rule to
+# every guard's own result (#519). The message names the type only: the value may be whatever
+# the app put in it.
 function _deny(f, req::HTTP.Request, reason::Symbol)::HTTP.Response
     resp = f(req, reason)
     resp isa HTTP.Response && return resp
