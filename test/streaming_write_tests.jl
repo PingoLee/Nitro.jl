@@ -20,28 +20,42 @@ import Nitro: App
 """
 One raw HTTP/1.1 connection with a background reader appending everything the server sends.
 A raw socket rather than HTTP.jl's client: no pool, no retry, exactly one connection.
+
+`eof` is set when the reader stops, and `err` holds the exception that stopped it, `nothing` for
+a clean close (#504). The bytes read before either are kept. Report it with `ending`.
 """
 mutable struct RawConn
     sock::TCPSocket
     buf::Vector{UInt8}
     lock::ReentrantLock
     eof::Bool
+    err::Union{Nothing, Exception}
     reader::Task
     function RawConn(port)
-        c = new(Sockets.connect(Sockets.localhost, port), UInt8[], ReentrantLock(), false)
+        c = new(Sockets.connect(Sockets.localhost, port), UInt8[], ReentrantLock(), false, nothing)
         c.reader = @async begin
             try
                 while !eof(c.sock)
                     bytes = readavailable(c.sock)
                     lock(() -> append!(c.buf, bytes), c.lock)
                 end
-            catch
+            catch e
+                c.err = e
             end
             c.eof = true
         end
         return c
     end
 end
+
+"""
+    ending(c::RawConn) -> String
+
+How the connection ended, for a red to print: `"closed"`, `read_failed`'s marker for a reset or
+other failed read, or `"open"` while the reader is still running. Before #504 a reset set `eof`
+exactly as a clean close did, and nothing said which it was.
+"""
+ending(c::RawConn) = !c.eof ? "open" : c.err === nothing ? "closed" : read_failed(c.err)
 
 send!(c::RawConn, s::AbstractString) = (write(c.sock, s); flush(c.sock); nothing)
 received(c::RawConn) = lock(() -> copy(c.buf), c.lock)
@@ -143,13 +157,16 @@ end
 "The `Warn` records `logger` has captured so far — read under its lock, since the server logs from its own tasks."
 warnings(logger) = lock(() -> filter(r -> r.level == Base.CoreLogging.Warn, copy(logger.logs)), logger.lock)
 
-"Send one request on a fresh connection and return everything the server sends before it closes."
+"""
+Send one request on a fresh connection and return everything the server sends before it ends the
+connection, with how it ended (`ending`): `"open"` if it did not within 10 s.
+"""
 function one_shot(port, target)
     c = RawConn(port)
     try
         send!(c, "GET $target HTTP/1.1\r\nHost: $HOST\r\nConnection: keep-alive\r\n\r\n")
-        timedwait(() -> c.eof, 10.0) === :ok || return nothing
-        return received(c)
+        timedwait(() -> c.eof, 10.0)
+        return (; bytes = received(c), ended = ending(c))
     finally
         close(c)
     end
@@ -244,12 +261,14 @@ for cap in (nothing, 4)
                 notify(release)
                 @test timedwait(() -> c.eof, 10.0) === :ok
                 bytes = received(c)
-                text = String(copy(bytes))
-                @test startswith(text, "HTTP/1.1 200")
-                @test count("HTTP/1.1 ", text) == 1
-                hend = head_end(bytes)
-                @test hend !== nothing
-                @test bytes[hend:end] == FIRST
+                @testset let ended = ending(c)          # printed with any red below (#504)
+                    text = String(copy(bytes))
+                    @test startswith(text, "HTTP/1.1 200")
+                    @test count("HTTP/1.1 ", text) == 1
+                    hend = head_end(bytes)
+                    @test hend !== nothing
+                    @test bytes[hend:end] == FIRST
+                end
             finally
                 close(c)
             end
@@ -264,15 +283,17 @@ for cap in (nothing, 4)
                 # Cleared first: `/broken` above already logged `declared = 2000, written = 1000`,
                 # which would satisfy `/short`'s check whether or not `/short` itself warned.
                 lock(() -> empty!(logger.logs), logger.lock)
-                bytes = one_shot(port, route)
-                @test bytes !== nothing
-                bytes === nothing && continue
-                text = String(copy(bytes))
-                @test startswith(text, "HTTP/1.1 200")
-                @test count("HTTP/1.1 ", text) == 1
-                hend = head_end(bytes)
-                @test hend !== nothing
-                @test bytes[hend:end] == FIRST
+                (; bytes, ended) = one_shot(port, route)
+                @test ended != "open"
+                ended == "open" && continue
+                @testset let route = route, ended = ended   # printed with any red below (#504)
+                    text = String(copy(bytes))
+                    @test startswith(text, "HTTP/1.1 200")
+                    @test count("HTTP/1.1 ", text) == 1
+                    hend = head_end(bytes)
+                    @test hend !== nothing
+                    @test bytes[hend:end] == FIRST
+                end
                 # The client only sees a cut connection, so the server log is where the defect
                 # surfaces: one warning, with how far the body got and what it promised.
                 logged = timedwait(10.0; pollint = 0.05) do
@@ -290,18 +311,60 @@ for cap in (nothing, 4)
             # server's defect, not the client's. The first route pins that the head waits for the
             # first read; the other two pin the pre-head length check.
             for route in ("/firstfail", "/overrun-first", "/empty-declared")
-                bytes = one_shot(port, route)
-                @test bytes !== nothing
-                bytes === nothing && continue
-                text = String(copy(bytes))
-                @test startswith(text, "HTTP/1.1 500")
-                @test count("HTTP/1.1 ", text) == 1
+                (; bytes, ended) = one_shot(port, route)
+                @test ended != "open"
+                ended == "open" && continue
+                @testset let route = route, ended = ended   # printed with any red below (#504)
+                    text = String(copy(bytes))
+                    @test startswith(text, "HTTP/1.1 500")
+                    @test count("HTTP/1.1 ", text) == 1
+                end
             end
         end
     finally
         notify(release)
         Nitro.Core.terminate(ctx)
     end
+end
+
+# #504. `RawConn`'s reader used to end in a bare `catch` and set `eof` either way, so a reset read
+# exactly like a clean close. A bare listener (no Nitro) sends the same bytes and then ends the
+# connection each way; the bytes are kept both times and `ending` must tell them apart. Against
+# the old shape there was no `err`, and both read as an `eof` with the same bytes.
+@testset "RawConn keeps the bytes and says how the connection ended (#504)" begin
+    reply = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nfirst"
+    function finish(; abort)
+        server = Sockets.listen(Sockets.localhost, 0)
+        port = Int(getsockname(server)[2])
+        task = @async try
+            conn = accept(server)
+            # A clean close reads the request first: closing over unread input is itself a reset
+            # on Linux. An abort does not (see `abort_with_reset!`).
+            abort || readuntil(conn, "\r\n\r\n")
+            write(conn, reply); flush(conn)
+            sleep(0.5)
+            abort ? abort_with_reset!(conn) : close(conn)
+        finally
+            close(server)
+        end
+        c = RawConn(port)
+        try
+            send!(c, "GET / HTTP/1.1\r\nHost: $HOST\r\n\r\n")
+            @test timedwait(() -> c.eof, 10.0) === :ok
+            wait(task)
+            return (; bytes = String(received(c)), ended = ending(c))
+        finally
+            close(c)
+        end
+    end
+
+    reset = finish(abort = true)
+    @test reset.bytes == reply
+    @test startswith(reset.ended, "(read failed:")
+
+    closed = finish(abort = false)
+    @test closed.bytes == reply
+    @test closed.ended == "closed"
 end
 
 end

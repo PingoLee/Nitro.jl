@@ -1150,13 +1150,16 @@ end
 end
 
 @testset "text() makes one copy of a byte body, not two" begin
+    # Each the minimum of 5 runs (`allocs`, #511).
     big = Vector{UInt8}(repeat("a", 1 << 20))
     req = HTTP.Request("POST", "/", [], big)
-    text(req)                                    # compile
-    @test (@allocated text(req)) < 1.5 * (1 << 20)
+    @testset let bytebody = allocs(() -> text(req))
+        @test bytebody.bytes < 1.5 * (1 << 20)
+    end
     # A String body needs no copy at all.
     sreq = HTTP.Request("POST", "/", [], repeat("a", 1 << 20))
-    text(sreq)
-    @test (@allocated text(sreq)) < 1024
+    @testset let stringbody = allocs(() -> text(sreq))
+        @test stringbody.bytes < 1024
+    end
 end
 end

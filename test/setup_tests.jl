@@ -17,7 +17,8 @@ export HOST
 export values_present, value_absent, value_count, has_property
 export get_free_port
 export jwtkey
-export raw_exchange, read_failed
+export raw_exchange, read_failed, abort_with_reset!
+export allocs, Allocs
 
 # ── Constants ────────────────────────────────────────────────────────
 
@@ -181,7 +182,138 @@ function raw_exchange(port, parts; gap = 0.0, limit = 15.0)
     end
 end
 
+# `SO_LINGER {on, 0}` makes `close` abort the connection with an RST instead of a FIN.
+const SOL_SOCKET = Sys.islinux() ? Cint(1) : Cint(0xffff)
+const SO_LINGER  = Sys.islinux() ? Cint(13) : Cint(0x0080)
+
+"""
+    abort_with_reset!(conn::TCPSocket)
+
+Close `conn` with an RST instead of a FIN, for a test server standing in for a peer that resets
+(#490, #504). A raw-socket reader's sensitivity check pairs it with an ordinary `close` of the
+same bytes: the reader must report the two differently.
+
+Do not read the request first on the abort path. On Windows, libuv closes a socket with a read
+pending by sending a FIN first, so the client would see a clean EOF before the RST. On the clean
+path, do read it: closing over unread input is itself a reset on Linux.
+"""
+function abort_with_reset!(conn::TCPSocket)
+    fd = Base._fd(conn)
+    @static if Sys.iswindows()
+        # `fd` is a `WindowsRawSocket`, which converts to the `SOCKET` pointer itself.
+        linger = Ref((UInt16(1), UInt16(0)))    # Winsock's `struct linger` is two u_short
+        rc = ccall((:setsockopt, "Ws2_32"), stdcall, Cint,
+                   (Ptr{Cvoid}, Cint, Cint, Ptr{Cvoid}, Cint),
+                   fd, SOL_SOCKET, SO_LINGER, linger, sizeof(linger))
+        rc == 0 || error("setsockopt(SO_LINGER) failed: $(Libc.GetLastError())")
+    else
+        linger = Ref((Cint(1), Cint(0)))
+        rc = ccall(:setsockopt, Cint, (Cint, Cint, Cint, Ptr{Cvoid}, Cuint),
+                   reinterpret(Cint, fd), SOL_SOCKET, SO_LINGER, linger, sizeof(linger))
+        rc == 0 || error("setsockopt(SO_LINGER) failed: $(Libc.errno())")
+    end
+    close(conn)
+end
+
+# ── Allocation measurement (#511) ────────────────────────────────────
+
+"""
+    Allocs
+
+What `allocs` measured: `count` allocations and `bytes` allocated **per call**, each the
+minimum over `runs` runs of `calls` calls. Its `show` names the Julia version and the
+`--check-bounds` setting as well, because both move these numbers (#481, #505): a red should say
+where it was measured, not leave that to be asked.
+"""
+struct Allocs
+    count::Float64
+    bytes::Float64
+    runs::Int
+    calls::Int
+end
+
+function Base.show(io::IO, m::Allocs)
+    cb = ("auto", "yes", "no")[Base.JLOptions().check_bounds + 1]
+    print(io, "Allocs(count = ", m.count, ", bytes = ", m.bytes, "; min of ", m.runs, " runs × ",
+          m.calls, " calls; Julia ", VERSION, ", check-bounds=", cb, ")")
+end
+
+"""
+    allocs(f; runs = 5, calls = 1) -> Allocs
+
+The allocations, and bytes, of one call to `f()`. Every allocation assertion in the suite measures
+through this, so they all follow the same rules:
+
+- **`f` is warmed first**, so compiling it is never charged to it.
+- **Both counters are measured**, so a test can bound either and a red reports both.
+- **The minimum over `runs` runs**, each of `calls` calls. Both counters are process-wide: another
+  task allocating mid-measurement is charged to `f`, and only ever adds. The minimum discards it.
+  `calls > 1` averages over a loop, for claims finer than one allocation (`+ 0.5`).
+
+`f` runs `1 + 2 * runs * calls` times in all — the warm-up, then one loop per counter in each
+run — which a caller feeding it a fresh input per call has to provide for.
+
+**Write the assertion so a red shows both sides.** `@test` prints the evaluated operands of a
+comparison but not where they came from, so bind the measurements in a `@testset let`, which prints
+each binding under the failure:
+
+```julia
+@testset let seed = allocs(() -> seed_once(req); calls = 1000),
+             reference = allocs(() -> bind_once(req); calls = 1000)
+    @test seed.count <= reference.count + 0.5
+end
+```
+
+Bound at the target, not at the measured value: the JWT path is held under 50 allocations
+against a measured 41, so a Julia release that moves a few does not fail CI. Prefer a bound on
+what the code under test owns over a difference of totals against a reference: a reference's own
+total can depend on its compilation state (#505). Give a sensitivity claim a
+positive control in the same test — a variant that does the wasteful thing on purpose and must
+break the bound. Measure under the suite's own flags: `Pkg.test` forces `--check-bounds=yes`, so a
+standalone script's numbers are not evidence about the suite.
+"""
+function allocs(f::F; runs::Int = 5, calls::Int = 1) where {F}
+    f()
+    count = bytes = typemax(Int)
+    for _ in 1:runs
+        # `donotdelete`: a call the compiler could prove effect-free would otherwise be removed,
+        # and measure 0 without measuring anything.
+        count = min(count, @allocations(for _ in 1:calls; Base.donotdelete(f()); end))
+        bytes = min(bytes, @allocated(for _ in 1:calls; Base.donotdelete(f()); end))
+    end
+    return Allocs(count / calls, bytes / calls, runs, calls)
+end
+
 end # module NitroCommon
+
+@testitem "NitroCommon: allocs measures one call, and a red names both sides (#511)" tags=[:core] setup=[NitroCommon] begin
+    using Test
+
+    # The positive control: a call that allocates on purpose must show up, at both counters.
+    # `sink` keeps the vector from being optimised away.
+    sink = Ref{Any}(nothing)
+    waste = allocs(() -> (sink[] = Vector{UInt8}(undef, 4096); nothing))
+    @test waste.count >= 1
+    @test waste.bytes >= 4096
+
+    # And one that allocates nothing reads exactly 0, so a `== 0` claim can pass.
+    v = [1, 2, 3]
+    @test allocs(() -> (v[1] += 1; nothing)).bytes == 0
+    @test allocs(() -> (v[1] += 1; nothing); calls = 100).count == 0
+
+    # `calls` divides: 100 calls of one 4 KiB vector are one vector per call, not 100.
+    per = allocs(() -> (sink[] = Vector{UInt8}(undef, 4096); nothing); calls = 100)
+    # The count is exact everywhere; the bytes are not on Windows, where one 4 KiB vector read
+    # 4167 B in one run and 4183 B in another. One vector's worth, not a hundred, is the claim.
+    @test per.count == waste.count
+    @test 4096 <= per.bytes < 2 * 4096
+
+    # What a red prints: the Julia version and the check-bounds flag the numbers came from.
+    shown = sprint(show, waste)
+    @test occursin("Julia $(VERSION)", shown)
+    @test occursin("check-bounds=", shown)
+    @test occursin("min of 5 runs × 1 calls", shown)
+end
 
 # A Ctrl-C test needs a REAL SIGINT, and only a child process can take one without taking the
 # test runner down with it. This is the one parent every such item uses: the #369 item at the

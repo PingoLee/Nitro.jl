@@ -188,15 +188,20 @@ end
 # on Julia 1.13.1 a `Union{String, SubString{String}}` path boxed there (#390). Only the 1.13 job
 # can catch it; on 1.12 the union happens not to allocate.
 @testset "a canonical target is handed back without building anything" begin
-    alloc(t) = (O(t); @allocated O(t))
+    # Each the minimum of 5 runs (`allocs`, #511).
     for t in ("/", "/a/b", "/a/", "/a?q=%70", "/a!b~c", "/caf%C3%A9", "/a%2Fb/%25", "/a..b",
               "/files/caf%C3%A9/s.txt?v=1", "/?", "/a?")
         @test O(t) == t
-        @test alloc(t) == 0
+        @testset let target = t, built = allocs(() -> O(t))
+            @test built.bytes == 0
+        end
     end
     # ...and one that needs rewriting does build, so the measurement can fail.
-    @test alloc("/caf%c3%a9") > 0
-    @test alloc("/%70") > 0
+    for t in ("/caf%c3%a9", "/%70")
+        @testset let target = t, built = allocs(() -> O(t))
+            @test built.bytes > 0
+        end
+    end
 end
 
 # The invariant: canonicalizing never changes what a decoder sees, only the spelling. Every

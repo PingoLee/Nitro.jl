@@ -8,7 +8,7 @@ using Nitro.Core.Types: CopyOnWriteDict, snapshot, publish!, RouteMiddleware
 # below). These assertions pin the container at `RouteMiddleware` AND at a second `V`, so its
 # semantics are proven generic rather than accidentally correct for the one value type in use.
 
-probe(d) = snapshot(d)                     # a call boundary, so @inferred/@allocated mean something
+probe(d) = snapshot(d)                     # a call boundary, so @inferred/allocs mean something
 mkf(tag) = (req -> tag)
 
 @testset "snapshot is type-stable and allocation-free at both V" begin
@@ -16,11 +16,12 @@ mkf(tag) = (req -> tag)
     ct = CopyOnWriteDict{RouteMiddleware}(); publish!(ct, "k", (nothing, Function[]))
     @test @inferred(probe(cf)) isa Dict{String, Function}
     @test @inferred(probe(ct)) isa Dict{String, RouteMiddleware}
-    probe(cf); probe(ct)                   # warm up before measuring
     # The reader fast path is on every request that gets past `compose`'s emptiness test; if
-    # this ever regresses we want to hear it.
-    @test (@allocated probe(cf)) == 0
-    @test (@allocated probe(ct)) == 0
+    # this ever regresses we want to hear it. Each the minimum of 5 runs (`allocs`, #511).
+    @testset let functions = allocs(() -> probe(cf)), middleware = allocs(() -> probe(ct))
+        @test functions.bytes == 0
+        @test middleware.bytes == 0
+    end
 end
 
 @testset "publish! is last-writer-wins" begin
@@ -176,8 +177,10 @@ end
     method, route = "GET", "/a"
     cache_chain!(c, t, snap, (method, route), mkf("a"))
     probe(c, snap, m, p) = cached_chain(c, snap, (m, p))
-    @test probe(c, snap, method, route)(nothing) == "a"        # warm up, and it is a hit
-    @test (@allocated probe(c, snap, method, route)) == 0
+    @test probe(c, snap, method, route)(nothing) == "a"        # it is a hit
+    @testset let hit = allocs(() -> probe(c, snap, method, route))   # min of 5 runs (#511)
+        @test hit.bytes == 0
+    end
     @test @inferred(Union{Function, Nothing}, probe(c, snap, method, route)) isa Function
 end
 

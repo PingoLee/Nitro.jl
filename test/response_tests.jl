@@ -119,16 +119,19 @@ function keyword_builder(body)
     return response
 end
 
-function allocs_per_call(f, x, n)
-    f(x)
-    return @allocations(for _ in 1:n; f(x); end) / n
-end
-
 @testset "builders allocate less than HTTP's keyword constructor (#446)" begin
     bytes = Vector{UInt8}("{}")
     # The keyword form normalizes then copies both header collections; the builders skip all four.
-    @test allocs_per_call(Res.send, "x", 1000) + 2 <= allocs_per_call(keyword_builder, "x", 1000)
-    @test allocs_per_call(Res.json, bytes, 1000) + 2 <= allocs_per_call(keyword_builder, bytes, 1000)
+    # Each side is the minimum of 5 runs of 1000 calls (`allocs`, #511).
+    s = "x"    # captured, not a literal, so neither side can constant-fold its argument
+    @testset let send = allocs(() -> Res.send(s); calls = 1000),
+                 keyword = allocs(() -> keyword_builder(s); calls = 1000)
+        @test send.count + 2 <= keyword.count
+    end
+    @testset let json = allocs(() -> Res.json(bytes); calls = 1000),
+                 keyword = allocs(() -> keyword_builder(bytes); calls = 1000)
+        @test json.count + 2 <= keyword.count
+    end
     # Same response, cheaper: the headers a builder emits did not change shape.
     @test Res.send("x").headers.entries == keyword_builder("x").headers.entries
     @test Res.send("x").content_length == keyword_builder("x").content_length == 1

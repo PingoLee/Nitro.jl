@@ -546,12 +546,13 @@ end
 
     # The point of #432: a JWT-claims-sized segment is the output buffer and little else.
     # It was ~2.3 KB and 23 allocations through the stdlib pipe.
+    # Each the minimum of 5 runs (`allocs`, #511).
     segment = encode(rand(rng, UInt8, 88))
-    decode(segment)
-    encode(rand(rng, UInt8, 88))
     bytes = rand(rng, UInt8, 88)
-    @test (@allocated decode(segment)) < 512
-    @test (@allocated encode(bytes)) < 512
+    @testset let decoding = allocs(() -> decode(segment)), encoding = allocs(() -> encode(bytes))
+        @test decoding.bytes < 512
+        @test encoding.bytes < 512
+    end
 end
 
 @testset "a critical header extension is refused (#321)" begin
@@ -666,16 +667,16 @@ end
     # numbers below come from -- because a three-claim one was already under 50 before #456.
     # It was ~11.7 KB / 176 before #432/#449, ~2.4 KB / 54 after them, and ~1.8 KB / 41 after
     # #456 (Julia 1.12). 50 rather than the measured value, so a Julia release that moves a few
-    # allocations does not fail it. The minimum of a few runs, because both counters are
-    # process-wide: another task allocating mid-measurement is charged to this call.
+    # allocations does not fail it. The minimum of 5 runs (`allocs`, #511), because both counters
+    # are process-wide: another task allocating mid-measurement is charged to this call.
     validator = Nitro.Auth.jwt_validator(secret)
     typical = Nitro.Auth.encode_jwt(Dict("sub" => "42", "iss" => "https://issuer.example",
                                          "aud" => "api", "role" => "admin", "name" => "Ada"),
                                     secret; expires_in = 3600)
-    validator(typical)
-    validator(typical)
-    @test minimum(@allocated(validator(typical)) for _ in 1:5) < 4_096
-    @test minimum(@allocations(validator(typical)) for _ in 1:5) < 50
+    @testset let validating = allocs(() -> validator(typical))
+        @test validating.bytes < 4_096
+        @test validating.count < 50
+    end
 end
 
 # A `dicttype` whose constructor throws: it runs inside `_jwt_segment_json`'s `try`, which is
@@ -1626,9 +1627,11 @@ end
     # HMAC re-hashes a key longer than its 64-byte block on every call, and the pure-Julia loop
     # allocated a fresh HMAC per iteration -- megabytes here, and time proportional to the
     # password's length. libcrypto keys the HMAC once and allocates only the output.
+    # The minimum of 5 runs (`allocs`, #511).
     long = "a"^MAX_PASSWORD_BYTES
-    _pbkdf2_sha256(long, "salt", 20_000)
-    @test (@allocated _pbkdf2_sha256(long, "salt", 20_000)) < 16_384
+    @testset let hashing = allocs(() -> _pbkdf2_sha256(long, "salt", 20_000))
+        @test hashing.bytes < 16_384
+    end
 end
 
 @testset "password length is capped before any hashing" begin

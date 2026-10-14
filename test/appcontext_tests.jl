@@ -179,17 +179,19 @@ const REF_SCOPE = ScopedValue{RequestScope}(RequestScope(nothing, Ref{Int64}(0))
 const REF_VALUE = RequestScope(nothing, Ref{Int64}(0))
 reference(req::HTTP.Request) = @with REF_SCOPE => REF_VALUE nothing
 
-function allocs_per_call(f, n)
-    # The app context is pre-seeded so the layer's one-off `req.context` insert is not measured.
-    reqs = [HTTP.Request("GET", "/") for _ in 1:n]
+# One fresh request per call. The app context is pre-seeded so the layer's one-off `req.context`
+# insert is not measured. The minimum of 5 runs of 1000 calls (`allocs`, #511).
+function allocs_per_request(f; calls = 1000, runs = 5)
+    reqs = [HTTP.Request("GET", "/") for _ in 1:(2 * runs * calls + 1)]   # as many as `allocs` calls
     foreach(r -> r.context[Nitro.Core.REQUEST_CONTEXT_KEY] = nothing, reqs)
-    f(reqs[1])
-    return @allocations(foreach(f, reqs)) / n
+    next = Ref(0)
+    return allocs(() -> f(reqs[next[] += 1]); calls, runs)
 end
 
 @testset "one scope insert per request, nothing boxed" begin
-    seed = _app_context_seed(app)((req::HTTP.Request) -> nothing)
-    allocs_per_call(reference, 10); allocs_per_call(seed, 10)
-    @test allocs_per_call(seed, 1000) <= allocs_per_call(reference, 1000) + 0.5
+    seed_layer = _app_context_seed(app)((req::HTTP.Request) -> nothing)
+    @testset let seed = allocs_per_request(seed_layer), ref = allocs_per_request(reference)
+        @test seed.count <= ref.count + 0.5
+    end
 end
 end
