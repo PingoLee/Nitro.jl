@@ -444,6 +444,26 @@ using Nitro: GuardMiddleware, login_required, role_required, permission_required
         req_tuple.context[:auth_claims] = Principal(Dict{String,Any}(); kid="service-b")
         @test isnothing(allowed(req_tuple))
 
+        # #517: the TOKEN's Principal at :auth_claims decides, never an app-built one at :user.
+        # Single-secret token (no verified kid) under an app Principal that writes one -> 403.
+        req_app_kid = HTTP.Request("GET", "/test")
+        req_app_kid.context[:user] = Principal(Dict{String,Any}(); id="u1", kid="service-a")
+        req_app_kid.context[:auth_claims] = Principal(Dict{String,Any}(); id="u1")
+        @test allowed(req_app_kid).status == 403
+        # A relabelled kid: the token was verified against a key outside the allowlist -> 403.
+        req_relabel = HTTP.Request("GET", "/test")
+        req_relabel.context[:user] = Principal(Dict{String,Any}(); id="u1", kid="service-a")
+        req_relabel.context[:auth_claims] = Principal(Dict{String,Any}(); id="u1", kid="service-c")
+        @test allowed(req_relabel).status == 403
+        # ...and the reverse: the token's verified kid admits whatever the app object says.
+        req_token_ok = HTTP.Request("GET", "/test")
+        req_token_ok.context[:user] = Principal(Dict{String,Any}(); id="u1", kid="service-c")
+        req_token_ok.context[:auth_claims] = Principal(Dict{String,Any}(); id="u1", kid="service-b")
+        @test isnothing(allowed(req_token_ok))
+        # A custom validator returning a bare Principal (no tuple, nothing at :auth_claims) still
+        # opts in through :user -- that one IS the token's Principal.
+        @test isnothing(allowed(req_ok))
+
         # Single-string allowlist form
         single = kid_required("service-a")
         @test isnothing(single(req_ok))
@@ -539,6 +559,145 @@ end
     @test_throws ArgumentError role_required("admin"; denied = one_arg)
     @test_throws ArgumentError permission_required("write"; denied = one_arg)
     @test_throws ArgumentError login_required(denied = one_arg)
+end
+
+end
+
+@testitem "GuardMiddleware fails closed on a non-response guard result (#519)" tags=[:middleware, :auth, :security] setup=[NitroCommon] begin
+using HTTP
+using Nitro
+
+# A guard runs, and a handler that records whether it was reached.
+function guarded(guards...)
+    ran = Ref(false)
+    return GuardMiddleware(guards...)(_ -> (ran[] = true; HTTP.Response(200, "handler"))), ran
+end
+
+# Every one of these LOOKS like a denial, and every one of them used to admit the request.
+@testset "a guard that 'denies' with $(typeof(bad)) is an error -- the handler never runs" for bad in (
+        false, true, Dict("error" => "forbidden"), "forbidden", 403, :forbidden, missing)
+    handler, ran = guarded(_ -> bad)
+    @test_throws ArgumentError handler(HTTP.Request("GET", "/"))
+    @test !ran[]
+end
+
+@testset "the contract that stays: `nothing` admits, a response denies as-is" begin
+    handler, ran = guarded(_ -> nothing)
+    @test text(handler(HTTP.Request("GET", "/"))) == "handler"
+    @test ran[]
+
+    DENIED = HTTP.Response(403, "no")
+    handler, ran = guarded(_ -> nothing, _ -> DENIED)
+    @test handler(HTTP.Request("GET", "/")) === DENIED
+    @test !ran[]
+end
+
+@testset "a denial before a malformed guard short-circuits it; a malformed guard stops the rest" begin
+    reached = Ref(false)
+    later = _ -> (reached[] = true; nothing)
+
+    handler, ran = guarded(_ -> HTTP.Response(403), _ -> false)
+    @test handler(HTTP.Request("GET", "/")).status == 403
+    @test !ran[]
+
+    handler, ran = guarded(_ -> false, later)
+    @test_throws ArgumentError handler(HTTP.Request("GET", "/"))
+    @test !reached[] && !ran[]
+end
+
+@testset "the error names the guard and the type, never the value" begin
+    secret = "sk_live_DO_NOT_LOG"
+    function only_admins(req::HTTP.Request)
+        return Dict("error" => "forbidden", "token" => secret)
+    end
+    handler, _ = guarded(_ -> nothing, only_admins)
+    err = try
+        handler(HTTP.Request("GET", "/"))
+        nothing
+    catch e
+        e
+    end
+    @test err isa ArgumentError
+    @test occursin("guard #2", err.msg)
+    @test occursin("only_admins", err.msg)
+    @test occursin("returned a Dict;", err.msg)
+    @test !occursin(secret, err.msg)
+
+    # A value can ride in a type parameter; only the type's NAME is reported.
+    handler, _ = guarded(_ -> Val(Symbol(secret)))
+    err = try
+        handler(HTTP.Request("GET", "/"))
+        nothing
+    catch e
+        e
+    end
+    @test err isa ArgumentError
+    @test occursin("returned a Val;", err.msg)
+    @test !occursin(secret, err.msg)
+end
+
+# The request path: the throw reaches the server's error boundary, which answers 500.
+@testset "through a routed app the client gets a 500, and the handler does not run" begin
+    ran = Ref(false)
+    app = App()
+    urlpatterns(app, "",
+        path("/admin", _ -> (ran[] = true; Res.send("admin"));
+             middleware = [GuardMiddleware(req -> HTTP.header(req, "X-Role", "") == "admin")]))
+    logger = Test.TestLogger(min_level = Base.CoreLogging.Error)
+    r = Base.CoreLogging.with_logger(logger) do
+        internalrequest(app, HTTP.Request("GET", "/admin"))
+    end
+    @test r.status == 500
+    @test !ran[]
+    # A guard returning `true` is no admission either: the check is on the type, not the truth.
+    r = Base.CoreLogging.with_logger(logger) do
+        internalrequest(app, HTTP.Request("GET", "/admin", ["X-Role" => "admin"]))
+    end
+    @test r.status == 500
+    @test !ran[]
+end
+
+end
+
+@testitem "kid_required reads the token's kid, not an app-built one (#517)" tags=[:middleware, :auth, :security] setup=[NitroCommon] begin
+using HTTP
+using Nitro
+
+# The issue's repro, end to end: a `user_validator` that "enriches" the token's Principal by
+# copying it into a new `Principal(...; kid = ...)`. Before #517 the guard read that kid first.
+enrich(kid) = p -> Principal(Dict{String,Any}(p); id = p.id, kid = kid)
+
+function serve_kid(validator, allowed)
+    seen = Ref{Any}(nothing)
+    handler = BearerAuth(validator)(GuardMiddleware(kid_required(allowed))(
+        req -> (seen[] = getprincipal(req); HTTP.Response(200, "in"))))
+    return handler, seen
+end
+bearer(token) = HTTP.Request("GET", "/import", ["Authorization" => "Bearer $token"])
+
+@testset "single secret: an app-written kid authorizes nothing" begin
+    secret = jwtkey("single-secret")
+    token = Nitro.Auth.encode_jwt(Dict("sub" => "7"), secret; expires_in = 3600)
+    handler, seen = serve_kid(Nitro.Auth.jwt_validator(secret; user_validator = enrich("importer")), "importer")
+    @test handler(bearer(token)).status == 403
+    @test seen[] === nothing
+end
+
+@testset "keyset: a relabelled kid is refused, the verified one is honoured" begin
+    keyset = Nitro.Auth.JWTKeyset("importer" => jwtkey("secret-importer"); verify = ["other" => jwtkey("secret-other")])
+    by_other = Nitro.Auth.encode_jwt(Dict("sub" => "7"), Nitro.Auth.JWTKeyset("other" => jwtkey("secret-other")); expires_in = 3600)
+    by_importer = Nitro.Auth.encode_jwt(Dict("sub" => "7"), Nitro.Auth.JWTKeyset("importer" => jwtkey("secret-importer")); expires_in = 3600)
+
+    # Signed by "other", relabelled "importer" by the app: refused.
+    handler, seen = serve_kid(Nitro.Auth.jwt_validator(keyset; user_validator = enrich("importer")), "importer")
+    @test handler(bearer(by_other)).status == 403
+    @test seen[] === nothing
+
+    # Signed by "importer", relabelled "other" by the app: admitted on the token's kid, and the
+    # handler sees the same kid the guard authorized.
+    handler, seen = serve_kid(Nitro.Auth.jwt_validator(keyset; user_validator = enrich("other")), "importer")
+    @test handler(bearer(by_importer)).status == 200
+    @test seen[].kid == "importer"
 end
 
 end

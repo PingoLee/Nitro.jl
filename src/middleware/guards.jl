@@ -1,8 +1,8 @@
 module GuardsMiddleware
 
 using HTTP
-using ...Core: getsession
-using ...Types: Nullable, Principal, _is_identity
+using ...Core: getsession, getprincipal
+using ...Types: Nullable, _is_identity
 using ...Util: _check_denial_factory, _deny
 
 export GuardMiddleware, login_required, role_required, permission_required,
@@ -13,8 +13,8 @@ export GuardMiddleware, login_required, role_required, permission_required,
 # allocation-free. Contract: 401 = unauthenticated (auth middleware), 403 = authenticated
 # but not authorized (guards), 302 = browser redirect (`login_required`). That contract is the
 # default: every guard takes a `denied` factory (#515), and an app whose clients only handle a
-# `401` may answer a wrong-`kid` token with one. `_deny` checks what the factory returns,
-# because a guard returning anything but a response ADMITS the request.
+# `401` may answer a wrong-`kid` token with one. `_deny` checks what the factory returns, so a
+# factory that answers no response is an error at the factory, not a mystery at the guard.
 const FORBIDDEN = HTTP.Response(403, "Forbidden")
 
 # The default `denied` of the claim and kid guards.
@@ -27,6 +27,16 @@ Turn authorization guards into a route or global middleware. Each guard is a
 `req -> Union{Nothing, HTTP.Response}`: `nothing` admits the request, and a response denies it
 and is returned as-is. Guards run in order and the first denial short-circuits the rest and the
 handler.
+
+**Any other result is an error, never an admission.** A guard that returns `false`, a `Dict`, a
+status code or a message throws an `ArgumentError` naming the guard and the result's type. The server
+answers that with a `500`, and the handler does not run:
+
+```julia
+only_admins = req -> getuser(req)["role"] == "admin"                     # ✗ `false` is a 500
+only_admins = req -> getuser(req)["role"] == "admin" ? nothing :
+                     Res.json(Dict("error" => "forbidden"); status = 403) # ✓
+```
 
 ```julia
 path("/admin/reports", reports;
@@ -50,18 +60,35 @@ anything but an `HTTP.Response` is an error, not an admission.
 function GuardMiddleware(guards::Function...)
 	return function(handle::Function)
 		return function(req::HTTP.Request)
+			# A counter, not `enumerate`: over a tuple of five or more distinct closures,
+			# `enumerate` allocates per request where the plain loop did not.
+			position = 0
 			for guard in guards
+				position += 1
 				result = guard(req)
-				if result isa HTTP.Response
-					return result
-				end
+				result === nothing && continue
+				result isa HTTP.Response && return result
+				_refuse_guard_result(position, guard, result)
 			end
 			return handle(req)
 		end
 	end
 end
 
-# Claims resolution for the claim guards. Mirrors `_request_kid`'s two-slot lookup: a
+# Fail closed (#519): the same rule `_deny` applies to a denial factory, applied to every guard.
+# A guard that "denies" with `false`, a `Dict` it meant to serialize, a status `Int` or a message
+# `String` used to ADMIT the request. Now it is an error, which the server answers with a 500; the
+# handler never runs. The message names the guard and the result's type NAME only -- the value is
+# whatever the application put in it, and a full type can carry a value as a parameter
+# (`Val{secret}`), so `nameof(typeof(result))` rather than `typeof(result)`.
+@noinline function _refuse_guard_result(position::Int, guard::Function, result)
+	throw(ArgumentError("GuardMiddleware: guard #$position ($(nameof(guard))) returned a " *
+	                    "$(nameof(typeof(result))); a guard must return `nothing` to admit the request " *
+	                    "or an `HTTP.Response` to deny it"))
+end
+
+# Claims resolution for the claim guards. The same two slots as `_request_kid`, with the
+# OPPOSITE precedence (see there for why a kid differs): a
 # `user_validator` parks the app's user object at `:user` and the verified `Principal` at
 # `:auth_claims`, so reading only `:user` denies a correctly-authenticated request (#24).
 #
@@ -246,19 +273,19 @@ see [`claim_required`](@ref).
 permission_required(permission::String; permissions_key::String="permissions", session_key::String="user_id", denied=_forbidden) =
 	claim_required(permissions_key, permission; kind=:contains, session_key, denied)
 
-# The verified key id of the request principal. Only a `Principal` carries a trusted kid
-# (populated exclusively from keyset-verified decodes); there is deliberately no session
-# fallback — a kid is meaningless in a session, so absence denies.
-function _request_kid(req::HTTP.Request)
-	user = Base.get(req.context, :user, nothing)
-	if user isa Principal && user.kid !== nothing
-		return user.kid
-	end
-	claims = Base.get(req.context, :auth_claims, nothing)
-	if claims isa Principal && claims.kid !== nothing
-		return claims.kid
-	end
-	return nothing
+# The verified key id of the request principal: the kid of the token's own `Principal`, read
+# through `getprincipal` so the guard and the handler accessor cannot disagree (#517). That
+# means `:auth_claims` FIRST. A `user_validator` puts the application's object at `:user`, and
+# that object may be a `Principal` the app built with a `kid` of its own, which nothing
+# verified. The asymmetry with `_request_claims`, which prefers `:user`, is deliberate: there a
+# fresher app object may revoke a stale claim, but a kid is a property of the token, and the app
+# cannot know more about which key signed it than the decode did.
+#
+# There is deliberately no session fallback -- a kid is meaningless in a session, so absence
+# denies.
+function _request_kid(req::HTTP.Request)::Nullable{String}
+	principal = getprincipal(req)
+	return principal === nothing ? nothing : principal.kid
 end
 
 """
@@ -278,14 +305,15 @@ middleware = [BearerAuth(Auth.jwt_validator(keyset); unauthorized = UNAUTHORIZED
               GuardMiddleware(kid_required(["importer"]; denied = UNAUTHORIZED))]
 ```
 
-A handler reads the verified key id with [`getprincipal`](@ref Nitro.Core.getprincipal)`(req).kid`.
+The guard reads the kid from [`getprincipal`](@ref Nitro.Core.getprincipal)`(req)`, the same
+place a handler reads it, so the two always agree.
 
 Use with a keyset-backed `jwt_validator` — the resulting `Principal` carries the verified
 `kid` (as does the `(user, principal)` tuple flow via `req.context[:auth_claims]`).
 Custom validators opt in by returning a `Principal`. Requests authenticated with a single
-string secret never carry a trusted kid and are denied — unless a `user_validator` returns a
-`Principal` it built with a `kid` of its own, which this guard currently reads first (#517);
-don't give an app-built `Principal` a `kid`.
+string secret never carry a trusted kid and are denied. That holds even when a
+`user_validator` returns a `Principal` it built with a `kid` of its own: the token's `Principal`
+at `:auth_claims` is read first, and an app-built kid is never trusted (#517).
 """
 function kid_required(allowed; denied=_forbidden)
 	_check_denial_factory(denied, :denied)
