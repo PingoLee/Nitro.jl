@@ -529,9 +529,11 @@ correct, handle released) stayed green. HTTP.jl's *request*-handler path writes 
 only the stream-handler path Nitro serves through buffers, and it has no switch. So Nitro now writes
 a known-length streaming body itself on HTTP/1.1 (`_write_fixed_body_live!` in
 `src/core/transport.jl`): the head, then each chunk to the connection, the length enforced. The
-cost is reaching HTTP internals, canaried in `test/http_internals_contract_tests.jl`, until HTTP.jl
-offers a public way to do it — requested in
-[JuliaWeb/HTTP.jl#1384](https://github.com/JuliaWeb/HTTP.jl/issues/1384). The behavioral pin is `test/streaming_write_tests.jl`, which checks
+cost is reaching HTTP internals, canaried in `test/http_internals_contract_tests.jl`. HTTP.jl 2.9
+offers the public way it was waiting for, an explicit `startwrite` that streams a fixed-length body
+([JuliaWeb/HTTP.jl#1389](https://github.com/JuliaWeb/HTTP.jl/pull/1389), closing the request in
+[JuliaWeb/HTTP.jl#1384](https://github.com/JuliaWeb/HTTP.jl/issues/1384)), and moving onto it is
+[#529](https://github.com/PingoLee/Nitro.jl/issues/529). The behavioral pin is `test/streaming_write_tests.jl`, which checks
 that the head and first chunk reach the client *while the body is still being read* — a check on
 when bytes hit the wire, which is the one thing #41's tests could not see. HTTP/2 was never
 affected: there a FIXED write is a live DATA frame.

@@ -480,8 +480,9 @@ end
 
 @testset "read_header_timeout bounds the head (Slowloris)" begin
     # A behavior pin, not a regression test: an explicit value was forwarded to HTTP.jl before
-    # #316 too. It pins that the head bound still holds through Nitro's deadline clearing, which
-    # must never run before a head has been parsed.
+    # #316 too. It pins that the head bound still holds now that the deadline is released after
+    # the head (HTTP.jl 2.9, JuliaWeb/HTTP.jl#1382; Nitro's own clear before that), which must never happen before
+    # a head has been parsed.
     ctx = _echo_context()
     port = get_free_port()
     _serve(ctx, port; read_header_timeout = 0.5)
@@ -496,13 +497,14 @@ end
 end
 
 @testset "read_header_timeout does not bound the body (Go semantics)" begin
-    # The regression this cluster exists for. HTTP.jl leaves the header deadline armed through
-    # the body read when `read_timeout` is unset, so against unpatched Nitro a body that finishes
-    # after the header timeout is cut mid-read — and surfaced as a 500, see the next testset.
+    # The regression this cluster exists for. Through 2.8, HTTP.jl left the header deadline armed
+    # through the body read when `read_timeout` was unset (JuliaWeb/HTTP.jl#1381), so a body that
+    # finished after the header timeout was cut mid-read -- and surfaced as a 500, see the next
+    # testset. Nitro cleared it itself until 2.9 did (JuliaWeb/HTTP.jl#1382); this is what proves 2.9 still does.
     #
     # The window is generous for the reason given in the keep-alive testset below (#483): the
-    # connection task's first read, the head parse and the clear must all land inside it, and
-    # 0.5 s races a loaded runner.
+    # connection task's first read, the head parse and HTTP's release of the header deadline
+    # (`_set_read_deadline_for_body!`) must all land inside it, and 0.5 s races a loaded runner.
     ctx = _echo_context()
     port = get_free_port()
     _serve(ctx, port; read_header_timeout = 2)
@@ -1217,15 +1219,16 @@ function _second_request_late_body(port; gap)
 end
 
 @testset "a keep-alive request's body is not cut by the idle deadline" begin
-    # Review finding on #316. After each response HTTP.jl arms the IDLE deadline, and with
-    # `read_header_timeout = 0` nothing replaces it before the next request's body is read. The
-    # clear used to be skipped whenever the header timeout was 0 ("nothing was armed"), so every
-    # request after the first on a connection had its body cut `idle_timeout` after the previous
-    # response — 120 seconds by default. Unpatched, the second request below is a 408.
+    # Review finding on #316. After each response HTTP.jl arms the IDLE deadline, and through 2.8,
+    # with `read_header_timeout = 0`, nothing replaced it before the next request's body was read:
+    # every request after the first on a connection had its body cut `idle_timeout` after the
+    # previous response — 120 seconds by default — until Nitro's own clear covered that case too.
+    # HTTP.jl 2.9 re-arms the deadline for the body itself (JuliaWeb/HTTP.jl#1382); against 2.8 without that clear,
+    # the second request below is a 408.
     #
     # What this pins is `gap > window`, not a small window. The second head must still get there
-    # and be parsed within `window` of the first response, or the deadline answers 408 before the
-    # clear can run. At 0.5 s a loaded runner missed that (#483: Windows at 1 thread, macOS at 2).
+    # and be parsed within `window` of the first response, or the idle deadline closes the
+    # connection first. At 0.5 s a loaded runner missed that (#483: Windows at 1 thread, macOS at 2).
     window = 2.0
     for kw in ((; read_header_timeout = 0, idle_timeout = window),
                (; read_header_timeout = window, idle_timeout = window))
@@ -1239,6 +1242,70 @@ end
         finally
             Nitro.Core.terminate(ctx)
         end
+    end
+end
+
+@testset "the keep-alive wait is idle_timeout's, not read_header_timeout's (HTTP.jl 2.9)" begin
+    # Through HTTP.jl 2.8 the header deadline was armed before the wait for the next request, so
+    # `read_header_timeout` was the keep-alive idle limit and answered an idle connection with an
+    # unsolicited 408 (JuliaWeb/HTTP.jl#1381). Since 2.9 (JuliaWeb/HTTP.jl#1382) the wait is
+    # `idle_timeout`'s, the header deadline starts with the next request's first byte, and an
+    # idle close writes nothing. `docs/src/tutorial/reverse_proxy.md` sizes `idle_timeout`
+    # against a proxy on this.
+    # A 2 s header window, not 0.5 s: each head must be read and parsed inside it, and 0.5 s
+    # loses that race on a loaded runner (#483, as in the testsets above).
+    header, idle = 2.0, 8.0
+    # One keep-alive request, read to the end of its response so nothing is left for later reads.
+    function first_exchange(sock)
+        write(sock, "POST /echo HTTP/1.1\r\nHost: $HOST\r\nContent-Length: 5\r\n\r\nfirst")
+        seen = IOBuffer()
+        reader = @async while !endswith(String(seen.data[1:seen.size]), "first")
+            chunk = readavailable(sock)
+            isempty(chunk) && break
+            write(seen, chunk)
+        end
+        timedwait(() -> istaskdone(reader), 15.0; pollint = 0.02) === :ok ||
+            return "(first response incomplete)"
+        return String(take!(seen))
+    end
+    read_rest(sock) = @async try
+        String(read(sock))
+    catch e
+        read_failed(e)
+    end
+
+    ctx = _echo_context()
+    port = get_free_port()
+    _serve(ctx, port; read_header_timeout = header, idle_timeout = idle)
+    try
+        sock = Sockets.connect(Sockets.localhost, port)
+        try
+            @test startswith(first_exchange(sock), "HTTP/1.1 200")
+            # Idle past the header timeout, well inside the idle one: still open.
+            sleep(1.5header)
+            write(sock, "POST /echo HTTP/1.1\r\nHost: $HOST\r\nContent-Length: 6\r\n" *
+                        "Connection: close\r\n\r\nsecond")
+            rest = read_rest(sock)
+            @test timedwait(() -> istaskdone(rest), 15.0; pollint = 0.05) === :ok
+            reply = fetch(rest)
+            @test startswith(reply, "HTTP/1.1 200")
+            @test endswith(reply, "second")
+        finally
+            close(sock)
+        end
+
+        # And past the idle timeout the connection closes without a response.
+        sock = Sockets.connect(Sockets.localhost, port)
+        try
+            @test startswith(first_exchange(sock), "HTTP/1.1 200")
+            rest = read_rest(sock)
+            @test timedwait(() -> istaskdone(rest), idle + 15.0; pollint = 0.05) === :ok
+            @test fetch(rest) == ""
+        finally
+            close(sock)
+        end
+    finally
+        Nitro.Core.terminate(ctx)
     end
 end
 

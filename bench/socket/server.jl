@@ -215,8 +215,8 @@ PROFILE_S > 0 && @eval function profile_window()
                       sortedby = :count, groupby = :thread, mincount = 20)
     end
     # The interactive thread(s) alone, as a tree: HTTP.jl's accept loop and every connection task
-    # run there, so this is where `read_request`, Nitro's `_clear_header_deadline!` and the
-    # `@spawn` wake-up show up against each other (#462). Selected by pool, not by id, so it stays
+    # run there, so this is where `read_request` and the `@spawn` wake-up show up against each
+    # other (#462). Selected by pool, not by id, so it stays
     # right if the numbering ever changes. C frames are kept: without them a stop-the-world GC is
     # charged to whatever Julia allocation site the thread was parked at, which reads as a parser
     # cost. The GC line is the window's wall time spent collecting -- every thread pays it.

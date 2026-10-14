@@ -74,17 +74,18 @@ Nitro's own limits are the floor underneath, for a process the proxy is not in f
 
 | Limit | Default | What it bounds |
 |---|---|---|
-| `read_header_timeout` | 120 s | How long a connection may take to send a complete request head, and on HTTP/1.1 how long a keep-alive connection may sit idle. A Slowloris client is answered `408` and dropped |
+| `read_header_timeout` | 120 s | How long a connection may take to send a complete request head, counted on a keep-alive connection from the next request's first byte. A Slowloris client is answered `408` and dropped |
+| `idle_timeout` | 120 s | How long a keep-alive connection may sit idle between requests before it is closed |
 | `max_body_bytes` | 64 MiB | How much one request body may hold |
 | `max_concurrent_requests` | off | How many requests are held at once, and so, with `max_body_bytes`, how much body memory. Over it, a request is answered `503` before its body is read. A WebSocket holds one of these slots for as long as it is open, unless `max_upgraded_connections` gives WebSockets their own budget (and its handshake carried no body); see [Bounding requests in flight](@ref) |
 | `max_upgraded_connections` | off | How many WebSockets are open at once — how many, not how much memory each holds. A socket counts here from its handshake, and once its `101` is sent it no longer counts against `max_concurrent_requests` — unless the handshake carried a body; over it, an upgrade is answered `503` |
 | `read_timeout` | off | How long the body may take once the head has arrived. Off because a legitimate large upload over a slow link can take minutes; turn it on when the proxy is not buffering bodies for you |
 
 `read_header_timeout` deliberately does not cover the body, so a slow upload is only cut by
-`read_timeout`. It is 120 seconds, not a few, because it doubles as the keep-alive idle limit: an
-nginx `upstream` pool and an AWS ALB both close idle connections at 60 seconds, and a backend that
-closes them first races the proxy reusing them, which surfaces as sporadic `502`s. Keep it above
-your proxy's idle timeout if you lower it.
+`read_timeout`. `idle_timeout` is the one to size against your proxy: an nginx `upstream` pool and
+an AWS ALB both close idle connections at 60 seconds, and a backend that closes them first races
+the proxy reusing them, which surfaces as sporadic `502`s. Keep it above your proxy's idle
+timeout if you lower it.
 
 The other half of capacity is the process itself: how many threads it starts with, and how much
 memory its garbage collector aims for. Both are covered in

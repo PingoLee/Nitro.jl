@@ -5,9 +5,10 @@ using HTTP
 using Nitro
 using Nitro: path
 
-# #375. HTTP.jl sniffs the cleartext HTTP/2 preface on every plain listener and has no switch
-# to turn it off; Nitro overrides that probe for its own servers (`src/core/lifecycle.jl`), so the
-# preface reaches the HTTP/1.1 parser and no HTTP/2 frame is ever read or written.
+# #375. HTTP.jl serves the cleartext HTTP/2 preface on a plain listener unless `listen!` gets
+# `allow_h2c = false` (HTTP.jl 2.9); Nitro always passes it (`preprocesskwargs` in
+# `src/core/lifecycle.jl`), so the preface reaches the HTTP/1.1 parser and no HTTP/2 frame is
+# ever read or written.
 
 const H2_PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 
@@ -91,7 +92,7 @@ end
 @testset "a custom handler is refused too" begin
     ctx = _h2c_context()
     port = get_free_port()
-    # `serve` wraps every handler in `NitroStreamHandler`, which is what the override keys on.
+    # The refusal is a `listen!` keyword, so it does not depend on which handler `serve` wraps.
     _serve(ctx, port; handler = mw -> Nitro.Core.stream_handler(mw), max_body_bytes = nothing)
     try
         @test startswith(raw_exchange(port, [H2_PREFACE]; limit = 10.0), "HTTP/1.1 400")
@@ -99,6 +100,31 @@ end
     finally
         Nitro.Core.terminate(ctx)
     end
+end
+
+@testset "`allow_h2c = true` is refused at the call, before anything starts" begin
+    # HTTP.jl accepts the keyword since 2.9, so it would otherwise ride `serve`'s `kwargs...`
+    # to `listen!` and turn h2c back on.
+    ctx = _h2c_context()
+    @test_throws "allow_h2c" _serve(ctx, get_free_port(); allow_h2c = true)
+    @test isnothing(ctx.service.server[])
+    @test_throws "allow_h2c" _serve(ctx, get_free_port(); allow_h2c = 1)
+    @test isnothing(ctx.service.server[])
+
+    # `false` is what Nitro passes anyway, so saying it is fine -- and it reaches the Server.
+    srv = _serve(ctx, get_free_port(); allow_h2c = false)
+    try
+        @test srv.allow_h2c === false
+    finally
+        Nitro.Core.terminate(ctx)
+    end
+    srv = _serve(ctx, get_free_port())
+    try
+        @test srv.allow_h2c === false
+    finally
+        Nitro.Core.terminate(ctx)
+    end
+    @test Nitro.Core.preprocesskwargs(pairs((;)))[:allow_h2c] === false
 end
 
 end

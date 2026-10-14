@@ -296,8 +296,8 @@ end
         )
     end
 
-    # The transport layer (#450): `NitroStreamHandler` → the header-deadline clear → the spawn →
-    # `stream_handler` → this pipeline, for the listener a default `serve` builds. COMPILED, not
+    # The transport layer (#450): `NitroStreamHandler` → the spawn → `stream_handler` → this
+    # pipeline, for the listener a default `serve` builds. COMPILED, not
     # run. Running it needs a live connection: `stream_handler` closes the write side itself
     # (#453), and HTTP's socket-free `Stream(request)` has no connection to close. `precompile`
     # needs only the types, and `_default_serve_listener` builds them through the same function

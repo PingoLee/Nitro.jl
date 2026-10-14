@@ -163,28 +163,9 @@ Base.show(io::IO, s::Server{<:NitroStreamHandler}) =
     print(io, "HTTP.Server(", something(s.bound_address, s.address), ")")
 Base.show(io::IO, ::MIME"text/plain", s::Server{<:NitroStreamHandler}) = show(io, s)
 
-# Nitro speaks HTTP/1.1 only (#375). HTTP.jl sniffs every plaintext connection for the cleartext
-# HTTP/2 (h2c) prior-knowledge preface and has no switch to turn that off, so without this any
-# client could opt into its h2 frame loop, and into Nitro's stream-level code on h2 streams, which
-# was written for HTTP/1.1: a 413 or 503 refusal cannot bound its swallow in time there (an
-# announced body that never arrives holds a `max_concurrent_requests` slot indefinitely), and
-# HTTP.jl's h2 server leaks flow-control credit and stream state when it discards a body. No
-# browser speaks h2c, and `serve` binds plaintext only, so HTTP/2 belongs at the TLS-terminating
-# proxy. Go (`Protocols.SetUnencryptedHTTP2`) and Node (a separate `http2.createServer`) also keep
-# h2c off a plain listener by default.
-#
-# Reporting "not h2" with nothing consumed hands the connection to the HTTP/1.1 parser untouched;
-# a preface then fails as a request line with no `Host` and is answered 400 with the connection
-# closed. `_serve_h1_conn!` arms its own header deadline, so the probe's is not missed. Constrained
-# to `NitroStreamHandler` like the `show` above: not piracy, and no other `HTTP.Server` changes.
-# `conn` is typed as in HTTP's method, or the two are ambiguous. Deleting this method re-enables
-# h2c; the internals it names are canaried in test/http_internals_contract_tests.jl.
-HTTP._probe_h2_preface!(::Server{<:NitroStreamHandler}, conn::HTTP.TCP.Conn) =
-    (false, HTTP._ServerPrefaceConn(UInt8[], conn))
-
 # The stream handler `serve` hands HTTP.jl, built around an assembled pipeline, outermost last:
-# Nitro's `stream_handler` (or a custom `handler`), the per-request spawn when `parallel`, the
-# header-deadline clear, and the `NitroStreamHandler` wrapper that gives it a secret-safe `show`.
+# Nitro's `stream_handler` (or a custom `handler`), the per-request spawn when `parallel`, and the
+# `NitroStreamHandler` wrapper that gives it a secret-safe `show`.
 # Returns `(listener, request_handler)`: what HTTP.jl calls on the connection task, and the
 # handler the spawn runs on the request's own task.
 #
@@ -202,9 +183,7 @@ function _serve_listener(pipeline::Function, handler, body_limit::Int64, request
                                                                          security_headers.headers) :
         handler(pipeline)
     spawned = parallel ? parallel_stream_handler(request_handler) : request_handler
-    # Outside the parallel spawn, so the header deadline is cleared on the connection task the
-    # moment the head is parsed (#316; see `header_deadline_handler`, src/core/transport.jl).
-    return NitroStreamHandler(header_deadline_handler(spawned)), request_handler
+    return NitroStreamHandler(spawned), request_handler
 end
 
 # `_serve_listener` for an `App` served with every default `serve` has: no middleware, the access
@@ -365,6 +344,7 @@ function serve(ctx::App;
     # Same reasoning as the checks above (#316): HTTP.jl only sees these at `listen!`, which runs
     # after the App has been mutated, so a typo'd timeout would otherwise fail half-way through.
     _validate_server_timeouts(kwargs)
+    _validate_allow_h2c(kwargs)
 
     # Before any mutation, like the checks above (#315). A malformed prefix is refused here
     # rather than served as a listener that answers 404 to every request.
@@ -777,7 +757,32 @@ function preprocesskwargs(kwargs)
         haskey(kwargs_dict, name) || haskey(kwargs_dict, Symbol(name, :_ns)) ||
             (kwargs_dict[name] = default)
     end
+    # Nitro speaks HTTP/1.1 only (#375). HTTP.jl serves a plaintext connection that opens with the
+    # cleartext HTTP/2 (h2c) prior-knowledge preface as HTTP/2 unless told otherwise, and Nitro's
+    # stream-level code was written for HTTP/1.1: on an h2 stream a 413 or 503 refusal cannot bound
+    # its swallow in time (an announced body that never arrives holds a `max_concurrent_requests`
+    # slot indefinitely), and HTTP.jl's h2 server leaks flow-control credit and stream state when
+    # it discards a body. No browser speaks h2c, and `serve` binds plaintext only, so HTTP/2
+    # belongs at the TLS-terminating proxy. Go (`Protocols.SetUnencryptedHTTP2`) and Node (a
+    # separate `http2.createServer`) also keep h2c off a plain listener by default.
+    #
+    # With `allow_h2c = false` (HTTP.jl 2.9) every plain connection goes to the HTTP/1.1 parser
+    # untouched; a preface fails as a request line with no `Host` and is answered 400 with the
+    # connection closed. Before 2.9 there was no switch, and Nitro overrode HTTP's private preface
+    # probe instead. Written unconditionally: `_validate_allow_h2c` has already refused a caller
+    # who asked for anything else.
+    kwargs_dict[:allow_h2c] = false
     return kwargs_dict
+end
+
+# Refuse `serve(allow_h2c = true)` at the call, rather than quietly overriding it in
+# `preprocesskwargs` (#375). HTTP.jl accepts the keyword since 2.9, so without this check it
+# would ride `kwargs...` to `listen!` and look like a supported way to turn h2c back on.
+function _validate_allow_h2c(kwargs)
+    Base.get(kwargs, :allow_h2c, false) === false || throw(ArgumentError(
+        "`allow_h2c` must be `false`: Nitro serves HTTP/1.1 only on its plaintext listener " *
+        "(#375). Terminate HTTP/2 at a TLS proxy in front of Nitro instead."))
+    return nothing
 end
 
 # The server timeouts HTTP.jl's `listen!` accepts, in their seconds spelling (#316). `readtimeout`
