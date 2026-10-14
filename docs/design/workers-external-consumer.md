@@ -1,0 +1,401 @@
+# Workers: an opt-in out-of-process consumer
+
+Design record for [#514](https://github.com/PingoLee/Nitro.jl/issues/514): running a Workers queue
+in a **separate process**, for CPU, GC, memory and fault isolation, as an option and never the
+default. **Status: decided.** §10 records the maintainer's decisions (2026-10-14); implementation
+follows the plan in §9, one PR per step. Nothing here changes an app that does not opt in. It builds
+on #513's queue concurrency, `submit_queued_task` and `checkpoint!`
+([PR #523](https://github.com/PingoLee/Nitro.jl/pull/523)), and uses their names.
+
+> **TL;DR.** [#513](https://github.com/PingoLee/Nitro.jl/issues/513) bounds CPU-bound jobs *inside*
+> the web process (a queue's concurrency `k`, and `checkpoint!`). It cannot isolate garbage
+> collection, memory or crashes; only a process boundary can. The design: a queue's *placement*
+> becomes configuration (`"heavy" => External(on_lease_expiry = :requeue)`), and a separate
+> `Workers.consume!(app; queues = ["heavy" => 4])` process claims its runs from the shared store
+> under a **lease**. That needs three things Nitro does not have yet, in this order: a
+> claim/lease/requeue contract on the store (§3), **named jobs with serializable arguments** (§2),
+> and the consumer itself (§5–§7). Delivery on an external queue becomes **at-least-once** (§4),
+> which is the main semantic cost, so every external queue must say explicitly what a lost lease
+> does. A one-shot, process-per-run mode for rare heavy jobs falls out of the same pieces (§7).
+
+## 1. What #513 leaves on the table
+
+| failure in a job | in-process, bounded by #513 | external consumer |
+|---|---|---|
+| a Julia exception | caught; `FAILED`; server unaffected | the same, in the consumer |
+| CPU saturation | handlers share the threads, at most `k` of them | **handlers unaffected** |
+| GC pauses from heavy allocation | stop-the-world stops handlers too | **handlers unaffected** |
+| `OutOfMemoryError`, segfault, a C library abort, `exit()` | **the server dies** | **only the consumer dies**; its lease expires and the run is re-claimed or failed (§4) |
+| a heap that grows to a heavy run's peak and stays there | in the **web** process's RSS | in the consumer's, which can be recycled (§7) |
+
+The CPU row is what [#512](https://github.com/PingoLee/Nitro.jl/pull/512) measured: an unbounded
+64-job burst put `/health` at a p99 of about 4 seconds, in every thread layout. #513's bound brings
+that to about 10 ms ([PR #523](https://github.com/PingoLee/Nitro.jl/pull/523)), but only for the
+CPU; the next three rows need a process boundary.
+
+What it does **not** isolate: the store. A job that overloads the database, or holds locks there,
+still reaches the web process through it, and the consumer adds claim and heartbeat traffic. Measure
+store load as part of the work (§9).
+
+Each consumer process pays Nitro's memory floor (about 450 MiB), which is why this can never be the
+default.
+
+## 2. Named jobs with serializable arguments
+
+Today `submit_task` and `submit_queued_task` take a **closure**. A closure cannot cross a process
+boundary, so an external queue needs a job that both processes can name and load from the app's own
+code, plus arguments the store can persist.
+
+A job is registered by name on the app, with a typed argument struct, and submitted by name:
+
+```julia
+@kwdef struct FitArgs
+    dataset_id::Int
+    epochs::Int = 10
+end
+
+function setup_workers!(app)            # called by BOTH processes, see §5
+    declare_queues!(app, ["email", "heavy" => External(on_lease_expiry = :requeue)])
+    register_job!(app, "fit_model", FitArgs) do task_info, args::FitArgs
+        fit(args.dataset_id; epochs = args.epochs, on_batch = () -> checkpoint!(task_info))
+    end
+end
+
+submit_queued_task(app, "heavy", "fit-42", Job("fit_model", FitArgs(dataset_id = 42)), Owner(uid))
+```
+
+- **Arguments are JSON, bound to a declared type.** They are serialized with the store's existing
+  JSON path (and its depth limit, #344) and parsed back with JSON.jl into the registered type, the
+  same typed-binding tradition as `Json{T}`. A value that does not round-trip is refused **at submit
+  time**, not when the consumer reads it.
+- **Argument types evolve additively only.** During a rolling deploy, a job queued by the old version
+  of the app is run by the new one, so the new type must still bind the old JSON: add fields with
+  defaults (`@kwdef`, as above), and never rename, remove or retype one. The docs state this rule
+  next to `register_job!`.
+- **Arguments that do not bind are recorded `FAILED`, never re-queued.** The error names the job and
+  the argument type, so the operator can see which deploy broke the contract. Re-queueing would only
+  fail again on every consumer running the same code.
+- **Named jobs work in-process too**, on any queue. This is the property the design is after: once a
+  job is named, moving its queue between in-process and external is configuration only (subject to
+  the switch procedure in §5), with no change to the job or the submit call. Closures stay supported
+  in-process, for work that will never need isolation; the docs recommend the named form for
+  anything that might.
+- **An external queue refuses a closure at submit time**, with an error naming the queue and saying to
+  register the job. It must never become a run nobody can execute.
+- **The registry is per app**, not process-global, following #31: two `App`s in one process do not
+  share job names. **Registration is a call the app makes at startup, never a module-body side
+  effect**: `register_job!` writes app state, so the "no runtime side effects in module bodies" rule
+  applies to it as to everything else. Both processes call the same setup function (§5).
+- **A name the consumer does not know** (an old consumer during a rolling deploy) is recorded `FAILED`
+  with an error naming the job. It is not re-queued, for the same reason as an argument that does not
+  bind: re-queueing would loop until a new consumer arrives, which the supervisor, not the queue, is
+  responsible for.
+
+## 3. The store contract: claim, lease, renew, requeue
+
+`AbstractWorkerStore` is data access only (#167), and that stays true: every addition below is an
+atomic intent operation in the store, and everything that *runs* stays on a runtime.
+
+**What already exists, and what it covers.** `try_transition!` is a `run_id`-fenced compare-and-set
+in one SQL statement: its `WHERE` holds both the `run_id` and the `from` statuses, so a stale run's
+terminal write after a re-claim or a requeue (each under a fresh `run_id`) changes nothing. Claiming
+a *known* row is therefore already atomic across processes. What is missing is choosing *which* row,
+holding it for a bounded time, and taking it back.
+
+| Method | Contract |
+|---|---|
+| `claim_next!(store, queue_name, consumer_id; lease_seconds)` | Atomically pick the oldest `PENDING` row of `queue_name` **that was submitted as external** (`external = true`), move it to `RUNNING` with a **fresh** `run_id`, `claimed_by = consumer_id`, `lease_expires_at = now + lease` and `attempt + 1`, and return it; `nothing` if there is none |
+| `renew_leases!(store, consumer_id, runs, lease_seconds)` | `runs` is `(run_id, progress)` pairs. Push `lease_expires_at` forward and write `progress` for each, **fenced on `run_id` and on `status = RUNNING`**; return the run ids that matched. A run missing from the answer is no longer this consumer's to run (§6 says how it finds out why) |
+| `release_claim!(store, task_id, run_id)` | Hand a claim back: `RUNNING` → `PENDING` with a fresh `run_id` and `claimed_by` cleared, fenced on `run_id`. `attempt` is **not** charged back, so a run a consumer gives up on voluntarily still counts toward `max_attempts` |
+| `requeue_expired!(store, now; policies)` | For every `RUNNING` row whose lease expired: back to `PENDING` with a fresh `run_id` and `claimed_by` cleared, or `FAILED`, per its queue's policy and attempt bound. A row whose queue has **no** known policy (the queue is no longer declared anywhere) is `FAILED` with an error saying so: fail-closed, never stranded |
+
+- **PostgreSQL:** `claim_next!` is `UPDATE … WHERE id = (SELECT id … WHERE queue_name = $1 AND
+  external AND status = 'PENDING' ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING …`,
+  River's model. `SKIP LOCKED` is what lets several consumers claim concurrently without queueing on
+  one row.
+- **SQLite:** writers are serialized, so the same `UPDATE … RETURNING` without `SKIP LOCKED` is
+  already exclusive. It is correct and slower, which is fine for SQLite's use.
+- **`requeue_expired!` is conditional per row, not "one statement per policy".** It needs a fresh
+  `run_id` per row (SQLite has no UUID generator, so the store mints them in Julia) and two outcomes
+  under `:requeue` (below the attempt bound, and at it). It runs as a transaction over the expired
+  rows, and each row's write repeats the expiry in its `WHERE` (`status = 'RUNNING' AND
+  lease_expires_at < now AND run_id = <read>`). A consumer renewing at the same moment then either
+  renews first, and the requeue skips the row, or loses its fence, and the requeue wins. Never both,
+  under PostgreSQL's re-check of a statement's own `WHERE` after a lock wait (the property #379 relies
+  on). Renew deliberately does **not** fence on `lease_expires_at >= now`: a late renew of a lease
+  nobody has taken yet is harmless, and is exactly what a GC pause produces (§6).
+- **The SQL lives only in `ext/NitroPormGExt.jl`** (workers §6). A backend that does not implement
+  these methods does not support external queues, and says so at start (§5).
+- **New columns:** `external`, `job_name`, `job_args`, `claimed_by`, `lease_expires_at`, `attempt`,
+  and `cancel_reason`, which `cancel_task` writes in the same statement as `CANCELLED` so a consumer
+  can read back *why* (§6). They are added the way `run_id` was (#366): probe, then `ALTER`, never a
+  destructive migration.
+- **`run_id` gets new writers, so its invariant changes.** Today the store contract says `run_id` is
+  written only by `replace_task!` (`registry.jl`, `types.jl`). `claim_next!`, `release_claim!` and
+  `requeue_expired!` now mint one too, each as part of the same fenced statement. The first PR updates
+  that invariant where it is stated.
+- **A fresh `run_id` per claim** is what fences a consumer that was presumed dead but was only
+  partitioned. When its lease is taken back, every write it makes afterwards fails its `run_id` CAS,
+  exactly the #108 defect class, already closed.
+- **`cancel_task` must retry across a claim.** Today it reads the record, then CASes on the `run_id`
+  it read. A cancel that reads a `PENDING` row and loses its CAS to `claim_next!` (which minted a new
+  `run_id`) reports *"Task was re-submitted; the run you asked to cancel has already ended"*, which is
+  wrong, and the cancel is lost. The fix: when the CAS fails and the record still has the **same
+  `created_at`**, the key was claimed, re-claimed or re-queued rather than replaced, so re-read and
+  retry. A re-submit mints a new `created_at` (`replace_task!`), and that case keeps today's answer.
+  Because ownership of the key has not changed, the #108 authorization concern does not apply to the
+  retry.
+
+**Who runs `requeue_expired!`.** Every consumer, on each heartbeat tick **and once before its first
+claim**, so a one-shot consumer that finds nothing to do still adjudicates its crashed predecessor's
+row. And the web process's retention tick, as the fallback for a queue whose last consumer is gone.
+That tick is coarse (it needs `cleanup_enabled`, and defaults to 24 hours), so the docs say a
+deployment relying on it should shorten `cleanup_interval_hours`. It is a store CAS, so it is safe
+from any process and idempotent across all of them.
+
+**The zombie sweep and leased rows, in both directions.** `recover_zombie_tasks!` marks `RUNNING`
+rows with no handle *in this process* as `FAILED`, and `start!` runs it unbounded by default
+(`recover_zombies = true`, `zombie_min_age = nothing`).
+- **In the web process**, it would fail every run a consumer is executing. Liveness for a leased row
+  is the lease, not a local handle, so the sweep skips rows with a `claimed_by`, and
+  `requeue_expired!` is the only thing that adjudicates them.
+- **In a consumer**, it would fail every *in-process* run the web is executing: those rows have no
+  `claimed_by` and no handle in the consumer. So `consume!` never runs the unleased sweep. It is
+  forced off, not a keyword, because every external deployment is multi-process by construction, and
+  one-shot mode would otherwise fail the web's live jobs on every launch.
+
+Both halves are a hard requirement (§9): the web half of the **first** PR, the consumer half of the
+PR that adds `consume!`.
+
+## 4. Delivery semantics: at-least-once
+
+A consumer that dies mid-run leaves a claim whose lease expires, and another consumer runs it again.
+Jobs on an external queue must therefore be **idempotent**, and the docs must say so plainly, next to
+the queue declaration and not only in a reference section. This is the price of isolation and the
+main semantic difference from the in-process mode.
+
+- **What a lost lease does has no default; every external queue declares it.** `External()` takes
+  `on_lease_expiry = :requeue` or `on_lease_expiry = :fail`, and omitting it is an `ArgumentError` at
+  `start!`/`worker_startup`/`consume!`. The right answer depends on whether the job is idempotent,
+  which only the app knows, and a default of `:requeue` would let an email or a charge repeat
+  silently. It is the fail-closed posture #515 took for denial responses, and the one #519 asks of
+  guard results.
+- **`:requeue`** puts the run back to `PENDING` under a fresh `run_id`, until it has been claimed
+  `max_attempts` times (default `3`). Past that, the run is `FAILED` with an error saying so, which is
+  the dead-letter state #19's vocabulary needs. A separate dead-letter table is not proposed.
+  **`:fail`** records `FAILED` on the first expiry, and `max_attempts` does not apply.
+- **A run handed back on purpose is not an expiry.** A drain or a lost lease returns the claim with
+  `release_claim!` (§7), whatever the policy: nothing failed, and a `:fail` queue would otherwise lose
+  every run in flight at each deploy. `attempt` is still charged, so a job that keeps being handed
+  back still reaches its bound.
+- **Uniqueness is already the task id.** A `:user`- or `:global`-scoped key already deduplicates a
+  submit onto a live run (#19), across processes, because the check is the store's.
+- **Ordering:** an external queue's items start in submit order per claim, but a re-queued item goes
+  back to its original position (`ORDER BY created_at`) and can overtake later items. An external
+  queue with `k = 1` is therefore not a strict FIFO across a consumer crash, and the docs say so.
+
+## 5. Placement is configuration, and impossible configurations fail at start
+
+**Both processes run the same setup function.** The queue declarations and the job registrations
+live in an app function (`setup_workers!` in §2) that the web process calls before `serve` and the
+consumer calls before `consume!`. Today `worker_startup(app; queues)` declares queues inside the
+`serve` middleware, which a consumer never builds; so for external queues the declaration moves to
+`declare_queues!`, and `worker_startup` / `consume!` read the app's declarations rather than taking
+their own. That is what makes *"the two processes cannot disagree"* true rather than hoped for.
+
+```julia
+# web process
+setup_workers!(app)
+serve(app; middleware = [worker_startup(app; store)])
+
+# consumer process, started with `julia -t 4,1`: the same app code, without serve()
+setup_workers!(app)
+Workers.consume!(app; store, queues = ["heavy" => 4])    # 4 = this process's concurrency (#513's k)
+```
+
+- **Placement and concurrency are different settings.** The declaration says *where* a queue runs
+  (`"compute" => 6` in-process, or `External(…)`). A consumer's `k` says *how many of its runs this
+  process executes*; it is a `consume!` argument, not a re-declaration, so #523's rule that a name is
+  declared once with one setting is untouched. Two consumers with `k = 4` run eight.
+- **The web process mints no processors for an external queue**, and an external name is never
+  "undeclared": `allow_undeclared_queues` does not apply to it.
+- **Rows record their placement.** A submit to an external queue writes `external = true`, and
+  `claim_next!` claims only those, so a consumer can never take a row the web queued in-process under
+  the same name (and holds in a channel).
+- **Switching a queue's placement is a deploy step, not only a config edit.** In-process → external:
+  rows already queued in-process stay in the web's channel and run there; new submits go external.
+  External → in-process: stop the consumers once the queue is empty. Rows still `PENDING` with
+  `external = true` are reported by the web's `start!` (`@warn` with the count) and stay claimable by
+  any consumer still running. The docs give both procedures.
+- **Admission is bounded through the store.** An external submit has no local channel and no local
+  run to release a reservation, so #523's `:queue` slot and the runtime's owner counter do not apply.
+  In their place, `External(…; max_pending = 100)` refuses a submit (`WorkerCapacityError(:queue, …)`,
+  a `503`) when the store counts that many `PENDING` external rows for the queue, and
+  `max_runs_per_owner` is counted in the store for external queues. Both are counts read before an
+  insert, so under concurrent submits they are approximate by a few rows. The docs say so: they bound
+  the backlog against runaway callers (the #324 class); they are not exact quotas. A consumer applies
+  no owner limit at claim time: the submit side already bounded the owner, and a claim-time limit
+  would let one owner's backlog stall the queue for everyone behind it.
+
+Refused at `start!`/`worker_startup`/`consume!`, never later:
+
+- `External()` with no `on_lease_expiry` (§4).
+- `External()` on a store that cannot claim: `InMemoryWorkerStore` is invisible to every other
+  process, so a run submitted there would never happen.
+- `consume!` with no queues, or with a queue the app does not declare `External(…)`.
+- `consume!` in a process with no interactive thread (§6).
+- An external queue with a closure submitted to it (at submit time, §2).
+
+## 6. Heartbeat, cancellation and progress
+
+- **The heartbeat is per consumer process, not per run.** One task renews every lease the process
+  holds in one `renew_leases!` call per tick, at a third of the lease. A per-run heartbeat inside
+  `checkpoint!` would let a job that never calls it lose its lease while healthy, which is the failure
+  a heartbeat exists to prevent.
+- **The heartbeat runs on the interactive thread.** A CPU-bound job holds a `:default` thread without
+  yielding (#467), so a heartbeat on `:default` can be starved by the very jobs it reports on. This
+  is the one place Nitro puts its own work on the interactive thread on purpose; it is a cheap
+  periodic store write, not a handler. **`consume!` refuses to start** (`ArgumentError`) when
+  `Threads.nthreads(:interactive) == 0`, and the error says to start the consumer with `-t k,1`.
+  This is an exception to `concurrency.instructions.md` §3 (background tasks spawn on `:default`),
+  and the PR that adds it amends that rule file with the maintainer's agreement.
+- **Under `-t k,1`, thread 1 is the interactive thread**, so a SIGINT can land in the heartbeat
+  (`deployment.md` says thread 1 runs none of Nitro's loops; that changes for a consumer). The
+  heartbeat treats an `InterruptException` as a stop request: it starts the drain (§7) and keeps
+  renewing until the drain ends, with one `@warn`, never a crash.
+- **The lease must outlast the worst stop-the-world GC pause.** A collection stops the interactive
+  thread too, so a pause longer than the lease's unrenewed remainder lets `requeue_expired!` take a
+  healthy run. The lease is configurable, `consume!(…; lease = Second(60))` by default, and the
+  docs state that rule next to it, with the heartbeat lateness measured in §9 as the evidence for the
+  default.
+- **When a renew does not match, the heartbeat reads why.** A run missing from `renew_leases!`'s
+  answer is no longer this consumer's, and job code must be able to tell *"I was cancelled"* (clean up
+  and stop) from *"I lost my lease"* (stop, and assume the run will happen again). So the heartbeat
+  reads the stored record and sets that run's in-process token by what it finds:
+
+  | stored record | reason set on the run's token | what the job should do |
+  |---|---|---|
+  | `CANCELLED` | **the cancel's own reason**, e.g. `:user`, read from `cancel_reason` | clean up and stop |
+  | another `run_id`, **same** `created_at` (re-queued, or re-claimed) | `:lease_lost` | stop, and assume the run will happen again |
+  | another `run_id`, **new** `created_at` (the key was re-submitted) | `:superseded` | stop; a new run owns the key |
+  | gone (released or pruned) | `:superseded` | stop; nothing of this run is wanted any more |
+  | another terminal status under another `run_id` | `:superseded` | stop |
+
+  `:lease_lost` joins `CANCEL_REASONS` and is never used for a cancel a person asked for. A cancel
+  followed within one tick by a re-submit or a `release_task!` reads as `:superseded`, not `:user`;
+  both mean "stop, this run is not wanted", which is what the job needs to know. `checkpoint!` throws
+  on any of them, exactly as it does in-process; no per-call store read is added to it, so its cost
+  stays #513's measurement.
+- **Progress is persisted by the heartbeat**, in the renew statement (`renew_leases!` takes it).
+  `update_progress!` writes only the in-process object today, so without this a web reader would see
+  no progress until the terminal write.
+- **Status, watchers and cancel** already go through the store, so the web side's task API is
+  unchanged, apart from `cancel_task`'s retry (§3).
+
+## 7. Lifecycle, recycling, and one-shot runs
+
+**A consumer gives work back; it does not cancel it.** In-process, a drain sets `:shutdown` and a run
+that unwinds on it is recorded `CANCELLED` (PR #523). A consumer must not do that: the run is still
+wanted, and the next consumer should run it. So on a consumer, a run that ends on `:shutdown` or
+`:lease_lost` (whether through `checkpoint!` or a callback that polls `cancel_requested` and returns)
+hands its claim back with `release_claim!` instead of recording a terminal state, and its return value
+is discarded. A `:lease_lost` run's `release_claim!` simply loses its fence, since the claim is
+already gone. Only a cancel a person or a deadline asked for is terminal.
+
+- **Stopping.** Nitro has no SIGTERM handler today; `serve` drains on Ctrl-C and on `terminate`. The
+  PR that adds `consume!` decides how a supervisor's stop request reaches it (an explicit handler, or
+  `SIGINT` delivered as `InterruptException`) and tests it. Either way the stop runs the drain: stop
+  claiming, set every held run's token to `:shutdown`, keep the heartbeat renewing until the drain
+  ends, wait up to the drain timeout, then exit. Runs that unwound were handed back; a run still going
+  at exit keeps its lease until it expires, and is then adjudicated by its queue's policy (§4). The
+  drain follows `concurrency.instructions.md` §3–§4: every start has a stop on every path (#427), and
+  shutdown code never throws.
+- **Recycling is not a drain.** A process's RSS rises to a heavy run's peak and tends to stay there,
+  and the established fix is to recycle: `consume!(…; max_runs = 500, max_rss_mb = 2048)`. Past
+  either bound it **stops claiming and waits for the runs it holds to finish**, with no cancellation
+  token and no timeout, then exits, and the supervisor restarts it. Reusing the drain here would set
+  `:shutdown` on healthy runs and abandon them after the drain timeout, every time. The cost is the
+  restart's compile time; a sysimage helps (`deployment.md`).
+- **One-shot mode for rare heavy jobs.** A few very heavy jobs a day should not keep a 450 MiB
+  process alive for 24 hours. That is `consume!(…; max_runs = 1, exit_when_idle = true)`: run
+  `requeue_expired!`, claim one, run it to completion (`max_runs` is a recycle, so it waits), and
+  exit. `exit_when_idle` means *nothing claimable **and** nothing held*, so it never exits under a
+  running job.
+
+**The launcher is an external scheduler** (decided, §10). Heavy jobs in this case run on a fixed
+schedule, which a scheduler already expresses. The documented examples are a **systemd timer** unit
+and a **Kubernetes `CronJob`**, each starting the one-shot consumer shortly after the job's submit
+time; a note covers **KEDA** for scaling a consumer from zero on queue depth, where a cluster runs
+it. That needs nothing from Nitro but `exit_when_idle`, and keeps the supervisor owning processes,
+which is this design's premise.
+
+| launcher | for | against |
+|---|---|---|
+| **an external scheduler** (decided): a systemd timer, a Kubernetes `CronJob`; KEDA as an option | fully decoupled; the supervisor owns processes | infrastructure outside Nitro; fits schedule- or depth-driven launches only |
+| the web process spawns a one-shot `julia` per enqueue | one deployment, no extra infrastructure | couples launch to the web process, the coupling §8 rejects for long-lived workers. **Deferred**: it needs a defined restart story and a bound on live children, and becomes a separate decision only if a user-triggered heavy job needs it |
+| a long-running consumer with `max_runs = 1` under a restarting supervisor | simplest | the restarted process idles at the floor until the next run, which defeats the point |
+
+## 8. Not this design
+
+- **Workers spawned by the web process** (`Distributed`, Malt). It looks simpler, one command to
+  deploy, but it ties the workers' lifecycle to the server's (if the server dies, they die),
+  complicates code loading, and pulls toward the cluster model Nitro deliberately does not have.
+  Separate services under one supervisor also **scale independently**: more consumers or a larger
+  `k` for a backlog, more web capacity for traffic.
+- **A message broker** (Redis streams, RabbitMQ). The task table already is the queue, and
+  `SKIP LOCKED` makes it a correct one; River and Oban run production queues on exactly this. A
+  Redis *store* (#9) is a second claim/lease backend, not a different design.
+
+## 9. Plan
+
+Each step is its own PR, landable and useful alone:
+
+1. **Store contract** (§3): the columns, `claim_next!`, `renew_leases!`, `release_claim!`,
+   `requeue_expired!` (with its fail-closed rule for unknown queues), their `NitroPormGExt`
+   implementations, the updated `run_id` invariant, `cancel_task`'s retry across a claim, and
+   conformance tests on SQLite plus the real-Postgres job (#407). **Hard requirement of this PR: the
+   web's zombie sweep skips leased rows.** Without it, the first consumer PR marks its own runs
+   `FAILED`.
+2. **Named jobs** (§2), in-process first, with no external queue yet: `declare_queues!`, the
+   registry, typed binding, the additive-evolution rule, and a test that a job queued under an older
+   argument type still binds after a field with a default is added. This is useful on its own and is
+   what makes the switch later a configuration change.
+3. **`External(…)` and `consume!`** (§5–§7): placement on the row, store-counted admission, the
+   start-time refusals, the heartbeat and its reason mapping, hand-back on drain, the stop mechanism,
+   and the `concurrency.instructions.md` amendment. **Hard requirement of this PR: `consume!` never
+   runs the unleased zombie sweep.** An end-to-end test with two processes sharing a PormG store
+   covers: a consumer killed mid-run, its lease expiring, the run re-claimed or failed per its
+   declared policy; a drained consumer handing a `checkpoint!`ing run back rather than cancelling it;
+   a user cancel reaching the consumer as `:user` and a stolen lease as `:lease_lost`; a consumer
+   starting while the web runs in-process jobs, which must stay untouched; and the web process
+   unaffected throughout. **Measure the heartbeat's lateness under a heavily allocating job**, which is
+   the evidence for the default lease (§6).
+4. **Recycling and one-shot** (§7), with RSS measured before, during and after a heavy run on the
+   Julia versions CI covers, and the systemd timer and `CronJob` examples run once against it.
+5. **Docs**: deployment (two services, one supervisor, the shared setup function, the placement
+   switch procedure), idempotency and the `on_lease_expiry` choice, the fault-isolation table, and
+   store-load numbers from step 3's test.
+
+Additive throughout: an app that never uses `External(…)` or named jobs changes nothing, so none of
+it needs an `upgrading/` entry. `consume!` is also the natural entry point for #8 (extracting
+`NitroWorkers.jl`), so this design feeds that issue's extraction criteria.
+
+## 10. Decisions (recorded 2026-10-14)
+
+1. **Named jobs: accepted.** `register_job!(app, name, ArgsType) do task_info, args … end` with
+   JSON-bound typed arguments, available in-process too. Argument types evolve additively only;
+   arguments that do not bind are `FAILED` with an error naming the job and the type, never
+   re-queued (§2).
+2. **Lease-expiry policy: no default.** `External()` must declare `on_lease_expiry = :requeue | :fail`,
+   and omitting it is an `ArgumentError` at `start!`, because the choice depends on idempotency and a
+   default would let a side effect repeat silently. `max_attempts` stays, default `3` under
+   `:requeue` (§4, §5).
+3. **Heartbeat on the interactive thread: accepted**, with `consume!` refusing to start without one,
+   and a configurable lease that must exceed the worst stop-the-world GC pause, measured in §9 (§6).
+4. **`:lease_lost`: accepted, and never used for a user cancel.** A run whose renew fails takes the
+   stored cancel's own reason when the record is `CANCELLED`, and `:lease_lost` only when the same
+   submission was re-queued or re-claimed (§6).
+5. **One-shot launcher: external scheduler first** (a systemd timer and a Kubernetes `CronJob`
+   documented, KEDA as an optional note). The web-spawned launcher is deferred (§7).
+6. **The zombie sweep skips leased rows: accepted**, as a hard requirement of the first
+   implementation PR (§3, §9).
