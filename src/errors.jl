@@ -217,7 +217,7 @@ no record, no queued item, and a previous run of the same key is not displaced.
 | `kind` | Limit | `handle_error` answers |
 |---|---|---|
 | `:runtime` | `WorkerRuntime(store; max_concurrent_runs)`, async runs in flight (64 by default) | `503 Service Unavailable` |
-| `:queue` | a sequential queue's capacity (100 items by default) | `503 Service Unavailable` |
+| `:queue` | a declared queue's buffer (100 items by default) | `503 Service Unavailable` |
 | `:owner` | `WorkerRuntime(store; max_runs_per_owner)`, one owner's live runs (off by default) | `429 Too Many Requests` |
 
 A full queue used to block the submitting request in `put!` with no timeout, so one owner could
@@ -439,7 +439,7 @@ rethrown (#367).
   operator's Ctrl-C (under `julia -t 1` it can land on any task) or the callback's own. Neither is
   a transient failure.
 - **Not rethrown**: nothing is waiting to receive it. The async run is a detached task, and the
-  sequential processor's catch-all logs and drops the item. Either way the record would stay
+  queue processor's catch-all logs and drops the item. Either way the record would stay
   `RUNNING` until a zombie sweep marked it failed with no hint of why, where `FAILED` with the
   exception's type is the honest record. It is group 2's argument one level down: a background
   task, where the failure has no request to fail.

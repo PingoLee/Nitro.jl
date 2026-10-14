@@ -269,12 +269,48 @@ function _start_runtime_for!(ctx::App, key::Symbol,
     return existing isa WorkerRuntime ? existing : install!(ctx; key, drain_timeout)
 end
 
+# The runtime `_start_runtime_for!` would START, when it would reuse one rather than build it --
+# `nothing` otherwise. Mirrors its branches, so a queue declaration can be checked against that
+# runtime BEFORE anything is installed: a refused `start!` must not have displaced the runtime it
+# was refused on (#513).
+function _runtime_to_reuse(ctx::App, key::Symbol,
+                           store::Union{Nothing, AbstractWorkerStore},
+                           runtime::Union{Nothing, WorkerRuntime})
+    runtime === nothing || return runtime
+    existing = worker_runtime(ctx; key)
+    existing isa WorkerRuntime || return nothing
+    return (store === nothing || existing.store === store) ? existing : nothing
+end
+
+# Shape first (`_queue_specs`), then conflicts with the runtime about to be started, both before
+# `_start_runtime_for!` installs anything. A freshly built runtime has no declarations to conflict
+# with, so there is nothing more to check for it.
+function _checked_queue_specs(ctx::App, key::Symbol, store, runtime, queues::AbstractVector)
+    # The same refusal `_start_runtime_for!` makes, first, so `store` + `runtime` together reports
+    # as that rather than as whatever the declarations happen to conflict with.
+    if !isnothing(store) && !isnothing(runtime)
+        throw(ArgumentError(
+            "pass `store` (build a runtime over this backend) or `runtime` (use this one), not both"))
+    end
+    specs = _queue_specs(queues)
+    target = _runtime_to_reuse(ctx, key, store, runtime)
+    target === nothing || _check_queue_declarations(target, specs)
+    return specs
+end
+
 """
     start!(ctx::App; queues, cleanup_enabled, ..., store=nothing, runtime=nothing,
            drain_timeout=WORKER_DRAIN_TIMEOUT_SECONDS) -> WorkerRuntime
 
-Install a runtime on `ctx` and start it: sweep zombies, spawn a processor per named queue, and
-start (or stop) the cleanup scheduler.
+Install a runtime on `ctx` and start it: sweep zombies, spawn each declared queue's processors,
+and start (or stop) the cleanup scheduler.
+
+`queues` declares the queue names [`submit_queued_task`](@ref) may use, each with a concurrency:
+`queues = ["email", "compute" => 6]` runs `"email"` one item at a time and up to six `"compute"`
+items at once ([#513](https://github.com/PingoLee/Nitro.jl/issues/513)). Give CPU-bound work a
+queue with a concurrency below `Threads.nthreads(:default)`, so the threads it cannot take stay
+free for request handlers. A name already declared on this runtime cannot be re-declared with a
+different concurrency (an `ArgumentError`).
 
 Returns the `WorkerRuntime` — that is the handle to pass as `runtime=` to the task API.
 
@@ -292,7 +328,7 @@ scheduler, so it cannot change that scheduler's `zombie_min_age`, `cleanup_inter
 re-sweep. Call `stop_cleanup_scheduler!` first.
 """
 function start!(ctx::App;
-    queues::AbstractVector{<:AbstractString}=String[],
+    queues::AbstractVector=String[],
     cleanup_enabled::Bool=true,
     cleanup_interval_hours::Real=24,
     cleanup_retain_days::Int=7,
@@ -303,16 +339,20 @@ function start!(ctx::App;
     runtime::Union{Nothing, WorkerRuntime}=nothing,
     drain_timeout::Real=WORKER_DRAIN_TIMEOUT_SECONDS,
 )
+    # Checked first, so a malformed or conflicting `queues` is refused before anything is installed,
+    # displaced or swept.
+    queue_specs = _checked_queue_specs(ctx, key, store, runtime, queues)
     resolved = _start_runtime_for!(ctx, key, store, runtime, drain_timeout)
 
     if recover_zombies
         recover_zombie_tasks!(; runtime=resolved, zombie_min_age)
     end
 
-    # Declared before its processor starts: these are the names a submit may use (#324).
-    _declare_queues!(resolved, queues)
-    for queue_name in queues
-        _start_queue_processor(resolved, String(queue_name))
+    # Declared before its processors start: these are the names a submit may use (#324), and the
+    # concurrency each one runs at (#513).
+    _declare_queues!(resolved, queue_specs)
+    for (queue_name, _) in queue_specs
+        _start_queue_processor(resolved, queue_name)
     end
 
     if cleanup_enabled
@@ -328,7 +368,7 @@ function start!(ctx::App;
 end
 
 function startup(ctx::App;
-    queues::AbstractVector{<:AbstractString}=String[],
+    queues::AbstractVector=String[],
     cleanup_enabled::Bool=true,
     cleanup_interval_hours::Real=24,
     cleanup_retain_days::Int=7,
@@ -346,7 +386,9 @@ function startup(ctx::App;
     _check_zombie_min_age(zombie_min_age)
     drain_timeout >= 0 || throw(ArgumentError(
         "drain_timeout must be >= 0 (got $(drain_timeout)); 0 releases without waiting"))
-    queue_names = String.(collect(queues))
+    # Checked here so a malformed or conflicting declaration is refused when the middleware is
+    # built, before the install below, not from `on_startup`, whose exception is only logged.
+    queue_specs = _checked_queue_specs(ctx, key, store, runtime, queues)
 
     # Installed NOW, when the middleware is built, not in `on_startup` (#322). `serve()` opens its
     # listener before it runs the startup hooks, so a runtime installed by the hook left a window
@@ -358,7 +400,7 @@ function startup(ctx::App;
     installed = _start_runtime_for!(ctx, key, store, runtime, drain_timeout)
     # Declared now too, not only by `start!` in the hook (#324): a submit in the startup window
     # would otherwise be refused as an undeclared queue.
-    _declare_queues!(installed, queue_names)
+    _declare_queues!(installed, queue_specs)
 
     passthrough = function(handle::Function)
         return function(req)
@@ -371,7 +413,7 @@ function startup(ctx::App;
         # the slot holds a different one, and after `terminate`'s `uninstall!` the slot is empty.
         # Re-serving must put back THIS runtime, the one policy may already hang off.
         start!(ctx;
-            queues=queue_names,
+            queues=queue_specs,
             cleanup_enabled=cleanup_enabled,
             cleanup_interval_hours=cleanup_interval_hours,
             cleanup_retain_days=cleanup_retain_days,
@@ -409,7 +451,7 @@ whom:
   is not already a watcher of an existing global key is refused unless the store's
   watch authorizer allows it — see [`set_watch_authorizer!`](@ref).
 
-`submit_task` and `submit_sequential_task` return the resolved id; pass *that* to
+`submit_task` and `submit_queued_task` return the resolved id; pass *that* to
 `get_task_status` and `cancel_task` along with the [`TaskAuthority`](@ref) the call acts
 under. Use this function when the return value was not kept.
 
@@ -524,7 +566,7 @@ end
 #
 # It returned a `Bool` until #182. **This is the only place a run's identity is known for certain,
 # because it is where the run is minted**, so every fence downstream carries it from here rather
-# than re-deriving it. Both submit paths do: `submit_sequential_task` puts it on the `QueueItem`,
+# than re-deriving it. Both submit paths do: `submit_queued_task` puts it on the `QueueItem`,
 # `submit_task` hands it to `_execute_task_async`.
 #
 # Three writes depend on that. A teardown abandoning the backlog records a terminal state
@@ -534,14 +576,14 @@ end
 # belong to a successor, so the abandon would cancel a run about to start and the start claim
 # would agree with a run that is not the caller's.
 #
-# `queue` is the sequential queue the new run will be enqueued on, or `nothing` for an async run.
+# `queue` is the declared queue the new run will be enqueued on, or `nothing` for an async run.
 # It decides which capacity the run reserves (#324) -- a slot in that queue's buffer, or one of the
 # runtime's concurrent async runs -- on top of its owner's quota. Only a run that is MINTED here
 # reserves; joining a live one costs nothing. The caller owns giving it back.
 function _register_or_watch!(runtime::WorkerRuntime, task_key::String, owner::Owner;
                              queue_name::Union{Nothing, String}=nothing,
                              grants::AbstractVector{Owner}=Owner[],
-                             queue::Union{Nothing, SequentialQueue}=nothing)
+                             queue::Union{Nothing, WorkerQueue}=nothing)
     uid = owner.user_id
     return lock_tasks(runtime) do
         # The DURABLE read, not the live-preferring one, by the rule in `get_task_info`: this is
@@ -672,15 +714,17 @@ function _execute_task_async(runtime::WorkerRuntime, task_key::String, callback:
         # owns the rationale. Runs INSIDE the spawned task, because the handle it publishes is
         # `current_task()`.
         #
-        # This path is DIFFERENTLY exposed to a supersede than the sequential one, not simply
+        # This path is DIFFERENTLY exposed to a supersede than the queued one, not simply
         # less: its window is shorter in wall-clock -- a lock release, a `Threads.@spawn`
         # scheduling hand-off, and on `PormGWorkerStore` a database round-trip, against a queued
         # item that can sit in a `Channel(100)` behind a long job for minutes -- but its
-        # CONSEQUENCE is worse. Where the sequential path usually serializes a stale item against
-        # its successor on `exec_lock`, here both runs are spawned tasks by construction, so
+        # CONSEQUENCE is worse. Where a concurrency-1 queue serializes a stale item against its
+        # successor on its single processor, here both runs are spawned tasks by construction, so
         # nothing serializes them and the interleaving in which one stole the other's handles was
-        # the ordinary case rather than an edge. A concurrent `cancel_task` plus re-submit needs
-        # only `lock_tasks` -- which is exactly why the claim takes it (#191, #198).
+        # the ordinary case rather than an edge. A queue with concurrency `k > 1` (#513) is in the
+        # same position, since two of its processors can hold the two items at once. A concurrent
+        # `cancel_task` plus re-submit needs only `lock_tasks` -- which is exactly why the claim
+        # takes it (#191, #198).
         #
         # Every way out gives back the run's capacity reservation (#324) exactly once, except a
         # timed-out callback, which keeps it until it actually returns (`_RunHandoff`).
@@ -701,7 +745,7 @@ function _execute_task_async(runtime::WorkerRuntime, task_key::String, callback:
         # sequential (#142). The CAS *is* the write, so there is no `set_task!` after it.
         #
         # In the ASYNC path this was masked, not absent: `cancel_task` also interrupted the worker
-        # task, and a task that had not started yet never ran its body at all. The sequential path
+        # task, and a task that had not started yet never ran its body at all. The queued path
         # had no such cover -- its processor is already `Threads.@spawn`ed, and a cancel can land
         # between its `get_task_info` and its start write. Removing the interrupt (#127) uncovers
         # the async path too, which is why this lands FIRST.
@@ -756,6 +800,16 @@ function _execute_task_async(runtime::WorkerRuntime, task_key::String, callback:
                     # about who stopped the job (#127).
                     latest_info = get_task_info(runtime, task_key)
                     if latest_info !== nothing && latest_info.status == CANCELLED
+                        return _cancel_task!(runtime, task_info)
+                    end
+
+                    # A `checkpoint!` that found this run's token set (#513). Recorded through the
+                    # same CAS as every other cancellation, so a cause that already decided the record
+                    # (a `cancel_task`, a supersede) keeps it, and a drain's `:shutdown` is stored as
+                    # one. Never retried: the token is never reset, so a retry would start cancelled.
+                    # Only when the token IS set: one the callback built itself is an ordinary failure,
+                    # for the reason the `InterruptException` note above gives.
+                    if unwrapped isa TaskCancelledError && cancel_requested(task_info)
                         return _cancel_task!(runtime, task_info)
                     end
 
@@ -861,7 +915,7 @@ function submit_task(task_key::AbstractString, callback::Function, owner::Owner;
     _authorize_queue!(runtime.store, DEFAULT_QUEUE_NAME, owner)
 
     key = scoped_task_key(task_key, owner; scope)
-    # The run identity is PLUMBED here, exactly as `submit_sequential_task` plumbs it onto the
+    # The run identity is PLUMBED here, exactly as `submit_queued_task` plumbs it onto the
     # `QueueItem`. This used to read "the async path does not carry the run identity ... only a
     # QUEUED item needs it, because it may sit in a buffer long enough for the record to move
     # on", and both halves were wrong (#191). A durable read is a LOOKUP, not a fence -- #167
@@ -885,17 +939,26 @@ function submit_task(ctx::App, task_key::AbstractString, callback::Function, own
 end
 
 """
-    submit_sequential_task(queue_name, task_key, callback, owner::Owner; scope=:user,
-                           watchers=Owner[], options=TaskOptions(), runtime=default_runtime())
+    submit_queued_task(queue_name, task_key, callback, owner::Owner; scope=:user,
+                       watchers=Owner[], options=TaskOptions(), runtime=default_runtime())
 
-Queue `callback` for one-at-a-time execution on `queue_name` and return the id it was
-stored under.
+Queue `callback` on the declared queue `queue_name` and return the id it was stored under.
+
+A queue runs at most its declared concurrency of items at once, starting them in the order they
+were submitted: `start!(app; queues = ["email", "compute" => 6])` runs `"email"` strictly one at a
+time and up to six `"compute"` items side by side
+([#513](https://github.com/PingoLee/Nitro.jl/issues/513)). A submit past that waits in the
+queue's buffer; a submit to a full buffer is refused with
+`WorkerCapacityError(:queue, …)`. That bound is what makes a queue the place for CPU-bound
+work, where [`submit_task`](@ref)'s runtime-wide `max_concurrent_runs` is sized for I/O.
 
 Identical to [`submit_task`](@ref) in how `scope` namespaces `task_key` and in what the
-return value is for; the difference is ordered execution and that the queue authorizer
-sees the real `queue_name`.
+return value is for; the difference is the queue's bound and order, and that the queue
+authorizer sees the real `queue_name`.
+
+This was `submit_sequential_task` until #513, which gave a queue a concurrency.
 """
-function submit_sequential_task(queue_name::AbstractString, task_key::AbstractString, callback::Function, owner::Owner; scope::Symbol=:user, watchers::AbstractVector{Owner}=Owner[], options::TaskOptions=TaskOptions(), runtime::WorkerRuntime=default_runtime())
+function submit_queued_task(queue_name::AbstractString, task_key::AbstractString, callback::Function, owner::Owner; scope::Symbol=:user, watchers::AbstractVector{Owner}=Owner[], options::TaskOptions=TaskOptions(), runtime::WorkerRuntime=default_runtime())
     queue_id = String(queue_name)
 
     _authorize_queue!(runtime.store, queue_id, owner)
@@ -961,8 +1024,8 @@ function submit_sequential_task(queue_name::AbstractString, task_key::AbstractSt
     return key
 end
 
-function submit_sequential_task(ctx::App, queue_name::AbstractString, task_key::AbstractString, callback::Function, owner::Owner; scope::Symbol=:user, watchers::AbstractVector{Owner}=Owner[], options::TaskOptions=TaskOptions(), key::Symbol=DEFAULT_EXTENSION_KEY, runtime::Union{Nothing, WorkerRuntime}=nothing)
-    return submit_sequential_task(queue_name, task_key, callback, owner; scope, watchers, options, runtime=_resolve_runtime(ctx; key, runtime))
+function submit_queued_task(ctx::App, queue_name::AbstractString, task_key::AbstractString, callback::Function, owner::Owner; scope::Symbol=:user, watchers::AbstractVector{Owner}=Owner[], options::TaskOptions=TaskOptions(), key::Symbol=DEFAULT_EXTENSION_KEY, runtime::Union{Nothing, WorkerRuntime}=nothing)
+    return submit_queued_task(queue_name, task_key, callback, owner; scope, watchers, options, runtime=_resolve_runtime(ctx; key, runtime))
 end
 
 """
@@ -1223,10 +1286,14 @@ end
 """
     get_queue_status(queue_name, ::System; runtime=default_runtime()) -> Dict{Symbol, Any}
 
-Queue-wide introspection: depth, whether the processor is running, the current task, and
-the ids of everything pending on `queue_name`.
+Queue-wide introspection: depth, whether its processors are running, its concurrency, the ids
+it is executing, and the ids of everything pending on `queue_name`.
 
-**This is an admin surface, and it takes `System()` only.** Queue depth and `:current_task`
+`:current_tasks` is a `Vector{String}` with one entry per busy processor, so at most
+`:concurrency` of them. It was a single `:current_task` id until #513 gave a queue more than one
+processor.
+
+**This is an admin surface, and it takes `System()` only.** Queue depth and `:current_tasks`
 are global facts about a queue, not facts about any one user, and `:pending_tasks`
 enumerates ids that — since [#19](https://github.com/PingoLee/Nitro.jl/issues/19) — carry
 their owner in the `"<owner>::<key>"` prefix. Handing it an `Owner` and filtering the id
@@ -1244,7 +1311,7 @@ rather than report an empty queue ([#267](https://github.com/PingoLee/Nitro.jl/i
 """
 function get_queue_status(queue_name::AbstractString, ::System; runtime::WorkerRuntime=default_runtime())
     qlock = get_queue_lock(runtime)
-    queues = get_sequential_queues(runtime)
+    queues = get_worker_queues(runtime)
 
     lock(qlock) do
         queue = Base.get(queues, String(queue_name), nothing)
@@ -1253,15 +1320,17 @@ function get_queue_status(queue_name::AbstractString, ::System; runtime::WorkerR
         end
 
         pending_tasks = [task.id for task in get_all_tasks(runtime, System(); status=PENDING, queue_name=String(queue_name))]
-        processing = queue.current_task !== nothing
+        current_tasks = copy(queue.current_tasks)
+        processing = !isempty(current_tasks)
         return Dict{Symbol, Any}(
             :queue_name => String(queue_name),
-            :running => queue.running,
-            :current_task => queue.current_task,
+            :running => any(t -> !istaskdone(t), queue.processors),
+            :concurrency => queue.concurrency,
+            :current_tasks => current_tasks,
             :pending_count => Base.n_avail(queue.channel),
             :pending_tasks => pending_tasks,
             :status_text => processing ? "Processing" : (isempty(pending_tasks) ? "Idle" : "Queued"),
-            :total_load => length(pending_tasks) + (processing ? 1 : 0),
+            :total_load => length(pending_tasks) + length(current_tasks),
         )
     end
 end

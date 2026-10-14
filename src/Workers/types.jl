@@ -6,13 +6,13 @@ current_time_utc() = Dates.now(Dates.UTC)
     DEFAULT_QUEUE_NAME
 
 Queue name that [`submit_task`](@ref) authorizes against. Unqueued tasks do not
-run through a `SequentialQueue`, but they are still submissions, so they are
+run through a `WorkerQueue`, but they are still submissions, so they are
 still subject to the store's queue authorizer — under this name, following the
 default-queue convention every comparable queue uses (Sidekiq `default`, River
 `QueueDefault`).
 
 A `TaskInfo.queue_name` stays `nothing` for these tasks: that field records the
-*sequential* queue a task belongs to, and an unqueued task belongs to none.
+*declared* queue a task belongs to, and an unqueued task belongs to none.
 """
 const DEFAULT_QUEUE_NAME = "default"
 
@@ -68,7 +68,7 @@ deadline.
 
 Task-local storage is per-task and is **not** inherited by a spawned child, so two runs can never
 see each other's marker. It is **not** enough on its own to keep the marker current, though: a
-sequential queue processor with `TaskOptions(timeout=0)` runs many callbacks on one long-lived
+queue processor with `TaskOptions(timeout=0)` runs many callbacks on one long-lived
 task, so `_invoke_task_callback` saves and restores the previous value around each invocation.
 Staleness is prevented by that `finally`, not by the language — do not remove it on the theory that
 one task runs one callback.
@@ -383,8 +383,8 @@ Use it to make a callback react differently to a deploy than to a person:
 submit_task("import", task_info -> begin
     for chunk in chunks
         if cancel_requested(task_info)
-            # A shutdown will restart us; checkpoint and let the next process resume.
-            cancel_reason(task_info) === :shutdown && return checkpoint(done)
+            # A shutdown will restart us; save how far we got, so the next process resumes from it.
+            cancel_reason(task_info) === :shutdown && return save_position(done)
             return "cancelled"
         end
         process(chunk)
@@ -420,6 +420,72 @@ struct TaskTimeoutError <: Exception
 end
 
 Base.showerror(io::IO, e::TaskTimeoutError) = print(io, "Timeout of $(e.timeout)s exceeded")
+
+"""
+    TaskCancelledError(reason::Symbol)
+
+What [`checkpoint!`](@ref) throws once the run has been asked to stop. `reason` is the
+[`cancel_reason`](@ref) it found, one of [`CANCEL_REASONS`](@ref).
+
+Both executors recognise it: the run is recorded through the same compare-and-set as every other
+cancellation, and it is **never retried**, since the token is never reset and a retry would start
+already cancelled. A callback that catches it to clean up should rethrow it.
+"""
+struct TaskCancelledError <: Exception
+    reason::Symbol
+end
+
+Base.showerror(io::IO, e::TaskCancelledError) = print(io, _cancel_message(e.reason))
+
+"""
+    checkpoint!(task_info::TaskInfo) -> Nothing
+
+A yield point for a long-running callback ([#513](https://github.com/PingoLee/Nitro.jl/issues/513)):
+give the thread back to whatever is waiting for it, then throw [`TaskCancelledError`](@ref) if this
+run has been asked to stop.
+
+```julia
+submit_queued_task(app, "compute", "fit-42", task_info -> begin
+    for (i, batch) in enumerate(batches)
+        train!(model, batch)                  # a few milliseconds of computation
+        checkpoint!(task_info)                # yield, and stop here if cancelled
+        update_progress!(task_info, 100 * i / length(batches))
+    end
+    return summary(model)
+end, Owner(uid))
+```
+
+**Why it exists.** Julia's tasks are cooperative and Julia 1.12 has no preemption: a callback that
+computes without reaching `yield`, `sleep`, `wait` or I/O holds its thread until it returns. Worker
+callbacks share the `:default` thread pool with every request handler, so a request scheduled onto
+that thread waits for the whole computation. `checkpoint!` is the explicit point at which it
+stops waiting. Call it every few milliseconds of work. When nothing else is waiting to run, a call
+costs about a microsecond, almost all of it the `yield` (0.6 µs on the main task and 1.1 µs inside
+a worker run, measured on Julia 1.12), so a call per millisecond of work costs about 0.1%.
+
+**It is the task API's `yield()` plus the cancellation check, in one call.** After the yield it
+reads the same token [`cancel_requested`](@ref) does, so it honours every cause in
+[`CANCEL_REASONS`](@ref): a `cancel_task`, an expired `TaskOptions(timeout=…)`, a re-run of the key,
+and a teardown drain. The throw unwinds the callback, and the executor records the run as the
+cancellation it was. A callback that would rather finish its current unit of work first can still
+poll `cancel_requested` itself and return; the two compose.
+
+**What it does not do:**
+
+- It does not preempt anything. A callback that never calls it gains nothing.
+- It does not bound garbage collection: a job that allocates heavily still triggers stop-the-world
+  pauses that stop handlers too.
+- It reads the **in-process** token, exactly like `cancel_requested`. A cancel issued on another
+  node writes the durable record and sets nothing here.
+"""
+function checkpoint!(task_info::TaskInfo)
+    yield()
+    # After the yield, not before: a cancel that lands while this run is off its thread is seen at
+    # once rather than one checkpoint later.
+    reason = cancel_reason(task_info)
+    reason === :none || throw(TaskCancelledError(reason))
+    return nothing
+end
 
 @kwdef struct TaskOptions
     priority::Int = 5
@@ -459,21 +525,50 @@ struct QueueItem
     end
 end
 
-mutable struct SequentialQueue
+# A declared queue: one buffer drained by up to `concurrency` processor tasks (#513).
+#
+# **`concurrency` is a bulkhead, not a throughput knob.** Every processor runs on `:default`, the
+# pool that also runs every request handler, and Julia 1.12 has no preemption (#467), so a queue of
+# CPU-bound jobs with `k` processors can hold at most `k` of those threads -- the rest stay free for
+# handlers by construction. That is Sidekiq's per-queue concurrency and River's `MaxWorkers`.
+#
+# One exception, deliberately not closed here: a callback abandoned by `TaskOptions(timeout=…)` frees
+# its processor but keeps its thread until it returns, so a queue of timing-out callbacks that never
+# reach `checkpoint!` can hold more than `k`. Those count against `max_concurrent_runs` instead, and
+# the queues hold their next item once they fill it (#324); `checkpoint!` is what makes the deadline
+# actually stop such a callback.
+#
+# `k = 1` is the strict FIFO queue this type used to be (`SequentialQueue`). With `k > 1` items still
+# START in FIFO order, since every processor `take!`s from the one channel, but they finish in
+# whatever order they finish. Nothing else changes with `k`: each processor runs its item through
+# the same `_execute_queued_task`, so the claim, the `run_id` fences, cancellation, deadlines and the
+# teardown drain hold per item exactly as they do for one. A stale item and its successor can now
+# execute side by side on two processors of one queue, which is the async path's ordinary case and
+# is what `_claim_run!` takes `lock_tasks` for (#191, #198).
+#
+# There used to be an `exec_lock` held around each execution. With one processor it serialized
+# nothing that the processor loop did not already serialize, and with `k` it would serialize the
+# processors back into one, so it is gone.
+mutable struct WorkerQueue
     channel::Channel{QueueItem}
-    running::Bool
-    current_task::Union{Nothing, String}
-    exec_lock::ReentrantLock
-    processor_task::Union{Nothing, Task}
+    const concurrency::Int
+    # The live processor tasks, at most `concurrency` of them, under `queue_lock`. A processor
+    # removes itself in its `finally`, so `!isempty(processors)` is "this queue is running", and
+    # `_start_queue_processor` tops the set back up to `concurrency` on the next submit.
+    processors::Vector{Task}
+    # The task ids the processors are executing right now, one entry per busy processor, under
+    # `queue_lock`. A list, not a set: two processors can hold items for one key at once (a stale
+    # item and its successor), and each removes only its own entry.
+    current_tasks::Vector{String}
     # Set by `shutdown!` before it closes the channel: this queue is being torn down, so the
     # processor must record whatever it has already taken as abandoned rather than start it
     # ([#182](https://github.com/PingoLee/Nitro.jl/issues/182)).
     #
     # **On the QUEUE, not on the runtime**, and that placement is the whole design. A
     # runtime-level flag would have to be RESET for the documented shutdown-then-reuse case, and
-    # the reset races a concurrent `submit_sequential_task` -- clearing it mid-teardown re-opens
+    # the reset races a concurrent `submit_queued_task` -- clearing it mid-teardown re-opens
     # exactly the window this closes. `shutdown!` empties the queue registry, so a reused runtime
-    # mints fresh `SequentialQueue`s that are not draining *by construction*, and the only reader
+    # mints fresh `WorkerQueue`s that are not draining *by construction*, and the only reader
     # of a dead queue's flag is its own processor, which is precisely who should see it.
     #
     # `@atomic` because the writer is `shutdown!` and the reader is the processor task.
@@ -485,17 +580,20 @@ mutable struct SequentialQueue
     # `capacity` is stored rather than read back off the `Channel`'s internals.
     capacity::Int
     @atomic reserved::Int
-    # The item the processor has TAKEN but is holding back while abandoned sequential callbacks
-    # fill the runtime cap (#324), under `queue_lock`. It is out of the channel, so `shutdown!`'s
-    # collect step would miss it, and it would be abandoned only after the teardown had returned --
-    # PENDING forever on a persistent store if the process exits first (the #182 orphan). So
-    # `shutdown!` collects it from here too; both abandons are the same idempotent CAS.
-    held::Union{Nothing, QueueItem}
+    # The items the processors have TAKEN but are holding back while abandoned queued callbacks
+    # fill the runtime cap (#324), at most one per processor, under `queue_lock`. They are out of
+    # the channel, so `shutdown!`'s collect step would miss them, and they would be abandoned only
+    # after the teardown had returned -- PENDING forever on a persistent store if the process exits
+    # first (the #182 orphan). So `shutdown!` collects them from here too; both abandons are the
+    # same idempotent CAS.
+    held::Vector{QueueItem}
 
-    function SequentialQueue(size::Int=100)
-        size >= 1 || throw(ArgumentError("SequentialQueue size must be at least 1, got $size"))
-        return new(Channel{QueueItem}(size), false, nothing, ReentrantLock(), nothing, false, size, 0,
-                   nothing)
+    function WorkerQueue(size::Int=100; concurrency::Int=1)
+        size >= 1 || throw(ArgumentError("WorkerQueue size must be at least 1, got $size"))
+        concurrency >= 1 || throw(ArgumentError(
+            "WorkerQueue concurrency must be at least 1, got $concurrency"))
+        return new(Channel{QueueItem}(size), concurrency, Task[], String[], false, size, 0,
+                   QueueItem[])
     end
 end
 

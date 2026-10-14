@@ -272,7 +272,7 @@ function submit_import(req, upload::Files{FormFile})
     # The worker reads from disk so the request memory is freed immediately.
     # Returns the STORED id ("<user_id>::import_<uuid>"), not task_key — stage the
     # file under task_key, but hand the client back what the submit returned.
-    task_id = Nitro.Workers.submit_sequential_task(
+    task_id = Nitro.Workers.submit_queued_task(
         Nitro.CONTEXT[],
         "import_queue",
         task_key,
@@ -307,7 +307,7 @@ serve(middleware=[worker_startup(queues=["import_queue"])])
 
 Without it the submit is refused with `WorkerUnavailableError`, a `503`: a task call never falls
 back to a runtime the app did not install. With an explicit `App`, pass it in both places instead
-(`worker_startup(app; …)` and `submit_sequential_task(app, …)`).
+(`worker_startup(app; …)` and `submit_queued_task(app, …)`).
 
 ## Sending multipart requests (client side)
 

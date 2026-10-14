@@ -11,6 +11,8 @@
 #   cpu        CPU_CONNS connections hammer `/cpu`, a handler that burns CPU_MS without yielding
 #   burst<K>   `/burst?n=K` submits K Workers jobs that each burn JOB_MS without yielding, then the
 #              probe starts at once (e.g. burst8, burst64)
+#   burst<K>q  the same K jobs through a queue of concurrency BURST_K (#513's bulkhead)
+#   ...cp<MS>  either burst, each job calling `checkpoint!` every MS ms (e.g. burst64cp5, burst64qcp5)
 #
 # Each row reports `/health` p50/p99/max and its success rate, the `/lag` probe's p50/p99/max (how
 # late a 10 ms `sleep` on the `:default` pool woke during the window, the delay a `Timer`-driven
@@ -21,6 +23,7 @@
 #   bench/socket/contention.sh "8,1 6,2 8,0" 5 8s
 #   SCENARIOS="idle cpu burst8 burst64" CPU_MS=50 bench/socket/contention.sh
 #   JULIA="julia +1.12" bench/socket/contention.sh
+#   SCENARIOS="idle burst64 burst64q burst64cp5 burst64qcp5" bench/socket/contention.sh "8,1 6,2"
 #
 # Results: one TSV per invocation under bench/results/ (gitignored).
 set -uo pipefail
@@ -53,7 +56,7 @@ for scenario in "${SCENARIO_LIST[@]}"; do
   case "$scenario" in
     idle|cpu) ;;
     burst*)
-      [[ $scenario =~ ^burst[0-9]+$ ]] || { echo "contention.sh: unknown scenario $scenario" >&2; exit 1; }
+      [[ $scenario =~ ^burst[0-9]+q?(cp[0-9]+)?$ ]] || { echo "contention.sh: unknown scenario $scenario" >&2; exit 1; }
       # Only the Nitro modes serve `/burst`; a bare mode would label an idle run a burst.
       [[ $MODE == nitro* ]] || { echo "contention.sh: $scenario needs a nitro MODE" >&2; exit 1; } ;;
     *) echo "contention.sh: unknown scenario $scenario" >&2; exit 1 ;;
@@ -96,7 +99,7 @@ for layout in "${LAYOUT_LIST[@]}"; do
     exit 1
   fi
   log="$OUT/contention-$STAMP-$layout.log"
-  MODE="$MODE" PORT="$port" WORKERS=1 LAG=1 CPU_MS="$CPU_MS" JOB_MS="$JOB_MS" \
+  MODE="$MODE" PORT="$port" WORKERS=1 LAG=1 CPU_MS="$CPU_MS" JOB_MS="$JOB_MS" ${BURST_K:+BURST_K="$BURST_K"} \
     taskset -c "$SERVER_CPUS" "${JULIA_CMD[@]}" --project="$ROOT/bench" --threads="$layout" \
     "$HERE/server.jl" >"$log" 2>&1 &
   pid=$!
@@ -108,6 +111,15 @@ for layout in "${LAYOUT_LIST[@]}"; do
   fi
   PORT_OF[$layout]=$port
 done
+
+# `burst64qcp5` -> 64 and `/burst?n=64&queue=1&cp=5` (#513).
+burst_n() { local s="${1#burst}"; echo "${s%%[!0-9]*}"; }
+burst_query() {
+  local q="/burst?n=$(burst_n "$1")"
+  [[ $1 =~ ^burst[0-9]+q ]] && q+="&queue=1"
+  [[ $1 =~ cp([0-9]+)$ ]] && q+="&cp=${BASH_REMATCH[1]}"
+  echo "$q"
+}
 
 oha_probe() {   # duration url -> oha JSON
   taskset -c "$CLIENT_CPUS" oha -z "$1" -c "$PROBE_CONNS" -q "$PROBE_RATE" --latency-correction \
@@ -140,8 +152,9 @@ for _ in $(seq 1 "$ROUNDS"); do
           bg=$!
           sleep 1 ;;
         burst*)
-          curl -fsS -o /dev/null "$base/burst?n=${scenario#burst}" ||
-            { echo "contention.sh: $layout refused /burst?n=${scenario#burst}" >&2; exit 1; } ;;
+          burst_url="$(burst_query "$scenario")"
+          curl -fsS -o /dev/null "$base$burst_url" ||
+            { echo "contention.sh: $layout refused $burst_url" >&2; exit 1; } ;;
       esac
       js="$(oha_probe "$DUR" "$base/health")"
       [ -n "$bg" ] && wait "$bg"
@@ -166,7 +179,7 @@ for _ in $(seq 1 "$ROUNDS"); do
       fi
       # Let a burst's jobs drain before the next layout is measured: every server is pinned to the
       # same cores, so leftover jobs here would load the next one. K jobs over at least 4 threads.
-      case "$scenario" in burst*) sleep $(( (${scenario#burst} * ${JOB_MS%.*} / 4000) + 2 )) ;; esac
+      case "$scenario" in burst*) sleep $(( ($(burst_n "$scenario") * ${JOB_MS%.*} / 4000) + 2 )) ;; esac
     done
   done
 done

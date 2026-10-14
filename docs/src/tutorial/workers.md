@@ -8,7 +8,7 @@ Use it when a request needs to trigger work that may take longer than you want t
 - importing data files
 - sending webhook batches
 - refreshing cached aggregates
-- enforcing sequential execution for one logical queue
+- keeping one kind of job in order, or bounding how many of them run at once
 
 It is not a separate worker service or distributed job system. The runtime lives inside the same Nitro server process and is tied to the server lifecycle.
 
@@ -55,11 +55,11 @@ runtime installed is refused with `WorkerUnavailableError` (a `503` over HTTP); 
 served by some other runtime ([#322](https://github.com/PingoLee/Nitro.jl/issues/322)).
 
 !!! warning "The returned id is not the key you passed in"
-    `submit_task` and `submit_sequential_task` namespace the key by its owner, so the
+    `submit_task` and `submit_queued_task` namespace the key by its owner, so the
     id above is `"user-1::report-42"`, not `"report-42"`. Always poll and cancel with the
     **returned** value. See [Task Keys And Deduplication Scope](@ref).
 
-## Immediate vs Sequential Tasks
+## Immediate vs Queued Tasks
 
 Nitro supports two worker patterns.
 
@@ -79,15 +79,17 @@ task_id = submit_task(app, "refresh-dashboard", () -> begin
 end, Owner("user-1"))
 ```
 
-### `submit_sequential_task`
+### `submit_queued_task`
 
-Use `submit_sequential_task(...)` when only one job in a queue should run at a time.
+Use `submit_queued_task(...)` when jobs of one kind must not all run at once: either strictly one
+at a time, or at most `k` at a time.
 
-- preserves order inside a named queue
-- useful for per-customer jobs, report pipelines, or jobs that must not overlap
+- starts jobs in the order they were submitted
+- runs at most the queue's **concurrency** at once; a bare queue name is one at a time
+- useful for per-customer jobs, report pipelines, jobs that must not overlap, and CPU-bound work
 
 ```julia
-task_id = submit_sequential_task(app, "reports", "report-42", task_info -> begin
+task_id = submit_queued_task(app, "reports", "report-42", task_info -> begin
     sleep(2)
     return Dict("queue" => "reports", "task" => task_info.id)
 end, Owner("user-1"))
@@ -97,8 +99,22 @@ Different queues can still run independently.
 
 A queue name must be **declared** before anything is submitted to it: list it in
 `worker_startup(app; queues=[...])` (or `start!(app; queues=[...])`). A submit to any other name is
-refused with `AuthorizationError`, a `403`, because every queue name gets a processor task that
-lives as long as the runtime. See [Worker Limits](@ref).
+refused with `AuthorizationError`, a `403`, because every queue name gets processor tasks that
+live as long as the runtime. See [Worker Limits](@ref).
+
+A declared name is either a bare string, which runs one job at a time in order, or `name => k`,
+which runs up to `k` jobs at once:
+
+```julia
+worker_startup(app; queues = ["reports", "compute" => max(Threads.nthreads(:default) - 2, 1)])
+```
+
+Jobs on `"compute"` still start in submission order, but finish in whatever order they finish. A
+queue's concurrency is fixed once it is declared; declaring the same name again with another `k`
+is an `ArgumentError`. See [CPU-Bound Jobs](@ref) for why this is the tool for heavy work.
+
+This was `submit_sequential_task` until a queue could run more than one job
+([#513](https://github.com/PingoLee/Nitro.jl/issues/513)).
 
 ## Start Workers With The Server
 
@@ -115,7 +131,7 @@ app = App(mod = @__MODULE__)
 
 function create_report(req::HTTP.Request)
     report_id = string(getparams(req)["id"])
-    task_id = submit_sequential_task(app, "reports", "report-" * report_id, task_info -> begin
+    task_id = submit_queued_task(app, "reports", "report-" * report_id, task_info -> begin
         sleep(3)
         return Dict("report_id" => report_id, "status" => "ready")
     end, Owner("user-1"))
@@ -202,7 +218,7 @@ Workers are two objects, and which one you reach for follows from one question:
 | | Answers | Holds |
 |---|---|---|
 | **Store** (`AbstractWorkerStore`) | *"what does the record say?"* | Task rows, watcher lists, and the policy hooks — the queue and watch authorizers, the error redactor |
-| **Runtime** (`WorkerRuntime`) | *"what is this process doing right now?"* | The sequential queues and their processor tasks, the cleanup scheduler, and the handles of runs executing here |
+| **Runtime** (`WorkerRuntime`) | *"what is this process doing right now?"* | The declared queues and their processor tasks, the cleanup scheduler, and the handles of runs executing here |
 
 You choose a **store** when you choose a backend, and that is the only place `store=` appears:
 `worker_startup(app; store=...)`, `Workers.start!(app; store=...)`, `install!(app; store=...)`.
@@ -262,7 +278,7 @@ Two things worth knowing:
   reuses its runtime across a `serve → terminate → serve` cycle in one process. A new process
   starts with empty handles; there, finishing the run inside the drain is the only thing that
   saves it.
-- **A sequential queue's unstarted backlog is abandoned, not executed.** Closing the channel stops
+- **A queue's unstarted backlog is abandoned, not executed.** Closing the channel stops
   new submissions; the teardown also stops the processor taking work, and records every task still
   queued as `CANCELLED` with `"Cancelled by worker shutdown"`. It used to let the processor work
   through the buffer, so a teardown could *start* jobs that got neither the token nor the wait.
@@ -372,9 +388,10 @@ naming its task id is logged. The rest of the listing is still returned.
 
 ### `get_queue_status`
 
-Queue-wide introspection for sequential queues, reporting:
+Queue-wide introspection for a declared queue, reporting:
 
-- current task
+- `:current_tasks`, the ids being executed (at most `:concurrency` of them)
+- `:concurrency`, the most it runs at once
 - pending count and the ids of everything pending
 - queue state
 - total load
@@ -385,7 +402,7 @@ Queue-wide introspection for sequential queues, reporting:
 queue = get_queue_status(app, "reports", System())
 ```
 
-Queue depth and the current task are facts about a *queue*, not about any one user, and
+Queue depth and the running tasks are facts about a *queue*, not about any one user, and
 the pending-id list carries owners in the `"<owner>::<key>"` prefix. Accepting an `Owner`
 and filtering that list would produce something that looks user-scoped while still
 reporting another tenant's queue depth. Put it behind the same authorization you would put
@@ -535,8 +552,9 @@ submit_task(
 
     Worker callbacks share the `:default` thread pool with the per-request tasks `serve`
     spawns, so `Threads.nthreads()` abandoned CPU-bound callbacks will wedge the web server.
-    A callback that can outrun its deadline **must** poll `cancel_requested(task_info)`; the
-    logged warning is the only other signal you get.
+    A callback that can outrun its deadline **must** poll `cancel_requested(task_info)`, or call
+    `checkpoint!(task_info)`, which throws once the token is set; the logged warning is the only
+    other signal you get.
 
     **A timeout is never retried.** `retry_on_failure` covers genuine failures. Retrying a
     timeout cannot help — nothing stopped the attempt that timed out, so `max_retries=3`
@@ -587,7 +605,8 @@ item) with a `WorkerCapacityError` ([#324](https://github.com/PingoLee/Nitro.jl/
 | Limit | Default | Refused as |
 |---|---|---|
 | Async runs (`submit_task`) in flight at once, runtime-wide | `max_concurrent_runs = 64` | `:runtime`, a `503` |
-| A sequential queue's buffer | 100 items per queue | `:queue`, a `503` |
+| Items one queue runs at once | its declared concurrency, `1` for a bare name | not refused: the item waits in the buffer |
+| A queue's buffer | 100 items per queue | `:queue`, a `503` |
 | One owner's live runs, queued or executing, on both paths | `max_runs_per_owner = nothing` (off) | `:owner`, a `429` |
 | Queue names | only those declared through `queues` | `AuthorizationError`, a `403` |
 
@@ -596,11 +615,68 @@ filled it hung every other user's request. It now refuses at once, and the clien
 
 A run counts against the cap until its callback **actually returns**. That includes a callback
 abandoned by `TaskOptions(timeout=…)`, because the deadline ends the wait, not the work, and the
-callback still holds a thread. A sequential callback abandoned that way counts too, and when such
-abandoned callbacks **alone** fill the cap, the sequential queues **hold** their next item rather
-than start another beside them. Ordinary async load never holds a queue, so an async run that
-waits on a sequential item it submitted cannot deadlock at the cap. Submitters are never held: a
-full queue still refuses at once.
+callback still holds a thread. A queued callback abandoned that way counts too, and when such
+abandoned callbacks **alone** fill the cap, the queues **hold** their next item rather than start
+another beside them. Ordinary async load never holds a queue, so an async run that waits on a
+queued item it submitted cannot deadlock at the cap. Submitters are never held: a full queue still
+refuses at once.
+
+A queue's running items count toward `max_runs_per_owner`, but **not** toward
+`max_concurrent_runs`. The two are separate bulkheads: counting queued runs against the async cap
+would let async load stall every queue, which is exactly the deadlock above.
+
+**`max_concurrent_runs = 64` is sized for I/O.** Sixty-four callbacks that mostly wait on a
+database or an HTTP call cost little. Sixty-four that compute fill every `:default` thread many
+times over, and request handlers run on those same threads. Do not lower it to protect the server
+from heavy jobs; give the heavy jobs a queue instead, as below.
+
+### CPU-Bound Jobs
+
+Julia's tasks are cooperative, and Julia 1.12 has no preemption: a callback that computes without
+yielding holds its thread until it returns. Worker callbacks and request handlers share the
+`:default` thread pool, and Julia has no task priorities, so a burst of CPU-bound jobs delays every
+request. With 64 such jobs in flight, a `/health` probe was measured at a p99 of about 4 seconds,
+in every thread layout ([#512](https://github.com/PingoLee/Nitro.jl/pull/512)).
+
+Bound the work, which is the only in-process lever. Submit CPU-bound jobs to a queue whose
+concurrency leaves threads free:
+
+```julia
+const CPU_JOBS = Threads.nthreads(:default) - 2      # keep two threads for handlers
+
+serve(app; middleware = [worker_startup(app; queues = ["compute" => max(CPU_JOBS, 1)])])
+
+submit_queued_task(app, "compute", "model-$(id)", task_info -> fit_model(id), Owner(uid))
+```
+
+However many are submitted, at most `CPU_JOBS` run at once, and the rest wait in the queue's
+buffer. The one way past that bound is a deadline: a callback abandoned by `TaskOptions(timeout = …)`
+frees its place in the queue but keeps computing on its thread until it returns, so give a
+deadlined CPU-bound job a `checkpoint!`, below, which is what makes the deadline stop it.
+
+Inside a long job, call `checkpoint!(task_info)` every few milliseconds of work. It yields, so a
+request waiting for that thread gets it, and then throws `TaskCancelledError` if the run has been
+asked to stop. The executor records that as the cancellation it was, never as a failure, and never
+retries it:
+
+```julia
+submit_queued_task(app, "compute", "model-$(id)", task_info -> begin
+    model = init_model(id)
+    for (i, batch) in enumerate(batches(id))
+        train!(model, batch)              # a few milliseconds of computation
+        checkpoint!(task_info)            # yield; stop here if cancelled, timed out or draining
+        update_progress!(task_info, 100 * i / nbatches(id))
+    end
+    return summarize(model)
+end, Owner(uid))
+```
+
+It is the cooperative half: a job that never calls it gives its thread back only when it returns.
+It also makes `TaskOptions(timeout = …)` and a deploy's drain effective for that job, since both
+work by setting the token `checkpoint!` reads. A call costs about a microsecond, so calling it
+every millisecond of work costs about 0.1%. Neither the queue bound nor `checkpoint!` bounds garbage
+collection: a job that allocates heavily still causes stop-the-world pauses that stop handlers too.
+Only a separate process isolates that.
 
 The limits are set when a runtime is built, so choose them by building one:
 
@@ -718,7 +794,7 @@ Task metadata will now be persisted to that database, while live running threads
 A task's return value is stored as JSON, and may nest at most **512** levels, the same limit Nitro puts on request JSON. A callback that returns something deeper does not complete. Its completing write throws an `ArgumentError` before the row changes. That holds however deep the value goes, because the depth is checked on the value before it is serialized. The run then retries or fails like any other attempt that throws, so the task ends `FAILED` instead of holding a result nothing could read back. With `retry_on_failure`, the callback runs again first, so return a flatter value. `InMemoryWorkerStore` serializes nothing and has no such limit.
 
 !!! note "Worker runs are detached from the submitter's dynamic scope"
-    Nitro spawns every worker task — the async run, each sequential queue's processor, and the
+    Nitro spawns every worker task — the async run, each queue's processors, and the
     cleanup scheduler — under a **fresh dynamic scope** rather than the caller's. PormG tracks
     transaction state in a `ScopedValue`, and `Threads.@spawn` inherits those, so without the
     detach a run would execute its own run-start write on the submitting transaction's
@@ -757,7 +833,7 @@ A task's return value is stored as JSON, and may nest at most **512** levels, th
     ```
 
     The same applies to `worker_startup` / `startup` / `start!` and to the first
-    `submit_sequential_task` into a queue that is not yet running — each spawns a task that
+    `submit_queued_task` into a queue that is not yet running — each spawns a task that
     lives for the rest of the process.
 
     A task call inside a transaction opened on a **different** connection still raises PormG's
@@ -1001,8 +1077,8 @@ end
 set_queue_authorizer!(worker_store(app), my_queue_authorizer)
 ```
 
-This runs on **both** submit paths. `submit_sequential_task` passes the queue it was given;
-`submit_task` has no sequential queue, so it passes `DEFAULT_QUEUE_NAME` (`"default"`),
+This runs on **both** submit paths. `submit_queued_task` passes the queue it was given;
+`submit_task` has no declared queue, so it passes `DEFAULT_QUEUE_NAME` (`"default"`),
 following the convention every comparable queue uses. An authorizer written as an allowlist
 must therefore permit `"default"`, or `submit_task` is closed to everyone:
 
@@ -1119,8 +1195,9 @@ Do not use `InMemoryWorkerStore` for jobs that must survive server restarts. For
 Even with database persistence, keep in mind that `Nitro.Workers` is an in-process runner. Move to a dedicated external queue cluster (like Celery or Sidekiq) if you need:
 - cross-machine execution or horizontal scaling across separate nodes
 - extremely heavy CPU-bound job queues that should not compete with your web server thread pool
+  even when bounded, or that allocate enough for their garbage collection to stall it
 
-That last point is load-bearing rather than advisory. Worker callbacks run on the `:default` thread pool — the same pool `serve` spawns every request into — and nothing can stop one: a cancelled or timed-out CPU-bound callback holds its thread until it returns of its own accord. `Threads.nthreads()` of those and the web server has no thread left to answer on. Either make every long callback poll `cancel_requested(task_info)`, or run the work out of process.
+That last point is load-bearing rather than advisory. Worker callbacks run on the `:default` thread pool — the same pool `serve` spawns every request into — and nothing can stop one: a cancelled or timed-out CPU-bound callback holds its thread until it returns of its own accord. `Threads.nthreads()` of those and the web server has no thread left to answer on. Bound them with a queue's concurrency ([CPU-Bound Jobs](@ref)), make every long callback call `checkpoint!(task_info)` or poll `cancel_requested(task_info)`, or run the work out of process.
 
 ## Summary
 
@@ -1130,10 +1207,10 @@ Use `Nitro.Workers` when you need lightweight or persistent background execution
 - use `PormGWorkerStore` to persist task state to your database
 - pass an `Owner(...)` on submission and on every read; `System()` is the named, unscoped bypass
 - use `submit_task(...)` for parallel jobs
-- use `submit_sequential_task(...)` for ordered queue processing, on a queue name declared in `queues`
+- use `submit_queued_task(...)` for ordered queue processing, on a queue name declared in `queues`
 - expect `WorkerCapacityError` (a 503, or a 429 for a per-owner quota) when a limit is reached, and size `max_concurrent_runs` to your workload
 - read and cancel with the id the submit call **returned**, not the `task_key` you passed
-- poll `cancel_requested(task_info)` in any long-running callback — `cancel_task` and `timeout` do nothing without it
+- call `checkpoint!(task_info)` (or poll `cancel_requested(task_info)`) in any long-running callback — `cancel_task` and `timeout` do nothing without it
 - use `scope=:global` only when a job is genuinely shared, and pair it with `set_watch_authorizer!`
 - use `get_task_status(...)` and `get_queue_status(...)` to monitor work
 - use `TaskOptions(...)` for retries and timeouts

@@ -29,7 +29,7 @@ Nitro.pormg_nitro_worker
 
 ```@docs
 Nitro.Workers.submit_task
-Nitro.Workers.submit_sequential_task
+Nitro.Workers.submit_queued_task
 Nitro.Workers.TaskAuthority
 Nitro.Workers.Owner
 Nitro.Workers.System
@@ -50,6 +50,8 @@ Nitro.Workers.update_progress!
 Nitro.Workers.cancel_requested
 Nitro.Workers.cancel_reason
 Nitro.Workers.CANCEL_REASONS
+Nitro.Workers.checkpoint!
+Nitro.Workers.TaskCancelledError
 Nitro.Workers.TaskTimeoutError
 Nitro.Workers.format_error
 Nitro.Workers.MAX_STORED_ERROR_CHARS

@@ -71,7 +71,7 @@ Each is a plain slot the application writes and the framework reads through `Bas
 
 # What a store is NOT asked for
 
-Nothing here runs, schedules, or holds a handle to a live `Task`. The sequential queues and their
+Nothing here runs, schedules, or holds a handle to a live `Task`. The declared queues and their
 processor tasks, the cleanup scheduler, and the process-local run handles belong to
 [`WorkerRuntime`](@ref) ([#167](https://github.com/PingoLee/Nitro.jl/issues/167)) — so a backend
 cannot leak them by forgetting a teardown method, which is what
@@ -170,7 +170,7 @@ atomic step against its own storage — a compare-and-set, a conditional update,
 the storage engine itself honours.
 
 Performs **no** authorization. The authorized public path for granting access is the
-`watchers=` keyword on `submit_task` / `submit_sequential_task`.
+`watchers=` keyword on `submit_task` / `submit_queued_task`.
 """
 function add_watcher! end
 

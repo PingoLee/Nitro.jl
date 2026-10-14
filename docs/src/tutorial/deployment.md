@@ -114,10 +114,11 @@ So:
   `--threads=N-2,2`. That had the lowest p99 in nearly every fixed-rate run.
 - **CPU-bound handlers or jobs**: no layout protects the other requests from them, because Julia
   does not preempt a task that computes without yielding. Bound them instead, so some default
-  threads stay free for requests: run CPU-heavy Workers jobs through one declared sequential
-  queue (`submit_sequential_task`), which runs one job at a time and buffers up to 100 behind it,
-  or put a `yield()` inside a long loop. `max_concurrent_runs` does not make jobs wait: past it,
-  `submit_task` refuses them.
+  threads stay free for requests: run CPU-heavy Workers jobs through a declared queue with a
+  concurrency below the default thread count, such as `queues = ["compute" => max(N - 2, 1)]`
+  (`submit_queued_task`), which runs at most that many at once and buffers up to 100 behind them
+  (see [CPU-Bound Jobs](@ref)), or put a `yield()` inside a long loop.
+  `max_concurrent_runs` does not make jobs wait: past it, `submit_task` refuses them.
 
 **Stopping it.** `--threads=N,0` is a production layout, for a process stopped by its supervisor.
 It is a worse one to press Ctrl-C at. In a REPL, Julia throws the interrupt into the task that last
