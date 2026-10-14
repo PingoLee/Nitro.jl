@@ -130,10 +130,12 @@ using .bounds2_pb: Point, Line, Drawing, Tag, Labeled, Row, Table, Bag, Box
         end
 
         # Upstream allocates the 64 MiB and only then finds the body short.
+        # The minimum of 5 runs (`allocs`, #511).
         attempt(bytes) = try protobuf(req(bytes), Person) catch e; e end
         body = UInt8[0x0a, 0x80, 0x80, 0x80, 0x20]
-        attempt(body); attempt(body)
-        @test (@allocated attempt(body)) < 2^20
+        @testset let refusal = allocs(() -> attempt(body))
+            @test refusal.bytes < 2^20
+        end
     end
 
     @testset "a lying prefix is refused, not silently truncated" begin

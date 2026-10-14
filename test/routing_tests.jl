@@ -1152,16 +1152,17 @@ end
 
 # Measured against upstream on the same request rather than against a constant, so the bound
 # tracks the HTTP.jl and Julia versions in use. Upstream pays a `Vector{SubString}` and a `Dict`.
-function allocs_per_call(f, r, req, n)
-    f(r, req)
-    return @allocations(for _ in 1:n; f(r, req); end) / n
-end
-
+# Each side is the minimum of 5 runs of 1000 calls (`allocs`, #511).
 @testset "fewer allocations than upstream on an exact route, none extra on a variable one" begin
     r = table_router()
     exact, variable = HTTP.Request("GET", "/a/b"), HTTP.Request("GET", "/a/zz")
-    allocs_per_call(_gethandler, r, exact, 10); allocs_per_call(HTTP.Handlers.gethandler, r, exact, 10)
-    @test allocs_per_call(_gethandler, r, exact, 1000) + 2 <= allocs_per_call(HTTP.Handlers.gethandler, r, exact, 1000)
-    @test allocs_per_call(_gethandler, r, variable, 1000) <= allocs_per_call(HTTP.Handlers.gethandler, r, variable, 1000) + 0.5
+    @testset let ours = allocs(() -> _gethandler(r, exact); calls = 1000),
+                 upstream = allocs(() -> HTTP.Handlers.gethandler(r, exact); calls = 1000)
+        @test ours.count + 2 <= upstream.count
+    end
+    @testset let ours = allocs(() -> _gethandler(r, variable); calls = 1000),
+                 upstream = allocs(() -> HTTP.Handlers.gethandler(r, variable); calls = 1000)
+        @test ours.count <= upstream.count + 0.5
+    end
 end
 end

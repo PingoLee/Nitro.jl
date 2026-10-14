@@ -1099,12 +1099,6 @@ catch e
         rethrow()
     (:refused, nothing)      # what `safe_extract` turns into a 400
 end
-# Bytes one warmed call allocates.
-function bytes(f, x)
-    f(x)
-    return @allocated f(x)
-end
-
 @testset "agrees with the two-pass bind on every edge" begin
     for (T, body) in [
             (Order, """{"id":2}"""),
@@ -1156,7 +1150,10 @@ end
     # the two-pass bind decoded it once, as a `Dict` key.
     key = "\\u0062" ^ 20_000
     body = Vector{UInt8}("{\"$key\":1}")
-    @test bytes(b -> E.json_bind(Wide, b), body) < 2 * bytes(b -> two_pass(Wide, b), body)
+    # Each the minimum of 5 runs (`allocs`, #511).
+    @testset let walk = allocs(() -> E.json_bind(Wide, body)), twopass = allocs(() -> two_pass(Wide, body))
+        @test walk.bytes < 2 * twopass.bytes
+    end
 end
 
 @testset "an array body is refused, as it was" begin
@@ -1176,17 +1173,20 @@ end
 @testset "a @kwdef body allocates what the plain struct's parse does" begin
     body = Vector{UInt8}(JSON.json(Dict("rows" => [Dict("id" => i, "label" => "row-$i")
                                                    for i in 1:400])))   # 801 keys: under the field cap
-    kw    = bytes(b -> E.json_bind(Rows, b), body)
-    plain = bytes(b -> E.json_bind(PlainRows, b), body)
-    # What the old bind paid on top of the parse: its first pass, a `JSONText` map whose value is a
-    # copy of the body's text.
-    textmap = bytes(b -> BP._parse_json_bounded(b, Dict{String, JSON.JSONText};
-                                                style = BP.NITRO_READ_STYLE), body)
-    @test textmap > length(body) ÷ 2
-    # A bind that copies the body once must fail the bound below, or the bound cannot see a copy.
-    copying = bytes(b -> E.json_bind(Rows, copy(b)), body)
-    @test copying - plain >= length(body) ÷ 8
-    @test kw - plain < length(body) ÷ 8
+    # Each the minimum of 5 runs (`allocs`, #511).
+    @testset let kw    = allocs(() -> E.json_bind(Rows, body)),
+                 plain = allocs(() -> E.json_bind(PlainRows, body)),
+                 # What the old bind paid on top of the parse: its first pass, a `JSONText` map
+                 # whose value is a copy of the body's text.
+                 textmap = allocs(() -> BP._parse_json_bounded(body, Dict{String, JSON.JSONText};
+                                                               style = BP.NITRO_READ_STYLE)),
+                 # A bind that copies the body once must fail the bound below, or the bound
+                 # cannot see a copy.
+                 copying = allocs(() -> E.json_bind(Rows, copy(body)))
+        @test textmap.bytes > length(body) ÷ 2
+        @test copying.bytes - plain.bytes >= length(body) ÷ 8
+        @test kw.bytes - plain.bytes < length(body) ÷ 8
+    end
 end
 
 end
@@ -1215,10 +1215,11 @@ struct LaterKw; a::Int; end
     @test E.binds_by_keyword(LaterKw)
 end
 
-kw_allocs(T) = @allocated R.kw_constructible(T)
 @testset "a repeated answer is the memoized one" begin
-    kw_allocs(LaterKw)
-    @test kw_allocs(LaterKw) == 0       # `hasmethod` with keyword names allocates; a hit does not
+    # `hasmethod` with keyword names allocates; a hit does not. Min of 5 runs (`allocs`, #511).
+    @testset let hit = allocs(() -> R.kw_constructible(LaterKw))
+        @test hit.bytes == 0
+    end
 end
 
 # Many tasks missing on fresh types at once, each publishing its own copy. Whether a publication is

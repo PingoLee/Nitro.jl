@@ -215,18 +215,16 @@ keyword_rebuild(resp, headers) = HTTP.Response(resp.status, resp.body; reason = 
     request = resp.request, request_url = resp.request_url, previous = resp.previous,
     redirect_count = resp.redirect_count)
 
-function allocs_per_call(f, n)
-    f()
-    return @allocations(for _ in 1:n; f(); end) / n
-end
-
+# Each side is the minimum of 5 runs of 1000 calls (`allocs`, #511).
 @testset "a rebuild allocates less than the keyword constructor did (#447)" begin
     resp, extra = HTTP.Response(200, "x"), ["X-A" => "1", "X-B" => "2"]
-    new_add() = add_response_headers(resp, extra)
-    old_add() = keyword_rebuild(resp, vcat(resp.headers, extra))
-    new_own() = own_response_headers(resp)
-    old_own() = keyword_rebuild(resp, copy(resp.headers))
-    @test allocs_per_call(new_add, 1000) + 3 <= allocs_per_call(old_add, 1000)
-    @test allocs_per_call(new_own, 1000) + 2 <= allocs_per_call(old_own, 1000)
+    @testset let ours = allocs(() -> add_response_headers(resp, extra); calls = 1000),
+                 keyword = allocs(() -> keyword_rebuild(resp, vcat(resp.headers, extra)); calls = 1000)
+        @test ours.count + 3 <= keyword.count
+    end
+    @testset let ours = allocs(() -> own_response_headers(resp); calls = 1000),
+                 keyword = allocs(() -> keyword_rebuild(resp, copy(resp.headers)); calls = 1000)
+        @test ours.count + 2 <= keyword.count
+    end
 end
 end

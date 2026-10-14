@@ -518,7 +518,9 @@ end
 @test interns_client_strings_cached(Walked) === false
 @test haskey(_INTERNS_CACHE, Walked)
 @test interns_client_strings_cached(Walked) === false
-@test (@allocated interns_client_strings_cached(Walked)) < 256
+@testset let lookup = allocs(() -> interns_client_strings_cached(Walked))  # min of 5 runs (#511)
+    @test lookup.bytes < 256
+end
 # ...and `json(req, T)` is what consults it.
 struct ViaJson
     a::Int

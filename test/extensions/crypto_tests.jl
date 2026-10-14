@@ -302,9 +302,10 @@ using Random
         # A view MACs exactly its own bytes, and any other string type its UTF-8 bytes.
         @test hmac("k", SubString("xxpayloadyy", 3, 9)) == reference("k", "payload")
         @test hmac(Test.GenericString("k"), Test.GenericString("payload")) == reference("k", "payload")
-        # The result is the 32-byte MAC and nothing else on the heap.
-        hmac("k", "payload")
-        @test (@allocated hmac("k", "payload")) < 256
+        # The result is the 32-byte MAC and nothing else on the heap. Min of 5 runs (`allocs`, #511).
+        @testset let mac = allocs(() -> hmac("k", "payload"))
+            @test mac.bytes < 256
+        end
     end
 
 end
