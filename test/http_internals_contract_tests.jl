@@ -29,9 +29,9 @@ import Sockets
 #       `WebSocketError.message.code`. `_write_fixed_body_live!` (#377) writes a known-length
 #       streaming body past HTTP/1.1's FIXED buffer with the stream head/byte writers and the
 #       `Stream` write-state fields.
-#   • src/core/lifecycle.jl — refuses cleartext HTTP/2 (#375) by adding a method to the private
-#       `_probe_h2_preface!` for `Server{<:NitroStreamHandler}`, returning a
-#       `_ServerPrefaceConn` built with nothing consumed.
+#   • src/core/lifecycle.jl — refuses cleartext HTTP/2 (#375) with `listen!`'s `allow_h2c = false`.
+#       Public since HTTP.jl 2.9, so no longer an internal; pinned anyway because it is the whole
+#       of the refusal (it replaced an override of the private `_probe_h2_preface!`).
 #   • src/response.jl — `Res._new_response` (#446) builds every `Res` and `format_response`
 #       response through `HTTP.Response`'s positional FIELD constructor, skipping the keyword
 #       form's header normalize-and-copy. It depends on the field order and on storing what
@@ -44,7 +44,7 @@ import Sockets
 #
 # None of these are part of HTTP's public, SemVer-guaranteed API, so a 2.x bump
 # can rename or remove them WITHOUT a breaking-version signal. The compat pin
-# (`HTTP = "~2.8"`) caps that exposure to 2.8 patch releases; this testset is the
+# (`HTTP = "~2.9"`) caps that exposure to 2.9 patch releases; this testset is the
 # canary — if an upgrade moves the ground, it fails HERE, loud and naming the
 # missing symbol, instead of deep inside request handling.
 #
@@ -400,48 +400,33 @@ end
     @test fieldtype(HTTP.Server, :reuseaddr) === Bool
 end
 
-@testset "header-deadline release surface (src/core/transport.jl `_clear_header_deadline!`)" begin
-    # #316: Nitro defaults `read_header_timeout`, and clears the read deadline once the head is
-    # parsed because HTTP.jl 2.7 leaves it armed through the body. The clear reads these fields to
-    # decide whether it applies, and calls this internal setter. A rename would not fail loudly:
-    # `_clear_header_deadline!` would throw on every request, or — worse, if a field were merely
-    # repurposed — stop clearing, and every upload slower than 120s would be cut mid-body again.
-    @test :server in fieldnames(HTTP.Stream)
+@testset "swallow-deadline surface (src/core/transport.jl `_bound_swallow!`)" begin
+    # #298: before swallowing a refused request's body, `_bound_swallow!` arms a read deadline on
+    # the connection through this internal setter, and reads these fields to reach it and to skip
+    # HTTP/2. A rename would not fail loudly: the setter's `try` tolerates a failure, so the
+    # swallow would quietly lose its time bound. (This section used to pin the header-deadline
+    # clear too, `_clear_header_deadline!` (#316), which HTTP.jl 2.9 made unnecessary: JuliaWeb/HTTP.jl#1382.)
     @test :h2_conn in fieldnames(HTTP.Stream)
     @test :tracked in fieldnames(HTTP.Stream)
-    # `tracked.conn` is read directly here, by `_bound_swallow!` and by the WebSocket TLS check.
-    # It used to be pinned by the peer-IP field-chain canary, which #410 retired along with the
-    # walk; all three of these readers still need it.
+    # `tracked.conn` is read directly by `_bound_swallow!` and by the WebSocket TLS check. It used
+    # to be pinned by the peer-IP field-chain canary, which #410 retired along with the walk.
     @test isdefined(HTTP, :_ServerConn)
     @test :conn in fieldnames(HTTP._ServerConn)
-    for f in (:read_header_timeout_ns, :read_timeout_ns, :idle_timeout_ns, :write_timeout_ns)
-        @test f in fieldnames(HTTP.Server)
-        @test fieldtype(HTTP.Server, f) === Int64
-    end
     @test isdefined(HTTP, :_set_read_deadline!)
     @test hasmethod(HTTP._set_read_deadline!, Tuple{HTTP.TCP.Conn, Int64})
     @test hasmethod(HTTP._set_read_deadline!, Tuple{HTTP.TLS.Conn, Int64})
 end
 
-@testset "h2c refusal surface (src/core/lifecycle.jl `_probe_h2_preface!` override)" begin
-    # #375: Nitro keeps HTTP/2 off its plaintext listeners by overriding the preface probe
-    # `_serve_conn!` calls on every non-TLS connection. A rename of the function fails the
-    # method definition at load time, which is loud; the quiet failures are a changed signature or
-    # return type, which would leave Nitro's method never selected (h2c silently accepted again)
-    # or returning something `_serve_h1_conn!` cannot read. test/h2c_tests.jl is the behavioral
-    # net for `_serve_conn!` no longer calling the probe at all.
-    # Concrete server types, so each query selects exactly one method: HTTP's for any other
-    # handler, Nitro's for its own.
-    other_server = HTTP.Server{typeof(identity)}
-    nitro_server = HTTP.Server{Nitro.Core.NitroStreamHandler{typeof(identity)}}
-    @test hasmethod(HTTP._probe_h2_preface!, Tuple{HTTP.Server, HTTP.TCP.Conn})
-    @test which(HTTP._probe_h2_preface!, Tuple{other_server, HTTP.TCP.Conn}).module === HTTP
-    @test Base.return_types(HTTP._probe_h2_preface!, Tuple{other_server, HTTP.TCP.Conn}) ==
-          [Tuple{Bool, HTTP._ServerPrefaceConn{HTTP.TCP.Conn}}]
-    @test hasmethod(HTTP._ServerPrefaceConn, Tuple{Vector{UInt8}, HTTP.TCP.Conn})
-    @test which(HTTP._probe_h2_preface!, Tuple{nitro_server, HTTP.TCP.Conn}).module === Nitro.Core
-    @test Base.return_types(HTTP._probe_h2_preface!, Tuple{nitro_server, HTTP.TCP.Conn}) ==
-          [Tuple{Bool, HTTP._ServerPrefaceConn{HTTP.TCP.Conn}}]
+@testset "h2c refusal surface (src/core/lifecycle.jl `preprocesskwargs`, `allow_h2c`)" begin
+    # #375: Nitro keeps HTTP/2 off its plaintext listeners with HTTP.jl's `allow_h2c = false`
+    # (HTTP.jl #1388, 2.9). Before 2.9 there was no switch and Nitro overrode the private preface
+    # probe. This is documented API now, but it is also the whole of the refusal, so a release
+    # that dropped the keyword from `listen!` (a `MethodError` at every `serve`, loud) or stopped
+    # storing it on the `Server` (quiet) is pinned here; test/h2c_tests.jl is the behavioral net.
+    # The method `serve` calls: `HTTP.listen!(listener, host, port; kwargs...)`. The others are
+    # forwarding wrappers that take `kwargs...`.
+    @test hasmethod(HTTP.listen!, Tuple{Function, String, Int}, (:allow_h2c,))
+    @test fieldtype(HTTP.Server, :allow_h2c) === Bool
 end
 
 @testset "live FIXED writer (src/core/transport.jl `_write_fixed_body_live!`)" begin
@@ -627,7 +612,7 @@ end
 
 @testset "HTTP's SSE body contract, which Res.sse is built on (#160)" begin
     # `Res.sse` hands the transport an `HTTP.SSEStream` and nothing else. Three properties of that
-    # type are load-bearing for Nitro, and `HTTP = "~2.8"` is a deliberately tight pin, so they are
+    # type are load-bearing for Nitro, and `HTTP = "~2.9"` is a deliberately tight pin, so they are
     # pinned here next to the rest of the HTTP contract.
 
     # 1. It is an `AbstractBody`, so it dispatches to the STREAMING method of

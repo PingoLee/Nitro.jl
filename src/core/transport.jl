@@ -340,15 +340,17 @@ end
 # wire only at `closewrite`. So this loop used to read a streamed `Res.file` — `servecontent` always
 # gives it a length — into memory in full before a byte was sent: peak memory was file size ×
 # concurrent downloads, exactly what #41 set out to remove, and `write_timeout` bounded the whole
-# transfer because it was one socket write. HTTP.jl has no switch for it (2.8 unchanged; its #1376
+# transfer because it was one socket write. Through 2.8 HTTP.jl had no switch for it (its #1376
 # only coalesces bodies ≤ 4 KiB with the head). Its own REQUEST-handler path already streams a
 # FIXED body live (`write_response!`); only the stream-handler path Nitro serves through buffers.
 #
 # `_write_fixed_body_live!` therefore does, for this one case, what that path does: head first,
-# then each chunk straight to the connection. A public API for it is requested upstream
-# (JuliaWeb/HTTP.jl#1384); until it exists, the internals it reaches are wrapped below and canaried in
-# test/http_internals_contract_tests.jl — and behaviorally in test/streaming_write_tests.jl, which
-# is the only check that sees WHEN bytes reach the wire.
+# then each chunk straight to the connection. HTTP.jl 2.9 ships a public way to do this: an
+# explicit `startwrite` now streams a fixed-length body past 4 KiB (JuliaWeb/HTTP.jl#1389, which
+# closed the upstream request JuliaWeb/HTTP.jl#1384), and moving onto it is #529. Until then, the
+# internals it reaches are wrapped below and canaried in test/http_internals_contract_tests.jl —
+# and behaviorally in test/streaming_write_tests.jl, which is the only check that sees WHEN bytes
+# reach the wire.
 #
 # The first chunk is read BEFORE anything is started, as Go's `io.Copy` reads before its first
 # write. That keeps the head's timing exactly where the first `write` always put it — for every
@@ -539,8 +541,9 @@ const _MAX_SWALLOW_BYTES = 2 * 1024 * 1024
 # client with unread data in flight eats an RST, as it does past the byte budget.
 const _SWALLOW_TIMEOUT_NS = Int64(5_000_000_000)
 
-# Arm that bound before swallowing. HTTP/1.1 only, for the reason `_clear_header_deadline!` gives:
-# an HTTP/2 connection's read deadline belongs to its frame loop, not to one stream. (Unreachable
+# Arm that bound before swallowing. HTTP/1.1 only: an HTTP/2 connection's read deadline belongs to
+# its frame loop, which re-arms it before every frame and multiplexes other streams, so setting it
+# from one stream's handler would reach across every stream on the connection. (Unreachable
 # through `serve` since #375 refused HTTP/2, and kept so that re-enabling it would not reach across
 # streams; an h2 swallow would also be unbounded in time, which is part of why it was refused.) It can
 # lengthen a caller's shorter `read_timeout` by at most those five seconds, on a request that is
@@ -553,7 +556,12 @@ function _bound_swallow!(stream::HTTP.Stream)::Nothing
         # An absolute `time_ns()` deadline — Reseau's contract for `set_read_deadline!`.
         HTTP._set_read_deadline!(getfield(tracked, :conn), Int64(time_ns()) + _SWALLOW_TIMEOUT_NS)
     catch err
-        # Same tolerance, and the same narrow rethrow, as `_clear_header_deadline!`.
+        # A `terminate` racing the refusal closes the connection underneath us, and Reseau then
+        # refuses the deadline change. That is harmless -- the connection is going anyway -- so it
+        # must not become an error of its own; HTTP's `_clear_deadlines!` ignores the same failure.
+        # Structural breakage (a renamed method, a changed signature) cannot hide here: the canary
+        # in test/http_internals_contract_tests.jl fails first. Narrow, not `is_unrecoverable`: a
+        # deadline setter recurses into nothing (group 1 in `src/errors.jl`).
         err isa InterruptException && rethrow()
     end
     return nothing
@@ -1220,67 +1228,11 @@ end
 # ── The header deadline bounds the head, not the body (#316) ────────────────────────────────────
 #
 # Go's `ReadHeaderTimeout` contract: "the connection's read deadline is reset after reading the
-# headers and the Handler can decide what is considered too slow for the body." HTTP.jl 2.7 arms
-# the header deadline before `read_request` and, when `read_timeout` is 0, never replaces it —
-# `_set_read_deadline_for_body!` returns early instead of clearing it, and `_clear_deadlines!` runs
-# only after the handler returns. So `read_header_timeout = 120` silently became "the head AND the
-# whole body within 120 seconds": an upload that took longer got its connection cut mid-body.
-# That is the wrong default for a timeout Nitro now turns on for everyone, so we clear the read
-# deadline the moment HTTP hands us a parsed head.
-#
-# A WORKAROUND, reported upstream as JuliaWeb/HTTP.jl#1381 (reproduced on HTTP.jl 2.8.0). When a
-# release fixes it — `_set_read_deadline_for_body!` clearing the deadline itself, and the idle
-# deadline no longer outliving a keep-alive wait — this wrapper and its canaries in
-# test/http_internals_contract_tests.jl can go. Keep the keep-alive and late-body tests in
-# test/server_lifecycle_tests.jl: they are what proves the fix landed.
-#
-# Narrow on purpose:
-#   * HTTP/1.1 only. An HTTP/2 stream's deadlines belong to the connection's frame loop, which
-#     re-arms them before every frame and multiplexes other streams; touching them from one
-#     stream's handler would reach across every stream on the connection. (Unreachable through
-#     `serve` since #375 refused HTTP/2; kept for the same reason as in `_bound_swallow!`.)
-#   * Only when `read_timeout` is unset. When it is set, HTTP has already re-armed the deadline for
-#     the body at the caller's chosen length, and that one must stand.
-#
-# NOT gated on `read_header_timeout` being set, although that looks like "nothing was armed".
-# After each response HTTP arms the IDLE deadline, and when the header timeout is 0 nothing
-# replaces it before the next request's head and body are read — so with
-# `read_header_timeout = 0` and the default `idle_timeout`, every request after the first on a
-# keep-alive connection had its body cut 120 seconds after the previous response. Clearing
-# unconditionally covers whichever deadline is armed; when none is, Reseau sees an unchanged value.
-#
-# `getfield`, not property access, to match the other readers of this internal chain
-# (`_bound_swallow!`, the WebSocket TLS check). Every field and the `_set_read_deadline!` method
-# are canaried in test/http_internals_contract_tests.jl ("header-deadline release surface").
-function _clear_header_deadline!(stream::HTTP.Stream)::Nothing
-    getfield(stream, :h2_conn) === nothing || return nothing
-    server = getfield(stream, :server)
-    server === nothing && return nothing
-    getfield(server, :read_timeout_ns) > 0 && return nothing
-    tracked = getfield(stream, :tracked)
-    tracked === nothing && return nothing
-    try
-        # `0` disables the read deadline (Reseau's documented contract for `set_read_deadline!`).
-        HTTP._set_read_deadline!(getfield(tracked, :conn), zero(Int64))
-    catch err
-        # A `terminate` racing a freshly parsed head closes the connection underneath us, and
-        # Reseau then refuses the deadline change. That is harmless — the request is being cut
-        # anyway — so it must not become an error of its own; HTTP's `_clear_deadlines!` ignores
-        # the same failure. Structural breakage (a renamed method, a changed signature) cannot
-        # hide here: the canary above fails first. Narrow, not `is_unrecoverable`: a deadline
-        # setter recurses into nothing (group 1 in `src/errors.jl`).
-        err isa InterruptException && rethrow()
-    end
-    return nothing
-end
-
-# Outermost of the handler wrappers `serve` installs, so the clear runs on the connection task the
-# instant the head is parsed — before `parallel_stream_handler` spends a spawn getting to the body.
-# Applied to a custom `handler` too: the deadline is HTTP's, not the handler's, and a custom
-# handler reading a slow body would hit exactly the same cut.
-function header_deadline_handler(handle_stream::Function)
-    function(stream::HTTP.Stream)
-        _clear_header_deadline!(stream)
-        handle_stream(stream)
-    end
-end
+# headers and the Handler can decide what is considered too slow for the body." Nitro defaults
+# `read_header_timeout`, so it relies on that contract, and HTTP.jl keeps it since 2.9
+# (JuliaWeb/HTTP.jl#1382): `_set_read_deadline_for_body!` re-arms the deadline at `read_timeout`, or
+# clears it when that is 0, and the next header deadline is armed only once the next request's
+# bytes arrive, so the idle wait between keep-alive requests is `idle_timeout`'s. Through 2.8 the
+# header deadline stayed armed through the body (JuliaWeb/HTTP.jl#1381), and Nitro cleared it itself in a stream
+# wrapper. The behavioral pins are the Slowloris, late-body and keep-alive tests in
+# test/server_lifecycle_tests.jl.

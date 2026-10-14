@@ -42,7 +42,8 @@ is explicit introspection, not accidental disclosure.)
 - `host="127.0.0.1"`, `port=8080`: listen address. Keep `host` on loopback when a
   reverse proxy terminates TLS in front of Nitro. The listener is plaintext **HTTP/1.x only**
   (#375): a client that opens with the cleartext HTTP/2 (h2c) preface is answered `400` and
-  disconnected. Put HTTP/2 and TLS at the proxy, and have it speak HTTP/1.1 upstream.
+  disconnected, and HTTP.jl's `allow_h2c = true` is refused with an `ArgumentError`. Put
+  HTTP/2 and TLS at the proxy, and have it speak HTTP/1.1 upstream.
 - `async=false`: when `true`, return the running `Server` instead of blocking.
 - `parallel=true`: run each request on its own `Threads.@spawn` task in Julia's default thread
   pool. This is what lets `--threads` reach your handlers: HTTP.jl runs its accept loop and every
@@ -153,15 +154,15 @@ is explicit introspection, not accidental disclosure.)
 - `read_header_timeout=120`: seconds a connection has to deliver a complete request head. Past
   it the server answers **408** and closes the connection, which bounds a client that trickles
   header bytes (Slowloris) or goes silent. It bounds the **head only**: once the head is parsed
-  the deadline is cleared, so a slow upload is not cut by it (Go's `ReadHeaderTimeout`
-  semantics). On HTTP/1.1 it is also the **keep-alive idle limit** — HTTP.jl re-arms it before
-  every request on a connection, including the wait between two requests — which is why it
-  defaults to 120 rather than a few seconds: behind nginx or an AWS ALB, whose idle upstream
-  connections time out at 60 seconds, the proxy must be the side that closes first. See
-  `DEFAULT_READ_HEADER_TIMEOUT_SECONDS`.
-- `idle_timeout=120`: seconds a connection waits for its next request when both
-  `read_header_timeout` and `read_timeout` are `0`. Otherwise `read_header_timeout` takes its
-  place, or `read_timeout` when only that one is set.
+  the deadline is re-armed for the body (at `read_timeout`, or cleared when that is unset), so a
+  slow upload is not cut by it (Go's `ReadHeaderTimeout` semantics). On a keep-alive
+  connection it starts when the next request's first byte arrives; the wait before that byte is
+  `idle_timeout`'s. See `DEFAULT_READ_HEADER_TIMEOUT_SECONDS`.
+- `idle_timeout=120`: seconds a keep-alive connection waits for the first byte of its next
+  request before it is closed, silently. `read_timeout` takes its place when `idle_timeout` is
+  `0`; with both `0` an idle connection is kept until the client closes it. Behind nginx or an
+  AWS ALB, whose idle upstream connections time out at 60 seconds, keep it above that so the
+  proxy is the side that closes first.
 - `read_timeout`, `write_timeout`: **off** by default, forwarded to `HTTP.listen!`.
   `read_timeout` is one deadline for the body *and* every read the handler makes, counted from
   the end of the head, and answers **408** when it fires. `write_timeout`

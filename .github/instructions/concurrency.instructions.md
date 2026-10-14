@@ -37,9 +37,10 @@ lives in the code comment it names, and that comment is canonical.
   happens. Do not weaken or remove the warning; its comment says which thread layouts stay
   silent and why (#454).
 - **The interactive thread is the scarcest resource in the process.** Add nothing to the
-  connection task before the spawn. Today `header_deadline_handler` is Nitro's only work there
-  (#316). The response is written on the request task: `stream_handler` calls `closewrite`
-  itself (#453). See #462 for HTTP.jl's own share of that thread.
+  connection task before the spawn. Since HTTP.jl 2.9, Nitro does no work there: the
+  header-deadline clear it used to run (#316) moved into HTTP.jl (JuliaWeb/HTTP.jl#1382).
+  The response is written on the request task: `stream_handler` calls `closewrite` itself
+  (#453). See #462 for HTTP.jl's own share of that thread.
 
 ## 3. Background tasks
 
