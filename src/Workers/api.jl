@@ -803,6 +803,16 @@ function _execute_task_async(runtime::WorkerRuntime, task_key::String, callback:
                         return _cancel_task!(runtime, task_info)
                     end
 
+                    # A `checkpoint!` that found this run's token set (#513). Recorded through the
+                    # same CAS as every other cancellation, so a cause that already decided the record
+                    # (a `cancel_task`, a supersede) keeps it, and a drain's `:shutdown` is stored as
+                    # one. Never retried: the token is never reset, so a retry would start cancelled.
+                    # Only when the token IS set: one the callback built itself is an ordinary failure,
+                    # for the reason the `InterruptException` note above gives.
+                    if unwrapped isa TaskCancelledError && cancel_requested(task_info)
+                        return _cancel_task!(runtime, task_info)
+                    end
+
                     # A timeout is terminal on the first attempt. Retrying it cannot help and can
                     # harm: nothing stops the attempt that timed out, so `max_retries = 3` would
                     # put four copies of the callback on the thread pool at once, sharing one

@@ -50,6 +50,8 @@ Nitro.Workers.update_progress!
 Nitro.Workers.cancel_requested
 Nitro.Workers.cancel_reason
 Nitro.Workers.CANCEL_REASONS
+Nitro.Workers.checkpoint!
+Nitro.Workers.TaskCancelledError
 Nitro.Workers.TaskTimeoutError
 Nitro.Workers.format_error
 Nitro.Workers.MAX_STORED_ERROR_CHARS

@@ -12,7 +12,9 @@
 A declared queue now has a **concurrency**: `queues = ["email", "compute" => 6]` runs up to six
 items of `"compute"` at once. A bare name still means one at a time, so an app that declares only
 bare names keeps exactly the ordering it had. That is a bulkhead for CPU-bound work: a class of
-heavy jobs can never take more than `k` threads, which keeps the rest for request handlers.
+heavy jobs never takes more than `k` threads, which keeps the rest for request handlers. (A callback
+abandoned by `TaskOptions(timeout = …)` still holds its thread until it returns; calling
+`checkpoint!(task_info)` in the job is what makes the deadline stop it.)
 
 Once a queue can run more than one item, "sequential" is the wrong name for it, so the submit
 function was renamed, with no alias. Its arguments and behavior are unchanged.

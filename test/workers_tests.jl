@@ -5178,4 +5178,127 @@ end
     end
 end
 
+@testset "#513: checkpoint! yields, and throws once the run is asked to stop" begin
+    info = TaskInfo("u::checkpoint")
+    # Both tasks `@async`, so both are sticky to ONE thread: `other` can run only when the outer
+    # task gives that thread up, and the outer one resumes only after `other`, whatever `-t` is.
+    observed = fetch(@async begin
+        other = @async :ran
+        before = istaskdone(other)
+        returned = checkpoint!(info)
+        (before, returned, istaskdone(other))
+    end)
+    @test observed == (false, nothing, true)
+
+    for reason in CANCEL_REASONS
+        cancelled = TaskInfo("u::checkpoint-$reason")
+        Nitro.Workers._request_cancel!(cancelled, reason)
+        err = try
+            checkpoint!(cancelled); nothing
+        catch e
+            e
+        end
+        @test err isa TaskCancelledError
+        @test err.reason === reason
+        @test sprint(showerror, err) == Nitro.Workers._cancel_message(reason)
+    end
+end
+
+@testset "#513: a checkpoint!ing run stops at a cancel, a deadline and a drain" begin
+    store = InMemoryWorkerStore()
+    rt = WorkerRuntime(store; queues = ["cpu" => 2])
+    status(id) = get_task_status(id, System(); runtime = rt)
+    # Computes in short slices, reaching `checkpoint!` between them; counts the slices it ran and
+    # records whether it unwound, so a run that kept going after the throw would show.
+    slices = Dict{String, Threads.Atomic{Int}}()
+    unwound = Dict{String, Threads.Atomic{Bool}}()
+    function spinner(name)
+        n = slices[name] = Threads.Atomic{Int}(0)
+        u = unwound[name] = Threads.Atomic{Bool}(false)
+        return function (task_info)
+            try
+                while true
+                    t = time_ns() + 2_000_000          # 2 ms without yielding
+                    while time_ns() < t end
+                    Threads.atomic_add!(n, 1)
+                    checkpoint!(task_info)
+                end
+            catch
+                u[] = true
+                rethrow()
+            end
+        end
+    end
+    try
+        # A user cancel, on a queued run that also has retries: recorded CANCELLED, never re-run.
+        a = submit_queued_task("cpu", "a", spinner("a"), Owner("u"); runtime = rt,
+                               options = TaskOptions(retry_on_failure = true, max_retries = 3))
+        @test wait_for(() -> slices["a"][] > 2) == :ok
+        cancel_task(a, Owner("u"); runtime = rt)
+        @test wait_for(() -> unwound["a"][]) == :ok
+        @test status(a)[:status] == "CANCELLED"
+        @test status(a)[:error] == "Cancelled by user"
+        stopped_at = slices["a"][]
+        sleep(0.1)
+        @test slices["a"][] <= stopped_at + 1                     # at most the slice in progress
+        @test wait_for(() -> capacity_idle(rt)) == :ok
+
+        # A deadline is now effective: the callback itself stops, not just the wait for it.
+        b = submit_task("b", spinner("b"), Owner("u"); runtime = rt, options = TaskOptions(timeout = 1))
+        @test wait_for(() -> status(b)[:status] == "FAILED"; timeout = 10.0) == :ok
+        @test wait_for(() -> unwound["b"][]) == :ok
+        @test wait_for(() -> capacity_idle(rt)) == :ok          # its thread, and its slot, came back
+
+        # A drain: both of the queue's runs unwind inside the window, and are recorded as a shutdown.
+        c = submit_queued_task("cpu", "c", spinner("c"), Owner("u"); runtime = rt)
+        d = submit_queued_task("cpu", "d", spinner("d"), Owner("u"); runtime = rt)
+        @test wait_for(() -> slices["c"][] > 0 && slices["d"][] > 0) == :ok
+        @test shutdown!(rt; drain_timeout = 5) == true
+        @test unwound["c"][] && unwound["d"][]
+        for id in (c, d)
+            @test status(id)[:status] == "CANCELLED"
+            @test status(id)[:error] == "Cancelled by worker shutdown"
+        end
+    finally
+        reset_runtime!(rt)
+    end
+end
+
+@testset "#513: an async checkpoint!ing run unwinds on a drain and is recorded as one" begin
+    # The drain claims nothing, so this is the one cause whose record the executor's
+    # `TaskCancelledError` branch writes: without it the run would be recorded FAILED.
+    store = InMemoryWorkerStore()
+    rt = WorkerRuntime(store)
+    entered = Threads.Atomic{Bool}(false)
+    try
+        id = submit_task("spin", function (task_info)
+                entered[] = true
+                while true
+                    t = time_ns() + 2_000_000
+                    while time_ns() < t end
+                    checkpoint!(task_info)
+                end
+            end, Owner("u"); runtime = rt)
+        @test wait_for(() -> entered[]) == :ok
+        @test shutdown!(rt; drain_timeout = 5) == true
+        @test get_task_status(id, System(); runtime = rt)[:status] == "CANCELLED"
+        @test get_task_status(id, System(); runtime = rt)[:error] == "Cancelled by worker shutdown"
+    finally
+        reset_runtime!(rt)
+    end
+end
+
+@testset "#513: a TaskCancelledError nobody asked for is an ordinary failure" begin
+    store = InMemoryWorkerStore()
+    rt = WorkerRuntime(store; queues = ["q"])
+    try
+        forged = () -> throw(TaskCancelledError(:user))
+        ids = [submit_task("forged", forged, Owner("u"); runtime = rt),
+               submit_queued_task("q", "forged-q", forged, Owner("u"); runtime = rt)]
+        @test wait_for(() -> all(id -> get_task_status(id, System(); runtime = rt)[:status] == "FAILED", ids)) == :ok
+    finally
+        reset_runtime!(rt)
+    end
+end
+
 end

@@ -23,7 +23,9 @@ refuses a submission **before anything is written**, with a [`WorkerCapacityErro
 - **A queue's concurrency** ([#513](https://github.com/PingoLee/Nitro.jl/issues/513)):
   `queues = ["email", "compute" => 6]` runs at most six `"compute"` items at once, and a bare name
   means one at a time. That is the bulkhead for CPU-bound jobs (Sidekiq's per-queue concurrency,
-  River's `MaxWorkers`): the class can never take more than `k` threads. A queue's running items
+  River's `MaxWorkers`): the class never takes more than `k` threads, except for callbacks a deadline
+  abandoned (below), which hold their thread until they return, and which a `checkpoint!` makes stop.
+  A queue's running items
   count toward `max_runs_per_owner` but **not** toward `max_concurrent_runs`. Counting them there
   would let async load stall every queue, and an async callback that waits on an item it queued
   would deadlock at the cap. A submit past `k` waits in the queue's buffer.

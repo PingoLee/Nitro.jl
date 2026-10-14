@@ -552,8 +552,9 @@ submit_task(
 
     Worker callbacks share the `:default` thread pool with the per-request tasks `serve`
     spawns, so `Threads.nthreads()` abandoned CPU-bound callbacks will wedge the web server.
-    A callback that can outrun its deadline **must** poll `cancel_requested(task_info)`; the
-    logged warning is the only other signal you get.
+    A callback that can outrun its deadline **must** poll `cancel_requested(task_info)`, or call
+    `checkpoint!(task_info)`, which throws once the token is set; the logged warning is the only
+    other signal you get.
 
     **A timeout is never retried.** `retry_on_failure` covers genuine failures. Retrying a
     timeout cannot help — nothing stopped the attempt that timed out, so `max_retries=3`
@@ -649,8 +650,33 @@ submit_queued_task(app, "compute", "model-$(id)", task_info -> fit_model(id), Ow
 ```
 
 However many are submitted, at most `CPU_JOBS` run at once, and the rest wait in the queue's
-buffer. This does not bound garbage collection: a job that allocates heavily still causes
-stop-the-world pauses that stop handlers too. Only a separate process isolates that.
+buffer. The one way past that bound is a deadline: a callback abandoned by `TaskOptions(timeout = …)`
+frees its place in the queue but keeps computing on its thread until it returns, so give a
+deadlined CPU-bound job a `checkpoint!`, below, which is what makes the deadline stop it.
+
+Inside a long job, call `checkpoint!(task_info)` every few milliseconds of work. It yields, so a
+request waiting for that thread gets it, and then throws `TaskCancelledError` if the run has been
+asked to stop. The executor records that as the cancellation it was, never as a failure, and never
+retries it:
+
+```julia
+submit_queued_task(app, "compute", "model-$(id)", task_info -> begin
+    model = init_model(id)
+    for (i, batch) in enumerate(batches(id))
+        train!(model, batch)              # a few milliseconds of computation
+        checkpoint!(task_info)            # yield; stop here if cancelled, timed out or draining
+        update_progress!(task_info, 100 * i / nbatches(id))
+    end
+    return summarize(model)
+end, Owner(uid))
+```
+
+It is the cooperative half: a job that never calls it gives its thread back only when it returns.
+It also makes `TaskOptions(timeout = …)` and a deploy's drain effective for that job, since both
+work by setting the token `checkpoint!` reads. A call costs about a microsecond, so calling it
+every millisecond of work costs about 0.1%. Neither the queue bound nor `checkpoint!` bounds garbage
+collection: a job that allocates heavily still causes stop-the-world pauses that stop handlers too.
+Only a separate process isolates that.
 
 The limits are set when a runtime is built, so choose them by building one:
 
@@ -1171,7 +1197,7 @@ Even with database persistence, keep in mind that `Nitro.Workers` is an in-proce
 - extremely heavy CPU-bound job queues that should not compete with your web server thread pool
   even when bounded, or that allocate enough for their garbage collection to stall it
 
-That last point is load-bearing rather than advisory. Worker callbacks run on the `:default` thread pool — the same pool `serve` spawns every request into — and nothing can stop one: a cancelled or timed-out CPU-bound callback holds its thread until it returns of its own accord. `Threads.nthreads()` of those and the web server has no thread left to answer on. Bound them with a queue's concurrency ([CPU-Bound Jobs](@ref)), make every long callback poll `cancel_requested(task_info)`, or run the work out of process.
+That last point is load-bearing rather than advisory. Worker callbacks run on the `:default` thread pool — the same pool `serve` spawns every request into — and nothing can stop one: a cancelled or timed-out CPU-bound callback holds its thread until it returns of its own accord. `Threads.nthreads()` of those and the web server has no thread left to answer on. Bound them with a queue's concurrency ([CPU-Bound Jobs](@ref)), make every long callback call `checkpoint!(task_info)` or poll `cancel_requested(task_info)`, or run the work out of process.
 
 ## Summary
 
@@ -1184,7 +1210,7 @@ Use `Nitro.Workers` when you need lightweight or persistent background execution
 - use `submit_queued_task(...)` for ordered queue processing, on a queue name declared in `queues`
 - expect `WorkerCapacityError` (a 503, or a 429 for a per-owner quota) when a limit is reached, and size `max_concurrent_runs` to your workload
 - read and cancel with the id the submit call **returned**, not the `task_key` you passed
-- poll `cancel_requested(task_info)` in any long-running callback — `cancel_task` and `timeout` do nothing without it
+- call `checkpoint!(task_info)` (or poll `cancel_requested(task_info)`) in any long-running callback — `cancel_task` and `timeout` do nothing without it
 - use `scope=:global` only when a job is genuinely shared, and pair it with `set_watch_authorizer!`
 - use `get_task_status(...)` and `get_queue_status(...)` to monitor work
 - use `TaskOptions(...)` for retries and timeouts

@@ -383,8 +383,8 @@ Use it to make a callback react differently to a deploy than to a person:
 submit_task("import", task_info -> begin
     for chunk in chunks
         if cancel_requested(task_info)
-            # A shutdown will restart us; checkpoint and let the next process resume.
-            cancel_reason(task_info) === :shutdown && return checkpoint(done)
+            # A shutdown will restart us; save how far we got, so the next process resumes from it.
+            cancel_reason(task_info) === :shutdown && return save_position(done)
             return "cancelled"
         end
         process(chunk)
@@ -420,6 +420,72 @@ struct TaskTimeoutError <: Exception
 end
 
 Base.showerror(io::IO, e::TaskTimeoutError) = print(io, "Timeout of $(e.timeout)s exceeded")
+
+"""
+    TaskCancelledError(reason::Symbol)
+
+What [`checkpoint!`](@ref) throws once the run has been asked to stop. `reason` is the
+[`cancel_reason`](@ref) it found, one of [`CANCEL_REASONS`](@ref).
+
+Both executors recognise it: the run is recorded through the same compare-and-set as every other
+cancellation, and it is **never retried**, since the token is never reset and a retry would start
+already cancelled. A callback that catches it to clean up should rethrow it.
+"""
+struct TaskCancelledError <: Exception
+    reason::Symbol
+end
+
+Base.showerror(io::IO, e::TaskCancelledError) = print(io, _cancel_message(e.reason))
+
+"""
+    checkpoint!(task_info::TaskInfo) -> Nothing
+
+A yield point for a long-running callback ([#513](https://github.com/PingoLee/Nitro.jl/issues/513)):
+give the thread back to whatever is waiting for it, then throw [`TaskCancelledError`](@ref) if this
+run has been asked to stop.
+
+```julia
+submit_queued_task(app, "compute", "fit-42", task_info -> begin
+    for (i, batch) in enumerate(batches)
+        train!(model, batch)                  # a few milliseconds of computation
+        checkpoint!(task_info)                # yield, and stop here if cancelled
+        update_progress!(task_info, 100 * i / length(batches))
+    end
+    return summary(model)
+end, Owner(uid))
+```
+
+**Why it exists.** Julia's tasks are cooperative and Julia 1.12 has no preemption: a callback that
+computes without reaching `yield`, `sleep`, `wait` or I/O holds its thread until it returns. Worker
+callbacks share the `:default` thread pool with every request handler, so a request scheduled onto
+that thread waits for the whole computation. `checkpoint!` is the explicit point at which it
+stops waiting. Call it every few milliseconds of work. When nothing else is waiting to run, a call
+costs about a microsecond, almost all of it the `yield` (0.6 µs on the main task and 1.1 µs inside
+a worker run, measured on Julia 1.12), so a call per millisecond of work costs about 0.1%.
+
+**It is the task API's `yield()` plus the cancellation check, in one call.** After the yield it
+reads the same token [`cancel_requested`](@ref) does, so it honours every cause in
+[`CANCEL_REASONS`](@ref): a `cancel_task`, an expired `TaskOptions(timeout=…)`, a re-run of the key,
+and a teardown drain. The throw unwinds the callback, and the executor records the run as the
+cancellation it was. A callback that would rather finish its current unit of work first can still
+poll `cancel_requested` itself and return; the two compose.
+
+**What it does not do:**
+
+- It does not preempt anything. A callback that never calls it gains nothing.
+- It does not bound garbage collection: a job that allocates heavily still triggers stop-the-world
+  pauses that stop handlers too.
+- It reads the **in-process** token, exactly like `cancel_requested`. A cancel issued on another
+  node writes the durable record and sets nothing here.
+"""
+function checkpoint!(task_info::TaskInfo)
+    yield()
+    # After the yield, not before: a cancel that lands while this run is off its thread is seen at
+    # once rather than one checkpoint later.
+    reason = cancel_reason(task_info)
+    reason === :none || throw(TaskCancelledError(reason))
+    return nothing
+end
 
 @kwdef struct TaskOptions
     priority::Int = 5
@@ -465,6 +531,12 @@ end
 # pool that also runs every request handler, and Julia 1.12 has no preemption (#467), so a queue of
 # CPU-bound jobs with `k` processors can hold at most `k` of those threads -- the rest stay free for
 # handlers by construction. That is Sidekiq's per-queue concurrency and River's `MaxWorkers`.
+#
+# One exception, deliberately not closed here: a callback abandoned by `TaskOptions(timeout=…)` frees
+# its processor but keeps its thread until it returns, so a queue of timing-out callbacks that never
+# reach `checkpoint!` can hold more than `k`. Those count against `max_concurrent_runs` instead, and
+# the queues hold their next item once they fill it (#324); `checkpoint!` is what makes the deadline
+# actually stop such a callback.
 #
 # `k = 1` is the strict FIFO queue this type used to be (`SequentialQueue`). With `k > 1` items still
 # START in FIFO order, since every processor `take!`s from the one channel, but they finish in
