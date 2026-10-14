@@ -304,10 +304,14 @@ function _ws_context()
     return ctx
 end
 
-# A raw request, so each handshake header can be left out on purpose. Returns the status and the
-# response headers (lowercased names), read up to the blank line that ends the head.
+# A raw request, so each handshake header can be left out on purpose. Returns the status, the
+# response headers (lowercased names), the head lines as read, and `why`: `""` for a head read up
+# to the blank line that ends it, otherwise why it was not (#504) -- `read_failed`'s marker for a
+# reset, a timeout, or a close before the blank line. Lines that arrived first are kept either
+# way, and `status` is 0 unless a status line did. Assert on `outcome`, so a red names the reason
+# rather than reading `0 == 426`.
 function _raw(port; target = "/ws", method = "GET", upgrade = "websocket", connection = "Upgrade",
-              key = WS_KEY, version = "13")
+              key = WS_KEY, version = "13", limit = 15.0)
     lines = ["$method $target HTTP/1.1", "Host: $HOST:$port"]
     upgrade    === nothing || push!(lines, "Upgrade: $upgrade")
     connection === nothing || push!(lines, "Connection: $connection")
@@ -315,30 +319,43 @@ function _raw(port; target = "/ws", method = "GET", upgrade = "websocket", conne
     version    === nothing || push!(lines, "Sec-WebSocket-Version: $version")
     sock = Sockets.connect(Sockets.localhost, port)
     try
-        write(sock, join(lines, "\r\n") * "\r\n\r\n")
-        flush(sock)
+        head = String[]
+        # Reading starts before the write, as `raw_exchange`'s does, so a head that arrives just
+        # before a reset is in this process rather than in a kernel buffer the reset can discard.
         reader = @async try
-            head = String[]
             while true
+                eof(sock) && return "(closed before the head ended)"
                 line = readline(sock)
-                isempty(line) && break
+                isempty(line) && return ""
                 push!(head, line)
             end
-            head
-        catch
-            String[]
+        catch e
+            read_failed(e)
         end
-        timedwait(() -> istaskdone(reader), 15.0; pollint = 0.05)
-        head = istaskdone(reader) ? fetch(reader) : String[]
-        isempty(head) && return (0, Dict{String,String}())
-        status = parse(Int, split(head[1])[2])
+        yield()
+        try
+            write(sock, join(lines, "\r\n") * "\r\n\r\n")
+            flush(sock)
+        catch
+            # The server already hung up; the reader reports what it said first, and why.
+        end
+        why = timedwait(() -> istaskdone(reader), limit; pollint = 0.05) === :ok ?
+              fetch(reader) : "(no head within $(limit)s)"
+        # A snapshot under its own name: `head` is captured by the reader, which may still be
+        # running after a timeout, so rebinding it would hand the caller the reader's array.
+        seen = copy(head)
+        words = isempty(seen) ? SubString{String}[] : split(seen[1])
+        status = length(words) >= 2 ? something(tryparse(Int, words[2]), 0) : 0
         headers = Dict(lowercase(strip(k)) => strip(v)
-                       for (k, v) in (split(h, ':'; limit = 2) for h in head[2:end]))
-        return (status, headers)
+                       for (k, v) in (split(h, ':'; limit = 2) for h in seen[2:end] if occursin(':', h)))
+        return (; status, headers, head = seen, why)
     finally
         close(sock)
     end
 end
+
+# What a test asserts on: the status and why the head ended, side by side.
+outcome(r) = (r.status, r.why)
 
 @testset "426, 400 and 101 on the wire" begin
     statuses = Channel{Int}(32)
@@ -366,32 +383,32 @@ end
 
         # `Upgrade` without `Connection: upgrade` — nginx without `Connection "upgrade"` — is not
         # an upgrade request at all (RFC 9110 §7.8), so it is the proxy case, not a malformed one.
-        status, headers = _raw(port; connection = nothing)
-        @test status == 426
-        @test get(headers, "upgrade", "") == "websocket"
-        @test first(_raw(port; upgrade = nothing)) == 426
-        @test first(_raw(port; connection = "keep-alive")) == 426
+        r = _raw(port; connection = nothing)
+        @test outcome(r) == (426, "")
+        @test get(r.headers, "upgrade", "") == "websocket"
+        @test outcome(_raw(port; upgrade = nothing)) == (426, "")
+        @test outcome(_raw(port; connection = "keep-alive")) == (426, "")
 
         # A version this server does not speak: 426 naming the one it does (RFC 6455 §4.4).
-        status, headers = _raw(port; version = "8")
-        @test status == 426
-        @test get(headers, "sec-websocket-version", "") == "13"
+        r = _raw(port; version = "8")
+        @test outcome(r) == (426, "")
+        @test get(r.headers, "sec-websocket-version", "") == "13"
 
         # An upgrade that is declared but malformed: 400.
-        @test first(_raw(port; key = nothing)) == 400
-        @test first(_raw(port; key = "not-a-key")) == 400
-        @test first(_raw(port; version = nothing)) == 400
-        @test first(_raw(port; version = "")) == 400
+        @test outcome(_raw(port; key = nothing)) == (400, "")
+        @test outcome(_raw(port; key = "not-a-key")) == (400, "")
+        @test outcome(_raw(port; version = nothing)) == (400, "")
+        @test outcome(_raw(port; version = "")) == (400, "")
         # A declared upgrade on another method is malformed (only GET upgrades); a POST that does
         # not ask to upgrade is the ordinary 426.
-        @test first(_raw(port; target = "/ws/any", method = "POST")) == 400
+        @test outcome(_raw(port; target = "/ws/any", method = "POST")) == (400, "")
         # ... even with a version that would earn a GET the 426: only GET upgrades.
-        @test first(_raw(port; target = "/ws/any", method = "POST", version = "8")) == 400
-        @test first(_raw(port; target = "/ws/any", method = "POST", upgrade = nothing)) == 426
+        @test outcome(_raw(port; target = "/ws/any", method = "POST", version = "8")) == (400, "")
+        @test outcome(_raw(port; target = "/ws/any", method = "POST", upgrade = nothing)) == (426, "")
 
         # Header tokens are case-insensitive, and a valid handshake still upgrades.
-        @test first(_raw(port; upgrade = "WebSocket", connection = "keep-alive, Upgrade")) == 101
-        @test first(_raw(port)) == 101
+        @test outcome(_raw(port; upgrade = "WebSocket", connection = "keep-alive, Upgrade")) == (101, "")
+        @test outcome(_raw(port)) == (101, "")
 
         # What a middleware on the way out sees is what the client got. (The two 101s are not
         # counted: a finished session reaches it as the serializer's placeholder, see streaming.md.)
@@ -421,6 +438,68 @@ end
         @test resp.status == 426
         @test HTTP.header(resp, "Upgrade") == "websocket"
     end
+end
+
+# #504. `_raw` used to read the head behind `catch; String[]` and map an empty head to status 0, so
+# a reset, a timeout and a silent close were all `(0, Dict())`, and head lines read before a reset
+# were thrown away. A bare listener (no Nitro) sends the same partial head and then ends the
+# connection each way; `_raw` must keep the lines and tell the endings apart. Against the old shape
+# every case below is `(0, Dict())`.
+@testset "_raw keeps a partial head and says why it ended (#504)" begin
+    partial = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+    function ending(reply; abort, linger = 0.5)
+        server = Sockets.listen(Sockets.localhost, 0)
+        port = Int(getsockname(server)[2])
+        task = @async try
+            conn = accept(server)
+            # A clean close reads the request first: closing over unread input is itself a reset
+            # on Linux. An abort does not (see `abort_with_reset!`).
+            abort || readuntil(conn, "\r\n\r\n")
+            isempty(reply) || (write(conn, reply); flush(conn))
+            sleep(linger)
+            abort ? abort_with_reset!(conn) : close(conn)
+        finally
+            close(server)
+        end
+        r = _raw(port; limit = 10.0)
+        wait(task)
+        return r
+    end
+
+    reset = ending(partial; abort = true)
+    @test reset.status == 101
+    @test reset.head == ["HTTP/1.1 101 Switching Protocols", "Upgrade: websocket"]
+    @test startswith(reset.why, "(read failed:")
+
+    closed = ending(partial; abort = false)
+    @test closed.status == 101
+    @test closed.head == reset.head
+    @test closed.why == "(closed before the head ended)"
+
+    silent = ending(""; abort = false)
+    @test outcome(silent) == (0, "(closed before the head ended)")
+    @test isempty(silent.head)
+
+    # A head that never ends: the timeout marker, the lines still kept.
+    server = Sockets.listen(Sockets.localhost, 0)
+    port = Int(getsockname(server)[2])
+    release = Base.Event()
+    task = @async try
+        conn = accept(server)
+        write(conn, partial); flush(conn)
+        wait(release)
+        close(conn)
+    finally
+        close(server)
+    end
+    stalled = try
+        _raw(port; limit = 1.0)
+    finally
+        notify(release)
+    end
+    wait(task)
+    @test stalled.why == "(no head within 1.0s)"
+    @test stalled.head == reset.head
 end
 
 end

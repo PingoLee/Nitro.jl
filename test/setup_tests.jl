@@ -17,7 +17,7 @@ export HOST
 export values_present, value_absent, value_count, has_property
 export get_free_port
 export jwtkey
-export raw_exchange, read_failed
+export raw_exchange, read_failed, abort_with_reset!
 export allocs, Allocs
 
 # ── Constants ────────────────────────────────────────────────────────
@@ -180,6 +180,39 @@ function raw_exchange(port, parts; gap = 0.0, limit = 15.0)
     finally
         close(sock)
     end
+end
+
+# `SO_LINGER {on, 0}` makes `close` abort the connection with an RST instead of a FIN.
+const SOL_SOCKET = Sys.islinux() ? Cint(1) : Cint(0xffff)
+const SO_LINGER  = Sys.islinux() ? Cint(13) : Cint(0x0080)
+
+"""
+    abort_with_reset!(conn::TCPSocket)
+
+Close `conn` with an RST instead of a FIN, for a test server standing in for a peer that resets
+(#490, #504). A raw-socket reader's sensitivity check pairs it with an ordinary `close` of the
+same bytes: the reader must report the two differently.
+
+Do not read the request first on the abort path. On Windows, libuv closes a socket with a read
+pending by sending a FIN first, so the client would see a clean EOF before the RST. On the clean
+path, do read it: closing over unread input is itself a reset on Linux.
+"""
+function abort_with_reset!(conn::TCPSocket)
+    fd = Base._fd(conn)
+    @static if Sys.iswindows()
+        # `fd` is a `WindowsRawSocket`, which converts to the `SOCKET` pointer itself.
+        linger = Ref((UInt16(1), UInt16(0)))    # Winsock's `struct linger` is two u_short
+        rc = ccall((:setsockopt, "Ws2_32"), stdcall, Cint,
+                   (Ptr{Cvoid}, Cint, Cint, Ptr{Cvoid}, Cint),
+                   fd, SOL_SOCKET, SO_LINGER, linger, sizeof(linger))
+        rc == 0 || error("setsockopt(SO_LINGER) failed: $(Libc.GetLastError())")
+    else
+        linger = Ref((Cint(1), Cint(0)))
+        rc = ccall(:setsockopt, Cint, (Cint, Cint, Cint, Ptr{Cvoid}, Cuint),
+                   reinterpret(Cint, fd), SOL_SOCKET, SO_LINGER, linger, sizeof(linger))
+        rc == 0 || error("setsockopt(SO_LINGER) failed: $(Libc.errno())")
+    end
+    close(conn)
 end
 
 # ── Allocation measurement (#511) ────────────────────────────────────

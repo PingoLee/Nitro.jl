@@ -1254,33 +1254,11 @@ end
 using Test
 using Sockets
 
-# `SO_LINGER {on, 0}` makes `close` abort the connection with an RST instead of a FIN.
-const SOL_SOCKET = Sys.islinux() ? Cint(1) : Cint(0xffff)
-const SO_LINGER  = Sys.islinux() ? Cint(13) : Cint(0x0080)
-
-function _abort!(conn)
-    fd = Base._fd(conn)
-    @static if Sys.iswindows()
-        # `fd` is a `WindowsRawSocket`, which converts to the `SOCKET` pointer itself.
-        linger = Ref((UInt16(1), UInt16(0)))    # Winsock's `struct linger` is two u_short
-        rc = ccall((:setsockopt, "Ws2_32"), stdcall, Cint,
-                   (Ptr{Cvoid}, Cint, Cint, Ptr{Cvoid}, Cint),
-                   fd, SOL_SOCKET, SO_LINGER, linger, sizeof(linger))
-        rc == 0 || error("setsockopt(SO_LINGER) failed: $(Libc.GetLastError())")
-    else
-        linger = Ref((Cint(1), Cint(0)))
-        rc = ccall(:setsockopt, Cint, (Cint, Cint, Cint, Ptr{Cvoid}, Cuint),
-                   reinterpret(Cint, fd), SOL_SOCKET, SO_LINGER, linger, sizeof(linger))
-        rc == 0 || error("setsockopt(SO_LINGER) failed: $(Libc.errno())")
-    end
-    close(conn)
-end
-
 # A one-connection server: write `reply`, give the client a moment to take it in, then end the
-# connection with an RST (`abort = true`) or an ordinary close. A clean close reads the request
-# first, because closing over unread input is itself a reset on Linux. An abort does not: on
-# Windows, libuv closes a socket with a read pending by sending a FIN first, and the client would
-# then see a clean EOF before the RST.
+# connection with an RST (`abort = true`, NitroCommon's `abort_with_reset!`) or an ordinary close.
+# A clean close reads the request first, because closing over unread input is itself a reset on
+# Linux. An abort does not: on Windows, libuv closes a socket with a read pending by sending a FIN
+# first, and the client would then see a clean EOF before the RST.
 function _one_shot(reply; abort)
     server = Sockets.listen(Sockets.localhost, 0)
     port = Int(getsockname(server)[2])
@@ -1289,7 +1267,7 @@ function _one_shot(reply; abort)
         abort || _drain_request(conn)
         isempty(reply) || (write(conn, reply); flush(conn))
         sleep(0.5)
-        abort ? _abort!(conn) : close(conn)
+        abort ? abort_with_reset!(conn) : close(conn)
     finally
         close(server)
     end
