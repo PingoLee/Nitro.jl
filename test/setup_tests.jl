@@ -303,8 +303,10 @@ end # module NitroCommon
 
     # `calls` divides: 100 calls of one 4 KiB vector are one vector per call, not 100.
     per = allocs(() -> (sink[] = Vector{UInt8}(undef, 4096); nothing); calls = 100)
+    # The count is exact everywhere; the bytes are not on Windows, where one 4 KiB vector read
+    # 4167 B in one run and 4183 B in another. One vector's worth, not a hundred, is the claim.
     @test per.count == waste.count
-    @test per.bytes == waste.bytes
+    @test 4096 <= per.bytes < 2 * 4096
 
     # What a red prints: the Julia version and the check-bounds flag the numbers came from.
     shown = sprint(show, waste)
