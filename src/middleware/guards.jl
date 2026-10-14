@@ -1,8 +1,8 @@
 module GuardsMiddleware
 
 using HTTP
-using ...Core: getsession
-using ...Types: Nullable, Principal, _is_identity
+using ...Core: getsession, getprincipal
+using ...Types: Nullable, _is_identity
 using ...Util: _check_denial_factory, _deny
 
 export GuardMiddleware, login_required, role_required, permission_required,
@@ -87,7 +87,8 @@ end
 	                    "or an `HTTP.Response` to deny it"))
 end
 
-# Claims resolution for the claim guards. Mirrors `_request_kid`'s two-slot lookup: a
+# Claims resolution for the claim guards. The same two slots as `_request_kid`, with the
+# OPPOSITE precedence (see there for why a kid differs): a
 # `user_validator` parks the app's user object at `:user` and the verified `Principal` at
 # `:auth_claims`, so reading only `:user` denies a correctly-authenticated request (#24).
 #
@@ -272,19 +273,19 @@ see [`claim_required`](@ref).
 permission_required(permission::String; permissions_key::String="permissions", session_key::String="user_id", denied=_forbidden) =
 	claim_required(permissions_key, permission; kind=:contains, session_key, denied)
 
-# The verified key id of the request principal. Only a `Principal` carries a trusted kid
-# (populated exclusively from keyset-verified decodes); there is deliberately no session
-# fallback — a kid is meaningless in a session, so absence denies.
-function _request_kid(req::HTTP.Request)
-	user = Base.get(req.context, :user, nothing)
-	if user isa Principal && user.kid !== nothing
-		return user.kid
-	end
-	claims = Base.get(req.context, :auth_claims, nothing)
-	if claims isa Principal && claims.kid !== nothing
-		return claims.kid
-	end
-	return nothing
+# The verified key id of the request principal: the kid of the token's own `Principal`, read
+# through `getprincipal` so the guard and the handler accessor cannot disagree (#517). That
+# means `:auth_claims` FIRST. A `user_validator` puts the application's object at `:user`, and
+# that object may be a `Principal` the app built with a `kid` of its own, which nothing
+# verified. The asymmetry with `_request_claims`, which prefers `:user`, is deliberate: there a
+# fresher app object may revoke a stale claim, but a kid is a property of the token, and the app
+# cannot know more about which key signed it than the decode did.
+#
+# There is deliberately no session fallback -- a kid is meaningless in a session, so absence
+# denies.
+function _request_kid(req::HTTP.Request)::Nullable{String}
+	principal = getprincipal(req)
+	return principal === nothing ? nothing : principal.kid
 end
 
 """
@@ -304,14 +305,15 @@ middleware = [BearerAuth(Auth.jwt_validator(keyset); unauthorized = UNAUTHORIZED
               GuardMiddleware(kid_required(["importer"]; denied = UNAUTHORIZED))]
 ```
 
-A handler reads the verified key id with [`getprincipal`](@ref Nitro.Core.getprincipal)`(req).kid`.
+The guard reads the kid from [`getprincipal`](@ref Nitro.Core.getprincipal)`(req)`, the same
+place a handler reads it, so the two always agree.
 
 Use with a keyset-backed `jwt_validator` — the resulting `Principal` carries the verified
 `kid` (as does the `(user, principal)` tuple flow via `req.context[:auth_claims]`).
 Custom validators opt in by returning a `Principal`. Requests authenticated with a single
-string secret never carry a trusted kid and are denied — unless a `user_validator` returns a
-`Principal` it built with a `kid` of its own, which this guard currently reads first (#517);
-don't give an app-built `Principal` a `kid`.
+string secret never carry a trusted kid and are denied. That holds even when a
+`user_validator` returns a `Principal` it built with a `kid` of its own: the token's `Principal`
+at `:auth_claims` is read first, and an app-built kid is never trusted (#517).
 """
 function kid_required(allowed; denied=_forbidden)
 	_check_denial_factory(denied, :denied)

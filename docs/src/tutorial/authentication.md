@@ -620,9 +620,9 @@ urlpatterns("",
 
 Inside the handler, `getprincipal(req).kid` is the token's verified key id — branch on it for
 per-caller behavior rather than keeping your own context slot. It reads the token's `Principal`
-even when your `user_validator` returns a `Principal` of its own — but don't give that one a
-`kid`: `kid_required` currently reads an app-built `Principal`'s kid first (#517). To answer a
-wrong-key token with something other than the default `403`, pass `denied` (see
+even when your `user_validator` returns a `Principal` of its own, and `kid_required` reads the
+same one, so a `kid` your app writes onto its own `Principal` authorizes nothing (#517). To
+answer a wrong-key token with something other than the default `403`, pass `denied` (see
 [your own error contract](#Your-own-error-contract)).
 
 A router-wide default allowlist is just the same guard at the router level, with tighter
@@ -672,9 +672,10 @@ Notes:
   session-authenticated app, while it carries the login marker (`session_key`). Full
   precedence and its rationale: §2.
 - `kid_required` has **no** session fallback and never trusts a claim named `"kid"` —
-  only the keyset-verified key id carried by a `Principal`. No trusted kid ⇒ 403. (The
-  exception, until #517: a `user_validator` that returns a `Principal` built with a `kid` of
-  its own.)
+  only the keyset-verified key id carried by the token's `Principal`, the one
+  `getprincipal(req)` returns. No trusted kid ⇒ 403. A `user_validator` that returns a
+  `Principal` built with a `kid` of its own does not change that; the token's `Principal` is
+  read first (#517).
 - By default, guards deny with a shared constant `403 Forbidden` response; bodies are stable
   and safe to assert on in tests. `denied` replaces it — see
   [your own error contract](#Your-own-error-contract).

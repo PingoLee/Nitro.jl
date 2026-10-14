@@ -600,8 +600,9 @@ with whatever `f(req, reason)` builds instead — see
 
 Note the trust boundary: a `kid` is only *verified* when resolved against a keyset. With a
 single string secret the header `kid` is an unchecked label, so `kid_required` denies and
-`identity_from=:kid` is a construction-time error — unless a `user_validator` returns a
-`Principal` it built with a `kid` of its own, which `kid_required` currently reads first (#517).
+`identity_from=:kid` is a construction-time error. A `user_validator` that returns a
+`Principal` built with a `kid` of its own does not get around this: `kid_required` reads the
+token's `Principal` first, as `getprincipal` does (#517).
 
 ## Auth Cookies and CSRF
 

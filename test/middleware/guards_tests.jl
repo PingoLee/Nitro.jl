@@ -444,6 +444,26 @@ using Nitro: GuardMiddleware, login_required, role_required, permission_required
         req_tuple.context[:auth_claims] = Principal(Dict{String,Any}(); kid="service-b")
         @test isnothing(allowed(req_tuple))
 
+        # #517: the TOKEN's Principal at :auth_claims decides, never an app-built one at :user.
+        # Single-secret token (no verified kid) under an app Principal that writes one -> 403.
+        req_app_kid = HTTP.Request("GET", "/test")
+        req_app_kid.context[:user] = Principal(Dict{String,Any}(); id="u1", kid="service-a")
+        req_app_kid.context[:auth_claims] = Principal(Dict{String,Any}(); id="u1")
+        @test allowed(req_app_kid).status == 403
+        # A relabelled kid: the token was verified against a key outside the allowlist -> 403.
+        req_relabel = HTTP.Request("GET", "/test")
+        req_relabel.context[:user] = Principal(Dict{String,Any}(); id="u1", kid="service-a")
+        req_relabel.context[:auth_claims] = Principal(Dict{String,Any}(); id="u1", kid="service-c")
+        @test allowed(req_relabel).status == 403
+        # ...and the reverse: the token's verified kid admits whatever the app object says.
+        req_token_ok = HTTP.Request("GET", "/test")
+        req_token_ok.context[:user] = Principal(Dict{String,Any}(); id="u1", kid="service-c")
+        req_token_ok.context[:auth_claims] = Principal(Dict{String,Any}(); id="u1", kid="service-b")
+        @test isnothing(allowed(req_token_ok))
+        # A custom validator returning a bare Principal (no tuple, nothing at :auth_claims) still
+        # opts in through :user -- that one IS the token's Principal.
+        @test isnothing(allowed(req_ok))
+
         # Single-string allowlist form
         single = kid_required("service-a")
         @test isnothing(single(req_ok))
@@ -635,6 +655,49 @@ end
     end
     @test r.status == 500
     @test !ran[]
+end
+
+end
+
+@testitem "kid_required reads the token's kid, not an app-built one (#517)" tags=[:middleware, :auth, :security] setup=[NitroCommon] begin
+using HTTP
+using Nitro
+
+# The issue's repro, end to end: a `user_validator` that "enriches" the token's Principal by
+# copying it into a new `Principal(...; kid = ...)`. Before #517 the guard read that kid first.
+enrich(kid) = p -> Principal(Dict{String,Any}(p); id = p.id, kid = kid)
+
+function serve_kid(validator, allowed)
+    seen = Ref{Any}(nothing)
+    handler = BearerAuth(validator)(GuardMiddleware(kid_required(allowed))(
+        req -> (seen[] = getprincipal(req); HTTP.Response(200, "in"))))
+    return handler, seen
+end
+bearer(token) = HTTP.Request("GET", "/import", ["Authorization" => "Bearer $token"])
+
+@testset "single secret: an app-written kid authorizes nothing" begin
+    secret = jwtkey("single-secret")
+    token = Nitro.Auth.encode_jwt(Dict("sub" => "7"), secret; expires_in = 3600)
+    handler, seen = serve_kid(Nitro.Auth.jwt_validator(secret; user_validator = enrich("importer")), "importer")
+    @test handler(bearer(token)).status == 403
+    @test seen[] === nothing
+end
+
+@testset "keyset: a relabelled kid is refused, the verified one is honoured" begin
+    keyset = Nitro.Auth.JWTKeyset("importer" => jwtkey("secret-importer"); verify = ["other" => jwtkey("secret-other")])
+    by_other = Nitro.Auth.encode_jwt(Dict("sub" => "7"), Nitro.Auth.JWTKeyset("other" => jwtkey("secret-other")); expires_in = 3600)
+    by_importer = Nitro.Auth.encode_jwt(Dict("sub" => "7"), Nitro.Auth.JWTKeyset("importer" => jwtkey("secret-importer")); expires_in = 3600)
+
+    # Signed by "other", relabelled "importer" by the app: refused.
+    handler, seen = serve_kid(Nitro.Auth.jwt_validator(keyset; user_validator = enrich("importer")), "importer")
+    @test handler(bearer(by_other)).status == 403
+    @test seen[] === nothing
+
+    # Signed by "importer", relabelled "other" by the app: admitted on the token's kid, and the
+    # handler sees the same kid the guard authorized.
+    handler, seen = serve_kid(Nitro.Auth.jwt_validator(keyset; user_validator = enrich("other")), "importer")
+    @test handler(bearer(by_importer)).status == 200
+    @test seen[].kid == "importer"
 end
 
 end
