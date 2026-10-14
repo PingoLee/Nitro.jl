@@ -26,6 +26,10 @@
 #                       milliseconds (#491: does a CPU-bound handler starve `/health`?).
 #   WORKERS=0|1         Nitro only: also serve `/burst?n=K`, which submits K Workers jobs that each
 #                       burn JOB_MS (default 500) without yielding, on a `WorkerRuntime` of its own.
+#                       `&queue=1` submits them to a queue of concurrency BURST_K instead of all at
+#                       once, and `&cp=MS` makes each job call `checkpoint!` every MS ms (#513).
+#   BURST_K=<k>         Nitro only: that queue's concurrency. Default `nthreads(:default) - 2`, at
+#                       least 1. The queue buffers 100, so a queued burst above 100 is refused.
 #   LAG=0|1             Start the `/lag` probe (off by default, so a throughput run carries no extra
 #                       task). Without it `/lag` answers `{"n":0}`.
 #   PRELOAD="Pkg ..."   Load these packages before serving, so `rss.sh` can measure what one adds
@@ -55,6 +59,7 @@ const CPU_MS     = parse(Float64, get(ENV, "CPU_MS", "50"))
 const JOB_MS     = parse(Float64, get(ENV, "JOB_MS", "500"))
 const WORKERS    = get(ENV, "WORKERS", "0") == "1"
 const LAG        = get(ENV, "LAG", "0") == "1"
+const BURST_K    = parse(Int, get(ENV, "BURST_K", string(max(Threads.nthreads(:default) - 2, 1))))
 
 for pkg in split(get(ENV, "PRELOAD", ""))
     @eval using $(Symbol(pkg))
@@ -138,19 +143,52 @@ end
 # HTTP.jl's connection tasks share when there is no interactive thread (#491). A runtime of its own,
 # no run cap (a `burst128` must run 128 jobs, not be refused past the default 64), no deadline
 # short enough to fire: the question is what the jobs do to `/health`.
+#
+# The two #513 levers are per REQUEST, not per server, so one `contention.sh` run interleaves every
+# variant on the same servers: `queue=1` sends the jobs to a queue of concurrency BURST_K (the
+# bulkhead), and `cp=MS` makes each one call `checkpoint!` every MS milliseconds.
 function burst_route()
     runtime = Nitro.Workers.WorkerRuntime(Nitro.Workers.InMemoryWorkerStore();
-                                          max_concurrent_runs = nothing)
+                                          max_concurrent_runs = nothing,
+                                          queues = ["burst" => BURST_K])
     owner = Nitro.Workers.Owner("bench")
     seq = Threads.Atomic{Int}(0)
     return function (req)
-        n = parse(Int, something(get(Nitro.getquery(req), "n", nothing), "8"))
+        query = Nitro.getquery(req)
+        n = parse(Int, something(get(query, "n", nothing), "8"))
+        queued = get(query, "queue", "0") == "1"
+        cp_ms = parse(Float64, something(get(query, "cp", nothing), "0"))
+        job = cp_ms > 0 ? (task_info -> burn_checkpointed(JOB_MS, cp_ms, task_info)) :
+                          (_ -> burn(JOB_MS))
         for _ in 1:n
             id = Threads.atomic_add!(seq, 1)
-            Nitro.Workers.submit_task("burn-$id", () -> burn(JOB_MS), owner; runtime)
+            if queued
+                Nitro.Workers.submit_queued_task("burst", "burn-$id", job, owner; runtime)
+            else
+                Nitro.Workers.submit_task("burn-$id", job, owner; runtime)
+            end
         end
         return Res.send("submitted $n")
     end
+end
+
+# `burn`, but calling `checkpoint!` every `every_ms` of it (#513): the cooperative yield point a
+# CPU-bound job is told to reach. Same clock-read loop otherwise, so the two differ only in that.
+function burn_checkpointed(ms::Float64, every_ms::Float64, task_info)::Float64
+    now = time_ns()
+    deadline = now + round(UInt64, ms * 1e6)
+    step = round(UInt64, every_ms * 1e6)
+    next = now + step
+    x = 0.0
+    while (now = time_ns()) < deadline
+        x = sin(x + 1.0)
+        GC.safepoint()
+        if now >= next
+            Nitro.Workers.checkpoint!(task_info)
+            next = time_ns() + step
+        end
+    end
+    return x
 end
 
 # Profile is not in Julia's system image (~13 MiB resident once loaded), so it loads only when
