@@ -123,7 +123,8 @@ The contract:
 
 ## 3. The error contract
 
-One rule, everywhere:
+One rule, everywhere — by default; [your own error contract](#Your-own-error-contract) below
+replaces the responses, not the decisions:
 
 | Status | Meaning | Returned by |
 |---|---|---|
@@ -171,6 +172,55 @@ same 401 as any other invalid credential. This matches RFC 6750: `invalid_token`
         nothing
     end
     ```
+
+### Your own error contract
+
+A JSON API usually has a published error shape, and its clients may only know `401`. Every
+auth middleware takes `unauthorized`, and every shipped guard takes `denied`: a factory
+`(req, reason) -> HTTP.Response` that builds the refusal. It is told *why*, coarsely:
+
+| `reason` | Passed by | When |
+|---|---|---|
+| `:missing_credentials` | `BearerAuth`, `CookieAuthMiddleware` | no usable credential: no header or cookie, another scheme, an empty credential, a cookie that does not decrypt |
+| `:invalid_credentials` | `BearerAuth`, `CookieAuthMiddleware` | a credential was found and the validator refused it, or threw |
+| `:forbidden` | `claim_required`, `role_required`, `permission_required`, `kid_required` | authenticated, but not authorized |
+| `:login_required` | `login_required` | nobody is logged in (`denied` replaces the redirect) |
+
+One function can serve every site:
+
+```julia
+const UNAUTHORIZED = (req, reason) -> Res.json(Dict("error" => "Unauthorized"); status = 401)
+
+path("/import", import_batch; middleware = [
+    BearerAuth(jwt_validator(keyset); unauthorized = UNAUTHORIZED),
+    GuardMiddleware(kid_required(["importer"]; denied = UNAUTHORIZED)),
+])
+```
+
+Every failure on that route — no token, a forged one, an expired one, a valid token signed by
+the wrong key — is the same `401 {"error":"Unauthorized"}`. Or tell a standards-following client
+apart the way RFC 6750 §3.1 does, with an `error` attribute only when a token was actually sent:
+
+```julia
+const BEARER_CHALLENGE = (req, reason) -> Res.json(Dict("error" => "Unauthorized"); status = 401,
+    headers = ["WWW-Authenticate" => reason === :invalid_credentials ?
+        "Bearer error=\"invalid_token\"" : "Bearer"])
+```
+
+The rules:
+
+  * **The reasons are closed and coarse on purpose.** An expired token and a forged one are
+    both `:invalid_credentials`, so no factory can leak which — the leak the error contract
+    exists to prevent.
+  * **The factory shapes the refusal, it does not decide it.** It must return an
+    `HTTP.Response`. Anything else — `nothing`, a `Dict` meant as the body — is an error and a
+    `500`, never an admission: a guard that returns something other than a response would
+    otherwise *admit* the request.
+  * **It takes `(req, reason)`.** A one-argument function is an `ArgumentError` when the
+    middleware or guard is built, at startup.
+  * **Return a fresh response or a `const` one**, as the defaults do — never one you mutate later;
+    responses are shared across threads.
+  * The three exceptions above still propagate; they never reach the factory.
 
 ## 4. JWT validation
 
@@ -427,7 +477,9 @@ auth check that wraps `decode_jwt` in a bare `catch` would otherwise turn it int
 request, with nothing at startup to say why.
 
 `decode_jwt` selects the key by the token's `kid` header, and the *verified* key id is
-exposed as `getuser(req).kid`. The trust boundary matters: **a `kid` is only trusted when it
+exposed as `getprincipal(req).kid` — in both validator flows, since with a `user_validator`
+`getuser(req)` is your own user object and the token's `Principal` rides at
+`req.context[:auth_claims]`. The trust boundary matters: **a `kid` is only trusted when it
 was resolved against a keyset** — with a single string secret the header `kid` is an
 attacker-writable label, so it is never exposed on the `Principal`, `kid_required` denies,
 and `identity_from=:kid` is a construction-time `ArgumentError`.
@@ -566,6 +618,13 @@ urlpatterns("",
 )
 ```
 
+Inside the handler, `getprincipal(req).kid` is the token's verified key id — branch on it for
+per-caller behavior rather than keeping your own context slot. It reads the token's `Principal`
+even when your `user_validator` returns a `Principal` of its own — but don't give that one a
+`kid`: `kid_required` currently reads an app-built `Principal`'s kid first (#517). To answer a
+wrong-key token with something other than the default `403`, pass `denied` (see
+[your own error contract](#Your-own-error-contract)).
+
 A router-wide default allowlist is just the same guard at the router level, with tighter
 per-route subsets where needed. Router middleware wraps route middleware, so a router-level
 guard runs before any route-level auth layer: put the `BearerAuth` on the router, not only on
@@ -579,12 +638,12 @@ returns `nothing` (pass) or a response (deny). They run after auth middleware, i
 
 | Guard | Passes when | Denies with |
 |---|---|---|
-| `login_required(; redirect_url, session_key)` | An auth middleware attached an identity, **or** the session carries one under `session_key` | 302 → `redirect_url` |
-| `claim_required(claim, value; kind=:equals, session_key="user_id")` | `principal[claim] == value` | 403 |
-| `claim_required(claim, value; kind=:contains, session_key="user_id")` | `value in principal[claim]` (a list) | 403 |
-| `role_required(role; role_key="role", session_key="user_id")` | alias: `claim_required(role_key, role)` | 403 |
-| `permission_required(perm; permissions_key="permissions", session_key="user_id")` | alias: `claim_required(permissions_key, perm; kind=:contains)` | 403 |
-| `kid_required(allowed)` | The principal's **verified** `kid` is in `allowed` | 403 |
+| `login_required(; redirect_url, session_key)` | An auth middleware attached an identity, **or** the session carries one under `session_key` | 302 → `redirect_url`, or `denied` |
+| `claim_required(claim, value; kind=:equals, session_key="user_id")` | `principal[claim] == value` | 403, or `denied` |
+| `claim_required(claim, value; kind=:contains, session_key="user_id")` | `value in principal[claim]` (a list) | 403, or `denied` |
+| `role_required(role; role_key="role", session_key="user_id")` | alias: `claim_required(role_key, role)` | 403, or `denied` |
+| `permission_required(perm; permissions_key="permissions", session_key="user_id")` | alias: `claim_required(permissions_key, perm; kind=:contains)` | 403, or `denied` |
+| `kid_required(allowed)` | The principal's **verified** `kid` is in `allowed` | 403, or `denied` |
 
 Notes:
 
@@ -594,9 +653,12 @@ Notes:
   session-authenticated app, while it carries the login marker (`session_key`). Full
   precedence and its rationale: §2.
 - `kid_required` has **no** session fallback and never trusts a claim named `"kid"` —
-  only the keyset-verified key id carried by a `Principal`. No trusted kid ⇒ 403.
-- Guards deny with a shared constant `403 Forbidden` response; bodies are stable and safe
-  to assert on in tests.
+  only the keyset-verified key id carried by a `Principal`. No trusted kid ⇒ 403. (The
+  exception, until #517: a `user_validator` that returns a `Principal` built with a `kid` of
+  its own.)
+- By default, guards deny with a shared constant `403 Forbidden` response; bodies are stable
+  and safe to assert on in tests. `denied` replaces it — see
+  [your own error contract](#Your-own-error-contract).
 
 ## 7. Session-based auth
 

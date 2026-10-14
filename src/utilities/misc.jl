@@ -444,6 +444,26 @@ function _auth_credential(value::AbstractString, scheme::AbstractString)
     return isempty(rest) ? nothing : rest
 end
 
+# The app-supplied denial factories of the auth middleware and the guards (#515): one signature,
+# `f(req, reason::Symbol) -> HTTP.Response`, at every site. Checked when the middleware or guard
+# is BUILT, so a one-argument `req -> …` fails at startup rather than on the first denial.
+function _check_denial_factory(f, keyword::Symbol)
+    hasmethod(f, Tuple{HTTP.Request, Symbol}) && return f
+    throw(ArgumentError("`$keyword` must be callable as `f(req::HTTP.Request, reason::Symbol)` " *
+                        "and return an `HTTP.Response`"))
+end
+
+# Fail closed. `GuardMiddleware` admits any guard result that is not an `HTTP.Response`, so a
+# factory returning `nothing` -- or a `Dict` it meant to serialize -- would turn a denial into an
+# admission. Anything else is an error, which the server answers with a 500; the handler never
+# runs. The message names the type only: the value may be whatever the app put in it.
+function _deny(f, req::HTTP.Request, reason::Symbol)::HTTP.Response
+    resp = f(req, reason)
+    resp isa HTTP.Response && return resp
+    throw(ArgumentError("auth denial factory returned a $(typeof(resp)) for reason :$reason; " *
+                        "it must return an `HTTP.Response`"))
+end
+
 """
     own_response_headers(resp::HTTP.Response) -> HTTP.Response
 

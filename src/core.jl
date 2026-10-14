@@ -42,6 +42,7 @@ function getpost end
 function getsession end
 function setsession! end
 function getuser end
+function getprincipal end
 function getip end
 function setip! end
 function getpeerip end
@@ -62,7 +63,7 @@ include("routing.jl");      @reexport using .Routing
 export serve, terminate,
     internalrequest, staticfiles, dynamicfiles, spafiles,
     getparams, getquery, getjson, getform, getfiles, getpost,
-    getsession, setsession!, getuser, getip, setip!, getpeerip, getcontext, payload, route_missed
+    getsession, setsession!, getuser, getprincipal, getip, setip!, getpeerip, getcontext, payload, route_missed
 
 # ── Implementation ──────────────────────────────────────────────────────────────
 # Split out of this file by responsibility (#32), which left it the thin

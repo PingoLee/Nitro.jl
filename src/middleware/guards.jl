@@ -3,6 +3,7 @@ module GuardsMiddleware
 using HTTP
 using ...Core: getsession
 using ...Types: Nullable, Principal, _is_identity
+using ...Util: _check_denial_factory, _deny
 
 export GuardMiddleware, login_required, role_required, permission_required,
 	claim_required, kid_required
@@ -10,8 +11,14 @@ export GuardMiddleware, login_required, role_required, permission_required,
 # Shared denial response for authorization guards. Module-level `const` Responses are
 # reuse-safe in Nitro (non-consuming write path, see nitro-core §4), so denials are
 # allocation-free. Contract: 401 = unauthenticated (auth middleware), 403 = authenticated
-# but not authorized (guards), 302 = browser redirect (`login_required`).
+# but not authorized (guards), 302 = browser redirect (`login_required`). That contract is the
+# default: every guard takes a `denied` factory (#515), and an app whose clients only handle a
+# `401` may answer a wrong-`kid` token with one. `_deny` checks what the factory returns,
+# because a guard returning anything but a response ADMITS the request.
 const FORBIDDEN = HTTP.Response(403, "Forbidden")
+
+# The default `denied` of the claim and kid guards.
+_forbidden(::HTTP.Request, ::Symbol) = FORBIDDEN
 
 """
     GuardMiddleware(guards::Function...)
@@ -33,7 +40,12 @@ middleware that sets `getuser(req)` **before** this layer.
 
 The status contract: an auth middleware answers `401` for no or bad credentials, the claim guards
 answer `403` for an authenticated caller without the right, and `login_required` answers a `302`
-browser redirect.
+browser redirect. Those are defaults. Each shipped guard takes `denied`, a factory
+`(req::HTTP.Request, reason::Symbol) -> HTTP.Response` called with `:forbidden` (the claim and
+kid guards) or `:login_required` (`login_required`); it follows the same rules as the auth
+middleware's `unauthorized` (see
+[`BearerAuth`](@ref Nitro.Core.Middleware.AuthMiddleware.BearerAuth)). A factory that returns
+anything but an `HTTP.Response` is an error, not an admission.
 """
 function GuardMiddleware(guards::Function...)
 	return function(handle::Function)
@@ -86,11 +98,29 @@ _session_marker(session::AbstractDict, session_key::String) =
 	haskey(session, session_key) ? session[session_key] :
 		Base.get(session, Symbol(session_key), nothing)
 
+# `login_required`'s denial factory: the app's `denied`, else the redirect. Resolved in a function
+# rather than in branches of the guard factory, so the closure captures a variable assigned once
+# (a branch-assigned capture is boxed -- `test/closure_boxing_tests.jl`).
+function _login_denial(redirect_url::Nullable{String}, denied)
+	if denied === nothing
+		location = redirect_url === nothing ? "/login" : redirect_url
+		# Built per request: nothing about a redirect needs to be a shared `const`.
+		return (::HTTP.Request, ::Symbol) -> HTTP.Response(302, ["Location" => location])
+	end
+	redirect_url === nothing || throw(ArgumentError(
+		"login_required: pass `redirect_url` or `denied`, not both — `denied` replaces the redirect"))
+	return _check_denial_factory(denied, :denied)
+end
+
 """
-    login_required(; redirect_url = "/login", session_key = "user_id")
+    login_required(; redirect_url = "/login", session_key = "user_id", denied = nothing)
 
 Guard that admits an authenticated request and otherwise answers `302` with
 `Location: redirect_url`. It is a factory, so call it: `GuardMiddleware(login_required())`.
+
+Pass `denied` — a factory `(req, reason) -> HTTP.Response`, called with `:login_required` — to
+answer something other than a redirect, e.g. a JSON `401`. It replaces the redirect, so passing
+both `denied` and `redirect_url` is an `ArgumentError`.
 
 A request counts as authenticated in one of two ways, and they are trusted differently:
 
@@ -107,7 +137,8 @@ A request counts as authenticated in one of two ways, and they are trusted diffe
 [`claim_required`](@ref) or [`role_required`](@ref) after it for that. For a JSON API a redirect
 is usually the wrong answer; an auth middleware's own `401` already covers the anonymous case.
 """
-function login_required(; redirect_url::String="/login", session_key::String="user_id")
+function login_required(; redirect_url::Nullable{String}=nothing, session_key::String="user_id", denied=nothing)
+	deny = _login_denial(redirect_url, denied)
 	return function(req::HTTP.Request)
 		# Two distinct sources of "user", which must be trusted differently:
 		#
@@ -133,22 +164,23 @@ function login_required(; redirect_url::String="/login", session_key::String="us
 		ctx_user = Base.get(req.context, :user, nothing)
 		if ctx_user !== nothing
 			_is_identity(ctx_user) && return nothing
-			return HTTP.Response(302, ["Location" => redirect_url])
+			return _deny(deny, req, :login_required)
 		end
 
 		session = getsession(req)
 		if session isa AbstractDict
 			_is_identity(_session_marker(session, session_key)) && return nothing
 		end
-		return HTTP.Response(302, ["Location" => redirect_url])
+		return _deny(deny, req, :login_required)
 	end
 end
 
 """
-    claim_required(claim, value; kind=:equals, session_key="user_id")
+    claim_required(claim, value; kind=:equals, session_key="user_id", denied=<403 Forbidden>)
 
 Declarative authorization guard on a claim of the request principal: 403 unless the
-principal's `claim` matches `value`.
+principal's `claim` matches `value`. `denied`, a factory `(req, reason) -> HTTP.Response` called
+with `:forbidden`, replaces that `403` (see [`GuardMiddleware`](@ref)).
 
 - `kind = :equals` — the claim's value must `==` `value` (e.g. a role or action claim).
 - `kind = :contains` — the claim must be a list containing `value` (e.g. permissions/scopes).
@@ -171,12 +203,13 @@ aliases over this guard.
     result. A demoted user keeps what the token says until it expires. Return a dict merging
     your fresh state if revocation must take effect within the token TTL.
 """
-function claim_required(claim::String, value; kind::Symbol=:equals, session_key::String="user_id")
+function claim_required(claim::String, value; kind::Symbol=:equals, session_key::String="user_id", denied=_forbidden)
+	_check_denial_factory(denied, :denied)
 	if kind === :equals
 		return function(req::HTTP.Request)
 			claims = _request_claims(req, session_key)
 			if claims === nothing || get(claims, claim, nothing) != value
-				return FORBIDDEN
+				return _deny(denied, req, :forbidden)
 			end
 			return nothing
 		end
@@ -185,7 +218,7 @@ function claim_required(claim::String, value; kind::Symbol=:equals, session_key:
 			claims = _request_claims(req, session_key)
 			container = claims === nothing ? nothing : get(claims, claim, nothing)
 			if !(container isa AbstractVector) || !(value in container)
-				return FORBIDDEN
+				return _deny(denied, req, :forbidden)
 			end
 			return nothing
 		end
@@ -194,24 +227,24 @@ function claim_required(claim::String, value; kind::Symbol=:equals, session_key:
 end
 
 """
-    role_required(role; role_key = "role", session_key = "user_id")
+    role_required(role; role_key = "role", session_key = "user_id", denied = <403 Forbidden>)
 
 Guard that answers `403` unless the principal's `role_key` claim equals `role`. Exactly
-`claim_required(role_key, role; kind = :equals, session_key)`; see [`claim_required`](@ref) for
+`claim_required(role_key, role; kind = :equals, session_key, denied)`; see [`claim_required`](@ref) for
 where the claims are read from, when the session counts, and how fast a revocation takes effect.
 """
-role_required(role::String; role_key::String="role", session_key::String="user_id") =
-	claim_required(role_key, role; kind=:equals, session_key)
+role_required(role::String; role_key::String="role", session_key::String="user_id", denied=_forbidden) =
+	claim_required(role_key, role; kind=:equals, session_key, denied)
 
 """
-    permission_required(permission; permissions_key = "permissions", session_key = "user_id")
+    permission_required(permission; permissions_key = "permissions", session_key = "user_id", denied = <403 Forbidden>)
 
 Guard that answers `403` unless the principal's `permissions_key` claim is a list containing
-`permission`. Exactly `claim_required(permissions_key, permission; kind = :contains, session_key)`;
+`permission`. Exactly `claim_required(permissions_key, permission; kind = :contains, session_key, denied)`;
 see [`claim_required`](@ref).
 """
-permission_required(permission::String; permissions_key::String="permissions", session_key::String="user_id") =
-	claim_required(permissions_key, permission; kind=:contains, session_key)
+permission_required(permission::String; permissions_key::String="permissions", session_key::String="user_id", denied=_forbidden) =
+	claim_required(permissions_key, permission; kind=:contains, session_key, denied)
 
 # The verified key id of the request principal. Only a `Principal` carries a trusted kid
 # (populated exclusively from keyset-verified decodes); there is deliberately no session
@@ -229,25 +262,40 @@ function _request_kid(req::HTTP.Request)
 end
 
 """
-    kid_required(allowed)
+    kid_required(allowed; denied = <403 Forbidden>)
 
 Authorization guard on the *verified* JWT key id: 403 unless the token that authenticated
 this request was verified against a keyset and its resolved `kid` is in `allowed` (a
 string or collection of strings).
 
+`denied`, a factory `(req, reason) -> HTTP.Response` called with `:forbidden`, replaces that
+`403` — an API whose clients only handle `401` answers a wrong-`kid` token with one:
+
+```julia
+const UNAUTHORIZED = (req, reason) -> Res.json(Dict("error" => "Unauthorized"); status = 401)
+
+middleware = [BearerAuth(Auth.jwt_validator(keyset); unauthorized = UNAUTHORIZED),
+              GuardMiddleware(kid_required(["importer"]; denied = UNAUTHORIZED))]
+```
+
+A handler reads the verified key id with [`getprincipal`](@ref Nitro.Core.getprincipal)`(req).kid`.
+
 Use with a keyset-backed `jwt_validator` — the resulting `Principal` carries the verified
 `kid` (as does the `(user, principal)` tuple flow via `req.context[:auth_claims]`).
 Custom validators opt in by returning a `Principal`. Requests authenticated with a single
-string secret never carry a trusted kid and are denied.
+string secret never carry a trusted kid and are denied — unless a `user_validator` returns a
+`Principal` it built with a `kid` of its own, which this guard currently reads first (#517);
+don't give an app-built `Principal` a `kid`.
 """
-function kid_required(allowed)
+function kid_required(allowed; denied=_forbidden)
+	_check_denial_factory(denied, :denied)
 	allowed_set = allowed isa AbstractString ? Set{String}((String(allowed),)) :
 		Set{String}(String(kid) for kid in allowed)
 	isempty(allowed_set) && throw(ArgumentError("kid_required requires at least one allowed key id"))
 	return function(req::HTTP.Request)
 		kid = _request_kid(req)
 		if kid === nothing || !(kid in allowed_set)
-			return FORBIDDEN
+			return _deny(denied, req, :forbidden)
 		end
 		return nothing
 	end
