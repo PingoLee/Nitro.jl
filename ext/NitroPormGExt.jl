@@ -52,7 +52,7 @@ Hook for PormG's `normalize_field_value` on `PasswordField` with `auto_hash=true
 - A password longer than `Nitro.Auth.MAX_PASSWORD_BYTES` (4096) bytes throws `ArgumentError`
   out of the save, as `make_password` does. Validate the length before assigning it.
 
-Contract for PormG's side of the seam, which does not exist yet (PormG, as of 0.7, has no
+Contract for PormG's side of the seam, which does not exist yet (PormG, as of 0.8, has no
 `register_field_hook`, so this hook is registered only when it appears): the hook must run on
 values the **application assigns**, never on a value read back from the database, or saving
 a loaded row would hash its hash.
@@ -101,24 +101,24 @@ binds the same way, so this is the narrow half of a supported operation rather t
 workaround. It is migration-neutral: `makemigrations` reads `models.jl` from disk and never
 consults `REGISTERED_MODULES`.
 
-**Why bind at all, when `.db(key)` already routes the query.** PormG's
-`ensure_model_transaction_scope` gates on the **model's** `connect_key` and never consults
-the query's `.db()` override. Unbound, it throws `InvalidConfigurationError` for *every*
-query issued while any transaction is open on the calling task — swallowed on the read paths
-and rethrown on the writes, which is #202.
+**Why bind at all, when `.db(key)` already routes the query.** Before PormG 0.8 the
+transaction-scope check gated on the **model's** `connect_key` and never consulted the query's
+`.db()` override. Unbound, it threw `InvalidConfigurationError` for *every* query issued while
+any transaction was open on the calling task — swallowed on the read paths and rethrown on
+the writes, which is #202. PormG 0.8 (PormG#838) checks the pool the query *runs* on instead,
+so the stores' `.db(store.db_key)` alone now satisfies it. The binding stays so that the model
+and the store name one connection for any PormG path that resolves by the model rather than
+by `.db()`.
 
 **Why the model is per store and never a process-wide singleton.** `connect_key` names
 exactly one connection. Two stores on different keys sharing one model object would
-overwrite each other's binding, and the loser would then throw `TransactionError` instead of
-being fixed. Building a model is a handful of allocations and happens about twice per
+overwrite each other's binding, and the loser's model would then name the other store's
+connection. Building a model is a handful of allocations and happens about twice per
 application, so there is nothing to cache and no shared mutable state to lock.
 
 The caller must pass the key the store will query on. On the path where a store *builds* its
 own model — the factories, and either constructor called without `model=` — both this key and
-the query's `.db(...)` come from the one `store.db_key` field, so they cannot diverge. That
-matters: a model bound to `A` queried with `.db(B)` inside `run_in_transaction(A)` *passes*
-the guard and then silently runs outside the transaction on B's pool, and PormG has no guard
-for that direction.
+the query's `.db(...)` come from the one `store.db_key` field, so they cannot diverge.
 
 Passing `model=` explicitly opts out of that coupling — the caller then owns keeping the
 model's `connect_key` and the store's `db_key` in agreement, and nothing checks it. The test
@@ -268,12 +268,9 @@ session_store_full(store::PormGSessionStore) =
 #
 # Since #202 the model carries `connect_key == store.db_key` too, so this call is redundant
 # for ROUTING and is kept anyway, for two reasons. It is the only thing the mock in
-# `test/extensions/pormg_worker_tests.jl` can pin (#203). And PormG reads the two keys from
-# different places -- `ensure_model_transaction_scope` reads the model's, `get_settings` reads
-# the query's -- so a model bound to A queried with `.db(B)` inside `run_in_transaction(A)`
-# passes the guard and then silently runs OUTSIDE the transaction on B's pool, with no guard
-# for that direction. Deriving both from the single `store.db_key` field is what makes that
-# divergence unrepresentable.
+# `test/extensions/pormg_worker_tests.jl` can pin (#203). And since PormG 0.8 (PormG#838) the
+# `.db()` key is the one PormG's transaction-scope check reads: inside a transaction, a query
+# whose pool has none open raises `TransactionError` instead of running in autocommit.
 _session_objects(store::PormGSessionStore) = store.model.objects.db(store.db_key)
 
 # -- Serialization helpers --
@@ -723,11 +720,18 @@ end
 # Route every task query to the store's configured connection. PormG's query manager always
 # supports `.db(key)`, so we call it directly rather than silently falling back to the model's
 # default connection (which would write tasks to the wrong database). Since #202 the model is
-# bound to the same key, and the reasoning for keeping both -- one field, two readers -- is on
-# `_session_objects` above.
+# bound to the same key, and the reasoning for keeping both is on `_session_objects` above.
 _task_objects(store::PormGWorkerStore) = store.model.objects.db(store.db_key)
 
 # -- Serialization Helpers --
+
+# PormG refuses a NUL in any bound text parameter since 0.8 (PormG#951): PostgreSQL text cannot
+# hold one, and SQLite cannot read a value back past it. The `error` column is the one place free
+# text reaches this store unescaped -- a task's own exception message, which can quote request
+# data -- so a NUL there would make the terminal write raise and lose the failure record. It is
+# diagnostic text: a visible U+FFFD beats a dropped write. `result` and `watchers` are JSON, whose
+# encoder already escapes a NUL.
+_storable_text(s::AbstractString) = '\0' in s ? replace(s, '\0' => '�') : s
 
 function _to_db_record(task::TaskInfo)
     # A result nested past the JSON depth bound throws here, before the row is touched, instead
@@ -741,7 +745,7 @@ function _to_db_record(task::TaskInfo)
         "status" => string(task.status),
         "progress" => task.progress,
         "result" => result_str,
-        "error" => isnothing(task.error) ? "" : task.error,
+        "error" => isnothing(task.error) ? "" : _storable_text(task.error),
         "created_at" => task.created_at,
         "started_at" => task.started_at,
         "completed_at" => task.completed_at,
@@ -1051,7 +1055,7 @@ function try_transition!(store::PormGWorkerStore, task_id::String, from, to::Tas
                          result=UNSUPPLIED,
                          progress::Union{Nothing, Real}=nothing)
     columns = Pair{String, Any}["status" => string(to)]
-    error === nothing || push!(columns, "error" => error)
+    error === nothing || push!(columns, "error" => _storable_text(error))
     completed_at === nothing || push!(columns, "completed_at" => completed_at)
     started_at === nothing || push!(columns, "started_at" => started_at)
     # The completing write of a callback's return value. Too deep to read back, it throws before

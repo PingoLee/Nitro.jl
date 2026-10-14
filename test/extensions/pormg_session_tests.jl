@@ -1063,11 +1063,12 @@ end
     # being bent to keep it. The `.db(key)` routing half it guarded is unaffected and is still
     # covered by the mock testsets above.
     #
-    # Why the binding has to exist: PormG's `ensure_model_transaction_scope` gates on the
-    # MODEL's `connect_key` and never consults the query's `.db()` override, so while any
-    # transaction is open on the calling task an unbound model throws for EVERY query --
-    # swallowed by `Base.get` (a live session silently reads as absent) and rethrown by
-    # `set_session!`/`delete_session!`.
+    # Why the binding had to exist: before PormG 0.8 the transaction-scope check gated on the
+    # MODEL's `connect_key` and never consulted the query's `.db()` override, so while any
+    # transaction was open on the calling task an unbound model threw for EVERY query --
+    # swallowed by `Base.get` (a live session silently read as absent) and rethrown by
+    # `set_session!`/`delete_session!`. PormG#838 moved the check onto the pool the query runs
+    # on; the binding is kept, and the half below now pins the premise the store relies on.
     @test getproperty(PormGExt, :session_model)().connect_key == "db"
     @test getproperty(PormGExt, :session_model)("sessions").connect_key == "sessions"
 
@@ -1089,14 +1090,22 @@ end
         # `with_tx_context` is PormG's own seam onto the `ScopedValue` that `run_in_transaction`
         # sets, so the guard can be driven without a live driver. Outside a transaction the
         # guard returns immediately -- which is exactly why #202 never showed up in the suite.
-        @test PormG.Configuration.ensure_model_transaction_scope(unbound) === nothing
-        @test PormG.Configuration.ensure_model_transaction_scope(bound) === nothing
+        # Its second argument is the pool the query EXECUTES on, which for the store is what
+        # `.db(store.db_key)` resolves: `conn`.
+        check = PormG.Configuration.ensure_transaction_scope
+        @test check(unbound, conn) === nothing
+        @test check(bound, conn) === nothing
 
         PormG.with_tx_context(conn, nothing) do
-            # The shipped defect, pinned: unbound + any open transaction == throw.
-            @test_throws PormG.Kernel.InvalidConfigurationError PormG.Configuration.ensure_model_transaction_scope(unbound)
-            # ... and the fix: a model bound to the transaction's own connection passes.
-            @test PormG.Configuration.ensure_model_transaction_scope(bound) === nothing
+            # A transaction on the store's own pool: both pass, because the check no longer
+            # reads the binding. Before PormG 0.8 `unbound` threw here -- that was #202.
+            @test check(unbound, conn) === nothing
+            @test check(bound, conn) === nothing
+        end
+        PormG.with_tx_context(FakeSessionPool(String[]), nothing) do
+            # A transaction on ANOTHER pool refuses the store's query rather than letting it run
+            # in autocommit outside the caller's rollback -- the error the docs promise.
+            @test_throws PormG.TransactionError check(bound, conn)
         end
     finally
         delete!(PormG.config, key)

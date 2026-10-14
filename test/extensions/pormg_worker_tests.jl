@@ -312,6 +312,16 @@ function _snapshot(qs::MockTaskQuerySet, row::Dict{String, Any})
     return Dict{String, Any}(c => row[c] for c in cols)
 end
 
+# PormG refuses a NUL in any bound text value before a statement is sent (PormG#951, 0.8):
+# PostgreSQL text cannot hold one and SQLite cannot read a value back past it. Modelled on the
+# writes, the path where free text -- a task's error message -- reaches the store.
+function _mock_refuse_nul(pairs)
+    for (k, v) in pairs
+        v isa AbstractString && '\0' in v &&
+            error("MockTaskQuerySet: `$k` contains a NUL character, which PormG refuses (PormG#951).")
+    end
+end
+
 function Base.getproperty(qs::MockTaskQuerySet, name::Symbol)
     if name === :filter
         return function(args...)
@@ -382,6 +392,7 @@ function Base.getproperty(qs::MockTaskQuerySet, name::Symbol)
         end
     elseif name === :create
         return function(pairs::Pair{String,<:Any}...)
+            _mock_refuse_nul(pairs)
             row = Dict{String,Any}()
             for (k, v) in pairs
                 row[k] = v
@@ -401,6 +412,7 @@ function Base.getproperty(qs::MockTaskQuerySet, name::Symbol)
             isempty(getfield(qs, :filters)) &&
                 error("MockTaskQuerySet: update() requires a filter -- refusing to update " *
                       "every row, as PormG does.")
+            _mock_refuse_nul(pairs)
             # Return the affected-row count, matching PormG's Django-style `update`.
             # It used to return `nothing`, which would make every compare-and-set in
             # the store read as a failure — or, worse, as an untested success.
@@ -1083,6 +1095,31 @@ else
                 @test "intruder" in got
                 @test "bob" in got
                 @test "alice" in got
+            end
+
+            @testset "a NUL in a task's error text does not lose its write (PormG#951)" begin
+                # A task's error is its own exception message, which can quote request data.
+                # PormG 0.8 refuses a NUL in any bound text value, so storing it raw would make
+                # the terminal write raise and drop the failure record. The premise first: the
+                # mock refuses what PormG refuses, or the two asserts below prove nothing.
+                m = MockTaskModel()
+                @test_throws "contains a NUL character" m.objects.db("db").create(
+                    "id" => "x", "error" => "a\0b")
+
+                store_n = RealPormGWorkerStore(model=MockTaskModel())
+                rt_store_n = WorkerRuntime(store_n)
+                t = TaskInfo("alice::nul")
+                t.error = "bad item \0name"
+                # Both write paths that carry `error`: the whole-row write ...
+                replace_task!(store_n, t.id, t)
+                @test get_task_info(store_n, t.id).error == "bad item �name"
+                # ... and the terminal transition.
+                @test try_transition!(store_n, t.id, (PENDING,), FAILED;
+                                      run_id=t.run_id, error="boom \0 here") == true
+                stored = get_task_info(store_n, t.id)
+                @test stored.status == FAILED
+                @test stored.error == "boom � here"
+                reset_runtime!(rt_store_n)
             end
 
             @testset "try_transition! fires only from the expected status" begin
@@ -3189,11 +3226,13 @@ else
 
         @testset "the task model is BOUND to its store's connection (#202)" begin
             # `_define_task_model()` used to build a bare `PormG.Models.Model` that never went
-            # through `set_models`, so `connect_key` was `nothing`. PormG's
-            # `ensure_model_transaction_scope` gates on the MODEL's key and never consults the
-            # query's `.db()` override, so while any transaction was open on the calling task
-            # EVERY `nitro_task` query threw `InvalidConfigurationError` -- `submit_task` inside
-            # an app's own `run_in_transaction` block, for instance.
+            # through `set_models`, so `connect_key` was `nothing`. Before PormG 0.8 the
+            # transaction-scope check gated on the MODEL's key and never consulted the query's
+            # `.db()` override, so while any transaction was open on the calling task EVERY
+            # `nitro_task` query threw `InvalidConfigurationError` -- `submit_task` inside an
+            # app's own `run_in_transaction` block, for instance. PormG#838 moved the check onto
+            # the pool the query runs on; the binding is kept, and the half below now pins the
+            # premise the store relies on.
             #
             # Mirrors the session-side guard in `pormg_session_tests.jl`; the two stores had the
             # identical gap and #202 closes both.
@@ -3215,15 +3254,23 @@ else
                 unbound.connect_key = nothing
 
                 # Outside a transaction the guard returns immediately for both -- which is
-                # precisely why this defect never showed up in the suite.
-                @test PormG.Configuration.ensure_model_transaction_scope(unbound) === nothing
-                @test PormG.Configuration.ensure_model_transaction_scope(bound) === nothing
+                # precisely why this defect never showed up in the suite. Its second argument is
+                # the pool the query EXECUTES on, which for the store is what
+                # `.db(store.db_key)` resolves: `conn`.
+                check = PormG.Configuration.ensure_transaction_scope
+                @test check(unbound, conn) === nothing
+                @test check(bound, conn) === nothing
 
                 # `with_tx_context` is PormG's own seam onto the `ScopedValue` that
-                # `run_in_transaction` sets, so the guard runs without a live driver.
+                # `run_in_transaction` sets, so the guard runs without a live driver. On the
+                # store's own pool both pass -- before PormG 0.8 `unbound` threw here.
                 PormG.with_tx_context(conn, nothing) do
-                    @test_throws PormG.Kernel.InvalidConfigurationError PormG.Configuration.ensure_model_transaction_scope(unbound)
-                    @test PormG.Configuration.ensure_model_transaction_scope(bound) === nothing
+                    @test check(unbound, conn) === nothing
+                    @test check(bound, conn) === nothing
+                end
+                # On another pool the store's query is refused, binding or not.
+                PormG.with_tx_context(FakeTaskPool(String[]), nothing) do
+                    @test_throws PormG.TransactionError check(bound, conn)
                 end
 
                 # And the factory hands the store a model bound to the key it was asked for.
