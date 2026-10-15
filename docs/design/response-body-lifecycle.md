@@ -348,7 +348,8 @@ only on `T`. Filed as #493.
 
 **The `@kwdef` path makes a large body parse slower than `getjson` does, at half the
 allocations.** For a `@kwdef` type, `json_bind` first parses the whole body into
-`Dict{String, JSON.JSONText}` (#294): that pass validates the body and copies its text, 38.6 µs at
+`Dict{String, JSON.JSONText}` (#294): that pass validates the body's structure (not its string
+escapes, see #577) and copies its text, 38.6 µs at
 10 KB for 6 allocations. Only then does it parse each field. At 250 rows that is 108 µs against 65
 for the plain struct. On a small body the extra cost is one `binds_by_keyword` per field plus
 `kw_construct`'s dynamic keyword call (1.2 µs, 12 allocations), so 6.2 µs against 1.5. The
@@ -378,6 +379,66 @@ bypass a hand-written keyword constructor that transforms its arguments, so it i
 One edge now behaves like JSON.jl's plain-struct path instead of like the `Dict` the walk replaced:
 a repeated key binds its last value as before, but every occurrence is parsed, so an invalid
 earlier occurrence (`{"a":"bad","a":5}`) refuses the body where the `Dict` kept only the last text.
+
+### JSON.jl upstream candidates, measured (#496)
+
+Two costs above sit in JSON.jl, not in Nitro: the `Object` writer, and the absence of a skip that
+still validates. Both were measured against JSON.jl 1.10.0 (`a69c082`, the tree Nitro's manifest
+resolves), Julia 1.12.7, HTTP 2.9.0, StructUtils 2.9.2, one thread. The prototype lived in a scratch
+clone of JSON.jl and is not part of Nitro.
+
+**The `Object` writer: the candidate fix halves the 250-row echo's writing, and is worth taking
+upstream.** The prototype is one method beside the generic
+`applyeach(::JSONStyle, f, ::AbstractDict{<:Any,Any})` in JSON.jl's `write.jl`:
+`applyeach(st::JSONStyle, f, x::Object{K,Any}) where {K}`. It walks the linked nodes through
+`_k`/`_v`/`_ch`, and calls `_applyvalue(st, f, lowerkey(st, k), v)` for every node that holds a
+key, keeping the `EarlyReturn` check. No `Pair` is built and no iteration tuple is boxed. Results
+are BenchmarkTools minima from the `bench/suite/json.jl` rows of the same names, two interleaved
+rounds that agreed:
+
+| allocations / time | JSON.jl 1.10.0 | with the prototype |
+|---|---|---|
+| `write_dict_small` (3 fields) | 22 / 0.6 µs | 13 / 0.3 µs |
+| `write_dict_10kb` (250 rows) | 2,524 / 110–111 µs | 271 / 55–59 µs |
+| `write_struct_10kb` (reference, unaffected) | 773 / 45–49 µs | 773 / 45 µs |
+| `echo_small_served` | 49 / 1.8 µs | 40 / 1.6 µs |
+| `echo_10kb_served` | 5,047 / 183–190 µs | 2,794 / 128–129 µs |
+
+The parsed `Object` now writes in fewer allocations than a struct, because it has no field names
+to turn into `String`s, and fewer than a Base `Dict`, because an `Object` is ordered and is not
+key-sorted. That reverses the write-side half of the #475 section above. The echo as a whole still
+favours `Json{T}` (2,053 allocations / 114 µs against 2,794 / 128 µs), because `getjson`'s untyped
+parse is still 2,510 of them. JSON.jl's own test suite passes with the method added. Every JSON.jl user who writes a parsed `Object` benefits, not only Nitro.
+
+**The validating skip: worth a few allocations per JWT, and nothing for `Json{T}`'s cost.** It
+cannot be counted by prototype, so this counts its upper bound: what is materialized today and
+then discarded. Allocations per call, minimum of five runs of 1,000:
+
+| | today | if only the members read were materialized |
+|---|---|---|
+| JWT header `{"alg","typ"}` | 9 (`Object`), 12 (`Dict`) | 3 (struct of `alg`, `kid`, `crit`) |
+| JWT header `{"alg","typ","kid"}` | 12 (`Object`), 14 (`Dict`) | 4 |
+| `Json{T}` plain struct, + 3 undeclared members | 6 | 6 (skipped already) |
+| `Json{T}` `@kwdef`, + 3 undeclared members | 23 | 20 |
+
+- **JWT header:** a validating skip would save 6–8 of the 41 allocations a token costs (#484). It
+  is the only place on that path it helps. The claims set cannot shrink: `Principal` keeps every
+  claim, so none of them is discarded.
+- **`Json{T}`:** a plain struct already skips undeclared members for free. A `@kwdef` struct pays
+  one allocation per undeclared member. The skip's value here is not speed but strictness.
+
+**Today, `Json{T}` does not check the string escapes of a member it does not declare (#577).** A
+body whose undeclared member holds an invalid escape (`{"name":"item","qty":3,"note":"bad \q
+escape"}`, or `"\uZZZZ"`) binds for a plain struct and for a `@kwdef` struct alike. The same escape
+in a declared member is refused, and `getjson` refuses the whole body. Numbers, literals, structure
+and control characters are still checked. Only escapes get through, because JSON.jl validates a
+string's escapes when it materializes the string. This predates #493: the `@kwdef` path's old
+`Dict{String, JSON.JSONText}` pass accepted the same bodies, and so does `JSON.isvalidjson`. #449
+refused this skip for the JWT header. A validating skip would let `Json{T}` refuse such a body
+without materializing anything.
+
+Whether either candidate goes to JuliaIO/JSON.jl, and in what form, is the maintainer's decision.
+Nothing has been filed upstream.
 
 ## 4. Reference facts
 

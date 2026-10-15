@@ -5,6 +5,7 @@ using JSON
 using Dates: Dates
 using UUIDs: UUID
 using ..Util
+using ..Util: TypeMemo, memoized, reset!
 using ...Errors: is_unrecoverable, ValidationError
 using ...Constants: request_max_fields
 
@@ -107,12 +108,21 @@ Route registration refuses such a parameter, and `json(req, T)` refuses such a `
 interns_client_strings(@nospecialize(T)) :: Bool = _interns(T, Base.IdSet{Any}())
 
 # `json(req, T)` asks once per request, and the walk allocates and costs tens of microseconds --
-# more than parsing a small body. The answer depends only on `T`, so it is cached per type. Under
-# a lock: requests run on many threads, and an `IdDict` is not safe to read while another writes.
-const _INTERNS_CACHE = IdDict{Any, Bool}()
-const _INTERNS_LOCK = ReentrantLock()
-interns_client_strings_cached(@nospecialize(T)) :: Bool =
-    lock(() -> get!(() -> interns_client_strings(T), _INTERNS_CACHE, T), _INTERNS_LOCK)
+# more than parsing a small body. So it is memoized per type, in a `TypeMemo` whose reads take no
+# lock (#498): this used to be an `IdDict` behind one process-wide lock, which every `json(req, T)`
+# request on every thread queued on to read an answer that never changes.
+#
+# The memo's world-counter key is needed here too, not only for `hasmethod`: the walk calls
+# `keytype`, `valtype` and `eltype`, which an app's own `AbstractDict` or `AbstractArray` type may
+# define as methods, so a method defined later can change the answer. The memo files each answer
+# under the newest world, so a miss walks in the newest world too (`invokelatest`): a caller still
+# running in an older one would otherwise store that world's answer for every newer caller.
+# `hasmethod` needs no such step; it asks about the newest world by default.
+const INTERNS_CLIENT_STRINGS = TypeMemo()
+__init__() = reset!(INTERNS_CLIENT_STRINGS)
+interns_client_strings_cached(::Type{T}) where {T} =
+    memoized(_interns_in_latest_world, INTERNS_CLIENT_STRINGS, T)
+_interns_in_latest_world(@nospecialize(T)) :: Bool = Base.invokelatest(interns_client_strings, T)
 
 function _interns(@nospecialize(T), seen::Base.IdSet{Any}) :: Bool
     T === Symbol && return true

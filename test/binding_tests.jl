@@ -254,7 +254,7 @@ using HTTP
 using Nitro
 using Nitro: App, Nullable, Query, Form, Json, Body, Cookie, Session, Context
 using Nitro.Core.Types: Extractor
-using Nitro.Core.Util.BodyParsers: interns_client_strings
+using Nitro.Core.Util.BodyParsers: interns_client_strings, interns_client_strings_cached
 using Random
 
 @enum Shade light = 1 dark = 2
@@ -290,10 +290,12 @@ interned(s::String) = ccall(:jl_symbol_lookup, Ptr{Cvoid}, (Cstring,), s) != C_N
               NamedTuple{(:a,),Tuple{Symbol}}, WithSymbol, WithSymbolDict, WithEnumDict,
               Vector{WithSymbol})
         @test interns_client_strings(T)
+        @test interns_client_strings_cached(T)  # the memo `json(req, T)` reads (#498)
     end
     for T in (Any, Int, Float64, String, Shade, Nullable{Shade}, Vector{Shade}, Dict{String,Shade},
               Dict{String,Any}, Tuple{Vararg{Int}}, Safe, Node, Vector)
         @test !interns_client_strings(T)
+        @test !interns_client_strings_cached(T)
     end
 end
 
@@ -494,7 +496,10 @@ using Test
 using HTTP
 using Nitro
 using Nitro: App, Query, Form
-using Nitro.Core.Util.BodyParsers: interns_client_strings_cached, _INTERNS_CACHE
+using Nitro.Core.Util.BodyParsers: interns_client_strings, interns_client_strings_cached,
+                                   INTERNS_CLIENT_STRINGS
+
+memoized_for(T) = haskey((@atomic :acquire INTERNS_CLIENT_STRINGS.snapshot).known, T)
 
 # StructTypes built a NamedTuple target; the field-driven binder's positional `T(args...)` has
 # no method for one, so `Query{@NamedTuple{...}}` answered 400 until this.
@@ -516,18 +521,44 @@ struct Walked
     a::Vector{Dict{String, Int}}
 end
 @test interns_client_strings_cached(Walked) === false
-@test haskey(_INTERNS_CACHE, Walked)
+@test memoized_for(Walked)
 @test interns_client_strings_cached(Walked) === false
-@testset let lookup = allocs(() -> interns_client_strings_cached(Walked))  # min of 5 runs (#511)
-    @test lookup.bytes < 256
+# A hit reads one atomic snapshot and takes no lock (#498): it used to queue on a process-wide
+# `ReentrantLock`, and allocate for the closures around it. Min of 5 runs (#511).
+@testset let lookup = allocs(() -> interns_client_strings_cached(Walked))
+    @test lookup.bytes == 0
 end
 # ...and `json(req, T)` is what consults it.
 struct ViaJson
     a::Int
 end
-@test !haskey(_INTERNS_CACHE, ViaJson)
+@test !memoized_for(ViaJson)
 @test json(HTTP.Request("POST", "/", ["Content-Type" => "application/json"], """{"a":1}"""), ViaJson).a == 1
-@test haskey(_INTERNS_CACHE, ViaJson)
+@test memoized_for(ViaJson)
+
+# The walk asks `eltype`, which a type may define as a method of its own: the memo is keyed on the
+# world counter, so a method defined after the first answer is seen, as the uncached walk sees it.
+struct Bag <: AbstractVector{Int}; end
+@test !interns_client_strings_cached(Bag)
+Core.eval(@__MODULE__, :(Base.eltype(::Type{Bag}) = Symbol))
+@test interns_client_strings(Bag)
+@test interns_client_strings_cached(Bag)
+
+# Many tasks missing on fresh types at once, each publishing its own copy of the snapshot. Whether
+# a publication is actually lost is up to the scheduler; this pins that every answer is right
+# however they interleave.
+@testset "concurrent first answers agree with the uncached walk" begin
+    types = [Core.eval(@__MODULE__, isodd(i) ?
+                 :(struct $(Symbol("Walk", i)); tag::Vector{Symbol}; end; $(Symbol("Walk", i))) :
+                 :(struct $(Symbol("Walk", i)); tag::Vector{String}; end; $(Symbol("Walk", i))))
+             for i in 1:32]
+    expected = interns_client_strings.(types)
+    @test count(expected) == 16
+    for _ in 1:4
+        answers = fetch.([Threads.@spawn(interns_client_strings_cached(T)) for T in types for _ in 1:4])
+        @test answers == repeat(expected; inner = 4)
+    end
+end
 end
 
 @testitem "Body{T} binds only raw text; a struct T is refused at registration (#345)" tags=[:core, :security] setup=[NitroCommon] begin
