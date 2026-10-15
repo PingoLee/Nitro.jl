@@ -3,7 +3,8 @@
 Design record for [#514](https://github.com/PingoLee/Nitro.jl/issues/514): running a Workers queue
 in a **separate process**, for CPU, GC, memory and fault isolation, as an option and never the
 default. **Status: decided.** §10 records the maintainer's decisions (2026-10-14); implementation
-follows the plan in §9, one PR per step. Nothing here changes an app that does not opt in. It builds
+follows the plan in §9, one PR per step. **Step 1 (the store contract) is implemented**; §11
+records where it departs from §3. Nothing here changes an app that does not opt in. It builds
 on #513's queue concurrency, `submit_queued_task` and `checkpoint!`
 ([PR #523](https://github.com/PingoLee/Nitro.jl/pull/523)), and uses their names.
 
@@ -399,3 +400,77 @@ it needs an `upgrading/` entry. `consume!` is also the natural entry point for #
    documented, KEDA as an optional note). The web-spawned launcher is deferred (§7).
 6. **The zombie sweep skips leased rows: accepted**, as a hard requirement of the first
    implementation PR (§3, §9).
+
+## 11. Implementation notes: step 1, the store contract (2026-10-15)
+
+Step 1 shipped the four claim operations on both stores, the zombie sweep's skip of leased rows,
+and `cancel_task`'s retry across a claim. Where it departs from §3, it is because the code showed
+a simpler or safer shape, and each change was agreed with the maintainer before it landed:
+
+- **No `cancel_reason` column.** A `CANCELLED` record's `error` is rendered only by
+  `_cancel_message(reason)` (the error redactor reaches only `FAILED` text), so the reason inverts
+  exactly from the stored text: `_cancel_reason_from_error`. A column would have needed a new
+  keyword on `try_transition!`, a required store method, and would have broken every custom store.
+  §6's heartbeat reads the reason through that function.
+- **The claim operations are an optional capability**, `CLAIM_STORE_INTERFACE`, checked by
+  `missing_claim_methods`, not rows of the required contract. Existing custom stores keep
+  conforming. Both shipped stores implement them, behind one conformance body. Refusing
+  `InMemoryWorkerStore` for `External(…)` (§5) is a separate check that step 3 adds: it is about
+  whether other processes can see the store, not about a missing method.
+- **`claim_next!` is an ORM read plus a fenced `UPDATE`, in one transaction**, not one
+  `UPDATE … RETURNING`. On PostgreSQL the read is `SELECT … FOR UPDATE SKIP LOCKED`
+  (`select_for_update(skip_locked = true)`), so the concurrency is the same as River's. Reading a
+  raw `RETURNING` row needs `Tables`, which Nitro does not depend on; PormG avoids `RETURNING` on
+  SQLite; and the test mock cannot see a raw statement. The claiming write is fenced on the
+  `run_id` it read, so a lost race moves on to the next row. A head row that does not decode is
+  failed out of the way rather than blocking the queue, but only one per call: a second one means
+  the cause is not the rows (a decode regression, say), and failing the whole backlog would be
+  irreversible, so the claim throws instead.
+- **`renew_leases!` takes `(id, run_id, progress)`**, not `(run_id, progress)`: `run_id` is not
+  indexed, so a run is addressed by its primary key and fenced on its run. It also fences on
+  `claimed_by`.
+- **`requeue_expired!` runs no wrapping transaction.** Each outcome is its own statement, fenced on
+  the run it read and on the lease still being expired. A transaction would hold every
+  adjudicated row's lock, and on SQLite the database's write lock, until the sweep ended, blocking
+  the renewals it races with. It returns `(requeued, failed, unknown_queue, lost_race)`, and a
+  requeue also clears `started_at` and resets progress.
+- **`cancel_task`'s retry is gated on `external` as well as `created_at`.** `created_at` has
+  millisecond resolution, so it alone could mistake a fast re-submit for a claim. Only an external
+  submission has runs that are not submissions, so for every record an app writes today the answer
+  is exactly the pre-#514 one. Each round restarts from `_visible_record` and re-authorizes; the
+  loop is bounded at eight rounds.
+- **`job_name` and `job_args` are not added yet.** Nothing writes or reads them before step 2,
+  which owns their type and binding. Adding a column is one `_ensure_column!` call.
+- **`RunningTaskRef` gained `claimed_by`**, which is how the sweep sees a leased row. That is the
+  one change a custom store may have to make, and `upgrading/` records it.
+
+**Checked against real drivers** (PostgreSQL 16 and SQLite, by hand: CI has no PostgreSQL, #407).
+- Three consumer processes released at one barrier drained 200 external rows with no duplicate
+  and no decoy touched.
+- On PostgreSQL the claim skipped a row another transaction held, at once, where the same read
+  without `SKIP LOCKED` waited.
+- A requeue whose write waited on an uncommitted renew lost its re-checked fence once the renew
+  committed.
+- On SQLite the same drain was **correct but not fair**: one process took all 200 rows, because
+  the write-lock holder re-acquires at once while the others back off in SQLite's busy handler.
+  Step 5's docs should say that several consumers on one SQLite file serialize, and that one of
+  them may do all the work.
+
+**Left to step 3, which the store cannot enforce.** §4 says a run handed back on purpose "still
+reaches its bound", because `attempt` is charged. The store keeps the count, but only
+`requeue_expired!` compares it with `max_attempts`; neither `claim_next!` nor `release_claim!`
+knows the queue's policy. The consumer must therefore record a run `FAILED` once it reaches the
+bound rather than releasing it again, or `release_claim!` must learn the bound. Step 3 also owns:
+- wiring `requeue_expired!` into the consumer's heartbeat and the web process's retention tick,
+  which needs `External(…)`'s policies. It throws on a read or decode failure, so the caller owns
+  the per-tick `try`, the `InterruptException` rule, and the `_janitor` discipline (#190, #266);
+- a consumer must **stop and alert, not retry**, when `claim_next!` refuses a second undecodable
+  head row: the one-row limit is per call, so a retry loop would still fail the whole backlog, one
+  row per call. Today the refusal is a plain `ErrorException`; step 3 should give it a distinct
+  exception type so the consumer can match on type, not on message text;
+- `created_at` and `queue_name` are submission identity now (`cancel_task`'s retry and the claim
+  order read them), but `set_task!` still writes both. Nothing calls `set_task!` in production
+  today; a consumer that does must not, or `set_task!` should stop writing them;
+- the rule that every web process runs step 1 or later before any consumer starts. An older web
+  process's zombie sweep would fail leased rows, and its `replace_task!` would not reset the claim
+  columns.

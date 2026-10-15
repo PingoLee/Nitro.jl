@@ -17,8 +17,11 @@ change belongs to: **the store answers *"what does the record say?"*; the runtim
 this process doing right now?"***.
 
 - **`AbstractWorkerStore`** (`src/Workers/registry.jl`): data access plus policy hooks, 16 required
-  methods. It owns **nothing that runs** — no queue, no scheduler, no `Task` handle — which is what
-  makes the #29 leak unrepresentable rather than merely fixed.
+  methods, plus an **optional** four-method claim capability (`CLAIM_STORE_INTERFACE`, checked by
+  `missing_claim_methods`) that only a store backing a queue run by a separate consumer process
+  needs ([#514](https://github.com/PingoLee/Nitro.jl/issues/514)). It owns **nothing that runs** —
+  no queue, no scheduler, no `Task` handle — which is what makes the #29 leak unrepresentable
+  rather than merely fixed.
 - **`WorkerRuntime`** (`src/Workers/runtime.jl`): the declared queues and their processor tasks,
   the cleanup scheduler, and `active_tasks` / `active_task_infos`. `shutdown!` takes one. It is
   parametric on the store type so `rt.store` stays concrete.
@@ -121,6 +124,7 @@ you add anything:
 | `release_task!` | **Admin only**, takes `System()`: deletes a *finished* record through the fenced `try_delete_task!`, so a squatted `:global` key can be reused |
 | `WorkerRuntime(store; max_concurrent_runs = 64, max_runs_per_owner = nothing, allow_undeclared_queues = false, queues)`, `WorkerCapacityError` | Limits ([#324](https://github.com/PingoLee/Nitro.jl/issues/324)). A submit past a limit is refused **before anything is written** — `:runtime`/`:queue` a 503, `:owner` a 429 — and a full queue never blocks in `put!`. Only declared queue names get a queue (else `AuthorizationError`). A run holds its reservation until its callback *returns*, a timed-out one included (`_RunHandoff`, one per attempt); a timed-out *queued* callback then counts against the runtime cap, and queues hold their next item only while such abandoned callbacks *alone* fill it (never on async load: an async run waiting on a queued item would deadlock). Every other exit releases the reservation exactly once, by `run_id`. `reservation_lock` is a leaf, and `queue_lock` is never taken inside `lock_tasks` |
 | *(not exported)* `get_task_info`, `add_watcher!`, `set_task!`, `replace_task!`, `try_transition!`, `try_delete_task!`, `delete_task!`, `cleanup_tasks!`, `clear_records!`, `list_running_task_refs`, `RunningTaskRef`, `lock_tasks`, `get_active_task[_info]`, `register_run!`, `WorkerQueue`, `QueueItem`, `get_worker_queues`, `get_queue_lock` | The store contract and the run/queue internals. Backends extend them qualified; they perform no authorization, so they must not become application API again (#323) |
+| *(not exported)* `claim_next!`, `renew_leases!`, `release_claim!`, `requeue_expired!`, `LeaseRenewal`, `LeasePolicy`; *(exported)* `missing_claim_methods` | The optional claim capability (#514). Each is one fenced store statement, never a read-modify-write under `lock_tasks`, and **never called under `lock_tasks`** (a SQLite claim transaction takes the database write lock) |
 | `scoped_task_key`, `DEFAULT_QUEUE_NAME` | Resolve a `(task_key, user_id, scope)` to its stored id; the queue name `submit_task` authorizes against |
 | `get_queue_status` | Queue-wide introspection — **admin only**, takes `System()`; an `Owner` is a `MethodError` |
 | `update_progress!` | The only safe write to `TaskInfo.progress` |
@@ -218,6 +222,13 @@ pair — see §6.
 
 On startup, `RUNNING` tasks without a live in-memory `Task` are marked `FAILED` when `recover_zombies=true`.
 
+**Except a leased run** ([#514](https://github.com/PingoLee/Nitro.jl/issues/514)). A run a consumer
+process claimed carries `claimed_by`, and its liveness is its lease, not a handle in any process
+but that consumer's, so the criterion above would fail every run a consumer is executing. The sweep
+reads `claimed_by` off each `RunningTaskRef`, skips those runs **first**, and counts them as
+`leased`. `requeue_expired!` is the only thing that adjudicates them. Do not "simplify" the skip
+into the SQL: like `zombie_min_age`'s filter, it runs in Julia so a skipped row is still counted.
+
 Since [#176](https://github.com/PingoLee/Nitro.jl/issues/176) that criterion is correct rather than
 conditionally correct: a teardown no longer manufactures zombies out of runs that are still
 executing. The window is narrower, not gone — run handles are per-runtime, so a restart that builds
@@ -301,9 +312,18 @@ decide.
   compare-and-set on the stored document) and `try_transition!` (a conditional status change) are
   the pattern. Composing `get_task_info` + mutate + `set_task!` under the lock is exactly the bug.
 - **`set_task!` writes state; `replace_task!` writes the whole record.** `set_task!` must never
-  write `watchers` **or `run_id`** — neither is volatile state, and carrying them on every
+  write `watchers`, **`run_id`**, or the claim fields (`external`, `claimed_by`,
+  `lease_expires_at`, `attempt`, #514) — none is volatile state, and carrying them on every
   transition is how grants got clobbered. `replace_task!` has exactly one caller: re-running a
-  finished key, which by design resets the watcher list and publishes the new run's identity.
+  finished key, which by design resets the watcher list and the claim fields, and publishes the new
+  **submission's** identity.
+  - **A new run of the SAME submission is published by the claim operations**, never by
+    `replace_task!` (#514): `claim_next!`, `release_claim!` and `requeue_expired!` each mint a
+    fresh `run_id` in the same fenced statement as the write it identifies, and keep `created_at`,
+    the watchers and the attempt count. `run_id` is still minted only by the `TaskInfo`
+    constructor; a store that keeps objects (`InMemoryWorkerStore`) installs a **new** object
+    (`_successor_run`) rather than assigning `run_id` on the claimed one, which would hand the new
+    identity to whoever holds the old object.
   - **A write that finds its row gone splits the two** ([#379](https://github.com/PingoLee/Nitro.jl/issues/379)).
     `replace_task!` must still leave the record written: a row deleted between its read and its
     write is created, and a create that loses to a concurrent insert updates that row instead. A
@@ -333,7 +353,14 @@ decide.
   **required** `run_id` — `nothing` is the named opt-out, never a default — and so does the runtime
   handle teardown: only the run that owns the runtime's `active_tasks[id]` may deregister it,
   because `recover_zombie_tasks!` reads liveness from exactly that entry. One `TaskInfo` object is
-  one run; a re-run is a new object, never a mutated one.
+  one run; a re-run is a new object, never a mutated one — and so is a claim, a hand-back or a
+  lease requeue of an external submission (#514).
+  - **`cancel_task` retries across a claim, and only across a claim.** A consumer claiming,
+    releasing or requeueing an external submission between the cancel's read and its CAS mints a
+    new run of the same submission, and the cancel must still land on it. The retry is gated on
+    `_same_submission` — both records `external`, same `created_at` — and restarts from
+    `_visible_record`, so it re-authorizes. Never widen the gate to non-external records: there a
+    changed `run_id` is a re-submit, and `created_at` has millisecond resolution.
   - **A write that fences on a run it just re-read is not fenced.** `_abandon_queued_item!` (#182)
     writes a terminal state for a task that never started, and re-reading the record to get a
     `run_id` would agree with whatever currently owns the key — precisely the successor the fence

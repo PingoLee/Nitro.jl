@@ -355,6 +355,253 @@ end
           length(Nitro.Workers.WORKER_STORE_INTERFACE) - 1
 end
 
+# -- The claim capability (#514) ----------------------------------------------------------------
+
+# A store that forwards to an `InMemoryWorkerStore` and runs `hook(inner)` just before each
+# `try_transition!`: another process's claim landing in the window between `cancel_task`'s read
+# and its fenced write. `lock_tasks` is the inner store's lock, and the hook runs under it, which
+# is fine for the inner store's own (reentrant) lock and is exactly the interleaving a second
+# process produces, since that process does not take this one's lock at all.
+struct ClaimRaceStore <: AbstractWorkerStore
+    inner::InMemoryWorkerStore
+    hook::Base.RefValue{Any}
+    persistent::Bool
+    calls::Base.RefValue{Int}
+end
+ClaimRaceStore(hook; persistent::Bool = false) =
+    ClaimRaceStore(InMemoryWorkerStore(), Ref{Any}(hook), persistent, Ref(0))
+
+const _W = Nitro.Workers
+_W.get_task_info(s::ClaimRaceStore, id::String) = _W.get_task_info(s.inner, id)
+_W.set_task!(s::ClaimRaceStore, id::String, t::TaskInfo) = _W.set_task!(s.inner, id, t)
+_W.replace_task!(s::ClaimRaceStore, id::String, t::TaskInfo) = _W.replace_task!(s.inner, id, t)
+_W.add_watcher!(s::ClaimRaceStore, id::String, u::String) = _W.add_watcher!(s.inner, id, u)
+_W.delete_task!(s::ClaimRaceStore, id::String) = _W.delete_task!(s.inner, id)
+_W.try_delete_task!(s::ClaimRaceStore, id::String, from; kw...) = _W.try_delete_task!(s.inner, id, from; kw...)
+_W.cleanup_tasks!(s::ClaimRaceStore, d::Int) = _W.cleanup_tasks!(s.inner, d)
+_W.get_all_tasks(s::ClaimRaceStore, a::TaskAuthority; kw...) = _W.get_all_tasks(s.inner, a; kw...)
+_W.get_queue_authorizer(s::ClaimRaceStore) = _W.get_queue_authorizer(s.inner)
+_W.set_queue_authorizer!(s::ClaimRaceStore, f) = _W.set_queue_authorizer!(s.inner, f)
+_W.get_watch_authorizer(s::ClaimRaceStore) = _W.get_watch_authorizer(s.inner)
+_W.set_watch_authorizer!(s::ClaimRaceStore, f) = _W.set_watch_authorizer!(s.inner, f)
+_W.get_error_redactor(s::ClaimRaceStore) = _W.get_error_redactor(s.inner)
+_W.set_error_redactor!(s::ClaimRaceStore, f) = _W.set_error_redactor!(s.inner, f)
+_W.lock_tasks(cb::Function, s::ClaimRaceStore) = _W.lock_tasks(cb, s.inner)
+function _W.try_transition!(s::ClaimRaceStore, id::String, from, to::TaskStatus; kw...)
+    h = s.hook[]
+    s.persistent || (s.hook[] = nothing)
+    if h !== nothing
+        s.calls[] += 1
+        h(s.inner)
+    end
+    return _W.try_transition!(s.inner, id, from, to; kw...)
+end
+
+@testset "the claim capability is optional, and discoverable (#514)" begin
+    claim_rows = [:claim_next!, :renew_leases!, :release_claim!, :requeue_expired!]
+
+    # The shipped backend has it.
+    @test isempty(missing_claim_methods(InMemoryWorkerStore))
+    @test _W.supports_claims(InMemoryWorkerStore())
+
+    # A store written before it is still a conforming store -- the capability is not in the
+    # required contract, so adding it broke no third-party backend -- and it says what it lacks.
+    @test isempty(missing_store_methods(DataOnlyStore))
+    @test missing_claim_methods(DataOnlyStore) == claim_rows
+    @test !_W.supports_claims(DataOnlyStore())
+    @test isempty(intersect(claim_rows, missing_store_methods(NothingWorkerStore)))
+
+    # Calling one is the same loud, named error as any other missing contract method.
+    err = try
+        _W.claim_next!(DataOnlyStore(), "heavy", "consumer-1"; lease_seconds = 30)
+        nothing
+    catch e
+        e
+    end
+    @test err isa StoreInterfaceError
+    @test occursin("claim_next!", sprint(showerror, err))
+    @test occursin("missing_claim_methods", sprint(showerror, err))
+
+    # The shared validators every backend calls.
+    # 1e-4 s would round to a 0 ms lease, born expired.
+    for bad in (0, -1, Inf, NaN, 1e-4)
+        @test_throws ArgumentError _W.claim_next!(InMemoryWorkerStore(), "q", "c"; lease_seconds = bad)
+    end
+    for bad in ("", "x"^256, "a\0b")
+        @test_throws ArgumentError _W.claim_next!(InMemoryWorkerStore(), "q", bad; lease_seconds = 1)
+    end
+    # An empty queue name is refused: the PormG store keeps "no queue" as "", so there it would
+    # claim the external rows that have no queue.
+    @test_throws ArgumentError _W.claim_next!(InMemoryWorkerStore(), "", "c"; lease_seconds = 1)
+
+    # A lease policy has no default and refuses what it cannot mean.
+    @test _W.LeasePolicy(:requeue).max_attempts == 3
+    @test _W.LeasePolicy(:fail; max_attempts = 1).on_expiry === :fail
+    @test_throws ArgumentError _W.LeasePolicy(:retry)
+    @test_throws ArgumentError _W.LeasePolicy(:requeue; max_attempts = 0)
+    @test_throws MethodError _W.LeasePolicy()
+end
+
+@testset "the claim fields: defaults, kept by set_task!, absent from the status (#514)" begin
+    t = TaskInfo("plain")
+    @test (t.external, t.claimed_by, t.lease_expires_at, t.attempt) == (false, nothing, nothing, 0)
+    @test TaskInfo("ext"; queue_name = "heavy", external = true).external
+
+    store = InMemoryWorkerStore()
+    id = scoped_task_key("fit", Owner("u-claim"))
+    _W.replace_task!(store, id, TaskInfo(id; queue_name = "heavy", external = true))
+    claimed = _W.claim_next!(store, "heavy", "consumer-1"; lease_seconds = 60)
+    @test claimed !== nothing
+
+    # A state save from an object that never saw the claim must not undo it: the claim fields are
+    # the current claim's, like `run_id`, and only the claim operations write them.
+    stale = TaskInfo(id; queue_name = "heavy")
+    stale.status = RUNNING
+    update_progress!(stale, 40)
+    _W.set_task!(store, id, stale)
+    stored = _W.get_task_info(store, id)
+    @test stored.progress == 40.0                     # the volatile state did land...
+    @test stored.external                             # ...and the claim did not move
+    @test stored.claimed_by == "consumer-1"
+    @test stored.lease_expires_at == claimed.lease_expires_at
+    @test stored.attempt == 1
+    @test stored.run_id == claimed.run_id
+
+    # Nothing about a claim reaches a caller: the status answer is an explicit key list.
+    status = get_task_status(id, Owner("u-claim"); runtime = WorkerRuntime(store))
+    @test Set(keys(status)) == Set([:id, :owner, :status, :progress, :result, :error, :created_at,
+                                    :started_at, :completed_at, :watcher_count, :queue_name])
+end
+
+@testset "a cancelled record's error names the cause that cancelled it (#514)" begin
+    reason_of = _W._cancel_reason_from_error
+    msg = _W._cancel_message
+    for r in CANCEL_REASONS
+        @test reason_of(msg(r)) === r
+    end
+    # Injective, which is what makes the inverse exact.
+    @test length(unique(map(msg, CANCEL_REASONS))) == length(CANCEL_REASONS)
+    @test reason_of(nothing) === :none
+    @test reason_of(msg(:none)) === :none          # the generic text names no cause
+    @test reason_of("Worker process terminated unexpectedly mid-execution.") === :none
+
+    # End to end, with an error redactor installed: the redactor reaches only FAILED text, so the
+    # stored cancel text still inverts.
+    store = InMemoryWorkerStore()
+    rt = WorkerRuntime(store)
+    set_error_redactor!(store, (e, r) -> "redacted")
+    started = Channel{Nothing}(1)
+    try
+        id = submit_task("cancel-inverse", function (task_info)
+            put!(started, nothing)
+            while !cancel_requested(task_info)
+                sleep(0.01)
+            end
+            return nothing
+        end, Owner("u-inv"); runtime = rt)
+        @test wait_for(() -> isready(started)) == :ok
+        @test cancel_task(id, Owner("u-inv"); runtime = rt) == Dict{Symbol, Any}(:status => "Task cancelled")
+        record = _W.get_task_info(store, id)
+        @test record.status == CANCELLED
+        @test reason_of(record.error) === :user
+    finally
+        reset_runtime!(rt)
+    end
+end
+
+@testset "the zombie sweep leaves a leased run to its lease (#514)" begin
+    store = InMemoryWorkerStore()
+    rt = WorkerRuntime(store)
+    leased_id = scoped_task_key("leased", Owner("u-z"))
+    _W.replace_task!(store, leased_id, TaskInfo(leased_id; queue_name = "heavy", external = true))
+    leased = _W.claim_next!(store, "heavy", "consumer-1"; lease_seconds = 60)
+    zombie = TaskInfo("zombie-unleased")
+    zombie.status = RUNNING
+    _W.replace_task!(store, zombie.id, zombie)
+
+    @test Set(_W.list_running_task_refs(store)) ==
+          Set([(id = leased_id, run_id = leased.run_id, started_at = leased.started_at,
+                claimed_by = "consumer-1"),
+               (id = zombie.id, run_id = zombie.run_id, started_at = nothing, claimed_by = nothing)])
+
+    logs, n = Test.collect_test_logs() do
+        recover_zombie_tasks!(; runtime = rt)
+    end
+    @test n == 1
+    @test _W.get_task_info(store, zombie.id).status == FAILED
+    # The leased run is a consumer's, alive or not, and only its lease decides that.
+    kept = _W.get_task_info(store, leased_id)
+    @test kept.status == RUNNING
+    @test kept.run_id == leased.run_id
+    done = only(filter(r -> r.message == "Nitro.Workers: zombie recovery complete", logs))
+    @test done.kwargs[:leased] == 1
+    @test done.kwargs[:candidates] == 2
+    @test done.kwargs[:recovered] == 1
+
+    # A ref built before `claimed_by` existed is an unleased run, and is still adjudicated.
+    old = TaskInfo("zombie-old-ref")
+    old.status = RUNNING
+    _W.replace_task!(store, old.id, old)
+    tally = _W._ZombieTally()
+    _W._recover_zombie_page!(tally, rt, [(id = old.id, run_id = old.run_id, started_at = nothing)], nothing)
+    @test tally.recovered == 1 && tally.leased == 0
+    @test _W.get_task_info(store, old.id).status == FAILED
+end
+
+@testset "cancel_task follows a claim to the run it became (#514)" begin
+    owner = Owner("u-cancel")
+    id = scoped_task_key("job", owner)
+    seed!(s; external) = _W.replace_task!(s.inner, id, TaskInfo(id; queue_name = "heavy", external))
+
+    # A consumer claims the submission between the cancel's read and its fenced write. The claim
+    # is a new run of the SAME submission, so the cancel the owner asked for still lands, on it.
+    s = ClaimRaceStore(inner -> _W.claim_next!(inner, "heavy", "consumer-1"; lease_seconds = 60))
+    seed!(s; external = true)
+    read_run = _W.get_task_info(s.inner, id).run_id
+    @test cancel_task(id, owner; runtime = WorkerRuntime(s)) ==
+          Dict{Symbol, Any}(:status => "Task cancelled")
+    @test s.calls[] == 1
+    rec = _W.get_task_info(s.inner, id)
+    @test rec.status == CANCELLED
+    @test rec.run_id != read_run                       # the claimed run, not the one read
+    @test rec.claimed_by == "consumer-1"
+    @test _W._cancel_reason_from_error(rec.error) === :user
+
+    # A submission this process runs itself has no such thing as a new run of it: a changed run
+    # there is a re-submit, and the answer is exactly the pre-#514 one.
+    s2 = ClaimRaceStore(inner -> _W.replace_task!(inner, id, TaskInfo(id; queue_name = "heavy")))
+    seed!(s2; external = false)
+    @test cancel_task(id, owner; runtime = WorkerRuntime(s2)) == Dict{Symbol, Any}(
+        :error => "Task was re-submitted; the run you asked to cancel has already ended")
+    @test _W.get_task_info(s2.inner, id).status == PENDING
+
+    # Even with an identical `created_at`, which a fast re-submit can produce at millisecond
+    # resolution: only an external submission gets runs that are not submissions.
+    s3 = ClaimRaceStore(inner -> begin
+        prev = _W.get_task_info(inner, id)
+        nxt = TaskInfo(id; queue_name = "heavy")
+        nxt.created_at = prev.created_at
+        _W.replace_task!(inner, id, nxt)
+    end)
+    seed!(s3; external = false)
+    @test cancel_task(id, owner; runtime = WorkerRuntime(s3)) == Dict{Symbol, Any}(
+        :error => "Task was re-submitted; the run you asked to cancel has already ended")
+
+    # A submission whose run changes on every round is not chased forever.
+    churn = inner -> begin
+        r = _W.get_task_info(inner, id)
+        r.status == PENDING ? _W.claim_next!(inner, "heavy", "consumer-1"; lease_seconds = 60) :
+                              _W.release_claim!(inner, id, r.run_id)
+    end
+    s4 = ClaimRaceStore(churn; persistent = true)
+    seed!(s4; external = true)
+    out = cancel_task(id, owner; runtime = WorkerRuntime(s4))
+    @test out == Dict{Symbol, Any}(
+        :error => "Task is being claimed by consumers faster than it can be cancelled; try again")
+    @test s4.calls[] == _W._CANCEL_CLAIM_ROUNDS
+    @test _W.get_task_info(s4.inner, id).status in (PENDING, RUNNING)
+end
+
 @testset "shutdown! releases the scheduler, the queues and every settled handle (#167, #176)" begin
     store = InMemoryWorkerStore()
     rt_store = WorkerRuntime(store; queues = ["teardown-q"])
@@ -3683,7 +3930,7 @@ end
     mem = InMemoryWorkerStore()
     running = lock(() -> seed_rows!(mem.task_registry), mem.task_lock)
     @test Nitro.Core.Errors.implements_contract_method(list_running_task_refs, InMemoryWorkerStore, AbstractWorkerStore, 1)
-    @test list_running_task_refs(mem) == [RunningTaskRef((running.id, running.run_id, started))]
+    @test list_running_task_refs(mem) == [RunningTaskRef((running.id, running.run_id, started, nothing))]
 
     # A backend that never heard of it still conforms, and still recovers: the default reads the
     # listing. Adding it as a REQUIRED row would have broken every third-party store for a method
@@ -3693,7 +3940,7 @@ end
     @test isempty(missing_store_methods(DataOnlyStore))
     @test !(:list_running_task_refs in [nameof(f) for (f, _) in Nitro.Workers.WORKER_STORE_INTERFACE])
     @test !Nitro.Core.Errors.implements_contract_method(list_running_task_refs, DataOnlyStore, AbstractWorkerStore, 1)
-    @test list_running_task_refs(legacy) == [RunningTaskRef((legacy_running.id, legacy_running.run_id, started))]
+    @test list_running_task_refs(legacy) == [RunningTaskRef((legacy_running.id, legacy_running.run_id, started, nothing))]
     @test recover_zombie_tasks!(; runtime=WorkerRuntime(legacy)) == 1
     @test legacy.rows["scan-running"].status == FAILED
 end
@@ -3824,6 +4071,7 @@ end
         @test done.kwargs[:spared_live] == 1
         @test done.kwargs[:too_recent] == 1
         @test done.kwargs[:lost_race] == 0
+        @test done.kwargs[:leased] == 0
         @test !any(r -> occursin(sentinel, string(r.message, " ", r.kwargs)), logs)
     finally
         wait(live)

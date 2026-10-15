@@ -345,7 +345,8 @@ function Base.showerror(io::IO, e::StoreInterfaceError)
               "The full contract is in the docstring of the abstract store type ",
               "(`?AbstractWorkerStore` or `?AbstractSessionStore`); ",
               "`missing_store_methods` / `missing_session_methods` list everything a type is ",
-              "still missing.")
+              "still missing; `missing_claim_methods` lists the worker store's optional claim ",
+              "capability, which only a store backing an external queue needs.")
 end
 
 
@@ -387,7 +388,7 @@ of these sites call (a user's `validate_token`, a user's session store):
 | `src/utilities/misc.jl` ×4 | `parseparam`'s `_parse_json_bounded(str, T)` fall-through — reached by **any** scalar path/query parameter, since `parse(Int, str)` fails first and lands there — plus `parsebody_union`'s member loop, the same shape for `Body{T}` (#345) |
 | `src/extractors.jl` ×2 | `safe_extract`'s `f()` (the extractor body, i.e. the parsers above) and the app's session store |
 | `src/middleware/csrf_middleware.jl` ×2 | `getform`/`getjson` |
-| `ext/NitroPormGExt.jl` ×4 | the PormG stores' reads of their own stored JSON (#344): the session query and decode in `Base.get(::PormGSessionStore, …)`, which `SessionMiddleware` calls per request; `_parse_stored_json` for a task's `result`/`watchers`; and `_listed_task`, which would otherwise swallow what `_parse_stored_json` rethrows one frame up |
+| `ext/NitroPormGExt.jl` ×5 | the PormG stores' reads of their own stored JSON (#344): the session query and decode in `Base.get(::PormGSessionStore, …)`, which `SessionMiddleware` calls per request; `_parse_stored_json` for a task's `result`/`watchers`; `_listed_task`, which would otherwise swallow what `_parse_stored_json` rethrows one frame up; and `_claim_row!`'s decode of the head row a consumer claims (#514) |
 
 `src/extractors.jl`'s `safe_extract` is the load-bearing one: without it the parser fix is a
 no-op for `Json{T}`/`JsonFragment{T}` routes, because the rethrow would be caught one

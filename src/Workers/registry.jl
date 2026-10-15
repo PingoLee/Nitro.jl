@@ -20,8 +20,8 @@ using Nitro.Workers    # the contract names are not re-exported from `Nitro`
 | Method | Contract |
 |---|---|
 | `get_task_info(store, task_id::String)` | The **durable** record: `TaskInfo` or `nothing`, see *Live objects* |
-| `set_task!(store, task_id::String, task_info::TaskInfo)` | Write volatile state; must never write `watchers` or `run_id` |
-| `replace_task!(store, task_id::String, task_info::TaskInfo)` | Write the whole record, `watchers` and `run_id` included |
+| `set_task!(store, task_id::String, task_info::TaskInfo)` | Write volatile state; must never write `watchers`, `run_id`, or the claim fields |
+| `replace_task!(store, task_id::String, task_info::TaskInfo)` | Write the whole record, `watchers`, `run_id` and the claim fields included |
 | `add_watcher!(store, task_id::String, user_id::String)` | Atomic compare-and-set append, returns `Bool` |
 | `try_transition!(store, task_id::String, from, to::TaskStatus; run_id, …)` | Atomic conditional status change, returns `Bool` |
 | `delete_task!(store, task_id::String)` | Remove one record |
@@ -87,6 +87,26 @@ Two optional methods exist, and neither is in the table above because each has a
   backend should implement it as a projection
   ([#236](https://github.com/PingoLee/Nitro.jl/issues/236)).
 
+# Claims (an optional capability)
+
+What a queue run by a **separate consumer process** needs from the store
+([#514](https://github.com/PingoLee/Nitro.jl/issues/514)): picking a submission, holding it for a
+bounded time, and taking it back. A store that does not implement these is still a conforming
+store; it just cannot back an external queue. [`missing_claim_methods`](@ref) lists what a type
+still owes for this capability, and `missing_store_methods` does not include them.
+
+| Method | Contract |
+|---|---|
+| [`claim_next!`](@ref)`(store, queue_name, consumer_id; lease_seconds, now)` | Atomically claim the oldest external `PENDING` submission of a queue as a new run, or `nothing` |
+| [`renew_leases!`](@ref)`(store, consumer_id, runs; lease_seconds, now)` | Extend the leases a consumer holds, returns the run ids that are still its own |
+| [`release_claim!`](@ref)`(store, task_id, run_id)` | Hand a claim back to `PENDING` as a new run, returns `Bool` |
+| [`requeue_expired!`](@ref)`(store, now; policies)` | Adjudicate every expired lease by its queue's [`LeasePolicy`](@ref), returns counts |
+
+Each is one atomic intent operation in the store, like `try_transition!`: a database backend
+expresses it in fenced statements, never as a read-modify-write under `lock_tasks`, which is
+process-local. **Never call them under `lock_tasks`**: a database transaction can take a lock of
+its own, and an order that differs from the request path's is a deadlock.
+
 # Obligations that are not methods
 
 - **Live objects.** `get_task_info` is the **durable** read and is free to reconstruct a fresh
@@ -97,6 +117,9 @@ Two optional methods exist, and neither is in the table above because each has a
   `InMemoryWorkerStore` is not an exception: its records simply *are* the objects callbacks hold,
   because it stores whatever it is handed.
 - **`run_id` round-trips, but `try_transition!` never writes it.** It is a precondition, not state.
+  A fresh one is published only by `replace_task!` (a new submission) and by the claim operations
+  (a new run of the same submission), each in the same atomic step as the write it identifies.
+  See [`TaskInfo`](@ref).
 - **`watchers` is populated on every read path.** Authorization reads it off whatever
   `get_task_info` returns, so a store that omits it silently denies everyone.
 - **`lock_tasks` is process-local.** For a database-backed store it guards this process only, so
@@ -131,6 +154,11 @@ frequent than watcher appends, so this was the dominant way a grant went missing
 re-run's identity be overwritten by whichever run wrote last — defeating the mechanism entirely
 ([#108](https://github.com/PingoLee/Nitro.jl/issues/108)).
 
+The claim fields — `claimed_by`, `lease_expires_at`, `attempt` — are excluded for the same reason
+as `run_id`: they describe the current claim, which only the claim operations may change, and a
+state save carrying a stale copy would hand a run back its predecessor's lease. `external` is
+identity of the submission and is never rewritten either.
+
 Use [`add_watcher!`](@ref) to add a grant and [`replace_task!`](@ref) to write a whole
 record, watchers and run id included.
 
@@ -142,12 +170,17 @@ function set_task! end
 """
     replace_task!(store, task_id::String, task_info::TaskInfo)
 
-Write a task record **in full, `watchers` and `run_id` included**, replacing whatever is
-stored.
+Write a task record **in full, `watchers`, `run_id`, `external` and the claim fields included**,
+replacing whatever is stored.
 
 The counterpart to [`set_task!`](@ref), and the only sanctioned way to reset a watcher
-list — or to publish a new run's identity. There is exactly one caller: re-running a *finished* task key, which by documented
-design replaces the record and resets its watchers to the resubmitter.
+list — or to publish a new **submission's** identity. There is exactly one caller: re-running a
+*finished* task key, which by documented design replaces the record and resets its watchers to the
+resubmitter. The new submission's `TaskInfo` has never been claimed, so writing its claim fields
+resets them too: a key re-run after an external run does not inherit that run's `attempt` count.
+
+A new run of the **same** submission is published by the claim operations instead (see
+[`claim_next!`](@ref)), which keep `created_at`, the watchers and the attempt count.
 
 A store that cannot distinguish this from `set_task!` has not implemented `set_task!`
 correctly — the whole point of the split is that ordinary saves leave grants alone.
@@ -266,12 +299,19 @@ function get_all_tasks end
     RunningTaskRef
 
 What zombie recovery needs to know about one `RUNNING` record, and nothing more: its `id`, the
-`run_id` a fenced [`try_transition!`](@ref) is addressed to, and the `started_at` its run claimed
-it at (`nothing` when the record carries none).
-"""
-const RunningTaskRef = @NamedTuple{id::String, run_id::UUID, started_at::Union{Nothing, DateTime}}
+`run_id` a fenced [`try_transition!`](@ref) is addressed to, the `started_at` its run claimed
+it at (`nothing` when the record carries none), and the `claimed_by` of a run a consumer process
+holds under a lease (`nothing` for a run some process is executing as its own).
 
-_running_ref(task::TaskInfo) = RunningTaskRef((task.id, task.run_id, task.started_at))
+`claimed_by` was added by [#514](https://github.com/PingoLee/Nitro.jl/issues/514): a leased run's
+liveness is its lease, not a handle in any process, so the sweep must leave it alone. Build a ref
+by name, `RunningTaskRef((id = …, run_id = …, started_at = …, claimed_by = …))`; the sweep still
+accepts a ref without the field, as an unleased run.
+"""
+const RunningTaskRef = @NamedTuple{id::String, run_id::UUID, started_at::Union{Nothing, DateTime},
+                                   claimed_by::Union{Nothing, String}}
+
+_running_ref(task::TaskInfo) = RunningTaskRef((task.id, task.run_id, task.started_at, task.claimed_by))
 
 # -- Keyset paging (#237) --
 #
@@ -337,6 +377,159 @@ function list_running_task_refs(store::AbstractWorkerStore; after::Union{Nothing
     # lost the race), which the sweep would then count twice.
     return paged ? _keyset_page(refs, after, nothing) : refs
 end
+
+# -- Claims: the optional capability behind an out-of-process consumer (#514) --
+
+"""
+    claim_next!(store, queue_name::String, consumer_id::String;
+                lease_seconds::Real, now::DateTime = current_time_utc()) -> Union{TaskInfo, Nothing}
+
+Claim the oldest `PENDING` submission of `queue_name` that was queued as **external**, for the
+consumer `consumer_id`, as one atomic step. Returns the claimed record, or `nothing` when there is
+nothing to claim. Part of the optional claim capability — see [`AbstractWorkerStore`](@ref).
+
+The claim is a **new run of the same submission**: the record moves to `RUNNING` under a fresh
+`run_id` (see [`TaskInfo`](@ref)), with `claimed_by = consumer_id`, `lease_expires_at = now +
+lease_seconds`, `attempt + 1` and `started_at = now`. `created_at` and the watchers are kept.
+Whatever the previous run of it was, its writes now fail their `run_id` fence.
+
+- **Only external rows.** A row the web process queued for itself under the same queue name sits
+  in that process's channel and is never claimed here.
+- **Oldest first**, by `created_at` and then `id`, so a burst submitted within one clock tick
+  still leaves in one order. A requeued run keeps its `created_at`, so it goes back to its original
+  position.
+- **Concurrent consumers never claim one row twice.** A database backend skips a row another
+  claimer holds rather than waiting on it (`FOR UPDATE SKIP LOCKED` on PostgreSQL), and fences
+  the claiming write on the `run_id` it read, so a lost race moves on to the next row.
+- **`nothing` means empty**, never "lost a race": a one-shot consumer exits on it. A backend that
+  cannot settle a claim after repeated races throws instead.
+- **A head row that cannot be read is failed out of the way, one per call.** A serializing store
+  that cannot decode the oldest row records it `FAILED`, so one bad row does not block the queue.
+  If a second head in the same call fails to decode, it throws instead and writes nothing more:
+  the cause is then probably not the rows, and failing a whole backlog cannot be undone. A
+  consumer must therefore **stop, not retry**, on that error. Retrying would fail one more row per
+  call.
+
+Never call it under `lock_tasks`.
+"""
+function claim_next! end
+
+"""
+    LeaseRenewal
+
+One run whose lease [`renew_leases!`](@ref) extends: the task `id`, the `run_id` the consumer
+holds, and the `progress` to persist with it.
+
+The task id is part of it because `run_id` is not indexed: a store addresses the row by its primary
+key and fences on the run.
+"""
+const LeaseRenewal = @NamedTuple{id::String, run_id::UUID, progress::Float64}
+
+"""
+    renew_leases!(store, consumer_id::String, runs::AbstractVector{LeaseRenewal};
+                  lease_seconds::Real, now::DateTime = current_time_utc()) -> Vector{UUID}
+
+Extend every lease in `runs` to `now + lease_seconds`, and persist each run's `progress`, as one
+fenced write per run. Returns the run ids that matched. Part of the optional claim capability.
+
+Each write is fenced on the run (`id`, `run_id`), on `status = RUNNING`, and on `claimed_by =
+consumer_id`. A run missing from the answer is **no longer this consumer's to run** — cancelled,
+taken back by [`requeue_expired!`](@ref), or the key re-submitted — and the consumer reads the
+record to learn which.
+
+It deliberately does **not** fence on the lease still being in the future. A late renew of a lease
+nobody has taken back yet is harmless, and it is exactly what a long garbage-collection pause
+produces. Taking a lease back is `requeue_expired!`'s decision, fenced on the expiry; the two
+writes cannot both win.
+"""
+function renew_leases! end
+
+"""
+    release_claim!(store, task_id::String, run_id::UUID) -> Bool
+
+Hand a claim back: the run `run_id` of `task_id` goes from `RUNNING` to `PENDING` as a new run of
+the same submission, with a fresh `run_id`, `claimed_by`, `lease_expires_at` and `started_at`
+cleared, and progress reset. Returns whether it did. Part of the optional claim capability.
+
+Fenced on `run_id`, on `status = RUNNING`, and on the submission being external, so a run whose
+claim is already gone — cancelled, requeued, re-claimed — changes nothing, and neither does a run
+a process executes as its own, which nothing would ever pick up again from `PENDING`.
+
+`attempt` is **not** given back. A run a consumer hands back on purpose (it is draining) still
+counts as an attempt, so a job that keeps being handed back still reaches its queue's bound.
+"""
+function release_claim! end
+
+"""
+    requeue_expired!(store, now::DateTime; policies::AbstractDict{String, LeasePolicy})
+        -> @NamedTuple{requeued::Int, failed::Int, unknown_queue::Int, lost_race::Int}
+
+Adjudicate every `RUNNING` run whose lease expired before `now`, by its queue's
+[`LeasePolicy`](@ref). Part of the optional claim capability.
+
+| The run's queue | Outcome |
+|---|---|
+| not in `policies` | `FAILED`, counted in `unknown_queue`: **fail-closed**, never stranded |
+| `:fail` | `FAILED` |
+| `:requeue`, `attempt < max_attempts` | back to `PENDING` as a new run (fresh `run_id`, claim and `started_at` cleared, progress reset, `created_at` kept) |
+| `:requeue`, `attempt >= max_attempts` | `FAILED`, with an error naming the attempts |
+
+`failed` counts every run recorded `FAILED`; `unknown_queue` is how many of those had no policy.
+
+Only leased runs are looked at: a `RUNNING` row with no lease belongs to a process running it as
+its own, and is the zombie sweep's to judge. Each outcome is one write fenced on the run it read
+**and** on the lease still being expired, so a consumer renewing at the same moment either renews
+first and is spared (counted in `lost_race`), or loses its fence. It is safe to run from any
+number of processes at once, and idempotent.
+
+`now` is the caller's clock, compared with a lease written by the claiming process's clock: clock
+skew between the two shortens or lengthens the effective lease by the skew.
+"""
+function requeue_expired! end
+
+# The duration a lease is extended by, validated once for every backend.
+function _lease_period(lease_seconds::Real)
+    # At least one millisecond, the resolution it is stored at: a smaller lease would round to
+    # zero and be born expired.
+    (isfinite(lease_seconds) && lease_seconds >= 0.001) || throw(ArgumentError(
+        "`lease_seconds` must be a finite number of seconds, at least 0.001, got $lease_seconds"))
+    return Dates.Millisecond(round(Int, 1000 * lease_seconds))
+end
+
+# A queue a claim can name. Empty is refused: `PormGWorkerStore` stores "no queue" as an empty
+# string, so an empty name there would claim the external rows that have no queue at all, which
+# no other backend does.
+function _check_claim_queue(queue_name::AbstractString)
+    isempty(queue_name) && throw(ArgumentError("`queue_name` must not be empty"))
+    return queue_name
+end
+
+# What may name a consumer: it is stored in a VARCHAR(255) column and compared byte for byte.
+function _check_consumer_id(consumer_id::AbstractString)
+    isempty(consumer_id) && throw(ArgumentError("`consumer_id` must not be empty"))
+    ncodeunits(consumer_id) <= 255 || throw(ArgumentError(
+        "`consumer_id` must be at most 255 bytes, got $(ncodeunits(consumer_id))"))
+    '\0' in consumer_id && throw(ArgumentError("`consumer_id` must not contain a NUL"))
+    return consumer_id
+end
+
+# The stored error of a run `requeue_expired!` fails, `nothing` when it requeues it instead. One
+# renderer for both backends, so the two cannot word an outcome differently.
+function _lease_expiry_error(queue::Union{Nothing, String}, policy::Union{Nothing, LeasePolicy},
+                             attempt::Int)
+    q = queue === nothing ? "(none)" : "'$queue'"
+    policy === nothing && return "Lease expired on queue $q, which no process declares as " *
+                                 "external; failing closed"
+    policy.on_expiry === :fail && return "Lease expired on queue $q (on_lease_expiry = :fail)"
+    attempt >= policy.max_attempts && return "Lease expired on queue $q after $attempt " *
+        "attempt(s) (max_attempts = $(policy.max_attempts)); not re-queued"
+    return nothing
+end
+
+_lease_policy(policies::AbstractDict, queue::Union{Nothing, String}) =
+    queue === nothing ? nothing : get(policies, queue, nothing)
+
+const _ExpiryTally = @NamedTuple{requeued::Int, failed::Int, unknown_queue::Int, lost_race::Int}
 
 function get_queue_authorizer end
 function set_queue_authorizer! end
@@ -475,6 +668,22 @@ const WORKER_STORE_INTERFACE = (
     (lock_tasks,                    (Function, AbstractWorkerStore)),
 )
 
+"""
+    CLAIM_STORE_INTERFACE
+
+The optional claim capability of an [`AbstractWorkerStore`](@ref), as data, in the same shape as
+`WORKER_STORE_INTERFACE` ([#514](https://github.com/PingoLee/Nitro.jl/issues/514)). Its
+rows get the same generated fallbacks, so calling one on a store that lacks it raises
+`StoreInterfaceError` naming the method. [`missing_claim_methods`](@ref) reads it;
+`missing_store_methods` does not, which is what keeps the capability optional.
+"""
+const CLAIM_STORE_INTERFACE = (
+    (claim_next!,                   (AbstractWorkerStore, String, String)),
+    (renew_leases!,                 (AbstractWorkerStore, String, Any)),
+    (release_claim!,                (AbstractWorkerStore, String, UUID)),
+    (requeue_expired!,              (AbstractWorkerStore, DateTime)),
+)
+
 _store_arg_index(argtypes) = something(findfirst(T -> T === AbstractWorkerStore, argtypes))
 
 # Generate one fallback per row: the store slot typed at the abstract type, every other parameter
@@ -485,7 +694,7 @@ _store_arg_index(argtypes) = something(findfirst(T -> T === AbstractWorkerStore,
 # `kwargs...` is accepted and ignored on purpose. It never swallows a keyword mistake: a store that
 # defines the method at all is more specific on the positional arguments, so it is the one that
 # gets to reject the keyword.
-for (f, argtypes) in WORKER_STORE_INTERFACE
+for (f, argtypes) in (WORKER_STORE_INTERFACE..., CLAIM_STORE_INTERFACE...)
     local idx = _store_arg_index(argtypes)
     local names = [Symbol("a", i) for i in eachindex(argtypes)]
     local params = [i == idx ? Expr(:(::), names[i], AbstractWorkerStore) : names[i]
@@ -514,9 +723,31 @@ it runs at load time, in a test, or in a REPL, without constructing a store.
 It asks about presence, not signature compatibility — see `implements_contract_method` for why
 checking the exact call signature is the less useful question.
 """
-function missing_store_methods(S::Type{<:AbstractWorkerStore})
+missing_store_methods(S::Type{<:AbstractWorkerStore}) = _missing_methods(S, WORKER_STORE_INTERFACE)
+
+"""
+    missing_claim_methods(S::Type{<:AbstractWorkerStore}) -> Vector{Symbol}
+
+The methods of the optional claim capability ([`CLAIM_STORE_INTERFACE`](@ref)) that `S` has not
+implemented. Empty means `S` can back a queue run by a separate consumer process
+([#514](https://github.com/PingoLee/Nitro.jl/issues/514)).
+
+The counterpart of [`missing_store_methods`](@ref), which does not list these: a store without
+them is conforming, it just cannot claim.
+
+```julia
+@test isempty(missing_claim_methods(MyWorkerStore))   # only if MyWorkerStore should claim
+```
+"""
+missing_claim_methods(S::Type{<:AbstractWorkerStore}) = _missing_methods(S, CLAIM_STORE_INTERFACE)
+
+# Whether a store implements the whole claim capability. Not exported: the consumer process asks it.
+supports_claims(S::Type{<:AbstractWorkerStore}) = isempty(missing_claim_methods(S))
+supports_claims(store::AbstractWorkerStore) = supports_claims(typeof(store))
+
+function _missing_methods(S::Type{<:AbstractWorkerStore}, interface)
     names = Symbol[]
-    for (f, argtypes) in WORKER_STORE_INTERFACE
+    for (f, argtypes) in interface
         idx = _store_arg_index(argtypes)
         if !implements_contract_method(f, S, AbstractWorkerStore, idx)
             push!(names, nameof(f))
@@ -579,9 +810,10 @@ function set_task!(store::InMemoryWorkerStore, task_id::String, task_info::TaskI
         end
 
         # A different object: copy the volatile state across and keep the *stored*
-        # record's watchers, run_id AND cancel_reason — precisely what the serializing
+        # record's watchers, run_id, cancel_reason AND the claim fields (`external`,
+        # `claimed_by`, `lease_expires_at`, `attempt`, #514) — precisely what the serializing
         # store achieves by omitting those columns. The list below is otherwise "copy every
-        # field", so those three absences ARE the rule.
+        # field", so those absences ARE the rule.
         #
         # `run_id` is the value `try_transition!` fences on, so copying it off a caller's
         # object would let a stale run adopt the current run's identity (#108).
@@ -736,6 +968,110 @@ function list_running_task_refs(store::InMemoryWorkerStore; after::Union{Nothing
         RunningTaskRef[_running_ref(t) for t in values(store.task_registry) if t.status == RUNNING]
     end
     return paged ? _keyset_page(refs, after, limit) : refs
+end
+
+# -- The claim capability (#514) --
+#
+# Implemented for parity, so one conformance body runs over both backends (workers §6), and so a
+# consumer loop can be exercised in one process. A store no other process can see cannot back a
+# real external queue; refusing that is a deployment check, not a missing capability.
+#
+# Every new run below is a NEW object (`_successor_run`) installed in the registry. Mutating the
+# claimed record's `run_id` in place would hand the new identity to whoever still holds the old
+# object, and every fence they reach would then pass (#108).
+
+function claim_next!(store::InMemoryWorkerStore, queue_name::String, consumer_id::String;
+                     lease_seconds::Real, now::DateTime=current_time_utc())
+    _check_claim_queue(queue_name)
+    _check_consumer_id(consumer_id)
+    lease = _lease_period(lease_seconds)
+    lock(store.task_lock) do
+        head = nothing
+        for t in values(store.task_registry)
+            (t.status == PENDING && t.external && t.queue_name == queue_name) || continue
+            if head === nothing || (t.created_at, t.id) < (head.created_at, head.id)
+                head = t
+            end
+        end
+        head === nothing && return nothing
+        run = _successor_run(head)
+        run.status = RUNNING
+        run.claimed_by = consumer_id
+        run.lease_expires_at = now + lease
+        run.attempt = head.attempt + 1
+        run.started_at = now
+        store.task_registry[run.id] = run
+        return run
+    end
+end
+
+function renew_leases!(store::InMemoryWorkerStore, consumer_id::String,
+                       runs::AbstractVector{LeaseRenewal};
+                       lease_seconds::Real, now::DateTime=current_time_utc())
+    _check_consumer_id(consumer_id)
+    expires = now + _lease_period(lease_seconds)
+    renewed = UUID[]
+    lock(store.task_lock) do
+        for r in runs
+            t = get(store.task_registry, r.id, nothing)
+            (t !== nothing && t.run_id == r.run_id && t.status == RUNNING &&
+             t.claimed_by == consumer_id) || continue
+            t.lease_expires_at = expires
+            @atomic t.progress = r.progress
+            push!(renewed, r.run_id)
+        end
+    end
+    return renewed
+end
+
+function release_claim!(store::InMemoryWorkerStore, task_id::String, run_id::UUID)
+    lock(store.task_lock) do
+        t = get(store.task_registry, task_id, nothing)
+        # `external` too: handing back a run this process executes itself would strand it at
+        # PENDING, since no channel holds it and `claim_next!` takes only external rows.
+        (t !== nothing && t.run_id == run_id && t.status == RUNNING && t.external) || return false
+        store.task_registry[task_id] = _back_to_pending(t)
+        return true
+    end
+end
+
+function requeue_expired!(store::InMemoryWorkerStore, now::DateTime;
+                          policies::AbstractDict{String, LeasePolicy})
+    # The counts live inside the closure and come back as its value: assigned from inside it, they
+    # would be captured in a `Core.Box` (#364).
+    return lock(store.task_lock) do
+        requeued = failed = unknown = 0
+        expired = [t for t in values(store.task_registry)
+                   if t.status == RUNNING && t.lease_expires_at !== nothing && t.lease_expires_at < now]
+        for t in expired
+            policy = _lease_policy(policies, t.queue_name)
+            err = _lease_expiry_error(t.queue_name, policy, t.attempt)
+            if err === nothing
+                store.task_registry[t.id] = _back_to_pending(t)
+                requeued += 1
+            else
+                # In place: status and the error are state, and the run that held the lease is
+                # over -- whoever holds this object should see it end, exactly as a cancel would.
+                t.error = err
+                t.completed_at = now
+                t.status = FAILED
+                failed += 1
+                policy === nothing && (unknown += 1)
+            end
+        end
+        return _ExpiryTally((requeued, failed, unknown, 0))
+    end
+end
+
+# A claimed run, handed back to the queue as the next run of the same submission.
+function _back_to_pending(t::TaskInfo)
+    run = _successor_run(t)
+    run.status = PENDING
+    run.claimed_by = nothing
+    run.lease_expires_at = nothing
+    run.started_at = nothing
+    @atomic run.progress = 0.0
+    return run
 end
 
 function get_queue_authorizer(store::InMemoryWorkerStore)

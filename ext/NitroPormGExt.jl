@@ -22,6 +22,10 @@ import Nitro.Workers: AbstractWorkerStore, TaskInfo, TaskStatus, TaskOptions,
     get_task_info, set_task!, replace_task!, add_watcher!, try_transition!,
     delete_task!, try_delete_task!, cleanup_tasks!, get_all_tasks,
     list_running_task_refs, RunningTaskRef,
+    # The optional claim capability (#514) and the helpers both backends share.
+    claim_next!, renew_leases!, release_claim!, requeue_expired!, LeaseRenewal, LeasePolicy,
+    _successor_run, _lease_period, _check_consumer_id, _check_claim_queue, _lease_expiry_error, _lease_policy,
+    _ExpiryTally, current_time_utc,
     get_queue_authorizer, set_queue_authorizer!,
     get_error_redactor, set_error_redactor!,
     get_watch_authorizer, set_watch_authorizer!,
@@ -597,18 +601,8 @@ The literal is in PormG's canonical UTC form (`yyyy-mm-ddTHH:MM:SS.sss+00:00`), 
 exactly like a value PormG wrote. On SQLite that same text is what makes the prune's string
 comparison agree with an instant comparison.
 """
-function _ensure_session_created_at_column!(conn)
-    _has_column(conn, "nitro_session", "created_at") && return nothing
-    try
-        PormG.ConnectionPool.fetch(conn,
-            "ALTER TABLE \"nitro_session\" ADD COLUMN \"created_at\" $(_datetime_column_type(conn)) " *
-            "NOT NULL DEFAULT '$(_canonical_utc(Dates.now(Dates.UTC)))'")
-    catch e
-        _interrupted(e) && rethrow()
-        _has_column(conn, "nitro_session", "created_at") || rethrow(e)
-    end
-    return nothing
-end
+_ensure_session_created_at_column!(conn) = _ensure_column!(conn, "nitro_session", "created_at",
+    "$(_datetime_column_type(conn)) NOT NULL DEFAULT '$(_canonical_utc(Dates.now(Dates.UTC)))'")
 
 # What `PormG.Dialect.create_table` emits for a `DateTimeField` on each backend (PormG
 # `constants.jl`), so a column added by `ALTER` matches one created with the table.
@@ -662,6 +656,15 @@ Columns:
 - `completed_at` — TIMESTAMPTZ, indexed for efficient querying/pruning
 - `watchers`     — TEXT (JSON-serialized list of watchers)
 - `queue_name`   — VARCHAR(100)
+- `external`, `claimed_by`, `lease_expires_at`, `attempt` — the claim columns
+                   ([#514](https://github.com/PingoLee/Nitro.jl/issues/514)): whether the
+                   submission was queued for a consumer process (BOOLEAN), which consumer holds
+                   its current run (VARCHAR(255), NULL when none), until when (TIMESTAMPTZ), and
+                   how many times it has been claimed (INTEGER). Written only by `replace_task!`
+                   and the claim operations, never by `set_task!`. Added after the table shipped,
+                   so `_ensure_task_table!` adds them on boot; the two claim indexes
+                   (`nitro_task_claim_idx`, `nitro_task_lease_idx`) serve `claim_next!` and
+                   `requeue_expired!`.
 """
 function _define_task_model(db_key::String)
     if isdefined(PormG, :Models)
@@ -677,6 +680,10 @@ function _define_task_model(db_key::String)
             completed_at = PormG.Models.DateTimeField(null=true, blank=true, db_index=true),
             watchers     = PormG.Models.TextField(default="[]"),
             queue_name   = PormG.Models.CharField(max_length=100),
+            external         = PormG.Models.BooleanField(default=false),
+            claimed_by       = PormG.Models.CharField(max_length=255, null=true, blank=true),
+            lease_expires_at = PormG.Models.DateTimeField(null=true, blank=true),
+            attempt          = PormG.Models.IntegerField(default=0),
         )
         _bind_model!(m, db_key)
         return m
@@ -770,7 +777,30 @@ function _to_db_record(task::TaskInfo)
         "completed_at" => task.completed_at,
         "watchers" => watchers_str,
         "queue_name" => isnothing(task.queue_name) ? "" : task.queue_name,
+        "external" => task.external,
+        "claimed_by" => task.claimed_by,
+        "lease_expires_at" => task.lease_expires_at,
+        "attempt" => task.attempt,
     )
+end
+
+# The claim columns (#514), read with the value a pre-#514 row was backfilled with when a row
+# does not carry them. SQLite hands a BOOLEAN back as an integer.
+function _row_or(row, key_sym::Symbol, key_str::String, default)
+    haskey(row, key_sym) && return row[key_sym]
+    haskey(row, key_str) && return row[key_str]
+    return default
+end
+
+_db_bool(v::Bool) = v
+_db_bool(v::Integer) = !iszero(v)
+_db_bool(v::AbstractString) = v in ("1", "t", "true", "TRUE")
+_db_bool(::Union{Nothing, Missing}) = false
+
+function _db_optional_string(v)
+    (v === nothing || v === missing) && return nothing
+    s = string(v)
+    return isempty(s) ? nothing : s
 end
 
 function _parse_optional_db_datetime(val)
@@ -859,6 +889,11 @@ function _from_db_record(row)::TaskInfo
     qn_str = string(get_val(:queue_name, "queue_name"))
     task.queue_name = isempty(qn_str) ? nothing : qn_str
 
+    task.external = _db_bool(_row_or(row, :external, "external", false))
+    task.claimed_by = _db_optional_string(_row_or(row, :claimed_by, "claimed_by", nothing))
+    task.lease_expires_at = _parse_optional_db_datetime(_row_or(row, :lease_expires_at, "lease_expires_at", nothing))
+    task.attempt = Int(_row_or(row, :attempt, "attempt", 0))
+
     return task
 end
 
@@ -935,6 +970,10 @@ function _create_task_row!(store::PormGWorkerStore, record)
         "completed_at" => record["completed_at"],
         "watchers" => record["watchers"],
         "queue_name" => record["queue_name"],
+        "external" => record["external"],
+        "claimed_by" => record["claimed_by"],
+        "lease_expires_at" => record["lease_expires_at"],
+        "attempt" => record["attempt"],
     )
     return nothing
 end
@@ -958,9 +997,17 @@ function _update_task_row!(store::PormGWorkerStore, task_id::String, record, ful
     # path. `run_id` is excluded for a sharper reason: it is the value
     # `try_transition!` fences on, so a state save that carried it would let whichever
     # run wrote last adopt the record's identity and defeat the fence (#108).
+    #
+    # The claim columns (#514) follow `run_id`, for the same reason: they describe the current
+    # claim, which only the claim operations write, and `replace_task!` publishing a new
+    # submission resets them. `external` is identity of the submission.
     if full_record
         push!(columns, "watchers" => record["watchers"])
         push!(columns, "run_id" => record["run_id"])
+        push!(columns, "external" => record["external"])
+        push!(columns, "claimed_by" => record["claimed_by"])
+        push!(columns, "lease_expires_at" => record["lease_expires_at"])
+        push!(columns, "attempt" => record["attempt"])
     end
     changed = _task_objects(store).filter("id" => task_id).update(columns...)
     return changed isa Integer ? Int(changed) : 0
@@ -1397,10 +1444,13 @@ function _running_ref_from_row(row)
         @warn "PormGWorkerStore: a RUNNING task's started_at does not parse; treating it as unstamped" task_id=id
         nothing
     end
-    return RunningTaskRef((id, run_id, started_at))
+    # A leased run is skipped by the sweep (#514), so this is what keeps it out of the zombie path.
+    claimed_by = _db_optional_string(_row_or(row, :claimed_by, "claimed_by", nothing))
+    return RunningTaskRef((id, run_id, started_at, claimed_by))
 end
 
-# Zombie recovery's scan (#236): a projection of exactly the three columns it reads. No row's
+# Zombie recovery's scan (#236): a projection of exactly the columns it reads -- three, and
+# `claimed_by` since #514. No row's
 # `result` or `watchers` blob is fetched, let alone parsed, and `_from_db_record` is never called.
 # Its full parse, behind what was then `get_all_tasks`'s swallow-into-empty, is what let one
 # malformed row blind the whole sweep. The listing now skips such a row (#267), but a skipped
@@ -1415,7 +1465,7 @@ end
 function list_running_task_refs(store::PormGWorkerStore; after::Union{Nothing, String}=nothing,
                                 limit::Union{Nothing, Int}=nothing)
     _check_page(after, limit)
-    query = () -> _task_objects(store).filter("status" => string(RUNNING)).values("id", "run_id", "started_at")
+    query = () -> _task_objects(store).filter("status" => string(RUNNING)).values("id", "run_id", "started_at", "claimed_by")
     try
         return _keyset_collect!(RunningTaskRef[], query, after, limit) do refs, row
             ref = _running_ref_from_row(row)
@@ -1425,6 +1475,199 @@ function list_running_task_refs(store::PormGWorkerStore; after::Union{Nothing, S
         @warn "PormGWorkerStore: failed to list running tasks" exception=(e, catch_backtrace())
         rethrow()
     end
+end
+
+# -- The claim capability (#514) --
+#
+# Every write below is one statement fenced on the run it read, in the statement's own WHERE --
+# the same shape as `try_transition!`, and for the same reason: `lock_tasks` is process-local, and
+# the processes that claim are, by construction, not this one. A claim mints a fresh `run_id` in
+# the fenced UPDATE that takes the row, so whatever held the previous run fails every fence from
+# then on (#108).
+#
+# The candidate read is ORM, not a hand-written `UPDATE ... RETURNING`: reading a raw RETURNING row
+# needs `Tables`, which Nitro does not depend on; PormG avoids RETURNING on SQLite; and a statement
+# the mock cannot see is a statement no test runs. The cost is a read and an UPDATE instead of one
+# round trip, next to a job heavy enough to need its own process.
+
+# The rows `claim_next!` takes from, oldest first. Its own function so the shape test renders
+# exactly what runs: on PostgreSQL it carries `FOR UPDATE SKIP LOCKED`, so two consumers reading
+# at once take different rows instead of queueing on the head; on SQLite it renders without it,
+# and the transaction's `BEGIN IMMEDIATE` makes the claim exclusive instead. `id` breaks ties
+# between rows submitted within one clock tick, so the order is total.
+_claim_candidates(objects, queue_name::String) =
+    objects.filter("queue_name" => queue_name, "external" => true, "status" => string(PENDING)
+        ).order_by("created_at", "id").select_for_update(skip_locked = true)
+
+# The transaction a claim runs in: on PostgreSQL it holds the `FOR UPDATE` lock from the read to
+# the claiming write. A seam on the model so the test mock -- which has no transactions -- runs the
+# body directly; a production fallback that silently dropped the transaction would be worse.
+_store_transaction(f::Function, model, db_key::String) = PormG.run_in_transaction(f, db_key)
+
+# How many lost races a claim survives before it throws rather than answer "empty". A race is lost
+# only when another claimer took the row between our read and our write, which `SKIP LOCKED`
+# already makes rare on PostgreSQL.
+const _CLAIM_ATTEMPTS = 8
+
+function claim_next!(store::PormGWorkerStore, queue_name::String, consumer_id::String;
+                     lease_seconds::Real, now::DateTime=current_time_utc())
+    _check_claim_queue(queue_name)
+    _check_consumer_id(consumer_id)
+    lease = _lease_period(lease_seconds)
+    lost = 0
+    poisoned = false
+    while lost < _CLAIM_ATTEMPTS
+        # Bound once per iteration, so the closure captures a value, not the reassigned
+        # `poisoned` itself, which would be a `Core.Box` (#364).
+        may_poison = !poisoned
+        outcome = _store_transaction(store.model, store.db_key) do
+            row = _claim_candidates(_task_objects(store), queue_name).first()
+            isnothing(row) && return :empty
+            return _claim_row!(store, row, queue_name, consumer_id, now, now + lease; may_poison)
+        end
+        outcome === :empty && return nothing
+        outcome isa TaskInfo && return outcome
+        # `:lost`, or `:poisoned` -- a head row that did not decode and was failed out of the way.
+        # Only a lost race counts toward the bound: a poisoned row is gone, so it cannot loop. At
+        # most ONE is failed per call, though: see `_claim_row!`.
+        outcome === :poisoned && (poisoned = true)
+        outcome === :lost && (lost += 1)
+    end
+    error("PormGWorkerStore: could not claim from queue '$queue_name' after $(_CLAIM_ATTEMPTS) " *
+          "lost races -- other consumers kept taking the head row between this one's read and " *
+          "its write")
+end
+
+function _claim_row!(store::PormGWorkerStore, row, queue_name::String, consumer_id::String,
+                     now::DateTime, expires::DateTime; may_poison::Bool)
+    task = try
+        _from_db_record(row)
+    catch e
+        is_unrecoverable(e) && rethrow()
+        # A SECOND head row that does not decode, in one call, says the cause is not the rows: a
+        # decode regression, or stored timestamps a new PormG reads differently. Failing every
+        # row in the queue would make that irreversible, so stop and say so instead. The type
+        # only: a decode error may have been about `result`, which is application data.
+        may_poison || error("PormGWorkerStore: a second head row of queue '$queue_name' does not " *
+            "decode ($(typeof(e))); refusing to fail more of the queue, since the cause is " *
+            "probably not the rows themselves")
+        return _fail_undecodable_head!(store, row, now, typeof(e))
+    end
+    run = _successor_run(task)       # the new run: a fresh `run_id`, minted here
+    run.status = RUNNING
+    run.claimed_by = consumer_id
+    run.lease_expires_at = expires
+    run.attempt = task.attempt + 1
+    run.started_at = now
+    # Fenced on the run we READ. `attempt` is written as a literal, not `attempt + 1` in SQL: every
+    # writer of `attempt` also changes `run_id`, so the fence proves the value we read is current.
+    changed = _task_objects(store).filter(
+        "id" => task.id, "run_id" => string(task.run_id), "status" => string(PENDING),
+    ).update(
+        "status" => string(RUNNING),
+        "run_id" => string(run.run_id),
+        "claimed_by" => consumer_id,
+        "lease_expires_at" => expires,
+        "attempt" => run.attempt,
+        "started_at" => now,
+    )
+    return (changed isa Integer && changed >= 1) ? run : :lost
+end
+
+# A head row that does not decode would be the head on every claim, so the queue would never move.
+# It is failed out of the way, fenced on the raw `run_id` it carries (no parse needed to compare),
+# with a value-free error: the decode failure may have been in `result`, which is application data.
+function _fail_undecodable_head!(store::PormGWorkerStore, row, now::DateTime, exception_type::Type)
+    id = something(_row_task_id(row), "")
+    raw_run_id = string(_row_or(row, :run_id, "run_id", ""))
+    @warn "PormGWorkerStore: failing an external task whose stored record does not decode, so its queue can move" task_id=id exception_type
+    changed = _task_objects(store).filter(
+        "id" => id, "run_id" => raw_run_id, "status" => string(PENDING),
+    ).update(
+        "status" => string(FAILED),
+        "error" => "Stored task record does not decode; failed by a consumer's claim",
+        "completed_at" => now,
+    )
+    return (changed isa Integer && changed >= 1) ? :poisoned : :lost
+end
+
+function renew_leases!(store::PormGWorkerStore, consumer_id::String,
+                       runs::AbstractVector{LeaseRenewal};
+                       lease_seconds::Real, now::DateTime=current_time_utc())
+    _check_consumer_id(consumer_id)
+    expires = now + _lease_period(lease_seconds)
+    renewed = UUIDs.UUID[]
+    # One statement per run, so the answer says WHICH runs are still this consumer's -- a batched
+    # UPDATE returns only a count. Addressed by `id`, the primary key: `run_id` is not indexed.
+    for r in runs
+        changed = _task_objects(store).filter(
+            "id" => r.id, "run_id" => string(r.run_id), "status" => string(RUNNING),
+            "claimed_by" => consumer_id,
+        ).update("lease_expires_at" => expires, "progress" => r.progress)
+        changed isa Integer && changed >= 1 && push!(renewed, r.run_id)
+    end
+    return renewed
+end
+
+# The columns that hand a claimed run back to the queue as a new run of the same submission.
+_back_to_pending_columns() = Pair{String, Any}[
+    "status" => string(PENDING),
+    "run_id" => string(UUIDs.uuid4()),
+    "claimed_by" => nothing,
+    "lease_expires_at" => nothing,
+    "started_at" => nothing,
+    "progress" => 0.0,
+]
+
+function release_claim!(store::PormGWorkerStore, task_id::String, run_id::UUIDs.UUID)
+    changed = _task_objects(store).filter(
+        "id" => task_id, "run_id" => string(run_id), "status" => string(RUNNING), "external" => true,
+    ).update(_back_to_pending_columns()...)
+    return changed isa Integer && changed >= 1
+end
+
+# A page of expired leases at a time, by keyset on the id, like retention. No wrapping
+# transaction: each outcome is its own fenced statement, which is what makes it correct, and a
+# transaction would hold every adjudicated row's lock -- and on SQLite the database's write lock --
+# until the whole sweep ended, blocking the very renewals it races with.
+const _EXPIRY_PAGE = 500
+
+function requeue_expired!(store::PormGWorkerStore, now::DateTime;
+                          policies::AbstractDict{String, LeasePolicy})
+    requeued = failed = unknown = lost = 0
+    expired = ("status" => string(RUNNING), "lease_expires_at__@lt" => now)
+    after = nothing
+    while true
+        query = _task_objects(store).filter(expired...).values("id", "run_id", "queue_name", "attempt")
+        rows = _keyset!(query, after, _EXPIRY_PAGE).list()
+        isempty(rows) && break
+        for row in rows
+            id = _row_task_id(row)
+            queue = _db_optional_string(_row_or(row, :queue_name, "queue_name", nothing))
+            attempt = Int(_row_or(row, :attempt, "attempt", 0))
+            policy = _lease_policy(policies, queue)
+            err = _lease_expiry_error(queue, policy, attempt)
+            columns = err === nothing ? _back_to_pending_columns() :
+                Pair{String, Any}["status" => string(FAILED), "error" => err, "completed_at" => now]
+            # The expiry is re-checked in the write's own WHERE, beside the run it read: a renew
+            # that committed since the read moved the lease past `now`, and this row is then not
+            # matched (PostgreSQL re-evaluates a waiting statement's WHERE on the row it finds).
+            changed = _task_objects(store).filter(
+                "id" => id, "run_id" => string(_row_or(row, :run_id, "run_id", "")), expired...,
+            ).update(columns...)
+            if !(changed isa Integer && changed >= 1)
+                lost += 1
+            elseif err === nothing
+                requeued += 1
+            else
+                failed += 1
+                policy === nothing && (unknown += 1)
+            end
+        end
+        length(rows) < _EXPIRY_PAGE && break
+        after = _row_task_id(last(rows))
+    end
+    return _ExpiryTally((requeued, failed, unknown, lost))
 end
 
 function get_queue_authorizer(store::PormGWorkerStore)
@@ -1508,15 +1751,33 @@ Called inside an open Postgres transaction on a pre-#108 table, the failed probe
 transaction, so the `ALTER` then fails with `InFailedSqlTransaction` and that is what surfaces.
 Boot outside a transaction; before #366 this path failed on every boot.
 """
-function _ensure_run_id_column!(conn)
-    _has_column(conn, "nitro_task", "run_id") && return nothing
+_ensure_run_id_column!(conn) = _ensure_column!(conn, "nitro_task", "run_id",
+    "VARCHAR(36) NOT NULL DEFAULT '$(_LEGACY_RUN_ID)'")
+
+# Add `table.column` with `definition` (everything after the column name in `ADD COLUMN`), unless
+# it is already there: probe first, then ALTER, then probe again before rethrowing a failed ALTER.
+# The reasoning for each of the three is on `_ensure_run_id_column!` above, and it is the same for
+# every column a boot adds -- which is why they all go through this.
+function _ensure_column!(conn, table::String, column::String, definition::String)
+    _has_column(conn, table, column) && return nothing
     try
         PormG.ConnectionPool.fetch(conn,
-            "ALTER TABLE \"nitro_task\" ADD COLUMN \"run_id\" VARCHAR(36) NOT NULL DEFAULT '$(_LEGACY_RUN_ID)'")
+            "ALTER TABLE \"$table\" ADD COLUMN \"$column\" $definition")
     catch e
         _interrupted(e) && rethrow()
-        _has_column(conn, "nitro_task", "run_id") || rethrow(e)
+        _has_column(conn, table, column) || rethrow(e)
     end
+    return nothing
+end
+
+# The claim columns (#514), on a table created before them. Each default is what a pre-#514 row
+# means: queued for this process (`external` false), never claimed. `FALSE`, not `0`: PostgreSQL
+# refuses an integer default on a BOOLEAN, and SQLite reads `FALSE` as 0.
+function _ensure_claim_columns!(conn)
+    _ensure_column!(conn, "nitro_task", "external", "BOOLEAN NOT NULL DEFAULT FALSE")
+    _ensure_column!(conn, "nitro_task", "attempt", "INTEGER NOT NULL DEFAULT 0")
+    _ensure_column!(conn, "nitro_task", "claimed_by", "VARCHAR(255)")
+    _ensure_column!(conn, "nitro_task", "lease_expires_at", _datetime_column_type(conn))
     return nothing
 end
 
@@ -1559,8 +1820,10 @@ function _ensure_task_table!(conn, model)
     create_table_sql = PormG.Dialect.create_table(conn, model)
     PormG.ConnectionPool.fetch(conn, create_table_sql)
 
-    # A table created before #108 does not get `run_id` from the statement above.
+    # A table created before #108 does not get `run_id` from the statement above, nor one created
+    # before #514 the claim columns.
     _ensure_run_id_column!(conn)
+    _ensure_claim_columns!(conn)
 
     create_index_sql1 = PormG.Dialect.create_index(
         conn,
@@ -1577,6 +1840,23 @@ function _ensure_task_table!(conn, model)
         ["\"completed_at\""],
     )
     PormG.ConnectionPool.fetch(conn, create_index_sql2)
+
+    # `claim_next!`'s read: equality on the first three, then its ORDER BY (#514). Plain, not
+    # partial: the ORM binds `external` and `status` as parameters, and SQLite cannot use a partial
+    # index whose condition a query meets only through a parameter.
+    PormG.ConnectionPool.fetch(conn, PormG.Dialect.create_index(
+        conn,
+        "\"nitro_task_claim_idx\"",
+        "\"nitro_task\"",
+        ["\"queue_name\"", "\"status\"", "\"external\"", "\"created_at\""],
+    ))
+    # `requeue_expired!`'s scan: RUNNING rows whose lease is past.
+    PormG.ConnectionPool.fetch(conn, PormG.Dialect.create_index(
+        conn,
+        "\"nitro_task_lease_idx\"",
+        "\"nitro_task\"",
+        ["\"status\"", "\"lease_expires_at\""],
+    ))
     return nothing
 end
 

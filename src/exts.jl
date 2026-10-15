@@ -124,12 +124,19 @@ function sync_pormg_env! end
 """
     pormg_nitro_worker(; db_key="db") -> PormGWorkerStore
 
-One-call setup for PormG-backed workers: creates the `nitro_task` table and **two** indexes if
+One-call setup for PormG-backed workers: creates the `nitro_task` table and **four** indexes if
 they do not already exist (`IF NOT EXISTS`), and returns a ready-to-use `PormGWorkerStore`.
 
-Table setup is not purely additive. Bootstrapping also issues an unconditional
-`ALTER TABLE … ADD COLUMN run_id` against a pre-existing table that predates the run-id
-column, and tolerates the error when the column is already there.
+Table setup is not purely additive. On a table created by an older Nitro, bootstrapping adds the
+columns it lacks with `ALTER TABLE … ADD COLUMN`: `run_id` ([#108](https://github.com/PingoLee/Nitro.jl/issues/108))
+and the claim columns `external`, `attempt`, `claimed_by` and `lease_expires_at`
+([#514](https://github.com/PingoLee/Nitro.jl/issues/514)), each with the default an existing row
+means. Each column is probed first and altered only when missing
+([#366](https://github.com/PingoLee/Nitro.jl/issues/366)), so a boot on an up-to-date table runs no
+`ALTER`; on PostgreSQL the boot that adds a column logs one missing-column message (LibPQ's
+`UndefinedColumn` warning) for its probe.
+The two claim indexes are plain `CREATE INDEX` statements, so on a large PostgreSQL table the boot
+that creates them blocks writes to it while they build.
 
 A task's return value is stored as JSON, and may nest at most **512** levels deep, the same
 bound as request JSON (`MAX_JSON_DEPTH`). A deeper result makes the completing write throw an
