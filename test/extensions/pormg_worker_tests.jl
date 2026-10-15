@@ -3231,8 +3231,9 @@ else
             # `.db()` override, so while any transaction was open on the calling task EVERY
             # `nitro_task` query threw `InvalidConfigurationError` -- `submit_task` inside an
             # app's own `run_in_transaction` block, for instance. PormG#838 moved the check onto
-            # the pool the query runs on; the binding is kept, and the half below now pins the
-            # premise the store relies on.
+            # the pool the query runs on, and the half below pins that premise. The binding is
+            # kept for a different reason, pinned below too: `model.objects` resolves by the
+            # model before `.db()` is reached (#532, see `_bind_model!`).
             #
             # Mirrors the session-side guard in `pormg_session_tests.jl`; the two stores had the
             # identical gap and #202 closes both.
@@ -3277,6 +3278,16 @@ else
                 store_b = pormg_nitro_worker(db_key=key)
                 @test store_b.db_key == key
                 @test store_b.model.connect_key == key
+
+                # What the binding is FOR since PormG 0.8 (#532). Every store query starts with
+                # `model.objects`, and PormG's `getproperty` runs `ensure_model_initialized`
+                # there, before `.db()` is reached. Only a bound model takes its fast path; an
+                # unbound one runs the self-heal scan on every query. The unbound result is not
+                # asserted: that path can re-run `set_models` on any loaded package carrying a
+                # `__pormg_init_path__` marker, which no test should set off.
+                @test PormG.Models.ensure_model_initialized(bound) === true
+                @test PormG.Models.ensure_model_initialized(store_b.model) === true
+                @test PormG.Models.ensure_model_initialized(RealPormGWorkerStore(db_key=key).model) === true
             finally
                 delete!(PormG.config, key)
             end

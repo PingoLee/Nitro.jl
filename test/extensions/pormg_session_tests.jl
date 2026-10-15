@@ -112,17 +112,18 @@ _mock_lock(qs::MockQuerySet) = getfield(qs, :mdb).lock
 # The connection this query runs on. `nothing` means the store reached `m.objects` directly
 # instead of routing through `_session_objects(store)`.
 #
-# Erroring here is not the mock inventing a rule PormG does not have -- it is the closest
-# FAITHFUL model of the configuration #199 is about. PormG resolves a query's connection as
-# `q.connect_key !== nothing ? q.connect_key : q.model.connect_key` and, when both are `nothing`,
-# uses the sole loaded connection or throws `InvalidConfigurationError`
-# (`PormG/src/querybuilder/build_helpers.jl`). The ext builds its session model with a bare
-# `PormG.Models.Model("nitro_session", ...)` in `_define_session_model()` and never passes it to
-# `set_models`, so `model.connect_key` IS `nothing` (`PormG/src/Models.jl`). Therefore, with a
-# `db` and a `sessions` connection both loaded, every unrouted session query THROWS -- into
-# `Base.get`'s and `cleanup_expired_sessions!`'s catch blocks, which swallow, and out of
-# `set_session!`/`delete_session!`, which rethrow. Modelling a silent fallback instead would mean
-# inventing a binding the ext does not make.
+# Erroring here is STRICTER than PormG today, deliberately. PormG resolves a query's connection
+# as `q.connect_key !== nothing ? q.connect_key : q.model.connect_key` and, when both are
+# `nothing`, uses the sole loaded connection or throws `InvalidConfigurationError`
+# (`PormG/src/querybuilder/build_helpers.jl`). When #199 was written the ext's session model was
+# never bound, so that throw was the faithful model: with a `db` and a `sessions` connection both
+# loaded, every unrouted session query threw -- into `Base.get`'s and
+# `cleanup_expired_sessions!`'s catch blocks, which swallow, and out of
+# `set_session!`/`delete_session!`, which rethrow. Since #202 a model the STORE builds is bound
+# to `store.db_key` (`_bind_model!`), so real PormG would route an unrouted query there. A
+# `model=` the caller supplies need not be bound, though, and that is the case this mock keeps
+# refusing. The source guard "every `.objects` in the extension is routed through `.db(`" below
+# pins the same rule against the ext itself (#532).
 function _selected_table(qs::MockQuerySet)
     key = getfield(qs, :db_key)
     key === nothing && error("MockSessionQuerySet: query ran without selecting a connection -- " *
@@ -139,11 +140,11 @@ end
 # `filter` is deliberate: this is the filter a query actually RAN with, which is what a test
 # wants to assert about.
 # MUST be called with the database lock held: it reads the shared table and appends to the
-# shared `seen` vector. Appends exactly once per call, and every terminal op calls it exactly
-# once -- `_filters_seen` carries exact-count assertions.
+# shared `seen` vector. Appends exactly once per call whose filter keys validate (none when one
+# is refused), and every terminal op calls it exactly once -- `_filters_seen` carries exact-count
+# assertions.
 function _matching_keys_locked(qs::MockQuerySet)
     filters = getfield(qs, :filters)
-    push!(getfield(qs, :mdb).seen, copy(filters))
 
     # Validate EVERY key BEFORE looking at any row. Checking inside the row loop -- which is
     # where this started -- makes the guard vanish on an empty table, and an empty table is
@@ -152,6 +153,13 @@ function _matching_keys_locked(qs::MockQuerySet)
     for k in keys(filters)
         k in MODELLED_FILTER_KEYS || _reject_filter_key(k)
     end
+
+    # Recorded AFTER validation, so `_filters_seen` holds only filters a query could actually
+    # run with -- otherwise an assertion written against it alone could be satisfied by a query
+    # that threw. The worker mock's `_filtered_rows_locked` records at the same point (#248).
+    # Still BEFORE the connection is resolved, as there: an unrouted query records its filter
+    # and then throws, which the prune-routing testset below accounts for.
+    push!(getfield(qs, :mdb).seen, copy(filters))
 
     # AFTER the filter-key check: a misspelled filter is the more specific diagnosis, and the two
     # `@test_throws` in "the mock refuses a filter it does not model" drive `m.objects` directly.
@@ -732,9 +740,9 @@ end
         @test isempty(m._tables["sessions"])
         @test haskey(m._tables["db"], "stale-elsewhere")
         #   3. the filter carried the operator the sibling testset pins. NOT a proof that a query
-        #      reached a table: `_matching_keys` records `seen` before it resolves the connection,
-        #      so an unrouted prune records one entry and then throws. Nets 1 and 2 are what
-        #      discriminate; this one pins the operator.
+        #      reached a table: `_matching_keys_locked` records `seen` after validating the keys
+        #      but before it resolves the connection, so an unrouted prune records one entry and
+        #      then throws. Nets 1 and 2 are what discriminate; this one pins the operator.
         @test length(m._filters_seen) == 1
         @test collect(keys(m._filters_seen[1])) == ["expires_at__@lte"]
     end
@@ -1041,6 +1049,9 @@ end
 
     @test_throws "missing PormG's `@` operator prefix" s.model.objects.filter("expires_at__lte" => Dates.now(Dates.UTC)).delete()
     @test_throws "unmodelled filter key" s.model.objects.filter("nonsense" => 1).first()
+    # ... and neither refused query left a filter behind: `_filters_seen` holds only filters a
+    # query could actually run with, the rule the worker mock already kept (#248).
+    @test isempty(s.model._filters_seen)
 
     # And PormG's unfiltered-mutation guards -- including the one escape hatch, so the guard is
     # pinned as a guard rather than as "delete never works without a filter".
@@ -1068,7 +1079,9 @@ end
     # transaction was open on the calling task an unbound model threw for EVERY query --
     # swallowed by `Base.get` (a live session silently read as absent) and rethrown by
     # `set_session!`/`delete_session!`. PormG#838 moved the check onto the pool the query runs
-    # on; the binding is kept, and the half below now pins the premise the store relies on.
+    # on, and the half below pins that premise. The binding is kept for a different reason,
+    # pinned below too: `model.objects` resolves by the model before `.db()` is reached (#532,
+    # see `_bind_model!`).
     @test getproperty(PormGExt, :session_model)().connect_key == "db"
     @test getproperty(PormGExt, :session_model)("sessions").connect_key == "sessions"
 
@@ -1107,6 +1120,26 @@ end
             # in autocommit outside the caller's rollback -- the error the docs promise.
             @test_throws PormG.TransactionError check(bound, conn)
         end
+
+        # What the binding is FOR since PormG 0.8 (#532). Every store query starts with
+        # `model.objects`, and PormG's `getproperty` runs `ensure_model_initialized` there,
+        # before `.db()` is reached. Only a bound model takes its fast path; an unbound one runs
+        # the self-heal scan on every query. The unbound result is not asserted: that path can
+        # re-run `set_models` on any loaded package carrying a `__pormg_init_path__` marker,
+        # which no test should set off.
+        @test PormG.Models.ensure_model_initialized(bound) === true
+        @test PormG.Models.ensure_model_initialized(RealPormGSessionStore(db_key=key).model) === true
+
+        # ... and the hook that makes the binding matter is still there, read off PormG's own
+        # lowered `getproperty` rather than by running it, so nothing self-heals. If a PormG bump
+        # drops it, this goes red, and `_bind_model!`'s docstring must be re-justified or the
+        # binding removed -- which is exactly what #532 asked about.
+        objects_getproperty = only(code_lowered(Base.getproperty, (typeof(bound), Symbol)))
+        @test any(objects_getproperty.code) do stmt
+            stmt isa Expr && stmt.head === :call &&
+                any(a -> a == QuoteNode(:ensure_model_initialized) || a === :ensure_model_initialized,
+                    stmt.args)
+        end
     finally
         delete!(PormG.config, key)
     end
@@ -1120,6 +1153,37 @@ end
     # `PormG.config` entry, so no fixture is needed.
     @test RealPormGSessionStore(db_key="sessions").model.connect_key == "sessions"
     @test RealPormGSessionStore().model.connect_key == "db"
+end
+
+@testset "every `.objects` in the extension is routed through `.db(` (#532)" begin
+    # A source assertion, because the property is "no query in this file escapes `.db(key)`"
+    # rather than "this store method behaves thus". `.db()` is what routes a query to
+    # `store.db_key` (#199), and since PormG 0.8 it is also the key the transaction-scope check
+    # reads. A store method that drops it would still route on the model the store BUILT, which
+    # is bound -- but not on a `model=` the caller supplied, which need not be, and the mocks
+    # in this file and `pormg_worker_tests.jl` cannot tell the two apart.
+    #
+    # Walked as SYNTAX, not text: comments and docstrings both describe `model.objects` in prose,
+    # and in the parsed tree a comment is gone and a docstring is a plain string, so neither
+    # can be mistaken for a call -- and no line-based stripping can hide one either.
+    src = read(joinpath(pkgdir(Nitro), "ext", "NitroPormGExt.jl"), String)
+    is_objects(x) = x isa Expr && x.head === :. && length(x.args) == 2 &&
+                    x.args[2] == QuoteNode(:objects)
+    uses = Expr[]     # every `<x>.objects`
+    routed = Expr[]   # the ones that are the receiver of a `.db(...)` call
+    function walk(x)
+        x isa Expr || return
+        is_objects(x) && push!(uses, x)
+        if x.head === :call && x.args[1] isa Expr && x.args[1].head === :. &&
+           x.args[1].args[2] == QuoteNode(:db) && is_objects(x.args[1].args[1])
+            push!(routed, x.args[1].args[1])
+        end
+        foreach(walk, x.args)
+    end
+    walk(Meta.parseall(src))
+    # Not vacuous: at least the two accessors, `_session_objects` and `_task_objects`, are seen.
+    @test length(uses) >= 2
+    @test all(u -> any(r -> r === u, routed), uses)
 end
 
 @testset "pormg_nitro_session hands its db_key to the store it returns (#199)" begin
