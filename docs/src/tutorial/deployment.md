@@ -38,14 +38,14 @@ request until it returns. The startup banner prints what you got, along with the
 covered in [Memory and GC](@ref) below — check it on the target machine, not on your laptop:
 
 ```
- Nitro <version>  (parallel mode: 8 threads + 1 interactive, GC target 2.8 GiB)
+ Nitro <version>  (8 threads + 1 interactive, GC target 2.8 GiB)
 ```
 
 The thread count is the default pool, where handlers run. Julia 1.12 also starts one
 *interactive* thread, in a pool of its own: `--threads=8` means 8 default threads **and** 1
 interactive one. HTTP.jl runs its accept loop and every connection's task there, reading each
-request's head before handing it on. With the default `parallel = true`, Nitro starts every
-request on its own task in the default pool, so no handler runs on the interactive thread.
+request's head before handing it on. Nitro then starts every request on its own task in the
+default pool, so no handler runs on the interactive thread.
 
 A process with no GC target prints `GC target: none`. When the environment is `prod`
 (`NITRO_ENV=prod`), `serve` also logs a warning about it at startup, even with
@@ -60,22 +60,20 @@ Leave `--gcthreads` at that default on a host of its own: Julia's collector stop
 while it marks the heap, so the more threads share the marking, the shorter that pause. Lower it
 only when the CPUs it would use belong to something else.
 
-### Do not turn off `parallel`
+### Every request gets its own task
 
-`serve(parallel = false)` skips the per-request task: each handler runs on its connection's task,
-on the interactive thread. The whole server then handles requests on the interactive pool alone
-(**one** thread unless `--threads=N,M` raised it), however many default threads `--threads` gave
-it.
-Go can serve a connection's requests on that connection's goroutine and still use every core,
-because goroutines run on all of them; HTTP.jl's connection tasks run only on the interactive
-pool, so in Julia the per-request task is what reaches the other threads. When the process has
-more than one default thread and an interactive one, `serve(parallel = false)` logs a warning
-saying so.
+The per-request task is not optional: `serve` has no keyword to turn it off. Go can serve a
+connection's requests on that connection's goroutine and still use every core, because goroutines
+run on all of them; HTTP.jl's connection tasks run only on the interactive pool, so in Julia the
+per-request task is what reaches the other threads. Without it the whole server would handle
+requests on the interactive pool alone (**one** thread unless `--threads=N,M` raised it), however
+many default threads `--threads` gave it.
 
-With no interactive pool (`--threads=N,0`, below) nothing is stranded, because the connection
-tasks already run on every default thread, and `serve` does not warn. Keep `parallel` on there
-too: on the machine measured below, `parallel = false` at `--threads=8,0` served 4–9% fewer
-requests per second, with a higher p99.
+It pays with no interactive pool (`--threads=N,0`, below) too, where the connection tasks already
+run on every default thread: on the machine measured below, skipping it at `--threads=8,0` served
+4–9% fewer requests per second, with a higher p99.
+
+If your handlers are not thread-safe, say so for the whole process: start it with `--threads=1`.
 
 ### The interactive thread
 

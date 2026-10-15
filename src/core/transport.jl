@@ -1190,11 +1190,11 @@ end
 # that connection's one goroutine and still scales, because goroutines run on every thread. HTTP.jl
 # 2.x runs every connection task on Julia's `:interactive` pool, and `julia -t 8` gives that pool
 # ONE thread, so a handler left on the connection task is serialized onto it whatever `-t` says.
-# That is what `serve(parallel = false)` does, and why `serve` warns about it on a multi-threaded
-# process (`_warn_if_serial_on_threads`). Measured on one
-# box (`-t 8`, server and `oha -c 50` on disjoint pinned cores, `/plaintext`, medians): bare
-# HTTP.jl `listen!` + `streamhandler` does ~33k rps with no spawn and ~72k with one per request;
-# `serve(parallel = false)` does ~26k. Keep it. The other half of the same lesson is in
+# Measured on one box (`-t 8`, server and `oha -c 50` on disjoint pinned cores, `/plaintext`,
+# medians): bare HTTP.jl `listen!` + `streamhandler` does ~33k rps with no spawn and ~72k with one
+# per request; Nitro without the spawn did ~26k. With no interactive pool (`-t 8,0`) the connection
+# tasks already spread over every thread, and the spawn still measured 4-9% faster (#492). So it is
+# unconditional: `serve` has no `parallel` keyword to turn it off (#525). Keep it. The other half of the same lesson is in
 # `stream_handler`: the response write has to happen on this task too (#453).
 #
 # One genuine semantic difference, since "pure overhead" undersells it: `@async`

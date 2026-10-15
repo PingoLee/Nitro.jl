@@ -277,7 +277,7 @@ end
     output = mktemp() do path, io
         redirect_stdout(io) do
             withenv("NITRO_ENV" => "dev", "GENIE_ENV" => nothing) do
-                serverwelcome("http://127.0.0.1:8080", nothing, false)
+                serverwelcome("http://127.0.0.1:8080", nothing)
             end
         end
         flush(io)
@@ -290,7 +290,7 @@ end
     output_env_unset = mktemp() do path, io
         redirect_stdout(io) do
             withenv("NITRO_ENV" => nothing, "GENIE_ENV" => nothing) do
-                serverwelcome("http://127.0.0.1:8080", "/api", true)
+                serverwelcome("http://127.0.0.1:8080", "/api")
             end
         end
         flush(io)
@@ -299,13 +299,13 @@ end
 
     @test occursin("Environment: dev", output_env_unset)   # the DEFAULT is announced too
     @test occursin("Global prefix: /api", output_env_unset)
-    @test occursin("parallel mode:", output_env_unset)
+    @test occursin(" ($(Threads.nthreads(:default)) thread", output_env_unset)
 
     # A non-default value is reported as itself, and the GENIE_ENV fallback reaches the banner.
     output_prod = mktemp() do path, io
         redirect_stdout(io) do
             withenv("NITRO_ENV" => nothing, "GENIE_ENV" => "prod") do
-                serverwelcome("http://127.0.0.1:8080", nothing, false)
+                serverwelcome("http://127.0.0.1:8080", nothing)
             end
         end
         flush(io)
@@ -325,7 +325,7 @@ end
             # Pin BOTH, per the block above: `serverwelcome` resolves the environment, and a
             # block pinning only `NITRO_ENV` fails on any machine that exports `GENIE_ENV`.
             withenv("NITRO_ENV" => "dev", "GENIE_ENV" => nothing) do
-                serverwelcome("http://127.0.0.1:8080", nothing, false)
+                serverwelcome("http://127.0.0.1:8080", nothing)
             end
         end
         flush(io)
@@ -341,10 +341,10 @@ end
 # #299: the banner reports the GC target and the thread pools, and never guesses. The target is
 # injected so each shape is deterministic; the live read has its own smoke test below.
 @testset "serverwelcome banner reports the GC target and thread pools" begin
-    banner(parallel; gc_target) = mktemp() do path, io
+    banner(; gc_target) = mktemp() do path, io
         redirect_stdout(io) do
             withenv("NITRO_ENV" => "dev", "GENIE_ENV" => nothing) do
-                serverwelcome("http://127.0.0.1:8080", nothing, parallel; gc_target)
+                serverwelcome("http://127.0.0.1:8080", nothing; gc_target)
             end
         end
         flush(io)
@@ -352,31 +352,27 @@ end
     end
 
     # A hint of 1G, as Julia 1.12 reports it (the hint minus its 250 MiB reserve).
-    with_target = banner(true; gc_target = UInt64(811597824))
+    with_target = banner(; gc_target = UInt64(811597824))
     @test occursin("GC target 774.0 MiB", with_target)
-    @test occursin("parallel mode: $(Threads.nthreads(:default)) thread", with_target)
+    @test occursin(" ($(Threads.nthreads(:default)) thread", with_target)
     if Threads.nthreads(:interactive) > 0
         @test occursin("+ $(Threads.nthreads(:interactive)) interactive", with_target)
     else
         @test !occursin("interactive", with_target)
     end
-    @test occursin("GC target 2.8 GiB", banner(true; gc_target = UInt64(3) * 2^30 - UInt64(250) * 2^20))
+    @test occursin("GC target 2.8 GiB", banner(; gc_target = UInt64(3) * 2^30 - UInt64(250) * 2^20))
 
     # Julia's "unset" value is reported as none, never as a 2 PiB limit.
-    none = banner(true; gc_target = UInt64(2)^51)
+    none = banner(; gc_target = UInt64(2)^51)
     @test occursin("GC target: none", none)
     @test !occursin("PiB", none)
 
     # The runtime would not say: no field at all, rather than a guess.
-    unknown = banner(true; gc_target = nothing)
+    unknown = banner(; gc_target = nothing)
     @test !occursin("GC target", unknown)
-    @test occursin("parallel mode:", unknown)
-
-    # Outside parallel mode the GC field still prints, on its own.
-    serial = banner(false; gc_target = UInt64(811597824))
-    @test occursin(" (GC target 774.0 MiB)", serial)
-    @test !occursin("parallel mode", serial)
-    @test !occursin("(", banner(false; gc_target = nothing))
+    @test occursin(" ($(Threads.nthreads(:default)) thread", unknown)
+    # There is no serial mode to describe any more (#525), so the label is gone too.
+    @test !occursin("parallel mode", unknown)
 end
 
 @testset "a prod process with no GC target warns once at startup, and nothing else does (#299)" begin
@@ -389,21 +385,6 @@ end
     @test_logs min_level = Base.CoreLogging.Debug warn_fn("test", unset)
     @test_logs min_level = Base.CoreLogging.Debug warn_fn("prod", UInt64(811597824))
     @test_logs min_level = Base.CoreLogging.Debug warn_fn("prod", nothing)
-end
-
-@testset "parallel = false warns only when it strands default threads (#454)" begin
-    warn_fn = Nitro.Core._warn_if_serial_on_threads
-    @test_logs (:warn, r"parallel = false.*\(1 thread\).*8 default threads") warn_fn(false, 8, 1)
-    @test_logs (:warn, r"\(2 threads\)") warn_fn(false, 8, 2)
-    @test_logs (:warn, r"parallel = false") warn_fn(false, 2, 1)
-    # The default, and one thread either way, are silent: a single thread is a valid
-    # deployment (#149), and with one default thread `parallel = false` strands nothing.
-    @test_logs min_level = Base.CoreLogging.Debug warn_fn(true, 8, 1)
-    @test_logs min_level = Base.CoreLogging.Debug warn_fn(true, 1, 1)
-    @test_logs min_level = Base.CoreLogging.Debug warn_fn(false, 1, 1)
-    # No interactive thread (`-t 8,0`): HTTP.jl's interactive spawn falls back to the default
-    # pool, connection tasks already run on every thread, and a warning would be false.
-    @test_logs min_level = Base.CoreLogging.Debug warn_fn(false, 8, 0)
 end
 
 @testset "the GC target is read from the running process (#299)" begin

@@ -25,17 +25,14 @@ lives in the code comment it names, and that comment is canonical.
   reasoning sits at its #39 comment in `src/core/transport.jl`.
 - **With no interactive thread (`-t N,0`) the connection tasks run on `:default`**, spread over
   every thread. The spawn is still a win there: skipping it measured 4–9% slower (#492), so keep
-  it in every layout. Do not make `parallel` depend on the thread layout. Thread 1 is then a
+  it in every layout. It is unconditional, and `serve` has no keyword to skip it (#525): do not
+  add one, and do not make the spawn depend on the thread layout. Thread 1 is then a
   default thread, so a REPL Ctrl-C can land in a handler or a background loop: everything that
   "never gets a press under the default layout" (#369) can get one at `N,0`, as under `-t 1`.
 - **The interactive thread protects accepting and reading heads, not handlers.** A handler runs on
   `:default` in every layout, so a CPU-bound handler or Workers job delays other requests just as
   much at `N,1` as at `N,0` (#491). Do not cite the interactive pool as protection from
   CPU-bound handlers or jobs.
-- **`serve(parallel = false)` strands the default threads**: every handler then runs on the
-  interactive thread. `_warn_if_serial_on_threads` (`src/core/lifecycle.jl`) warns when that
-  happens. Do not weaken or remove the warning; its comment says which thread layouts stay
-  silent and why (#454).
 - **The interactive thread is the scarcest resource in the process.** Add nothing to the
   connection task before the spawn. Since HTTP.jl 2.9, Nitro does no work there: the
   header-deadline clear it used to run (#316) moved into HTTP.jl (JuliaWeb/HTTP.jl#1382).

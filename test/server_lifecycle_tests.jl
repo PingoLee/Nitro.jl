@@ -324,14 +324,11 @@ end
     end
     mentions(logs, pat) = any(r -> occursin(pat, string(r.message)), logs)
 
-    for kw in ((; queuesize = 100), (; queuesize = 100, parallel = false))
-        logs = serve_logs(; kw...)
-        # `queuesize` is dropped whatever `parallel` is, so the warning is unconditional.
-        @test any(r -> r.level == Base.CoreLogging.Warn &&
-                       occursin("queuesize", string(r.message)) &&
-                       occursin("serve()", string(r.message)), logs)
-        @test !mentions(logs, "serveparallel")
-    end
+    logs = serve_logs(; queuesize = 100)
+    @test any(r -> r.level == Base.CoreLogging.Warn &&
+                   occursin("queuesize", string(r.message)) &&
+                   occursin("serve()", string(r.message)), logs)
+    @test !mentions(logs, "serveparallel")
 
     # One thread is a valid deployment: nothing warns about it, on any thread count.
     logs = serve_logs()
@@ -364,23 +361,27 @@ end
     @test isempty(gc_warnings("dev"))
 end
 
-@testset "serve(parallel = false) warns once when the process has threads it cannot reach (#454)" begin
-    # The helper is unit-tested in test/util_tests.jl; this pins the CALL SITE and that it reads
-    # the default pool. CI runs this file at 1 and 2 threads, so both sides are exercised.
-    function serial_warnings(; kw...)
-        ctx = Nitro.Core.App()
-        logger = Test.TestLogger(min_level = Base.CoreLogging.Warn)
-        try
-            Base.CoreLogging.with_logger(() -> _serve(ctx, get_free_port(); kw...), logger)
-        finally
-            Nitro.Core.terminate(ctx)
+@testset "serve() has no `parallel` keyword: passing one is refused, and binds nothing (#525)" begin
+    # The per-request spawn is unconditional. No shim: the keyword falls through to HTTP.jl's
+    # `listen!`, whose MethodError names it -- the string the upgrading/ entry tells apps to grep.
+    ctx = Nitro.Core.App()
+    port = get_free_port()
+    try
+        err = try
+            _serve(ctx, port; parallel = false)
+            nothing
+        catch e
+            e
         end
-        return filter(r -> occursin("parallel = false", string(r.message)), logger.logs)
+        @test err isa MethodError
+        @test occursin("\"parallel\"", sprint(showerror, err))
+        @test ctx.service.server[] === nothing
+        # The port is free again: a refused call leaves no listener behind.
+        srv = _serve(ctx, port)
+        @test ctx.service.server[] === srv
+    finally
+        Nitro.Core.terminate(ctx)
     end
-
-    stranded = Threads.nthreads(:default) > 1 && Threads.nthreads(:interactive) > 0
-    @test length(serial_warnings(; parallel = false)) == (stranded ? 1 : 0)
-    @test isempty(serial_warnings())
 end
 
 # ── Default server timeouts (#316) ──────────────────────────────────────────────────────────────
