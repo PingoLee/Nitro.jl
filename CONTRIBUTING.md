@@ -53,10 +53,11 @@ the trade-off when you propose a design.
 [`LICENSE.md`](LICENSE.md)); a sibling `../Oxygen.jl` checkout is often present locally.
 Capabilities were removed **on purpose**: macro and function route registrars, cron, repeat tasks,
 metrics, and autodoc. Finding one of them in Oxygen — or in a Stack Overflow answer about Oxygen — is
-**not** a reason to reintroduce it; check nitro-core §1–§3 first. `serveparallel()` is the one
-survivor: it still exists in `src/methods.jl` as a deprecated shim that just forwards to `serve()`.
-Never use or suggest it — and note that under the pre-publish posture below, a shim like this is a
-candidate for deletion, not preservation.
+**not** a reason to reintroduce it; check nitro-core §1–§3 first. `serveparallel()` was the last
+survivor, kept for a while as a deprecated shim that forwarded to `serve()`; it was deleted in
+[#579](https://github.com/PingoLee/Nitro.jl/issues/579) once `serve()` lost its `parallel` keyword
+(#525). Never use, suggest or restore it — under the pre-publish posture below, a shim like that is
+a candidate for deletion, not preservation.
 `test/original_tests.jl` is the retained upstream integration suite and is why some tests read in an
 older style than the rest of `test/`.
 
@@ -188,8 +189,7 @@ abstract type, a constant, an exception type — belongs in `src/types.jl`, `src
 bind to the process-wide `CONTEXT[]` singleton declared in `src/Nitro.jl`. Every one of them also
 has an `(app::App, …)` method defined **in that same file** — reach for that form in tests and in
 any code that must not touch the global. The exceptions are `resetstate` (singleton-shaped by
-definition) and `route` (plumbing, not public API). `serveparallel` has none either, but it is a
-deprecated shim awaiting deletion, not a principled exception.
+definition) and `route` (plumbing, not public API).
 
 That placement is load-bearing, not incidental: `methods.jl` defines these names inside `Nitro`, so
 they **shadow** the same-named functions `using .Core` brings in. An `(app, …)` method added only in
