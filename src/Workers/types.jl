@@ -174,7 +174,7 @@ function owner_of(task_id::AbstractString)
 end
 
 """
-    TaskInfo(id; queue_name=nothing)
+    TaskInfo(id; queue_name=nothing, external=false)
 
 One task record — and, crucially, **one run of it**.
 
@@ -187,12 +187,26 @@ that replaced it ([#108](https://github.com/PingoLee/Nitro.jl/issues/108)).
 So the invariant is: **one `TaskInfo` object is one run.** A re-run constructs a new object; it is
 never a mutation of the old one. Everything that identifies a run — `run_id` today — may therefore
 be set exactly once, in this constructor, and read freely without synchronisation.
+
+A run is published in two ways, and both go through this constructor. A **new submission** is
+published by [`replace_task!`](@ref). A **new run of the same submission** is published by the
+claim operations ([`claim_next!`](@ref), [`release_claim!`](@ref), [`requeue_expired!`](@ref),
+[#514](https://github.com/PingoLee/Nitro.jl/issues/514)): a store that keeps objects installs a new
+one, and a serializing store writes a fresh `run_id` in the same fenced statement. Neither ever
+assigns `run_id` on an object a caller may already hold — that would hand a stale holder the
+current run's identity, and every fence it then reaches would pass.
+
+`external` is identity too: whether the submission was queued for a consumer process rather than
+for this one, written once at submit. `claimed_by`, `lease_expires_at` and `attempt` describe the
+current claim on an external submission and are written only by the claim operations;
+`replace_task!` resets them, since a new submission has never been claimed.
 """
 mutable struct TaskInfo
     id::String
-    # Identity of this run, not state of the task. Written only by `replace_task!`, never by
-    # `set_task!` — the same split that protects `watchers`, and for the same reason: a value
-    # carried along on every state transition is a value that gets clobbered.
+    # Identity of this run, not state of the task. Minted only by this constructor, and published
+    # by `replace_task!` or a claim operation (see the docstring) — never written by `set_task!` or
+    # `try_transition!`, which is the same split that protects `watchers`, for the same reason: a
+    # value carried along on every state transition is a value that gets clobbered.
     #
     # `uuid4()`, deliberately NOT `Crypto.secure_uuid4()`. A run id is an internal correlation
     # value: it is never returned to a caller and is never a capability, so guessing one buys
@@ -209,6 +223,13 @@ mutable struct TaskInfo
     completed_at::Union{Nothing, DateTime}
     watchers::Vector{String}
     queue_name::Union{Nothing, String}
+    # The claim fields (#514). `external` is fixed at submit; the other three belong to the
+    # current claim and, like `run_id`, are written only by the store's claim operations, so
+    # `set_task!` never carries them. All four are inert on a submission this process runs itself.
+    external::Bool
+    claimed_by::Union{Nothing, String}
+    lease_expires_at::Union{Nothing, DateTime}
+    attempt::Int
     # The cancellation token, and the CAUSE of the cancellation in one field. Process-local and
     # NOT persisted: it is a request aimed at a callback running *here*, and the durable `status`
     # is what carries a cancellation between processes. Read it with `cancel_requested` /
@@ -227,7 +248,7 @@ mutable struct TaskInfo
     # which is the #88 clobber with the sign flipped.
     @atomic cancel_reason::Symbol
 
-    function TaskInfo(id::String; queue_name::Union{Nothing, String}=nothing)
+    function TaskInfo(id::String; queue_name::Union{Nothing, String}=nothing, external::Bool=false)
         created_at = current_time_utc()
         return new(
             id,
@@ -241,10 +262,66 @@ mutable struct TaskInfo
             nothing,
             String[],
             queue_name,
+            external,
+            nothing,
+            nothing,
+            0,
             :none,
         )
     end
 end
+
+# A new run of the same submission (#514): what a claim, a hand-back or a lease requeue publishes.
+# A NEW object, so a holder of the previous run's object keeps the previous `run_id` and loses
+# every fence from here on -- the #108 rule, for a store whose records are the objects. Identity of
+# the submission (`id`, `created_at`, `queue_name`, `external`) is carried; the watcher list is
+# copied, never shared, because `add_watcher!` swaps it copy-on-write and a shared vector would
+# make two records' grants one. The claim and run state are the caller's to set.
+function _successor_run(t::TaskInfo)
+    s = TaskInfo(t.id; queue_name = t.queue_name, external = t.external)
+    s.created_at = t.created_at
+    s.watchers = copy(t.watchers)
+    s.status = t.status
+    @atomic s.progress = t.progress
+    s.result = t.result
+    s.error = t.error
+    s.started_at = t.started_at
+    s.completed_at = t.completed_at
+    s.claimed_by = t.claimed_by
+    s.lease_expires_at = t.lease_expires_at
+    s.attempt = t.attempt
+    return s
+end
+
+"""
+    LeasePolicy(on_expiry::Symbol; max_attempts::Int = 3)
+
+What [`requeue_expired!`](@ref) does with a run on an external queue whose lease expired
+([#514](https://github.com/PingoLee/Nitro.jl/issues/514)).
+
+- `:requeue` puts the run back to `PENDING` under a fresh `run_id`, while its `attempt` count is
+  below `max_attempts`, and records it `FAILED` once it reaches the bound. That makes delivery
+  **at-least-once**: the job must be idempotent.
+- `:fail` records it `FAILED` on the first expiry; `max_attempts` does not apply.
+
+There is no default `on_expiry`. Whether a lost run may run again depends on whether the job is
+idempotent, which only the application knows, and a default of `:requeue` would let an email or a
+charge repeat silently.
+"""
+struct LeasePolicy
+    on_expiry::Symbol
+    max_attempts::Int
+
+    function LeasePolicy(on_expiry::Symbol, max_attempts::Int)
+        on_expiry in (:requeue, :fail) || throw(ArgumentError(
+            "`on_expiry` must be :requeue or :fail, got :$on_expiry"))
+        max_attempts >= 1 || throw(ArgumentError(
+            "`max_attempts` must be at least 1, got $max_attempts"))
+        return new(on_expiry, max_attempts)
+    end
+end
+
+LeasePolicy(on_expiry::Symbol; max_attempts::Int = 3) = LeasePolicy(on_expiry, max_attempts)
 
 # Authority comes from the id; `watchers` is a list of ADDITIONAL grants layered on top
 # of it. For a `:global` id `owner_of` is `nothing`, so the first disjunct is always
@@ -326,6 +403,23 @@ function _cancel_message(reason::Symbol)
     reason === :superseded && return "Cancelled by a re-run of this task key"
     reason === :shutdown && return "Cancelled by worker shutdown"
     return "Cancelled"
+end
+
+# The inverse, for a record read back from the store: which cause cancelled it (#514). A
+# consumer process reads it to tell "a person cancelled this run" from "it was taken back", and
+# that cause is not stored anywhere else -- the token above is process-local.
+#
+# Exact, because `_cancel_message` is the ONLY renderer of a CANCELLED record's `error`: every
+# write that claims CANCELLED passes its text straight through (`cancel_task`, `_cancel_task!`,
+# `_abandon_queued_item!`), and the error redactor and truncation reach only the FAILED path
+# (`_store_error_text`). A text it does not recognise -- `nothing`, or a record written before
+# #183 -- answers `:none`.
+function _cancel_reason_from_error(err::Union{Nothing, AbstractString})
+    err === nothing && return :none
+    for reason in CANCEL_REASONS
+        err == _cancel_message(reason) && return reason
+    end
+    return :none
 end
 
 """

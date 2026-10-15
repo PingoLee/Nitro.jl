@@ -78,7 +78,7 @@ It logs twice at `@info` ([#238](https://github.com/PingoLee/Nitro.jl/issues/238
 `"Nitro.Workers: scanning for zombie tasks"` goes out before it takes the lock, and
 `"Nitro.Workers: zombie recovery complete"` goes out when it finishes, **always**, including when
 it recovered nothing. The completion line carries `candidates`, `recovered`, `spared_live`,
-`too_recent` and `lost_race`. If a read fails, an `@error` with the same counts replaces the
+`too_recent`, `lost_race` and `leased`. If a read fails, an `@error` with the same counts replaces the
 completion line, and the sweep returns what it had recovered so far. A write that throws is
 logged the same way and then rethrown. Every field is a count; no task's `result` or `error` is
 ever logged.
@@ -103,6 +103,12 @@ tasks that are still executing. The window is narrower, not gone — handles nev
 a restart that builds a **new** `WorkerRuntime` over the same store still sees the previous
 runtime's abandoned runs as dead. That is also what makes a genuine process crash recoverable, and
 why this stays process-local rather than trying to be authoritative.
+
+**A leased run is never this sweep's** ([#514](https://github.com/PingoLee/Nitro.jl/issues/514)).
+A run a consumer process claimed has no handle in any process but that consumer's, so the
+criterion above would fail every run a consumer is executing. Its liveness is its lease instead,
+and [`requeue_expired!`](@ref) adjudicates it once the lease expires. The sweep reads `claimed_by`
+off each ref, skips those runs, and counts them as `leased`.
 """
 function recover_zombie_tasks!(; runtime::WorkerRuntime=default_runtime(),
                                zombie_min_age::Union{Nothing, Dates.Period}=nothing,
@@ -188,12 +194,16 @@ mutable struct _ZombieTally
     spared_live::Int    # this process holds a live handle for the run
     too_recent::Int     # claimed inside `zombie_min_age` (#239): left for a later sweep, not absent
     lost_race::Int      # the fenced transition was refused: it finished, or was re-run, meanwhile
+    leased::Int         # a consumer process holds it under a lease (#514): `requeue_expired!`'s call
 end
-_ZombieTally() = _ZombieTally(0, 0, 0, 0, 0)
+_ZombieTally() = _ZombieTally(0, 0, 0, 0, 0, 0)
 
 _tally_kwargs(t::_ZombieTally) = (candidates=t.candidates, recovered=t.recovered,
                                   spared_live=t.spared_live, too_recent=t.too_recent,
-                                  lost_race=t.lost_race)
+                                  lost_race=t.lost_race, leased=t.leased)
+
+# A ref built before `claimed_by` existed has no such field; it describes an unleased run.
+_ref_claimed_by(ref) = hasproperty(ref, :claimed_by) ? ref.claimed_by : nothing
 
 _check_zombie_min_age(age) =
     age === nothing || age >= zero(age) ||
@@ -205,6 +215,15 @@ function _recover_zombie_page!(tally::_ZombieTally, runtime::WorkerRuntime, page
                                cutoff::Union{Nothing, DateTime})
     for task in page
         tally.candidates += 1
+        # A run a consumer process holds under a lease (#514). Its liveness is the lease, not a
+        # handle in THIS process, so the criterion below would call every such run dead -- in the
+        # web process, every run a consumer is executing. `requeue_expired!` adjudicates it
+        # instead, once the lease has actually expired. First, so it is never counted as anything
+        # else; and still counted, so the log says how many runs were someone else's.
+        if _ref_claimed_by(task) !== nothing
+            tally.leased += 1
+            continue
+        end
         # Too recent to call dead: see `zombie_min_age`. Checked in Julia over the projected
         # `started_at` rather than in SQL, so a row it excludes is still SEEN, and the sweep can
         # say how many it left for later.
@@ -1071,94 +1090,125 @@ one, with `:status => "NOT_FOUND"` ([#323](https://github.com/PingoLee/Nitro.jl/
 """
 function cancel_task(task_id::AbstractString, authority::TaskAuthority; runtime::WorkerRuntime=default_runtime())
     return lock_tasks(runtime) do
-        # The record served here is the one the fenced claim below addresses: when a live
-        # predecessor and a durable successor disagree, `_visible_record` hands back the run the
-        # caller is authorized on, so the claim can never cancel a run on another run's grant.
-        task_info = _visible_record(runtime, authority, String(task_id))
-        task_info === nothing && return _not_found()
-
-        if task_info.status in (COMPLETED, FAILED, CANCELLED)
-            return Dict{Symbol, Any}(:error => "Task already finished with status $(task_info.status)")
+        # Several rounds, only for an EXTERNAL submission a consumer process claimed, released or
+        # requeued between this read and the claim below (#514). Each of those publishes a new
+        # run of the same submission under a fresh `run_id`, so the fenced claim loses -- and the
+        # cancel the caller asked for would be lost with it, answered as a re-submit it was not.
+        # Every round starts again from `_visible_record`, so it re-authorizes against the record
+        # it is about to cancel. `lock_tasks` already orders every in-process writer of `run_id`
+        # against this, so for a submission this process runs itself there is only ever one round.
+        for _ in 1:_CANCEL_CLAIM_ROUNDS
+            outcome = _cancel_once(runtime, authority, String(task_id))
+            outcome === nothing || return outcome
         end
-
-        # Claim the transition *before* interrupting anything. The status precondition
-        # and the write are one atomic step in the store, so a task finishing
-        # concurrently — in this process or another one sharing the database — either
-        # loses the race and stays cancelled, or wins it and we report the truth.
-        # Doing this with a read, a decision, and a full-record save under `lock_tasks`
-        # was #88: that lock does not span processes.
-        # Fencing this on `run_id` is an AUTHORIZATION fix, not merely bookkeeping.
-        # `_visible_record` above decided against the watcher list of the run we read,
-        # and re-running a finished key RESETS that list (`replace_task!`). Cancelling the
-        # successor on the predecessor's grant would be an authorization the app never issued
-        # — reachable across processes, since `lock_tasks` is process-local for a
-        # database-backed store (#108).
-        cancelled_at = current_time_utc()
-        claimed = try_transition!(runtime.store, task_info.id, (PENDING, RUNNING), CANCELLED;
-                                  run_id=task_info.run_id,
-                                  error=_cancel_message(:user), completed_at=cancelled_at)
-
-        if !claimed
-            # DURABLE: reaching here means the row is no longer in `(PENDING, RUNNING)`, or
-            # failed the run fence. A live object still reporting RUNNING would render as
-            # "already finished with status RUNNING" -- a sentence the CAS above just disproved.
-            latest = get_task_info(runtime.store, task_info.id)
-            latest === nothing && return _not_found()
-            if latest.run_id != task_info.run_id
-                # Distinguished on purpose: reporting the successor's status here would say
-                # "Task already finished with status PENDING", which is nonsense.
-                return Dict{Symbol, Any}(
-                    :error => "Task was re-submitted; the run you asked to cancel has already ended")
-            end
-            return Dict{Symbol, Any}(:error => "Task already finished with status $(latest.status)")
-        end
-
-        # Ask the callback to stop. This replaces
-        # `schedule(worker_task, InterruptException(), error=true)`, which was only ever safe
-        # while worker tasks were thread-pinned: `schedule(t, exc; error=true)` does not
-        # check whether `t` is running, and injecting into a task executing on another
-        # thread aborts the process in `jl_finish_task` (#127, blocking #30).
-        #
-        # `get_active_task_info`, NOT `get_task_info`: the latter falls back to a database
-        # read for a database-backed store and hands back a throwaway object the callback
-        # does not hold, so the write would be a silent no-op. The `run_id` guard keeps the
-        # request off a successor run (#108).
-        #
-        # Nothing is deregistered here any more. That used to mean "this process is done
-        # running it", which was true a moment later under the old model and is false now --
-        # the callback keeps going. Leaving the handles in place keeps `get_active_task`
-        # honest for `recover_zombie_tasks!` and keeps `get_task_info` serving live progress
-        # for a task that is still producing it. `_finish_task!` tears them down whether or
-        # not it wins its CAS, so nothing leaks.
-        live = get_active_task_info(runtime, task_info.id)
-        if live !== nothing && live.run_id == task_info.run_id
-            # AFTER the durable claim above, which is why that write renders `:user` directly
-            # rather than reading the token back. The two can legitimately disagree: if a drain
-            # had already asked (`:shutdown`) without claiming anything, this CAS loses and the
-            # token keeps `:shutdown` while the record says "Cancelled by user". Both are true of
-            # what they describe -- the token says who asked FIRST, the record says who CLAIMED
-            # it -- and the claim is the half an operator reads.
-            _request_cancel!(live, :user)
-
-            # Mirror the claim onto the live record, which is a REQUIREMENT now that this
-            # function no longer deregisters it. `PormGWorkerStore.try_transition!` writes
-            # only the database row, and its `get_task_info` prefers the live object -- so
-            # without this a cancelled task kept reporting RUNNING until its callback
-            # returned: `get_task_status` lied, a second `cancel_task` answered "already
-            # finished with status RUNNING", and `_register_or_watch!` saw RUNNING and
-            # silently refused to re-run the key. `InMemoryWorkerStore` never had the
-            # problem because its CAS mutates the very object the registry holds, so
-            # leaving this out made the two backends disagree.
-            #
-            # It also makes the `task_info.status == CANCELLED` poll that the tutorial has
-            # always documented actually work under PormG, which it never did.
-            live.status = CANCELLED
-            live.error = _cancel_message(:user)
-            live.completed_at = cancelled_at
-        end
-
-        return Dict{Symbol, Any}(:status => "Task cancelled")
+        return Dict{Symbol, Any}(
+            :error => "Task is being claimed by consumers faster than it can be cancelled; try again")
     end
+end
+
+# How many times `cancel_task` re-reads a submission whose run changed under it (#514).
+const _CANCEL_CLAIM_ROUNDS = 8
+
+# Is `latest` a later run of the SAME submission `read` was a run of -- claimed, handed back or
+# requeued -- rather than a re-submit of the key? Only an external submission gets new runs
+# without a new submission, and a re-submit is a new `TaskInfo` with its own `created_at`. Gating on
+# `external` keeps every submission an app runs in-process on the pre-#514 answer, whatever the
+# clock resolution.
+_same_submission(read::TaskInfo, latest::TaskInfo) =
+    read.external && latest.external && read.created_at == latest.created_at
+
+# One round of `cancel_task`: its answer, or `nothing` to go round again on a newer run.
+function _cancel_once(runtime::WorkerRuntime, authority::TaskAuthority, task_id::String)
+    # The record served here is the one the fenced claim below addresses: when a live
+    # predecessor and a durable successor disagree, `_visible_record` hands back the run the
+    # caller is authorized on, so the claim can never cancel a run on another run's grant.
+    task_info = _visible_record(runtime, authority, task_id)
+    task_info === nothing && return _not_found()
+
+    if task_info.status in (COMPLETED, FAILED, CANCELLED)
+        return Dict{Symbol, Any}(:error => "Task already finished with status $(task_info.status)")
+    end
+
+    # Claim the transition *before* interrupting anything. The status precondition
+    # and the write are one atomic step in the store, so a task finishing
+    # concurrently — in this process or another one sharing the database — either
+    # loses the race and stays cancelled, or wins it and we report the truth.
+    # Doing this with a read, a decision, and a full-record save under `lock_tasks`
+    # was #88: that lock does not span processes.
+    # Fencing this on `run_id` is an AUTHORIZATION fix, not merely bookkeeping.
+    # `_visible_record` above decided against the watcher list of the run we read,
+    # and re-running a finished key RESETS that list (`replace_task!`). Cancelling the
+    # successor on the predecessor's grant would be an authorization the app never issued
+    # — reachable across processes, since `lock_tasks` is process-local for a
+    # database-backed store (#108).
+    cancelled_at = current_time_utc()
+    claimed = try_transition!(runtime.store, task_info.id, (PENDING, RUNNING), CANCELLED;
+                              run_id=task_info.run_id,
+                              error=_cancel_message(:user), completed_at=cancelled_at)
+
+    if !claimed
+        # DURABLE: reaching here means the row is no longer in `(PENDING, RUNNING)`, or
+        # failed the run fence. A live object still reporting RUNNING would render as
+        # "already finished with status RUNNING" -- a sentence the CAS above just disproved.
+        latest = get_task_info(runtime.store, task_info.id)
+        latest === nothing && return _not_found()
+        if latest.run_id != task_info.run_id
+            # A consumer took, gave back or lost the claim since we read it (#514): still the
+            # run the caller asked to cancel, as far as they can tell. Go round again.
+            _same_submission(task_info, latest) && return nothing
+            # Distinguished on purpose: reporting the successor's status here would say
+            # "Task already finished with status PENDING", which is nonsense.
+            return Dict{Symbol, Any}(
+                :error => "Task was re-submitted; the run you asked to cancel has already ended")
+        end
+        return Dict{Symbol, Any}(:error => "Task already finished with status $(latest.status)")
+    end
+
+    # Ask the callback to stop. This replaces
+    # `schedule(worker_task, InterruptException(), error=true)`, which was only ever safe
+    # while worker tasks were thread-pinned: `schedule(t, exc; error=true)` does not
+    # check whether `t` is running, and injecting into a task executing on another
+    # thread aborts the process in `jl_finish_task` (#127, blocking #30).
+    #
+    # `get_active_task_info`, NOT `get_task_info`: the latter falls back to a database
+    # read for a database-backed store and hands back a throwaway object the callback
+    # does not hold, so the write would be a silent no-op. The `run_id` guard keeps the
+    # request off a successor run (#108).
+    #
+    # Nothing is deregistered here any more. That used to mean "this process is done
+    # running it", which was true a moment later under the old model and is false now --
+    # the callback keeps going. Leaving the handles in place keeps `get_active_task`
+    # honest for `recover_zombie_tasks!` and keeps `get_task_info` serving live progress
+    # for a task that is still producing it. `_finish_task!` tears them down whether or
+    # not it wins its CAS, so nothing leaks.
+    live = get_active_task_info(runtime, task_info.id)
+    if live !== nothing && live.run_id == task_info.run_id
+        # AFTER the durable claim above, which is why that write renders `:user` directly
+        # rather than reading the token back. The two can legitimately disagree: if a drain
+        # had already asked (`:shutdown`) without claiming anything, this CAS loses and the
+        # token keeps `:shutdown` while the record says "Cancelled by user". Both are true of
+        # what they describe -- the token says who asked FIRST, the record says who CLAIMED
+        # it -- and the claim is the half an operator reads.
+        _request_cancel!(live, :user)
+
+        # Mirror the claim onto the live record, which is a REQUIREMENT now that this
+        # function no longer deregisters it. `PormGWorkerStore.try_transition!` writes
+        # only the database row, and its `get_task_info` prefers the live object -- so
+        # without this a cancelled task kept reporting RUNNING until its callback
+        # returned: `get_task_status` lied, a second `cancel_task` answered "already
+        # finished with status RUNNING", and `_register_or_watch!` saw RUNNING and
+        # silently refused to re-run the key. `InMemoryWorkerStore` never had the
+        # problem because its CAS mutates the very object the registry holds, so
+        # leaving this out made the two backends disagree.
+        #
+        # It also makes the `task_info.status == CANCELLED` poll that the tutorial has
+        # always documented actually work under PormG, which it never did.
+        live.status = CANCELLED
+        live.error = _cancel_message(:user)
+        live.completed_at = cancelled_at
+    end
+
+    return Dict{Symbol, Any}(:status => "Task cancelled")
 end
 
 function cancel_task(ctx::App, task_id::AbstractString, authority::TaskAuthority; key::Symbol=DEFAULT_EXTENSION_KEY, runtime::Union{Nothing, WorkerRuntime}=nothing)

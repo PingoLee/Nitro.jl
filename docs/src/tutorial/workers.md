@@ -1154,14 +1154,18 @@ in the warning below, is quieter. A boot sweep logs:
 │   recovered = 2
 │   spared_live = 1
 │   too_recent = 0
-└   lost_race = 0
+│   lost_race = 0
+└   leased = 0
 ```
 
 The sweep runs after the startup banner and before the first request is served. If a boot
 announces itself and then goes quiet, look for these two lines. A "scanning" line with no
 "complete" line means the sweep is still working, or is stuck. Only counts are logged, never a
 task's `result` or `error`. `lost_race` counts records that another writer finished, cancelled or
-re-ran between the sweep's read and its write. The sweep leaves those alone.
+re-ran between the sweep's read and its write. The sweep leaves those alone. `leased` counts runs
+that a separate consumer process holds under a lease. Their liveness is the lease, not a handle in
+this process, so the sweep never judges them. It stays `0` unless the store backs a queue run by a
+consumer process.
 
 !!! warning "Several processes sharing one store: set `zombie_min_age`"
     "No live handle" is a fact about *this* process only. A node that boots while another node's

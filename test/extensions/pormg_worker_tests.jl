@@ -11,7 +11,8 @@ using Nitro.Workers
 # exercises them directly, so it names them.
 using Nitro.Workers: get_task_info, set_task!, replace_task!, add_watcher!, try_transition!,
     delete_task!, try_delete_task!, cleanup_tasks!, list_running_task_refs, RunningTaskRef,
-    lock_tasks, get_active_task, get_active_task_info, register_run!, get_worker_queues
+    lock_tasks, get_active_task, get_active_task_info, register_run!, get_worker_queues,
+    claim_next!, renew_leases!, release_claim!, requeue_expired!, LeaseRenewal, LeasePolicy
 using Nitro.Errors: AuthorizationError
 
 # The ONE answer a read or cancel gives both for a missing task and for one the caller may not
@@ -60,7 +61,20 @@ const MODELLED_FILTER_KEYS = Set([
     "id", "id__@gt", "id__@in", "run_id", "status", "status__@in", "queue_name",
     "completed_at__@lte", "completed_at__@isnull",
     "watchers", "id__@startswith", "watchers__@contains",
+    # The claim capability (#514).
+    "external", "claimed_by", "lease_expires_at__@lt",
 ])
+
+# The claim columns (#514), as a row built by hand before them reads them: with the default the
+# boot-time ALTER gives an existing row. Any other missing column is still a KeyError, so a row
+# that lost a column the ext always writes keeps failing loudly.
+const MOCK_COLUMN_DEFAULTS = Dict{String, Any}(
+    "external" => false, "attempt" => 0, "claimed_by" => nothing, "lease_expires_at" => nothing)
+_mock_col(row::Dict{String, Any}, c::String) = haskey(row, c) ? row[c] : MOCK_COLUMN_DEFAULTS[c]
+
+# Columns the mock can ORDER BY. `claim_next!` orders by `created_at` then `id` (#514); every
+# other read orders by `id` alone.
+const MOCK_ORDER_COLUMNS = Set(["id", "created_at"])
 
 function _reject_filter_key(k::String)
     parts = split(k, "__")
@@ -115,6 +129,11 @@ struct MockDB
     # the window between a retention sweep's read and its delete (#379), or a failure there.
     # One-shot, so a hook can install the next one.
     before_delete::Base.RefValue{Any}
+    # `select_for_update` reads (#514): for each one that ran, whether it ran inside the store's
+    # transaction seam and with which options. The mock has no row locks to take, so this is how
+    # a test sees that `claim_next!` asked for one, and asked inside its transaction.
+    locks::Vector{Any}
+    in_tx::Base.RefValue{Bool}
 end
 
 MockDB(db_keys::String...) = MockDB(
@@ -122,11 +141,11 @@ MockDB(db_keys::String...) = MockDB(
         k => Dict{String, Dict{String, Any}}() for k in (isempty(db_keys) ? ("db",) : db_keys)),
     Dict{String, Any}[],
     ReentrantLock(),
-    Ref{Any}(nothing))
+    Ref{Any}(nothing), Any[], Ref(false))
 
 # Around an existing table set (`RacingWatcherModel` wraps one it was handed).
 MockDB(tables::Dict{String, Dict{String, Dict{String, Any}}}, seen::Vector{Dict{String, Any}},
-       lock::ReentrantLock) = MockDB(tables, seen, lock, Ref{Any}(nothing))
+       lock::ReentrantLock) = MockDB(tables, seen, lock, Ref{Any}(nothing), Any[], Ref(false))
 
 mutable struct MockTaskQuerySet
     mdb::MockDB
@@ -138,14 +157,17 @@ mutable struct MockTaskQuerySet
     # wins. A projected read hands back ONLY these keys, which is what makes "the recovery scan
     # never parses `result`" observable: a row whose blob is not JSON is harmless to it (#236).
     projection::Union{Nothing, Vector{String}}
-    # `.order_by("id")` and `.limit(n)`: the keyset page shape (#237). Applied by the READ ops
-    # only. PormG refuses a `delete()` carrying either, and so does this mock.
-    order::Union{Nothing, String}
+    # `.order_by(cols...)` and `.limit(n)`: the keyset page shape (#237), and the claim order
+    # (#514). Applied by the READ ops only. PormG refuses a `delete()` carrying either, and so does
+    # this mock.
+    order::Union{Nothing, Vector{String}}
     limit::Union{Nothing, Int}
+    # `.select_for_update(; kw...)`'s options, recorded when a read runs (see `MockDB.locks`).
+    for_update::Any
 end
 
 MockTaskQuerySet(mdb::MockDB, db_key, filters::Dict{String, Any}) =
-    MockTaskQuerySet(mdb, db_key, filters, nothing, nothing, nothing)
+    MockTaskQuerySet(mdb, db_key, filters, nothing, nothing, nothing, nothing)
 
 # The key a `Qor(...)` is recorded under in `filters`: a vector of reconstructed pairs, ANY of
 # which may match. One per query -- that is all the ext builds.
@@ -278,6 +300,14 @@ function _mock_matches(row::Dict{String, Any}, k::String, v)
     elseif k == "watchers__@contains"
         # Substring match on the serialized JSON, like the real backend.
         return occursin(v, row["watchers"])
+    elseif k == "external"
+        return _mock_col(row, "external") == v
+    elseif k == "claimed_by"
+        return _mock_col(row, "claimed_by") == v
+    elseif k == "lease_expires_at__@lt"
+        # NULL compares as unknown in SQL, so an unleased row never matches.
+        lease = _mock_col(row, "lease_expires_at")
+        return lease !== nothing && lease < v
     end
     # Unreachable: `_filtered_rows_locked` rejected every key not in `MODELLED_FILTER_KEYS`
     # before reaching here. Kept as the belt to that braces, so adding a key to the constant
@@ -289,8 +319,11 @@ end
 function _ordered_limited!(qs::MockTaskQuerySet, rows::Vector{Dict{String, Any}})
     order = getfield(qs, :order)
     if order !== nothing
-        order == "id" || error("MockTaskQuerySet: unmodelled order_by '$order' -- teach the mock about it.")
-        sort!(rows; by = r -> r["id"])
+        for c in order
+            c in MOCK_ORDER_COLUMNS ||
+                error("MockTaskQuerySet: unmodelled order_by '$c' -- teach the mock about it.")
+        end
+        sort!(rows; by = r -> Tuple(r[c] for c in order))
     end
     lim = getfield(qs, :limit)
     lim === nothing || length(rows) <= lim || resize!(rows, lim)
@@ -309,7 +342,17 @@ _snapshot(row::Dict{String, Any}) = copy(row)
 function _snapshot(qs::MockTaskQuerySet, row::Dict{String, Any})
     cols = getfield(qs, :projection)
     cols === nothing && return _snapshot(row)
-    return Dict{String, Any}(c => row[c] for c in cols)
+    return Dict{String, Any}(c => (haskey(MOCK_COLUMN_DEFAULTS, c) ? _mock_col(row, c) : row[c])
+                             for c in cols)
+end
+
+# A read that asked for `FOR UPDATE` records it, with whether it ran inside the transaction seam.
+function _record_lock!(qs::MockTaskQuerySet)
+    opts = getfield(qs, :for_update)
+    opts === nothing && return nothing
+    mdb = getfield(qs, :mdb)
+    push!(mdb.locks, (in_tx = mdb.in_tx[], opts = opts))
+    return nothing
 end
 
 # PormG refuses a NUL in any bound text value before a statement is sent (PormG#951, 0.8):
@@ -368,10 +411,16 @@ function Base.getproperty(qs::MockTaskQuerySet, name::Symbol)
             return qs
         end
     elseif name === :order_by
-        return function(col::String)
-            setfield!(qs, :order, col)          # last call wins, as in PormG
+        return function(cols::String...)
+            setfield!(qs, :order, collect(String, cols))   # last call wins, as in PormG
             return qs
         end
+    elseif name === :select_for_update
+        f = function(; kw...)
+            setfield!(qs, :for_update, NamedTuple(kw))
+            return qs
+        end
+        return f
     elseif name === :limit
         return function(n::Int)
             setfield!(qs, :limit, n)
@@ -380,12 +429,14 @@ function Base.getproperty(qs::MockTaskQuerySet, name::Symbol)
     elseif name === :list
         return function()
             return lock(_mock_lock(qs)) do
+                _record_lock!(qs)
                 Dict{String,Any}[_snapshot(qs, r) for r in _ordered_limited!(qs, _filtered_rows_locked(qs))]
             end
         end
     elseif name === :first
         return function()
             return lock(_mock_lock(qs)) do
+                _record_lock!(qs)
                 rows = _ordered_limited!(qs, _filtered_rows_locked(qs))
                 isempty(rows) ? nothing : _snapshot(qs, first(rows))
             end
@@ -557,10 +608,10 @@ function Base.getproperty(qs::FlakyReadQuerySet, name::Symbol)
 
     if name === :db
         return (key::String) -> FlakyReadQuerySet(inner.db(key), fail_next, fail_ids)
-    elseif name in (:filter, :values, :order_by, :limit)
+    elseif name in (:filter, :values, :order_by, :limit, :select_for_update)
         # Every chaining builder is re-wrapped. Falling through to `inner` would hand back the bare
         # queryset, and the `.list()` after a projection or a page would bypass the guard.
-        return (args...) -> FlakyReadQuerySet(getproperty(inner, name)(args...), fail_next, fail_ids)
+        return (args...; kw...) -> FlakyReadQuerySet(getproperty(inner, name)(args...; kw...), fail_next, fail_ids)
     elseif name === :first
         return function()
             _flaky_guard(qs)
@@ -733,13 +784,24 @@ function Base.getproperty(qs::InterloperQuerySet, name::Symbol)
     hooks = getfield(qs, :hooks)
     if name === :db
         return (key::String) -> InterloperQuerySet(inner.db(key), hooks)
-    elseif name === :filter
-        return (args...) -> InterloperQuerySet(inner.filter(args...), hooks)
+    elseif name in (:filter, :values, :order_by, :limit, :select_for_update)
+        # Re-wrapped, so a hook still fires at the end of a longer chain -- `claim_next!`'s read
+        # is `.filter(...).order_by(...).select_for_update(...).first()` (#514).
+        return (args...; kw...) -> InterloperQuerySet(getproperty(inner, name)(args...; kw...), hooks)
     elseif name === :first
         return function()
             row = inner.first()
             row === nothing || _run_hook!(qs, :after_first)
             return row
+        end
+    elseif name === :list
+        return function()
+            rows = inner.list()
+            # `requeue_expired!`'s read of the expired leases (#514): a renew landing between
+            # it and the fenced write.
+            haskey(getfield(inner, :filters), "lease_expires_at__@lt") &&
+                _run_hook!(qs, :after_expired_read)
+            return rows
         end
     elseif name === :create
         return function(pairs::Pair{String,<:Any}...)
@@ -748,9 +810,18 @@ function Base.getproperty(qs::InterloperQuerySet, name::Symbol)
         end
     elseif name === :update
         return function(pairs::Pair{String,<:Any}...)
-            # Only `replace_task!` writes `run_id`, so this lands between exactly ITS read and
-            # its UPDATE, whatever other reads the calling path made first.
-            any(p -> first(p) == "run_id", pairs) && _run_hook!(qs, :before_replace_update)
+            cols = Set(first(p) for p in pairs)
+            # `replace_task!` is the one UPDATE that writes `run_id` AND `watchers`, so this lands
+            # between exactly ITS read and its UPDATE, whatever other reads the calling path made
+            # first. (The claim operations write `run_id` too since #514, never `watchers`.)
+            ("run_id" in cols && "watchers" in cols) && _run_hook!(qs, :before_replace_update)
+            # `claim_next!`'s fenced write: the one UPDATE that takes a PENDING row to a consumer.
+            ("claimed_by" in cols && get(getfield(inner, :filters), "status", nothing) == "PENDING") &&
+                _run_hook!(qs, :before_claim_update)
+            # A transition to CANCELLED: `cancel_task`'s claim, the window a consumer's claim can
+            # land in (#514).
+            any(p -> first(p) == "status" && last(p) == "CANCELLED", pairs) &&
+                _run_hook!(qs, :before_cancel_update)
             return inner.update(pairs...)
         end
     end
@@ -854,11 +925,19 @@ mutable struct FakeSchemaPool <: PormG.PormGSQLite
     probe_error::Union{Nothing, Exception}
     # Another process adds the column between our probe and our `ALTER`.
     concurrent_add::Bool
+    # The claim columns (#514) this table has. They are modelled with the same probe/ALTER
+    # semantics as `run_id`, minus the fault injection above, which stays `run_id`'s.
+    claim_columns::Set{String}
 end
 
+const CLAIM_COLUMNS = ("external", "attempt", "claimed_by", "lease_expires_at")
+
+# A table "has run_id" means a current table unless said otherwise: it has the claim columns too.
 FakeSchemaPool(has_run_id::Bool; alter_error=nothing, probe_error=nothing,
-               concurrent_add::Bool=false) =
-    FakeSchemaPool(String[], has_run_id, alter_error, probe_error, concurrent_add)
+               concurrent_add::Bool=false,
+               claim_columns = has_run_id ? Set(CLAIM_COLUMNS) : Set{String}()) =
+    FakeSchemaPool(String[], has_run_id, alter_error, probe_error, concurrent_add,
+                   Set{String}(claim_columns))
 
 function PormG.ConnectionPool.fetch(c::FakeSchemaPool, sql::String; kwargs...)
     push!(c.sql, sql)
@@ -870,12 +949,36 @@ function PormG.ConnectionPool.fetch(c::FakeSchemaPool, sql::String; kwargs...)
     elseif occursin("\"nitro_task\".\"run_id\"", sql)
         c.probe_error === nothing || throw(c.probe_error)
         c.has_run_id || error("no such column: nitro_task.run_id")
+    else
+        for col in CLAIM_COLUMNS
+            if startswith(sql, "ALTER TABLE \"nitro_task\" ADD COLUMN \"$col\"")
+                col in c.claim_columns && error("duplicate column name: $col")
+                push!(c.claim_columns, col)
+            elseif occursin("\"nitro_task\".\"$col\"", sql)
+                col in c.claim_columns || error("no such column: nitro_task.$col")
+            end
+        end
     end
     return nothing
 end
 
 # The extension module itself, for the private `task_model` accessor the #202 guard drives.
 const PormGExt = Base.get_extension(Nitro, :NitroPormGExt)
+
+# `claim_next!` runs in a transaction (#514), through a seam on the store's model. The mocks have
+# no transactions, so their method runs the body directly -- and marks the database as inside one
+# for its duration, which is what `MockDB.locks` records against each `FOR UPDATE` read.
+function _mock_transaction(f::Function, mdb::MockDB)
+    mdb.in_tx[] && error("MockDB: nested claim transaction -- the ext opens exactly one per attempt")
+    mdb.in_tx[] = true
+    try
+        return f()
+    finally
+        mdb.in_tx[] = false
+    end
+end
+PormGExt._store_transaction(f::Function, m::Union{MockTaskModel, InterloperModel, FlakyReadModel},
+                            ::String) = _mock_transaction(f, getfield(m, :mdb))
 
 # FAIL, do not skip (#128). This branch used to be
 # `@test_skip "PormG is not available, ..."`, which the Test stdlib reports as
@@ -3364,6 +3467,399 @@ else
                 alter_error=PormG.StatementError("SQLite", InterruptException()))
             @test_throws PormG.StatementError ensure!(ialter)
             @test length(ialter.sql) == 2   # probe, ALTER -- no re-probe
+        end
+
+        # -- The claim capability (#514) ----------------------------------------------------
+
+        # The store contract's conformance body for claims, run over BOTH backends: a capability
+        # implemented differently by the two is a store that silently behaves differently
+        # (workers §6). Rows are seeded through `replace_task!`, the way a submit writes them.
+        claim_backends() = (("in-memory", InMemoryWorkerStore()),
+                            ("pormg", RealPormGWorkerStore(model=MockTaskModel())))
+        function seed_claimable!(s, id; queue = "heavy", external = true, created = DateTime(2026, 1, 1))
+            t = TaskInfo(id; queue_name = queue, external)
+            t.created_at = created
+            replace_task!(s, id, t)
+            return t
+        end
+
+        @testset "claims conform on both backends (#514)" begin
+            @test isempty(missing_claim_methods(RealPormGWorkerStore))
+            # The shared validators run before any query on this backend too.
+            s0 = RealPormGWorkerStore(model = MockTaskModel())
+            @test_throws ArgumentError claim_next!(s0, "", "c1"; lease_seconds = 60)
+            @test_throws ArgumentError claim_next!(s0, "heavy", "c1"; lease_seconds = 1e-4)
+            t0 = DateTime(2026, 1, 1)
+            now1 = t0 + Minute(1)
+            for (label, s) in claim_backends()
+                @testset "$label" begin
+                    claim(c = "c1"; now = now1, lease = 60) =
+                        claim_next!(s, "heavy", c; lease_seconds = lease, now)
+                    @test claim() === nothing                                  # empty
+
+                    # Ignored: in-process rows of the same queue, other queues, and anything not
+                    # PENDING.
+                    seed_claimable!(s, "in-proc"; external = false)
+                    seed_claimable!(s, "other-q"; queue = "light")
+                    running = seed_claimable!(s, "running")
+                    @test try_transition!(s, "running", (PENDING,), RUNNING; run_id = running.run_id)
+                    @test claim() === nothing
+
+                    # Oldest first, `id` breaking a tie inside one clock tick.
+                    seed_claimable!(s, "b"; created = t0 + Second(1))
+                    a2 = seed_claimable!(s, "a2")
+                    a1 = seed_claimable!(s, "a1")
+                    c1 = claim()
+                    @test c1.id == "a1"
+                    @test c1.status == RUNNING
+                    @test c1.claimed_by == "c1"
+                    @test c1.lease_expires_at == now1 + Second(60)
+                    @test c1.attempt == 1
+                    @test c1.started_at == now1
+                    @test c1.created_at == t0
+                    @test c1.run_id != a1.run_id                               # a new run
+                    durable = get_task_info(s, "a1")
+                    @test (durable.run_id, durable.claimed_by, durable.attempt, durable.lease_expires_at,
+                           durable.status, durable.external) ==
+                          (c1.run_id, "c1", 1, now1 + Second(60), RUNNING, true)
+                    if label == "in-memory"
+                        # A new OBJECT: the old one keeps the old identity, so its holder's
+                        # fences fail rather than pass.
+                        @test c1 !== a1
+                        @test a1.status == PENDING
+                    end
+                    # The previous run's write loses its fence; the claimed run's wins.
+                    @test !try_transition!(s, "a1", (PENDING, RUNNING), COMPLETED; run_id = a1.run_id)
+                    @test claim().id == "a2"
+                    @test claim().id == "b"
+                    @test claim() === nothing
+
+                    # Renew: only this consumer's live runs, with progress persisted.
+                    later = now1 + Minute(1)
+                    renewals = [LeaseRenewal(("a1", c1.run_id, 25.0)),
+                                LeaseRenewal(("a1", a1.run_id, 1.0)),           # stale run
+                                LeaseRenewal(("nope", UUIDs.uuid4(), 0.0))]     # no such task
+                    @test renew_leases!(s, "c1", renewals; lease_seconds = 120, now = later) == [c1.run_id]
+                    durable = get_task_info(s, "a1")
+                    @test durable.lease_expires_at == later + Second(120)
+                    @test durable.progress == 25.0
+                    @test isempty(renew_leases!(s, "c2", renewals[1:1]; lease_seconds = 1, now = later))
+                    # No fence on the lease being in the future: a late renew is harmless.
+                    @test renew_leases!(s, "c1", renewals[1:1]; lease_seconds = 1,
+                                        now = later + Hour(5)) == [c1.run_id]
+
+                    # Release: a new PENDING run that keeps its place and its attempt count.
+                    @test !release_claim!(s, "a1", a1.run_id)
+                    @test release_claim!(s, "a1", c1.run_id)
+                    durable = get_task_info(s, "a1")
+                    @test durable.status == PENDING
+                    @test !(durable.run_id in (a1.run_id, c1.run_id))
+                    @test (durable.claimed_by, durable.lease_expires_at, durable.started_at) ==
+                          (nothing, nothing, nothing)
+                    @test durable.attempt == 1
+                    @test durable.progress == 0.0
+                    @test durable.created_at == t0
+                    @test !release_claim!(s, "a1", c1.run_id)               # already handed back
+                    # A run a process executes as its own is never handed back: from PENDING,
+                    # nothing would ever pick it up again.
+                    inproc = get_task_info(s, "in-proc")
+                    @test try_transition!(s, "in-proc", (PENDING,), RUNNING; run_id = inproc.run_id)
+                    @test !release_claim!(s, "in-proc", inproc.run_id)
+                    @test get_task_info(s, "in-proc").status == RUNNING
+                    again = claim("c2")
+                    @test again.id == "a1"
+                    @test again.attempt == 2
+
+                    # A re-submit is a new submission: it does not inherit the claim or its count.
+                    replace_task!(s, "a1", TaskInfo("a1"; queue_name = "heavy", external = true))
+                    durable = get_task_info(s, "a1")
+                    @test (durable.status, durable.claimed_by, durable.lease_expires_at, durable.attempt) ==
+                          (PENDING, nothing, nothing, 0)
+                end
+            end
+        end
+
+        @testset "requeue_expired! adjudicates each lease by its queue's policy (#514)" begin
+            t0 = DateTime(2026, 1, 1)
+            expiry = t0 + Minute(5)
+            policies = Dict("rq" => LeasePolicy(:requeue; max_attempts = 2), "fq" => LeasePolicy(:fail))
+            for (label, s) in claim_backends()
+                @testset "$label" begin
+                    claim!(q; now = t0) = claim_next!(s, q, "c1"; lease_seconds = 60, now)
+                    seed_claimable!(s, "rq-1"; queue = "rq"); rq1 = claim!("rq")
+                    seed_claimable!(s, "rq-2"; queue = "rq2tmp")
+                    # Two claims, so its attempt count is at the bound when its lease runs out.
+                    rq2 = claim!("rq2tmp")
+                    @test release_claim!(s, "rq-2", rq2.run_id)
+                    rq2 = claim!("rq2tmp")
+                    @test rq2.attempt == 2
+                    seed_claimable!(s, "fq-1"; queue = "fq"); fq1 = claim!("fq")
+                    seed_claimable!(s, "gone-1"; queue = "gone"); claim!("gone")
+                    seed_claimable!(s, "fresh"; queue = "rq"); fresh = claim!("rq"; now = expiry)
+                    unleased = TaskInfo("unleased"; queue_name = "rq")
+                    replace_task!(s, "unleased", unleased)
+                    @test try_transition!(s, "unleased", (PENDING,), RUNNING; run_id = unleased.run_id)
+
+                    # `rq2tmp` stands in for an `rq` row at its bound: same policy, by name.
+                    pol = merge(policies, Dict("rq2tmp" => policies["rq"]))
+                    @test requeue_expired!(s, expiry; policies = pol) ==
+                          (requeued = 1, failed = 3, unknown_queue = 1, lost_race = 0)
+
+                    r = get_task_info(s, "rq-1")
+                    @test r.status == PENDING
+                    @test r.run_id != rq1.run_id
+                    @test (r.claimed_by, r.lease_expires_at, r.started_at) == (nothing, nothing, nothing)
+                    @test r.attempt == 1
+                    @test r.created_at == t0                       # back in its original place
+                    r = get_task_info(s, "rq-2")
+                    @test r.status == FAILED
+                    @test occursin("after 2 attempt(s)", r.error)
+                    r = get_task_info(s, "fq-1")
+                    @test r.status == FAILED
+                    @test occursin("on_lease_expiry = :fail", r.error)
+                    @test r.completed_at == expiry
+                    r = get_task_info(s, "gone-1")
+                    @test r.status == FAILED
+                    @test occursin("no process declares", r.error)
+                    # Not expired, and not leased at all: neither is this sweep's.
+                    @test get_task_info(s, "fresh").run_id == fresh.run_id
+                    @test get_task_info(s, "fresh").status == RUNNING
+                    @test get_task_info(s, "unleased").status == RUNNING
+
+                    # Idempotent: a second pass finds nothing left to decide.
+                    @test requeue_expired!(s, expiry; policies = pol) ==
+                          (requeued = 0, failed = 0, unknown_queue = 0, lost_race = 0)
+                end
+            end
+        end
+
+        @testset "the zombie sweep leaves a leased run alone on both backends (#514)" begin
+            for (label, s) in claim_backends()
+                @testset "$label" begin
+                    seed_claimable!(s, "leased")
+                    leased = claim_next!(s, "heavy", "c1"; lease_seconds = 60)
+                    zombie = TaskInfo("zombie")
+                    replace_task!(s, "zombie", zombie)
+                    @test try_transition!(s, "zombie", (PENDING,), RUNNING; run_id = zombie.run_id)
+                    refs = Dict(r.id => r for r in list_running_task_refs(s))
+                    @test refs["leased"].claimed_by == "c1"
+                    @test refs["zombie"].claimed_by === nothing
+                    @test recover_zombie_tasks!(; runtime = WorkerRuntime(s)) == 1
+                    @test get_task_info(s, "zombie").status == FAILED
+                    @test get_task_info(s, "leased").status == RUNNING
+                    @test get_task_info(s, "leased").run_id == leased.run_id
+                end
+            end
+        end
+
+        @testset "claim_next! reads FOR UPDATE SKIP LOCKED inside its transaction, and fences its write (#514)" begin
+            m = MockTaskModel()
+            s = RealPormGWorkerStore(model = m)
+            a1 = seed_claimable!(s, "a1")
+            claimed = claim_next!(s, "heavy", "c1"; lease_seconds = 60)
+            @test only(getfield(m, :mdb).locks) == (in_tx = true, opts = (skip_locked = true,))
+            # The claiming UPDATE is fenced on the run it READ, in its own WHERE.
+            @test Dict{String, Any}("id" => "a1", "run_id" => string(a1.run_id), "status" => "PENDING") in
+                  m._filters_seen
+            @test m._table["a1"]["run_id"] == string(claimed.run_id)
+        end
+
+        @testset "a rival claim between the read and the fence costs a row, not a double claim (#514)" begin
+            m = InterloperModel()
+            s = RealPormGWorkerStore(model = m)
+            seed_claimable!(s, "a1")
+            seed_claimable!(s, "a2"; created = DateTime(2026, 1, 1) + Second(1))
+            # Another consumer takes a1 after our read, before our write.
+            m.hooks[:before_claim_update] = table -> begin
+                table["a1"]["run_id"] = string(UUIDs.uuid4())
+                table["a1"]["status"] = "RUNNING"
+                table["a1"]["claimed_by"] = "rival"
+            end
+            ours = claim_next!(s, "heavy", "c1"; lease_seconds = 60)
+            @test ours.id == "a2"
+            @test m._table["a1"]["claimed_by"] == "rival"           # untouched by our lost write
+            @test m._table["a2"]["claimed_by"] == "c1"
+
+            # A head row that keeps changing run under us is not reported as an empty queue.
+            m2 = InterloperModel()
+            s2 = RealPormGWorkerStore(model = m2)
+            seed_claimable!(s2, "hot")
+            requeue_under_us = table -> begin
+                table["hot"]["run_id"] = string(UUIDs.uuid4())       # still PENDING, a new run
+                m2.hooks[:before_claim_update] = requeue_under_us
+            end
+            m2.hooks[:before_claim_update] = requeue_under_us
+            @test_throws "lost races" claim_next!(s2, "heavy", "c1"; lease_seconds = 60)
+            pop!(m2.hooks, :before_claim_update, nothing)
+        end
+
+        @testset "a head row that does not decode is failed out of the queue's way (#514)" begin
+            m = MockTaskModel()
+            s = RealPormGWorkerStore(model = m)
+            seed_claimable!(s, "poison")
+            seed_claimable!(s, "next"; created = DateTime(2026, 1, 1) + Second(1))
+            secret = "poison-secret-91ab"
+            m._table["poison"]["result"] = "{not json $secret"
+            logs, ours = Test.collect_test_logs() do
+                claim_next!(s, "heavy", "c1"; lease_seconds = 60)
+            end
+            @test ours.id == "next"
+            @test m._table["poison"]["status"] == "FAILED"
+            @test !occursin(secret, m._table["poison"]["error"])
+            @test !any(r -> occursin(secret, string(r.message, " ", r.kwargs)), logs)
+            # The warning says what kind of failure it was, never what it quoted.
+            @test only(filter(r -> occursin("does not decode", r.message), logs)).kwargs[:exception_type] <: Exception
+
+            # Two heads that do not decode, in one call: the cause is not the rows, so the claim
+            # stops instead of failing the queue's whole backlog, which could not be undone.
+            m2 = MockTaskModel()
+            s2 = RealPormGWorkerStore(model = m2)
+            for (i, id) in enumerate(("bad-1", "bad-2", "good"))
+                seed_claimable!(s2, id; created = DateTime(2026, 1, 1) + Second(i))
+            end
+            m2._table["bad-1"]["result"] = "{broken"
+            m2._table["bad-2"]["result"] = "{broken"
+            @test_throws "refusing to fail more" claim_next!(s2, "heavy", "c1"; lease_seconds = 60)
+            @test m2._table["bad-1"]["status"] == "FAILED"
+            @test m2._table["bad-2"]["status"] == "PENDING"
+            @test m2._table["good"]["status"] == "PENDING"
+        end
+
+        @testset "cancel_task follows a consumer's claim through the PormG store (#514)" begin
+            # The in-memory half is in workers_tests.jl. This one runs the retry against the
+            # serialized record, so `external` and `created_at` must round-trip for it to work.
+            m = InterloperModel()
+            s = RealPormGWorkerStore(model = m)
+            owner = Owner("u-pc")
+            id = scoped_task_key("job", owner)
+            seed_claimable!(s, id)
+            read_run = get_task_info(s, id).run_id
+            claimed_run = string(UUIDs.uuid4())
+            m.hooks[:before_cancel_update] = table -> begin
+                table[id]["run_id"] = claimed_run
+                table[id]["status"] = "RUNNING"
+                table[id]["claimed_by"] = "consumer-1"
+            end
+            @test cancel_task(id, owner; runtime = WorkerRuntime(s)) ==
+                  Dict{Symbol, Any}(:status => "Task cancelled")
+            @test m._table[id]["status"] == "CANCELLED"
+            @test m._table[id]["run_id"] == claimed_run && claimed_run != string(read_run)
+        end
+
+        @testset "a renew and a requeue racing for one lease: exactly one wins (#514)" begin
+            t0 = DateTime(2026, 1, 1)
+            pol = Dict("heavy" => LeasePolicy(:requeue))
+            # The renew lands between the requeue's read and its write: the requeue's fence
+            # re-checks the expiry and loses, and the run stays the consumer's.
+            m = InterloperModel()
+            s = RealPormGWorkerStore(model = m)
+            seed_claimable!(s, "a1")
+            claimed = claim_next!(s, "heavy", "c1"; lease_seconds = 60, now = t0)
+            m.hooks[:after_expired_read] = table -> (table["a1"]["lease_expires_at"] = t0 + Hour(1))
+            @test requeue_expired!(s, t0 + Minute(5); policies = pol) ==
+                  (requeued = 0, failed = 0, unknown_queue = 0, lost_race = 1)
+            @test m._table["a1"]["status"] == "RUNNING"
+            @test m._table["a1"]["run_id"] == string(claimed.run_id)
+            # The other order: the requeue wins, and the consumer's renew then matches nothing.
+            m._table["a1"]["lease_expires_at"] = t0 + Minute(1)
+            @test requeue_expired!(s, t0 + Minute(5); policies = pol).requeued == 1
+            @test isempty(renew_leases!(s, "c1", [LeaseRenewal(("a1", claimed.run_id, 0.0))];
+                                        lease_seconds = 60, now = t0 + Minute(5)))
+        end
+
+        @testset "the claim queries render their predicates on the target row (#514)" begin
+            # A shape pin, like the guarded deletes': the race needs a real database, the SQL
+            # does not. PostgreSQL's claim read must skip a row another claimer holds, and every
+            # fence must sit in the statement's own WHERE so a lock wait re-checks it.
+            keys = ("nitro-test-claim-sqlite" => ShapeSQLite(), "nitro-test-claim-pg" => ShapePostgres())
+            for (key, _) in keys
+                haskey(PormG.config, key) &&
+                    error("test-only PormG connection key is already registered: $key")
+            end
+            try
+                for (key, conn) in keys
+                    PormG.config[key] = PormG.Configuration.Settings(
+                        connections = conn, change_data = true, db_def_folder = key)
+                end
+                for (key, conn) in keys
+                    pg = conn isa ShapePostgres
+                    model = getproperty(PormGExt, :task_model)(key)
+                    @testset "$(nameof(typeof(conn))): claim read" begin
+                        d = PormG.inspect_query(PormGExt._claim_candidates(model.objects, "claim-queue-value");
+                                                connection = conn)
+                        sql = d[:sql_text]
+                        @test occursin("FOR UPDATE SKIP LOCKED", sql) == pg
+                        @test !occursin("FOR UPDATE", sql) || pg
+                        order = sql[findfirst("ORDER BY", sql)[1]:end]
+                        @test findfirst("created_at", order)[1] < findfirst("\"id\"", order)[1]
+                        @test all(c -> occursin("\"$c\"", sql), ("queue_name", "external", "status"))
+                        params = String[string(p) for p in d[:parameters]]
+                        @test "claim-queue-value" in params && !occursin("claim-queue-value", sql)
+                        pg && @test occursin("\$1", sql)
+                    end
+                    fences = (
+                        ("claim", ["id", "run_id", "status"],
+                         () -> model.objects.filter("id" => "fence-id-value", "run_id" => "fence-run-value",
+                                                    "status" => "PENDING")),
+                        ("requeue", ["id", "run_id", "status", "lease_expires_at"],
+                         () -> model.objects.filter("id" => "fence-id-value", "run_id" => "fence-run-value",
+                                                    "status" => "RUNNING",
+                                                    "lease_expires_at__@lt" => DateTime(2026, 1, 1))),
+                    )
+                    for (name, cols, build) in fences
+                        @testset "$(nameof(typeof(conn))): $name fence" begin
+                            d = build().update("status" => "FAILED"; show_query = :dict)
+                            sql = d[:sql_text]
+                            @test startswith(sql, "UPDATE \"nitro_task\"")
+                            @test !occursin("SELECT", sql)
+                            @test all(c -> occursin("\"$c\"", sql), cols)
+                            @test !occursin("fence-run-value", sql)       # bound, never spliced
+                        end
+                    end
+                end
+            finally
+                for (key, _) in keys
+                    delete!(PormG.config, key)
+                end
+            end
+        end
+
+        @testset "the claim columns are added on boot, each probed first (#514)" begin
+            is_alter(s) = startswith(s, "ALTER TABLE")
+            pre = FakeSchemaPool(true; claim_columns = Set{String}())
+            getproperty(PormGExt, :_ensure_task_table!)(pre, getproperty(PormGExt, :task_model)())
+            @test pre.claim_columns == Set(CLAIM_COLUMNS)
+            alters = filter(is_alter, pre.sql)
+            @test length(alters) == 4
+            for (col, ddl) in ("external" => "BOOLEAN NOT NULL DEFAULT FALSE",
+                               "attempt" => "INTEGER NOT NULL DEFAULT 0",
+                               "claimed_by" => "VARCHAR(255)",
+                               "lease_expires_at" => "DATETIME")
+                i = findfirst(==("ALTER TABLE \"nitro_task\" ADD COLUMN \"$col\" $ddl"), pre.sql)
+                @test i !== nothing
+                # Probed before it was altered.
+                @test i !== nothing && occursin("\"nitro_task\".\"$col\"", pre.sql[i - 1])
+            end
+            @test any(s -> occursin("nitro_task_claim_idx", s), pre.sql)
+            @test any(s -> occursin("nitro_task_lease_idx", s), pre.sql)
+
+            # A fresh database gets them from CREATE TABLE, so its boot alters nothing.
+            fresh = FakeSchemaPool(true)
+            getproperty(PormGExt, :_ensure_task_table!)(fresh, getproperty(PormGExt, :task_model)())
+            @test all(c -> occursin("\"$c\"", first(fresh.sql)), CLAIM_COLUMNS)
+            @test !any(is_alter, fresh.sql)
+
+            # A row written before #514 reads back with the defaults the ALTER gave it.
+            legacy_row = Dict{String, Any}(
+                "id" => "legacy", "run_id" => string(UUIDs.uuid4()), "status" => "PENDING",
+                "progress" => 0.0, "result" => "", "error" => "", "created_at" => DateTime(2026, 1, 1),
+                "started_at" => nothing, "completed_at" => nothing, "watchers" => "[]",
+                "queue_name" => "heavy")
+            t = getproperty(PormGExt, :_from_db_record)(legacy_row)
+            @test (t.external, t.claimed_by, t.lease_expires_at, t.attempt) == (false, nothing, nothing, 0)
+            # SQLite hands a BOOLEAN back as an integer.
+            t = getproperty(PormGExt, :_from_db_record)(merge(legacy_row, Dict{String, Any}("external" => 1)))
+            @test t.external
         end
 
         @testset "a run does not inherit the submitter's PormG transaction (#209)" begin
