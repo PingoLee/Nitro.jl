@@ -95,6 +95,22 @@ function search_products(req, payload = Json(ProductSearch, q -> !isempty(q.name
 end
 ```
 
+### Members your type does not declare
+
+`Json{T}` reads only the members `T` declares. Any other member in the body is skipped, so it costs
+almost nothing to parse. The skip still checks the member's numbers, `true`/`false`/`null`,
+brackets and commas, and control characters, and nesting depth is checked across the whole body.
+It does **not** check the escapes inside the member's strings: JSON.jl validates an escape only
+when it decodes the string, and a skipped string is never decoded. So
+`{"name": "lamp", "note": "bad \q escape"}` binds the `ProductSearch` above. Give it a `note`
+field and the same body is a `400`. A top-level member's *name* is always decoded, to match it
+against the fields, so an invalid escape there is a `400` either way.
+
+`getjson(req)` and `JsonFragment{T}` parse the whole body: `getjson` returns `nothing` for that
+body, and `JsonFragment{T}` answers `400`. A strict JSON gateway in front of the application will
+refuse it too. If every member of the body must be valid JSON, declare it in `T` or read the body
+with `getjson`.
+
 ---
 
 ## The `Form{T}` Extractor
