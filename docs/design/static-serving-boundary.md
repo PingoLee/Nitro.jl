@@ -526,14 +526,16 @@ and HTTP.jl 2.7 buffers every write to a FIXED stream response in `stream.reques
 head and body only at `closewrite`. The 64 KiB drain therefore copied the whole file into that
 buffer before a byte was sent — one layer below the code #41 changed, which is why its tests (body
 correct, handle released) stayed green. HTTP.jl's *request*-handler path writes a FIXED body live;
-only the stream-handler path Nitro serves through buffers, and it has no switch. So Nitro now writes
-a known-length streaming body itself on HTTP/1.1 (`_write_fixed_body_live!` in
-`src/core/transport.jl`): the head, then each chunk to the connection, the length enforced. The
-cost is reaching HTTP internals, canaried in `test/http_internals_contract_tests.jl`. HTTP.jl 2.9
-offers the public way it was waiting for, an explicit `startwrite` that streams a fixed-length body
+only the stream-handler path Nitro serves through buffers, and through HTTP.jl 2.8 it had no switch.
+So #377 had Nitro write a known-length streaming body itself on HTTP/1.1: the head, then each chunk
+to the connection, the length enforced, through HTTP internals canaried in
+`test/http_internals_contract_tests.jl`. HTTP.jl 2.9 then shipped the public way: an explicit
+`startwrite` streams a fixed-length body once it passes 4 KiB
 ([JuliaWeb/HTTP.jl#1389](https://github.com/JuliaWeb/HTTP.jl/pull/1389), closing the request in
-[JuliaWeb/HTTP.jl#1384](https://github.com/JuliaWeb/HTTP.jl/issues/1384)), and moving onto it is
-[#529](https://github.com/PingoLee/Nitro.jl/issues/529). The behavioral pin is `test/streaming_write_tests.jl`, which checks
+[JuliaWeb/HTTP.jl#1384](https://github.com/JuliaWeb/HTTP.jl/issues/1384)), and
+[#529](https://github.com/PingoLee/Nitro.jl/issues/529) moved onto it (`_write_fixed_body!` in
+`src/core/transport.jl`). Nitro still checks the length itself, so a mismatch is a logged `500` or a
+closed connection rather than HTTP's `400`. The behavioral pin is `test/streaming_write_tests.jl`, which checks
 that the head and first chunk reach the client *while the body is still being read* — a check on
 when bytes hit the wire, which is the one thing #41's tests could not see. HTTP/2 was never
 affected: there a FIXED write is a live DATA frame.
