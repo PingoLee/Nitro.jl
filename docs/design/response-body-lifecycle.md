@@ -348,7 +348,8 @@ only on `T`. Filed as #493.
 
 **The `@kwdef` path makes a large body parse slower than `getjson` does, at half the
 allocations.** For a `@kwdef` type, `json_bind` first parses the whole body into
-`Dict{String, JSON.JSONText}` (#294): that pass validates the body and copies its text, 38.6 µs at
+`Dict{String, JSON.JSONText}` (#294): that pass validates the body's structure (not its string
+escapes, see #577) and copies its text, 38.6 µs at
 10 KB for 6 allocations. Only then does it parse each field. At 250 rows that is 108 µs against 65
 for the plain struct. On a small body the extra cost is one `binds_by_keyword` per field plus
 `kw_construct`'s dynamic keyword call (1.2 µs, 12 allocations), so 6.2 µs against 1.5. The
@@ -375,12 +376,9 @@ The plain-struct echo now ties `getjson`'s 1.9 µs on the 3-field body, with few
 about 1.2 µs. A positional shortcut when every field is present would remove it, but would also
 bypass a hand-written keyword constructor that transforms its arguments, so it is not taken.
 
-Two edges now behave like JSON.jl's plain-struct path instead of like the `Dict` the walk replaced.
-A repeated key binds its last value as before, but every occurrence is parsed, so an invalid
+One edge now behaves like JSON.jl's plain-struct path instead of like the `Dict` the walk replaced:
+a repeated key binds its last value as before, but every occurrence is parsed, so an invalid
 earlier occurrence (`{"a":"bad","a":5}`) refuses the body where the `Dict` kept only the last text.
-And a member the struct does not declare is skipped without being validated, where the
-`Dict{String, JSON.JSONText}` pass validated the whole body; #496 below measures what a validating
-skip would take.
 
 ### JSON.jl upstream candidates, measured (#496)
 
@@ -429,11 +427,15 @@ then discarded. Allocations per call, minimum of five runs of 1,000:
 - **`Json{T}`:** a plain struct already skips undeclared members for free. A `@kwdef` struct pays
   one allocation per undeclared member. The skip's value here is not speed but strictness.
 
-**Today, a member `Json{T}` does not declare is not validated.** A body whose undeclared member
-holds an invalid escape (`{"name":"item","qty":3,"note":"bad \q escape"}`) binds for a plain struct
-and for a `@kwdef` struct alike. The same escape in a declared member is refused. This is the
-behavior #449 refused for the JWT header, and the case for upstream is the same: a validating skip
-would let `Json{T}` reject malformed input without materializing it.
+**Today, `Json{T}` does not check the string escapes of a member it does not declare (#577).** A
+body whose undeclared member holds an invalid escape (`{"name":"item","qty":3,"note":"bad \q
+escape"}`, or `"\uZZZZ"`) binds for a plain struct and for a `@kwdef` struct alike. The same escape
+in a declared member is refused, and `getjson` refuses the whole body. Numbers, literals, structure
+and control characters are still checked. Only escapes get through, because JSON.jl validates a
+string's escapes when it materializes the string. This predates #493: the `@kwdef` path's old
+`Dict{String, JSON.JSONText}` pass accepted the same bodies, and so does `JSON.isvalidjson`. #449
+refused this skip for the JWT header. A validating skip would let `Json{T}` refuse such a body
+without materializing anything.
 
 Whether either candidate goes to JuliaIO/JSON.jl, and in what form, is the maintainer's decision.
 Nothing has been filed upstream.
