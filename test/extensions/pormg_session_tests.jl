@@ -140,11 +140,11 @@ end
 # `filter` is deliberate: this is the filter a query actually RAN with, which is what a test
 # wants to assert about.
 # MUST be called with the database lock held: it reads the shared table and appends to the
-# shared `seen` vector. Appends exactly once per call, and every terminal op calls it exactly
-# once -- `_filters_seen` carries exact-count assertions.
+# shared `seen` vector. Appends exactly once per call whose filter keys validate (none when one
+# is refused), and every terminal op calls it exactly once -- `_filters_seen` carries exact-count
+# assertions.
 function _matching_keys_locked(qs::MockQuerySet)
     filters = getfield(qs, :filters)
-    push!(getfield(qs, :mdb).seen, copy(filters))
 
     # Validate EVERY key BEFORE looking at any row. Checking inside the row loop -- which is
     # where this started -- makes the guard vanish on an empty table, and an empty table is
@@ -153,6 +153,13 @@ function _matching_keys_locked(qs::MockQuerySet)
     for k in keys(filters)
         k in MODELLED_FILTER_KEYS || _reject_filter_key(k)
     end
+
+    # Recorded AFTER validation, so `_filters_seen` holds only filters a query could actually
+    # run with -- otherwise an assertion written against it alone could be satisfied by a query
+    # that threw. The worker mock's `_filtered_rows_locked` records at the same point (#248).
+    # Still BEFORE the connection is resolved, as there: an unrouted query records its filter
+    # and then throws, which the prune-routing testset below accounts for.
+    push!(getfield(qs, :mdb).seen, copy(filters))
 
     # AFTER the filter-key check: a misspelled filter is the more specific diagnosis, and the two
     # `@test_throws` in "the mock refuses a filter it does not model" drive `m.objects` directly.
@@ -733,9 +740,9 @@ end
         @test isempty(m._tables["sessions"])
         @test haskey(m._tables["db"], "stale-elsewhere")
         #   3. the filter carried the operator the sibling testset pins. NOT a proof that a query
-        #      reached a table: `_matching_keys` records `seen` before it resolves the connection,
-        #      so an unrouted prune records one entry and then throws. Nets 1 and 2 are what
-        #      discriminate; this one pins the operator.
+        #      reached a table: `_matching_keys_locked` records `seen` after validating the keys
+        #      but before it resolves the connection, so an unrouted prune records one entry and
+        #      then throws. Nets 1 and 2 are what discriminate; this one pins the operator.
         @test length(m._filters_seen) == 1
         @test collect(keys(m._filters_seen[1])) == ["expires_at__@lte"]
     end
@@ -1042,6 +1049,9 @@ end
 
     @test_throws "missing PormG's `@` operator prefix" s.model.objects.filter("expires_at__lte" => Dates.now(Dates.UTC)).delete()
     @test_throws "unmodelled filter key" s.model.objects.filter("nonsense" => 1).first()
+    # ... and neither refused query left a filter behind: `_filters_seen` holds only filters a
+    # query could actually run with, the rule the worker mock already kept (#248).
+    @test isempty(s.model._filters_seen)
 
     # And PormG's unfiltered-mutation guards -- including the one escape hatch, so the guard is
     # pinned as a guard rather than as "delete never works without a filter".
