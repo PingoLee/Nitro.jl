@@ -8,8 +8,8 @@ using Dates
 using ..Util: text, json, formdata, multipart, parseparam, parsebody, FormFile
 using ..Util.BodyParsers: NITRO_READ_STYLE, _parse_json_bounded, _body_view, is_json_media_type,
     is_multipart_form_media_type, is_form_media_type
-using ..Reflection: struct_builder, extract_struct_info, kw_construct, kw_constructible, TypeMemo,
-                    memoized, reset!
+using ..Util: TypeMemo, memoized, reset!
+using ..Reflection: struct_builder, extract_struct_info, kw_construct, kw_constructible
 using ..Errors: ValidationError, UnsupportedMediaTypeError, is_unrecoverable
 # The Core stubs `getjson`/`getform` bind to (their bodies are in core/request.jl, included later).
 using ...Core: getjson, getform

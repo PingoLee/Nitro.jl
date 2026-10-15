@@ -214,6 +214,7 @@ they **shadow** the same-named functions `using .Core` brings in. An `(app, …)
 | `src/types.jl`, `src/constants.jl`, `src/errors.jl` | Shared vocabulary: `Nullable`, `Principal`, HTTP method constants, `ValidationError`/`CookieError`/`AuthorizationError` |
 | `src/environment.jl` | `Environment` module — `current_env()`, the `NITRO_ENV`/`GENIE_ENV` precedence and its closed value set. Reports the environment; deliberately gates nothing (#55) |
 | `src/response.jl` | The `Res` module — the response builders handlers use: `json`, `html`, `send`, `status`, `file`, `redirect` |
+| `src/utilities/typememo.jl` | `TypeMemo` — the lock-free per-type `Bool` memo keyed on the world counter, behind the per-request type checks in `BodyParsers`, `Reflection` and `Extractors`. In `Util`, below all three, so each can import it (#498) |
 | `src/utilities/bodyparsers.jl` | Request body parsing: `text`, `json`, `binary`, `formdata`, `multipart`, `FormFile` |
 | `src/utilities/misc.jl` | `parseparam`, `format_response`, `response` (content-sniffing builder used by the templating extensions — a markup sink), `add_response_headers`, `own_response_headers`, request plumbing |
 | `src/utilities/fileutil.jl` | `readfile`, `mountable_files`, `mountfolder` — static-mount helpers; `mountable_files` owns which files a mount will expose (dotfiles, symlink confinement, route-pattern names) |
