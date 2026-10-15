@@ -437,8 +437,20 @@ string's escapes when it materializes the string. This predates #493: the `@kwde
 refused this skip for the JWT header. A validating skip would let `Json{T}` refuse such a body
 without materializing anything.
 
-Whether either candidate goes to JuliaIO/JSON.jl, and in what form, is the maintainer's decision.
-Nothing has been filed upstream.
+**Decided.** Neither candidate changes Nitro's `src/`:
+
+- **The `Object` writer goes upstream.** The method is rebuilt against JSON.jl's current `main`
+  and the PR is tracked in #578, which records its number once it is opened. When a JSON.jl
+  release ships it, Nitro raises its `[compat]` and re-runs the `write_dict_*` and `echo_*_served`
+  rows. `getjson` already returns an `Object`, so handlers pick up the change without any edit.
+- **`Json{T}` keeps the skip, and the guide says so (#577).** A Nitro-side pre-check would give
+  back most of `Json{T}`'s advantage. `isvalidjson` misses these escapes, so the only
+  pre-checks left would be an untyped parse or a hand-written scan duplicating JSON.jl's grammar. The
+  *Request Body* guide states what the skip checks and what it does not.
+  `test/extractor_tests.jl` pins both sides. A JSON.jl release that adds a validating skip turns
+  that test red, and the guide changes with it.
+- **The `isvalidjson` false positive goes upstream as its own report.** It is a separate bug
+  from the missing skip, and the easier of the two to fix.
 
 ## 4. Reference facts
 
