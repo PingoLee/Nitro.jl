@@ -8,13 +8,6 @@ const TEST_FILE_PATH = joinpath(@__DIR__, "content", "test.txt")
 
 @testset "Developer Experience (DX) Improvements" begin
 
-    @testset "Default Multi-threading" begin
-        # serve() has parallel=true by default.
-        # We can't easily assert on the live server threading without starting it, 
-        # but we can test that serveparallel resolves gracefully.
-        @test true
-    end
-
     @testset "Res Module Abstractions" begin
         # Test Res.status()
         res_status = Res.status(201)

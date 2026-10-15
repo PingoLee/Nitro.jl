@@ -10,8 +10,6 @@
 #                       the shape Nitro's `parallel_stream_handler` takes, and the ceiling to
 #                       compare it against.
 #   MODE=bare_nospawn   The same without the spawn: the handler runs on HTTP.jl's connection task.
-#   MODE=nitro_serial   Nitro `serve(parallel = false)`: no per-request spawn, so the handler runs on
-#                       HTTP.jl's connection task -- the Nitro counterpart of `bare_nospawn` (#492).
 #
 #   PORT=8080           Loopback port.
 #   ACCESS_LOG=0|1      Nitro only: `serve(access_log = …)`. Default 0.
@@ -49,7 +47,7 @@ const MODE       = get(ENV, "MODE", "nitro")
 
 # Only where it is used, so a `bare_*` process has no Nitro in it at all: `rss.sh` reports that
 # mode as the HTTP.jl-only floor (#451), and a loaded-but-idle Nitro would be counted in it.
-MODE in ("nitro", "nitro_log", "nitro_serial") && @eval using Nitro
+MODE in ("nitro", "nitro_log") && @eval using Nitro
 
 const PORT      = parse(Int, get(ENV, "PORT", "8080"))
 const ACCESS_LOG = get(ENV, "ACCESS_LOG", "0") == "1" || MODE == "nitro_log"
@@ -124,7 +122,7 @@ function start_bare(spawn::Bool)
     return HTTP.listen!(handler, "127.0.0.1", PORT)
 end
 
-function start_nitro(parallel::Bool)
+function start_nitro()
     app = App()
     urlpatterns(app, "",
         path("/plaintext", req -> Res.send(PLAINTEXT); method = "GET"),
@@ -135,7 +133,7 @@ function start_nitro(parallel::Bool)
     )
     WORKERS && urlpatterns(app, "", path("/burst", burst_route(); method = "GET"))
     serve(app; host = "127.0.0.1", port = PORT, async = true, show_banner = false,
-          access_log = ACCESS_LOG, parallel)
+          access_log = ACCESS_LOG)
     return app
 end
 
@@ -231,11 +229,10 @@ PROFILE_S > 0 && @eval function profile_window()
     @info "bench: profile written" stem
 end
 
-handle = MODE in ("nitro", "nitro_log") ? start_nitro(true) :
-         MODE == "nitro_serial" ? start_nitro(false) :
+handle = MODE in ("nitro", "nitro_log") ? start_nitro() :
          MODE == "bare_spawn"   ? start_bare(true) :
          MODE == "bare_nospawn" ? start_bare(false) :
-         error("unknown MODE=$(MODE): expected nitro, nitro_log, nitro_serial, bare_spawn or bare_nospawn")
+         error("unknown MODE=$(MODE): expected nitro, nitro_log, bare_spawn or bare_nospawn")
 
 @info "bench: serving" MODE PORT threads = Threads.nthreads() interactive = Threads.nthreads(:interactive)
 PROFILE_S > 0 && Threads.@spawn profile_window()

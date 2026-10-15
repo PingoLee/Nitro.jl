@@ -63,7 +63,7 @@ listener, so a bad value fails at startup whether or not the banner is shown. Th
 banner always names the resolved environment, including the default:
 
 ```
- Nitro <version>  (parallel mode: 8 threads)
+ Nitro <version>  (8 threads)
 2026-09-12 14:02:11
 Environment: dev
 Starting server at http://127.0.0.1:8080

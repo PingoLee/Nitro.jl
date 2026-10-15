@@ -26,9 +26,8 @@ import Sockets
 #   • src/core/transport.jl — `_upgrade_websocket!` (#374) runs the private
 #       `WebSockets._origin_allowed_default` with a proxy-reported scheme, mirrors `upgrade`'s
 #       `stream.tracked.conn isa TLS.Conn`, and classifies a refused handshake by
-#       `WebSocketError.message.code`. `_write_fixed_body_live!` (#377) writes a known-length
-#       streaming body past HTTP/1.1's FIXED buffer with the stream head/byte writers and the
-#       `Stream` write-state fields.
+#       `WebSocketError.message.code`. `_write_fixed_body!` (#377, #529) streams a known-length
+#       body through the public `startwrite` + `write`, and reads two `Stream` state fields.
 #   • src/core/lifecycle.jl — refuses cleartext HTTP/2 (#375) with `listen!`'s `allow_h2c = false`.
 #       Public since HTTP.jl 2.9, so no longer an internal; pinned anyway because it is the whole
 #       of the refusal (it replaced an override of the private `_probe_h2_preface!`).
@@ -429,24 +428,21 @@ end
     @test fieldtype(HTTP.Server, :allow_h2c) === Bool
 end
 
-@testset "live FIXED writer (src/core/transport.jl `_write_fixed_body_live!`)" begin
-    # #377: on HTTP/1.1 HTTP.jl 2.7 buffers a FIXED stream response whole until `closewrite`, so
-    # Nitro writes a known-length streaming body itself — head, then each chunk to the socket —
-    # through these internals. A rename fails the wrappers loudly; the quieter breakage is a field
-    # changing meaning, so the fields are pinned by type too. What no signature can pin is the
-    # BEHAVIOR being worked around — `startwrite` deferring the HTTP/1.1 FIXED head. If HTTP.jl
-    # changes that, `_buffers_fixed_body`'s `head_committed` guard falls back to plain writes, and
-    # test/streaming_write_tests.jl is the canary that says whether they are live.
-    @test hasmethod(HTTP._server_stream_buffered_fixed_h1, Tuple{HTTP.Stream})
-    @test hasmethod(HTTP._write_server_stream_head!, Tuple{HTTP.Stream})
-    @test hasmethod(HTTP._write_server_stream_bytes!, Tuple{HTTP.Stream, Vector{UInt8}, Bool})
+@testset "streamed FIXED body (src/core/transport.jl `_write_fixed_body!`)" begin
+    # #377 wrote a known-length streaming body through three HTTP.jl internals, because HTTP/1.1
+    # buffered a FIXED stream response whole until `closewrite`. HTTP.jl 2.9 streams it after an
+    # explicit `startwrite` (JuliaWeb/HTTP.jl#1389), so #529 moved onto that: `startwrite` and
+    # `write` are public, and pinned here only for that. What no signature can pin is the BEHAVIOR —
+    # that `startwrite` makes a FIXED body past 4 KiB go out as it is written; that is
+    # test/streaming_write_tests.jl's job, the only check that sees WHEN bytes reach the wire.
+    @test Base.ispublic(HTTP, :startwrite)
+    # Still read directly, by `_holds_fixed_head`. `ignore_writes` marks a bodyless response (HEAD,
+    # 304); `head_committed` still false after `startwrite` is how Nitro tells HTTP chose FIXED
+    # framing and is holding the head. It is also logged when a body fails, and is what makes HTTP's
+    # error path close the connection after the head instead of appending a raw 500.
+    # `response_started` is read by `_response_started` in src/core/transport.jl.
     @test fieldtype(HTTP.Stream, :ignore_writes) === Bool
-    @test fieldtype(HTTP.Stream, :written_bytes) === Int64
-    # `write_closed` is what stops HTTP's loop and `stream_handler` from writing the head again;
-    # `head_committed` is what makes HTTP's error path close the connection after a failed body
-    # instead of appending a raw 500 to the bytes already sent — and `_buffers_fixed_body` reads it
-    # as its guard. `response_started` is read by `_response_started` in src/core/transport.jl.
-    for f in (:write_closed, :head_committed, :response_started)
+    for f in (:head_committed, :response_started)
         @test fieldtype(HTTP.Stream, f) === Bool
     end
 end

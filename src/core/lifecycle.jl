@@ -62,24 +62,7 @@ function _warn_if_no_gc_target(env::AbstractString, gc_target::Nullable{UInt64})
     return nothing
 end
 
-# `parallel = false` on a process started with several default threads (#454). Not the case #149
-# declined to warn about: one thread is a valid deployment, but here the caller asked for N threads
-# and then turned off the one thing that reaches them. HTTP.jl 2.x runs every connection task on
-# the `:interactive` pool -- one thread for `-t N` with N > 1 -- so without the per-request spawn
-# every handler runs there, whatever `-t` says. With NO interactive thread (`-t N,0`, and `-t 1`
-# on Julia 1.12) HTTP.jl's interactive spawn falls back to the default pool, connection tasks run
-# on every thread, and nothing is stranded -- so that case is silent. Every environment: the
-# contradiction is the same in dev, and dev is where a throughput test would be misread.
-function _warn_if_serial_on_threads(parallel::Bool, ndefault::Int, ninteractive::Int)::Nothing
-    (parallel || ndefault <= 1 || ninteractive == 0) && return nothing
-    @warn "serve(parallel = false) runs every handler on HTTP.jl's connection tasks, which live " *
-          "on Julia's interactive thread pool ($ninteractive thread$(ninteractive == 1 ? "" : "s")" *
-          "), so none of this process's $ndefault default threads ever runs a handler. Drop " *
-          "`parallel = false` to use them; see \"Running in Production\" in the Nitro docs."
-    return nothing
-end
-
-function serverwelcome(external_url::String, prefix::Nullable{String}, parallel::Bool;
+function serverwelcome(external_url::String, prefix::Nullable{String};
                        gc_target::Nullable{UInt64} = _gc_target_bytes())
     server_url = Util.join_url_path(external_url, prefix)
     curr_time = Dates.format(now(), "yyyy-mm-dd HH:MM:SS")
@@ -95,16 +78,12 @@ function serverwelcome(external_url::String, prefix::Nullable{String}, parallel:
     # `1.10.0` literal this replaces, just with a longer fuse.
     version = something(Base.pkgversion(@__MODULE__), "unknown")
     printstyled(" Nitro $version ", color=:cyan, reverse=true, bold=true)
-    # `(parallel mode: 8 threads + 1 interactive, GC target 2.8 GiB)`. Each field is printed only
-    # when there is something true to say: no thread count outside parallel mode, and no GC field
-    # at all when the runtime would not say (`nothing`) rather than a guess.
-    opened = false
-    if parallel
-        printstyled(" (parallel mode: $(_thread_summary())", color=:light_black)
-        opened = true
-    end
+    # `(8 threads + 1 interactive, GC target 2.8 GiB)`. The GC field is printed only when there
+    # is something true to say: none at all when the runtime would not say (`nothing`) rather
+    # than a guess.
+    printstyled(" ($(_thread_summary())", color=:light_black)
     if gc_target !== nothing
-        printstyled(opened ? ", " : " (", color=:light_black)
+        printstyled(", ", color=:light_black)
         if _has_gc_target(gc_target)
             printstyled("GC target $(_format_gc_bytes(gc_target))", color=:light_black)
         else
@@ -112,9 +91,8 @@ function serverwelcome(external_url::String, prefix::Nullable{String}, parallel:
             # read as a real, enormous limit.
             printstyled("GC target: none", color=:yellow)
         end
-        opened = true
     end
-    opened && printstyled(")", color=:light_black)
+    printstyled(")", color=:light_black)
     println("\n$curr_time")
     # ALWAYS printed, including the defaulted case. A prod box that forgot `NITRO_ENV` must
     # SEE that it is running as `dev` -- hiding the line when nobody set one reproduces exactly
@@ -164,7 +142,7 @@ Base.show(io::IO, s::Server{<:NitroStreamHandler}) =
 Base.show(io::IO, ::MIME"text/plain", s::Server{<:NitroStreamHandler}) = show(io, s)
 
 # The stream handler `serve` hands HTTP.jl, built around an assembled pipeline, outermost last:
-# Nitro's `stream_handler` (or a custom `handler`), the per-request spawn when `parallel`, and the
+# Nitro's `stream_handler` (or a custom `handler`), the per-request spawn, and the
 # `NitroStreamHandler` wrapper that gives it a secret-safe `show`.
 # Returns `(listener, request_handler)`: what HTTP.jl calls on the connection task, and the
 # handler the spawn runs on the request's own task.
@@ -174,7 +152,7 @@ Base.show(io::IO, ::MIME"text/plain", s::Server{<:NitroStreamHandler}) = show(io
 # and every closure here is typed by what it captures, so a hand-copied chain that differs in one
 # layer caches code no server ever runs. test/precompilation_test.jl asserts the two agree.
 function _serve_listener(pipeline::Function, handler, body_limit::Int64, request_limit::Int64,
-                         upgraded_limit::Int64, security_headers, parallel::Bool)
+                         upgraded_limit::Int64, security_headers)
     request_handler = handler === stream_handler ?
         stream_handler(pipeline; max_body_bytes = body_limit,
                        max_concurrent_requests = request_limit,
@@ -182,13 +160,12 @@ function _serve_listener(pipeline::Function, handler, body_limit::Int64, request
                        rejection_headers = security_headers === nothing ? Pair{String,String}[] :
                                                                          security_headers.headers) :
         handler(pipeline)
-    spawned = parallel ? parallel_stream_handler(request_handler) : request_handler
-    return NitroStreamHandler(spawned), request_handler
+    return NitroStreamHandler(parallel_stream_handler(request_handler)), request_handler
 end
 
 # `_serve_listener` for an `App` served with every default `serve` has: no middleware, the access
 # log on, Nitro's own stream handler, the default body cap, no request or WebSocket cap, no
-# security headers, parallel. The shape the precompile workload warms (#450); a change to one of
+# security headers. The shape the precompile workload warms (#450); a change to one of
 # `serve`'s defaults that alters a type here makes test/precompilation_test.jl fail rather than
 # leaving the workload silently caching the old shape.
 _default_serve_listener(ctx::App) =
@@ -196,7 +173,7 @@ _default_serve_listener(ctx::App) =
                                     show_errors = true, access_log = true,
                                     access_log_query = false, access_log_skip = nothing,
                                     security_headers = nothing),
-                    stream_handler, DEFAULT_MAX_BODY_BYTES, zero(Int64), zero(Int64), nothing, true)
+                    stream_handler, DEFAULT_MAX_BODY_BYTES, zero(Int64), zero(Int64), nothing)
 
 # Documented on the public `Nitro.serve` (src/methods.jl), which is the binding users call and
 # the one `docs/` renders. A docstring here is a second copy Documenter counts as missing (#186).
@@ -206,7 +183,6 @@ function serve(ctx::App;
     host="127.0.0.1",
     port=8080,
     async=false,
-    parallel=true,
     serialize=true,
     catch_errors=true,
     show_errors::Bool=true,
@@ -388,7 +364,7 @@ function serve(ctx::App;
     ctx.service.max_fields[] = Int64(max_fields)
 
     if revise == :lazy || revise == :eager
-        if parallel && Threads.nthreads() > 1
+        if Threads.nthreads() > 1
             @warn "You are attempting to use Revise with multiple threads. Please note that Revise 3.5.18 and earlier are not threadsafe."
         end
         if !has_revise_hooks()
@@ -421,7 +397,7 @@ function serve(ctx::App;
 
     # No warning for running on one thread (#149): single-threaded is a valid deployment, not a
     # misconfiguration, and the banner already reports the thread count. `preprocesskwargs` drops
-    # `queuesize` whatever `parallel` is, so the warning that it is ignored is unconditional too.
+    # `queuesize` unconditionally, so the warning that it is ignored is unconditional too.
     if haskey(kwargs, :queuesize)
         @warn "Deprecated: serve() ignores `queuesize`; remove the argument."
     end
@@ -429,7 +405,7 @@ function serve(ctx::App;
     # Once-assigned, because the `start` closure below captures it: a name reassigned before
     # capture is boxed (#364).
     listener = first(_serve_listener(configured_middelware, handler, body_limit, request_limit,
-                                     upgraded_limit, security_headers, parallel))
+                                     upgraded_limit, security_headers))
 
     if revise == :eager
         # Never overwrite a live watcher: its handle is the only way to stop it (#427). `close`
@@ -443,10 +419,9 @@ function serve(ctx::App;
     # `listen!` can still refuse below (an address in use, say), after the warning has been
     # logged; that costs one accurate line about the process, which is harmless.
     _warn_if_no_gc_target(current_env(), _gc_target_bytes())
-    _warn_if_serial_on_threads(parallel, Threads.nthreads(:default), Threads.nthreads(:interactive))
 
     try
-        return startserver(ctx; host, port, show_banner, parallel, async, kwargs, start=(kwargs) ->
+        return startserver(ctx; host, port, show_banner, async, kwargs, start=(kwargs) ->
             HTTP.listen!(listener, host, port; kwargs...))
     catch
         # A `serve(async = true)` that never got its listener up (an address in use, say) returns
@@ -644,8 +619,8 @@ function terminate(context::App; timeout::Nullable{Real} = nothing)
     return nothing
 end
 
-function startserver(ctx::App; host, port, show_banner=false, parallel=false, async=false, kwargs, start)::Union{Server, Nothing}
-    show_banner && serverwelcome(ctx.service.external_url[], ctx.service.prefix[], parallel)
+function startserver(ctx::App; host, port, show_banner=false, async=false, kwargs, start)::Union{Server, Nothing}
+    show_banner && serverwelcome(ctx.service.external_url[], ctx.service.prefix[])
     ctx.service.server[] = start(preprocesskwargs(kwargs))
     # Route-owned first, then serve-owned: that is declaration order — routes are registered at
     # `urlpatterns()` time, the `serve(middleware = ...)` list only at `serve()` time (#82).
@@ -745,8 +720,8 @@ function preprocesskwargs(kwargs)
     Base.get!(kwargs_dict, :reuseaddr, !Sys.iswindows())
     # HTTP.jl disables every server timeout by default, which leaves a half-sent head or a silent
     # connection holding its socket forever (#316). Nitro defaults the two that cannot cut a
-    # legitimate stream; `read_timeout` and `write_timeout` stay opt-in. The values, and why they
-    # are 120 seconds, are on the constants (src/constants.jl).
+    # legitimate stream; `read_timeout` and `write_timeout` stay opt-in. The values, and why
+    # they are what they are, are on the constants (src/constants.jl).
     #
     # Written only when NEITHER spelling is present: HTTP.jl takes each timeout in seconds (`X`)
     # or nanoseconds (`X_ns`) and throws when it gets both, so defaulting `X` next to a caller's

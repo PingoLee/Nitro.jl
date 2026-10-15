@@ -324,14 +324,11 @@ end
     end
     mentions(logs, pat) = any(r -> occursin(pat, string(r.message)), logs)
 
-    for kw in ((; queuesize = 100), (; queuesize = 100, parallel = false))
-        logs = serve_logs(; kw...)
-        # `queuesize` is dropped whatever `parallel` is, so the warning is unconditional.
-        @test any(r -> r.level == Base.CoreLogging.Warn &&
-                       occursin("queuesize", string(r.message)) &&
-                       occursin("serve()", string(r.message)), logs)
-        @test !mentions(logs, "serveparallel")
-    end
+    logs = serve_logs(; queuesize = 100)
+    @test any(r -> r.level == Base.CoreLogging.Warn &&
+                   occursin("queuesize", string(r.message)) &&
+                   occursin("serve()", string(r.message)), logs)
+    @test !mentions(logs, "serveparallel")
 
     # One thread is a valid deployment: nothing warns about it, on any thread count.
     logs = serve_logs()
@@ -364,23 +361,27 @@ end
     @test isempty(gc_warnings("dev"))
 end
 
-@testset "serve(parallel = false) warns once when the process has threads it cannot reach (#454)" begin
-    # The helper is unit-tested in test/util_tests.jl; this pins the CALL SITE and that it reads
-    # the default pool. CI runs this file at 1 and 2 threads, so both sides are exercised.
-    function serial_warnings(; kw...)
-        ctx = Nitro.Core.App()
-        logger = Test.TestLogger(min_level = Base.CoreLogging.Warn)
-        try
-            Base.CoreLogging.with_logger(() -> _serve(ctx, get_free_port(); kw...), logger)
-        finally
-            Nitro.Core.terminate(ctx)
+@testset "serve() has no `parallel` keyword: passing one is refused, and binds nothing (#525)" begin
+    # The per-request spawn is unconditional. No shim: the keyword falls through to HTTP.jl's
+    # `listen!`, whose MethodError names it -- the string the upgrading/ entry tells apps to grep.
+    ctx = Nitro.Core.App()
+    port = get_free_port()
+    try
+        err = try
+            _serve(ctx, port; parallel = false)
+            nothing
+        catch e
+            e
         end
-        return filter(r -> occursin("parallel = false", string(r.message)), logger.logs)
+        @test err isa MethodError
+        @test occursin("\"parallel\"", sprint(showerror, err))
+        @test ctx.service.server[] === nothing
+        # The port is free again: a refused call leaves no listener behind.
+        srv = _serve(ctx, port)
+        @test ctx.service.server[] === srv
+    finally
+        Nitro.Core.terminate(ctx)
     end
-
-    stranded = Threads.nthreads(:default) > 1 && Threads.nthreads(:interactive) > 0
-    @test length(serial_warnings(; parallel = false)) == (stranded ? 1 : 0)
-    @test isempty(serial_warnings())
 end
 
 # ── Default server timeouts (#316) ──────────────────────────────────────────────────────────────
@@ -390,6 +391,11 @@ end
     d = pk(pairs((;)))
     @test d[:read_header_timeout] === Nitro.Core.DEFAULT_READ_HEADER_TIMEOUT_SECONDS
     @test d[:idle_timeout] === Nitro.Core.DEFAULT_IDLE_TIMEOUT_SECONDS
+    # The values themselves (#531). The header deadline was 120 s while it doubled as the
+    # keep-alive idle limit; since HTTP.jl 2.9 it bounds only an unfinished head, so it sits well
+    # below the idle limit, which stays above a proxy pool's 60 s.
+    @test Nitro.Core.DEFAULT_READ_HEADER_TIMEOUT_SECONDS == 15.0
+    @test Nitro.Core.DEFAULT_IDLE_TIMEOUT_SECONDS == 120.0
     # The two that could cut a legitimate stream stay opt-in.
     @test !haskey(d, :read_timeout)
     @test !haskey(d, :write_timeout)
@@ -491,6 +497,24 @@ end
         reply = raw_exchange(port, ["GET /echo HTTP/1.1\r\nHost: $HOST\r\n"])   # never finished
         @test startswith(reply, "HTTP/1.1 408")
         @test time() - t0 < 10.0
+    finally
+        Nitro.Core.terminate(ctx)
+    end
+end
+
+@testset "on a fresh connection the header deadline runs from accept (#531)" begin
+    # What `DEFAULT_READ_HEADER_TIMEOUT_SECONDS` documents: there is no idle wait before a
+    # connection's first request, so a socket opened and left silent (a browser preconnect) is
+    # answered 408 and closed at the header deadline, not held for `idle_timeout`. The idle limit
+    # is set far above the header one so the two cannot be confused.
+    ctx = _echo_context()
+    port = get_free_port()
+    _serve(ctx, port; read_header_timeout = 2.0, idle_timeout = 60.0)
+    try
+        t0 = time()
+        reply = raw_exchange(port, String[])   # connect, send nothing
+        @test startswith(reply, "HTTP/1.1 408")
+        @test time() - t0 < 30.0
     finally
         Nitro.Core.terminate(ctx)
     end

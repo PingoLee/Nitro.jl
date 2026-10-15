@@ -37,8 +37,7 @@ serve(
     async = true, 
     show_errors = false, 
     show_banner = false, 
-    access_log = nothing, 
-    parallel = Base.Threads.nthreads() > 1
+    access_log = nothing
 )
 
 @testset "async spam requests" begin

@@ -73,9 +73,6 @@ Report missing env vars by name; do not invent secret values.
       `docs/src/tutorial/deployment.md`). The floor is flat under load and does not scale with
       `--threads`, so a 512 MiB container is too small for any Nitro app; size from the floor plus
       the app's own data, not from a laptop's idle reading.
-- [ ] **`serve(parallel = false)` is not set** on a multi-threaded process. It runs every handler
-      on HTTP.jl's interactive-pool thread (one, for `--threads=N`) whatever `--threads` says;
-      `serve` logs a warning when it happens, so check the startup log.
 - [ ] **The cold start is planned.** The first request to each route compiles code the
       precompile workload cannot reach. Either warm the new process (request its key routes
       before the proxy or readiness probe sends it traffic) or ship a PackageCompiler sysimage.

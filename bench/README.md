@@ -95,7 +95,7 @@ bench/socket/contention.sh "8,1 6,2 8,0" 5 8s       # /health while the default 
 ```
 
 - `server.jl` serves `/plaintext`, `/json`, `/health`, `/cpu` and `/lag` in one of these `MODE`s:
-  `nitro` (`serve()` with no middleware), `nitro_serial` (the same with `parallel = false`, #492),
+  `nitro` (`serve()` with no middleware), `nitro_log` (the same with the access log on),
   `bare_spawn` (HTTP.jl `listen!` + `streamhandler` with a `Threads.@spawn` per request, the shape
   Nitro takes and the ceiling to compare it with), and `bare_nospawn` (the handler on HTTP.jl's
   connection task). `/cpu` burns `CPU_MS` (default 50) without yielding; `/lag` is live only with

@@ -358,7 +358,6 @@ Keyword-only. Register routes with `urlpatterns(...)` first.
 | `port` | `8080` | |
 | `middleware` | `[]` | Global pipeline, applied top-down |
 | `async` | `false` | `true` returns immediately (tests, REPL) |
-| `parallel` | `true` | `Threads.@spawn` per request |
 | `serialize` | `true` | Auto-format raw handler returns |
 | `catch_errors` | `true` | Generic 500 body; never leaks stack traces |
 | `show_errors` | `true` | **Server-side logging only** — off does not harden the response |

@@ -7,11 +7,14 @@ using Random
 using Nitro
 import Nitro: App
 
-# A response with a declared length is framed FIXED, and on HTTP/1.1 HTTP.jl 2.7 buffers every
-# write to a FIXED stream response in `stream.request_buffer`, putting the head and body on the
-# wire only at `closewrite`. #41's streamed `Res.file` read its cursor into that buffer in full,
-# so peak memory was the file, not a chunk. `_write_response_body!` now commits the head and
-# writes each chunk live (see `_write_fixed_body_live!` in `src/core/transport.jl`).
+# A response with a declared length is framed FIXED, and on HTTP/1.1 HTTP.jl buffers every write to
+# a FIXED stream response in `stream.request_buffer`, putting the head and body on the wire only at
+# `closewrite`. #41's streamed `Res.file` read its cursor into that buffer in full, so peak memory
+# was the file, not a chunk. `_write_response_body!` now calls `startwrite` first, which since
+# HTTP.jl 2.9 streams a FIXED body once it passes 4 KiB (see `_write_fixed_body!` in
+# `src/core/transport.jl`, #377/#529). A body of 4 KiB or less is still held and sent with its head
+# in one write, which is why the chunks below are larger than that, and why a small body that fails
+# still gets a clean 500 (the last testset).
 #
 # Every assertion here goes over a raw socket: the defect is WHEN bytes reach the wire, which no
 # in-process check and no pooling client can observe. Random bytes come from `RandomDevice`,
@@ -94,9 +97,12 @@ function next_response(c::RawConn, from::Int; bodyless::Bool = false, limit = 20
 end
 
 # Two chunks of a body with a declared length, the second held back until `release` fires. Built
-# per request: a streaming body is single-use.
-const FIRST  = fill(UInt8('a'), 1000)
-const SECOND = fill(UInt8('b'), 1000)
+# per request: a streaming body is single-use. Each is past HTTP.jl's 4 KiB coalescing limit
+# (`_FIXED_BODY_COALESCE_BYTES`), so the head goes out with FIRST rather than waiting for the end.
+const FIRST  = fill(UInt8('a'), 5000)
+const SECOND = fill(UInt8('b'), 5000)
+# Under that limit: held with the head until `closewrite`, so a failure is still answerable.
+const SMALL  = fill(UInt8('c'), 1000)
 
 function gated_response(release::Base.Event, fail_second::Bool)
     calls = Ref(0)
@@ -118,7 +124,7 @@ function gated_response(release::Base.Event, fail_second::Bool)
 end
 
 # A body that lies about its length: `FIRST` then `SECOND` against a declared `declared` bytes.
-# Short (2000 declared, 1000 sent) and long (1500 declared, 2000 produced) both have to end the
+# Short (10000 declared, 5000 sent) and long (7500 declared, 10000 produced) both have to end the
 # response by closing the connection, or the next response on it is read out of step.
 function lying_response(declared::Int, chunks::Vector{Vector{UInt8}})
     next = Ref(1)
@@ -132,6 +138,18 @@ function lying_response(declared::Int, chunks::Vector{Vector{UInt8}})
     return HTTP.Response(200, ["Content-Length" => string(declared)], body)
 end
 
+# A body declaring 2000 bytes that produces SMALL and then throws.
+function small_broken_response()
+    calls = Ref(0)
+    body = HTTP.CallbackBody(function (dst)
+        calls[] += 1
+        calls[] == 1 || error("producer failed mid-body")
+        copyto!(dst, SMALL)
+        return length(SMALL)
+    end, () -> nothing)
+    return HTTP.Response(200, ["Content-Length" => "2000"], body)
+end
+
 const FILE_BYTES = rand(Random.RandomDevice(), UInt8, 3 * 1024 * 1024 + 17)   # 49 chunks, a short last one
 const FILE_PATH  = joinpath(mktempdir(), "download.bin")
 write(FILE_PATH, FILE_BYTES)
@@ -141,8 +159,18 @@ function streaming_app(release::Base.Event)
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/gated",  (req::HTTP.Request) -> gated_response(release, false)),
         path("/broken", (req::HTTP.Request) -> gated_response(release, true)),
-        path("/short",  (req::HTTP.Request) -> lying_response(2000, [FIRST])),
-        path("/long",   (req::HTTP.Request) -> lying_response(1500, [FIRST, SECOND])),
+        path("/short",  (req::HTTP.Request) -> lying_response(10000, [FIRST])),
+        path("/long",   (req::HTTP.Request) -> lying_response(7500, [FIRST, SECOND])),
+        # Wrong only after the first chunk, but small enough that HTTP still holds the head.
+        path("/small-short",  (req::HTTP.Request) -> lying_response(2000, [SMALL])),
+        path("/small-broken", (req::HTTP.Request) -> small_broken_response()),
+        # Both framings declared: HTTP frames it CHUNKED (Transfer-Encoding wins), so there is no
+        # length to hold it to, and the body must go out whole rather than be refused.
+        path("/te-and-cl", (req::HTTP.Request) -> HTTP.Response(200,
+             ["Transfer-Encoding" => "chunked", "Content-Length" => "7"],
+             HTTP.CallbackBody(let sent = Ref(false)
+                 dst -> sent[] ? 0 : (sent[] = true; copyto!(dst, FIRST); length(FIRST))
+             end, () -> nothing))),
         # Wrong before a byte is sent: known from the first read, so refused before the head.
         path("/overrun-first",  (req::HTTP.Request) -> lying_response(500, [FIRST])),
         path("/empty-declared", (req::HTTP.Request) -> lying_response(100, Vector{UInt8}[])),
@@ -173,7 +201,7 @@ function one_shot(port, target)
 end
 
 # Uncapped, and under `max_concurrent_requests`: the capped path calls `closewrite` itself while
-# the slot is held (#298), so both have to agree that a live-written body is already closed.
+# the slot is held (#298), so both have to agree on a streamed body's last write.
 for cap in (nothing, 4)
     release = Base.Event()
     ctx = streaming_app(release)
@@ -205,7 +233,7 @@ for cap in (nothing, 4)
                 notify(release)
                 head, body, _ = next_response(c, 1)
                 @test startswith(head, "HTTP/1.1 200")
-                @test content_length(head) == 2000
+                @test content_length(head) == length(FIRST) + length(SECOND)
                 @test body == vcat(FIRST, SECOND)
             finally
                 notify(release)
@@ -279,8 +307,8 @@ for cap in (nothing, 4)
             # connection reusable -- the client would wait forever for the missing bytes -- and a
             # long one must not put the surplus on the wire, where it would be read as the start
             # of the next response. Keep-alive is requested on purpose, so only the check closes it.
-            for (route, declared) in (("/short", 2000), ("/long", 1500))
-                # Cleared first: `/broken` above already logged `declared = 2000, written = 1000`,
+            for (route, declared) in (("/short", 10000), ("/long", 7500))
+                # Cleared first: `/broken` above already logged `declared = 10000, written = 5000`,
                 # which would satisfy `/short`'s check whether or not `/short` itself warned.
                 lock(() -> empty!(logger.logs), logger.lock)
                 (; bytes, ended) = one_shot(port, route)
@@ -298,7 +326,7 @@ for cap in (nothing, 4)
                 # surfaces: one warning, with how far the body got and what it promised.
                 logged = timedwait(10.0; pollint = 0.05) do
                     any(r -> get(r.kwargs, :declared, nothing) == declared &&
-                             get(r.kwargs, :written, nothing) == 1000, warnings(logger))
+                             get(r.kwargs, :written, nothing) == length(FIRST), warnings(logger))
                 end
                 @test logged === :ok
             end
@@ -319,6 +347,58 @@ for cap in (nothing, 4)
                     @test startswith(text, "HTTP/1.1 500")
                     @test count("HTTP/1.1 ", text) == 1
                 end
+            end
+        end
+
+        @testset "cap=$cap: a chunked response that also names a Content-Length is sent whole (#529)" begin
+            # The FIXED writer is chosen by the framing HTTP picked, not by the header: holding a
+            # CHUNKED body to `content_length` (unset, -1) refused it on its first chunk.
+            lock(() -> empty!(logger.logs), logger.lock)
+            c = RawConn(port)
+            try
+                send!(c, "GET /te-and-cl HTTP/1.1\r\nHost: $HOST\r\nConnection: close\r\n\r\n")
+                @test timedwait(() -> c.eof, 10.0) === :ok
+                bytes = received(c)
+                @testset let ended = ending(c)          # printed with any red below (#504)
+                    text = String(copy(bytes))
+                    @test startswith(text, "HTTP/1.1 200")
+                    @test occursin(r"(?i)\r\ntransfer-encoding: chunked\r\n", text)
+                    hend = head_end(bytes)
+                    @test hend !== nothing
+                    # One chunk of FIRST, then the last-chunk marker.
+                    @test String(bytes[hend:end]) ==
+                          string(length(FIRST), base = 16) * "\r\n" * String(copy(FIRST)) * "\r\n0\r\n\r\n"
+                end
+            finally
+                close(c)
+            end
+            @test isempty(warnings(logger))
+        end
+
+        @testset "cap=$cap: a small body that fails after its first chunk still gets a clean 500 (#529)" begin
+            # HTTP.jl holds a FIXED body of 4 KiB or less to send it with its head in one write, so
+            # when one turns out short or its producer throws, nothing is on the wire yet: HTTP's
+            # loop answers 500 and drops what it held (JuliaWeb/HTTP.jl#1303). Before #529 Nitro's
+            # own writer had already sent the head, so these were a 200 with a truncated body. Not
+            # HTTP's 400 either: Nitro's length check throws before HTTP's `ProtocolError` could.
+            for route in ("/small-short", "/small-broken")
+                lock(() -> empty!(logger.logs), logger.lock)
+                (; bytes, ended) = one_shot(port, route)
+                @test ended != "open"
+                ended == "open" && continue
+                @testset let route = route, ended = ended   # printed with any red below (#504)
+                    text = String(copy(bytes))
+                    @test startswith(text, "HTTP/1.1 500")
+                    @test count("HTTP/1.1 ", text) == 1
+                    @test !occursin(String(copy(SMALL)), text)   # none of the held body leaked
+                end
+                # Still logged: the client sees only a 500, and the server log says why.
+                logged = timedwait(10.0; pollint = 0.05) do
+                    any(r -> get(r.kwargs, :declared, nothing) == 2000 &&
+                             get(r.kwargs, :written, nothing) == length(SMALL) &&
+                             get(r.kwargs, :head_sent, nothing) === false, warnings(logger))
+                end
+                @test logged === :ok
             end
         end
     finally
