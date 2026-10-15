@@ -101,14 +101,23 @@ binds the same way, so this is the narrow half of a supported operation rather t
 workaround. It is migration-neutral: `makemigrations` reads `models.jl` from disk and never
 consults `REGISTERED_MODULES`.
 
-**Why bind at all, when `.db(key)` already routes the query.** Before PormG 0.8 the
+**Why bind at all, when `.db(key)` already routes the query.** Because every store query
+starts with `model.objects`, and PormG resolves that property by the model *before* `.db()`
+is ever reached: `Base.getproperty(::Model_Type, :objects)` calls
+`Models.ensure_model_initialized(model)` first. Its fast path is a set `connect_key` that names
+a loaded connection. An unbound model misses it and runs the self-heal path on **every**
+session and task query — scanning `REGISTERED_MODULES` and `Base.loaded_modules`, and, for any
+loaded package carrying a `__pormg_init_path__` marker (what `@models_module` injects), logging
+an `@info "Self-healing: …"` and re-running `set_models` on that package. It then returns
+`false`, which `getproperty` ignores, so nothing fails and the query still runs; it is just a
+per-request log line and model re-registration nobody asked for (#532) — on PormG 0.8 it costs
+milliseconds per query where the bound fast path is effectively free.
+
+The binding was introduced for a different reason, which no longer holds. Before PormG 0.8 the
 transaction-scope check gated on the **model's** `connect_key` and never consulted the query's
-`.db()` override. Unbound, it threw `InvalidConfigurationError` for *every* query issued while
-any transaction was open on the calling task — swallowed on the read paths and rethrown on
-the writes, which is #202. PormG 0.8 (PormG#838) checks the pool the query *runs* on instead,
-so the stores' `.db(store.db_key)` alone now satisfies it. The binding stays so that the model
-and the store name one connection for any PormG path that resolves by the model rather than
-by `.db()`.
+`.db()` override, so an unbound model threw `InvalidConfigurationError` for every query issued
+while any transaction was open on the calling task (#202). PormG 0.8 (PormG#838) checks the
+pool the query *runs* on, which for the stores is what `.db(store.db_key)` resolves.
 
 **Why the model is per store and never a process-wide singleton.** `connect_key` names
 exactly one connection. Two stores on different keys sharing one model object would
@@ -193,6 +202,11 @@ prune alike — and it must name the connection whose `nitro_session` table you 
 Prefer `pormg_nitro_session(db_key=...)`, which creates the table and returns a store already
 pointed at the same connection.
 
+A `model` passed explicitly is used as given, including its `connect_key`; omit it and the
+store builds one bound to `db_key` (see `_bind_model!`). A supplied model whose `connect_key`
+is unset still routes correctly through `db_key`, but pays PormG's self-heal scan on every
+query — bind it to `db_key` first.
+
 ## Usage
 
 ```julia
@@ -266,11 +280,14 @@ session_store_full(store::PormGSessionStore) =
 # ignored `db_key`, and the throw is swallowed by the read paths below, so sessions silently
 # stopped persisting (#199).
 #
-# Since #202 the model carries `connect_key == store.db_key` too, so this call is redundant
-# for ROUTING and is kept anyway, for two reasons. It is the only thing the mock in
-# `test/extensions/pormg_worker_tests.jl` can pin (#203). And since PormG 0.8 (PormG#838) the
-# `.db()` key is the one PormG's transaction-scope check reads: inside a transaction, a query
-# whose pool has none open raises `TransactionError` instead of running in autocommit.
+# Since #202 a model the store builds carries `connect_key == store.db_key` too (see
+# `_bind_model!` for what that binding is for now), so this call is redundant for ROUTING on that
+# path and is kept anyway. A `model=` the caller supplies is used as given and need not be
+# bound. It is the only thing the mock in `test/extensions/pormg_worker_tests.jl` can pin
+# (#203). And since PormG 0.8 (PormG#838) the `.db()` key is the one PormG's transaction-scope
+# check reads: inside a transaction, a query whose pool has none open raises `TransactionError`
+# instead of running in autocommit. A source guard in `test/extensions/pormg_session_tests.jl`
+# pins that every `.objects` in this file goes through `.db(` (#532).
 _session_objects(store::PormGSessionStore) = store.model.objects.db(store.db_key)
 
 # -- Serialization helpers --
@@ -690,7 +707,9 @@ you bootstrapped. Prefer `pormg_nitro_worker(db_key=...)`, which creates the tab
 returns a store pointed at the same connection.
 
 A `model` passed explicitly is used as given, including its `connect_key`; omit it and the
-store builds one bound to `db_key` (see `_bind_model!`).
+store builds one bound to `db_key` (see `_bind_model!`). A supplied model whose `connect_key`
+is unset still routes correctly through `db_key`, but pays PormG's self-heal scan on every
+query — bind it to `db_key` first.
 """
 struct PormGWorkerStore <: AbstractWorkerStore
     model::Any
@@ -1624,11 +1643,12 @@ function __init__()
         PormG.register_ignore_tables!(["nitro_session", "nitro_task"])
     end
 
-    # There is no model priming here any more. Both models carry a `connect_key` since #202,
-    # and the key is only known when a store is constructed -- so a model built at load time
-    # could not be bound, and one process-wide model could not serve two stores on different
-    # keys. `session_model(db_key)` / `task_model(db_key)` build a bound model per store
-    # instead, which is a handful of allocations about twice per application.
+    # There is no model priming here any more. Both models carry a `connect_key` since #202
+    # (what it is for now is on `_bind_model!`, #532), and the key is only known when a store
+    # is constructed -- so a model built at load time could not be bound, and one process-wide
+    # model could not serve two stores on different keys. `session_model(db_key)` /
+    # `task_model(db_key)` build a bound model per store instead, which is a handful of
+    # allocations about twice per application.
 
     # Bridge the environment set in `NITRO_ENV`/`GENIE_ENV` to PormG's, so an app can call
     # `PormG.Configuration.load_many([...])` with no `env=` and get the environment Nitro
