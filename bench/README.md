@@ -20,7 +20,7 @@ bench/
 │   ├── session.jl      # MemoryStore read/write (payload-size scaling)
 │   ├── ratelimiter.jl  # limiter hot path: keying, lock contention, exempt-path scan
 │   └── taskpattern.jl  # SYNTHETIC replica of parallel_stream_handler's task overhead
-├── socket/             # real-socket load: server.jl (Nitro vs bare HTTP.jl), run.sh, contention.sh (oha)
+├── socket/             # real-socket load: server.jl (Nitro vs bare HTTP.jl), run.sh, contention.sh, stall.sh (oha)
 │   └── go/             # the Go net/http reference server run.sh's `go` mode builds
 ├── tasks/              # Julia tasks vs goroutines, no HTTP: tasks.jl, go/, run.sh
 ├── results/            # JSON run outputs — gitignored (machine-specific)
@@ -94,6 +94,7 @@ bench/socket/run.sh "nitro@8,1 nitro@8,2 nitro@8,4"  # one mode per --threads, i
 RATE=20000 bench/socket/run.sh "nitro@8,1 nitro@8,0" # fixed rate: latency without saturation (#491)
 JULIA="julia +1.12" bench/socket/run.sh              # another Julia, by juliaup channel
 bench/socket/contention.sh "8,1 6,2 8,0" 5 8s       # /health while the default pool is busy (#491)
+bench/socket/stall.sh "nitro nitro@8,0 go" 3 6s      # /plaintext while K handlers compute (#467)
 ```
 
 - `server.jl` serves `/plaintext`, `/json`, `/health`, `/cpu` and `/lag` in one of these `MODE`s:
@@ -101,8 +102,11 @@ bench/socket/contention.sh "8,1 6,2 8,0" 5 8s       # /health while the default 
   `bare_spawn` (HTTP.jl `listen!` + `streamhandler` with a `Threads.@spawn` per request, the shape
   Nitro takes and the ceiling to compare it with), and `bare_nospawn` (the handler on HTTP.jl's
   connection task). `/cpu` burns `CPU_MS` (default 50) without yielding; `/lag` is live only with
-  `LAG=1`. `WORKERS=1` adds `/burst?n=K` to the Nitro modes, which submits K Workers jobs that each
-  burn `JOB_MS` (default 500).
+  `LAG=1`. `/cpu_yield` burns the same but calls `yield()` every `YIELD_MS` (default 2).
+  `WORKERS=1` adds `/burst?n=K` to the Nitro modes, which submits K Workers jobs that each burn
+  `JOB_MS` (default 500), and `/cpu_job`, which submits one `/cpu` of work to a queue of
+  concurrency `BURST_K` and answers `202` (a full queue answers `503`); `/jobs` counts the
+  `/cpu_job` jobs not yet finished.
 - `run.sh` pins the server (`-t 8`) and the load generator to disjoint physical cores, warms each
   route, and reports the median, min and max of N runs plus the median p99. The default CPU sets
   assume a 6-core part whose SMT siblings are `n` and `n+6`; set `SERVER_CPUS`/`CLIENT_CPUS` for
@@ -138,6 +142,14 @@ bench/socket/contention.sh "8,1 6,2 8,0" 5 8s       # /health while the default 
   10 ms `sleep` on the default pool woke, which is the delay a `Timer`-driven deadline (a Workers
   timeout) sees. It answers whether the interactive thread protects a cheap request while
   handlers or jobs hold the CPU (#491).
+- `stall.sh [modes] [rounds] [duration]` keeps K requests computing `CPU_MS` (default 200) in
+  flight while `CONNS` connections saturate `/plaintext`, and reports `/plaintext`'s throughput
+  and p50/p99 for each K in `KS`: how few computing handlers it takes to stall the server (#467).
+  `VARIANTS` runs the same work as `cpu` (in the handler), `cpu_yield` and `cpu_job` (a Workers
+  queue, offered at the rate that would keep K busy and drained between passes); the `load_2xx`
+  column is the share of those submissions the queue accepted. Modes are `nitro`, `nitro@N,M` and
+  `go`, which runs `cpu` only. The latest table is in the deployment guide's *Handlers that
+  compute*.
 - `JULIA="julia +1.12"` runs the servers on another juliaup channel. Each Julia minor wants its
   own resolved manifest; `bench/Manifest-v1.12.toml` (gitignored) is the one 1.12 reads first, so
   copy `Manifest.toml` to it and `Pkg.resolve()` under 1.12 once.

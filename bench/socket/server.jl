@@ -22,10 +22,15 @@
 #   WARMUP=<seconds>    Delay before the profile window opens. Default 8.
 #   CPU_MS=50           What `/cpu` burns: a loop that never yields, holding its thread for this many
 #                       milliseconds (#491: does a CPU-bound handler starve `/health`?).
+#                       `/cpu_yield` burns the same but calls `yield()` every YIELD_MS (default 2),
+#                       the cooperative mitigation #467 measures.
 #   WORKERS=0|1         Nitro only: also serve `/burst?n=K`, which submits K Workers jobs that each
 #                       burn JOB_MS (default 500) without yielding, on a `WorkerRuntime` of its own.
 #                       `&queue=1` submits them to a queue of concurrency BURST_K instead of all at
 #                       once, and `&cp=MS` makes each job call `checkpoint!` every MS ms (#513).
+#                       `/cpu_job` submits ONE job of CPU_MS to that queue and answers 202 at once:
+#                       `/cpu`'s work moved off the request path (#467). `/jobs` answers how many
+#                       `/cpu_job` jobs are submitted and not yet finished, so a script can drain.
 #   BURST_K=<k>         Nitro only: that queue's concurrency. Default `nthreads(:default) - 2`, at
 #                       least 1. The queue buffers 100, so a queued burst above 100 is refused.
 #   LAG=0|1             Start the `/lag` probe (off by default, so a throughput run carries no extra
@@ -54,6 +59,7 @@ const ACCESS_LOG = get(ENV, "ACCESS_LOG", "0") == "1" || MODE == "nitro_log"
 const PROFILE_S  = parse(Float64, get(ENV, "PROFILE", "0"))
 const WARMUP_S   = parse(Float64, get(ENV, "WARMUP", "8"))
 const CPU_MS     = parse(Float64, get(ENV, "CPU_MS", "50"))
+const YIELD_MS   = parse(Float64, get(ENV, "YIELD_MS", "2"))
 const JOB_MS     = parse(Float64, get(ENV, "JOB_MS", "500"))
 const WORKERS    = get(ENV, "WORKERS", "0") == "1"
 const LAG        = get(ENV, "LAG", "0") == "1"
@@ -82,6 +88,26 @@ function burn(ms::Float64)::Float64
     return x
 end
 cpu_body() = string("ok ", burn(CPU_MS) > 2.0)   # never true; keeps `burn` from being elided
+
+# `burn`, with a `yield()` every `every_ms`: the cooperative mitigation for a CPU-bound handler
+# (#467). Same clock-read loop otherwise, so the two differ only in the yield.
+function burn_yielding(ms::Float64, every_ms::Float64)::Float64
+    now = time_ns()
+    deadline = now + round(UInt64, ms * 1e6)
+    step = round(UInt64, every_ms * 1e6)
+    next = now + step
+    x = 0.0
+    while (now = time_ns()) < deadline
+        x = sin(x + 1.0)
+        GC.safepoint()
+        if now >= next
+            yield()
+            next = time_ns() + step
+        end
+    end
+    return x
+end
+cpu_yield_body() = string("ok ", burn_yielding(CPU_MS, YIELD_MS) > 2.0)
 
 # How late a 10 ms sleep on the `:default` pool wakes. Every mode can start it (LAG=1), so modes
 # stay alike.
@@ -112,6 +138,7 @@ function bare_handler(req::HTTP.Request)::HTTP.Response
     target == "/json"      && return HTTP.Response(200, ["Content-Type" => "application/json"], json_body())
     target == "/health"    && return HTTP.Response(200, "ok")
     target == "/cpu"       && return HTTP.Response(200, cpu_body())
+    target == "/cpu_yield" && return HTTP.Response(200, cpu_yield_body())
     target == "/lag"       && return HTTP.Response(200, ["Content-Type" => "application/json"], lag_body())
     return HTTP.Response(404)
 end
@@ -129,9 +156,17 @@ function start_nitro()
         path("/json",      req -> Res.send(json_body(); content_type = "application/json"); method = "GET"),
         path("/health",    req -> Res.send("ok"); method = "GET"),
         path("/cpu",       req -> Res.send(cpu_body()); method = "GET"),
+        path("/cpu_yield", req -> Res.send(cpu_yield_body()); method = "GET"),
         path("/lag",       req -> Res.send(lag_body(); content_type = "application/json"); method = "GET"),
     )
-    WORKERS && urlpatterns(app, "", path("/burst", burst_route(); method = "GET"))
+    if WORKERS
+        burst, cpu_job, jobs = worker_routes()
+        urlpatterns(app, "",
+            path("/burst",   burst; method = "GET"),
+            path("/cpu_job", cpu_job; method = "GET"),
+            path("/jobs",    jobs; method = "GET"),
+        )
+    end
     serve(app; host = "127.0.0.1", port = PORT, async = true, show_banner = false,
           access_log = ACCESS_LOG)
     return app
@@ -145,13 +180,33 @@ end
 # The two #513 levers are per REQUEST, not per server, so one `contention.sh` run interleaves every
 # variant on the same servers: `queue=1` sends the jobs to a queue of concurrency BURST_K (the
 # bulkhead), and `cp=MS` makes each one call `checkpoint!` every MS milliseconds.
-function burst_route()
+#
+# `/cpu_job` (#467) is `/cpu` moved to that same queue: one job of CPU_MS per request, answered
+# 202 before it runs. `/jobs` counts the ones not yet finished, so `stall.sh` can drain between
+# passes instead of letting one pass's backlog load the next.
+function worker_routes()
     runtime = Nitro.Workers.WorkerRuntime(Nitro.Workers.InMemoryWorkerStore();
                                           max_concurrent_runs = nothing,
                                           queues = ["burst" => BURST_K])
     owner = Nitro.Workers.Owner("bench")
     seq = Threads.Atomic{Int}(0)
-    return function (req)
+    pending = Threads.Atomic{Int}(0)
+    cpu_job = function (req)
+        id = Threads.atomic_add!(seq, 1)
+        Threads.atomic_add!(pending, 1)
+        job = _ -> try burn(CPU_MS) finally Threads.atomic_sub!(pending, 1) end
+        try
+            Nitro.Workers.submit_queued_task("burst", "cpu-$id", job, owner; runtime)
+        catch
+            # A full queue refuses the job with `WorkerCapacityError`, which Nitro answers 503.
+            # It will never run, so it is not pending.
+            Threads.atomic_sub!(pending, 1)
+            rethrow()
+        end
+        return Res.send("accepted"; status = 202)
+    end
+    jobs = req -> Res.send(string(pending[]))
+    burst = function (req)
         query = Nitro.getquery(req)
         n = parse(Int, something(get(query, "n", nothing), "8"))
         queued = get(query, "queue", "0") == "1"
@@ -168,6 +223,7 @@ function burst_route()
         end
         return Res.send("submitted $n")
     end
+    return burst, cpu_job, jobs
 end
 
 # `burn`, but calling `checkpoint!` every `every_ms` of it (#513): the cooperative yield point a

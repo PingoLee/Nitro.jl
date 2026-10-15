@@ -111,7 +111,8 @@ So:
 - **Latency-bound**: keep the interactive pool and give it a second thread within the same total,
   `--threads=N-2,2`. That had the lowest p99 in nearly every fixed-rate run.
 - **CPU-bound handlers or jobs**: no layout protects the other requests from them, because Julia
-  does not preempt a task that computes without yielding. Bound them instead, so some default
+  does not preempt a task that computes without yielding (measured in
+  [Handlers that compute](@ref) below). Bound them instead, so some default
   threads stay free for requests: run CPU-heavy Workers jobs through a declared queue with a
   concurrency below the default thread count, such as `queues = ["compute" => max(N - 2, 1)]`
   (`submit_queued_task`), which runs at most that many at once and buffers up to 100 behind them
@@ -128,6 +129,53 @@ scheduler), and the same press under load stopped `serve` at once in some runs, 
 press in most, and ended the whole Julia session in 2 of 10. Develop at the default layout, and
 stop a production server with `terminate` or its process supervisor rather than Ctrl-C (see
 `serve`'s docstring).
+
+### Handlers that compute
+
+A task gives up its thread only when it waits: on I/O, a lock, a `sleep` or a `yield()`. Julia
+1.12 does not preempt one, so a handler that computes for 200 ms holds its default thread for
+200 ms. Waiting on a database, another service or a file is not computing; those handlers give
+their thread back while they wait and are not what this section is about.
+
+On the machine above (`--threads=8`, so 8 default threads), `bench/socket/stall.sh` kept k
+requests computing 200 ms each in flight while a load generator held 50 connections on a minimal
+route, and measured that route. The same 200 ms of work was run three ways in Nitro: computing in
+the handler, the same loop calling `yield()` every 2 ms, and moved to a Workers queue of
+concurrency 6 with the handler answering `202`. Go's `net/http`, which preempts a computing
+goroutine, ran the first shape on the same CPUs for reference. Each cell is the minimal route's
+requests per second and p99. The queue column is from a second run the same day, after a fix to
+the benchmark's own job counter; its k = 0 baseline was 102k and 2.4 ms.
+
+| k | In the handler | `yield()` every 2 ms | Workers queue of 6, `202` | Go, in the handler |
+|---|---|---|---|---|
+| 0 | 100k, 2.6 ms | | | 238k, 3.4 ms |
+| 1 | 99k, 2.7 ms | 99k, 2.6 ms | 101k, 2.5 ms | 228k, 3.4 ms |
+| 4 | 96k, 2.9 ms | 95k, 3.0 ms | 98k, 3.0 ms | 156k, 1.8 ms |
+| 6 | 60k, 4.0 ms | 70k, 4.0 ms | 61k, 3.8 ms | 93k, 3.1 ms |
+| 7 | 18k, 9.7 ms | 32k, 7.4 ms | 61k, 3.7 ms | 57k, 5.7 ms |
+| 8 | 1.5k, 192 ms | 16k, 10.5 ms | 60k, 4.0 ms | 26k, 19.9 ms |
+| 16 | 221, 804 ms | 7.6k, 36 ms | 60k, 3.9 ms | 3.4k, 64 ms |
+
+- **The knee is the default thread count.** With a few computing handlers the other requests
+  barely notice. Near 8, a cheap request waits for a computing handler to finish, so its p99
+  becomes the handlers' own run time: 192 ms behind 200 ms handlers. (The 8 CPUs here are 4
+  cores' hyperthreads, which is why the drop begins at 6.) `--threads=8,0` measured the same:
+  1.6k requests per second and a p99 of 213 ms at k = 8.
+- **So the threshold is your latency budget.** The longest a handler may compute without yielding
+  is the delay you accept for *every other* request on a busy server. For an API answering in
+  milliseconds, that is a few milliseconds of computation.
+- **Past it, move the work to a queue** whose concurrency leaves threads free, and answer `202`
+  with the task id ([CPU-Bound Jobs](@ref)). Only 6 jobs ever ran at once, so the minimal route
+  kept about 60k requests per second at every k. The cost moves to the jobs: past what the queue
+  can run, they wait in its buffer, and once the buffer is full (100 by default) a submit throws
+  `WorkerCapacityError`, which Nitro answers `503`. At k = 16, half the submissions were refused.
+- **Or `yield()` every 1–2 ms** in a loop that has to stay in the handler. It does not make the
+  work cheaper, so throughput still falls, but it bounds the wait: a p99 of 10.5 ms at k = 8,
+  lower than Go's 19.9 ms (Go preempts a goroutine after about 10 ms).
+
+No setting in Nitro bounds a computing handler: `read_timeout` and `write_timeout` are socket
+deadlines, and nothing can stop a task from outside. The `AccessLog` middleware records each
+request's `duration_ms`, which is where a slow handler shows up.
 
 ## Memory and GC
 

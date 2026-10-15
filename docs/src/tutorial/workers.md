@@ -638,6 +638,10 @@ yielding holds its thread until it returns. Worker callbacks and request handler
 request. With 64 such jobs in flight, a `/health` probe was measured at a p99 of about 4 seconds,
 in every thread layout ([#512](https://github.com/PingoLee/Nitro.jl/pull/512)).
 
+A request handler that computes has the same problem, and a queue like the one below is also how
+it gets out of it: submit the work, answer `202`, and let the client poll. The measurements,
+handlers against a queue against `yield()`, are in [Handlers that compute](@ref).
+
 Bound the work, which is the only in-process lever. Submit CPU-bound jobs to a queue whose
 concurrency leaves threads free:
 
