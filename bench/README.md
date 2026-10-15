@@ -141,3 +141,27 @@ bench/socket/contention.sh "8,1 6,2 8,0" 5 8s       # /health while the default 
   copy `Manifest.toml` to it and `Pkg.resolve()` under 1.12 once.
 - Compare modes **within one run**, not across days: the CPU governor and anything else on the box
   move absolute numbers by tens of percent. Requires `oha`, `jq`, `curl` and `taskset`.
+
+## juliac (compiled executable)
+
+`juliac/` asks whether a Nitro app can be compiled with Julia 1.12's `juliac`, and what stands
+between `main` and `--trim=safe` (#570). It is a readiness probe, not a benchmark group:
+
+```bash
+bench/juliac/build.sh                                   # untrimmed exe: does HTTP + Reseau + Nitro serve from an image?
+bench/juliac/build.sh unsafe-warn                       # the warning list is the trim-readiness backlog
+bench/juliac/build.sh safe                              # the goal
+bench/juliac/smoke.sh bench/juliac/out/nitro-min-no     # first vs warm /plaintext, RSS, OS threads
+bench/juliac/smoke.sh jit                               # the same app under the JIT, as the baseline
+```
+
+- `app.jl` is the smallest app the driver can be pointed at: one exact route, no middleware, and
+  routes registered at **top level**, so registration (and the reflection it needs) runs in the
+  build process while `main` only serves. It is both the compile input and, run as a script, the
+  JIT baseline — `@main` runs when the file is the program.
+- `build.sh` pins `--project` to `bench/juliac` (the driver compiles the *active* project),
+  instantiates it, and logs to `results/juliac-<stamp>-<mode>.log`; the exe lands in `juliac/out/`
+  (gitignored).
+- `smoke.sh` exports `THREADS` as `JULIA_NUM_THREADS` for the exe — a compiled `main` does not
+  parse Julia flags — and reports the OS thread count, which is how you see whether the layout took.
+- `JULIA="julia +1.12"` is the default: the driver lives in 1.12's `share/julia/juliac/`.
