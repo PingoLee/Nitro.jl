@@ -269,16 +269,6 @@ end
 
 
 """
-    serveparallel(; middleware::Vector=[], handler=stream_handler, host="127.0.0.1", port=8080, serialize=true, async=false, catch_errors=true, docs=true, metrics=true, kwargs...)
-
-"""
-function serveparallel(; kwargs...)
-    @warn "serveparallel() is deprecated. serve() always runs each request on its own Threads.@spawn task. Please use serve() instead."
-    serve(; kwargs...)
-end
-
-
-"""
     worker_startup(; kwargs...)
 
 Create a lifecycle middleware that starts `Nitro.Workers` when `serve()` starts and

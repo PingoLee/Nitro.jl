@@ -308,7 +308,7 @@ end
     end
 end
 
-@testset "serve() warnings name serve(), never serveparallel() (#149)" begin
+@testset "serve() warnings name serve() (#149)" begin
     # Every record `serve()` logs, at every level. The old guards keyed on an `is_test()` that
     # never returned true, so these warnings reached production -- asserting on the captured
     # records is what shows what an operator reads.
@@ -328,11 +328,9 @@ end
     @test any(r -> r.level == Base.CoreLogging.Warn &&
                    occursin("queuesize", string(r.message)) &&
                    occursin("serve()", string(r.message)), logs)
-    @test !mentions(logs, "serveparallel")
 
     # One thread is a valid deployment: nothing warns about it, on any thread count.
     logs = serve_logs()
-    @test !mentions(logs, "serveparallel")
     @test !mentions(logs, "thread available")
     @test !mentions(logs, "queuesize")
 end

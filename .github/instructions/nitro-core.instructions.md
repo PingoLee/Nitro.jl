@@ -15,7 +15,7 @@ Whenever you write code, write tests, or propose architecture for this repositor
 - **Always multithreaded**: `serve()` always runs each request on its own `Threads.@spawn` task; there is no keyword to turn it off.
 - **Handling I/O vs CPU**: All endpoints run via `Threads.@spawn`. Do not add heavy OS-level multi-processing (`Distributed` or multi-process clustering) unless explicitly requested. Threads scale I/O-bound handlers, but Julia tasks are cooperative: a CPU-bound handler holds its thread until it finishes.
 - **Task model**: where code runs, background tasks, interrupts and cancellation are in [`concurrency.instructions.md`](concurrency.instructions.md).
-- **No `serveparallel()`**: This function is deprecated. Do not use or suggest it.
+- **No `serveparallel()`**: This function does not exist (removed in #579). Do not use or suggest it.
 
 ## 3. Routing: Django-Style ONLY
 - The ONLY way to define routes is via `path()`, `urlpatterns()`, and `include_routes()`.
