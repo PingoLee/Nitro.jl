@@ -1321,6 +1321,75 @@ end
 end
 
 
+# -- #577 -----------------------------------------------------------------------------------
+#
+# JSON.jl checks a string's escapes only when it materializes the string, and a typed parse skips
+# a member `T` does not declare without materializing it. So an invalid escape in an undeclared
+# member binds, while the same escape in a declared member -- or anywhere, through `getjson` --
+# is refused. That is the documented behavior (*Request Body* guide), not a target: if a JSON.jl
+# bump turns a "binds" row red, the validating skip landed upstream. Update the guide and flip
+# the row; do not work around it to keep the row green.
+@testitem "Json{T} skips undeclared members without checking their escapes (#577)" tags=[:core] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+using Nitro: App, Json, JsonFragment
+
+struct Item577; name::String; qty::Int; end
+@kwdef struct KwItem577; name::String; qty::Int = 1; end
+
+app = App(mod = @__MODULE__)
+urlpatterns(app, "",
+    path("/plain", (req, i::Json{Item577}) -> "$(i.payload.name)/$(i.payload.qty)"; method = "POST"),
+    path("/kwdef", (req, i::Json{KwItem577}) -> "$(i.payload.name)/$(i.payload.qty)"; method = "POST"),
+    path("/fragment", (req, item::JsonFragment{Item577}) -> "ok"; method = "POST"),
+    path("/getjson", req -> getjson(req) === nothing ? "refused" : "parsed"; method = "POST"),
+)
+send(target, body) = internalrequest(app,
+    HTTP.Request("POST", target, ["Content-Type" => "application/json"], body))
+undeclared(value) = """{"name":"item","qty":3,"note":$value}"""
+
+# The last one is a bad escape in a member NAME nested inside the skipped value.
+bad_escapes = (raw"\"bad \q escape\"", raw"\"\uZZZZ\"", raw"{\"a\":[\"\q\"]}", raw"{\"k\q\":1}")
+# Depth is checked across the whole body before the parse (#314), not by the skip.
+still_checked = ("\"a\x01b\"", "01", "1e", "-", "nul", "[1,2,]", "["^513 * "]"^513)
+
+@testset "an invalid escape in a declared member, or in a top-level member name, is a 400" begin
+    for target in ("/plain", "/kwdef")
+        @test send(target, raw"""{"name":"bad \q","qty":3}""").status == 400
+        @test send(target, raw"""{"name":"\uZZZZ","qty":3}""").status == 400
+        # A top-level member name is decoded to match it against the fields, declared or not.
+        @test send(target, raw"""{"name":"item","qty":3,"no\qte":1}""").status == 400
+    end
+end
+
+@testset "an invalid escape in an undeclared member binds" begin
+    for target in ("/plain", "/kwdef"), value in bad_escapes
+        r = send(target, undeclared(value))
+        @test r.status == 200
+        @test Nitro.text(r) == "item/3"
+    end
+end
+
+@testset "everything but string escapes is still checked in an undeclared member" begin
+    for target in ("/plain", "/kwdef"), value in still_checked
+        @test send(target, undeclared(value)).status == 400
+    end
+end
+
+@testset "getjson and JsonFragment{T} parse the whole body, so they refuse it" begin
+    for value in (bad_escapes..., still_checked...)
+        @test Nitro.text(send("/getjson", undeclared(value))) == "refused"
+        @test send("/fragment", """{"item":{"name":"item","qty":3},"note":$value}""").status == 400
+    end
+    # The control: the same bodies with a valid member are accepted by both.
+    @test Nitro.text(send("/getjson", undeclared("\"fine\""))) == "parsed"
+    @test send("/fragment", """{"item":{"name":"item","qty":3},"note":"fine"}""").status == 200
+end
+
+end
+
+
 # -- #254 -----------------------------------------------------------------------------------
 #
 # The `Session` extractor looks a session id up in an application-supplied store through a
