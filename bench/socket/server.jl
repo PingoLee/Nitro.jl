@@ -10,7 +10,11 @@
 #                       the shape Nitro's `parallel_stream_handler` takes, and the ceiling to
 #                       compare it against.
 #   MODE=bare_nospawn   The same without the spawn: the handler runs on HTTP.jl's connection task.
+#   MODE=bare_pool      `bare_spawn` with the per-request spawn replaced by POOL long-lived tasks on
+#                       `:default` (default `nthreads(:default)`), fed by a channel (#468): is
+#                       CREATING a task per request a material cost, or is a pool no cheaper?
 #
+#   POOL=<n>            bare_pool only: how many pooled handler tasks.
 #   PORT=8080           Loopback port.
 #   ACCESS_LOG=0|1      Nitro only: `serve(access_log = …)`. Default 0.
 #   PROFILE=<seconds>   After WARMUP seconds, sample every thread for this long and write three
@@ -149,6 +153,44 @@ function start_bare(spawn::Bool)
     return HTTP.listen!(handler, "127.0.0.1", PORT)
 end
 
+# One reusable hand-off per CONNECTION (a connection serves one request at a time), kept in the
+# connection task's storage: the pool side allocates no task and no event per request, which is
+# the whole point of a pool. `stream` is untyped, one dynamic call per request -- tens of
+# nanoseconds against a spawn's microseconds, and it errs in the spawn's favour.
+mutable struct PoolSlot
+    stream::Any
+    err::Any
+    const done::Base.Event
+    PoolSlot() = new(nothing, nothing, Base.Event(true))   # autoreset: reusable
+end
+
+function start_bare_pool()
+    inner = HTTP.streamhandler(bare_handler)
+    n = parse(Int, get(ENV, "POOL", string(Threads.nthreads(:default))))
+    jobs = Channel{PoolSlot}(Inf)
+    for _ in 1:n
+        Threads.@spawn :default for slot in jobs
+            try
+                inner(slot.stream)
+            catch e
+                slot.err = e
+            end
+            notify(slot.done)
+        end
+    end
+    handler = function (stream)
+        slot = get!(PoolSlot, task_local_storage(), :bench_pool_slot)::PoolSlot
+        slot.stream = stream
+        slot.err = nothing
+        put!(jobs, slot)
+        wait(slot.done)
+        slot.stream = nothing
+        slot.err === nothing || throw(slot.err)
+        return nothing
+    end
+    return HTTP.listen!(handler, "127.0.0.1", PORT)
+end
+
 function start_nitro()
     app = App()
     urlpatterns(app, "",
@@ -282,13 +324,90 @@ PROFILE_S > 0 && @eval function profile_window()
         Profile.print(IOContext(io, :displaysize => (10_000, 400)); format = :tree, C = true,
                       threads = interactive, mincount = 20, maxdepth = 80)
     end
+    open(io -> sched_share(io, interactive), "$stem-sched.txt", "w")
     @info "bench: profile written" stem
+end
+
+# What share of the AWAKE samples is task machinery (#468): creating, scheduling, switching to and
+# waiting on tasks. Each awake sample is charged to the leaf-most frame that decides it: a C frame
+# outside Julia's runtime (libc, libuv) is skipped, so the `pthread_cond_signal` that wakes a
+# thread is charged to `scheduler.c` and a `memcpy` inside `jl_new_task` to `task.c`; a runtime C
+# frame that is neither task nor GC code (dispatch, `jl_apply`) is skipped too, to its caller. A
+# Julia frame decides: task machinery if it is one of Base's task files, otherwise `other`.
+# Sleeping samples -- a thread parked with nothing to run -- are counted separately and charged to
+# nothing: without the profiler's sleep state an idle thread reads as time spent in `poptask`.
+PROFILE_S > 0 && @eval begin
+const SCHED_JL = ("task.jl", "partr.jl", "condition.jl", "lock.jl", "locks-mt.jl",
+                  "threadingconstructs.jl")
+const SCHED_C  = ("task.c", "scheduler.c", "partr.c", "threading.c")
+
+# `:tasks`, `:gc` or `:other` when this frame decides the sample, `nothing` to look at its caller.
+function frame_category(fr)::Union{Symbol, Nothing}
+    path = string(fr.file)
+    f = basename(path)
+    (isempty(f) || f == "?") && return nothing
+    if fr.from_c
+        occursin("libuv", path) && return nothing        # libuv's own `src/` is not Julia's
+        f in SCHED_C && return :tasks
+        (startswith(f, "gc") && endswith(f, ".c")) || f == "safepoint.c" ? :gc : nothing
+    else
+        base = startswith(path, "./") || occursin("/base/", path)   # not a package's `task.jl`
+        base && f in SCHED_JL && return :tasks
+        return base && f == "gc.jl" ? :gc : :other
+    end
+end
+
+function sched_share(io::IO, interactive::Vector{Int})
+    data, lidict = Profile.retrieve()
+    # Each block is: ip... (leaf first), threadid, taskid, cycles, sleep state + 1, 0, 0 -- the
+    # offsets are Profile's own `META_OFFSET_*`, and `is_block_end` finds the closing zero.
+    counts = Dict{Tuple{Symbol, Symbol}, Int}()   # (pool, category) => samples
+    block_start = 1
+    for i in eachindex(data)
+        i > Profile.META_OFFSET_THREADID || continue
+        Profile.is_block_end(data, i) || continue
+        tid = Int(data[i - Profile.META_OFFSET_THREADID])
+        sleeping = data[i - Profile.META_OFFSET_SLEEPSTATE] - 1 == 1
+        # The profiler also samples threads Julia did not start for tasks: the parallel GC's (one
+        # per default thread unless --gcthreads) and any I/O poller. Parked in a condition wait,
+        # they read as awake, so lumping them in with `:default` halves every share.
+        pool = tid in interactive ? :interactive :
+               tid <= Threads.maxthreadid() && Threads.threadpool(tid) == :default ? :default :
+               :foreign
+        cat = sleeping ? :sleeping : :other
+        if !sleeping && pool !== :foreign
+            # ips leaf first, and each ip's frames (inlining) leaf first too.
+            found = false
+            for j in block_start:(i - Profile.META_OFFSET_THREADID - 1)
+                for fr in get(lidict, data[j], ())
+                    c = frame_category(fr)
+                    c === nothing && continue
+                    cat = c; found = true; break
+                end
+                found && break
+            end
+        end
+        counts[(pool, cat)] = get(counts, (pool, cat), 0) + 1
+        block_start = i + 1
+    end
+    println(io, "samples by pool and category (awake samples charged to the leaf-most deciding frame)")
+    for pool in (:interactive, :default)
+        awake = sum(get(counts, (pool, c), 0) for c in (:tasks, :gc, :other))
+        asleep = get(counts, (pool, :sleeping), 0)
+        pct(c) = awake == 0 ? 0.0 : round(100 * get(counts, (pool, c), 0) / awake; digits = 1)
+        println(io, rpad(string(pool), 12), " awake=", awake, " sleeping=", asleep,
+                " | tasks ", pct(:tasks), "%  gc ", pct(:gc), "%  other ", pct(:other), "%")
+    end
+    foreign = sum(v for ((p, _), v) in counts if p === :foreign; init = 0)
+    println(io, rpad("foreign", 12), " samples=", foreign, " (GC and I/O threads, not counted above)")
+end
 end
 
 handle = MODE in ("nitro", "nitro_log") ? start_nitro() :
          MODE == "bare_spawn"   ? start_bare(true) :
          MODE == "bare_nospawn" ? start_bare(false) :
-         error("unknown MODE=$(MODE): expected nitro, nitro_log, bare_spawn or bare_nospawn")
+         MODE == "bare_pool"    ? start_bare_pool() :
+         error("unknown MODE=$(MODE): expected nitro, nitro_log, bare_spawn, bare_nospawn or bare_pool")
 
 @info "bench: serving" MODE PORT threads = Threads.nthreads() interactive = Threads.nthreads(:interactive)
 PROFILE_S > 0 && Threads.@spawn profile_window()

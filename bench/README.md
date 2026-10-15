@@ -100,8 +100,9 @@ bench/socket/stall.sh "nitro nitro@8,0 go" 3 6s      # /plaintext while K handle
 - `server.jl` serves `/plaintext`, `/json`, `/health`, `/cpu` and `/lag` in one of these `MODE`s:
   `nitro` (`serve()` with no middleware), `nitro_log` (the same with the access log on),
   `bare_spawn` (HTTP.jl `listen!` + `streamhandler` with a `Threads.@spawn` per request, the shape
-  Nitro takes and the ceiling to compare it with), and `bare_nospawn` (the handler on HTTP.jl's
-  connection task). `/cpu` burns `CPU_MS` (default 50) without yielding; `/lag` is live only with
+  Nitro takes and the ceiling to compare it with), `bare_nospawn` (the handler on HTTP.jl's
+  connection task), and `bare_pool` (`bare_spawn` with the spawn replaced by `POOL` long-lived
+  tasks, default `nthreads(:default)`, fed by a `Channel`: no task created per request, #468). `/cpu` burns `CPU_MS` (default 50) without yielding; `/lag` is live only with
   `LAG=1`. `/cpu_yield` burns the same but calls `yield()` every `YIELD_MS` (default 2).
   `WORKERS=1` adds `/burst?n=K` to the Nitro modes, which submits K Workers jobs that each burn
   `JOB_MS` (default 500), and `/cpu_job`, which submits one `/cpu` of work to a queue of
@@ -111,7 +112,13 @@ bench/socket/stall.sh "nitro nitro@8,0 go" 3 6s      # /plaintext while K handle
   route, and reports the median, min and max of N runs plus the median p99. The default CPU sets
   assume a 6-core part whose SMT siblings are `n` and `n+6`; set `SERVER_CPUS`/`CLIENT_CPUS` for
   another layout. Results go to `results/socket-<stamp>.tsv`, profiles to
-  `results/profile-<mode>-<time>-{flat,threads,interactive-tree}.txt` — the last is a call tree
+  `results/profile-<mode>-<time>-{flat,threads,interactive-tree,sched}.txt`. `sched` is the share of
+  each pool's awake samples whose leaf-most deciding frame is task machinery (Base's `task.jl`,
+  `partr.jl`, …, the runtime's `task.c`, `scheduler.c`, …) or GC (allocation and waiting for a
+  collection included), with sleeping samples counted apart. A libc or libuv frame decides
+  nothing, so a thread wake-up's `pthread_cond_signal` counts as `scheduler.c`. Threads that run
+  no tasks, the parallel GC's and the I/O poller's, are counted apart too. It is an upper bound on
+  task overhead, since a thread spinning for work counts too. `interactive-tree` is a call tree
   of the `:interactive` threads only, which is where HTTP.jl accepts, parses every request head
   and wakes the per-request task (#462). It keeps C frames and opens with the window's GC time.
   Without C frames, a stop-the-world GC wait (`jl_safepoint_wait_gc`) is charged to whatever
@@ -129,6 +136,13 @@ bench/socket/stall.sh "nitro nitro@8,0 go" 3 6s      # /plaintext while K handle
   precompile workload warms; set `BASE_ROOT` to measure another checkout.
 - `trace_first_request.sh [route]` runs the server under `--trace-compile` and prints exactly
   what the first request compiled, which is the list of what the precompile workload missed.
+- Pool against spawn (#468), on the box and versions of the *Comparing with Go* tables below,
+  in a run of its own: `bare_pool` served 93k `/plaintext`
+  requests per second against `bare_spawn`'s 112k at `--threads=8` (p99 2.8 ms against 1.2 ms),
+  and 153k against 168k at `8,0`. Under the profiler, creating the per-request task is about 8% of
+  the interactive thread at `8,1`; waking a default thread for it is twice that, and a pool's
+  hand-off pays the wake too. The conclusion is recorded beside `parallel_stream_handler` in
+  `src/core/transport.jl`.
 - `MODE=nitro_log` is `nitro` with the default console access log on (#443), for a one-run A/B
   of what that line costs.
 - `RATE=<n>` makes `run.sh` send a fixed `n` requests per second (`oha -q`, with
