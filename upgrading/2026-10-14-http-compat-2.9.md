@@ -1,6 +1,6 @@
 ## HTTP compat moves to `~2.9` — an app pinning `~2.8` must move too, and the keep-alive wait is now `idle_timeout`'s
 
-- **Version**: Unreleased
+- **Version**: 0.6.0
 - **Nitro ref**: `Project.toml` `[compat]`; `src/core/lifecycle.jl` (`preprocesskwargs`,
   `_validate_allow_h2c`), `src/core/transport.jl` (`_clear_header_deadline!` removed);
   `test/http_internals_contract_tests.jl`

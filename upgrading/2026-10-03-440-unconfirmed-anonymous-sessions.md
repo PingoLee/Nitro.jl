@@ -1,6 +1,6 @@
 ## `SessionMiddleware` — a new anonymous session lives `unconfirmed_max_age` until its cookie comes back (#440)
 
-- **Version**: Unreleased
+- **Version**: 0.6.0
 - **Nitro ref**: [#440](https://github.com/PingoLee/Nitro.jl/issues/440) ;
   `src/middleware/session_middleware.jl`, `src/types.jl`, `ext/NitroPormGExt.jl`
 - **Recorded**: 2026-10-03

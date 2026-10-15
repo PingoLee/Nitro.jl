@@ -1,6 +1,6 @@
 ## `serve(read_header_timeout = …)` defaults to 15 seconds, not 120 (#531)
 
-- **Version**: Unreleased
+- **Version**: 0.6.0
 - **Nitro ref**: [#531](https://github.com/PingoLee/Nitro.jl/issues/531) ; `src/constants.jl`
 - **Recorded**: 2026-10-15
 - **Severity**: **behavior change (security default).** An app that does not set

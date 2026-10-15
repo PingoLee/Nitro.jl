@@ -1,6 +1,6 @@
 ## `CSRFMiddleware` — a new visitor gets a token only when a handler asks for it with `csrf_token!` (#431)
 
-- **Version**: Unreleased
+- **Version**: 0.6.0
 - **Nitro ref**: [#431](https://github.com/PingoLee/Nitro.jl/issues/431) ;
   `src/middleware/csrf_middleware.jl`
 - **Recorded**: 2026-10-02

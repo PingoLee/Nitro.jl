@@ -1,6 +1,6 @@
 ## `RateLimiter` — an exception from below the limiter propagates once, instead of becoming its `503` or running the chain twice (#421)
 
-- **Version**: Unreleased
+- **Version**: 0.6.0
 - **Nitro ref**: [#421](https://github.com/PingoLee/Nitro.jl/issues/421) ;
   `src/middleware/rate_limiter.jl`
 - **Recorded**: 2026-10-02

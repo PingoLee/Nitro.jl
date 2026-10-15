@@ -1,6 +1,6 @@
 ## `CSRFMiddleware` — a bearer-only request skips the token check by default (#438)
 
-- **Version**: Unreleased
+- **Version**: 0.6.0
 - **Nitro ref**: [#438](https://github.com/PingoLee/Nitro.jl/issues/438) ;
   `src/middleware/csrf_middleware.jl`
 - **Recorded**: 2026-10-03

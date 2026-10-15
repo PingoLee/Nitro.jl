@@ -1,6 +1,6 @@
 ## `serve(...; parallel=...)` is removed — every request always runs on its own task (#525)
 
-- **Version**: Unreleased
+- **Version**: 0.6.0
 - **Nitro ref**: [#525](https://github.com/PingoLee/Nitro.jl/issues/525) ; `src/core/lifecycle.jl`
 - **Recorded**: 2026-10-15
 - **Severity**: **breaking (removed kwarg)** — a `serve` call that still passes `parallel` no

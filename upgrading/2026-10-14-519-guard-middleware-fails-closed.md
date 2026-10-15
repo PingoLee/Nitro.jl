@@ -1,6 +1,6 @@
 ## `GuardMiddleware` — a guard result other than `nothing` or a response is a 500, not an admission (#519)
 
-- **Version**: Unreleased
+- **Version**: 0.6.0
 - **Nitro ref**: [#519](https://github.com/PingoLee/Nitro.jl/issues/519) ; `src/middleware/guards.jl`
 - **Recorded**: 2026-10-14
 - **Severity**: **behavior change (auth).** The fix fails closed: a request that a malformed guard

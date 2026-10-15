@@ -1,6 +1,6 @@
 ## Workers — `submit_sequential_task` is now `submit_queued_task`, and queue status reports `:current_tasks` (#513)
 
-- **Version**: Unreleased
+- **Version**: 0.6.0
 - **Nitro ref**: [#513](https://github.com/PingoLee/Nitro.jl/issues/513) ;
   `src/Workers/api.jl`, `src/Workers/queue.jl`, `src/Workers/types.jl`
 - **Recorded**: 2026-10-14
