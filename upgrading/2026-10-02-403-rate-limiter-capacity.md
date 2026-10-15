@@ -1,6 +1,6 @@
 ## `RateLimiter` — both strategies cap their store at `max_clients` and refuse new clients when full, instead of growing or evicting (#403)
 
-- **Version**: Unreleased
+- **Version**: 0.6.0
 - **Nitro ref**: [#403](https://github.com/PingoLee/Nitro.jl/issues/403) ;
   `src/middleware/rate_limiter.jl`
 - **Recorded**: 2026-10-02

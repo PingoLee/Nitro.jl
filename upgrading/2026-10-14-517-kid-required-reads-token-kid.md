@@ -1,6 +1,6 @@
 ## `kid_required` — reads the token's kid, never one an app-built `Principal` carries (#517)
 
-- **Version**: Unreleased
+- **Version**: 0.6.0
 - **Nitro ref**: [#517](https://github.com/PingoLee/Nitro.jl/issues/517) ; `src/middleware/guards.jl`
 - **Recorded**: 2026-10-14
 - **Severity**: **behavior change (auth).** The fix fails closed: a route that was admitted on an

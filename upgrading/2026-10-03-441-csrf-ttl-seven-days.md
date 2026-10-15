@@ -1,6 +1,6 @@
 ## `CSRFMiddleware` — the CSRF cookie lasts seven days by default, not one hour (#441)
 
-- **Version**: Unreleased
+- **Version**: 0.6.0
 - **Nitro ref**: [#441](https://github.com/PingoLee/Nitro.jl/issues/441) ;
   `src/middleware/csrf_middleware.jl`
 - **Recorded**: 2026-10-03

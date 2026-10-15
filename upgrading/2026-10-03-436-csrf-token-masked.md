@@ -1,6 +1,6 @@
 ## `csrf_token!` — the CSRF token handed to a handler is masked per call (#436)
 
-- **Version**: Unreleased
+- **Version**: 0.6.0
 - **Nitro ref**: [#436](https://github.com/PingoLee/Nitro.jl/issues/436) ;
   `src/middleware/csrf_middleware.jl`
 - **Recorded**: 2026-10-03

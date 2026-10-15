@@ -1,6 +1,6 @@
 ## `AccessLog` — `skip` runs after the handler as `skip(req, resp)`, records gain `matched` and bounded fields (#401)
 
-- **Version**: Unreleased
+- **Version**: 0.6.0
 - **Nitro ref**: [#401](https://github.com/PingoLee/Nitro.jl/issues/401) ;
   `src/middleware/access_log.jl`, `src/core/framework_middleware.jl`, `src/core/staticfiles.jl`
 - **Recorded**: 2026-10-02
