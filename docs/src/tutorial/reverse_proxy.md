@@ -11,7 +11,7 @@ box, and how to recover the real client IP afterwards without letting anyone for
 |---|---|
 | TLS termination and certificates | **Proxy** — Nitro speaks plain HTTP and has no TLS story |
 | Static assets, SPA history fallback | **Proxy** in production (see below) |
-| Request body caps, connection timeouts, compression | **Proxy first, app second** — Nitro caps request bodies at 64 MiB by default (`serve(max_body_bytes = …)`) and closes a connection that has not sent a complete request head within 120 seconds (`serve(read_header_timeout = …)`), but the proxy rejects an oversized or slow upload before it reaches Julia at all |
+| Request body caps, connection timeouts, compression | **Proxy first, app second** — Nitro caps request bodies at 64 MiB by default (`serve(max_body_bytes = …)`) and closes a connection that has not sent a complete request head within 15 seconds (`serve(read_header_timeout = …)`), but the proxy rejects an oversized or slow upload before it reaches Julia at all |
 | Coarse per-IP rate limiting | **Proxy first, app second** — `RateLimiter` still matters in development and as a second layer |
 | Per-user rate limiting, quotas | **App** — needs identity |
 | **Authentication and authorization** | **App, always** |
@@ -74,7 +74,7 @@ Nitro's own limits are the floor underneath, for a process the proxy is not in f
 
 | Limit | Default | What it bounds |
 |---|---|---|
-| `read_header_timeout` | 120 s | How long a connection may take to send a complete request head, counted on a keep-alive connection from the next request's first byte. A Slowloris client is answered `408` and dropped |
+| `read_header_timeout` | 15 s | How long a connection may take to send a complete request head, counted on a keep-alive connection from the next request's first byte and on a new one from accept. A Slowloris client is answered `408` and dropped |
 | `idle_timeout` | 120 s | How long a keep-alive connection may sit idle between requests before it is closed |
 | `max_body_bytes` | 64 MiB | How much one request body may hold |
 | `max_concurrent_requests` | off | How many requests are held at once, and so, with `max_body_bytes`, how much body memory. Over it, a request is answered `503` before its body is read. A WebSocket holds one of these slots for as long as it is open, unless `max_upgraded_connections` gives WebSockets their own budget (and its handshake carried no body); see [Bounding requests in flight](@ref) |

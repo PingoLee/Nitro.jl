@@ -720,8 +720,8 @@ function preprocesskwargs(kwargs)
     Base.get!(kwargs_dict, :reuseaddr, !Sys.iswindows())
     # HTTP.jl disables every server timeout by default, which leaves a half-sent head or a silent
     # connection holding its socket forever (#316). Nitro defaults the two that cannot cut a
-    # legitimate stream; `read_timeout` and `write_timeout` stay opt-in. The values, and why they
-    # are 120 seconds, are on the constants (src/constants.jl).
+    # legitimate stream; `read_timeout` and `write_timeout` stay opt-in. The values, and why
+    # they are what they are, are on the constants (src/constants.jl).
     #
     # Written only when NEITHER spelling is present: HTTP.jl takes each timeout in seconds (`X`)
     # or nanoseconds (`X_ns`) and throws when it gets both, so defaulting `X` next to a caller's

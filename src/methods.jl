@@ -150,13 +150,15 @@ is explicit introspection, not accidental disclosure.)
   allows rebinding a port still in `TIME_WAIT`, and to **`false` on Windows**, where
   `SO_REUSEADDR` instead lets a second process bind a port another is actively listening
   on — turning a port conflict into two servers silently splitting the traffic.
-- `read_header_timeout=120`: seconds a connection has to deliver a complete request head. Past
+- `read_header_timeout=15`: seconds a connection has to deliver a complete request head. Past
   it the server answers **408** and closes the connection, which bounds a client that trickles
   header bytes (Slowloris) or goes silent. It bounds the **head only**: once the head is parsed
   the deadline is re-armed for the body (at `read_timeout`, or cleared when that is unset), so a
   slow upload is not cut by it (Go's `ReadHeaderTimeout` semantics). On a keep-alive
   connection it starts when the next request's first byte arrives; the wait before that byte is
-  `idle_timeout`'s. See `DEFAULT_READ_HEADER_TIMEOUT_SECONDS`.
+  `idle_timeout`'s. On a fresh connection it runs from accept, so a socket opened and left
+  silent is answered 408 and closed. See `DEFAULT_READ_HEADER_TIMEOUT_SECONDS` for why 15
+  (#531; it was 120 while it doubled as the keep-alive idle limit).
 - `idle_timeout=120`: seconds a keep-alive connection waits for the first byte of its next
   request before it is closed, silently. `read_timeout` takes its place when `idle_timeout` is
   `0`; with both `0` an idle connection is kept until the client closes it. Behind nginx or an

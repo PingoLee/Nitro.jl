@@ -69,22 +69,34 @@ HTTP.jl disables every server timeout by default, so without this a client that 
 and trickles header bytes (Slowloris), or simply goes silent, holds its socket and its task
 forever. Go's `net/http` guidance is the same: always set `ReadHeaderTimeout`.
 
-**Why 120 seconds rather than Go's usual 5–10.** Through HTTP.jl 2.8 this deadline was re-armed
-before *every* request head, including the wait between two requests on a keep-alive connection,
-so it was also the keep-alive idle limit. A backend that drops idle connections before its proxy
-does races the proxy's reuse of them: nginx upstream pools and AWS ALB both idle out at 60
-seconds, and a backend below that produces sporadic `502`s. 120 seconds kept the proxy the side
-that closes first. HTTP.jl 2.9 keeps the two apart the way Go does
+**Why 15 seconds (#531).** It was 120 through HTTP.jl 2.8, where this deadline was re-armed before
+*every* request head, including the wait between two requests on a keep-alive connection, so it
+was also the keep-alive idle limit. A backend that drops idle connections before its proxy does
+races the proxy's reuse of them: nginx upstream pools and AWS ALB both idle out at 60 seconds, and
+a backend below that produces sporadic `502`s. 120 seconds kept the proxy the side that closes
+first. HTTP.jl 2.9 keeps the two apart the way Go does
 ([JuliaWeb/HTTP.jl#1381](https://github.com/JuliaWeb/HTTP.jl/issues/1381), fixed by JuliaWeb/HTTP.jl#1382): the
 idle wait is [`DEFAULT_IDLE_TIMEOUT_SECONDS`](@ref Nitro.Core.Constants.DEFAULT_IDLE_TIMEOUT_SECONDS)'s,
-and this deadline starts only once the next request's bytes arrive. So this default could now
-drop to Go's usual range without touching keep-alive; it has not been lowered yet.
+which stays at 120, and on a keep-alive connection this deadline starts only once the next
+request's bytes arrive. What is left for it to bound is exactly the Slowloris window: a client
+that began a request and has not finished its head. 15 seconds holds such a connection 8× less
+long than 120 did, and is still generous for any real client — a browser sends its head in one
+write, and a slow mobile link sends a few KB well under a second. Go's guidance is 5–10; 15
+leaves room for very lossy links at little cost. Behind a proxy it rarely matters: nginx sends
+the backend each head in one go, and pools an upstream connection only after a response on it.
+
+**On a fresh connection it runs from accept**, not from the first byte (HTTP.jl 2.9 arms it
+before the first read; there is no idle wait before a connection's first request). A socket
+opened speculatively and left silent — a browser *preconnect* — is therefore answered `408` and
+closed after this long. That is harmless: the browser opens another when it needs one. A load
+balancer that opens backend connections ahead of requests and holds them idle is the exception:
+set `read_header_timeout` at or above its idle timeout, or it races Nitro closing them.
 
 It bounds the head only. Once the head is parsed HTTP.jl re-arms the read deadline at
 `read_timeout`, or clears it when that is unset, so a slow upload is not cut by it — the Go
 semantics. Set `read_timeout` to bound the body too.
 """
-const DEFAULT_READ_HEADER_TIMEOUT_SECONDS :: Float64 = 120.0
+const DEFAULT_READ_HEADER_TIMEOUT_SECONDS :: Float64 = 15.0
 
 """
 Default for `serve(idle_timeout = …)`: seconds an idle connection is kept before it is closed
