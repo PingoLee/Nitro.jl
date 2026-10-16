@@ -121,6 +121,44 @@ The contract:
     Short token lifetimes are the other half of this; Nitro cannot revoke a signed token it
     did not issue.
 
+### Typed claims with `Claims{T}`
+
+Reading claims through `getprincipal(req)["org_id"]` gives you `Any`, a run-time error for a
+misspelled claim name, and a type check in every handler. Declare the claims a route needs as
+a struct instead, and take them as a [`Claims`](@ref) parameter:
+
+```julia
+struct ApiClaims
+    sub::String
+    role::String
+    org_id::Int
+end
+
+report(req, claims::Claims{ApiClaims}) = Res.json(load_report(claims.payload.org_id))  # an Int
+
+path("/report", report; middleware = [BearerAuth(jwt_validator(keyset))])
+```
+
+- **It binds the token's verified claims, and only those.** It reads [`getprincipal`](@ref),
+  never `getuser`. With a `user_validator`, what binds is the token's `Principal` at
+  `:auth_claims`, never the object your validator returned, *even when that object is itself
+  a `Principal`*. The one way your own object binds is a custom validator that returns a
+  `Principal` itself, with no token behind it. That is the validator vouching for it, as it
+  does for `getprincipal`.
+- **That makes it the token's view, with the token's staleness.** A fresh lookup in your
+  `user_validator` does not reach `Claims{T}`, for the reason the warning above gives about
+  the struct-user path. Bind what the token fixes for its lifetime (`sub`, a tenant, a
+  scope), and read revocable state from your own user object.
+- **The binder is `Json{T}`'s,** applied to the claims the validator already decoded. No
+  second JWT parse happens. Unknown claims are ignored, and every field's type is enforced:
+  a `Vector` field does not take a single value.
+  With a `@kwdef` struct an absent claim takes the field's default, so optional claims are
+  optional fields.
+- **It refuses before the handler runs.** No token principal is a `401`. A principal whose
+  claims do not bind is a `403` whose body names the claim (`Forbidden: claim 'org_id' is
+  missing`) and never its value. Both go through the denial factories below; see
+  [why not binding is a 403](#Claims{T}-and-the-error-contract).
+
 ## 3. The error contract
 
 One rule, everywhere — by default; [your own error contract](#Your-own-error-contract) below
@@ -128,8 +166,8 @@ replaces the responses, not the decisions:
 
 | Status | Meaning | Returned by |
 |---|---|---|
-| **401** | *Not authenticated* — credential missing, malformed, expired, or failed verification | `BearerAuth`, `CookieAuthMiddleware` |
-| **403** | *Authenticated but not authorized* — the principal lacks the required claim/kid | `claim_required`, `role_required`, `permission_required`, `kid_required` |
+| **401** | *Not authenticated* — credential missing, malformed, expired, or failed verification | `BearerAuth`, `CookieAuthMiddleware`; `Claims{T}` when there is no token principal |
+| **403** | *Authenticated but not authorized* — the principal lacks the required claim/kid | `claim_required`, `role_required`, `permission_required`, `kid_required`; `Claims{T}` when the claims do not bind |
 | **302** | Browser redirect to login (session-flavored apps) | `login_required` (`redirect_url`, default `/login`) |
 
 A **throwing validator is a 401, never a 500**: both auth middlewares catch validator
@@ -181,10 +219,29 @@ auth middleware takes `unauthorized`, and every shipped guard takes `denied`: a 
 
 | `reason` | Passed by | When |
 |---|---|---|
-| `:missing_credentials` | `BearerAuth`, `CookieAuthMiddleware` | no usable credential: no header or cookie, another scheme, an empty credential, a cookie that does not decrypt |
+| `:missing_credentials` | `BearerAuth`, `CookieAuthMiddleware`; `Claims{T}`'s `unauthorized` | no usable credential: no header or cookie, another scheme, an empty credential, a cookie that does not decrypt. For `Claims{T}`, no token principal |
 | `:invalid_credentials` | `BearerAuth`, `CookieAuthMiddleware` | a credential was found and the validator refused it, or threw |
-| `:forbidden` | `claim_required`, `role_required`, `permission_required`, `kid_required` | authenticated, but not authorized |
+| `:forbidden` | `claim_required`, `role_required`, `permission_required`, `kid_required`; `Claims{T}`'s `denied` | authenticated, but not authorized. For `Claims{T}`, the claims do not bind to `T` or fail its validator |
 | `:login_required` | `login_required` | nobody is logged in (`denied` replaces the redirect) |
+
+#### `Claims{T}` and the error contract
+
+An extractor runs inside the route, after the auth middleware, so it cannot reach the
+middleware's factory. [`Claims`](@ref) takes its own two, through the parameter's default,
+and is told the same reasons:
+
+```julia
+report(req, claims = Claims(ApiClaims; unauthorized = UNAUTHORIZED, denied = UNAUTHORIZED)) = ...
+```
+
+**Claims that do not bind are `:forbidden` and a `403`, not `:invalid_credentials` and a
+`401`.** The token's signature, expiry and issuer all verified, so the credential is valid,
+and `:invalid_credentials` would say otherwise. What the token lacks is what this route
+requires: the guards' "authenticated but not authorized", and RFC 6750's
+`insufficient_scope`. A `401` would also send a well-behaved client to sign in again, for a
+token of the same shape. If your clients know only `401`, pass `denied = UNAUTHORIZED`, as
+above. Your factory is told only the reason. Which claim failed goes to a `@debug` log line,
+and only the default `403` body names it.
 
 One function can serve every site:
 

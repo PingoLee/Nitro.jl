@@ -62,7 +62,10 @@ FormFile
 
 An extractor is a handler parameter whose *type* says where its value comes from. Nitro binds it
 before the handler runs, and a value that does not bind or does not validate is answered with a
-`400` without calling the handler (a `415` when the body has the wrong media type). The bound value is in the parameter's `.payload` (`.value` for
+`400` without calling the handler (a `415` when the body has the wrong media type). The exception
+is [`Claims`](@ref), which binds the verified token claims rather than client input: it answers
+`401` without a token principal and `403` when the claims do not bind, through its denial
+factories (see [the error contract](../tutorial/authentication.md#Claims{T}-and-the-error-contract)). The bound value is in the parameter's `.payload` (`.value` for
 [`Cookie`](@ref)). [Request Body](../tutorial/request_body.md),
 [Query Parameters](../tutorial/query_parameters.md) and [File Uploads](../tutorial/file_uploads.md)
 walk through them.
@@ -77,6 +80,7 @@ Form
 Body
 Files
 MultipartForm
+Claims
 Cookie
 Session
 Context

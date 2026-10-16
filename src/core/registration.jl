@@ -85,8 +85,11 @@ end
 # The extractors that bind client input with Nitro's own parsers. `Session` reads a server-side
 # store, `Files` binds `FormFile`s, `Context` is the app's own value, and a third-party extractor
 # (`ProtoBuffer{T}`, whose generated `OneOf` carries a `name::Symbol`) binds with its own decoder --
-# none of them turns a client string into a `Symbol` through Nitro, so none is checked.
-const CLIENT_BOUND_EXTRACTOR = Union{Path, Query, Header, Json, JsonFragment, Form, Body, Cookie, MultipartForm}
+# none of them turns a client string into a `Symbol` through Nitro, so none is checked. `Claims` is
+# checked (#527): a token's claims are verified, but a verified token still carries whatever
+# strings its holder got signed -- a `sub`, a name, a tenant -- so they are client-signed, not
+# client-free.
+const CLIENT_BOUND_EXTRACTOR = Union{Path, Query, Header, Json, JsonFragment, Form, Body, Cookie, MultipartForm, Claims}
 
 """
     refuse_client_symbols(route, param)
