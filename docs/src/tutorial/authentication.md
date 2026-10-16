@@ -221,7 +221,7 @@ auth middleware takes `unauthorized`, and every shipped guard takes `denied`: a 
 |---|---|---|
 | `:missing_credentials` | `BearerAuth`, `CookieAuthMiddleware`; `Claims{T}`'s `unauthorized` | no usable credential: no header or cookie, another scheme, an empty credential, a cookie that does not decrypt. For `Claims{T}`, no token principal |
 | `:invalid_credentials` | `BearerAuth`, `CookieAuthMiddleware` | a credential was found and the validator refused it, or threw |
-| `:forbidden` | `claim_required`, `role_required`, `permission_required`, `kid_required`; `Claims{T}`'s `denied` | authenticated, but not authorized. For `Claims{T}`, the claims do not bind to `T` or fail its validator |
+| `:forbidden` | `claim_required`, `role_required`, `permission_required`, `kid_required`; `Claims{T}`'s `denied` | authenticated, but not authorized. For `Claims{T}`, the claims do not bind to `T`, or a validator returns `false` (one that throws is a `500`) |
 | `:login_required` | `login_required` | nobody is logged in (`denied` replaces the redirect) |
 
 #### `Claims{T}` and the error contract

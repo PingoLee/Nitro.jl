@@ -1958,3 +1958,117 @@ end
     @test @inferred(Nullable{Int}, (c -> c.payload.org_id)(kw)) === 7
 end
 end
+
+@testitem "a validator that throws never logs the value it was handed (#595)" tags=[:core, :auth, :security] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+using Nitro: App, Claims, Json
+
+struct FaultLogin
+    password::String
+end
+struct FaultClaims
+    sub::String
+    role::String
+end
+# The global hook, for a type of this item's own. `>` against an `Int` is a `MethodError` whose
+# arguments are the submitted password.
+struct GlobalLogin
+    password::String
+end
+Nitro.validate(l::GlobalLogin) = l.password > 3
+# Two `validate` methods, neither more specific for an `AmbLogin{String}`: the call is a
+# `MethodError`, and so is the `which` that names the faulting method.
+struct AmbLogin{A, B}
+    password::A
+    note::B
+end
+Nitro.validate(l::AmbLogin{String, B}) where {B} = true
+Nitro.validate(l::AmbLogin{A, String}) where {A} = true
+
+sentinel = "S3NT1NEL-secret"
+secret = jwtkey("fault-secret")
+validator = Nitro.Auth.jwt_validator(secret)
+bearer(target) = HTTP.Request("GET", target,
+    ["Authorization" => "Bearer $(Nitro.Auth.encode_jwt(Dict("sub" => "u1", "role" => sentinel), secret; expires_in = 60))"])
+post(target) = HTTP.Request("POST", target, ["Content-Type" => "application/json"], """{"password":"$sentinel","note":"x"}""")
+
+app = App(mod = @__MODULE__)
+urlpatterns(app, "",
+    path("/throws", (req, b = Json(FaultLogin, l -> l.password > 3)) -> "ok"; method = "POST"),
+    path("/global", (req, b::Json{GlobalLogin}) -> "ok"; method = "POST"),
+    # Returns the value itself: `!value` was the `MethodError` that rendered it.
+    path("/nonbool", (req, b = Json(FaultLogin, l -> l.password)) -> "ok"; method = "POST"),
+    path("/own", (req, b = Json(FaultLogin, l -> throw(Nitro.ValidationError("too short")))) -> "ok"; method = "POST"),
+    path("/ambiguous", (req, b::Json{AmbLogin{String, String}}) -> "ok"; method = "POST"),
+    path("/interrupt", (req, b = Json(FaultLogin, l -> throw(InterruptException()))) -> "ok"; method = "POST"),
+    path("/claims", (req, c = Claims(FaultClaims, c -> c.role > 3)) -> "ok"; middleware = [BearerAuth(validator)]),
+)
+
+# Everything a log sink could render: the message, every kwarg as `show` prints it, and an
+# `exception=(e, bt)` kwarg the way ConsoleLogger prints it.
+function rendered(l)
+    out = string(l.message, sprint(show, l.kwargs))
+    ex = get(l.kwargs, :exception, nothing)
+    ex isa Tuple && (out *= sprint(showerror, ex[1], ex[2]))
+    return out
+end
+
+@testset "$target: a 500 with the fixed body, the value in no log record" for (target, req) in (
+        ("/throws", post("/throws")), ("/global", post("/global")),
+        ("/nonbool", post("/nonbool")), ("/claims", bearer("/claims")), ("/ambiguous", post("/ambiguous")))
+    logs, r = Test.collect_test_logs(; min_level = Base.CoreLogging.Debug) do
+        internalrequest(app, req)
+    end
+    @test r.status == 500
+    @test Nitro.json(r) == Dict("message" => "500: Internal Server Error")
+    @test !occursin(sentinel, Nitro.text(r))
+    # The fault is still a server bug, logged at @error -- just without the value.
+    @test any(l -> l.level >= Base.CoreLogging.Error, logs)
+    @test !any(l -> occursin(sentinel, rendered(l)), logs)
+end
+
+@testset "the fault names the parameter and the validator" begin
+    logs, _ = Test.collect_test_logs(; min_level = Base.CoreLogging.Debug) do
+        internalrequest(app, post("/global"))
+    end
+    msg = only(rendered(l) for l in logs if l.level >= Base.CoreLogging.Error)
+    @test occursin("Validator Fault", msg)
+    @test occursin("parameter 'b'", msg)
+    @test occursin("GlobalLogin", msg)
+    @test occursin(".validate threw or returned a non-Bool", msg)
+end
+
+@testset "the original is not left on the exception stack" begin
+    # With no serializer the fault reaches the caller, which sees every exception still live.
+    stack = try
+        internalrequest(app, post("/throws"); serialize = false)
+        nothing
+    catch
+        current_exceptions()
+    end
+    @test stack !== nothing
+    @test all(s -> s.exception isa Nitro.Errors.ValidatorFault, stack)
+    @test !any(s -> occursin(sentinel, sprint(show, s.exception)), stack)
+end
+
+@testset "an ambiguous global validate still raises the fault, under the bare name" begin
+    logs, _ = Test.collect_test_logs(; min_level = Base.CoreLogging.Debug) do
+        internalrequest(app, post("/ambiguous"))
+    end
+    msg = only(rendered(l) for l in logs if l.level >= Base.CoreLogging.Error)
+    @test occursin("Validator Fault", msg)
+    @test occursin("parameter 'b'", msg)
+    @test occursin(": validate threw or returned a non-Bool", msg)
+end
+
+@testset "a validator's own ValidationError is still a 400" begin
+    r = internalrequest(app, post("/own"))
+    @test r.status == 400
+end
+
+@testset "an interrupt from a validator is not turned into a fault" begin
+    @test_throws InterruptException internalrequest(app, post("/interrupt"); serialize = false)
+end
+end

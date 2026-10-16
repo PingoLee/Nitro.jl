@@ -115,6 +115,13 @@ function handlerequest(getresponse::Function, catch_errors::Bool; show_errors::B
                 # request at exactly the moment the server is busiest. `kind` only -- no message.
                 show_errors && @debug "Request refused: worker capacity" kind=error.kind
             elseif show_errors && !isa(error, InterruptException)
+                # `showerror` of whatever the handler or a middleware threw, so nothing keeps a value
+                # out of this line but the thrower. Validator input is kept out upstream: an
+                # extractor's validator is handed the bound value, and `try_validate`
+                # (src/extractors.jl) replaces anything it throws but a `ValidationError` with a
+                # value-free `ValidatorFault`, raised outside the `catch` so the original is not
+                # left on the exception stack either (#595). Never "improve" this line by logging
+                # `current_exceptions()`, or a cause chain.
                 @error "ERROR: " exception=(error, catch_backtrace())
             end
             return handle_error(error)
