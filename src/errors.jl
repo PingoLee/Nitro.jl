@@ -389,6 +389,7 @@ of these sites call (a user's `validate_token`, a user's session store):
 | `src/extractors.jl` ×2 | `safe_extract`'s `f()` (the extractor body, i.e. the parsers above) and the app's session store |
 | `src/middleware/csrf_middleware.jl` ×2 | `getform`/`getjson` |
 | `ext/NitroPormGExt.jl` ×5 | the PormG stores' reads of their own stored JSON (#344): the session query and decode in `Base.get(::PormGSessionStore, …)`, which `SessionMiddleware` calls per request; `_parse_stored_json` for a task's `result`/`watchers`; `_listed_task`, which would otherwise swallow what `_parse_stored_json` rethrows one frame up; and `_claim_row!`'s decode of the head row a consumer claims (#514) |
+| `src/Workers/jobs.jl` ×2 | a named job's arguments (#514): `_encode_job`'s serialize-and-bind-back at submit, and `NamedJobRun`'s bind of the stored JSON when the run starts. Both reach `JSON.parse` through `json_bind`, and the run-side one turns every other failure into a terminal `JobError` |
 
 `src/extractors.jl`'s `safe_extract` is the load-bearing one: without it the parser fix is a
 no-op for `Json{T}`/`JsonFragment{T}` routes, because the rethrow would be caught one
@@ -432,8 +433,8 @@ within a file this change already touched.
 
 The per-attempt `catch` in both worker executors — `_execute_task_async` (`src/Workers/api.jl`)
 and `_execute_queued_task` (`src/Workers/queue.jl`) — treats the three as **terminal**, in the
-same arm as `TaskTimeoutError`: no retry, recorded `FAILED` through `_fail_task!`, never
-rethrown (#367).
+same arm as `TaskTimeoutError` and a named job's `JobError` (#514): no retry, recorded `FAILED`
+through `_fail_task!`, never rethrown (#367).
 
 - **Not retried**: a retry re-runs a callback that has just overflowed the stack or exhausted
   memory, and on some Windows hosts the overflow ends the process (#301). An interrupt is the

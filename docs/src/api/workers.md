@@ -30,6 +30,9 @@ Nitro.pormg_nitro_worker
 ```@docs
 Nitro.Workers.submit_task
 Nitro.Workers.submit_queued_task
+Nitro.Workers.register_job!
+Nitro.Workers.Job
+Nitro.Workers.JobError
 Nitro.Workers.TaskAuthority
 Nitro.Workers.Owner
 Nitro.Workers.System

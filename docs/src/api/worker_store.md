@@ -27,6 +27,24 @@ Nitro.Workers.RunningTaskRef
 Nitro.Workers.register_run!
 ```
 
+## What a record carries, and which call writes it
+
+A store persists every [`TaskInfo`](@ref Nitro.Workers.TaskInfo) field except the process-local
+cancellation token. The fields fall into two groups, and the split is the store contract:
+
+- **State** is written by `set_task!` and `try_transition!`: `status`, `progress`, `result`,
+  `error` and the timestamps.
+- **Identity** is written by `replace_task!` (a new submission) and by the claim operations below
+  (a new run of the same submission). `set_task!` never writes it: `run_id`, `watchers`, the claim
+  fields, and the named-job fields.
+
+`job_name` and `job_args` ([#514](https://github.com/PingoLee/Nitro.jl/issues/514)) hold a named
+job's registered name and its arguments as JSON text. Both are `nothing` for a closure.
+`PormGWorkerStore` keeps them in the `job_name` (`VARCHAR(255)`) and `job_args` (`TEXT`) columns,
+and adds both on boot to a table created before them. A custom store that drops them still runs
+named jobs **in this process**, which binds from the queued item's copy. It cannot back a queue
+run by a separate consumer process, because that process has only what the store hands back.
+
 ## Claims: the optional capability for a consumer process
 
 A queue whose runs execute in a **separate consumer process**

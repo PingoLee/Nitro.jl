@@ -15,6 +15,12 @@ using Nitro.Workers: get_task_info, set_task!, replace_task!, add_watcher!, try_
     claim_next!, renew_leases!, release_claim!, requeue_expired!, LeaseRenewal, LeasePolicy
 using Nitro.Errors: AuthorizationError
 
+# A named job's argument type (#514), with the field a later deploy added under a default.
+@kwdef struct JobArgsV2
+    dataset_id::Int
+    epochs::Int = 10
+end
+
 # The ONE answer a read or cancel gives both for a missing task and for one the caller may not
 # see (#323), on this backend exactly as on the in-memory one.
 is_not_found(d) = d == Dict{Symbol, Any}(:error => "Task not found", :status => "NOT_FOUND")
@@ -65,11 +71,12 @@ const MODELLED_FILTER_KEYS = Set([
     "external", "claimed_by", "lease_expires_at__@lt",
 ])
 
-# The claim columns (#514), as a row built by hand before them reads them: with the default the
-# boot-time ALTER gives an existing row. Any other missing column is still a KeyError, so a row
-# that lost a column the ext always writes keeps failing loudly.
+# The claim and named-job columns (#514), as a row built by hand before them reads them: with the
+# default the boot-time ALTER gives an existing row. Any other missing column is still a KeyError,
+# so a row that lost a column the ext always writes keeps failing loudly.
 const MOCK_COLUMN_DEFAULTS = Dict{String, Any}(
-    "external" => false, "attempt" => 0, "claimed_by" => nothing, "lease_expires_at" => nothing)
+    "external" => false, "attempt" => 0, "claimed_by" => nothing, "lease_expires_at" => nothing,
+    "job_name" => nothing, "job_args" => nothing)
 _mock_col(row::Dict{String, Any}, c::String) = haskey(row, c) ? row[c] : MOCK_COLUMN_DEFAULTS[c]
 
 # Columns the mock can ORDER BY. `claim_next!` orders by `created_at` then `id` (#514); every
@@ -925,17 +932,20 @@ mutable struct FakeSchemaPool <: PormG.PormGSQLite
     probe_error::Union{Nothing, Exception}
     # Another process adds the column between our probe and our `ALTER`.
     concurrent_add::Bool
-    # The claim columns (#514) this table has. They are modelled with the same probe/ALTER
-    # semantics as `run_id`, minus the fault injection above, which stays `run_id`'s.
+    # The claim and named-job columns (#514) this table has. They are modelled with the same
+    # probe/ALTER semantics as `run_id`, minus the fault injection above, which stays `run_id`'s.
     claim_columns::Set{String}
 end
 
 const CLAIM_COLUMNS = ("external", "attempt", "claimed_by", "lease_expires_at")
+# Step 2's named-job columns, added after the claim columns shipped.
+const JOB_COLUMNS = ("job_name", "job_args")
+const ADDED_COLUMNS = (CLAIM_COLUMNS..., JOB_COLUMNS...)
 
-# A table "has run_id" means a current table unless said otherwise: it has the claim columns too.
+# A table "has run_id" means a current table unless said otherwise: it has every added column too.
 FakeSchemaPool(has_run_id::Bool; alter_error=nothing, probe_error=nothing,
                concurrent_add::Bool=false,
-               claim_columns = has_run_id ? Set(CLAIM_COLUMNS) : Set{String}()) =
+               claim_columns = has_run_id ? Set(ADDED_COLUMNS) : Set{String}()) =
     FakeSchemaPool(String[], has_run_id, alter_error, probe_error, concurrent_add,
                    Set{String}(claim_columns))
 
@@ -950,7 +960,7 @@ function PormG.ConnectionPool.fetch(c::FakeSchemaPool, sql::String; kwargs...)
         c.probe_error === nothing || throw(c.probe_error)
         c.has_run_id || error("no such column: nitro_task.run_id")
     else
-        for col in CLAIM_COLUMNS
+        for col in ADDED_COLUMNS
             if startswith(sql, "ALTER TABLE \"nitro_task\" ADD COLUMN \"$col\"")
                 col in c.claim_columns && error("duplicate column name: $col")
                 push!(c.claim_columns, col)
@@ -3828,13 +3838,15 @@ else
             is_alter(s) = startswith(s, "ALTER TABLE")
             pre = FakeSchemaPool(true; claim_columns = Set{String}())
             getproperty(PormGExt, :_ensure_task_table!)(pre, getproperty(PormGExt, :task_model)())
-            @test pre.claim_columns == Set(CLAIM_COLUMNS)
+            @test pre.claim_columns == Set(ADDED_COLUMNS)
             alters = filter(is_alter, pre.sql)
-            @test length(alters) == 4
+            @test length(alters) == 6
             for (col, ddl) in ("external" => "BOOLEAN NOT NULL DEFAULT FALSE",
                                "attempt" => "INTEGER NOT NULL DEFAULT 0",
                                "claimed_by" => "VARCHAR(255)",
-                               "lease_expires_at" => "DATETIME")
+                               "lease_expires_at" => "DATETIME",
+                               "job_name" => "VARCHAR(255)",
+                               "job_args" => "TEXT")
                 i = findfirst(==("ALTER TABLE \"nitro_task\" ADD COLUMN \"$col\" $ddl"), pre.sql)
                 @test i !== nothing
                 # Probed before it was altered.
@@ -3846,7 +3858,7 @@ else
             # A fresh database gets them from CREATE TABLE, so its boot alters nothing.
             fresh = FakeSchemaPool(true)
             getproperty(PormGExt, :_ensure_task_table!)(fresh, getproperty(PormGExt, :task_model)())
-            @test all(c -> occursin("\"$c\"", first(fresh.sql)), CLAIM_COLUMNS)
+            @test all(c -> occursin("\"$c\"", first(fresh.sql)), ADDED_COLUMNS)
             @test !any(is_alter, fresh.sql)
 
             # A row written before #514 reads back with the defaults the ALTER gave it.
@@ -3860,6 +3872,97 @@ else
             # SQLite hands a BOOLEAN back as an integer.
             t = getproperty(PormGExt, :_from_db_record)(merge(legacy_row, Dict{String, Any}("external" => 1)))
             @test t.external
+        end
+
+        @testset "the named-job columns: added on boot, written as submission identity (#514)" begin
+            is_alter(s) = startswith(s, "ALTER TABLE")
+            # A table from step 1: the claim columns, not the job columns. Exactly two ALTERs.
+            step1 = FakeSchemaPool(true; claim_columns = Set(CLAIM_COLUMNS))
+            getproperty(PormGExt, :_ensure_task_table!)(step1, getproperty(PormGExt, :task_model)())
+            @test step1.claim_columns == Set(ADDED_COLUMNS)
+            @test filter(is_alter, step1.sql) == ["ALTER TABLE \"nitro_task\" ADD COLUMN \"job_name\" VARCHAR(255)",
+                                                  "ALTER TABLE \"nitro_task\" ADD COLUMN \"job_args\" TEXT"]
+            for col in JOB_COLUMNS
+                i = findfirst(s -> startswith(s, "ALTER TABLE \"nitro_task\" ADD COLUMN \"$col\""), step1.sql)
+                @test i !== nothing && occursin("\"nitro_task\".\"$col\"", step1.sql[i - 1])
+            end
+
+            # A row written before them is a closure's.
+            legacy = getproperty(PormGExt, :_from_db_record)(Dict{String, Any}(
+                "id" => "legacy", "run_id" => string(UUIDs.uuid4()), "status" => "PENDING",
+                "progress" => 0.0, "result" => "", "error" => "", "created_at" => DateTime(2026, 1, 1),
+                "started_at" => nothing, "completed_at" => nothing, "watchers" => "[]", "queue_name" => ""))
+            @test (legacy.job_name, legacy.job_args) == (nothing, nothing)
+
+            # The row round-trips both fields.
+            named = TaskInfo("u::fit"; queue_name = "q", job_name = "fit", job_args = "{\"dataset_id\":1}")
+            row = getproperty(PormGExt, :_to_db_record)(named)
+            @test (row["job_name"], row["job_args"]) == ("fit", "{\"dataset_id\":1}")
+            back = getproperty(PormGExt, :_from_db_record)(row)
+            @test (back.job_name, back.job_args) == ("fit", "{\"dataset_id\":1}")
+
+            # `replace_task!` writes them; `set_task!` never does, on either backend.
+            for (label, s) in (("in-memory", InMemoryWorkerStore()),
+                               ("pormg", RealPormGWorkerStore(model = MockTaskModel())))
+                @testset "$label" begin
+                    replace_task!(s, "u::fit", TaskInfo("u::fit"; job_name = "fit", job_args = "{\"dataset_id\":1}"))
+                    stale = TaskInfo("u::fit"; job_name = "other", job_args = "{}")
+                    stale.status = RUNNING
+                    set_task!(s, "u::fit", stale)
+                    stored = get_task_info(s, "u::fit")
+                    @test stored.status == RUNNING
+                    @test (stored.job_name, stored.job_args) == ("fit", "{\"dataset_id\":1}")
+                    # A re-submit over the existing row (the UPDATE branch on PormG) replaces them:
+                    # with another job's, then with a closure's `nothing`.
+                    replace_task!(s, "u::fit", TaskInfo("u::fit"; job_name = "other", job_args = "{\"x\":2}"))
+                    @test (get_task_info(s, "u::fit").job_name, get_task_info(s, "u::fit").job_args) == ("other", "{\"x\":2}")
+                    replace_task!(s, "u::fit", TaskInfo("u::fit"))
+                    @test (get_task_info(s, "u::fit").job_name, get_task_info(s, "u::fit").job_args) == (nothing, nothing)
+                    # A claim carries them to the new run of the same submission.
+                    claimable = TaskInfo("u::ext"; queue_name = "heavy", external = true,
+                                         job_name = "fit", job_args = "{\"dataset_id\":2}")
+                    replace_task!(s, "u::ext", claimable)
+                    run = claim_next!(s, "heavy", "c1"; lease_seconds = 60)
+                    @test run !== nothing && (run.job_name, run.job_args) == ("fit", "{\"dataset_id\":2}")
+                end
+            end
+        end
+
+        @testset "named jobs run the same on both backends (#514)" begin
+            for (label, s) in (("in-memory", InMemoryWorkerStore()),
+                               ("pormg", RealPormGWorkerStore(model = MockTaskModel())))
+                @testset "$label" begin
+                    app = App()
+                    rt = WorkerRuntime(s; queues = ["q" => 1])
+                    start!(app; runtime = rt, cleanup_enabled = false, recover_zombies = false)
+                    try
+                        register_job!(app, "fit", JobArgsV2) do task_info, args
+                            return args.dataset_id * 100 + args.epochs
+                        end
+                        owner = Owner("u")
+                        id = submit_queued_task(app, "q", "fit", Job("fit", JobArgsV2(dataset_id = 4, epochs = 2)), owner)
+                        @test _settled(() -> get_task_status(app, id, System())[:status] == "COMPLETED")
+                        @test get_task_status(app, id, System())[:result] == 402
+                        stored = get_task_info(s, id)
+                        @test (stored.job_name, stored.job_args) == ("fit", "{\"dataset_id\":4,\"epochs\":2}")
+
+                        # What an older deploy stored, without `epochs`, binds with its default.
+                        old = submit_queued_task("q", "old", Nitro.Workers._job_run(app, "fit", "{\"dataset_id\":7}"),
+                                                 owner; runtime = rt)
+                        @test _settled(() -> get_task_status(app, old, System())[:status] == "COMPLETED")
+                        @test get_task_status(app, old, System())[:result] == 710
+
+                        # What does not bind is FAILED, naming the job and the type, quoting nothing.
+                        bad = submit_queued_task("q", "bad", Nitro.Workers._job_run(app, "fit", "{\"dataset_id\":\"SECRET\"}"),
+                                                 owner; runtime = rt)
+                        @test _settled(() -> get_task_status(app, bad, System())[:status] == "FAILED")
+                        err = get_task_status(app, bad, System())[:error]
+                        @test occursin("\"fit\"", err) && occursin("JobArgsV2", err) && !occursin("SECRET", err)
+                    finally
+                        uninstall!(app; drain_timeout = 0)
+                    end
+                end
+            end
         end
 
         @testset "a run does not inherit the submitter's PormG transaction (#209)" begin

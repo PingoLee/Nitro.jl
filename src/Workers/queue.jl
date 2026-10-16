@@ -379,8 +379,10 @@ function _execute_queued_task(runtime::WorkerRuntime, item::QueueItem)
                 # So are the three `is_unrecoverable` exceptions (#367), recorded FAILED and
                 # never rethrown -- see that function's site table (src/errors.jl). A rethrow
                 # here would reach the processor's catch-all below, which logs and DROPS the item,
-                # leaving its record RUNNING until a zombie sweep.
-                if unwrapped isa TaskTimeoutError || is_unrecoverable(unwrapped)
+                # leaving its record RUNNING until a zombie sweep. And so is a named job whose name
+                # or arguments this process cannot bind (`JobError`, #514): every retry would bind
+                # the same text against the same registry and fail the same way.
+                if unwrapped isa TaskTimeoutError || unwrapped isa JobError || is_unrecoverable(unwrapped)
                     return _fail_task!(runtime, task_info, _store_error_text(runtime.store, unwrapped))
                 end
 

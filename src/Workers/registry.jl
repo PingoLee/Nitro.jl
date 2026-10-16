@@ -20,8 +20,8 @@ using Nitro.Workers    # the contract names are not re-exported from `Nitro`
 | Method | Contract |
 |---|---|
 | `get_task_info(store, task_id::String)` | The **durable** record: `TaskInfo` or `nothing`, see *Live objects* |
-| `set_task!(store, task_id::String, task_info::TaskInfo)` | Write volatile state; must never write `watchers`, `run_id`, or the claim fields |
-| `replace_task!(store, task_id::String, task_info::TaskInfo)` | Write the whole record, `watchers`, `run_id` and the claim fields included |
+| `set_task!(store, task_id::String, task_info::TaskInfo)` | Write volatile state; must never write `watchers`, `run_id`, the claim fields, or `job_name`/`job_args` |
+| `replace_task!(store, task_id::String, task_info::TaskInfo)` | Write the whole record, `watchers`, `run_id`, the claim fields and `job_name`/`job_args` included |
 | `add_watcher!(store, task_id::String, user_id::String)` | Atomic compare-and-set append, returns `Bool` |
 | `try_transition!(store, task_id::String, from, to::TaskStatus; run_id, …)` | Atomic conditional status change, returns `Bool` |
 | `delete_task!(store, task_id::String)` | Remove one record |
@@ -811,7 +811,8 @@ function set_task!(store::InMemoryWorkerStore, task_id::String, task_info::TaskI
 
         # A different object: copy the volatile state across and keep the *stored*
         # record's watchers, run_id, cancel_reason AND the claim fields (`external`,
-        # `claimed_by`, `lease_expires_at`, `attempt`, #514) — precisely what the serializing
+        # `claimed_by`, `lease_expires_at`, `attempt`, #514) and the named-job identity
+        # (`job_name`, `job_args`, #514) — precisely what the serializing
         # store achieves by omitting those columns. The list below is otherwise "copy every
         # field", so those absences ARE the rule.
         #

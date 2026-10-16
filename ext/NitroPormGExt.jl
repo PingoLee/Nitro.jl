@@ -12,7 +12,7 @@ import Nitro.Core.Cookies: storesession!, prunesessions!
 import Nitro: pormg_nitro_session, sync_pormg_env!
 # Stored JSON is read through the same depth bound as request JSON, and written only when it can
 # be read back (#344). `is_unrecoverable` is the #254 catch policy every request-path site uses.
-import Nitro.Core.Util.BodyParsers: _parse_json_bounded, _check_json_depth, _check_value_depth
+import Nitro.Core.Util.BodyParsers: _parse_json_bounded, _json_for_storage
 import Nitro.Core.Errors: is_unrecoverable
 
 import Nitro.Workers: AbstractWorkerStore, TaskInfo, TaskStatus, TaskOptions,
@@ -296,30 +296,10 @@ _session_objects(store::PormGSessionStore) = store.model.objects.db(store.db_key
 
 # -- Serialization helpers --
 
-# Stored JSON -- a session payload here, a task's `result` in the worker store below -- is read
-# through the same 512-level bound as request JSON (#344). What the application stored is not
-# attacker input, but reading it back recurses once per level on whatever task asked, often a
-# request task (`get_task_info` from a handler, the session read in middleware), and #301 showed
-# an overflow there can take a Windows process down rather than raise.
-#
-# Bounding only the read would make a value stored deeper than the bound permanently
-# unreadable: the session would silently reset on every request, the task info would error on
-# every read. So the WRITE refuses it instead, while the caller can still see why, before any row
-# is touched. `max_fields = 0` on the read: the per-request key cap guards request bodies, and
-# this is the app's own data.
-#
-# Twice, and the order is the point. `JSON.json` recurses once per level, so a value deep enough
-# to overflow it -- thousands of levels, which only the app can build, since request JSON stops
-# at 512 -- used to raise `StackOverflowError` from inside the serializer before any check of its
-# output could run (#367). `_check_value_depth` walks the VALUE first, non-recursively and
-# mirroring the writer, and refuses it with the same `ArgumentError`. The scan of the text stays
-# as the final word: a `JSONText` is written verbatim, and only the text shows its depth.
-function _json_for_storage(value)::String
-    _check_value_depth(value)
-    serialized = JSON.json(value)
-    _check_json_depth(serialized)
-    return serialized
-end
+# Stored JSON -- a session payload, a task's `result` -- is written by `_json_for_storage`
+# (`src/utilities/bodyparsers.jl`, where the reasoning lives) and read back through the same
+# 512-level bound as request JSON (#344). `max_fields = 0` on the read: the per-request key cap
+# guards request bodies, and this is the app's own data.
 
 _parse_stored(raw::AbstractString) = _parse_json_bounded(raw; max_fields = 0)
 
@@ -665,6 +645,10 @@ Columns:
                    so `_ensure_task_table!` adds them on boot; the two claim indexes
                    (`nitro_task_claim_idx`, `nitro_task_lease_idx`) serve `claim_next!` and
                    `requeue_expired!`.
+- `job_name`, `job_args` — a named job's registered name (VARCHAR(255)) and its arguments as JSON
+                   (TEXT), both NULL for a closure ([#514](https://github.com/PingoLee/Nitro.jl/issues/514)).
+                   Submission identity: written by `replace_task!`, carried by the claim
+                   operations, never written by `set_task!`. Added on boot like the claim columns.
 """
 function _define_task_model(db_key::String)
     if isdefined(PormG, :Models)
@@ -684,6 +668,8 @@ function _define_task_model(db_key::String)
             claimed_by       = PormG.Models.CharField(max_length=255, null=true, blank=true),
             lease_expires_at = PormG.Models.DateTimeField(null=true, blank=true),
             attempt          = PormG.Models.IntegerField(default=0),
+            job_name         = PormG.Models.CharField(max_length=255, null=true, blank=true),
+            job_args         = PormG.Models.TextField(null=true, blank=true),
         )
         _bind_model!(m, db_key)
         return m
@@ -781,6 +767,8 @@ function _to_db_record(task::TaskInfo)
         "claimed_by" => task.claimed_by,
         "lease_expires_at" => task.lease_expires_at,
         "attempt" => task.attempt,
+        "job_name" => task.job_name,
+        "job_args" => task.job_args,
     )
 end
 
@@ -893,6 +881,8 @@ function _from_db_record(row)::TaskInfo
     task.claimed_by = _db_optional_string(_row_or(row, :claimed_by, "claimed_by", nothing))
     task.lease_expires_at = _parse_optional_db_datetime(_row_or(row, :lease_expires_at, "lease_expires_at", nothing))
     task.attempt = Int(_row_or(row, :attempt, "attempt", 0))
+    task.job_name = _db_optional_string(_row_or(row, :job_name, "job_name", nothing))
+    task.job_args = _db_optional_string(_row_or(row, :job_args, "job_args", nothing))
 
     return task
 end
@@ -974,6 +964,8 @@ function _create_task_row!(store::PormGWorkerStore, record)
         "claimed_by" => record["claimed_by"],
         "lease_expires_at" => record["lease_expires_at"],
         "attempt" => record["attempt"],
+        "job_name" => record["job_name"],
+        "job_args" => record["job_args"],
     )
     return nothing
 end
@@ -1000,7 +992,8 @@ function _update_task_row!(store::PormGWorkerStore, task_id::String, record, ful
     #
     # The claim columns (#514) follow `run_id`, for the same reason: they describe the current
     # claim, which only the claim operations write, and `replace_task!` publishing a new
-    # submission resets them. `external` is identity of the submission.
+    # submission resets them. `external` is identity of the submission, and so are `job_name` and
+    # `job_args`: a state save never carries them.
     if full_record
         push!(columns, "watchers" => record["watchers"])
         push!(columns, "run_id" => record["run_id"])
@@ -1008,6 +1001,8 @@ function _update_task_row!(store::PormGWorkerStore, task_id::String, record, ful
         push!(columns, "claimed_by" => record["claimed_by"])
         push!(columns, "lease_expires_at" => record["lease_expires_at"])
         push!(columns, "attempt" => record["attempt"])
+        push!(columns, "job_name" => record["job_name"])
+        push!(columns, "job_args" => record["job_args"])
     end
     changed = _task_objects(store).filter("id" => task_id).update(columns...)
     return changed isa Integer ? Int(changed) : 0
@@ -1781,6 +1776,14 @@ function _ensure_claim_columns!(conn)
     return nothing
 end
 
+# The named-job columns (#514, step 2), on a table created before them. NULL is what a row
+# written before them means: a closure, which no other process could run anyway.
+function _ensure_job_columns!(conn)
+    _ensure_column!(conn, "nitro_task", "job_name", "VARCHAR(255)")
+    _ensure_column!(conn, "nitro_task", "job_args", "TEXT")
+    return nothing
+end
+
 # Whether `table` has `column`, answered by whether a statement naming it runs. Shared by every
 # add-a-column-on-boot migration: `nitro_task.run_id` (#108) and `nitro_session.created_at` (#362).
 #
@@ -1821,9 +1824,10 @@ function _ensure_task_table!(conn, model)
     PormG.ConnectionPool.fetch(conn, create_table_sql)
 
     # A table created before #108 does not get `run_id` from the statement above, nor one created
-    # before #514 the claim columns.
+    # before #514 the claim and named-job columns.
     _ensure_run_id_column!(conn)
     _ensure_claim_columns!(conn)
+    _ensure_job_columns!(conn)
 
     create_index_sql1 = PormG.Dialect.create_index(
         conn,
