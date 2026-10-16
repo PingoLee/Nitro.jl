@@ -20,7 +20,9 @@ bench/
 │   ├── session.jl      # MemoryStore read/write (payload-size scaling)
 │   ├── ratelimiter.jl  # limiter hot path: keying, lock contention, exempt-path scan
 │   └── taskpattern.jl  # SYNTHETIC replica of parallel_stream_handler's task overhead
-├── socket/             # real-socket load: server.jl (Nitro vs bare HTTP.jl), run.sh, contention.sh (oha)
+├── socket/             # real-socket load: server.jl (Nitro vs bare HTTP.jl), run.sh, contention.sh, stall.sh (oha)
+│   └── go/             # the Go net/http reference server run.sh's `go` mode builds
+├── tasks/              # Julia tasks vs goroutines, no HTTP: tasks.jl, go/, run.sh
 ├── results/            # JSON run outputs — gitignored (machine-specific)
 └── .gitignore          # ignores results/, Manifest.toml and per-version Manifest-v*.toml
 ```
@@ -92,20 +94,31 @@ bench/socket/run.sh "nitro@8,1 nitro@8,2 nitro@8,4"  # one mode per --threads, i
 RATE=20000 bench/socket/run.sh "nitro@8,1 nitro@8,0" # fixed rate: latency without saturation (#491)
 JULIA="julia +1.12" bench/socket/run.sh              # another Julia, by juliaup channel
 bench/socket/contention.sh "8,1 6,2 8,0" 5 8s       # /health while the default pool is busy (#491)
+bench/socket/stall.sh "nitro nitro@8,0 go" 3 6s      # /plaintext while K handlers compute (#467)
 ```
 
 - `server.jl` serves `/plaintext`, `/json`, `/health`, `/cpu` and `/lag` in one of these `MODE`s:
   `nitro` (`serve()` with no middleware), `nitro_log` (the same with the access log on),
   `bare_spawn` (HTTP.jl `listen!` + `streamhandler` with a `Threads.@spawn` per request, the shape
-  Nitro takes and the ceiling to compare it with), and `bare_nospawn` (the handler on HTTP.jl's
-  connection task). `/cpu` burns `CPU_MS` (default 50) without yielding; `/lag` is live only with
-  `LAG=1`. `WORKERS=1` adds `/burst?n=K` to the Nitro modes, which submits K Workers jobs that each
-  burn `JOB_MS` (default 500).
+  Nitro takes and the ceiling to compare it with), `bare_nospawn` (the handler on HTTP.jl's
+  connection task), and `bare_pool` (`bare_spawn` with the spawn replaced by `POOL` long-lived
+  tasks, default `nthreads(:default)`, fed by a `Channel`: no task created per request, #468). `/cpu` burns `CPU_MS` (default 50) without yielding; `/lag` is live only with
+  `LAG=1`. `/cpu_yield` burns the same but calls `yield()` every `YIELD_MS` (default 2).
+  `WORKERS=1` adds `/burst?n=K` to the Nitro modes, which submits K Workers jobs that each burn
+  `JOB_MS` (default 500), and `/cpu_job`, which submits one `/cpu` of work to a queue of
+  concurrency `BURST_K` and answers `202` (a full queue answers `503`); `/jobs` counts the
+  `/cpu_job` jobs not yet finished.
 - `run.sh` pins the server (`-t 8`) and the load generator to disjoint physical cores, warms each
   route, and reports the median, min and max of N runs plus the median p99. The default CPU sets
   assume a 6-core part whose SMT siblings are `n` and `n+6`; set `SERVER_CPUS`/`CLIENT_CPUS` for
   another layout. Results go to `results/socket-<stamp>.tsv`, profiles to
-  `results/profile-<mode>-<time>-{flat,threads,interactive-tree}.txt` — the last is a call tree
+  `results/profile-<mode>-<time>-{flat,threads,interactive-tree,sched}.txt`. `sched` is the share of
+  each pool's awake samples whose leaf-most deciding frame is task machinery (Base's `task.jl`,
+  `partr.jl`, …, the runtime's `task.c`, `scheduler.c`, …) or GC (allocation and waiting for a
+  collection included), with sleeping samples counted apart. A libc or libuv frame decides
+  nothing, so a thread wake-up's `pthread_cond_signal` counts as `scheduler.c`. Threads that run
+  no tasks, the parallel GC's and the I/O poller's, are counted apart too. It is an upper bound on
+  task overhead, since a thread spinning for work counts too. `interactive-tree` is a call tree
   of the `:interactive` threads only, which is where HTTP.jl accepts, parses every request head
   and wakes the per-request task (#462). It keeps C frames and opens with the window's GC time.
   Without C frames, a stop-the-world GC wait (`jl_safepoint_wait_gc`) is charged to whatever
@@ -123,6 +136,13 @@ bench/socket/contention.sh "8,1 6,2 8,0" 5 8s       # /health while the default 
   precompile workload warms; set `BASE_ROOT` to measure another checkout.
 - `trace_first_request.sh [route]` runs the server under `--trace-compile` and prints exactly
   what the first request compiled, which is the list of what the precompile workload missed.
+- Pool against spawn (#468), on the box and versions of the *Comparing with Go* tables below,
+  in a run of its own: `bare_pool` served 93k `/plaintext`
+  requests per second against `bare_spawn`'s 112k at `--threads=8` (p99 2.8 ms against 1.2 ms),
+  and 153k against 168k at `8,0`. Under the profiler, creating the per-request task is about 8% of
+  the interactive thread at `8,1`; waking a default thread for it is twice that, and a pool's
+  hand-off pays the wake too. The conclusion is recorded beside `parallel_stream_handler` in
+  `src/core/transport.jl`.
 - `MODE=nitro_log` is `nitro` with the default console access log on (#443), for a one-run A/B
   of what that line costs.
 - `RATE=<n>` makes `run.sh` send a fixed `n` requests per second (`oha -q`, with
@@ -136,11 +156,88 @@ bench/socket/contention.sh "8,1 6,2 8,0" 5 8s       # /health while the default 
   10 ms `sleep` on the default pool woke, which is the delay a `Timer`-driven deadline (a Workers
   timeout) sees. It answers whether the interactive thread protects a cheap request while
   handlers or jobs hold the CPU (#491).
+- `stall.sh [modes] [rounds] [duration]` keeps K requests computing `CPU_MS` (default 200) in
+  flight while `CONNS` connections saturate `/plaintext`, and reports `/plaintext`'s throughput
+  and p50/p99 for each K in `KS`: how few computing handlers it takes to stall the server (#467).
+  `VARIANTS` runs the same work as `cpu` (in the handler), `cpu_yield` and `cpu_job` (a Workers
+  queue, offered at the rate that would keep K busy and drained between passes); the `load_2xx`
+  column is the share of those submissions the queue accepted. Modes are `nitro`, `nitro@N,M` and
+  `go`, which runs `cpu` only. The latest table is in the deployment guide's *Handlers that
+  compute*.
 - `JULIA="julia +1.12"` runs the servers on another juliaup channel. Each Julia minor wants its
   own resolved manifest; `bench/Manifest-v1.12.toml` (gitignored) is the one 1.12 reads first, so
   copy `Manifest.toml` to it and `Pkg.resolve()` under 1.12 once.
 - Compare modes **within one run**, not across days: the CPU governor and anything else on the box
   move absolute numbers by tens of percent. Requires `oha`, `jq`, `curl` and `taskset`.
+- Every `run.sh` row also carries the server's resident memory, read from `/proc` for the process
+  that owns the listening socket: at rest (once it answers `/health`), after the last run, and the
+  peak (`VmHWM`).
+
+## Comparing with Go
+
+Go's `net/http` is the reference, not the target (#469): the point is to know which part of the gap
+is HTTP.jl, which is the Julia runtime, and which is Nitro. **Only numbers from the same box and the
+same run are compared**; a Go figure measured elsewhere says nothing about the Julia ones.
+
+```bash
+bench/socket/run.sh "go nitro nitro@8,0 bare_spawn bare_nospawn" 5 6s   # HTTP, Go interleaved
+bench/tasks/run.sh                                                       # runtimes, no HTTP
+```
+
+- **`socket/go/`** answers `/plaintext`, `/json`, `/health`, `/cpu` and `/lag` with the same bodies
+  as `server.jl`, building every response per request. `run.sh` builds it once and pins it to
+  `SERVER_CPUS` like any other mode; its `threads` column is `GOMAXPROCS`, by default the number of
+  server CPUs (`go@4` sets it). Go is needed only when the `go` mode is requested.
+- **`tasks/`** isolates the runtimes from HTTP. `go/tasks_test.go` (`go test -bench`) and
+  `tasks.jl` (BenchmarkTools) time the same shapes: spawn + wait one at a time (Nitro's
+  per-request spawn), a ping-pong round trip over unbuffered channels, and a fan-out of 1000 with
+  one wait for all. `parked` blocks 100,000 tasks on one event and reports resident memory per
+  task; `spin` keeps every thread busy with a loop that cannot yield and measures how late a 1 ms
+  heartbeat wakes, charged from the moment it was spawned. Go runs it twice, the second time with
+  `GODEBUG=asyncpreemptoff=1`, which is Julia's cooperative model reproduced in Go. Both sides
+  calibrate the spinners with all of them running at once: SMT siblings make one spinner alone
+  several times faster than eight together.
+
+Latest pass — Ryzen 5 5500, server on 4 cores / 8 logical CPUs, client on the other 2, governor
+`powersave`, Julia 1.12.7, HTTP.jl 2.9.0, Go 1.27.1, `GOMAXPROCS=8`, Julia `--threads=8,1`
+unless shown, 2026-10-15:
+
+| `/plaintext`, c=50, median of 5 | rps | p99 | RSS at rest → after |
+|---|--:|--:|--:|
+| Go `net/http` | 236k | 3.5 ms | 8 → 16 MiB |
+| Nitro at `--threads=8,0` | 151k | 3.1 ms | 530 → 556 MiB |
+| bare HTTP.jl, spawn per request | 110k | 1.4 ms | 480 → 487 MiB |
+| Nitro (`--threads=8`, i.e. `8,1`) | 101k | 2.0 ms | 507 → 530 MiB |
+| bare HTTP.jl, no spawn | 53k | 2.0 ms | 481 → 483 MiB |
+
+| Task primitive, 8 threads (1 thread) | Go | Julia 1.12 |
+|---|--:|--:|
+| spawn + wait, one at a time | 0.34 µs (0.32), 144 B | 3.9 µs (1.0), 320 B |
+| ping-pong round trip | 0.25 µs (0.25) | 9.2 µs (4.7) |
+| fan-out of 1000, per task | 0.18 µs (0.22) | 0.42 µs (0.22) |
+| 100,000 parked: create, per task | 1.6 µs | 5.7 µs |
+| 100,000 parked: resident memory, per task | 2.7 KiB | 2.9 KiB |
+| heartbeat lateness while every thread spins 1.5 s (max) | 20 ms | 1.5 s |
+| … Go with `asyncpreemptoff=1` / Julia heartbeat on `:interactive` | 1.2 s | 3 ms |
+| … Julia spinners calling `yield()` every 1 ms | — | 3 ms |
+
+What the second table says:
+
+- **Memory per parked task is not the gap.** Julia reserves an 8 MiB stack per task, but it is
+  address space: a parked task costs about as much resident memory as a goroutine. The ~500 MiB
+  floor of a Julia server is the runtime and the loaded code (#451), not its tasks.
+- **Hand-off latency is.** Creating and running tasks in bulk costs the same on one thread (the
+  fan-out, 0.22 µs either way). What costs microseconds is a task waiting on another: a spawn +
+  wait is 3× Go on one thread and 11× on eight — so most of it there is waking another thread —
+  and a `Channel` round trip is 19× Go even on one thread. The 1-thread figures are not from
+  `run.sh`; they are `taskset -c 0 julia --project=bench --threads=1,0 bench/tasks/tasks.jl micro`
+  and, in `bench/tasks/go/`, `GOMAXPROCS=1 taskset -c 0 go test -run '^$' -bench . -benchmem`.
+- **Preemption is the qualitative difference.** With every `:default` thread computing, a Julia
+  task on `:default` does not run until one finishes; Go bounds the wait at its ~10 ms time
+  slice. Turning Go's preemption off reproduces Julia exactly. The `:interactive` pool and a
+  periodic `yield()` are Julia's two ways out (#467). Their 3 ms is mostly the timer, not the
+  scheduler: Julia's `sleep` rounds a timer up to the next millisecond and adds one (libuv fires
+  early), so the heartbeat wakes about 1 ms late with nothing in its way.
 
 ## juliac (compiled executable)
 

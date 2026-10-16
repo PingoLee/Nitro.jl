@@ -1180,6 +1180,15 @@ end
 # unconditional: `serve` has no `parallel` keyword to turn it off (#525). Keep it. The other half of the same lesson is in
 # `stream_handler`: the response write has to happen on this task too (#453).
 #
+# Creating a task per request is not the cost to remove either (#468). Profiled under load
+# (`PROFILE=10 bench/socket/run.sh`, `/plaintext`, c=50), the spawn and the `wait` below are about
+# 31% of the interactive thread at `-t 8` -- the thread that saturates first there -- but creating
+# the `Task` is 7-8% of it; twice that is `schedule` waking a sleeping default thread, which any
+# hand-off pays. At `-t 8,0` the pair is 3.5% of the default threads' samples, creation 1.3%. A
+# pool of `nthreads(:default)` long-lived tasks fed by a `Channel` (`MODE=bare_pool`) allocates no
+# task per request and measured 16% fewer requests per second than the spawn at `8,1` and 9% fewer
+# at `8,0`; it would also hold a slot through every I/O wait of a handler, which the spawn does not.
+#
 # One genuine semantic difference, since "pure overhead" undersells it: `@async`
 # creates a **sticky** task, pinned to the thread that created it, while
 # `Threads.@spawn` creates a migratable one. A handler may therefore now move

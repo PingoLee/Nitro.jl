@@ -10,7 +10,11 @@
 #                       the shape Nitro's `parallel_stream_handler` takes, and the ceiling to
 #                       compare it against.
 #   MODE=bare_nospawn   The same without the spawn: the handler runs on HTTP.jl's connection task.
+#   MODE=bare_pool      `bare_spawn` with the per-request spawn replaced by POOL long-lived tasks on
+#                       `:default` (default `nthreads(:default)`), fed by a channel (#468): is
+#                       CREATING a task per request a material cost, or is a pool no cheaper?
 #
+#   POOL=<n>            bare_pool only: how many pooled handler tasks.
 #   PORT=8080           Loopback port.
 #   ACCESS_LOG=0|1      Nitro only: `serve(access_log = …)`. Default 0.
 #   PROFILE=<seconds>   After WARMUP seconds, sample every thread for this long and write three
@@ -22,10 +26,15 @@
 #   WARMUP=<seconds>    Delay before the profile window opens. Default 8.
 #   CPU_MS=50           What `/cpu` burns: a loop that never yields, holding its thread for this many
 #                       milliseconds (#491: does a CPU-bound handler starve `/health`?).
+#                       `/cpu_yield` burns the same but calls `yield()` every YIELD_MS (default 2),
+#                       the cooperative mitigation #467 measures.
 #   WORKERS=0|1         Nitro only: also serve `/burst?n=K`, which submits K Workers jobs that each
 #                       burn JOB_MS (default 500) without yielding, on a `WorkerRuntime` of its own.
 #                       `&queue=1` submits them to a queue of concurrency BURST_K instead of all at
 #                       once, and `&cp=MS` makes each job call `checkpoint!` every MS ms (#513).
+#                       `/cpu_job` submits ONE job of CPU_MS to that queue and answers 202 at once:
+#                       `/cpu`'s work moved off the request path (#467). `/jobs` answers how many
+#                       `/cpu_job` jobs are submitted and not yet finished, so a script can drain.
 #   BURST_K=<k>         Nitro only: that queue's concurrency. Default `nthreads(:default) - 2`, at
 #                       least 1. The queue buffers 100, so a queued burst above 100 is refused.
 #   LAG=0|1             Start the `/lag` probe (off by default, so a throughput run carries no extra
@@ -54,6 +63,7 @@ const ACCESS_LOG = get(ENV, "ACCESS_LOG", "0") == "1" || MODE == "nitro_log"
 const PROFILE_S  = parse(Float64, get(ENV, "PROFILE", "0"))
 const WARMUP_S   = parse(Float64, get(ENV, "WARMUP", "8"))
 const CPU_MS     = parse(Float64, get(ENV, "CPU_MS", "50"))
+const YIELD_MS   = parse(Float64, get(ENV, "YIELD_MS", "2"))
 const JOB_MS     = parse(Float64, get(ENV, "JOB_MS", "500"))
 const WORKERS    = get(ENV, "WORKERS", "0") == "1"
 const LAG        = get(ENV, "LAG", "0") == "1"
@@ -82,6 +92,26 @@ function burn(ms::Float64)::Float64
     return x
 end
 cpu_body() = string("ok ", burn(CPU_MS) > 2.0)   # never true; keeps `burn` from being elided
+
+# `burn`, with a `yield()` every `every_ms`: the cooperative mitigation for a CPU-bound handler
+# (#467). Same clock-read loop otherwise, so the two differ only in the yield.
+function burn_yielding(ms::Float64, every_ms::Float64)::Float64
+    now = time_ns()
+    deadline = now + round(UInt64, ms * 1e6)
+    step = round(UInt64, every_ms * 1e6)
+    next = now + step
+    x = 0.0
+    while (now = time_ns()) < deadline
+        x = sin(x + 1.0)
+        GC.safepoint()
+        if now >= next
+            yield()
+            next = time_ns() + step
+        end
+    end
+    return x
+end
+cpu_yield_body() = string("ok ", burn_yielding(CPU_MS, YIELD_MS) > 2.0)
 
 # How late a 10 ms sleep on the `:default` pool wakes. Every mode can start it (LAG=1), so modes
 # stay alike.
@@ -112,6 +142,7 @@ function bare_handler(req::HTTP.Request)::HTTP.Response
     target == "/json"      && return HTTP.Response(200, ["Content-Type" => "application/json"], json_body())
     target == "/health"    && return HTTP.Response(200, "ok")
     target == "/cpu"       && return HTTP.Response(200, cpu_body())
+    target == "/cpu_yield" && return HTTP.Response(200, cpu_yield_body())
     target == "/lag"       && return HTTP.Response(200, ["Content-Type" => "application/json"], lag_body())
     return HTTP.Response(404)
 end
@@ -122,6 +153,44 @@ function start_bare(spawn::Bool)
     return HTTP.listen!(handler, "127.0.0.1", PORT)
 end
 
+# One reusable hand-off per CONNECTION (a connection serves one request at a time), kept in the
+# connection task's storage: the pool side allocates no task and no event per request, which is
+# the whole point of a pool. `stream` is untyped, one dynamic call per request -- tens of
+# nanoseconds against a spawn's microseconds, and it errs in the spawn's favour.
+mutable struct PoolSlot
+    stream::Any
+    err::Any
+    const done::Base.Event
+    PoolSlot() = new(nothing, nothing, Base.Event(true))   # autoreset: reusable
+end
+
+function start_bare_pool()
+    inner = HTTP.streamhandler(bare_handler)
+    n = parse(Int, get(ENV, "POOL", string(Threads.nthreads(:default))))
+    jobs = Channel{PoolSlot}(Inf)
+    for _ in 1:n
+        Threads.@spawn :default for slot in jobs
+            try
+                inner(slot.stream)
+            catch e
+                slot.err = e
+            end
+            notify(slot.done)
+        end
+    end
+    handler = function (stream)
+        slot = get!(PoolSlot, task_local_storage(), :bench_pool_slot)::PoolSlot
+        slot.stream = stream
+        slot.err = nothing
+        put!(jobs, slot)
+        wait(slot.done)
+        slot.stream = nothing
+        slot.err === nothing || throw(slot.err)
+        return nothing
+    end
+    return HTTP.listen!(handler, "127.0.0.1", PORT)
+end
+
 function start_nitro()
     app = App()
     urlpatterns(app, "",
@@ -129,9 +198,17 @@ function start_nitro()
         path("/json",      req -> Res.send(json_body(); content_type = "application/json"); method = "GET"),
         path("/health",    req -> Res.send("ok"); method = "GET"),
         path("/cpu",       req -> Res.send(cpu_body()); method = "GET"),
+        path("/cpu_yield", req -> Res.send(cpu_yield_body()); method = "GET"),
         path("/lag",       req -> Res.send(lag_body(); content_type = "application/json"); method = "GET"),
     )
-    WORKERS && urlpatterns(app, "", path("/burst", burst_route(); method = "GET"))
+    if WORKERS
+        burst, cpu_job, jobs = worker_routes()
+        urlpatterns(app, "",
+            path("/burst",   burst; method = "GET"),
+            path("/cpu_job", cpu_job; method = "GET"),
+            path("/jobs",    jobs; method = "GET"),
+        )
+    end
     serve(app; host = "127.0.0.1", port = PORT, async = true, show_banner = false,
           access_log = ACCESS_LOG)
     return app
@@ -145,13 +222,33 @@ end
 # The two #513 levers are per REQUEST, not per server, so one `contention.sh` run interleaves every
 # variant on the same servers: `queue=1` sends the jobs to a queue of concurrency BURST_K (the
 # bulkhead), and `cp=MS` makes each one call `checkpoint!` every MS milliseconds.
-function burst_route()
+#
+# `/cpu_job` (#467) is `/cpu` moved to that same queue: one job of CPU_MS per request, answered
+# 202 before it runs. `/jobs` counts the ones not yet finished, so `stall.sh` can drain between
+# passes instead of letting one pass's backlog load the next.
+function worker_routes()
     runtime = Nitro.Workers.WorkerRuntime(Nitro.Workers.InMemoryWorkerStore();
                                           max_concurrent_runs = nothing,
                                           queues = ["burst" => BURST_K])
     owner = Nitro.Workers.Owner("bench")
     seq = Threads.Atomic{Int}(0)
-    return function (req)
+    pending = Threads.Atomic{Int}(0)
+    cpu_job = function (req)
+        id = Threads.atomic_add!(seq, 1)
+        Threads.atomic_add!(pending, 1)
+        job = _ -> try burn(CPU_MS) finally Threads.atomic_sub!(pending, 1) end
+        try
+            Nitro.Workers.submit_queued_task("burst", "cpu-$id", job, owner; runtime)
+        catch
+            # A full queue refuses the job with `WorkerCapacityError`, which Nitro answers 503.
+            # It will never run, so it is not pending.
+            Threads.atomic_sub!(pending, 1)
+            rethrow()
+        end
+        return Res.send("accepted"; status = 202)
+    end
+    jobs = req -> Res.send(string(pending[]))
+    burst = function (req)
         query = Nitro.getquery(req)
         n = parse(Int, something(get(query, "n", nothing), "8"))
         queued = get(query, "queue", "0") == "1"
@@ -168,6 +265,7 @@ function burst_route()
         end
         return Res.send("submitted $n")
     end
+    return burst, cpu_job, jobs
 end
 
 # `burn`, but calling `checkpoint!` every `every_ms` of it (#513): the cooperative yield point a
@@ -226,13 +324,90 @@ PROFILE_S > 0 && @eval function profile_window()
         Profile.print(IOContext(io, :displaysize => (10_000, 400)); format = :tree, C = true,
                       threads = interactive, mincount = 20, maxdepth = 80)
     end
+    open(io -> sched_share(io, interactive), "$stem-sched.txt", "w")
     @info "bench: profile written" stem
+end
+
+# What share of the AWAKE samples is task machinery (#468): creating, scheduling, switching to and
+# waiting on tasks. Each awake sample is charged to the leaf-most frame that decides it: a C frame
+# outside Julia's runtime (libc, libuv) is skipped, so the `pthread_cond_signal` that wakes a
+# thread is charged to `scheduler.c` and a `memcpy` inside `jl_new_task` to `task.c`; a runtime C
+# frame that is neither task nor GC code (dispatch, `jl_apply`) is skipped too, to its caller. A
+# Julia frame decides: task machinery if it is one of Base's task files, otherwise `other`.
+# Sleeping samples -- a thread parked with nothing to run -- are counted separately and charged to
+# nothing: without the profiler's sleep state an idle thread reads as time spent in `poptask`.
+PROFILE_S > 0 && @eval begin
+const SCHED_JL = ("task.jl", "partr.jl", "condition.jl", "lock.jl", "locks-mt.jl",
+                  "threadingconstructs.jl")
+const SCHED_C  = ("task.c", "scheduler.c", "partr.c", "threading.c")
+
+# `:tasks`, `:gc` or `:other` when this frame decides the sample, `nothing` to look at its caller.
+function frame_category(fr)::Union{Symbol, Nothing}
+    path = string(fr.file)
+    f = basename(path)
+    (isempty(f) || f == "?") && return nothing
+    if fr.from_c
+        occursin("libuv", path) && return nothing        # libuv's own `src/` is not Julia's
+        f in SCHED_C && return :tasks
+        (startswith(f, "gc") && endswith(f, ".c")) || f == "safepoint.c" ? :gc : nothing
+    else
+        base = startswith(path, "./") || occursin("/base/", path)   # not a package's `task.jl`
+        base && f in SCHED_JL && return :tasks
+        return base && f == "gc.jl" ? :gc : :other
+    end
+end
+
+function sched_share(io::IO, interactive::Vector{Int})
+    data, lidict = Profile.retrieve()
+    # Each block is: ip... (leaf first), threadid, taskid, cycles, sleep state + 1, 0, 0 -- the
+    # offsets are Profile's own `META_OFFSET_*`, and `is_block_end` finds the closing zero.
+    counts = Dict{Tuple{Symbol, Symbol}, Int}()   # (pool, category) => samples
+    block_start = 1
+    for i in eachindex(data)
+        i > Profile.META_OFFSET_THREADID || continue
+        Profile.is_block_end(data, i) || continue
+        tid = Int(data[i - Profile.META_OFFSET_THREADID])
+        sleeping = data[i - Profile.META_OFFSET_SLEEPSTATE] - 1 == 1
+        # The profiler also samples threads Julia did not start for tasks: the parallel GC's (one
+        # per default thread unless --gcthreads) and any I/O poller. Parked in a condition wait,
+        # they read as awake, so lumping them in with `:default` halves every share.
+        pool = tid in interactive ? :interactive :
+               tid <= Threads.maxthreadid() && Threads.threadpool(tid) == :default ? :default :
+               :foreign
+        cat = sleeping ? :sleeping : :other
+        if !sleeping && pool !== :foreign
+            # ips leaf first, and each ip's frames (inlining) leaf first too.
+            found = false
+            for j in block_start:(i - Profile.META_OFFSET_THREADID - 1)
+                for fr in get(lidict, data[j], ())
+                    c = frame_category(fr)
+                    c === nothing && continue
+                    cat = c; found = true; break
+                end
+                found && break
+            end
+        end
+        counts[(pool, cat)] = get(counts, (pool, cat), 0) + 1
+        block_start = i + 1
+    end
+    println(io, "samples by pool and category (awake samples charged to the leaf-most deciding frame)")
+    for pool in (:interactive, :default)
+        awake = sum(get(counts, (pool, c), 0) for c in (:tasks, :gc, :other))
+        asleep = get(counts, (pool, :sleeping), 0)
+        pct(c) = awake == 0 ? 0.0 : round(100 * get(counts, (pool, c), 0) / awake; digits = 1)
+        println(io, rpad(string(pool), 12), " awake=", awake, " sleeping=", asleep,
+                " | tasks ", pct(:tasks), "%  gc ", pct(:gc), "%  other ", pct(:other), "%")
+    end
+    foreign = sum(v for ((p, _), v) in counts if p === :foreign; init = 0)
+    println(io, rpad("foreign", 12), " samples=", foreign, " (GC and I/O threads, not counted above)")
+end
 end
 
 handle = MODE in ("nitro", "nitro_log") ? start_nitro() :
          MODE == "bare_spawn"   ? start_bare(true) :
          MODE == "bare_nospawn" ? start_bare(false) :
-         error("unknown MODE=$(MODE): expected nitro, nitro_log, bare_spawn or bare_nospawn")
+         MODE == "bare_pool"    ? start_bare_pool() :
+         error("unknown MODE=$(MODE): expected nitro, nitro_log, bare_spawn, bare_nospawn or bare_pool")
 
 @info "bench: serving" MODE PORT threads = Threads.nthreads() interactive = Threads.nthreads(:interactive)
 PROFILE_S > 0 && Threads.@spawn profile_window()

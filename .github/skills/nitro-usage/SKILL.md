@@ -423,6 +423,31 @@ another's task by guessing a resource-derived key. For persistence,
 `pormg_nitro_worker(db_key="workers")` needs `using PormG` in the **application** so the extension
 loads.
 
+**Computation longer than a few milliseconds does not belong in a handler.** Julia cannot preempt a
+task: a handler that computes without waiting holds its `:default` thread until it returns, and
+once every default thread is held, every other request waits for one. Measured with 8 default
+threads, 8 handlers each computing for 200 ms took a minimal route from about 100k requests per
+second to 1.5k, with a p99 of 192 ms: the handlers' own run time. Waiting on a database, an HTTP
+call or a file is not computing; it already gives the thread back. For real computation:
+
+- **Move it to a queue whose concurrency leaves threads free, and answer `202`.** The queue bounds
+  how many run at once, so the other requests keep their threads however many are submitted. A
+  full queue refuses the next submit with `WorkerCapacityError`, which Nitro answers `503`.
+
+  ```julia
+  serve(app; middleware = [worker_startup(app;
+      queues = ["compute" => max(Threads.nthreads(:default) - 2, 1)])])
+
+  function start_fit(req::HTTP.Request, id::Int)
+      task_id = submit_queued_task(app, "compute", "fit-$(id)",
+                                   task_info -> fit_model(id), Owner(user_id))
+      return Res.json(Dict("task_id" => task_id); status = 202)
+  end
+  ```
+
+- **Or call `yield()` every 1–2 ms** inside a loop that has to stay in the handler. It does not
+  reduce the CPU the work takes, but it bounds how long a cheap request waits behind it.
+
 ---
 
 ## 10. Bootstrap
@@ -489,6 +514,7 @@ query parameter with no default is **required**: omitting it is a 400, not `noth
 | `if user.role == "admin"` inside a handler | `role_required("admin")` guard on the route |
 | `login_required()` on a route that loads a record by client id | Also verify ownership — otherwise IDOR |
 | `submit_task(key, cb)` without an authority | `submit_task(key, cb, Owner(user_id))` |
+| A handler that computes for more than a few milliseconds | `submit_queued_task` to a bounded queue and answer `202`, or `yield()` every 1–2 ms — Julia cannot preempt it |
 | Polling `get_task_status(key, …)` with the key you submitted | Poll with the id `submit_task` returned, or `scoped_task_key(key, Owner(user_id))` |
 | Mutating a `Response` returned by inner middleware | `add_response_headers(resp, extra)` |
 | A global mutable config object | A typed struct passed via `serve(context=…)` |

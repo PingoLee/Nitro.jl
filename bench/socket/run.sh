@@ -29,6 +29,15 @@
 # `baseline` is `nitro` served from the checkout at BASE_ROOT (its own bench/ env, instantiated),
 # so a change can be A/B'd against the code it replaces in the same interleaved run.
 #
+# `go` is the Go `net/http` reference in socket/go/ (#469): same routes, same bodies, built once
+# per invocation and pinned to the same SERVER_CPUS. Its `threads` column is GOMAXPROCS, which
+# defaults to the number of server CPUs; `go@4` sets it. Go is required only when `go` is one of
+# the modes, so Julia-only runs keep working without a Go toolchain.
+#
+# Every mode's resident memory is read from /proc for the process that owns the listening socket,
+# not for `$!`, so a wrapper between the two cannot misreport it: `rss_rest_mib` once it answers `/health`,
+# `rss_after_mib` once every run is done, and `rss_peak_mib` (VmHWM) over its life.
+#
 # `mode@threads` starts that one server with its own `--threads` and records it in the TSV's
 # `threads` column; a bare mode takes THREADS. That is what lets a sweep of the interactive
 # thread count (#462: does HTTP.jl's single interactive thread set the ceiling?) obey the rule
@@ -55,6 +64,11 @@ for tool in oha taskset jq curl "${JULIA_CMD[0]}" ss; do
   command -v "$tool" >/dev/null || { echo "run.sh: $tool not on PATH" >&2; exit 1; }
 done
 read -r -a MODE_LIST <<<"$MODES"
+WANT_GO=0
+for mode in "${MODE_LIST[@]}"; do [ "${mode%%@*}" = go ] && WANT_GO=1; done
+if [ "$WANT_GO" = 1 ]; then
+  command -v go >/dev/null || { echo "run.sh: go not on PATH (needed by the go mode)" >&2; exit 1; }
+fi
 if [ "${PROFILE:-0}" != "0" ] && [ "${#MODE_LIST[@]}" -ne 1 ]; then
   echo "run.sh: PROFILE takes exactly one mode" >&2; exit 1
 fi
@@ -63,13 +77,30 @@ OUT="$ROOT/bench/results"
 mkdir -p "$OUT"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 RESULT="$OUT/socket-$STAMP.tsv"
-printf 'mode\tthreads\taccess_log\troute\trate\tmedian_rps\tmin_rps\tmax_rps\tmedian_p50_ms\tmedian_p99_ms\n' > "$RESULT"
+printf 'mode\tthreads\taccess_log\troute\trate\tmedian_rps\tmin_rps\tmax_rps\tmedian_p50_ms\tmedian_p99_ms\trss_rest_mib\trss_after_mib\trss_peak_mib\n' > "$RESULT"
 
 median() { sort -n | awk '{a[NR]=$1} END{print (NR%2)?a[(NR+1)/2]:(a[NR/2]+a[NR/2+1])/2}'; }
 
-# `nitro@8,2` -> name `nitro`, threads `8,2`; `nitro` -> name `nitro`, threads $THREADS.
+# `nitro@8,2` -> name `nitro`, threads `8,2`; `nitro` -> name `nitro`, threads $THREADS; a bare
+# `go` -> GOMAXPROCS = the number of server CPUs (`nproc` honours the affinity mask).
+SERVER_NCPU="$(taskset -c "$SERVER_CPUS" nproc)"
 mode_name()    { printf '%s' "${1%%@*}"; }
-mode_threads() { case "$1" in *@*) printf '%s' "${1#*@}" ;; *) printf '%s' "$THREADS" ;; esac; }
+mode_threads() {
+  case "$1" in
+    *@*) printf '%s' "${1#*@}" ;;
+    go)  printf '%s' "$SERVER_NCPU" ;;
+    *)   printf '%s' "$THREADS" ;;
+  esac
+}
+
+# The pid that owns the listening socket on port $1, and a /proc/<pid>/status field in MiB.
+listener_pid() { ss -Hltnp "sport = :$1" | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2; }
+status_mib()   { awk -v k="$2:" '$1 == k { printf "%.0f", $2 / 1024 }' "/proc/$1/status" 2>/dev/null; }
+
+GO_BIN="$OUT/go-server"
+if [ "$WANT_GO" = 1 ]; then
+  (cd "$HERE/go" && go build -o "$GO_BIN" .) || { echo "run.sh: go build failed" >&2; exit 1; }
+fi
 
 PIDS=()
 cleanup() { for p in ${PIDS[@]+"${PIDS[@]}"}; do kill "$p" 2>/dev/null; done; wait 2>/dev/null; }
@@ -96,8 +127,9 @@ oha_json() {
 echo "socket bench: server CPUs $SERVER_CPUS (--threads=$THREADS unless mode@threads), client CPUs $CLIENT_CPUS, $RUNS x $DUR interleaved, c=$CONNS${RATE:+, rate=$RATE/s}"
 echo "julia: $("${JULIA_CMD[@]}" --version)"
 echo "governor: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo unknown)"
+[ "$WANT_GO" = 1 ] && echo "go: $(go version)"
 
-declare -A PORT_OF LOG_OF
+declare -A PORT_OF LOG_OF SPID_OF RSS_REST
 i=0
 for mode in "${MODE_LIST[@]}"; do
   port=$((BASE_PORT + i)); i=$((i + 1))
@@ -116,9 +148,13 @@ for mode in "${MODE_LIST[@]}"; do
     [ -n "${BASE_ROOT:-}" ] || { echo "run.sh: baseline needs BASE_ROOT" >&2; exit 1; }
     project="$BASE_ROOT/bench"; served=nitro
   fi
-  MODE="$served" PORT="$port" ACCESS_LOG="${ACCESS_LOG:-0}" PROFILE="${PROFILE:-0}" WARMUP="${WARMUP:-8}" \
-    taskset -c "$SERVER_CPUS" "${JULIA_CMD[@]}" --project="$project" --threads="$threads" \
-    "$HERE/server.jl" >"$log" 2>&1 &
+  if [ "$name" = go ]; then
+    GOMAXPROCS="$threads" PORT="$port" taskset -c "$SERVER_CPUS" "$GO_BIN" >"$log" 2>&1 &
+  else
+    MODE="$served" PORT="$port" ACCESS_LOG="${ACCESS_LOG:-0}" PROFILE="${PROFILE:-0}" WARMUP="${WARMUP:-8}" \
+      taskset -c "$SERVER_CPUS" "${JULIA_CMD[@]}" --project="$project" --threads="$threads" \
+      "$HERE/server.jl" >"$log" 2>&1 &
+  fi
   pid=$!
   PIDS+=("$pid")
   if ! wait_up "$port" "$pid"; then
@@ -128,6 +164,8 @@ for mode in "${MODE_LIST[@]}"; do
   fi
   PORT_OF[$mode]=$port
   LOG_OF[$mode]=$log
+  SPID_OF[$mode]="$(listener_pid "$port")"
+  RSS_REST[$mode]="$(status_mib "${SPID_OF[$mode]}" VmRSS)"
 done
 
 # Warm every route on every server before anything is recorded: compiles the route and fills
@@ -148,6 +186,12 @@ for _ in $(seq 1 "$RUNS"); do
   done
 done
 
+declare -A RSS_AFTER RSS_PEAK
+for mode in "${MODE_LIST[@]}"; do
+  RSS_AFTER[$mode]="$(status_mib "${SPID_OF[$mode]}" VmRSS)"
+  RSS_PEAK[$mode]="$(status_mib "${SPID_OF[$mode]}" VmHWM)"
+done
+
 for route in $ROUTES; do
   for mode in "${MODE_LIST[@]}"; do
     read -r -a rps <<<"${RPS[$mode$route]}"
@@ -158,11 +202,13 @@ for route in $ROUTES; do
     mx=$(printf '%s\n' "${rps[@]}" | sort -n | tail -1)
     m50=$(printf '%s\n' "${p50[@]}" | median)
     mp=$(printf '%s\n' "${p99[@]}" | median)
-    printf '%-13s %-10s median=%-8s [%s..%s]  p50=%sms p99=%sms  runs: %s\n' \
-      "$mode" "$route" "$med" "$mn" "$mx" "$m50" "$mp" "${rps[*]}"
+    printf '%-13s %-10s median=%-8s [%s..%s]  p50=%sms p99=%sms  rss=%s/%s/%sMiB  runs: %s\n' \
+      "$mode" "$route" "$med" "$mn" "$mx" "$m50" "$mp" \
+      "${RSS_REST[$mode]}" "${RSS_AFTER[$mode]}" "${RSS_PEAK[$mode]}" "${rps[*]}"
     logged="${ACCESS_LOG:-0}"; [ "$(mode_name "$mode")" = nitro_log ] && logged=1
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(mode_name "$mode")" "$(mode_threads "$mode")" \
-      "$logged" "$route" "${RATE:-max}" "$med" "$mn" "$mx" "$m50" "$mp" >> "$RESULT"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(mode_name "$mode")" "$(mode_threads "$mode")" \
+      "$logged" "$route" "${RATE:-max}" "$med" "$mn" "$mx" "$m50" "$mp" \
+      "${RSS_REST[$mode]}" "${RSS_AFTER[$mode]}" "${RSS_PEAK[$mode]}" >> "$RESULT"
   done
 done
 
