@@ -185,6 +185,31 @@ urlpatterns("",
 )
 ```
 
+## A login is a handler that computes
+
+`check_password` and `make_password` compute until they return, and they never yield. At the
+defaults, PBKDF2 takes about 0.1 s and bcrypt about 0.2 s. A request runs on a `:default`
+thread that Julia does not preempt. So as many concurrent logins as there are default threads
+stall every other request for the length of one hash. The measurement is in the deployment
+guide's [Handlers that compute](@ref) ([#587](https://github.com/PingoLee/Nitro.jl/issues/587)).
+
+Keep some threads free for everything else: let only a few checks run at once, and make the
+rest wait without holding a thread. A `Base.Semaphore` does both: `acquire` parks the task, and
+a parked task gives up its thread.
+
+```julia
+const PASSWORD_CHECKS = Base.Semaphore(max(Threads.nthreads(:default) - 2, 1))
+
+checked(password, stored_hash) =
+    Base.acquire(() -> check_password(password, stored_hash), PASSWORD_CHECKS)
+```
+
+Call `checked` in the login handler above, and in any handler that calls `make_password`. Logins
+then wait their turn under load: the sign-ins per second stay at what the free threads can hash,
+and the rest of the API keeps the threads the semaphore leaves free. This is the same rule as the
+bounded Workers queue, which was measured there. It was not measured for logins, and it is not
+yet built into Nitro (#587).
+
 ## Wire Format Specifications
 
 ### Django PBKDF2 (`pbkdf2_sha256`)

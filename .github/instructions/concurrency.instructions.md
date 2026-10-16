@@ -91,14 +91,21 @@ lives in the code comment it names, and that comment is canonical.
 - **Or `yield()` every 1-2 ms** in a loop that has to stay in the handler. It bounds the wait
   (a p99 of 10.5 ms at the knee in #467's run, against 192 ms) but not the throughput loss, so it
   is the fallback, not the rule.
-- **On Julia 1.13.0 through 1.13.2, `yield()` does not bound the wait of a task that is already
-  waiting (#586).** With every default thread in a loop that yields every 1 ms, a task woken by a
-  `Timer` did not run until the loops ended (1.5 s in the repro), against a few ms on 1.12.7 and
-  on 1.14-DEV; it begins at 1.13.0-rc3, with the scheduler backports in JuliaLang/julia#62665.
-  New requests still got in: #467's `cpu_yield` row did not move on 1.13.2. So the victim is a
-  handler already parked on a `sleep`, and probably on a database or socket reply, which also
-  wakes through the event loop (not measured). On 1.13.x, take the queue. Drop this bullet once a
-  1.13 release fixes it, and change the documents below with it.
+- **On Julia 1.13.0 through 1.13.2, `yield()` does not wake a parked task when nothing else
+  keeps a libuv timer alive (#586).** In the repro, every default thread runs a loop that yields
+  every 1 ms, and a task in `sleep(0.001)` does not run again until the loops end (1.5 s), against
+  a few ms on 1.12.7 and on 1.14-DEV. It begins at 1.13.0-rc3, with the scheduler backports in
+  JuliaLang/julia#62665, and is reported as JuliaLang/julia#63882. **Any second live `Timer`
+  removes it, even one that never fires.**
+  - **Not affected:** the bounded queue, and new requests (#467's `cpu_yield` row did not move on
+    1.13.2). **Exposed:** an app with no live timer.
+  - **Who is protected:** Nitro's janitors keep a timer alive while they sleep: the session
+    pruner, `FixedRateLimiter`'s janitor and the Workers cleanup scheduler. An app that runs any
+    of them should not see this (read from the code, not tested with `serve()`).
+  - **The bench masks it:** `bench/socket/server.jl` waits on a `Timer` itself, so `stall.sh`
+    cannot show this.
+  - **Open question:** whether `serve()` should hold such a timer is #598. Drop this bullet once
+    a 1.13 release fixes it, and change the documents below with it.
 - The measurements and the user-facing rule live in `docs/src/tutorial/deployment.md` (*Handlers
   that compute*) and `docs/src/tutorial/workers.md` (*CPU-Bound Jobs*); the `nitro-usage` skill
   carries the same rule for application code. Change all of them together, or none.
