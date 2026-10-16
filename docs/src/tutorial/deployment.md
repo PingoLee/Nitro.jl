@@ -116,8 +116,8 @@ So:
   threads stay free for requests: run CPU-heavy Workers jobs through a declared queue with a
   concurrency below the default thread count, such as `queues = ["compute" => max(N - 2, 1)]`
   (`submit_queued_task`), which runs at most that many at once and buffers up to 100 behind them
-  (see [CPU-Bound Jobs](@ref)), or put a `yield()` inside a long loop (not on Julia 1.13.1 or
-  1.13.2; see [Handlers that compute](@ref)).
+  (see [CPU-Bound Jobs](@ref)), or put a `yield()` inside a long loop (not on Julia 1.13.0
+  through 1.13.2; see [Handlers that compute](@ref)).
   `max_concurrent_runs` does not make jobs wait: past it, `submit_task` refuses them.
 
 **Stopping it.** `--threads=N,0` is a production layout, for a process stopped by its supervisor.
@@ -173,7 +173,7 @@ the benchmark's own job counter; its k = 0 baseline was 102k and 2.4 ms.
 - **Or `yield()` every 1–2 ms** in a loop that has to stay in the handler. It does not make the
   work cheaper, so throughput still falls, but it bounds the wait: a p99 of 10.5 ms at k = 8,
   lower than Go's 19.9 ms (Go preempts a goroutine after about 10 ms).
-- **Except on Julia 1.13.1 and 1.13.2**
+- **Except on Julia 1.13.0 through 1.13.2**
   ([#586](https://github.com/PingoLee/Nitro.jl/issues/586)). Those releases still let *new*
   requests past a yielding handler: the `yield()` column above did not change on 1.13.2. But a
   task that was already waiting and is woken by a timer stays behind the yielding loops until

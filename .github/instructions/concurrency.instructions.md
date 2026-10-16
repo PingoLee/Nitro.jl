@@ -91,14 +91,14 @@ lives in the code comment it names, and that comment is canonical.
 - **Or `yield()` every 1-2 ms** in a loop that has to stay in the handler. It bounds the wait
   (a p99 of 10.5 ms at the knee in #467's run, against 192 ms) but not the throughput loss, so it
   is the fallback, not the rule.
-- **On Julia 1.13.1 and 1.13.2, `yield()` does not bound the wait of a task that is already
+- **On Julia 1.13.0 through 1.13.2, `yield()` does not bound the wait of a task that is already
   waiting (#586).** With every default thread in a loop that yields every 1 ms, a task woken by a
   `Timer` did not run until the loops ended (1.5 s in the repro), against a few ms on 1.12.7 and
-  on 1.14-DEV. New requests still got in: #467's `cpu_yield` row did not move on 1.13.2. So the
-  victim is a handler already parked on a `sleep`, and probably on a database or socket reply,
-  which also wakes through the event loop (not measured). On 1.13.x, take the queue. 1.13.0 was
-  not checked. Drop this bullet once a 1.13 release fixes it, and change the documents below with
-  it.
+  on 1.14-DEV; it begins at 1.13.0-rc3, with the scheduler backports in JuliaLang/julia#62665.
+  New requests still got in: #467's `cpu_yield` row did not move on 1.13.2. So the victim is a
+  handler already parked on a `sleep`, and probably on a database or socket reply, which also
+  wakes through the event loop (not measured). On 1.13.x, take the queue. Drop this bullet once a
+  1.13 release fixes it, and change the documents below with it.
 - The measurements and the user-facing rule live in `docs/src/tutorial/deployment.md` (*Handlers
   that compute*) and `docs/src/tutorial/workers.md` (*CPU-Bound Jobs*); the `nitro-usage` skill
   carries the same rule for application code. Change all of them together, or none.
