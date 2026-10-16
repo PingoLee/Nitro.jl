@@ -269,6 +269,26 @@ function registerhandler(ctx::App, router::Router, httpmethod::String, route::St
         handle = function(req::HTTP.Request)
             func_handle(req, func)
         end
+    elseif any(p -> p.type <: Claims, info.sig)
+        # A `Claims{T}` refusal is a response the app's denial factory already built, thrown as an
+        # `AuthDenial` because an extractor can only throw (#527). It is served HERE, as this
+        # route's response, so `catch_errors` and `serialize` do not decide whether the app's
+        # 401/403 reaches the client (#594): `handlerequest` converted it only under
+        # `catch_errors=true`, and with `serialize=false` there is no `handlerequest` at all. A
+        # guard returns its 403 the same way rather than throwing. It still leaves through
+        # `format_response` and every middleware, the position the `catch_errors=true` path gave it.
+        #
+        # Only a route that binds a `Claims` pays for the `try`; nothing else throws an `AuthDenial`.
+        handle = function(req::HTTP.Request)
+            params = try
+                parse_params(req)
+            catch e
+                e isa Errors.AuthDenial || rethrow()
+                # Not logged here: `extract` already wrote one `@debug` line naming the reason.
+                return e.response
+            end
+            func_handle(req, func; parameters=params)
+        end
     else
         handle = function(req::HTTP.Request)
             params = parse_params(req)

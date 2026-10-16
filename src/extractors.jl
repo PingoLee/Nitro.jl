@@ -776,7 +776,10 @@ function extract(param::Param{Claims{T}}, request::LazyRequest) :: Claims{T} whe
     req = request.request
     unauthorized, denied = claims_factories(param)
     principal = getprincipal(req)
-    principal === nothing && throw(AuthDenial(_deny(unauthorized, req, :missing_credentials)))
+    if principal === nothing
+        @debug "Claims{T} refused: no token principal" parameter = param.name type = T
+        throw(AuthDenial(_deny(unauthorized, req, :missing_credentials)))
+    end
     claims = getfield(principal, :claims)
     instance = try
         claims_bind(T, claims)

@@ -2072,3 +2072,87 @@ end
     @test_throws InterruptException internalrequest(app, post("/interrupt"); serialize = false)
 end
 end
+
+@testitem "a Claims{T} refusal is served whatever catch_errors and serialize say (#594)" tags=[:core, :auth, :security] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+using Nitro: App, Claims
+
+struct GateClaims
+    sub::String
+    org_id::Int
+end
+struct GateBody
+    n::Int
+end
+
+secret = jwtkey("gate-secret")
+validator = Nitro.Auth.jwt_validator(secret)
+bearer(target, claims) = HTTP.Request("GET", target,
+    ["Authorization" => "Bearer $(Nitro.Auth.encode_jwt(claims, secret; expires_in = 60))"])
+deny(status) = (req, reason) -> Res.json(Dict("error" => String(reason)); status)
+
+app = App(mod = @__MODULE__)
+urlpatterns(app, "",
+    path("/open", (req, c::Claims{GateClaims}) -> Res.send("ok")),
+    path("/auth", (req, c::Claims{GateClaims}) -> Res.send("ok"); middleware = [BearerAuth(validator)]),
+    path("/custom", (req, c = Claims(GateClaims; unauthorized = deny(418), denied = deny(451))) -> Res.send("ok");
+         middleware = [BearerAuth(validator)]),
+    path("/custom-open", (req, c = Claims(GateClaims; unauthorized = deny(418))) -> Res.send("ok")),
+    path("/boom", req -> error("not a refusal")),
+    # A Claims route with a second extractor: only the refusal is caught around the parse.
+    path("/both", (req, c::Claims{GateClaims}, b::Json{GateBody}) -> Res.send("ok");
+         method = "POST", middleware = [BearerAuth(validator)]),
+)
+
+modes = (("catch_errors=true", (;)), ("catch_errors=false", (; catch_errors = false)),
+         ("serialize=false", (; serialize = false)))
+
+@testset "$label" for (label, kw) in modes
+    call(req) = internalrequest(app, req; kw...)
+    # No token principal: the default factory's 401, and the app's own when it brings one.
+    @test call(HTTP.Request("GET", "/open")).status == 401
+    r = call(HTTP.Request("GET", "/custom-open"))
+    @test r.status == 418
+    @test Nitro.json(r) == Dict("error" => "missing_credentials")
+    # Claims that do not bind: the default 403, and the app's own.
+    @test call(bearer("/auth", Dict("sub" => "u1"))).status == 403
+    r = call(bearer("/custom", Dict("sub" => "u1")))
+    @test r.status == 451
+    @test Nitro.json(r) == Dict("error" => "forbidden")
+    # Admitted, the handler runs as before.
+    @test call(bearer("/auth", Dict("sub" => "u1", "org_id" => 7))).status == 200
+end
+
+@testset "a refusal writes no error log" begin
+    logs, r = Test.collect_test_logs(; min_level = Base.CoreLogging.Debug) do
+        internalrequest(app, HTTP.Request("GET", "/open"); catch_errors = false)
+    end
+    @test r.status == 401
+    @test !any(l -> l.level >= Base.CoreLogging.Warn, logs)
+end
+
+@testset "on a Claims route, a sibling extractor's error is not a refusal" begin
+    t = Nitro.Auth.encode_jwt(Dict("sub" => "u1", "org_id" => 7), secret; expires_in = 60)
+    bad() = HTTP.Request("POST", "/both",
+        ["Authorization" => "Bearer $t", "Content-Type" => "application/json"], "{not json")
+    @test internalrequest(app, bad()).status == 400
+    @test_throws Nitro.ValidationError internalrequest(app, bad(); catch_errors = false)
+end
+
+@testset "a refusal is logged once, with its reason" begin
+    logs, _ = Test.collect_test_logs(; min_level = Base.CoreLogging.Debug) do
+        internalrequest(app, HTTP.Request("GET", "/open"))
+    end
+    refusals = [l for l in logs if occursin("refused", string(l.message))]
+    @test length(refusals) == 1
+    @test occursin("no token principal", string(only(refusals).message))
+end
+
+@testset "any other exception still propagates under catch_errors=false" begin
+    @test_throws ErrorException internalrequest(app, HTTP.Request("GET", "/boom"); catch_errors = false)
+    logs, r = Test.collect_test_logs(() -> internalrequest(app, HTTP.Request("GET", "/boom")))
+    @test r.status == 500
+end
+end

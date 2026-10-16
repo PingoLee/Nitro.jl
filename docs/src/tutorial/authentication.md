@@ -243,6 +243,11 @@ token of the same shape. If your clients know only `401`, pass `denied = UNAUTHO
 above. Your factory is told only the reason. Which claim failed goes to a `@debug` log line,
 and only the default `403` body names it.
 
+**The refusal is the route's response under every setting.** Your factory's response is served as
+it is, with or without `serve(...; catch_errors = false)` or `serialize = false`, the way a guard's
+`403` is. It is a decision your app made, not an error, so it never propagates as an exception.
+It still passes back out through every middleware on the route, like any handler's response.
+
 One function can serve every site:
 
 ```julia

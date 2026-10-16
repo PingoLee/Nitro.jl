@@ -161,9 +161,11 @@ end
 
 A refusal that a denial factory has already built, thrown from where a response cannot be
 returned: an extractor runs before the handler, and it can only throw. `Claims{T}` (#527) throws
-one when the request has no token principal, or one whose claims do not bind. `handle_error`
-answers with `response` as it is, so the app's `unauthorized`/`denied` factory decides the status
-and the body. It is logged at `@debug`, with no backtrace and no body.
+one when the request has no token principal, or one whose claims do not bind. The route's handler
+closure (`registerhandler`, `src/core/registration.jl`) catches it and serves `response` as it is,
+whatever `catch_errors` and `serialize` are set to (#594), so the app's `unauthorized`/`denied`
+factory decides the status and the body. It is logged at `@debug`, with no backtrace and no body.
+Thrown from anywhere else it is a server fault, a `500`.
 
 Deliberately **not exported**: an application builds the response, never this.
 """
