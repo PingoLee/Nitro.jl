@@ -446,7 +446,9 @@ call or a file is not computing; it already gives the thread back. For real comp
   ```
 
 - **Or call `yield()` every 1–2 ms** inside a loop that has to stay in the handler. It does not
-  reduce the CPU the work takes, but it bounds how long a cheap request waits behind it.
+  reduce the CPU the work takes, but it bounds how long a cheap request waits behind it. **Not on
+  Julia 1.13.1 or 1.13.2:** there, a handler that is already waiting (on a `sleep`, and probably
+  on a database reply) stays behind the yielding loop until it ends (#586). Use the queue.
 
 ---
 
@@ -515,7 +517,7 @@ query parameter with no default is **required**: omitting it is a 400, not `noth
 | `if user.role == "admin"` inside a handler | `role_required("admin")` guard on the route |
 | `login_required()` on a route that loads a record by client id | Also verify ownership — otherwise IDOR |
 | `submit_task(key, cb)` without an authority | `submit_task(key, cb, Owner(user_id))` |
-| A handler that computes for more than a few milliseconds | `submit_queued_task` to a bounded queue and answer `202`, or `yield()` every 1–2 ms — Julia cannot preempt it |
+| A handler that computes for more than a few milliseconds | `submit_queued_task` to a bounded queue and answer `202`, or `yield()` every 1–2 ms (not on Julia 1.13.1/1.13.2, #586) — Julia cannot preempt it |
 | Polling `get_task_status(key, …)` with the key you submitted | Poll with the id `submit_task` returned, or `scoped_task_key(key, Owner(user_id))` |
 | Mutating a `Response` returned by inner middleware | `add_response_headers(resp, extra)` |
 | A global mutable config object | A typed struct passed via `serve(context=…)` |
