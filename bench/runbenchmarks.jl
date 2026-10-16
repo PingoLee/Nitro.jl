@@ -4,7 +4,8 @@
 # Run:           julia --project=bench --threads=4 bench/runbenchmarks.jl
 #
 # Env knobs: NITRO_BENCH_SECONDS (per-benchmark budget, default 1.0),
-#            NITRO_BENCH_QUICK=1 (smoke mode: 0.1s, no result file).
+#            NITRO_BENCH_QUICK=1 (smoke mode: 0.1s, no result file),
+#            NITRO_BENCH_GROUPS="holds passwords" (only these groups; default: all).
 
 using BenchmarkTools
 using JSON
@@ -18,10 +19,19 @@ BenchmarkTools.DEFAULT_PARAMETERS.seconds = SECONDS
 
 include(joinpath(BENCH_DIR, "setup.jl"))
 
+# One group per file, named after it. A group left out is not even included: `holds.jl` builds
+# 10 MB payloads and a 100 MiB file at include time, and `httpparse.jl` opens a socket.
+const GROUP_FILES = ["routing", "params", "query", "json", "session", "ratelimiter", "taskpattern",
+                     "httpparse", "holds", "passwords"]
+const GROUPS = let wanted = split(get(ENV, "NITRO_BENCH_GROUPS", ""))
+    unknown = setdiff(wanted, GROUP_FILES)
+    isempty(unknown) || error("NITRO_BENCH_GROUPS: unknown group(s) $(join(unknown, ", ")); known: $(join(GROUP_FILES, ", "))")
+    isempty(wanted) ? GROUP_FILES : String.(wanted)
+end
+
 const SUITE = BenchmarkGroup()
-for f in ["routing.jl", "params.jl", "query.jl", "json.jl", "session.jl", "ratelimiter.jl", "taskpattern.jl",
-          "httpparse.jl"]
-    include(joinpath(BENCH_DIR, "suite", f))
+for g in GROUP_FILES
+    g in GROUPS && include(joinpath(BENCH_DIR, "suite", "$g.jl"))
 end
 
 @info "Tuning suite..." seconds = SECONDS threads = Threads.nthreads()
@@ -50,6 +60,7 @@ meta = Dict(
     "cpu" => Sys.cpu_info()[1].model,
     "timestamp_utc" => string(Dates.now(Dates.UTC)),
     "seconds_per_benchmark" => SECONDS,
+    "groups" => GROUPS,
 )
 
 println("\n", "="^72)
@@ -60,7 +71,7 @@ for name in sort!(collect(keys(flat)))
     s = flat[name]
     println(rpad(name, 40),
         lpad(BenchmarkTools.prettytime(s["time_ns_min"]), 12),
-        lpad(string(s["allocs"], " allocs"), 14),
+        lpad(string(s["allocs"], " allocs"), 16),
         lpad(BenchmarkTools.prettymemory(s["memory_bytes"]), 12))
 end
 

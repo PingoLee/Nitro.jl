@@ -19,7 +19,10 @@ bench/
 │   ├── json.jl         # JSON echo (small + 10 KB)
 │   ├── session.jl      # MemoryStore read/write (payload-size scaling)
 │   ├── ratelimiter.jl  # limiter hot path: keying, lock contention, exempt-path scan
-│   └── taskpattern.jl  # SYNTHETIC replica of parallel_stream_handler's task overhead
+│   ├── taskpattern.jl  # SYNTHETIC replica of parallel_stream_handler's task overhead
+│   ├── httpparse.jl    # HTTP.jl's request-head parse on the connection task
+│   ├── holds.jl        # how long one large JSON / multipart / file call holds its thread (#588)
+│   └── passwords.jl    # one check_password at the default pbkdf2 and bcrypt costs (#587)
 ├── socket/             # real-socket load: server.jl (Nitro vs bare HTTP.jl), run.sh, contention.sh, stall.sh (oha)
 │   └── go/             # the Go net/http reference server run.sh's `go` mode builds
 ├── tasks/              # Julia tasks vs goroutines, no HTTP: tasks.jl, go/, run.sh
@@ -46,6 +49,9 @@ Environment knobs:
 
 - `NITRO_BENCH_SECONDS` — per-benchmark time budget (default `1.0`).
 - `NITRO_BENCH_QUICK=1` — smoke mode (0.1 s/benchmark, does not write a results file).
+- `NITRO_BENCH_GROUPS="holds passwords"` — run only these groups (one per `suite/` file, named
+  after it); an unknown name is an error. A group left out is not even included, so a run of
+  `json` alone does not build `holds`' 100 MiB file. Default: every group.
 
 Each full run prints a table and writes `bench/results/<git-sha>-<timestamp>.json` with a metadata
 header (git SHA, Julia version, thread count, CPU model — no hostname or paths).
@@ -78,6 +84,15 @@ header (git SHA, Julia version, thread count, CPU model — no hostname or paths
   absolute is dominated by response construction. The delta is what justifies keeping the
   `exempt_paths` matcher a linear scan (#22).
 
+- `holds/*` and `passwords/*` (#588, #587) ask how long ONE call holds its `:default` thread, which
+  Julia never preempts (#467): run them at `--threads=1`, and read the minimum against the ~1 ms
+  the issue treats as "nothing to do". Sizes are nominal (the JSON rows are ~40 bytes each). The
+  JSON parse rows pass `max_fields = 0`, because at the default field cap (1000 keys) a 100 KB
+  array of three-key rows is refused before it is parsed; that is the configuration an app that
+  accepts such bodies runs. `file_100mib_stream_read` is the read side of the streamed write loop
+  only: on a socket each 64 KiB chunk's write is where the task can give its thread up, so the
+  hold that matters there is the total divided by 1,600 chunks.
+
 ## Socket benchmarks
 
 `internalrequest` skips everything between the socket and the middleware chain: the per-request
@@ -95,6 +110,7 @@ RATE=20000 bench/socket/run.sh "nitro@8,1 nitro@8,0" # fixed rate: latency witho
 JULIA="julia +1.12" bench/socket/run.sh              # another Julia, by juliaup channel
 bench/socket/contention.sh "8,1 6,2 8,0" 5 8s       # /health while the default pool is busy (#491)
 bench/socket/stall.sh "nitro nitro@8,0 go" 3 6s      # /plaintext while K handlers compute (#467)
+VARIANTS="login login_bcrypt" bench/socket/stall.sh "nitro go" 3 6s   # ... while K check a password (#587)
 ```
 
 - `server.jl` serves `/plaintext`, `/json`, `/health`, `/cpu` and `/lag` in one of these `MODE`s:
@@ -107,7 +123,9 @@ bench/socket/stall.sh "nitro nitro@8,0 go" 3 6s      # /plaintext while K handle
   `WORKERS=1` adds `/burst?n=K` to the Nitro modes, which submits K Workers jobs that each burn
   `JOB_MS` (default 500), and `/cpu_job`, which submits one `/cpu` of work to a queue of
   concurrency `BURST_K` and answers `202` (a full queue answers `503`); `/jobs` counts the
-  `/cpu_job` jobs not yet finished.
+  `/cpu_job` jobs not yet finished. `LOGIN=1` adds `/login` and `/login_bcrypt` to the Nitro
+  modes: one `Nitro.Auth.check_password` per request against a pbkdf2_sha256 or bcrypt hash minted
+  at startup at the default cost, answering a fixed `ok` (#587).
 - `run.sh` pins the server (`-t 8`) and the load generator to disjoint physical cores, warms each
   route, and reports the median, min and max of N runs plus the median p99. The default CPU sets
   assume a 6-core part whose SMT siblings are `n` and `n+6`; set `SERVER_CPUS`/`CLIENT_CPUS` for
@@ -161,8 +179,9 @@ bench/socket/stall.sh "nitro nitro@8,0 go" 3 6s      # /plaintext while K handle
   and p50/p99 for each K in `KS`: how few computing handlers it takes to stall the server (#467).
   `VARIANTS` runs the same work as `cpu` (in the handler), `cpu_yield` and `cpu_job` (a Workers
   queue, offered at the rate that would keep K busy and drained between passes); the `load_2xx`
-  column is the share of those submissions the queue accepted. Modes are `nitro`, `nitro@N,M` and
-  `go`, which runs `cpu` only. The latest table is in the deployment guide's *Handlers that
+  column is the share of those submissions the queue accepted. `login` and `login_bcrypt` keep K
+  password checks in flight instead, and start the servers with `LOGIN=1`. Modes are `nitro`,
+  `nitro@N,M` and `go`, which runs `cpu` only. The latest table is in the deployment guide's *Handlers that
   compute*.
 - `JULIA="julia +1.12"` runs the servers on another juliaup channel. Each Julia minor wants its
   own resolved manifest; `bench/Manifest-v1.12.toml` (gitignored) is the one 1.12 reads first, so
