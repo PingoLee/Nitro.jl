@@ -5836,4 +5836,65 @@ end
     end
 end
 
+
+@testset "a handler defined, or redefined, after the queue processor started is the one that runs" begin
+    app, rt = started_app(["q" => 1])
+    try
+        # Spawn the processor first, so its task carries an OLD world age (the #86 shape): every
+        # method below is defined after it.
+        warm = submit_queued_task(app, "q", "warm", () -> "warm", Owner("u"))
+        @test wait_for(() -> status_of(app, warm)[:status] == "COMPLETED") == :ok
+
+        @eval late_handler(task_info, args::FitV1) = args.dataset_id * 3
+        register_job!(late_handler, app, "late", FitV1)
+        first_run = submit_queued_task(app, "q", "late-1", Job("late", FitV1(dataset_id = 5)), Owner("u"))
+        @test wait_for(() -> status_of(app, first_run)[:status] == "COMPLETED") == :ok
+        @test status_of(app, first_run)[:result] == 15
+
+        # Redefined the way Revise would: the registry holds the function, so the next run takes
+        # the new method without registering again.
+        @eval late_handler(task_info, args::FitV1) = args.dataset_id * 4
+        second_run = submit_queued_task(app, "q", "late-2", Job("late", FitV1(dataset_id = 5)), Owner("u"))
+        @test wait_for(() -> status_of(app, second_run)[:status] == "COMPLETED") == :ok
+        @test status_of(app, second_run)[:result] == 20
+    finally
+        uninstall!(app; drain_timeout = 0)
+    end
+end
+
+@testset "a Job submitted onto a live key joins the running submission" begin
+    app, rt = started_app(["q" => 1])
+    release = Base.Event()
+    runs = Threads.Atomic{Int}(0)
+    try
+        register_job!(app, "slow", FitV1) do task_info, args
+            Threads.atomic_add!(runs, 1)
+            wait(release)
+            return args.dataset_id
+        end
+        owner = Owner("u")
+        for submit in ((job) -> submit_queued_task(app, "q", "shared", job, owner),
+                       (job) -> submit_task(app, "shared-async", job, owner))
+            id = submit(Job("slow", FitV1(dataset_id = 1)))
+            @test wait_for(() -> status_of(app, id)[:status] == "RUNNING") == :ok
+            # Same owner, same key, other arguments: deduplicated onto the live run, which keeps its
+            # own arguments. No second run is minted and the row is not rewritten.
+            @test submit(Job("slow", FitV1(dataset_id = 2))) == id
+            record = get_task_info(rt.store, id)
+            @test (record.job_name, record.job_args) == ("slow", "{\"dataset_id\":1}")
+        end
+        @test runs[] == 2                     # one per key, not one per submit
+        notify(release)
+        q_id = scoped_task_key("shared", Owner("u"))
+        a_id = scoped_task_key("shared-async", Owner("u"))
+        @test wait_for(() -> status_of(app, q_id)[:status] == "COMPLETED" && status_of(app, a_id)[:status] == "COMPLETED") == :ok
+        @test status_of(app, q_id)[:result] == 1
+        @test status_of(app, a_id)[:result] == 1
+        @test runs[] == 2
+    finally
+        notify(release)
+        uninstall!(app; drain_timeout = 0)
+    end
+end
+
 end
