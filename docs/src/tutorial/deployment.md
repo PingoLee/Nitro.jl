@@ -177,6 +177,22 @@ No setting in Nitro bounds a computing handler: `read_timeout` and `write_timeou
 deadlines, and nothing can stop a task from outside. The `AccessLog` middleware records each
 request's `duration_ms`, which is where a slow handler shows up.
 
+**Nitro's own primitives hold a thread too, in proportion to the body.** Parsing or building a
+body is computing.
+[#588](https://github.com/PingoLee/Nitro.jl/issues/588) measured one call each, on one thread on
+Julia 1.12.7:
+
+- JSON (`getjson`, `Json{T}`, `Res.json`) takes 0.4–1.1 ms at 100 KB and 4–11 ms at 1 MB, and
+  grows linearly from there.
+- Parsing a 10 MB multipart upload takes about 6 ms.
+- A buffered `Res.file` of a 100 MiB file is a single 53 ms `read`.
+
+**Serve large files with `Res.file(req, path; stream = true)`.** It reads 64 KiB per chunk
+(about 6 µs each), and each chunk's socket write is a point where the task can give its thread
+up. Static mounts already stream above `stream_threshold`. Whether the larger JSON and multipart
+holds matter under load is what #588's stall pass will decide; until then, the rule above applies
+to them: a body large enough to take longer than your latency budget is computing.
+
 ## Memory and GC
 
 Set a heap-size hint on every server process, and size it on purpose:
