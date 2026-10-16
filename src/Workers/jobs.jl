@@ -160,6 +160,10 @@ end
 # back to the REGISTERED type. "Round-trip" means exactly that -- serializes through the store's
 # write path (and its depth bound, #344), and binds back -- not that the bound value `==` the
 # original: `==` on a mutable field, or a `Dict`'s iteration order, would refuse sound values.
+#
+# Both binds here and in `_bind_job_args` go through `stored_json_bind`, with no field cap. The
+# arguments are stored data, and the two sides would otherwise see different caps: the submit
+# often runs inside a request, under `serve(max_fields = …)`, and the run always outside one.
 function _encode_job(registry::JobRegistry, job::Job)::String
     def = _job_definition(registry, job.name)
     def === nothing && throw(ArgumentError(
@@ -170,7 +174,7 @@ function _encode_job(registry::JobRegistry, job::Job)::String
     json = nothing
     try
         encoded = _json_for_storage(job.args)
-        json_bind(def.args_type, encoded)
+        stored_json_bind(def.args_type, encoded)
         json = encoded
     catch e
         is_unrecoverable(e) && rethrow()
@@ -210,7 +214,7 @@ function _bind_job_args(def::JobDefinition, json::String)
     bound = nothing
     ok = false
     try
-        bound = json_bind(def.args_type, json)
+        bound = stored_json_bind(def.args_type, json)
         ok = true
     catch e
         is_unrecoverable(e) && rethrow()

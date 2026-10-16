@@ -497,9 +497,12 @@ landed:
 - **"Round-trip" means serializes, then binds back to the registered type.** The submit check
   writes the arguments through `_json_for_storage`, the store's JSON path with its #344 depth
   bounds (moved from the PormG extension to `src/utilities/bodyparsers.jl` so Workers shares it),
-  and binds the text with `json_bind`, the `Json{T}` binder. It does not compare the bound value
-  with the original: `==` on a mutable field, or a `Dict`'s iteration order, would refuse sound
-  values. A lossy-but-bindable value is therefore accepted. The refusal names the type and never
+  and binds the text with `stored_json_bind`, which is the `Json{T}` binder without the request
+  field cap. Job arguments are stored data, so both sides parse them with `max_fields = 0`, as
+  every stored read does. Under the cap, a job submitted from a handler under a raised
+  `serve(max_fields = …)` passed its submit check and then failed its run, which binds outside
+  any request at 1000. The check does not compare the bound value with the original: `==` on a
+  mutable field, or a `Dict`'s iteration order, would refuse sound values. A lossy-but-bindable value is therefore accepted. The refusal names the type and never
   the value.
 - **The registry lives in the App's extension slot (`:workers_jobs`), not on the
   `WorkerRuntime`.** Registration happens before `worker_startup` installs a runtime, and

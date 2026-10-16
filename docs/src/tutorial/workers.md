@@ -163,7 +163,7 @@ What is checked, and where:
 | The queue authorizer allows the caller, and the queue is declared | submit, first | `AuthorizationError`, as for a closure |
 | The name is registered on this `App` | submit | `ArgumentError`, nothing written |
 | `args` is an instance of the registered type | submit | `ArgumentError`, nothing written |
-| `args` serializes through the store's JSON path (depth limit 512) and binds back to the type, like a `Json{T}` body | submit | `ArgumentError`, nothing written; the message names the type, never the values |
+| `args` serializes through the store's JSON path (depth limit 512) and binds back to the type, like a `Json{T}` body but with no field cap, since the arguments are your own data | submit | `ArgumentError`, nothing written; the message names the type, never the values |
 | The stored arguments bind to the type registered **when the run starts** | run | `FAILED` with a `JobError`, never retried |
 | A name registered twice, empty, or longer than 255 characters; a type that is not a concrete struct or holds a `Symbol`; a handler with no `(task_info, args)` method | `register_job!` | `ArgumentError` |
 

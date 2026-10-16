@@ -436,6 +436,34 @@ struct JsonBinder{P} end
 
 json_binder(::Type{T}) where {T} = binds_by_keyword(T) ? JsonBinder{KwdefBind{T}}() : JsonBinder{T}()
 
+"""
+    stored_json_bind(T, text) :: T
+
+`json_bind` for JSON the application stored itself, such as a named job's arguments
+([#514](https://github.com/PingoLee/Nitro.jl/issues/514)). It is the same bind: the same
+`@kwdef` defaults, Nitro's read style, and the 512-level depth bound. The one difference is that
+it applies **no field cap** (`max_fields = 0`).
+
+The cap (#327) guards request bodies, whose keys a client chooses. Stored data is the app's own,
+so every read of it parses with `max_fields = 0`, as the PormG stores do. Through `json_bind` it
+would take whatever cap was in force: `serve(max_fields = …)` inside a request, and 1000 outside
+one. A job's arguments are checked at submit, often inside a request, and bound when the run
+starts, always on a background task outside one. So arguments under the app's raised cap would
+pass the check and then fail the run.
+"""
+function stored_json_bind(::Type{T}, text::Union{AbstractString, AbstractVector{UInt8}}) :: T where {T}
+    return Base.inferencebarrier(stored_json_binder(T))(text) :: T
+end
+
+# A separate binder type, not a keyword on `JsonBinder`, so `Json{T}`'s request path compiles and
+# runs exactly as before; the barrier reasoning above applies to this one unchanged.
+struct StoredJsonBinder{P} end
+(::StoredJsonBinder{P})(text) where {P} =
+    _parse_json_bounded(text, P; style = NITRO_READ_STYLE, max_fields = 0)
+
+stored_json_binder(::Type{T}) where {T} =
+    binds_by_keyword(T) ? StoredJsonBinder{KwdefBind{T}}() : StoredJsonBinder{T}()
+
 # Asked once per `Json{T}` request and once per field of a keyword-bound struct, so the answer is
 # memoized per type (#493): uncached, the `hasmethod` behind `kw_constructible` cost ~1 µs, three
 # times the parse of a small body. StructUtils is reached through JSON, whose typed-parse API is

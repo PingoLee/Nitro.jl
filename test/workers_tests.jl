@@ -5559,6 +5559,7 @@ using Nitro.Workers
 using Nitro.Workers: get_task_info, _job_run
 using Nitro.Errors: AuthorizationError
 using JSON
+using HTTP
 
 wait_for(predicate::Function; timeout::Real = 5.0) = timedwait(predicate, timeout)
 
@@ -5590,6 +5591,20 @@ JSON.lower(l::Lowered) = string(l.v)
 struct LoweredArgs
     inner::Lowered
 end
+
+# Wide arguments: 400 three-field structs are 1200 object keys, past the 1000-key request cap
+# (`DEFAULT_MAX_FIELDS`) that guards request bodies, which a job's own arguments are not.
+struct Point3
+    x::Int
+    y::Int
+    z::Int
+end
+@kwdef struct WideArgs
+    points::Vector{Point3}
+    label::String = "wide"
+end
+wide_args() = WideArgs(points = [Point3(i, 2i, 3i) for i in 1:400])
+wide_sum(args::WideArgs) = sum(p -> p.x + p.y + p.z, args.points)
 
 # The message an expression throws, or "" when it does not throw.
 thrown_message(f) = try
@@ -5893,6 +5908,52 @@ end
         @test runs[] == 2
     finally
         notify(release)
+        uninstall!(app; drain_timeout = 0)
+    end
+end
+
+
+@testset "job arguments are stored data: no request field cap on either side" begin
+    app, rt = started_app(["q" => 2])
+    try
+        register_job!((task_info, args) -> wide_sum(args), app, "wide", WideArgs)
+        args = wide_args()
+        expected = wide_sum(args)
+        owner = Owner("u")
+
+        # (a) The submit-side round trip accepts 1200 keys, outside any request.
+        # Inside `@test`, so a refusal is recorded and the cases below still run.
+        id = nothing
+        @test (id = submit_queued_task(app, "q", "wide-submit", Job("wide", args), owner)) isa String
+        if id !== nothing
+            @test wait_for(() -> status_of(app, id)[:status] in ("COMPLETED", "FAILED")) == :ok
+            @test status_of(app, id)[:status] == "COMPLETED"
+            @test status_of(app, id)[:result] == expected
+        end
+
+        # (b) The run-side bind of the same JSON, outside any request scope.
+        run_id = submit_queued_task("q", "wide-run", _job_run(app, "wide", JSON.json(args)), owner; runtime = rt)
+        @test wait_for(() -> status_of(app, run_id)[:status] in ("COMPLETED", "FAILED")) == :ok
+        @test status_of(app, run_id)[:status] == "COMPLETED"
+        @test status_of(app, run_id)[:result] == expected
+
+        # (c) Submitted from a handler on an app that raised its cap: the submit sees the request's
+        # cap and the run, on a background task, sees none. Both paths must still complete.
+        app.service.max_fields[] = 5000
+        urlpatterns(app, "", path("/submit-wide", req -> begin
+            ids = (submit_task(app, "wide-async", Job("wide", args), owner),
+                   submit_queued_task(app, "q", "wide-queued", Job("wide", args), owner))
+            Res.json(Dict("ids" => collect(ids)))
+        end))
+        r = internalrequest(app, HTTP.Request("GET", "/submit-wide"))
+        @test r.status == 200
+        ids = String.(JSON.parse(Nitro.text(r))["ids"])
+        @test wait_for(() -> all(i -> status_of(app, i)[:status] in ("COMPLETED", "FAILED"), ids)) == :ok
+        for i in ids
+            @test status_of(app, i)[:status] == "COMPLETED"
+            @test status_of(app, i)[:result] == expected
+        end
+    finally
         uninstall!(app; drain_timeout = 0)
     end
 end

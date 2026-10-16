@@ -13,9 +13,9 @@ using ..Core.Errors: implements_contract_method, store_contract_error
 # table in `is_unrecoverable`'s docstring.
 using ..Core.Errors: is_unrecoverable
 # Named jobs (#514): arguments are written through the store's JSON path and bound back with the
-# binder `Json{T}` uses.
+# binder `Json{T}` uses, minus the request field cap: they are stored data, not a request body.
 using ..Core.Util.BodyParsers: _json_for_storage, interns_client_strings, MAX_JSON_DEPTH
-using ..Core.Extractors: json_bind
+using ..Core.Extractors: stored_json_bind
 
 const DEFAULT_EXTENSION_KEY = :workers
 
