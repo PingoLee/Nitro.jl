@@ -191,6 +191,23 @@ the benchmark's own job counter; its k = 0 baseline was 102k and 2.4 ms.
     request. It was measured in the repro (7–12 ms, against 1.5 s), not in a server. The queue
     is not affected either way.
 
+**Every app has one such handler: the login.** One `check_password` at the default cost
+computes without yielding for about 0.1 s (pbkdf2_sha256, 720,000 iterations) or 0.2 s
+(bcrypt, cost 12). The same run with k logins in flight instead of `/cpu` (Julia 1.12.7,
+[#587](https://github.com/PingoLee/Nitro.jl/issues/587)):
+
+| k | pbkdf2: `/plaintext` rps, p99 | bcrypt: `/plaintext` rps, p99 |
+|---|---|---|
+| 0 | 99.7k, 2.3 ms | 99.7k, 2.3 ms |
+| 4 | 92.6k, 3.5 ms | 93.9k, 2.6 ms |
+| 8 | 2.1k, 122 ms | 1.3k, 237 ms |
+| 16 | 291, 880 ms | 172, 1.6 s |
+
+Eight sign-ins at once stall the whole API while they run. So do eight guesses from a
+credential-stuffing client. A `RateLimiter` on the login route bounds what one client can impose,
+not what many impose together. Bound the checks the way the queue bounds jobs; see
+[Passwords](passwords.md#A-login-is-a-handler-that-computes).
+
 No setting in Nitro bounds a computing handler: `read_timeout` and `write_timeout` are socket
 deadlines, and nothing can stop a task from outside. The `AccessLog` middleware records each
 request's `duration_ms`, which is where a slow handler shows up.

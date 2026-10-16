@@ -774,6 +774,9 @@ not for Nitro, so the page documented an integration that does not exist.
 - Access tokens only, short-lived (`expires_in`/`exp`). Refresh, rotation and revocation
   are your application's — see the scope note at the top of this page and §4's *Token
   lifetime and renewal*.
+- Bound concurrent password checks. Each one holds a thread for 0.1–0.2 s, and as many logins
+  as there are default threads stall the whole API, rate limiter or not:
+  [A login is a handler that computes](passwords.md#A-login-is-a-handler-that-computes).
 - Behind a reverse proxy, declare `trusted_proxies` **and** the `forwarded_header` your proxy
   writes before trusting client IPs for auth-adjacent rate limiting —
   [Behind a Reverse Proxy](reverse_proxy.md).
