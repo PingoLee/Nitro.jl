@@ -19,6 +19,7 @@ bench/
 │   ├── json.jl         # JSON echo (small + 10 KB)
 │   ├── session.jl      # MemoryStore read/write (payload-size scaling)
 │   ├── ratelimiter.jl  # limiter hot path: keying, lock contention, exempt-path scan
+│   ├── claims.jl       # a Claims{T} bind against two untyped getprincipal reads (#527)
 │   └── taskpattern.jl  # SYNTHETIC replica of parallel_stream_handler's task overhead
 ├── socket/             # real-socket load: server.jl (Nitro vs bare HTTP.jl), run.sh, contention.sh, stall.sh (oha)
 │   └── go/             # the Go net/http reference server run.sh's `go` mode builds

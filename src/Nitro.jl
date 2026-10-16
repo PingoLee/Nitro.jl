@@ -82,7 +82,7 @@ export  # The application handle
         # Request body parsers (response building lives in `Res`, #28)
         text, json, binary,
         # Extractors
-        Path, Query, Header, Json, JsonFragment, Form, Body, Cookie, Session, Files, MultipartForm, FormFile, extract, validate,
+        Path, Query, Header, Json, JsonFragment, Form, Body, Cookie, Session, Files, MultipartForm, Claims, FormFile, extract, validate,
         # Extractor extension surface (for app-layer custom extractors)
         Param, LazyRequest, ValidationError, UnsupportedMediaTypeError, Nullable,
         # Cookies & Security

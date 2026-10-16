@@ -2,6 +2,7 @@ module Errors
 ## In this module, we export commonly used exceptions across the package
 
 import JSON
+import HTTP
 
 export ValidationError, CookieError, AuthorizationError, StoreInterfaceError, UnsupportedMediaTypeError,
     WorkerUnavailableError, WorkerCapacityError
@@ -154,6 +155,23 @@ end
 function Base.showerror(io::IO, e::AuthorizationError)
     print(io, "Authorization Error: $(e.msg)")
 end
+
+"""
+    AuthDenial(response::HTTP.Response)
+
+A refusal that a denial factory has already built, thrown from where a response cannot be
+returned: an extractor runs before the handler, and it can only throw. `Claims{T}` (#527) throws
+one when the request has no token principal, or one whose claims do not bind. `handle_error`
+answers with `response` as it is, so the app's `unauthorized`/`denied` factory decides the status
+and the body. It is logged at `@debug`, with no backtrace and no body.
+
+Deliberately **not exported**: an application builds the response, never this.
+"""
+struct AuthDenial <: Exception
+    response::HTTP.Response
+end
+
+Base.showerror(io::IO, e::AuthDenial) = print(io, "Auth Denial: ", e.response.status)
 
 """
     UnsupportedMediaTypeError(msg::String)

@@ -204,7 +204,7 @@ end
 ```
 
 Available extractors: `Path{T}`, `Query{T}`, `Header{T}`, `Json{T}`, `JsonFragment{T}`, `Form{T}`,
-`Body`, `Cookie`, `Session`, `Files{...}`, `MultipartForm{T}`. Full binding rules in
+`Body`, `Cookie`, `Session`, `Files{...}`, `MultipartForm{T}`, `Claims{T}`. Full binding rules in
 [`reference.md`](reference.md). Five that bite (#306, #327):
 
 - **JSON needs a JSON `Content-Type`.** `Json{T}`/`JsonFragment{T}` answer **415** to anything
@@ -510,6 +510,7 @@ query parameter with no default is **required**: omitting it is a 400, not `noth
 | Unescaped interpolation into `Res.html()` or `Res.send(...; content_type=...)` | Escape first; or return JSON and render client-side |
 | `req.context[:session]` | `getsession(req)` (likewise `getuser`, `getip`, `getparams`) |
 | Reaching into `getjson(req)["field"]` for a typed body | `Json{T}` extractor + `validate` |
+| Reading `getprincipal(req)["claim"]` (an `Any`) for typed token claims | `Claims{T}` extractor — verified claims only, `401` without a token, `403` when they do not bind |
 | Binding a request body to a struct with `is_admin` / `user_id` | A separate input struct; assign privileged fields server-side |
 | `if user.role == "admin"` inside a handler | `role_required("admin")` guard on the route |
 | `login_required()` on a route that loads a record by client id | Also verify ownership — otherwise IDOR |
