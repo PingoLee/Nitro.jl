@@ -12,12 +12,17 @@ using ..Core.Errors: implements_contract_method, store_contract_error
 # The per-attempt catch in the two executors treats these as terminal (#367); see the site
 # table in `is_unrecoverable`'s docstring.
 using ..Core.Errors: is_unrecoverable
+# Named jobs (#514): arguments are written through the store's JSON path and bound back with the
+# binder `Json{T}` uses, minus the request field cap: they are stored data, not a request body.
+using ..Core.Util.BodyParsers: _json_for_storage, interns_client_strings, MAX_JSON_DEPTH
+using ..Core.Extractors: stored_json_bind
 
 const DEFAULT_EXTENSION_KEY = :workers
 
 include("Workers/types.jl")
 include("Workers/registry.jl")
 include("Workers/runtime.jl")
+include("Workers/jobs.jl")
 include("Workers/execution.jl")
 include("Workers/queue.jl")
 include("Workers/api.jl")
@@ -31,6 +36,7 @@ export TaskStatus, PENDING, RUNNING, COMPLETED, FAILED, CANCELLED,
     install!, uninstall!, worker_store, default_store,
     start!, startup, recover_zombie_tasks!,
     submit_task, submit_queued_task, get_task_status, cancel_task, release_task!,
+    Job, register_job!, JobError,
     update_progress!, cancel_requested, cancel_reason, CANCEL_REASONS, TaskTimeoutError,
     checkpoint!, TaskCancelledError,
     get_all_tasks, cleanup_old_tasks,

@@ -5550,3 +5550,412 @@ end
 end
 
 end
+
+@testitem "Workers -- named jobs (#514)" tags=[:core, :workers] setup=[NitroCommon] begin
+
+using Test
+using Nitro
+using Nitro.Workers
+using Nitro.Workers: get_task_info, _job_run
+using Nitro.Errors: AuthorizationError
+using JSON
+using HTTP
+
+wait_for(predicate::Function; timeout::Real = 5.0) = timedwait(predicate, timeout)
+
+# The argument type as an older deploy declared it, and as the next one does: one field added,
+# with a default. The additive-evolution rule (design record §2) says the second must bind what
+# the first wrote.
+@kwdef struct FitV1
+    dataset_id::Int
+end
+@kwdef struct FitV2
+    dataset_id::Int
+    epochs::Int = 10
+end
+struct FloatArgs
+    x::Float64
+end
+struct DeepArgs
+    x::Vector{Any}
+end
+struct SymbolArgs
+    kind::Symbol
+end
+# Serializes, but not to a shape its own type binds: `JSON.lower` writes a string where binding
+# expects an object. Only the submit-side bind-back can refuse it.
+struct Lowered
+    v::Int
+end
+JSON.lower(l::Lowered) = string(l.v)
+struct LoweredArgs
+    inner::Lowered
+end
+
+# Wide arguments: 400 three-field structs are 1200 object keys, past the 1000-key request cap
+# (`DEFAULT_MAX_FIELDS`) that guards request bodies, which a job's own arguments are not.
+struct Point3
+    x::Int
+    y::Int
+    z::Int
+end
+@kwdef struct WideArgs
+    points::Vector{Point3}
+    label::String = "wide"
+end
+wide_args() = WideArgs(points = [Point3(i, 2i, 3i) for i in 1:400])
+wide_sum(args::WideArgs) = sum(p -> p.x + p.y + p.z, args.points)
+
+# The message an expression throws, or "" when it does not throw.
+thrown_message(f) = try
+    f()
+    ""
+catch e
+    sprint(showerror, e)
+end
+
+# An App with its own runtime over an in-memory store, started the way `worker_startup` would.
+function started_app(queues = ["q" => 1])
+    app = App()
+    rt = WorkerRuntime(InMemoryWorkerStore(); queues)
+    start!(app; runtime = rt, cleanup_enabled = false, recover_zombies = false)
+    return app, rt
+end
+
+status_of(app, id) = get_task_status(app, id, System())
+
+@testset "a named job runs in-process and its row records the name and the arguments" begin
+    app = App()
+    # Registered BEFORE any runtime is installed, as a setup function called ahead of `serve` does.
+    register_job!(app, "fit", FitV2) do task_info, args
+        update_progress!(task_info, 50)
+        return Dict("dataset_id" => args.dataset_id, "epochs" => args.epochs)
+    end
+    rt = WorkerRuntime(InMemoryWorkerStore(); queues = ["q" => 1])
+    start!(app; runtime = rt, cleanup_enabled = false, recover_zombies = false)
+    try
+        id = submit_queued_task(app, "q", "fit-1", Job("fit", FitV2(dataset_id = 7, epochs = 3)), Owner("u"))
+        @test wait_for(() -> status_of(app, id)[:status] == "COMPLETED") == :ok
+        @test status_of(app, id)[:result] == Dict("dataset_id" => 7, "epochs" => 3)
+        record = get_task_info(rt.store, id)
+        @test record.job_name == "fit"
+        @test record.job_args == "{\"dataset_id\":7,\"epochs\":3}"
+        # Not exposed to a reader: the arguments are application data.
+        @test !haskey(status_of(app, id), :job_args)
+
+        # The registry is the App's, not the runtime's: it survives a teardown and a re-install.
+        uninstall!(app; drain_timeout = 0)
+        rt2 = WorkerRuntime(InMemoryWorkerStore())
+        start!(app; runtime = rt2, cleanup_enabled = false, recover_zombies = false)
+        again = submit_task(app, "fit-2", Job("fit", FitV2(dataset_id = 1)), Owner("u"))
+        @test wait_for(() -> status_of(app, again)[:status] == "COMPLETED") == :ok
+        @test status_of(app, again)[:result] == Dict("dataset_id" => 1, "epochs" => 10)
+    finally
+        uninstall!(app; drain_timeout = 0)
+    end
+end
+
+@testset "additive evolution: arguments queued under an older type bind after a defaulted field is added" begin
+    old_app, old_rt = started_app()
+    new_app, new_rt = started_app()
+    try
+        register_job!((task_info, args) -> args.dataset_id, old_app, "fit", FitV1)
+        old_id = submit_queued_task(old_app, "q", "fit-old", Job("fit", FitV1(dataset_id = 42)), Owner("u"))
+        @test wait_for(() -> status_of(old_app, old_id)[:status] == "COMPLETED") == :ok
+        stored = get_task_info(old_rt.store, old_id)
+        @test stored.job_args == "{\"dataset_id\":42}"
+
+        # The next deploy: same name, the type gained `epochs = 10`. It runs the row the old one
+        # wrote, through the run-side bind a consumer process uses.
+        register_job!(new_app, "fit", FitV2) do task_info, args
+            return (args.dataset_id, args.epochs)
+        end
+        id = submit_queued_task("q", "fit-new", _job_run(new_app, stored.job_name, stored.job_args), Owner("u");
+                                runtime = new_rt)
+        @test wait_for(() -> status_of(new_app, id)[:status] == "COMPLETED") == :ok
+        @test status_of(new_app, id)[:result] == (42, 10)
+    finally
+        uninstall!(old_app; drain_timeout = 0)
+        uninstall!(new_app; drain_timeout = 0)
+    end
+end
+
+@testset "arguments that do not bind are FAILED, naming the job and the type, never retried, never echoed" begin
+    app, rt = started_app()
+    calls = Threads.Atomic{Int}(0)
+    try
+        register_job!(app, "fit", FitV2) do task_info, args
+            Threads.atomic_add!(calls, 1)
+            return args.dataset_id
+        end
+        # A retrying run would sit in its 2 s backoff before a second attempt; a terminal one is
+        # FAILED at once.
+        retrying = TaskOptions(retry_on_failure = true, max_retries = 3)
+        for (label, submit) in (
+            ("queued", () -> submit_queued_task("q", "bad-q", _job_run(app, "fit", "{\"dataset_id\":\"SECRET-xyz\"}"),
+                                                Owner("u"); runtime = rt, options = retrying)),
+            ("async", () -> submit_task("bad-a", _job_run(app, "fit", "{\"epochs\":\"SECRET-xyz\"}"),
+                                        Owner("u"); runtime = rt, options = retrying)),
+        )
+            started = time()
+            id = submit()
+            @test wait_for(() -> status_of(app, id)[:status] == "FAILED"; timeout = 5.0) == :ok
+            @test time() - started < 1.5
+            err = status_of(app, id)[:error]
+            @test occursin("JobError", err)
+            @test occursin("\"fit\"", err)
+            @test occursin("FitV2", err)
+            @test !occursin("SECRET", err)
+        end
+        @test calls[] == 0
+    finally
+        uninstall!(app; drain_timeout = 0)
+    end
+end
+
+@testset "a job name the process does not know: refused at submit, FAILED when a stored row names it" begin
+    app, rt = started_app()
+    try
+        owner = Owner("u")
+        @test_throws ArgumentError submit_queued_task(app, "q", "unknown", Job("nope", FitV1(dataset_id = 1)), owner)
+        @test occursin("\"nope\" is not registered",
+                       thrown_message(() -> submit_task(app, "unknown", Job("nope", FitV1(dataset_id = 1)), owner)))
+        @test get_task_info(rt.store, scoped_task_key("unknown", owner)) === nothing
+
+        # A row an old consumer cannot run: a newer deploy queued a job this process never registered.
+        started = time()
+        id = submit_queued_task("q", "from-a-newer-deploy", _job_run(app, "nope", "{\"dataset_id\":1}"), owner;
+                                runtime = rt, options = TaskOptions(retry_on_failure = true))
+        @test wait_for(() -> status_of(app, id)[:status] == "FAILED") == :ok
+        @test time() - started < 1.5
+        err = status_of(app, id)[:error]
+        @test occursin("JobError", err)
+        @test occursin("\"nope\"", err)
+        @test occursin("not registered", err)
+    finally
+        uninstall!(app; drain_timeout = 0)
+    end
+end
+
+@testset "a closure and a named job share one queue" begin
+    app, rt = started_app(["q" => 1])
+    try
+        register_job!((task_info, args) -> args.dataset_id + 1, app, "inc", FitV1)
+        owner = Owner("u")
+        closure = submit_queued_task(app, "q", "closure", () -> "from a closure", owner)
+        named = submit_queued_task(app, "q", "named", Job("inc", FitV1(dataset_id = 41)), owner)
+        async_named = submit_task(app, "async-named", Job("inc", FitV1(dataset_id = 1)), owner)
+        @test wait_for(() -> all(id -> status_of(app, id)[:status] == "COMPLETED", (closure, named, async_named))) == :ok
+        @test status_of(app, closure)[:result] == "from a closure"
+        @test status_of(app, named)[:result] == 42
+        @test status_of(app, async_named)[:result] == 2
+        @test get_task_info(rt.store, closure).job_name === nothing
+        @test get_task_info(rt.store, closure).job_args === nothing
+        @test get_task_info(rt.store, named).job_name == "inc"
+    finally
+        uninstall!(app; drain_timeout = 0)
+    end
+end
+
+@testset "registrations do not leak between two Apps" begin
+    app1, _ = started_app()
+    app2, _ = started_app()
+    try
+        register_job!((task_info, args) -> "app1:$(args.dataset_id)", app1, "j", FitV1)
+        @test_throws ArgumentError submit_task(app2, "k", Job("j", FitV1(dataset_id = 1)), Owner("u"))
+        # The same name on the other App, with another type and another handler.
+        register_job!((task_info, args) -> "app2:$(args.epochs)", app2, "j", FitV2)
+        id1 = submit_task(app1, "k", Job("j", FitV1(dataset_id = 5)), Owner("u"))
+        id2 = submit_task(app2, "k", Job("j", FitV2(dataset_id = 5, epochs = 9)), Owner("u"))
+        @test wait_for(() -> status_of(app1, id1)[:status] == "COMPLETED" && status_of(app2, id2)[:status] == "COMPLETED") == :ok
+        @test status_of(app1, id1)[:result] == "app1:5"
+        @test status_of(app2, id2)[:result] == "app2:9"
+        # Each App still refuses the other's argument type under its own registration.
+        @test_throws ArgumentError submit_task(app1, "k2", Job("j", FitV2(dataset_id = 5)), Owner("u"))
+    finally
+        uninstall!(app1; drain_timeout = 0)
+        uninstall!(app2; drain_timeout = 0)
+    end
+end
+
+@testset "refusals at registration and at submit write nothing" begin
+    app, rt = started_app()
+    try
+        handler = (task_info, args) -> nothing
+        register_job!(handler, app, "fit", FitV1)
+        @test_throws ArgumentError register_job!(handler, app, "fit", FitV1)          # registered once
+        @test_throws ArgumentError register_job!(handler, app, "", FitV1)             # empty name
+        @test occursin("at most 255", thrown_message(() -> register_job!(handler, app, "x"^256, FitV1)))
+        register_job!(handler, app, "x"^255, FitV1)                                   # the column's width fits
+        @test_throws ArgumentError register_job!(handler, app, "int", Int)            # not a struct
+        @test_throws ArgumentError register_job!(handler, app, "abstract", Number)    # not concrete
+        @test_throws ArgumentError register_job!(handler, app, "sym", SymbolArgs)     # never binds
+        @test_throws ArgumentError register_job!(args -> nothing, app, "arity", FitV1) # no (task_info, args)
+
+        register_job!(handler, app, "float", FloatArgs)
+        register_job!(handler, app, "deep", DeepArgs)
+        register_job!(handler, app, "lowered", LoweredArgs)
+        nested = Any[]
+        for _ in 1:600
+            nested = Any[nested]
+        end
+        owner = Owner("u")
+        refused = (
+            "wrong-type" => () -> submit_task(app, "wrong-type", Job("fit", FitV2(dataset_id = 1)), owner),
+            "nan" => () -> submit_queued_task(app, "q", "nan", Job("float", FloatArgs(NaN)), owner),
+            "too-deep" => () -> submit_queued_task(app, "q", "too-deep", Job("deep", DeepArgs(nested)), owner),
+            "no-bind-back" => () -> submit_queued_task(app, "q", "no-bind-back", Job("lowered", LoweredArgs(Lowered(5))), owner),
+        )
+        for (key, submit) in refused
+            @test_throws ArgumentError submit()
+            @test get_task_info(rt.store, scoped_task_key(key, owner)) === nothing
+        end
+        wrong_type = thrown_message(refused[1].second)
+        @test occursin("FitV1 arguments, got a ", wrong_type) && occursin("FitV2", wrong_type)
+        @test occursin("LoweredArgs arguments do not round-trip", thrown_message(refused[4].second))
+        # A round-trip refusal never quotes the value.
+        msg = try
+            submit_queued_task(app, "q", "nan", Job("float", FloatArgs(NaN)), owner)
+            ""
+        catch e
+            sprint(showerror, e)
+        end
+        @test occursin("FloatArgs", msg) && !occursin("NaN", msg)
+
+        # No App, no registry: the runtime-first forms refuse a Job outright.
+        @test_throws ArgumentError submit_task("rt-first", Job("fit", FitV1(dataset_id = 1)), owner; runtime = rt)
+        @test_throws ArgumentError submit_queued_task("q", "rt-first", Job("fit", FitV1(dataset_id = 1)), owner; runtime = rt)
+        @test get_task_info(rt.store, scoped_task_key("rt-first", owner)) === nothing
+    finally
+        uninstall!(app; drain_timeout = 0)
+    end
+end
+
+
+@testset "a Job is authorized and its queue checked before it is encoded" begin
+    app, rt = started_app(["q" => 1])
+    try
+        register_job!((task_info, args) -> args.dataset_id, app, "fit", FitV1)
+        set_queue_authorizer!(rt.store, (queue, uid) -> uid != "mallory")
+        owner = Owner("mallory")
+        # Refused as a closure is, even for a job this App does not know: the caller learns nothing.
+        @test_throws AuthorizationError submit_task(app, "k", Job("nope", FitV1(dataset_id = 1)), owner)
+        @test_throws AuthorizationError submit_queued_task(app, "q", "k", Job("fit", FitV1(dataset_id = 1)), owner)
+        @test get_task_info(rt.store, scoped_task_key("k", owner)) === nothing
+        # An undeclared queue is refused before the job is looked at, as for a closure.
+        @test_throws AuthorizationError submit_queued_task(app, "undeclared", "k", Job("nope", FitV1(dataset_id = 1)), Owner("u"))
+        ok = submit_queued_task(app, "q", "k", Job("fit", FitV1(dataset_id = 3)), Owner("u"))
+        @test wait_for(() -> status_of(app, ok)[:status] == "COMPLETED") == :ok
+    finally
+        uninstall!(app; drain_timeout = 0)
+    end
+end
+
+
+@testset "a handler defined, or redefined, after the queue processor started is the one that runs" begin
+    app, rt = started_app(["q" => 1])
+    try
+        # Spawn the processor first, so its task carries an OLD world age (the #86 shape): every
+        # method below is defined after it.
+        warm = submit_queued_task(app, "q", "warm", () -> "warm", Owner("u"))
+        @test wait_for(() -> status_of(app, warm)[:status] == "COMPLETED") == :ok
+
+        @eval late_handler(task_info, args::FitV1) = args.dataset_id * 3
+        register_job!(late_handler, app, "late", FitV1)
+        first_run = submit_queued_task(app, "q", "late-1", Job("late", FitV1(dataset_id = 5)), Owner("u"))
+        @test wait_for(() -> status_of(app, first_run)[:status] == "COMPLETED") == :ok
+        @test status_of(app, first_run)[:result] == 15
+
+        # Redefined the way Revise would: the registry holds the function, so the next run takes
+        # the new method without registering again.
+        @eval late_handler(task_info, args::FitV1) = args.dataset_id * 4
+        second_run = submit_queued_task(app, "q", "late-2", Job("late", FitV1(dataset_id = 5)), Owner("u"))
+        @test wait_for(() -> status_of(app, second_run)[:status] == "COMPLETED") == :ok
+        @test status_of(app, second_run)[:result] == 20
+    finally
+        uninstall!(app; drain_timeout = 0)
+    end
+end
+
+@testset "a Job submitted onto a live key joins the running submission" begin
+    app, rt = started_app(["q" => 1])
+    release = Base.Event()
+    runs = Threads.Atomic{Int}(0)
+    try
+        register_job!(app, "slow", FitV1) do task_info, args
+            Threads.atomic_add!(runs, 1)
+            wait(release)
+            return args.dataset_id
+        end
+        owner = Owner("u")
+        for submit in ((job) -> submit_queued_task(app, "q", "shared", job, owner),
+                       (job) -> submit_task(app, "shared-async", job, owner))
+            id = submit(Job("slow", FitV1(dataset_id = 1)))
+            @test wait_for(() -> status_of(app, id)[:status] == "RUNNING") == :ok
+            # Same owner, same key, other arguments: deduplicated onto the live run, which keeps its
+            # own arguments. No second run is minted and the row is not rewritten.
+            @test submit(Job("slow", FitV1(dataset_id = 2))) == id
+            record = get_task_info(rt.store, id)
+            @test (record.job_name, record.job_args) == ("slow", "{\"dataset_id\":1}")
+        end
+        @test runs[] == 2                     # one per key, not one per submit
+        notify(release)
+        q_id = scoped_task_key("shared", Owner("u"))
+        a_id = scoped_task_key("shared-async", Owner("u"))
+        @test wait_for(() -> status_of(app, q_id)[:status] == "COMPLETED" && status_of(app, a_id)[:status] == "COMPLETED") == :ok
+        @test status_of(app, q_id)[:result] == 1
+        @test status_of(app, a_id)[:result] == 1
+        @test runs[] == 2
+    finally
+        notify(release)
+        uninstall!(app; drain_timeout = 0)
+    end
+end
+
+
+@testset "job arguments are stored data: no request field cap on either side" begin
+    app, rt = started_app(["q" => 2])
+    try
+        register_job!((task_info, args) -> wide_sum(args), app, "wide", WideArgs)
+        args = wide_args()
+        expected = wide_sum(args)
+        owner = Owner("u")
+
+        # (a) The submit-side round trip accepts 1200 keys, outside any request.
+        # Inside `@test`, so a refusal is recorded and the cases below still run.
+        id = nothing
+        @test (id = submit_queued_task(app, "q", "wide-submit", Job("wide", args), owner)) isa String
+        if id !== nothing
+            @test wait_for(() -> status_of(app, id)[:status] in ("COMPLETED", "FAILED")) == :ok
+            @test status_of(app, id)[:status] == "COMPLETED"
+            @test status_of(app, id)[:result] == expected
+        end
+
+        # (b) The run-side bind of the same JSON, outside any request scope.
+        run_id = submit_queued_task("q", "wide-run", _job_run(app, "wide", JSON.json(args)), owner; runtime = rt)
+        @test wait_for(() -> status_of(app, run_id)[:status] in ("COMPLETED", "FAILED")) == :ok
+        @test status_of(app, run_id)[:status] == "COMPLETED"
+        @test status_of(app, run_id)[:result] == expected
+
+        # (c) Submitted from a handler on an app that raised its cap: the submit sees the request's
+        # cap and the run, on a background task, sees none. Both paths must still complete.
+        app.service.max_fields[] = 5000
+        urlpatterns(app, "", path("/submit-wide", req -> begin
+            ids = (submit_task(app, "wide-async", Job("wide", args), owner),
+                   submit_queued_task(app, "q", "wide-queued", Job("wide", args), owner))
+            Res.json(Dict("ids" => collect(ids)))
+        end))
+        r = internalrequest(app, HTTP.Request("GET", "/submit-wide"))
+        @test r.status == 200
+        ids = String.(JSON.parse(Nitro.text(r))["ids"])
+        @test wait_for(() -> all(i -> status_of(app, i)[:status] in ("COMPLETED", "FAILED"), ids)) == :ok
+        for i in ids
+            @test status_of(app, i)[:status] == "COMPLETED"
+            @test status_of(app, i)[:result] == expected
+        end
+    finally
+        uninstall!(app; drain_timeout = 0)
+    end
+end
+
+end

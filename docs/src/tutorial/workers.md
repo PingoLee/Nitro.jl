@@ -116,6 +116,63 @@ is an `ArgumentError`. See [CPU-Bound Jobs](@ref) for why this is the tool for h
 This was `submit_sequential_task` until a queue could run more than one job
 ([#513](https://github.com/PingoLee/Nitro.jl/issues/513)).
 
+## Named Jobs
+
+A closure cannot leave the process that built it. A **named job** can: it is registered on the
+`App` under a name, with a typed argument struct, and submitted as `Job(name, args)` in place of
+the closure ([#514](https://github.com/PingoLee/Nitro.jl/issues/514)). The arguments are stored
+with the task as JSON and bound back to the declared type when the run starts.
+
+```julia
+@kwdef struct FitArgs
+    dataset_id::Int
+    epochs::Int = 10
+end
+
+# Called once at startup, before `serve`: never from a module body.
+function setup_workers!(app)
+    register_job!(app, "fit_model", FitArgs) do task_info, args
+        fit(args.dataset_id; epochs = args.epochs, on_batch = () -> checkpoint!(task_info))
+    end
+end
+
+setup_workers!(app)
+serve(app; middleware = [worker_startup(app; queues = ["heavy" => 2])])
+
+# in a handler
+task_id = submit_queued_task(app, "heavy", "fit-42", Job("fit_model", FitArgs(dataset_id = 42)), Owner(uid))
+```
+
+**Argument types evolve additively only.** Once a queue runs in a separate worker process, a job
+queued by one version of your app may be run by the next one during a rolling deploy. Follow the
+rule from the first named job, so that moving a queue out of process never needs a type change.
+The new type must still bind the JSON the old one wrote:
+
+- **add** fields, each **with a default** (`@kwdef`, as `epochs` above);
+- **never rename, remove or retype** a field.
+
+A run whose arguments do not bind is recorded `FAILED` with a `JobError` that names the job and
+the argument type, so you can see which deploy broke the contract. It is never retried, because a
+retry would bind the same text and fail the same way. The error never quotes the argument values.
+The same applies when the process running the job has no registration for its name.
+
+What is checked, and where:
+
+| Check | When | Outcome |
+|---|---|---|
+| The queue authorizer allows the caller, and the queue is declared | submit, first | `AuthorizationError`, as for a closure |
+| The name is registered on this `App` | submit | `ArgumentError`, nothing written |
+| `args` is an instance of the registered type | submit | `ArgumentError`, nothing written |
+| `args` serializes through the store's JSON path (depth limit 512) and binds back to the type, like a `Json{T}` body but with no field cap, since the arguments are your own data | submit | `ArgumentError`, nothing written; the message names the type, never the values |
+| The stored arguments bind to the type registered **when the run starts** | run | `FAILED` with a `JobError`, never retried |
+| A name registered twice, empty, or longer than 255 characters; a type that is not a concrete struct or holds a `Symbol`; a handler with no `(task_info, args)` method | `register_job!` | `ArgumentError` |
+
+Named jobs work on any queue and with `submit_task`, and they share a queue with closures. A `Job`
+is submitted through its `App` (`submit_task(app, …)`), because the `App` owns the registry: two
+`App`s in one process do not share job names. Closures stay fully supported for work that will
+only ever run in this process. Prefer the named form for anything you might later want to run
+in a separate worker process, where a closure cannot go.
+
 ## Start Workers With The Server
 
 The recommended app-level entrypoint is the exported `worker_startup(app; ...)` middleware.
@@ -1216,6 +1273,7 @@ Use `Nitro.Workers` when you need lightweight or persistent background execution
 - pass an `Owner(...)` on submission and on every read; `System()` is the named, unscoped bypass
 - use `submit_task(...)` for parallel jobs
 - use `submit_queued_task(...)` for ordered queue processing, on a queue name declared in `queues`
+- use `register_job!` and `Job(name, args)` for work that may one day run out of process, and only ever add fields, with defaults, to an argument type
 - expect `WorkerCapacityError` (a 503, or a 429 for a per-owner quota) when a limit is reached, and size `max_concurrent_runs` to your workload
 - read and cancel with the id the submit call **returned**, not the `task_key` you passed
 - call `checkpoint!(task_info)` (or poll `cancel_requested(task_info)`) in any long-running callback — `cancel_task` and `timeout` do nothing without it

@@ -602,7 +602,9 @@ end
 function _register_or_watch!(runtime::WorkerRuntime, task_key::String, owner::Owner;
                              queue_name::Union{Nothing, String}=nothing,
                              grants::AbstractVector{Owner}=Owner[],
-                             queue::Union{Nothing, WorkerQueue}=nothing)
+                             queue::Union{Nothing, WorkerQueue}=nothing,
+                             job_name::Union{Nothing, String}=nothing,
+                             job_args::Union{Nothing, String}=nothing)
     uid = owner.user_id
     return lock_tasks(runtime) do
         # The DURABLE read, not the live-preferring one, by the rule in `get_task_info`: this is
@@ -673,7 +675,7 @@ function _register_or_watch!(runtime::WorkerRuntime, task_key::String, owner::Ow
         # The new run reserves its capacity FIRST (#324), before the predecessor is asked to
         # stop and before the record is replaced, so a refused submit changes nothing: no record,
         # and no superseded run.
-        task_info = TaskInfo(task_key; queue_name)
+        task_info = TaskInfo(task_key; queue_name, job_name, job_args)
         _reserve_capacity!(runtime, queue, task_info.run_id, uid)
         try
             previous = get_active_task_info(runtime, task_key)
@@ -841,7 +843,9 @@ function _execute_task_async(runtime::WorkerRuntime, task_key::String, callback:
                     # So are the three `is_unrecoverable` exceptions (#367), recorded FAILED and
                     # never rethrown. Why neither a retry nor a rethrow is canonical in that
                     # function's site table (src/errors.jl); `_execute_queued_task` does the same.
-                    if unwrapped isa TaskTimeoutError || is_unrecoverable(unwrapped)
+                    # A named job that does not bind (`JobError`, #514) is terminal too: a retry
+                    # binds the same text against the same registry.
+                    if unwrapped isa TaskTimeoutError || unwrapped isa JobError || is_unrecoverable(unwrapped)
                         return _fail_task!(runtime, task_info, _store_error_text(runtime.store, unwrapped))
                     end
 
@@ -893,8 +897,13 @@ end
 """
     submit_task(task_key, callback, owner::Owner; scope=:user, watchers=Owner[],
                 options=TaskOptions(), runtime=default_runtime())
+    submit_task(app, task_key, callback_or_job, owner::Owner; scope, watchers, options, key, runtime)
 
 Run `callback` on its own task and return the id it was stored under.
+
+On an `App`, a [`Job`](@ref)`(name, args)` registered with [`register_job!`](@ref) can stand in
+for the callback ([#514](https://github.com/PingoLee/Nitro.jl/issues/514)). Its arguments are
+checked and encoded before anything is written, and recorded on the task as JSON.
 
 `scope` decides how `task_key` is namespaced — see [`scoped_task_key`](@ref). The
 returned id is what `get_task_status` and `cancel_task` expect; under the default
@@ -931,9 +940,27 @@ passed again on each such resubmission. Granting an identity that is already a w
 including the owner — is a no-op.
 """
 function submit_task(task_key::AbstractString, callback::Function, owner::Owner; scope::Symbol=:user, watchers::AbstractVector{Owner}=Owner[], options::TaskOptions=TaskOptions(), runtime::WorkerRuntime=default_runtime())
+    return _submit_task(runtime, task_key, _ClosureRun(callback), owner, scope, watchers, options)
+end
+
+# A named job has no registry without its App (#514), so only the App-first form takes one.
+submit_task(::AbstractString, ::Job, ::Owner; kwargs...) = _throw_job_needs_app("submit_task")
+
+function submit_task(ctx::App, task_key::AbstractString, job::Job, owner::Owner; scope::Symbol=:user, watchers::AbstractVector{Owner}=Owner[], options::TaskOptions=TaskOptions(), key::Symbol=DEFAULT_EXTENSION_KEY, runtime::Union{Nothing, WorkerRuntime}=nothing)
+    resolved = _resolve_runtime(ctx; key, runtime)
+    return _submit_task(resolved, task_key, _PendingJob(_job_registry(ctx), job), owner, scope, watchers, options)
+end
+
+# The body of both `submit_task` forms. `work` is resolved by `_prepare_run` AFTER the authorizer
+# and the key checks, so a caller the queue authorizer refuses learns nothing about the job, and
+# a named job's encoding (#514) costs nothing until the submit is allowed. It runs before the
+# record is written, so a refused job writes nothing and reserves nothing.
+function _submit_task(runtime::WorkerRuntime, task_key::AbstractString, work, owner::Owner,
+                      scope::Symbol, watchers::AbstractVector{Owner}, options::TaskOptions)
     _authorize_queue!(runtime.store, DEFAULT_QUEUE_NAME, owner)
 
     key = scoped_task_key(task_key, owner; scope)
+    callback, job_name, job_args = _prepare_run(work)
     # The run identity is PLUMBED here, exactly as `submit_queued_task` plumbs it onto the
     # `QueueItem`. This used to read "the async path does not carry the run identity ... only a
     # QUEUED item needs it, because it may sit in a buffer long enough for the record to move
@@ -941,7 +968,7 @@ function submit_task(task_key::AbstractString, callback::Function, owner::Owner;
     # says which record to read, never that reading it authenticates the reader. And "long
     # enough" is not a correctness criterion: the window here is a lock release plus a `@spawn`
     # scheduling hand-off, not a buffer wait, and it is unbounded under thread pressure.
-    run_id = _register_or_watch!(runtime, key, owner; grants=watchers)
+    run_id = _register_or_watch!(runtime, key, owner; grants=watchers, job_name, job_args)
     if run_id !== nothing
         try
             _execute_task_async(runtime, key, callback, options, run_id)
@@ -960,8 +987,11 @@ end
 """
     submit_queued_task(queue_name, task_key, callback, owner::Owner; scope=:user,
                        watchers=Owner[], options=TaskOptions(), runtime=default_runtime())
+    submit_queued_task(app, queue_name, task_key, callback_or_job, owner::Owner; scope, watchers, options, key, runtime)
 
-Queue `callback` on the declared queue `queue_name` and return the id it was stored under.
+Queue `callback` on the declared queue `queue_name` and return the id it was stored under. On an
+`App`, a [`Job`](@ref) can stand in for the callback, as on [`submit_task`](@ref); closures and
+named jobs share any queue.
 
 A queue runs at most its declared concurrency of items at once, starting them in the order they
 were submitted: `start!(app; queues = ["email", "compute" => 6])` runs `"email"` strictly one at a
@@ -978,6 +1008,21 @@ authorizer sees the real `queue_name`.
 This was `submit_sequential_task` until #513, which gave a queue a concurrency.
 """
 function submit_queued_task(queue_name::AbstractString, task_key::AbstractString, callback::Function, owner::Owner; scope::Symbol=:user, watchers::AbstractVector{Owner}=Owner[], options::TaskOptions=TaskOptions(), runtime::WorkerRuntime=default_runtime())
+    return _submit_queued_task(runtime, queue_name, task_key, _ClosureRun(callback), owner, scope, watchers, options)
+end
+
+submit_queued_task(::AbstractString, ::AbstractString, ::Job, ::Owner; kwargs...) =
+    _throw_job_needs_app("submit_queued_task")
+
+function submit_queued_task(ctx::App, queue_name::AbstractString, task_key::AbstractString, job::Job, owner::Owner; scope::Symbol=:user, watchers::AbstractVector{Owner}=Owner[], options::TaskOptions=TaskOptions(), key::Symbol=DEFAULT_EXTENSION_KEY, runtime::Union{Nothing, WorkerRuntime}=nothing)
+    resolved = _resolve_runtime(ctx; key, runtime)
+    return _submit_queued_task(resolved, queue_name, task_key, _PendingJob(_job_registry(ctx), job), owner, scope, watchers, options)
+end
+
+# The body of both `submit_queued_task` forms; see `_submit_task`.
+function _submit_queued_task(runtime::WorkerRuntime, queue_name::AbstractString, task_key::AbstractString,
+                             work, owner::Owner, scope::Symbol,
+                             watchers::AbstractVector{Owner}, options::TaskOptions)
     queue_id = String(queue_name)
 
     _authorize_queue!(runtime.store, queue_id, owner)
@@ -994,6 +1039,7 @@ function submit_queued_task(queue_name::AbstractString, task_key::AbstractString
             "Queue '$queue_id' is not declared on this worker runtime; declare it with " *
             "`start!(app; queues = [...])` / `worker_startup(app; queues = [...])`"))
     end
+    callback, job_name, job_args = _prepare_run(work)
 
     # One lookup, not two -- and it now comes BEFORE the record is written, because the new run
     # reserves its slot in THIS queue's buffer while the record is claimed (#324). A second
@@ -1007,7 +1053,7 @@ function submit_queued_task(queue_name::AbstractString, task_key::AbstractString
     # Outside `lock_tasks`, deliberately: `get_queue_status` holds `queue_lock` while it lists
     # under the store's lock, so taking `queue_lock` inside `lock_tasks` would be that pair inverted.
     queue = _start_queue_processor(runtime, queue_id)
-    run_id = _register_or_watch!(runtime, key, owner; queue_name=queue_id, grants=watchers, queue)
+    run_id = _register_or_watch!(runtime, key, owner; queue_name=queue_id, grants=watchers, queue, job_name, job_args)
     if run_id !== nothing
         item = QueueItem(key, run_id, callback, options)
 

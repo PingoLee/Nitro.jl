@@ -502,6 +502,32 @@ function _check_value_depth(value)
     return deepest
 end
 
+# Stored JSON -- a session payload, a task's `result`, a named job's arguments (#514) -- is read
+# back through the same 512-level bound as request JSON (#344). What the application stored is
+# not attacker input, but reading it back recurses once per level on whatever task asked, often a
+# request task (`get_task_info` from a handler, the session read in middleware), and #301 showed
+# an overflow there can take a Windows process down rather than raise.
+#
+# Bounding only the read would make a value stored deeper than the bound permanently
+# unreadable: the session would silently reset on every request, the task info would error on
+# every read. So the WRITE refuses it instead, while the caller can still see why, before any row
+# is touched. It lives here rather than in the PormG extension because the Workers named-job
+# submit serializes its arguments through it too, whatever the store: one write path, so the
+# arguments a consumer process reads were bounded exactly like a stored result.
+#
+# Twice, and the order is the point. `JSON.json` recurses once per level, so a value deep enough
+# to overflow it -- thousands of levels, which only the app can build, since request JSON stops
+# at 512 -- used to raise `StackOverflowError` from inside the serializer before any check of its
+# output could run (#367). `_check_value_depth` walks the VALUE first, non-recursively and
+# mirroring the writer, and refuses it with the same `ArgumentError`. The scan of the text stays
+# as the final word: a `JSONText` is written verbatim, and only the text shows its depth.
+function _json_for_storage(value)::String
+    _check_value_depth(value)
+    serialized = JSON.json(value)
+    _check_json_depth(serialized)
+    return serialized
+end
+
 # The field cap (#327): one message for every source, naming the source and the cap -- never a
 # key, which is client input.
 @noinline _throw_too_many_fields(source::String, cap::Int) =

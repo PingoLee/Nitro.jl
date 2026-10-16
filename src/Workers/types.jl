@@ -174,7 +174,7 @@ function owner_of(task_id::AbstractString)
 end
 
 """
-    TaskInfo(id; queue_name=nothing, external=false)
+    TaskInfo(id; queue_name=nothing, external=false, job_name=nothing, job_args=nothing)
 
 One task record — and, crucially, **one run of it**.
 
@@ -200,6 +200,10 @@ current run's identity, and every fence it then reaches would pass.
 for this one, written once at submit. `claimed_by`, `lease_expires_at` and `attempt` describe the
 current claim on an external submission and are written only by the claim operations;
 `replace_task!` resets them, since a new submission has never been claimed.
+
+`job_name` and `job_args` are identity as well: the registered name and the JSON text of the
+arguments of a submission made as a [`Job`](@ref), both `nothing` for a closure. They are written
+once at submit, so `replace_task!` publishes them and `set_task!` never writes them.
 """
 mutable struct TaskInfo
     id::String
@@ -230,6 +234,12 @@ mutable struct TaskInfo
     claimed_by::Union{Nothing, String}
     lease_expires_at::Union{Nothing, DateTime}
     attempt::Int
+    # A named job (#514): the name it was registered under and its arguments as JSON text, fixed at
+    # submit, `nothing` for a closure. Submission identity like `external`, so a claim, a hand-back
+    # and a requeue carry them and `set_task!` never writes them. This process runs its own named
+    # submissions from the queue item's copy; the row is what a consumer process will read.
+    job_name::Union{Nothing, String}
+    job_args::Union{Nothing, String}
     # The cancellation token, and the CAUSE of the cancellation in one field. Process-local and
     # NOT persisted: it is a request aimed at a callback running *here*, and the durable `status`
     # is what carries a cancellation between processes. Read it with `cancel_requested` /
@@ -248,7 +258,8 @@ mutable struct TaskInfo
     # which is the #88 clobber with the sign flipped.
     @atomic cancel_reason::Symbol
 
-    function TaskInfo(id::String; queue_name::Union{Nothing, String}=nothing, external::Bool=false)
+    function TaskInfo(id::String; queue_name::Union{Nothing, String}=nothing, external::Bool=false,
+                      job_name::Union{Nothing, String}=nothing, job_args::Union{Nothing, String}=nothing)
         created_at = current_time_utc()
         return new(
             id,
@@ -266,6 +277,8 @@ mutable struct TaskInfo
             nothing,
             nothing,
             0,
+            job_name,
+            job_args,
             :none,
         )
     end
@@ -274,11 +287,12 @@ end
 # A new run of the same submission (#514): what a claim, a hand-back or a lease requeue publishes.
 # A NEW object, so a holder of the previous run's object keeps the previous `run_id` and loses
 # every fence from here on -- the #108 rule, for a store whose records are the objects. Identity of
-# the submission (`id`, `created_at`, `queue_name`, `external`) is carried; the watcher list is
+# the submission (`id`, `created_at`, `queue_name`, `external`, `job_name`, `job_args`) is carried; the watcher list is
 # copied, never shared, because `add_watcher!` swaps it copy-on-write and a shared vector would
 # make two records' grants one. The claim and run state are the caller's to set.
 function _successor_run(t::TaskInfo)
-    s = TaskInfo(t.id; queue_name = t.queue_name, external = t.external)
+    s = TaskInfo(t.id; queue_name = t.queue_name, external = t.external,
+                 job_name = t.job_name, job_args = t.job_args)
     s.created_at = t.created_at
     s.watchers = copy(t.watchers)
     s.status = t.status

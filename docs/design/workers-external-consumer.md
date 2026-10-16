@@ -4,7 +4,8 @@ Design record for [#514](https://github.com/PingoLee/Nitro.jl/issues/514): runni
 in a **separate process**, for CPU, GC, memory and fault isolation, as an option and never the
 default. **Status: decided.** §10 records the maintainer's decisions (2026-10-14); implementation
 follows the plan in §9, one PR per step. **Step 1 (the store contract) is implemented**; §11
-records where it departs from §3. Nothing here changes an app that does not opt in. It builds
+records where it departs from §3. **Step 2 (named jobs, in-process) is implemented**; §12 records
+where it departs from §2. Nothing here changes an app that does not opt in. It builds
 on #513's queue concurrency, `submit_queued_task` and `checkpoint!`
 ([PR #523](https://github.com/PingoLee/Nitro.jl/pull/523)), and uses their names.
 
@@ -474,3 +475,70 @@ bound rather than releasing it again, or `release_claim!` must learn the bound. 
 - the rule that every web process runs step 1 or later before any consumer starts. An older web
   process's zombie sweep would fail leased rows, and its `replace_task!` would not reset the claim
   columns.
+
+## 12. Implementation notes: step 2, named jobs (2026-10-16)
+
+Step 2 shipped `register_job!`, `Job`, the run-side bind, `JobError`, and the `job_name` and
+`job_args` columns, for in-process queues only. Where it departs from §2 and §9, it is because the
+code showed a simpler or safer shape, and each change was agreed with the maintainer before it
+landed:
+
+- **`declare_queues!` is deferred to step 3.** §9 lists it in step 2, but its purpose is to carry
+  `External(…)` placements, which do not exist yet. Shipped alone, it would only be a second way
+  to declare in-process queues beside `worker_startup(app; queues)`, with a merge rule to define and
+  nothing to use it for. Step 3 adds it together with `External(…)`.
+- **An unknown name is refused at submit, not only recorded `FAILED`.** The submitting process
+  registers every job it submits (§5: both processes run one setup function), so a name it does
+  not know is a typo, and an `ArgumentError` at the call site beats a `FAILED` row. The run-side
+  half of §2 is still built: a run resolves its name when it starts, and a name the running
+  process does not know is a terminal `JobError`. That is the old-consumer case, and it is tested
+  by running a stored `(job_name, job_args)` pair (`_job_run`) against an `App` that lacks the
+  name.
+- **"Round-trip" means serializes, then binds back to the registered type.** The submit check
+  writes the arguments through `_json_for_storage`, the store's JSON path with its #344 depth
+  bounds (moved from the PormG extension to `src/utilities/bodyparsers.jl` so Workers shares it),
+  and binds the text with `stored_json_bind`, which is the `Json{T}` binder without the request
+  field cap. Job arguments are stored data, so both sides parse them with `max_fields = 0`, as
+  every stored read does. Under the cap, a job submitted from a handler under a raised
+  `serve(max_fields = …)` passed its submit check and then failed its run, which binds outside
+  any request at 1000. The check does not compare the bound value with the original: `==` on a
+  mutable field, or a `Dict`'s iteration order, would refuse sound values. A lossy-but-bindable value is therefore accepted. The refusal names the type and never
+  the value.
+- **The registry lives in the App's extension slot (`:workers_jobs`), not on the
+  `WorkerRuntime`.** Registration happens before `worker_startup` installs a runtime, and
+  `uninstall!` drops the runtime's slot on every `terminate`, while registrations must survive a
+  re-serve. The registry is created on first use under the extension lock.
+- **Only the App-first submit forms take a `Job`.** A runtime has no registry, so
+  `submit_task(key, Job(…), owner; runtime)` is an `ArgumentError` pointing at the App form.
+- **The job is encoded after the queue authorizer and the declared-queue check**, not before them.
+  A caller the authorizer refuses gets the same `AuthorizationError` as for a closure, and learns
+  nothing about the job. The encoding costs nothing until the submit is allowed. It still runs
+  before the record is written, so a refused job writes and reserves nothing.
+- **`register_job!` refuses more than a duplicate name:** a name longer than 255 characters (the
+  PormG column is `VARCHAR(255)`, so PostgreSQL would refuse it at every submit), a type that is
+  not a concrete struct, a
+  type holding a `Symbol` (Nitro's read style never binds one, #306, so the job could never run),
+  and a handler with no `(task_info, args)` method. A re-registration of the same name is refused
+  even when it is identical, like a re-declared queue concurrency: one rule, no comparison of
+  closures.
+- **`JobError` is terminal in both executors**, in the same arm as `TaskTimeoutError` and the
+  `is_unrecoverable` three, so `TaskOptions(retry_on_failure = true)` does not retry it. Its
+  message names the job and the type and never renders the parse error, which quotes its input.
+- **In-process runs bind the queue item's copy, not the row.** The arguments are encoded once at
+  submit, and the `NamedJobRun` the item carries holds that text, the same text the row records.
+  Re-reading the row would be the fence-from-inside-the-window mistake workers §6 forbids. A
+  consumer will build the same `NamedJobRun` from a claimed row, so both placements go through
+  one bind.
+- **`job_name` and `job_args` are submission identity**, like `external`. `replace_task!` writes
+  them, the claim operations carry them (`_successor_run`), and `set_task!` never writes them.
+  `get_task_status` does not expose them, because the arguments are application data. On the
+  PormG store they are `VARCHAR(255)` and `TEXT`, added on boot with one `_ensure_column!` each.
+- **No `upgrading/` entry.** Every change is additive: new exported names, new optional `TaskInfo`
+  constructor keywords, and nullable columns. A custom store that does not persist the two fields
+  still runs named jobs in-process.
+
+**Left to step 3:**
+- an external queue's refusal of a closure at submit (§2);
+- building a `NamedJobRun` from a claimed row (`_job_run` is the seam);
+- `declare_queues!`;
+- the distinct exception type for `claim_next!`'s second undecodable head (§11).
