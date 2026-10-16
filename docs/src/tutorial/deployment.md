@@ -182,14 +182,16 @@ the benchmark's own job counter; its k = 0 baseline was 102k and 2.4 ms.
   - **When it happens:** only while no other timer is alive in the process. Any second live
     `Timer` removes it, even one that never fires. New requests are not affected: the `yield()`
     column above did not change on 1.13.2.
-  - **Who is safe:** Nitro's session pruner, rate-limiter janitor and Workers cleanup scheduler
-    each keep a timer alive while they sleep, so an app that uses any of them should not see it
-    (read from the code, not tested).
-  - **Who is exposed, and the workaround:** an app that uses none of them is exposed. On these
-    versions it can keep one timer for the server's lifetime: `keepalive = Timer(typemax(Int32))`
-    before `serve`, and `close(keepalive)` after. That timer never fires, so it costs nothing per
-    request. It was measured in the repro (7–12 ms, against 1.5 s), not in a server. The queue
-    is not affected either way.
+  - **Nitro works around it while serving.** On 1.13.0-rc3 and later 1.13 releases, `serve`
+    holds one `Timer` that never fires, and `terminate` closes it: one handle, nothing per
+    request. `bench/socket/wake.sh` measured a Nitro server with no other timer on 1.13.2
+    ([#598](https://github.com/PingoLee/Nitro.jl/issues/598)). It kept one handler parked in a
+    10 ms `sleep` loop while 8 handlers yielded every 1 ms for 1.5 s. Without the guard the
+    parked handler woke 1.48 s late in 3 runs of 3. With `serve`'s guard it woke 10–23 ms
+    late, against 2–8 ms on 1.12.7 with no load beside it.
+  - **What is still exposed:** a task that sleeps while no server is up, such as a script that
+    runs yielding loops before or after `serve`. It can hold the same guard itself:
+    `keepalive = Timer(typemax(Int32))`, and `close(keepalive)` when done.
 
 **Every app has one such handler: the login.** One `check_password` at the default cost
 computes without yielding for about 0.1 s (pbkdf2_sha256, 720,000 iterations) or 0.2 s

@@ -448,10 +448,9 @@ call or a file is not computing; it already gives the thread back. For real comp
 - **Or call `yield()` every 1–2 ms** inside a loop that has to stay in the handler. It does not
   reduce the CPU the work takes, but it bounds how long a cheap request waits behind it. **Julia
   1.13.0 through 1.13.2 have one caveat:** a task parked in `sleep` can stay behind the yielding
-  loop until it ends, but only while no other timer is alive in the process (#586). Nitro's
-  session pruner, rate-limiter janitor and Workers cleanup scheduler each keep one alive. An app
-  with none of them can hold `keepalive = Timer(typemax(Int32))` for the server's lifetime, or use
-  the queue.
+  loop until it ends, but only while no other timer is alive in the process (#586). `serve()`
+  holds such a timer on those versions (#598), so a running server is covered. Code that runs
+  yielding loops while no server is up can hold `keepalive = Timer(typemax(Int32))` itself.
 
 ---
 
@@ -520,7 +519,7 @@ query parameter with no default is **required**: omitting it is a 400, not `noth
 | `if user.role == "admin"` inside a handler | `role_required("admin")` guard on the route |
 | `login_required()` on a route that loads a record by client id | Also verify ownership — otherwise IDOR |
 | `submit_task(key, cb)` without an authority | `submit_task(key, cb, Owner(user_id))` |
-| A handler that computes for more than a few milliseconds | `submit_queued_task` to a bounded queue and answer `202`, or `yield()` every 1–2 ms (on Julia 1.13.0–1.13.2, keep a timer alive in the process, #586) — Julia cannot preempt it |
+| A handler that computes for more than a few milliseconds | `submit_queued_task` to a bounded queue and answer `202`, or `yield()` every 1–2 ms — Julia cannot preempt it |
 | Polling `get_task_status(key, …)` with the key you submitted | Poll with the id `submit_task` returned, or `scoped_task_key(key, Owner(user_id))` |
 | Mutating a `Response` returned by inner middleware | `add_response_headers(resp, extra)` |
 | A global mutable config object | A typed struct passed via `serve(context=…)` |
