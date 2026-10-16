@@ -269,6 +269,14 @@ What the second table says:
   every 1 ms no longer let a timer-woken task run: the heartbeat is about as late as with no
   yield at all. A 30-line repro without Nitro shows the same thing on 1.13.1 and 1.13.2, and not on 1.12.7
   or master. It is tracked in #586; the `:interactive` row is unaffected.
+- **That 1.13 row is a Julia bug, reported as
+  [JuliaLang/julia#63882](https://github.com/JuliaLang/julia/issues/63882).** It begins at
+  1.13.0-rc3, with the scheduler backports in JuliaLang/julia#62665 (rc2 does not stall), and it
+  needs the sleeper's own `Timer` to be the only live libuv handle in the process: any second live
+  `Timer`, even one that never fires, removes it. That is why `socket/server.jl`, which parks its
+  main task in `wait(Timer(typemax(Int32)))`, never showed it, and why `stall.sh` cannot be used to
+  look for it unless the server parks some other way. Until a fixed 1.13.x
+  ships, compare this row only across versions, never as a property of `yield()`.
 
 ## juliac (compiled executable)
 
