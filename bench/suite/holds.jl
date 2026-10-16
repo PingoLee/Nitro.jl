@@ -8,6 +8,10 @@
 #
 # Every row builds its input in `setup` with `evals=1`, so a request's body cache or a consumed
 # stream never carries over between samples.
+#
+# Each input is checked once at include time against the full result it must produce. A parser
+# that rejects its input answers fast and quietly -- `json(req)` with `nothing`, `multipart(req)`
+# with an empty `Dict` -- and a row timing that path would report a plausible, meaningless number.
 
 SUITE["holds"] = BenchmarkGroup()
 
@@ -33,6 +37,13 @@ const HOLDS_JSON_BYTES = Dict(size => sizeof(body) for (size, body) in HOLDS_JSO
 
 for (size, body) in HOLDS_JSON
     bytes = Vector{UInt8}(body)
+    rows = length(_HOLDS_BP._parse_json_bounded(bytes; max_fields = 0)["rows"])
+    req = bench_request("POST", "/bench/json"; body = body)
+    length(_HOLDS_BP.json(req; max_fields = 0)["rows"]) == rows ||
+        error("holds: getjson_$size does not parse its body")
+    req = bench_request("POST", "/bench/json"; body = body)
+    length(_HOLDS_BP.json(req, BenchRows; max_fields = 0).rows) == rows ||
+        error("holds: json_typed_$size does not bind its body")
     SUITE["holds"]["write_dict_$size"] = @benchmarkable Res.json(v) setup=(
         v = _HOLDS_BP._parse_json_bounded($bytes; max_fields = 0)) evals=1
     SUITE["holds"]["write_struct_$size"] = @benchmarkable Res.json(v) setup=(
@@ -58,14 +69,18 @@ function _holds_multipart_body(total::Int)
                   "Content-Type: application/octet-stream\r\n\r\n")
     tail = string("\r\n--", HOLDS_BOUNDARY, "--\r\n")
     payload = rand(UInt8, total - sizeof(head) - sizeof(tail))
-    return vcat(Vector{UInt8}(head), payload, Vector{UInt8}(tail))
+    return vcat(Vector{UInt8}(head), payload, Vector{UInt8}(tail)), length(payload)
 end
 
 const HOLDS_MULTIPART_HEADERS = ["Content-Type" => "multipart/form-data; boundary=$HOLDS_BOUNDARY"]
 
 for (size, total) in (("1mb", 1_000_000), ("10mb", 10_000_000),
                       ("64mib", Int(Nitro.Core.Constants.DEFAULT_MAX_BODY_BYTES)))
-    body = _holds_multipart_body(total)
+    body, file_bytes = _holds_multipart_body(total)
+    parsed = _HOLDS_BP.multipart(HTTP.Request("POST", "/bench/upload", HOLDS_MULTIPART_HEADERS, copy(body)))
+    (get(parsed, "note", nothing) == "hello" && haskey(parsed, "upload") &&
+     length(parsed["upload"].data) == file_bytes) ||
+        error("holds: multipart_$size does not parse its body")
     SUITE["holds"]["multipart_$size"] = @benchmarkable _HOLDS_BP.multipart(req) setup=(
         req = HTTP.Request("POST", "/bench/upload", HOLDS_MULTIPART_HEADERS, copy($body))) evals=1
 end
@@ -103,6 +118,12 @@ function _holds_drain(resp::HTTP.Response)
     total == HOLDS_FILE_BYTES || error("drained $total bytes, expected $HOLDS_FILE_BYTES")
     return total
 end
+
+let resp = Res.file(HTTP.Request("GET", "/bench/file"), HOLDS_FILE)
+    resp.status == 200 && HTTP.header(resp, "Content-Length") == string(HOLDS_FILE_BYTES) ||
+        error("holds: file_100mib does not serve the whole file")
+end
+_holds_drain(Res.file(HTTP.Request("GET", "/bench/file"), HOLDS_FILE; stream = true))   # checks the length
 
 SUITE["holds"]["file_100mib"] = @benchmarkable Res.file(req, HOLDS_FILE) setup=(
     req = HTTP.Request("GET", "/bench/file")) evals=1
