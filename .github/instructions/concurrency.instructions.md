@@ -69,9 +69,31 @@ lives in the code comment it names, and that comment is canonical.
 
 ## 5. Handlers that compute
 
-- Nothing can preempt or stop a CPU-bound handler. `Threads.nthreads(:default)` of them stall
-  every other request until they finish. Long computation belongs in a Worker (`submit_task`) or
-  must reach a yield point regularly. The threshold to document is #467's measurement.
+- **Nothing can preempt or stop a CPU-bound handler.** Julia 1.12 has no preemption: a handler
+  that computes without waiting holds its `:default` thread until it returns, and
+  `Threads.nthreads(:default)` of them stall every other request until one finishes. Measured in
+  #467 (PR #584): with 8 default threads, 8 handlers each computing 200 ms took a minimal route
+  from about 100k requests per second to 1.5k, with a p99 of 192 ms, the handlers' own run time.
+  The knee is the default thread count; below it the other requests barely notice (4 of 8 cost
+  4%). Waiting on I/O, a lock or a `sleep` is not computing: those handlers give the thread back.
+- **The threshold is the application's latency budget, not a fixed number of milliseconds.** Past
+  the knee, a cheap request's p99 becomes the computing handler's run time, so the longest a
+  handler may compute is the delay the application accepts for every other request. For an API
+  answering in milliseconds, that is a few milliseconds of computation. Do not add a long-handler
+  warning to `serve` for it (declined in #467): the threshold is per application, and the
+  `AccessLog` middleware already records each request's `duration_ms`.
+- **Past it, the work leaves the handler for a bounded queue and the handler answers `202`.**
+  `submit_queued_task` to a queue whose concurrency leaves default threads free
+  (`queues = ["compute" => max(N - 2, 1)]`), returning the task id. Not a bare `submit_task`: an
+  unbounded submit runs on the same default threads and stalls them the same way (#512, #513).
+  A full queue refuses the submit with `WorkerCapacityError`, which Nitro answers `503`; that is
+  the backpressure, not a bug.
+- **Or `yield()` every 1-2 ms** in a loop that has to stay in the handler. It bounds the wait
+  (a p99 of 10.5 ms at the knee in #467's run, against 192 ms) but not the throughput loss, so it
+  is the fallback, not the rule.
+- The measurements and the user-facing rule live in `docs/src/tutorial/deployment.md` (*Handlers
+  that compute*) and `docs/src/tutorial/workers.md` (*CPU-Bound Jobs*); the `nitro-usage` skill
+  carries the same rule for application code. Change all of them together, or none.
 
 ## 6. Julia 1.14: changes to plan for
 
