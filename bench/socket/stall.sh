@@ -23,8 +23,22 @@
 #                 (#587), the computing handler every app has. K in flight, closed loop.
 #   login_bcrypt  `/login_bcrypt`: the same against a bcrypt hash at the default cost.
 #                 The Nitro servers get LOGIN=1 only when one of the two is requested.
+#   route:<target>          Any route as the K-in-flight operation, GET, closed loop like `cpu`:
+#                           `route:/aggregate?n=10000000&op=groupby` (#590). A target starting
+#                           with `/login` starts the Nitro servers with LOGIN=1; anything else a
+#                           route needs (AGG_ROWS, HOLDS) is read from the environment the servers
+#                           inherit.
+#   route:<target>@<file>   The same as a POST with <file> as the body and ROUTE_CT as its
+#                           Content-Type (default application/octet-stream):
+#                           `route:/hold/multipart@body.bin` (#588).
+#                           A target carrying `queue=1` answers 202 and queues the work, so it is
+#                           offered at a rate, as `cpu_job` is: K * 1000 / ROUTE_MS per second,
+#                           drained between passes.
+#                           ROUTE_MS (default CPU_MS) is what one request of the route costs; it
+#                           sets that rate and the settle time after each pass.
 #
-# `base` (K = 0) is `/plaintext` alone. The `go` mode (socket/go/) runs `base` and `cpu` only: Go
+# `base` (K = 0) is `/plaintext` alone. The `go` mode (socket/go/) runs `base`, `cpu` and the
+# unqueued `route:` variants only (it must serve the route; `/aggregate` it does): Go
 # preempts a computing goroutine, so it is the reference for what preemption buys, and it has no
 # Workers. Modes, `mode@threads`, pinning, JULIA and the Go build work as in run.sh.
 #
@@ -32,8 +46,10 @@
 #   bench/socket/stall.sh "nitro go" 3 6s
 #   KS="1 2 4 8 16" VARIANTS="cpu cpu_yield cpu_job" CPU_MS=200 bench/socket/stall.sh
 #   VARIANTS="login login_bcrypt" bench/socket/stall.sh "nitro go" 3 6s
+#   AGG_ROWS=10000000 ROUTE_MS=120 VARIANTS="route:/aggregate?n=10000000&op=groupby" bench/socket/stall.sh "nitro go"
 #
-# Results: one TSV per invocation under bench/results/ (gitignored).
+# Results: one TSV per invocation under bench/results/ (gitignored). KEEP_JSON=1 also keeps every
+# oha JSON report, the load's and /plaintext's, under bench/results/stall-<stamp>-raw/.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
@@ -44,6 +60,9 @@ DUR="${3:-6s}"
 KS="${KS:-1 2 4 8 16}"
 VARIANTS="${VARIANTS:-cpu cpu_yield cpu_job}"
 CPU_MS="${CPU_MS:-200}"
+ROUTE_MS="${ROUTE_MS:-$CPU_MS}"
+ROUTE_CT="${ROUTE_CT:-application/octet-stream}"
+KEEP_JSON="${KEEP_JSON:-0}"
 YIELD_MS="${YIELD_MS:-2}"
 CONNS="${CONNS:-50}"
 THREADS="${THREADS:-8}"
@@ -72,8 +91,13 @@ for v in "${VARIANT_LIST[@]}"; do
   case "$v" in
     cpu|cpu_yield|cpu_job) ;;
     login|login_bcrypt) LOGIN=1 ;;
+    route:/login*) LOGIN=1 ;;
+    route:/*) ;;
     *) echo "stall.sh: unknown variant $v" >&2; exit 1 ;;
   esac
+  if [[ $v == route:*@* ]] && [ ! -r "${v#*@}" ]; then
+    echo "stall.sh: variant $v: body file ${v#*@} is not readable" >&2; exit 1
+  fi
 done
 if [ "$WANT_GO" = 1 ]; then
   command -v go >/dev/null || { echo "stall.sh: go not on PATH (needed by the go mode)" >&2; exit 1; }
@@ -83,6 +107,8 @@ OUT="$ROOT/bench/results"
 mkdir -p "$OUT"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 RESULT="$OUT/stall-$STAMP.tsv"
+RAW="$OUT/stall-$STAMP-raw"
+[ "$KEEP_JSON" = 1 ] && mkdir -p "$RAW"
 printf 'mode\tthreads\tvariant\tk\tplaintext_rps\tplaintext_p50_ms\tplaintext_p99_ms\tload_rps\tload_2xx\n' > "$RESULT"
 
 median() { sort -n | awk '{a[NR]=$1} END{print (NR%2)?a[(NR+1)/2]:(a[NR/2]+a[NR/2+1])/2}'; }
@@ -150,7 +176,25 @@ for mode in "${MODE_LIST[@]}"; do
 done
 
 # A pass applies to a mode unless it is a Julia-only variant on the go mode.
-applies() { [ "$(mode_name "$1")" != go ] || [ "$2" = base ] || [ "$2" = cpu ]; }
+applies() {
+  [ "$(mode_name "$1")" != go ] || [ "$2" = base ] || [ "$2" = cpu ] ||
+    { [[ $2 == route:* ]] && ! queued "$2"; }
+}
+queued() { [[ $1 == route:* && $1 == *queue=1* ]]; }
+
+# The oha arguments that send variant $2 to the server at base url $1: the URL, and for a
+# `route:<target>@<file>` variant the POST and its body.
+load_args() {
+  local base="$1" v="$2" target
+  case "$v" in
+    route:*@*) target="${v#route:}"; target="${target%@*}"
+               printf '%s\n' -m POST -D "${v#*@}" -T "$ROUTE_CT" "$base$target" ;;
+    route:*)   printf '%s\n' "$base${v#route:}" ;;
+    *)         printf '%s\n' "$base/$v" ;;
+  esac
+}
+cost_ms() { if [[ $1 == route:* ]]; then printf '%s' "$ROUTE_MS"; else printf '%s' "$CPU_MS"; fi; }
+slug() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
 
 drain_jobs() {   # base url: wait until no /cpu_job job is pending (at most 120 s)
   for _ in $(seq 1 240); do
@@ -166,7 +210,8 @@ for mode in "${MODE_LIST[@]}"; do
   taskset -c "$CLIENT_CPUS" oha -z 3s -c "$CONNS" --no-tui "$base/plaintext" >/dev/null 2>&1
   for v in "${VARIANT_LIST[@]}"; do
     applies "$mode" "$v" || continue
-    taskset -c "$CLIENT_CPUS" oha -n 8 -c 2 --no-tui "$base/$v" >/dev/null 2>&1
+    mapfile -t args < <(load_args "$base" "$v")
+    taskset -c "$CLIENT_CPUS" oha -n 8 -c 2 --no-tui "${args[@]}" >/dev/null 2>&1
   done
   [ "$(mode_name "$mode")" = go ] || drain_jobs "$base"
 done
@@ -185,7 +230,7 @@ TWO_XX='([.statusCodeDistribution // {} | to_entries[] | select(.key | startswit
 
 LOAD_DUR="$(( ${DUR%s} + 2 ))s"
 declare -A RPS P50 P99 LRPS LOK
-for _ in $(seq 1 "$ROUNDS"); do
+for round in $(seq 1 "$ROUNDS"); do
   for pass in "${PASSES[@]}"; do
     variant="${pass%|*}"; k="${pass#*|}"
     for mode in "${MODE_LIST[@]}"; do
@@ -196,14 +241,18 @@ for _ in $(seq 1 "$ROUNDS"); do
       if [ "$variant" != base ]; then
         load_json="$(mktemp)"
         rate=()
-        [ "$variant" = cpu_job ] && rate=(-q "$(awk -v k="$k" -v ms="$CPU_MS" 'BEGIN { printf "%.2f", k * 1000 / ms }')")
+        { [ "$variant" = cpu_job ] || queued "$variant"; } &&
+          rate=(-q "$(awk -v k="$k" -v ms="$(cost_ms "$variant")" 'BEGIN { printf "%.2f", k * 1000 / ms }')")
+        mapfile -t args < <(load_args "$base" "$variant")
         taskset -c "$CLIENT_CPUS" oha -z "$LOAD_DUR" -c "$k" ${rate[@]+"${rate[@]}"} --no-tui \
-          --output-format json "$base/$variant" >"$load_json" 2>/dev/null &
+          --output-format json "${args[@]}" >"$load_json" 2>/dev/null &
         bg=$!
         sleep 1
       fi
       js="$(taskset -c "$CLIENT_CPUS" oha -z "$DUR" -c "$CONNS" --no-tui --disable-compression \
               --output-format json "$base/plaintext" 2>/dev/null)"
+      raw_stem="$RAW/r$round-$(slug "$mode")-$(slug "$variant")-k$k"
+      [ "$KEEP_JSON" = 1 ] && printf '%s\n' "$js" >"$raw_stem-plaintext.json"
       RPS[$key]+="$(jq -r '.summary.requestsPerSec | floor' <<<"$js") "
       P50[$key]+="$(jq -r '(.latencyPercentiles.p50 // 0) * 1000 | . * 100 | floor / 100' <<<"$js") "
       P99[$key]+="$(jq -r '(.latencyPercentiles.p99 // 0) * 1000 | . * 100 | floor / 100' <<<"$js") "
@@ -211,11 +260,11 @@ for _ in $(seq 1 "$ROUNDS"); do
         wait "$bg"
         LRPS[$key]+="$(jq -r '.summary.requestsPerSec * 100 | floor / 100' <"$load_json") "
         LOK[$key]+="$(jq -r "$TWO_XX" <"$load_json") "
-        rm -f "$load_json"
+        if [ "$KEEP_JSON" = 1 ]; then mv "$load_json" "$raw_stem-load.json"; else rm -f "$load_json"; fi
         # Requests oha abandoned at its deadline may still be computing; let them finish, and
         # drain any queued jobs, so this pass cannot load the next one.
-        sleep "$(awk -v ms="$CPU_MS" -v k="$k" 'BEGIN { printf "%.1f", 0.5 + ms * k / 1000 / 4 }')"
-        [ "$variant" = cpu_job ] && drain_jobs "$base"
+        sleep "$(awk -v ms="$(cost_ms "$variant")" -v k="$k" 'BEGIN { printf "%.1f", 0.5 + ms * k / 1000 / 4 }')"
+        { [ "$variant" = cpu_job ] || queued "$variant"; } && drain_jobs "$base"
       fi
     done
   done

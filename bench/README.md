@@ -23,9 +23,10 @@ bench/
 │   ├── taskpattern.jl  # SYNTHETIC replica of parallel_stream_handler's task overhead
 │   ├── httpparse.jl    # HTTP.jl's request-head parse on the connection task
 │   ├── holds.jl        # how long one large JSON / multipart / file call holds its thread (#588)
-│   └── passwords.jl    # one check_password at the default pbkdf2 and bcrypt costs (#587)
+│   ├── passwords.jl    # one check_password at the default pbkdf2 and bcrypt costs (#587)
+│   └── aggregate.jl    # the /aggregate kernel alone: sum, mean, groupby at N = 10^3..10^7 (#590)
 ├── socket/             # real-socket load: server.jl (Nitro vs bare HTTP.jl), run.sh, contention.sh, stall.sh (oha)
-│   └── go/             # the Go net/http reference server run.sh's `go` mode builds
+│   └── go/             # the Go net/http reference server run.sh's `go` mode builds; `go test -bench Aggregate`
 ├── tasks/              # Julia tasks vs goroutines, no HTTP: tasks.jl, go/, run.sh
 ├── results/            # JSON run outputs — gitignored (machine-specific)
 └── .gitignore          # ignores results/, Manifest.toml and per-version Manifest-v*.toml
@@ -112,6 +113,9 @@ JULIA="julia +1.12" bench/socket/run.sh              # another Julia, by juliaup
 bench/socket/contention.sh "8,1 6,2 8,0" 5 8s       # /health while the default pool is busy (#491)
 bench/socket/stall.sh "nitro nitro@8,0 go" 3 6s      # /plaintext while K handlers compute (#467)
 VARIANTS="login login_bcrypt" bench/socket/stall.sh "nitro go" 3 6s   # ... while K check a password (#587)
+AGG_ROWS=10000000 ROUTE_MS=115 VARIANTS="route:/aggregate?n=10000000&op=groupby" \
+  bench/socket/stall.sh "nitro go" 3 8s                                # ... while K aggregate (#590)
+bench/socket/night2.sh                               # the #587/#588/#590 night run, unattended
 ```
 
 - `server.jl` serves `/plaintext`, `/json`, `/health`, `/cpu` and `/lag` in one of these `MODE`s:
@@ -126,7 +130,14 @@ VARIANTS="login login_bcrypt" bench/socket/stall.sh "nitro go" 3 6s   # ... whil
   concurrency `BURST_K` and answers `202` (a full queue answers `503`); `/jobs` counts the
   `/cpu_job` jobs not yet finished. `LOGIN=1` adds `/login` and `/login_bcrypt` to the Nitro
   modes: one `Nitro.Auth.check_password` per request against a pbkdf2_sha256 or bcrypt hash minted
-  at startup at the default cost, answering a fixed `ok` (#587).
+  at startup at the default cost, answering a fixed `ok` (#587). `AGG_ROWS=<n>` builds `n` rows at
+  startup and serves `/aggregate?n=<N>&op=<sum|mean|groupby>` in every mode, Go included (#590): a
+  plain loop over the first N rows (`socket/aggregate.jl`, mirrored line for line in
+  `socket/go/aggregate.go`; both generate the same rows from one splitmix64 seed), and with
+  `WORKERS=1` `&queue=1` sends it to the `/cpu_job` queue instead. `HOLDS=1` adds the two largest
+  holds of #588's inventory as routes: `GET /hold/json` (`Res.json` of a ~12 MB untyped value) and
+  `POST /hold/multipart` (`getfiles` of the request body; `socket/multipart_body.jl` writes a 64 MiB
+  one). `/gc` answers every field of `Base.gc_num()`.
 - `run.sh` pins the server (`-t 8`) and the load generator to disjoint physical cores, warms each
   route, and reports the median, min and max of N runs plus the median p99. The default CPU sets
   assume a 6-core part whose SMT siblings are `n` and `n+6`; set `SERVER_CPUS`/`CLIENT_CPUS` for
@@ -181,7 +192,10 @@ VARIANTS="login login_bcrypt" bench/socket/stall.sh "nitro go" 3 6s   # ... whil
   `VARIANTS` runs the same work as `cpu` (in the handler), `cpu_yield` and `cpu_job` (a Workers
   queue, offered at the rate that would keep K busy and drained between passes); the `load_2xx`
   column is the share of those submissions the queue accepted. `login` and `login_bcrypt` keep K
-  password checks in flight instead, and start the servers with `LOGIN=1`. Modes are `nitro`,
+  password checks in flight instead, and start the servers with `LOGIN=1`. `route:<target>` keeps K
+  requests of any route in flight (`route:<target>@<file>` POSTs `<file>` with `ROUTE_CT`); a
+  target with `queue=1` is offered at a rate like `cpu_job`. `ROUTE_MS` is one request's cost.
+  `KEEP_JSON=1` keeps every oha report under `results/stall-<stamp>-raw/`. Modes are `nitro`,
   `nitro@N,M` and `go`, which runs `cpu` only. The latest table is in the deployment guide's *Handlers that
   compute*.
 - `JULIA="julia +1.12"` runs the servers on another juliaup channel. Each Julia minor wants its
@@ -189,6 +203,11 @@ VARIANTS="login login_bcrypt" bench/socket/stall.sh "nitro go" 3 6s   # ... whil
   copy `Manifest.toml` to it and `Pkg.resolve()` under 1.12 once.
 - Compare modes **within one run**, not across days: the CPU governor and anything else on the box
   move absolute numbers by tens of percent. Requires `oha`, `jq`, `curl` and `taskset`.
+- `KEEP_JSON=1` makes `run.sh` keep every measured oha report (p99.9 and the histogram are in it)
+  under `results/socket-<stamp>-raw/`, and `GC_SNAPSHOTS=1` records each server's GC counters
+  around every run in `socket-<stamp>-gc.tsv`: a Julia mode's `/gc`, a Go mode's log line count,
+  which with `GODEBUG=gctrace=1` is one line per collection. `socket/gc_tail.jl <stem>` sets each
+  run's p99/p99.9 against those deltas (#590).
 - Every `run.sh` row also carries the server's resident memory, read from `/proc` for the process
   that owns the listening socket: at rest (once it answers `/health`), after the last run, and the
   peak (`VmHWM`).
