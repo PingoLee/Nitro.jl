@@ -39,6 +39,10 @@
 #                       least 1. The queue buffers 100, so a queued burst above 100 is refused.
 #   LAG=0|1             Start the `/lag` probe (off by default, so a throughput run carries no extra
 #                       task). Without it `/lag` answers `{"n":0}`.
+#   LOGIN=0|1           Nitro only: also serve `/login` and `/login_bcrypt`, which each verify one
+#                       password with `Nitro.Auth.check_password` against a hash minted at startup at
+#                       the default cost (pbkdf2_sha256, and bcrypt) and answer a fixed `ok` (#587):
+#                       the computing handler every app has, for `stall.sh`'s `login` variants.
 #   PRELOAD="Pkg ..."   Load these packages before serving, so `rss.sh` can measure what one adds
 #                       to the process (PRELOAD=PormG also loads NitroPormGExt). The project
 #                       passed to `--project` must have them; the bench env does not.
@@ -67,6 +71,7 @@ const YIELD_MS   = parse(Float64, get(ENV, "YIELD_MS", "2"))
 const JOB_MS     = parse(Float64, get(ENV, "JOB_MS", "500"))
 const WORKERS    = get(ENV, "WORKERS", "0") == "1"
 const LAG        = get(ENV, "LAG", "0") == "1"
+const LOGIN      = get(ENV, "LOGIN", "0") == "1"
 const BURST_K    = parse(Int, get(ENV, "BURST_K", string(max(Threads.nthreads(:default) - 2, 1))))
 
 for pkg in split(get(ENV, "PRELOAD", ""))
@@ -201,6 +206,13 @@ function start_nitro()
         path("/cpu_yield", req -> Res.send(cpu_yield_body()); method = "GET"),
         path("/lag",       req -> Res.send(lag_body(); content_type = "application/json"); method = "GET"),
     )
+    if LOGIN
+        login, login_bcrypt = login_routes()
+        urlpatterns(app, "",
+            path("/login",        login; method = "GET"),
+            path("/login_bcrypt", login_bcrypt; method = "GET"),
+        )
+    end
     if WORKERS
         burst, cpu_job, jobs = worker_routes()
         urlpatterns(app, "",
@@ -212,6 +224,18 @@ function start_nitro()
     serve(app; host = "127.0.0.1", port = PORT, async = true, show_banner = false,
           access_log = ACCESS_LOG)
     return app
+end
+
+# `/login` and `/login_bcrypt` (#587): one password check per request, at the default cost, and a
+# fixed body. No user, no store, no request body: the point is how long the check holds its
+# `:default` thread, not the auth flow. The password is right, so the check runs to the end and
+# `denied` is never sent.
+function login_routes()
+    password = "correct horse battery staple"
+    pbkdf2 = Nitro.Auth.make_password(password)
+    bcrypt = Nitro.Auth.make_password(password; algorithm = "bcrypt")
+    check(hash) = req -> Res.send(Nitro.Auth.check_password(password, hash) ? "ok" : "denied")
+    return check(pbkdf2), check(bcrypt)
 end
 
 # `/burst?n=K`: K Workers jobs at once, each burning JOB_MS on the `:default` pool -- the pool

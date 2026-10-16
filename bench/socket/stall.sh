@@ -7,7 +7,8 @@
 # throughput and p50/p99 for every K. Expected: little change while K is below the number of
 # default threads, then a collapse.
 #
-# Variants -- the same CPU work, three ways (all servers are started with WORKERS=1, see server.jl):
+# Variants -- the same CPU work three ways, then the two password checks (all servers are started
+# with WORKERS=1, see server.jl):
 #
 #   cpu        `/cpu`: the handler computes, never yields. K in flight, closed loop.
 #   cpu_yield  `/cpu_yield`: the same, calling `yield()` every YIELD_MS. K in flight, closed loop.
@@ -18,6 +19,10 @@
 #              thread, and once the queue's buffer is full a submit is refused with 503. The
 #              `load_2xx` column is the share accepted. Each pass drains the queue (`/jobs`)
 #              before the next one starts.
+#   login         `/login`: one `check_password` against a pbkdf2_sha256 hash at the default cost
+#                 (#587), the computing handler every app has. K in flight, closed loop.
+#   login_bcrypt  `/login_bcrypt`: the same against a bcrypt hash at the default cost.
+#                 The Nitro servers get LOGIN=1 only when one of the two is requested.
 #
 # `base` (K = 0) is `/plaintext` alone. The `go` mode (socket/go/) runs `base` and `cpu` only: Go
 # preempts a computing goroutine, so it is the reference for what preemption buys, and it has no
@@ -26,6 +31,7 @@
 # Usage: bench/socket/stall.sh [modes] [rounds] [duration]
 #   bench/socket/stall.sh "nitro go" 3 6s
 #   KS="1 2 4 8 16" VARIANTS="cpu cpu_yield cpu_job" CPU_MS=200 bench/socket/stall.sh
+#   VARIANTS="login login_bcrypt" bench/socket/stall.sh "nitro go" 3 6s
 #
 # Results: one TSV per invocation under bench/results/ (gitignored).
 set -uo pipefail
@@ -61,8 +67,13 @@ for mode in "${MODE_LIST[@]}"; do
     *) echo "stall.sh: mode $mode: expected nitro or go" >&2; exit 1 ;;
   esac
 done
+LOGIN=0
 for v in "${VARIANT_LIST[@]}"; do
-  case "$v" in cpu|cpu_yield|cpu_job) ;; *) echo "stall.sh: unknown variant $v" >&2; exit 1 ;; esac
+  case "$v" in
+    cpu|cpu_yield|cpu_job) ;;
+    login|login_bcrypt) LOGIN=1 ;;
+    *) echo "stall.sh: unknown variant $v" >&2; exit 1 ;;
+  esac
 done
 if [ "$WANT_GO" = 1 ]; then
   command -v go >/dev/null || { echo "stall.sh: go not on PATH (needed by the go mode)" >&2; exit 1; }
@@ -124,7 +135,7 @@ for mode in "${MODE_LIST[@]}"; do
     GOMAXPROCS="$threads" PORT="$port" CPU_MS="$CPU_MS" taskset -c "$SERVER_CPUS" "$GO_BIN" >"$log" 2>&1 &
   else
     # `env`, because an assignment produced by an expansion is not an assignment to the shell.
-    env MODE=nitro PORT="$port" WORKERS=1 CPU_MS="$CPU_MS" YIELD_MS="$YIELD_MS" ${BURST_K:+"BURST_K=$BURST_K"} \
+    env MODE=nitro PORT="$port" WORKERS=1 LOGIN="$LOGIN" CPU_MS="$CPU_MS" YIELD_MS="$YIELD_MS" ${BURST_K:+"BURST_K=$BURST_K"} \
       taskset -c "$SERVER_CPUS" "${JULIA_CMD[@]}" --project="$ROOT/bench" --threads="$threads" \
       "$HERE/server.jl" >"$log" 2>&1 &
   fi
