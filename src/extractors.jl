@@ -6,13 +6,15 @@ using HTTP
 using Dates
 
 using ..Util: text, json, formdata, multipart, parseparam, parsebody, FormFile
-using ..Util.BodyParsers: NITRO_READ_STYLE, _parse_json_bounded, _body_view, is_json_media_type,
+using ..Util.BodyParsers: NITRO_READ_STYLE, NitroReadStyle, _parse_json_bounded, _body_view, is_json_media_type,
     is_multipart_form_media_type, is_form_media_type
 using ..Util: TypeMemo, memoized, reset!
 using ..Reflection: struct_builder, extract_struct_info, kw_construct, kw_constructible
-using ..Errors: ValidationError, UnsupportedMediaTypeError, is_unrecoverable
-# The Core stubs `getjson`/`getform` bind to (their bodies are in core/request.jl, included later).
-using ...Core: getjson, getform
+using ..Util: _check_denial_factory, _deny
+using ..Errors: ValidationError, UnsupportedMediaTypeError, AuthDenial, is_unrecoverable
+# The Core stubs `getjson`/`getform`/`getprincipal` bind to (their bodies are in core/request.jl,
+# included later).
+using ...Core: getjson, getform, getprincipal
 using ..Types
 using ..Cookies
 using ..Crypto: SecretString
@@ -22,7 +24,7 @@ using ..Crypto: SecretString
 using ..Types: Cookie
 
 export extract, validate, extracttype, isextractor, isreqparam, isbodyparam,
-    Path, Query, Header, Json, JsonFragment, Form, Body, Cookie, Session, Files, MultipartForm
+    Path, Query, Header, Json, JsonFragment, Form, Body, Cookie, Session, Files, MultipartForm, Claims
 
 """
 Given a classname, build a new Extractor class
@@ -76,6 +78,48 @@ end
 @extractor Files
 @extractor MultipartForm
 
+## Principal Extractors
+
+# The defaults of `Claims{T}`'s two denial factories (#515's contract): 401 when there is no token
+# principal, 403 when there is one whose claims do not bind. A module-level `const` response is
+# reuse-safe (nitro-core §4). The default `denied` is a sentinel as much as a factory: `extract`
+# recognizes it and builds its 403 per request instead, naming the claim that failed (see
+# `_claims_forbidden_response`).
+const CLAIMS_UNAUTHORIZED = HTTP.Response(401, "Unauthorized")
+_claims_unauthorized(::HTTP.Request, ::Symbol) = CLAIMS_UNAUTHORIZED
+_claims_forbidden(::HTTP.Request, ::Symbol) = HTTP.Response(403, "Forbidden")
+
+# Hand-written rather than `@extractor`: a `Claims` default also carries the two denial factories,
+# which `extract` reads off `param.default`. The bound value never needs them, so the
+# `(payload, validate)` constructor `extract` uses fills in the defaults without checking them;
+# every constructor that takes a factory checks it, so a wrong one fails when the route is declared.
+struct Claims{T} <: Extractor{T}
+    payload::Nullable{T}
+    validate::Union{Function, Nothing}
+    type::Type{T}
+    unauthorized::Function
+    denied::Function
+
+    Claims{T}(payload, validate::Union{Function, Nothing}) where {T} =
+        new{T}(payload, validate, T, _claims_unauthorized, _claims_forbidden)
+
+    function Claims{T}(payload, validate::Union{Function, Nothing}, unauthorized::Function,
+                       denied::Function) where {T}
+        _check_denial_factory(unauthorized, :unauthorized)
+        _check_denial_factory(denied, :denied)
+        return new{T}(payload, validate, T, unauthorized, denied)
+    end
+end
+
+Claims{T}(; unauthorized::Function = _claims_unauthorized, denied::Function = _claims_forbidden) where {T} =
+    Claims{T}(nothing, nothing, unauthorized, denied)
+Claims{T}(f::Function; unauthorized::Function = _claims_unauthorized, denied::Function = _claims_forbidden) where {T} =
+    Claims{T}(nothing, f, unauthorized, denied)
+Claims(::Type{T}; unauthorized::Function = _claims_unauthorized, denied::Function = _claims_forbidden) where {T} =
+    Claims{T}(nothing, nothing, unauthorized, denied)
+Claims(::Type{T}, f::Function; unauthorized::Function = _claims_unauthorized, denied::Function = _claims_forbidden) where {T} =
+    Claims{T}(nothing, f, unauthorized, denied)
+
 # Every extractor is a thin wrapper: declare a handler parameter of the wrapped type, and the
 # bound value arrives in `.payload`. They share one construction surface (from `@extractor`):
 # `X(T)`, `X{T}()`, `X(T, validator)` and `X{T}(validator)` build the parameter's *default*, which
@@ -124,6 +168,63 @@ header binds only a field spelled the same way, `var"x-api-key"`; `HTTP.header(r
 is usually simpler.
 """
 Header
+
+"""
+    Claims{T}
+
+Extractor that binds the **verified token claims** into a struct `T`: the claims of
+[`getprincipal`](@ref)`(req)`, the `Principal` that `jwt_validator` verified. It never reads
+`getuser`, so an object the application built is never bound as if it were verified claims,
+and with a `user_validator` the token's `Principal` at `req.context[:auth_claims]` is read, not
+whatever the app put at `:user` (#517). The one way an application's own object binds is
+`getprincipal`'s: a custom validator that returns a `Principal` itself, which is that validator
+vouching for it.
+
+```julia
+struct ApiClaims
+    sub::String
+    role::String
+    org_id::Int
+end
+
+report(req, claims::Claims{ApiClaims}) = Res.json(Dict("org" => claims.payload.org_id))  # an Int
+```
+
+The claims are not parsed again: the token was already decoded and validated, and `Claims{T}`
+converts that `Dict` with the binder [`Json`](@ref) uses. Fields match claims by name, a claim
+that is not a field is ignored, and the field's declared type is enforced: a `String` field does
+not take a number, an `Int` field a string, nor a `Vector` field a single value. With a `@kwdef` struct an absent claim takes the
+field's default, so optional claims are optional fields; an absent field with no default binds
+`nothing` if its type admits one. The registered claims (`exp`, `iat`, `nbf`, `iss`, `aud`) may be
+fields too. A `T` that would build a `Symbol` from a claim is refused when the route is declared
+(#306): a verified token still carries whatever strings its holder had signed, so claims are
+client-signed, not client-free.
+
+A request it cannot bind is refused before the handler runs, through the same denial contract
+as the auth middlewares and guards (#515):
+
+| Request | Default | `reason` |
+|---|---|---|
+| no token principal: unauthenticated, session-only, or a custom validator's identity that is not a `Principal` | `401` | `:missing_credentials`, to `unauthorized` |
+| a principal whose claims do not bind to `T` (a claim missing or of the wrong type), or fail `validate` | `403` | `:forbidden`, to `denied` |
+
+Not binding is a `403`, not a `401`: the token is authentic, so authentication succeeded, but
+it does not carry what this route requires. That is the guards' "authenticated but not
+authorized", and RFC 6750's `insufficient_scope`. A `401` would tell the client to sign in again,
+and the token it gets back has the same shape. The default `403` body names the claim, never its
+value: `Forbidden: claim 'org_id' is missing`, or `… is not of type Int64`. A failed validator is a
+`403` too, not the `400` other extractors answer, since the principal is not client input.
+
+Pass the app's own factories through the parameter's default, as in `BearerAuth` and the guards:
+
+```julia
+report(req, claims = Claims(ApiClaims; unauthorized = UNAUTHORIZED, denied = UNAUTHORIZED)) = ...
+```
+
+Each is a `(req, reason) -> HTTP.Response`, and is told only the reason. Which claim failed is
+logged at `@debug`; a factory of the app's own does not receive it.
+"""
+Claims
 
 """
     Json{T}
@@ -598,6 +699,128 @@ function extract(param::Param{Header{T}}, request::LazyRequest) :: Header{T}  wh
     valid_instance = try_validate(param, instance)
     return Header{T}(valid_instance, nothing)
 end
+
+"""
+Binds the verified token claims of `getprincipal(req)` into a custom struct (#527).
+"""
+function extract(param::Param{Claims{T}}, request::LazyRequest) :: Claims{T} where {T}
+    req = request.request
+    unauthorized, denied = claims_factories(param)
+    principal = getprincipal(req)
+    principal === nothing && throw(AuthDenial(_deny(unauthorized, req, :missing_credentials)))
+    claims = getfield(principal, :claims)
+    instance = try
+        claims_bind(T, claims)
+    catch e
+        is_unrecoverable(e) && rethrow()
+        # `e` is dropped on purpose: a `MethodError` from the conversion holds the claim's value,
+        # and claims carry identities, so nothing of it is kept or logged. The diagnosis is only a
+        # better message, so a failure inside it costs the message, never the 403.
+        why = try
+            claims_mismatch(T, claims)
+        catch d
+            is_unrecoverable(d) && rethrow()
+            "the claims do not bind to $T"
+        end
+        @debug "Claims{T} refused: the token's claims do not bind" parameter = param.name type = T why
+        throw(AuthDenial(_claims_forbidden_response(denied, req, why)))
+    end
+    valid_instance = try
+        try_validate(param, instance)
+    catch e
+        e isa ValidationError || rethrow()
+        @debug "Claims{T} refused: a validator rejected the claims" message = e.msg
+        throw(AuthDenial(_claims_forbidden_response(denied, req, "a validator rejected the claims")))
+    end
+    return Claims{T}(valid_instance, nothing)
+end
+
+# The factories the parameter's default declared, else the defaults. Folds to a constant for a
+# parameter with no default.
+function claims_factories(param::Param{Claims{T}}) where {T}
+    default = param.default
+    (param.hasdefault && default isa Claims{T}) || return (_claims_unauthorized, _claims_forbidden)
+    return (default.unauthorized, default.denied)
+end
+
+# The default `denied` names the claim that failed; an app's factory is told only the reason.
+function _claims_forbidden_response(denied::Function, req::HTTP.Request, why::String) :: HTTP.Response
+    denied === _claims_forbidden && return HTTP.Response(403, "Forbidden: " * why)
+    return _deny(denied, req, :forbidden)
+end
+
+"""
+    claims_bind(T, claims::Dict{String, Any}) :: T
+
+The verified claims converted to `T` with `json_bind`'s binder, which walks a `Dict` exactly as it
+walks a JSON body: StructUtils' `make` with Nitro's read style, through `KwdefBind{T}` for a
+`@kwdef` struct. There is no JSON parse and no re-serialization: the token was decoded and
+validated by `jwt_validator` already (#449 refused binding a JWT straight from its text). The call
+goes through `inferencebarrier` for the reason `json_bind`'s does (#508): only the branch a type
+takes is compiled.
+"""
+claims_bind(::Type{T}, claims::Dict{String, Any}) where {T} =
+    Base.inferencebarrier(claims_binder(T))(claims) :: T
+
+struct ClaimsBinder{P} end
+(::ClaimsBinder{P})(claims) where {P} = first(_SU.make(NITRO_READ_STYLE, P, claims))
+
+# A collection field takes only a collection. StructUtils walks whatever source it is handed, so a
+# scalar claim bound to an array, set or dict field made an EMPTY one -- `"aud" => "api"` bound
+# `aud::Vector{String}` as `String[]`, and a deny-list check on it admitted everything -- where
+# `Json{T}` refuses the same `{"aud":"api"}`. These are the scalars a decoded claim can be. A JSON
+# body never reaches this method: JSON.jl hands `make` its own lazy values, not Julia scalars.
+@noinline _throw_scalar_for_collection() = throw(ArgumentError("expected a JSON array or object"))
+_SU.make(::NitroReadStyle, ::Type{T}, ::Union{AbstractString, Number, Nothing}) where
+    {T <: Union{AbstractArray, AbstractSet, AbstractDict}} = _throw_scalar_for_collection()
+
+claims_binder(::Type{T}) where {T} = binds_by_keyword(T) ? ClaimsBinder{KwdefBind{T}}() : ClaimsBinder{T}()
+
+# Which claim made `claims_bind` fail, for the refusal: the first field whose claim does not bind
+# as the field's type, else the first required field with no claim. Runs on the refusal path only,
+# and names fields of `T` and their declared types, never a value. The error the bind raised is
+# no help: a conversion's `MethodError` names neither the field nor anything safe to repeat.
+function claims_mismatch(::Type{T}, claims::Dict{String, Any}) :: String where {T}
+    # Only a record's fields are claims. A `Tuple` or a collection has fields of its own that are
+    # not claim names, and a StructUtils-tagged field may bind a claim under another name.
+    generic = "the claims do not bind to $T"
+    (T isa DataType && isstructtype(T)) || return generic
+    T <: Union{Tuple, NamedTuple, AbstractArray, AbstractSet, AbstractDict} && return generic
+    isempty(_SU.fieldtags(_SU.DefaultStyle(), T)) || return generic
+    keyword = binds_by_keyword(T)
+    defaults = keyword ? (;) : _SU.fielddefaults(_SU.DefaultStyle(), T)
+    kwargs = Pair{Symbol, Any}[]
+    for name in fieldnames(T)
+        key = String(name)
+        FT = fieldtype(T, name)
+        if haskey(claims, key)
+            bound = try
+                claims_field_bind(FT, claims[key])
+            catch e
+                is_unrecoverable(e) && rethrow()
+                return "claim '$key' is not of type $(Base.nonnothingtype(FT))"
+            end
+            push!(kwargs, name => bound)
+        elseif Nothing <: FT || Missing <: FT
+            push!(kwargs, name => (Nothing <: FT ? nothing : missing))
+        elseif !keyword && !haskey(defaults, name)
+            return "claim '$key' is missing"
+        end
+    end
+    # A `@kwdef` struct knows its own defaults: whichever keyword it still needs had no claim.
+    if keyword
+        try
+            T(; kwargs...)
+        catch e
+            is_unrecoverable(e) && rethrow()
+            e isa UndefKeywordError && e.var in fieldnames(T) && return "claim '$(e.var)' is missing"
+        end
+    end
+    return "the claims do not bind to $T"
+end
+
+claims_field_bind(::Type{FT}, value) where {FT} =
+    first(_SU.make(NITRO_READ_STYLE, binds_by_keyword(FT) ? KwdefBind{FT} : FT, value))
 
 """
 Extracts a cookie from a request and converts it into a custom type.

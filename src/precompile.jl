@@ -194,6 +194,18 @@ end
         catch_errors=false,
     )
 
+    # `Claims{T}` (#527) binds the verified claims `Dict` with `Json{T}`'s binder, over a source
+    # type the JSON warm-up never reaches. The principal is put on the request by hand: a token
+    # would also warm `jwt_validator`, which is not what this block is for.
+    Core.Routing.urlpatterns(ctx, "", RouteDefinition[
+        path("/precompile/extract/claims", (req::Request, c::Claims{PrecompileRecord}) ->
+             Res.json(c.payload)),
+    ])
+    let claims_req = Request("GET", "/precompile/extract/claims")
+        claims_req.context[:auth_claims] = Principal(Dict{String, Any}("id" => 1, "name" => "p"))
+        Core.internalrequest(ctx, claims_req; catch_errors=false)
+    end
+
     # ── Typed JSON under Nitro's read style (#306) ──────────────────────────────────────
     #
     # Every typed parse of client JSON passes `NITRO_READ_STYLE` (it never interns a client

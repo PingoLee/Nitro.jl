@@ -1783,3 +1783,178 @@ urlpatterns(app2, "", path("/plain", plain))
 @test internalrequest(app2, HTTP.Request("GET", "/plain?n=4")).status == 200
 @test internalrequest(app2, HTTP.Request("GET", "/plain")).status == 400
 end
+
+@testitem "Claims{T} binds the verified token claims (#527)" tags=[:core, :auth, :security] setup=[NitroCommon] begin
+using Base: @kwdef
+using Test
+using HTTP
+using Nitro
+using Nitro: App, Claims, Param, LazyRequest, extract
+
+struct ApiClaims
+    sub::String
+    role::String
+    org_id::Int
+end
+@kwdef struct OptionalClaims
+    sub::String
+    role::String = "viewer"
+    org_id::Nullable{Int} = nothing
+    scopes::Vector{String} = String[]
+end
+
+secret = jwtkey("claims-secret")
+validator = Nitro.Auth.jwt_validator(secret)
+token(claims) = Nitro.Auth.encode_jwt(claims, secret; expires_in = 60)
+bearer(target, t) = HTTP.Request("GET", target, ["Authorization" => "Bearer $t"])
+
+full(req, c::Claims{ApiClaims}) = Res.json(Dict("sub" => c.payload.sub, "role" => c.payload.role, "org" => c.payload.org_id))
+optional(req, c::Claims{OptionalClaims}) =
+    Res.json(Dict("role" => c.payload.role, "org" => c.payload.org_id, "scopes" => c.payload.scopes))
+
+app = App(mod = @__MODULE__)
+urlpatterns(app, "",
+    path("/full", full; middleware = [BearerAuth(validator)]),
+    path("/optional", optional; middleware = [BearerAuth(validator)]),
+    path("/open", full),
+)
+call(target, t = nothing) = internalrequest(app, t === nothing ? HTTP.Request("GET", target) : bearer(target, t))
+
+@testset "a plain T binds every field; an unknown claim is ignored" begin
+    r = call("/full", token(Dict("sub" => "u1", "role" => "admin", "org_id" => 7, "plan" => "pro")))
+    @test r.status == 200
+    @test Nitro.json(r) == Dict("sub" => "u1", "role" => "admin", "org" => 7)
+end
+
+@testset "a @kwdef T takes its defaults for absent claims" begin
+    r = call("/optional", token(Dict("sub" => "u1")))
+    @test r.status == 200
+    @test Nitro.json(r) == Dict("role" => "viewer", "org" => nothing, "scopes" => Any[])
+    r = call("/optional", token(Dict("sub" => "u1", "role" => "admin", "org_id" => 3, "scopes" => ["a", "b"])))
+    @test Nitro.json(r) == Dict("role" => "admin", "org" => 3, "scopes" => ["a", "b"])
+end
+
+@testset "no token principal is a 401" begin
+    @test call("/open").status == 401
+    # Authenticated, but not by a token: a custom validator's own identity is no principal.
+    app2 = App(mod = @__MODULE__)
+    urlpatterns(app2, "", path("/x", full; middleware = [BearerAuth(t -> t == "k" ? "api-client" : nothing)]))
+    @test internalrequest(app2, bearer("/x", "k")).status == 401
+end
+
+@testset "claims that do not bind are a 403 naming the claim, never its value" begin
+    sentinel = "S3NT1NEL-value"
+    for (claims, field) in ((Dict("sub" => "u1", "role" => "admin"), "org_id"),
+                            (Dict("sub" => "u1", "role" => "admin", "org_id" => sentinel), "org_id"),
+                            (Dict("sub" => "u1", "role" => 42, "org_id" => 1), "role"))
+        logs, r = Test.collect_test_logs(; min_level = Base.CoreLogging.Debug) do
+            call("/full", token(claims))
+        end
+        body = Nitro.text(r)
+        @test r.status == 403
+        @test occursin("claim '$field'", body)
+        @test !occursin(sentinel, body)
+        @test !any(l -> occursin(sentinel, sprint(show, l.kwargs)) || occursin(sentinel, string(l.message)), logs)
+        @test any(l -> occursin("claim '$field'", sprint(show, l.kwargs)), logs)
+    end
+    # A @kwdef T: a required field with no default, and a mistyped optional one.
+    @test occursin("claim 'sub' is missing", Nitro.text(call("/optional", token(Dict("role" => "x")))))
+    r = call("/optional", token(Dict("sub" => "u1", "org_id" => sentinel)))
+    @test r.status == 403
+    @test occursin("claim 'org_id' is not of type Int64", Nitro.text(r))
+    # A single value is not a collection: StructUtils alone bound it as an EMPTY vector, so a
+    # deny-list check on the field admitted everything. `Json{T}` refuses the same shape.
+    for scalar in ("admin", 5, true)
+        r = call("/optional", token(Dict("sub" => "u1", "scopes" => scalar)))
+        @test r.status == 403
+        @test occursin("claim 'scopes' is not of type Vector{String}", Nitro.text(r))
+    end
+    @test_throws ArgumentError Nitro.Core.Extractors.json_bind(OptionalClaims, """{"sub":"u1","scopes":"admin"}""")
+    # The diagnosis is only a message: a `T` whose fields are not claim names gets the generic one.
+    @test Nitro.Core.Extractors.claims_mismatch(Tuple{String, Int}, Dict{String,Any}("1" => 2)) ==
+        "the claims do not bind to Tuple{String, Int64}"
+end
+
+@testset "the app's factories decide the response" begin
+    seen = Symbol[]
+    deny(status) = (req, reason) -> (push!(seen, reason); Res.json(Dict("error" => "no"); status))
+    custom(req, c = Claims(ApiClaims; unauthorized = deny(401), denied = deny(401))) = c.payload.role
+    app3 = App(mod = @__MODULE__)
+    urlpatterns(app3, "",
+        path("/open", custom),
+        path("/auth", custom; middleware = [BearerAuth(validator)]),
+        path("/broken", (req, c = Claims(ApiClaims; denied = (req, reason) -> nothing)) -> "x";
+             middleware = [BearerAuth(validator)]),
+    )
+    r = internalrequest(app3, HTTP.Request("GET", "/open"))
+    @test r.status == 401 && Nitro.json(r) == Dict("error" => "no")
+    r = internalrequest(app3, bearer("/auth", token(Dict("sub" => "u1"))))
+    @test r.status == 401 && Nitro.json(r) == Dict("error" => "no")
+    @test seen == [:missing_credentials, :forbidden]
+    # A factory that answers no response fails closed: a 500, never an admission.
+    @test internalrequest(app3, bearer("/broken", token(Dict("sub" => "u1")))).status == 500
+end
+
+@testset "a validator that rejects the claims is a 403, not a 400" begin
+    Nitro.validate(c::OptionalClaims) = c.role != "banned"
+    gated(req, c = Claims(OptionalClaims, c -> c.org_id !== nothing)) = "ok"
+    app4 = App(mod = @__MODULE__)
+    urlpatterns(app4, "", path("/gated", gated; middleware = [BearerAuth(validator)]))
+    @test internalrequest(app4, bearer("/gated", token(Dict("sub" => "u1", "org_id" => 1)))).status == 200
+    @test internalrequest(app4, bearer("/gated", token(Dict("sub" => "u1")))).status == 403
+    @test internalrequest(app4, bearer("/gated", token(Dict("sub" => "u1", "org_id" => 1, "role" => "banned")))).status == 403
+end
+
+@testset "an app-built Principal at :user is not bound (#517)" begin
+    # The user_validator "enriches" the token into a Principal of its own, with claims the token
+    # never carried. getprincipal reads the verified one at :auth_claims first, and so does Claims.
+    enrich = p -> Principal(Dict{String,Any}("sub" => "u1", "role" => "admin", "org_id" => 99); id = p.id)
+    app5 = App(mod = @__MODULE__)
+    urlpatterns(app5, "", path("/full", full;
+        middleware = [BearerAuth(Nitro.Auth.jwt_validator(secret; user_validator = enrich))]))
+    r = internalrequest(app5, bearer("/full", token(Dict("sub" => "u1", "role" => "viewer", "org_id" => 7))))
+    @test r.status == 200
+    @test Nitro.json(r) == Dict("sub" => "u1", "role" => "viewer", "org" => 7)
+end
+
+@testset "a custom validator's own Principal binds, as getprincipal reports it" begin
+    # No token: the validator vouches for the Principal it returns, and `getprincipal` -- so
+    # `Claims` -- takes it. A non-Principal identity from the same validator is a 401 (above).
+    app6 = App(mod = @__MODULE__)
+    urlpatterns(app6, "", path("/full", full; middleware = [BearerAuth(t -> t == "k" ?
+        Principal(Dict{String,Any}("sub" => "svc", "role" => "importer", "org_id" => 3); id = "svc") : nothing)]))
+    r = internalrequest(app6, bearer("/full", "k"))
+    @test r.status == 200
+    @test Nitro.json(r) == Dict("sub" => "svc", "role" => "importer", "org" => 3)
+end
+
+@testset "registration refuses what cannot be bound safely" begin
+    struct SymbolClaims
+        sub::Symbol
+    end
+    err = try
+        urlpatterns(App(mod = @__MODULE__), "", path("/s", (req, c::Claims{SymbolClaims}) -> "x"))
+        nothing
+    catch e
+        e
+    end
+    @test err isa ArgumentError
+    @test occursin("#306", err.msg)
+    # A one-argument factory is refused where it is built, as on the middlewares and guards.
+    @test_throws ArgumentError Claims(ApiClaims; denied = req -> HTTP.Response(403))
+    @test_throws ArgumentError Claims(ApiClaims; unauthorized = req -> HTTP.Response(401))
+end
+
+@testset "the bound argument is type-stable" begin
+    req = HTTP.Request("GET", "/")
+    req.context[:auth_claims] = Principal(Dict{String,Any}("sub" => "u1", "role" => "admin", "org_id" => 7))
+    lr = LazyRequest(request = req)
+    bound = @inferred extract(Param(:c, Claims{ApiClaims}, nothing, false), lr)
+    @test bound isa Claims{ApiClaims}
+    @test @inferred((c -> c.payload.role)(bound)) == "admin"
+    @test @inferred((c -> c.payload.org_id)(bound)) === 7
+    kw = @inferred extract(Param(:c, Claims{OptionalClaims}, nothing, false), lr)
+    # The field is declared `Nullable{Int}`, so that union is the type, not an inference failure.
+    @test @inferred(Nullable{Int}, (c -> c.payload.org_id)(kw)) === 7
+end
+end

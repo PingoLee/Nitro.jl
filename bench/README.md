@@ -19,6 +19,7 @@ bench/
 │   ├── json.jl         # JSON echo (small + 10 KB)
 │   ├── session.jl      # MemoryStore read/write (payload-size scaling)
 │   ├── ratelimiter.jl  # limiter hot path: keying, lock contention, exempt-path scan
+│   ├── claims.jl       # a Claims{T} bind against two untyped getprincipal reads (#527)
 │   ├── taskpattern.jl  # SYNTHETIC replica of parallel_stream_handler's task overhead
 │   ├── httpparse.jl    # HTTP.jl's request-head parse on the connection task
 │   ├── holds.jl        # how long one large JSON / multipart / file call holds its thread (#588)

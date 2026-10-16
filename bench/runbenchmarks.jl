@@ -22,7 +22,7 @@ include(joinpath(BENCH_DIR, "setup.jl"))
 # One group per file, named after it. A group left out is not even included: `holds.jl` builds
 # 10 MB payloads and a 100 MiB file at include time, and `httpparse.jl` opens a socket.
 const GROUP_FILES = ["routing", "params", "query", "json", "session", "ratelimiter", "taskpattern",
-                     "httpparse", "holds", "passwords"]
+                     "httpparse", "claims", "holds", "passwords"]
 const GROUPS = let wanted = split(get(ENV, "NITRO_BENCH_GROUPS", ""))
     unknown = setdiff(wanted, GROUP_FILES)
     isempty(unknown) || error("NITRO_BENCH_GROUPS: unknown group(s) $(join(unknown, ", ")); known: $(join(GROUP_FILES, ", "))")

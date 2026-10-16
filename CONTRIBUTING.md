@@ -212,14 +212,14 @@ they **shadow** the same-named functions `using .Core` brings in. An `(app, …)
 | `src/routerhof.jl` | Higher-order router internals (`HOFRouter`) — plumbing, not public API |
 | `src/context.jl` | `AppContext` module — the public **`App`** handle and its secret-safe `show`, plus `Service`, app-context storage, extension slots, lifecycle services |
 | `src/methods.jl` | The `(app::App, …)` public surface **and** the argument-less conveniences bound to the global `CONTEXT[]`. Both live here because definitions in `Nitro` shadow `Core`'s |
-| `src/types.jl`, `src/constants.jl`, `src/errors.jl` | Shared vocabulary: `Nullable`, `Principal`, HTTP method constants, `ValidationError`/`CookieError`/`AuthorizationError` |
+| `src/types.jl`, `src/constants.jl`, `src/errors.jl` | Shared vocabulary: `Nullable`, `Principal`, HTTP method constants, `ValidationError`/`CookieError`/`AuthorizationError`, and the internal `AuthDenial` an extractor throws to serve a denial factory's response (#527) |
 | `src/environment.jl` | `Environment` module — `current_env()`, the `NITRO_ENV`/`GENIE_ENV` precedence and its closed value set. Reports the environment; deliberately gates nothing (#55) |
 | `src/response.jl` | The `Res` module — the response builders handlers use: `json`, `html`, `send`, `status`, `file`, `redirect` |
 | `src/utilities/typememo.jl` | `TypeMemo` — the lock-free per-type `Bool` memo keyed on the world counter, behind the per-request type checks in `BodyParsers`, `Reflection` and `Extractors`. In `Util`, below all three, so each can import it (#498) |
 | `src/utilities/bodyparsers.jl` | Request body parsing: `text`, `json`, `binary`, `formdata`, `multipart`, `FormFile` |
 | `src/utilities/misc.jl` | `parseparam`, `format_response`, `response` (content-sniffing builder used by the templating extensions — a markup sink), `add_response_headers`, `own_response_headers`, request plumbing |
 | `src/utilities/fileutil.jl` | `readfile`, `mountable_files`, `mountfolder` — static-mount helpers; `mountable_files` owns which files a mount will expose (dotfiles, symlink confinement, route-pattern names) |
-| `src/extractors.jl` | Typed extractors: `Path`, `Query`, `Header`, `Json`, `JsonFragment`, `Form`, `Body`, `Cookie`, `Session`, `Files`, `MultipartForm` |
+| `src/extractors.jl` | Typed extractors: `Path`, `Query`, `Header`, `Json`, `JsonFragment`, `Form`, `Body`, `Cookie`, `Session`, `Files`, `MultipartForm`, and `Claims` (the verified token claims, #527) |
 | `src/reflection.jl` | `struct_builder`, `splitdef`, `extract_struct_info` — the machinery extractors bind through |
 | `src/handlers.jl` | Handler dispatch — `select_handler`, first-argument typing |
 | `src/middleware.jl`, `src/middleware/` | Middleware: `ExtractIP`, `WebSocketOrigins`, `RateLimiter`, auth (`BearerAuth`/`CookieAuthMiddleware`), `Cors`, `SecurityHeaders`, `CSRFMiddleware`, `CrossOriginProtection` (tokenless Fetch-Metadata CSRF, #437), `SessionMiddleware`, `GuardMiddleware` + guards, `AccessLog` |
