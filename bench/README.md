@@ -229,16 +229,21 @@ unless shown, 2026-10-15:
 | Nitro (`--threads=8`, i.e. `8,1`) | 101k | 2.0 ms | 507 → 530 MiB |
 | bare HTTP.jl, no spawn | 53k | 2.0 ms | 481 → 483 MiB |
 
-| Task primitive, 8 threads (1 thread) | Go | Julia 1.12 |
-|---|--:|--:|
-| spawn + wait, one at a time | 0.34 µs (0.32), 144 B | 3.9 µs (1.0), 320 B |
-| ping-pong round trip | 0.25 µs (0.25) | 9.2 µs (4.7) |
-| fan-out of 1000, per task | 0.18 µs (0.22) | 0.42 µs (0.22) |
-| 100,000 parked: create, per task | 1.6 µs | 5.7 µs |
-| 100,000 parked: resident memory, per task | 2.7 KiB | 2.9 KiB |
-| heartbeat lateness while every thread spins 1.5 s (max) | 20 ms | 1.5 s |
-| … Go with `asyncpreemptoff=1` / Julia heartbeat on `:interactive` | 1.2 s | 3 ms |
-| … Julia spinners calling `yield()` every 1 ms | — | 3 ms |
+| Task primitive, 8 threads (1 thread) | Go | Julia 1.12 | Julia 1.13.2 |
+|---|--:|--:|--:|
+| spawn + wait, one at a time | 0.34 µs (0.32), 144 B | 3.9 µs (1.0), 320 B | 1.35–1.42 µs (1.1), 320 B |
+| ping-pong round trip | 0.25 µs (0.25) | 9.2 µs (4.7) | 8.2–8.7 µs (4.6) |
+| fan-out of 1000, per task | 0.18 µs (0.22) | 0.42 µs (0.22) | 0.41–0.46 µs (0.21) |
+| 100,000 parked: create, per task | 1.6 µs | 5.7 µs | 5.1–5.4 µs |
+| 100,000 parked: resident memory, per task | 2.7 KiB | 2.9 KiB | 2.95 KiB |
+| heartbeat lateness while every thread spins 1.5 s (max) | 20 ms | 1.5 s | 1.25–1.48 s |
+| … Go with `asyncpreemptoff=1` / Julia heartbeat on `:interactive` | 1.2 s | 3 ms | 2.3–4.9 ms |
+| … Julia spinners calling `yield()` every 1 ms | — | 3 ms | **1.4–2.2 s** (#586) |
+
+The Julia 1.13.2 column is a second pass on the same box, 2026-10-16: each 8-thread cell is the
+range over four `run.sh` runs, in which Go stayed within 0.5%. Its 1-thread figures are the
+minimum of two rounds of the `micro` command below, interleaved with 1.12, whose own figures
+repeated the column beside it.
 
 What the second table says:
 
@@ -257,6 +262,12 @@ What the second table says:
   periodic `yield()` are Julia's two ways out (#467). Their 3 ms is mostly the timer, not the
   scheduler: Julia's `sleep` rounds a timer up to the next millisecond and adds one (libuv fires
   early), so the heartbeat wakes about 1 ms late with nothing in its way.
+- **1.13.2 makes waking another thread cheaper, and breaks one of those ways out.** Spawn + wait
+  at eight threads is 2.4× cheaper than on 1.12 in every run (still 4× Go), while the 1-thread
+  figures do not move, so the gain is in the cross-thread wake. But spinners that call `yield()`
+  every 1 ms no longer let a timer-woken task run: the heartbeat is about as late as with no
+  yield at all. A 30-line repro without Nitro shows the same thing on 1.13.1 and 1.13.2, and not on 1.12.7
+  or master. It is tracked in #586; the `:interactive` row is unaffected.
 
 ## juliac (compiled executable)
 
