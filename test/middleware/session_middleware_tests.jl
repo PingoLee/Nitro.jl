@@ -1143,9 +1143,17 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
         @test Base.get(plain_store, sid, nothing).data == Dict{String,Any}("user_id" => 42)
     end
 
-    @testset "a hook returning a non-String is a TypeError (#391)" begin
+    @testset "a hook returning a non-String is a value-free fault (#391, #602)" begin
+        # It was a `TypeError`, which carried the returned value; the fault names only the hook.
         store, versions, calls, mw = auth_hash_fixture(hook = uid -> 1)
-        @test_throws TypeError send_as(mw, sign_in(42), nothing)
+        err = try
+            send_as(mw, sign_in(42), nothing)
+            nothing
+        catch e
+            e
+        end
+        @test err isa Nitro.Errors.ValidatorFault
+        @test occursin("`session_auth_hash`", sprint(showerror, err))
     end
 
     @testset "store is required — no shared process-global (#171)" begin
@@ -1515,6 +1523,130 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
         @test store.writes == Dict(:set => 1, :update => 1)
     end
 
+end
+
+end
+
+@testitem "a session callback that throws never logs what it was handed (#602)" tags=[:middleware, :security] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+using Nitro: App, SessionMiddleware
+using Nitro.Core.Types: MemoryStore
+using Nitro.Core.Cookies: storesession!
+
+# One sentinel in the session data, one as the session id: a `MethodError` from a buggy callback
+# renders whichever of the two it was handed, and the session id is a bearer credential.
+sentinel = "S3NT1NEL-data"
+sid_sentinel = "S3NT1NEL-sid"
+
+app = App(mod = @__MODULE__)
+urlpatterns(app, "",
+    path("/read", req -> "ok"),
+    path("/who", req -> (getsession(req)["who"] = sentinel; "ok")),
+    path("/signin", req -> (getsession(req)["user_id"] = sentinel; "ok")),
+)
+
+# A store holding one session, under `sid`.
+function seeded(sid, data)
+    store = MemoryStore{String, Dict{String,Any}}()
+    storesession!(store, sid, Dict{String,Any}(data); ttl = 3600)
+    return store
+end
+mw(store; kw...) = [SessionMiddleware(; cookie_name = "sid", secure = false, store, kw...)]
+get_(target, sid) = HTTP.Request("GET", target, sid === nothing ? Pair{String,String}[] : ["Cookie" => "sid=$sid"])
+
+# Everything a log sink could render: the message, every kwarg as `show` prints it, and an
+# `exception=(e, bt)` kwarg the way ConsoleLogger prints it.
+function rendered(l)
+    out = string(l.message, sprint(show, l.kwargs))
+    ex = get(l.kwargs, :exception, nothing)
+    ex isa Tuple && (out *= sprint(showerror, ex[1], ex[2]))
+    return out
+end
+
+# (label, middleware, request, the hook the fault must name)
+cases = (
+    ("validator(sid, data) on the session data, on the way in",
+     mw(seeded("plain", "who" => sentinel); validator = (sid, data) -> get(data, "who", "") > 3),
+     get_("/read", "plain"), "`validator`"),
+    ("validator(sid, data) on the session id, on the way in",
+     mw(MemoryStore{String, Dict{String,Any}}(); validator = (sid, data) -> sid > 3),
+     get_("/read", sid_sentinel), "`validator`"),
+    ("validator(sid) on the session id",
+     mw(MemoryStore{String, Dict{String,Any}}(); validator = sid -> sid > 3),
+     get_("/read", sid_sentinel), "`validator`"),
+    # Passes on the way in (no "who" yet), throws on the rotate_on_auth comparison after the handler.
+    ("validator after the handler, on a loaded session (rotate_on_auth)",
+     mw(seeded(sid_sentinel, "cart" => 1);
+        validator = (sid, data) -> haskey(data, "who") ? data["who"] > 3 : nothing),
+     get_("/who", sid_sentinel), "`validator`"),
+    ("validator after the handler, on a new session",
+     mw(MemoryStore{String, Dict{String,Any}}();
+        validator = (sid, data) -> haskey(data, "who") ? data["who"] > 3 : nothing),
+     get_("/who", nothing), "`validator`"),
+    ("session_auth_hash on a loaded identity, on the way in",
+     mw(seeded(sid_sentinel, "user_id" => sentinel); session_auth_hash = uid -> uid > 3),
+     get_("/read", sid_sentinel), "`session_auth_hash`"),
+    ("session_auth_hash at sign-in, after the handler",
+     mw(seeded(sid_sentinel, "cart" => 1); session_auth_hash = uid -> uid > 3),
+     get_("/signin", sid_sentinel), "`session_auth_hash`"),
+    # Not a string: the result assert's `TypeError` carried the returned value.
+    ("session_auth_hash returning a non-string",
+     mw(seeded(sid_sentinel, "user_id" => sentinel); session_auth_hash = uid -> Symbol(uid)),
+     get_("/read", sid_sentinel), "`session_auth_hash`"),
+)
+
+@testset "$label: a 500 with the fixed body, the value in no log record" for (label, m, req, hook) in cases
+    logs, r = Test.collect_test_logs(; min_level = Base.CoreLogging.Debug) do
+        internalrequest(app, req; middleware = m)
+    end
+    @test r.status == 500
+    @test Nitro.json(r) == Dict("message" => "500: Internal Server Error")
+    @test !occursin(sentinel, Nitro.text(r))
+    @test !occursin(sid_sentinel, Nitro.text(r))
+    @test !any(l -> occursin(sentinel, rendered(l)) || occursin(sid_sentinel, rendered(l)), logs)
+    # Still a server bug, logged at @error -- as a fault naming the hook.
+    errors = [rendered(l) for l in logs if l.level >= Base.CoreLogging.Error]
+    @test length(errors) == 1
+    @test occursin("Validator Fault", only(errors))
+    @test occursin(hook, only(errors))
+end
+
+@testset "$label: the original is not left on the exception stack" for (label, m, req) in (
+        ("validator", mw(MemoryStore{String, Dict{String,Any}}(); validator = (sid, data) -> sid > 3),
+         get_("/read", sid_sentinel)),
+        ("session_auth_hash", mw(seeded(sid_sentinel, "user_id" => sentinel); session_auth_hash = uid -> uid > 3),
+         get_("/read", sid_sentinel)))
+    # With no serializer the fault reaches the caller, which sees every exception still live.
+    stack = try
+        internalrequest(app, req; middleware = m, serialize = false)
+        nothing
+    catch
+        current_exceptions()
+    end
+    @test stack !== nothing
+    @test all(s -> s.exception isa Nitro.Errors.ValidatorFault, stack)
+    @test !any(s -> occursin(sentinel, sprint(show, s.exception)) ||
+                    occursin(sid_sentinel, sprint(show, s.exception)), stack)
+end
+
+@testset "an interrupt from a session callback still propagates" begin
+    @test_throws InterruptException internalrequest(app, get_("/read", sid_sentinel);
+        middleware = mw(MemoryStore{String, Dict{String,Any}}(); validator = sid -> throw(InterruptException())))
+    @test_throws InterruptException internalrequest(app, get_("/read", sid_sentinel);
+        middleware = mw(seeded(sid_sentinel, "user_id" => 1); session_auth_hash = uid -> throw(InterruptException())))
+end
+
+@testset "healthy hooks still answer: a sign-in is stamped and rotated" begin
+    store = seeded(sid_sentinel, "cart" => 1)
+    r = internalrequest(app, get_("/signin", sid_sentinel);
+        middleware = mw(store; validator = (sid, data) -> get(data, "who", nothing),
+                        session_auth_hash = uid -> first(split("v1 extra"))))
+    @test r.status == 200
+    new_sid = match(r"sid=([^;]+)", HTTP.header(r, "Set-Cookie")).captures[1]
+    @test new_sid != sid_sentinel                       # rotate_on_auth moved it
+    @test Base.get(store, new_sid, nothing).data["_nitro_auth_hash"] === "v1"
 end
 
 end

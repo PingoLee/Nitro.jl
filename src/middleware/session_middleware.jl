@@ -6,13 +6,13 @@ using JSON
 using UUIDs
 using ...Types: AbstractSessionStore, MemoryStore, SessionPayload, Nullable, is_expired,
     update_session!, delete_session!, session_store_full, SESSION_AUTH_HASH_KEY,
-    _session_auth_hash_current
+    _session_auth_hash_current, _session_auth_hash_of
 using ...Types: CookieConfig, LifecycleMiddleware
 using ..JanitorMiddleware: _janitor
 using ...Cookies: get_cookie, set_cookie!, storesession!, prunesessions!, regenerate_session!,
     _validate_cookie_prefix
 using ...Crypto: secure_uuid4
-using ...Errors: is_unrecoverable
+using ...Errors: ValidatorFault, is_unrecoverable
 using ...Core: own_response_headers
 using ...Util: _mark_private!
 
@@ -261,7 +261,8 @@ How that identity is resolved, in order:
   resolver**, consulted *only* when `auth_key` is absent from the session (and a session ID
   exists). It is arity-dispatched — called as `validator(session_id, session_data)` if that
   method exists, else `validator(session_id)` — and its return value is the identity marker
-  used for change detection.
+  used for change detection. An exception it throws fails the request with a 500, logged as a
+  fault that names `validator` and never its arguments: those are the session id and data.
 
 The `validator` participates in fixation detection **only**; it never populates
 `getuser(req)`. Authenticating a request (attaching a principal) is the job of `BearerAuth` /
@@ -302,8 +303,10 @@ rotation cannot pick up the new one.
   identity is cleared.
 - Anonymous sessions never call the hook. An authenticated one calls it once per request, so keep it
   cheap, for example a cached column read.
-- Requests run concurrently, so the hook must be thread-safe. An exception it throws is not caught
-  and the request fails with a 500. That fails closed: a session is never accepted without a check.
+- Requests run concurrently, so the hook must be thread-safe. An exception it throws, or a result
+  that is neither a string nor `nothing`, fails the request with a 500. That fails closed: a
+  session is never accepted without a check. The 500 is logged as a fault that names the hook and
+  never the identity it was handed.
 - A `validator` identity must come from the session data it is passed, not from reading the store
   by id. The stamp is taken before the request's writes reach the store, so a store-reading
   validator does not see a login and leaves it unstamped, and the next request then refuses it.
@@ -753,11 +756,11 @@ function _stamp_auth_hash!(session::Dict{String,Any}, session_id::String, origin
     if marker === nothing
         delete!(session, SESSION_AUTH_HASH_KEY)
     elseif rehash || _auth_marker_changed(original_marker, marker)
-        stamp = hook(marker)::Nullable{AbstractString}
-        # Stored as a plain `String`, whatever string type the hook returned, so every store
-        # (PormG's JSON column included) holds the same thing.
+        # A plain `String`, whatever string type the hook returned, so every store (PormG's JSON
+        # column included) holds the same thing.
+        stamp = _session_auth_hash_of(hook, marker)
         stamp === nothing ? delete!(session, SESSION_AUTH_HASH_KEY) :
-                            (session[SESSION_AUTH_HASH_KEY] = String(stamp))
+                            (session[SESSION_AUTH_HASH_KEY] = stamp)
     end
     return nothing
 end
@@ -822,15 +825,30 @@ function _auth_marker(session_data::Dict{String,Any}, session_id::Nullable{Strin
         return auth_marker
     end
 
-    if applicable(validator, session_id, session_data)
-        return validator(session_id, session_data)
-    end
+    marker = _validator_marker(validator, session_id, session_data)
+    marker isa _Faulted && throw(ValidatorFault("SessionMiddleware's `validator` threw"))
+    return marker
+end
 
-    if applicable(validator, session_id)
-        return validator(session_id)
-    end
+# What `_validator_marker` returns when the validator threw. A sentinel of its own, because
+# `nothing` is a real answer: an anonymous session.
+struct _Faulted end
 
-    return nothing
+# The app's `validator`, arity-dispatched. It is application code handed the session id -- a bearer
+# credential -- and the session data, and its most likely accidental throw, a `MethodError`, renders
+# its arguments; reaching the error boundary's `@error`, that wrote either to the log (#602). So the
+# exception is dropped here and `_auth_marker` raises a value-free `ValidatorFault` after this
+# returns, never from inside the `catch`, which would leave the original on the task's exception
+# stack (#595). Its result is not checked: any value is an identity.
+function _validator_marker(validator::Function, session_id::String, session_data::Dict{String,Any})
+    try
+        applicable(validator, session_id, session_data) && return validator(session_id, session_data)
+        applicable(validator, session_id) && return validator(session_id)
+        return nothing
+    catch e
+        is_unrecoverable(e) && rethrow()
+        return _Faulted()
+    end
 end
 
 function _auth_marker_for_key(session_data::Dict{String,Any}, auth_key::String)

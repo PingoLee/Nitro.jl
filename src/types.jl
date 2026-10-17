@@ -11,7 +11,8 @@ using Base: @kwdef
 using DataStructures: CircularDeque
 using LRUCache: LRU
 using ..Util
-using ..Errors: ValidationError, StoreInterfaceError, implements_contract_method, store_contract_error
+using ..Errors: ValidationError, StoreInterfaceError, ValidatorFault, implements_contract_method,
+    store_contract_error, is_unrecoverable
 using ..Crypto: SecretString, _cookie_secret
 
 export Server, Nullable, Context,
@@ -206,13 +207,38 @@ const SESSION_AUTH_HASH_KEY = "_nitro_auth_hash"
 # nothing vouches for it. Plain `==`: both sides are server-side values the client never sees
 # or supplies, so there is no timing oracle to close.
 function _session_auth_hash_current(data::AbstractDict, marker, hook::Function)::Bool
-    # Asserted: the hook is application code, so its result is checked here rather than carried
-    # as `Any` into the request path. Any string will do -- a `SubString` from `split` included --
-    # but a hook returning a number is a `TypeError`.
-    expected = hook(marker)::Nullable{AbstractString}
+    expected = _session_auth_hash_of(hook, marker)
     expected === nothing && return false
     stored = get(data, SESSION_AUTH_HASH_KEY, nothing)
     return stored isa AbstractString && stored == expected
+end
+
+# The app's `session_auth_hash` value for `marker`, as a plain `String` (#391), or `nothing` when
+# the user is gone. Any string will do -- a `SubString` from `split` included. The hook is
+# application code handed the session's identity, which is session data, and its most likely
+# accidental throw, a `MethodError`, renders its arguments; so did the `TypeError` of the result
+# assert this replaced, which held the returned value. Either reached the error boundary's `@error`
+# (#602), so a throw or a result that is neither a string nor `nothing` becomes a value-free
+# `ValidatorFault` -- still a 500, so a session is never accepted unchecked. The fault is raised
+# here, after `_call_auth_hash_hook` returns, never from inside its `catch`: that would leave the
+# original on the task's exception stack (#595).
+function _session_auth_hash_of(hook::Function, marker)::Nullable{String}
+    ok, value = _call_auth_hash_hook(hook, marker)
+    ok || throw(ValidatorFault(
+        "the `session_auth_hash` hook threw or returned something other than a string or `nothing`"))
+    return value
+end
+
+function _call_auth_hash_hook(hook::Function, marker)::Tuple{Bool, Nullable{String}}
+    try
+        value = hook(marker)
+        value === nothing && return (true, nothing)
+        value isa AbstractString || return (false, nothing)
+        return (true, String(value))
+    catch e
+        is_unrecoverable(e) && rethrow()
+        return (false, nothing)
+    end
 end
 
 # Required-method fallbacks. `Base.get` is not piracy: the store argument is our own type.

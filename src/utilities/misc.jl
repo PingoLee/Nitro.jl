@@ -113,8 +113,10 @@ function handlerequest(getresponse::Function, catch_errors::Bool; show_errors::B
                 # extractor's validator is handed the bound value, and `try_validate`
                 # (src/extractors.jl) replaces anything it throws but a `ValidationError` with a
                 # value-free `ValidatorFault`, raised outside the `catch` so the original is not
-                # left on the exception stack either (#595). Never "improve" this line by logging
-                # `current_exceptions()`, or a cause chain.
+                # left on the exception stack either (#595). `SessionMiddleware` does the same for
+                # its `validator` and `session_auth_hash` hooks, which are handed the session id and
+                # data (#602). Never "improve" this line by logging `current_exceptions()`, or a
+                # cause chain.
                 @error "ERROR: " exception=(error, catch_backtrace())
             end
             return handle_error(error)
