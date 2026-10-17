@@ -182,7 +182,9 @@ bench/socket/wake.sh 3                               # does a parked handler wak
   `VARIANTS` runs the same work as `cpu` (in the handler), `cpu_yield` and `cpu_job` (a Workers
   queue, offered at the rate that would keep K busy and drained between passes); the `load_2xx`
   column is the share of those submissions the queue accepted. `login` and `login_bcrypt` keep K
-  password checks in flight instead, and start the servers with `LOGIN=1`. Modes are `nitro`,
+  password checks in flight instead, and start the servers with `LOGIN=1`; Nitro bounds those
+  checks itself since #587, and `PASSWORD_CONCURRENCY=0` in the environment turns the bound off
+  for an A/B. Modes are `nitro`,
   `nitro@N,M` and `go`, which runs `cpu` only. The latest table is in the deployment guide's *Handlers that
   compute*.
 - `wake.sh [rounds]` asks whether a handler parked on a `Timer` wakes while every default thread

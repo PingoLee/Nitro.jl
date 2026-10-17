@@ -204,7 +204,7 @@ end
 # the 32-byte result, and the output is byte-identical (the test suite holds it to SHA.jl).
 #
 # No `gc_safe`, unlike `_pbkdf2_hmac_sha256` below: one HMAC over a token takes a couple of
-# microseconds (mostly the digest lookup `HMAC` repeats per call), not the ~0.2 s that makes
+# microseconds (mostly the digest lookup `HMAC` repeats per call), not the ~0.1 s that makes
 # PBKDF2 worth a GC-safe transition. It is thread-safe: `HMAC` keeps
 # no state between calls and `EVP_sha256()` returns a static table. An empty key is passed as a
 # real (non-NULL) pointer of length 0, which libcrypto treats as the empty key, exactly as
@@ -236,10 +236,12 @@ _hmac_sha256(key::AbstractString, message::AbstractString) = _hmac_sha256(String
 # libcrypto keys the HMAC once per derivation, and the output is byte-identical, so every
 # stored hash still verifies.
 #
-# `gc_safe = true` is load-bearing: at the default cost this call runs for ~0.2 s, and a
+# `gc_safe = true` is load-bearing: at the default cost this call runs for ~0.1 s (#587), and a
 # ccall that is not GC-safe makes every other request thread wait for it at the next
 # stop-the-world collection. It is sound here because libcrypto touches only the buffers
-# passed in, which the ccall keeps rooted and Julia's non-moving GC never relocates.
+# passed in, which the ccall keeps rooted and Julia's non-moving GC never relocates. GC-safe is
+# not the same as giving the thread back: the call still holds its thread for the whole hash,
+# which is why `make_password`/`check_password` bound how many run at once (#587).
 #
 # The caller owns the policy bounds (`Auth`'s `MAX_*` constants); this only refuses what
 # the C signature cannot represent.

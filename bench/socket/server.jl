@@ -43,6 +43,8 @@
 #                       password with `Nitro.Auth.check_password` against a hash minted at startup at
 #                       the default cost (pbkdf2_sha256, and bcrypt) and answer a fixed `ok` (#587):
 #                       the computing handler every app has, for `stall.sh`'s `login` variants.
+#                       PASSWORD_CONCURRENCY=<n> passes `n` to `set_password_concurrency!` (#587;
+#                       `0` is unbounded); unset keeps Nitro's default.
 #   PARK=timer|event    What the main task parks on once serving: a never-firing `Timer` (the
 #                       default) or a `Base.Event`, which is not a libuv handle (#598, `wake.sh`).
 #   GUARD=0|1           Hold one extra `Timer(typemax(Int32))` for the process's life: the
@@ -235,6 +237,9 @@ end
 # `:default` thread, not the auth flow. The password is right, so the check runs to the end and
 # `denied` is never sent.
 function login_routes()
+    n = get(ENV, "PASSWORD_CONCURRENCY", "")
+    isempty(n) || Nitro.Auth.set_password_concurrency!(parse(Int, n))
+    @info "bench: password checks" concurrency = Nitro.Auth.password_concurrency()
     password = "correct horse battery staple"
     pbkdf2 = Nitro.Auth.make_password(password)
     bcrypt = Nitro.Auth.make_password(password; algorithm = "bcrypt")
