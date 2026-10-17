@@ -104,6 +104,12 @@ lives in the code comment it names, and that comment is canonical.
   answering in milliseconds, that is a few milliseconds of computation. Do not add a long-handler
   warning to `serve` for it (declined in #467): the threshold is per application, and the
   `AccessLog` middleware already records each request's `duration_ms`.
+  - **Against Go, as a data point, not a threshold (#590):** at the knee, a handler computing
+    about 1 ms per call costs throughput but no stall (p99 3.7 ms, Go's too). The plain loop stops
+    matching Go between 11 and 33 ms per call: Go preempts the long calls, so its p99 levels off
+    near 18 ms, and Nitro's becomes the call time. A loop yielding every 2 ms kept pace with Go
+    past it, in a run not interleaved with Go's. Do not turn the 11–33 ms into a rule: it is
+    where Go stops being better, not what an application's budget allows.
 - **Past it, the work leaves the handler for a bounded queue and the handler answers `202`.**
   `submit_queued_task` to a queue whose concurrency leaves default threads free
   (`queues = ["compute" => max(N - 2, 1)]`), returning the task id. Not a bare `submit_task`: an

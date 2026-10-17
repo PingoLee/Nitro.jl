@@ -164,7 +164,13 @@ the benchmark's own job counter; its k = 0 baseline was 102k and 2.4 ms.
   1.6k requests per second and a p99 of 213 ms at k = 8.
 - **So the threshold is your latency budget.** The longest a handler may compute without yielding
   is the delay you accept for *every other* request on a busy server. For an API answering in
-  milliseconds, that is a few milliseconds of computation.
+  milliseconds, that is a few milliseconds of computation. Measured against Go on an
+  aggregation handler ([#590](https://github.com/PingoLee/Nitro.jl/issues/590)): at k = 8, a
+  call of about 1 ms cost the minimal route throughput but no stall (p99 3.7 ms, the same as
+  Go's). Nitro stopped matching Go between 11 and 33 ms per call: Go preempts the long calls,
+  so its p99 levels off near 18 ms, while Nitro's becomes the call time. In a later run, not
+  interleaved with Go's, the same loop calling `yield()` every 2 ms matched Go's throughput at
+  k = 8 with a lower p99.
 - **Past it, move the work to a queue** whose concurrency leaves threads free, and answer `202`
   with the task id ([CPU-Bound Jobs](@ref)). Only 6 jobs ever ran at once, so the minimal route
   kept about 60k requests per second at every k. The cost moves to the jobs: past what the queue
@@ -210,20 +216,21 @@ credential-stuffing client. A `RateLimiter` on the login route bounds what one c
 not what many impose together. **So Nitro bounds the checks itself**, the way the queue bounds
 jobs: at most `password_concurrency()` hash at once (`nthreads(:default) - 2` by default), and
 the rest wait parked ([Passwords](passwords.md#A-login-is-a-handler-that-computes)). The same
-run with the bound, on a busier box, against the bound turned off and against `/cpu_job` (the
-Workers queue of 6) in the same session. The unbounded and `/cpu_job` cells are Julia 1.12.7;
-each bounded cell is the range over three runs: 1.12.7, 1.13.2, and the 1.12.7 run beside
-`/cpu_job`:
+run on a quiet box, with the bound on, with it turned off, and with `/cpu_job` (the Workers queue
+of 6), all interleaved in one session (Julia 1.12.7, medians of three rounds; a different day
+from the table above, so compare within this table):
 
 | k | pbkdf2, unbounded | pbkdf2, bounded | bcrypt, unbounded | bcrypt, bounded | `/cpu_job`, queue of 6 |
 |---|---|---|---|---|---|
-| 8 | 2.3k, 104 ms | 25–28k, 8–9 ms | 1.2k, 195 ms | 26–28k, 8 ms | 29k, 7.7 ms |
-| 16 | 254, 1.6 s | 25–27k, 8–9 ms | 132, 2.3 s | 26–29k, 8 ms | 28k, 7.9 ms |
+| 8 | 2.2k, 121 ms | 53k, 4.7 ms | 1.2k, 238 ms | 55k, 4.2 ms | 57k, 4.3 ms |
+| 16 | 275, 1.15 s | 52k, 4.8 ms | 150, 2.7 s | 55k, 4.3 ms | 57k, 4.2 ms |
 
-The other routes keep the queue's throughput at any k (lower here than in the table above
-because other work shared the CPUs; compare within a column set, not across tables). Logins
-pay for it. At k = 16 they ran at 42 per second (pbkdf2) and 20 (bcrypt) instead of 51 and 27,
-and a sign-in past the bound waits for one to finish. `set_password_concurrency!` moves that
+With the bound, the other routes keep 91–97% of the queue's throughput at both k, against 0.3–4%
+without it. Logins pay for it. At k = 16 they ran at 44 per second (pbkdf2) and 24 (bcrypt)
+instead of 57 and 32, and a sign-in past the bound waits for a permit: at k = 8 a login's median
+went from 145 to 184 ms (pbkdf2) and from 263 to 336 ms (bcrypt). The wait is fairer, though:
+at k = 16 a login's p99 was lower with the bound than without it (675 ms against 870 ms for
+pbkdf2, 1.2 s against 2.1 s for bcrypt). `set_password_concurrency!` moves that
 trade. The bound covers logins only: a Workers queue sized the same way takes its own threads
 on top of it, so an app running both at full load should size the two together.
 
