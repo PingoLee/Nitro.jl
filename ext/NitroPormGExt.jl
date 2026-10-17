@@ -2006,7 +2006,9 @@ end
 # dependencies of PormG, so the adapter `setup` recorded decides which one the app loads, and the
 # app is written again once it is known.
 function Nitro._newapp_pormg(write_app::Function, root::String)
-    v = pkgversion(PormG)
+    # The commit and compat Nitro itself pins: a tag can move (CONTRIBUTING, *Bumping the PormG
+    # pin*), and Nitro is tested against this commit, not whichever PormG happens to be loaded.
+    pin = Nitro._newapp_pormg_pin()
     # name => (uuid, compat). Kept equal to PormG's own `[weakdeps]`/`[compat]` by
     # `test/extensions/newapp_pormg_tests.jl`.
     drivers = Dict("SQLite" => ("0aa819cd-b072-5ff4-a722-6bc24af294d9", "1.6.1"),
@@ -2025,8 +2027,8 @@ function Nitro._newapp_pormg(write_app::Function, root::String)
         ],
         store = "pormg_nitro_worker(db_key = \"db\")",
         deps = ["PormG" => string(Base.PkgId(PormG).uuid); [n => drivers[n][1] for n in names]],
-        sources = ["PormG" => "{url = \"https://github.com/PingoLee/PormG.jl.git\", rev = \"v$v\"}"],
-        compat = ["PormG" => string(v); [n => drivers[n][2] for n in names]],
+        sources = ["PormG" => "{url = \"$(pin.url)\", rev = \"$(pin.rev)\"}"],
+        compat = ["PormG" => pin.compat; [n => drivers[n][2] for n in names]],
         gitignore = ["db/connection.yml"],
     )
     # Nitro's files first, so an abandoned prompt still leaves a complete app.

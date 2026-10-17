@@ -19,6 +19,11 @@ end
     for name in ("Nitro", "HTTP", "SQLite", "Main")
         @test_throws "depends on" Nitro.newapp(name; path = target, pormg = false)
     end
+    # A module's own name is bound inside it: `App` would make `App(mod = …)` call the module,
+    # `app`/`main` collide with what it defines, and the other two with what it includes.
+    for name in ("App", "app", "main", "Routes", "HealthHandlers", "serve")
+        @test_throws "uses itself" Nitro.newapp(name; path = target, pormg = false)
+    end
     @test !ispath(target)
 end
 
@@ -44,7 +49,8 @@ end
 
 @testset "writes the layout and the in-memory boot" begin
     root = Nitro.newapp("DemoApp"; path = joinpath(mktempdir(), "demo"), pormg = false)
-    files = sort!([relpath(joinpath(d, f), root) for (d, _, fs) in walkdir(root) for f in fs])
+    files = sort!([replace(relpath(joinpath(d, f), root), '\\' => '/')
+                   for (d, _, fs) in walkdir(root) for f in fs])
     @test files == sort!(["Project.toml", "src/DemoApp.jl", "src/Routes.jl",
                           "src/Handlers/HealthHandlers.jl", "test/runtests.jl"])
     @test !isdir(joinpath(root, "db"))
@@ -68,14 +74,41 @@ end
     @test sort!(collect(keys(project["deps"]))) == ["HTTP", "Nitro"]
     @test project["deps"]["Nitro"] == nitro_project["uuid"]
     @test project["deps"]["HTTP"] == nitro_project["deps"]["HTTP"]
-    # Installed by URL, pinned to the release tag of the Nitro doing the generating.
-    @test project["sources"]["Nitro"] == Dict("url" => nitro_project["repo"],
-                                              "rev" => "v$(pkgversion(Nitro))")
+    # Installed by URL, pinned to the commit of the Nitro doing the generating: this suite runs
+    # from a git checkout, so that is its HEAD.
+    @test project["sources"]["Nitro"]["url"] == nitro_project["repo"]
+    @test project["sources"]["Nitro"]["rev"] ==
+          readchomp(Cmd(`git rev-parse HEAD`; dir = pkgdir(Nitro)))
     @test project["compat"]["Nitro"] == string(pkgversion(Nitro))
     # Derived (HTTP) or hard-coded (julia), these must say what Nitro's own compat says.
     @test project["compat"]["HTTP"] == nitro_project["compat"]["HTTP"]
     @test project["compat"]["julia"] == nitro_project["compat"]["julia"]
     @test project["targets"]["test"] == ["Test"]
+end
+
+@testset "outside a checkout, Nitro's rev comes from the manifest that provides it" begin
+    uuid = string(Base.PkgId(Nitro).uuid)
+    function env(entry)
+        dir = mktempdir()
+        write(joinpath(dir, "Project.toml"), "[deps]\nNitro = \"$uuid\"\n")
+        open(io -> TOML.print(io, Dict("manifest_format" => "2.0",
+                                       "deps" => Dict("Nitro" => [entry]))),
+             joinpath(dir, "Manifest.toml"), "w")
+        return joinpath(dir, "Project.toml")
+    end
+    sha = "0123456789abcdef0123456789abcdef01234567"
+    pinned = env(Dict("uuid" => uuid, "repo-rev" => sha))
+    tagged = env(Dict("uuid" => uuid, "repo-rev" => "v0.5.0"))
+    developed = env(Dict("uuid" => uuid, "path" => "../Nitro.jl"))
+    other = env(Dict("uuid" => string(Base.UUID(0)), "repo-rev" => "v9.9.9"))
+    stdlib = Sys.STDLIB
+    @test Nitro._manifest_nitro_rev([stdlib, pinned, tagged]) == sha
+    @test Nitro._manifest_nitro_rev([tagged, pinned]) == "v0.5.0"   # the first provider wins
+    @test Nitro._manifest_nitro_rev([developed, pinned]) === nothing
+    @test Nitro._manifest_nitro_rev([other, pinned]) == sha          # matched by uuid, not name
+    @test Nitro._manifest_nitro_rev([stdlib, joinpath(mktempdir(), "Project.toml")]) === nothing
+    @test Nitro._is_commit(sha)
+    @test !Nitro._is_commit("v0.5.0") && !Nitro._is_commit(uppercase(sha))
 end
 end
 
@@ -92,7 +125,8 @@ logfile = joinpath(mktempdir(), "child.log")
 
 function run_child(script; timeout = 900)
     cmd = addenv(Cmd(`$(Base.julia_cmd()) --project=$root -e $script`; dir = root),
-                 "JULIA_LOAD_PATH" => "@:@stdlib", "JULIA_PROJECT" => nothing)
+                 "JULIA_LOAD_PATH" => join(["@", "@stdlib"], Sys.iswindows() ? ';' : ':'),
+                 "JULIA_PROJECT" => nothing)
     proc = open(logfile, "a") do log
         run(pipeline(cmd; stdout = log, stderr = log); wait = false)
     end

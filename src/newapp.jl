@@ -11,6 +11,7 @@
 # it; the template itself stays in one place.
 
 import HTTP
+import TOML
 import UUIDs
 
 # The database half of the generated app — what differs between `pormg = true` and `false`.
@@ -38,6 +39,10 @@ const _TEST_UUID = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 # `SQLite` and `LibPQ` are the database drivers the PormG branch may add.
 const _NEWAPP_TAKEN_NAMES =
     ("Nitro", "HTTP", "PormG", "SQLite", "LibPQ", "Test", "Base", "Core", "Main")
+
+# A module's own name is bound inside it, so the generated module cannot be named after what it
+# defines or includes itself; Nitro's exports are refused separately, for the same reason.
+const _NEWAPP_TEMPLATE_NAMES = ("app", "main", "Routes", "HealthHandlers")
 
 """
     Nitro.newapp(name; path = ".", pormg = true) -> String
@@ -75,11 +80,19 @@ driver yourself. With `pormg = false` the boot uses an in-memory worker store an
 `db/`.
 
 `Project.toml` installs Nitro and PormG from their repositories, since neither is in Julia's
-General registry. Each `rev` is the release tag of the version you generated with
-(`v\$(pkgversion(Nitro))`). Generating from an unreleased checkout therefore pins its last release.
-The first `Pkg.instantiate()` records the exact commit in `Manifest.toml`, which is the app's
-real lock. To work on Nitro itself from the app, delete the `Nitro` line from `[sources]` before
-`Pkg.develop`: Pkg refuses a `path` on top of a `url`. Next steps:
+General registry. Each `rev` should be a commit, because a tag can move or not exist yet. PormG's
+is the commit Nitro itself pins. Nitro cannot read its own commit, so its `rev` is copied from how
+the generating Nitro was installed:
+
+- from a git checkout, its `HEAD`, with a warning when the checkout has uncommitted changes, which
+  that commit does not contain;
+- otherwise the `rev` your `Manifest.toml` records for Nitro, with a warning when that is a tag or
+  a branch;
+- with neither, the release tag `v\$(pkgversion(Nitro))`, with a warning.
+
+Replace a warned-about `rev` with a commit. To work on Nitro itself from the app, delete the
+`Nitro` line from `[sources]` before `Pkg.develop`: Pkg refuses a `path` on top of a `url`. Next
+steps:
 
 ```julia
 julia> using Nitro, PormG
@@ -94,8 +107,8 @@ julia> using MyApp; MyApp.main()
 ```
 
 Throws an `ArgumentError`, and writes nothing, when `name` is not a valid Julia module name (or
-is the name of a dependency), when `path` exists and is not an empty directory, or when
-`pormg = true` and PormG is not loaded. There is no `force`: delete the directory yourself.
+is the name of a dependency, of a Nitro export, or of something the module defines), when `path`
+exists and is not an empty directory, or when `pormg = true` and PormG is not loaded. There is no `force`: delete the directory yourself.
 """
 function newapp(name::AbstractString; path::AbstractString = ".", pormg::Bool = true)
     name = String(name)
@@ -103,6 +116,8 @@ function newapp(name::AbstractString; path::AbstractString = ".", pormg::Bool = 
         "`$name` is not a valid Julia module name; use an identifier such as `MyApp`"))
     name in _NEWAPP_TAKEN_NAMES && throw(ArgumentError(
         "`$name` is the name of a module the generated app depends on; choose another"))
+    (name in _NEWAPP_TEMPLATE_NAMES || Base.isexported(@__MODULE__, Symbol(name))) &&
+        throw(ArgumentError("`$name` is a name the generated module uses itself; choose another"))
     root = abspath(path)
     if ispath(root) && !(isdir(root) && isempty(readdir(root)))
         throw(ArgumentError("`$root` already exists and is not empty; " *
@@ -113,10 +128,12 @@ function newapp(name::AbstractString; path::AbstractString = ".", pormg::Bool = 
                             "or pass `pormg = false`"))
     end
 
+    # Once, here: the PormG branch writes the app twice, and the lookup may warn.
+    rev = _newapp_nitro_rev()
     if pormg
-        _newapp_pormg(db -> _write_newapp(root, _newapp_files(name, db)), root)
+        _newapp_pormg(db -> _write_newapp(root, _newapp_files(name, db, rev)), root)
     else
-        _write_newapp(root, _newapp_files(name, _NEWAPP_MEMORY))
+        _write_newapp(root, _newapp_files(name, _NEWAPP_MEMORY, rev))
     end
     return root
 end
@@ -135,10 +152,11 @@ function _write_newapp(root::String, files::Vector{Pair{String,String}})
     return nothing
 end
 
-# Every file of the generated app as `relative path => content`. Pure, so tests compare strings.
-function _newapp_files(name::String, db::_NewappDB)::Vector{Pair{String,String}}
+# Every file of the generated app as `relative path => content`. Pure, so tests compare strings;
+# `nitro_rev` is the `[sources]` rev for Nitro.
+function _newapp_files(name::String, db::_NewappDB, nitro_rev::String)::Vector{Pair{String,String}}
     files = [
-        "Project.toml" => _newapp_project(name, db),
+        "Project.toml" => _newapp_project(name, db, nitro_rev),
         "src/$name.jl" => _newapp_module(name, db),
         "src/Routes.jl" => _NEWAPP_ROUTES,
         "src/Handlers/HealthHandlers.jl" => _NEWAPP_HEALTH,
@@ -148,12 +166,12 @@ function _newapp_files(name::String, db::_NewappDB)::Vector{Pair{String,String}}
     return files
 end
 
-function _newapp_project(name::String, db::_NewappDB)
+function _newapp_project(name::String, db::_NewappDB, nitro_rev::String)
     nitro = string(pkgversion(@__MODULE__))
     http = pkgversion(HTTP)
     deps = sort!(vcat(["HTTP" => string(Base.PkgId(HTTP).uuid),
                        "Nitro" => string(Base.PkgId(@__MODULE__).uuid)], db.deps); by = first)
-    sources = vcat(["Nitro" => "{url = \"$_NEWAPP_NITRO_URL\", rev = \"v$nitro\"}"], db.sources)
+    sources = vcat(["Nitro" => "{url = \"$_NEWAPP_NITRO_URL\", rev = \"$nitro_rev\"}"], db.sources)
     compat = sort!(vcat(["HTTP" => "~$(http.major).$(http.minor)", "Nitro" => nitro], db.compat);
                    by = first)
     push!(compat, "julia" => _NEWAPP_JULIA_COMPAT)
@@ -179,6 +197,72 @@ function _newapp_project(name::String, db::_NewappDB)
         [targets]
         test = ["Test"]
         """
+end
+
+_is_commit(rev::AbstractString) = occursin(r"^[0-9a-f]{40}$", rev)
+
+# The generated `[sources]` rev for Nitro. No package can read its own commit, so it is copied
+# from how this Nitro was installed; see the docstring for the order and the warnings.
+function _newapp_nitro_rev()::String
+    dir = pkgdir(@__MODULE__)
+    if ispath(joinpath(dir, ".git"))    # a directory, or a file in a git worktree
+        git(args...) = try
+            readchomp(pipeline(Cmd(`git $args`; dir = dir); stderr = devnull))
+        catch
+            nothing
+        end
+        sha = git("rev-parse", "HEAD")
+        if sha !== nothing && _is_commit(sha)
+            dirty = git("status", "--porcelain", "--untracked-files=no")
+            dirty === nothing || isempty(dirty) || @warn(
+                "newapp: Nitro's checkout has uncommitted changes; the generated app pins its " *
+                "HEAD commit, which does not contain them", commit = sha)
+            return sha
+        end
+    end
+    rev = _manifest_nitro_rev(Base.load_path())
+    if rev === nothing
+        rev = "v$(pkgversion(@__MODULE__))"
+        @warn "newapp: cannot tell which commit this Nitro is; the generated app pins its " *
+              "release tag, which can move or not exist. Replace it with a commit" rev
+    elseif !_is_commit(rev)
+        @warn "newapp: this Nitro was installed from a `rev` that is not a commit, and the " *
+              "generated app copies it. A tag or a branch can move: replace it with a commit" rev
+    end
+    return rev
+end
+
+# The `repo-rev` of Nitro's entry in the first manifest on `envs` that has one, the way loading
+# picks the first environment that provides a package. `nothing` for a `path` entry or none.
+function _manifest_nitro_rev(envs::Vector{String})::Union{String,Nothing}
+    uuid = string(Base.PkgId(@__MODULE__).uuid)
+    for env in envs
+        isfile(env) || continue      # the stdlib entry is a directory
+        manifest = try
+            Base.project_file_manifest_path(env)   # internal: Pkg's own lookup, no public twin
+        catch
+            nothing
+        end
+        manifest isa String && isfile(manifest) || continue
+        toml = TOML.tryparsefile(manifest)
+        toml isa Dict || continue
+        deps = get(toml, "deps", nothing)
+        deps isa Dict || continue
+        for entry in get(deps, "Nitro", ())
+            entry isa Dict && get(entry, "uuid", nothing) == uuid || continue
+            rev = get(entry, "repo-rev", nothing)
+            return rev isa String ? rev : nothing
+        end
+    end
+    return nothing
+end
+
+# PormG's pin for the generated `[sources]` and `[compat]`: the ones Nitro itself is tested
+# against, read from Nitro's own Project.toml. Used by `NitroPormGExt`.
+function _newapp_pormg_pin()::NamedTuple{(:url, :rev, :compat),NTuple{3,String}}
+    project = TOML.parsefile(joinpath(pkgdir(@__MODULE__), "Project.toml"))
+    source = project["sources"]["PormG"]
+    return (url = source["url"], rev = source["rev"], compat = project["compat"]["PormG"])
 end
 
 function _newapp_module(name::String, db::_NewappDB)

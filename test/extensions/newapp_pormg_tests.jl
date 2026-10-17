@@ -50,9 +50,10 @@ end
     pormg_project = TOML.parsefile(joinpath(pkgdir(PormG), "Project.toml"))
     @test sort!(collect(keys(project["deps"]))) == ["HTTP", "Nitro", "PormG", "SQLite"]
     @test project["deps"]["PormG"] == nitro_project["weakdeps"]["PormG"]
-    @test project["sources"]["PormG"] == Dict("url" => nitro_project["sources"]["PormG"]["url"],
-                                              "rev" => "v$(pkgversion(PormG))")
-    @test project["compat"]["PormG"] == string(pkgversion(PormG))
+    # Nitro's own pins, both of them, so the generated app and Nitro cannot drift apart.
+    @test project["sources"]["PormG"] == nitro_project["sources"]["PormG"]
+    @test occursin(r"^[0-9a-f]{40}$", project["sources"]["PormG"]["rev"])
+    @test project["compat"]["PormG"] == nitro_project["compat"]["PormG"]
     # The drivers the extension knows are PormG's own weak dependencies, at PormG's compat.
     @test project["deps"]["SQLite"] == pormg_project["weakdeps"]["SQLite"]
     @test project["compat"]["SQLite"] == pormg_project["compat"]["SQLite"]
@@ -81,7 +82,9 @@ end
 # The single source for the tutorial's boot (#417): `bigger_applications.md` carries this exact
 # file between the markers. Regenerate it with `Nitro.newapp("MyApp")` (SQLite) and paste.
 @testset "bigger_applications.md shows exactly what newapp writes" begin
-    md = read(joinpath(pkgdir(Nitro), "docs", "src", "tutorial", "bigger_applications.md"), String)
+    # A Windows checkout may give the page CRLF line endings; the generated file has LF.
+    md = replace(read(joinpath(pkgdir(Nitro), "docs", "src", "tutorial", "bigger_applications.md"),
+                      String), "\r\n" => "\n")
     m = match(r"<!-- newapp:src/MyApp\.jl -->\n```julia\n(.*?)```\n<!-- /newapp -->"s, md)
     @test m !== nothing
     m === nothing || @test m[1] == src
