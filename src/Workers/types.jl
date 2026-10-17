@@ -602,6 +602,64 @@ end
     max_retries::Int = 3
 end
 
+# An in-process queue's buffer, and the default backlog bound of an external one: the same 100, so
+# moving a queue out of process does not change how many runs it admits.
+const _DEFAULT_QUEUE_BUFFER = 100
+
+"""
+    External(; on_lease_expiry, max_attempts = 3, max_pending = 100, options = TaskOptions())
+
+The placement of a queue whose runs execute in a **separate consumer process**, not in the process
+that submits them ([#514](https://github.com/PingoLee/Nitro.jl/issues/514)). Declare it with
+[`declare_queues!`](@ref), in a setup function that the web process and the consumer both call:
+
+```julia
+declare_queues!(app, ["email", "heavy" => External(on_lease_expiry = :requeue)])
+```
+
+The web process only records a submit to `"heavy"`. A consumer process claims the run from the
+shared store, under a lease, and runs it.
+
+- **`on_lease_expiry` has no default.** It decides what happens to a run whose consumer died
+  mid-run, so that its lease expired: `:requeue` runs it again (at-least-once delivery, so **the
+  job must be idempotent**), and `:fail` records it `FAILED`. Omitting it is an `ArgumentError`,
+  because only the application knows whether its job may run twice, and a default of `:requeue`
+  would let an email or a charge repeat silently. See [`LeasePolicy`](@ref).
+- **`max_attempts`** bounds `:requeue`: a run claimed that many times is recorded `FAILED`.
+- **`max_pending`** bounds the backlog: a submit is refused with `WorkerCapacityError(:queue, …)`
+  (a `503`) once the store holds that many `PENDING` runs of the queue. The default, 100, is an
+  in-process queue's buffer size, so moving a queue out of process admits the same backlog;
+  `max_pending = nothing` removes the bound. The count is read before
+  the insert, so concurrent submits can overshoot it by a few rows. It bounds runaway callers; it
+  is not an exact quota.
+- **`options`** are the queue's `TaskOptions`: the consumer runs every run of the queue
+  with them. A submit cannot pass its own, because the consumer never sees the submit call.
+
+Only a **named job** can run on an external queue ([`register_job!`](@ref), [`Job`](@ref)): a
+closure cannot cross a process boundary, so submitting one is an `ArgumentError`.
+"""
+struct External
+    policy::LeasePolicy
+    max_pending::Union{Nothing, Int}
+    options::TaskOptions
+
+    function External(policy::LeasePolicy, max_pending::Union{Nothing, Integer}, options::TaskOptions)
+        max_pending === nothing || max_pending >= 1 || throw(ArgumentError(
+            "`max_pending` must be at least 1 or `nothing`, got $max_pending"))
+        return new(policy, max_pending === nothing ? nothing : Int(max_pending), options)
+    end
+end
+
+function External(; on_lease_expiry::Union{Nothing, Symbol} = nothing, max_attempts::Integer = 3,
+                  max_pending::Union{Nothing, Integer} = _DEFAULT_QUEUE_BUFFER,
+                  options::TaskOptions = TaskOptions())
+    on_lease_expiry === nothing && throw(ArgumentError(
+        "External(…) needs `on_lease_expiry`: `:requeue` runs a run again when its consumer dies " *
+        "mid-run (the job must be idempotent), `:fail` records it FAILED. There is no default, " *
+        "because only the application knows whether its job may run twice"))
+    return External(LeasePolicy(on_lease_expiry; max_attempts = Int(max_attempts)), max_pending, options)
+end
+
 struct QueueItem
     task_key::String
     # The run this item was queued FOR, not merely the key it was queued under. A queued item can
@@ -696,7 +754,7 @@ mutable struct WorkerQueue
     # same idempotent CAS.
     held::Vector{QueueItem}
 
-    function WorkerQueue(size::Int=100; concurrency::Int=1)
+    function WorkerQueue(size::Int=_DEFAULT_QUEUE_BUFFER; concurrency::Int=1)
         size >= 1 || throw(ArgumentError("WorkerQueue size must be at least 1, got $size"))
         concurrency >= 1 || throw(ArgumentError(
             "WorkerQueue concurrency must be at least 1, got $concurrency"))

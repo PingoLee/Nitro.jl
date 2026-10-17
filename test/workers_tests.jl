@@ -398,7 +398,7 @@ function _W.try_transition!(s::ClaimRaceStore, id::String, from, to::TaskStatus;
 end
 
 @testset "the claim capability is optional, and discoverable (#514)" begin
-    claim_rows = [:claim_next!, :renew_leases!, :release_claim!, :requeue_expired!]
+    claim_rows = [:claim_next!, :renew_leases!, :release_claim!, :requeue_expired!, :count_external_runs]
 
     # The shipped backend has it.
     @test isempty(missing_claim_methods(InMemoryWorkerStore))
@@ -591,7 +591,9 @@ end
     churn = inner -> begin
         r = _W.get_task_info(inner, id)
         r.status == PENDING ? _W.claim_next!(inner, "heavy", "consumer-1"; lease_seconds = 60) :
-                              _W.release_claim!(inner, id, r.run_id)
+                              # A bound it never reaches, so every round hands the run back.
+                              _W.release_claim!(inner, id, r.run_id;
+                                                policy = _W.LeasePolicy(:requeue; max_attempts = 1000))
     end
     s4 = ClaimRaceStore(churn; persistent = true)
     seed!(s4; external = true)
@@ -5953,6 +5955,374 @@ end
             @test status_of(app, i)[:status] == "COMPLETED"
             @test status_of(app, i)[:result] == expected
         end
+    finally
+        uninstall!(app; drain_timeout = 0)
+    end
+end
+
+end
+
+@testitem "Workers -- external queues, the web side (#514)" tags=[:core, :workers] setup=[NitroCommon] begin
+
+using Test
+using Dates
+using Nitro
+using Nitro.Workers
+using Nitro.Workers: get_task_info, replace_task!, try_transition!, claim_next!, get_worker_queues,
+    count_external_runs, LeasePolicy
+using Nitro.Errors: AuthorizationError, WorkerCapacityError
+
+const _W = Nitro.Workers
+
+# An in-memory store that says other processes can read it: every claim-capable backend a
+# consumer could share. Forwards the whole contract, the claim capability included, so the web
+# side runs exactly as it would over a database, without one.
+struct SharedStore <: AbstractWorkerStore
+    inner::InMemoryWorkerStore
+end
+SharedStore() = SharedStore(InMemoryWorkerStore())
+# Each forward with the contract's own arity: a varargs forward can be ambiguous with the
+# generated fixed-arity fallbacks on `AbstractWorkerStore`.
+for (f, n) in ((:get_task_info, 1), (:set_task!, 2), (:replace_task!, 2), (:add_watcher!, 2),
+               (:try_transition!, 3), (:delete_task!, 1), (:try_delete_task!, 2), (:cleanup_tasks!, 1),
+               (:get_all_tasks, 1), (:get_queue_authorizer, 0), (:set_queue_authorizer!, 1),
+               (:get_watch_authorizer, 0), (:set_watch_authorizer!, 1), (:get_error_redactor, 0),
+               (:set_error_redactor!, 1), (:claim_next!, 2), (:renew_leases!, 2), (:release_claim!, 2),
+               (:requeue_expired!, 1), (:count_external_runs, 1), (:clear_records!, 0),
+               (:list_running_task_refs, 0))
+    args = [Symbol("a", i) for i in 1:n]
+    @eval _W.$f(s::SharedStore, $(args...); kw...) = _W.$f(s.inner, $(args...); kw...)
+end
+_W.lock_tasks(cb::Function, s::SharedStore) = _W.lock_tasks(cb, s.inner)
+_W._visible_across_processes(::SharedStore) = true
+
+struct CannotClaim <: AbstractWorkerStore end
+
+@kwdef struct HeavyArgs
+    n::Int
+end
+
+heavy(; kw...) = External(; on_lease_expiry = :requeue, kw...)
+
+function external_app(; store = SharedStore(), runtime_kw = (;), queues = ["email", "heavy" => heavy()])
+    app = App()
+    declare_queues!(app, queues)
+    register_job!(app, "crunch", HeavyArgs) do _, args
+        args.n
+    end
+    runtime = WorkerRuntime(store; runtime_kw...)
+    start!(app; runtime, cleanup_enabled = false, recover_zombies = false)
+    return app, runtime
+end
+
+@testset "External(…) has no lease-expiry default, and validates the rest" begin
+    @test_throws "needs `on_lease_expiry`" External()
+    @test_throws ArgumentError External(on_lease_expiry = :retry)
+    @test_throws ArgumentError External(on_lease_expiry = :requeue, max_attempts = 0)
+    @test_throws ArgumentError External(on_lease_expiry = :requeue, max_pending = 0)
+    p = External(on_lease_expiry = :fail, max_pending = 5, options = TaskOptions(timeout = 60))
+    @test p.policy == LeasePolicy(:fail) && p.max_pending == 5 && p.options.timeout == 60
+    # The backlog bound defaults to an in-process queue's buffer; `nothing` removes it.
+    @test External(on_lease_expiry = :fail).max_pending == 100 == _W.WorkerQueue().capacity
+    @test External(on_lease_expiry = :fail, max_pending = nothing).max_pending === nothing
+    # Equal by value: a re-declaration with the same settings must be recognised as the same.
+    @test heavy() == heavy()
+    @test heavy() != heavy(max_attempts = 5)
+end
+
+@testset "declare_queues!: one name, one setting, and a refused call declares nothing" begin
+    app = App()
+    declare_queues!(app, ["email", "compute" => 4, "heavy" => heavy()])
+    declare_queues!(app, ["email", "heavy" => heavy()])                 # same settings: a no-op
+    @test _W._app_placements(app) == Any["email" => 1, "compute" => 4, "heavy" => heavy()]
+
+    @test_throws "declared twice" declare_queues!(app, ["compute" => 2])
+    @test_throws "two different External" declare_queues!(app, ["x" => heavy(), "x" => heavy(max_attempts = 9)])
+    @test_throws "declared twice" declare_queues!(app, ["heavy" => heavy(max_attempts = 9)])
+    @test_throws "both in-process and External" declare_queues!(app, ["heavy"])
+    @test_throws "both in-process and External" declare_queues!(app, ["email" => heavy()])
+    @test_throws "non-empty name" declare_queues!(app, ["" => heavy()])
+    # Refused as a whole: "fresh" came first in the list, and is not recorded either.
+    @test_throws ArgumentError declare_queues!(app, ["fresh", "compute" => 9])
+    @test !any(p -> first(p) == "fresh", _W._app_placements(app))
+
+    # An External passed to `worker_startup`/`start!`/the runtime itself is pointed at the one
+    # place both processes read.
+    @test_throws "declare it with `declare_queues!" worker_startup(App(); queues = ["h" => heavy()])
+    @test_throws "declare it with `declare_queues!" WorkerRuntime(SharedStore(); queues = ["h" => heavy()])
+end
+
+@testset "an external queue no consumer could claim from is refused at start, before any install" begin
+    # The default store, built fresh: in this process's memory only.
+    app = App()
+    declare_queues!(app, ["heavy" => heavy()])
+    @test_throws "never be claimed" start!(app; cleanup_enabled = false)
+    @test worker_runtime(app) === nothing
+    @test_throws "never be claimed" worker_startup(app)
+    @test worker_runtime(app) === nothing
+    # An explicit in-memory store, the same.
+    @test_throws "InMemoryWorkerStore" start!(app; store = InMemoryWorkerStore(), cleanup_enabled = false)
+    @test worker_runtime(app) === nothing
+
+    # A store that cannot claim at all names what it lacks.
+    @test_throws "claim capability" _W._check_external_store(CannotClaim(), ["heavy" => heavy()])
+
+    # Declaring onto an app whose runtime is already installed checks that runtime's store.
+    plain = App()
+    start!(plain; cleanup_enabled = false, recover_zombies = false)
+    try
+        @test_throws "never be claimed" declare_queues!(plain, ["heavy" => heavy()])
+        @test isempty(_W._app_external_queues(plain))
+        @test _W._external_placement(worker_runtime(plain), "heavy") === nothing
+    finally
+        uninstall!(plain; drain_timeout = 0)
+    end
+end
+
+@testset "start! mints no processor for an external queue, and the declarations outlive the runtime" begin
+    app, runtime = external_app()
+    try
+        @test haskey(get_worker_queues(runtime), "email")
+        @test !haskey(get_worker_queues(runtime), "heavy")
+        @test _W._external_placement(runtime, "heavy") == heavy()
+        @test _W._external_policies(runtime) == Dict("heavy" => LeasePolicy(:requeue))
+        # An app's declarations are the app's: a terminate drops the runtime, not them.
+        uninstall!(app; drain_timeout = 0)
+        @test _W._app_external_queues(app) == ["heavy" => heavy()]
+        again = start!(app; store = SharedStore(), cleanup_enabled = false, recover_zombies = false)
+        @test _W._external_placement(again, "heavy") == heavy()
+    finally
+        uninstall!(app; drain_timeout = 0)
+    end
+
+    # Declared AFTER the runtime started: it learns the queue at once.
+    late = App()
+    rt = start!(late; store = SharedStore(), cleanup_enabled = false, recover_zombies = false)
+    try
+        declare_queues!(late, ["heavy" => heavy()])
+        @test _W._external_placement(rt, "heavy") == heavy()
+        @test_throws "already declared External" _W._declare_queues!(rt, ["heavy" => 2])
+    finally
+        uninstall!(late; drain_timeout = 0)
+    end
+
+    # Refused by the RUNTIME (it runs "x" in-process from a `start!` keyword the App never saw):
+    # the App's declarations are left exactly as they were.
+    keyed = App()
+    rt = start!(keyed; store = SharedStore(), queues = ["x"], cleanup_enabled = false, recover_zombies = false)
+    try
+        @test_throws "already runs in-process" declare_queues!(keyed, ["x" => heavy(), "y" => heavy()])
+        @test isempty(_W._app_external_queues(keyed))
+        @test _W._external_placement(rt, "y") === nothing
+    finally
+        uninstall!(keyed; drain_timeout = 0)
+    end
+
+    # An undeclared first submit racing an External declaration of the same name is refused where
+    # the queue would be minted, so one name never runs in both places.
+    loose = WorkerRuntime(SharedStore(); allow_undeclared_queues = true)
+    _W._declare_queues!(loose, ["late" => heavy()])
+    @test_throws "declared External" _W._get_or_create_queue(loose, "late")
+    @test !haskey(get_worker_queues(loose), "late")
+end
+
+@testset "worker_startup declares an external queue when it is built" begin
+    app = App()
+    declare_queues!(app, ["heavy" => heavy()])
+    register_job!(app, "crunch", HeavyArgs) do _, args
+        args.n
+    end
+    store = SharedStore()
+    worker_startup(app; store, cleanup_enabled = false, recover_zombies = false)
+    try
+        # The startup window: installed and declared, before any server started it.
+        id = submit_queued_task(app, "heavy", "w", Job("crunch", HeavyArgs(n = 2)), Owner("u1"))
+        @test get_task_info(store, id).external
+        @test !haskey(get_worker_queues(worker_runtime(app)), "heavy")
+    finally
+        uninstall!(app; drain_timeout = 0)
+    end
+end
+
+@testset "a submit to an external queue records an external row and runs nothing here" begin
+    app, runtime = external_app()
+    try
+        owner = Owner("u1")
+        id = submit_queued_task(app, "heavy", "job-1", Job("crunch", HeavyArgs(n = 7)), owner)
+        rec = get_task_info(runtime.store, id)
+        @test rec.status == PENDING
+        @test rec.external
+        @test rec.queue_name == "heavy"
+        @test rec.job_name == "crunch"
+        @test rec.job_args == "{\"n\":7}"
+        @test !haskey(get_worker_queues(runtime), "heavy")       # nothing minted
+        @test isempty(runtime.reservations)                       # nothing reserved here
+        sleep(0.2)
+        @test get_task_info(runtime.store, id).status == PENDING # nothing ran it
+        # A consumer can claim it, and only it.
+        claimed = claim_next!(runtime.store, "heavy", "consumer-1"; lease_seconds = 60)
+        @test claimed.id == id && claimed.job_name == "crunch"
+
+        # Joining the live key costs nothing and writes no second row.
+        @test submit_queued_task(app, "heavy", "job-1", Job("crunch", HeavyArgs(n = 7)), owner) == id
+        @test count_external_runs(runtime.store, [PENDING, RUNNING]) == 1
+    finally
+        uninstall!(app; drain_timeout = 0)
+    end
+end
+
+@testset "an external queue refuses a closure and a submit's own options" begin
+    app, runtime = external_app()
+    try
+        owner = Owner("u1")
+        @test_throws "cannot run a closure" submit_queued_task(app, "heavy", "c", _ -> 1, owner)
+        @test_throws "cannot run a closure" submit_queued_task("heavy", "c", _ -> 1, owner; runtime)
+        @test_throws "cannot pass `options`" submit_queued_task(app, "heavy", "o",
+            Job("crunch", HeavyArgs(n = 1)), owner; options = TaskOptions(timeout = 5))
+        @test get_task_info(runtime.store, scoped_task_key("c", owner)) === nothing
+        @test get_task_info(runtime.store, scoped_task_key("o", owner)) === nothing
+        # The in-process queue beside it still takes closures.
+        id = submit_queued_task(app, "email", "e", _ -> :sent, owner)
+        @test timedwait(() -> get_task_info(runtime.store, id).status == COMPLETED, 5) === :ok
+
+        # The authorizer is asked first: a refused caller learns nothing about the queue.
+        set_queue_authorizer!(runtime.store, (q, uid) -> uid != "intruder")
+        @test_throws AuthorizationError submit_queued_task(app, "heavy", "c", _ -> 1, Owner("intruder"))
+    finally
+        uninstall!(app; drain_timeout = 0)
+    end
+end
+
+@testset "max_pending and max_runs_per_owner are counted in the store" begin
+    app, runtime = external_app(queues = ["heavy" => heavy(max_pending = 2)])
+    try
+        job = Job("crunch", HeavyArgs(n = 1))
+        submit_queued_task(app, "heavy", "a", job, Owner("u1"))
+        submit_queued_task(app, "heavy", "b", job, Owner("u2"))
+        err = try submit_queued_task(app, "heavy", "c", job, Owner("u3")); nothing catch e; e end
+        @test err isa WorkerCapacityError && err.kind === :queue
+        @test get_task_info(runtime.store, scoped_task_key("c", Owner("u3"))) === nothing
+        # Joining a live key is never refused by the bound: it mints nothing.
+        @test submit_queued_task(app, "heavy", "a", job, Owner("u1")) == scoped_task_key("a", Owner("u1"))
+        # A claimed run is no longer pending, so it frees a slot.
+        claim_next!(runtime.store, "heavy", "consumer-1"; lease_seconds = 60)
+        submit_queued_task(app, "heavy", "c", job, Owner("u3"))
+        @test get_task_info(runtime.store, scoped_task_key("c", Owner("u3"))).status == PENDING
+    finally
+        uninstall!(app; drain_timeout = 0)
+    end
+
+    app, runtime = external_app(runtime_kw = (; max_runs_per_owner = 2))
+    gate = Base.Event()
+    try
+        job = Job("crunch", HeavyArgs(n = 1))
+        owner = Owner("u1")
+        submit_queued_task(app, "heavy", "a", job, owner)
+        claim_next!(runtime.store, "heavy", "consumer-1"; lease_seconds = 60)   # RUNNING counts too
+        submit_queued_task(app, "heavy", "b", job, owner)
+        err = try submit_queued_task(app, "heavy", "c", job, owner); nothing catch e; e end
+        @test err isa WorkerCapacityError && err.kind === :owner
+        # Nor through `scope = :global`, whose id has no owner half to count by.
+        err = try submit_queued_task(app, "heavy", "g", job, owner; scope = :global); nothing catch e; e end
+        @test err isa WorkerCapacityError && err.kind === :owner
+        # Another owner is not bounded by u1's runs.
+        @test submit_queued_task(app, "heavy", "c", job, Owner("u2")) isa String
+        # A grant does not count against the grantee: otherwise any user could fill another's
+        # quota by naming them as a watcher.
+        submit_queued_task(app, "heavy", "x1", job, Owner("atk"); watchers = [Owner("vic")])
+        @test submit_queued_task(app, "heavy", "v1", job, Owner("vic")) isa String
+        @test submit_queued_task(app, "heavy", "v2", job, Owner("vic")) isa String
+        # A :global submit counts against its submitter afterwards.
+        @test submit_queued_task(app, "heavy", "g2", job, Owner("u4"); scope = :global) == "g2"
+        submit_queued_task(app, "heavy", "h", job, Owner("u4"))
+        err = try submit_queued_task(app, "heavy", "i", job, Owner("u4")); nothing catch e; e end
+        @test err isa WorkerCapacityError && err.kind === :owner
+        # An in-process run of the owner counts against the same quota.
+        submit_queued_task(app, "email", "e", _ -> wait(gate), Owner("u3"))
+        submit_queued_task(app, "heavy", "d", job, Owner("u3"))
+        err = try submit_queued_task(app, "heavy", "f", job, Owner("u3")); nothing catch e; e end
+        @test err isa WorkerCapacityError && err.kind === :owner
+    finally
+        notify(gate)
+        uninstall!(app; drain_timeout = 0)
+    end
+end
+
+@testset "the retention tick adjudicates expired leases by the queue's policy" begin
+    app, runtime = external_app(queues = ["heavy" => heavy(max_attempts = 1)])
+    try
+        id = submit_queued_task(app, "heavy", "a", Job("crunch", HeavyArgs(n = 1)), Owner("u1"))
+        claim_next!(runtime.store, "heavy", "consumer-1"; lease_seconds = 0.01)
+        sleep(0.05)
+        tally = _W._requeue_expired_tick!(runtime)
+        @test tally.failed == 1 && tally.requeued == 0
+        @test get_task_info(runtime.store, id).status == FAILED
+        # A runtime with no external queue does nothing at all.
+        @test _W._requeue_expired_tick!(WorkerRuntime(SharedStore())) === nothing
+    finally
+        uninstall!(app; drain_timeout = 0)
+    end
+
+    # Two apps on one store, each declaring its own external queue: one's tick never touches the
+    # other's expired run, which its consumers adjudicate (#603). Under fail-closed it would be
+    # FAILED as `unknown_queue`.
+    store = SharedStore()
+    app, runtime = external_app(; store, queues = ["heavy" => heavy()])
+    other, other_runtime = external_app(; store, queues = ["reports" => heavy()])
+    try
+        id = submit_queued_task(app, "heavy", "a", Job("crunch", HeavyArgs(n = 1)), Owner("u1"))
+        claimed = claim_next!(store, "heavy", "consumer-1"; lease_seconds = 0.01)
+        sleep(0.05)
+        @test _W._requeue_expired_tick!(other_runtime) == (requeued = 0, failed = 0, unknown_queue = 0, lost_race = 0)
+        rec = get_task_info(store, id)
+        @test rec.status == RUNNING && rec.run_id == claimed.run_id && rec.claimed_by == "consumer-1"
+        # Its own runtime's tick does adjudicate it.
+        @test _W._requeue_expired_tick!(runtime).requeued == 1
+        @test get_task_info(store, id).status == PENDING
+    finally
+        uninstall!(other; drain_timeout = 0)
+        uninstall!(app; drain_timeout = 0)
+    end
+
+    # Through the scheduler itself, on a short interval.
+    app, runtime = external_app()
+    try
+        id = submit_queued_task(app, "heavy", "a", Job("crunch", HeavyArgs(n = 1)), Owner("u1"))
+        claimed = claim_next!(runtime.store, "heavy", "consumer-1"; lease_seconds = 0.01)
+        start_cleanup_scheduler(; interval_hours = 0.05 / 3600, runtime)
+        @test timedwait(() -> get_task_info(runtime.store, id).status == PENDING, 10) === :ok
+        @test get_task_info(runtime.store, id).run_id != claimed.run_id
+    finally
+        stop_cleanup_scheduler!(runtime)
+        uninstall!(app; drain_timeout = 0)
+    end
+end
+
+@testset "start! warns about external rows left on a queue it now runs in-process" begin
+    store = SharedStore()
+    replace_task!(store, "u1::old", TaskInfo("u1::old"; queue_name = "heavy", external = true))
+    app = App()
+    try
+        @test_logs (:warn, r"queued for a consumer process") match_mode = :any start!(app;
+            store, queues = ["heavy"], cleanup_enabled = false, recover_zombies = false)
+    finally
+        uninstall!(app; drain_timeout = 0)
+    end
+end
+
+@testset "get_queue_status reads an external queue from the store" begin
+    app, runtime = external_app()
+    try
+        job = Job("crunch", HeavyArgs(n = 1))
+        submit_queued_task(app, "heavy", "a", job, Owner("u1"))
+        submit_queued_task(app, "heavy", "b", job, Owner("u1"))
+        claim_next!(runtime.store, "heavy", "consumer-1"; lease_seconds = 60)
+        st = get_queue_status(app, "heavy", System())
+        @test st[:external] === true
+        @test st[:pending_count] == 1 && length(st[:current_tasks]) == 1
+        @test st[:running] === true && st[:concurrency] === nothing
+        @test st[:status_text] == "Processing" && st[:total_load] == 2
+        @test get_queue_status(app, "nope", System())[:error] == "Queue not found"
     finally
         uninstall!(app; drain_timeout = 0)
     end

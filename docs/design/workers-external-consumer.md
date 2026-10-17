@@ -5,7 +5,9 @@ in a **separate process**, for CPU, GC, memory and fault isolation, as an option
 default. **Status: decided.** §10 records the maintainer's decisions (2026-10-14); implementation
 follows the plan in §9, one PR per step. **Step 1 (the store contract) is implemented**; §11
 records where it departs from §3. **Step 2 (named jobs, in-process) is implemented**; §12 records
-where it departs from §2. Nothing here changes an app that does not opt in. It builds
+where it departs from §2. **Step 3 lands in two parts**: 3a, the web side of `External(…)`, is
+implemented, and §13 records where it departs from §5. Nothing here changes an app that does not
+opt in. It builds
 on #513's queue concurrency, `submit_queued_task` and `checkpoint!`
 ([PR #523](https://github.com/PingoLee/Nitro.jl/pull/523)), and uses their names.
 
@@ -151,7 +153,8 @@ holding it for a bounded time, and taking it back.
 **Who runs `requeue_expired!`.** Every consumer, on each heartbeat tick **and once before its first
 claim**, so a one-shot consumer that finds nothing to do still adjudicates its crashed predecessor's
 row. And the web process's retention tick, as the fallback for a queue whose last consumer is gone.
-That tick is coarse (it needs `cleanup_enabled`, and defaults to 24 hours), so the docs say a
+The tick adjudicates only the queues its own runtime declares external (`on_unknown_queue = :skip`,
+decided on #603 and recorded in §13); a consumer keeps the fail-closed rule. That tick is coarse (it needs `cleanup_enabled`, and defaults to 24 hours), so the docs say a
 deployment relying on it should shorten `cleanup_interval_hours`. It is a store CAS, so it is safe
 from any process and idempotent across all of them.
 
@@ -225,7 +228,10 @@ Workers.consume!(app; store, queues = ["heavy" => 4])    # 4 = this process's co
   `claim_next!` claims only those, so a consumer can never take a row the web queued in-process under
   the same name (and holds in a channel).
 - **Switching a queue's placement is a deploy step, not only a config edit.** In-process → external:
-  rows already queued in-process stay in the web's channel and run there; new submits go external.
+  the switch is a restart, and the old web process's teardown **cancels** the runs still buffered in
+  its channel (`"Cancelled by worker shutdown"`), as every teardown does; runs already executing get
+  the drain timeout. They never become external rows, so drain the queue first if they matter. New
+  submits go external. (Corrected in §13: this bullet first said the buffered rows stay and run.)
   External → in-process: stop the consumers once the queue is empty. Rows still `PENDING` with
   `external = true` are reported by the web's `start!` (`@warn` with the count) and stay claimable by
   any consumer still running. The docs give both procedures.
@@ -542,3 +548,80 @@ landed:
 - building a `NamedJobRun` from a claimed row (`_job_run` is the seam);
 - `declare_queues!`;
 - the distinct exception type for `claim_next!`'s second undecodable head (§11).
+
+## 13. Implementation notes: step 3a, placement on the web side (2026-10-16)
+
+Step 3 is split in two PRs, agreed with the maintainer: 3a is everything the **web process** does
+with an external queue, and 3b is `consume!` (the claim loop, the heartbeat, hand-back and the stop
+path) with the two-process test. 3a shipped `External(…)`, `declare_queues!`, external rows,
+store-counted admission, the start-time refusals, `requeue_expired!` on the retention tick,
+`release_claim!`'s policy, and `ClaimPoisonedError`. Where it departs from §2–§5:
+
+- **`External(…; options = TaskOptions(…))`.** A claimed row carries no `TaskOptions`: the
+  `QueueItem` that holds them in-process never crosses to another process, and §3 adds no column
+  for them. An external queue's timeout and retry settings are therefore queue configuration, read
+  by both processes from the shared declaration, and a submit to an external queue that passes its
+  own `options` is an `ArgumentError` pointing at the declaration.
+- **`External()` refuses a missing `on_lease_expiry` when it is built**, not first at `start!`:
+  earlier than §4 asks, and the same refusal.
+- **Declarations live on the App** (extension slot `:workers_queues`), like the job registry, so
+  they survive `terminate` and a consumer, which installs no runtime, reads the same ones.
+  `worker_startup(app; queues)` and `start!(app; queues)` keep their keyword and merge it with the
+  app's declarations under the one-name-one-setting rule. An `External(…)` passed through that
+  keyword, or to `WorkerRuntime(store; queues)`, is refused with a pointer to `declare_queues!`, so
+  placement has one source. `declare_queues!` on an app with a runtime installed applies to it at
+  once.
+- **"A store no other process can read" is a trait**, `_visible_across_processes(store)`: `false`
+  for `InMemoryWorkerStore`, `true` by default. §11 had kept it separate from the claim capability,
+  since `InMemoryWorkerStore` implements every claim method.
+- **Admission adds one store read to the claim capability**, `count_external_runs(store, statuses;
+  queue_name, submitter)`. `max_pending` counts the queue's `PENDING` external rows;
+  `max_runs_per_owner` counts the live external rows the identity **submitted** plus its live runs
+  in this process, so one quota covers both placements for an external submit. The submitter is the
+  record's first watcher, which needs no new column. Two shapes were rejected in review: the owner
+  half of the id, because a `:global` id has none, so `scope = :global` was a way past the quota;
+  and "any watcher", because a submit may grant any identity, so one user could fill another's
+  quota with grants. An in-process submit still counts only this
+  process's runs, which keeps its path free of store reads. The checks run inside
+  `_register_or_watch!`, where a run is about to be minted, so joining a live key is never refused
+  by them. The count is a plain read, so it is the one claim-capability method called under
+  `lock_tasks`.
+- **`release_claim!(…; policy)` enforces the attempt bound in the store**, as proposed on #514
+  (2026-10-15): at the bound under `:requeue` the run is `FAILED`, under `:fail` a hand-back is
+  never failed, because nothing expired. Its error has its own wording ("Handed back … not
+  re-queued"), not `_lease_expiry_error`'s "Lease expired", since nothing did; the bound itself is
+  one condition. On PormG the write reads the row's attempt under the same fence it then writes
+  with, which is sound because every writer of `attempt` also changes `run_id`.
+- **`get_queue_status` answers an external queue from the store** (`:external => true`, the pending
+  ids and the running count) rather than "Queue not found".
+- **Declarations made while a runtime starts are not lost.** `start!` and `startup` merge the
+  app's declarations again, under their lock, after the install, so a `declare_queues!` racing the
+  start either lands in that merge or finds the runtime installed. Under `allow_undeclared_queues`,
+  an undeclared first submit racing an `External(…)` declaration of the same name is refused where
+  the queue would be minted, under `queue_lock`, so one name never runs in both places.
+- **The web tick adjudicates only its own external queues** (decided by the maintainer on #603,
+  2026-10-17). As first written, the web process adjudicated with its runtime's policies and §3's
+  fail-closed rule, so an expired lease on an external queue it does not declare was `FAILED` as
+  `unknown_queue`. Two apps sharing one store with different external queues, or an old web
+  process during a rolling deploy that adds a queue, would then fail the other's crashed
+  `:requeue` runs. `requeue_expired!` now takes `on_unknown_queue = :fail | :skip`: the web tick
+  passes `:skip`, so it reads only its own queues' rows, and the others are left to the consumers
+  that declare them. Consumers keep `:fail`, the default, so a queue no process declares any more
+  is still failed closed by the next consumer of the app, never stranded. The cost is that a
+  queue with no consumer *and* no web declaration stays `RUNNING` until one exists.
+- **`max_pending` defaults to 100** (maintainer, #603), an in-process queue's buffer size, as §5
+  first proposed; the first cut had shipped no default. `max_pending = nothing` removes the bound.
+- **§5's switch procedure was wrong and is corrected there** (maintainer, #603): switching a queue
+  from in-process to external is a restart, and the old web process's teardown cancels the runs
+  still buffered in its channel, as every teardown does. They do not stay and run; the tutorial
+  already said so.
+- **Under `:requeue`, every hand-back counts toward `max_attempts`.** `claim_next!` increments
+  `attempt` whatever ended the previous claim, so a run handed back at each deploy drain is
+  recorded `FAILED` once it has been claimed `max_attempts` times. The tutorial says so.
+- **`set_task!` still writes `created_at` and `queue_name`** (§11). The consumer in 3b writes
+  terminal states through `try_transition!`, never `set_task!`, so the item stays open rather than
+  changing a shared write path here.
+
+No `upgrading/` entry: `release_claim!`'s new required keyword is on an optional store method that
+no release has shipped yet (step 1 is still `Unreleased`), and everything else is additive.
+

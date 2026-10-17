@@ -99,13 +99,16 @@ still owes for this capability, and `missing_store_methods` does not include the
 |---|---|
 | [`claim_next!`](@ref)`(store, queue_name, consumer_id; lease_seconds, now)` | Atomically claim the oldest external `PENDING` submission of a queue as a new run, or `nothing` |
 | [`renew_leases!`](@ref)`(store, consumer_id, runs; lease_seconds, now)` | Extend the leases a consumer holds, returns the run ids that are still its own |
-| [`release_claim!`](@ref)`(store, task_id, run_id)` | Hand a claim back to `PENDING` as a new run, returns `Bool` |
-| [`requeue_expired!`](@ref)`(store, now; policies)` | Adjudicate every expired lease by its queue's [`LeasePolicy`](@ref), returns counts |
+| [`release_claim!`](@ref)`(store, task_id, run_id; policy, now)` | Hand a claim back to `PENDING` as a new run, or record it `FAILED` at its queue's attempt bound, returns `Bool` |
+| [`requeue_expired!`](@ref)`(store, now; policies, on_unknown_queue)` | Adjudicate every expired lease by its queue's [`LeasePolicy`](@ref), failing or skipping one on a queue `policies` does not name, returns counts |
+| [`count_external_runs`](@ref)`(store, statuses; queue_name, submitter)` | Count external submissions, for the submit-time bounds of an external queue |
 
-Each is one atomic intent operation in the store, like `try_transition!`: a database backend
-expresses it in fenced statements, never as a read-modify-write under `lock_tasks`, which is
-process-local. **Never call them under `lock_tasks`**: a database transaction can take a lock of
-its own, and an order that differs from the request path's is a deadlock.
+The first four are each one atomic intent operation in the store, like `try_transition!`: a
+database backend expresses it in fenced statements, never as a read-modify-write under
+`lock_tasks`, which is process-local. **Never call them under `lock_tasks`**: a database
+transaction can take a lock of its own, and an order that differs from the request path's is a
+deadlock. `count_external_runs` is the exception: it is a plain read, like `get_task_info`, and the
+submit path calls it under `lock_tasks`, where it decides to mint a run.
 
 # Obligations that are not methods
 
@@ -445,23 +448,58 @@ writes cannot both win.
 function renew_leases! end
 
 """
-    release_claim!(store, task_id::String, run_id::UUID) -> Bool
+    release_claim!(store, task_id::String, run_id::UUID; policy::LeasePolicy,
+                   now::DateTime = current_time_utc()) -> Bool
 
 Hand a claim back: the run `run_id` of `task_id` goes from `RUNNING` to `PENDING` as a new run of
 the same submission, with a fresh `run_id`, `claimed_by`, `lease_expires_at` and `started_at`
-cleared, and progress reset. Returns whether it did. Part of the optional claim capability.
+cleared, and progress reset. Returns whether it wrote anything. Part of the optional claim
+capability.
 
 Fenced on `run_id`, on `status = RUNNING`, and on the submission being external, so a run whose
 claim is already gone — cancelled, requeued, re-claimed — changes nothing, and neither does a run
 a process executes as its own, which nothing would ever pick up again from `PENDING`.
 
 `attempt` is **not** given back. A run a consumer hands back on purpose (it is draining) still
-counts as an attempt, so a job that keeps being handed back still reaches its queue's bound.
+counts as an attempt, so a job that keeps being handed back still reaches its queue's bound, and
+**the store enforces that bound**, from `policy`, the queue's [`LeasePolicy`](@ref):
+
+| `policy` | Outcome |
+|---|---|
+| `:requeue`, `attempt < max_attempts` | back to `PENDING`, as above |
+| `:requeue`, `attempt >= max_attempts` | `FAILED`, with an error naming the attempts |
+| `:fail` | back to `PENDING`: nothing expired, so the policy for a lost lease does not apply |
+
+Both outcomes are one write fenced on the run, so the attempt count it reads is the current one:
+every writer of `attempt` also changes `run_id`. Leaving the bound to the consumer would make it
+hold only for a well-behaved one.
 """
 function release_claim! end
 
 """
-    requeue_expired!(store, now::DateTime; policies::AbstractDict{String, LeasePolicy})
+    count_external_runs(store, statuses::AbstractVector{TaskStatus};
+                        queue_name::Union{Nothing, String} = nothing,
+                        submitter::Union{Nothing, String} = nothing) -> Int
+
+How many **external** submissions are in one of `statuses`, optionally only those of `queue_name`,
+and only those **submitted by** the user id `submitter`. Part of the optional claim capability.
+
+The submitter is the record's **first** watcher: a submit writes the submitter, then its grants, and
+a later grant or join only appends. Not the owner half of the id ([`owner_of`](@ref)), because a
+`:global` id has none, so a count by id would let one identity past its quota with `scope =
+:global`. And not "any watcher", because a submit may grant any identity, so counting grants would
+let one user exhaust another's quota. This is the identity the in-process quota counts too.
+
+The web process reads it to bound an external queue at submit time
+([`External`](@ref)`(; max_pending)`, and `max_runs_per_owner`), because an external run reserves
+nothing in the process that submitted it. It is a plain read, so a count followed by an insert is
+approximate under concurrent submits.
+"""
+function count_external_runs end
+
+"""
+    requeue_expired!(store, now::DateTime; policies::AbstractDict{String, LeasePolicy},
+                     on_unknown_queue::Symbol = :fail)
         -> @NamedTuple{requeued::Int, failed::Int, unknown_queue::Int, lost_race::Int}
 
 Adjudicate every `RUNNING` run whose lease expired before `now`, by its queue's
@@ -469,12 +507,19 @@ Adjudicate every `RUNNING` run whose lease expired before `now`, by its queue's
 
 | The run's queue | Outcome |
 |---|---|
-| not in `policies` | `FAILED`, counted in `unknown_queue`: **fail-closed**, never stranded |
+| not in `policies`, `on_unknown_queue = :fail` | `FAILED`, counted in `unknown_queue`: **fail-closed**, never stranded |
+| not in `policies`, `on_unknown_queue = :skip` | not read, and left `RUNNING` for a process that declares the queue |
 | `:fail` | `FAILED` |
 | `:requeue`, `attempt < max_attempts` | back to `PENDING` as a new run (fresh `run_id`, claim and `started_at` cleared, progress reset, `created_at` kept) |
 | `:requeue`, `attempt >= max_attempts` | `FAILED`, with an error naming the attempts |
 
 `failed` counts every run recorded `FAILED`; `unknown_queue` is how many of those had no policy.
+
+A consumer passes `:fail`, the default: it holds the app's whole set of external queues, so an
+expired run on a queue none of them names belongs to a queue no longer declared anywhere. The web
+process's retention tick passes `:skip`: it adjudicates only the queues its own runtime declares,
+so two apps sharing one store, or an old web process in a rolling deploy that adds a queue, never
+fail each other's runs.
 
 Only leased runs are looked at: a `RUNNING` row with no lease belongs to a process running it as
 its own, and is the zombie sweep's to judge. Each outcome is one write fenced on the run it read
@@ -526,8 +571,25 @@ function _lease_expiry_error(queue::Union{Nothing, String}, policy::Union{Nothin
     return nothing
 end
 
+# The stored error of a run `release_claim!` fails because it reached its queue's attempt bound,
+# `nothing` when it goes back to `PENDING` instead. Its own wording, not `_lease_expiry_error`'s:
+# nothing expired. One renderer for both backends, so the two cannot word it differently.
+function _release_bound_error(queue::Union{Nothing, String}, policy::LeasePolicy, attempt::Int)
+    (policy.on_expiry === :requeue && attempt >= policy.max_attempts) || return nothing
+    q = queue === nothing ? "(none)" : "'$queue'"
+    return "Handed back on queue $q after $attempt attempt(s) (max_attempts = " *
+           "$(policy.max_attempts)); not re-queued"
+end
+
 _lease_policy(policies::AbstractDict, queue::Union{Nothing, String}) =
     queue === nothing ? nothing : get(policies, queue, nothing)
+
+# `requeue_expired!`'s `on_unknown_queue`, validated once for every backend.
+function _check_on_unknown_queue(on_unknown_queue::Symbol)
+    on_unknown_queue in (:fail, :skip) || throw(ArgumentError(
+        "`on_unknown_queue` must be :fail or :skip, got $(repr(on_unknown_queue))"))
+    return on_unknown_queue
+end
 
 const _ExpiryTally = @NamedTuple{requeued::Int, failed::Int, unknown_queue::Int, lost_race::Int}
 
@@ -682,6 +744,7 @@ const CLAIM_STORE_INTERFACE = (
     (renew_leases!,                 (AbstractWorkerStore, String, Any)),
     (release_claim!,                (AbstractWorkerStore, String, UUID)),
     (requeue_expired!,              (AbstractWorkerStore, DateTime)),
+    (count_external_runs,           (AbstractWorkerStore, Any)),
 )
 
 _store_arg_index(argtypes) = something(findfirst(T -> T === AbstractWorkerStore, argtypes))
@@ -744,6 +807,13 @@ missing_claim_methods(S::Type{<:AbstractWorkerStore}) = _missing_methods(S, CLAI
 # Whether a store implements the whole claim capability. Not exported: the consumer process asks it.
 supports_claims(S::Type{<:AbstractWorkerStore}) = isempty(missing_claim_methods(S))
 supports_claims(store::AbstractWorkerStore) = supports_claims(typeof(store))
+
+# Whether a process other than this one can read what `store` holds. An external queue needs it:
+# its runs are claimed by a consumer process, so a store that only this process can see would
+# record a submit no consumer could ever claim. `true` unless a backend says otherwise: a store
+# that implements the claim capability is assumed to be shared, and the one volatile backend
+# opts out below.
+_visible_across_processes(::AbstractWorkerStore) = true
 
 function _missing_methods(S::Type{<:AbstractWorkerStore}, interface)
     names = Symbol[]
@@ -1025,25 +1095,51 @@ function renew_leases!(store::InMemoryWorkerStore, consumer_id::String,
     return renewed
 end
 
-function release_claim!(store::InMemoryWorkerStore, task_id::String, run_id::UUID)
+function release_claim!(store::InMemoryWorkerStore, task_id::String, run_id::UUID;
+                        policy::LeasePolicy, now::DateTime=current_time_utc())
     lock(store.task_lock) do
         t = get(store.task_registry, task_id, nothing)
         # `external` too: handing back a run this process executes itself would strand it at
         # PENDING, since no channel holds it and `claim_next!` takes only external rows.
         (t !== nothing && t.run_id == run_id && t.status == RUNNING && t.external) || return false
-        store.task_registry[task_id] = _back_to_pending(t)
+        err = _release_bound_error(t.queue_name, policy, t.attempt)
+        if err === nothing
+            store.task_registry[task_id] = _back_to_pending(t)
+        else
+            # In place, as `requeue_expired!` fails a run: the run that held the claim is over.
+            t.error = err
+            t.completed_at = now
+            t.status = FAILED
+        end
         return true
     end
 end
 
+function count_external_runs(store::InMemoryWorkerStore, statuses::AbstractVector{TaskStatus};
+                             queue_name::Union{Nothing, String}=nothing,
+                             submitter::Union{Nothing, String}=nothing)
+    lock(store.task_lock) do
+        return count(values(store.task_registry)) do t
+            t.external && t.status in statuses &&
+                (queue_name === nothing || t.queue_name == queue_name) &&
+                (submitter === nothing || (!isempty(t.watchers) && first(t.watchers) == submitter))
+        end
+    end
+end
+
+# Its records live in this process's memory, which no consumer process can read (#514).
+_visible_across_processes(::InMemoryWorkerStore) = false
+
 function requeue_expired!(store::InMemoryWorkerStore, now::DateTime;
-                          policies::AbstractDict{String, LeasePolicy})
+                          policies::AbstractDict{String, LeasePolicy}, on_unknown_queue::Symbol = :fail)
+    skip_unknown = _check_on_unknown_queue(on_unknown_queue) === :skip
     # The counts live inside the closure and come back as its value: assigned from inside it, they
     # would be captured in a `Core.Box` (#364).
     return lock(store.task_lock) do
         requeued = failed = unknown = 0
         expired = [t for t in values(store.task_registry)
-                   if t.status == RUNNING && t.lease_expires_at !== nothing && t.lease_expires_at < now]
+                   if t.status == RUNNING && t.lease_expires_at !== nothing && t.lease_expires_at < now &&
+                      !(skip_unknown && _lease_policy(policies, t.queue_name) === nothing)]
         for t in expired
             policy = _lease_policy(policies, t.queue_name)
             err = _lease_expiry_error(t.queue_name, policy, t.attempt)

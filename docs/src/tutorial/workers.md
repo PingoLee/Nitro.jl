@@ -173,6 +173,87 @@ is submitted through its `App` (`submit_task(app, …)`), because the `App` owns
 only ever run in this process. Prefer the named form for anything you might later want to run
 in a separate worker process, where a closure cannot go.
 
+## External Queues
+
+A queue's **placement** says where its runs execute. By default that is this process. A queue
+declared `External(…)` runs in a **separate consumer process** instead, which isolates the web
+process from the job's CPU, its garbage collection, its memory and its crashes
+([#514](https://github.com/PingoLee/Nitro.jl/issues/514)). The web process only records the
+submit in the shared store; a consumer claims the run from there, under a lease, and runs it.
+
+Placement is configuration. Declare the queues with `declare_queues!`, in the same setup
+function as the jobs, which the web process and the consumer both call:
+
+```julia
+function setup_workers!(app)
+    declare_queues!(app, ["email", "heavy" => External(on_lease_expiry = :requeue)])
+    register_job!(app, "fit_model", FitArgs) do task_info, args
+        fit(args.dataset_id; epochs = args.epochs, on_batch = () -> checkpoint!(task_info))
+    end
+end
+
+setup_workers!(app)
+serve(app; middleware = [worker_startup(app; store = pormg_nitro_worker())])
+
+# in a handler: the same call as for an in-process queue
+task_id = submit_queued_task(app, "heavy", "fit-42", Job("fit_model", FitArgs(dataset_id = 42)), Owner(uid))
+```
+
+The consumer process's entry point is the next part of #514; this section covers what the web
+process does with an external queue.
+
+**Delivery is at-least-once, so the job must be idempotent.** A consumer that dies mid-run leaves
+a claim whose lease expires, and `on_lease_expiry` decides what happens then. It has no default,
+because only you know whether your job may run twice:
+
+- `:requeue` runs it again, up to `max_attempts` claims (default 3), then records it `FAILED`.
+  Choose it only for a job that is safe to repeat. Every hand-back at a deploy drain counts toward
+  `max_attempts` too, so a long run interrupted by that many deploys is recorded `FAILED`.
+- `:fail` records it `FAILED` on the first expiry. Choose it for a job with a side effect that must
+  not repeat, such as an email or a charge.
+
+A re-queued run goes back to its original place in the queue, so it can overtake runs submitted
+after it: an external queue is not a strict FIFO across a consumer crash.
+
+What changes for a submit to an external queue:
+
+| | In-process queue | `External(…)` queue |
+|---|---|---|
+| A closure | runs | `ArgumentError`: register the job and submit `Job(name, args)` |
+| `options = TaskOptions(…)` on the submit | applies | `ArgumentError`: set them on the declaration, `External(…; options)`, which the consumer reads |
+| The backlog bound | the queue's buffer (100) | `External(…; max_pending = 100)` by default, counted in the store; `nothing` removes it |
+| `max_runs_per_owner` | this process's live runs | the same, plus the external runs the identity submitted (either scope), counted in the store |
+
+Both store counts are read before the insert, so concurrent submits can overshoot them by a few
+rows: they bound runaway callers, they are not exact quotas. A full queue or owner is the same
+`WorkerCapacityError` (`503`, `429`) as in-process.
+
+**Impossible configurations fail at start**, not as a run that never happens:
+
+- `External()` without `on_lease_expiry` is an `ArgumentError` when it is built.
+- An external queue on `InMemoryWorkerStore` (the default) is refused by `start!` and
+  `worker_startup`: no other process can see that store, so no consumer could ever claim the run.
+  Use a persistent store such as `pormg_nitro_worker()`.
+- An `External(…)` passed to `worker_startup(app; queues)` is refused, with a pointer to
+  `declare_queues!`, so the two processes read their placements from one place.
+
+The web process also adjudicates expired leases on its retention tick, as a fallback for a queue
+whose consumers are all gone. It looks only at the queues its own runtime declares external, so
+two apps sharing a store, or an old web process during a deploy that adds a queue, never fail each
+other's runs. That tick runs every `cleanup_interval_hours` (24 by default), so a deployment that
+relies on it should shorten the interval.
+
+**Switching a queue's placement is a deploy step.** A queue's declaration is fixed for the life of
+a runtime, so the switch is a restart with the new setup function:
+
+- **In-process to external:** the old web process's teardown cancels the runs still buffered in
+  its queue (`"Cancelled by worker shutdown"`), as every teardown does, and runs that were already
+  executing get the drain timeout. After the restart, new submits go external. Drain the queue
+  first if those runs matter.
+- **External to in-process:** stop the consumers once the queue is empty. `start!` warns, with a
+  count, about runs still waiting for a consumer on a queue it now runs in-process; only a consumer
+  can run them.
+
 ## Start Workers With The Server
 
 The recommended app-level entrypoint is the exported `worker_startup(app; ...)` middleware.

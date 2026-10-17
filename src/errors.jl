@@ -5,7 +5,7 @@ import JSON
 import HTTP
 
 export ValidationError, CookieError, AuthorizationError, StoreInterfaceError, UnsupportedMediaTypeError,
-    WorkerUnavailableError, WorkerCapacityError
+    WorkerUnavailableError, WorkerCapacityError, ClaimPoisonedError
 
 """
     ValidationError(msg::String)
@@ -258,7 +258,7 @@ no record, no queued item, and a previous run of the same key is not displaced.
 | `kind` | Limit | `handle_error` answers |
 |---|---|---|
 | `:runtime` | `WorkerRuntime(store; max_concurrent_runs)`, async runs in flight (64 by default) | `503 Service Unavailable` |
-| `:queue` | a declared queue's buffer (100 items by default) | `503 Service Unavailable` |
+| `:queue` | a declared queue's buffer (100 items by default), or an `External(…; max_pending)` queue's backlog in the store | `503 Service Unavailable` |
 | `:owner` | `WorkerRuntime(store; max_runs_per_owner)`, one owner's live runs (off by default) | `429 Too Many Requests` |
 
 A full queue used to block the submitting request in `put!` with no timeout, so one owner could
@@ -279,6 +279,31 @@ end
 
 function Base.showerror(io::IO, e::WorkerCapacityError)
     print(io, "Worker Capacity ($(e.kind)): $(e.msg)")
+end
+
+"""
+    ClaimPoisonedError(queue_name::String, exception_type::Type)
+
+What `claim_next!` throws when a **second** head row of `queue_name` does not decode in one call
+([#514](https://github.com/PingoLee/Nitro.jl/issues/514)). The first one is failed out of the way,
+so a single bad row does not block the queue. A second one says the cause is probably not the rows
+(a decode regression, say), and failing a whole backlog would be irreversible, so the store writes
+nothing more and throws this instead.
+
+A consumer must **stop claiming from that queue** on it, not retry: the limit is one failed row per
+call, so a retry loop would still fail the whole backlog, one row at a time. It is its own type so a
+consumer can match on it rather than on message text. It carries the exception's type and never its
+message, which may quote stored application data.
+"""
+struct ClaimPoisonedError <: Exception
+    queue_name::String
+    exception_type::Type
+end
+
+function Base.showerror(io::IO, e::ClaimPoisonedError)
+    print(io, "ClaimPoisonedError: a second head row of queue '$(e.queue_name)' does not decode ",
+          "($(e.exception_type)); refusing to fail more of the queue, since the cause is probably ",
+          "not the rows themselves")
 end
 
 
@@ -454,7 +479,9 @@ different reasons**, and conflating them is how this list rots:
    handler that ends the loop with a `@warn`** rather than killing the task (#369). In a
    background task a rethrow reaches nobody who can act on it, and swallowing it and looping on
    makes the loop the task every later Ctrl-C lands in. The reasoning is canonical next to
-   `_cleanup_scheduler_loop`. `src/response.jl`'s `_run_sse_producer` (#160) is the same
+   `_cleanup_scheduler_loop`. Its third per-tick catch, around `_requeue_expired_tick!` (#514),
+   is the same shape, and so is `_warn_stranded_external`'s catch on `start!`, whose failure
+   costs a warning and never the start. `src/response.jl`'s `_run_sse_producer` (#160) is the same
    discipline one level down: the producer task nothing waits on, where the expected failure is
    the client disconnecting. Do not "fix" these to match the table above.
 3. **The error boundary itself — the place the other two are MEANT to arrive.**

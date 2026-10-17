@@ -17,7 +17,7 @@ change belongs to: **the store answers *"what does the record say?"*; the runtim
 this process doing right now?"***.
 
 - **`AbstractWorkerStore`** (`src/Workers/registry.jl`): data access plus policy hooks, 16 required
-  methods, plus an **optional** four-method claim capability (`CLAIM_STORE_INTERFACE`, checked by
+  methods, plus an **optional** five-method claim capability (`CLAIM_STORE_INTERFACE`, checked by
   `missing_claim_methods`) that only a store backing a queue run by a separate consumer process
   needs ([#514](https://github.com/PingoLee/Nitro.jl/issues/514)). It owns **nothing that runs** —
   no queue, no scheduler, no `Task` handle — which is what makes the #29 leak unrepresentable
@@ -124,7 +124,8 @@ you add anything:
 | `release_task!` | **Admin only**, takes `System()`: deletes a *finished* record through the fenced `try_delete_task!`, so a squatted `:global` key can be reused |
 | `WorkerRuntime(store; max_concurrent_runs = 64, max_runs_per_owner = nothing, allow_undeclared_queues = false, queues)`, `WorkerCapacityError` | Limits ([#324](https://github.com/PingoLee/Nitro.jl/issues/324)). A submit past a limit is refused **before anything is written** — `:runtime`/`:queue` a 503, `:owner` a 429 — and a full queue never blocks in `put!`. Only declared queue names get a queue (else `AuthorizationError`). A run holds its reservation until its callback *returns*, a timed-out one included (`_RunHandoff`, one per attempt); a timed-out *queued* callback then counts against the runtime cap, and queues hold their next item only while such abandoned callbacks *alone* fill it (never on async load: an async run waiting on a queued item would deadlock). Every other exit releases the reservation exactly once, by `run_id`. `reservation_lock` is a leaf, and `queue_lock` is never taken inside `lock_tasks` |
 | *(not exported)* `get_task_info`, `add_watcher!`, `set_task!`, `replace_task!`, `try_transition!`, `try_delete_task!`, `delete_task!`, `cleanup_tasks!`, `clear_records!`, `list_running_task_refs`, `RunningTaskRef`, `lock_tasks`, `get_active_task[_info]`, `register_run!`, `WorkerQueue`, `QueueItem`, `get_worker_queues`, `get_queue_lock` | The store contract and the run/queue internals. Backends extend them qualified; they perform no authorization, so they must not become application API again (#323) |
-| *(not exported)* `claim_next!`, `renew_leases!`, `release_claim!`, `requeue_expired!`, `LeaseRenewal`, `LeasePolicy`; *(exported)* `missing_claim_methods` | The optional claim capability (#514). Each is one fenced store statement, never a read-modify-write under `lock_tasks`, and **never called under `lock_tasks`** (a SQLite claim transaction takes the database write lock) |
+| *(not exported)* `claim_next!`, `renew_leases!`, `release_claim!`, `requeue_expired!`, `count_external_runs`, `LeaseRenewal`, `LeasePolicy`; *(exported)* `missing_claim_methods` | The optional claim capability (#514). Each of the first four is one fenced store statement, never a read-modify-write under `lock_tasks`, and **never called under `lock_tasks`** (a SQLite claim transaction takes the database write lock). `count_external_runs` is a plain read, the one the submit path calls under `lock_tasks`. `release_claim!` takes the queue's `policy` and records a run `FAILED` at its attempt bound, so the bound holds for any consumer, not only a well-behaved one |
+| `External`, `declare_queues!` | A queue's placement (#514). `declare_queues!(app, [...])` writes the **App's** declarations (extension slot `:workers_queues`), which `worker_startup`/`start!` merge and a consumer reads; an `External(…)` passed anywhere else is refused with a pointer to it. An external queue gets no processor and no channel; its submit records an `external = true` row and **reserves nothing in this runtime**, because no local run would ever release it — `max_pending` and `max_runs_per_owner` are counted in the store instead (`_admit_external!`). It refuses a closure and a submit's own `options` (those live on `External(…; options)`). A store with no claim capability, or one `_visible_across_processes` says no consumer can read (`InMemoryWorkerStore`), is refused before anything is installed |
 | `scoped_task_key`, `DEFAULT_QUEUE_NAME` | Resolve a `(task_key, user_id, scope)` to its stored id; the queue name `submit_task` authorizes against |
 | `get_queue_status` | Queue-wide introspection — **admin only**, takes `System()`; an `Owner` is a `MethodError` |
 | `update_progress!` | The only safe write to `TaskInfo.progress` |
@@ -228,6 +229,15 @@ but that consumer's, so the criterion above would fail every run a consumer is e
 reads `claimed_by` off each `RunningTaskRef`, skips those runs **first**, and counts them as
 `leased`. `requeue_expired!` is the only thing that adjudicates them. Do not "simplify" the skip
 into the SQL: like `zombie_min_age`'s filter, it runs in Julia so a skipped row is still counted.
+
+The web process runs `requeue_expired!` on its retention tick, in a `try` of its own between the
+periodic zombie sweep and retention, with its runtime's external policies and
+`on_unknown_queue = :skip` (`_requeue_expired_tick!`). It is the fallback for a queue whose
+consumers are all gone, and a no-op on a runtime with no external queue. **It never adjudicates a
+queue its runtime does not declare**: that queue may belong to another app on the same store, or
+to a newer deploy, so failing its runs closed is the consumers' call (they keep the default
+`:fail`). It is safe from any number of processes because every
+outcome is fenced on the expiry, so it needs no bound the way the zombie sweep does.
 
 Since [#176](https://github.com/PingoLee/Nitro.jl/issues/176) that criterion is correct rather than
 conditionally correct: a teardown no longer manufactures zombies out of runs that are still
