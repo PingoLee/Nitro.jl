@@ -178,12 +178,20 @@ Base.showerror(io::IO, e::AuthDenial) = print(io, "Auth Denial: ", e.response.st
 """
     ValidatorFault(msg::String)
 
-What an extractor's validator raises in place of its own exception when it throws something other
-than a `ValidationError`, or returns something other than a `Bool` (#595). A validator receives
-the bound value (a client's deserialized body, a token's claims), and the most likely accidental
-throw, a `MethodError`, renders its arguments, so letting the original reach `handlerequest`'s
-`@error` wrote that value to the log. The original is dropped; `msg` names the parameter, the
-bound type and the validator, never the value.
+What Nitro raises in place of an exception thrown by an application callback that is handed
+request or session data. It replaces the exceptions of two kinds of callback:
+
+- **An extractor's validator** (#595), when it throws something other than a `ValidationError` or
+  returns something other than a `Bool`. It receives the bound value (a client's deserialized
+  body, a token's claims). `msg` names the parameter, the bound type and the validator.
+- **`SessionMiddleware`'s `validator` and `session_auth_hash`** (#602), when one throws, or the
+  hook returns something other than a string or `nothing`. They receive the session id, which is
+  a bearer credential, and the session data or the identity found in it. `msg` names the hook.
+
+The most likely accidental throw, a `MethodError`, renders its arguments, so letting the original
+reach `handlerequest`'s `@error` wrote them to the log. The original is dropped, and `msg` never
+carries a value. One type serves both, because nothing tells them apart: neither is answered any
+differently from another handler fault.
 
 It is a server bug, not a rejection, so it is answered like any other handler fault: the fixed
 `500` body, logged at `@error` with a backtrace.
@@ -454,6 +462,8 @@ of these sites call (a user's `validate_token`, a user's session store):
 | `src/utilities/misc.jl` ×4 | `parseparam`'s `_parse_json_bounded(str, T)` fall-through — reached by **any** scalar path/query parameter, since `parse(Int, str)` fails first and lands there — plus `parsebody_union`'s member loop, the same shape for `Body{T}` (#345) |
 | `src/extractors.jl` ×8 | `safe_extract`'s `f()` (the extractor body, i.e. the parsers above), the app's session store, `Claims{T}`'s bind and the three in its refusal diagnosis (#527), and `validator_verdict`'s call of an app validator with `global_validate_identity`'s method lookup for its fault (#595) |
 | `src/middleware/csrf_middleware.jl` ×2 | `getform`/`getjson` |
+| `src/middleware/session_middleware.jl` ×2 | `_end_session!`'s delete through the app's session store, and `_validator_marker`'s call of the app's `validator` (#602) |
+| `src/types.jl` ×1 | `_call_auth_hash_hook`'s call of the app's `session_auth_hash` (#602) |
 | `ext/NitroPormGExt.jl` ×5 | the PormG stores' reads of their own stored JSON (#344): the session query and decode in `Base.get(::PormGSessionStore, …)`, which `SessionMiddleware` calls per request; `_parse_stored_json` for a task's `result`/`watchers`; `_listed_task`, which would otherwise swallow what `_parse_stored_json` rethrows one frame up; and `_claim_row!`'s decode of the head row a consumer claims (#514) |
 | `src/Workers/jobs.jl` ×2 | a named job's arguments (#514): `_encode_job`'s serialize-and-bind-back at submit, and `NamedJobRun`'s bind of the stored JSON when the run starts. Both reach `JSON.parse` through `stored_json_bind` (`json_bind` without the request field cap, since arguments are stored data), and the run-side one turns every other failure into a terminal `JobError` |
 
