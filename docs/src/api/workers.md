@@ -33,6 +33,8 @@ Nitro.Workers.submit_queued_task
 Nitro.Workers.register_job!
 Nitro.Workers.Job
 Nitro.Workers.JobError
+Nitro.Workers.declare_queues!
+Nitro.Workers.External
 Nitro.Workers.TaskAuthority
 Nitro.Workers.Owner
 Nitro.Workers.System

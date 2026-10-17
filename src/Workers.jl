@@ -7,7 +7,8 @@ import Base.Threads: ReentrantLock, lock
 
 using ..Core: App, LifecycleMiddleware
 using ..Core.AppContext: set_extension!, get_extension, delete_extension!
-using ..Core: AuthorizationError, StoreInterfaceError, WorkerUnavailableError, WorkerCapacityError
+using ..Core: AuthorizationError, StoreInterfaceError, WorkerUnavailableError, WorkerCapacityError,
+    ClaimPoisonedError
 using ..Core.Errors: implements_contract_method, store_contract_error
 # The per-attempt catch in the two executors treats these as terminal (#367); see the site
 # table in `is_unrecoverable`'s docstring.
@@ -37,6 +38,7 @@ export TaskStatus, PENDING, RUNNING, COMPLETED, FAILED, CANCELLED,
     start!, startup, recover_zombie_tasks!,
     submit_task, submit_queued_task, get_task_status, cancel_task, release_task!,
     Job, register_job!, JobError,
+    External, declare_queues!,
     update_progress!, cancel_requested, cancel_reason, CANCEL_REASONS, TaskTimeoutError,
     checkpoint!, TaskCancelledError,
     get_all_tasks, cleanup_old_tasks,
@@ -55,7 +57,7 @@ export TaskStatus, PENDING, RUNNING, COMPLETED, FAILED, CANCELLED,
 #   `add_watcher!`, `try_transition!`, `delete_task!`, `try_delete_task!`, `cleanup_tasks!`,
 #   `clear_records!`, `list_running_task_refs`, `RunningTaskRef`, `lock_tasks`, and the optional
 #   claim capability `claim_next!`, `renew_leases!`, `release_claim!`, `requeue_expired!`,
-#   `LeaseRenewal`, `LeasePolicy` (#514) -- and the live-run
+#   `count_external_runs`, `LeaseRenewal`, `LeasePolicy` (#514) -- and the live-run
 #   internals `get_active_task`, `get_active_task_info`, `register_run!`. A backend implements them
 #   and Nitro calls them; an application has no business calling them. They were exported and
 #   documented as user-facing API, which made the unsafe call the shorter one again (#323):

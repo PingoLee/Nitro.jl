@@ -12,8 +12,9 @@ using Nitro.Workers
 using Nitro.Workers: get_task_info, set_task!, replace_task!, add_watcher!, try_transition!,
     delete_task!, try_delete_task!, cleanup_tasks!, list_running_task_refs, RunningTaskRef,
     lock_tasks, get_active_task, get_active_task_info, register_run!, get_worker_queues,
-    claim_next!, renew_leases!, release_claim!, requeue_expired!, LeaseRenewal, LeasePolicy
-using Nitro.Errors: AuthorizationError
+    claim_next!, renew_leases!, release_claim!, requeue_expired!, count_external_runs,
+    LeaseRenewal, LeasePolicy
+using Nitro.Errors: AuthorizationError, ClaimPoisonedError
 
 # A named job's argument type (#514), with the field a later deploy added under a default.
 @kwdef struct JobArgsV2
@@ -66,7 +67,7 @@ const PORMG_OPERATOR_NAMES = Set([
 const MODELLED_FILTER_KEYS = Set([
     "id", "id__@gt", "id__@in", "run_id", "status", "status__@in", "queue_name",
     "completed_at__@lte", "completed_at__@isnull",
-    "watchers", "id__@startswith", "watchers__@contains",
+    "watchers", "id__@startswith", "watchers__@contains", "watchers__@startswith",
     # The claim capability (#514).
     "external", "claimed_by", "lease_expires_at__@lt",
 ])
@@ -304,6 +305,9 @@ function _mock_matches(row::Dict{String, Any}, k::String, v)
         return row["watchers"] == v
     elseif k == "id__@startswith"
         return startswith(row["id"], v)
+    elseif k == "watchers__@startswith"
+        # The submitter count (#514): a prefix of the serialized list, as LIKE 'x%' reads it.
+        return startswith(row["watchers"], v)
     elseif k == "watchers__@contains"
         # Substring match on the serialized JSON, like the real backend.
         return occursin(v, row["watchers"])
@@ -446,6 +450,14 @@ function Base.getproperty(qs::MockTaskQuerySet, name::Symbol)
                 _record_lock!(qs)
                 rows = _ordered_limited!(qs, _filtered_rows_locked(qs))
                 isempty(rows) ? nothing : _snapshot(qs, first(rows))
+            end
+        end
+    elseif name === :count
+        # `SELECT COUNT(*)` over the filtered rows: the submit-time bounds of an external queue
+        # (#514). Exact here, as it is in one statement on a real database.
+        return function()
+            return lock(_mock_lock(qs)) do
+                length(_filtered_rows_locked(qs))
             end
         end
     elseif name === :create
@@ -3559,8 +3571,8 @@ else
                                         now = later + Hour(5)) == [c1.run_id]
 
                     # Release: a new PENDING run that keeps its place and its attempt count.
-                    @test !release_claim!(s, "a1", a1.run_id)
-                    @test release_claim!(s, "a1", c1.run_id)
+                    @test !release_claim!(s, "a1", a1.run_id; policy = LeasePolicy(:requeue))
+                    @test release_claim!(s, "a1", c1.run_id; policy = LeasePolicy(:requeue))
                     durable = get_task_info(s, "a1")
                     @test durable.status == PENDING
                     @test !(durable.run_id in (a1.run_id, c1.run_id))
@@ -3569,12 +3581,12 @@ else
                     @test durable.attempt == 1
                     @test durable.progress == 0.0
                     @test durable.created_at == t0
-                    @test !release_claim!(s, "a1", c1.run_id)               # already handed back
+                    @test !release_claim!(s, "a1", c1.run_id; policy = LeasePolicy(:requeue))  # already handed back
                     # A run a process executes as its own is never handed back: from PENDING,
                     # nothing would ever pick it up again.
                     inproc = get_task_info(s, "in-proc")
                     @test try_transition!(s, "in-proc", (PENDING,), RUNNING; run_id = inproc.run_id)
-                    @test !release_claim!(s, "in-proc", inproc.run_id)
+                    @test !release_claim!(s, "in-proc", inproc.run_id; policy = LeasePolicy(:requeue))
                     @test get_task_info(s, "in-proc").status == RUNNING
                     again = claim("c2")
                     @test again.id == "a1"
@@ -3600,7 +3612,7 @@ else
                     seed_claimable!(s, "rq-2"; queue = "rq2tmp")
                     # Two claims, so its attempt count is at the bound when its lease runs out.
                     rq2 = claim!("rq2tmp")
-                    @test release_claim!(s, "rq-2", rq2.run_id)
+                    @test release_claim!(s, "rq-2", rq2.run_id; policy = LeasePolicy(:requeue))
                     rq2 = claim!("rq2tmp")
                     @test rq2.attempt == 2
                     seed_claimable!(s, "fq-1"; queue = "fq"); fq1 = claim!("fq")
@@ -3729,10 +3741,93 @@ else
             end
             m2._table["bad-1"]["result"] = "{broken"
             m2._table["bad-2"]["result"] = "{broken"
-            @test_throws "refusing to fail more" claim_next!(s2, "heavy", "c1"; lease_seconds = 60)
+            # Its own type, so a consumer matches on it rather than on the message (#514 step 3),
+            # and the message names the exception type, never what the row held.
+            err = try claim_next!(s2, "heavy", "c1"; lease_seconds = 60); nothing catch e; e end
+            @test err isa ClaimPoisonedError
+            @test err.queue_name == "heavy" && err.exception_type <: Exception
+            @test occursin("refusing to fail more", sprint(showerror, err))
+            @test !occursin("broken", sprint(showerror, err))
             @test m2._table["bad-1"]["status"] == "FAILED"
             @test m2._table["bad-2"]["status"] == "PENDING"
             @test m2._table["good"]["status"] == "PENDING"
+        end
+
+        @testset "release_claim! enforces the queue's attempt bound in the store (#514)" begin
+            t0 = DateTime(2026, 1, 1)
+            bounded = LeasePolicy(:requeue; max_attempts = 2)
+            for (label, s) in claim_backends()
+                @testset "$label" begin
+                    claim!() = claim_next!(s, "heavy", "c1"; lease_seconds = 60, now = t0)
+                    seed_claimable!(s, "b1")
+                    first_run = claim!()
+                    @test first_run.attempt == 1
+                    # Below the bound: back to PENDING, as before.
+                    @test release_claim!(s, "b1", first_run.run_id; policy = bounded, now = t0)
+                    @test get_task_info(s, "b1").status == PENDING
+                    second_run = claim!()
+                    @test second_run.attempt == 2
+                    # At the bound: FAILED, by the store, whatever the consumer would have done.
+                    @test release_claim!(s, "b1", second_run.run_id; policy = bounded, now = t0 + Minute(1))
+                    durable = get_task_info(s, "b1")
+                    @test durable.status == FAILED
+                    @test durable.error == "Handed back on queue 'heavy' after 2 attempt(s) " *
+                                           "(max_attempts = 2); not re-queued"
+                    @test durable.completed_at == t0 + Minute(1)
+                    @test claim!() === nothing
+                    # The fence still holds: a run already gone writes nothing.
+                    @test !release_claim!(s, "b1", second_run.run_id; policy = bounded)
+
+                    # `:fail` is about a LOST lease; a hand-back is not one, so it never fails here.
+                    seed_claimable!(s, "f1")
+                    fail_policy = LeasePolicy(:fail; max_attempts = 1)
+                    for _ in 1:3
+                        run = claim!()
+                        @test run.id == "f1"
+                        @test release_claim!(s, "f1", run.run_id; policy = fail_policy)
+                    end
+                    @test get_task_info(s, "f1").status == PENDING
+                    @test get_task_info(s, "f1").attempt == 3
+                end
+            end
+        end
+
+        @testset "count_external_runs counts external submissions only (#514)" begin
+            t0 = DateTime(2026, 1, 1)
+            for (label, s) in claim_backends()
+                @testset "$label" begin
+                    function seed!(id, watchers; queue = "heavy", external = true)
+                        t = TaskInfo(id; queue_name = queue, external)
+                        t.created_at = t0
+                        append!(t.watchers, watchers)
+                        replace_task!(s, id, t)
+                    end
+                    seed!("u1::a", ["u1"])
+                    seed!("u1::b", ["u1"])
+                    seed!("u2::c", ["u2"])
+                    seed!("u1::d", ["u1"]; queue = "other")
+                    seed!("u1::local", ["u1"]; external = false)
+                    # A `:global` id has no owner half; its submitter is still its first watcher.
+                    seed!("shared", ["u1"])
+                    # A grant is NOT counted against the grantee: any submit may grant anyone,
+                    # so counting it would let one user exhaust another's quota.
+                    seed!("u3::granted", ["u3", "u2"])
+                    claimed = claim_next!(s, "other", "c1"; lease_seconds = 60, now = t0)
+                    @test claimed.id == "u1::d"
+
+                    @test count_external_runs(s, [PENDING]) == 5
+                    @test count_external_runs(s, [PENDING]; queue_name = "heavy") == 5
+                    @test count_external_runs(s, [PENDING, RUNNING]; queue_name = "other") == 1
+                    @test count_external_runs(s, [RUNNING]) == 1
+                    @test count_external_runs(s, [PENDING, RUNNING]; submitter = "u1") == 4
+                    @test count_external_runs(s, [PENDING]; submitter = "u1") == 3
+                    @test count_external_runs(s, [PENDING]; queue_name = "heavy", submitter = "u2") == 1
+                    @test count_external_runs(s, [PENDING]; submitter = "u3") == 1
+                    # Matched as a whole id: "u" submitted nothing here, though "u1" starts with it.
+                    @test count_external_runs(s, [PENDING, RUNNING]; submitter = "u") == 0
+                    @test count_external_runs(s, [COMPLETED]) == 0
+                end
+            end
         end
 
         @testset "cancel_task follows a consumer's claim through the PormG store (#514)" begin

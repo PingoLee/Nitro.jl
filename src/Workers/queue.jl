@@ -5,8 +5,13 @@
 # Read INSIDE `queue_lock`, in the same critical section as the mint: `_declare_queues!` checks for
 # a live queue under that lock, so a declaration racing an undeclared first submit either sees the
 # queue this mints, or is seen by it -- never neither, which would record one `k` and run another.
+# The same holds for an `External(…)` declaration (#514): a submit that found no placement a moment
+# ago is refused here, under the lock, rather than minting an in-process queue for a name that now
+# runs in a consumer process. It runs before the record is written, so the refusal writes nothing.
 function _get_or_create_queue(runtime::WorkerRuntime, queue_name::String)
     lock(get_queue_lock(runtime)) do
+        haskey(runtime.external_queues, queue_name) && throw(ArgumentError(
+            "queue '$queue_name' was declared External(…) while this submit was in flight; retry it"))
         return get!(get_worker_queues(runtime), queue_name) do
             WorkerQueue(; concurrency=something(_declared_concurrency(runtime, queue_name), 1))
         end

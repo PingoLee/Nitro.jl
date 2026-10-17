@@ -13,7 +13,7 @@ import Nitro: pormg_nitro_session, sync_pormg_env!
 # Stored JSON is read through the same depth bound as request JSON, and written only when it can
 # be read back (#344). `is_unrecoverable` is the #254 catch policy every request-path site uses.
 import Nitro.Core.Util.BodyParsers: _parse_json_bounded, _json_for_storage
-import Nitro.Core.Errors: is_unrecoverable
+import Nitro.Core.Errors: is_unrecoverable, ClaimPoisonedError
 
 import Nitro.Workers: AbstractWorkerStore, TaskInfo, TaskStatus, TaskOptions,
     PENDING, RUNNING, COMPLETED, FAILED, CANCELLED,
@@ -23,8 +23,10 @@ import Nitro.Workers: AbstractWorkerStore, TaskInfo, TaskStatus, TaskOptions,
     delete_task!, try_delete_task!, cleanup_tasks!, get_all_tasks,
     list_running_task_refs, RunningTaskRef,
     # The optional claim capability (#514) and the helpers both backends share.
-    claim_next!, renew_leases!, release_claim!, requeue_expired!, LeaseRenewal, LeasePolicy,
+    claim_next!, renew_leases!, release_claim!, requeue_expired!, count_external_runs,
+    LeaseRenewal, LeasePolicy,
     _successor_run, _lease_period, _check_consumer_id, _check_claim_queue, _lease_expiry_error, _lease_policy,
+    _release_bound_error,
     _ExpiryTally, current_time_utc,
     get_queue_authorizer, set_queue_authorizer!,
     get_error_redactor, set_error_redactor!,
@@ -1542,10 +1544,9 @@ function _claim_row!(store::PormGWorkerStore, row, queue_name::String, consumer_
         # A SECOND head row that does not decode, in one call, says the cause is not the rows: a
         # decode regression, or stored timestamps a new PormG reads differently. Failing every
         # row in the queue would make that irreversible, so stop and say so instead. The type
-        # only: a decode error may have been about `result`, which is application data.
-        may_poison || error("PormGWorkerStore: a second head row of queue '$queue_name' does not " *
-            "decode ($(typeof(e))); refusing to fail more of the queue, since the cause is " *
-            "probably not the rows themselves")
+        # only: a decode error may have been about `result`, which is application data. Its own
+        # type, so a consumer stops claiming from this queue on it rather than retrying.
+        may_poison || throw(ClaimPoisonedError(queue_name, typeof(e)))
         return _fail_undecodable_head!(store, row, now, typeof(e))
     end
     run = _successor_run(task)       # the new run: a fresh `run_id`, minted here
@@ -1614,11 +1615,39 @@ _back_to_pending_columns() = Pair{String, Any}[
     "progress" => 0.0,
 ]
 
-function release_claim!(store::PormGWorkerStore, task_id::String, run_id::UUIDs.UUID)
-    changed = _task_objects(store).filter(
-        "id" => task_id, "run_id" => string(run_id), "status" => string(RUNNING), "external" => true,
-    ).update(_back_to_pending_columns()...)
+function release_claim!(store::PormGWorkerStore, task_id::String, run_id::UUIDs.UUID;
+                        policy::LeasePolicy, now::DateTime=current_time_utc())
+    fence = ("id" => task_id, "run_id" => string(run_id), "status" => string(RUNNING), "external" => true)
+    # The attempt count decides which columns the write sets, so it is read first -- under the
+    # same fence the write repeats. The read cannot go stale unnoticed: every writer of `attempt`
+    # also changes `run_id`, so a write that lands between the two makes the fenced write below
+    # match nothing.
+    row = _task_objects(store).filter(fence...).values("queue_name", "attempt").first()
+    isnothing(row) && return false
+    queue = _db_optional_string(_row_or(row, :queue_name, "queue_name", nothing))
+    err = _release_bound_error(queue, policy, Int(_row_or(row, :attempt, "attempt", 0)))
+    columns = err === nothing ? _back_to_pending_columns() :
+        Pair{String, Any}["status" => string(FAILED), "error" => err, "completed_at" => now]
+    changed = _task_objects(store).filter(fence...).update(columns...)
     return changed isa Integer && changed >= 1
+end
+
+function count_external_runs(store::PormGWorkerStore, statuses::AbstractVector{TaskStatus};
+                             queue_name::Union{Nothing, String}=nothing,
+                             submitter::Union{Nothing, String}=nothing)
+    terms = Pair{String, Any}["external" => true, "status__@in" => String[string(s) for s in statuses]]
+    queue_name === nothing || push!(terms, "queue_name" => queue_name)
+    query = _task_objects(store).filter(terms...)
+    submitter === nothing && return Int(query.count())
+    # The FIRST element of the serialized watcher list, which every writer produces with
+    # `JSON.json`: the whole list is `["u"]`, or it starts `["u",`. The id is JSON-quoted, so
+    # `"bob"` cannot match `"bobby"`, and PormG renders `@startswith` with an ESCAPE clause, so a
+    # `%` or `_` in an id is matched literally.
+    quoted = JSON.json(submitter)
+    return Int(query.filter(PormG.Qor(
+        "watchers" => "[" * quoted * "]",
+        "watchers__@startswith" => "[" * quoted * ",",
+    )).count())
 end
 
 # A page of expired leases at a time, by keyset on the id, like retention. No wrapping
