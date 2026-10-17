@@ -478,3 +478,23 @@ decide.
   that timed out, so retrying it runs a second copy of the callback beside the first against one
   `task_info`. `TaskTimeoutError` is terminal on the first attempt.
 - **Never serialize running `Task` objects** to the database.
+- **A consumer process (`consume!`, `src/Workers/consumer.jl`, #514) gives work back; it does not
+  cancel it.** A run that ends on `:shutdown` (the consumer's drain) or `:lease_lost` (its lease
+  was taken back, and another run of it will happen) is still wanted, so it goes back to its
+  queue through `release_claim!`, and its return value is discarded. Only a cause someone asked
+  for (`:user`, `:timeout`) or a failure is terminal. The rules that hold it together:
+  - **One attempt loop, three callers.** The queued executor, the async one and the consumer all
+    run `_run_attempts!` (`src/Workers/queue.jl`); the consumer only redirects `on_complete` and
+    `on_cancel` to a hand-back. Do not grow a third copy of the loop for a consumer-only case.
+  - **Claim operations are never called under `lock_tasks`**, the hand-back included: a SQLite
+    claim transaction takes the database write lock.
+  - **No unleased zombie sweep, ever.** Every in-process run of a web process looks like a zombie
+    from a consumer (RUNNING, no lease, no handle here), so `consume!` has no `recover_zombies`
+    keyword and never calls `recover_zombie_tasks!`. Expired leases are `requeue_expired!`'s.
+  - **The heartbeat reads WHY a renew missed** (`_lost_claim_reason`): the cancel's own reason for
+    a `CANCELLED` record, `:lease_lost` for another run of the same submission (same
+    `created_at`), `:superseded` otherwise. `:lease_lost` is never used for a person's cancel.
+  - **A queue's options live on `External(…; options)`**, never on the submit: a claimed row
+    carries no `TaskOptions`.
+  - **A consumer stops claiming a queue on `ClaimPoisonedError`, and never retries it**: the store
+    fails one undecodable row per call, so a retry loop would fail the backlog one row at a time.

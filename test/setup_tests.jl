@@ -458,3 +458,44 @@ function report(r)
 end
 
 end # module CtrlCChild
+
+# An in-memory store that says other processes can read it: every claim-capable backend an
+# external queue's consumer could share (#514). Forwards the whole contract, the claim capability
+# included, so the web side and a consumer run exactly as they would over a database, without
+# one. In-process, both sides can share one `SharedStore`.
+@testsetup module SharedClaimStore
+
+using Nitro
+using Nitro.Workers: AbstractWorkerStore, InMemoryWorkerStore
+const _W = Nitro.Workers
+
+export SharedStore
+
+struct SharedStore <: AbstractWorkerStore
+    inner::InMemoryWorkerStore
+    # Run before every `claim_next!` with the queue name; a test sets it to make a claim throw.
+    claim_hook::Base.RefValue{Any}
+end
+SharedStore() = SharedStore(InMemoryWorkerStore(), Ref{Any}(nothing))
+
+# Each forward with the contract's own arity: a varargs forward can be ambiguous with the
+# generated fixed-arity fallbacks on `AbstractWorkerStore`.
+for (f, n) in ((:get_task_info, 1), (:set_task!, 2), (:replace_task!, 2), (:add_watcher!, 2),
+               (:try_transition!, 3), (:delete_task!, 1), (:try_delete_task!, 2), (:cleanup_tasks!, 1),
+               (:get_all_tasks, 1), (:get_queue_authorizer, 0), (:set_queue_authorizer!, 1),
+               (:get_watch_authorizer, 0), (:set_watch_authorizer!, 1), (:get_error_redactor, 0),
+               (:set_error_redactor!, 1), (:renew_leases!, 2), (:release_claim!, 2),
+               (:requeue_expired!, 1), (:count_external_runs, 1), (:clear_records!, 0),
+               (:list_running_task_refs, 0))
+    args = [Symbol("a", i) for i in 1:n]
+    @eval _W.$f(s::SharedStore, $(args...); kw...) = _W.$f(s.inner, $(args...); kw...)
+end
+_W.lock_tasks(cb::Function, s::SharedStore) = _W.lock_tasks(cb, s.inner)
+_W._visible_across_processes(::SharedStore) = true
+function _W.claim_next!(s::SharedStore, queue::String, consumer::String; kw...)
+    hook = s.claim_hook[]
+    hook === nothing || hook(queue)
+    return _W.claim_next!(s.inner, queue, consumer; kw...)
+end
+
+end # module SharedClaimStore

@@ -38,16 +38,34 @@ lives in the code comment it names, and that comment is canonical.
   header-deadline clear it used to run (#316) moved into HTTP.jl (JuliaWeb/HTTP.jl#1382).
   The response is written on the request task: `stream_handler` calls `closewrite` itself
   (#453). See #462 for HTTP.jl's own share of that thread.
+- **A consumer process (`Workers.consume!`, #514) is the other layout.** It serves nothing, so
+  HTTP.jl does not hold its interactive thread, and its lease heartbeat runs there instead (§3).
+  `consume!` refuses to start without an interactive thread (`julia -t k,1`). Under `-t k,1`
+  thread 1 is that thread, so a REPL Ctrl-C can land in the heartbeat or in the task blocked in
+  `consume!`; both treat it as a stop request and drain. Outside a REPL, a SIGINT or a
+  supervisor's SIGTERM exits through `atexit`, where `consume!` registers its drain: probed on
+  1.12 and 1.13, an `atexit` hook still runs, and can still spawn and wait on tasks on other
+  threads, before the process exits.
 
 ## 3. Background tasks
 
 - **Spawn with `_spawn_detached`** (`src/Workers/execution.jl`): non-sticky, on `:default`,
   detached from the caller's scope. **Never `@async`.** A sticky task parked on thread 1 is where
   a REPL's Ctrl-C lands (#369).
+  - **One exception: a consumer's lease heartbeat runs on `:interactive`**
+    (`_spawn_detached(…; pool = :interactive)`, `src/Workers/consumer.jl`, #514). A CPU-bound job
+    holds a `:default` thread without yielding (#467), so a heartbeat there can be starved by the
+    very runs it renews, and a starved heartbeat turns a healthy run into a stolen one. It is
+    allowed there because it is one cheap store write per tick in a process that serves nothing,
+    so it competes with no connection task. Nothing else goes on `:interactive`; a new caller
+    needs the same argument and an entry here.
 - **A periodic loop goes through `_janitor`/`_janitor_loop`** (`src/middleware/janitor.jl`). It
   keeps the `try` inside the `while` (#169), uses a stop token per activation (#190), and ends
-  with one `@warn` on an interrupt (#369). The Workers retention scheduler is the one
-  hand-rolled loop; its reasoning is next to `_cleanup_scheduler_loop`.
+  with one `@warn` on an interrupt (#369). The Workers retention scheduler is a hand-rolled
+  loop, and its reasoning is next to `_cleanup_scheduler_loop`. A consumer's claim loop and
+  heartbeat are the other two (#514). They are waited on by the consumer's drain, and an
+  interrupt there is a request to drain, not a reason to stop the loop: the heartbeat must keep
+  renewing until the drain ends.
 - **A long idle wait parks; it does not poll.** A task that idles between ticks or until stopped
   parks once on a `Base.Event`, woken by a `Timer` and by the stop path (#369, #371). A short
   `timedwait` with a deadline is fine for a bounded wait during shutdown or a drain.

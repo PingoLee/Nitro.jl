@@ -199,8 +199,8 @@ serve(app; middleware = [worker_startup(app; store = pormg_nitro_worker())])
 task_id = submit_queued_task(app, "heavy", "fit-42", Job("fit_model", FitArgs(dataset_id = 42)), Owner(uid))
 ```
 
-The consumer process's entry point is the next part of #514; this section covers what the web
-process does with an external queue.
+The consumer is a second process running the same app code, with no `serve`; see
+[Running A Consumer](#Running-A-Consumer) below.
 
 **Delivery is at-least-once, so the job must be idempotent.** A consumer that dies mid-run leaves
 a claim whose lease expires, and `on_lease_expiry` decides what happens then. It has no default,
@@ -239,6 +239,55 @@ rows: they bound runaway callers, they are not exact quotas. A full queue or own
 The web process also adjudicates expired leases on its retention tick, as a fallback for a queue
 whose consumers are all gone. That tick runs every `cleanup_interval_hours` (24 by default), so a
 deployment that relies on it should shorten the interval.
+
+### Running A Consumer
+
+The consumer process loads the same app, calls the same setup function, and runs `consume!`
+instead of `serve`. Start it with an **interactive thread** (`-t k,1`): its lease heartbeat runs
+there, where the jobs it renews cannot starve it, and `consume!` refuses to start without one.
+
+```julia
+# consumer.jl, started with `julia -t 4,1 --project consumer.jl`
+using MyApp, Nitro, Nitro.Workers
+app = MyApp.build_app()
+MyApp.setup_workers!(app)
+consume!(app; store = pormg_nitro_worker(), queues = ["heavy" => 4])
+```
+
+- **`"heavy" => 4` is this process's concurrency**, not a re-declaration: it runs up to four of
+  the queue's runs here. Two consumers with `4` run eight, and the web process's declaration says
+  only *where* the queue runs.
+- **The lease** (`lease = Second(60)` by default) is how long a run stays claimed without a
+  renewal. The heartbeat renews every third of it. **It must exceed the longest pause your jobs
+  can cause**: a stop-the-world garbage collection stops the heartbeat too, and a run whose lease
+  runs out is taken back and re-run (or failed, under `:fail`) even though it was healthy.
+- **Cancellation reaches a job at its next `checkpoint!`**, after the next heartbeat, so within a
+  third of the lease. `cancel_reason(task_info)` tells the job why: `:user` for a `cancel_task`,
+  `:shutdown` when the consumer is stopping, `:lease_lost` when its lease was taken back and the
+  run **will happen again** (stop, and do not assume the work is lost).
+- **Progress** set with `update_progress!` is written to the store with each renewal, so the web
+  process's `get_task_status` sees it.
+- **Store policy is per store object**, and each process builds its own store. An error redactor
+  (`set_error_redactor!`) set only in the web process does not reach the consumer, which then
+  stores a failed run's full error text. Set the store's hooks where both processes run them: in
+  the setup function, on the store each one passes in.
+
+**Stopping.** A supervisor's `SIGTERM`, or Ctrl-C, drains the consumer: it stops claiming, tells
+every run it holds `:shutdown`, keeps their leases alive for up to `drain_timeout` seconds
+(5 by default), and exits. A run that ends in that window is **handed back** to its queue, not
+cancelled, so the next consumer runs it **again**, even one that finished its work: a consumer
+cannot tell a job that completed from one that saw the token and returned early, and recording
+the second as done would lose work. That is at-least-once delivery again, and why a job on an
+external queue must be idempotent. Give jobs a `checkpoint!` in their loops, and make the drain
+timeout at least as long as the longest gap between two checkpoints. A run still going at
+exit keeps its lease until it expires, and is then re-queued or failed by its queue's policy. On
+Windows, terminating a process runs no shutdown code at all, so a stopped consumer's runs wait for
+their leases to expire, exactly as after a crash.
+
+A consumer never runs the zombie sweep: from its point of view, every run the web process
+executes in-process looks like a zombie.
+
+### Switching A Queue's Placement
 
 **Switching a queue's placement is a deploy step.** A queue's declaration is fixed for the life of
 a runtime, so the switch is a restart with the new setup function:
