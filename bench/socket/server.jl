@@ -51,7 +51,9 @@
 #                       number or 100 key => sum pairs as JSON. The kernel and the generator are in
 #                       `aggregate.jl`, shared with `suite/aggregate.jl` and mirrored in `go/`.
 #                       Nitro with WORKERS=1 also takes `&queue=1`: the same op submitted to the
-#                       `/cpu_job` queue, answered 202, and counted by `/jobs`.
+#                       `/cpu_job` queue, answered 202, and counted by `/jobs`. `&yield=<ms>` runs
+#                       the loop with a `yield()` every <ms> in the handler (§5's fallback; Go
+#                       has no twin, it preempts).
 #   HOLDS=0|1           Nitro only: also serve the largest holds of #588's inventory as routes,
 #                       so `stall.sh` can keep K of them in flight: `GET /hold/json` answers
 #                       `Res.json` of a ~12 MB untyped `JSON.Object` parsed once at startup (the
@@ -120,6 +122,13 @@ function agg_params(n_str, op_str)::Union{Nothing, Tuple{Int, String}}
     (n === nothing || !(1 <= n <= length(AGG_DATA))) && return nothing
     op_str in ("sum", "mean", "groupby") || return nothing
     return n, String(op_str)
+end
+
+# `&yield=<ms>`: 0 (the plain loop) when absent; `nothing` when it is not a positive number.
+function agg_yield_ms(y_str)::Union{Nothing, Float64}
+    y_str === nothing && return 0.0
+    y = tryparse(Float64, y_str)
+    return y === nothing || !(y > 0) ? nothing : y
 end
 
 gc_body() = let g = Base.gc_num()
@@ -198,8 +207,9 @@ function bare_handler(req::HTTP.Request)::HTTP.Response
     if startswith(target, "/aggregate")
         query = HTTP.URIs.queryparams(HTTP.URIs.URI(target))
         parsed = agg_params(get(query, "n", nothing), get(query, "op", nothing))
-        parsed === nothing && return HTTP.Response(400, "bad n or op")
-        return HTTP.Response(200, ["Content-Type" => "application/json"], agg_body(AGG_DATA, parsed...))
+        yield_ms = agg_yield_ms(get(query, "yield", nothing))
+        (parsed === nothing || yield_ms === nothing) && return HTTP.Response(400, "bad n, op or yield")
+        return HTTP.Response(200, ["Content-Type" => "application/json"], agg_body(AGG_DATA, parsed..., yield_ms))
     end
     return HTTP.Response(404)
 end
@@ -312,13 +322,14 @@ function aggregate_route(submit)
     return function (req)
         query = Nitro.getquery(req)
         parsed = agg_params(get(query, "n", nothing), get(query, "op", nothing))
-        parsed === nothing && return Res.send("bad n or op"; status = 400)
+        yield_ms = agg_yield_ms(get(query, "yield", nothing))
+        (parsed === nothing || yield_ms === nothing) && return Res.send("bad n, op or yield"; status = 400)
         if get(query, "queue", "0") == "1"
             submit === nothing && return Res.send("queue=1 needs WORKERS=1"; status = 400)
             submit(parsed...)
             return Res.send("accepted"; status = 202)
         end
-        return Res.send(agg_body(AGG_DATA, parsed...); content_type = "application/json")
+        return Res.send(agg_body(AGG_DATA, parsed..., yield_ms); content_type = "application/json")
     end
 end
 

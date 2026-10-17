@@ -60,10 +60,62 @@ function agg_groupby(rows::Vector{AggRow}, n::Int)::Dict{Int, Float64}
     return sums
 end
 
-# The response body: one number, or the 100 key => sum pairs (keys as JSON strings).
-function agg_body(rows::Vector{AggRow}, n::Int, op::AbstractString)::String
-    op == "sum"     && return JSON.json(Dict("sum" => agg_sum(rows, n)))
-    op == "mean"    && return JSON.json(Dict("mean" => agg_mean(rows, n)))
-    op == "groupby" && return JSON.json(agg_groupby(rows, n))
+# The same loops with a `yield()` every `every_ms` (#590): §5's cooperative fallback for a loop
+# that must stay in the handler, as `server.jl`'s `burn_yielding` is for `/cpu`. The clock is read
+# once per AGG_CHUNK rows (~180 µs of groupby, ~12 µs of sum), not per row, so the check costs
+# next to nothing; the rows inside a chunk run the plain loop above. No Go twin: Go preempts.
+const AGG_CHUNK = 16_384
+
+function agg_sum_yielding(rows::Vector{AggRow}, n::Int, every_ms::Float64)::Float64
+    s = 0.0
+    step = round(UInt64, every_ms * 1e6)
+    next = time_ns() + step
+    i = 1
+    @inbounds while i <= n
+        stop = min(i + AGG_CHUNK - 1, n)
+        for j in i:stop
+            s += rows[j].value
+        end
+        i = stop + 1
+        if time_ns() >= next
+            yield()
+            next = time_ns() + step
+        end
+    end
+    return s
+end
+
+function agg_groupby_yielding(rows::Vector{AggRow}, n::Int, every_ms::Float64)::Dict{Int, Float64}
+    sums = Dict{Int, Float64}()
+    step = round(UInt64, every_ms * 1e6)
+    next = time_ns() + step
+    i = 1
+    @inbounds while i <= n
+        stop = min(i + AGG_CHUNK - 1, n)
+        for j in i:stop
+            r = rows[j]
+            sums[r.key] = get(sums, r.key, 0.0) + r.value
+        end
+        i = stop + 1
+        if time_ns() >= next
+            yield()
+            next = time_ns() + step
+        end
+    end
+    return sums
+end
+
+# The response body: one number, or the 100 key => sum pairs (keys as JSON strings). `yield_ms > 0`
+# runs the yielding loops (`mean` is `sum`'s, divided).
+function agg_body(rows::Vector{AggRow}, n::Int, op::AbstractString, yield_ms::Float64 = 0.0)::String
+    if yield_ms > 0
+        op == "sum"     && return JSON.json(Dict("sum" => agg_sum_yielding(rows, n, yield_ms)))
+        op == "mean"    && return JSON.json(Dict("mean" => agg_sum_yielding(rows, n, yield_ms) / n))
+        op == "groupby" && return JSON.json(agg_groupby_yielding(rows, n, yield_ms))
+    else
+        op == "sum"     && return JSON.json(Dict("sum" => agg_sum(rows, n)))
+        op == "mean"    && return JSON.json(Dict("mean" => agg_mean(rows, n)))
+        op == "groupby" && return JSON.json(agg_groupby(rows, n))
+    end
     throw(ArgumentError("op must be sum, mean or groupby, got $op"))
 end
