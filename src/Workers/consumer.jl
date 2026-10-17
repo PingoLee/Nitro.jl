@@ -61,9 +61,20 @@ mutable struct ConsumerHandle{S <: AbstractWorkerStore}
     @atomic finished::Bool            # the drain has ended, however it ended
     claim_task::Union{Nothing, Task}
     heartbeat_task::Union{Nothing, Task}
+    # Held for the consumer's lifetime on the Julia versions `_needs_wake_guard` names, closed by
+    # the drain. See `_consumer_wake_guard`.
+    const wake_guard::Union{Nothing, Timer}
 end
 
 const CONSUMER_DEFAULT_LEASE = Dates.Second(60)
+
+# JuliaLang/julia#63882 (#586): on Julia 1.13.0-rc3 through 1.13.x, a task parked on a `Timer`
+# does not wake while every `:default` thread runs a `yield()`ing loop, as long as its timer is the
+# only live libuv handle. A consumer parks both its loops on one-shot `Timer`s, and its jobs are
+# exactly those loops when they follow the "yield every few ms" advice. A consumer never calls
+# `serve`, so it does not get `serve`'s guard (#604): it holds its own never-firing `Timer`, under
+# the same gate, so lowering that gate when a fixed 1.13.x ships retires both.
+_consumer_wake_guard() = (_WAKE_GUARD_FORCED[] || _needs_wake_guard()) ? Timer(typemax(Int32)) : nothing
 
 # An interrupt, however a store wrapped it. PormG hands back a Ctrl-C that landed inside a query as
 # a `DatabaseError` whose `cause` is the `InterruptException`, so a bare `isa` test would log the
@@ -107,6 +118,11 @@ What it does:
   and persists each run's `update_progress!` with it. A healthy run whose heartbeat is late by
   more than the lease, for instance through a garbage-collection pause that long, can be taken
   back and run again: **the lease must exceed the worst pause your jobs cause**.
+- **Use the LibPQ driver for a consumer.** The heartbeat's renewal stays on the interactive thread
+  only with LibPQ. On SQLite and Postgres.jl, PormG runs the statement on a `:default` task
+  ([PormG#1280](https://github.com/PingoLee/PormG.jl/issues/1280)), so CPU-bound jobs that fill every
+  `:default` thread without yielding can still let healthy leases expire there, and their runs
+  then run twice.
 - **Adjudicates expired leases** by each queue's `on_lease_expiry`, once before the first claim and
   on every heartbeat, so a crashed consumer's runs are re-queued or failed.
 - **Tells a job why it must stop.** A run whose lease is no longer this process's reads, at its
@@ -183,21 +199,22 @@ function _start_consumer(app::App; store::AbstractWorkerStore, queues::AbstractV
                        lease_seconds, poll_seconds, Float64(drain_timeout),
                        ReentrantLock(), Dict{UUID, _HeldRun}(), Dict{String, Int}(), Set{String}(), 0,
                        Base.Event(true), Base.Event(true), Base.Event(),
-                       false, true, false, false, nothing, nothing)
+                       false, true, false, false, nothing, nothing, _consumer_wake_guard())
 
-    # Before the first claim, so a consumer that finds nothing to do still adjudicates its crashed
-    # predecessor's run (§3).
-    _consumer_requeue!(c)
-
-    pool = Threads.nthreads(:interactive) > 0 ? :interactive : :default
-    c.heartbeat_task = errormonitor(_spawn_detached(() -> _heartbeat_loop(c); pool))
     # Every start has a stop on every path (#427): a claim loop that fails to start must not
-    # leave the heartbeat it started renewing nothing for ever.
+    # leave the heartbeat it started renewing nothing for ever, nor the guard open.
     try
+        # Before the first claim, so a consumer that finds nothing to do still adjudicates its
+        # crashed predecessor's run (§3).
+        _consumer_requeue!(c)
+
+        pool = Threads.nthreads(:interactive) > 0 ? :interactive : :default
+        c.heartbeat_task = errormonitor(_spawn_detached(() -> _heartbeat_loop(c); pool))
         c.claim_task = errormonitor(_spawn_detached(() -> _claim_loop(c)))
     catch
         @atomic c.beating = false
         notify(c.beat)
+        c.wake_guard === nothing || close(c.wake_guard)
         rethrow()
     end
     @info "Nitro.Workers: consumer started" consumer_id = c.consumer_id queues = c.queues lease_seconds
@@ -500,6 +517,8 @@ function _drain!(c::ConsumerHandle)
         catch e
             _is_interrupt(e) || @error "Nitro.Workers: the consumer's stop did not finish cleanly" exception = (e, catch_backtrace())
         end
+        # Last, once both loops are done parking: they are what it guards.
+        c.wake_guard === nothing || close(c.wake_guard)
         @atomic c.finished = true
     end
     return nothing

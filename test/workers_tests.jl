@@ -6424,6 +6424,38 @@ status(store, id) = get_task_info(store, id).status
     end
 end
 
+# JuliaLang/julia#63882 (#586): on 1.13.0-rc3..1.13.x a consumer holds #604's never-firing guard
+# `Timer` for its lifetime. Forced on, as #604's server test does, so it runs on the 1.12 CI too.
+@testset "consume! holds the wake guard while consuming, and the drain closes it" begin
+    Nitro.Core.AppContext._WAKE_GUARD_FORCED[] = true
+    local c
+    try
+        web, c, store = pair()
+        try
+            guard = c.wake_guard
+            @test guard isa Timer && isopen(guard)
+            # Still held mid-run, not only at start.
+            id = submit(web, "g", "return"; n = 1)
+            @test waitfor(() -> status(store, id) == COMPLETED)
+            @test isopen(guard)
+        finally
+            stop!(web, c)
+        end
+        @test !isopen(c.wake_guard)
+    finally
+        Nitro.Core.AppContext._WAKE_GUARD_FORCED[] = false
+    end
+    # Unforced, the version gate decides.
+    web2, c2, _ = pair()
+    try
+        @test Nitro.Core.AppContext._needs_wake_guard() ? (c2.wake_guard isa Timer && isopen(c2.wake_guard)) :
+                                                         c2.wake_guard === nothing
+    finally
+        stop!(web2, c2)
+    end
+    @test c2.wake_guard === nothing || !isopen(c2.wake_guard)
+end
+
 @testset "a claimed run completes, and k bounds how many run at once" begin
     web, c, store = pair()
     try

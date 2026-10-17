@@ -121,8 +121,10 @@ lives in the code comment it names, and that comment is canonical.
     (`src/context.jl`) names, `startserver` keeps one never-firing `Timer` in
     `Service.wake_guard`, and `close(::Service)` releases it once nothing serves. Measured with
     `bench/socket/wake.sh` on 1.13.2: a parked handler in a `serve()` with no other timer woke
-    1.48 s late without it, 10-23 ms with it. **Still exposed:** yielding loops while no server is
-    up. When a fixed 1.13.x ships, lower the gate's upper bound; once Nitro's floor passes the
+    1.48 s late without it, 10-23 ms with it. **`consume!` holds its own** (#514), since a
+    consumer never calls `serve`: one never-firing `Timer` in `ConsumerHandle.wake_guard` under the
+    same gate, closed by the drain. **Still exposed:** yielding loops while neither a server nor a
+    consumer is up. When a fixed 1.13.x ships, lower the gate's upper bound; once Nitro's floor passes the
     last affected release, delete the guard and this bullet, and change the documents below
     with it.
   - **The bench masks it unless told not to:** `bench/socket/server.jl` parks on a `Timer` by

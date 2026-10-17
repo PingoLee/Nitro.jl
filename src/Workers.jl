@@ -6,7 +6,7 @@ using Base: @kwdef
 import Base.Threads: ReentrantLock, lock
 
 using ..Core: App, LifecycleMiddleware
-using ..Core.AppContext: set_extension!, get_extension, delete_extension!
+using ..Core.AppContext: set_extension!, get_extension, delete_extension!, _needs_wake_guard, _WAKE_GUARD_FORCED
 using ..Core: AuthorizationError, StoreInterfaceError, WorkerUnavailableError, WorkerCapacityError,
     ClaimPoisonedError
 using ..Core.Errors: implements_contract_method, store_contract_error

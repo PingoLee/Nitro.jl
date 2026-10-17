@@ -6,11 +6,18 @@
 # (`_start_consumer`, the heartbeat on `:interactive`) over an in-process claim-capable store,
 # runs `k` jobs that allocate as hard as they can, and records every successful renewal.
 #
-#   julia +1.12 --project=bench -t 4,1 bench/consumer/heartbeat_lateness.jl [seconds] [k] [live_mb] [mode]
+#   julia +1.12 --project=bench -t 4,1 bench/consumer/heartbeat_lateness.jl [seconds] [k] [live_mb] [mode] [store]
 #
 # `live_mb` is the long-lived heap each job keeps (a ring of small objects), which is what makes a
 # full collection's mark phase, and so its pause, long. `mode = spin` runs CPU-bound jobs that
 # neither allocate nor yield instead: what the interactive-thread placement exists for.
+#
+# `store = memory` (the default) measures the heartbeat's own scheduling. `store = sqlite` runs the
+# same consumer over `pormg_nitro_worker()` on a temporary SQLite file, so a renewal pays for the
+# driver too, and in particular for WHERE the driver runs its statement: PormG's SQLite backend
+# runs every statement on one `:default` task (PormG#1280), which spinning jobs can starve. It
+# needs PormG and SQLite, which the bench env does not carry: run it from an env that adds them to
+# a `Pkg.develop`ed Nitro.
 using Nitro, Nitro.Workers, Dates, Printf
 const W = Nitro.Workers
 
@@ -18,11 +25,27 @@ seconds = length(ARGS) >= 1 ? parse(Float64, ARGS[1]) : 60.0
 k = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 3
 live_mb = length(ARGS) >= 3 ? parse(Int, ARGS[3]) : 256
 mode = length(ARGS) >= 4 ? ARGS[4] : "churn"
+backend = length(ARGS) >= 5 ? ARGS[5] : "memory"
 lease = 3.0                                     # heartbeat every 1 s
 
-# An in-memory store that answers like a shared one, and timestamps every renewal it serves.
-struct TimedStore <: W.AbstractWorkerStore
-    inner::W.InMemoryWorkerStore
+backend in ("memory", "sqlite") || error("store must be memory or sqlite, got $backend")
+backend == "sqlite" && @eval using PormG, SQLite
+
+# A real PormG store on a fresh SQLite file. Called through `invokelatest`: PormG is loaded above,
+# after this file's other definitions were compiled.
+function sqlite_store()
+    key = "heartbeat_bench"
+    path = joinpath(mktempdir(), "bench.sqlite")
+    PormG.register_connection(key, path; adapter = "SQLite")
+    PormG.config[key].change_data = true
+    PormG.config[key].change_db = true
+    return Nitro.pormg_nitro_worker(db_key = key)
+end
+
+# A store that answers like a shared one, and timestamps every renewal it serves (when the call
+# returns, which is when the lease is actually extended).
+struct TimedStore{S <: W.AbstractWorkerStore} <: W.AbstractWorkerStore
+    inner::S
     renewed_at::Vector{Float64}
 end
 for (f, n) in ((:get_task_info, 1), (:set_task!, 2), (:replace_task!, 2), (:add_watcher!, 2),
@@ -77,7 +100,8 @@ function churn(task_info, args::Churn)
     return i
 end
 
-store = TimedStore(W.InMemoryWorkerStore(), Float64[])
+inner = backend == "sqlite" ? Base.invokelatest(sqlite_store) : W.InMemoryWorkerStore()
+store = TimedStore(inner, Float64[])
 app = App()
 declare_queues!(app, ["heavy" => External(on_lease_expiry = :requeue)])
 register_job!(churn, app, "churn", Churn)
@@ -103,6 +127,11 @@ gaps = diff(stamps)
 tick = lease / 3
 sorted = sort(gaps)
 pct(p) = isempty(sorted) ? NaN : sorted[clamp(ceil(Int, p * length(sorted)), 1, length(sorted))]
-@printf "julia %s  threads %d,%d  k=%d  mode=%s  live=%d MiB/job  lease=%.1f s (tick %.2f s)  %.0f s\n" VERSION Threads.nthreads(:default) Threads.nthreads(:interactive) k mode live_mb lease tick seconds
+@printf "julia %s  threads %d,%d  k=%d  mode=%s  store=%s  live=%d MiB/job  lease=%.1f s (tick %.2f s)  %.0f s\n" VERSION Threads.nthreads(:default) Threads.nthreads(:interactive) k mode backend live_mb lease tick seconds
 @printf "renewals %d  gap p50 %.3f s  p99 %.3f s  max %.3f s  (max lateness %.3f s)\n" length(stamps) pct(0.5) pct(0.99) maximum(gaps; init = 0.0) maximum(gaps; init = 0.0) - tick
+# A gap longer than the lease is a window in which the run's lease was expired: another consumer,
+# or the web's retention tick, could have taken a healthy run back. The first renewal counts from
+# the start of the measurement, so a heartbeat that never renewed at all shows here too.
+first_gap = isempty(stamps) ? seconds : first(stamps) - t0
+@printf "first renewal after %.3f s; gaps longer than the lease: %d\n" first_gap count(>(lease), [first_gap; gaps])
 @printf "GC: %d collections (%d full), total pause %.2f s, max pause %.3f s\n" (gc1.pause - gc0.pause) (gc1.full_sweep - gc0.full_sweep) (gc1.total_time - gc0.total_time) / 1e9 gc1.max_pause / 1e9

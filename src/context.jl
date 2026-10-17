@@ -324,7 +324,8 @@ end
 # one libuv handle, no callback, no wake-up, nothing on the request path.
 #
 # The upper bound drops to the first fixed 1.13.x when upstream ships one. Once Nitro's Julia
-# floor passes the last affected release, delete this, its two call sites and `wake_guard`.
+# floor passes the last affected release, delete this, its call sites (`_hold_wake_guard!`, and
+# `_consumer_wake_guard` in Workers, #514) and both `wake_guard` fields.
 _needs_wake_guard(v::VersionNumber = VERSION) = v"1.13.0-rc3" <= v < v"1.14.0-"
 
 # Tests only: CI runs 1.12, where the gate is shut, and this lets it drive the serve path anyway.

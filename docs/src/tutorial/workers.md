@@ -264,6 +264,12 @@ consume!(app; store = pormg_nitro_worker(), queues = ["heavy" => 4])
   renewal. The heartbeat renews every third of it. **It must exceed the longest pause your jobs
   can cause**: a stop-the-world garbage collection stops the heartbeat too, and a run whose lease
   runs out is taken back and re-run (or failed, under `:fail`) even though it was healthy.
+- **Use PormG's LibPQ driver for a consumer.** The interactive thread keeps the *heartbeat* on
+  time, but the renewal is a database statement, and only LibPQ runs it on the calling thread. With
+  SQLite or Postgres.jl, PormG runs the statement on a `:default` task, so jobs that compute
+  without yielding on every `:default` thread hold the renewal back until they stop. Leases then
+  expire under healthy runs, which run twice. On those drivers, run fewer jobs than
+  `Threads.nthreads(:default)`, or have the jobs `yield()` (see [CPU-Bound Jobs](@ref)).
 - **Cancellation reaches a job at its next `checkpoint!`**, after the next heartbeat, so within a
   third of the lease. `cancel_reason(task_info)` tells the job why: `:user` for a `cancel_task`,
   `:shutdown` when the consumer is stopping, `:lease_lost` when its lease was taken back and the
@@ -282,7 +288,9 @@ cancelled, so the next consumer runs it **again**, even one that finished its wo
 cannot tell a job that completed from one that saw the token and returned early, and recording
 the second as done would lose work. That is at-least-once delivery again, and why a job on an
 external queue must be idempotent. Give jobs a `checkpoint!` in their loops, and make the drain
-timeout at least as long as the longest gap between two checkpoints. A run still going at
+timeout at least as long as the longest gap between two checkpoints. Every hand-back at a drain
+counts toward `max_attempts`, including a run that completed during the drain, so under
+`:requeue` a run handed back that many times is recorded `FAILED`. A run still going at
 exit keeps its lease until it expires, and is then re-queued or failed by its queue's policy. On
 Windows, terminating a process runs no shutdown code at all, so a stopped consumer's runs wait for
 their leases to expire, exactly as after a crash.

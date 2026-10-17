@@ -657,8 +657,9 @@ two-process test, which adds SQLite.jl as a test dependency. Where it departs fr
   executor, the async one and the consumer, which differ only in `on_complete` / `on_cancel`. The
   two executors used to carry identical copies. A third copy for the consumer is what this avoided.
 - **A consumer's policies are every external queue the app declares**, not only the consumed ones,
-  because `requeue_expired!` fails a leased row whose queue it has no policy for (§13's open
-  question applies here too).
+  because `requeue_expired!` fails a leased row whose queue it has no policy for. The consumer
+  keeps that fail-closed default (`on_unknown_queue = :fail`); only the web tick skips, as decided
+  on #603 (§13).
 - **An interrupt is recognised however the store wrapped it** (`_is_interrupt`). PormG hands back
   a Ctrl-C that landed inside a query as a `DatabaseError` whose `cause` is the interrupt, and a
   bare `isa` test would log it as a failed heartbeat and lose the stop (found in review).
@@ -670,6 +671,23 @@ two-process test, which adds SQLite.jl as a test dependency. Where it departs fr
 - **Timeouts are still the queue's**, from `External(…; options)` (§13). A timed-out callback keeps
   its consumer slot until it returns, as in-process (`_RunHandoff`), but stops being renewed once
   its run is recorded.
+- **A consumer holds #604's wake guard** (maintainer, #605). On Julia 1.13.0-rc3 through 1.13.x, a
+  task parked on a `Timer` does not wake while every `:default` thread runs a `yield()`ing loop,
+  as long as its timer is the only live libuv handle in the process
+  ([#586](https://github.com/PingoLee/Nitro.jl/issues/586),
+  [JuliaLang/julia#63882](https://github.com/JuliaLang/julia/issues/63882)). Both consumer loops
+  park on one-shot `Timer`s, and jobs that follow the "`yield()` every few ms" advice are exactly
+  those loops; the claim loop's timer is re-armed only from `:default`. Whether a waiter on
+  `:interactive` is affected at all was not tested (#586's repro parked on `:default`), so this is
+  a cheap precaution, not a measured fix. A consumer never calls `serve`, so it holds its own
+  never-firing `Timer(typemax(Int32))` for its lifetime, under the same `_needs_wake_guard()` gate,
+  and the drain closes it once both loops are done. One gate means one place to lower when a fixed
+  1.13.x ships.
+- **Every hand-back costs an attempt** (maintainer, #605). Claiming increments `attempt`, and a
+  hand-back keeps it (§4, #603), including the hand-back of a run that completed during the drain
+  and of one the drain reached before it started. Under `:requeue` with the default
+  `max_attempts = 3`, a long run that lives through three rolling deploys is recorded `FAILED`
+  ("Handed back … after 3 attempt(s)") without having failed. The tutorial says so.
 
 **Measured: heartbeat lateness under a heavily allocating job** (`bench/consumer/heartbeat_lateness.jl`;
 `-t 4,1`; three jobs that allocate small objects into a ring that keeps a live heap, plus
@@ -696,6 +714,35 @@ Four jobs spinning without allocating or yielding, one per `:default` thread:
   included. It never renewed, and the run had to be killed at 600 s.
 
 That is the evidence for refusing to start without an interactive thread.
+
+**Measured: the interactive thread keeps the heartbeat on time, not the renewal's statement**
+(maintainer, #605). The runs above use an in-memory store. Through PormG, a renewal is a database
+statement, and where it runs depends on the driver. At the PormG commit Nitro pins (`6f558894`),
+SQLite sends every statement to one global worker task started with `Threads.@spawn`, and
+Postgres.jl's `backend_execute_async` is a `Threads.@spawn`: both on `:default`. LibPQ's
+`async_execute` runs its task with `@async`, on the calling thread, so there the renewal stays on
+the interactive thread; that was read in LibPQ's source and not measured. The bench's
+`store = sqlite` runs the same consumer over `pormg_nitro_worker()` on a temporary SQLite file.
+Spin mode, `-t 4,1`, Julia 1.12.7, lease 3 s (a tick every 1 s), 60 s per run:
+
+| store | spinning jobs | renewals | first renewal | max gap | gaps longer than the lease |
+|---|---|---|---|---|---|
+| in-memory (the control) | 4 | 59 | 1.17 s | 1.002 s | 0 |
+| PormG, SQLite | 4 | **1** | **60.47 s** | — | **1: the whole run** |
+| PormG, SQLite | 3 | 60 | 1.18 s | 1.025 s | 0 |
+
+- **With every `:default` thread spinning, nothing renewed for the whole minute.** The heartbeat
+  woke on time and then waited for a `:default` thread for its statement; the one renewal landed
+  only after the drain had stopped the jobs. Every lease was expired from about 3 s on, so another
+  consumer, or the web's retention tick, would have taken back four healthy runs, which then run
+  twice.
+- **One free `:default` thread is enough**: with three jobs on four threads the SQLite store
+  renewed as punctually as the in-memory one.
+- **So the guarantee holds with LibPQ only.** The docs recommend LibPQ for consumers, and on SQLite
+  or Postgres.jl they say to run fewer jobs than `nthreads(:default)` or to have jobs `yield()`.
+  Postgres.jl was not measured; its code path is the same `:default` spawn. The real fix is on the
+  PormG side, a driver that runs the statement on the caller's pool, tracked on
+  [PormG#1280](https://github.com/PingoLee/PormG.jl/issues/1280).
 
 **Checked against real drivers.** The two-process test (`test/workers_consumer_e2e_tests.jl`)
 covers each of these:
