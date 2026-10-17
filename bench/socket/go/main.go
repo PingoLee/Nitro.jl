@@ -7,6 +7,9 @@
 //	CPU_MS=50     What /cpu burns: a loop that never blocks, as in server.jl. Unlike Julia, Go
 //	              preempts it asynchronously (since Go 1.14), so it does not hold its P to the end.
 //	LAG=0|1       Start the /lag probe, as in server.jl.
+//	AGG_ROWS=<n>  Build n aggregation rows at startup and serve /aggregate?n=<N>&op=<sum|mean|groupby>
+//	              over the first N, as server.jl does (#590): aggregate.go, a plain loop in the
+//	              handler. Default 0: no rows.
 //
 // GOMAXPROCS is set by run.sh to the number of server CPUs. Every response is built per request,
 // as in every other mode: no cached bodies, no cached headers.
@@ -89,6 +92,16 @@ func main() {
 		cpuMs = f
 	}
 
+	aggN := 0
+	if v := os.Getenv("AGG_ROWS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			log.Fatalf("AGG_ROWS: %v", err)
+		}
+		aggN = n
+	}
+	aggData := aggRows(aggN)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /plaintext", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -106,6 +119,28 @@ func main() {
 	mux.HandleFunc("GET /cpu", func(w http.ResponseWriter, r *http.Request) {
 		x := burn(cpuMs)
 		fmt.Fprintf(w, "ok %v", x > 2.0)
+	})
+	mux.HandleFunc("GET /aggregate", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		n, err := strconv.Atoi(q.Get("n"))
+		if err != nil || n < 1 || n > len(aggData) {
+			http.Error(w, "bad n or op", http.StatusBadRequest)
+			return
+		}
+		var b []byte
+		switch q.Get("op") {
+		case "sum":
+			b, _ = json.Marshal(map[string]float64{"sum": aggSum(aggData, n)})
+		case "mean":
+			b, _ = json.Marshal(map[string]float64{"mean": aggMean(aggData, n)})
+		case "groupby":
+			b, _ = json.Marshal(aggGroupBy(aggData, n))
+		default:
+			http.Error(w, "bad n or op", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(b)
 	})
 	mux.HandleFunc("GET /lag", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

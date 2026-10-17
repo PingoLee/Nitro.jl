@@ -45,6 +45,29 @@
 #                       the computing handler every app has, for `stall.sh`'s `login` variants.
 #                       PASSWORD_CONCURRENCY=<n> passes `n` to `set_password_concurrency!` (#587;
 #                       `0` is unbounded); unset keeps Nitro's default.
+#   AGG_ROWS=<n>        Build `n` aggregation rows at startup (default 0: none, so `rss.sh` counts
+#                       nothing) and serve `/aggregate?n=<N>&op=<sum|mean|groupby>` over the first N
+#                       of them (#590), in every mode: a plain loop in the handler, answering one
+#                       number or 100 key => sum pairs as JSON. The kernel and the generator are in
+#                       `aggregate.jl`, shared with `suite/aggregate.jl` and mirrored in `go/`.
+#                       Nitro with WORKERS=1 also takes `&queue=1`: the same op submitted to the
+#                       `/cpu_job` queue, answered 202, and counted by `/jobs`. `&yield=<ms>` runs
+#                       the loop with a `yield()` every <ms> in the handler (§5's fallback; Go
+#                       has no twin, it preempts).
+#   HOLDS=0|1           Nitro only: also serve the largest holds of #588's inventory as routes,
+#                       so `stall.sh` can keep K of them in flight: `GET /hold/json` answers
+#                       `Res.json` of a ~12 MB untyped `JSON.Object` parsed once at startup (the
+#                       `write_dict_10mb` row); `POST /hold/json_typed` binds the request's body
+#                       with `json(req, T; max_fields = 0)` (the `json_typed_10mb` row when it is
+#                       sent `rows_body.jl`'s 12 MB body) and answers `ok <rows>`;
+#                       `POST /hold/multipart` parses the request's multipart body with `getfiles`
+#                       (the `multipart_64mib` row when it is sent a 64 MiB body) and answers
+#                       `ok <parts>`; `GET /hold/file` is `Res.file(req, HOLD_FILE)`, the whole-file
+#                       read (`file_100mib`), and `GET /hold/file_stream` the same with
+#                       `stream = true`, the negative control (`file_100mib_stream_read`).
+#   HOLD_FILE=<path>    The file the two `/hold/file*` routes serve. Default
+#                       `bench/results/hold-100mib.bin`, written (100 MiB of random bytes) when
+#                       missing and read once at startup, so it is in page cache.
 #   PARK=timer|event    What the main task parks on once serving: a never-firing `Timer` (the
 #                       default) or a `Base.Event`, which is not a libuv handle (#598, `wake.sh`).
 #   GUARD=0|1           Hold one extra `Timer(typemax(Int32))` for the process's life: the
@@ -57,7 +80,8 @@
 # with the same bodies, so the stacks differ only in what serves them: `/plaintext`, `/json`,
 # `/health`, `/cpu`, and `/lag`. `/lag` reports how late a `sleep(0.01)` loop on the `:default`
 # pool woke since the previous `/lag` (p50/p99/max in ms, then resets) -- what a `Timer`-driven
-# deadline, such as a Workers timeout, sees while the pool is busy (#491).
+# deadline, such as a Workers timeout, sees while the pool is busy (#491). `/gc` answers every
+# field of `Base.gc_num()` as JSON, so a script can take the GC's counters before and after a run.
 
 using HTTP
 using JSON
@@ -78,6 +102,8 @@ const JOB_MS     = parse(Float64, get(ENV, "JOB_MS", "500"))
 const WORKERS    = get(ENV, "WORKERS", "0") == "1"
 const LAG        = get(ENV, "LAG", "0") == "1"
 const LOGIN      = get(ENV, "LOGIN", "0") == "1"
+const HOLDS      = get(ENV, "HOLDS", "0") == "1"
+const AGG_ROWS   = parse(Int, get(ENV, "AGG_ROWS", "0"))
 const BURST_K    = parse(Int, get(ENV, "BURST_K", string(max(Threads.nthreads(:default) - 2, 1))))
 
 for pkg in split(get(ENV, "PRELOAD", ""))
@@ -86,6 +112,28 @@ end
 
 const PLAINTEXT = "Hello, World!"
 json_body() = JSON.json(Dict("message" => "Hello, World!"))
+
+include(joinpath(@__DIR__, "aggregate.jl"))
+const AGG_DATA = agg_rows(AGG_ROWS)
+
+# `(n, op)` from the query's strings, or `nothing` when either is not one `/aggregate` serves.
+function agg_params(n_str, op_str)::Union{Nothing, Tuple{Int, String}}
+    n = n_str === nothing ? nothing : tryparse(Int, n_str)
+    (n === nothing || !(1 <= n <= length(AGG_DATA))) && return nothing
+    op_str in ("sum", "mean", "groupby") || return nothing
+    return n, String(op_str)
+end
+
+# `&yield=<ms>`: 0 (the plain loop) when absent; `nothing` when it is not a positive number.
+function agg_yield_ms(y_str)::Union{Nothing, Float64}
+    y_str === nothing && return 0.0
+    y = tryparse(Float64, y_str)
+    return y === nothing || !(y > 0) ? nothing : y
+end
+
+gc_body() = let g = Base.gc_num()
+    JSON.json(Dict(string(f) => getfield(g, f) for f in fieldnames(typeof(g))))
+end
 
 # Compute for `ms` without reaching a yield point: `time_ns` is a plain clock read. Julia does not
 # preempt, so this holds its thread for the whole duration, which is the case #491 asks about.
@@ -155,6 +203,14 @@ function bare_handler(req::HTTP.Request)::HTTP.Response
     target == "/cpu"       && return HTTP.Response(200, cpu_body())
     target == "/cpu_yield" && return HTTP.Response(200, cpu_yield_body())
     target == "/lag"       && return HTTP.Response(200, ["Content-Type" => "application/json"], lag_body())
+    target == "/gc"        && return HTTP.Response(200, ["Content-Type" => "application/json"], gc_body())
+    if startswith(target, "/aggregate")
+        query = HTTP.URIs.queryparams(HTTP.URIs.URI(target))
+        parsed = agg_params(get(query, "n", nothing), get(query, "op", nothing))
+        yield_ms = agg_yield_ms(get(query, "yield", nothing))
+        (parsed === nothing || yield_ms === nothing) && return HTTP.Response(400, "bad n, op or yield")
+        return HTTP.Response(200, ["Content-Type" => "application/json"], agg_body(AGG_DATA, parsed..., yield_ms))
+    end
     return HTTP.Response(404)
 end
 
@@ -211,7 +267,18 @@ function start_nitro()
         path("/cpu",       req -> Res.send(cpu_body()); method = "GET"),
         path("/cpu_yield", req -> Res.send(cpu_yield_body()); method = "GET"),
         path("/lag",       req -> Res.send(lag_body(); content_type = "application/json"); method = "GET"),
+        path("/gc",        req -> Res.send(gc_body(); content_type = "application/json"); method = "GET"),
     )
+    if HOLDS
+        hold_json, hold_json_typed, hold_multipart, hold_file, hold_file_stream = hold_routes()
+        urlpatterns(app, "",
+            path("/hold/json",        hold_json; method = "GET"),
+            path("/hold/json_typed",  hold_json_typed; method = "POST"),
+            path("/hold/multipart",   hold_multipart; method = "POST"),
+            path("/hold/file",        hold_file; method = "GET"),
+            path("/hold/file_stream", hold_file_stream; method = "GET"),
+        )
+    end
     if LOGIN
         login, login_bcrypt = login_routes()
         urlpatterns(app, "",
@@ -219,14 +286,16 @@ function start_nitro()
             path("/login_bcrypt", login_bcrypt; method = "GET"),
         )
     end
+    agg_job = nothing
     if WORKERS
-        burst, cpu_job, jobs = worker_routes()
+        burst, cpu_job, jobs, agg_job = worker_routes()
         urlpatterns(app, "",
             path("/burst",   burst; method = "GET"),
             path("/cpu_job", cpu_job; method = "GET"),
             path("/jobs",    jobs; method = "GET"),
         )
     end
+    urlpatterns(app, "", path("/aggregate", aggregate_route(agg_job); method = "GET"))
     serve(app; host = "127.0.0.1", port = PORT, async = true, show_banner = false,
           access_log = ACCESS_LOG)
     return app
@@ -245,6 +314,56 @@ function login_routes()
     bcrypt = Nitro.Auth.make_password(password; algorithm = "bcrypt")
     check(hash) = req -> Res.send(Nitro.Auth.check_password(password, hash) ? "ok" : "denied")
     return check(pbkdf2), check(bcrypt)
+end
+
+# `/aggregate` in Nitro: the query through `getquery`, as an app reads it. `submit` is
+# `worker_routes`' queue submitter, or `nothing` without WORKERS=1.
+function aggregate_route(submit)
+    return function (req)
+        query = Nitro.getquery(req)
+        parsed = agg_params(get(query, "n", nothing), get(query, "op", nothing))
+        yield_ms = agg_yield_ms(get(query, "yield", nothing))
+        (parsed === nothing || yield_ms === nothing) && return Res.send("bad n, op or yield"; status = 400)
+        if get(query, "queue", "0") == "1"
+            submit === nothing && return Res.send("queue=1 needs WORKERS=1"; status = 400)
+            submit(parsed...)
+            return Res.send("accepted"; status = 202)
+        end
+        return Res.send(agg_body(AGG_DATA, parsed..., yield_ms); content_type = "application/json")
+    end
+end
+
+# The largest holds of #588's inventory, as routes. The JSON value is built the way
+# `suite/holds.jl` builds `write_dict_10mb`'s: `suite/json.jl`'s rows payload at 250,000 rows,
+# parsed untyped. It is shared by every request and only read. `HoldRows` is `bench/setup.jl`'s
+# `BenchRows` under another name, so `/hold/json_typed` binds what `json_typed_10mb` binds.
+struct HoldRow
+    id::Int
+    label::String
+    value::Float64
+end
+struct HoldRows
+    rows::Vector{HoldRow}
+end
+
+const HOLD_FILE_BYTES = 100 * 1024 * 1024
+
+function hold_routes()
+    rows = JSON.json(Dict("rows" => [Dict("id" => i, "label" => "row-$i", "value" => i * 1.5)
+                                     for i in 1:250_000]))
+    value = JSON.parse(rows)
+    file = get(ENV, "HOLD_FILE", joinpath(@__DIR__, "..", "results", "hold-100mib.bin"))
+    if filesize(file) != HOLD_FILE_BYTES
+        mkpath(dirname(file))
+        write(file, rand(UInt8, HOLD_FILE_BYTES))
+    end
+    read(file)   # into page cache
+    hold_json = req -> Res.json(value)
+    hold_json_typed = req -> Res.send(string("ok ", length(Nitro.json(req, HoldRows; max_fields = 0).rows)))
+    hold_multipart = req -> Res.send(string("ok ", length(Nitro.getfiles(req))))
+    hold_file = req -> Res.file(req, file)
+    hold_file_stream = req -> Res.file(req, file; stream = true)
+    return hold_json, hold_json_typed, hold_multipart, hold_file, hold_file_stream
 end
 
 # `/burst?n=K`: K Workers jobs at once, each burning JOB_MS on the `:default` pool -- the pool
@@ -281,6 +400,19 @@ function worker_routes()
         return Res.send("accepted"; status = 202)
     end
     jobs = req -> Res.send(string(pending[]))
+    # `/aggregate?…&queue=1`: one aggregation per request on the same queue, counted the same way.
+    agg_job = function (n, op)
+        id = Threads.atomic_add!(seq, 1)
+        Threads.atomic_add!(pending, 1)
+        job = _ -> try agg_body(AGG_DATA, n, op) finally Threads.atomic_sub!(pending, 1) end
+        try
+            Nitro.Workers.submit_queued_task("burst", "agg-$id", job, owner; runtime)
+        catch
+            Threads.atomic_sub!(pending, 1)
+            rethrow()
+        end
+        return nothing
+    end
     burst = function (req)
         query = Nitro.getquery(req)
         n = parse(Int, something(get(query, "n", nothing), "8"))
@@ -298,7 +430,7 @@ function worker_routes()
         end
         return Res.send("submitted $n")
     end
-    return burst, cpu_job, jobs
+    return burst, cpu_job, jobs, agg_job
 end
 
 # `burn`, but calling `checkpoint!` every `every_ms` of it (#513): the cooperative yield point a

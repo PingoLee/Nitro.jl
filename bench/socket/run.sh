@@ -43,6 +43,13 @@
 # thread count (#462: does HTTP.jl's single interactive thread set the ceiling?) obey the rule
 # the README states -- compare within ONE run -- instead of one run per thread count.
 #
+# KEEP_JSON=1 keeps every measured oha JSON report under bench/results/socket-<stamp>-raw/ (it
+# carries p99.9 and the latency histogram, which the TSV does not). GC_SNAPSHOTS=1 records each
+# server's GC counters right before and right after every measured run in socket-<stamp>-gc.tsv,
+# so a run's tail can be set against the collections it contained (#590): a Julia mode's line is
+# its `/gc` (every `Base.gc_num()` field), a `go` mode's is the line count of its log, which with
+# GODEBUG=gctrace=1 in the environment is one line per collection.
+#
 # Results: one TSV per invocation under bench/results/ (gitignored).
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -58,6 +65,8 @@ SERVER_CPUS="${SERVER_CPUS:-0,1,2,3,6,7,8,9}"   # 4 physical cores (8 logical)
 CLIENT_CPUS="${CLIENT_CPUS:-4,5,10,11}"         # 2 other physical cores
 ROUTES="${ROUTES:-/plaintext /json}"
 RATE="${RATE:-}"
+KEEP_JSON="${KEEP_JSON:-0}"
+GC_SNAPSHOTS="${GC_SNAPSHOTS:-0}"
 read -r -a JULIA_CMD <<<"${JULIA:-julia}"
 
 for tool in oha taskset jq curl "${JULIA_CMD[0]}" ss; do
@@ -77,6 +86,10 @@ OUT="$ROOT/bench/results"
 mkdir -p "$OUT"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 RESULT="$OUT/socket-$STAMP.tsv"
+RAW="$OUT/socket-$STAMP-raw"
+[ "$KEEP_JSON" = 1 ] && mkdir -p "$RAW"
+GC_TSV="$OUT/socket-$STAMP-gc.tsv"
+[ "$GC_SNAPSHOTS" = 1 ] && printf 'mode\troute\trun\tphase\tsnapshot\n' > "$GC_TSV"
 printf 'mode\tthreads\taccess_log\troute\trate\tmedian_rps\tmin_rps\tmax_rps\tmedian_p50_ms\tmedian_p99_ms\trss_rest_mib\trss_after_mib\trss_peak_mib\n' > "$RESULT"
 
 median() { sort -n | awk '{a[NR]=$1} END{print (NR%2)?a[(NR+1)/2]:(a[NR/2]+a[NR/2+1])/2}'; }
@@ -174,11 +187,25 @@ for mode in "${MODE_LIST[@]}"; do
   for route in $ROUTES; do oha_json 3s "http://127.0.0.1:${PORT_OF[$mode]}$route" >/dev/null; done
 done
 
+slug() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
+gc_snapshot() {   # mode route run phase
+  local snap
+  if [ "$(mode_name "$1")" = go ]; then
+    snap="loglines=$(wc -l <"${LOG_OF[$1]}")"
+  else
+    snap="$(curl -fsS "http://127.0.0.1:${PORT_OF[$1]}/gc" 2>/dev/null || printf '{}')"
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$snap" >> "$GC_TSV"
+}
+
 declare -A RPS P50 P99
-for _ in $(seq 1 "$RUNS"); do
+for run in $(seq 1 "$RUNS"); do
   for route in $ROUTES; do
     for mode in "${MODE_LIST[@]}"; do
+      [ "$GC_SNAPSHOTS" = 1 ] && gc_snapshot "$mode" "$route" "$run" before
       js=$(oha_json "$DUR" "http://127.0.0.1:${PORT_OF[$mode]}$route")
+      [ "$GC_SNAPSHOTS" = 1 ] && gc_snapshot "$mode" "$route" "$run" after
+      [ "$KEEP_JSON" = 1 ] && printf '%s\n' "$js" >"$RAW/r$run-$(slug "$mode")-$(slug "$route").json"
       RPS[$mode$route]+="$(jq -r '.summary.requestsPerSec|floor' <<<"$js") "
       P50[$mode$route]+="$(jq -r '(.latencyPercentiles.p50 // 0) * 1000 | . * 100 | floor / 100' <<<"$js") "
       P99[$mode$route]+="$(jq -r '(.latencyPercentiles.p99 // 0) * 1000 | . * 100 | floor / 100' <<<"$js") "
