@@ -481,7 +481,12 @@ different reasons**, and conflating them is how this list rots:
    makes the loop the task every later Ctrl-C lands in. The reasoning is canonical next to
    `_cleanup_scheduler_loop`. Its third per-tick catch, around `_requeue_expired_tick!` (#514),
    is the same shape, and so is `_warn_stranded_external`'s catch on `start!`, whose failure
-   costs a warning and never the start. `src/response.jl`'s `_run_sse_producer` (#160) is the same
+   costs a warning and never the start. A consumer process's loops (`src/Workers/consumer.jl`,
+   #514) are this group too: `_claim_loop`, `_claim_one`, `_heartbeat_loop`, `_consumer_requeue!`
+   and the run task's `_run_claimed!`/`_hand_back!` catch-alls. They rethrow only the interrupt.
+   The loops' outer handlers turn it into a drain request rather than a `@warn` and an exit,
+   because the heartbeat must keep renewing while the drain runs. `_drain!`'s catch is
+   shutdown code and swallows everything (#427). `src/response.jl`'s `_run_sse_producer` (#160) is the same
    discipline one level down: the producer task nothing waits on, where the expected failure is
    the client disconnecting. Do not "fix" these to match the table above.
 3. **The error boundary itself — the place the other two are MEANT to arrive.**

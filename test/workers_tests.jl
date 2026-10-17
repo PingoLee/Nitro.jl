@@ -1399,7 +1399,7 @@ end
 
         # Pinned exactly, not iterated. The loop below walks `CANCEL_REASONS` itself, so dropping
         # a member would silently shrink what it tests and stay green.
-        @test Nitro.Workers.CANCEL_REASONS === (:user, :timeout, :superseded, :shutdown)
+        @test Nitro.Workers.CANCEL_REASONS === (:user, :timeout, :superseded, :shutdown, :lease_lost)
 
         for reason in Nitro.Workers.CANCEL_REASONS
             fresh = Nitro.Workers.TaskInfo("u::k")
@@ -5962,7 +5962,7 @@ end
 
 end
 
-@testitem "Workers -- external queues, the web side (#514)" tags=[:core, :workers] setup=[NitroCommon] begin
+@testitem "Workers -- external queues, the web side (#514)" tags=[:core, :workers] setup=[NitroCommon, SharedClaimStore] begin
 
 using Test
 using Dates
@@ -5973,28 +5973,6 @@ using Nitro.Workers: get_task_info, replace_task!, try_transition!, claim_next!,
 using Nitro.Errors: AuthorizationError, WorkerCapacityError
 
 const _W = Nitro.Workers
-
-# An in-memory store that says other processes can read it: every claim-capable backend a
-# consumer could share. Forwards the whole contract, the claim capability included, so the web
-# side runs exactly as it would over a database, without one.
-struct SharedStore <: AbstractWorkerStore
-    inner::InMemoryWorkerStore
-end
-SharedStore() = SharedStore(InMemoryWorkerStore())
-# Each forward with the contract's own arity: a varargs forward can be ambiguous with the
-# generated fixed-arity fallbacks on `AbstractWorkerStore`.
-for (f, n) in ((:get_task_info, 1), (:set_task!, 2), (:replace_task!, 2), (:add_watcher!, 2),
-               (:try_transition!, 3), (:delete_task!, 1), (:try_delete_task!, 2), (:cleanup_tasks!, 1),
-               (:get_all_tasks, 1), (:get_queue_authorizer, 0), (:set_queue_authorizer!, 1),
-               (:get_watch_authorizer, 0), (:set_watch_authorizer!, 1), (:get_error_redactor, 0),
-               (:set_error_redactor!, 1), (:claim_next!, 2), (:renew_leases!, 2), (:release_claim!, 2),
-               (:requeue_expired!, 1), (:count_external_runs, 1), (:clear_records!, 0),
-               (:list_running_task_refs, 0))
-    args = [Symbol("a", i) for i in 1:n]
-    @eval _W.$f(s::SharedStore, $(args...); kw...) = _W.$f(s.inner, $(args...); kw...)
-end
-_W.lock_tasks(cb::Function, s::SharedStore) = _W.lock_tasks(cb, s.inner)
-_W._visible_across_processes(::SharedStore) = true
 
 struct CannotClaim <: AbstractWorkerStore end
 
@@ -6325,6 +6303,302 @@ end
         @test get_queue_status(app, "nope", System())[:error] == "Queue not found"
     finally
         uninstall!(app; drain_timeout = 0)
+    end
+end
+
+end
+
+@testitem "Workers -- the consumer, in-process (#514)" tags=[:core, :workers] setup=[NitroCommon, SharedClaimStore] begin
+
+using Test
+using Dates
+using Nitro
+using Nitro.Workers
+using Nitro.Workers: get_task_info, replace_task!, try_transition!, claim_next!, requeue_expired!,
+    LeasePolicy, _start_consumer, _request_stop!, _drain!
+using Nitro.Errors: ClaimPoisonedError
+
+const _W = Nitro.Workers
+
+@kwdef struct Work
+    mode::String
+    tag::String = ""
+    n::Int = 0
+end
+
+# What each job saw, by tag: the reason it was stopped with, or that it ran.
+const SEEN = Dict{String, Any}()
+const SEEN_LOCK = ReentrantLock()
+const GATES = Dict{String, Base.Event}()
+seen!(tag, v) = lock(() -> (SEEN[tag] = v), SEEN_LOCK)
+seen(tag) = lock(() -> Base.get(SEEN, tag, nothing), SEEN_LOCK)
+gate(tag) = lock(() -> get!(Base.Event, GATES, tag), SEEN_LOCK)
+
+function work(task_info, w::Work)
+    if w.mode == "return"
+        return w.n * 2
+    elseif w.mode == "loop" || (w.mode == "attempt" && task_info.attempt == 1)
+        try
+            while true
+                checkpoint!(task_info)
+                sleep(0.02)
+            end
+        catch e
+            e isa TaskCancelledError && seen!(w.tag, e.reason)
+            rethrow()
+        end
+    elseif w.mode == "attempt"
+        seen!(w.tag * "-second", task_info.attempt)
+        return :second
+    elseif w.mode == "poll_return"
+        while !cancel_requested(task_info)
+            sleep(0.02)
+        end
+        seen!(w.tag, cancel_reason(task_info))
+        return :ignored
+    elseif w.mode == "block"
+        seen!(w.tag, :started)
+        wait(gate(w.tag))
+        return :unblocked
+    elseif w.mode == "progress"
+        update_progress!(task_info, 40)
+        wait(gate(w.tag))
+        return :done
+    end
+    error("unknown mode $(w.mode)")
+end
+
+# The setup function both processes call -- here, both "processes" are Apps over one store.
+function setup!(app; heavy = External(on_lease_expiry = :requeue))
+    declare_queues!(app, ["heavy" => heavy, "other" => External(on_lease_expiry = :fail)])
+    register_job!(work, app, "work", Work)
+    return app
+end
+
+waitfor(f; timeout = 10) = timedwait(f, timeout; pollint = 0.02) === :ok
+
+# A web App that submits, and a consumer App over the same store, with a short lease so the
+# heartbeat ticks every ~0.33 s. Not shorter: a run claimed just after a tick's snapshot is not
+# renewed by that tick, so a stall longer than the lease before the tick's own adjudication would
+# take it back, and on a slow CI host that would be a flake.
+function pair(; store = SharedStore(), heavy = External(on_lease_expiry = :requeue), k = 1,
+              queues = ["heavy" => k], kw...)
+    web = setup!(App(); heavy)
+    start!(web; store, cleanup_enabled = false, recover_zombies = false)
+    worker = setup!(App(); heavy)
+    c = _start_consumer(worker; store, queues, lease = 1.0, poll_interval = 0.05, drain_timeout = 3,
+                        require_interactive = false, kw...)
+    return web, c, store
+end
+
+function stop!(web, c)
+    _request_stop!(c)
+    _drain!(c)
+    uninstall!(web; drain_timeout = 0)
+end
+
+submit(web, tag, mode; n = 0, queue = "heavy", owner = Owner("u1")) =
+    submit_queued_task(web, queue, tag, Job("work", Work(; mode, tag, n)), owner)
+
+status(store, id) = get_task_info(store, id).status
+
+@testset "consume! refuses what could never run, before anything starts" begin
+    store = SharedStore()
+    app = setup!(App())
+    @test_throws "at least one queue" _start_consumer(app; store, queues = String[], require_interactive = false)
+    @test_throws "not declared External" _start_consumer(app; store, queues = ["nope" => 1], require_interactive = false)
+    @test_throws "never be claimed" _start_consumer(app; store = InMemoryWorkerStore(), queues = ["heavy" => 1],
+                                                    require_interactive = false)
+    @test_throws ArgumentError _start_consumer(app; store, queues = ["heavy" => 0], require_interactive = false)
+    @test_throws "positive duration" _start_consumer(app; store, queues = ["heavy" => 1], lease = 0,
+                                                     require_interactive = false)
+    # The heartbeat's thread. A process with one starts; one without is refused, which the
+    # two-process test proves in a child started with `--threads=1,0`, since CI's own layouts
+    # (`-t N` on 1.12) always have one.
+    if Threads.nthreads(:interactive) == 0
+        @test_throws "julia -t k,1" _start_consumer(app; store, queues = ["heavy" => 1])
+    else
+        c = _start_consumer(app; store, queues = ["heavy" => 1], lease = 1.0, poll_interval = 0.05)
+        _drain!(c)
+        @test istaskdone(c.heartbeat_task) && istaskdone(c.claim_task)
+    end
+end
+
+# JuliaLang/julia#63882 (#586): on 1.13.0-rc3..1.13.x a consumer holds #604's never-firing guard
+# `Timer` for its lifetime. Forced on, as #604's server test does, so it runs on the 1.12 CI too.
+@testset "consume! holds the wake guard while consuming, and the drain closes it" begin
+    Nitro.Core.AppContext._WAKE_GUARD_FORCED[] = true
+    local c
+    try
+        web, c, store = pair()
+        try
+            guard = c.wake_guard
+            @test guard isa Timer && isopen(guard)
+            # Still held mid-run, not only at start.
+            id = submit(web, "g", "return"; n = 1)
+            @test waitfor(() -> status(store, id) == COMPLETED)
+            @test isopen(guard)
+        finally
+            stop!(web, c)
+        end
+        @test !isopen(c.wake_guard)
+    finally
+        Nitro.Core.AppContext._WAKE_GUARD_FORCED[] = false
+    end
+    # Unforced, the version gate decides.
+    web2, c2, _ = pair()
+    try
+        @test Nitro.Core.AppContext._needs_wake_guard() ? (c2.wake_guard isa Timer && isopen(c2.wake_guard)) :
+                                                         c2.wake_guard === nothing
+    finally
+        stop!(web2, c2)
+    end
+    @test c2.wake_guard === nothing || !isopen(c2.wake_guard)
+end
+
+@testset "a claimed run completes, and k bounds how many run at once" begin
+    web, c, store = pair()
+    try
+        id = submit(web, "r", "return"; n = 7)
+        @test waitfor(() -> status(store, id) == COMPLETED)
+        @test get_task_info(store, id).result == 14
+
+        a = submit(web, "a", "block")
+        b = submit(web, "b", "block")
+        @test waitfor(() -> seen("a") === :started || seen("b") === :started)
+        sleep(0.3)
+        # k = 1: exactly one of the two is running, the other still waits in the store.
+        @test count(id -> status(store, id) == RUNNING, (a, b)) == 1
+        @test count(id -> status(store, id) == PENDING, (a, b)) == 1
+        notify(gate("a")); notify(gate("b"))
+        @test waitfor(() -> status(store, a) == COMPLETED && status(store, b) == COMPLETED)
+    finally
+        stop!(web, c)
+    end
+end
+
+@testset "a user cancel reaches the job as :user, and stays CANCELLED" begin
+    web, c, store = pair()
+    try
+        id = submit(web, "c", "loop")
+        @test waitfor(() -> status(store, id) == RUNNING)
+        cancel_task(id, Owner("u1"); runtime = worker_runtime(web))
+        @test waitfor(() -> seen("c") !== nothing)
+        @test seen("c") === :user
+        @test status(store, id) == CANCELLED
+    finally
+        stop!(web, c)
+    end
+end
+
+@testset "a stolen lease reaches the job as :lease_lost, and the run happens again" begin
+    web, c, store = pair()
+    try
+        id = submit(web, "l", "attempt")
+        @test waitfor(() -> status(store, id) == RUNNING)
+        first_run = get_task_info(store, id).run_id
+        # Another process's clock says the lease ran out: the run is taken back and re-queued.
+        tally = requeue_expired!(store, now(UTC) + Hour(1); policies = Dict("heavy" => LeasePolicy(:requeue)))
+        @test tally.requeued == 1
+        @test waitfor(() -> seen("l") !== nothing)
+        @test seen("l") === :lease_lost
+        # The hand-back lost its fence (the claim was already gone), and the next claim runs it.
+        @test waitfor(() -> status(store, id) == COMPLETED)
+        @test seen("l-second") == 2
+        @test get_task_info(store, id).run_id != first_run
+    finally
+        stop!(web, c)
+    end
+end
+
+@testset "a drain hands runs back instead of cancelling them" begin
+    web, c, store = pair(; k = 2)
+    try
+        looping = submit(web, "d", "loop")
+        polling = submit(web, "p", "poll_return")
+        @test waitfor(() -> status(store, looping) == RUNNING && status(store, polling) == RUNNING)
+        _request_stop!(c)
+        _drain!(c)
+        @test seen("d") === :shutdown
+        @test seen("p") === :shutdown
+        for id in (looping, polling)
+            rec = get_task_info(store, id)
+            # Back in the queue for the next consumer, its attempt still counted; a callback that
+            # returned on the token does not complete the run.
+            @test rec.status == PENDING
+            @test rec.claimed_by === nothing
+            @test rec.attempt == 1
+        end
+        @test istaskdone(c.heartbeat_task) && istaskdone(c.claim_task)
+    finally
+        stop!(web, c)        # a second drain waits for the first and returns
+    end
+end
+
+@testset "a run handed back at its queue's attempt bound is FAILED by the store" begin
+    web, c, store = pair(; heavy = External(on_lease_expiry = :requeue, max_attempts = 1))
+    try
+        id = submit(web, "b1", "loop")
+        @test waitfor(() -> status(store, id) == RUNNING)
+        _request_stop!(c)
+        _drain!(c)
+        rec = get_task_info(store, id)
+        @test rec.status == FAILED
+        @test occursin("Handed back", rec.error)
+    finally
+        stop!(web, c)
+    end
+end
+
+@testset "a poisoned queue stops being claimed; the others go on" begin
+    store = SharedStore()
+    store.claim_hook[] = q -> q == "heavy" && throw(ClaimPoisonedError(q, ErrorException))
+    web, c, _ = pair(; store, queues = ["heavy" => 1, "other" => 1])
+    try
+        heavy_id = submit(web, "h", "return"; n = 1)
+        other_id = submit(web, "o", "return"; n = 2, queue = "other")
+        @test waitfor(() -> status(store, other_id) == COMPLETED)
+        @test "heavy" in c.poisoned
+        sleep(0.2)
+        @test status(store, heavy_id) == PENDING
+    finally
+        store.claim_hook[] = nothing
+        stop!(web, c)
+    end
+end
+
+@testset "the consumer never runs the zombie sweep: the web's in-process runs are left alone" begin
+    store = SharedStore()
+    # What a web process's own run looks like from here: RUNNING, no lease, no handle.
+    local_run = TaskInfo("u1::in-web"; queue_name = "email")
+    replace_task!(store, "u1::in-web", local_run)
+    @test try_transition!(store, "u1::in-web", (PENDING,), RUNNING; run_id = local_run.run_id)
+    web, c, _ = pair(; store)
+    try
+        sleep(1.2)             # several heartbeats, each one adjudicating expired leases
+        @test status(store, "u1::in-web") == RUNNING
+    finally
+        stop!(web, c)
+    end
+end
+
+@testset "progress reaches the store; a row with no named job is failed" begin
+    web, c, store = pair()
+    try
+        id = submit(web, "g", "progress")
+        # On the in-memory store the claimed run's object IS the record, so this holds whether or
+        # not the heartbeat writes it. The two-process test proves the renewal persists it.
+        @test waitfor(() -> get_task_info(store, id).progress == 40.0)
+        notify(gate("g"))
+        @test waitfor(() -> status(store, id) == COMPLETED)
+
+        orphan = TaskInfo("u1::orphan"; queue_name = "heavy", external = true)
+        push!(orphan.watchers, "u1")
+        replace_task!(store, "u1::orphan", orphan)
+        @test waitfor(() -> status(store, "u1::orphan") == FAILED)
+        @test occursin("no named job", get_task_info(store, "u1::orphan").error)
+    finally
+        stop!(web, c)
     end
 end
 

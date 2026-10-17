@@ -6,7 +6,8 @@ default. **Status: decided.** §10 records the maintainer's decisions (2026-10-1
 follows the plan in §9, one PR per step. **Step 1 (the store contract) is implemented**; §11
 records where it departs from §3. **Step 2 (named jobs, in-process) is implemented**; §12 records
 where it departs from §2. **Step 3 lands in two parts**: 3a, the web side of `External(…)`, is
-implemented, and §13 records where it departs from §5. Nothing here changes an app that does not
+implemented, and §13 records where it departs from §5; 3b, `consume!`, is implemented, and §14
+records where it departs from §6–§7, with the measurements. Nothing here changes an app that does not
 opt in. It builds
 on #513's queue concurrency, `submit_queued_task` and `checkpoint!`
 ([PR #523](https://github.com/PingoLee/Nitro.jl/pull/523)), and uses their names.
@@ -624,4 +625,138 @@ store-counted admission, the start-time refusals, `requeue_expired!` on the rete
 
 No `upgrading/` entry: `release_claim!`'s new required keyword is on an optional store method that
 no release has shipped yet (step 1 is still `Unreleased`), and everything else is additive.
+
+## 14. Implementation notes: step 3b, the consumer (2026-10-16)
+
+Step 3b shipped `consume!` (`src/Workers/consumer.jl`): the claim loop, the lease heartbeat, the
+reason mapping, hand-back on drain and on a lost lease, and the stop path. It also shipped the
+`concurrency.instructions.md` amendment (the heartbeat's place on `:interactive`) and the
+two-process test, which adds SQLite.jl as a test dependency. Where it departs from §6–§7:
+
+- **The stop mechanism is `atexit`, plus the interrupt.** §7 left it open.
+  - Probed on Julia 1.12.7 and 1.13.2 with a script parked in `wait`:
+    - a `SIGTERM`, and a `SIGINT` outside a REPL, both end the process through `exit`;
+    - `exit` runs the `atexit` hooks, and the main task's wait never returns;
+    - a hook can still spawn tasks on other threads, and wait on them.
+  - So `consume!` registers one `atexit` drain when it is called (never in a module body), and its
+    own `finally` drains on a REPL interrupt. The drain runs once, and a second caller waits for it.
+  - A supervisor needs nothing special: systemd's and Kubernetes' default `SIGTERM` drains.
+  - The probe ran on Linux; macOS CI is the evidence there. On Windows a terminate is a hard kill
+    that runs no hook, so a stopped consumer's runs wait for their leases, as after a crash.
+  - The hook runs on whichever task thread 1 was running at the signal. Under `-t k,1` that is the
+    main task or the heartbeat. In the rare second case, nothing renews during the drain, and runs
+    still going when it ends keep only their remaining lease. A second signal during the drain
+    is bounded the same way: the second drain caller waits at most `drain_timeout + 10` seconds.
+  - A run that finishes during the drain is handed back too, and so runs again. A consumer cannot
+    tell a job that completed from one that saw `:shutdown` and returned early, and recording the
+    second as done would lose work (§7). A run the drain reaches before its task starts is handed
+    back without running.
+- **The heartbeat renews first and adjudicates second.** A heartbeat that was itself late does not
+  take back its own leases before renewing them.
+- **One attempt loop.** `_run_attempts!` (`src/Workers/queue.jl`) is now the loop of the queued
+  executor, the async one and the consumer, which differ only in `on_complete` / `on_cancel`. The
+  two executors used to carry identical copies. A third copy for the consumer is what this avoided.
+- **A consumer's policies are every external queue the app declares**, not only the consumed ones,
+  because `requeue_expired!` fails a leased row whose queue it has no policy for. The consumer
+  keeps that fail-closed default (`on_unknown_queue = :fail`); only the web tick skips, as decided
+  on #603 (§13).
+- **An interrupt is recognised however the store wrapped it** (`_is_interrupt`). PormG hands back
+  a Ctrl-C that landed inside a query as a `DatabaseError` whose `cause` is the interrupt, and a
+  bare `isa` test would log it as a failed heartbeat and lose the stop (found in review).
+- **A `ClaimPoisonedError` stops that queue only.** The consumer logs one `@error`, keeps running
+  its other queues, and does not exit. Exiting would make a restarting supervisor fail one more
+  row per restart, which is the backlog-eating loop the error exists to prevent.
+- **Progress** goes to the store with each renewal (`renew_leases!` carries it), as §6 asked. The
+  two-process test reads it back from the database.
+- **Timeouts are still the queue's**, from `External(…; options)` (§13). A timed-out callback keeps
+  its consumer slot until it returns, as in-process (`_RunHandoff`), but stops being renewed once
+  its run is recorded.
+- **A consumer holds #604's wake guard** (maintainer, #605). On Julia 1.13.0-rc3 through 1.13.x, a
+  task parked on a `Timer` does not wake while every `:default` thread runs a `yield()`ing loop,
+  as long as its timer is the only live libuv handle in the process
+  ([#586](https://github.com/PingoLee/Nitro.jl/issues/586),
+  [JuliaLang/julia#63882](https://github.com/JuliaLang/julia/issues/63882)). Both consumer loops
+  park on one-shot `Timer`s, and jobs that follow the "`yield()` every few ms" advice are exactly
+  those loops; the claim loop's timer is re-armed only from `:default`. Whether a waiter on
+  `:interactive` is affected at all was not tested (#586's repro parked on `:default`), so this is
+  a cheap precaution, not a measured fix. A consumer never calls `serve`, so it holds its own
+  never-firing `Timer(typemax(Int32))` for its lifetime, under the same `_needs_wake_guard()` gate,
+  and the drain closes it once both loops are done. One gate means one place to lower when a fixed
+  1.13.x ships.
+- **Every hand-back costs an attempt** (maintainer, #605). Claiming increments `attempt`, and a
+  hand-back keeps it (§4, #603), including the hand-back of a run that completed during the drain
+  and of one the drain reached before it started. Under `:requeue` with the default
+  `max_attempts = 3`, a long run that lives through three rolling deploys is recorded `FAILED`
+  ("Handed back … after 3 attempt(s)") without having failed. The tutorial says so.
+
+**Measured: heartbeat lateness under a heavily allocating job** (`bench/consumer/heartbeat_lateness.jl`;
+`-t 4,1`; three jobs that allocate small objects into a ring that keeps a live heap, plus
+short-lived garbage; lease 3 s, so a tick every 1 s; 60 s per run):
+
+| Julia | live heap per job | GC pause total / max | renewal gap p50 / p99 / max |
+|---|---|---|---|
+| 1.12.7 | 256 MiB | 41 s / 0.89 s | 1.20 / 1.55 / 1.55 s |
+| 1.12.7 | 1 GiB | 42 s / **11.6 s** | 1.00 / 12.5 / **12.5 s** |
+| 1.13.2 | 1 GiB | 43 s / **18.3 s** | 1.27 / 19.3 / **19.3 s** |
+
+- **The worst gap is the worst GC pause plus about one tick**, as §6 predicted. A stop-the-world
+  collection stops the interactive thread with everything else.
+- A 3 s lease would have lost these healthy runs. The **60 s default** holds the worst measured
+  pause, 18 s on 1.13, about three times over.
+- A job that keeps several GiB of small live objects can pause longer still. The docs therefore
+  state the rule ("the lease must exceed the longest pause your jobs cause") instead of a number.
+
+**Measured: the interactive thread is what keeps a CPU-bound job from starving the heartbeat.**
+Four jobs spinning without allocating or yielding, one per `:default` thread:
+
+- **At `-t 4,1`** the heartbeat was at most **17 ms** late.
+- **At `-t 4,0`** the heartbeat had no thread to run on: the four jobs held all four, thread 1
+  included. It never renewed, and the run had to be killed at 600 s.
+
+That is the evidence for refusing to start without an interactive thread.
+
+**Measured: the interactive thread keeps the heartbeat on time, not the renewal's statement**
+(maintainer, #605). The runs above use an in-memory store. Through PormG, a renewal is a database
+statement, and where it runs depends on the driver. At the PormG commit Nitro pins (`6f558894`),
+SQLite sends every statement to one global worker task started with `Threads.@spawn`, and
+Postgres.jl's `backend_execute_async` is a `Threads.@spawn`: both on `:default`. LibPQ's
+`async_execute` runs its task with `@async`, on the calling thread, so there the renewal stays on
+the interactive thread; that was read in LibPQ's source and not measured. The bench's
+`store = sqlite` runs the same consumer over `pormg_nitro_worker()` on a temporary SQLite file.
+Spin mode, `-t 4,1`, Julia 1.12.7, lease 3 s (a tick every 1 s), 60 s per run:
+
+| store | spinning jobs | renewals | first renewal | max gap | gaps longer than the lease |
+|---|---|---|---|---|---|
+| in-memory (the control) | 4 | 59 | 1.17 s | 1.002 s | 0 |
+| PormG, SQLite | 4 | **1** | **60.47 s** | — | **1: the whole run** |
+| PormG, SQLite | 3 | 60 | 1.18 s | 1.025 s | 0 |
+
+- **With every `:default` thread spinning, nothing renewed for the whole minute.** The heartbeat
+  woke on time and then waited for a `:default` thread for its statement; the one renewal landed
+  only after the drain had stopped the jobs. Every lease was expired from about 3 s on, so another
+  consumer, or the web's retention tick, would have taken back four healthy runs, which then run
+  twice.
+- **One free `:default` thread is enough**: with three jobs on four threads the SQLite store
+  renewed as punctually as the in-memory one.
+- **So the guarantee holds with LibPQ only.** The docs recommend LibPQ for consumers, and on SQLite
+  or Postgres.jl they say to run fewer jobs than `nthreads(:default)` or to have jobs `yield()`.
+  Postgres.jl was not measured; its code path is the same `:default` spawn. The real fix is on the
+  PormG side, a driver that runs the statement on the caller's pool, tracked on
+  [PormG#1280](https://github.com/PingoLee/PormG.jl/issues/1280).
+
+**Checked against real drivers.** The two-process test (`test/workers_consumer_e2e_tests.jl`)
+covers each of these:
+
+- a consumer `SIGKILL`ed mid-run, and its leases re-queued (`:requeue`) or failed (`:fail`) after
+  they expired;
+- the next consumer running the re-queued run;
+- a `SIGTERM` drain handing a `checkpoint!`ing run back;
+- a user cancel reaching the job as `:user`, and a lease taken back reaching it as `:lease_lost`;
+- the web's in-process run left alone throughout;
+- progress persisted;
+- the submitter count matching `_`, `%` and `\` in user ids literally.
+
+It runs on SQLite in CI, and was run by hand against PostgreSQL 16, through
+`NITRO_E2E_POSTGRES=<libpq conninfo>` and an environment with LibPQ: green on both. Store load
+was not measured beyond that; step 5's docs should not quote a number for it yet.
 

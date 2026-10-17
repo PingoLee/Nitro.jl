@@ -6,7 +6,7 @@ using Base: @kwdef
 import Base.Threads: ReentrantLock, lock
 
 using ..Core: App, LifecycleMiddleware
-using ..Core.AppContext: set_extension!, get_extension, delete_extension!
+using ..Core.AppContext: set_extension!, get_extension, delete_extension!, _needs_wake_guard, _WAKE_GUARD_FORCED
 using ..Core: AuthorizationError, StoreInterfaceError, WorkerUnavailableError, WorkerCapacityError,
     ClaimPoisonedError
 using ..Core.Errors: implements_contract_method, store_contract_error
@@ -27,6 +27,7 @@ include("Workers/jobs.jl")
 include("Workers/execution.jl")
 include("Workers/queue.jl")
 include("Workers/api.jl")
+include("Workers/consumer.jl")
 
 export TaskStatus, PENDING, RUNNING, COMPLETED, FAILED, CANCELLED,
     TaskInfo, TaskOptions, CleanupScheduler,
@@ -38,7 +39,7 @@ export TaskStatus, PENDING, RUNNING, COMPLETED, FAILED, CANCELLED,
     start!, startup, recover_zombie_tasks!,
     submit_task, submit_queued_task, get_task_status, cancel_task, release_task!,
     Job, register_job!, JobError,
-    External, declare_queues!,
+    External, declare_queues!, consume!,
     update_progress!, cancel_requested, cancel_reason, CANCEL_REASONS, TaskTimeoutError,
     checkpoint!, TaskCancelledError,
     get_all_tasks, cleanup_old_tasks,

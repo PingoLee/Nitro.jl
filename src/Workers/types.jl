@@ -371,21 +371,23 @@ end
 """
     CANCEL_REASONS
 
-The four things that can request a cancellation, as the symbols [`cancel_reason`](@ref) reports.
+The five things that can request a cancellation, as the symbols [`cancel_reason`](@ref) reports.
 
 | Reason | Who set it | What it already did to the record |
 |---|---|---|
 | `:user` | `cancel_task` | claimed `CANCELLED` **before** setting the token |
 | `:timeout` | an expired `TaskOptions(timeout=…)` | nothing yet — it throws [`TaskTimeoutError`](@ref), which is terminal `FAILED` |
 | `:superseded` | re-running a key whose predecessor is still executing | replaced the record, so the predecessor's `run_id` fence now fails |
-| `:shutdown` | a teardown drain ([`shutdown!`](@ref), #176) | **nothing** — a terminal write there would race the run's own, the #88/#108 failure mode |
+| `:shutdown` | a teardown drain ([`shutdown!`](@ref), #176), or a consumer process's drain (#514) | **nothing** — a terminal write there would race the run's own, the #88/#108 failure mode. On a consumer the run is **handed back** to the queue, not recorded |
+| `:lease_lost` | a consumer process's heartbeat, finding its lease taken back and the same submission re-queued or re-claimed (#514) | taken the run back: another run of it will happen. The run is handed back, which loses its fence and writes nothing |
 
-That last column is why the reason exists. Three of the four have already decided the record by
-the time the callback notices, so only a drain leaves the run to write its own terminal state —
-and before #183 it wrote `"Cancelled by user"` for a shutdown no user asked for. See
-[`cancel_reason`](@ref).
+That last column is why the reason exists. Most causes have already decided the record by the
+time the callback notices, so only a drain leaves the run to write its own terminal state — and
+before #183 it wrote `"Cancelled by user"` for a shutdown no user asked for. A job on an external
+queue reads `:lease_lost` as *stop, and assume the run will happen again*, never as a person's
+cancel: a cancel a person asked for always reads `:user`. See [`cancel_reason`](@ref).
 """
-const CANCEL_REASONS = (:user, :timeout, :superseded, :shutdown)
+const CANCEL_REASONS = (:user, :timeout, :superseded, :shutdown, :lease_lost)
 
 # The ONLY write path into the token. Deliberately not exported and not public: workers §6 keeps
 # `cancel_task` the authorized route into a cancellation, because it is the one that performs the
@@ -416,6 +418,7 @@ function _cancel_message(reason::Symbol)
     reason === :timeout && return "Cancelled by timeout"
     reason === :superseded && return "Cancelled by a re-run of this task key"
     reason === :shutdown && return "Cancelled by worker shutdown"
+    reason === :lease_lost && return "Cancelled: the consumer lost its lease on this run"
     return "Cancelled"
 end
 

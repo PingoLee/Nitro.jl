@@ -42,22 +42,24 @@ function _detached_thunk(f::Function)
 end
 
 """
-    _spawn_detached(f) -> Task
+    _spawn_detached(f; pool = :default) -> Task
 
 `Threads.@spawn f()`, but detached from the caller's dynamic scope (#209) — except for the
 logger, which is carried across deliberately.
 
-Matches `Threads.@spawn` in every other respect: non-sticky, `:default` thread pool. The
+Matches `Threads.@spawn` in every other respect: non-sticky, `:default` thread pool. `pool =
+:interactive` exists for one caller, a consumer process's lease heartbeat (#514), which a
+CPU-bound job on `:default` could otherwise starve; see `concurrency.instructions.md` §3. The
 `:default` pool is set explicitly because a bare `Task` does **not** default to it — see the
 parity assertion in `test/workers_tests.jl`, which is what fails if `_spawn_set_thrpool` or the
 `Task.scope` setter moves. (`_detached_thunk` reaches a third Base internal,
 `CoreLogging.CURRENT_LOGSTATE`; that one announces itself as an `UndefVarError` on the first
 spawn rather than as a silent behaviour change, so no assertion guards it.)
 """
-function _spawn_detached(f::Function)
+function _spawn_detached(f::Function; pool::Symbol = :default)
     task = Task(_detached_thunk(f))
     task.sticky = false
-    Base.Threads._spawn_set_thrpool(task, :default)
+    Base.Threads._spawn_set_thrpool(task, pool)
     task.scope = nothing
     schedule(task)
     return task

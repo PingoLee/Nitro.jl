@@ -35,6 +35,7 @@ Nitro.Workers.Job
 Nitro.Workers.JobError
 Nitro.Workers.declare_queues!
 Nitro.Workers.External
+Nitro.Workers.consume!
 Nitro.Workers.TaskAuthority
 Nitro.Workers.Owner
 Nitro.Workers.System

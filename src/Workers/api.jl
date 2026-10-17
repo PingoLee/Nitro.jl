@@ -965,7 +965,7 @@ function _execute_task_async(runtime::WorkerRuntime, task_key::String, callback:
             rethrow()
         end
         task_info === nothing && (_release_run!(runtime, run_id); return nothing)
-        handoff = _RunHandoff(() -> _release_run!(runtime, run_id))
+        handoff = Ref(_RunHandoff(() -> _release_run!(runtime, run_id)))
 
         # Starting is a CLAIMED transition, not an unconditional write. `set_task!` has no
         # precondition, so a `cancel_task` that already claimed PENDING -> CANCELLED was simply
@@ -1009,85 +1009,11 @@ function _execute_task_async(runtime::WorkerRuntime, task_key::String, callback:
             task_info.status = RUNNING
             task_info.started_at = started
 
-            max_attempts = options.retry_on_failure ? options.max_retries : 0
-            for retry_count in 0:max_attempts
-                try
-                    handoff = _RunHandoff(handoff)       # a fresh one per attempt
-                    result = timeout_call(callback, task_info; timeout=options.timeout, handoff)
-                    return _complete_task!(runtime, task_info, result)
-                catch error
-                    unwrapped = _unwrap_exception(error)
-
-                    # NOT dead code, however redundant it looks. `_fail_task!` below would lose
-                    # its CAS against an already-CANCELLED record anyway -- but without this
-                    # branch a cancelled task with `retry_on_failure` falls through to the
-                    # backoff `sleep` and RE-RUNS. This is what short-circuits the retry loop.
-                    #
-                    # `unwrapped isa InterruptException` used to be an arm of this test, back when
-                    # cancellation was delivered by injecting one. Nothing injects any more, so
-                    # the only way one arrives is that the callback itself threw it -- and nothing
-                    # set a cancel reason for it, so recording it as a cancellation would be a lie
-                    # about who stopped the job (#127).
-                    latest_info = get_task_info(runtime, task_key)
-                    if latest_info !== nothing && latest_info.status == CANCELLED
-                        return _cancel_task!(runtime, task_info)
-                    end
-
-                    # A `checkpoint!` that found this run's token set (#513). Recorded through the
-                    # same CAS as every other cancellation, so a cause that already decided the record
-                    # (a `cancel_task`, a supersede) keeps it, and a drain's `:shutdown` is stored as
-                    # one. Never retried: the token is never reset, so a retry would start cancelled.
-                    # Only when the token IS set: one the callback built itself is an ordinary failure,
-                    # for the reason the `InterruptException` note above gives.
-                    if unwrapped isa TaskCancelledError && cancel_requested(task_info)
-                        return _cancel_task!(runtime, task_info)
-                    end
-
-                    # A timeout is terminal on the first attempt. Retrying it cannot help and can
-                    # harm: nothing stops the attempt that timed out, so `max_retries = 3` would
-                    # put four copies of the callback on the thread pool at once, sharing one
-                    # `task_info` and one set of external side effects (#127). The token is not
-                    # reset between attempts either, so a retry would start pre-cancelled.
-                    #
-                    # So are the three `is_unrecoverable` exceptions (#367), recorded FAILED and
-                    # never rethrown. Why neither a retry nor a rethrow is canonical in that
-                    # function's site table (src/errors.jl); `_execute_queued_task` does the same.
-                    # A named job that does not bind (`JobError`, #514) is terminal too: a retry
-                    # binds the same text against the same registry.
-                    if unwrapped isa TaskTimeoutError || unwrapped isa JobError || is_unrecoverable(unwrapped)
-                        return _fail_task!(runtime, task_info, _store_error_text(runtime.store, unwrapped))
-                    end
-
-                    if retry_count == max_attempts
-                        return _fail_task!(runtime, task_info, _store_error_text(runtime.store, unwrapped))
-                    end
-
-                    # Cancellation-aware backoff. The catch above checks CANCELLED before sleeping and
-                    # never after, and the interrupt that used to abort this sleep is gone (#127) -- so a
-                    # cancel landing inside a 2/4/8s window re-invoked the user callback on a task that was
-                    # already cancelled. Polling the token instead of sleeping blind also cuts cancellation
-                    # latency during a backoff from seconds to milliseconds.
-                    deadline = time() + 2.0 ^ (retry_count + 1)
-                    while time() < deadline && !cancel_requested(task_info)
-                        sleep(0.05)
-                    end
-
-                    # The token is process-local, so a cancel issued on another node sets nothing here. One
-                    # durable read per ATTEMPT (not per poll) covers that without a round-trip every 50ms.
-                    if cancel_requested(task_info)
-                        return _cancel_task!(runtime, task_info)
-                    end
-                    resumed = get_task_info(runtime.store, task_key)
-                    if resumed !== nothing && resumed.status == CANCELLED
-                        return _cancel_task!(runtime, task_info)
-                    end
-                end
-            end
-
-            return task_info
+            # The attempt loop is shared with the queued executor and a consumer process (#514).
+            return _run_attempts!(runtime, task_info, callback, options, handoff)
         finally
             _deregister_run!(runtime, task_info)
-            _handed_off(handoff) || _release_run!(runtime, run_id)
+            _handed_off(handoff[]) || _release_run!(runtime, run_id)
         end
     end
 
