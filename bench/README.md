@@ -25,7 +25,7 @@ bench/
 │   ├── holds.jl        # how long one large JSON / multipart / file call holds its thread (#588)
 │   ├── passwords.jl    # one check_password at the default pbkdf2 and bcrypt costs (#587)
 │   └── aggregate.jl    # the /aggregate kernel alone: sum, mean, groupby at N = 10^3..10^7 (#590)
-├── socket/             # real-socket load: server.jl (Nitro vs bare HTTP.jl), run.sh, contention.sh, stall.sh, wake.sh (oha)
+├── socket/             # real-socket load: server.jl (Nitro vs bare HTTP.jl), run.sh, contention.sh, stall.sh, wake.sh, quiet.sh (oha)
 │   └── go/             # the Go net/http reference server run.sh's `go` mode builds; `go test -bench Aggregate`
 ├── tasks/              # Julia tasks vs goroutines, no HTTP: tasks.jl, go/, run.sh
 ├── results/            # JSON run outputs — gitignored (machine-specific)
@@ -115,7 +115,10 @@ bench/socket/stall.sh "nitro nitro@8,0 go" 3 6s      # /plaintext while K handle
 VARIANTS="login login_bcrypt" bench/socket/stall.sh "nitro go" 3 6s   # ... while K check a password (#587)
 AGG_ROWS=10000000 ROUTE_MS=115 VARIANTS="route:/aggregate?n=10000000&op=groupby" \
   bench/socket/stall.sh "nitro go" 3 8s                                # ... while K aggregate (#590)
+HOLDS=1 VARIANTS="route:/hold/multipart@bench/results/multipart-64mib.bin" \
+  bench/socket/stall.sh nitro 3 8s                                     # ... while K parse a 64 MiB upload (#588)
 bench/socket/night2.sh                               # the #587/#588/#590 night run, unattended
+bench/socket/quiet.sh holds-1.12 bench/socket/stall.sh nitro 3 8s   # run a block only on a quiet box
 bench/socket/wake.sh 3                               # does a parked handler wake while K yield? (#598)
 ```
 
@@ -135,10 +138,16 @@ bench/socket/wake.sh 3                               # does a parked handler wak
   startup and serves `/aggregate?n=<N>&op=<sum|mean|groupby>` in every mode, Go included (#590): a
   plain loop over the first N rows (`socket/aggregate.jl`, mirrored line for line in
   `socket/go/aggregate.go`; both generate the same rows from one splitmix64 seed), and with
-  `WORKERS=1` `&queue=1` sends it to the `/cpu_job` queue instead. `HOLDS=1` adds the two largest
-  holds of #588's inventory as routes: `GET /hold/json` (`Res.json` of a ~12 MB untyped value) and
-  `POST /hold/multipart` (`getfiles` of the request body; `socket/multipart_body.jl` writes a 64 MiB
-  one). `/gc` answers every field of `Base.gc_num()`.
+  `WORKERS=1` `&queue=1` sends it to the `/cpu_job` queue instead; `&yield=<ms>` makes the Julia
+  loop `yield()` every `<ms>` (§5's fallback; Go preempts, so it has no twin). `HOLDS=1` adds the
+  largest holds of #588's inventory to the Nitro modes as routes: `GET /hold/json` (`Res.json` of a
+  ~12 MB untyped value), `POST /hold/json_typed` (`json(req, T; max_fields = 0)` of the request
+  body; `socket/rows_body.jl` writes a 12 MB one), `POST /hold/multipart` (`getfiles` of the
+  request body; `socket/multipart_body.jl` writes a 64 MiB one), `GET /hold/file` (`Res.file`, the
+  whole-file read) and `GET /hold/file_stream` (the same with `stream = true`, the negative
+  control). Both file routes serve `HOLD_FILE`, by default `results/hold-100mib.bin`, written when
+  missing and read once at startup so it is in page cache. `/gc` answers every field of
+  `Base.gc_num()`.
 - `run.sh` pins the server (`-t 8`) and the load generator to disjoint physical cores, warms each
   route, and reports the median, min and max of N runs plus the median p99. The default CPU sets
   assume a 6-core part whose SMT siblings are `n` and `n+6`; set `SERVER_CPUS`/`CLIENT_CPUS` for
@@ -195,12 +204,19 @@ bench/socket/wake.sh 3                               # does a parked handler wak
   column is the share of those submissions the queue accepted. `login` and `login_bcrypt` keep K
   password checks in flight instead, and start the servers with `LOGIN=1`; Nitro bounds those
   checks itself since #587, and `PASSWORD_CONCURRENCY=0` in the environment turns the bound off
-  for an A/B. `route:<target>` keeps K requests of any route in flight (`route:<target>@<file>`
-  POSTs `<file>` with `ROUTE_CT`); a target with `queue=1` is offered at a rate like `cpu_job`.
-  `ROUTE_MS` is one request's cost. `KEEP_JSON=1` keeps every oha report under
-  `results/stall-<stamp>-raw/`. Modes are `nitro`,
-  `nitro@N,M` and `go`, which runs `cpu` only. The latest table is in the deployment guide's *Handlers that
-  compute*.
+  for an A/B. `route:<target>` keeps K requests of any route in flight; `route:<target>@<file>`
+  POSTs `<file>`, with the Content-Type on the first line of `<file>.ct` when it exists (the two
+  body writers create one) and `ROUTE_CT` otherwise. A target with `queue=1` is offered at a rate
+  like `cpu_job`. `ROUTE_MS` is one request's cost. `KEEP_JSON=1` keeps every oha report under
+  `results/stall-<stamp>-raw/`, and `GC_SNAPSHOTS=1` records each Julia server's `/gc` right before
+  and after every `/plaintext` window in `stall-<stamp>-gc.tsv`; `socket/stall_report.jl <stem>`
+  turns the two into one table per mode of medians with their min and max, GC columns included
+  (#588). Modes are `nitro`, `nitro@N,M`, `go` (which runs `base`, `cpu` and the unqueued
+  `route:` variants it serves) and `nitro+<tag>[@N,M]`: another Nitro server in the same
+  interleaved run, with the assignments in `ENV_<tag>` added to its environment and on
+  `JULIA_<tag>` instead of `JULIA` when that is set, so `ENV_unb="PASSWORD_CONCURRENCY=0"` and
+  `"nitro+unb nitro"` A/B #587's bound in one run. The latest table is in the deployment guide's
+  *Handlers that compute*.
 - `wake.sh [rounds]` asks whether a handler parked on a `Timer` wakes while every default thread
   runs a `yield()`ing handler: `LAG=1`'s probe is the parked task, K = 8 requests of `/cpu_yield`
   (`SPIN_MS`, default 1500) the yielding ones, and `/lag`'s max is the answer, with and without
@@ -209,6 +225,12 @@ bench/socket/wake.sh 3                               # does a parked handler wak
   JuliaLang/julia#63882 stalls on 1.13.0-rc3..1.13.2 (#586). Since #598 `serve()` holds the guard
   itself on those versions, so `event/0` there measures that guard; run it against an older
   checkout's `src/` to see the stall.
+- `quiet.sh <label> <command...>` runs one block only on a quiet box: it waits, for at most
+  `QUIET_WAIT_S` (default 1800), until no julia, oha or go-server process is left and the 1-minute
+  load is under `QUIET_LOAD` (default 0.5), then runs the command in a session of its own and
+  samples the box every `SAMPLE_S` seconds. A foreign julia, oha or go-server stops the block.
+  It exits 3 when the box never went quiet and 4 when it stopped a block; the samples go to
+  `results/quiet-<label>-<stamp>.tsv`, so a table can say what else was running.
 - `JULIA="julia +1.12"` runs the servers on another juliaup channel. Each Julia minor wants its
   own resolved manifest; `bench/Manifest-v1.12.toml` (gitignored) is the one 1.12 reads first, so
   copy `Manifest.toml` to it and `Pkg.resolve()` under 1.12 once.
