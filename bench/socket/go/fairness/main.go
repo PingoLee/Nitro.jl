@@ -6,10 +6,16 @@
 //
 //	go build -o fairness ./fairness && ./fairness -url http://127.0.0.1:8080/aggregate?n=100000&op=groupby -c 500 -d 8s
 //
+// -stamp tags every request with X-Conn (its connection's index), X-Seq (its number on that
+// connection) and X-Sent (the wall clock at send, Unix ns), which server.jl's PROBE=1 records
+// beside its own stamps (#618). -trace <file> writes one TSV line per completed request: conn,
+// seq, sent ns, received ns, so the two can be joined on (conn, seq).
+//
 // Prints one JSON object.
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -18,6 +24,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -27,6 +34,7 @@ type conn struct {
 	errors  int
 	maxWait time.Duration
 	lat     []time.Duration
+	trace   [][3]int64 // seq, sent, received (Unix ns), with -trace
 }
 
 func pct(sorted []float64, p float64) float64 {
@@ -44,6 +52,8 @@ func main() {
 	url := flag.String("url", "", "target URL")
 	c := flag.Int("c", 500, "connections")
 	d := flag.Duration("d", 8*time.Second, "duration")
+	stamp := flag.Bool("stamp", false, "send X-Conn, X-Seq and X-Sent headers")
+	tracePath := flag.String("trace", "", "write one TSV line per request (conn, seq, sent ns, received ns) here")
 	flag.Parse()
 	if *url == "" {
 		fmt.Fprintln(os.Stderr, "fairness: -url is required")
@@ -56,13 +66,24 @@ func main() {
 	deadline := start.Add(*d)
 	for i := range conns {
 		wg.Add(1)
-		go func(cs *conn) {
+		go func(idx int, cs *conn) {
 			defer wg.Done()
 			// One transport per goroutine: its own keep-alive connection, never shared.
 			client := &http.Client{Transport: &http.Transport{MaxIdleConnsPerHost: 1, DisableCompression: true}}
-			for time.Now().Before(deadline) {
+			req, err := http.NewRequest("GET", *url, nil)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "fairness:", err)
+				os.Exit(2)
+			}
+			connID := strconv.Itoa(idx)
+			for seq := 0; time.Now().Before(deadline); seq++ {
 				t0 := time.Now()
-				resp, err := client.Get(*url)
+				if *stamp {
+					req.Header.Set("X-Conn", connID)
+					req.Header.Set("X-Seq", strconv.Itoa(seq))
+					req.Header.Set("X-Sent", strconv.FormatInt(t0.UnixNano(), 10))
+				}
+				resp, err := client.Do(req)
 				if err == nil {
 					_, err = io.Copy(io.Discard, resp.Body)
 					resp.Body.Close()
@@ -77,11 +98,29 @@ func main() {
 				if l > cs.maxWait {
 					cs.maxWait = l
 				}
+				if *tracePath != "" {
+					cs.trace = append(cs.trace, [3]int64{int64(seq), t0.UnixNano(), t0.Add(l).UnixNano()})
+				}
 			}
-		}(&conns[i])
+		}(i, &conns[i])
 	}
 	wg.Wait()
 	wall := time.Since(start).Seconds()
+	if *tracePath != "" {
+		f, err := os.Create(*tracePath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "fairness:", err)
+			os.Exit(1)
+		}
+		w := bufio.NewWriter(f)
+		for i, cs := range conns {
+			for _, t := range cs.trace {
+				fmt.Fprintf(w, "%d\t%d\t%d\t%d\n", i, t[0], t[1], t[2])
+			}
+		}
+		w.Flush()
+		f.Close()
+	}
 
 	var all, counts, maxWaits []float64
 	total, errs := 0, 0
@@ -112,11 +151,11 @@ func main() {
 	}
 	out := map[string]any{
 		"connections": *c, "seconds": wall, "requests": total, "errors": errs,
-		"rps":            float64(total) / wall,
-		"latency_ms":     map[string]float64{"p50": pct(all, 0.5), "p90": pct(all, 0.9), "p99": pct(all, 0.99), "p999": pct(all, 0.999), "max": pct(all, 1)},
-		"share_over_1s":  float64(over1s) / math.Max(float64(len(all)), 1),
-		"per_conn_count": map[string]float64{"min": counts[0], "p1": pct(counts, 0.01), "p10": pct(counts, 0.1), "p50": pct(counts, 0.5), "p90": pct(counts, 0.9), "max": counts[len(counts)-1]},
-		"jain_index":     jain,
+		"rps":                  float64(total) / wall,
+		"latency_ms":           map[string]float64{"p50": pct(all, 0.5), "p90": pct(all, 0.9), "p99": pct(all, 0.99), "p999": pct(all, 0.999), "max": pct(all, 1)},
+		"share_over_1s":        float64(over1s) / math.Max(float64(len(all)), 1),
+		"per_conn_count":       map[string]float64{"min": counts[0], "p1": pct(counts, 0.01), "p10": pct(counts, 0.1), "p50": pct(counts, 0.5), "p90": pct(counts, 0.9), "max": counts[len(counts)-1]},
+		"jain_index":           jain,
 		"per_conn_max_wait_ms": map[string]float64{"p10": pct(maxWaits, 0.1), "p50": pct(maxWaits, 0.5), "p90": pct(maxWaits, 0.9), "max": maxWaits[len(maxWaits)-1]},
 	}
 	enc := json.NewEncoder(os.Stdout)
