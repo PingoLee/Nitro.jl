@@ -67,6 +67,40 @@ using Test
 # less. `min` throughout rather than the mean: a timing sample is noise ABOVE a floor, never
 # below it, so the minimum is the least-contaminated estimate of each.
 #
+# ── Why it logs on every run, pass or fail (#610) ─────────────────────────────────────────
+#
+# A pass used to print nothing, so the MARGIN was invisible: nobody knew how close a given
+# OS runs to `MAX_RATIO` until it crossed it. #610 is that crossing: `query_ext` read 9.5x
+# once on macOS / 1.12 / 1 thread, with the runner at 95–99% memory, and was green on the
+# next head. The item now logs one line per number, every run, all under the stable prefix
+# `warmth:` (`grep 'warmth:'` over a CI job log):
+#
+#   warmth: start os=… julia=… threads=… mem_free=<fraction> …   <- before any measurement
+#   warmth: baseline dict_int_s=…                                 <- before its @test
+#   warmth: ratio shape=… ratio=… shape_s=… baseline_s=…          <- one per shape, before its @test
+#   warmth: end mem_free=…                                        <- after them, even on a throw
+#
+# Those lines are for two things. Over a few CI runs they give the per-OS distribution of
+# each ratio. With the memory fraction beside them, a red can be read against the runner's
+# state, not guessed at. That data decides #610's third proposal (a per-OS limit, a third
+# numerator sample, or a free-memory floor). Until then the limits and sample counts above
+# stay as they are, and a ratio logged on a loaded developer box is not evidence for moving
+# them.
+#
+# The values go INTO the message string, not as `key=value` logging pairs, because
+# ConsoleLogger puts pairs on their own `│` lines, which a grep for the prefix would drop.
+#
+# They are written to `ReTestItems.DEFAULT_STDOUT[]`, not to the item's own logger, because
+# the item's logger would lose them. Run non-interactively (CI, `julia test/runtests.jl`),
+# ReTestItems defaults to `logs=:issues`: it redirects an item's output to a file and
+# deletes that file unless the item FAILED, so a plain `@info` appears only on exactly the
+# runs that already tell us the ratio. `DEFAULT_STDOUT` is the stream ReTestItems saves in
+# its `__init__`, before it redirects anything. On a worker that is the worker's stdout,
+# which the coordinator forwards as `Worker <pid>:  …`; in-process (`--workers 0`, the
+# coverage job) it is the run's own stdout. It is an INTERNAL of ReTestItems, so the lookup
+# falls back to `stdout` when it is missing. If an upgrade renames it, the lines go quiet
+# on a pass again, and the test itself still asserts.
+#
 # This is a `:slow` item — it spawns one Julia process per measurement. `--skip-tags slow`
 # drops it.
 
@@ -94,14 +128,38 @@ end
 
 best_of(shape, n) = minimum(measure(shape) for _ in 1:n)
 
-baseline = best_of("dict_int", 3)
-@test 0 < baseline < MAX_BASELINE_SECONDS
+# See "Why it logs on every run" above for why this is not the item's own logger.
+rti = isdefined(Main, :ReTestItems) ? getfield(Main, :ReTestItems) : nothing
+warmth_io = rti isa Module && isdefined(rti, :DEFAULT_STDOUT) && isassigned(rti.DEFAULT_STDOUT) ?
+    rti.DEFAULT_STDOUT[] : stdout
+function warmth(msg)
+    Base.CoreLogging.with_logger(Base.CoreLogging.ConsoleLogger(warmth_io)) do
+        @info "warmth: $msg"
+    end
+    flush(warmth_io)
+end
 
-# Two samples per numerator, not one: ReTestItems runs with `retries=0` here, so a single
-# sample makes one GC pause or one moment of CPU steal on a shared runner a hard red.
-@testset "$shape stays warm" for shape in SHAPES
-    ratio = best_of(shape, 2) / baseline
-    @test ratio < MAX_RATIO
+fmt(x) = string(round(x; digits = 3))
+memory() = "mem_free=$(fmt(Sys.free_memory() / Sys.total_memory())) " *
+           "mem_free_gib=$(fmt(Sys.free_memory() / 2^30)) mem_total_gib=$(fmt(Sys.total_memory() / 2^30))"
+
+warmth("start os=$(Sys.KERNEL) arch=$(Sys.ARCH) julia=$VERSION threads=$(Threads.nthreads()) $(memory())")
+try
+    baseline = best_of("dict_int", 3)
+    warmth("baseline dict_int_s=$(fmt(baseline)) limit_s=$MAX_BASELINE_SECONDS")
+    @test 0 < baseline < MAX_BASELINE_SECONDS
+
+    # Two samples per numerator, not one: ReTestItems runs with `retries=0` here, so a single
+    # sample makes one GC pause or one moment of CPU steal on a shared runner a hard red.
+    @testset "$shape stays warm" for shape in SHAPES
+        shape_s = best_of(shape, 2)
+        ratio = shape_s / baseline
+        warmth("ratio shape=$shape ratio=$(round(ratio; digits = 2)) shape_s=$(fmt(shape_s)) " *
+               "baseline_s=$(fmt(baseline)) limit=$MAX_RATIO")
+        @test ratio < MAX_RATIO
+    end
+finally
+    warmth("end $(memory())")
 end
 
 end
