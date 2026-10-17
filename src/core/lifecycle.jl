@@ -194,7 +194,7 @@ function serve(ctx::App;
     external_url=nothing,
     prefix=nothing,
     context=missing,
-    revise=:none,
+    revise::Symbol=:none,
     secret_key=nothing,
     httponly=nothing,
     secure=nothing,
@@ -234,8 +234,12 @@ function serve(ctx::App;
         throw(ArgumentError("`security_headers` must be a `SecurityHeaders(...)` value or " *
                             "`nothing`, got $(repr(security_headers))"))
 
+    # `:$revise`, not `repr(revise)` (#571): `repr` of a `Symbol` goes through Base's
+    # `show_unquoted` on an `Any`, which pulled the whole `show` machinery into every compiled
+    # `serve` -- 310 of the 408 errors in the first `juliac --trim` build. Interpolating the
+    # `Symbol` only `print`s its name.
     if revise ∉ (:none, :lazy, :eager)
-        throw(ArgumentError("Invalid `revise` value $(repr(revise)). Expected one of :none, :lazy, or :eager."))
+        throw(ArgumentError("Invalid `revise` value :$revise. Expected one of :none, :lazy, or :eager."))
     end
 
     # Validate HERE rather than only at shutdown. `_shutdown_server` also rejects a bad value,
@@ -622,6 +626,9 @@ end
 function startserver(ctx::App; host, port, show_banner=false, async=false, kwargs, start)::Union{Server, Nothing}
     show_banner && serverwelcome(ctx.service.external_url[], ctx.service.prefix[])
     ctx.service.server[] = start(preprocesskwargs(kwargs))
+    # Before the hooks: every exit from here on goes through `terminate`, whose `close` releases
+    # it. A no-op outside the Julia versions JuliaLang/julia#63882 affects (src/context.jl).
+    AppContext._hold_wake_guard!(ctx.service)
     # Route-owned first, then serve-owned: that is declaration order — routes are registered at
     # `urlpatterns()` time, the `serve(middleware = ...)` list only at `serve()` time (#82).
     # Within each half, registration order. `terminate` unwinds the exact reverse (#74).

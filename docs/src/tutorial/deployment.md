@@ -182,14 +182,16 @@ the benchmark's own job counter; its k = 0 baseline was 102k and 2.4 ms.
   - **When it happens:** only while no other timer is alive in the process. Any second live
     `Timer` removes it, even one that never fires. New requests are not affected: the `yield()`
     column above did not change on 1.13.2.
-  - **Who is safe:** Nitro's session pruner, rate-limiter janitor and Workers cleanup scheduler
-    each keep a timer alive while they sleep, so an app that uses any of them should not see it
-    (read from the code, not tested).
-  - **Who is exposed, and the workaround:** an app that uses none of them is exposed. On these
-    versions it can keep one timer for the server's lifetime: `keepalive = Timer(typemax(Int32))`
-    before `serve`, and `close(keepalive)` after. That timer never fires, so it costs nothing per
-    request. It was measured in the repro (7–12 ms, against 1.5 s), not in a server. The queue
-    is not affected either way.
+  - **Nitro works around it while serving.** On 1.13.0-rc3 and later 1.13 releases, `serve`
+    holds one `Timer` that never fires, and `terminate` closes it: one handle, nothing per
+    request. `bench/socket/wake.sh` measured a Nitro server with no other timer on 1.13.2
+    ([#598](https://github.com/PingoLee/Nitro.jl/issues/598)). It kept one handler parked in a
+    10 ms `sleep` loop while 8 handlers yielded every 1 ms for 1.5 s. Without the guard the
+    parked handler woke 1.48 s late in 3 runs of 3. With `serve`'s guard it woke 10–23 ms
+    late, against 2–8 ms on 1.12.7 with no load beside it.
+  - **What is still exposed:** a task that sleeps while no server is up, such as a script that
+    runs yielding loops before or after `serve`. It can hold the same guard itself:
+    `keepalive = Timer(typemax(Int32))`, and `close(keepalive)` when done.
 
 **Every app has one such handler: the login.** One `check_password` at the default cost
 computes without yielding for about 0.1 s (pbkdf2_sha256, 720,000 iterations) or 0.2 s
@@ -203,10 +205,27 @@ computes without yielding for about 0.1 s (pbkdf2_sha256, 720,000 iterations) or
 | 8 | 2.1k, 122 ms | 1.3k, 237 ms |
 | 16 | 291, 880 ms | 172, 1.6 s |
 
-Eight sign-ins at once stall the whole API while they run. So do eight guesses from a
+Eight sign-ins at once stalled the whole API while they ran, and so would eight guesses from a
 credential-stuffing client. A `RateLimiter` on the login route bounds what one client can impose,
-not what many impose together. Bound the checks the way the queue bounds jobs; see
-[Passwords](passwords.md#A-login-is-a-handler-that-computes).
+not what many impose together. **So Nitro bounds the checks itself**, the way the queue bounds
+jobs: at most `password_concurrency()` hash at once (`nthreads(:default) - 2` by default), and
+the rest wait parked ([Passwords](passwords.md#A-login-is-a-handler-that-computes)). The same
+run with the bound, on a busier box, against the bound turned off and against `/cpu_job` (the
+Workers queue of 6) in the same session. The unbounded and `/cpu_job` cells are Julia 1.12.7;
+each bounded cell is the range over three runs: 1.12.7, 1.13.2, and the 1.12.7 run beside
+`/cpu_job`:
+
+| k | pbkdf2, unbounded | pbkdf2, bounded | bcrypt, unbounded | bcrypt, bounded | `/cpu_job`, queue of 6 |
+|---|---|---|---|---|---|
+| 8 | 2.3k, 104 ms | 25–28k, 8–9 ms | 1.2k, 195 ms | 26–28k, 8 ms | 29k, 7.7 ms |
+| 16 | 254, 1.6 s | 25–27k, 8–9 ms | 132, 2.3 s | 26–29k, 8 ms | 28k, 7.9 ms |
+
+The other routes keep the queue's throughput at any k (lower here than in the table above
+because other work shared the CPUs; compare within a column set, not across tables). Logins
+pay for it. At k = 16 they ran at 42 per second (pbkdf2) and 20 (bcrypt) instead of 51 and 27,
+and a sign-in past the bound waits for one to finish. `set_password_concurrency!` moves that
+trade. The bound covers logins only: a Workers queue sized the same way takes its own threads
+on top of it, so an app running both at full load should size the two together.
 
 No setting in Nitro bounds a computing handler: `read_timeout` and `write_timeout` are socket
 deadlines, and nothing can stop a task from outside. The `AccessLog` middleware records each
