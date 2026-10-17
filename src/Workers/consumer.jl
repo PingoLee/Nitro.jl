@@ -425,16 +425,32 @@ end
 function _heartbeat_tick!(c::ConsumerHandle)
     store = c.runtime.store
     held = lock(() -> collect(values(c.held)), c.lock)
+    # Each step on its own, as in the drain (#608): a failed renewal, or one run's failed lookup,
+    # must not hold back the other runs' signals nor this tick's adjudication.
     if !isempty(held)
         renewals = LeaseRenewal[LeaseRenewal((h.info.id, h.info.run_id, Float64(@atomic h.info.progress)))
                                 for h in held]
         # Renew first, adjudicate second: a heartbeat that was itself late must not take back its
         # own leases before it renews them.
-        kept = Set{UUID}(renew_leases!(store, c.consumer_id, renewals; lease_seconds = c.lease_seconds))
-        for h in held
-            h.info.run_id in kept && continue
-            reason = _lost_claim_reason(store, h.info)
-            reason === nothing || _request_cancel!(h.info, reason)
+        kept = try
+            Set{UUID}(renew_leases!(store, c.consumer_id, renewals; lease_seconds = c.lease_seconds))
+        catch e
+            _is_interrupt(e) && throw(InterruptException())
+            @error "Nitro.Workers: a consumer's lease renewal failed; retrying on the next heartbeat" runs = length(renewals) exception = (e, catch_backtrace())
+            nothing
+        end
+        # A failed renewal says nothing about which runs were lost, so nothing is looked up.
+        if kept !== nothing
+            for h in held
+                h.info.run_id in kept && continue
+                try
+                    reason = _lost_claim_reason(store, h.info)
+                    reason === nothing || _request_cancel!(h.info, reason)
+                catch e
+                    _is_interrupt(e) && throw(InterruptException())
+                    @error "Nitro.Workers: a consumer could not read why a run's renewal missed; retrying on the next heartbeat" task_id = h.info.id exception = (e, catch_backtrace())
+                end
+            end
         end
     end
     # Once the drain has ended, the heartbeat only keeps the runs it left going alive (#607): a

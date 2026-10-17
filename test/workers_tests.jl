@@ -6591,6 +6591,56 @@ end
     end
 end
 
+# #608: one run's failed lookup costs that run's signal, not the other runs' nor the tick's adjudication.
+@testset "a heartbeat tick goes on past one lost run's failed lookup" begin
+    store = SharedStore()
+    web, c, _ = pair(; store, k = 2)
+    try
+        a = submit(web, "fa", "poll_return")
+        b = submit(web, "fb", "poll_return")
+        @test waitfor(() -> status(store, a) == RUNNING && status(store, b) == RUNNING)
+        # What the heartbeat does, in order. The first lookup of either run throws, whichever the
+        # tick reaches first, so the test does not depend on `held`'s iteration order.
+        events = Any[]
+        failed = Ref{Any}(nothing)
+        ev_lock = ReentrantLock()
+        on_heartbeat() = current_task() === c.heartbeat_task
+        # Only a lost run is looked up, so nothing is logged before the leases are taken back.
+        store.read_hook[] = id -> begin
+            (on_heartbeat() && id in (a, b)) || return
+            throws = lock(ev_lock) do
+                failed[] === nothing || (push!(events, (:read, id)); return false)
+                failed[] = id
+                push!(events, :threw)
+                return true
+            end
+            throws && error("one row's read failed")
+        end
+        store.requeue_hook[] = () -> on_heartbeat() &&
+            lock(() -> failed[] === nothing || push!(events, :requeue), ev_lock)
+        # Another process takes both leases back; the k = 2 slots stay busy, so neither is re-claimed.
+        requeue_expired!(store, now(UTC) + Hour(1); policies = Dict("heavy" => LeasePolicy(:requeue)))
+        @test waitfor(() -> lock(() -> count(==(:requeue), events) >= 1, ev_lock))
+        store.read_hook[] = nothing
+        store.requeue_hook[] = nothing
+        other = failed[] == a ? b : a
+        log = lock(() -> copy(events), ev_lock)
+        @test first(log) === :threw
+        tick = log[2:findfirst(==(:requeue), log)]
+        # In the same tick as the failure: the other run was still looked up, the failed one not
+        # again, and adjudication still ran.
+        @test (:read, other) in tick
+        @test !((:read, failed[]) in tick)
+        @test waitfor(() -> seen(other == a ? "fa" : "fb") !== nothing)
+        # The failed one is signalled on a later tick.
+        @test waitfor(() -> seen(other == a ? "fb" : "fa") !== nothing)
+    finally
+        store.read_hook[] = nothing
+        store.requeue_hook[] = nothing
+        stop!(web, c)
+    end
+end
+
 @testset "a poisoned queue stops being claimed; the others go on" begin
     store = SharedStore()
     store.claim_hook[] = q -> q == "heavy" && throw(ClaimPoisonedError(q, ErrorException))
