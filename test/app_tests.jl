@@ -206,3 +206,30 @@ finally
 end
 
 end
+
+# `Ref{T}` is abstract, so a `Ref{T}`-typed field makes every `service.x[]` a dynamic call that
+# returns `Any` -- per request on the `Cookie{T}`/`Session{T}` binding path, and the first wall a
+# `juliac --trim` build hit (#571). Pinned structurally, so a new slot cannot reintroduce it.
+@testitem "Service slots are concrete RefValues (#571)" tags=[:core] begin
+using Test
+using Nitro
+Service = Nitro.Core.AppContext.Service
+for name in fieldnames(Service)
+    T = fieldtype(Service, name)
+    T <: Ref || continue
+    @test (name, T <: Base.RefValue && isconcretetype(T)) == (name, true)
+end
+# Through a function of the `App`, so it is the FIELD's declared type inference sees -- a bare
+# `@inferred app.service.cookies[]` evaluates the field first and only checks `getindex`.
+app = App()
+read_cookies(a) = a.service.cookies[]
+read_timeout(a) = a.service.shutdown_timeout[]
+read_prefix(a) = a.service.prefix[]
+@test (@inferred read_cookies(app)) isa Nitro.Core.Types.CookieConfig
+@test (@inferred read_timeout(app)) isa Float64
+@test Base.return_types(read_prefix, (App,)) == [Union{Nothing, String}]
+@test Base.return_types(isopen, (Service,)) == [Bool]
+read_key(a) = a.service.cookies[].secret_key
+read_key(app)
+@test @allocated(read_key(app)) == 0
+end

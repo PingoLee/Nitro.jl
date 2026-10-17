@@ -231,8 +231,10 @@ configure `ExtractIP`/`RateLimiter` with both `trusted_proxies` and the
 
 See also `terminate`, `RateLimiter`, and `ExtractIP`.
 """
-function serve(; kwargs...)
-    async = Base.get(kwargs, :async, false)
+function serve(; async::Bool = false, kwargs...)
+    # `async` is a named keyword, not read out of the kwargs bag, so this layer stays statically
+    # typed (#571) -- same for the `App` form below. (Inside the body: a comment between the
+    # docstring and `function` detaches the docstring.)
     # Whether the server this `finally` would tear down is OURS to tear down. Decided from
     # the context *before* the call, not from a flag set after it: if something is already
     # serving, `Core.serve` rejects this call and that server belongs to somebody else —
@@ -246,7 +248,7 @@ function serve(; kwargs...)
         # server is already down by then, so the handle would be useless). Either way the
         # handle is safe to display — `Nitro.Core.NitroStreamHandler` gives it a `show`
         # that prints only the address, never the secrets captured in handler closures.
-        return Nitro.Core.serve(CONTEXT[]; kwargs...)
+        return Nitro.Core.serve(CONTEXT[]; async, kwargs...)
     finally
         # close server on exit if we aren't running asynchronously
         if !async && ours
@@ -740,11 +742,14 @@ end
 # …)`, no `app`) while an explicit `App` is served. Those helpers used to encrypt under the global
 # key by accident; now they would write plaintext without a word. Say so, once, where the mix is
 # visible. Never names the key.
-function _warn_shadowed_cookie_key(app::App, kwargs)
+#
+# `secret_key` is the one `serve` keyword this reads, passed on its own rather than as the kwargs
+# bag (#571): a `get` on a `Base.Pairs` of unknown keys is a call `juliac --trim` cannot resolve.
+function _warn_shadowed_cookie_key(app::App, secret_key)
     app === CONTEXT[] && return nothing
     isnothing(CONTEXT[].service.cookies[].secret_key) && return nothing
     isnothing(app.service.cookies[].secret_key) || return nothing
-    isnothing(Base.get(kwargs, :secret_key, nothing)) || return nothing
+    isnothing(secret_key) || return nothing
     @warn "Nitro: a cookie secret_key is configured on the GLOBAL app (`configcookies(secret_key = …)`), " *
           "but the App being served has none, so any cookie it sets is NOT encrypted. `get_cookie`/" *
           "`set_cookie!` use the configuration of the app serving the request (#308) -- configure " *
@@ -873,14 +878,13 @@ Unlike the singleton form this never calls `resetstate()` on exit — that reset
 context, which has nothing to do with `app`. A blocking call still terminates the listener
 it started.
 """
-function serve(app::App; kwargs...)
-    _warn_shadowed_cookie_key(app, kwargs)
-    async = Base.get(kwargs, :async, false)
+function serve(app::App; async::Bool = false, secret_key = nothing, kwargs...)
+    _warn_shadowed_cookie_key(app, secret_key)
     # Same reasoning as the singleton form above: decide ownership BEFORE the call, so a
     # rejected `serve` never tears down the healthy server that caused the rejection.
     ours = !isopen(app.service)
     try
-        return Nitro.Core.serve(app; kwargs...)
+        return Nitro.Core.serve(app; async, secret_key, kwargs...)
     finally
         if !async && ours
             try

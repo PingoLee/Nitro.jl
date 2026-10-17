@@ -66,14 +66,20 @@ function _try_cancel(cancel::Function, task::Task)::Union{Bool,Nothing}
     end
 end
 
+# Every mutable slot is a concrete `Base.RefValue{T}`, never `Ref{T}` (#571). `Ref{T}` is ABSTRACT
+# -- it has several concrete subtypes -- so `getindex` on a `Ref{T}` field cannot be resolved
+# statically and every `service.x[]` came back `Any`: a dynamic call per read, including the
+# `cookies[]` read `Cookie{T}`/`Session{T}` binding makes on every request, and the first wall a
+# `juliac --trim` build hits. `Ref{T}(x)` constructs a `RefValue{T}`, so the defaults and every
+# `x[]`/`x[] = v` call site are unchanged.
 @kwdef struct Service
-    server              :: Ref{Nullable{Server}}    = Ref{Nullable{Server}}(nothing)
+    server              :: Base.RefValue{Nullable{Server}} = Ref{Nullable{Server}}(nothing)
     router              :: Router                   = Router()
     custommiddleware    :: CopyOnWriteDict{RouteMiddleware} = CopyOnWriteDict{RouteMiddleware}()
     named_routes        :: Dict{String, NamedRoute} = Dict{String, NamedRoute}()
-    external_url        :: Ref{Nullable{String}}    = Ref{Nullable{String}}(nothing)
-    prefix              :: Ref{Nullable{String}}    = Ref{Nullable{String}}(nothing)
-    eager_revise        :: Ref{Nullable{EagerReviseService}} = Ref{Nullable{EagerReviseService}}(nothing)
+    external_url        :: Base.RefValue{Nullable{String}} = Ref{Nullable{String}}(nothing)
+    prefix              :: Base.RefValue{Nullable{String}} = Ref{Nullable{String}}(nothing)
+    eager_revise        :: Base.RefValue{Nullable{EagerReviseService}} = Ref{Nullable{EagerReviseService}}(nothing)
     named_routes_lock     :: ReentrantLock          = ReentrantLock()
     # Route shape -> `:auto`, `:explicit` or `:retired`: who owns the `HEAD` leaf there (#277).
     # Explicit `HEAD` wins whatever the registration order; see `_register_head!`
@@ -115,10 +121,10 @@ end
     route_lifecycle       :: Vector{LifecycleMiddleware} = LifecycleMiddleware[]
     serve_lifecycle       :: Vector{LifecycleMiddleware} = LifecycleMiddleware[]
     lifecycle_lock        :: ReentrantLock          = ReentrantLock()
-    cookies               :: Ref{CookieConfig}      = Ref{CookieConfig}(CookieConfig())
+    cookies               :: Base.RefValue{CookieConfig} = Ref{CookieConfig}(CookieConfig())
     extensions            :: Dict{Symbol, Any}      = Dict{Symbol, Any}()
     extensions_lock       :: ReentrantLock          = ReentrantLock()
-    shutdown_timeout      :: Ref{Float64}           = Ref{Float64}(SHUTDOWN_TIMEOUT_SECONDS)
+    shutdown_timeout      :: Base.RefValue{Float64} = Ref{Float64}(SHUTDOWN_TIMEOUT_SECONDS)
     # `serve(max_fields = …)`. The pipeline's outermost layer binds THIS cell, not a copy, in
     # `REQUEST_SCOPE` for each request's extent (#327, #444), so a pipeline built before `serve`
     # sets it still sees it. Concrete `RefValue` so the scope can hold it without a conversion.

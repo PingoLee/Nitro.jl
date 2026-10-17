@@ -161,9 +161,11 @@ end
 
 A refusal that a denial factory has already built, thrown from where a response cannot be
 returned: an extractor runs before the handler, and it can only throw. `Claims{T}` (#527) throws
-one when the request has no token principal, or one whose claims do not bind. `handle_error`
-answers with `response` as it is, so the app's `unauthorized`/`denied` factory decides the status
-and the body. It is logged at `@debug`, with no backtrace and no body.
+one when the request has no token principal, or one whose claims do not bind. The route's handler
+closure (`registerhandler`, `src/core/registration.jl`) catches it and serves `response` as it is,
+whatever `catch_errors` and `serialize` are set to (#594), so the app's `unauthorized`/`denied`
+factory decides the status and the body. It is logged at `@debug`, with no backtrace and no body.
+Thrown from anywhere else it is a server fault, a `500`.
 
 Deliberately **not exported**: an application builds the response, never this.
 """
@@ -172,6 +174,27 @@ struct AuthDenial <: Exception
 end
 
 Base.showerror(io::IO, e::AuthDenial) = print(io, "Auth Denial: ", e.response.status)
+
+"""
+    ValidatorFault(msg::String)
+
+What an extractor's validator raises in place of its own exception when it throws something other
+than a `ValidationError`, or returns something other than a `Bool` (#595). A validator receives
+the bound value (a client's deserialized body, a token's claims), and the most likely accidental
+throw, a `MethodError`, renders its arguments, so letting the original reach `handlerequest`'s
+`@error` wrote that value to the log. The original is dropped; `msg` names the parameter, the
+bound type and the validator, never the value.
+
+It is a server bug, not a rejection, so it is answered like any other handler fault: the fixed
+`500` body, logged at `@error` with a backtrace.
+
+Deliberately **not exported**: an application never raises or catches this.
+"""
+struct ValidatorFault <: Exception
+    msg::String
+end
+
+Base.showerror(io::IO, e::ValidatorFault) = print(io, "Validator Fault: ", e.msg)
 
 """
     UnsupportedMediaTypeError(msg::String)
@@ -404,7 +427,7 @@ of these sites call (a user's `validate_token`, a user's session store):
 | `src/middleware/auth_middleware.jl` ×2 | the user's `validate_token` (reaches `decode_jwt` → `JSON.parse`) |
 | `src/utilities/bodyparsers.jl` ×6 | `_parse_json_bounded` — plus `HTTP.queryparams`/`HTTP.parse_multipart_body`, which do NOT recurse and ride along so the parsers in one file cannot drift apart; the sixth is `json(req, T)`'s wrap into a `ValidationError` (#326) |
 | `src/utilities/misc.jl` ×4 | `parseparam`'s `_parse_json_bounded(str, T)` fall-through — reached by **any** scalar path/query parameter, since `parse(Int, str)` fails first and lands there — plus `parsebody_union`'s member loop, the same shape for `Body{T}` (#345) |
-| `src/extractors.jl` ×2 | `safe_extract`'s `f()` (the extractor body, i.e. the parsers above) and the app's session store |
+| `src/extractors.jl` ×8 | `safe_extract`'s `f()` (the extractor body, i.e. the parsers above), the app's session store, `Claims{T}`'s bind and the three in its refusal diagnosis (#527), and `validator_verdict`'s call of an app validator with `global_validate_identity`'s method lookup for its fault (#595) |
 | `src/middleware/csrf_middleware.jl` ×2 | `getform`/`getjson` |
 | `ext/NitroPormGExt.jl` ×5 | the PormG stores' reads of their own stored JSON (#344): the session query and decode in `Base.get(::PormGSessionStore, …)`, which `SessionMiddleware` calls per request; `_parse_stored_json` for a task's `result`/`watchers`; `_listed_task`, which would otherwise swallow what `_parse_stored_json` rethrows one frame up; and `_claim_row!`'s decode of the head row a consumer claims (#514) |
 | `src/Workers/jobs.jl` ×2 | a named job's arguments (#514): `_encode_job`'s serialize-and-bind-back at submit, and `NamedJobRun`'s bind of the stored JSON when the run starts. Both reach `JSON.parse` through `stored_json_bind` (`json_bind` without the request field cap, since arguments are stored data), and the run-side one turns every other failure into a terminal `JobError` |

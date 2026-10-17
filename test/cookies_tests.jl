@@ -1797,28 +1797,32 @@ end
     try
         configcookies(secret_key = key_g)
         bare = App(mod = @__MODULE__)
-        @test_logs (:warn, r"GLOBAL app.*NOT encrypted") Nitro._warn_shadowed_cookie_key(bare, (;))
+        @test_logs (:warn, r"GLOBAL app.*NOT encrypted") Nitro._warn_shadowed_cookie_key(bare, nothing)
         # ...and `serve(app)` really calls it. An invalid `revise` makes serve refuse right after,
         # before anything binds a port.
         @test_logs (:warn, r"GLOBAL app") match_mode = :any begin
             @test_throws ArgumentError serve(bare; revise = :bogus, show_banner = false)
         end
+        # ...and `serve(app; secret_key = …)` reaches it as the key it is (#571 names the keyword).
+        @test_logs min_level = Base.CoreLogging.Warn begin
+            @test_throws ArgumentError serve(bare; secret_key = key_a, revise = :bogus, show_banner = false)
+        end
         # ...and the message never carries the key.
         logger = Test.TestLogger()
-        Base.CoreLogging.with_logger(() -> Nitro._warn_shadowed_cookie_key(bare, (;)), logger)
+        Base.CoreLogging.with_logger(() -> Nitro._warn_shadowed_cookie_key(bare, nothing), logger)
         @test !any(r -> occursin(key_g, r.message), logger.logs)
 
         # Silent whenever the served app does have a key, or is the global app itself.
         keyed = App(mod = @__MODULE__)
         configcookies(keyed; secret_key = key_a)
-        @test_logs min_level = Base.CoreLogging.Warn Nitro._warn_shadowed_cookie_key(keyed, (;))
-        @test_logs min_level = Base.CoreLogging.Warn Nitro._warn_shadowed_cookie_key(bare, (; secret_key = key_a))
-        @test_logs min_level = Base.CoreLogging.Warn Nitro._warn_shadowed_cookie_key(Nitro.CONTEXT[], (;))
+        @test_logs min_level = Base.CoreLogging.Warn Nitro._warn_shadowed_cookie_key(keyed, nothing)
+        @test_logs min_level = Base.CoreLogging.Warn Nitro._warn_shadowed_cookie_key(bare, key_a)
+        @test_logs min_level = Base.CoreLogging.Warn Nitro._warn_shadowed_cookie_key(Nitro.CONTEXT[], nothing)
     finally
         resetstate()
     end
     # No global key: nothing to shadow.
-    @test_logs min_level = Base.CoreLogging.Warn Nitro._warn_shadowed_cookie_key(App(mod = @__MODULE__), (;))
+    @test_logs min_level = Base.CoreLogging.Warn Nitro._warn_shadowed_cookie_key(App(mod = @__MODULE__), nothing)
 end
 
 @testset "outside a request, and on the singleton, they mean the global app" begin
