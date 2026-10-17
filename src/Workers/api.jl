@@ -311,10 +311,173 @@ function _checked_queue_specs(ctx::App, key::Symbol, store, runtime, queues::Abs
         throw(ArgumentError(
             "pass `store` (build a runtime over this backend) or `runtime` (use this one), not both"))
     end
-    specs = _queue_specs(queues)
+    # The keyword's own list first, so an `External(…)` passed there is refused as that, with a
+    # pointer at `declare_queues!`, before the app's declarations are merged in.
+    _queue_specs(queues)
+    specs, external = _placement_specs(Any[_app_placements(ctx)..., queues...])
     target = _runtime_to_reuse(ctx, key, store, runtime)
-    target === nothing || _check_queue_declarations(target, specs)
-    return specs
+    target === nothing || _check_queue_declarations(target, specs, external)
+    _check_external_store(_target_store(ctx, key, store, runtime), external)
+    return specs, external
+end
+
+# The store `_start_runtime_for!` would start a runtime over, or `nothing` when it would build a
+# fresh default runtime, whose store is a new `InMemoryWorkerStore`.
+function _target_store(ctx::App, key::Symbol, store::Union{Nothing, AbstractWorkerStore},
+                       runtime::Union{Nothing, WorkerRuntime})
+    runtime === nothing || return runtime.store
+    store === nothing || return store
+    existing = worker_runtime(ctx; key)
+    return existing isa WorkerRuntime ? existing.store : nothing
+end
+
+# Refused at start, never later (#514): an external queue whose runs no consumer process could
+# ever claim. `nothing` is the default in-memory store a fresh runtime would get.
+function _check_external_store(store::Union{Nothing, AbstractWorkerStore},
+                               external::Vector{Pair{String, External}})
+    isempty(external) && return nothing
+    names = join(("\"$(first(p))\"" for p in external), ", ")
+    if store !== nothing && !supports_claims(store)
+        throw(ArgumentError(
+            "the External(…) queue(s) $names need a store with the claim capability, and " *
+            "$(typeof(store)) lacks $(join(missing_claim_methods(typeof(store)), ", "))"))
+    end
+    if store === nothing || !_visible_across_processes(store)
+        what = store === nothing ? "a new InMemoryWorkerStore" : string(typeof(store))
+        throw(ArgumentError(
+            "the External(…) queue(s) $names need a store another process can read, and this " *
+            "runtime's is $what, which lives in this process's memory: a run submitted there " *
+            "would never be claimed. Pass a persistent store, such as `pormg_nitro_worker(…)`"))
+    end
+    return nothing
+end
+
+# -- The app's queue declarations (#514) --
+
+# Per App, in its extension slot like the job registry and for the same reasons: the declarations
+# are made by the app's setup function, before any runtime is installed, and must outlive the
+# runtime `uninstall!` drops on every `terminate`. They are also what a consumer process reads,
+# and it installs no runtime at all.
+struct QueueDeclarations
+    specs::Vector{Pair{String, Int}}
+    external::Vector{Pair{String, External}}
+    lock::ReentrantLock
+end
+QueueDeclarations() = QueueDeclarations(Pair{String, Int}[], Pair{String, External}[], ReentrantLock())
+
+const QUEUE_DECLARATIONS_KEY = :workers_queues
+
+function _queue_declarations(ctx::App)
+    return lock(ctx.service.extensions_lock) do
+        decl = get_extension(ctx, QUEUE_DECLARATIONS_KEY, nothing)
+        decl isa QueueDeclarations && return decl
+        fresh = QueueDeclarations()
+        set_extension!(ctx, QUEUE_DECLARATIONS_KEY, fresh)
+        return fresh
+    end
+end
+
+# A snapshot of the app's declarations, as one `queues`-shaped list.
+function _app_placements(ctx::App)
+    decl = get_extension(ctx, QUEUE_DECLARATIONS_KEY, nothing)
+    decl isa QueueDeclarations || return Any[]
+    return lock(() -> Any[decl.specs..., decl.external...], decl.lock)
+end
+
+# The app's `External(…)` declarations, which `consume!` reads.
+function _app_external_queues(ctx::App)
+    decl = get_extension(ctx, QUEUE_DECLARATIONS_KEY, nothing)
+    decl isa QueueDeclarations || return Pair{String, External}[]
+    return lock(() -> copy(decl.external), decl.lock)
+end
+
+"""
+    declare_queues!(app::App, queues::AbstractVector; key = :workers) -> App
+
+Declare the queues `app` submits to, and where each one runs
+([#514](https://github.com/PingoLee/Nitro.jl/issues/514)):
+
+```julia
+function setup_workers!(app)                       # called by the web process AND the consumer
+    declare_queues!(app, ["email", "compute" => 4, "heavy" => External(on_lease_expiry = :requeue)])
+    register_job!(app, "fit_model", FitArgs) do task_info, args
+        fit(args)
+    end
+end
+```
+
+- A bare name, or `name => k`, runs **in-process**, at most `k` items at once, exactly as
+  `worker_startup(app; queues)` declares it.
+- `name => External(…)` runs in a **separate consumer process**: this process only records the
+  submit, and a consumer claims it from the shared store. See [`External`](@ref).
+
+The declarations belong to the app, not to a runtime, so they can be made before
+`worker_startup(app; …)` builds one, they survive a `terminate` and re-serve, and a consumer
+process, which serves nothing, reads the same ones. `worker_startup(app; queues)` and
+`start!(app; queues)` merge their own `queues` with them. If a runtime is already installed under
+`key`, it learns the new declarations at once.
+
+A name is declared once, with one setting: declaring it again with the same one is a no-op, and
+with another one is an `ArgumentError`, as is declaring it both in-process and external. Every
+name is checked before any is recorded, so a refused call declares nothing. An external queue on a
+store no other process can read (`InMemoryWorkerStore`), or one without the claim capability, is
+refused too, here when a runtime is installed and otherwise when one starts.
+"""
+function declare_queues!(ctx::App, queues::AbstractVector; key::Symbol=DEFAULT_EXTENSION_KEY)
+    new_specs, new_external = _placement_specs(queues)
+    decl = _queue_declarations(ctx)
+    lock(decl.lock) do
+        specs, external = _placement_specs(Any[decl.specs..., decl.external..., new_specs..., new_external...])
+        runtime = worker_runtime(ctx; key)
+        if runtime isa WorkerRuntime
+            _check_external_store(runtime.store, new_external)
+            _declare_queues!(runtime, new_specs, new_external)
+        end
+        # Recorded only once nothing refused it.
+        copy!(decl.specs, specs)
+        copy!(decl.external, external)
+    end
+    return ctx
+end
+
+# Declare `specs` and `external` on `runtime` together with the app's declarations as they stand
+# NOW, under the declarations' lock, and return what was declared. `_checked_queue_specs` merged a
+# snapshot taken before the runtime was installed; a `declare_queues!` that ran in between found no
+# runtime, so it recorded its queues on the App alone. Under this lock it either ran first, and is
+# merged here, or runs after, and finds the runtime installed. Lock order: the declarations' lock,
+# then `queue_lock`, as in `declare_queues!`.
+#
+# It runs AFTER the install, so it is the one refusal that can come too late to leave nothing
+# installed: only a declaration that lands between the pre-install check and here, and conflicts,
+# reaches it. Do not rely on `_checked_queue_specs` alone to have seen every declaration.
+function _declare_with_app!(ctx::App, runtime::WorkerRuntime, specs::Vector{Pair{String, Int}},
+                            external::Vector{Pair{String, External}})
+    decl = _queue_declarations(ctx)
+    return lock(decl.lock) do
+        merged_specs, merged_external = _placement_specs(Any[decl.specs..., decl.external..., specs..., external...])
+        _check_external_store(runtime.store, merged_external)
+        _declare_queues!(runtime, merged_specs, merged_external)
+        return merged_specs, merged_external
+    end
+end
+
+# A queue the web now runs in-process may still hold rows queued for a consumer before the switch
+# (#514's switch procedure). They stay claimable by a consumer still running, and nothing here
+# runs them, so the operator is told, with the count, at every start. Never fatal: a read failure
+# costs the warning, not the start.
+function _warn_stranded_external(runtime::WorkerRuntime, specs::Vector{Pair{String, Int}})
+    (isempty(specs) || !supports_claims(runtime.store)) && return nothing
+    for (queue_name, _) in specs
+        try
+            stranded = count_external_runs(runtime.store, [PENDING]; queue_name)
+            stranded > 0 && @warn "Nitro.Workers: a queue declared in-process still holds runs " *
+                "queued for a consumer process; only a consumer can run them" queue = queue_name stranded
+        catch e
+            e isa InterruptException && rethrow()
+            @error "Nitro.Workers: could not count a queue's external runs at start" queue = queue_name exception = (e, catch_backtrace())
+        end
+    end
+    return nothing
 end
 
 """
@@ -330,6 +493,15 @@ items at once ([#513](https://github.com/PingoLee/Nitro.jl/issues/513)). Give CP
 queue with a concurrency below `Threads.nthreads(:default)`, so the threads it cannot take stay
 free for request handlers. A name already declared on this runtime cannot be re-declared with a
 different concurrency (an `ArgumentError`).
+
+The app's own [`declare_queues!`](@ref) declarations are merged in, under the same rule. An
+`External(…)` queue among them gets **no processor** here: a consumer process runs it, and this
+process only records its submits ([#514](https://github.com/PingoLee/Nitro.jl/issues/514)). An
+external queue on a store no other process can read, or one without the claim capability, is
+refused before anything is installed. Runs left waiting for a consumer on a queue now declared
+in-process are reported with one `@warn`. With `cleanup_enabled`, the cleanup scheduler also
+adjudicates the expired leases of this runtime's own external queues on each tick (`requeue_expired!`),
+as a fallback for a queue whose consumers are gone; another queue's are left to its consumers.
 
 Returns the `WorkerRuntime` — that is the handle to pass as `runtime=` to the task API.
 
@@ -360,7 +532,7 @@ function start!(ctx::App;
 )
     # Checked first, so a malformed or conflicting `queues` is refused before anything is installed,
     # displaced or swept.
-    queue_specs = _checked_queue_specs(ctx, key, store, runtime, queues)
+    queue_specs, external = _checked_queue_specs(ctx, key, store, runtime, queues)
     resolved = _start_runtime_for!(ctx, key, store, runtime, drain_timeout)
 
     if recover_zombies
@@ -368,11 +540,13 @@ function start!(ctx::App;
     end
 
     # Declared before its processors start: these are the names a submit may use (#324), and the
-    # concurrency each one runs at (#513).
-    _declare_queues!(resolved, queue_specs)
+    # concurrency each one runs at (#513). An external queue gets no processor here: a consumer
+    # process runs it (#514).
+    queue_specs, _ = _declare_with_app!(ctx, resolved, queue_specs, external)
     for (queue_name, _) in queue_specs
         _start_queue_processor(resolved, queue_name)
     end
+    _warn_stranded_external(resolved, queue_specs)
 
     if cleanup_enabled
         # `recover_zombies = false` turns the sweep off, periodic half included (#266) -- for a
@@ -407,7 +581,7 @@ function startup(ctx::App;
         "drain_timeout must be >= 0 (got $(drain_timeout)); 0 releases without waiting"))
     # Checked here so a malformed or conflicting declaration is refused when the middleware is
     # built, before the install below, not from `on_startup`, whose exception is only logged.
-    queue_specs = _checked_queue_specs(ctx, key, store, runtime, queues)
+    queue_specs, external = _checked_queue_specs(ctx, key, store, runtime, queues)
 
     # Installed NOW, when the middleware is built, not in `on_startup` (#322). `serve()` opens its
     # listener before it runs the startup hooks, so a runtime installed by the hook left a window
@@ -419,7 +593,9 @@ function startup(ctx::App;
     installed = _start_runtime_for!(ctx, key, store, runtime, drain_timeout)
     # Declared now too, not only by `start!` in the hook (#324): a submit in the startup window
     # would otherwise be refused as an undeclared queue.
-    _declare_queues!(installed, queue_specs)
+    # A new name, not `queue_specs` reassigned: `on_startup` below captures it, and a captured
+    # variable that is assigned twice is a `Core.Box` (#364).
+    declared_specs, _ = _declare_with_app!(ctx, installed, queue_specs, external)
 
     passthrough = function(handle::Function)
         return function(req)
@@ -432,7 +608,7 @@ function startup(ctx::App;
         # the slot holds a different one, and after `terminate`'s `uninstall!` the slot is empty.
         # Re-serving must put back THIS runtime, the one policy may already hang off.
         start!(ctx;
-            queues=queue_specs,
+            queues=declared_specs,
             cleanup_enabled=cleanup_enabled,
             cleanup_interval_hours=cleanup_interval_hours,
             cleanup_retain_days=cleanup_retain_days,
@@ -604,7 +780,8 @@ function _register_or_watch!(runtime::WorkerRuntime, task_key::String, owner::Ow
                              grants::AbstractVector{Owner}=Owner[],
                              queue::Union{Nothing, WorkerQueue}=nothing,
                              job_name::Union{Nothing, String}=nothing,
-                             job_args::Union{Nothing, String}=nothing)
+                             job_args::Union{Nothing, String}=nothing,
+                             external::Union{Nothing, External}=nothing)
     uid = owner.user_id
     return lock_tasks(runtime) do
         # The DURABLE read, not the live-preferring one, by the rule in `get_task_info`: this is
@@ -675,8 +852,15 @@ function _register_or_watch!(runtime::WorkerRuntime, task_key::String, owner::Ow
         # The new run reserves its capacity FIRST (#324), before the predecessor is asked to
         # stop and before the record is replaced, so a refused submit changes nothing: no record,
         # and no superseded run.
-        task_info = TaskInfo(task_key; queue_name, job_name, job_args)
-        _reserve_capacity!(runtime, queue, task_info.run_id, uid)
+        #
+        # An external run (#514) reserves nothing here: no process-local run will ever release it,
+        # because a consumer process runs it. It is admitted against counts the store keeps instead.
+        task_info = TaskInfo(task_key; queue_name, external = external !== nothing, job_name, job_args)
+        if external === nothing
+            _reserve_capacity!(runtime, queue, task_info.run_id, uid)
+        else
+            _admit_external!(runtime, external, something(queue_name), uid)
+        end
         try
             previous = get_active_task_info(runtime, task_key)
             previous === nothing || _request_cancel!(previous, :superseded)
@@ -690,11 +874,36 @@ function _register_or_watch!(runtime::WorkerRuntime, task_key::String, owner::Ow
             replace_task!(runtime, task_key, task_info)
         catch
             # A store write that throws leaves no run to release it later.
-            _release_capacity!(runtime, queue, task_info.run_id)
+            external === nothing && _release_capacity!(runtime, queue, task_info.run_id)
             rethrow()
         end
         return task_info.run_id
     end
+end
+
+# The submit-time bounds of an external queue (#514), read from the store, because the runs they
+# bound are claimed and executed by other processes and hold nothing in this one. Called under
+# `lock_tasks`, where the run is about to be minted, so joining a live run is never refused by
+# them; `count_external_runs` is a plain read, the one claim-capability method allowed there. Both
+# are approximate under concurrent submits: they bound the backlog against runaway callers (the
+# #324 class), they are not quotas.
+function _admit_external!(runtime::WorkerRuntime, placement::External, queue_name::String, uid::String)
+    cap = placement.max_pending
+    if cap !== nothing && count_external_runs(runtime.store, [PENDING]; queue_name) >= cap
+        throw(WorkerCapacityError(:queue,
+            "the external queue already holds its maximum of $cap pending runs; retry once it drains"))
+    end
+    quota = runtime.max_runs_per_owner
+    if quota !== nothing
+        # This process's own live runs of the owner, plus the external runs it submitted, wherever
+        # they run -- by submitter, so a `:global` submit counts and a grant from someone else does
+        # not. A consumer applies no owner limit at claim time: this is where the owner is bounded.
+        held = lock(() -> Base.get(runtime.owner_runs, uid, 0), runtime.reservation_lock)
+        if held + count_external_runs(runtime.store, [PENDING, RUNNING]; submitter = uid) >= quota
+            throw(WorkerCapacityError(:owner, "this identity already has its maximum of $quota live tasks"))
+        end
+    end
+    return nothing
 end
 
 # `Threads.@spawn`, not `@async` (#30). `@async` creates a **sticky** task, pinned for life to
@@ -756,7 +965,7 @@ function _execute_task_async(runtime::WorkerRuntime, task_key::String, callback:
             rethrow()
         end
         task_info === nothing && (_release_run!(runtime, run_id); return nothing)
-        handoff = _RunHandoff(() -> _release_run!(runtime, run_id))
+        handoff = Ref(_RunHandoff(() -> _release_run!(runtime, run_id)))
 
         # Starting is a CLAIMED transition, not an unconditional write. `set_task!` has no
         # precondition, so a `cancel_task` that already claimed PENDING -> CANCELLED was simply
@@ -800,85 +1009,11 @@ function _execute_task_async(runtime::WorkerRuntime, task_key::String, callback:
             task_info.status = RUNNING
             task_info.started_at = started
 
-            max_attempts = options.retry_on_failure ? options.max_retries : 0
-            for retry_count in 0:max_attempts
-                try
-                    handoff = _RunHandoff(handoff)       # a fresh one per attempt
-                    result = timeout_call(callback, task_info; timeout=options.timeout, handoff)
-                    return _complete_task!(runtime, task_info, result)
-                catch error
-                    unwrapped = _unwrap_exception(error)
-
-                    # NOT dead code, however redundant it looks. `_fail_task!` below would lose
-                    # its CAS against an already-CANCELLED record anyway -- but without this
-                    # branch a cancelled task with `retry_on_failure` falls through to the
-                    # backoff `sleep` and RE-RUNS. This is what short-circuits the retry loop.
-                    #
-                    # `unwrapped isa InterruptException` used to be an arm of this test, back when
-                    # cancellation was delivered by injecting one. Nothing injects any more, so
-                    # the only way one arrives is that the callback itself threw it -- and nothing
-                    # set a cancel reason for it, so recording it as a cancellation would be a lie
-                    # about who stopped the job (#127).
-                    latest_info = get_task_info(runtime, task_key)
-                    if latest_info !== nothing && latest_info.status == CANCELLED
-                        return _cancel_task!(runtime, task_info)
-                    end
-
-                    # A `checkpoint!` that found this run's token set (#513). Recorded through the
-                    # same CAS as every other cancellation, so a cause that already decided the record
-                    # (a `cancel_task`, a supersede) keeps it, and a drain's `:shutdown` is stored as
-                    # one. Never retried: the token is never reset, so a retry would start cancelled.
-                    # Only when the token IS set: one the callback built itself is an ordinary failure,
-                    # for the reason the `InterruptException` note above gives.
-                    if unwrapped isa TaskCancelledError && cancel_requested(task_info)
-                        return _cancel_task!(runtime, task_info)
-                    end
-
-                    # A timeout is terminal on the first attempt. Retrying it cannot help and can
-                    # harm: nothing stops the attempt that timed out, so `max_retries = 3` would
-                    # put four copies of the callback on the thread pool at once, sharing one
-                    # `task_info` and one set of external side effects (#127). The token is not
-                    # reset between attempts either, so a retry would start pre-cancelled.
-                    #
-                    # So are the three `is_unrecoverable` exceptions (#367), recorded FAILED and
-                    # never rethrown. Why neither a retry nor a rethrow is canonical in that
-                    # function's site table (src/errors.jl); `_execute_queued_task` does the same.
-                    # A named job that does not bind (`JobError`, #514) is terminal too: a retry
-                    # binds the same text against the same registry.
-                    if unwrapped isa TaskTimeoutError || unwrapped isa JobError || is_unrecoverable(unwrapped)
-                        return _fail_task!(runtime, task_info, _store_error_text(runtime.store, unwrapped))
-                    end
-
-                    if retry_count == max_attempts
-                        return _fail_task!(runtime, task_info, _store_error_text(runtime.store, unwrapped))
-                    end
-
-                    # Cancellation-aware backoff. The catch above checks CANCELLED before sleeping and
-                    # never after, and the interrupt that used to abort this sleep is gone (#127) -- so a
-                    # cancel landing inside a 2/4/8s window re-invoked the user callback on a task that was
-                    # already cancelled. Polling the token instead of sleeping blind also cuts cancellation
-                    # latency during a backoff from seconds to milliseconds.
-                    deadline = time() + 2.0 ^ (retry_count + 1)
-                    while time() < deadline && !cancel_requested(task_info)
-                        sleep(0.05)
-                    end
-
-                    # The token is process-local, so a cancel issued on another node sets nothing here. One
-                    # durable read per ATTEMPT (not per poll) covers that without a round-trip every 50ms.
-                    if cancel_requested(task_info)
-                        return _cancel_task!(runtime, task_info)
-                    end
-                    resumed = get_task_info(runtime.store, task_key)
-                    if resumed !== nothing && resumed.status == CANCELLED
-                        return _cancel_task!(runtime, task_info)
-                    end
-                end
-            end
-
-            return task_info
+            # The attempt loop is shared with the queued executor and a consumer process (#514).
+            return _run_attempts!(runtime, task_info, callback, options, handoff)
         finally
             _deregister_run!(runtime, task_info)
-            _handed_off(handoff) || _release_run!(runtime, run_id)
+            _handed_off(handoff[]) || _release_run!(runtime, run_id)
         end
     end
 
@@ -1039,6 +1174,26 @@ function _submit_queued_task(runtime::WorkerRuntime, queue_name::AbstractString,
             "Queue '$queue_id' is not declared on this worker runtime; declare it with " *
             "`start!(app; queues = [...])` / `worker_startup(app; queues = [...])`"))
     end
+
+    # An external queue (#514): the run is recorded here and executed by a consumer process, so
+    # there is no queue to mint, no processor, and no item to hand over. After the declared check,
+    # so a caller the authorizer refuses learns nothing about the queue.
+    placement = _external_placement(runtime, queue_id)
+    if placement !== nothing
+        work isa _ClosureRun && throw(ArgumentError(
+            "queue '$queue_id' is External(…): its runs execute in a consumer process, which cannot " *
+            "run a closure. Register the job with `register_job!(app, name, ArgsType)` and submit " *
+            "`Job(name, args)` through the App-first `submit_queued_task(app, …)`"))
+        options == TaskOptions() || throw(ArgumentError(
+            "queue '$queue_id' is External(…): a consumer process runs it with the queue's own " *
+            "options, so a submit cannot pass `options`. Set them on the declaration, " *
+            "`External(…; options = TaskOptions(…))`"))
+        _, job_name, job_args = _prepare_run(work)
+        _register_or_watch!(runtime, key, owner; queue_name=queue_id, grants=watchers, job_name,
+                            job_args, external=placement)
+        return key
+    end
+
     callback, job_name, job_args = _prepare_run(work)
 
     # One lookup, not two -- and it now comes BEFORE the record is written, because the new run
@@ -1404,8 +1559,18 @@ which reports only what they may see.
 
 `:pending_tasks` is read from the store, so a store that cannot be read makes this **throw**
 rather than report an empty queue ([#267](https://github.com/PingoLee/Nitro.jl/issues/267)).
+
+An `External(…)` queue ([#514](https://github.com/PingoLee/Nitro.jl/issues/514)) is answered from
+the store alone, with the same keys plus `:external => true`: `:current_tasks` are its runs a
+consumer holds (`RUNNING`), `:running` is whether there is one, and `:concurrency` is `nothing`,
+because each consumer process sets its own.
 """
 function get_queue_status(queue_name::AbstractString, ::System; runtime::WorkerRuntime=default_runtime())
+    # An external queue (#514) has no queue object here: its state is the store's. Read outside
+    # `queue_lock`, since every answer below comes from the store.
+    name = String(queue_name)
+    _external_placement(runtime, name) === nothing || return _external_queue_status(runtime, name)
+
     qlock = get_queue_lock(runtime)
     queues = get_worker_queues(runtime)
 
@@ -1429,6 +1594,27 @@ function get_queue_status(queue_name::AbstractString, ::System; runtime::WorkerR
             :total_load => length(pending_tasks) + length(current_tasks),
         )
     end
+end
+
+# Its own function, not a branch of the one above: the in-process branch assigns the same names
+# inside a `lock` closure, and sharing them would box them (#364).
+function _external_queue_status(runtime::WorkerRuntime, name::String)
+    listed(status) = [task.id for task in get_all_tasks(runtime, System(); status, queue_name=name)
+                      if task.external]
+    pending_tasks = listed(PENDING)
+    current_tasks = listed(RUNNING)
+    processing = !isempty(current_tasks)
+    return Dict{Symbol, Any}(
+        :queue_name => name,
+        :external => true,
+        :running => processing,
+        :concurrency => nothing,
+        :current_tasks => current_tasks,
+        :pending_count => length(pending_tasks),
+        :pending_tasks => pending_tasks,
+        :status_text => processing ? "Processing" : (isempty(pending_tasks) ? "Idle" : "Queued"),
+        :total_load => length(pending_tasks) + length(current_tasks),
+    )
 end
 
 function get_queue_status(ctx::App, queue_name::AbstractString, authority::System; key::Symbol=DEFAULT_EXTENSION_KEY, runtime::Union{Nothing, WorkerRuntime}=nothing)
@@ -1594,6 +1780,15 @@ function _cleanup_scheduler_loop(runtime::WorkerRuntime, stop_signal::Channel{No
                     @error "Nitro.Workers: periodic zombie sweep failed" exception=(e, catch_backtrace())
                 end
             end
+            # Expired leases next, in their own `try` too (#514): the fallback adjudicator for an
+            # external queue whose last consumer is gone, since each consumer also runs it on its
+            # own heartbeat. Only this runtime's external queues, and a no-op on a runtime with none.
+            try
+                _requeue_expired_tick!(runtime)
+            catch e
+                e isa InterruptException && rethrow()
+                @error "Nitro.Workers: periodic lease adjudication failed" exception=(e, catch_backtrace())
+            end
             try
                 deleted = cleanup_old_tasks(retain_days; runtime=runtime)
                 # A success line too (#238), so a quiet log means "nothing to retire" rather than
@@ -1623,6 +1818,23 @@ function _cleanup_scheduler_loop(runtime::WorkerRuntime, stop_signal::Channel{No
               "a REPL, that press can end the process without running its shutdown hooks."
     end
     return nothing
+end
+
+# One `requeue_expired!` over this runtime's external queues, logged like the retention pass:
+# `@info` only when it adjudicated something. It throws on a read failure; the caller's `try` owns
+# that, as it does for the other two passes. `:skip`, not the consumer's fail-closed `:fail`: a
+# queue this runtime does not declare may be another app's on the same store, or one a newer
+# deploy added, so its expired runs are left to the consumers that declare it.
+function _requeue_expired_tick!(runtime::WorkerRuntime)
+    policies = _external_policies(runtime)
+    (isempty(policies) || !supports_claims(runtime.store)) && return nothing
+    tally = requeue_expired!(runtime.store, current_time_utc(); policies, on_unknown_queue = :skip)
+    if tally.requeued + tally.failed > 0
+        @info "Nitro.Workers: expired leases adjudicated" requeued = tally.requeued failed = tally.failed unknown_queue = tally.unknown_queue lost_race = tally.lost_race
+    else
+        @debug "Nitro.Workers: expired leases adjudicated" requeued = tally.requeued failed = tally.failed unknown_queue = tally.unknown_queue lost_race = tally.lost_race
+    end
+    return tally
 end
 
 function start_cleanup_scheduler(ctx::App; interval_hours::Real=24, retain_days::Int=7,

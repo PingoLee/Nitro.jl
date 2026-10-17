@@ -66,14 +66,20 @@ function _try_cancel(cancel::Function, task::Task)::Union{Bool,Nothing}
     end
 end
 
+# Every mutable slot is a concrete `Base.RefValue{T}`, never `Ref{T}` (#571). `Ref{T}` is ABSTRACT
+# -- it has several concrete subtypes -- so `getindex` on a `Ref{T}` field cannot be resolved
+# statically and every `service.x[]` came back `Any`: a dynamic call per read, including the
+# `cookies[]` read `Cookie{T}`/`Session{T}` binding makes on every request, and the first wall a
+# `juliac --trim` build hits. `Ref{T}(x)` constructs a `RefValue{T}`, so the defaults and every
+# `x[]`/`x[] = v` call site are unchanged.
 @kwdef struct Service
-    server              :: Ref{Nullable{Server}}    = Ref{Nullable{Server}}(nothing)
+    server              :: Base.RefValue{Nullable{Server}} = Ref{Nullable{Server}}(nothing)
     router              :: Router                   = Router()
     custommiddleware    :: CopyOnWriteDict{RouteMiddleware} = CopyOnWriteDict{RouteMiddleware}()
     named_routes        :: Dict{String, NamedRoute} = Dict{String, NamedRoute}()
-    external_url        :: Ref{Nullable{String}}    = Ref{Nullable{String}}(nothing)
-    prefix              :: Ref{Nullable{String}}    = Ref{Nullable{String}}(nothing)
-    eager_revise        :: Ref{Nullable{EagerReviseService}} = Ref{Nullable{EagerReviseService}}(nothing)
+    external_url        :: Base.RefValue{Nullable{String}} = Ref{Nullable{String}}(nothing)
+    prefix              :: Base.RefValue{Nullable{String}} = Ref{Nullable{String}}(nothing)
+    eager_revise        :: Base.RefValue{Nullable{EagerReviseService}} = Ref{Nullable{EagerReviseService}}(nothing)
     named_routes_lock     :: ReentrantLock          = ReentrantLock()
     # Route shape -> `:auto`, `:explicit` or `:retired`: who owns the `HEAD` leaf there (#277).
     # Explicit `HEAD` wins whatever the registration order; see `_register_head!`
@@ -115,15 +121,19 @@ end
     route_lifecycle       :: Vector{LifecycleMiddleware} = LifecycleMiddleware[]
     serve_lifecycle       :: Vector{LifecycleMiddleware} = LifecycleMiddleware[]
     lifecycle_lock        :: ReentrantLock          = ReentrantLock()
-    cookies               :: Ref{CookieConfig}      = Ref{CookieConfig}(CookieConfig())
+    cookies               :: Base.RefValue{CookieConfig} = Ref{CookieConfig}(CookieConfig())
     extensions            :: Dict{Symbol, Any}      = Dict{Symbol, Any}()
     extensions_lock       :: ReentrantLock          = ReentrantLock()
-    shutdown_timeout      :: Ref{Float64}           = Ref{Float64}(SHUTDOWN_TIMEOUT_SECONDS)
+    shutdown_timeout      :: Base.RefValue{Float64} = Ref{Float64}(SHUTDOWN_TIMEOUT_SECONDS)
     # `serve(max_fields = …)`. The pipeline's outermost layer binds THIS cell, not a copy, in
     # `REQUEST_SCOPE` for each request's extent (#327, #444), so a pipeline built before `serve`
     # sets it still sees it. Concrete `RefValue` so the scope can hold it without a conversion.
     # `0` means unlimited.
     max_fields            :: Base.RefValue{Int64}   = Ref{Int64}(DEFAULT_MAX_FIELDS)
+    # The never-firing `Timer` held while serving on the Julia versions `_needs_wake_guard`
+    # names (#598). `nothing` everywhere else, and whenever nothing serves.
+    wake_guard            :: Base.RefValue{Nullable{Timer}} = Ref{Nullable{Timer}}(nothing)
+    wake_guard_lock       :: ReentrantLock          = ReentrantLock()
 end
 
 """
@@ -298,7 +308,57 @@ function Base.close(service::Service; timeout::Real = service.shutdown_timeout[]
         # `terminate()`, which is precisely the leak this whole change exists to remove.
         service.server[] === server && (service.server[] = nothing)
     end
+    _release_wake_guard!(service)
     !isnothing(service.eager_revise[]) && close(service.eager_revise[])
+    return nothing
+end
+
+# JuliaLang/julia#63882 (#586, #598). On Julia 1.13.0-rc3 through 1.13.x, a task parked on a
+# `Timer` -- a `sleep`, a `timedwait`, a deadline -- does not wake while every `:default` thread
+# runs a handler that calls `yield()`, as long as its timer is the only live libuv handle in the
+# process. It begins with the scheduler backports in JuliaLang/julia#62665; 1.12 and 1.14-DEV are
+# not affected. A Nitro app with no janitor (no `SessionMiddleware`, no `FixedRateLimiter`, no
+# Workers cleanup scheduler) is exactly that process: `bench/socket/wake.sh` measured a parked
+# handler waking 1.48 s late on 1.13.2, against 3-8 ms on 1.12.7. Any second live `Timer`
+# removes the stall, even one that never fires, so `serve` holds one for as long as it serves:
+# one libuv handle, no callback, no wake-up, nothing on the request path.
+#
+# The upper bound drops to the first fixed 1.13.x when upstream ships one. Once Nitro's Julia
+# floor passes the last affected release, delete this, its call sites (`_hold_wake_guard!`, and
+# `_consumer_wake_guard` in Workers, #514) and both `wake_guard` fields.
+_needs_wake_guard(v::VersionNumber = VERSION) = v"1.13.0-rc3" <= v < v"1.14.0-"
+
+# Tests only: CI runs 1.12, where the gate is shut, and this lets it drive the serve path anyway.
+const _WAKE_GUARD_FORCED = Ref(false)
+
+# Called by `startserver` once the listener is set. Reuses a guard that is still open (a
+# `serve()` admitted while the previous run was still draining) rather than overwriting the
+# only handle to it.
+#
+# Both halves run under `wake_guard_lock`. `close` checks "nothing serves" and then closes, and
+# closing a `Timer` waits on the uv close callback; without the lock a `serve()` admitted in that
+# gap would set its listener, find the doomed guard still open, keep it, and serve unguarded.
+function _hold_wake_guard!(service::Service;
+                           needed::Bool = _WAKE_GUARD_FORCED[] || _needs_wake_guard())
+    needed || return nothing
+    lock(service.wake_guard_lock) do
+        guard = service.wake_guard[]
+        (isnothing(guard) || !isopen(guard)) && (service.wake_guard[] = Timer(typemax(Int32)))
+    end
+    return nothing
+end
+
+# Called by `close(::Service)`. Only once nothing serves: a `serve()` admitted during the drain
+# (see `close`'s compare-and-clear) keeps the guard it found, and closing it here would unguard
+# that server.
+function _release_wake_guard!(service::Service)
+    lock(service.wake_guard_lock) do
+        guard = service.wake_guard[]
+        if !isnothing(guard) && isnothing(service.server[])
+            close(guard)
+            service.wake_guard[] = nothing
+        end
+    end
     return nothing
 end
 

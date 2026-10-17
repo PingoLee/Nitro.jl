@@ -5,7 +5,7 @@ import JSON
 import HTTP
 
 export ValidationError, CookieError, AuthorizationError, StoreInterfaceError, UnsupportedMediaTypeError,
-    WorkerUnavailableError, WorkerCapacityError
+    WorkerUnavailableError, WorkerCapacityError, ClaimPoisonedError
 
 """
     ValidationError(msg::String)
@@ -161,9 +161,11 @@ end
 
 A refusal that a denial factory has already built, thrown from where a response cannot be
 returned: an extractor runs before the handler, and it can only throw. `Claims{T}` (#527) throws
-one when the request has no token principal, or one whose claims do not bind. `handle_error`
-answers with `response` as it is, so the app's `unauthorized`/`denied` factory decides the status
-and the body. It is logged at `@debug`, with no backtrace and no body.
+one when the request has no token principal, or one whose claims do not bind. The route's handler
+closure (`registerhandler`, `src/core/registration.jl`) catches it and serves `response` as it is,
+whatever `catch_errors` and `serialize` are set to (#594), so the app's `unauthorized`/`denied`
+factory decides the status and the body. It is logged at `@debug`, with no backtrace and no body.
+Thrown from anywhere else it is a server fault, a `500`.
 
 Deliberately **not exported**: an application builds the response, never this.
 """
@@ -172,6 +174,35 @@ struct AuthDenial <: Exception
 end
 
 Base.showerror(io::IO, e::AuthDenial) = print(io, "Auth Denial: ", e.response.status)
+
+"""
+    ValidatorFault(msg::String)
+
+What Nitro raises in place of an exception thrown by an application callback that is handed
+request or session data. It replaces the exceptions of two kinds of callback:
+
+- **An extractor's validator** (#595), when it throws something other than a `ValidationError` or
+  returns something other than a `Bool`. It receives the bound value (a client's deserialized
+  body, a token's claims). `msg` names the parameter, the bound type and the validator.
+- **`SessionMiddleware`'s `validator` and `session_auth_hash`** (#602), when one throws, or the
+  hook returns something other than a string or `nothing`. They receive the session id, which is
+  a bearer credential, and the session data or the identity found in it. `msg` names the hook.
+
+The most likely accidental throw, a `MethodError`, renders its arguments, so letting the original
+reach `handlerequest`'s `@error` wrote them to the log. The original is dropped, and `msg` never
+carries a value. One type serves both, because nothing tells them apart: neither is answered any
+differently from another handler fault.
+
+It is a server bug, not a rejection, so it is answered like any other handler fault: the fixed
+`500` body, logged at `@error` with a backtrace.
+
+Deliberately **not exported**: an application never raises or catches this.
+"""
+struct ValidatorFault <: Exception
+    msg::String
+end
+
+Base.showerror(io::IO, e::ValidatorFault) = print(io, "Validator Fault: ", e.msg)
 
 """
     UnsupportedMediaTypeError(msg::String)
@@ -235,7 +266,7 @@ no record, no queued item, and a previous run of the same key is not displaced.
 | `kind` | Limit | `handle_error` answers |
 |---|---|---|
 | `:runtime` | `WorkerRuntime(store; max_concurrent_runs)`, async runs in flight (64 by default) | `503 Service Unavailable` |
-| `:queue` | a declared queue's buffer (100 items by default) | `503 Service Unavailable` |
+| `:queue` | a declared queue's buffer (100 items by default), or an `External(…; max_pending)` queue's backlog in the store | `503 Service Unavailable` |
 | `:owner` | `WorkerRuntime(store; max_runs_per_owner)`, one owner's live runs (off by default) | `429 Too Many Requests` |
 
 A full queue used to block the submitting request in `put!` with no timeout, so one owner could
@@ -256,6 +287,31 @@ end
 
 function Base.showerror(io::IO, e::WorkerCapacityError)
     print(io, "Worker Capacity ($(e.kind)): $(e.msg)")
+end
+
+"""
+    ClaimPoisonedError(queue_name::String, exception_type::Type)
+
+What `claim_next!` throws when a **second** head row of `queue_name` does not decode in one call
+([#514](https://github.com/PingoLee/Nitro.jl/issues/514)). The first one is failed out of the way,
+so a single bad row does not block the queue. A second one says the cause is probably not the rows
+(a decode regression, say), and failing a whole backlog would be irreversible, so the store writes
+nothing more and throws this instead.
+
+A consumer must **stop claiming from that queue** on it, not retry: the limit is one failed row per
+call, so a retry loop would still fail the whole backlog, one row at a time. It is its own type so a
+consumer can match on it rather than on message text. It carries the exception's type and never its
+message, which may quote stored application data.
+"""
+struct ClaimPoisonedError <: Exception
+    queue_name::String
+    exception_type::Type
+end
+
+function Base.showerror(io::IO, e::ClaimPoisonedError)
+    print(io, "ClaimPoisonedError: a second head row of queue '$(e.queue_name)' does not decode ",
+          "($(e.exception_type)); refusing to fail more of the queue, since the cause is probably ",
+          "not the rows themselves")
 end
 
 
@@ -404,8 +460,10 @@ of these sites call (a user's `validate_token`, a user's session store):
 | `src/middleware/auth_middleware.jl` ×2 | the user's `validate_token` (reaches `decode_jwt` → `JSON.parse`) |
 | `src/utilities/bodyparsers.jl` ×6 | `_parse_json_bounded` — plus `HTTP.queryparams`/`HTTP.parse_multipart_body`, which do NOT recurse and ride along so the parsers in one file cannot drift apart; the sixth is `json(req, T)`'s wrap into a `ValidationError` (#326) |
 | `src/utilities/misc.jl` ×4 | `parseparam`'s `_parse_json_bounded(str, T)` fall-through — reached by **any** scalar path/query parameter, since `parse(Int, str)` fails first and lands there — plus `parsebody_union`'s member loop, the same shape for `Body{T}` (#345) |
-| `src/extractors.jl` ×2 | `safe_extract`'s `f()` (the extractor body, i.e. the parsers above) and the app's session store |
+| `src/extractors.jl` ×8 | `safe_extract`'s `f()` (the extractor body, i.e. the parsers above), the app's session store, `Claims{T}`'s bind and the three in its refusal diagnosis (#527), and `validator_verdict`'s call of an app validator with `global_validate_identity`'s method lookup for its fault (#595) |
 | `src/middleware/csrf_middleware.jl` ×2 | `getform`/`getjson` |
+| `src/middleware/session_middleware.jl` ×2 | `_end_session!`'s delete through the app's session store, and `_validator_marker`'s call of the app's `validator` (#602) |
+| `src/types.jl` ×1 | `_call_auth_hash_hook`'s call of the app's `session_auth_hash` (#602) |
 | `ext/NitroPormGExt.jl` ×5 | the PormG stores' reads of their own stored JSON (#344): the session query and decode in `Base.get(::PormGSessionStore, …)`, which `SessionMiddleware` calls per request; `_parse_stored_json` for a task's `result`/`watchers`; `_listed_task`, which would otherwise swallow what `_parse_stored_json` rethrows one frame up; and `_claim_row!`'s decode of the head row a consumer claims (#514) |
 | `src/Workers/jobs.jl` ×2 | a named job's arguments (#514): `_encode_job`'s serialize-and-bind-back at submit, and `NamedJobRun`'s bind of the stored JSON when the run starts. Both reach `JSON.parse` through `stored_json_bind` (`json_bind` without the request field cap, since arguments are stored data), and the run-side one turns every other failure into a terminal `JobError` |
 
@@ -431,7 +489,14 @@ different reasons**, and conflating them is how this list rots:
    handler that ends the loop with a `@warn`** rather than killing the task (#369). In a
    background task a rethrow reaches nobody who can act on it, and swallowing it and looping on
    makes the loop the task every later Ctrl-C lands in. The reasoning is canonical next to
-   `_cleanup_scheduler_loop`. `src/response.jl`'s `_run_sse_producer` (#160) is the same
+   `_cleanup_scheduler_loop`. Its third per-tick catch, around `_requeue_expired_tick!` (#514),
+   is the same shape, and so is `_warn_stranded_external`'s catch on `start!`, whose failure
+   costs a warning and never the start. A consumer process's loops (`src/Workers/consumer.jl`,
+   #514) are this group too: `_claim_loop`, `_claim_one`, `_heartbeat_loop`, `_consumer_requeue!`
+   and the run task's `_run_claimed!`/`_hand_back!` catch-alls. They rethrow only the interrupt.
+   The loops' outer handlers turn it into a drain request rather than a `@warn` and an exit,
+   because the heartbeat must keep renewing while the drain runs. `_drain!`'s catch is
+   shutdown code and swallows everything (#427). `src/response.jl`'s `_run_sse_producer` (#160) is the same
    discipline one level down: the producer task nothing waits on, where the expected failure is
    the client disconnecting. Do not "fix" these to match the table above.
 3. **The error boundary itself — the place the other two are MEANT to arrive.**

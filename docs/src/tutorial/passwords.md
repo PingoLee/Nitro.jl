@@ -185,6 +185,36 @@ urlpatterns("",
 )
 ```
 
+## A login is a handler that computes
+
+`check_password` and `make_password` compute until they return, and they never yield. At the
+defaults, PBKDF2 takes about 0.1 s and bcrypt about 0.2 s. A request runs on a `:default`
+thread that Julia does not preempt. So as many concurrent logins as there are default threads
+would stall every other request for the length of one hash. The measurement is in the
+deployment guide's [Handlers that compute](@ref) ([#587](https://github.com/PingoLee/Nitro.jl/issues/587)).
+
+**Nitro bounds them.** At most `password_concurrency()` calls of `check_password` and
+`make_password` hash at once, process-wide; the default is `Threads.nthreads(:default) - 2`
+(at least 1). The rest wait their turn parked, and a parked task gives its thread back. So under
+a burst of logins, the logins queue and the rest of the API keeps the threads the bound leaves
+free. The unknown-user path (`check_password(password, nothing)`) waits in the same queue, so
+the wait does not tell the two apart.
+
+```julia
+set_password_concurrency!(4)   # at most 4 hashes at once
+set_password_concurrency!(0)   # no bound: every check hashes at once, as before #587
+```
+
+Raising the bound buys sign-ins per second with every other request's latency, and the right
+trade depends on the application. Set it at startup, at run time (in `main` or an `__init__`),
+not from a module body. Two cautions: a call waiting for its turn keeps whatever its caller
+holds, so do not hold a pooled database connection or a lock across `check_password`. And a
+Workers queue sized the same way takes its own threads on top of this bound; the two add up.
+
+The bound is a process setting, not an `App` one, because the threads it protects are shared by
+every `App` in the process. It covers `check_password` and `make_password`; the lower-level
+`encode` and `matches` are not bounded.
+
 ## Wire Format Specifications
 
 ### Django PBKDF2 (`pbkdf2_sha256`)

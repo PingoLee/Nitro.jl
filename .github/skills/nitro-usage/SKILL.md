@@ -446,7 +446,11 @@ call or a file is not computing; it already gives the thread back. For real comp
   ```
 
 - **Or call `yield()` every 1–2 ms** inside a loop that has to stay in the handler. It does not
-  reduce the CPU the work takes, but it bounds how long a cheap request waits behind it.
+  reduce the CPU the work takes, but it bounds how long a cheap request waits behind it. **Julia
+  1.13.0 through 1.13.2 have one caveat:** a task parked in `sleep` can stay behind the yielding
+  loop until it ends, but only while no other timer is alive in the process (#586). `serve()`
+  holds such a timer on those versions (#598), so a running server is covered. Code that runs
+  yielding loops while no server is up can hold `keepalive = Timer(typemax(Int32))` itself.
 
 ---
 

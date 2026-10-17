@@ -3,7 +3,7 @@ using JSON
 using Dates
 
 using ..Errors: ValidationError, UnsupportedMediaTypeError, AuthorizationError, WorkerUnavailableError,
-    WorkerCapacityError, AuthDenial, is_unrecoverable
+    WorkerCapacityError, is_unrecoverable
 using .BodyParsers: _parse_json_bounded
 
 export recursive_merge, parseparam, parsebody, parseparam_checked,
@@ -29,9 +29,6 @@ end
 function handle_error(::AuthorizationError)
     return Res.json(("message" => "403: Forbidden"), status = 403)
 end
-
-# A refusal whose response the app's denial factory already built (#527): served as it is.
-handle_error(e::AuthDenial) = e.response
 
 # The App a worker call named has no runtime installed (#322). It used to fall back to the
 # process-wide runtime, which carries none of the app's policy; now it is refused, and "the
@@ -101,10 +98,6 @@ function handlerequest(getresponse::Function, catch_errors::Bool; show_errors::B
                 # `.msg`: an `AuthorizationError`'s message names the caller-chosen queue or task key
                 # verbatim, and it is not pinned value-free the way `ValidationError.msg` is (#323).
                 show_errors && @debug "Request refused (403 Forbidden)"
-            elseif error isa AuthDenial
-                # The status only. The body is whatever the app's factory wrote, and nothing about
-                # the principal that was refused belongs in a log line (#527).
-                show_errors && @debug "Request refused by an auth denial" status=error.response.status
             elseif error isa WorkerUnavailableError
                 # A misconfiguration or a restart gap, not a client fault -- so visible, at
                 # `@warn`, but without a backtrace per request. `.msg` is fixed text naming the
@@ -115,6 +108,15 @@ function handlerequest(getresponse::Function, catch_errors::Bool; show_errors::B
                 # request at exactly the moment the server is busiest. `kind` only -- no message.
                 show_errors && @debug "Request refused: worker capacity" kind=error.kind
             elseif show_errors && !isa(error, InterruptException)
+                # `showerror` of whatever the handler or a middleware threw, so nothing keeps a value
+                # out of this line but the thrower. Validator input is kept out upstream: an
+                # extractor's validator is handed the bound value, and `try_validate`
+                # (src/extractors.jl) replaces anything it throws but a `ValidationError` with a
+                # value-free `ValidatorFault`, raised outside the `catch` so the original is not
+                # left on the exception stack either (#595). `SessionMiddleware` does the same for
+                # its `validator` and `session_auth_hash` hooks, which are handed the session id and
+                # data (#602). Never "improve" this line by logging `current_exceptions()`, or a
+                # cause chain.
                 @error "ERROR: " exception=(error, catch_backtrace())
             end
             return handle_error(error)

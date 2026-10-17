@@ -64,6 +64,7 @@ ReTestItems = "^1"
 Reexport = "^1"
 Revise = "^3"
 SHA = "^0.7, 1"
+SQLite = "^1.6.1"
 Sockets = "^1"
 Suppressor = "^0.2.6"
 Test = "^1"
@@ -80,9 +81,10 @@ PormG = "7d8d7541-4d3d-4580-80a2-17064efb0993"
 ProtoBuf = "3349acd9-ac6a-5e09-bcdb-63829b23a429"
 ReTestItems = "817f1d60-ba6b-4fd5-9520-3cf149f6a823"
 Revise = "295af30f-e4ad-537b-8983-00126c2a3abe"
+SQLite = "0aa819cd-b072-5ff4-a722-6bc24af294d9"
 Suppressor = "fd094767-a336-5f1f-9728-57cf17d0bbfb"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 TimeZones = "f269a46b-ccf7-5d73-abea-4c690281aa53"
 
 [targets]
-test = ["Aqua", "Mustache", "OteraEngine", "PormG", "Pkg", "ProtoBuf", "ReTestItems", "Revise", "Suppressor", "Test", "TimeZones"]
+test = ["Aqua", "Mustache", "OteraEngine", "PormG", "Pkg", "ProtoBuf", "ReTestItems", "Revise", "SQLite", "Suppressor", "Test", "TimeZones"]

@@ -371,21 +371,23 @@ end
 """
     CANCEL_REASONS
 
-The four things that can request a cancellation, as the symbols [`cancel_reason`](@ref) reports.
+The five things that can request a cancellation, as the symbols [`cancel_reason`](@ref) reports.
 
 | Reason | Who set it | What it already did to the record |
 |---|---|---|
 | `:user` | `cancel_task` | claimed `CANCELLED` **before** setting the token |
 | `:timeout` | an expired `TaskOptions(timeout=…)` | nothing yet — it throws [`TaskTimeoutError`](@ref), which is terminal `FAILED` |
 | `:superseded` | re-running a key whose predecessor is still executing | replaced the record, so the predecessor's `run_id` fence now fails |
-| `:shutdown` | a teardown drain ([`shutdown!`](@ref), #176) | **nothing** — a terminal write there would race the run's own, the #88/#108 failure mode |
+| `:shutdown` | a teardown drain ([`shutdown!`](@ref), #176), or a consumer process's drain (#514) | **nothing** — a terminal write there would race the run's own, the #88/#108 failure mode. On a consumer the run is **handed back** to the queue, not recorded |
+| `:lease_lost` | a consumer process's heartbeat, finding its lease taken back and the same submission re-queued or re-claimed (#514) | taken the run back: another run of it will happen. The run is handed back, which loses its fence and writes nothing |
 
-That last column is why the reason exists. Three of the four have already decided the record by
-the time the callback notices, so only a drain leaves the run to write its own terminal state —
-and before #183 it wrote `"Cancelled by user"` for a shutdown no user asked for. See
-[`cancel_reason`](@ref).
+That last column is why the reason exists. Most causes have already decided the record by the
+time the callback notices, so only a drain leaves the run to write its own terminal state — and
+before #183 it wrote `"Cancelled by user"` for a shutdown no user asked for. A job on an external
+queue reads `:lease_lost` as *stop, and assume the run will happen again*, never as a person's
+cancel: a cancel a person asked for always reads `:user`. See [`cancel_reason`](@ref).
 """
-const CANCEL_REASONS = (:user, :timeout, :superseded, :shutdown)
+const CANCEL_REASONS = (:user, :timeout, :superseded, :shutdown, :lease_lost)
 
 # The ONLY write path into the token. Deliberately not exported and not public: workers §6 keeps
 # `cancel_task` the authorized route into a cancellation, because it is the one that performs the
@@ -416,6 +418,7 @@ function _cancel_message(reason::Symbol)
     reason === :timeout && return "Cancelled by timeout"
     reason === :superseded && return "Cancelled by a re-run of this task key"
     reason === :shutdown && return "Cancelled by worker shutdown"
+    reason === :lease_lost && return "Cancelled: the consumer lost its lease on this run"
     return "Cancelled"
 end
 
@@ -602,6 +605,64 @@ end
     max_retries::Int = 3
 end
 
+# An in-process queue's buffer, and the default backlog bound of an external one: the same 100, so
+# moving a queue out of process does not change how many runs it admits.
+const _DEFAULT_QUEUE_BUFFER = 100
+
+"""
+    External(; on_lease_expiry, max_attempts = 3, max_pending = 100, options = TaskOptions())
+
+The placement of a queue whose runs execute in a **separate consumer process**, not in the process
+that submits them ([#514](https://github.com/PingoLee/Nitro.jl/issues/514)). Declare it with
+[`declare_queues!`](@ref), in a setup function that the web process and the consumer both call:
+
+```julia
+declare_queues!(app, ["email", "heavy" => External(on_lease_expiry = :requeue)])
+```
+
+The web process only records a submit to `"heavy"`. A consumer process claims the run from the
+shared store, under a lease, and runs it.
+
+- **`on_lease_expiry` has no default.** It decides what happens to a run whose consumer died
+  mid-run, so that its lease expired: `:requeue` runs it again (at-least-once delivery, so **the
+  job must be idempotent**), and `:fail` records it `FAILED`. Omitting it is an `ArgumentError`,
+  because only the application knows whether its job may run twice, and a default of `:requeue`
+  would let an email or a charge repeat silently. See [`LeasePolicy`](@ref).
+- **`max_attempts`** bounds `:requeue`: a run claimed that many times is recorded `FAILED`.
+- **`max_pending`** bounds the backlog: a submit is refused with `WorkerCapacityError(:queue, …)`
+  (a `503`) once the store holds that many `PENDING` runs of the queue. The default, 100, is an
+  in-process queue's buffer size, so moving a queue out of process admits the same backlog;
+  `max_pending = nothing` removes the bound. The count is read before
+  the insert, so concurrent submits can overshoot it by a few rows. It bounds runaway callers; it
+  is not an exact quota.
+- **`options`** are the queue's `TaskOptions`: the consumer runs every run of the queue
+  with them. A submit cannot pass its own, because the consumer never sees the submit call.
+
+Only a **named job** can run on an external queue ([`register_job!`](@ref), [`Job`](@ref)): a
+closure cannot cross a process boundary, so submitting one is an `ArgumentError`.
+"""
+struct External
+    policy::LeasePolicy
+    max_pending::Union{Nothing, Int}
+    options::TaskOptions
+
+    function External(policy::LeasePolicy, max_pending::Union{Nothing, Integer}, options::TaskOptions)
+        max_pending === nothing || max_pending >= 1 || throw(ArgumentError(
+            "`max_pending` must be at least 1 or `nothing`, got $max_pending"))
+        return new(policy, max_pending === nothing ? nothing : Int(max_pending), options)
+    end
+end
+
+function External(; on_lease_expiry::Union{Nothing, Symbol} = nothing, max_attempts::Integer = 3,
+                  max_pending::Union{Nothing, Integer} = _DEFAULT_QUEUE_BUFFER,
+                  options::TaskOptions = TaskOptions())
+    on_lease_expiry === nothing && throw(ArgumentError(
+        "External(…) needs `on_lease_expiry`: `:requeue` runs a run again when its consumer dies " *
+        "mid-run (the job must be idempotent), `:fail` records it FAILED. There is no default, " *
+        "because only the application knows whether its job may run twice"))
+    return External(LeasePolicy(on_lease_expiry; max_attempts = Int(max_attempts)), max_pending, options)
+end
+
 struct QueueItem
     task_key::String
     # The run this item was queued FOR, not merely the key it was queued under. A queued item can
@@ -696,7 +757,7 @@ mutable struct WorkerQueue
     # same idempotent CAS.
     held::Vector{QueueItem}
 
-    function WorkerQueue(size::Int=100; concurrency::Int=1)
+    function WorkerQueue(size::Int=_DEFAULT_QUEUE_BUFFER; concurrency::Int=1)
         size >= 1 || throw(ArgumentError("WorkerQueue size must be at least 1, got $size"))
         concurrency >= 1 || throw(ArgumentError(
             "WorkerQueue concurrency must be at least 1, got $concurrency"))

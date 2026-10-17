@@ -110,6 +110,7 @@ struct WorkerRuntime{S <: AbstractWorkerStore}
     allow_undeclared_queues::Bool
     initial_queues::Vector{Pair{String, Int}}
     declared_queues::Dict{String, Int}               # name => concurrency (#513)
+    external_queues::Dict{String, External}          # name => placement in a consumer process (#514)
     warned_queues::Set{String}                       # undeclared names already warned about
 
     # run_id => (owner, kind). `kind` is `:async` (a `submit_task` run), `:queued` (a queued
@@ -144,6 +145,7 @@ struct WorkerRuntime{S <: AbstractWorkerStore}
             allow_undeclared_queues,
             initial,
             Dict{String, Int}(initial),
+            Dict{String, External}(),
             Set{String}(),
             Dict{UUID, Tuple{String, Symbol}}(),
             Dict{String, Int}(),
@@ -166,6 +168,9 @@ function _queue_spec(spec::Pair)
     name, k = spec
     name isa AbstractString || throw(ArgumentError(
         "a queue declaration is a name or `name => concurrency`; got a $(typeof(name)) name in $(repr(spec))"))
+    k isa External && throw(ArgumentError(
+        "queue \"$name\" is `External(…)`: declare it with `declare_queues!(app, [...])`, in the " *
+        "setup function both the web process and the consumer call, not here"))
     k isa Integer && !(k isa Bool) || throw(ArgumentError(
         "queue \"$name\": the concurrency must be an integer, got $(repr(k))"))
     k >= 1 || throw(ArgumentError("queue \"$name\": the concurrency must be at least 1, got $k"))
@@ -193,20 +198,56 @@ function _queue_specs(queues::AbstractVector)
     return specs
 end
 
-# Declare queue names a submit may use, with their concurrency. `start!(…; queues)` and `startup`
-# call it; the second one does so when the middleware is BUILT, so the startup window cannot refuse
-# a declared queue.
+# `declare_queues!`'s list (#514): the in-process declarations, normalized as `_queue_specs` does,
+# and the `name => External(…)` placements beside them. A name is one or the other, and the same
+# name twice must carry the same setting, exactly as for a concurrency.
+function _placement_specs(queues::AbstractVector)
+    in_process = Any[]
+    external = Pair{String, External}[]
+    for entry in queues
+        if entry isa Pair && last(entry) isa External
+            name = first(entry)
+            name isa AbstractString && !isempty(name) || throw(ArgumentError(
+                "an External(…) queue needs a non-empty name; got $(repr(name))"))
+            placement = last(entry)
+            i = findfirst(p -> first(p) == name, external)
+            if i === nothing
+                push!(external, String(name) => placement)
+            elseif last(external[i]) != placement
+                throw(ArgumentError("queue \"$name\" is declared twice, with two different External(…) settings"))
+            end
+        else
+            push!(in_process, entry)
+        end
+    end
+    specs = _queue_specs(in_process)
+    for (name, _) in specs
+        any(p -> first(p) == name, external) && throw(ArgumentError(
+            "queue \"$name\" is declared both in-process and External(…); a queue runs in one place"))
+    end
+    return specs, external
+end
+
+# Declare queue names a submit may use, with their concurrency or their external placement.
+# `start!(…; queues)` and `startup` call it; the second one does so when the middleware is BUILT,
+# so the startup window cannot refuse a declared queue.
 #
-# Re-declaring a name with ANOTHER concurrency is refused rather than applied: a queue's processors
+# Re-declaring a name with ANOTHER setting is refused rather than applied: a queue's processors
 # may already be running at the old `k`, and `startup` declares the same list twice (at build time
 # and again from `on_startup`), so the only consistent rule is that a declaration is fixed once made.
 # Every name is checked before any is written, so a refused call declares nothing.
-function _declare_queues!(runtime::WorkerRuntime, queues::AbstractVector)
-    specs = _queue_specs(queues)
+_declare_queues!(runtime::WorkerRuntime, queues::AbstractVector) =
+    _declare_queues!(runtime, _placement_specs(queues)...)
+
+function _declare_queues!(runtime::WorkerRuntime, specs::Vector{Pair{String, Int}},
+                          external::Vector{Pair{String, External}})
     lock(runtime.queue_lock) do
-        _check_queue_declarations_locked(runtime, specs)
+        _check_queue_declarations_locked(runtime, specs, external)
         for (name, k) in specs
             runtime.declared_queues[name] = k
+        end
+        for (name, placement) in external
+            runtime.external_queues[name] = placement
         end
     end
     return runtime
@@ -217,13 +258,25 @@ end
 # runs at 1) that a later `start!` declares at another `k` -- recording the new `k` would leave a
 # declaration the running queue silently ignores. `start!` and `startup` also call this BEFORE they
 # install a runtime, so a refused declaration neither installs one nor displaces the old one.
-function _check_queue_declarations(runtime::WorkerRuntime, specs::Vector{Pair{String, Int}})
-    lock(() -> _check_queue_declarations_locked(runtime, specs), runtime.queue_lock)
+function _check_queue_declarations(runtime::WorkerRuntime, specs::Vector{Pair{String, Int}},
+                                   external::Vector{Pair{String, External}} = Pair{String, External}[])
+    lock(() -> _check_queue_declarations_locked(runtime, specs, external), runtime.queue_lock)
     return nothing
 end
 
-function _check_queue_declarations_locked(runtime::WorkerRuntime, specs::Vector{Pair{String, Int}})
+function _check_queue_declarations_locked(runtime::WorkerRuntime, specs::Vector{Pair{String, Int}},
+                                          external::Vector{Pair{String, External}} = Pair{String, External}[])
+    for (name, placement) in external
+        (haskey(runtime.declared_queues, name) || haskey(runtime.worker_queues, name)) && throw(ArgumentError(
+            "queue \"$name\" already runs in-process on this runtime; it cannot be declared External(…)"))
+        declared = Base.get(runtime.external_queues, name, placement)
+        declared == placement || throw(ArgumentError(
+            "queue \"$name\" is already declared External(…) on this runtime with other settings; " *
+            "it cannot be re-declared with $placement"))
+    end
     for (name, k) in specs
+        haskey(runtime.external_queues, name) && throw(ArgumentError(
+            "queue \"$name\" is already declared External(…) on this runtime; it cannot also run in-process"))
         declared = Base.get(runtime.declared_queues, name, k)
         declared == k || throw(ArgumentError(
             "queue \"$name\" is already declared on this runtime with concurrency $declared; " *
@@ -245,7 +298,17 @@ function _declared_concurrency(runtime::WorkerRuntime, name::String)
     return k
 end
 
-_queue_declared(runtime::WorkerRuntime, name::String) = _declared_concurrency(runtime, name) !== nothing
+# The `External(…)` placement of `name`, or `nothing` when it runs in-process or is undeclared.
+_external_placement(runtime::WorkerRuntime, name::String) =
+    lock(() -> Base.get(runtime.external_queues, name, nothing), runtime.queue_lock)
+
+# The lease policy of every external queue, which `requeue_expired!` adjudicates leases by.
+_external_policies(runtime::WorkerRuntime) = lock(runtime.queue_lock) do
+    Dict{String, LeasePolicy}(name => p.policy for (name, p) in runtime.external_queues)
+end
+
+_queue_declared(runtime::WorkerRuntime, name::String) =
+    _external_placement(runtime, name) !== nothing || _declared_concurrency(runtime, name) !== nothing
 
 const _UNDECLARED_QUEUE_WARNINGS = 16
 
@@ -1107,6 +1170,7 @@ function reset_runtime!(runtime::WorkerRuntime=default_runtime(); drain_timeout:
     lock(runtime.queue_lock) do
         empty!(runtime.declared_queues)
         merge!(runtime.declared_queues, Dict(runtime.initial_queues))
+        empty!(runtime.external_queues)
     end
 
     clear_records!(runtime.store)

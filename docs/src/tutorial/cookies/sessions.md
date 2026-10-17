@@ -440,6 +440,8 @@ first.
 - **Cost.** Anonymous sessions never call the hook. An authenticated request calls it once, so back
   it with a cache or a cheap indexed read. Requests run concurrently, so it must be thread-safe.
   An exception from it fails the request with a 500 rather than accepting an unchecked session.
+  The 500 is logged as a fault that names the hook, without the identity it was handed. The same
+  goes for a custom `validator`, which is handed the session id and data.
 - **A custom `validator`** must find the identity in the session data it is handed, not by reading
   the store by ID. A store read does not see the login the request is making, so the login is left
   unstamped and refused on the next request.

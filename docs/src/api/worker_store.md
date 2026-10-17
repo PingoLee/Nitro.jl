@@ -48,8 +48,9 @@ run by a separate consumer process, because that process has only what the store
 ## Claims: the optional capability for a consumer process
 
 A queue whose runs execute in a **separate consumer process**
-([#514](https://github.com/PingoLee/Nitro.jl/issues/514)) needs four more store operations:
-claim a submission, renew the lease on it, hand it back, and adjudicate expired leases. They are
+([#514](https://github.com/PingoLee/Nitro.jl/issues/514)) needs five more store operations:
+claim a submission, renew the lease on it, hand it back, adjudicate expired leases, and count a
+queue's external submissions for its submit-time bounds. They are
 **optional**. A store without them still passes `missing_store_methods`; it just cannot back such a
 queue, and [`missing_claim_methods`](@ref Nitro.Workers.missing_claim_methods) says what it lacks.
 Both shipped stores implement them.
@@ -66,5 +67,13 @@ Nitro.Workers.renew_leases!
 Nitro.Workers.LeaseRenewal
 Nitro.Workers.release_claim!
 Nitro.Workers.requeue_expired!
+Nitro.Workers.count_external_runs
 Nitro.Workers.LeasePolicy
+```
+
+A store throws [`ClaimPoisonedError`](@ref Nitro.Errors.ClaimPoisonedError) from
+`claim_next!` when a second head row of a queue does not decode in one call.
+
+```@docs
+Nitro.Errors.ClaimPoisonedError
 ```

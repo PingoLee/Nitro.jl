@@ -116,7 +116,8 @@ So:
   threads stay free for requests: run CPU-heavy Workers jobs through a declared queue with a
   concurrency below the default thread count, such as `queues = ["compute" => max(N - 2, 1)]`
   (`submit_queued_task`), which runs at most that many at once and buffers up to 100 behind them
-  (see [CPU-Bound Jobs](@ref)), or put a `yield()` inside a long loop.
+  (see [CPU-Bound Jobs](@ref)), or put a `yield()` inside a long loop (on Julia 1.13.0
+  through 1.13.2, see the caveat in [Handlers that compute](@ref)).
   `max_concurrent_runs` does not make jobs wait: past it, `submit_task` refuses them.
 
 **Stopping it.** `--threads=N,0` is a production layout, for a process stopped by its supervisor.
@@ -172,10 +173,79 @@ the benchmark's own job counter; its k = 0 baseline was 102k and 2.4 ms.
 - **Or `yield()` every 1–2 ms** in a loop that has to stay in the handler. It does not make the
   work cheaper, so throughput still falls, but it bounds the wait: a p99 of 10.5 ms at k = 8,
   lower than Go's 19.9 ms (Go preempts a goroutine after about 10 ms).
+- **One caveat on Julia 1.13.0 through 1.13.2**
+  ([#586](https://github.com/PingoLee/Nitro.jl/issues/586), reported upstream as
+  [JuliaLang/julia#63882](https://github.com/JuliaLang/julia/issues/63882)).
+  - **The stall:** in a repro with every default thread in a yielding loop for 1.5 s, a task
+    parked in `sleep(0.001)` woke only when the loops ended. On 1.12.7 and on the 1.14
+    development branch it woke a few milliseconds late.
+  - **When it happens:** only while no other timer is alive in the process. Any second live
+    `Timer` removes it, even one that never fires. New requests are not affected: the `yield()`
+    column above did not change on 1.13.2.
+  - **Nitro works around it while serving.** On 1.13.0-rc3 and later 1.13 releases, `serve`
+    holds one `Timer` that never fires, and `terminate` closes it: one handle, nothing per
+    request. `bench/socket/wake.sh` measured a Nitro server with no other timer on 1.13.2
+    ([#598](https://github.com/PingoLee/Nitro.jl/issues/598)). It kept one handler parked in a
+    10 ms `sleep` loop while 8 handlers yielded every 1 ms for 1.5 s. Without the guard the
+    parked handler woke 1.48 s late in 3 runs of 3. With `serve`'s guard it woke 10–23 ms
+    late, against 2–8 ms on 1.12.7 with no load beside it.
+  - **What is still exposed:** a task that sleeps while no server is up, such as a script that
+    runs yielding loops before or after `serve`. It can hold the same guard itself:
+    `keepalive = Timer(typemax(Int32))`, and `close(keepalive)` when done.
+
+**Every app has one such handler: the login.** One `check_password` at the default cost
+computes without yielding for about 0.1 s (pbkdf2_sha256, 720,000 iterations) or 0.2 s
+(bcrypt, cost 12). The same run with k logins in flight instead of `/cpu` (Julia 1.12.7,
+[#587](https://github.com/PingoLee/Nitro.jl/issues/587)):
+
+| k | pbkdf2: `/plaintext` rps, p99 | bcrypt: `/plaintext` rps, p99 |
+|---|---|---|
+| 0 | 99.7k, 2.3 ms | 99.7k, 2.3 ms |
+| 4 | 92.6k, 3.5 ms | 93.9k, 2.6 ms |
+| 8 | 2.1k, 122 ms | 1.3k, 237 ms |
+| 16 | 291, 880 ms | 172, 1.6 s |
+
+Eight sign-ins at once stalled the whole API while they ran, and so would eight guesses from a
+credential-stuffing client. A `RateLimiter` on the login route bounds what one client can impose,
+not what many impose together. **So Nitro bounds the checks itself**, the way the queue bounds
+jobs: at most `password_concurrency()` hash at once (`nthreads(:default) - 2` by default), and
+the rest wait parked ([Passwords](passwords.md#A-login-is-a-handler-that-computes)). The same
+run with the bound, on a busier box, against the bound turned off and against `/cpu_job` (the
+Workers queue of 6) in the same session. The unbounded and `/cpu_job` cells are Julia 1.12.7;
+each bounded cell is the range over three runs: 1.12.7, 1.13.2, and the 1.12.7 run beside
+`/cpu_job`:
+
+| k | pbkdf2, unbounded | pbkdf2, bounded | bcrypt, unbounded | bcrypt, bounded | `/cpu_job`, queue of 6 |
+|---|---|---|---|---|---|
+| 8 | 2.3k, 104 ms | 25–28k, 8–9 ms | 1.2k, 195 ms | 26–28k, 8 ms | 29k, 7.7 ms |
+| 16 | 254, 1.6 s | 25–27k, 8–9 ms | 132, 2.3 s | 26–29k, 8 ms | 28k, 7.9 ms |
+
+The other routes keep the queue's throughput at any k (lower here than in the table above
+because other work shared the CPUs; compare within a column set, not across tables). Logins
+pay for it. At k = 16 they ran at 42 per second (pbkdf2) and 20 (bcrypt) instead of 51 and 27,
+and a sign-in past the bound waits for one to finish. `set_password_concurrency!` moves that
+trade. The bound covers logins only: a Workers queue sized the same way takes its own threads
+on top of it, so an app running both at full load should size the two together.
 
 No setting in Nitro bounds a computing handler: `read_timeout` and `write_timeout` are socket
 deadlines, and nothing can stop a task from outside. The `AccessLog` middleware records each
 request's `duration_ms`, which is where a slow handler shows up.
+
+**Nitro's own primitives hold a thread too, in proportion to the body.** Parsing or building a
+body is computing.
+[#588](https://github.com/PingoLee/Nitro.jl/issues/588) measured one call each, on one thread on
+Julia 1.12.7:
+
+- JSON (`getjson`, `Json{T}`, `Res.json`) takes 0.4–1.1 ms at 100 KB and 4–11 ms at 1 MB, and
+  grows linearly from there.
+- Parsing a 10 MB multipart upload takes about 6 ms.
+- A buffered `Res.file` of a 100 MiB file is a single 53 ms `read`.
+
+**Serve large files with `Res.file(req, path; stream = true)`.** It reads 64 KiB per chunk
+(about 6 µs each), and each chunk's socket write is a point where the task can give its thread
+up. Static mounts already stream above `stream_threshold`. Whether the larger JSON and multipart
+holds matter under load is what #588's stall pass will decide; until then, the rule above applies
+to them: a body large enough to take longer than your latency budget is computing.
 
 ## Memory and GC
 
