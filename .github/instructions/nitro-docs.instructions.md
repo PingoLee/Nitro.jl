@@ -52,12 +52,19 @@ Good generic domains: Products, Orders, Users, Drivers, Stores, Items.
 When showing how to wire PormG into an app, use the `@import_models` + alias pattern:
 
 ```julia
-# src/App.jl
-PormG.Configuration.load_many(["db"])
+# src/MyApp.jl — module body: defines code, connects nothing
 PormG.@import_models "../db/automatic_models.jl" automatic_models
 const appM = automatic_models   # handlers import this alias
+
+function main(; kwargs...)
+    PormG.Configuration.load_many(["db"]; root = pkgdir(@__MODULE__))   # connects at runtime
+    # … worker_startup, urlpatterns(app, …), serve(app; …)
+end
 ```
 
+- **Never call `load_many`/`load` in a module body.** A package's module body runs at precompile
+  time and never again, so the connection would not exist at runtime. It goes in `main()`, as
+  `Nitro.newapp` writes it — the boot in `bigger_applications.md` is that generated file.
 - The `db/` directory lives **outside** `src/` alongside the project root.
 - `@import_models` creates a plain Julia module; the `const appM = ...` alias is what handlers use.
 - Handlers include `import ..appM` and query with `appM.Product |> object`.

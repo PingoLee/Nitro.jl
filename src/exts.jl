@@ -163,3 +163,8 @@ serve(app; middleware=[worker_startup(app; queues=["reports"], store=store)])
 ```
 """
 function pormg_nitro_worker end
+
+# `Nitro.newapp(name; pormg = true)`'s PormG half (#417), documented on `newapp` in
+# `src/newapp.jl`. `NitroPormGExt` gives it its one method: it writes the app through the callback
+# it is handed, then runs PormG's interactive `setup`. No method means PormG is not loaded.
+function _newapp_pormg end

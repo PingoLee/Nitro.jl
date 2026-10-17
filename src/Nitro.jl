@@ -62,6 +62,7 @@ const CONTEXT::Ref{App} = Ref(App())
 include("exts.jl")
 include("methods.jl")
 include("upgrading.jl")
+include("newapp.jl")
 
 export  # The application handle
         App,
@@ -114,6 +115,10 @@ export  # The application handle
         Res,
         # Version-scoped `upgrading/` change-log emitter (release-train rollout)
         upgrade_guide
+
+# Public, not exported (#417): a maximally generic verb for a one-off lifecycle helper does not
+# belong in every `using Nitro` namespace. Called qualified, `Nitro.newapp(...)`.
+public newapp
 
 include("precompile.jl")
 end

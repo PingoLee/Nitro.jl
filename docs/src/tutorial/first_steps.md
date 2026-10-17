@@ -67,19 +67,21 @@ For the duration of this guide, we will be working out of the `src/main.jl` file
 Here's an example of what a simple Nitro server could look like
 
 ```julia
-module Main
+module Greeter
 using Nitro
 using HTTP
+
+const app = App(mod = @__MODULE__)
 
 function greet(req::HTTP.Request)
     return "hello world!"
 end
 
-urlpatterns("",
+urlpatterns(app, "",
     path("/greet", greet, method="GET"),
 )
 
-serve()
+serve(app)
 end
 ```
 
@@ -96,8 +98,17 @@ using Nitro
 using HTTP
 ```
 
-Here we pull in the both libraries our api depends on. The `path()`, `urlpatterns()` and `serve()`
-functions come from Nitro, and the `HTTP.Request` type comes from the HTTP library.
+Here we pull in the both libraries our api depends on. The `App` type and the `path()`,
+`urlpatterns()` and `serve()` functions come from Nitro, and the `HTTP.Request` type comes from the
+HTTP library.
+
+```julia
+const app = App(mod = @__MODULE__)
+```
+
+`app` is the application handle: it holds this app's routes, middleware and server, and every
+routing and serving call takes it first. `mod = @__MODULE__` tells it which module it belongs to,
+which is what hot reloading tracks.
 
 Next we define the handler. It is an ordinary function that takes a request and returns a response —
 nothing about it is Nitro-specific, which is what makes it easy to test on its own.
@@ -116,24 +127,24 @@ readable in one place. Each `path()` is made up of several components.
 - http method => the `method` keyword (`"GET"` here)
 
 ```julia
-urlpatterns("",
+urlpatterns(app, "",
     path("/greet", greet, method="GET"),
 )
 ```
 
-The first argument to `urlpatterns()` is a prefix applied to every route in the block. It is `""`
+After the app, the next argument to `urlpatterns()` is a prefix applied to every route in the block. It is `""`
 here, so `/greet` is mounted at the root; passing `"/api"` would mount it at `/api/greet` instead.
 
-Finally at the bottom of our `Main` module we have this function to start up our brand new webserver.
+Finally at the bottom of our `Greeter` module we have this function to start up our brand new webserver.
 This function can take a number of keyword arguments such as the `host` & `port`, which can be helpful if you don't want to use the default values.
 
 ```julia
-serve()
+serve(app)
 ```
 
 For example, you can start your server on port `8000` instead of `8080` which is used by default
 ```julia
-serve(port=8000)
+serve(app; port=8000)
 ```
 
 ## Try out your endpoints
@@ -143,3 +154,19 @@ You should be able to hit `http://127.0.0.1:8080/greet` inside your browser and 
 ```
 "hello world!"
 ```
+
+## Starting a real project
+
+A single file run with `include` is fine for trying things out. For an application, let Nitro
+write the project for you:
+
+```julia
+julia> using Nitro
+
+julia> Nitro.newapp("MyApp"; path = "myapp", pormg = false)
+```
+
+It writes a package with its routes, handlers and a test, and a `main()` that boots it. Leave out
+`pormg = false`, after `using PormG`, to get a database too. Run in a package, the server starts
+from `main()` rather than the module body, because a package's module body runs only when it is
+precompiled. [Bigger Applications](bigger_applications.md) walks through what it writes.
