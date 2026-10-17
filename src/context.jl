@@ -132,7 +132,7 @@ end
     max_fields            :: Base.RefValue{Int64}   = Ref{Int64}(DEFAULT_MAX_FIELDS)
     # The never-firing `Timer` held while serving on the Julia versions `_needs_wake_guard`
     # names (#598). `nothing` everywhere else, and whenever nothing serves.
-    wake_guard            :: Ref{Nullable{Timer}}   = Ref{Nullable{Timer}}(nothing)
+    wake_guard            :: Base.RefValue{Nullable{Timer}} = Ref{Nullable{Timer}}(nothing)
     wake_guard_lock       :: ReentrantLock          = ReentrantLock()
 end
 
