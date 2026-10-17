@@ -290,7 +290,11 @@ the second as done would lose work. That is at-least-once delivery again, and wh
 external queue must be idempotent. Give jobs a `checkpoint!` in their loops, and make the drain
 timeout at least as long as the longest gap between two checkpoints. Every hand-back at a drain
 counts toward `max_attempts`, including a run that completed during the drain, so under
-`:requeue` a run handed back that many times is recorded `FAILED`. A run still going at
+`:requeue` a run handed back that many times is recorded `FAILED`. When the drain times out in a
+process that keeps running, as in a REPL where `consume!` returns to the prompt, the runs still
+going keep their leases renewed until they return, and are handed back then: they finish under a
+live lease, and no other consumer starts them again meanwhile. A run that never returns keeps its
+lease for as long as that process lives. A run still going at
 exit keeps its lease until it expires, and is then re-queued or failed by its queue's policy. On
 Windows, terminating a process runs no shutdown code at all, so a stopped consumer's runs wait for
 their leases to expire, exactly as after a crash.

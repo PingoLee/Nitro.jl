@@ -65,7 +65,11 @@ lives in the code comment it names, and that comment is canonical.
   loop, and its reasoning is next to `_cleanup_scheduler_loop`. A consumer's claim loop and
   heartbeat are the other two (#514). They are waited on by the consumer's drain, and an
   interrupt there is a request to drain, not a reason to stop the loop: the heartbeat must keep
-  renewing until the drain ends.
+  renewing until the drain ends. It may outlive the drain, but only to renew. A drain that times
+  out returns, and the heartbeat goes on renewing the runs it left going until the last one
+  returns. Meanwhile it claims nothing and adjudicates nothing. In a REPL the process outlives
+  `consume!`, and an unrenewed lease there would let another consumer run the same job at the
+  same time (#607).
 - **A long idle wait parks; it does not poll.** A task that idles between ticks or until stopped
   parks once on a `Base.Event`, woken by a `Timer` and by the stop path (#369, #371). A short
   `timedwait` with a deadline is fine for a bounded wait during shutdown or a drain.
@@ -123,7 +127,8 @@ lives in the code comment it names, and that comment is canonical.
     `bench/socket/wake.sh` on 1.13.2: a parked handler in a `serve()` with no other timer woke
     1.48 s late without it, 10-23 ms with it. **`consume!` holds its own** (#514), since a
     consumer never calls `serve`: one never-firing `Timer` in `ConsumerHandle.wake_guard` under the
-    same gate, closed by the drain. **Still exposed:** yielding loops while neither a server nor a
+    same gate. The drain closes it, or the heartbeat does, if it outlives a drain that timed out
+    (#607). **Still exposed:** yielding loops while neither a server nor a
     consumer is up. When a fixed 1.13.x ships, lower the gate's upper bound; once Nitro's floor passes the
     last affected release, delete the guard and this bullet, and change the documents below
     with it.

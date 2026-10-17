@@ -6412,6 +6412,14 @@ status(store, id) = get_task_info(store, id).status
     @test_throws ArgumentError _start_consumer(app; store, queues = ["heavy" => 0], require_interactive = false)
     @test_throws "positive duration" _start_consumer(app; store, queues = ["heavy" => 1], lease = 0,
                                                      require_interactive = false)
+    # The refusal below cannot be turned off through the public entry point, only through the
+    # internal `_start_consumer` (#607).
+    err = try
+        consume!(app; store, queues = ["heavy" => 1], require_interactive = false)
+    catch e
+        e
+    end
+    @test err isa MethodError && occursin("require_interactive", sprint(showerror, err))
     # The heartbeat's thread. A process with one starts; one without is refused, which the
     # two-process test proves in a child started with `--threads=1,0`, since CI's own layouts
     # (`-t N` on 1.12) always have one.
@@ -6546,6 +6554,97 @@ end
         @test rec.status == FAILED
         @test occursin("Handed back", rec.error)
     finally
+        stop!(web, c)
+    end
+end
+
+# #607: in a REPL the process outlives `consume!`, and so does a run its drain timed out on. Left
+# unrenewed, its lease would expire and another consumer would run it again while it still runs.
+@testset "a drain that times out keeps renewing the runs still going until they return" begin
+    Nitro.Core.AppContext._WAKE_GUARD_FORCED[] = true
+    local web, c, store
+    try
+        web, c, store = pair(; drain_timeout = 0.3)
+        try
+            id = submit(web, "straggler", "block")      # never looks at its token
+            @test waitfor(() -> seen("straggler") === :started)
+            run_id = get_task_info(store, id).run_id
+            _request_stop!(c)
+            _drain!(c)                                  # what `consume!` does before it returns
+            @test c.finished && istaskdone(c.claim_task)
+            sleep(2.5)                                  # past two leases since the drain gave up
+            rec = get_task_info(store, id)
+            @test rec.status == RUNNING
+            @test rec.run_id == run_id && rec.claimed_by == c.consumer_id
+            @test rec.lease_expires_at > _W.current_time_utc()
+            # So another process's adjudication has nothing to take back.
+            tally = requeue_expired!(store, _W.current_time_utc(); policies = Dict("heavy" => LeasePolicy(:requeue)))
+            @test tally.requeued + tally.failed == 0
+            @test !istaskdone(c.heartbeat_task)
+            @test isopen(c.wake_guard)
+
+            notify(gate("straggler"))
+            # It returned under a live lease, so its fenced hand-back landed.
+            @test waitfor(() -> status(store, id) == PENDING)
+            @test get_task_info(store, id).claimed_by === nothing
+            # And the heartbeat ended with the last straggler, closing the guard behind it.
+            @test waitfor(() -> istaskdone(c.heartbeat_task))
+            @test !isopen(c.wake_guard)
+        finally
+            notify(gate("straggler"))
+            stop!(web, c)
+        end
+    finally
+        Nitro.Core.AppContext._WAKE_GUARD_FORCED[] = false
+    end
+end
+
+# #608: one run's failed lookup costs that run's signal, not the other runs' nor the tick's adjudication.
+@testset "a heartbeat tick goes on past one lost run's failed lookup" begin
+    store = SharedStore()
+    web, c, _ = pair(; store, k = 2)
+    try
+        a = submit(web, "fa", "poll_return")
+        b = submit(web, "fb", "poll_return")
+        @test waitfor(() -> status(store, a) == RUNNING && status(store, b) == RUNNING)
+        # What the heartbeat does, in order. The first lookup of either run throws, whichever the
+        # tick reaches first, so the test does not depend on `held`'s iteration order.
+        events = Any[]
+        failed = Ref{Any}(nothing)
+        ev_lock = ReentrantLock()
+        on_heartbeat() = current_task() === c.heartbeat_task
+        # Only a lost run is looked up, so nothing is logged before the leases are taken back.
+        store.read_hook[] = id -> begin
+            (on_heartbeat() && id in (a, b)) || return
+            throws = lock(ev_lock) do
+                failed[] === nothing || (push!(events, (:read, id)); return false)
+                failed[] = id
+                push!(events, :threw)
+                return true
+            end
+            throws && error("one row's read failed")
+        end
+        store.requeue_hook[] = () -> on_heartbeat() &&
+            lock(() -> failed[] === nothing || push!(events, :requeue), ev_lock)
+        # Another process takes both leases back; the k = 2 slots stay busy, so neither is re-claimed.
+        requeue_expired!(store, now(UTC) + Hour(1); policies = Dict("heavy" => LeasePolicy(:requeue)))
+        @test waitfor(() -> lock(() -> count(==(:requeue), events) >= 1, ev_lock))
+        store.read_hook[] = nothing
+        store.requeue_hook[] = nothing
+        other = failed[] == a ? b : a
+        log = lock(() -> copy(events), ev_lock)
+        @test first(log) === :threw
+        tick = log[2:findfirst(==(:requeue), log)]
+        # In the same tick as the failure: the other run was still looked up, the failed one not
+        # again, and adjudication still ran.
+        @test (:read, other) in tick
+        @test !((:read, failed[]) in tick)
+        @test waitfor(() -> seen(other == a ? "fa" : "fb") !== nothing)
+        # The failed one is signalled on a later tick.
+        @test waitfor(() -> seen(other == a ? "fb" : "fa") !== nothing)
+    finally
+        store.read_hook[] = nothing
+        store.requeue_hook[] = nothing
         stop!(web, c)
     end
 end

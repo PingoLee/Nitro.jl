@@ -53,10 +53,12 @@ mutable struct ConsumerHandle{S <: AbstractWorkerStore}
     @atomic held_count::Int          # `length(held)`, readable without the lock by the drain's wait
 
     const wake::Base.Event            # the claim loop's park: its timer, a freed slot, a stop
-    const beat::Base.Event            # the heartbeat's park: its timer, or the end of the drain
+    const beat::Base.Event            # the heartbeat's park: its timer, the end of the drain, the last straggler
     const stop_requested::Base.Event  # what `consume!` waits on
     @atomic stopping::Bool            # no more claims
-    @atomic beating::Bool             # the heartbeat runs until the drain clears it
+    # The drain clears it when it ends. The heartbeat then runs on until the last held run settles
+    # (`_keeps_beating`), so a run a timed-out drain left going keeps its lease in a live process.
+    @atomic beating::Bool
     @atomic drained::Bool             # the drain has begun; a second caller waits for it
     @atomic finished::Bool            # the drain has ended, however it ended
     claim_task::Union{Nothing, Task}
@@ -135,7 +137,10 @@ consumer: it stops claiming, sets `:shutdown` on every run it holds, keeps renew
 for up to `drain_timeout` seconds, and returns. A run that ends in that window is **handed back**
 to its queue, not cancelled, so the next consumer runs it again, even one that finished: its
 result is discarded, because a job that saw the token and returned early looks the same as one
-that completed. A run still going when the process
+that completed. A run still going when `consume!` returns **in a process that lives on**, as in a
+REPL, keeps being renewed until it returns, and is handed back then: it finishes under a live
+lease, and no other consumer runs it at the same time. A run that never returns keeps its lease,
+and the heartbeat, for as long as the process lives. A run still going when the process
 exits keeps its lease until it expires, and is then re-queued or failed by its queue's policy. On
 Windows a terminate is a hard kill that runs no hook, so there a stopped consumer's runs wait for
 their leases to expire, as after a crash.
@@ -148,8 +153,15 @@ their leases to expire, as after a crash.
 A consumer never runs the zombie sweep: the web process's in-process runs look exactly like
 zombies from here.
 """
-function consume!(app::App; kwargs...)
-    c = _start_consumer(app; kwargs...)
+function consume!(app::App; store::AbstractWorkerStore, queues::AbstractVector,
+                  lease::Union{Real, Dates.Period} = CONSUMER_DEFAULT_LEASE,
+                  consumer_id::AbstractString = _default_consumer_id(),
+                  drain_timeout::Real = WORKER_DRAIN_TIMEOUT_SECONDS,
+                  poll_interval::Union{Real, Dates.Period} = Dates.Second(1))
+    # The keywords are named, not forwarded (#607): `_start_consumer`'s `require_interactive =
+    # false` turns off the interactive-thread refusal, and only the tests and the heartbeat bench
+    # may reach it.
+    c = _start_consumer(app; store, queues, lease, consumer_id, drain_timeout, poll_interval)
     # A supervisor's SIGTERM, and a SIGINT outside a REPL, end the process through `exit`, which
     # runs the `atexit` hooks but never returns to the wait below (probed on 1.12 and 1.13: a hook
     # can still spawn and wait on tasks on other threads). So the drain is registered here, at call
@@ -366,10 +378,13 @@ function _run_claimed!(c::ConsumerHandle, run::TaskInfo, queue::String)
         # `requeue_expired!` then decides the run by its queue's policy.
         @error "Nitro.Workers: a consumer run ended without a recorded outcome; its lease will expire" task_id = run.id exception = (e, catch_backtrace())
     finally
-        lock(c.lock) do
+        emptied = lock(c.lock) do
             delete!(c.held, run.run_id)
             @atomic c.held_count = length(c.held)
+            isempty(c.held)
         end
+        # The last straggler of a drain that timed out: the heartbeat stops now, not a tick later.
+        emptied && !(@atomic c.beating) && notify(c.beat)
         _handed_off(handoff[]) || _release_slot!(c, queue)
     end
     return nothing
@@ -377,17 +392,22 @@ end
 
 # -- The heartbeat --
 
+# Until the drain ends, and then until the last run it left going returns (#607). In a REPL the
+# process outlives `consume!`, and so do those runs: unrenewed, their leases would expire, and
+# another consumer would run them again while they still run here.
+_keeps_beating(c::ConsumerHandle) = (@atomic c.beating) || (@atomic c.held_count) > 0
+
 function _heartbeat_loop(c::ConsumerHandle)
     interrupted = false
-    while @atomic c.beating
+    while _keeps_beating(c)
         try
             timer = Timer(_ -> notify(c.beat), c.lease_seconds / 3)
             try
-                (@atomic c.beating) && wait(c.beat)
+                _keeps_beating(c) && wait(c.beat)
             finally
                 close(timer)
             end
-            (@atomic c.beating) || break
+            _keeps_beating(c) || break
             _heartbeat_tick!(c)
         catch e
             if _is_interrupt(e)
@@ -403,25 +423,46 @@ function _heartbeat_loop(c::ConsumerHandle)
             @error "Nitro.Workers: a consumer heartbeat failed; retrying on the next one" exception = (e, catch_backtrace())
         end
     end
+    # After a drain that timed out, this loop outlives the drain, so it closes the wake guard
+    # itself: it is the last of the two loops the guard is for. Closing twice is harmless.
+    c.wake_guard === nothing || close(c.wake_guard)
     return nothing
 end
 
 function _heartbeat_tick!(c::ConsumerHandle)
     store = c.runtime.store
     held = lock(() -> collect(values(c.held)), c.lock)
+    # Each step on its own, as in the drain (#608): a failed renewal, or one run's failed lookup,
+    # must not hold back the other runs' signals nor this tick's adjudication.
     if !isempty(held)
         renewals = LeaseRenewal[LeaseRenewal((h.info.id, h.info.run_id, Float64(@atomic h.info.progress)))
                                 for h in held]
         # Renew first, adjudicate second: a heartbeat that was itself late must not take back its
         # own leases before it renews them.
-        kept = Set{UUID}(renew_leases!(store, c.consumer_id, renewals; lease_seconds = c.lease_seconds))
-        for h in held
-            h.info.run_id in kept && continue
-            reason = _lost_claim_reason(store, h.info)
-            reason === nothing || _request_cancel!(h.info, reason)
+        kept = try
+            Set{UUID}(renew_leases!(store, c.consumer_id, renewals; lease_seconds = c.lease_seconds))
+        catch e
+            _is_interrupt(e) && throw(InterruptException())
+            @error "Nitro.Workers: a consumer's lease renewal failed; retrying on the next heartbeat" runs = length(renewals) exception = (e, catch_backtrace())
+            nothing
+        end
+        # A failed renewal says nothing about which runs were lost, so nothing is looked up.
+        if kept !== nothing
+            for h in held
+                h.info.run_id in kept && continue
+                try
+                    reason = _lost_claim_reason(store, h.info)
+                    reason === nothing || _request_cancel!(h.info, reason)
+                catch e
+                    _is_interrupt(e) && throw(InterruptException())
+                    @error "Nitro.Workers: a consumer could not read why a run's renewal missed; retrying on the next heartbeat" task_id = h.info.id exception = (e, catch_backtrace())
+                end
+            end
         end
     end
-    _consumer_requeue!(c)
+    # Once the drain has ended, the heartbeat only keeps the runs it left going alive (#607): a
+    # consumer that returned claims nothing and adjudicates nothing.
+    (@atomic c.beating) && _consumer_requeue!(c)
     return nothing
 end
 
@@ -466,11 +507,12 @@ end
 
 # -- Stopping --
 
-# The drain (§7): stop claiming, set `:shutdown` on every held run, keep the heartbeat renewing for
-# up to `drain_timeout`, then stop it. Runs that stop in the window hand themselves back
-# (`_gives_back`); one still going keeps its lease until it expires. It runs once: a second
-# caller -- the `atexit` hook after a normal return, or a stop while it runs -- waits for the
-# first. It never throws (#427): every failure is logged and the stop still completes.
+# The drain (§7): stop claiming, set `:shutdown` on every held run, and wait up to `drain_timeout`
+# for them. Runs that stop in the window hand themselves back (`_gives_back`). Runs still going
+# when it ends keep the heartbeat renewing their leases until they return, and hand themselves back
+# then (#607); a process that exits first takes them with it, and their leases expire. It runs
+# once: a second caller -- the `atexit` hook after a normal return, or a stop while it runs --
+# waits for the first. It never throws (#427): every failure is logged and the stop still completes.
 function _drain!(c::ConsumerHandle)
     if !(@atomicreplace c.drained false => true).success
         # Bounded: if the first drain cannot finish -- a second signal landed on the very task
@@ -494,8 +536,9 @@ function _drain!(c::ConsumerHandle)
             timedwait(() -> (@atomic c.held_count) == 0, c.drain_timeout; pollint = 0.05)
             left = @atomic c.held_count
             if left > 0
-                @warn "Nitro.Workers: the consumer's drain timed out with runs still going. They keep " *
-                      "their leases until those expire, then their queues' policies decide" consumer_id = c.consumer_id runs = left
+                @warn "Nitro.Workers: the consumer's drain timed out with runs still going. The " *
+                      "heartbeat keeps renewing their leases until they return; if the process " *
+                      "exits first, the leases expire and their queues' policies decide" consumer_id = c.consumer_id runs = left
             end
         catch e
             if _is_interrupt(e)
@@ -509,16 +552,19 @@ function _drain!(c::ConsumerHandle)
         @atomic c.beating = false
         notify(c.beat)
         notify(c.wake)
+        hb = c.heartbeat_task
         try
-            for t in (c.heartbeat_task, c.claim_task)
-                t === nothing || timedwait(() -> istaskdone(t), 5.0; pollint = 0.05)
-            end
-            @info "Nitro.Workers: consumer stopped" consumer_id = c.consumer_id
+            # Not for a heartbeat that still renews runs the drain left going: it ends when they do.
+            hb === nothing || timedwait(() -> istaskdone(hb) || (@atomic c.held_count) > 0, 5.0; pollint = 0.05)
+            claim = c.claim_task
+            claim === nothing || timedwait(() -> istaskdone(claim), 5.0; pollint = 0.05)
+            @info "Nitro.Workers: consumer stopped" consumer_id = c.consumer_id runs_still_renewed = (@atomic c.held_count)
         catch e
             _is_interrupt(e) || @error "Nitro.Workers: the consumer's stop did not finish cleanly" exception = (e, catch_backtrace())
         end
-        # Last, once both loops are done parking: they are what it guards.
-        c.wake_guard === nothing || close(c.wake_guard)
+        # Last, once both loops are done parking: they are what it guards. A heartbeat still
+        # renewing closes it itself when it ends.
+        (hb === nothing || istaskdone(hb)) && c.wake_guard !== nothing && close(c.wake_guard)
         @atomic c.finished = true
     end
     return nothing
