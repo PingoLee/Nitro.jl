@@ -88,6 +88,13 @@ end
 
 Attach a validator that returns a `Bool`. A `false` result automatically produces a `400 Bad Request`.
 
+A validator that *throws*, or returns anything other than a `Bool`, is a bug in the server rather
+than a rejection, so it is a `500` with the fixed body. Its exception is dropped and replaced by one
+naming the parameter, the type and the validator. The validator was handed the submitted value, and
+the likeliest accident, a `MethodError` such as `q.limit > "3"`, prints its arguments, so logging it
+would write the value to the server log. Throwing a `ValidationError` yourself is still a `400` with
+your message.
+
 ```julia
 # At least one search field must be provided
 function search_products(req, payload = Json(ProductSearch, q -> !isempty(q.name) || !isempty(q.category)))

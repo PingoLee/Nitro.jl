@@ -18,6 +18,10 @@ an `App` with no worker runtime installed) is a `503`, logged at `@warn` without
 `WorkerCapacityError` (a worker limit reached) is a `503`, or a `429` for a per-owner quota,
 logged at `@debug`. The access log records the status either way. An `InterruptException` is not converted; it propagates.
 
+A [`Claims`](@ref) refusal is not on this list because it is not converted at all: the `401` or
+`403` its denial factory built is the route's response, served under `catch_errors=false` and
+`serialize=false` too, the way a guard's `403` is.
+
 There is one difference: a handler's `500` still passes back out through every middleware, but a
 middleware's `500` is produced *above* the chain. It therefore carries no headers from layers the exception skipped,
 such as `Cors` or the session cookie, so a cross-origin browser client sees a CORS failure
