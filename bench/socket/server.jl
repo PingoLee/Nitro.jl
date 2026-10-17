@@ -75,6 +75,10 @@
 #   PRELOAD="Pkg ..."   Load these packages before serving, so `rss.sh` can measure what one adds
 #                       to the process (PRELOAD=PormG also loads NitroPormGExt). The project
 #                       passed to `--project` must have them; the bench env does not.
+#   PROBE=1             Stamp every request `go/fairness -stamp` sends at the connection task, the
+#                       handler task's start, the handler's return and the end of the write, and
+#                       answer the rows at `/probe` (#618; see `probe_begin`). PROBE_CAP rows at
+#                       most (default 10^6). Off by default: a throughput run carries none of it.
 #
 # Run with `julia --project=bench -t 8 bench/socket/server.jl`. Every mode answers the same routes
 # with the same bodies, so the stacks differ only in what serves them: `/plaintext`, `/json`,
@@ -133,6 +137,79 @@ end
 
 gc_body() = let g = Base.gc_num()
     JSON.json(Dict(string(f) => getfield(g, f) for f in fieldnames(typeof(g))))
+end
+
+# PROBE=1 (#618): where a slow request's time went. `go/fairness -stamp` tags every request with
+# `X-Conn` (its connection), `X-Seq` (its number on that connection) and `X-Sent` (the client's
+# wall clock at send, ns). The server stamps the same wall clock at four points:
+#   conn   the connection task has the request head, before any spawn (0 in `nitro`: that point
+#          is inside `serve()`, and the bench does not edit src/);
+#   start  the task that runs the handler starts: the spawned task, the pool task, or the
+#          connection task itself in `bare_nospawn`;
+#   hend   the handler has returned its response, before the write;
+#   done   the response is written.
+# `/probe` answers every row as TSV (conn, seq, sent, conn, start, hend, done) and empties the
+# buffer. Requests without `X-Conn` (warm-up, `/health`, `/probe`) are not recorded. Client and
+# server read the same clock on one box; `time()` resolves microseconds.
+const PROBE     = get(ENV, "PROBE", "0") == "1"
+const PROBE_CAP = PROBE ? parse(Int, get(ENV, "PROBE_CAP", "1000000")) : 0
+const PROBE_BUF = zeros(Int64, 7, PROBE_CAP)
+const PROBE_N   = Threads.Atomic{Int}(0)
+
+mutable struct ProbeRec
+    const conn::Int64
+    const seq::Int64
+    const sent::Int64
+    t_conn::Int64
+    t_start::Int64
+    t_hend::Int64
+end
+
+wall_ns() = round(Int64, time() * 1e9)
+
+function probe_begin(stream::HTTP.Stream, on_conn_task::Bool)::Union{Nothing, ProbeRec}
+    PROBE || return nothing
+    req = stream.message
+    c = tryparse(Int64, HTTP.header(req, "X-Conn", ""))
+    c === nothing && return nothing
+    now = wall_ns()
+    return ProbeRec(c, something(tryparse(Int64, HTTP.header(req, "X-Seq", "")), -1),
+                    something(tryparse(Int64, HTTP.header(req, "X-Sent", "")), 0),
+                    on_conn_task ? now : 0, now, 0)
+end
+# On the task about to run the handler, which is where `probe_hend!` looks for the record.
+function probe_started!(rec::ProbeRec)
+    rec.t_start = wall_ns()
+    task_local_storage(:bench_probe, rec)
+    return nothing
+end
+probe_started!(::Nothing) = nothing
+function probe_hend!()
+    PROBE || return nothing
+    rec = get(task_local_storage(), :bench_probe, nothing)
+    rec isa ProbeRec && (rec.t_hend = wall_ns())
+    return nothing
+end
+function probe_done!(rec::ProbeRec)
+    t_done = wall_ns()
+    task_local_storage(:bench_probe, nothing)
+    i = Threads.atomic_add!(PROBE_N, 1) + 1
+    i <= PROBE_CAP || return nothing
+    for (row, v) in enumerate((rec.conn, rec.seq, rec.sent, rec.t_conn, rec.t_start, rec.t_hend, t_done))
+        @inbounds PROBE_BUF[row, i] = v
+    end
+    return nothing
+end
+probe_done!(::Nothing) = nothing
+# Call it between runs: a request still in flight could land in a row being read.
+function probe_body()::String
+    n = min(Threads.atomic_xchg!(PROBE_N, 0), PROBE_CAP)
+    io = IOBuffer()
+    for i in 1:n
+        join(io, view(PROBE_BUF, :, i), '\t')
+        write(io, '\n')
+    end
+    return String(take!(io))
 end
 
 # Compute for `ms` without reaching a yield point: `time_ns` is a plain clock read. Julia does not
@@ -204,6 +281,7 @@ function bare_handler(req::HTTP.Request)::HTTP.Response
     target == "/cpu_yield" && return HTTP.Response(200, cpu_yield_body())
     target == "/lag"       && return HTTP.Response(200, ["Content-Type" => "application/json"], lag_body())
     target == "/gc"        && return HTTP.Response(200, ["Content-Type" => "application/json"], gc_body())
+    target == "/probe"     && return HTTP.Response(200, ["Content-Type" => "text/tab-separated-values"], probe_body())
     if startswith(target, "/aggregate")
         query = HTTP.URIs.queryparams(HTTP.URIs.URI(target))
         parsed = agg_params(get(query, "n", nothing), get(query, "op", nothing))
@@ -214,9 +292,34 @@ function bare_handler(req::HTTP.Request)::HTTP.Response
     return HTTP.Response(404)
 end
 
+# `bare_handler` with the probe's `hend` stamp after it (PROBE=1 only).
+function probed_bare_handler(req::HTTP.Request)::HTTP.Response
+    resp = bare_handler(req)
+    probe_hend!()
+    return resp
+end
+
 function start_bare(spawn::Bool)
-    inner = HTTP.streamhandler(bare_handler)
-    handler = spawn ? (stream -> wait(Threads.@spawn inner(stream))) : inner
+    inner = HTTP.streamhandler(PROBE ? probed_bare_handler : bare_handler)
+    handler = if !PROBE
+        spawn ? (stream -> wait(Threads.@spawn inner(stream))) : inner
+    elseif spawn
+        function (stream)
+            rec = probe_begin(stream, true)
+            wait(Threads.@spawn begin
+                probe_started!(rec)
+                inner(stream)
+                probe_done!(rec)
+            end)
+        end
+    else
+        function (stream)
+            rec = probe_begin(stream, true)
+            probe_started!(rec)
+            inner(stream)
+            probe_done!(rec)
+        end
+    end
     return HTTP.listen!(handler, "127.0.0.1", PORT)
 end
 
@@ -227,21 +330,24 @@ end
 mutable struct PoolSlot
     stream::Any
     err::Any
+    rec::Union{Nothing, ProbeRec}
     const done::Base.Event
-    PoolSlot() = new(nothing, nothing, Base.Event(true))   # autoreset: reusable
+    PoolSlot() = new(nothing, nothing, nothing, Base.Event(true))   # autoreset: reusable
 end
 
 function start_bare_pool()
-    inner = HTTP.streamhandler(bare_handler)
+    inner = HTTP.streamhandler(PROBE ? probed_bare_handler : bare_handler)
     n = parse(Int, get(ENV, "POOL", string(Threads.nthreads(:default))))
     jobs = Channel{PoolSlot}(Inf)
     for _ in 1:n
         Threads.@spawn :default for slot in jobs
+            PROBE && probe_started!(slot.rec)
             try
                 inner(slot.stream)
             catch e
                 slot.err = e
             end
+            PROBE && probe_done!(slot.rec)
             notify(slot.done)
         end
     end
@@ -249,6 +355,7 @@ function start_bare_pool()
         slot = get!(PoolSlot, task_local_storage(), :bench_pool_slot)::PoolSlot
         slot.stream = stream
         slot.err = nothing
+        PROBE && (slot.rec = probe_begin(stream, true))
         put!(jobs, slot)
         wait(slot.done)
         slot.stream = nothing
@@ -268,6 +375,7 @@ function start_nitro()
         path("/cpu_yield", req -> Res.send(cpu_yield_body()); method = "GET"),
         path("/lag",       req -> Res.send(lag_body(); content_type = "application/json"); method = "GET"),
         path("/gc",        req -> Res.send(gc_body(); content_type = "application/json"); method = "GET"),
+        path("/probe",     req -> Res.send(probe_body(); content_type = "text/tab-separated-values"); method = "GET"),
     )
     if HOLDS
         hold_json, hold_json_typed, hold_multipart, hold_file, hold_file_stream = hold_routes()
@@ -296,8 +404,24 @@ function start_nitro()
         )
     end
     urlpatterns(app, "", path("/aggregate", aggregate_route(agg_job); method = "GET"))
+    # PROBE=1: Nitro's own `stream_handler`, at its defaults as `serve` builds it, wrapped to stamp
+    # the request's task at its start, after the pipeline and after the write. It runs on the task
+    # `serve` spawns per request, so `conn` stays 0 here.
+    probed = (; handler = pipeline -> begin
+        base = Nitro.Core.stream_handler(function (req)
+            resp = pipeline(req)
+            probe_hend!()
+            return resp
+        end)
+        function (stream)
+            rec = probe_begin(stream, false)
+            probe_started!(rec)
+            base(stream)
+            probe_done!(rec)
+        end
+    end)
     serve(app; host = "127.0.0.1", port = PORT, async = true, show_banner = false,
-          access_log = ACCESS_LOG)
+          access_log = ACCESS_LOG, (PROBE ? probed : (;))...)
     return app
 end
 

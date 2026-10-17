@@ -26,7 +26,7 @@ bench/
 │   ├── passwords.jl    # one check_password at the default pbkdf2 and bcrypt costs (#587)
 │   └── aggregate.jl    # the /aggregate kernel alone, plain and yielding every 2 ms, at N = 10^3..10^7 (#590)
 ├── socket/             # real-socket load: server.jl (Nitro vs bare HTTP.jl), run.sh, contention.sh, stall.sh, wake.sh,
-│   │                   #   slow_stream.sh, fairness.sh, quiet.sh (oha, curl, go/fairness)
+│   │                   #   slow_stream.sh, fairness.sh, quiet.sh (oha, curl, go/fairness), probe_report.jl
 │   └── go/             # the Go net/http reference server run.sh's `go` mode builds; `go test -bench Aggregate`;
 │                       #   fairness/, the per-connection client fairness.sh drives
 ├── tasks/              # Julia tasks vs goroutines, no HTTP: tasks.jl, go/, run.sh
@@ -124,6 +124,8 @@ bench/socket/quiet.sh holds-1.12 bench/socket/stall.sh nitro 3 8s   # run a bloc
 bench/socket/wake.sh 3                               # does a parked handler wake while K yield? (#598)
 bench/socket/slow_stream.sh 3 8s                     # /plaintext while K capped-rate clients stream (#588)
 bench/socket/fairness.sh "nitro bare_spawn go" 3 8s  # how evenly C connections are served (#590)
+PROBE=1 bench/socket/fairness.sh "nitro bare_spawn bare_pool" 3 8s  # ... and where a slow request waited (#618)
+julia bench/socket/probe_report.jl bench/results/fairness-<stamp>-raw  # the PROBE=1 run's segment tables
 ```
 
 - `server.jl` serves `/plaintext`, `/json`, `/health`, `/cpu` and `/lag` in one of these `MODE`s:
@@ -237,7 +239,12 @@ bench/socket/fairness.sh "nitro bare_spawn go" 3 8s  # how evenly C connections 
   connections busy on `ROUTE`, one request at a time each, and reports requests completed per
   connection (and Jain's index), every request's latency and each connection's longest wait: what
   pooled percentiles cannot show, whether every connection waits a little or a few wait a lot
-  (#590). Modes are `nitro`, `bare_spawn` and `go`.
+  (#590). Modes are `run.sh`'s, and `mode@threads` gives one server its own `--threads` (#618).
+  `PROBE=1` starts the Julia servers with `server.jl`'s probe and the client with `-stamp`: each
+  request is stamped at the client's send, at the connection task, at the start of the task that
+  runs the handler, at the handler's return, at the end of the write and at the client's receipt,
+  and `probe_report.jl <raw dir>` splits the slowest 1% by segment. In `nitro` the stamp before the
+  spawn is not available (it is inside `serve()`), so its first segment covers both.
 - `quiet.sh <label> <command...>` runs one block only on a quiet box: it waits, for at most
   `QUIET_WAIT_S` (default 1800), until no julia, oha or go-server process is left and the 1-minute
   load is under `QUIET_LOAD` (default 0.5), then runs the command in a session of its own and
