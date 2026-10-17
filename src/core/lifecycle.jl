@@ -626,6 +626,9 @@ end
 function startserver(ctx::App; host, port, show_banner=false, async=false, kwargs, start)::Union{Server, Nothing}
     show_banner && serverwelcome(ctx.service.external_url[], ctx.service.prefix[])
     ctx.service.server[] = start(preprocesskwargs(kwargs))
+    # Before the hooks: every exit from here on goes through `terminate`, whose `close` releases
+    # it. A no-op outside the Julia versions JuliaLang/julia#63882 affects (src/context.jl).
+    AppContext._hold_wake_guard!(ctx.service)
     # Route-owned first, then serve-owned: that is declaration order — routes are registered at
     # `urlpatterns()` time, the `serve(middleware = ...)` list only at `serve()` time (#82).
     # Within each half, registration order. `terminate` unwinds the exact reverse (#74).

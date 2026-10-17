@@ -130,6 +130,10 @@ end
     # sets it still sees it. Concrete `RefValue` so the scope can hold it without a conversion.
     # `0` means unlimited.
     max_fields            :: Base.RefValue{Int64}   = Ref{Int64}(DEFAULT_MAX_FIELDS)
+    # The never-firing `Timer` held while serving on the Julia versions `_needs_wake_guard`
+    # names (#598). `nothing` everywhere else, and whenever nothing serves.
+    wake_guard            :: Base.RefValue{Nullable{Timer}} = Ref{Nullable{Timer}}(nothing)
+    wake_guard_lock       :: ReentrantLock          = ReentrantLock()
 end
 
 """
@@ -304,7 +308,56 @@ function Base.close(service::Service; timeout::Real = service.shutdown_timeout[]
         # `terminate()`, which is precisely the leak this whole change exists to remove.
         service.server[] === server && (service.server[] = nothing)
     end
+    _release_wake_guard!(service)
     !isnothing(service.eager_revise[]) && close(service.eager_revise[])
+    return nothing
+end
+
+# JuliaLang/julia#63882 (#586, #598). On Julia 1.13.0-rc3 through 1.13.x, a task parked on a
+# `Timer` -- a `sleep`, a `timedwait`, a deadline -- does not wake while every `:default` thread
+# runs a handler that calls `yield()`, as long as its timer is the only live libuv handle in the
+# process. It begins with the scheduler backports in JuliaLang/julia#62665; 1.12 and 1.14-DEV are
+# not affected. A Nitro app with no janitor (no `SessionMiddleware`, no `FixedRateLimiter`, no
+# Workers cleanup scheduler) is exactly that process: `bench/socket/wake.sh` measured a parked
+# handler waking 1.48 s late on 1.13.2, against 3-8 ms on 1.12.7. Any second live `Timer`
+# removes the stall, even one that never fires, so `serve` holds one for as long as it serves:
+# one libuv handle, no callback, no wake-up, nothing on the request path.
+#
+# The upper bound drops to the first fixed 1.13.x when upstream ships one. Once Nitro's Julia
+# floor passes the last affected release, delete this, its two call sites and `wake_guard`.
+_needs_wake_guard(v::VersionNumber = VERSION) = v"1.13.0-rc3" <= v < v"1.14.0-"
+
+# Tests only: CI runs 1.12, where the gate is shut, and this lets it drive the serve path anyway.
+const _WAKE_GUARD_FORCED = Ref(false)
+
+# Called by `startserver` once the listener is set. Reuses a guard that is still open (a
+# `serve()` admitted while the previous run was still draining) rather than overwriting the
+# only handle to it.
+#
+# Both halves run under `wake_guard_lock`. `close` checks "nothing serves" and then closes, and
+# closing a `Timer` waits on the uv close callback; without the lock a `serve()` admitted in that
+# gap would set its listener, find the doomed guard still open, keep it, and serve unguarded.
+function _hold_wake_guard!(service::Service;
+                           needed::Bool = _WAKE_GUARD_FORCED[] || _needs_wake_guard())
+    needed || return nothing
+    lock(service.wake_guard_lock) do
+        guard = service.wake_guard[]
+        (isnothing(guard) || !isopen(guard)) && (service.wake_guard[] = Timer(typemax(Int32)))
+    end
+    return nothing
+end
+
+# Called by `close(::Service)`. Only once nothing serves: a `serve()` admitted during the drain
+# (see `close`'s compare-and-clear) keeps the guard it found, and closing it here would unguard
+# that server.
+function _release_wake_guard!(service::Service)
+    lock(service.wake_guard_lock) do
+        guard = service.wake_guard[]
+        if !isnothing(guard) && isnothing(service.server[])
+            close(guard)
+            service.wake_guard[] = nothing
+        end
+    end
     return nothing
 end
 

@@ -43,6 +43,12 @@
 #                       password with `Nitro.Auth.check_password` against a hash minted at startup at
 #                       the default cost (pbkdf2_sha256, and bcrypt) and answer a fixed `ok` (#587):
 #                       the computing handler every app has, for `stall.sh`'s `login` variants.
+#                       PASSWORD_CONCURRENCY=<n> passes `n` to `set_password_concurrency!` (#587;
+#                       `0` is unbounded); unset keeps Nitro's default.
+#   PARK=timer|event    What the main task parks on once serving: a never-firing `Timer` (the
+#                       default) or a `Base.Event`, which is not a libuv handle (#598, `wake.sh`).
+#   GUARD=0|1           Hold one extra `Timer(typemax(Int32))` for the process's life: the
+#                       workaround for JuliaLang/julia#63882 that #598 asks `serve()` to adopt.
 #   PRELOAD="Pkg ..."   Load these packages before serving, so `rss.sh` can measure what one adds
 #                       to the process (PRELOAD=PormG also loads NitroPormGExt). The project
 #                       passed to `--project` must have them; the bench env does not.
@@ -231,6 +237,9 @@ end
 # `:default` thread, not the auth flow. The password is right, so the check runs to the end and
 # `denied` is never sent.
 function login_routes()
+    n = get(ENV, "PASSWORD_CONCURRENCY", "")
+    isempty(n) || Nitro.Auth.set_password_concurrency!(parse(Int, n))
+    @info "bench: password checks" concurrency = Nitro.Auth.password_concurrency()
     password = "correct horse battery staple"
     pbkdf2 = Nitro.Auth.make_password(password)
     bcrypt = Nitro.Auth.make_password(password; algorithm = "bcrypt")
@@ -438,5 +447,9 @@ PROFILE_S > 0 && Threads.@spawn profile_window()
 LAG && Threads.@spawn lag_probe()
 
 # Block until killed. A `Timer` keeps an idle task parked so the process stays up and a SIGTERM
-# from `run.sh` ends it cleanly.
-wait(Timer(typemax(Int32)))
+# from `run.sh` ends it cleanly. That `Timer` is also a live libuv handle, which on Julia
+# 1.13.0-rc3..1.13.2 hides JuliaLang/julia#63882 (#586): `PARK=event` parks on a `Base.Event`
+# instead, which is no handle, so `wake.sh` can look for the stall; `GUARD=1` then adds the
+# one-line workaround back explicitly (#598).
+const GUARD_TIMER = get(ENV, "GUARD", "0") == "1" ? Timer(typemax(Int32)) : nothing
+get(ENV, "PARK", "timer") == "event" ? wait(Base.Event()) : wait(Timer(typemax(Int32)))
