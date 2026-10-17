@@ -500,8 +500,8 @@ process only records its submits ([#514](https://github.com/PingoLee/Nitro.jl/is
 external queue on a store no other process can read, or one without the claim capability, is
 refused before anything is installed. Runs left waiting for a consumer on a queue now declared
 in-process are reported with one `@warn`. With `cleanup_enabled`, the cleanup scheduler also
-adjudicates the external queues' expired leases on each tick (`requeue_expired!`), as a fallback
-for a queue whose consumers are gone.
+adjudicates the expired leases of this runtime's own external queues on each tick (`requeue_expired!`),
+as a fallback for a queue whose consumers are gone; another queue's are left to its consumers.
 
 Returns the `WorkerRuntime` — that is the handle to pass as `runtime=` to the task API.
 
@@ -1856,7 +1856,7 @@ function _cleanup_scheduler_loop(runtime::WorkerRuntime, stop_signal::Channel{No
             end
             # Expired leases next, in their own `try` too (#514): the fallback adjudicator for an
             # external queue whose last consumer is gone, since each consumer also runs it on its
-            # own heartbeat. A no-op on a runtime with no external queue.
+            # own heartbeat. Only this runtime's external queues, and a no-op on a runtime with none.
             try
                 _requeue_expired_tick!(runtime)
             catch e
@@ -1896,11 +1896,13 @@ end
 
 # One `requeue_expired!` over this runtime's external queues, logged like the retention pass:
 # `@info` only when it adjudicated something. It throws on a read failure; the caller's `try` owns
-# that, as it does for the other two passes.
+# that, as it does for the other two passes. `:skip`, not the consumer's fail-closed `:fail`: a
+# queue this runtime does not declare may be another app's on the same store, or one a newer
+# deploy added, so its expired runs are left to the consumers that declare it.
 function _requeue_expired_tick!(runtime::WorkerRuntime)
     policies = _external_policies(runtime)
     (isempty(policies) || !supports_claims(runtime.store)) && return nothing
-    tally = requeue_expired!(runtime.store, current_time_utc(); policies)
+    tally = requeue_expired!(runtime.store, current_time_utc(); policies, on_unknown_queue = :skip)
     if tally.requeued + tally.failed > 0
         @info "Nitro.Workers: expired leases adjudicated" requeued = tally.requeued failed = tally.failed unknown_queue = tally.unknown_queue lost_race = tally.lost_race
     else

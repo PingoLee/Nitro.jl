@@ -6022,6 +6022,9 @@ end
     @test_throws ArgumentError External(on_lease_expiry = :requeue, max_pending = 0)
     p = External(on_lease_expiry = :fail, max_pending = 5, options = TaskOptions(timeout = 60))
     @test p.policy == LeasePolicy(:fail) && p.max_pending == 5 && p.options.timeout == 60
+    # The backlog bound defaults to an in-process queue's buffer; `nothing` removes it.
+    @test External(on_lease_expiry = :fail).max_pending == 100 == _W.WorkerQueue().capacity
+    @test External(on_lease_expiry = :fail, max_pending = nothing).max_pending === nothing
     # Equal by value: a re-declaration with the same settings must be recognised as the same.
     @test heavy() == heavy()
     @test heavy() != heavy(max_attempts = 5)
@@ -6257,6 +6260,27 @@ end
         # A runtime with no external queue does nothing at all.
         @test _W._requeue_expired_tick!(WorkerRuntime(SharedStore())) === nothing
     finally
+        uninstall!(app; drain_timeout = 0)
+    end
+
+    # Two apps on one store, each declaring its own external queue: one's tick never touches the
+    # other's expired run, which its consumers adjudicate (#603). Under fail-closed it would be
+    # FAILED as `unknown_queue`.
+    store = SharedStore()
+    app, runtime = external_app(; store, queues = ["heavy" => heavy()])
+    other, other_runtime = external_app(; store, queues = ["reports" => heavy()])
+    try
+        id = submit_queued_task(app, "heavy", "a", Job("crunch", HeavyArgs(n = 1)), Owner("u1"))
+        claimed = claim_next!(store, "heavy", "consumer-1"; lease_seconds = 0.01)
+        sleep(0.05)
+        @test _W._requeue_expired_tick!(other_runtime) == (requeued = 0, failed = 0, unknown_queue = 0, lost_race = 0)
+        rec = get_task_info(store, id)
+        @test rec.status == RUNNING && rec.run_id == claimed.run_id && rec.claimed_by == "consumer-1"
+        # Its own runtime's tick does adjudicate it.
+        @test _W._requeue_expired_tick!(runtime).requeued == 1
+        @test get_task_info(store, id).status == PENDING
+    finally
+        uninstall!(other; drain_timeout = 0)
         uninstall!(app; drain_timeout = 0)
     end
 

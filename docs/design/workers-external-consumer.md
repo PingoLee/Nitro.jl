@@ -153,7 +153,8 @@ holding it for a bounded time, and taking it back.
 **Who runs `requeue_expired!`.** Every consumer, on each heartbeat tick **and once before its first
 claim**, so a one-shot consumer that finds nothing to do still adjudicates its crashed predecessor's
 row. And the web process's retention tick, as the fallback for a queue whose last consumer is gone.
-That tick is coarse (it needs `cleanup_enabled`, and defaults to 24 hours), so the docs say a
+The tick adjudicates only the queues its own runtime declares external (`on_unknown_queue = :skip`,
+decided on #603 and recorded in §13); a consumer keeps the fail-closed rule. That tick is coarse (it needs `cleanup_enabled`, and defaults to 24 hours), so the docs say a
 deployment relying on it should shorten `cleanup_interval_hours`. It is a store CAS, so it is safe
 from any process and idempotent across all of them.
 
@@ -227,7 +228,10 @@ Workers.consume!(app; store, queues = ["heavy" => 4])    # 4 = this process's co
   `claim_next!` claims only those, so a consumer can never take a row the web queued in-process under
   the same name (and holds in a channel).
 - **Switching a queue's placement is a deploy step, not only a config edit.** In-process → external:
-  rows already queued in-process stay in the web's channel and run there; new submits go external.
+  the switch is a restart, and the old web process's teardown **cancels** the runs still buffered in
+  its channel (`"Cancelled by worker shutdown"`), as every teardown does; runs already executing get
+  the drain timeout. They never become external rows, so drain the queue first if they matter. New
+  submits go external. (Corrected in §13: this bullet first said the buffered rows stay and run.)
   External → in-process: stop the consumers once the queue is empty. Rows still `PENDING` with
   `external = true` are reported by the web's `start!` (`@warn` with the count) and stay claimable by
   any consumer still running. The docs give both procedures.
@@ -595,14 +599,25 @@ store-counted admission, the start-time refusals, `requeue_expired!` on the rete
   start either lands in that merge or finds the runtime installed. Under `allow_undeclared_queues`,
   an undeclared first submit racing an `External(…)` declaration of the same name is refused where
   the queue would be minted, under `queue_lock`, so one name never runs in both places.
-- **Left open for the maintainer: `requeue_expired!`'s fail-closed rule on the web tick.** The web
-  process adjudicates with its own runtime's policies, so an expired lease on an external queue it
-  does not declare is `FAILED` as `unknown_queue`, as §3 decided ("fail-closed, never stranded").
-  Two apps sharing one store with different external queues, or an old web process during a
-  rolling deploy that adds a queue, would then fail the other's crashed `:requeue` runs. Only
-  *expired* leases are affected, so live runs never are. The alternative is a `queues` filter on
-  `requeue_expired!` for the web tick, which leaves a queue nobody declares stranded `RUNNING`
-  instead. Kept as designed, pending a decision.
+- **The web tick adjudicates only its own external queues** (decided by the maintainer on #603,
+  2026-10-17). As first written, the web process adjudicated with its runtime's policies and §3's
+  fail-closed rule, so an expired lease on an external queue it does not declare was `FAILED` as
+  `unknown_queue`. Two apps sharing one store with different external queues, or an old web
+  process during a rolling deploy that adds a queue, would then fail the other's crashed
+  `:requeue` runs. `requeue_expired!` now takes `on_unknown_queue = :fail | :skip`: the web tick
+  passes `:skip`, so it reads only its own queues' rows, and the others are left to the consumers
+  that declare them. Consumers keep `:fail`, the default, so a queue no process declares any more
+  is still failed closed by the next consumer of the app, never stranded. The cost is that a
+  queue with no consumer *and* no web declaration stays `RUNNING` until one exists.
+- **`max_pending` defaults to 100** (maintainer, #603), an in-process queue's buffer size, as §5
+  first proposed; the first cut had shipped no default. `max_pending = nothing` removes the bound.
+- **§5's switch procedure was wrong and is corrected there** (maintainer, #603): switching a queue
+  from in-process to external is a restart, and the old web process's teardown cancels the runs
+  still buffered in its channel, as every teardown does. They do not stay and run; the tutorial
+  already said so.
+- **Under `:requeue`, every hand-back counts toward `max_attempts`.** `claim_next!` increments
+  `attempt` whatever ended the previous claim, so a run handed back at each deploy drain is
+  recorded `FAILED` once it has been claimed `max_attempts` times. The tutorial says so.
 - **`set_task!` still writes `created_at` and `queue_name`** (§11). The consumer in 3b writes
   terminal states through `try_transition!`, never `set_task!`, so the item stays open rather than
   changing a shared write path here.

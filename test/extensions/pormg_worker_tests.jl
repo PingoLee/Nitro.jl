@@ -65,7 +65,7 @@ const PORMG_OPERATOR_NAMES = Set([
 # actually exercising, and must say so. These are exactly the keys `ext/NitroPormGExt.jl`
 # builds -- adding one here without the matching branch below is how the guard rots.
 const MODELLED_FILTER_KEYS = Set([
-    "id", "id__@gt", "id__@in", "run_id", "status", "status__@in", "queue_name",
+    "id", "id__@gt", "id__@in", "run_id", "status", "status__@in", "queue_name", "queue_name__@in",
     "completed_at__@lte", "completed_at__@isnull",
     "watchers", "id__@startswith", "watchers__@contains", "watchers__@startswith",
     # The claim capability (#514).
@@ -294,6 +294,9 @@ function _mock_matches(row::Dict{String, Any}, k::String, v)
         return row["status"] in v
     elseif k == "queue_name"
         return row["queue_name"] == v
+    elseif k == "queue_name__@in"
+        # The web tick's lease scan (#514): only the queues its runtime declares external.
+        return row["queue_name"] in v
     elseif k == "completed_at__@lte"
         return row["completed_at"] !== nothing && row["completed_at"] <= v
     elseif k == "completed_at__@isnull"
@@ -3651,6 +3654,36 @@ else
                     # Idempotent: a second pass finds nothing left to decide.
                     @test requeue_expired!(s, expiry; policies = pol) ==
                           (requeued = 0, failed = 0, unknown_queue = 0, lost_race = 0)
+                end
+            end
+        end
+
+        @testset "requeue_expired! under :skip leaves a queue it has no policy for alone (#603)" begin
+            t0 = DateTime(2026, 1, 1)
+            expiry = t0 + Minute(5)
+            for (label, s) in claim_backends()
+                @testset "$label" begin
+                    seed_claimable!(s, "mine"; queue = "fq")
+                    claim_next!(s, "fq", "c1"; lease_seconds = 60, now = t0)
+                    seed_claimable!(s, "theirs"; queue = "elsewhere")
+                    theirs = claim_next!(s, "elsewhere", "c2"; lease_seconds = 60, now = t0)
+
+                    @test_throws "must be :fail or :skip" requeue_expired!(s, expiry;
+                        policies = Dict("fq" => LeasePolicy(:fail)), on_unknown_queue = :ignore)
+                    # No policies at all: nothing is read, nothing is decided.
+                    @test requeue_expired!(s, expiry; policies = Dict{String, LeasePolicy}(),
+                                           on_unknown_queue = :skip) ==
+                          (requeued = 0, failed = 0, unknown_queue = 0, lost_race = 0)
+                    @test requeue_expired!(s, expiry; policies = Dict("fq" => LeasePolicy(:fail)),
+                                           on_unknown_queue = :skip) ==
+                          (requeued = 0, failed = 1, unknown_queue = 0, lost_race = 0)
+                    @test get_task_info(s, "mine").status == FAILED
+                    r = get_task_info(s, "theirs")
+                    @test (r.status, r.run_id, r.claimed_by) == (RUNNING, theirs.run_id, "c2")
+                    # The default still fails it closed.
+                    @test requeue_expired!(s, expiry; policies = Dict("fq" => LeasePolicy(:fail))) ==
+                          (requeued = 0, failed = 1, unknown_queue = 1, lost_race = 0)
+                    @test get_task_info(s, "theirs").status == FAILED
                 end
             end
         end
