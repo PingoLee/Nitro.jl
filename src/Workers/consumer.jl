@@ -153,8 +153,15 @@ their leases to expire, as after a crash.
 A consumer never runs the zombie sweep: the web process's in-process runs look exactly like
 zombies from here.
 """
-function consume!(app::App; kwargs...)
-    c = _start_consumer(app; kwargs...)
+function consume!(app::App; store::AbstractWorkerStore, queues::AbstractVector,
+                  lease::Union{Real, Dates.Period} = CONSUMER_DEFAULT_LEASE,
+                  consumer_id::AbstractString = _default_consumer_id(),
+                  drain_timeout::Real = WORKER_DRAIN_TIMEOUT_SECONDS,
+                  poll_interval::Union{Real, Dates.Period} = Dates.Second(1))
+    # The keywords are named, not forwarded (#607): `_start_consumer`'s `require_interactive =
+    # false` turns off the interactive-thread refusal, and only the tests and the heartbeat bench
+    # may reach it.
+    c = _start_consumer(app; store, queues, lease, consumer_id, drain_timeout, poll_interval)
     # A supervisor's SIGTERM, and a SIGINT outside a REPL, end the process through `exit`, which
     # runs the `atexit` hooks but never returns to the wait below (probed on 1.12 and 1.13: a hook
     # can still spawn and wait on tasks on other threads). So the drain is registered here, at call

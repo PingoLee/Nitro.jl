@@ -6412,6 +6412,14 @@ status(store, id) = get_task_info(store, id).status
     @test_throws ArgumentError _start_consumer(app; store, queues = ["heavy" => 0], require_interactive = false)
     @test_throws "positive duration" _start_consumer(app; store, queues = ["heavy" => 1], lease = 0,
                                                      require_interactive = false)
+    # The refusal below cannot be turned off through the public entry point, only through the
+    # internal `_start_consumer` (#607).
+    err = try
+        consume!(app; store, queues = ["heavy" => 1], require_interactive = false)
+    catch e
+        e
+    end
+    @test err isa MethodError && occursin("require_interactive", sprint(showerror, err))
     # The heartbeat's thread. A process with one starts; one without is refused, which the
     # two-process test proves in a child started with `--threads=1,0`, since CI's own layouts
     # (`-t N` on 1.12) always have one.
