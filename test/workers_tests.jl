@@ -6550,6 +6550,47 @@ end
     end
 end
 
+# #607: in a REPL the process outlives `consume!`, and so does a run its drain timed out on. Left
+# unrenewed, its lease would expire and another consumer would run it again while it still runs.
+@testset "a drain that times out keeps renewing the runs still going until they return" begin
+    Nitro.Core.AppContext._WAKE_GUARD_FORCED[] = true
+    local web, c, store
+    try
+        web, c, store = pair(; drain_timeout = 0.3)
+        try
+            id = submit(web, "straggler", "block")      # never looks at its token
+            @test waitfor(() -> seen("straggler") === :started)
+            run_id = get_task_info(store, id).run_id
+            _request_stop!(c)
+            _drain!(c)                                  # what `consume!` does before it returns
+            @test c.finished && istaskdone(c.claim_task)
+            sleep(2.5)                                  # past two leases since the drain gave up
+            rec = get_task_info(store, id)
+            @test rec.status == RUNNING
+            @test rec.run_id == run_id && rec.claimed_by == c.consumer_id
+            @test rec.lease_expires_at > _W.current_time_utc()
+            # So another process's adjudication has nothing to take back.
+            tally = requeue_expired!(store, _W.current_time_utc(); policies = Dict("heavy" => LeasePolicy(:requeue)))
+            @test tally.requeued + tally.failed == 0
+            @test !istaskdone(c.heartbeat_task)
+            @test isopen(c.wake_guard)
+
+            notify(gate("straggler"))
+            # It returned under a live lease, so its fenced hand-back landed.
+            @test waitfor(() -> status(store, id) == PENDING)
+            @test get_task_info(store, id).claimed_by === nothing
+            # And the heartbeat ended with the last straggler, closing the guard behind it.
+            @test waitfor(() -> istaskdone(c.heartbeat_task))
+            @test !isopen(c.wake_guard)
+        finally
+            notify(gate("straggler"))
+            stop!(web, c)
+        end
+    finally
+        Nitro.Core.AppContext._WAKE_GUARD_FORCED[] = false
+    end
+end
+
 @testset "a poisoned queue stops being claimed; the others go on" begin
     store = SharedStore()
     store.claim_hook[] = q -> q == "heavy" && throw(ClaimPoisonedError(q, ErrorException))

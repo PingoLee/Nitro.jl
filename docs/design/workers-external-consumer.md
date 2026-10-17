@@ -651,6 +651,13 @@ two-process test, which adds SQLite.jl as a test dependency. Where it departs fr
     tell a job that completed from one that saw `:shutdown` and returned early, and recording the
     second as done would lose work (§7). A run the drain reaches before its task starts is handed
     back without running.
+  - **A drain that times out in a live process keeps renewing** (maintainer, #607). In a REPL,
+    `consume!` returns and the process lives on, so do the runs still going. With the heartbeat
+    stopped, their leases expired, and another consumer re-ran them while they still ran here:
+    the fence kept the stale copy's writes out, not its side effects. So the heartbeat now runs
+    until the last of them returns, renewing them and nothing else: no claim, no `requeue_expired!`.
+    They finish under a live lease and hand themselves back. A run that never returns keeps its
+    lease for the life of the process. A process that exits is unchanged.
 - **The heartbeat renews first and adjudicates second.** A heartbeat that was itself late does not
   take back its own leases before renewing them.
 - **One attempt loop.** `_run_attempts!` (`src/Workers/queue.jl`) is now the loop of the queued
