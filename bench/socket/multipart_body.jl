@@ -1,7 +1,7 @@
 # Write the multipart body `stall.sh`'s `route:/hold/multipart@<file>` variant sends (#588): the
 # shape `suite/holds.jl` parses -- one text field, one file part of random bytes -- at a total of
-# BYTES (default 64 MiB, the whole of the default `max_body_bytes`). Prints the Content-Type to
-# pass as ROUTE_CT.
+# BYTES (default 64 MiB, the whole of the default `max_body_bytes`). Prints the Content-Type, and
+# writes it to `<path>.ct`, where `stall.sh` reads it.
 #
 #   julia bench/socket/multipart_body.jl bench/results/multipart-64mib.bin [bytes]
 const BOUNDARY = "----NitroBenchBoundary7MA4YWxkTrZu0gW"
@@ -17,4 +17,6 @@ open(path, "w") do io
     write(io, head, rand(UInt8, total - sizeof(head) - sizeof(tail)), tail)
 end
 filesize(path) == total || error("wrote $(filesize(path)) bytes, expected $total")
-println("multipart/form-data; boundary=", BOUNDARY)
+ct = string("multipart/form-data; boundary=", BOUNDARY)
+write(path * ".ct", ct, "\n")
+println(ct)

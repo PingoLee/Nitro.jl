@@ -28,9 +28,10 @@
 #                           with `/login` starts the Nitro servers with LOGIN=1; anything else a
 #                           route needs (AGG_ROWS, HOLDS) is read from the environment the servers
 #                           inherit.
-#   route:<target>@<file>   The same as a POST with <file> as the body and ROUTE_CT as its
-#                           Content-Type (default application/octet-stream):
-#                           `route:/hold/multipart@body.bin` (#588).
+#   route:<target>@<file>   The same as a POST with <file> as the body. Its Content-Type is the
+#                           first line of `<file>.ct` when that file exists (`multipart_body.jl`
+#                           and `rows_body.jl` write one), else ROUTE_CT (default
+#                           application/octet-stream): `route:/hold/multipart@body.bin` (#588).
 #                           A target carrying `queue=1` answers 202 and queues the work, so it is
 #                           offered at a rate, as `cpu_job` is: K * 1000 / ROUTE_MS per second,
 #                           drained between passes.
@@ -41,6 +42,16 @@
 # unqueued `route:` variants only (it must serve the route; `/aggregate` it does): Go
 # preempts a computing goroutine, so it is the reference for what preemption buys, and it has no
 # Workers. Modes, `mode@threads`, pinning, JULIA and the Go build work as in run.sh.
+#
+# `nitro+<tag>` (or `nitro+<tag>@<threads>`) is another Nitro server in the same interleaved run,
+# started with the assignments in ENV_<tag> added to its environment and on JULIA_<tag> instead
+# of JULIA when that is set: `ENV_unb="PASSWORD_CONCURRENCY=0" ... stall.sh "nitro+unb nitro"`
+# A/Bs #587's bound in one run.
+#
+# GC_SNAPSHOTS=1 records each Julia server's `/gc` (every `Base.gc_num()` field) right before and
+# right after every measured `/plaintext` window in stall-<stamp>-gc.tsv, so a pass's stall can be
+# set against the collections it contained (#588). `stall_report.jl <stem>` turns that and the
+# KEEP_JSON reports into tables of medians with their min and max.
 #
 # Usage: bench/socket/stall.sh [modes] [rounds] [duration]
 #   bench/socket/stall.sh "nitro go" 3 6s
@@ -63,6 +74,7 @@ CPU_MS="${CPU_MS:-200}"
 ROUTE_MS="${ROUTE_MS:-$CPU_MS}"
 ROUTE_CT="${ROUTE_CT:-application/octet-stream}"
 KEEP_JSON="${KEEP_JSON:-0}"
+GC_SNAPSHOTS="${GC_SNAPSHOTS:-0}"
 YIELD_MS="${YIELD_MS:-2}"
 CONNS="${CONNS:-50}"
 THREADS="${THREADS:-8}"
@@ -82,8 +94,8 @@ WANT_GO=0
 for mode in "${MODE_LIST[@]}"; do
   case "${mode%%@*}" in
     go) WANT_GO=1 ;;
-    nitro) ;;
-    *) echo "stall.sh: mode $mode: expected nitro or go" >&2; exit 1 ;;
+    nitro|nitro+*) ;;
+    *) echo "stall.sh: mode $mode: expected nitro, nitro+<tag> or go" >&2; exit 1 ;;
   esac
 done
 LOGIN=0
@@ -110,10 +122,14 @@ RESULT="$OUT/stall-$STAMP.tsv"
 RAW="$OUT/stall-$STAMP-raw"
 [ "$KEEP_JSON" = 1 ] && mkdir -p "$RAW"
 printf 'mode\tthreads\tvariant\tk\tplaintext_rps\tplaintext_p50_ms\tplaintext_p99_ms\tload_rps\tload_2xx\n' > "$RESULT"
+GC_TSV="$OUT/stall-$STAMP-gc.tsv"
+[ "$GC_SNAPSHOTS" = 1 ] && printf 'mode\tvariant\tk\tround\tphase\tsnapshot\n' > "$GC_TSV"
 
 median() { sort -n | awk '{a[NR]=$1} END{print (NR%2)?a[(NR+1)/2]:(a[NR/2]+a[NR/2+1])/2}'; }
 SERVER_NCPU="$(taskset -c "$SERVER_CPUS" nproc)"
 mode_name()    { printf '%s' "${1%%@*}"; }
+mode_kind()    { local n="${1%%@*}"; printf '%s' "${n%%+*}"; }   # nitro+unb@8 -> nitro
+mode_tag()     { local n="${1%%@*}"; [[ $n == *+* ]] && printf '%s' "${n#*+}"; }
 mode_threads() {
   case "$1" in
     *@*) printf '%s' "${1#*@}" ;;
@@ -160,9 +176,17 @@ for mode in "${MODE_LIST[@]}"; do
   if [ "$(mode_name "$mode")" = go ]; then
     GOMAXPROCS="$threads" PORT="$port" CPU_MS="$CPU_MS" taskset -c "$SERVER_CPUS" "$GO_BIN" >"$log" 2>&1 &
   else
+    tag="$(mode_tag "$mode")"; extra=(); julia_cmd=("${JULIA_CMD[@]}")
+    if [ -n "$tag" ]; then
+      env_var="ENV_$tag"; julia_var="JULIA_$tag"
+      read -r -a extra <<<"${!env_var:-}"
+      [ -n "${!julia_var:-}" ] && read -r -a julia_cmd <<<"${!julia_var}"
+    fi
+    echo "  $mode: $("${julia_cmd[@]}" --version)${extra[*]:+, ${extra[*]}}"
     # `env`, because an assignment produced by an expansion is not an assignment to the shell.
     env MODE=nitro PORT="$port" WORKERS=1 LOGIN="$LOGIN" CPU_MS="$CPU_MS" YIELD_MS="$YIELD_MS" ${BURST_K:+"BURST_K=$BURST_K"} \
-      taskset -c "$SERVER_CPUS" "${JULIA_CMD[@]}" --project="$ROOT/bench" --threads="$threads" \
+      ${extra[@]+"${extra[@]}"} \
+      taskset -c "$SERVER_CPUS" "${julia_cmd[@]}" --project="$ROOT/bench" --threads="$threads" \
       "$HERE/server.jl" >"$log" 2>&1 &
   fi
   pid=$!
@@ -188,10 +212,16 @@ load_args() {
   local base="$1" v="$2" target
   case "$v" in
     route:*@*) target="${v#route:}"; target="${target%@*}"
-               printf '%s\n' -m POST -D "${v#*@}" -T "$ROUTE_CT" "$base$target" ;;
+               printf '%s\n' -m POST -D "${v#*@}" -T "$(body_ct "${v#*@}")" "$base$target" ;;
     route:*)   printf '%s\n' "$base${v#route:}" ;;
     *)         printf '%s\n' "$base/$v" ;;
   esac
+}
+body_ct() { if [ -r "$1.ct" ]; then head -1 "$1.ct"; else printf '%s' "$ROUTE_CT"; fi; }
+gc_snapshot() {   # base url, mode, variant, k, round, phase
+  [ "$GC_SNAPSHOTS" = 1 ] && [ "$(mode_name "$2")" != go ] || return 0
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$2" "$3" "$4" "$5" "$6" \
+    "$(curl -fsS -m 30 "$1/gc" 2>/dev/null || printf '{}')" >> "$GC_TSV"
 }
 cost_ms() { if [[ $1 == route:* ]]; then printf '%s' "$ROUTE_MS"; else printf '%s' "$CPU_MS"; fi; }
 slug() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
@@ -249,10 +279,15 @@ for round in $(seq 1 "$ROUNDS"); do
         bg=$!
         sleep 1
       fi
+      gc_snapshot "$base" "$mode" "$variant" "$k" "$round" before
       js="$(taskset -c "$CLIENT_CPUS" oha -z "$DUR" -c "$CONNS" --no-tui --disable-compression \
               --output-format json "$base/plaintext" 2>/dev/null)"
+      gc_snapshot "$base" "$mode" "$variant" "$k" "$round" after
       raw_stem="$RAW/r$round-$(slug "$mode")-$(slug "$variant")-k$k"
-      [ "$KEEP_JSON" = 1 ] && printf '%s\n' "$js" >"$raw_stem-plaintext.json"
+      if [ "$KEEP_JSON" = 1 ]; then
+        printf '%s\n' "$js" >"$raw_stem-plaintext.json"
+        printf '%s\t%s\t%s\t%s\t%s\n' "$round" "$mode" "$variant" "$k" "$(basename "$raw_stem")" >>"$RAW/index.tsv"
+      fi
       RPS[$key]+="$(jq -r '.summary.requestsPerSec | floor' <<<"$js") "
       P50[$key]+="$(jq -r '(.latencyPercentiles.p50 // 0) * 1000 | . * 100 | floor / 100' <<<"$js") "
       P99[$key]+="$(jq -r '(.latencyPercentiles.p99 // 0) * 1000 | . * 100 | floor / 100' <<<"$js") "
@@ -285,4 +320,5 @@ for pass in "${PASSES[@]}"; do
     (IFS=$'\t'; printf '%s\n' "${row[*]}") >> "$RESULT"
   done
 done
+[ "$GC_SNAPSHOTS" = 1 ] && echo "gc snapshots: $GC_TSV"
 echo "results: $RESULT"

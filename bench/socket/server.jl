@@ -52,12 +52,20 @@
 #                       `aggregate.jl`, shared with `suite/aggregate.jl` and mirrored in `go/`.
 #                       Nitro with WORKERS=1 also takes `&queue=1`: the same op submitted to the
 #                       `/cpu_job` queue, answered 202, and counted by `/jobs`.
-#   HOLDS=0|1           Nitro only: also serve the two largest holds of #588's inventory as routes,
+#   HOLDS=0|1           Nitro only: also serve the largest holds of #588's inventory as routes,
 #                       so `stall.sh` can keep K of them in flight: `GET /hold/json` answers
 #                       `Res.json` of a ~12 MB untyped `JSON.Object` parsed once at startup (the
-#                       `write_dict_10mb` row), and `POST /hold/multipart` parses the request's
-#                       multipart body with `getfiles` (the `multipart_64mib` row when it is sent
-#                       a 64 MiB body) and answers `ok <parts>`.
+#                       `write_dict_10mb` row); `POST /hold/json_typed` binds the request's body
+#                       with `json(req, T; max_fields = 0)` (the `json_typed_10mb` row when it is
+#                       sent `rows_body.jl`'s 12 MB body) and answers `ok <rows>`;
+#                       `POST /hold/multipart` parses the request's multipart body with `getfiles`
+#                       (the `multipart_64mib` row when it is sent a 64 MiB body) and answers
+#                       `ok <parts>`; `GET /hold/file` is `Res.file(req, HOLD_FILE)`, the whole-file
+#                       read (`file_100mib`), and `GET /hold/file_stream` the same with
+#                       `stream = true`, the negative control (`file_100mib_stream_read`).
+#   HOLD_FILE=<path>    The file the two `/hold/file*` routes serve. Default
+#                       `bench/results/hold-100mib.bin`, written (100 MiB of random bytes) when
+#                       missing and read once at startup, so it is in page cache.
 #   PARK=timer|event    What the main task parks on once serving: a never-firing `Timer` (the
 #                       default) or a `Base.Event`, which is not a libuv handle (#598, `wake.sh`).
 #   GUARD=0|1           Hold one extra `Timer(typemax(Int32))` for the process's life: the
@@ -252,10 +260,13 @@ function start_nitro()
         path("/gc",        req -> Res.send(gc_body(); content_type = "application/json"); method = "GET"),
     )
     if HOLDS
-        hold_json, hold_multipart = hold_routes()
+        hold_json, hold_json_typed, hold_multipart, hold_file, hold_file_stream = hold_routes()
         urlpatterns(app, "",
-            path("/hold/json",      hold_json; method = "GET"),
-            path("/hold/multipart", hold_multipart; method = "POST"),
+            path("/hold/json",        hold_json; method = "GET"),
+            path("/hold/json_typed",  hold_json_typed; method = "POST"),
+            path("/hold/multipart",   hold_multipart; method = "POST"),
+            path("/hold/file",        hold_file; method = "GET"),
+            path("/hold/file_stream", hold_file_stream; method = "GET"),
         )
     end
     if LOGIN
@@ -311,16 +322,37 @@ function aggregate_route(submit)
     end
 end
 
-# The two largest holds of #588's inventory, as routes. The JSON value is built the way
+# The largest holds of #588's inventory, as routes. The JSON value is built the way
 # `suite/holds.jl` builds `write_dict_10mb`'s: `suite/json.jl`'s rows payload at 250,000 rows,
-# parsed untyped. It is shared by every request and only read.
+# parsed untyped. It is shared by every request and only read. `HoldRows` is `bench/setup.jl`'s
+# `BenchRows` under another name, so `/hold/json_typed` binds what `json_typed_10mb` binds.
+struct HoldRow
+    id::Int
+    label::String
+    value::Float64
+end
+struct HoldRows
+    rows::Vector{HoldRow}
+end
+
+const HOLD_FILE_BYTES = 100 * 1024 * 1024
+
 function hold_routes()
     rows = JSON.json(Dict("rows" => [Dict("id" => i, "label" => "row-$i", "value" => i * 1.5)
                                      for i in 1:250_000]))
     value = JSON.parse(rows)
+    file = get(ENV, "HOLD_FILE", joinpath(@__DIR__, "..", "results", "hold-100mib.bin"))
+    if filesize(file) != HOLD_FILE_BYTES
+        mkpath(dirname(file))
+        write(file, rand(UInt8, HOLD_FILE_BYTES))
+    end
+    read(file)   # into page cache
     hold_json = req -> Res.json(value)
+    hold_json_typed = req -> Res.send(string("ok ", length(Nitro.json(req, HoldRows; max_fields = 0).rows)))
     hold_multipart = req -> Res.send(string("ok ", length(Nitro.getfiles(req))))
-    return hold_json, hold_multipart
+    hold_file = req -> Res.file(req, file)
+    hold_file_stream = req -> Res.file(req, file; stream = true)
+    return hold_json, hold_json_typed, hold_multipart, hold_file, hold_file_stream
 end
 
 # `/burst?n=K`: K Workers jobs at once, each burning JOB_MS on the `:default` pool -- the pool
