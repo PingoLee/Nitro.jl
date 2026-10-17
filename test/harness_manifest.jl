@@ -42,6 +42,7 @@ const TEST_FILES = [
     "extensions/pormg_session_tests.jl",
     "extensions/pormg_worker_tests.jl",
     "extensions/pormg_env_tests.jl",
+    "extensions/newapp_pormg_tests.jl",
 
     # ── Special Handler Tests ─────────────────────────────────────────────────
     "sse_tests.jl",
@@ -53,6 +54,7 @@ const TEST_FILES = [
     "util_tests.jl",
     "environment_tests.jl",
     "upgrade_guide_tests.jl",
+    "newapp_tests.jl",
     "docs_deploy_tests.jl",
     "cookies_tests.jl",
     "session_tests.jl",

@@ -2001,4 +2001,56 @@ function __init__()
     end
 end
 
+# `Nitro.newapp(name; pormg = true)` (#417). The template lives in `src/newapp.jl`; this supplies
+# its PormG half and hands `db/` to PormG's own interactive writer. PormG's drivers are weak
+# dependencies of PormG, so the adapter `setup` recorded decides which one the app loads, and the
+# app is written again once it is known.
+function Nitro._newapp_pormg(write_app::Function, root::String)
+    v = pkgversion(PormG)
+    # name => (uuid, compat). Kept equal to PormG's own `[weakdeps]`/`[compat]` by
+    # `test/extensions/newapp_pormg_tests.jl`.
+    drivers = Dict("SQLite" => ("0aa819cd-b072-5ff4-a722-6bc24af294d9", "1.6.1"),
+                   "LibPQ" => ("194296ae-ab2e-5f79-8cd4-7183a0a5a0d1", "1"))
+    db(names) = Nitro._NewappDB(
+        usings = join(["using Nitro", "PormG", names...], ", "),
+        module_note = [
+            "# Once db/models.jl defines models, import them here for the handlers (`import ..appM`):",
+            "#   PormG.@import_models \"../db/models.jl\" models",
+            "#   const appM = models",
+        ],
+        boot = [
+            "sync_pormg_env!()  # NITRO_ENV -> PORMG_ENV, only when NITRO_ENV is set",
+            "# PormG parses db/connection.yml, validates it and connects, from any working directory",
+            "PormG.Configuration.load_many([\"db\"]; root = pkgdir(@__MODULE__))",
+        ],
+        store = "pormg_nitro_worker(db_key = \"db\")",
+        deps = ["PormG" => string(Base.PkgId(PormG).uuid); [n => drivers[n][1] for n in names]],
+        sources = ["PormG" => "{url = \"https://github.com/PingoLee/PormG.jl.git\", rev = \"v$v\"}"],
+        compat = ["PormG" => string(v); [n => drivers[n][2] for n in names]],
+        gitignore = ["db/connection.yml"],
+    )
+    # Nitro's files first, so an abandoned prompt still leaves a complete app.
+    write_app(db(String[]))
+    # `setup` offers to install PormG's AI skills into `pwd()`, not next to the folder it was
+    # given, so run it from the app root or a "yes" puts them wherever the REPL happens to be.
+    cd(() -> PormG.setup(joinpath(root, "db")), root)
+
+    yml = joinpath(root, "db", "connection.yml")
+    isfile(yml) || return nothing
+    names = String[]
+    for m in eachmatch(r"(?m)^\s*adapter:\s*['\"]?([A-Za-z]+)", read(yml, String))
+        adapter = lowercase(m[1])
+        driver = startswith(adapter, "sqlite") ? "SQLite" :
+                 startswith(adapter, "postgres") ? "LibPQ" : nothing
+        if driver === nothing
+            @warn "newapp: no database driver added for this adapter; add the package it needs " *
+                  "to Project.toml and the app's `using` line" adapter = m[1]
+        elseif !(driver in names)
+            push!(names, driver)
+        end
+    end
+    isempty(names) || write_app(db(sort!(names)))
+    return nothing
+end
+
 end # module NitroPormGExt
