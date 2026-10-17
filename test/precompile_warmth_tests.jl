@@ -87,6 +87,12 @@ using Test
 # stay as they are, and a ratio logged on a loaded developer box is not evidence for moving
 # them.
 #
+# Compare the memory fraction WITHIN one OS only. On macOS `Sys.free_memory()` counts only
+# pages that are completely free, not cached or inactive ones. The first CI run with this
+# log read ~0.05 there on a GREEN run, against ~0.7–0.8 on Linux and Windows. So the
+# 95–99% that #610 saw is the macOS runner's normal state, not a sign of trouble, and a
+# free-memory floor would skip every macOS run.
+#
 # The values go INTO the message string, not as `key=value` logging pairs, because
 # ConsoleLogger puts pairs on their own `│` lines, which a grep for the prefix would drop.
 #
@@ -140,8 +146,10 @@ function warmth(msg)
 end
 
 fmt(x) = string(round(x; digits = 3))
-memory() = "mem_free=$(fmt(Sys.free_memory() / Sys.total_memory())) " *
-           "mem_free_gib=$(fmt(Sys.free_memory() / 2^30)) mem_total_gib=$(fmt(Sys.total_memory() / 2^30))"
+function memory()
+    free, total = Sys.free_memory(), Sys.total_memory()   # one reading, so the line is consistent
+    "mem_free=$(fmt(free / total)) mem_free_gib=$(fmt(free / 2^30)) mem_total_gib=$(fmt(total / 2^30))"
+end
 
 warmth("start os=$(Sys.KERNEL) arch=$(Sys.ARCH) julia=$VERSION threads=$(Threads.nthreads()) $(memory())")
 try
